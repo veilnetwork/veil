@@ -108,7 +108,11 @@ jobs:
           # (C++) — which ubuntu's musl-tools (musl-gcc only, no g++) cannot.
           # Mirrors scripts/cross-build-linux-musl.sh on the runner.
           cd "$RUNNER_TEMP"
-          curl -fsSLO https://musl.cc/x86_64-linux-musl-cross.tgz
+          # musl.cc is the upstream host but is frequently flaky / slow; retry
+          # hard and fail fast per-attempt instead of hanging on one connect.
+          curl -fL --retry 6 --retry-delay 15 --retry-all-errors \
+               --connect-timeout 30 --max-time 600 -O \
+               https://musl.cc/x86_64-linux-musl-cross.tgz
           tar xzf x86_64-linux-musl-cross.tgz
           TC="$RUNNER_TEMP/x86_64-linux-musl-cross"
           SYSROOT="$TC/x86_64-linux-musl"
@@ -172,6 +176,12 @@ jobs:
           SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.value }}
           CARGO_INCREMENTAL: 0
           RUSTFLAGS: '--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=C:\=/'
+          # The repo-global [env] CC=clang/CXX=clang++ (.cargo/config.toml, a
+          # rocksdb header workaround) is a gnu-driver clang and chokes on the
+          # MSVC-style flags crates add for *-windows-msvc (e.g. pqcrypto's
+          # /arch:AVX2). Use clang-cl (the MSVC driver) for this target.
+          CC_x86_64_pc_windows_msvc: clang-cl
+          CXX_x86_64_pc_windows_msvc: clang-cl
         run: |
           # Phase 6.50.b audit fix: switched от allow-empty-seeds к
           # production-seeds.  Pre-fix а CI release artifact for Windows
