@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/veil-abuse",
+    "crates/veil-adaptive",
+    "crates/veil-anonymity",
+    "crates/veil-anycast",
+    "crates/veil-app",
+    "crates/veil-bloom",
+    "crates/veil-bootstrap",
+    "crates/veil-bufpool",
+    "crates/veil-cfg",
+    "crates/veil-cli",
+    "crates/veil-congestion",
+    "crates/veil-crypto",
+    "crates/veil-dht",
+    "crates/veil-discovery",
+    "crates/veil-dispatcher",
+    "crates/veil-e2e",
+    "crates/veil-error",
+    "crates/veil-fingerprint",
+    "crates/veil-gateway",
+    "crates/veil-identity",
+    "crates/veil-invite",
+    "crates/veil-ipc",
+    "crates/veil-local-transport",
+    "crates/veil-mailbox",
+    "crates/veil-memory",
+    "crates/veil-mesh",
+    "crates/veil-node-runtime",
+    "crates/veil-nat",
+    "crates/veil-obfs4",
+    "crates/veil-obfs4-smoke",
+    "crates/veil-observability",
+    "crates/veil-dispatcher-state",
+    "crates/veil-pending-ack",
+    "crates/veil-pex",
+    "crates/veil-proxy",
+    "crates/veil-reputation",
+    "crates/veil-push",
+    "crates/veil-routing",
+    "crates/veil-session",
+    "crates/veil-session-integration-tests",
+    "crates/veil-proto",
+    "crates/veil-transfer",
+    "crates/veil-transport",
+    "crates/veil-types",
+    "crates/veil-udp-obfs",
+    "crates/veil-update",
+    "crates/veil-util",
+    "crates/veil-webtunnel",
+    "veilcore",
+    "veilclient",
+    "crates/veilclient-ffi",
+    "crates/ogate",
+    "crates/oproxy",
+]
+
+[workspace.lints.clippy]
+# Mutex/RwLock guards must not be held across .await — guard is held while
+# the task suspends, preventing other tasks from acquiring the lock и risking
+# deadlock на single-threaded executors. Rust's Send checker catches some
+# cases (std::Mutex guard is !Send) but не all (parking_lot::Mutex IS Send;
+# single-threaded tokio runtime doesn't require Send). This lint is а
+# defence-in-depth that fires regardless.
+#
+# Use `tokio::sync::Mutex` / `tokio::sync::RwLock` if you genuinely need
+# to hold а lock across .await — those are designed for it.
+#
+# Audit batch 2026-05-24 (D1/M2): promoted к "deny".  External review
+# flagged ipc/server.rs:acceptor_streams as fragile (std::Mutex held
+# в an async fn — current code doesn't await across it, но code drift
+# could introduce one).  Workspace lint converts the hazard от code-
+# review burden к compile-time гарантию.
+await_holding_lock = "deny"
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+# Phase 6.50.d.5n: keep .symtab (function names) для jeprof symbolication
+# и production crash backtraces.  strip = "debuginfo" removes dwarf debug
+# info but preserves the symbol table — binary grows ~1 MB but stack
+# traces stay readable.
+
+# Test profile: optimize crypto/PoW hot paths but keep fast compile.
+# opt-level = 1 gives ~3-5× speedup on Argon2id/BLAKE3/Ed25519 tests
+# with only ~30% slower compile vs dev.
+[profile.test]
+opt-level = 1
+
+# Optimize deps to max in tests too — they rarely recompile and their
+# optimization provides most of the speedup (crypto crates, tokio).
+[profile.test.package."*"]
+opt-level = 3

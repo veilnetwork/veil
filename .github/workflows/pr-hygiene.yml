@@ -1,0 +1,65 @@
+name: PR hygiene
+
+# Lightweight pre-submit gate (audit follow-up 2026-06-03). The full CI
+# (ci.yml) stays tag-only for budget reasons (Phase Q.6); this job runs ONLY
+# the cheap, build-once hygiene checks — fmt + clippy(-D warnings) + the policy
+# scripts + cargo-audit — on every PR and on non-tag branch pushes, so a
+# style/lint/poison/dead-code/advisory regression is caught before it lands
+# instead of only at release. No test matrix, no Windows, no bench, no devnet.
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      # tag pushes already trigger the full ci.yml; don't double-run.
+      - 'gh-readonly-queue/**'
+
+# Cancel superseded runs on the same ref so rapid pushes don't pile up minutes.
+concurrency:
+  group: pr-hygiene-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  hygiene:
+    name: Hygiene (fmt + clippy + policy + audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (with rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-hygiene-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-hygiene-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (warnings deny)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Mutex poison-recovery policy
+        run: ./scripts/check-mutex-poison-policy.sh
+
+      - name: '#[allow(dead_code)] anchor policy'
+        run: ./scripts/check-allow-dead-code-anchors.sh
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version "^0.22" --locked
+
+      - name: cargo audit (RustSec advisory DB)
+        run: cargo audit --deny warnings

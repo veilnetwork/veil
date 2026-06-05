@@ -1,0 +1,61 @@
+---
+# Disable node-aggregate inbound/outbound bandwidth gate on the testnet.
+#
+# Default `max_in/outbound_bandwidth_kbps = 100_000` (declared в kbps but
+# the gate impl multiplies by 1024, так effective steady rate ≈ 100 MiB/s
+# = ~800 Mbit/s, burst ≈ 195 MiB). Under iperf-scale load TCP bursts past
+# the gate → silent frame drops → AEAD counter desync → session.violation
+# → auto_ban → 10-20s stall. See `bandwidth_gate.rs:78` for the drop site.
+#
+# Setting both to `-1` маps `BandwidthGate::new(0)` (unlimited) — the
+# `if val < 0 { 0 }` branch in `NodeCapacityConfig::bandwidth_kbps_to_gate`.
+#
+# Run:
+#   ansible-playbook -i inventory.yml disable-bandwidth-gate.yml
+#
+# Idempotent — re-runs only replace the block if values differ.
+
+- name: Disable bandwidth gate on veil daemon (testnet)
+  hosts: all
+  become: true
+
+  vars:
+    max_inbound_kbps: -1
+    max_outbound_kbps: -1
+
+  tasks:
+    - name: Insert / update [capacity] block in node.toml
+      ansible.builtin.blockinfile:
+        path: /var/lib/veil/node.toml
+        marker: "# {mark} ANSIBLE MANAGED [capacity] block"
+        block: |
+          [capacity]
+          max_inbound_bandwidth_kbps  = {{ max_inbound_kbps }}
+          max_outbound_bandwidth_kbps = {{ max_outbound_kbps }}
+        owner: veil
+        group: veil
+        mode: "0644"
+      register: cfg_changed
+
+    - name: Restart veil if config changed (cascades to ogate via PartOf)
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
+      when: cfg_changed.changed
+
+    - name: Wait 5 s for veil + ogate to come up
+      ansible.builtin.pause:
+        seconds: 5
+      when: cfg_changed.changed
+
+    - name: Verify both services active
+      ansible.builtin.shell:
+        cmd: |
+          systemctl is-active veil
+          systemctl is-active ogate
+      register: status
+      changed_when: false
+
+    - name: Status
+      ansible.builtin.debug:
+        var: status.stdout_lines

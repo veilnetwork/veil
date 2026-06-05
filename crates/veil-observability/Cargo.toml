@@ -1,0 +1,22 @@
+[package]
+name = "veil-observability"
+version = "0.1.0"
+edition = "2024"
+description = "Veil observability: NodeLogger (structured stderr/file/JSON), NodeMetrics (atomic counters + histograms + gauges), MetricsSnapshot for Prometheus scrape. Phase 6 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-abuse = { path = "../veil-abuse" }
+veil-app = { path = "../veil-app" }
+veil-dht = { path = "../veil-dht" }
+veil-error = { path = "../veil-error" }
+veil-ipc = { path = "../veil-ipc" }
+veil-mesh = { path = "../veil-mesh" }
+veil-pex = { path = "../veil-pex" }
+veil-proxy = { path = "../veil-proxy" }
+veil-routing = { path = "../veil-routing" }
+veil-types = { path = "../veil-types" }
+veil-update = { path = "../veil-update" }
+
+[lints]
+workspace = true

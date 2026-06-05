@@ -1,0 +1,25 @@
+[package]
+name = "veil-obfs4"
+version = "0.1.0"
+edition = "2024"
+description = "obfs4-style TCP stream obfuscation для plaintext transports. Phase 1b of PLAN_TRANSPORT_OBFUSCATION.md ships the AEAD framing core; NTOR handshake + elligator2 land в Phase 1c."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+curve25519-elligator2 = { version = "0.1.0-alpha.2", default-features = false, features = ["alloc", "elligator2", "zeroize"] }
+hkdf = "0.12"
+hmac = "0.12"
+pin-project-lite = "0.2"
+rand = "0.9"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

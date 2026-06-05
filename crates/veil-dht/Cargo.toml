@@ -1,0 +1,44 @@
+[package]
+name = "veil-dht"
+version = "0.1.0"
+edition = "2024"
+description = "Veil network Kademlia DHT: routing table, k-bucket, iterative lookup, transport-resolution cache, lookup-result cache. Phase 5 extraction from veilcore — depends only on Tier-0/1/2 crates and on three trait surfaces (FrameRouter, RttHint, CoordinateOracle) for upper-layer hooks."
+license = "AGPL-3.0-or-later"
+
+[features]
+test-low-difficulty = ["veil-crypto/test-low-difficulty", "veil-proto/test-low-difficulty"]
+# Mirrors veilcore's `rocksdb-cold` flag so downstream binaries can pass it
+# through without veil-dht needing a direct rocksdb dep.
+rocksdb-cold = ["dep:rocksdb"]
+
+[dependencies]
+veil-crypto = { path = "../veil-crypto" }
+veil-error = { path = "../veil-error" }
+veil-proto = { path = "../veil-proto" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+base64 = "0.22"
+blake3 = "1.5"
+futures = "0.3"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+log = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["sync", "time", "rt", "rt-multi-thread", "macros"] }
+pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
+pqcrypto-traits = "0.3"
+
+rocksdb = { version = "0.22", optional = true }
+
+[dev-dependencies]
+# `test-util` enables tokio::time::pause/advance для churn sim tests
+# (epic485_1_c_24h_churn_does_not_amplify_sybil_eclipse).
+tokio = { version = "1.42", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "test-util"] }
+# Scratch dir for the RocksDB cold-tier durability test (rocksdb-cold only).
+tempfile = "3"
+
+[lints]
+workspace = true

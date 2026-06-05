@@ -1,0 +1,77 @@
+[package]
+name = "veilclient"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "High-level Rust client SDK for the Veil network"
+
+[dependencies]
+veilcore = { path = "../veilcore" }
+# Phase 6.50 audit (2026-05-09): veil-ipc moved from dev-dependency
+# к а regular dependency после the shim deletion in veilcore.
+# The lib re-routes calls к `veil_ipc::*` directly instead of через
+# the deleted `veilcore::node::ipc::*` re-export shim.
+veil-ipc = { path = "../crates/veil-ipc" }
+# Phase 6.50.d.6.1: needed после Phase 5d migration — public wire payloads
+# (`AppIpcSendPayload.data`, `AppDeliverPayload.data`) carry `PooledShared`,
+# so the SDK boundary wraps user `&[u8]` через `pooled_shared_from_vec`.
+veil-bufpool = { path = "../crates/veil-bufpool" }
+# Slice 4 of the PoW-Gated Rendezvous epic — rendezvous module uses
+# the proto crate's wire frames + sign/verify helpers directly.
+# Promoted from dev-dependency к regular dep.
+veil-proto = { path = "../crates/veil-proto" }
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros"] }
+# `PollSender` gives the `AsyncWrite` stream path real channel backpressure
+# (waker registered when the bounded IPC writer channel is full) instead of a
+# `wake_by_ref` busy-spin. Already in the workspace lockfile via veil-transport.
+tokio-util = "0.7"
+bytes = "1"
+ed25519-dalek = "2"
+thiserror = "1"
+
+[features]
+# Forward veilcore/veil-bootstrap feature flags so downstream
+# crates (veilclient-ffi, Flutter plugin) can opt into testnet
+# build mode without re-declaring the chain.
+allow-empty-seeds = ["veilcore/allow-empty-seeds"]
+production-seeds  = ["veilcore/production-seeds"]
+test-low-difficulty = ["veilcore/test-low-difficulty"]
+# Forward the BoringSSL TLS-fingerprint backend so downstream binaries that
+# embed a node (or otherwise dial veil TLS) can enable the rotating
+# ClientHello. Not a default here — the SDK is transport-agnostic; consumers
+# (veil-cli, ogate, oproxy) opt in.
+tls-boring = ["veilcore/tls-boring"]
+
+[dev-dependencies]
+# Integration tests construct an `IpcServer` directly + impl IPC trait
+# fixtures in-test, so they need both crate surfaces explicitly.
+veil-ipc = { path = "../crates/veil-ipc" }
+# `test-util` enables `tokio::time::pause` / `advance` so the bind-
+# timeout regression test doesn't have to wait 30 real seconds.
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "test-util"] }
+# Slice 4 rendezvous tests construct target identities (blake3 of pubkey)
+# to derive expected node_ids.
+blake3 = "1.5"
+
+[[example]]
+name = "echo_server"
+path = "examples/echo_server.rs"
+
+[[example]]
+name = "ping_client"
+path = "examples/ping_client.rs"
+
+[[example]]
+name = "chat_server"
+path = "examples/chat_server.rs"
+
+[[example]]
+name = "chat_client"
+path = "examples/chat_client.rs"
+
+[[example]]
+name = "chat_node"
+path = "examples/chat_node.rs"
+
+[lints]
+workspace = true

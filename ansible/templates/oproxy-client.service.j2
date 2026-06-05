@@ -1,0 +1,27 @@
+[Unit]
+Description=oproxy client — SOCKS5/HTTP → veil tunnel ({{ inventory_hostname }})
+After=veil.service
+Requires=veil.service
+PartOf=veil.service
+
+[Service]
+Type=simple
+User=veil
+Group=veil
+ExecStart=/usr/local/bin/oproxy-client --config /etc/oproxy/client.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=append:/var/log/veil/oproxy-client.log
+StandardError=append:/var/log/veil/oproxy-client.log
+WorkingDirectory=/var/lib/veil
+
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/veil /var/log/veil
+ProtectHome=true
+NoNewPrivileges=true
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

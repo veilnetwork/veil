@@ -1,0 +1,14 @@
+# cargo-audit ignore list (read by `cargo audit` from `.cargo/audit.toml`).
+# Policy: entries MUST be "unmaintained"/informational advisories — never a
+# real vulnerability — and carry a rationale.
+[advisories]
+ignore = [
+    # pqcrypto-{traits,internals,falcon}: the upstream PQClean project is being
+    # archived, so RustSec flagged these as unmaintained. Informational only —
+    # not an exploitable vulnerability; the crates remain functionally correct.
+    # They back the Falcon post-quantum signature path. Migrating to a
+    # maintained Falcon implementation is tracked separately; revisit then.
+    "RUSTSEC-2026-0162", # pqcrypto-traits unmaintained
+    "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained
+    "RUSTSEC-2026-0165", # pqcrypto-falcon unmaintained
+]

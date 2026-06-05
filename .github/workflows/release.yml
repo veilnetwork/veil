@@ -1,0 +1,220 @@
+name: release
+
+# Epic 484.1: deterministic release builds + signed UpdateManifest.
+#
+# Manually triggered (workflow_dispatch) — operator picks version,
+# decides whether к draft a fresh GitHub Release or attach к existing
+# tag.  Matrix builds for each supported target run в parallel; per-
+# target artifacts (binary + sha256.txt + manifest.bin) are uploaded
+# к the GitHub Release.
+#
+# Required GitHub repo secret:
+#   VEIL_RELEASE_IDENTITY_TOML — full TOML body of the issuer
+#                                   identity (algo + public_key +
+#                                   private_key).  Cold-storage
+#                                   release-signing key, distinct
+#                                   from any node identity.
+#
+# Verification (any user can run this локально):
+#   1. Download `veil-cli-<triple>` + `manifest.bin` от Release.
+#   2. `sha256sum veil-cli-<triple>` matches `binary_sha256` field
+#      decoded from the published manifest.
+#   3. Independent rebuild: clone repo, checkout same tag, run
+#      `scripts/build-release.sh --target <triple>
+#       --source-date-epoch <commit-author-date>` — output should
+#      have byte-identical SHA-256.
+#
+# Determinism enforced by `scripts/build-release.sh`:
+#   * `SOURCE_DATE_EPOCH` pinned to the tagged commit's author date.
+#   * `cargo build --locked` so Cargo.lock is не resolved fresh.
+#   * `RUSTFLAGS=--remap-path-prefix` strips host paths from debug info.
+#   * `CARGO_INCREMENTAL=0` so no per-machine state leaks in.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver string (e.g. 1.2.3) — must match a git tag if release_existing.'
+        required: true
+        type: string
+      min_compatible_version:
+        description: 'Minimum installed version that may apply this update.'
+        required: true
+        type: string
+      release_existing:
+        description: 'Attach to existing GitHub Release (else create new draft).'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # для release-attach
+
+jobs:
+  build:
+    name: build-${{ matrix.triple }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          # Static-musl build: same x86_64 platform but linked against
+          # musl libc.  Produced specifically для older Linux distros
+          # whose glibc lacks symbols GitHub's ubuntu-latest images bring
+          # (the runner pins а very recent glibc — binaries built there
+          # otherwise fail на old hosts с "GLIBC_2.39 not found").
+          # musl artifact runs on any Linux kernel ≥ 3.2 regardless of
+          # the host's libc version.
+          - triple: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            install_musl: true
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross_linker: aarch64-linux-gnu-gcc
+          - triple: aarch64-apple-darwin
+            runner: macos-14
+          - triple: x86_64-pc-windows-msvc
+            runner: windows-latest
+            is_windows: true
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute SOURCE_DATE_EPOCH from HEAD
+        id: epoch
+        shell: bash
+        run: echo "value=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Install ARM64 Linux cross-linker
+        if: matrix.cross_linker == 'aarch64-linux-gnu-gcc'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+
+      - name: Install musl toolchain
+        if: matrix.install_musl == true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Write release-signing identity (Linux host job only)
+        id: identity
+        if: matrix.runner == 'ubuntu-latest' && matrix.triple == 'x86_64-unknown-linux-gnu'
+        env:
+          IDENTITY_TOML: ${{ secrets.VEIL_RELEASE_IDENTITY_TOML }}
+        run: |
+          mkdir -p $RUNNER_TEMP/release-key
+          umask 077
+          printf '%s' "$IDENTITY_TOML" > $RUNNER_TEMP/release-key/identity.toml
+          echo "path=$RUNNER_TEMP/release-key/identity.toml" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries (Unix)
+        if: matrix.is_windows != true
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_linker }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          ./scripts/build-release.sh \
+            --target ${{ matrix.triple }} \
+            --source-date-epoch ${{ steps.epoch.outputs.value }}
+
+      - name: Build release binaries (Windows)
+        if: matrix.is_windows == true
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.value }}
+          CARGO_INCREMENTAL: 0
+          RUSTFLAGS: '--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=C:\=/'
+        run: |
+          # Phase 6.50.b audit fix: switched от allow-empty-seeds к
+          # production-seeds.  Pre-fix а CI release artifact for Windows
+          # would be built without builtin seeds, producing а binary that
+          # won't bootstrap без manual peer config.  Now matches the
+          # Unix path through scripts/build-release.sh (which also
+          # defaults к production-seeds).  For testnet artifacts use
+          # а separate workflow that explicitly opts in.
+          cargo build --release --target ${{ matrix.triple }} --locked \
+            --bin veil-cli --bin ogate --bin oproxy-client --bin oproxy-server \
+            --features veil-bootstrap/production-seeds
+          stage="target/release-artifacts/${{ matrix.triple }}"
+          mkdir -p "$stage"
+          : > "$stage/sha256.txt"
+          for b in veil-cli ogate oproxy-client oproxy-server; do
+            src="target/${{ matrix.triple }}/release/${b}.exe"
+            cp "$src" "$stage/"
+            sha256sum "$stage/${b}.exe" | awk -v n="${b}.exe" '{print $1"  "n}' >> "$stage/sha256.txt"
+          done
+
+      - name: Sign manifest (host build only — has signing key)
+        if: steps.identity.outputs.path != ''
+        run: |
+          ./scripts/build-release.sh \
+            --target ${{ matrix.triple }} \
+            --source-date-epoch ${{ steps.epoch.outputs.value }} \
+            --sign \
+            --identity ${{ steps.identity.outputs.path }} \
+            --version ${{ inputs.version }} \
+            --min-compatible-version ${{ inputs.min_compatible_version }} \
+            --binary-url 'https://github.com/${{ github.repository }}/releases/download/v${{ inputs.version }}/veil-cli-${{ matrix.triple }}'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.triple }}
+          path: target/release-artifacts/${{ matrix.triple }}/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Rename per-triple для release upload
+        shell: bash
+        run: |
+          mkdir -p out/
+          for d in artifacts/release-*/; do
+            triple="$(basename "$d" | sed 's/^release-//')"
+            for f in "$d"/*; do
+              base="$(basename "$f")"
+              # veil-cli         → veil-cli-<triple>
+              # veil-cli.exe     → veil-cli-<triple>.exe
+              # sha256.txt          → sha256-<triple>.txt
+              # manifest.bin        → manifest-<triple>.bin
+              ext=""
+              stem="$base"
+              case "$base" in
+                *.exe) ext=".exe"; stem="${base%.exe}" ;;
+                *.txt) ext=".txt"; stem="${base%.txt}" ;;
+                *.bin) ext=".bin"; stem="${base%.bin}" ;;
+              esac
+              cp "$f" "out/${stem}-${triple}${ext}"
+            done
+          done
+          ls -la out/
+
+      - name: Attach к Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: Release v${{ inputs.version }}
+          draft: ${{ !inputs.release_existing }}
+          files: out/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

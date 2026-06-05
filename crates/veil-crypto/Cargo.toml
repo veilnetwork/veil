@@ -1,0 +1,37 @@
+[package]
+name = "veil-crypto"
+version = "0.1.0"
+edition = "2024"
+description = "Veil network cryptographic primitives: Ed25519/Falcon-512 signatures, X25519 + ML-KEM-768 X3DH key exchange, ChaCha20-Poly1305 AEAD session cipher, BLAKE3 hashing, PoW score. Phase 3 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[features]
+# Used by downstream crates (veilcore) so their #[cfg(test)] runs
+# inherit the low-difficulty PoW that veil-crypto's own #[cfg(test)]
+# uses.  Without this feature the default 24-bit difficulty turns
+# milliseconds-per-test into seconds-per-test.
+test-low-difficulty = []
+
+[dependencies]
+veil-error = { path = "../veil-error" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+base64 = "0.22"
+blake3 = "1.5"
+chacha20poly1305 = "0.10"
+ctrlc = "3.4"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hkdf = "0.12"
+hmac = "0.12"
+thiserror = "2.0"
+ml-kem = { version = "0.3.0-rc.1", features = ["getrandom"] }
+pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
+pqcrypto-traits = "0.3"
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1"
+
+[lints]
+workspace = true

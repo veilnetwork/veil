@@ -1,0 +1,20 @@
+[package]
+name = "veil-nat"
+version = "0.1.0"
+edition = "2024"
+description = "NAT traversal: ICE-style candidate discovery, UDP hole-punch, relay fallback. Phase 6 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-proto = { path = "../veil-proto" }
+veil-types = { path = "../veil-types" }
+
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+tokio = { version = "1.42", features = ["net", "sync", "rt", "time", "macros"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+rustls = "0.23"
+
+[lints]
+workspace = true

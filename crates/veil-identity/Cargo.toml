@@ -1,0 +1,48 @@
+[package]
+name = "veil-identity"
+version = "0.1.0"
+edition = "2024"
+description = "Sovereign identity for the Veil network — master seed (BIP39 mnemonic, Argon2id-encrypted at-rest file, QR backup share format), per-device instance state, and the full identity-document publish/verify/resolve flow.  Independent of DHT / transport / dispatcher; the production Kademlia publisher lives next to the runtime as veil_node_runtime::identity_local::publisher_dht."
+license = "AGPL-3.0-or-later"
+
+[features]
+# Mirrors `veil-proto`'s test-only PoW difficulty knob so downstream
+# crates can run `cargo test -p veil-identity --features test-low-difficulty`
+# without timing out on the production-tier name-claim difficulty.
+test-low-difficulty = ["veil-crypto/test-low-difficulty", "veil-proto/test-low-difficulty"]
+
+[dependencies]
+veil-crypto = { path = "../veil-crypto" }
+veil-dht = { path = "../veil-dht" }
+veil-error = { path = "../veil-error" }
+veil-proto = { path = "../veil-proto" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+argon2 = "0.5"
+async-trait = "0.1"
+base64 = "0.22"
+bip39 = { version = "2", default-features = false, features = ["std"] }
+blake3 = "1.5"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+log = "0.4"
+pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
+pqcrypto-traits = "0.3"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+subtle = "2"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["sync", "rt", "macros", "time", "io-util", "net"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1"
+
+[dev-dependencies]
+# Enable the test-low-difficulty feature for our own #[cfg(test)] runs
+# so resolver / sovereign tests don't have to wait for production-tier
+# PoW mining.
+veil-crypto = { path = "../veil-crypto", features = ["test-low-difficulty"] }
+veil-proto = { path = "../veil-proto", features = ["test-low-difficulty"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+[package]
+name = "veil-util"
+version = "0.1.0"
+edition = "2024"
+description = "Cross-cutting micro-utilities for the Veil network (atomic writes, hex encoding, retry helpers, leading-zero-bit counts)."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+# Zeroize-on-drop primitive for the `MlockedBytes` type.  Used
+# standalone for secret-key memory regions that must wipe
+# deterministically на drop, separate из the OS-level mlock guard.
+zeroize = "1"
+# Structured errors для `MlockedBytes`'s `MlockError` enum.
+thiserror = "2"
+# `log` facade — used by `SensitiveBytes` к warn once-per-process when
+# falling back от mlock к zeroize-only.  Daemon binaries route к stderr;
+# embedded builds use `env_logger` или а custom backend.
+log = "0.4"
+# CSPRNG for `atomic_write`'s tmp-file suffix — an UNpredictable name is
+# required so an attacker with write access к the parent dir cannot
+# pre-create the tmp path and capture a secret write (paired with O_EXCL).
+getrandom = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+# Used by `setsid_on_spawn` for daemon detachment on Unix.
+# Also used by `MlockedBytes` для `mlock(2)` / `munlock(2)`.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# `VirtualLock` / `VirtualUnlock` для `MlockedBytes`'s Windows backend.
+# Narrow feature gate — only the `Memory` namespace из Win32,
+# ≈ 30 KB extra compile time.  Matches the rust-msrv windows-sys
+# baseline (0.59 ара stable as of 2026-Q2).
+windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_Foundation"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

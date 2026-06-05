@@ -1,0 +1,25 @@
+[package]
+name = "veil-routing"
+version = "0.1.0"
+edition = "2024"
+description = "Veil routing primitives: route cache, Vivaldi coordinates, RTT probe table, neighbor scorer, route-discovery PoW, loss tracker. Phase 6 extraction from veilcore — leaf bits without session/dispatcher coupling."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-abuse = { path = "../veil-abuse" }
+veil-mesh = { path = "../veil-mesh" }
+veil-proto = { path = "../veil-proto" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+blake3 = "1.5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.42", features = ["sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1.0"
+
+[lints]
+workspace = true

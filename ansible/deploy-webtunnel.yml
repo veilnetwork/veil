@@ -1,0 +1,243 @@
+---
+# Deploy webtunnel-wss transport.
+#
+# Adds а webtunnel-wss listen alongside existing transports.  Each host
+# gets unique random secret_path + auth_token (per-host secrets reduce
+# blast radius if one leaks).  Decoy directory с а minimal neutral
+# index.html — operator can replace с richer decoy snapshot.
+#
+# Run:
+#   ansible-playbook -i inventory.yml deploy-webtunnel.yml \
+#     --extra-vars 'webtunnel_port=8443' --limit node1
+#
+# Each host gets DIFFERENT secret_path/auth_token.  The corresponding
+# client invite-bundle is saved к /tmp/webtunnel-invite-<host>.json on
+# the controller за каждый host.
+
+- name: Deploy webtunnel-wss transport
+  hosts: all
+  become: true
+  serial: 1
+  vars:
+    veil_bin_src: "{{ playbook_dir }}/../target/release/veil-cli"
+    webtunnel_port_default: 8443
+    webtunnel_decoy_dir: /var/lib/veil/webtunnel_decoy
+    webtunnel_auth_token_dest: /var/lib/veil/webtunnel_auth.b64
+
+  tasks:
+    - name: Generate per-host secret_path (32 random chars)
+      ansible.builtin.set_fact:
+        webtunnel_secret_path: "/_t/{{ lookup('community.general.random_string', length=32, special=false) | default(lookup('password', '/dev/null length=32 chars=ascii_letters,digits'), true) }}"
+
+    - name: Generate per-host auth token (32 random bytes base64)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell:
+        cmd: "openssl rand 32 | base64 -w 0"
+      register: token_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Save invite-bundle для this host on controller (DEBUG ONLY)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        dest: "/tmp/webtunnel-invite-{{ inventory_hostname }}.json"
+        mode: "0600"
+        content: |
+          {
+            "host": "{{ inventory_hostname }}",
+            "ansible_host": "{{ ansible_host }}",
+            "transport": "webtunnel-wss://{{ ansible_host }}:{{ webtunnel_port | default(webtunnel_port_default) }}",
+            "secret_path": "{{ webtunnel_secret_path }}",
+            "auth_token_b64": "{{ token_raw.stdout }}",
+            "generated_at": "{{ ansible_date_time.iso8601 }}"
+          }
+
+    - name: Verify veil-cli binary present on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ veil_bin_src }}"
+      register: bin_stat
+
+    - name: Fail if binary missing
+      ansible.builtin.fail:
+        msg: |
+          Missing {{ veil_bin_src }}.  Build first с:
+          `cargo build --release -p veilcore --bin veil-cli --features allow-empty-seeds`
+      when: not bin_stat.stat.exists
+
+    - name: Push binary (in case older one missing webtunnel)
+      ansible.builtin.copy:
+        src: "{{ veil_bin_src }}"
+        dest: /usr/local/bin/veil-cli
+        owner: root
+        group: root
+        mode: "0755"
+      register: binary_copy
+
+    - name: Push auth_token file
+      ansible.builtin.copy:
+        content: "{{ token_raw.stdout }}\n"
+        dest: "{{ webtunnel_auth_token_dest }}"
+        owner: veil
+        group: veil
+        mode: "0600"
+
+    - name: Ensure decoy directory exists
+      ansible.builtin.file:
+        path: "{{ webtunnel_decoy_dir }}"
+        state: directory
+        owner: veil
+        group: veil
+        mode: "0755"
+
+    - name: Install minimal decoy index.html
+      ansible.builtin.copy:
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>Status</title>
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+          </head>
+          <body>
+            <h1>Server status</h1>
+            <p>All systems operational.</p>
+            <ul>
+              <li>Uptime: monitoring active</li>
+              <li>Last check: recent</li>
+            </ul>
+          </body>
+          </html>
+        dest: "{{ webtunnel_decoy_dir }}/index.html"
+        owner: veil
+        group: veil
+        mode: "0644"
+
+    - name: Ensure [transport] section exists в node.toml
+      ansible.builtin.shell:
+        cmd: |
+          if ! grep -qE '^\[transport\]$' /var/lib/veil/node.toml; then
+            printf '\n[transport]\n' >> /var/lib/veil/node.toml
+          fi
+
+    - name: Configure webtunnel_secret_path
+      ansible.builtin.lineinfile:
+        path: /var/lib/veil/node.toml
+        regexp: '^webtunnel_secret_path\s*='
+        line: 'webtunnel_secret_path = "{{ webtunnel_secret_path }}"'
+        insertafter: '^\[transport\]$'
+
+    - name: Configure webtunnel_auth_token_file
+      ansible.builtin.lineinfile:
+        path: /var/lib/veil/node.toml
+        regexp: '^webtunnel_auth_token_file\s*='
+        line: 'webtunnel_auth_token_file = "{{ webtunnel_auth_token_dest }}"'
+        insertafter: '^webtunnel_secret_path = '
+
+    - name: Configure webtunnel_decoy_dir
+      ansible.builtin.lineinfile:
+        path: /var/lib/veil/node.toml
+        regexp: '^webtunnel_decoy_dir\s*='
+        line: 'webtunnel_decoy_dir = "{{ webtunnel_decoy_dir }}"'
+        insertafter: '^webtunnel_auth_token_file = '
+
+    - name: Stage Python script с new listen-entry data
+      ansible.builtin.copy:
+        dest: /tmp/_veil_listen_add.py
+        mode: "0755"
+        content: |
+          #!/usr/bin/env python3
+          import re, sys
+          path = "/var/lib/veil/node.toml"
+          host_ip = sys.argv[1]
+          port = sys.argv[2]
+          with open(path) as f:
+              src = f.read()
+          if 'webtunnel-wss://' in src:
+              print("already configured")
+          else:
+              new_entry = (
+                  ',\n  { id = "0x00000003", transport = "webtunnel-wss://0.0.0.0:' + port + '", '
+                  'advertise = "webtunnel-wss://' + host_ip + ':' + port + '" }'
+              )
+              pattern = re.compile(r'((?:^|\n)listen\s*=\s*\[.*?)(\n\])', re.DOTALL)
+              m = pattern.search(src)
+              if not m:
+                  sys.exit("could not locate listen= [...] block")
+              new_src = src[:m.start(2)] + new_entry + src[m.start(2):]
+              with open(path, "w") as f:
+                  f.write(new_src)
+              print("added")
+
+    - name: Add webtunnel-wss listen entry (if missing)
+      ansible.builtin.shell:
+        cmd: |
+          python3 /tmp/_veil_listen_add.py \
+            "{{ ansible_host }}" \
+            "{{ webtunnel_port | default(webtunnel_port_default) }}"
+        executable: /bin/bash
+      register: listen_result
+
+    - name: Cleanup staged script
+      ansible.builtin.file:
+        path: /tmp/_veil_listen_add.py
+        state: absent
+
+    - name: Show listen entry result
+      ansible.builtin.debug:
+        var: listen_result.stdout
+
+    - name: Restart veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait для metrics endpoint
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:19999/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Show wait result
+      ansible.builtin.debug:
+        var: wait_result.stdout
+
+    - name: Verify webtunnel-wss socket bound
+      ansible.builtin.shell:
+        cmd: ss -tlnp 'sport = :{{ webtunnel_port | default(webtunnel_port_default) }}' | grep -c LISTEN || true
+      register: sock_check
+      changed_when: false
+
+    - name: Show socket check
+      ansible.builtin.debug:
+        msg: "webtunnel listener на :{{ webtunnel_port | default(webtunnel_port_default) }}: {{ sock_check.stdout }}"
+
+    - name: Fail если socket not bound
+      ansible.builtin.fail:
+        msg: "webtunnel-wss listener did NOT bind на {{ webtunnel_port | default(webtunnel_port_default) }}"
+      when: sock_check.stdout | int < 1
+
+    - name: Check journal для errors
+      ansible.builtin.shell:
+        cmd: |
+          journalctl -u veil.service --since "2 minutes ago" --no-pager | \
+            grep -E "panic|webtunnel|FATAL|error" | tail -5
+      register: journal
+      changed_when: false
+
+    - name: Show journal
+      ansible.builtin.debug:
+        msg: "{{ journal.stdout_lines | default(['(clean)']) }}"

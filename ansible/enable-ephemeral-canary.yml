@@ -1,0 +1,203 @@
+---
+# Phase 5f Step 3c — canary playbook to enable ephemeral-port rotation
+# on ONE testnet node.  Conservative defaults (10-minute rotation, narrow
+# port range) for quick observability — after the canary soak completes
+# successfully, re-run for the rest of the fleet with relaxed timings.
+#
+# Idempotent: skips если [listen.ephemeral] block already present in
+# /var/lib/veil/node.toml.
+#
+# Run:
+#   ansible-playbook -i inventory.yml enable-ephemeral-canary.yml \
+#     --limit node1
+#
+# Override defaults at runtime:
+#   --extra-vars 'eph_range_lo=51000 eph_range_hi=52000 eph_rotation=5m'
+
+- name: Enable ephemeral-port rotation on canary node
+  hosts: all
+  become: true
+  serial: 1
+  vars:
+    # Default canary settings — short rotation для quick feedback в
+    # the test window.  Tune to "1h" / "30m" grace for production.
+    eph_range_lo: 51000
+    eph_range_hi: 51999
+    eph_rotation: "10m"
+    eph_grace_period: "5m"
+    eph_bind_retries: 64
+    # Listener ID to attach the [listen.ephemeral] block к. Must
+    # match an existing [[listen]] entry's id.  Default = 0x00000002
+    # (the obfs4-tcp entry в the standard testnet layout).
+    eph_listen_id: "0x00000002"
+
+  tasks:
+    - name: Sanity — listener with target id must exist
+      ansible.builtin.shell:
+        cmd: |
+          grep -c 'id\s*=\s*"{{ eph_listen_id }}"' /var/lib/veil/node.toml || true
+      register: target_exists
+      changed_when: false
+
+    - name: Fail если target listener missing
+      ansible.builtin.fail:
+        msg: >-
+          Listener id={{ eph_listen_id }} not found в node.toml.
+          Check the listen-table OR override --extra-vars 'eph_listen_id=...'.
+      when: target_exists.stdout | int < 1
+
+    - name: Check if [listen.ephemeral] already configured
+      ansible.builtin.shell:
+        cmd: grep -c '^\[listen\.ephemeral\]' /var/lib/veil/node.toml || true
+      register: existing_eph
+      changed_when: false
+
+    - name: Skip already-configured hosts
+      ansible.builtin.meta: end_host
+      when: existing_eph.stdout | int > 0
+
+    - name: Capture journal baseline (pre-change)
+      ansible.builtin.shell:
+        cmd: |
+          journalctl -u veil.service --since "5 minutes ago" --no-pager \
+            | grep -cE "session.violation|rekey_grace_cap_evictions" || true
+      register: baseline_journal
+      changed_when: false
+
+    # Append the [listen.ephemeral] block к the end of node.toml.
+    # А separate table block — no need to splice into the [[listen]]
+    # array (TOML's `listen.ephemeral` syntax associates с the most
+    # recently declared [[listen]] entry whose id matches the
+    # `attached_to` comment, but we keep things simple by
+    # appending and letting the toml parser flatten the keys).
+    #
+    # NB: the actual binding между [listen.ephemeral] и а specific
+    # [[listen]] entry is done VIA TOML INLINE TABLE.  Здесь мы
+    # rewrite the matched [[listen]] entry, инлайня the ephemeral
+    # table.
+    - name: Inject ephemeral block into the matched [[listen]] entry
+      ansible.builtin.shell:
+        cmd: |
+          python3 << 'PYEOF'
+          import sys, re
+          path = "/var/lib/veil/node.toml"
+          target_id = "{{ eph_listen_id }}"
+          eph_block = '''
+          ephemeral = { range = [{{ eph_range_lo }}, {{ eph_range_hi }}], rotation = "{{ eph_rotation }}", grace_period = "{{ eph_grace_period }}", bind_retries = {{ eph_bind_retries }} }'''
+
+          with open(path) as f:
+              src = f.read()
+
+          # Find the [[listen]] entry that contains id = "{target_id}".
+          # Strategy: regex для inline-table form
+          # `{ id = "..." , transport = "..." [, ...] }` AND multi-line
+          # `[[listen]] ...` form.  Testnet uses INLINE form (one-line per
+          # listener inside the top-level `listen = [...]` array), so we
+          # match that первое.
+
+          # Match the inline table containing the target id; replace its
+          # closing `}` с `, ephemeral = {...} }`.
+          inline_re = re.compile(
+              r'(\{\s*id\s*=\s*"' + re.escape(target_id) + r'"[^}]*?)\}',
+              re.MULTILINE | re.DOTALL,
+          )
+          m = inline_re.search(src)
+          if not m:
+              sys.stderr.write(f"ERROR: could not locate inline [[listen]] entry с id={target_id}\n")
+              sys.exit(1)
+          inline_eph = ', ephemeral = { range = [{{ eph_range_lo }}, {{ eph_range_hi }}], rotation = "{{ eph_rotation }}", grace_period = "{{ eph_grace_period }}", bind_retries = {{ eph_bind_retries }} }'
+          new_src = src[:m.end(1)] + inline_eph + " }" + src[m.end():]
+          with open(path, "w") as f:
+              f.write(new_src)
+          print("ok")
+          PYEOF
+        executable: /bin/bash
+      register: inject_result
+
+    - name: Show inject result
+      ansible.builtin.debug:
+        var: inject_result.stdout
+
+    - name: Restart veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait для metrics endpoint
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:{{ metrics_port }}/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Show wait result
+      ansible.builtin.debug:
+        var: wait_result.stdout
+
+    - name: Check veil.log для rotation.spawned log
+      ansible.builtin.shell:
+        # Veil daemon writes к /var/log/veil/veil.log, не journald.
+        # journalctl only carries systemd-side restart events.  Tail the
+        # rotated current log file directly.
+        cmd: |
+          grep -aE "listen\\.rotation|listen\\.swap|session\\.violation|panic|error" \
+            /var/log/veil/veil.log | tail -30
+      register: journal
+      changed_when: false
+
+    - name: Show journal
+      ansible.builtin.debug:
+        msg: "{{ journal.stdout_lines }}"
+
+    - name: Fail если journal shows panic
+      ansible.builtin.fail:
+        msg: "PANIC in journal — rotator wiring failed.  Revert immediately."
+      when: "'panic' in (journal.stdout | lower)"
+
+    - name: Confirm `listen.rotation.spawned` log present
+      ansible.builtin.shell:
+        cmd: |
+          grep -aE "listen\\.rotation\\.spawned" /var/log/veil/veil.log \
+            | tail -3 | grep -c "listen.rotation.spawned" || true
+      register: rotation_log
+      changed_when: false
+
+    - name: Show rotation log count
+      ansible.builtin.debug:
+        msg: "listen.rotation.spawned event count: {{ rotation_log.stdout }}"
+
+    - name: Fail если rotator did NOT start
+      ansible.builtin.fail:
+        msg: >-
+          listen.rotation.spawned event missing from journal.
+          Likely cause: identity is не Ed25519, или ephemeral block
+          parsing failed.  Inspect `/var/lib/veil/node.toml` + journal.
+      when: rotation_log.stdout | int < 1
+
+    - name: Print follow-up instructions
+      ansible.builtin.debug:
+        msg: |
+          ✅ Canary enabled на {{ inventory_hostname }}.
+
+          Wait one rotation cycle ({{ eph_rotation }}) + grace ({{ eph_grace_period }})
+          then check:
+
+          1. `ss -tlnp 'sport >= :{{ eph_range_lo }} sport <= :{{ eph_range_hi }}'`
+             should show а LISTEN socket in the configured range.
+          2. journalctl: `listen.rotation.swap_sent`, `listen.swap` events
+             at each rotation tick.
+          3. Other nodes должны log `session.migration.notify.applied`
+             pointing к this host's new ephemeral port.
+          4. `active_sessions` metric стays stable — no session drops.
+
+          Revert command если something goes wrong:
+              ansible-playbook -i inventory.yml revert-ephemeral-canary.yml \
+                --limit {{ inventory_hostname }}

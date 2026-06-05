@@ -1,0 +1,143 @@
+---
+# Remove the legacy `tcp://...:5555` listen entry, leaving only
+# `obfs4-tcp://...:5556`.  After this playbook, the node accepts ONLY
+# obfs4-handshake connections.
+#
+# IMPORTANT: run AFTER `switch-bootstraps-to-obfs4.yml` is applied
+# everywhere — otherwise external peers що hold а stale tcp:// URI
+# (via PEX gossip) won't be able к reach this node.
+#
+# Run:
+#   ansible-playbook -i inventory.yml drop-tcp-listener.yml --limit all
+
+- name: Drop tcp:// listen entry, leaving obfs4-tcp:// only
+  hosts: all
+  become: true
+  serial: 1
+
+  tasks:
+    - name: Check if tcp:// listen entry still present
+      ansible.builtin.shell:
+        cmd: |
+          # Multi-line listen= block; check for `transport = "tcp://...`
+          # inside the block (not bootstrap_peers — those are already
+          # rewritten к obfs4-tcp by switch-bootstraps playbook).
+          python3 << 'PYEOF'
+          path = "/var/lib/veil/node.toml"
+          with open(path) as f:
+              src = f.read()
+          # Find the listen= [...] block — top-level only.
+          import re
+          m = re.search(r'^listen\s*=\s*\[(.*?)\n\]', src, re.DOTALL | re.MULTILINE)
+          if not m:
+              # Single-line case: `listen = [{...}]`.
+              m = re.search(r'^listen\s*=\s*\[(.*?)\]$', src, re.MULTILINE)
+          if not m:
+              print("no-listen-block")
+          else:
+              block = m.group(1)
+              has_tcp = 'tcp://' in block and 'obfs4-tcp://' in block and block.count('tcp://') > block.count('obfs4-tcp://')
+              print("has-tcp" if has_tcp else "obfs4-only")
+          PYEOF
+        executable: /bin/bash
+      register: check_result
+      changed_when: false
+
+    - name: Skip если already obfs4-only
+      ansible.builtin.meta: end_host
+      when: check_result.stdout != "has-tcp"
+
+    - name: Drop the tcp:// listen entry
+      ansible.builtin.shell:
+        cmd: |
+          python3 << 'PYEOF'
+          import re
+          path = "/var/lib/veil/node.toml"
+          with open(path) as f:
+              src = f.read()
+          # Match the multi-line listen= block, drop entries що have
+          # `transport = "tcp://...:5555"`, keep obfs4-tcp:// entries.
+          listen_pattern = re.compile(r'^(listen\s*=\s*\[)(.*?)(\n\])', re.DOTALL | re.MULTILINE)
+          def filter_entries(m):
+              prefix, body, suffix = m.group(1), m.group(2), m.group(3)
+              # Split body into entries by `},` boundary; keep only
+              # those containing obfs4-tcp://.
+              entries = re.split(r'(?<=\}),\s*\n', body)
+              kept = [e for e in entries if 'obfs4-tcp://' in e]
+              new_body = ',\n'.join(kept)
+              return prefix + new_body + suffix
+          new_src = listen_pattern.sub(filter_entries, src)
+          if new_src == src:
+              print("no-change")
+          else:
+              with open(path, "w") as f:
+                  f.write(new_src)
+              print("done")
+          PYEOF
+        executable: /bin/bash
+      register: drop_result
+
+    - name: Show drop result
+      ansible.builtin.debug:
+        var: drop_result.stdout
+
+    - name: Restart veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait для metrics endpoint
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:19999/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Show wait result
+      ansible.builtin.debug:
+        var: wait_result.stdout
+
+    - name: Verify tcp:5555 socket no longer bound
+      ansible.builtin.shell:
+        cmd: ss -tlnp 'sport = :5555' | grep -c LISTEN || true
+      register: sock_5555
+      changed_when: false
+
+    - name: Verify obfs4 (5556) still bound
+      ansible.builtin.shell:
+        cmd: ss -tlnp 'sport = :5556' | grep -c LISTEN || true
+      register: sock_5556
+      changed_when: false
+
+    - name: Show socket state
+      ansible.builtin.debug:
+        msg: "5555: {{ sock_5555.stdout }}  5556: {{ sock_5556.stdout }}"
+
+    - name: Wait для live veil session
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 30); do
+            n=$(curl -sS http://127.0.0.1:19999/metrics 2>/dev/null | \
+                grep '^veil_state_live_sessions ' | awk '{print $2}')
+            if [ -n "$n" ] && [ "$n" -gt 0 ]; then
+              echo "sessions=${n} after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "no live sessions after 30s"
+          exit 1
+      register: sess_check
+      changed_when: false
+
+    - name: Show sessions check
+      ansible.builtin.debug:
+        var: sess_check.stdout

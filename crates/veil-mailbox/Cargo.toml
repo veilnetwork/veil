@@ -1,0 +1,29 @@
+[package]
+name = "veil-mailbox"
+version = "0.1.0"
+edition = "2024"
+description = "Relay-side store-and-forward mailbox for offline message delivery. Phase 6.49 T1.4 P1, Epic 489.10."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-bloom = { path = "../veil-bloom" }
+
+# Phase 6.50.b #316 slice 1: capability tokens — receiver-signed cookies
+# that gate sender access к the mailbox PUT endpoint.  blake3 binds the
+# token к а `node_id` (BLAKE3 of issuer pubkey); ed25519-dalek и
+# pqcrypto-falcon verify the signature.  Verify-only code path в this
+# crate (~50 LoC); avoids а fat edge к veil-identity для what is
+# functionally а small standalone primitive.
+blake3 = "1.5"
+ed25519-dalek = { version = "2", features = ["std"] }
+pqcrypto-falcon = "0.4"
+pqcrypto-traits = "0.3"
+redb = "2"
+thiserror = "2.0"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

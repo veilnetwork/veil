@@ -1,0 +1,31 @@
+# Workspace-level cargo config.
+#
+# GCC 15 / clang 21 default to a stricter C/C++ frontend that rejects
+# transitively-included headers like rocksdb's `trace_record.h` which
+# uses `uint64_t` without `#include <cstdint>`.  Until we update the
+# `rocksdb` crate to a release that fixed those upstream patches
+# (>= rocksdb 0.23 / librocksdb-sys 0.17), force-include `<cstdint>` and
+# `<cstring>` for every C++ TU compiled by cc-rs build scripts.  The
+# matching CFLAGS injection avoids similar fallout in C-only sys crates
+# (blake3, ring, pqcrypto-internals) when their headers regress.
+[env]
+CC = "clang"
+CXX = "clang++"
+CXXFLAGS = "-include cstdint -include cstring"
+
+# Strip absolute build paths from binaries:
+#   * `file!()` panic locations no longer leak `/home/<user>/...`
+#   * cargo registry paths become `cargo-registry/...`
+#   * rustc-source paths get short alias
+#
+# Saves ~100-300 KB on а 15 MB release binary (depends on how many
+# panic sites the dep tree triggers) и + reproducible builds across
+# developers / CI workers.
+#
+# Note: `-Z trim-paths=all` (nightly) would supersede these once stabilised.
+[build]
+rustflags = [
+    "--remap-path-prefix=/home/claude=~",
+    "--remap-path-prefix=/home/claude/.cargo/registry/src=cargo-registry",
+    "--remap-path-prefix=/home/claude/.rustup/toolchains=rustc-toolchain",
+]

@@ -1,0 +1,18 @@
+[package]
+name = "veil-error"
+version = "0.1.0"
+edition = "2024"
+description = "Shared error type for the Veil network — ConfigError enum (legacy name; covers config + crypto + identity + ad-hoc command failures) plus the canonical Result alias.  Tier 0 leaf crate: every upper layer that returns errors depends on this one type."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+# Versions MUST match veilcore's deps so #[from] impls produce the
+# same `toml::de::Error` / etc types that callers in veilcore see —
+# otherwise `?` operator fails с "From not implemented".
+thiserror = "2.0"
+base64 = "0.22"
+toml = "0.9"
+serde_json = "1.0"
+
+[lints]
+workspace = true

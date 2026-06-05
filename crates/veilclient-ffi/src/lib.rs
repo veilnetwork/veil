@@ -1,0 +1,5302 @@
+//! C-FFI surface around `veilclient`.
+//!
+//! Exposes the veil client SDK as a stable C ABI so non-Rust hosts
+//! (Flutter via `dart:ffi`, Kotlin/Swift via `cinterop`/`Cgo`) can drive
+//! the network without needing a Rust-side wrapper per platform.
+//!
+//! # Threading & async model
+//!
+//! Each [`VeilHandle`] owns a private multi-threaded Tokio runtime.
+//! All async work runs there; the FFI surface is synchronous (every
+//! entry point either `block_on`s or spawns a detached task).
+//!
+//! Recv callbacks are invoked from a tokio worker thread. Hosts that
+//! need to deliver back to a single-threaded UI loop must marshal
+//! across the boundary themselves (in Dart, use `NativeCallable.listener`
+//! so the callback wakes the isolate even from a worker thread).
+//!
+//! # Memory ownership
+//!
+//! All returned opaque pointers are owned by the caller until released
+//! via the corresponding `*_close` function. Outstanding [`VeilApp`]
+//! and [`VeilStreamFfi`] objects each hold a strong reference to the
+//! parent runtime via an internal `Arc`, so calling [`veil_close`]
+//! does not abruptly tear down the runtime — it merely releases the
+//! caller's handle. The runtime is dropped only when the last app /
+//! stream is closed.
+//!
+//! Returned C strings (error messages) are heap-allocated; the caller
+//! MUST free them with [`veil_free_string`].
+//!
+//! Every pointer parameter is null-checked before dereference. Passing
+//! a freed or invalid pointer is undefined behaviour.
+//!
+//! # Error model
+//!
+//! Fallible functions take a `char** err_out`:
+//! * On success, `*err_out = NULL`.
+//! * On error, `*err_out` is set to a heap-allocated UTF-8 message.
+
+#![allow(clippy::missing_safety_doc)]
+// `veilclient-ffi` exposes types (`AppHandle`, `VeilClient`,
+// `MailboxBlobInfo`, …) that are themselves `#[cfg(unix)]`-gated in the
+// upstream `veilclient` crate (Unix-domain-socket IPC).  Mobile FFI
+// builds target iOS / Android (both Unix-family), so gating the whole
+// crate on `cfg(unix)` keeps the workspace `cargo check --target
+// x86_64-pc-windows-gnu` gate green without breaking any actual
+// downstream consumer.
+#![cfg(unix)]
+
+use std::collections::HashSet;
+use std::ffi::CString;
+use std::os::raw::{c_char, c_int};
+use std::ptr;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+// Phase 6.49 unified FFI boundary helpers.  See module-level doc для
+// migration plan; new FFI fns use these directly, existing fns
+// migrate opportunistically when touched.
+pub(crate) mod guard;
+
+use libc::{size_t, ssize_t};
+use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex as TokioMutex;
+use veilclient::{
+    AppHandle, AppReceiver, AppSender, ClientError, IncomingMessage, VeilClient,
+    VeilStream as SdkStream,
+};
+
+// ── Status constants ─────────────────────────────────────────────────────────
+
+/// Operation succeeded.
+pub const VEIL_OK: c_int = 0;
+/// Generic error (see `err_out` for detail).
+pub const VEIL_ERR: c_int = -1;
+/// A required pointer parameter was NULL or invalid UTF-8.
+pub const VEIL_ERR_INVALID_ARG: c_int = -2;
+/// The handle / app / stream has already been closed.
+pub const VEIL_ERR_CLOSED: c_int = -3;
+/// the FFI call was made from inside a Tokio
+/// runtime worker thread (e.g. from a recv-handler callback). Calling
+/// a `block_on` or `blocking_lock` FFI entry point from such a context
+/// would deadlock the worker. Hosts that need to perform another FFI
+/// operation from a callback must dispatch it to a different thread
+/// (e.g. main UI thread, dedicated worker pool).
+pub const VEIL_ERR_REENTRANT: c_int = -4;
+
+/// hard cap on `data` byte length accepted by
+/// FFI calls that allocate from caller-supplied len. Mirrors the
+/// daemon's `MAX_FRAME_BODY` (16 MiB) so an attacker — or buggy
+/// caller — passing а huge `len` к [`veil_send`] gets а clean
+/// `VEIL_ERR_INVALID_ARG` instead of triggering an allocation
+/// large enough к hard-OOM the host process.
+pub const VEIL_MAX_DATA_LEN: size_t = 16 * 1024 * 1024;
+
+// ── Internal types ───────────────────────────────────────────────────────────
+
+/// Shared runtime + client state. Held by `Arc` so that apps and
+/// streams keep the runtime alive even [`veil_close`].
+struct RuntimeBundle {
+    /// `ManuallyDrop` so [`RuntimeBundle`]'s `Drop` impl can choose HOW to
+    /// tear the runtime down (audit U4). Dereferences transparently, so all
+    /// `bundle.runtime.block_on(...)` / `.spawn(...)` call sites are unchanged.
+    runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
+    client: TokioMutex<VeilClient>,
+    ///.4 P2: cached mailbox-fetch result between
+    /// [`veil_mailbox_fetch_count`] (which fetches and caches) and
+    /// [`veil_mailbox_fetch_into`] (which copies into caller-managed
+    /// buffers and clears). Single-shot; a second fetch_count
+    /// overwrites. `std::sync::Mutex` is fine — accessed only from
+    /// the FFI thread, never inside the runtime.
+    pending_mailbox_fetch: StdMutex<Option<Vec<veilclient::MailboxBlobInfo>>>,
+}
+
+impl Drop for RuntimeBundle {
+    fn drop(&mut self) {
+        // SAFETY: `drop` runs exactly once per value; we take the Runtime out
+        // of the `ManuallyDrop` here and never touch the field again.
+        let rt = unsafe { std::mem::ManuallyDrop::take(&mut self.runtime) };
+        if in_tokio_runtime() {
+            // The last `Arc<RuntimeBundle>` is being released from INSIDE one
+            // of the runtime's own worker threads — e.g. the host called
+            // `veil_*_close` from a recv/event callback (those run on a
+            // worker thread) and that handle/app/stream held the last Arc.
+            // Dropping a multi-thread Tokio runtime in that context panics
+            // ("Cannot drop a runtime in a context where blocking is not
+            // allowed"); under the release `panic = "abort"` profile that
+            // aborts the host process. Tear the runtime down WITHOUT blocking
+            // instead — `shutdown_background` is safe to call from a worker
+            // thread and does not join the current one (audit U4).
+            rt.shutdown_background();
+        } else {
+            // Normal path: drop on a non-worker (FFI/host) thread runs the
+            // default blocking shutdown, which joins the worker threads.
+            drop(rt);
+        }
+    }
+}
+
+// ── Live-handle registry (double-free / double-close guard) ───────────────────
+//
+// Dart's GC is nondeterministic; combined с `NativeFinalizer` it is easy to
+// get a situation where `veil_close` / `veil_app_close` /
+// `veil_stream_close` is called twice on the same pointer. A naïve second
+// `Box::from_raw` reinterprets freed memory as a live struct → UB → potential
+// RCE.
+//
+// The PREVIOUS guard embedded an `AtomicU32` sentinel INSIDE each struct and
+// read it back through the pointer (`(*handle).magic`) before `Box::from_raw`.
+// That read is itself UB on already-freed memory (audit cycle-7 M1) — it only
+// happened to work while the allocator had not yet reused the slot.
+//
+// Instead we track the set of LIVE handle addresses in an external, per-type
+// registry. The close path checks membership by integer address WITHOUT ever
+// dereferencing the (possibly dangling) pointer — `ptr as usize` is a
+// well-defined cast even for a freed pointer, unlike a deref. A double-close /
+// already-freed / garbage pointer is therefore a safe no-op: `unregister`
+// returns `false` and we never reconstruct the `Box`.
+//
+// Residual: if the allocator reuses a freed address for a NEW handle of the
+// SAME type before a stale close of the OLD handle lands (classic ABA), the
+// registry cannot distinguish them — full immunity needs monotonic handle IDs
+// (an ABI change). This matches the prior sentinel's residual exactly; hosts
+// must still guarantee single-close (Dart `NativeFinalizer`, Swift `deinit`).
+// Per-type registries additionally turn a cross-type pointer mix-up (e.g. an
+// `VeilHandle*` passed to `veil_app_close`) into a safe no-op rather than
+// a type-confused free.
+
+fn handle_registry() -> &'static StdMutex<HashSet<usize>> {
+    static REG: OnceLock<StdMutex<HashSet<usize>>> = OnceLock::new();
+    REG.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn app_registry() -> &'static StdMutex<HashSet<usize>> {
+    static REG: OnceLock<StdMutex<HashSet<usize>>> = OnceLock::new();
+    REG.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn stream_registry() -> &'static StdMutex<HashSet<usize>> {
+    static REG: OnceLock<StdMutex<HashSet<usize>>> = OnceLock::new();
+    REG.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+/// Record `addr` as a live handle. Called on every successful create, with the
+/// raw pointer returned to the caller.
+fn register_handle(reg: &StdMutex<HashSet<usize>>, addr: usize) {
+    if let Ok(mut set) = reg.lock() {
+        set.insert(addr);
+    }
+}
+
+/// Atomically remove `addr` from the live set. Returns `true` iff it WAS live
+/// (so the caller may now reconstruct + drop the `Box`); `false` for a
+/// double-close / already-freed / garbage / wrong-type pointer — in which case
+/// the caller MUST NOT dereference it. A poisoned lock fails safe (`false`):
+/// leaking is preferable to a double-free.
+#[must_use]
+fn unregister_handle(reg: &StdMutex<HashSet<usize>>, addr: usize) -> bool {
+    match reg.lock() {
+        Ok(mut set) => set.remove(&addr),
+        Err(_) => false,
+    }
+}
+
+/// Non-destructive membership probe used by the USE-path guard (audit M-2).
+/// Returns `true` iff `addr` is currently a LIVE handle of this registry's
+/// type. Unlike [`unregister_handle`] this does NOT remove the address, so it
+/// is safe to call on every dereference. A poisoned lock fails CLOSED
+/// (`false` → "treat as not-live"): an FFI panic would be UB on the C side, and
+/// reporting a live handle as dead degrades to a clean `VEIL_ERR_INVALID_ARG`
+/// rather than risking a use-after-free, which is the safe direction.
+#[must_use]
+fn is_registered(reg: &StdMutex<HashSet<usize>>, addr: usize) -> bool {
+    reg.lock().map(|s| s.contains(&addr)).unwrap_or(false)
+}
+
+/// USE-path liveness guard (audit M-2): assert a raw handle/app/stream pointer
+/// is still LIVE in its matching registry BEFORE dereferencing it, turning a
+/// use-after-close (host calls a method with an already-closed pointer) from
+/// undefined behaviour into a clean error return.
+///
+/// `$reg`     — the matching registry (`handle_registry()` / `app_registry()` /
+///              `stream_registry()`); `$ptr` MUST have been created and closed
+///              against THIS registry for the guard to be meaningful.
+/// `$ptr`     — the raw pointer about to be dereferenced (already null-checked
+///              by the surrounding fn's `null_check!`).
+/// `$err_out` — the fn's `err_out` slot, or `ptr::null_mut()` for fns without
+///              one (`write_err` no-ops on a NULL slot).
+/// `$ret`     — the value to return on failure; MUST match the value the
+///              surrounding fn's null-check returns (`VEIL_ERR_INVALID_ARG`,
+///              `VEIL_ERR_INVALID_ARG as ssize_t`, `ptr::null_mut()`, `0`…).
+/// `$what`    — the opaque type name for the diagnostic string.
+///
+/// Membership is checked by integer address WITHOUT dereferencing `$ptr`, so an
+/// unregistered (never-registered or registered-then-unregistered) address is
+/// rejected before any load — the guard is the security property even when the
+/// underlying allocation was already freed.
+macro_rules! live_or_return {
+    ($reg:expr, $ptr:expr, $err_out:expr, $ret:expr, $what:literal) => {{
+        // Expand metavariables into a safe scope before the unsafe `write_err`
+        // (mirrors the `null_check!` pattern; satisfies
+        // clippy::macro_metavars_in_unsafe).
+        let reg_ref = $reg;
+        let addr = $ptr as usize;
+        if !$crate::is_registered(reg_ref, addr) {
+            let err_out_ref = $err_out;
+            unsafe {
+                $crate::write_err(
+                    err_out_ref,
+                    concat!($what, ": use-after-close or unknown handle"),
+                );
+            }
+            return $ret;
+        }
+    }};
+}
+
+/// Opaque connection handle returned by [`veil_connect`].
+///
+/// Wraps a strong `Arc` over [`RuntimeBundle`]; cloning an internal `Arc`
+/// from this is what allows apps and streams to outlive the caller's
+/// own `VeilHandle*` if they so choose (although the typical pattern
+/// is to keep the handle alive for the whole session).
+pub struct VeilHandle {
+    bundle: Arc<RuntimeBundle>,
+    /// `Some` once a push-event handler is installed via
+    /// [`veil_set_event_handler`]. Aborted on
+    /// [`veil_close`] or replaced on subsequent
+    /// `set_event_handler` calls.
+    event_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// Opaque app endpoint.
+///
+/// split into a `AppSender` (always present
+/// while the app is bound) and an optional `AppReceiver` (moved out
+/// when `set_recv_handler` installs the recv loop). Previously we
+/// stored a single `Option<AppHandle>` and `set_recv_handler` did a
+/// `take`, which left `veil_send` permanently returning
+/// `VEIL_ERR_CLOSED` despite the daemon-side binding still being
+/// alive — directly contradicting the documented contract. Now
+/// `veil_send` always works through the still-resident `AppSender`
+/// regardless of whether a recv handler is installed.
+pub struct VeilApp {
+    bundle: Arc<RuntimeBundle>,
+    sender: TokioMutex<Option<AppSender>>,
+    receiver: TokioMutex<Option<AppReceiver>>,
+    /// `app_id` cached at bind time so callers can read it after the
+    /// receiver has been moved into a recv loop.
+    app_id: [u8; 32],
+    endpoint_id: u32,
+    /// `Some` once the (single, persistent) recv task is spawned; aborted on
+    /// app close. Audit cycle-6 (P6): spawned at most once — `set_recv_handler`
+    /// re-entry swaps `recv_cb` rather than aborting/respawning.
+    recv_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Swappable recv callback the persistent recv task dispatches to. `None`
+    /// means "no handler currently installed" → messages are dropped.
+    recv_cb: Arc<StdMutex<Option<RecvCbSlot>>>,
+}
+
+/// Opaque veil stream — reliable ordered byte channel.
+pub struct VeilStreamFfi {
+    bundle: Arc<RuntimeBundle>,
+    inner: TokioMutex<Option<SdkStream>>,
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+unsafe fn write_err(err_out: *mut *mut c_char, msg: impl Into<String>) {
+    if err_out.is_null() {
+        return;
+    }
+    let cs = CString::new(msg.into())
+        .unwrap_or_else(|_| CString::new("<error message contained NUL>").unwrap());
+    unsafe {
+        *err_out = cs.into_raw();
+    }
+}
+
+unsafe fn clear_err(err_out: *mut *mut c_char) {
+    if !err_out.is_null() {
+        unsafe {
+            *err_out = ptr::null_mut();
+        }
+    }
+}
+
+/// Maximum length для caller-supplied C strings on the FFI boundary.
+/// Bounded scan via [`cstr_to_str_with_len`] / [`cstr_to_str`] prevents
+/// OOB read если caller passes а non-NUL-terminated buffer.  4 KiB
+/// covers every legitimate input shape: filesystem paths (Linux
+/// PATH_MAX = 4096), BIP-39 phrases (~330 B for 24 words), passwords
+/// (typically <256 B), error strings (<1 KiB).  Inputs longer than this
+/// are rejected as invalid even если they happen to be NUL-terminated
+/// — better к refuse а malformed contract upfront than scan kilobytes
+/// of arbitrary memory.
+const MAX_FFI_CSTR_LEN: usize = 4096;
+
+/// Bounded variant of `CStr::from_ptr().to_str()`.
+///
+/// Returns `Some((str, byte_len))` when the pointer is non-null, NUL-
+/// terminated within `MAX_FFI_CSTR_LEN` bytes, и contains valid UTF-8.
+/// Returns `None` otherwise.
+///
+/// # Safety
+///
+/// `p` either NULL or points к а **readable** buffer.  Caller does NOT
+/// need to guarantee NUL-termination — the `strnlen` scan bounds itself
+/// at `MAX_FFI_CSTR_LEN` так что а runaway pointer cannot cause OOB
+/// read (worst case: scan reads up к 4 KiB past the buffer, but never
+/// further).
+unsafe fn cstr_to_str_with_len<'a>(p: *const c_char) -> Option<(&'a str, usize)> {
+    if p.is_null() {
+        return None;
+    }
+    let len = unsafe { libc::strnlen(p, MAX_FFI_CSTR_LEN) };
+    if len >= MAX_FFI_CSTR_LEN {
+        // No NUL within bound — refuse rather than continue the scan
+        // через `CStr::from_ptr` (which would be unbounded).
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+    std::str::from_utf8(bytes).ok().map(|s| (s, len))
+}
+
+unsafe fn cstr_to_str<'a>(p: *const c_char) -> Option<&'a str> {
+    unsafe { cstr_to_str_with_len(p).map(|(s, _)| s) }
+}
+
+/// Bounded `strnlen` — returns `Some(len)` if а NUL byte exists within
+/// `MAX_FFI_CSTR_LEN` bytes of `p`, `None` otherwise (caller passed
+/// non-NUL-terminated buffer или а string longer than the cap).
+///
+/// Use in zeroize-paths где we need the length **before** decoding
+/// UTF-8 so the RAII scrub guard can be armed.  Returning `None`
+/// signals "structurally invalid input — refuse but also do NOT touch
+/// the buffer", since at that point we don't know how long the
+/// allocation actually is.
+///
+/// # Safety
+/// `p` either NULL or points к а readable buffer.
+unsafe fn ffi_cstr_len_bounded(p: *const c_char) -> Option<usize> {
+    if p.is_null() {
+        return None;
+    }
+    let len = unsafe { libc::strnlen(p, MAX_FFI_CSTR_LEN) };
+    if len >= MAX_FFI_CSTR_LEN {
+        return None;
+    }
+    Some(len)
+}
+
+/// detect FFI re-entry from inside a Tokio worker
+/// thread (e.g. from a recv-handler callback) and refuse to proceed.
+///
+/// Returns `true` iff the current thread is already executing inside a
+/// Tokio runtime context. Calling `runtime.block_on(...)` or
+/// `tokio_mutex.blocking_lock` from such a thread would deadlock the
+/// worker. Every FFI entry point that performs a synchronous
+/// `block_on` must call this before doing so and surface
+/// [`VEIL_ERR_REENTRANT`] when it returns `true`.
+fn in_tokio_runtime() -> bool {
+    tokio::runtime::Handle::try_current().is_ok()
+}
+
+/// Build a tokio multi-threaded runtime sized for mobile/desktop hosts.
+///
+/// Worker threads = `min(cpu_count, 4)` — small enough to keep RSS low
+/// on a budget Android device, large enough to overlap I/O on multi-core.
+fn build_runtime() -> Result<tokio::runtime::Runtime, std::io::Error> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(2);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .thread_name("veil-ffi")
+        .build()
+}
+
+// ── Lifecycle: free string, connect, close ───────────────────────────────────
+
+/// Free a C string returned by this library (error messages, etc.).
+/// Safe to call on NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_free_string(s: *mut c_char) {
+    if s.is_null() {
+        return;
+    }
+    unsafe {
+        drop(CString::from_raw(s));
+    }
+}
+
+/// Connect to an veil daemon's IPC socket and perform the APP_HELLO
+/// handshake. Returns an opaque [`VeilHandle`] on success, NULL on
+/// failure (with `*err_out` set).
+///
+/// `socket_path` is treated as an anchor — see
+/// [`veilclient::VeilClient::connect`] for backend discovery rules.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_connect(
+    socket_path: *const c_char,
+    err_out: *mut *mut c_char,
+) -> *mut VeilHandle {
+    if unsafe { guard::ffi_prelude(err_out, "veil_connect") }.is_err() {
+        return ptr::null_mut();
+    }
+    // socket_path validation is delegated к `cstr_to_str` (returns
+    // None on null OR invalid UTF-8) — finer-grained than а plain
+    // null check.
+    let Some(path) = (unsafe { cstr_to_str(socket_path) }) else {
+        unsafe {
+            write_err(err_out, "socket_path is NULL or not valid UTF-8");
+        }
+        return ptr::null_mut();
+    };
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("failed to create tokio runtime: {e}"));
+            }
+            return ptr::null_mut();
+        }
+    };
+    let client_res = runtime.block_on(async { VeilClient::connect(path).await });
+    let client = match client_res {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("connect failed: {e}"));
+            }
+            return ptr::null_mut();
+        }
+    };
+    let bundle = Arc::new(RuntimeBundle {
+        runtime: std::mem::ManuallyDrop::new(runtime),
+        client: TokioMutex::new(client),
+        pending_mailbox_fetch: StdMutex::new(None),
+    });
+    let ptr = Box::into_raw(Box::new(VeilHandle {
+        bundle,
+        event_task: StdMutex::new(None),
+    }));
+    register_handle(handle_registry(), ptr as usize);
+    ptr
+}
+
+/// Release the handle. Outstanding apps / streams keep the runtime
+/// alive via their own `Arc`; the runtime is dropped only when the last
+/// reference goes away. Safe to call on NULL.
+///
+/// defends against double-free. If the caller passes а pointer that's either
+/// NULL, already-freed, or random garbage this function returns без
+/// `Box::from_raw` (which would be UB on freed memory). Liveness is resolved
+/// via the external [`handle_registry`] keyed by address, so the guard never
+/// dereferences the pointer (see the registry's module comment).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_close(handle: *mut VeilHandle) {
+    if handle.is_null() {
+        return;
+    }
+    // Atomically claim the address from the live set. A double-close /
+    // already-freed / garbage pointer is not present → safe no-op, and we
+    // never read through the (possibly dangling) pointer.
+    if !unregister_handle(handle_registry(), handle as usize) {
+        return;
+    }
+    // SAFETY: the address was in the live set and we just removed it, so this
+    // is the unique close that owns the allocation.
+    let h: Box<VeilHandle> = unsafe { Box::from_raw(handle) };
+    if let Ok(mut guard) = h.event_task.lock()
+        && let Some(task) = guard.take()
+    {
+        task.abort();
+    }
+    drop(h);
+}
+
+// ── App binding ──────────────────────────────────────────────────────────────
+
+unsafe fn bind_internal(
+    handle: *mut VeilHandle,
+    namespace: *const c_char,
+    name: *const c_char,
+    endpoint_id: u32,
+    err_out: *mut *mut c_char,
+    named: bool,
+) -> *mut VeilApp {
+    if unsafe { guard::ffi_prelude(err_out, "veil_bind") }.is_err() {
+        return ptr::null_mut();
+    }
+    null_check_with_default!(err_out, ptr::null_mut(),
+        "handle" => handle,
+    );
+    // namespace / name validation delegated к `cstr_to_str`
+    // (None on null OR invalid UTF-8).
+    let Some(ns) = (unsafe { cstr_to_str(namespace) }) else {
+        unsafe {
+            write_err(err_out, "namespace is NULL or invalid UTF-8");
+        }
+        return ptr::null_mut();
+    };
+    let Some(nm) = (unsafe { cstr_to_str(name) }) else {
+        unsafe {
+            write_err(err_out, "name is NULL or invalid UTF-8");
+        }
+        return ptr::null_mut();
+    };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        ptr::null_mut(),
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bind_res: Result<AppHandle, ClientError> = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        if named {
+            client.bind_named(ns, nm, endpoint_id).await
+        } else {
+            client.bind(ns, nm, endpoint_id).await
+        }
+    });
+    let app_handle = match bind_res {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("bind failed: {e}"));
+            }
+            return ptr::null_mut();
+        }
+    };
+    let app_id = *app_handle.app_id();
+    let ep_id = app_handle.endpoint_id();
+    // split immediately so `set_recv_handler` doesn't
+    // need to do anything destructive to the send half.
+    let (sender, receiver) = app_handle.into_split();
+    let app = VeilApp {
+        bundle,
+        sender: TokioMutex::new(Some(sender)),
+        receiver: TokioMutex::new(Some(receiver)),
+        recv_cb: Arc::new(StdMutex::new(None)),
+        app_id,
+        endpoint_id: ep_id,
+        recv_task: StdMutex::new(None),
+    };
+    let ptr = Box::into_raw(Box::new(app));
+    register_handle(app_registry(), ptr as usize);
+    ptr
+}
+
+/// Bind an ephemeral application endpoint. Returns NULL on failure
+/// (see `*err_out`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_bind(
+    handle: *mut VeilHandle,
+    namespace: *const c_char,
+    name: *const c_char,
+    endpoint_id: u32,
+    err_out: *mut *mut c_char,
+) -> *mut VeilApp {
+    unsafe { bind_internal(handle, namespace, name, endpoint_id, err_out, false) }
+}
+
+/// Bind a well-known persistent application endpoint. Returns NULL on
+/// failure (see `*err_out`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_bind_named(
+    handle: *mut VeilHandle,
+    namespace: *const c_char,
+    name: *const c_char,
+    endpoint_id: u32,
+    err_out: *mut *mut c_char,
+) -> *mut VeilApp {
+    unsafe { bind_internal(handle, namespace, name, endpoint_id, err_out, true) }
+}
+
+/// Copy the bound `app_id` (32 bytes) into `out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_app_get_app_id(app: *const VeilApp, out: *mut u8) -> c_int {
+    if app.is_null() || out.is_null() {
+        return VEIL_ERR_INVALID_ARG;
+    }
+    live_or_return!(
+        app_registry(),
+        app,
+        ptr::null_mut(),
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let app_ref: &VeilApp = unsafe { &*app };
+    unsafe {
+        ptr::copy_nonoverlapping(app_ref.app_id.as_ptr(), out, 32);
+    }
+    VEIL_OK
+}
+
+/// Return the bound endpoint id.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_app_get_endpoint_id(app: *const VeilApp) -> u32 {
+    if app.is_null() {
+        return 0;
+    }
+    live_or_return!(app_registry(), app, ptr::null_mut(), 0, "VeilApp");
+    let app_ref: &VeilApp = unsafe { &*app };
+    app_ref.endpoint_id
+}
+
+/// Close an app endpoint. Aborts any active recv loop and releases
+/// resources. Safe to call on NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_app_close(app: *mut VeilApp) {
+    if app.is_null() {
+        return;
+    }
+    // double-free guard via the external registry (см. [`veil_close`]).
+    if !unregister_handle(app_registry(), app as usize) {
+        return;
+    }
+    let app_box: Box<VeilApp> = unsafe { Box::from_raw(app) };
+    if let Ok(mut guard) = app_box.recv_task.lock()
+        && let Some(task) = guard.take()
+    {
+        task.abort();
+    }
+    drop(app_box);
+}
+
+// ── Datagram I/O ─────────────────────────────────────────────────────────────
+
+/// Send a datagram from `app` to `(dst_node_id, dst_app_id, dst_endpoint_id)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_send(
+    app: *mut VeilApp,
+    dst_node_id: *const u8,
+    dst_app_id: *const u8,
+    dst_endpoint_id: u32,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_send") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "app" => app,
+        "dst_node_id" => dst_node_id,
+        "dst_app_id" => dst_app_id,
+    );
+    if data.is_null() && len > 0 {
+        unsafe {
+            write_err(err_out, "data is NULL but len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // bounds-check caller-supplied len BEFORE any
+    // allocation. An untrusted caller passing usize::MAX would
+    // trigger а 16 EiB Vec::with_capacity, OOM-killing the host.
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("data len {len} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    live_or_return!(
+        app_registry(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let app_ref: &VeilApp = unsafe { &*app };
+    let mut dst_node = [0u8; 32];
+    let mut dst_app = [0u8; 32];
+    // SAFETY: caller MUST guarantee that
+    // `dst_node_id` and `dst_app_id` each point к a readable region
+    // of at least 32 bytes. Both pointers are NULL-checked above;
+    // the size contract is documented in the C header. Passing
+    // shorter buffers is undefined behaviour — Dart wrappers (see
+    // veil_flutter/lib/src/client.dart) always pass 32-byte
+    // buffers obtained from `Uint8List(32)`.
+    unsafe {
+        ptr::copy_nonoverlapping(dst_node_id, dst_node.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(dst_app_id, dst_app.as_mut_ptr(), 32);
+    }
+    let payload: Vec<u8> = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    // send through the persistent `sender` half — set_recv_handler
+    // only takes the receiver, so the sender stays addressable for the entire
+    // app lifetime.
+    let send_res: Result<(), ClientError> = app_ref.bundle.runtime.block_on(async {
+        let inner_guard = app_ref.sender.lock().await;
+        let Some(sender) = inner_guard.as_ref() else {
+            return Err(ClientError::Protocol("app already closed".to_string()));
+        };
+        sender
+            .send(dst_node, dst_app, dst_endpoint_id, &payload)
+            .await
+    });
+    match send_res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            let s = e.to_string();
+            unsafe {
+                write_err(err_out, format!("send failed: {s}"));
+            }
+            if s == "app already closed" {
+                VEIL_ERR_CLOSED
+            } else {
+                VEIL_ERR
+            }
+        }
+    }
+}
+
+/// Recv callback signature — invoked from a tokio worker thread.
+///
+/// wrapped в `Option<...>` so а NULL
+/// function pointer passed from C/Swift/Kotlin is а valid `None`
+/// representation that Rust matches и rejects gracefully — instead
+/// of being silently treated as а valid `unsafe extern "C" fn(...)`
+/// (which Rust assumes non-nullable, leading к UB on dereference
+/// before `catch_unwind` could intervene).
+pub type VeilRecvCb = Option<
+    unsafe extern "C" fn(
+        user: *mut std::ffi::c_void,
+        src_node_id: *const u8, // 32 bytes
+        src_app_id: *const u8,  // 32 bytes
+        data: *const u8,
+        len: size_t,
+    ),
+>;
+
+/// A currently-installed recv callback plus its opaque `user` pointer, the
+/// latter transported as `usize` so the slot is `Send` (the caller's contract
+/// guarantees `user` outlives the recv loop). Audit cycle-6 (P6): the recv
+/// task reads from this swappable slot each message, so `set_recv_handler` can
+/// REPLACE the handler on every call by swapping the slot — fixing the bug
+/// where the first call moved the receiver into the task and the second found
+/// it gone (`VEIL_ERR_CLOSED`). Copied out per message so the lock is never
+/// held across the C callback.
+#[derive(Clone, Copy)]
+struct RecvCbSlot {
+    cb: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, *const u8, *const u8, size_t),
+    user_addr: usize,
+}
+
+/// Install a recv handler that calls `cb` for every incoming datagram on this
+/// app. Returns [`VEIL_OK`] once the handler is installed.
+///
+/// A single persistent recv loop runs on the runtime and dispatches to the
+/// currently-installed callback. Calling `set_recv_handler` again REPLACES the
+/// handler (the callback is swapped atomically; no in-flight messages are
+/// lost, and the call succeeds on every invocation). [`veil_send`] continues
+/// to work throughout via the bundle reference.
+///
+/// `user` is an opaque pointer passed to every callback invocation. The caller
+/// MUST keep EVERY `user` it ever passes to `set_recv_handler` valid until
+/// [`veil_app_close`] — NOT merely until the next `set_recv_handler` call.
+/// Replacing the handler swaps the slot, but a message dispatch that already
+/// copied the *previous* `(cb, user)` may still be running on a runtime thread
+/// when the replacing call returns; that in-flight callback dereferences the
+/// old `user`. There is no signal back to the caller for when such a dispatch
+/// completes, so the only safe contract is "valid until close". (This is the
+/// same exposure the pre-swap design had — `abort()` was never synchronous —
+/// now stated precisely.)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_app_set_recv_handler(
+    app: *mut VeilApp,
+    cb: VeilRecvCb,
+    user: *mut std::ffi::c_void,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_app_set_recv_handler") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "app" => app,
+    );
+    // audit: callback was retyped to `Option<fn>` so NULL
+    // becomes а valid `None` representation that we can detect и
+    // reject gracefully — pre-fix а raw `unsafe extern "C" fn` would
+    // be silently dereferenced (segfault, NOT а panic, so catch_unwind
+    // could not intercept).
+    let cb_fn = match cb {
+        Some(f) => f,
+        None => {
+            unsafe {
+                write_err(err_out, "callback is NULL");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    live_or_return!(
+        app_registry(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let app_ref: &VeilApp = unsafe { &*app };
+
+    // audit cycle-6 (P6): install/replace the callback by swapping the shared
+    // slot. A SINGLE persistent recv task (spawned below on the first call)
+    // owns the receiver and dispatches each message to whatever callback is
+    // currently in this slot. The previous design moved the receiver INTO the
+    // task and aborted it on replace, so a second `set_recv_handler` found the
+    // receiver gone and returned VEIL_ERR_CLOSED — breaking the documented
+    // "calling set_recv_handler again replaces it" contract. Swapping the slot
+    // replaces the handler on every call, with no lost in-flight messages.
+    // FFI pointers are not Send, so `user` is transported as `usize`; the
+    // caller's contract is that `user` outlives the recv loop.
+    {
+        let mut slot = app_ref.recv_cb.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(RecvCbSlot {
+            cb: cb_fn,
+            user_addr: user as usize,
+        });
+    }
+
+    // Spawn the persistent recv task exactly once. Lock acquisition order here
+    // is recv_cb (released above, line ~744) → receiver (TokioMutex) → recv_task
+    // (StdMutex). The only other site that takes any of these is
+    // `veil_app_close`, which takes ONLY recv_task — so there is no lock-order
+    // inversion. (A future change that locks `receiver` while holding `recv_task`
+    // would introduce one; keep this ordering.) If the task already exists, the
+    // swap above is all that's needed.
+    let mut receiver_guard = app_ref.receiver.blocking_lock();
+    let mut task_guard = app_ref.recv_task.lock().unwrap_or_else(|e| e.into_inner());
+    if task_guard.is_none() {
+        let mut receiver = match receiver_guard.take() {
+            Some(r) => r,
+            None => {
+                // App already closed before the first handler install. Clear the
+                // slot we just wrote so no dangling (cb, user) lingers in the Arc
+                // (harmless — no task reads it — but cleaner).
+                *app_ref.recv_cb.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                unsafe {
+                    write_err(err_out, "app already closed");
+                }
+                return VEIL_ERR_CLOSED;
+            }
+        };
+        let cb_cell = Arc::clone(&app_ref.recv_cb);
+        let task = app_ref.bundle.runtime.spawn(async move {
+            while let Ok(Some(IncomingMessage {
+                src_node_id,
+                src_app_id,
+                data,
+                ..
+            })) = receiver.recv().await
+            {
+                // Copy the current callback out of the slot; never hold the
+                // lock across the C callback.
+                let Some(RecvCbSlot { cb, user_addr }) =
+                    *cb_cell.lock().unwrap_or_else(|e| e.into_inner())
+                else {
+                    continue; // no handler currently installed — drop the frame
+                };
+                let user_ptr = user_addr as *mut std::ffi::c_void;
+                // wrap the callback в catch_unwind. А panic across the FFI
+                // boundary is undefined behaviour (Rust's unwinder doesn't
+                // cross C-ABI frames cleanly); catching here turns it into а
+                // logged warning + drop the message. The recv loop continues so
+                // а single bad callback panic doesn't permanently break it.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    cb(
+                        user_ptr,
+                        src_node_id.as_ptr(),
+                        src_app_id.as_ptr(),
+                        data.as_ptr(),
+                        data.len(),
+                    );
+                }));
+                if result.is_err() {
+                    eprintln!(
+                        "[veilclient-ffi] recv-handler callback panicked; \
+                         frame dropped, channel kept open",
+                    );
+                }
+            }
+        });
+        *task_guard = Some(task);
+    }
+    VEIL_OK
+}
+
+// ── Streams ──────────────────────────────────────────────────────────────────
+
+/// Open a reliable byte-stream to a remote endpoint.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_stream_open(
+    app: *mut VeilApp,
+    dst_node_id: *const u8,
+    dst_app_id: *const u8,
+    dst_endpoint_id: u32,
+    initial_window: u32,
+    err_out: *mut *mut c_char,
+) -> *mut VeilStreamFfi {
+    if unsafe { guard::ffi_prelude(err_out, "veil_stream_open") }.is_err() {
+        return ptr::null_mut();
+    }
+    null_check_with_default!(err_out, ptr::null_mut(),
+        "app" => app,
+        "dst_node_id" => dst_node_id,
+        "dst_app_id" => dst_app_id,
+    );
+    live_or_return!(app_registry(), app, err_out, ptr::null_mut(), "VeilApp");
+    let app_ref: &VeilApp = unsafe { &*app };
+    let mut dst_node = [0u8; 32];
+    let mut dst_app = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(dst_node_id, dst_node.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(dst_app_id, dst_app.as_mut_ptr(), 32);
+    }
+    // stream opens go through the persistent sender too.
+    let stream_res = app_ref.bundle.runtime.block_on(async {
+        let inner_guard = app_ref.sender.lock().await;
+        let Some(sender) = inner_guard.as_ref() else {
+            return Err(ClientError::Protocol("app already closed".to_string()));
+        };
+        sender
+            .open_stream(dst_node, dst_app, dst_endpoint_id, initial_window)
+            .await
+    });
+    let sdk_stream = match stream_res {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("stream open failed: {e}"));
+            }
+            return ptr::null_mut();
+        }
+    };
+    let stream = VeilStreamFfi {
+        bundle: Arc::clone(&app_ref.bundle),
+        inner: TokioMutex::new(Some(sdk_stream)),
+    };
+    let ptr = Box::into_raw(Box::new(stream));
+    register_handle(stream_registry(), ptr as usize);
+    ptr
+}
+
+/// Write `len` bytes to the stream.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_stream_write(
+    stream: *mut VeilStreamFfi,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_stream_write") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "stream" => stream,
+    );
+    if data.is_null() && len > 0 {
+        unsafe {
+            write_err(err_out, "data is NULL but len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // mirror the veil_send bounds-check.
+    // veil_stream_write is the streaming sibling of veil_send;
+    // both copy `len` bytes из caller memory into a fresh Vec. Without
+    // this guard a caller passing usize::MAX OOM-kills the host before
+    // any peer-side limit applies.
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("data len {len} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    live_or_return!(
+        stream_registry(),
+        stream,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilStreamFfi"
+    );
+    let stream_ref: &VeilStreamFfi = unsafe { &*stream };
+    let payload: Vec<u8> = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    let res: std::io::Result<()> = stream_ref.bundle.runtime.block_on(async {
+        let inner_guard = stream_ref.inner.lock().await;
+        let Some(s) = inner_guard.as_ref() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "stream already closed",
+            ));
+        };
+        s.send_data(&payload).await
+    });
+    match res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            let s = e.to_string();
+            unsafe {
+                write_err(err_out, format!("stream write failed: {s}"));
+            }
+            if s.contains("stream already closed") {
+                VEIL_ERR_CLOSED
+            } else {
+                VEIL_ERR
+            }
+        }
+    }
+}
+
+/// Read up to `cap` bytes from the stream into `buf`. Returns the
+/// number of bytes read, 0 on EOF, or a negative error code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_stream_read(
+    stream: *mut VeilStreamFfi,
+    buf: *mut u8,
+    cap: size_t,
+    err_out: *mut *mut c_char,
+) -> ssize_t {
+    // ssize_t return type — ffi_prelude returns c_int; cast at the boundary.
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_stream_read") } {
+        return rc as ssize_t;
+    }
+    // null_check_with_default не supports ssize_t directly; inline check.
+    if stream.is_null() || buf.is_null() {
+        unsafe {
+            write_err(err_out, "stream or buf is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG as ssize_t;
+    }
+    if cap == 0 {
+        return 0;
+    }
+    // cap pre-allocation так that
+    // а malicious / buggy caller passing huge `cap` (e.g. accidentally
+    // SIZE_MAX from а sentinel mismatch) cannot trigger а multi-GiB
+    // allocation that hard-OOMs the host process. Mirrors the
+    // existing `veil_send` cap pattern. Caller с а legitimate
+    // need for а bigger buffer can call `veil_stream_read` in а
+    // loop — стreaming guarantees nothing about chunk boundaries
+    // anyway.
+    if cap > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("stream_read cap {cap} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})",),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG as ssize_t;
+    }
+    live_or_return!(
+        stream_registry(),
+        stream,
+        err_out,
+        VEIL_ERR_INVALID_ARG as ssize_t,
+        "VeilStreamFfi"
+    );
+    let stream_ref: &VeilStreamFfi = unsafe { &*stream };
+    let mut local_buf = vec![0u8; cap];
+    let read_res: std::io::Result<usize> = stream_ref.bundle.runtime.block_on(async {
+        let mut inner_guard = stream_ref.inner.lock().await;
+        let Some(s) = inner_guard.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "stream already closed",
+            ));
+        };
+        s.read(&mut local_buf).await
+    });
+    match read_res {
+        Ok(n) => {
+            // n == 0 indicates EOF per AsyncRead contract.
+            if n > 0 {
+                unsafe {
+                    ptr::copy_nonoverlapping(local_buf.as_ptr(), buf, n);
+                }
+            }
+            n as ssize_t
+        }
+        Err(e) => {
+            let s = e.to_string();
+            unsafe {
+                write_err(err_out, format!("stream read failed: {s}"));
+            }
+            if s.contains("stream already closed") {
+                VEIL_ERR_CLOSED as ssize_t
+            } else {
+                VEIL_ERR as ssize_t
+            }
+        }
+    }
+}
+
+/// Close the stream and free its resources. Safe to call on NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_stream_close(stream: *mut VeilStreamFfi) {
+    if stream.is_null() {
+        return;
+    }
+    // double-free guard via the external registry (см. [`veil_close`]).
+    if !unregister_handle(stream_registry(), stream as usize) {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(stream));
+    }
+}
+
+// ── Mobile lifecycle events ─────────────────────────────
+
+/// Background-mode tier values [`veil_set_background_mode`].
+/// Mirrors `MobileBackgroundMode` on the wire (0/1/2 byte).
+pub const VEIL_BG_FOREGROUND: c_int = 0;
+pub const VEIL_BG_ACTIVE: c_int = 1;
+pub const VEIL_BG_LOWPOWER: c_int = 2;
+
+/// Network-kind values [`veil_notify_network_changed`].
+pub const VEIL_NET_OFFLINE: c_int = 0;
+pub const VEIL_NET_WIFI: c_int = 1;
+pub const VEIL_NET_CELLULAR: c_int = 2;
+pub const VEIL_NET_ETHERNET: c_int = 3;
+pub const VEIL_NET_UNKNOWN: c_int = 255;
+
+/// Push-envelope status return codes [`veil_set_push_envelope`].
+/// Mirrors `SetPushEnvelopeStatus` on the wire (0/1/2 byte).
+pub const VEIL_PUSH_OK: c_int = 0;
+pub const VEIL_PUSH_NO_RENDEZVOUS: c_int = 1;
+pub const VEIL_PUSH_TOO_LARGE: c_int = 2;
+
+/// Wake-HMAC verdict codes returned by [`veil_verify_wake_hmac`].
+/// Mirrors `veil_crypto::wake_hmac::WakePayloadVerdict` so receiver
+/// plugins can branch on each failure mode separately (operators care
+/// about clock-skew rate as а distinct signal от active forging).
+///
+/// Slice 4.3.3 of Epic 489.10.
+pub const VEIL_WAKE_VERDICT_VALID: c_int = 0;
+pub const VEIL_WAKE_VERDICT_TAMPERED: c_int = 1;
+pub const VEIL_WAKE_VERDICT_EXPIRED: c_int = 2;
+pub const VEIL_WAKE_VERDICT_MALFORMED: c_int = 3;
+
+/// Wake-HMAC key length (32 bytes).  Pinned за
+/// `veil_crypto::wake_hmac::WAKE_HMAC_KEY_LEN`.
+pub const VEIL_WAKE_HMAC_KEY_LEN: size_t = 32;
+
+/// Wake payload total wire size (72 bytes — `ts u64 BE || content_id 32
+/// || hmac_tag 32`).  Pinned за `veil_crypto::wake_hmac::WAKE_PAYLOAD_LEN`.
+pub const VEIL_WAKE_PAYLOAD_LEN: size_t = 72;
+
+///.4 P0: outcome [`veil_get_relay_x25519_pubkey`].
+/// `VEIL_OK` means the daemon is relay-capable and `out_pubkey_32`
+/// was populated. `VEIL_RELAY_X25519_UNAVAILABLE` means the daemon
+/// is not relay-capable (operator did not opt into
+/// `anonymity.relay_capable`) — apps must pick a different relay for
+/// push-envelope sealing. Other negative codes are protocol errors.
+pub const VEIL_RELAY_X25519_UNAVAILABLE: c_int = -10;
+
+/// Read the daemon's relay-side X25519 public key into `out_pubkey_32`.
+/// This is the seal-target for push-envelopes — apps that want to
+/// register a sealed FCM/APNs token [`veil_set_push_envelope`]
+/// must seal it against THIS exact key.
+///
+/// Returns:
+/// [`VEIL_OK`] — `out_pubkey_32` populated with 32 bytes.
+/// [`VEIL_RELAY_X25519_UNAVAILABLE`] — daemon is not relay-
+/// capable; pick a different relay or skip push-wake.
+/// other negative codes — connection/protocol errors.
+///
+/// Stable for the lifetime of the daemon process: the relay X25519 key
+/// is persisted on disk (`<veil_dir>/device_anonymity_x25519_sk.bin`)
+/// and survives restarts. Apps can cache the result.
+///
+/// # Safety
+/// `handle` must be a live `VeilHandle*` from `veil_connect`.
+/// `out_pubkey_32` must point to writable storage for at least 32 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_get_relay_x25519_pubkey(
+    handle: *mut VeilHandle,
+    out_pubkey_32: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_get_relay_x25519_pubkey") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_pubkey_32" => out_pubkey_32,
+    );
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.node_identity().await
+    });
+    match res {
+        Ok(id) => match id.relay_x25519_pubkey {
+            Some(pk) => {
+                unsafe {
+                    ptr::copy_nonoverlapping(pk.as_ptr(), out_pubkey_32, 32);
+                }
+                VEIL_OK
+            }
+            None => VEIL_RELAY_X25519_UNAVAILABLE,
+        },
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("get_relay_x25519_pubkey failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+// ── Mailbox put/fetch/ack ────────────────
+
+/// Status return codes [`veil_mailbox_put`]. Mirrors
+/// `MailboxPutStatus` on the wire (0..8 byte).
+pub const VEIL_MAILBOX_PUT_STORED: c_int = 0;
+pub const VEIL_MAILBOX_PUT_DUPLICATE: c_int = 1;
+pub const VEIL_MAILBOX_PUT_QUOTA_PER_RECEIVER: c_int = 2;
+pub const VEIL_MAILBOX_PUT_QUOTA_GLOBAL: c_int = 3;
+pub const VEIL_MAILBOX_PUT_RATE_LIMITED: c_int = 4;
+pub const VEIL_MAILBOX_PUT_NOT_RELAY: c_int = 5;
+/// relay configured с
+/// `require_capability_token = true` rejected а PUT that arrived
+/// without а capability token.
+pub const VEIL_MAILBOX_PUT_CAPABILITY_REQUIRED: c_int = 6;
+/// capability token decode или verify
+/// failed (expired, wrong receiver, или bad signature).
+pub const VEIL_MAILBOX_PUT_CAPABILITY_INVALID: c_int = 7;
+/// per-sender byte cap exceeded.
+pub const VEIL_MAILBOX_PUT_QUOTA_PER_SENDER: c_int = 8;
+
+/// Deposit `blob` for an offline `receiver_id` at the daemon's mailbox
+///. No `auth_cookie` required.
+///
+/// `push_envelope` / `push_envelope_len` are optional (pass NULL / 0
+/// to skip). When supplied и storage succeeds, the relay fires a
+/// wake-push to the receiver after this call returns.
+///
+/// Returns one of `VEIL_MAILBOX_PUT_*` (≥0) on a structured outcome
+/// or a negative `VEIL_ERR_*` on transport / argument errors.
+/// `out_evicted` (may be NULL) receives the count of older blobs the
+/// relay had to evict to fit (only nonzero on `VEIL_MAILBOX_PUT_STORED`).
+///
+/// # Safety
+/// `handle` must be a live `VeilHandle*` from `veil_connect`.
+/// `receiver_id`, `content_id`, `sender_id` must each point to ≥32
+/// readable bytes. `blob` must point to ≥`blob_len` readable bytes
+/// (or NULL if `blob_len == 0`). `push_envelope` must point to
+/// ≥`push_envelope_len` readable bytes (or NULL if 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_mailbox_put(
+    handle: *mut VeilHandle,
+    receiver_id: *const u8,
+    content_id: *const u8,
+    sender_id: *const u8,
+    blob: *const u8,
+    blob_len: size_t,
+    push_envelope: *const u8,
+    push_envelope_len: size_t,
+    out_evicted: *mut u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    // Forwards к the shared body с `capability_token = None` и
+    // `wake_hmac_envelope = None`. For relays running с
+    // `require_capability_token = true` the daemon will reply
+    // `CAPABILITY_REQUIRED` (status 6); callers that have а token should
+    // use [`veil_mailbox_put_with_capability`].  Callers что forward
+    // the receiver's sealed wake-HMAC envelope should use
+    // [`veil_mailbox_put_with_wake_hmac`].
+    unsafe {
+        mailbox_put_inner(
+            handle,
+            receiver_id,
+            content_id,
+            sender_id,
+            blob,
+            blob_len,
+            push_envelope,
+            push_envelope_len,
+            ptr::null(),
+            0,
+            ptr::null(),
+            0,
+            out_evicted,
+            err_out,
+        )
+    }
+}
+
+/// `veil_mailbox_put` variant that forwards
+/// а receiver-signed capability token. Required when targeting а
+/// relay running с `MailboxConfig::require_capability_token = true`.
+///
+/// `capability_token` / `capability_token_len` ара the bytes obtained
+/// от the receiver's `RendezvousAd` (surfaced on the SDK side as
+/// `RendezvousReplicaInfo::capability_token`). Pass `NULL` / `0` to
+/// fall back к the no-token path (equivalent к calling the original
+/// `veil_mailbox_put`). Maximum length is
+/// [`veilclient::MAX_MAILBOX_CAPABILITY_TOKEN_BYTES`].
+///
+/// All other parameters и safety contracts ара identical к
+/// [`veil_mailbox_put`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_mailbox_put_with_capability(
+    handle: *mut VeilHandle,
+    receiver_id: *const u8,
+    content_id: *const u8,
+    sender_id: *const u8,
+    blob: *const u8,
+    blob_len: size_t,
+    push_envelope: *const u8,
+    push_envelope_len: size_t,
+    capability_token: *const u8,
+    capability_token_len: size_t,
+    out_evicted: *mut u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        mailbox_put_inner(
+            handle,
+            receiver_id,
+            content_id,
+            sender_id,
+            blob,
+            blob_len,
+            push_envelope,
+            push_envelope_len,
+            capability_token,
+            capability_token_len,
+            ptr::null(),
+            0,
+            out_evicted,
+            err_out,
+        )
+    }
+}
+
+/// `veil_mailbox_put` variant that forwards BOTH а receiver-signed
+/// capability token AND the receiver's sealed wake-HMAC envelope (Epic
+/// 489.10 slice 4.3.4).  This is the export а mobile sender uses to
+/// forward the wake-HMAC envelope so the relay can mint а receiver-
+/// verifiable wake-HMAC tag on the push.
+///
+/// `capability_token` / `capability_token_len` ара as in
+/// [`veil_mailbox_put_with_capability`] (pass `NULL` / `0` to skip).
+///
+/// `wake_hmac_envelope` / `wake_hmac_envelope_len` ара the bytes the
+/// receiver published в its `RendezvousAd` (surfaced SDK-side as
+/// `RendezvousReplicaInfo::wake_hmac_envelope` и returned over the C
+/// ABI by [`veil_lookup_rendezvous_replicas`]).  Pass `NULL` / `0`
+/// к fall back к an unauthenticated wake (equivalent к
+/// [`veil_mailbox_put_with_capability`]).  Maximum length is
+/// [`veilclient::MAX_WAKE_HMAC_ENVELOPE_BYTES`]; overflow returns
+/// `VEIL_ERR_INVALID_ARG`.
+///
+/// All other parameters и safety contracts ара identical к
+/// [`veil_mailbox_put`].  `wake_hmac_envelope` MUST point к
+/// ≥`wake_hmac_envelope_len` readable bytes (или NULL if 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_mailbox_put_with_wake_hmac(
+    handle: *mut VeilHandle,
+    receiver_id: *const u8,
+    content_id: *const u8,
+    sender_id: *const u8,
+    blob: *const u8,
+    blob_len: size_t,
+    push_envelope: *const u8,
+    push_envelope_len: size_t,
+    capability_token: *const u8,
+    capability_token_len: size_t,
+    wake_hmac_envelope: *const u8,
+    wake_hmac_envelope_len: size_t,
+    out_evicted: *mut u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        mailbox_put_inner(
+            handle,
+            receiver_id,
+            content_id,
+            sender_id,
+            blob,
+            blob_len,
+            push_envelope,
+            push_envelope_len,
+            capability_token,
+            capability_token_len,
+            wake_hmac_envelope,
+            wake_hmac_envelope_len,
+            out_evicted,
+            err_out,
+        )
+    }
+}
+
+/// Shared implementation для `veil_mailbox_put`,
+/// `veil_mailbox_put_with_capability` и
+/// `veil_mailbox_put_with_wake_hmac`.
+///
+/// # Safety
+/// All pointer / length contracts от the public wrappers apply. This
+/// helper is `unsafe` because it dereferences caller pointers; the
+/// public wrappers re-document the safety surface explicitly.
+#[allow(clippy::too_many_arguments)]
+unsafe fn mailbox_put_inner(
+    handle: *mut VeilHandle,
+    receiver_id: *const u8,
+    content_id: *const u8,
+    sender_id: *const u8,
+    blob: *const u8,
+    blob_len: size_t,
+    push_envelope: *const u8,
+    push_envelope_len: size_t,
+    capability_token: *const u8,
+    capability_token_len: size_t,
+    wake_hmac_envelope: *const u8,
+    wake_hmac_envelope_len: size_t,
+    out_evicted: *mut u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_mailbox_put_with_capability") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "receiver_id" => receiver_id,
+        "content_id" => content_id,
+        "sender_id" => sender_id,
+    );
+    if blob.is_null() && blob_len > 0 {
+        unsafe {
+            write_err(err_out, "blob is null but blob_len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if push_envelope.is_null() && push_envelope_len > 0 {
+        unsafe {
+            write_err(err_out, "push_envelope is null but push_envelope_len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if capability_token.is_null() && capability_token_len > 0 {
+        unsafe {
+            write_err(
+                err_out,
+                "capability_token is null but capability_token_len > 0",
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if wake_hmac_envelope.is_null() && wake_hmac_envelope_len > 0 {
+        unsafe {
+            write_err(
+                err_out,
+                "wake_hmac_envelope is null but wake_hmac_envelope_len > 0",
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // cap pre-allocation так that
+    // а huge caller-supplied len cannot OOM the process before the
+    // mailbox-layer quota check fires. Backend caps exist
+    // (MAX_MAILBOX_BLOB_BYTES = 1 MiB, MAX_PUSH_ENVELOPE_BYTES =
+    // 512 B), but they're enforced AFTER the slice→Vec copy here.
+    // Reject up-front к avoid the copy.
+    if blob_len > veilclient::MAX_MAILBOX_BLOB_BYTES {
+        unsafe {
+            write_err(
+                err_out,
+                format!(
+                    "mailbox_put blob_len {blob_len} exceeds MAX_MAILBOX_BLOB_BYTES ({})",
+                    veilclient::MAX_MAILBOX_BLOB_BYTES,
+                ),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if push_envelope_len > veilclient::MAX_PUSH_ENVELOPE_BYTES {
+        unsafe {
+            write_err(
+                err_out,
+                format!(
+                    "mailbox_put push_envelope_len {push_envelope_len} exceeds MAX_PUSH_ENVELOPE_BYTES ({})",
+                    veilclient::MAX_PUSH_ENVELOPE_BYTES,
+                ),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if capability_token_len > veilclient::MAX_MAILBOX_CAPABILITY_TOKEN_BYTES {
+        unsafe {
+            write_err(
+                err_out,
+                format!(
+                    "mailbox_put capability_token_len {capability_token_len} exceeds MAX_MAILBOX_CAPABILITY_TOKEN_BYTES ({})",
+                    veilclient::MAX_MAILBOX_CAPABILITY_TOKEN_BYTES,
+                ),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if wake_hmac_envelope_len > veilclient::MAX_WAKE_HMAC_ENVELOPE_BYTES {
+        unsafe {
+            write_err(
+                err_out,
+                format!(
+                    "mailbox_put wake_hmac_envelope_len {wake_hmac_envelope_len} exceeds MAX_WAKE_HMAC_ENVELOPE_BYTES ({})",
+                    veilclient::MAX_WAKE_HMAC_ENVELOPE_BYTES,
+                ),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let mut recv_arr = [0u8; 32];
+    let mut content_arr = [0u8; 32];
+    let mut sender_arr = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(receiver_id, recv_arr.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(content_id, content_arr.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(sender_id, sender_arr.as_mut_ptr(), 32);
+    }
+    let blob_vec: Vec<u8> = if blob_len == 0 {
+        Vec::new()
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(blob, blob_len) };
+        slice.to_vec()
+    };
+    let envelope_opt: Option<Vec<u8>> = if push_envelope_len == 0 {
+        None
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(push_envelope, push_envelope_len) };
+        Some(slice.to_vec())
+    };
+    let capability_opt: Option<Vec<u8>> = if capability_token_len == 0 {
+        None
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(capability_token, capability_token_len) };
+        Some(slice.to_vec())
+    };
+    let wake_hmac_opt: Option<Vec<u8>> = if wake_hmac_envelope_len == 0 {
+        None
+    } else {
+        let slice =
+            unsafe { std::slice::from_raw_parts(wake_hmac_envelope, wake_hmac_envelope_len) };
+        Some(slice.to_vec())
+    };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client
+            .mailbox_put(
+                recv_arr,
+                content_arr,
+                sender_arr,
+                blob_vec,
+                envelope_opt,
+                capability_opt,
+                // .10 slice 4.3.4: forward the receiver's sealed wake-HMAC
+                // envelope (surfaced SDK-side as
+                // `RendezvousReplicaInfo::wake_hmac_envelope`) so the relay can
+                // mint а receiver-verifiable wake-HMAC tag.  `None` когда the
+                // caller passed NULL / 0 — relay falls back к an
+                // unauthenticated wake.  Reachable с the wake bytes only via
+                // [`veil_mailbox_put_with_wake_hmac`]; the two legacy
+                // exports forward `(NULL, 0)` here for ABI back-compat.
+                wake_hmac_opt,
+            )
+            .await
+    });
+    match res {
+        Ok(reply) => {
+            if !out_evicted.is_null() {
+                unsafe {
+                    *out_evicted = reply.evicted;
+                }
+            }
+            reply.status as u8 as c_int
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("mailbox_put failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Serialize а replica list into the length-prefixed wire buffer
+/// documented on [`veil_lookup_rendezvous_replicas`].  Factored out
+/// of the `extern "C"` body so the exact byte layout can be unit-tested
+/// без а live daemon (the C entry-point only adds pointer marshalling).
+///
+/// Layout (all integers little-endian):
+///   count: u32
+///   then `count` entries, each:
+///     relay_node_id:          [u8; 32]
+///     valid_until_unix:       u64
+///     push_envelope_len:      u16, push_envelope:      [u8; len]
+///     capability_token_len:   u16, capability_token:   [u8; len]
+///     wake_hmac_envelope_len: u16, wake_hmac_envelope: [u8; len]
+fn serialize_replica_buf(replicas: &[veilclient::RendezvousReplicaInfo]) -> Vec<u8> {
+    // Pre-size exactly: 4-byte count header + per-entry fixed 32+8 plus
+    // three u16 length prefixes (6) plus each blob's bytes.
+    let body: usize = replicas
+        .iter()
+        .map(|r| {
+            32 + 8
+                + 6
+                + r.push_envelope.len()
+                + r.capability_token.len()
+                + r.wake_hmac_envelope.len()
+        })
+        .sum();
+    let mut buf = Vec::with_capacity(4 + body);
+    buf.extend_from_slice(&(replicas.len() as u32).to_le_bytes());
+    for r in replicas {
+        buf.extend_from_slice(&r.relay_node_id);
+        buf.extend_from_slice(&r.valid_until_unix.to_le_bytes());
+        for blob in [&r.push_envelope, &r.capability_token, &r.wake_hmac_envelope] {
+            // The u16 length prefix is only safe because every blob is
+            // backend-capped well under 64 KiB (push <= 512, cap-token <= 2048,
+            // wake-HMAC <= 128). Make that invariant explicit so a future cap
+            // bump that breaks it trips in debug instead of silently truncating
+            // the prefix and desyncing the Dart-side parser (audit N-1).
+            debug_assert!(
+                blob.len() <= u16::MAX as usize,
+                "replica blob len {} exceeds the u16 length prefix",
+                blob.len(),
+            );
+            buf.extend_from_slice(&(blob.len() as u16).to_le_bytes());
+            buf.extend_from_slice(blob);
+        }
+    }
+    buf
+}
+
+/// Look up candidate mailbox-relays for `receiver_id` и return each
+/// verified replica's relay id, ad-expiry, и the three sealed blobs a
+/// sender forwards on the put: `push_envelope`, `capability_token`, и
+/// (Epic 489.10 slice 4.3.4 — the whole point of this export) the
+/// `wake_hmac_envelope`.  Round-trips to the daemon via IPC; resolves
+/// the receiver's `RendezvousAd` от the local DHT cache.
+///
+/// `max_replicas == 0` means "all up к the daemon's cap"
+/// (`MAX_RENDEZVOUS_REPLICAS = 8`; single-key publication returns ≤ 1).
+///
+/// On success returns [`VEIL_OK`] (0) и writes а heap-allocated,
+/// length-prefixed buffer к `*out_buf` (its length к `*out_len`).  The
+/// caller OWNS that buffer и MUST free it with
+/// [`veil_free_replica_buf`] (NOT `free` / `veil_free_string`).
+/// An empty result (no cached ad / no replicas) still returns
+/// [`VEIL_OK`] with `*out_len == 4` (just the `count = 0` header) и
+/// а non-NULL `*out_buf` the caller must still free.  On error returns a
+/// negative `VEIL_ERR_*`, sets `*err_out`, и leaves `*out_buf =
+/// NULL` / `*out_len = 0`.
+///
+/// Wire layout (all integers little-endian) — hand this to the Dart side:
+///   count: u32
+///   then `count` entries, each:
+///     relay_node_id:          [u8; 32]
+///     valid_until_unix:       u64
+///     push_envelope_len:      u16, push_envelope:      [u8; len]
+///     capability_token_len:   u16, capability_token:   [u8; len]
+///     wake_hmac_envelope_len: u16, wake_hmac_envelope: [u8; len]
+/// (Per-blob length is u16; every blob is backend-capped well under
+/// 64 KiB — push ≤ 512 B, cap-token и wake-HMAC envelopes likewise.)
+///
+/// # Safety
+/// `handle` MUST be а live `VeilHandle*` от `veil_connect`.
+/// `receiver_id` MUST point к ≥32 readable bytes.  `out_buf` и
+/// `out_len` MUST be valid, writable pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_lookup_rendezvous_replicas(
+    handle: *mut VeilHandle,
+    receiver_id: *const u8,
+    max_replicas: u8,
+    out_buf: *mut *mut u8,
+    out_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_lookup_rendezvous_replicas") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "receiver_id" => receiver_id,
+        "out_buf" => out_buf,
+        "out_len" => out_len,
+    );
+    // Initialise out-params to the empty/failure state up-front so every
+    // early return leaves them well-defined (NULL / 0).
+    unsafe {
+        *out_buf = ptr::null_mut();
+        *out_len = 0;
+    }
+    let mut recv_arr = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(receiver_id, recv_arr.as_mut_ptr(), 32);
+    }
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client
+            .lookup_rendezvous_replicas(recv_arr, max_replicas)
+            .await
+    });
+    match res {
+        Ok(replicas) => {
+            let mut buf = serialize_replica_buf(&replicas);
+            // Hand the heap buffer to the caller. `into_raw_parts` is
+            // unstable, so shrink-to-fit then leak the Vec's pointer +
+            // length; `veil_free_replica_buf` reconstitutes the exact
+            // (ptr, len, len) triple via `Vec::from_raw_parts`.
+            buf.shrink_to_fit();
+            debug_assert_eq!(buf.len(), buf.capacity());
+            let len = buf.len();
+            let ptr = buf.as_mut_ptr();
+            std::mem::forget(buf);
+            unsafe {
+                *out_buf = ptr;
+                *out_len = len;
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("lookup_rendezvous_replicas failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Free а replica buffer returned by
+/// [`veil_lookup_rendezvous_replicas`].  `ptr` / `len` MUST be the
+/// exact `*out_buf` / `*out_len` pair that call produced — passing any
+/// other pointer, or a mismatched length, is undefined behaviour.  Safe
+/// to call on `ptr == NULL` (no-op).
+///
+/// # Safety
+/// `ptr` MUST be either NULL or а pointer previously returned by
+/// `veil_lookup_rendezvous_replicas` that has NOT already been freed,
+/// и `len` MUST equal the length that call wrote.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_free_replica_buf(ptr: *mut u8, len: size_t) {
+    if ptr.is_null() {
+        return;
+    }
+    // The buffer was leaked from a Vec whose len == capacity (we
+    // `shrink_to_fit` before forgetting it), so reconstruct with
+    // capacity == len and drop.
+    unsafe {
+        drop(Vec::from_raw_parts(ptr, len, len));
+    }
+}
+
+/// Fetch all blobs currently stored for `receiver_id`. `auth_cookie`
+/// must match a previously-registered rendezvous-publisher entry.
+///
+/// On success returns ≥0 (the count of blobs returned) and populates
+/// `out_blobs` (allocated via `veil_mailbox_blobs_alloc`-style
+/// caller-managed buffer). Apps fetch blobs into a length-aware
+/// container by calling [`veil_mailbox_fetch_count`] first to size
+/// their array, then [`veil_mailbox_fetch_into`] to copy.
+///
+/// Two-call API avoids hidden allocations through the FFI boundary —
+/// callers control all memory lifetimes.
+///
+/// # Safety
+/// `handle`, `receiver_id` (32 B), `auth_cookie` (16 B), `out_count`
+/// must all be valid pointers. `out_count` receives the count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_mailbox_fetch_count(
+    handle: *mut VeilHandle,
+    receiver_id: *const u8,
+    auth_cookie: *const u8,
+    out_count: *mut u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_mailbox_fetch_count") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "receiver_id" => receiver_id,
+        "auth_cookie" => auth_cookie,
+        "out_count" => out_count,
+    );
+    let mut recv_arr = [0u8; 32];
+    let mut cookie_arr = [0u8; 16];
+    unsafe {
+        ptr::copy_nonoverlapping(receiver_id, recv_arr.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(auth_cookie, cookie_arr.as_mut_ptr(), 16);
+    }
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.mailbox_fetch(recv_arr, cookie_arr).await
+    });
+    match res {
+        Ok(blobs) => {
+            // Stash the result on the handle for the next _into call.
+            // Single-shot: the handle holds at most one pending fetch
+            // result. A second fetch_count overwrites it.
+            //
+            // Mutex poison recovery: this is а FFI boundary — а panic
+            // here would unwind across the `extern "C"` ABI и trigger
+            // UB on the C-side caller (mobile SDK / chat_node). Если
+            // the mutex is poisoned (а previous holder panicked), we
+            // adopt the inner state и continue; the stored value is
+            // about to be overwritten anyway так что poison is harmless.
+            let count = blobs.len();
+            let mut pending = match bundle.pending_mailbox_fetch.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *pending = Some(blobs);
+            unsafe {
+                *out_count = count as u32;
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("mailbox_fetch_count failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Mailbox blob descriptor returned by [`veil_mailbox_fetch_into`].
+/// `blob` is a borrow into a buffer the caller provided to the fetch
+/// call; valid until the caller frees that buffer.
+#[repr(C)]
+pub struct VeilMailboxBlob {
+    pub sender_id: [u8; 32],
+    pub content_id: [u8; 32],
+    pub deposited_at: u64,
+    /// Pointer into caller-provided `blob_buf` (NOT separately allocated).
+    pub blob: *const u8,
+    pub blob_len: u32,
+    pub _reserved: u32,
+}
+
+/// Copy the most-recently-fetched blob list (cached by
+/// [`veil_mailbox_fetch_count`]) into caller-provided buffers.
+///
+/// `descriptors_out` must point to ≥`max_descriptors` `VeilMailboxBlob`
+/// slots. `blob_buf` is a contiguous byte buffer where blob payloads
+/// are concatenated; descriptors' `blob` pointers index into it.
+/// `blob_buf_len` must be ≥ sum of all blob_len; if too small, returns
+/// `VEIL_ERR_INVALID_ARG` and the cached fetch list is kept (caller
+/// can re-call with a larger buffer without re-fetching).
+///
+/// On success returns the count of descriptors written and clears the
+/// cache.
+///
+/// # Safety
+/// All output pointers must be writable for at least the documented
+/// extents. After this call, the descriptor `blob` pointers are valid
+/// only as long as `blob_buf` is alive and unmodified.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_mailbox_fetch_into(
+    handle: *mut VeilHandle,
+    descriptors_out: *mut VeilMailboxBlob,
+    max_descriptors: u32,
+    blob_buf: *mut u8,
+    blob_buf_len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if handle.is_null() || descriptors_out.is_null() || blob_buf.is_null() {
+        unsafe {
+            write_err(err_out, "null pointer argument");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    // Mutex poison recovery: see fetch_count для rationale — FFI panic
+    // = UB on C-side. Adopt poisoned inner state и continue.
+    let mut pending = match bundle.pending_mailbox_fetch.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(blobs) = pending.take() else {
+        unsafe {
+            write_err(
+                err_out,
+                "no fetch result cached — call veil_mailbox_fetch_count first",
+            );
+        }
+        return VEIL_ERR;
+    };
+    // Audit cycle-5 (FFI): fail (and restore the cache) when the caller supplies
+    // fewer descriptor slots than the cached result holds, instead of silently
+    // writing a prefix and discarding the rest. The required count came from a
+    // prior veil_mailbox_fetch_count, so an undersized max_descriptors is a
+    // caller error — mirror the blob_buf-too-small path below so the result is
+    // not lost. The Dart wrapper always passes the queried count; this guards
+    // direct C callers.
+    if (max_descriptors as usize) < blobs.len() {
+        let need = blobs.len();
+        *pending = Some(blobs);
+        unsafe {
+            write_err(
+                err_out,
+                format!("max_descriptors too small: need {need}, got {max_descriptors}"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let total_bytes: usize = blobs.iter().map(|b| b.blob.len()).sum();
+    let count = blobs.len();
+    if total_bytes > blob_buf_len {
+        // Restore cache so caller can retry with larger buffer.
+        *pending = Some(blobs);
+        unsafe {
+            write_err(
+                err_out,
+                format!("blob_buf too small: need {total_bytes}, got {blob_buf_len}",),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let mut offset = 0usize;
+    for (i, b) in blobs.iter().take(count).enumerate() {
+        let dst_ptr = unsafe { blob_buf.add(offset) };
+        if !b.blob.is_empty() {
+            unsafe {
+                ptr::copy_nonoverlapping(b.blob.as_ptr(), dst_ptr, b.blob.len());
+            }
+        }
+        let descriptor = VeilMailboxBlob {
+            sender_id: b.sender_id,
+            content_id: b.content_id,
+            deposited_at: b.deposited_at,
+            blob: dst_ptr as *const u8,
+            blob_len: b.blob.len() as u32,
+            _reserved: 0,
+        };
+        unsafe {
+            ptr::write(descriptors_out.add(i), descriptor);
+        }
+        offset += b.blob.len();
+    }
+    count as c_int
+}
+
+/// Acknowledge end-to-end receipt of a mailbox blob. Daemon deletes
+/// the blob and frees its quota slice. Idempotent.
+///
+/// Returns 1 if the blob was removed, 0 if no-op (already acked /
+/// not present / wrong cookie), or negative on transport error.
+///
+/// # Safety
+/// `handle` must be a live `VeilHandle*`; `receiver_id` (32 B)
+/// `content_id` (32 B), `auth_cookie` (16 B) must point to readable
+/// storage of at least the documented length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_mailbox_ack(
+    handle: *mut VeilHandle,
+    receiver_id: *const u8,
+    content_id: *const u8,
+    auth_cookie: *const u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_mailbox_ack") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "receiver_id" => receiver_id,
+        "content_id" => content_id,
+        "auth_cookie" => auth_cookie,
+    );
+    let mut recv_arr = [0u8; 32];
+    let mut content_arr = [0u8; 32];
+    let mut cookie_arr = [0u8; 16];
+    unsafe {
+        ptr::copy_nonoverlapping(receiver_id, recv_arr.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(content_id, content_arr.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(auth_cookie, cookie_arr.as_mut_ptr(), 16);
+    }
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.mailbox_ack(recv_arr, content_arr, cookie_arr).await
+    });
+    match res {
+        Ok(removed) => {
+            if removed {
+                1
+            } else {
+                0
+            }
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("mailbox_ack failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Read the daemon's own `node_id` (32 bytes) into `out`. Returns
+/// [`VEIL_OK`] or a negative error code. Round-trips to the daemon
+/// via the IPC `GetNodeIdentity` request — call once at app startup
+/// and cache; the value never changes for the lifetime of the daemon
+/// process.
+///
+/// Useful for displaying the user's identity in UI ("you are: 0xABC…")
+/// without scraping `VEIL_LOCAL_NODE_ID` env or shelling out to
+/// `veil-cli admin node-show`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_get_node_id(
+    handle: *mut VeilHandle,
+    out_node_id_32: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_get_node_id") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_node_id_32" => out_node_id_32,
+    );
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.node_identity().await
+    });
+    match res {
+        Ok(id) => {
+            unsafe {
+                ptr::copy_nonoverlapping(id.node_id.as_ptr(), out_node_id_32, 32);
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("get_node_id failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Snapshot of the daemon's mobile/battery state, populated by
+/// `veil_get_mobile_status`. All fields are scalar wire bytes;
+/// apps interpret sentinels themselves (`battery_level_pct == 100`
+/// could mean "literal 100%" or "AC / unknown").
+#[repr(C)]
+pub struct VeilMobileStatus {
+    /// 0 = Foreground / 1 = Active / 2 = LowPower.
+    pub background_tier: u8,
+    pub _pad1: [u8; 3],
+    /// Configured `mobile.background_keepalive_multiplier`.
+    pub background_keepalive_multiplier: u32,
+    /// Effective background-keepalive factor RIGHT NOW.
+    pub background_keepalive_factor: u32,
+    /// Battery reading 0-100 (100 = AC / unknown).
+    pub battery_level_pct: u8,
+    /// Configured threshold для route-probe throttling (255 = disabled).
+    pub low_battery_threshold_pct: u8,
+    pub _pad2: [u8; 2],
+    /// Configured route-probe multiplier on low-battery.
+    pub low_battery_multiplier: u32,
+    /// Effective route-probe factor RIGHT NOW.
+    pub battery_route_probe_factor: u32,
+}
+
+/// Snapshot the daemon's current mobile/battery state into `out`.
+/// Returns [`VEIL_OK`] or a negative error code. Round-trips to the
+/// daemon via IPC `GetMobileStatus`; cheap (~1 ms) so apps can call
+/// this every few seconds for live UI updates.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_get_mobile_status(
+    handle: *mut VeilHandle,
+    out: *mut VeilMobileStatus,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_get_mobile_status") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out" => out,
+    );
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.mobile_status().await
+    });
+    match res {
+        Ok(s) => {
+            unsafe {
+                ptr::write(
+                    out,
+                    VeilMobileStatus {
+                        background_tier: s.background_tier,
+                        _pad1: [0; 3],
+                        background_keepalive_multiplier: s.background_keepalive_multiplier,
+                        background_keepalive_factor: s.background_keepalive_factor,
+                        battery_level_pct: s.battery_level_pct,
+                        low_battery_threshold_pct: s.low_battery_threshold_pct,
+                        _pad2: [0; 2],
+                        low_battery_multiplier: s.low_battery_multiplier,
+                        battery_route_probe_factor: s.battery_route_probe_factor,
+                    },
+                );
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("get_mobile_status failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Status codes returned by `veil_join_bootstrap_uri` via `out_status`.
+/// Mirror `veil_proto::join_status` constants exactly.
+pub const VEIL_JOIN_OK: u8 = 0;
+pub const VEIL_JOIN_INVALID_URI: u8 = 1;
+pub const VEIL_JOIN_PASSWORD_REQUIRED: u8 = 2;
+pub const VEIL_JOIN_PASSWORD_WRONG: u8 = 3;
+pub const VEIL_JOIN_SIGNATURE_INVALID: u8 = 4;
+pub const VEIL_JOIN_INTERNAL_ERROR: u8 = 5;
+pub const VEIL_JOIN_ALREADY_REGISTERED: u8 = 6;
+
+/// Decode a bootstrap-invite URI и register the peer for outbound dial
+///. Forwards the URI bytes to the daemon, which decodes
+/// them через the standard plain / encrypted / signed-invite paths.
+///
+/// `uri` must be NUL-terminated UTF-8. `password` and `expected_issuer_pk`
+/// may be NULL (for plain URIs / unsigned), or NUL-terminated UTF-8
+/// strings.
+///
+/// On success / `VEIL_JOIN_ALREADY_REGISTERED`, `out_node_id_32` is
+/// populated с the decoded peer's node_id. On any error status it is
+/// zero-filled. `out_status` always carries the wire-byte status code
+/// (one of `VEIL_JOIN_*`). Returns [`VEIL_OK`] iff the IPC
+/// round-trip itself succeeded; the actual decode/verify outcome lives
+/// в `out_status`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_join_bootstrap_uri(
+    handle: *mut VeilHandle,
+    uri: *const c_char,
+    password: *const c_char,
+    expected_issuer_pk: *const c_char,
+    out_node_id_32: *mut u8,
+    out_status: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_join_bootstrap_uri") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_node_id_32" => out_node_id_32,
+        "out_status" => out_status,
+    );
+    let Some(uri_str) = (unsafe { cstr_to_str(uri) }) else {
+        unsafe {
+            write_err(err_out, "uri is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let pw = unsafe { cstr_to_str(password) };
+    let pk = unsafe { cstr_to_str(expected_issuer_pk) };
+
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.join_bootstrap_uri(uri_str, pw, pk).await
+    });
+    match res {
+        Ok(result) => {
+            unsafe {
+                *out_status = result.status;
+                ptr::copy_nonoverlapping(result.peer_node_id.as_ptr(), out_node_id_32, 32);
+                if !result.detail.is_empty() {
+                    write_err(err_out, result.detail);
+                }
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("join_bootstrap_uri failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Create-bootstrap-invite status codes (Epic 489.7 generator side).
+/// Mirror `veil_proto::create_invite_status`.
+pub const VEIL_CREATE_INVITE_OK: u8 = 0;
+pub const VEIL_CREATE_INVITE_NOT_CONFIGURED: u8 = 1;
+pub const VEIL_CREATE_INVITE_BAD_PASSWORD: u8 = 2;
+pub const VEIL_CREATE_INVITE_INTERNAL_ERROR: u8 = 3;
+
+/// Build а bootstrap-invite URI from the daemon's own identity и
+/// listen-address config (Epic 489.7 generator side, "share my invite"
+/// flow).  Output goes к а caller-owned heap-allocated UTF-8 string
+/// the FFI returns through `out_uri` — caller MUST free it via
+/// [`veil_free_string`] after consuming.
+///
+/// `password` may be `NULL` (plain `veil:bootstrap?…` URI) или а
+/// NUL-terminated UTF-8 string (encrypted `veil:pair?…` envelope).
+/// Empty / whitespace-only passwords are rejected с status
+/// `VEIL_CREATE_INVITE_BAD_PASSWORD` so callers can re-prompt rather
+/// than emitting an envelope encrypted under а trivial key.
+///
+/// On non-OK status, `out_uri` is set к NULL и `err_out` (если non-NULL)
+/// carries а human-readable detail message.
+///
+/// Returns [`VEIL_OK`] iff the IPC round-trip itself succeeded; the
+/// actual outcome lives in `out_status` (one of `VEIL_CREATE_INVITE_*`).
+///
+/// # Safety
+/// `handle` must be а live `VeilHandle*` from `veil_connect`.
+/// `out_status` must be writable.  `out_uri` must be writable; on
+/// success it receives а pointer к а malloc'd NUL-terminated UTF-8
+/// string — caller frees с [`veil_free_string`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_create_bootstrap_invite(
+    handle: *mut VeilHandle,
+    password: *const c_char,
+    out_status: *mut u8,
+    out_uri: *mut *mut c_char,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_create_bootstrap_invite") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_status" => out_status,
+        "out_uri" => out_uri,
+    );
+    unsafe {
+        *out_uri = ptr::null_mut();
+    }
+    let pw = unsafe { cstr_to_str(password) };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.create_bootstrap_invite(pw).await
+    });
+    match res {
+        Ok(reply) => {
+            unsafe {
+                *out_status = reply.status;
+            }
+            if reply.status == VEIL_CREATE_INVITE_OK && !reply.uri.is_empty() {
+                // CString::new fails iff string contains а NUL byte —
+                // bootstrap URIs are URL-safe base64 + ASCII только,
+                // so this should never trigger.  Defensive guard logs +
+                // returns INTERNAL_ERROR instead of panicking across the
+                // FFI boundary.
+                match std::ffi::CString::new(reply.uri.as_bytes()) {
+                    Ok(c) => unsafe {
+                        *out_uri = c.into_raw();
+                    },
+                    Err(e) => unsafe {
+                        *out_status = VEIL_CREATE_INVITE_INTERNAL_ERROR;
+                        write_err(err_out, format!("URI contains NUL byte: {e}"));
+                    },
+                }
+            } else if !reply.detail.is_empty() {
+                unsafe {
+                    write_err(err_out, reply.detail);
+                }
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("create_bootstrap_invite failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Peer-list iteration callback.
+///
+/// Invoked once per peer entry from `veil_peers_list`. All buffer
+/// pointers are valid only for the duration of the call — copy out
+/// anything you need to keep.
+///
+/// user — the opaque pointer passed to `veil_peers_list`.
+/// node_id — pointer to 32 bytes; peer's identity.
+/// state — wire-byte session state (see VEIL_PEER_STATE_*).
+/// direction — wire-byte direction (see VEIL_PEER_DIR_*).
+/// transport — UTF-8 transport URI (NOT null-terminated; use len).
+/// transport_len — byte length of `transport`.
+/// wrapped в `Option<...>` for safe
+/// NULL-pointer rejection at the FFI boundary. See [`VeilRecvCb`]
+/// docs.
+pub type VeilPeerCb = Option<
+    unsafe extern "C" fn(
+        user: *mut std::ffi::c_void,
+        node_id: *const u8,
+        state: u8,
+        direction: u8,
+        transport: *const u8,
+        transport_len: size_t,
+    ),
+>;
+
+/// Wire-byte session-state values для `VeilPeerCb::state`.
+pub const VEIL_PEER_STATE_CONNECTING: u8 = 0;
+pub const VEIL_PEER_STATE_ACTIVE: u8 = 1;
+pub const VEIL_PEER_STATE_CLOSED: u8 = 2;
+pub const VEIL_PEER_STATE_UNKNOWN: u8 = 255;
+
+/// Wire-byte direction values для `VeilPeerCb::direction`.
+pub const VEIL_PEER_DIR_INBOUND: u8 = 0;
+pub const VEIL_PEER_DIR_OUTBOUND: u8 = 1;
+
+/// Snapshot the daemon's currently-active peer sessions. Calls `cb`
+/// once per peer, passing `user` through unchanged. Returns
+/// [`VEIL_OK`] on success or a negative error code.
+///
+/// The list is bounded at 256 entries server-side — apps with thousands
+/// of active sessions on a relay should treat the result as a snapshot
+/// (not exhaustive).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_peers_list(
+    handle: *mut VeilHandle,
+    cb: VeilPeerCb,
+    user: *mut std::ffi::c_void,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_peers_list") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+    );
+    // audit: NULL callback → Some(_) match (see VeilRecvCb).
+    let cb_fn = match cb {
+        Some(f) => f,
+        None => {
+            unsafe {
+                write_err(err_out, "callback is NULL");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.peers().await
+    });
+    match res {
+        Ok(entries) => {
+            // Transport user pointer как usize so the future is Send safe.
+            let user_addr = user as usize;
+            let user_ptr = user_addr as *mut std::ffi::c_void;
+            // wrap each callback
+            // invocation in `catch_unwind`. А panic across the FFI
+            // boundary is undefined behaviour (Rust's unwinder
+            // doesn't cross C-ABI frames cleanly); catching here
+            // turns it into а logged warning + skip the bad entry.
+            // Mirrors the recv-handler / event-handler pattern shipped
+            // — `veil_peers_list` was the one
+            // remaining unguarded callback site.
+            for entry in entries {
+                let transport_bytes = entry.transport.as_bytes();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    cb_fn(
+                        user_ptr,
+                        entry.node_id.as_ptr(),
+                        entry.state,
+                        entry.direction,
+                        transport_bytes.as_ptr(),
+                        transport_bytes.len(),
+                    );
+                }));
+                if result.is_err() {
+                    eprintln!(
+                        "[veilclient-ffi] peers_list callback panicked; \
+                         entry skipped, iteration continues",
+                    );
+                    // Don't abort the iteration — caller may want к
+                    // see the rest of the list even if one entry's
+                    // handler misbehaves.
+                }
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("peers_list failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Tell the daemon what background-mode tier the app is currently in.
+/// Daemon scales keepalive cadence (and, in a future revision, suspends
+/// route probes on `LowPower`) so sessions survive OS-level Doze / iOS
+/// background-task suspension.
+///
+/// `mode` must be one of `VEIL_BG_FOREGROUND`, `VEIL_BG_ACTIVE`
+/// `VEIL_BG_LOWPOWER`. Returns [`VEIL_OK`] or a negative error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_set_background_mode(
+    handle: *mut VeilHandle,
+    mode: c_int,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_set_background_mode") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+    );
+    let wire_mode = match mode {
+        VEIL_BG_FOREGROUND => veilclient::MobileBackgroundMode::Foreground,
+        VEIL_BG_ACTIVE => veilclient::MobileBackgroundMode::Active,
+        VEIL_BG_LOWPOWER => veilclient::MobileBackgroundMode::LowPower,
+        other => {
+            unsafe {
+                write_err(err_out, format!("invalid background mode: {other}"));
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.set_mobile_background_mode(wire_mode).await
+    });
+    match res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("set_background_mode failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Tell the daemon that the local network attachment changed. Triggers
+/// an eager gateway-reconnect attempt so the app doesn't have to wait
+/// for the keepalive timeout to detect that warm sessions are doomed.
+///
+/// `kind` must be one of `VEIL_NET_*`. `mtu_hint = 0` means "use
+/// default" (advisory only).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_notify_network_changed(
+    handle: *mut VeilHandle,
+    kind: c_int,
+    mtu_hint: u16,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_notify_network_changed") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+    );
+    let net_kind = match kind {
+        VEIL_NET_OFFLINE => veilclient::NetworkKind::Offline,
+        VEIL_NET_WIFI => veilclient::NetworkKind::Wifi,
+        VEIL_NET_CELLULAR => veilclient::NetworkKind::Cellular,
+        VEIL_NET_ETHERNET => veilclient::NetworkKind::Ethernet,
+        VEIL_NET_UNKNOWN => veilclient::NetworkKind::Unknown,
+        other => {
+            unsafe {
+                write_err(err_out, format!("invalid network kind: {other}"));
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.notify_network_changed(net_kind, mtu_hint).await
+    });
+    match res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("notify_network_changed failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Register а sealed FCM/APNs push-token envelope on а rendezvous-publisher
+/// entry.
+///
+/// `rendezvous_node_id` (32 bytes) и `auth_cookie` (16 bytes) must match an
+/// entry the daemon has already registered via
+/// `register_rendezvous_publisher_with_push`. `envelope` carries opaque
+/// sealed bytes (use `veil_anonymity::push_envelope::seal_push_envelope`
+/// client-side BEFORE calling this — daemon never sees raw token).
+/// `envelope_len = 0` clears the registration.
+///
+/// Returns one of:
+/// * [`VEIL_PUSH_OK`] — envelope set / cleared successfully.
+/// * [`VEIL_PUSH_NO_RENDEZVOUS`] — no matching entry registered (caller
+///   should call register_rendezvous_publisher_with_push first OR ignore
+///   if the daemon isn't running rendezvous).
+/// * [`VEIL_PUSH_TOO_LARGE`] — envelope exceeds 512 B cap.
+/// * [`VEIL_ERR`] / [`VEIL_ERR_INVALID_ARG`] / [`VEIL_ERR_REENTRANT`]
+///   per the standard FFI error model.
+///
+/// # Safety
+///
+/// `rendezvous_node_id` MUST point к an exactly 32-byte buffer. `auth_cookie`
+/// к exactly 16. `envelope` к а buffer of length `envelope_len`. All
+/// pointers may be NULL only when their corresponding length is 0. Caller
+/// retains ownership of all input buffers; the function copies the envelope
+/// internally (returning before write completes к the daemon's state).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_set_push_envelope(
+    handle: *mut VeilHandle,
+    rendezvous_node_id: *const u8,
+    auth_cookie: *const u8,
+    envelope: *const u8,
+    envelope_len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_set_push_envelope") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "rendezvous_node_id" => rendezvous_node_id,
+        "auth_cookie" => auth_cookie,
+    );
+    if envelope_len > 0 && envelope.is_null() {
+        unsafe {
+            write_err(err_out, "envelope is NULL but envelope_len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // cap pre-allocation так that
+    // а huge `envelope_len` cannot OOM the process before reaching
+    // the daemon-side `EnvelopeTooLarge` reply path. Daemon enforces
+    // `MAX_PUSH_ENVELOPE_BYTES` already; we mirror it here so the
+    // copy never happens for obviously-bad input.
+    if envelope_len > veilclient::MAX_PUSH_ENVELOPE_BYTES {
+        unsafe {
+            write_err(
+                err_out,
+                format!(
+                    "set_push_envelope envelope_len {envelope_len} exceeds MAX_PUSH_ENVELOPE_BYTES ({})",
+                    veilclient::MAX_PUSH_ENVELOPE_BYTES,
+                ),
+            );
+        }
+        return VEIL_PUSH_TOO_LARGE;
+    }
+    // 32-byte / 16-byte buffer SAFETY contract — caller MUST
+    // pass exactly the documented buffer sizes; we copy out а fixed-size array
+    // unconditionally so any miscount on the C side surfaces as а readable
+    // memory bug at the call site rather than а silent corruption later.
+    let mut rid_bytes = [0u8; 32];
+    let mut cookie_bytes = [0u8; 16];
+    unsafe {
+        std::ptr::copy_nonoverlapping(rendezvous_node_id, rid_bytes.as_mut_ptr(), 32);
+        std::ptr::copy_nonoverlapping(auth_cookie, cookie_bytes.as_mut_ptr(), 16);
+    }
+    let envelope_vec: Vec<u8> = if envelope_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(envelope, envelope_len) }.to_vec()
+    };
+
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client
+            .set_push_envelope(rid_bytes, cookie_bytes, envelope_vec)
+            .await
+    });
+    match res {
+        Ok(veilclient::SetPushEnvelopeStatus::Ok) => VEIL_PUSH_OK,
+        Ok(veilclient::SetPushEnvelopeStatus::NoMatchingRendezvous) => VEIL_PUSH_NO_RENDEZVOUS,
+        Ok(veilclient::SetPushEnvelopeStatus::EnvelopeTooLarge) => VEIL_PUSH_TOO_LARGE,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("set_push_envelope failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+// ── Push envelope sealing (Epic 489.10) ─────────────────────────
+
+/// Per-envelope wire overhead (`eph_pk + nonce + tag`).  Pre-allocate
+/// `token_len + VEIL_PUSH_ENVELOPE_OVERHEAD` bytes на the caller
+/// side to receive the sealed bytes.  Mirrors
+/// `veil_anonymity::push_envelope::PUSH_ENVELOPE_OVERHEAD`.
+pub const VEIL_PUSH_ENVELOPE_OVERHEAD: size_t = 60;
+
+/// Hard cap on inner token length (mirrors MAX_PUSH_TOKEN_LEN).
+pub const VEIL_MAX_PUSH_TOKEN_LEN: size_t = 384;
+
+/// Hard cap on sealed envelope length (mirrors MAX_PUSH_ENVELOPE_LEN).
+pub const VEIL_MAX_PUSH_ENVELOPE_LEN: size_t = 512;
+
+/// Seal а raw FCM/APNs token к the push-relay identified by а 32-byte
+/// X25519 public key.  Stateless — does not need an `VeilHandle`.
+/// The relay pubkey is typically obtained от `veil_get_node_id` of
+/// the relay daemon (which surfaces it as
+/// [`veil_get_relay_x25519_pubkey`]), then transferred OOB к the
+/// sender (typically baked into the app via а build-time constant
+/// per push-relay deployment).
+///
+/// Output goes к caller-owned buffer `out_buf` of length `out_buf_cap`.
+/// On success `*out_len` receives the actual sealed length (always
+/// `token_len + VEIL_PUSH_ENVELOPE_OVERHEAD`).  Returns
+/// [`VEIL_OK`] / [`VEIL_PUSH_TOO_LARGE`] / [`VEIL_ERR_INVALID_ARG`]
+/// / [`VEIL_ERR`].
+///
+/// # Safety
+///
+/// `token` must point к `token_len` readable bytes (или NULL if 0).
+/// `relay_pk_32` MUST point к exactly 32 readable bytes.  `out_buf`
+/// MUST be writable for at least `out_buf_cap` bytes.  `out_len` MUST
+/// be а writable pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_seal_push_envelope(
+    token: *const u8,
+    token_len: size_t,
+    relay_pk_32: *const u8,
+    out_buf: *mut u8,
+    out_buf_cap: size_t,
+    out_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if relay_pk_32.is_null() || out_buf.is_null() || out_len.is_null() {
+        unsafe {
+            write_err(err_out, "null pointer argument");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if token_len > VEIL_MAX_PUSH_TOKEN_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!(
+                    "token_len {token_len} exceeds VEIL_MAX_PUSH_TOKEN_LEN ({})",
+                    VEIL_MAX_PUSH_TOKEN_LEN,
+                ),
+            );
+        }
+        return VEIL_PUSH_TOO_LARGE;
+    }
+    if token.is_null() && token_len > 0 {
+        unsafe {
+            write_err(err_out, "token is NULL but token_len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let needed = token_len.saturating_add(VEIL_PUSH_ENVELOPE_OVERHEAD);
+    if out_buf_cap < needed {
+        unsafe {
+            write_err(
+                err_out,
+                format!("out_buf_cap {out_buf_cap} < required {needed}"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let token_slice: &[u8] = if token_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(token, token_len) }
+    };
+    let mut relay_pk = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(relay_pk_32, relay_pk.as_mut_ptr(), 32);
+    }
+    match veil_anonymity::push_envelope::seal_push_envelope(token_slice, &relay_pk) {
+        Ok(sealed) => {
+            unsafe {
+                ptr::copy_nonoverlapping(sealed.as_ptr(), out_buf, sealed.len());
+                *out_len = sealed.len();
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("seal_push_envelope failed: {e}"));
+            }
+            match e {
+                veil_anonymity::push_envelope::PushEnvelopeError::TokenTooLarge { .. } => {
+                    VEIL_PUSH_TOO_LARGE
+                }
+                _ => VEIL_ERR,
+            }
+        }
+    }
+}
+
+// ── Wake-HMAC envelope IPC (Epic 489.10 slice 4.3.4) ───────────────────────
+
+/// Upload а sealed wake-HMAC envelope к the daemon's rendezvous-publisher
+/// entry matched by `(rendezvous_node_id, auth_cookie)` (Epic 489.10
+/// slice 4.3.4 — analog к [`veil_set_push_envelope`]).
+///
+/// Empty `envelope` (`envelope_len == 0`) clears the registration —
+/// the receiver falls back к the legacy rate-limited wake path.  Use
+/// when toggling HMAC authentication on/off.
+///
+/// Returns:
+/// * [`VEIL_PUSH_OK`] — envelope set / cleared successfully.
+/// * [`VEIL_PUSH_NO_RENDEZVOUS`] — no matching publisher entry
+///   (caller should `register_rendezvous_publisher` first).
+/// * [`VEIL_PUSH_TOO_LARGE`] — `envelope_len` exceeds
+///   `MAX_WAKE_HMAC_ENVELOPE_BYTES`.
+/// * Other negative codes — connection / protocol errors.
+///
+/// # Safety
+///
+/// `handle` MUST be а live `VeilHandle*`.  `rendezvous_node_id`
+/// MUST point к 32 readable bytes.  `auth_cookie` MUST point к 16
+/// readable bytes.  `envelope` MUST point к `envelope_len` readable
+/// bytes (или NULL if 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_set_wake_hmac_envelope(
+    handle: *mut VeilHandle,
+    rendezvous_node_id: *const u8,
+    auth_cookie: *const u8,
+    envelope: *const u8,
+    envelope_len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_set_wake_hmac_envelope") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "rendezvous_node_id" => rendezvous_node_id,
+        "auth_cookie" => auth_cookie,
+    );
+    if envelope_len > 0 && envelope.is_null() {
+        unsafe {
+            write_err(err_out, "envelope is NULL but envelope_len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if envelope_len > veilclient::MAX_WAKE_HMAC_ENVELOPE_BYTES {
+        unsafe {
+            write_err(
+                err_out,
+                format!(
+                    "set_wake_hmac_envelope envelope_len {envelope_len} exceeds MAX_WAKE_HMAC_ENVELOPE_BYTES ({})",
+                    veilclient::MAX_WAKE_HMAC_ENVELOPE_BYTES,
+                ),
+            );
+        }
+        return VEIL_PUSH_TOO_LARGE;
+    }
+    let mut rid_bytes = [0u8; 32];
+    let mut cookie_bytes = [0u8; 16];
+    unsafe {
+        std::ptr::copy_nonoverlapping(rendezvous_node_id, rid_bytes.as_mut_ptr(), 32);
+        std::ptr::copy_nonoverlapping(auth_cookie, cookie_bytes.as_mut_ptr(), 16);
+    }
+    let envelope_vec: Vec<u8> = if envelope_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(envelope, envelope_len) }.to_vec()
+    };
+
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client
+            .set_wake_hmac_envelope(rid_bytes, cookie_bytes, envelope_vec)
+            .await
+    });
+    match res {
+        Ok(veilclient::SetWakeHmacEnvelopeStatus::Ok) => VEIL_PUSH_OK,
+        Ok(veilclient::SetWakeHmacEnvelopeStatus::NoMatchingRendezvous) => VEIL_PUSH_NO_RENDEZVOUS,
+        Ok(veilclient::SetWakeHmacEnvelopeStatus::EnvelopeTooLarge) => VEIL_PUSH_TOO_LARGE,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("set_wake_hmac_envelope failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+// ── Wake-HMAC primitives (Epic 489.10 slice 4.3.3) ──────────────────────────
+
+/// Fill `out_key_32` с а fresh 32-byte wake-HMAC key from the OS CSPRNG.
+///
+/// Receivers generate one key per identity rotation epoch и persist it
+/// platform-side (iOS Keychain / Android Keystore — sibling slice).
+/// The key is sealed к the chosen push-relay via [`veil_seal_push_envelope`]
+/// — same envelope shape as а push token — и embedded в the receiver's
+/// rendezvous ad как `wake_hmac_envelope` (slice 4.3.2 wire bump).
+///
+/// # Safety
+///
+/// `out_key_32` MUST point к exactly 32 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_generate_wake_hmac_key(
+    out_key_32: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if out_key_32.is_null() {
+        unsafe {
+            write_err(err_out, "out_key_32 is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let key = veil_crypto::wake_hmac::WakeHmacKey::generate();
+    unsafe {
+        ptr::copy_nonoverlapping(key.as_bytes().as_ptr(), out_key_32, 32);
+    }
+    VEIL_OK
+}
+
+/// Verify а wake-up payload delivered via OS push (FCM / APNs body).
+/// Receiver's plugin calls this inside `handleWakeup` BEFORE doing any
+/// expensive veil work (daemon reconnect, mailbox drain).
+///
+/// Returns one of [`VEIL_WAKE_VERDICT_*`] codes via `out_verdict`:
+///
+/// * `VALID` — payload matches; proceed к drain.
+/// * `TAMPERED` — HMAC mismatch.  Silent no-op; no observable network
+///   reaction (defeats presence oracle).
+/// * `EXPIRED` — `ts` outside ±5-min freshness window.  Silent no-op;
+///   distinguish from tampering so operators can track clock-skew
+///   rate separately.
+/// * `MALFORMED` — `payload_len != 72`.  Silent no-op; logs locally.
+///
+/// On any [`VEIL_OK`] return the verdict byte is meaningful (≤ 3).
+/// Other return codes indicate input-validation errors.
+///
+/// # Safety
+///
+/// `key_32` and `receiver_id_32` MUST each point к exactly 32 readable
+/// bytes.  `payload` MUST point к `payload_len` readable bytes (или
+/// NULL if 0).  `out_verdict` MUST be а writable pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_verify_wake_hmac(
+    key_32: *const u8,
+    payload: *const u8,
+    payload_len: size_t,
+    receiver_id_32: *const u8,
+    now_secs: u64,
+    out_verdict: *mut c_int,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if key_32.is_null() || receiver_id_32.is_null() || out_verdict.is_null() {
+        unsafe {
+            write_err(err_out, "null pointer argument");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if payload.is_null() && payload_len > 0 {
+        unsafe {
+            write_err(err_out, "payload is NULL but payload_len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // SECURITY (audit 2026-05-29, FFI hardening): a valid wake payload is
+    // ALWAYS exactly 72 bytes (see WAKE_PAYLOAD_LEN / verify_wake_payload).
+    // Reject any other length BEFORE constructing the slice via
+    // `from_raw_parts`, so а hostile/mis-bound caller that lies about
+    // `payload_len` (e.g. claims 1_000_000 over а 72-byte buffer) cannot
+    // induce an out-of-bounds read.  This is behaviour-preserving: a
+    // != 72 length would have produced the MALFORMED verdict anyway —
+    // we just decide it without touching the (untrusted) buffer span.
+    if payload_len != veil_crypto::wake_hmac::WAKE_PAYLOAD_LEN {
+        unsafe {
+            *out_verdict = VEIL_WAKE_VERDICT_MALFORMED;
+        }
+        return VEIL_OK;
+    }
+    let mut key_bytes = [0u8; 32];
+    let mut recv_bytes = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(key_32, key_bytes.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(receiver_id_32, recv_bytes.as_mut_ptr(), 32);
+    }
+    let key = veil_crypto::wake_hmac::WakeHmacKey::from_bytes(key_bytes);
+    // SAFETY: payload_len == WAKE_PAYLOAD_LEN (72) verified above, and the
+    // caller's `# Safety` contract guarantees `payload` points к that many
+    // readable bytes; the slice span is now bounded к the fixed 72.
+    let payload_slice: &[u8] = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+    let verdict =
+        veil_crypto::wake_hmac::verify_wake_payload(&key, payload_slice, &recv_bytes, now_secs);
+    let code = match verdict {
+        veil_crypto::wake_hmac::WakePayloadVerdict::Valid { .. } => VEIL_WAKE_VERDICT_VALID,
+        veil_crypto::wake_hmac::WakePayloadVerdict::TamperedOrForged => VEIL_WAKE_VERDICT_TAMPERED,
+        veil_crypto::wake_hmac::WakePayloadVerdict::Expired { .. } => VEIL_WAKE_VERDICT_EXPIRED,
+        veil_crypto::wake_hmac::WakePayloadVerdict::MalformedLength { .. } => {
+            VEIL_WAKE_VERDICT_MALFORMED
+        }
+    };
+    unsafe {
+        *out_verdict = code;
+    }
+    VEIL_OK
+}
+
+// ── Push event stream ───────────────────────────────────────────
+
+/// Event-kind wire bytes mirroring `veil_proto::event_kind::*`.
+/// Hosts dispatch on `kind` to know how to interpret `payload`. Keep
+/// в lockstep with the server-side constants — adding new kinds is
+/// forward-compatible (older C consumers see an unknown kind and
+/// fall back to a noop handler).
+pub const VEIL_EVENT_SESSIONS_CHANGED: u8 = 0;
+pub const VEIL_EVENT_MOBILE_TIER_CHANGED: u8 = 1;
+pub const VEIL_EVENT_IDENTITY_ROTATED: u8 = 2;
+/// Mailbox drain (fetch) completed.  Payload: `[u32 BE drained_count]`.
+/// BG-handler consumers (iOS BGProcessingTask, Android background workers)
+/// subscribe so they can complete precisely at drain completion instead of
+/// padding to a hardcoded fallback timeout.
+pub const VEIL_EVENT_MAILBOX_DRAINED: u8 = 3;
+
+/// Push-event callback. Invoked from a tokio worker thread for every
+/// `LocalAppMsg::Event` frame the daemon emits while this handler is
+/// installed. `payload`+`payload_len` describe the per-kind opaque
+/// bytes (см. `veil_proto::event_kind` для wire format per kind);
+/// they are valid for the duration of the call only — the consumer
+/// must copy if it needs to retain.
+/// wrapped в `Option<...>` for safe
+/// NULL-pointer rejection at the FFI boundary. See [`VeilRecvCb`]
+/// docs.
+pub type VeilEventCb = Option<
+    unsafe extern "C" fn(
+        user: *mut std::ffi::c_void,
+        kind: u8,
+        payload: *const u8,
+        payload_len: size_t,
+    ),
+>;
+
+/// Install a push-event handler on this veil connection
+///. The handler runs on a private tokio task and is
+/// torn down when the handle is closed or `set_event_handler` is
+/// called again. Returns [`VEIL_OK`] iff a fresh handler was
+/// installed; [`VEIL_ERR_INVALID_ARG`] if `handle` is NULL.
+///
+/// Single-subscriber semantics — calling this twice replaces the
+/// previous handler (the prior task is aborted). Pass NULL `user`
+/// if the C side does not need the opaque pointer; otherwise the
+/// caller must keep `user` valid until the handler is replaced or
+/// the handle is closed.
+///
+/// Threading note: the callback fires on a tokio worker thread.
+/// Hosts that marshal к a single-threaded UI loop (Flutter
+/// dart:ffi, Swift, Kotlin) should wrap their callback in a
+/// listener-style trampoline that wakes the UI isolate/queue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_set_event_handler(
+    handle: *mut VeilHandle,
+    cb: VeilEventCb,
+    user: *mut std::ffi::c_void,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if handle.is_null() {
+        unsafe {
+            write_err(err_out, "handle is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // audit: NULL callback → Some(_) match (see VeilRecvCb).
+    let cb_fn = match cb {
+        Some(f) => f,
+        None => {
+            unsafe {
+                write_err(err_out, "callback is NULL");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let h_ref: &VeilHandle = unsafe { &*handle };
+    // Cancel any previous handler before subscribing again. A second
+    // subscriber would replace the SDK-side mpsc sink anyway, but we
+    // also want to drop the old task so it stops holding the runtime
+    // worker and any captured pointers.
+    if let Ok(mut guard) = h_ref.event_task.lock()
+        && let Some(prev) = guard.take()
+    {
+        prev.abort();
+    }
+    let bundle = Arc::clone(&h_ref.bundle);
+    let bundle_for_task = Arc::clone(&bundle);
+    // FFI pointers are not Send — transport `user` as `usize`.
+    let user_addr = user as usize;
+    let task = bundle.runtime.spawn(async move {
+        let bundle = bundle_for_task;
+        // Subscribe inside the task so the SDK-side mpsc sender is
+        // installed под the same lock that `events` takes — avoids
+        // a race с simultaneous `events` callers (the doc contract
+        // says single-subscriber, so racing would already be UB on
+        // the consumer side, но this keeps the daemon-side behaviour
+        // deterministic).
+        let mut events = {
+            let client = bundle.client.lock().await;
+            client.events().await
+        };
+        while let Some(ev) = events.recv().await {
+            let user_ptr = user_addr as *mut std::ffi::c_void;
+            let payload_ptr = if ev.payload.is_empty() {
+                std::ptr::null()
+            } else {
+                ev.payload.as_ptr()
+            };
+            // catch_unwind around the callback so
+            // а panic doesn't unwind across the C-ABI frame
+            // (UB). Logged and the event-stream stays alive.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                cb_fn(user_ptr, ev.kind, payload_ptr, ev.payload.len());
+            }));
+            if result.is_err() {
+                eprintln!(
+                    "[veilclient-ffi] event-handler callback panicked; \
+                     event dropped, stream kept open",
+                );
+            }
+            // Loop continues until channel closes (None from recv).
+        }
+    });
+    if let Ok(mut guard) = h_ref.event_task.lock() {
+        *guard = Some(task);
+    }
+    VEIL_OK
+}
+
+// ── Identity restore ────────────────────────────────────────────
+
+/// Maximum freshness window для a restored IdentityDocument — 30 days.
+/// Mirrors `veil_identity::MAX_FRESHNESS_WINDOW_SECS`. Restored
+/// devices typically request the full window so the doc lives через
+/// the next routine document republish (default ~half-life).
+pub const VEIL_DEFAULT_RESTORE_VALIDITY_SECS: u64 = 30 * 24 * 3600;
+
+/// Validate a BIP-39 master phrase. Returns `VEIL_OK` iff the
+/// phrase is exactly 24 words from the English BIP-39 wordlist AND
+/// the checksum verifies. Sets `*err_out` к a human-readable
+/// description on failure (unknown word / wrong word count / bad
+/// checksum).
+///
+/// Lightweight — no key derivation, no disk I/O. UI uses this to
+/// give immediate feedback as the user types ("checksum invalid"
+/// before they hit "Restore").
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_validate_bip39_phrase(
+    phrase: *const c_char,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    let Some(phrase_str) = (unsafe { cstr_to_str(phrase) }) else {
+        unsafe {
+            write_err(err_out, "phrase is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
+        Ok(_seed) => VEIL_OK, // Zeroizing seed dropped immediately
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("invalid phrase: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Restore an identity from a BIP-39 master phrase.
+///
+/// Decodes phrase → master_seed → derives identity_sk → builds a
+/// fresh signed `IdentityDocument` → writes к `veil_dir`:
+///
+/// * `identity_document.bin` (signed master+device cert chain)
+/// * `instance.toml` (per-device label + sig key index)
+/// * `identity_sk.bin` (this device's per-instance signing key)
+///
+/// `instance_label` is the human-readable name shown в `identity show`
+/// output на other devices belonging к the same identity_id (e.g.
+/// "phone-2024-05"). Caps at 64 ASCII chars; longer names truncate.
+///
+/// Idempotent: re-running с the same phrase + same veil_dir
+/// regenerates the per-device identity_sk и rewrites the document.
+/// The `node_id` (= BLAKE3(master_pk)) is **stable** across calls.
+///
+/// Pow_difficulty is fixed at 0 для testnet builds; release builds
+/// using `production-seeds` would set it from a release-policy file.
+///
+/// Returns `VEIL_OK` on success. On failure sets `*err_out` к
+/// a description and returns `VEIL_ERR`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_restore_identity_from_phrase(
+    phrase: *const c_char,
+    veil_dir: *const c_char,
+    instance_label: *const c_char,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    let Some(phrase_str) = (unsafe { cstr_to_str(phrase) }) else {
+        unsafe {
+            write_err(err_out, "phrase is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(dir_str) = (unsafe { cstr_to_str(veil_dir) }) else {
+        unsafe {
+            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(label_str) = (unsafe { cstr_to_str(instance_label) }) else {
+        unsafe {
+            write_err(err_out, "instance_label is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+
+    let master_seed = match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("decode phrase: {e}"));
+            }
+            return VEIL_ERR;
+        }
+    };
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let opts = veil_identity::sovereign_flow::RestoreIdentityOptions {
+        veil_dir: std::path::PathBuf::from(dir_str),
+        master_seed,
+        save_encrypted_with_password: None,
+        argon2_params_override: None,
+        instance_label: label_str.chars().take(64).collect::<String>(),
+        pow_difficulty: 0,
+        now_unix,
+        valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
+        algo: veil_types::SignatureAlgorithm::Ed25519,
+        master_falcon_keypair_bytes: None,
+    };
+
+    match veil_identity::sovereign_flow::restore_identity(opts) {
+        Ok(_output) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("restore_identity: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+// ── zeroize-on-consume BIP-39 variants ────────────────
+//
+// The original `veil_validate_bip39_phrase` / `veil_restore_identity_from_phrase`
+// take the phrase as `*const c_char` and never zero the caller's buffer.
+// Hosts that load a 24-word seed phrase via malloc'd buffers (typical
+// Flutter `Pointer<Utf8>` from `String.toNativeUtf8`) leave that
+// memory in the heap until later allocations overwrite it, lengthening
+// the plaintext-lifetime window.
+//
+// The `_zeroize` variants below take a `*mut c_char` and overwrite
+// every byte (including the trailing NUL) with `0` after decoding, in
+// place. Caller still owns the allocation and is responsible for
+// freeing (now-zeroed) buffer.
+
+/// Zero-on-consume variant [`veil_validate_bip39_phrase`].
+///
+/// Reads the phrase, runs the same validation, and unconditionally
+/// overwrites the buffer bytes with `0` before returning — regardless
+/// of success or failure. Caller MUST guarantee `phrase` points to a
+/// writable, NUL-terminated UTF-8 buffer (typical: malloc'd from C, or
+/// `String.toNativeUtf8` in Dart).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
+    phrase: *mut c_char,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    let (phrase_str, phrase_len) = match unsafe { cstr_to_str_with_len(phrase) } {
+        Some(pair) => pair,
+        None => {
+            unsafe {
+                write_err(
+                    err_out,
+                    "phrase is NULL, too long (>4 KiB), or not valid UTF-8",
+                );
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let rc = match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
+        Ok(_seed) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("invalid phrase: {e}"));
+            }
+            VEIL_ERR
+        }
+    };
+    // Zero the caller's buffer including the trailing NUL. This runs
+    // unconditionally — even on the error path — so a bad phrase that
+    // exposes which words are wrong does not stay in plaintext.
+    unsafe {
+        std::ptr::write_bytes(phrase as *mut u8, 0, phrase_len.saturating_add(1));
+    }
+    rc
+}
+
+/// Zero-on-consume variant [`veil_restore_identity_from_phrase`].
+///
+/// Same contract as [`veil_restore_identity_from_phrase`] except
+/// `phrase` is `*mut c_char` (caller-owned writable buffer). After
+/// decoding the master seed, the phrase buffer is overwritten with `0`
+/// in place — including on every error path — before this function
+/// returns. `veil_dir` and `instance_label` are still `*const c_char`
+/// (non-secret).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
+    phrase: *mut c_char,
+    veil_dir: *const c_char,
+    instance_label: *const c_char,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if phrase.is_null() {
+        unsafe {
+            write_err(err_out, "phrase is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // Length check FIRST с bounded scan.  None ⇒ caller passed а NULL
+    // OR а non-NUL-terminated buffer longer than MAX_FFI_CSTR_LEN.  В
+    // last case we cannot safely scrub без knowing the actual allocation
+    // size, so refuse без touching the buffer.
+    let phrase_len = match unsafe { ffi_cstr_len_bounded(phrase) } {
+        Some(n) => n,
+        None => {
+            unsafe {
+                write_err(err_out, "phrase is NULL or too long (>4 KiB)");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+
+    // RAII guard: zero the buffer no matter how this function returns
+    // (early return on validation error, panic, success).  Armed AFTER
+    // bounded length check so we know `phrase_len` is safe to scrub.
+    struct ZeroOnDrop {
+        ptr: *mut u8,
+        len: usize,
+    }
+    impl Drop for ZeroOnDrop {
+        fn drop(&mut self) {
+            unsafe {
+                std::ptr::write_bytes(self.ptr, 0, self.len);
+            }
+        }
+    }
+    let _guard = ZeroOnDrop {
+        ptr: phrase as *mut u8,
+        len: phrase_len.saturating_add(1),
+    };
+
+    // UTF-8 decode AFTER guard armed, so а non-UTF8 phrase still gets
+    // scrubbed (possibly-sensitive bytes from а user input field).
+    let phrase_bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
+    let phrase_str = match std::str::from_utf8(phrase_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe {
+                write_err(err_out, "phrase is not valid UTF-8");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let Some(dir_str) = (unsafe { cstr_to_str(veil_dir) }) else {
+        unsafe {
+            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(label_str) = (unsafe { cstr_to_str(instance_label) }) else {
+        unsafe {
+            write_err(err_out, "instance_label is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+
+    let master_seed = match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("decode phrase: {e}"));
+            }
+            return VEIL_ERR;
+        }
+    };
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let opts = veil_identity::sovereign_flow::RestoreIdentityOptions {
+        veil_dir: std::path::PathBuf::from(dir_str),
+        master_seed,
+        save_encrypted_with_password: None,
+        argon2_params_override: None,
+        instance_label: label_str.chars().take(64).collect::<String>(),
+        pow_difficulty: 0,
+        now_unix,
+        valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
+        algo: veil_types::SignatureAlgorithm::Ed25519,
+        master_falcon_keypair_bytes: None,
+    };
+
+    match veil_identity::sovereign_flow::restore_identity(opts) {
+        Ok(_output) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("restore_identity: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Restore identity AND write an encrypted master-seed backup
+/// ([`veil_restore_identity_from_phrase_zeroize`] + passphrase-protected
+/// `master.enc` file in `veil_dir`).
+///
+/// Both `phrase` AND `password` buffers are zeroed in place before this
+/// function returns (on every code path — success, validation error,
+/// I/O error, или panic).  Caller still owns the allocations и frees
+/// them after this call.
+///
+/// `password` may be NULL — equivalent к calling
+/// [`veil_restore_identity_from_phrase_zeroize`] without the encrypted-
+/// master file.  This is provided as а convenience so consumer Flutter
+/// apps can branch on "user-supplied passphrase or not" without
+/// switching FFI symbols.
+///
+/// The Argon2id parameters are the spec-production default (64 MiB,
+/// t=3, p=4).  Test code wanting cheaper KDF must use the lower-level
+/// `veil_identity::sovereign_flow::restore_identity` directly с
+/// `argon2_params_override`.
+///
+/// # Safety
+/// `phrase` и (if non-NULL) `password` must each point к а writable,
+/// NUL-terminated UTF-8 buffer.  `veil_dir` и `instance_label` must
+/// be NUL-terminated UTF-8 (read-only).  `err_out` must be writable;
+/// on non-OK returns it receives а pointer к а malloc'd UTF-8 string —
+/// caller frees с [`veil_free_string`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password(
+    phrase: *mut c_char,
+    veil_dir: *const c_char,
+    instance_label: *const c_char,
+    password: *mut c_char,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if phrase.is_null() {
+        unsafe {
+            write_err(err_out, "phrase is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+
+    // RAII guard: zero both phrase + password buffers regardless of
+    // return path.  Same struct as the zeroize-only variant, repeated
+    // here per buffer because lengths differ.
+    struct ZeroOnDrop {
+        ptr: *mut u8,
+        len: usize,
+    }
+    impl Drop for ZeroOnDrop {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                unsafe {
+                    std::ptr::write_bytes(self.ptr, 0, self.len);
+                }
+            }
+        }
+    }
+
+    let phrase_len = match unsafe { ffi_cstr_len_bounded(phrase) } {
+        Some(n) => n,
+        None => {
+            unsafe {
+                write_err(err_out, "phrase is NULL or too long (>4 KiB)");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let _phrase_guard = ZeroOnDrop {
+        ptr: phrase as *mut u8,
+        len: phrase_len.saturating_add(1),
+    };
+
+    // Read password BEFORE constructing its guard so we can copy it к an owned
+    // buffer — the guard scrubs the original caller buffer after we return.
+    // Audit L-15: the owned copy is wrapped in `Zeroizing` and moved into
+    // `RestoreIdentityOptions.save_encrypted_with_password` (now typed
+    // `Option<Zeroizing<Vec<u8>>>`), so it is scrubbed when `opts` drops inside
+    // `restore_identity`. The encryption path only BORROWS the password, so this
+    // owned copy is the longest-lived plaintext and must wipe itself — the
+    // previous plain `Vec<u8>` left it in freed heap, defeating this function's
+    // whole purpose.
+    let (pw_bytes, _pw_guard) = if password.is_null() {
+        (
+            None,
+            ZeroOnDrop {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            },
+        )
+    } else {
+        let pw_len = match unsafe { ffi_cstr_len_bounded(password) } {
+            Some(n) => n,
+            None => {
+                unsafe {
+                    write_err(err_out, "password too long (>4 KiB)");
+                }
+                return VEIL_ERR_INVALID_ARG;
+            }
+        };
+        let guard = ZeroOnDrop {
+            ptr: password as *mut u8,
+            len: pw_len.saturating_add(1),
+        };
+        let pw_slice = unsafe { std::slice::from_raw_parts(password as *const u8, pw_len) };
+        let bytes = match std::str::from_utf8(pw_slice) {
+            Ok(s) => Some(zeroize::Zeroizing::new(s.as_bytes().to_vec())),
+            Err(_) => {
+                unsafe {
+                    write_err(err_out, "password is not valid UTF-8");
+                }
+                return VEIL_ERR_INVALID_ARG;
+            }
+        };
+        (bytes, guard)
+    };
+
+    let phrase_bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
+    let phrase_str = match std::str::from_utf8(phrase_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe {
+                write_err(err_out, "phrase is not valid UTF-8");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let Some(dir_str) = (unsafe { cstr_to_str(veil_dir) }) else {
+        unsafe {
+            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    let Some(label_str) = (unsafe { cstr_to_str(instance_label) }) else {
+        unsafe {
+            write_err(err_out, "instance_label is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+
+    let master_seed = match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("decode phrase: {e}"));
+            }
+            return VEIL_ERR;
+        }
+    };
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let opts = veil_identity::sovereign_flow::RestoreIdentityOptions {
+        veil_dir: std::path::PathBuf::from(dir_str),
+        master_seed,
+        save_encrypted_with_password: pw_bytes,
+        argon2_params_override: None,
+        instance_label: label_str.chars().take(64).collect::<String>(),
+        pow_difficulty: 0,
+        now_unix,
+        valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
+        algo: veil_types::SignatureAlgorithm::Ed25519,
+        master_falcon_keypair_bytes: None,
+    };
+
+    match veil_identity::sovereign_flow::restore_identity(opts) {
+        Ok(_output) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("restore_identity: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+// ── Multi-device pairing FFI (Epic 489.8) ──────────────────────
+
+/// Wire-byte status codes для Source-side pairing ops.  Mirror
+/// `veil_proto::pair_source_status`.
+pub const VEIL_PAIR_SOURCE_OK: u8 = 0;
+pub const VEIL_PAIR_SOURCE_NOT_CONFIGURED: u8 = 1;
+pub const VEIL_PAIR_SOURCE_ALREADY_IN_PROGRESS: u8 = 2;
+pub const VEIL_PAIR_SOURCE_INTERNAL_ERROR: u8 = 3;
+pub const VEIL_PAIR_SOURCE_WRONG_STATE: u8 = 4;
+pub const VEIL_PAIR_SOURCE_BAD_HELLO: u8 = 5;
+pub const VEIL_PAIR_SOURCE_USER_ABORTED: u8 = 6;
+pub const VEIL_PAIR_SOURCE_BAD_CONFIRM: u8 = 7;
+
+/// Wire-byte status codes для Target-side pairing ops.  Mirror
+/// `veil_proto::pair_target_status`.
+pub const VEIL_PAIR_TARGET_OK: u8 = 0;
+pub const VEIL_PAIR_TARGET_BAD_URI: u8 = 1;
+pub const VEIL_PAIR_TARGET_EXPIRED: u8 = 2;
+pub const VEIL_PAIR_TARGET_ALREADY_IN_PROGRESS: u8 = 3;
+pub const VEIL_PAIR_TARGET_BAD_CERT: u8 = 4;
+pub const VEIL_PAIR_TARGET_WRONG_STATE: u8 = 5;
+pub const VEIL_PAIR_TARGET_INTERNAL_ERROR: u8 = 6;
+
+/// Hard cap on ceremony frame size (mirrors
+/// `veil_proto::MAX_PAIR_CEREMONY_BYTES`).  Callers can pre-
+/// allocate а buffer of this size to safely receive Hello / Cert /
+/// Confirm bytes without two-call sizing.
+pub const VEIL_MAX_PAIR_CEREMONY_BYTES: size_t = 64 * 1024;
+
+/// OOB code length (always 6 ASCII digits).
+pub const VEIL_PAIR_OOB_CODE_LEN: size_t = 6;
+
+/// Helper: write SDK reply detail to err_out если non-empty (treats
+/// detail as advisory metadata, not а fatal-error string).  Used by
+/// every pairing FFI fn so consumers get а stable surface.
+unsafe fn write_pair_detail(err_out: *mut *mut c_char, detail: &str) {
+    if !detail.is_empty() && !err_out.is_null() {
+        unsafe {
+            write_err(err_out, detail);
+        }
+    }
+}
+
+/// Source-side: generate а pair-invite URI + initialize ceremony.
+/// On success, `*out_uri` receives а malloc'd NUL-terminated UTF-8
+/// string — caller frees с [`veil_free_string`].  `password` MUST
+/// be NUL-terminated UTF-8 (the master_sk decryption passphrase).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_pair_source_create_invite(
+    handle: *mut VeilHandle,
+    password: *const c_char,
+    out_status: *mut u8,
+    out_uri: *mut *mut c_char,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_pair_source_create_invite") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_status" => out_status,
+        "out_uri" => out_uri,
+    );
+    unsafe {
+        *out_uri = ptr::null_mut();
+    }
+    let pw = unsafe { cstr_to_str(password) };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.pair_source_create_invite(pw).await
+    });
+    match res {
+        Ok(reply) => {
+            unsafe {
+                *out_status = reply.status;
+            }
+            if reply.status == VEIL_PAIR_SOURCE_OK && !reply.uri.is_empty() {
+                match std::ffi::CString::new(reply.uri.as_bytes()) {
+                    Ok(c) => unsafe {
+                        *out_uri = c.into_raw();
+                    },
+                    Err(e) => unsafe {
+                        *out_status = VEIL_PAIR_SOURCE_INTERNAL_ERROR;
+                        write_err(err_out, format!("URI contains NUL byte: {e}"));
+                    },
+                }
+            }
+            unsafe {
+                write_pair_detail(err_out, &reply.detail);
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("pair_source_create_invite failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Source-side: process Hello bytes from Target.  Returns Cert bytes
+/// (via caller buffer) + 6-digit OOB code.  `out_cert_buf` must be
+/// writable for ≥ `out_cert_buf_cap` bytes (recommend
+/// `VEIL_MAX_PAIR_CEREMONY_BYTES` = 64 KiB so а fixed-size buffer
+/// always fits the Cert).  `out_oob_6` MUST point к а 6-byte buffer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_pair_source_handle_hello(
+    handle: *mut VeilHandle,
+    hello_bytes: *const u8,
+    hello_len: size_t,
+    out_status: *mut u8,
+    out_oob_6: *mut u8,
+    out_cert_buf: *mut u8,
+    out_cert_buf_cap: size_t,
+    out_cert_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_pair_source_handle_hello") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_status" => out_status,
+        "out_oob_6" => out_oob_6,
+        "out_cert_buf" => out_cert_buf,
+        "out_cert_len" => out_cert_len,
+    );
+    if hello_bytes.is_null() && hello_len > 0 {
+        unsafe {
+            write_err(err_out, "hello_bytes is NULL but hello_len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // Audit L-16: bound the caller-supplied length BEFORE `from_raw_parts(...)
+    // .to_vec()`, matching every other byte-input FFI fn. An unbounded `len`
+    // (mis-bound / hostile caller) would OOM-kill the host before any downstream
+    // pairing-frame limit fires. 64 KiB is the documented ceremony-frame cap.
+    if hello_len > VEIL_MAX_PAIR_CEREMONY_BYTES {
+        unsafe {
+            write_err(err_out, "hello_len exceeds VEIL_MAX_PAIR_CEREMONY_BYTES");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    unsafe {
+        ptr::write_bytes(out_oob_6, 0, 6);
+        *out_cert_len = 0;
+    }
+    let hello = if hello_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(hello_bytes, hello_len) }.to_vec()
+    };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.pair_source_handle_hello(hello).await
+    });
+    match res {
+        Ok(reply) => {
+            unsafe {
+                *out_status = reply.status;
+            }
+            if reply.status == VEIL_PAIR_SOURCE_OK {
+                if reply.response_bytes.len() > out_cert_buf_cap {
+                    unsafe {
+                        write_err(
+                            err_out,
+                            format!(
+                                "cert bytes {} > out_cert_buf_cap {}",
+                                reply.response_bytes.len(),
+                                out_cert_buf_cap,
+                            ),
+                        );
+                        *out_status = VEIL_PAIR_SOURCE_INTERNAL_ERROR;
+                    }
+                } else {
+                    unsafe {
+                        if !reply.response_bytes.is_empty() {
+                            ptr::copy_nonoverlapping(
+                                reply.response_bytes.as_ptr(),
+                                out_cert_buf,
+                                reply.response_bytes.len(),
+                            );
+                        }
+                        *out_cert_len = reply.response_bytes.len();
+                        ptr::copy_nonoverlapping(reply.oob_code.as_ptr(), out_oob_6, 6);
+                    }
+                }
+            }
+            unsafe {
+                write_pair_detail(err_out, &reply.detail);
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("pair_source_handle_hello failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Source-side: process Confirm bytes — finalizes the ceremony.
+///
+/// Phase 6.49 exemplar: uses [`guard::ffi_prelude`] + [`null_check!`]
+/// for the boundary checks так that the consistent error messages
+/// land на every FFI fn after incremental migration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_pair_source_handle_confirm(
+    handle: *mut VeilHandle,
+    confirm_bytes: *const u8,
+    confirm_len: size_t,
+    out_status: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_pair_source_handle_confirm") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_status" => out_status,
+    );
+    // Conditional null check doesn't fit the уni-form macro shape —
+    // keep inline.  Pattern stays consistent across all FFI fns.
+    if confirm_bytes.is_null() && confirm_len > 0 {
+        unsafe {
+            write_err(err_out, "confirm_bytes is NULL but confirm_len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // Audit L-16: bound the length before `from_raw_parts(...).to_vec()`.
+    if confirm_len > VEIL_MAX_PAIR_CEREMONY_BYTES {
+        unsafe {
+            write_err(err_out, "confirm_len exceeds VEIL_MAX_PAIR_CEREMONY_BYTES");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let confirm = if confirm_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(confirm_bytes, confirm_len) }.to_vec()
+    };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.pair_source_handle_confirm(confirm).await
+    });
+    match res {
+        Ok(reply) => {
+            unsafe {
+                *out_status = reply.status;
+                write_pair_detail(err_out, &reply.detail);
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("pair_source_handle_confirm failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Target-side: consume scanned URI, build Hello bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_pair_target_consume_uri(
+    handle: *mut VeilHandle,
+    uri: *const c_char,
+    out_status: *mut u8,
+    out_hello_buf: *mut u8,
+    out_hello_buf_cap: size_t,
+    out_hello_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_pair_target_consume_uri") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_status" => out_status,
+        "out_hello_buf" => out_hello_buf,
+        "out_hello_len" => out_hello_len,
+    );
+    let Some(uri_str) = (unsafe { cstr_to_str(uri) }) else {
+        unsafe {
+            write_err(err_out, "uri is NULL or invalid UTF-8");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    };
+    unsafe {
+        *out_hello_len = 0;
+    }
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.pair_target_consume_uri(uri_str).await
+    });
+    match res {
+        Ok(reply) => {
+            unsafe {
+                *out_status = reply.status;
+            }
+            if reply.status == VEIL_PAIR_TARGET_OK {
+                if reply.bytes.len() > out_hello_buf_cap {
+                    unsafe {
+                        write_err(
+                            err_out,
+                            format!(
+                                "hello bytes {} > out_hello_buf_cap {}",
+                                reply.bytes.len(),
+                                out_hello_buf_cap,
+                            ),
+                        );
+                        *out_status = VEIL_PAIR_TARGET_INTERNAL_ERROR;
+                    }
+                } else {
+                    unsafe {
+                        if !reply.bytes.is_empty() {
+                            ptr::copy_nonoverlapping(
+                                reply.bytes.as_ptr(),
+                                out_hello_buf,
+                                reply.bytes.len(),
+                            );
+                        }
+                        *out_hello_len = reply.bytes.len();
+                    }
+                }
+            }
+            unsafe {
+                write_pair_detail(err_out, &reply.detail);
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("pair_target_consume_uri failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Target-side: process Cert bytes, return OOB code.
+///
+/// Phase 6.49 exemplar (second after `veil_pair_source_handle_confirm`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_pair_target_handle_cert(
+    handle: *mut VeilHandle,
+    cert_bytes: *const u8,
+    cert_len: size_t,
+    out_status: *mut u8,
+    out_oob_6: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_pair_target_handle_cert") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_status" => out_status,
+        "out_oob_6" => out_oob_6,
+    );
+    if cert_bytes.is_null() && cert_len > 0 {
+        unsafe {
+            write_err(err_out, "cert_bytes is NULL but cert_len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // Audit L-16: bound the length before `from_raw_parts(...).to_vec()`.
+    if cert_len > VEIL_MAX_PAIR_CEREMONY_BYTES {
+        unsafe {
+            write_err(err_out, "cert_len exceeds VEIL_MAX_PAIR_CEREMONY_BYTES");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    unsafe {
+        ptr::write_bytes(out_oob_6, 0, 6);
+    }
+    let cert = if cert_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(cert_bytes, cert_len) }.to_vec()
+    };
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.pair_target_handle_cert(cert).await
+    });
+    match res {
+        Ok(reply) => {
+            unsafe {
+                *out_status = reply.status;
+                if reply.status == VEIL_PAIR_TARGET_OK {
+                    ptr::copy_nonoverlapping(reply.oob_code.as_ptr(), out_oob_6, 6);
+                }
+                write_pair_detail(err_out, &reply.detail);
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("pair_target_handle_cert failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Target-side: emit Confirm bytes based на user's OOB-compare
+/// decision.  `confirmed = 1` triggers identity persistence.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_pair_target_build_confirm(
+    handle: *mut VeilHandle,
+    confirmed: u8,
+    out_status: *mut u8,
+    out_confirm_buf: *mut u8,
+    out_confirm_buf_cap: size_t,
+    out_confirm_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_pair_target_build_confirm") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_status" => out_status,
+        "out_confirm_buf" => out_confirm_buf,
+        "out_confirm_len" => out_confirm_len,
+    );
+    unsafe {
+        *out_confirm_len = 0;
+    }
+    live_or_return!(
+        handle_registry(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.pair_target_build_confirm(confirmed != 0).await
+    });
+    match res {
+        Ok(reply) => {
+            unsafe {
+                *out_status = reply.status;
+            }
+            if reply.status == VEIL_PAIR_TARGET_OK {
+                if reply.bytes.len() > out_confirm_buf_cap {
+                    unsafe {
+                        write_err(
+                            err_out,
+                            format!(
+                                "confirm bytes {} > out_confirm_buf_cap {}",
+                                reply.bytes.len(),
+                                out_confirm_buf_cap,
+                            ),
+                        );
+                        *out_status = VEIL_PAIR_TARGET_INTERNAL_ERROR;
+                    }
+                } else {
+                    unsafe {
+                        if !reply.bytes.is_empty() {
+                            ptr::copy_nonoverlapping(
+                                reply.bytes.as_ptr(),
+                                out_confirm_buf,
+                                reply.bytes.len(),
+                            );
+                        }
+                        *out_confirm_len = reply.bytes.len();
+                    }
+                }
+            }
+            unsafe {
+                write_pair_detail(err_out, &reply.detail);
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("pair_target_build_confirm failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CStr;
+
+    #[test]
+    fn null_handle_close_is_noop() {
+        unsafe {
+            veil_close(ptr::null_mut());
+        }
+    }
+
+    /// Audit cycle-7 M1: the live-handle registry makes a double-close a safe
+    /// no-op WITHOUT dereferencing the (possibly freed) pointer. We exercise
+    /// the registry directly with synthetic addresses — they are never
+    /// dereferenced, so no real allocation is required.
+    #[test]
+    fn live_handle_registry_double_close_is_safe_noop() {
+        let reg = handle_registry();
+        // A fake address that is never dereferenced (proves the guard is
+        // deref-free: a real freed pointer would be UB to read).
+        let addr = 0xDEAD_BEEF_usize;
+
+        register_handle(reg, addr);
+        // First close: address is live → claim it.
+        assert!(
+            unregister_handle(reg, addr),
+            "first close must claim the live handle"
+        );
+        // Second close (the double-close the guard exists for): no-op.
+        assert!(
+            !unregister_handle(reg, addr),
+            "double-close must be a safe no-op"
+        );
+        // Never-registered / garbage address: no-op.
+        assert!(
+            !unregister_handle(reg, 0x1234_usize),
+            "garbage pointer must be a no-op"
+        );
+    }
+
+    /// Per-type registries prevent cross-type pointer confusion: an address
+    /// registered as a handle is invisible to the app/stream close paths, so
+    /// passing the wrong pointer to `veil_app_close` is a no-op, not a
+    /// type-confused free.
+    #[test]
+    fn registries_are_per_type_isolated() {
+        let addr = 0xABCD_0001_usize;
+        register_handle(handle_registry(), addr);
+        assert!(
+            !unregister_handle(app_registry(), addr),
+            "app close must not claim a handle addr"
+        );
+        assert!(
+            !unregister_handle(stream_registry(), addr),
+            "stream close must not claim a handle addr"
+        );
+        assert!(
+            unregister_handle(handle_registry(), addr),
+            "correct-type close still works"
+        );
+    }
+
+    /// `is_registered` is the non-destructive probe behind the USE-path guard
+    /// (audit M-2). It must report membership WITHOUT removing the address (so
+    /// it is safe to call on every deref), report `false` for never-registered
+    /// / garbage addresses, and — critically — never dereference the address.
+    #[test]
+    fn is_registered_probe_is_non_destructive() {
+        let reg = handle_registry();
+        let addr = 0x1515_0001_usize;
+
+        // Not registered yet → false.
+        assert!(!is_registered(reg, addr), "unknown addr must be not-live");
+
+        register_handle(reg, addr);
+        // Registered → true, repeatedly (non-destructive: does NOT consume it).
+        assert!(is_registered(reg, addr), "registered addr must be live");
+        assert!(
+            is_registered(reg, addr),
+            "probe must not consume the entry — still live on second call"
+        );
+        // Garbage address never registered → false.
+        assert!(
+            !is_registered(reg, 0x9999_9999_usize),
+            "garbage addr must be not-live"
+        );
+
+        // After close → false (this is the use-after-close signal).
+        assert!(unregister_handle(reg, addr), "close claims the live handle");
+        assert!(
+            !is_registered(reg, addr),
+            "closed addr must be reported not-live"
+        );
+    }
+
+    /// Audit M-2 (use-after-close): calling a real USE method on a handle that
+    /// was registered and then CLOSED (unregistered) must return the
+    /// invalid-arg error via the liveness guard, NOT dereference the now-stale
+    /// pointer. We use a synthetic non-NULL address that is never dereferenced —
+    /// the guard rejects it on the integer-address membership check *before* the
+    /// `unsafe { &*handle }` deref, so this exercises the security property
+    /// without committing real UB (reading a freed allocation).
+    #[test]
+    fn use_after_close_handle_returns_error_not_uaf() {
+        // Distinct sentinel (parallel tests share the global registries).
+        let stale = 0x0AF5_0001_usize as *mut VeilHandle;
+
+        // Simulate the create→close lifecycle WITHOUT a real allocation:
+        // register the address, then unregister it (== `veil_close`).
+        register_handle(handle_registry(), stale as usize);
+        assert!(
+            unregister_handle(handle_registry(), stale as usize),
+            "precondition: close claims the live handle"
+        );
+
+        // USE after close: the guard must fire and return INVALID_ARG.
+        let mut out_node = [0u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_get_node_id(stale, out_node.as_mut_ptr(), &mut err) };
+        assert_eq!(
+            rc, VEIL_ERR_INVALID_ARG,
+            "use-after-close must return INVALID_ARG, not crash"
+        );
+        assert!(!err.is_null(), "guard must write a diagnostic");
+        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        assert_eq!(msg, "VeilHandle: use-after-close or unknown handle");
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    /// A handle pointer that was NEVER registered (e.g. a wild/forged value, or
+    /// a different object's address) is likewise rejected by the guard before
+    /// any deref. Same security property as the closed case, different entry.
+    #[test]
+    fn unknown_handle_returns_error_not_uaf() {
+        let bogus = 0x0AF5_0002_usize as *mut VeilHandle;
+        // Deliberately NOT registered.
+        let mut out_node = [0u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_get_node_id(bogus, out_node.as_mut_ptr(), &mut err) };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        assert_eq!(msg, "VeilHandle: use-after-close or unknown handle");
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    /// Audit M-2 (use-after-close) for `VeilApp*`: a closed app pointer
+    /// passed to a real send must hit the app-registry guard and return
+    /// INVALID_ARG before the `unsafe { &*app }` deref. `len == 0` with valid
+    /// stack dst buffers carries control past the cheap arg checks straight to
+    /// the liveness guard.
+    #[test]
+    fn use_after_close_app_returns_error_not_uaf() {
+        let stale = 0x0AF5_0003_usize as *mut VeilApp;
+        register_handle(app_registry(), stale as usize);
+        assert!(
+            unregister_handle(app_registry(), stale as usize),
+            "precondition: app close claims the live handle"
+        );
+
+        let dst_node = [0u8; 32];
+        let dst_app = [0u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_send(
+                stale,
+                dst_node.as_ptr(),
+                dst_app.as_ptr(),
+                0,
+                ptr::null(),
+                0,
+                &mut err,
+            )
+        };
+        assert_eq!(
+            rc, VEIL_ERR_INVALID_ARG,
+            "use-after-close app must return INVALID_ARG, not crash"
+        );
+        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        assert_eq!(msg, "VeilApp: use-after-close or unknown handle");
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    /// Audit M-2 (use-after-close) for `VeilStreamFfi*`: a closed stream
+    /// pointer passed to a real write must hit the stream-registry guard and
+    /// return INVALID_ARG before the `unsafe { &*stream }` deref.
+    #[test]
+    fn use_after_close_stream_returns_error_not_uaf() {
+        let stale = 0x0AF5_0004_usize as *mut VeilStreamFfi;
+        register_handle(stream_registry(), stale as usize);
+        assert!(
+            unregister_handle(stream_registry(), stale as usize),
+            "precondition: stream close claims the live handle"
+        );
+
+        let mut err: *mut c_char = ptr::null_mut();
+        // len == 0 → no payload deref; control reaches the liveness guard.
+        let rc = unsafe { veil_stream_write(stale, ptr::null(), 0, &mut err) };
+        assert_eq!(
+            rc, VEIL_ERR_INVALID_ARG,
+            "use-after-close stream must return INVALID_ARG, not crash"
+        );
+        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        assert_eq!(msg, "VeilStreamFfi: use-after-close or unknown handle");
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    /// Cross-type confusion on the USE path: an address registered as a HANDLE
+    /// but passed to an APP method must be rejected (it is not in the app
+    /// registry), mirroring the per-type isolation already enforced on close.
+    #[test]
+    fn use_path_rejects_cross_type_pointer() {
+        let addr = 0x0AF5_0005_usize;
+        register_handle(handle_registry(), addr);
+
+        // Same address handed to an app USE method → not in app_registry → error.
+        let dst_node = [0u8; 32];
+        let dst_app = [0u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_send(
+                addr as *mut VeilApp,
+                dst_node.as_ptr(),
+                dst_app.as_ptr(),
+                0,
+                ptr::null(),
+                0,
+                &mut err,
+            )
+        };
+        assert_eq!(
+            rc, VEIL_ERR_INVALID_ARG,
+            "a handle addr must not be usable as an app"
+        );
+        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        assert_eq!(msg, "VeilApp: use-after-close or unknown handle");
+        unsafe {
+            veil_free_string(err);
+        }
+        // Cleanup the global registry so we don't leak the sentinel.
+        assert!(unregister_handle(handle_registry(), addr));
+    }
+
+    /// Bounded FFI string scan must accept а normal NUL-terminated buffer
+    /// и reject (1) NULL pointer, (2) buffer без NUL within MAX_FFI_CSTR_LEN.
+    /// Closes the OOB-read surface где caller passes mis-terminated input.
+    #[test]
+    fn ffi_cstr_bounded_scan_accepts_and_rejects() {
+        // Accept: normal NUL-terminated CString.
+        let valid = CString::new("hello").unwrap();
+        let (s, n) =
+            unsafe { cstr_to_str_with_len(valid.as_ptr()) }.expect("normal CString must decode");
+        assert_eq!(s, "hello");
+        assert_eq!(n, 5);
+
+        // Reject: NULL pointer.
+        let null_result = unsafe { cstr_to_str_with_len(std::ptr::null()) };
+        assert!(null_result.is_none(), "NULL pointer must yield None");
+
+        // Reject: buffer of MAX_FFI_CSTR_LEN bytes без NUL.  Use Vec<u8>
+        // filled с 'A' (no NUL anywhere); `strnlen` will scan up to the
+        // cap, see no NUL, и return MAX_FFI_CSTR_LEN — helper rejects.
+        let runaway = vec![b'A'; MAX_FFI_CSTR_LEN + 16];
+        let bounded = unsafe { cstr_to_str_with_len(runaway.as_ptr() as *const c_char) };
+        assert!(
+            bounded.is_none(),
+            "non-NUL-terminated buffer must be rejected при scan past cap"
+        );
+
+        // ffi_cstr_len_bounded follows same contract.
+        let len_only = unsafe { ffi_cstr_len_bounded(valid.as_ptr()) };
+        assert_eq!(len_only, Some(5));
+        let len_runaway = unsafe { ffi_cstr_len_bounded(runaway.as_ptr() as *const c_char) };
+        assert!(len_runaway.is_none());
+    }
+
+    #[test]
+    fn null_string_free_is_noop() {
+        unsafe {
+            veil_free_string(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn connect_to_invalid_path_returns_null() {
+        let path = CString::new("/nonexistent/path/that/does/not/exist.sock").unwrap();
+        let mut err: *mut c_char = ptr::null_mut();
+        let h = unsafe { veil_connect(path.as_ptr(), &mut err) };
+        assert!(h.is_null());
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    #[test]
+    fn connect_with_null_path_returns_null() {
+        let mut err: *mut c_char = ptr::null_mut();
+        let h = unsafe { veil_connect(ptr::null(), &mut err) };
+        assert!(h.is_null());
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    #[test]
+    fn null_app_get_id_returns_invalid_arg() {
+        let mut buf = [0u8; 32];
+        let rc = unsafe { veil_app_get_app_id(ptr::null(), buf.as_mut_ptr()) };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+    }
+
+    #[test]
+    fn null_app_get_endpoint_id_returns_zero() {
+        let rc = unsafe { veil_app_get_endpoint_id(ptr::null()) };
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn null_app_close_is_noop() {
+        unsafe {
+            veil_app_close(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn null_stream_close_is_noop() {
+        unsafe {
+            veil_stream_close(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn null_app_send_returns_invalid_arg() {
+        let dst_node = [0u8; 32];
+        let dst_app = [0u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_send(
+                ptr::null_mut(),
+                dst_node.as_ptr(),
+                dst_app.as_ptr(),
+                0,
+                ptr::null(),
+                0,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    /// every block_on / blocking_lock FFI entry
+    /// point must refuse to run when called from inside a Tokio
+    /// runtime worker (e.g. recv-handler callback) — a re-entrant
+    /// `block_on` would park the only worker forever. We verify the
+    /// guard fires by calling `veil_connect` from a tokio task; the
+    /// runtime context check should trip and surface
+    /// [`VEIL_ERR_REENTRANT`] / a NULL handle without ever
+    /// reaching `runtime.block_on`.
+    #[test]
+    fn phase647_h6_connect_from_tokio_runtime_returns_reentrant() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let r = rt.block_on(async {
+            let path = CString::new("/tmp/veil-h6.sock").unwrap();
+            let mut err: *mut c_char = ptr::null_mut();
+            let h = unsafe { veil_connect(path.as_ptr(), &mut err) };
+            let err_string = if err.is_null() {
+                String::new()
+            } else {
+                let s = unsafe { CStr::from_ptr(err) }
+                    .to_string_lossy()
+                    .into_owned();
+                unsafe {
+                    veil_free_string(err);
+                }
+                s
+            };
+            (h.is_null(), err_string)
+        });
+        assert!(
+            r.0,
+            "handle must be NULL when called from inside tokio runtime"
+        );
+        assert!(
+            r.1.contains("would deadlock"),
+            "err message should mention deadlock; got: {}",
+            r.1
+        );
+    }
+
+    /// sanity: the same call from a non-tokio thread must NOT trip
+    /// the guard (otherwise the guard is broken). We can't actually
+    /// connect (path is invalid), but the failure mode must be the
+    /// connect-error path, not the re-entrancy path.
+    #[test]
+    fn phase647_h6_connect_from_plain_thread_does_not_trip_guard() {
+        let path = CString::new("/nonexistent/h6.sock").unwrap();
+        let mut err: *mut c_char = ptr::null_mut();
+        let h = unsafe { veil_connect(path.as_ptr(), &mut err) };
+        assert!(h.is_null());
+        assert!(!err.is_null());
+        let s = unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            veil_free_string(err);
+        }
+        // Real failure is "connect failed:..." — guard would say "would deadlock".
+        assert!(
+            !s.contains("would deadlock"),
+            "guard must NOT fire on a fresh thread; got: {s}"
+        );
+    }
+
+    /// zeroize-on-consume variant overwrites
+    /// the caller's phrase buffer in place. After return, every byte
+    /// of the original phrase must be `0` — including on the error
+    /// path (invalid checksum), so a UI bug that retries with the
+    /// same buffer doesn't keep the secret resident in heap.
+    #[test]
+    fn phase647_h8_validate_zeroize_clears_phrase_buffer_on_success() {
+        let phrase = fresh_phrase();
+        let phrase_bytes = phrase.as_bytes_with_nul().to_vec();
+        // Move the bytes into a heap-owned buffer that mimics a C-side
+        // malloc — write_bytes(0) on it is well-defined.
+        let mut buf: Vec<u8> = phrase_bytes.clone();
+        let buf_ptr = buf.as_mut_ptr() as *mut c_char;
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf_ptr, &mut err) };
+        assert_eq!(rc, VEIL_OK);
+        assert!(err.is_null());
+        // Every byte (including trailing NUL) must now be 0.
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "buffer must be fully zeroed; got: {:?}",
+            buf
+        );
+    }
+
+    #[test]
+    fn phase647_h8_validate_zeroize_clears_phrase_buffer_on_error() {
+        // Crafted invalid phrase (random words but not a real BIP-39).
+        let bad = std::ffi::CString::new(
+            "abandon abandon abandon abandon abandon abandon abandon abandon \
+             abandon abandon abandon abandon abandon abandon abandon abandon \
+             abandon abandon abandon abandon abandon abandon abandon zoo",
+        )
+        .unwrap();
+        let mut buf: Vec<u8> = bad.as_bytes_with_nul().to_vec();
+        let buf_ptr = buf.as_mut_ptr() as *mut c_char;
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf_ptr, &mut err) };
+        assert_eq!(rc, VEIL_ERR); // bad checksum
+        if !err.is_null() {
+            unsafe {
+                veil_free_string(err);
+            }
+        }
+        // Even on the error path the buffer must be zeroed.
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "buffer must be zeroed on error path; got: {:?}",
+            buf
+        );
+    }
+
+    #[test]
+    fn phase647_h8_validate_zeroize_rejects_null() {
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_validate_bip39_phrase_zeroize(ptr::null_mut(), &mut err) };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    unsafe extern "C" fn noop_event_cb(
+        _user: *mut std::ffi::c_void,
+        _kind: u8,
+        _payload: *const u8,
+        _payload_len: size_t,
+    ) {
+    }
+
+    #[test]
+    fn null_handle_set_event_handler_returns_invalid_arg() {
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_set_event_handler(
+                ptr::null_mut(),
+                Some(noop_event_cb),
+                ptr::null_mut(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    /// NULL callback (i.e. `None` after
+    /// the `Option<fn>` retype) must be rejected с `VEIL_ERR_INVALID_ARG`
+    /// rather than dereferenced — pre-fix this would have segfaulted.
+    #[test]
+    fn null_callback_set_event_handler_returns_invalid_arg() {
+        // Note: passing `None` requires а live handle to exercise the
+        // post-handle-check path. We use а null handle here to confirm
+        // that handle check fires first; а separate test would need а
+        // real VeilHandle к hit the cb-check after.
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc =
+            unsafe { veil_set_event_handler(ptr::null_mut(), None, ptr::null_mut(), &mut err) };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    #[test]
+    fn event_kind_constants_match_proto() {
+        assert_eq!(
+            VEIL_EVENT_SESSIONS_CHANGED,
+            veil_proto::event_kind::SESSIONS_CHANGED
+        );
+        assert_eq!(
+            VEIL_EVENT_MOBILE_TIER_CHANGED,
+            veil_proto::event_kind::MOBILE_TIER_CHANGED
+        );
+        assert_eq!(
+            VEIL_EVENT_IDENTITY_ROTATED,
+            veil_proto::event_kind::IDENTITY_ROTATED
+        );
+        assert_eq!(
+            VEIL_EVENT_MAILBOX_DRAINED,
+            veil_proto::event_kind::MAILBOX_DRAINED
+        );
+    }
+
+    // ── Wake-HMAC FFI (Epic 489.10 slice 4.3.3) ──────────────────────
+
+    #[test]
+    fn wake_hmac_constants_match_crypto() {
+        assert_eq!(
+            VEIL_WAKE_HMAC_KEY_LEN,
+            veil_crypto::wake_hmac::WAKE_HMAC_KEY_LEN,
+        );
+        assert_eq!(
+            VEIL_WAKE_PAYLOAD_LEN,
+            veil_crypto::wake_hmac::WAKE_PAYLOAD_LEN,
+        );
+        // Verdict codes ара not exposed на the crypto side as integers
+        // (they're а Rust enum), но this test pins the FFI mapping
+        // contract: 0 = Valid, 1 = Tampered, 2 = Expired, 3 = Malformed.
+        assert_eq!(VEIL_WAKE_VERDICT_VALID, 0);
+        assert_eq!(VEIL_WAKE_VERDICT_TAMPERED, 1);
+        assert_eq!(VEIL_WAKE_VERDICT_EXPIRED, 2);
+        assert_eq!(VEIL_WAKE_VERDICT_MALFORMED, 3);
+    }
+
+    #[test]
+    fn generate_wake_hmac_key_writes_32_bytes() {
+        let mut buf = [0u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_generate_wake_hmac_key(buf.as_mut_ptr(), &mut err) };
+        assert_eq!(rc, VEIL_OK);
+        assert!(err.is_null());
+        // OsRng-generated key is extremely unlikely к be all zeros.
+        assert!(buf.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn generate_wake_hmac_key_rejects_null_out() {
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_generate_wake_hmac_key(ptr::null_mut(), &mut err) };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe { veil_free_string(err) };
+    }
+
+    #[test]
+    fn verify_wake_hmac_accepts_well_formed_payload() {
+        let key = veil_crypto::wake_hmac::WakeHmacKey::from_bytes([1u8; 32]);
+        let cid = [2u8; 32];
+        let rid = [3u8; 32];
+        let ts = 1_700_000_000u64;
+        let tag = veil_crypto::wake_hmac::compute_wake_hmac(&key, ts, &cid, &rid);
+        let payload = veil_crypto::wake_hmac::encode_wake_payload(ts, &cid, &tag);
+        let mut verdict: c_int = -1;
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_verify_wake_hmac(
+                key.as_bytes().as_ptr(),
+                payload.as_ptr(),
+                payload.len(),
+                rid.as_ptr(),
+                ts + 10,
+                &mut verdict,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert_eq!(verdict, VEIL_WAKE_VERDICT_VALID);
+        assert!(err.is_null());
+    }
+
+    #[test]
+    fn verify_wake_hmac_rejects_forged_payload_silently() {
+        let key = veil_crypto::wake_hmac::WakeHmacKey::from_bytes([1u8; 32]);
+        let wrong_key = veil_crypto::wake_hmac::WakeHmacKey::from_bytes([2u8; 32]);
+        let cid = [2u8; 32];
+        let rid = [3u8; 32];
+        let ts = 1_700_000_000u64;
+        let forged_tag = veil_crypto::wake_hmac::compute_wake_hmac(&wrong_key, ts, &cid, &rid);
+        let payload = veil_crypto::wake_hmac::encode_wake_payload(ts, &cid, &forged_tag);
+        let mut verdict: c_int = -1;
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_verify_wake_hmac(
+                key.as_bytes().as_ptr(),
+                payload.as_ptr(),
+                payload.len(),
+                rid.as_ptr(),
+                ts + 10,
+                &mut verdict,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert_eq!(verdict, VEIL_WAKE_VERDICT_TAMPERED);
+    }
+
+    #[test]
+    fn verify_wake_hmac_surfaces_expired_distinct_from_tampered() {
+        let key = veil_crypto::wake_hmac::WakeHmacKey::from_bytes([1u8; 32]);
+        let cid = [2u8; 32];
+        let rid = [3u8; 32];
+        let ts = 1_700_000_000u64;
+        let tag = veil_crypto::wake_hmac::compute_wake_hmac(&key, ts, &cid, &rid);
+        let payload = veil_crypto::wake_hmac::encode_wake_payload(ts, &cid, &tag);
+        let now_far_future = ts + veil_crypto::wake_hmac::WAKE_FRESHNESS_SECS + 1;
+        let mut verdict: c_int = -1;
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_verify_wake_hmac(
+                key.as_bytes().as_ptr(),
+                payload.as_ptr(),
+                payload.len(),
+                rid.as_ptr(),
+                now_far_future,
+                &mut verdict,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert_eq!(verdict, VEIL_WAKE_VERDICT_EXPIRED);
+    }
+
+    #[test]
+    fn verify_wake_hmac_rejects_malformed_length() {
+        let key = [0u8; 32];
+        let rid = [0u8; 32];
+        let short = [0u8; VEIL_WAKE_PAYLOAD_LEN - 1];
+        let mut verdict: c_int = -1;
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_verify_wake_hmac(
+                key.as_ptr(),
+                short.as_ptr(),
+                short.len(),
+                rid.as_ptr(),
+                1_700_000_000,
+                &mut verdict,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert_eq!(verdict, VEIL_WAKE_VERDICT_MALFORMED);
+    }
+
+    #[test]
+    fn verify_wake_hmac_rejects_null_args() {
+        let key = [0u8; 32];
+        let mut verdict: c_int = -1;
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_verify_wake_hmac(
+                ptr::null(),
+                ptr::null(),
+                0,
+                key.as_ptr(),
+                0,
+                &mut verdict,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe { veil_free_string(err) };
+    }
+
+    // ── BIP-39 restore FFI ───────────────────────────────────────
+
+    fn fresh_phrase() -> std::ffi::CString {
+        // Generate a fresh master_seed and convert к its BIP-39 phrase.
+        // This guarantees the phrase is well-formed (24 words, valid
+        // checksum) without hardcoding а secret in the test.
+        let seed = veil_identity::master_seed::generate_master_seed();
+        let mnemonic =
+            veil_identity::master_seed::encode_master_seed_to_phrase(&seed).expect("seed → phrase");
+        std::ffi::CString::new(mnemonic.to_string()).unwrap()
+    }
+
+    #[test]
+    fn epic489_8_validate_phrase_accepts_valid_24_words() {
+        let phrase = fresh_phrase();
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_validate_bip39_phrase(phrase.as_ptr(), &mut err) };
+        assert_eq!(rc, VEIL_OK, "valid phrase must accept");
+        assert!(err.is_null(), "no error message on success");
+    }
+
+    #[test]
+    fn epic489_8_validate_phrase_rejects_garbage() {
+        let bad = std::ffi::CString::new("not actually a valid bip39 phrase at all").unwrap();
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_validate_bip39_phrase(bad.as_ptr(), &mut err) };
+        assert_eq!(rc, VEIL_ERR);
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    #[test]
+    fn epic489_8_validate_phrase_rejects_null() {
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_validate_bip39_phrase(ptr::null(), &mut err) };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+
+    #[test]
+    fn epic489_8_restore_writes_identity_files() {
+        // End-to-end: valid phrase + tempdir → produces signed identity
+        // document + instance file + identity_sk on disk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let phrase = fresh_phrase();
+        let dir_c = std::ffi::CString::new(dir.path().to_str().unwrap()).unwrap();
+        let label_c = std::ffi::CString::new("test-device").unwrap();
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_restore_identity_from_phrase(
+                phrase.as_ptr(),
+                dir_c.as_ptr(),
+                label_c.as_ptr(),
+                &mut err,
+            )
+        };
+        if rc != VEIL_OK {
+            let detail = unsafe { CStr::from_ptr(err).to_string_lossy().into_owned() };
+            unsafe {
+                veil_free_string(err);
+            }
+            panic!("restore failed: {detail}");
+        }
+        assert!(
+            dir.path().join("identity_document.bin").exists(),
+            "identity_document.bin must be written"
+        );
+    }
+
+    #[test]
+    fn epic489_8_restore_same_phrase_yields_same_node_id() {
+        // Critical: BIP-39 → master_seed → master_pk → node_id is
+        // DETERMINISTIC. Restoring on Device A and Device B from the
+        // same phrase MUST give the same node_id (that's the whole
+        // point of identity recovery).
+        let phrase = fresh_phrase();
+        let label_c = std::ffi::CString::new("dev").unwrap();
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let dir_a_c = std::ffi::CString::new(dir_a.path().to_str().unwrap()).unwrap();
+        let dir_b_c = std::ffi::CString::new(dir_b.path().to_str().unwrap()).unwrap();
+        let mut err: *mut c_char = ptr::null_mut();
+
+        let rc_a = unsafe {
+            veil_restore_identity_from_phrase(
+                phrase.as_ptr(),
+                dir_a_c.as_ptr(),
+                label_c.as_ptr(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc_a, VEIL_OK);
+        let rc_b = unsafe {
+            veil_restore_identity_from_phrase(
+                phrase.as_ptr(),
+                dir_b_c.as_ptr(),
+                label_c.as_ptr(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc_b, VEIL_OK);
+
+        // Both files start с the same node_id field (first 32 bytes
+        // after magic "ID" + version + master_algo). We just
+        // byte-compare the node_id range, не decode the full document.
+        let bytes_a = std::fs::read(dir_a.path().join("identity_document.bin")).unwrap();
+        let bytes_b = std::fs::read(dir_b.path().join("identity_document.bin")).unwrap();
+        // Magic "ID" (2) + version (1) + master_algo (1) = 4 byte prefix
+        // before node_id.
+        assert_eq!(
+            &bytes_a[4..36],
+            &bytes_b[4..36],
+            "same phrase MUST produce same node_id (BIP-39 deterministic)"
+        );
+    }
+
+    // ── Wake-HMAC put + replica-lookup FFI (Epic 489.10 slice 4.3.4) ──
+
+    /// `veil_mailbox_put_with_wake_hmac` must exist with the full arg
+    /// set (incl. the wake bytes) and reject a NULL handle up-front with
+    /// `VEIL_ERR_INVALID_ARG` — i.e. the wake-arg slot is wired through
+    /// without needing a live daemon. Compile-time presence of the symbol
+    /// with this exact signature is itself part of what we're asserting.
+    #[test]
+    fn mailbox_put_with_wake_hmac_rejects_null_handle() {
+        let id = [7u8; 32];
+        let wake = [0xABu8; 16];
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_mailbox_put_with_wake_hmac(
+                ptr::null_mut(), // handle
+                id.as_ptr(),     // receiver_id
+                id.as_ptr(),     // content_id
+                id.as_ptr(),     // sender_id
+                ptr::null(),     // blob
+                0,
+                ptr::null(), // push_envelope
+                0,
+                ptr::null(), // capability_token
+                0,
+                wake.as_ptr(), // wake_hmac_envelope
+                wake.len(),
+                ptr::null_mut(), // out_evicted
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe { veil_free_string(err) };
+    }
+
+    /// The legacy `veil_mailbox_put` / `_with_capability` exports must
+    /// keep their original ABI — same arg arity, same NULL-handle
+    /// rejection. (A signature drift would fail to compile here.)
+    #[test]
+    fn legacy_mailbox_put_exports_keep_abi() {
+        let id = [5u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc1 = unsafe {
+            veil_mailbox_put(
+                ptr::null_mut(),
+                id.as_ptr(),
+                id.as_ptr(),
+                id.as_ptr(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc1, VEIL_ERR_INVALID_ARG);
+        unsafe { veil_free_string(err) };
+        err = ptr::null_mut();
+        let rc2 = unsafe {
+            veil_mailbox_put_with_capability(
+                ptr::null_mut(),
+                id.as_ptr(),
+                id.as_ptr(),
+                id.as_ptr(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc2, VEIL_ERR_INVALID_ARG);
+        unsafe { veil_free_string(err) };
+    }
+
+    /// `veil_lookup_rendezvous_replicas` must reject NULL out-params
+    /// up-front and leave them in the documented empty/failure state.
+    #[test]
+    fn lookup_rendezvous_replicas_rejects_null_out_params() {
+        let id = [9u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+        // NULL handle → INVALID_ARG (null_check! fires before any deref).
+        let rc = unsafe {
+            veil_lookup_rendezvous_replicas(
+                ptr::null_mut(),
+                id.as_ptr(),
+                0,
+                ptr::null_mut(), // out_buf
+                ptr::null_mut(), // out_len
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe { veil_free_string(err) };
+    }
+
+    /// `veil_free_replica_buf(NULL, _)` is a documented no-op.
+    #[test]
+    fn free_replica_buf_null_is_noop() {
+        unsafe {
+            veil_free_replica_buf(ptr::null_mut(), 0);
+            veil_free_replica_buf(ptr::null_mut(), 9999);
+        }
+    }
+
+    /// Independent parser for the replica wire layout documented on
+    /// `veil_lookup_rendezvous_replicas` — decodes back to
+    /// `(relay_node_id, valid_until, push, cap, wake)` tuples WITHOUT
+    /// reusing the serializer, so a layout change in either direction
+    /// fails the round-trip.
+    #[allow(clippy::type_complexity)]
+    fn parse_replica_buf(buf: &[u8]) -> Vec<([u8; 32], u64, Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let mut off = 0usize;
+        let take = |buf: &[u8], off: &mut usize, n: usize| -> Vec<u8> {
+            let out = buf[*off..*off + n].to_vec();
+            *off += n;
+            out
+        };
+        let count = u32::from_le_bytes(take(buf, &mut off, 4).try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut rid = [0u8; 32];
+            rid.copy_from_slice(&take(buf, &mut off, 32));
+            let valid = u64::from_le_bytes(take(buf, &mut off, 8).try_into().unwrap());
+            let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(3);
+            for _ in 0..3 {
+                let len = u16::from_le_bytes(take(buf, &mut off, 2).try_into().unwrap()) as usize;
+                blobs.push(take(buf, &mut off, len));
+            }
+            let wake = blobs.pop().unwrap();
+            let cap = blobs.pop().unwrap();
+            let push = blobs.pop().unwrap();
+            out.push((rid, valid, push, cap, wake));
+        }
+        assert_eq!(off, buf.len(), "no trailing bytes in replica buffer");
+        out
+    }
+
+    #[test]
+    fn serialize_replica_buf_roundtrips_layout() {
+        let replicas = vec![
+            veilclient::RendezvousReplicaInfo {
+                relay_node_id: [0x11; 32],
+                valid_until_unix: 1_700_000_000,
+                push_envelope: vec![1, 2, 3, 4, 5],
+                capability_token: vec![9, 8, 7],
+                wake_hmac_envelope: vec![0xAA, 0xBB],
+            },
+            // Second entry exercises empty blobs (all three len-prefixes 0).
+            veilclient::RendezvousReplicaInfo {
+                relay_node_id: [0x22; 32],
+                valid_until_unix: 0,
+                push_envelope: vec![],
+                capability_token: vec![],
+                wake_hmac_envelope: vec![],
+            },
+        ];
+        let buf = serialize_replica_buf(&replicas);
+        // count header (4) + entry0 (32+8 + (2+5)+(2+3)+(2+2)) + entry1 (32+8 + 2+2+2)
+        let expected_len = 4 + (32 + 8 + 7 + 5 + 4) + (32 + 8 + 2 + 2 + 2);
+        assert_eq!(buf.len(), expected_len, "exact serialized length");
+
+        let parsed = parse_replica_buf(&buf);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, [0x11; 32]);
+        assert_eq!(parsed[0].1, 1_700_000_000);
+        assert_eq!(parsed[0].2, vec![1, 2, 3, 4, 5]);
+        assert_eq!(parsed[0].3, vec![9, 8, 7]);
+        assert_eq!(parsed[0].4, vec![0xAA, 0xBB]);
+        assert_eq!(parsed[1].0, [0x22; 32]);
+        assert_eq!(parsed[1].1, 0);
+        assert!(parsed[1].2.is_empty());
+        assert!(parsed[1].3.is_empty());
+        assert!(parsed[1].4.is_empty());
+    }
+
+    #[test]
+    fn serialize_replica_buf_empty_is_count_header_only() {
+        let buf = serialize_replica_buf(&[]);
+        assert_eq!(
+            buf,
+            vec![0, 0, 0, 0],
+            "empty list = u32 count 0, nothing else"
+        );
+        // And it round-trips back to an empty parse.
+        assert!(parse_replica_buf(&buf).is_empty());
+    }
+
+    /// The (ptr, len) the C entry-point leaks must be reconstructable by
+    /// `veil_free_replica_buf` with no leak/double-free. Mirror the
+    /// shrink_to_fit + forget + from_raw_parts dance the export performs.
+    #[test]
+    fn replica_buf_leak_then_free_roundtrips() {
+        let replicas = vec![veilclient::RendezvousReplicaInfo {
+            relay_node_id: [0x33; 32],
+            valid_until_unix: 42,
+            push_envelope: vec![0; 10],
+            capability_token: vec![1; 4],
+            wake_hmac_envelope: vec![2; 6],
+        }];
+        let mut buf = serialize_replica_buf(&replicas);
+        buf.shrink_to_fit();
+        let len = buf.len();
+        let ptr = buf.as_mut_ptr();
+        std::mem::forget(buf);
+        // Caller would parse here; we just confirm the free path is sound
+        // (run under `cargo test` / Miri this proves no double-free / leak).
+        unsafe { veil_free_replica_buf(ptr, len) };
+    }
+}

@@ -1,0 +1,173 @@
+name: mobile-cross-compile
+
+# Epic 489.2: cross-compile veilclient-ffi for Android + iOS + macOS
+# desktop targets that the Flutter plugin pubspec.yaml declares.  Uploads
+# a ready-to-bundle artifact per target so the Flutter plugin's
+# `android/build.gradle` + iOS Podspec can pull straight from the run.
+#
+# Manually triggered or on git tag push (release flow).  Skipped on
+# regular pushes — full matrix takes ~15-20 min and isn't load-bearing
+# for the daemon-side CI.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'mobile-v*'
+      - 'v*'
+
+jobs:
+  android:
+    name: android-${{ matrix.triple }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        triple:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - x86_64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: Cross-compile ffi
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          # cycle-7 (M3): this is the release/tag flow — bake in BUILTIN_SEEDS
+          # (production-seeds), never the bootstrap-less dev `allow-empty-seeds`.
+          cargo ndk --target ${{ matrix.triple }} -- \
+            build --release -p veilclient-ffi \
+                  --features production-seeds
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffi-${{ matrix.triple }}
+          path: |
+            target/${{ matrix.triple }}/release/libveilclient_ffi.so
+            target/${{ matrix.triple }}/release/libveilclient_ffi.a
+
+  ios-and-macos:
+    name: apple-${{ matrix.triple }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        triple:
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - x86_64-apple-ios
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Cross-compile ffi
+        run: |
+          cargo build --release -p veilclient-ffi \
+                --target ${{ matrix.triple }} \
+                --features production-seeds
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffi-${{ matrix.triple }}
+          path: |
+            target/${{ matrix.triple }}/release/libveilclient_ffi.dylib
+            target/${{ matrix.triple }}/release/libveilclient_ffi.a
+
+  ios-xcframework:
+    # Combine the per-arch iOS staticlibs into a single .xcframework that
+    # the Flutter plugin's Podspec consumes.  Runs after the apple-* legs
+    # finish so it can pull their artifacts.
+    name: ios-xcframework
+    runs-on: macos-14
+    needs: ios-and-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download device slice
+        uses: actions/download-artifact@v4
+        with:
+          name: ffi-aarch64-apple-ios
+          path: target/aarch64-apple-ios/release
+
+      - name: Download sim arm64 slice
+        uses: actions/download-artifact@v4
+        with:
+          name: ffi-aarch64-apple-ios-sim
+          path: target/aarch64-apple-ios-sim/release
+
+      - name: Download sim x86_64 slice
+        uses: actions/download-artifact@v4
+        with:
+          name: ffi-x86_64-apple-ios
+          path: target/x86_64-apple-ios/release
+
+      - name: Build xcframework
+        run: scripts/build-xcframework.sh
+
+      - name: Upload xcframework artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VeilClientFFI.xcframework
+          path: target/xcframework/VeilClientFFI.xcframework
+
+  linux-desktop:
+    name: linux-${{ matrix.triple }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        triple:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Install cross-linker for ARM64
+        if: matrix.triple == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+
+      - name: Cross-compile ffi
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release -p veilclient-ffi \
+                --target ${{ matrix.triple }} \
+                --features production-seeds
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffi-${{ matrix.triple }}
+          path: |
+            target/${{ matrix.triple }}/release/libveilclient_ffi.so
+            target/${{ matrix.triple }}/release/libveilclient_ffi.a

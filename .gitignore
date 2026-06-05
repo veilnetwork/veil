@@ -1,0 +1,43 @@
+target
+**/__pycache__
+stend/*/mlkem.key
+temp.md
+**/bans.json
+**/dht_values.json
+
+# Loop-state lock + ad-hoc planning notes from interactive sessions
+/.claude/
+/temp
+
+# Phase 6.49 audit (2026-05-08): TLS test cert+key для local dev.
+# Regenerated по `bash ssl/gen.sh`.  Cert is fine to ship as а
+# template, но key is а private key и must not live в git.
+ssl/key.pem
+ssl/cert.pem
+
+# Flutter / Dart generated artefacts (Epic 489.3).  All auto-rebuilt
+# by `flutter pub get` / `flutter build` so committing them creates
+# spurious diffs on every developer machine.
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+
+# Library/plugin convention: pubspec.lock is NOT committed (Dart
+# pub.dev guideline — applications commit their own lock, libraries
+# resolve fresh).  veil_flutter is а plugin library.
+flutter/veil_flutter/pubspec.lock
+flutter/veil_flutter/example/pubspec.lock
+
+# Flutter build output (apk/aar/ios staging artefacts).
+flutter/veil_flutter/build/
+flutter/veil_flutter/example/build/
+
+# cycle-7 audit (2026-05-31): stray local build artefacts that landed in the
+# repo root (ad-hoc `rustc -o rust_out` / piped builds + a generated `doc/`
+# dir). Not part of the source tree; ignored so they can't be committed by
+# accident. (Left on disk, not deleted — operator's local scratch.)
+/rust_out
+/stdin
+/librust_out.rlib
+/doc/

@@ -1,0 +1,60 @@
+# cargo-deny policy (cycle-7 audit: the repo had no deny.toml, so a full
+# `cargo deny check` failed at the license stage on every MIT/Apache dep).
+#
+# Scope of this gate: THIRD-PARTY dependency hygiene — advisories, sources, and
+# license compliance. First-party (workspace) crates are AGPL-3.0-or-later (the
+# project license) and are skipped via `private.ignore` below; their license
+# field is a packaging concern, not a dependency-policy one.
+#
+# Run:  cargo deny check        (all)
+#       cargo deny check advisories sources licenses bans
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Fail on crates with an active RUSTSEC advisory or that have been yanked.
+yanked = "deny"
+
+[licenses]
+version = 2
+# Skip our own workspace crates (AGPL-3.0-or-later; a few have no license field
+# yet — packaging cleanup, tracked separately). This gate is about deps.
+private = { ignore = true }
+confidence-threshold = 0.9
+# Permissive licenses present in the dependency tree (enumerated from
+# `cargo deny list` 2026-05-31). Anything outside this set must be reviewed
+# and added deliberately — a strong-copyleft dep (e.g. GPL) would be rejected.
+allow = [
+    # First-party workspace crates (the project license).
+    "AGPL-3.0-or-later",
+    # Permissive third-party licenses present in the dependency tree.
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+    "WTFPL",
+]
+
+[bans]
+# The tree carries several duplicate-version deps (windows-sys, rand, hashbrown,
+# toml, etc.) pulled by transitive crates — flagging them all would be noise,
+# not a policy decision. Revisit if a duplicate becomes a real bloat/security
+# concern.
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
