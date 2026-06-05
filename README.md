@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/veil_logo.png" alt="Veil" width="180" />
+  <img src="assets/veil_banner.jpg" alt="Veil — decentralized, censorship-resistant network" width="100%" />
 </p>
 
 # Veil (OVL1)
@@ -15,13 +15,13 @@ gateways.
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf \
-  https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.sh | sh
+  https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.ps1 | iex
 ```
 
 This installs prebuilt, sha256-verified binaries into `~/.veil/bin`
@@ -30,7 +30,7 @@ This installs prebuilt, sha256-verified binaries into `~/.veil/bin`
 Want the gateway and proxy tools too? Add `--all` (or `-All` on Windows):
 
 ```sh
-curl -sSf https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.sh | sh -s -- --all
+curl -sSf https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.sh | sh -s -- --all
 ```
 
 Full guide, options, server setup, and uninstall: **[docs/en/install.md](docs/en/install.md)**

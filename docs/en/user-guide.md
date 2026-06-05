@@ -24,13 +24,13 @@ The fast path — prebuilt, sha256-verified binaries, no Rust toolchain needed:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf \
-  https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.sh | sh
+  https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.ps1 | iex
 ```
 
 This installs `veil-cli` into `~/.veil/bin` (`%USERPROFILE%\.veil\bin` on Windows). Add `--all` to also install `ogate` and the `oproxy` client/server. Components, options, server setup, and uninstall are covered in **[Installation & first node](install.md)**.
