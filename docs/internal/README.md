@@ -25,7 +25,7 @@ model в anonymity stack, не здесь).
 ## 1. Multi-layer defense
 
 ```
-┌──────────────────────────────────────────────────────────┐
+┌─────────────────────────────────────────────────────────┐
 │           ADVERSARY: DPI / Active Probe / Block         │
 └────────────┬────────────────────────────────────────────┘
              │
@@ -61,7 +61,7 @@ model в anonymity stack, не здесь).
    │ L1  Continuous validation                          │
    │     • Fingerprint regression suite (FINGERPRINT_*) │
    │     • n-gram analysis on outgoing wire traces      │
-   │     • CI-gated против JA3/JA4 drift               │
+   │     • CI-gated против JA3/JA4 drift                │
    └────────────────────────────────────────────────────┘
 ```
 

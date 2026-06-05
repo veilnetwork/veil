@@ -23,7 +23,7 @@ The new `deploy-webtunnel-autotls.yml` puts Caddy в front:
                                   │
                                   ▼
                 ┌──────────────────────────────────────────┐
-                │  veil on 127.0.0.1:18443 (loopback)   │
+                │  veil on 127.0.0.1:18443 (loopback)      │
                 │    – Webtunnel-WSS upgrade handler       │
                 └──────────────────────────────────────────┘
 ```

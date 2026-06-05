@@ -27,12 +27,12 @@ fallback в mailbox-хранилище для offline-получателей. En
 
 ```
               ┌──────────────────────────────────────┐
-              │           CORE VEIL                │
+              │           CORE VEIL                  │
               │                                      │
               │   Core ─── Core ─── Core ─── Core    │
               │     │      ╱  ╲      │       │       │
               │     │    ╱     ╲     │       │       │
-              │   Core ─ Core ─ Core ─ Core           │
+              │   Core ─ Core ─ Core ─ Core          │
               │    DHT (Kademlia, K=20)              │
               └────┬──────────────────────────┬──────┘
                    │                          │
@@ -58,7 +58,7 @@ Leaf-к-Core attachment регистрируется через Discovery
 ┌──────────────────────────────────────────────────────┐
 │   APP                                                │
 │   ├─ IPC client (Unix / NamedPipe / TCP loopback)    │
-│   └─ Veil client library (veilclient)          │
+│   └─ Veil client library (veilclient)                │
 └────────────────────────┬─────────────────────────────┘
                          │ IPC frames
 ┌────────────────────────┴─────────────────────────────┐
@@ -142,8 +142,8 @@ OVL1 handshake (6 round-trips, все OVL1-framed):
      │ ──SessionConfirm(session_id, HMAC)──→   │
      │           ←──SessionConfirm──           │
      │                                         │
-     │  ... все последующие кадры AEAD'd с    │
-     │      ChaCha20-Poly1305                 │
+     │  ... все последующие кадры AEAD'd с     │
+     │      ChaCha20-Poly1305                  │
 ```
 
 После `SessionConfirm`:

@@ -86,7 +86,7 @@ signatures and the companion docs for user-facing behaviour.
                                                │
                                    ┌───────────▼──────────────┐
    6. Wrap as DELIVERY_FORWARD     │ Recipient::All(bob_id)   │
-                                   │ → veil dispatcher     │
+                                   │ → veil dispatcher        │
                                    └───────────┬──────────────┘
                                                │
           ════════════════════════════════════╪═══════════════
@@ -109,7 +109,7 @@ signatures and the companion docs for user-facing behaviour.
                   └───────┬─────┘                      │ SendFailed  │
                           │                            │ for inst[2] │
                           │                            └─────────────┘
-                  ┌───────▼─────────────────────────────────┐
+                  ┌───────▼──────────────────────────────────┐
                   │ phone picks its FanoutEnvelope           │
                   │ recipient_decapsulate via local ML-KEM   │
                   │ AEAD-decrypt payload                     │

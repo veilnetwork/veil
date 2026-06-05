@@ -37,9 +37,9 @@ Pick the leftmost branch that matches what you still have access to.
 
 ```
                    ┌────────────────────────┐
-                   │ Do you still have the   │
-                   │ original device and it  │
-                   │ boots?                  │
+                   │ Do you still have the  │
+                   │ original device and it │
+                   │ boots?                 │
                    └───────────┬────────────┘
                                │
                     ┌──────────┼──────────┐
@@ -55,7 +55,7 @@ Pick the leftmost branch that matches what you still have access to.
 │ Do you suspect a key leak (device stolen     │
 │ while unlocked, malware spotted, phishing    │
 │ attempt succeeded)?                          │
-└──────────────────┬──────────────────────────┘
+└──────────────────┬───────────────────────────┘
                    yes
                    ▼
               section 3.3: compromise recovery
