@@ -1,0 +1,12 @@
+//! Integration tests for the session-runner state machine.
+//!
+//! Extracted от veilcore в audit batch 2026-05-21 Phase D14:
+//! `runner_tests.rs` was 5568 LoC coupled к veilcore-private path
+//! `crate::node::dispatcher::make_test_dispatcher` плюс `use super::*;`
+//! wildcards into the veilcore session module shim.  Moving it here
+//! pins the tests к the published surface of veil-session,
+//! veil-dispatcher, veil-proto, veil-transport, veil-cfg
+//! и veil-node-runtime — same coupling profile as any downstream
+//! integration test would have.
+//!
+//! Тhe library itself is empty; the suite lives entirely под `tests/`.

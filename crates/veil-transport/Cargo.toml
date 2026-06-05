@@ -1,0 +1,61 @@
+[package]
+name = "veil-transport"
+version = "0.1.0"
+edition = "2024"
+description = "Veil network transport layer: TCP, QUIC, TLS (rustls + optional BoringSSL), WebSocket, SOCKS proxy, Unix domain sockets. Phase 4 extraction from veilcore — pure transport primitives, no veil-protocol or session-runtime coupling."
+license = "AGPL-3.0-or-later"
+
+[features]
+# Anti-DPI BoringSSL TLS backend (Chrome-like JA3/JA4 fingerprint).
+# Mirrors veilcore's `tls-boring` feature so downstream binaries can
+# enable it via `veil-transport = { …, features = ["tls-boring"] }`.
+tls-boring = ["dep:btls", "dep:tokio-btls", "dep:quinn-btls"]
+# Phase 6.50.b audit-C2: `tls-webpki-roots` is now а semver-stable
+# no-op kept for existing build configs.  Originally gated а cfg-block
+# в `context.rs` that decided whether `use_system_roots = true` actually
+# applied Mozilla roots; that gate was а silent footgun (operator says
+# "yes, use Mozilla roots", build flag не задан → silent fall-through к
+# pinned-CAs-only с only а warn log).  `webpki-roots` is now а direct
+# dep either way (the HTTPS-bootstrap и signed-update fetch paths
+# require it unconditionally), so the build-flag/runtime-flag split
+# served no purpose.  Scheduled for removal в the next semver-major.
+tls-webpki-roots = []
+
+[dependencies]
+veil-error = { path = "../veil-error" }
+
+futures = "0.3"
+# Этап 10 slice 3: HTTPS RR (RFC 9460) lookups for real ECH config
+# resolution.  Basic features only — DoH/DoT not needed for this path.
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
+log = "0.4"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+rcgen = "0.13"
+rustls = "0.23"
+# Phase 6.50.b followup: dropped `rustls-pemfile` (RUSTSEC-2025-0134
+# unmaintained) — PEM parsing now goes through `rustls-pki-types`'s
+# native `PemObject` trait (1.14+).  Bumped pki-types floor accordingly.
+rustls-pki-types = "1.14"
+socket2 = "0.5"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-socks = "0.5"
+tokio-tungstenite = "0.24"
+tokio-util = { version = "0.7", features = ["io"] }
+url = "2.5"
+veil-obfs4 = { path = "../veil-obfs4" }
+veil-webtunnel = { path = "../veil-webtunnel" }
+rand = "0.9"
+
+# Optional: anti-DPI / public-CA features.
+btls = { version = "0.5", optional = true }
+tokio-btls = { version = "0.5", optional = true }
+quinn-btls = { version = "0.1", optional = true }
+webpki-roots = "0.26"
+
+[dev-dependencies]
+tokio = { version = "1.42", features = ["full", "test-util"] }
+
+[lints]
+workspace = true

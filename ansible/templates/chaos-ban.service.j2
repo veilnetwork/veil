@@ -1,0 +1,22 @@
+[Unit]
+Description=Veil chaos-ban cycler (Phase 6.50.b iterative-DHT fallback exerciser)
+After=veil.service
+Wants=veil.service
+
+[Service]
+Type=simple
+# veil daemon's admin socket has а UID-gate (Epic 451), only the
+# `veil` user can connect.  Run the chaos cycler under the same
+# identity so `sessions ban/unban/list` go through unrestricted.
+User=veil
+Group=veil
+ExecStart=/usr/local/bin/chaos-ban-cycler.sh
+Restart=on-failure
+RestartSec=30
+# /var/log/veil is owned by veil:veil (per deploy-testnet.yml),
+# so this user can append к the dedicated log file without sudo.
+StandardOutput=append:/var/log/veil/chaos-ban.log
+StandardError=append:/var/log/veil/chaos-ban.log
+
+[Install]
+WantedBy=multi-user.target

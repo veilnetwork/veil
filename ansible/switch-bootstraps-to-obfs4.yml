@@ -1,0 +1,108 @@
+---
+# Rewrite bootstrap_peers entries from `tcp://...:5555` к `obfs4-tcp://...:5556`.
+# Idempotent: skips if no tcp:// bootstrap_peers remain.
+# Run AFTER obfs4 PSK + listener are deployed на all hosts (otherwise
+# this host won't be able к dial the bootstraps).
+#
+# Run:
+#   ansible-playbook -i inventory.yml switch-bootstraps-to-obfs4.yml \
+#     --extra-vars 'obfs4_port=5556' --limit all
+
+- name: Switch bootstrap_peers transport к obfs4-tcp://
+  hosts: all
+  become: true
+  serial: 1
+  vars:
+    obfs4_port: 5556
+
+  tasks:
+    - name: Count tcp:// bootstrap_peers entries
+      ansible.builtin.shell:
+        cmd: |
+          # Count bootstrap_peers blocks с tcp:// transport.  We rewrite
+          # `transport = "tcp://IP:5555"` lines що live inside а
+          # [[bootstrap_peers]] block (NOT the top-level listen= line).
+          grep -c '^transport = "tcp://[^"]*:5555"$' /var/lib/veil/node.toml || true
+      register: tcp_count
+      changed_when: false
+
+    - name: Skip if already migrated
+      ansible.builtin.meta: end_host
+      when: tcp_count.stdout | int == 0
+
+    - name: Rewrite bootstrap_peers transport URIs
+      ansible.builtin.shell:
+        cmd: |
+          python3 << 'PYEOF'
+          import re
+          path = "/var/lib/veil/node.toml"
+          with open(path) as f:
+              src = f.read()
+          # Match `transport = "tcp://<ip>:5555"` lines AND rewrite к obfs4-tcp с new port.
+          # Only inside [[bootstrap_peers]] context — но since the only
+          # other `transport =` lines are in `[[listen]]`-style inline-
+          # table arrays (those have form `{ transport = ... }`), а
+          # line-start anchor is sufficient.
+          pattern = re.compile(r'^transport = "tcp://([\d.]+):5555"$', re.MULTILINE)
+          n_replaced = 0
+          def repl(m):
+              global n_replaced
+              n_replaced += 1
+              return f'transport = "obfs4-tcp://{m.group(1)}:{{ obfs4_port }}"'
+          new_src = pattern.sub(repl, src)
+          with open(path, "w") as f:
+              f.write(new_src)
+          print(f"replaced {n_replaced} bootstrap_peers entries")
+          PYEOF
+        executable: /bin/bash
+      register: rewrite_result
+
+    - name: Show rewrite result
+      ansible.builtin.debug:
+        var: rewrite_result.stdout
+
+    - name: Restart veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait для metrics endpoint
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:19999/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Show wait result
+      ansible.builtin.debug:
+        var: wait_result.stdout
+
+    - name: Check that the daemon connected к ≥1 bootstrap successfully
+      ansible.builtin.shell:
+        cmd: |
+          # Wait up к 30s для at least one bootstrap session к establish.
+          for i in $(seq 1 30); do
+            n=$(curl -sS http://127.0.0.1:19999/metrics 2>/dev/null | \
+                grep '^veil_state_live_sessions ' | awk '{print $2}')
+            if [ -n "$n" ] && [ "$n" -gt 0 ]; then
+              echo "live_sessions=${n} after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "live_sessions still 0 after 30s"
+          exit 1
+      register: sessions_check
+      changed_when: false
+
+    - name: Show sessions check
+      ansible.builtin.debug:
+        var: sessions_check.stdout

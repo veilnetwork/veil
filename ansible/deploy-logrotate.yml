@@ -1,0 +1,71 @@
+---
+# Deploy + activate hourly logrotate для veil daemon logs.
+#
+# Background (2026-05-13 incident):
+# - chaos-ban + chat_node load → veil.log writes ~70-230 MB/h
+# - Default logrotate.timer runs daily → log grows к 5 GB before first rotation
+# - One host (b1) hit 100% disk = ansible UNREACHABLE = unrecoverable
+#   без manual SSH (no `tmp dir` к stage commands)
+#
+# Fix: separate `veil-logrotate.service` + `.timer` (hourly), runs ONLY
+# against `/etc/logrotate.d/veil` so it doesn't fight the system daily
+# timer.  `copytruncate` semantics в the config preserve the daemon's
+# `StandardOutput=append:` file descriptor — no veil restart needed.
+#
+# Apply:
+#   cd ansible && ansible-playbook -i inventory.yml deploy-logrotate.yml
+#
+# Idempotent — safe к re-run.  Triggers а daemon-reload only когда
+# unit files actually change.
+
+- name: Deploy veil logrotate
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Ensure /etc/logrotate.d/veil exists с 200 MB cap
+      ansible.builtin.copy:
+        src: templates/logrotate-veil.conf
+        dest: /etc/logrotate.d/veil
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install veil-logrotate.service unit
+      ansible.builtin.copy:
+        src: templates/veil-logrotate.service
+        dest: /etc/systemd/system/veil-logrotate.service
+        owner: root
+        group: root
+        mode: "0644"
+      register: service_changed
+
+    - name: Install veil-logrotate.timer unit
+      ansible.builtin.copy:
+        src: templates/veil-logrotate.timer
+        dest: /etc/systemd/system/veil-logrotate.timer
+        owner: root
+        group: root
+        mode: "0644"
+      register: timer_changed
+
+    - name: systemd daemon-reload (only когда unit files changed)
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: service_changed.changed or timer_changed.changed
+
+    - name: Enable + start veil-logrotate.timer
+      ansible.builtin.systemd:
+        name: veil-logrotate.timer
+        state: started
+        enabled: true
+
+    - name: Show next scheduled rotation
+      ansible.builtin.shell:
+        cmd: systemctl show veil-logrotate.timer -p NextElapseUSecRealtime --value
+      register: next_run
+      changed_when: false
+
+    - name: Display next-run schedule
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: next rotation at {{ next_run.stdout }}"

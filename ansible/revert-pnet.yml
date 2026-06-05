@@ -1,0 +1,65 @@
+---
+# Revert P-Net (private mode) rollout — drop `[network]` block из node.toml,
+# remove membership cert, restart veil + chat-node.
+# Inverse of deploy-pnet.yml. Cluster returns к public-mode behaviour;
+# membership-gate becomes no-op (gate=None at startup).
+
+- name: Revert P-Net (private → public)
+  hosts: all
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  tasks:
+    - name: Stop veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: stopped
+
+    - name: Drop ANSIBLE-managed [network] block
+      ansible.builtin.blockinfile:
+        path: /var/lib/veil/node.toml
+        marker: "# {mark} ANSIBLE MANAGED — P-Net config"
+        block: ""
+        state: absent
+
+    - name: Also drop any unmarked [network] block (failsafe)
+      ansible.builtin.replace:
+        path: /var/lib/veil/node.toml
+        regexp: '(?ms)^\[network\]\n.*?(?=^\[|\Z)'
+        replace: ''
+
+    - name: Remove membership cert
+      ansible.builtin.file:
+        path: /var/lib/veil/network.cert
+        state: absent
+
+    - name: Validate config
+      become_user: veil
+      ansible.builtin.command:
+        cmd: /usr/local/bin/veil-cli --config /var/lib/veil/node.toml config validate
+      changed_when: false
+
+    - name: Start veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: started
+
+    - name: Wait for node к come back online
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:19999/metrics > /dev/null; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+      changed_when: false
+
+    - name: Restart chat-node после veil restart
+      ansible.builtin.systemd:
+        name: chat-node.service
+        state: restarted
+      ignore_errors: true

@@ -1,0 +1,747 @@
+use toml_edit::{DocumentMut, Item, Table, Value, value};
+
+use crate::format::{FormatBackend, GLOBAL_SECTION, IDENTITY_SECTION, SaveStrategy};
+use crate::{Config, ConfigError, Result};
+
+pub(crate) static BACKEND: TomlBackend = TomlBackend;
+const IDENTITY_SECTION_ALIAS: &str = "identity";
+
+pub(crate) struct TomlBackend;
+
+impl FormatBackend for TomlBackend {
+    fn load(&self, content: &str) -> Result<Config> {
+        load_config(content)
+    }
+
+    fn save_strategy(&self) -> SaveStrategy {
+        SaveStrategy::PatchExisting
+    }
+
+    fn render(&self, config: &Config) -> Result<String> {
+        Ok(toml::to_string_pretty(config)?)
+    }
+
+    fn patch_existing(&self, content: &str, config: &Config) -> Result<String> {
+        save_existing(content, config)
+    }
+}
+
+fn load_config(content: &str) -> Result<Config> {
+    Ok(toml::from_str(content)?)
+}
+
+fn save_existing(content: &str, config: &Config) -> Result<String> {
+    let mut document =
+        content
+            .parse::<DocumentMut>()
+            .map_err(|err| ConfigError::TomlDocumentParse {
+                details: err.to_string(),
+            })?;
+    update_document(&mut document, config)?;
+    Ok(document.to_string())
+}
+
+fn update_document(document: &mut DocumentMut, config: &Config) -> Result<()> {
+    let g = &config.global;
+
+    if !document.get(GLOBAL_SECTION).is_some_and(Item::is_table) {
+        document[GLOBAL_SECTION] = Item::Table(Table::new());
+    }
+
+    let global =
+        document[GLOBAL_SECTION]
+            .as_table_mut()
+            .ok_or(ConfigError::TomlSectionNotTable {
+                section: GLOBAL_SECTION,
+            })?;
+    set_string(global, "runtime_flavor", &g.runtime_flavor.to_string());
+    set_integer(global, "worker_threads", g.worker_threads.map(i64::from));
+    set_integer(
+        global,
+        "max_blocking_threads",
+        g.max_blocking_threads.map(i64::from),
+    );
+    set_integer(
+        global,
+        "thread_keep_alive_ms",
+        checked_integer(
+            "global.thread_keep_alive_ms",
+            g.thread_keep_alive_ms,
+            u128::from,
+        )?,
+    );
+    set_string_optional(global, "thread_name", g.thread_name.as_deref());
+    set_integer(
+        global,
+        "thread_stack_size",
+        checked_integer("global.thread_stack_size", g.thread_stack_size, |v| {
+            v as u128
+        })?,
+    );
+    set_string_optional(global, "admin_socket", g.admin_socket.as_deref());
+    set_string(global, "logs", &g.logs.to_string());
+    set_string_optional(global, "log_file", g.log_file.as_deref());
+    // follow-up + pre-existing-bug fix: previous global-section
+    // patcher dropped these fields on save (operator edits the file by
+    // hand, runs `node show` or any path that re-saves config, the field
+    // silently disappears). Patch them explicitly so set/unset round-
+    // trips through `cfg::save_config`.
+    set_string_optional(
+        global,
+        "bootstrap_dns_domain",
+        g.bootstrap_dns_domain.as_deref(),
+    );
+    set_string_optional(
+        global,
+        "discovered_peers_cache_path",
+        g.discovered_peers_cache_path.as_deref(),
+    );
+    set_string_optional(
+        global,
+        "trusted_bundle_issuer_pubkey",
+        g.trusted_bundle_issuer_pubkey.as_deref(),
+    );
+    set_string_array(global, "bootstrap_https_urls", &g.bootstrap_https_urls);
+
+    set_transport(document, &config.transport)?;
+
+    match config.identity.as_ref() {
+        Some(identity) => {
+            let target_section = identity_section_name(document);
+            document.remove(other_identity_section_name(target_section));
+
+            if !document.get(target_section).is_some_and(Item::is_table) {
+                document[target_section] = Item::Table(Table::new());
+            }
+
+            let identity_table = document[target_section].as_table_mut().ok_or(
+                ConfigError::TomlSectionNotTable {
+                    section: target_section,
+                },
+            )?;
+            set_string(identity_table, "algo", &identity.algo.to_string());
+            set_string(identity_table, "public_key", &identity.public_key);
+            set_string(identity_table, "private_key", &identity.private_key);
+            set_string(identity_table, "nonce", &identity.nonce);
+            set_string_optional(
+                identity_table,
+                "node_id",
+                identity.node_id.map(|value| value.to_string()).as_deref(),
+            );
+            identity_table.remove("names");
+        }
+        None => {
+            document.remove(IDENTITY_SECTION);
+            document.remove(IDENTITY_SECTION_ALIAS);
+        }
+    }
+
+    set_ipc(document, &config.ipc)?;
+    set_peers(document, &config.peers);
+    set_listens(document, &config.listen);
+    set_metrics(document, config.metrics.as_ref());
+    set_bootstrap_peers(document, &config.bootstrap_peers);
+    Ok(())
+}
+
+fn identity_section_name(document: &DocumentMut) -> &'static str {
+    if document.get(IDENTITY_SECTION_ALIAS).is_some() && document.get(IDENTITY_SECTION).is_none() {
+        IDENTITY_SECTION_ALIAS
+    } else {
+        IDENTITY_SECTION
+    }
+}
+
+fn other_identity_section_name(section: &'static str) -> &'static str {
+    if section == IDENTITY_SECTION {
+        IDENTITY_SECTION_ALIAS
+    } else {
+        IDENTITY_SECTION
+    }
+}
+
+fn set_string(table: &mut Table, key: &str, new_value: &str) {
+    match table.get_mut(key).and_then(Item::as_value_mut) {
+        Some(existing) => replace_value(existing, Value::from(new_value)),
+        None => {
+            table[key] = value(new_value);
+        }
+    }
+}
+
+fn set_string_optional(table: &mut Table, key: &str, value: Option<&str>) {
+    match value {
+        Some(value) => set_string(table, key, value),
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+/// Patch a `Vec<String>` table entry: empty Vec → remove key (mirrors
+/// the `serde::skip_serializing_if = "Vec::is_empty"` annotation), non-
+/// empty → write the array. Used for `bootstrap_https_urls` etc.
+fn set_string_array(table: &mut Table, key: &str, values: &[String]) {
+    if values.is_empty() {
+        table.remove(key);
+        return;
+    }
+    let mut array = toml_edit::Array::new();
+    for v in values {
+        array.push(v.as_str());
+    }
+    table[key] = value(array);
+}
+
+fn set_integer(table: &mut Table, key: &str, new_value: Option<i64>) {
+    match new_value {
+        Some(new_value) => match table.get_mut(key).and_then(Item::as_value_mut) {
+            Some(existing) => replace_value(existing, Value::from(new_value)),
+            None => {
+                table[key] = value(new_value);
+            }
+        },
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+fn set_transport(document: &mut DocumentMut, transport: &crate::TransportConfig) -> Result<()> {
+    // Rotation is **always** emitted (см. `TransportConfig::rotation`
+    // doc) — its anti-DPI semantics matter enough that operators should
+    // discover it by reading their config file даже когда it's at default.
+    // So we don't take the "skip the whole section если default" shortcut
+    // anymore — only skip the optional sub-tables (`tls_client`).
+    if !document.get("transport").is_some_and(Item::is_table) {
+        document["transport"] = Item::Table(Table::new());
+    }
+    let transport_table =
+        document["transport"]
+            .as_table_mut()
+            .ok_or(ConfigError::TomlSectionNotTable {
+                section: "transport",
+            })?;
+
+    set_tls_client_table(transport_table, &transport.tls_client)?;
+    set_rotation_table(transport_table, &transport.rotation)?;
+    // Prune sub-tables that are not part of the current schema (e.g.
+    // legacy `quic_client` / `websocket` left over от older configs
+    // someone copied и updated incrementally).  Pre-Q.7 the entire
+    // `[transport]` section was removed-and-rebuilt в the default
+    // case, which incidentally cleaned these up; now that we always
+    // emit `[transport.rotation]`, we have к do the pruning explicitly.
+    const KNOWN_SUB_TABLES: &[&str] = &["rotation", "tls_client"];
+    let stale: Vec<String> = transport_table
+        .iter()
+        .filter_map(|(k, v)| {
+            if v.is_table() && !KNOWN_SUB_TABLES.contains(&k) {
+                Some(k.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for k in stale {
+        transport_table.remove(&k);
+    }
+    Ok(())
+}
+
+/// Always emit `[transport.rotation]` с the current `min`/`max`
+/// pair, EVEN when it matches the baked-in default.  Rationale: see
+/// `set_transport` — discoverability of the anti-DPI knob beats keeping
+/// the file minimal.
+fn set_rotation_table(table: &mut Table, rotation: &crate::TransportRotationConfig) -> Result<()> {
+    if !table.get("rotation").is_some_and(Item::is_table) {
+        table["rotation"] = Item::Table(Table::new());
+    }
+    let rotation_table =
+        table["rotation"]
+            .as_table_mut()
+            .ok_or(ConfigError::TomlSectionNotTable {
+                section: "transport.rotation",
+            })?;
+    rotation_table.insert(
+        "min_lifetime_secs",
+        Item::Value(Value::from(rotation.min_lifetime_secs)),
+    );
+    rotation_table.insert(
+        "max_lifetime_secs",
+        Item::Value(Value::from(rotation.max_lifetime_secs)),
+    );
+    Ok(())
+}
+
+fn set_tls_client_table(table: &mut Table, tls_client: &crate::TlsClientConfig) -> Result<()> {
+    if tls_client.is_default() {
+        table.remove("tls_client");
+        return Ok(());
+    }
+    if !table.get("tls_client").is_some_and(Item::is_table) {
+        table["tls_client"] = Item::Table(Table::new());
+    }
+    let tls_client_table =
+        table["tls_client"]
+            .as_table_mut()
+            .ok_or(ConfigError::TomlSectionNotTable {
+                section: "transport",
+            })?;
+    set_integer(
+        tls_client_table,
+        "connect_timeout_ms",
+        checked_integer(
+            "transport.tls_client.connect_timeout_ms",
+            tls_client.connect_timeout_ms,
+            u128::from,
+        )?,
+    );
+    if tls_client_table.is_empty() {
+        table.remove("tls_client");
+    }
+    Ok(())
+}
+
+fn set_ipc(document: &mut DocumentMut, ipc: &crate::IpcConfig) -> Result<()> {
+    if ipc.is_default() {
+        document.remove("ipc");
+        return Ok(());
+    }
+    if !document.get("ipc").is_some_and(Item::is_table) {
+        document["ipc"] = Item::Table(Table::new());
+    }
+    let ipc_table = document["ipc"]
+        .as_table_mut()
+        .ok_or(ConfigError::TomlSectionNotTable { section: "ipc" })?;
+    match ipc_table.get_mut("enabled").and_then(Item::as_value_mut) {
+        Some(existing) => replace_value(existing, Value::from(ipc.enabled)),
+        None => {
+            ipc_table["enabled"] = value(ipc.enabled);
+        }
+    }
+    set_string_optional(ipc_table, "socket_uri", ipc.socket_uri.as_deref());
+    set_string_optional(
+        ipc_table,
+        "app_socket_dir",
+        ipc.app_socket_dir.as_deref().and_then(|p| p.to_str()),
+    );
+    Ok(())
+}
+
+fn set_peers(document: &mut DocumentMut, peers: &[crate::PeerConfig]) {
+    if peers.is_empty() {
+        document.remove("peers");
+        return;
+    }
+
+    let mut array = toml_edit::Array::default();
+    for peer in peers {
+        let mut table = toml_edit::InlineTable::new();
+        table.insert("peer_id", Value::from(peer.peer_id.to_string()));
+        table.insert("public_key", Value::from(peer.public_key.as_str()));
+        table.insert("nonce", Value::from(peer.nonce.as_str()));
+        table.insert("transport", Value::from(peer.transport.as_str()));
+        if let Some(value) = peer.tls_cert.as_deref() {
+            table.insert("tls_cert", Value::from(value));
+        }
+        if let Some(value) = peer.tls_key.as_deref() {
+            table.insert("tls_key", Value::from(value));
+        }
+        if let Some(value) = peer.tls_ca_cert.as_deref() {
+            table.insert("tls_ca_cert", Value::from(value));
+        }
+        // stage (c): alt_uri for hot-standby auto-swap.
+        if let Some(value) = peer.alt_uri.as_deref() {
+            table.insert("alt_uri", Value::from(value));
+        }
+        array.push(Value::InlineTable(table));
+    }
+    document["peers"] = Item::Value(Value::Array(array));
+}
+
+fn set_listens(document: &mut DocumentMut, listens: &[crate::ListenConfig]) {
+    if listens.is_empty() {
+        document.remove("listen");
+        return;
+    }
+
+    let mut array = toml_edit::Array::default();
+    for listen in listens {
+        let mut table = toml_edit::InlineTable::new();
+        table.insert("id", Value::from(listen.id.to_string()));
+        table.insert("transport", Value::from(listen.transport.as_str()));
+        // `advertise` and `relay` are core PEX/RouteResponse fields —
+        // without them, peers behind a wildcard bind have no public URI to
+        // gossip and PEX walks return `peers=0` cluster-wide. Earlier
+        // versions of `set_listens` wrote only TLS material and silently
+        // dropped these on save (the CLI's `listen add --advertise` would
+        // succeed but the next config reload would not see the value).
+        if let Some(value) = listen.advertise.as_deref() {
+            table.insert("advertise", Value::from(value));
+        }
+        if let Some(value) = listen.relay.as_deref() {
+            table.insert("relay", Value::from(value));
+        }
+        if let Some(value) = listen.tls_cert.as_deref() {
+            table.insert("tls_cert", Value::from(value));
+        }
+        if let Some(value) = listen.tls_key.as_deref() {
+            table.insert("tls_key", Value::from(value));
+        }
+        if let Some(value) = listen.tls_ca_cert.as_deref() {
+            table.insert("tls_ca_cert", Value::from(value));
+        }
+        array.push(Value::InlineTable(table));
+    }
+    document["listen"] = Item::Value(Value::Array(array));
+}
+
+fn set_bootstrap_peers(document: &mut DocumentMut, peers: &[crate::BootstrapPeer]) {
+    // Remove any existing [[bootstrap_peers]] array-of-tables.
+    document.remove("bootstrap_peers");
+    if peers.is_empty() {
+        return;
+    }
+    // Serialize as an array-of-tables using toml::to_string_pretty on a
+    // wrapper struct, then splice the resulting TOML into the document.
+    // Because toml_edit has no ergonomic array-of-tables builder, we render
+    // the bootstrap_peers sub-document and merge it in.
+    #[derive(serde::Serialize)]
+    struct Wrapper<'a> {
+        bootstrap_peers: &'a [crate::BootstrapPeer],
+    }
+    let rendered = toml::to_string_pretty(&Wrapper {
+        bootstrap_peers: peers,
+    })
+    .unwrap_or_default();
+    let sub: DocumentMut = rendered.parse().unwrap_or_default();
+    if let Some(item) = sub.get("bootstrap_peers") {
+        document["bootstrap_peers"] = item.clone();
+    }
+}
+
+fn set_metrics(document: &mut DocumentMut, metrics: Option<&crate::MetricsConfig>) {
+    match metrics {
+        Some(metrics) => {
+            if !document.get("metrics").is_some_and(Item::is_table) {
+                document["metrics"] = Item::Table(Table::new());
+            }
+            if let Some(metrics_table) = document["metrics"].as_table_mut() {
+                set_string(metrics_table, "listen", &metrics.listen);
+                set_string_optional(metrics_table, "path", metrics.path.as_deref());
+                set_string_optional(metrics_table, "auth_token", metrics.auth_token.as_deref());
+                if metrics.allow_unauthenticated_remote_metrics {
+                    metrics_table["allow_unauthenticated_remote_metrics"] = value(true);
+                } else {
+                    metrics_table.remove("allow_unauthenticated_remote_metrics");
+                }
+            }
+        }
+        None => {
+            document.remove("metrics");
+        }
+    }
+}
+
+fn checked_integer<T>(
+    key: &'static str,
+    value: Option<T>,
+    to_u128: impl Fn(T) -> u128,
+) -> Result<Option<i64>>
+where
+    T: TryInto<i64> + Copy,
+{
+    value
+        .map(|value| {
+            value
+                .try_into()
+                .map_err(|_| ConfigError::TomlIntegerOutOfRange {
+                    key,
+                    value: to_u128(value),
+                })
+        })
+        .transpose()
+}
+
+fn replace_value(existing: &mut Value, mut replacement: Value) {
+    std::mem::swap(existing.decor_mut(), replacement.decor_mut());
+    *existing = replacement;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn updates_without_removing_comments() {
+        let mut document = "[global]\n# for test\nruntime_flavor = \"multi_thread\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        let mut config = Config::default();
+        config.global.runtime_flavor = "current_thread".parse().unwrap();
+
+        update_document(&mut document, &config).unwrap();
+
+        let rendered = document.to_string();
+        assert!(rendered.contains("# for test"));
+        assert!(rendered.contains("runtime_flavor = \"current_thread\""));
+    }
+
+    #[test]
+    fn adds_identity_section_when_missing() {
+        let mut document = "[global]\nruntime_flavor = \"multi_thread\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        let config = Config {
+            identity: Some(crate::IdentityConfig {
+                algo: crate::SignatureAlgorithm::Ed25519,
+                role: Default::default(),
+                public_key: "pub".to_owned(),
+                private_key: "priv".to_owned(),
+                nonce: "AAAAAA==".to_owned(),
+                node_id: None,
+                key_passphrase: None,
+                key_passphrase_file: None,
+                key_passphrase_prompt: false,
+                lazy_mining: true,
+                max_lazy_difficulty: 64,
+            }),
+            ..Config::default()
+        };
+
+        update_document(&mut document, &config).unwrap();
+
+        let rendered = document.to_string();
+        assert!(rendered.contains("[Identity]"));
+        assert!(rendered.contains("algo = \"ed25519\""));
+        assert!(rendered.contains("public_key = \"pub\""));
+    }
+
+    #[test]
+    fn updates_existing_lowercase_identity_without_creating_uppercase_duplicate() {
+        let mut document =
+            "[global]\nruntime_flavor = \"multi_thread\"\n\n[identity]\nnonce = \"AAAAAA==\"\n"
+                .parse::<DocumentMut>()
+                .unwrap();
+
+        let config = Config {
+            identity: Some(crate::IdentityConfig {
+                algo: crate::SignatureAlgorithm::Ed25519,
+                role: Default::default(),
+                public_key: "pub".to_owned(),
+                private_key: "priv".to_owned(),
+                nonce: "AQAAAA==".to_owned(),
+                node_id: None,
+                key_passphrase: None,
+                key_passphrase_file: None,
+                key_passphrase_prompt: false,
+                lazy_mining: true,
+                max_lazy_difficulty: 64,
+            }),
+            ..Config::default()
+        };
+
+        update_document(&mut document, &config).unwrap();
+
+        let rendered = document.to_string();
+        assert!(rendered.contains("[identity]"));
+        assert!(!rendered.contains("[Identity]"));
+        assert!(rendered.contains("public_key = \"pub\""));
+        assert!(rendered.contains("private_key = \"priv\""));
+        assert!(rendered.contains("nonce = \"AQAAAA==\""));
+    }
+
+    #[test]
+    fn removing_identity_drops_uppercase_and_lowercase_sections() {
+        let mut document = "[global]\nruntime_flavor = \"multi_thread\"\n\n[Identity]\npublic_key = \"upper\"\n\n[identity]\npublic_key = \"lower\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        update_document(&mut document, &Config::default()).unwrap();
+
+        let rendered = document.to_string();
+        assert!(!rendered.contains("[Identity]"));
+        assert!(!rendered.contains("[identity]"));
+    }
+
+    #[test]
+    fn thread_keep_alive_ms_overflow_returns_error_without_removing_existing_key() {
+        let mut document =
+            "[global]\nthread_keep_alive_ms = 42\nruntime_flavor = \"multi_thread\"\n"
+                .parse::<DocumentMut>()
+                .unwrap();
+        let mut config = Config::default();
+        config.global.thread_keep_alive_ms = Some(u64::MAX);
+
+        let err = update_document(&mut document, &config).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConfigError::TomlIntegerOutOfRange {
+                key: "global.thread_keep_alive_ms",
+                value,
+            } if value == u128::from(u64::MAX)
+        ));
+        assert!(document.to_string().contains("thread_keep_alive_ms = 42"));
+    }
+
+    #[test]
+    fn thread_stack_size_overflow_returns_error_without_removing_existing_key() {
+        let mut document = "[global]\nthread_stack_size = 64\nruntime_flavor = \"multi_thread\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let mut config = Config::default();
+        config.global.thread_stack_size = Some(usize::MAX);
+
+        let err = update_document(&mut document, &config).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConfigError::TomlIntegerOutOfRange {
+                key: "global.thread_stack_size",
+                value,
+            } if value == (usize::MAX as u128)
+        ));
+        assert!(document.to_string().contains("thread_stack_size = 64"));
+    }
+
+    #[test]
+    fn adds_node_sections_when_missing() {
+        let mut document = "[global]\nruntime_flavor = \"multi_thread\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let mut config = Config::default();
+        config.global.admin_socket = Some("unix:///tmp/veil.sock".to_owned());
+        config.global.logs = crate::LogsConfig::File;
+        config.global.log_file = Some("/tmp/veil.log".to_owned());
+        config.peers.push(crate::PeerConfig {
+            peer_id: crate::PeerId::new(1),
+            public_key: "pub".to_owned(),
+            nonce: "AAAAAA==".to_owned(),
+            transport: "tcp://127.0.0.1:9000".to_owned(),
+            algo: Default::default(),
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            alt_uri: None,
+        });
+        config.listen.push(crate::ListenConfig {
+            id: crate::ListenId::new(2),
+            transport: "tcp://127.0.0.1:9001".to_owned(),
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            advertise: None,
+            relay: None,
+            ..Default::default()
+        });
+        config.metrics = Some(crate::MetricsConfig {
+            listen: "tcp://127.0.0.1:9100".to_owned(),
+            path: Some("/metrics".to_owned()),
+            auth_token: None,
+            allow_unauthenticated_remote_metrics: false,
+        });
+
+        update_document(&mut document, &config).unwrap();
+
+        let rendered = document.to_string();
+        assert!(rendered.contains("admin_socket = \"unix:///tmp/veil.sock\""));
+        assert!(rendered.contains("logs = \"file\""));
+        assert!(rendered.contains("[metrics]"));
+        assert!(rendered.contains("peers = ["));
+        assert!(rendered.contains("listen = ["));
+    }
+
+    #[test]
+    fn adds_ipc_section_when_enabled() {
+        let mut document = "[global]\nruntime_flavor = \"multi_thread\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        let config = Config {
+            ipc: crate::IpcConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        update_document(&mut document, &config).unwrap();
+
+        let rendered = document.to_string();
+        assert!(rendered.contains("[ipc]"), "rendered: {rendered}");
+        assert!(rendered.contains("enabled = true"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn removes_ipc_section_when_disabled() {
+        let mut document = "[global]\nruntime_flavor = \"multi_thread\"\n\n[ipc]\nenabled = true\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        update_document(&mut document, &Config::default()).unwrap();
+
+        let rendered = document.to_string();
+        assert!(!rendered.contains("[ipc]"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn removes_default_transport_sections() {
+        let mut document = "[transport]\n[transport.tls_client]\nbrowser_profile = \"chrome_like\"\n[transport.quic_client]\nbackend = \"native_quinn\"\n[transport.websocket]\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        update_document(&mut document, &Config::default()).unwrap();
+
+        let rendered = document.to_string();
+        // [transport] и [transport.rotation] are now ALWAYS emitted
+        // (rotation is а discoverable anti-DPI knob — см. set_transport).
+        // Other default sub-tables still get removed.
+        assert!(rendered.contains("[transport.rotation]"));
+        assert!(!rendered.contains("[transport.tls_client]"));
+        assert!(!rendered.contains("[transport.quic_client]"));
+        assert!(!rendered.contains("[transport.websocket]"));
+        assert!(!rendered.contains("browser_profile"));
+    }
+
+    #[test]
+    fn rotation_section_always_emitted_with_defaults() {
+        // Fresh config (no existing [transport] in document) must
+        // still get а [transport.rotation] section with default values.
+        let mut document = DocumentMut::new();
+        update_document(&mut document, &Config::default()).unwrap();
+        let rendered = document.to_string();
+        assert!(
+            rendered.contains("[transport.rotation]"),
+            "rotation section must always appear, got: {rendered}"
+        );
+        assert!(rendered.contains("min_lifetime_secs = 1800"));
+        assert!(rendered.contains("max_lifetime_secs = 3600"));
+    }
+
+    #[test]
+    fn rotation_section_reflects_custom_values() {
+        let mut config = Config::default();
+        config.transport.rotation.min_lifetime_secs = 600;
+        config.transport.rotation.max_lifetime_secs = 1_200;
+        let mut document = DocumentMut::new();
+        update_document(&mut document, &config).unwrap();
+        let rendered = document.to_string();
+        assert!(rendered.contains("min_lifetime_secs = 600"));
+        assert!(rendered.contains("max_lifetime_secs = 1200"));
+    }
+
+    #[test]
+    fn rotation_section_emits_minus_one_disable_sentinel() {
+        let mut config = Config::default();
+        config.transport.rotation.min_lifetime_secs = -1;
+        config.transport.rotation.max_lifetime_secs = -1;
+        let mut document = DocumentMut::new();
+        update_document(&mut document, &config).unwrap();
+        let rendered = document.to_string();
+        assert!(rendered.contains("min_lifetime_secs = -1"));
+        assert!(rendered.contains("max_lifetime_secs = -1"));
+    }
+}

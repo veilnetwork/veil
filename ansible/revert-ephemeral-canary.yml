@@ -1,0 +1,105 @@
+---
+# Phase 5f Step 3c — revert the ephemeral-rotation canary.
+# Strips the `ephemeral = {...}` inline-table field из the targeted
+# [[listen]] entry и restarts the daemon.
+#
+# Idempotent: skips если no ephemeral field found.
+#
+# Run:
+#   ansible-playbook -i inventory.yml revert-ephemeral-canary.yml \
+#     --limit node1
+
+- name: Revert ephemeral-port rotation canary
+  hosts: all
+  become: true
+  serial: 1
+  vars:
+    eph_listen_id: "0x00000002"
+
+  tasks:
+    - name: Check if ephemeral field present в target listener
+      ansible.builtin.shell:
+        cmd: |
+          python3 << 'PYEOF'
+          import re
+          with open("/var/lib/veil/node.toml") as f:
+              src = f.read()
+          inline_re = re.compile(
+              r'\{\s*id\s*=\s*"{{ eph_listen_id }}"[^}]*ephemeral\s*=',
+              re.MULTILINE | re.DOTALL,
+          )
+          print("1" if inline_re.search(src) else "0")
+          PYEOF
+        executable: /bin/bash
+      register: has_eph
+      changed_when: false
+
+    - name: Skip already-reverted hosts
+      ansible.builtin.meta: end_host
+      when: has_eph.stdout | trim == "0"
+
+    - name: Strip the ephemeral inline field
+      ansible.builtin.shell:
+        cmd: |
+          python3 << 'PYEOF'
+          import re, sys
+          path = "/var/lib/veil/node.toml"
+          target_id = "{{ eph_listen_id }}"
+          with open(path) as f:
+              src = f.read()
+          # Within the inline-table { id = "...", ..., ephemeral = { ... } },
+          # strip `, ephemeral = { ... }` substring.  The match is greedy
+          # to swallow the entire inner ephemeral table в one shot.
+          inline_re = re.compile(
+              r'(\{\s*id\s*=\s*"' + re.escape(target_id) + r'"[^}]*?)'
+              r',\s*ephemeral\s*=\s*\{[^}]*\}'
+              r'(\s*\})',
+              re.MULTILINE | re.DOTALL,
+          )
+          new_src, n = inline_re.subn(r'\1\2', src, count=1)
+          if n != 1:
+              sys.stderr.write(f"ERROR: expected exactly 1 match, got {n}\n")
+              sys.exit(1)
+          with open(path, "w") as f:
+              f.write(new_src)
+          print("ok")
+          PYEOF
+        executable: /bin/bash
+
+    - name: Restart veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait для metrics endpoint
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:{{ metrics_port }}/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Show wait result
+      ansible.builtin.debug:
+        var: wait_result.stdout
+
+    - name: Confirm no rotation events after revert
+      ansible.builtin.shell:
+        cmd: |
+          journalctl -u veil.service --since "1 minute ago" --no-pager \
+            | grep -cE "listen.rotation.spawned" || true
+      register: rotation_post_revert
+      changed_when: false
+
+    - name: Show post-revert rotation count
+      ansible.builtin.debug:
+        msg: |
+          listen.rotation.spawned после revert: {{ rotation_post_revert.stdout }}
+          (Should be 0 — ephemeral block stripped, daemon restarted без rotator.)

@@ -1,0 +1,167 @@
+//! IPC endpoint path resolution.
+//!
+//! Resolves the operator's `[ipc]` config к а concrete listener backend
+//! (`IpcEndpoint`) и computes the anchor path that `veil-cli` /
+//! `veilclient` use к find the running daemon.  All public symbols
+//! здесь mirror the admin-endpoint contract в `node/admin.rs` so the two
+//! discovery channels share parsing rules.
+
+use std::path::{Path, PathBuf};
+
+/// Default IPC socket path under the user's veil data directory.
+pub fn default_ipc_socket_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
+    PathBuf::from(home).join(".veil").join("app.sock")
+}
+
+/// Resolved IPC server backend.  Mirrors `AdminEndpoint` в `node/admin.rs` —
+/// same URI parsing + sidecar pattern so app clients can discover the
+/// server с one cross-platform code path.
+#[derive(Debug, Clone)]
+pub enum IpcEndpoint {
+    /// Unix domain socket at `path`. Default на Linux/macOS.
+    Unix(PathBuf),
+    /// TCP-loopback at `bind_addr`; `runtime_dir` holds `ipc.port` + `ipc.token`
+    /// sidecars so clients can discover the listener и authenticate.
+    Tcp {
+        bind_addr: std::net::SocketAddr,
+        runtime_dir: PathBuf,
+    },
+    /// Windows NamedPipe at the given pipe name (full `\\.\pipe\xxx` form).
+    /// `runtime_dir` holds `ipc.pipe` + `ipc.token`.
+    NamedPipe {
+        pipe_name: String,
+        runtime_dir: PathBuf,
+    },
+}
+
+/// Sidecar filenames written next to а TCP IPC anchor (mirrors the admin
+/// `admin.port` / `admin.token` convention).
+pub const IPC_PORT_FILENAME: &str = "ipc.port";
+pub const IPC_TOKEN_FILENAME: &str = "ipc.token";
+pub const IPC_ANCHOR_FILENAME: &str = "ipc.anchor";
+/// NamedPipe sidecar filename — UTF-8 file containing the Windows pipe
+/// name that clients should open.
+#[cfg(windows)]
+pub const IPC_PIPE_FILENAME: &str = "ipc.pipe";
+
+/// Errors surfaced by [`resolve_ipc_endpoint`] / [`ipc_anchor_path`].
+///
+/// Decoupled from veilcore's error tree (`NodeError`) so this crate
+/// doesn't have к depend на it.  Production runtime adapter wraps this
+/// back into `NodeError::Config(ConfigError::ValidationFailed(_))`.
+#[derive(Debug, thiserror::Error)]
+pub enum IpcEndpointError {
+    /// The configured `ipc.socket_uri` failed validation.  The contained
+    /// string is the human-readable explanation.
+    #[error("{0}")]
+    Validation(String),
+}
+
+/// Resolve the IPC endpoint from `[ipc]` config.  Precedence:
+/// 1. `socket_uri` (explicit URI form, supports both backends).
+/// 2. `socket_path` (Unix-only, backward compat).
+/// 3. Default Unix path under the veil home dir.
+///
+/// `default_runtime_dir` is the fallback used когда neither the URI's
+/// `?runtime_dir=` query nor `config_dir` is set.  Production runtime
+/// passes the value of `cfg::runtime_veil_dir` here.
+///
+/// Returns an error if the URI is malformed, references а non-loopback
+/// host, или specifies an unknown scheme.
+pub fn resolve_ipc_endpoint(
+    cfg: &veil_types::IpcConfig,
+    config_dir: Option<&Path>,
+    default_runtime_dir: &Path,
+) -> Result<IpcEndpoint, IpcEndpointError> {
+    if let Some(uri) = cfg.socket_uri.as_deref() {
+        let (uri_body, query_runtime_dir) = split_ipc_uri_query(uri);
+
+        // pipe:// handled здесь — `TransportUri` doesn't model Windows
+        // NamedPipes.  Form: `pipe://LEAF[?runtime_dir=...]`.
+        if let Some(rest) = uri_body.strip_prefix("pipe://") {
+            let leaf = rest.split('/').next().unwrap_or("");
+            if leaf.is_empty() || leaf.contains(':') || leaf.contains('\\') {
+                return Err(IpcEndpointError::Validation(format!(
+                    "ipc.socket_uri: pipe:// leaf must be a simple name (got: {uri})"
+                )));
+            }
+            let pipe_name = format!(r"\\.\pipe\{leaf}");
+            let runtime_dir = query_runtime_dir
+                .map(PathBuf::from)
+                .or_else(|| config_dir.map(|p| p.to_path_buf()))
+                .unwrap_or_else(|| default_runtime_dir.to_path_buf());
+            return Ok(IpcEndpoint::NamedPipe {
+                pipe_name,
+                runtime_dir,
+            });
+        }
+
+        let parsed = veil_transport::TransportUri::parse(uri_body)
+            .map_err(|e| IpcEndpointError::Validation(format!("ipc.socket_uri: {e}")))?;
+        return match parsed {
+            veil_transport::TransportUri::Unix { path } => Ok(IpcEndpoint::Unix(path)),
+            veil_transport::TransportUri::Tcp { host, port } => {
+                if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+                    return Err(IpcEndpointError::Validation(format!(
+                        "ipc.socket_uri: TCP host must be loopback, got `{host}`"
+                    )));
+                }
+                let bind_addr: std::net::SocketAddr =
+                    format!("{host}:{port}").parse().map_err(|e| {
+                        IpcEndpointError::Validation(format!(
+                            "ipc.socket_uri: invalid tcp address {host}:{port} — {e}"
+                        ))
+                    })?;
+                let runtime_dir = query_runtime_dir
+                    .map(PathBuf::from)
+                    .or_else(|| config_dir.map(|p| p.to_path_buf()))
+                    .unwrap_or_else(|| default_runtime_dir.to_path_buf());
+                Ok(IpcEndpoint::Tcp {
+                    bind_addr,
+                    runtime_dir,
+                })
+            }
+            _ => Err(IpcEndpointError::Validation(format!(
+                "ipc.socket_uri: unsupported scheme in `{uri}` (use unix:// or tcp://)"
+            ))),
+        };
+    }
+    Ok(IpcEndpoint::Unix(default_ipc_socket_path()))
+}
+
+/// Anchor path — what `veil-cli` и `veilclient` resolve к find the
+/// IPC server.  For Unix it's the socket file; for TCP / NamedPipe it's а
+/// synthetic path под `runtime_dir` whose siblings (`ipc.port` /
+/// `ipc.token` / `ipc.pipe`) authenticate the discovery.  See
+/// [`resolve_ipc_endpoint`] for `config_dir` semantics.
+pub fn ipc_anchor_path(
+    cfg: &veil_types::IpcConfig,
+    config_dir: Option<&Path>,
+    default_runtime_dir: &Path,
+) -> Result<PathBuf, IpcEndpointError> {
+    Ok(
+        match resolve_ipc_endpoint(cfg, config_dir, default_runtime_dir)? {
+            IpcEndpoint::Unix(p) => p,
+            IpcEndpoint::Tcp { runtime_dir, .. } => runtime_dir.join(IPC_ANCHOR_FILENAME),
+            IpcEndpoint::NamedPipe { runtime_dir, .. } => runtime_dir.join(IPC_ANCHOR_FILENAME),
+        },
+    )
+}
+
+/// Split an IPC URI into `(body, runtime_dir?)`.  Extracts the
+/// `?runtime_dir=` query parameter since `TransportUri::parse` doesn't
+/// model query strings yet.
+fn split_ipc_uri_query(uri: &str) -> (&str, Option<String>) {
+    let Some(q) = uri.find('?') else {
+        return (uri, None);
+    };
+    let (body, query) = uri.split_at(q);
+    let query = &query[1..];
+    for pair in query.split('&') {
+        if let Some(rest) = pair.strip_prefix("runtime_dir=") {
+            return (body, Some(rest.to_owned()));
+        }
+    }
+    (body, None)
+}

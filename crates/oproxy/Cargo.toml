@@ -1,0 +1,54 @@
+[package]
+name = "oproxy"
+version = "0.1.0"
+edition = "2024"
+description = "Veil-network proxy bridge: standalone client с SOCKS5/HTTP/TProxy inbounds + standalone server c custom app_name + node_id allowlist.  Works на Windows, Linux, macOS, FreeBSD, Keenetic."
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "oproxy-client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "oproxy-server"
+path = "src/bin/server.rs"
+
+[features]
+# `tls-boring` ON by default — browser-like TLS ClientHello + rotation
+# (censorship-resistance baseline; needs cmake + a C toolchain at build time).
+# Opt out for pure-Rust / cross builds without cmake:
+#     cargo build -p oproxy --no-default-features
+# See docs/en/OPERATIONS.md → "TLS ClientHello fingerprint rotation".
+default = ["tls-boring"]
+tls-boring = ["veilclient/tls-boring"]
+
+[dependencies]
+veilclient = { path = "../../veilclient" }
+veil-app = { path = "../veil-app" }
+veil-cfg = { path = "../veil-cfg" }
+veil-identity = { path = "../veil-identity" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+hex = "0.4"
+
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+blake3 = "1.5"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["sync", "time", "rt", "rt-multi-thread", "io-util", "macros", "net", "signal"] }
+toml = "0.8"
+env_logger = "0.11"
+
+# Linux/FreeBSD/Keenetic-only — TProxy + SO_ORIGINAL_DST.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

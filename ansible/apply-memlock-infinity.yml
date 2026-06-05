@@ -1,0 +1,56 @@
+---
+# Apply LimitMEMLOCK=infinity к the veil systemd unit so the
+# daemon's startup mlockall(MCL_CURRENT | MCL_FUTURE) succeeds and
+# pins all key material против swap-out.
+#
+# Without this, mlockall returns ENOMEM (logged as
+# `node.mlock.budget_exhausted`); daemon continues to run но keys
+# remain swappable.
+#
+# Re-runs the template task only (not а full deploy), then daemon-
+# reload + restart-only-если-changed.  Idempotent.
+#
+# Run:
+#   ansible-playbook -i inventory.yml apply-memlock-infinity.yml
+
+- name: Apply LimitMEMLOCK=infinity к veil systemd unit
+  hosts: all
+  become: true
+  serial: 1
+  tasks:
+    - name: Install updated systemd unit
+      ansible.builtin.template:
+        src: templates/veil.service.j2
+        dest: /etc/systemd/system/veil.service
+        owner: root
+        group: root
+        mode: "0644"
+      register: unit_change
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: unit_change.changed
+
+    - name: Restart veil service to pick up new LimitMEMLOCK
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
+      when: unit_change.changed
+
+    - name: Wait 5s for service to come up
+      ansible.builtin.pause:
+        seconds: 5
+      when: unit_change.changed
+
+    - name: Verify mlockall succeeded in logs (last 1 minute)
+      ansible.builtin.shell:
+        cmd: grep -aE 'node\.mlock\.(success|budget_exhausted|unsupported|permission_denied|unexpected_error)' /var/log/veil/veil.log | tail -1
+      register: mlock_log
+      changed_when: false
+      when: unit_change.changed
+
+    - name: Show mlock log line
+      ansible.builtin.debug:
+        msg: "{{ mlock_log.stdout | default('(no log line yet)') }}"
+      when: unit_change.changed

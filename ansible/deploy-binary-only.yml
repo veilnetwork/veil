@@ -1,0 +1,114 @@
+---
+# Phase 6.50.b iterative-DHT rollout — binary-only deploy.
+#
+# Replaces /usr/local/bin/veil-cli с the fresh release build,
+# keeps /var/lib/veil/node.toml untouched (preserves any in-place
+# operator edits — е.g. stress-soak overrides applied 2026-05-09:
+# `rekey_bytes_threshold = 100000000`, `rekey_time_threshold_secs = 300`).
+#
+# Use this playbook when shipping а bugfix или а new feature whose config
+# defaults are backward-compatible (e.g. Phase 6.50.b slice 5 added
+# four `[routing] dht_fallback_*` knobs all with safe defaults — no
+# existing config needs editing к pick them up).
+#
+# Run с:
+#   ansible-playbook -i inventory.yml deploy-binary-only.yml
+
+- name: Deploy veil binary only (preserve config + state)
+  hosts: all
+  become: true
+  serial: 1  # stagger rollout so the cluster keeps а quorum during restart
+  vars:
+    veil_bin_src: "{{ playbook_dir }}/../target/release/veil-cli"
+
+  tasks:
+    - name: Verify veil-cli binary exists on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ veil_bin_src }}"
+      register: bin_stat
+
+    - name: Fail if binary missing
+      ansible.builtin.fail:
+        msg: "Missing binary: {{ veil_bin_src }} — build first с `cargo build --release -p veilcore --bin veil-cli`"
+      when: not bin_stat.stat.exists
+
+    - name: Capture current node.toml stress-overrides (for log/verification)
+      ansible.builtin.shell:
+        cmd: grep -E "^rekey_(bytes|time)_threshold" /var/lib/veil/node.toml || true
+      register: pre_overrides
+      changed_when: false
+
+    - name: Show pre-deploy overrides
+      ansible.builtin.debug:
+        msg: "{{ pre_overrides.stdout_lines | default(['(no overrides)']) }}"
+
+    # Replace the binary in place while veil is still running — the copy is an
+    # atomic temp-write + rename, so the live process keeps the old inode until
+    # the restart below execs the new file.  We then `restart` rather than
+    # stop+start: a restart propagates through `PartOf=veil.service` to the
+    # chat-node load generator (and any other PartOf-linked unit), so it follows
+    # the redeploy.  A stop+start sequence does NOT — PartOf propagates stop and
+    # restart but not start — which previously left chat-node down after every
+    # binary roll until a manual `systemctl start chat-node`.
+    - name: Replace veil-cli binary
+      ansible.builtin.copy:
+        src: "{{ veil_bin_src }}"
+        dest: /usr/local/bin/veil-cli
+        owner: root
+        group: root
+        mode: "0755"
+      register: binary_copy
+
+    - name: Restart veil service (propagates to PartOf-linked chat-node)
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait for node к come back online (metrics endpoint = readiness probe)
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:19999/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "metrics still down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Show wait result
+      ansible.builtin.debug:
+        var: wait_result.stdout
+
+    - name: Verify stress-overrides survived
+      ansible.builtin.shell:
+        cmd: grep -E "^rekey_(bytes|time)_threshold" /var/lib/veil/node.toml || echo "(no overrides)"
+      register: post_overrides
+      changed_when: false
+
+    - name: Fail если overrides got wiped
+      ansible.builtin.fail:
+        msg: "Stress overrides were wiped! pre={{ pre_overrides.stdout_lines }} post={{ post_overrides.stdout_lines }}"
+      when:
+        - pre_overrides.stdout != ""
+        - pre_overrides.stdout != post_overrides.stdout
+
+    - name: Verify new DHT-fallback metrics present
+      ansible.builtin.shell:
+        cmd: curl -sS http://127.0.0.1:19999/metrics | grep -c "^veil_dht_fallback_"
+      register: new_metrics
+      changed_when: false
+
+    - name: Show new metrics count
+      ansible.builtin.debug:
+        msg: "New DHT-fallback metrics exposed: {{ new_metrics.stdout }} lines"
+
+    - name: Fail if new metrics missing (rollout sanity check)
+      ansible.builtin.fail:
+        msg: "New metrics not exposed — binary may not include slice 5 changes"
+      when: new_metrics.stdout | int < 5

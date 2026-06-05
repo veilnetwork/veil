@@ -1,0 +1,56 @@
+# Docker context exclusions — protect dev secrets, speed up builds, и cap the
+# tarball uploaded к the daemon / remote builder.
+
+# Version control
+.git
+.gitignore
+.github
+
+# Build artifacts
+target
+**/*.rs.bk
+**/Cargo.lock.bak
+
+# Local development environments
+ansible/.venv
+ansible/__pycache__
+.venv
+.envrc
+.direnv
+flutter/veil_flutter/build
+flutter/veil_flutter/.dart_tool
+flutter/veil_flutter/.pub-cache
+
+# Local secrets и generated keys (cert.pem is checked in для testnet, the
+# corresponding private key is NOT)
+ssl/*.pem
+ssl/*.key
+*.identity.toml
+*.pkcs8
+*.private.toml
+
+# Local config / state files spawned by sim / devnet
+devnet-*
+sim-*
+.veil-runtime
+veil-data
+
+# OS noise
+.DS_Store
+Thumbs.db
+*~
+.vscode
+.idea
+
+# Editor caches
+*.swp
+*.swo
+*.bak
+
+# Cargo caches (only the workspace target/ — sccache lives outside repo)
+.cargo-cache
+
+# Ansible artifacts
+ansible/*.retry
+ansible/host_vars
+ansible/group_vars/secret.yml

@@ -1,0 +1,286 @@
+//! `oproxy-client` — standalone proxy client binary.
+//!
+//! Connects к а local veil daemon's app socket, binds an endpoint
+//! под the configured `app_name`, и runs one OR more inbound listeners
+//! (SOCKS5 / HTTP / TProxy) forwarding traffic через veil к а
+//! configured upstream `(server_node_id, server_app_name)` pair.
+//!
+//! Each connection is dispatched через the `[routing]` policy (veil
+//! / direct / block + optional direct-fallback на veil failure).
+//!
+//! Usage:
+//!   oproxy-client --config /etc/oproxy/client.toml
+
+// oproxy-client depends on `veilclient::VeilClient`, which is
+// itself `#[cfg(unix)]`-gated (Unix-domain socket IPC).  Wrap the
+// entire bin content в а `#[cfg(unix)] mod imp` so cross-compile к
+// x86_64-pc-windows-gnu doesn't trip on the unresolved `AppSender`
+// import от oproxy::connector.  Windows stub main exits с error.
+#[cfg(not(unix))]
+fn main() -> std::process::ExitCode {
+    eprintln!("oproxy-client is not supported on this platform (Unix-family only).");
+    std::process::ExitCode::FAILURE
+}
+
+#[cfg(unix)]
+fn main() -> std::process::ExitCode {
+    imp::main()
+}
+
+#[cfg(unix)]
+mod imp {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use anyhow::{Context, Result};
+    use clap::Parser;
+
+    use veilclient::VeilClient;
+
+    use oproxy::config::{ClientConfig, InboundConfig, parse_node_id_hex};
+    use oproxy::inbound;
+    use veil_cfg::build_tokio_runtime;
+
+    #[derive(Parser, Debug)]
+    #[command(
+        version,
+        about = "Veil-network proxy client (SOCKS5 / HTTP / TProxy → veil)"
+    )]
+    struct Args {
+        /// Path к а TOML config file (см. `crates/oproxy/README.md`).
+        #[arg(long, value_name = "PATH", required_unless_present = "gen_config")]
+        config: Option<PathBuf>,
+
+        /// Print а commented default-config TOML template к stdout и exit.
+        /// Operators run this once, redirect к а file, edit the placeholders
+        /// (`server_node_id`, `[[inbound]]` listeners), then start с
+        /// `--config <path>`.
+        ///
+        /// Example:
+        ///   oproxy-client --gen-config > /etc/oproxy/client.toml
+        #[arg(long, conflicts_with = "config")]
+        gen_config: bool,
+    }
+
+    pub fn main() -> std::process::ExitCode {
+        let args = Args::parse();
+        if args.gen_config {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            if let Err(e) = stdout
+                .lock()
+                .write_all(oproxy::config_template::CLIENT_DEFAULT_CONFIG.as_bytes())
+            {
+                eprintln!("oproxy-client: write default config: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            return std::process::ExitCode::SUCCESS;
+        }
+        let config_path = args
+            .config
+            .expect("clap should have required --config when --gen-config absent");
+
+        // Audit batch 2026-05-24 (M6): warn если config file is loose-mode.
+        oproxy::config::warn_loose_config_perms(&config_path);
+
+        // Load config first so we can derive runtime + logging knobs from
+        // it before building the tokio runtime.
+        let raw = match std::fs::read_to_string(&config_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("oproxy-client: read {}: {e}", config_path.display());
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let cfg: ClientConfig = match toml::from_str(&raw) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("oproxy-client: parse {}: {e}", config_path.display());
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+
+        // Initialise logger от config; `RUST_LOG` env var still wins (per
+        // env_logger's `from_env` semantics) — operators retain debug
+        // ergonomics.  When `[logging] file` is set, route output к the
+        // file instead of stderr.
+        if let Err(e) = oproxy::init_oproxy_logger("oproxy-client", &cfg.logging) {
+            eprintln!("oproxy-client: failed к init logger: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+
+        // S2.B: load app-cert blob если configured.  Fail-fast если the
+        // file can't be read — better than launching и silently sending
+        // no preamble.
+        let app_cert_blob: Option<Vec<u8>> = match &cfg.app_cert_path {
+            Some(path) => match std::fs::read(path) {
+                Ok(bytes) => {
+                    log::info!(
+                        "oproxy-client: loaded app-cert blob ({} B) от {}",
+                        bytes.len(),
+                        path.display()
+                    );
+                    Some(bytes)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "oproxy-client: failed к read app_cert_path={}: {e}",
+                        path.display()
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+            },
+            None => None,
+        };
+        oproxy::connector::set_app_cert_blob(app_cert_blob);
+
+        // Build the tokio runtime from `[runtime]` + env overrides.
+        let mut rt_cfg = cfg.runtime.clone();
+        rt_cfg.apply_env_overrides("OPROXY");
+        let rt = match build_tokio_runtime(&rt_cfg) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("oproxy-client: failed к build tokio runtime: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+
+        rt.block_on(async move {
+            match run(cfg).await {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("oproxy-client: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        })
+    }
+
+    async fn run(cfg: ClientConfig) -> Result<()> {
+        let server_node_id = parse_node_id_hex(&cfg.server_node_id)
+            .map_err(|e| anyhow::anyhow!("server_node_id: {e}"))?;
+        let server_app_id = veil_app::address::app_id(
+            &server_node_id,
+            oproxy::SERVER_NAMESPACE,
+            &cfg.server_app_name,
+        );
+
+        log::info!(
+            "oproxy-client: connecting к daemon socket {}",
+            cfg.socket_path.display()
+        );
+        let client = VeilClient::connect(&cfg.socket_path)
+            .await
+            .with_context(|| format!("connect к veil daemon at {}", cfg.socket_path.display()))?;
+        log::info!(
+            "oproxy-client: binding local app endpoint (namespace={}, name={})",
+            oproxy::CLIENT_NAMESPACE,
+            oproxy::CLIENT_BIND_NAME,
+        );
+        let app = client
+            .bind(oproxy::CLIENT_NAMESPACE, oproxy::CLIENT_BIND_NAME, 0)
+            .await
+            .context("bind local app endpoint")?;
+        // Audit batch 2026-05-24 (M9): use `into_split()` к get an AppSender
+        // что implements `&self`-only `open_stream`.  Previously wrapped в
+        // `Arc<Mutex<AppHandle>>`, but `.lock().await` was held *через* the
+        // `open_stream().await` call — а single hung veil-peer blocked
+        // ALL other concurrent SOCKS5/HTTP connect attempts.  oproxy-client
+        // never reads inbound messages on this endpoint (only opens streams),
+        // so the receiver-half is dropped immediately.
+        let (sender, _rx) = app.into_split();
+        let app_sender = Arc::new(sender);
+
+        if cfg.inbound.is_empty() {
+            anyhow::bail!("no [[inbound]] sections configured — nothing к do");
+        }
+
+        let routing = Arc::new(cfg.routing.clone());
+        log::info!(
+            "oproxy-client: routing default={:?} fallback={:?} rules={}",
+            routing.default,
+            routing.fallback,
+            routing.rules.len()
+        );
+
+        // Audit batch 2026-05-24 (M8): per-listener semaphore caps concurrent
+        // sessions.  Each listener gets its OWN semaphore (не shared) — а
+        // SOCKS5 flood does not starve the HTTP path.
+        let limit_per_listener = cfg.limits.max_concurrent_per_listener;
+        log::info!("oproxy-client: max_concurrent_per_listener={limit_per_listener}");
+
+        let mut tasks = Vec::with_capacity(cfg.inbound.len());
+        for inbound_cfg in cfg.inbound {
+            let h = Arc::clone(&app_sender);
+            let r = Arc::clone(&routing);
+            let sem = Arc::new(tokio::sync::Semaphore::new(limit_per_listener));
+            let task = match inbound_cfg {
+                InboundConfig::Socks5 { listen } => tokio::spawn(async move {
+                    if let Err(e) = inbound::socks5::run(
+                        listen.clone(),
+                        h,
+                        server_node_id,
+                        server_app_id,
+                        r,
+                        sem,
+                    )
+                    .await
+                    {
+                        log::error!("oproxy.socks5 listener {listen} exited: {e}");
+                    }
+                }),
+                InboundConfig::Http { listen } => tokio::spawn(async move {
+                    if let Err(e) =
+                        inbound::http::run(listen.clone(), h, server_node_id, server_app_id, r, sem)
+                            .await
+                    {
+                        log::error!("oproxy.http listener {listen} exited: {e}");
+                    }
+                }),
+                InboundConfig::Tproxy { listen } => tokio::spawn(async move {
+                    if let Err(e) = inbound::tproxy::run(
+                        listen.clone(),
+                        h,
+                        server_node_id,
+                        server_app_id,
+                        r,
+                        sem,
+                    )
+                    .await
+                    {
+                        log::error!("oproxy.tproxy listener {listen} exited: {e}");
+                    }
+                }),
+            };
+            tasks.push(task);
+        }
+
+        // Wait для shutdown signal или task panic.
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                log::info!("oproxy-client: SIGINT received, shutting down");
+            }
+            _ = futures_first(tasks) => {
+                log::error!("oproxy-client: an inbound task exited unexpectedly");
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait для the first task в the vector к complete.  Simple
+    /// poll-based implementation — avoids а `futures` crate dependency
+    /// just для this one-shot select.
+    async fn futures_first(mut tasks: Vec<tokio::task::JoinHandle<()>>) {
+        if tasks.is_empty() {
+            std::future::pending::<()>().await;
+            return;
+        }
+        loop {
+            if let Some(idx) = tasks.iter().position(|t| t.is_finished()) {
+                let _ = tasks.swap_remove(idx).await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+} // end mod imp (cfg unix)

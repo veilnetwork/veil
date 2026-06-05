@@ -1,0 +1,98 @@
+# cbindgen configuration for veilclient-ffi (Phase 6.50.b-followup).
+#
+# Purpose: auto-generate `include/veil_ffi.h` от Rust pub-exports.
+# Eliminates the "header drifts from lib.rs" bug class (е.g. the Dart
+# `NetworkKind.unknown = 4 vs 255` mismatch that survived only because
+# the C header was manually maintained и nobody noticed missing exports).
+#
+# Run:
+#     cbindgen --config crates/veilclient-ffi/cbindgen.toml \
+#              --crate veilclient-ffi \
+#              --output crates/veilclient-ffi/include/veil_ffi.h
+#
+# CI gate: same command + `git diff --exit-code` ensures committed header
+# matches generated.
+
+language = "C"
+include_guard = "VEIL_FFI_H"
+pragma_once = true
+# Phase 6.50.b audit-B4: `no_includes = true` makes `sys_includes`
+# authoritative — without it cbindgen's auto-include set (stdarg.h,
+# stdbool.h, stdint.h, stdlib.h) was emitted on top of `sys_includes`,
+# producing dup #include lines (stdint.h × 2, stdbool.h × 2).  We
+# manually list only what's actually referenced in the generated body:
+#   stdint.h  → uint8/16/32/64_t
+#   stddef.h  → size_t
+#   sys/types.h → ssize_t (POSIX; Windows consumers typically alias).
+no_includes = true
+sys_includes = ["stdint.h", "stddef.h", "sys/types.h"]
+documentation = true
+documentation_style = "doxy"
+style = "type"
+cpp_compat = true
+
+header = """
+/* SPDX-License-Identifier: MIT
+ *
+ * veil_ffi.h — C ABI для the veil client SDK.
+ *
+ * AUTO-GENERATED от `crates/veilclient-ffi/src/lib.rs`.
+ * DO NOT EDIT BY HAND — regenerate via:
+ *
+ *     cbindgen --config crates/veilclient-ffi/cbindgen.toml \\
+ *              --crate veilclient-ffi \\
+ *              --output crates/veilclient-ffi/include/veil_ffi.h
+ *
+ * CI gate в `.github/workflows/ci.yml::hygiene` runs the same command
+ * и diffs против committed header; PRs that touch FFI signatures must
+ * also commit the regenerated header.
+ *
+ * Memory ownership / lifetime / safety contracts:
+ *   * Opaque handles ара caller-owned; free via the matching `_close()`
+ *     или `_free()` function (е.g. `veil_close`, `veil_stream_close`).
+ *   * `err_out` ара caller-allocated `*mut *mut c_char`; library writes
+ *     а heap-owned C string на error.  Caller frees via `veil_string_free`.
+ *   * Buffer pointers + length pairs ара caller-allocated; callee never
+ *     reallocates them.
+ *   * Callbacks may be invoked от arbitrary tokio worker threads; caller
+ *     must synchronise по own state.  Callbacks ара wrapped в `catch_unwind`;
+ *     panics в callback bodies will NOT cross the ABI boundary.
+ */
+"""
+
+[parse]
+parse_deps = false
+
+[fn]
+prefix = ""
+postfix = ""
+rename_args = "None"
+sort_by = "None"
+must_use = "VEIL_NODISCARD"
+
+[struct]
+must_use = "VEIL_NODISCARD"
+derive_constructor = false
+derive_eq = false
+derive_neq = false
+
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
+must_use = "VEIL_NODISCARD"
+
+[export]
+include = []
+exclude = []
+
+# Phase 6.50.b audit-B4: cbindgen has no per-config "primitive type
+# rename" — `[export.rename]` only applies к struct/enum/fn symbols.
+# Type substitution для `usize → size_t` is achieved by declaring FFI
+# parameters as `libc::size_t` (или `c_size_t` when stabilised) directly
+# in the Rust source.  All current FFI sites do this; the audit caught
+# 4 raw `usize` parameters в `veil_mailbox_*` that survived the
+# Epic 472 sweep; those были migrated к `size_t` (no ABI change —
+# `size_t = usize` on every supported target).
+
+[macro_expansion]
+bitflags = false
