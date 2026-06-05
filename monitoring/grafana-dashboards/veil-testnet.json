@@ -1,0 +1,1147 @@
+{
+  "title": "Veil testnet 8-node (v6 — bufpool + state-size gauges)",
+  "uid": "veil-testnet-v2",
+  "tags": [
+    "veil"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m"
+    ],
+    "time_options": [
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "3h",
+      "6h",
+      "12h",
+      "24h"
+    ]
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active sessions per node",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_active_sessions",
+          "legendFormat": "{{host}} ({{role}})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Transport bytes RX / TX (per-node)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_transport_bytes_rx_total[1m])",
+          "legendFormat": "{{host}} rx",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_transport_bytes_tx_total[1m])",
+          "legendFormat": "{{host}} tx",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "binBps",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Aggregate cluster traffic (sum across all nodes)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(veil_transport_bytes_rx_total[1m]))",
+          "legendFormat": "rx total",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(veil_transport_bytes_tx_total[1m]))",
+          "legendFormat": "tx total",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "binBps",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Outbound connect failures (rate /s)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_outbound_connect_failures_total[1m])",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Session handshake failures (cumulative)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_session_handshake_failures_total",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "DHT activity (lookups / stores rate)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 14,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_dht_lookup_total[1m])",
+          "legendFormat": "{{host}} lookups",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_dht_store_total[1m])",
+          "legendFormat": "{{host}} stores",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Rate-limit / quota drops + bans",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_rate_limit_drops_total[1m])",
+          "legendFormat": "{{host}} rate-drops",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_ban_actions_total[1m])",
+          "legendFormat": "{{host}} bans",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_ban_actions_total[1m])",
+          "legendFormat": "{{host}} bans",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Network reachability score (1 = healthy)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_network_reachability_score",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Route selection avg RTT (ms)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_route_selection_avg_rtt_ms",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Decrypt failures + delivery rejects (rate)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_decrypt_failures_total[1m])",
+          "legendFormat": "{{host}} decrypt-fail",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_ipc_delivery_drops_total[1m])",
+          "legendFormat": "{{host}} ipc-deliv-drops",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Storage evictions (rate)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_storage_evictions_total[1m])",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "Per-node session count (current)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 24,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_active_sessions",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "red"
+              },
+              {
+                "value": 1,
+                "color": "yellow"
+              },
+              {
+                "value": 3,
+                "color": "green"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 20,
+      "title": "Session rekey throughput (rate /s) — phase 6.32-6.33 visibility",
+      "description": "Per-stage rekey FSM counters.  Healthy: init.tx ≈ init.rx ≈ ack.tx ≈ ack.rx (small lag OK).  Drift between init.tx and ack.rx ⇒ acks dropped on the wire OR session torn down before completion (paired with active-sessions dip).",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 24,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_rekey_init_sent_total[1m])",
+          "legendFormat": "{{host}} init.tx",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_rekey_init_received_total[1m])",
+          "legendFormat": "{{host}} init.rx",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_rekey_ack_sent_total[1m])",
+          "legendFormat": "{{host}} ack.tx",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_rekey_ack_received_total[1m])",
+          "legendFormat": "{{host}} ack.rx",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "Rekey-grace fallback + cap evictions — back-to-back rekey early-warning",
+      "description": "Decrypt fallback (left) is the rekey-grace mechanism working as designed — frames in flight at rekey boundary recovered via prev cipher.  Healthy: low non-zero rate paired with rekey rate.  Cap evictions (right) MUST stay at 0 — non-zero ⇒ rekeys arriving faster than 30s grace expires, ring buffer of 3 prev ciphers overflowed, real risk of session-teardown decrypt-failure storm.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 24,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_rekey_decrypt_fallback_total[1m])",
+          "legendFormat": "{{host}} fallback (healthy)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_rekey_grace_cap_evictions_total[1m])",
+          "legendFormat": "{{host}} cap-evict (ALERT > 0)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 22,
+      "title": "Iterative-DHT fallback rate (Phase 6.50.b)",
+      "description": "Fires when legacy RouteRequest flood (TTL=7) exhausts retries и we fall through к RecursiveQuery(FIND_NODE).  Triggered = total fallback invocations.  Resolved = RecursiveResponse arrived within RECURSIVE_TIMEOUT (10s) и dispatcher auto-populated route_cache.  Miss = timeout без response.  Healthy: triggered rate proportional к route-miss-rate; resolved/(resolved+miss) ratio > 50%.  High miss rate indicates network diameter exceeds RecursiveQuery TTL=40 OR CPU pressure dropping reverse-path responses.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 54,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_dht_fallback_triggered_total[1m])",
+          "legendFormat": "{{host}} triggered",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_dht_fallback_resolved_total[1m])",
+          "legendFormat": "{{host}} resolved",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_dht_fallback_miss_total[1m])",
+          "legendFormat": "{{host}} miss",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 24,
+      "title": "DHT fallback adaptive timeout + backpressure (Phase 6.50.b slice 5)",
+      "description": "LEFT axis: effective timeout (ms) — flat at baseline `dht_fallback_timeout_ms` when adaptive=false; climbs 1.5× under sustained miss-rate >50% when adaptive=true, clamped 1000-60000ms.  RIGHT axis: backpressure-skipped events/s — rises when `pending_recursive` map exceeds `dht_fallback_backpressure_threshold_pct` (default 75%) of cap.  Operator alerts: timeout climbing rapidly = network is congesting; skipped non-zero = dispatcher CPU saturated.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 24,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_dht_fallback_effective_timeout_ms",
+          "legendFormat": "{{host}} effective_timeout_ms",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_dht_fallback_skipped_backpressure_total[1m])",
+          "legendFormat": "{{host}} skipped/s (ALERT > 0)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 23,
+      "title": "DHT fallback resolution ratio (partition health)",
+      "description": "Per-node ratio resolved/(resolved+miss) over the last 5 min.  This is the **partition-health signal**: 1.0 = every fallback succeeds (sparse mesh handled well by DHT), 0.0 = every fallback times out (network fragmented past RecursiveQuery's TTL=40 reach OR responses are being dropped/lost).  Threshold guidance: > 0.5 = healthy, 0.2-0.5 = degraded, < 0.2 = partition suspected.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 54,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_dht_fallback_resolved_total[5m]) / (rate(veil_dht_fallback_resolved_total[5m]) + rate(veil_dht_fallback_miss_total[5m]))",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.2
+              },
+              {
+                "color": "green",
+                "value": 0.5
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 30,
+      "title": "Buffer pool throughput (Phase 6.50.d — hot path recycle rate)",
+      "description": "cache_hit_total = pool returned а cached buffer (zero malloc).  fallback_alloc_total = bucket empty, fresh heap alloc (rare in steady state).  Healthy: hit/(hit+fb) > 99.99%.  Spike in fb rate = bucket cap too small или burst exceeds pool budget.  return_anomaly = caller mutated buffer capacity in а way pool can't cache; should be 0.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 66,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_bufpool_cache_hit_total[1m])",
+          "legendFormat": "{{host}} cache_hit",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_bufpool_fallback_alloc_total[1m])",
+          "legendFormat": "{{host}} fallback",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(veil_bufpool_overflow_drop_total[1m])",
+          "legendFormat": "{{host}} overflow_drop",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 31,
+      "title": "Buffer pool inflight + peak (cache occupancy)",
+      "description": "cached_inflight = current count of buffers held in pool free lists across all 3 size buckets (256B / 4KiB / 64KiB).  cached_peak = high watermark.  Plateau within cap is healthy.  Climbing peak + low inflight = high churn (acquire/release cycle).",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 66,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_bufpool_cached_inflight",
+          "legendFormat": "{{host}} inflight",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_bufpool_cached_peak",
+          "legendFormat": "{{host}} peak",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 32,
+      "title": "Session-plane state (live + tx/outbox registries)",
+      "description": "live_sessions = open transport sessions.  session_tx_registry = peers с outbound frame channel.  session_outbox = peers с RPC outbox.  Should track 1:1 in steady state; divergence indicates teardown lag (sessions cleaned up faster than registries OR vice-versa).",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 72,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_live_sessions",
+          "legendFormat": "{{host}} live",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_session_tx_registry",
+          "legendFormat": "{{host}} tx_reg",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_session_outbox",
+          "legendFormat": "{{host}} outbox",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 33,
+      "title": "Routing state — route_cache + DHT routing table",
+      "description": "route_cache_destinations = distinct dst node_ids cached.  route_cache_routes = total (dst,via) entries — capped at destinations × MAX_ROUTES_PER_DST=4.  dht_routing_contacts = Kademlia k-bucket population.  Cap-bounded; flat lines = steady state, sustained climb = chaos-ban turnover accumulating route candidates.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 72,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_route_cache_destinations",
+          "legendFormat": "{{host}} route_dst",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_route_cache_routes",
+          "legendFormat": "{{host}} route_total",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_dht_routing_contacts",
+          "legendFormat": "{{host}} dht_contacts",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 34,
+      "title": "DHT sub-stores (store / transport_cache / lookup_cache / pending_recursive)",
+      "description": "dht_store = replicated value-store entries (TieredStore: hot + cold tiers).  transport_cache = resolved SignedTransportAnnouncement entries (TTL).  lookup_cache = in-flight iterative-lookup state.  pending_recursive = correlator entries для RecursiveQuery responses (cap MAX_PENDING_RECURSIVE=1024).  All cap-bounded.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 78,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_dht_store",
+          "legendFormat": "{{host}} store",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_dht_transport_cache",
+          "legendFormat": "{{host}} transport_cache",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_dht_lookup_cache",
+          "legendFormat": "{{host}} lookup_cache",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_pending_recursive",
+          "legendFormat": "{{host}} pending_rec",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 35,
+      "title": "Dispatcher caches (peer_observed / relay / pubkeys / discovered)",
+      "description": "peer_observed_addrs = remote-address index per peer (cleaned on session close).  relay_tunnels = active relay binding pairs (per peer Pair).  peer_pubkeys = LRU pubkey cache.  discovered_peers = bootstrap-cache snapshot (MAX_DISCOVERED_PEERS=32).  All bounded.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 78,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_peer_observed_addrs",
+          "legendFormat": "{{host}} peer_obs",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_relay_tunnels",
+          "legendFormat": "{{host}} relay_tun",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_peer_pubkeys",
+          "legendFormat": "{{host}} pubkeys",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_discovered_peers",
+          "legendFormat": "{{host}} discovered",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 36,
+      "title": "Chunk reassembler — transfers in-flight + bytes buffered",
+      "description": "transfers = in-progress chunked transfers awaiting completion.  bytes = total reassembly memory across them (cap MAX_REASSEMBLY_BYTES).  Should be 0 в idle clusters; spikes correlate с large multi-chunk DHT value transfers OR Epic 290 route-discovery floods.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 84,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_chunk_reassembler_transfers",
+          "legendFormat": "{{host}} transfers",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_chunk_reassembler_bytes / 1024",
+          "legendFormat": "{{host}} buffered_KiB",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 37,
+      "title": "Ban list size + BootstrapWatchdog retries",
+      "description": "ban_list = entries in BanList (manual + temporary + ML decisions, cap MAX_BAN_LIST_SIZE).  bootstrap_watchdog_retries_total = times the partition-recovery loop re-dialed bootstraps after detecting all sessions torn down (Phase 6.50.c).  Watchdog retries are operator-alerting: non-zero means partition was detected и recovered.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 84,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_state_ban_list",
+          "legendFormat": "{{host}} bans",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "veil_bootstrap_watchdog_retries_total",
+          "legendFormat": "{{host}} watchdog_retries",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    }
+  ]
+}

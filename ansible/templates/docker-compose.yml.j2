@@ -1,0 +1,117 @@
+services:
+{% if not (veil_no_tls | default(false)) %}
+  certbot:
+    image: certbot/certbot:latest
+    container_name: veil-certbot
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot-lib:/var/lib/letsencrypt
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        HOST="{{ veil_host }}"
+        EMAIL="{{ veil_email }}"
+        {% if veil_staging | default(false) %}
+        STAGING_FLAG="--staging"
+        {% else %}
+        STAGING_FLAG=""
+        {% endif %}
+
+        if [ ! -s "/etc/letsencrypt/live/$${HOST}/fullchain.pem" ]; then
+          echo "[certbot] issuing cert for $${HOST}"
+          certbot certonly --standalone --non-interactive --agree-tos \
+            $${STAGING_FLAG} \
+            --email "$${EMAIL}" --preferred-challenges http \
+            --rsa-key-size 2048 -d "$${HOST}" \
+            || { echo "[certbot] issuance failed"; exit 1; }
+        else
+          echo "[certbot] cert already present"
+        fi
+
+        # Restrict cert permissions: dirs 0750 root:999, privkey 0640, chain 0644.
+        # World-readable privkey leaks TLS material к any sidecar process.
+        chown -R root:999 /etc/letsencrypt/live /etc/letsencrypt/archive
+        chmod -R 0750 /etc/letsencrypt/live /etc/letsencrypt/archive
+        find /etc/letsencrypt/live /etc/letsencrypt/archive -name 'privkey*.pem' -exec chmod 0640 {} +
+        find /etc/letsencrypt/live /etc/letsencrypt/archive \
+          \( -name 'fullchain*.pem' -o -name 'chain*.pem' -o -name 'cert*.pem' \) \
+          -exec chmod 0644 {} +
+
+        while :; do
+          sleep 43200
+          certbot renew --standalone --non-interactive $${STAGING_FLAG} || true
+          # Restrict cert permissions: dirs 0750 root:999, privkey 0640, chain 0644.
+        # World-readable privkey leaks TLS material к any sidecar process.
+        chown -R root:999 /etc/letsencrypt/live /etc/letsencrypt/archive
+        chmod -R 0750 /etc/letsencrypt/live /etc/letsencrypt/archive
+        find /etc/letsencrypt/live /etc/letsencrypt/archive -name 'privkey*.pem' -exec chmod 0640 {} +
+        find /etc/letsencrypt/live /etc/letsencrypt/archive \
+          \( -name 'fullchain*.pem' -o -name 'chain*.pem' -o -name 'cert*.pem' \) \
+          -exec chmod 0644 {} +
+        done
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /etc/letsencrypt/live/{{ veil_host }}/fullchain.pem"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+{% endif %}
+
+  veil:
+    image: {{ veil_image }}
+    container_name: {{ veil_container_name }}
+    restart: unless-stopped
+{% if not (veil_no_tls | default(false)) %}
+    depends_on:
+      certbot:
+        condition: service_healthy
+{% endif %}
+    environment:
+{% if veil_no_tls | default(false) %}
+      NO_TLS: "1"
+      ADVERTISE_HOST: "{{ veil_advertise_host | default(ansible_host) }}"
+{% else %}
+      HOST: "{{ veil_host }}"
+{% endif %}
+      ROLE: "{{ veil_role }}"
+      DIFFICULTY: "{{ veil_difficulty }}"
+      TCP_PORT: "{{ tcp_port }}"
+{% if not (veil_no_tls | default(false)) %}
+      TLS_PORT: "{{ tls_port }}"
+      QUIC_PORT: "{{ quic_port }}"
+      WSS_PORT: "{{ wss_port }}"
+{% endif %}
+      MESH_UDP_PORT: "{{ mesh_udp_port }}"
+      METRICS_PORT: "{{ metrics_port }}"
+    ports:
+      - "{{ tcp_port }}:{{ tcp_port }}/tcp"
+{% if not (veil_no_tls | default(false)) %}
+      - "{{ tls_port }}:{{ tls_port }}/tcp"
+      - "{{ quic_port }}:{{ quic_port }}/udp"
+      - "{{ wss_port }}:{{ wss_port }}/tcp"
+{% endif %}
+      - "{{ mesh_udp_port }}:{{ mesh_udp_port }}/udp"
+      - "{{ metrics_port }}:{{ metrics_port }}/tcp"
+    volumes:
+      - veil-data:/var/lib/veil
+{% if not (veil_no_tls | default(false)) %}
+      - letsencrypt:/etc/letsencrypt:ro
+{% endif %}
+      - ./entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD", "veil-cli", "--config", "/var/lib/veil/node.toml", "node", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+{% if not (veil_no_tls | default(false)) %}
+  letsencrypt:
+  certbot-lib:
+{% endif %}
+  veil-data:

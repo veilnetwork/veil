@@ -1,0 +1,225 @@
+---
+# Deploy `oproxy-server` и/или `oproxy-client` on testnet hosts.
+#
+# Selects role per-host via the `oproxy_role` variable:
+#   * `server` — installs oproxy-server binary + config + systemd unit
+#   * `client` — installs oproxy-client binary + config + systemd unit
+#   * `both`   — both binaries (useful для local-loop smoke tests)
+#   * (unset)  — host skipped
+#
+# Per-host vars (set в inventory or `--extra-vars`):
+#
+#   oproxy_role: "server" | "client" | "both"
+#
+#   # Server-side (когда role == "server" OR "both"):
+#   oproxy_app_name: "testnet-proxy"      # default
+#   oproxy_allowed_node_ids: []            # default — allow all
+#   oproxy_allow_private: false            # default — block RFC1918
+#
+#   # Client-side (когда role == "client" OR "both"):
+#   oproxy_server_node_id: "<64 hex chars of server's node_id>"
+#   oproxy_server_app_name: "testnet-proxy"
+#   oproxy_socks5_listen:  "127.0.0.1:1080"
+#   oproxy_http_listen:    "127.0.0.1:8080"
+#
+# Run:
+#   ansible-playbook -i inventory.yml deploy-oproxy.yml \
+#     --extra-vars '{"oproxy_role": "server"}' \
+#     --limit b1
+#
+#   ansible-playbook -i inventory.yml deploy-oproxy.yml \
+#     --extra-vars '{
+#       "oproxy_role": "client",
+#       "oproxy_server_node_id": "<b1 node_id hex>"
+#     }' \
+#     --limit b2
+
+- name: Deploy oproxy binaries + configs + systemd units
+  hosts: all
+  become: true
+  serial: 1  # roll-by-host so cluster keeps quorum during restarts
+  vars:
+    oproxy_bin_src_dir: "{{ playbook_dir }}/../target/release"
+    oproxy_etc_dir: /etc/oproxy
+  tasks:
+    - name: Skip hosts с no oproxy_role set
+      ansible.builtin.meta: end_host
+      when: oproxy_role is not defined
+
+    - name: Sanity — verify role value
+      ansible.builtin.fail:
+        msg: >-
+          oproxy_role must be one of ['server', 'client', 'both']; got
+          '{{ oproxy_role }}'
+      when: oproxy_role not in ['server', 'client', 'both']
+
+    - name: Ensure /etc/oproxy/ exists
+      ansible.builtin.file:
+        path: "{{ oproxy_etc_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # ── Server-side install ────────────────────────────────────────
+    - name: Verify oproxy-server binary present on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ oproxy_bin_src_dir }}/oproxy-server"
+      register: server_bin_stat
+      when: oproxy_role in ['server', 'both']
+
+    - name: Fail if oproxy-server binary missing locally
+      ansible.builtin.fail:
+        msg: >-
+          Missing {{ oproxy_bin_src_dir }}/oproxy-server.  Build first с
+          `cargo build -p oproxy --release`.
+      when: oproxy_role in ['server', 'both'] and not server_bin_stat.stat.exists
+
+    - name: Install oproxy-server binary
+      ansible.builtin.copy:
+        src: "{{ oproxy_bin_src_dir }}/oproxy-server"
+        dest: /usr/local/bin/oproxy-server
+        owner: root
+        group: root
+        mode: "0755"
+      when: oproxy_role in ['server', 'both']
+      register: server_bin_copy
+
+    - name: Render oproxy-server config
+      ansible.builtin.template:
+        src: templates/oproxy-server.toml.j2
+        dest: "{{ oproxy_etc_dir }}/server.toml"
+        owner: veil
+        group: veil
+        mode: "0640"
+      when: oproxy_role in ['server', 'both']
+      register: server_cfg_render
+
+    - name: Install oproxy-server.service systemd unit
+      ansible.builtin.template:
+        src: templates/oproxy-server.service.j2
+        dest: /etc/systemd/system/oproxy-server.service
+        owner: root
+        group: root
+        mode: "0644"
+      when: oproxy_role in ['server', 'both']
+      register: server_unit
+
+    - name: Reload systemd daemon (server)
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when:
+        - oproxy_role in ['server', 'both']
+        - server_unit.changed | default(false)
+
+    - name: Enable + (re)start oproxy-server
+      ansible.builtin.systemd:
+        name: oproxy-server.service
+        state: restarted
+        enabled: true
+      when:
+        - oproxy_role in ['server', 'both']
+        - server_bin_copy.changed | default(false)
+          or server_cfg_render.changed | default(false)
+          or server_unit.changed | default(false)
+
+    # ── Client-side install ────────────────────────────────────────
+    - name: Verify oproxy-client binary present on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ oproxy_bin_src_dir }}/oproxy-client"
+      register: client_bin_stat
+      when: oproxy_role in ['client', 'both']
+
+    - name: Fail if oproxy-client binary missing locally
+      ansible.builtin.fail:
+        msg: >-
+          Missing {{ oproxy_bin_src_dir }}/oproxy-client.  Build first с
+          `cargo build -p oproxy --release`.
+      when: oproxy_role in ['client', 'both'] and not client_bin_stat.stat.exists
+
+    - name: Fail if oproxy_server_node_id not set для client role
+      ansible.builtin.fail:
+        msg: >-
+          oproxy_server_node_id must be set (64 hex chars) when oproxy_role
+          includes 'client'.
+      when: oproxy_role in ['client', 'both'] and oproxy_server_node_id is not defined
+
+    - name: Install oproxy-client binary
+      ansible.builtin.copy:
+        src: "{{ oproxy_bin_src_dir }}/oproxy-client"
+        dest: /usr/local/bin/oproxy-client
+        owner: root
+        group: root
+        mode: "0755"
+      when: oproxy_role in ['client', 'both']
+      register: client_bin_copy
+
+    - name: Render oproxy-client config
+      ansible.builtin.template:
+        src: templates/oproxy-client.toml.j2
+        dest: "{{ oproxy_etc_dir }}/client.toml"
+        owner: veil
+        group: veil
+        mode: "0640"
+      when: oproxy_role in ['client', 'both']
+      register: client_cfg_render
+
+    - name: Install oproxy-client.service systemd unit
+      ansible.builtin.template:
+        src: templates/oproxy-client.service.j2
+        dest: /etc/systemd/system/oproxy-client.service
+        owner: root
+        group: root
+        mode: "0644"
+      when: oproxy_role in ['client', 'both']
+      register: client_unit
+
+    - name: Reload systemd daemon (client)
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when:
+        - oproxy_role in ['client', 'both']
+        - client_unit.changed | default(false)
+
+    - name: Enable + (re)start oproxy-client
+      ansible.builtin.systemd:
+        name: oproxy-client.service
+        state: restarted
+        enabled: true
+      when:
+        - oproxy_role in ['client', 'both']
+        - client_bin_copy.changed | default(false)
+          or client_cfg_render.changed | default(false)
+          or client_unit.changed | default(false)
+
+    # ── Post-deploy verification ───────────────────────────────────
+    - name: Wait 3s для services к stabilise
+      ansible.builtin.pause:
+        seconds: 3
+      when: oproxy_role is defined
+
+    - name: Verify oproxy-server active
+      ansible.builtin.shell: systemctl is-active oproxy-server
+      register: server_status
+      changed_when: false
+      failed_when: server_status.rc != 0
+      when: oproxy_role in ['server', 'both']
+
+    - name: Verify oproxy-client active
+      ansible.builtin.shell: systemctl is-active oproxy-client
+      register: client_status
+      changed_when: false
+      failed_when: client_status.rc != 0
+      when: oproxy_role in ['client', 'both']
+
+    - name: Show role summary
+      ansible.builtin.debug:
+        msg:
+          - "oproxy_role: {{ oproxy_role }}"
+          - "server: {{ server_status.stdout | default('skipped') }}"
+          - "client: {{ client_status.stdout | default('skipped') }}"
+      when: oproxy_role is defined

@@ -1,0 +1,186 @@
+---
+# Wire-format kill-switch rotation playbook (anti-censorship Phase 2).
+#
+# Operator-driven rotation between obfs4 wire-format variants (V1 → V2
+# or V2 → V1).  Designed для emergency response when а fingerprint
+# signature is published: total time от trigger к full-rotation
+# completion ≈ 30-60 minutes на а 5-node testnet, much faster than the
+# binary-redeploy cycle.
+#
+# ## Activation playbook (5-stage rotation)
+#
+# When а V2-targeting DPI signature is published:
+#
+# **Stage 1 — Dual-accept on ALL servers (5 min):**
+#   ansible-playbook -i inventory.yml rotate-obfs4-variant.yml \
+#     --extra-vars 'stage=dual_accept'
+#
+# Sets `obfs4_accept_variants = ["v2", "v1"]` on every host.  Clients
+# can be V1 or V2; cluster heals.  Wait until all hosts restarted.
+#
+# **Stage 2 — Verify dual-accept healthy (operator runs):**
+#   ./scripts/check-cluster-health.sh    # OR just curl /metrics
+#
+# Look для `peer.connect.success` events с both V1 и V2 client paths
+# (when implemented via metric — currently logs).  ALL active sessions
+# remain stable; new V2 connects should succeed.
+#
+# **Stage 3 — Switch client outbound к V2 (5 min):**
+#   ansible-playbook -i inventory.yml rotate-obfs4-variant.yml \
+#     --extra-vars 'stage=client_v2'
+#
+# Sets `obfs4_client_variant = "v2"` on every host.  Outbound dials
+# now use V2.  Mixed-version cluster works because servers still
+# accept both.  Wait для cluster к re-converge on V2 connections.
+#
+# **Stage 4 — Drop V1 accept (final stage, 5 min):**
+#   ansible-playbook -i inventory.yml rotate-obfs4-variant.yml \
+#     --extra-vars 'stage=v2_only'
+#
+# Sets `obfs4_accept_variants = ["v2"]`.  V1 connections refused.
+# Old fingerprint signature now misses every connection.
+#
+# **Stage 5 — Verify (operator runs):**
+# Same health-check as Stage 2.  Confirm все peers reconnect using
+# V2; check `active_sessions` returns к baseline.
+#
+# ## Rollback (V2 → V1)
+#
+# If а V2 deploy reveals an unexpected issue, rollback sequence:
+#
+#   ansible-playbook -i inventory.yml rotate-obfs4-variant.yml \
+#     --extra-vars 'stage=rollback_v1'
+#
+# Single-stage: sets `obfs4_accept_variants = ["v1", "v2"]` (V1 first,
+# V2 transitional) AND `obfs4_client_variant = "v1"` simultaneously.
+# Clients revert к V1 outbound; servers accept both — cluster heals
+# back к V1.  Once stable, run а follow-up:
+#
+#   ansible-playbook -i inventory.yml rotate-obfs4-variant.yml \
+#     --extra-vars 'stage=v1_only'
+#
+# This drops V2 от accept_variants.
+
+- name: Rotate obfs4 wire-format variant
+  hosts: all
+  become: true
+  serial: 1
+  vars:
+    stage: "{{ stage | default('dual_accept') }}"
+    accept_variants_dual_accept: ["v2", "v1"]
+    accept_variants_v2_only: ["v2"]
+    accept_variants_rollback: ["v1", "v2"]
+    accept_variants_v1_only: ["v1"]
+
+  pre_tasks:
+    - name: Validate stage parameter
+      ansible.builtin.assert:
+        that:
+          - stage in ['dual_accept', 'client_v2', 'v2_only', 'rollback_v1', 'v1_only']
+        fail_msg: >-
+          stage={{ stage }} not recognised.  Accepted values:
+          dual_accept | client_v2 | v2_only | rollback_v1 | v1_only
+
+  tasks:
+    - name: Stage Python helper для variant-config edit
+      ansible.builtin.copy:
+        dest: /tmp/_veil_variant_set.py
+        mode: "0755"
+        content: |
+          #!/usr/bin/env python3
+          import re, sys, json
+          path = "/var/lib/veil/node.toml"
+          stage = sys.argv[1]
+          # Stage → (accept_variants, client_variant) settings.
+          # client_variant = None means "do not set / leave existing".
+          settings = {
+              "dual_accept": (["v2", "v1"], None),
+              "client_v2":   (None, "v2"),
+              "v2_only":     (["v2"], None),
+              "rollback_v1": (["v1", "v2"], "v1"),
+              "v1_only":     (["v1"], None),
+          }
+          accept, client = settings[stage]
+          with open(path) as f:
+              src = f.read()
+          # Ensure [transport] section exists.
+          if "[transport]" not in src:
+              src = src.rstrip() + "\n\n[transport]\n"
+          # Helper: upsert а scalar `key = value` in the [transport]
+          # section (matches either а bare-line or array-line form).
+          def upsert(src, key, value_repr):
+              pattern = re.compile(
+                  r"(\[transport\][^\[]*?)(^" + re.escape(key) + r"\s*=.*$)",
+                  re.DOTALL | re.MULTILINE,
+              )
+              if pattern.search(src):
+                  return pattern.sub(r"\1" + key + " = " + value_repr, src, count=1)
+              # Insert before any subsequent `[section]` или append к end of [transport].
+              return re.sub(
+                  r"(\[transport\][^\[]*?)(\n\[|$)",
+                  r"\1" + key + " = " + value_repr + "\n\\2",
+                  src, count=1, flags=re.DOTALL,
+              )
+          if accept is not None:
+              src = upsert(src, "obfs4_accept_variants", json.dumps(accept))
+          if client is not None:
+              src = upsert(src, "obfs4_client_variant", '"' + client + '"')
+          with open(path, "w") as f:
+              f.write(src)
+          print(json.dumps({"accept": accept, "client": client}))
+
+    - name: Apply stage={{ stage }} к node.toml
+      ansible.builtin.shell:
+        cmd: |
+          python3 /tmp/_veil_variant_set.py "{{ stage }}"
+        executable: /bin/bash
+      register: edit_result
+      changed_when: true
+
+    - name: Cleanup staged script
+      ansible.builtin.file:
+        path: /tmp/_veil_variant_set.py
+        state: absent
+
+    - name: Show applied settings
+      ansible.builtin.debug:
+        var: edit_result.stdout
+
+    - name: Validate config
+      ansible.builtin.shell:
+        cmd: |
+          su -s /bin/sh veil -c \
+            '/usr/local/bin/veil-cli --config /var/lib/veil/node.toml config validate'
+      register: validate_result
+      changed_when: false
+      failed_when: validate_result.rc != 0
+
+    - name: Restart veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait для metrics endpoint
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:{{ metrics_port }}/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Show rotation status
+      ansible.builtin.debug:
+        msg: |
+          ✅ Stage '{{ stage }}' applied на {{ inventory_hostname }}.
+          {{ wait_result.stdout }}
+          {% if stage == 'v2_only' or stage == 'v1_only' %}
+          ⚠ Final stage applied — verify ALL hosts reconverge before
+          considering rotation complete.
+          {% endif %}

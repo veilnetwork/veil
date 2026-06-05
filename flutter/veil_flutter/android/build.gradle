@@ -1,0 +1,164 @@
+// Plugin Android build (Epic 489.3 follow-up).
+//
+// Builds `libveilclient_ffi.so` for every Android ABI using
+// `cargo-ndk`, then bundles the resulting .so files into the
+// plugin's AAR.  Consumer apps using `veil_flutter` get the
+// native library automatically — no manual copy step.
+//
+// Requirements on the build host:
+//   * Rust toolchain (`stable`, with the four Android targets installed:
+//       rustup target add aarch64-linux-android armv7-linux-androideabi \
+//                         x86_64-linux-android i686-linux-android)
+//   * cargo-ndk: `cargo install cargo-ndk --locked`
+//   * Android NDK (path в `local.properties` or `ANDROID_NDK_HOME`)
+//
+// Skipping the cargo build:  set `VEIL_SKIP_CARGO=1` in the
+// environment OR pass `-PveilSkipCargo=true` to gradle.  Useful
+// for CI jobs that pre-build the .so via `scripts/build-mobile.sh`
+// and just want gradle to pick up the existing artifacts.
+
+group 'com.veil.veil_flutter'
+version '0.1.0'
+
+buildscript {
+    ext.kotlin_version = '1.9.22'
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.1.4'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    namespace 'com.veil.veil_flutter'
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 21  // Android 5.0; matches Flutter's own minimum.
+        targetSdk 34
+
+        // Subset of ABIs we support.  Excluding 32-bit ARM (armeabi-v7a)
+        // would shrink the APK dramatically (~30 %), но 32-bit Android
+        // devices are still common in budget-phone deployments — keep
+        // it.  Excluding x86 (32-bit Intel) is fine — Google Play stops
+        // accepting x86 in 2024 anyway.
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86'
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+            java.srcDirs += 'src/main/kotlin'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+}
+
+dependencies {
+    // androidx.core.app.NotificationCompat для backward-compat
+    // notification building (handles channel-required vs not-required
+    // splits across SDK levels).  Kept narrow к минимизировать
+    // method-count creep on consumer apps.
+    implementation 'androidx.core:core-ktx:1.13.1'
+    // EncryptedSharedPreferences (Epic 489.10 follow-up): wraps push
+    // tokens с Android-Keystore-backed AES-256-GCM так that
+    // /data/data/<pkg>/shared_prefs/*.xml contents on а rooted /
+    // adb-debuggable device do NOT expose the raw FCM/APNs token.
+    // Token is per-device + already known к Google/Apple, но keeping
+    // it out of cleartext blocks on-device malware harvesting tokens
+    // для replay-spam against the user (closes audit-flagged finding).
+    implementation 'androidx.security:security-crypto:1.1.0-alpha06'
+}
+
+// ── Cargo / cargo-ndk build wiring ──────────────────────────────────────────
+
+def veilRepoRoot = file('../../..').canonicalPath
+def cargoSkip = (project.findProperty('veilSkipCargo') ?: System.getenv('VEIL_SKIP_CARGO') ?: 'false').toString() == 'true'
+
+// Map from Android ABI к Rust target triple.  cargo-ndk uses the ABI
+// shorthand directly so we don't need this map at the cargo invocation —
+// only for locating the output `.so`.
+ext.cargoTargetMap = [
+    'arm64-v8a'    : 'aarch64-linux-android',
+    'armeabi-v7a'  : 'armv7-linux-androideabi',
+    'x86_64'       : 'x86_64-linux-android',
+    'x86'          : 'i686-linux-android',
+]
+
+cargoTargetMap.each { abi, triple ->
+    // 1. Run cargo-ndk for this ABI.  We do NOT use cargo-ndk's `-o`
+    // output flag — it copies к а directory that gradle already
+    // expects под `src/main/jniLibs/${abi}/`, but we want gradle to
+    // own the output staging so we can clean it deterministically.
+    tasks.register("cargoBuild_${abi}", Exec) {
+        workingDir veilRepoRoot
+        environment 'CARGO_NDK_ANDROID_PLATFORM', '21'
+        // cycle-7 (M3): default to production-seeds (BUILTIN_SEEDS baked in — the
+        // safe release posture). Dev/testnet builds opt into the bootstrap-less
+        // feature explicitly: `./gradlew ... -PveilSeedFeature=allow-empty-seeds`.
+        def seedFeature = (project.findProperty('veilSeedFeature') ?: 'production-seeds').toString()
+        commandLine 'cargo', 'ndk', '-t', abi, '--',
+                    'build', '--release', '-p', 'veilclient-ffi',
+                    '--features', seedFeature
+        // Capture stderr/stdout to gradle's log so build failures
+        // surface clearly in а CI job's output.
+        ignoreExitValue false
+        onlyIf { !cargoSkip }
+    }
+
+    // 2. Copy the built .so из target/<triple>/release/ into the
+    // plugin's jniLibs/<abi>/ where gradle bundles it into the AAR.
+    tasks.register("copyNative_${abi}", Copy) {
+        dependsOn "cargoBuild_${abi}"
+        from "${veilRepoRoot}/target/${triple}/release/libveilclient_ffi.so"
+        into "src/main/jniLibs/${abi}/"
+        // Gracefully handle the VEIL_SKIP_CARGO case: when the
+        // .so is pre-built (CI artifact, manual build-mobile.sh), the
+        // file may already be in place; the Copy task is a no-op
+        // when source doesn't exist (instead of failing) so callers
+        // can stage `.so` files directly into jniLibs/<abi>/ before
+        // running gradle.
+        onlyIf {
+            file("${veilRepoRoot}/target/${triple}/release/libveilclient_ffi.so").exists()
+        }
+    }
+}
+
+// Hook into the standard gradle build lifecycle:  any android build
+// (assemble, bundle, etc.) triggers а `preBuild` step, which depends
+// on every `copyNative_${abi}` we registered above.  This makes
+// `flutter build apk` Just Work без ручного шага cargo build.
+afterEvaluate {
+    tasks.named('preBuild').configure {
+        dependsOn cargoTargetMap.collect { abi, _ -> "copyNative_${abi}" }
+    }
+}
+
+// Cleanup task: removes built .so so consecutive builds at different
+// ABI counts don't ship stale binaries.  Wired into `clean`.
+tasks.register('cleanNative', Delete) {
+    delete fileTree('src/main/jniLibs/') { include '**/*.so' }
+}
+clean.dependsOn 'cleanNative'

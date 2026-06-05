@@ -1,0 +1,39 @@
+[package]
+name = "veil-push"
+version = "0.1.0"
+edition = "2024"
+description = "Push-notification dispatcher trait + token format for the veil mailbox push pipeline. Phase 6.49 T1.4 P3, Epic 489.10."
+license = "AGPL-3.0-or-later"
+
+[features]
+default = ["fcm", "apns"]
+# Enable FcmDispatcher (Firebase Cloud Messaging v1 API).
+# Operator wires `FcmDispatcher::from_service_account_path(...)` at
+# startup if a service-account.json is configured; otherwise the
+# default LogOnlyDispatcher remains.
+fcm = ["dep:reqwest", "dep:jsonwebtoken", "dep:serde", "dep:serde_json", "dep:base64", "dep:tokio"]
+# Enable ApnsDispatcher (HTTP/2 + ES256 .p8 token-based auth).
+# Operator wires `ApnsDispatcher::from_p8_key(...)` at startup if an
+# APNs auth key is configured.
+apns = ["dep:reqwest", "dep:jsonwebtoken", "dep:serde", "dep:serde_json", "dep:base64", "dep:tokio"]
+
+[dependencies]
+async-trait = "0.1"
+log = "0.4"
+thiserror = "2.0"
+
+# Provider HTTP clients (FCM + APNs).  Common: rustls-tls (no openssl),
+# JSON serde, JWT signing.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"], optional = true }
+jsonwebtoken = { version = "9", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+base64 = { version = "0.22", optional = true }
+tokio = { version = "1.42", features = ["sync", "time"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.42", features = ["rt", "macros", "time", "sync"] }
+wiremock = "0.6"
+
+[lints]
+workspace = true

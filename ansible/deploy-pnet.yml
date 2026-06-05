@@ -1,0 +1,144 @@
+---
+# Roll out P-Net (private veil network) onto а pre-existing public-mode
+# cluster.
+#
+# Pre-requisites (run на controller before this playbook):
+#   1. veil-cli network gen-owner --pub-out /tmp/pnet/owner.pub --priv-out /tmp/pnet/owner.priv
+#   2. veil-cli network gen-network-id   (saved к /tmp/pnet/network_id.hex)
+#   3. For each host, one signed cert at /tmp/pnet/<cfg-name>.cert
+#      (where cfg-name = b1/b2/b3 + n1..n5 — see inv_to_cfg map below).
+#
+# What this playbook does (serial:1 rolling):
+#   - Push the host's cert to /var/lib/veil/network.cert (mode 0644, veil-owned)
+#   - Patch node.toml: replace-or-add а `[network]` block с mode=private,
+#     network_id, owner_pubkey, owner_algo, membership_cert path, и
+#     admin_node_ids allowlist (b1/b2/b3 — bootstraps act as admins).
+#   - Restart veil.service
+#   - Wait for metrics endpoint к come back
+#   - Validate config
+#
+# Run:
+#   ansible-playbook -i inventory.yml deploy-pnet.yml
+#
+# Rollback: remove the `[network]` block from node.toml + restart, OR set
+# `mode = "public"` (gate is a no-op в public mode).
+
+- name: Roll out P-Net private mode
+  hosts: all
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    pnet_dir: "{{ playbook_dir }}/../../../../tmp/pnet"
+    inv_to_cfg:
+      b1: b1
+      b2: b2
+      b3: b3
+      node1: n1
+      node2: n2
+      node3: n3
+      node4: n4
+      node5: n5
+    admin_node_ids:
+      - "5dffa7a4f3d942c467e5373da13f978118987f8a8a5a4a87fe34b8fdd43c5ac3"
+      - "256bc205ef4200a70fb88eac7aedf5c2a7db559f587874030c2db565d39b8ad0"
+      - "eab61fcea32fba4ebf7dabe61047cdaf37513a94e7e99e5c16b0a87a8c691c7a"
+    cert_path: /var/lib/veil/network.cert
+
+  tasks:
+    - name: Verify cert exists on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "/tmp/pnet/{{ inv_to_cfg[inventory_hostname] }}.cert"
+      register: cert_stat
+
+    - name: Fail if cert missing
+      ansible.builtin.fail:
+        msg: "Missing cert: /tmp/pnet/{{ inv_to_cfg[inventory_hostname] }}.cert"
+      when: not cert_stat.stat.exists
+
+    - name: Read owner pubkey on controller (base64)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.slurp:
+        src: /tmp/pnet/owner.pub
+      register: owner_pub_b64
+      run_once: true
+
+    - name: Read network_id on controller (hex)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.slurp:
+        src: /tmp/pnet/network_id.hex
+      register: network_id_hex
+      run_once: true
+
+    - name: Push membership cert to host
+      ansible.builtin.copy:
+        src: "/tmp/pnet/{{ inv_to_cfg[inventory_hostname] }}.cert"
+        dest: "{{ cert_path }}"
+        owner: veil
+        group: veil
+        mode: "0644"
+      register: cert_push
+
+    - name: Stop veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: stopped
+
+    - name: Drop any prior [network] block (idempotent)
+      ansible.builtin.replace:
+        path: /var/lib/veil/node.toml
+        # Match а `[network]\n…\n` block delimited by next `\n[` or EOF.
+        regexp: '(?ms)^\[network\]\n.*?(?=^\[|\Z)'
+        replace: ''
+
+    - name: Append fresh [network] block
+      ansible.builtin.blockinfile:
+        path: /var/lib/veil/node.toml
+        marker: "# {mark} ANSIBLE MANAGED — P-Net config"
+        block: |
+          [network]
+          mode = "private"
+          network_id = "{{ (network_id_hex.content | b64decode).strip() }}"
+          owner_pubkey = "{{ (owner_pub_b64.content | b64decode).strip() }}"
+          owner_algo = "ed25519"
+          membership_cert = "{{ cert_path }}"
+          admin_node_ids = [
+          {% for nid in admin_node_ids %}
+            "{{ nid }}",
+          {% endfor %}
+          ]
+
+    - name: Validate config
+      become_user: veil
+      ansible.builtin.command:
+        cmd: /usr/local/bin/veil-cli --config /var/lib/veil/node.toml config validate
+      changed_when: false
+
+    - name: Start veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: started
+
+    - name: Wait for node к come back online (metrics endpoint = readiness probe)
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:19999/metrics > /dev/null; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "metrics NOT up after 30s"
+          exit 1
+      changed_when: false
+
+    - name: Restart chat-node после veil restart
+      ansible.builtin.systemd:
+        name: chat-node.service
+        state: restarted
+      ignore_errors: true  # chat-node optional

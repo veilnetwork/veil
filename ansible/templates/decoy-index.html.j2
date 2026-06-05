@@ -1,0 +1,114 @@
+{# Decoy landing page для Caddy-fronted webtunnel (anti-censorship P1 #3).
+
+   Threat model: а VAS-class active probe issues а plain HTTP GET / к
+   veil's `:443` listener.  Прежде это hit veil's webtunnel
+   handler which served а tiny one-paragraph default decoy ("Server
+   status / All systems operational") — clearly machine-generated и
+   thin enough к flag as "не real site".
+
+   With Caddy in front, the probe instead lands on this template.
+   Properties chosen to pass "looks like an ordinary small static
+   site" heuristics:
+
+   * Multi-page (links к /about, /sitemap.xml, /robots.txt)
+   * External CSS reference (loaded inline для simplicity, but
+     looks как normal site structure)
+   * Plain-English content без obvious veil/proxy references
+   * No JavaScript (some sites are static-only; не а red flag)
+   * Standard semantic HTML5 structure
+
+   Operators are encouraged to replace this template с а real
+   snapshot of а small static site (open-source project landing,
+   personal blog, etc.) — anything с real content и historical
+   substance is harder к distinguish от а live decoy.
+
+   Variable: `decoy_site_name` — operator-configurable, defaults к
+   а generic placeholder.
+-#}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>{{ decoy_site_name | default('Notes &amp; Drafts') }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Working notes, drafts, и occasional longer-form writing.">
+    <link rel="canonical" href="https://{{ veil_host }}/">
+    <link rel="alternate" type="application/rss+xml" title="RSS" href="/feed.xml">
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            line-height: 1.6;
+            color: #2c2c2c;
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 2rem 1.5rem;
+            background: #fdfdfd;
+        }
+        h1 { font-weight: 600; margin-bottom: 0.25rem; }
+        h2 { font-weight: 600; margin-top: 2.5rem; border-bottom: 1px solid #e5e5e5; padding-bottom: 0.25rem; }
+        nav { margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid #e5e5e5; }
+        nav a { margin-right: 1.5rem; color: #555; text-decoration: none; }
+        nav a:hover { color: #000; text-decoration: underline; }
+        article { margin-bottom: 2rem; }
+        article time { color: #888; font-size: 0.875rem; }
+        article h3 { margin-bottom: 0.25rem; font-weight: 500; }
+        a.read-more { font-size: 0.875rem; color: #0066cc; }
+        footer { margin-top: 4rem; padding-top: 1rem; border-top: 1px solid #e5e5e5; color: #888; font-size: 0.875rem; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>{{ decoy_site_name | default('Notes &amp; Drafts') }}</h1>
+        <p>Working notes, drafts, и occasional longer-form writing.</p>
+    </header>
+
+    <nav>
+        <a href="/">Home</a>
+        <a href="/about.html">About</a>
+        <a href="/feed.xml">RSS</a>
+    </nav>
+
+    <h2>Recent</h2>
+
+    <article>
+        <h3>On choosing the right level of abstraction</h3>
+        <time datetime="2026-04-12">12 April 2026</time>
+        <p>
+            One of the most useful skills in software design is knowing
+            when к invent а new layer и when к stay close к the metal.
+            А good rule of thumb: если you find yourself repeatedly
+            translating between two representations, the boundary is
+            probably misplaced…
+        </p>
+    </article>
+
+    <article>
+        <h3>Notes on small-team incident response</h3>
+        <time datetime="2026-03-28">28 March 2026</time>
+        <p>
+            После а few rough on-call weeks I started keeping а short
+            "what worked / what didn't" checklist.  The single biggest
+            lesson: blameless retro is not optional — it's the cheapest
+            way к build the kind of trust that lets people surface
+            problems early.
+        </p>
+    </article>
+
+    <article>
+        <h3>Reading log: March</h3>
+        <time datetime="2026-03-15">15 March 2026</time>
+        <p>
+            А mix of fiction и technical reading this month.  Highlights:
+            а new edition of Hennessy &amp; Patterson, а short essay
+            collection by Maciej Cegłowski, и the second half of <em>The
+            Master and Margarita</em> (took my time с the Pevear/Volokhonsky
+            translation).
+        </p>
+    </article>
+
+    <footer>
+        <p>Built с Hugo · Hosted on а small VPS · No tracking, no ads.</p>
+    </footer>
+</body>
+</html>

@@ -1,0 +1,34 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    network: veil-testnet
+
+scrape_configs:
+  - job_name: veil
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 203.0.113.11:19999
+        labels: { host: b1, role: bootstrap }
+      - targets:
+          - 203.0.113.12:19999
+        labels: { host: b2, role: bootstrap }
+      - targets:
+          - 203.0.113.13:19999
+        labels: { host: b3, role: bootstrap }
+      - targets:
+          - 203.0.113.21:19999
+        labels: { host: n1, role: node }
+      - targets:
+          - 203.0.113.22:19999
+        labels: { host: n2, role: node }
+      - targets:
+          - 203.0.113.23:19999
+        labels: { host: n3, role: node }
+      - targets:
+          - 203.0.113.24:19999
+        labels: { host: n4, role: node }
+      - targets:
+          - 203.0.113.25:19999
+        labels: { host: n5, role: node }

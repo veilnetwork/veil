@@ -1,0 +1,55 @@
+name: veil_flutter
+description: Dart-FFI bindings for the veil daemon — censorship-resistant P2P network for budget Android devices.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.0
+  # Connectivity detection for VeilLifecycleBinding.attachConnectivity().
+  # Plugin works WITHOUT this (consumers can roll their own NetworkKind
+  # stream), но including by default gives one-line wiring for the
+  # common case.  Range matches what the package supported as of 2026-05.
+  connectivity_plus: ^6.1.0
+  # QR scanning for the pairing flow (Epic 489.7).  Provides camera
+  # access + barcode decode на iOS / Android.  Optional from а strict
+  # functionality standpoint — the bare PairingDialog widget falls back
+  # to а paste field if camera init fails — но shipping by default
+  # gives one-line wiring for the common case.
+  mobile_scanner: ^5.2.3
+  # QR generation (Epic 489.7 generator side).  Renders а bootstrap-
+  # invite URI as а scannable QR code for "share my invite" flow.
+  # Pure-Dart — no platform deps.
+  qr_flutter: ^4.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  ffigen: ^11.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        ffiPlugin: true
+        # Epic 489.6: Kotlin plugin class for foreground-service
+        # control (startBackgroundService / stopBackgroundService
+        # MethodChannel).  Coexists с the FFI plugin surface — same
+        # plugin definition can ship both.
+        package: com.veil.veil_flutter
+        pluginClass: VeilFlutterPlugin
+      ios:
+        ffiPlugin: true
+        # Epic 489.10: Swift plugin class for APNs wake-up handler
+        # (BGProcessingTask) + token storage.  Coexists с the FFI
+        # plugin surface — same plugin definition can ship both.
+        pluginClass: VeilFlutterPlugin
+      linux:
+        ffiPlugin: true
+      macos:
+        ffiPlugin: true

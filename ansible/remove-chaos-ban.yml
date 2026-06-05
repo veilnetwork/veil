@@ -1,0 +1,39 @@
+---
+# Stop + disable + remove the chaos-ban-cycler testnet service.
+# Inverse of deploy-chaos-ban.yml.
+#
+# Run:
+#   ansible-playbook -i inventory.yml remove-chaos-ban.yml
+
+- name: Remove chaos-ban-cycler testnet service
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Stop + disable chaos-ban.service (ignore missing)
+      ansible.builtin.systemd:
+        name: chaos-ban
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Delete chaos-ban systemd unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/chaos-ban.service
+        state: absent
+      register: unit_removed
+
+    - name: Reload systemd if unit was removed
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: unit_removed.changed
+
+    - name: Delete chaos-ban-cycler.sh
+      ansible.builtin.file:
+        path: /usr/local/bin/chaos-ban-cycler.sh
+        state: absent
+
+    - name: Delete chaos-ban log
+      ansible.builtin.file:
+        path: /var/log/veil/chaos-ban.log
+        state: absent

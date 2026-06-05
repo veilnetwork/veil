@@ -1,0 +1,15 @@
+[package]
+name = "veil-transfer"
+version = "0.1.0"
+edition = "2024"
+description = "Veil network chunk-based transfer: payload fragmentation + reassembly within proto budget. Phase 6 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-proto = { path = "../veil-proto" }
+
+blake3 = "1.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[lints]
+workspace = true

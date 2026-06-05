@@ -1,0 +1,61 @@
+---
+# Disable the background `lazy_miner` PoW thread on testnet daemons.
+#
+# Found via perf during 540 Mbps ogate iperf ceiling investigation:
+# `lazy_miner` runs continuously in the background, doing Ed25519
+# signatures on every PoW nonce attempt to upgrade the node's identity
+# difficulty toward `max_lazy_difficulty = 64` (a target that would
+# take 2^64 Ed25519 signs to reach). On 1-vCPU VPS this burns ~40% of
+# CPU even when the daemon is otherwise idle, competing with the
+# session loop for the same core.
+#
+# Disabling it for testnet (where identity-difficulty progression is
+# not a goal) frees up significant CPU for session throughput.
+#
+# Run:
+#   ansible-playbook -i inventory.yml disable-lazy-mining.yml
+
+- name: Disable lazy_mining on veil daemon
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Set [identity] lazy_mining = false in node.toml
+      ansible.builtin.lineinfile:
+        path: /var/lib/veil/node.toml
+        regexp: '^\s*lazy_mining\s*='
+        line: 'lazy_mining = false'
+        insertafter: '^\[identity\]'
+        owner: veil
+        group: veil
+        mode: "0644"
+      register: cfg_changed
+
+    - name: Restart veil if config changed (cascades to ogate via PartOf)
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
+      when: cfg_changed.changed
+
+    - name: Restart ogate (PartOf cascades stop but not start)
+      ansible.builtin.systemd:
+        name: ogate
+        state: restarted
+      when: cfg_changed.changed
+
+    - name: Wait 5 s for stabilisation
+      ansible.builtin.pause:
+        seconds: 5
+      when: cfg_changed.changed
+
+    - name: Confirm services active
+      ansible.builtin.shell:
+        cmd: |
+          systemctl is-active veil
+          systemctl is-active ogate
+      register: status
+      changed_when: false
+
+    - name: Status
+      ansible.builtin.debug:
+        var: status.stdout_lines

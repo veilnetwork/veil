@@ -1,0 +1,131 @@
+# Docker Compose for an veil bootstrap node with Let's Encrypt + TLS/QUIC/WSS.
+#
+# Usage:
+#   1. cp docker/.env.example .env    (edit HOST + EMAIL)
+#   2. docker compose up -d
+#
+# Boot order:
+#   certbot -> veil-bootstrap
+#
+# The certbot service issues (and periodically renews) a Let's Encrypt cert
+# via HTTP-01 standalone on port 80.  It emits a healthcheck green once
+# fullchain.pem + privkey.pem are on disk, at which point veil-bootstrap
+# starts and serves TLS/QUIC/WSS using that material.
+
+services:
+  # ── Cert issuer + renewer (standalone HTTP-01) ──────────────────────────
+  certbot:
+    image: certbot/certbot:latest
+    container_name: veil-certbot
+    restart: unless-stopped
+    # HTTP-01 challenge needs port 80.  Renewal does the same; certbot
+    # briefly binds 80 then releases it.  Make sure the host's port 80 is
+    # free (no nginx / apache / etc).
+    ports:
+      - "80:80"
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot-lib:/var/lib/letsencrypt
+    environment:
+      HOST: ${HOST:?set HOST in .env (DNS name for the cert)}
+      EMAIL: ${EMAIL:?set EMAIL in .env (used by Let's Encrypt for renewal notices)}
+      STAGING: ${STAGING:-0}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        STAGING_FLAG=""
+        [ "$${STAGING}" = "1" ] && STAGING_FLAG="--staging"
+
+        # Initial issuance (no-op if already valid for 30+ days).
+        if [ ! -s "/etc/letsencrypt/live/$${HOST}/fullchain.pem" ]; then
+          echo "[certbot] issuing cert for $${HOST}"
+          certbot certonly --standalone --non-interactive --agree-tos \
+            $${STAGING_FLAG} \
+            --email "$${EMAIL}" --preferred-challenges http \
+            --rsa-key-size 2048 -d "$${HOST}" \
+            || { echo "[certbot] issuance failed"; exit 1; }
+        else
+          echo "[certbot] cert already present — skipping issuance"
+        fi
+
+        # Make certs readable ONLY by the veil container (uid 999, gid 999):
+        #   * Dirs `live` и `archive` → 0750, owned root:999 (group=veil)
+        #     so non-veil-group processes inside the volume cannot traverse.
+        #   * `privkey.pem` → 0640 root:999 — group-read for veil, NO world.
+        #   * `fullchain.pem` / `chain.pem` / `cert.pem` → 0644 (public material).
+        # Previous `chmod -R a+rX` made privkey.pem world-readable, leaking the
+        # TLS private key к any process / sidecar with access to the volume.
+        chown -R root:999 /etc/letsencrypt/live /etc/letsencrypt/archive
+        chmod -R 0750 /etc/letsencrypt/live /etc/letsencrypt/archive
+        find /etc/letsencrypt/live /etc/letsencrypt/archive -name 'privkey*.pem' -exec chmod 0640 {} +
+        find /etc/letsencrypt/live /etc/letsencrypt/archive \
+          \( -name 'fullchain*.pem' -o -name 'chain*.pem' -o -name 'cert*.pem' \) \
+          -exec chmod 0644 {} +
+
+        # Periodic renewal loop.  certbot renew is idempotent; no-op when
+        # renewal isn't due.  Sleep 12 h between attempts.
+        while :; do
+          sleep 43200
+          echo "[certbot] attempting renewal"
+          certbot renew --standalone --non-interactive $${STAGING_FLAG} || true
+          # Re-apply restrictive perms after renew (certbot rewrites files
+          # с default 0600 root:root; we restore group-read для veil only).
+          chown -R root:999 /etc/letsencrypt/live /etc/letsencrypt/archive
+          chmod -R 0750 /etc/letsencrypt/live /etc/letsencrypt/archive
+          find /etc/letsencrypt/live /etc/letsencrypt/archive -name 'privkey*.pem' -exec chmod 0640 {} +
+          find /etc/letsencrypt/live /etc/letsencrypt/archive \
+            \( -name 'fullchain*.pem' -o -name 'chain*.pem' -o -name 'cert*.pem' \) \
+            -exec chmod 0644 {} +
+        done
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "test -s /etc/letsencrypt/live/${HOST}/fullchain.pem && test -s /etc/letsencrypt/live/${HOST}/privkey.pem"
+      interval: 10s
+      timeout: 5s
+      retries: 60     # up to ~10 minutes for initial issuance
+      start_period: 5s
+
+  # ── Bootstrap node ─────────────────────────────────────────────────────
+  veil-bootstrap:
+    image: ${VEIL_IMAGE:-veil-bootstrap:latest}
+    container_name: veil-bootstrap
+    restart: unless-stopped
+    depends_on:
+      certbot:
+        condition: service_healthy
+    environment:
+      HOST: ${HOST}
+      EMAIL: ${EMAIL}
+      ROLE: ${ROLE:-core}
+      DIFFICULTY: ${DIFFICULTY:-24}
+      TCP_PORT: ${TCP_PORT:-5555}
+      TLS_PORT: ${TLS_PORT:-9906}
+      QUIC_PORT: ${QUIC_PORT:-8443}
+      WSS_PORT: ${WSS_PORT:-8443}
+      MESH_UDP_PORT: ${MESH_UDP_PORT:-6666}
+      METRICS_PORT: ${METRICS_PORT:-}
+    ports:
+      - "${TCP_PORT:-5555}:5555/tcp"
+      - "${TLS_PORT:-9906}:9906/tcp"
+      - "${QUIC_PORT:-8443}:8443/udp"       # QUIC
+      - "${WSS_PORT:-8443}:8443/tcp"        # WSS shares the 8443 port number over TCP
+      - "${MESH_UDP_PORT:-6666}:6666/udp"
+    volumes:
+      - veil-data:/var/lib/veil       # identity + persist snapshots
+      - letsencrypt:/etc/letsencrypt:ro     # certs (read-only)
+    healthcheck:
+      test: ["CMD", "veil-cli", "--config", "/var/lib/veil/node.toml", "node", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  letsencrypt:
+    driver: local
+  certbot-lib:
+    driver: local
+  veil-data:
+    driver: local

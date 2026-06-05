@@ -1,0 +1,34 @@
+[Unit]
+Description=Veil testnet node ({{ inventory_hostname }})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=veil
+Group=veil
+ExecStart=/usr/local/bin/veil-cli --config /var/lib/veil/node.toml node run --foreground
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# Required для mlockall(MCL_CURRENT | MCL_FUTURE) at startup — pins
+# process address space против swap-out, protects session keys (incl.
+# bytes owned by upstream crates: chacha20poly1305 internal
+# GenericArray, ed25519_dalek SigningKey seed, ml_kem
+# DecapsulationKey).  Без `infinity` mlockall returns ENOMEM (logged
+# as `node.mlock.budget_exhausted`); daemon continues to run но keys
+# remain swappable.
+LimitMEMLOCK=infinity
+StandardOutput=append:/var/log/veil/veil.log
+StandardError=append:/var/log/veil/veil.log
+WorkingDirectory=/var/lib/veil
+
+# Sandboxing
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/veil /var/log/veil
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
