@@ -69,12 +69,22 @@ jobs:
           - triple: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             install_musl: true
+          # aarch64 static-musl: same no-glibc portability for ARM Linux
+          # (servers, SBCs). Cross-compiled by zig via cargo-zigbuild.
+          - triple: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            install_musl: true
           - triple: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             cross_linker: aarch64-linux-gnu-gcc
           - triple: aarch64-apple-darwin
             runner: macos-14
           - triple: x86_64-pc-windows-msvc
+            runner: windows-latest
+            is_windows: true
+          # Native Windows on ARM64. Cross-compiled from the x64 runner with
+          # clang-cl --target=aarch64-pc-windows-msvc.
+          - triple: aarch64-pc-windows-msvc
             runner: windows-latest
             is_windows: true
 
@@ -154,6 +164,8 @@ jobs:
           # /arch:AVX2). Use clang-cl (the MSVC driver) for this target.
           CC_x86_64_pc_windows_msvc: clang-cl
           CXX_x86_64_pc_windows_msvc: clang-cl
+          CC_aarch64_pc_windows_msvc: clang-cl
+          CXX_aarch64_pc_windows_msvc: clang-cl
           # Drop the global gnu force-include (-include cstdint, .cargo/config.toml)
           # on this target: cl rejects the gnu form, and the MSVC /FI form gets
           # mangled by git-bash MSYS path conversion (/FI -> C:/.../FI). MSVC's STL
