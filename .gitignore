@@ -9,9 +9,12 @@ temp.md
 /.claude/
 /temp
 
-# Phase 6.49 audit (2026-05-08): TLS test cert+key для local dev.
-# Regenerated по `bash ssl/gen.sh`.  Cert is fine to ship as а
-# template, но key is а private key и must not live в git.
+# Release sign
+release-identity.toml
+release.key
+release.pub
+
+# Testnet ssl
 ssl/key.pem
 ssl/cert.pem
 
