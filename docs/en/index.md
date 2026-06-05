@@ -6,6 +6,7 @@ Veil is a decentralized hybrid open-source network written in Rust, implementing
 
 | Document | Audience | Contents |
 |----------|----------|------------|
+| [**Start here — plain language**](start-here.md) | Newcomers | What Veil is and why, a glossary of every term, and your first ten minutes |
 | [**Installation & first node**](install.md) | Everyone | `curl … \| sh` / PowerShell install, components, running a client/server node, ogate/oproxy quickstart, uninstall |
 | [**How the network works (tour)**](HOW_IT_WORKS.md) | Engineers new to the project | Overview document with diagrams — stack, identity, sessions, routing, mailbox |
 | [User Guide](user-guide.md) | End users | What OVL1 is, installation, quick start, using the CLI |

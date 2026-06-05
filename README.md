@@ -58,9 +58,12 @@ veil-cli node stop        # graceful stop
 
 ## Documentation
 
-Start at **[docs/en/index.md](docs/en/index.md)** — user guide, administrator
-guide, protocol spec, architecture, and security model. New to the project? Read
-**[How the network works](docs/en/HOW_IT_WORKS.md)**.
+New to the project? Start with **[Start here — Veil in plain language](docs/en/start-here.md)**
+(what it is, a glossary of every term, your first ten minutes) · на русском:
+**[С чего начать](docs/ru/start-here.md)**.
+
+Then browse **[docs/en/index.md](docs/en/index.md)** — user guide, administrator
+guide, protocol spec, architecture, and security model.
 
 ## Build from source
 
