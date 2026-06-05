@@ -98,7 +98,7 @@ jobs:
         if: matrix.cross_linker == 'aarch64-linux-gnu-gcc'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - name: Install musl toolchain
         if: matrix.install_musl == true
@@ -121,6 +121,11 @@ jobs:
         if: matrix.is_windows != true
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_linker }}
+          # blake3 (NEON C) + rocksdb (C++) build via cc-rs; without a target
+          # CC/CXX they fall back to host clang and miss the aarch64 multiarch
+          # headers (bits/wordsize.h not found). Point them at the cross gcc.
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |

@@ -50,7 +50,9 @@ jobs:
         run: |
           # cycle-7 (M3): this is the release/tag flow — bake in BUILTIN_SEEDS
           # (production-seeds), never the bootstrap-less dev `allow-empty-seeds`.
-          cargo ndk --target ${{ matrix.triple }} -- \
+          # --platform 24: 32-bit armv7 builds rocksdb's C++ <fstream>, which
+          # needs fseeko/ftello — only present in bionic at API >= 24.
+          cargo ndk --target ${{ matrix.triple }} --platform 24 -- \
             build --release -p veilclient-ffi \
                   --features production-seeds
 
@@ -83,6 +85,12 @@ jobs:
           targets: ${{ matrix.triple }}
 
       - name: Cross-compile ffi
+        env:
+          # iOS device/sim link at this deployment target; ___chkstk_darwin
+          # lives in libSystem from iOS 13 on, and rustc links cdylibs with
+          # -nodefaultlibs (dropping compiler-rt's copy), so an older target
+          # leaves it undefined. Harmless for the macOS legs in this matrix.
+          IPHONEOS_DEPLOYMENT_TARGET: "13.0"
         run: |
           cargo build --release -p veilclient-ffi \
                 --target ${{ matrix.triple }} \
@@ -154,11 +162,16 @@ jobs:
         if: matrix.triple == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - name: Cross-compile ffi
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          # blake3 (NEON C) + rocksdb (C++) compile via cc-rs; without a
+          # target CC/CXX they use host clang and miss the aarch64 multiarch
+          # headers (bits/wordsize.h not found). Point them at the cross gcc.
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
         run: |
           cargo build --release -p veilclient-ffi \
                 --target ${{ matrix.triple }} \
