@@ -27,12 +27,12 @@ post-quantum (ML-KEM-768 + AEAD).  Two node roles only:
 
 ```
               ┌──────────────────────────────────────┐
-              │            CORE VEIL               │
+              │            CORE VEIL                 │
               │                                      │
               │   Core ─── Core ─── Core ─── Core    │
               │     │      ╱  ╲      │       │       │
               │     │    ╱     ╲     │       │       │
-              │   Core ─ Core ─ Core ─ Core           │
+              │   Core ─ Core ─ Core ─ Core          │
               │    DHT (Kademlia, K=20)              │
               └────┬──────────────────────────┬──────┘
                    │                          │
@@ -57,7 +57,7 @@ so other nodes can route messages back to the Leaf.
 ┌──────────────────────────────────────────────────────┐
 │   APP                                                │
 │   ├─ IPC client (Unix / NamedPipe / TCP loopback)    │
-│   └─ Veil client library (veilclient)          │
+│   └─ Veil client library (veilclient)                │
 └────────────────────────┬─────────────────────────────┘
                          │ IPC frames
 ┌────────────────────────┴─────────────────────────────┐
@@ -139,8 +139,8 @@ OVL1 handshake (6 round-trips, all OVL1-framed):
      │ ──SessionConfirm(session_id, HMAC)──→   │
      │           ←──SessionConfirm──           │
      │                                         │
-     │  ... all subsequent frames AEAD'd      │
-     │      with ChaCha20-Poly1305            │
+     │  ... all subsequent frames AEAD'd       │
+     │      with ChaCha20-Poly1305             │
 ```
 
 After `SessionConfirm`:

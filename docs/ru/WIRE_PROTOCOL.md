@@ -65,25 +65,25 @@ Source of truth: [`family.rs`](../../crates/veil-proto/src/family.rs).
 
 ```
 Client                               Server
-  │                                    │
-  ├── Hello(magic, version, node_id) ─→│
+  │                                     │
+  ├── Hello(magic, version, node_id) ──→│
   │ ←── Hello ──────────────────────────┤
-  │                                    │
+  │                                     │
   ├── Identity(algo, pubkey, nonce, ───→│
-  │            node_id, mlkem_ek?)     │
+  │            node_id, mlkem_ek?)      │
   │ ←── Identity ───────────────────────┤
-  │                                    │
-  ├── Capabilities(role_bits, flags, ─→│
-  │                discovery_mode)     │
+  │                                     │
+  ├── Capabilities(role_bits, flags, ──→│
+  │                discovery_mode)      │
   │ ←── Capabilities ───────────────────┤
-  │                                    │
-  ├── KeyAgreement(X25519_pubkey) ────→│
+  │                                     │
+  ├── KeyAgreement(X25519_pubkey) ─────→│
   │ ←── KeyAgreement ───────────────────┤
-  │    [HKDF-SHA256 → session keys]    │
-  │                                    │
+  │    [HKDF-SHA256 → session keys]     │
+  │                                     │
   ├── SessionConfirm(session_id, mac) ─→│
   │ ←── SessionConfirm ─────────────────┤
-  │    [AEAD encrypted from here]      │
+  │    [AEAD encrypted from here]       │
 ```
 
 После `SessionConfirm` тело каждого frame'а шифруется ChaCha20-Poly1305;

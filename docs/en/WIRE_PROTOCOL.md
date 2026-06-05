@@ -62,25 +62,25 @@ Unknown `family` → frame ignored (forward-compatible).  Unknown `msg_type` wit
 
 ```
 Client                               Server
-  │                                    │
-  ├── Hello(magic, version, node_id) ─→│
+  │                                     │
+  ├── Hello(magic, version, node_id) ──→│
   │ ←── Hello ──────────────────────────┤
-  │                                    │
+  │                                     │
   ├── Identity(algo, pubkey, nonce, ───→│
-  │            node_id, mlkem_ek?)     │
+  │            node_id, mlkem_ek?)      │
   │ ←── Identity ───────────────────────┤
-  │                                    │
-  ├── Capabilities(role_bits, flags, ─→│
-  │                discovery_mode)     │
+  │                                     │
+  ├── Capabilities(role_bits, flags, ──→│
+  │                discovery_mode)      │
   │ ←── Capabilities ───────────────────┤
-  │                                    │
-  ├── KeyAgreement(X25519_pubkey) ────→│
+  │                                     │
+  ├── KeyAgreement(X25519_pubkey) ─────→│
   │ ←── KeyAgreement ───────────────────┤
-  │    [HKDF-SHA256 → session keys]    │
-  │                                    │
+  │    [HKDF-SHA256 → session keys]     │
+  │                                     │
   ├── SessionConfirm(session_id, mac) ─→│
   │ ←── SessionConfirm ─────────────────┤
-  │    [AEAD encrypted from here]      │
+  │    [AEAD encrypted from here]       │
 ```
 
 After `SessionConfirm` every frame body is ChaCha20-Poly1305-encrypted; the 24-byte header stays in plaintext and serves as AAD.

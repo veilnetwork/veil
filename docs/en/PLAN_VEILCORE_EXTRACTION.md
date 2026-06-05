@@ -81,10 +81,10 @@ re-exports them for downstream callers (preserves
 
 ```
 veil-cfg ────────────────────────────────────────────┐
-                                                        ↓
+                                                     ↓
 veil-session ──→ veil-dispatcher ──→ veil-node-runtime
-                                                        │
-                                          ┌─────────────┘
+                                                     │
+                                          ┌──────────┘
                                           ↓
                                       veilcore (sim + re-exports)
                                           ↓

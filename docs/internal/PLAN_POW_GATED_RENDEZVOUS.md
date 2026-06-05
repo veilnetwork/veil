@@ -71,7 +71,7 @@
                                     │
                                     ▼
                         ┌─────────────────────────────────┐
-                        │  Mediator (any veil node     │
+                        │  Mediator (any veil node        │
                         │  with а session к Bob)          │
                         │  - relays the request к Bob     │
                         │    via the existing OVL1 session│
@@ -100,8 +100,8 @@
                                        ▼
                         ┌─────────────────────────────────┐
                         │  Initiator dials transport_uri  │
-                        │  с psk; obfs4 handshake          │
-                        │  proceeds normally               │
+                        │  с psk; obfs4 handshake         │
+                        │  proceeds normally              │
                         └─────────────────────────────────┘
                                        │
                                        │ 4. OVL1 session established

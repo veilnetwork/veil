@@ -62,24 +62,24 @@ veil/
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                  Application Layer                    │
-│  Local apps via IPC (Unix socket) / veilclient SDK │
+│                  Application Layer                   │
+│  Local apps via IPC (Unix socket) / veilclient SDK   │
 └───────────────────────┬──────────────────────────────┘
                         │
 ┌───────────────────────▼──────────────────────────────┐
-│               Node Runtime (runtime.rs)               │
-│  Event loop, session lifecycle, background tasks      │
-└────┬──────────────────┬───────────────────────────────┘
+│               Node Runtime (runtime.rs)              │
+│  Event loop, session lifecycle, background tasks     │
+└────┬──────────────────┬──────────────────────────────┘
      │                  │
-┌────▼────┐    ┌────────▼────────────────────────────────┐
+┌────▼────┐    ┌────────▼─────────────────────────────────┐
 │Session  │    │         FrameDispatcher                  │
 │Manager  │    │  Control │ Discovery │ Delivery │ Routing│
-│handshake│    └──────────┬──────────────────────────────┘
+│handshake│    └──────────┬───────────────────────────────┘
 │FSM      │               │
-└─────────┘   ┌───────────▼──────────────────────────────┐
+└─────────┘   ┌───────────▼───────────────────────────────┐
               │           Services                        │
-              │ DHT │ Mailbox │ Gateway │ AppRegistry │..  │
-              └──────────────────────────────────────────┘
+              │ DHT │ Mailbox │ Gateway │ AppRegistry │.. │
+              └───────────────────────────────────────────┘
 ```
 
 ### Core Components
