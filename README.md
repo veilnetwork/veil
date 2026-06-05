@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/veil_logo.png" alt="Veil" width="180" />
+</p>
+
 # Veil (OVL1)
 
 A decentralized, censorship-resistant hybrid veil network written in Rust,
