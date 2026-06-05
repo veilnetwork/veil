@@ -188,6 +188,13 @@ cargo build "${cargo_args[@]}"
 stage="$ARTIFACT_ROOT/$target"
 mkdir -p "$stage"
 : > "$stage/sha256.txt"
+# Portable SHA-256: coreutils `sha256sum` (Linux / git-bash on Windows) or,
+# on macOS runners which ship neither, BSD `shasum -a 256`.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256_of() { sha256sum "$1" | awk '{print $1}'; }
+else
+  sha256_of() { shasum -a 256 "$1" | awk '{print $1}'; }
+fi
 veil_cli_bin_name=""
 veil_cli_stage_path=""
 for b in "${bins[@]}"; do
@@ -202,7 +209,7 @@ for b in "${bins[@]}"; do
   fi
   cp "$src_path" "$stage/$bin_name"
   # Strip whitespace/path from sha256sum output to keep it parseable.
-  sha=$(sha256sum "$stage/$bin_name" | awk '{print $1}')
+  sha=$(sha256_of "$stage/$bin_name")
   echo "$sha  $bin_name" >> "$stage/sha256.txt"
   echo "==> artifact: $stage/$bin_name"
   echo "    sha256:   $sha"
