@@ -4,7 +4,7 @@
 # veil installer  —  Linux & macOS  (rustup-style one-liner)
 #
 #   curl --proto '=https' --tlsv1.2 -sSf \
-#     https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.sh | sh
+#     https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.sh | sh
 #
 # Downloads PREBUILT, sha256-verified binaries from GitHub Releases and walks
 # you from `curl` all the way to a running node. No Rust toolchain required.
@@ -33,7 +33,7 @@ BIN_DIR=""                 # resolved after flag parse (prefix vs veil-home)
 PREFIX=""                  # if set, install into $PREFIX/bin instead
 REQ_VERSION="latest"       # 'latest' or an explicit X.Y.Z
 COMPONENTS="veil-cli"   # comma list; --all expands to the full set
-LIBC="auto"                # auto|musl|gnu (Linux x86_64 only)
+LIBC="auto"                # auto|musl|gnu (Linux only)
 MODIFY_PATH=1
 ASSUME_YES=0
 QUICKSTART="auto"          # auto|yes|no — offer to init+run a node at the end
@@ -70,7 +70,7 @@ OPTIONS:
     --prefix <dir>        Install into <dir>/bin (e.g. /usr/local) instead of
                           ~/.veil/bin. Use for system-wide / server installs.
     --bin-dir <dir>       Install binaries straight into <dir> (overrides --prefix).
-    --libc <musl|gnu>     Linux x86_64 only: pick the libc flavour
+    --libc <musl|gnu>     Linux only: pick the libc flavour
                           (default: musl — a static binary that runs on any distro).
     --no-modify-path      Do not touch your shell profile / PATH.
     --quickstart          After install, interactively init + start a node.
@@ -172,17 +172,15 @@ detect_triple() {
     esac
     case "$_os" in
         Linux)
-            if [ "$_arch" = x86_64 ]; then
-                _flavour="$LIBC"
-                [ "$_flavour" = auto ] && _flavour=musl   # static = runs anywhere
-                case "$_flavour" in
-                    musl) TRIPLE="x86_64-unknown-linux-musl" ;;
-                    gnu)  TRIPLE="x86_64-unknown-linux-gnu" ;;
-                    *) err "--libc must be 'musl' or 'gnu'" ;;
-                esac
-            else
-                TRIPLE="aarch64-unknown-linux-gnu"   # only gnu is published for arm64
-            fi
+            # Both x86_64 and aarch64 publish musl (static — runs on any distro,
+            # no glibc version dependency) and gnu builds. Default to musl.
+            _flavour="$LIBC"
+            [ "$_flavour" = auto ] && _flavour=musl
+            case "$_flavour" in
+                musl) TRIPLE="${_arch}-unknown-linux-musl" ;;
+                gnu)  TRIPLE="${_arch}-unknown-linux-gnu" ;;
+                *) err "--libc must be 'musl' or 'gnu'" ;;
+            esac
             ;;
         Darwin)
             if [ "$_arch" = aarch64 ]; then
