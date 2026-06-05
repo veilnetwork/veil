@@ -24,13 +24,13 @@
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf \
-  https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.sh | sh
+  https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.ps1 | iex
 ```
 
 Ставит `veil-cli` в `~/.veil/bin` (`%USERPROFILE%\.veil\bin` на Windows). Добавьте `--all`, чтобы поставить также `ogate` и `oproxy` client/server. Компоненты, опции, серверная настройка и удаление — в **[Установке и первом узле](install.md)**.

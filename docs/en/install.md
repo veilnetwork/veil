@@ -16,13 +16,13 @@ Releases. No Rust toolchain is required (that is only needed if you
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf \
-  https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.sh | sh
+  https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.ps1 | iex
 ```
 
 Then start a node:
@@ -61,7 +61,7 @@ Install more than the node:
 
 ```sh
 # everything (node + ogate + oproxy client & server)
-curl -sSf https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.sh | sh -s -- --all
+curl -sSf https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.sh | sh -s -- --all
 
 # a specific subset
 ... | sh -s -- --components ogate,oproxy-server
@@ -70,7 +70,7 @@ curl -sSf https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/inst
 On Windows:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.ps1))) -All
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.ps1))) -All
 ```
 
 ---
@@ -288,7 +288,7 @@ only `~/.veil` plus your shell profile's `PATH` line. If you prefer to read
 before running, download it first:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.sh
+curl -fsSLO https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.sh
 less install.sh        # review
 sh install.sh
 ```

@@ -7,10 +7,10 @@
     %USERPROFILE%\.veil\bin (added to your user PATH). No Rust toolchain needed.
 
     One-liner (latest, node only):
-        irm https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.ps1 | iex
+        irm https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.ps1 | iex
 
     With options, pass them through a scriptblock:
-        & ([scriptblock]::Create((irm https://raw.githubusercontent.com/veilnetwork/veil/master/scripts/install.ps1))) -All
+        & ([scriptblock]::Create((irm https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.ps1))) -All
     ...or save the file and run:  .\install.ps1 -All -Version 1.4.0
 
     When piped to `iex`, configure via environment variables instead of flags:
@@ -77,15 +77,19 @@ foreach ($c in $wanted) {
 if (-not $wanted) { Die 'no components selected' }
 
 # ── Platform -> triple ──────────────────────────────────────────────────────
-$arch = $env:PROCESSOR_ARCHITECTURE
-if ($arch -ne 'AMD64') {
-    Die @"
-no prebuilt Windows binary for architecture '$arch' (only x86_64/AMD64 is published).
-On ARM64 Windows, x64 emulation may work, or build from source:
-  git clone https://github.com/$Repo; cargo build --release
+# On ARM64 Windows, a 32-bit/emulated host process reports the emulated arch in
+# PROCESSOR_ARCHITECTURE; PROCESSOR_ARCHITEW6432 holds the true arch when set.
+$arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+switch ($arch) {
+    'AMD64' { $triple = 'x86_64-pc-windows-msvc' }
+    'ARM64' { $triple = 'aarch64-pc-windows-msvc' }
+    default {
+        Die @"
+no prebuilt Windows binary for architecture '$arch' (x86_64/AMD64 and ARM64 are published).
+Build from source:  git clone https://github.com/$Repo; cargo build --release
 "@
+    }
 }
-$triple = 'x86_64-pc-windows-msvc'
 
 # ── Resolve release tag ─────────────────────────────────────────────────────
 if ($Version -eq 'latest') {
