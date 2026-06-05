@@ -100,11 +100,43 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Install musl toolchain
+      - name: Install musl cross toolchain (gcc/g++/sysroot)
         if: matrix.install_musl == true
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends musl-tools
+          # Full musl C/C++ cross toolchain. The release binaries default to
+          # rocksdb-cold + tls-boring, i.e. they build RocksDB and BoringSSL
+          # (C++) — which ubuntu's musl-tools (musl-gcc only, no g++) cannot.
+          # Mirrors scripts/cross-build-linux-musl.sh on the runner.
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://musl.cc/x86_64-linux-musl-cross.tgz
+          tar xzf x86_64-linux-musl-cross.tgz
+          TC="$RUNNER_TEMP/x86_64-linux-musl-cross"
+          SYSROOT="$TC/x86_64-linux-musl"
+          echo "$TC/bin" >> "$GITHUB_PATH"
+          # CMake toolchain file so btls-sys (BoringSSL, cmake-driven) configures
+          # with the musl compilers instead of the host glibc cc/c++.
+          TCF="$RUNNER_TEMP/musl-toolchain.cmake"
+          printf '%s\n' \
+            'set(CMAKE_SYSTEM_NAME Linux)' \
+            'set(CMAKE_SYSTEM_PROCESSOR x86_64)' \
+            'set(CMAKE_C_COMPILER x86_64-linux-musl-gcc)' \
+            'set(CMAKE_CXX_COMPILER x86_64-linux-musl-g++)' \
+            'set(CMAKE_AR x86_64-linux-musl-ar)' \
+            'set(CMAKE_RANLIB x86_64-linux-musl-ranlib)' \
+            "set(CMAKE_SYSROOT $SYSROOT)" \
+            'set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)' \
+            'set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)' \
+            'set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)' \
+            > "$TCF"
+          # bindgen (librocksdb-sys) runs clang against the musl sysroot.
+          {
+            echo "CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc"
+            echo "CXX_x86_64_unknown_linux_musl=x86_64-linux-musl-g++"
+            echo "AR_x86_64_unknown_linux_musl=x86_64-linux-musl-ar"
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_musl=--sysroot=$SYSROOT --target=x86_64-unknown-linux-musl"
+            echo "CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl=$TCF"
+          } >> "$GITHUB_ENV"
 
       - name: Write release-signing identity (Linux host job only)
         id: identity
@@ -126,8 +158,8 @@ jobs:
           # headers (bits/wordsize.h not found). Point them at the cross gcc.
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CC_x86_64_unknown_linux_musl: musl-gcc
+          # musl cross env (CC/CXX/AR/LINKER/BINDGEN/CMAKE_TOOLCHAIN_FILE) is set
+          # by the "Install musl cross toolchain" step via $GITHUB_ENV.
         run: |
           ./scripts/build-release.sh \
             --target ${{ matrix.triple }} \
