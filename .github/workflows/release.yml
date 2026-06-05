@@ -154,11 +154,11 @@ jobs:
           # /arch:AVX2). Use clang-cl (the MSVC driver) for this target.
           CC_x86_64_pc_windows_msvc: clang-cl
           CXX_x86_64_pc_windows_msvc: clang-cl
-          # cl/clang-cl don't grok the global gnu CXXFLAGS `-include cstdint`
-          # (.cargo/config.toml) and treat the header name as a source file
-          # (C1083). Use the MSVC force-include form for btls-sys (BoringSSL)
-          # + rocksdb C++ on this target.
-          CXXFLAGS: '/FI cstdint /FI cstring'
+          # Drop the global gnu force-include (-include cstdint, .cargo/config.toml)
+          # on this target: cl rejects the gnu form, and the MSVC /FI form gets
+          # mangled by git-bash MSYS path conversion (/FI -> C:/.../FI). MSVC's STL
+          # pulls <cstdint> in transitively, so rocksdb's headers compile without it.
+          CXXFLAGS: ''
         run: |
           # Phase 6.50.b audit fix: switched от allow-empty-seeds к
           # production-seeds.  Pre-fix а CI release artifact for Windows
