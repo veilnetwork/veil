@@ -100,47 +100,19 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Install musl cross toolchain (gcc/g++/sysroot)
+      - name: Install cargo-zigbuild (musl C/C++ cross via zig)
         if: matrix.install_musl == true
         run: |
-          # Full musl C/C++ cross toolchain. The release binaries default to
-          # rocksdb-cold + tls-boring, i.e. they build RocksDB and BoringSSL
-          # (C++) — which ubuntu's musl-tools (musl-gcc only, no g++) cannot.
-          # Mirrors scripts/cross-build-linux-musl.sh on the runner.
-          cd "$RUNNER_TEMP"
-          # musl.cc is the upstream host but is frequently flaky / slow; retry
-          # hard and fail fast per-attempt instead of hanging on one connect.
-          curl -fL --retry 6 --retry-delay 15 --retry-all-errors \
-               --connect-timeout 30 --max-time 600 -O \
-               https://musl.cc/x86_64-linux-musl-cross.tgz
-          tar xzf x86_64-linux-musl-cross.tgz
-          TC="$RUNNER_TEMP/x86_64-linux-musl-cross"
-          SYSROOT="$TC/x86_64-linux-musl"
-          echo "$TC/bin" >> "$GITHUB_PATH"
-          # CMake toolchain file so btls-sys (BoringSSL, cmake-driven) configures
-          # with the musl compilers instead of the host glibc cc/c++.
-          TCF="$RUNNER_TEMP/musl-toolchain.cmake"
-          printf '%s\n' \
-            'set(CMAKE_SYSTEM_NAME Linux)' \
-            'set(CMAKE_SYSTEM_PROCESSOR x86_64)' \
-            'set(CMAKE_C_COMPILER x86_64-linux-musl-gcc)' \
-            'set(CMAKE_CXX_COMPILER x86_64-linux-musl-g++)' \
-            'set(CMAKE_AR x86_64-linux-musl-ar)' \
-            'set(CMAKE_RANLIB x86_64-linux-musl-ranlib)' \
-            "set(CMAKE_SYSROOT $SYSROOT)" \
-            'set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)' \
-            'set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)' \
-            'set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)' \
-            > "$TCF"
-          # bindgen (librocksdb-sys) runs clang against the musl sysroot.
-          {
-            echo "CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc"
-            echo "CXX_x86_64_unknown_linux_musl=x86_64-linux-musl-g++"
-            echo "AR_x86_64_unknown_linux_musl=x86_64-linux-musl-ar"
-            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc"
-            echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_musl=--sysroot=$SYSROOT --target=x86_64-unknown-linux-musl"
-            echo "CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl=$TCF"
-          } >> "$GITHUB_ENV"
+          # The release binaries default to rocksdb-cold + tls-boring, so the
+          # musl target must cross-compile RocksDB and BoringSSL (C++). The
+          # musl.cc gcc cross-toolchain host is unreliable, so use zig instead:
+          # it ships a complete clang + musl libc + libc++ and cross-compiles
+          # C/C++ deps without an external toolchain download. zig and
+          # cargo-zigbuild both install from PyPI (reliable). build-release.sh
+          # then runs `cargo zigbuild` for this target via VEIL_CARGO_CMD.
+          pip3 install --user cargo-zigbuild ziglang
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "VEIL_CARGO_CMD=zigbuild" >> "$GITHUB_ENV"
 
       - name: Write release-signing identity (Linux host job only)
         id: identity
@@ -182,6 +154,11 @@ jobs:
           # /arch:AVX2). Use clang-cl (the MSVC driver) for this target.
           CC_x86_64_pc_windows_msvc: clang-cl
           CXX_x86_64_pc_windows_msvc: clang-cl
+          # cl/clang-cl don't grok the global gnu CXXFLAGS `-include cstdint`
+          # (.cargo/config.toml) and treat the header name as a source file
+          # (C1083). Use the MSVC force-include form for btls-sys (BoringSSL)
+          # + rocksdb C++ on this target.
+          CXXFLAGS: '/FI cstdint /FI cstring'
         run: |
           # Phase 6.50.b audit fix: switched от allow-empty-seeds к
           # production-seeds.  Pre-fix а CI release artifact for Windows

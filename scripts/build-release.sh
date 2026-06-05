@@ -181,7 +181,9 @@ echo "    SOURCE_DATE_EPOCH=$source_date_epoch"
 echo "    features=$features"
 echo "    bins=${bins[*]}"
 cd "$REPO_ROOT"
-cargo build "${cargo_args[@]}"
+# musl builds via `cargo zigbuild` (zig as the musl C/C++ cross-toolchain),
+# selected through VEIL_CARGO_CMD; all other targets use plain `cargo build`.
+cargo "${VEIL_CARGO_CMD:-build}" "${cargo_args[@]}"
 
 # ── Stage artifact directory + per-bin SHA-256 ─────────────────────────────
 
