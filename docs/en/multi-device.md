@@ -69,17 +69,17 @@ siblings.
           Primary device                          New device
           (has master_seed)                       (fresh install)
 
-          $ veil-cli identity pair-invite              │
-            ↳ pair_secret generated                       │
-            ↳ PairingInvite published                     │
-            ↳ QR displayed: veil:pair?id=X&secret=Y    │
-            ↳ OOB 6-digit code shown: "123-456"           │
-                                                          │
-                                                 scan QR ◄┤
-                                                          │
-                                                          │  connect directly to
-                                                          │  source via `secret`
-                                 ┌──────────────────────► │
+          $ veil-cli identity pair-invite                  │
+            ↳ pair_secret generated                        │
+            ↳ PairingInvite published                      │
+            ↳ QR displayed: veil:pair?id=X&secret=Y        │
+            ↳ OOB 6-digit code shown: "123-456"            │
+                                                           │
+                                                 scan QR  ◄┤
+                                                           │
+                                                           │  connect directly to
+                                                           │  source via `secret`
+                                 ┌──────────────────────►  │
                                  │                         │
                                  │                         │  target generates
                                  │                         │  fresh identity_sk
@@ -97,16 +97,16 @@ siblings.
           Appended to                                      │
           IdentityDocument.                                │
           Republished.          ─────────────────────────► │
-                                                          │
+                                                           │
           OOB check: source displays "Target: XXX-XXX?"    │
                      target displays same deterministic    │
                      code derived from session key         │
           User compares visually, confirms on source. ────►│
-                                                          │
+                                                           │
                                  target's InstanceEntry ◄──┤
                                  appended to               │
                                  InstanceRegistry.         │
-                                                          │
+                                                           │
                                  DeviceLinkedEvent pushed  │
                                  to existing instances.    │
 ```
