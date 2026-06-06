@@ -2,9 +2,10 @@
 
 ## Структура проекта
 
-Проект — это workspace из множества крейтов `crates/veil-*`. Реализации
-живут в этих крейтах; `veilcore/` теперь тонкий фасадный крейт-агрегатор,
-а бинарник `veil-cli` вынесен в отдельный крейт `crates/veil-cli`.
+Проект — это Cargo-workspace (рабочее пространство Cargo) из множества крейтов
+(крейт — Rust-библиотека) `crates/veil-*`. Настоящие реализации живут именно в
+них. `veilcore/` теперь лишь тонкий фасад, который их реэкспортирует, а бинарник
+`veil-cli` вынесен в отдельный крейт `crates/veil-cli`.
 
 ```
 veil/
@@ -48,11 +49,10 @@ veil/
 └── specification.md            # Исходная спецификация (RU)
 ```
 
-> Примечание: бинарник теперь — `crates/veil-cli` (`src/bin/cli.rs`).
-> `veilcore/src/node/*.rs` и `crates/veil-proto/src/lib.rs` — это re-export
-> фасады над крейтами `crates/veil-*` (veil-dht, veil-session,
-> veil-proto, veil-transport и т.д.); каталог `crates/veil-cli/src/bin/`
-> отсутствует.
+> Примечание: бинарник теперь лежит в `crates/veil-cli` (`src/bin/cli.rs`).
+> `veilcore/src/node/*.rs` и `crates/veil-proto/src/lib.rs` — это реэкспорт-фасады
+> над крейтами `crates/veil-*` (veil-dht, veil-session, veil-proto, veil-transport
+> и так далее). Старого каталога `crates/veil-cli/src/bin/` больше нет.
 
 ---
 
@@ -88,12 +88,12 @@ veil/
 
 ## NodeRuntime (`node/runtime.rs`, ~7600 строк)
 
-Центральный event loop. Реализует:
+Это центральный цикл событий (event loop). Он отвечает за четыре задачи:
 
-- **Lifecycle**: запуск/остановка слушателей, подключение к пирам, обработка сигналов (SIGHUP)
-- **Session management**: accept входящих → handshake → регистрация; reconnect исходящих с exponential backoff
-- **Background tasks**: DHT republish, gateway cleanup, mailbox cleanup, периодическое сохранение состояния (routes, RTT, Vivaldi, gateways, peer pubkeys)
-- **Frame dispatch**: после handshake передаёт декодированные фреймы в `FrameDispatcher`
+- **Жизненный цикл (lifecycle)**: запуск и остановка слушателей, подключение к соседям, обработка сигналов (SIGHUP)
+- **Управление сессиями**: принять входящее соединение, провести рукопожатие (handshake), затем зарегистрировать сессию; и переподключать исходящие связи с экспоненциальной выдержкой (exponential backoff)
+- **Фоновые задачи**: переобъявление в DHT, очистка шлюзов и почтовых ящиков, периодическое сохранение состояния (маршруты, RTT, Vivaldi, шлюзы, публичные ключи соседей)
+- **Диспетчеризация фреймов**: после рукопожатия передаёт декодированные фреймы в `FrameDispatcher`
 
 **Ключевые структуры:**
 
@@ -123,15 +123,16 @@ struct SessionRuntimeContext {
 
 **При добавлении нового сервиса:**
 1. Добавьте поле `Arc<YourService>` в `NodeServices`
-2. Инициализируйте в `NodeRuntime::new()`
-3. При необходимости передайте в `SessionRuntimeContext` через `spawn_session_runner()`
-4. Добавьте фоновую задачу в `NodeRuntime::run_inner()` если нужно
+2. Инициализируйте его в `NodeRuntime::new()`
+3. При необходимости передайте его в `SessionRuntimeContext` через `spawn_session_runner()`
+4. Если нужна фоновая работа, добавьте задачу в `NodeRuntime::run_inner()`
 
 ---
 
 ## FrameDispatcher (`node/dispatcher/mod.rs`)
 
-Получает декодированный фрейм от session runner'а и маршрутизирует по `family`:
+Берёт декодированный фрейм у обработчика сессии (session runner) и направляет его
+по полю `family` — категории сообщения (control, discovery, delivery и так далее):
 
 ```rust
 pub async fn dispatch(
@@ -141,7 +142,7 @@ pub async fn dispatch(
 ) -> Option<EncodedFrame> // Some = ответ отправить назад
 ```
 
-**Структура dispatcher'а:**
+**Структура диспетчера:**
 
 ```
 dispatcher/
@@ -161,9 +162,9 @@ dispatcher/
 **При добавлении нового типа фрейма:**
 
 1. Добавьте новый `msg_type` в `proto/family.rs` (enum + TryFrom)
-2. Добавьте decode-метод в соответствующем `proto/` файле
+2. Добавьте метод декодирования в подходящий файл `proto/`
 3. В `dispatcher/mod.rs` добавьте ветку в `match frame.family`
-4. В соответствующем `dispatcher/*.rs` реализуйте обработчик
+4. В подходящем `dispatcher/*.rs` реализуйте обработчик
 5. Напишите тест в `#[cfg(test)] mod tests`
 
 ---
@@ -191,20 +192,20 @@ pub async fn perform_ovl1_handshake(
 ) -> Result<OvlHandshakeResult>
 ```
 
-Возвращает `OvlHandshakeResult` с `session_keys`, `node_id`, `remote_role`, `remote_identity_payload`, `remote_capabilities`, `remote_attach`.
+Возвращает `OvlHandshakeResult` с полями `session_keys`, `node_id`, `remote_role`, `remote_identity_payload`, `remote_capabilities` и `remote_attach`.
 
 ### Session Runner
 
-После handshake создаётся `SessionRunner`:
+Как только рукопожатие прошло, управление берёт `SessionRunner`. На каждом витке цикла он:
 
-1. Читает фреймы из транспорта
-2. Декодирует заголовок + тело
-3. Проверяет ChaCha20-Poly1305 MAC (если `flags.encrypted`)
+1. Читает фрейм из транспорта
+2. Декодирует заголовок и тело
+3. Проверяет MAC ChaCha20-Poly1305 (если установлен `flags.encrypted`)
 4. Вызывает `FrameDispatcher::dispatch()`
-5. Отправляет ответ через `SessionOutbox`
-6. Проверяет keepalive/idle timeout
+5. Отправляет ответ (если он есть) через `SessionOutbox`
+6. Проверяет таймауты keepalive и простоя
 
-**Приоритизация фреймов**: Weighted Round-Robin по `flags.priority`:
+**Приоритизация фреймов** использует взвешенный круговой алгоритм (Weighted Round-Robin) по полю `flags.priority`. Чем выше приоритет трафика, тем больше его доля в каждом круге:
 - RT (0): weight 8
 - Interactive (1): weight 4
 - Bulk (2): weight 2
@@ -214,7 +215,9 @@ pub async fn perform_ovl1_handshake(
 
 ## Proto Layer (`proto/`)
 
-Wire-форматы реализованы без внешних библиотек — только `encode() → Vec<u8>` и `decode(&[u8]) → Result<Self, ProtoError>`.
+Этот слой задаёт форматы передачи (wire-форматы) — точную раскладку байтов каждого
+сообщения в сети. Они написаны вручную, без сторонней библиотеки сериализации: у
+каждого типа есть свои `encode() → Vec<u8>` и `decode(&[u8]) → Result<Self, ProtoError>`.
 
 ```
 proto/
@@ -241,7 +244,7 @@ proto/
 └── golden_tests.rs  # Golden-векторы wire-форматов
 ```
 
-### Правила при добавлении нового payload:
+### Правила при добавлении новой полезной нагрузки (payload):
 
 ```rust
 // 1. Структура с pub полями
@@ -307,7 +310,8 @@ mod tests {
 
 ### MailboxService (`node/mailbox/`)
 
-Интерфейс:
+Хранит сообщения для получателей, которые сейчас офлайн. Бэкенд (backend —
+реализация хранилища) подключается через этот трейт:
 ```rust
 pub trait MailboxBackend: Send + Sync {
     fn put(&self, envelope: DeliveryEnvelope) -> Option<u64>;        // → seq
@@ -321,14 +325,14 @@ pub trait MailboxBackend: Send + Sync {
 }
 ```
 
-Добавление нового backend'а:
+Добавление нового бэкенда:
 1. Реализуйте `MailboxBackend` в `node/mailbox/`
-2. Добавьте вариант в `MailboxBackendKind` enum
-3. Добавьте строку `"yourbackend"` в парсер в `MailboxService::new()`
+2. Добавьте вариант в enum `MailboxBackendKind`
+3. Добавьте строку `"yourbackend"` в разбор внутри `MailboxService::new()`
 
 ### AppEndpointRegistry (`node/app/registry.rs`)
 
-Мультиплексирует IPC-сообщения к зарегистрированным приложениям:
+Направляет входящие IPC-сообщения нужному зарегистрированному приложению:
 
 ```rust
 pub struct AppEndpointRegistry { ... }
@@ -356,7 +360,9 @@ impl KademliaService {
 }
 ```
 
-**Внимание:** Кросс-узловые итеративные lookup (`find_value` по сети) требуют отправки фреймов через сессии. Запрашивайте через `dispatcher/discovery.rs`, а не напрямую через `KademliaService`.
+**Внимание:** итеративный поиск, идущий между узлами (`find_value` по сети),
+вынужден слать фреймы через живые сессии. Запускайте такой поиск через
+`dispatcher/discovery.rs`, а не напрямую через `KademliaService`.
 
 ### RouteCache (`node/routing/cache.rs`)
 
@@ -369,11 +375,13 @@ impl RouteCache {
 }
 ```
 
-ECMP: при нескольких путях с `score` в пределах `ecmp_score_band` (±20%) выбирается случайный.
+ECMP (маршрутизация по нескольким равноценным путям): если у нескольких путей
+`score` отличается не больше чем на `ecmp_score_band` (±20%), кэш выбирает один из
+них случайно — чтобы распределить нагрузку.
 
 ### ControlPlaneService (`node/control.rs`)
 
-Управляет RTT-измерениями (RouteProbe/Reply):
+Отвечает за измерение времени кругового обхода (RTT) через обмен RouteProbe/Reply:
 
 ```rust
 impl ControlPlaneService {
@@ -389,7 +397,7 @@ impl ControlPlaneService {
 
 ### Макрос `lock!`
 
-Все блокировки Mutex выполняются через `lock!`:
+Блокировку Mutex всегда берите через `lock!`, а не сырым `.lock().unwrap()`:
 
 ```rust
 // Правильно:
@@ -400,17 +408,18 @@ table.insert(...);
 self.route_cache.lock().unwrap()
 ```
 
-Макрос восстанавливается от отравленного mutex с предупреждением в лог. Определён в `lib.rs`.
+Если mutex отравлен (поток запаниковал, держа блокировку), макрос восстанавливает
+guard и пишет предупреждение в лог вместо того, чтобы паниковать. Определён в `lib.rs`.
 
 ### `Arc<Mutex<_>>` vs `Arc<RwLock<_>>`
 
-- `Arc<Mutex<_>>` — стандарт для mutable state (всегда)
-- `Arc<RwLock<_>>` — только если доказанно читается многократно без записи (редко)
-- Все `Arc<Mutex<_>>` используются с `lock!` (не `.lock().unwrap()`)
+- `Arc<Mutex<_>>` — выбор по умолчанию для разделяемого изменяемого состояния; берите его первым
+- `Arc<RwLock<_>>` — только когда чтений доказанно намного больше, чем записей (редкий случай)
+- Каждый `Arc<Mutex<_>>` блокируется через `lock!`, никогда не `.lock().unwrap()`
 
 ### Hex-форматирование
 
-Используйте утилиты из крейта `veil-util`:
+Форматируйте байтовые ID хелперами из крейта `veil-util` — не пишите это вручную:
 
 ```rust
 // 32-байтный ID (полный hex, 64 символа)
@@ -423,9 +432,10 @@ veil_util::hex_short(&node_id)
 node_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
 ```
 
-### Производительность и размер cast'ов
+### Сужающие приведения типов
 
-**Обязательно** проверяйте перед `as u16` / `as u8`:
+**Обязательно** проверяйте `assert`-ом, что длина влезает, перед приведением
+`as u16` или `as u8`: тихое усечение здесь портит формат передачи:
 
 ```rust
 // Правильно:
@@ -438,7 +448,7 @@ let len = data.len() as u16;
 
 ### Логирование
 
-Проект использует крейт `log` (не `tracing`):
+Проект пишет логи через крейт `log`, а не `tracing`:
 
 ```rust
 log::debug!("route.cache.insert dst={} via={} score={}", hex_short(&dst), hex_short(&via), score);
@@ -447,11 +457,11 @@ log::warn!("mailbox.put.failed reason={}", e);
 log::error!("config.save.failed: {e}");
 ```
 
-### Async и blocking
+### Асинхронность и блокирующий код
 
-- Вся I/O — async через tokio
-- Тяжёлые вычисления (PoW, Falcon512 keygen) → `tokio::task::spawn_blocking`
-- `Mutex` (не `tokio::sync::Mutex`) — для коротких критических секций
+- Весь ввод-вывод асинхронный, поверх tokio
+- Тяжёлые вычисления (PoW, генерация ключей Falcon512) выносите в `tokio::task::spawn_blocking`, чтобы не застопорить рантайм
+- Для коротких критических секций берите обычный `Mutex`, а не `tokio::sync::Mutex`
 
 ---
 
@@ -460,30 +470,30 @@ log::error!("config.save.failed: {e}");
 ### Чеклист при добавлении нового сообщения протокола
 
 - [ ] `proto/family.rs`: добавить вариант в enum + `TryFrom<u16>`
-- [ ] `proto/`: создать/дополнить файл с `encode()`/`decode()` + unit-тест
-- [ ] `proto/budget.rs`: добавить константы лимитов если нужно
-- [ ] `dispatcher/mod.rs`: добавить ветку dispatch
+- [ ] `proto/`: создать или дополнить файл с `encode()`/`decode()` + модульный тест
+- [ ] `proto/budget.rs`: при необходимости добавить константы лимитов
+- [ ] `dispatcher/mod.rs`: добавить ветку диспетчеризации
 - [ ] `dispatcher/NEW.rs`: реализовать обработчик
-- [ ] `node/runtime.rs`: wire в SessionRuntimeContext если нужно
+- [ ] `node/runtime.rs`: при необходимости подключить к `SessionRuntimeContext`
 - [ ] Написать интеграционный тест
 
 ### Чеклист при добавлении нового конфиг-поля
 
-- [ ] `cfg/model.rs`: добавить поле в соответствующую Config-структуру
-- [ ] Значение по умолчанию через `#[serde(default = "...")]`
-- [ ] `cfg/validate/`: добавить валидацию если нужно
-- [ ] `cfg/access.rs`: добавить `ConfigKey` вариант для get/set через CLI
-- [ ] Документация в [admin-guide.md](admin-guide.md)
+- [ ] `cfg/model.rs`: добавить поле в соответствующую структуру Config
+- [ ] Задать значение по умолчанию через `#[serde(default = "...")]`
+- [ ] `cfg/validate/`: при необходимости добавить валидацию
+- [ ] `cfg/access.rs`: добавить вариант `ConfigKey` для get/set через CLI
+- [ ] Описать в [admin-guide.md](admin-guide.md)
 
 ### Чеклист при добавлении нового сервиса
 
 - [ ] Создать `node/myservice/mod.rs` с `pub(crate) struct MyService`
-- [ ] Сделать `Clone-cheap` через `Arc<Mutex<Inner>>`
+- [ ] Сделать клонирование дешёвым через `Arc<Mutex<Inner>>`
 - [ ] Добавить в `NodeServices` как `Arc<MyService>`
 - [ ] Инициализировать в `NodeRuntime::new()`
-- [ ] Добавить `Arc::clone` в нужных местах (не передавать по значению)
+- [ ] Расставить `Arc::clone` где нужно (не передавать по значению)
 - [ ] Фоновую задачу добавить в `run_inner()` через `tokio::spawn`
-- [ ] Unit-тест в `#[cfg(test)]`
+- [ ] Модульный тест в `#[cfg(test)]`
 
 ---
 
@@ -500,7 +510,7 @@ veilcore/src/
 
 ### Полезные утилиты для тестов
 
-**Создание тестового dispatcher'а:**
+**Создание тестового диспетчера:**
 
 ```rust
 // В #[cfg(test)]:
@@ -546,14 +556,15 @@ cargo fuzz run fuzz_proto_decode
 
 ## Известные ограничения и заглушки
 
-Следующие компоненты являются **стабами** или имеют неполную реализацию:
+Эти компоненты — **заглушки** или реализованы лишь частично; не считайте их
+готовыми к продакшену:
 
 | Компонент | Файл | Статус |
 |-----------|------|--------|
-| Mesh WiFi Direct / BLE | отсутствует | Реальная интеграция не реализована; mesh работает поверх UDP-линков ([`node/mesh/udp.rs`](../../crates/veil-mesh/src/udp.rs)) |
-| QUIC-сессии | [`transport/quic.rs`](../../crates/veil-transport/src/quic.rs) | Транспорт `quic://` компилируется всегда (безусловная зависимость `quinn`); отдельного feature-флага больше нет |
-| PoW signature verify | [`node/dispatcher/routing.rs`](../../crates/veil-dispatcher/src/routing.rs) | Подпись PowChallenge не верифицируется в некоторых путях |
-| TUN/TAP | [`crates/ogate/src/tun/`](../../crates/ogate/src/tun/) | Базовая реализация в крейте `ogate` (вынесена из `veilcore`); продакшн-готовность не проверялась |
+| Mesh WiFi Direct / BLE | отсутствует | Настоящая интеграция не реализована; mesh работает поверх UDP-каналов ([`node/mesh/udp.rs`](../../crates/veil-mesh/src/udp.rs)) |
+| QUIC-сессии | [`transport/quic.rs`](../../crates/veil-transport/src/quic.rs) | Транспорт `quic://` компилируется всегда (безусловная зависимость `quinn`); отдельного флага сборки больше нет |
+| Проверка подписи PoW | [`node/dispatcher/routing.rs`](../../crates/veil-dispatcher/src/routing.rs) | Подпись PowChallenge на некоторых путях не проверяется |
+| TUN/TAP | [`crates/ogate/src/tun/`](../../crates/ogate/src/tun/) | Базовая реализация в крейте `ogate` (вынесена из `veilcore`); готовность к продакшену не проверялась |
 
 ---
 
@@ -623,9 +634,10 @@ RoutingService.discover_route(target_node_id)
 
 ## Добавление нового транспорта
 
-Для добавления нового транспорта (например, BLUETOOTH_TCP):
+Транспорт — это слой, который решает, как байты физически путешествуют. Чтобы
+добавить новый (например, BLUETOOTH_TCP):
 
-1. Реализуйте `TransportConnection` trait в `transport/`:
+1. Реализуйте трейт `TransportConnection` в `transport/`:
 
 ```rust
 pub trait TransportConnection: AsyncRead + AsyncWrite + Unpin + Send + 'static {
@@ -634,7 +646,7 @@ pub trait TransportConnection: AsyncRead + AsyncWrite + Unpin + Send + 'static {
 }
 ```
 
-2. Реализуйте `TransportListener` trait:
+2. Реализуйте трейт `TransportListener`:
 
 ```rust
 pub trait TransportListener: Send + 'static {
@@ -642,42 +654,47 @@ pub trait TransportListener: Send + 'static {
 }
 ```
 
-3. Зарегистрируйте в `TransportRegistry` с URI-схемой:
+3. Зарегистрируйте его в `TransportRegistry` с URI-схемой:
 
 ```rust
 registry.register("bt", Box::new(BluetoothTransportFactory));
 ```
 
-4. Добавьте парсинг в `cfg/model.rs::ListenConfig::transport`
+4. Добавьте разбор в `cfg/model.rs::ListenConfig::transport`
 
-5. Добавьте в документацию транспортов
+5. Добавьте его в документацию по транспортам
 
 ---
 
 ## Feature-флаги сборки
 
-Проект использует Cargo feature-флаги для опциональных зависимостей. Важно
-различать **крейт-библиотеку** `veilcore` и **пользовательский бинарник**
-`veil-cli` (`crates/veil-cli`) — у них разные дефолты:
+Опциональные зависимости включаются через feature-флаги Cargo (флаги сборки).
+Одно надо держать в голове: у **крейта-библиотеки** `veilcore` и
+**пользовательского бинарника** `veil-cli` (`crates/veil-cli`) разные настройки по
+умолчанию.
 
 - `veilcore` (библиотека): `default = ["rocksdb-cold"]`.
 - `veil-cli` (бинарник, который собирают и запускают пользователи):
   `default = ["rocksdb-cold", "tls-boring"]`. То есть в поставляемых сборках
-  BoringSSL и его браузероподобный JA3/JA4-fingerprint ClientHello (с ротацией)
-  включены **по умолчанию**; `rustls` остаётся fallback'ом через
+  BoringSSL и его браузероподобный ClientHello с отпечатком (fingerprint) JA3/JA4 и
+  ротацией включены **по умолчанию**. `rustls` остаётся запасным путём через
   `--no-default-features`.
+
+  (Отпечатки JA3/JA4 — это то, по чему наблюдатель в сети опознаёт TLS-клиента по
+  форме его рукопожатия; подделка под браузерный отпечаток помогает трафику Veil
+  слиться с фоном.)
 
 | Флаг | Крейт | Эффект |
 |------|-------|--------|
-| `rocksdb-cold` (default) | `veilcore`, `veil-cli` | Включает RocksDB-бэкенд для cold-хранилищ (mailbox, DHT cold tier). Требует `librocksdb`. |
-| `tls-boring` (default у `veil-cli`) | `veilcore`, `veil-cli` | Заменяет `rustls` на BoringSSL (`btls`/`tokio-btls`/`quinn-btls`); даёт Chrome-подобный JA3/JA4 ClientHello-fingerprint + ротацию (базовый путь обхода DPI). У `veilcore` off по умолчанию, у `veil-cli` — on. |
-| `tls-webpki-roots` | `veilcore`, `veil-cli` | Semver-стабильный no-op для существующих конфигов сборки (webpki-roots всегда присутствует в бинарнике для HTTPS-bootstrap). |
-| `production-seeds` | `veilcore`, `veil-cli` | Встраивает production seed-узлы в бинарник. |
-| `allow-empty-seeds` | `veilcore`, `veil-cli` | Разрешает запуск без seeds (только для dev/test). |
-| `test-low-difficulty` | `veilcore`, `veil-cli` | Снижает PoW-сложность identity до 16 бит для devnet/тестов (в продакшене — 24 бита). |
-| `slow-sim-tests` | `veilcore`, `veil-cli` | Включает тяжёлые sim-тесты (≥55 с), иначе `#[ignore]`d. |
+| `rocksdb-cold` (default) | `veilcore`, `veil-cli` | Включает бэкенд RocksDB для холодных хранилищ (mailbox, холодный уровень DHT). Требует `librocksdb`. |
+| `tls-boring` (default у `veil-cli`) | `veilcore`, `veil-cli` | Заменяет `rustls` на BoringSSL (`btls`/`tokio-btls`/`quinn-btls`); даёт Chrome-подобный отпечаток ClientHello JA3/JA4 + ротацию (базовый путь обхода DPI). У `veilcore` выключен по умолчанию, у `veil-cli` — включён. |
+| `tls-webpki-roots` | `veilcore`, `veil-cli` | Semver-стабильная пустышка (no-op) для существующих конфигов сборки (webpki-roots всегда есть в бинарнике для первичного подключения по HTTPS). |
+| `production-seeds` | `veilcore`, `veil-cli` | Встраивает боевые seed-узлы (узлы первичного входа) в бинарник. |
+| `allow-empty-seeds` | `veilcore`, `veil-cli` | Разрешает запуск без seed-узлов (только для разработки и тестов). |
+| `test-low-difficulty` | `veilcore`, `veil-cli` | Снижает PoW-сложность личности до 16 бит для devnet и тестов (в продакшене — 24 бита). |
+| `slow-sim-tests` | `veilcore`, `veil-cli` | Включает тяжёлые симуляционные тесты (≥55 с); без флага они помечены `#[ignore]`. |
 
-> QUIC и TUN/TAP **не** управляются feature-флагами: транспорт `quic://`
+> QUIC и TUN/TAP **не** управляются флагами сборки: транспорт `quic://`
 > компилируется всегда (безусловная зависимость `quinn`), а TUN/TAP вынесен
 > в крейт `crates/ogate` (`src/tun/`).
 
@@ -702,25 +719,26 @@ cargo check -p veil-cli --no-default-features
 
 ### Сборка на Windows (нативно)
 
-CI собирает весь workspace на Linux; джоба `windows-test` намеренно использует
-`-p veilcore --no-default-features`, чтобы пропустить C/C++-зависимости крипто.
-Собрать **дефолтный** набор фич нативно на Windows (BoringSSL через `btls-sys`,
-RocksDB, `ring`, `aws-lc-sys`, `pqcrypto-internals`) возможно, но нужен особый
-тулчейн: workspace-овый `.cargo/config.toml` в `[env]` форсит флаги GNU-драйвера
-(`CC=clang`, `CXX=clang++`, `CXXFLAGS=-include cstdint …`), заточенные под
-Linux-раннеры.
+CI собирает весь workspace на Linux. Задача `windows-test` намеренно запускает
+`-p veilcore --no-default-features`, чтобы пропустить C/C++-зависимости
+криптографии. Собрать **набор фич по умолчанию** прямо на Windows (BoringSSL через
+`btls-sys`, RocksDB, `ring`, `aws-lc-sys`, `pqcrypto-internals`) можно, но нужен
+особый инструментарий (toolchain). Причина: блок `[env]` в `.cargo/config.toml`
+рабочего пространства навязывает флаги GNU-драйвера (`CC=clang`, `CXX=clang++`,
+`CXXFLAGS=-include cstdint …`), заточенные под Linux-машины CI, и их приходится
+переопределять.
 
-Требуется:
+Понадобится:
 
-- **Visual Studio 2022** с C++-workload (приносит `cmake` + `ninja` в
+- **Visual Studio 2022** с набором инструментов C++ (приносит `cmake` + `ninja` в
   `…\Common7\IDE\CommonExtensions\Microsoft\CMake\`).
 - **LLVM** (`clang-cl`) — например `winget install LLVM.LLVM`, ставится в
   `C:\Program Files\LLVM\bin`.
 - **NASM** (ассемблер x86-64 для BoringSSL / `ring`) — `winget install NASM.NASM`,
   ставится в `%LOCALAPPDATA%\bin\NASM`.
 
-Затем запускайте cargo из оболочки с таким окружением (вставить один раз на сессию
-PowerShell либо обернуть в функцию в `$PROFILE`):
+Затем запускайте cargo из оболочки с таким окружением. Вставьте его один раз на
+сессию PowerShell либо оберните в функцию в `$PROFILE`:
 
 ```powershell
 # 1. Окружение MSVC (INCLUDE/LIB) + bundled ninja/cmake в PATH
@@ -740,22 +758,22 @@ cargo build --workspace
 cargo clippy --workspace --all-targets
 ```
 
-Зачем каждая ручка:
+Зачем нужна каждая настройка:
 
 - `CC/CXX=clang-cl` — `pqcrypto-internals` передаёт MSVC-флаг `/arch:AVX2`,
-  который понимает только драйвер `clang-cl` (голый `clang` падает с ошибкой).
-- `CMAKE_GENERATOR=Ninja` — генератор Visual Studio гонит `cl.exe` через MSBuild и
-  игнорирует `CC`, а также не принимает clang-флаги. Ninja вызывает `clang-cl`
-  напрямую.
+  который понимает только драйвер `clang-cl` (чистый `clang` падает с ошибкой).
+- `CMAKE_GENERATOR=Ninja` — генератор Visual Studio запускает `cl.exe` через
+  MSBuild и игнорирует `CC`, а ещё не принимает флаги в стиле clang. Ninja же
+  вызывает `clang-cl` напрямую.
 - `CXXFLAGS=/FIcstdint /FIcstring` — `clang-cl` не понимает GNU-флаг
   `-include cstdint` из конфига (принимает `cstdint` за отсутствующий входной
-  файл, и cmake-конфигурация BoringSSL падает). `/FI` — эквивалентная форма
-  forced-include; переопределение переменной окружения заменяет значение из
-  конфига на эту сессию.
+  файл, и конфигурация BoringSSL через cmake падает). `/FI` — это эквивалентная
+  форма принудительного включения (forced-include); переопределение переменной
+  окружения заменяет значение из конфига на эту сессию.
 
-> Часть example/bin-таргетов помечена `#[cfg(unix)]` и не компилируется под
-> `--all-targets` на Windows; ограничьтесь `--lib --tests` (или исключите
-> соответствующий крейт), если нужен только линт библиотеки.
+> Часть таргетов example/bin помечена `#[cfg(unix)]` и не компилируется под
+> `--all-targets` на Windows. Если нужен только линт библиотеки, ограничьтесь
+> `--lib --tests` (или исключите соответствующий крейт).
 
 ---
 

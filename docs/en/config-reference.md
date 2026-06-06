@@ -1,14 +1,14 @@
 # OVL1 Configuration Reference
 
-Complete description of all fields in the `config.toml` configuration file.
+Every field in the `config.toml` file, described in one place.
 
-The config is read at startup by the `veil-cli node run` command. The default path depends on the OS (XDG on Linux, `AppData` on Windows); to find it: `veil-cli config locate`.
+The config is read at startup by `veil-cli node run`. Where it lives depends on your OS (XDG on Linux, `AppData` on Windows); to find the exact path, run `veil-cli config locate`.
 
 ---
 
 ## File format
 
-The file is in **TOML** format. Most sections are optional — if a section is omitted, default values are used. The exceptions: the `[Identity]` section and at least one `[[peers]]` or `[[listen]]` entry are required for a node to actually work.
+The file is **TOML**. Most sections are optional — leave one out and its defaults apply. Two things are not optional: the `[Identity]` section, and at least one `[[peers]]` or `[[listen]]` entry. Without them a node has no identity and nowhere to connect.
 
 ```toml
 # Minimal config example (leaf node)
@@ -39,36 +39,36 @@ transport  = "tls://gateway.example.com:9443"
 |-----|-------------|
 | `bool` | `true` |
 
-The master switch for all on-disk persistence. When `false`, no `*_persist_path` is written or read at startup. Convenient for ephemeral nodes, CI, and debugging.
+The master switch for everything written to disk. When `false`, no `*_persist_path` is read at startup or written while running — handy for throwaway nodes, CI, and debugging.
 
 ---
 
 ## `[global]`
 
-Tokio runtime and logging settings.
+Tokio runtime and logging.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
 | `runtime_flavor` | enum | `"multi_thread"` | Tokio runtime type. Values: `"multi_thread"`, `"current_thread"` |
-| `worker_threads` | `u16` or absent | unset | Number of worker threads. If unset — `num_cpus`. Only for `multi_thread` |
-| `max_blocking_threads` | `u16` or absent | unset | Blocking-thread pool (for `spawn_blocking`). Absent — uses the tokio default (512) |
-| `thread_keep_alive_ms` | `u64` or absent | unset | Lifetime of an idle blocking thread in ms |
-| `thread_name` | `string` or absent | unset | Name prefix for worker threads (for `ps`, `top`) |
+| `worker_threads` | `u16` or absent | unset | Number of worker threads. Left unset, it follows `num_cpus`. Applies only to `multi_thread` |
+| `max_blocking_threads` | `u16` or absent | unset | Size of the blocking-thread pool (for `spawn_blocking`). Left unset, the tokio default (512) applies |
+| `thread_keep_alive_ms` | `u64` or absent | unset | How long an idle blocking thread sticks around, in ms |
+| `thread_name` | `string` or absent | unset | Name prefix for worker threads, so they're easy to spot in `ps` or `top` |
 | `thread_stack_size` | `usize` or absent | unset | Worker-thread stack size in bytes |
-| `admin_socket` | `string` or absent | unset | Admin backend URI: `"unix:///abs/path/to/admin.sock"` (Linux/macOS) or `"tcp://127.0.0.1:0?runtime_dir=/abs/path"` (Windows, or when domain sockets are unavailable). On TCP, `admin.port` and `admin.token` are written to `runtime_dir` and read by clients; the ban on non-loopback hosts is enforced in the validator (`::1`, `localhost` are allowed). |
-| `logs` | enum | `"stderr"` | Where to write logs. Values: `"stderr"`, `"file"` |
-| `log_file` | `string` or absent | unset | Path to the log file. Used only when `logs = "file"` |
-| `log_level` | enum | `"info"` | Minimum log level. Values: `"debug"`, `"info"`, `"warn"`, `"error"` |
+| `admin_socket` | `string` or absent | unset | Admin backend URI: `"unix:///abs/path/to/admin.sock"` (Linux/macOS), or `"tcp://127.0.0.1:0?runtime_dir=/abs/path"` on Windows or wherever domain sockets aren't available. With TCP, `admin.port` and `admin.token` are written to `runtime_dir` for clients to read; the validator refuses non-loopback hosts (`::1` and `localhost` are fine). |
+| `logs` | enum | `"stderr"` | Where logs go. Values: `"stderr"`, `"file"` |
+| `log_file` | `string` or absent | unset | Path to the log file. Only consulted when `logs = "file"` |
+| `log_level` | enum | `"info"` | Minimum level to log. Values: `"debug"`, `"info"`, `"warn"`, `"error"` |
 | `log_format` | enum | `"text"` | Log line format. Values: `"text"` (human-readable), `"json"` (NDJSON) |
-| `admin_max_connections` | `usize` | `32` | Max concurrent admin-socket connections |
+| `admin_max_connections` | `usize` | `32` | Most admin-socket connections allowed at once |
 | `require_signed_config` | `bool` | `false` | When `true`, the node refuses to load a config that isn't validly signed (Этап 11d) — see config signing in [OPERATIONS](OPERATIONS.md) |
-| `tls_ech_grease` | `bool` | `true` | Send TLS **ECH GREASE** so middleboxes can't distinguish ECH-capable from non-ECH connections. Set `false` only for TLS-1.2-only CDNs |
-| `bootstrap_dns_domain` | `string` or absent | unset | DNS bootstrap domain (TXT-record seed source — a fallback bootstrap layer) |
-| `bootstrap_https_urls` | `[string]` | `[]` | HTTPS (and `.onion`) URLs serving a **signed** seed bundle — last-resort bootstrap when clearnet seeds are blocked |
+| `tls_ech_grease` | `bool` | `true` | Send TLS **ECH GREASE** so middleboxes can't tell ECH-capable connections from the rest. Set `false` only for CDNs stuck on TLS 1.2 |
+| `bootstrap_dns_domain` | `string` or absent | unset | DNS bootstrap domain — seeds delivered as TXT records, one more fallback layer for joining the network |
+| `bootstrap_https_urls` | `[string]` | `[]` | HTTPS (and `.onion`) URLs that serve a **signed** seed bundle — the last resort when clearnet seeds are blocked |
 | `bootstrap_tor_socks_proxy` | `string` or absent | unset | SOCKS5 proxy (e.g. `"socks5://127.0.0.1:9050"`) for fetching `.onion` `bootstrap_https_urls` over Tor |
-| `trusted_bundle_issuer_pubkey` | `string` or absent | unset | Pinned issuer pubkey that signed seed bundles must verify against |
+| `trusted_bundle_issuer_pubkey` | `string` or absent | unset | Pinned issuer pubkey that every signed seed bundle must verify against |
 | `legacy_allow_unsigned_bootstrap` | `bool` | `false` | Accept unsigned bootstrap bundles (legacy). Default `false`; `.onion` sources are always force-signed regardless |
-| `discovered_peers_cache_path` | `string` or absent | unset | Cache of peers discovered in prior runs — a bootstrap fallback if known seed IPs go down |
+| `discovered_peers_cache_path` | `string` or absent | unset | Cache of peers found in earlier runs — a fallback for joining if the known seed IPs are down |
 
 **Example:**
 
@@ -89,7 +89,7 @@ log_format        = "json"
 
 > The spelling `[identity]` (lowercase) is also accepted. Both variants are equivalent.
 
-The node's cryptographic identity. The only section required for operation.
+The node's cryptographic identity — the one section a node can't run without.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
@@ -98,21 +98,21 @@ The node's cryptographic identity. The only section required for operation.
 | `public_key` | `string` | — | Public key, base64-encoded. **Required** |
 | `private_key` | `string` | — | Private key, base64-encoded. **Required** |
 | `nonce` | `string` | `"AAAAAA=="` (4 zero bytes) | PoW nonce for `node_id = BLAKE3(pubkey \|\| nonce)`. Generated by `config init` |
-| `node_id` | `string` or absent | computed | Explicit hex node_id (64 characters). If unset — computed from `public_key` + `nonce` |
-| `key_passphrase` | `string` or absent | unset | Passphrase to decrypt the encrypted private key inline (discouraged — prefer the file/prompt variants) |
+| `node_id` | `string` or absent | computed | Explicit hex node_id (64 characters). Left unset, it's computed from `public_key` + `nonce` |
+| `key_passphrase` | `string` or absent | unset | Passphrase to decrypt the encrypted private key, written inline. Discouraged — prefer the file or prompt variants below |
 | `key_passphrase_file` | `string` or absent | unset | Path to a file holding the key passphrase (keep it mode `0600`) |
-| `key_passphrase_prompt` | `bool` | `false` | When `true`, prompt for the key passphrase interactively at startup |
-| `lazy_mining` | `bool` | `false` | Mine the PoW nonce lazily in the background instead of blocking `config init` |
-| `max_lazy_difficulty` | `u8` | `64` | Upper bound on the difficulty the lazy miner will attempt |
+| `key_passphrase_prompt` | `bool` | `false` | When `true`, ask for the key passphrase interactively at startup |
+| `lazy_mining` | `bool` | `false` | Mine the PoW nonce in the background instead of making `config init` wait for it |
+| `max_lazy_difficulty` | `u8` | `64` | The highest difficulty the lazy miner will attempt |
 
-> Names are not config keys — claim a name with `veil-cli identity claim-name <name>`; the running node republishes it to the DHT. See [Names](user-guide.md#names-name-system).
+> Names aren't config keys. Claim one with `veil-cli identity claim-name <name>`, and the running node republishes it to the DHT. See [Names](user-guide.md#names-name-system).
 
 **Node roles:**
 
 | Role | Description |
 |------|----------|
-| `leaf` | Mobile/lightweight node. Does not participate in the DHT. Operates through core nodes and the mailbox |
-| `core` | Full-fledged network participant. DHT (K=20), relay/forwarding, gateway (attachment records), mailbox. Recommended PoW difficulty ≥ 24 (the `--difficulty` default is `16`; `MAX_POW_DIFFICULTY = 24` is the hard cap) |
+| `leaf` | A mobile or lightweight node. Stays out of the DHT and works through core nodes and the mailbox |
+| `core` | A full network participant: DHT (K=20), relay/forwarding, gateway (attachment records), and mailbox. Recommended PoW difficulty ≥ 24 (the `--difficulty` default is `16`; `MAX_POW_DIFFICULTY = 24` is the hard cap) |
 
 The legacy values `"relay"`, `"gateway"`, `"core_router"` have been removed — the parser
 now accepts only `"leaf"` or `"core"`.
@@ -132,18 +132,18 @@ nonce       = "AAAAAA=="
 
 ## `[[peers]]`
 
-An array of persistent peers with which the node maintains an outbound connection. Each entry is one connection.
+Persistent peers the node keeps an outbound connection open to. One entry, one connection.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
 | `peer_id` | `string` (hex u32) | — | Local peer identifier, e.g. `"0x00000001"`. **Required** |
 | `public_key` | `string` | — | Peer public key (base64). **Required** |
 | `nonce` | `string` | — | Peer PoW nonce (base64). **Required** |
-| `transport` | `string` | — | Transport URI to connect to (see [Transport URI format](#transport-uri-format)). **Required** |
+| `transport` | `string` | — | Transport URI to dial (see [Transport URI format](#transport-uri-format)). **Required** |
 | `algo` | enum | `"ed25519"` | Peer signature algorithm. Values: `"ed25519"`, `"falcon512"` |
-| `tls_cert` | `string` or absent | unset | PEM certificate for mTLS (client) |
-| `tls_key` | `string` or absent | unset | Private key for mTLS (client) |
-| `tls_ca_cert` | `string` or absent | unset | CA certificate for verifying the peer's certificate |
+| `tls_cert` | `string` or absent | unset | PEM certificate for mTLS (client side) |
+| `tls_key` | `string` or absent | unset | Private key for mTLS (client side) |
+| `tls_ca_cert` | `string` or absent | unset | CA certificate for checking the peer's certificate |
 
 **Example:**
 
@@ -167,33 +167,33 @@ transport  = "quic://core.example.com:9444"
 
 ## Transport URI format
 
-The `transport` field in all sections (`[[peers]]`, `[[listen]]`, `[[bootstrap_peers]]`) uses a single URI format. Implementation: `crates/veil-transport/src/uri.rs`.
+The `transport` field shares one URI format across every section that has it (`[[peers]]`, `[[listen]]`, `[[bootstrap_peers]]`). Implementation: `crates/veil-transport/src/uri.rs`.
 
 ### Supported schemes
 
 | Scheme | Direction | Description |
 |-------|-------------|----------|
-| `tcp://HOST:PORT` | outbound / inbound | Direct TCP connection without encryption |
+| `tcp://HOST:PORT` | outbound / inbound | Plain TCP, no encryption |
 | `tls://HOST:PORT` | outbound / inbound | TCP + TLS 1.3 |
-| `quic://HOST:PORT` | outbound / inbound | UDP + QUIC (built-in TLS); supports bidirectional streams, substreams, and datagrams |
-| `ws://HOST:PORT/PATH` | outbound / inbound | WebSocket over TCP; available as a byte stream and a message stream |
-| `wss://HOST:PORT/PATH` | outbound / inbound | WebSocket over TLS; available as a byte stream and a message stream |
+| `quic://HOST:PORT` | outbound / inbound | UDP + QUIC (TLS built in); supports bidirectional streams, substreams, and datagrams |
+| `ws://HOST:PORT/PATH` | outbound / inbound | WebSocket over TCP; usable as a byte stream or a message stream |
+| `wss://HOST:PORT/PATH` | outbound / inbound | WebSocket over TLS; usable as a byte stream or a message stream |
 | `socks://PROXY:PORT/TARGET:PORT` | outbound only | TCP through a SOCKS5 proxy |
 | `sockstls://PROXY:PORT/TARGET:PORT` | outbound only | TLS through a SOCKS5 proxy |
-| `unix:///path/to/socket` | inbound only | Unix Domain Socket (IPC only) |
+| `unix:///path/to/socket` | inbound only | Unix domain socket (IPC only) |
 
-**Bind addresses for `[[listen]]`:** use `0.0.0.0` or `[::]` to accept connections on all interfaces; `127.0.0.1` or `unix://` for local listeners.  
+**Bind addresses for `[[listen]]`:** use `0.0.0.0` or `[::]` to accept connections on every interface; `127.0.0.1` or `unix://` to keep a listener local.  
 **For `[[peers]]` / `[[bootstrap_peers]]`:** the DNS name or IP of the remote node.  
-**IPv6:** addresses are wrapped in square brackets: `tcp://[::1]:9000`, `tls://[2001:db8::1]:443`.
+**IPv6:** wrap the address in square brackets — `tcp://[::1]:9000`, `tls://[2001:db8::1]:443`.
 
 ### Query parameters for TLS schemes
 
-The `tls://`, `quic://`, `wss://`, `sockstls://` schemes support query parameters:
+The `tls://`, `quic://`, `wss://`, and `sockstls://` schemes accept query parameters:
 
 | Parameter | Repeat | Description |
 |----------|--------|----------|
-| `sni=NAME` | once | Override the SNI (Server Name Indication) for the TLS handshake. Defaults to `host`. For `sockstls://` the default is `target_host` |
-| `alpn=PROTO` | many | Add an ALPN protocol. Can be specified multiple times |
+| `sni=NAME` | once | Override the SNI (Server Name Indication) for the TLS handshake. Defaults to `host`; for `sockstls://` it defaults to `target_host` |
+| `alpn=PROTO` | many | Add an ALPN protocol. May be given more than once |
 
 **Examples:**
 
@@ -228,7 +228,7 @@ sockstls://127.0.0.1:1080/10.0.0.5:9443?sni=remote.example.com&alpn=h2
 
 ### TLS certificates
 
-The `tls_cert`, `tls_key`, `tls_ca_cert` parameters in `[[listen]]` / `[[peers]]` sections apply only to the `tls://`, `quic://`, `wss://` schemes. For `tcp://`, `ws://`, `unix://` they are ignored.
+The `tls_cert`, `tls_key`, and `tls_ca_cert` parameters in `[[listen]]` / `[[peers]]` apply only to the `tls://`, `quic://`, and `wss://` schemes. For `tcp://`, `ws://`, and `unix://` they're ignored.
 
 | Parameter | In `[[listen]]` | In `[[peers]]` |
 |----------|---------------|--------------|
@@ -236,11 +236,11 @@ The `tls_cert`, `tls_key`, `tls_ca_cert` parameters in `[[listen]]` / `[[peers]]
 | `tls_key` | Server private key | Client private key |
 | `tls_ca_cert` | CA for verifying clients (mTLS) | CA for verifying the server's certificate |
 
-> Do not pass a CA certificate in the `tls_cert` field for a listener: rustls will reject a CA certificate used as an end-entity server certificate.
+> Don't put a CA certificate in a listener's `tls_cert` field: rustls rejects a CA certificate used as an end-entity server certificate.
 
 ### Debugging transports
 
-The `veil-cli debug transport` subcommand lets you manually test connections without launching a full node.
+The `veil-cli debug transport` subcommand lets you test a connection by hand, without standing up a full node.
 
 **Connection examples (client):**
 
@@ -266,7 +266,7 @@ veil-cli debug transport listen ws://0.0.0.0:8080/veil
 veil-cli debug transport listen wss://0.0.0.0:8443/veil?alpn=http/1.1
 ```
 
-For `listen` with TLS schemes (`tls://`, `wss://`, `quic://`) a temporary self-signed certificate is generated automatically. For production testing, pass explicit certificates:
+For `listen` with a TLS scheme (`tls://`, `wss://`, `quic://`) a temporary self-signed certificate is generated for you. To test closer to production, pass real certificates:
 
 ```bash
 # Listener with a real certificate
@@ -285,28 +285,28 @@ veil-cli debug transport connect wss://127.0.0.1:8443/veil \
   --tls-ca-cert ssl/ca.pem
 ```
 
-The `--tls-cert`, `--tls-key`, `--tls-ca-cert` flags work the same for `tls://`, `wss://`, and `quic://`.
+The `--tls-cert`, `--tls-key`, and `--tls-ca-cert` flags behave the same across `tls://`, `wss://`, and `quic://`.
 
 ---
 
 ## `[[listen]]`
 
-An array of inbound listeners. Each listener is one port on which the node accepts connections.
+Inbound listeners. Each one is a single port the node accepts connections on.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
 | `id` | `string` (hex u32) | — | Local listener identifier, e.g. `"0x00000001"`. **Required** |
-| `transport` | `string` | — | Transport URI to bind on (see [Transport URI format](#transport-uri-format)). **Required** |
-| `advertise` | `string` or absent | unset | Address advertised to peers instead of `transport`. Used behind a reverse proxy: bind to `localhost:9443`, advertise `wss://nginx.example.com:443/veil` |
-| `relay` | `string` or absent | unset | Hex node_id of a relay node through which this listener can be reached (for NAT). Included in `RouteResponsePayload.relay_ids` |
+| `transport` | `string` | — | Transport URI to bind (see [Transport URI format](#transport-uri-format)). **Required** |
+| `advertise` | `string` or absent | unset | Address advertised to peers in place of `transport`. Used behind a reverse proxy: bind to `localhost:9443`, advertise `wss://nginx.example.com:443/veil` |
+| `relay` | `string` or absent | unset | Hex node_id of a relay node this listener can be reached through (for NAT). Included in `RouteResponsePayload.relay_ids` |
 | `tls_cert` | `string` or absent | unset | PEM server certificate (TLS/WSS) |
 | `tls_key` | `string` or absent | unset | Server private key |
 | `tls_ca_cert` | `string` or absent | unset | CA certificate for verifying clients (mTLS) |
-| `visibility` | enum | `"public"` | Listener visibility level. `"public"` — advertised via PEX + DHT; `"trusted"` — not advertised (out-of-band invite); `"hidden"` — same as trusted plus enforces `allowlist_node_ids` at handshake |
-| `psk_file` | `string` (path) or absent | unset | Path to a file containing the PSK (32 bytes, base64) for an `obfs4-tcp://` listener. Overrides the global `[transport].obfs4_psk_file`. Allows splitting PSKs by group — a public listener with a deployment-wide PSK + a family listener with a private one |
-| `allowlist_node_ids` | `[string]` | `[]` | List of hex-encoded 32-byte node_ids permitted to authenticate against this listener. Required for `visibility = "hidden"`; optional reinforcement for `"trusted"`. Empty = no allowlist |
-| `group_label` | `string` or absent | unset | Human-readable group tag (e.g. `"family"`, `"snowflake"`). Not used by daemon logic; surfaced in logs + metrics |
-| `ephemeral` | table or absent | unset | Random-port rotation config (anti-port-clustering). See [`[listen.ephemeral]`](#listenephemeral) below |
+| `visibility` | enum | `"public"` | How visible the listener is. `"public"` — advertised via PEX + DHT; `"trusted"` — not advertised, reached by out-of-band invite; `"hidden"` — like trusted, but also enforces `allowlist_node_ids` at the handshake |
+| `psk_file` | `string` (path) or absent | unset | Path to a file with the PSK (32 bytes, base64) for an `obfs4-tcp://` listener. Overrides the global `[transport].obfs4_psk_file`, so you can split PSKs by group — a public listener on a deployment-wide PSK plus a family listener on a private one |
+| `allowlist_node_ids` | `[string]` | `[]` | Hex-encoded 32-byte node_ids allowed to authenticate against this listener. Required for `visibility = "hidden"`; optional reinforcement for `"trusted"`. Empty means no allowlist |
+| `group_label` | `string` or absent | unset | A human-readable group tag (e.g. `"family"`, `"snowflake"`). The daemon doesn't act on it; it just shows up in logs and metrics |
+| `ephemeral` | table or absent | unset | Random-port rotation, to avoid port clustering. See [`[listen.ephemeral]`](#listenephemeral) below |
 
 **Example:**
 
@@ -333,21 +333,21 @@ group_label = "family"
 
 ### `[listen.ephemeral]`
 
-Periodic random-port rotation for anti-port-clustering (snowflake-style).
-The daemon rebinds to a fresh port from `range` every `rotation`; peers learn the new URI through a signed `TransportMigrationNotify` broadcast.
+Rotates the listening port at random on a schedule, so ports don't cluster (snowflake-style).
+The daemon rebinds to a fresh port from `range` every `rotation`, and peers pick up the new URI from a signed `TransportMigrationNotify` broadcast.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `range` | `[u16, u16]` | — | Inclusive port range, e.g. `[10000, 60000]`. A narrow range is useful for mimicry of a specific protocol (`[3306, 3306]` — MySQL-SSL). **Required** |
-| `rotation` | `string` (duration spec) | — | Rotation interval: `"30s"`, `"5m"`, `"3h"`, `"7d"`. **Required** |
-| `bind_retries` | `u32` | `64` | Number of bind attempts on collision (`EADDRINUSE`). 0 = single-shot |
-| `grace_period` | `string` (duration spec) | `"30m"` | Window after rotation during which the old listener stays alive for in-flight handshakes before dropping |
+| `range` | `[u16, u16]` | — | Inclusive port range, e.g. `[10000, 60000]`. A narrow range helps mimic a specific protocol (`[3306, 3306]` — MySQL-SSL). **Required** |
+| `rotation` | `string` (duration spec) | — | How often to rotate: `"30s"`, `"5m"`, `"3h"`, `"7d"`. **Required** |
+| `bind_retries` | `u32` | `64` | How many bind attempts to make on a collision (`EADDRINUSE`). 0 = single-shot |
+| `grace_period` | `string` (duration spec) | `"30m"` | How long the old listener stays alive after rotation, finishing in-flight handshakes before it's dropped |
 
 **Constraints:**
 
 - Works only for `obfs4-tcp://` listeners (or another transport whose URI supports `with_host_port`).
-- Requires an Ed25519 identity — the `TransportMigrationNotify` wire frame is signed via ed25519-dalek; hybrid Falcon-512 + Ed25519 is not yet supported.
-- On a failed rebind on the new port, a warn is logged + the old listener stays in service. Peers whose caches already point to the new URI fall back through the DHT.
+- Needs an Ed25519 identity — the `TransportMigrationNotify` wire frame is signed with ed25519-dalek; the hybrid Falcon-512 + Ed25519 case isn't supported yet.
+- If the rebind to the new port fails, a warning is logged and the old listener keeps serving. Peers whose caches already point at the new URI fall back through the DHT.
 
 **Example:**
 
@@ -364,36 +364,36 @@ grace_period  = "30m"
 bind_retries  = 64
 ```
 
-**Logs and metrics:** on rotation the daemon emits structured info-level logs:
+**Logs and metrics:** on each rotation the daemon emits structured info-level logs:
 
 - `listen.rotation.spawned` — at startup, confirms the rotator task came up
-- `session.migration.notify.applied` — on the peer side, on receiving and applying the broadcast
-- `listen.rotation.swap_sent` — on the rotating node's side, after a successful rebind
+- `session.migration.notify.applied` — on the peer side, once it receives and applies the broadcast
+- `listen.rotation.swap_sent` — on the rotating node, after a successful rebind
 - `listen.swap` — the accept-loop has switched to the new listener
-- `listen.rotation.rebind_failed` (warn) — if the new bind failed; the old one keeps working
-- `listen.rotation.bind_failed` (warn) — if the rotator couldn't pick a port from the range
+- `listen.rotation.rebind_failed` (warn) — the new bind failed; the old one keeps working
+- `listen.rotation.bind_failed` (warn) — the rotator couldn't pick a port from the range
 
 ### `[listen.on_demand]`
 
-On-demand listener — a slot binds **on request** rather than at startup.
-By default `ss -tlnp` shows no port at all; the port opens only after a
-successful PoW handshake, serves a limited number of sessions (or a TTL), and
-closes automatically.
+An on-demand listener binds its port **only when asked**, not at startup.
+Normally `ss -tlnp` shows nothing; the port opens only after a successful PoW
+handshake, serves a capped number of sessions (or until a TTL), then closes on
+its own.
 
 **Requirements:**
 
-- `visibility = "stealth"` is required (otherwise config validation throws an error at startup)
-- Ed25519 node identity (hybrid Falcon-512 is not supported at this layer)
+- `visibility = "stealth"` is required (otherwise config validation errors out at startup)
+- An Ed25519 node identity (hybrid Falcon-512 isn't supported at this layer)
 - **One stealth listener** per node (multi-stealth = TODO in Slice 6+)
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
 | `range` | `[u16, u16]` | — | Inclusive port range for the on-demand bind. **Required** |
-| `pow_difficulty` | `u32` | — | Required PoW difficulty in BLAKE3 leading-zero bits. Production: 24 (~16M attempts ≈ 0.5 sec CPU). Minimum 8. **Required** |
-| `ttl` | `string` (duration) | — | Slot TTL: `"5m"`, `"300s"`. After the TTL the accept-task exits and the listener closes, even if no session arrived. **Required** |
-| `max_concurrent` | `usize` | `16` | Maximum simultaneous on-demand slots. Protects the FD table from a PoW-funded burst |
-| `rate_limit` | `string` (`"N/period"`) | `"3/h"` | Per-requester rate limit: `"3/h"` (3 grants per hour per pubkey), `"1/m"`, `"10/30s"` |
-| `max_accepts` | `usize` | `1` | How many sessions the slot accepts before retiring. 1 = one-shot rendezvous |
+| `pow_difficulty` | `u32` | — | Required PoW difficulty, in BLAKE3 leading-zero bits. Production: 24 (~16M attempts ≈ 0.5 sec CPU). Minimum 8. **Required** |
+| `ttl` | `string` (duration) | — | Slot TTL: `"5m"`, `"300s"`. Once it expires the accept-task exits and the listener closes, even if no session ever arrived. **Required** |
+| `max_concurrent` | `usize` | `16` | Most on-demand slots open at once. Keeps a PoW-funded burst from exhausting the FD table |
+| `rate_limit` | `string` (`"N/period"`) | `"3/h"` | Per-requester rate limit: `"3/h"` (3 grants an hour per pubkey), `"1/m"`, `"10/30s"` |
+| `max_accepts` | `usize` | `1` | How many sessions the slot takes before retiring. 1 = a one-shot rendezvous |
 | `bind_retries` | `u32` | `64` | Bind attempts on EADDRINUSE |
 
 **Example:**
@@ -437,22 +437,22 @@ max_accepts    = 1
 - `veil_rendezvous_requests_rejected_bind_failed_total` (counter)
 - `veil_rendezvous_slots_in_use` (gauge) — current number of active on-demand listeners
 
-Grant rate: `granted / received`. A high `rejected_verify_total` with a low `granted` = either clients are mining too weak a PoW (raise `pow_difficulty`), or forge-attempts (rate-limit and anti-abuse are working). A high `rejected_concurrency_total` = `max_concurrent` is too tight for normal load.
+Grant rate is `granted / received`. A high `rejected_verify_total` with a low `granted` means one of two things: clients are mining too weak a PoW (raise `pow_difficulty`), or someone's forging requests (and the rate-limit and anti-abuse layers are doing their job). A high `rejected_concurrency_total` means `max_concurrent` is too tight for normal load.
 
-**What is not yet implemented (Slice 6+):**
+**What isn't built yet (Slice 6+):**
 
-- **Mediator routing**: at this layer only target-side handling of the request frame is implemented, which assumes the requester already has an OVL1 session with the target (which is nonsense for a stealth listener that has no port). Full integration via a PEX/DHT mediator-relay lands in Slice 6.
-- **End-to-end integration tests**: Slice 8.
+- **Mediator routing.** This layer only handles the request frame on the target side, which assumes the requester already has an OVL1 session with the target — nonsense for a stealth listener that has no open port. Full integration through a PEX/DHT mediator-relay lands in Slice 6.
+- **End-to-end integration tests.** Slice 8.
 
-Until Slice 6 the stealth listener operates in "hooks into the dispatch path, but nobody can reach it through a mediator" mode — useful for unit-testing the controller and observing it through metrics during manual frame injection.
+Until Slice 6, the stealth listener runs in a "hooked into the dispatch path, but unreachable through a mediator" mode — useful for unit-testing the controller and watching it through metrics while you inject frames by hand.
 
 ---
 
 ## `[[bootstrap_peers]]`
 
-Bootstrap peers for the initial seeding of the DHT routing table. Used only at startup: the node performs FIND_NODE(self), then the session closes (unless the peer is also listed in `[[peers]]`).
+Bootstrap peers seed the DHT routing table when the node first starts. They're used only at startup: the node runs FIND_NODE(self), then the session closes — unless that peer also appears in `[[peers]]`.
 
-Unlike `[[peers]]`, connections to bootstrap peers are **not maintained** persistently.
+Unlike `[[peers]]`, bootstrap connections aren't kept open.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
@@ -460,7 +460,7 @@ Unlike `[[peers]]`, connections to bootstrap peers are **not maintained** persis
 | `public_key` | `string` | — | Bootstrap node public key (base64). **Required** |
 | `nonce` | `string` | `"AAAAAA=="` | Bootstrap node PoW nonce |
 | `algo` | enum | `"ed25519"` | Signature algorithm. Values: `"ed25519"`, `"falcon512"`, `"ed25519+falcon512"`, `"ed25519+falcon1024"` (the last two are post-quantum hybrids) |
-| `tls_cert` | `string` or absent | unset | PEM certificate (if a TLS transport) |
+| `tls_cert` | `string` or absent | unset | PEM certificate (for a TLS transport) |
 | `tls_ca_cert` | `string` or absent | unset | CA certificate for verification |
 
 **Example:**
@@ -480,14 +480,14 @@ public_key = "MCowBQYDK2VwAyEB..."
 
 ## `[metrics]`
 
-Prometheus metrics exporter (HTTP). The section is optional; if unset — metrics are not exported.
+Prometheus metrics exporter (HTTP). Optional — leave the section out and nothing is exported.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `listen` | `string` | — | Transport URI for the metrics HTTP server — a scheme is **required**, e.g. `"tcp://0.0.0.0:9090"` (a bare `host:port` is rejected). Required when the section is present |
-| `path` | `string` or absent | `"/metrics"` | HTTP path for scraping |
-| `auth_token` | `string` or absent | unset | Bearer token required to scrape. When set, requests without it are rejected |
-| `allow_unauthenticated_remote_metrics` | `bool` | `false` | Allow non-loopback scrapes without a token. Default `false` — remote scrapes require `auth_token` |
+| `listen` | `string` | — | Transport URI for the metrics HTTP server. A scheme is **required**, e.g. `"tcp://0.0.0.0:9090"` (a bare `host:port` is rejected). Required whenever the section is present |
+| `path` | `string` or absent | `"/metrics"` | HTTP path to scrape |
+| `auth_token` | `string` or absent | unset | Bearer token required to scrape. Set it, and requests without it are rejected |
+| `allow_unauthenticated_remote_metrics` | `bool` | `false` | Allow non-loopback scrapes without a token. Default `false` — remote scrapes need `auth_token` |
 
 **Example:**
 
@@ -501,59 +501,52 @@ path   = "/metrics"
 
 ## `[transport]`
 
-Transport-layer settings and censorship-circumvention facilities (DPI evasion). All
-keys are optional.
+Transport-layer settings and the censorship-circumvention tools (DPI evasion). Every key is optional.
 
-> **TLS backend.** For the `veil-cli` binary, the BoringSSL backend is
-> enabled by default (cargo feature `tls-boring`, part of `default = ["rocksdb-cold",
+> **TLS backend.** The `veil-cli` binary uses the BoringSSL backend by default
+> (cargo feature `tls-boring`, part of `default = ["rocksdb-cold",
 > "tls-boring"]`). It produces a Chrome-like JA3/JA4 fingerprint in the TLS
-> ClientHello and supports rotating it. The `rustls` backend is available as a fallback
-> when building with `--no-default-features` and cannot substitute the ClientHello —
-> the `[transport.tls_fingerprint]` subsection is ignored on it.
+> ClientHello and can rotate it. The `rustls` backend is the fallback when you
+> build with `--no-default-features`; it can't shape the ClientHello, so the
+> `[transport.tls_fingerprint]` subsection is ignored there.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `default_sni` | `string` or absent | unset | Default SNI hostname in the TLS ClientHello, when the outbound URI does not set `?sni=...` and the target is not loopback. For example `"www.google.com"` — DPI on the path sees a popular domain instead of the node's real hostname. Unset — use the target host as the SNI |
-| `obfs4_psk_file` | `string` (path) or absent | unset | Path to a file with the obfs4 pre-shared key (32 bytes, base64 on a single line). When set, enables the `obfs4-tcp://` transport: the server checks incoming MACs, the client adds a MAC to outgoing handshakes. A single network-wide PSK. Unset — the `obfs4-tcp` transport is disabled |
-| `webtunnel_secret_path` | `string` or absent | unset | Webtunnel secret path (e.g. `/_t/random-32-chars`). Activates tunnel mode on the server side of the `webtunnel-wss://` transport |
-| `webtunnel_auth_token_file` | `string` (path) or absent | unset | Webtunnel auth-token file (32 random bytes in base64). Passed in the `X-Veil-Auth` header alongside the secret path |
-| `webtunnel_decoy_dir` | `string` (path) or absent | unset | Webtunnel decoy-content directory: static files served to probes that did not match the secret path / auth. A snapshot of a neutral site is recommended. Unset — a minimal built-in HTML page |
-| `outbound_socks_fallback_proxy` | `string` or absent | unset | URL of a SOCKS proxy used as a **fallback** when a direct dial fails repeatedly (AS-level blocking, ISP route interception). Format `socks5://127.0.0.1:9050` (local Tor) or `socks5://proxy.example:1080`. Unset — direct connections only |
-| `bandwidth_mimicry_enabled` | `bool` | `false` | Bandwidth profile mimicry (P2 #7). This is currently a **design landing-pad**: the field is recognized, but the traffic-shaping layer is not yet wired in. Setting it to `true` without `experimental_allow_noop_mimicry` causes a validation error (fail-closed) |
-| `bandwidth_mimicry_profile` | `string` or absent | unset | Profile name for `bandwidth_mimicry_enabled`: `"chrome-browsing"`, `"cdn-download"`, `"interactive-chat"`. Still a pure landing-pad |
-| `experimental_allow_noop_mimicry` | `bool` | `false` | Confirmation that `bandwidth_mimicry_enabled` is currently a no-op landing-pad, and consent to start the daemon without real mimicry. A required pairing with `bandwidth_mimicry_enabled = true` |
-| `obfs4_accept_variants` | `[string]` | `[]` | **Kill-switch, server side**: list of accepted obfs4 wire-format variants in priority order. Empty (resolves to `["v1"]`) preserves pre-Phase-2 behavior. Values: `"v1"`, `"v2"` |
-| `obfs4_client_variant` | `string` or absent | unset | **Kill-switch, client side**: obfs4 wire-format variant for outbound `obfs4-tcp://`. Unset — resolves to `v1`. Values: `"v1"`, `"v2"`. Switch to `"v2"` only after every target server's `obfs4_accept_variants` includes `v2` |
+| `default_sni` | `string` or absent | unset | Default SNI hostname in the TLS ClientHello, used when the outbound URI doesn't set `?sni=...` and the target isn't loopback. Set it to something like `"www.google.com"` and DPI on the path sees a popular domain instead of the node's real hostname. Left unset, the target host is used as the SNI |
+| `obfs4_psk_file` | `string` (path) or absent | unset | Path to a file holding the obfs4 pre-shared key (32 bytes, base64 on one line). Setting it turns on the `obfs4-tcp://` transport: the server checks the MAC on incoming handshakes, the client adds one to outgoing handshakes. A single network-wide PSK. Left unset, the `obfs4-tcp` transport stays off |
+| `webtunnel_secret_path` | `string` or absent | unset | Webtunnel secret path (e.g. `/_t/random-32-chars`). Turns on tunnel mode on the server side of the `webtunnel-wss://` transport |
+| `webtunnel_auth_token_file` | `string` (path) or absent | unset | Webtunnel auth-token file (32 random bytes in base64). Sent in the `X-Veil-Auth` header alongside the secret path |
+| `webtunnel_decoy_dir` | `string` (path) or absent | unset | Webtunnel decoy-content directory: static files served to probes that don't match the secret path or auth. A snapshot of some neutral site works well. Left unset, a minimal built-in HTML page is served |
+| `outbound_socks_fallback_proxy` | `string` or absent | unset | URL of a SOCKS proxy to fall back on when a direct dial keeps failing (AS-level blocking, ISP route interception). Format `socks5://127.0.0.1:9050` (local Tor) or `socks5://proxy.example:1080`. Left unset, only direct connections are tried |
+| `bandwidth_mimicry_enabled` | `bool` | `false` | Bandwidth-profile mimicry (P2 #7). For now this is a **placeholder**: the field is recognized, but the traffic-shaping layer isn't wired in yet. Setting it `true` without `experimental_allow_noop_mimicry` is a validation error (fail-closed) |
+| `bandwidth_mimicry_profile` | `string` or absent | unset | Profile name for `bandwidth_mimicry_enabled`: `"chrome-browsing"`, `"cdn-download"`, `"interactive-chat"`. Still a placeholder |
+| `experimental_allow_noop_mimicry` | `bool` | `false` | Acknowledges that `bandwidth_mimicry_enabled` is a no-op placeholder for now, and agrees to start the daemon without real mimicry. Required alongside `bandwidth_mimicry_enabled = true` |
+| `obfs4_accept_variants` | `[string]` | `[]` | **Kill-switch, server side**: which obfs4 wire-format variants to accept, in priority order. Empty (resolves to `["v1"]`) keeps the pre-Phase-2 behavior. Values: `"v1"`, `"v2"` |
+| `obfs4_client_variant` | `string` or absent | unset | **Kill-switch, client side**: the obfs4 wire-format variant for outbound `obfs4-tcp://`. Left unset, it resolves to `v1`. Values: `"v1"`, `"v2"`. Switch to `"v2"` only once every target server's `obfs4_accept_variants` includes `v2` |
 
 ### `[transport.rotation]`
 
-Transport-connection rotation policy. Periodically and forcibly
-recreates the underlying TCP/TLS connection of each session, so that DPI
-classification by flow lifetime (e.g. "this HTTPS session has been alive for 6 hours — that's a VPN")
-loses its signal. Each session, at the handshake, picks a random lifetime from
-the `[min_lifetime_secs, max_lifetime_secs]` range. The section is **always
-serialized** (as a censorship-circumvention facility, the operator must see it in their
-config).
+Rotates transport connections on a schedule. It tears down and rebuilds each session's underlying TCP/TLS connection, so DPI can't classify a flow by how long it's lived (the "this HTTPS session has been up for 6 hours — must be a VPN" heuristic loses its signal). At the handshake, every session picks a random lifetime from the `[min_lifetime_secs, max_lifetime_secs]` range. The section is **always serialized** — as a censorship-circumvention tool, the operator should see it in their config.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `min_lifetime_secs` | `i64` | `1800` | Minimum session lifetime in seconds (30 min). `-1` — disable the entire rotation mechanism. Positive values < 60 are rejected by validation |
-| `max_lifetime_secs` | `i64` | `3600` | Maximum session lifetime in seconds (1 hour). `-1` — disable rotation. Must be `>= min_lifetime_secs` when both are positive |
+| `min_lifetime_secs` | `i64` | `1800` | Shortest session lifetime, in seconds (30 min). `-1` turns the whole rotation mechanism off. Positive values under 60 are rejected by validation |
+| `max_lifetime_secs` | `i64` | `3600` | Longest session lifetime, in seconds (1 hour). `-1` turns rotation off. Must be `>= min_lifetime_secs` when both are positive |
 
 ### `[transport.tls_fingerprint]`
 
-TLS ClientHello fingerprint policy for outbound `tls://` / `wss://`
-connections. Active **only on builds with `tls-boring`** (the `rustls` backend
-cannot change the ClientHello and ignores this section). The section is **always
-serialized** — like `[transport.rotation]`, it is a censorship-circumvention control,
-discoverable by reading the config.
+Controls the TLS ClientHello fingerprint on outbound `tls://` / `wss://`
+connections. Active **only on builds with `tls-boring`** — the `rustls` backend
+can't change the ClientHello and ignores this section. The section is **always
+serialized**; like `[transport.rotation]`, it's a censorship-circumvention
+control, so it stays visible in the config.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `mode` | enum | `"rotate"` | Mode: `"pinned"` (always `profile`), `"rotate"` (cycle through the profiles in `rotation` on fresh connections until one completes the handshake), `"random"` (a fresh randomized ClientHello on every connection). The default is `"rotate"` — resilient to blocking: when one JA3 is blocked, the node switches to another |
+| `mode` | enum | `"rotate"` | How the fingerprint is chosen: `"pinned"` (always `profile`), `"rotate"` (cycle through the profiles in `rotation` on fresh connections until one completes the handshake), `"random"` (a fresh randomized ClientHello every time). The default `"rotate"` rides out blocking — when one JA3 is blocked, the node moves to the next |
 | `profile` | enum | `"chrome"` | Profile for `"pinned"` mode. Profile tokens: `chrome`, `firefox`, `safari`, `ios`, `android`, `random` |
-| `rotation` | `[string]` | `["chrome", "firefox", "safari"]` | Ordered list of profiles to cycle through in `"rotate"` mode |
-| `sticky` | `bool` | `true` | In `"rotate"` mode, keep using the last profile that completed the handshake instead of cycling again from the start |
+| `rotation` | `[string]` | `["chrome", "firefox", "safari"]` | The ordered list of profiles to cycle through in `"rotate"` mode |
+| `sticky` | `bool` | `true` | In `"rotate"` mode, stick with the last profile that completed a handshake instead of starting the cycle over |
 
 ### `[transport.tls_client]`
 
@@ -562,7 +555,7 @@ Trust store for the node's **outbound** TLS (HTTPS bootstrap, webtunnel). Option
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
 | `connect_timeout_ms` | `u64` or absent | unset | Connect timeout for outbound TLS, in ms |
-| `use_system_roots` | `bool` | `false` | Include Mozilla's webpki-roots CA bundle in the client trust store. Default `false` — veil trusts only operator-pinned CAs via `trusted_ca_file`. Set `true` for mesh nodes reaching publicly-certified hosts |
+| `use_system_roots` | `bool` | `false` | Add Mozilla's webpki-roots CA bundle to the client trust store. Default `false` — veil trusts only the operator-pinned CAs in `trusted_ca_file`. Set `true` for mesh nodes that reach publicly-certified hosts |
 | `trusted_ca_file` | `string` or absent | unset | PEM file of the operator-pinned CA(s) to trust |
 
 **Example:**
@@ -587,20 +580,20 @@ sticky   = true
 
 ## `[mesh]`
 
-Configuration for the local UDP mesh network (neighbor discovery within a single segment). The section is optional.
+Settings for the local UDP mesh — discovering neighbors within a single network segment. Optional.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
 | `bind_addr` | `string` | — | UDP address for the realm listener, e.g. `"0.0.0.0:9100"`. **Required** when the section is present |
 | `realm_id` | `string` | — | 32 hex characters (16 bytes) — the realm identifier. **Required** |
-| `beacon_addr` | `string` | `"255.255.255.255:9100"` | Broadcast/multicast address for beacon discovery. The **port** here is the one remaining beacon traffic-shape signal (size and cadence are already hidden when `realm_psk` is set, C-03) — on a hostile LAN, set a non-default port (all realm members must match) |
-| `autodiscover_gateway` | `bool` | `true` | Automatically connect to gateway nodes discovered via mesh beacons |
-| `autodiscover_max_concurrent` | `usize` | `3` | Maximum simultaneous outbound sessions to auto-discovered gateways |
-| `beacon_dedup_window_secs` | `u64` | `3` | Deduplication window for beacons from a single source, in seconds. `0` — disable deduplication |
-| `autodiscover_persist_path` | `string` or absent | unset | Path for persisting the `AutoDiscoveredPeers` table. Restored at startup so the nearest gateways are known before the first beacon |
-| `require_signed_beacons` | `bool` | `true` | When `true` (default, C-03), only cryptographically-signed mesh beacons are accepted; unsigned beacons are dropped, closing the on-link gateway-injection / neighbor-redirect vector. Set `false` only for legacy interop with deployments still emitting unsigned beacons — flipping signed-on across a live unsigned network partitions those nodes, so roll signed beacons out fleet-wide first |
-| `advertise_role_in_beacon` | `bool` | `false` | When `true`, the node advertises its role flags (`IS_GATEWAY` / `IS_RELAY` / `HAS_INTERNET`) in its mesh beacon — required for `autodiscover_gateway` peers to recognise this node as a gateway. Default `false` (C-03): the beacon carries `role_flags = 0`, so a passive on-link observer cannot single the node out as a gateway/relay (a targeting/censorship signal). The stable `node_id` is still broadcast regardless |
-| `realm_psk` | `string` or absent | unset | **Opt-in UDP obfuscation.** Base64-encoded pre-shared key (≥ 16 bytes decoded). When set, mesh **DATA** datagrams **and discovery beacons** are AEAD-wrapped (`veil-udp-obfs`: ChaCha20-Poly1305, fresh random nonce + random padding per datagram) so a passive DPI/LAN observer sees only rotating ciphertext — the mesh framing **and the stable `node_id` / role flags / dial address carried in beacons** are hidden (closes C-03; discovery then requires the PSK, expected for a protected realm). The key is realm-wide (HKDF-derived from the PSK and `realm_id`); **all realm members must share the same PSK**, distributed out-of-band. Unset (default) → plaintext mesh + plaintext beacons, byte-for-byte unchanged behaviour. A configured-but-invalid/too-short PSK **disables the mesh** rather than silently falling back to plaintext |
+| `beacon_addr` | `string` | `"255.255.255.255:9100"` | Broadcast/multicast address for beacon discovery. The **port** is the last remaining traffic-shape signal a beacon gives off (size and cadence are already hidden once `realm_psk` is set, C-03) — on a hostile LAN, pick a non-default port (every realm member must match) |
+| `autodiscover_gateway` | `bool` | `true` | Automatically connect to gateway nodes found via mesh beacons |
+| `autodiscover_max_concurrent` | `usize` | `3` | Most outbound sessions to auto-discovered gateways at once |
+| `beacon_dedup_window_secs` | `u64` | `3` | How long to ignore repeat beacons from the same source, in seconds. `0` turns deduplication off |
+| `autodiscover_persist_path` | `string` or absent | unset | Where to persist the `AutoDiscoveredPeers` table. Restored at startup, so the nearest gateways are known before the first beacon arrives |
+| `require_signed_beacons` | `bool` | `true` | When `true` (default, C-03), only cryptographically-signed mesh beacons are accepted and unsigned ones are dropped, closing the on-link gateway-injection / neighbor-redirect hole. Set `false` only to interop with older deployments still sending unsigned beacons — turning signed-only on across a live unsigned network partitions those nodes, so roll signed beacons out fleet-wide first |
+| `advertise_role_in_beacon` | `bool` | `false` | When `true`, the node advertises its role flags (`IS_GATEWAY` / `IS_RELAY` / `HAS_INTERNET`) in its mesh beacon — which `autodiscover_gateway` peers need in order to recognize it as a gateway. Default `false` (C-03): the beacon carries `role_flags = 0`, so a passive on-link observer can't pick the node out as a gateway/relay (a targeting/censorship signal). The stable `node_id` is broadcast either way |
+| `realm_psk` | `string` or absent | unset | **Opt-in UDP obfuscation.** A base64-encoded pre-shared key (≥ 16 bytes decoded). When set, mesh **DATA** datagrams **and discovery beacons** are AEAD-wrapped (`veil-udp-obfs`: ChaCha20-Poly1305, a fresh random nonce + random padding per datagram), so a passive DPI/LAN observer sees only rotating ciphertext — the mesh framing **and the stable `node_id` / role flags / dial address inside beacons** are hidden (closes C-03; discovery then needs the PSK, as you'd expect for a protected realm). The key is realm-wide (HKDF-derived from the PSK and `realm_id`); **every realm member must share the same PSK**, handed out out-of-band. Left unset (default) → plaintext mesh + plaintext beacons, behavior byte-for-byte unchanged. A PSK that's set but invalid or too short **disables the mesh** rather than quietly falling back to plaintext |
 
 **Example:**
 
@@ -618,18 +611,18 @@ autodiscover_persist_path  = "/var/lib/veil/autodiscover.bin"
 
 ## `[mailbox]`
 
-Mailbox configuration — message storage for offline recipients.
+Mailbox settings — where messages wait for recipients who are offline.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `enabled` | `bool` | `false` | Master switch — a node only runs a mailbox if you opt in |
+| `enabled` | `bool` | `false` | Master switch — a node runs a mailbox only if you opt in |
 | `quota_per_receiver_bytes` | `u64` | `0` (crate default) | Per-receiver storage quota in bytes. `0` = built-in default |
 | `quota_global_bytes` | `u64` | `0` (crate default) | Global per-relay storage quota in bytes. `0` = built-in default |
-| `quota_per_sender_bytes` | `u64` | `0` (crate default ≈ 10 MiB) | Per-sender byte quota. `0` = built-in default; set `u64::MAX` to effectively disable accounting |
-| `ttl_secs` | `u64` | `0` (crate default 7 days) | Stored-blob TTL in seconds. `0` = built-in default |
+| `quota_per_sender_bytes` | `u64` | `0` (crate default ≈ 10 MiB) | Per-sender byte quota. `0` = built-in default; `u64::MAX` effectively turns accounting off |
+| `ttl_secs` | `u64` | `0` (crate default 7 days) | How long a stored blob lives, in seconds. `0` = built-in default |
 | `rate_limit_per_minute` | `u32` | `0` (crate default) | Per-receiver PUT rate limit. `0` = built-in default |
-| `require_capability_token` | `bool` | `false` | When `true`, tokenless PUTs are rejected with `CapabilityRequired` |
-| `[mailbox.push]` | table | absent | Push-provider credentials (FCM / APNs). Absent ⇒ log-only dispatcher (puts logged, no provider API call) |
+| `require_capability_token` | `bool` | `false` | When `true`, PUTs without a token are rejected with `CapabilityRequired` |
+| `[mailbox.push]` | table | absent | Push-provider credentials (FCM / APNs). Leave it out and you get a log-only dispatcher — puts are logged, with no provider API call |
 
 **Example:**
 
@@ -643,7 +636,7 @@ require_capability_token = true
 
 ### `[mailbox.push]`
 
-Push-notification provider credentials (FCM / APNs). When empty, the daemon uses a log-only dispatcher (puts are logged, no provider call).
+Push-notification provider credentials (FCM / APNs). Leave it empty and the daemon falls back to a log-only dispatcher — puts are logged, with no provider call.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
@@ -658,14 +651,14 @@ Push-notification provider credentials (FCM / APNs). When empty, the daemon uses
 
 ## `[ipc]`
 
-Configuration of the IPC server for connecting local applications via a Unix socket.
+The IPC server, which lets local applications connect over a Unix socket.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `enabled` | `bool` | `false` | Enable the IPC server |
-| `socket_uri` | `string` or absent | `~/.veil/app.sock` | IPC endpoint. Accepts a Unix path / `unix:///abs/path`, or `tcp://127.0.0.1:0?runtime_dir=...` (TCP loopback — the Windows path) |
-| `e2e_key_ttl_secs` | `u64` | `3600` | TTL of the cache of peers' ML-KEM-768 encapsulation keys, in seconds. After expiry — a new `RouteRequest/RouteResponse` for a fresh key |
-| `app_socket_dir` | `string` or absent | unset | Directory where the node opens an additional per-app Unix socket `{app_socket_dir}/{hex(app_id)}.sock` for app-scoped IPC |
+| `enabled` | `bool` | `false` | Turn the IPC server on |
+| `socket_uri` | `string` or absent | `~/.veil/app.sock` | IPC endpoint. Takes a Unix path / `unix:///abs/path`, or `tcp://127.0.0.1:0?runtime_dir=...` (TCP loopback — the Windows route) |
+| `e2e_key_ttl_secs` | `u64` | `3600` | How long peers' ML-KEM-768 encapsulation keys stay cached, in seconds. Once they expire, a fresh `RouteRequest/RouteResponse` fetches a new key |
+| `app_socket_dir` | `string` or absent | unset | Directory where the node opens an extra per-app Unix socket, `{app_socket_dir}/{hex(app_id)}.sock`, for app-scoped IPC |
 
 **Example:**
 
@@ -680,7 +673,7 @@ e2e_key_ttl_secs = 1800
 
 ## `[priority_weights]`
 
-Weighted Round Robin (WRR) weights for the 4 traffic classes in the outbound scheduler.
+Weighted Round Robin (WRR) weights for the four traffic classes in the outbound scheduler.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
@@ -689,7 +682,7 @@ Weighted Round Robin (WRR) weights for the 4 traffic classes in the outbound sch
 | `bulk` | `u32` | `2` | Weight for BULK traffic (file transfer) |
 | `background` | `u32` | `1` | Weight for BACKGROUND traffic (background sync) |
 
-The node sends `realtime` REALTIME-class frames for every `background` BACKGROUND frames.
+For every `background` BACKGROUND frames the node sends, it sends `realtime` REALTIME-class frames.
 
 **Example:**
 
@@ -705,26 +698,26 @@ background  = 1
 
 ## `[proxy]`
 
-Proxy functionality of the veil node.
+The veil node's proxy features.
 
 ### `[proxy.socks5]`
 
-SOCKS5 proxy: the node accepts SOCKS5 CONNECT and tunnels TCP over the veil to an exit node.
+SOCKS5 proxy: the node accepts SOCKS5 CONNECT and tunnels the TCP over veil to an exit node.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `enabled` | `bool` | `false` | Enable the SOCKS5 listener |
+| `enabled` | `bool` | `false` | Turn the SOCKS5 listener on |
 | `listen` | `string` | `"127.0.0.1:1080"` | TCP address for the SOCKS5 listener |
-| `exit_node_id` | `string` or absent | unset | Pin the exit by hex node_id — SOCKS5 traffic is tunneled to this node. If unset, an exit is chosen dynamically |
+| `exit_node_id` | `string` or absent | unset | Pin the exit by hex node_id — SOCKS5 traffic is tunneled to this node. Left unset, an exit is picked dynamically |
 
 ### `[proxy.exit]`
 
-Exit proxy: the node accepts veil proxy-connect streams and establishes outbound TCP connections.
+Exit proxy: the node accepts veil proxy-connect streams and opens the outbound TCP connections for them.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `enabled` | `bool` | `false` | Enable the exit proxy. When `true`, this node forwards connections to external TCP addresses |
-| `allow_private` | `bool` | `false` | Allow exit connections to private/RFC1918 ranges (10/8, 172.16/12, 192.168/16, loopback). Default `false` — blocked (SSRF guard) |
+| `enabled` | `bool` | `false` | Turn the exit proxy on. When `true`, this node forwards connections to external TCP addresses |
+| `allow_private` | `bool` | `false` | Allow exit connections to private/RFC1918 ranges (10/8, 172.16/12, 192.168/16, loopback). Default `false` — blocked, as an SSRF guard |
 
 **Example:**
 
@@ -741,10 +734,10 @@ enabled = true
 
 ## `[tun]`
 
-> **Moved.** The TUN/TAP veil-VPN was extracted into the separate **`ogate`**
-> binary and is now configured in its own `ogate.toml` (per-network `peers[]`
-> allowlist, `iface_name`, `mode`, `mtu`, …). The main node config no longer has
-> a `[tun]` section — see **[ogate.md](ogate.md)**.
+> **Moved.** The TUN/TAP veil-VPN now lives in its own **`ogate`** binary,
+> configured through its own `ogate.toml` (per-network `peers[]` allowlist,
+> `iface_name`, `mode`, `mtu`, …). The main node config no longer has a `[tun]`
+> section — see **[ogate.md](ogate.md)**.
 
 ---
 
@@ -754,27 +747,27 @@ Session-layer settings: keepalive, idle timeout, queues.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `keepalive_interval_secs` | `u64` | `30` | Interval for sending keepalive frames, in seconds. `0` — disable |
-| `idle_timeout_secs` | `u64` | `90` | Close the session if no frame is received within this time. Must be > `keepalive_interval_secs` |
-| `max_concurrent` | `usize` | `512` | Maximum simultaneous OVL1 sessions |
-| `max_per_ip` | `usize` | `32` | Maximum inbound sessions from a single IP address |
-| `max_pending_responses` | `usize` | `256` | Maximum pending RPC responses per session. Excess — dropped |
-| `pending_response_ttl_ms` | `u64` | `30000` | TTL of a pending-response slot in ms. Stale ones are evicted |
-| `tx_queue_depth` | `usize` | `4096` | Size of the outbound-frame channel per session. Overflow — dropped |
+| `keepalive_interval_secs` | `u64` | `30` | How often to send keepalive frames, in seconds. `0` turns them off |
+| `idle_timeout_secs` | `u64` | `90` | Close the session if no frame arrives within this window. Must be > `keepalive_interval_secs` |
+| `max_concurrent` | `usize` | `512` | Most OVL1 sessions open at once |
+| `max_per_ip` | `usize` | `32` | Most inbound sessions from a single IP address |
+| `max_pending_responses` | `usize` | `256` | Most pending RPC responses per session. Anything beyond is dropped |
+| `pending_response_ttl_ms` | `u64` | `30000` | How long a pending-response slot lives, in ms. Stale ones are evicted |
+| `tx_queue_depth` | `usize` | `4096` | Size of the outbound-frame channel per session. On overflow, frames are dropped |
 | `outbox_depth` | `usize` | `256` | Size of the RPC outbox per session. When the channel is full, `send_request()` returns `None` |
-| `max_frame_body_bytes` | `u32` | 1 MiB | Maximum frame body size. Larger frames are rejected. Hard ceiling: 16 MiB |
+| `max_frame_body_bytes` | `u32` | 1 MiB | Largest allowed frame body; bigger frames are rejected. Hard ceiling: 16 MiB |
 | `qos_weights` | `[u8; 4]` | `[8, 4, 2, 1]` | WRR weights for the classes `[RealTime, Interactive, Bulk, Background]` within a session |
-| `rt_queue_len` | `usize` | `64` | Depth of the REALTIME queue per session. Overflow — dropped |
-| `bg_queue_len` | `usize` | `256` | Depth of the BACKGROUND queue per session. Overflow — dropped |
-| `rekey_bytes_threshold` | `u64` | 128 GiB (`137_438_953_472`) | Initiate a rekey after this volume of bytes transferred per session |
-| `rekey_time_threshold_secs` | `u64` | 32 days (`2_764_800`) | Initiate a rekey after this time since the last rekey or session start |
-| `max_per_subnet` | `usize` | `64` | Maximum inbound sessions from a single /24 (IPv4) or /48 (IPv6) subnet |
-| `battery_threshold_low` | `u8` | `20` | Battery % at or below which the "low" keepalive scaling applies |
-| `battery_threshold_medium` | `u8` | `50` | Battery % at or below which the "medium" keepalive scaling applies |
+| `rt_queue_len` | `usize` | `64` | Depth of the REALTIME queue per session. On overflow, frames are dropped |
+| `bg_queue_len` | `usize` | `256` | Depth of the BACKGROUND queue per session. On overflow, frames are dropped |
+| `rekey_bytes_threshold` | `u64` | 128 GiB (`137_438_953_472`) | Rekey once this many bytes have moved through the session |
+| `rekey_time_threshold_secs` | `u64` | 32 days (`2_764_800`) | Rekey once this long has passed since the last rekey or the session start |
+| `max_per_subnet` | `usize` | `64` | Most inbound sessions from a single /24 (IPv4) or /48 (IPv6) subnet |
+| `battery_threshold_low` | `u8` | `20` | Battery % at or below which the "low" keepalive scaling kicks in |
+| `battery_threshold_medium` | `u8` | `50` | Battery % at or below which the "medium" keepalive scaling kicks in |
 | `battery_keepalive_scale_low` | `f32` | `4.0` | Keepalive-interval multiplier when battery ≤ `battery_threshold_low` |
 | `battery_keepalive_scale_medium` | `f32` | `2.0` | Keepalive-interval multiplier when battery ≤ `battery_threshold_medium` |
-| `battery_sync_threshold` | `u8` | `15` | Battery % below which background sync is suppressed |
-| `allowed_peer_algos` | `[enum]` | `[]` | Allowlist of peer signature algorithms accepted at handshake (`"ed25519"`, `"falcon512"`, hybrids). Empty = accept all supported |
+| `battery_sync_threshold` | `u8` | `15` | Battery % below which background sync is held off |
+| `allowed_peer_algos` | `[enum]` | `[]` | Allowlist of peer signature algorithms accepted at the handshake (`"ed25519"`, `"falcon512"`, hybrids). Empty = accept everything supported |
 
 **Example:**
 
@@ -792,39 +785,38 @@ rekey_time_threshold_secs  = 604800         # 7 days
 
 ### `[session.padding]`
 
-Outbound traffic shaping (anti-fingerprinting). Optional.
+Shapes outbound traffic to resist fingerprinting. Optional.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `mode` | enum | `"adaptive"` | Padding mode: `"adaptive"` (size-bucket padding), `"none"` (off), `"full"` (maximum padding) |
-| `jitter_ms` | `u32` | `0` | Maximum random delay (ms) added to each outbound frame. `0` = no jitter |
-| `cover_interval_ms` | `u32` | `0` | Interval (ms) between cover (dummy) frames during idle sessions. `0` = no cover traffic |
+| `mode` | enum | `"adaptive"` | Padding mode: `"adaptive"` (pad to size buckets), `"none"` (off), `"full"` (maximum padding) |
+| `jitter_ms` | `u32` | `0` | Largest random delay (ms) added to each outbound frame. `0` = no jitter |
+| `cover_interval_ms` | `u32` | `0` | Gap (ms) between cover (dummy) frames while a session sits idle. `0` = no cover traffic |
 
 ---
 
 ## `[hot_standby]`
 
-Warm-standby transport: keep a second transport primed so a failing primary can be swapped without dropping the session. Optional.
+Keeps a second transport primed so a failing primary can be swapped out without dropping the session. Optional.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `enabled` | `bool` | `false` | Enable hot-standby transport swapping |
-| `handoff_timeout_secs` | `u64` | `5` | Deadline for completing a handoff before it is aborted |
-| `max_swaps_per_minute` | `u32` | `4` | Rate cap on transport swaps (anti-flap) |
-| `auto_trigger_after_write_errors` | `u32` | `3` | Consecutive write errors on the primary that auto-trigger a swap |
+| `enabled` | `bool` | `false` | Turn hot-standby transport swapping on |
+| `handoff_timeout_secs` | `u64` | `5` | How long a handoff has to finish before it's aborted |
+| `max_swaps_per_minute` | `u32` | `4` | Cap on transport swaps per minute, to stop flapping |
+| `auto_trigger_after_write_errors` | `u32` | `3` | How many write errors in a row on the primary auto-trigger a swap |
 
 ---
 
 ## `[gateway]`
 
-Gateway-functionality settings (attachment records for leaf nodes).
-Available only for Core nodes.
+Gateway settings (attachment records for leaf nodes). Core nodes only.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `enabled` | `bool` | `true` | Enable the gateway (attachment records for leaf nodes). Can be disabled on a Core node |
-| `attachment_lease_ttl_secs` | `u64` | `300` | Lifetime of an attachment lease without keepalive, in seconds |
-| `keepalive_interval_secs` | `u64` | `60` | Interval for sending leaf→core keepalives, in seconds. `0` — disable (not recommended in production) |
+| `enabled` | `bool` | `true` | Turn the gateway on (attachment records for leaf nodes). Can be switched off on a Core node |
+| `attachment_lease_ttl_secs` | `u64` | `300` | How long an attachment lease survives without a keepalive, in seconds |
+| `keepalive_interval_secs` | `u64` | `60` | How often a leaf sends its core keepalive, in seconds. `0` turns it off (not recommended in production) |
 
 **Example:**
 
@@ -838,14 +830,14 @@ keepalive_interval_secs   = 120
 
 ## `[nat]`
 
-NAT-traversal configuration (hole punching + relay fallback).
+NAT traversal (hole punching, with a relay to fall back on).
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `enabled` | `bool` | `true` | Enable NAT traversal. `false` — only if all peers are directly reachable |
-| `punch_timeout_ms` | `u64` | `3000` | Maximum wait time for a UDP hole-punch, in ms. Then — relay fallback |
-| `stun_servers` | `[string]` | `[]` | List of external STUN servers (`"host:port"`, RFC 5389). If empty — the address is determined via the veil (a core node reflects the source) |
-| `relay_enabled` | `bool` | `true` | Allow relay fallback when hole-punch fails |
+| `enabled` | `bool` | `true` | Turn NAT traversal on. Set `false` only when every peer is directly reachable |
+| `punch_timeout_ms` | `u64` | `3000` | How long to wait for a UDP hole-punch, in ms, before falling back to a relay |
+| `stun_servers` | `[string]` | `[]` | External STUN servers (`"host:port"`, RFC 5389). Left empty, the address is found through veil itself — a core node reflects the source |
+| `relay_enabled` | `bool` | `true` | Allow falling back to a relay when the hole-punch fails |
 
 **Example:**
 
@@ -861,31 +853,31 @@ stun_servers     = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
 
 ## `[pow]`
 
-Settings for the PoW rate limiter for `PowChallenge` frames.
+The rate limiter for `PowChallenge` frames.
 
-Relevant only when `abuse.pow_min_difficulty > 0`.
+Only matters when `abuse.pow_min_difficulty > 0`.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `challenge_rate` | `f64` | `1.0` | Sustained rate of issuing PoW challenges per peer per second |
-| `challenge_burst` | `f64` | `1.0` | Permitted burst for the PoW rate limiter per peer. Burst=1 is enough for a legitimate `RouteRequest` flow |
-| `challenge_window_secs` | `u64` | `300` | Sliding window of PoW rate-limiter state, in seconds |
+| `challenge_rate` | `f64` | `1.0` | Steady rate of PoW challenges issued, per peer per second |
+| `challenge_burst` | `f64` | `1.0` | Burst the PoW rate limiter allows per peer. A burst of 1 is plenty for a legitimate `RouteRequest` flow |
+| `challenge_window_secs` | `u64` | `300` | Sliding window the PoW rate-limiter state covers, in seconds |
 
 ---
 
 ## `[connection]`
 
-Settings for outbound reconnects and gateway failover.
+Outbound reconnects and gateway failover.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `reconnect_backoff_min_ms` | `u64` | `1000` | Minimum reconnect interval in ms |
-| `reconnect_backoff_max_ms` | `u64` | `300000` | Maximum reconnect interval in ms (5 minutes) |
-| `prefer_internet_gateway` | `bool` | `true` | Prefer a gateway with the `HAS_INTERNET` flag for routing to global nodes. `false` — use the nearest gateway regardless of internet access |
-| `gateway_failover_delay_secs` | `u64` | `5` | Minimum gateway-unavailability time (sec) before switching. Short outages are ignored |
-| `exit_diversification` | `bool` | `false` | Sample exit-gateway selection weighted-random from the top-K candidates instead of always the single best — reduces statistical fingerprinting (one fat flow to one IP is distinctive) |
-| `exit_diversification_top_k` | `u8` | `4` | Window size for `exit_diversification`: pick from the top-K gateways by score |
-| `reconnect_quiet_after_failures` | `u32` | `5` | Consecutive reconnect failures after which per-attempt logs drop WARN→DEBUG (keeps retrying; emits `INFO peer.recovered` on recovery). `0` keeps WARN forever |
+| `reconnect_backoff_min_ms` | `u64` | `1000` | Shortest reconnect interval, in ms |
+| `reconnect_backoff_max_ms` | `u64` | `300000` | Longest reconnect interval, in ms (5 minutes) |
+| `prefer_internet_gateway` | `bool` | `true` | Favor a gateway with the `HAS_INTERNET` flag when routing to global nodes. `false` uses the nearest gateway, internet access or not |
+| `gateway_failover_delay_secs` | `u64` | `5` | How long a gateway must stay unavailable (sec) before switching away. Brief outages are ignored |
+| `exit_diversification` | `bool` | `false` | Pick the exit gateway weighted-random from the top-K candidates instead of always the single best — cuts down statistical fingerprinting, since one fat flow to one IP stands out |
+| `exit_diversification_top_k` | `u8` | `4` | Window for `exit_diversification`: choose from the top-K gateways by score |
+| `reconnect_quiet_after_failures` | `u32` | `5` | After this many reconnect failures in a row, per-attempt logs drop from WARN to DEBUG (it keeps retrying, and emits `INFO peer.recovered` once it's back). `0` keeps them at WARN forever |
 
 **Example:**
 
@@ -901,17 +893,17 @@ gateway_failover_delay_secs  = 10
 
 ## `[capacity]`
 
-Load-shedding limits for relay nodes. `0` = no limit.
+Load-shedding limits for relay nodes. `0` means no limit.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `max_relay_sessions` | `usize` | `0` | Maximum simultaneous relay sessions. `0` — no limit |
-| `max_total_sessions` | `usize` | `0` | Maximum of all sessions (relay + direct). `0` — no limit |
-| `tx_queue_high_watermark` | `f64` | `0.8` | TX-queue fill fraction at which the node is considered overloaded (0.0–1.0) |
-| `congestion_high` | `f64` | `0.8` | Congestion-score threshold above which the node drops new relay sessions |
-| `congestion_low` | `f64` | `0.6` | Congestion-score threshold below which the node resumes accepting relay sessions (hysteresis) |
-| `max_inbound_bandwidth_kbps` | `i64` | `10000000` | Per-node aggregate inbound bandwidth cap in kbps (10 Gbit/s default). `-1` — unlimited |
-| `max_outbound_bandwidth_kbps` | `i64` | `10000000` | Per-node aggregate outbound bandwidth cap in kbps. `-1` — unlimited |
+| `max_relay_sessions` | `usize` | `0` | Most relay sessions at once. `0` = no limit |
+| `max_total_sessions` | `usize` | `0` | Most sessions of any kind (relay + direct). `0` = no limit |
+| `tx_queue_high_watermark` | `f64` | `0.8` | TX-queue fill fraction at which the node counts as overloaded (0.0–1.0) |
+| `congestion_high` | `f64` | `0.8` | Congestion-score threshold above which the node stops taking new relay sessions |
+| `congestion_low` | `f64` | `0.6` | Congestion-score threshold below which it starts taking relay sessions again (the hysteresis) |
+| `max_inbound_bandwidth_kbps` | `i64` | `10000000` | Per-node total inbound bandwidth cap in kbps (default 10 Gbit/s). `-1` = unlimited |
+| `max_outbound_bandwidth_kbps` | `i64` | `10000000` | Per-node total outbound bandwidth cap in kbps. `-1` = unlimited |
 
 **Example:**
 
@@ -932,13 +924,13 @@ Abuse protection: rate limiting, mailbox quotas, PoW, bans.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `rate_limit_fps` | `f64` | `200000.0` | Per-peer sustained frame rate (frames/sec) |
+| `rate_limit_fps` | `f64` | `200000.0` | Steady per-peer frame rate (frames/sec) |
 | `rate_limit_burst` | `f64` | `400000.0` | Per-peer burst frame quota |
-| `pow_min_difficulty` | `u32` | `16` | Leading-zero bits required in the `RouteRequest`/`PowChallenge` PoW (≈65k hashes, <1 ms). `0` disables (dev only); hard cap is `MAX_POW_DIFFICULTY = 24` |
-| `ban_threshold` | `u32` | `5` | Protocol violations before a temporary ban |
-| `ban_initial_secs` | `u64` | `5` | Duration of the first ban (seconds) |
-| `ban_step_secs` | `u64` | `5` | Added per subsequent ban — progressive: Nth ban = `ban_initial_secs + N × ban_step_secs`, capped at `ban_max_secs` |
-| `ban_max_secs` | `u64` | `3600` | Ceiling for the progressive ban duration (seconds) |
+| `pow_min_difficulty` | `u32` | `16` | Leading-zero bits required in the `RouteRequest`/`PowChallenge` PoW (≈65k hashes, <1 ms). `0` turns it off (dev only); the hard cap is `MAX_POW_DIFFICULTY = 24` |
+| `ban_threshold` | `u32` | `5` | How many protocol violations earn a temporary ban |
+| `ban_initial_secs` | `u64` | `5` | Length of the first ban (seconds) |
+| `ban_step_secs` | `u64` | `5` | Added to each later ban — it grows step by step: the Nth ban is `ban_initial_secs + N × ban_step_secs`, capped at `ban_max_secs` |
+| `ban_max_secs` | `u64` | `3600` | Ceiling on the growing ban duration (seconds) |
 
 **Example (production settings):**
 
@@ -957,42 +949,42 @@ ban_max_secs       = 7200
 
 ## `[routing]`
 
-Fine-tuning of the routing plane.
+Fine-tuning for the routing plane.
 
 ### Core parameters
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `route_probe_interval_secs` | `u64` | `30` | Interval for sending ROUTE_PROBE in seconds |
-| `reannounce_interval_secs` | `u64` | `30` | Interval for re-announcing routes in seconds |
-| `route_cache_ttl_secs` | `u64` | `120` | TTL of entries in the route cache |
-| `route_request_backoff_ms` | `[u64; 3]` | `[500, 1000, 2000]` | Backoff for RouteRequest retries: [attempt0, attempt1, attempt2] ms |
-| `partition_score_threshold` | `f64` | `0.2` | Minimum `network_reachability_score` (0.0–1.0) before logging a network partition. `0.0` — disable |
+| `route_probe_interval_secs` | `u64` | `30` | How often to send ROUTE_PROBE, in seconds |
+| `reannounce_interval_secs` | `u64` | `30` | How often to re-announce routes, in seconds |
+| `route_cache_ttl_secs` | `u64` | `120` | How long route-cache entries live |
+| `route_request_backoff_ms` | `[u64; 3]` | `[500, 1000, 2000]` | Backoff between RouteRequest retries: [attempt0, attempt1, attempt2] ms |
+| `partition_score_threshold` | `f64` | `0.2` | The `network_reachability_score` (0.0–1.0) below which a network partition is logged. `0.0` turns the check off |
 | `route_seen_capacity` | `usize` | `4096` | Size of the route-deduplication cache |
-| `route_seen_window_secs` | `u64` | `120` | Route-deduplication window in seconds |
-| `max_gossip_hops` | `u8` | `2` | Maximum TTL of gossip frames. Frames with a higher hop count are dropped |
+| `route_seen_window_secs` | `u64` | `120` | Route-deduplication window, in seconds |
+| `max_gossip_hops` | `u8` | `2` | Maximum TTL for gossip frames. Frames past this hop count are dropped |
 
 ### ECMP and redundant send
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `ecmp_score_band` | `f64` | `0.20` | Maximum relative score difference for including a route in the ECMP group. `0.0` — disable ECMP |
-| `redundant_send` | `bool` | `false` | Send critical frames simultaneously over the two best paths. Lowers p99 latency at the cost of doubling traffic |
+| `ecmp_score_band` | `f64` | `0.20` | How far a route's score may trail the best and still join the ECMP group. `0.0` turns ECMP off |
+| `redundant_send` | `bool` | `false` | Send critical frames over the two best paths at once. Trims p99 latency, but doubles the traffic |
 
 ### Adaptive probe intervals
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `probe_min_interval_secs` | `u64` | `5` | Minimum ROUTE_PROBE interval on an unstable path |
-| `probe_max_interval_secs` | `u64` | `120` | Maximum ROUTE_PROBE interval on a stable path |
-| `probe_stability_threshold` | `f64` | `0.05` | Stability threshold (`std_dev/mean` of RTT). Below it — the path is stable, probes are sent less often |
+| `probe_min_interval_secs` | `u64` | `5` | Shortest ROUTE_PROBE interval on a shaky path |
+| `probe_max_interval_secs` | `u64` | `120` | Longest ROUTE_PROBE interval on a steady path |
+| `probe_stability_threshold` | `f64` | `0.05` | Stability threshold (`std_dev/mean` of RTT). Below it the path counts as stable and gets probed less often |
 
 ### Epidemic broadcast
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `epidemic_fanout` | `usize` | `3` | Number of random neighbors to forward an `EpidemicBroadcast` to |
-| `epidemic_max_payload` | `usize` | `4096` | Maximum payload size for `EpidemicBroadcast` in bytes |
+| `epidemic_fanout` | `usize` | `3` | How many random neighbors an `EpidemicBroadcast` is forwarded to |
+| `epidemic_max_payload` | `usize` | `4096` | Largest `EpidemicBroadcast` payload, in bytes |
 
 ### Battery-aware routing
 
@@ -1000,43 +992,43 @@ Fine-tuning of the routing plane.
 |------|-----|-------------|----------|
 | `battery_penalty_low` | `f64` | `3.0` | Penalty multiplier at critically low charge (< `battery_threshold_low` %) |
 | `battery_penalty_medium` | `f64` | `0.5` | Penalty multiplier at medium charge (< `battery_threshold_medium` %) |
-| `battery_threshold_low` | `u8` | `20` | Threshold (%) for applying `battery_penalty_low` |
-| `battery_threshold_medium` | `u8` | `40` | Threshold (%) for applying `battery_penalty_medium` |
+| `battery_threshold_low` | `u8` | `20` | Charge (%) at which `battery_penalty_low` applies |
+| `battery_threshold_medium` | `u8` | `40` | Charge (%) at which `battery_penalty_medium` applies |
 
 ### Distributed tracing
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `trace_sample_rate` | `f64` | `0.01` | Fraction of outbound DELIVERY_FORWARD frames with `trace_id` injection (0.0 = off, 1.0 = all) |
-| `trace_buffer_size` | `usize` | `10000` | Size of the ring buffer of trace-hop records per node |
+| `trace_sample_rate` | `f64` | `0.01` | Share of outbound DELIVERY_FORWARD frames that get a `trace_id` injected (0.0 = none, 1.0 = all) |
+| `trace_buffer_size` | `usize` | `10000` | Size of the per-node ring buffer of trace-hop records |
 
 ### Persistence
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `cache_persist_path` | `string` or absent | unset | Path for a route-cache snapshot. `None` — disable |
-| `cache_persist_interval_secs` | `u64` | `30` | Interval for writing the route-cache snapshot |
-| `cache_persist_max_age_secs` | `u64` | `3600` | Maximum snapshot age on load. Stale files are ignored |
-| `rtt_persist_path` | `string` or absent | unset | Path for an RTT-table snapshot |
-| `rtt_persist_interval_secs` | `u64` | `60` | Interval for writing the RTT snapshot |
-| `vivaldi_persist_path` | `string` or absent | unset | Path for persisting Vivaldi coordinates |
-| `gateway_persist_path` | `string` or absent | unset | Path for persisting the gateway list (ranked) |
-| `peer_pubkeys_persist_path` | `string` or absent | unset | Path for the cache of public keys of known peers |
+| `cache_persist_path` | `string` or absent | unset | Where to write a route-cache snapshot. `None` turns it off |
+| `cache_persist_interval_secs` | `u64` | `30` | How often the route-cache snapshot is written |
+| `cache_persist_max_age_secs` | `u64` | `3600` | Oldest a snapshot may be and still be loaded. Stale files are ignored |
+| `rtt_persist_path` | `string` or absent | unset | Where to write an RTT-table snapshot |
+| `rtt_persist_interval_secs` | `u64` | `60` | How often the RTT snapshot is written |
+| `vivaldi_persist_path` | `string` or absent | unset | Where to persist Vivaldi coordinates |
+| `gateway_persist_path` | `string` or absent | unset | Where to persist the (ranked) gateway list |
+| `peer_pubkeys_persist_path` | `string` or absent | unset | Where to cache the public keys of known peers |
 | `discovery_mode` | enum | `"public"` | Visibility advertised in the handshake. Values: `"public"`, `"contacts_only"` |
 | `target_labels` | `[string]` | `[]` | Operator labels advertised for label-based routing/selection |
-| `dht_fallback_timeout_ms` | `u64` | `10000` | Timeout before falling back to a DHT lookup when direct route discovery stalls, in ms |
+| `dht_fallback_timeout_ms` | `u64` | `10000` | How long to wait, in ms, before falling back to a DHT lookup when direct route discovery stalls |
 | `dht_fallback_backpressure_threshold_pct` | `u8` | `75` | Queue-fill % above which DHT-fallback lookups are throttled |
-| `dht_fallback_adaptive` | `bool` | `false` | Adaptively tune the DHT-fallback timeout from observed latencies |
+| `dht_fallback_adaptive` | `bool` | `false` | Tune the DHT-fallback timeout on the fly from observed latencies |
 | `dht_fallback_priority_mult` | `[u16; 2]` | `[50, 200]` | Priority multipliers `[floor, ceiling]` applied to DHT-fallback traffic |
-| `multi_path_enabled` | `bool` | `false` | Send over multiple disjoint paths in parallel for resilience |
-| `max_parallel_paths` | `u8` | `2` | Maximum disjoint paths when `multi_path_enabled` |
-| `multi_path_min_priority` | `u8` | `1` (INTERACTIVE) | Only multi-path traffic at or above this priority class |
-| `relay_reputation_min_attempts` | `u32` | `10` | Minimum relay attempts before reputation downweighting engages |
-| `relay_reputation_threshold` | `f64` | `0.5` | Success-rate below which a relay is downweighted |
-| `relay_reputation_penalty` | `f64` | `2.0` | Score-penalty multiplier applied to low-reputation relays |
+| `multi_path_enabled` | `bool` | `false` | Send across several disjoint paths in parallel, for resilience |
+| `max_parallel_paths` | `u8` | `2` | Most disjoint paths to use when `multi_path_enabled` |
+| `multi_path_min_priority` | `u8` | `1` (INTERACTIVE) | Only multi-path traffic at this priority class or above |
+| `relay_reputation_min_attempts` | `u32` | `10` | How many relay attempts to observe before reputation downweighting kicks in |
+| `relay_reputation_threshold` | `f64` | `0.5` | Success rate below which a relay is downweighted |
+| `relay_reputation_penalty` | `f64` | `2.0` | Score-penalty multiplier for low-reputation relays |
 | `jitter_penalty_weight` | `f64` | `0.5` | Weight of the RTT-jitter penalty in path scoring |
 | `jitter_threshold_ms` | `u64` | `20` | Jitter (ms) above which the jitter penalty applies |
-| `narrow_bandwidth_bulk_penalty` | `f64` | `2.0` | Penalty multiplier for routing BULK traffic over narrow-bandwidth links |
+| `narrow_bandwidth_bulk_penalty` | `f64` | `2.0` | Penalty multiplier for routing BULK traffic over narrow links |
 
 **Example:**
 
@@ -1063,22 +1055,22 @@ DHT (Kademlia) settings — background node lookup and value storage.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `republish_interval_secs` | `u64` | `1800` | Interval for re-publishing DHT records (30 minutes) |
-| `cleanup_interval_secs` | `u64` | `60` | Interval for cleaning up expired DHT records |
-| `participate` | `bool` | `true` | Participate in DHT storage (accept STORE/DELETE). `false` — routing only (FIND_NODE/FIND_VALUE) |
-| `k` | `u8` | `20` | Kademlia k-bucket size — contacts in a FIND_NODE response |
+| `republish_interval_secs` | `u64` | `1800` | How often DHT records are re-published (30 minutes) |
+| `cleanup_interval_secs` | `u64` | `60` | How often expired DHT records are cleaned up |
+| `participate` | `bool` | `true` | Take part in DHT storage (accept STORE/DELETE). `false` = routing only (FIND_NODE/FIND_VALUE) |
+| `k` | `u8` | `20` | Kademlia k-bucket size — the number of contacts in a FIND_NODE response |
 | `alpha` | `u8` | `3` | Kademlia α — parallel requests per round of the iterative lookup |
-| `max_rounds` | `u8` | `20` | Maximum iterative-lookup rounds before giving up |
-| `find_node_timeout_ms` | `u64` | `2000` | Timeout of a single FIND_NODE/FIND_VALUE RPC in ms |
-| `vivaldi_weight` | `f64` | `0.3` | Weight of the Vivaldi topology factor in ranking DHT nodes. `0.0` — pure XOR ordering |
-| `routing_persist_path` | `string` or absent | unset | Path for persisting the DHT k-bucket routing table |
-| `values_persist_path` | `string` or absent | unset | Path for persisting stored DHT values (a periodic JSON snapshot of the entire store) |
-| `cold_store_path` | `string` or absent | unset | Directory for an on-disk **RocksDB cold tier** for evicted DHT values. When set (and the binary is built with the `rocksdb-cold` feature — enabled by default for `veil-cli`), values evicted from the in-memory hot tier are written to this on-disk RocksDB store instead of the bounded in-memory cold map. Lifts the entry-count limit from RAM to disk (a dedicated DHT node serves >1M entries); cold records survive a restart. Differs from `values_persist_path` (a periodic JSON snapshot): the cold tier is a live, continuously-updated DB. If the feature is absent or RocksDB failed to open — it is ignored with a log line at startup, and the node falls back to the in-memory cold tier |
-| `allow_unsigned_store` | `bool` | `false` | Accept legacy **unsigned** raw STOREs. Default `false` (rejected outright). Re-enabling is a deploy footgun — see [OPERATIONS](OPERATIONS.md); a one-shot deprecation warning fires on first acceptance |
-| `max_store_entries` | `usize` | `25000` | Hard cap on entries in the DHT store. Lift for dedicated DHT seeds (e.g. `250000`); to exceed RAM, page out via the `cold_store_path` RocksDB tier |
-| `max_store_bytes` | `u64` or absent | unset | Optional byte-size cap on the DHT store (complements `max_store_entries`) |
-| `per_origin_max_bytes` | `u64` or absent | unset | Per-signer byte cap (Этап 11e) — bounds how much one origin can store so a single signer can't exhaust the store |
-| `shard_filtering` | `bool` | `false` | Opt-in: only accept STOREs whose key falls in this node's shard. Default `false`; intended to become default-on once the network exceeds ~1M nodes |
+| `max_rounds` | `u8` | `20` | How many iterative-lookup rounds to try before giving up |
+| `find_node_timeout_ms` | `u64` | `2000` | Timeout for a single FIND_NODE/FIND_VALUE RPC, in ms |
+| `vivaldi_weight` | `f64` | `0.3` | How much the Vivaldi topology factor counts when ranking DHT nodes. `0.0` = pure XOR ordering |
+| `routing_persist_path` | `string` or absent | unset | Where to persist the DHT k-bucket routing table |
+| `values_persist_path` | `string` or absent | unset | Where to persist stored DHT values (a periodic JSON snapshot of the whole store) |
+| `cold_store_path` | `string` or absent | unset | Directory for an on-disk **RocksDB cold tier** holding evicted DHT values. When set (and the binary is built with the `rocksdb-cold` feature — on by default for `veil-cli`), values evicted from the in-memory hot tier land in this on-disk RocksDB store instead of the bounded in-memory cold map. That moves the entry-count limit from RAM to disk (a dedicated DHT node then serves >1M entries), and cold records survive a restart. Unlike `values_persist_path` (a periodic JSON snapshot), the cold tier is a live DB, updated continuously. If the feature is missing or RocksDB won't open, it's ignored with a log line at startup and the node falls back to the in-memory cold tier |
+| `allow_unsigned_store` | `bool` | `false` | Accept legacy **unsigned** raw STOREs. Default `false` (rejected outright). Turning it back on is a deploy footgun — see [OPERATIONS](OPERATIONS.md); a one-shot deprecation warning fires the first time one is accepted |
+| `max_store_entries` | `usize` | `25000` | Hard cap on entries in the DHT store. Raise it for dedicated DHT seeds (e.g. `250000`); to go past RAM, page out through the `cold_store_path` RocksDB tier |
+| `max_store_bytes` | `u64` or absent | unset | Optional byte-size cap on the DHT store, alongside `max_store_entries` |
+| `per_origin_max_bytes` | `u64` or absent | unset | Per-signer byte cap (Этап 11e) — limits how much one origin can store, so a single signer can't fill the store |
+| `shard_filtering` | `bool` | `false` | Opt-in: accept a STORE only when its key falls in this node's shard. Default `false`; meant to become default-on once the network grows past ~1M nodes |
 
 **Example:**
 
@@ -1098,62 +1090,62 @@ cold_store_path          = "/var/lib/veil/dht-cold"
 
 ## `[pex]`
 
-Peer Exchange — random-walk peer discovery. Optional; sensible defaults.
+Peer Exchange — random-walk peer discovery. Optional, with sensible defaults.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `enabled` | `bool` | `true` | Enable PEX random-walk discovery |
-| `max_peers` | `usize` | `32` | Max peers to keep from PEX discovery |
+| `enabled` | `bool` | `true` | Turn on PEX random-walk discovery |
+| `max_peers` | `usize` | `32` | Most peers to keep from PEX discovery |
 | `walk_parallelism` | `u8` | `3` | Parallel walk requests per round |
-| `max_response_peers` | `u8` | `16` | Max peers returned per PEX response |
+| `max_response_peers` | `u8` | `16` | Most peers returned in a single PEX response |
 
 ---
 
 ## `[anycast]`
 
-Anycast service-resolution policy.
+How anycast service records are resolved.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `resolve_policy` | enum | `"signed_bound"` | How anycast records are accepted. Values: `"signed_bound"` (default — signed + owner-bound), `"signed_only"` (reject unsigned), `"best_effort"` (accept any — legacy, not recommended) |
+| `resolve_policy` | enum | `"signed_bound"` | Which anycast records to accept. Values: `"signed_bound"` (default — signed and owner-bound), `"signed_only"` (reject unsigned), `"best_effort"` (accept anything — legacy, not recommended) |
 
 ---
 
 ## `[mobile]`
 
-Battery- and background-aware throttling for mobile / battery-powered leaf nodes. Optional (the `mobile` profile pre-fills it).
+Throttling that's aware of battery and background state, for mobile or battery-powered leaf nodes. Optional (the `mobile` profile fills it in for you).
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `low_battery_threshold_pct` | `u8` or absent | unset | Battery % at or below which probe rates throttle. Unset disables battery awareness; typical mobile value `30` |
-| `low_battery_multiplier` | `u32` | `4` | Probe-interval multiplier when below the battery threshold (4 = 4× less often). Capped at a safe max |
-| `background_keepalive_multiplier` | `u32` | `1` | Keepalive-interval multiplier when the runtime `background_mode` flag is set (composes with battery scaling). `1` = off; the `mobile` profile sets `60` (30 s → 30 min) |
-| `low_battery_throttle_maintenance` | `bool` | `false` | Also throttle background maintenance tasks under low battery. Recommended for cellular/mobile |
+| `low_battery_threshold_pct` | `u8` or absent | unset | Battery % at or below which probe rates throttle. Left unset, battery awareness is off; a typical mobile value is `30` |
+| `low_battery_multiplier` | `u32` | `4` | Probe-interval multiplier below the battery threshold (4 = 4× less often). Capped at a safe maximum |
+| `background_keepalive_multiplier` | `u32` | `1` | Keepalive-interval multiplier when the runtime `background_mode` flag is set (it stacks with battery scaling). `1` = off; the `mobile` profile sets `60` (30 s → 30 min) |
+| `low_battery_throttle_maintenance` | `bool` | `false` | Throttle background maintenance tasks too when the battery is low. Recommended for cellular/mobile |
 
 ---
 
 ## `[anonymity]`
 
-This node's participation as an onion-routing relay. Optional. (The node always uses anonymity for its OWN sends; this controls whether it carries OTHER peers' circuits.)
+Whether this node acts as an onion-routing relay for others. Optional. (The node always uses anonymity for its OWN sends; this only controls whether it carries OTHER peers' circuits.)
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `relay_capable` | `bool` | `false` | Advertise the `ANONYMITY_RELAY` capability and be selectable as a circuit hop. `false` = invisible to relay-directory lookups |
-| `advertised_bps` | `u32` | `0` | Self-reported (UNVERIFIED) relay bandwidth in bytes/sec for load-balancing. Only meaningful when `relay_capable = true`. `0` = "don't know / lowest-priority" |
+| `relay_capable` | `bool` | `false` | Advertise the `ANONYMITY_RELAY` capability and be eligible as a circuit hop. `false` = invisible to relay-directory lookups |
+| `advertised_bps` | `u32` | `0` | Self-reported (UNVERIFIED) relay bandwidth in bytes/sec, used for load-balancing. Only meaningful when `relay_capable = true`. `0` = "don't know / lowest priority" |
 
 ---
 
 ## `[update]`
 
-Self-update via signed manifests. Optional — the mechanism engages only when `expected_issuer_pk` is set.
+Self-update from signed manifests. Optional — nothing happens until `expected_issuer_pk` is set.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
-| `manifest_urls` | `[string]` | `[]` | HTTPS URLs serving the operator's signed update manifest. Multiple diverse providers defend against single-endpoint takedown |
-| `expected_issuer_pk` | `string` or absent | unset | Hex public key the manifest must be signed by. **Must be set** for the update mechanism to engage |
-| `installed_version_path` | `string` or absent | unset | File recording the installed binary's `release_unix`. Required for the apply path |
-| `install_path` | `string` or absent | unset | Path of the binary itself (atomic stage + rename target). Required for the apply path |
-| `check_interval_secs` | `u64` or absent | unset | When set, poll `manifest_urls` every N seconds (hard floor 60). Unset disables auto-poll |
+| `manifest_urls` | `[string]` | `[]` | HTTPS URLs that serve the operator's signed update manifest. Spreading them across several providers guards against any one endpoint being taken down |
+| `expected_issuer_pk` | `string` or absent | unset | Hex public key the manifest must be signed by. **Must be set** for the update mechanism to do anything |
+| `installed_version_path` | `string` or absent | unset | File that records the installed binary's `release_unix`. Required for the apply path |
+| `install_path` | `string` or absent | unset | Path to the binary itself (the atomic stage-and-rename target). Required for the apply path |
+| `check_interval_secs` | `u64` or absent | unset | When set, poll `manifest_urls` every N seconds (hard floor of 60). Left unset, auto-poll is off |
 
 ---
 

@@ -1,12 +1,18 @@
 # Monitoring Guide
 
-> Operational reference: what to watch, why, and when to alert.  Companion to
+> An operator's reference for watching a running node: what to watch, why it
+> matters, and when to raise an alert. Read it alongside
 > [OPERATIONS.md](OPERATIONS.md) (deployment) and
 > [TROUBLESHOOTING.md](TROUBLESHOOTING.md) (incident response).
 
 ## Exporter Setup
 
-Enable the Prometheus exporter in `config.toml`:
+A node reports its health as **metrics** — named numbers like "active sessions"
+or "failed dials" that you sample over time. Veil exposes them in the format
+[Prometheus](https://prometheus.io) reads. Prometheus is a tool that collects
+metrics from many machines and stores them so you can chart and alert on them.
+
+To turn the exporter on, add this to `config.toml`:
 
 ```toml
 [metrics]
@@ -15,7 +21,7 @@ path        = "/metrics"          # default
 auth_token  = "abcd1234..."       # optional bearer token; clients send `Authorization: Bearer …`
 ```
 
-Restart the node, verify:
+Restart the node, then check that the endpoint answers:
 
 ```bash
 curl http://127.0.0.1:9090/metrics
@@ -23,13 +29,16 @@ curl http://127.0.0.1:9090/metrics
 curl -H "Authorization: Bearer abcd1234..." http://127.0.0.1:9090/metrics
 ```
 
-Each metric is reported once per scrape, no labels other than the
-implicit `instance` Prometheus injects.  All counters are monotonic
-`u64`; gauges may be `f64` (Vivaldi coords) or `usize`.
+A *scrape* is one read of the endpoint by Prometheus. Each metric appears once
+per scrape. The only label attached is `instance`, which Prometheus adds itself
+to mark which node the reading came from. Two kinds of metric show up below. A
+**counter** only ever climbs — it counts events since startup (here, always a
+`u64`). A **gauge** is a current value that can rise or fall, like a fuel gauge;
+gauges may be `f64` (Vivaldi coordinates) or `usize`.
 
 ## Metric Reference
 
-Categories ordered by ops-utility.
+The sections below are ordered roughly by how often you'll reach for them.
 
 ### Liveness / capacity
 
@@ -62,9 +71,11 @@ Categories ordered by ops-utility.
 
 #### Iterative-DHT fallback (route recovery)
 
-When direct routing misses, the node falls back to an iterative DHT
-lookup to re-resolve a transport.  These signals track mesh
-fragmentation and fallback health:
+When the node can't route a frame directly, it tries a backup path: an iterative
+DHT lookup that hunts for a fresh transport to the destination. (Iterative means
+the node walks the DHT hop by hop instead of relying on a cached answer.) These
+metrics show how often that backup runs and whether it succeeds — a good early
+read on mesh fragmentation:
 
 | Metric | Type | Meaning | Alert if |
 |--------|------|---------|----------|
@@ -76,10 +87,13 @@ fragmentation and fallback health:
 
 ### Mailbox (offline delivery)
 
-> Mailbox depth is **not exported to Prometheus**.  The only surfaced
-> signal is the `mailbox_entries` field in the admin HTTP state dump
-> (`veil-cli node metrics`, or the admin HTTP `/state` JSON/text).
-> There are no `veil_mailbox_*` counters or gauges.
+The mailbox holds messages for recipients who are currently offline, to be
+handed over once they reconnect.
+
+> Mailbox depth is **not exported to Prometheus**. The one place it shows up is
+> the `mailbox_entries` field in the admin HTTP state dump (run
+> `veil-cli node metrics`, or read the admin HTTP `/state` endpoint as JSON or
+> text). There are no `veil_mailbox_*` counters or gauges.
 
 | Field | Source | Meaning | Watch for |
 |-------|--------|---------|-----------|
@@ -123,9 +137,9 @@ fragmentation and fallback health:
 
 ## Suggested Alert Set
 
-A starter [`alerting.yml`](../alerting.yml) ships in the repo.  Tune
-thresholds for your fleet size; the defaults assume single-host nodes
-on commodity hardware.
+The repo ships a starter [`alerting.yml`](../alerting.yml) you can drop into
+Prometheus. Treat the thresholds as a starting point and tune them to your fleet
+size — the defaults assume single-host nodes on ordinary hardware.
 
 ```yaml
 groups:
@@ -183,8 +197,10 @@ groups:
 
 ## Grafana Dashboard
 
-A reference dashboard JSON ships at `docs/grafana/`.  Import via Grafana
-UI → "+" → Import → Upload JSON.  Key panels:
+[Grafana](https://grafana.com) draws metrics as charts on a *dashboard* — a
+single screen of graphs. A ready-made dashboard ships as JSON at
+`docs/grafana/`. To load it, open the Grafana UI → "+" → Import → Upload JSON.
+The key panels:
 
 1. **Connectivity** — `active_sessions`, `configured_peers`, reachability
    gauge, outbound failure ratio.
@@ -201,30 +217,32 @@ UI → "+" → Import → Upload JSON.  Key panels:
 
 ## What to look at first when something is wrong
 
-1. **`up{job="veil"}`** — is the node even reachable by Prometheus?
-   If no — the node may be alive but admin/metrics endpoint is bound to
-   a wrong interface; check `[metrics].listen` and firewall.
+Work down this list in order. Each step rules out a common cause.
 
-2. **`active_sessions`** — does it match expectations?  Drop = upstream
-   peer outage or local config change.
+1. **`up{job="veil"}`** — can Prometheus reach the node at all? If not, the node
+   may well be alive while its metrics endpoint is bound to the wrong interface.
+   Check `[metrics].listen` and your firewall.
 
-3. **`outbound_connect_failures_total / outbound_connect_attempts_total`**
-   ratio — sustained high failure ratio = DNS / firewall / bootstrap-peer
-   reachability issue.
+2. **`active_sessions`** — does the count match what you expect? A drop usually
+   means an upstream peer went down, or someone changed the local config.
 
-4. **`route_miss_total` rate** — high → check `node dht routing` for
-   k-bucket fill, then `peers banned` for unintended bans.
+3. **`outbound_connect_failures_total / outbound_connect_attempts_total`** — the
+   ratio of these two. If it stays high, the node can't reach the outside world:
+   suspect DNS, the firewall, or an unreachable bootstrap peer.
 
-5. **`ban_actions_total` rate** — spike correlates with attack;
-   `veil-cli peers banned` to inspect which `node_id`s are getting
-   banned and why.
+4. **`route_miss_total` rate** — if it's high, check `node dht routing` to see
+   how full the k-buckets are, then `peers banned` in case you've banned
+   something by accident.
 
-For specific symptom → diagnosis → fix mapping see
+5. **`ban_actions_total` rate** — a spike tracks an attack. Run
+   `veil-cli peers banned` to see which `node_id`s are being banned, and why.
+
+For a full symptom → diagnosis → fix walkthrough, see
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## CLI snapshot (no Prometheus)
 
-For ad-hoc inspection without scraping:
+When you just want a quick look and don't have Prometheus set up:
 
 ```bash
 veil-cli node metrics
@@ -233,7 +251,7 @@ veil-cli node metrics
 # hint instead of 35 zero counters.
 ```
 
-For real-time tail of significant events without metrics scrape:
+To follow significant events live, without metrics at all, tail the log:
 
 ```bash
 journalctl -fu veil-node | grep -E "WARN|ERROR|session.banned|route.discovery.miss|recursive.response.relay_dropped"

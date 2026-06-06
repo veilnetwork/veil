@@ -1,33 +1,83 @@
 # How the Veil Network Works
 
-> This document gives a high-level tour.  For the full source-level description
-> (wire formats, every constant, locking rules, subsystem interactions) see
+> This is the friendly tour — the big picture, the moving parts, and how a
+> message actually gets from one person to another. If you want the full
+> source-level detail (wire formats, every constant, locking rules, how the
+> subsystems interact), that lives in
 > [ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md).
+>
+> New to Veil entirely? Start with [start-here.md](start-here.md) first — it
+> defines the basic words. This page assumes you've met them.
 
-## Overview
+## The big picture
 
-A decentralized, E2E encrypted veil network with NAT traversal, DHT-routed delivery, and mesh capability.
+Veil is a network with no company in the middle. It's decentralized (no central
+server owns it), every message is end-to-end encrypted (only the sender and the
+final recipient can read it), and the network finds people for you even when
+they're behind a home router or briefly offline.
+
+A message travels through a small chain of nodes — running copies of Veil — like
+this:
 
 ```
 App ←→ Leaf ←→ Core ←→ Core ←→ Core ←→ Leaf ←→ App
 ```
 
-Key properties: E2E encryption (ML-KEM-768 + ChaCha20-Poly1305), O(log N) routing via Kademlia DHT, automatic NAT traversal, local mesh discovery, offline mailbox delivery.
+Your app talks to a nearby node, that node passes the message along to other
+nodes, and the last one hands it to your friend's app.
 
-## Node Roles
+A few ideas do most of the work, and the rest of this page unpacks each one:
+
+- **End-to-end encryption** seals every message (ML-KEM-768 for the key
+  exchange, ChaCha20-Poly1305 for the content), so the nodes in between only
+  ever see scrambled bytes.
+- **DHT routing** lets the network find anyone in roughly `O(log N)` hops — a
+  handful even when there are millions of nodes — using a shared address book
+  called a Kademlia DHT (more on that below).
+- **NAT traversal** punches through home routers automatically, so two people
+  behind firewalls can still reach each other.
+- **Local mesh discovery** lets nearby devices find each other directly, even
+  without internet.
+- **Offline delivery** parks a message in a mailbox when the recipient is away
+  and hands it over the moment they return.
+
+## Two kinds of node
+
+There are just two roles, and the difference is simple: how much work a node does
+for everyone else.
 
 | Role | DHT | Relay | Mailbox | Gateway | Typical environment |
 |------|-----|-------|---------|---------|---------------------|
 | **Leaf** | - | - | - | - | Mobile phone, IoT sensor |
 | **Core** | yes (K=20) | yes | yes | yes | Server, VPS, home server |
 
-All Core nodes are equal participants: DHT, relay/forwarding, mailbox, gateway
-(attachment records for leaf nodes). PoW ≥ 24 bits. Gateway can be disabled per-node
-via `[gateway] enabled = false`.
+A **leaf** is a light node — your phone, a laptop, a tiny sensor. It joins the
+network and sends and receives its own traffic, but it doesn't carry the network
+on its back.
 
-Only two roles exist; the legacy `Relay`/`Gateway`/`CoreRouter` roles are not part of the protocol.
+A **core** is a full node, and every core pulls its weight equally. Each one
+helps with all four shared jobs:
 
-## Identity & PoW
+- **DHT** — keeping a slice of the shared address book.
+- **Relay** — forwarding messages it isn't the final recipient of.
+- **Mailbox** — holding messages for people who are currently offline.
+- **Gateway** — keeping *attachment records*, the notes that say which core a
+  given leaf is currently reachable through.
+
+Standing up a core takes a little proof of work — at least 24 bits, a quick
+one-time puzzle that keeps fake identities expensive (see [Identity and proof of
+work](#identity-and-proof-of-work)). If you'd rather a core not act as a gateway,
+you can turn just that job off with `[gateway] enabled = false`.
+
+Those are the only two roles. If you come across older names like `Relay`,
+`Gateway`, or `CoreRouter`, they're history — they aren't part of the protocol.
+
+## Identity and proof of work
+
+Before a node can join, it gives itself an identity. An **identity** is just a
+key pair — a public key everyone may see and a private key only you hold — plus a
+small proof that you did a bit of work to make it. From the public key, Veil
+computes the node's permanent address (its `node_id`). Here's the recipe:
 
 ```
 keygen(Ed25519 | Falcon512) → (pubkey, privkey)
@@ -36,11 +86,26 @@ node_id = BLAKE3(pubkey)
 identity_proof = (pubkey, nonce, sign(pubkey, nonce))
 ```
 
-Both **Ed25519** and **Falcon-512** are first-class signing algorithms; choice is per-node (`[identity] algo`, which also offers the `ed25519+falcon512` / `ed25519+falcon1024` hybrids). BLAKE3(pubkey) yields the 32-byte `node_id` identically for both.
+You can sign with either **Ed25519** (small and fast) or **Falcon-512** (larger,
+and resistant to future quantum computers). Both are first-class — you pick per
+node with `[identity] algo`, which also offers the `ed25519+falcon512` and
+`ed25519+falcon1024` hybrids that sign with both at once. Whichever you choose,
+hashing the public key with BLAKE3 gives the same 32-byte `node_id`.
 
-PoW difficulty: 24 bits baseline (16 in debug builds); adaptive = `24 + ceil(log2(N / 100K))` via epoch-based DHT records.
+The **proof of work** is that small puzzle from the recipe (`mine_nonce`): you
+search for a number that makes the hash come out a certain way. It costs a little
+CPU time, which is the point — it makes minting throwaway identities expensive
+for spammers and trivial for an honest user creating one. The baseline difficulty
+is 24 bits (lowered to 16 in debug builds so testing stays fast). As the network
+grows it scales itself with `24 + ceil(log2(N / 100K))`, where `N` is the
+network size that nodes agree on through epoch-based DHT records.
 
-## Handshake (OVL1)
+## The handshake (OVL1)
+
+When two nodes first connect, they go through a **handshake** — a short
+back-and-forth where they say hello, prove who they are, agree on what they each
+support, and work out a shared secret key. After the handshake, everything they
+send is encrypted. The exchange (named OVL1) looks like this:
 
 ```
 Client → Server: Hello(magic="OVL1", version=1, node_id)
@@ -57,11 +122,32 @@ Server → Client: SessionConfirm
   [All subsequent frames: ChaCha20-Poly1305 AEAD encrypted]
 ```
 
-ML-KEM-768 encapsulation key is carried inside `IdentityPayload` (1184 bytes; `mlkem_pk_len=0` means the peer does not publish one). Session keys come from the X25519 ephemeral DH plus HKDF-SHA256; ML-KEM is *not* used at the session layer today, only for E2E.
+Reading the steps top to bottom: the two sides greet each other, present their
+identities, compare capabilities, then each sends a one-time X25519 public value.
+From those two values both sides independently derive the same pair of keys (one
+for sending, one for receiving) with HKDF-SHA256, confirm they match, and from
+then on every frame is sealed with ChaCha20-Poly1305.
 
-Rekey thresholds: 128 GiB of frames **or** 32 days **or** nonce-counter wrap-around. Both byte- and time-thresholds are configurable via `[session] rekey_bytes_threshold` / `rekey_time_threshold_secs`.
+One detail worth calling out: the ML-KEM-768 encapsulation key — the post-quantum
+key used for end-to-end encryption — rides along inside the `IdentityPayload`
+(1184 bytes; a length of `mlkem_pk_len=0` simply means that peer doesn't publish
+one). The keys that protect *this connection*, though, come from the X25519
+exchange plus HKDF-SHA256. So ML-KEM is *not* used to protect the link itself
+today — only for the end-to-end sealing of message content.
 
-## Frame Dispatch
+No key is meant to last forever. A connection quietly negotiates fresh keys — a
+**rekey** — once any one of three limits is reached: 128 GiB of frames sent, 32
+days elapsed, or the nonce counter wrapping around. You can tune the size and
+time limits with `[session] rekey_bytes_threshold` and
+`rekey_time_threshold_secs`.
+
+## How a frame is handled
+
+Everything on the wire arrives as a **frame** — one self-contained packet with a
+small header. When a frame comes in, a node reads the header, decrypts the body,
+and then routes it to the right handler based on its *family* — the category it
+belongs to. Anything from a family the node doesn't recognize is simply ignored,
+which is what lets the protocol grow without breaking older nodes. The families:
 
 ```
 bytes → FrameHeader decode → AEAD decrypt → family switch:
@@ -79,11 +165,24 @@ bytes → FrameHeader decode → AEAD decrypt → family switch:
   Unknown  → ignored (forward-compatible)
 ```
 
-## Routing: Gossip + DHT
+## Finding a route: gossip plus the DHT
 
-**Local gossip** (TTL=2): ROUTE_ANNOUNCE → immediate neighbors learn routes.
+To send a message, a node first has to know which neighbor to hand it to.
+**Routing** is how it figures that out, and Veil combines two approaches.
 
-**DHT forwarding** (cache miss): RecursiveRelay wraps ForwardPayload → sent to XOR-closest DHT node → each hop checks for live session to dst → deliver or forward closer → mailbox fallback after 20 hops.
+The first is **gossip**: when a node learns a route, it tells its immediate
+neighbors with a `ROUTE_ANNOUNCE`. These announcements carry a *TTL* (time to
+live — a small hop counter that stops them spreading too far), set to 2 here, so
+word travels just a step or two and the network isn't flooded.
+
+The second kicks in when gossip didn't already supply the answer — a *cache
+miss*. The node falls back to the shared address book, the DHT. It wraps the
+message in a `RecursiveRelay` and sends it to the DHT node whose ID is
+mathematically closest to the destination (closest by XOR distance, explained in
+the DHT section). Each node along the way asks the same question: do I have a
+live connection straight to the destination? If yes, it delivers; if not, it
+forwards one step closer. If no live path turns up within 20 hops, the message
+falls back to a mailbox to wait.
 
 ```
 A announces → B (TTL=1) → C (TTL=0, stop)
@@ -92,22 +191,33 @@ A → route cache miss → RecursiveRelay(dst=D)
   → X doesn't → forward to closer Y → ... → mailbox fallback
 ```
 
-Reverse path caching: successful RecursiveRelay delivery inserts `originator → peer_id` in route cache.
+One nice touch: when a `RecursiveRelay` delivery succeeds, each node remembers
+the way back, caching `originator → peer_id`. So the reply has a route ready and
+doesn't have to repeat the search.
 
-## Message Delivery (3 Paths)
+## Delivering a message: three paths
 
-**Path 1 — Direct** (route cache hit):
+When you send something, Veil tries the cheapest route that can work and falls
+back as needed. There are three paths, from fastest to most patient.
+
+**Path 1 — Direct** (the route is already known, a *cache hit*). The node looks
+up the destination in its route cache, finds the next hop, and the message walks
+straight there:
 ```
 Sender → FORWARD(dst) → route_cache.lookup(dst) → next_hop → ... → Recipient
 ```
 
-**Path 2 — DHT-routed** (cache miss):
+**Path 2 — Via the DHT** (the route isn't cached, a *cache miss*). The node asks
+the shared address book instead, hopping closer and closer until it reaches a
+node that has a live connection to the recipient — up to 20 hops:
 ```
 Sender → FORWARD(dst) → cache miss → RecursiveRelay(dst, hop=20)
   → DHT hop chain → node with live session to dst → deliver
 ```
 
-**Path 3 — Mailbox** (offline recipient):
+**Path 3 — Mailbox** (the recipient is offline). When nobody can be reached
+directly, the message is left in a mailbox to be picked up later. This one has a
+few more moving parts, so the steps are spelled out below:
 ```
 Sender → MAILBOX_PUT → Primary (recipient's attachment gateway from DHT)
   Primary:
@@ -126,25 +236,72 @@ Recipient comes online:
     SEC check: recipient_node_id == authenticated peer_id
 ```
 
-Selection of replicas is **deterministic**: any Core node with a DHT view can independently compute `shard_target` and find the same closest replicas — the sender and the recipient don't need to exchange host addresses.
+The clever part is that the backup holders (the **replicas**) are chosen by a
+formula, not by negotiation — the selection is **deterministic**. Any core node
+that can see the DHT computes the same `shard_target` and arrives at the same set
+of closest replicas. So the sender and the recipient never have to swap host
+addresses or agree on anything in advance; the math points them both at the same
+mailboxes.
 
-## DHT (Kademlia)
+## The shared address book (DHT)
 
-256 k-buckets × K contacts (K=20 per the Kademlia paper). XOR distance metric.
+The **DHT** — distributed hash table — is the network's shared address book. No
+single node holds all of it; each one keeps a slice, and together they can answer
+"where is this node right now?" Veil uses the Kademlia design, and a few ideas
+make it tick.
 
-**Iterative lookup**: seed K closest → query α=3 per round → merge responses → converge (at most `MAX_ROUNDS=20`).
+**Distance is math.** Kademlia measures how "close" two IDs are by **XOR
+distance**: line the two IDs up bit for bit and count where they differ. It has
+nothing to do with geography — it's just a number, and it gives every node a
+consistent sense of who is near a given address.
 
-**Sharding**: `shard_id = key[0]`; each node covers 16 nearest shards out of 256. Shard-aware STORE filtering is opt-in.
+**Each node keeps a structured contact list.** That list is split into 256
+*k-buckets*, each holding up to `K` contacts (`K = 20`, the value from the
+original Kademlia paper). Buckets are arranged by distance, so a node knows many
+neighbors that are close to it and a few that are far — exactly what you need to
+hop efficiently toward any address.
 
-**Tiered storage**: hot HashMap + cold tier; LRU promotion on access; demotion on hot overflow; eviction on cold overflow. The cold tier is an in-memory HashMap by default, but can be a disk-backed RocksDB store via `[dht] cold_store_path` (cargo feature `rocksdb-cold`, on by default for `veil-cli`), which lifts the entry-count ceiling from RAM to disk (>1M entries) and survives restarts. Falls back to the in-memory cold tier — with a startup log line — if the feature is absent or the RocksDB open fails.
+**Looking something up is iterative.** Rather than ask one node and wait, a node
+starts with the `K` closest contacts it knows, queries `α = 3` of them at a time,
+folds in whatever closer contacts come back, and repeats — each round landing
+nearer the target until it converges, within at most `MAX_ROUNDS = 20` rounds.
 
-**Eclipse defense**: at most `K/4 = 5` contacts per /24 IPv4 (/48 IPv6) subnet in a single bucket.
+**Storage is sharded.** The address space is divided into 256 *shards* (a
+shard is just the first byte of the key, `shard_id = key[0]`), and each node
+takes responsibility for the 16 shards nearest to it. Filtering `STORE`s by shard
+is opt-in.
 
-**STORE / DELETE authentication**:
-- `StorePayload` carries optional Ed25519 signature over `key || value`.
-- `DeletePayload` requires `algo + pubkey + signature` (any identity signature algo — Ed25519, Falcon-512, or an Ed25519+Falcon hybrid); accepted only when `BLAKE3(pubkey) == key`.
+**Storage has two tiers.** Fresh, frequently used entries live in a fast in-memory
+*hot* tier; the rest sit in a *cold* tier. Entries get promoted to hot when
+they're accessed (least-recently-used order), pushed back down to cold when hot
+fills up, and dropped entirely only when cold overflows. By default the cold tier
+is also in memory, but you can back it with an on-disk RocksDB store via `[dht]
+cold_store_path` (cargo feature `rocksdb-cold`, on by default for `veil-cli`).
+That swaps the RAM ceiling for a disk one — comfortably past a million entries —
+and keeps the data across restarts. If the feature isn't compiled in, or RocksDB
+fails to open, it quietly falls back to the in-memory cold tier and notes it in a
+startup log line.
 
-## Discovery & Attachment
+**It defends against being surrounded.** An *eclipse attack* tries to fill your
+contact list with nodes the attacker controls, cutting you off from the honest
+network. To make that hard, a single bucket accepts at most `K/4 = 5` contacts
+from any one `/24` IPv4 (or `/48` IPv6) subnet, so no small corner of the
+internet can dominate your view.
+
+**Writes are authenticated**, so nobody can store or delete under your name:
+- A `StorePayload` may carry an Ed25519 signature over `key || value`.
+- A `DeletePayload` must carry `algo + pubkey + signature` (any identity
+  signature algorithm — Ed25519, Falcon-512, or an Ed25519+Falcon hybrid), and
+  it's honored only when `BLAKE3(pubkey) == key` — that is, only the key's true
+  owner can delete it.
+
+## How a leaf becomes reachable (attachment)
+
+A leaf sits behind a home router, so others can't connect to it directly. To stay
+reachable anyway, a leaf **attaches** to a core and asks it to act as its public
+contact point. The core publishes a small, signed *attachment record* in the DHT
+saying "to reach this leaf, come through me." Anyone who wants the leaf looks that
+record up and learns where to route:
 
 ```
 Leaf starts → attach to Core → AnnounceAttachment(node_id, role, gateways, mailboxes, expires_at)
@@ -152,7 +309,13 @@ Leaf starts → attach to Core → AnnounceAttachment(node_id, role, gateways, m
 Peer wants to reach Leaf → GetAttachment(node_id) → learns Core gateways/mailboxes → route
 ```
 
-## E2E Encryption
+## End-to-end encryption
+
+This is what keeps your messages private from everyone except the person you're
+talking to. The sender seals the message so that only the final recipient can
+open it; every node in between just carries a locked box. Veil uses ML-KEM-768 (a
+post-quantum scheme) to agree on a one-time shared secret, then ChaCha20-Poly1305
+to encrypt the content with it:
 
 ```
 sender: (ct, ss) = ML-KEM-768.Encaps(recipient_ek)
@@ -163,9 +326,19 @@ recipient: ss = ML-KEM-768.Decaps(dk, ct)
            plaintext = ChaCha20-Poly1305.open(ss, nonce, ciphertext)
 ```
 
-Relay nodes see only ciphertext — no access to plaintext.
+Because the secret is established directly between the two endpoints, the relays
+in the middle only ever handle ciphertext — the scrambled form. They never see
+the plaintext.
 
-## NAT Traversal
+## Getting through home routers (NAT traversal)
+
+Most people are behind **NAT** — the address translation a home router does that
+lets many devices share one public IP. It's convenient, but it means nobody on
+the outside can simply dial in to you. So how do two people who are *both* behind
+NAT reach each other? They get a little help from a relay that both can already
+talk to. The relay introduces them — telling each side where the other appears to
+be — and they open a direct path; if that fails, the relay carries the traffic
+itself:
 
 ```
 A behind NAT → connect to Relay R
@@ -176,7 +349,14 @@ A wants to reach B (also behind NAT):
   Fallback: relay tunnel through R
 ```
 
-## Mesh Networking
+## Finding neighbors nearby (mesh)
+
+Veil can also connect devices on the same local network directly — handy for a
+room full of IoT gadgets, or anywhere the wider internet is unavailable. Each
+device shouts a small *beacon* — a hello broadcast to everyone on the local
+segment — every 30 seconds. A nearby gateway hears it, recognizes a fellow Veil
+device, and sets up a session. That gateway then acts as a bridge between the
+little local mesh and the wider Veil network:
 
 ```
 IoT device ← UDP beacon (multicast/broadcast, 30-sec interval) → Gateway
@@ -184,13 +364,20 @@ IoT device ← UDP beacon (multicast/broadcast, 30-sec interval) → Gateway
   Gateway bridges local mesh ↔ global veil
 ```
 
-Beacons carry node_id, realm_id (UUID), transport URIs, and a signed algo/pubkey.
-Multiple realms can coexist on the same physical segment — peers ignore beacons
-with a foreign `realm_id`.
+Each beacon carries the sender's `node_id`, a `realm_id` (a UUID naming which
+logical network it belongs to), its transport URIs, and a signed algorithm and
+public key so listeners can trust it. The `realm_id` lets separate Veil networks
+share the same physical wire without mixing: a node simply ignores any beacon
+whose `realm_id` isn't its own.
 
-## Peer Exchange (PEX)
+## Learning about more peers (PEX)
 
-Random-walk-based transport discovery (Family 11):
+A node always wants to know a few more peers — both to stay well-connected and to
+discover new ways to reach them. **Peer exchange** (PEX, frame family 11) handles
+this with a random walk: a request wanders from node to node, and the node it
+lands on answers with a fresh batch of peers and their transport addresses. To
+keep it from being abused for spam, the walk includes a small proof-of-work
+challenge along the way:
 
 ```
 Originator → seed:        PexWalk (walk_id, pubkey, nonce, signature, TTL)
@@ -199,9 +386,15 @@ Originator → terminator:  PexResponse (solution, origin_sig)
 Terminator → originator:  PexResult (peer list with transport URIs)
 ```
 
-Multi-algo: `origin_sig` is verified as Ed25519 (32-byte pubkey) or Falcon-512 (longer pubkey) via `crypto::verify_message`.
+The walk works with either signing algorithm: `crypto::verify_message` checks
+`origin_sig` as Ed25519 when the public key is 32 bytes, or Falcon-512 when it's
+the longer one.
 
-## Abuse Protection
+## Keeping out abuse
+
+An open network needs defenses against floods, spam, and freeloaders. Veil layers
+several, and a new inbound connection passes through them in order — each one
+cheap to check and quick to reject a bad actor before it can cost much:
 
 ```
 Inbound connection:
@@ -215,10 +408,18 @@ Inbound connection:
   8. Reputation gate (200 points for transit)
 ```
 
-## Observability
+## Seeing what's going on (observability)
 
-- **Prometheus metrics**: `GET /metrics` — counters, gauges for all subsystems
-- **Structured logging**: `[timestamp] LEVEL event message` (JSON-L optional)
-- **Debug capture**: `debug capture` CLI — live frame capture to file
-- **DiagPing**: end-to-end latency probe through veil
-- **Trace buffer**: last N dispatch events for debugging
+When you want to know how your node is doing, Veil gives you several windows into
+it:
+
+- **Prometheus metrics** — fetch `GET /metrics` for counters and gauges covering
+  every subsystem, ready to chart or alert on.
+- **Structured logging** — each line is `[timestamp] LEVEL event message`, with
+  JSON-L available if you'd rather machines read it.
+- **Debug capture** — the `debug capture` CLI command records frames to a file
+  as they fly past, for a closer look.
+- **DiagPing** — measures round-trip latency all the way through Veil, end to
+  end.
+- **Trace buffer** — keeps the last N dispatch events in memory, a short flight
+  recorder for debugging.

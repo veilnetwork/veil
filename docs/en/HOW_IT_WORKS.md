@@ -1,29 +1,36 @@
 # How the Veil Network Works
 
-A guided tour of the internal architecture, intended for engineers who
-want to understand the system before diving into source.
+A guided tour of how Veil is built inside, for engineers who want the
+shape of the system before they open the source.
 
-For exhaustive source-level reference see
-[ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md) (full walkthrough),
-[NETWORK.md](NETWORK.md) (data-plane focus), and
-[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md) (byte-level wire format).
-Russian: [HOW_IT_WORKS.md](../ru/HOW_IT_WORKS.md).
+Want more depth later? Three references go deeper:
+[ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md) walks the whole system,
+[NETWORK.md](NETWORK.md) focuses on how data moves, and
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md) spells out the exact bytes on the
+wire. Russian: [HOW_IT_WORKS.md](../ru/HOW_IT_WORKS.md).
 
 ---
 
 ## 1. What is this
 
-A peer-to-peer veil network: nodes form a Kademlia DHT, exchange
-encrypted messages, traverse NAT automatically, and fall back to
-mailbox storage for offline recipients.  End-to-end encryption is
-post-quantum (ML-KEM-768 + AEAD).  Two node roles only:
+Veil is a peer-to-peer network — every participant is an equal node,
+with no central server. The nodes together form a **DHT** (a shared,
+distributed address book; here a Kademlia one) so they can find each
+other. They exchange encrypted messages, punch through home routers on
+their own, and drop a message in a **mailbox** when the recipient is
+offline so it waits there until they wake up. Encryption runs end to
+end and is post-quantum: only the two endpoints can read a message, and
+the math holds up even against a future quantum computer (ML-KEM-768 +
+AEAD). There are just two kinds of node:
 
-- **Leaf** — phones, IoT, lightweight clients.  No DHT, no relay, no
-  mailbox.  Connects to one or more Core nodes via configured peers
-  or local mesh.
-- **Core** — full participant.  K=20 Kademlia bucket, relays for
-  others, hosts mailboxes, may act as gateway for Leaf attachment
-  records.
+- **Leaf** — phones, IoT, lightweight clients. A leaf keeps no DHT,
+  relays nothing, and hosts no mailbox. It simply connects to one or
+  more Core nodes, either through peers you list in the config or
+  through other nodes it discovers on the local network.
+- **Core** — a full participant. It keeps a K=20 Kademlia bucket (its
+  slice of the address book), relays traffic for others, hosts
+  mailboxes, and can act as a gateway that holds the records pointing
+  back to attached leaves.
 
 ```
               ┌──────────────────────────────────────┐
@@ -46,8 +53,9 @@ post-quantum (ML-KEM-768 + AEAD).  Two node roles only:
               └───────┘                  └───────┘
 ```
 
-Leaf-to-Core attachment is registered via Discovery (`AttachmentPayload`)
-so other nodes can route messages back to the Leaf.
+When a leaf attaches to a Core node, that link is recorded through
+Discovery (an `AttachmentPayload`) so the rest of the network knows how
+to route a reply back to the leaf.
 
 ---
 
@@ -89,10 +97,13 @@ so other nodes can route messages back to the Leaf.
 └──────────────────────────────────────────────────────┘
 ```
 
-Each layer is **sync** unless explicitly async — the dispatcher
-returns `DispatchResult` (Response | NoResponse | Violation |
-RateLimited) and never awaits.  All I/O lives in `tokio` tasks above
-or below.
+One rule keeps this stack easy to reason about: each layer runs
+synchronously unless it is explicitly marked async. The dispatcher
+(the part that looks at a frame and decides what to do with it) just
+returns a `DispatchResult` — one of `Response`, `NoResponse`,
+`Violation`, or `RateLimited` — and never waits on anything. All the
+actual I/O happens in `tokio` tasks (lightweight background threads)
+that sit above or below it.
 
 ---
 
@@ -105,23 +116,31 @@ node_id                       =  BLAKE3(public_key)
 identity_proof                =  (pk, nonce, sign(pk, nonce))
 ```
 
-- `node_id` is a flat 256-bit ID; **no PKI**, no domain names.
-- Two signature algorithms supported: **Ed25519** (default, fast) and
-  **Falcon-512** (post-quantum, larger keys).  Choice is per-node,
-  set via `[identity] algo`.  BLAKE3 collapses all pubkey
-  formats to the same 32-byte node_id.
-- PoW difficulty: 24 bits baseline (16 in debug); adaptive:
-  `24 + ceil(log2(N / 100K))` from the DHT-tracked epoch.
+- The `node_id` is a flat 256-bit name. There is **no PKI** and there
+  are no domain names — a node's identity is just its key, nothing to
+  register and no authority to trust.
+- A node can sign with one of two algorithms: **Ed25519** (the default,
+  and fast) or **Falcon-512** (post-quantum, with larger keys). You
+  pick per node via `[identity] algo`. Either way BLAKE3 (a hash
+  function) folds the public key down to the same 32-byte node_id.
+- The Proof of Work — a small puzzle that makes minting fake identities
+  cost real CPU — starts at 24 bits of difficulty (16 in debug builds).
+  It scales with the network: `24 + ceil(log2(N / 100K))`, where N is
+  the node count the DHT tracks per epoch.
 
-Identity can be **sovereign** — a master Falcon-512 key signs delegated
-Ed25519 device keys, enabling multi-device messengers with per-device
-revocation.  See [identity-model.md](identity-model.md).
+An identity can also be **sovereign**: one master Falcon-512 key signs
+the everyday Ed25519 keys of your individual devices. That is what lets
+a messenger run on several devices at once and revoke any one of them on
+its own. See [identity-model.md](identity-model.md).
 
 ---
 
 ## 4. Sessions: handshake → AEAD frames
 
-OVL1 handshake (6 round-trips, all OVL1-framed):
+Before two nodes can talk, they shake hands. A **handshake** is the
+short back-and-forth where they prove who they are and agree on the keys
+for everything that follows. Veil's handshake takes six round-trips, and
+every step rides in an OVL1 frame:
 
 ```
    Client                                    Server
@@ -143,26 +162,35 @@ OVL1 handshake (6 round-trips, all OVL1-framed):
      │      with ChaCha20-Poly1305             │
 ```
 
-After `SessionConfirm`:
-- Every frame is wrapped: `header || ciphertext`, where `ciphertext =
+Once `SessionConfirm` lands, the session is live and everything after it
+is encrypted:
+- Every frame goes out as `header || ciphertext`, where `ciphertext =
   ChaCha20-Poly1305(key, nonce=session_id||counter, plaintext, AAD=header)`.
-- Rekey triggered at **128 GiB** of frames, **32 days**, or AEAD
-  counter wrap-around — whichever comes first.
-- Padding frames (`SessionMsg::Padding`) round wire-level records up
-  to MTU so passive observers cannot infer message-length structure.
+  (AEAD just means the cipher both hides the contents and detects any
+  tampering.)
+- The keys don't last forever. A rekey kicks in after **128 GiB** of
+  frames, after **32 days**, or when the AEAD counter wraps around —
+  whichever comes first.
+- Padding frames (`SessionMsg::Padding`) pad each record on the wire up
+  to the MTU, so someone merely watching the traffic can't read message
+  lengths off it.
 
 ### Hot-standby
 
-Every session can transparently migrate its underlying transport
-(TCP → TLS, IPv4 → IPv6, port → port) without re-handshaking: the
-AEAD state is preserved, the writer task swaps the underlying socket
-between frame boundaries.  See [hot-standby.md](hot-standby.md).
+A session can move from one transport to another mid-flight — TCP to
+TLS, IPv4 to IPv6, one port to another — without redoing the handshake.
+The AEAD state carries over, and the writer task simply swaps the
+underlying socket at a frame boundary, so nothing notices the change.
+See [hot-standby.md](hot-standby.md).
 
 ---
 
 ## 5. Routing: how messages find their destination
 
-Three independent mechanisms work in concert:
+Routing is the job of getting a message to the right node when you only
+know its address, not where it is. Veil leans on three mechanisms that
+work together — a fast local cache, a global DHT lookup when the cache
+misses, and a sender-drawn path when you already know the way:
 
 ### 5.1 Route cache (local gossip)
 
@@ -171,11 +199,13 @@ A announces route to D → B (TTL=2) → C (TTL=1, re-announce only to
                                        directly-connected) → STOP
 ```
 
-`ROUTE_ANNOUNCE` is sent with TTL=2, so popular routes propagate
-exactly 2 hops.  Cache is TTL-based (60 s default), priced by
-RTT + jitter + congestion + battery (configurable scoring weights
-via `[routing]`).  Multi-path: top-K paths kept per destination for
-load-balancing and failover.
+A `ROUTE_ANNOUNCE` carries a TTL (time-to-live) of 2, so a popular route
+spreads exactly two hops and no further. Entries in the cache expire on
+their own (60 s by default). Each route gets a score from how it
+behaves — round-trip time, jitter, congestion, and the peer's battery —
+and you can tune what each factor counts for under `[routing]`. Veil
+keeps the best few paths to each destination, not just one, so it can
+spread load across them and fail over if one dies.
 
 ### 5.2 Kademlia DHT (cache miss)
 
@@ -192,17 +222,20 @@ Sender A wants to reach D, no cached route:
    After ≤ 16 hops, or mailbox fallback if D is offline.
 ```
 
-This is **O(log N)** in expectation.  Every successful delivery
-inserts a **reverse-path** entry into the cache, so subsequent
-messages in the same direction skip the DHT walk.
+Each hop roughly halves the distance to the target, so a message reaches
+it in about **O(log N)** hops — the count grows only slowly as the
+network grows. And every delivery that succeeds drops a **reverse-path**
+entry into the cache, so the next message heading the same way skips the
+DHT walk entirely.
 
 ### 5.3 Source routing (sender-specified path)
 
-When the sender already knows the relay path (e.g. operator-supplied
-trusted relay chain, or connectivity testing tool), it can send a
-`DeliveryMsg::RelayPath` frame carrying the full chain inside the
-payload.  Each hop just forwards to the next entry — no DHT lookups,
-no cache dependencies.  Max 64 hops in one frame.
+Sometimes the sender already knows the exact relay chain to use — say an
+operator handed it a trusted list, or a tool is testing connectivity. In
+that case it sends a `DeliveryMsg::RelayPath` frame with the whole chain
+packed inside. Each hop just hands the message to the next name on the
+list — no DHT lookups, nothing read from any cache. One frame can carry
+up to 64 hops.
 
 ```
 A → RelayPath{path=[B,C,D,E,F], next_hop=0, inner=msg}
@@ -210,13 +243,15 @@ B receives, sees path[0]=self, forwards to C with next_hop=1
 C → D → E → F (terminal): F decodes inner and delivers locally
 ```
 
-Used for: bridging pathological topologies, deterministic relay
-chains, debug connectivity testing.
+This is handy for reaching across awkward network shapes the DHT
+struggles with, for relay chains that must stay fixed, and for debugging
+whether two nodes can reach each other at all.
 
 ### 5.4 Mailbox fallback
 
-If a message cannot be delivered live (recipient sleeping, hop
-exhausted) it lands in a mailbox replica set:
+If a message can't be handed over live — the recipient is asleep, or the
+hop budget ran out — it goes into a mailbox instead, copied across a
+small set of nodes so it survives:
 
 ```
 sender → STORE(MailboxRef.put(content_id, payload), 3 replicas)
@@ -224,47 +259,56 @@ recipient (on wake): FETCH(MailboxRef.list(my_node_id))
               → FETCH(content_id, ack)
 ```
 
-Mailbox is sharded by `BLAKE3(node_id)` to 3 replicas, persisted via
-WAL, and ACKed once recipient confirms.
+Which nodes hold a given mailbox is decided by `BLAKE3(node_id)`, spread
+across 3 replicas. Each one writes the message to a write-ahead log so a
+crash won't lose it, and clears it only after the recipient confirms it
+arrived.
 
 ---
 
 ## 6. End-to-end encryption
 
-There are **two** distinct encryption layers:
+Veil encrypts in **two** separate layers, and they do different jobs:
 
 | Layer | Algorithm | Scope | Purpose |
 |-------|-----------|-------|---------|
 | Session | X25519 ephemeral + HKDF + ChaCha20-Poly1305 | per-hop | Wire encryption between adjacent nodes |
 | E2E | ML-KEM-768 + ChaCha20-Poly1305 | sender ↔ recipient | Payload is opaque to relays |
 
-Session keys rotate every reconnect.  E2E uses the recipient's
-**published** ML-KEM-768 encapsulation key (in DHT or session
-piggyback) — relays cannot read the payload even if they cooperate.
-Markers `0xE2`/`0xE3` flag E2E-wrapped envelopes inside `Forward`
-payloads.
+The session keys are fresh on every reconnect. The end-to-end layer
+seals the message with the recipient's **published** ML-KEM-768 key —
+found in the DHT, or piggybacked on a session — so the relays in between
+can't read the contents no matter how many of them collude. The markers
+`0xE2` and `0xE3` flag an end-to-end-wrapped envelope inside a `Forward`
+payload.
 
 ---
 
 ## 7. Application layer
 
-Apps talk to the node daemon over IPC (Unix socket / Windows NamedPipe
-/ TCP loopback).  Two primary primitives:
+An app talks to the node — which runs as a background daemon — over IPC,
+the local channel between two programs on the same machine (a Unix
+socket, a Windows named pipe, or TCP over loopback). There are two ways
+to send:
 
-- **AppSend** — fire-and-forget datagram to a remote `(node_id,
-  app_id, endpoint_id)` triple.
-- **Stream** — windowed reliable stream over the veil; the
-  daemon's `AppStreamTable` tracks per-stream state.
+- **AppSend** — a fire-and-forget datagram aimed at a remote
+  `(node_id, app_id, endpoint_id)` triple. You send it and move on; the
+  network makes its best effort.
+- **Stream** — a reliable, ordered stream over the veil, with flow
+  control so a fast sender can't drown a slow reader. The daemon's
+  `AppStreamTable` keeps the state for each open stream.
 
-App authentication uses `app_id` (a 32-byte handle issued at
-registration).  The IPC server gates capabilities — a Leaf-mode IPC
-client cannot, for example, request transit-relay.
+An app proves who it is with its `app_id`, a 32-byte handle it's given
+when it registers. The IPC server decides what each app may do — a
+client running in Leaf mode can't ask to relay transit traffic, for
+instance.
 
 ---
 
 ## 8. Wire protocol at a glance
 
-Every frame on the wire:
+Every frame Veil sends starts with the same fixed header, laid out
+byte by byte like this:
 
 ```
 [0..4]   magic        = "OVL1" (0x4F564C31)
@@ -278,15 +322,20 @@ Every frame on the wire:
 [24..]   body         = msg_type-specific payload
 ```
 
-Header is **24 bytes**, no TLV extensions in v1 (kill-switch rotates
-the magic to a new value if a variant is needed).  Body is opaque until
-dispatch.  Full reference: [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
+The header is a fixed **24 bytes**. There are no optional tacked-on
+fields in v1 — if a new variant is ever needed, a kill-switch simply
+rotates the magic number to a new value rather than bolting extensions
+onto the old one. The body stays untouched until dispatch decides what
+it is. Full reference: [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
 
 ---
 
 ## 9. NAT traversal
 
-Two-phase: **discovery** + **establishment**.
+Most nodes sit behind a home router that hides them behind one shared
+public address (this is NAT, network address translation), which makes
+them hard to reach directly. Veil gets two such nodes connected in two
+phases — first **discovery**, then **establishment**:
 
 ```
 Phase 1 — Discovery:
@@ -303,15 +352,16 @@ Phase 2 — Establishment:
             (configurable, off by default for Leaf).
 ```
 
-Local-network discovery uses UDP **mesh beacons** (multicast 239.x.x.x)
-so two phones on the same Wi-Fi find each other without going through
-a Core node at all.
+On a local network there's an even shorter path: nodes send out UDP
+**mesh beacons** (multicast to 239.x.x.x), so two phones on the same
+Wi-Fi find each other directly, without involving a Core node at all.
 
 ---
 
 ## 10. Anti-abuse
 
-Layered defense, all per-peer:
+Defenses stack in layers, and each one is tracked per peer, so one bad
+actor can't spoil things for everyone else:
 
 | Layer | Action |
 |-------|--------|
@@ -323,9 +373,10 @@ Layered defense, all per-peer:
 | Memory budget | Global RAM cap with priority-based eviction |
 | Congestion monitor | Real-time load; >78% → drop transit frames |
 
-Violations are emitted by every dispatch handler that detects a
-protocol invariant break (bad signature, decode failure, mis-routed
-frame, etc.).  Specifics in [SECURITY.md](SECURITY.md).
+Any dispatch handler that spots a peer breaking the rules — a bad
+signature, a frame it can't decode, a frame sent to the wrong place —
+records a violation against that peer. The details are in
+[SECURITY.md](SECURITY.md).
 
 ---
 
@@ -348,7 +399,8 @@ frame, etc.).  Specifics in [SECURITY.md](SECURITY.md).
 
 ## 12. A note on terminology
 
-The version of OVL1 documented here is **OVL1 v1** (magic
-`0x4F564C31`, version byte `0x01`).  Capability negotiation extends
-the protocol forward; old nodes simply ignore unknown frame families
-(`Unknown → forward-compatible`).
+Everything above describes **OVL1 v1** (magic `0x4F564C31`, version byte
+`0x01`). The protocol grows by having nodes negotiate which features
+they support, and it grows safely: an old node that meets a frame family
+it doesn't recognize just ignores it (`Unknown → forward-compatible`)
+rather than choking on it.

@@ -1,6 +1,31 @@
 # Security Model
 
+This page is the security and threat model for a Veil node. It is written to be
+read top to bottom by an auditor: every row names a concrete attack, the defense
+that ships today, and where in the code that defense lives. Terms of art are
+spelled out the first time they appear.
+
+A note on scope. "Implemented" means the defense is in the shipping code, not
+that it is proven optimal. The [Open Risks](#open-risks) section at the bottom is
+deliberately honest about what is still weak. Read it.
+
 ## Threat Model
+
+Each row below pairs one attack with the mitigation that blocks (or blunts) it. A
+few terms used in the table:
+
+- **Sybil attack** — one operator spins up a flood of fake identities to gain
+  outsized influence. Veil makes each identity cost CPU time to mint (Proof of
+  Work), so a flood gets expensive.
+- **Eclipse attack** — an attacker surrounds your node with nodes it controls,
+  cutting you off from the honest network. Diversity rules in the routing table
+  stop any one network neighborhood from owning all your slots.
+- **Replay** — an attacker re-sends a message it captured earlier, hoping it gets
+  acted on twice. Deduplication (**dedup**) remembers what was already seen and
+  drops the repeat.
+- **DHT** — the distributed hash table: the shared address book all nodes keep
+  together. Poisoning, deletion abuse, and enumeration are the ways an attacker
+  tries to corrupt or mine it.
 
 | Attack | Mitigation | Status |
 |--------|-----------|--------|
@@ -24,6 +49,16 @@
 
 ## Cryptographic Primitives
 
+These are the building blocks the rest of the system stands on. A few terms:
+**AEAD** (authenticated encryption with associated data) both hides a message and
+detects any tampering with it. **HKDF** is a key-derivation function — it turns
+one shared secret into several purpose-specific keys. A **nonce** is a number
+used once per encryption so the same plaintext never encrypts to the same bytes
+twice; reusing one breaks the cipher, which is why we **rekey** (switch to fresh
+keys) before any counter can wrap. **PoW** is the Proof of Work puzzle mentioned
+above. "PQ" marks the post-quantum options, chosen to stay safe even against a
+future quantum computer.
+
 | Purpose | Algorithm | Notes |
 |---------|-----------|-------|
 | Identity | Ed25519, Falcon-512, or Ed25519+Falcon-512/1024 hybrids (PQ) | Configurable per-node; `node_id = BLAKE3(pubkey)` |
@@ -36,13 +71,23 @@
 
 ## Key Material Protection
 
-- `PowParams`, `Base64PrivateKey`, `Base64PublicKey`: Debug output redacted
-- `SessionKeys`: custom Debug impl with redaction
-- `IdentityConfig`, `MetricsConfig`: Debug output redacted (C-12)
-- Session keys derived via HKDF-SHA256; tx/rx assignment is mirrored by lex-ordering both peers' node_ids
-- Nonce counter overflow detected and session rekeyed
+Secret keys are the crown jewels, so they get special handling. Two rules apply
+throughout: keys never leak into debug logs, and long-lived secrets are pinned in
+memory so they can't be swapped to disk or captured in a crash dump.
+
+- `PowParams`, `Base64PrivateKey`, and `Base64PublicKey` redact their secrets
+  from debug output.
+- `SessionKeys` has a custom `Debug` implementation that does the same.
+- `IdentityConfig` and `MetricsConfig` also redact their debug output (C-12).
+- Session keys are derived with HKDF-SHA256. The two peers agree on which key is
+  for sending versus receiving by lex-ordering both of their `node_id`s, so the
+  assignment comes out mirrored on each side.
+- If the nonce counter ever overflows, that is detected and the session is
+  rekeyed before any nonce can repeat.
 
 ## Open Risks
+
+Honest gaps. Each is a known weakness with a plan, not a surprise.
 
 | Risk | Description | Mitigation Plan |
 |------|-------------|-----------------|

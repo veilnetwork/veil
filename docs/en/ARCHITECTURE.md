@@ -1,8 +1,13 @@
 # Veil Network Architecture
 
-> For an exhaustive, source-level walkthrough see [ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md).
+This is the one-page tour: the layers a message passes through, the two kinds of
+node, and the pieces that make it all work. For an exhaustive, source-level
+walkthrough, see [ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md).
 
 ## Layers
+
+Every message moves top to bottom through these layers. Each one has a single
+job and hands off to the next.
 
 ```
 Application Layer     App ←→ IPC ←→ AppEndpointRegistry
@@ -32,13 +37,24 @@ Transport Layer       TCP / TLS / QUIC / WebSocket (ws,wss) / Unix / SOCKS5
 | Leaf | - | - | - | - | Mobile, IoT, lightweight clients |
 | Core | yes (K=20) | yes | yes | yes (configurable) | Full network participant |
 
-All Core nodes are equal: DHT, relay/forwarding, mailbox, PoW ≥ 24 bits.
-Gateway functionality (attachment records for leaf nodes) is on when `CAN_GATEWAY_LOCAL_MESH`
-flag is set in capabilities; configurable via `[gateway] enabled = false`.
-Legacy roles `Relay / Gateway / CoreRouter` are not part of the protocol — the network has
-exactly two roles.
+There are exactly two roles. A **leaf** is a lightweight client (phone, IoT
+device) that reaches out but stores nothing. A **core** node is a full
+participant: it carries the DHT, relays and forwards traffic, runs a mailbox,
+and mines proof-of-work of at least 24 bits.
+
+All core nodes are equal — none is more privileged than another. Gateway duty
+(holding attachment records on behalf of leaf nodes) is the one optional extra:
+it turns on when the `CAN_GATEWAY_LOCAL_MESH` capability flag is set, and you can
+disable it with `[gateway] enabled = false`.
+
+The older role names `Relay / Gateway / CoreRouter` are not part of the protocol.
+Two roles, nothing more.
 
 ## Data Flow: Message Delivery
+
+What happens when one app sends a message to another. The fast path uses a cached
+route; if that misses, the node falls back to a DHT lookup, and if even that
+can't reach a live recipient, the message waits in a mailbox.
 
 ```
 Sender App
@@ -55,12 +71,18 @@ Sender App
 
 ## Routing
 
+How a node decides where to send a message next. Four mechanisms work together:
+
 - **Gossip**: ROUTE_ANNOUNCE with TTL=2 (local neighbours only)
 - **DHT forwarding**: RecursiveRelay O(log N) hops through Kademlia closest nodes
 - **Route cache**: TTL-based, adaptive capacity, reverse path caching
 - **Scoring**: RTT + Vivaldi + jitter + congestion + battery
 
 ## Security Layers
+
+Security is layered: each line below is an independent defence, so a weakness in
+one does not unravel the rest. AEAD here means *authenticated encryption with
+associated data* — it both hides the payload and detects any tampering.
 
 1. **Identity**: Ed25519 **or** Falcon-512 signing key + PoW mining (24+ bits, adaptive)
 2. **Handshake**: X25519 + ML-KEM-768 hybrid key exchange
@@ -72,12 +94,17 @@ Sender App
 
 ## Threading Model
 
+The node runs on a single async runtime and keeps its locking discipline simple
+on purpose — most concurrency bugs come from tangled locks, so there are none.
+
 - **Tokio runtime**: all async I/O, session management, periodic tasks
 - **Shared state**: `Arc<Mutex<_>>` for caches, `Arc<AtomicU64>` for counters
 - **No nested locks**: single-lock-at-a-time convention prevents deadlocks
 - **Dispatcher**: sync dispatch on `FrameHeader` → `DispatchResult` (no async in hot path)
 
 ## Key Subsystems
+
+The major moving parts and where each lives in the source tree.
 
 | Subsystem | Module | Purpose |
 |-----------|--------|---------|

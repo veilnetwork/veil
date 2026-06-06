@@ -2,10 +2,20 @@
 
 **Status**: design-locked 2026-04-20.
 
-This document is the reference specification for veil's sovereign identity
-layer: stable `node_id`, master key + per-device subkeys, short-lived
-delegations with auto-reissue, standalone (single-device) mode, and
-multi-device operation under one master.
+This is the reference specification for veil's identity layer. "Identity"
+here means a node's permanent name plus the keys that prove it owns that
+name. Your identity is yours alone — no company issues it and no registry
+can take it away. The pieces:
+
+- a stable **`node_id`** — your permanent address, computed from your key;
+- a **master key** that you keep safe, plus short-lived **device keys** it
+  signs off on — one per phone, laptop, or server;
+- **delegations** — the master key's signed permission slips that say "this
+  device key is really mine," reissued automatically before they expire;
+- **standalone mode** for people with a single device, and
+- **multi-device** operation, where many devices share one identity.
+
+Each of these is explained in full below; the bullets are just the map.
 
 ## Quick reference
 
@@ -27,36 +37,41 @@ Standalone mode:
   ⟹ node_id == device_id == BLAKE3(device_pk)  // single self-signed delegation
 ```
 
-**No revocation flow**: the mitigation for compromise is
-the short `valid_until_unix` window (default 7 days) plus auto-reissue
-at half-validity.  A compromised device's cert ages out within ≤ 7 days
-even without operator intervention.
+**There is no revocation flow** — no way to broadcast "cancel this key right
+now." We don't need one. Every delegation expires on its own after a short
+window (`valid_until_unix`, 7 days by default), and a healthy device renews
+its delegation halfway through that window. So if a device is stolen, its
+delegation simply stops being renewed and dies within 7 days on its own — no
+emergency action required.
 
 ## Goals
 
-1. **Stable identity** — a `node_id` that survives key rotation, device
-   loss, and compromise recovery. Once registered, it's permanent until user
-   abandons it.
-2. **Free registration** — any user with a keypair can register. No
-   gatekeeper, no central registry, no DNS.  Short delegation validity
-   replaces rate-limit-by-PoW at the document level.
-3. **Standalone-mode default** — single-device users (phone-only, laptop-only)
-   need no master-key ceremony.  The runtime auto-builds a degenerate
-   `IdentityDocument` where `master_pk == device_pk` on first start.
-4. **Multi-device** — one identity, many devices (phone + laptop + desktop).
-   Each device runs with its own signing key, master-certified for ≤ 7 days
-   at a time; auto-reissue at half-validity keeps long-running honest
-   devices fresh.
-5. **Load balancing** — the same `node_id` can route to multiple devices
-   based on score / RTT / last-seen.
-6. **Zero external trust** — no DNS verification, no guardians, no social
-   recovery. Only cryptography.
-7. **Forward secrecy for async messages** — compromise of keys later does not
-   decrypt past messages (X3DH-style pre-keys).
-8. **Time-bounded compromise** — no in-band revocation
-   channel to defend.  Instead each delegation has a 7-day `valid_until`,
-   re-issued by the master at half-validity.  A compromised device's cert
-   ages out within ≤ 7 days regardless of operator action.
+1. **Stable identity.** Your `node_id` survives key rotation, a lost device,
+   and recovery after a break-in. Once you register it, it's yours until you
+   walk away from it.
+2. **Free registration.** Anyone with a key pair can register. There's no
+   gatekeeper, no central registry, and no DNS. Short delegation lifetimes do
+   the rate-limiting that a proof-of-work puzzle would otherwise do at the
+   document level. (Proof of work, or PoW, is a small CPU puzzle that makes
+   spam expensive; it still guards name claims, covered later.)
+3. **Standalone mode by default.** If you have just one device — only a phone,
+   only a laptop — you shouldn't have to perform a master-key ceremony. On
+   first start the runtime quietly builds a one-device `IdentityDocument`
+   where the master key and the device key are the same key.
+4. **Multi-device.** One identity, many devices — phone plus laptop plus
+   desktop. Each device signs with its own key, and the master vouches for
+   that key for 7 days at a stretch. Auto-reissue at the halfway mark keeps
+   honest, long-running devices current.
+5. **Load balancing.** The same `node_id` can route to several devices, picking
+   one by score, round-trip time, or how recently it was seen.
+6. **Zero external trust.** No DNS to verify against, no guardians, no social
+   recovery. Cryptography is the only thing you rely on.
+7. **Forward secrecy for async messages.** If your keys leak later, your past
+   messages stay sealed (this uses X3DH-style pre-keys).
+8. **Time-bounded compromise.** There's no live revocation channel to guard.
+   Instead every delegation carries a 7-day `valid_until`, and the master
+   reissues it at the halfway point. A stolen device's certificate ages out
+   within 7 days no matter what the operator does.
 
 ## Conceptual model
 
@@ -116,29 +131,30 @@ device_sk_seed (32 B Ed25519 seed, runtime-generated or from [identity] config)
      │     └── document_sig by the lone subkey
 ```
 
-The wire format is unchanged.  An external observer cannot distinguish a
-standalone document from a freshly-created multi-device document with one
-delegation: the `master_pubkey == identity_keys[0].pubkey` equivalence
-holds for both.
+The bytes on the wire are exactly the same in both modes. An outside observer
+can't tell a standalone document apart from a brand-new multi-device document
+that happens to have one delegation: in both, `master_pubkey` equals
+`identity_keys[0].pubkey`.
 
-**Key invariants**:
+**The invariants worth remembering**:
 
-- `node_id` changes **only** on master_seed loss (catastrophic, analogous
-  to Bitcoin wallet seed loss).
-- In multi-device mode: `master_seed` lives **only on the primary device**;
-  other devices get their own independent identity_sk via pairing or
-  `identity delegate-device` with master certification.
-- In standalone mode: there is no separate master_seed — the device key IS
-  the master key.  Re-issue happens automatically every ~3.5 days via the
-  maintenance tick; no operator action required.
-- Per-device delegations: compromise of one device's cert
-  naturally expires within ≤ 7 days even without operator action; the
-  master simply stops re-issuing.
-- Multiple devices under one `node_id` — native use case (load balancing +
-  multi-device messenger).
-- Session dedup by `(node_id, instance_id)` — per-peer.  `instance_id` is
-  a 16-byte compatibility shim derived from `device_id[..16]`; new code
-  should prefer the full 32-byte `device_id`.
+- Your `node_id` changes **only** if you lose the master seed (the 32-byte
+  secret everything is derived from). That's catastrophic — the same kind of
+  loss as misplacing a Bitcoin wallet's seed.
+- In multi-device mode the master seed lives **only on your primary device**.
+  Every other device gets its own independent device key, either by pairing or
+  by running `identity delegate-device`, and the master certifies it.
+- In standalone mode there is no separate master seed at all — the device key
+  *is* the master key. The delegation renews itself roughly every 3.5 days on
+  the maintenance tick, with nothing for you to do.
+- Each device's delegation stands on its own. If one is compromised, it simply
+  expires within 7 days; the master just stops renewing it.
+- Running many devices under one `node_id` is the intended case, not a corner
+  case — that's what powers load balancing and the multi-device messenger.
+- veil keeps one session per `(node_id, instance_id)` pair for each peer.
+  `instance_id` is a 16-byte stand-in kept for backward compatibility, taken
+  from the first half of `device_id` (`device_id[..16]`); new code should
+  prefer the full 32-byte `device_id`.
 
 ## Cryptographic primitives
 
@@ -151,11 +167,12 @@ holds for both.
 | Master-seed backup encoding | BIP39 (English, 24 words) |
 | Password KDF (encrypted master file) | Argon2id |
 
-Domain-separated signing contexts prevent cross-protocol sig substitution.
-There is no `REVOKE_CONTEXT` or `FRESHNESS_CONTEXT` — no in-band
-revocation, no separate freshness sig.  The document-level
-`valid_until_unix` plus per-key `valid_until_unix` are the only freshness
-mechanisms:
+Every signature is tied to a named context string, so a signature made for one
+purpose can never be replayed as if it meant another. Notice what's *missing*:
+there's no `REVOKE_CONTEXT` and no `FRESHNESS_CONTEXT`, because there's no live
+revocation and no separate freshness signature. The only things that say "this
+is still current" are the document's `valid_until_unix` and each key's own
+`valid_until_unix`:
 
 ```rust
 const CERTIFY_CONTEXT: &[u8] = b"veil.certify.v1";
@@ -181,34 +198,38 @@ master_sk = HKDF-SHA256(
 node_id = BLAKE3(master_pubkey)        // 32 bytes; bare hash, no domain tag
 ```
 
-The binding is a bare BLAKE3 hash, matching the runtime's
-`cfg::NodeId::from_public_key` derivation.
-In standalone mode this yields `node_id == device_id ==
-BLAKE3(device_pubkey)` byte-for-byte against the same pubkey.
+It's a plain BLAKE3 hash with no extra tag — BLAKE3 is the fast, modern hash
+function veil uses throughout. This matches the runtime's
+`cfg::NodeId::from_public_key` exactly. In standalone mode the same public key
+feeds both formulas, so `node_id == device_id == BLAKE3(device_pubkey)`,
+byte for byte.
 
-Cross-algorithm collisions (e.g. an Ed25519 pubkey hashing to the same
-BLAKE3 output as a Falcon-512 pubkey) are practically impossible: BLAKE3
-is a 256-bit hash and the algorithm byte is part of the surrounding
-`IdentityKey` cert that the verifier checks separately.
+Could two different signature algorithms ever hash to the same `node_id` — say
+an Ed25519 key and a Falcon-512 key landing on the same output? In practice,
+no. BLAKE3 produces a 256-bit value, and on top of that the algorithm byte
+lives inside the surrounding `IdentityKey` certificate, which the verifier
+checks separately.
 
 ### device_id binding
 
-Each per-device delegation carries an explicit `device_id` field, and the
-verifier rejects any cert where the binding does not hold:
+Every per-device delegation carries its `device_id` right in the open, and the
+verifier throws out any certificate where that field doesn't match the hash of
+the key:
 
 ```
 device_id = BLAKE3(device_pubkey)      // 32 bytes; same shape as node_id
 ```
 
-This makes per-device addresses deterministic and observable from the wire
-without trusting the sender.
+Because the address is just a hash of the key, anyone can recompute it
+straight from the wire and confirm it — there's no need to take the sender's
+word for anything.
 
 ## IdentityDocument wire format
 
 DHT key: `BLAKE3("veil.identity_dht.v1" || node_id)`.
 
-Source-of-truth: `crates/veil-proto/src/identity_document.rs`.  This
-section reproduces the layout for documentation purposes only.
+The real definition lives in `crates/veil-proto/src/identity_document.rs`; the
+layout below is here for reading, not as the authority.
 
 ```
 Layout (canonical bytes — all integers big-endian unless noted):
@@ -227,18 +248,20 @@ Layout (canonical bytes — all integers big-endian unless noted):
 [last]       document_sig                      [u8; S]
 ```
 
-**Policy caps** (enforced at decode):
-- `identity_keys_count ≤ MAX_IDENTITY_KEYS = 8`
-- `valid_until_unix - issued_at_unix ≤ MAX_FRESHNESS_WINDOW_SECS = 30 days`
-- Total document size ≤ `MAX_IDENTITY_DOCUMENT_BYTES = 16384` bytes (16 KiB,
-  hard cap; sized to hold a fully-rotated Falcon hybrid document and matched
-  to the DHT value cap)
+**Hard limits**, checked the moment a document is decoded:
+- at most 8 device keys (`identity_keys_count ≤ MAX_IDENTITY_KEYS = 8`);
+- the freshness window can't exceed 30 days
+  (`valid_until_unix - issued_at_unix ≤ MAX_FRESHNESS_WINDOW_SECS = 30 days`);
+- the whole document must fit in 16 KiB
+  (`MAX_IDENTITY_DOCUMENT_BYTES = 16384` bytes). That ceiling is big enough to
+  hold a fully-rotated Falcon hybrid document and lines up with the largest
+  value the DHT will store.
 
-The document carries no replay-guard `document_version`, no
-`revocation_seq` / `revoked_keys[]` / `RevocationEntry`, no
-`freshness_hour` / `master_freshness_sig` / document-level `pow_nonce`,
-and no `extensions_root`.  Mitigation is short delegation validity; the
-document's own `valid_until_unix` is the only freshness mechanism.
+Notice what the document leaves out. There's no `document_version` replay
+guard, no `revocation_seq` / `revoked_keys[]` / `RevocationEntry`, no
+`freshness_hour` / `master_freshness_sig` / document-level `pow_nonce`, and no
+`extensions_root`. Short delegation lifetimes do that job instead, and the
+document's own `valid_until_unix` is the only thing that marks it as current.
 
 ### `IdentityKey` (per-device delegation)
 
@@ -268,22 +291,23 @@ CERTIFY_CONTEXT
 
 ### Document signing
 
-`document_sig` covers the canonical bytes of all fields above (excluding
-`document_sig_len` and `document_sig` itself):
+`document_sig` is a signature over the canonical bytes of every field above —
+all of them except `document_sig_len` and `document_sig` itself:
 
 ```
 DOC_SIG_CONTEXT || canonical_bytes_up_to_doc_sig
 ```
 
-Signed by the current active identity_sk (referenced by `sig_key_idx`).
-In standalone mode the active subkey IS the master, so the document_sig
-and the lone `IdentityKey.master_sig` are produced by the same key.
+The signer is whichever device key is currently active, pointed to by
+`sig_key_idx`. In standalone mode that active key *is* the master, so the
+`document_sig` and the single `IdentityKey.master_sig` both come from the same
+key.
 
 ## Verifier algorithm
 
-Input: `doc: IdentityDocument`, `now_unix_secs: u64`.
-
-Source-of-truth: `crates/veil-identity/src/verify.rs`.
+It takes two inputs: the document to check (`doc: IdentityDocument`) and the
+current time (`now_unix_secs: u64`). Here's what it does, in order. The real
+code lives in `crates/veil-identity/src/verify.rs`.
 
 1. Magic `"ID"` and version.
 2. Recompute `node_id = BLAKE3(master_pubkey)`, reject on mismatch.
@@ -308,9 +332,9 @@ Returns `ValidatedIdentity {
   active_instance_id,                // compat shim: device_id[..16]
 }`.
 
-The verifier does not touch a persistent revocation cache, does not
-check document-level PoW, and does not verify a separate freshness
-signature.
+Notice the three things the verifier never does: it doesn't consult a saved
+revocation list, it doesn't check any document-level proof of work, and it
+doesn't look for a separate freshness signature. None of those exist.
 
 ## Lifecycle operations
 
@@ -340,13 +364,16 @@ signature.
 4. `document_sig = device_sk.sign(DOC_SIG_CONTEXT || canonical)`.
 5. Persist `identity_document.bin` + `device_identity_sk.bin`.
 
-The runtime auto-runs steps 1-5 on first start when `identity_document.bin`
-is absent and the `[identity]` config has an Ed25519 keypair
-(auto-bootstrap).
+You rarely run these steps by hand. On first start, if there's no
+`identity_document.bin` yet and your `[identity]` config already holds an
+Ed25519 key pair, the runtime walks through steps 1 to 5 for you. This is the
+auto-bootstrap path.
 
 ### Auto-reissue at half-validity
 
-The maintenance loop runs on every cleanup tick (~30 s default):
+A delegation that's renewed only when it's about to die would cut things too
+close. So the maintenance loop checks on every cleanup tick (about every 30
+seconds by default) and renews at the halfway mark:
 
 1. Read the active `IdentityKey.valid_until_unix`.
 2. If `now + DELEGATION_VALIDITY_SECS / 2 < valid_until` — no-op (>
@@ -354,42 +381,46 @@ The maintenance loop runs on every cleanup tick (~30 s default):
 3. Otherwise, in **standalone mode**, the runtime re-signs in-place:
    `master_sk == device_sk == self.identity_sk` is already in memory.
    New `valid_until = now + 7 days` (full window again).
-4. In **multi-device mode**, the tick is a no-op — the master_sk lives
-   on a different device.  The operator runs `veil-cli identity
-   delegate-device --pubkey-file ... --validity 7d` from the master
-   device before the existing delegation expires; the resulting updated
-   document is transported (USB / scp / QR) to the target device and
-   dropped into `<veil_dir>/identity_document.bin`.  The on-change
-   mtime poll in `runtime/sovereign_republish.rs` (60 s cadence) picks
-   up the new document and DHT-republishes it.
+4. In **multi-device mode** the tick does nothing, because the master key
+   lives on another device. Here you renew by hand. Before the current
+   delegation expires, run `veil-cli identity delegate-device --pubkey-file
+   ... --validity 7d` on the master device. Then carry the updated document to
+   the target device however you like — USB stick, `scp`, or a QR code — and
+   drop it in `<veil_dir>/identity_document.bin`. The runtime watches that
+   file's modification time (a 60-second poll in
+   `runtime/sovereign_republish.rs`), notices the change, and republishes the
+   new document to the DHT.
 
 ### Pairing a new device (QR ceremony)
 
-See `crates/veil-cli/src/cmd/sovereign_identity.rs::{pair_invite, pair_listen,
-pair_accept}` for the runtime implementation.
+To add a second device, the two devices run a short QR-code handshake. For the
+working implementation, see `crates/veil-cli/src/cmd/sovereign_identity.rs::{pair_invite,
+pair_listen, pair_accept}`.
 
 ### Compromise mitigation
 
-There is **no in-band revocation channel**.  Instead:
+Say a device gets stolen. There's **no live revocation channel** to shout
+"cancel this key." Instead the fix plays out on its own:
 
-1. The operator stops re-issuing the compromised device's delegation
-   (multi-device: simply doesn't run `delegate-device` for that pubkey
-   any more; standalone: rolls the device key via `identity standalone
-   --force` if the master SK itself was compromised).
-2. The compromised cert ages out within ≤ 7 days as `valid_until_unix`
-   passes.  Verifiers reject the cert (step 4b
-   `KeyExpired`); peers stop accepting handshakes from that device.
-3. Long-term sessions already established with the compromised device
-   continue until they hit their own session-rekey TTL.
+1. You stop renewing that device's delegation. On multi-device, that just
+   means you don't run `delegate-device` for its key any more. On standalone,
+   if the master key itself leaked, you roll the device key with `identity
+   standalone --force`.
+2. Within 7 days the certificate ages out as its `valid_until_unix` slips into
+   the past. From then on verifiers reject it (step 4b, `KeyExpired`), and
+   peers stop accepting handshakes from that device.
+3. Sessions already running with the stolen device keep going until they hit
+   their own rekey deadline.
 
-This trades response time (≤ 7 days vs minutes for an in-band revoke)
-for a much smaller protocol surface — no revocation gossip, no
-revocation cache, no `revoked_keys[]` field, no `master_freshness_sig`.
+The trade is plain: you wait up to 7 days instead of cancelling in minutes,
+and in return the protocol stays small — no revocation gossip, no revocation
+cache, no `revoked_keys[]` field, no `master_freshness_sig`.
 
 ## Name resolution
 
-Names are claimed under ASCII-only whitelist `[a-z0-9#_-]`, case-insensitive
-(normalized to lowercase before hashing):
+A name lets a human-friendly handle stand in for a `node_id`. Names use only
+the ASCII characters `[a-z0-9#_-]` and ignore case — everything is lowercased
+before it's hashed:
 
 ```
 name_dht_key = BLAKE3("veil.name_claim_dht.v1" || u16_be(len(name)) || name.as_bytes())
@@ -404,10 +435,12 @@ NameClaim value contains:
 - signature by any active identity_sk
 - rarity-proportional PoW nonce
 
-Resolver fetches NameClaim → extracts node_id → fetches IdentityDocument
-→ validates cert chain → resolves to `ValidatedIdentity`.
+Looking a name up is a short chain: the resolver fetches the NameClaim, reads
+the `node_id` out of it, fetches that node's IdentityDocument, checks the
+certificate chain, and ends up with a `ValidatedIdentity`.
 
-**PoW difficulty scales by rarity**:
+The proof-of-work cost rises the rarer — and so the more valuable — a name is,
+which is what keeps short, desirable names from being grabbed in bulk:
 - 1-3 char ASCII alphabetic: 28-30 (hours of CPU)
 - 4-6 char: 22-26 (minutes)
 - 7-12 char: 18-22 (seconds to minutes)
@@ -416,17 +449,19 @@ Resolver fetches NameClaim → extracts node_id → fetches IdentityDocument
 
 ## InstanceRegistry
 
-Separate DHT record, updated on online/offline transitions.  Compact
-(typically < 2 KB).  Source-of-truth:
+This is a small, separate DHT record that lists which devices are currently
+online. It's refreshed whenever a device comes up or drops off, and it stays
+compact — usually under 2 KB. The real definition is in
 `crates/veil-proto/src/instance_registry.rs`.
 
 ```
 DHT key = BLAKE3("veil.instances_dht.v1" || node_id)
 ```
 
-The registry carries no `tier_b` block; `mailbox_anchor` and encrypted
-contact hints are not part of the schema.  Transport hints live in
-`SignedTransportAnnouncement` gossip.  The current shape:
+A couple of things are deliberately absent: there's no `tier_b` block, and
+neither `mailbox_anchor` nor encrypted contact hints belong here. Hints about
+how to reach a device travel separately, in `SignedTransportAnnouncement`
+gossip. Here's the shape today:
 
 ```
 InstanceRegistry {
@@ -448,7 +483,9 @@ InstanceEntry {
 
 ## Routing: InstanceTag
 
-Wire-level `Recipient`:
+When you address a message, you say *who* (`node_id`) and *which device* (an
+`InstanceTag`). The tag is what lets one identity fan out to many devices.
+Here's the `Recipient` as it appears on the wire:
 
 ```
 Recipient {
@@ -463,16 +500,20 @@ enum InstanceTag {
 }
 ```
 
-Note: the runtime still keys on a 16-byte `instance_id` (truncation of
-the full 32-byte `device_id`) for session dedup + dispatcher delivery.
+One implementation note: internally the runtime still keys on the 16-byte
+`instance_id` (the first half of the full 32-byte `device_id`) when it
+deduplicates sessions and routes deliveries.
 
 ## Threat model
 
-See [`docs/recovery.md`](recovery.md) and
-[`docs/opsec-user-guide.md`](opsec-user-guide.md) for user-facing
-operational security concerns.
+This section lays out which attacks veil stops, which it leaves to you, and
+which it deliberately doesn't try to handle. For the everyday operational side
+of staying safe, see [`docs/recovery.md`](recovery.md) and
+[`docs/opsec-user-guide.md`](opsec-user-guide.md).
 
-### In scope (veil defends)
+### What veil defends against
+
+Each line below names an attack and the defense that turns it away:
 
 - `node_id` hijacking via pre-image attack on BLAKE3 — infeasible (2^256).
 - `device_id` spoofing — verifier rejects any cert where `device_id !=
@@ -480,19 +521,22 @@ operational security concerns.
 - Daily `identity_sk` leak (malware, stolen laptop) — compromised cert
   ages out within ≤ 7 days as the master stops re-issuing.
 - Name squatting — rarity-proportional PoW (still in NameClaim layer).
-- QR pairing phishing — OOB confirmation code.
+- QR pairing phishing — an out-of-band confirmation code both sides compare.
 - Document update flood from compromised key — per-identity DHT quota.
 - Eclipse attack on identity resolution — multi-replica quorum.
 - Forward secrecy for past async messages — X3DH one-time prekeys.
 
-**Out of scope by design**:
-- Sub-7-day compromise response.  Use `identity standalone --force` (for
-  master compromise on a standalone) or `identity rotate` + waiting for
-  the natural 7-day window (multi-device).
-- Stale revocation attacks.  No revocation channel exists; nothing to be
-  stale.
+**Things veil deliberately doesn't try to do**:
+- Cancel a compromised key in under 7 days. If you can't wait, use `identity
+  standalone --force` (when the master leaks on a standalone) or `identity
+  rotate` and let the natural 7-day window run out (multi-device).
+- Defend against stale-revocation attacks. There's no revocation channel, so
+  there's nothing that can go stale.
 
-### Out of scope (user OpSec responsibility)
+### What's on you (user OpSec)
+
+These aren't bugs veil can fix — they're the parts that depend on how you
+guard your secrets:
 
 - `master_seed` physical backup loss — identity is permanently lost (as with
   Bitcoin wallet seed).
@@ -508,8 +552,9 @@ operational security concerns.
 
 ## Algorithm agility
 
-`master_algo: u8` and each `IdentityKey.algo: u8` allow mixed algorithm
-deployments. A user can:
+Both `master_algo: u8` and each key's `IdentityKey.algo: u8` record which
+signature algorithm that key uses, so one identity can mix algorithms and
+migrate over time. You can:
 
 - Start with Ed25519 identity.
 - Add Falcon-512 subkeys later (master certifies them).

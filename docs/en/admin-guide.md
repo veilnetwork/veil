@@ -2,46 +2,69 @@
 
 ## Overview
 
-An OVL1 node is configured through a single TOML file. Administrative management is performed via `veil-cli` or directly through the JSON-over-socket admin protocol (not to be confused with the binary OVL1 wire protocol between nodes).
+You run a Veil node by configuring it through a single TOML file (a plain-text
+settings file). One file holds everything the node needs to know.
 
-### Admin protocol transport
+There are two ways to manage a running node. You can use the `veil-cli` command,
+or you can talk to the node directly over its admin protocol — a simple
+request/response channel that sends JSON over a local socket. (Don't confuse this
+with the OVL1 *wire protocol*, the compact binary format nodes use to talk to
+each other. The admin protocol is for you and your tools; the wire protocol is
+for the nodes.)
 
-Epic 451 added a TCP-loopback backend: `global.admin_socket` can be
-`unix:///path/to/admin.sock` (the default on Linux/macOS) or
-`tcp://127.0.0.1:0?runtime_dir=/abs/path` (mandatory on Windows — Unix
-domain sockets are unavailable there).
+### How the admin protocol connects
+
+The node listens for admin commands on a local channel. You pick which kind with
+`global.admin_socket`. There are two choices.
+
+The first is a *Unix domain socket* — a special file on disk that programs on the
+same machine use to talk to each other. This is the default on Linux and macOS:
+`unix:///path/to/admin.sock`.
+
+The second is *TCP-loopback* — a network connection that never leaves your own
+machine (it stays on `127.0.0.1`, the address every computer uses for itself):
+`tcp://127.0.0.1:0?runtime_dir=/abs/path`. This is the only option on Windows,
+because Unix domain sockets aren't available there.
 
 | Backend | Config | Where the files live | UID equality check |
 |--------|--------|-----------------|------------------------|
 | Unix | `unix:///abs/admin.sock` | The socket file itself (mode `0o600`) | `SO_PEERCRED` / `getpeereid` |
 | TCP-loopback | `tcp://127.0.0.1:0?runtime_dir=…` | `admin.port` + `admin.token` in `runtime_dir` | 32-byte token (`subtle::ct_eq`) |
 
-The TCP backend binds `127.0.0.1` and only `127.0.0.1`: `localhost`, `::1` are
-also allowed, any other host is rejected by the validator (admin over a public
-port is insecure even with a token).
+The TCP backend binds to `127.0.0.1` and nothing else. `localhost` and `::1`
+(the same loopback address, written other ways) are allowed too; any other host
+is rejected by the validator. Serving admin commands on a public port is unsafe
+even behind a token, so the node simply won't do it.
 
-Clients (`veil-cli`, direct connections) obtain both forms through a single
-`admin_socket_path(config)` — for TCP it returns a synthetic
-`runtime_dir/admin.anchor`; the actual connection is made via
-`connect_admin_client_any`, which looks for `admin.port` + `admin.token`
-next to the anchor and goes over TCP, or falls back to the Unix socket.
+Clients — `veil-cli` and any direct connection — find the right channel through a
+single helper, `admin_socket_path(config)`. For TCP it hands back a stand-in path,
+`runtime_dir/admin.anchor`. The real connection is then made by
+`connect_admin_client_any`, which looks next to that anchor for `admin.port` and
+`admin.token`, connects over TCP if it finds them, and otherwise falls back to
+the Unix socket.
 
 ---
 
 ## Configuration file
 
-The configuration file is located by default at:
+By default, the node looks for its config file here:
 - Linux: `~/.config/veil/config.toml`
 - macOS: `~/Library/Application Support/veil/config.toml`
 - Windows: `%APPDATA%\veil\config.toml`
 
-To set the path explicitly: `veil-cli --config /etc/veil/config.toml node run`
+To point it somewhere else, pass the path yourself: `veil-cli --config /etc/veil/config.toml node run`
 
-> An exhaustive reference of all config sections and fields with types, default values, and a description of each parameter — see the **[Configuration Reference](config-reference.md)**.
+> Want every section and field — types, defaults, and what each one does? The
+> **[Configuration Reference](config-reference.md)** is the full list.
 
 ---
 
 ## Node identity and key management
+
+Every node has an *identity*: a pair of cryptographic keys (a public one everyone
+may see, and a private one only you hold). The node's address is computed from
+the public key, so the identity *is* the node. Guard the private key carefully —
+lose it and the node is gone.
 
 ### Signature algorithms
 
@@ -50,9 +73,12 @@ To set the path explicitly: `veil-cli --config /etc/veil/config.toml node run`
 | Ed25519 | 0 | 32 bytes | 32 bytes | 64 bytes | Default |
 | Falcon512 | 2 | 897 bytes | 1281 bytes | 666 bytes | Post-quantum |
 
-The `algo` wire byte matches the values in `IdentityPayload`, `DeletePayload`, the mesh beacon,
-and the PEX signature. The session handshake (`SessionMsg::KeyAgreement`) uses a separate
-convention: 1 = Ed25519, 2 = Falcon512 (see `node/session/handshake.rs::algo_to_u8`).
+Each algorithm has a one-byte tag, the `algo` *wire byte*, that travels on the
+network so the other side knows which algorithm to expect. The same value is used
+in `IdentityPayload`, `DeletePayload`, the mesh beacon, and the PEX signature.
+One exception: the session handshake (`SessionMsg::KeyAgreement`) numbers them
+differently — 1 = Ed25519, 2 = Falcon512 (see
+`node/session/handshake.rs::algo_to_u8`).
 
 ### Key generation
 
@@ -61,23 +87,32 @@ veil-cli key gen
 veil-cli key gen --algo falcon512
 ```
 
-**Creating an identity with a PoW nonce** (recommended during initial setup):
+**Creating an identity with a proof-of-work nonce** (recommended when you first
+set up a node):
 
 ```bash
 veil-cli config init --difficulty 16
 ```
 
-The `difficulty` is the number of leading zero bits in the BLAKE3 hash of the nonce. At `difficulty=16`, expect ~65K iterations (< 1 ms on modern hardware).
+*Proof of work* is a small puzzle the node solves to earn its identity — cheap
+for an honest user, costly for a spammer churning out fakes. The answer to the
+puzzle is a number called the *nonce*. The `difficulty` sets how hard the puzzle
+is: it's the number of leading zero bits the BLAKE3 hash of the nonce must have.
+At `difficulty=16`, expect about 65K tries — under a millisecond on modern
+hardware.
 
 ### Key security
 
-- The config file must be accessible only to its owner: `chmod 600 ~/.config/veil/config.toml`
-- The private key is stored in plaintext — use filesystem encryption or an HSM for production
-- **Never** publish the `private_key`
+- Keep the config file readable by its owner alone: `chmod 600 ~/.config/veil/config.toml`
+- The private key sits in the file as plain text. For a production node, protect
+  it with filesystem encryption or a hardware security module (HSM — a dedicated
+  device that stores keys and never lets them out).
+- **Never** publish the `private_key`.
 
 ### Key rotation
 
-Rotating a key changes the `node_id`, which is equivalent to creating a new node:
+Replacing a node's key changes its `node_id`, so as far as the network is
+concerned you've created a brand-new node:
 
 ```bash
 veil-cli key gen --output > new_keys.txt   # prints the pair to stdout without touching the config
@@ -89,6 +124,10 @@ veil-cli config init --force
 
 ## Managing listeners and peers
 
+A *listener* is an address your node opens so others can connect *in* to it. A
+*peer* is another node yours reaches *out* to. Listeners are how people find you;
+peers are who you talk to.
+
 ### CLI for listeners
 
 ```bash
@@ -97,10 +136,17 @@ veil-cli listen del LISTEN_ID
 veil-cli listen list
 ```
 
-Additional `listen add` flags: `--advertise URI` (the address advertised when behind a reverse proxy),
-`--relay NODE_ID_BASE64`, as well as `--tls-cert/--tls-key/--tls-ca-cert` for `tls://`/`wss://` listeners.
+A few more flags for `listen add`: `--advertise URI` lets you announce a different
+address than the one you bind to — handy when your node sits behind a reverse
+proxy (a front-end server that relays connections to it). There's also
+`--relay NODE_ID_BASE64`, and `--tls-cert`, `--tls-key`, `--tls-ca-cert` for the
+encrypted `tls://` and `wss://` listeners.
 
 ### Transports
+
+A *transport* is simply how the bytes physically travel — plain TCP, encrypted
+TLS, QUIC, and so on. You pick one by the scheme at the front of a listener
+address (the `tcp://` part). Here's the menu:
 
 | Scheme | Protocol | Security | Notes |
 |-------|----------|--------------|-------------|
@@ -133,16 +179,28 @@ veil-cli peers list
 
 ## Mailbox — message storage
 
-Core nodes can store messages for offline recipients. The mailbox is disabled by default and is enabled with a single flag:
+When someone you're messaging is offline, their node can't receive anything. A
+*mailbox* fixes that: a core node holds the message until the recipient comes
+back online and fetches it. The mailbox is off by default, and you turn it on
+with a single flag:
 
 ```toml
 [mailbox]
 enabled = true
 ```
 
-There is no backend choice: when `enabled = true`, the runtime always opens the built-in redb store at the fixed path `<veil_dir>/mailbox/blobs.db` (durable, transactional). No `backend`, `data_dir`, or `strict_backend` fields exist in the `[mailbox]` section.
+There's nothing to choose about where it stores things. With `enabled = true`,
+the node always opens its built-in redb store at one fixed path,
+`<veil_dir>/mailbox/blobs.db`. (redb is a small embedded database; *durable*
+means data survives a crash, *transactional* means each change happens all-or-
+nothing.) The `[mailbox]` section has no `backend`, `data_dir`, or
+`strict_backend` fields — those don't exist.
 
-Only quotas, TTL, the rate limit, and push notifications are configurable (with zero values, the `veil-mailbox` crate's defaults are used):
+What you *can* tune is the quotas, the TTL, the rate limit, and push
+notifications. (A *quota* caps how much can be stored; *TTL*, "time to live," is
+how long a message is kept before it's dropped; the *rate limit* caps how fast
+new messages may arrive.) Leave a value at zero and the node uses the
+`veil-mailbox` crate's own default:
 
 | Field | Purpose | Default |
 |------|------------|--------------|
@@ -155,15 +213,20 @@ Only quotas, TTL, the rate limit, and push notifications are configurable (with 
 | `require_capability_token` | Require a capability token on PUT | `false` |
 | `[mailbox.push]` | Push provider credentials (FCM/APNs) | empty (log only) |
 
-For more on the `[mailbox]` section fields — see the [Configuration Reference](config-reference.md#mailbox).
+For more on the fields in the `[mailbox]` section, see the [Configuration Reference](config-reference.md#mailbox).
 
 ---
 
 ## Metrics
 
+*Metrics* are running counts and gauges the node keeps about itself — how many
+sessions are open, how many bytes have flowed, and so on. They let you watch the
+node's health over time.
+
 ### Configuring the exporter
 
-The `[metrics]` section enables the HTTP exporter in Prometheus format:
+The `[metrics]` section switches on an *exporter*: a small built-in web page that
+publishes those numbers for Prometheus, the popular monitoring tool, to read.
 
 ```toml
 [metrics]
@@ -171,7 +234,8 @@ listen = "tcp://0.0.0.0:9090"
 path   = "/metrics"
 ```
 
-`listen` is a TransportUri (must contain the `tcp://` scheme), otherwise the config will fail validation.
+`listen` is a TransportUri and must start with the `tcp://` scheme, or the config
+won't pass validation.
 
 ### Retrieving metrics
 
@@ -185,9 +249,11 @@ curl http://127.0.0.1:9090/metrics
 
 ### Available counters
 
-The full list is built in `NodeMetrics::render_prometheus`
-([observability.rs](../../crates/veil-observability/src/lib.rs)). All names
-are exported with the `veil_` prefix. Below are the main groups.
+The complete list lives in the code, in `NodeMetrics::render_prometheus`
+([observability.rs](../../crates/veil-observability/src/lib.rs)). Every name
+carries the `veil_` prefix. The main groups are below. (A *counter* only ever
+climbs — a total since startup; a *gauge* goes up and down to show a value right
+now.)
 
 | Group | Metric | Type | Description |
 |--------|---------|-----|----------|
@@ -235,24 +301,26 @@ are exported with the `veil_` prefix. Below are the main groups.
 | Sleep | `veil_sleep_advertisements_emitted_total` | counter | SleepAdvertisement emitted |
 | Sleep | `veil_wakeup_fetches_total` | counter | Wake-up MAILBOX_FETCH on session open |
 
-> **Mailbox depth.** The current number of blobs in the mailbox is not
-> exported to Prometheus — it is available only through the admin HTTP API
-> state dump in the `mailbox_entries` field.
+> **Mailbox depth.** One number is missing from Prometheus: how many blobs the
+> mailbox currently holds. To see it, read the `mailbox_entries` field in the
+> admin HTTP API's state dump.
 
 ---
 
 ## Admin API — the administrative socket
 
-**Address:** Unix domain socket (the default on Linux/macOS) or TCP-loopback with
-token authentication (mandatory on Windows, since Unix sockets are unavailable).
-The path/URI is set by `global.admin_socket`; see the "Admin protocol transport"
-section above.
+**Address.** A Unix domain socket (the default on Linux and macOS), or
+TCP-loopback guarded by a token (the only choice on Windows, where Unix sockets
+don't exist). You set the path or URI with `global.admin_socket`; the
+"How the admin protocol connects" section above covers both.
 
-**Protocol:** JSON request/response over the socket, newline-terminated. For the TCP backend,
-the client sends a 32-byte binary token as its first frame, read from
-`runtime_dir/admin.token` — only after a successful constant-time
-check does the server begin serving the admin protocol; otherwise the connection
-is dropped.
+**Protocol.** Plain request/response: the client sends a line of JSON, the node
+sends one back, each ended by a newline. On the TCP backend there's one extra
+step first. The client sends a 32-byte token — read from `runtime_dir/admin.token`
+— as its opening message. The node compares it in *constant time* (a check that
+takes the same time whether the token is right or wrong, so an attacker can't
+learn anything from timing). Only on a match does the node start answering;
+otherwise it hangs up.
 
 ### Node inspection
 
@@ -311,9 +379,13 @@ veil-cli peers unban NODE_ID
 veil-cli peers banned
 ```
 
-These same subcommands are also available under `veil-cli sessions ban/unban/banned` — they share one backend state.
+The very same commands also live under `veil-cli sessions ban/unban/banned` —
+both names act on the same shared state.
 
 ### Hot config reload
+
+You can change a node's config without restarting it. This is a *hot reload* —
+the running node re-reads its config file on the fly.
 
 ```bash
 # Via the admin API (recommended — addresses exactly the running daemon)
@@ -323,12 +395,19 @@ veil-cli node reload
 systemctl reload veil        # see ExecReload in the unit below
 ```
 
-`pkill -HUP veil-cli` will only work if there is a single running process of
-the binary in the system and it is not a CLI client — do not rely on this in production.
+A quick warning about `pkill -HUP veil-cli`: it only does the right thing if
+exactly one copy of the binary is running and that copy is the node, not a CLI
+client. That's too fragile to trust in production — use one of the two commands
+above instead.
 
 ---
 
 ## Configuring the systemd service
+
+On Linux you'll usually want the node to start at boot and restart itself if it
+ever crashes. *systemd* — the service manager built into most Linux distributions
+— handles that. You describe the service in a small file called a *unit*, like
+this one:
 
 ```ini
 # /etc/systemd/system/veil.service
@@ -361,7 +440,13 @@ journalctl -u veil -f
 
 ## Troubleshooting
 
-### The node does not start
+When something's off, work through the symptom that matches. Each one starts with
+the most common cause.
+
+### The node won't start
+
+Usually the config has a problem. Check it first, then watch the logs as the node
+comes up:
 
 ```bash
 # Validate the config
@@ -374,19 +459,24 @@ veil-cli --config /etc/veil/config.toml node run
 
 ### No inbound connections
 
-1. Check that the firewall is open on the required ports
-2. Make sure a `[[listen]]` block exists in the config
-3. Check the listener status: `veil-cli listen list`
+Nobody can reach you. Check, in order:
+
+1. Is the firewall open on the ports you're using?
+2. Is there a `[[listen]]` block in the config?
+3. What does the listener say? Run `veil-cli listen list`.
 
 ### No outbound connections
 
-1. Check that `[[peers]]` blocks have been added
-2. Check the transport URI: `veil-cli debug transport connect URI`
-3. Check connectivity: `veil-cli debug peers connect PEER_ID`
+You can't reach anyone. Check, in order:
 
-### High memory consumption
+1. Have you added any `[[peers]]` blocks?
+2. Is the transport URI good? Try `veil-cli debug transport connect URI`.
+3. Can you reach the peer at all? Try `veil-cli debug peers connect PEER_ID`.
 
-Check the limits in `[capacity]` and `[abuse]`. On an overloaded gateway:
+### High memory use
+
+Look at the limits in `[capacity]` and `[abuse]`. On a gateway that's carrying
+too much, tightening them helps:
 
 ```toml
 [capacity]
@@ -396,21 +486,30 @@ max_relay_sessions = 512
 rate_limit_fps = 20.0
 ```
 
-### The node is not visible in the DHT
+### The node isn't visible in the DHT
 
-- Make sure at least one Core node is added to `[[peers]]`
-- The node must have a publicly reachable `[[listen]]` address
-- Check: `veil-cli node dht routing`
+The DHT is the network's shared address book, the way other nodes find you. If
+you're not in it:
+
+- Make sure at least one Core node is listed in `[[peers]]`.
+- The node needs a `[[listen]]` address others can actually reach from the
+  public internet.
+- Check the routing table: `veil-cli node dht routing`.
 
 ---
 
 ## Running as a service
 
+You don't want to babysit the node by hand. Better to hand it to whatever your
+operating system uses to keep background programs running — and to restart them
+after a reboot or a crash.
+
 ### Linux / macOS — systemd / launchd
 
-On Unix systems, veil runs as an ordinary daemon; integration with
-the system supervisor is done through a systemd unit (Linux) or a
-launchd plist (macOS). Template unit:
+On Unix systems the node runs as an ordinary background program (a *daemon*). You
+hook it into the system's service manager — systemd on Linux, or launchd on macOS
+(its equivalent, configured with a small file called a *plist*). Here's a
+template systemd unit:
 
 ```ini
 [Unit]
@@ -429,11 +528,12 @@ WantedBy=multi-user.target
 
 ### Windows — Service Control Manager
 
-On Windows, veil can register itself as a native service through the
-SCM. The service starts automatically at boot, stops at
-shutdown, and is visible in `services.msc` / `Get-Service VeilNode`.
+On Windows the node can register itself as a native service through the Service
+Control Manager (SCM), the part of Windows that runs and supervises background
+services. Once registered, it starts automatically at boot, stops at shutdown,
+and shows up in `services.msc` and `Get-Service VeilNode`.
 
-**Installation** (requires admin privileges):
+**Installation** (needs administrator rights):
 
 ```powershell
 # From an administrator PowerShell.
@@ -460,18 +560,18 @@ Start-Service VeilNode
 veil-cli service uninstall
 ```
 
-**Implementation details:**
+**A few details worth knowing:**
 
-- The service logs in as `LocalSystem` by default. To run under a
-  less privileged account, edit after install:
+- By default the service runs as `LocalSystem`, a powerful built-in account. To
+  run it under a less privileged user instead, edit it after install:
   ```powershell
   sc config VeilNode obj= ".\veil_user" password= "..."
   ```
-- The config path is baked into the service `ImagePath` at install time. If
-  the config is later moved — uninstall and reinstall the service.
-- `service run` — the entry invoked by SCM, hidden from `--help`. Operators
-  must not invoke it directly; use `install` +
-  `Start-Service`.
-- Graceful shutdown: on `Stop-Service`, SCM sends `ServiceControl::Stop`,
-  the service flips its status to `StopPending`, waits for the node runtime to stop
-  (including the fsync persist of bans/peers_discovered/etc), then `Stopped`.
+- The config path is baked into the service's `ImagePath` when you install it. So
+  if you ever move the config, uninstall and reinstall the service.
+- `service run` is the entry point the SCM calls; it's hidden from `--help`. Don't
+  run it yourself — use `install` followed by `Start-Service`.
+- Shutting down cleanly: on `Stop-Service`, the SCM sends a `ServiceControl::Stop`
+  signal. The service marks itself `StopPending`, waits for the node to wind down
+  (including flushing bans, discovered peers, and the like to disk so nothing is
+  lost), and only then reports `Stopped`.

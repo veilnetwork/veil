@@ -14,88 +14,67 @@
 
 ## Two threat axes
 
-This plan addresses **two distinct DPI/censorship threats**.  Solutions
-are independent — а deployment can ship one, both, or neither depending
-on its environment:
+This plan addresses **two distinct DPI/censorship threats**. (DPI is deep packet inspection: a censor's box that examines packet contents, not just where they're headed.) The two solutions are independent — a deployment can ship one, both, or neither, depending on its environment:
 
 | Threat                | Solution                              | Applies to                       |
 |-----------------------|---------------------------------------|----------------------------------|
 | Passive DPI on wire   | obfs4 framing (TCP) / stateless AEAD (UDP) | `tcp://`, `udp://` plaintext   |
 | Active probing of endpoint | webtunnel-style decoy + secret-path | `tls://`, `wss://`, `quic://`  |
 
-**Passive DPI**: censor's middle-box reads plaintext bytes, looks for
-OVL1 magic or distinctive headers.  TLS-bearing transports already
-defeat this (внутренний trafic encrypted), но plaintext TCP/UDP show
-OVL1 directly.
+**Passive DPI:** the censor's middle-box reads the plaintext bytes and looks for the OVL1 magic or distinctive headers. TLS-bearing transports already defeat this, since the inner traffic is encrypted, but plaintext TCP and UDP show OVL1 directly.
 
-**Active probing**: censor scans candidate IPs, connects, sends crafted
-probes к detect veil endpoints.  Even on TLS, а server что accepts
-veil connections but rejects everything else (or returns
-distinctive error pages) is identifiable.  webtunnel-style masking
-makes the endpoint look like а regular HTTPS site to anyone без
-the secret path/auth.
+**Active probing:** the censor scans candidate IPs, connects, and sends crafted probes to detect veil endpoints. Even over TLS, a server that accepts veil connections but rejects everything else — or returns distinctive error pages — is identifiable. webtunnel-style masking makes the endpoint look like a regular HTTPS site to anyone without the secret path and auth.
 
 ## Why
 
-OVL1 frame header (magic = `"OVL1"`, version byte, body-length, etc.) is
-plaintext **inside the transport channel**.  Session-layer AEAD encrypts
-the frame *body*, не the header — see [crates/veil-session/src/runner.rs](../../crates/veil-session/src/runner.rs) and
-[crates/veil-proto/src/codec.rs](../../crates/veil-proto/src/codec.rs).
+The OVL1 frame header (magic = `"OVL1"`, a version byte, a body-length, and so on) is plaintext **inside the transport channel**. Session-layer AEAD encrypts the frame *body*, not the header — see [crates/veil-session/src/runner.rs](../../crates/veil-session/src/runner.rs) and [crates/veil-proto/src/codec.rs](../../crates/veil-proto/src/codec.rs). (AEAD is authenticated encryption with associated data: it both hides and tamper-proofs the bytes it covers.)
 
-Consequences by transport:
+The consequences, by transport:
 
 | Transport         | Passive-DPI risk         | Active-probe risk            |
 |-------------------|--------------------------|------------------------------|
-| `tcp://`          | high (OVL1 magic plain)  | high (responds к anything)   |
-| `udp://`          | high (OVL1 в datagrams)  | high                         |
+| `tcp://`          | high (OVL1 magic plain)  | high (responds to anything)  |
+| `udp://`          | high (OVL1 in datagrams) | high                         |
 | `ws://` (no TLS)  | high (OVL1 inside WS)    | high                         |
-| `tls://`          | low (внутренний enc)     | medium (no decoy on 443)     |
+| `tls://`          | low (inner enc)          | medium (no decoy on 443)     |
 | `wss://`          | low                      | medium                       |
 | `quic://`         | low                      | medium                       |
 
-The Phase 1/2/3 work (obfs4 + UDP stateless) addresses the high
-passive-DPI column.  Phase 5 webtunnel work addresses the
-medium/high active-probe column для TLS-bearing transports.
+The Phase 1/2/3 work (obfs4 plus stateless UDP) addresses the high passive-DPI column. The Phase 5 webtunnel work addresses the medium/high active-probe column for TLS-bearing transports.
 
-For deployments що can't ship TLS-bearing transports (embedded routers,
-constrained devices, environments где TLS is itself flagged as
-suspicious), the plaintext transports remain operational но trivially
-DPI-fingerprintable.
+For deployments that can't ship TLS-bearing transports — embedded routers, constrained devices, or environments where TLS is itself flagged as suspicious — the plaintext transports keep working, but they are trivially DPI-fingerprintable.
 
-The fix: wrap plaintext transports в an obfuscation layer что makes wire
-bytes statistically indistinguishable from random.  Two paradigms:
+The fix is to wrap the plaintext transports in an obfuscation layer that makes the wire bytes statistically indistinguishable from random. There are two paradigms:
 
-- **TCP** stream-oriented → obfs4-style: NTOR handshake + AEAD framing с
-  elligator2-encoded ephemeral pubkeys.
-- **UDP** datagram-oriented → stateless AEAD-per-packet: PSK-derived key,
-  random IV в each datagram, counter + replay window.
+- **TCP** is stream-oriented, so we use an obfs4-style approach: an NTOR handshake plus AEAD framing, with elligator2-encoded ephemeral pubkeys.
+- **UDP** is datagram-oriented, so we use stateless AEAD per packet: a PSK-derived key, a random IV in each datagram, plus a counter and a replay window.
 
 ## Scope
 
 In-scope:
 - `tcp://` → wrap with obfs4 handshake (new `veil-obfs4` crate).
 - `udp://` → wrap with stateless AEAD (new `veil-udp-obfs` crate).
-- `ws://` (without TLS) → wrap inner TCP с obfs4 before WebSocket upgrade
-  OR adopt the same obfs4 framing **inside** WebSocket binary frames.
-  Decision deferred к Phase 4 после obfs4 ядро готово.
+- `ws://` (without TLS) → wrap the inner TCP with obfs4 before the WebSocket
+  upgrade, OR adopt the same obfs4 framing **inside** WebSocket binary frames.
+  This decision is deferred to Phase 4, once the obfs4 core is ready.
 - `wss://` / `tls://` → optional webtunnel-style endpoint masking
-  (new `veil-webtunnel` crate, Phase 5).  Disguises the endpoint
-  as а legitimate HTTPS site; tunnel mode только при правильном
-  secret path + auth header.
+  (new `veil-webtunnel` crate, Phase 5). Disguises the endpoint as a
+  legitimate HTTPS site; tunnel mode engages only with the correct
+  secret path and auth header.
 - New URI schemes:
   - `obfs4+tcp://`, `obfs4+udp://`, optionally `obfs4+ws://` (Phase 2).
   - `webtunnel+wss://path?auth=secret@host:443` (Phase 5).
 
 Out-of-scope:
-- `quic://` — already encrypted at transport layer; active-probe
-  resistance possible но quinn lacks the HTTP routing surface
-  webtunnel needs.  Re-open trigger: quinn HTTP/3 support matures и
-  operator needs decoy для QUIC endpoints.
-- Unix-domain sockets (local IPC) — DPI is не the threat model там.
-- SOCKS5 inbound — operator's local proxy, не network-facing.
+- `quic://` — already encrypted at the transport layer. Active-probe
+  resistance is possible, but quinn lacks the HTTP routing surface that
+  webtunnel needs. Re-open trigger: quinn's HTTP/3 support matures and an
+  operator needs a decoy for QUIC endpoints.
+- Unix-domain sockets (local IPC) — DPI is not the threat model there.
+- SOCKS5 inbound — the operator's local proxy, not network-facing.
 - Statistical traffic-analysis defences (packet-timing obfuscation,
-  decoy-traffic injection) — separate effort, deferred к а
-  follow-up plan if/when needed.
+  decoy-traffic injection) — a separate effort, deferred to a follow-up
+  plan if and when it's needed.
 
 ## Wire formats
 
@@ -112,23 +91,26 @@ Each datagram:
 Total overhead per datagram: **40 bytes** (16 nonce-prefix + 8 counter
 + 16 tag).
 
-- **AEAD nonce** = `nonce-prefix || counter[..4]` (24-byte XChaCha20-Poly1305
-  nonce constructed by HKDF expansion от prefix + counter).
+- **AEAD nonce** = `nonce-prefix || counter[..4]` (a 24-byte
+  XChaCha20-Poly1305 nonce, built by HKDF expansion of the prefix plus the
+  counter).
 - **AEAD key** = `HKDF-SHA256(PSK, "veil-udp-obfs:v1:" || peer_node_id, 32)`.
-- **Replay window** = sliding bitmap по counter, default 1024 slots.
-- **Random padding** = 0..256 bytes uniformly random, length encoded in
-  body as 1-byte prefix.
+- **Replay window** = a sliding bitmap over the counter, default 1024 slots.
+- **Random padding** = 0..256 bytes, uniformly random, with the length
+  encoded in the body as a 1-byte prefix.
 
 Properties:
-- Wire bytes uniformly random; no plaintext OVL1 magic visible.
-- Tolerant к loss / reorder / duplication.
-- Each datagram self-contained — no state machine, no handshake RTT.
-- Counter в plaintext но replay-bound; cannot be advanced без the key.
+- The wire bytes are uniformly random; no plaintext OVL1 magic is visible.
+- Tolerant of loss, reorder, and duplication.
+- Each datagram is self-contained — no state machine, no handshake RTT.
+- The counter is in plaintext but replay-bound; it cannot be advanced
+  without the key.
 
-Trade-off (documented в module-level docstring): PSK = long-lived
-symmetric secret.  Compromise reveals all past и future traffic
-encrypted under this PSK.  Acceptable для discovery / NAT-probe /
-diagnostic traffic; sensitive payloads ride session-layer AEAD on TCP.
+Trade-off (documented in the module-level docstring): the PSK is a
+long-lived symmetric secret. If it leaks, all past and future traffic
+encrypted under it is exposed. That is acceptable for discovery, NAT-probe,
+and diagnostic traffic; sensitive payloads ride the session-layer AEAD on
+TCP instead.
 
 ### TCP obfs4-style (Phases 1b–3)
 
@@ -159,16 +141,16 @@ For each frame in each direction:
   [ 16 byte AEAD tag ]
 ```
 
-Properties (per obfs4 design):
-- First 32 bytes от client = uniformly random (elligator2 magic).
-- Server replies *only* if MAC verifies → silent drop on active probing.
-- Per-session ephemeral X25519 keys → forward secrecy в obfuscation layer.
-- Length field encrypted с ChaCha20 keystream — outsider can't read frame
-  sizes без the key.
+Properties (following the obfs4 design):
+- The first 32 bytes from the client are uniformly random (the elligator2 magic).
+- The server replies *only* if the MAC verifies, so it silently drops active probes.
+- Per-session ephemeral X25519 keys give the obfuscation layer forward secrecy.
+- The length field is encrypted with the ChaCha20 keystream, so an outsider
+  can't read frame sizes without the key.
 
-PSK = `server_node_id_pk` (already part of identity infrastructure) +
-а dedicated `obfs4_mac_key` (32 bytes random, per-node, published в
-`transport_hints` signed by identity_key).
+The PSK is `server_node_id_pk` (already part of the identity infrastructure)
+plus a dedicated `obfs4_mac_key` (32 random bytes, per node, published in
+`transport_hints` and signed by identity_key).
 
 ## Phase plan
 
@@ -188,10 +170,10 @@ PSK = `server_node_id_pk` (already part of identity infrastructure) +
 - Unit tests on framing layer in isolation.
 
 **1c — TCP NTOR handshake + elligator2 (~1-2 sessions):**
-- `elligator2.rs`: encode/decode Curve25519 ↔ uniformly-random 32-byte.
-  Lift code от а reference Rust impl (lyrebird forks, curve25519-dalek's
-  `MontgomeryPoint::from_bytes` + manual elligator math) с careful
-  constant-time review.
+- `elligator2.rs`: encode/decode Curve25519 ↔ a uniformly-random 32-byte
+  value. Lift the code from a reference Rust impl (lyrebird forks, or
+  curve25519-dalek's `MontgomeryPoint::from_bytes` plus manual elligator
+  math), with a careful constant-time review.
 - `ntor.rs`: client_handshake / server_handshake state machines.
 - Timing-safe MAC verification.
 - Property tests for elligator2 (encode-decode roundtrip on random
@@ -201,49 +183,50 @@ PSK = `server_node_id_pk` (already part of identity infrastructure) +
 
 **2a — UDP integration (~1 session):**
 - Add `obfs4+udp://` URI scheme.
-- Wrap existing `udp.rs` transport: outbound `dial` calls obfs4-udp
-  encrypt before send_to, inbound recv decrypts before delivering к
-  session-layer.
-- PSK derivation: HKDF от bootstrap-distributed `obfs4_psk` field.
+- Wrap the existing `udp.rs` transport: on outbound, `dial` calls the
+  obfs4-udp encrypt before send_to; on inbound, recv decrypts before handing
+  bytes to the session layer.
+- PSK derivation: HKDF from the bootstrap-distributed `obfs4_psk` field.
 - Config: per-deployment PSK distribution.
 
 **2b — TCP integration (~1 session):**
 - Add `obfs4+tcp://` URI scheme.
-- `obfs4_tcp_stream` wraps `tcp.rs` `BoxIoStream`: spawns handshake task
-  before yielding the stream к session-layer.
-- Server-side: bind listens на `obfs4+tcp://` accept loop performs
-  server handshake; silent-drops on bad MAC.
+- `obfs4_tcp_stream` wraps the `tcp.rs` `BoxIoStream`: it spawns a handshake
+  task before yielding the stream to the session layer.
+- Server-side: the `obfs4+tcp://` bind accept loop performs the server
+  handshake and silently drops on a bad MAC.
 
 ### Phase 3 — PSK distribution
 
-- Extend `transport_hints` к carry `obfs4_pubkey` + `obfs4_mac_key`
+- Extend `transport_hints` to carry `obfs4_pubkey` and `obfs4_mac_key`
   fields (signed by identity_key).
-- Update bootstrap-bundle format к include obfs4 fields for seed peers.
-- Document operator key-rotation procedure.
+- Update the bootstrap-bundle format to include the obfs4 fields for seed peers.
+- Document the operator key-rotation procedure.
 
 ### Phase 4 — WebSocket variant + dual-stack
 
-- Decide: wrap WS payload bytes with obfs4-stream framing (inside
-  binary frames), or wrap underlying TCP with obfs4 before WS upgrade.
-- The latter is simpler но breaks WS-aware DPI's expectation of
-  HTTP/1.1 Upgrade на the first packet — inconsistent.
-- Recommended: inner-WS framing (encrypt-then-base64? or use binary
-  frames so obfs4 bytes pass through unchanged).
+- Decide between two options: wrap the WS payload bytes with obfs4-stream
+  framing (inside binary frames), or wrap the underlying TCP with obfs4
+  before the WS upgrade.
+- The latter is simpler, but it breaks WS-aware DPI's expectation of an
+  HTTP/1.1 Upgrade on the first packet, which is inconsistent.
+- Recommended: inner-WS framing — either encrypt-then-base64, or use binary
+  frames so the obfs4 bytes pass through unchanged.
 
-### Phase 5 — webtunnel anti-probe для WSS / TLS
+### Phase 5 — webtunnel anti-probe for WSS / TLS
 
-**Threat addressed:** active probing of TLS-bearing endpoints.  Even
-when the transport is TLS-encrypted, а server що:
-- responds к ANY connection on port 443 with а distinctive error,
-- responds к а custom protocol probe with а recognisable shape,
-- has an empty document root (`GET /` → 404 / generic Hyper page),
+**Threat addressed:** active probing of TLS-bearing endpoints. Even when the
+transport is TLS-encrypted, a server that:
+- responds to ANY connection on port 443 with a distinctive error,
+- responds to a custom protocol probe with a recognisable shape, or
+- has an empty document root (`GET /` → a 404 or a generic Hyper page),
 
-is identifiable to а scanner crawling all IPs.  Once tagged, the IP
-can be blocked or its traffic monitored.
+is identifiable to a scanner crawling all IPs. Once tagged, the IP can be
+blocked or have its traffic monitored.
 
-**Solution:** webtunnel-style endpoint masking.  Server presents as а
-legitimate HTTPS site by default; switches к veil-tunnel mode только
-when the client connects с the configured secret path + auth header.
+**Solution:** webtunnel-style endpoint masking. The server presents as a
+legitimate HTTPS site by default and switches to veil-tunnel mode only when
+the client connects with the configured secret path and auth header.
 
 #### Wire flow
 
@@ -279,23 +262,24 @@ Server check (constant-time):
 
 | Mode             | Realism | Operator cost                         |
 |------------------|---------|---------------------------------------|
-| Static-string    | low     | zero — single HTML string в config    |
-| Static-directory | medium  | low — point к а dir of cached pages   |
-| Reverse-proxy    | high    | medium — proxy к а real HTTP backend  |
-| Meek-style fetch | high    | high — caches от real sites on demand |
+| Static-string    | low     | zero — a single HTML string in config |
+| Static-directory | medium  | low — point to a dir of cached pages  |
+| Reverse-proxy    | high    | medium — proxy to a real HTTP backend |
+| Meek-style fetch | high    | high — caches from real sites on demand |
 
-Recommended default: **static-directory**.  Operator deploys а snapshot
-of а neutral site (status dashboard, dev blog, etc.) once; subsequent
-probes get realistic responses with proper Content-Type, Etag, etc.
+Recommended default: **static-directory**. The operator deploys a snapshot
+of a neutral site (a status dashboard, a dev blog, and so on) once; after
+that, probes get realistic responses with a proper Content-Type, Etag, and
+the rest.
 
 #### Components (new `veil-webtunnel` crate)
 
 1. **HTTP routing** (Hyper-based):
-   - Accept incoming TLS-decrypted HTTP/1.1 connection.
-   - Parse request line + headers.
-   - Constant-time compare path и auth header.
-   - On match: hand off socket к WebSocket upgrade handler.
-   - On miss: serve decoy content; close connection cleanly.
+   - Accept the incoming TLS-decrypted HTTP/1.1 connection.
+   - Parse the request line and headers.
+   - Constant-time compare the path and auth header.
+   - On a match: hand the socket off to the WebSocket upgrade handler.
+   - On a miss: serve decoy content, then close the connection cleanly.
 
 2. **WebSocket upgrade** (existing `veil-transport::websocket` or
    `tokio-tungstenite`): standard RFC 6455 handshake after path match.
@@ -312,51 +296,51 @@ probes get realistic responses with proper Content-Type, Etag, etc.
    - `StaticStringDecoy`, `StaticDirectoryDecoy`, `ReverseProxyDecoy`
      implementations.
 
-4. **Secret distribution**: extends `transport_hints` (Phase 3) с two
+4. **Secret distribution**: extends `transport_hints` (Phase 3) with two
    new fields:
    - `webtunnel_secret_path: String` (32+ chars, random),
-   - `webtunnel_auth_token: Option<Vec<u8>>` (32 bytes random).
+   - `webtunnel_auth_token: Option<Vec<u8>>` (32 random bytes).
 
-   Both signed by identity_key like other transport hints.
+   Both are signed by identity_key, like the other transport hints.
 
-5. **Client side**: extends `websocket.rs` connect path к add
-   `X-Veil-Auth` header и use the secret path в the WebSocket
-   upgrade URI.
+5. **Client side**: extends the `websocket.rs` connect path to add the
+   `X-Veil-Auth` header and use the secret path in the WebSocket upgrade URI.
 
 #### Anti-probing properties
 
-What active probing **cannot** do без the secret:
-- Distinguish а webtunnel-host от а real HTTPS site.
-- Force tunnel mode via crafted probes.
-- Use timing-side-channel к infer existence of tunnel mode (constant-
-  time compare on path + auth).
+What active probing **cannot** do without the secret:
+- Tell a webtunnel host apart from a real HTTPS site.
+- Force tunnel mode with crafted probes.
+- Use a timing side-channel to infer that tunnel mode exists (the path and
+  auth compare is constant-time).
 
 What active probing **can** do:
-- Identify the IP as running TLS — но `~25%` of public IPs do.
+- Identify the IP as running TLS — but about 25% of public IPs do.
 - Identify the TLS fingerprint (mitigated by `tls-boring`).
-- Eventually exhaust the IP space и flag specific IPs as "websites
-  that never had real users visit them" — а general censorship
-  problem, not specific к veil.
+- Eventually exhaust the IP space and flag specific IPs as "websites that
+  never had real users visit them." That is a general censorship problem,
+  not specific to veil.
 
 What an adversary who **has** the secret can do:
-- Verify the endpoint runs veil.  Secret = шibboleth, not
-  cryptographic identification.  This is fundamental: any
-  PSK-based scheme reveals the endpoint к anyone with the PSK.
-- Mitigation: rotate secrets periodically, distribute via
-  `transport_hints` що is identity-signed so leaked secrets
-  expire at the next rotation.
+- Verify the endpoint runs veil. The secret is a shibboleth, not
+  cryptographic identification. This is fundamental: any PSK-based scheme
+  reveals the endpoint to anyone holding the PSK.
+- Mitigation: rotate secrets periodically and distribute them via
+  `transport_hints`, which is identity-signed, so leaked secrets expire at
+  the next rotation.
 
 #### Phase 5 sub-phases
 
-- **5a** — `veil-webtunnel` crate skeleton + decoy trait + static-
-  string и static-directory providers (~400 LoC + tests).
+- **5a** — `veil-webtunnel` crate skeleton + decoy trait + static-string
+  and static-directory providers (~400 LoC + tests).
 - **5b** — HTTP routing + secret-path constant-time match +
   WebSocket upgrade handoff (~500 LoC + tests).
 - **5c** — `transport_hints` extension + `webtunnel+wss://` URI scheme
   + client-side path/auth wiring (~300 LoC + tests).
 - **5d** — Reverse-proxy decoy provider (optional, ~200 LoC).
-- **5e** — Integration test: probe-without-secret returns decoy;
-  probe-with-secret upgrades к WebSocket; tunnel carries OVL1 session.
+- **5e** — Integration test: a probe without the secret returns the decoy;
+  a probe with the secret upgrades to WebSocket; the tunnel carries an OVL1
+  session.
 
 ### Phase 6 — tests + production-readiness
 
@@ -366,19 +350,20 @@ What an adversary who **has** the secret can do:
   scanner-decoy verification.
 - Statistical entropy tests on captured handshake bytes (chi-square,
   byte-frequency analysis).
-- Anti-probe test: connect c bad MAC (obfs4) / wrong path (webtunnel),
-  assert silent drop / decoy response.
-- Replay-attack test: capture+replay handshake → server rejects timestamp.
-- Documentation: update `dpi-evasion.md` matrix; add operator guides для
-  PSK distribution + webtunnel decoy-content setup.
+- Anti-probe test: connect with a bad MAC (obfs4) or the wrong path
+  (webtunnel), and assert a silent drop or a decoy response.
+- Replay-attack test: capture and replay a handshake; the server rejects the
+  timestamp.
+- Documentation: update the `dpi-evasion.md` matrix; add operator guides for
+  PSK distribution and webtunnel decoy-content setup.
 
 ## Acceptance gates (per phase)
 
 1. `cargo check --workspace --all-features` clean.
 2. `cargo test -p <new-crate>` green.
 3. `cargo clippy --workspace --all-features --tests` zero new warnings.
-4. Wire-entropy spot check: capture 1000 handshake bytes от Phase 1c
-   implementation, run chi-square test for uniform distribution
+4. Wire-entropy spot check: capture 1000 handshake bytes from the Phase 1c
+   implementation and run a chi-square test for a uniform distribution
    (expected p-value > 0.01).
 5. **Phase 1c specifically:** timing-safe MAC compare verified via
    `subtle::ConstantTimeEq` audit.
@@ -386,14 +371,15 @@ What an adversary who **has** the secret can do:
 ## Re-open triggers vs out-of-scope items
 
 - **Statistical traffic analysis** (packet timing, volume fingerprinting):
-  hold until либо incident в production либо operator request.
-- **iat-mode** (inter-arrival timing obfuscation): hold; significant
-  complexity, marginal entropy gain.
-- **`ws://` integration**: hold до Phase 1c lands (need framing first).
-- **`quic+webtunnel`**: hold до quinn surfaces clean HTTP/3 routing
-  hook OR operator explicitly needs QUIC anti-probe.
-- **Meek-style on-demand decoy caching**: hold; high-realism but
-  significant code surface, only justified для high-stakes deployments.
+  on hold until either a production incident or an operator request.
+- **iat-mode** (inter-arrival timing obfuscation): on hold; significant
+  complexity for a marginal entropy gain.
+- **`ws://` integration**: on hold until Phase 1c lands, since it needs the
+  framing first.
+- **`quic+webtunnel`**: on hold until quinn surfaces a clean HTTP/3 routing
+  hook, OR an operator explicitly needs QUIC anti-probe.
+- **Meek-style on-demand decoy caching**: on hold; high realism, but a large
+  code surface, justified only for high-stakes deployments.
 
 ## Total estimate
 
@@ -401,11 +387,10 @@ What an adversary who **has** the secret can do:
 - Phase 1b: **done** (`a977890` — TCP framing core).
 - Phase 1c: 1-2 sessions (NTOR + elligator2, crypto-careful).
 - Phase 2: 2 sessions (UDP + TCP transport integration).
-- Phase 3: 1 session (PSK distribution через transport_hints).
+- Phase 3: 1 session (PSK distribution via transport_hints).
 - Phase 4: 1 session (WebSocket variant).
 - Phase 5: 2-3 sessions (webtunnel sub-phases 5a–5e).
 - Phase 6: 1 session (integration tests + docs).
 
-**~8-10 sessions total** beyond `a977890` для full deployment.
-Granular phases mean each step can be reviewed / paused / re-prioritised
-independently.
+**~8-10 sessions total** beyond `a977890` for full deployment. The granular
+phases mean each step can be reviewed, paused, or re-prioritised on its own.

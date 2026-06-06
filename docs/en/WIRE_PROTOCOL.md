@@ -1,10 +1,15 @@
 # OVL1 Wire Protocol
 
-> Field-level reference for implementers.  For the full system description see
-> [ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md); for per-payload semantics see
+> A byte-by-byte reference for anyone implementing the protocol. It defines what
+> goes on the wire, field by field. For the full system description, see
+> [ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md). For what each payload means, see
 > [protocol-spec.md](protocol-spec.md).
 
 ## Frame Header (24 bytes)
+
+Every message on the wire is a *frame*: a fixed 24-byte header followed by an
+optional body. The header below is the same on every frame; multi-byte fields are
+big-endian (BE).
 
 ```
 Offset  Size  Field        Description
@@ -28,6 +33,10 @@ Constants (`proto/codec.rs`, `proto/header.rs`):
 
 ### Priority bits (flags[1:0])
 
+The low two bits of `flags` set the frame's priority class. The scheduler drains
+the four classes by weighted round-robin (WRR), so a higher weight gets more turns
+under load.
+
 | Value | Class | WRR weight |
 |-------|-------|------------|
 | 0 | RealTime | 8 |
@@ -35,11 +44,15 @@ Constants (`proto/codec.rs`, `proto/header.rs`):
 | 2 | Bulk | 2 |
 | 3 | Background | 1 |
 
-All other flag bits are reserved; senders MUST clear them, receivers MUST ignore unknown bits.
+Every other flag bit is reserved. Senders MUST clear them; receivers MUST ignore
+any bit they don't recognize.
 
 ## Frame Families
 
-Source of truth: [`family.rs`](../../crates/veil-proto/src/family.rs).
+A *family* groups related message types under one `family` byte; the `msg_type`
+field then picks the specific message within that family. The numbers in
+parentheses below are the `msg_type` values. The source of truth is
+[`family.rs`](../../crates/veil-proto/src/family.rs).
 
 | ID | Family | Messages |
 |----|--------|----------|
@@ -56,9 +69,16 @@ Source of truth: [`family.rs`](../../crates/veil-proto/src/family.rs).
 | 10 | RelayChain | Hop(0) — onion-encrypted relay chain; RegisterRendezvous(1), UnregisterRendezvous(2), ForwardIntroduce(3) — plain control payloads over an established session (not onion-encrypted) |
 | 11 | PeerExchange | Walk(0), Challenge(1), Response(2), Result(3) |
 
-Unknown `family` → frame ignored (forward-compatible).  Unknown `msg_type` within a known family → same treatment.
+A frame with an unknown `family` is simply ignored, which keeps the protocol
+forward-compatible: old nodes skip messages they don't understand instead of
+breaking. An unknown `msg_type` inside a family you do know is ignored the same
+way.
 
 ## Handshake Sequence
+
+Before any real traffic flows, the two sides run a *handshake* — a fixed exchange
+that proves identity and agrees on a shared key. Each step below is sent by the
+client and echoed by the server, in order:
 
 ```
 Client                               Server
@@ -83,9 +103,16 @@ Client                               Server
   │    [AEAD encrypted from here]       │
 ```
 
-After `SessionConfirm` every frame body is ChaCha20-Poly1305-encrypted; the 24-byte header stays in plaintext and serves as AAD.
+From `SessionConfirm` onward, every frame body is encrypted with
+ChaCha20-Poly1305. The 24-byte header stays in plaintext, but it is fed to the
+cipher as additional authenticated data (AAD): it isn't hidden, yet any tampering
+with it makes decryption fail.
 
 ## Key Payloads
+
+A *payload* is the body of a frame — the bytes that follow the 24-byte header.
+Each layout below uses `[start..end]` byte ranges, half-open (the end index is
+excluded), and the same big-endian convention as the header.
 
 ### HelloPayload (34 bytes)
 ```
@@ -112,13 +139,18 @@ After `SessionConfirm` every frame body is ChaCha20-Poly1305-encrypted; the 24-b
                              ANONYMITY_RELAY=0x04, SUPPORTS_HYBRID_KEX=0x08)
 [2]      discovery_mode  u8  (0=Public, 1=ContactsOnly)
 ```
-> Wire v3 dropped the legacy 12-byte form: `transports_supported`, `max_frame_size`,
-> `max_streams`, `ovl1_minor`, and the `CAN_MAILBOX/CAN_GATEWAY_LOCAL_MESH/CAN_PARTICIPATE_DHT/`
-> `CAN_ACCEPT_APP_STREAMS/CAN_STORE/SUPPORTS_TRANSIT` flags were removed. The decoder also
-> accepts the 2-byte form (`roles + flags`), defaulting `discovery_mode` to `Public`.
+> Wire v3 dropped the old 12-byte form. Gone are the fields `transports_supported`,
+> `max_frame_size`, `max_streams`, and `ovl1_minor`, along with the
+> `CAN_MAILBOX/CAN_GATEWAY_LOCAL_MESH/CAN_PARTICIPATE_DHT/`
+> `CAN_ACCEPT_APP_STREAMS/CAN_STORE/SUPPORTS_TRANSIT` flags. For compatibility the
+> decoder still accepts a 2-byte form (`roles + flags`); when it does, it defaults
+> `discovery_mode` to `Public`.
 
 ### DeletePayload (variable)
-Authenticated DHT delete.  Supports every identity signature algorithm (Ed25519, Falcon-512, and the Ed25519+Falcon-512/1024 hybrids) via `SignatureAlgorithm::from_wire_byte`.
+An authenticated request to delete a value from the DHT. It carries a signature, so
+only the rightful owner can remove an entry. Every identity signature algorithm is
+supported — Ed25519, Falcon-512, and the Ed25519+Falcon-512/1024 hybrids — through
+`SignatureAlgorithm::from_wire_byte`.
 
 ```
 [0..32]             key         [u8; 32]
@@ -129,10 +161,10 @@ Authenticated DHT delete.  Supports every identity signature algorithm (Ed25519,
 [+slen]             signature   bytes (64 for Ed25519, ~666 for Falcon-512)
 ```
 
-Server-side validation:
-1. `algo ∈ {0, 2}`;
-2. `crypto::verify_message(algo, public_key, key_bytes, signature)` = OK;
-3. `BLAKE3(public_key) == key` — only the node whose `node_id == key` can delete.
+The server accepts the delete only if all three checks pass:
+1. the algorithm is one it allows here — `algo ∈ {0, 2}`;
+2. the signature verifies — `crypto::verify_message(algo, public_key, key_bytes, signature)` returns OK;
+3. the key belongs to the signer — `BLAKE3(public_key) == key`, so only the node whose `node_id == key` can delete it.
 
 ### RecursiveRelayPayload
 ```
@@ -172,7 +204,9 @@ Server-side validation:
 
 ## Constants quick-reference
 
-See [`budget.rs`](../../crates/veil-proto/src/budget.rs) for the authoritative list.
+A handful of limits worth keeping nearby. The authoritative list lives in
+[`budget.rs`](../../crates/veil-proto/src/budget.rs); the table below is just a
+convenience copy.
 
 | Constant | Value |
 |----------|-------|

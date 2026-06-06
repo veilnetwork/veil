@@ -2,23 +2,23 @@
 
 ## What is Veil (OVL1)?
 
-**Veil** is a decentralized P2P network with cryptographic addressing. Each node in the network is identified by a 32-byte `node_id = BLAKE3(public_key)` — the address does not depend on IP, location, or transport. Applications communicate via veil addresses, and the network itself finds delivery paths.
+**Veil** is a peer-to-peer network: there's no central server, just many equal computers — **nodes** — passing traffic for each other. Every node has an address built from its cryptographic key, written `node_id = BLAKE3(public_key)`. (BLAKE3 is just a fast hash function — a one-way recipe that turns the key into a short, fixed-size fingerprint.) That address is 32 bytes long and never changes: it doesn't depend on your IP, your location, or how you connect. Apps talk to a veil address, and the network figures out how to deliver the bytes.
 
-What OVL1 can do:
+OVL1 is the name of Veil's protocol — the shared set of rules every node speaks. Here's what it gives you:
 
-- **Message delivery** between nodes through arbitrary intermediate nodes (relay)
-- **Mailbox** — storing messages for offline recipients on gateway nodes
-- **DHT** (distributed hash table, Kademlia) — node lookup, resource publication
-- **Names** — human-readable identifiers with a Proof-of-Work binding to a node
-- **Streaming** — bidirectional streams with window control (analogous to TCP over veil)
-- **E2E encryption** — message contents are hidden even from relay nodes (ML-KEM + ChaCha20-Poly1305)
-- **Local network** — UDP mesh-broadcast for discovering neighbors within a single segment
+- **Message delivery** between nodes, hopping through other nodes along the way (each forwarding node is a **relay**)
+- **Mailbox** — when the person you're writing to is offline, their messages wait for them on a gateway node
+- **DHT** — a shared address book spread across all nodes (a *distributed hash table*, using the Kademlia design). Use it to find nodes and to publish things others can look up.
+- **Names** — readable handles like `@alice` instead of long hex addresses, tied to a node by a small proof-of-work puzzle
+- **Streaming** — two-way data streams with flow control, much like TCP but running over Veil
+- **End-to-end encryption** — only you and the recipient can read a message; the relays in between see only scrambled bytes (sealed with ML-KEM + ChaCha20-Poly1305, modern encryption built to resist even future quantum computers)
+- **Local network** — a quick UDP broadcast on your LAN to find neighbors on the same network segment
 
 ---
 
 ## Installation
 
-The fast path — prebuilt, sha256-verified binaries, no Rust toolchain needed:
+The fast path: grab a ready-made build. The script downloads a prebuilt program, checks its sha256 fingerprint so you know it wasn't tampered with, and installs it — no compiler or Rust setup required.
 
 **Linux / macOS:**
 
@@ -33,13 +33,13 @@ curl --proto '=https' --tlsv1.2 -sSf \
 irm https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.ps1 | iex
 ```
 
-This installs `veil-cli` into `~/.veil/bin` (`%USERPROFILE%\.veil\bin` on Windows). Add `--all` to also install `ogate` and the `oproxy` client/server. Components, options, server setup, and uninstall are covered in **[Installation & first node](install.md)**.
+This puts `veil-cli` into `~/.veil/bin` (`%USERPROFILE%\.veil\bin` on Windows). Add `--all` to install `ogate` and the `oproxy` client and server too. For the full list of components, options, server setup, and how to uninstall, see **[Installation & first node](install.md)**.
 
-> **Windows note:** the node uses TCP loopback for the admin protocol. Unix-specific conveniences (SIGHUP reload, Unix domain sockets) are unavailable, but the admin CLI, the main veil traffic, and foreground mode all work. Set `global.admin_socket = "tcp://127.0.0.1:0"`; the node picks a port from the kernel and writes `admin.port`/`admin.token` to `runtime_dir`, and clients read them when connecting.
+> **Windows note:** on Windows the node talks to the admin CLI over a local TCP connection. A couple of Unix-only conveniences are missing (reloading the config with a SIGHUP signal, and Unix domain sockets), but everything that matters works: the admin CLI, your regular Veil traffic, and running the node in the foreground. Set `global.admin_socket = "tcp://127.0.0.1:0"`; the node lets the operating system pick a free port, writes `admin.port` and `admin.token` into `runtime_dir`, and clients read those when they connect.
 
 ### Building from source
 
-Only needed for platforms without a prebuilt binary (e.g. Intel macOS) or for development. The default build links BoringSSL (`tls-boring`) + RocksDB (`rocksdb-cold`), so a C/C++ toolchain is required:
+You only need this on platforms with no ready-made build (Intel macOS, say), or if you're developing Veil itself. The default build links in two C/C++ libraries — BoringSSL (`tls-boring`) for encryption and RocksDB (`rocksdb-cold`) for storage — so you'll need a C/C++ compiler installed:
 
 ```bash
 # Debian/Ubuntu prerequisites:
@@ -64,7 +64,7 @@ See [Installation → Build from source](install.md#build-from-source) for the f
 veil-cli config init
 ```
 
-The command creates `~/.config/veil/config.toml` (the path depends on the OS) and **mines a PoW nonce** for the identity — this may take a few seconds. The nonce protects against node_id collisions.
+This writes a config file at `~/.config/veil/config.toml` (the exact path depends on your operating system) and creates your identity — the key pair that *is* your node. As part of that it solves a small proof-of-work puzzle: it searches for a special number (a **nonce**) that makes the puzzle check out. This takes a few seconds of CPU time. The point is to make it costly to mint huge batches of fake identities, so two nodes don't end up fighting over the same address.
 
 See where the config is located:
 
@@ -84,7 +84,7 @@ veil-cli config show
 veil-cli node run
 ```
 
-The node starts in the background. Check its state:
+The node starts up and keeps running in the background. Check how it's doing:
 
 ```bash
 veil-cli node show
@@ -92,6 +92,8 @@ veil-cli node health
 ```
 
 ### 3. View your node_id
+
+Your `node_id` is your address on the network — share it so others can reach you.
 
 ```bash
 veil-cli node show
@@ -106,9 +108,11 @@ listeners: 0
 peers:    1 connected
 ```
 
+Here `role: leaf` means your node reaches out to the network but isn't publicly reachable — the right setup for a laptop or phone behind a home router. (A node with a public address others can connect to is a *relay*.) `peers` is how many other nodes you're connected to directly.
+
 ### 4. Connect to a known peer
 
-Add a peer to the configuration:
+A **peer** is another node yours talks to directly. To connect to one, add it to your config — you'll need its public key, its proof-of-work nonce, and a transport address telling Veil how to reach it:
 
 ```bash
 # PUBLIC_KEY, NONCE, and TRANSPORT are positional arguments
@@ -119,7 +123,7 @@ veil-cli peers add \
   "tls://gateway.example.com:9443"
 ```
 
-Restart the node:
+Restart the node so it picks up the change:
 
 ```bash
 veil-cli node restart
@@ -165,7 +169,7 @@ veil-cli node stop
 | `node stop` | Gracefully stop the node |
 | `node restart` | Restart (stop + run) |
 | `node show` | Show a summary (node_id, role, sessions) |
-| `node health` | Check the liveness of the event loop and the number of sessions |
+| `node health` | Confirm the node is responsive and report how many sessions are open |
 
 ### `veil-cli listen`
 
@@ -198,13 +202,13 @@ veil-cli node stop
 | `debug trace TARGET [--max-hops N]` | Traceroute across the veil network |
 | `debug capture [--node-id HEX] [--family N] [--limit N]` | Capture frames for debugging |
 
-`debug ping` / `debug trace` take a 64-character hex `NODE_ID` only. To reach a node by `@name`, resolve it first with `node resolve-name` (see [Names](#names-name-system)).
+`debug ping` and `debug trace` only accept a raw `NODE_ID` (64 hex characters). If you have a `@name` instead, turn it into an address first with `node resolve-name` (see [Names](#names-name-system)).
 
 ---
 
 ## Names (Name System)
 
-OVL1 supports human-readable names bound to a sovereign identity via PoW. Names belong to the `identity` branch (there is no separate `name` command), and `@name` resolution is performed via `node resolve-name`.
+A `node_id` is 64 hex characters — fine for a computer, painful for a human. So Veil lets you claim a readable name like `@alice` and bind it to your identity. Nobody can hand out names for you, and nobody can quietly steal yours: a name is locked to your keys, and a small proof-of-work puzzle makes grabbing names in bulk expensive. Names live under the `identity` command (there's no separate `name` command), and you turn a `@name` back into an address with `node resolve-name`.
 
 ### Claim a name
 
@@ -212,9 +216,9 @@ OVL1 supports human-readable names bound to a sovereign identity via PoW. Names 
 veil-cli identity claim-name alice
 ```
 
-The name is a positional argument; it is normalized to lowercase ASCII (only the characters `[a-z0-9#_-]` are allowed). The command mines a PoW nonce proportional to the rarity of the name, signs a `NameClaim` with the active `identity_sk`, and saves it to `<veil_dir>/name_claims/<name>.bin`. A running daemon publishes the claim to the DHT at the next republish tick (once every 6 hours) or on restart.
+The name is a positional argument. It's lowercased to plain ASCII, and only the characters `[a-z0-9#_-]` are allowed. The command solves a proof-of-work puzzle — harder for rarer, more desirable names — then signs a `NameClaim` record with your active signing key (`identity_sk`) and saves it to `<veil_dir>/name_claims/<name>.bin`. If your node is running, it announces the claim to the DHT so others can find it: either on restart, or at the next scheduled re-announcement (every 6 hours).
 
-The `--veil-dir PATH` option overrides the identity directory (by default `~/.config/veil` or `$VEIL_IDENTITY_DIR`).
+Use `--veil-dir PATH` to point at a different identity directory (the default is `~/.config/veil`, or wherever `$VEIL_IDENTITY_DIR` points).
 
 ### Resolve a name
 
@@ -222,11 +226,11 @@ The `--veil-dir PATH` option overrides the identity directory (by default `~/.co
 veil-cli node resolve-name @alice
 ```
 
-Accepts both `alice` and `@alice`. It resolves the chain `NameClaim` → `IdentityDocument` with full verification (PoW difficulty, freshness-hour tolerance, and verification of the name binding to the signature of the document's active subkey). The `--timeout-ms N` option limits the total resolution time (5000 by default).
+This takes a name and gives you back the address behind it. Both `alice` and `@alice` work. It follows the trail from the `NameClaim` to the full `IdentityDocument` and checks every step — that the proof-of-work is strong enough, that the record is recent, and that the name really is signed by the identity's current key — so you can trust the address you get back. Use `--timeout-ms N` to cap how long resolution may take (5000 ms by default).
 
 ### DHT key of a name
 
-Compute the DHT key under which the `NameClaim` for a given name is published (without network I/O):
+Work out the DHT key where a name's `NameClaim` gets stored — purely a local calculation, no network access:
 
 ```bash
 veil-cli identity name-dht-key alice
@@ -236,9 +240,9 @@ veil-cli identity name-dht-key alice
 
 ## Use from an application (IPC)
 
-If you are writing an application that should work over the veil network:
+Want your own app to send and receive traffic over Veil? It talks to the local node through IPC (inter-process communication) — a small socket on your own machine that your program connects to. Here's how:
 
-1. Enable IPC in the config:
+1. Turn IPC on in the config:
 
 ```toml
 [ipc]
@@ -246,9 +250,9 @@ enabled = true
 socket_uri = "unix:///home/user/.veil/app.sock"
 ```
 
-The key is called `socket_uri` and accepts a URI (`unix:///abs/path` on Linux/macOS or `tcp://127.0.0.1:0?runtime_dir=/abs/path` on Windows), not a file path. The tilde `~` in the URI is not expanded — specify an absolute path. If `socket_uri` is not set, on Unix the daemon uses `~/.veil/app.sock` by default.
+Note the key is `socket_uri`, and it wants a full URI — `unix:///abs/path` on Linux/macOS, or `tcp://127.0.0.1:0?runtime_dir=/abs/path` on Windows — not a plain file path. A `~` in the URI is taken literally, not expanded to your home folder, so write out the absolute path. Leave `socket_uri` unset and, on Unix, the node falls back to `~/.veil/app.sock`.
 
-2. Connect to the socket and perform the handshake:
+2. Connect to the socket and do the opening handshake (the short hello-and-acknowledge exchange that sets up the connection):
 
 ```python
 # Example in Python (simplified)
@@ -285,14 +289,14 @@ For more on the IPC protocol, see the [Protocol Specification](protocol-spec.md#
 
 ### Peer-to-peer messenger
 
-1. Both nodes know each other's node_id (or the names `@alice`, `@bob`)
-2. The application opens a `StreamOpen` → receives a bidirectional stream
-3. Data is encrypted E2E (ML-KEM + ChaCha20-Poly1305)
-4. If the recipient is offline, the message is stored in a mailbox on a gateway
+1. Each node knows the other's node_id (or its name, `@alice` or `@bob`)
+2. The app sends a `StreamOpen` and gets back a two-way stream to talk over
+3. Everything is encrypted end to end (ML-KEM + ChaCha20-Poly1305), so relays in between can't read it
+4. If the recipient is offline, the message waits in their mailbox on a gateway until they come back
 
 ### Publishing a resource to the DHT
 
-Via IPC or the admin API:
+Through IPC, or directly with the admin API:
 ```bash
 veil-cli node dht put HEX_KEY HEX_VALUE
 ```

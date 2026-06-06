@@ -1,17 +1,21 @@
 # Messenger dev guide
 
-How to build a Signal-style messenger (or any app that needs
-sovereign identity + async delivery) on top of veil.
+How to build a Signal-style messenger on top of veil. The same
+recipe works for any app that needs a sovereign identity (an
+account that belongs to the user, not to a server) plus async
+delivery (messages that reach a recipient who is currently offline).
 
-This doc points at the APIs; see the linked source files for
-signatures and the companion docs for user-facing behaviour.
+This doc points you at the APIs. For exact signatures, read the
+linked source files. For user-facing behaviour, read the companion
+docs.
 
-- [`identity-model.md`](identity-model.md) — protocol spec.
-- [`multi-device.md`](multi-device.md) — the LB/messenger mode
-  split.
-- [`recovery.md`](recovery.md) — user-visible recovery flows.
-- [`opsec-user-guide.md`](opsec-user-guide.md) — hand to your
-  users.
+- [`identity-model.md`](identity-model.md) — the protocol spec.
+- [`multi-device.md`](multi-device.md) — the split between the two
+  operating modes (load-balancer and messenger).
+- [`recovery.md`](recovery.md) — recovery flows as the user sees
+  them.
+- [`opsec-user-guide.md`](opsec-user-guide.md) — hand this one to
+  your users.
 
 ---
 
@@ -19,34 +23,53 @@ signatures and the companion docs for user-facing behaviour.
 
 **Gives you**:
 
-- Sovereign identity (`identity_id` stable across rotations).
-- `@name` → `identity_id` resolution (eclipse-resistant quorum).
-- Forward-secret synchronous E2E (X3DH prekeys + ML-KEM fan-out).
-- Multi-device message delivery to **online** instances + own-instance
-  state-blob fan-out (see [`integration_tests::scenario_app_state_sync_*`](../../crates/veil-identity/src/integration_tests.rs)).
-- Safety-number fingerprints for out-of-band verification.
-- Backup → restore via BIP-39 paper phrase (see
+- Sovereign identity. The `identity_id` stays stable even when the
+  underlying keys rotate.
+- Name resolution: `@name` → `identity_id`. It uses a quorum (several
+  independent replicas must agree) so a single malicious node can't
+  feed you a fake answer.
+- Forward-secret end-to-end encryption for messages sent while the
+  recipient is online. Built from X3DH prekeys and ML-KEM fan-out
+  (both defined in section 2). Forward secrecy means that stealing
+  today's keys can't decrypt yesterday's messages.
+- Message delivery to a recipient's **online** instances across all
+  their devices, plus state-blob fan-out between your *own* instances
+  (see [`integration_tests::scenario_app_state_sync_*`](../../crates/veil-identity/src/integration_tests.rs)).
+  An *instance* is one device's running copy of the identity.
+- Safety-number fingerprints: short numeric codes two people can read
+  to each other out of band (over a phone call, in person) to confirm
+  nobody is impersonating either side.
+- Backup and restore through a BIP-39 paper phrase — the kind of
+  word list you write on paper (see
   [`integration_tests::scenario_chat_backup_restore_roundtrip`](../../crates/veil-identity/src/integration_tests.rs)).
 
 **Does NOT give you**:
 
-- **Async / offline delivery** — veil has no in-network mailbox
-  subsystem.  If your messenger needs durable async, build it as a
-  separate crate (`veil-mailbox`, not yet implemented; or use
-  `DHT.store` with TTL, multi-node self-sync, or external relay).
-- **Revocation + compromise recovery** — veil has no in-band
-  revocation gossip, no `RevocationCache`, no `master_freshness_sig`.
-  Recovery flow today: short-lived `IdentityKey.valid_until` (≤7 d) +
-  re-issue from master.  Long-term revocation crate is open backlog.
-- Message content schemas — pick your own (protobuf, JSON, whatever).
-- Group chat — MLS (RFC 9420) is recommended; any library that speaks
-  MLS slots in at the application layer.
-- Presence / typing indicators / read receipts — build on top using
-  app_state fan-out + direct sessions.
-- Voice/video — veil's real-time stream channel carries the media;
-  layer your SDP exchange on top.
-- Push-notification delivery to mobile OSes — veil emits a
-  `WakeHint`; your mobile app handles the APN/FCM round-trip.
+- **Async / offline delivery.** Veil has no built-in mailbox. If your
+  messenger needs durable async delivery (messages that wait for an
+  offline recipient and survive a restart), you build it yourself:
+  either as a separate crate (`veil-mailbox`, not yet implemented), or
+  on top of existing primitives — `DHT.store` with a TTL (a record
+  that the network drops after a time-to-live), self-sync across your
+  own nodes, or an external relay.
+- **Revocation and compromise recovery.** Veil has no in-band way to
+  gossip "this key is revoked" — no `RevocationCache`, no
+  `master_freshness_sig`. Today's recovery flow is simpler: each
+  `IdentityKey` is short-lived (`valid_until` ≤ 7 days), and you
+  re-issue a fresh one from the master key. A proper long-term
+  revocation crate is still on the backlog.
+- Message content schemas. Pick your own — protobuf, JSON, whatever
+  fits.
+- Group chat. Use MLS (RFC 9420). Any library that speaks MLS slots
+  in at the application layer.
+- Presence, typing indicators, read receipts. Build these on top,
+  using app_state fan-out plus direct sessions.
+- Voice and video. Veil's real-time stream channel carries the media;
+  you layer your own SDP exchange (the WebRTC call-setup handshake) on
+  top.
+- Push delivery to mobile operating systems. Veil emits a `WakeHint`;
+  your mobile app handles the round-trip to Apple's or Google's push
+  service (APN / FCM).
 
 ---
 
@@ -117,24 +140,28 @@ signatures and the companion docs for user-facing behaviour.
                   └──────────────────────────────────────────┘
 ```
 
-All of the veil-side steps are already implemented (see
+Every veil-side step here is already implemented (see
 [`integration_tests::scenario_multi_device_fanout_messenger`](../../crates/veil-identity/src/integration_tests.rs)).
-Your app sits at the top and bottom of this diagram.
+Your app supplies the top and bottom of this diagram; veil does the
+middle.
 
-> **Async / offline delivery is out-of-scope for the network layer.**
-> Veil has no in-network mailbox.  If your messenger needs to
-> store-and-forward to offline recipients, build it on top: either a
-> dedicated `veil-mailbox` crate (TBD), or use existing primitives
-> (`DHT.store` with TTL on a known shard, or pick an online relay-peer
-> per-recipient and replicate).
+> **Async / offline delivery is out of scope for the network layer.**
+> Veil has no built-in mailbox. If your messenger needs to
+> store-and-forward to offline recipients, build that on top. Two
+> options: a dedicated `veil-mailbox` crate (to be designed), or
+> existing primitives — `DHT.store` with a TTL on a known shard (a
+> fixed slice of the address space), or pick one online relay peer
+> per recipient and replicate to it.
 
 ---
 
 ## 3. Library cheat-sheet
 
-Quick pointer table to current primitives.  Crate layout: identity
-primitives live in [`veil-identity`](../../crates/veil-identity/),
-crypto in [`veil-crypto`](../../crates/veil-crypto/), wire types in
+A quick pointer table to the current primitives. The crates split up
+like this: identity primitives live in
+[`veil-identity`](../../crates/veil-identity/), crypto in
+[`veil-crypto`](../../crates/veil-crypto/), and wire types — the
+structs that actually go over the network — in
 [`veil-proto`](../../crates/veil-proto/).
 
 | Concern | Module | Key entry points |
@@ -169,13 +196,14 @@ crypto in [`veil-crypto`](../../crates/veil-crypto/), wire types in
 [`veil-proto/recipient.rs`]: ../crates/veil-proto/src/recipient.rs
 [`veil-proto/wake_hint.rs`]: ../crates/veil-proto/src/wake_hint.rs
 
-> **Removed by architectural decision**:
+> **Removed by an architectural decision**:
 > `revocation_cache.rs`, `propagate.rs` (revocation gossip),
-> `watcher.rs` (anomaly), `tier_b.rs`, `mailbox/*` — none of these
-> exist in the current network layer.  Async-delivery and revocation
-> crates may return as **separate** crates layered on top of the
-> network layer (not yet implemented).  Sections 4-7 below may still
-> reference these APIs; reading the cheat-sheet above is authoritative.
+> `watcher.rs` (anomaly detection), `tier_b.rs`, and `mailbox/*`. None
+> of these exist in the current network layer. Async delivery and
+> revocation may come back later, but as **separate** crates layered
+> on top of the network layer — not yet implemented. Sections 4-7
+> below may still reference these APIs. When in doubt, the cheat-sheet
+> above wins.
 
 ---
 
@@ -183,8 +211,8 @@ crypto in [`veil-crypto`](../../crates/veil-crypto/), wire types in
 
 ### 4.1. App-layer message format
 
-Your messages are opaque to veil — any serialisation works.
-A good starting point:
+Veil never looks inside your messages, so any serialisation works.
+Here is a reasonable starting point:
 
 ```rust
 struct AppMessage {
@@ -203,9 +231,13 @@ enum AppMessageKind {
 }
 ```
 
-Serialise to bytes — those are what `fanout_encrypt` sees.
+Serialise it to bytes. Those bytes are exactly what `fanout_encrypt`
+sees.
 
 ### 4.2. Resolve a recipient
+
+Resolving means turning a human-readable `@name` into the
+`identity_id` you actually send to.
 
 ```rust
 use veilcore::node::identity::resolver::{NameResolver, VerifyConfig};
@@ -223,10 +255,15 @@ let validated = resolver.resolve("alice", &cache, now_unix_secs()).await?;
 let recipient_identity_id = validated.id;
 ```
 
-The resolver has cached `alice → identity_id` for up to 5 minutes
-after first success, so repeated sends are cheap.
+After the first successful lookup, the resolver caches
+`alice → identity_id` for up to 5 minutes. Repeated sends in that
+window are cheap — no second quorum fetch.
 
-### 4.3. Fetch the recipient's instances + ML-KEM certs
+### 4.3. Fetch the recipient's instances and ML-KEM certs
+
+You now know *who* Bob is. Next you need *where* to send: one ML-KEM
+certificate per device he has online. The registry lists his devices;
+each device publishes its own certificate.
 
 ```rust
 use veilcore::node::identity::mlkem_fanout::{
@@ -269,12 +306,13 @@ for env in envelopes {
 }
 ```
 
-That's the outbound path.
+That's the whole outbound path.
 
 ### 4.5. Receive + decrypt
 
-On the recipient side, every time mailbox hands you an incoming
-`FanoutEnvelope`:
+On the recipient side, run this every time your mailbox hands you an
+incoming `FanoutEnvelope` (one sealed copy of the message, addressed
+to a single device):
 
 ```rust
 use veilcore::node::identity::mlkem_fanout::fanout_decrypt_one;
@@ -292,13 +330,18 @@ let msg: AppMessage = deserialise(&plaintext)?;
 app_display_inbound(msg);
 ```
 
-### 4.6. For truly async delivery: X3DH prekeys first, fallback to ML-KEM cert
+### 4.6. For truly async delivery: X3DH prekeys first, ML-KEM cert as a fallback
 
-Forward secrecy matters when the recipient is offline.  The
-message sits in the DHT/mailbox long enough that a later
-compromise of the long-lived ML-KEM key could decrypt it.
-X3DH prekeys solve this: a one-time key that's consumed and
-deleted.
+Forward secrecy matters most when the recipient is offline. The
+message then sits in the DHT or mailbox for a while. If someone later
+steals the long-lived ML-KEM key, they could decrypt that waiting
+message. X3DH prekeys close the gap. A *prekey* is a one-time key the
+recipient publishes in advance; the sender uses it once, and then it
+is consumed and deleted, so it can't decrypt anything a second time.
+
+The picking logic has three outcomes, in order of preference: a fresh
+one-time prekey, a reusable fallback prekey when the pool is empty,
+or — if even those are gone — the device's long-lived certificate.
 
 ```rust
 use veilcore::proto::prekey_bundle::PrekeyBundle;
@@ -336,6 +379,11 @@ match bundle.pick_for_send(&my_consumed_prekey_ids, now_unix_secs()) {
 
 ### 4.7. Sync the contact list across devices
 
+Store the contact list as an `AppState` record: one encrypted blob,
+signed by your identity, that every one of your own devices can read
+and overwrite. Bump the version on each write so devices can tell
+which copy is newest.
+
 ```rust
 use veilcore::proto::app_state::{encrypt_app_state, decrypt_app_state, AppState};
 
@@ -362,9 +410,11 @@ let contacts = decrypt_app_state(&state, &my_app_state_secret)?;
 
 ### 4.8. Surface safety-number changes
 
-Keep the last-observed safety number per contact.  When you
-resolve a contact and the resulting `(my_id, their_id)`
-fingerprint differs from what you stored, show an alert:
+Store the last safety number you saw for each contact. Each time you
+resolve that contact, recompute the `(my_id, their_id)` fingerprint.
+If it differs from what you stored, the contact's keys changed —
+which is normal after a reinstall, but also what an impersonation
+attack looks like. Either way, warn the user:
 
 ```
 Alice's safety number changed.
@@ -374,8 +424,8 @@ Contact Alice out-of-band to verify before sending anything
 sensitive.
 ```
 
-The `identity_fingerprint` function gives you the canonical
-form (60 digits, 12 groups of 5):
+The `identity_fingerprint` function returns this number in its
+canonical form — 60 digits, shown as 12 groups of 5:
 
 ```rust
 use veilcore::crypto::identity_fingerprint::identity_fingerprint;
@@ -384,8 +434,9 @@ let number = identity_fingerprint(&my_id, &their_id);
 
 ### 4.9. Device-linking UX
 
-Listen for `DeviceLinkedEvent` frames in your
-incoming message stream.  Show the user:
+Watch your incoming message stream for `DeviceLinkedEvent` frames.
+One arrives whenever a new device is linked to the identity. Show the
+user what happened:
 
 ```
 A new device linked to your identity:
@@ -396,35 +447,39 @@ A new device linked to your identity:
 Did you initiate this?  [ I did ]  [ I did NOT — help! ]
 ```
 
-If they tap "did NOT", immediately:
+If they tap "did NOT", treat it as a possible compromise and act at
+once:
 
 1. Revoke the new `identity_key` from the master device.
 2. Run the anomaly watcher.
-3. Consider full rotation (compromise scenario).
+3. Consider a full key rotation — assume the worst and start fresh.
 
 ---
 
 ## 5. Group chat — MLS
 
-Veil explicitly does NOT implement group-chat crypto.  The
-right primitive is MLS (RFC 9420).  Typical integration:
+Veil deliberately does NOT implement group-chat crypto. The right
+tool for that is MLS — Messaging Layer Security, RFC 9420. A typical
+integration looks like this:
 
-- Each member runs an MLS group library (`openmls` is
-  production-quality in Rust).
-- MLS welcome messages, commits, and application messages are
-  carried inside veil's `DELIVERY_FORWARD` as opaque bytes.
-- Veil handles transport + identity; MLS handles group state.
+- Each member runs an MLS group library (`openmls` is a
+  production-quality one in Rust).
+- MLS messages of every kind — welcomes, commits, and application
+  messages — ride inside veil's `DELIVERY_FORWARD` as opaque bytes.
+  Veil never parses them.
+- Veil handles transport and identity; MLS handles the shared group
+  state.
 
-The hand-off is clean: MLS sessions use veil's
-`identity_id` as each member's long-term identity key; veil's
-safety-number fingerprint verifies identity once out-of-band,
-and MLS takes it from there for group crypto.
+The hand-off is clean. Each MLS session uses veil's `identity_id` as
+that member's long-term identity key. You verify identity once, out
+of band, with veil's safety-number fingerprint — and from there MLS
+takes over the group crypto.
 
 ---
 
 ## 6. Building the user's first run
 
-The UX everyone gets wrong:
+Here is the first-run screen that almost everyone gets wrong:
 
 ```
 Welcome to [your messenger].
@@ -436,74 +491,76 @@ To get started, choose your identity name:  [__________]
 
 What the user actually needs, in order:
 
-1. **Pick a name** (your UI should resolve in real time to
-   show if it's taken).
-2. **See the BIP-39 phrase + confirmation**.  Let the user
-   physically write it down.  Show them veil's phrase-display
-   mode (dimmed-screen, no scrollback), and make them retype 3
-   random positions before proceeding.
-3. **Optionally set a master-file password** for the local
-   encrypted backup.  Skip by default — paper is the actual
-   durable backup.
-4. **Render the QR code for contact sharing**.  Encourage them
-   to screenshot it or save to cloud — it contains no secrets,
-   only the public `identity_id` + preferred name.
-5. **Prompt to add contacts** or **link another device**.
+1. **Pick a name.** Resolve it in real time as they type, so they can
+   see whether it's already taken.
+2. **See the BIP-39 phrase, then confirm it.** Let the user write it
+   down on paper. Show it in veil's phrase-display mode — dimmed
+   screen, no scrollback — and make them retype 3 random positions
+   before they move on.
+3. **Optionally set a master-file password** for the local encrypted
+   backup. Skip it by default. Paper is the backup that actually
+   lasts; the encrypted file is a convenience.
+4. **Render a QR code for sharing the contact.** Encourage a
+   screenshot or a save to the cloud — it holds no secrets, only the
+   public `identity_id` and preferred name.
+5. **Prompt them to add contacts** or **link another device**.
 
-Pair-invite + pair-accept round-trip, with OOB code matching,
-should be under 90 seconds on a typical consumer setup.
+The full pair-invite plus pair-accept round-trip, including the
+out-of-band code check, should take under 90 seconds on a typical
+consumer setup.
 
 ---
 
 ## 7. Testing strategy for app integrations
 
-`veilcore` exposes its backends as traits — use in-memory
-fakes in your integration tests:
+`veilcore` exposes its backends as traits, so your integration tests
+can swap in in-memory fakes instead of touching the real network:
 
-- `NameLookup` + `IdentityLookup` (see `resolver.rs` tests).
-- Construct your own `MemBackend` and wire it up just like
-  veil's existing tests do.
-- Generate test identities with `master_seed = [0x42u8; 32]`
-  so tests are deterministic.
+- Fake out `NameLookup` and `IdentityLookup` (see the `resolver.rs`
+  tests for how).
+- Build your own `MemBackend` and wire it up exactly the way veil's
+  own tests do.
+- Generate test identities from a fixed seed,
+  `master_seed = [0x42u8; 32]`, so every run is deterministic.
 
-Reference patterns live in every `tests` module in
-`veilcore` — they are intentionally verbose so they double
-as documentation.
+You'll find reference patterns in every `tests` module across
+`veilcore`. They are verbose on purpose, so they double as worked
+examples.
 
 ---
 
 ## 8. Checklist before you ship your v1
 
-☐ BIP-39 phrase displayed at create time, user retype
-confirmation, screen dimmed.
+☐ BIP-39 phrase shown at create time, on a dimmed screen, with a
+retype confirmation.
 
-☐ Encrypted-master-file support if you're not paper-only.
+☐ Encrypted-master-file support, unless you are paper-only.
 
-☐ Contacts synced via `AppState` (not an ad-hoc DHT record).
+☐ Contacts synced through `AppState`, not an ad-hoc DHT record.
 
 ☐ Fan-out encryption for multi-device recipients.
 
-☐ X3DH prekey pool maintained — refill when it drops below
+☐ X3DH prekey pool kept topped up — refill it whenever it drops below
 `MIN_PREKEY_POOL_REMAINING = 3`.
 
-☐ Revocation cache persistent at `~/.config/veil/revocations.bin`.
+☐ Revocation cache persisted at `~/.config/veil/revocations.bin`.
 
-☐ Quorum resolver enabled (`resolver_quorum = 2`).
+☐ Quorum resolver turned on (`resolver_quorum = 2`).
 
-☐ Safety-number display in contact profiles.
+☐ Safety number shown in each contact's profile.
 
-☐ DeviceLinkedEvent alerts.
+☐ DeviceLinkedEvent alerts wired up.
 
-☐ Anomaly watcher run at every start (shows warnings if
-present).
+☐ Anomaly watcher run at every startup, surfacing any warnings it
+finds.
 
-☐ Mailbox cursors tracked per instance (shared mailbox, not
-per-device state).
+☐ Mailbox cursors tracked per instance — the mailbox is shared, so
+this is not per-device state.
 
-☐ Freshness refresh scheduled (`veil-cli identity
-refresh-freshness` or equivalent automation) ≥ every 25 days.
+☐ Freshness refresh scheduled at least every 25 days (`veil-cli
+identity refresh-freshness`, or your own automation).
 
-☐ User-facing docs linking to
+☐ User-facing docs that link to
 [`opsec-user-guide.md`](opsec-user-guide.md) and
 [`recovery.md`](recovery.md).
 
@@ -511,8 +568,8 @@ refresh-freshness` or equivalent automation) ≥ every 25 days.
 
 ## 9. Where to ask questions
 
-- Protocol details: [`identity-model.md`](identity-model.md)
-  §10 (threat model) and §11 (algorithm agility).
-- Integration bugs: veil's issue tracker, label
-  `integration-help`.
-- Crypto review: veil RFCs in `docs/rfcs/`.
+- Protocol details: [`identity-model.md`](identity-model.md), §10
+  (threat model) and §11 (algorithm agility).
+- Integration bugs: veil's issue tracker, under the `integration-help`
+  label.
+- Crypto review: the veil RFCs in `docs/rfcs/`.
