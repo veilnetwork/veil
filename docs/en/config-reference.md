@@ -61,7 +61,7 @@ Tokio runtime and logging.
 | `log_level` | enum | `"info"` | Minimum level to log. Values: `"debug"`, `"info"`, `"warn"`, `"error"` |
 | `log_format` | enum | `"text"` | Log line format. Values: `"text"` (human-readable), `"json"` (NDJSON) |
 | `admin_max_connections` | `usize` | `32` | Most admin-socket connections allowed at once |
-| `require_signed_config` | `bool` | `false` | When `true`, the node refuses to load a config that isn't validly signed (Этап 11d) — see config signing in [OPERATIONS](OPERATIONS.md) |
+| `require_signed_config` | `bool` | `false` | When `true`, the node refuses to load a config that isn't validly signed (Stage 11d) — see config signing in [OPERATIONS](OPERATIONS.md) |
 | `tls_ech_grease` | `bool` | `true` | Send TLS **ECH GREASE** so middleboxes can't tell ECH-capable connections from the rest. Set `false` only for CDNs stuck on TLS 1.2 |
 | `bootstrap_dns_domain` | `string` or absent | unset | DNS bootstrap domain — seeds delivered as TXT records, one more fallback layer for joining the network |
 | `bootstrap_https_urls` | `[string]` | `[]` | HTTPS (and `.onion`) URLs that serve a **signed** seed bundle — the last resort when clearnet seeds are blocked |
@@ -1069,7 +1069,7 @@ DHT (Kademlia) settings — background node lookup and value storage.
 | `allow_unsigned_store` | `bool` | `false` | Accept legacy **unsigned** raw STOREs. Default `false` (rejected outright). Turning it back on is a deploy footgun — see [OPERATIONS](OPERATIONS.md); a one-shot deprecation warning fires the first time one is accepted |
 | `max_store_entries` | `usize` | `25000` | Hard cap on entries in the DHT store. Raise it for dedicated DHT seeds (e.g. `250000`); to go past RAM, page out through the `cold_store_path` RocksDB tier |
 | `max_store_bytes` | `u64` or absent | unset | Optional byte-size cap on the DHT store, alongside `max_store_entries` |
-| `per_origin_max_bytes` | `u64` or absent | unset | Per-signer byte cap (Этап 11e) — limits how much one origin can store, so a single signer can't fill the store |
+| `per_origin_max_bytes` | `u64` or absent | unset | Per-signer byte cap (Stage 11e) — limits how much one origin can store, so a single signer can't fill the store |
 | `shard_filtering` | `bool` | `false` | Opt-in: accept a STORE only when its key falls in this node's shard. Default `false`; meant to become default-on once the network grows past ~1M nodes |
 
 **Example:**

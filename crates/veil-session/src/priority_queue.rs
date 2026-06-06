@@ -32,20 +32,20 @@ pub const DEFAULT_WEIGHTS: [u32; 4] = [8, 4, 2, 1];
 /// priority levels per session. Above this, lowest-priority frames are
 /// shed first; same priority shed front-of-queue (oldest).
 ///
-/// Sized к match the upstream mpsc cap (64 frames in `tx_queue_depth`)
-/// и the IPC delivery cap (64) — at chat-load 60 KiB frames × 64 ≈ 4 MiB
+/// Sized to match the upstream mpsc cap (64 frames in `tx_queue_depth`)
+/// and the IPC delivery cap (64) — at chat-load 60 KiB frames × 64 ≈ 4 MiB
 /// per session worst case. Without this, the WRR queue grew unbounded
 /// whenever the wire writer hiccupped under chaos-ban-style network
 /// churn — observed as 300+ MiB RSS on a bootstrap with only 8 outbound
-/// connect attempts и all-tiny gauges (the leak sat between the bounded
-/// mpsc и the wire, completely unmetered).
+/// connect attempts and all-tiny gauges (the leak sat between the bounded
+/// mpsc and the wire, completely unmetered).
 ///
 /// Raised 64 → 1024 to align with `PQ_DRAIN_FRAMES_PER_PASS = 256`. The
 /// older cap of 64 was below one drain pass, so `drain_outbox_into_pq`
 /// kept shedding mid-priority frames every burst — the upstream mpsc
-/// (cap 4096) effectively decimated к 64 on the way to the wire. Cap
+/// (cap 4096) effectively decimated to 64 on the way to the wire. Cap
 /// 1024 at 60 KiB ≈ 60 MiB worst case; production frames are 60-300 B
-/// (control) к 64 KiB (data), so steady state is well below this.
+/// (control) to 64 KiB (data), so steady state is well below this.
 pub const DEFAULT_MAX_DEPTH: usize = 1024;
 
 // ── PriorityQueue ─────────────────────────────────────────────────────────────
@@ -78,10 +78,10 @@ impl PriorityQueue {
         Self::with_capacity_and_drop_counter(weights, max_depth, Arc::new(AtomicU64::new(0)))
     }
 
-    /// g: construct with a custom cap и a shared
+    /// g: construct with a custom cap and a shared
     /// `Arc<AtomicU64>` drop counter (typically
     /// `NodeMetrics::priority_queue_drops_counter` so overflow drops
-    /// flow к Prometheus without per-tick polling).
+    /// flow to Prometheus without per-tick polling).
     pub fn with_capacity_and_drop_counter(
         weights: [u32; 4],
         max_depth: usize,
@@ -112,7 +112,7 @@ impl PriorityQueue {
     /// the queue's memory footprint bounded under sustained wire-stall
     /// pressure while preserving REALTIME/INTERACTIVE frames at the
     /// expense of BULK/BACKGROUND. Drops increment `drops_total` so the
-    /// runner can forward them к Prometheus.
+    /// runner can forward them to Prometheus.
     pub fn push(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
         let p = priority.min(3) as usize;
         if self.len() >= self.max_depth {
@@ -184,11 +184,11 @@ impl PriorityQueue {
     /// the queue is empty. Used by deferred
     /// outbound-batching: the session runner peeks the head priority
     /// before draining; if it's strictly above [`INTERACTIVE`] (i.e.
-    /// `BULK` или `BACKGROUND`), the runner may defer drain by up
+    /// `BULK` or `BACKGROUND`), the runner may defer drain by up
     /// to `MobileConfig::outbound_batch_window_ms` to coalesce
     /// cellular-radio wake-ups.
     ///
-    /// Note this does NOT advance the WRR slot counter — it's а pure
+    /// Note this does NOT advance the WRR slot counter — it's a pure
     /// inspection of the queue state.
     pub fn peek_priority(&self) -> Option<u8> {
         (0..4u8).find(|&p| !self.queues[p as usize].is_empty())
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn epic483_5o_peek_returns_priority_after_wrr_pop() {
         // Mixed priorities — verify peek tracks queue state through a
-        // pop sequence, never returning а priority that has 0 frames.
+        // pop sequence, never returning a priority that has 0 frames.
         let mut pq = PriorityQueue::with_default_weights();
         pq.push(REALTIME, arc(b"rt"));
         pq.push(BACKGROUND, arc(b"bg"));

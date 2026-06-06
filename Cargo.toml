@@ -58,20 +58,20 @@ members = [
 
 [workspace.lints.clippy]
 # Mutex/RwLock guards must not be held across .await — guard is held while
-# the task suspends, preventing other tasks from acquiring the lock и risking
-# deadlock на single-threaded executors. Rust's Send checker catches some
-# cases (std::Mutex guard is !Send) but не all (parking_lot::Mutex IS Send;
-# single-threaded tokio runtime doesn't require Send). This lint is а
+# the task suspends, preventing other tasks from acquiring the lock and risking
+# deadlock on single-threaded executors. Rust's Send checker catches some
+# cases (std::Mutex guard is !Send) but not all (parking_lot::Mutex IS Send;
+# single-threaded tokio runtime doesn't require Send). This lint is a
 # defence-in-depth that fires regardless.
 #
 # Use `tokio::sync::Mutex` / `tokio::sync::RwLock` if you genuinely need
-# to hold а lock across .await — those are designed for it.
+# to hold a lock across .await — those are designed for it.
 #
-# Audit batch 2026-05-24 (D1/M2): promoted к "deny".  External review
+# Audit batch 2026-05-24 (D1/M2): promoted to "deny".  External review
 # flagged ipc/server.rs:acceptor_streams as fragile (std::Mutex held
-# в an async fn — current code doesn't await across it, но code drift
-# could introduce one).  Workspace lint converts the hazard от code-
-# review burden к compile-time гарантию.
+# in an async fn — current code doesn't await across it, but code drift
+# could introduce one).  Workspace lint converts the hazard from code-
+# review burden to a compile-time guarantee.
 await_holding_lock = "deny"
 
 [profile.release]
@@ -80,8 +80,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "debuginfo"
-# Phase 6.50.d.5n: keep .symtab (function names) для jeprof symbolication
-# и production crash backtraces.  strip = "debuginfo" removes dwarf debug
+# Phase 6.50.d.5n: keep .symtab (function names) for jeprof symbolication
+# and production crash backtraces.  strip = "debuginfo" removes dwarf debug
 # info but preserves the symbol table — binary grows ~1 MB but stack
 # traces stay readable.
 

@@ -173,34 +173,34 @@ fn effective_quic_alpn(alpn: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 
 // ── Chrome HTTP/3 transport-parameter mimicry (anti-censorship P1 #4) ──
 //
-// Chrome's QUIC sends а distinctive set of transport-parameter values
-// в its TLS-CRYPTO-frame ClientHello — DPI tooling что fingerprints
-// QUIC connections (СКАТ DPI 12.0+, Wireshark dissectors,
-// independent classifier services) profile these values к
-// distinguish "real Chrome HTTP/3" от "library defaults / VPN /
+// Chrome's QUIC sends a distinctive set of transport-parameter values
+// in its TLS-CRYPTO-frame ClientHello — DPI tooling that fingerprints
+// QUIC connections (SKAT DPI 12.0+, Wireshark dissectors,
+// independent classifier services) profile these values to
+// distinguish "real Chrome HTTP/3" from "library defaults / VPN /
 // proxy".  quinn's `TransportConfig::default()` matches none of
 // them — initial_max_data is the most obviously distinct (quinn's
-// default is `VarInt::MAX`, Chrome's is а modest 15 MiB).
+// default is `VarInt::MAX`, Chrome's is a modest 15 MiB).
 //
 // Reproducing Chrome's exact values closes the QUIC-fingerprint
-// half of #19 (QUIC_UNKNOWN_MARKED) против stateless classifiers.
+// half of #19 (QUIC_UNKNOWN_MARKED) against stateless classifiers.
 // Bit-exact ClientHello mimicry — extensions ordering, point format
 // list, etc. — lives in the `tls-boring` feature (`quinn-btls`
-// backend); this module covers the transport-parameter layer на top
+// backend); this module covers the transport-parameter layer on top
 // of whichever crypto backend is enabled.
 //
-// Values sourced от Chromium's net/quic/quic_session_pool.cc
-// (`InitializeSessionConfig`) и net/third_party/quiche/src/
+// Values sourced from Chromium's net/quic/quic_session_pool.cc
+// (`InitializeSessionConfig`) and net/third_party/quiche/src/
 // quiche/quic/core/quic_session.cc (stable channel mid-2026).
 //
-// Note: quinn names some parameters differently от the IETF spec:
+// Note: quinn names some parameters differently from the IETF spec:
 // - `stream_receive_window`  ↔ `initial_max_stream_data_bidi_local`
 // - `receive_window`         ↔ `initial_max_data`
-// - `send_window` is а quinn-only knob; left at default (1 MiB) as
-//   it doesn't appear в the transport-param list sent on the wire.
+// - `send_window` is a quinn-only knob; left at default (1 MiB) as
+//   it doesn't appear in the transport-param list sent on the wire.
 
 /// `initial_max_data` value Chrome 120+ stable advertises (≈ 15 MiB).
-/// DPI compares this к pattern-bucket Chrome's 15728640 falls in;
+/// DPI compares this to pattern-bucket Chrome's 15728640 falls in;
 /// quinn's default `VarInt::MAX` (62-bit) is the dead giveaway.
 pub(crate) const CHROME_INITIAL_MAX_DATA: u64 = 15 * 1024 * 1024;
 
@@ -210,7 +210,7 @@ pub(crate) const CHROME_INITIAL_MAX_STREAM_DATA: u64 = 6 * 1024 * 1024;
 
 /// `initial_max_streams_bidi` value Chrome advertises (100).  quinn's
 /// default for connect-side is 100, server-side is unbounded — we
-/// pin both к Chrome's 100 для symmetry.
+/// pin both to Chrome's 100 for symmetry.
 pub(crate) const CHROME_INITIAL_MAX_STREAMS_BIDI: u64 = 100;
 
 /// `initial_max_streams_uni` value Chrome advertises (100).
@@ -218,11 +218,11 @@ pub(crate) const CHROME_INITIAL_MAX_STREAMS_UNI: u64 = 100;
 
 /// `max_idle_timeout` value Chrome advertises (30 seconds).  quinn's
 /// default is 0 = "no idle timeout from this endpoint"; both sides
-/// must agree on min, so we set а concrete value matching Chrome.
+/// must agree on min, so we set a concrete value matching Chrome.
 pub(crate) const CHROME_MAX_IDLE_TIMEOUT_MS: u64 = 30_000;
 
-/// Build а `TransportConfig` що mimics Chrome HTTP/3's transport
-/// parameters.  Applied к both client + server config builders.
+/// Build a `TransportConfig` that mimics Chrome HTTP/3's transport
+/// parameters.  Applied to both client + server config builders.
 pub fn chrome_mimic_transport_config() -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
     cfg.max_concurrent_bidi_streams(
@@ -268,10 +268,10 @@ fn build_quic_server_config(
     let server_crypto =
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).map_err(quic_error)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
-    // Anti-censorship P1 #4: same Chrome-mimic transport params на
-    // the accept side.  Servers и clients negotiate the min of each
+    // Anti-censorship P1 #4: same Chrome-mimic transport params on
+    // the accept side.  Servers and clients negotiate the min of each
     // side's advertised value, so symmetry minimizes the chance that
-    // а DPI middlebox observes а transport-params mismatch.
+    // a DPI middlebox observes a transport-params mismatch.
     server_config.transport_config(Arc::new(chrome_mimic_transport_config()));
     Ok(server_config)
 }
@@ -573,10 +573,10 @@ mod tests {
     use super::*;
 
     /// Anti-censorship P1 #4: the Chrome-mimic transport config builder
-    /// must produce concrete values matching Chromium's QUIC params, не
+    /// must produce concrete values matching Chromium's QUIC params, not
     /// the quinn defaults (which are wildly different — initial_max_data
-    /// defaults к `VarInt::MAX` for example).  This test pins the
-    /// concrete constants so а quinn upgrade что changes its defaults
+    /// defaults to `VarInt::MAX` for example).  This test pins the
+    /// concrete constants so a quinn upgrade that changes its defaults
     /// can't silently regress the DPI-fingerprint surface.
     #[test]
     fn chrome_mimic_constants_match_published_values() {
@@ -597,8 +597,8 @@ mod tests {
     }
 
     /// Default ALPN must be the bare bytes `b"h3"` — matches Chrome
-    /// stable от ~v120 (which dropped the `h3-29 / h3-32` draft
-    /// variants).  А DPI fingerprint check on the ClientHello ALPN
+    /// stable from ~v120 (which dropped the `h3-29 / h3-32` draft
+    /// variants).  A DPI fingerprint check on the ClientHello ALPN
     /// list would flag any variant.
     #[test]
     fn default_alpn_is_h3_only() {
@@ -608,7 +608,7 @@ mod tests {
     }
 
     /// Operator-supplied ALPN overrides the default — so test harnesses
-    /// can use а distinct ALPN to isolate test traffic without рисуя
+    /// can use a distinct ALPN to isolate test traffic without dragging in
     /// production's anti-DPI guarantees.
     #[test]
     fn user_supplied_alpn_overrides_default() {

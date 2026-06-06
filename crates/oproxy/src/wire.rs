@@ -10,14 +10,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ConnectStatus {
-    /// Server accepted the request и opened the TCP outbound;
+    /// Server accepted the request and opened the TCP outbound;
     /// bidirectional pipe is now active.
     Ok = 0x00,
-    /// Caller's node_id is not в the server's `allowed_node_ids` list,
-    /// или the destination is а forbidden (RFC1918 / loopback / metadata)
-    /// address и `allow_private` is off.
+    /// Caller's node_id is not in the server's `allowed_node_ids` list,
+    /// or the destination is a forbidden (RFC1918 / loopback / metadata)
+    /// address and `allow_private` is off.
     Denied = 0x01,
-    /// TCP-connect к destination failed (DNS error, refused, timeout).
+    /// TCP-connect to destination failed (DNS error, refused, timeout).
     ConnectFailed = 0x02,
     /// Malformed wire header (host_len > 255, truncated, invalid UTF-8).
     BadRequest = 0x03,
@@ -35,16 +35,16 @@ impl ConnectStatus {
     }
 }
 
-/// Maximum length of the host field в bytes.  Matches DNS limit
-/// (longest legitimate domain name) и mirrors the bound applied в
+/// Maximum length of the host field in bytes.  Matches DNS limit
+/// (longest legitimate domain name) and mirrors the bound applied in
 /// `veil-proxy::exit`.
 pub const MAX_HOST_LEN: usize = 255;
 
 /// S2.B: marker byte announcing an **app-layer cert preamble** before
 /// the regular connect header.  The byte is unambiguous wrt the legacy
-/// `[host_len u16 BE]` wire prefix — а legitimate host_len BE starts
-/// either с 0x00 (host_len ≤ 255 → high byte zero) или а small value;
-/// 0xC0 here is safely outside that range и lets the server detect
+/// `[host_len u16 BE]` wire prefix — a legitimate host_len BE starts
+/// either with 0x00 (host_len ≤ 255 → high byte zero) or a small value;
+/// 0xC0 here is safely outside that range and lets the server detect
 /// the new format on the first byte.
 ///
 /// Wire shape (when present):
@@ -58,13 +58,13 @@ pub const APP_CERT_MARKER: u8 = 0xC0;
 
 /// Hard cap on the cert blob length carried on the wire.  Real
 /// `MembershipCert` blobs are < 1 KiB (Ed25519 sig = 64 B, body ≈ 80 B,
-/// envelope overhead ≤ 100 B).  4 KiB leaves headroom для Falcon-512
-/// signatures (~666 B) и future schema extensions без а wire bump.
+/// envelope overhead ≤ 100 B).  4 KiB leaves headroom for Falcon-512
+/// signatures (~666 B) and future schema extensions without a wire bump.
 pub const MAX_APP_CERT_LEN: usize = 4096;
 
-/// Encode а connect header `[host_len u16 BE][host bytes][port u16 BE]`.
+/// Encode a connect header `[host_len u16 BE][host bytes][port u16 BE]`.
 ///
-/// Returns `None` если `host` is empty or longer than [`MAX_HOST_LEN`].
+/// Returns `None` if `host` is empty or longer than [`MAX_HOST_LEN`].
 pub fn encode_connect_header(host: &str, port: u16) -> Option<Vec<u8>> {
     let host_bytes = host.as_bytes();
     if host_bytes.is_empty() || host_bytes.len() > MAX_HOST_LEN {
@@ -77,7 +77,7 @@ pub fn encode_connect_header(host: &str, port: u16) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Read а connect header off а byte stream.
+/// Read a connect header off a byte stream.
 pub async fn read_connect_header<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> io::Result<(String, u16)> {
@@ -103,7 +103,7 @@ pub async fn read_connect_header<R: AsyncReadExt + Unpin>(
     Ok((host, port))
 }
 
-/// Write а one-byte status reply.
+/// Write a one-byte status reply.
 pub async fn write_status<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     status: ConnectStatus,
@@ -113,7 +113,7 @@ pub async fn write_status<W: AsyncWriteExt + Unpin>(
 
 /// Encode an app-cert preamble `[0xC0][cert_len u16 BE][cert_blob]`.
 ///
-/// Returns `None` если `cert_blob` is empty или longer than
+/// Returns `None` if `cert_blob` is empty or longer than
 /// [`MAX_APP_CERT_LEN`].
 pub fn encode_app_cert_preamble(cert_blob: &[u8]) -> Option<Vec<u8>> {
     if cert_blob.is_empty() || cert_blob.len() > MAX_APP_CERT_LEN {
@@ -129,19 +129,19 @@ pub fn encode_app_cert_preamble(cert_blob: &[u8]) -> Option<Vec<u8>> {
 /// Outcome of reading the stream prefix on the server side.
 #[derive(Debug)]
 pub enum StreamPrefix {
-    /// Client sent а cert preamble (S2.B); body holds the raw cert blob.
+    /// Client sent a cert preamble (S2.B); body holds the raw cert blob.
     /// Server should `decode_cert_blob` + `verify_membership_cert`,
-    /// then read the regular connect header що follows.
+    /// then read the regular connect header that follows.
     Cert(Vec<u8>),
-    /// Client went straight к the connect header (legacy / no cert).
-    /// `peeked_host_len_hi` is the first byte що's already consumed —
-    /// the server must construct the connect-header read с this byte
+    /// Client went straight to the connect header (legacy / no cert).
+    /// `peeked_host_len_hi` is the first byte that's already consumed —
+    /// the server must construct the connect-header read with this byte
     /// as the high half of host_len.
     NoPreamble { peeked_host_len_hi: u8 },
 }
 
-/// Peek the first byte off the stream и decide if а cert preamble
-/// follows.  When marker matches, consume cert_len + blob и return
+/// Peek the first byte off the stream and decide if a cert preamble
+/// follows.  When marker matches, consume cert_len + blob and return
 /// `Cert(blob)`.  Otherwise the byte is returned as `peeked_host_len_hi`
 /// so the caller can splice it back into the host_len read.
 pub async fn read_stream_prefix<R: AsyncReadExt + Unpin>(
@@ -168,8 +168,8 @@ pub async fn read_stream_prefix<R: AsyncReadExt + Unpin>(
     Ok(StreamPrefix::Cert(blob))
 }
 
-/// Read а connect header **knowing the high byte of host_len was
-/// already consumed**.  Used после `read_stream_prefix` returned
+/// Read a connect header **knowing the high byte of host_len was
+/// already consumed**.  Used after `read_stream_prefix` returned
 /// `NoPreamble { peeked_host_len_hi }`.
 pub async fn read_connect_header_with_peeked_hi<R: AsyncReadExt + Unpin>(
     reader: &mut R,
@@ -197,7 +197,7 @@ pub async fn read_connect_header_with_peeked_hi<R: AsyncReadExt + Unpin>(
     Ok((host, port))
 }
 
-/// Read а one-byte status reply.
+/// Read a one-byte status reply.
 pub async fn read_status<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<ConnectStatus> {
     let mut b = [0u8; 1];
     reader.read_exact(&mut b).await?;
@@ -306,9 +306,9 @@ mod tests {
 
     #[tokio::test]
     async fn no_preamble_returns_peeked_byte() {
-        // First byte of а regular connect header for host_len=256 (=0x0100).
+        // First byte of a regular connect header for host_len=256 (=0x0100).
         // The 0x01 first byte ≠ APP_CERT_MARKER, so read_stream_prefix
-        // returns NoPreamble + the 0x01 byte как peeked_host_len_hi.
+        // returns NoPreamble + the 0x01 byte as peeked_host_len_hi.
         let mut buf = Vec::new();
         buf.extend_from_slice(&[0x00, 0x04]); // host_len = 4
         buf.extend_from_slice(b"host");

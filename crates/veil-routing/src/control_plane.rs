@@ -1,13 +1,13 @@
 //! Control-plane service — handles ROUTE_PROBE / ROUTE_REPLY.
 //!
 //! `ControlPlaneService` manages RTT measurements used by
-//! `NeighborScorer` и `RouteCache`.  Sits behind а `FrameDispatcher`-
-//! field в production; isolated here as а dispatcher-agnostic service.
+//! `NeighborScorer` and `RouteCache`.  Sits behind a `FrameDispatcher`-
+//! field in production; isolated here as a dispatcher-agnostic service.
 //!
-//! Phase 3 prep (veilcore extraction): moved here от
-//! `veilcore::node::control` so dispatcher can move к а sibling crate.
-//! Lives в veil-routing because it uses veil-routing's `RttTable`
-//! и `PeerReportedRtt` types.
+//! Phase 3 prep (veilcore extraction): moved here from
+//! `veilcore::node::control` so dispatcher can move to a sibling crate.
+//! Lives in veil-routing because it uses veil-routing's `RttTable`
+//! and `PeerReportedRtt` types.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,9 +24,9 @@ pub struct ControlPlaneService {
 }
 
 impl ControlPlaneService {
-    /// Construct с а private `RttTable`.
+    /// Construct with a private `RttTable`.
     ///
-    /// Used в tests + initial dispatcher-construction; production code uses
+    /// Used in tests + initial dispatcher-construction; production code uses
     /// [`Self::with_rtt_table`] so the table is shared across subsystems.
     pub fn new(rtt_max_age: Duration) -> Self {
         Self {
@@ -34,22 +34,22 @@ impl ControlPlaneService {
         }
     }
 
-    /// Create а service що shares the provided `rtt_table`.  Use this when
-    /// multiple subsystems (DHT, routing, scoring) need к read RTT data що
+    /// Create a service that shares the provided `rtt_table`.  Use this when
+    /// multiple subsystems (DHT, routing, scoring) need to read RTT data that
     /// is updated by the control plane.
     pub fn with_rtt_table(rtt_table: Arc<Mutex<RttTable>>) -> Self {
         Self { rtt_table }
     }
 
-    /// Shared reference к the RTT table — allows other services к observe
+    /// Shared reference to the RTT table — allows other services to observe
     /// RTT measurements.
     pub fn rtt_table(&self) -> Arc<Mutex<RttTable>> {
         Arc::clone(&self.rtt_table)
     }
 
-    /// Build а `RouteReplyPayload` що echoes the probe back к the sender.
+    /// Build a `RouteReplyPayload` that echoes the probe back to the sender.
     ///
-    /// `rtt_ms` is set к `0` here (the *receiver* doesn't know the one-way
+    /// `rtt_ms` is set to `0` here (the *receiver* doesn't know the one-way
     /// latency yet — the *sender* computes it on receipt).
     pub fn handle_probe(&self, payload: &RouteProbePayload) -> RouteReplyPayload {
         RouteReplyPayload {
@@ -60,14 +60,14 @@ impl ControlPlaneService {
         }
     }
 
-    /// Record the RTT от an incoming `RouteReplyPayload` into `RttTable`.
+    /// Record the RTT from an incoming `RouteReplyPayload` into `RttTable`.
     pub fn handle_reply(&self, peer_id: &[u8; 32], payload: &RouteReplyPayload) {
         let rtt = PeerReportedRtt::from_raw_ms(payload.rtt_ms);
         lock!(self.rtt_table).record(*peer_id, rtt, payload.congestion);
     }
 
-    /// Read the latest smoothed RTT (ms) для а peer.  Originally test-
-    /// only; promoted к public для cross-crate test access после the
+    /// Read the latest smoothed RTT (ms) for a peer.  Originally test-
+    /// only; promoted to public for cross-crate test access after the
     /// Phase 3 move.
     pub fn rtt_ms(&self, peer_id: &[u8; 32]) -> Option<u32> {
         lock!(self.rtt_table).get(peer_id).map(|p| p.rtt_ms)

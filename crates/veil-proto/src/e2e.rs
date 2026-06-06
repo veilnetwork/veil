@@ -119,7 +119,7 @@ impl E2eEnvelope {
         let offset = offset + 12;
 
         // checked_add chain defends 32-bit hosts (Android armv7)
-        // против ct_len wraparound — bare `+` here would let а u32::MAX-class
+        // against ct_len wraparound — bare `+` here would let a u32::MAX-class
         // value pass the bounds check but panic on slicing. Mirrors the
         // relay_chain.rs fix.
         let need_len_field = offset.checked_add(4).ok_or(ProtoError::BufferTooShort {

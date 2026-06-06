@@ -1,7 +1,7 @@
-// Pure-Dart unit tests для JoinBootstrapStatus wire-byte mapping +
+// Pure-Dart unit tests for JoinBootstrapStatus wire-byte mapping +
 // public-API exports of the pairing surface.  Widget integration tests
-// (camera permission, QR-detect path) belong к а separate
-// `integration_test/` суite.
+// (camera permission, QR-detect path) belong to a separate
+// `integration_test/` suite.
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:veil_flutter/veil_flutter.dart';
@@ -14,7 +14,7 @@ void main() {
         expect(
           JoinBootstrapStatus.fromWire(s.wireByte),
           s,
-          reason: 'wire byte ${s.wireByte} must decode к $s',
+          reason: 'wire byte ${s.wireByte} must decode to $s',
         );
       }
     });
@@ -36,7 +36,7 @@ void main() {
   });
 
   group('Pairing public exports', () {
-    test('VeilPairingDialog + JoinBootstrapResult resolve через root', () {
+    test('VeilPairingDialog + JoinBootstrapResult resolve through root', () {
       const t1 = VeilPairingDialog;
       const t2 = JoinBootstrapResult;
       const t3 = JoinBootstrapStatus;
@@ -53,7 +53,7 @@ void main() {
         expect(
           CreateBootstrapInviteStatus.fromWire(s.wireByte),
           s,
-          reason: 'wire byte ${s.wireByte} must decode к $s',
+          reason: 'wire byte ${s.wireByte} must decode to $s',
         );
       }
     });

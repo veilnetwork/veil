@@ -690,26 +690,26 @@ impl RecursiveRelayPayload {
 // ── RelayPathPayload ──────────────────────────────────────────────────────────
 //
 // **Source-routed relay** (Epic 482.7-adjacent / Epic 137.5 deferred, lifted
-// for audit batch 2026-05-23 как antidote к the Audit-H22 `iterative.lookup`
-// strict-progress filter што blocks DHT walks в pathological linear /
+// for audit batch 2026-05-23 as antidote to the Audit-H22 `iterative.lookup`
+// strict-progress filter that blocks DHT walks in pathological linear /
 // chain-of-pearls topologies).
 //
 // The sender picks the relay chain explicitly — every hop just looks at the
-// next entry in `path` и forwards via its existing session к that node.
+// next entry in `path` and forwards via its existing session to that node.
 //
 // Compared to the existing routing-plane options:
 //
 // * `Forward` / `DeliveryEnvelope`        — relies on receiver-side
-//   `route_cache` lookup + gossip propagation; falls over когда the
+//   `route_cache` lookup + gossip propagation; falls over when the
 //   cache is empty / partition isolates the sender.
-// * `RecursiveRelay`                       — walks DHT closest-nodes к
-//   `dst_node_id`; fails когда `iterative.lookup` filter rejects all
-//   contacts на а chain где each step has the same XOR-distance.
+// * `RecursiveRelay`                       — walks DHT closest-nodes to
+//   `dst_node_id`; fails when `iterative.lookup` filter rejects all
+//   contacts on a chain where each step has the same XOR-distance.
 // * `RelayPath` (this one)                 — sender names the entire
-//   path up-front; no routing dependency anywhere в the network.
+//   path up-front; no routing dependency anywhere in the network.
 //   Works in **any** connected topology so long as the sender knows
-//   а path (which he can obtain out-of-band, через PEX walks, или
-//   construct manually for а private testbed).
+//   a path (which he can obtain out-of-band, through PEX walks, or
+//   construct manually for a private testbed).
 //
 // ## Wire layout
 //
@@ -720,12 +720,12 @@ impl RecursiveRelayPayload {
 // [2..2 + 32 × hop_count] path: [[u8; 32]; hop_count]
 // [2 + 32 × hop_count..] inner: Vec<u8>  — body destined for
 //                                          `path[hop_count - 1]`; opaque
-//                                          к relays.
+//                                          to relays.
 // ```
 //
 // ## Invariants
 //
-// * `next_hop < hop_count` while frame is in-flight (relays drop когда
+// * `next_hop < hop_count` while frame is in-flight (relays drop when
 //   next_hop ≥ hop_count, defensive).
 // * `hop_count ≤ MAX_RELAY_PATH_HOPS` (anti-amplification budget).
 // * `path[next_hop]` is the recipient node-id; recipient checks
@@ -734,12 +734,12 @@ impl RecursiveRelayPayload {
 //   deliver inner locally instead of forwarding.
 
 /// Hard ceiling on source-routed relay path length.  Sized to cover the
-/// 64-node testnet diameter end-to-end в один кадр (worst case
-/// node-0 → node-63 в linear topology = 63 hops); chosen as а power of
+/// 64-node testnet diameter end-to-end in a single frame (worst case
+/// node-0 → node-63 in linear topology = 63 hops); chosen as a power of
 /// two for clean encoding.  The dispatcher's `MAX_RELAY_HOPS` (16) cap
 /// on RecursiveRelay does NOT apply here — source routing carries the
 /// full path inside the frame, so loops are impossible by construction
-/// и the only resource bound is frame size (64 * 32 = 2 KiB path
+/// and the only resource bound is frame size (64 * 32 = 2 KiB path
 /// overhead, comfortable within any link MTU).
 pub const MAX_RELAY_PATH_HOPS: usize = 64;
 
@@ -750,7 +750,7 @@ pub struct RelayPathPayload {
     /// entry = first hop after sender; last entry = ultimate destination.
     pub path: Vec<[u8; 32]>,
     /// Index of the next hop in `path`.  Each forwarder increments before
-    /// re-sending.  Receiver checks `path[next_hop] == local_node_id` к
+    /// re-sending.  Receiver checks `path[next_hop] == local_node_id` to
     /// guard against mis-routing.
     pub next_hop: u8,
     /// Opaque inner payload — typically an `AppDeliverPayload`-encoded
@@ -759,7 +759,7 @@ pub struct RelayPathPayload {
 }
 
 impl RelayPathPayload {
-    /// Encode к wire bytes.
+    /// Encode to wire bytes.
     pub fn encode(&self) -> Vec<u8> {
         let hop_count = self.path.len().min(MAX_RELAY_PATH_HOPS);
         let mut buf = Vec::with_capacity(2 + 32 * hop_count + self.inner.len());
@@ -830,14 +830,14 @@ impl RelayPathPayload {
     }
 
     /// The node-id the current forwarder should hand the frame off to.
-    /// Returns `None` если `next_hop` is somehow out-of-range (defensive —
+    /// Returns `None` if `next_hop` is somehow out-of-range (defensive —
     /// `decode` already rejects this).
     pub fn current_recipient(&self) -> Option<&[u8; 32]> {
         self.path.get(self.next_hop as usize)
     }
 
     /// The node-id the NEXT forwarder will hand the frame off to.
-    /// Returns `None` если caller is the terminal hop.
+    /// Returns `None` if caller is the terminal hop.
     pub fn next_recipient(&self) -> Option<&[u8; 32]> {
         self.path.get(usize::from(self.next_hop) + 1)
     }
@@ -1200,7 +1200,7 @@ mod tests {
         // next_hop = 0 → not terminal, recipient = path[0]
         assert!(!p.is_terminal());
         assert_eq!(p.current_recipient(), Some(&p.path[0]));
-        // Advance к last
+        // Advance to last
         p.next_hop = 2;
         assert!(p.is_terminal());
         assert_eq!(p.current_recipient(), Some(&p.path[2]));

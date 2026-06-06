@@ -17,8 +17,8 @@
 //! Behaviour and wire format are unchanged from the previous hand-rolled
 //! implementation.
 //!
-//! switched от the deleted
-//! `crate::node::local_transport` re-export shim к direct
+//! switched from the deleted
+//! `crate::node::local_transport` re-export shim to direct
 //! `veil_local_transport::*` import.
 
 use std::path::Path;
@@ -156,11 +156,11 @@ impl AdminListener {
 
     /// slow-loris fix: accept the raw kernel-level
     /// connection without performing the 32-byte token handshake.
-    /// Returns immediately после `accept(2)` (μs); caller spawns
-    /// а task that calls [`AdminPendingStream::verify`] к complete
+    /// Returns immediately after `accept(2)` (μs); caller spawns
+    /// a task that calls [`AdminPendingStream::verify`] to complete
     /// the handshake. Pre-fix, the admin accept loop awaited the
-    /// 3 s token-read inline, so одно malicious connect-and-stall
-    /// блокировал admin для 3 s × N attempts.
+    /// 3 s token-read inline, so a single malicious connect-and-stall
+    /// blocked admin for 3 s × N attempts.
     pub async fn accept_raw(&self) -> Result<(AdminPendingStream, AdminPeerInfo)> {
         let (pending, peer_info) = self.0.accept_raw().await?;
         Ok((
@@ -180,15 +180,15 @@ impl AdminListener {
 
 // ── AdminPendingStream ────────────────────────────────────────────────────────
 
-/// а pre-handshake admin connection. Wraps
-/// [`local_transport::PendingStream`] и translates handshake-time errors
+/// a pre-handshake admin connection. Wraps
+/// [`local_transport::PendingStream`] and translates handshake-time errors
 /// (timeout / token mismatch) into [`NodeError::AdminProtocol`] for uniform
 /// admin-server logging.
 pub struct AdminPendingStream(local_transport::PendingStream);
 
 impl AdminPendingStream {
-    /// Complete the token handshake. Spawn this в а task so the accept loop
-    /// is never blocked by а slow-loris client.
+    /// Complete the token handshake. Spawn this in a task so the accept loop
+    /// is never blocked by a slow-loris client.
     pub async fn verify(self) -> Result<AdminStream> {
         match self.0.verify().await {
             Ok(stream) => Ok(AdminStream(stream)),

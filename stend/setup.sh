@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Generate per-node identity material для the local 5-node test
+# Generate per-node identity material for the local 5-node test
 # stand.  Idempotent: re-running skips nodes that already have
-# а populated `veil/` dir.
+# a populated `veil/` dir.
 #
 # Phase 6.49 audit follow-up (2026-05-08): replaces previously-
 # committed secrets with reproducible local generation.  See
-# `stend/SETUP.md` для context.
+# `stend/SETUP.md` for context.
 
 set -euo pipefail
 
@@ -39,7 +39,7 @@ for n in 1 2 3 4 5; do
     mkdir -p "$NODE_DIR"
     echo "node$n: provisioning..."
 
-    # Reference the external veil_dir.  This is а deliberate move
+    # Reference the external veil_dir.  This is a deliberate move
     # away from inline `[Identity] private_key = "..."` (which leaked
     # SK material into the repo previously).  The daemon writes
     # device_identity_sk.bin into veil_dir on first start.
@@ -64,7 +64,7 @@ listen = "tcp://127.0.0.1:$((19000 + n))"
 path = "/metrics"
 EOF
 
-    # Pre-create the veil dir с the right perms — daemon writes
+    # Pre-create the veil dir with the right perms — daemon writes
     # SK/PK material here on first start.
     mkdir -p "$VEIL_DIR"
     chmod 700 "$VEIL_DIR"
@@ -75,7 +75,7 @@ done
 cat <<EOF
 
 stend setup complete.  Each node generates its own identity material
-on first start (inside its veil_dir).  Start individual nodes с:
+on first start (inside its veil_dir).  Start individual nodes with:
 
   ($CLI --config node1/config.toml node run --foreground &)
   ($CLI --config node2/config.toml node run --foreground &)
@@ -84,5 +84,5 @@ on first start (inside its veil_dir).  Start individual nodes с:
 NOTE: The legacy topology-*.sh scripts grep for \`^node_id\` in
 config.toml.  Since identity is now external (veil_dir), those
 scripts need updating to read node_id from each daemon's admin
-socket после first start.  Open issue if you actually use them.
+socket after first start.  Open issue if you actually use them.
 EOF

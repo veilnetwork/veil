@@ -27,7 +27,7 @@ pub type BoxTlsStream = tokio_rustls::TlsStream<TcpStream>;
 /// SECURITY (audit 2026-05-29, HIGH listener-DoS fix): hard upper bound on
 /// the inline TLS server handshake.  Like the obfs4 listener, the TLS
 /// `accept()` future runs the full handshake inline before the runtime
-/// accept-loop can take the next connection; а peer що connects-and-
+/// accept-loop can take the next connection; a peer that connects-and-
 /// stalls mid-handshake would otherwise hang the loop indefinitely.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -98,20 +98,20 @@ pub async fn connect_tls_client_stream(
 /// [`connect_tls_client_stream`] which uses the operator-supplied
 /// veil trust store + node-id binding. Used by the HTTPS
 /// bootstrap fetch path (`veil-bootstrap::https`) so an on-path
-/// MITM cannot tamper с or replay stale signed seed bundles, and
+/// MITM cannot tamper with or replay stale signed seed bundles, and
 /// by the signed-update fetch path for similar reasons.
 ///
-/// **Why а separate function:** veil peer transport (`tls://`
+/// **Why a separate function:** veil peer transport (`tls://`
 /// `wss://`) intentionally uses `set_verify(NONE)` and accepts
-/// self-signed certs because trust binds к the session-layer
-/// `node_id`, not к а certificate chain. Reusing that path for
-/// HTTPS к а public CDN would be insecure — а MITM could present
+/// self-signed certs because trust binds to the session-layer
+/// `node_id`, not to a certificate chain. Reusing that path for
+/// HTTPS to a public CDN would be insecure — a MITM could present
 /// any self-signed cert and veil's TLS layer would happily
-/// accept it. This function builds а dedicated `ClientConfig` с
+/// accept it. This function builds a dedicated `ClientConfig` with
 /// Mozilla's bundled CA roots + standard hostname verification.
 ///
-/// `alpn` is honoured (typically `h2`/`http/1.1` for а CDN target).
-/// `sni` defaults к `host` if `None`; passing `Some(parsed_host)`
+/// `alpn` is honoured (typically `h2`/`http/1.1` for a CDN target).
+/// `sni` defaults to `host` if `None`; passing `Some(parsed_host)`
 /// matches the existing bootstrap convention.
 pub async fn connect_pki_verified_https_stream(
     host: &str,
@@ -123,28 +123,28 @@ pub async fn connect_pki_verified_https_stream(
     let stream = connect_tcp_stream(host, port, ctx).await?;
     let server_name = ctx.server_name(ctx.effective_sni(sni, host))?;
 
-    // Build а fresh PKI-trusting ClientConfig — DO NOT reuse
+    // Build a fresh PKI-trusting ClientConfig — DO NOT reuse
     // `ctx.tls.client_config` (operator-veil trust, node-id bound).
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    // **Этап 10 slice 2b** — opt-in ECH GREASE on the public-PKI HTTPS
+    // **Stage 10 slice 2b** — opt-in ECH GREASE on the public-PKI HTTPS
     // bootstrap path.  Driven by `GlobalConfig.tls_ech_grease`
     // (plumbed through `TransportContext::tls_ech_grease`).  When `true`,
-    // pin TLS 1.3 (rustls `with_ech` requires it) и attach а
-    // GREASE extension к ClientHello so middleboxes cannot fingerprint
-    // ECH-capable от non-ECH connections.  Slice 2c will flip the
-    // GlobalConfig default к `true`.  See `docs/en/OPERATIONS.md` →
-    // "TLS ECH (Этап 10 slice 2)" для the rollout plan + cover-traffic
+    // pin TLS 1.3 (rustls `with_ech` requires it) and attach a
+    // GREASE extension to ClientHello so middleboxes cannot fingerprint
+    // ECH-capable from non-ECH connections.  Slice 2c will flip the
+    // GlobalConfig default to `true`.  See `docs/en/OPERATIONS.md` →
+    // "TLS ECH (Stage 10 slice 2)" for the rollout plan + cover-traffic
     // argument.
     let mut config = if ctx.tls_ech_grease {
-        // `with_ech` lives on `ConfigBuilder<_, WantsVersions>` — що
+        // `with_ech` lives on `ConfigBuilder<_, WantsVersions>` — that
         // returned by `builder_with_provider`, not the version-pinned
         // `builder`.  Use `aws_lc_rs::default_provider()` directly
-        // (matches the install_default sites elsewhere в this crate).
+        // (matches the install_default sites elsewhere in this crate).
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        // **Этап 10 slice 3** — try real ECH first via DNS HTTPS RR
-        // lookup; fall back к slice 2c's GREASE на any DNS-side
-        // failure.  See `crate::ech_dns` для the soft-failure model.
+        // **Stage 10 slice 3** — try real ECH first via DNS HTTPS RR
+        // lookup; fall back to slice 2c's GREASE on any DNS-side
+        // failure.  See `crate::ech_dns` for the soft-failure model.
         let mode = match resolve_real_ech_mode(host, ctx).await {
             Some(real) => real,
             None => rustls::client::EchMode::Grease(build_ech_grease_config()?),
@@ -173,17 +173,17 @@ pub async fn connect_pki_verified_https_stream(
     Ok(Box::new(tls_stream))
 }
 
-/// Resolve real ECH config от DNS HTTPS RR (Этап 10 slice 3).  Returns
-/// `Some(EchMode::Enable(...))` если а live HTTPS record exists and
-/// rustls can select а supported HPKE suite от the published
-/// EchConfigList; returns `None` for the caller к fall back к GREASE.
+/// Resolve real ECH config from DNS HTTPS RR (Stage 10 slice 3).  Returns
+/// `Some(EchMode::Enable(...))` if a live HTTPS record exists and
+/// rustls can select a supported HPKE suite from the published
+/// EchConfigList; returns `None` for the caller to fall back to GREASE.
 ///
-/// Failure paths що land в the `None` branch:
+/// Failure paths that land in the `None` branch:
 /// * no HTTPS record exists for `host` (most domains today),
 /// * the record exists but carries no `ech` SvcParamKey,
 /// * the DNS lookup times out (3 s default per `ech_dns::HTTPS_RR_TIMEOUT`),
 /// * the published EchConfigList is malformed,
-/// * none of the published HPKE suites overlap с aws-lc-rs's
+/// * none of the published HPKE suites overlap with aws-lc-rs's
 ///   [`ALL_SUPPORTED_SUITES`].
 ///
 /// Errors are logged at DEBUG level (operators can grep `tls.ech.dns`)
@@ -211,7 +211,7 @@ async fn resolve_real_ech_mode(
             log::debug!(
                 target: "tls.ech.dns",
                 "ECH bytes parsed but no supported HPKE suite available \
-                 — falling back к GREASE host={host} err={e}"
+                 — falling back to GREASE host={host} err={e}"
             );
             None
         }
@@ -220,16 +220,16 @@ async fn resolve_real_ech_mode(
 
 /// Build an `EchGreaseConfig` for use in
 /// `connect_pki_verified_https_stream` when
-/// `TransportContext::tls_ech_grease == true` (Этап 10 slice 2b).
+/// `TransportContext::tls_ech_grease == true` (Stage 10 slice 2b).
 ///
 /// Picks the `DH_KEM_X25519_HKDF_SHA256_AES_128` HPKE suite (widely
-/// supported, the canonical default for ECH в the wild) и generates а
+/// supported, the canonical default for ECH in the wild) and generates a
 /// random 32-byte placeholder X25519 public key.  GREASE makes the
-/// ClientHello indistinguishable от а real ECH-enabled connection
-/// without requiring an actual EchConfig от DNS.  The real-ECH path
+/// ClientHello indistinguishable from a real ECH-enabled connection
+/// without requiring an actual EchConfig from DNS.  The real-ECH path
 /// (`EchMode::Enable`, with the `EchConfig` resolved from an HTTPS RR — see
-/// the resolver above) is implemented as of Этап 10 slice 3; GREASE is the
-/// fallback used when no real `EchConfig` is available от DNS.
+/// the resolver above) is implemented as of Stage 10 slice 3; GREASE is the
+/// fallback used when no real `EchConfig` is available from DNS.
 fn build_ech_grease_config() -> Result<rustls::client::EchGreaseConfig> {
     use rand::RngCore;
     use rustls::crypto::aws_lc_rs::hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;
@@ -321,7 +321,7 @@ impl TransportListener for TlsTransportListener {
             let (stream, remote_addr) = self.listener.accept().await?;
             let local_addr = stream.local_addr().ok();
             // SECURITY (audit 2026-05-29): bound the inline TLS handshake
-            // so а stalled client cannot freeze the accept loop.
+            // so a stalled client cannot freeze the accept loop.
             let tls_stream: ServerTlsStream<TcpStream> =
                 tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, self.acceptor.accept(stream))
                     .await

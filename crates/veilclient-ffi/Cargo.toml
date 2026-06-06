@@ -37,14 +37,14 @@ veil-types = { path = "../veil-types" }
 # Audit L-15: wrap the in-flight password copy in `Zeroizing` so the
 # `_zeroize_with_password` restore path scrubs every copy on drop.
 zeroize = "1"
-# Push-envelope sealing primitive (Epic 489.10) — exposed как
+# Push-envelope sealing primitive (Epic 489.10) — exposed as a
 # stateless FFI helper so apps can seal FCM/APNs tokens locally
 # before calling `veil_set_push_envelope`.  Pulled directly to
-# avoid а round-trip через veilclient (sealing is pure crypto;
+# avoid a round-trip through veilclient (sealing is pure crypto;
 # no daemon RPC needed).
 veil-anonymity = { path = "../veil-anonymity" }
 # Wake-HMAC primitive (slice 4.3.3) — same rationale: pure crypto,
-# avoid а round-trip через veilclient.  Used for the FFI verify
+# avoid a round-trip through veilclient.  Used for the FFI verify
 # entry-point and the random-key generator that receivers persist
 # platform-side.
 veil-crypto = { path = "../veil-crypto" }

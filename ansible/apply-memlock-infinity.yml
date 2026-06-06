@@ -1,19 +1,19 @@
 ---
-# Apply LimitMEMLOCK=infinity к the veil systemd unit so the
+# Apply LimitMEMLOCK=infinity to the veil systemd unit so the
 # daemon's startup mlockall(MCL_CURRENT | MCL_FUTURE) succeeds and
-# pins all key material против swap-out.
+# pins all key material against swap-out.
 #
 # Without this, mlockall returns ENOMEM (logged as
-# `node.mlock.budget_exhausted`); daemon continues to run но keys
+# `node.mlock.budget_exhausted`); daemon continues to run but keys
 # remain swappable.
 #
-# Re-runs the template task only (not а full deploy), then daemon-
-# reload + restart-only-если-changed.  Idempotent.
+# Re-runs the template task only (not a full deploy), then daemon-
+# reload + restart-only-if-changed.  Idempotent.
 #
 # Run:
 #   ansible-playbook -i inventory.yml apply-memlock-infinity.yml
 
-- name: Apply LimitMEMLOCK=infinity к veil systemd unit
+- name: Apply LimitMEMLOCK=infinity to veil systemd unit
   hosts: all
   become: true
   serial: 1

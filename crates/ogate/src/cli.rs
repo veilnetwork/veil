@@ -65,7 +65,7 @@ pub enum Command {
         node_id: String,
     },
 
-    /// Emit а commented default-config TOML template к stdout or к the
+    /// Emit a commented default-config TOML template to stdout or to the
     /// file given by `-o`.  Operators fill in the placeholders (network
     /// name, peer node_ids, virtual IPs) and `ogate up --config <path>`.
     ///
@@ -74,7 +74,7 @@ pub enum Command {
     ///   ogate gen-config -o /etc/ogate/ogate.toml       # to file
     GenConfig {
         /// Optional output path.  When omitted, the template is written
-        /// к stdout (so you can pipe it: `ogate gen-config | less`).
+        /// to stdout (so you can pipe it: `ogate gen-config | less`).
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
     },
@@ -139,7 +139,7 @@ pub async fn run(
                 Some(path) => {
                     if path.exists() {
                         return Err(format!(
-                            "refusing к overwrite existing file {} (delete it first if intentional)",
+                            "refusing to overwrite existing file {} (delete it first if intentional)",
                             path.display()
                         )
                         .into());
@@ -226,6 +226,6 @@ fn show(cfg: &OgateConfig) {
     }
 }
 
-// Tracing initialisation moved к `main.rs::install_tracing` so it can
+// Tracing initialisation moved to `main.rs::install_tracing` so it can
 // honour the config's `[logging]` section.  CLI verbosity flags
-// continue к override the configured level when > 0.
+// continue to override the configured level when > 0.

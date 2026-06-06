@@ -242,10 +242,10 @@ impl FrameDispatcher {
             // fallback hop BEFORE taking the session_tx_registry write
             // lock.  The previous order (registry-write held while
             // acquiring route_cache-read) inverted the canonical
-            // route_cache→registry order used throughout routing.rs — а
+            // route_cache→registry order used throughout routing.rs — a
             // second thread taking the locks in canonical order could
-            // deadlock against this one.  The extra route_cache lookup в
-            // the direct-hit case is а cheap LRU read.
+            // deadlock against this one.  The extra route_cache lookup in
+            // the direct-hit case is a cheap LRU read.
             let fallback_hop = rlock!(self.route_cache).lookup(dest);
             let guard = wlock!(reg);
             if !guard.send_to(

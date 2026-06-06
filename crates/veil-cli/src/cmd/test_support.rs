@@ -49,7 +49,7 @@ impl ConfigOps for MockConfigOps {
     }
 
     fn write_raw_config(&self, _path: &Path, _content: &str) -> veil_cfg::Result<()> {
-        // Slice 11b: test stub.  Real adapter atomically writes к
+        // Slice 11b: test stub.  Real adapter atomically writes to
         // disk; the fixture just acks.
         Ok(())
     }

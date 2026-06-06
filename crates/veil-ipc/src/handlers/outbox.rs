@@ -1,15 +1,15 @@
 //! Outbox handlers (`OutboxPut` / `OutboxFindMissing` / `OutboxAck`).
 //!
-//! Outbox = sender-side peer-sync store.  Когда sending а message the
+//! Outbox = sender-side peer-sync store.  When sending a message the
 //! app records it here for opportunistic retransmission whenever the
-//! receiver comes online и а peer-sync exchange happens.  `OutboxPut`
-//! stores а fresh entry, `OutboxFindMissing` answers а peer-sync request
-//! (peer sends а Bloom filter of what they have; the daemon's outbox
-//! returns entries the peer is missing), и `OutboxAck` drops an entry
+//! receiver comes online and a peer-sync exchange happens.  `OutboxPut`
+//! stores a fresh entry, `OutboxFindMissing` answers a peer-sync request
+//! (peer sends a Bloom filter of what they have; the daemon's outbox
+//! returns entries the peer is missing), and `OutboxAck` drops an entry
 //! after the receiver confirms direct receipt.
 //!
-//! Без а wired backend, `OutboxPut` returns `false` (stored=false),
-//! `OutboxFindMissing` returns an empty list, и `OutboxAck` returns
+//! Without a wired backend, `OutboxPut` returns `false` (stored=false),
+//! `OutboxFindMissing` returns an empty list, and `OutboxAck` returns
 //! `false` (feature off gracefully).
 
 use std::sync::Arc;

@@ -1,6 +1,6 @@
-//! Async-stream wrapper що applies obfs4 framing к а raw `AsyncRead +
+//! Async-stream wrapper that applies obfs4 framing to a raw `AsyncRead +
 //! AsyncWrite` transport.  Sits between session-layer (which sends
-//! plaintext OVL1 bytes) и raw TCP (which sees obfs4 ciphertext only).
+//! plaintext OVL1 bytes) and raw TCP (which sees obfs4 ciphertext only).
 //!
 //! Usage (sketch — real callers use [`tokio::net::TcpStream`]):
 //!
@@ -10,10 +10,10 @@
 //!
 //! let psk = NodeIdMacKey([0x42; 32]);
 //!
-//! // Client side: connect, then upgrade к obfs4-wrapped stream.
+//! // Client side: connect, then upgrade to obfs4-wrapped stream.
 //! let tcp = TcpStream::connect("server.example:9000").await?;
 //! let mut stream = obfs4_client_connect(tcp, &psk).await?;
-//! // `stream` is AsyncRead + AsyncWrite, говорит OVL1 plaintext.
+//! // `stream` is AsyncRead + AsyncWrite, speaks OVL1 plaintext.
 //!
 //! // Server side:
 //! let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -57,16 +57,16 @@ fn frame_to_io(e: FrameError) -> io::Error {
 
 // ── Upgrade helpers ──────────────────────────────────────────────────────────
 
-/// Read а single obfs4 handshake message (length-prefix-aware) от the
-/// underlying stream и return the bytes.  Caps at `HANDSHAKE_MAX_BYTES`.
+/// Read a single obfs4 handshake message (length-prefix-aware) from the
+/// underlying stream and return the bytes.  Caps at `HANDSHAKE_MAX_BYTES`.
 async fn read_handshake_message<S: AsyncRead + Unpin>(
     stream: &mut S,
 ) -> Result<Vec<u8>, UpgradeError> {
-    // Handshake message has variable padding 0..=128 bytes, but а
+    // Handshake message has variable padding 0..=128 bytes, but a
     // valid message is bounded by HANDSHAKE_MAX_BYTES.  We don't know
-    // the exact length until parsed — so read up к the max и hand the
-    // fully-buffered slice к the parser.  Read in chunks; stop when
-    // we have enough к verify (parser ругнётся on excess trailing
+    // the exact length until parsed — so read up to the max and hand the
+    // fully-buffered slice to the parser.  Read in chunks; stop when
+    // we have enough to verify (parser will complain on excess trailing
     // bytes, but we'd never read past HANDSHAKE_MAX_BYTES).
     let mut buf = Vec::with_capacity(HANDSHAKE_MAX_BYTES);
     let mut chunk = [0u8; 64];
@@ -76,11 +76,11 @@ async fn read_handshake_message<S: AsyncRead + Unpin>(
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        // Try parsing с current buffer; if `TrailingBytes` we've over-read,
-        // truncate и accept.  If `TooShort`, keep reading.  If parsing
+        // Try parsing with current buffer; if `TrailingBytes` we've over-read,
+        // truncate and accept.  If `TooShort`, keep reading.  If parsing
         // succeeds, perfect.
         if buf.len() >= HANDSHAKE_MIN_BYTES {
-            // Peek at declared pad_len к determine total length.
+            // Peek at declared pad_len to determine total length.
             // (No timestamp field on the wire since C-01.)
             let pad_len_offset = REPRESENTATIVE_LEN + TWEAK_LEN + MAC_LEN;
             if buf.len() > pad_len_offset {
@@ -102,9 +102,9 @@ async fn read_handshake_message<S: AsyncRead + Unpin>(
     Ok(buf)
 }
 
-/// Perform the obfs4 client handshake on the supplied raw stream и
-/// return an `Obfs4Stream` ready для OVL1 plaintext I/O.  V1-default
-/// wrapper — для Phase 2 kill-switch use `obfs4_client_connect_variant`.
+/// Perform the obfs4 client handshake on the supplied raw stream and
+/// return an `Obfs4Stream` ready for OVL1 plaintext I/O.  V1-default
+/// wrapper — for Phase 2 kill-switch use `obfs4_client_connect_variant`.
 pub async fn obfs4_client_connect<S>(
     stream: S,
     psk: &NodeIdMacKey,
@@ -116,10 +116,10 @@ where
 }
 
 /// Variant-aware obfs4 client handshake.  Caller picks the variant
-/// (V1 / V2); если the server doesn't accept that variant, the read
+/// (V1 / V2); if the server doesn't accept that variant, the read
 /// of the server response times out / returns EOF, which surfaces as
-/// `UpgradeError::Io` — caller (transport layer) treats it as а
-/// silent-drop signal и may retry с а fallback variant.
+/// `UpgradeError::Io` — caller (transport layer) treats it as a
+/// silent-drop signal and may retry with a fallback variant.
 pub async fn obfs4_client_connect_variant<S>(
     mut stream: S,
     psk: &NodeIdMacKey,
@@ -141,10 +141,10 @@ where
     ))
 }
 
-/// Perform the obfs4 server handshake on the supplied raw stream и
+/// Perform the obfs4 server handshake on the supplied raw stream and
 /// return an `Obfs4Stream`.  Returns `Err` on bad PSK / tampered
-/// message; caller treats it as а silent-drop signal (closes the
-/// connection без sending anything).
+/// message; caller treats it as a silent-drop signal (closes the
+/// connection without sending anything).
 ///
 /// V1-only wrapper.  For Phase 2 kill-switch multi-variant accept,
 /// use `obfs4_server_accept_multi`.
@@ -161,12 +161,12 @@ where
     Ok(s)
 }
 
-/// Phase 2 multi-variant server accept.  Tries each variant в
+/// Phase 2 multi-variant server accept.  Tries each variant in
 /// `accept_variants` order on the client's first frame; first MAC
 /// that verifies wins.  Returns the stream + the matched variant so
-/// the caller can log/metric которая wire format the client used.
+/// the caller can log/metric which wire format the client used.
 ///
-/// Operator wires this от `[transport] obfs4_accept_variants` config.
+/// Operator wires this from `[transport] obfs4_accept_variants` config.
 /// Default `&[V1]` preserves pre-Phase-2 behavior bit-for-bit.
 pub async fn obfs4_server_accept_multi<S>(
     mut stream: S,
@@ -195,9 +195,9 @@ where
 
 /// Internal write state.
 enum WriteState {
-    /// No frame pending — ready к accept new bytes.
+    /// No frame pending — ready to accept new bytes.
     Idle,
-    /// Currently writing an outbound frame к the underlying stream.
+    /// Currently writing an outbound frame to the underlying stream.
     Writing { frame: Vec<u8>, offset: usize },
 }
 
@@ -208,14 +208,14 @@ enum ReadState {
     /// Reading the body of the current frame.  `total` includes the
     /// (already-consumed) 2-byte length prefix.
     Body { wire: Vec<u8>, total: usize },
-    /// Plaintext ready to deliver к caller.
+    /// Plaintext ready to deliver to caller.
     Plaintext { plaintext: Vec<u8>, offset: usize },
 }
 
 pin_project! {
-    /// Wraps а raw `AsyncRead + AsyncWrite` transport with obfs4 framing.
+    /// Wraps a raw `AsyncRead + AsyncWrite` transport with obfs4 framing.
     /// Implements `AsyncRead + AsyncWrite` so session-layer can use it
-    /// transparently in place of а raw TCP stream.
+    /// transparently in place of a raw TCP stream.
     pub struct Obfs4Stream<S> {
         #[pin]
         inner: S,
@@ -240,8 +240,8 @@ impl<S> Obfs4Stream<S> {
         }
     }
 
-    /// Consume the wrapper и return the underlying stream.  Useful
-    /// для test cleanup; do NOT call mid-stream — any buffered
+    /// Consume the wrapper and return the underlying stream.  Useful
+    /// for test cleanup; do NOT call mid-stream — any buffered
     /// plaintext or ciphertext is lost.
     pub fn into_inner(self) -> S {
         self.inner
@@ -282,29 +282,29 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Obfs4Stream<S> {
                 }
             }
         }
-        // State is Idle — wrap user bytes into а frame и queue it.
+        // State is Idle — wrap user bytes into a frame and queue it.
         //
         // Audit batch 2026-05-24 phase H: fragment large writes to fit
         // the obfs4 16 KiB ciphertext cap (`MAX_FRAME_CIPHERTEXT_BYTES`).
-        // `wrap_next` enforces the cap on body ciphertext; а single
+        // `wrap_next` enforces the cap on body ciphertext; a single
         // OVL1 frame can legitimately reach `MAX_FRAME_BODY = 16 MiB`
-        // (e.g. DHT `owned_push` с 14 records ≈ 62 KiB), so the
-        // transport layer is responsible для chunking.  Without this,
+        // (e.g. DHT `owned_push` with 14 records ≈ 62 KiB), so the
+        // transport layer is responsible for chunking.  Without this,
         // every oversized push tore down the session ("session.writer.
         // write_error frame ciphertext length 63121 exceeds cap
-        // 16384") и tx_registry churn cycled the whole cluster: every
+        // 16384") and tx_registry churn cycled the whole cluster: every
         // host saw 0-session windows every few minutes pre-fix even
-        // с chaos-ban stopped.
+        // with chaos-ban stopped.
         //
         // Take only the next `MAX_PLAINTEXT_PER_FRAME` bytes; the
-        // AsyncWrite contract permits returning а short count, so the
-        // caller will re-poll с the remainder.
+        // AsyncWrite contract permits returning a short count, so the
+        // caller will re-poll with the remainder.
         let chunk_len = buf.len().min(crate::MAX_PLAINTEXT_PER_FRAME);
         let chunk = &buf[..chunk_len];
         let frame = this.outbound.wrap_next(chunk).map_err(frame_to_io)?;
         *this.write_state = WriteState::Writing { frame, offset: 0 };
         // Optimistically try writing the new frame; either way report
-        // chunk_len consumed since those bytes are committed к our
+        // chunk_len consumed since those bytes are committed to our
         // pipeline.
         if let WriteState::Writing { frame, offset } = this.write_state {
             match this.inner.as_mut().poll_write(cx, &frame[*offset..]) {
@@ -386,13 +386,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for Obfs4Stream<S> {
                     return Poll::Ready(Ok(()));
                 }
                 ReadState::Length { buf, filled } => {
-                    // Need 2 bytes для the length prefix.
+                    // Need 2 bytes for the length prefix.
                     let mut tmp = ReadBuf::new(&mut buf[*filled..]);
                     match this.inner.as_mut().poll_read(cx, &mut tmp) {
                         Poll::Ready(Ok(())) => {
                             let read_n = tmp.filled().len();
                             if read_n == 0 {
-                                // EOF mid-prefix.  Surface as Ok(()) с
+                                // EOF mid-prefix.  Surface as Ok(()) with
                                 // out untouched ⇒ caller sees EOF.
                                 return Poll::Ready(Ok(()));
                             }
@@ -402,8 +402,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for Obfs4Stream<S> {
                             }
                             // Have full prefix.  Peek next-frame length.
                             let prefix = *buf;
-                            // peek_frame_len reads from а slice starting с
-                            // the prefix; build а dummy buf containing
+                            // peek_frame_len reads from a slice starting with
+                            // the prefix; build a dummy buf containing
                             // just the prefix.
                             let body_len =
                                 this.inbound.peek_frame_len(&prefix).map_err(frame_to_io)?;
@@ -423,7 +423,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Obfs4Stream<S> {
                     }
                 }
                 ReadState::Body { wire, total } => {
-                    // Read body bytes к fill wire.
+                    // Read body bytes to fill wire.
                     let needed = *total - wire.len();
                     if needed == 0 {
                         // Decrypt.
@@ -456,10 +456,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for Obfs4Stream<S> {
     }
 }
 
-// ── Re-exports необходимых ntor constants (для read_handshake_message) ──
+// ── Re-exports required ntor constants (for read_handshake_message) ──
 
 // Make ntor constants visible at our internal use site.  ntor.rs already
-// declares them `pub` so this is а path re-export, not а new definition.
+// declares them `pub` so this is a path re-export, not a new definition.
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -472,8 +472,8 @@ mod tests {
         NodeIdMacKey([0x42; 32])
     }
 
-    /// End-to-end: bind а duplex pair, run client handshake on one
-    /// half и server handshake on the other, then push bytes через.
+    /// End-to-end: bind a duplex pair, run client handshake on one
+    /// half and server handshake on the other, then push bytes through.
     #[tokio::test]
     async fn handshake_then_roundtrip_bytes() {
         let (client_raw, server_raw) = duplex(64 * 1024);
@@ -544,26 +544,26 @@ mod tests {
             Err(other) => panic!("expected ClientMacMismatch, got {other:?}"),
         }
 
-        // Client could fail с various errors depending on timing
-        // (EOF when server drops, AuthMismatch if server happens к
+        // Client could fail with various errors depending on timing
+        // (EOF when server drops, AuthMismatch if server happens to
         // respond before drop).  Just confirm it's an error.
         assert!(client_res.is_err());
     }
 
-    /// Wire-level capture: writes а payload containing the OVL1 magic;
+    /// Wire-level capture: writes a payload containing the OVL1 magic;
     /// the wire bytes between the two halves MUST NOT contain it.
     #[tokio::test]
     async fn no_ovl1_magic_on_wire() {
         let (mut client_raw, server_raw) = duplex(64 * 1024);
         let psk = test_psk();
 
-        // Spawn server-side handshake on а separate task so it
+        // Spawn server-side handshake on a separate task so it
         // actually progresses while we manually drive the client.
         let psk_clone = psk.clone();
         let server_task =
             tokio::spawn(async move { obfs4_server_accept(server_raw, &psk_clone).await });
 
-        // Client side: handshake manually так we can intercept bytes.
+        // Client side: handshake manually so we can intercept bytes.
         let (state, c_hs_wire) = ClientHandshake::start(&psk).unwrap();
         client_raw.write_all(&c_hs_wire).await.unwrap();
         client_raw.flush().await.unwrap();
@@ -574,7 +574,7 @@ mod tests {
         let out = state.complete(&s_hs).unwrap();
         let mut outbound = OutboundStream::new(out.dk_c_to_s);
 
-        // Wrap а payload containing the OVL1 magic plaintext.
+        // Wrap a payload containing the OVL1 magic plaintext.
         let payload = b"OVL1\x01\x00\x00\x00body...";
         let frame = outbound.wrap_next(payload).unwrap();
 

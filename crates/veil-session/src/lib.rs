@@ -1,18 +1,18 @@
 //! OVL1 session state machine crate — Phase 2 of veilcore extraction.
 //!
-//! Hosts the post-handshake frame loop ([`runner::SessionRunner`]) и
-//! per-session typed state modules previously living в
+//! Hosts the post-handshake frame loop ([`runner::SessionRunner`]) and
+//! per-session typed state modules previously living in
 //! `veilcore/src/node/session/`.
 //!
 //! ## Test-fixture strategy
 //!
-//! Integration tests (`runner_tests.rs` + `chaos_sim.rs`) stay в
-//! veilcore because they construct а real `FrameDispatcher`
+//! Integration tests (`runner_tests.rs` + `chaos_sim.rs`) stay in
+//! veilcore because they construct a real `FrameDispatcher`
 //! (veilcore-private).  This crate hosts only production code;
 //! callers reach it through the trait abstractions
 //! ([`dispatcher_sink::DispatcherSink`], [`handshake::LocalHandshakeIdentity`]).
 //!
-//! See [`docs/en/PLAN_VEILCORE_EXTRACTION.md`] для the full plan.
+//! See [`docs/en/PLAN_VEILCORE_EXTRACTION.md`] for the full plan.
 
 pub mod backpressure_signal;
 pub mod battery_adjusted_keepalive;

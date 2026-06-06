@@ -13,17 +13,17 @@ dependencies:
   ffi: ^2.1.0
   # Connectivity detection for VeilLifecycleBinding.attachConnectivity().
   # Plugin works WITHOUT this (consumers can roll their own NetworkKind
-  # stream), но including by default gives one-line wiring for the
+  # stream), but including by default gives one-line wiring for the
   # common case.  Range matches what the package supported as of 2026-05.
   connectivity_plus: ^6.1.0
   # QR scanning for the pairing flow (Epic 489.7).  Provides camera
-  # access + barcode decode на iOS / Android.  Optional from а strict
+  # access + barcode decode on iOS / Android.  Optional from a strict
   # functionality standpoint — the bare PairingDialog widget falls back
-  # to а paste field if camera init fails — но shipping by default
+  # to a paste field if camera init fails — but shipping by default
   # gives one-line wiring for the common case.
   mobile_scanner: ^5.2.3
-  # QR generation (Epic 489.7 generator side).  Renders а bootstrap-
-  # invite URI as а scannable QR code for "share my invite" flow.
+  # QR generation (Epic 489.7 generator side).  Renders a bootstrap-
+  # invite URI as a scannable QR code for "share my invite" flow.
   # Pure-Dart — no platform deps.
   qr_flutter: ^4.1.0
 
@@ -39,14 +39,14 @@ flutter:
         ffiPlugin: true
         # Epic 489.6: Kotlin plugin class for foreground-service
         # control (startBackgroundService / stopBackgroundService
-        # MethodChannel).  Coexists с the FFI plugin surface — same
+        # MethodChannel).  Coexists with the FFI plugin surface — same
         # plugin definition can ship both.
         package: com.veil.veil_flutter
         pluginClass: VeilFlutterPlugin
       ios:
         ffiPlugin: true
         # Epic 489.10: Swift plugin class for APNs wake-up handler
-        # (BGProcessingTask) + token storage.  Coexists с the FFI
+        # (BGProcessingTask) + token storage.  Coexists with the FFI
         # plugin surface — same plugin definition can ship both.
         pluginClass: VeilFlutterPlugin
       linux:

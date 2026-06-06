@@ -8,7 +8,7 @@
 /// See [`mlock::MlockedBytes`].
 pub mod mlock;
 
-/// Sensitive-bytes container с automatic mlock-or-fallback selection.
+/// Sensitive-bytes container with automatic mlock-or-fallback selection.
 /// See [`sensitive_bytes::SensitiveBytes`].
 pub mod sensitive_bytes;
 
@@ -75,13 +75,13 @@ pub fn setsid_on_spawn(command: &mut std::process::Command) {
 #[cfg(not(unix))]
 pub fn setsid_on_spawn(_command: &mut std::process::Command) {}
 
-/// scrub а spawning `Command`'s environment к а
+/// scrub a spawning `Command`'s environment to a
 /// minimal allow-list before spawn. Carries through only:
 ///
-/// * `PATH` — pinned к а minimal `/usr/bin:/bin` if the parent did not
-///   set it. Stdlib requires а PATH for any future
-///   `Command::new("name")` (vs. absolute path) calls в the child.
-/// * `HOME`, `USER`, `LOGNAME` — needed by tilde-expansion и user-
+/// * `PATH` — pinned to a minimal `/usr/bin:/bin` if the parent did not
+///   set it. Stdlib requires a PATH for any future
+///   `Command::new("name")` (vs. absolute path) calls in the child.
+/// * `HOME`, `USER`, `LOGNAME` — needed by tilde-expansion and user-
 ///   relative config paths.
 /// * `TZ` — timestamp formatting.
 /// * `LANG`, `LC_ALL` — UTF-8 stderr formatting (when set).
@@ -92,10 +92,10 @@ pub fn setsid_on_spawn(_command: &mut std::process::Command) {}
 /// `VEIL_*` (only the explicit `--config` arg should drive veil
 /// behaviour). The pattern matches systemd's `EnvironmentFile=` discipline.
 ///
-/// Use это для long-lived daemon spawns (`spawn_restart_child`
-/// `spawn_background_node_process`) where the child runs unattended и
-/// the parent's env могла прийти от an exec'd-into context (sudo, su
-/// CI runner) с unwanted variables в scope.
+/// Use this for long-lived daemon spawns (`spawn_restart_child`
+/// `spawn_background_node_process`) where the child runs unattended and
+/// the parent's env could come from an exec'd-into context (sudo, su
+/// CI runner) with unwanted variables in scope.
 pub fn scrub_command_env(command: &mut std::process::Command) {
     const ALLOW: &[&str] = &[
         "PATH",
@@ -114,7 +114,7 @@ pub fn scrub_command_env(command: &mut std::process::Command) {
         }
     }
     // Make sure PATH is always set — child needs it to resolve any
-    // sub-spawn target by name. Falls к the POSIX-standard minimum.
+    // sub-spawn target by name. Falls to the POSIX-standard minimum.
     if std::env::var_os("PATH").is_none() {
         command.env("PATH", "/usr/bin:/bin");
     }
@@ -532,9 +532,9 @@ pub fn hex_short(b: &[u8; 32]) -> String {
     bytes_to_hex(&b[..4])
 }
 
-/// Format а byte slice as а lowercase hex string.  Identical к
-/// [`bytes_to_hex`]; preserved для call-site continuity с veilcore
-/// code що использовало the legacy alias.
+/// Format a byte slice as a lowercase hex string.  Identical to
+/// [`bytes_to_hex`]; preserved for call-site continuity with veilcore
+/// code that used the legacy alias.
 pub fn hex_str(bytes: &[u8]) -> String {
     bytes_to_hex(bytes)
 }
@@ -609,10 +609,10 @@ pub fn hex_to_bytes(s: &str) -> Result<Vec<u8>, HexError> {
         .collect()
 }
 
-/// Current UNIX timestamp truncated к `u32` seconds.
+/// Current UNIX timestamp truncated to `u32` seconds.
 ///
-/// Clamps к `u32::MAX` rather than wrapping — timestamps after year 2106
-/// saturate instead of rolling over к zero и breaking TTL comparisons.
+/// Clamps to `u32::MAX` rather than wrapping — timestamps after year 2106
+/// saturate instead of rolling over to zero and breaking TTL comparisons.
 ///
 /// Returns `0` if the system clock is before the UNIX epoch.
 pub fn unix_secs_now_u32() -> u32 {
@@ -623,10 +623,10 @@ pub fn unix_secs_now_u32() -> u32 {
         .min(u32::MAX as u64) as u32
 }
 
-/// Current UNIX timestamp as а full `u64` seconds value.
+/// Current UNIX timestamp as a full `u64` seconds value.
 ///
 /// Prefer this over inline `SystemTime::now.duration_since(UNIX_EPOCH)`
-/// к keep timestamp acquisition в one place.  Returns `0` if the system
+/// to keep timestamp acquisition in one place.  Returns `0` if the system
 /// clock is before the UNIX epoch.
 pub fn unix_secs_now_u64() -> u64 {
     std::time::SystemTime::now()
@@ -635,14 +635,14 @@ pub fn unix_secs_now_u64() -> u64 {
         .as_secs()
 }
 
-/// Strip the host portion от а transport URI for log output.
+/// Strip the host portion from a transport URI for log output.
 ///
-/// Replaces the host:port pair с `[redacted]:port`, preserving the
-/// scheme prefix (`tcp://`, `quic://`, `ws://`, …) и the port number.
+/// Replaces the host:port pair with `[redacted]:port`, preserving the
+/// scheme prefix (`tcp://`, `quic://`, `ws://`, …) and the port number.
 /// Operators correlate sessions by `node_id` (always logged adjacent
-/// в the same INFO line); routine logs no longer announce who is
-/// talking к whom at the IP level.  Local schemes (`unix://`, `ipc://`)
-/// pass through unchanged because они ара not PII.
+/// in the same INFO line); routine logs no longer announce who is
+/// talking to whom at the IP level.  Local schemes (`unix://`, `ipc://`)
+/// pass through unchanged because they are not PII.
 pub fn redact_addr_for_log(transport: &str) -> std::borrow::Cow<'_, str> {
     let scheme_end = match transport.find("://") {
         Some(i) => i + 3,
@@ -672,17 +672,17 @@ pub fn redact_addr_for_log(transport: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// Returns 100 (assume full / no battery) on:
 /// * Non-Linux platforms.
-/// * Linux hosts без а `BAT*` entry в `/sys/class/power_supply`.
+/// * Linux hosts without a `BAT*` entry in `/sys/class/power_supply`.
 /// * Read errors (mount-point absent, kernel rebuild rare-case, etc.).
 ///
-/// The 100-sentinel was chosen so battery-thresholded paths default к
-/// the "no power-saving" branch when the level is unknown — better к
-/// drain а desktop's wall power than over-aggressively slow а device
-/// що happens к not expose battery info.
+/// The 100-sentinel was chosen so battery-thresholded paths default to
+/// the "no power-saving" branch when the level is unknown — better to
+/// drain a desktop's wall power than over-aggressively slow a device
+/// that happens to not expose battery info.
 ///
 /// Phase 2 session 2 prep (veilcore extraction): canonicalized here
-/// so session crate can read battery state без а dep on veilcore
-/// (formerly lived в `veilcore/src/node/battery.rs`).
+/// so session crate can read battery state without a dep on veilcore
+/// (formerly lived in `veilcore/src/node/battery.rs`).
 pub fn local_battery_level() -> u8 {
     #[cfg(target_os = "linux")]
     {
@@ -765,8 +765,8 @@ macro_rules! wlock {
 // ── Ttl: typed wrapper for time-to-live durations ────────────
 //
 // cleanup: ~50 `*_TTL_SECS: u64` constants spread across crates
-// freely mixed с `Duration` values, occasionally compared against `_TTL_MS`
-// constants of different unit. Easy к accidentally pass а seconds value where
+// freely mixed with `Duration` values, occasionally compared against `_TTL_MS`
+// constants of different unit. Easy to accidentally pass a seconds value where
 // milliseconds expected (or vice-versa) — `60u64` doesn't tell the compiler
 // whether it's seconds or millis.
 //
@@ -776,63 +776,63 @@ macro_rules! wlock {
 // units; the wrapped `Duration` is recovered via `as_duration` for arithmetic
 // and comparison without dropping the type information.
 
-/// Time-to-live duration. Newtype wrapper over `Duration` к
-/// make TTL semantics explicit at function/struct boundaries и prevent
+/// Time-to-live duration. Newtype wrapper over `Duration` to
+/// make TTL semantics explicit at function/struct boundaries and prevent
 /// accidental seconds-vs-millis mix-ups at constant-declaration sites.
 ///
 /// # Why this exists
 ///
 /// ~50 `*_TTL_SECS: u64` constants spread across veil crates. Operator
-/// who adds а new `_TTL_MS: u64` next to existing seconds constants creates
-/// а footgun: the type system silently accepts the wrong-unit value. Wrapping
-/// в `Ttl` makes the unit explicit at construction (`from_secs` / `from_millis`)
-/// и opaque at boundaries — callers can't accidentally pass а raw integer
+/// who adds a new `_TTL_MS: u64` next to existing seconds constants creates
+/// a footgun: the type system silently accepts the wrong-unit value. Wrapping
+/// in `Ttl` makes the unit explicit at construction (`from_secs` / `from_millis`)
+/// and opaque at boundaries — callers can't accidentally pass a raw integer
 /// without going through one of the named constructors.
 ///
 /// # Construction
 ///
 /// Always go through one [`Ttl::from_secs`], [`Ttl::from_millis`], or
-/// [`Ttl::from_duration`]. No `From<u64>` impl на purpose — would re-introduce
-/// the unit-confusion footgun the type exists к prevent.
+/// [`Ttl::from_duration`]. No `From<u64>` impl on purpose — would re-introduce
+/// the unit-confusion footgun the type exists to prevent.
 ///
 /// # Use
 ///
-/// `as_duration` exposes the wrapped `Duration` for use в comparison
+/// `as_duration` exposes the wrapped `Duration` for use in comparison
 /// arithmetic, and `tokio::time::sleep`/etc. without unwrapping. `as_secs` /
-/// `as_millis` для the rare cases where а raw integer is needed (typically
-/// для serialization on the wire).
+/// `as_millis` for the rare cases where a raw integer is needed (typically
+/// for serialization on the wire).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ttl(std::time::Duration);
 
 impl Ttl {
-    /// Zero-duration TTL, useful as а sentinel.
+    /// Zero-duration TTL, useful as a sentinel.
     pub const ZERO: Ttl = Ttl(std::time::Duration::ZERO);
 
-    /// Construct из а seconds count.
+    /// Construct from a seconds count.
     pub const fn from_secs(secs: u64) -> Self {
         Self(std::time::Duration::from_secs(secs))
     }
 
-    /// Construct из а milliseconds count.
+    /// Construct from a milliseconds count.
     pub const fn from_millis(millis: u64) -> Self {
         Self(std::time::Duration::from_millis(millis))
     }
 
-    /// Construct из an explicit `Duration` (preserves any sub-second
-    /// precision). Used when wrapping а pre-existing duration calculated
-    /// dynamically (e.g. configurable interval scaled by а multiplier).
+    /// Construct from an explicit `Duration` (preserves any sub-second
+    /// precision). Used when wrapping a pre-existing duration calculated
+    /// dynamically (e.g. configurable interval scaled by a multiplier).
     pub const fn from_duration(d: std::time::Duration) -> Self {
         Self(d)
     }
 
-    /// Underlying `Duration`. Use for comparison, arithmetic, и sleep
-    /// calls без dropping the `Ttl` annotation prematurely.
+    /// Underlying `Duration`. Use for comparison, arithmetic, and sleep
+    /// calls without dropping the `Ttl` annotation prematurely.
     pub const fn as_duration(&self) -> std::time::Duration {
         self.0
     }
 
-    /// Whole seconds (truncating fractional). Use only когда serializing
-    /// over the wire или к а human-readable format.
+    /// Whole seconds (truncating fractional). Use only when serializing
+    /// over the wire or to a human-readable format.
     pub const fn as_secs(&self) -> u64 {
         self.0.as_secs()
     }
@@ -842,7 +842,7 @@ impl Ttl {
         self.0.as_millis()
     }
 
-    /// Whether the TTL is zero (sentinel for "disabled" в some configs).
+    /// Whether the TTL is zero (sentinel for "disabled" in some configs).
     pub const fn is_zero(&self) -> bool {
         self.0.is_zero()
     }
@@ -854,9 +854,9 @@ impl Ttl {
         Ttl(self.0.saturating_add(other.0))
     }
 
-    /// Checked subtraction. Returns `None` если result would be negative —
+    /// Checked subtraction. Returns `None` if result would be negative —
     /// callers MUST handle the absent value explicitly rather than silently
-    /// clamping к zero (which is а common bug source в TTL math).
+    /// clamping to zero (which is a common bug source in TTL math).
     pub fn checked_sub(self, other: Ttl) -> Option<Ttl> {
         self.0.checked_sub(other.0).map(Ttl)
     }
@@ -865,7 +865,7 @@ impl Ttl {
 impl std::fmt::Display for Ttl {
     /// Human-readable formatting: picks the largest whole-unit representation
     /// (e.g. 86400s prints as `1d`, 3600s as `1h`, 60s as `1m`, sub-second as
-    /// `Nms`). Used в operator-facing log/IPC output.
+    /// `Nms`). Used in operator-facing log/IPC output.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let secs = self.0.as_secs();
         let nanos = self.0.subsec_nanos();
@@ -1038,7 +1038,7 @@ mod tests {
         let d = std::time::Duration::from_millis(1234);
         let ttl = Ttl::from_duration(d);
         assert_eq!(ttl.as_duration(), d);
-        // From impl works в the conversion direction too.
+        // From impl works in the conversion direction too.
         let back: std::time::Duration = ttl.into();
         assert_eq!(back, d);
     }
@@ -1047,7 +1047,7 @@ mod tests {
     fn r4_ttl_saturating_add_does_not_panic() {
         let huge = Ttl::from_secs(u64::MAX);
         let sum = huge.saturating_add(Ttl::from_secs(1));
-        // Saturated к Duration::MAX (which is u64::MAX seconds + max nanos).
+        // Saturated to Duration::MAX (which is u64::MAX seconds + max nanos).
         // Just check it didn't panic and result >= huge.
         assert!(sum >= huge);
     }
@@ -1079,9 +1079,9 @@ mod tests {
 
     #[test]
     fn r4_ttl_display_breaks_ties_at_largest_unit_first() {
-        // 90 seconds is NOT а whole minute — fall through к seconds.
+        // 90 seconds is NOT a whole minute — fall through to seconds.
         assert_eq!(format!("{}", Ttl::from_secs(90)), "90s");
-        // 25h is NOT а whole day — fall through к hours.
+        // 25h is NOT a whole day — fall through to hours.
         assert_eq!(format!("{}", Ttl::from_secs(25 * 3600)), "25h");
     }
 
@@ -1097,8 +1097,8 @@ mod tests {
 
     #[test]
     fn r4_ttl_const_constructors_compile_in_const_context() {
-        // Lock в the const-fn property — necessary so call sites can use
-        // Ttl::from_secs(60) directly в `pub const FOO_TTL: Ttl =...;`
+        // Lock in the const-fn property — necessary so call sites can use
+        // Ttl::from_secs(60) directly in `pub const FOO_TTL: Ttl =...;`
         // declarations (the migration target for ~50 _TTL_SECS constants).
         const FOO: Ttl = Ttl::from_secs(60);
         const BAR: Ttl = Ttl::ZERO;
@@ -1107,7 +1107,7 @@ mod tests {
     }
 
     // scrub_command_env tests. We can't easily
-    // inspect а std::process::Command's env after configuration (no
+    // inspect a std::process::Command's env after configuration (no
     // public accessor), so we drive an actual `printenv` child and read
     // stdout. Skipped on non-Unix because /usr/bin/printenv is GNU.
     #[cfg(unix)]
@@ -1115,14 +1115,14 @@ mod tests {
     fn scrub_command_env_drops_unallowed_vars() {
         use std::process::Command;
         // SAFETY: unsetting an env var is documented to be safe in single-
-        // threaded contexts; cargo test runs each #[test] on а fresh thread
-        // but other tests in the same process could race. We use а unique
+        // threaded contexts; cargo test runs each #[test] on a fresh thread
+        // but other tests in the same process could race. We use a unique
         // var name to avoid collisions.
         // SAFETY: see Rust 1.85+ deprecation notice on std::env::set_var —
         // this is only safe in single-threaded test scope. cargo nextest
         // gives each test its own process; the workspace standard runner
         // serializes scrub_command_env_* via single-threaded grouping is
-        // not enforced, so we accept the small race risk for а unique
+        // not enforced, so we accept the small race risk for a unique
         // var name (env::set_var is locked behind the unsafe gate as of
         // 1.85 specifically to flag this).
         unsafe {

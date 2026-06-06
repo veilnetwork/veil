@@ -1,25 +1,25 @@
 //! `oproxy-server` — standalone proxy exit binary.
 //!
 //! Binds an veil app endpoint via the local daemon's IPC socket
-//! (using the **inbound-stream accept** SDK API shipped в Phase 6.51),
-//! accepts incoming veil streams, и для each one:
+//! (using the **inbound-stream accept** SDK API shipped in Phase 6.51),
+//! accepts incoming veil streams, and for each one:
 //!
 //! 1. Checks the source `node_id` against the configured allowlist.
 //!    Empty allowlist ⇒ allow-all (open proxy).
 //! 2. Reads the connect header (`[host_len u16][host][port u16]`).
 //! 3. Validates the destination is not RFC1918 / loopback /
 //!    multicast / metadata (unless `allow_private = true`).
-//! 4. Opens а TCP outbound к `host:port`.
-//! 5. Replies с а status byte и bridges bytes duplex.
+//! 4. Opens a TCP outbound to `host:port`.
+//! 5. Replies with a status byte and bridges bytes duplex.
 //!
 //! Run:
 //!   oproxy-server --config /etc/oproxy/server.toml
 
 // oproxy-server depends on `veilclient::VeilClient`, which is
 // itself `#[cfg(unix)]`-gated (Unix-domain socket IPC).  Wrap the
-// entire bin content в а `#[cfg(unix)] mod imp` so cross-compile к
+// entire bin content in a `#[cfg(unix)] mod imp` so cross-compile to
 // x86_64-pc-windows-gnu doesn't trip on the unresolved `AppSender`
-// import от oproxy::connector.  Windows stub main exits с error.
+// import from oproxy::connector.  Windows stub main exits with error.
 #[cfg(not(unix))]
 fn main() -> std::process::ExitCode {
     eprintln!("oproxy-server is not supported on this platform (Unix-family only).");
@@ -58,13 +58,13 @@ mod imp {
     #[derive(Parser, Debug)]
     #[command(version, about = "Veil-network proxy exit server")]
     struct Args {
-        /// Path к а TOML config file (см. `crates/oproxy/README.md`).
+        /// Path to a TOML config file (see `crates/oproxy/README.md`).
         #[arg(long, value_name = "PATH", required_unless_present = "gen_config")]
         config: Option<PathBuf>,
 
-        /// Print а commented default-config TOML template к stdout и exit.
-        /// Operators run this once, redirect к а file, edit the placeholders,
-        /// then start с `--config <path>`.
+        /// Print a commented default-config TOML template to stdout and exit.
+        /// Operators run this once, redirect to a file, edit the placeholders,
+        /// then start with `--config <path>`.
         ///
         /// Example:
         ///   oproxy-server --gen-config > /etc/oproxy/server.toml
@@ -92,7 +92,7 @@ mod imp {
         let config_path = args
             .config
             .expect("clap should have required --config when --gen-config absent");
-        // Audit batch 2026-05-24 (M6): warn если config file is loose-mode.
+        // Audit batch 2026-05-24 (M6): warn if config file is loose-mode.
         oproxy::config::warn_loose_config_perms(&config_path);
         let raw = match std::fs::read_to_string(&config_path) {
             Ok(s) => s,
@@ -140,22 +140,22 @@ mod imp {
             .map_err(|e| anyhow!("allowed_node_ids: {e}"))?;
 
         // Audit batch 2026-05-24 (M11): refuse silent open-proxy.  Operator
-        // must explicitly set `allow_all = true` к acknowledge what they're
+        // must explicitly set `allow_all = true` to acknowledge what they're
         // running.  This catches the common "empty list means restrictive"
-        // misconception ДО the daemon starts taking traffic.
+        // misconception BEFORE the daemon starts taking traffic.
         if !allowlist.is_restrictive() && !cfg.allow_all {
             anyhow::bail!(
-                "oproxy-server: refusing к start as open proxy.  Either:\n  \
-              • Populate `allowed_node_ids = [\"<hex>\", ...]` к gate \
+                "oproxy-server: refusing to start as open proxy.  Either:\n  \
+              • Populate `allowed_node_ids = [\"<hex>\", ...]` to gate \
                 callers, OR\n  \
-              • Set `allow_all = true` explicitly к acknowledge open-\
+              • Set `allow_all = true` explicitly to acknowledge open-\
                 proxy semantics (any veil peer can use this server)."
             );
         }
         if !allowlist.is_restrictive() && cfg.allow_all {
             log::warn!(
                 "oproxy-server: starting as OPEN PROXY (allow_all=true, no allowlist). \
-             Any veil peer can use this server для outbound TCP."
+             Any veil peer can use this server for outbound TCP."
             );
         }
 
@@ -176,9 +176,9 @@ mod imp {
         // `bind_named` (not `bind`) — required for stable deterministic
         // app_id derivation.  Clients compute the SAME app_id via
         // `veil_app::address::app_id(server_node_id, namespace, name)`
-        // и use it as the dst_app_id in their `open_stream` calls.
-        // `bind` would assign а random ephemeral app_id что the client
-        // cannot reproduce, so opens would fail с NOT_FOUND.
+        // and use it as the dst_app_id in their `open_stream` calls.
+        // `bind` would assign a random ephemeral app_id that the client
+        // cannot reproduce, so opens would fail with NOT_FOUND.
         let mut app = client
             .bind_named(oproxy::SERVER_NAMESPACE, &cfg.app_name, 0)
             .await
@@ -195,14 +195,14 @@ mod imp {
         let allowlist = Arc::new(allowlist);
         let allow_private = cfg.allow_private;
         let pnet_required = cfg.pnet_required;
-        // Arc-wrap the client so each spawned handler holds а handle for
+        // Arc-wrap the client so each spawned handler holds a handle for
         // its own `peer_pnet_status` calls when pnet_required.  All clones
         // share the same dispatcher / IPC writer underneath.
         let client = Arc::new(client);
 
-        // S2.B: build app-cert gate если operator configured all three fields.
-        // Partial config (e.g. owner_pubkey set но network_id missing) fails
-        // startup — better than silently downgrading к no-gate semantics.
+        // S2.B: build app-cert gate if operator configured all three fields.
+        // Partial config (e.g. owner_pubkey set but network_id missing) fails
+        // startup — better than silently downgrading to no-gate semantics.
         let app_cert_gate: Option<Arc<AppCertGate>> = match (
             &cfg.app_cert_trusted_owner_pubkey,
             cfg.app_cert_owner_algo,
@@ -230,7 +230,7 @@ mod imp {
         log::info!("oproxy-server: max_concurrent_streams={max_streams}");
         let stream_sem = Arc::new(tokio::sync::Semaphore::new(max_streams));
 
-        // Accept loop — для each incoming veil stream, spawn а handler.
+        // Accept loop — for each incoming veil stream, spawn a handler.
         loop {
             let permit = match Arc::clone(&stream_sem).acquire_owned().await {
                 Ok(p) => p,
@@ -248,7 +248,7 @@ mod imp {
             };
             let src = incoming.src_node_id;
             log::debug!(
-                "oproxy-server: accept stream от node_id={:02x}{:02x}..",
+                "oproxy-server: accept stream from node_id={:02x}{:02x}..",
                 src[0],
                 src[1],
             );
@@ -269,7 +269,7 @@ mod imp {
                 .await
                 {
                     log::debug!(
-                        "oproxy-server: stream от {:02x}{:02x}.. closed: {e}",
+                        "oproxy-server: stream from {:02x}{:02x}.. closed: {e}",
                         src[0],
                         src[1],
                     );
@@ -291,10 +291,10 @@ mod imp {
         let src = incoming.src_node_id;
 
         // Authz check first — fail-closed.  Cheaper than reading the
-        // header for а peer we'd reject anyway.
+        // header for a peer we'd reject anyway.
         if !allowlist.permits(&src) {
             log::info!(
-                "oproxy-server: deny node_id={:02x}{:02x}{:02x}{:02x}.. (not в allowlist)",
+                "oproxy-server: deny node_id={:02x}{:02x}{:02x}{:02x}.. (not in allowlist)",
                 src[0],
                 src[1],
                 src[2],
@@ -305,10 +305,10 @@ mod imp {
         }
 
         // S2.A P-Net check: when `pnet_required = true`, query the daemon's
-        // verified-cert cache.  Reject если peer has no valid
+        // verified-cert cache.  Reject if peer has no valid
         // MembershipCert.  Local IPC round-trip — sub-millisecond cost on
-        // а warm daemon.  Cache на the daemon side means repeat queries
-        // для the same peer don't burn CPU.
+        // a warm daemon.  Cache on the daemon side means repeat queries
+        // for the same peer don't burn CPU.
         if pnet_required {
             match client.peer_pnet_status(&src).await {
                 Ok(status) => {
@@ -328,11 +328,11 @@ mod imp {
                     }
                 }
                 Err(e) => {
-                    // Daemon RPC failed — fail-closed.  Operator's choice к
-                    // run в p_net mode means они want the strict gate; if it
+                    // Daemon RPC failed — fail-closed.  Operator's choice to
+                    // run in p_net mode means they want the strict gate; if it
                     // can't be evaluated, deny rather than fall-back-open.
                     log::warn!(
-                        "oproxy-server: pnet_status query failed для {:02x}{:02x}..: {e}; denying",
+                        "oproxy-server: pnet_status query failed for {:02x}{:02x}..: {e}; denying",
                         src[0],
                         src[1]
                     );
@@ -356,7 +356,7 @@ mod imp {
                     Some(gate) => match gate.verify(&blob, &src) {
                         Ok(()) => {
                             log::debug!(
-                                "oproxy-server: app-cert verified для {:02x}{:02x}..",
+                                "oproxy-server: app-cert verified for {:02x}{:02x}..",
                                 src[0],
                                 src[1]
                             );
@@ -372,10 +372,10 @@ mod imp {
                         }
                     },
                     None => {
-                        // Client presented cert но server isn't configured к verify.
-                        // Accept silently — wire-compat для mixed-deployment migration.
+                        // Client presented cert but server isn't configured to verify.
+                        // Accept silently — wire-compat for mixed-deployment migration.
                         log::debug!(
-                            "oproxy-server: ignoring unsolicited app-cert от {:02x}{:02x}.. (gate not configured)",
+                            "oproxy-server: ignoring unsolicited app-cert from {:02x}{:02x}.. (gate not configured)",
                             src[0],
                             src[1]
                         );
@@ -409,14 +409,14 @@ mod imp {
             }
         };
 
-        // Audit batch 2026-05-24: wrap connect-header read в timeout — а
+        // Audit batch 2026-05-24: wrap connect-header read in timeout — a
         // slow / never-terminating peer cannot tie up the accept-loop's
         // worker indefinitely.
         let read_header_fut = async {
             match peeked_host_len_hi {
                 Some(hi) => read_connect_header_with_peeked_hi(&mut stream, hi).await,
                 None => {
-                    // Cert-preamble path consumed nothing после the cert —
+                    // Cert-preamble path consumed nothing after the cert —
                     // host_len_hi byte is fresh on the wire.
                     let mut hi = [0u8; 1];
                     tokio::io::AsyncReadExt::read_exact(&mut stream, &mut hi).await?;

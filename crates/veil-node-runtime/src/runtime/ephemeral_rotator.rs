@@ -1,24 +1,24 @@
-//! Glue between [`veil_transport::rotation`] и the live runtime —
+//! Glue between [`veil_transport::rotation`] and the live runtime —
 //! Phase 5f Step 2.
 //!
 //! Builds the [`veil_transport::rotation::BindFn`] +
 //! [`veil_transport::rotation::BroadcastFn`] closures with real
 //! production wiring (the standard ephemeral binder + signed
 //! `TransportMigrationNotify` broadcasts over the live session-tx
-//! registry) и hands them к the generic
+//! registry) and hands them to the generic
 //! [`veil_transport::rotation::run_rotation_loop`] driver.
 //!
 //! ## Scope (Step 2)
 //!
-//! - [`spawn_ephemeral_rotator`]: spawns the rotation loop с production
+//! - [`spawn_ephemeral_rotator`]: spawns the rotation loop with production
 //!   closures wired up. Caller passes the listener's
-//!   `EphemeralConfig`, the local node-id + Ed25519 signing key, а URI
-//!   template что turns the picked port into the full transport URI
-//!   broadcast к peers, and an `Arc<RwLock<SessionTxRegistry>>` для
-//!   the actual frame broadcast.  Returns the events receiver и а
+//!   `EphemeralConfig`, the local node-id + Ed25519 signing key, a URI
+//!   template that turns the picked port into the full transport URI
+//!   broadcast to peers, and an `Arc<RwLock<SessionTxRegistry>>` for
+//!   the actual frame broadcast.  Returns the events receiver and a
 //!   shutdown watch handle.
-//! - Unit tests exercise the broadcast plumbing с а registered fake
-//!   peer и verify the wire bytes round-trip through `decode_header` +
+//! - Unit tests exercise the broadcast plumbing with a registered fake
+//!   peer and verify the wire bytes round-trip through `decode_header` +
 //!   `TransportMigrationNotifyPayload::decode` +
 //!   `verify_transport_migration_notify`.
 //!
@@ -55,25 +55,25 @@ use veil_proto::{
 use veil_session::SessionTxRegistry;
 use veil_transport::{TransportContext, TransportListener, TransportRegistry, TransportUri};
 
-/// Function что turns the freshly bound port into the canonical
-/// transport URI advertised к peers.  Typical bodies:
+/// Function that turns the freshly bound port into the canonical
+/// transport URI advertised to peers.  Typical bodies:
 ///
 /// ```ignore
 /// |port: u16| format!("obfs4-tcp://example.com:{port}")
 /// ```
 ///
-/// Kept as а type alias rather than а concrete closure trait so call
-/// sites can pass either а plain `fn(u16) -> String` или а closure что
-/// captures `host` / `advertise_template` от the config.
+/// Kept as a type alias rather than a concrete closure trait so call
+/// sites can pass either a plain `fn(u16) -> String` or a closure that
+/// captures `host` / `advertise_template` from the config.
 pub type UriTemplate = Box<dyn Fn(u16) -> String + Send + Sync + 'static>;
 
-/// Production broadcaster: signs а `TransportMigrationNotify` payload
-/// под the local identity key и pushes the wire-encoded frame к every
-/// active session через [`SessionTxRegistry::send_to_all_with_priority`].
+/// Production broadcaster: signs a `TransportMigrationNotify` payload
+/// under the local identity key and pushes the wire-encoded frame to every
+/// active session through [`SessionTxRegistry::send_to_all_with_priority`].
 ///
-/// `new_expiry_offset` is added к `now_unix()` к compute the NEW URI's
-/// expiry — peers will treat the cached entry as valid up к that point
-/// и fall back к а fresh `ResolveTransport` лookup beyond.
+/// `new_expiry_offset` is added to `now_unix()` to compute the NEW URI's
+/// expiry — peers will treat the cached entry as valid up to that point
+/// and fall back to a fresh `ResolveTransport` lookup beyond.
 pub struct SessionTxBroadcaster {
     local_node_id: [u8; 32],
     signing_key: Arc<SigningKey>,
@@ -116,29 +116,29 @@ impl BroadcastFn for SessionTxBroadcaster {
             frame.extend_from_slice(&encode_header(&hdr));
             frame.extend_from_slice(&body);
             let pooled = veil_bufpool::pooled_shared_from_vec(frame);
-            // Use INTERACTIVE priority (matches DetachPayload broadcast в
-            // shutdown — migration is operationally urgent but не
+            // Use INTERACTIVE priority (matches DetachPayload broadcast in
+            // shutdown — migration is operationally urgent but not
             // realtime-critical).  Sync RwLock read here — `send_to_all`
             // returns immediately after enqueuing, so the guard lifetime
-            // is microseconds, не held across .await.
+            // is microseconds, not held across .await.
             veil_util::rlock!(registry).send_to_all(pooled);
         })
     }
 }
 
-/// Spawn the rotation lifecycle для one ephemeral listener.
+/// Spawn the rotation lifecycle for one ephemeral listener.
 ///
 /// Returns:
-///   - `JoinHandle<()>` для the rotation-loop task.
-///   - `mpsc::Receiver<RotationEvent>` через which the caller can
+///   - `JoinHandle<()>` for the rotation-loop task.
+///   - `mpsc::Receiver<RotationEvent>` through which the caller can
 ///     observe rotation outcomes (e.g. invoke listener-swap mechanics
 ///     on `RotationEvent::Rotated`).
-///   - `watch::Sender<bool>` для clean shutdown — flip к `true` к stop.
+///   - `watch::Sender<bool>` for clean shutdown — flip to `true` to stop.
 ///
-/// Caller is responsible для draining `events_rx`. Если the receiver
+/// Caller is responsible for draining `events_rx`. If the receiver
 /// fills, the loop's `events_tx.send(...).await` will park, blocking
 /// subsequent rotations.  64-deep channel matches the bind-retry cap
-/// и is more than sufficient for any realistic rotation cadence.
+/// and is more than sufficient for any realistic rotation cadence.
 pub fn spawn_ephemeral_rotator(
     spec: RotationSpec,
     local_node_id: [u8; 32],
@@ -162,8 +162,8 @@ pub fn spawn_ephemeral_rotator(
     )
 }
 
-/// Test-hook variant того же helper — accepts а custom binder so unit
-/// tests can drive the loop с mocked random-port outcomes без
+/// Test-hook variant of the same helper — accepts a custom binder so unit
+/// tests can drive the loop with mocked random-port outcomes without
 /// touching real sockets.
 pub fn spawn_ephemeral_rotator_with_binder<B: BindFn>(
     spec: RotationSpec,
@@ -196,35 +196,35 @@ pub fn spawn_ephemeral_rotator_with_binder<B: BindFn>(
 // ── Phase 5f Step 3 — full listener wiring ──────────────────────────
 
 /// Bundle of handles returned by [`wire_ephemeral_rotator`].  Caller
-/// owns these handles; dropping the shutdown sender или the swap_tx
-/// triggers the rotator + consumer tasks к exit cleanly.
+/// owns these handles; dropping the shutdown sender or the swap_tx
+/// triggers the rotator + consumer tasks to exit cleanly.
 #[derive(Debug)]
 pub struct EphemeralRotatorHandles {
     /// Join handle for the rotation-loop task.
     pub rotator: JoinHandle<()>,
-    /// Join handle for the consumer task что rebinds the listener
-    /// after each `RotationEvent::Rotated` и pushes it to the accept
-    /// loop через the swap channel.
+    /// Join handle for the consumer task that rebinds the listener
+    /// after each `RotationEvent::Rotated` and pushes it to the accept
+    /// loop through the swap channel.
     pub consumer: JoinHandle<()>,
-    /// Watch sender to signal shutdown.  Both tasks observe это
-    /// indirectly через the rotator's internal channel.
+    /// Watch sender to signal shutdown.  Both tasks observe this
+    /// indirectly through the rotator's internal channel.
     pub shutdown: watch::Sender<bool>,
 }
 
-/// Build + spawn the rotator AND the listener-rebind consumer для
+/// Build + spawn the rotator AND the listener-rebind consumer for
 /// one ephemeral listen entry.  Caller has already bound the initial
 /// listener separately; this helper drives subsequent rotations.
 ///
-/// Returns `Err` если the operator's config is malformed (invalid
+/// Returns `Err` if the operator's config is malformed (invalid
 /// duration spec, inverted port range, zero rotation interval) —
-/// caught up-front so spawn_listeners fails clearly при startup rather
-/// than silently dying на the first rotation tick.
+/// caught up-front so spawn_listeners fails clearly during startup rather
+/// than silently dying on the first rotation tick.
 ///
-/// Accepts the listener swap channel (`listener_swap_tx`) что the
+/// Accepts the listener swap channel (`listener_swap_tx`) that the
 /// accept-loop owns the receiver of.  On each rotation, the consumer
-/// task: parses the new URI, calls `registry.bind(new_uri)`, и pushes
+/// task: parses the new URI, calls `registry.bind(new_uri)`, and pushes
 /// the freshly-bound listener through swap_tx.  The accept loop drains
-/// и swaps к the new listener между accepts.
+/// and swaps to the new listener between accepts.
 #[allow(clippy::too_many_arguments)]
 pub fn wire_ephemeral_rotator(
     eph: &EphemeralConfig,
@@ -258,10 +258,10 @@ pub fn wire_ephemeral_rotator(
     )
     .map_err(|e| format!("spec invalid: {e}"))?;
 
-    // ── URI template для the broadcast payload ────────────────────
+    // ── URI template for the broadcast payload ────────────────────
     // Prefer the operator's `advertise` URI as the template when set
     // (so peers learn the externally-reachable address rather than
-    // the bind host).  When absent, fall back к the bind URI.
+    // the bind host).  When absent, fall back to the bind URI.
     let template_source = advertise_uri.cloned().unwrap_or_else(|| listen_uri.clone());
     let template_host = template_source
         .plaintext_host()
@@ -278,8 +278,8 @@ pub fn wire_ephemeral_rotator(
 
     // ── rotator + broadcast pipeline ───────────────────────────────
     // Bundle expiry matches the rotation interval × 4 — peers' caches
-    // stay valid past 4 full rotation cycles, so а receiver что misses
-    // (say) 3 consecutive migration notifies still has а usable URI
+    // stay valid past 4 full rotation cycles, so a receiver that misses
+    // (say) 3 consecutive migration notifies still has a usable URI
     // until the operator's next rotation.
     let new_expiry_offset = rotation.saturating_mul(4);
     let (rotator_handle, mut events_rx, shutdown_tx) = spawn_ephemeral_rotator(
@@ -291,7 +291,7 @@ pub fn wire_ephemeral_rotator(
         session_tx_registry,
     );
 
-    // ── consumer task: rebind + push к accept loop ────────────────
+    // ── consumer task: rebind + push to accept loop ────────────────
     let template_for_rebind = template_source;
     let host_for_rebind = template_host;
     let listen_id = listen_id_for_log;
@@ -372,7 +372,7 @@ mod tests {
     use veil_transport::error::TransportError;
 
     /// Scripted binder used by the wire-level test below — returns one
-    /// port в order then errors thereafter.
+    /// port in order then errors thereafter.
     struct ScriptedBinder {
         ports: Arc<StdMutex<Vec<u16>>>,
         calls: Arc<AtomicU32>,
@@ -411,14 +411,14 @@ mod tests {
     #[tokio::test]
     async fn broadcaster_writes_signed_migration_notify_to_registered_peer() {
         // Identity setup — caller passes ownership of the SigningKey,
-        // but we keep а duplicate-via-from_bytes so the test can verify
+        // but we keep a duplicate-via-from_bytes so the test can verify
         // the sig against the matching pubkey.
         let sk_bytes = [0xA5u8; 32];
         let signing_key = SigningKey::from_bytes(&sk_bytes);
         let verifying_pk = signing_key.verifying_key().to_bytes();
         let local_node_id = *blake3::hash(&verifying_pk).as_bytes();
 
-        // Build а live SessionTxRegistry + register one fake peer so we
+        // Build a live SessionTxRegistry + register one fake peer so we
         // can observe the broadcast.
         let registry: Arc<RwLock<SessionTxRegistry>> =
             Arc::new(RwLock::new(SessionTxRegistry::with_capacity(4)));
@@ -467,7 +467,7 @@ mod tests {
         }
 
         // The broadcaster ran inside the same tick — the peer's
-        // outbox должно already carry а PriorityFrame.
+        // outbox must already carry a PriorityFrame.
         let frame = tokio::time::timeout(Duration::from_secs(2), peer_rx.recv())
             .await
             .expect("peer_rx timeout")
@@ -547,7 +547,7 @@ mod tests {
         }
 
         // Peer must NOT have received any frame — the broadcaster is
-        // only invoked после а successful bind.
+        // only invoked after a successful bind.
         assert!(
             peer_rx.try_recv().is_err(),
             "broadcast must not fire when bind fails",
@@ -559,8 +559,8 @@ mod tests {
 
     // ── wire_ephemeral_rotator error paths ──────────────────────────
 
-    /// Helper: build а listen URI и EphemeralConfig for the validation
-    /// tests.  Uses obfs4-tcp которое supports `with_host_port` (per
+    /// Helper: build a listen URI and EphemeralConfig for the validation
+    /// tests.  Uses obfs4-tcp which supports `with_host_port` (per
     /// `crates/veil-transport/src/uri.rs::with_host_port`).
     #[allow(clippy::type_complexity)] // test-fixture tuple
     fn mock_inputs(

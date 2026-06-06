@@ -35,13 +35,13 @@ struct BroadcastSeenSet {
     entries: HashMap<[u8; 16], Instant>,
 }
 
-/// typed TTL. Migrated из `BROADCAST_SEEN_TTL_SECS: u64`
-/// к `Ttl`-typed constant к prevent accidental seconds/millis mix-ups
+/// typed TTL. Migrated from `BROADCAST_SEEN_TTL_SECS: u64`
+/// to `Ttl`-typed constant to prevent accidental seconds/millis mix-ups
 /// at consumer sites (the duplicate check below previously had two
 /// separate `Duration::from_secs(BROADCAST_SEEN_TTL_SECS)` constructions
-/// — easy к get the unit wrong on either, та же exposure для new
+/// — easy to get the unit wrong on either, the same exposure for new
 /// consumers added later). Now: single `BROADCAST_SEEN_TTL` constant
-/// callers use `.as_duration` to interop с `Duration` arithmetic.
+/// callers use `.as_duration` to interop with `Duration` arithmetic.
 const BROADCAST_SEEN_TTL: veil_util::Ttl = veil_util::Ttl::from_secs(10);
 /// bumped from 4096 → 65_536. At the
 /// stated 80K pkt/s envelope the previous cap collapsed the
@@ -282,9 +282,9 @@ impl MeshForwarder {
     }
 }
 
-// cleanup: `forward_result_to_ack_status` removed — pub fn с
+// cleanup: `forward_result_to_ack_status` removed — pub fn with
 // zero callers workspace-wide. Mesh ack-byte build now happens inline at the
-// callers that emit ack frames. Re-introduce из git history if а new mesh-ack
+// callers that emit ack frames. Re-introduce from git history if a new mesh-ack
 // emitter shows up.
 
 #[cfg(test)]

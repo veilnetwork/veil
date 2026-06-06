@@ -779,25 +779,25 @@ mod tests {
     // 1000-node variant (402.2) explicitly requires `ulimit -n 16384`.
 
     /// 30-node random topology (p ≈ 0.20, avg-degree ~6)
-    /// converges within a wall-time bound. Validates что architecture
-    /// actually scales on realistic random-shape topology, in а size
+    /// converges within a wall-time bound. Validates that architecture
+    /// actually scales on realistic random-shape topology, in a size
     /// that completes meaningfully in DEBUG builds (existing scale_100
-    /// и scale_500 tests are release-build-only, take 30s-5min).
+    /// and scale_500 tests are release-build-only, take 30s-5min).
     ///
     /// **Why random vs ring:** ring is a degenerate-easy case (every
     /// node degree 2, structure fully predictable, gossip hops
     /// linearly). Random topology stresses real Kademlia bucket-fill
-    /// PEX walks, route-gossip convergence в patterns closer to
+    /// PEX walks, route-gossip convergence in patterns closer to
     /// what real-world nodes see post-bootstrap.
     ///
     /// **Why N=30 specifically:** large enough that O(N²) gossip-flood
     /// regression becomes wall-clock visible (~9× more work than
-    /// N=10 baseline) but small enough что debug-build crypto-
+    /// N=10 baseline) but small enough that debug-build crypto-
     /// overhead doesn't dominate. Tried N=100 first — debug-build
     /// timed out (handshake-storm overhead too high in non-`--release`
-    /// builds). N=500/1000 random-topology variants belong в a
+    /// builds). N=500/1000 random-topology variants belong in a
     /// dedicated release-only slice; this one fills the gap between
-    /// existing N=20 и release-only
+    /// existing N=20 and release-only
     /// scale_* tests.
     ///
     /// **Bounds:** wait_sessions(1) per node within 30s timeout (each
@@ -841,7 +841,7 @@ mod tests {
                 "random-topology n=30 — node {i} did not reach \
                  ≥1 session within 30s.  Wire-up took {:?}; convergence \
                  elapsed so far: {:?}.  This bound trips on O(N²) gossip \
-                 regression — investigate route-announce flooding или \
+                 regression — investigate route-announce flooding or \
                  RouteSeenSet eviction policy.",
                 wire_elapsed,
                 convergence_start.elapsed()
@@ -3112,25 +3112,25 @@ mod tests {
     // ── 485.1 ID-grinding: prefix-matched sybils still bounded ───────────────
     //
     // The vanilla 485.1.b assumes sybils have random node_ids, so they
-    // tend to land in а target's far buckets (high XOR distance →
-    // less-trafficked bucket slots). А real attacker mines keypairs
-    // until the derived node_id shares а leading prefix с the
-    // victim's id, putting sybils close in keyspace и therefore
-    // competing для slots в the victim's CLOSEST bucket (the one
+    // tend to land in a target's far buckets (high XOR distance →
+    // less-trafficked bucket slots). A real attacker mines keypairs
+    // until the derived node_id shares a leading prefix with the
+    // victim's id, putting sybils close in keyspace and therefore
+    // competing for slots in the victim's CLOSEST bucket (the one
     // their lookups hit first).
     //
     // This scenario validates that the eclipse bound holds anyway:
-    // even с prefix-matched sybils, Kademlia bucket-eviction policy
+    // even with prefix-matched sybils, Kademlia bucket-eviction policy
     // does NOT trivially over-admit them.  Grinds 8 bits per sybil
-    // — 256 expected keypair draws per sybil, completes в < 100 ms
-    // on а modern machine.
+    // — 256 expected keypair draws per sybil, completes in < 100 ms
+    // on a modern machine.
     //
-    // Bound: < 30 % sybil contacts на the target's routing table,
+    // Bound: < 30 % sybil contacts on the target's routing table,
     // matching the 485.1.b spec gate.  Tighter than the floor (< 50 %)
-    // because we ара exploring the SAME population density (2/10 = 20 %)
+    // because we are exploring the SAME population density (2/10 = 20 %)
     // as the spec test, not the worst case.
     //
-    // Re-open trigger из TASKS.md: "Kademlia bucket-acceptance
+    // Re-open trigger from TASKS.md: "Kademlia bucket-acceptance
     // regression observed in production OR new attack class published
     // showing prefix-grinding succeeds against current routing-table
     // shape" — this scenario regression-protects that gate.
@@ -3143,34 +3143,34 @@ mod tests {
         let target_idx = 0;
         // Prefix bits to grind sybil node_ids against the target.
         // 4 bits ≈ 16 expected draws per sybil (microseconds total).
-        // Lower than the spec assumes а real attacker would aim for
-        // но keeps the test fast и still concentrates 10× more sybil
-        // density в the target's closest bucket vs random sybils.
+        // Lower than the spec assumes a real attacker would aim for
+        // but keeps the test fast and still concentrates 10× more sybil
+        // density in the target's closest bucket vs random sybils.
         const GRIND_BITS: u32 = 4;
 
-        // Stage 0: pre-generate а target keypair via the standard
-        // create_identity path so we can hand its node_id к the
+        // Stage 0: pre-generate a target keypair via the standard
+        // create_identity path so we can hand its node_id to the
         // sybil-grind config BEFORE the network builds. SimNetwork
         // builds nodes serially, so even an "honest-first" build
         // order doesn't help — we need the target's id ahead of time.
         //
         // The cheapest path: build target first solo, capture its id,
-        // then tear it down и rebuild а full network where node 0
-        // gets restored to the same id и sybils ара grind-pinned к
-        // that prefix.  Easier: build а full network where target is
+        // then tear it down and rebuild a full network where node 0
+        // gets restored to the same id and sybils are grind-pinned to
+        // that prefix.  Easier: build a full network where target is
         // node 0 (its id is whatever generation picks), capture it,
-        // then если no sybils are grind-matched discard the network
-        // и retry с the captured prefix — but that's wasteful.
+        // then if no sybils are grind-matched discard the network
+        // and retry with the captured prefix — but that's wasteful.
         //
-        // Simplest correct approach: build the network с а random
-        // target node_id first, then capture, then build а SECOND
-        // network where node 0 carries а keypair grinded к the
-        // recorded id и sybils ара grinded к match.  The "second
-        // network" wastes а PoW mine но keeps the scenario self-
+        // Simplest correct approach: build the network with a random
+        // target node_id first, then capture, then build a SECOND
+        // network where node 0 carries a keypair grinded to the
+        // recorded id and sybils are grinded to match.  The "second
+        // network" wastes a PoW mine but keeps the scenario self-
         // contained.
         //
-        // Even simpler: just grind ALL OF THE NODES к share а common
-        // 8-bit prefix.  Target node_id will then share its prefix с
+        // Even simpler: just grind ALL OF THE NODES to share a common
+        // 8-bit prefix.  Target node_id will then share its prefix with
         // sybils by construction.  Avoids the multi-build dance.
         //
         // Pick an arbitrary prefix:
@@ -3223,9 +3223,9 @@ mod tests {
             (0..honest_count).map(|i| net.node(i).node_id()).collect();
 
         // Stage 2 — sybil flood: every sybil dials the target.  Sybils'
-        // node_ids share the SAME 8-bit prefix as the target по
-        // construction — they ара now "close" в Kademlia keyspace,
-        // landing in the same bucket the target uses для its closest
+        // node_ids share the SAME 8-bit prefix as the target by
+        // construction — they are now "close" in Kademlia keyspace,
+        // landing in the same bucket the target uses for its closest
         // lookups.
         for s in honest_count..total {
             let _ = net.connect(target_idx, s).await;
@@ -3252,8 +3252,8 @@ mod tests {
         assert!(
             sybil_fraction < ECLIPSE_BOUND,
             ".1d: prefix-grinded sybils eclipsed target — \
-             {sybil_contacts}/{total_contacts} contacts ара sybils \
-             ({:.1} %); bound is < {:.0} %.  This is а .1d regression \
+             {sybil_contacts}/{total_contacts} contacts are sybils \
+             ({:.1} %); bound is < {:.0} %.  This is a .1d regression \
              — Kademlia bucket-acceptance under prefix-matched ID grinding \
              should not exceed the spec eclipse cap.",
             sybil_fraction * 100.0,
@@ -3544,18 +3544,18 @@ mod tests {
     }
 
     /// `resolve_identity_verified` follows a freshly-injected
-    /// `MigrationCert` chain end-to-end через the production runtime
+    /// `MigrationCert` chain end-to-end through the production runtime
     /// path (chain-walk + non-downgrade ranking + cycle detection).
     ///
     /// Wire-up: spin up a single sim node only for the runtime
     /// infrastructure (DHT shard + resolver). Mint TWO synthetic
-    /// identities offline (Ed25519 OLD + hybrid NEW, each с known
+    /// identities offline (Ed25519 OLD + hybrid NEW, each with known
     /// fixed seeds), inject both `IdentityDocument`s + a signed
     /// `MigrationCert` into node-0's local DHT shard via
     /// `dht_put_local`, then call `resolve_identity_verified`
-    /// для the OLD node_id и assert it surfaces the NEW one.
+    /// for the OLD node_id and assert it surfaces the NEW one.
     ///
-    /// Three sub-cases bundled into one #[tokio::test] к keep total
+    /// Three sub-cases bundled into one #[tokio::test] to keep total
     /// runtime down (each SimNetwork::builder.build takes seconds):
     /// A) baseline — no cert ⇒ steady-state OLD returned
     /// B) chain-follow — valid cert ⇒ NEW returned
@@ -3575,7 +3575,7 @@ mod tests {
 
         // Build a deterministic Ed25519 identity from `[seed; 32]`.
         // Returns (doc, master_sk_b64, master_pk_b64) so the caller
-        // can sign migration certs со старого master.
+        // can sign migration certs with the old master.
         fn build_test_ed25519_identity(
             master_seed: u8,
             sub_seed: u8,
@@ -3641,7 +3641,7 @@ mod tests {
             .unwrap_or(0);
         let valid_until = now.saturating_add(7 * 86_400);
 
-        // Mint OLD (alice) и NEW (alice2) identities.
+        // Mint OLD (alice) and NEW (alice2) identities.
         let (alice_doc, alice_pk_b64, alice_sk_b64) =
             build_test_ed25519_identity(0xA1, 0xA2, now, valid_until);
         let (alice2_doc, alice2_pk_b64, alice2_sk_b64) =
@@ -3655,8 +3655,8 @@ mod tests {
 
         // Inject both docs into node-0's local DHT shard. The
         // resolver's `dht_get_replicated` consults the local store
-        // first, so локальный dht_put_local is enough к exercise
-        // the chain-walk (no need для cross-peer replication).
+        // first, so a local dht_put_local is enough to exercise
+        // the chain-walk (no need for cross-peer replication).
         net.node(0)
             .runtime
             .dht_put_local(alice_doc_key, alice_doc.encode());
@@ -3702,7 +3702,7 @@ mod tests {
             .expect("chain-follow resolve must succeed");
         assert_eq!(
             migrated.node_id, alice2_node_id,
-            "case B: cert published ⇒ resolver follows chain к NEW"
+            "case B: cert published ⇒ resolver follows chain to NEW"
         );
 
         // ── Case C: cycle B→A added → MigrationChainCycle surfaces ──
@@ -5251,15 +5251,15 @@ mod tests {
     ///
     /// Flow:
     /// 1. Receiver registers as rendezvous-publisher (ad gets signed +
-    /// stored to local DHT). Receiver also opens a session к the
+    /// stored to local DHT). Receiver also opens a session to the
     /// rendezvous and sends `RegisterRendezvous` so the rendezvous
     /// knows where to forward Introduce frames addressed to the
     /// auth_cookie.
     /// 2. Sender fetches the ad (in this test, mirrored OOB).
     /// 3. Sender invokes `send_via_rendezvous(ad, app_id, endpoint
-    /// src_app, payload, hop_count=3)` — payload sealed к
-    /// receiver's x25519_pk, wrapped в IntroducePayload, onion-
-    /// encrypted с rendezvous-node_id as Final hop.
+    /// src_app, payload, hop_count=3)` — payload sealed to
+    /// receiver's x25519_pk, wrapped in IntroducePayload, onion-
+    /// encrypted with rendezvous-node_id as Final hop.
     /// 4. Onion peeled at relay1 + relay2, delivered to rendezvous.
     /// 5. Rendezvous decodes IntroducePayload, looks up auth_cookie →
     /// receiver's session, forwards `ForwardIntroduce` over OVL1.
@@ -5268,8 +5268,8 @@ mod tests {
     /// delivers to bound app endpoint.
     ///
     /// Verifies:
-    /// * Receiver-IP NEVER flows к sender (sender only knows N3 + cookie).
-    /// * Rendezvous can NOT read the payload (sealed к receiver's pk).
+    /// * Receiver-IP NEVER flows to sender (sender only knows N3 + cookie).
+    /// * Rendezvous can NOT read the payload (sealed to receiver's pk).
     /// * Payload bytes round-trip exactly.
     #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5318,14 +5318,14 @@ mod tests {
 
         // Step 1b: receiver tells the rendezvous "forward to me on
         // this auth_cookie". Sends `RelayChainMsg::RegisterRendezvous`
-        // over the established OVL1 session к N3.
+        // over the established OVL1 session to N3.
         net.node(4)
             .runtime
             .register_with_rendezvous(rendezvous_node_id.into(), auth_cookie);
         // Tiny pause so the register frame traverses + dispatcher
         // handler inserts into the rendezvous registry before the
         // sender's Introduce arrives (which would otherwise silent-drop
-        // на cookie-not-found).
+        // on cookie-not-found).
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Step 1c: also publish each relay's directory entry so
@@ -5420,7 +5420,7 @@ mod tests {
     /// 3. Call `A.force_reconnect_all_peers` — emulates IPC
     /// `network_changed` event handler.
     /// 4. Immediately verify A's session table dropped to zero.
-    /// 5. Wait up к 5 s for the outbound-connector to retry and
+    /// 5. Wait up to 5 s for the outbound-connector to retry and
     /// re-establish — should be FAST because it skipped the 30 s
     /// sleep via `force_reconnect_notify`.
     /// 6. Verify session re-established within the budget.

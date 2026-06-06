@@ -35,7 +35,7 @@ pub mod identity_proof;
 /// Per-identity instance registry.
 pub mod instance_registry;
 /// In-band introducer wire-frame (Epic 481.3): owner-signed vouching record
-/// что lets node A attest к the validity of node B for higher-layer trust
+/// that lets node A attest to the validity of node B for higher-layer trust
 /// signals (mass-onboarding, sponsored mailbox access, etc.).
 pub mod introducer;
 /// Per-instance ML-KEM key certificate.

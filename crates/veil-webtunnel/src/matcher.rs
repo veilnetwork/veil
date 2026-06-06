@@ -1,16 +1,16 @@
-//! Path + auth-header matcher для webtunnel secret-mode activation.
+//! Path + auth-header matcher for webtunnel secret-mode activation.
 //!
 //! Used by Phase 5b's HTTP router: incoming request → ask matcher
-//! "is this а tunnel-mode request?" → if yes, upgrade к WebSocket;
-//! if no, pass к decoy provider.
+//! "is this a tunnel-mode request?" → if yes, upgrade to WebSocket;
+//! if no, pass to decoy provider.
 //!
 //! ## Constant-time comparison
 //!
-//! Both path и auth header are compared с [`subtle::ConstantTimeEq`]
-//! to prevent timing-side-channel attacks що could otherwise reveal
-//! the secret path byte-by-byte.  An attacker що measures
+//! Both path and auth header are compared with [`subtle::ConstantTimeEq`]
+//! to prevent timing-side-channel attacks that could otherwise reveal
+//! the secret path byte-by-byte.  An attacker that measures
 //! response-time-by-prefix would not learn anything about the secret
-//! since the compare runs в constant time regardless of where the
+//! since the compare runs in constant time regardless of where the
 //! mismatch occurs.
 
 use subtle::ConstantTimeEq;
@@ -19,26 +19,26 @@ use subtle::ConstantTimeEq;
 /// credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchResult {
-    /// Path и auth (if configured) both verified — caller should
-    /// proceed к WebSocket upgrade.
+    /// Path and auth (if configured) both verified — caller should
+    /// proceed to WebSocket upgrade.
     TunnelMode,
     /// Path mismatch or auth mismatch — caller should serve decoy
-    /// content as а regular HTTPS site.
+    /// content as a regular HTTPS site.
     Decoy,
 }
 
 /// Tunnel-mode credential matcher.
 ///
 /// Construction:
-/// - `secret_path` — path string що activates tunnel mode (е.g.
+/// - `secret_path` — path string that activates tunnel mode (e.g.
 ///   `"/_t/n3xK9...32-random-chars"`).  Empty string disables matching.
 /// - `auth_header_name` + `auth_token` — optional secondary check.
 ///   When set, the incoming request must carry `auth_header_name: auth_token`
-///   in addition к the path match.  `None` for path-only mode.
+///   in addition to the path match.  `None` for path-only mode.
 ///
-/// Realism: even с а short secret_path, the auth-header check raises
+/// Realism: even with a short secret_path, the auth-header check raises
 /// the bar against bulk-path-fuzzing.  Recommended: 32+ random bytes
-/// в the path + 32 bytes в the auth token.
+/// in the path + 32 bytes in the auth token.
 pub struct SecretMatcher {
     secret_path: Vec<u8>,
     auth_header_name: Option<String>,
@@ -46,7 +46,7 @@ pub struct SecretMatcher {
 }
 
 impl SecretMatcher {
-    /// Path-only matcher.  `secret_path` must start с `/`.
+    /// Path-only matcher.  `secret_path` must start with `/`.
     pub fn path_only(secret_path: impl Into<String>) -> Self {
         Self {
             secret_path: secret_path.into().into_bytes(),
@@ -72,10 +72,10 @@ impl SecretMatcher {
     /// `TunnelMode` only when all configured checks pass; `Decoy`
     /// otherwise.  Constant-time on the byte compares.
     ///
-    /// `path` is the request path (без host).  `auth_header_value` is
+    /// `path` is the request path (without host).  `auth_header_value` is
     /// the bytes of the configured auth-header value if the request
-    /// carries it, или `None`.  Caller (Phase 5b HTTP router) extracts
-    /// it от Hyper's `Request::headers().get(name)` before invoking.
+    /// carries it, or `None`.  Caller (Phase 5b HTTP router) extracts
+    /// it from Hyper's `Request::headers().get(name)` before invoking.
     pub fn check(&self, path: &str, auth_header_value: Option<&[u8]>) -> MatchResult {
         // Path check: must match exactly.  When secret_path is empty
         // tunnel mode is disabled (matcher never returns TunnelMode).
@@ -102,7 +102,7 @@ impl SecretMatcher {
     }
 
     /// Name of the auth header this matcher expects, if configured.
-    /// Phase 5b's HTTP router uses this to know which header к extract
+    /// Phase 5b's HTTP router uses this to know which header to extract
     /// before calling [`check`](Self::check).
     pub fn auth_header_name(&self) -> Option<&str> {
         self.auth_header_name.as_deref()
@@ -115,7 +115,7 @@ impl SecretMatcher {
 fn ct_eq_with_length_check(a: &[u8], b: &[u8]) -> bool {
     // Compare lengths in constant-time then content in constant-time.
     // If lengths differ, the content compare is meaningless but we run
-    // it anyway against а padded slice к keep timing uniform.
+    // it anyway against a padded slice to keep timing uniform.
     let len_eq = (a.len() as u64).ct_eq(&(b.len() as u64));
     let n = a.len().min(b.len());
     let content_eq = a[..n].ct_eq(&b[..n]);
@@ -194,8 +194,8 @@ mod tests {
         assert!(!ct_eq_with_length_check(b"", b"x"));
     }
 
-    /// Realism: even с paths що share а long prefix, the matcher must
-    /// decoy.  Tests against а prefix attack где an adversary що knows
+    /// Realism: even with paths that share a long prefix, the matcher must
+    /// decoy.  Tests against a prefix attack where an adversary that knows
     /// part of the secret could otherwise leak more byte-by-byte.
     #[test]
     fn long_shared_prefix_still_rejected() {

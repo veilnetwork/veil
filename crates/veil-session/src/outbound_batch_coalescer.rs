@@ -1,7 +1,7 @@
 //! Outbound priority-queue drain coalescer.  SessionRunner
 //! decomposition slice 30 (architecture backlog) — extracts the
 //! `last_drain_ts` Instant + the 12-line coalesce-deadline compute
-//! що previously lived inline в `run()`.
+//! that previously lived inline in `run()`.
 //!
 //! ## Wire contract
 //!
@@ -15,13 +15,13 @@
 //! 3. The queue-head priority is `BULK` (2) or `BACKGROUND` (3) —
 //!    INTERACTIVE / REALTIME frames bypass coalescing.
 //!
-//! When deferred, the runner skips the drain loop и proceeds к the
+//! When deferred, the runner skips the drain loop and proceeds to the
 //! next select tick.  Frames accumulate in the priority queue until
-//! the window elapses или а higher-priority frame arrives at the head.
+//! the window elapses or a higher-priority frame arrives at the head.
 //!
-//! `last_drain_ts` is stamped **only after а pass що actually emitted
+//! `last_drain_ts` is stamped **only after a pass that actually emitted
 //! ≥ 1 frame** — doing it unconditionally would let the deadline creep
-//! forward на no-op iterations, defeating the caller's intended delay.
+//! forward on no-op iterations, defeating the caller's intended delay.
 //!
 //! ## Why extract
 //!
@@ -32,9 +32,9 @@
 //! * **Testability**: pure compute, no async, no I/O.  Trivial unit
 //!   tests verify the four-condition truth table + the "no-stamp-on-
 //!   empty-pass" rule.
-//! * **Search-greppability**: `last_drain_ts` was а bare `tokio::time::Instant`
-//!   in `run()`; now а typed `OutboundBatchCoalescer` field surfaces в
-//!   signatures и method ownership.
+//! * **Search-greppability**: `last_drain_ts` was a bare `tokio::time::Instant`
+//!   in `run()`; now a typed `OutboundBatchCoalescer` field surfaces in
+//!   signatures and method ownership.
 
 use std::time::Duration;
 
@@ -44,16 +44,16 @@ use tokio::time::Instant;
 /// timestamp + provides the "should we defer this drain pass?" check.
 #[derive(Debug)]
 pub struct OutboundBatchCoalescer {
-    /// Wall-clock instant of the last drain pass що actually emitted
+    /// Wall-clock instant of the last drain pass that actually emitted
     /// ≥ 1 frame.  Stays put on no-op iterations (rationale: see
     /// module-doc "creep-forward" warning).
     last_drain_ts: Instant,
 }
 
 impl OutboundBatchCoalescer {
-    /// New coalescer initialised к the current instant.  First drain
+    /// New coalescer initialised to the current instant.  First drain
     /// pass may proceed immediately if the queue head qualifies
-    /// (window has "already elapsed since session start" в effect —
+    /// (window has "already elapsed since session start" in effect —
     /// no correctness risk, coalescing only matters across multiple
     /// bursts).
     pub fn new(now: Instant) -> Self {
@@ -68,9 +68,9 @@ impl OutboundBatchCoalescer {
     /// * `now` — current wall-clock instant.
     /// * `window` — output of [`super::runner::current_outbound_batch_window`]
     ///   given the current battery level.  `None` disables coalescing
-    ///   entirely (operator не opted in, или battery is above the
+    ///   entirely (operator did not opt in, or battery is above the
     ///   low-battery threshold).
-    /// * `head_priority` — top-of-queue priority byte, или None if
+    /// * `head_priority` — top-of-queue priority byte, or None if
     ///   the queue is empty.
     pub fn is_coalescing(
         &self,
@@ -78,7 +78,7 @@ impl OutboundBatchCoalescer {
         window: Option<Duration>,
         head_priority: Option<u8>,
     ) -> bool {
-        // Coalescing only applies к BULK (2) и BACKGROUND (3) head
+        // Coalescing only applies to BULK (2) and BACKGROUND (3) head
         // priorities.  Anything higher (INTERACTIVE / REALTIME) bypasses.
         let head_eligible = matches!(
             head_priority,
@@ -90,8 +90,8 @@ impl OutboundBatchCoalescer {
         }
     }
 
-    /// Stamp the latest drain time.  Caller invokes after а drain
-    /// pass що actually emitted ≥ 1 frame.  No-op passes (queue
+    /// Stamp the latest drain time.  Caller invokes after a drain
+    /// pass that actually emitted ≥ 1 frame.  No-op passes (queue
     /// empty, all frames dropped on bandwidth-cap, etc.) must NOT
     /// call this — see module-doc rationale.
     pub fn record_drain(&mut self, now: Instant) {
@@ -140,7 +140,7 @@ mod tests {
         let now = Instant::now();
         let c = OutboundBatchCoalescer::new(now);
         let window = Some(Duration::from_millis(200));
-        // INTERACTIVE и REALTIME bypass даже с window set.
+        // INTERACTIVE and REALTIME bypass even with window set.
         assert!(!c.is_coalescing(now, window, Some(priority::INTERACTIVE)));
         assert!(!c.is_coalescing(now, window, Some(priority::REALTIME)));
     }
@@ -189,7 +189,7 @@ mod tests {
         assert!(c.is_coalescing(t2, window, Some(priority::BULK)));
     }
 
-    /// Bulk frames arriving в bursts within а 200ms window should
+    /// Bulk frames arriving in bursts within a 200ms window should
     /// all defer until the window elapses, then drain together.
     /// Models the production "low-battery + chat-burst" scenario.
     #[test]

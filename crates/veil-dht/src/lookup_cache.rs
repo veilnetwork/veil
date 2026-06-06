@@ -1,6 +1,6 @@
 //! Per-node bounded LRU cache for FIND_NODE results.
 //!
-//! Critical для interactive UX на trillion scale: a cold iterative
+//! Critical for interactive UX on trillion scale: a cold iterative
 //! Kademlia lookup is O(log N) round-trips × per-hop RTT. At
 //! N = 10¹² with ~100 ms per hop, that's ~4 seconds. Repeated
 //! lookups for the SAME target — common for popular relays via
@@ -156,11 +156,11 @@ impl LookupCache {
         // Audit batch 2026-05-25 phase M: unify TTL comparison
         // operator with `get()` (line 95).  Previously `get()` used
         // strict `>` (expired iff `age > ttl`) while `prune_expired()`
-        // used `<=` (keep iff `age <= ttl`), которое equivalent к
+        // used `<=` (keep iff `age <= ttl`), which is equivalent to
         // `prune iff age > ttl` only on integer time — but `Instant`
         // semantics treat `age == ttl` as "exactly at boundary",
-        // и the two operators диверг at that exact nanosecond.
-        // Не security issue, но в-debug-able if ever observed.
+        // and the two operators diverge at that exact nanosecond.
+        // Not security issue, but in-debug-able if ever observed.
         self.entries
             .retain(|_, e| now.duration_since(e.inserted_at) < ttl);
     }

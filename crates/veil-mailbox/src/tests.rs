@@ -105,9 +105,9 @@ fn t1_4_p1_global_quota_evicts_oldest_first() {
     let r2 = [2u8; 32];
 
     // audit: eviction protects blobs younger than
-    // MIN_EVICTION_AGE_SECS (3600 s). Time gaps below need к exceed
-    // this threshold для legitimate eviction к happen — otherwise the
-    // put is rejected с QuotaGlobalExceeded.
+    // MIN_EVICTION_AGE_SECS (3600 s). Time gaps below need to exceed
+    // this threshold for legitimate eviction to happen — otherwise the
+    // put is rejected with QuotaGlobalExceeded.
     // t=0: r1 puts 80 bytes (id=A).
     clk.store(0, Ordering::SeqCst);
     mb.put(r1, [b'A'; 32], [9u8; 32], vec![0u8; 80]).unwrap();
@@ -136,7 +136,7 @@ fn t1_4_p1_global_quota_evicts_oldest_first() {
 
 /// audit regression test: random-receiver-flood attack
 /// must NOT evict legitimate-but-fresh offline messages. Pre-fix, an
-/// attacker could push the global quota over its cap и trigger
+/// attacker could push the global quota over its cap and trigger
 /// oldest-globally eviction, displacing data from honest receivers.
 #[test]
 fn phase650b_recent_blobs_protected_from_eviction_under_flood() {
@@ -153,13 +153,13 @@ fn phase650b_recent_blobs_protected_from_eviction_under_flood() {
     let honest_recv = [1u8; 32];
     let attacker_target = [2u8; 32];
 
-    // Honest receiver gets а fresh offline message at t=0.
+    // Honest receiver gets a fresh offline message at t=0.
     clk.store(0, Ordering::SeqCst);
     mb.put(honest_recv, [b'A'; 32], [9u8; 32], vec![0u8; 80])
         .unwrap();
 
-    // Attacker, after а small delay (well within MIN_EVICTION_AGE
-    // window), tries к flood: deposits to attacker_target until
+    // Attacker, after a small delay (well within MIN_EVICTION_AGE
+    // window), tries to flood: deposits to attacker_target until
     // global cap is hit.
     clk.store(60, Ordering::SeqCst); // 60 s — A is still fresh
     mb.put(attacker_target, [b'B'; 32], [99u8; 32], vec![0u8; 80])
@@ -411,7 +411,7 @@ fn t1_4_p1_fetch_filters_by_receiver() {
 
 // ── capability-token policy gate ─────────────────
 
-/// Mint а valid Ed25519 capability token for а freshly-derived receiver.
+/// Mint a valid Ed25519 capability token for a freshly-derived receiver.
 /// Returns `(receiver_id, encoded_token_bytes)` so the test can use
 /// the receiver_id as the PUT target.
 fn mint_test_token(valid_from: u64, valid_until: u64) -> ([u8; 32], Vec<u8>) {
@@ -447,7 +447,7 @@ fn phase650b_316_capability_required_rejects_tokenless_put() {
     };
     let (mb, _tmp, _clk) = fresh(cfg);
     // clock pinned at 1_700_000_000. Token must not matter for this test —
-    // we send а PUT с token=None и expect rejection.
+    // we send a PUT with token=None and expect rejection.
     let outcome = mb
         .put_with_capability([11u8; 32], [22u8; 32], [33u8; 32], b"blob".to_vec(), None)
         .unwrap();
@@ -591,7 +591,7 @@ fn phase650b_316_per_sender_quota_blocks_when_exceeded() {
     };
     let (mb, _tmp, _clk) = fresh(cfg);
     let sender = [0xABu8; 32];
-    // Two 60-byte puts от same sender → second exceeds 100 cap.
+    // Two 60-byte puts from same sender → second exceeds 100 cap.
     let r1 = mb.put([1u8; 32], [b'A'; 32], sender, vec![0; 60]).unwrap();
     assert!(matches!(r1, PutOutcome::Stored { .. }));
     let r2 = mb.put([2u8; 32], [b'B'; 32], sender, vec![0; 60]).unwrap();
@@ -633,7 +633,7 @@ fn phase650b_316_per_sender_quota_decremented_on_ack() {
 #[test]
 fn phase650b_316_per_sender_quota_default_disabled() {
     // Default config has quota_per_sender_bytes = u64::MAX → many puts
-    // от same sender go through unrestricted (modulo other quotas).
+    // from same sender go through unrestricted (modulo other quotas).
     let cfg = MailboxConfig {
         rate_limit_per_minute: 0,
         ..MailboxConfig::default()
@@ -653,7 +653,7 @@ fn phase650b_316_per_sender_quota_default_disabled() {
 
 #[test]
 fn phase650b_316_anon_pool_evicted_before_identified_under_global_pressure() {
-    // Setup: tight global quota, two pools. Mint а valid token для the
+    // Setup: tight global quota, two pools. Mint a valid token for the
     // identified sender; anonymous sender uses no token. Hit the global
     // cap; next put must displace the anon-pool entry first.
     use crate::capability::{
@@ -667,7 +667,7 @@ fn phase650b_316_anon_pool_evicted_before_identified_under_global_pressure() {
         ..MailboxConfig::default()
     };
     let (mb, _tmp, clk) = fresh(cfg);
-    // Use clock advance к get past MIN_EVICTION_AGE_SECS so eviction is allowed.
+    // Use clock advance to get past MIN_EVICTION_AGE_SECS so eviction is allowed.
     let mut seed = [0u8; 32];
     seed[0] = 0x33;
     let sk = SigningKey::from_bytes(&seed);
@@ -712,8 +712,8 @@ fn phase650b_316_anon_pool_evicted_before_identified_under_global_pressure() {
         std::sync::atomic::Ordering::SeqCst,
     );
 
-    // 4. Mint а fresh token for the new clock и put 100 more bytes (any class) — total 300
-    // exceeds 250 cap → eviction kicks в. Anon pool's [1u8;32]/'A' must
+    // 4. Mint a fresh token for the new clock and put 100 more bytes (any class) — total 300
+    // exceeds 250 cap → eviction kicks in. Anon pool's [1u8;32]/'A' must
     // be the victim, NOT the identified [receiver_id]/'B'.
     let r = mb
         .put_with_capability([3u8; 32], [b'C'; 32], [0xCCu8; 32], vec![0; 100], None)
@@ -738,8 +738,8 @@ fn phase650b_316_anon_pool_evicted_before_identified_under_global_pressure() {
 
 #[test]
 fn phase650b_316_identified_pool_evicted_when_anon_empty() {
-    // Same shape but no anon-class put — eviction falls back к identified
-    // pool when global pressure hits (slice-3 invariant: anon-first но
+    // Same shape but no anon-class put — eviction falls back to identified
+    // pool when global pressure hits (slice-3 invariant: anon-first but
     // not anon-only).
     let cfg = MailboxConfig {
         rate_limit_per_minute: 0,
@@ -747,7 +747,7 @@ fn phase650b_316_identified_pool_evicted_when_anon_empty() {
         ..MailboxConfig::default()
     };
     let (mb, _tmp, clk) = fresh(cfg);
-    // Two trusted in-process puts (`put` defaults к Identified pool).
+    // Two trusted in-process puts (`put` defaults to Identified pool).
     mb.put([1u8; 32], [b'A'; 32], [0xAAu8; 32], vec![0; 100])
         .unwrap();
     clk.store(
@@ -825,8 +825,8 @@ fn c13_fresh_anon_flood_falls_through_to_old_identified_victim() {
 #[test]
 fn phase650b_316_capability_required_uses_identified_pool() {
     // When `require_capability_token = true` is enforced, every accepted
-    // put has а verified token — все идут в Identified pool. Confirm
-    // by exhausting global quota и verifying eviction comes from
+    // put has a verified token — all go into Identified pool. Confirm
+    // by exhausting global quota and verifying eviction comes from
     // Identified (anon would be empty in this scenario).
     use crate::capability::{
         ALGO_ED25519, MailboxCapabilityToken, TOKEN_VERSION, signed_message_for,

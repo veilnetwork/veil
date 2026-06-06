@@ -22,9 +22,9 @@
   # Fail the entire run if ANY host fails phase-1 app_id harvesting.
   # Without this, ansible default behaviour (continue on per-host
   # error) silently aggregates an INCOMPLETE peer-list excluding the
-  # failed host's app_id, distributes it к the survivors, and they
-  # never learn how к send messages to the failed host.  Observed
-  # 2026-05-08 on b3: failed=1 в phase 1 → 7 healthy hosts had no
+  # failed host's app_id, distributes it to the survivors, and they
+  # never learn how to send messages to the failed host.  Observed
+  # 2026-05-08 on b3: failed=1 in phase 1 → 7 healthy hosts had no
   # b3 entry → b3 rx ≈ 0 (sends fine, receives nothing).  Re-running
   # the playbook with all hosts active fixes it, but the failure mode
   # is silent.  `any_errors_fatal: true` makes the whole run abort on
@@ -188,8 +188,8 @@
           Description=Veil testnet chat_node ({{ inventory_hostname }})
           After=veil.service
           # Phase 6.50.d cron #9: `Requires=` was previously used here,
-          # which causes chat-node к stop when veil stops но NOT
-          # к auto-restart when veil comes back.  After an emergency
+          # which causes chat-node to stop when veil stops but NOT
+          # to auto-restart when veil comes back.  After an emergency
           # veil restart (e.g. RSS-watchdog action) the chat-node stayed
           # silently inactive until manual intervention, masking what would
           # otherwise be testnet-load data.  `PartOf=` cascades restarts

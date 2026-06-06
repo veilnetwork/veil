@@ -54,12 +54,12 @@ pub const ALGO_FALCON512: u8 = 2;
 /// `master_pubkey` (32 ed + 897 falcon) and a `document_sig` produced by
 /// the hybrid sign function (64 ed + 2 length prefix + ~666 falcon).
 pub const ALGO_ED25519_FALCON512_HYBRID: u8 = 3;
-/// Ed25519 + Falcon-1024 hybrid algorithm byte (Этап 10).  Higher-PQ
+/// Ed25519 + Falcon-1024 hybrid algorithm byte (Phase 10).  Higher-PQ
 /// hybrid: IdentityDocument with `master_algo = ALGO_ED25519_FALCON1024_HYBRID`
-/// carries а 1825-byte `master_pubkey` (32 ed + 1793 falcon) and а
+/// carries a 1825-byte `master_pubkey` (32 ed + 1793 falcon) and a
 /// `document_sig` produced by the hybrid-1024 sign function (64 ed +
 /// 2 length prefix + ≤ 1462 falcon-1024).  Sovereign-identity creation
-/// flow is а future slice — for now, the wire byte и crypto primitive
+/// flow is a future slice — for now, the wire byte and crypto primitive
 /// are present so config-signing / general signature operations can
 /// adopt Falcon-1024 hybrid keys today.
 pub const ALGO_ED25519_FALCON1024_HYBRID: u8 = 4;

@@ -1,12 +1,12 @@
 ---
 # Revert the 24h-stress-soak rekey-threshold overrides in node.toml.
 #
-# Sometime around 2026-05-09 the `[session]` block was edited на 8
-# testnet hosts с lowered rekey thresholds (compresses weeks of
-# rekey pressure into hours). The comment in the config promised а
-# REVERT before 2026-05-10 09:30 UTC — но the date has passed и the
-# overrides are still в place, exposing the cluster к unnecessarily
-# frequent rekeys и a misleading view of rekey-storm behaviour under
+# Sometime around 2026-05-09 the `[session]` block was edited on 8
+# testnet hosts with lowered rekey thresholds (compresses weeks of
+# rekey pressure into hours). The comment in the config promised a
+# REVERT before 2026-05-10 09:30 UTC — but the date has passed and the
+# overrides are still in place, exposing the cluster to unnecessarily
+# frequent rekeys and a misleading view of rekey-storm behaviour under
 # normal traffic.
 #
 # Production defaults:
@@ -22,7 +22,7 @@
 - name: Revert stress-soak [session] overrides
   hosts: all
   become: true
-  serial: 1  # stagger restart so cluster keeps а quorum
+  serial: 1  # stagger restart so cluster keeps a quorum
   tasks:
     - name: Check if [session] block present
       ansible.builtin.shell:
@@ -30,10 +30,10 @@
       register: session_present
       changed_when: false
 
-    - name: Strip the stress-soak [session] block из node.toml (awk-based)
+    - name: Strip the stress-soak [session] block from node.toml (awk-based)
       # `replace` module regex couldn't span multi-line comment block
-      # between `[session]` и the first key.  awk approach matches TASKS.md
-      # recipe: skip everything от `[session]` line до the next blank line
+      # between `[session]` and the first key.  awk approach matches TASKS.md
+      # recipe: skip everything from `[session]` line to the next blank line
       # (inclusive). Idempotent — if no [session] block present, no-op.
       ansible.builtin.shell:
         executable: /bin/bash

@@ -152,10 +152,10 @@ fn discovery_pow_hash(
 
 // cleanup: Argon2id memory-hard PoW was
 // shipped but never wired — name-PoW migrated to the BLAKE3
-// `RESOLVE_POW_DOMAIN_TAG` pipeline и then removed document-level PoW
+// `RESOLVE_POW_DOMAIN_TAG` pipeline and then removed document-level PoW
 // entirely. `name_pow_hash_argon2` + `argon2_params` had zero callers; module
-// + argon2 crate dependency removed. Re-introduce из git history if memory-
-// hard name-PoW returns в the design.
+// + argon2 crate dependency removed. Re-introduce from git history if memory-
+// hard name-PoW returns to the design.
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

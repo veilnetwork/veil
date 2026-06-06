@@ -8,7 +8,7 @@
 //!
 //! # Why this crate exists
 //!
-//! Before extraction, `ConfigError` lived в
+//! Before extraction, `ConfigError` lived in
 //! `veilcore::cfg::error`. But `crypto` returns it
 //! (`InvalidKeyLength`, `SignatureVerificationFailed`, etc.) and
 //! depends on `cfg::Result`, creating a `cfg ↔ crypto` dependency
@@ -22,13 +22,13 @@
 //! Legacy. When the project was small everything error-related
 //! lived in `cfg`, hence `ConfigError`. The name stuck even as
 //! the enum grew to cover crypto / PoW / identity / ad-hoc CLI
-//! failures. A future rename к `VeilError` is on the table
+//! failures. A future rename to `VeilError` is on the table
 //! but would touch hundreds of call sites; preserved as-is for
 //! now via re-export shim from `cfg::error`.
 
 use thiserror::Error;
 
-/// Canonical error type для the Veil network (legacy name —
+/// Canonical error type for the Veil network (legacy name —
 /// covers config + crypto + ad-hoc command / identity / PoW
 /// failures). Wraps upstream errors (`std::io`, `toml`
 /// `serde_json`, `base64`) plus internal validation and command

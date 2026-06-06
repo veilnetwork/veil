@@ -2,26 +2,26 @@
 //!
 //! [`check_and_reserve_ip_slot`][] performs the atomic check-and-increment
 //! step at session accept time; [`IpSlotGuard`][] wraps the resulting slot
-//! в RAII so а future cancellation (async drop) between accept и
+//! in RAII so a future cancellation (async drop) between accept and
 //! `SessionGuard` construction cannot leak the counter.
 //!
 //! Two limits are enforced when the source IP is non-loopback:
 //!
-//! - `max_per_ip` — sessions from а single IP
-//! - `max_per_subnet` — sessions from а single /24 (IPv4) or /48 (IPv6)
-//!   prefix, к bound eclipse / flood attempts from а CIDR-block adversary
+//! - `max_per_ip` — sessions from a single IP
+//! - `max_per_subnet` — sessions from a single /24 (IPv4) or /48 (IPv6)
+//!   prefix, to bound eclipse / flood attempts from a CIDR-block adversary
 //!
 //! Loopback peers bypass both limits — sim/devnet topologies inevitably
-//! share `127.0.0.1` across all nodes и would trip the production cap at
+//! share `127.0.0.1` across all nodes and would trip the production cap at
 //! mesh size > 5.
 //!
 //! # Implementation note — O(1) subnet count
 //!
-//! Earlier versions kept а single `HashMap<IpAddr, usize>` и computed the
-//! subnet count by iterating ALL keys on every accept (O(N) under а lock,
-//! N = unique IPs). Under а scattered-IP flood the lock-held scan blocked
-//! all inbound accepts for the duration. The current design keeps а
-//! parallel `HashMap<SubnetKey, usize>` so subnet count is а direct lookup
+//! Earlier versions kept a single `HashMap<IpAddr, usize>` and computed the
+//! subnet count by iterating ALL keys on every accept (O(N) under a lock,
+//! N = unique IPs). Under a scattered-IP flood the lock-held scan blocked
+//! all inbound accepts for the duration. The current design keeps a
+//! parallel `HashMap<SubnetKey, usize>` so subnet count is a direct lookup
 //! (O(1)). The two maps update atomically under the same `Mutex`.
 
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ use crate::types::LinkId;
 
 use super::SessionRuntimeContext;
 
-/// /24 (IPv4) или /48 (IPv6) subnet prefix, used as а HashMap key для
+/// /24 (IPv4) or /48 (IPv6) subnet prefix, used as a HashMap key for
 /// per-subnet collision counting.
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub enum SubnetKey {
@@ -56,10 +56,10 @@ impl SubnetKey {
     }
 }
 
-/// Per-source-IP и per-subnet session-slot accounting table.
+/// Per-source-IP and per-subnet session-slot accounting table.
 ///
-/// Two maps live under а single `Mutex` so reserve / release are atomic
-/// across both dimensions. The per-subnet map is а direct lookup (O(1))
+/// Two maps live under a single `Mutex` so reserve / release are atomic
+/// across both dimensions. The per-subnet map is a direct lookup (O(1))
 /// rather than the earlier O(N) scan of all unique-IP keys.
 pub struct IpSlotTable {
     inner: Mutex<IpSlotInner>,
@@ -80,9 +80,9 @@ impl IpSlotTable {
         }
     }
 
-    /// Atomically check both per-IP и per-subnet caps и increment
+    /// Atomically check both per-IP and per-subnet caps and increment
     /// counters on success. Returns `Err` if either limit would be
-    /// breached; в that case no mutation occurs (caller's reject path
+    /// breached; in that case no mutation occurs (caller's reject path
     /// doesn't need cleanup). A cap value of `0` disables that check.
     fn reserve(
         &self,
@@ -107,8 +107,8 @@ impl IpSlotTable {
         Ok(())
     }
 
-    /// Release а previously-reserved slot. Decrements both per-IP и
-    /// per-subnet counters; removes а map entry when its count drops к
+    /// Release a previously-reserved slot. Decrements both per-IP and
+    /// per-subnet counters; removes a map entry when its count drops to
     /// zero. Defensive — does nothing on count=0 (matches pre-refactor).
     pub fn release(&self, ip: IpAddr) {
         let subnet = SubnetKey::from_ip(ip);
@@ -129,7 +129,7 @@ impl IpSlotTable {
         }
     }
 
-    /// Number of distinct source IPs currently held. Used by tests и
+    /// Number of distinct source IPs currently held. Used by tests and
     /// admin introspection. Not on the accept hot path.
     #[cfg(test)]
     pub fn ip_count(&self) -> usize {
@@ -140,9 +140,9 @@ impl IpSlotTable {
             .len()
     }
 
-    /// Reset both maps к empty. Used by [`NodeRuntime::stop_tasks`] when
+    /// Reset both maps to empty. Used by [`NodeRuntime::stop_tasks`] when
     /// all sessions have already been torn down — the per-IP / per-subnet
-    /// counters могли остаться stale from aborted runner tasks that didn't
+    /// counters could remain stale from aborted runner tasks that didn't
     /// run their RAII drop. Cheap O(1) — just `.clear()` on both maps.
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -167,12 +167,12 @@ pub enum ReserveError {
 /// [`check_and_reserve_ip_slot`][] succeeds; on drop (including async-
 /// future cancellation between awaits) the slot is decremented.  Call
 /// [`disarm`](IpSlotGuard::disarm) once `SessionGuard` adopts ownership
-/// к suppress the destructor decrement.
+/// to suppress the destructor decrement.
 ///
 /// Closes the async-cancellation leak where the legacy manual
 /// `decrement_ip_slot(...)` calls scattered across the error-return
-/// sites of `register_connection_session` could miss а decrement when
-/// the future was dropped между а reserve и а manual undo site.
+/// sites of `register_connection_session` could miss a decrement when
+/// the future was dropped between a reserve and a manual undo site.
 pub struct IpSlotGuard {
     ip: Option<IpAddr>,
     table: Arc<IpSlotTable>,
@@ -203,24 +203,24 @@ impl Drop for IpSlotGuard {
     }
 }
 
-/// Atomically enforce per-IP и per-/24-subnet session caps before
+/// Atomically enforce per-IP and per-/24-subnet session caps before
 /// handshake bytes are exchanged.
 ///
 /// The check-and-increment is one atomic operation under
 /// `runtime.sessions_per_ip`; any error path after this point must
-/// decrement (either через [`IpSlotTable::release`], [`IpSlotGuard`][]'s
-/// destructor, or `SessionGuard`'s).  Logs + returns а
+/// decrement (either through [`IpSlotTable::release`], [`IpSlotGuard`][]'s
+/// destructor, or `SessionGuard`'s).  Logs + returns a
 /// `NodeError::Handshake` on limit breach so the TCP socket is closed
-/// без sending data.
+/// without sending data.
 pub fn check_and_reserve_ip_slot(
     runtime: &SessionRuntimeContext,
     ip: IpAddr,
     link_id: LinkId,
 ) -> Result<()> {
-    // Auto-disable both limits для loopback peers.  На devnet/sim every
-    // node binds 127.0.0.1 и they all share the one IP bucket; the
+    // Auto-disable both limits for loopback peers.  On devnet/sim every
+    // node binds 127.0.0.1 and they all share the one IP bucket; the
     // production-facing limits trip instantly under any mesh size > 5.
-    // The check remains fully active для routable peers so eclipse /
+    // The check remains fully active for routable peers so eclipse /
     // flood attacks are still mitigated.
     if ip.is_loopback() {
         runtime
@@ -327,7 +327,7 @@ mod tests {
         let c = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0x0002, 0, 0, 0, 0, 1));
         t.reserve(a, 100, 2).unwrap();
         t.reserve(b, 100, 2).unwrap();
-        // Same /48 как a и b — rejected on subnet cap.
+        // Same /48 as a and b — rejected on subnet cap.
         let d = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0x0001, 0xeeee, 0, 0, 0, 3));
         assert!(matches!(
             t.reserve(d, 100, 2),
@@ -363,7 +363,7 @@ mod tests {
         t.reserve(a, 100, 1).unwrap();
         // per_subnet=1 already saturated — reject must not increment b's counters.
         let _ = t.reserve(b, 100, 1);
-        // ip_count still 1; if b had incremented и then rolled back manually,
+        // ip_count still 1; if b had incremented and then rolled back manually,
         // ip_count would be > 1.
         assert_eq!(t.ip_count(), 1);
     }

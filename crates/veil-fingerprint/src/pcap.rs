@@ -1,34 +1,34 @@
-//! PCAP-format ingest для `NGramModel`.
+//! PCAP-format ingest for `NGramModel`.
 //!
-//! Wraps the `pcap-parser` crate (pure-Rust, no libpcap C dep) к extract
-//! application-layer bytes от .pcap / .pcapng captures и feed them into
+//! Wraps the `pcap-parser` crate (pure-Rust, no libpcap C dep) to extract
+//! application-layer bytes from .pcap / .pcapng captures and feed them into
 //! the n-gram analyzer.  Strips Ethernet/Linux-cooked + IPv4/IPv6 + TCP/UDP
 //! overhead so the model only counts the actual encrypted payload bytes
-//! (matching what а DPI middlebox would profile).
+//! (matching what a DPI middlebox would profile).
 //!
 //! ## Operator workflow
 //!
 //! ```bash
-//! # Capture а sample.
+//! # Capture a sample.
 //! sudo tcpdump -i any -w veil-sample.pcap "port 5556 or port 8443" -G 600 -W 1
 //!
-//! # Pipe into а Rust analyzer using this module.
+//! # Pipe into a Rust analyzer using this module.
 //! cargo run --features pcap --example fp-compare -- \
 //!   veil-sample.pcap chrome-reference.pcap
 //! ```
 //!
 //! ## Limitations (deliberately scoped)
 //!
-//! * Supports linktypes **Ethernet** (1) и **Linux cooked v1** (113).
+//! * Supports linktypes **Ethernet** (1) and **Linux cooked v1** (113).
 //!   Other linktypes silently skip the frame.  Most operator captures use
 //!   one of these two.
 //! * IPv4 + IPv6 supported; IPv6 extension headers NOT decoded (rare in
 //!   practice for DPI-relevant flows; would silently skip).
 //! * TCP + UDP supported; SCTP/QUIC-over-UDP encoded payload counted as
-//!   "payload bytes" without further peeling (correct для n-gram purposes
-//!   since QUIC ciphertext is what а DPI sees).
-//! * Port filter is applied к **either** source-or-destination port —
-//!   so capturing а bidirectional flow needs no separate flag.
+//!   "payload bytes" without further peeling (correct for n-gram purposes
+//!   since QUIC ciphertext is what a DPI sees).
+//! * Port filter is applied to **either** source-or-destination port —
+//!   so capturing a bidirectional flow needs no separate flag.
 
 use std::io::Read;
 
@@ -53,9 +53,9 @@ impl<E: std::fmt::Debug> From<PcapError<E>> for PcapIngestError {
     }
 }
 
-/// Observe application-layer bytes от а pcap (.pcap or .pcapng) reader.
+/// Observe application-layer bytes from a pcap (.pcap or .pcapng) reader.
 ///
-/// `port_filter` keeps frames where either src или dst port matches.
+/// `port_filter` keeps frames where either src or dst port matches.
 /// `None` ingests every TCP/UDP frame.
 ///
 /// Returns the total byte count fed into the model.
@@ -103,8 +103,8 @@ fn process_block(
 ) {
     let (frame_bytes, frame_linktype) = match block {
         PcapBlockOwned::LegacyHeader(hdr) => {
-            // Legacy PCAP file header carries the linktype для всех
-            // following frames в the file.
+            // Legacy PCAP file header carries the linktype for all
+            // following frames in the file.
             *linktype = Some(hdr.network.0 as i32);
             return;
         }
@@ -132,7 +132,7 @@ const LINKTYPE_ETHERNET: i32 = 1;
 const LINKTYPE_LINUX_SLL: i32 = 113;
 
 /// Strip Ethernet/Linux-cooked + IPv4/v6 + TCP/UDP headers, returning
-/// the application-layer payload или None if the frame couldn't be
+/// the application-layer payload or None if the frame couldn't be
 /// fully decoded (truncated, unsupported transport, filter mismatch).
 fn strip_link_ip_transport<'a>(
     frame: &'a [u8],
@@ -193,7 +193,7 @@ fn strip_ipv4(packet: &[u8]) -> Option<(&[u8], u8)> {
     if version != 4 {
         return None;
     }
-    let ihl = (packet[0] & 0x0f) as usize * 4; // header length в bytes
+    let ihl = (packet[0] & 0x0f) as usize * 4; // header length in bytes
     if ihl < 20 || packet.len() < ihl {
         return None;
     }
@@ -211,7 +211,7 @@ fn strip_ipv6(packet: &[u8]) -> Option<(&[u8], u8)> {
     }
     // Next-header at offset 6; payload starts at offset 40.  Note: this
     // does NOT decode IPv6 extension headers (Hop-by-Hop, Routing,
-    // Fragment, etc.) — rare в DPI-relevant flows; truncated frames
+    // Fragment, etc.) — rare in DPI-relevant flows; truncated frames
     // silently skip.
     let next_header = packet[6];
     Some((&packet[40..], next_header))
@@ -229,7 +229,7 @@ fn strip_tcp<'a>(packet: &'a [u8], port_filter: Option<u16>) -> Option<&'a [u8]>
     {
         return None;
     }
-    // Data-offset в the upper 4 bits of byte 12, в units of 32-bit words.
+    // Data-offset in the upper 4 bits of byte 12, in units of 32-bit words.
     let data_offset = ((packet[12] >> 4) as usize) * 4;
     if data_offset < 20 || packet.len() < data_offset {
         return None;
@@ -256,8 +256,8 @@ fn strip_udp<'a>(packet: &'a [u8], port_filter: Option<u16>) -> Option<&'a [u8]>
 mod tests {
     use super::*;
 
-    /// Build а synthetic Ethernet + IPv4 + TCP frame с the given
-    /// payload и ports.  Used к verify the strip logic без needing а
+    /// Build a synthetic Ethernet + IPv4 + TCP frame with the given
+    /// payload and ports.  Used to verify the strip logic without needing a
     /// real pcap fixture.
     fn build_ethernet_ipv4_tcp_frame(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
@@ -273,7 +273,7 @@ mod tests {
         ipv4.extend_from_slice(&[0; 4]); // id, flags, frag offset
         ipv4.push(64); // TTL
         ipv4.push(6); // protocol = TCP
-        ipv4.extend_from_slice(&[0; 2]); // checksum (unused в tests)
+        ipv4.extend_from_slice(&[0; 2]); // checksum (unused in tests)
         ipv4.extend_from_slice(&[10, 0, 0, 1]); // src IP
         ipv4.extend_from_slice(&[10, 0, 0, 2]); // dst IP
         frame.extend_from_slice(&ipv4);

@@ -56,7 +56,7 @@ use veil_crypto::identity::{
     certify_message as build_certify, compute_node_id, derive_master_sk_ed25519,
 };
 // `DELEGATION_VALIDITY_SECS` referenced only from #[cfg(test)] paths
-// в this file; cfg-gating the import avoids unused-import warning в
+// in this file; cfg-gating the import avoids unused-import warning in
 // non-test builds while keeping it available for tests.
 #[cfg(test)]
 use veil_proto::identity_document::DELEGATION_VALIDITY_SECS;
@@ -132,7 +132,7 @@ pub struct CreateIdentityOptions {
     /// master-key algorithm. `Ed25519` (default) keeps the
     /// classical-only flow; `Ed25519Falcon512Hybrid` produces a hybrid
     /// master with both classical (Ed25519, BIP-39 recoverable) and
-    /// post-quantum (Falcon-512, persisted к `master_falcon.bin` because
+    /// post-quantum (Falcon-512, persisted to `master_falcon.bin` because
     /// Falcon is NOT BIP-39 recoverable) components. `Falcon512`
     /// standalone is rejected here — too brittle (loss of the on-disk
     /// SK = total identity loss with no paper backup). Operators
@@ -142,7 +142,7 @@ pub struct CreateIdentityOptions {
     /// recovers the Ed25519 component of the master. The Falcon
     /// component requires the on-disk `master_falcon.bin` file to be
     /// preserved alongside the BIP-39 paper backup — losing the file
-    /// degrades the identity к Ed25519-only. Operators MUST be
+    /// degrades the identity to Ed25519-only. Operators MUST be
     /// explicitly instructed of this trade-off at the CLI surface.
     pub algo: veil_types::SignatureAlgorithm,
 }
@@ -179,11 +179,11 @@ pub struct CreateIdentityOutput {
     /// caller is responsible for persisting this however they
     /// choose (plain TOML, encrypted file, hardware token…).
     ///
-    /// Этап 6 slice 6i — backed by `SensitiveBytesN<32>` (mlocked when
+    /// Phase 6 slice 6i — backed by `SensitiveBytesN<32>` (mlocked when
     /// `RLIMIT_MEMLOCK` permits, zeroize-on-drop fallback otherwise).
-    /// Consumers что need а `[u8; 32]` for downstream APIs (e.g.
+    /// Consumers that need a `[u8; 32]` for downstream APIs (e.g.
     /// `IdentitySigningKey::from_ed25519_seed`) use `.as_array()` to
-    /// borrow а typed view; the value moves into the receiver via а
+    /// borrow a typed view; the value moves into the receiver via a
     /// brief stack copy.
     pub identity_sk_seed: SensitiveBytesN<32>,
     /// present only when `opts.algo ==
@@ -318,11 +318,11 @@ pub fn create_identity(
             )
         }
         SignatureAlgorithm::Ed25519Falcon1024Hybrid => {
-            // Этап 10 follow-up: Falcon-1024 hybrid master.  Mirrors
-            // the Falcon-512 hybrid path exactly с the larger Falcon
+            // Phase 10 follow-up: Falcon-1024 hybrid master.  Mirrors
+            // the Falcon-512 hybrid path exactly with the larger Falcon
             // suite (1793 B pk vs 897 B, ~2305 B sk vs ~1281 B).
             // BIP-39 phrase recovers ONLY the Ed25519 half; the
-            // Falcon-1024 SK lives в `master_falcon.bin` (same file
+            // Falcon-1024 SK lives in `master_falcon.bin` (same file
             // name as Falcon-512 hybrid — disambiguated by the
             // surrounding `master_algo` byte in the IdentityDocument).
             use base64::Engine as _;
@@ -334,10 +334,10 @@ pub fn create_identity(
             let fal_pk_bytes = fal_pk.as_bytes();
             let fal_sk_bytes = fal_sk.as_bytes();
             // Falcon-1024 pubkey size invariant — pqcrypto-falcon 0.4
-            // pins this к 1793 bytes across all backends (CLEAN /
+            // pins this to 1793 bytes across all backends (CLEAN /
             // AVX2 / AArch64).  Panic-on-regression matches the
             // 512-hybrid pattern: silently-misshapen pk layouts would
-            // produce nodes що cannot interop с the rest of the network.
+            // produce nodes that cannot interop with the rest of the network.
             if fal_pk_bytes.len() != 1793 {
                 return Err(CreateIdentityError::Internal(format!(
                     "hybrid-1024 create: Falcon-1024 pubkey size invariant \
@@ -368,12 +368,12 @@ pub fn create_identity(
         }
         SignatureAlgorithm::Falcon512 => {
             // ext: standalone Falcon-512 master. No BIP-39
-            // recovery — the master SK is OsRng-derived и `master_seed`
-            // плюс its 24-word phrase remain populated на the output
-            // struct purely для API uniformity, но they DO NOT recover
+            // recovery — the master SK is OsRng-derived and `master_seed`
+            // plus its 24-word phrase remain populated on the output
+            // struct purely for API uniformity, but they DO NOT recover
             // anything. The SOLE recovery medium is `master_falcon.bin`.
             //
-            // CLI gates this с `--accept-no-recovery`; library callers
+            // CLI gates this with `--accept-no-recovery`; library callers
             // are responsible for their own safety.
             use base64::Engine as _;
             use pqcrypto_falcon::falcon512;
@@ -411,14 +411,14 @@ pub fn create_identity(
     let instance = LocalInstance::load_or_init(&instance_path, &opts.instance_label)?;
 
     // 6. Generate the first instance's Ed25519 identity_sk. The
-    // per-device subkey stays Ed25519 even в hybrid mode — fast
+    // per-device subkey stays Ed25519 even in hybrid mode — fast
     // sign/verify for the hot path, hybrid PQ protection lives at
     // the master layer (cert_sig is hybrid; rotation re-issues
     // cert_sig under hybrid master).
     //
-    // Этап 6 slice 6i — fill the seed bytes inside `SensitiveBytesN<32>`
-    // so the entropy material lives в mlocked storage (или the zeroize-
-    // only fallback) от the moment OsRng returns.
+    // Phase 6 slice 6i — fill the seed bytes inside `SensitiveBytesN<32>`
+    // so the entropy material lives in mlocked storage (or the zeroize-
+    // only fallback) from the moment OsRng returns.
     let mut identity_sk_seed: SensitiveBytesN<32> = SensitiveBytesN::new();
     OsRng.fill_bytes(identity_sk_seed.as_mut_array());
     let identity_sk = SigningKey::from_bytes(identity_sk_seed.as_array());
@@ -501,9 +501,9 @@ pub fn create_identity(
     save_identity_sk(&opts.veil_dir, &identity_sk_seed)?;
 
     // 10b. Hybrid OR standalone Falcon: persist the master Falcon
-    // keypair (SK + PK) к master_falcon.bin in framed form. For
+    // keypair (SK + PK) to master_falcon.bin in framed form. For
     // hybrid this file holds the PQ half (Ed25519 half is BIP-39
-    // recoverable); для standalone Falcon it's the WHOLE master
+    // recoverable); for standalone Falcon it's the WHOLE master
     // and the only recovery medium that exists. SK + PK are
     // bundled because pqcrypto-falcon's SecretKey doesn't expose
     //.public_key.
@@ -605,23 +605,23 @@ pub struct RestoreIdentityOptions {
 
     /// master-key algorithm. `Ed25519` (default) restores
     /// the classical-only flow; `Ed25519Falcon512Hybrid` restores a
-    /// hybrid identity и REQUIRES `master_falcon_sk_bytes` к be set
+    /// hybrid identity and REQUIRES `master_falcon_sk_bytes` to be set
     /// (this is the SOLE copy of the post-quantum master half — BIP-39
-    /// alone cannot recover it). Caller is expected к have read the
-    /// preserved `master_falcon.bin` from a backup medium и pass its
+    /// alone cannot recover it). Caller is expected to have read the
+    /// preserved `master_falcon.bin` from a backup medium and pass its
     /// contents through. `Falcon512` standalone is rejected (mirrors
     /// `create_identity`).
     pub algo: veil_types::SignatureAlgorithm,
 
     /// framed Falcon-512 master keypair bundle (SK + PK)
-    /// loaded из the caller's preserved `master_falcon.bin` — see
-    /// [`MASTER_FALCON_FILE`] для the wire layout. Required when
+    /// loaded from the caller's preserved `master_falcon.bin` — see
+    /// [`MASTER_FALCON_FILE`] for the wire layout. Required when
     /// `algo == Ed25519Falcon512Hybrid`; ignored otherwise. Missing
     /// on a hybrid restore surfaces as `MissingFalconMaster` — the
-    /// caller MUST forward that error к the operator, since silently
-    /// degrading к Ed25519-only would change the node_id и lose
+    /// caller MUST forward that error to the operator, since silently
+    /// degrading to Ed25519-only would change the node_id and lose
     /// name-claim continuity. Tests can also pass this bundle
-    /// in-memory без touching disk.
+    /// in-memory without touching disk.
     pub master_falcon_keypair_bytes: Option<Vec<u8>>,
 }
 
@@ -645,18 +645,18 @@ pub struct RestoreIdentityOutput {
     /// Local per-device instance state (loaded-or-initialised).
     pub instance: LocalInstance,
     /// Freshly-generated device identity_sk seed. Caller persists
-    /// per their key-storage policy.  Этап 6 slice 6i — backed by
+    /// per their key-storage policy.  Phase 6 slice 6i — backed by
     /// `SensitiveBytesN<32>` (see `CreateIdentityOutput.identity_sk_seed`
-    /// для the threat-model rationale).
+    /// for the threat-model rationale).
     pub identity_sk_seed: SensitiveBytesN<32>,
     /// Path to the optional encrypted master file written by this
     /// call. `None` if `save_encrypted_with_password` was `None`.
     pub encrypted_master_path: Option<PathBuf>,
 
-    /// when `algo == Ed25519Falcon512Hybrid`, path к the
+    /// when `algo == Ed25519Falcon512Hybrid`, path to the
     /// re-saved `master_falcon.bin` (the function persists the
-    /// caller-supplied Falcon SK into the new veil_dir с mode
-    /// 0o600). `None` для the classical Ed25519 path.
+    /// caller-supplied Falcon SK into the new veil_dir with mode
+    /// 0o600). `None` for the classical Ed25519 path.
     pub master_falcon_path: Option<PathBuf>,
 }
 
@@ -710,15 +710,15 @@ pub fn restore_identity(
     std::fs::create_dir_all(&opts.veil_dir)?;
 
     // Derive the Ed25519 master half (always — present in both
-    // classical и hybrid paths, recoverable from BIP-39).
+    // classical and hybrid paths, recoverable from BIP-39).
     // Standalone Falcon-512 doesn't use it (master_seed is informational
-    // only) but we still derive для structural simplicity.
+    // only) but we still derive for structural simplicity.
     let master_sk_bytes = derive_master_sk_ed25519(&opts.master_seed);
     let master_sk = SigningKey::from_bytes(&master_sk_bytes);
     let master_ed_pk = master_sk.verifying_key();
 
     // Hybrid path: rebuild the canonical 929 B hybrid pubkey + base64
-    // SK encoding из the operator-supplied Falcon SK (loaded from the
+    // SK encoding from the operator-supplied Falcon SK (loaded from the
     // preserved master_falcon.bin) so cert signing goes through the
     // canonical hybrid `sign_message`. Mirrors the composition in
     // `create_identity`.
@@ -778,10 +778,10 @@ pub fn restore_identity(
             )
         }
         SignatureAlgorithm::Ed25519Falcon1024Hybrid => {
-            // Этап 10 follow-up: Falcon-1024 hybrid restore.  Mirrors
-            // the 512-hybrid path с the larger Falcon suite.  The
+            // Phase 10 follow-up: Falcon-1024 hybrid restore.  Mirrors
+            // the 512-hybrid path with the larger Falcon suite.  The
             // BIP-39 phrase reconstructs the Ed25519 half; the
-            // Falcon-1024 SK + PK come from а previously-backed
+            // Falcon-1024 SK + PK come from a previously-backed
             // `master_falcon.bin` bundle supplied via
             // `opts.master_falcon_keypair_bytes`.
             use base64::Engine as _;
@@ -827,8 +827,8 @@ pub fn restore_identity(
         SignatureAlgorithm::Falcon512 => {
             // Standalone Falcon-512 restore: BIP-39 phrase / master_seed
             // is irrelevant — the bundle is the SOLE recovery medium.
-            // Library still requires opts.master_seed к be supplied для
-            // API uniformity; callers с no preserved seed pass a dummy
+            // Library still requires opts.master_seed to be supplied for
+            // API uniformity; callers with no preserved seed pass a dummy
             // zero-seed (CLI does this when --phrase-file is omitted).
             use base64::Engine as _;
 
@@ -864,7 +864,7 @@ pub fn restore_identity(
     let instance = LocalInstance::load_or_init(&instance_path, &opts.instance_label)?;
 
     // Fresh per-device identity_sk (always Ed25519).
-    // Этап 6 slice 6i — mlocked storage from the OsRng output forward.
+    // Phase 6 slice 6i — mlocked storage from the OsRng output forward.
     let mut identity_sk_seed: SensitiveBytesN<32> = SensitiveBytesN::new();
     OsRng.fill_bytes(identity_sk_seed.as_mut_array());
     let identity_sk = SigningKey::from_bytes(identity_sk_seed.as_array());
@@ -1014,7 +1014,7 @@ pub struct RotateIdentityOutput {
     /// subkey. `0` on the first rotation.
     pub old_identity_key_idx: u16,
     /// The fresh Ed25519 secret for this device — caller persists
-    /// per their key-storage policy.  Этап 6 slice 6i — backed by
+    /// per their key-storage policy.  Phase 6 slice 6i — backed by
     /// `SensitiveBytesN<32>`.
     pub new_identity_sk_seed: SensitiveBytesN<32>,
     /// Local time of the rotation (copied from `opts.now_unix`).
@@ -1172,7 +1172,7 @@ pub fn rotate_identity(
     let old_identity_key_idx = doc.sig_key_idx;
 
     // 4. Generate fresh identity_sk for this device.
-    // Этап 6 slice 6i — fresh entropy lands в mlocked storage.
+    // Phase 6 slice 6i — fresh entropy lands in mlocked storage.
     let mut new_sk_seed: SensitiveBytesN<32> = SensitiveBytesN::new();
     OsRng.fill_bytes(new_sk_seed.as_mut_array());
     let new_identity_sk = SigningKey::from_bytes(new_sk_seed.as_array());
@@ -1418,14 +1418,14 @@ const DEVICE_IDENTITY_FALCON_MAX_BYTES: usize = 8 * 1024;
 /// [4] version u8 (1)
 /// [5..9] sk_len u32 BE (typically 1281)
 /// [9..] sk_bytes [u8; sk_len]
-/// [..] pk_len u32 BE (897 для Falcon-512)
+/// [..] pk_len u32 BE (897 for Falcon-512)
 /// [..] pk_bytes [u8; pk_len]
 /// ```
 ///
 /// SK + PK are bundled in one file because pqcrypto-falcon's
 /// `SecretKey` doesn't expose `.public_key` — restore therefore
-/// needs both halves preserved, и a single framed file is the only
-/// atomic way к persist them.
+/// needs both halves preserved, and a single framed file is the only
+/// atomic way to persist them.
 ///
 /// **Recovery semantics:** the BIP-39 paper backup recovers only the
 /// Ed25519 half of the hybrid master. Loss of `master_falcon.bin`
@@ -1435,7 +1435,7 @@ const DEVICE_IDENTITY_FALCON_MAX_BYTES: usize = 8 * 1024;
 /// preserve this file alongside the BIP-39 phrase.
 pub const MASTER_FALCON_FILE: &str = "master_falcon.bin";
 
-/// file-format magic (4 bytes) для `master_falcon.bin`.
+/// file-format magic (4 bytes) for `master_falcon.bin`.
 pub const MASTER_FALCON_MAGIC: &[u8; 4] = b"OFAM";
 
 /// current `master_falcon.bin` version.
@@ -1448,8 +1448,8 @@ const MASTER_FALCON_MAX_BYTES: usize = 8 * 1024;
 
 /// persist the **master-layer** Falcon-512 keypair (SK +
 /// PK) to `<veil_dir>/master_falcon.bin` (mode `0o600`) using the
-/// framed `OFAM` format (see [`MASTER_FALCON_FILE`] для wire layout).
-/// Caller is responsible для emitting an operator warning that this
+/// framed `OFAM` format (see [`MASTER_FALCON_FILE`] for wire layout).
+/// Caller is responsible for emitting an operator warning that this
 /// file is the SOLE copy of the Falcon master keypair — the BIP-39
 /// phrase only recovers the Ed25519 half.
 pub fn save_master_falcon_keypair(
@@ -1573,7 +1573,7 @@ pub fn parse_master_falcon_keypair(bundle: &[u8]) -> std::io::Result<(Vec<u8>, V
 
 /// load + parse `<veil_dir>/master_falcon.bin` into
 /// `(sk_bytes, pk_bytes)`. Returns the file's `io::Error` for I/O
-/// failures и `InvalidData` для structural decode errors.
+/// failures and `InvalidData` for structural decode errors.
 pub fn load_master_falcon_keypair(
     veil_dir: &std::path::Path,
 ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
@@ -1587,8 +1587,8 @@ pub fn load_master_falcon_keypair(
 /// permissions. File is 32 raw bytes — no magic header because
 /// an attacker with read access already has the secret material.
 ///
-/// Этап 6 slice 6i — accepts `&SensitiveBytesN<32>` so the in-memory
-/// copy that flows к disk is mlocked (or zeroize-only fallback).
+/// Phase 6 slice 6i — accepts `&SensitiveBytesN<32>` so the in-memory
+/// copy that flows to disk is mlocked (or zeroize-only fallback).
 pub fn save_identity_sk(
     veil_dir: &std::path::Path,
     seed: &SensitiveBytesN<32>,
@@ -1621,8 +1621,8 @@ pub fn save_identity_sk(
 }
 
 /// Load the device's identity_sk seed from
-/// `<veil_dir>/device_identity_sk.bin`.  Returned в
-/// `SensitiveBytesN<32>` (Этап 6 slice 6i) — mlocked when
+/// `<veil_dir>/device_identity_sk.bin`.  Returned in
+/// `SensitiveBytesN<32>` (Phase 6 slice 6i) — mlocked when
 /// `RLIMIT_MEMLOCK` permits, zeroize-on-drop fallback otherwise.
 pub fn load_identity_sk(veil_dir: &std::path::Path) -> std::io::Result<SensitiveBytesN<32>> {
     let path = veil_dir.join(DEVICE_IDENTITY_SK_FILE);
@@ -2151,12 +2151,12 @@ mod tests {
 
     // ── hybrid-1024 create_identity (Falcon-1024 follow-up) ────────────
     //
-    // Mirrors the 512-hybrid acceptance test с the larger Falcon suite:
+    // Mirrors the 512-hybrid acceptance test with the larger Falcon suite:
     // • master_algo = ALGO_ED25519_FALCON1024_HYBRID (4)
     // • master_pubkey is 1825 bytes (32 ed + 1793 falcon-1024)
     // • document verifies under verify_identity_document (canonical
-    //   hybrid-1024 verify в verify::verify_proof_sig)
-    // • master_falcon.bin persists а Falcon-1024 SK+PK bundle (~2305 B
+    //   hybrid-1024 verify in verify::verify_proof_sig)
+    // • master_falcon.bin persists a Falcon-1024 SK+PK bundle (~2305 B
     //   SK + ~1800 B PK + framing > the 512-hybrid 1281 B bound).
     #[test]
     fn create_identity_hybrid_1024_produces_verifiable_document() {
@@ -2192,12 +2192,12 @@ mod tests {
             veil_proto::identity_document::ALGO_ED25519,
         );
 
-        // Document verifies через the canonical hybrid-1024 path.
+        // Document verifies through the canonical hybrid-1024 path.
         let validated = verify_identity_document(&out.document, issued)
             .expect("hybrid-1024 document must verify");
         assert_eq!(validated.node_id, out.node_id);
 
-        // master_falcon.bin must exist и hold the Falcon-1024 bundle.
+        // master_falcon.bin must exist and hold the Falcon-1024 bundle.
         let falcon_path = out
             .master_falcon_path
             .as_ref()
@@ -2205,8 +2205,8 @@ mod tests {
         assert!(falcon_path.exists(), "master_falcon.bin must be created");
         let falcon_bytes = std::fs::read(falcon_path).expect("read master_falcon.bin");
         // Falcon-1024 SK is ~2305 B; bundle is SK + PK (1793 B) +
-        // framing overhead → well > 3000 bytes. Use 2000 as а defensive
-        // lower-bound that excludes а Falcon-512 misroute.
+        // framing overhead → well > 3000 bytes. Use 2000 as a defensive
+        // lower-bound that excludes a Falcon-512 misroute.
         assert!(
             falcon_bytes.len() > 2000,
             "Falcon-1024 bundle should be > 2000 bytes; got {} \
@@ -2218,18 +2218,18 @@ mod tests {
         assert_eq!(recomputed, out.node_id);
     }
 
-    /// hybrid-1024 и hybrid-512 produce **different** node_ids even
+    /// hybrid-1024 and hybrid-512 produce **different** node_ids even
     /// under an identical BIP-39 seed — the master_pubkey layouts have
     /// different sizes (1825 vs 929 B), so BLAKE3 outputs diverge.
-    /// Guards against а silent regression што would let а hybrid-1024
-    /// node accidentally collide с а hybrid-512 node under matched
+    /// Guards against a silent regression that would let a hybrid-1024
+    /// node accidentally collide with a hybrid-512 node under matched
     /// recovery phrases.
     #[test]
     fn etap10_followup_hybrid_1024_node_id_distinct_from_hybrid_512() {
         use veil_types::SignatureAlgorithm;
-        // Both paths take the seed от OsRng internally — we can't pin
+        // Both paths take the seed from OsRng internally — we can't pin
         // identical phrases at the API surface, but we CAN confirm
-        // structural distinctness via а side-by-side create call.
+        // structural distinctness via a side-by-side create call.
         let dir_a = tempdir();
         let dir_b = tempdir();
         let issued = 1_700_000_000u64;
@@ -2262,7 +2262,7 @@ mod tests {
         assert_ne!(
             out_512.document.master_pubkey.len(),
             out_1024.document.master_pubkey.len(),
-            "hybrid-512 (929 B) и hybrid-1024 (1825 B) must differ structurally"
+            "hybrid-512 (929 B) and hybrid-1024 (1825 B) must differ structurally"
         );
         assert_ne!(out_512.node_id, out_1024.node_id);
         assert_ne!(
@@ -2272,7 +2272,7 @@ mod tests {
     }
 
     /// ext: standalone Falcon-512 master. Library-level
-    /// path now accepts it (CLI gates с --accept-no-recovery).
+    /// path now accepts it (CLI gates with --accept-no-recovery).
     /// Verify: master_pubkey is 897 B (raw Falcon pk, no Ed25519
     /// prefix), master_falcon.bin holds the SK+PK bundle, document
     /// verifies under canonical Falcon verify.
@@ -2377,7 +2377,7 @@ mod tests {
         );
         verify_identity_document(&restored.document, now)
             .expect("restored Falcon-only document must verify");
-        // master_falcon.bin re-saved в the new veil_dir.
+        // master_falcon.bin re-saved in the new veil_dir.
         let restored_falcon_path = restored
             .master_falcon_path
             .expect("standalone Falcon restore must re-save master_falcon.bin");
@@ -2385,7 +2385,7 @@ mod tests {
         assert_eq!(restored_bundle, bundle, "round-trip preserves the bundle");
     }
 
-    /// ext: standalone Falcon-512 restore без bundle still
+    /// ext: standalone Falcon-512 restore without bundle still
     /// fails fast — the BIP-39 phrase has no Falcon recovery path
     /// so the error message must point operator at the bundle, not
     /// at any phrase-related fix.
@@ -2599,7 +2599,7 @@ mod tests {
     /// env var mutations are process-global; serialise
     /// against any concurrent test that reads VEIL_IDENTITY_DIR.
     /// Process-wide Mutex deterministically orders writers (preferred
-    /// over а dev-dep on `serial_test`).
+    /// over a dev-dep on `serial_test`).
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::OnceLock;
         static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
@@ -2692,7 +2692,7 @@ mod tests {
         }
     }
 
-    /// Regression for Этап 10: a Falcon-1024 hybrid identity must be able to
+    /// Regression for Phase 10: a Falcon-1024 hybrid identity must be able to
     /// rotate. The fix reconstructs the FULL master pubkey (ed||falcon, from
     /// master_falcon.bin) so the node_id check passes, and certifies the new
     /// subkey with a HYBRID master signature. Before the fix rotate derived
@@ -3003,10 +3003,10 @@ mod tests {
         assert_eq!(restored_bundle, falcon_bundle);
     }
 
-    /// hybrid restore без master_falcon_keypair_bytes
+    /// hybrid restore without master_falcon_keypair_bytes
     /// surfaces `MissingFalconMaster` instead of silently producing a
     /// degraded Ed25519-only identity (which would change the
-    /// node_id и lose name-claim continuity).
+    /// node_id and lose name-claim continuity).
     #[test]
     fn restore_hybrid_rejects_missing_falcon_bundle() {
         use veil_types::SignatureAlgorithm;
@@ -3024,7 +3024,7 @@ mod tests {
             now_unix: now,
             valid_until_unix: now + 7 * 86_400,
             algo: SignatureAlgorithm::Ed25519Falcon512Hybrid,
-            master_falcon_keypair_bytes: None, // ← the operator forgot к back up.
+            master_falcon_keypair_bytes: None, // ← the operator forgot to back up.
         })
         .expect_err("must reject hybrid restore without master_falcon bundle");
         assert!(

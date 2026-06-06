@@ -23,8 +23,8 @@ use std::collections::HashMap;
 /// could spam `MailboxPut` with one different receiver_id per request
 /// would force unbounded HashMap growth (32 + ~24 bytes per entry).
 /// Once the cap is hit, the LRU bucket (oldest `last_refill`) is
-/// evicted to make room for the newcomer — а fresh receiver always
-/// starts с а full bucket, so eviction does not unfairly reset а
+/// evicted to make room for the newcomer — a fresh receiver always
+/// starts with a full bucket, so eviction does not unfairly reset a
 /// throttled receiver's allowance.
 #[derive(Debug)]
 pub(crate) struct ReceiverRateLimiter {
@@ -35,10 +35,10 @@ pub(crate) struct ReceiverRateLimiter {
     buckets: HashMap<[u8; 32], BucketState>,
 }
 
-/// Maximum number of receiver buckets held в memory. At ~56 bytes
+/// Maximum number of receiver buckets held in memory. At ~56 bytes
 /// per entry (32 B key + ~24 B value), 65 536 entries cap the bucket
-/// HashMap к ≈ 3.5 MiB. Plenty for а realistic mailbox-relay (one
-/// entry per recipient currently using the relay) и а hard ceiling
+/// HashMap to ≈ 3.5 MiB. Plenty for a realistic mailbox-relay (one
+/// entry per recipient currently using the relay) and a hard ceiling
 /// against attacker-supplied receiver_id flood.
 pub(crate) const MAX_BUCKETS: usize = 65_536;
 
@@ -74,7 +74,7 @@ impl ReceiverRateLimiter {
         let cap_scaled = self.capacity as u64 * SCALE;
         let refill_per_sec = cap_scaled / 60;
         // audit follow-up: enforce MAX_BUCKETS before
-        // potentially inserting а new entry. If the cap is hit и
+        // potentially inserting a new entry. If the cap is hit and
         // the receiver is NOT already tracked, evict the LRU bucket
         // (oldest `last_refill`) to make room.
         if !self.buckets.contains_key(&receiver)

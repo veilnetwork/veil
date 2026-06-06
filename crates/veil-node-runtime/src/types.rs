@@ -2,24 +2,24 @@ use std::{fmt, path::PathBuf, time::Instant};
 
 pub use veil_cfg::{ListenId, NodeId, NodeRole, PeerId};
 
-/// 32-byte cryptographic node identifier (`BLAKE3(pubkey)` для Ed25519
-/// nodes, `BLAKE3(falcon_pubkey)` для PQ nodes).
+/// 32-byte cryptographic node identifier (`BLAKE3(pubkey)` for Ed25519
+/// nodes, `BLAKE3(falcon_pubkey)` for PQ nodes).
 ///
 /// Transparent alias for `[u8; 32]` — chosen over the [`NodeId`] newtype
-/// для hot-path use because:
+/// for hot-path use because:
 ///
-/// * Zero runtime cost: type-level signal, не wrapper.
-/// * Compatible с every existing `[u8; 32]` API (FFI, serde, BLAKE3).
+/// * Zero runtime cost: type-level signal, not wrapper.
+/// * Compatible with every existing `[u8; 32]` API (FFI, serde, BLAKE3).
 /// * Readable signatures: `fn foo(peer_id: NodeIdBytes)` clearly says
 ///   "peer's network identity" rather than ambiguous "some 32-byte hash".
 ///
-/// Use this alias when the slot specifically means а node-identity —
+/// Use this alias when the slot specifically means a node-identity —
 /// not for `content_id`, `session_id`, `nonce`, or other 32-byte tokens
 /// that share the wire shape but carry different semantics.
 ///
-/// **Не путать с [`PeerId`]** (newtype `u32`, the local config-file
+/// **Do not confuse with [`PeerId`]** (newtype `u32`, the local config-file
 /// slot index).  The type system enforces non-interchangeability; this
-/// alias is а cognitive aid для human readers, not extra safety.
+/// alias is a cognitive aid for human readers, not extra safety.
 pub type NodeIdBytes = [u8; 32];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -149,31 +149,31 @@ pub struct ListenConfigEntry {
     pub tls_key: Option<String>,
     pub tls_ca_cert: Option<String>,
     /// Per-listener PSK file (32 raw bytes base64-encoded).  When set
-    /// и the listener's transport is `obfs4-tcp://`, this PSK overrides
+    /// and the listener's transport is `obfs4-tcp://`, this PSK overrides
     /// the global `transport.obfs4_psk_file`.  Allows different listen
-    /// entries on one node к use different PSKs (e.g. public listener
-    /// uses deployment-wide PSK; trusted/family listener uses а secret
-    /// shared only с invitees).  `None` falls back к global PSK.
+    /// entries on one node to use different PSKs (e.g. public listener
+    /// uses deployment-wide PSK; trusted/family listener uses a secret
+    /// shared only with invitees).  `None` falls back to global PSK.
     pub psk_file: Option<std::path::PathBuf>,
     /// Visibility level (public/trusted/hidden).  Controls whether
-    /// this listener's URI gets gossiped через PEX/DHT.
+    /// this listener's URI gets gossiped through PEX/DHT.
     pub visibility: veil_cfg::Visibility,
-    /// Allowlist of node_ids permitted к authenticate against this
-    /// listener.  Required для `hidden`; optional reinforcement для
+    /// Allowlist of node_ids permitted to authenticate against this
+    /// listener.  Required for `hidden`; optional reinforcement for
     /// `trusted`.  Hex-encoded 32-byte node_id strings.
     pub allowlist_node_ids: Vec<String>,
     /// Optional human-readable group tag.
     pub group_label: Option<String>,
     /// Ephemeral random-port rotation config (Phase 5f Step 3).  None =
-    /// listener binds at config-specified port и stays there.  Some =
+    /// listener binds at config-specified port and stays there.  Some =
     /// daemon rebinds on a fresh random port from `range` every
-    /// `rotation` interval; peers learn the new URI через а signed
+    /// `rotation` interval; peers learn the new URI through a signed
     /// `TransportMigrationNotify` broadcast.
     pub ephemeral: Option<veil_cfg::EphemeralConfig>,
     /// PoW-Gated Rendezvous binding config (Slice 5 of the
     /// PoW-Gated Rendezvous epic).  When set + `visibility = "stealth"`
     /// the daemon skips startup-time bind; ports come alive on-demand
-    /// после а valid PoW-gated rendezvous request lands.
+    /// after a valid PoW-gated rendezvous request lands.
     pub on_demand: Option<veil_cfg::OnDemandListenConfig>,
     pub local_addr: Option<String>,
     pub active: bool,

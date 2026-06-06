@@ -2,13 +2,13 @@
 // (Epic 489.3).
 //
 // Mailboxes are offline message stores hosted by relay nodes (relays
-// configured как `MailboxConfig.enabled = true`).  Sender deposits an
+// configured as `MailboxConfig.enabled = true`).  Sender deposits an
 // encrypted blob keyed by `(receiver_id, content_id)`; receiver later
 // fetches all pending blobs for its `receiver_id`, then acks each one
 // after E2E decryption succeeds so the relay can release the slot.
 //
-// See `crates/veil-mailbox/` для the wire-level contract.  The Dart
-// surface is а thin lifecycle + memory-management wrapper.
+// See `crates/veil-mailbox/` for the wire-level contract.  The Dart
+// surface is a thin lifecycle + memory-management wrapper.
 
 import 'dart:async';
 import 'dart:ffi';
@@ -31,29 +31,29 @@ class VeilMailbox {
   /// start failing as expected.
   final Pointer<ffi.VeilHandle> _handle;
 
-  /// Deposit а blob in the recipient's mailbox.  Caller MUST encrypt
+  /// Deposit a blob in the recipient's mailbox.  Caller MUST encrypt
   /// the payload end-to-end before calling — relays cannot decrypt
   /// stored content.
   ///
   /// [receiverId], [contentId], [senderId] are each 32 bytes.
   /// [pushEnvelope] (optional) — sealed FCM/APNs envelope; when present
-  /// AND the relay accepts the PUT, the relay fires а wake-push к the
+  /// AND the relay accepts the PUT, the relay fires a wake-push to the
   /// receiver after this call returns.
   /// [capabilityToken] (optional) — receiver-signed token obtained
   /// from the receiver's RendezvousAd.  Required only when targeting
-  /// relays configured с `require_capability_token = true`; the
+  /// relays configured with `require_capability_token = true`; the
   /// status [MailboxPutStatus.capabilityRequired] tells callers when
-  /// they need к add it.
+  /// they need to add it.
   /// [wakeHmacEnvelope] (optional) — sealed wake-HMAC envelope obtained
   /// from the receiver's RendezvousAd ([RendezvousReplica.wakeHmacEnvelope]).
   /// When present, the relay stamps it into the wake-push it fires so
   /// the receiver's device can authenticate the wake (defeats presence-
   /// oracle / battery-DoS from leaked push tokens).  Supplying it routes
   /// the PUT through `veil_mailbox_put_with_wake_hmac`, which also
-  /// carries [pushEnvelope] и [capabilityToken]; omitting it preserves
+  /// carries [pushEnvelope] and [capabilityToken]; omitting it preserves
   /// the back-compat call path.
   ///
-  /// Returns а [MailboxPutResult] describing the outcome.  Throws
+  /// Returns a [MailboxPutResult] describing the outcome.  Throws
   /// [VeilException] on transport / argument errors.
   Future<MailboxPutResult> put({
     required Uint8List receiverId,
@@ -188,8 +188,8 @@ class VeilMailbox {
           zeroizeNative(tokenPtr, capabilityToken!.length);
           calloc.free(tokenPtr);
         }
-        // wakeHmacEnvelope is а sealed (relay-opaque) blob already published
-        // in the receiver's rendezvous ad — not а device-local secret, so а
+        // wakeHmacEnvelope is a sealed (relay-opaque) blob already published
+        // in the receiver's rendezvous ad — not a device-local secret, so a
         // plain free (like pushPtr) is sufficient.
         if (wakePtr != nullptr) calloc.free(wakePtr);
         calloc.free(outEvicted);
@@ -199,14 +199,14 @@ class VeilMailbox {
   }
 
   /// Fetch all blobs currently pending for [receiverId].  [authCookie]
-  /// (16 bytes) must match а previously-registered rendezvous-publisher
+  /// (16 bytes) must match a previously-registered rendezvous-publisher
   /// entry on the daemon — typically the cookie persisted alongside the
   /// receiver's identity.
   ///
-  /// Implementation note: the FFI surface is а two-call protocol
+  /// Implementation note: the FFI surface is a two-call protocol
   /// ([veil_mailbox_fetch_count] + [veil_mailbox_fetch_into])
   /// to avoid hidden allocations through the boundary.  This wrapper
-  /// hides the dance: caller just gets back а `List<MailboxBlob>`.
+  /// hides the dance: caller just gets back a `List<MailboxBlob>`.
   ///
   /// Returns an empty list when no blobs are pending.  Throws
   /// [VeilException] on transport / argument errors.
@@ -246,12 +246,12 @@ class VeilMailbox {
         final count = outCount.value;
         if (count == 0) return <MailboxBlob>[];
 
-        // Step 2: allocate descriptor array + а blob buffer sized at
+        // Step 2: allocate descriptor array + a blob buffer sized at
         // [veilMaxDataLen] cap (16 MiB) — daemon-side already caps
-        // per-blob, и а pending-list bigger than the cap is а sign of
+        // per-blob, and a pending-list bigger than the cap is a sign of
         // misconfiguration that the FFI will reject via INVALID_ARG
-        // (it does NOT lose the cache — caller can retry с larger
-        // buffer).  16 MiB is а sane upper bound для а single fetch.
+        // (it does NOT lose the cache — caller can retry with larger
+        // buffer).  16 MiB is a sane upper bound for a single fetch.
         const blobBufLen = ffi.veilMaxDataLen;
         final descriptors = calloc<ffi.VeilMailboxBlobStruct>(count);
         final blobBuf = calloc<Uint8>(blobBufLen);
@@ -271,7 +271,7 @@ class VeilMailbox {
             );
           }
           // rc2 = number of descriptors written; copy each blob payload
-          // into а Dart-owned Uint8List before freeing the buffer.
+          // into a Dart-owned Uint8List before freeing the buffer.
           final result = <MailboxBlob>[];
           for (var i = 0; i < rc2; i++) {
             final d = descriptors[i];
@@ -307,13 +307,13 @@ class VeilMailbox {
     });
   }
 
-  /// Acknowledge end-to-end receipt of а blob.  Daemon deletes the
-  /// blob и releases its quota slice.  Call this AFTER the receiver
-  /// has successfully decrypted и persisted the payload.
+  /// Acknowledge end-to-end receipt of a blob.  Daemon deletes the
+  /// blob and releases its quota slice.  Call this AFTER the receiver
+  /// has successfully decrypted and persisted the payload.
   ///
-  /// Idempotent: re-acking an already-removed blob is а silent no-op
-  /// и returns `false`.  Returns `true` iff the daemon removed а
-  /// blob in response к this call.
+  /// Idempotent: re-acking an already-removed blob is a silent no-op
+  /// and returns `false`.  Returns `true` iff the daemon removed a
+  /// blob in response to this call.
   ///
   /// Throws [VeilException] on transport / argument errors.
   Future<bool> ack({
@@ -359,19 +359,19 @@ class VeilMailbox {
 
   /// Look up the rendezvous replicas currently advertised for
   /// [receiverId] (push wake-HMAC end-to-end).  Each entry bundles the
-  /// relay's node_id plus the three per-replica blobs а sender needs к
+  /// relay's node_id plus the three per-replica blobs a sender needs to
   /// deposit an authenticated, wake-pushing message: the sealed push
-  /// envelope, the receiver-signed capability token, и the sealed
-  /// wake-HMAC envelope.  Feed а chosen [RendezvousReplica] straight
+  /// envelope, the receiver-signed capability token, and the sealed
+  /// wake-HMAC envelope.  Feed a chosen [RendezvousReplica] straight
   /// into [put] (`pushEnvelope` / `capabilityToken` / `wakeHmacEnvelope`).
   ///
   /// [maxReplicas] caps how many entries the daemon returns; `0` (the
-  /// default) lets the daemon pick its own cap.  Values are clamped к
+  /// default) lets the daemon pick its own cap.  Values are clamped to
   /// the `u8` wire field (`0..255`).
   ///
   /// Returns an empty list when the receiver advertises no replicas.
-  /// Throws [VeilException] on transport / argument errors, и on а
-  /// malformed / truncated reply buffer (defensive — а well-behaved
+  /// Throws [VeilException] on transport / argument errors, and on a
+  /// malformed / truncated reply buffer (defensive — a well-behaved
   /// daemon never emits one).
   Future<List<RendezvousReplica>> lookupRendezvousReplicas(
     Uint8List receiverId, {
@@ -414,7 +414,7 @@ class VeilMailbox {
           return _parseReplicaBuffer(bytes);
         } finally {
           // ALWAYS release the daemon-allocated buffer — both on the
-          // happy path AND if parsing throws on а malformed reply.
+          // happy path AND if parsing throws on a malformed reply.
           ffi.veilFreeReplicaBuf(bufPtr, len);
         }
       } finally {
@@ -426,15 +426,15 @@ class VeilMailbox {
     });
   }
 
-  /// Library-internal: construct against а client's borrowed handle.
+  /// Library-internal: construct against a client's borrowed handle.
   /// External code goes through [VeilClient.mailbox] which calls
-  /// this с the right pointer.
+  /// this with the right pointer.
   static VeilMailbox forHandle(Pointer<ffi.VeilHandle> handle) =>
       VeilMailbox._(handle);
 }
 
 /// Parse the length-prefixed replica buffer returned by
-/// `veil_lookup_rendezvous_replicas`.  All integers ара
+/// `veil_lookup_rendezvous_replicas`.  All integers are
 /// LITTLE-ENDIAN.  Layout:
 ///
 ///   count:u32
@@ -445,7 +445,7 @@ class VeilMailbox {
 ///     cap_len  : u16  + capability_token   [cap_len  bytes]
 ///     wake_len : u16  + wake_hmac_envelope [wake_len bytes]
 ///
-/// Every field read is bounds-checked against [bytes.length]; а short
+/// Every field read is bounds-checked against [bytes.length]; a short
 /// or inconsistent buffer throws [VeilException] rather than reading
 /// out of range.
 List<RendezvousReplica> _parseReplicaBuffer(Uint8List bytes) {

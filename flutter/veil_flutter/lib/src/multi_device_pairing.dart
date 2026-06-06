@@ -3,21 +3,21 @@
 // Workflow:
 // - Source (existing device c master_seed):
 //     1. Enter master passphrase → daemon generates pairing URI.
-//     2. Show URI as QR + text → user sends к target.
+//     2. Show URI as QR + text → user sends to target.
 //     3. Paste target's Hello bytes → daemon emits Cert + OOB code.
-//     4. Show Cert bytes for transport к target; show OOB к compare.
+//     4. Show Cert bytes for transport to target; show OOB to compare.
 //     5. Paste target's Confirm bytes → daemon finalizes.
 //
 // - Target (new device):
 //     1. Paste / scan source URI.
-//     2. Daemon emits Hello bytes → user sends к source.
+//     2. Daemon emits Hello bytes → user sends to source.
 //     3. Paste source's Cert bytes → daemon shows OOB.
-//     4. Compare OOB с source's screen → press "match"/"no match".
+//     4. Compare OOB with source's screen → press "match"/"no match".
 //     5. Daemon emits Confirm bytes; on match also persists new identity.
 //
-// Transport (Hello / Cert / Confirm bytes) is hex-encoded паsteable
-// strings in this MVP.  QR-scanner для transport bytes can be added
-// в а follow-up — the byte sizes (≤ 16 KiB usually) ара beyond
+// Transport (Hello / Cert / Confirm bytes) is hex-encoded pasteable
+// strings in this MVP.  QR-scanner for transport bytes can be added
+// in a follow-up — the byte sizes (≤ 16 KiB usually) are beyond
 // typical QR capacity (Version 40 fits ~2.9 KiB binary), so paste
 // is the realistic transport.
 
@@ -33,8 +33,8 @@ import 'types.dart';
 /// Pairing role chosen at dialog open.
 enum PairingRole { source, target }
 
-/// Material-3 multi-screen dialog driving either side of а pairing
-/// ceremony.  Stateful — keeps step-by-step transport bytes между
+/// Material-3 multi-screen dialog driving either side of a pairing
+/// ceremony.  Stateful — keeps step-by-step transport bytes between
 /// daemon round-trips.  Returns `true` on success, `false` on user
 /// cancel, throws on transport error.
 class VeilMultiDevicePairingDialog extends StatefulWidget {
@@ -86,8 +86,8 @@ class _VeilMultiDevicePairingDialogState
   @override
   Widget build(BuildContext context) {
     final title = widget.role == PairingRole.source
-        ? 'Pair а new device (Source)'
-        : 'Pair с existing identity (Target)';
+        ? 'Pair a new device (Source)'
+        : 'Pair with existing identity (Target)';
     return Dialog(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 560, maxHeight: 720),
@@ -223,8 +223,8 @@ class _VeilMultiDevicePairingDialogState
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         const Text(
-          'Show this QR к the target device (or paste the URI).  Target '
-          'will send back а Hello byte string — paste it в the next step.',
+          'Show this QR to the target device (or paste the URI).  Target '
+          'will send back a Hello byte string — paste it in the next step.',
         ),
         const SizedBox(height: 12),
         Center(
@@ -291,7 +291,7 @@ class _VeilMultiDevicePairingDialogState
         ),
         if (_sourceOob != null) ...[
           const SizedBox(height: 16),
-          _oobBlock('Source OOB code (compare с target screen):', _sourceOob!),
+          _oobBlock('Source OOB code (compare with target screen):', _sourceOob!),
           const SizedBox(height: 12),
           const Text('Cert bytes to send to target:'),
           const SizedBox(height: 4),
@@ -449,7 +449,7 @@ class _VeilMultiDevicePairingDialogState
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Text('Hello bytes to send к source (paste these в source screen):'),
+        const Text('Hello bytes to send to source (paste these in source screen):'),
         const SizedBox(height: 8),
         _hexBlock(_helloBytes!),
         const SizedBox(height: 16),
@@ -508,13 +508,13 @@ class _VeilMultiDevicePairingDialogState
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Text('Send these Confirm bytes back к source:'),
+        const Text('Send these Confirm bytes back to source:'),
         const SizedBox(height: 8),
         _hexBlock(_confirmBytesOut!),
         const SizedBox(height: 16),
         Text(
           'Once source processes the Confirm, both devices share the same '
-          'identity.  This device persisted а new subkey to disk.',
+          'identity.  This device persisted a new subkey to disk.',
           style: Theme.of(context).textTheme.bodySmall,
         ),
         const SizedBox(height: 12),

@@ -19,13 +19,13 @@ use crate::handle::AppHandle;
 /// Each request method wraps the oneshot `rx.await` in
 /// `tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT...)`; expiry
 /// surfaces as `ClientError::Protocol("timeout waiting for...")`
-/// instead of а UI hang. 5 s is generous for local IPC; per-call
-/// override is а future API addition если operators need it.
+/// instead of a UI hang. 5 s is generous for local IPC; per-call
+/// override is a future API addition if operators need it.
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Helper для the common `tokio::oneshot::Receiver<T>` await pattern
+/// Helper for the common `tokio::oneshot::Receiver<T>` await pattern
 /// used by all RPC-shaped client methods. Folds three error cases
-/// into а single `ClientError`:
+/// into a single `ClientError`:
 /// * timeout → `Protocol("timeout waiting for {what}")`
 /// * sender dropped → `ConnectionClosed`
 /// * value received → `Ok(value)`
@@ -40,10 +40,10 @@ pub(crate) async fn await_rpc_reply<T>(
     }
 }
 
-/// Remove abandoned senders (receiver dropped) от a pending RPC queue.
+/// Remove abandoned senders (receiver dropped) from a pending RPC queue.
 ///
-/// Without this, a caller-side timeout leaves the `oneshot::Sender` в the
-/// FIFO даже after the receiver is gone. Eventually `len() >= MAX_PENDING_OPS`
+/// Without this, a caller-side timeout leaves the `oneshot::Sender` in the
+/// FIFO even after the receiver is gone. Eventually `len() >= MAX_PENDING_OPS`
 /// and legitimate callers get spuriously rejected. Run at every queue.push_back
 /// site before the cap check.
 pub(crate) fn prune_closed<T>(
@@ -52,8 +52,8 @@ pub(crate) fn prune_closed<T>(
     queue.retain(|tx| !tx.is_closed());
 }
 
-/// Pop the next non-closed waiter from а pending FIFO. Dispatcher-side
-/// counterpart to [`prune_closed`]: ensures а late reply lands on а
+/// Pop the next non-closed waiter from a pending FIFO. Dispatcher-side
+/// counterpart to [`prune_closed`]: ensures a late reply lands on a
 /// still-listening caller rather than being silently discarded into an
 /// abandoned slot, leaving subsequent legitimate callers waiting on the
 /// reply that already passed them by.
@@ -85,11 +85,11 @@ pub(crate) struct SharedWriter {
 
 pub(crate) const FRAME_TX_CAPACITY: usize = 1024;
 
-/// Number of uninit bytes а caller must reserve at the FRONT of а
-/// `Vec<u8>` before calling [`AppSender::send_prepared`]. Equal к
+/// Number of uninit bytes a caller must reserve at the FRONT of a
+/// `Vec<u8>` before calling [`AppSender::send_prepared`]. Equal to
 /// `FrameHeader (24) + AppIpcSendPayload::FIXED_SIZE (108)`.  Exposed
 /// here so the ogate TUN reader can request exactly this much headroom
-/// и avoid copying the data into а fresh frame buffer downstream.
+/// and avoid copying the data into a fresh frame buffer downstream.
 pub const APP_IPC_SEND_PREFIX_BYTES: usize = 24 + 108;
 
 impl SharedWriter {
@@ -105,15 +105,15 @@ impl SharedWriter {
             .map_err(|_| ClientError::ConnectionClosed)
     }
 
-    /// Zero-data-copy variant: caller supplies а `Vec<u8>` that already
+    /// Zero-data-copy variant: caller supplies a `Vec<u8>` that already
     /// has [`APP_IPC_SEND_PREFIX_BYTES`] uninit bytes reserved at the
     /// FRONT, followed by the IP packet (or other datagram payload).
-    /// This method fills the prefix region in-place с FrameHeader +
-    /// AppIpcSendPayload fixed fields, then moves the whole `buf` к the
+    /// This method fills the prefix region in-place with FrameHeader +
+    /// AppIpcSendPayload fixed fields, then moves the whole `buf` to the
     /// writer task.  No memcpy of the payload bytes whatsoever.
     ///
-    /// Used by ogate's solo-ship hot path где the TUN reader allocates
-    /// the buffer с the prefix reserved (см. `Reader::read_packet_with_prefix`).
+    /// Used by ogate's solo-ship hot path where the TUN reader allocates
+    /// the buffer with the prefix reserved (see. `Reader::read_packet_with_prefix`).
     pub(crate) async fn send_prepared_app_ipc_send(
         &self,
         mut buf: Vec<u8>,
@@ -157,8 +157,8 @@ impl SharedWriter {
             .map_err(|_| ClientError::ConnectionClosed)
     }
 
-    /// Hot-path encoder для `APP_IPC_SEND` that builds the IPC frame
-    /// (FrameHeader + AppIpcSendPayload fixed fields + data) in а
+    /// Hot-path encoder for `APP_IPC_SEND` that builds the IPC frame
+    /// (FrameHeader + AppIpcSendPayload fixed fields + data) in a
     /// single buffer, one allocation, one copy of `data`.
     ///
     /// Pre-patch the call chain was:
@@ -168,8 +168,8 @@ impl SharedWriter {
     ///    yet another fresh `Vec` of HEADER_SIZE + body.len(); ANOTHER
     ///    memcpy of the same data.
     ///
-    /// На ogate egress hot path (16 K-sized IP packets) those two redundant
-    /// memcopies showed up в local-bench profiles.  Single-buffer
+    /// On ogate egress hot path (16 K-sized IP packets) those two redundant
+    /// memcopies showed up in local-bench profiles.  Single-buffer
     /// encode skips the second copy entirely.
     pub(crate) async fn write_app_ipc_send_owned(
         &self,
@@ -237,16 +237,16 @@ pub(crate) fn encode_frame(msg_type: u16, body: &[u8]) -> Vec<u8> {
 
 pub(crate) async fn run_writer_task(mut wh: IpcWriteHalf, mut rx: mpsc::Receiver<Vec<u8>>) {
     /// Cap on frames drained in one batch — bounds the worst-case syscall
-    /// size при writev-style concat и keeps tail-latency для interactive
+    /// size at writev-style concat and keeps tail-latency for interactive
     /// frames bounded.
     const DRAIN_CAP: usize = 16;
 
     while let Some(first) = rx.recv().await {
-        // Drain any frames that are already sitting в the channel — pure
+        // Drain any frames that are already sitting in the channel — pure
         // `try_recv` peek-ahead, no await between recv()s.  This avoids
-        // а recv()→write→recv()→write ping-pong когда the egress task is
+        // a recv()→write→recv()→write ping-pong when the egress task is
         // bursty (e.g. ogate has just shipped multiple back-to-back batch
-        // envelopes), turning N awaits into 1 + N − 1 cheap try_recv'ы.
+        // envelopes), turning N awaits into 1 + N − 1 cheap try_recv calls.
         let mut frames: Vec<Vec<u8>> = Vec::with_capacity(DRAIN_CAP);
         frames.push(first);
         while frames.len() < DRAIN_CAP {
@@ -324,19 +324,19 @@ pub(crate) struct DispatchTable {
         tokio::sync::oneshot::Sender<Result<veilcore::proto::AppBindOkPayload, ClientError>>,
     >,
     pub pending_stream_opens: std::collections::VecDeque<PendingStreamOpen>,
-    /// pending oneshot replies для `GetNodeIdentity`.
+    /// pending oneshot replies for `GetNodeIdentity`.
     /// FIFO — apps making concurrent identity queries get matched in order.
     pub pending_node_identity:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<NodeIdentity>>,
-    /// pending oneshot replies для `GetPeers`.
+    /// pending oneshot replies for `GetPeers`.
     pub pending_peers_list:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<Vec<PeerEntry>>>,
-    /// S2.A: pending oneshot replies для `PnetStatusQuery`.
+    /// S2.A: pending oneshot replies for `PnetStatusQuery`.
     pub pending_pnet_status: std::collections::VecDeque<tokio::sync::oneshot::Sender<PnetStatus>>,
-    /// pending oneshot replies для `JoinBootstrapUri`.
+    /// pending oneshot replies for `JoinBootstrapUri`.
     pub pending_bootstrap_join:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<JoinBootstrapResult>>,
-    /// pending oneshot replies для `CreateBootstrapInvite` (Epic 489.7
+    /// pending oneshot replies for `CreateBootstrapInvite` (Epic 489.7
     /// generator side).
     pub pending_create_invite:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<CreateBootstrapInviteReply>>,
@@ -354,35 +354,35 @@ pub(crate) struct DispatchTable {
         std::collections::VecDeque<tokio::sync::oneshot::Sender<PairOobReply>>,
     pub pending_pair_target_confirm:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<PairFrameReply>>,
-    /// pending oneshot replies для `GetMobileStatus`.
+    /// pending oneshot replies for `GetMobileStatus`.
     pub pending_mobile_status:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<MobileStatus>>,
-    ///.2: pending oneshot replies для `SetPushEnvelope`.
+    ///.2: pending oneshot replies for `SetPushEnvelope`.
     pub pending_set_push_envelope: std::collections::VecDeque<
         tokio::sync::oneshot::Sender<veilcore::proto::SetPushEnvelopeStatus>,
     >,
-    /// Epic 489.10 slice 4.3.4: pending oneshot replies для
+    /// Epic 489.10 slice 4.3.4: pending oneshot replies for
     /// `SetWakeHmacEnvelope`.  Same dispatch pattern as the push
     /// envelope queue.
     pub pending_set_wake_hmac_envelope: std::collections::VecDeque<
         tokio::sync::oneshot::Sender<veilcore::proto::SetWakeHmacEnvelopeStatus>,
     >,
-    ///.4 P2: pending oneshot replies для `MailboxPut`.
+    ///.4 P2: pending oneshot replies for `MailboxPut`.
     pub pending_mailbox_put:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<MailboxPutReply>>,
-    ///.4 P2: pending oneshot replies для `MailboxFetch`.
+    ///.4 P2: pending oneshot replies for `MailboxFetch`.
     pub pending_mailbox_fetch:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<Vec<MailboxBlobInfo>>>,
-    ///.4 P2: pending oneshot replies для `MailboxAck`.
+    ///.4 P2: pending oneshot replies for `MailboxAck`.
     pub pending_mailbox_ack: std::collections::VecDeque<tokio::sync::oneshot::Sender<bool>>,
-    ///.4 P4: pending oneshot replies для `OutboxPut`.
+    ///.4 P4: pending oneshot replies for `OutboxPut`.
     pub pending_outbox_put: std::collections::VecDeque<tokio::sync::oneshot::Sender<bool>>,
-    ///.4 P4: pending oneshot replies для `OutboxFindMissing`.
+    ///.4 P4: pending oneshot replies for `OutboxFindMissing`.
     pub pending_outbox_find_missing:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<Vec<OutboxEntryInfo>>>,
-    ///.4 P4: pending oneshot replies для `OutboxAck`.
+    ///.4 P4: pending oneshot replies for `OutboxAck`.
     pub pending_outbox_ack: std::collections::VecDeque<tokio::sync::oneshot::Sender<bool>>,
-    ///.4 P5c: pending oneshot replies для `LookupRendezvousReplicas`.
+    ///.4 P5c: pending oneshot replies for `LookupRendezvousReplicas`.
     pub pending_lookup_replicas:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<Vec<RendezvousReplicaInfo>>>,
     /// push event sink. When set by [`VeilClient::events`]
@@ -402,19 +402,19 @@ pub(crate) struct DispatchTable {
 pub(crate) const ENDPOINT_QUEUE_CAP: usize = 256;
 
 /// Cap on the per-stream `StreamEvent` queue (Data / Close events the
-/// SDK forwards from the daemon к а bound `VeilStream`).
+/// SDK forwards from the daemon to a bound `VeilStream`).
 ///
 /// **Why bounded:** pre-fix this was `mpsc::unbounded_channel`, with the
 /// rationale that the daemon's STREAM_DATA window cap (server-side
-/// `route_data_from_a` checks `window_a_to_b`) would throttle А→B.
-/// That argument breaks для the B→A direction (no window enforcement in
-/// `route_data_from_b`) and для opener-requested huge initial windows
-/// — а hostile or buggy peer could flood inbound STREAM_DATA frames
+/// `route_data_from_a` checks `window_a_to_b`) would throttle A→B.
+/// That argument breaks for the B→A direction (no window enforcement in
+/// `route_data_from_b`) and for opener-requested huge initial windows
+/// — a hostile or buggy peer could flood inbound STREAM_DATA frames
 /// faster than the SDK consumer reads, pinning unbounded memory on
 /// the budget-Android target the project optimises for.
 ///
-/// 256 covers а full STREAM_INITIAL_WINDOW worth of small frames plus
-/// substantial headroom; consumers that fall behind get а stream
+/// 256 covers a full STREAM_INITIAL_WINDOW worth of small frames plus
+/// substantial headroom; consumers that fall behind get a stream
 /// closure (visible via `recv()` → None → EOF in `VeilStream`),
 /// matching the server-side backpressure-close pattern shipped in
 /// `route_data_from_a` / `route_data_from_b`.
@@ -424,14 +424,14 @@ pub(crate) const STREAM_EVENT_QUEUE_CAP: usize = 256;
 /// (`IncomingStream` items emitted on `StreamOpenInbound` IPC frames).
 ///
 /// **Why bounded:** matches the daemon-side `MAX_IPC_STREAMS_PER_CLIENT`
-/// (256, см. `veil_proto::budget`).  Pre-fix the SDK queue was
-/// unbounded, so а malicious peer firing the maximum allowed inbound
-/// opens against а bound endpoint that did not call `accept_stream`
-/// could allocate 256 `VeilStream` objects (each с its own
-/// data-channel mpsc + writer Arc + state) — bounded RAM, but а
+/// (256, see. `veil_proto::budget`).  Pre-fix the SDK queue was
+/// unbounded, so a malicious peer firing the maximum allowed inbound
+/// opens against a bound endpoint that did not call `accept_stream`
+/// could allocate 256 `VeilStream` objects (each with its own
+/// data-channel mpsc + writer Arc + state) — bounded RAM, but a
 /// non-trivial wedge on cheap hardware.  At cap, additional inbound
 /// notifications are dropped client-side; daemon's own cap takes over
-/// то reject future opens.
+/// then reject future opens.
 pub(crate) const INBOUND_STREAM_QUEUE_CAP: usize = 256;
 
 /// Events that can be routed to an active `VeilStream`.
@@ -455,8 +455,8 @@ pub(crate) const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration:
 /// (and its named/flagged variants) waits for the daemon's
 /// `AppBindOk` / `AppBindErr` reply before erroring out.
 ///
-/// **Why bounded:** previously the bind await was unbounded — а bug в
-/// the daemon (e.g. routing layer still initializing right after а
+/// **Why bounded:** previously the bind await was unbounded — a bug in
+/// the daemon (e.g. routing layer still initializing right after a
 /// `systemctl restart veil`) could leave the client task wedged
 /// forever with no observable error to systemd's watchdog. Reproduced
 /// sporadically on testnet's node1 / node5 post-deploy:
@@ -464,8 +464,8 @@ pub(crate) const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration:
 /// → service shown as `active` indefinitely.
 ///
 /// 30 s is comfortably longer than the daemon's typical readiness
-/// window (~ а few hundred ms cold-start) and shorter than systemd's
-/// default `WatchdogSec=` so а hard-failed bind triggers а normal
+/// window (~ a few hundred ms cold-start) and shorter than systemd's
+/// default `WatchdogSec=` so a hard-failed bind triggers a normal
 /// service restart cycle rather than systemd's last-resort kill-9.
 pub(crate) const BIND_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -666,10 +666,10 @@ impl VeilClient {
         // out. Single atomic critical section over both dispatch-table
         // mutations closes the race.
         let (tx, rx) = mpsc::channel(ENDPOINT_QUEUE_CAP);
-        // Inbound-stream notification channel (Phase 6.51).  Bounded к
+        // Inbound-stream notification channel (Phase 6.51).  Bounded to
         // `INBOUND_STREAM_QUEUE_CAP` (= daemon's `MAX_IPC_STREAMS_PER_CLIENT`)
-        // so а malicious peer firing the maximum-allowed inbound opens against
-        // an endpoint что never `accept_stream`s does not pin unbounded SDK
+        // so a malicious peer firing the maximum-allowed inbound opens against
+        // an endpoint that never `accept_stream`s does not pin unbounded SDK
         // memory.  Audit batch 2026-05-23.
         let (inbound_streams_tx, inbound_streams_rx) =
             mpsc::channel::<crate::handle::IncomingStream>(INBOUND_STREAM_QUEUE_CAP);
@@ -705,7 +705,7 @@ impl VeilClient {
 
         // Send APP_BIND. If the write fails, clean up both dispatch-table
         // entries we just registered — otherwise stale endpoint mapping +
-        // dangling oneshot stay в the table.
+        // dangling oneshot stay in the table.
         if let Err(e) = self
             .writer
             .write_frame(LocalAppMsg::AppBind as u16, &bind.encode())
@@ -746,7 +746,7 @@ impl VeilClient {
             Err(_elapsed) => {
                 // Prune abandoned entries (this caller's `tx` is closed
                 // because `rx` was dropped on timeout). The pop_front from
-                // the legacy code popped а blind FIFO head, which could
+                // the legacy code popped a blind FIFO head, which could
                 // remove the wrong tx if multiple binds raced; `prune_closed`
                 // picks exactly the closed entries — i.e. ours + any other
                 // abandoned ones. Dispatcher-side `pop_next_open` also
@@ -789,7 +789,7 @@ impl VeilClient {
             .await
     }
 
-    /// Register а sealed FCM/APNs push-token envelope on а rendezvous-publisher
+    /// Register a sealed FCM/APNs push-token envelope on a rendezvous-publisher
     /// entry. The envelope must be already
     /// sealed via `veil_anonymity::push_envelope::seal_push_envelope`
     /// before passing here — the daemon never sees the underlying token.
@@ -833,8 +833,8 @@ impl VeilClient {
         }
     }
 
-    /// Update the sealed wake-HMAC envelope on а rendezvous-publisher
-    /// entry (Epic 489.10 slice 4.3.4 — analog к
+    /// Update the sealed wake-HMAC envelope on a rendezvous-publisher
+    /// entry (Epic 489.10 slice 4.3.4 — analog to
     /// [`Self::set_push_envelope`]).  Empty `envelope` clears the
     /// registration (HMAC opt-out fallback).
     ///
@@ -884,7 +884,7 @@ impl VeilClient {
     ///
     /// `push_envelope` (optional, P3) is the sealed FCM/APNs token
     /// the sender obtained from receiver's `RendezvousAd` in DHT.
-    /// When supplied и storage returns `Stored`, the relay fires a
+    /// When supplied and storage returns `Stored`, the relay fires a
     /// wake-push to the receiver after this call returns. Pass
     /// `None` (or empty) when the receiver doesn't register push
     /// (e.g. desktop client — relay only stores).
@@ -902,18 +902,18 @@ impl VeilClient {
         blob: Vec<u8>,
         push_envelope: Option<Vec<u8>>,
         // optional receiver-signed mailbox
-        // capability token, typically obtained от
+        // capability token, typically obtained from
         // [`Self::lookup_rendezvous_replicas`] which surfaces it on
         // [`veil_ipc::ResolvedReplica::capability_token`]. Pass
-        // `None` for relays running с the default
+        // `None` for relays running with the default
         // `require_capability_token = false` (legacy permissive mode).
         capability_token: Option<Vec<u8>>,
         // Epic 489.10 slice 4.3.4 follow-up — sealed wake-HMAC envelope
-        // copy-paste'd от the receiver's RendezvousAd `wake_hmac_envelope`
-        // field.  Forwarded к the relay так it can mint а receiver-
+        // copy-paste'd from the receiver's RendezvousAd `wake_hmac_envelope`
+        // field.  Forwarded to the relay so it can mint a receiver-
         // verifiable HMAC tag when dispatching the wake push.  `None`
-        // = sender did not propagate (legacy, или receiver did not
-        // register для HMAC); relay falls back к unauthenticated wake.
+        // = sender did not propagate (legacy, or receiver did not
+        // register for HMAC); relay falls back to unauthenticated wake.
         wake_hmac_envelope: Option<Vec<u8>>,
     ) -> Result<MailboxPutReply, ClientError> {
         if blob.len() > veilcore::proto::MAX_MAILBOX_BLOB_BYTES {
@@ -1239,7 +1239,7 @@ impl VeilClient {
             .await?;
 
         // Wait for the reader task to deliver the reply (bounded;
-        // see DEFAULT_REQUEST_TIMEOUT для rationale).
+        // see DEFAULT_REQUEST_TIMEOUT for rationale).
         await_rpc_reply(rx, "node_identity reply").await
     }
 
@@ -1252,7 +1252,7 @@ impl VeilClient {
     /// running heavily-loaded relays trim before encoding.
     ///
     /// Useful for Flutter UI that displays a "connected to N peers"
-    /// indicator or peer-debug screen, без admin-token round-trip.
+    /// indicator or peer-debug screen, without admin-token round-trip.
     pub async fn peers(&self) -> Result<Vec<PeerEntry>, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
@@ -1273,11 +1273,11 @@ impl VeilClient {
         await_rpc_reply(rx, "peers reply").await
     }
 
-    /// Query the daemon's P-Net admission status for а peer.
+    /// Query the daemon's P-Net admission status for a peer.
     ///
-    /// Returns а snapshot of: whether the daemon has an active session
-    /// к the peer (`admitted`) и whether а valid `MembershipCert` was
-    /// presented at handshake-time (`has_cert`).  Apps в strict-p_net
+    /// Returns a snapshot of: whether the daemon has an active session
+    /// to the peer (`admitted`) and whether a valid `MembershipCert` was
+    /// presented at handshake-time (`has_cert`).  Apps in strict-p_net
     /// admission mode reject when either flag is false.
     ///
     /// Example:
@@ -1286,7 +1286,7 @@ impl VeilClient {
     /// if status.admitted && status.has_cert {
     ///     // peer admitted into the private network — accept their stream
     /// } else {
-    ///     // reject — daemon hasn't verified а cert for this peer
+    ///     // reject — daemon hasn't verified a cert for this peer
     /// }
     /// ```
     pub async fn peer_pnet_status(
@@ -1314,10 +1314,10 @@ impl VeilClient {
     ///
     /// Returns the current background tier (Foreground/Active/LowPower)
     /// battery percentage (0-100; 100 = AC or unknown), configured
-    /// keepalive + low-battery multipliers, и the EFFECTIVE factors
+    /// keepalive + low-battery multipliers, and the EFFECTIVE factors
     /// being applied right now. Useful for Flutter UI that displays
-    /// "Power-saving mode active" badges или helps the user diagnose
-    /// "why is my keepalive 30 min?" без operator-level admin access.
+    /// "Power-saving mode active" badges or helps the user diagnose
+    /// "why is my keepalive 30 min?" without operator-level admin access.
     pub async fn mobile_status(&self) -> Result<MobileStatus, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
@@ -1338,18 +1338,18 @@ impl VeilClient {
         await_rpc_reply(rx, "mobile_status reply").await
     }
 
-    /// Decode a bootstrap-invite URI и register the resulting peer for
+    /// Decode a bootstrap-invite URI and register the resulting peer for
     /// outbound dial. The daemon owns the decode +
     /// verification pipeline (plain / encrypted / signed-invite); the
     /// app only forwards bytes. Closes the deep-link onboarding gap
     /// for Flutter / Swift / Kotlin apps that previously had to either
-    /// re-implement decode in the host language или shell out to
+    /// re-implement decode in the host language or shell out to
     /// `veil-cli bootstrap join` (impossible from sandboxed mobile).
     ///
     /// `password` is required for `veil:pair?…` (encrypted) URIs
-    /// и rejected for plain / signed. `expected_issuer_pk` is required
-    /// for `veil:signed-invite?…` URIs (the signature is только useful
-    /// when verified against an OOB-known pubkey) и rejected for plain /
+    /// and rejected for plain / signed. `expected_issuer_pk` is required
+    /// for `veil:signed-invite?…` URIs (the signature is only useful
+    /// when verified against an OOB-known pubkey) and rejected for plain /
     /// encrypted.
     pub async fn join_bootstrap_uri(
         &self,
@@ -1381,15 +1381,15 @@ impl VeilClient {
         await_rpc_reply(rx, "join_bootstrap_uri reply").await
     }
 
-    /// Ask the daemon to assemble а bootstrap-invite URI from its own
+    /// Ask the daemon to assemble a bootstrap-invite URI from its own
     /// `[identity]` + first `[[listen]]` advertise (Epic 489.7 generator
     /// side).  Returns the canonical URI on success; structured error
     /// codes on missing config / bad password / daemon internal failure.
     ///
     /// `password = Some(pw)` emits an encrypted `veil:pair?…` envelope
     /// — receiver must supply the same passphrase on consume.  Empty
-    /// password is rejected с `BadPassword` so the UI can re-prompt
-    /// rather than emitting an envelope encrypted under а trivial key.
+    /// password is rejected with `BadPassword` so the UI can re-prompt
+    /// rather than emitting an envelope encrypted under a trivial key.
     pub async fn create_bootstrap_invite(
         &self,
         password: Option<&str>,
@@ -1416,8 +1416,8 @@ impl VeilClient {
 
     // ── Multi-device pairing (Epic 489.8) ─────────────────────────────
 
-    /// Source-side: generate а pair-invite URI + initialize ceremony.
-    /// Daemon stashes state, returns URI к QR-render.
+    /// Source-side: generate a pair-invite URI + initialize ceremony.
+    /// Daemon stashes state, returns URI to QR-render.
     pub async fn pair_source_create_invite(
         &self,
         master_password: Option<&str>,
@@ -1470,7 +1470,7 @@ impl VeilClient {
     }
 
     /// Source-side: process Confirm bytes — finalizes the ceremony,
-    /// persists the new IdentityDocument с appended IdentityKey.
+    /// persists the new IdentityDocument with appended IdentityKey.
     pub async fn pair_source_handle_confirm(
         &self,
         confirm_bytes: Vec<u8>,
@@ -1556,7 +1556,7 @@ impl VeilClient {
 
     /// Target-side: emit Confirm bytes based on user's OOB-compare
     /// decision.  `confirmed = true` also persists the new identity
-    /// document к disk.
+    /// document to disk.
     pub async fn pair_target_build_confirm(
         &self,
         confirmed: bool,
@@ -1588,22 +1588,22 @@ impl VeilClient {
     /// below) that yields one [`VeilEvent`]
     /// per `LocalAppMsg::Event` frame the daemon emits over this IPC
     /// connection. Used by Flutter / native UIs to drive reactive
-    /// state updates без polling — matters on budget Android where
+    /// state updates without polling — matters on budget Android where
     /// every wakeup costs battery.
     ///
     /// Single-subscriber semantics: calling `events` a second time
     /// replaces the previous sink. Drop the receiver to stop receiving
-    /// events; the daemon keeps publishing на the bus regardless of
+    /// events; the daemon keeps publishing on the bus regardless of
     /// subscribers.
     ///
-    /// Bounded к 1024 events: events are tiny (≤ 4 KiB each) and rare
-    /// (state transitions, not data flow), so 1024 is а generous buffer
-    /// для transient consumer stalls — but bounded prevents unbounded
+    /// Bounded to 1024 events: events are tiny (≤ 4 KiB each) and rare
+    /// (state transitions, not data flow), so 1024 is a generous buffer
+    /// for transient consumer stalls — but bounded prevents unbounded
     /// memory growth if the consumer hangs entirely.
     ///
     /// Dispatcher uses `try_send` (see `dispatcher_loop` event handler);
-    /// on а full channel the event is dropped и the sender is cleared
-    /// to avoid log spam. Apps reading events should keep up с the
+    /// on a full channel the event is dropped and the sender is cleared
+    /// to avoid log spam. Apps reading events should keep up with the
     /// daemon's event rate — they ARE the consumer.
     pub async fn events(&self) -> mpsc::Receiver<VeilEvent> {
         let (tx, rx) = mpsc::channel(1024);
@@ -1642,9 +1642,9 @@ pub struct MobileStatus {
     pub background_keepalive_factor: u32,
     /// Battery reading 0-100 (100 = AC / unknown).
     pub battery_level_pct: u8,
-    /// Configured threshold для route-probe throttling (255 = disabled).
+    /// Configured threshold for route-probe throttling (255 = disabled).
     pub low_battery_threshold_pct: u8,
-    /// Configured route-probe multiplier на low-battery.
+    /// Configured route-probe multiplier on low-battery.
     pub low_battery_multiplier: u32,
     /// Effective route-probe factor RIGHT NOW.
     pub battery_route_probe_factor: u32,
@@ -1661,7 +1661,7 @@ pub struct JoinBootstrapResult {
     /// Decoded peer's `node_id` on success / ALREADY_REGISTERED;
     /// zero-filled otherwise.
     pub peer_node_id: [u8; 32],
-    /// Human-readable detail (best-effort UTF-8; lossy на the SDK side
+    /// Human-readable detail (best-effort UTF-8; lossy on the SDK side
     /// for forward-compat with future status codes that ship non-UTF-8
     /// debug data).
     pub detail: String,
@@ -1672,7 +1672,7 @@ pub struct JoinBootstrapResult {
 pub struct PairCreateInviteReply {
     /// Wire-byte status — see `veil_proto::pair_source_status`.
     pub status: u8,
-    /// Pairing URI к QR-encode + show к target user.  Empty on error.
+    /// Pairing URI to QR-encode + show to target user.  Empty on error.
     pub uri: String,
     /// Human-readable detail.
     pub detail: String,
@@ -1684,9 +1684,9 @@ pub struct PairCreateInviteReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairOobReply {
     pub status: u8,
-    /// 6-digit ASCII OOB code (zero-filled на non-OK).
+    /// 6-digit ASCII OOB code (zero-filled on non-OK).
     pub oob_code: [u8; 6],
-    /// Cert bytes (Source.handle_hello) или empty (Target.handle_cert).
+    /// Cert bytes (Source.handle_hello) or empty (Target.handle_cert).
     pub response_bytes: Vec<u8>,
     pub detail: String,
 }
@@ -1699,7 +1699,7 @@ pub struct PairStatusReply {
 }
 
 /// Reply carrying status + opaque bytes.  Used by
-/// `target_consume_uri` (Hello bytes) и `target_build_confirm`
+/// `target_consume_uri` (Hello bytes) and `target_build_confirm`
 /// (Confirm bytes).  Epic 489.8.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairFrameReply {
@@ -1718,8 +1718,8 @@ pub struct CreateBootstrapInviteReply {
     pub status: u8,
     /// Encoded invite URI on success; empty on error.
     pub uri: String,
-    /// Human-readable detail (best-effort UTF-8 from а fallible decode
-    /// of the bytes the daemon sent; lossy если future status codes
+    /// Human-readable detail (best-effort UTF-8 from a fallible decode
+    /// of the bytes the daemon sent; lossy if future status codes
     /// ship non-UTF-8 debug data).
     pub detail: String,
 }
@@ -1762,18 +1762,18 @@ pub struct RendezvousReplicaInfo {
     /// (receiver did not register push — relay only stores).
     pub push_envelope: Vec<u8>,
     /// receiver-signed mailbox capability
-    /// token к forward в [`VeilClient::mailbox_put`]. Empty when
+    /// token to forward in [`VeilClient::mailbox_put`]. Empty when
     /// the receiver did not mint one (legacy senders / hybrid identities
-    /// / pre-slice-2 daemons / relays running с the default
+    /// / pre-slice-2 daemons / relays running with the default
     /// `require_capability_token = false`).
     pub capability_token: Vec<u8>,
     /// Sealed `WakeHmacKey` envelope (Epic 489.10 slice 2b) copied verbatim
-    /// от the receiver's resolved `RendezvousAd.wake_hmac_envelope`. Forward
-    /// it as the `wake_hmac_envelope` argument к
-    /// [`VeilClient::mailbox_put`] так the relay can mint а receiver-
+    /// from the receiver's resolved `RendezvousAd.wake_hmac_envelope`. Forward
+    /// it as the `wake_hmac_envelope` argument to
+    /// [`VeilClient::mailbox_put`] so the relay can mint a receiver-
     /// verifiable wake-HMAC tag. Empty when the receiver did not register for
-    /// wake-HMAC (legacy receivers / pre-slice-2b daemons); pass `None` к
-    /// `mailbox_put` in that case и the relay falls back к an
+    /// wake-HMAC (legacy receivers / pre-slice-2b daemons); pass `None` to
+    /// `mailbox_put` in that case and the relay falls back to an
     /// unauthenticated wake.
     pub wake_hmac_envelope: Vec<u8>,
 }
@@ -1805,18 +1805,18 @@ pub struct MailboxBlobInfo {
 
 /// Peer P-Net admission status returned by
 /// [`VeilClient::peer_pnet_status`].  Surfaces whether the daemon
-/// has an active session к the queried peer и (когда P-Net is enabled)
+/// has an active session to the queried peer and (when P-Net is enabled)
 /// the verified MembershipCert details.
 ///
-/// Use by app-layer admission gates (ogate / oproxy) к delegate cert
-/// verification к the daemon instead of maintaining their own static
+/// Use by app-layer admission gates (ogate / oproxy) to delegate cert
+/// verification to the daemon instead of maintaining their own static
 /// `allowed_node_ids` list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PnetStatus {
-    /// `true` ⇒ daemon has an active veil session к this peer.
+    /// `true` ⇒ daemon has an active veil session to this peer.
     pub admitted: bool,
-    /// `true` ⇒ daemon verified а MembershipCert for this peer at
-    /// handshake time.  `false` когда daemon is in public mode или
+    /// `true` ⇒ daemon verified a MembershipCert for this peer at
+    /// handshake time.  `false` when daemon is in public mode or
     /// the session predates cert verification.
     pub has_cert: bool,
     /// Cert admin flag (only meaningful when `has_cert == true`).
@@ -1826,7 +1826,7 @@ pub struct PnetStatus {
     pub valid_until_unix: u64,
     /// Cert's network_id (zeros when `has_cert == false`).
     pub network_id: [u8; 32],
-    /// Echoes the queried peer_node_id для correlation в pipelined IPC.
+    /// Echoes the queried peer_node_id for correlation in pipelined IPC.
     pub peer_node_id: [u8; 32],
 }
 
@@ -1939,9 +1939,9 @@ async fn reader_task(
                 }
             }
             LocalAppMsg::StreamOpenInbound => {
-                // Phase 6.51: inbound-stream notification от daemon.
+                // Phase 6.51: inbound-stream notification from daemon.
                 // Build the data-channel pair, register the stream-id,
-                // wrap as VeilStream, и hand off к the bound
+                // wrap as VeilStream, and hand off to the bound
                 // endpoint's accept_stream queue.
                 use veilcore::proto::StreamOpenInboundPayload;
                 if let Ok(p) = StreamOpenInboundPayload::decode(&body) {
@@ -1957,7 +1957,7 @@ async fn reader_task(
                             stream: veil_stream,
                             src_node_id: p.src_node_id,
                         };
-                        // `try_send` (не `send().await`) so а slow
+                        // `try_send` (not `send().await`) so a slow
                         // `accept_stream` consumer cannot block the
                         // reader task that drives EVERY stream on this
                         // IPC connection.  On `Full`/`Closed` the
@@ -1978,7 +1978,7 @@ async fn reader_task(
                         }
                     }
                     // No matching endpoint — drop silently (matches the
-                    // existing pattern for AppDeliver к а closed
+                    // existing pattern for AppDeliver to a closed
                     // endpoint).  Reader task can't depend on `log`
                     // because the SDK is `no-deps`-friendly.
                 }
@@ -2007,14 +2007,14 @@ async fn reader_task(
                     let stream_id = p.stream_id;
                     let mut close_stream = false;
                     if let Some(tx) = d.streams.get(&stream_id) {
-                        // `try_send` (не `.await`) so а slow consumer
-                        // на ONE stream cannot stall the global reader
+                        // `try_send` (not `.await`) so a slow consumer
+                        // on ONE stream cannot stall the global reader
                         // task (and every other stream on this IPC
                         // connection).  On `Full` the consumer is
                         // demonstrably falling behind the daemon's
                         // delivery rate — close the stream so the
                         // consumer surfaces EOF (`recv()` → None) and
-                        // any further frames на the wire get sent а
+                        // any further frames on the wire get sent a
                         // STREAM_CLOSE by the daemon.
                         if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
                             tx.try_send(StreamEvent::Data(p.data))
@@ -2022,7 +2022,7 @@ async fn reader_task(
                             close_stream = true;
                         }
                         // `Closed` variant = consumer already dropped
-                        // VeilStream; nothing к do (next STREAM_CLOSE
+                        // VeilStream; nothing to do (next STREAM_CLOSE
                         // from daemon will clean the table entry).
                     }
                     if close_stream {
@@ -2038,11 +2038,11 @@ async fn reader_task(
                 if let Ok(p) = StreamClosePayload::decode(&body) {
                     let mut d = dispatch.lock().await;
                     if let Some(tx) = d.streams.remove(&p.stream_id) {
-                        // `try_send`: на а full queue we simply drop
+                        // `try_send`: on a full queue we simply drop
                         // the Close event — the sender goes out of
                         // scope after `remove`, so the consumer sees
                         // `recv()` → None which the stream-reader
-                        // already maps к EOF (см. stream.rs:104).
+                        // already maps to EOF (see. stream.rs:104).
                         let _ = tx.try_send(StreamEvent::Close);
                     }
                 }
@@ -2119,7 +2119,7 @@ async fn reader_task(
                 }
             }
             LocalAppMsg::SetWakeHmacEnvelopeOk => {
-                // slice 4.3.4: 1-byte status response (analog к SetPushEnvelopeOk).
+                // slice 4.3.4: 1-byte status response (analog to SetPushEnvelopeOk).
                 if !body.is_empty()
                     && let Ok(status) =
                         veilcore::proto::SetWakeHmacEnvelopeStatus::from_wire(body[0])
@@ -2366,7 +2366,7 @@ async fn reader_task(
                     let drop_sink = if let Some(tx) = d.event_sink.as_ref() {
                         // `try_send` returns Err if either the receiver
                         // is gone OR the channel is full. Both cases ⇒
-                        // drop the event и (if closed) clear the sender.
+                        // drop the event and (if closed) clear the sender.
                         match tx.try_send(event) {
                             Ok(()) => false,
                             Err(mpsc::error::TrySendError::Closed(_)) => true,

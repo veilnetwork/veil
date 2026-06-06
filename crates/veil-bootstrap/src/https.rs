@@ -33,16 +33,16 @@
 //!
 //! # No new dependencies
 //!
-//! The fetch is a hand-rolled HTTP/1.1 GET over а PKI-verified TLS
+//! The fetch is a hand-rolled HTTP/1.1 GET over a PKI-verified TLS
 //! handshake ([`veil_transport::tls::connect_pki_verified_https_stream`]
 //! or [`veil_transport::tls_boring::connect_pki_verified_https_stream`]
 //! under `--features tls-boring`). audit follow-up
 //!the bootstrap path was decoupled from the veil
 //! peer-transport TLS profile — the latter accepts self-signed certs
-//! because trust binds к session-layer node_id, but а CDN target
+//! because trust binds to session-layer node_id, but a CDN target
 //! requires real Web PKI verification (Mozilla's webpki-roots OR
-//! `set_default_verify_paths`) plus hostname matching, otherwise а
-//! MITM с а stale-but-veil-trusted cert could replay or DoS the
+//! `set_default_verify_paths`) plus hostname matching, otherwise a
+//! MITM with a stale-but-veil-trusted cert could replay or DoS the
 //! HTTPS fetch.
 //!
 //! Hand-rolled HTTP is intentionally minimal:
@@ -66,17 +66,17 @@ use veil_transport::TransportContext;
 use veil_types::BootstrapPeer;
 
 // bootstrap fetches MUST use the PKI-
-// verified TLS path (`connect_pki_verified_https_stream`) — а CDN
+// verified TLS path (`connect_pki_verified_https_stream`) — a CDN
 // target requires real certificate-chain verification, NOT veil's
 // node-id-bound trust which accepts self-signed certs. Pre-fix, both
-// the rustls и tls-boring paths shared `connect_tls_client_stream`
-// с veil's peer trust profile, leaving HTTPS bootstrap susceptible
-// к MITM с а stale-but-still-veil-trusted cert. Bootstrap bundles
-// are Ed25519-signed so payload integrity was preserved, но an MITM
+// the rustls and tls-boring paths shared `connect_tls_client_stream`
+// with veil's peer trust profile, leaving HTTPS bootstrap susceptible
+// to MITM with a stale-but-still-veil-trusted cert. Bootstrap bundles
+// are Ed25519-signed so payload integrity was preserved, but an MITM
 // could still serve replays of older signed bundles OR break TLS
 // sessions for DoS. Now bootstrap explicitly uses Mozilla's
 // webpki-roots (rustls) OR boringssl `set_default_verify_paths`
-// (tls-boring) с `verify_hostname(true)`.
+// (tls-boring) with `verify_hostname(true)`.
 #[cfg(not(feature = "tls-boring"))]
 use veil_transport::tls::connect_pki_verified_https_stream;
 #[cfg(feature = "tls-boring")]
@@ -151,13 +151,13 @@ pub enum HttpsBootstrapError {
     ChunkTimeout(Duration),
     /// response had multiple `Content-Length`
     /// headers with conflicting values. RFC 7230 §3.3.3 requires
-    /// recipients к reject such messages — they are а classic HTTP
-    /// request-smuggling vector when а proxy и origin disagree on
-    /// which value к honor. Even in our threat model (no proxy in
+    /// recipients to reject such messages — they are a classic HTTP
+    /// request-smuggling vector when a proxy and origin disagree on
+    /// which value to honor. Even in our threat model (no proxy in
     /// front of the daemon), the strict interpretation is cheap
-    /// insurance against future deployments that DO add а proxy.
-    /// Previously parse_content_length silently returned None и we
-    /// fell through к the streaming cap; now we abort с this error.
+    /// insurance against future deployments that DO add a proxy.
+    /// Previously parse_content_length silently returned None and we
+    /// fell through to the streaming cap; now we abort with this error.
     #[error("conflicting Content-Length headers — rejecting per RFC 7230 §3.3.3")]
     ContentLengthConflict,
     #[error("missing `\\r\\n\\r\\n` between headers and body in response")]
@@ -168,13 +168,13 @@ pub enum HttpsBootstrapError {
     BadStatus(u16),
     #[error("parse bundle: {0}")]
     ParseBundle(String),
-    /// Fetched body is а raw JSON `Vec<BootstrapPeer>` (legacy unsigned
-    /// shape), but the active [`BootstrapHttpsPolicy`] requires а
-    /// signed envelope.  TLS gives channel auth ("bytes came от the
-    /// CDN endpoint без on-path tampering") but not endpoint auth —
-    /// если CDN, CA, hosting account или mirror endpoint is
-    /// compromised, attacker swaps the JSON для own peer list.
-    /// Signed bundles defend against this класса compromise.
+    /// Fetched body is a raw JSON `Vec<BootstrapPeer>` (legacy unsigned
+    /// shape), but the active [`BootstrapHttpsPolicy`] requires a
+    /// signed envelope.  TLS gives channel auth ("bytes came from the
+    /// CDN endpoint without on-path tampering") but not endpoint auth —
+    /// if CDN, CA, hosting account or mirror endpoint is
+    /// compromised, attacker swaps the JSON for own peer list.
+    /// Signed bundles defend against this class compromise.
     #[error(
         "policy requires signed bundle but endpoint returned raw JSON; \
          configure `trusted_bundle_issuer_pubkey` to enable signed bundles, \
@@ -182,7 +182,7 @@ pub enum HttpsBootstrapError {
     )]
     SignedBundleRequired,
     /// Signed-envelope decode/verify failed (wrong issuer pubkey,
-    /// tampered envelope, expired bundle, или unsupported sig algo).
+    /// tampered envelope, expired bundle, or unsupported sig algo).
     #[error("signed bundle verify: {0}")]
     SignedBundleVerify(#[from] crate::signed_bundle::SignedBundleError),
     #[error("timed out after {0:?}")]
@@ -196,27 +196,27 @@ pub enum HttpsBootstrapError {
 /// pubkey pinned, [`BootstrapHttpsPolicy::signed_preferred`] without
 /// pinning) protects against compromised TLS endpoints (CDN, CA,
 /// hosting account, mirror endpoint).  Raw-JSON fallback is opt-in via
-/// [`BootstrapHttpsPolicy::legacy_allow_unsigned`] для dev/testnet
-/// builds що haven't yet provisioned а signed bundle.
+/// [`BootstrapHttpsPolicy::legacy_allow_unsigned`] for dev/testnet
+/// builds that haven't yet provisioned a signed bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BootstrapHttpsPolicy {
     /// Pinned issuer pubkey (base64).  When `Some`, signed bundles whose
-    /// embedded `issuer_pk` does NOT match this value ара rejected.
+    /// embedded `issuer_pk` does NOT match this value are rejected.
     /// `None` accepts any internally-consistent signature (envelope
-    /// tamper-proof но не authenticated WHO signed it — same degraded
+    /// tamper-proof but not authenticated WHO signed it — same degraded
     /// mode as `verify_signed_bundle(.., None, ..)`).
     pub trusted_issuer_pubkey: Option<String>,
-    /// Если the fetched body is raw JSON (no signed-bundle magic),
-    /// accept it?  Default `false`.  Set к `true` ONLY для dev/testnet
-    /// configs що haven't yet provisioned а signed bundle.  Production
-    /// builds should reject unsigned bodies к close the TLS-endpoint-
+    /// If the fetched body is raw JSON (no signed-bundle magic),
+    /// accept it?  Default `false`.  Set to `true` ONLY for dev/testnet
+    /// configs that haven't yet provisioned a signed bundle.  Production
+    /// builds should reject unsigned bodies to close the TLS-endpoint-
     /// compromise vector.
     pub legacy_allow_unsigned: bool,
 }
 
 impl BootstrapHttpsPolicy {
-    /// Strict policy: require а signed envelope, pin issuer pubkey,
-    /// reject raw JSON.  This is the safe default для production.
+    /// Strict policy: require a signed envelope, pin issuer pubkey,
+    /// reject raw JSON.  This is the safe default for production.
     pub fn signed_required(issuer_pubkey: impl Into<String>) -> Self {
         Self {
             trusted_issuer_pubkey: Some(issuer_pubkey.into()),
@@ -224,9 +224,9 @@ impl BootstrapHttpsPolicy {
         }
     }
 
-    /// Policy без pinning: accept signed envelopes що ара internally
-    /// consistent (envelope tamper-proof) но без authenticating the
-    /// issuer.  Raw JSON still rejected.  Use only когда the operator
+    /// Policy without pinning: accept signed envelopes that are internally
+    /// consistent (envelope tamper-proof) but without authenticating the
+    /// issuer.  Raw JSON still rejected.  Use only when the operator
     /// pubkey cannot be pinned out-of-band.
     pub fn signed_preferred() -> Self {
         Self {
@@ -235,11 +235,11 @@ impl BootstrapHttpsPolicy {
         }
     }
 
-    /// LEGACY policy: accept raw JSON без any signature.  TLS gives
-    /// channel auth only — compromised CDN, CA, hosting account, или
-    /// mirror endpoint can substitute а malicious peer list and the
-    /// fetcher will accept it.  Use ONLY для dev/testnet builds що
-    /// haven't yet provisioned а signed bundle.
+    /// LEGACY policy: accept raw JSON without any signature.  TLS gives
+    /// channel auth only — compromised CDN, CA, hosting account, or
+    /// mirror endpoint can substitute a malicious peer list and the
+    /// fetcher will accept it.  Use ONLY for dev/testnet builds that
+    /// haven't yet provisioned a signed bundle.
     pub fn legacy_unsigned() -> Self {
         Self {
             trusted_issuer_pubkey: None,
@@ -248,13 +248,13 @@ impl BootstrapHttpsPolicy {
     }
 }
 
-/// Fetch and parse bootstrap peers from `url`, applying `policy` к
+/// Fetch and parse bootstrap peers from `url`, applying `policy` to
 /// govern signed-vs-unsigned handling.
 ///
 /// `url` must be `https://host[:port]/path`; `http://` is intentionally
-/// rejected.  Body is detected as signed (magic `"SB"` prefix) или raw
-/// JSON; signed bundles ара verified against `policy.trusted_issuer_pubkey`
-/// when set.  Raw JSON is accepted only когда `policy.legacy_allow_unsigned`
+/// rejected.  Body is detected as signed (magic `"SB"` prefix) or raw
+/// JSON; signed bundles are verified against `policy.trusted_issuer_pubkey`
+/// when set.  Raw JSON is accepted only when `policy.legacy_allow_unsigned`
 /// is `true`.
 ///
 /// Bounded by [`DEFAULT_FETCH_TIMEOUT`] and [`MAX_RESPONSE_BYTES`].
@@ -267,15 +267,15 @@ pub async fn fetch_seeds_https_with_policy(
     decode_with_policy(&body, policy)
 }
 
-/// Apply `policy` к а fetched body.  Public for unit-testing the
+/// Apply `policy` to a fetched body.  Public for unit-testing the
 /// signed/unsigned decision matrix without spinning up an HTTPS server.
 pub fn decode_with_policy(
     body: &[u8],
     policy: &BootstrapHttpsPolicy,
 ) -> Result<Vec<BootstrapPeer>, HttpsBootstrapError> {
-    // Signed-bundle wire detection: leading 2 bytes ара the magic
+    // Signed-bundle wire detection: leading 2 bytes are the magic
     // `"SB"` (see `signed_bundle::SIGNED_BUNDLE_MAGIC`).  An unsigned
-    // JSON bundle starts с `[` (array) or whitespace, neither matches.
+    // JSON bundle starts with `[` (array) or whitespace, neither matches.
     let looks_signed = body.len() >= 2 && &body[..2] == crate::signed_bundle::SIGNED_BUNDLE_MAGIC;
     if looks_signed {
         let envelope = crate::signed_bundle::decode_signed_bundle(body)
@@ -313,11 +313,11 @@ pub fn decode_with_policy(
 ///
 /// Bounded by [`DEFAULT_FETCH_TIMEOUT`] and [`MAX_RESPONSE_BYTES`].
 ///
-/// **Legacy unsigned mode** — accepts raw JSON без а signed envelope.
+/// **Legacy unsigned mode** — accepts raw JSON without a signed envelope.
 /// Use [`fetch_seeds_https_with_policy`] in new code so production
 /// builds can require signed bundles (closes the TLS-endpoint-
-/// compromise vector — see [`BootstrapHttpsPolicy`]).  Kept для
-/// existing call sites + tests; service-task wiring switches к the
+/// compromise vector — see [`BootstrapHttpsPolicy`]).  Kept for
+/// existing call sites + tests; service-task wiring switches to the
 /// policy-aware version once `legacy_allow_unsigned_bootstrap` config
 /// is in place.
 pub async fn fetch_seeds_https(
@@ -544,18 +544,18 @@ async fn fetch_bytes_https_inner(
     let parsed = parse_https_url(url)?;
     // ALPN advertises ONLY `http/1.1`. Previously
     // we listed `h2` first, claiming the server would "downgrade" — but
-    // ALPN is а binding negotiation, not а suggestion. If а CDN selects
+    // ALPN is a binding negotiation, not a suggestion. If a CDN selects
     // h2 (Cloudflare with HTTP/2-by-default-for-edge), our hand-rolled
     // HTTP/1.1 framing parser gives up reading binary HPACK frames as
     // ASCII headers. Symptom would be sporadic bootstrap/update failures
-    // на specific CDN edges that prefer h2.
+    // on specific CDN edges that prefer h2.
     //
     // DPI fingerprinting impact: minor. Modern browsers offer h2/h3
-    // first, но HTTP/1.1-only is still seen widely (curl default, legacy
-    // mobile, fetch libraries без h2). Anti-censorship benefit of
+    // first, but HTTP/1.1-only is still seen widely (curl default, legacy
+    // mobile, fetch libraries without h2). Anti-censorship benefit of
     // h2-in-ALPN is marginal — TLS ClientHello has many other signals
-    // (cipher suites, SNI, extensions order). Until we implement а real
-    // h2 client, claiming h2 capability is incorrect и harmful.
+    // (cipher suites, SNI, extensions order). Until we implement a real
+    // h2 client, claiming h2 capability is incorrect and harmful.
     let alpn: Vec<Vec<u8>> = vec![b"http/1.1".to_vec()];
     let stream =
         connect_pki_verified_https_stream(parsed.host, parsed.port, Some(parsed.host), &alpn, ctx)
@@ -674,7 +674,7 @@ where
         if !content_length_checked && let Some(sep) = find_subslice(&buf, b"\r\n\r\n") {
             content_length_checked = true;
             // surface conflict-rejection explicitly
-            // instead of silently falling through к the streaming cap.
+            // instead of silently falling through to the streaming cap.
             match parse_content_length(&buf[..sep]) {
                 Ok(Some(declared)) if declared > max_body_bytes => {
                     return Err(HttpsBootstrapError::ContentLengthTooLarge {
@@ -739,7 +739,7 @@ fn parse_content_length(headers: &[u8]) -> Result<Option<usize>, ()> {
             match value {
                 None => value = Some(v),
                 Some(prev) if prev == v => { /* duplicate, identical — accept */ }
-                Some(_) => return Err(()), // conflict → caller maps к ContentLengthConflict
+                Some(_) => return Err(()), // conflict → caller maps to ContentLengthConflict
             }
         }
     }
@@ -981,7 +981,7 @@ mod tests {
         (signed, kp.public_key)
     }
 
-    /// signed-required policy ACCEPTS а properly-signed bundle whose
+    /// signed-required policy ACCEPTS a properly-signed bundle whose
     /// issuer matches the pinned pubkey.
     #[test]
     fn decode_signed_required_accepts_matching_pinned_issuer() {
@@ -1005,8 +1005,8 @@ mod tests {
         );
     }
 
-    /// signed-required + WRONG pinned pubkey rejects а bundle signed
-    /// by а different operator (closes "sybil publishes own bundle"
+    /// signed-required + WRONG pinned pubkey rejects a bundle signed
+    /// by a different operator (closes "sybil publishes own bundle"
     /// vector).
     #[test]
     fn decode_signed_required_rejects_wrong_issuer() {
@@ -1035,7 +1035,7 @@ mod tests {
         assert!(matches!(err, HttpsBootstrapError::SignedBundleRequired));
     }
 
-    /// legacy_unsigned policy (testnet/dev) accepts BOTH signed и raw.
+    /// legacy_unsigned policy (testnet/dev) accepts BOTH signed and raw.
     #[test]
     fn decode_legacy_unsigned_accepts_signed_and_raw() {
         let peers = policy_test_peer();
@@ -1353,7 +1353,7 @@ mod tests {
 
     /// Build a stub fetcher closure backed by a HashMap. Closures
     /// captured by `aggregate_seeds_via_failover` need to satisfy
-    /// `Fn(&str) -> Fut`; we wrap the Map lookup в an immediate
+    /// `Fn(&str) -> Fut`; we wrap the Map lookup in an immediate
     /// async block so the closure shape matches.
     type StubBootstrapFuture = std::pin::Pin<
         Box<
@@ -1481,7 +1481,7 @@ mod tests {
         assert_eq!(r.per_url_errors[0].0, "https://cdn1-blocked.example/seeds");
         assert!(
             r.per_url_errors[0].1.contains("censor blackholed"),
-            "per-URL error message preserved для diagnostic logging"
+            "per-URL error message preserved for diagnostic logging"
         );
     }
 
@@ -1548,7 +1548,7 @@ mod tests {
         assert_eq!(
             r.per_url_seed_counts[0],
             ("https://cdn.example/empty".to_owned(), 0),
-            "successful-but-empty surfaced как (url, 0) in seed counts"
+            "successful-but-empty surfaced as (url, 0) in seed counts"
         );
     }
 

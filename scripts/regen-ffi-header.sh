@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Phase 6.50.b-followup: regenerate `crates/veilclient-ffi/include/veil_ffi.h`
-# от Rust source via cbindgen.
+# from Rust source via cbindgen.
 #
-# Run locally before committing any change к the FFI surface (lib.rs);
-# CI hygiene job runs the same command + `git diff --exit-code` к gate
+# Run locally before committing any change to the FFI surface (lib.rs);
+# CI hygiene job runs the same command + `git diff --exit-code` to gate
 # header drift.
 #
 # Install cbindgen one-time:

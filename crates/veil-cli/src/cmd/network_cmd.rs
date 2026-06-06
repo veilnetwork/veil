@@ -118,7 +118,7 @@ fn gen_owner<I: CommandIo>(
     write_secret(priv_out, &kp.private_key)?;
     context.io.emit(OutputEvent::message(format!(
         "Wrote owner pubkey → {}\nWrote owner privkey → {} (mode 0600)\nAlgo: {algo}\n\n\
-         ⚠ Keep the private key OFFLINE / encrypted backup. Anyone с it can issue admin certs.",
+         ⚠ Keep the private key OFFLINE / encrypted backup. Anyone with it can issue admin certs.",
         pub_out.display(),
         priv_out.display(),
     )));
@@ -133,7 +133,7 @@ fn gen_network_id<I: CommandIo>(
     OsRng.fill_bytes(&mut bytes);
     let hex = bytes_to_hex(&bytes);
     context.io.emit(OutputEvent::message(format!(
-        "network_id = {hex}\n\nCopy this к `[network].network_id` в every member's node.toml.",
+        "network_id = {hex}\n\nCopy this to `[network].network_id` in every member's node.toml.",
     )));
     Ok(())
 }
@@ -290,7 +290,7 @@ fn verify_cert<I: CommandIo>(
 }
 
 fn write_secret(path: &Path, contents: &str) -> veil_cfg::Result<()> {
-    // На Unix: create с mode 0600 so the privkey не world-readable.
+    // On Unix: create with mode 0600 so the privkey not world-readable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -396,7 +396,7 @@ mod tests {
         )
         .expect("gen_owner");
 
-        // 2. sign а member cert
+        // 2. sign a member cert
         let nid = "11".repeat(32);
         let mid = "22".repeat(32);
         let mut c_sign = ctx();

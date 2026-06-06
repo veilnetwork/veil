@@ -57,14 +57,14 @@ pub trait DhtMetrics: Send + Sync {
 
 /// Verifier for P-Net DHT-replicated authentication records. Implemented
 /// by an veilcore adapter wrapping `NetworkAccessGate` — veil-dht
-/// stays oblivious к the cert / ban schema, just routes incoming STOREs
+/// stays oblivious to the cert / ban schema, just routes incoming STOREs
 /// here when the value carries the P-Net authentication magic prefix.
 ///
 /// Returns `true` if the STORE is allowed (record decoded + verified +
 /// key matches the derived ban-DHT key). Returns `false` for any failure
 /// — the DHT layer rejects with [`crate::kademlia::KademliaError::InvalidNetworkRecord`].
 pub trait NetworkAuthGate: Send + Sync {
-    /// Verify а STORE payload that carries the P-Net `PBAN` magic.
+    /// Verify a STORE payload that carries the P-Net `PBAN` magic.
     /// `key` is the DHT key (must derive of the ban target); `value` is
     /// the encoded ban blob (including the magic prefix).
     fn verify_ban_record(&self, key: &[u8; 32], value: &[u8]) -> bool;
@@ -90,13 +90,13 @@ pub struct DhtRuntimeConfig {
     pub find_node_timeout_ms: u64,
     pub vivaldi_weight: f64,
     pub max_store_entries: usize,
-    /// Optional global byte budget для the TieredStore.  See
+    /// Optional global byte budget for the TieredStore.  See
     /// `veil_cfg::DhtConfig::max_store_bytes` (audit batch 2026-05-23).
     /// `None` = no byte cap, only the entry cap applies.
     pub max_store_bytes: Option<u64>,
-    /// Per-signer byte budget (Этап 11e).  See
+    /// Per-signer byte budget (Phase 11e).  See
     /// `veil_cfg::DhtConfig::per_origin_max_bytes`.  `None` = no
-    /// per-origin cap; а single misbehaving signer can still saturate
+    /// per-origin cap; a single misbehaving signer can still saturate
     /// up to the global cap (or the entry cap when the global cap is
     /// `None`).
     pub per_origin_max_bytes: Option<u64>,

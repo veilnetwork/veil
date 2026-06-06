@@ -1,21 +1,21 @@
 //! Re-export shim for the extracted [`veil-session`](veil_session) crate.
 //!
-//! Phase 2 of `veilcore` extraction (см.
+//! Phase 2 of `veilcore` extraction (see
 //! [`docs/en/PLAN_VEILCORE_EXTRACTION.md`](../../../docs/en/PLAN_VEILCORE_EXTRACTION.md)):
-//! all session production code (27 files, ~21 KLoC) moved к the
+//! all session production code (27 files, ~21 KLoC) moved to the
 //! sibling crate.  This module preserves the existing
 //! `crate::node::session::X` import paths so the rest of veilcore
-//! (dispatcher, runtime, node bootstrap) does not need а mass
+//! (dispatcher, runtime, node bootstrap) does not need a mass
 //! find/replace.
 //!
-//! Integration tests + chaos sim stay here because они need а
-//! real `FrameDispatcher` (Strategy A в the plan doc).
+//! Integration tests + chaos sim stay here because they need a
+//! real `FrameDispatcher` (Strategy A in the plan doc).
 
 pub use veil_session::*;
 
-// Wildcard re-exports от the runner module so `runner_tests.rs`'s
+// Wildcard re-exports from the runner module so `runner_tests.rs`'s
 // `super::*` reaches every helper fn / struct it touches.  Bulk-promote
-// applied к runner.rs items moved every previous `pub(crate)` к `pub`.
+// applied to runner.rs items moved every previous `pub(crate)` to `pub`.
 pub use veil_session::runner::*;
 
 // Sub-module re-exports for callers using fully-qualified paths
@@ -51,11 +51,11 @@ pub use veil_session::write_error_tracker;
 #[cfg(test)]
 pub(crate) mod chaos_sim;
 
-// `runner_tests.rs` extracted к the standalone
+// `runner_tests.rs` extracted to the standalone
 // `crates/veil-session-integration-tests/tests/runner_tests.rs` (audit
-// batch 2026-05-21 Phase D14).  5568 LoC що previously coupled the
+// batch 2026-05-21 Phase D14).  5568 LoC that previously coupled the
 // veilcore-private dispatcher factory + session shim's `use super::*;`
-// now compile против the published surface of veil-session +
+// now compile against the published surface of veil-session +
 // sibling crates.
 
 #[cfg(test)]

@@ -1,27 +1,27 @@
 ---
-# Roll out P-Net (private veil network) onto а pre-existing public-mode
+# Roll out P-Net (private veil network) onto a pre-existing public-mode
 # cluster.
 #
-# Pre-requisites (run на controller before this playbook):
+# Pre-requisites (run on controller before this playbook):
 #   1. veil-cli network gen-owner --pub-out /tmp/pnet/owner.pub --priv-out /tmp/pnet/owner.priv
-#   2. veil-cli network gen-network-id   (saved к /tmp/pnet/network_id.hex)
+#   2. veil-cli network gen-network-id   (saved to /tmp/pnet/network_id.hex)
 #   3. For each host, one signed cert at /tmp/pnet/<cfg-name>.cert
 #      (where cfg-name = b1/b2/b3 + n1..n5 — see inv_to_cfg map below).
 #
 # What this playbook does (serial:1 rolling):
 #   - Push the host's cert to /var/lib/veil/network.cert (mode 0644, veil-owned)
-#   - Patch node.toml: replace-or-add а `[network]` block с mode=private,
-#     network_id, owner_pubkey, owner_algo, membership_cert path, и
+#   - Patch node.toml: replace-or-add a `[network]` block with mode=private,
+#     network_id, owner_pubkey, owner_algo, membership_cert path, and
 #     admin_node_ids allowlist (b1/b2/b3 — bootstraps act as admins).
 #   - Restart veil.service
-#   - Wait for metrics endpoint к come back
+#   - Wait for metrics endpoint to come back
 #   - Validate config
 #
 # Run:
 #   ansible-playbook -i inventory.yml deploy-pnet.yml
 #
 # Rollback: remove the `[network]` block from node.toml + restart, OR set
-# `mode = "public"` (gate is a no-op в public mode).
+# `mode = "public"` (gate is a no-op in public mode).
 
 - name: Roll out P-Net private mode
   hosts: all
@@ -91,7 +91,7 @@
     - name: Drop any prior [network] block (idempotent)
       ansible.builtin.replace:
         path: /var/lib/veil/node.toml
-        # Match а `[network]\n…\n` block delimited by next `\n[` or EOF.
+        # Match a `[network]\n…\n` block delimited by next `\n[` or EOF.
         regexp: '(?ms)^\[network\]\n.*?(?=^\[|\Z)'
         replace: ''
 
@@ -123,7 +123,7 @@
         name: veil.service
         state: started
 
-    - name: Wait for node к come back online (metrics endpoint = readiness probe)
+    - name: Wait for node to come back online (metrics endpoint = readiness probe)
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 30); do
@@ -137,7 +137,7 @@
           exit 1
       changed_when: false
 
-    - name: Restart chat-node после veil restart
+    - name: Restart chat-node after veil restart
       ansible.builtin.systemd:
         name: chat-node.service
         state: restarted

@@ -16,7 +16,7 @@ pub struct RuntimeMobileStatus {
     /// Path to the on-disk config; reloaded on every snapshot so the
     /// reply reflects edits made since startup (mirrors UpdateStatus /
     /// BootstrapStatus semantics — operator who tweaked `[mobile]`
-    /// gets fresh view без admin reload).
+    /// gets fresh view without admin reload).
     config_path: PathBuf,
 }
 

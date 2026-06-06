@@ -604,7 +604,7 @@
     {
       "id": 22,
       "title": "Iterative-DHT fallback rate (Phase 6.50.b)",
-      "description": "Fires when legacy RouteRequest flood (TTL=7) exhausts retries и we fall through к RecursiveQuery(FIND_NODE).  Triggered = total fallback invocations.  Resolved = RecursiveResponse arrived within RECURSIVE_TIMEOUT (10s) и dispatcher auto-populated route_cache.  Miss = timeout без response.  Healthy: triggered rate proportional к route-miss-rate; resolved/(resolved+miss) ratio > 50%.  High miss rate indicates network diameter exceeds RecursiveQuery TTL=40 OR CPU pressure dropping reverse-path responses.",
+      "description": "Fires when legacy RouteRequest flood (TTL=7) exhausts retries and we fall through to RecursiveQuery(FIND_NODE).  Triggered = total fallback invocations.  Resolved = RecursiveResponse arrived within RECURSIVE_TIMEOUT (10s) and dispatcher auto-populated route_cache.  Miss = timeout without response.  Healthy: triggered rate proportional to route-miss-rate; resolved/(resolved+miss) ratio > 50%.  High miss rate indicates network diameter exceeds RecursiveQuery TTL=40 OR CPU pressure dropping reverse-path responses.",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -747,7 +747,7 @@
     {
       "id": 30,
       "title": "Buffer pool throughput (Phase 6.50.d — hot path recycle rate)",
-      "description": "cache_hit_total = pool returned а cached buffer (zero malloc).  fallback_alloc_total = bucket empty, fresh heap alloc (rare in steady state).  Healthy: hit/(hit+fb) > 99.99%.  Spike in fb rate = bucket cap too small или burst exceeds pool budget.  return_anomaly = caller mutated buffer capacity in а way pool can't cache; should be 0.",
+      "description": "cache_hit_total = pool returned a cached buffer (zero malloc).  fallback_alloc_total = bucket empty, fresh heap alloc (rare in steady state).  Healthy: hit/(hit+fb) > 99.99%.  Spike in fb rate = bucket cap too small or burst exceeds pool budget.  return_anomaly = caller mutated buffer capacity in a way pool can't cache; should be 0.",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -840,7 +840,7 @@
     {
       "id": 32,
       "title": "Session-plane state (live + tx/outbox registries)",
-      "description": "live_sessions = open transport sessions.  session_tx_registry = peers с outbound frame channel.  session_outbox = peers с RPC outbox.  Should track 1:1 in steady state; divergence indicates teardown lag (sessions cleaned up faster than registries OR vice-versa).",
+      "description": "live_sessions = open transport sessions.  session_tx_registry = peers with outbound frame channel.  session_outbox = peers with RPC outbox.  Should track 1:1 in steady state; divergence indicates teardown lag (sessions cleaned up faster than registries OR vice-versa).",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -942,7 +942,7 @@
     {
       "id": 34,
       "title": "DHT sub-stores (store / transport_cache / lookup_cache / pending_recursive)",
-      "description": "dht_store = replicated value-store entries (TieredStore: hot + cold tiers).  transport_cache = resolved SignedTransportAnnouncement entries (TTL).  lookup_cache = in-flight iterative-lookup state.  pending_recursive = correlator entries для RecursiveQuery responses (cap MAX_PENDING_RECURSIVE=1024).  All cap-bounded.",
+      "description": "dht_store = replicated value-store entries (TieredStore: hot + cold tiers).  transport_cache = resolved SignedTransportAnnouncement entries (TTL).  lookup_cache = in-flight iterative-lookup state.  pending_recursive = correlator entries for RecursiveQuery responses (cap MAX_PENDING_RECURSIVE=1024).  All cap-bounded.",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -1062,7 +1062,7 @@
     {
       "id": 36,
       "title": "Chunk reassembler — transfers in-flight + bytes buffered",
-      "description": "transfers = in-progress chunked transfers awaiting completion.  bytes = total reassembly memory across them (cap MAX_REASSEMBLY_BYTES).  Should be 0 в idle clusters; spikes correlate с large multi-chunk DHT value transfers OR Epic 290 route-discovery floods.",
+      "description": "transfers = in-progress chunked transfers awaiting completion.  bytes = total reassembly memory across them (cap MAX_REASSEMBLY_BYTES).  Should be 0 in idle clusters; spikes correlate with large multi-chunk DHT value transfers OR Epic 290 route-discovery floods.",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -1104,7 +1104,7 @@
     {
       "id": 37,
       "title": "Ban list size + BootstrapWatchdog retries",
-      "description": "ban_list = entries in BanList (manual + temporary + ML decisions, cap MAX_BAN_LIST_SIZE).  bootstrap_watchdog_retries_total = times the partition-recovery loop re-dialed bootstraps after detecting all sessions torn down (Phase 6.50.c).  Watchdog retries are operator-alerting: non-zero means partition was detected и recovered.",
+      "description": "ban_list = entries in BanList (manual + temporary + ML decisions, cap MAX_BAN_LIST_SIZE).  bootstrap_watchdog_retries_total = times the partition-recovery loop re-dialed bootstraps after detecting all sessions torn down (Phase 6.50.c).  Watchdog retries are operator-alerting: non-zero means partition was detected and recovered.",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",

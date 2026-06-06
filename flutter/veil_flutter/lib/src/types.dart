@@ -27,17 +27,17 @@ enum NetworkKind {
 /// Push event kind — mirrors `veil_proto::event_kind`.
 ///
 /// Forward-compat: a daemon emitting a kind we don't recognise yields
-/// [VeilEventKind.unknown] и the raw byte is preserved on
+/// [VeilEventKind.unknown] and the raw byte is preserved on
 /// [VeilEvent.rawKind] for forensic display.
 enum VeilEventKind {
   sessionsChanged(ffi.veilEventSessionsChanged),
   mobileTierChanged(ffi.veilEventMobileTierChanged),
   identityRotated(ffi.veilEventIdentityRotated),
-  /// Mailbox fetch (drain) completed.  Carries а 4-byte BE blob-count.
+  /// Mailbox fetch (drain) completed.  Carries a 4-byte BE blob-count.
   /// Background-handler consumers (iOS BGProcessingTask, Android
   /// background workers) subscribe to this so they can `setTaskCompleted`
-  /// precisely when the daemon is done draining rather than padding к
-  /// а hardcoded timeout.  See [VeilEvent.drainedCount] helper.
+  /// precisely when the daemon is done draining rather than padding to
+  /// a hardcoded timeout.  See [VeilEvent.drainedCount] helper.
   mailboxDrained(ffi.veilEventMailboxDrained),
   unknown(-1);
 
@@ -91,12 +91,12 @@ class VeilEvent {
     return null;
   }
 
-  /// Convenience: decode `MAILBOX_DRAINED` payload as а `u32 BE` blob
+  /// Convenience: decode `MAILBOX_DRAINED` payload as a `u32 BE` blob
   /// count (number of blobs delivered by the just-completed mailbox
   /// fetch).  Returns `null` if [kind] is not
-  /// [VeilEventKind.mailboxDrained] или the payload is malformed.
+  /// [VeilEventKind.mailboxDrained] or the payload is malformed.
   ///
-  /// Background-handlers typically await this event с а timeout (e.g.,
+  /// Background-handlers typically await this event with a timeout (e.g.,
   /// iOS BGProcessingTask's ~30 s budget): event arrives → call
   /// `setTaskCompleted(success: true)`; budget expires → fall back.
   int? get drainedCount {
@@ -116,11 +116,11 @@ class VeilEvent {
 /// Status return from a mailbox PUT operation.  Mirrors
 /// `veil_proto::MailboxPutStatus` on the wire (bytes 0..8).
 ///
-/// Values ≥ [stored] represent а structured outcome from the daemon;
+/// Values ≥ [stored] represent a structured outcome from the daemon;
 /// negative codes (transport / argument errors) are surfaced through
 /// [VeilException].
 enum MailboxPutStatus {
-  /// Blob accepted и stored.  [MailboxPutResult.evicted] may indicate
+  /// Blob accepted and stored.  [MailboxPutResult.evicted] may indicate
   /// older blobs the relay dropped to fit.
   stored(ffi.veilMailboxPutStored),
 
@@ -137,30 +137,30 @@ enum MailboxPutStatus {
   /// Per-source rate limit triggered.
   rateLimited(ffi.veilMailboxPutRateLimited),
 
-  /// Targeted node is not configured as а mailbox relay.
+  /// Targeted node is not configured as a mailbox relay.
   notRelay(ffi.veilMailboxPutNotRelay),
 
-  /// Relay requires capability tokens но this PUT had none.  Caller
+  /// Relay requires capability tokens but this PUT had none.  Caller
   /// should re-fetch the receiver's RendezvousAd, extract the
-  /// per-replica `capability_token`, и retry с it.
+  /// per-replica `capability_token`, and retry with it.
   capabilityRequired(ffi.veilMailboxPutCapabilityRequired),
 
   /// Supplied capability token decoded but failed verification
-  /// (expired, wrong receiver, bad signature, или wrong relay binding
+  /// (expired, wrong receiver, bad signature, or wrong relay binding
   /// for the targeted replica).
   capabilityInvalid(ffi.veilMailboxPutCapabilityInvalid),
 
-  /// Per-sender byte cap exceeded на the relay (`sender_id` пишет
-  /// больше своей доли).
+  /// Per-sender byte cap exceeded on the relay (`sender_id` writes
+  /// more than its share).
   quotaPerSender(ffi.veilMailboxPutQuotaPerSender),
 
-  /// Forward-compat: daemon returned а status byte we don't recognise.
+  /// Forward-compat: daemon returned a status byte we don't recognise.
   unknown(-1);
 
   const MailboxPutStatus(this.wireByte);
   final int wireByte;
 
-  /// Map а wire byte from the FFI surface back to an enum value.
+  /// Map a wire byte from the FFI surface back to an enum value.
   /// Unrecognised bytes yield [MailboxPutStatus.unknown] — the consumer
   /// can still inspect the raw byte through whatever logged it.
   static MailboxPutStatus fromWire(int b) {
@@ -171,7 +171,7 @@ enum MailboxPutStatus {
   }
 }
 
-/// Result of а mailbox PUT operation.
+/// Result of a mailbox PUT operation.
 class MailboxPutResult {
   const MailboxPutResult({required this.status, required this.evicted});
 
@@ -179,7 +179,7 @@ class MailboxPutResult {
   final MailboxPutStatus status;
 
   /// On [MailboxPutStatus.stored], count of older blobs the relay had
-  /// к evict к fit this one.  Zero on other statuses.
+  /// to evict to fit this one.  Zero on other statuses.
   final int evicted;
 
   @override
@@ -209,9 +209,9 @@ class MailboxBlob {
   final Uint8List data;
 }
 
-/// One rendezvous replica advertised for а receiver (push wake-HMAC
+/// One rendezvous replica advertised for a receiver (push wake-HMAC
 /// end-to-end).  Returned by [VeilMailbox.lookupRendezvousReplicas];
-/// senders use it to deposit а blob via [VeilMailbox.put] together
+/// senders use it to deposit a blob via [VeilMailbox.put] together
 /// with the matching [pushEnvelope] / [capabilityToken] /
 /// [wakeHmacEnvelope] so the relay can fire an authenticated wake-push.
 class RendezvousReplica {
@@ -227,20 +227,20 @@ class RendezvousReplica {
   final Uint8List relayNodeId;
 
   /// Unix-seconds expiry — the replica entry is stale past this point
-  /// и senders should re-look-up rather than deposit against it.
+  /// and senders should re-look-up rather than deposit against it.
   final int validUntilUnix;
 
-  /// Sealed FCM/APNs push envelope (opaque to the sender); pass через
+  /// Sealed FCM/APNs push envelope (opaque to the sender); pass through
   /// to [VeilMailbox.put]'s `pushEnvelope`.  Empty when the receiver
   /// published no push envelope for this replica.
   final Uint8List pushEnvelope;
 
-  /// Receiver-signed capability token for this replica; pass через to
+  /// Receiver-signed capability token for this replica; pass through to
   /// [VeilMailbox.put]'s `capabilityToken`.  Empty when the replica's
   /// relay does not require capability tokens.
   final Uint8List capabilityToken;
 
-  /// Sealed wake-HMAC envelope (opaque to the sender); pass через to
+  /// Sealed wake-HMAC envelope (opaque to the sender); pass through to
   /// [VeilMailbox.put]'s `wakeHmacEnvelope`.  Empty when the receiver
   /// published no wake-HMAC envelope for this replica.
   final Uint8List wakeHmacEnvelope;
@@ -252,33 +252,33 @@ class RendezvousReplica {
       'capLen=${capabilityToken.length}, wakeLen=${wakeHmacEnvelope.length})';
 }
 
-/// Result wire byte from а bootstrap-invite consume (Epic 489.7).
+/// Result wire byte from a bootstrap-invite consume (Epic 489.7).
 /// Mirrors `veil_proto::JoinBootstrapStatus`.
 enum JoinBootstrapStatus {
   /// Invite accepted, peer is now registered for outbound dial.
   ok(ffi.veilJoinOk),
 
   /// URI failed plain / encrypted / signed decoding.  Could be typo
-  /// or wrong invite-protocol version (e.g. ancient invite from а
+  /// or wrong invite-protocol version (e.g. ancient invite from a
   /// pre-v3 daemon).
   invalidUri(ffi.veilJoinInvalidUri),
 
   /// Invite is encrypted but caller passed no passphrase.  UI should
-  /// prompt и retry с the user-supplied secret.
+  /// prompt and retry with the user-supplied secret.
   passwordRequired(ffi.veilJoinPasswordRequired),
 
-  /// Caller supplied а passphrase that failed Argon2id verify.  UI
-  /// should re-prompt — wrong passphrases ара indistinguishable from
+  /// Caller supplied a passphrase that failed Argon2id verify.  UI
+  /// should re-prompt — wrong passphrases are indistinguishable from
   /// "expired key", so guidance should suggest checking case / spaces.
   passwordWrong(ffi.veilJoinPasswordWrong),
 
-  /// Invite was signed но the signature didn't verify against the
-  /// `expectedIssuerPk` (или the invite was tampered).  Refusal-к-pair
-  /// — do NOT prompt the user к "try again" с the same URI.
+  /// Invite was signed but the signature didn't verify against the
+  /// `expectedIssuerPk` (or the invite was tampered).  Refusal-to-pair
+  /// — do NOT prompt the user to "try again" with the same URI.
   signatureInvalid(ffi.veilJoinSignatureInvalid),
 
-  /// Daemon-side I/O или RPC failure — typically transient.  UI can
-  /// suggest "check connection и retry".
+  /// Daemon-side I/O or RPC failure — typically transient.  UI can
+  /// suggest "check connection and retry".
   internalError(ffi.veilJoinInternalError),
 
   /// Peer was already registered before this call (idempotent re-pair).
@@ -286,7 +286,7 @@ enum JoinBootstrapStatus {
   /// populated correctly.
   alreadyRegistered(ffi.veilJoinAlreadyRegistered),
 
-  /// Forward-compat: daemon returned а status byte we don't recognise.
+  /// Forward-compat: daemon returned a status byte we don't recognise.
   unknown(-1);
 
   const JoinBootstrapStatus(this.wireByte);
@@ -303,24 +303,24 @@ enum JoinBootstrapStatus {
 /// Status return from [VeilClient.createBootstrapInvite] (Epic
 /// 489.7 generator side).  Mirrors `veil_proto::create_invite_status`.
 enum CreateBootstrapInviteStatus {
-  /// Invite assembled и encoded.  [CreateBootstrapInviteResult.uri] is
+  /// Invite assembled and encoded.  [CreateBootstrapInviteResult.uri] is
   /// populated.
   ok(ffi.veilCreateInviteOk),
 
-  /// Daemon's config has no `[identity]` или no `[[listen]]` entry.
-  /// Detail names which.  Surface as а setup-required nudge in the
+  /// Daemon's config has no `[identity]` or no `[[listen]]` entry.
+  /// Detail names which.  Surface as a setup-required nudge in the
   /// UI ("run identity create first").
   notConfigured(ffi.veilCreateInviteNotConfigured),
 
   /// Caller-supplied password failed validation (empty / oversized).
-  /// UI should re-prompt с а strength hint.
+  /// UI should re-prompt with a strength hint.
   badPassword(ffi.veilCreateInviteBadPassword),
 
-  /// Daemon-internal failure (encode error, hybrid identity на encrypted
-  /// path, …).  Surface as а transient retry suggestion.
+  /// Daemon-internal failure (encode error, hybrid identity on encrypted
+  /// path, …).  Surface as a transient retry suggestion.
   internalError(ffi.veilCreateInviteInternalError),
 
-  /// Forward-compat: daemon returned а status byte we don't recognise.
+  /// Forward-compat: daemon returned a status byte we don't recognise.
   unknown(-1);
 
   const CreateBootstrapInviteStatus(this.wireByte);
@@ -357,26 +357,26 @@ class CreateBootstrapInviteResult {
       'uriLen=${uri.length}, detail=${detail ?? "<none>"})';
 }
 
-/// Status return от Source-side multi-device pairing ops
+/// Status return from Source-side multi-device pairing ops
 /// (Epic 489.8).  Mirrors `veil_proto::pair_source_status`.
 enum PairSourceStatus {
   /// Operation succeeded.
   ok(ffi.veilPairSourceOk),
 
   /// Daemon has no sovereign identity OR caller did not supply
-  /// а master_password to decrypt `master.enc`.  Detail names which.
+  /// a master_password to decrypt `master.enc`.  Detail names which.
   notConfigured(ffi.veilPairSourceNotConfigured),
 
-  /// А Source ceremony is already в progress; cancel it OR wait for
-  /// timeout before issuing а new `createInvite`.
+  /// A Source ceremony is already in progress; cancel it OR wait for
+  /// timeout before issuing a new `createInvite`.
   alreadyInProgress(ffi.veilPairSourceAlreadyInProgress),
 
   /// Daemon-internal failure (encode error, master.enc decrypt fail,
   /// I/O error on persist, …).
   internalError(ffi.veilPairSourceInternalError),
 
-  /// Ceremony state mismatch — e.g. `handleHello` без prior
-  /// `createInvite`, или `handleConfirm` без prior `handleHello`.
+  /// Ceremony state mismatch — e.g. `handleHello` without prior
+  /// `createInvite`, or `handleConfirm` without prior `handleHello`.
   wrongState(ffi.veilPairSourceWrongState),
 
   /// `handleHello`: Target's Hello payload failed MAC / pair_secret
@@ -390,7 +390,7 @@ enum PairSourceStatus {
   /// `handleConfirm`: Confirm proof failed verification.
   badConfirm(ffi.veilPairSourceBadConfirm),
 
-  /// Forward-compat: daemon returned а status byte we don't recognise.
+  /// Forward-compat: daemon returned a status byte we don't recognise.
   unknown(-1);
 
   const PairSourceStatus(this.wireByte);
@@ -404,7 +404,7 @@ enum PairSourceStatus {
   }
 }
 
-/// Status return от Target-side ops (Epic 489.8).  Mirrors
+/// Status return from Target-side ops (Epic 489.8).  Mirrors
 /// `veil_proto::pair_target_status`.
 enum PairTargetStatus {
   ok(ffi.veilPairTargetOk),
@@ -436,7 +436,7 @@ class PairCreateInviteResult {
   });
   final PairSourceStatus status;
 
-  /// Pairing URI к QR-encode + show к target user.  Empty на error.
+  /// Pairing URI to QR-encode + show to target user.  Empty on error.
   final String uri;
 
   /// Daemon-side advisory message (e.g. "ttl expired", "master.enc
@@ -455,11 +455,11 @@ class PairOobResult {
     this.detail,
   });
 
-  /// Raw wire byte — каллер decodes к `PairSourceStatus` (for source
-  /// ops) или `PairTargetStatus` (for target ops).
+  /// Raw wire byte — caller decodes to `PairSourceStatus` (for source
+  /// ops) or `PairTargetStatus` (for target ops).
   final int statusByte;
 
-  /// 6-character ASCII OOB code (empty string на error).  User
+  /// 6-character ASCII OOB code (empty string on error).  User
   /// visually compares against the peer's screen.
   final String oobCode;
 
@@ -504,13 +504,13 @@ class JoinBootstrapResult {
   final JoinBootstrapStatus status;
 
   /// 32-byte BLAKE3 hash of the new peer's signing pubkey.  Zero-filled
-  /// when [status] is а terminal failure (invalidUri / signatureInvalid /
-  /// internalError) — daemon couldn't extract а node_id from а
+  /// when [status] is a terminal failure (invalidUri / signatureInvalid /
+  /// internalError) — daemon couldn't extract a node_id from a
   /// failed-decode invite.
   final Uint8List peerNodeId;
 
   /// Free-form daemon-side message — typically empty on success, fills
-  /// с decode-error details on failure (e.g. "version 1 invite, daemon
+  /// with decode-error details on failure (e.g. "version 1 invite, daemon
   /// supports v3+").
   final String? detail;
 
@@ -550,12 +550,12 @@ class VeilException implements Exception {
 
 /// Outcome of [VeilPush.verifyWakePayload] (Epic 489.10 slice 4.3.3).
 ///
-/// Distinct values для each failure mode so receivers can surface
-/// each differently — operators care about clock-skew rate as а
-/// separate metric от active forging attempts.
+/// Distinct values for each failure mode so receivers can surface
+/// each differently — operators care about clock-skew rate as a
+/// separate metric from active forging attempts.
 ///
 /// Receiver's `handleWakeup` flow:
-///   * [valid] — proceed к drain mailbox + foreground promotion.
+///   * [valid] — proceed to drain mailbox + foreground promotion.
 ///   * [tamperedOrForged] / [expired] / [malformedLength] — silent
 ///     no-op (defeats presence oracle); optionally log metric.
 ///   * [unknown] — forward-compat fallback for future verdict values.
@@ -564,8 +564,8 @@ enum WakePayloadVerdict {
   tamperedOrForged(ffi.veilWakeVerdictTampered),
   expired(ffi.veilWakeVerdictExpired),
   malformedLength(ffi.veilWakeVerdictMalformed),
-  /// Forward-compat: FFI returned а verdict byte the Dart binding
-  /// does not recognise.  Should be treated as а silent failure
+  /// Forward-compat: FFI returned a verdict byte the Dart binding
+  /// does not recognise.  Should be treated as a silent failure
   /// (do not drain).
   unknown(-1);
 

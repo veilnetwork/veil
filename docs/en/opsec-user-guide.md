@@ -187,7 +187,7 @@ one step.
 
 An attacker registers `@a1ice` — with the digit one in place of the letter "l" —
 hoping you won't notice. Or they try swapping the Latin "a" for the Cyrillic
-letter "а" (Unicode U+0430), which looks identical.
+letter at Unicode U+0430, which looks identical.
 
 How the protocol helps: Veil only allows plain ASCII letters in names and blocks
 Unicode characters entirely, so the Cyrillic look-alike is rejected outright.

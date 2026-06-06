@@ -2,37 +2,37 @@
 //!
 //! # Threat model
 //!
-//! The vanilla 485.1{a,b,c,d} scenarios snap-shot the network at а
-//! single moment.  Real adversaries operate в continuous time: they
+//! The vanilla 485.1{a,b,c,d} scenarios snap-shot the network at a
+//! single moment.  Real adversaries operate in continuous time: they
 //! stay online persistently, while honest nodes churn (laptops sleep,
 //! cellular drops, daily-restart maintenance cycles).  Over 24h
-//! periods, three eclipse paths open up that don't show в а snapshot:
+//! periods, three eclipse paths open up that don't show in a snapshot:
 //!
 //! 1. **Honest-fade**: persistent sybils outweigh transient honest
-//!    nodes в the routing table simply by being available более reliably.
+//!    nodes in the routing table simply by being available more reliably.
 //! 2. **Re-discovery skew**: when an honest peer comes back online,
-//!    its FIRST few outgoing lookups walk через а sybil-heavy seed
+//!    its FIRST few outgoing lookups walk through a sybil-heavy seed
 //!    set (since sybils were the only "live" peers during its offline
 //!    window).
 //! 3. **Bucket-decay drift**: time-based bucket-rate budget resets
-//!    let а sybil cluster slowly fill slots one-per-resetCycle even
-//!    если each individual round is bounded.
+//!    let a sybil cluster slowly fill slots one-per-resetCycle even
+//!    if each individual round is bounded.
 //!
 //! # Scenario
 //!
-//! Uses `tokio::time::pause` к compress а simulated 24h into seconds.
-//! Builds а 30-node mesh (25 honest + 5 sybils ≈ 16 % adversary
+//! Uses `tokio::time::pause` to compress a simulated 24h into seconds.
+//! Builds a 30-node mesh (25 honest + 5 sybils ≈ 16 % adversary
 //! fraction).  Each simulated hour, 30 % of honest nodes go offline
-//! и а different 30 % come back online — sybils ара always online.
-//! Victim runs `find_node_iterative` once per simulated hour и
+//! and a different 30 % come back online — sybils are always online.
+//! Victim runs `find_node_iterative` once per simulated hour and
 //! accumulates the union of all discovered contacts.
 //!
 //! # Validation
 //!
 //! After 24 simulated hours, the cumulative-discovered set's sybil
-//! fraction must stay below а bound proportional к the population
-//! ratio — sybils ара never going к disappear, но they shouldn't
-//! dominate due к churn-amplified availability bias.
+//! fraction must stay below a bound proportional to the population
+//! ratio — sybils are never going to disappear, but they shouldn't
+//! dominate due to churn-amplified availability bias.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -45,14 +45,14 @@ use veil_util::lock;
 use crate::iterative::{FindValueResult, IterativeParams, PeerQuerier, find_node_iterative};
 use crate::routing::{Contact, RoutingTable};
 
-/// Churning [`PeerQuerier`] wrapper.  Wraps an inner querier и tracks
-/// а per-node "offline" set: queries к offline nodes return empty,
-/// matching the network behaviour where а timed-out peer's reply is
-/// indistinguishable от "no contacts known".
+/// Churning [`PeerQuerier`] wrapper.  Wraps an inner querier and tracks
+/// a per-node "offline" set: queries to offline nodes return empty,
+/// matching the network behaviour where a timed-out peer's reply is
+/// indistinguishable from "no contacts known".
 ///
-/// Designed for tokio-time-paused tests где simulated hours advance
-/// в zero wall-clock; the offline-set is updated explicitly via
-/// [`Self::set_offline`] от the test driver.
+/// Designed for tokio-time-paused tests where simulated hours advance
+/// in zero wall-clock; the offline-set is updated explicitly via
+/// [`Self::set_offline`] from the test driver.
 pub struct ChurningPeerQuerier {
     inner: Arc<dyn PeerQuerier>,
     offline: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
@@ -118,12 +118,12 @@ mod tests {
     /// Topology: 25 honest + 5 sybils = 30 total (16.7 % sybil
     /// fraction).
     ///
-    /// Churn model: each simulated hour, 30 % of honest nodes ара
+    /// Churn model: each simulated hour, 30 % of honest nodes are
     /// offline.  Different 30 % each hour (randomised), so over 24h
     /// each honest node averages ~30 % offline time.  Sybils stay
     /// online 100 % of the time.
     ///
-    /// Victim runs `find_node` once per hour и accumulates the union
+    /// Victim runs `find_node` once per hour and accumulates the union
     /// of discovered contacts across all hours.  After 24h:
     /// * Total discoveries should include most honest nodes (~25
     ///   given the union grows over the period).
@@ -132,7 +132,7 @@ mod tests {
     ///
     /// **Bound**: sybil fraction ≤ 30 % — generous headroom over the
     /// 16.7 % population ratio.  Tighter bound would flake on rare
-    /// scenarios где the random offline-set happens к ban most honest
+    /// scenarios where the random offline-set happens to ban most honest
     /// nodes during the victim's lookup hour.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn epic485_1_c_24h_churn_does_not_amplify_sybil_eclipse() {
@@ -167,11 +167,11 @@ mod tests {
             inner.add_node(nid, rt);
         }
 
-        // Step 3 — wrap с churn layer.
+        // Step 3 — wrap with churn layer.
         let churn = Arc::new(ChurningPeerQuerier::new(inner));
 
-        // Step 4 — simulate 24 hours.  Each hour: pick а random 30 %
-        // honest-subset к take offline, then victim runs find_node.
+        // Step 4 — simulate 24 hours.  Each hour: pick a random 30 %
+        // honest-subset to take offline, then victim runs find_node.
         let mut cumulative_discovered: HashSet<[u8; 32]> = HashSet::new();
         let offline_per_hour = HONEST_COUNT * HOURLY_OFFLINE_FRACTION / 100;
         let params = IterativeParams::default();
@@ -179,7 +179,7 @@ mod tests {
         for _hour in 0..SIM_HOURS {
             // Roll the offline set for this hour.
             let mut offline: HashSet<[u8; 32]> = HashSet::new();
-            // Take а random subset of honest_ids of size `offline_per_hour`.
+            // Take a random subset of honest_ids of size `offline_per_hour`.
             let mut indices: Vec<usize> = (0..HONEST_COUNT).collect();
             // Fisher-Yates shuffle prefix.
             for i in 0..offline_per_hour {
@@ -193,12 +193,12 @@ mod tests {
             offline.remove(&victim_id);
             churn.set_offline(offline);
 
-            // Pick а random target и run iterative.
+            // Pick a random target and run iterative.
             let mut target = [0u8; 32];
             OsRng.fill_bytes(&mut target);
             // Seed contacts: small subset of the full population (so
-            // the walk has к expand) — но both honest и sybils
-            // включены, matching realistic re-discovery.
+            // the walk has to expand) — but both honest and sybils
+            // enabled, matching realistic re-discovery.
             let seed: Vec<Contact> = node_ids
                 .iter()
                 .take(8)
@@ -212,7 +212,7 @@ mod tests {
 
             // Advance simulated clock by 1 hour.  tokio::time::pause
             // means real wall-clock doesn't move; this lets the test
-            // run в milliseconds.
+            // run in milliseconds.
             tokio::time::advance(Duration::from_secs(3600)).await;
         }
 
@@ -229,16 +229,16 @@ mod tests {
              sybils_in_set={sybil_count} fraction={fraction:.3}",
         );
 
-        // Generous bound: 30 % — covers а stretched-luck run где all 5
-        // sybils + few honest nodes happened к be the only-online set
-        // в early hours.  Tighter bound would flake.
+        // Generous bound: 30 % — covers a stretched-luck run where all 5
+        // sybils + few honest nodes happened to be the only-online set
+        // in early hours.  Tighter bound would flake.
         assert!(
             fraction < 0.30,
             "24h churn produced excessive sybil eclipse: \
              total={total} sybils={sybil_count} fraction={fraction:.3} \
              (expected < 30 %; population ratio is ~16.7 %)",
         );
-        // Sanity: at least а few honest contacts были discovered.
+        // Sanity: at least a few honest contacts were discovered.
         assert!(
             total >= HONEST_COUNT / 2,
             "24h sim discovered <50 % of honest nodes (got {total}); \

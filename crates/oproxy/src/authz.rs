@@ -1,32 +1,32 @@
-//! Node-id allowlist для the server-side acceptor.
+//! Node-id allowlist for the server-side acceptor.
 //!
-//! Empty list = **allow all** when paired с explicit `allow_all = true`
-//! (см. ServerConfig docs).  Otherwise оператор should populate the list
-//! к gate callers.  Non-empty list = **strict allowlist** — only matching
+//! Empty list = **allow all** when paired with explicit `allow_all = true`
+//! (see ServerConfig docs).  Otherwise the operator should populate the list
+//! to gate callers.  Non-empty list = **strict allowlist** — only matching
 //! node_ids may use this server.
 //!
 //! # Note on `[0u8; 32]` (audit batch 2026-05-24, L5)
 //!
-//! The all-zeros node_id is treated as а **literal entry** — добавляя
-//! `"0000...0000"` к `allowed_node_ids` does NOT mean "wildcard"; it
-//! permits only а peer whose actual `node_id` is zero.  Such а peer is
-//! cryptographically infeasible (BLAKE3 collision к 32 zero bytes ≈
-//! 2^256 expected tries), но the schema doesn't special-case the value.
+//! The all-zeros node_id is treated as a **literal entry** — adding
+//! `"0000...0000"` to `allowed_node_ids` does NOT mean "wildcard"; it
+//! permits only a peer whose actual `node_id` is zero.  Such a peer is
+//! cryptographically infeasible (BLAKE3 collision to 32 zero bytes ≈
+//! 2^256 expected tries), but the schema doesn't special-case the value.
 //! For "allow any peer" use `allow_all = true` instead.
 
 use std::collections::HashSet;
 
-/// Allowlist guard.  Constructed once at startup от config; cheap O(1)
+/// Allowlist guard.  Constructed once at startup from config; cheap O(1)
 /// lookups thereafter.
 #[derive(Debug, Clone)]
 pub struct NodeAllowlist {
     /// `None` ⇒ allow all callers (no restriction).  `Some(set)` ⇒
-    /// only node_ids в the set ара permitted.
+    /// only node_ids in the set are permitted.
     set: Option<HashSet<[u8; 32]>>,
 }
 
 impl NodeAllowlist {
-    /// Build от raw hex strings (64 chars each, ignoring case + `0x`
+    /// Build from raw hex strings (64 chars each, ignoring case + `0x`
     /// prefix).  Empty vec ⇒ allow-all.
     pub fn from_hex_list(hex_ids: &[String]) -> Result<Self, String> {
         if hex_ids.is_empty() {
@@ -60,7 +60,7 @@ impl NodeAllowlist {
     }
 
     /// Whether the allowlist is in restrictive mode (some IDs only)
-    /// vs allow-all.  Surfaced для startup logging.
+    /// vs allow-all.  Surfaced for startup logging.
     pub fn is_restrictive(&self) -> bool {
         self.set.is_some()
     }

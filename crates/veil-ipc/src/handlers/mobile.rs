@@ -1,7 +1,7 @@
-//! Mobile lifecycle и push-envelope handlers.
+//! Mobile lifecycle and push-envelope handlers.
 //!
 //! Apps report background-mode tier transitions, network-state changes,
-//! и register sealed push envelopes (FCM/APNs tokens) here.  All three
+//! and register sealed push envelopes (FCM/APNs tokens) here.  All three
 //! handlers degrade gracefully when no sink is wired (desktop builds, or
 //! test fixtures with no mobile-runtime integration).
 
@@ -21,7 +21,7 @@ pub(crate) fn handle_set_mobile_background_mode(
     body: &[u8],
     mobile_event_sink: Option<&Arc<dyn MobileEventSink>>,
 ) {
-    // Drop silently на malformed input — apps shouldn't get к wedge the
+    // Drop silently on malformed input — apps shouldn't get to wedge the
     // daemon with bad payloads.
     if let (Ok(req), Some(sink)) = (
         SetMobileBackgroundModePayload::decode(body),
@@ -45,7 +45,7 @@ pub(crate) async fn handle_set_push_envelope(
     body: &[u8],
     push_envelope_sink: Option<&Arc<dyn PushEnvelopeSink>>,
 ) -> std::io::Result<()> {
-    // App registers а sealed FCM/APNs envelope on а rendezvous-publisher
+    // App registers a sealed FCM/APNs envelope on a rendezvous-publisher
     // entry.  Reply carries OK / NoMatchingRendezvous / EnvelopeTooLarge.
     // Drop malformed silently (no response).
     let Ok(req) = SetPushEnvelopePayload::decode(body) else {

@@ -41,7 +41,7 @@ fn bench_acquire_release(c: &mut Criterion) {
         });
     });
 
-    // Pool с cold cache (each iter drops to overflow, next acquires fallback)
+    // Pool with cold cache (each iter drops to overflow, next acquires fallback)
     let cold_pool = BufferPool::with_capacity(1);
     group.bench_function("pool_cold_overflow", |b| {
         b.iter(|| {
@@ -93,7 +93,7 @@ fn bench_acquire_release(c: &mut Criterion) {
             drop(clones);
         });
     });
-    // Equivalent с Arc<[u8]>
+    // Equivalent with Arc<[u8]>
     fg.bench_function("arc_box", |b| {
         b.iter(|| {
             let v: Vec<u8> = Vec::with_capacity(black_box(61440));

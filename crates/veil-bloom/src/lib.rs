@@ -175,11 +175,11 @@ impl BloomFilter {
         }
         // reject `k > MAX_K`.
         // Previously the decoder accepted any 1..=255 here, which let
-        // а malicious peer ship а Bloom с `k = 255` — every
+        // a malicious peer ship a Bloom with `k = 255` — every
         // `contains` call then runs 255 BLAKE3-derived index
-        // calculations, turning а cheap membership check into а CPU
+        // calculations, turning a cheap membership check into a CPU
         // amplifier the peer controls remotely. At MAX_K=32 the
-        // worst-case probe cost is bounded by а constant the local
+        // worst-case probe cost is bounded by a constant the local
         // node chose, not the peer.
         if k > MAX_K {
             return Err(BloomError::TooLarge {
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn audit_2026_05_08_bloom_decode_rejects_k_above_max() {
-        // audit fix: peer sends а Bloom claiming `k=255`.
+        // audit fix: peer sends a Bloom claiming `k=255`.
         // Decoder must reject so each `contains` call doesn't run
         // 255 hash derivations under attacker control.
         for bad_k in [(MAX_K + 1), (MAX_K + 17), 200u8, 255u8] {
@@ -344,9 +344,9 @@ mod tests {
         // The cap is INCLUSIVE — `k == MAX_K` is fine, only k > MAX_K
         // gets rejected. Otherwise valid filters at the boundary
         // would round-trip-fail.
-        let bf = BloomFilter::for_capacity(2, 0.01); // tiny n → k saturates к MAX_K
+        let bf = BloomFilter::for_capacity(2, 0.01); // tiny n → k saturates to MAX_K
         // Force k to MAX_K before encode (small filters might pick
-        // smaller k); test против the boundary explicitly.
+        // smaller k); test against the boundary explicitly.
         let mut buf = bf.encode();
         buf[0] = MAX_K; // override
         let _ = BloomFilter::decode(&buf).expect("k=MAX_K must be accepted");

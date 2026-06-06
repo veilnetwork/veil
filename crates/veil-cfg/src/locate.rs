@@ -298,11 +298,11 @@ mod tests {
 
     // ── runtime_veil_dir ──────────────────────────────────
     //
-    // fix: env var mutations ара process-global; cargo
+    // fix: env var mutations are process-global; cargo
     // test's default parallel execution would race these tests against
     // each other AND against any other test that reads the same vars.
-    // А simple process-wide Mutex serialises them deterministically
-    // (preferred over а dev-dep on `serial_test` для keeping the
+    // A simple process-wide Mutex serialises them deterministically
+    // (preferred over a dev-dep on `serial_test` for keeping the
     // dependency footprint small).
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::OnceLock;

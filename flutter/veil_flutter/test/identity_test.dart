@@ -1,5 +1,5 @@
 // Pure-Dart tests for `veil_flutter` identity helpers — only the
-// helpers that DON'T touch FFI run on `dart test` без the native lib.
+// helpers that DON'T touch FFI run on `dart test` without the native lib.
 //
 // `validateBip39Phrase` and `restoreIdentity` are FFI-bound and
 // covered by the Rust-side unit tests in

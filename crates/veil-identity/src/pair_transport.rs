@@ -86,12 +86,12 @@ where
 /// Write a single length-prefixed frame to `w`.
 ///
 /// Audit batch 2026-05-25 phase M (cross-audit closure): previously
-/// guarded by а `debug_assert!` which is stripped в release builds.
-/// А mis-built caller passing а body > `MAX_PAIR_FRAME_BODY` would
+/// guarded by a `debug_assert!` which is stripped in release builds.
+/// A mis-built caller passing a body > `MAX_PAIR_FRAME_BODY` would
 /// silently put an oversized frame on the wire — readers would
-/// reject с `FrameOversized` but only after the bytes already went
-/// out, и в the case of streaming senders the local buffer might
-/// reallocate к multi-MiB before the peer closes.  Convert к а
+/// reject with `FrameOversized` but only after the bytes already went
+/// out, and in the case of streaming senders the local buffer might
+/// reallocate to multi-MiB before the peer closes.  Convert to a
 /// proper runtime check that returns the existing `FrameOversized`
 /// variant so callers handle it through the normal `?` path.
 pub async fn write_frame<W>(w: &mut W, body: &[u8]) -> Result<(), PairTransportError>

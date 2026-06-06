@@ -1,29 +1,29 @@
 ---
-# Caddy-fronted webtunnel deploy с Let's Encrypt auto-TLS.
+# Caddy-fronted webtunnel deploy with Let's Encrypt auto-TLS.
 #
 # Anti-censorship strategy P1 #3 — closes DPI method #15 (FakeTLS
 # validation by active probe).  Old `deploy-webtunnel.yml` puts veil
-# directly on :443 с а self-signed cert и а one-paragraph decoy;
-# this playbook adds Caddy в front so the same :443 endpoint serves а
-# real Let's Encrypt cert + а multi-page decoy site, while still
-# routing the secret-path WSS upgrade к veil's loopback listener.
+# directly on :443 with a self-signed cert and a one-paragraph decoy;
+# this playbook adds Caddy in front so the same :443 endpoint serves a
+# real Let's Encrypt cert + a multi-page decoy site, while still
+# routing the secret-path WSS upgrade to veil's loopback listener.
 #
 # Threat surface closed:
-#   * Cert chain validates against а public CA (Let's Encrypt) → DPI
+#   * Cert chain validates against a public CA (Let's Encrypt) → DPI
 #     active probe sees an ordinary HTTPS site, not the self-signed
 #     red flag.
 #   * Decoy site has multiple pages + plausible content + standard
-#     headers — passes "looks like а real small site" heuristics.
-#   * Veil's webtunnel listener rebound к 127.0.0.1 (no public
+#     headers — passes "looks like a real small site" heuristics.
+#   * Veil's webtunnel listener rebound to 127.0.0.1 (no public
 #     port exposed except Caddy's :443).
 #
 # Prerequisites:
-#   * `veil_host` resolves к the host's public IP via DNS
+#   * `veil_host` resolves to the host's public IP via DNS
 #     (Let's Encrypt's HTTP-01 challenge requires this)
 #   * `veil_email` set in inventory (used as ACME contact)
-#   * Port 443 reachable от the public internet (HTTP-01 challenge
+#   * Port 443 reachable from the public internet (HTTP-01 challenge
 #     also needs :80 briefly — Caddy listens on :80 automatically
-#     для the challenge и redirects к :443)
+#     for the challenge and redirects to :443)
 #   * Host doesn't already have something on :80 / :443
 #
 # Run:
@@ -35,27 +35,27 @@
 #     --extra-vars 'webtunnel_internal_port=18443 decoy_site_name="Personal Site"' \
 #     --limit b2
 
-- name: Deploy Caddy-fronted webtunnel с Let's Encrypt
+- name: Deploy Caddy-fronted webtunnel with Let's Encrypt
   hosts: all
   become: true
   serial: 1
   vars:
     # The port on 127.0.0.1 where veil's webtunnel listener will
-    # bind.  Caddy reverse-proxies the secret path к this port.  Pick
+    # bind.  Caddy reverse-proxies the secret path to this port.  Pick
     # something outside the standard service ranges + clearly
-    # internal-only (high port, not :8443 which is а common alt-https
+    # internal-only (high port, not :8443 which is a common alt-https
     # that some scanners check).
     webtunnel_internal_port: 18443
     # Where the static decoy site files live on the host.
     webtunnel_decoy_root: /var/lib/veil/webtunnel_decoy
-    # ID для the new listen entry — must not collide с existing ids.
+    # ID for the new listen entry — must not collide with existing ids.
     webtunnel_listen_id: "0x00000007"
     # Operator-visible decoy site name.  Override per-host via
-    # --extra-vars 'decoy_site_name="My Blog"' для personalized cover.
+    # --extra-vars 'decoy_site_name="My Blog"' for personalized cover.
     decoy_site_name: "Notes &amp; Drafts"
     # The webtunnel secret token — 32 random ascii chars.  Default
     # generated per-host; override only when migrating an existing
-    # deployment с а known token.
+    # deployment with a known token.
     webtunnel_secret_path: "/_t/{{ lookup('community.general.random_string', length=32, special=false) | default(lookup('password', '/dev/null length=32 chars=ascii_letters,digits'), true) }}"
 
   pre_tasks:
@@ -65,9 +65,9 @@
           - veil_host is defined and veil_host | length > 0
           - veil_email is defined and veil_email | length > 0
         fail_msg: >-
-          Playbook requires `veil_host` (public DNS hostname для
+          Playbook requires `veil_host` (public DNS hostname for
           Let's Encrypt) + `veil_email` (ACME contact).  Set both
-          в the host's inventory entry before running.
+          in the host's inventory entry before running.
 
     - name: Verify DNS resolution of veil_host
       ansible.builtin.shell:
@@ -79,7 +79,7 @@
 
     - name: Show DNS-resolved IP
       ansible.builtin.debug:
-        msg: "{{ veil_host }} resolves к {{ dns_lookup.stdout }}"
+        msg: "{{ veil_host }} resolves to {{ dns_lookup.stdout }}"
 
   tasks:
     # ── Caddy install ─────────────────────────────────────────────────
@@ -195,8 +195,8 @@
       ansible.builtin.debug:
         var: caddy_validate.stdout_lines
 
-    # ── veil node.toml: webtunnel listener на 127.0.0.1 ────────────
-    # Replace any existing webtunnel-wss entry с а loopback-bound one;
+    # ── veil node.toml: webtunnel listener on 127.0.0.1 ────────────
+    # Replace any existing webtunnel-wss entry with a loopback-bound one;
     # add if missing.  Reusing `webtunnel_listen_id` so re-runs are
     # idempotent.
     - name: Stage Python helper for atomic listen-block edit
@@ -213,14 +213,14 @@
           host = sys.argv[4]
           with open(path) as f:
               src = f.read()
-          # New entry: bind на 127.0.0.1, advertise the public host
+          # New entry: bind on 127.0.0.1, advertise the public host
           # (Caddy fronts so the advertise URI is the public hostname).
           new_entry = (
               '{ id = "' + listen_id + '", '
               'transport = "webtunnel-wss://127.0.0.1:' + port + '", '
               'advertise = "webtunnel-wss://' + host + ':443" }'
           )
-          # Strip any existing entry с matching id OR any non-loopback
+          # Strip any existing entry with matching id OR any non-loopback
           # webtunnel-wss entry (legacy `deploy-webtunnel.yml` artifact).
           patterns_to_strip = [
               r',\s*\{\s*id\s*=\s*"' + re.escape(listen_id) + r'"[^}]*\}',
@@ -234,7 +234,7 @@
           if not m:
               sys.exit("ERROR: could not find top-level listen = [...] block")
           new_src = src[:m.start(2)] + ',\n  ' + new_entry + src[m.start(2):]
-          # Update secret-path в [transport] section (or insert if missing).
+          # Update secret-path in [transport] section (or insert if missing).
           if re.search(r'^webtunnel_secret_path\s*=', new_src, re.MULTILINE):
               new_src = re.sub(
                   r'^webtunnel_secret_path\s*=.*$',
@@ -253,7 +253,7 @@
               f.write(new_src)
           print("ok")
 
-    - name: Apply webtunnel loopback config к node.toml
+    - name: Apply webtunnel loopback config to node.toml
       ansible.builtin.shell:
         cmd: |
           python3 /tmp/_veil_webtunnel_loopback.py \
@@ -285,7 +285,7 @@
         name: veil.service
         state: restarted
 
-    - name: Wait для veil metrics endpoint
+    - name: Wait for veil metrics endpoint
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 60); do
@@ -310,7 +310,7 @@
         state: restarted
         enabled: true
 
-    - name: Wait для Caddy к obtain Let's Encrypt cert + start serving
+    - name: Wait for Caddy to obtain Let's Encrypt cert + start serving
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 120); do
@@ -345,10 +345,10 @@
       delegate_to: localhost
       become: false
 
-    - name: Verify secret-path proxies к veil (404 from veil, NOT Caddy's file_server 404)
+    - name: Verify secret-path proxies to veil (404 from veil, NOT Caddy's file_server 404)
       ansible.builtin.shell:
         cmd: |
-          # GET к secret path returns either а WSS upgrade rejection
+          # GET to secret path returns either a WSS upgrade rejection
           # (veil's webtunnel server demands the upgrade) or 400
           # bad-request — both confirm veil is on the other side.
           # The key signal: status NOT 404, which would mean Caddy's
@@ -362,7 +362,7 @@
       delegate_to: localhost
       become: false
 
-    - name: Confirm veil webtunnel bound на loopback only
+    - name: Confirm veil webtunnel bound on loopback only
       ansible.builtin.shell:
         cmd: |
           ss -tlnp 'sport = :{{ webtunnel_internal_port }}' | \
@@ -381,7 +381,7 @@
           Listen:  127.0.0.1:{{ webtunnel_internal_port }}   (veil, loopback-only)
           Caddy:   :443 (Let's Encrypt cert auto-renews)
 
-          To rotate secret_path: re-run с the same playbook (а new
+          To rotate secret_path: re-run with the same playbook (a new
           path is generated automatically); update client invites.
 
   handlers:

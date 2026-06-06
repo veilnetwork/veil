@@ -1,18 +1,18 @@
 ---
 # Clear DHT routing cache + peers_discovered + route_cache + rtt + vivaldi.
-# After а transport-URI migration (е.g. tcp:// → obfs4-tcp://) these caches
-# hold stale transport URIs що block discovery of the new endpoints.
+# After a transport-URI migration (e.g. tcp:// → obfs4-tcp://) these caches
+# hold stale transport URIs that block discovery of the new endpoints.
 #
-# Run серийно с serial=1 so the cluster keeps an established quorum
+# Run serially with serial=1 so the cluster keeps an established quorum
 # during the rolling-clear.
 #
-# Backup files are written к /tmp/<file>.bak.YYYYMMDD-HHMMSS so an
+# Backup files are written to /tmp/<file>.bak.YYYYMMDD-HHMMSS so an
 # operator can restore if something goes sideways.
 #
 # Run:
 #   ansible-playbook -i inventory.yml clear-routing-caches.yml
 
-- name: Clear routing caches к force obfs4 re-discovery
+- name: Clear routing caches to force obfs4 re-discovery
   hosts: all
   become: true
   serial: 1
@@ -47,7 +47,7 @@
         name: veil.service
         state: started
 
-    - name: Wait для live sessions through obfs4 bootstrap_peers
+    - name: Wait for live sessions through obfs4 bootstrap_peers
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 60); do

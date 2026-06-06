@@ -38,13 +38,13 @@ impl Default for VivaldiCoord {
     }
 }
 
-/// physical-plausibility bounds для peer-reported
+/// physical-plausibility bounds for peer-reported
 /// coordinate fields. Real-world RTT ≤ ~300 ms (geosynchronous), so any
-/// 2D coord beyond ±1000 ms-equivalent is не plausible. An attacker
+/// 2D coord beyond ±1000 ms-equivalent is not plausible. An attacker
 /// publishing `{x:0,y:0,h:0,error:0}` would otherwise appear "near
-/// everyone" в distance_estimate и win latency-aware circuit-builder
-/// selection — guard-position bias. These bounds are wide enough к
-/// fit ANY honest network topology (even satellite hops) и tight
+/// everyone" in distance_estimate and win latency-aware circuit-builder
+/// selection — guard-position bias. These bounds are wide enough to
+/// fit ANY honest network topology (even satellite hops) and tight
 /// enough to prevent the deanonymization-vector exploit.
 const VIVALDI_COORD_MAX: f64 = 100_000.0; // ±100 s-equivalent (10× geosync RTT)
 const VIVALDI_HEIGHT_MAX: f64 = 100_000.0; // same scale
@@ -57,11 +57,11 @@ impl VivaldiCoord {
         Self::default()
     }
 
-    /// clamp peer-reported coord fields к physically-
-    /// plausible bounds. Calls this BEFORE consuming а peer's coordinate
+    /// clamp peer-reported coord fields to physically-
+    /// plausible bounds. Calls this BEFORE consuming a peer's coordinate
     /// — `distance_estimate`, `update`, persistence layer. NaN / Infinity
-    /// are mapped к conservative-uncertainty defaults (cap-bounded values
-    /// + max error) so а malformed peer claim cannot poison routing math.
+    /// are mapped to conservative-uncertainty defaults (cap-bounded values
+    /// + max error) so a malformed peer claim cannot poison routing math.
     pub fn sanitize(&self) -> Self {
         let clamp = |v: f64, cap: f64| {
             if v.is_finite() {

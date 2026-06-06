@@ -6,14 +6,14 @@ Playbooks for deploying and operating veil nodes.
 
 | Playbook | Purpose |
 |---|---|
-| `deploy-node.yml` | Initial install of veil onto а Debian/Ubuntu/RHEL host (config + service + cert). |
-| `deploy-bootstrap.yml` | Same but для bootstrap nodes (b1/b2/b3). |
-| `deploy-binary-only.yml` | Roll out а new `/usr/local/bin/veil-cli` binary, preserving config. `serial: 1` rolling restart. |
+| `deploy-node.yml` | Initial install of veil onto a Debian/Ubuntu/RHEL host (config + service + cert). |
+| `deploy-bootstrap.yml` | Same but for bootstrap nodes (b1/b2/b3). |
+| `deploy-binary-only.yml` | Roll out a new `/usr/local/bin/veil-cli` binary, preserving config. `serial: 1` rolling restart. |
 | `deploy-chat.yml` | Spawn `chat_node` mesh-load workers. Requires `/tmp/testnet-configs/manifest.json` (host → node_id map). |
-| `deploy-chaos-ban.yml` | Install `chaos-ban-cycler.service` для stress-testing handshake/auto-ban paths. |
+| `deploy-chaos-ban.yml` | Install `chaos-ban-cycler.service` for stress-testing handshake/auto-ban paths. |
 | `deploy-logrotate.yml` | Install logrotate config for `/var/log/veil/*.log`. |
-| `deploy-pnet.yml` | **P-Net rollout** — copies а membership cert + adds `[network]` config block + restarts in private mode. See [`docs/en/p-net.md`](../docs/en/p-net.md) или [`docs/ru/p-net.md`](../docs/ru/p-net.md). |
-| `revert-pnet.yml` | **P-Net rollback** — removes cert + `[network]` block + restarts в public mode. Inverse of `deploy-pnet.yml`. |
+| `deploy-pnet.yml` | **P-Net rollout** — copies a membership cert + adds `[network]` config block + restarts in private mode. See [`docs/en/p-net.md`](../docs/en/p-net.md) or [`docs/ru/p-net.md`](../docs/ru/p-net.md). |
+| `revert-pnet.yml` | **P-Net rollback** — removes cert + `[network]` block + restarts in public mode. Inverse of `deploy-pnet.yml`. |
 | `deploy-ogate.yml` | **ogate rollout** — TUN-based virtual LAN over the veil. Renders per-host `/etc/ogate/ogate.toml` from `manifest.json` + an in-playbook IP map, installs binary + systemd unit, rolling `serial: 1`. See [`docs/en/ogate.md`](../docs/en/ogate.md) / [`docs/ru/ogate.md`](../docs/ru/ogate.md). |
 | `remove-chat.yml` | Stop + disable + remove `chat-node` service + config (inverse of `deploy-chat.yml`; leaves binary). |
 | `remove-chaos-ban.yml` | Stop + disable + remove `chaos-ban` service + cycler script (inverse of `deploy-chaos-ban.yml`). |

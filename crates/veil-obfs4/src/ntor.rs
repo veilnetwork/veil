@@ -1,8 +1,8 @@
-//! NTOR handshake над elligator2-encoded Curve25519.
+//! NTOR handshake over elligator2-encoded Curve25519.
 //!
 //! Phase 1c of [`docs/internal/PLAN_TRANSPORT_OBFUSCATION.md`](../../docs/internal/PLAN_TRANSPORT_OBFUSCATION.md).
 //!
-//! Adapted от Tor's obfs4 spec.  Two-flight handshake:
+//! Adapted from Tor's obfs4 spec.  Two-flight handshake:
 //!
 //! ```text
 //! Client → Server:
@@ -28,7 +28,7 @@
 //! uniform-random opener.
 //!
 //! Where:
-//! - `node_id_mac_key` = pre-shared 32-byte secret, derived от server's
+//! - `node_id_mac_key` = pre-shared 32-byte secret, derived from server's
 //!   identity by HKDF.  Both sides know it (server-id-bound PSK).
 //! - `auth_key` = HKDF(`shared_secret`, "obfs4-auth-key-v1") computed
 //!   AFTER ECDH.
@@ -37,9 +37,9 @@
 //!
 //! ## Anti-probe properties
 //!
-//! - Server silent-drops connections где the client's MAC doesn't verify
-//!   under `node_id_mac_key`.  Active prober без the PSK cannot
-//!   trigger а response.
+//! - Server silent-drops connections where the client's MAC doesn't verify
+//!   under `node_id_mac_key`.  Active prober without the PSK cannot
+//!   trigger a response.
 //! - The hour-granular `epoch` bound into the MAC (never sent on the wire,
 //!   C-01) prevents replay across a wide window: the receiver reconstructs
 //!   candidate epochs `{e-1, e, e+1}` from its own clock, so a handshake
@@ -78,7 +78,7 @@ pub const TWEAK_LEN: usize = 1;
 /// Pad-length byte length.
 pub const PAD_LEN_LEN: usize = 1;
 
-/// Maximum random padding bytes in а handshake message.
+/// Maximum random padding bytes in a handshake message.
 pub const MAX_HANDSHAKE_PADDING: usize = 128;
 
 /// Minimum handshake message size (no padding).
@@ -94,7 +94,7 @@ pub const HANDSHAKE_MIN_BYTES: usize = REPRESENTATIVE_LEN + TWEAK_LEN + MAC_LEN 
 /// Maximum handshake message size.
 pub const HANDSHAKE_MAX_BYTES: usize = HANDSHAKE_MIN_BYTES + MAX_HANDSHAKE_PADDING;
 
-/// Maximum permissible skew between client и server clocks (seconds), and the
+/// Maximum permissible skew between client and server clocks (seconds), and the
 /// granularity of the epoch bound into the MAC/AUTH. Because the epoch is
 /// `unix_secs / 3600`, any peer whose clock is within ±1h reconstructs a
 /// matching epoch from the candidate set {e-1, e, e+1}; a handshake captured
@@ -109,17 +109,17 @@ const HANDSHAKE_EPOCH_SECS: u64 = MAX_TIMESTAMP_SKEW_SECS;
 // [`super::wire_variant::WireFormatVariant`].  V1 callers go through
 // the V1-default wrappers (`start()`, `accept_full()`); variant-aware
 // callers reach the labels directly via `variant.hkdf_auth_key_info()`
-// и `variant.auth_mac_context()`.
+// and `variant.auth_mac_context()`.
 
 // ── Server PSK ───────────────────────────────────────────────────────────────
 
-/// Server's pre-shared MAC key (32 bytes).  Derived от the server's
+/// Server's pre-shared MAC key (32 bytes).  Derived from the server's
 /// long-term obfs4-PSK material — distributed out-of-band via
 /// `transport_hints` (Phase 3).  Both sides need it: server uses it
-/// к check incoming client MACs; client uses it к craft the outgoing
+/// to check incoming client MACs; client uses it to craft the outgoing
 /// client MAC.
 ///
-/// A wrong PSK на the client side causes the server к silent-drop —
+/// A wrong PSK on the client side causes the server to silent-drop —
 /// this is the anti-probe property.
 #[derive(Clone)]
 pub struct NodeIdMacKey(pub [u8; 32]);
@@ -171,7 +171,7 @@ fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 }
 
 /// Variant-aware padding length sampler.  V1 uses 0..=128; V2 uses
-/// 0..=96 к break length-distribution fingerprint correlation.
+/// 0..=96 to break length-distribution fingerprint correlation.
 fn fresh_pad_len_for(variant: super::wire_variant::WireFormatVariant) -> u8 {
     let mut b = [0u8; 1];
     rand::rng().fill_bytes(&mut b);
@@ -186,48 +186,48 @@ fn random_padding(len: usize) -> Vec<u8> {
 
 // ── Client side ──────────────────────────────────────────────────────────────
 
-/// Client-side handshake state held between `ClientHandshake::start` и
-/// `ClientHandshake::complete`.  Holds the ephemeral private key и
+/// Client-side handshake state held between `ClientHandshake::start` and
+/// `ClientHandshake::complete`.  Holds the ephemeral private key and
 /// the outgoing client representative; releases shared_secret after
 /// complete.
 pub struct ClientHandshake {
     ephemeral: ElligatorKeypair,
-    /// Snapshot of the bytes we sent — included в the auth-MAC compute
-    /// on response к bind the AUTH к this specific handshake.
+    /// Snapshot of the bytes we sent — included in the auth-MAC compute
+    /// on response to bind the AUTH to this specific handshake.
     sent_repr: [u8; REPRESENTATIVE_LEN],
     /// Epoch (hour-granular) we bound into the first-flight MAC. The server
     /// echoes it in the AUTH; `complete()` uses it (not the wall clock) for
     /// the client-epoch component so the AUTH check is exact on our side.
     sent_epoch: u64,
     /// Variant chosen by the client at start time.  `complete()` uses
-    /// this к pick the matching AUTH-context label when verifying
-    /// the server's response.  Default V1 — kept private к force
-    /// callers through `start_variant()` если they need а different.
+    /// this to pick the matching AUTH-context label when verifying
+    /// the server's response.  Default V1 — kept private to force
+    /// callers through `start_variant()` if they need a different.
     variant: super::wire_variant::WireFormatVariant,
 }
 
-/// Result of а successful client-side handshake.
+/// Result of a successful client-side handshake.
 #[derive(Debug)]
 pub struct ClientHandshakeOutput {
-    /// Direction key для outgoing (client-to-server) framing.
+    /// Direction key for outgoing (client-to-server) framing.
     pub dk_c_to_s: DirectionKey,
-    /// Direction key для incoming (server-to-client) framing.
+    /// Direction key for incoming (server-to-client) framing.
     pub dk_s_to_c: DirectionKey,
 }
 
 impl ClientHandshake {
-    /// Begin а client-side handshake (V1 — default, backwards-compat wrapper).
-    /// Caller writes `wire_bytes` к the underlying transport и retains
+    /// Begin a client-side handshake (V1 — default, backwards-compat wrapper).
+    /// Caller writes `wire_bytes` to the underlying transport and retains
     /// `state` to call `complete` on the server's response.
     pub fn start(node_id_mac_key: &NodeIdMacKey) -> Result<(Self, Vec<u8>), HandshakeError> {
         Self::start_variant(node_id_mac_key, super::wire_variant::WireFormatVariant::V1)
     }
 
     /// Variant-aware handshake initiator — Phase 2 kill-switch.
-    /// Client builds first frame с variant-specific MAC tag + variant
-    /// padding bounds.  V1 produces bit-identical wire bytes к the
-    /// legacy `start()`; V2 prepends а variant tag к the MAC input и
-    /// uses а tighter padding bound (см. `WireFormatVariant`).
+    /// Client builds first frame with variant-specific MAC tag + variant
+    /// padding bounds.  V1 produces bit-identical wire bytes to the
+    /// legacy `start()`; V2 prepends a variant tag to the MAC input and
+    /// uses a tighter padding bound (see `WireFormatVariant`).
     ///
     /// Returned `Self` state remembers the variant so `complete()`
     /// uses the matching AUTH context when verifying the server's
@@ -242,8 +242,8 @@ impl ClientHandshake {
         let tweak = ephemeral.tweak();
 
         // V1 tag is empty (backwards compat), V2 tag = "obfs4-v2:".
-        // Including the tag в the MAC input means а V1 server (no tag
-        // в its expected MAC) cannot validate а V2 client's MAC, и
+        // Including the tag in the MAC input means a V1 server (no tag
+        // in its expected MAC) cannot validate a V2 client's MAC, and
         // vice versa — silent-drop on mismatch.
         //
         // The epoch is bound into the MAC but NOT written to the wire (C-01):
@@ -282,20 +282,20 @@ impl ClientHandshake {
     }
 
     /// Process the server's response.  Returns direction keys on
-    /// success, или an error on AUTH/decode failure.
+    /// success, or an error on AUTH/decode failure.
     ///
     /// Note: this consumes `self` because the ephemeral private key
-    /// is no longer needed после ECDH derivation.
+    /// is no longer needed after ECDH derivation.
     pub fn complete(self, wire: &[u8]) -> Result<ClientHandshakeOutput, HandshakeError> {
         let (server_repr, _server_tweak, auth_received) = parse_handshake_message(wire)?;
 
-        // ECDH с server's elligator-decoded pubkey.
+        // ECDH with server's elligator-decoded pubkey.
         let server_pk = decode_representative(&server_repr);
         let mut shared = ecdh(self.ephemeral.private(), &server_pk);
 
         // Derive AUTH key + verify server's AUTH MAC.  Variant-aware
-        // HKDF label + MAC context — а V2 client cannot validate а
-        // V1 server's response (different auth_key) и vice versa.
+        // HKDF label + MAC context — a V2 client cannot validate a
+        // V1 server's response (different auth_key) and vice versa.
         //
         // The server's epoch is not on the wire (C-01): we reconstruct
         // candidate server epochs from our own clock and accept if the AUTH
@@ -335,31 +335,31 @@ impl ClientHandshake {
 
 // ── Server side ──────────────────────────────────────────────────────────────
 
-/// Server-side handshake entry point.  Stateless — все computation
-/// happens within `accept_full`; this is а namespace marker для
-/// API symmetry с `ClientHandshake`.
+/// Server-side handshake entry point.  Stateless — all computation
+/// happens within `accept_full`; this is a namespace marker for
+/// API symmetry with `ClientHandshake`.
 pub struct ServerHandshake;
 
-/// Result of а successful server-side handshake.
+/// Result of a successful server-side handshake.
 #[derive(Debug)]
 pub struct ServerHandshakeOutput {
-    /// Direction key для incoming (client-to-server) framing.
+    /// Direction key for incoming (client-to-server) framing.
     pub dk_c_to_s: DirectionKey,
-    /// Direction key для outgoing (server-to-client) framing.
+    /// Direction key for outgoing (server-to-client) framing.
     pub dk_s_to_c: DirectionKey,
 }
 
 impl ServerHandshake {
-    /// Process а client's handshake message (V1 — default,
+    /// Process a client's handshake message (V1 — default,
     /// backwards-compat wrapper).  See `accept_full_variant` for
-    /// variant-aware variants и `accept_full_multi` for multi-variant
+    /// variant-aware variants and `accept_full_multi` for multi-variant
     /// accept used by the Phase 2 kill-switch.
     ///
     /// Silent-drop policy: on MAC failure (which also covers replay — a
     /// handshake outside the ±1h epoch window matches no candidate epoch)
     /// or decode failure, returns `Err`.  Caller (transport layer) drops
-    /// the connection без sending **anything** so что active probers
-    /// observe only TCP RST/FIN, not а protocol error frame.
+    /// the connection without sending **anything** so that active probers
+    /// observe only TCP RST/FIN, not a protocol error frame.
     pub fn accept_full(
         wire: &[u8],
         node_id_mac_key: &NodeIdMacKey,
@@ -372,7 +372,7 @@ impl ServerHandshake {
         Ok((output, wire_resp))
     }
 
-    /// Variant-aware single-variant accept.  Caller pins а specific
+    /// Variant-aware single-variant accept.  Caller pins a specific
     /// variant; client's MAC must verify under that variant's tag
     /// or accept fails (silent-drop policy preserved).
     pub fn accept_full_variant(
@@ -386,18 +386,18 @@ impl ServerHandshake {
     }
 
     /// **Phase 2 kill-switch multi-variant accept**: tries each
-    /// variant в `accept_variants` priority order.  Returns the
+    /// variant in `accept_variants` priority order.  Returns the
     /// `(output, matched_variant, response_wire)` tuple on the first
     /// variant whose MAC verifies; returns `Err(ClientMacMismatch)`
     /// if no variant's MAC verifies (silent-drop).
     ///
     /// Operator config wires this from `[transport] obfs4_accept_variants
-    /// = ["v2", "v1"]` — server prefers V2 но still accepts V1 during
-    /// а grace period.  Once V1 cut off, operator sets `["v2"]`.
+    /// = ["v2", "v1"]` — server prefers V2 but still accepts V1 during
+    /// a grace period.  Once V1 cut off, operator sets `["v2"]`.
     ///
-    /// Empty `accept_variants` is а programmer error (returns
+    /// Empty `accept_variants` is a programmer error (returns
     /// `ClientMacMismatch` — vacuously no variant matches).  Caller
-    /// should default к `&[V1]` if no operator override.
+    /// should default to `&[V1]` if no operator override.
     pub fn accept_full_multi(
         wire: &[u8],
         node_id_mac_key: &NodeIdMacKey,
@@ -490,7 +490,7 @@ impl ServerHandshake {
 
 // ── Wire parser ──────────────────────────────────────────────────────────────
 
-/// Parse а handshake message (request or response — same format) and
+/// Parse a handshake message (request or response — same format) and
 /// return its components.  Validates structural minimum length only;
 /// MAC/AUTH verification happens at the caller.
 fn parse_handshake_message(
@@ -602,11 +602,11 @@ mod tests {
         let (server_out, s_wire) = ServerHandshake::accept_full(&c_wire, &psk).unwrap();
         assert!(s_wire.len() >= HANDSHAKE_MIN_BYTES);
 
-        // Client completes на server's response.
+        // Client completes on server's response.
         let client_out = client_state.complete(&s_wire).unwrap();
 
         // Both sides MUST derive the same direction keys; round-trip
-        // а frame через c2s direction.
+        // a frame through c2s direction.
         let mut tx = OutboundStream::new(client_out.dk_c_to_s);
         let mut rx = InboundStream::new(server_out.dk_c_to_s);
         let payload = b"hello via handshake";
@@ -745,7 +745,7 @@ mod tests {
         );
     }
 
-    /// V2 client ↔ V1-only server — symmetric к the above.
+    /// V2 client ↔ V1-only server — symmetric to the above.
     /// V1 server's expected MAC omits the V2 tag, V2 client's MAC
     /// includes it.  MAC verify fails → silent-drop.
     #[test]
@@ -786,7 +786,7 @@ mod tests {
 
     /// V2 client ↔ multi-accept server [V2, V1] — server matches V2
     /// immediately on the first try.  Server's response uses V2
-    /// labels так что V2 client's `complete()` verifies the AUTH.
+    /// labels so that V2 client's `complete()` verifies the AUTH.
     #[test]
     fn multi_accept_server_routes_v2_client_via_v2() {
         let psk = test_psk();
@@ -820,7 +820,7 @@ mod tests {
     }
 
     /// V2 padding range is tighter than V1 (0..=96 vs 0..=128).
-    /// Sample 200 handshakes и assert V2's max length stays under
+    /// Sample 200 handshakes and assert V2's max length stays under
     /// V1's max length.  Defense-in-depth against accidental constant
     /// regression that would re-align V1/V2 length distributions.
     #[test]

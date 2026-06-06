@@ -34,35 +34,35 @@ pub const RTT_CEIL_MS: u32 = 60_000;
 
 // ── PeerReportedRtt newtype ──────────────────────────────────
 //
-// cleanup: every entry point that ingests а peer-supplied RTT
+// cleanup: every entry point that ingests a peer-supplied RTT
 // scalar manually called `.clamp(RTT_FLOOR_MS, RTT_CEIL_MS)` BEFORE forwarding
-// it к `RttTable::record` / `RttProbe::update`. The fix from
-// added the clamp в one site (`record`); X1 hardens the contract by
-// MOVING the clamp into а constructor that runs ON CONSTRUCTION, so callers
-// physically cannot skip it — а new entry point added by future code (e.g.
-// а new wire frame variant carrying RTT) gets the protection automatically
+// it to `RttTable::record` / `RttProbe::update`. The fix from
+// added the clamp in one site (`record`); X1 hardens the contract by
+// MOVING the clamp into a constructor that runs ON CONSTRUCTION, so callers
+// physically cannot skip it — a new entry point added by future code (e.g.
+// a new wire frame variant carrying RTT) gets the protection automatically
 // just by typing the field as `PeerReportedRtt`.
 //
-// Defends against а malicious peer advertising:
-// * Absurdly low RTT (`1 ms` on transcontinental link) к win NeighborScorer
-// preference и become an attractive relay-correlation vantage point.
-// * Huge RTT (`u32::MAX`) к evict an honest peer from the route shortlist.
+// Defends against a malicious peer advertising:
+// * Absurdly low RTT (`1 ms` on transcontinental link) to win NeighborScorer
+// preference and become an attractive relay-correlation vantage point.
+// * Huge RTT (`u32::MAX`) to evict an honest peer from the route shortlist.
 
-/// Peer-reported RTT measurement, clamped к the safe range
+/// Peer-reported RTT measurement, clamped to the safe range
 /// `[RTT_FLOOR_MS, RTT_CEIL_MS]` at construction time.
 ///
 /// Construct [`PeerReportedRtt::from_raw_ms`] or [`PeerReportedRtt::new`]
 /// (alias). The clamp runs unconditionally — no escape hatch — so an attacker-
-/// supplied value cannot reach the routing layer без passing through it.
+/// supplied value cannot reach the routing layer without passing through it.
 ///
-/// Use `as_clamped_ms` к extract the validated value for storage / arithmetic.
+/// Use `as_clamped_ms` to extract the validated value for storage / arithmetic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerReportedRtt(u32);
 
 impl PeerReportedRtt {
-    /// Wrap а raw u32 RTT-in-milliseconds value, clamping к
+    /// Wrap a raw u32 RTT-in-milliseconds value, clamping to
     /// `[RTT_FLOOR_MS, RTT_CEIL_MS]`. Always succeeds — out-of-range
-    /// values silently snap к the boundary (design: still
+    /// values silently snap to the boundary (design: still
     /// record extreme samples so the peer is scored as "extreme"
     /// rather than silently dropping which would let attackers blank
     /// their RTT history).
@@ -70,7 +70,7 @@ impl PeerReportedRtt {
         Self(rtt_ms.clamp(RTT_FLOOR_MS, RTT_CEIL_MS))
     }
 
-    /// Alias для [`Self::from_raw_ms`] — concise call site.
+    /// Alias for [`Self::from_raw_ms`] — concise call site.
     pub fn new(rtt_ms: u32) -> Self {
         Self::from_raw_ms(rtt_ms)
     }
@@ -352,12 +352,12 @@ impl RttTable {
     /// the smoothed value is updated via EWMA so routing decisions are not
     /// thrown off by single-sample spikes.
     ///
-    /// the `rtt_ms` parameter is а [`PeerReportedRtt`] — already
-    /// clamped к `[RTT_FLOOR_MS, RTT_CEIL_MS]` at construction time. The
-    /// clamp lives в the type rather than this function, so а new caller
+    /// the `rtt_ms` parameter is a [`PeerReportedRtt`] — already
+    /// clamped to `[RTT_FLOOR_MS, RTT_CEIL_MS]` at construction time. The
+    /// clamp lives in the type rather than this function, so a new caller
     /// added by future code cannot accidentally bypass it (the type system
     /// physically refuses raw `u32`). / originated the
-    /// clamp; X1 just moves enforcement к the construction boundary.
+    /// clamp; X1 just moves enforcement to the construction boundary.
     ///
     /// Source-validation (peer can't be the sample's source) is enforced at
     /// the caller layer where the wire-frame parser knows who advertised what.

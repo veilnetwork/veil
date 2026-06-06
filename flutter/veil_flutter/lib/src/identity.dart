@@ -3,7 +3,7 @@
 // User flow:
 //   1. App launches on a fresh device.
 //   2. User picks "Restore identity" → enters their 24-word BIP-39
-//      phrase (paper backup от a previous device).
+//      phrase (paper backup from a previous device).
 //   3. App calls [validateBip39Phrase] for live feedback as they type.
 //   4. On submit, app calls [restoreIdentity] which derives the
 //      device's identity files into [veilDir] (typically the
@@ -64,20 +64,20 @@ bool validateBip39Phrase(String phrase) {
 ///   * `instance.toml`         — per-device instance label + sig key index
 ///   * `identity_sk.bin`       — this device's per-instance signing key
 ///
-/// The daemon, на subsequent launch, reads these files and brings
-/// up the network connection с the recovered `node_id`.
+/// The daemon, on subsequent launch, reads these files and brings
+/// up the network connection with the recovered `node_id`.
 ///
 /// [instanceLabel] is the human-readable name shown in
 /// `identity show` for this device (e.g. "Phone — May 2024").  Cap
 /// is 64 ASCII chars; longer labels truncate.
 ///
-/// Idempotent: re-running с the same phrase + same dir regenerates
-/// the per-device identity_sk и rewrites the document.  The
+/// Idempotent: re-running with the same phrase + same dir regenerates
+/// the per-device identity_sk and rewrites the document.  The
 /// `node_id` stays stable across calls (BIP-39 → master is
 /// deterministic).
 ///
 /// Throws [VeilException] on:
-///   * malformed phrase (use [validateBip39Phrase] для UI feedback first),
+///   * malformed phrase (use [validateBip39Phrase] for UI feedback first),
 ///   * cannot create / write to [veilDir],
 ///   * any underlying crypto failure (rare — would indicate a bug).
 void restoreIdentity({
@@ -108,8 +108,8 @@ void restoreIdentity({
   }
 }
 
-/// Restore identity AND save а passphrase-encrypted master-seed backup
-/// (`master.enc`) alongside it.  Combines [restoreIdentity] с the
+/// Restore identity AND save a passphrase-encrypted master-seed backup
+/// (`master.enc`) alongside it.  Combines [restoreIdentity] with the
 /// Argon2id-encrypted backup path so apps can offer "recovery via
 /// passphrase only" — user provides the passphrase to decrypt; no
 /// BIP-39 phrase needs to leave the device once the encrypted blob
@@ -122,24 +122,24 @@ void restoreIdentity({
 /// promptly.
 ///
 /// [passphrase] is encoded as UTF-8.  Strength is the caller's
-/// responsibility — veil-identity uses Argon2id с production
+/// responsibility — veil-identity uses Argon2id with production
 /// parameters (64 MiB memory, t=3, p=4), which makes brute-force
 /// expensive but cannot save user-supplied "password123".  Consider
-/// gating on length (≥ 12 chars) и/или а strength meter in the UI.
+/// gating on length (≥ 12 chars) and/or a strength meter in the UI.
 ///
-/// Files written к [veilDir]:
+/// Files written to [veilDir]:
 ///   * `identity_document.bin` — signed master+device cert chain
 ///   * `instance.toml`         — per-device instance label + sig key
 ///   * `identity_sk.bin`       — this device's per-instance signing key
 ///   * `master.enc`            — Argon2id-derived-key-encrypted master
-///                               seed (allows offline restore с only
+///                               seed (allows offline restore with only
 ///                               the passphrase)
 ///
 /// Throws [VeilException] on:
 ///   * malformed [phrase],
 ///   * invalid UTF-8 [passphrase],
-///   * cannot create / write к [veilDir],
-///   * crypto failure (rare — would indicate а bug).
+///   * cannot create / write to [veilDir],
+///   * crypto failure (rare — would indicate a bug).
 void restoreIdentityEncrypted({
   required String phrase,
   required String veilDir,
@@ -169,9 +169,9 @@ void restoreIdentityEncrypted({
   }
 }
 
-/// Sanity-check helper для UI: returns `true` iff [phrase], when
+/// Sanity-check helper for UI: returns `true` iff [phrase], when
 /// trimmed and split on whitespace, has exactly 24 tokens.  Lightweight
-/// pre-check that the phrase has the right shape без calling FFI.
+/// pre-check that the phrase has the right shape without calling FFI.
 /// Use in UI to gate the "Restore" button BEFORE the heavyweight
 /// [validateBip39Phrase] call (which validates the BIP-39 checksum).
 bool hasBip39WordCount(String phrase) {

@@ -1,19 +1,19 @@
 //! decomposition : encapsulates the four timer
 //! deadlines that gate the runner's `await_next_input` sleep
-//! computation и the keepalive / cover-traffic / idle / rx-stall
+//! computation and the keepalive / cover-traffic / idle / rx-stall
 //! handlers:
 //!
 //! * `last_rx` — last successful frame-byte read (idle-timeout
-//!   ticker; stage (c.2) rx-stall threshold; sole input к the
+//!   ticker; stage (c.2) rx-stall threshold; sole input to the
 //!   `now - last_rx >= idle_timeout` check at runner.rs:1416)
 //! * `next_keepalive` — scheduled time of the next outbound Keepalive
-//!   (jittered к defeat per-session timing fingerprints)
+//!   (jittered to defeat per-session timing fingerprints)
 //! * `next_cover` — scheduled time of the next outbound cover-Padding
 //!   frame
 //!
-//! Plus the static enable-flags derived от config.
+//! Plus the static enable-flags derived from config.
 //!
-//! Was scattered inline mutables в `run`; extracting into а typed
+//! Was scattered inline mutables in `run`; extracting into a typed
 //! struct lets future slices touch the keepalive / cover / idle
 //! handlers without each one re-touching the same three locals.
 //!
@@ -21,12 +21,12 @@
 //! (`phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent`
 //! commit `7a8237f`):
 //! `last_rx` must be advanced ONLY by `note_frame_received` (peer
-//! activity) или `note_swap` (transport handover); the runner's own
+//! activity) or `note_swap` (transport handover); the runner's own
 //! rekey / keepalive / cover emission MUST NOT advance it, else
-//! а silently-disconnecting peer would leave the session hung
+//! a silently-disconnecting peer would leave the session hung
 //! forever. This struct's API enforces the invariant by exposing
-//! `last_rx` as а read-only accessor — only `note_frame_received`
-//! и `note_swap` are mutators.
+//! `last_rx` as a read-only accessor — only `note_frame_received`
+//! and `note_swap` are mutators.
 
 use std::time::Duration;
 use tokio::time::Instant;
@@ -48,8 +48,8 @@ impl SessionTimers {
     pub fn new(keepalive_interval: Duration, idle_timeout: Duration) -> Self {
         let keepalive_enabled = !keepalive_interval.is_zero();
         let idle_enabled = idle_timeout > Duration::ZERO;
-        // Cover-traffic kicks in only когда keepalive is also enabled —
-        // а keepalive-disabled session is short-lived и doesn't need
+        // Cover-traffic kicks in only when keepalive is also enabled —
+        // a keepalive-disabled session is short-lived and doesn't need
         // anti-DPI cover.
         let cover_enabled = keepalive_enabled;
         let now = Instant::now();
@@ -66,9 +66,9 @@ impl SessionTimers {
     }
 
     /// Test-only accessor; production reads `last_rx` via the typed
-    /// predicates `idle_timeout_elapsed` / `rx_stall_elapsed` или
+    /// predicates `idle_timeout_elapsed` / `rx_stall_elapsed` or
     /// the `idle_deadline` / `stall_trigger_deadline` helpers.
-    /// Gating с `#[cfg(test)]` blocks accidental external mutation
+    /// Gating with `#[cfg(test)]` blocks accidental external mutation
     /// of the ticker invariant (gate Test 5).
     pub fn last_rx(&self) -> Instant {
         self.last_rx
@@ -95,7 +95,7 @@ impl SessionTimers {
     }
 
     /// Idle-deadline = `last_rx + idle_timeout`. Used in the
-    /// `sleep_until` computation и as the upper bound для the
+    /// `sleep_until` computation and as the upper bound for the
     /// 2/3-of-idle stall-trigger threshold.
     pub fn idle_deadline(&self) -> Instant {
         self.last_rx + self.idle_timeout
@@ -105,7 +105,7 @@ impl SessionTimers {
     ///when the peer goes silent for 2/3 of
     /// idle_timeout, fire the hot-standby trigger ONE iteration
     /// before the session would naturally idle-out — gives the warm
-    /// probe time к dial и attach.
+    /// probe time to dial and attach.
     pub fn stall_trigger_deadline(&self) -> Instant {
         self.last_rx + self.idle_timeout * 2 / 3
     }
@@ -120,25 +120,25 @@ impl SessionTimers {
         self.idle_enabled && now.duration_since(self.last_rx) >= self.idle_timeout * 2 / 3
     }
 
-    /// Mark а received-frame event. Resets `last_rx` к `now`; caller
+    /// Mark a received-frame event. Resets `last_rx` to `now`; caller
     /// also resets the per-stall-event `stall_trigger_fired` flag
     /// since "peer is responsive again".
     pub fn note_frame_received(&mut self, now: Instant) {
         self.last_rx = now;
     }
 
-    /// Mark а transport-swap event. Same effect as
-    /// `note_frame_received`: the swap itself is activity, и any
+    /// Mark a transport-swap event. Same effect as
+    /// `note_frame_received`: the swap itself is activity, and any
     /// previously-fired stall trigger is cleared (caller's
     /// responsibility).
     pub fn note_swap(&mut self, now: Instant) {
         self.last_rx = now;
     }
 
-    /// Test + reschedule для keepalive-due check. Returns `true`
-    /// если caller must emit а Keepalive frame; в that case
-    /// `next_keepalive` has already been advanced к the next
-    /// jittered deadline so the caller doesn't have к remember
+    /// Test + reschedule for keepalive-due check. Returns `true`
+    /// if caller must emit a Keepalive frame; in that case
+    /// `next_keepalive` has already been advanced to the next
+    /// jittered deadline so the caller doesn't have to remember
     /// to do it.
     pub fn keepalive_due_and_reschedule(&mut self, now: Instant) -> bool {
         if !self.keepalive_enabled || now < self.next_keepalive {
@@ -148,8 +148,8 @@ impl SessionTimers {
         true
     }
 
-    /// Test + reschedule для cover-traffic-due check. Returns
-    /// `true` если caller must emit а Padding frame; в that case
+    /// Test + reschedule for cover-traffic-due check. Returns
+    /// `true` if caller must emit a Padding frame; in that case
     /// `next_cover` has already been advanced.
     pub fn cover_due_and_reschedule(&mut self, now: Instant) -> bool {
         if !self.cover_enabled || now < self.next_cover {
@@ -160,8 +160,8 @@ impl SessionTimers {
     }
 
     /// Update the keepalive interval (e.g. called by
-    /// `BatteryAdjustedKeepalive::maybe_recompute` with а scaled
-    /// interval) и immediately reschedule `next_keepalive`.
+    /// `BatteryAdjustedKeepalive::maybe_recompute` with a scaled
+    /// interval) and immediately reschedule `next_keepalive`.
     pub fn update_keepalive_interval(&mut self, new_interval: Duration, now: Instant) {
         self.keepalive_interval = new_interval;
         self.next_keepalive = now + jitter_keepalive_interval(new_interval);
@@ -208,7 +208,7 @@ mod tests {
         assert!(!timers.idle_timeout_elapsed(t0 + Duration::from_secs(4)));
         // 6 s elapsed: idle.
         assert!(timers.idle_timeout_elapsed(t0 + Duration::from_secs(6)));
-        // After а frame arrives, the ticker resets.
+        // After a frame arrives, the ticker resets.
         timers.note_frame_received(t0 + Duration::from_secs(6));
         assert!(
             !timers.idle_timeout_elapsed(t0 + Duration::from_secs(7)),
@@ -247,7 +247,7 @@ mod tests {
         let prev = timers.next_keepalive();
         let now = Instant::now() + Duration::from_secs(100);
         timers.update_keepalive_interval(Duration::from_secs(60), now);
-        // New next_keepalive should be ~now + 60s; в any case strictly later than prev.
+        // New next_keepalive should be ~now + 60s; in any case strictly later than prev.
         assert!(timers.next_keepalive() > prev);
     }
 

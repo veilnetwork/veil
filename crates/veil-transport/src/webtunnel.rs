@@ -2,17 +2,17 @@
 //!
 //! Stack: TCP → TLS (rustls) → HTTP/1.1 → WebSocket upgrade → byte stream.
 //!
-//! Server side: incoming requests са wrong secret path / auth get а decoy
-//! HTML response (looks like а regular HTTPS site).  Tunnel-mode requests
-//! upgrade к WebSocket binary frames carrying OVL1 plaintext.
+//! Server side: incoming requests with wrong secret path / auth get a decoy
+//! HTML response (looks like a regular HTTPS site).  Tunnel-mode requests
+//! upgrade to WebSocket binary frames carrying OVL1 plaintext.
 //!
-//! Client side: dials с realistic Chrome-like browser headers, completes
-//! TLS+WS upgrade, exposes а transparent byte stream к session layer.
+//! Client side: dials with realistic Chrome-like browser headers, completes
+//! TLS+WS upgrade, exposes a transparent byte stream to session layer.
 //!
 //! Configuration via [`TransportContext`]:
 //! - `webtunnel_secret_path`: e.g. `/_t/32-random-chars`
 //! - `webtunnel_auth_token`: optional auth header value
-//! - `webtunnel_decoy_dir`: directory с decoy site content
+//! - `webtunnel_decoy_dir`: directory with decoy site content
 //!
 //! In-process TLS uses the existing `ctx.tls.client_config` / `server_config`
 //! infrastructure — same node-id-bound certs as other TLS transports.
@@ -73,7 +73,7 @@ fn parts(uri: &TransportUri) -> Result<(&str, u16, Option<&str>)> {
 fn build_matcher(ctx: &TransportContext) -> Result<SecretMatcher> {
     let path = ctx.webtunnel_secret_path.as_ref().ok_or_else(|| {
         TransportError::Unsupported(
-            "webtunnel-wss requires `webtunnel_secret_path` в TransportContext".to_owned(),
+            "webtunnel-wss requires `webtunnel_secret_path` in TransportContext".to_owned(),
         )
     })?;
     let m = match &ctx.webtunnel_auth_token {
@@ -107,9 +107,9 @@ fn build_client(ctx: &TransportContext, host: &str) -> Result<WebtunnelClient> {
 
 // ── WebSocketStream → AsyncRead+AsyncWrite bridge ───────────────────────────
 
-/// Convert а WebSocketStream (Stream<Message> + Sink<Message>) к а byte
-/// stream compatible с session-layer's BoxIoStream.  Reads pull binary
-/// messages → bytes; writes wrap bytes в binary messages.
+/// Convert a WebSocketStream (Stream<Message> + Sink<Message>) to a byte
+/// stream compatible with session-layer's BoxIoStream.  Reads pull binary
+/// messages → bytes; writes wrap bytes in binary messages.
 fn ws_to_byte_stream<S>(ws: WebSocketStream<S>) -> tokio::io::DuplexStream
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -263,7 +263,7 @@ impl TransportListener for WebtunnelListener {
             // SECURITY (audit 2026-05-29, HIGH listener-DoS fix): bound the
             // inline TLS handshake AND the webtunnel HTTP/WS routing — both
             // read attacker-controlled bytes inside the accept future, so
-            // either could otherwise wedge the accept loop on а silent
+            // either could otherwise wedge the accept loop on a silent
             // client.  Mirrors the obfs4/tls/wss listeners.
             let tls_stream =
                 tokio::time::timeout(WEBTUNNEL_HANDSHAKE_TIMEOUT, self.acceptor.accept(tcp))
@@ -271,7 +271,7 @@ impl TransportListener for WebtunnelListener {
                     .map_err(|_| handshake_timeout(WEBTUNNEL_HANDSHAKE_TIMEOUT))?
                     .map_err(|e| TransportError::Tls(format!("webtunnel TLS accept: {e}")))?;
 
-            // Webtunnel routing — Box к break the recursive type.
+            // Webtunnel routing — Box to break the recursive type.
             let ws = tokio::time::timeout(
                 WEBTUNNEL_HANDSHAKE_TIMEOUT,
                 self.router.handle(Box::new(tls_stream) as BoxIoStream),

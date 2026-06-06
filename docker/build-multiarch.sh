@@ -24,10 +24,10 @@
 #   TAG / $2          Image tag (default: latest)
 #   PLATFORMS         Comma-separated platforms (default: auto-detected native)
 #   CARGO_FEATURES    Rust feature flags (default: production-seeds,quic-session).
-#                     Override к "allow-empty-seeds,quic-session" ONLY для
+#                     Override to "allow-empty-seeds,quic-session" ONLY for
 #                     explicit testnet/devnet builds; the production default
-#                     refuses к compile без populated bootstrap seeds, which
-#                     prevents shipping а "production-looking" artefact that
+#                     refuses to compile without populated bootstrap seeds, which
+#                     prevents shipping a "production-looking" artefact that
 #                     cannot bootstrap (Phase 6.50.b safe-default policy).
 #   PUSH              1=push (default), 0=local only
 set -euo pipefail

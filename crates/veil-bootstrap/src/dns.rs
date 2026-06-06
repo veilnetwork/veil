@@ -12,21 +12,21 @@
 //! Anti-censorship strategy P0 #2: the **default** seed-discovery
 //! path uses DNS-over-TLS (DoT, port 853) against pinned-IP upstream
 //! resolvers, falling through to DNS-over-HTTPS (DoH, port 443) if
-//! DoT is blocked, and **only as a last resort** к system DNS (which
-//! а local DPI can intercept and rewrite).
+//! DoT is blocked, and **only as a last resort** to system DNS (which
+//! a local DPI can intercept and rewrite).
 //!
-//! The pinned upstreams are Cloudflare 1.1.1.1, Google 8.8.8.8, и
+//! The pinned upstreams are Cloudflare 1.1.1.1, Google 8.8.8.8, and
 //! Quad9 9.9.9.9 — chosen so blocking all three has high collateral
-//! damage (these resolvers serve а significant fraction of legit
+//! damage (these resolvers serve a significant fraction of legit
 //! traffic in any country).  All three are queried in parallel; the
 //! first success wins.  TLS cert chain validated against bundled
-//! webpki-roots (independent of OS trust store, so а compromised
+//! webpki-roots (independent of OS trust store, so a compromised
 //! local CA cannot MITM).
 //!
 //! [`discover_seeds_dns`] is the public entry-point and follows the
 //! DoT → DoH → system fallback chain automatically.  Callers that
-//! specifically need а variant can use [`discover_seeds_dns_secure`]
-//! (DoT+DoH only, never falls back к system) or
+//! specifically need a variant can use [`discover_seeds_dns_secure`]
+//! (DoT+DoH only, never falls back to system) or
 //! [`discover_seeds_dns_system`] (system DNS only, e.g. for tests
 //! where DoT/DoH would touch the public internet).
 
@@ -41,26 +41,26 @@ use veil_types::{BootstrapPeer, SignatureAlgorithm};
 pub const DEFAULT_BOOTSTRAP_DOMAIN: &str = "veil.example";
 
 /// Total time budget for the DoT or DoH stage before fallthrough.  Set
-/// short enough что а blocked upstream doesn't stall startup; long
-/// enough к accommodate а high-latency cellular link.
+/// short enough that a blocked upstream doesn't stall startup; long
+/// enough to accommodate a high-latency cellular link.
 const SECURE_DNS_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Total time budget для the system-DNS fallback stage.  Short — the
-/// censor-controlled resolver typically answers quickly (often с а
-/// rewritten record), so если this stage isn't done in а few seconds
-/// it's hung и we'd rather move on.
+/// Total time budget for the system-DNS fallback stage.  Short — the
+/// censor-controlled resolver typically answers quickly (often with a
+/// rewritten record), so if this stage isn't done in a few seconds
+/// it's hung and we'd rather move on.
 const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Query DNS TXT records for bootstrap seeds, preferring encrypted
 /// transports (DoT > DoH > system).
 ///
 /// Returns an empty vec on any failure — bootstrap then falls through
-/// к builtin seeds.  This is the **production** entry-point used by
+/// to builtin seeds.  This is the **production** entry-point used by
 /// `veilcore::node::bootstrap::*`.
 pub async fn discover_seeds_dns(domain: &str) -> Vec<BootstrapPeer> {
     // Stage 1: DoT to pinned upstreams.  TLS-on-853 is the most
-    // censor-resistant: encrypted, port-distinct от vanilla DNS-on-53,
-    // и pinned-IP defeats DNS-spoofing of the upstream hostname.
+    // censor-resistant: encrypted, port-distinct from vanilla DNS-on-53,
+    // and pinned-IP defeats DNS-spoofing of the upstream hostname.
     if let Some(seeds) = tokio::time::timeout(
         SECURE_DNS_TIMEOUT,
         run_encrypted(domain, EncryptedMode::Dot),
@@ -74,8 +74,8 @@ pub async fn discover_seeds_dns(domain: &str) -> Vec<BootstrapPeer> {
     }
 
     // Stage 2: DoH if DoT was blocked.  HTTPS-on-443 indistinguishable
-    // от ordinary web traffic; harder для а stateless port-block к
-    // catch, но more expensive than DoT (HTTP overhead).
+    // from ordinary web traffic; harder for a stateless port-block to
+    // catch, but more expensive than DoT (HTTP overhead).
     if let Some(seeds) = tokio::time::timeout(
         SECURE_DNS_TIMEOUT,
         run_encrypted(domain, EncryptedMode::Doh),
@@ -89,9 +89,9 @@ pub async fn discover_seeds_dns(domain: &str) -> Vec<BootstrapPeer> {
     }
 
     // Stage 3: system DNS — censor-readable, last resort.  Returns
-    // whatever the local resolver chooses (potentially rewritten by а
+    // whatever the local resolver chooses (potentially rewritten by a
     // DPI middlebox); operator-deployed bootstrap signature on the
-    // signed-invite layer (`signed_invite.rs`) protects against а
+    // signed-invite layer (`signed_invite.rs`) protects against a
     // tampered TXT response delivering rogue seeds.
     tokio::time::timeout(SYSTEM_DNS_TIMEOUT, discover_seeds_dns_system(domain))
         .await
@@ -99,9 +99,9 @@ pub async fn discover_seeds_dns(domain: &str) -> Vec<BootstrapPeer> {
 }
 
 /// DoT- + DoH-only seed discovery (no system-DNS fallback).  Used by
-/// callers что explicitly want к refuse system-DNS results — e.g. а
-/// deployment running inside а jurisdiction with а known-malicious
-/// state resolver.  Returns empty vec if both DoT и DoH fail.
+/// callers that explicitly want to refuse system-DNS results — e.g. a
+/// deployment running inside a jurisdiction with a known-malicious
+/// state resolver.  Returns empty vec if both DoT and DoH fail.
 pub async fn discover_seeds_dns_secure(domain: &str) -> Vec<BootstrapPeer> {
     if let Some(seeds) = run_encrypted(domain, EncryptedMode::Dot).await
         && !seeds.is_empty()
@@ -113,17 +113,17 @@ pub async fn discover_seeds_dns_secure(domain: &str) -> Vec<BootstrapPeer> {
         .unwrap_or_default()
 }
 
-/// Plain-DNS seed discovery via the system resolver.  Used as а
-/// last-resort fallback by [`discover_seeds_dns`] и directly by tests
+/// Plain-DNS seed discovery via the system resolver.  Used as a
+/// last-resort fallback by [`discover_seeds_dns`] and directly by tests
 /// (where DoT/DoH would touch the public internet).
 pub async fn discover_seeds_dns_system(domain: &str) -> Vec<BootstrapPeer> {
     let query_name = format!("_veil._bootstrap.{domain}.");
 
     // hickory-resolver 0.26 (RUSTSEC-2026-0119 fix) renamed `AsyncResolver`
-    // → `Resolver` и replaced `tokio_from_system_conf` с `builder_tokio`
+    // → `Resolver` and replaced `tokio_from_system_conf` with `builder_tokio`
     // + `.build`. `builder_tokio` pulls system DNS config (matches the
-    // old `from_system_conf` semantics) и returns а `ResolverBuilder`;
-    // `.build` finalizes it to а `Resolver<TokioRuntimeProvider>`.
+    // old `from_system_conf` semantics) and returns a `ResolverBuilder`;
+    // `.build` finalizes it to a `Resolver<TokioRuntimeProvider>`.
     let resolver = match Resolver::builder_tokio().and_then(|b| b.build()) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
@@ -138,11 +138,11 @@ enum EncryptedMode {
     Doh,
 }
 
-/// Build а Tokio resolver from а ServerGroup using the requested
-/// encrypted transport, then run а TXT query.  Returns `Some(seeds)`
-/// on success (even если seeds is empty) или `None` если the
+/// Build a Tokio resolver from a ServerGroup using the requested
+/// encrypted transport, then run a TXT query.  Returns `Some(seeds)`
+/// on success (even if seeds is empty) or `None` if the
 /// resolver couldn't be constructed (config error, missing TLS
-/// support и т. п.).
+/// support etc.).
 async fn run_encrypted_group(
     group: &ServerGroup<'_>,
     mode: EncryptedMode,
@@ -159,9 +159,9 @@ async fn run_encrypted_group(
     Some(run_txt_query(&resolver, query_name).await)
 }
 
-/// Race CLOUDFLARE / GOOGLE / QUAD9 для the requested mode и return
+/// Race CLOUDFLARE / GOOGLE / QUAD9 for the requested mode and return
 /// the first non-empty success.  Single-resolver failures (network
-/// error, NXDOMAIN, transport-layer block) silently fall through к
+/// error, NXDOMAIN, transport-layer block) silently fall through to
 /// the next upstream.
 async fn run_encrypted(domain: &str, mode: EncryptedMode) -> Option<Vec<BootstrapPeer>> {
     let query_name = format!("_veil._bootstrap.{domain}.");
@@ -175,9 +175,9 @@ async fn run_encrypted(domain: &str, mode: EncryptedMode) -> Option<Vec<Bootstra
     None
 }
 
-/// Shared TXT-query worker — same path для system, DoT, и DoH.  Any
-/// error (NXDOMAIN, network timeout, etc.) collapses к an empty Vec
-/// so the caller can fall through к the next stage.
+/// Shared TXT-query worker — same path for system, DoT, and DoH.  Any
+/// error (NXDOMAIN, network timeout, etc.) collapses to an empty Vec
+/// so the caller can fall through to the next stage.
 async fn run_txt_query<P>(resolver: &Resolver<P>, query_name: &str) -> Vec<BootstrapPeer>
 where
     P: hickory_resolver::ConnectionProvider + Clone,
@@ -272,11 +272,11 @@ mod tests {
         assert!(parse_seed_txt("").is_none());
     }
 
-    /// Resolver-construction smoke test — DoT и DoH builders shouldn't
-    /// fail at config time даже без network access.  Catches the
-    /// "missed а cargo feature" case where webpki-roots isn't pulled
-    /// in и `TlsConfig::new()` returns an error.  No DNS query
-    /// issued (so safe для CI без internet).
+    /// Resolver-construction smoke test — DoT and DoH builders shouldn't
+    /// fail at config time even without network access.  Catches the
+    /// "missed a cargo feature" case where webpki-roots isn't pulled
+    /// in and `TlsConfig::new()` returns an error.  No DNS query
+    /// issued (so safe for CI without internet).
     #[tokio::test]
     async fn dot_resolver_builds_ok() {
         let cfg = ResolverConfig::tls(&CLOUDFLARE);
@@ -294,7 +294,7 @@ mod tests {
     }
 
     /// All three upstream presets should produce buildable resolvers
-    /// for both DoT и DoH — guards against а typo in the pinned-list.
+    /// for both DoT and DoH — guards against a typo in the pinned-list.
     #[tokio::test]
     async fn all_pinned_upstreams_build_for_dot_and_doh() {
         for group in [&CLOUDFLARE, &GOOGLE, &QUAD9] {

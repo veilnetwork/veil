@@ -486,7 +486,7 @@ pub struct AppDeliverPayload {
     /// Destination endpoint id.
     pub endpoint_id: u32,
     /// Delivered datagram bytes. d: pool-backed for symmetry
-    /// с AppSendPayload / AppIpcSendPayload — daemon → chat-node hot path.
+    /// with AppSendPayload / AppIpcSendPayload — daemon → chat-node hot path.
     pub data: veil_bufpool::PooledShared,
 }
 
@@ -781,9 +781,9 @@ impl StreamOpenOkPayload {
 
 /// **Inbound stream notification** — daemon → bound app.
 ///
-/// Sent when а remote peer opens а stream к а bound endpoint owned
-/// by this IPC client.  The SDK uses `app_id` + `endpoint_id` к route
-/// the notification к the right `AppHandle`'s inbound queue.
+/// Sent when a remote peer opens a stream to a bound endpoint owned
+/// by this IPC client.  The SDK uses `app_id` + `endpoint_id` to route
+/// the notification to the right `AppHandle`'s inbound queue.
 ///
 /// Wire layout (fixed 76 bytes):
 /// ```text
@@ -822,7 +822,7 @@ impl StreamOpenInboundPayload {
         buf
     }
 
-    /// Parse from а 76-byte buffer.
+    /// Parse from a 76-byte buffer.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
         if buf.len() < Self::WIRE_SIZE {
             return Err(ProtoError::BufferTooShort {
@@ -857,14 +857,14 @@ pub mod stream_open_err {
     pub const WINDOW_EXHAUSTED: u16 = 3;
     /// Global stream table is full (`MAX_TOTAL_STREAMS` reached).
     pub const CAPACITY_REACHED: u16 = 4;
-    /// Destination `dst_node_id` is not the local daemon's node, и
-    /// inter-node IPC stream-forwarding is не yet implemented в this
+    /// Destination `dst_node_id` is not the local daemon's node, and
+    /// inter-node IPC stream-forwarding is not yet implemented in this
     /// daemon. The VeilConnector path (used by oproxy / proxy)
-    /// works fine для cross-node streams; this code surfaces ТОЛЬКО
-    /// для the `STREAM_OPEN` IPC frame на а remote endpoint.
+    /// works fine for cross-node streams; this code surfaces ONLY
+    /// for the `STREAM_OPEN` IPC frame on a remote endpoint.
     ///
-    /// Distinct от `NOT_FOUND` так что SDK clients can tell "you
-    /// asked для а node we just don't talk к от IPC yet" apart от
+    /// Distinct from `NOT_FOUND` so that SDK clients can tell "you
+    /// asked for a node we just don't talk to from IPC yet" apart from
     /// "the endpoint really isn't bound anywhere on the network."
     ///
     /// Re-open trigger: implement Phase 1 of the IPC stream-forwarding
@@ -1223,15 +1223,15 @@ impl MobileBackgroundMode {
 }
 
 /// Payload [`crate::family::LocalAppMsg::SetPushEnvelope`] (
-/// — T1.2). App registers а sealed FCM/APNs token envelope с
-/// the daemon, scoped к а specific rendezvous publication.
+/// — T1.2). App registers a sealed FCM/APNs token envelope with
+/// the daemon, scoped to a specific rendezvous publication.
 ///
 /// Wire layout:
 /// ```text
 /// [0..32] rendezvous_node_id — matches an entry already registered via
 /// `register_rendezvous_publisher_with_push`
 /// [32..48] auth_cookie — same `(rendezvous, cookie)` tuple disambiguates
-/// multiple publications с the same rendezvous
+/// multiple publications with the same rendezvous
 /// [48..50] envelope_len u16 BE — 0 = clear push registration
 /// [50..] envelope — sealed FCM/APNs token; up to MAX_PUSH_ENVELOPE_LEN
 /// ```
@@ -1247,12 +1247,12 @@ pub struct SetPushEnvelopePayload {
 }
 
 /// Mirror of `veil_anonymity::push_envelope::MAX_PUSH_ENVELOPE_LEN` —
-/// kept here so the proto layer is self-contained и can defend the
-/// wire-decode path без depending on the anonymity crate.
+/// kept here so the proto layer is self-contained and can defend the
+/// wire-decode path without depending on the anonymity crate.
 pub const MAX_PUSH_ENVELOPE_BYTES: usize = 512;
 
 impl SetPushEnvelopePayload {
-    /// Minimum wire size: header без envelope body.
+    /// Minimum wire size: header without envelope body.
     pub const MIN_WIRE_SIZE: usize = 32 + 16 + 2;
 
     pub fn encode(&self) -> Vec<u8> {
@@ -1334,15 +1334,15 @@ impl SetPushEnvelopeStatus {
 // ── SetWakeHmacEnvelope (Epic 489.10 slice 4.3.4) ──────────────────────────
 
 /// Mirror of `veil_anonymity::rendezvous::MAX_WAKE_HMAC_ENVELOPE_LEN`.
-/// Kept here so the proto layer can defend the wire-decode path без
-/// depending на the anonymity crate.
+/// Kept here so the proto layer can defend the wire-decode path without
+/// depending on the anonymity crate.
 pub const MAX_WAKE_HMAC_ENVELOPE_BYTES: usize = 128;
 
 /// Payload [`crate::family::LocalAppMsg::SetWakeHmacEnvelope`].  Receiver
-/// app uploads the sealed wake-HMAC envelope so the daemon embeds it в
+/// app uploads the sealed wake-HMAC envelope so the daemon embeds it in
 /// every subsequent signed RendezvousAd refresh.
 ///
-/// Wire layout (identical к [`SetPushEnvelopePayload`] modulo the cap):
+/// Wire layout (identical to [`SetPushEnvelopePayload`] modulo the cap):
 /// ```text
 /// [0..32]  rendezvous_node_id
 /// [32..48] auth_cookie
@@ -1411,7 +1411,7 @@ impl SetWakeHmacEnvelopePayload {
 }
 
 /// Reply status [`SetWakeHmacEnvelopePayload`].  Same shape as
-/// [`SetPushEnvelopeStatus`] для consistency.
+/// [`SetPushEnvelopeStatus`] for consistency.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetWakeHmacEnvelopeStatus {
@@ -1452,8 +1452,8 @@ pub const MAILBOX_AUTH_COOKIE_LEN: usize = 16;
 
 /// max bytes for the optional capability-
 /// token trailer. Mirrors `veil-mailbox::MAX_CAPABILITY_TOKEN_BYTES`.
-/// 2 KiB fits Falcon-512 worst-case (~1.6 KiB) с headroom. Hardcoded
-/// here to keep `veil-proto` а leaf crate (no dep on veil-mailbox).
+/// 2 KiB fits Falcon-512 worst-case (~1.6 KiB) with headroom. Hardcoded
+/// here to keep `veil-proto` a leaf crate (no dep on veil-mailbox).
 pub const MAX_MAILBOX_CAPABILITY_TOKEN_BYTES: usize = 2048;
 
 /// Payload [`crate::family::LocalAppMsg::MailboxPut`].
@@ -1489,17 +1489,17 @@ pub const MAX_MAILBOX_CAPABILITY_TOKEN_BYTES: usize = 2048;
 /// the offline receiver. Empty / absent → relay only stores the blob;
 /// receiver picks it up on next online cycle.
 ///
-/// **Capability token** is optional на the wire but the relay
+/// **Capability token** is optional on the wire but the relay
 /// can require it via `MailboxConfig::require_capability_token`. Token
-/// is signed by the receiver's identity key и proves "the receiver
-/// authorised deposits к its own mailbox". Sender obtains the token
+/// is signed by the receiver's identity key and proves "the receiver
+/// authorised deposits to its own mailbox". Sender obtains the token
 /// from the receiver's `RendezvousAd`.
-/// Pre-slice-1 senders emit no token; relays running с the policy
-/// gate flipped к `false` (the default) accept those puts unchanged.
+/// Pre-slice-1 senders emit no token; relays running with the policy
+/// gate flipped to `false` (the default) accept those puts unchanged.
 ///
 /// **Backward compatibility:** both trailers are optional. Old senders
 /// emit either or both at length-zero / absent; new senders emit both
-/// trailer-length fields с zero defaults. Old daemons receiving а
+/// trailer-length fields with zero defaults. Old daemons receiving a
 /// new sender's payload ignore the trailing bytes (length is bounded
 /// by `MAX_FRAME_BODY`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1523,22 +1523,22 @@ pub struct MailboxPutPayload {
     /// relay only stores.
     pub push_envelope: Option<Vec<u8>>,
     /// optional opaque capability-token
-    /// bytes. Decoded и verified by `veil-mailbox`'s
+    /// bytes. Decoded and verified by `veil-mailbox`'s
     /// `Mailbox::put_with_capability` against the receiver's identity
     /// pubkey. `None` = sender omitted the token (legacy senders
-    /// или relays running с `require_capability_token = false`).
+    /// or relays running with `require_capability_token = false`).
     pub capability_token: Option<Vec<u8>>,
-    /// Optional sealed wake-HMAC envelope copied verbatim от the
+    /// Optional sealed wake-HMAC envelope copied verbatim from the
     /// receiver's RendezvousAd `wake_hmac_envelope` field (slice 4.3.2).
-    /// Relay (если it decided к fire а push wake) unseals it с its
-    /// X25519 sk к recover the receiver's WakeHmacKey, then mints
+    /// Relay (if it decided to fire a push wake) unseals it with its
+    /// X25519 sk to recover the receiver's WakeHmacKey, then mints
     /// an HMAC tag over the wake payload before dispatching the FCM
     /// / APNs delivery — receiver's plugin verifies the tag locally
-    /// и aborts wake on mismatch (closes leaked-push-token DoS /
+    /// and aborts wake on mismatch (closes leaked-push-token DoS /
     /// presence-oracle vector).
     ///
     /// `None` = sender did not propagate the envelope (legacy sender,
-    /// или receiver did not register для wake-HMAC).  Cap
+    /// or receiver did not register for wake-HMAC).  Cap
     /// [`MAX_WAKE_HMAC_ENVELOPE_BYTES`].
     ///
     /// NOTE (audit cycle-6, P7): this is the sender→relay PROPAGATION channel
@@ -1557,7 +1557,7 @@ impl MailboxPutPayload {
 
     /// Encode to wire bytes. Caller is responsible for the blob size
     /// staying ≤ [`MAX_MAILBOX_BLOB_BYTES`], the envelope size
-    /// staying ≤ [`MAX_PUSH_ENVELOPE_BYTES`], и the capability token
+    /// staying ≤ [`MAX_PUSH_ENVELOPE_BYTES`], and the capability token
     /// staying ≤ [`MAX_MAILBOX_CAPABILITY_TOKEN_BYTES`].
     pub fn encode(&self) -> Vec<u8> {
         debug_assert!(self.blob.len() <= MAX_MAILBOX_BLOB_BYTES);
@@ -1589,7 +1589,7 @@ impl MailboxPutPayload {
         }
         // Trailer 2 (capability_token): same
         // shape — always emit cap_len (0 = absent). Old decoders stop
-        // after Trailer 1 и ignore these trailing bytes.
+        // after Trailer 1 and ignore these trailing bytes.
         buf.extend_from_slice(&(cap_len as u16).to_be_bytes());
         if let Some(token) = self.capability_token.as_ref() {
             buf.extend_from_slice(token);
@@ -1597,7 +1597,7 @@ impl MailboxPutPayload {
         // Trailer 3 (wake_hmac_envelope, Epic 489.10 slice 4.3.4 follow-up):
         // sealed `WakeHmacKey` forwarded copy-paste from the receiver's
         // RendezvousAd.  Same length-prefix-then-bytes shape; legacy
-        // decoders stop after Trailer 2 и ignore these bytes.
+        // decoders stop after Trailer 2 and ignore these bytes.
         buf.extend_from_slice(&(wake_env_len as u16).to_be_bytes());
         if let Some(env) = self.wake_hmac_envelope.as_ref() {
             buf.extend_from_slice(env);
@@ -1695,7 +1695,7 @@ impl MailboxPutPayload {
             None
         };
         // ── Trailer 3: optional wake_hmac_envelope (slice 4.3.4 follow-up) ──
-        // Legacy senders stop после Trailer 2; new senders emit а
+        // Legacy senders stop after Trailer 2; new senders emit a
         // length-prefixed envelope (0 = sender did not propagate).
         let wake_hmac_envelope = if buf.len() >= cursor + 2 {
             let wake_env_len = super::read_u16_be(buf, cursor)? as usize;
@@ -1754,12 +1754,12 @@ pub enum MailboxPutStatus {
     RateLimited = 4,
     /// Daemon is not running a mailbox (operator did not opt).
     NotMailboxRelay = 5,
-    /// relay configured с
-    /// `require_capability_token = true` rejected а PUT that arrived
-    /// без а capability token.
+    /// relay configured with
+    /// `require_capability_token = true` rejected a PUT that arrived
+    /// without a capability token.
     CapabilityRequired = 6,
-    /// capability token decode или verify
-    /// failed (expired, wrong receiver, или bad signature).
+    /// capability token decode or verify
+    /// failed (expired, wrong receiver, or bad signature).
     CapabilityInvalid = 7,
     /// per-sender byte cap exceeded.
     QuotaPerSenderExceeded = 8,
@@ -2419,11 +2419,11 @@ impl LookupRendezvousReplicasPayload {
 /// ```
 ///
 /// Backward compat: pre-slice-2 daemons emit only the env trailer. New
-/// decoders see no cap_token bytes after env и default
+/// decoders see no cap_token bytes after env and default
 /// `capability_token = vec![]`. Likewise, pre-slice-2b daemons emit only
 /// the env + cap_token trailers; new decoders see no wake_hmac bytes after
-/// cap_token и default `wake_hmac_envelope = vec![]`. The 3rd trailer is
-/// thus optional on decode так а newer SDK keeps reading older daemons.
+/// cap_token and default `wake_hmac_envelope = vec![]`. The 3rd trailer is
+/// thus optional on decode so a newer SDK keeps reading older daemons.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaWire {
     /// Relay's `node_id`. Senders open `client.send` to this id +
@@ -2438,14 +2438,14 @@ pub struct ReplicaWire {
     /// register push).
     pub push_envelope: Vec<u8>,
     /// receiver-signed mailbox capability
-    /// token bytes pulled из the resolved RendezvousAd. Senders forward
-    /// these в `MailboxPutPayload.capability_token`. Empty when the
-    /// receiver did not mint а token (legacy senders / hybrid identities
+    /// token bytes pulled from the resolved RendezvousAd. Senders forward
+    /// these in `MailboxPutPayload.capability_token`. Empty when the
+    /// receiver did not mint a token (legacy senders / hybrid identities
     /// / pre-slice-2 daemons). Cap [`MAX_MAILBOX_CAPABILITY_TOKEN_BYTES`].
     pub capability_token: Vec<u8>,
     /// Sealed `WakeHmacKey` envelope (Epic 489.10 slice 2b) copied verbatim
     /// from the resolved `RendezvousAd.wake_hmac_envelope`. Senders forward it
-    /// в `MailboxPutPayload.wake_hmac_envelope` так the relay can mint а
+    /// in `MailboxPutPayload.wake_hmac_envelope` so the relay can mint a
     /// receiver-verifiable HMAC tag when dispatching the wake push. Empty when
     /// the receiver did not register for wake-HMAC (legacy receivers /
     /// pre-slice-2b daemons that emit only the first two trailers). Cap
@@ -2503,12 +2503,12 @@ impl ReplicaWire {
         let push_envelope = buf[env_start..env_end].to_vec();
         // mandatory trailer. The ReplicaWire
         // wire format ships only between local IPC peers (daemon ↔ SDK
-        // на the same host), where version skew is operator-controlled
-        // — they upgrade together as а package. So we require the
+        // on the same host), where version skew is operator-controlled
+        // — they upgrade together as a package. So we require the
         // cap_token_len u16 unconditionally; old senders won't be
-        // decoded by а new receiver и vice-versa, и that's fine for
-        // local IPC. (Compare с MailboxPutPayload's optional trailer
-        // approach where senders и relays can run mismatched versions
+        // decoded by a new receiver and vice-versa, and that's fine for
+        // local IPC. (Compare with MailboxPutPayload's optional trailer
+        // approach where senders and relays can run mismatched versions
         // across the network.)
         if buf.len() < env_end + 2 {
             return Err(ProtoError::BufferTooShort {
@@ -2534,10 +2534,10 @@ impl ReplicaWire {
         }
         let capability_token = buf[cap_start..cap_end].to_vec();
         // 3rd trailer (Epic 489.10 slice 2b): wake-HMAC envelope. Unlike the
-        // cap_token trailer above, this one is OPTIONAL on decode so а newer
-        // SDK keeps reading entries from а pre-slice-2b daemon that emits only
+        // cap_token trailer above, this one is OPTIONAL on decode so a newer
+        // SDK keeps reading entries from a pre-slice-2b daemon that emits only
         // the first two trailers. If no bytes remain after cap_token (older
-        // encoder), default `wake_hmac_envelope = vec![]` и report the
+        // encoder), default `wake_hmac_envelope = vec![]` and report the
         // consumed length as `cap_end` so the multi-replica container walks to
         // the next entry boundary correctly.
         if buf.len() < cap_end + 2 {
@@ -3020,7 +3020,7 @@ impl PeersListEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PeersListPayload {
     /// Active peer entries. Server side trims to `MAX_PEERS_LIST_ENTRIES`
-    /// before encoding so a daemon с тысячами sessions doesn't
+    /// before encoding so a daemon with thousands of sessions doesn't
     /// overflow the IPC frame body budget; clients should treat this
     /// as a snapshot (not exhaustive) on heavily-loaded relays.
     pub peers: Vec<PeersListEntry>,
@@ -3094,12 +3094,12 @@ impl PeersListPayload {
 /// app input.
 pub const MAX_JOIN_URI_LEN: usize = 8192;
 
-/// Hard cap on password byte length для encrypted-invite URIs.
+/// Hard cap on password byte length for encrypted-invite URIs.
 /// 1 KiB tolerates extremely long passphrases without giving an
 /// attacker an unbounded allocation oracle.
 pub const MAX_JOIN_PASSWORD_LEN: usize = 1024;
 
-/// Hard cap on expected-issuer-pubkey bytes для signed-invite URIs.
+/// Hard cap on expected-issuer-pubkey bytes for signed-invite URIs.
 /// 1 KiB matches Falcon-512 raw pubkey + base64 expansion overhead.
 pub const MAX_JOIN_ISSUER_PK_LEN: usize = 1024;
 
@@ -3108,7 +3108,7 @@ pub const MAX_JOIN_ISSUER_PK_LEN: usize = 1024;
 /// pathological error path can't pin a large allocation.
 pub const MAX_JOIN_DETAIL_LEN: usize = 1024;
 
-/// Result codes для [`JoinBootstrapResultPayload::status`].
+/// Result codes for [`JoinBootstrapResultPayload::status`].
 pub mod join_status {
     /// Peer was decoded, verified, and registered — outbound dial in flight.
     pub const OK: u8 = 0;
@@ -3147,13 +3147,13 @@ pub struct JoinBootstrapPayload {
     pub uri: String,
     /// Password for `veil:pair?…` envelopes; `None` for plain /
     /// signed URIs. Wire-mismatch (password sent when URI is plain)
-    /// is rejected by the daemon с status `INVALID_URI`.
+    /// is rejected by the daemon with status `INVALID_URI`.
     pub password: Option<String>,
-    /// Base64-encoded expected issuer pubkey для `veil:signed-invite?…`
+    /// Base64-encoded expected issuer pubkey for `veil:signed-invite?…`
     /// envelopes; `None` for plain / encrypted URIs. REQUIRED when
     /// URI is signed — daemon refuses to register without an external
     /// trust signal (anyone could sign an envelope claiming to be
-    /// anyone — the signature is only useful когда verified against
+    /// anyone — the signature is only useful when verified against
     /// an OOB-known pubkey).
     pub expected_issuer_pk: Option<String>,
 }
@@ -3292,7 +3292,7 @@ pub struct JoinBootstrapResultPayload {
     /// zero-filled otherwise. Caller should only consult this on
     /// `status == OK || status == ALREADY_REGISTERED`.
     pub peer_node_id: [u8; 32],
-    /// Optional human-readable detail (UTF-8). Bounded к
+    /// Optional human-readable detail (UTF-8). Bounded to
     /// [`MAX_JOIN_DETAIL_LEN`] by the daemon.
     pub detail: Vec<u8>,
 }
@@ -3361,15 +3361,15 @@ pub const MAX_CREATE_INVITE_PASSWORD_LEN: usize = MAX_JOIN_PASSWORD_LEN;
 /// Hard cap on detail bytes in [`CreateBootstrapInviteResultPayload`].
 pub const MAX_CREATE_INVITE_DETAIL_LEN: usize = MAX_JOIN_DETAIL_LEN;
 
-/// Result codes для [`CreateBootstrapInviteResultPayload::status`].
+/// Result codes for [`CreateBootstrapInviteResultPayload::status`].
 pub mod create_invite_status {
-    /// Invite was assembled и encoded successfully.  URI field is
+    /// Invite was assembled and encoded successfully.  URI field is
     /// populated, detail is empty.
     pub const OK: u8 = 0;
-    /// Daemon's config has no `[identity]` или no `[[listen]]` entry —
+    /// Daemon's config has no `[identity]` or no `[[listen]]` entry —
     /// invite has no peer to advertise.  Detail names which.
     pub const NOT_CONFIGURED: u8 = 1;
-    /// Caller-supplied password was rejected (empty after trim или
+    /// Caller-supplied password was rejected (empty after trim or
     /// exceeds [`MAX_CREATE_INVITE_PASSWORD_LEN`]).
     pub const BAD_PASSWORD: u8 = 2;
     /// Daemon-internal failure (encode error, runtime in shutdown,
@@ -3386,13 +3386,13 @@ pub mod create_invite_status {
 /// [2..2+pw_len] password UTF-8 bytes
 /// ```
 ///
-/// `password = None` emits а plain `veil:bootstrap?…` URI; `Some(...)`
+/// `password = None` emits a plain `veil:bootstrap?…` URI; `Some(...)`
 /// emits an `veil:pair?…` encrypted envelope (Argon2id-derived KEK +
-/// AEAD).  Signed variant (`veil:signed-invite?…`) is а future slice —
-/// requires plumbing the daemon's signing key через the IPC sink trait.
+/// AEAD).  Signed variant (`veil:signed-invite?…`) is a future slice —
+/// requires plumbing the daemon's signing key through the IPC sink trait.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreateBootstrapInvitePayload {
-    /// Encryption passphrase для the encrypted envelope variant.
+    /// Encryption passphrase for the encrypted envelope variant.
     /// `None` ⇒ plain `veil:bootstrap?…` URI (most common, fastest
     /// QR render).  `Some(pw)` ⇒ encrypted invite — receiver MUST
     /// supply the same passphrase on consume.
@@ -3455,7 +3455,7 @@ impl CreateBootstrapInvitePayload {
 /// Wire layout:
 /// ```text
 /// [0] status u8 (create_invite_status::*)
-/// [1..3] uri_len u16 BE (≤ MAX_CREATE_INVITE_URI_LEN; 0 на non-OK)
+/// [1..3] uri_len u16 BE (≤ MAX_CREATE_INVITE_URI_LEN; 0 on non-OK)
 /// [3..3+uri_len] uri UTF-8 bytes
 /// [3+uri_len..3+uri_len+2] detail_len u16 BE (≤ MAX_CREATE_INVITE_DETAIL_LEN)
 /// [3+uri_len+2..] detail UTF-8 bytes
@@ -3464,7 +3464,7 @@ impl CreateBootstrapInvitePayload {
 pub struct CreateBootstrapInviteResultPayload {
     /// Status code (see [`create_invite_status`]).
     pub status: u8,
-    /// Encoded invite URI на success; empty otherwise.
+    /// Encoded invite URI on success; empty otherwise.
     pub uri: String,
     /// Human-readable detail (UTF-8); typically empty on success.
     pub detail: Vec<u8>,
@@ -3544,11 +3544,11 @@ impl CreateBootstrapInviteResultPayload {
 
 // ── Multi-device pairing ceremony (Epic 489.8) ─────────────────
 
-/// Max single-message payload cap для any pairing ceremony frame
-/// (Hello / Cert / Confirm bytes flowing between Source и Target).
-/// 64 KiB easily fits the largest IdentityDocument в the Cert frame
+/// Max single-message payload cap for any pairing ceremony frame
+/// (Hello / Cert / Confirm bytes flowing between Source and Target).
+/// 64 KiB easily fits the largest IdentityDocument in the Cert frame
 /// (`MAX_IDENTITY_DOCUMENT_BYTES` is currently 16 KiB) plus all wire
-/// overhead.  Bounded so а sandboxed-but-IPC-capable adversary can't
+/// overhead.  Bounded so a sandboxed-but-IPC-capable adversary can't
 /// pin gigabytes of allocation through this surface.
 pub const MAX_PAIR_CEREMONY_BYTES: usize = 64 * 1024;
 
@@ -3559,27 +3559,27 @@ pub const MAX_PAIR_URI_LEN: usize = 1024;
 /// 6-digit OOB code length (always 6 ASCII digits).
 pub const PAIR_OOB_CODE_LEN: usize = 6;
 
-/// Detail bytes cap для error responses.
+/// Detail bytes cap for error responses.
 pub const MAX_PAIR_DETAIL_LEN: usize = 1024;
 
-/// Result codes для [`PairSourceCreateInviteResultPayload::status`].
+/// Result codes for [`PairSourceCreateInviteResultPayload::status`].
 pub mod pair_source_status {
     /// Invite assembled.  URI field populated.
     pub const OK: u8 = 0;
-    /// Daemon's config has no `[identity]` или no sovereign-identity
+    /// Daemon's config has no `[identity]` or no sovereign-identity
     /// master_sk on disk — ceremony cannot proceed.
     pub const NOT_CONFIGURED: u8 = 1;
-    /// Source-side ceremony already в progress (one-at-a-time policy).
-    /// Cancel the in-flight ceremony OR wait для its timeout.
+    /// Source-side ceremony already in progress (one-at-a-time policy).
+    /// Cancel the in-flight ceremony OR wait for its timeout.
     pub const ALREADY_IN_PROGRESS: u8 = 2;
     /// Daemon-internal failure (master_sk locked, encode error, …).
     pub const INTERNAL_ERROR: u8 = 3;
-    /// `handle_hello` / `handle_confirm`: ceremony state не matches
-    /// the expected step (no in-progress ceremony, или wrong-order op).
+    /// `handle_hello` / `handle_confirm`: ceremony state not matches
+    /// the expected step (no in-progress ceremony, or wrong-order op).
     pub const WRONG_STATE: u8 = 4;
     /// `handle_hello`: target's Hello payload failed MAC / pair_secret
-    /// correlation.  Most common cause: the user scanned а stale QR
-    /// from а previous (expired) ceremony.
+    /// correlation.  Most common cause: the user scanned a stale QR
+    /// from a previous (expired) ceremony.
     pub const BAD_HELLO: u8 = 5;
     /// `handle_confirm`: target reported user aborted (codes didn't
     /// match).  Caller MUST drop the in-progress IdentityKey.
@@ -3589,7 +3589,7 @@ pub mod pair_source_status {
     pub const BAD_CONFIRM: u8 = 7;
 }
 
-/// Result codes для `PairTarget*ResultPayload::status`.
+/// Result codes for `PairTarget*ResultPayload::status`.
 pub mod pair_target_status {
     /// Operation succeeded.
     pub const OK: u8 = 0;
@@ -3597,7 +3597,7 @@ pub mod pair_target_status {
     pub const BAD_URI: u8 = 1;
     /// `consume_uri`: scanned URI is past its `expires_at_unix`.
     pub const EXPIRED: u8 = 2;
-    /// Target-side ceremony already в progress.
+    /// Target-side ceremony already in progress.
     pub const ALREADY_IN_PROGRESS: u8 = 3;
     /// `handle_cert`: Cert bytes failed decode / sig verify / oob derive.
     pub const BAD_CERT: u8 = 4;
@@ -3616,8 +3616,8 @@ pub mod pair_target_status {
 /// ```
 /// The password is needed when the sovereign identity's master_sk is
 /// encrypted at rest (Argon2id master.enc); on success the daemon
-/// derives master_sk, holds it for the ceremony, и drops at finalize
-/// или timeout.  Empty password = "master_sk is unencrypted on disk".
+/// derives master_sk, holds it for the ceremony, and drops at finalize
+/// or timeout.  Empty password = "master_sk is unencrypted on disk".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PairSourceCreateInvitePayload {
     pub master_password: Option<String>,
@@ -3672,7 +3672,7 @@ impl PairSourceCreateInvitePayload {
 /// Wire layout:
 /// ```text
 /// [0] status u8 (pair_source_status::*)
-/// [1..3] uri_len u16 BE (0 на non-OK)
+/// [1..3] uri_len u16 BE (0 on non-OK)
 /// [3..3+uri_len] uri UTF-8 bytes
 /// [..] detail_len u16 BE
 /// [..] detail UTF-8 bytes
@@ -3746,7 +3746,7 @@ impl PairSourceCreateInviteResultPayload {
 
 /// Generic length-prefixed-bytes payload for opaque pairing-frame
 /// transport across IPC.  Used by 4 messages (Hello / Cert / Confirm
-/// requests from one side к the other).  Single struct so encode/decode
+/// requests from one side to the other).  Single struct so encode/decode
 /// stays one place.
 ///
 /// Wire: `[0..4] bytes_len u32 BE`, `[4..] bytes`.
@@ -3790,14 +3790,14 @@ impl PairCeremonyFramePayload {
 }
 
 /// Payload [`crate::family::LocalAppMsg::PairSourceHandleHelloResult`]
-/// и [`crate::family::LocalAppMsg::PairTargetHandleCertResult`].  Both
-/// reply с (status, cert-or-empty bytes, 6-digit OOB code или empty,
+/// and [`crate::family::LocalAppMsg::PairTargetHandleCertResult`].  Both
+/// reply with (status, cert-or-empty bytes, 6-digit OOB code or empty,
 /// detail).  Sharing one type keeps wire surface area small.
 ///
 /// Wire layout:
 /// ```text
 /// [0] status u8
-/// [1..7] oob_code 6 ASCII digits (zero-filled на non-OK)
+/// [1..7] oob_code 6 ASCII digits (zero-filled on non-OK)
 /// [7..11] response_bytes_len u32 BE
 /// [11..11+resp_len] response_bytes
 /// [..] detail_len u16 BE
@@ -3806,9 +3806,9 @@ impl PairCeremonyFramePayload {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PairCeremonyOobResultPayload {
     pub status: u8,
-    /// 6-digit OOB code as ASCII bytes (e.g. b"012345"); all-zero на non-OK.
+    /// 6-digit OOB code as ASCII bytes (e.g. b"012345"); all-zero on non-OK.
     pub oob_code: [u8; PAIR_OOB_CODE_LEN],
-    /// On Source.handle_hello: Cert bytes for transport к Target.
+    /// On Source.handle_hello: Cert bytes for transport to Target.
     /// On Target.handle_cert: empty (Target keeps state internally).
     pub response_bytes: Vec<u8>,
     pub detail: Vec<u8>,
@@ -3883,7 +3883,7 @@ impl PairCeremonyOobResultPayload {
 
 /// Simple status-only reply payload for ops that just acknowledge.
 /// Used by `PairSourceHandleConfirmResult`, `PairTargetBuildConfirmResult`,
-/// `PairTargetConsumeUriResult` (latter also carries Hello bytes — но
+/// `PairTargetConsumeUriResult` (latter also carries Hello bytes — but
 /// uses [`PairCeremonyFrameResultPayload`] instead).
 ///
 /// Wire: `[0] status u8`, `[1..3] detail_len u16 BE`, `[3..] detail`.
@@ -3931,7 +3931,7 @@ impl PairStatusResultPayload {
 }
 
 /// Reply payload carrying status + opaque bytes + detail.  Used by
-/// `PairTargetConsumeUriResult` (carries Hello bytes к transport к Source).
+/// `PairTargetConsumeUriResult` (carries Hello bytes to transport to Source).
 ///
 /// Wire: `[0] status u8`, `[1..5] bytes_len u32 BE`, `[5..] bytes`,
 ///       `[..] detail_len u16 BE`, `[..] detail`.
@@ -4116,14 +4116,14 @@ impl PairTargetBuildConfirmPayload {
 pub const MOBILE_LOW_BATTERY_THRESHOLD_DISABLED: u8 = 255;
 
 /// Sentinel for `battery_level_pct` when running on AC / unknown
-/// hardware / non-Linux platform — never throttled on this signal по
+/// hardware / non-Linux platform — never throttled on this signal by
 /// design. Apps display this as "AC / unknown" rather than "100%".
 pub const MOBILE_BATTERY_AC_OR_UNKNOWN: u8 = 100;
 
 /// Payload [`crate::family::LocalAppMsg::MobileStatus`].
 ///
 /// Mirrors `veilcore::node::admin::AdminMobileStatus` field-for-field
-/// so the IPC handler can build the wire payload directly от the
+/// so the IPC handler can build the wire payload directly from the
 /// existing runtime helper. All fields stay typed wire bytes (no
 /// JSON), keeping the payload compact (≤ 16 bytes typical) and the
 /// decoder allocation-free.
@@ -4223,10 +4223,10 @@ pub mod event_kind {
     /// recovery from compromise). Payload: `[u8; 32] new_node_id`.
     pub const IDENTITY_ROTATED: u8 = 2;
     /// Mailbox drain (fetch) completed. Published after every authorised
-    /// fetch returns, including the empty-result path. Allows а consumer
+    /// fetch returns, including the empty-result path. Allows a consumer
     /// background-handler (iOS BGProcessingTask, Android JobScheduler)
     /// to `setTaskCompleted` precisely when the daemon has finished
-    /// draining pending wake-triggered work — rather than padding to а
+    /// draining pending wake-triggered work — rather than padding to a
     /// hardcoded ceiling.  Payload: `[u32 BE drained_count]` (4 bytes;
     /// number of blobs returned in this fetch).
     pub const MAILBOX_DRAINED: u8 = 3;
@@ -4315,15 +4315,15 @@ impl EventPayload {
 
 // ── PnetStatusQuery / PnetStatusResult ─────────────────────────────────────
 
-/// Reply к [`crate::family::LocalAppMsg::PnetStatusQuery`].  The daemon
+/// Reply to [`crate::family::LocalAppMsg::PnetStatusQuery`].  The daemon
 /// looks up its `NetworkAccessGate` cache for the queried peer and
-/// reports whether the OVL1 session was admitted under а valid
+/// reports whether the OVL1 session was admitted under a valid
 /// `MembershipCert`.
 ///
 /// Wire layout (fixed 74 bytes):
 /// ```text
 /// [0]        admitted        u8 (0 = no, 1 = yes)
-/// [1]        has_cert        u8 (0 = no, 1 = yes — daemon cached а cert)
+/// [1]        has_cert        u8 (0 = no, 1 = yes — daemon cached a cert)
 /// [2]        admin           u8 (0/1; meaningful only when has_cert=1)
 /// [3..11]    valid_until_unix u64 BE (0 = never expires; meaningful only when has_cert=1)
 /// [11..43]   network_id      [u8; 32] (zeros when has_cert=0)
@@ -4331,20 +4331,20 @@ impl EventPayload {
 /// ```
 ///
 /// Semantics:
-/// * `admitted=1` AND `has_cert=1` ⇒ peer presented а valid cert; the
-///   `network_id` / `admin` / `valid_until_unix` fields ара from that
-///   cert. Use case: ogate/oproxy admission в "p_net" mode.
+/// * `admitted=1` AND `has_cert=1` ⇒ peer presented a valid cert; the
+///   `network_id` / `admin` / `valid_until_unix` fields are from that
+///   cert. Use case: ogate/oproxy admission in "p_net" mode.
 /// * `admitted=1` AND `has_cert=0` ⇒ daemon admits because P-Net is not
-///   enabled OR the session predates cert verification. Apps в strict
+///   enabled OR the session predates cert verification. Apps in strict
 ///   p_net mode SHOULD reject this case (treat as "no cert presented").
-/// * `admitted=0` ⇒ no active session к the queried peer, or the session
+/// * `admitted=0` ⇒ no active session to the queried peer, or the session
 ///   was rejected during handshake. Apps reject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PnetStatusResultPayload {
-    /// Whether there's an active veil session к `peer_node_id`.
+    /// Whether there's an active veil session to `peer_node_id`.
     pub admitted: bool,
-    /// Whether the daemon has а verified `MembershipCert` for this peer
-    /// (always false unless P-Net is configured в the daemon).
+    /// Whether the daemon has a verified `MembershipCert` for this peer
+    /// (always false unless P-Net is configured in the daemon).
     pub has_cert: bool,
     /// Cert admin flag (only meaningful when `has_cert == true`).
     pub admin: bool,
@@ -4475,7 +4475,7 @@ mod tests {
     #[test]
     fn pnet_status_result_unlimited_cert() {
         // valid_until_unix=0 sentinel meaning "no expiry" — wire round-trips
-        // the sentinel verbatim. Apps render это as NEVER.
+        // the sentinel verbatim. Apps render this as NEVER.
         let payload = PnetStatusResultPayload {
             admitted: true,
             has_cert: true,
@@ -4954,7 +4954,7 @@ mod tests {
         // encoder emits three trailer
         // length-prefix u16s (env_len + cap_token_len + wake_hmac_env_len,
         // all zero here) — total = HEADER_SIZE + blob + 2 + 2 + 2.
-        // (Trailer 3 = wake_hmac_envelope added в slice 4.3.4 follow-up.)
+        // (Trailer 3 = wake_hmac_envelope added in slice 4.3.4 follow-up.)
         assert_eq!(buf.len(), MailboxPutPayload::HEADER_SIZE + 1024 + 2 + 2 + 2);
         let d = MailboxPutPayload::decode(&buf).unwrap();
         assert_eq!(d, p);
@@ -5014,7 +5014,7 @@ mod tests {
 
     #[test]
     fn epic489_10_mailbox_put_legacy_2_trailer_decodes_under_new_decoder() {
-        // Construct а wire blob manually using ONLY the v2 two-trailer
+        // Construct a wire blob manually using ONLY the v2 two-trailer
         // layout (no Trailer 3 bytes) — confirms backward-compat decode
         // yields wake_hmac_envelope = None.
         let mut buf = Vec::new();
@@ -5065,7 +5065,7 @@ mod tests {
     #[test]
     fn phase650b_316_mailbox_put_with_token_no_envelope() {
         // Token attached but no push envelope — still must round-trip
-        // confirms the cap_token trailer doesn't depend на envelope being
+        // confirms the cap_token trailer doesn't depend on envelope being
         // present.
         let p = MailboxPutPayload {
             receiver_id: [1u8; 32],
@@ -5083,7 +5083,7 @@ mod tests {
 
     #[test]
     fn phase650b_316_mailbox_put_legacy_buffer_decodes_with_no_token() {
-        // Pre-slice-1 sender emits header+blob+env_trailer но no
+        // Pre-slice-1 sender emits header+blob+env_trailer but no
         // cap_token trailer. New decoder must produce capability_token=None.
         let mut buf = Vec::new();
         buf.extend_from_slice(&[1u8; 32]);
@@ -5485,7 +5485,7 @@ mod tests {
     #[test]
     fn t489_10_2b_replica_wire_round_trip_with_wake_hmac() {
         // Round-trip an entry carrying ALL THREE non-empty trailers:
-        // push_envelope, capability_token и the new wake_hmac_envelope.
+        // push_envelope, capability_token and the new wake_hmac_envelope.
         let r = ReplicaWire {
             relay_node_id: [11u8; 32],
             valid_until_unix: 1_700_000_000,
@@ -5507,10 +5507,10 @@ mod tests {
 
     #[test]
     fn t489_10_2b_replica_wire_decode_backward_compat_no_wake_trailer() {
-        // Hand-craft а 2-trailer buffer exactly as а pre-slice-2b encoder
+        // Hand-craft a 2-trailer buffer exactly as a pre-slice-2b encoder
         // would: relay_node_id | valid_until | env_len+env | cap_len+cap,
-        // и NOTHING after the cap_token trailer. A new decoder must default
-        // `wake_hmac_envelope == []` и report consumed length == buf.len()
+        // and NOTHING after the cap_token trailer. A new decoder must default
+        // `wake_hmac_envelope == []` and report consumed length == buf.len()
         // (the entry boundary, so the multi-replica walker advances right).
         let mut buf = Vec::new();
         buf.extend_from_slice(&[7u8; 32]); // relay_node_id
@@ -5531,7 +5531,7 @@ mod tests {
 
     #[test]
     fn t489_10_2b_replica_wire_oversized_wake_hmac_rejected() {
-        // Full valid prefix (relay|valid|env|cap) then а wake_len that
+        // Full valid prefix (relay|valid|env|cap) then a wake_len that
         // exceeds MAX_WAKE_HMAC_ENVELOPE_BYTES — must be rejected at decode.
         let mut buf = Vec::new();
         buf.extend_from_slice(&[0u8; 32]); // relay_node_id
@@ -5552,7 +5552,7 @@ mod tests {
 
     #[test]
     fn t489_10_2b_replicas_resp_multi_round_trip_distinct_wake_hmac() {
-        // Two entries each carrying а DIFFERENT wake_hmac_envelope (one short,
+        // Two entries each carrying a DIFFERENT wake_hmac_envelope (one short,
         // one max-length, one empty) prove the container's offset-walking
         // accounts for the variable-length 3rd trailer per entry.
         let p = LookupRendezvousReplicasRespPayload {
@@ -5754,7 +5754,7 @@ mod tests {
 
     #[test]
     fn peers_list_oversized_transport_rejected() {
-        // Single entry с claimed transport_len > MAX_PEER_TRANSPORT_LEN.
+        // Single entry with claimed transport_len > MAX_PEER_TRANSPORT_LEN.
         let mut buf = Vec::new();
         buf.extend_from_slice(&1u16.to_be_bytes()); // count
         buf.extend_from_slice(&[0u8; 32]); // node_id
@@ -6005,9 +6005,9 @@ mod tests {
 
     #[test]
     fn event_payload_mailbox_drained_roundtrip() {
-        // MAILBOX_DRAINED carries а 4-byte BE drained-count payload —
+        // MAILBOX_DRAINED carries a 4-byte BE drained-count payload —
         // pin both the kind constant and the wire layout so iOS / Android
-        // BGProcessingTask handlers stay in sync с the Rust publisher.
+        // BGProcessingTask handlers stay in sync with the Rust publisher.
         let p = EventPayload {
             kind: event_kind::MAILBOX_DRAINED,
             payload: 42u32.to_be_bytes().to_vec(),
@@ -6178,9 +6178,9 @@ mod tests {
 
     #[test]
     fn set_wake_hmac_envelope_payload_rejects_oversized_envelope_at_decode() {
-        // Encode а blob с envelope_len > MAX_WAKE_HMAC_ENVELOPE_BYTES,
+        // Encode a blob with envelope_len > MAX_WAKE_HMAC_ENVELOPE_BYTES,
         // confirm decoder rejects.  Catches malicious / corrupted wire
-        // bytes на the daemon side.
+        // bytes on the daemon side.
         let mut buf = vec![0u8; 32 + 16];
         let bad_len = (MAX_WAKE_HMAC_ENVELOPE_BYTES + 1) as u16;
         buf.extend_from_slice(&bad_len.to_be_bytes());

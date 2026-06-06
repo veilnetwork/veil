@@ -1,12 +1,12 @@
-//! Logger initialisation для the `oproxy-client` и `oproxy-server`
-//! binaries.  Reads the `[logging]` config section и wires
+//! Logger initialisation for the `oproxy-client` and `oproxy-server`
+//! binaries.  Reads the `[logging]` config section and wires
 //! `env_logger` so:
 //!
-//! * `level = "off"` (и no `RUST_LOG` override) ⇒ logger silently
+//! * `level = "off"` (and no `RUST_LOG` override) ⇒ logger silently
 //!   not initialised — zero log output.
-//! * `file = "/path"` ⇒ log lines appended к the file (created if
+//! * `file = "/path"` ⇒ log lines appended to the file (created if
 //!   absent); stderr stays clean.
-//! * `level = "..."` без file ⇒ default env_logger init к stderr.
+//! * `level = "..."` without file ⇒ default env_logger init to stderr.
 //!
 //! `RUST_LOG` env var always wins over config (`env_logger::from_env`
 //! semantics).  This preserves the operator escape hatch:
@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use crate::config::{LogLevel, LoggingConfig};
 
 /// Reject log file paths containing `..` components.  Audit batch
-/// 2026-05-24 (M5): а local user с write-access к the config.toml could
+/// 2026-05-24 (M5): a local user with write-access to the config.toml could
 /// otherwise point the daemon's log writer at `/etc/cron.d/...` and
 /// clobber privileged files via path traversal.
 fn validate_log_path(path: &Path) -> std::io::Result<()> {
@@ -33,7 +33,7 @@ fn validate_log_path(path: &Path) -> std::io::Result<()> {
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "log file path {} contains `..` — \
-                     refusing к open (path-traversal guard)",
+                     refusing to open (path-traversal guard)",
                     path.display()
                 ),
             ));
@@ -44,12 +44,12 @@ fn validate_log_path(path: &Path) -> std::io::Result<()> {
 
 /// Initialise the global logger for one of the oproxy binaries.
 ///
-/// `binary_name` is included в the error message если file open fails.
+/// `binary_name` is included in the error message if file open fails.
 pub fn init_oproxy_logger(binary_name: &str, log: &LoggingConfig) -> std::io::Result<()> {
-    // Disable entirely если level=off и no RUST_LOG override.
+    // Disable entirely if level=off and no RUST_LOG override.
     if log.level == LogLevel::Off && std::env::var("RUST_LOG").is_err() {
-        // env_logger::Builder::init() can be called только once globally;
-        // не вызывать вообще — `log` facade silently drops all calls.
+        // env_logger::Builder::init() can be called only once globally;
+        // not called at all — `log` facade silently drops all calls.
         return Ok(());
     }
 
@@ -60,8 +60,8 @@ pub fn init_oproxy_logger(binary_name: &str, log: &LoggingConfig) -> std::io::Re
     if let Some(path) = &log.file {
         validate_log_path(path)
             .map_err(|e| std::io::Error::new(e.kind(), format!("{binary_name}: {e}")))?;
-        // Open в append mode.  Wrap в `Mutex<File>` because env_logger's
-        // `Target::Pipe` takes а `Write + Send` and our writer needs
+        // Open in append mode.  Wrap in `Mutex<File>` because env_logger's
+        // `Target::Pipe` takes a `Write + Send` and our writer needs
         // serialised access (concurrent log calls).  `FileWriter` adapter
         // does the locking.
         let file = OpenOptions::new()
@@ -79,17 +79,17 @@ pub fn init_oproxy_logger(binary_name: &str, log: &LoggingConfig) -> std::io::Re
         })));
     }
 
-    // env_logger panics если called twice.  `try_init` instead of
+    // env_logger panics if called twice.  `try_init` instead of
     // `init` returns Err on double-init, which we swallow (tests
     // sometimes init twice).
     let _ = builder.try_init();
     Ok(())
 }
 
-/// `Write`-impl wrapper that serialises concurrent writes through а
-/// `Mutex`.  env_logger's `Target::Pipe` requires `Send` но не
-/// `Sync`, и file handles aren't atomically writeable от multiple
-/// threads без locking.
+/// `Write`-impl wrapper that serialises concurrent writes through a
+/// `Mutex`.  env_logger's `Target::Pipe` requires `Send` but not
+/// `Sync`, and file handles aren't atomically writeable from multiple
+/// threads without locking.
 struct FileWriter {
     inner: Mutex<std::fs::File>,
 }
@@ -116,14 +116,14 @@ mod tests {
     #[test]
     fn off_level_no_rust_log_skips_init() {
         // We can't easily check whether env_logger was initialised
-        // (it's а global), but we can confirm `init_oproxy_logger`
-        // returns Ok без а file path и с level=off, и does not
+        // (it's a global), but we can confirm `init_oproxy_logger`
+        // returns Ok without a file path and with level=off, and does not
         // touch the filesystem.
         let cfg = LoggingConfig {
             level: LogLevel::Off,
             file: None,
         };
-        // Saved env state — restore после.
+        // Saved env state — restore after.
         let prev = std::env::var("RUST_LOG").ok();
         unsafe {
             std::env::remove_var("RUST_LOG");
@@ -142,7 +142,7 @@ mod tests {
         use std::io::Read;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
-        drop(tmp); // Want the path не the file (file gets opened append).
+        drop(tmp); // Want the path not the file (file gets opened append).
 
         let cfg = LoggingConfig {
             level: LogLevel::Info,
@@ -156,8 +156,8 @@ mod tests {
         if let Ok(mut f) = std::fs::File::open(&path) {
             let mut buf = String::new();
             f.read_to_string(&mut buf).unwrap_or(0);
-            // We can only assert if THIS test was the first к init the
-            // global logger.  В rustlong-running test process other tests
+            // We can only assert if THIS test was the first to init the
+            // global logger.  In rustlong-running test process other tests
             // may have init'd already, so we tolerate empty buffer.
             if !buf.is_empty() {
                 assert!(buf.contains("oproxy logging file smoke test marker"));

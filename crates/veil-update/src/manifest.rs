@@ -59,7 +59,7 @@
 //! Verifier rejects manifest with `release_unix < installed_release_unix`.
 //! Stops a censor that captures an OLD signed manifest from convincing
 //! clients to roll back to a known-vulnerable version (which the
-//! censor может then exploit). Each install records its source
+//! censor can then exploit). Each install records its source
 //! manifest's `release_unix`; subsequent updates must monotonically
 //! advance.
 //!
@@ -81,7 +81,7 @@
 //! # What this module does NOT do (deferred to follow-up slices)
 //!
 //! * **No HTTPS fetch.** Caller resolves URLs and downloads bytes;
-//!   this primitive только validates the manifest envelope + provides
+//!   this primitive only validates the manifest envelope + provides
 //!   `binary_sha256` for caller to check downloaded bytes against.
 //! * **No in-place restart.** Apply mechanism is separate.
 //! * **No partial / delta updates.** Each manifest names a complete
@@ -107,21 +107,21 @@ pub const MAX_MANIFEST_BYTES: usize = 8 * 1024;
 ///
 /// **Staged tier** (86 400 s = 24 h) — central policy in
 /// `veil-proto::time_validity::STAGED_SKEW_SECS`.  Cannot import
-/// directly (veil-update doesn't depend на veil-proto) so the
+/// directly (veil-update doesn't depend on veil-proto) so the
 /// constant is duplicated.  **Pinned by the `staged_tier_is_24_hours`
-/// test в `veil-proto::time_validity`** — that test fails если а
+/// test in `veil-proto::time_validity`** — that test fails if a
 /// future refactor flips the central tier without updating this site.
 ///
 /// Why this tier:
-/// * 1 day covers normal client clock drift на budget-Android devices
+/// * 1 day covers normal client clock drift on budget-Android devices
 ///   (where NTP may not run while the device is offline / in airplane
 ///   mode for several days) without admitting indefinitely-future-dated
 ///   manifests.
 /// * Admits pre-staged rollouts: issuer signs at T1, schedules
-///   activation at T2, clients pulling в the T1-T2 window must
+///   activation at T2, clients pulling in the T1-T2 window must
 ///   accept.
 /// * An attacker who compromises the issuer key can still sign now+1d,
-///   но cannot stage a 10-year-future manifest that freezes upgrades
+///   but cannot stage a 10-year-future manifest that freezes upgrades
 ///   after rotation.
 pub const MAX_MANIFEST_FUTURE_SKEW_SECS: u64 = 86_400;
 
@@ -152,7 +152,7 @@ fn max_issuer_pk_len(algo: SignatureAlgorithm) -> usize {
         SignatureAlgorithm::Falcon512 => 1280,
         SignatureAlgorithm::Ed25519Falcon512Hybrid => 1408,
         // Hybrid-1024: 32 (ed25519) + 1793 (falcon-1024) = 1825 raw bytes.
-        // Base64 ≈ 1825 × 4/3 ≈ 2434 chars; round up к 2560 для padding +
+        // Base64 ≈ 1825 × 4/3 ≈ 2434 chars; round up to 2560 for padding +
         // operator slack while keeping the cap tight enough that
         // malformed manifests can't inflate the issuer_pk field.
         SignatureAlgorithm::Ed25519Falcon1024Hybrid => 2560,
@@ -701,7 +701,7 @@ mod tests {
     #[test]
     fn epic484_3_tampered_binary_sha256_fails_verify() {
         // The most security-critical tamper: attacker swaps the hash
-        // → could redirect to malicious binary при ostalisya legitimate
+        // → could redirect to malicious binary while keeping the legitimate
         // signature. Must fail.
         let (bytes, issuer_pk) = build_fixture(1_700_000_000, "1.2.3");
         let mut m = decode_manifest(&bytes).unwrap();

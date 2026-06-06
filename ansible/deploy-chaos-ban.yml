@@ -1,12 +1,12 @@
 ---
 # Phase 6.50.b chaos-ban deployment — installs the per-host script that
-# bans а random active session for 600 s every 600 s, exercising the
+# bans a random active session for 600 s every 600 s, exercising the
 # iterative-DHT fallback path (Slice 5) under realistic load.
 #
-# Run с:
+# Run with:
 #   ansible-playbook -i inventory.yml deploy-chaos-ban.yml
 #
-# Stop с:
+# Stop with:
 #   ansible all -i inventory.yml -m systemd -a "name=chaos-ban.service state=stopped enabled=no" --become
 
 - name: Deploy chaos-ban cycler

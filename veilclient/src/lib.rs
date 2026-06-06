@@ -121,11 +121,11 @@ pub use veilcore::proto::MobileBackgroundMode;
 /// [`VeilClient::notify_network_changed`].
 pub use veilcore::proto::NetworkKind;
 
-/// Push-envelope status reply из [`VeilClient::set_push_envelope`]
+/// Push-envelope status reply from [`VeilClient::set_push_envelope`]
 ///
 pub use veilcore::proto::SetPushEnvelopeStatus;
 
-/// Wake-HMAC envelope status reply из
+/// Wake-HMAC envelope status reply from
 /// [`VeilClient::set_wake_hmac_envelope`] (Epic 489.10 slice 4.3.4).
 pub use veilcore::proto::SetWakeHmacEnvelopeStatus;
 

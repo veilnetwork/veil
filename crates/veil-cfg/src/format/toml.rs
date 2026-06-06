@@ -208,10 +208,10 @@ fn set_integer(table: &mut Table, key: &str, new_value: Option<i64>) {
 }
 
 fn set_transport(document: &mut DocumentMut, transport: &crate::TransportConfig) -> Result<()> {
-    // Rotation is **always** emitted (см. `TransportConfig::rotation`
+    // Rotation is **always** emitted (see `TransportConfig::rotation`
     // doc) — its anti-DPI semantics matter enough that operators should
-    // discover it by reading their config file даже когда it's at default.
-    // So we don't take the "skip the whole section если default" shortcut
+    // discover it by reading their config file even when it's at default.
+    // So we don't take the "skip the whole section if default" shortcut
     // anymore — only skip the optional sub-tables (`tls_client`).
     if !document.get("transport").is_some_and(Item::is_table) {
         document["transport"] = Item::Table(Table::new());
@@ -226,11 +226,11 @@ fn set_transport(document: &mut DocumentMut, transport: &crate::TransportConfig)
     set_tls_client_table(transport_table, &transport.tls_client)?;
     set_rotation_table(transport_table, &transport.rotation)?;
     // Prune sub-tables that are not part of the current schema (e.g.
-    // legacy `quic_client` / `websocket` left over от older configs
-    // someone copied и updated incrementally).  Pre-Q.7 the entire
-    // `[transport]` section was removed-and-rebuilt в the default
+    // legacy `quic_client` / `websocket` left over from older configs
+    // someone copied and updated incrementally).  Pre-Q.7 the entire
+    // `[transport]` section was removed-and-rebuilt in the default
     // case, which incidentally cleaned these up; now that we always
-    // emit `[transport.rotation]`, we have к do the pruning explicitly.
+    // emit `[transport.rotation]`, we have to do the pruning explicitly.
     const KNOWN_SUB_TABLES: &[&str] = &["rotation", "tls_client"];
     let stale: Vec<String> = transport_table
         .iter()
@@ -248,7 +248,7 @@ fn set_transport(document: &mut DocumentMut, transport: &crate::TransportConfig)
     Ok(())
 }
 
-/// Always emit `[transport.rotation]` с the current `min`/`max`
+/// Always emit `[transport.rotation]` with the current `min`/`max`
 /// pair, EVEN when it matches the baked-in default.  Rationale: see
 /// `set_transport` — discoverability of the anti-DPI knob beats keeping
 /// the file minimal.
@@ -696,8 +696,8 @@ mod tests {
         update_document(&mut document, &Config::default()).unwrap();
 
         let rendered = document.to_string();
-        // [transport] и [transport.rotation] are now ALWAYS emitted
-        // (rotation is а discoverable anti-DPI knob — см. set_transport).
+        // [transport] and [transport.rotation] are now ALWAYS emitted
+        // (rotation is a discoverable anti-DPI knob — see set_transport).
         // Other default sub-tables still get removed.
         assert!(rendered.contains("[transport.rotation]"));
         assert!(!rendered.contains("[transport.tls_client]"));
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn rotation_section_always_emitted_with_defaults() {
         // Fresh config (no existing [transport] in document) must
-        // still get а [transport.rotation] section with default values.
+        // still get a [transport.rotation] section with default values.
         let mut document = DocumentMut::new();
         update_document(&mut document, &Config::default()).unwrap();
         let rendered = document.to_string();

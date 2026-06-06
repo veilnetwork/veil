@@ -220,7 +220,7 @@ pub fn decode_entry(blob: &[u8]) -> Result<RelayDirectoryEntry, DirectoryError> 
     x25519_pk.copy_from_slice(read(blob, &mut p, X25519_PK_LEN)?);
     // SAFETY — `read` returns slice of exactly N bytes
     // when Ok, so `try_into::<[u8; N]>` is provably-infallible. The
-    // prior absence of а SAFETY comment was the lone audit complaint;
+    // prior absence of a SAFETY comment was the lone audit complaint;
     // semantics were already correct.
     let advertised_bps =
         u32::from_be_bytes(read(blob, &mut p, 4)?.try_into().expect("4-byte slice"));

@@ -6,25 +6,25 @@
 //! (typically local Tor on `socks5://127.0.0.1:9050`).
 //!
 //! This module ships the **pure URI-composition layer** so the runtime's
-//! `socks_fallback_dial` async method stays thin и the parsing logic is
-//! unit-testable без а mock SOCKS server.
+//! `socks_fallback_dial` async method stays thin and the parsing logic is
+//! unit-testable without a mock SOCKS server.
 
 use veil_transport::TransportUri;
 
-/// Compose the SOCKS-fallback dial parameters от an operator-supplied
-/// proxy string и the primary target URI.
+/// Compose the SOCKS-fallback dial parameters from an operator-supplied
+/// proxy string and the primary target URI.
 ///
 /// Returns `Some((proxy_host, proxy_port, target_host, target_port))`
 /// when the wrapper can be built, or `None` if:
 ///
-/// * `proxy_str` is unparseable (missing `:port` или malformed)
-/// * `primary_uri`'s scheme can't be tunneled через SOCKS5 (QUIC, Unix,
-///   webtunnel-wss, etc. — SOCKS5 is а TCP-only transport)
+/// * `proxy_str` is unparseable (missing `:port` or malformed)
+/// * `primary_uri`'s scheme can't be tunneled through SOCKS5 (QUIC, Unix,
+///   webtunnel-wss, etc. — SOCKS5 is a TCP-only transport)
 ///
 /// Accepted proxy formats:
 /// * `socks5://host:port`
 /// * `socks://host:port`
-/// * Bare `host:port` (defaults к SOCKS5)
+/// * Bare `host:port` (defaults to SOCKS5)
 pub fn compose_socks_fallback(
     proxy_str: &str,
     primary_uri: &TransportUri,
@@ -34,7 +34,7 @@ pub fn compose_socks_fallback(
     Some((proxy_host, proxy_port, target_host, target_port))
 }
 
-/// Parse а proxy endpoint string into (host, port).  Delegates to the canonical
+/// Parse a proxy endpoint string into (host, port).  Delegates to the canonical
 /// parser in `veil-transport` (audit U13) so the peer-dial SOCKS fallback
 /// accepts exactly the same forms as the bootstrap / `.onion` dial path —
 /// `socks5h://` / `socks5://` / `socks://` / bare `host:port`, a tolerated
@@ -45,8 +45,8 @@ fn parse_proxy_endpoint(proxy_str: &str) -> Option<(String, u16)> {
     veil_transport::socks::parse_socks_proxy_url(proxy_str).ok()
 }
 
-/// Extract а TCP-shaped target от а primary URI.  Returns None для
-/// schemes що SOCKS5 cannot tunnel.
+/// Extract a TCP-shaped target from a primary URI.  Returns None for
+/// schemes that SOCKS5 cannot tunnel.
 fn extract_tcp_target(uri: &TransportUri) -> Option<(String, u16)> {
     match uri {
         TransportUri::Tcp { host, port }
@@ -54,8 +54,8 @@ fn extract_tcp_target(uri: &TransportUri) -> Option<(String, u16)> {
         | TransportUri::Obfs4Tcp { host, port } => Some((host.clone(), *port)),
         // QUIC is UDP — can't tunnel via SOCKS5.
         // Unix sockets are local-only.
-        // SOCKS / SocksTls / Ws / Wss / WebtunnelWss already имеют their
-        // own proxy paths or aren't routable через а SOCKS hop.
+        // SOCKS / SocksTls / Ws / Wss / WebtunnelWss already have their
+        // own proxy paths or aren't routable through a SOCKS hop.
         _ => None,
     }
 }
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn parse_strips_trailing_target() {
-        // Operator pasted а full SOCKS URI by accident — handle gracefully.
+        // Operator pasted a full SOCKS URI by accident — handle gracefully.
         let parsed = parse_proxy_endpoint("socks://127.0.0.1:9050/target:5556");
         assert_eq!(parsed, Some(("127.0.0.1".to_owned(), 9050)));
     }
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_zero_port() {
-        // Port 0 is "kernel-assigned" — meaningless для а proxy.
+        // Port 0 is "kernel-assigned" — meaningless for a proxy.
         assert_eq!(parse_proxy_endpoint("127.0.0.1:0"), None);
     }
 
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn compose_obfs4_tcp_target() {
-        // obfs4-tcp is а TCP-shaped transport — SOCKS5 should tunnel
+        // obfs4-tcp is a TCP-shaped transport — SOCKS5 should tunnel
         // it transparently (SOCKS layer doesn't touch payload).
         let proxy = "socks5://127.0.0.1:9050";
         let primary = obfs4("peer.example", 5556);
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn compose_rejects_bad_proxy() {
-        let proxy = "not-а-proxy";
+        let proxy = "not-a-proxy";
         let primary = tcp("peer.example", 5556);
         assert_eq!(compose_socks_fallback(proxy, &primary), None);
     }

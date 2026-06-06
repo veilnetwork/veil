@@ -1,15 +1,15 @@
 ---
-# Deploy obfs4 transport support к veil nodes.
+# Deploy obfs4 transport support to veil nodes.
 #
 # Phases:
-# 1. Push fresh veil-cli binary (с obfs4-tcp Transport registered).
+# 1. Push fresh veil-cli binary (with obfs4-tcp Transport registered).
 # 2. Push the deployment-wide obfs4 PSK file.
 # 3. Patch node.toml [transport] obfs4_psk_file (idempotent).
 # 4. Restart veil service.
-# 5. Verify daemon came up + check obfs4 wiring via а local connect probe.
+# 5. Verify daemon came up + check obfs4 wiring via a local connect probe.
 #
 # Run options:
-#   # Generate а fresh PSK only:
+#   # Generate a fresh PSK only:
 #   openssl rand 32 | base64 > /tmp/obfs4_psk.b64
 #
 #   # Canary single host:
@@ -22,14 +22,14 @@
 #     --extra-vars 'obfs4_psk_path=/tmp/obfs4_psk.b64' \
 #     --limit nodes
 #
-# IMPORTANT: same PSK file must reach every host що should accept obfs4
-# connections от each other.  Per-peer PSK lookup is planned як а
-# follow-up; для now а single network-wide PSK is shipped.
+# IMPORTANT: same PSK file must reach every host that should accept obfs4
+# connections from each other.  Per-peer PSK lookup is planned as a
+# follow-up; for now a single network-wide PSK is shipped.
 
 - name: Deploy obfs4-tcp transport
   hosts: all
   become: true
-  serial: 1  # one host at а time, preserve quorum
+  serial: 1  # one host at a time, preserve quorum
   vars:
     veil_bin_src: "{{ playbook_dir }}/../target/release/veil-cli"
     obfs4_psk_dest: /var/lib/veil/obfs4_psk.b64
@@ -39,7 +39,7 @@
       ansible.builtin.fail:
         msg: |
           Pass --extra-vars 'obfs4_psk_path=/path/to/psk.b64' pointing
-          к а file containing one line of base64-encoded 32-byte PSK.
+          to a file containing one line of base64-encoded 32-byte PSK.
           Generate: `openssl rand 32 | base64 > /tmp/obfs4_psk.b64`.
       when: obfs4_psk_path is not defined
 
@@ -52,7 +52,7 @@
 
     - name: Fail if PSK missing
       ansible.builtin.fail:
-        msg: "PSK file {{ obfs4_psk_path }} not found на controller"
+        msg: "PSK file {{ obfs4_psk_path }} not found on controller"
       when: not psk_stat.stat.exists
 
     - name: Verify veil-cli binary exists on controller
@@ -65,7 +65,7 @@
     - name: Fail if binary missing
       ansible.builtin.fail:
         msg: |
-          Missing {{ veil_bin_src }}.  Build first с:
+          Missing {{ veil_bin_src }}.  Build first with:
           `cargo build --release -p veilcore --bin veil-cli --features allow-empty-seeds`
       when: not bin_stat.stat.exists
 
@@ -92,7 +92,7 @@
         mode: "0600"
       register: psk_copy
 
-    - name: Ensure [transport] section exists в node.toml
+    - name: Ensure [transport] section exists in node.toml
       ansible.builtin.shell:
         cmd: |
           if ! grep -qE '^\[transport\]$' /var/lib/veil/node.toml; then
@@ -104,7 +104,7 @@
       register: transport_section
       changed_when: transport_section.stdout == 'added'
 
-    - name: Set transport.obfs4_psk_file в node.toml (idempotent)
+    - name: Set transport.obfs4_psk_file in node.toml (idempotent)
       ansible.builtin.lineinfile:
         path: /var/lib/veil/node.toml
         regexp: '^obfs4_psk_file\s*='
@@ -119,7 +119,7 @@
         name: veil.service
         state: started
 
-    - name: Wait для metrics endpoint (readiness probe)
+    - name: Wait for metrics endpoint (readiness probe)
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 60); do
@@ -138,7 +138,7 @@
       ansible.builtin.debug:
         var: wait_result.stdout
 
-    - name: Verify no panic в journal с obfs4 config
+    - name: Verify no panic in journal with obfs4 config
       ansible.builtin.shell:
         cmd: |
           journalctl -u veil.service --since "2 minutes ago" --no-pager | \
@@ -150,7 +150,7 @@
       ansible.builtin.debug:
         msg: "{{ journal_check.stdout_lines | default(['(clean)']) }}"
 
-    - name: Fail если daemon panicked
+    - name: Fail if daemon panicked
       ansible.builtin.fail:
-        msg: "Daemon panic detected в journal: {{ journal_check.stdout }}"
+        msg: "Daemon panic detected in journal: {{ journal_check.stdout }}"
       when: "'panic' in (journal_check.stdout | lower)"

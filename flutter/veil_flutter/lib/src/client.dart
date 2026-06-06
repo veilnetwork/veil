@@ -31,11 +31,11 @@ String _readErrAndFree(Pointer<Pointer<Utf8>> errOut) {
   return msg;
 }
 
-/// GC-time safety-net: if а Dart `VeilClient` becomes unreachable
+/// GC-time safety-net: if a Dart `VeilClient` becomes unreachable
 /// without calling [VeilClient.close], the finalizer fires
 /// `veil_close` to release the daemon-side handle.  Explicit close
-/// detaches the finalizer first к avoid double-free (the С-side magic
-/// guard would catch it anyway, but а clean detach is cheaper).
+/// detaches the finalizer first to avoid double-free (the C-side magic
+/// guard would catch it anyway, but a clean detach is cheaper).
 final _veilClientFinalizer = NativeFinalizer(
   ffi.veilCloseFinalizerPtr.cast<NativeFinalizerFunction>(),
 );
@@ -48,10 +48,10 @@ class VeilClient implements Finalizable {
 
   final Pointer<ffi.VeilHandle> _handle;
 
-  /// Path used к open this connection (verbatim из [connect]).  Retained
+  /// Path used to open this connection (verbatim from [connect]).  Retained
   /// so background-handler helpers like [VeilPush.drainMailbox] can
-  /// re-open а fresh client from а separate Dart isolate without
-  /// requiring the consumer к thread the path through the app's own
+  /// re-open a fresh client from a separate Dart isolate without
+  /// requiring the consumer to thread the path through the app's own
   /// state.  Treated as an anchor (parent-dir ipc.port / ipc.token
   /// sidecars detected automatically), same as the `connect` arg.
   final String socketPath;
@@ -64,14 +64,14 @@ class VeilClient implements Finalizable {
   /// Lazy-constructed mailbox surface sharing this client's daemon
   /// connection.  Re-use the same instance across calls — Mailbox
   /// is stateless on the Dart side, the borrowed handle gives it
-  /// access к the daemon.
+  /// access to the daemon.
   VeilMailbox? _mailbox;
 
   /// Connect to the veil daemon's IPC socket and perform the
   /// APP_HELLO handshake.  Throws [VeilException] on failure.
   ///
   /// `socketPath` is treated as an anchor — if its parent dir contains
-  /// `ipc.port` + `ipc.token` sidecars, TCP-loopback с token auth is
+  /// `ipc.port` + `ipc.token` sidecars, TCP-loopback with token auth is
   /// used; otherwise plain Unix socket.
   static Future<VeilClient> connect(String socketPath) async {
     return Future(() {
@@ -90,7 +90,7 @@ class VeilClient implements Finalizable {
     });
   }
 
-  /// Mailbox surface — deposit blobs к offline recipients и fetch
+  /// Mailbox surface — deposit blobs to offline recipients and fetch
   /// blobs deposited for this node (Epic 489.3).  Lazily constructed
   /// on first access; subsequent calls return the same instance.
   /// Throws [VeilException] if called after [close].
@@ -168,21 +168,21 @@ class VeilClient implements Finalizable {
     });
   }
 
-  /// Consume а bootstrap-invite URI (Epic 489.7) — typically scanned
-  /// from а QR code или pasted из а sharing channel.  The daemon
+  /// Consume a bootstrap-invite URI (Epic 489.7) — typically scanned
+  /// from a QR code or pasted from a sharing channel.  The daemon
   /// decodes plain / encrypted / signed formats automatically and
   /// (on success) registers the encoded peer for outbound dial.
   ///
   /// [uri] is the full invite string (the bytes from the QR / paste).
   /// [password] — UTF-8 passphrase for encrypted invites.  Pass `null`
-  /// для plain or signed invites; daemon will return
+  /// for plain or signed invites; daemon will return
   /// [JoinBootstrapStatus.passwordRequired] if needed.
-  /// [expectedIssuerPk] — base64-encoded issuer Ed25519 pubkey used к
+  /// [expectedIssuerPk] — base64-encoded issuer Ed25519 pubkey used to
   /// verify signed invites.  Required for `veil:signed-invite?…`
   /// URIs (else verify fails with [JoinBootstrapStatus.signatureInvalid]);
   /// ignored for plain/encrypted.
   ///
-  /// Returns а [JoinBootstrapResult] describing the outcome.  Throws
+  /// Returns a [JoinBootstrapResult] describing the outcome.  Throws
   /// [VeilException] only on transport-level failures (IPC stall,
   /// daemon panic) — invalid URIs / wrong passwords are NOT exceptions,
   /// they surface as [JoinBootstrapStatus] codes the UI should branch on.
@@ -217,7 +217,7 @@ class VeilClient implements Finalizable {
             code: rc,
           );
         }
-        // err_out на success-paths carries а detail string (decode
+        // err_out on success-paths carries a detail string (decode
         // error message or similar) — surface it but don't throw.
         final errPtr = errOut.value;
         String? detail;
@@ -248,17 +248,17 @@ class VeilClient implements Finalizable {
     });
   }
 
-  /// Ask the daemon к assemble а bootstrap-invite URI from its own
+  /// Ask the daemon to assemble a bootstrap-invite URI from its own
   /// `[identity]` + first `[[listen]]` advertise (Epic 489.7 generator
   /// side, "share my invite" flow).  Returns the canonical URI suitable
-  /// для encoding as а QR code OR pasting into а sharing channel.
+  /// for encoding as a QR code OR pasting into a sharing channel.
   ///
   /// [password] = `null` → plain `veil:bootstrap?…` URI (most
   /// common, fastest QR render).  [password] = `'…'` → encrypted
   /// `veil:pair?…` envelope (Argon2id-derived KEK).  Empty /
   /// whitespace-only passwords surface as
   /// [CreateBootstrapInviteStatus.badPassword] so the UI can re-prompt
-  /// rather than emitting an envelope encrypted under а trivial key.
+  /// rather than emitting an envelope encrypted under a trivial key.
   ///
   /// Throws [VeilException] only on transport-level failures (IPC
   /// stall, daemon panic) — missing-config / invalid-password come
@@ -294,7 +294,7 @@ class VeilClient implements Finalizable {
           ffi.veilFreeString(uriPtr);
           outUri.value = nullptr;
         }
-        // Detail (if any) ара written via err_out — see FFI implementation.
+        // Detail (if any) are written via err_out — see FFI implementation.
         final errPtr = errOut.value;
         String? detail;
         if (errPtr != nullptr) {
@@ -322,14 +322,14 @@ class VeilClient implements Finalizable {
     });
   }
 
-  /// Register а sealed push envelope с the daemon (Epic 489.10).
-  /// Daemon attaches it к the matching rendezvous-publisher entry so
-  /// the next maintenance tick re-signs every active RendezvousAd с
-  /// the new envelope.  Pass an empty [envelope] (`Uint8List(0)`) к
-  /// clear push registration без disrupting the rendezvous itself —
-  /// use case: user disabled push в settings.
+  /// Register a sealed push envelope with the daemon (Epic 489.10).
+  /// Daemon attaches it to the matching rendezvous-publisher entry so
+  /// the next maintenance tick re-signs every active RendezvousAd with
+  /// the new envelope.  Pass an empty [envelope] (`Uint8List(0)`) to
+  /// clear push registration without disrupting the rendezvous itself —
+  /// use case: user disabled push in settings.
   ///
-  /// [rendezvousNodeId] и [authCookie] must match а previously-
+  /// [rendezvousNodeId] and [authCookie] must match a previously-
   /// registered rendezvous-publisher entry (the daemon's
   /// `register_rendezvous_publisher_with_push` call).
   ///
@@ -339,8 +339,8 @@ class VeilClient implements Finalizable {
   /// the FCM/APNs token out of daemon plaintext.
   ///
   /// Throws [VeilException] on transport / argument errors.
-  /// Returns true on OK, false на NoMatchingRendezvous (graceful
-  /// "no active rendezvous к attach к"); throws on TOO_LARGE.
+  /// Returns true on OK, false on NoMatchingRendezvous (graceful
+  /// "no active rendezvous to attach to"); throws on TOO_LARGE.
   Future<bool> setPushEnvelope({
     required Uint8List rendezvousNodeId,
     required Uint8List authCookie,
@@ -405,17 +405,17 @@ class VeilClient implements Finalizable {
     });
   }
 
-  /// Register а sealed wake-HMAC envelope с the daemon (Epic 489.10
-  /// slice 4.3.4 — analog к [setPushEnvelope]).  The daemon embeds
-  /// the envelope в every subsequent signed RendezvousAd refresh.
+  /// Register a sealed wake-HMAC envelope with the daemon (Epic 489.10
+  /// slice 4.3.4 — analog to [setPushEnvelope]).  The daemon embeds
+  /// the envelope in every subsequent signed RendezvousAd refresh.
   ///
-  /// `envelope` is а sealed [`veil_crypto::wake_hmac::WakeHmacKey`]
+  /// `envelope` is a sealed [`veil_crypto::wake_hmac::WakeHmacKey`]
   /// (build via [VeilPush.sealWakeHmacKey]).  Empty envelope clears
-  /// the registration — receiver falls back к the legacy rate-limited
+  /// the registration — receiver falls back to the legacy rate-limited
   /// wake path.
   ///
-  /// Returns `true` on OK, `false` на NoMatchingRendezvous; throws на
-  /// TOO_LARGE или other failure.
+  /// Returns `true` on OK, `false` on NoMatchingRendezvous; throws on
+  /// TOO_LARGE or other failure.
   Future<bool> setWakeHmacEnvelope({
     required Uint8List rendezvousNodeId,
     required Uint8List authCookie,
@@ -483,7 +483,7 @@ class VeilClient implements Finalizable {
 
   // ── Multi-device pairing (Epic 489.8) ─────────────────────────────
 
-  /// Source-side: generate а pair-invite URI + initialize ceremony.
+  /// Source-side: generate a pair-invite URI + initialize ceremony.
   /// [password] is the master_sk decryption passphrase (required —
   /// daemon's `master.enc` lives encrypted at rest).
   Future<PairCreateInviteResult> pairSourceCreateInvite({
@@ -604,8 +604,8 @@ class VeilClient implements Finalizable {
     });
   }
 
-  /// Target-side: consume scanned URI, returns Hello bytes к relay
-  /// back к Source.
+  /// Target-side: consume scanned URI, returns Hello bytes to relay
+  /// back to Source.
   Future<PairFrameResult> pairTargetConsumeUri({required String uri}) async {
     _ensureOpen();
     return Future(() => _pairFrameCall(
@@ -634,7 +634,7 @@ class VeilClient implements Finalizable {
   }) async {
     _ensureOpen();
     return Future(() {
-      // Target.handle_cert returns no Cert bytes (only OOB) — pass а
+      // Target.handle_cert returns no Cert bytes (only OOB) — pass a
       // zero-cap output buffer; FFI checks len before write.
       final certPtr =
           certBytes.isEmpty ? nullptr : calloc<Uint8>(certBytes.length);
@@ -704,7 +704,7 @@ class VeilClient implements Finalizable {
         ));
   }
 
-  /// Shared helper для ops that take input bytes + return OOB + Cert
+  /// Shared helper for ops that take input bytes + return OOB + Cert
   /// bytes (Source.handle_hello shape).
   PairOobResult _pairOobCall(
     Uint8List inputBytes,
@@ -773,7 +773,7 @@ class VeilClient implements Finalizable {
     }
   }
 
-  /// Shared helper для ops that return only а byte payload (Hello /
+  /// Shared helper for ops that return only a byte payload (Hello /
   /// Confirm shape).
   PairFrameResult _pairFrameCall(
     int Function(
@@ -824,7 +824,7 @@ class VeilClient implements Finalizable {
   }
 
   /// Notify the daemon that the host's mobile-background tier changed.
-  /// Drives keepalive scaling и suppresses background maintenance on
+  /// Drives keepalive scaling and suppresses background maintenance on
   /// `lowPower` (Epic 489.4).
   Future<void> setBackgroundMode(MobileBackgroundMode mode) async {
     _ensureOpen();
@@ -919,7 +919,7 @@ class VeilClient implements Finalizable {
     });
   }
 
-  /// Close the connection.  Aborts any active event subscription и
+  /// Close the connection.  Aborts any active event subscription and
   /// releases the C handle.  Safe to call multiple times.
   ///
   /// Order matters: the native handle is closed FIRST so the daemon-
@@ -1033,11 +1033,11 @@ class AppHandle implements Finalizable {
 
   /// Open a reliable bidirectional byte-stream to a remote endpoint.
   /// Returns once the daemon-side stream FSM is established (the open
-  /// handshake doesn't await peer ACK — call [VeilStream.write] и
-  /// the daemon flow-controls против the configured `initialWindow`).
+  /// handshake doesn't await peer ACK — call [VeilStream.write] and
+  /// the daemon flow-controls against the configured `initialWindow`).
   ///
-  /// [initialWindow] sets the receive-window the daemon advertises к
-  /// the peer (bytes the peer may send before waiting for а window
+  /// [initialWindow] sets the receive-window the daemon advertises to
+  /// the peer (bytes the peer may send before waiting for a window
   /// update).  Default 64 KiB matches the FFI surface default.
   Future<VeilStream> openStream({
     required Uint8List dstNodeId,
@@ -1124,7 +1124,7 @@ class AppHandle implements Finalizable {
     return controller.stream;
   }
 
-  /// Close the endpoint.  Aborts any active recv loop и releases the
+  /// Close the endpoint.  Aborts any active recv loop and releases the
   /// C-side AppHandle.  Safe to call multiple times.
   ///
   /// Same close-ordering as `VeilClient.close` — native handle

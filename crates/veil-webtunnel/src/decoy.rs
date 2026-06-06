@@ -1,10 +1,10 @@
-//! Decoy-content providers що serve "looks like а regular HTTPS site"
-//! responses к probes що don't carry valid tunnel-mode credentials.
+//! Decoy-content providers that serve "looks like a regular HTTPS site"
+//! responses to probes that don't carry valid tunnel-mode credentials.
 //!
-//! The trait is async-trait based и framework-agnostic — the request
-//! comes в as а bare path + headers, response goes out as а status
-//! code + headers + body.  Phase 5b's HTTP router wraps а Hyper
-//! request, calls the decoy provider, и serialises the response back
+//! The trait is async-trait based and framework-agnostic — the request
+//! comes in as a bare path + headers, response goes out as a status
+//! code + headers + body.  Phase 5b's HTTP router wraps a Hyper
+//! request, calls the decoy provider, and serialises the response back
 //! over TLS.
 
 use std::path::{Path, PathBuf};
@@ -31,7 +31,7 @@ pub enum DecoyError {
 // ── Response shape ───────────────────────────────────────────────────────────
 
 /// Decoy-provider response.  Framework-agnostic; Phase 5b's HTTP
-/// router converts this к а Hyper response.
+/// router converts this to a Hyper response.
 #[derive(Debug, Clone)]
 pub struct DecoyResponse {
     pub status: u16,
@@ -77,7 +77,7 @@ const DEFAULT_400_HTML: &str = "<!DOCTYPE html>\n<html><head><title>400 Bad Requ
 
 // ── Trait ────────────────────────────────────────────────────────────────────
 
-/// Decoy provider — produces an HTTP response для а given request path
+/// Decoy provider — produces an HTTP response for a given request path
 /// when the request does NOT pass tunnel-mode authentication.
 ///
 /// Implementations should:
@@ -85,11 +85,11 @@ const DEFAULT_400_HTML: &str = "<!DOCTYPE html>\n<html><head><title>400 Bad Requ
 ///   status codes).
 /// - Avoid distinctive markers (no "Server: veil" headers, no
 ///   characteristic error pages).
-/// - Be fast — а scanner generating thousands of probes shouldn't
+/// - Be fast — a scanner generating thousands of probes shouldn't
 ///   thrash the operator's server.
 #[async_trait]
 pub trait DecoyProvider: Send + Sync {
-    /// Generate а decoy response для the given request.
+    /// Generate a decoy response for the given request.
     /// `path` is the request URI path (no scheme/host); `method` is
     /// HTTP method ("GET", "POST", etc.).
     async fn respond(&self, method: &str, path: &str) -> Result<DecoyResponse, DecoyError>;
@@ -97,11 +97,11 @@ pub trait DecoyProvider: Send + Sync {
 
 // ── StaticStringDecoy ───────────────────────────────────────────────────────
 
-/// Simplest decoy: serves а single HTML string for any GET request,
+/// Simplest decoy: serves a single HTML string for any GET request,
 /// 404 for everything else.
 ///
-/// Low realism — а scanner що hits multiple URLs will see the same
-/// page regardless of path.  Useful для tests и operator quick-starts.
+/// Low realism — a scanner that hits multiple URLs will see the same
+/// page regardless of path.  Useful for tests and operator quick-starts.
 pub struct StaticStringDecoy {
     body: Vec<u8>,
     content_type: String,
@@ -138,18 +138,18 @@ impl DecoyProvider for StaticStringDecoy {
 
 // ── StaticDirectoryDecoy ───────────────────────────────────────────────────
 
-/// Serves static files from а directory rooted at `root_dir`.  Maps
-/// request path → file path; reads и returns the file content с а
+/// Serves static files from a directory rooted at `root_dir`.  Maps
+/// request path → file path; reads and returns the file content with a
 /// sensible Content-Type guess.
 ///
-/// Realism: medium-high.  Operator deploys а snapshot of а neutral site
+/// Realism: medium-high.  Operator deploys a snapshot of a neutral site
 /// (status dashboard, dev blog, public-data archive).  Probes see
-/// realistic responses с proper Content-Type, varying file sizes, и
-/// 404 для absent paths — indistinguishable от а real static-hosted site.
+/// realistic responses with proper Content-Type, varying file sizes, and
+/// 404 for absent paths — indistinguishable from a real static-hosted site.
 ///
 /// Security: path-traversal attempts (e.g. `..`, encoded `%2e%2e`) are
-/// rejected с `DecoyError::PathTraversal`.  Caller (Phase 5b) maps это
-/// к а 400 response.
+/// rejected with `DecoyError::PathTraversal`.  Caller (Phase 5b) maps this
+/// to a 400 response.
 pub struct StaticDirectoryDecoy {
     root_dir: PathBuf,
     index_file: String,
@@ -168,7 +168,7 @@ impl StaticDirectoryDecoy {
         self
     }
 
-    /// Resolve а URL path к а file path within `root_dir`, rejecting
+    /// Resolve a URL path to a file path within `root_dir`, rejecting
     /// traversal attempts.  Path normalization:
     /// - `/` → `<root>/index.html`
     /// - `/foo/` → `<root>/foo/index.html`
@@ -179,7 +179,7 @@ impl StaticDirectoryDecoy {
             return Err(DecoyError::PathTraversal(url_path.to_owned()));
         }
         let trimmed = url_path.trim_start_matches('/');
-        // Split into segments и reject `..` / empty-segment-as-traversal.
+        // Split into segments and reject `..` / empty-segment-as-traversal.
         let mut segments: Vec<&str> = Vec::new();
         for seg in trimmed.split('/') {
             match seg {
@@ -193,15 +193,15 @@ impl StaticDirectoryDecoy {
         for seg in &segments {
             path.push(seg);
         }
-        // Trailing-slash или empty path → use index file.
+        // Trailing-slash or empty path → use index file.
         if url_path.ends_with('/') || segments.is_empty() {
             path.push(&self.index_file);
         }
         Ok(path)
     }
 
-    /// Best-effort Content-Type от file extension.  Returns generic
-    /// `application/octet-stream` для unknown extensions.
+    /// Best-effort Content-Type from file extension.  Returns generic
+    /// `application/octet-stream` for unknown extensions.
     fn content_type_from_extension(path: &Path) -> &'static str {
         match path.extension().and_then(|e| e.to_str()) {
             Some("html" | "htm") => "text/html; charset=utf-8",
@@ -259,26 +259,26 @@ impl DecoyProvider for StaticDirectoryDecoy {
 
 // ── ReverseProxyDecoy ───────────────────────────────────────────────────────
 
-/// Proxies decoy requests к а real HTTP backend (e.g., локальный nginx
-/// serving а neutral cached site).  **Highest realism** decoy mode:
+/// Proxies decoy requests to a real HTTP backend (e.g., local nginx
+/// serving a neutral cached site).  **Highest realism** decoy mode:
 /// responses include actual server's `Server:` header, ETag, Cache-Control,
 /// Content-Length matching real file sizes — DPI scrutiny of headers
-/// reveals nothing distinguishing от а regular HTTPS site.
+/// reveals nothing distinguishing from a regular HTTPS site.
 ///
 /// ## Setup recommendation
 ///
-/// Operator runs local nginx serving а snapshot of а neutral website
+/// Operator runs local nginx serving a snapshot of a neutral website
 /// (status dashboard, dev blog, open-data archive).  Configure
 /// `ReverseProxyDecoy::new("http://127.0.0.1:8080")`.  Webtunnel
-/// forwards all decoy-mode requests there и returns the backend's
-/// response verbatim к probe clients.
+/// forwards all decoy-mode requests there and returns the backend's
+/// response verbatim to probe clients.
 ///
 /// ## Constraints
 ///
-/// - Backend MUST be HTTP/1.1 (HTTP/2 not implemented здесь).
+/// - Backend MUST be HTTP/1.1 (HTTP/2 not implemented here).
 /// - Backend SHOULD bind on loopback only — exposing the backend
 ///   directly defeats its purpose.
-/// - Default 5s connect/read timeout protects against а slow backend
+/// - Default 5s connect/read timeout protects against a slow backend
 ///   tarpitting scanner requests.
 pub struct ReverseProxyDecoy {
     backend: String,
@@ -300,7 +300,7 @@ impl ReverseProxyDecoy {
     }
 
     /// Parse backend URL into (host, port, path-prefix).  Supports
-    /// `http://host:port` и `http://host:port/prefix`.
+    /// `http://host:port` and `http://host:port/prefix`.
     fn parse_backend(&self) -> Result<(String, u16, String), DecoyError> {
         let trimmed = self.backend.trim_start_matches("http://");
         let (host_port, prefix) = match trimmed.find('/') {
@@ -362,7 +362,7 @@ impl DecoyProvider for ReverseProxyDecoy {
                     name.as_str(),
                     "content-length" | "transfer-encoding" | "connection"
                 ) {
-                    // Copy non-hop-by-hop headers через.
+                    // Copy non-hop-by-hop headers through.
                     extra_headers.push((k.as_str().to_owned(), value_str.to_owned()));
                 }
             }
@@ -464,7 +464,7 @@ mod tests {
         let r = d.respond("GET", "/../etc/passwd").await.unwrap();
         assert_eq!(r.status, 404);
 
-        // Encoded traversal — naive %2e%2e not decoded by us, so just а 404.
+        // Encoded traversal — naive %2e%2e not decoded by us, so just a 404.
         let r2 = d.respond("GET", "/foo/../../etc/passwd").await.unwrap();
         assert_eq!(r2.status, 404);
     }

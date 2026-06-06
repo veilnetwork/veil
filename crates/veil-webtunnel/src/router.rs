@@ -1,25 +1,25 @@
-//! HTTP routing + WebSocket upgrade для webtunnel.
+//! HTTP routing + WebSocket upgrade for webtunnel.
 //!
 //! Phase 5b of [`docs/internal/PLAN_TRANSPORT_OBFUSCATION.md`](../../docs/internal/PLAN_TRANSPORT_OBFUSCATION.md).
 //!
 //! Sits on top of an already-TLS-terminated stream (operator should
-//! wrap raw TCP с rustls/BoringSSL via `veil-transport::tls` или
+//! wrap raw TCP with rustls/BoringSSL via `veil-transport::tls` or
 //! `tls_boring` so the TLS fingerprint is realistic).  Reads the inbound
-//! HTTP request, asks the [`SecretMatcher`] whether it's а tunnel-mode
-//! request, и:
+//! HTTP request, asks the [`SecretMatcher`] whether it's a tunnel-mode
+//! request, and:
 //!
-//! - **tunnel match** → completes the WebSocket upgrade и hands the
-//!   [`WebSocketStream`] back к the caller.
-//! - **decoy** → calls the [`DecoyProvider`] и sends а regular HTTPS
+//! - **tunnel match** → completes the WebSocket upgrade and hands the
+//!   [`WebSocketStream`] back to the caller.
+//! - **decoy** → calls the [`DecoyProvider`] and sends a regular HTTPS
 //!   response back over the wire.  Connection is then closed.
 //!
 //! ## Why tokio-tungstenite
 //!
-//! Already в the veil workspace ([`veil-transport`] uses it for
+//! Already in the veil workspace ([`veil-transport`] uses it for
 //! `ws://` / `wss://` transports).  `accept_hdr_async`'s Callback hook
 //! lets us inspect the inbound HTTP request before deciding whether
-//! к upgrade, и to reject с а custom response (the decoy) when we
-//! choose not к upgrade.
+//! to upgrade, and to reject with a custom response (the decoy) when we
+//! choose not to upgrade.
 
 #![allow(clippy::result_large_err)] // WebSocketStream Ok-arm is also large; no boxing benefit
 
@@ -44,17 +44,17 @@ pub enum RouterError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Sentinel returned when the inbound request triggered decoy mode и
-    /// the decoy response was written к the wire.  Caller closes the
-    /// connection; не а programmer error.
+    /// Sentinel returned when the inbound request triggered decoy mode and
+    /// the decoy response was written to the wire.  Caller closes the
+    /// connection; not a programmer error.
     #[error("served decoy response — connection should close")]
     ServedDecoy,
 }
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
-/// HTTP router що inspects inbound requests и either upgrades к
-/// WebSocket (tunnel mode) или serves а decoy response.
+/// HTTP router that inspects inbound requests and either upgrades to
+/// WebSocket (tunnel mode) or serves a decoy response.
 ///
 /// Construct once and reuse across many connections — clone-cheap
 /// (`Arc`-wrapped internals).
@@ -74,47 +74,47 @@ impl WebtunnelRouter {
 
     /// Handle one inbound connection.  Returns:
     /// - `Ok(WebSocketStream)` when tunnel mode upgraded successfully.
-    /// - `Err(ServedDecoy)` when the request triggered decoy mode и
-    ///   the response was already written к the wire.  Caller closes.
-    /// - Other `Err(...)` для I/O или WebSocket errors.
+    /// - `Err(ServedDecoy)` when the request triggered decoy mode and
+    ///   the response was already written to the wire.  Caller closes.
+    /// - Other `Err(...)` for I/O or WebSocket errors.
     pub async fn handle<S>(&self, stream: S) -> Result<WebSocketStream<S>, RouterError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         // The callback is invoked synchronously by tokio-tungstenite
         // after parsing the inbound request line + headers.  Our
-        // decision: return Ok(response) to proceed с the upgrade, or
-        // Err(error_response) to short-circuit и send the decoy bytes.
+        // decision: return Ok(response) to proceed with the upgrade, or
+        // Err(error_response) to short-circuit and send the decoy bytes.
         let matcher = Arc::clone(&self.matcher);
         let decoy = Arc::clone(&self.decoy);
 
         // The decoy response, if needed, is computed inside the
         // callback (sync context) so we serialise async decoy fetches
         // synchronously here.  This means StaticDirectoryDecoy's
-        // tokio::fs::read becomes а problem inside а sync callback.
+        // tokio::fs::read becomes a problem inside a sync callback.
         //
-        // Workaround: do а preliminary HTTP-only read here to extract
-        // path и auth header (см. read_http_request), then call decoy
-        // async, then either invoke accept_hdr_async с а static
+        // Workaround: do a preliminary HTTP-only read here to extract
+        // path and auth header (see. read_http_request), then call decoy
+        // async, then either invoke accept_hdr_async with a static
         // "always upgrade" callback OR write the decoy and bail.
         //
         // This means we read the HTTP request **twice** in tunnel
         // mode: once here for inspection, once by accept_hdr_async.
-        // Tokio-tungstenite's API doesn't expose а "pre-parsed
-        // request" entry point, so the cleaner alternative is к ship
-        // а custom HTTP→WS upgrade.  For Phase 5b we take the simpler
-        // route: peek the request, route, и either decoy or hand back
-        // к tokio-tungstenite.
+        // Tokio-tungstenite's API doesn't expose a "pre-parsed
+        // request" entry point, so the cleaner alternative is to ship
+        // a custom HTTP→WS upgrade.  For Phase 5b we take the simpler
+        // route: peek the request, route, and either decoy or hand back
+        // to tokio-tungstenite.
         //
         // BUT — re-reading the same stream isn't trivial since reads
-        // consume bytes.  We need а peekable stream.  Two options:
-        // (a) buffer bytes ourselves и replay; (b) parse the request
-        // ourselves и then synthesize the upgrade response without
+        // consume bytes.  We need a peekable stream.  Two options:
+        // (a) buffer bytes ourselves and replay; (b) parse the request
+        // ourselves and then synthesize the upgrade response without
         // calling accept_hdr_async on the original stream.
         //
-        // (b) is cleaner.  Let's do а full hand-rolled upgrade
+        // (b) is cleaner.  Let's do a full hand-rolled upgrade
         // including computing Sec-WebSocket-Accept.  Phase 5b ships
-        // что; Phase 5c can refactor if а cleaner tungstenite API
+        // that; Phase 5c can refactor if a cleaner tungstenite API
         // surfaces.
         let (request, residual, mut stream) = read_http_request(stream).await?;
 
@@ -142,11 +142,11 @@ impl WebtunnelRouter {
                 stream.write_all(response.as_bytes()).await?;
                 stream.flush().await?;
 
-                // Hand the now-upgraded stream к tokio-tungstenite's
+                // Hand the now-upgraded stream to tokio-tungstenite's
                 // server-side framing reader.  We have to inject any
-                // residual bytes що we read past the request boundary
+                // residual bytes that we read past the request boundary
                 // (typically zero unless the client pipelined data —
-                // не valid per WebSocket spec but defensive).
+                // not valid per WebSocket spec but defensive).
                 if !residual.is_empty() {
                     return Err(RouterError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -154,9 +154,9 @@ impl WebtunnelRouter {
                     )));
                 }
 
-                // Wrap the stream as а server-side WebSocket.  Since
+                // Wrap the stream as a server-side WebSocket.  Since
                 // we already wrote the 101 response, we use
-                // `WebSocketStream::from_raw_socket` с role=Server.
+                // `WebSocketStream::from_raw_socket` with role=Server.
                 let ws = WebSocketStream::from_raw_socket(
                     stream,
                     tokio_tungstenite::tungstenite::protocol::Role::Server,
@@ -194,12 +194,12 @@ impl ParsedRequest {
     }
 }
 
-/// Read an HTTP/1.1 request line + headers до `\r\n\r\n`.  Returns the
+/// Read an HTTP/1.1 request line + headers before `\r\n\r\n`.  Returns the
 /// parsed request, any residual bytes read past the boundary (should
-/// always be empty в well-behaved clients), и the stream (ownership
-/// returned so caller can write а response back).
+/// always be empty in well-behaved clients), and the stream (ownership
+/// returned so caller can write a response back).
 ///
-/// Caps at 16 KiB к prevent slowloris-style header floods.
+/// Caps at 16 KiB to prevent slowloris-style header floods.
 async fn read_http_request<S>(mut stream: S) -> Result<(ParsedRequest, Vec<u8>, S), RouterError>
 where
     S: AsyncRead + Unpin,
@@ -239,13 +239,13 @@ where
     Ok((parsed, residual, stream))
 }
 
-/// Find the byte position of `\r\n\r\n` в `buf`, returning the index
+/// Find the byte position of `\r\n\r\n` in `buf`, returning the index
 /// of the FIRST `\r` of the sequence.  Returns `None` if not found.
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// Parse HTTP/1.1 request from header bytes (без trailing `\r\n\r\n`).
+/// Parse HTTP/1.1 request from header bytes (without trailing `\r\n\r\n`).
 fn parse_request(bytes: &[u8]) -> Result<ParsedRequest, RouterError> {
     let s = std::str::from_utf8(bytes).map_err(|_| {
         RouterError::Io(std::io::Error::new(
@@ -279,7 +279,7 @@ fn parse_request(bytes: &[u8]) -> Result<ParsedRequest, RouterError> {
             ))
         })?
         .to_owned();
-    // Ignore HTTP version field — caller can be HTTP/1.0 или /1.1.
+    // Ignore HTTP version field — caller can be HTTP/1.0 or /1.1.
 
     let mut headers = Vec::new();
     for line in lines {
@@ -300,14 +300,14 @@ fn parse_request(bytes: &[u8]) -> Result<ParsedRequest, RouterError> {
     })
 }
 
-/// Compute the `Sec-WebSocket-Accept` header value от the client's
+/// Compute the `Sec-WebSocket-Accept` header value from the client's
 /// `Sec-WebSocket-Key` per RFC 6455 §1.3:  base64(SHA-1(key || GUID)).
 fn compute_sec_websocket_accept(client_key: &[u8]) -> String {
     use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
     derive_accept_key(client_key)
 }
 
-/// Serialise а [`crate::DecoyResponse`] к the wire як an HTTP/1.1
+/// Serialise a [`crate::DecoyResponse`] to the wire as an HTTP/1.1
 /// response.
 async fn write_http_response<S>(
     stream: &mut S,
@@ -373,7 +373,7 @@ mod tests {
         let router = test_router();
         let router_task = tokio::spawn(async move { router.handle(server).await });
 
-        // Client sends а regular HTTP GET к the wrong path.
+        // Client sends a regular HTTP GET to the wrong path.
         let req = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         client.write_all(req.as_bytes()).await.unwrap();
         client.flush().await.unwrap();
@@ -397,7 +397,7 @@ mod tests {
         let router = test_router();
         let router_task = tokio::spawn(async move { router.handle(server).await });
 
-        // Correct path но no auth header.
+        // Correct path but no auth header.
         let req = "GET /_t/abc HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
         client.write_all(req.as_bytes()).await.unwrap();
         client.flush().await.unwrap();
@@ -454,7 +454,7 @@ mod tests {
         assert!(response.contains("Upgrade: websocket"));
         assert!(response.contains("Sec-WebSocket-Accept:"));
 
-        // Server task должно return Ok(WebSocketStream).
+        // Server task must return Ok(WebSocketStream).
         let result = router_task.await.unwrap();
         assert!(result.is_ok(), "router should return upgraded WS stream");
     }

@@ -2,13 +2,13 @@
 # Tighten on-disk `mlkem.key` file permissions on already-deployed nodes.
 #
 # The post-audit veil-cli builds write fresh keys at `0o600` via
-# `veil_util::atomic_write`, но nodes that generated their key with
+# `veil_util::atomic_write`, but nodes that generated their key with
 # the pre-audit binary still have the pre-fix permissions (typically
 # `0o644` from the default umask) — those files are owner-only-readable
 # logically (veil user) but world-readable on disk, leaking DK seed
-# к anyone с FS read access.
+# to anyone with FS read access.
 #
-# This playbook chmods the existing keys к `0o600` without rotating
+# This playbook chmods the existing keys to `0o600` without rotating
 # them. Safe to run repeatedly (idempotent).
 #
 # Run:

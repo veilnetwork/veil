@@ -4,27 +4,27 @@
 //! This module provides the **client-side** primitives for one
 //! rendezvous exchange:
 //!
-//! 1. [`RendezvousRequestBuilder`] — mints а PoW-gated request signed
+//! 1. [`RendezvousRequestBuilder`] — mints a PoW-gated request signed
 //!    under the initiator's identity key.  Mining is CPU-bound;
-//!    optional progress callback supports а UI spinner.
+//!    optional progress callback supports a UI spinner.
 //! 2. [`parse_and_verify_response`] — decodes wire bytes + verifies
 //!    the target's signature + identity binding + requester echo +
-//!    TTL; returns а ready-к-dial [`EphemeralEndpoint`] (URI + PSK +
+//!    TTL; returns a ready-to-dial [`EphemeralEndpoint`] (URI + PSK +
 //!    expiry).
 //!
 //! ## Scope (Slice 4)
 //!
 //! This module ships only the wire-level + signing primitives.  The
-//! transport-layer "send the request, await а matching response"
+//! transport-layer "send the request, await a matching response"
 //! plumbing requires session integration that lives outside the SDK
 //! (mediator routing, dispatcher arms) — that's Slice 5+ work.
 //!
 //! Today's typical caller will:
-//! 1. Construct а `RendezvousRequestBuilder` from their identity sk.
-//! 2. Call `build_request()` к get а signed payload + the encoded bytes.
-//! 3. Hand the bytes к а transport-layer routing primitive (Slice 5).
+//! 1. Construct a `RendezvousRequestBuilder` from their identity sk.
+//! 2. Call `build_request()` to get a signed payload + the encoded bytes.
+//! 3. Hand the bytes to a transport-layer routing primitive (Slice 5).
 //! 4. When response bytes come back, call `parse_and_verify_response`.
-//! 5. Dial `EphemeralEndpoint::transport_uri` с `EphemeralEndpoint::psk`
+//! 5. Dial `EphemeralEndpoint::transport_uri` with `EphemeralEndpoint::psk`
 //!    as the obfs4 PSK.
 
 use std::sync::Arc;
@@ -43,41 +43,41 @@ use veil_proto::routing::{RecursiveQueryPayload, RecursiveResponsePayload, recur
 
 // ── Public API ──────────────────────────────────────────────────────
 
-/// Decoded + verified ephemeral endpoint, ready для а dial.  Returned
+/// Decoded + verified ephemeral endpoint, ready for a dial.  Returned
 /// by [`parse_and_verify_response`] after signature verification + TTL
 /// check passes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EphemeralEndpoint {
-    /// Transport URI к dial (e.g. `"obfs4-tcp://example.com:51237"`).
+    /// Transport URI to dial (e.g. `"obfs4-tcp://example.com:51237"`).
     pub transport_uri: String,
-    /// One-shot PSK для the obfs4 handshake.
+    /// One-shot PSK for the obfs4 handshake.
     pub psk: [u8; 32],
     /// Wall-clock expiry (unix seconds) — caller MUST dial before this.
     pub valid_until_unix: u64,
 }
 
-/// Progress reporter для PoW mining.  Cheap closure что the mine loop
+/// Progress reporter for PoW mining.  Cheap closure that the mine loop
 /// invokes every N attempts (configured by the caller).  Default cadence
 /// is `RendezvousRequestBuilder::DEFAULT_PROGRESS_EVERY = 65_536` —
-/// fast enough к keep а UI spinner alive without dominating the mining
+/// fast enough to keep a UI spinner alive without dominating the mining
 /// hot path.
 pub trait ProgressCallback: Send + Sync + 'static {
     fn on_progress(&self, attempts_so_far: u64);
 }
 
-/// Convenience impl для bare closures: any `Fn(u64)` что is `Send +
-/// Sync + 'static` becomes а `ProgressCallback`.
+/// Convenience impl for bare closures: any `Fn(u64)` that is `Send +
+/// Sync + 'static` becomes a `ProgressCallback`.
 impl<F: Fn(u64) + Send + Sync + 'static> ProgressCallback for F {
     fn on_progress(&self, attempts_so_far: u64) {
         (self)(attempts_so_far)
     }
 }
 
-/// Shared counter что mining loops can write into.  Cheap, allocation-
-/// free observability primitive for callers что want к poll progress
-/// asynchronously без registering а callback closure.  Pass the
-/// returned `Arc` к [`RendezvousRequestBuilder::build_request_async`]
-/// (when added в а future slice) or hand-roll your own polling task.
+/// Shared counter that mining loops can write into.  Cheap, allocation-
+/// free observability primitive for callers that want to poll progress
+/// asynchronously without registering a callback closure.  Pass the
+/// returned `Arc` to [`RendezvousRequestBuilder::build_request_async`]
+/// (when added in a future slice) or hand-roll your own polling task.
 #[derive(Debug, Clone, Default)]
 pub struct AtomicProgress {
     counter: Arc<AtomicU64>,
@@ -98,41 +98,41 @@ impl ProgressCallback for AtomicProgress {
     }
 }
 
-/// Builder для one PoW-gated rendezvous request.  Wraps the
-/// proto-level mining + signing primitives с client-side ergonomics:
-/// generates the timestamp, validates the difficulty against а
-/// caller-configurable cap, и dispatches the progress callback.
+/// Builder for one PoW-gated rendezvous request.  Wraps the
+/// proto-level mining + signing primitives with client-side ergonomics:
+/// generates the timestamp, validates the difficulty against a
+/// caller-configurable cap, and dispatches the progress callback.
 pub struct RendezvousRequestBuilder {
     signing_key: SigningKey,
 }
 
 impl RendezvousRequestBuilder {
-    /// Default cadence для progress-callback invocations.  Chosen
-    /// such что at 28 bits (~250M attempts ≈ 8 s wall-clock) the
-    /// callback fires ~4000 times — every ~2 ms, fast enough к
-    /// drive а smooth UI spinner.
+    /// Default cadence for progress-callback invocations.  Chosen
+    /// such that at 28 bits (~250M attempts ≈ 8 s wall-clock) the
+    /// callback fires ~4000 times — every ~2 ms, fast enough to
+    /// drive a smooth UI spinner.
     pub const DEFAULT_PROGRESS_EVERY: u64 = 65_536;
 
     /// Construct.  The signing key MUST be the initiator's identity
-    /// Ed25519 key; the corresponding pubkey is embedded в the request
-    /// и binds the PoW solution к this requester.
+    /// Ed25519 key; the corresponding pubkey is embedded in the request
+    /// and binds the PoW solution to this requester.
     pub fn new(signing_key: SigningKey) -> Self {
         Self { signing_key }
     }
 
-    /// Build а signed request с mined PoW.  Returns the payload + the
-    /// final attempt count.  CPU-bound work proportional к
+    /// Build a signed request with mined PoW.  Returns the payload + the
+    /// final attempt count.  CPU-bound work proportional to
     /// `2^difficulty`.
     ///
-    /// Production callers should set `difficulty` к the target's
+    /// Production callers should set `difficulty` to the target's
     /// declared minimum (discovered through DHT or operator config).
     /// Below [`MIN_POW_DIFFICULTY`] (8 bits) the build rejects to keep
     /// even demonstration deployments anti-spam.  Above
-    /// [`MAX_POW_DIFFICULTY`] (64 bits) rejects to prevent а wedged
+    /// [`MAX_POW_DIFFICULTY`] (64 bits) rejects to prevent a wedged
     /// mining loop on operator misconfig.
     ///
-    /// `now_unix` is captured at build time AND included в the
-    /// signable surface — callers что mine offline и transmit later
+    /// `now_unix` is captured at build time AND included in the
+    /// signable surface — callers that mine offline and transmit later
     /// must respect the [`REPLAY_WINDOW_SECS`] (5 min) on the
     /// verifier side.
     pub fn build_request<P: ProgressCallback>(
@@ -144,7 +144,7 @@ impl RendezvousRequestBuilder {
         self.build_request_with_timestamp(target_node_id, difficulty, now_unix(), progress)
     }
 
-    /// Test-hook variant что accepts an explicit `timestamp_unix`.
+    /// Test-hook variant that accepts an explicit `timestamp_unix`.
     /// Production callers use [`Self::build_request`] which calls
     /// `SystemTime::now`.
     pub fn build_request_with_timestamp<P: ProgressCallback>(
@@ -170,7 +170,7 @@ impl RendezvousRequestBuilder {
         let requester_pubkey = self.signing_key.verifying_key().to_bytes();
 
         // Stage 1 — mine the nonce against the canonical form.  Mining
-        // mutates pow_nonce which IS в signable_bytes; signing comes
+        // mutates pow_nonce which IS in signable_bytes; signing comes
         // after.
         let mut draft = RequestEphemeralEndpointPayload {
             target_node_id,
@@ -207,25 +207,25 @@ impl RendezvousRequestBuilder {
         })
     }
 
-    /// Diagnostics: requester pubkey derived от the signing key.
-    /// Useful когда the caller needs к check the target's response
+    /// Diagnostics: requester pubkey derived from the signing key.
+    /// Useful when the caller needs to check the target's response
     /// echoes the right pubkey.
     pub fn requester_pubkey(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
     }
 
-    /// Slice 6c — wrap а freshly-built `BuiltRequest` в the recursive
+    /// Slice 6c — wrap a freshly-built `BuiltRequest` in the recursive
     /// envelope used by the mediator-relay path.  Caller ships the
-    /// returned wire bytes as а `RoutingMsg::RecursiveQuery` frame
-    /// addressed к any neighbour; the existing recursive-routing
+    /// returned wire bytes as a `RoutingMsg::RecursiveQuery` frame
+    /// addressed to any neighbour; the existing recursive-routing
     /// infrastructure (already in production for DHT FIND_NODE) takes
-    /// care of forwarding к the target и returning а signed response.
+    /// care of forwarding to the target and returning a signed response.
     ///
     /// `target_node_id` MUST equal `BLAKE3(target_identity_pubkey)`
     /// (the target's well-known node-id).  `reply_to_node_id` MUST
     /// equal the initiator's own node-id — recursive responses route
-    /// back to this address.  `ttl` defaults к the canonical
-    /// `MAX_RECURSIVE_RELAY_HOPS` (20 hops) когда `None`.
+    /// back to this address.  `ttl` defaults to the canonical
+    /// `MAX_RECURSIVE_RELAY_HOPS` (20 hops) when `None`.
     pub fn wrap_recursive(
         built: &BuiltRequest,
         target_node_id: [u8; 32],
@@ -241,24 +241,24 @@ impl RendezvousRequestBuilder {
             query_type: recursive_query_type::RENDEZVOUS_REQUEST,
             // 0 = no UDP-direct reply.  Target's reachable IP is the
             // secret protected by stealth — response MUST travel
-            // через veil reverse-path.
+            // through veil reverse-path.
             reply_port: 0,
             payload: built.wire_bytes.clone(),
         }
     }
 }
 
-/// Parse + verify а `RecursiveResponsePayload` carrying а
+/// Parse + verify a `RecursiveResponsePayload` carrying a
 /// PoW-rendezvous response inner payload.  Performs two layers of
 /// verification:
 ///
 /// 1. Outer envelope's `responder_pubkey` MUST equal
-///    `expected_target_pubkey` — а malicious mediator cannot replace
-///    the target's identity с its own.
+///    `expected_target_pubkey` — a malicious mediator cannot replace
+///    the target's identity with its own.
 /// 2. Inner `EphemeralEndpointResponsePayload` runs through the
 ///    same `verify_ephemeral_endpoint_response` as the direct-session
 ///    path (see [`parse_and_verify_response_at`]).  Domain-separated
-///    sig что а passive observer cannot replay к а different
+///    sig that a passive observer cannot replay to a different
 ///    `requester_pubkey`.
 ///
 /// Outer envelope's own Ed25519 sig (signed by target's key over
@@ -316,7 +316,7 @@ pub fn parse_and_verify_recursive_response_at(
         ))
     })?;
 
-    // 4. inner verify — delegates к the existing parse path.
+    // 4. inner verify — delegates to the existing parse path.
     parse_and_verify_response_at(
         &outer.payload,
         expected_target_pubkey,
@@ -328,31 +328,31 @@ pub fn parse_and_verify_recursive_response_at(
 /// Output of [`RendezvousRequestBuilder::build_request`].
 #[derive(Debug)]
 pub struct BuiltRequest {
-    /// Decoded form — useful для tests / logging.
+    /// Decoded form — useful for tests / logging.
     pub payload: RequestEphemeralEndpointPayload,
-    /// Wire bytes ready к ship — Slice 5 transport layer takes these
-    /// и wraps them в а `SessionMsg::RequestEphemeralEndpoint` frame.
+    /// Wire bytes ready to ship — Slice 5 transport layer takes these
+    /// and wraps them in a `SessionMsg::RequestEphemeralEndpoint` frame.
     pub wire_bytes: Vec<u8>,
     /// Number of PoW attempts the miner burned.  Surfaced for metric/
     /// log purposes.
     pub mining_attempts: u64,
 }
 
-/// Decode + verify а response payload.  Returns а ready-к-dial
+/// Decode + verify a response payload.  Returns a ready-to-dial
 /// [`EphemeralEndpoint`] on success.  Performs the full 5-step verify
-/// (sig, identity binding, requester echo, TTL) от
+/// (sig, identity binding, requester echo, TTL) from
 /// [`veil_proto::rendezvous::verify_ephemeral_endpoint_response`].
 ///
 /// `expected_target_pubkey` is the initiator's a-priori knowledge of
-/// the target's Ed25519 identity pubkey — typically learnt from а
+/// the target's Ed25519 identity pubkey — typically learnt from a
 /// previous handshake, DHT lookup, or bootstrap invite.  Caller MUST
-/// supply it; signature verify alone is insufficient (а malicious
-/// mediator could forge а response under а DIFFERENT key claiming к
+/// supply it; signature verify alone is insufficient (a malicious
+/// mediator could forge a response under a DIFFERENT key claiming to
 /// be the target).
 ///
 /// `own_requester_pubkey` MUST match the initiator's own pubkey —
-/// usually `builder.requester_pubkey()`.  Prevents а malicious mediator
-/// от replaying а response originally signed для а different requester.
+/// usually `builder.requester_pubkey()`.  Prevents a malicious mediator
+/// from replaying a response originally signed for a different requester.
 pub fn parse_and_verify_response(
     bytes: &[u8],
     expected_target_pubkey: &[u8; 32],
@@ -366,7 +366,7 @@ pub fn parse_and_verify_response(
     )
 }
 
-/// Test-hook variant что accepts an explicit `now_unix`.  Production
+/// Test-hook variant that accepts an explicit `now_unix`.  Production
 /// callers use [`parse_and_verify_response`] which calls
 /// `SystemTime::now`.
 pub fn parse_and_verify_response_at(
@@ -449,7 +449,7 @@ mod tests {
             .unwrap();
         assert!(built.mining_attempts >= 1);
         assert_eq!(built.payload.pow_difficulty, MIN_POW_DIFFICULTY);
-        // Encoded form decodes back к the same payload.
+        // Encoded form decodes back to the same payload.
         let decoded = RequestEphemeralEndpointPayload::decode(&built.wire_bytes).unwrap();
         assert_eq!(decoded, built.payload);
     }
@@ -465,7 +465,7 @@ mod tests {
         // target's min_difficulty matches what we mined for.
         let now = now_unix();
         verify_request_ephemeral_endpoint(&built.payload, MIN_POW_DIFFICULTY, now)
-            .expect("freshly-built request должен verify");
+            .expect("freshly-built request must verify");
     }
 
     // ── Difficulty bounds ─────────────────────────────────────────
@@ -494,10 +494,10 @@ mod tests {
 
     #[test]
     fn progress_callback_fires_during_mining() {
-        // Use moderately-hard difficulty so the miner has к take
+        // Use moderately-hard difficulty so the miner has to take
         // enough attempts that the default cadence (65_536) fires at
         // least once.  At difficulty 16 expect ~65K attempts on
-        // average, ample к trigger а call.
+        // average, ample to trigger a call.
         let (target_nid, _, _) = target_identity(9);
         let builder = RendezvousRequestBuilder::new(test_sk(10));
         let counter = Arc::new(AtomicU64::new(0));
@@ -508,14 +508,14 @@ mod tests {
         let _built = builder
             .build_request(target_nid, 16, Some(progress))
             .unwrap();
-        // Не assert exact count — random PoW could mine quickly OR
+        // Not assert exact count — random PoW could mine quickly OR
         // many cycles.  Just assert at least the callback machinery
         // works.
         let observed = counter.load(Ordering::Relaxed);
         // Some attempts must have been recorded if mining took more
         // than `DEFAULT_PROGRESS_EVERY` iterations.  In rare cases
-        // mining finishes < 65K attempts и the counter stays 0 — that's
-        // valid и does not indicate а failure of the progress path.
+        // mining finishes < 65K attempts and the counter stays 0 — that's
+        // valid and does not indicate a failure of the progress path.
         assert!(
             observed == 0 || observed >= RendezvousRequestBuilder::DEFAULT_PROGRESS_EVERY,
             "observed {observed} should be 0 OR >= default cadence",
@@ -530,8 +530,8 @@ mod tests {
         let _built = builder
             .build_request(target_nid, 16, Some(progress.clone()))
             .unwrap();
-        // AtomicProgress is а ProgressCallback — verify it exposed
-        // through current() и matched what mining would have set.
+        // AtomicProgress is a ProgressCallback — verify it exposed
+        // through current() and matched what mining would have set.
         let observed = progress.current();
         assert!(observed == 0 || observed >= RendezvousRequestBuilder::DEFAULT_PROGRESS_EVERY,);
     }
@@ -585,7 +585,7 @@ mod tests {
             "obfs4-tcp://example.com:51234",
             now_unix() + 300,
         );
-        // Use а DIFFERENT pubkey as the expected target.
+        // Use a DIFFERENT pubkey as the expected target.
         let mut wrong_pk = target_pk;
         wrong_pk[0] ^= 0x01;
         let err = parse_and_verify_response(&bytes, &wrong_pk, &requester_pk).unwrap_err();
@@ -603,7 +603,7 @@ mod tests {
             "obfs4-tcp://example.com:51234",
             now_unix() + 300,
         );
-        // Response signed для A, но we're trying к verify as B.
+        // Response signed for A, but we're trying to verify as B.
         let err = parse_and_verify_response(&bytes, &target_pk, &requester_b_pk).unwrap_err();
         assert!(matches!(err, ParseError::Verify(_)));
     }
@@ -658,10 +658,10 @@ mod tests {
 
     #[test]
     fn full_client_round_trip_via_proto() {
-        // Simulate: initiator builds request → ships к target → target
+        // Simulate: initiator builds request → ships to target → target
         // signs response → initiator parses + verifies.  Uses ONLY the
         // public surfaces of this client module + the proto crate (no
-        // veilcore controller — что's covered separately in
+        // veilcore controller — that's covered separately in
         // veilcore::node::rendezvous tests).
         let (target_nid, target_sk, target_pk) = target_identity(30);
         let requester_sk = test_sk(31);
@@ -677,7 +677,7 @@ mod tests {
         let now = now_unix();
         verify_request_ephemeral_endpoint(&built.payload, MIN_POW_DIFFICULTY, now).unwrap();
 
-        // Target signs а response.
+        // Target signs a response.
         let psk = [0x99u8; 32];
         let response = sign_ephemeral_endpoint_response(
             target_nid,
@@ -777,7 +777,7 @@ mod tests {
         assert_eq!(envelope.ttl, 5);
     }
 
-    /// Helper for Slice 6c response tests: build а signed
+    /// Helper for Slice 6c response tests: build a signed
     /// `RecursiveResponsePayload` mirroring what the dispatcher arm
     /// would emit, then run the client's parse + verify.
     fn build_signed_recursive_response(
@@ -843,7 +843,7 @@ mod tests {
             "obfs4-tcp://example.com:51234",
             now_unix() + 300,
         );
-        // Caller expected а DIFFERENT query_id.
+        // Caller expected a DIFFERENT query_id.
         let expected_id = [0xBBu8; 16];
         let err =
             parse_and_verify_recursive_response(&bytes, &expected_id, &target_pk, &requester_pk)
@@ -862,7 +862,7 @@ mod tests {
             "obfs4-tcp://example.com:51234",
             now_unix() + 300,
         );
-        // Pretend we expected а different target.
+        // Pretend we expected a different target.
         let mut wrong_pk = target_pk;
         wrong_pk[0] ^= 0x01;
         let err = parse_and_verify_recursive_response(&bytes, &query_id, &wrong_pk, &requester_pk)
@@ -881,7 +881,7 @@ mod tests {
             "obfs4-tcp://example.com:51234",
             now_unix() + 300,
         );
-        // Flip а bit в the outer sig (last byte).
+        // Flip a bit in the outer sig (last byte).
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
         let err = parse_and_verify_recursive_response(&bytes, &query_id, &target_pk, &requester_pk)
@@ -891,8 +891,8 @@ mod tests {
 
     #[test]
     fn parse_recursive_response_rejects_inner_for_wrong_requester() {
-        // Response signed for requester_A; B tries к verify under
-        // its own pubkey.  Outer sig validates но inner echo-check
+        // Response signed for requester_A; B tries to verify under
+        // its own pubkey.  Outer sig validates but inner echo-check
         // fails.
         let requester_a_pk = test_sk(110).verifying_key().to_bytes();
         let requester_b_pk = test_sk(111).verifying_key().to_bytes();

@@ -103,11 +103,11 @@ EOF
 
         # Metrics block (only if METRICS_PORT is set).
         #
-        # Safe-default policy (Phase 6.50.b): generate а random
-        # `auth_token` if the operator opted into а non-loopback bind.
+        # Safe-default policy (Phase 6.50.b): generate a random
+        # `auth_token` if the operator opted into a non-loopback bind.
         # Otherwise the metrics endpoint would expose role / session /
-        # mailbox / DHT telemetry to anyone who can route к the port.
-        # Loopback-only deploys (most production setups behind а reverse
+        # mailbox / DHT telemetry to anyone who can route to the port.
+        # Loopback-only deploys (most production setups behind a reverse
         # proxy) skip the token.  Operator can override by setting
         # METRICS_BIND=127.0.0.1 / ::1 OR pre-populating METRICS_TOKEN.
         if [ -n "${METRICS_PORT}" ]; then

@@ -528,13 +528,13 @@ impl FrameDispatcher {
         }
     }
 
-    /// Validate а STORE-payload `value` against the per-magic authenticator
-    /// policy.  Used by both the direct `DiscoveryMsg::Store` arm и the
-    /// `RecursiveQuery::STORE` arm в routing.rs so the recursive plane
+    /// Validate a STORE-payload `value` against the per-magic authenticator
+    /// policy.  Used by both the direct `DiscoveryMsg::Store` arm and the
+    /// `RecursiveQuery::STORE` arm in routing.rs so the recursive plane
     /// cannot bypass signed-store invariants.
     ///
     /// Direct STORE arms its own "signed ed25519_pubkey + sig (BLAKE3(pk)
-    /// == key)" и "unsigned-self-key (key == BLAKE3(peer_id))" shortcuts
+    /// == key)" and "unsigned-self-key (key == BLAKE3(peer_id))" shortcuts
     /// BEFORE calling this — those two cases are inapplicable on the
     /// recursive forward path (the recursive payload carries no
     /// authenticator field; `peer_id` is the forwarder, not the origin).
@@ -549,8 +549,8 @@ impl FrameDispatcher {
     /// * `MC`  — MlKemKeyCert (decode + identity_write_quota)
     ///
     /// Anything else → `Violation`.  `Err(DispatchResult::NoResponse)` is
-    /// returned when the identity-write quota refuses the write — а quota
-    /// hit isn't а protocol violation, just а silent drop.
+    /// returned when the identity-write quota refuses the write — a quota
+    /// hit isn't a protocol violation, just a silent drop.
     #[allow(clippy::result_large_err)]
     pub fn validate_store_value_by_magic(
         &self,
@@ -569,10 +569,10 @@ impl FrameDispatcher {
             // Signed operator bootstrap bundle (cf. `veil-bootstrap::
             // signed_bundle`).  Structural decode catches obvious garbage;
             // full Ed25519 / Falcon verification + issuer-pk pinning
-            // happens на the resolver path (callers of
+            // happens on the resolver path (callers of
             // `dht.get_local(bootstrap_bundle_dht_key())` must run
             // `verify_signed_bundle`).  Per-peer dht_quota bounds spam
-            // independent of issuer; SB isn't tied к sovereign identity,
+            // independent of issuer; SB isn't tied to sovereign identity,
             // so no `identity_write_quota` gate applies.
             if veil_bootstrap::decode_signed_bundle(payload_value).is_err() {
                 return Err(DispatchResult::Violation(
@@ -705,7 +705,7 @@ impl FrameDispatcher {
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE // audit cycle-5 N1-residue
         } else {
             return Err(DispatchResult::Violation(
-                "Store: unrecognised payload magic — recursive plane requires а signed-record magic prefix"
+                "Store: unrecognised payload magic — recursive plane requires a signed-record magic prefix"
                     .to_owned(),
             ));
         };

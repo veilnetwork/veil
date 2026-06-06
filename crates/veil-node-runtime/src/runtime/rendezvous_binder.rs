@@ -1,15 +1,15 @@
-//! Production `BindClosure` для the PoW-Gated Rendezvous controller —
+//! Production `BindClosure` for the PoW-Gated Rendezvous controller —
 //! Slice 5c of the epic ([`docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`]).
 //!
-//! Replaces the stub binder shipped в Slice 5b (which always returned
-//! `BindFailed`) с the real wiring що:
+//! Replaces the stub binder shipped in Slice 5b (which always returned
+//! `BindFailed`) with the real wiring that:
 //!
-//! 1. Clones the base [`TransportContext`] и sets `obfs4_psk` к the
+//! 1. Clones the base [`TransportContext`] and sets `obfs4_psk` to the
 //!    per-request PSK so the obfs4-tcp listener handshakes against
 //!    the requester's expected secret.
-//! 2. Calls `TransportRegistry::bind(uri, ctx).await` к get the
+//! 2. Calls `TransportRegistry::bind(uri, ctx).await` to get the
 //!    actual `Box<dyn TransportListener>`.
-//! 3. Spawns а dedicated short-lived accept task that mirrors the
+//! 3. Spawns a dedicated short-lived accept task that mirrors the
 //!    Phase 5f accept-loop pattern (scanner-shield ban check, per-
 //!    spawn inbound-handshake semaphore, full `spawn_inbound_session`
 //!    pipeline) but bounded by [`OnDemandLifecycle`] (TTL deadline +
@@ -17,7 +17,7 @@
 //!
 //! When the accept task exits — TTL reached OR all `max_accepts`
 //! sessions accepted OR shutdown signalled — the `Box<dyn
-//! TransportListener>` drops, freeing the port back к the kernel.
+//! TransportListener>` drops, freeing the port back to the kernel.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -39,10 +39,10 @@ use super::{
 
 // ── AcceptBundle — captured Arcs needed for spawn_inbound_session ───
 
-/// Cloneable bundle of all `Arc`s + values needed к build а
-/// [`SessionRuntimeContext`] и spawn an inbound session.  Construction
-/// happens once в `wire_rendezvous_controller_for_listen`; each
-/// accepted connection clones (cheap — all `Arc`s) и calls
+/// Cloneable bundle of all `Arc`s + values needed to build a
+/// [`SessionRuntimeContext`] and spawn an inbound session.  Construction
+/// happens once in `wire_rendezvous_controller_for_listen`; each
+/// accepted connection clones (cheap — all `Arc`s) and calls
 /// [`spawn_inbound_session`].
 #[derive(Clone)]
 pub struct AcceptBundle {
@@ -57,7 +57,7 @@ pub struct AcceptBundle {
 // ── Binder ──────────────────────────────────────────────────────────
 
 /// Production `BindClosure` implementation.  Captures the bundle of
-/// Arcs needed к bind а listener + spawn its accept task.
+/// Arcs needed to bind a listener + spawn its accept task.
 pub struct RendezvousBinder {
     pub registry: Arc<TransportRegistry>,
     pub base_ctx: Arc<TransportContext>,
@@ -85,7 +85,7 @@ impl BindClosure for RendezvousBinder {
                 .await
                 .map_err(|e| format!("rendezvous binder: bind {uri}: {e}"))?;
             let local_addr = listener.local_addr();
-            // Spawn the bounded accept task — owns the listener для
+            // Spawn the bounded accept task — owns the listener for
             // its lifetime, drops on exit.
             tokio::spawn(run_on_demand_accept_task(
                 listener,
@@ -101,22 +101,22 @@ impl BindClosure for RendezvousBinder {
 // ── Bounded accept task ─────────────────────────────────────────────
 
 /// Accept-loop wrapper bounded by [`OnDemandLifecycle`].  Mirrors the
-/// Phase 5f accept-loop pattern в `services.rs::spawn_listeners` (scanner-
+/// Phase 5f accept-loop pattern in `services.rs::spawn_listeners` (scanner-
 /// shield check + accept-waiter dispatch + inbound-handshake semaphore
 /// + `spawn_inbound_session` pipeline) but exits cleanly on TTL OR
-///   после `max_accepts` sessions accepted.
+///   after `max_accepts` sessions accepted.
 ///
 /// Per-accept flow:
 /// 1. Check `lifecycle.should_exit()` up-front; bail if exhausted.
-/// 2. `tokio::select!` between `listener.accept()` и
+/// 2. `tokio::select!` between `listener.accept()` and
 ///    `lifecycle.await_ttl_or_shutdown()`.  Either resolves → break.
 /// 3. On accept: scanner-shield ban check (drop if IP banned).
-/// 4. Pop а pending-accept waiter если any (debug-CLI accept hooks).
+/// 4. Pop a pending-accept waiter if any (debug-CLI accept hooks).
 /// 5. Try-acquire inbound-handshake semaphore permit; drop connection
 ///    if cap reached.
-/// 6. Call [`spawn_inbound_session`] с а freshly-cloned
+/// 6. Call [`spawn_inbound_session`] with a freshly-cloned
 ///    [`SessionRuntimeContext`].
-/// 7. `lifecycle.note_accept()` — decrement budget; break если returns 1.
+/// 7. `lifecycle.note_accept()` — decrement budget; break if returns 1.
 async fn run_on_demand_accept_task(
     listener: Box<dyn TransportListener>,
     lifecycle: Arc<OnDemandLifecycle>,
@@ -155,8 +155,8 @@ async fn run_on_demand_accept_task(
             }
             accepted = listener.accept() => match accepted {
                 Ok(connection) => {
-                    // Scanner-shield: drop а banned-IP connection
-                    // without burning а note_accept.  Mirrors the
+                    // Scanner-shield: drop a banned-IP connection
+                    // without burning a note_accept.  Mirrors the
                     // Phase 5f accept-loop check.
                     let banned_ip = connection
                         .peer_meta()
@@ -173,8 +173,8 @@ async fn run_on_demand_accept_task(
                         drop(connection);
                         continue;
                     }
-                    // Pop а pending-accept waiter if any (debug-CLI
-                    // path; the waiter consumes the connection и
+                    // Pop a pending-accept waiter if any (debug-CLI
+                    // path; the waiter consumes the connection and
                     // we skip session-spawn).
                     let connection = if let Some(waiter) =
                         pop_accept_waiter(&bundle.pending_accepts, listen_id)
@@ -195,15 +195,15 @@ async fn run_on_demand_accept_task(
                     } else {
                         connection
                     };
-                    // Reserve а note_accept slot up-front так и
+                    // Reserve a note_accept slot up-front so
                     // capacity-dropped connections still count
                     // against the budget (DoS-resistance: keep the
-                    // lifecycle clock running even на dropped
+                    // lifecycle clock running even on dropped
                     // attempts).  Race-safe: returns prev count.
                     let prev = lifecycle.note_accept();
                     if prev == 0 {
                         // Budget exhausted between should_exit check
-                        // и here — bail.
+                        // and here — bail.
                         drop(connection);
                         break;
                     }
@@ -234,7 +234,7 @@ async fn run_on_demand_accept_task(
                         },
                         connection,
                     );
-                    // Wrap the handle к keep the permit alive for the
+                    // Wrap the handle to keep the permit alive for the
                     // session's lifetime.  Same idiom as Phase 5f.
                     let wrapped = tokio::spawn(async move {
                         let _permit = permit;
@@ -258,8 +258,8 @@ async fn run_on_demand_accept_task(
                             "listen_id={listen_id} error={err}",
                         ),
                     );
-                    // Bail на persistent accept-error rather than spinning
-                    // — the listener is likely в а bad state.
+                    // Bail on persistent accept-error rather than spinning
+                    // — the listener is likely in a bad state.
                     break;
                 }
             }
@@ -275,10 +275,10 @@ async fn run_on_demand_accept_task(
     );
 }
 
-// Slice 5c's binder is unit-tested transitively через the existing
-// rendezvous-controller test suite (Slice 3 uses а RecordingBinder
+// Slice 5c's binder is unit-tested transitively through the existing
+// rendezvous-controller test suite (Slice 3 uses a RecordingBinder
 // that captures bind calls).  Live `registry.bind()` + accept-task
-// integration tests require а full NodeRuntime fixture + а real
-// session-handshake counterparty — shipped в Slice 8 (integration
+// integration tests require a full NodeRuntime fixture + a real
+// session-handshake counterparty — shipped in Slice 8 (integration
 // tests, see PLAN_POW_GATED_RENDEZVOUS.md).  Until then the cargo
 // check + workspace test pass is the regression protection.

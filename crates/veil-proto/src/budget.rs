@@ -88,17 +88,17 @@ pub const SESSION_TICKET_MAX_AGE_SECS: u64 = 7_200; // 2 hours
 /// TLV type byte for a resume_ticket extension in `HelloPayload`.
 pub const HELLO_TLV_RESUME_TICKET: u8 = 0x01;
 
-/// TLV type byte для а private-veil-network membership cert
-/// extension в `HelloPayload`. Carries the bincode-encoded
+/// TLV type byte for a private-veil-network membership cert
+/// extension in `HelloPayload`. Carries the bincode-encoded
 /// `veil_types::MembershipCert` blob signed by the network owner.
-/// Receivers in `mode = private` reject HELLO frames without а valid
-/// cert; receivers in `mode = public` ignore the TLV для forward
-/// compatibility с private-mode peers connecting к public bootstrap.
+/// Receivers in `mode = private` reject HELLO frames without a valid
+/// cert; receivers in `mode = public` ignore the TLV for forward
+/// compatibility with private-mode peers connecting to public bootstrap.
 pub const HELLO_TLV_MEMBERSHIP_CERT: u8 = 0x02;
 
 /// Upper bound on encoded `MembershipCert` blob size (defense-in-depth
-/// against а malicious HELLO inflating the TLV). Real certs serialise
-/// к ~150-200 bytes (Ed25519 sig = 64 bytes; Falcon = 666 bytes; plus
+/// against a malicious HELLO inflating the TLV). Real certs serialise
+/// to ~150-200 bytes (Ed25519 sig = 64 bytes; Falcon = 666 bytes; plus
 /// fixed fields). Cap matches the highest expected algo + headroom.
 pub const MAX_MEMBERSHIP_CERT_SIZE: usize = 2048;
 
@@ -242,28 +242,28 @@ pub const MAX_SESSIONS_PER_IP: usize = 32;
 
 /// Maximum number of entries in the `peer_pubkeys` cache.
 ///
-/// o: lowered 65_536 → 1024. Previous cap was sized для
+/// o: lowered 65_536 → 1024. Previous cap was sized for
 /// large-deployment servers; under chaos-ban-driven peer churn the
-/// HashMap'я internal storage grew к full capacity (~5 MB per table)
-/// и `reserve_rehash` doubling temporarily held twice that. jeprof'ом
-/// показано: 200 MiB live в `cache_peer_handshake_state` → reserve_rehash
-/// path под chaos-only load. On а 128-MB device target with realistic
+/// HashMap's internal storage grew to full capacity (~5 MB per table)
+/// and `reserve_rehash` doubling temporarily held twice that. jeprof
+/// showed: 200 MiB live in `cache_peer_handshake_state` → reserve_rehash
+/// path under chaos-only load. On a 128-MB device target with realistic
 /// peer count (50-200 active), 1024 entries ≈ 80 KiB is plenty.
 pub const MAX_PEER_PUBKEYS_CACHE: usize = 1_024;
 
 /// cap for `peer_sovereign_identities` LRU cache.
 ///
 /// o: lowered 4_096 → 256. Each ValidatedIdentity is
-/// ~1-2 KiB; 256 × 1.5 KiB = 384 KiB worst-case. Sized for а typical
+/// ~1-2 KiB; 256 × 1.5 KiB = 384 KiB worst-case. Sized for a typical
 /// device's address book — sovereign identity churn beyond this hits
-/// LRU rather than holding а full 8 MiB cache.
+/// LRU rather than holding a full 8 MiB cache.
 pub const MAX_PEER_SOVEREIGN_IDENTITIES: usize = 256;
 
 /// cap for `per_session_mlkem_dk` LRU cache.
 ///
-/// o: lowered 4_096 → 256. Tied к session count, not
-/// historical peer count. Live session ceiling в `SessionConfig` is
-/// typically <100; 256 gives comfortable headroom без paying RSS.
+/// o: lowered 4_096 → 256. Tied to session count, not
+/// historical peer count. Live session ceiling in `SessionConfig` is
+/// typically <100; 256 gives comfortable headroom without paying RSS.
 pub const MAX_PER_SESSION_MLKEM_DK: usize = 256;
 
 /// maximum application-payload size accepted by
@@ -280,14 +280,14 @@ pub const MAX_APP_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// Each entry is `peer_id ([u8;32])` → `(ek_bytes (~1184 B), Instant)`.
 /// o: lowered 4096 → 512 (612 KiB worst-case). Even under
 /// peer churn, 512 entries comfortably covers any device's active address
-/// book; new peers re-fetch ek через а cheap handshake-time exchange.
+/// book; new peers re-fetch ek through a cheap handshake-time exchange.
 pub const MAX_PEER_MLKEM_CACHE: usize = 512;
 
 /// Maximum number of Vivaldi coordinates cached for known peers.
 ///
 /// o: lowered 32_768 → 1024 (~56 KiB worst-case). Coordinates
-/// only benefit RTT-aware routing; 1024 entries cover а meshy network с
-/// dense connectivity, beyond which routes can fall back к hop-count
+/// only benefit RTT-aware routing; 1024 entries cover a meshy network with
+/// dense connectivity, beyond which routes can fall back to hop-count
 /// without measurable user-visible degradation.
 pub const MAX_PEER_VIVALDI_CACHE: usize = 1_024;
 
@@ -373,10 +373,10 @@ pub const MAX_ROUTE_ANNOUNCE_AGE_SECS: u32 = 300; // 5 minutes
 /// **Gossip tier** — see [`crate::time_validity::GOSSIP_SKEW_SECS`].
 /// Announcements with `timestamp > now + skew` are dropped to prevent
 /// injection of long-lived "future" routes.  Tighter than the
-/// Interactive tier (60 s) because а 30-second-old announce is already
-/// obsolete на а busy mesh.
+/// Interactive tier (60 s) because a 30-second-old announce is already
+/// obsolete on a busy mesh.
 ///
-/// `u32` (not `u64`) для wire-format compactness.
+/// `u32` (not `u64`) for wire-format compactness.
 pub const MAX_ROUTE_ANNOUNCE_SKEW_SECS: u32 = crate::time_validity::GOSSIP_SKEW_SECS as u32; // 30 seconds
 
 /// Maximum byte length of a single transport address string (limited by u8 length prefix).
@@ -388,7 +388,7 @@ pub const MAX_NODES_PER_RESPONSE: usize = 32;
 /// Maximum allowed clock skew for `DeliveryEnvelope::created_at`.
 ///
 /// **Wire tier** — see [`crate::time_validity::WIRE_SKEW_SECS`].
-/// **Wire-stable v1** — changing this requires а wire-format version
+/// **Wire-stable v1** — changing this requires a wire-format version
 /// bump (cross-version verifier compat).
 ///
 /// Envelopes with `created_at > now + MAX_CLOCK_SKEW_SECS` are rejected by
@@ -438,9 +438,9 @@ pub const REKEY_TIME_THRESHOLD_SECS: u64 = 32 * 24 * 3600;
 /// be decrypted with the new decapsulation key.
 ///
 /// Raised 100 MiB → 128 GiB to match `REKEY_BYTES_THRESHOLD`. At high-throughput
-/// workloads (ogate tunnel @ 540 Mbps = 67 MB/s) the 100-MiB threshold fired а
+/// workloads (ogate tunnel @ 540 Mbps = 67 MB/s) the 100-MiB threshold fired a
 /// rekey every ~1.5 s, burning Ed25519 signing CPU on every cycle without any
-/// real forward-secrecy benefit на such short scales (the `MLKEM_REKEY_TIME_THRESHOLD_SECS = 1h`
+/// real forward-secrecy benefit at such short scales (the `MLKEM_REKEY_TIME_THRESHOLD_SECS = 1h`
 /// cap already provides time-based rotation). 128 GiB now matches the session-rekey
 /// cadence — operators chasing tighter FS lower both thresholds together in
 /// `node.toml`.
@@ -903,19 +903,19 @@ pub const MAX_TRANSFERS_CONCURRENT: usize = 256;
 /// Bounded capacity of the per-IPC-client delivery channel (frames queued
 /// for an application that has not yet read its socket).
 ///
-/// Phase E27 (2026-05-22): raised 64 → 1024.  Under iperf3-через-ogate
-/// testnet с E27 batching, the 64-cap was hit ~5.6 K times in 8 s и dropped
+/// Phase E27 (2026-05-22): raised 64 → 1024.  Under iperf3-through-ogate
+/// testnet with E27 batching, the 64-cap was hit ~5.6 K times in 8 s and dropped
 /// 34 % of forwarded packets (`veil_ipc_delivery_drops_total` confirmed),
-/// collapsing iperf3 TCP к 30 Kbps.  Each batch envelope is ≤ 60 KiB; 1024
+/// collapsing iperf3 TCP to 30 Kbps.  Each batch envelope is ≤ 60 KiB; 1024
 /// slots = ~60 MiB worst-case per client, well within the budget that
-/// previously caused the 4096 → 64 cut (which targeted а 60-KiB chat frame
-/// rate of 200 msg/s = ~12 MiB/s steady backlog, NOT а burst of much-larger
+/// previously caused the 4096 → 64 cut (which targeted a 60-KiB chat frame
+/// rate of 200 msg/s = ~12 MiB/s steady backlog, NOT a burst of much-larger
 /// envelopes).  1024 buys ~1 s of buffering — comfortable head-of-line
 /// margin for backpressure-to-app to still kick in correctly.
 ///
 /// Historical note:  f: lowered from 4096 (~256 MiB worst-case) to 64
 /// under chat-load (200 msg/sec × 60 KiB chat_node frames).  See git log
-/// для full rationale.
+/// for full rationale.
 pub const DELIVERY_CHANNEL_CAP: usize = 1024;
 
 /// Bounded capacity of the per-proxy-stream data channel (APP_DATA chunks

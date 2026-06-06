@@ -10,8 +10,8 @@
 // ─────────────────────────────────────────────────────────────────────
 // Push wake-HMAC end-to-end — consumer FCM/APNs handler pattern
 // (Epic 489.10).  The demo app itself does NOT bundle firebase_messaging
-// (см. push.dart rationale — keeps the plugin dep-light), so this is а
-// reference comment block rather than live code.  А real consumer wires
+// (see push.dart rationale — keeps the plugin dep-light), so this is a
+// reference comment block rather than live code.  A real consumer wires
 // it like so:
 //
 // ```dart
@@ -19,15 +19,15 @@
 // import 'dart:convert' show base64Decode;
 // import 'package:veil_flutter/veil_flutter.dart';
 //
-// // `client` is the app's long-lived VeilClient (main isolate).  In а
-// // pure FCM *background* isolate it is unreachable — there you'd open а
-// // fresh client from the saved socket path (см. VeilPush.drainMailbox).
+// // `client` is the app's long-lived VeilClient (main isolate).  In a
+// // pure FCM *background* isolate it is unreachable — there you'd open a
+// // fresh client from the saved socket path (see VeilPush.drainMailbox).
 // Future<void> _onPush(RemoteMessage message) async {
 //   // 72-byte wake payload rides base64 under push data key "w":
 //   //   FCM  → message.data["w"]
 //   //   APNs → top-level "w"
 //   final encoded = message.data['w'];
-//   if (encoded == null) return; // not а wake-HMAC push — ignore.
+//   if (encoded == null) return; // not a wake-HMAC push — ignore.
 //   final wakePayload = base64Decode(encoded);
 //
 //   // Key persisted at onboarding via VeilPush.storeWakeHmacKey
@@ -109,7 +109,7 @@ class _HomeState extends State<_Home> {
       final c = await VeilClient.connect(_socketPath);
       final id = await c.nodeId();
       _eventSub = c.events().listen(_onEvent);
-      // Epic 489.6: pin the process to foreground via а persistent
+      // Epic 489.6: pin the process to foreground via a persistent
       // notification — without this, Android kills our daemon after
       // ~5-15 min in background.  No-op on iOS / desktop.
       await VeilBackground.start(
@@ -150,7 +150,7 @@ class _HomeState extends State<_Home> {
     try {
       await c.setBackgroundMode(mode);
       // Optimistic — the bus will also publish MOBILE_TIER_CHANGED; if it
-      // races us the listener flips state идентично.
+      // races us the listener flips state identically.
       setState(() => _tier = mode);
     } catch (e) {
       setState(() => _err = e.toString());

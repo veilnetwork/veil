@@ -37,7 +37,7 @@ use super::tls_boring::connect_tls_client_stream;
 /// the inline WS/WSS server handshake (TLS handshake + WebSocket
 /// upgrade).  Both run inside the `accept()` future before the runtime
 /// accept-loop takes the next connection, so an unbounded read here lets
-/// а silent client wedge the listener.  Mirrors the obfs4/tls listeners.
+/// a silent client wedge the listener.  Mirrors the obfs4/tls listeners.
 const WS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Plain `ws://` `Transport` — binary WebSocket framing over TCP, used for
@@ -369,9 +369,9 @@ fn make_path_callback(expected_path: String) -> PathCallback {
         if expected_path == "/" || req.uri().path() == expected_path {
             Ok(resp)
         } else {
-            // SAFETY — Response::builder с known-valid
-            // status (constant) и Some-body cannot fail к build;.unwrap
-            // here is provably-infallible. Use.expect для self-
+            // SAFETY — Response::builder with known-valid
+            // status (constant) and Some-body cannot fail to build;.unwrap
+            // here is provably-infallible. Use.expect for self-
             // documenting the invariant.
             Err(http::Response::builder()
                 .status(http::StatusCode::NOT_FOUND)
@@ -420,7 +420,7 @@ async fn accept_wss_connection(
 ) -> Result<Box<dyn TransportConnection>> {
     let local_addr = stream.local_addr().ok();
     // SECURITY (audit 2026-05-29): bound the TLS handshake AND the WS
-    // upgrade — either stage could otherwise hang on а silent client.
+    // upgrade — either stage could otherwise hang on a silent client.
     let tls_stream: ServerTlsStream<TcpStream> =
         tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
             .await

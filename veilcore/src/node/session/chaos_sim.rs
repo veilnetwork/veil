@@ -1,31 +1,31 @@
 //! chaos-sim harness — deterministic adversarial stress
-//! framework для `SessionRunner::run`.
+//! framework for `SessionRunner::run`.
 //!
-//! **Purpose:** replace 1-week real-world testnet soak с compressed
-//! deterministic random-event sequences. Each test seed produces а
-//! reproducible event ladder; failures bisect к а specific seed.
-//! Designed для ship-blocking gate (a.k.a. "did the slice break
+//! **Purpose:** replace 1-week real-world testnet soak with compressed
+//! deterministic random-event sequences. Each test seed produces a
+//! reproducible event ladder; failures bisect to a specific seed.
+//! Designed for ship-blocking gate (a.k.a. "did the slice break
 //! anything") rather than baseline performance measurement.
 //!
 //! ## What it covers
 //! * Event-sequence randomisation: peer-side Ping, peer-init Rekey
-//!   (collisions), pause-к-advance-timers. All composable из а
+//!   (collisions), pause-to-advance-timers. All composable from a
 //!   seeded xorshift64 RNG so failing runs reproduce verbatim.
-//! * Cipher-counter coherence: each event advances/decrypts с the
-//!   correct cipher (OLD vs NEW post-rekey); harness panics если а
+//! * Cipher-counter coherence: each event advances/decrypts with the
+//!   correct cipher (OLD vs NEW post-rekey); harness panics if a
 //!   real frame fails decryption (catches FSM corruption).
 //! * Invariant assertions: zero `session.violation` events, rekey
 //!   round-trips balanced, decrypt failures surface immediately.
 //!
 //! ## What it doesn't cover (yet)
-//! * Two real `SessionRunner` instances talking к each other — the
-//!   harness uses а fake-peer driver pattern same as the gate tests.
+//! * Two real `SessionRunner` instances talking to each other — the
+//!   harness uses a fake-peer driver pattern same as the gate tests.
 //!   Adding peer-to-peer would catch synchronisation races but
-//!   doubles complexity; deferred к V2.
+//!   doubles complexity; deferred to V2.
 //! * Network conditions (packet loss, RTT jitter): the duplex IO is
-//!   loss-free. V2 wraps duplex с а chaos shim для these.
+//!   loss-free. V2 wraps duplex with a chaos shim for these.
 //! * Long-tail timing bugs needing minutes of real time: V2 uses
-//!   `tokio::time::pause` + `advance` для compressed-time tests.
+//!   `tokio::time::pause` + `advance` for compressed-time tests.
 //!
 //! ## Running
 //! ```text
@@ -58,8 +58,8 @@ use crate::transport::BoxIoStream;
 
 // ── Tiny seeded RNG (xorshift64) ─────────────────────────────────────────────
 //
-// `rand_chacha` isn't а dependency и we don't want к add one just for
-// the harness. xorshift64 is sufficient для test-event distribution:
+// `rand_chacha` isn't a dependency and we don't want to add one just for
+// the harness. xorshift64 is sufficient for test-event distribution:
 // passes Diehard, period 2^64-1, fast enough that RNG cost doesn't
 // dominate the harness.
 
@@ -90,29 +90,29 @@ impl SimpleRng {
 
 // ── Event vocabulary ─────────────────────────────────────────────────────────
 
-/// One random event the harness can inject into а running session.
-/// Seeded RNG produces а deterministic sequence; failing seeds
-/// reproduce verbatim. Not all events are equally weighted в
+/// One random event the harness can inject into a running session.
+/// Seeded RNG produces a deterministic sequence; failing seeds
+/// reproduce verbatim. Not all events are equally weighted in
 /// `sample_event` below — Ping is the most common (matches real
-/// traffic mix), exotic events ара rare.
+/// traffic mix), exotic events are rare.
 #[derive(Debug, Clone, Copy)]
 enum ChaosEvent {
-    /// Fake peer sends а Ping. Server should reply с Pong.
+    /// Fake peer sends a Ping. Server should reply with Pong.
     Ping,
-    /// Fake peer initiates а rekey by sending RekeyInit. May
-    /// collide с server's own pending init (if server crossed
-    /// threshold concurrently — won't happen с the harness's
+    /// Fake peer initiates a rekey by sending RekeyInit. May
+    /// collide with server's own pending init (if server crossed
+    /// threshold concurrently — won't happen with the harness's
     /// `rekey_bytes_threshold = u64::MAX` config, but the responder-
     /// path itself is exercised which catches FSM corruption).
     PeerInitRekey,
-    /// Sleep `n` ms к advance the runner's idle / battery / cover
-    /// timers; bounded к keep stress runs short.
+    /// Sleep `n` ms to advance the runner's idle / battery / cover
+    /// timers; bounded to keep stress runs short.
     Pause(u64),
-    /// V2-C: inject а fresh transport into the runner's swap_inbox.
-    /// Server picks it up в next `await_next_input` tick, drops the
+    /// V2-C: inject a fresh transport into the runner's swap_inbox.
+    /// Server picks it up in next `await_next_input` tick, drops the
     /// OLD wire, takes over the NEW one. AEAD state is preserved
     /// across the swap. The harness's client-
-    /// side stream handle gets replaced с the matching NEW client
+    /// side stream handle gets replaced with the matching NEW client
     /// half of the new duplex; subsequent events continue on the
     /// NEW wire.
     InjectSwap,
@@ -120,10 +120,10 @@ enum ChaosEvent {
 
 fn sample_event(rng: &mut SimpleRng) -> ChaosEvent {
     // Weighted distribution: Ping dominant (≈80 %), peer-init rare
-    // (≈10 %), pause moderate (≈10 %). Tuned к match а real chat-
+    // (≈10 %), pause moderate (≈10 %). Tuned to match a real chat-
     // node traffic mix where rekey events are 1-per-thousand-frames.
-    // InjectSwap not sampled here; V2-C uses а separate
-    // `sample_event_v2c` так что V1 baseline tests stay deterministic.
+    // InjectSwap not sampled here; V2-C uses a separate
+    // `sample_event_v2c` so that V1 baseline tests stay deterministic.
     let r = rng.gen_range(0, 100);
     match r {
         0..=79 => ChaosEvent::Ping,
@@ -134,9 +134,9 @@ fn sample_event(rng: &mut SimpleRng) -> ChaosEvent {
 
 /// V2-C event sampler that adds occasional `InjectSwap` events.
 /// Distribution: ~70 % Ping, ~15 % PeerInitRekey, ~10 % Pause
-/// ~5 % InjectSwap. Swap-events ара intentionally rare — every
-/// swap consumes а duplex pair и triggers writer-task re-spawn
-/// so high swap-frequency would dominate run time с infrastructure
+/// ~5 % InjectSwap. Swap-events are intentionally rare — every
+/// swap consumes a duplex pair and triggers writer-task re-spawn
+/// so high swap-frequency would dominate run time with infrastructure
 /// rather than protocol exercise.
 fn sample_event_v2c(rng: &mut SimpleRng) -> ChaosEvent {
     let r = rng.gen_range(0, 100);
@@ -171,24 +171,24 @@ struct ChaosDriver {
     client: tokio::io::DuplexStream,
     /// V2-C: previously-active client handles parked alive until the
     /// iteration ends. Dropping them immediately would close the OLD
-    /// duplex и cause the runner's read_half к return EOF BEFORE the
+    /// duplex and cause the runner's read_half to return EOF BEFORE the
     /// `SwapStream` branch ran, sending the runner down the
     /// primary_closed path instead of the swap path. Vec preserves all
-    /// previous handles so multiple swaps в one iteration ара safe.
+    /// previous handles so multiple swaps in one iteration are safe.
     parked_old_clients: Vec<tokio::io::DuplexStream>,
-    /// V2-C: swap-channel sender — `Some` если the runner was set up
-    /// с `with_swap_inbox`. When the harness fires а swap event
-    /// it creates а new duplex pair, sends the server-side к
-    /// `swap_tx`, и replaces `self.client` с the new client-side.
+    /// V2-C: swap-channel sender — `Some` if the runner was set up
+    /// with `with_swap_inbox`. When the harness fires a swap event
+    /// it creates a new duplex pair, sends the server-side to
+    /// `swap_tx`, and replaces `self.client` with the new client-side.
     swap_tx: Option<tokio::sync::mpsc::Sender<BoxIoStream>>,
     /// Current client-side tx cipher. Replaced after each successful
     /// rekey so subsequent seals use the new key.
     client_tx: SessionCipher,
-    /// Same для rx — the harness opens incoming bodies к keep AEAD
-    /// counters в lockstep с the server side.
+    /// Same for rx — the harness opens incoming bodies to keep AEAD
+    /// counters in lockstep with the server side.
     client_rx: SessionCipher,
     /// `(local_id, peer_id)` — the harness's `local_id` matches the
-    /// server's `peer_id` и vice versa. Used in `derive_rekey_keys`.
+    /// server's `peer_id` and vice versa. Used in `derive_rekey_keys`.
     local_id: [u8; 32],
     peer_id: [u8; 32],
     /// Constant session_id (rekey doesn't rotate it for X25519 path).
@@ -198,7 +198,7 @@ struct ChaosDriver {
 }
 
 impl ChaosDriver {
-    /// Seal а Ping и write it onto the wire.
+    /// Seal a Ping and write it onto the wire.
     async fn send_ping(&mut self) {
         let aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
         let body = self.client_tx.seal(&[], &aad).expect("seal Ping");
@@ -208,12 +208,12 @@ impl ChaosDriver {
         self.client.write_all(&body).await.unwrap();
     }
 
-    /// V2-C: inject а fresh duplex stream into the runner's swap_inbox.
-    /// Returns `true` если swap channel was configured AND the runner
+    /// V2-C: inject a fresh duplex stream into the runner's swap_inbox.
+    /// Returns `true` if swap channel was configured AND the runner
     /// accepted the new stream. AEAD state preserved across swap;
-    /// subsequent events continue с the same cipher counters on the
-    /// NEW wire. Caller should drain а bit afterward к let the
-    /// runner's `select!` loop pick up the SwapStream branch и
+    /// subsequent events continue with the same cipher counters on the
+    /// NEW wire. Caller should drain a bit afterward to let the
+    /// runner's `select!` loop pick up the SwapStream branch and
     /// re-spawn the writer task on the new transport.
     async fn inject_swap(&mut self) -> bool {
         let Some(tx) = self.swap_tx.as_ref() else {
@@ -224,18 +224,18 @@ impl ChaosDriver {
             return false;
         }
         // Park the OLD client alive — dropping it would close the OLD
-        // duplex и cause the runner's read_half к EOF BEFORE the
+        // duplex and cause the runner's read_half to EOF BEFORE the
         // SwapStream branch picks up our new_server, sending the
-        // runner down the primary_closed path. Parked handles ара
+        // runner down the primary_closed path. Parked handles are
         // drained at iteration end.
         let old = std::mem::replace(&mut self.client, new_client);
         self.parked_old_clients.push(old);
         true
     }
 
-    /// Forge а peer-side RekeyInit к drive the responder path
-    /// (server is Idle → falls through к responder, generates fresh
-    /// ephemeral, sends а RekeyAck back).
+    /// Forge a peer-side RekeyInit to drive the responder path
+    /// (server is Idle → falls through to responder, generates fresh
+    /// ephemeral, sends a RekeyAck back).
     async fn send_peer_init_rekey(&mut self) -> kex::EphemeralKeypair {
         let kp = kex::generate_ephemeral();
         let body = RekeyPayload {
@@ -255,9 +255,9 @@ impl ChaosDriver {
     }
 
     /// Drain whatever frames the server has emitted so far, decrypt
-    /// и dispatch them. On Pong: count and discard. On RekeyAck
-    /// (server-side responder): we have а pending RekeyInit
-    /// outstanding — derive matching keys и mirror the cipher swap.
+    /// and dispatch them. On Pong: count and discard. On RekeyAck
+    /// (server-side responder): we have a pending RekeyInit
+    /// outstanding — derive matching keys and mirror the cipher swap.
     /// Padding frames: silently consumed (advancing rx counter).
     async fn drain_until_quiet(
         &mut self,
@@ -293,7 +293,7 @@ impl ChaosDriver {
         pending_init_kp: Option<kex::EphemeralKeypair>,
     ) -> Option<kex::EphemeralKeypair> {
         // Padding: discard but advance counter (
-        // coalesce-with-padding: each pad consumes а cipher slot).
+        // coalesce-with-padding: each pad consumes a cipher slot).
         if hdr.family == FrameFamily::Session as u8 && hdr.msg_type == SessionMsg::Padding as u16 {
             let aad = frame_aad(FrameFamily::Session as u8, SessionMsg::Padding as u16);
             let _ = self
@@ -302,7 +302,7 @@ impl ChaosDriver {
                 .expect("decrypt Padding to advance rx counter");
             return pending_init_kp;
         }
-        // Pong: count, decrypt empty body для counter.
+        // Pong: count, decrypt empty body for counter.
         if hdr.family == FrameFamily::Control as u8 && hdr.msg_type == ControlMsg::Pong as u16 {
             self.outcome.pong_received += 1;
             if hdr.body_len > 0 {
@@ -311,8 +311,8 @@ impl ChaosDriver {
             }
             return pending_init_kp;
         }
-        // Server-side RekeyAck (responder): we forged а peer-init, server
-        // generated а fresh ephemeral, sent us а RekeyAck containing it.
+        // Server-side RekeyAck (responder): we forged a peer-init, server
+        // generated a fresh ephemeral, sent us a RekeyAck containing it.
         // Decrypt, derive new keys, mirror cipher swap.
         if hdr.family == FrameFamily::Session as u8 && hdr.msg_type == SessionMsg::RekeyAck as u16 {
             let aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
@@ -320,10 +320,10 @@ impl ChaosDriver {
             let server_responder_pubkey = RekeyPayload::decode(&plain)
                 .expect("decode RekeyAck")
                 .ephemeral_pubkey;
-            // We MUST have а pending init keypair — server only emits
-            // а RekeyAck в response к our RekeyInit.
-            let our_kp =
-                pending_init_kp.expect("server emitted RekeyAck без а pending peer-init from us");
+            // We MUST have a pending init keypair — server only emits
+            // a RekeyAck in response to our RekeyInit.
+            let our_kp = pending_init_kp
+                .expect("server emitted RekeyAck without a pending peer-init from us");
             let shared = kex::compute_shared_secret(our_kp, &server_responder_pubkey)
                 .expect("contributory X25519 shared secret");
             let new_keys = session_kdf::derive_rekey_keys(
@@ -334,17 +334,17 @@ impl ChaosDriver {
             );
             self.client_tx = SessionCipher::new(&new_keys.tx_key, true);
             self.client_rx = SessionCipher::new(&new_keys.rx_key, true);
-            // Critical: server updates self.session_id к new_keys.session_id
+            // Critical: server updates self.session_id to new_keys.session_id
             // (runner.rs line ~2046). Harness must mirror, else the NEXT
-            // rekey's salt diverges и AEAD breaks (caught на seed 0 in V1
+            // rekey's salt diverges and AEAD breaks (caught on seed 0 in V1
             // smoke test).
             self.session_id = new_keys.session_id;
             self.outcome.rekey_complete_count += 1;
             return None; // pending consumed
         }
-        // Anything else: harness не handles в V1. Print + advance
-        // counter с empty AAD probe (best-effort). Если this
-        // happens, the test seed gets bisected к manually
+        // Anything else: harness does not handle in V1. Print + advance
+        // counter with empty AAD probe (best-effort). If this
+        // happens, the test seed gets bisected to manually
         // investigate.
         eprintln!(
             "chaos: unhandled server frame family={} msg_type={}",
@@ -356,17 +356,17 @@ impl ChaosDriver {
 
 // ── Run-one-iteration entry point ────────────────────────────────────────────
 
-/// Build а fresh runner + harness, replay `events`, return outcome.
+/// Build a fresh runner + harness, replay `events`, return outcome.
 /// Caller asserts invariants on the returned `ChaosOutcome`.
 async fn run_chaos_iteration(seed: u64, events: &[ChaosEvent]) -> ChaosOutcome {
     run_chaos_iteration_inner(seed, events, false).await
 }
 
 /// V2-C variant: same as `run_chaos_iteration` but enables the
-/// swap_inbox path так что `ChaosEvent::InjectSwap` events can take
-/// effect. Without the inbox configured, InjectSwap events ара
-/// silently no-ops (which would mask а regression если those events
-/// were supposed к exercise the swap branch).
+/// swap_inbox path so that `ChaosEvent::InjectSwap` events can take
+/// effect. Without the inbox configured, InjectSwap events are
+/// silently no-ops (which would mask a regression if those events
+/// were supposed to exercise the swap branch).
 async fn run_chaos_iteration_with_swap(seed: u64, events: &[ChaosEvent]) -> ChaosOutcome {
     run_chaos_iteration_inner(seed, events, true).await
 }
@@ -473,7 +473,7 @@ async fn run_chaos_iteration_inner(
                 pending_init_kp = driver.drain_until_quiet(20, pending_init_kp).await;
             }
             ChaosEvent::PeerInitRekey => {
-                // Skip if we already have а pending peer-init in flight —
+                // Skip if we already have a pending peer-init in flight —
                 // sending two back-to-back would race responder paths.
                 if pending_init_kp.is_none() {
                     let kp = driver.send_peer_init_rekey().await;
@@ -486,14 +486,14 @@ async fn run_chaos_iteration_inner(
                 pending_init_kp = driver.drain_until_quiet(5, pending_init_kp).await;
             }
             ChaosEvent::InjectSwap => {
-                // V2-C: trigger а transport handover. Если no swap
+                // V2-C: trigger a transport handover. If no swap
                 // channel was configured, this silently no-ops.
                 if driver.inject_swap().await {
                     // Brief sleep gives the runner's select! loop
-                    // time к pick up the SwapStream branch, drop the
+                    // time to pick up the SwapStream branch, drop the
                     // OLD wire, re-spawn the writer task on the NEW
                     // wire. 50 ms is many OOM over actual swap
-                    // latency на `tokio::io::duplex`.
+                    // latency on `tokio::io::duplex`.
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     // Pending init keypair (if any) survives the
                     // swap — AEAD state is preserved.
@@ -522,8 +522,8 @@ async fn run_chaos_iteration_inner(
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-/// Smoke test: 10 short iterations с fixed seeds. Runs by default
-/// в `cargo test`. Failures here are critical — а freshly shipped
+/// Smoke test: 10 short iterations with fixed seeds. Runs by default
+/// in `cargo test`. Failures here are critical — a freshly shipped
 /// slice broke the chaos baseline.
 #[tokio::test]
 async fn chaos_sim_smoke_baseline() {
@@ -535,7 +535,7 @@ async fn chaos_sim_smoke_baseline() {
             outcome.final_violation_count, 0,
             "seed={seed}: chaos run produced session.violation; events={events:?}; outcome={outcome:#?}"
         );
-        // Server must have responded к at least most of our Pings.
+        // Server must have responded to at least most of our Pings.
         // Allow some slack for events emitted just before timeout.
         let pings_sent = events
             .iter()
@@ -543,7 +543,7 @@ async fn chaos_sim_smoke_baseline() {
             .count() as u64;
         assert!(
             outcome.pong_received + 5 >= pings_sent,
-            "seed={seed}: only {} Pongs received из {} Pings; outcome={outcome:#?}",
+            "seed={seed}: only {} Pongs received from {} Pings; outcome={outcome:#?}",
             outcome.pong_received,
             pings_sent
         );
@@ -551,10 +551,10 @@ async fn chaos_sim_smoke_baseline() {
 }
 
 /// Full stress: 100 iterations × 200 events. ~30 s wall time.
-/// `#[ignore]` so it doesn't run в default `cargo test` —
+/// `#[ignore]` so it doesn't run in default `cargo test` —
 /// invoke explicitly per slice via `--ignored`.
 #[tokio::test]
-#[ignore = "long-running stress test; invoke с `cargo test --release chaos_sim_full -- --ignored --nocapture`"]
+#[ignore = "long-running stress test; invoke with `cargo test --release chaos_sim_full -- --ignored --nocapture`"]
 async fn chaos_sim_full_stress() {
     let mut failures = 0u64;
     let mut total_events = 0u64;
@@ -593,20 +593,20 @@ async fn chaos_sim_full_stress() {
 //
 // Production network failures at the application-stream layer look
 // like:
-// * TCP RTT spikes during congestion → bytes arrive в clumps
+// * TCP RTT spikes during congestion → bytes arrive in clumps
 // inter-arrival jitter
 // * Connection drop mid-stream → EOF on read
 //
 // TCP itself handles reliability (no packet loss at app layer)
-// in-order delivery, и MSS-sized chunking. So а realistic shim
+// in-order delivery, and MSS-sized chunking. So a realistic shim
 // preserves these AND adds:
 // 1. RTT jitter (delay between byte chunks)
 // 2. (optional) connection close mid-session
 //
-// `lossy_duplex_pair` returns а replacement для `tokio::io::duplex(N)`:
+// `lossy_duplex_pair` returns a replacement for `tokio::io::duplex(N)`:
 // it spawns two mediator tasks that forward bytes one-direction-at-a-
-// time, sleeping а random `0..=max_jitter_ms` ms before each forward.
-// The harness и runner use the returned halves identically к а plain
+// time, sleeping a random `0..=max_jitter_ms` ms before each forward.
+// The harness and runner use the returned halves identically to a plain
 // duplex pair — chaos is transparent.
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -637,11 +637,11 @@ where
     }
 }
 
-/// Returns а `(harness_client, runner_server)` pair connected via а
-/// pair of mediator tasks that introduce RTT jitter. Bytes ара
-/// delivered in-order и complete (no truncation, no loss); only
+/// Returns a `(harness_client, runner_server)` pair connected via a
+/// pair of mediator tasks that introduce RTT jitter. Bytes are
+/// delivered in-order and complete (no truncation, no loss); only
 /// timing is perturbed. Caller uses the returned halves identically
-/// к а plain `tokio::io::duplex(N)` pair. Mediator tasks exit
+/// to a plain `tokio::io::duplex(N)` pair. Mediator tasks exit
 /// cleanly when EITHER half is dropped.
 fn lossy_duplex_pair(
     buf_size: usize,
@@ -669,9 +669,9 @@ fn lossy_duplex_pair(
 }
 
 /// V2-B variant of `run_chaos_iteration`: same event-driven harness
-/// но the underlying duplex IS shimmed through а RTT-jitter mediator.
+/// but the underlying duplex IS shimmed through a RTT-jitter mediator.
 /// `max_jitter_ms` bounds the per-chunk delay; production-realistic
-/// values ара 10-100 ms.
+/// values are 10-100 ms.
 async fn run_chaos_iteration_lossy(
     seed: u64,
     events: &[ChaosEvent],
@@ -764,7 +764,7 @@ async fn run_chaos_iteration_lossy(
             ChaosEvent::Ping => {
                 driver.send_ping().await;
                 // Drain timeout must be > max_jitter (round-trip = 2×) +
-                // server processing. Padding decrypt timeouts get а
+                // server processing. Padding decrypt timeouts get a
                 // matching budget.
                 pending_init_kp = driver
                     .drain_until_quiet(max_jitter_ms * 4 + 30, pending_init_kp)
@@ -785,7 +785,7 @@ async fn run_chaos_iteration_lossy(
                     .drain_until_quiet(max_jitter_ms * 4 + 10, pending_init_kp)
                     .await;
             }
-            ChaosEvent::InjectSwap => { /* not exercised в lossy mode */ }
+            ChaosEvent::InjectSwap => { /* not exercised in lossy mode */ }
         }
     }
 
@@ -807,20 +807,20 @@ async fn run_chaos_iteration_lossy(
 /// V2-B smoke: 3 iterations × 15 events × 5 ms max jitter.
 ///
 /// **NOTE**: harness functionally works (observed
-/// successful rekey-completes through the mediator) BUT exhibits а
-/// shutdown deadlock — после the events loop, dropping
+/// successful rekey-completes through the mediator) BUT exhibits a
+/// shutdown deadlock — after the events loop, dropping
 /// `driver.client` does not reliably EOF the runner because the
 /// mediator's `tokio::io::split` halves do not propagate close
-/// semantics через а `DuplexStream`. Result: `server_task.await`
+/// semantics through a `DuplexStream`. Result: `server_task.await`
 /// waits forever, test exceeds 60 s. Marked `#[ignore]` until the
-/// mediator is rewritten к use explicit shutdown channels (replace
-/// `tokio::io::split` с а manual byte-copy task that takes а
+/// mediator is rewritten to use explicit shutdown channels (replace
+/// `tokio::io::split` with a manual byte-copy task that takes a
 /// `oneshot::Receiver<>` shutdown signal).
 ///
 /// V2-C + V2-D (compressed-time) provide overlapping coverage in
-/// the meantime; this slice is а capability gap, не а blocker.
+/// the meantime; this slice is a capability gap, not a blocker.
 #[tokio::test]
-#[ignore = "shutdown deadlock в lossy mediator; see in-source note"]
+#[ignore = "shutdown deadlock in lossy mediator; see in-source note"]
 async fn chaos_sim_lossy_smoke() {
     for seed in 0..3u64 {
         let mut rng = SimpleRng::seed(seed.wrapping_mul(0xb47ce53a1f0d829f));
@@ -833,10 +833,10 @@ async fn chaos_sim_lossy_smoke() {
     }
 }
 
-/// V2-B full stress: 20 iter × 100 events с 50 ms max jitter — twice
-/// the prod-realistic worst case к hammer timeout-sensitive code.
+/// V2-B full stress: 20 iter × 100 events with 50 ms max jitter — twice
+/// the prod-realistic worst case to hammer timeout-sensitive code.
 #[tokio::test]
-#[ignore = "long-running stress test; invoke с `cargo test --release --features allow-empty-seeds chaos_sim_lossy_full -- --ignored --nocapture`"]
+#[ignore = "long-running stress test; invoke with `cargo test --release --features allow-empty-seeds chaos_sim_lossy_full -- --ignored --nocapture`"]
 async fn chaos_sim_lossy_full_stress() {
     let mut failures = 0u64;
     let mut total_pongs = 0u64;
@@ -858,7 +858,7 @@ async fn chaos_sim_lossy_full_stress() {
     }
 
     eprintln!(
-        "chaos-sim lossy full: {} Pongs / {} rekey-completes (20 iter × 100 events с max 50 ms jitter)",
+        "chaos-sim lossy full: {} Pongs / {} rekey-completes (20 iter × 100 events with max 50 ms jitter)",
         total_pongs, total_rekeys
     );
     assert_eq!(
@@ -869,33 +869,33 @@ async fn chaos_sim_lossy_full_stress() {
 
 // ── Compressed-time tests via tokio::time::pause ────────────────────────────
 //
-// Some bug-classes need а LOT of wall time к surface на real clocks:
+// Some bug-classes need a LOT of wall time to surface on real clocks:
 // * session-rotation deadline (max-age jittered hours)
-// * Long-running idle-timeout interaction с keepalive scaling
-// * Battery-tier transitions over а 60-second check interval
+// * Long-running idle-timeout interaction with keepalive scaling
+// * Battery-tier transitions over a 60-second check interval
 //
 // `tokio::time::pause` freezes the runtime's clock; `advance(d)`
-// jumps it by `d` without waiting wall time. Combined с
-// `current_thread` runtime flavor (required для time control), we
+// jumps it by `d` without waiting wall time. Combined with
+// `current_thread` runtime flavor (required for time control), we
 // can compress hours of session lifetime into milliseconds.
 //
-// Important caveat: paused-time tests CANNOT interleave с real-time
-// IO (the duplex stream's `select!` won't make progress если the
+// Important caveat: paused-time tests CANNOT interleave with real-time
+// IO (the duplex stream's `select!` won't make progress if the
 // timer arm never wakes). We rely on `tokio::test(start_paused =
 // true)` + explicit `advance` calls between events.
 
-/// V2-D: compressed-time test that advances а full session-rotation
-/// jitter window (~33 min worst case) во second of wall time. Just
+/// V2-D: compressed-time test that advances a full session-rotation
+/// jitter window (~33 min worst case) in a second of wall time. Just
 /// verifies the rotation timer fires at the expected boundary;
-/// behaviour-level checks ара covered by gate Test 5.
+/// behaviour-level checks are covered by gate Test 5.
 #[tokio::test(start_paused = true)]
 #[allow(clippy::await_holding_lock)] // intentional: serialise tests
 // against the shared `session_max_age_secs` global; sync Mutex
 // across `tokio::time::advance` await is safe because paused-time
-// doesn't actually park the task, и we never block waiting on
+// doesn't actually park the task, and we never block waiting on
 // another tokio task that would need this Mutex.
 async fn chaos_sim_compressed_time_rotation_fires() {
-    // Configure session-rotation к 60 s nominal, jittered ±10 % so
+    // Configure session-rotation to 60 s nominal, jittered ±10 % so
     // the deadline lives [54 s, 66 s].
     use std::sync::Mutex;
     static LOCK: Mutex<()> = Mutex::new(());
@@ -907,7 +907,7 @@ async fn chaos_sim_compressed_time_rotation_fires() {
     );
     assert!(
         rotation.enabled(),
-        "rotation deadline must be enabled с max_age=60"
+        "rotation deadline must be enabled with max_age=60"
     );
     let deadline = rotation.deadline().expect("deadline present");
     let now0 = tokio::time::Instant::now();
@@ -915,12 +915,12 @@ async fn chaos_sim_compressed_time_rotation_fires() {
     // Not due immediately.
     assert!(!rotation.is_due(now0));
 
-    // Advance к 70 s — comfortably past the upper jitter bound.
+    // Advance to 70 s — comfortably past the upper jitter bound.
     tokio::time::advance(Duration::from_secs(70)).await;
     let now_after = tokio::time::Instant::now();
     assert!(
         rotation.is_due(now_after),
-        "rotation MUST be due после 70 s advance; deadline={:?} now={:?}",
+        "rotation MUST be due after 70 s advance; deadline={:?} now={:?}",
         deadline,
         now_after
     );
@@ -931,11 +931,11 @@ async fn chaos_sim_compressed_time_rotation_fires() {
 
 // ── V2-C: hot-standby swap injection ────────────────────────────────────────
 
-/// V2-C smoke: 5 iterations × 50 events с ~5 % swap-injection rate.
+/// V2-C smoke: 5 iterations × 50 events with ~5 % swap-injection rate.
 /// Exercises Test 2's "rekey-during-swap convergence" invariant
 /// across random event sequences instead of the single deterministic
-/// gate-test path. Каждый seed может interleave swaps mid-rekey
-/// peer-init-rekey mid-swap, и so on.
+/// gate-test path. Each seed can interleave swaps mid-rekey
+/// peer-init-rekey mid-swap, and so on.
 #[tokio::test]
 async fn chaos_sim_swap_smoke() {
     for seed in 0..5u64 {
@@ -957,7 +957,7 @@ async fn chaos_sim_swap_smoke() {
 /// V2-C full stress: 30 iterations × 300 events. ~2-3 min wall time.
 /// `#[ignore]` — invoke per slice via `--ignored`.
 #[tokio::test]
-#[ignore = "long-running stress test; invoke с `cargo test --release --features allow-empty-seeds chaos_sim_swap_full -- --ignored --nocapture`"]
+#[ignore = "long-running stress test; invoke with `cargo test --release --features allow-empty-seeds chaos_sim_swap_full -- --ignored --nocapture`"]
 async fn chaos_sim_swap_full_stress() {
     let mut failures = 0u64;
     let mut total_swaps = 0u64;
@@ -996,28 +996,28 @@ async fn chaos_sim_swap_full_stress() {
 
 // ── V2: dual-runner (peer-to-peer) chaos mode ────────────────────────────────
 //
-// V1 used а fake-peer driver — а handcrafted client-side state machine
+// V1 used a fake-peer driver — a handcrafted client-side state machine
 // driving one real `SessionRunner`. This catches harness-side
 // inconsistencies but doesn't validate two real runners interoperating.
 //
-// V2-A spins up TWO `SessionRunner` instances back-to-back через а
+// V2-A spins up TWO `SessionRunner` instances back-to-back through a
 // duplex pair, drives plaintext Pings into both runners' `outbox`
-// channels, и asserts neither side records а violation. Catches:
+// channels, and asserts neither side records a violation. Catches:
 //
 // * Cross-runner rekey-collision races (both runners crossing
 // `rekey_bytes_threshold` within RTT — d916e3b tie-breaker).
 // * Counter-coherence drift across many rekey rounds in flight.
-// * ML-KEM rotation interplay с X25519 rekey.
-// * Anything where "real implementation на both sides" exposes
-// а bug the V1 fake-peer-driver couldn't surface.
+// * ML-KEM rotation interplay with X25519 rekey.
+// * Anything where "real implementation on both sides" exposes
+// a bug the V1 fake-peer-driver couldn't surface.
 //
 // Idle/keepalive timers disabled for V2-A — focus is rekey-heavy
 // traffic. V2-B will add timer events; V2-C will add network shim.
 
-/// V2-A captures these на а fields-snapshot pattern; some fields read
+/// V2-A captures these on a fields-snapshot pattern; some fields read
 /// only by `Debug` (eprintln! on the failure path). Future V2-A stress
 /// tests will assert on `a_init_imbalance` / `b_init_imbalance` once
-/// mutual-collision distribution is needed; meanwhile they're kept в the
+/// mutual-collision distribution is needed; meanwhile they're kept in the
 /// struct for visibility-on-failure semantics. Anchor: TASKS.md
 /// "dead_code policy" row.
 #[derive(Debug, Default)]
@@ -1034,17 +1034,17 @@ struct DualOutcome {
     b_init_sent: u64,
     b_init_received: u64,
     /// Number of d916e3b-style mutual-collisions observed.
-    /// Inferred от the imbalance between sent и received init counts.
+    /// Inferred from the imbalance between sent and received init counts.
     a_init_imbalance: i64,
     b_init_imbalance: i64,
 }
 
-/// Build а pair of SessionRunner instances connected back-to-back
-/// через а duplex stream. Each runner has matching tx/rx ciphers
-/// (А's tx_key == B's rx_key, А's rx_key == B's tx_key) so они
+/// Build a pair of SessionRunner instances connected back-to-back
+/// through a duplex stream. Each runner has matching tx/rx ciphers
+/// (A's tx_key == B's rx_key, A's rx_key == B's tx_key) so they
 /// can immediately decrypt each other's frames.
 async fn run_p2p_iteration(seed: u64, ping_count: u64, bytes_threshold: u64) -> DualOutcome {
-    // Distinct keys для each direction.
+    // Distinct keys for each direction.
     let key_ab = {
         let mut k = [0u8; 32];
         let mut rng = SimpleRng::seed(seed.wrapping_mul(0xa3f8c2e1d04b6709));
@@ -1070,8 +1070,8 @@ async fn run_p2p_iteration(seed: u64, ping_count: u64, bytes_threshold: u64) -> 
         k
     };
 
-    // Distinct node_ids: А lower (will keep init on collision per
-    // d916e3b), B higher (will abort own init и accept А's).
+    // Distinct node_ids: A lower (will keep init on collision per
+    // d916e3b), B higher (will abort own init and accept A's).
     let id_a = [0x10u8; 32];
     let id_b = [0xF0u8; 32];
 
@@ -1201,8 +1201,8 @@ async fn run_p2p_iteration(seed: u64, ping_count: u64, bytes_threshold: u64) -> 
         r.run().await;
     });
 
-    // Drive: alternate Pings into А's и B's outboxes. Each Ping is
-    // а plaintext header (no body) — runner encrypts on output.
+    // Drive: alternate Pings into A's and B's outboxes. Each Ping is
+    // a plaintext header (no body) — runner encrypts on output.
     let mut rng = SimpleRng::seed(seed.wrapping_mul(0xc7e1f0ab8d529463));
     let mut a_pings = 0u64;
     let mut b_pings = 0u64;
@@ -1211,7 +1211,7 @@ async fn run_p2p_iteration(seed: u64, ping_count: u64, bytes_threshold: u64) -> 
         hdr.body_len = 0;
         let frame = encode_header(&hdr).to_vec();
         if rng.next_u64() & 1 == 0 {
-            // Push к А → А encrypts, sends к B, B replies с Pong.
+            // Push to A → A encrypts, sends to B, B replies with Pong.
             if a_outbox_tx
                 .send((
                     crate::proto::priority::INTERACTIVE,
@@ -1232,8 +1232,8 @@ async fn run_p2p_iteration(seed: u64, ping_count: u64, bytes_threshold: u64) -> 
         {
             b_pings += 1;
         }
-        // Tiny yield so the runners can drain — без this, the test
-        // outbox channel may saturate before any runner processes а
+        // Tiny yield so the runners can drain — without this, the test
+        // outbox channel may saturate before any runner processes a
         // single frame.
         tokio::task::yield_now().await;
     }
@@ -1265,26 +1265,26 @@ async fn run_p2p_iteration(seed: u64, ping_count: u64, bytes_threshold: u64) -> 
     }
 }
 
-/// V2-A smoke: 5 short p2p iterations с moderate rekey pressure.
-/// `bytes_threshold = 4 KiB` ensures every iteration triggers а
-/// few rekeys, including потенциальные mutual-collisions когда
+/// V2-A smoke: 5 short p2p iterations with moderate rekey pressure.
+/// `bytes_threshold = 4 KiB` ensures every iteration triggers a
+/// few rekeys, including potential mutual-collisions when
 /// both sides cross threshold within RTT.
 ///
-/// **Marked `#[ignore]`**: each iteration waits на the real 60 s rekey-
+/// **Marked `#[ignore]`**: each iteration waits on the real 60 s rekey-
 /// retry-window timer, so 5 iterations cost ~5 min wall.  That's beyond
-/// the default nextest terminate-after cap (and не a "smoke" test by any
-/// reasonable definition).  Invoke explicitly с
+/// the default nextest terminate-after cap (and not a "smoke" test by any
+/// reasonable definition).  Invoke explicitly with
 /// `cargo test --release chaos_sim_p2p_smoke -- --ignored --nocapture`
 /// when working on the rekey state machine.  Matches the convention used
 /// by `chaos_sim_full_stress` / `chaos_sim_lossy_full_stress` below.
 #[tokio::test]
-#[ignore = "long-running rekey-collision test; invoke с `cargo test chaos_sim_p2p_smoke -- --ignored`"]
+#[ignore = "long-running rekey-collision test; invoke with `cargo test chaos_sim_p2p_smoke -- --ignored`"]
 async fn chaos_sim_p2p_smoke() {
     for seed in 0..5u64 {
         let outcome = run_p2p_iteration(seed, 200, 4096).await;
         assert_eq!(
             outcome.a_violations, 0,
-            "seed={seed}: А-side violation count = {}; outcome = {outcome:#?}",
+            "seed={seed}: A-side violation count = {}; outcome = {outcome:#?}",
             outcome.a_violations
         );
         assert_eq!(
@@ -1295,11 +1295,11 @@ async fn chaos_sim_p2p_smoke() {
     }
 }
 
-/// V2-A full stress: 30 iterations × 1000 Pings с tight rekey
-/// threshold (1 KiB) к maximize collision probability. ~30-60 s
+/// V2-A full stress: 30 iterations × 1000 Pings with tight rekey
+/// threshold (1 KiB) to maximize collision probability. ~30-60 s
 /// wall. `#[ignore]` — invoke per slice via `--ignored`.
 #[tokio::test]
-#[ignore = "long-running stress test; invoke с `cargo test --release --features allow-empty-seeds chaos_sim_p2p_full -- --ignored --nocapture`"]
+#[ignore = "long-running stress test; invoke with `cargo test --release --features allow-empty-seeds chaos_sim_p2p_full -- --ignored --nocapture`"]
 async fn chaos_sim_p2p_full_stress() {
     let mut total_a_pings = 0u64;
     let mut total_b_pings = 0u64;
@@ -1338,6 +1338,6 @@ async fn chaos_sim_p2p_full_stress() {
     );
     assert_eq!(
         violations, 0,
-        "chaos-sim p2p full: {violations} iteration(s) с violations"
+        "chaos-sim p2p full: {violations} iteration(s) with violations"
     );
 }

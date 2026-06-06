@@ -7,7 +7,7 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
     // Load config eagerly for commands that have one so we can use
-    // its [runtime] + [logging] sections.  Commands without а config
+    // its [runtime] + [logging] sections.  Commands without a config
     // (`reload`, `app-id`) fall back to defaults.
     let cfg_for_runtime: Option<OgateConfig> = match &cli.command {
         Command::Up { config } | Command::Show { config } => match OgateConfig::from_path(config) {
@@ -21,10 +21,10 @@ fn main() -> std::process::ExitCode {
     };
 
     // Build the tokio runtime:
-    //   1. Start from config's `[runtime]` section (или defaults if absent /
+    //   1. Start from config's `[runtime]` section (or defaults if absent /
     //      no config command).
     //   2. Layer env-var overrides (OGATE_RUNTIME / OGATE_WORKERS /
-    //      OGATE_MAX_BLOCKING_THREADS) on top для backward-compat с
+    //      OGATE_MAX_BLOCKING_THREADS) on top for backward-compat with
     //      pre-runtime-section systemd units.
     let mut rt_cfg = cfg_for_runtime
         .as_ref()
@@ -40,7 +40,7 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    // Pull logging config out of the loaded config (или defaults).
+    // Pull logging config out of the loaded config (or defaults).
     let log_cfg = cfg_for_runtime
         .as_ref()
         .map(|c| c.logging.clone())
@@ -69,10 +69,10 @@ fn main() -> std::process::ExitCode {
 ///   4. baked-in default "info"
 ///
 /// Output destination:
-///   * `[logging] file = "/path/to/log"` ⇒ append к the file
+///   * `[logging] file = "/path/to/log"` ⇒ append to the file
 ///   * otherwise ⇒ stderr
 ///
-/// Returns the `_guard` от non-blocking writer (если file is configured),
+/// Returns the `_guard` from the non-blocking writer (if a file is configured),
 /// which must stay alive for the duration of the process — drop flushes
 /// the queued log lines.  Caller stores this in main's stack frame.
 fn install_tracing(
@@ -89,34 +89,34 @@ fn install_tracing(
     let level = cli_level.unwrap_or_else(|| log.level.as_filter_str());
 
     // Shortcut: level=off + no env override = don't even register
-    // а subscriber.  Saves the per-event filter overhead и leaves
-    // stderr completely silent (operators that pipe stderr к а
-    // log file expect zero lines когда logging is disabled).
+    // a subscriber.  Saves the per-event filter overhead and leaves
+    // stderr completely silent (operators that pipe stderr to a
+    // log file expect zero lines when logging is disabled).
     if level == "off" && std::env::var("RUST_LOG").is_err() {
         return None;
     }
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
-    // Choose writer: file (non-blocking, append) или stderr.
+    // Choose writer: file (non-blocking, append) or stderr.
     let (writer, guard): (
         tracing_appender::non_blocking::NonBlocking,
         Option<tracing_appender::non_blocking::WorkerGuard>,
     ) = if let Some(path) = &log.file {
         // Audit batch 2026-05-24 (M5): reject `..` path traversal.  An
-        // operator с writable config but без daemon-user privilege
-        // could otherwise redirect logs к /etc/cron.d/... or similar.
+        // operator with writable config but without daemon-user privilege
+        // could otherwise redirect logs to /etc/cron.d/... or similar.
         for c in path.components() {
             if matches!(c, std::path::Component::ParentDir) {
                 eprintln!(
-                    "ogate: [logging] file = {} contains `..` — refusing к open (path-traversal guard)",
+                    "ogate: [logging] file = {} contains `..` — refusing to open (path-traversal guard)",
                     path.display()
                 );
                 return None;
             }
         }
-        // Open в append mode; `tracing_appender::rolling::never`
-        // gives us а plain non-rolling appender.  Parent dir must
+        // Open in append mode; `tracing_appender::rolling::never`
+        // gives us a plain non-rolling appender.  Parent dir must
         // exist (we don't auto-create — operator's responsibility).
         let parent = path
             .parent()

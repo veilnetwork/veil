@@ -26,13 +26,13 @@ use sha2::Sha256;
 /// Keying material derived for one OVL1 session.
 ///
 /// `ZeroizeOnDrop` wipes the AEAD keys when this struct is dropped — the
-/// hot path в `SessionRunner` consumes these via field-moves into
-/// `SessionCipher::new`, so explicit `.zeroize()` calls would race с
+/// hot path in `SessionRunner` consumes these via field-moves into
+/// `SessionCipher::new`, so explicit `.zeroize()` calls would race with
 /// move semantics.  Drop-on-end-of-scope catches the dangling-Vec
 /// scenarios on error paths.
 ///
 /// `PartialEq` is excluded so that future call-sites cannot accidentally
-/// use а variable-time `==` compare on session-key material — use
+/// use a variable-time `==` compare on session-key material — use
 /// `subtle::ConstantTimeEq` if equality is needed.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SessionKeys {
@@ -69,24 +69,24 @@ const HKDF_REKEY_INFO: &[u8] = b"ovl1-session-rekey-v1";
 const HKDF_HYBRID_INFO: &[u8] = b"ovl1-session-hybrid-x25519-mlkem-v1";
 
 /// 96-byte session-key block: tx_key (32) || rx_key (32) || session_id (32).
-/// Constant lifted к module scope так чтобы [`OKM_LEN_VALID`]
-/// const_assert ниже can pin the size at compile time. HKDF-SHA256
-/// permits okm up to `255 × 32 = 8160` bytes; if а future refactor flips
-/// this к anything > 8160 the const_assert fails at build time, before
+/// Constant lifted to module scope so so that [`OKM_LEN_VALID`]
+/// const_assert below can pin the size at compile time. HKDF-SHA256
+/// permits okm up to `255 × 32 = 8160` bytes; if a future refactor flips
+/// this to anything > 8160 the const_assert fails at build time, before
 /// the silently-deferred runtime panic would fire on every rekey/handshake.
 const SESSION_OKM_LEN: usize = 96;
 
 /// preempt: HKDF-SHA256 max okm = 255 × 32 = 8160 B.
-/// Pre-emptive guard against а refactor that bumps `SESSION_OKM_LEN` past
-/// the limit. Without this assert, the runtime `expect` chain ниже
-/// would silently flip от "infallible" к "panics on every session
-/// derivation" at the moment the buffer crosses 8160 bytes — а DoS on
+/// Pre-emptive guard against a refactor that bumps `SESSION_OKM_LEN` past
+/// the limit. Without this assert, the runtime `expect` chain below
+/// would silently flip from "infallible" to "panics on every session
+/// derivation" at the moment the buffer crosses 8160 bytes — a DoS on
 /// every session establishment.
 const OKM_LEN_VALID: () = assert!(SESSION_OKM_LEN <= 255 * 32, "HKDF-SHA256 max okm exceeded");
 /// preempt: each subsequent slice (tx_key, rx_key
-/// session_id) is exactly 32 bytes. Without this, а future refactor that
-/// changes `SESSION_OKM_LEN` к а non-multiple of 32 would silently break
-/// the `try_into::<[u8; 32]>` calls на every derivation.
+/// session_id) is exactly 32 bytes. Without this, a future refactor that
+/// changes `SESSION_OKM_LEN` to a non-multiple of 32 would silently break
+/// the `try_into::<[u8; 32]>` calls on every derivation.
 const OKM_LEN_DIVISIBLE: () = assert!(
     SESSION_OKM_LEN == 96,
     "session OKM block must be 96 B = 3 × 32 B keys"
@@ -113,13 +113,13 @@ pub fn derive_session_keys(
     }
 
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), shared_secret);
-    // Этап 6 — SensitiveBytes wraps the intermediate 96-byte block so
-    // it gets wiped on drop AND the backing pages ара mlocked when the
-    // process budget allows (closes the swap-к-disk vector that the
+    // Phase 6 — SensitiveBytes wraps the intermediate 96-byte block so
+    // it gets wiped on drop AND the backing pages are mlocked when the
+    // process budget allows (closes the swap-to-disk vector that the
     // previous `Zeroizing<[u8; N]>` left open).  On RLIMIT_MEMLOCK-
-    // exhausted hosts (containers без CAP_IPC_LOCK, low-ulimit dev
-    // boxes) SensitiveBytes silently falls back к а Zeroizing<Vec<u8>>
-    // — identical к the pre-Этап-6 behaviour, no regression.
+    // exhausted hosts (containers without CAP_IPC_LOCK, low-ulimit dev
+    // boxes) SensitiveBytes silently falls back to a Zeroizing<Vec<u8>>
+    // — identical to the pre-Phase-6 behaviour, no regression.
     let mut okm = veil_util::sensitive_bytes::SensitiveBytes::new(SESSION_OKM_LEN);
     // const_assert OKM_LEN_VALID at module scope guarantees
     // SESSION_OKM_LEN ≤ HKDF-SHA256 max (8160 B). expand cannot fail.
@@ -181,10 +181,10 @@ pub fn derive_rekey_keys(
     }
 
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), new_shared_secret);
-    // Этап 6 — SensitiveBytes intermediate (mlock-when-possible с
-    // Zeroizing fallback).  See derive_session_keys для rationale.
+    // Phase 6 — SensitiveBytes intermediate (mlock-when-possible with
+    // Zeroizing fallback).  See derive_session_keys for rationale.
     let mut okm = veil_util::sensitive_bytes::SensitiveBytes::new(SESSION_OKM_LEN);
-    // see derive_session_keys для const_assert rationale.
+    // see derive_session_keys for const_assert rationale.
     hkdf.expand(HKDF_REKEY_INFO, okm.as_mut_slice())
         .expect("compile-time-bounded okm size");
 
@@ -226,8 +226,8 @@ pub fn derive_rekey_keys(
 ///   sides agree).
 /// * `info` = [`HKDF_HYBRID_INFO`] — distinct from the classical
 ///   [`HKDF_INFO`] so a hybrid-mode peer and a classical-mode peer
-///   derive DIFFERENT session keys, refusing к interoperate instead
-///   of silently dropping back к classical-only security.
+///   derive DIFFERENT session keys, refusing to interoperate instead
+///   of silently dropping back to classical-only security.
 /// * `ikm` = `x25519_shared_secret || mlkem_shared_secret` — the
 ///   concatenation gives HKDF its full entropy budget; HKDF-Extract
 ///   handles arbitrary-length IKM correctly.
@@ -268,7 +268,7 @@ pub fn derive_hybrid_session_keys(
     // (e.g. via a quantum-break of X25519) still can't predict the
     // output without the OTHER.
     // Zeroizing wrapper wipes the concatenated PQ + classical shared
-    // secret on scope exit.  Both inputs are already Zeroizing на the
+    // secret on scope exit.  Both inputs are already Zeroizing on the
     // caller side; without this wrapper the intermediate Vec would
     // remain in deallocated memory until the arena page is reused.
     let mut ikm: zeroize::Zeroizing<Vec<u8>> =
@@ -277,10 +277,10 @@ pub fn derive_hybrid_session_keys(
     ikm.extend_from_slice(mlkem_shared_secret);
 
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), &ikm);
-    // Этап 6 — SensitiveBytes intermediate (mlock-when-possible с
-    // Zeroizing fallback).  See derive_session_keys для rationale.
+    // Phase 6 — SensitiveBytes intermediate (mlock-when-possible with
+    // Zeroizing fallback).  See derive_session_keys for rationale.
     let mut okm = veil_util::sensitive_bytes::SensitiveBytes::new(SESSION_OKM_LEN);
-    // see derive_session_keys для const_assert rationale.
+    // see derive_session_keys for const_assert rationale.
     hkdf.expand(HKDF_HYBRID_INFO, okm.as_mut_slice())
         .expect("compile-time-bounded okm size");
 
@@ -421,15 +421,15 @@ mod tests {
         assert_eq!(k1.rx_key, k2.tx_key);
     }
 
-    /// role-assignment uses `<=` (not `<`), so а
+    /// role-assignment uses `<=` (not `<`), so a
     /// degenerate handshake where `local_node_id == remote_node_id`
     /// still produces stable role-symmetric keys: both sides take
     /// the same branch (`key_a` → tx, `key_b` → rx). This means tx
-    /// == tx и rx == rx on both peers — they cannot decrypt each
-    /// other's ciphertext, but the function does not deadlock или
+    /// == tx and rx == rx on both peers — they cannot decrypt each
+    /// other's ciphertext, but the function does not deadlock or
     /// produce inconsistent state. Self-handshakes shouldn't happen
-    /// in practice (а node never connects к itself) но this test
-    /// guards against а future refactor flipping `<=` → `<` (which
+    /// in practice (a node never connects to itself) but this test
+    /// guards against a future refactor flipping `<=` → `<` (which
     /// would split the equal-id case asymmetrically and silently
     /// corrupt the keystream).
     #[test]
@@ -443,11 +443,11 @@ mod tests {
         assert_eq!(k_self.tx_key, k_again.tx_key);
         assert_eq!(k_self.rx_key, k_again.rx_key);
         assert_eq!(k_self.session_id, k_again.session_id);
-        // And tx!= rx — otherwise а self-loop would encrypt-decrypt
-        // its own keystream и leak plaintext.
+        // And tx!= rx — otherwise a self-loop would encrypt-decrypt
+        // its own keystream and leak plaintext.
         assert_ne!(
             k_self.tx_key, k_self.rx_key,
-            "tx и rx must differ even when local_id == remote_id"
+            "tx and rx must differ even when local_id == remote_id"
         );
     }
 
@@ -556,7 +556,7 @@ mod tests {
 
     /// hybrid keys are sensitive to the ML-KEM secret —
     /// flipping a byte in the ML-KEM input produces different keys.
-    /// Proves both secrets contribute к the output (no silent dropping
+    /// Proves both secrets contribute to the output (no silent dropping
     /// of one input).
     #[test]
     fn epic486_1_hybrid_output_depends_on_mlkem_secret() {
@@ -571,7 +571,7 @@ mod tests {
         let sk_b = derive_hybrid_session_keys(&x25519, &mlkem_b, &alice, &bob);
         assert_ne!(
             sk_a.tx_key, sk_b.tx_key,
-            "ml-kem secret must contribute к output (flip one byte → different key)"
+            "ml-kem secret must contribute to output (flip one byte → different key)"
         );
 
         // Sanity: idempotent in the same input.
@@ -582,7 +582,7 @@ mod tests {
     }
 
     /// hybrid keys are sensitive to the X25519 secret too
-    /// (companion к the ML-KEM sensitivity test above).
+    /// (companion to the ML-KEM sensitivity test above).
     #[test]
     fn epic486_1_hybrid_output_depends_on_x25519_secret() {
         let mut x_a = [0xA1u8; 32];
@@ -596,7 +596,7 @@ mod tests {
         let sk_b = derive_hybrid_session_keys(&x_b, &mlkem, &alice, &bob);
         assert_ne!(
             sk_a.tx_key, sk_b.tx_key,
-            "x25519 secret must contribute к output"
+            "x25519 secret must contribute to output"
         );
 
         x_a.zeroize();

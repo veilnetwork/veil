@@ -218,11 +218,11 @@ impl SovereignIdentity {
     }
 
     /// Audit batch 2026-05-25 phase O: borrow the embedded Ed25519
-    /// signing key для service layers что need it directly (currently
+    /// signing key for service layers that need it directly (currently
     /// only [`veil_anycast::AnycastService::with_signing_key`]
     /// to auto-sign IPC-initiated advertisements).  Returns `None`
-    /// для PQ-only identities (Falcon-512 sovereign), wherein the
-    /// service should fall back к unsigned advertise.
+    /// for PQ-only identities (Falcon-512 sovereign), wherein the
+    /// service should fall back to unsigned advertise.
     ///
     /// Caller pattern:
     ///   let sk_arc = sovereign.ed25519_signing_key()

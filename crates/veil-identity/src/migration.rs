@@ -100,7 +100,7 @@ pub enum MigrationCertError {
 }
 
 /// A decoded migration cert. Construct [`sign_migration_cert`];
-/// transmit as bytes (typically published к the DHT under
+/// transmit as bytes (typically published to the DHT under
 /// `migration_cert_dht_key(old_node_id)`); decode at the receiver via
 /// [`decode_migration_cert`]; verify [`verify_migration_cert`].
 #[derive(Debug, Clone, PartialEq)]
@@ -116,7 +116,7 @@ pub struct MigrationCert {
 }
 
 /// DHT key under which `old_node_id`'s migration cert is published.
-/// Domain-separated from other DHT-key derivations так чтобы a migration
+/// Domain-separated from other DHT-key derivations so that a migration
 /// query cannot accidentally hit a relay-directory or rendezvous-ad slot.
 pub fn migration_cert_dht_key(old_node_id: &[u8; 32]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
@@ -181,11 +181,11 @@ pub(crate) fn security_tier(algo: u8) -> u8 {
 }
 
 /// Sign a fresh `MigrationCert` linking `old_node_id` (signed by the
-/// OLD master keypair) к `new_node_id` (the new master's public key).
+/// OLD master keypair) to `new_node_id` (the new master's public key).
 ///
 /// `old_master_pubkey_b64` / `old_master_sk_b64` are the base64-encoded
 /// keypair material of the OLD master — the entity that's relinquishing
-/// control of `old_node_id` к the new identity. The signature must
+/// control of `old_node_id` to the new identity. The signature must
 /// verify against the old IdentityDocument's `master_pubkey` at the
 /// time the cert is published, which is what gives the cert its weight.
 #[allow(clippy::too_many_arguments)]
@@ -255,7 +255,7 @@ pub fn sign_migration_cert(
 /// signature. Caller MUST chain [`verify_migration_cert`] before
 /// trusting any field. Decoding-without-verifying is exposed
 /// separately so debug tools can pretty-print "what does this cert
-/// claim" before deciding к trust it.
+/// claim" before deciding to trust it.
 pub fn decode_migration_cert(blob: &[u8]) -> Result<MigrationCert, MigrationCertError> {
     if blob.len() > MAX_MIGRATION_CERT_BYTES {
         return Err(MigrationCertError::TooLarge { got: blob.len() });
@@ -322,7 +322,7 @@ pub fn decode_migration_cert(blob: &[u8]) -> Result<MigrationCert, MigrationCert
 ///
 /// `now_unix` is a monotonic-ish wall-clock timestamp; production caller
 /// supplies `SystemTime::now.duration_since(UNIX_EPOCH).as_secs`
-/// tests pin к a literal.
+/// tests pin to a literal.
 pub fn verify_migration_cert(
     cert: &MigrationCert,
     old_master_pubkey_b64: &str,

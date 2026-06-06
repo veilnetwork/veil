@@ -18,12 +18,12 @@
 //!
 //! Best-effort: per-replica failures are silent at the per-frame level
 //! (the design is fire-and-forget — synchronous STORE-acks would make
-//! re-publish O(RTT × K) and create а DoS amplifier on slow peers).
+//! re-publish O(RTT × K) and create a DoS amplifier on slow peers).
 //! The periodic re-replication tick lives at
 //! [`crate::node::runtime::dht_republish::spawn_dht_republish_task`]:
 //! every TTL/2 (≈ 30 min default) it walks the local store, filters
-//! к self-authenticating record types only, and re-fan-outs to the
-//! current K closest peers — so а peer that was unreachable at
+//! to self-authenticating record types only, and re-fan-outs to the
+//! current K closest peers — so a peer that was unreachable at
 //! original publish time picks up the record on the next tick once
 //! it comes back online. audit follow-up wired
 //! `veil_replicas_published_total` (per-tick fan-out total) plus

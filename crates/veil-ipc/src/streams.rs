@@ -45,12 +45,12 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ── RouteOutcome ─────────────────────────────────────────────────────────────
 
-/// Result of routing а STREAM_DATA frame.
+/// Result of routing a STREAM_DATA frame.
 ///
 /// Distinguishes between "route succeeded" (caller does nothing),
 /// "no such stream" (caller drops the frame; pre-existing semantics —
 /// stream may have just been reaped or closed), "window exhausted"
-/// (caller should send а `STREAM_OPEN_ERR(WINDOW_EXHAUSTED)` reply or
+/// (caller should send a `STREAM_OPEN_ERR(WINDOW_EXHAUSTED)` reply or
 /// close the stream), and "peer backpressure" (the receiver's mpsc is
 /// full — caller MUST close the stream rather than silently dropping
 /// data, because the window has already been debited and silently
@@ -58,9 +58,9 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// it has actually delivered).
 ///
 /// Pre-fix, both `route_data_from_a` and `route_data_from_b` returned
-/// а bare `bool` that the server.rs read loop ignored entirely.  The
+/// a bare `bool` that the server.rs read loop ignored entirely.  The
 /// window for A→B was already debited before the failed `try_send`, so
-/// а sender that hit backpressure ON its peer's endpoint would
+/// a sender that hit backpressure ON its peer's endpoint would
 /// silently lose every frame and quietly exhaust its window with
 /// nothing delivered.  The new contract: this method restores the
 /// window on `PeerBackpressure` and returns the variant so the read
@@ -328,8 +328,8 @@ impl IpcStreamTable {
     ///
     /// Pre-encodes the frame and pushes to A's delivery channel.  The
     /// B→A direction does not currently use windowing (the SDK reads
-    /// off а bounded delivery_tx that propagates TCP backpressure all
-    /// the way to А's IPC socket), so there is no window к restore on
+    /// off a bounded delivery_tx that propagates TCP backpressure all
+    /// the way to A's IPC socket), so there is no window to restore on
     /// failure.  On `PeerBackpressure` the caller closes the stream so
     /// the sender's view tracks reality.
     pub fn route_data_from_b(&self, stream_id: u32, data: Vec<u8>) -> RouteOutcome {
@@ -634,12 +634,12 @@ mod tests {
         );
     }
 
-    /// Regression guard for the silent-data-loss bug.  Pre-fix а full
+    /// Regression guard for the silent-data-loss bug.  Pre-fix a full
     /// b_endpoint_tx caused `try_send` to return `Err(Full)`; the
     /// caller saw `false` and assumed the route helper had already
     /// restored state, but the window had silently been debited.  The
     /// contract is now: on `PeerBackpressure` the window is restored,
-    /// so retrying after а window-update or peer-drain would succeed
+    /// so retrying after a window-update or peer-drain would succeed
     /// against the same accounting state.
     #[tokio::test(flavor = "current_thread")]
     async fn route_from_a_backpressure_restores_window_and_signals() {
@@ -657,7 +657,7 @@ mod tests {
         // First send consumes the only slot (registry pushed StreamOpen
         // in `open_local`, which occupies the queue).  Second send
         // races the registry's StreamOpen — at least one of them must
-        // backpressure.  Build а deterministic scenario by NOT draining
+        // backpressure.  Build a deterministic scenario by NOT draining
         // b_rx first.
 
         // Push enough to fill the receiver after StreamOpen is enqueued.
@@ -671,7 +671,7 @@ mod tests {
         );
 
         // Window must be intact (the 5-byte debit was rolled back).
-        // Drain the StreamOpen so we have capacity for а new frame.
+        // Drain the StreamOpen so we have capacity for a new frame.
         let _ = b_rx.try_recv();
         let after = table.route_data_from_a(stream_id, vec![7u8; 100]);
         assert_eq!(

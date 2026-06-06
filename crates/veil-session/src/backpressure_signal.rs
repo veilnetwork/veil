@@ -1,7 +1,7 @@
 //! decomposition slice 22: encapsulates the
-//! "send а Backpressure signal at most once per cooldown" gate.
+//! "send a Backpressure signal at most once per cooldown" gate.
 //!
-//! Was inline в `SessionRunner::run`:
+//! Was inline in `SessionRunner::run`:
 //! ```ignore
 //! const BP_SIGNAL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
 //! let mut bp_last_sent: std::time::Instant =
@@ -13,21 +13,21 @@
 //! }
 //! ```
 //!
-//! Background — backpressure: when а peer exceeds its rate limit, the
-//! receiver drops the offending frame и emits one Backpressure control
-//! frame back so the peer marks us as congested и redistributes traffic.
+//! Background — backpressure: when a peer exceeds its rate limit, the
+//! receiver drops the offending frame and emits one Backpressure control
+//! frame back so the peer marks us as congested and redistributes traffic.
 //! The cooldown gate prevents spamming Backpressure frames in response
-//! к а burst of rate-limited frames — а 1-second window is enough к
-//! signal once-per-burst, не enough к saturate the reverse channel.
+//! to a burst of rate-limited frames — a 1-second window is enough to
+//! signal once-per-burst, not enough to saturate the reverse channel.
 //!
 //! Initial `last_sent = now - cooldown` so the FIRST event always fires
 //! (no warm-up period where backpressure is silently swallowed).
 //!
-//! Why not just а timer arm? Backpressure is event-driven (fires only
-//! когда some other frame triggered RateLimited dispatch), не
-//! periodic. Bundling it with the existing Timer arm would require а
-//! state machine to track "do we have а pending BP to emit" — simpler
-//! к keep the trigger inline и gate only the cooldown.
+//! Why not just a timer arm? Backpressure is event-driven (fires only
+//! when some other frame triggered RateLimited dispatch), not
+//! periodic. Bundling it with the existing Timer arm would require a
+//! state machine to track "do we have a pending BP to emit" — simpler
+//! to keep the trigger inline and gate only the cooldown.
 
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,7 @@ pub struct BackpressureSignal {
 
 impl BackpressureSignal {
     /// Build with the configured cooldown.  `last_sent` initialised
-    /// к `now - cooldown` so [try_arm] returns `true` on the very
+    /// to `now - cooldown` so [try_arm] returns `true` on the very
     /// first call (no warm-up suppression).
     pub fn new(cooldown: Duration) -> Self {
         Self {
@@ -48,9 +48,9 @@ impl BackpressureSignal {
         }
     }
 
-    /// Returns `true` если at least [cooldown] has elapsed since
+    /// Returns `true` if at least [cooldown] has elapsed since
     /// the previous successful arm.  On `true` the internal clock
-    /// advances к `now` — subsequent calls within the cooldown
+    /// advances to `now` — subsequent calls within the cooldown
     /// window return `false`.
     pub fn try_arm(&mut self, now: Instant) -> bool {
         if now.duration_since(self.last_sent) >= self.cooldown {
@@ -67,7 +67,7 @@ mod tests {
     use super::*;
 
     /// First call always returns true regardless of how soon after
-    /// construction it fires (warm-up suppression would be а bug).
+    /// construction it fires (warm-up suppression would be a bug).
     #[test]
     fn first_arm_fires_immediately() {
         let mut bp = BackpressureSignal::new(Duration::from_secs(1));

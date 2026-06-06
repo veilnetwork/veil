@@ -1,9 +1,9 @@
 //! IPC endpoint path resolution.
 //!
-//! Resolves the operator's `[ipc]` config к а concrete listener backend
-//! (`IpcEndpoint`) и computes the anchor path that `veil-cli` /
-//! `veilclient` use к find the running daemon.  All public symbols
-//! здесь mirror the admin-endpoint contract в `node/admin.rs` so the two
+//! Resolves the operator's `[ipc]` config to a concrete listener backend
+//! (`IpcEndpoint`) and computes the anchor path that `veil-cli` /
+//! `veilclient` use to find the running daemon.  All public symbols
+//! here mirror the admin-endpoint contract in `node/admin.rs` so the two
 //! discovery channels share parsing rules.
 
 use std::path::{Path, PathBuf};
@@ -14,15 +14,15 @@ pub fn default_ipc_socket_path() -> PathBuf {
     PathBuf::from(home).join(".veil").join("app.sock")
 }
 
-/// Resolved IPC server backend.  Mirrors `AdminEndpoint` в `node/admin.rs` —
+/// Resolved IPC server backend.  Mirrors `AdminEndpoint` in `node/admin.rs` —
 /// same URI parsing + sidecar pattern so app clients can discover the
-/// server с one cross-platform code path.
+/// server with one cross-platform code path.
 #[derive(Debug, Clone)]
 pub enum IpcEndpoint {
-    /// Unix domain socket at `path`. Default на Linux/macOS.
+    /// Unix domain socket at `path`. Default on Linux/macOS.
     Unix(PathBuf),
     /// TCP-loopback at `bind_addr`; `runtime_dir` holds `ipc.port` + `ipc.token`
-    /// sidecars so clients can discover the listener и authenticate.
+    /// sidecars so clients can discover the listener and authenticate.
     Tcp {
         bind_addr: std::net::SocketAddr,
         runtime_dir: PathBuf,
@@ -35,7 +35,7 @@ pub enum IpcEndpoint {
     },
 }
 
-/// Sidecar filenames written next to а TCP IPC anchor (mirrors the admin
+/// Sidecar filenames written next to a TCP IPC anchor (mirrors the admin
 /// `admin.port` / `admin.token` convention).
 pub const IPC_PORT_FILENAME: &str = "ipc.port";
 pub const IPC_TOKEN_FILENAME: &str = "ipc.token";
@@ -48,7 +48,7 @@ pub const IPC_PIPE_FILENAME: &str = "ipc.pipe";
 /// Errors surfaced by [`resolve_ipc_endpoint`] / [`ipc_anchor_path`].
 ///
 /// Decoupled from veilcore's error tree (`NodeError`) so this crate
-/// doesn't have к depend на it.  Production runtime adapter wraps this
+/// doesn't have to depend on it.  Production runtime adapter wraps this
 /// back into `NodeError::Config(ConfigError::ValidationFailed(_))`.
 #[derive(Debug, thiserror::Error)]
 pub enum IpcEndpointError {
@@ -63,12 +63,12 @@ pub enum IpcEndpointError {
 /// 2. `socket_path` (Unix-only, backward compat).
 /// 3. Default Unix path under the veil home dir.
 ///
-/// `default_runtime_dir` is the fallback used когда neither the URI's
+/// `default_runtime_dir` is the fallback used when neither the URI's
 /// `?runtime_dir=` query nor `config_dir` is set.  Production runtime
 /// passes the value of `cfg::runtime_veil_dir` here.
 ///
-/// Returns an error if the URI is malformed, references а non-loopback
-/// host, или specifies an unknown scheme.
+/// Returns an error if the URI is malformed, references a non-loopback
+/// host, or specifies an unknown scheme.
 pub fn resolve_ipc_endpoint(
     cfg: &veil_types::IpcConfig,
     config_dir: Option<&Path>,
@@ -77,7 +77,7 @@ pub fn resolve_ipc_endpoint(
     if let Some(uri) = cfg.socket_uri.as_deref() {
         let (uri_body, query_runtime_dir) = split_ipc_uri_query(uri);
 
-        // pipe:// handled здесь — `TransportUri` doesn't model Windows
+        // pipe:// handled here — `TransportUri` doesn't model Windows
         // NamedPipes.  Form: `pipe://LEAF[?runtime_dir=...]`.
         if let Some(rest) = uri_body.strip_prefix("pipe://") {
             let leaf = rest.split('/').next().unwrap_or("");
@@ -130,9 +130,9 @@ pub fn resolve_ipc_endpoint(
     Ok(IpcEndpoint::Unix(default_ipc_socket_path()))
 }
 
-/// Anchor path — what `veil-cli` и `veilclient` resolve к find the
-/// IPC server.  For Unix it's the socket file; for TCP / NamedPipe it's а
-/// synthetic path под `runtime_dir` whose siblings (`ipc.port` /
+/// Anchor path — what `veil-cli` and `veilclient` resolve to find the
+/// IPC server.  For Unix it's the socket file; for TCP / NamedPipe it's a
+/// synthetic path under `runtime_dir` whose siblings (`ipc.port` /
 /// `ipc.token` / `ipc.pipe`) authenticate the discovery.  See
 /// [`resolve_ipc_endpoint`] for `config_dir` semantics.
 pub fn ipc_anchor_path(

@@ -1,23 +1,23 @@
 ---
 # Phase 6.50.b iterative-DHT rollout — binary-only deploy.
 #
-# Replaces /usr/local/bin/veil-cli с the fresh release build,
+# Replaces /usr/local/bin/veil-cli with the fresh release build,
 # keeps /var/lib/veil/node.toml untouched (preserves any in-place
-# operator edits — е.g. stress-soak overrides applied 2026-05-09:
+# operator edits — e.g. stress-soak overrides applied 2026-05-09:
 # `rekey_bytes_threshold = 100000000`, `rekey_time_threshold_secs = 300`).
 #
-# Use this playbook when shipping а bugfix или а new feature whose config
+# Use this playbook when shipping a bugfix or a new feature whose config
 # defaults are backward-compatible (e.g. Phase 6.50.b slice 5 added
 # four `[routing] dht_fallback_*` knobs all with safe defaults — no
-# existing config needs editing к pick them up).
+# existing config needs editing to pick them up).
 #
-# Run с:
+# Run with:
 #   ansible-playbook -i inventory.yml deploy-binary-only.yml
 
 - name: Deploy veil binary only (preserve config + state)
   hosts: all
   become: true
-  serial: 1  # stagger rollout so the cluster keeps а quorum during restart
+  serial: 1  # stagger rollout so the cluster keeps a quorum during restart
   vars:
     veil_bin_src: "{{ playbook_dir }}/../target/release/veil-cli"
 
@@ -31,7 +31,7 @@
 
     - name: Fail if binary missing
       ansible.builtin.fail:
-        msg: "Missing binary: {{ veil_bin_src }} — build first с `cargo build --release -p veilcore --bin veil-cli`"
+        msg: "Missing binary: {{ veil_bin_src }} — build first with `cargo build --release -p veilcore --bin veil-cli`"
       when: not bin_stat.stat.exists
 
     - name: Capture current node.toml stress-overrides (for log/verification)
@@ -66,7 +66,7 @@
         name: veil.service
         state: restarted
 
-    - name: Wait for node к come back online (metrics endpoint = readiness probe)
+    - name: Wait for node to come back online (metrics endpoint = readiness probe)
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 60); do
@@ -91,7 +91,7 @@
       register: post_overrides
       changed_when: false
 
-    - name: Fail если overrides got wiped
+    - name: Fail if overrides got wiped
       ansible.builtin.fail:
         msg: "Stress overrides were wiped! pre={{ pre_overrides.stdout_lines }} post={{ post_overrides.stdout_lines }}"
       when:

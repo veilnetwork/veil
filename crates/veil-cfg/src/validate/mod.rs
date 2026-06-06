@@ -422,7 +422,7 @@ mod tests {
         fn epic483_6b_per_peer_bytes_none_passes() {
             // Default (per-peer enforcement disabled) must NOT
             // trigger too-low rule — None is the intended "off"
-            // sentinel, не a misconfig.
+            // sentinel, not a misconfig.
             let config = Config::default();
             assert!(config.abuse.per_peer_bytes_per_sec.is_none());
             let report = validate(&config);
@@ -438,11 +438,11 @@ mod tests {
 
         #[test]
         fn epic488_1_session_max_age_below_60s_flagged() {
-            // Misconfig (or malicious config push) с too-short
+            // Misconfig (or malicious config push) with too-short
             // rotation interval would force connection-storm
-            // (~once-a-second handshakes) — itself anomalous и
+            // (~once-a-second handshakes) — itself anomalous and
             // would dominate CPU/network cost. Floor matches
-            // the runtime clamp в MIN_SESSION_MAX_AGE_SECS.
+            // the runtime clamp in MIN_SESSION_MAX_AGE_SECS.
             let mut config = Config::default();
             config.session.max_age_secs = Some(30);
             let report = validate(&config);
@@ -485,7 +485,7 @@ mod tests {
         fn epic488_1_session_max_age_none_passes() {
             // Default (rotation disabled) must NOT trigger the
             // too-short rule — None is the intended "rotation
-            // off" sentinel, не a misconfig.
+            // off" sentinel, not a misconfig.
             let config = Config::default();
             assert!(config.session.max_age_secs.is_none());
             let report = validate(&config);
@@ -501,13 +501,13 @@ mod tests {
 
         // ── [transport.rotation] validation ────────────────────────
         //
-        // Mirrors the session.max_age_secs rules above, но для the
+        // Mirrors the session.max_age_secs rules above, but for the
         // new range-based knobs (Q.7 audit batch — censor-evasion via
         // periodic TCP rotation).
 
         #[test]
         fn transport_rotation_default_passes_validation() {
-            // Default (1800..3600) must be valid + не flag anything.
+            // Default (1800..3600) must be valid + not flag anything.
             let config = Config::default();
             let report = validate(&config);
             let rotation_issues: Vec<_> = report
@@ -542,7 +542,7 @@ mod tests {
 
         #[test]
         fn transport_rotation_partial_disable_flagged() {
-            // -1 в одном бо́ке + positive в другом — likely typo.
+            // -1 in one bound + positive in the other — likely typo.
             let mut config = Config::default();
             config.transport.rotation.min_lifetime_secs = -1;
             config.transport.rotation.max_lifetime_secs = 3_600;

@@ -25,13 +25,13 @@ Worse still: the IP itself can land in a federal "VPN/proxy" blocklist once a sc
 ```
    client      DPI sees:                       Cloudflare      veil
      │              │                                │             │
-     ├─ TLS к ─────────────────────────────────────► (terminates) │
+     ├─ TLS to ────────────────────────────────────► (terminates) │
      │  www.example.workers.dev:443                   │             │
      │  SNI = www.example.workers.dev                 │             │
      │  IP = Cloudflare anycast (≈ 100k+ IPs)         │             │
      │                                                ├──── HTTP ───►
      │                                                │             │  webtunnel
-     │                                                │             │  upgrade на
+     │                                                │             │  upgrade to
      │                                                │             │  internal port
 ```
 
@@ -41,11 +41,11 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/_t/')) {
-      // Proxy WSS upgrade к veil's webtunnel listener.
+      // Proxy WSS upgrade to veil's webtunnel listener.
       const upstream = `wss://${env.VEIL_HOST}:443${url.pathname}`;
       return fetch(upstream, { headers: request.headers });
     }
-    // All other paths: serve decoy content (cached от Caddy-fronted host).
+    // All other paths: serve decoy content (cached from Caddy-fronted host).
     return fetch(`https://${env.VEIL_HOST}/`);
   }
 }
@@ -92,7 +92,7 @@ The operator can enable a SOCKS-proxy fallback so that **direct connect failures
 
 ```toml
 [transport]
-# Local Tor SOCKS port (install с `apt install tor` or similar).
+# Local Tor SOCKS port (install with `apt install tor` or similar).
 outbound_socks_fallback_proxy = "socks5://127.0.0.1:9050"
 ```
 
@@ -120,7 +120,7 @@ sudo systemctl enable --now tor
 # Verify Tor is listening on :9050:
 sudo ss -tlnp | grep 9050
 
-# Add к /var/lib/veil/node.toml [transport] section:
+# Add to /var/lib/veil/node.toml [transport] section:
 echo 'outbound_socks_fallback_proxy = "socks5://127.0.0.1:9050"' \
   | sudo tee -a /var/lib/veil/node.toml
 sudo systemctl restart veil
@@ -131,7 +131,7 @@ sudo systemctl restart veil
 ## #29-31 — Throughput-shaping / rating-group classifiers
 
 ### Threat
-Modern DPI (СКАТ DPI 12.0+, OpenIris) sorts traffic into bandwidth-rated buckets — "video streaming" vs "messaging" vs "VPN-shaped". A sustained ≥ 10 Mbps flow gets tagged differently from a bursty interactive one. So even with perfect byte-level fingerprint mimicry, the **shape** of the flow over time still leaks.
+Modern DPI (SKAT DPI 12.0+, OpenIris) sorts traffic into bandwidth-rated buckets — "video streaming" vs "messaging" vs "VPN-shaped". A sustained ≥ 10 Mbps flow gets tagged differently from a bursty interactive one. So even with perfect byte-level fingerprint mimicry, the **shape** of the flow over time still leaks.
 
 ### Recommendation — operator-side bandwidth policy
 
@@ -161,7 +161,7 @@ tc filter add dev eth0 parent 1: protocol ip u32 \
 
 ### Threat
 
-A normal HTTPS browser session lives for seconds to a few minutes, then opens a fresh TCP+TLS handshake to the next page. Veil sessions, by contrast, naturally stay up for hours or days. A DPI heuristic reads "this HTTPS-shaped flow has been open continuously for 6+ hours" as a strong VPN/tunnel tell (observed in TSPU 2024-2025 rulesets and СКАТ DPI 12.x flow-classifier output). Pair that with the throughput-shaping signal (#29-31) and the lifetime alone gives the censor a case — even when the per-byte fingerprint is perfect.
+A normal HTTPS browser session lives for seconds to a few minutes, then opens a fresh TCP+TLS handshake to the next page. Veil sessions, by contrast, naturally stay up for hours or days. A DPI heuristic reads "this HTTPS-shaped flow has been open continuously for 6+ hours" as a strong VPN/tunnel tell (observed in TSPU 2024-2025 rulesets and SKAT DPI 12.x flow-classifier output). Pair that with the throughput-shaping signal (#29-31) and the lifetime alone gives the censor a case — even when the per-byte fingerprint is perfect.
 
 ### Recommendation — code-side, default-on
 
@@ -241,10 +241,10 @@ Most VPS hosts ship no-swap by default; rented bare-metal often has swap configu
 echo 'kernel.core_pattern = |/bin/false' | sudo tee /etc/sysctl.d/50-veil.conf
 sudo sysctl --system
 
-# systemd-level (для veil.service unit):
+# systemd-level (for the veil.service unit):
 #   [Service]
 #   LimitCORE=0
-# или поставить prctl(PR_SET_DUMPABLE, 0) внутри veil (process-local; cheaper sweep).
+# or set prctl(PR_SET_DUMPABLE, 0) inside veil (process-local; cheaper sweep).
 ```
 
 **3. Disable hibernation for laptop / desktop relays** — closes #3:

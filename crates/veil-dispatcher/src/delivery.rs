@@ -34,7 +34,7 @@ pub fn rand_seed_for_pick(trace_id: u64) -> u64 {
 /// `candidates: Vec<[u8; 32]>` array (`hop_attrs[i]` describes
 /// `candidates[i]`).
 ///
-/// Lifted from а local-scope struct inside `relay_forward` so helper
+/// Lifted from a local-scope struct inside `relay_forward` so helper
 /// methods (`gather_relay_candidates`, future scoring extraction) can
 /// take and return it without inheriting the function's local type.
 /// Tuple returned by [`FrameDispatcher::gather_relay_candidates`]:
@@ -50,8 +50,8 @@ pub struct HopAttrs {
     pub rtt_ms: u32,
     /// Congestion byte (0-255) reported by the peer in keepalive frames.
     pub congestion: u8,
-    /// RTT-probe confidence (0.0 - 1.0).  Stale probes decay к 0 and
-    /// fall back к Vivaldi distance.
+    /// RTT-probe confidence (0.0 - 1.0).  Stale probes decay to 0 and
+    /// fall back to Vivaldi distance.
     pub confidence: f64,
     /// Battery percentage (0 = AC / unknown / not reported).
     pub battery: u8,
@@ -59,7 +59,7 @@ pub struct HopAttrs {
     pub jitter_ms: f64,
     /// `BandwidthClass` discriminant.  Narrow class penalises BULK traffic.
     pub bandwidth_class: u8,
-    /// Relay success EMA (0.0 - 1.0).  Used к penalise unreliable relays
+    /// Relay success EMA (0.0 - 1.0).  Used to penalise unreliable relays
     /// once `relay_attempts >= relay_reputation_min_attempts`.
     pub relay_success_ema: f32,
     /// Cumulative relay attempt count (gates reputation penalty).
@@ -161,9 +161,9 @@ impl FrameDispatcher {
             frame.extend_from_slice(&suffix);
 
             if reg_guard.send_to(&target, traffic_class, frame) {
-                // Direct-forward counter would land here на а future
+                // Direct-forward counter would land here on a future
                 // operator-dashboard milestone (was closed
-                // без the metric; не critical к session correctness).
+                // without the metric; not critical to session correctness).
                 return true;
             }
         }
@@ -201,17 +201,17 @@ impl FrameDispatcher {
         }
     }
 
-    /// Handle а source-routed relay frame.  Either forward к the next
+    /// Handle a source-routed relay frame.  Either forward to the next
     /// node listed in `path` OR deliver the inner payload locally if
     /// we are the terminal hop.  Drops on:
     /// - malformed wire bytes,
     /// - `path[next_hop] != local_node_id` (mis-routed),
-    /// - no session к the next-recipient (chain broken).
+    /// - no session to the next-recipient (chain broken).
     ///
-    /// The inner payload, at the terminal hop, is dispatched as а
+    /// The inner payload, at the terminal hop, is dispatched as a
     /// regular `AppDeliver` frame (sender-side wraps an `AppDeliverPayload`
     /// inside `inner`) so the existing app-registry routing path
-    /// delivers к the bound endpoint.
+    /// delivers to the bound endpoint.
     fn handle_relay_path(&self, body: &[u8], peer_id: NodeId) -> DispatchResult {
         use veil_proto::app::AppSendPayload;
         use veil_proto::codec::encode_header;
@@ -241,10 +241,10 @@ impl FrameDispatcher {
             ));
         }
 
-        // Terminal hop: decode the inner as `AppSendPayload` и hand off
-        // к the app registry just like an incoming `AppSend` от а direct
+        // Terminal hop: decode the inner as `AppSendPayload` and hand off
+        // to the app registry just like an incoming `AppSend` from a direct
         // session.  `src_node_id` becomes the last-hop peer (best effort;
-        // proper originator preservation needs а wire-format extension
+        // proper originator preservation needs a wire-format extension
         // that carries the originator separately).
         if payload.is_terminal() {
             match AppSendPayload::decode(&payload.inner) {
@@ -280,14 +280,14 @@ impl FrameDispatcher {
                 }
                 Err(e) => {
                     return DispatchResult::Violation(format!(
-                        "RelayPath terminal: inner is not а valid AppSend: {e}"
+                        "RelayPath terminal: inner is not a valid AppSend: {e}"
                     ));
                 }
             }
         }
 
-        // Forward к the next node в the path.  Increment next_hop, re-encode,
-        // send through whatever session exists к next_recipient.  Если no
+        // Forward to the next node in the path.  Increment next_hop, re-encode,
+        // send through whatever session exists to next_recipient.  If no
         // session — drop (the sender's path is broken; no point flooding).
         let next_id = match payload.next_recipient() {
             Some(id) => *id,
@@ -326,14 +326,14 @@ impl FrameDispatcher {
             self.logger.warn(
                 "relay_path.chain_broken",
                 format!(
-                    "from={} next={} hop={}/{} (no session к next hop)",
+                    "from={} next={} hop={}/{} (no session to next hop)",
                     veil_util::hex_short(peer_id.as_bytes()),
                     veil_util::hex_short(&next_id),
                     new_hop_index,
                     total_hops,
                 ),
             );
-            // Chain broken at this hop.  We have no way к signal the
+            // Chain broken at this hop.  We have no way to signal the
             // sender (RelayPath is unidirectional by design).
             if let Some(m) = &self.metrics {
                 m.inc_route_miss();
@@ -449,8 +449,8 @@ impl FrameDispatcher {
         Ok(relay_hops_out)
     }
 
-    /// Collect и rank relay-hop candidates for `dst`, excluding `peer_id`
-    /// (split-horizon) и `local_node_id` (self-loop guard), и filtering out
+    /// Collect and rank relay-hop candidates for `dst`, excluding `peer_id`
+    /// (split-horizon) and `local_node_id` (self-loop guard), and filtering out
     /// peers that did not advertise `CAN_RELAY`.
     ///
     /// Returns three parallel vectors:
@@ -459,11 +459,11 @@ impl FrameDispatcher {
     /// - `hops_with_scores` — `(hop, score)` pairs from route_cache (used
     ///   downstream for ECMP flow-pinning hash input)
     ///
-    /// All read locks are acquired и released inside the helper; no guards
+    /// All read locks are acquired and released inside the helper; no guards
     /// are held across the return.
     pub fn gather_relay_candidates(&self, dst: NodeIdBytes, peer_id: NodeId) -> RelayCandidates {
         // Acquire route_cache (Mutex), collect candidates with scores + hop counts.
-        // Split-horizon: drop the sending peer и self.
+        // Split-horizon: drop the sending peer and self.
         let mut raw: Vec<([u8; 32], u32, u8)> = rlock!(self.route_cache)
             .lookup_all_with_scores_and_hops(&dst)
             .into_iter()
@@ -494,7 +494,7 @@ impl FrameDispatcher {
         }
         // Per-hop routing attributes — one Vec instead of 5 HashMaps.
         // Index-based lookup avoids HashMap overhead for the typical
-        // 1-5 candidate case. rtt_lock is acquired и released here so
+        // 1-5 candidate case. rtt_lock is acquired and released here so
         // the caller can then take peer_vivaldi without lock-order risk.
         let hop_attrs: Vec<HopAttrs> = {
             let rtt_lock = self.control_plane.rtt_table();
@@ -550,7 +550,7 @@ impl FrameDispatcher {
     }
 
     /// Apply ECMP flow-pinning: identify the equal-cost group inside
-    /// `candidates` (using raw cache scores from `hops_with_scores` и the
+    /// `candidates` (using raw cache scores from `hops_with_scores` and the
     /// dispatcher's `ecmp_score_band`), then rotate the group prefix so that
     /// the path chosen by the per-flow hash appears first.
     ///
@@ -582,7 +582,7 @@ impl FrameDispatcher {
         if group_len < 2 {
             return 0;
         }
-        // Flow-pinning hash: XOR sender и destination node-ids, then mix bytes
+        // Flow-pinning hash: XOR sender and destination node-ids, then mix bytes
         // with FNV-1a to produce a stable per-flow index. Packets from the same
         // (src, dst) pair always take the same next-hop as long as the ECMP
         // group membership is stable.
@@ -602,7 +602,7 @@ impl FrameDispatcher {
 
     /// Score candidates via the weighted-random Efraimidis-Spirakis
     /// reservoir-sampling shuffle so multiple senders don't synchronise on
-    /// the same "best" hop под load.
+    /// the same "best" hop under load.
     ///
     /// `effective_score = (rtt_ms + 1 + jitter_penalty) × (1 + 2×cong/255)
     ///                    × (1 + 0.1×hop_count) × (1 + battery_penalty)
@@ -610,8 +610,8 @@ impl FrameDispatcher {
     /// `weight = confidence / effective_score`
     ///
     /// Stale probes (confidence → 0) sort last; otherwise candidates are
-    /// permuted с probability proportional к their weight.  The mutation
-    /// is in-place — `candidates` и `hop_attrs` are reshuffled together
+    /// permuted with probability proportional to their weight.  The mutation
+    /// is in-place — `candidates` and `hop_attrs` are reshuffled together
     /// preserving their parallel indexing.
     pub fn score_and_shuffle_candidates(
         &self,
@@ -687,8 +687,8 @@ impl FrameDispatcher {
 
         if candidates.len() > 1 {
             // Efraimidis-Spirakis weighted reservoir sample: each candidate
-            // gets key k = u^(1/w), sort descending → bias к high-weight
-            // entries без deterministically picking the best one.
+            // gets key k = u^(1/w), sort descending → bias to high-weight
+            // entries without deterministically picking the best one.
             use rand_core::{OsRng, RngCore};
             let mut keyed: Vec<(f64, usize)> = (0..candidates.len())
                 .map(|i| {
@@ -711,7 +711,7 @@ impl FrameDispatcher {
             *hop_attrs = keyed.iter().map(|(_, src)| hop_attrs[*src]).collect();
             *candidates = keyed.iter().map(|(_, src)| candidates[*src]).collect();
         }
-        // Single candidate: nothing к shuffle.
+        // Single candidate: nothing to shuffle.
     }
 
     /// Gateway fallback: route a forward through an internet-capable gateway
@@ -783,9 +783,9 @@ impl FrameDispatcher {
     }
 
     /// DHT recursive-relay fallback: when neither route_cache nor a gateway
-    /// can reach the recipient, find the DHT-closest nodes к `fwd_dst` and
-    /// wrap the forward в а `RecursiveRelayPayload` toward the first one
-    /// that has a live session. Returns `true` if а recursive-relay frame
+    /// can reach the recipient, find the DHT-closest nodes to `fwd_dst` and
+    /// wrap the forward in a `RecursiveRelayPayload` toward the first one
+    /// that has a live session. Returns `true` if a recursive-relay frame
     /// was emitted (regardless of whether the underlying `send_to` succeeded
     /// — failure is observed via the `send_to_failed` metric).
     pub fn try_recursive_relay_via_dht(
@@ -869,7 +869,7 @@ impl FrameDispatcher {
         if let Some(reg) = &self.session_tx_registry {
             let dst = fwd_dst;
 
-            // Collect и rank candidates BEFORE acquiring reg_guard.
+            // Collect and rank candidates BEFORE acquiring reg_guard.
             // All read-only lookups (route_cache, rtt) happen inside the helper
             // so reg_guard is held only for the minimal `send_to` window,
             // avoiding nested lock-ordering hazards. peer_vivaldi is acquired
@@ -878,7 +878,7 @@ impl FrameDispatcher {
                 self.gather_relay_candidates(dst, peer_id);
             self.score_and_shuffle_candidates(&mut candidates, &mut hop_attrs, traffic_class);
 
-            // ECMP flow pinning — identify the equal-cost group и rotate the
+            // ECMP flow pinning — identify the equal-cost group and rotate the
             // candidate prefix so the flow-pinned path comes first. Provides
             // deterministic per-flow path selection while leaving the order
             // outside the group unchanged.
@@ -1101,7 +1101,7 @@ impl FrameDispatcher {
             if let Some(tx) = tx_opt {
                 // try_send — route-miss signals are best-effort;
                 // drop silently when the channel is full (consumer is busy).
-                // pair `fwd_dst` с `traffic_class`
+                // pair `fwd_dst` with `traffic_class`
                 // so the fallback's per-priority timeout multiplier picks
                 // the right budget (INTERACTIVE = fast-fail
                 // BACKGROUND = tolerant).
@@ -1251,12 +1251,12 @@ impl FrameDispatcher {
         // Resolve the decapsulation-key seed once (used by both E2E branches).
         // prefer per-session ephemeral DK seed over long-term seed.
         let dk_seed: [u8; veil_e2e::DK_SEED_BYTES] = {
-            // Этап 6 slice 6h: per-session DK seeds ара
+            // Phase 6 slice 6h: per-session DK seeds are
             // SensitiveBytesN<64> not Copy, so dereference the `.as_array()`
-            // view к get а `[u8; 64]` value off the mlocked storage.  The
-            // resulting stack copy lives only через the ml-kem decap call
-            // below — short enough що swap exposure is bounded к single-
-            // digit microseconds под normal load.
+            // view to get a `[u8; 64]` value off the mlocked storage.  The
+            // resulting stack copy lives only through the ml-kem decap call
+            // below — short enough that swap exposure is bounded to single-
+            // digit microseconds under normal load.
             let map = lock!(self.crypto.per_session_mlkem_dk);
             map.get(&envelope.sender_node_id)
                 .map(|s| *s.as_array())
@@ -1386,7 +1386,7 @@ impl FrameDispatcher {
         // Match-shape (rather than `if status == DELIVERED`) is intentional —
         // future /221 work will add additional status arms (LOST
         // QUEUED, RETRYING etc); the match's `_ => {}` arm is the natural
-        // place к add them. Switching к `if`-form would require a bigger
+        // place to add them. Switching to `if`-form would require a bigger
         // refactor when the next status code arrives.
         #[allow(clippy::single_match)]
         match status.status {
@@ -1574,15 +1574,15 @@ impl FrameDispatcher {
 
         // Split-horizon + self-loop guard before forwarding.
         //
-        // Audit batch 2026-05-24 (M3): bind the looked-up hop к а local
+        // Audit batch 2026-05-24 (M3): bind the looked-up hop to a local
         // immediately so the rlock guard is dropped BEFORE we acquire
         // the session_tx_registry wlock.  Rust temporary semantics
-        // already drop it at end of statement, но binding makes the
-        // intent explicit и survives refactors (e.g. если `lookup()`
-        // were к return `&NodeId` instead of `NodeId`).  Lock-asymmetry
-        // concern: route_cache читается hot-path frequently; holding а
+        // already drop it at end of statement, but binding makes the
+        // intent explicit and survives refactors (e.g. if `lookup()`
+        // were to return `&NodeId` instead of `NodeId`).  Lock-asymmetry
+        // concern: route_cache is read hot-path frequently; holding a
         // reader across an unrelated wlock would let many writers
-        // pile up на the registry — sequential locking avoids the
+        // pile up on the registry — sequential locking avoids the
         // hazard entirely.
         let hop = {
             let cache = rlock!(self.route_cache);
@@ -2208,11 +2208,11 @@ mod tests {
         // matters because a re-dispatched frame with identical trace_id must
         // not always pick the same gateway (would defeat diversification).
         //
-        // Use sleep instead of а tight CPU loop: на modern fast CPUs (M2/M3)
-        // 1 000 black-box multiplies retire в well under а microsecond, which
-        // is shorter than the macOS `clock_gettime` resolution для some
+        // Use sleep instead of a tight CPU loop: on modern fast CPUs (M2/M3)
+        // 1 000 black-box multiplies retire in well under a microsecond, which
+        // is shorter than the macOS `clock_gettime` resolution for some
         // CLOCK_REALTIME backends.  100 µs sleep guarantees the OS wall clock
-        // advances past the SystemTime granularity bound на every supported
+        // advances past the SystemTime granularity bound on every supported
         // platform.
         let trace = 0xDEAD_BEEF_CAFE_BABEu64;
         let s1 = super::rand_seed_for_pick(trace);
@@ -2583,20 +2583,20 @@ mod tests {
     }
 
     /// Regression test for audit batch 2026-05-23: source-routed relay
-    /// must walk а 63-hop path end-to-end (worst-case diameter of the
+    /// must walk a 63-hop path end-to-end (worst-case diameter of the
     /// 64-node testnet linear topology, where node-0 → node-63).
     ///
     /// Verifies:
-    /// * every intermediate hop увеличивает `next_hop` by exactly 1
-    /// * `path` is never mutated в transit
+    /// * every intermediate hop increments `next_hop` by exactly 1
+    /// * `path` is never mutated in transit
     /// * `inner` survives 63 wire roundtrips byte-for-byte
     /// * terminal hop calls `route_ipc_deliver` and the registered
     ///   endpoint receives the original payload
     /// * neither `Violation` nor `chain_broken` occurs along the chain
     ///
-    /// Uses а single dispatcher instance per hop (cheap) by rewriting
+    /// Uses a single dispatcher instance per hop (cheap) by rewriting
     /// `local_node_id` between iterations and feeding the forwarded
-    /// frame back в as the next hop's input.
+    /// frame back in as the next hop's input.
     #[test]
     fn relay_path_63_hops_end_to_end() {
         use crate::DispatchResult;
@@ -2612,7 +2612,7 @@ mod tests {
 
         let sender_id = [0u8; 32];
 
-        // path[i] = byte-distinct id with i+1 в byte 0 (matches node-1..node-63).
+        // path[i] = byte-distinct id with i+1 in byte 0 (matches node-1..node-63).
         let mut path: Vec<[u8; 32]> = Vec::with_capacity(63);
         for i in 1u8..=63 {
             let mut id = [0u8; 32];
@@ -2622,7 +2622,7 @@ mod tests {
         assert_eq!(path.len(), 63);
         assert!(
             path.len() <= MAX_RELAY_PATH_HOPS,
-            "test assumes path fits в MAX_RELAY_PATH_HOPS={MAX_RELAY_PATH_HOPS}"
+            "test assumes path fits in MAX_RELAY_PATH_HOPS={MAX_RELAY_PATH_HOPS}"
         );
 
         // Original inner payload (identifiable byte pattern).
@@ -2637,7 +2637,7 @@ mod tests {
         };
         let inner_bytes = inner_send.encode();
 
-        // Initial relay frame body — next_hop=0 (node-0 hands off к path[0]).
+        // Initial relay frame body — next_hop=0 (node-0 hands off to path[0]).
         let initial_relay = RelayPathPayload {
             path: path.clone(),
             next_hop: 0,
@@ -2662,8 +2662,8 @@ mod tests {
         disp.session_tx_registry = Some(Arc::clone(&tx_reg));
 
         // Register an endpoint on the dispatcher's app_registry so the
-        // terminal hop's `route_ipc_deliver` call lands в а receiver мы
-        // can drain. `_endpoint_handle` MUST stay в scope (drop unregisters).
+        // terminal hop's `route_ipc_deliver` call lands in a receiver we
+        // can drain. `_endpoint_handle` MUST stay in scope (drop unregisters).
         let (_endpoint_handle, mut endpoint_rx) =
             disp.app_registry.register(dst_app_id, dst_endpoint_id, 16);
 
@@ -2681,7 +2681,7 @@ mod tests {
             );
 
             if i == 62 {
-                // Terminal hop — endpoint must have received Deliver с
+                // Terminal hop — endpoint must have received Deliver with
                 // original byte-pattern intact.
                 let msg = endpoint_rx
                     .try_recv()
@@ -2749,7 +2749,7 @@ mod tests {
                     "hop {i}: inner must be preserved byte-for-byte",
                 );
 
-                // Feed forwarded body back в as next hop's input.
+                // Feed forwarded body back in as next hop's input.
                 current_body = body_slice.to_vec();
             }
         }

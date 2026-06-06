@@ -1,20 +1,20 @@
 //! Obfs4-wrapped TCP transport.  Plain TCP underneath, obfs4 handshake
-//! + AEAD framing applied к the resulting stream so OVL1 не visible
-//! к passive DPI.
+//! + AEAD framing applied to the resulting stream so OVL1 is not visible
+//! to passive DPI.
 //!
-//! Wired в Phase 3+4 of [`docs/internal/PLAN_TRANSPORT_OBFUSCATION.md`](../../docs/internal/PLAN_TRANSPORT_OBFUSCATION.md).
+//! Wired in Phase 3+4 of [`docs/internal/PLAN_TRANSPORT_OBFUSCATION.md`](../../docs/internal/PLAN_TRANSPORT_OBFUSCATION.md).
 //!
 //! ## URI scheme
 //!
 //! `obfs4-tcp://host:port` — same host/port form as `tcp://`.  The PSK
 //! comes from [`TransportContext::obfs4_psk`] (per-runtime configuration);
-//! per-peer PSK lookup is а follow-up.
+//! per-peer PSK lookup is a follow-up.
 //!
 //! ## Anti-probing
 //!
-//! Server-side `bind` accepts only connections що carry а valid
+//! Server-side `bind` accepts only connections that carry a valid
 //! obfs4 handshake MAC.  Bad-MAC clients are silent-dropped (the
-//! `handshake.await?` Err path); active probers что don't know the
+//! `handshake.await?` Err path); active probers that don't know the
 //! PSK observe only TCP RST/FIN.
 
 use std::sync::Arc;
@@ -41,13 +41,13 @@ use super::{
 /// future returned by `accept()`, which the runtime accept-loop awaits
 /// before accepting the next connection (services.rs).
 /// `read_handshake_message` loops on `stream.read().await` with no time
-/// bound и only exits on EOF or HANDSHAKE_MAX_BYTES, so а peer that
+/// bound and only exits on EOF or HANDSHAKE_MAX_BYTES, so a peer that
 /// connects-and-goes-silent would hang the accept future forever and
 /// freeze ALL new inbound connections (slowloris / HOL-blocking DoS, no
-/// PSK needed).  Bounding the handshake к 10 s converts an unbounded
-/// hang into а bounded per-connection cost; the loop drops the stalled
-/// connection и continues.  10 s is generous for а legit crypto
-/// handshake + round-trip yet tight enough к bound the attack.
+/// PSK needed).  Bounding the handshake to 10 s converts an unbounded
+/// hang into a bounded per-connection cost; the loop drops the stalled
+/// connection and continues.  10 s is generous for a legit crypto
+/// handshake + round-trip yet tight enough to bound the attack.
 const OBFS4_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Plain TCP + obfs4 wrapping.
@@ -67,7 +67,7 @@ fn obfs4_parts(uri: &TransportUri) -> Result<(&str, u16)> {
 fn psk_from_context(ctx: &TransportContext) -> Result<NodeIdMacKey> {
     let raw = ctx.obfs4_psk.as_ref().ok_or_else(|| {
         TransportError::Unsupported(
-            "obfs4-tcp transport requires `obfs4_psk` set в TransportContext".to_owned(),
+            "obfs4-tcp transport requires `obfs4_psk` set in TransportContext".to_owned(),
         )
     })?;
     Ok(NodeIdMacKey(**raw))
@@ -94,7 +94,7 @@ impl Transport for Obfs4TcpTransport {
             let local_addr = tcp.local_addr().ok();
             let remote_addr = tcp.peer_addr().ok();
 
-            // Phase 2 kill-switch: client variant pulled от
+            // Phase 2 kill-switch: client variant pulled from
             // TransportContext.  Default V1 preserves pre-Phase-2
             // behavior.  Operator sets `[transport] obfs4_client_variant
             // = "v2"` only when all target servers' accept_variants
@@ -150,7 +150,7 @@ struct Obfs4TcpListener {
     psk: NodeIdMacKey,
     keepalive_idle: Option<std::time::Duration>,
     /// Phase 2 kill-switch: variants accepted on this listener,
-    /// в priority order.  First MAC verify wins.
+    /// in priority order.  First MAC verify wins.
     accept_variants: Vec<WireFormatVariant>,
 }
 
@@ -166,13 +166,13 @@ impl TransportListener for Obfs4TcpListener {
 
             // Run server-side handshake; silent-drop (return Err)
             // bad-PSK clients per anti-active-probe contract.  Phase 2
-            // kill-switch: tries each variant в `accept_variants`
+            // kill-switch: tries each variant in `accept_variants`
             // order; first MAC verify wins.
             //
-            // SECURITY (audit 2026-05-29): bound the handshake so а
+            // SECURITY (audit 2026-05-29): bound the handshake so a
             // silent/slow client cannot wedge the accept loop forever
             // (see OBFS4_HANDSHAKE_TIMEOUT).  On timeout we drop the
-            // connection (Err) и the loop proceeds к the next accept.
+            // connection (Err) and the loop proceeds to the next accept.
             let (wrapped, _matched_variant) = tokio::time::timeout(
                 OBFS4_HANDSHAKE_TIMEOUT,
                 obfs4_server_accept_multi(tcp, &self.psk, &self.accept_variants),
@@ -240,15 +240,15 @@ fn boxed_stream_connection_obfs4(
     peer: super::traits::PeerMeta,
     stream: BoxIoStream,
 ) -> Box<dyn TransportConnection> {
-    // Reuse the StreamConnection wrapper от the tcp module via а
-    // public constructor.  StreamConnection holds peer_meta + а
+    // Reuse the StreamConnection wrapper from the tcp module via a
+    // public constructor.  StreamConnection holds peer_meta + a
     // ready-to-be-taken BoxIoStream.
     boxed_stream_connection(peer, BoxIoStreamWrapper(stream))
 }
 
-/// Wraps а BoxIoStream so it can be passed как `impl IoStream` к
-/// `boxed_stream_connection`.  `BoxIoStream` IS `Box<dyn IoStream>` но
-/// `boxed_stream_connection` accepts а concrete `impl IoStream`; this
+/// Wraps a BoxIoStream so it can be passed as `impl IoStream` to
+/// `boxed_stream_connection`.  `BoxIoStream` IS `Box<dyn IoStream>` but
+/// `boxed_stream_connection` accepts a concrete `impl IoStream`; this
 /// adapter bridges them.
 struct BoxIoStreamWrapper(BoxIoStream);
 
@@ -296,10 +296,10 @@ mod tests {
     }
 
     /// End-to-end: bind, accept, connect, round-trip plaintext bytes
-    /// over the obfs4-wrapped TCP transport.  Verifies що:
+    /// over the obfs4-wrapped TCP transport.  Verifies that:
     /// - Both sides successfully complete the obfs4 handshake.
     /// - The session-layer sees plaintext bytes (obfs4 transparent).
-    /// - Server rejects а connection с the wrong PSK.
+    /// - Server rejects a connection with the wrong PSK.
     #[tokio::test]
     async fn obfs4_tcp_round_trip() {
         let psk = [0x42u8; 32];
@@ -363,7 +363,7 @@ mod tests {
             .parse()
             .unwrap();
 
-        // Server-accept task в background; expect it к Err on bad MAC.
+        // Server-accept task in background; expect it to Err on bad MAC.
         let server_task = tokio::spawn(async move { listener.accept().await });
 
         let connect_uri = TransportUri::Obfs4Tcp {

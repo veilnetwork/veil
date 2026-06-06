@@ -60,16 +60,16 @@ pub struct NodeMetrics {
     dht_lookup_total: Arc<AtomicU64>,
     /// Total STORE frames successfully queued during periodic re-replication
     /// across all keys. Healthy: rate ≈ `(records_published × DHT_REPLICATION_K)
-    /// / republish_interval` — а sustained shortfall indicates partitioned
+    /// / republish_interval` — a sustained shortfall indicates partitioned
     /// routing OR persistent unreachable closest-peers. audit
-    /// follow-up: closes the long-standing TODO в `publisher_dht.rs` of
+    /// follow-up: closes the long-standing TODO in `publisher_dht.rs` of
     /// "we have no visibility on whether identity / name records are actually
     /// reaching their K-replica targets".
     replicas_published_total: Arc<AtomicU64>,
     /// Re-replication ticks where the fan-out reached zero remote peers
-    /// (key was stored locally but found no replication targets). Spike в
+    /// (key was stored locally but found no replication targets). Spike in
     /// this counter signals partition / single-node situation — operator
-    /// alert trigger. Distinct from `replicas_published_total` so а single
+    /// alert trigger. Distinct from `replicas_published_total` so a single
     /// "K = 0 fan-out" event is observable even if total throughput stays
     /// healthy on other keys.
     replicas_under_count_total: Arc<AtomicU64>,
@@ -90,7 +90,7 @@ pub struct NodeMetrics {
     rekey_ack_sent_total: Arc<AtomicU64>,
     /// `RekeyAck` frames the initiator-side received and applied.
     rekey_ack_received_total: Arc<AtomicU64>,
-    /// AEAD decryption succeeded only via а stashed prev-cipher fallback —
+    /// AEAD decryption succeeded only via a stashed prev-cipher fallback —
     /// indicates an OLD-encrypted frame in flight during rekey. Healthy
     /// in low numbers (one or two per rekey under chat-load); a sustained
     /// spike means the 30 s grace window is being approached.
@@ -102,13 +102,13 @@ pub struct NodeMetrics {
     /// frames triggering session-teardown.
     rekey_grace_cap_evictions_total: Arc<AtomicU64>,
     /// `RekeyKeptInit` frames pushed onto the wire — emitted by the
-    /// lower-`node_id` side of а mutual rekey-init collision к signal
-    /// the loser к back off. Healthy under burst load (correlates с
+    /// lower-`node_id` side of a mutual rekey-init collision to signal
+    /// the loser to back off. Healthy under burst load (correlates with
     /// rekey-storm risk); persistent non-zero ⇒ both peers crossing
     /// the byte threshold in lockstep often.
     rekey_kept_init_sent_total: Arc<AtomicU64>,
     /// `RekeyKeptInit` frames received and applied (own pending init
-    /// reset к Idle, time-threshold trigger pushed forward). Mirrors
+    /// reset to Idle, time-threshold trigger pushed forward). Mirrors
     /// peer's `rekey_kept_init_sent_total`.
     rekey_kept_init_received_total: Arc<AtomicU64>,
     // ── Storage lifecycle ──────────────────────────────────────────
@@ -118,41 +118,41 @@ pub struct NodeMetrics {
     discovery_triggered_total: Arc<AtomicU64>,
     // ── Iterative-DHT route-discovery fallback ───────────────
     /// Count of `try_resolve_and_dial` invocations — fires whenever the
-    /// legacy `RouteRequest` flood (TTL=7) exhausts retries без finding а
-    /// route и we fall through к the relay-aware `RecursiveQuery(FIND_NODE)`
+    /// legacy `RouteRequest` flood (TTL=7) exhausts retries without finding a
+    /// route and we fall through to the relay-aware `RecursiveQuery(FIND_NODE)`
     /// path. High value indicates the network's diameter exceeds 7 hops
     /// regularly (sparse mesh / partition / pathological topology).
     dht_fallback_triggered_total: Arc<AtomicU64>,
     /// Count of fallbacks that succeeded — `RecursiveResponse` arrived
-    /// within the `RECURSIVE_TIMEOUT` budget и dispatcher populated
+    /// within the `RECURSIVE_TIMEOUT` budget and dispatcher populated
     /// `route_cache`. Ratio `resolved / triggered` is the **partition
     /// health signal**: > 0.5 = healthy mesh, < 0.2 = fragmentation OR
-    /// CPU starvation на the response path.
+    /// CPU starvation on the response path.
     dht_fallback_resolved_total: Arc<AtomicU64>,
     /// Count of fallbacks that hit the `RECURSIVE_TIMEOUT` (10 s) without
-    /// а response. High value points к either (a) network partition
+    /// a response. High value points to either (a) network partition
     /// past the recursive-query TTL=40 hop budget (b) target's
-    /// `SignedTransportAnnouncement` absent от DHT, or (c) under-load
-    /// daemons dropping responses на the reverse path.
+    /// `SignedTransportAnnouncement` absent from DHT, or (c) under-load
+    /// daemons dropping responses on the reverse path.
     dht_fallback_miss_total: Arc<AtomicU64>,
     /// route-miss events dropped because
     /// `pending_recursive` was already past the backpressure threshold.
     /// Operator alert trigger when this spikes alongside
     /// `dht_fallback_triggered_total` flatlining — fallback is being
-    /// silently disabled и the system is under sustained load.
+    /// silently disabled and the system is under sustained load.
     dht_fallback_skipped_backpressure_total: Arc<AtomicU64>,
     /// current effective timeout (ms) after
     /// adaptive scaling. Gauge — operator can correlate spikes
-    /// (timeout climbed → network is misbehaving) с the miss-rate
+    /// (timeout climbed → network is misbehaving) with the miss-rate
     /// panel. Equals baseline `dht_fallback_timeout_ms` when adaptive
     /// is disabled OR conditions are nominal.
     dht_fallback_effective_timeout_ms: Arc<AtomicU64>,
     /// Partition-recovery watchdog ( cascade follow-up):
     /// number of times `BootstrapWatchdog` observed `live_sessions == 0`
-    /// for `ZERO_STREAK_THRESHOLD` consecutive ticks и re-dialed the
-    /// operator-curated bootstrap list. Should be 0 in а healthy
+    /// for `ZERO_STREAK_THRESHOLD` consecutive ticks and re-dialed the
+    /// operator-curated bootstrap list. Should be 0 in a healthy
     /// cluster; non-zero indicates the local node was at some point
-    /// fully isolated from every direct peer и recovered via fallback.
+    /// fully isolated from every direct peer and recovered via fallback.
     bootstrap_watchdog_retries_total: Arc<AtomicU64>,
     // ── Partition detection ────────────────────────────────────────
     /// Count of route miss events that were followed by a successful recovery.
@@ -208,7 +208,7 @@ pub struct NodeMetrics {
     /// when its aggregate depth would exceed `DEFAULT_MAX_DEPTH`.
     /// Distinct from `session_tx_drops_total` which counts drops at the
     /// mpsc layer one stage upstream — this counter surfaces overflow
-    /// of the WRR queue between mpsc и wire write.
+    /// of the WRR queue between mpsc and wire write.
     priority_queue_drops_total: Arc<AtomicU64>,
     // ── IPC delivery backpressure ──────────────────────────────────
     /// Frames dropped because the per-IPC-client delivery channel was full.
@@ -236,9 +236,9 @@ pub struct NodeMetrics {
     // ── denial/drop counters surfaced by security gates ─────────
     /// RouteAnnounce/RouteWithdraw frames rejected because `via_node_id`
     /// did not match the transport-layer sender (post-461.7 invariant:
-    /// relays always re-sign с `via = self`, so divergence is malicious
+    /// relays always re-sign with `via = self`, so divergence is malicious
     /// by construction → Violation).  Metric name retained for dashboard
-    /// stability; semantics ара now "via spoof" не the original "quota
+    /// stability; semantics are now "via spoof" not the original "quota
     /// drop" (quota field removed 2026-05-22 after design moved past
     /// forward-then-verify).
     unknown_origin_gossip_rejected_total: Arc<AtomicU64>,
@@ -284,9 +284,9 @@ pub struct NodeMetrics {
     rendezvous_requests_rejected_rate_limit_total: Arc<AtomicU64>,
     rendezvous_requests_rejected_concurrency_total: Arc<AtomicU64>,
     rendezvous_requests_rejected_bind_failed_total: Arc<AtomicU64>,
-    /// Current snapshot — incremented когда an on-demand listener
-    /// is bound, decremented когда its lifecycle retires.  Gauge,
-    /// not а counter.
+    /// Current snapshot — incremented when an on-demand listener
+    /// is bound, decremented when its lifecycle retires.  Gauge,
+    /// not a counter.
     rendezvous_slots_in_use: Arc<AtomicU64>,
 }
 
@@ -390,12 +390,12 @@ pub struct MetricsSnapshot {
     pub session_wire_dropped_total: u64,
     // ── PoW-Gated Rendezvous (Slice 7) ───────────────────────────
     /// Total `SessionMsg::RequestEphemeralEndpoint` frames received
-    /// и handed к the controller.  Includes both granted и
-    /// rejected outcomes — denominator для grant-rate calculations.
+    /// and handed to the controller.  Includes both granted and
+    /// rejected outcomes — denominator for grant-rate calculations.
     pub rendezvous_requests_received_total: u64,
-    /// Subset of requests где the controller successfully bound an
-    /// on-demand listener и shipped а signed
-    /// `EphemeralEndpointResponse` back к the requester.
+    /// Subset of requests where the controller successfully bound an
+    /// on-demand listener and shipped a signed
+    /// `EphemeralEndpointResponse` back to the requester.
     pub rendezvous_requests_granted_total: u64,
     /// Requests rejected for malformed wire bytes (decode error).
     /// Counted under `rendezvous_requests_received_total` too.
@@ -403,7 +403,7 @@ pub struct MetricsSnapshot {
     /// Requests rejected at verify (bad sig, PoW below min, replay
     /// outside window, target_node_id ≠ ours).
     pub rendezvous_requests_rejected_verify_total: u64,
-    /// Requests rejected because the target_node_id field did не
+    /// Requests rejected because the target_node_id field did not
     /// match our local_node_id (mediator misrouted OR forged request).
     pub rendezvous_requests_rejected_not_our_target_total: u64,
     /// Requests rejected by the per-requester rate limiter.
@@ -411,12 +411,12 @@ pub struct MetricsSnapshot {
     /// Requests rejected by the concurrent-slot semaphore
     /// (max_concurrent in-flight on-demand listeners reached).
     pub rendezvous_requests_rejected_concurrency_total: u64,
-    /// Requests где verify + rate-limit + concurrent acquire all
-    /// passed но the bind closure itself failed (port pool exhausted,
+    /// Requests where verify + rate-limit + concurrent acquire all
+    /// passed but the bind closure itself failed (port pool exhausted,
     /// obfs4 wrapping error, etc.).
     pub rendezvous_requests_rejected_bind_failed_total: u64,
     /// Snapshot gauge: currently-active on-demand listener slots.
-    /// Increments when а bind succeeds; decrements when the lifecycle
+    /// Increments when a bind succeeds; decrements when the lifecycle
     /// retires.  Bounded by the operator's `max_concurrent` config.
     pub rendezvous_slots_in_use: u64,
 }
@@ -434,7 +434,7 @@ impl NodeLogger {
     }
 
     /// low-level constructor that takes the destructured config
-    /// values directly. `NodeLogger::from_config(&Config)` was lifted к
+    /// values directly. `NodeLogger::from_config(&Config)` was lifted to
     /// `veilcore::cfg::observability_glue` so this crate stays free of
     /// the cfg layer. Pass `LogsConfig::Stderr` to get the stderr sink;
     /// pass `LogsConfig::File` with `log_file = Some(path)` for a
@@ -592,7 +592,7 @@ impl NodeMetrics {
         }
     }
 
-    // `NodeMetrics::from_config(&Config)` was lifted к
+    // `NodeMetrics::from_config(&Config)` was lifted to
     // `veilcore::cfg::observability_glue::metrics_from_config` so this
     // crate stays free of the cfg layer.
 
@@ -679,8 +679,8 @@ impl NodeMetrics {
     }
 
     /// 6.33 visibility slice: per-stage rekey counters surface
-    /// the session-rekey state-machine progress в Prometheus так оператор
-    /// видит "rekey-init storm without acks" before sessions tear down.
+    /// the session-rekey state-machine progress in Prometheus so the operator
+    /// sees "rekey-init storm without acks" before sessions tear down.
     pub fn inc_rekey_init_sent(&self) {
         self.rekey_init_sent_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -699,7 +699,7 @@ impl NodeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Frame decrypted via а stashed prev cipher (rekey-grace fallback).
+    /// Frame decrypted via a stashed prev cipher (rekey-grace fallback).
     pub fn inc_rekey_decrypt_fallback(&self) {
         self.rekey_decrypt_fallback_total
             .fetch_add(1, Ordering::Relaxed);
@@ -713,8 +713,8 @@ impl NodeMetrics {
     }
 
     /// `RekeyKeptInit` frame pushed onto the wire — emitted by the
-    /// lower-`node_id` side of а mutual rekey-init collision к signal
-    /// the loser к back off.
+    /// lower-`node_id` side of a mutual rekey-init collision to signal
+    /// the loser to back off.
     pub fn inc_rekey_kept_init_sent(&self) {
         self.rekey_kept_init_sent_total
             .fetch_add(1, Ordering::Relaxed);
@@ -823,15 +823,15 @@ impl NodeMetrics {
         self.rendezvous_requests_rejected_bind_failed_total
             .fetch_add(1, Ordering::Relaxed);
     }
-    /// Increment the in-use-slots gauge — called когда an on-demand
+    /// Increment the in-use-slots gauge — called when an on-demand
     /// listener gets bound + its accept task spawns.
     pub fn inc_rendezvous_slots_in_use(&self) {
         self.rendezvous_slots_in_use.fetch_add(1, Ordering::Relaxed);
     }
-    /// Decrement the in-use-slots gauge — called когда an on-demand
+    /// Decrement the in-use-slots gauge — called when an on-demand
     /// listener's accept task exits (TTL OR budget exhausted).
     pub fn dec_rendezvous_slots_in_use(&self) {
-        // Saturating sub via CAS loop к avoid underflow на races.
+        // Saturating sub via CAS loop to avoid underflow on races.
         loop {
             let cur = self.rendezvous_slots_in_use.load(Ordering::Relaxed);
             if cur == 0 {
@@ -853,26 +853,26 @@ impl NodeMetrics {
     }
 
     /// iterative-DHT fallback was triggered — legacy
-    /// `RouteRequest` flood had exhausted its retries и we fall through
-    /// к the relay-aware `RecursiveQuery(FIND_NODE)` path.
+    /// `RouteRequest` flood had exhausted its retries and we fall through
+    /// to the relay-aware `RecursiveQuery(FIND_NODE)` path.
     pub fn inc_dht_fallback_triggered(&self) {
         self.dht_fallback_triggered_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
     /// iterative-DHT fallback resolved — `RecursiveResponse`
-    /// arrived within budget и dispatcher populated `route_cache`.
+    /// arrived within budget and dispatcher populated `route_cache`.
     pub fn inc_dht_fallback_resolved(&self) {
         self.dht_fallback_resolved_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// iterative-DHT fallback timed out without а response.
+    /// iterative-DHT fallback timed out without a response.
     pub fn inc_dht_fallback_miss(&self) {
         self.dht_fallback_miss_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// route-miss event dropped due к pending-
+    /// route-miss event dropped due to pending-
     /// recursive backpressure (fallback skipped).
     pub fn inc_dht_fallback_skipped_backpressure(&self) {
         self.dht_fallback_skipped_backpressure_total
@@ -880,8 +880,8 @@ impl NodeMetrics {
     }
 
     /// set the current adaptive-effective timeout
-    /// (ms) — exposed as а Prometheus gauge so operators can correlate
-    /// timeout climbs с miss-rate spikes.
+    /// (ms) — exposed as a Prometheus gauge so operators can correlate
+    /// timeout climbs with miss-rate spikes.
     pub fn set_dht_fallback_effective_timeout_ms(&self, ms: u64) {
         self.dht_fallback_effective_timeout_ms
             .store(ms, Ordering::Relaxed);
@@ -1497,9 +1497,9 @@ fn format_log_json(level: &str, event: &str, message: &str) -> String {
     // SECURITY (audit 2026-05-29, log-injection fix): RFC 8259 requires
     // control characters U+0000–U+001F inside JSON strings to be escaped.
     // The previous escape only handled `\` and `"`, so an attacker-
-    // controlled field carrying а raw newline/CR (e.g. а peer-supplied
-    // name echoed into а log event) could inject forged log lines OR
-    // produce malformed JSON що breaks downstream SIEM parsers.  Escape
+    // controlled field carrying a raw newline/CR (e.g. a peer-supplied
+    // name echoed into a log event) could inject forged log lines OR
+    // produce malformed JSON that breaks downstream SIEM parsers.  Escape
     // the standard short forms (\n \r \t \" \\ \b \f) and \u00XX for the
     // remaining C0 controls.
     let escape = |s: &str| {

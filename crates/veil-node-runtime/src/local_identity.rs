@@ -34,10 +34,10 @@ impl HandshakeIdentity {
     }
 }
 
-// Phase 2 session 2 prep: session/handshake.rs decoupled от concrete
+// Phase 2 session 2 prep: session/handshake.rs decoupled from concrete
 // `HandshakeIdentity` via the `LocalHandshakeIdentity` trait — see
 // `session::handshake::LocalHandshakeIdentity`.  Implementation here
-// delegates к the struct fields.
+// delegates to the struct fields.
 impl veil_session::handshake::LocalHandshakeIdentity for HandshakeIdentity {
     fn algo(&self) -> SignatureAlgorithm {
         self.algo

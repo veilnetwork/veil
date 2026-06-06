@@ -132,17 +132,17 @@ cmd_start() {
         generate_config "$n"
     done
 
-    # Wire bidirectional peer knowledge:  node-0 ↔ node-N для каждого N>0.
+    # Wire bidirectional peer knowledge:  node-0 ↔ node-N for each N>0.
     # node-0 acts as the seed; everyone else PEX-walks from there.
     #
     # **Bidirectional is required** under the Phase E20 directional dedup
-    # policy (veil-node-runtime/outbound_connector.rs:176):  для pair
-    # (A, B), the **smaller-hex** side dials, the larger-hex side waits для
-    # inbound.  If only one side knows the peer и that side happens к be
-    # the larger-hex one, no connection ever forms (наблюдалось node-1's
-    # hex `89c2…` > node-0's `29c1…` → node-1 sits в gateway.failover
-    # waiting на а dial from node-0, который не знает про node-1).  Adding
-    # the peer entry в both directions ensures whichever side has the lower
+    # policy (veil-node-runtime/outbound_connector.rs:176):  for pair
+    # (A, B), the **smaller-hex** side dials, the larger-hex side waits for
+    # inbound.  If only one side knows the peer and that side happens to be
+    # the larger-hex one, no connection ever forms (observed node-1's
+    # hex `89c2…` > node-0's `29c1…` → node-1 sits in gateway.failover
+    # waiting on a dial from node-0, which does not know about node-1).  Adding
+    # the peer entry in both directions ensures whichever side has the lower
     # hex is the one that actually dials.
     if (( num_nodes > 1 )); then
         local n0_pubkey n0_nonce n0_transport
@@ -155,8 +155,8 @@ cmd_start() {
                 "$n0_pubkey" "$n0_nonce" "$n0_transport" \
                 >/dev/null \
                 || die "peers add failed for node-${n}"
-            # node-0 learns node-N (so node-0 can dial out если it's the
-            # lower-hex side для this pair — required by the directional
+            # node-0 learns node-N (so node-0 can dial out if it's the
+            # lower-hex side for this pair — required by the directional
             # dedup policy described above).
             local nN_pubkey nN_nonce nN_transport
             nN_pubkey=$(  awk -F'"' '/^public_key /{print $2}' "$(config_file "$n")")
@@ -283,7 +283,7 @@ cmd_smoke() {
     info "node-0 responded to admin query."
 
     # Check all configured nodes are reachable.  Retry up to 90s per node so
-    # а node whose admin socket came up slightly later doesn't flake the
+    # a node whose admin socket came up slightly later doesn't flake the
     # test — observed 30s+ to first-`node show`-success on GitHub
     # ubuntu-latest under debug-mode PoW init (audit 2026-05-27 phase Q.4).
     local ok=0 fail=0
@@ -311,9 +311,9 @@ cmd_smoke() {
         fi
     done
 
-    # Short-circuit: если any node is unreachable, downstream topology /
-    # DHT / identity / name-resolve checks would all try к talk к the
-    # dead node и spam the log с pipeline failures.  Surface the actual
+    # Short-circuit: if any node is unreachable, downstream topology /
+    # DHT / identity / name-resolve checks would all try to talk to the
+    # dead node and spam the log with pipeline failures.  Surface the actual
     # root cause now instead of cascading.
     if (( fail > 0 )); then
         local total=$(( ok + fail ))
@@ -327,18 +327,18 @@ cmd_smoke() {
     # "admin responds" check above cannot.
     #
     # Poll up to 90s for sessions to come up — bootstrap + handshake on
-    # cold GitHub runners can take 30-60s даже под `--test-low-difficulty`
-    # (наблюдалось sessions_active=0 после 30s poll даже когда DHT local
-    # round-trip уже работает, audit 2026-05-27 phase Q.5).  Bumped от 30s
+    # cold GitHub runners can take 30-60s even under `--test-low-difficulty`
+    # (observed sessions_active=0 after a 30s poll even when the DHT local
+    # round-trip already works, audit 2026-05-27 phase Q.5).  Bumped from 30s
     # because debug-mode handshakes plus shared-CPU jitter push the
     # convergence window past one minute on ubuntu-latest.
     info "Topology check (sessions_active across nodes):"
     local topology_ok=0
     local topo_attempt=0
-    # Read sessions_active без letting а failing `node show` (dead node)
-    # propagate out of the pipeline и trigger `set -euo pipefail`.  The
+    # Read sessions_active without letting a failing `node show` (dead node)
+    # propagate out of the pipeline and trigger `set -euo pipefail`.  The
     # `if ... ; then ... else echo 0` pattern keeps the function exit
-    # code 0 даже когда the binary itself returns non-zero (e.g. admin
+    # code 0 even when the binary itself returns non-zero (e.g. admin
     # socket gone, node crashed).
     read_sessions_active() {
         local cfg="$1"
@@ -369,7 +369,7 @@ cmd_smoke() {
                 fi
             else
                 if (( sessions < 1 )); then
-                    pending_log+="    (${node} bootstrap к node-0 not yet handshaked)\n"
+                    pending_log+="    (${node} bootstrap to node-0 not yet handshaked)\n"
                     topology_ok=0
                 fi
             fi

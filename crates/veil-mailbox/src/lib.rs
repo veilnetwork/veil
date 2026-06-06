@@ -43,7 +43,7 @@
 //! **No push trigger.** Wiring `put` to FCM/APNs is P3.
 //! **No wire protocol.** IPC opcodes for `MailboxPut/Fetch/Ack` are
 //! P2.
-//! **No anonymity.** Caller is responsible для onion-wrapping the
+//! **No anonymity.** Caller is responsible for onion-wrapping the
 //! transport so the mailbox sees an anonymous deposit, not source IP.
 
 #![deny(missing_docs)]
@@ -79,14 +79,14 @@ pub use capability::{
 /// Default per-receiver quota in bytes (100 MiB).
 pub const DEFAULT_QUOTA_PER_RECEIVER_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Default per-sender quota в bytes (10 MiB ≈ 10 % of per-receiver cap).
+/// Default per-sender quota in bytes (10 MiB ≈ 10 % of per-receiver cap).
 ///
-/// Without an explicit per-sender bound, а single OVL1-authenticated peer
-/// can deposit up к `DEFAULT_RATE_LIMIT_PER_MINUTE` × `MAX_BLOB_BYTES` =
+/// Without an explicit per-sender bound, a single OVL1-authenticated peer
+/// can deposit up to `DEFAULT_RATE_LIMIT_PER_MINUTE` × `MAX_BLOB_BYTES` =
 /// 60 × 1 MiB = 60 MiB/min targeted at one victim's `receiver_id` (which
-/// is public information из `RendezvousAd`), filling the victim's
-/// 100 MiB quota в ~2 min.  10 MiB caps а single sender к ~10 % of the
-/// receiver's window per quota cycle, allowing K legitimate senders к
+/// is public information from `RendezvousAd`), filling the victim's
+/// 100 MiB quota in ~2 min.  10 MiB caps a single sender to ~10 % of the
+/// receiver's window per quota cycle, allowing K legitimate senders to
 /// co-exist before any one of them locks out the rest.  Operator can
 /// raise via `MailboxConfig::quota_per_sender_bytes`.
 pub const DEFAULT_QUOTA_PER_SENDER_BYTES: u64 = 10 * 1024 * 1024;
@@ -108,40 +108,40 @@ pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 60;
 /// trying to put a single multi-GiB blob to exhaust the quota.
 pub const MAX_BLOB_BYTES: u64 = 1024 * 1024;
 
-/// minimum age в seconds before а blob
-/// becomes eligible для **global-quota eviction** во время another
+/// minimum age in seconds before a blob
+/// becomes eligible for **global-quota eviction** during another
 /// receiver's [`Mailbox::put`]. Pre-fix the eviction loop would pick
-/// the oldest blob globally regardless of age и evict it к make room
-/// для а new put — meaning an attacker spamming `put` к random
-/// `receiver_id`s could fill the global 10 GiB cap и displace а
+/// the oldest blob globally regardless of age and evict it to make room
+/// for a new put — meaning an attacker spamming `put` to random
+/// `receiver_id`s could fill the global 10 GiB cap and displace a
 /// legitimate receiver's recent offline message (data loss, not just
 /// availability). Now blobs younger than this threshold are protected;
-/// если no eligible victim exists, the put is rejected с
+/// if no eligible victim exists, the put is rejected with
 /// `QuotaGlobalExceeded` instead of evicting fresh authenticated
 /// content. Stale attacker traffic ages out via TTL prune (default
 /// 24 h).
 pub const MIN_EVICTION_AGE_SECS: u64 = 3600;
 
 /// hard cap on the number of records
-/// returned by а single [`Mailbox::fetch`] call. Pre-fix `fetch` would
-/// allocate а `Vec<MailboxBlob>` containing every record для the
-/// receiver, with no count cap. Combined с the byte-only quota
-/// (100 MiB default) и [`MIN_BLOB_BYTES`] = 1, an attacker could
-/// deposit up к ~100M one-byte records under the per-receiver quota и
+/// returned by a single [`Mailbox::fetch`] call. Pre-fix `fetch` would
+/// allocate a `Vec<MailboxBlob>` containing every record for the
+/// receiver, with no count cap. Combined with the byte-only quota
+/// (100 MiB default) and [`MIN_BLOB_BYTES`] = 1, an attacker could
+/// deposit up to ~100M one-byte records under the per-receiver quota and
 /// trigger ~10 GiB of heap allocation when the receiver fetches. Now
 /// `fetch` returns at most this many records (oldest-first); callers
-/// that need the rest are expected к ack-then-fetch in batches.
+/// that need the rest are expected to ack-then-fetch in batches.
 pub const MAX_FETCH_COUNT: usize = 1024;
 
 /// Minimum size of a deposited blob (1 byte).
 ///
 /// pre-fix the only check was the
-/// upper bound, so а sender could spam empty (`blob.len == 0`) puts.
+/// upper bound, so a sender could spam empty (`blob.len == 0`) puts.
 /// Each empty put still consumes the quota counter at 0 bytes (no-op
-/// for the per-receiver quota) AND consumes а row in the redb blobs
-/// table (40+ bytes of redb overhead per empty record). Combined с
+/// for the per-receiver quota) AND consumes a row in the redb blobs
+/// table (40+ bytes of redb overhead per empty record). Combined with
 /// many distinct content_ids OR many distinct receivers, this turns
-/// into а disk-fill DoS that the quota subsystem cannot account for.
+/// into a disk-fill DoS that the quota subsystem cannot account for.
 /// Empty blobs also have no protocol use case — every legitimate
 /// payload type (small message, attachment, identity proof, push
 /// envelope) carries at least one byte of header.
@@ -164,27 +164,27 @@ const GLOBAL_BYTES_KEY: &str = "total";
 const TABLE_SENDER_BYTES: TableDefinition<&[u8], u64> = TableDefinition::new("sender_bytes_v1");
 
 /// secondary eviction index keyed only by
-/// **anonymous-pool** blobs (puts arriving without а valid capability
-/// token, или с `require_capability_token = false` policy and no token).
-/// Eviction loop scans this first; only falls back к the main
+/// **anonymous-pool** blobs (puts arriving without a valid capability
+/// token, or with `require_capability_token = false` policy and no token).
+/// Eviction loop scans this first; only falls back to the main
 /// `TABLE_EVICTION_INDEX` (identified pool) if the anon pool is empty.
-/// Pre-slice-3 records exist only в the main index; first put after
-/// upgrade adds the new index, и existing records continue в the
+/// Pre-slice-3 records exist only in the main index; first put after
+/// upgrade adds the new index, and existing records continue in the
 /// "identified pool" (conservative — doesn't lose existing bytes).
 const TABLE_EVICTION_INDEX_ANON: TableDefinition<&[u8], ()> =
     TableDefinition::new("eviction_index_anon_v1");
 
-/// trust class assigned к а blob at deposit
-/// time. Determines which eviction-index table it goes into и therefore
+/// trust class assigned to a blob at deposit
+/// time. Determines which eviction-index table it goes into and therefore
 /// which pool gets evicted first under global-quota pressure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustClass {
-    /// Anonymous deposit: sender either omitted а capability token
-    /// или supplied an invalid one (но the relay's policy was permissive
-    /// и accepted the put anyway). Evicted FIRST under global pressure.
+    /// Anonymous deposit: sender either omitted a capability token
+    /// or supplied an invalid one (but the relay's policy was permissive
+    /// and accepted the put anyway). Evicted FIRST under global pressure.
     Anonymous,
-    /// Identified deposit: sender supplied а receiver-signed capability
-    /// token that verified successfully. Evicted only после the anon
+    /// Identified deposit: sender supplied a receiver-signed capability
+    /// token that verified successfully. Evicted only after the anon
     /// pool drains. Also the default for in-process callers (`Mailbox::put`).
     Identified,
 }
@@ -223,10 +223,10 @@ pub enum MailboxError {
     #[error("corrupt record: {0}")]
     Corrupt(&'static str),
     /// outbox total-bytes quota would be exceeded.
-    /// IPC client может flood `Outbox::put` to fill disk; the per-blob
-    /// и total quotas (`outbox::MAX_OUTBOX_BLOB_BYTES` /
+    /// IPC client can flood `Outbox::put` to fill disk; the per-blob
+    /// and total quotas (`outbox::MAX_OUTBOX_BLOB_BYTES` /
     /// `OutboxConfig::quota_total_bytes`) bound this. Sender should
-    /// drain outbox via ack или wait для TTL prune before retrying.
+    /// drain outbox via ack or wait for TTL prune before retrying.
     #[error("outbox quota exceeded: current={current_bytes} blob={blob_size} cap={cap_bytes}")]
     OutboxQuotaExceeded {
         /// Bytes the outbox currently occupies (sum of all blob payloads).
@@ -282,21 +282,21 @@ pub struct MailboxConfig {
     /// protection independent of storage quota.
     pub rate_limit_per_minute: u32,
     /// when `true`, every PUT must include
-    /// а valid receiver-signed [`MailboxCapabilityToken`]. Puts без
-    /// а token, или с а token that fails verify (expired, wrong receiver
-    /// bad signature), are rejected с [`PutOutcome::CapabilityRequired`]
-    /// или [`PutOutcome::CapabilityInvalid`] respectively.
+    /// a valid receiver-signed [`MailboxCapabilityToken`]. Puts without
+    /// a token, or with a token that fails verify (expired, wrong receiver
+    /// bad signature), are rejected with [`PutOutcome::CapabilityRequired`]
+    /// or [`PutOutcome::CapabilityInvalid`] respectively.
     ///
-    /// Default `false` для backward compatibility — pre-slice-1 senders
-    /// emit no token, и а relay flipping this к `true` would refuse all
-    /// existing traffic. Flip к `true` only after the receiver-side mint
-    /// API и the sender-side propagation through `RendezvousAd`
+    /// Default `false` for backward compatibility — pre-slice-1 senders
+    /// emit no token, and a relay flipping this to `true` would refuse all
+    /// existing traffic. Flip to `true` only after the receiver-side mint
+    /// API and the sender-side propagation through `RendezvousAd`
     /// have rolled out.
     pub require_capability_token: bool,
-    /// cap on bytes а single sender_id may
+    /// cap on bytes a single sender_id may
     /// occupy across the entire mailbox (sum across all receivers).
-    /// Without this а sender targeting many receivers can drive the
-    /// global quota up while staying под each receiver's per-receiver
+    /// Without this a sender targeting many receivers can drive the
+    /// global quota up while staying under each receiver's per-receiver
     /// cap individually.
     ///
     /// Audit L-17: default `DEFAULT_QUOTA_PER_SENDER_BYTES` = 10 MiB (caps a
@@ -305,10 +305,10 @@ pub struct MailboxConfig {
     /// unsafe). Set to `u64::MAX` to disable the per-sender cap explicitly. PUT
     /// over this cap returns [`PutOutcome::QuotaPerSenderExceeded`].
     pub quota_per_sender_bytes: u64,
-    /// This relay's own `node_id`, used к verify v2 (relay-bound) capability
+    /// This relay's own `node_id`, used to verify v2 (relay-bound) capability
     /// tokens. When non-zero, v2 tokens MUST claim this id; v1 tokens are
-    /// still accepted unchanged (backward compat). Set к `[0u8; 32]` if the
-    /// mailbox is running в-process for the receiver's own node (no
+    /// still accepted unchanged (backward compat). Set to `[0u8; 32]` if the
+    /// mailbox is running in-process for the receiver's own node (no
     /// cross-relay attack surface) or for tests.
     pub local_node_id: [u8; 32],
 }
@@ -366,18 +366,18 @@ pub enum PutOutcome {
     /// A blob with the same `(receiver, content_id)` was already
     /// stored. No-op — the existing blob is preserved unchanged.
     Duplicate,
-    /// relay configured с
-    /// `require_capability_token = true` rejected а PUT that arrived
-    /// без а capability token. Sender should re-fetch the receiver's
-    /// `RendezvousAd` (which carries the current token) и retry.
+    /// relay configured with
+    /// `require_capability_token = true` rejected a PUT that arrived
+    /// without a capability token. Sender should re-fetch the receiver's
+    /// `RendezvousAd` (which carries the current token) and retry.
     CapabilityRequired,
-    /// capability token decode или verify
+    /// capability token decode or verify
     /// failed. Either the wire shape is malformed, the token expired
-    /// the issuer pubkey doesn't hash к the declared receiver, или the
+    /// the issuer pubkey doesn't hash to the declared receiver, or the
     /// signature is invalid. Caller does not learn the specific failure
     /// reason — same fail-closed pattern as auth_cookie mismatch in
-    /// `MailboxFetchPayload` к avoid signaling-side-channels к а probing
-    /// attacker. Operator-side trace logs (WARN level в the relay app
+    /// `MailboxFetchPayload` to avoid signaling-side-channels to a probing
+    /// attacker. Operator-side trace logs (WARN level in the relay app
     /// service) carry the granular reason.
     CapabilityInvalid,
     /// sender's per-sender byte cap would be
@@ -452,8 +452,8 @@ fn decode_record(bytes: &[u8]) -> Result<([u8; 32], u64, Vec<u8>), MailboxError>
 }
 
 /// read just (sender_id, deposited_at)
-/// header без allocating the blob bytes — useful when the eviction loop
-/// needs the sender для per-sender counter bookkeeping but otherwise
+/// header without allocating the blob bytes — useful when the eviction loop
+/// needs the sender for per-sender counter bookkeeping but otherwise
 /// throws the blob away.
 fn decode_record_header(bytes: &[u8]) -> Result<([u8; 32], u64), MailboxError> {
     if bytes.len() < 32 + 8 + 4 {
@@ -523,8 +523,8 @@ impl Mailbox {
             let _ = txn.open_table(TABLE_EVICTION_INDEX)?;
             let _ = txn.open_table(TABLE_GLOBAL_BYTES)?;
             // ensure new tables are created
-            // at first open. redb auto-creates on first open_table в
-            // а write transaction; idempotent on existing DBs.
+            // at first open. redb auto-creates on first open_table in
+            // a write transaction; idempotent on existing DBs.
             let _ = txn.open_table(TABLE_SENDER_BYTES)?;
             let _ = txn.open_table(TABLE_EVICTION_INDEX_ANON)?;
         }
@@ -557,25 +557,25 @@ impl Mailbox {
         Ok(mb)
     }
 
-    /// deposit а blob с а capability check
+    /// deposit a blob with a capability check
     /// against the relay's [`MailboxConfig::require_capability_token`]
     /// policy.
     ///
     /// `capability_token` carries the receiver-signed
-    /// [`MailboxCapabilityToken`] wire bytes (typically obtained от the
+    /// [`MailboxCapabilityToken`] wire bytes (typically obtained from the
     /// receiver's published `RendezvousAd`). Pass `None` for in-process
     /// callers that don't need authorisation (the receiver's own node
-    /// depositing к its own mailbox via the IPC bridge — the receiver
+    /// depositing to its own mailbox via the IPC bridge — the receiver
     /// is trusting itself).
     ///
     /// Verify path:
     /// 1. If `require_capability_token` is `false`, the token is verified
     ///    if provided (still rejects malformed) but absence is accepted.
     ///    This is the backward-compat default.
-    /// 2. If `require_capability_token` is `true`, а missing token →
-    ///    [`PutOutcome::CapabilityRequired`]; а token that fails decode
-    ///    или verify → [`PutOutcome::CapabilityInvalid`].
-    /// 3. On verify success the call delegates к [`Self::put`].
+    /// 2. If `require_capability_token` is `true`, a missing token →
+    ///    [`PutOutcome::CapabilityRequired`]; a token that fails decode
+    ///    or verify → [`PutOutcome::CapabilityInvalid`].
+    /// 3. On verify success the call delegates to [`Self::put`].
     pub fn put_with_capability(
         &self,
         receiver: [u8; 32],
@@ -594,10 +594,10 @@ impl Mailbox {
                 let token = match crate::capability::MailboxCapabilityToken::decode(bytes) {
                     Ok(t) => t,
                     Err(e) => {
-                        // INFO-level — а malformed token is more likely а
+                        // INFO-level — a malformed token is more likely a
                         // misconfigured client than an attack; routine spam
                         // would be hidden by INFO level. Operator can
-                        // bump to DEBUG если digging into а probe.
+                        // bump to DEBUG if digging into a probe.
                         tracing::info!(
                             target: "veil-mailbox",
                             "capability decode failed: {e}",
@@ -637,13 +637,13 @@ impl Mailbox {
     /// padding, and authenticating ciphertext.
     ///
     /// **:** this entry-point bypasses the capability
-    /// token policy gate. Production callers что accept inbound puts
-    /// от арбитрарных senders should use [`Self::put_with_capability`]
+    /// token policy gate. Production callers that accept inbound puts
+    /// from arbitrary senders should use [`Self::put_with_capability`]
     /// to enforce the receiver-signed-token requirement. This method
-    /// remains для in-process callers что are inherently trusted (e.g.
+    /// remains for in-process callers that are inherently trusted (e.g.
     /// the receiver's own node depositing into its own mailbox via the
-    /// IPC bridge, или test code) — they are stored в the identified
-    /// pool так как the daemon trusts itself.
+    /// IPC bridge, or test code) — they are stored in the identified
+    /// pool so as the daemon trusts itself.
     pub fn put(
         &self,
         receiver: [u8; 32],
@@ -654,11 +654,11 @@ impl Mailbox {
         self.put_classified(receiver, content_id, sender, blob, TrustClass::Identified)
     }
 
-    /// storage path с trust-class
-    /// classification. Anonymous-class blobs go into а secondary
+    /// storage path with trust-class
+    /// classification. Anonymous-class blobs go into a secondary
     /// eviction index that gets scanned first under global-quota
     /// pressure, so identified-class deposits won't be displaced by
-    /// а tokenless flood.
+    /// a tokenless flood.
     pub fn put_classified(
         &self,
         receiver: [u8; 32],
@@ -676,7 +676,7 @@ impl Mailbox {
         }
         // audit: reject empty / below-minimum blobs. See
         // `MIN_BLOB_BYTES` doc-comment for why — empty puts bypass
-        // the byte-counted quota и accumulate redb row overhead.
+        // the byte-counted quota and accumulate redb row overhead.
         if blob_size < MIN_BLOB_BYTES {
             return Err(MailboxError::BlobTooSmall {
                 actual: blob_size,
@@ -688,9 +688,9 @@ impl Mailbox {
         // SECURITY (audit 2026-05-29, poison-DoS fix): recover from a
         // poisoned rate-limiter mutex instead of `.expect()`-panicking.
         // A poisoned lock (some prior holder panicked) must NOT cascade
-        // into а panic on every subsequent PUT — that would convert one
-        // transient panic into а permanent mailbox DoS.  The rate-limiter
-        // state is а simple counter map; recovering the guard via
+        // into a panic on every subsequent PUT — that would convert one
+        // transient panic into a permanent mailbox DoS.  The rate-limiter
+        // state is a simple counter map; recovering the guard via
         // `into_inner()` is logically safe (worst case: one stale count).
         let now = (self.clock)();
         if !self
@@ -744,9 +744,9 @@ impl Mailbox {
                     } else {
                         // Global quota: evict oldest until the new blob fits.
                         // scan anonymous pool
-                        // first; only fall back к the identified pool
-                        // когда anonymous is empty. This protects
-                        // tokenized senders' blobs от tokenless-flood
+                        // first; only fall back to the identified pool
+                        // when anonymous is empty. This protects
+                        // tokenized senders' blobs from tokenless-flood
                         // displacement.
                         let mut global_total = global_bytes
                             .get(GLOBAL_BYTES_KEY)?
@@ -773,12 +773,12 @@ impl Mailbox {
                                     .map(|(k, _)| k.value().to_vec());
                                 (anon_head, ident_head)
                             };
-                            // audit / C-13: protect recently-deposited blobs от
+                            // audit / C-13: protect recently-deposited blobs from
                             // random-receiver-flood eviction — a victim younger
                             // than [`MIN_EVICTION_AGE_SECS`] is never displaced.
                             // Prefer the anonymous pool (shields tokenized
-                            // senders от tokenless-flood displacement), but when
-                            // its oldest entry is too young, fall through к an
+                            // senders from tokenless-flood displacement), but when
+                            // its oldest entry is too young, fall through to an
                             // older *identified* victim instead of rejecting:
                             // otherwise a flood of FRESH anon blobs would bounce
                             // legitimate identified puts even while old,
@@ -814,7 +814,7 @@ impl Mailbox {
                                 split_eviction_key(&victim_idx_key)?;
                             let victim_blob_key = make_key(&victim_receiver, &victim_content_id);
                             // Read the victim's record so we know its byte count
-                            // и its sender_id для per-sender accounting.
+                            // and its sender_id for per-sender accounting.
                             let victim_record = blobs
                                 .get(victim_blob_key.as_slice())?
                                 .ok_or(MailboxError::Corrupt(
@@ -828,7 +828,7 @@ impl Mailbox {
                             // sub-44-byte record can never underflow-panic here
                             // (decode_record_header above already enforces ≥ 44).
                             let victim_size = (victim_record.len() as u64).saturating_sub(44);
-                            // Remove от blobs + correct eviction index +
+                            // Remove from blobs + correct eviction index +
                             // adjust counters (receiver, sender, global).
                             blobs.remove(victim_blob_key.as_slice())?;
                             match victim_class {
@@ -895,19 +895,19 @@ impl Mailbox {
         Ok(outcome)
     }
 
-    /// Fetch up к [`MAX_FETCH_COUNT`] currently-stored blobs for `receiver`
-    /// oldest first. Does not delete — caller must call [`Self::ack`] для
-    /// each blob после the receiver has received it end-to-end.
+    /// Fetch up to [`MAX_FETCH_COUNT`] currently-stored blobs for `receiver`
+    /// oldest first. Does not delete — caller must call [`Self::ack`] for
+    /// each blob after the receiver has received it end-to-end.
     ///
-    /// ** bounded result. Pre-fix а
+    /// ** bounded result. Pre-fix a
     /// receiver could trigger ~10 GiB heap allocation if an attacker
-    /// deposited ~100M one-byte blobs против its 100 MiB byte quota.
-    /// Now the result is capped и а caller с more queued messages must
-    /// ack the returned batch и call `fetch` again. Caller-visible
-    /// behaviour change: оф clients written before this fix that didn't
-    /// drain в loops would now leave older blobs unacked indefinitely;
+    /// deposited ~100M one-byte blobs against its 100 MiB byte quota.
+    /// Now the result is capped and a caller with more queued messages must
+    /// ack the returned batch and call `fetch` again. Caller-visible
+    /// behaviour change: of clients written before this fix that didn't
+    /// drain in loops would now leave older blobs unacked indefinitely;
     /// the standard mailbox-IPC consumer (`MailboxIpcBridge`) already
-    /// drains в а loop because it ack's per-record после delivery.
+    /// drains in a loop because it ack's per-record after delivery.
     pub fn fetch(&self, receiver: [u8; 32]) -> Result<Vec<MailboxBlob>, MailboxError> {
         let txn = self.db.begin_read()?;
         let blobs = txn.open_table(TABLE_BLOBS)?;
@@ -993,8 +993,8 @@ impl Mailbox {
                     blobs.remove(key.as_slice())?;
                     let evict_key = make_eviction_key(deposited_at, &receiver, &content_id);
                     // ack does not know which
-                    // index the entry lives в — try both (remove on missing
-                    // is а no-op). At most one will fire.
+                    // index the entry lives in — try both (remove on missing
+                    // is a no-op). At most one will fire.
                     eviction_index.remove(evict_key.as_slice())?;
                     eviction_index_anon.remove(evict_key.as_slice())?;
                     let recv_total = bytes_per_receiver
@@ -1037,7 +1037,7 @@ impl Mailbox {
     }
 
     /// Remove all blobs older than `now - ttl_secs`. Returns the
-    /// count of pruned blobs. Designed для periodic background
+    /// count of pruned blobs. Designed for periodic background
     /// invocation (every few minutes).
     pub fn prune_expired(&self) -> Result<u64, MailboxError> {
         let now = (self.clock)();
@@ -1081,7 +1081,7 @@ impl Mailbox {
                 .get(GLOBAL_BYTES_KEY)?
                 .map(|v| v.value())
                 .unwrap_or(0);
-            // Drain anon pool first, then identified. Same shape для both;
+            // Drain anon pool first, then identified. Same shape for both;
             // only the index-table reference differs.
             for (victim_idx_key, is_anon) in victims_anon
                 .into_iter()

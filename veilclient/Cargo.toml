@@ -8,17 +8,17 @@ description = "High-level Rust client SDK for the Veil network"
 [dependencies]
 veilcore = { path = "../veilcore" }
 # Phase 6.50 audit (2026-05-09): veil-ipc moved from dev-dependency
-# к а regular dependency после the shim deletion in veilcore.
-# The lib re-routes calls к `veil_ipc::*` directly instead of через
+# to a regular dependency after the shim deletion in veilcore.
+# The lib re-routes calls to `veil_ipc::*` directly instead of through
 # the deleted `veilcore::node::ipc::*` re-export shim.
 veil-ipc = { path = "../crates/veil-ipc" }
-# Phase 6.50.d.6.1: needed после Phase 5d migration — public wire payloads
+# Phase 6.50.d.6.1: needed after Phase 5d migration — public wire payloads
 # (`AppIpcSendPayload.data`, `AppDeliverPayload.data`) carry `PooledShared`,
-# so the SDK boundary wraps user `&[u8]` через `pooled_shared_from_vec`.
+# so the SDK boundary wraps user `&[u8]` through `pooled_shared_from_vec`.
 veil-bufpool = { path = "../crates/veil-bufpool" }
 # Slice 4 of the PoW-Gated Rendezvous epic — rendezvous module uses
 # the proto crate's wire frames + sign/verify helpers directly.
-# Promoted from dev-dependency к regular dep.
+# Promoted from dev-dependency to regular dep.
 veil-proto = { path = "../crates/veil-proto" }
 tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros"] }
 # `PollSender` gives the `AsyncWrite` stream path real channel backpressure

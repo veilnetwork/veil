@@ -1,26 +1,26 @@
 #!/bin/bash
 # Phase 6.50.b chaos-ban cycler — exercise the iterative-DHT fallback in
-# production by banning а random active session for 600 s every 600 s.
+# production by banning a random active session for 600 s every 600 s.
 #
 # Each cycle:
 #   1. Sample one active peer node_id (full 64-hex via `sessions list -v`).
 #   2. `sessions ban <peer>` — drops the direct session.  When chat_node
-#      next attempts an `app.send` к that peer, dispatcher's
+#      next attempts an `app.send` to that peer, dispatcher's
 #      DELIVERY_FORWARD path hits route-cache, RouteRequest flood (TTL=7)
 #      tries to recover, eventually exhausts retries, the new
-#      iterative-DHT fallback fires а RecursiveQuery(FIND_NODE), gets
-#      back а signed response, and route_cache repopulates с а multi-hop
+#      iterative-DHT fallback fires a RecursiveQuery(FIND_NODE), gets
+#      back a signed response, and route_cache repopulates with a multi-hop
 #      relay path.  Empirically this should bump
-#      `veil_dht_fallback_triggered_total` и (assuming healthy mesh)
+#      `veil_dht_fallback_triggered_total` and (assuming healthy mesh)
 #      `veil_dht_fallback_resolved_total`.
 #   3. Sleep 600 s.
 #   4. `sessions unban <peer>` — direct session re-establishes.
-#   5. Pick а NEW random peer (avoiding the just-unbanned one) и repeat.
+#   5. Pick a NEW random peer (avoiding the just-unbanned one) and repeat.
 #
 # Cleanup: on SIGTERM/EXIT, unban whatever peer is currently banned so
 # the cluster returns to clean state when the operator stops the service.
 #
-# Self-protect: never bans bootstrap peers (b1/b2/b3) от а bootstrap host
+# Self-protect: never bans bootstrap peers (b1/b2/b3) from a bootstrap host
 # itself — would lose the only way back if something goes wrong.
 
 set -euo pipefail
@@ -29,14 +29,14 @@ CFG=/var/lib/veil/node.toml
 CLI=/usr/local/bin/veil-cli
 # Ban duration picked uniformly at random per cycle from [PERIOD_MIN, PERIOD_MAX]
 # seconds.  Avoids the synchronised-cycle artefact of the fixed-600s version
-# where all 8 hosts banned at multiples of 600 s и unbanned simultaneously,
-# producing periodic cluster-wide ban storms.  Each cycle also adds а 1-second
+# where all 8 hosts banned at multiples of 600 s and unbanned simultaneously,
+# producing periodic cluster-wide ban storms.  Each cycle also adds a 1-second
 # gap between unban and the next ban (i.e. real cycle = N + 1).
 PERIOD_MIN=600
 PERIOD_MAX=1200
 LOG_PREFIX="$(date -u +%FT%TZ) chaos-ban"
 
-# Bootstrap node_ids — NEVER ban these.  Banning а bootstrap kills DHT
+# Bootstrap node_ids — NEVER ban these.  Banning a bootstrap kills DHT
 # discovery for the host that did it; if 4+ hosts ban the same bootstrap
 # at once the whole cluster fragments (observed 2026-05-12 cascade).
 BOOTSTRAP_IDS=(
@@ -62,7 +62,7 @@ echo "$LOG_PREFIX started — period=[${PERIOD_MIN},${PERIOD_MAX}]s (random per 
 while true; do
     # Pull active peers, drop the header line, extract full node_id column,
     # exclude bootstrap node_ids (banning them fragments the cluster) AND
-    # the just-unbanned peer (avoid same-peer re-ban two cycles in а row),
+    # the just-unbanned peer (avoid same-peer re-ban two cycles in a row),
     # shuffle, pick one.
     exclude_pattern="^(${last_banned}"
     for bid in "${BOOTSTRAP_IDS[@]}"; do
@@ -82,7 +82,7 @@ while true; do
         continue
     fi
 
-    # `shuf` lives в coreutils on Ubuntu 24.04.
+    # `shuf` lives in coreutils on Ubuntu 24.04.
     target=$(echo "$peers" | shuf -n 1)
     current_banned="$target"
 
@@ -106,7 +106,7 @@ while true; do
     last_banned="$target"
     current_banned=""
 
-    # +1s gap before the next BAN (user-requested: "через N+1 секунд повторяем")
-    # gives sessions а brief breather to re-establish before the next disruption.
+    # +1s gap before the next BAN (user-requested: "repeat after N+1 seconds")
+    # gives sessions a brief breather to re-establish before the next disruption.
     sleep 1
 done

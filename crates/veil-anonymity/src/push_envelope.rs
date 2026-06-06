@@ -1,25 +1,25 @@
 //! Push-token sealing primitive.
 //!
-//! The receiver's `RendezvousAd` (see [`super::rendezvous`]) carries а
+//! The receiver's `RendezvousAd` (see [`super::rendezvous`]) carries a
 //! `push_envelope: Vec<u8>` field — opaque-to-veil sealed bytes that
-//! only а trusted push-relay operator can decrypt. This module provides
+//! only a trusted push-relay operator can decrypt. This module provides
 //! the actual seal / unseal primitive.
 //!
 //! # Threat model
 //!
-//! * **Sender** (anyone fetching the rendezvous-ad из DHT) sees only
+//! * **Sender** (anyone fetching the rendezvous-ad from DHT) sees only
 //!   the sealed envelope. Cannot recover the underlying FCM/APNs token
 //!   nor link receiver_node_id ↔ token without the relay's X25519 sk.
 //! * **Censor** observing DHT traffic sees published envelopes but can't
 //!   decrypt — so cannot pressure Google/Apple to disclose "give me the
 //!   device IDs that received these FCM tokens" to deanonymize users.
 //! * **Push-relay operator** holds the X25519 sk and can decrypt. Sees
-//!   only "user X (by node_id) wants а wake-up at time T". Cannot read
+//!   only "user X (by node_id) wants a wake-up at time T". Cannot read
 //!   message content (veil E2E protects). Trust placed:
-//!   "this operator forwards wake-ups but does not log token-к-user
+//!   "this operator forwards wake-ups but does not log token-to-user
 //!   correlations indefinitely". Future slice can add forward-secrecy
 //!   via per-message ephemeral relay keys; currently the relay's
-//!   long-term sk decrypts every envelope addressed к it.
+//!   long-term sk decrypts every envelope addressed to it.
 //!
 //! # Wire format
 //!
@@ -30,27 +30,27 @@
 //! ```
 //!
 //! Total: `64 + token.len` bytes. Cap [`MAX_PUSH_TOKEN_LEN`] = 384 so
-//! а sealed envelope fits in [`super::rendezvous::MAX_PUSH_ENVELOPE_LEN`]
+//! a sealed envelope fits in [`super::rendezvous::MAX_PUSH_ENVELOPE_LEN`]
 //! = 512 B cap on the wire field.
 //!
 //! # Domain separation
 //!
 //! AEAD AAD = `b"veil-push-envelope-v1\0"` — distinct from onion-layer
 //! ([`super::onion`] uses `b"veil-onion-v1\0"`) so an envelope sealed
-//! for push delivery cannot be re-dispatched as а circuit layer (или vice
+//! for push delivery cannot be re-dispatched as a circuit layer (or vice
 //! versa). Bumping `:v1` would invalidate every published envelope —
-//! only do this on а security-relevant format change.
+//! only do this on a security-relevant format change.
 //!
 //! # Forward secrecy
 //!
 //! Sender's per-call ephemeral keypair gives forward secrecy IF the
 //! relay keeps its long-term sk safe. If the relay's disk is seized
-//! ALL past sealed envelopes addressed к it can be retroactively
+//! ALL past sealed envelopes addressed to it can be retroactively
 //! decrypted (same property as Tor's pre-NTor onion routing).
-//! documents the analogous gap для anonymity-layer
+//! documents the analogous gap for anonymity-layer
 //! relay keys; same defence direction applies — short-rotation cadence
 //! published as overlapping `valid_from / valid_until` intervals.
-//! Out-of-scope для this primitive; the rotation scheme lives in the
+//! Out-of-scope for this primitive; the rotation scheme lives in the
 //! push-relay reference implementation.
 
 use chacha20poly1305::{
@@ -75,21 +75,21 @@ pub const NONCE_LEN: usize = 12;
 /// ChaCha20-Poly1305 AEAD tag length.
 pub const TAG_LEN: usize = 16;
 
-/// Per-envelope wire overhead: eph_pk + nonce + AEAD tag. Add к
+/// Per-envelope wire overhead: eph_pk + nonce + AEAD tag. Add to
 /// `token.len` to compute the full sealed envelope length.
 pub const PUSH_ENVELOPE_OVERHEAD: usize = EPH_PK_LEN + NONCE_LEN + TAG_LEN;
 
 /// Hard cap on the inner token length. FCM HTTP v1 tokens are typically
 /// ~163 chars (base64-ish); APNs binary tokens are 32 bytes; iOS
-/// PassKit tokens up to ~190 bytes; this 384 ceiling leaves slack для
-/// future formats и still fits sealed envelope под the
+/// PassKit tokens up to ~190 bytes; this 384 ceiling leaves slack for
+/// future formats and still fits sealed envelope under the
 /// [`super::rendezvous::MAX_PUSH_ENVELOPE_LEN`] = 512 B wire cap
 /// (384 + 60 = 444 ≤ 512 with 68 B slack).
 pub const MAX_PUSH_TOKEN_LEN: usize = 384;
 
 /// Hard cap on the wire envelope size. Mirrors
-/// [`super::rendezvous::MAX_PUSH_ENVELOPE_LEN`] for consistency но
-/// kept as а separate constant so this module is loadable in
+/// [`super::rendezvous::MAX_PUSH_ENVELOPE_LEN`] for consistency but
+/// kept as a separate constant so this module is loadable in
 /// isolation (e.g. push-relay reference impl that doesn't import
 /// rendezvous primitives).
 pub const MAX_PUSH_ENVELOPE_LEN: usize = 512;
@@ -112,10 +112,10 @@ pub enum PushEnvelopeError {
 
 // ── Seal ────────────────────────────────────────────────────────────────────
 
-/// Encrypt `token` к the push-relay identified by `relay_pk` (X25519
+/// Encrypt `token` to the push-relay identified by `relay_pk` (X25519
 /// public key). Output layout: `eph_pk (32B) || nonce (12B) || ct+tag`.
 ///
-/// Fresh ephemeral keypair generated per call → forward secrecy против
+/// Fresh ephemeral keypair generated per call → forward secrecy against
 /// future ephemeral compromise (assumes relay's long-term sk stays safe;
 /// see module docstring).
 pub fn seal_push_envelope(
@@ -140,9 +140,9 @@ pub fn seal_push_envelope(
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&aead_key));
     let aad = build_aad(&ephemeral_pk, &nonce_bytes);
-    // ChaCha20-Poly1305 cannot fail at the encrypt path для valid
+    // ChaCha20-Poly1305 cannot fail at the encrypt path for valid
     // key/nonce/payload sizes (which we control here); panic here would
-    // be а chacha20poly1305 bug.
+    // be a chacha20poly1305 bug.
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce_bytes),
@@ -163,7 +163,7 @@ pub fn seal_push_envelope(
 
 // ── Unseal ──────────────────────────────────────────────────────────────────
 
-/// Decrypt а sealed envelope using the push-relay's static X25519 secret.
+/// Decrypt a sealed envelope using the push-relay's static X25519 secret.
 /// Returns the original `token` bytes on success; AEAD failure on wrong
 /// key / tampered envelope / wrong domain.
 ///
@@ -213,9 +213,9 @@ pub fn unseal_push_envelope(
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// BLAKE3-based KDF: derives а 32-byte ChaCha20-Poly1305 key из the
+/// BLAKE3-based KDF: derives a 32-byte ChaCha20-Poly1305 key from the
 /// X25519 shared-secret bytes. Domain separator binds the derivation
-/// к "push-envelope" purpose, distinct from onion-layer keys.
+/// to "push-envelope" purpose, distinct from onion-layer keys.
 fn derive_aead_key(shared: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new_derive_key("veil.push_envelope.aead.v1");
     h.update(shared);
@@ -225,7 +225,7 @@ fn derive_aead_key(shared: &[u8]) -> [u8; 32] {
     out
 }
 
-/// AAD bound into the AEAD: `domain || eph_pk || nonce`. Tampering с
+/// AAD bound into the AEAD: `domain || eph_pk || nonce`. Tampering with
 /// any of these triggers AEAD failure on decrypt. Including eph_pk +
 /// nonce in AAD makes header-bit fuzzing produce AEAD failures rather
 /// than silent successes.
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn t1_1_empty_token_round_trips() {
-        // App that wants к unregister push: send empty envelope.
+        // App that wants to unregister push: send empty envelope.
         // Still must encrypt-then-decrypt cleanly so the relay sees
         // "this user has no push" rather than a malformed envelope.
         let (relay_sk, relay_pk) = fixture_relay_keypair();
@@ -319,7 +319,7 @@ mod tests {
     fn t1_1_tampered_ciphertext_aead_failure() {
         let (relay_sk, relay_pk) = fixture_relay_keypair();
         let mut envelope = seal_push_envelope(b"original-token", &relay_pk).unwrap();
-        // Flip а bit в the ciphertext.
+        // Flip a bit in the ciphertext.
         let last = envelope.len() - 1;
         envelope[last] ^= 0x01;
         let err = unseal_push_envelope(&envelope, &relay_sk).unwrap_err();
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn t1_1_tampered_eph_pk_aead_failure() {
         // CRITICAL: AAD includes eph_pk so swapping it produces AEAD
-        // failure rather than а silent success с garbled ciphertext.
+        // failure rather than a silent success with garbled ciphertext.
         let (relay_sk, relay_pk) = fixture_relay_keypair();
         let mut envelope = seal_push_envelope(b"token", &relay_pk).unwrap();
         envelope[0] ^= 0x01;
@@ -365,8 +365,8 @@ mod tests {
     #[test]
     fn t1_1_two_seals_produce_distinct_ciphertexts() {
         // Fresh ephemeral keypair per seal → two seals of the same token
-        // к the same relay produce different envelopes. Without this
-        // а passive observer correlating envelopes could fingerprint а
+        // to the same relay produce different envelopes. Without this
+        // a passive observer correlating envelopes could fingerprint a
         // user as "same token across multiple receivers".
         let (_relay_sk, relay_pk) = fixture_relay_keypair();
         let e1 = seal_push_envelope(b"same-token", &relay_pk).unwrap();
@@ -377,13 +377,13 @@ mod tests {
     #[test]
     fn t1_1_envelope_does_not_reveal_token() {
         // Smoke test: passive observer of the envelope cannot read
-        // the underlying token (без the relay's sk). We don't claim
+        // the underlying token (without the relay's sk). We don't claim
         // CCA security beyond AEAD's standard guarantees; this just
         // checks the wire format does NOT contain plaintext token.
         let (_relay_sk, relay_pk) = fixture_relay_keypair();
         let token = b"secret-token-do-not-leak";
         let envelope = seal_push_envelope(token, &relay_pk).unwrap();
-        // The token bytes should not appear contiguously в the envelope.
+        // The token bytes should not appear contiguously in the envelope.
         assert!(!envelope.windows(token.len()).any(|w| w == token));
     }
 }

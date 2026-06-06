@@ -134,10 +134,10 @@ impl NodeRuntime {
             let logger = self.logger.clone();
             let urls = config.global.bootstrap_https_urls.clone();
             let transport_ctx = self.transport_ctx.clone();
-            // Construct policy от config: pinned-issuer takes precedence
-            // (signed-required + pin); else signed-required без pinning
+            // Construct policy from config: pinned-issuer takes precedence
+            // (signed-required + pin); else signed-required without pinning
             // when `legacy_allow_unsigned_bootstrap = false` (default);
-            // else legacy unsigned acceptance (dev/testnet опт-ин).
+            // else legacy unsigned acceptance (dev/testnet opt-in).
             let bootstrap_policy = match config.global.trusted_bundle_issuer_pubkey.as_deref() {
                 Some(pk) => veil_bootstrap::https::BootstrapHttpsPolicy::signed_required(pk),
                 None if !config.global.legacy_allow_unsigned_bootstrap => {
@@ -679,7 +679,7 @@ impl NodeRuntime {
                             // 256-entry prune-on-overflow logic catches
                             // the stale JoinHandles from prior retry
                             // waves; raw `extend` bypasses pruning and
-                            // grows the Vec linearly с retry count.
+                            // grows the Vec linearly with retry count.
                             {
                                 let mut t = lock_tasks(&tasks);
                                 if t.sessions.len() + handles.len() >= 256 {
@@ -754,7 +754,7 @@ impl NodeRuntime {
             route_request_backoff_ms,
             partition_threshold,
             // wire the iterative-DHT fallback so
-            // что after RouteRequest flood retries are exhausted we run а
+            // that after RouteRequest flood retries are exhausted we run a
             // Kademlia walk + direct dial. Closes the > 16-hop reach gap
             // exposed by the 20-node linear chain test (long-chain
             // reach extension).
@@ -819,10 +819,10 @@ impl NodeRuntime {
         let route_cache = Arc::clone(&self.routing.route_cache);
         let route_updated = Arc::clone(&self.dispatcher.route_updated);
         // Epic 486.1 slice 3 (audit batch 2026-05-23): construct cold-start
-        // ML-KEM EK resolver и attach it к the IPC server.  When the IPC
-        // sender's local `peer_mlkem_keys` cache misses for а target node_id,
-        // the resolver fetches + verifies the recipient's EK от DHT (instance
-        // registry walk + cert chain) и populates the cache.
+        // ML-KEM EK resolver and attach it to the IPC server.  When the IPC
+        // sender's local `peer_mlkem_keys` cache misses for a target node_id,
+        // the resolver fetches + verifies the recipient's EK from DHT (instance
+        // registry walk + cert chain) and populates the cache.
         let mlkem_ek_resolver: Arc<dyn veil_types::MlKemEkResolver> =
             Arc::new(crate::mlkem_resolver::DhtMlKemEkResolver::new(
                 Arc::clone(&self.dht),
@@ -864,13 +864,13 @@ impl NodeRuntime {
             }
         };
         // Audit batch 2026-05-25 phase O (cross-audit #3 closure):
-        // если sovereign identity wired AND uses Ed25519, configure
-        // anycast к auto-sign all advertise calls (including those
-        // initiated через IPC `AnycastAdvertise`).  Resolvers running
+        // if sovereign identity wired AND uses Ed25519, configure
+        // anycast to auto-sign all advertise calls (including those
+        // initiated through IPC `AnycastAdvertise`).  Resolvers running
         // `SignedOnly` / `SignedBound` will admit our records.  PQ-only
-        // sovereign identities (Falcon-512) fall through к unsigned
-        // v1 advertise — caller-side opt-in к sign would require Falcon
-        // anycast support, which is а separate wire-compat exercise.
+        // sovereign identities (Falcon-512) fall through to unsigned
+        // v1 advertise — caller-side opt-in to sign would require Falcon
+        // anycast support, which is a separate wire-compat exercise.
         let mut anycast_svc_builder = veil_anycast::AnycastService::new(
             Arc::clone(&self.dht),
             *self.identity.local_identity.node_id.as_bytes(),
@@ -880,8 +880,8 @@ impl NodeRuntime {
             && let Some(ed_sk) = sov.ed25519_signing_key()
         {
             // sig_key_idx = 0 follows the IdentityDocument convention
-            // (master signing key).  Cloning а 32-byte SigningKey to
-            // Arc-share с the anycast service is cheap.
+            // (master signing key).  Cloning a 32-byte SigningKey to
+            // Arc-share with the anycast service is cheap.
             anycast_svc_builder =
                 anycast_svc_builder.with_signing_key(std::sync::Arc::new(ed_sk.clone()), 0);
         }
@@ -927,13 +927,13 @@ impl NodeRuntime {
         // peer-list provider — answers `LocalAppMsg::GetPeers`
         // by snapshotting `live_sessions` (cheap mutex-and-clone, no
         // network I/O). Without it Flutter UI has to poll mobile_status
-        // через admin socket, which requires admin-token (operator-only).
+        // through admin socket, which requires admin-token (operator-only).
         let peer_list: Arc<dyn veil_ipc::PeerListProvider> = Arc::new(
             crate::peer_list_provider::LiveSessionsPeerList::new(Arc::clone(&self.live_sessions)),
         );
         server = server.with_peer_list_provider(peer_list);
         // S2.A: P-Net status provider — surfaces verified cert state
-        // к IPC consumers (ogate / oproxy) for app-layer admission
+        // to IPC consumers (ogate / oproxy) for app-layer admission
         // decisions.  Empty cache (public-mode daemon) ⇒ all queries
         // reply has_cert=false; strict-p_net apps reject downstream.
         let pnet_status: Arc<dyn veil_ipc::PnetStatusProvider> =
@@ -944,10 +944,10 @@ impl NodeRuntime {
         server = server.with_pnet_status_provider(pnet_status);
         // bootstrap-URI join sink — handles `JoinBootstrapUri`
         // requests by decoding the URI and registering the resulting
-        // peer для outbound dial. Critical для Flutter onboarding —
+        // peer for outbound dial. Critical for Flutter onboarding —
         // without it, an app receiving an `veil:` deep-link would
         // have to either re-implement the decode (Argon2id + Ed25519)
-        // в Dart or shell out to veil-cli (impossible on Android).
+        // in Dart or shell out to veil-cli (impossible on Android).
         let bootstrap_join: Arc<dyn veil_ipc::BootstrapJoinSink> =
             Arc::new(crate::bootstrap_join::BootstrapJoinForwarder::new(
                 Arc::clone(&self.logger),
@@ -958,9 +958,9 @@ impl NodeRuntime {
         server = server.with_bootstrap_join_sink(bootstrap_join);
         // bootstrap-invite-create sink (Epic 489.7 generator side).
         // Snapshot the daemon's `[identity]` keypair + first advertise URI
-        // at register time — used by `CreateBootstrapInvite` IPC к
-        // assemble а canonical `veil:bootstrap?…` URI (plain) или
-        // `veil:pair?…` (when caller supplies а passphrase).
+        // at register time — used by `CreateBootstrapInvite` IPC to
+        // assemble a canonical `veil:bootstrap?…` URI (plain) or
+        // `veil:pair?…` (when caller supplies a passphrase).
         let invite_create_sink: Arc<dyn veil_ipc::BootstrapInviteCreateSink> = {
             let identity_snap = Some((
                 self.identity.local_identity.algo,
@@ -971,7 +971,7 @@ impl NodeRuntime {
                 // Prefer explicit `advertise` (public hostname behind
                 // nginx) over bind transport (e.g. tcp://0.0.0.0:443);
                 // matches the CLI `bootstrap invite` address-picking
-                // logic and what а live peer can actually dial.
+                // logic and what a live peer can actually dial.
                 l.advertise.clone().or(Some(l.transport.clone()))
             });
             Arc::new(crate::bootstrap_invite_create::BootstrapInviteCreator::new(
@@ -983,7 +983,7 @@ impl NodeRuntime {
         server = server.with_bootstrap_invite_create_sink(invite_create_sink);
         // multi-device pairing sinks (Epic 489.8).  One forwarder
         // instance handles both Source + Target sides — wire surface
-        // shipped; ceremony plumbing fills in а follow-up slice.
+        // shipped; ceremony plumbing fills in a follow-up slice.
         let veil_dir = self
             .config_path
             .parent()
@@ -1006,9 +1006,9 @@ impl NodeRuntime {
         );
         server = server.with_mobile_status_provider(mobile_status);
         //.2: push-envelope sink — handles `LocalAppMsg::SetPushEnvelope`
-        // by routing к `NodeRuntime::set_rendezvous_push_envelope`. Without it
-        // IPC handler responds с `NoMatchingRendezvous` для every client request
-        // (graceful degradation на nodes without active rendezvous publications).
+        // by routing to `NodeRuntime::set_rendezvous_push_envelope`. Without it
+        // IPC handler responds with `NoMatchingRendezvous` for every client request
+        // (graceful degradation on nodes without active rendezvous publications).
         let push_envelope_sink: Arc<dyn veil_ipc::PushEnvelopeSink> =
             Arc::new(RendezvousPushEnvelopeForwarder::new(Arc::clone(
                 &self.anonymity.rendezvous_publisher_entries,
@@ -1017,7 +1017,7 @@ impl NodeRuntime {
         //.4 P2/P3: wire mailbox IPC bridge
         // + push-dispatch task. Only present when operator opted in
         // (`mailbox.enabled`). Without it, `MailboxPut/Fetch/Ack`
-        // reply с graceful "not a mailbox relay" / empty list / no-op.
+        // reply with graceful "not a mailbox relay" / empty list / no-op.
         if let Some(mailbox) = self.mailbox_state.mailbox.as_ref() {
             // bounded channel. See
             // `crate::builtin::mailbox::PUSH_TRIGGER_QUEUE_CAP`
@@ -1042,10 +1042,10 @@ impl NodeRuntime {
             // third party). See `build_push_dispatcher` for
             // per-provider error handling.
             //
-            //.4 followup: wrap в HotReloadDispatcher so
+            //.4 followup: wrap in HotReloadDispatcher so
             // operators can rotate FCM/APNs credentials without
             // restarting the daemon. The mtime-watch task spawned
-            // below polls credential paths every 60 s и swaps the
+            // below polls credential paths every 60 s and swaps the
             // inner dispatcher in-place when either file changes.
             let initial_dispatcher = build_push_dispatcher(&config.mailbox.push);
             let hot_reload = Arc::new(HotReloadDispatcher::new(initial_dispatcher));
@@ -1076,7 +1076,7 @@ impl NodeRuntime {
             //.4 P5b: spawn the mailbox built-in app
             // service. Receives `MailboxPutPayload` from senders over
             // the veil app-message channel (cross-node fanout path)
-            // и calls the same `Mailbox::put` the IPC bridge uses.
+            // and calls the same `Mailbox::put` the IPC bridge uses.
             // Both paths share the push_trigger channel — the dispatch
             // task drains regardless of source.
             //
@@ -1123,7 +1123,7 @@ impl NodeRuntime {
         }
         //.4 P5c: wire the rendezvous-replica resolver
         // so apps can lookup K candidate mailbox-relays for a
-        // receiver via IPC. Always wired — даже на nodes without
+        // receiver via IPC. Always wired — even on nodes without
         // `mailbox.enabled`, because senders need lookup to find
         // OTHER nodes' replicas (asymmetric: lookup-side vs
         // serve-side roles).
@@ -1336,9 +1336,9 @@ impl NodeRuntime {
 
 // ── T1.2: push-envelope IPC forwarder ────────────────────────────
 //
-// Hooks `LocalAppMsg::SetPushEnvelope` IPC requests к
-// `NodeRuntime::set_rendezvous_push_envelope` без round-trip через NodeRuntime
-// itself — holds an Arc clone of `rendezvous_publisher_entries` Mutex и
+// Hooks `LocalAppMsg::SetPushEnvelope` IPC requests to
+// `NodeRuntime::set_rendezvous_push_envelope` without round-trip through NodeRuntime
+// itself — holds an Arc clone of `rendezvous_publisher_entries` Mutex and
 // performs the in-place update on lookup. Mirrors the pattern of
 // `MobileEventForwarder` (which holds runtime sync-Notify clones).
 
@@ -1424,7 +1424,7 @@ pub struct MailboxIpcBridge {
     push_trigger_tx: tokio::sync::mpsc::Sender<PushTrigger>,
     /// Event bus used to publish `MAILBOX_DRAINED` notifications after
     /// every authorised fetch.  Optional so non-IPC test contexts can
-    /// construct the bridge without а live bus; production wiring always
+    /// construct the bridge without a live bus; production wiring always
     /// supplies one (see `service_tasks` ctor at the call site).
     event_bus: Option<Arc<veil_ipc::EventBus>>,
 }
@@ -1548,8 +1548,8 @@ impl veil_ipc::MailboxBackend for MailboxIpcBridge {
             // Return Some(empty) — caller cannot distinguish "wrong
             // cookie" from "no blobs", so the cookie isn't a probing
             // oracle.  Wrong-cookie path bypasses MAILBOX_DRAINED publish
-            // so а bad-cookie probe cannot serve as а fan-out oracle к
-            // event subscribers (would also be а wakeup-loop trigger if
+            // so a bad-cookie probe cannot serve as a fan-out oracle to
+            // event subscribers (would also be a wakeup-loop trigger if
             // the iOS BG handler awaits the event before completing).
             return Some(Vec::new());
         }
@@ -1567,8 +1567,8 @@ impl veil_ipc::MailboxBackend for MailboxIpcBridge {
                 // Publish MAILBOX_DRAINED so BG-handler consumers
                 // (iOS BGProcessingTask / Android background workers)
                 // can `setTaskCompleted` precisely at drain completion
-                // instead of padding к а hardcoded timeout.  Best-effort
-                // — zero subscribers is the steady state и not an error.
+                // instead of padding to a hardcoded timeout.  Best-effort
+                // — zero subscribers is the steady state and not an error.
                 if let Some(bus) = &self.event_bus {
                     let count = u32::try_from(out.len()).unwrap_or(u32::MAX);
                     bus.publish(EventPayload {
@@ -1776,14 +1776,14 @@ pub fn build_apns_dispatcher(
 // inner dispatcher can be atomically swapped in/out at runtime when
 // the operator rotates credentials. An mtime-watch task polls the
 // credential file paths every 60 s; on detected change it rebuilds
-// the dispatcher и swaps it in.
+// the dispatcher and swaps it in.
 //
 // This is a deliberate poll-not-notify design: filesystem-watch APIs
 // (inotify on Linux, kqueue on BSD) introduce platform-specific
 // dependencies and edge cases (file replaced via atomic-rename loses
-// the watch). Polling mtime every 60 s is plenty fast для a
+// the watch). Polling mtime every 60 s is plenty fast for a
 // credential rotation operation that operators trigger maybe once a
-// quarter, и survives any rename / atomic-replace tactic.
+// quarter, and survives any rename / atomic-replace tactic.
 
 pub struct HotReloadDispatcher {
     inner: tokio::sync::RwLock<Arc<dyn veil_push::PushDispatcher>>,
@@ -1821,10 +1821,10 @@ impl veil_push::PushDispatcher for HotReloadDispatcher {
     }
 }
 
-/// Modification time of `path` в seconds since UNIX_EPOCH, or 0 if
+/// Modification time of `path` in seconds since UNIX_EPOCH, or 0 if
 /// the file is missing / metadata read failed. Treats missing-file vs
-/// present-file as different mtimes so а credential file appearing
-/// or disappearing triggers а swap.
+/// present-file as different mtimes so a credential file appearing
+/// or disappearing triggers a swap.
 pub fn file_mtime_secs(path: &str) -> u64 {
     if path.is_empty() {
         return 0;
@@ -1838,7 +1838,7 @@ pub fn file_mtime_secs(path: &str) -> u64 {
 }
 
 /// Background task that polls the FCM/APNs credential file mtimes
-/// every 60 s и rebuilds the dispatcher when either changes.
+/// every 60 s and rebuilds the dispatcher when either changes.
 /// Returns when `shutdown` fires.
 async fn push_creds_watch_task(
     cfg: veil_cfg::MailboxPushConfig,
@@ -1874,7 +1874,7 @@ async fn push_creds_watch_task(
 
 // ── T1.4 P5c: rendezvous-replica resolver ──────────────────────
 //
-// Local-DHT-only лookup for the receiver's RendezvousAd. Apps call
+// Local-DHT-only lookup for the receiver's RendezvousAd. Apps call
 // `LocalAppMsg::LookupRendezvousReplicas` → IPC server → this impl →
 // `KademliaService::get_local` → decode + verify → ResolvedReplica.
 //
@@ -2042,7 +2042,7 @@ fn mint_wake_payload(
 }
 
 /// Background task that consumes [`PushTrigger`]s, unseals each
-/// envelope с the relay's X25519 secret, and dispatches the recovered
+/// envelope with the relay's X25519 secret, and dispatches the recovered
 /// FCM/APNs token [`veil_push::PushDispatcher`].
 ///
 /// Errors at every step are logged at WARN and the task moves on to
@@ -2222,7 +2222,7 @@ mod tests {
     // but inside cool-down, streak reached past cool-down, first-ever
     // retry). The real watchdog loop is a thin wrapper around this fn
     // plus a 30 s tokio interval, so behavioural coverage of the decision
-    // logic is enough to catch logic regressions без 90 s real-clock tests.
+    // logic is enough to catch logic regressions without 90 s real-clock tests.
 
     const TEST_THRESHOLD: u32 = 3;
     const TEST_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
