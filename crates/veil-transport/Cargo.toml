@@ -36,7 +36,7 @@ rustls = "0.23"
 # unmaintained) — PEM parsing now goes through `rustls-pki-types`'s
 # native `PemObject` trait (1.14+).  Bumped pki-types floor accordingly.
 rustls-pki-types = "1.14"
-socket2 = "0.5"
+socket2 = "0.6"
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["full"] }
 tokio-rustls = "0.26"

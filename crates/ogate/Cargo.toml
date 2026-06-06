@@ -41,12 +41,12 @@ base64 = "0.22"
 # CLI + config + logging.
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "0.9"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-thiserror = "1"
+thiserror = "2.0"
 
 # Lock-free Arc swap for hot-reloading the peer / routing table.
 # Egress / ingress paths .load() on each packet — `ArcSwap` is the

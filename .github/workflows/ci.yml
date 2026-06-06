@@ -118,6 +118,15 @@ jobs:
         # tracking issue/Epic.
         run: cargo audit --deny warnings
 
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version "^0.19" --locked
+
+      - name: cargo deny (advisories + bans + licenses + sources)
+        # Supply-chain gate (config: deny.toml). Catches RustSec advisories
+        # incl. `unmaintained` (which `cargo audit` does not surface), duplicate
+        # major versions (warn), a license allow-list, and crates.io-only sources.
+        run: cargo deny check
+
   test:
     name: Test
     needs: hygiene
