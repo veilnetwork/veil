@@ -136,11 +136,26 @@ pub(crate) async fn handle_mailbox_fetch(
 pub(crate) async fn handle_mailbox_ack(
     wh: &mut IpcWriteHalf,
     body: &[u8],
+    client_state: &mut IpcClientState,
     mailbox_backend: Option<&Arc<dyn MailboxBackend>>,
 ) -> std::io::Result<()> {
     // Recipient's app confirms end-to-end receipt.  Backend verifies
     // `auth_cookie`; mismatch returns false (a no-op from the caller's
     // perspective).
+    // Per-client rate-limit (shared read-query bucket, symmetric with
+    // `handle_mailbox_fetch`): ack hits the backend's auth-cookie verify +
+    // store mutation, so a local process must not be able to spam it. On
+    // limit, reply the same no-op `removed=false` a cookie mismatch yields, so
+    // the rate-limit is not a distinguishable oracle.
+    if !client_state.allow_query() {
+        return write_frame_wh(
+            wh,
+            FrameFamily::LocalApp as u8,
+            LocalAppMsg::MailboxAckOk as u16,
+            &[0u8],
+        )
+        .await;
+    }
     let Ok(req) = MailboxAckPayload::decode(body) else {
         return Ok(());
     };
