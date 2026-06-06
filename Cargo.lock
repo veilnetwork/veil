@@ -4398,7 +4398,6 @@ dependencies = [
  "pqcrypto-falcon",
  "pqcrypto-traits",
  "quinn",
- "rand 0.8.6",
  "rand_core 0.6.4",
  "rcgen",
  "rpassword",
