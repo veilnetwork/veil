@@ -333,8 +333,11 @@ unsafe fn clear_err(err_out: *mut *mut c_char) {
 /// least `MAX_FFI_CSTR_LEN` bytes. A pointer to a shorter, unterminated buffer
 /// is undefined behaviour: the bound limits how far a *terminated* contract is
 /// scanned and prevents an unbounded walk of arbitrary memory, but it cannot
-/// detect a lying caller. Hosts that cannot guarantee this should pass an
-/// explicit length through the `*_with_len` entry points. 4 KiB covers every
+/// detect a lying caller. (There are currently no length-based C entry points —
+/// `cstr_to_str_with_len` is an internal helper, not an exported ABI — so a host
+/// that cannot uphold the termination contract must not pass the pointer; an
+/// explicit-length `*_with_len` C ABI is tracked as future work.) 4 KiB covers
+/// every
 /// legitimate input shape: filesystem paths (Linux PATH_MAX = 4096), BIP-39
 /// phrases (~330 B for 24 words), passwords (typically <256 B), error strings
 /// (<1 KiB). Inputs longer than this are rejected as invalid even if they are
