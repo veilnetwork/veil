@@ -1,5 +1,5 @@
-# Docker context exclusions — protect dev secrets, speed up builds, и cap the
-# tarball uploaded к the daemon / remote builder.
+# Docker context exclusions — protect dev secrets, speed up builds, and cap the
+# tarball uploaded to the daemon / remote builder.
 
 # Version control
 .git
@@ -21,11 +21,19 @@ flutter/veil_flutter/build
 flutter/veil_flutter/.dart_tool
 flutter/veil_flutter/.pub-cache
 
-# Local secrets и generated keys (cert.pem is checked in для testnet, the
-# corresponding private key is NOT)
+# Local secrets and generated keys (cert.pem is checked in for testnet, the
+# corresponding private key is NOT). The release-signing identity lives at the
+# repo root (git-ignored) — exclude it EXPLICITLY so `docker build .` with a
+# root context never ships it to the daemon / remote builder / image layer.
+# (The earlier `*.identity.toml` glob did NOT match `release-identity.toml`
+# because of the dash, so the key was silently included.)
+release.key
+release.pub
+release-identity.toml
+*-identity.toml
+*.identity.toml
 ssl/*.pem
 ssl/*.key
-*.identity.toml
 *.pkcs8
 *.private.toml
 
