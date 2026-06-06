@@ -232,6 +232,18 @@ where
                 continue;
             }
         };
+        // Defence-in-depth: a custom fetcher could return an oversized
+        // body (the HTTPS wrapper already caps, but this generic helper
+        // must not trust the closure). Skip + try the next URL.
+        if bytes.len() > MAX_BINARY_BYTES {
+            if first_error.is_none() {
+                first_error = Some(format!(
+                    "{url}: oversized {} > {MAX_BINARY_BYTES}",
+                    bytes.len()
+                ));
+            }
+            continue;
+        }
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let hash: [u8; BINARY_SHA256_LEN] = hasher.finalize().into();

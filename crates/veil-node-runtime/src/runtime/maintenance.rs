@@ -559,7 +559,7 @@ impl NodeRuntime {
         if guard.is_empty() {
             return;
         }
-        // We log but don't propagate save errors — a transient EIO
+        // We swallow (don't propagate) save errors — a transient EIO
         // shouldn't bring the maintenance tick down. Cache will retry
         // next interval.
         let _ = guard.save();

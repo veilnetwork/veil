@@ -64,14 +64,13 @@ pub fn compute_shared_secret(
 ) -> Result<Zeroizing<[u8; 32]>, KexError> {
     let remote = PublicKey::from(*remote_pubkey);
     let shared: SharedSecret = keypair.secret.diffie_hellman(&remote);
-    let bytes = *shared.as_bytes();
-    // X25519 with a low-order remote pubkey produces all-zero shared
-    // secret.  Reject explicitly — never proceed with a DH output known to
-    // the chooser.
-    if bytes == [0u8; 32] {
+    // Reject non-contributory DH (low-order remote pubkey → attacker-known
+    // output). `was_contributory()` is the canonical x25519-dalek check,
+    // matching the anonymity/rendezvous/push DH paths.
+    if !shared.was_contributory() {
         return Err(KexError::NonContributory);
     }
-    Ok(Zeroizing::new(bytes))
+    Ok(Zeroizing::new(*shared.as_bytes()))
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
