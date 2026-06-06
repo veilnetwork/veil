@@ -1955,12 +1955,15 @@ mod tests {
     // ── Control plane: NEIGHBOR_OFFER ─────────────────────────────────────────
 
     #[test]
-    fn neighbor_offer_adds_contact_to_dht_routing_table() {
+    fn neighbor_offer_routes_to_pending_not_live_table() {
         use veil_proto::control::NeighborOfferPayload;
         let d = make_test_dispatcher(NodeRole::Core);
         let offerer_id = [0x42u8; 32];
+        // Offer a DIFFERENT node_id than the sender so the contact is genuinely
+        // peer-claimed (the eclipse case M-1 guards against).
+        let offered_id = [0x99u8; 32];
         let payload = NeighborOfferPayload {
-            node_id: offerer_id,
+            node_id: offered_id,
             addr: b"127.0.0.1:9001".to_vec(),
             flags: 0,
         };
@@ -1971,11 +1974,18 @@ mod tests {
             matches!(result, DispatchResult::NoResponse),
             "NEIGHBOR_OFFER must return NoResponse, got {result:?}"
         );
-        // Contact should now be in the DHT routing table.
+        // M-1: a peer-claimed offer must NOT enter the live routing table
+        // directly — it lands in the source-tracked pending pool and is only
+        // promoted on a successful OVL1 handshake with the claimed node_id.
         assert_eq!(
             d.dht.routing_table_size(),
+            0,
+            "NEIGHBOR_OFFER must not inject directly into the live routing table"
+        );
+        assert_eq!(
+            d.dht.pending_contacts_count(),
             1,
-            "DHT routing table should have 1 contact"
+            "offer should be parked in the source-tracked pending pool"
         );
     }
 
