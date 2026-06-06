@@ -155,7 +155,7 @@ async fn handle_connection(
 
         // Step 3 — confirm к the SOCKS client (return success BEFORE
         // opening the veil stream so the client может start streaming
-        // immediately).  Тactic mirrors v2ray / xray behavior: best-effort
+        // immediately).  Tactic mirrors v2ray / xray behavior: best-effort
         // optimistic ack; если the veil stream открыть to NOT open,
         // the subsequent write would simply close the connection.
         write_reply(&mut stream, 0x00)

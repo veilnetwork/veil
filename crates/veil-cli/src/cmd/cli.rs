@@ -1215,7 +1215,18 @@ pub enum UpdateCommand {
     /// After this exits 0, restart the process yourself (systemd,
     /// `veil-cli node restart`, or stop-and-respawn) — the new binary takes
     /// effect on the next start. Does nothing if no update is available.
-    Apply,
+    Apply {
+        /// Authorize a one-time migration from a LEGACY (pre-authentication,
+        /// no-MAC) installed-version file to the MAC-authenticated form.
+        ///
+        /// Off by default: a keyed store that finds an unauthenticated record
+        /// now refuses to adopt it, because a local writer who can reach the
+        /// state file but not your identity key could strip the MAC to re-open
+        /// the anti-downgrade window. Pass this flag once, on a host you trust,
+        /// to upgrade a genuine pre-existing legacy file.
+        #[arg(long)]
+        allow_legacy_state_migration: bool,
+    },
     /// Build and sign an update manifest for a freshly built binary.
     ///
     /// Used by the release pipeline to produce the signed blob that operators
@@ -1239,10 +1250,11 @@ pub struct SignManifestArgs {
     pub version: String,
 
     /// Minimum version that can apply this update — recorded in the signed
-    /// manifest. NOTE (audit cycle-5): this value is signed but the
-    /// receiver-side gate is NOT yet implemented (no installed-version
-    /// comparison), so it does NOT currently refuse skip-migration upgrades.
-    /// Deferred gate tracked in TASKS.md.
+    /// manifest. The receiver enforces it: `update apply` refuses a binary
+    /// whose running version is below this value (mandatory-intermediate-
+    /// migration gate, `min_compatible_satisfied` in `veil-update`). A present
+    /// but unparseable value is rejected fail-closed; an empty value means
+    /// "no constraint".
     #[arg(long)]
     pub min_compatible_version: String,
 

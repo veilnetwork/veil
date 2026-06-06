@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(reg.len(), 1);
         // Trigger а write-lock op → prune_closed fires:
         let _rx2 = reg.register([99u8; 32]);
-        assert_eq!(reg.len(), 1, "registering а fresh peer prunes [2u8;32]");
+        assert_eq!(reg.len(), 1, "registering a fresh peer prunes [2u8;32]");
     }
 
     #[tokio::test]
@@ -548,7 +548,7 @@ mod tests {
         // evict_lru(1) should drop А (older last_active) not B.
         let evicted = reg.evict_lru(1);
         assert_eq!(evicted, 1);
-        assert!(!reg.has_session(&peer_a), "older peer А evicted");
+        assert!(!reg.has_session(&peer_a), "older peer A evicted");
         assert!(reg.has_session(&peer_b), "recently-active peer B retained");
     }
 }

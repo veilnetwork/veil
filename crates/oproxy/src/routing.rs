@@ -256,7 +256,7 @@ pub(crate) async fn connect_direct_vetted(target: &str, allow_private: bool) -> 
                 crate::timeouts::DIRECT_CONNECT_TIMEOUT
             )
         })?
-        .with_context(|| format!("direct TCP connect к {target} failed"))
+        .with_context(|| format!("direct TCP connect to {target} failed"))
 }
 
 /// Open а direct outbound TCP socket к `host:port` и bridge it

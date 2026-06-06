@@ -824,7 +824,10 @@ impl Mailbox {
                                 .to_vec();
                             let (victim_sender, _victim_now) =
                                 decode_record_header(&victim_record)?;
-                            let victim_size = victim_record.len() as u64 - 44; // record header overhead
+                            // record header overhead; saturating so a malformed
+                            // sub-44-byte record can never underflow-panic here
+                            // (decode_record_header above already enforces ≥ 44).
+                            let victim_size = (victim_record.len() as u64).saturating_sub(44);
                             // Remove от blobs + correct eviction index +
                             // adjust counters (receiver, sender, global).
                             blobs.remove(victim_blob_key.as_slice())?;

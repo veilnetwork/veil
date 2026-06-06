@@ -739,7 +739,7 @@ async fn ipc_stream_open_remote_without_bridge_returns_not_implemented() {
     // dst_node_id is а fabricated remote node — not the local
     // server's node_id().  Any non-matching value triggers the branch.
     let remote_node_id = [0xEEu8; 32];
-    assert_ne!(remote_node_id, node_id(), "fixture must differ от local");
+    assert_ne!(remote_node_id, node_id(), "fixture must differ from local");
 
     let open = StreamOpenPayload {
         dst_node_id: remote_node_id,

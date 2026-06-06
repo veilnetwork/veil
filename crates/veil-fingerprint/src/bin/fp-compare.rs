@@ -185,7 +185,7 @@ fn load_into_model(
 
 fn run(args: Args) -> Result<bool, String> {
     if !(1..=4).contains(&args.n) {
-        return Err(format!("--n must be в 1..=4, got {}", args.n));
+        return Err(format!("--n must be in 1..=4, got {}", args.n));
     }
 
     let sample = load_into_model(
@@ -219,9 +219,9 @@ fn run(args: Args) -> Result<bool, String> {
 
     let pass = chi < args.threshold && kl < args.threshold;
     if pass {
-        println!("✅ PASS — sample statistically indistinguishable от reference");
+        println!("✅ PASS — sample statistically indistinguishable from reference");
     } else {
-        println!("❌ FAIL — sample distinguishable от reference");
+        println!("❌ FAIL — sample distinguishable from reference");
         if chi >= args.threshold {
             println!("  chi² {chi:.6} ≥ threshold {:.6}", args.threshold);
         }

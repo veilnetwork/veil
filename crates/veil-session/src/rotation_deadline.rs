@@ -184,7 +184,7 @@ mod tests {
         for _ in 0..50 {
             let now = Instant::now();
             let r = SessionRotationDeadline::compute(now);
-            let d = r.deadline().expect("range mode must yield а deadline");
+            let d = r.deadline().expect("range mode must yield a deadline");
             assert!(
                 d >= now + Duration::from_secs(1_800),
                 "deadline below range floor"

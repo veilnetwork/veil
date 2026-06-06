@@ -57,7 +57,7 @@ Stealth-listener architecture: nodes can configure `visibility = "stealth"` list
 3. ✅ **`bind_with_flags` race** — waiter регистрируется перед `APP_BIND` write; cleanup на всех error paths ([client.rs:344+](veilclient/src/client.rs#L344)).
 4. ✅ **HTTPS ALPN** — `h2` удалён, остался только `http/1.1` ([https.rs:342](crates/veil-bootstrap/src/https.rs#L342)).
 5. ✅ **Hybrid handshake algorithm binding** — алгоритм связан через transcript hash (не отдельный MAC byte, но эквивалентная защита) ([handshake.rs:1120-1220](veilcore/src/node/session/handshake.rs#L1120)).
-6. ✅ **FFI double-free protection** — `magic: AtomicU32` sentinel + atomic swap на handle close ([veilclient-ffi/src/lib.rs:123](crates/veilclient-ffi/src/lib.rs#L123)).
+6. ✅ **FFI double-free protection** — external per-type handle-address registry (`is_registered` / `unregister_handle`): a close or use of an unknown / already-freed pointer is a safe no-op. Superseded the original in-struct `magic: AtomicU32` sentinel (whose read-back of a possibly-freed struct was itself UB). ([veilclient-ffi/src/lib.rs](crates/veilclient-ffi/src/lib.rs)).
 
 ### 6.50.d.6.3 — Operational hardening (MEDIUM)
 

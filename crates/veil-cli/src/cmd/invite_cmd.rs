@@ -598,7 +598,7 @@ mod tests {
             .join("invite_psks")
             .join(format!("{nid_hex}.psk"));
         let saved_psk_b64 = std::fs::read_to_string(&psk_out_path)
-            .expect("recipient should have written the PSK к default_psk_path");
+            .expect("recipient should have written the PSK to default_psk_path");
         let saved_psk = STANDARD.decode(saved_psk_b64.trim()).unwrap();
         assert_eq!(saved_psk, psk_bytes, "PSK round-trip mismatch");
 

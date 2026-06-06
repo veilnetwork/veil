@@ -480,7 +480,7 @@ fn derive_key_from_passphrase(
     p_cost: u32,
 ) -> veil_util::sensitive_bytes::SensitiveBytesN<32> {
     use argon2::{Algorithm, Argon2, Params, Version};
-    let params = Params::new(m_cost_kib, t_cost, p_cost, Some(32)).expect("argon2 params в-range");
+    let params = Params::new(m_cost_kib, t_cost, p_cost, Some(32)).expect("argon2 params in-range");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key: veil_util::sensitive_bytes::SensitiveBytesN<32> =
         veil_util::sensitive_bytes::SensitiveBytesN::new();

@@ -296,7 +296,7 @@ impl IntroduceRequest {
             .sig
             .as_slice()
             .try_into()
-            .expect("checked above что sig.len() == 64");
+            .expect("checked above that sig.len() == 64");
         let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
 
         let msg = self.canonical_signing_input();

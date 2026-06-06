@@ -44,7 +44,7 @@ async fn obfs4_smoke_two_node() {
         .next()
         .unwrap()
         .parse()
-        .expect("port в bind local_addr");
+        .expect("port in bind local_addr");
 
     let ctx_server = Arc::clone(&ctx);
     let server_task = tokio::spawn(async move {

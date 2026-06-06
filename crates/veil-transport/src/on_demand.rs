@@ -286,7 +286,7 @@ mod tests {
     async fn bind_happy_path_returns_port_in_range() {
         let slot = bind_on_demand(cfg(Duration::from_secs(60), 1))
             .await
-            .expect("bind должен succeed");
+            .expect("bind must succeed");
         assert!((30000..=60000).contains(&slot.port));
         assert_eq!(slot.host, "127.0.0.1");
         assert_eq!(slot.lifecycle.accepts_remaining(), 1);
@@ -348,7 +348,7 @@ mod tests {
         let results: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         assert_eq!(l.accepts_remaining(), 0);
         let granted = results.iter().filter(|&&p| p > 0).count();
-        assert_eq!(granted, 8, "exactly 8 grants for а budget of 8");
+        assert_eq!(granted, 8, "exactly 8 grants for a budget of 8");
     }
 
     // ── should_exit ────────────────────────────────────────────────
@@ -405,7 +405,7 @@ mod tests {
         l.shutdown();
         // Should resolve promptly (< TTL of 60s).
         let result = tokio::time::timeout(Duration::from_secs(1), waiter).await;
-        assert!(result.is_ok(), "waiter должен resolve после shutdown");
+        assert!(result.is_ok(), "waiter must resolve after shutdown");
     }
 
     #[tokio::test]

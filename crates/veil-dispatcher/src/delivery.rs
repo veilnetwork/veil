@@ -2714,7 +2714,7 @@ mod tests {
                 // Intermediate hop — receiver for path[i+1] gets the
                 // forwarded frame.
                 let (prio, frame) = rxs[i + 1].try_recv().unwrap_or_else(|e| {
-                    panic!("hop {i}: expected forward к rxs[{}], got {e:?}", i + 1)
+                    panic!("hop {i}: expected forward to rxs[{}], got {e:?}", i + 1)
                 });
                 assert_eq!(
                     prio,
@@ -2728,7 +2728,7 @@ mod tests {
                     "hop {i}: forwarded frame too short",
                 );
                 let new_hdr = decode_header(&frame[..HEADER_SIZE])
-                    .expect("forwarded frame must carry а valid header");
+                    .expect("forwarded frame must carry a valid header");
                 assert_eq!(new_hdr.family, FrameFamily::Delivery as u8);
                 assert_eq!(new_hdr.msg_type, DeliveryMsg::RelayPath as u16);
 

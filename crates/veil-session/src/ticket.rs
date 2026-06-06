@@ -160,7 +160,7 @@ impl TicketIssuer {
     ///
     /// The fn is gated к `#[cfg(test)]` so production callers cannot
     /// reach it через а typo или а new migration that forgets к pass
-    /// `peer_instance_id`.  Production уses [`Self::issue_for_instance`]
+    /// `peer_instance_id`.  Production uses [`Self::issue_for_instance`]
     /// exclusively.  Re-gating это к а production-callable shim requires
     /// either (а) shipping the multi-instance metadata propagation slice
     /// для sovereign-identity (handshake carries peer device/instance ID)

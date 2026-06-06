@@ -376,7 +376,7 @@ fn make_path_callback(expected_path: String) -> PathCallback {
             Err(http::Response::builder()
                 .status(http::StatusCode::NOT_FOUND)
                 .body(Some(format!("path not found: {}", req.uri().path())))
-                .expect("404 response с literal status + Some body is well-formed"))
+                .expect("404 response with literal status + Some body is well-formed"))
         }
     })
 }

@@ -110,7 +110,7 @@ mod imp {
         };
 
         if let Err(e) = oproxy::init_oproxy_logger("oproxy-server", &cfg.logging) {
-            eprintln!("oproxy-server: failed к init logger: {e}");
+            eprintln!("oproxy-server: failed to init logger: {e}");
             return std::process::ExitCode::FAILURE;
         }
 
@@ -119,7 +119,7 @@ mod imp {
         let rt = match build_tokio_runtime(&rt_cfg) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("oproxy-server: failed к build tokio runtime: {e}");
+                eprintln!("oproxy-server: failed to build tokio runtime: {e}");
                 return std::process::ExitCode::FAILURE;
             }
         };
@@ -172,7 +172,7 @@ mod imp {
 
         let client = VeilClient::connect(&cfg.socket_path)
             .await
-            .with_context(|| format!("connect к veil daemon at {}", cfg.socket_path.display()))?;
+            .with_context(|| format!("connect to veil daemon at {}", cfg.socket_path.display()))?;
         // `bind_named` (not `bind`) — required for stable deterministic
         // app_id derivation.  Clients compute the SAME app_id via
         // `veil_app::address::app_id(server_node_id, namespace, name)`
@@ -487,7 +487,7 @@ mod imp {
                 write_status(&mut stream, ConnectStatus::ConnectFailed)
                     .await
                     .ok();
-                return Err(anyhow!("timeout connecting к {}", addrs[0]));
+                return Err(anyhow!("timeout connecting to {}", addrs[0]));
             }
         };
 

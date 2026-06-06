@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _stream = obfs4_client_connect(tcp, &psk).await?;
     let after_hs = t_hs.elapsed();
     let total = t0.elapsed();
-    println!("✓ obfs4 handshake completed после {after_hs:?} (total {total:?})");
+    println!("✓ obfs4 handshake completed after {after_hs:?} (total {total:?})");
     println!("✓ smoke test PASSED");
     Ok(())
 }

@@ -175,7 +175,7 @@ mod tests {
         let now_after = Instant::now() + Duration::from_secs(5);
         let seed = ctx.take_dk_seed_on_ack(now_after);
         assert_eq!(seed, Some([0xBBu8; DK_SEED_BYTES]));
-        assert!(ctx.is_idle(), "state must transition back к Idle");
+        assert!(ctx.is_idle(), "state must transition back to Idle");
         assert!(
             !ctx.should_initiate_rekey(now_after),
             "bytes-since-rekey must reset к 0 after ack"

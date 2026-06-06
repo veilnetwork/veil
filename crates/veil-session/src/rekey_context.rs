@@ -221,7 +221,7 @@ mod tests {
         assert!(ctx.is_awaiting_ack());
         let taken = ctx.take_initiator_keypair().expect("must return keypair");
         assert_eq!(taken.public_key, pubkey);
-        assert!(ctx.is_idle(), "transitions back к Idle");
+        assert!(ctx.is_idle(), "transitions back to Idle");
     }
 
     #[tokio::test]

@@ -1338,7 +1338,7 @@ pub fn sign_transport_migration_notify(
 /// 2. `node_id` equals `BLAKE3(pubkey)` (identity binding).
 /// 3. `|issued_at_unix - now_unix| ≤ MIGRATION_REPLAY_WINDOW_SECS`.
 ///
-/// Каller separately checks `new_transport` length cap (already done
+/// Caller separately checks `new_transport` length cap (already done
 /// by `decode`).  Replay outside the window returns
 /// `ProtoError::Malformed` so the caller can silent-drop.
 pub fn verify_transport_migration_notify(

@@ -226,7 +226,7 @@ pub fn check_and_reserve_ip_slot(
         runtime
             .sessions_per_ip
             .reserve(ip, 0, 0)
-            .expect("reserve с 0/0 caps never rejects");
+            .expect("reserve with 0/0 caps never rejects");
         return Ok(());
     }
     match runtime.sessions_per_ip.reserve(

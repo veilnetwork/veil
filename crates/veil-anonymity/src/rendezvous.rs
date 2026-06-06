@@ -2177,7 +2177,7 @@ mod tests {
         // replay between v1 и v2 ads even if all other fields match.
         let v1 = canonical_message_v1(&[0u8; 32], &[0u8; 32], &[0u8; 16], &[0u8; 32], 0, 0);
         assert!(v1.starts_with(b"veil-rendezvous-ad:v1\0"));
-        assert_ne!(v1, canonical, "v1 и v2 canonical messages must differ");
+        assert_ne!(v1, canonical, "v1 and v2 canonical messages must differ");
     }
 
     #[test]
@@ -2734,7 +2734,7 @@ mod tests {
             ad.push_envelope, envelope,
             "envelope bytes must round-trip exactly"
         );
-        verify_rendezvous_ad(&ad).expect("v2 ad с envelope must verify");
+        verify_rendezvous_ad(&ad).expect("v2 ad with envelope must verify");
     }
 
     #[test]
@@ -3432,7 +3432,7 @@ mod tests {
         )
         .unwrap();
         let ad = decode_rendezvous_ad(&bytes).unwrap();
-        verify_rendezvous_ad(&ad).expect("v4 с all 3 envelopes verifies");
+        verify_rendezvous_ad(&ad).expect("v4 with all 3 envelopes verifies");
         assert_eq!(ad.push_envelope, push_env);
         assert_eq!(ad.capability_token, cap_tok);
         assert_eq!(ad.wake_hmac_envelope, wake_env);

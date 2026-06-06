@@ -18,7 +18,7 @@
 use tokio::runtime::Builder;
 
 use veil_cfg;
-use veil_update::apply::{ApplyError, apply_update};
+use veil_update::apply::{ApplyError, ApplyOptions, apply_update_with_options};
 use veil_update::checker::{CheckerError, UpdateChecker};
 use veil_update::fetch::{FetchError, UpdateAvailability, fetch_binary_via_https};
 use veil_update::installed_version::InstalledVersionStore;
@@ -35,7 +35,9 @@ pub fn handle_update_command<I: CommandIo, O: ConfigOps>(
 ) -> veil_cfg::Result<()> {
     match args.command {
         UpdateCommand::Check => update_check(&mut context),
-        UpdateCommand::Apply => update_apply(&mut context),
+        UpdateCommand::Apply {
+            allow_legacy_state_migration,
+        } => update_apply(&mut context, allow_legacy_state_migration),
         UpdateCommand::SignManifest(args) => update_sign_manifest(&mut context, args),
     }
 }
@@ -277,6 +279,7 @@ fn installed_version_mac_key() -> Option<[u8; 32]> {
 
 fn update_apply<I: CommandIo, O: ConfigOps>(
     context: &mut CommandContext<'_, I, O>,
+    allow_legacy_state_migration: bool,
 ) -> veil_cfg::Result<()> {
     let (_, config) = context.config().load_existing()?;
 
@@ -376,12 +379,15 @@ fn update_apply<I: CommandIo, O: ConfigOps>(
     // its CARGO_PKG_VERSION is the authoritative installed version) for the
     // manifest's min_compatible_version gate — not the veil-update library
     // crate's own version.
-    let outcome = apply_update(
+    let outcome = apply_update_with_options(
         &manifest,
         &binary_bytes,
         &install_path,
         &store,
         env!("CARGO_PKG_VERSION"),
+        &ApplyOptions {
+            allow_legacy_state_migration,
+        },
     )
     .map_err(map_apply_err)?;
 
@@ -546,7 +552,9 @@ mod tests {
         };
         let context = ctx_with_config(cfg);
         let args = UpdateArgs {
-            command: UpdateCommand::Apply,
+            command: UpdateCommand::Apply {
+                allow_legacy_state_migration: false,
+            },
         };
         let err = handle_update_command(context, args).unwrap_err();
         match err {
@@ -571,7 +579,9 @@ mod tests {
         // is_check_enabled.
         let context = ctx_with_config(Config::default());
         let args = UpdateArgs {
-            command: UpdateCommand::Apply,
+            command: UpdateCommand::Apply {
+                allow_legacy_state_migration: false,
+            },
         };
         let err = handle_update_command(context, args).unwrap_err();
         let msg = match err {

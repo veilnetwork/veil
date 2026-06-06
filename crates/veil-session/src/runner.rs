@@ -585,15 +585,6 @@ pub fn broken_stream_sentinel() -> BoxIoStream {
 }
 
 impl SessionRunner {
-    // ── chunking guard ────────────────────────────────────────────
-
-    /// chunking is now always supported — single protocol
-    /// version. Method retained so call sites compile; always returns
-    /// `true`. Remove on next sweep.
-    pub fn chunking_supported(&self) -> bool {
-        true
-    }
-
     /// push pre-encrypted wire bytes to the writer task.
     /// Returns `Ok` on success, `Err` if the channel is full
     /// (writer falling behind — we drop the frame with metric) or
@@ -731,12 +722,17 @@ impl SessionRunner {
     /// asymmetry that used к exist here surfaced as а stall pattern
     /// under iperf-scale throughput (every byte-threshold-driven rekey
     /// was а race с in-flight frames).
+    ///
+    /// Returns [`ControlFlow::Break`] to tear the session down when the peer's
+    /// rekey ephemeral is non-contributory (a downgrade-toward-known-secret
+    /// attempt); [`ControlFlow::Continue`] on every normal path.
     fn handle_rekey_ack_arm(
         &mut self,
         body: &[u8],
         rekey: &mut crate::rekey_context::RekeyContext,
         rx_cipher_prev: &mut crate::rekey_rx_grace_buffer::RekeyRxGraceBuffer,
-    ) {
+    ) -> std::ops::ControlFlow<()> {
+        use std::ops::ControlFlow;
         // Initiator path: peer confirmed the rekey, sent their pubkey.
         if rekey.is_awaiting_ack()
             && let Ok(payload) = RekeyPayload::decode(body)
@@ -762,7 +758,7 @@ impl SessionRunner {
             let Some(keypair) = rekey.take_initiator_keypair() else {
                 // FSM invariant violated: state changed between guard и take.
                 // Treat as а no-op к avoid panicking the session.
-                return;
+                return ControlFlow::Continue(());
             };
             let shared = match kex::compute_shared_secret(keypair, &payload.ephemeral_pubkey) {
                 Ok(s) => s,
@@ -775,7 +771,7 @@ impl SessionRunner {
                         "session.rekey.non_contributory",
                         format!("peer_id={} error={}", hex_short(&self.peer_id), e),
                     );
-                    return;
+                    return ControlFlow::Break(());
                 }
             };
             let new_keys = session_kdf::derive_rekey_keys(
@@ -823,6 +819,7 @@ impl SessionRunner {
                 ),
             );
         }
+        ControlFlow::Continue(())
     }
 
     /// Handler for incoming `SessionMsg::RekeyKeptInit`. The peer (with
@@ -1401,23 +1398,11 @@ impl SessionRunner {
     ) -> std::ops::ControlFlow<()> {
         use std::ops::ControlFlow;
         use tokio::sync::mpsc::error::TryRecvError;
-        // cache once to avoid borrow conflict with `outbox`.
-        let chunking_ok = self.chunking_supported();
         loop {
             match outbox.try_recv() {
                 Ok((prio, frame)) => {
-                    // Drop CHUNK frames when the peer has not negotiated
-                    // chunking support (ovl1_minor < 2).
-                    if frame.len() >= veil_proto::header::HEADER_SIZE {
-                        let flags = u16::from_be_bytes([frame[8], frame[9]]);
-                        if flags & veil_proto::delivery::IS_CHUNK_FLAG != 0 && !chunking_ok {
-                            log::warn!(
-                                "runner: dropping CHUNK frame for peer {:?} — chunking not negotiated",
-                                &self.peer_id[..4],
-                            );
-                            continue;
-                        }
-                    }
+                    // chunking is always supported (single protocol version),
+                    // so no CHUNK-flag gating is needed here.
                     pq.push(prio, frame);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1884,11 +1869,15 @@ impl SessionRunner {
             let shared = match kex::compute_shared_secret(our_kp, &payload.ephemeral_pubkey) {
                 Ok(s) => s,
                 Err(e) => {
+                    // Peer's rekey ephemeral was non-contributory — abort the
+                    // rekey AND tear the session down (consistent with the
+                    // initiator path): a peer negotiating toward a known secret
+                    // is treated as a terminal violation, not silently ignored.
                     self.logger.warn(
                         "session.rekey.non_contributory",
                         format!("peer_id={} error={}", hex_short(&self.peer_id), e),
                     );
-                    return std::ops::ControlFlow::Continue(());
+                    return std::ops::ControlFlow::Break(());
                 }
             };
             let new_keys = session_kdf::derive_rekey_keys(
@@ -3410,8 +3399,12 @@ impl SessionRunner {
                         }
                     }
                     Ok(SessionMsg::RekeyAck) => {
-                        self.handle_rekey_ack_arm(body, &mut rekey, &mut rx_cipher_prev);
-                        continue;
+                        // Break tears the session down when the peer's rekey
+                        // ephemeral is non-contributory (downgrade attempt).
+                        match self.handle_rekey_ack_arm(body, &mut rekey, &mut rx_cipher_prev) {
+                            std::ops::ControlFlow::Continue(()) => continue,
+                            std::ops::ControlFlow::Break(()) => return,
+                        }
                     }
                     Ok(SessionMsg::RekeyKeptInit) => {
                         // Peer (lower node_id) told us they kept their own

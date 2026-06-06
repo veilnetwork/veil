@@ -160,7 +160,7 @@ mod tests {
         let before = veil_bufpool::global().stats();
 
         // Steady-state: 32 emissions, each dropped immediately so its
-        // buffer returns к the bucket.  Сache-hit count must climb;
+        // buffer returns к the bucket.  Cache-hit count must climb;
         // fallback-alloc count must NOT (otherwise the bucket is being
         // skipped, e.g. mis-sized acquire request).
         for _ in 0..32 {
