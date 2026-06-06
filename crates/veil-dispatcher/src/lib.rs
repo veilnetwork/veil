@@ -56,6 +56,7 @@ pub mod control;
 pub mod delivery;
 pub mod diag;
 pub mod discovery;
+pub mod envelope_chunks;
 pub mod pending_ack;
 pub mod routing;
 pub mod session;
@@ -625,7 +626,7 @@ pub struct FrameDispatcher {
     pub stream_table: Arc<AppStreamTable>,
     pub mesh_forwarder: Arc<MeshForwarder>,
     /// Chunked transfer reassembly.
-    pub chunk_reassembler: Arc<Mutex<veil_transfer::ChunkReassembler>>,
+    pub chunk_reassembler: Arc<Mutex<crate::envelope_chunks::EnvelopeChunkReassembler>>,
     /// Route discovery forwarder.
     pub discovery_forwarder: Arc<Mutex<veil_routing::discovery_forwarder::DiscoveryForwarder>>,
     pub control_plane: Arc<ControlPlaneService>,
@@ -1454,7 +1455,9 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
             role,
             Arc::new(NeighborTable::new()),
         )),
-        chunk_reassembler: Arc::new(Mutex::new(veil_transfer::ChunkReassembler::new())),
+        chunk_reassembler: Arc::new(Mutex::new(
+            crate::envelope_chunks::EnvelopeChunkReassembler::new(),
+        )),
         discovery_forwarder: Arc::new(Mutex::new(
             veil_routing::discovery_forwarder::DiscoveryForwarder::with_default_difficulty(
                 local_id, role,
@@ -2119,7 +2122,9 @@ mod tests {
                 role,
                 Arc::new(NeighborTable::new()),
             )),
-            chunk_reassembler: Arc::new(Mutex::new(veil_transfer::ChunkReassembler::new())),
+            chunk_reassembler: Arc::new(Mutex::new(
+                crate::envelope_chunks::EnvelopeChunkReassembler::new(),
+            )),
             discovery_forwarder: Arc::new(Mutex::new(
                 veil_routing::discovery_forwarder::DiscoveryForwarder::with_default_difficulty(
                     local_id, role,

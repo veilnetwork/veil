@@ -11,8 +11,11 @@
 //! for `anonymous=true` sends so outer envelope fields are zeroed and
 //! relays cannot learn sender identity.
 //!
-//! Large payloads (>`MAX_ENVELOPE_PAYLOAD`) are fragmented into
-//! `ChunkManifest` + `Chunk` frames before relay.
+//! Large payloads (>`MAX_ENVELOPE_PAYLOAD`) are split into relay-preserving
+//! chunk-envelopes: each piece travels as its own ordinary `Forward` envelope
+//! and the destination reassembles them into the original envelope before
+//! addressed delivery (see `ChunkedEnvelopePayload` + the dispatcher's
+//! `handle_chunk_envelope`).
 //!
 //! Pre-encryption capture: when the operator enables live-capture, a
 //! plaintext `CaptureEvent` is emitted before E2E sealing so operators
@@ -523,92 +526,159 @@ pub(crate) async fn handle_ipc_send(
                     trace_id,
                     require_ack: send.require_ack,
                 };
-                // if the payload exceeds the single-envelope limit
-                // fragment it into a ChunkManifest + Chunk frames before relay.
+                // Oversized payload → relay-preserving chunking. Split the
+                // (already-E2E) payload into ≤ MAX_CHUNK_PAYLOAD pieces, each
+                // carried in its OWN relayable `DeliveryEnvelope` (same addressing
+                // metadata, a unique per-chunk content_id, payload = the chunk
+                // wrapper). Every chunk rides the proven Forward relay path; the
+                // destination reassembles them into the original envelope before
+                // E2E-decrypt + addressed delivery + ACK (dispatcher
+                // `handle_chunk_envelope`). This replaces the old path that sent
+                // raw Chunk frames to a dst we have no session with (always
+                // NO_ROUTE on the relay path) and reassembled via a metadata-
+                // losing epidemic broadcast.
+                //
+                // NOTE: sender-side ACK *retransmit* is not wired for chunked
+                // messages (the pending-ack tracker is single-frame); the
+                // destination still emits an end-to-end ACK on `orig_content_id`.
                 if envelope.payload.len() > veil_proto::delivery::MAX_ENVELOPE_PAYLOAD {
-                    use veil_proto::{
-                        delivery::{ChunkPayload, IS_CHUNK_FLAG},
-                        family::DeliveryMsg,
-                    };
-                    use veil_transfer::fragment_payload;
-                    match fragment_payload(&envelope.payload, envelope.content_id) {
-                        None => {
-                            // Too large even for chunking — send error.
-                            let mut hdr = FrameHeader::new(
-                                FrameFamily::LocalApp as u8,
-                                LocalAppMsg::AppSendFailed as u16,
-                            );
-                            hdr.body_len = 2;
-                            let mut frame = codec::encode_header(&hdr).to_vec();
-                            frame.extend_from_slice(&ipc_send_err::NO_ROUTE.to_be_bytes());
-                            return wh.write_all(&frame).await;
+                    use veil_proto::budget::{MAX_CHUNK_PAYLOAD, MAX_REASSEMBLY_BYTES};
+                    use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope};
+                    use veil_proto::family::DeliveryMsg;
+
+                    let total_size = envelope.payload.len();
+                    // Bounded by the receiver's reassembly cap — refuse early.
+                    if total_size > MAX_REASSEMBLY_BYTES {
+                        let mut hdr = FrameHeader::new(
+                            FrameFamily::LocalApp as u8,
+                            LocalAppMsg::AppSendFailed as u16,
+                        );
+                        hdr.body_len = 2;
+                        let mut frame = codec::encode_header(&hdr).to_vec();
+                        frame.extend_from_slice(&ipc_send_err::NO_ROUTE.to_be_bytes());
+                        return wh.write_all(&frame).await;
+                    }
+
+                    let pieces: Vec<Vec<u8>> = envelope
+                        .payload
+                        .chunks(MAX_CHUNK_PAYLOAD)
+                        .map(|c| c.to_vec())
+                        .collect();
+                    let chunk_count = pieces.len() as u32;
+                    let mut transfer_id = [0u8; 16];
+                    {
+                        use rand_core::RngCore;
+                        rand_core::OsRng.fill_bytes(&mut transfer_id);
+                    }
+                    let orig_content_id = envelope.content_id;
+                    let want_ack = send.require_ack;
+                    let trace_bytes = trace_id.to_be_bytes();
+
+                    // Candidate relay hops: primary then cached alternatives.
+                    let hops_to_try: Vec<[u8; 32]> = {
+                        let mut v = vec![hop];
+                        if let Some(cache) = route_cache {
+                            for alt in rlock!(cache).lookup_all(&send.dst_node_id) {
+                                if alt != hop {
+                                    v.push(alt);
+                                }
+                            }
                         }
-                        Some((manifest, chunks)) => {
-                            // Send CHUNK_MANIFEST frame.
-                            let manifest_body = manifest.payload.encode();
-                            let mut mhdr = FrameHeader::new(
-                                veil_proto::family::FrameFamily::Delivery as u8,
-                                DeliveryMsg::ChunkManifest as u16,
-                            );
-                            mhdr.body_len = manifest_body.len() as u32;
-                            mhdr.flags = IS_CHUNK_FLAG;
-                            let mut manifest_frame = codec::encode_header(&mhdr).to_vec();
-                            manifest_frame.extend_from_slice(&manifest_body);
+                        v
+                    };
 
-                            // Send Chunk frames.
-                            let transfer_id = manifest.payload.transfer_id;
-                            let mut sent_any = false;
-                            if reg.send_to(
-                                &send.dst_node_id,
-                                veil_proto::header::priority::INTERACTIVE,
-                                manifest_frame,
-                            ) {
-                                sent_any = true;
-                                for (i, chunk_data) in chunks.iter().enumerate() {
-                                    let chunk_body = ChunkPayload {
-                                        transfer_id,
-                                        chunk_index: i as u32,
-                                        data: chunk_data.clone(),
-                                    }
-                                    .encode();
-                                    let mut chdr = FrameHeader::new(
-                                        veil_proto::family::FrameFamily::Delivery as u8,
-                                        DeliveryMsg::Chunk as u16,
-                                    );
-                                    chdr.body_len = chunk_body.len() as u32;
-                                    chdr.flags = IS_CHUNK_FLAG;
-                                    let mut chunk_frame = codec::encode_header(&chdr).to_vec();
-                                    chunk_frame.extend_from_slice(&chunk_body);
-                                    reg.send_to(
-                                        &send.dst_node_id,
-                                        veil_proto::header::priority::INTERACTIVE,
-                                        chunk_frame,
-                                    );
-                                }
+                    // Build one relayable chunk-envelope Forward frame for `next_hop`.
+                    let make_chunk_frame =
+                        |next_hop: [u8; 32], index: u32, data: &[u8]| -> Vec<u8> {
+                            let mut cid = [0u8; 32];
+                            {
+                                use rand_core::RngCore;
+                                rand_core::OsRng.fill_bytes(&mut cid);
                             }
-
-                            if sent_any {
-                                if send.require_ack {
-                                    let ok_hdr = FrameHeader::new(
-                                        FrameFamily::LocalApp as u8,
-                                        LocalAppMsg::AppSendOk as u16,
-                                    );
-                                    return wh.write_all(&codec::encode_header(&ok_hdr)).await;
+                            let chunk_env = DeliveryEnvelope {
+                                recipient: envelope.recipient,
+                                sender_node_id: envelope.sender_node_id,
+                                src_app_id: envelope.src_app_id,
+                                app_id: envelope.app_id,
+                                endpoint_id: envelope.endpoint_id,
+                                content_id: cid,
+                                created_at: envelope.created_at,
+                                ttl_secs: envelope.ttl_secs,
+                                payload: ChunkedEnvelopePayload {
+                                    transfer_id,
+                                    chunk_index: index,
+                                    chunk_count,
+                                    total_size: total_size as u32,
+                                    orig_content_id,
+                                    require_ack: want_ack,
+                                    data: data.to_vec(),
                                 }
-                                return Ok(());
-                            }
-                            // Fall through to NO_ROUTE.
-                            let err_code = ipc_send_err::NO_ROUTE.to_be_bytes();
+                                .encode(),
+                                trace_id,
+                                require_ack: false,
+                            };
+                            let env_bytes = chunk_env.encode();
+                            let body_len = 32 + env_bytes.len() + 8 + 1;
                             let mut hdr = FrameHeader::new(
-                                FrameFamily::LocalApp as u8,
-                                LocalAppMsg::AppSendFailed as u16,
+                                FrameFamily::Delivery as u8,
+                                DeliveryMsg::Forward as u16,
                             );
-                            hdr.body_len = err_code.len() as u32;
+                            hdr.body_len = body_len as u32;
                             let mut frame = codec::encode_header(&hdr).to_vec();
-                            frame.extend_from_slice(&err_code);
-                            return wh.write_all(&frame).await;
+                            frame.extend_from_slice(&next_hop);
+                            frame.extend_from_slice(&env_bytes);
+                            frame.extend_from_slice(&trace_bytes);
+                            frame.push(0u8); // relay_hops = 0 at origin
+                            frame
+                        };
+
+                    // Stream every chunk to the first hop that accepts them all.
+                    // (Reassembly is index-deduped, so the partial chunks left on
+                    // a hop that dies mid-stream are harmless on retry.)
+                    let mut delivered = false;
+                    for next_hop in &hops_to_try {
+                        let mut all_ok = true;
+                        for (i, piece) in pieces.iter().enumerate() {
+                            let frame = make_chunk_frame(*next_hop, i as u32, piece);
+                            if !reg.send_to(
+                                next_hop,
+                                veil_proto::header::priority::INTERACTIVE,
+                                frame,
+                            ) {
+                                all_ok = false;
+                                break;
+                            }
+                        }
+                        if all_ok {
+                            delivered = true;
+                            break;
+                        }
+                        if let Some(cache) = route_cache {
+                            wlock!(cache).invalidate_hop(&send.dst_node_id, next_hop);
                         }
                     }
+
+                    if delivered {
+                        if want_ack {
+                            let ok_hdr = FrameHeader::new(
+                                FrameFamily::LocalApp as u8,
+                                LocalAppMsg::AppSendOk as u16,
+                            );
+                            return wh.write_all(&codec::encode_header(&ok_hdr)).await;
+                        }
+                        return Ok(());
+                    }
+                    if let Some(cache) = route_cache {
+                        wlock!(cache).invalidate(&send.dst_node_id);
+                    }
+                    let mut hdr = FrameHeader::new(
+                        FrameFamily::LocalApp as u8,
+                        LocalAppMsg::AppSendFailed as u16,
+                    );
+                    hdr.body_len = 2;
+                    let mut frame = codec::encode_header(&hdr).to_vec();
+                    frame.extend_from_slice(&ipc_send_err::NO_ROUTE.to_be_bytes());
+                    return wh.write_all(&frame).await;
                 }
 
                 // Pre-encode the envelope once; reused for all hop attempts.

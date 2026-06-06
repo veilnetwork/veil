@@ -25,7 +25,6 @@ veil-local-transport = { path = "../veil-local-transport" }
 veil-pending-ack = { path = "../veil-pending-ack" }
 veil-proto = { path = "../veil-proto" }
 veil-routing = { path = "../veil-routing" }
-veil-transfer = { path = "../veil-transfer" }
 veil-transport = { path = "../veil-transport" }
 veil-types = { path = "../veil-types" }
 veil-util = { path = "../veil-util" }
