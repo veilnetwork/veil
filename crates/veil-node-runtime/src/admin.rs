@@ -1715,11 +1715,23 @@ pub fn resolve_admin_endpoint(config: &Config, config_dir: Option<&Path>) -> Res
     match uri {
         veil_transport::TransportUri::Unix { path } => Ok(AdminEndpoint::Unix(path)),
         veil_transport::TransportUri::Tcp { host, port } => {
-            let bind_addr = format!("{host}:{port}").parse().map_err(|e| {
-                NodeError::AdminProtocol(format!(
-                    "global.admin_socket: invalid tcp address {host}:{port} — {e}"
-                ))
-            })?;
+            let bind_addr: std::net::SocketAddr =
+                format!("{host}:{port}").parse().map_err(|e| {
+                    NodeError::AdminProtocol(format!(
+                        "global.admin_socket: invalid tcp address {host}:{port} — {e}"
+                    ))
+                })?;
+            // F6 (defense-in-depth): enforce loopback in the resolver itself, not
+            // only in config validation. A direct caller (test, tool, future call
+            // site) that bypasses validation must not be able to bind the admin
+            // endpoint — which has no network auth beyond a local token file — on
+            // a routable address.
+            if !bind_addr.ip().is_loopback() {
+                return Err(NodeError::AdminProtocol(format!(
+                    "global.admin_socket: TCP admin endpoint must bind a loopback \
+                     address, got {bind_addr}"
+                )));
+            }
             // Precedence: explicit `?runtime_dir=` query → caller-provided
             // `config_dir` (sidecars next to the config — multi-node-friendly)
             // → per-platform default [`runtime_veil_dir`] (honours
