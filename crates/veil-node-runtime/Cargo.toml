@@ -84,7 +84,13 @@ ml-kem = { version = "0.3.0-rc.1", features = ["getrandom"] }
 pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
 pqcrypto-traits = "0.3"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
-rand = "0.8"
+# `rand_core` 0.6 (not the high-level `rand`): all randomness here goes through
+# `rand_core::OsRng`. Pinned to 0.6 because `OsRng` is handed to the dalek-2
+# ecosystem — `x25519_dalek::StaticSecret::random_from_rng(OsRng)` and
+# `ed25519_dalek::SigningKey::generate(&mut OsRng)` — whose `RngCore`/`CryptoRng`
+# bounds are rand_core-0.6-based (curve25519-dalek 4.x). Bumping to rand_core 0.9
+# (where `OsRng` is `TryRngCore`) breaks those call sites and yields no dedup
+# (curve25519-dalek pins 0.6 regardless). Migrate when dalek moves to 0.9.
 rand_core = { version = "0.6", features = ["getrandom"] }
 rcgen = "0.13"
 rpassword = "7"

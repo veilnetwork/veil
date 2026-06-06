@@ -68,7 +68,7 @@ multiple-versions = "warn"
 wildcards = "allow"
 skip = [
     { name = "thiserror", version = "=1.0.69" }, # via tokio-socks 0.5
-    { name = "rand", version = "=0.8.6" },        # via tungstenite 0.24 + veil-node-runtime direct (0.8→0.9 migration tracked)
+    { name = "rand", version = "=0.8.6" },        # via tungstenite 0.24 (transitive)
     { name = "rand", version = "=0.10.1" },       # via hickory-resolver 0.26 (transitive)
 ]
 
