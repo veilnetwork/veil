@@ -34,7 +34,7 @@ curl -sSf https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/instal
 ```
 
 Full guide, options, server setup, and uninstall: **[docs/en/install.md](docs/en/install.md)**
-· на русском: **[docs/ru/install.md](docs/ru/install.md)**.
+· in Russian: **[docs/ru/install.md](docs/ru/install.md)**.
 
 ## Run a node (60 seconds)
 
@@ -59,8 +59,8 @@ veil-cli node stop        # graceful stop
 ## Documentation
 
 New to the project? Start with **[Start here — Veil in plain language](docs/en/start-here.md)**
-(what it is, a glossary of every term, your first ten minutes) · на русском:
-**[С чего начать](docs/ru/start-here.md)**.
+(what it is, a glossary of every term, your first ten minutes) · in Russian:
+**[Start here](docs/ru/start-here.md)**.
 
 Then browse **[docs/en/index.md](docs/en/index.md)** — user guide, administrator
 guide, protocol spec, architecture, and security model.

@@ -1,7 +1,7 @@
 //! Ephemeral-port rotation primitives — Phase 5f.
 //!
-//! Builds on top of [`super::ephemeral::bind_random_port`] (Phase 5а)
-//! и pairs with the wire-frame from `veil-proto::session::
+//! Builds on top of [`super::ephemeral::bind_random_port`] (Phase 5a)
+//! and pairs with the wire-frame from `veil-proto::session::
 //! TransportMigrationNotify` (Phase 5b) + the dispatcher arm in
 //! `veilcore::node::session::runner::handle_transport_migration_
 //! notify_arm` (Phase 5e).
@@ -11,18 +11,18 @@
 //! [`RotationSpec`]: parsed snapshot of the operator's per-listener
 //! `[listen.ephemeral]` config (range, interval, grace period).
 //! Construction is fallible — invalid duration strings, inverted port
-//! ranges, и zero rotation intervals are caught up-front so the loop
+//! ranges, and zero rotation intervals are caught up-front so the loop
 //! never spins on garbage.
 //!
-//! [`run_rotation_loop`]: а generic async task primitive that drives
+//! [`run_rotation_loop`]: a generic async task primitive that drives
 //! the rotation lifecycle. Caller injects the bind closure (typically
-//! [`super::ephemeral::bind_random_port`]) и the broadcast closure
-//! (sign + send `TransportMigrationNotify` к active sessions); the loop
+//! [`super::ephemeral::bind_random_port`]) and the broadcast closure
+//! (sign + send `TransportMigrationNotify` to active sessions); the loop
 //! handles the timing + grace-period choreography.
 //!
-//! The split — primitives in `veil-transport`, runtime integration в
-//! `veilcore` — keeps signing key и session-registry concerns out
-//! of this crate (which avoids а cyclic dep на veil-proto + crypto
+//! The split — primitives in `veil-transport`, runtime integration in
+//! `veilcore` — keeps signing key and session-registry concerns out
+//! of this crate (which avoids a cyclic dep on veil-proto + crypto
 //! material that veil-transport must not know about).
 
 use std::ops::RangeInclusive;
@@ -35,13 +35,13 @@ use super::error::{Result, TransportError};
 
 // ── duration parsing ────────────────────────────────────────────────
 
-/// Parse а compact duration spec accepted в the `[listen.ephemeral]`
+/// Parse a compact duration spec accepted in the `[listen.ephemeral]`
 /// section: `"30s"`, `"5m"`, `"3h"`, `"7d"`.  Trailing whitespace is
-/// trimmed; leading whitespace и signs are NOT.
+/// trimmed; leading whitespace and signs are NOT.
 ///
-/// Numeric part must be а decimal integer ≥ 0 fitting в `u64`; suffix
-/// must be exactly one of `s / m / h / d`.  Returns а `Duration` saturated
-/// at `Duration::MAX` if а wildly large value would overflow seconds.
+/// Numeric part must be a decimal integer ≥ 0 fitting in `u64`; suffix
+/// must be exactly one of `s / m / h / d`.  Returns a `Duration` saturated
+/// at `Duration::MAX` if a wildly large value would overflow seconds.
 ///
 /// # Examples
 ///
@@ -55,14 +55,14 @@ use super::error::{Result, TransportError};
 /// assert!(parse_duration_spec("3").is_err());
 /// assert!(parse_duration_spec("3x").is_err());
 /// ```
-/// Parse а rate-limit spec в the `"N/period"` form used by
+/// Parse a rate-limit spec in the `"N/period"` form used by
 /// `[listen.on_demand].rate_limit`.  Returns `(burst, window)`.
 ///
 /// Period unit follows the [`parse_duration_spec`] convention:
 /// `s` / `m` / `h` / `d`.  Examples: `"3/h"` → `(3, 1h)`;
 /// `"1/m"` → `(1, 1m)`; `"10/30s"` → `(10, 30s)`.  When the period
-/// number is omitted (i.e. just а unit letter), implies 1 of that
-/// unit — `"3/h"` is shorthand для `"3/1h"`.
+/// number is omitted (i.e. just a unit letter), implies 1 of that
+/// unit — `"3/h"` is shorthand for `"3/1h"`.
 ///
 /// # Examples
 /// ```
@@ -89,7 +89,7 @@ pub fn parse_rate_spec(s: &str) -> Result<(u32, Duration)> {
     }
     let burst: u32 = burst_str.parse().map_err(|_| {
         TransportError::Unsupported(format!(
-            "rate spec `{s}`: burst part `{burst_str}` не parses as u32",
+            "rate spec `{s}`: burst part `{burst_str}` not parses as u32",
         ))
     })?;
     // Allow bare unit ("h" instead of "1h").
@@ -124,7 +124,7 @@ pub fn parse_duration_spec(s: &str) -> Result<Duration> {
     let num_part = &trimmed[..trimmed.len() - 1];
     let n: u64 = num_part.parse().map_err(|_| {
         TransportError::Unsupported(format!(
-            "duration spec `{s}`: numeric part `{num_part}` не parses as u64",
+            "duration spec `{s}`: numeric part `{num_part}` not parses as u64",
         ))
     })?;
     Ok(Duration::from_secs(n.saturating_mul(unit_secs)))
@@ -132,29 +132,29 @@ pub fn parse_duration_spec(s: &str) -> Result<Duration> {
 
 // ── RotationSpec ────────────────────────────────────────────────────
 
-/// Fully-parsed view of а listener's ephemeral-rotation config.
-/// Construction validates ranges и duration parsing so the loop never
+/// Fully-parsed view of a listener's ephemeral-rotation config.
+/// Construction validates ranges and duration parsing so the loop never
 /// encounters garbage at runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RotationSpec {
-    /// Bind host (e.g. `"0.0.0.0"`, `"::"`, or а specific local IP).
+    /// Bind host (e.g. `"0.0.0.0"`, `"::"`, or a specific local IP).
     pub host: String,
     /// Inclusive port range. `start > end` rejected at construction.
     pub port_range: RangeInclusive<u16>,
     /// Bind retry count for [`super::ephemeral::bind_random_port`].
     pub bind_retries: u32,
-    /// Interval между successive rotations. Zero rejected at construction.
+    /// Interval between successive rotations. Zero rejected at construction.
     pub rotation_interval: Duration,
-    /// Grace period после а successful rotation before the old listener
-    /// is dropped. Zero is valid (drop immediately) но typically operators
-    /// set 30m–1h к let in-flight handshakes complete.
+    /// Grace period after a successful rotation before the old listener
+    /// is dropped. Zero is valid (drop immediately) but typically operators
+    /// set 30m–1h to let in-flight handshakes complete.
     pub grace_period: Duration,
 }
 
 impl RotationSpec {
     /// Construct + validate.  Designed for `From<EphemeralConfig>`
-    /// glue layer в `veilcore` — это crate doesn't have the config
-    /// type itself к avoid а dep cycle.
+    /// glue layer in `veilcore` — this crate doesn't have the config
+    /// type itself to avoid a dep cycle.
     pub fn new(
         host: impl Into<String>,
         port_range: RangeInclusive<u16>,
@@ -187,39 +187,39 @@ impl RotationSpec {
 // ── rotation loop primitive ─────────────────────────────────────────
 
 /// Outcome reported by the rotation loop on every iteration.  Wrapped
-/// в а channel send (test fixtures observe them via the `events_tx` arg)
-/// и mirrored к structured logs in production.
+/// in a channel send (test fixtures observe them via the `events_tx` arg)
+/// and mirrored to structured logs in production.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RotationEvent {
-    /// Successfully bound а new port; broadcast was issued; the old
-    /// listener will be dropped после the grace period.
+    /// Successfully bound a new port; broadcast was issued; the old
+    /// listener will be dropped after the grace period.
     Rotated { new_port: u16 },
     /// Bind failed at this tick (port range exhausted, all attempts
-    /// `EADDRINUSE`, etc.). The OLD listener stays in place и the loop
-    /// retries at the next interval; до then existing peers keep
-    /// connecting к the unchanged URI.
+    /// `EADDRINUSE`, etc.). The OLD listener stays in place and the loop
+    /// retries at the next interval; until then existing peers keep
+    /// connecting to the unchanged URI.
     BindFailed { reason: String },
-    /// Loop has been cancelled через the watch channel.
+    /// Loop has been cancelled through the watch channel.
     Shutdown,
 }
 
-/// Trait для the bind closure injected into [`run_rotation_loop`].
+/// Trait for the bind closure injected into [`run_rotation_loop`].
 /// Production builds use [`super::ephemeral::bind_random_port`]; tests
-/// inject а mock что returns scripted results.  The function-trait shape
-/// (rather than just а `Fn`) is used because the closure is async и
+/// inject a mock that returns scripted results.  The function-trait shape
+/// (rather than just a `Fn`) is used because the closure is async and
 /// needs `&` instead of `move`-once semantics.
 pub trait BindFn: Send + Sync + 'static {
     fn bind(&self, host: String, port_range: RangeInclusive<u16>, bind_retries: u32) -> BindFuture;
 }
 
-/// Boxed-future return type для [`Binder::bind`].  Aliased к suppress
-/// clippy::type_complexity на the trait method signature и give consumers
-/// а cleaner name к refer to.
+/// Boxed-future return type for [`Binder::bind`].  Aliased to suppress
+/// clippy::type_complexity on the trait method signature and give consumers
+/// a cleaner name to refer to.
 pub type BindFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(TcpListener, u16)>> + Send + 'static>,
 >;
 
-/// Default production bind: dispatches к [`super::ephemeral::bind_random_port`].
+/// Default production bind: dispatches to [`super::ephemeral::bind_random_port`].
 pub struct DefaultBinder;
 
 impl BindFn for DefaultBinder {
@@ -237,10 +237,10 @@ impl BindFn for DefaultBinder {
     }
 }
 
-/// Trait для the broadcast closure called после а successful rotation
-/// с the freshly-bound port.  In production это constructs а signed
-/// `TransportMigrationNotify` payload + pushes it через the session-tx
-/// registry's `send_to_all` path.  Tests pass а closure что records
+/// Trait for the broadcast closure called after a successful rotation
+/// with the freshly-bound port.  In production this constructs a signed
+/// `TransportMigrationNotify` payload + pushes it through the session-tx
+/// registry's `send_to_all` path.  Tests pass a closure that records
 /// invocations so the assertion can check (port, count).
 pub trait BroadcastFn: Send + Sync + 'static {
     fn broadcast(
@@ -254,21 +254,21 @@ pub trait BroadcastFn: Send + Sync + 'static {
 /// Lifecycle per tick:
 ///
 /// 1. Sleep `spec.rotation_interval` (interruptible via `shutdown_rx`).
-/// 2. Call `binder.bind(...)`. On error → emit `BindFailed`, skip к
+/// 2. Call `binder.bind(...)`. On error → emit `BindFailed`, skip to
 ///    step 1 (the old listener stays live).
 /// 3. Call `broadcaster.broadcast(new_port)`. The broadcaster is
 ///    responsible for signing + transmitting the migration notify.
 /// 4. Sleep `spec.grace_period` (interruptible).
 /// 5. Drop the old listener implicitly — the caller owns the swap.
 ///    `new_port` is reported through `events_tx` so the caller can pick
-///    it up + replace the listener в whatever wrapper it owns.
+///    it up + replace the listener in whatever wrapper it owns.
 ///
 /// The loop exits cleanly when `shutdown_rx` flips to `true`.
 ///
-/// **Why the caller owns the listener swap, не the rotator:** binding +
+/// **Why the caller owns the listener swap, not the rotator:** binding +
 /// broadcasting are stateless side-effects; rebinding the runtime's
-/// task spawner к accept against the NEW listener requires lifecycle
-/// access (tx registry, handshake spawn, etc.) что lives в veilcore.
+/// task spawner to accept against the NEW listener requires lifecycle
+/// access (tx registry, handshake spawn, etc.) that lives in veilcore.
 /// Returning the new port + binder gives the caller everything it
 /// needs without dragging cross-crate types here.
 pub async fn run_rotation_loop<B, C>(
@@ -282,12 +282,12 @@ pub async fn run_rotation_loop<B, C>(
     C: BroadcastFn,
 {
     loop {
-        // Step 1: sleep к next rotation tick (or be cancelled).
+        // Step 1: sleep to next rotation tick (or be cancelled).
         tokio::select! {
             biased;
             changed = shutdown_rx.changed() => {
-                // changed() returns Err когда the sender is dropped;
-                // either way we treat it as а shutdown signal so а
+                // changed() returns Err when the sender is dropped;
+                // either way we treat it as a shutdown signal so a
                 // rotator outliving its driver doesn't leak.
                 if changed.is_err() || *shutdown_rx.borrow() {
                     let _ = events_tx.send(RotationEvent::Shutdown).await;
@@ -297,7 +297,7 @@ pub async fn run_rotation_loop<B, C>(
             _ = tokio::time::sleep(spec.rotation_interval) => {}
         }
 
-        // Step 2: try к bind.
+        // Step 2: try to bind.
         let bind_result = binder
             .bind(
                 spec.host.clone(),
@@ -308,14 +308,14 @@ pub async fn run_rotation_loop<B, C>(
         let new_port = match bind_result {
             Ok((listener, port)) => {
                 // Caller owns the listener post-rotation — drop our
-                // reference так it goes из scope after broadcast/
+                // reference so it goes from scope after broadcast/
                 // grace.  Actually we drop it immediately: the
                 // production caller's tx-registry-driven broadcast
                 // includes the listener bind upstream (lifecycle.rs
-                // pulls а fresh listener through here only once и
+                // pulls a fresh listener through here only once and
                 // hands it to its own accept loop). Keeping the
-                // listener inside this loop would orphan а bound
-                // socket каждую iteration.
+                // listener inside this loop would orphan a bound
+                // socket every iteration.
                 drop(listener);
                 port
             }
@@ -343,7 +343,7 @@ pub async fn run_rotation_loop<B, C>(
                 biased;
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
-                        // Report the rotation as completed even на
+                        // Report the rotation as completed even on
                         // mid-grace shutdown so the caller knows about
                         // the new port (it'll bind+accept on the next
                         // startup against whichever listener it owns).
@@ -359,7 +359,7 @@ pub async fn run_rotation_loop<B, C>(
         }
 
         // Step 5: report.  Caller picks up the new port via events_tx
-        // и swaps its accept-loop against а listener it owns separately.
+        // and swaps its accept-loop against a listener it owns separately.
         let _ = events_tx.send(RotationEvent::Rotated { new_port }).await;
     }
 }
@@ -389,8 +389,8 @@ mod tests {
 
     #[test]
     fn parse_zero_is_allowed() {
-        // Zero seconds is а valid duration here — the rotation-loop
-        // constructor separately rejects а zero interval, но that's
+        // Zero seconds is a valid duration here — the rotation-loop
+        // constructor separately rejects a zero interval, but that's
         // RotationSpec policy not the parser's.
         assert_eq!(parse_duration_spec("0s").unwrap(), Duration::ZERO);
     }
@@ -421,12 +421,12 @@ mod tests {
 
     #[test]
     fn parse_overflow_saturates() {
-        // 18446744073709551615 seconds × 86400 wraps к а small number
-        // в normal mul; `saturating_mul` keeps the result safe.
+        // 18446744073709551615 seconds × 86400 wraps to a small number
+        // in normal mul; `saturating_mul` keeps the result safe.
         let huge = format!("{}d", u64::MAX);
         let dur = parse_duration_spec(&huge).unwrap();
         // We don't check the exact value — just that it didn't panic
-        // и returned _some_ duration.
+        // and returned _some_ duration.
         assert!(dur >= Duration::from_secs(1));
     }
 
@@ -533,7 +533,7 @@ mod tests {
 
     // ── run_rotation_loop ────────────────────────────────────────
 
-    /// Mock binder что returns scripted results.
+    /// Mock binder that returns scripted results.
     struct MockBinder {
         results: Arc<std::sync::Mutex<Vec<Result<u16>>>>,
         bind_calls: Arc<AtomicU32>,
@@ -562,7 +562,7 @@ mod tests {
         }
     }
 
-    /// Mock broadcaster что records the ports it was called with.
+    /// Mock broadcaster that records the ports it was called with.
     struct MockBroadcaster {
         calls: Arc<std::sync::Mutex<Vec<u16>>>,
     }
@@ -606,12 +606,12 @@ mod tests {
             run_rotation_loop(spec, binder, broadcaster, events_tx, shutdown_rx).await;
         });
 
-        // Advance к first rotation.
+        // Advance to first rotation.
         tokio::time::advance(Duration::from_secs(60)).await;
         let ev = events_rx.recv().await.unwrap();
         assert_eq!(ev, RotationEvent::Rotated { new_port: 42424 });
 
-        // Advance к second rotation.
+        // Advance to second rotation.
         tokio::time::advance(Duration::from_secs(60)).await;
         let ev = events_rx.recv().await.unwrap();
         assert_eq!(ev, RotationEvent::Rotated { new_port: 42425 });
@@ -731,13 +731,13 @@ mod tests {
             run_rotation_loop(spec, binder, broadcaster, events_tx, shutdown_rx).await;
         });
 
-        // Advance к rotation tick (60s) AND wait through the bind +
-        // broadcast.  Event should still be pending due к grace.
+        // Advance to rotation tick (60s) AND wait through the bind +
+        // broadcast.  Event should still be pending due to grace.
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::time::sleep(Duration::from_secs(1)).await; // let task run
         assert!(
             events_rx.try_recv().is_err(),
-            "Rotated should not fire до grace period elapses"
+            "Rotated should not fire until grace period elapses"
         );
 
         // Advance through grace (30s).

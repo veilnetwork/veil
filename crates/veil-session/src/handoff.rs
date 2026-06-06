@@ -146,14 +146,14 @@ impl HandoffRegistry {
         inner.by_session.insert(session_id, entry);
     }
 
-    /// Look up а pending entry без consuming it. Originally designed
-    /// для the accept-side к verify HMAC before commit; production
-    /// path now folds peek+consume in а single atomic `consume` call
-    /// (which prunes expired entries internally too). Retained для
+    /// Look up a pending entry without consuming it. Originally designed
+    /// for the accept-side to verify HMAC before commit; production
+    /// path now folds peek+consume in a single atomic `consume` call
+    /// (which prunes expired entries internally too). Retained for
     /// tests + future "verify-then-commit" workflows.
     ///
     /// Phase 2 session 2: `#[cfg(test)]` removed so cross-crate tests
-    /// в veilcore (Strategy A) can reach this method.
+    /// in veilcore (Strategy A) can reach this method.
     pub fn peek(&self, session_id: &[u8; 32]) -> Option<PendingHandoff> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -176,7 +176,7 @@ impl HandoffRegistry {
     }
 
     /// Drop all entries whose `expires_at ≤ now`. Called
-    /// opportunistically от `insert`/`peek`/`consume`, и by а periodic
+    /// opportunistically from `insert`/`peek`/`consume`, and by a periodic
     /// background tick (`spawn_handoff_prune_task`) so quiet sessions
     /// don't accumulate stale entries between operations.
     pub fn prune_expired(&self) {
@@ -193,7 +193,7 @@ impl HandoffRegistry {
             .len()
     }
 
-    /// `true` если nothing is currently buffered.  Companion к [`Self::len`].
+    /// `true` if nothing is currently buffered.  Companion to [`Self::len`].
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -366,7 +366,7 @@ impl SessionSwapRegistry {
             .len()
     }
 
-    /// `true` если nothing is currently registered.  Companion к [`Self::len`].
+    /// `true` if nothing is currently registered.  Companion to [`Self::len`].
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -544,7 +544,7 @@ impl HandoffAckWaiters {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
-    /// `true` если no waiter is currently registered.  Companion к [`Self::len`].
+    /// `true` if no waiter is currently registered.  Companion to [`Self::len`].
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

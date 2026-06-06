@@ -21,13 +21,13 @@ pub struct EphemeralKeypair {
 /// Errors returned by [`compute_shared_secret`][].
 #[derive(Debug, thiserror::Error)]
 pub enum KexError {
-    /// The remote public key was а low-order point, so the resulting
-    /// shared secret is all-zero (или another fixed value known к the
+    /// The remote public key was a low-order point, so the resulting
+    /// shared secret is all-zero (or another fixed value known to the
     /// attacker who chose the point).  Aborting the handshake is the
-    /// only safe response — proceeding would derive session keys из а
-    /// secret known к the adversary.
+    /// only safe response — proceeding would derive session keys from a
+    /// secret known to the adversary.
     #[error(
-        "non-contributory X25519: remote pubkey is а low-order point (shared secret would be known к attacker)"
+        "non-contributory X25519: remote pubkey is a low-order point (shared secret would be known to attacker)"
     )]
     NonContributory,
 }
@@ -50,13 +50,13 @@ pub fn generate_ephemeral() -> EphemeralKeypair {
 /// pass `&*secret` (deref to `&[u8; 32]`); the wrapper Zeroizes when
 /// the binding goes out of scope.
 ///
-/// Returns [`KexError::NonContributory`] when the remote pubkey is а
+/// Returns [`KexError::NonContributory`] when the remote pubkey is a
 /// low-order point — `x25519-dalek` silently produces an all-zero
 /// shared secret in that case, which would let an attacker who chose
 /// the point derive identical session keys.  Even though OVL1 binds
-/// peer-supplied pubkeys через an ephemeral signature (see
+/// peer-supplied pubkeys through an ephemeral signature (see
 /// `runner.rs::on_session_init`), the cheap zero-check provides
-/// defense-in-depth against а compromised long-term key actively
+/// defense-in-depth against a compromised long-term key actively
 /// publishing low-order points.
 pub fn compute_shared_secret(
     keypair: EphemeralKeypair,
@@ -65,8 +65,8 @@ pub fn compute_shared_secret(
     let remote = PublicKey::from(*remote_pubkey);
     let shared: SharedSecret = keypair.secret.diffie_hellman(&remote);
     let bytes = *shared.as_bytes();
-    // X25519 with а low-order remote pubkey produces all-zero shared
-    // secret.  Reject explicitly — never proceed с а DH output known к
+    // X25519 with a low-order remote pubkey produces all-zero shared
+    // secret.  Reject explicitly — never proceed with a DH output known to
     // the chooser.
     if bytes == [0u8; 32] {
         return Err(KexError::NonContributory);

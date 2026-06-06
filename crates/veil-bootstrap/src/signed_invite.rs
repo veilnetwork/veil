@@ -363,7 +363,7 @@ fn decode_body(buf: &[u8]) -> Result<DecodedSignedInvite<'_>, SignedInviteError>
     let algo_byte = read(buf, &mut p, 1)?[0];
     let issuer_algo = algo_from_u8(algo_byte)?;
     // previous code used `try_into.unwrap` which is
-    // provably infallible (read enforces N bytes), но ugly-looking
+    // provably infallible (read enforces N bytes), but ugly-looking
     // hygiene + survives less well across refactors. Switched to
     // explicit `read_u16_be` / `read_u64_be` helpers that handle
     // the byte-array conversion internally — same wire format
@@ -395,7 +395,7 @@ fn decode_body(buf: &[u8]) -> Result<DecodedSignedInvite<'_>, SignedInviteError>
 fn read<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], SignedInviteError> {
     // defensive overflow check on `*pos + n`. In
     // practice `pos` stays well below `usize::MAX` because `buf`
-    // is а decode buffer bounded к the network frame size, но
+    // is a decode buffer bounded to the network frame size, but
     // `checked_add` removes the implicit wraparound risk on
     // 32-bit Android targets.
     let end = pos
@@ -411,7 +411,7 @@ fn read<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], Signed
 fn read_u16_be(buf: &[u8], pos: &mut usize) -> Result<u16, SignedInviteError> {
     let s = read(buf, pos, 2)?;
     // 2-byte slice → [u8; 2] is infallible by construction; we
-    // express it via TryInto so the conversion is explicit, и the
+    // express it via TryInto so the conversion is explicit, and the
     // `.expect` message documents the invariant that survives
     // across refactors.
     Ok(u16::from_be_bytes(

@@ -8,8 +8,8 @@ pub mod identity_master;
 pub mod identity_master_file;
 pub mod identity_master_qr;
 // Pre-Phase-1 of `veilcore` extraction: identity_ops + identity_policy
-// moved here from `crate::` root к break the cfg ↔ identity_ops cycle.
-// `crate::lib.rs` re-exports both для backwards compat.
+// moved here from `crate::` root to break the cfg ↔ identity_ops cycle.
+// `crate::lib.rs` re-exports both for backwards compat.
 pub mod identity_ops;
 pub mod identity_policy;
 pub mod instance;

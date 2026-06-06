@@ -70,18 +70,18 @@ pub fn context_from_config(config: &Config) -> Result<TransportContext> {
     let mut ctx = TransportContext::for_debug()?
         .with_tcp_connect_timeout(connect_timeout)
         .with_default_sni(config.transport.default_sni.clone())
-        // Этап 10 slice 2b — propagate the GREASE ECH опт-in flag
-        // от `[global] tls_ech_grease` к the transport layer.  Default
-        // remains `false` (foundation flag); slice 2c flips к `true`.
+        // Phase 10 slice 2b — propagate the GREASE ECH opt-in flag
+        // from `[global] tls_ech_grease` to the transport layer.  Default
+        // remains `false` (foundation flag); slice 2c flips to `true`.
         .with_tls_ech_grease(config.global.tls_ech_grease)
         // Runtime TLS fingerprint rotation policy (tls-boring path).
         .with_tls_fingerprint(fingerprint_policy);
 
     // apply TLS trust-store config knobs.
     // closed the build-flag footgun — `use_system_roots = true`
-    // is now respected unconditionally (webpki-roots is а direct dep
-    // either way). The `tls-webpki-roots` feature is now а no-op kept
-    // for existing build configs; scheduled for removal в semver-major.
+    // is now respected unconditionally (webpki-roots is a direct dep
+    // either way). The `tls-webpki-roots` feature is now a no-op kept
+    // for existing build configs; scheduled for removal in semver-major.
     let tls_cfg = &config.transport.tls_client;
     if tls_cfg.use_system_roots {
         ctx.tls = ctx.tls.with_system_roots(true)?;
@@ -101,13 +101,13 @@ pub fn context_from_config(config: &Config) -> Result<TransportContext> {
         let trimmed = raw.trim();
         let decoded = BASE64.decode(trimmed).map_err(|e| {
             TransportError::Unsupported(format!(
-                "obfs4_psk_file: invalid base64 в {}: {e}",
+                "obfs4_psk_file: invalid base64 in {}: {e}",
                 psk_path.display()
             ))
         })?;
         if decoded.len() != 32 {
             return Err(TransportError::Unsupported(format!(
-                "obfs4_psk_file: expected 32 bytes, got {} в {}",
+                "obfs4_psk_file: expected 32 bytes, got {} in {}",
                 decoded.len(),
                 psk_path.display()
             )));
@@ -122,9 +122,9 @@ pub fn context_from_config(config: &Config) -> Result<TransportContext> {
         ctx.webtunnel_secret_path = Some(path.clone());
     }
     if let Some(ref token_path) = config.transport.webtunnel_auth_token_file {
-        // Token is stored AS-IS — каждый wire-byte op (sending в header,
-        // comparing на receive) treats it як opaque bytes.  Operators
-        // typically use base64 ASCII so the file is greppable, но any
+        // Token is stored AS-IS — each wire-byte op (sending in header,
+        // comparing on receive) treats it as opaque bytes.  Operators
+        // typically use base64 ASCII so the file is greppable, but any
         // printable-ASCII secret works.  Trailing whitespace/newline
         // trimmed; otherwise file content == token verbatim.
         let raw = std::fs::read_to_string(token_path).map_err(|e| {
@@ -169,22 +169,22 @@ pub fn context_from_config(config: &Config) -> Result<TransportContext> {
             })?;
     }
     // Anti-censorship P2 #7: bandwidth mimicry — design landing-pad
-    // recognised here so operators can pre-bake the flag, но не
-    // wired yet (см. docs/internal/PLAN_BANDWIDTH_MIMICRY.md).  Fail-closed
+    // recognised here so operators can pre-bake the flag, but not
+    // wired yet (see docs/internal/PLAN_BANDWIDTH_MIMICRY.md).  Fail-closed
     // gate (audit batch 2026-05-23): if the operator sets the flag
     // without also acknowledging the no-op via `experimental_allow_noop_mimicry`,
-    // refuse to start.  Pre-fix the daemon only WARN-logged и kept
-    // running, which gave operators а false sense of DPI resistance.
+    // refuse to start.  Pre-fix the daemon only WARN-logged and kept
+    // running, which gave operators a false sense of DPI resistance.
     if config.transport.bandwidth_mimicry_enabled {
         if !config.transport.experimental_allow_noop_mimicry {
             return Err(TransportError::Unsupported(
                 "[transport] bandwidth_mimicry_enabled = true but the feature \
-                 wire-up is deferred (см. docs/internal/PLAN_BANDWIDTH_MIMICRY.md). \
-                 Setting it on its own gives а false sense of DPI resistance \
+                 wire-up is deferred (see docs/internal/PLAN_BANDWIDTH_MIMICRY.md). \
+                 Setting it on its own gives a false sense of DPI resistance \
                  because nothing actually shapes the traffic.  Either set it \
-                 back к false, OR also set experimental_allow_noop_mimicry = \
-                 true к explicitly acknowledge the daemon will run без \
-                 mimicry.  Use operator-side tc/qdisc (см. \
+                 back to false, OR also set experimental_allow_noop_mimicry = \
+                 true to explicitly acknowledge the daemon will run without \
+                 mimicry.  Use operator-side tc/qdisc (see \
                  docs/internal/DEPLOYMENT_HARDENING.md) if you need throughput-\
                  shape resistance now."
                     .to_string(),
@@ -217,7 +217,7 @@ mod bandwidth_mimicry_failclosed_tests {
         cfg.transport.bandwidth_mimicry_enabled = true;
         // experimental_allow_noop_mimicry left at its default `false`.
         let err = context_from_config(&cfg).expect_err(
-            "enabling mimicry without ack must fail — regression bar для audit batch 2026-05-23",
+            "enabling mimicry without ack must fail — regression bar for audit batch 2026-05-23",
         );
         let msg = format!("{err}");
         assert!(

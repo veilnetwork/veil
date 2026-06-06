@@ -1,20 +1,20 @@
 //! PoW-gated rendezvous wire frames + primitives — Slice 1 of the
 //! PoW-Gated Rendezvous epic ([`docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`]).
 //!
-//! Two payload types live в this module:
+//! Two payload types live in this module:
 //!
 //! * [`RequestEphemeralEndpointPayload`] — initiator's request that
-//!   а target node provision an ephemeral listener for one-shot dial.
-//!   Carries а PoW proof + Ed25519 signature от the requester.
+//!   a target node provision an ephemeral listener for one-shot dial.
+//!   Carries a PoW proof + Ed25519 signature from the requester.
 //! * [`EphemeralEndpointResponsePayload`] — target's signed response
-//!   с the freshly-bound URI + per-request PSK + TTL.
+//!   with the freshly-bound URI + per-request PSK + TTL.
 //!
-//! Domain-separated signatures + PoW canonicalisation prevent а
-//! cross-purpose replay: signing material для request и response are
-//! disjoint, и а PoW solution для one cannot be reused для the other.
+//! Domain-separated signatures + PoW canonicalisation prevent a
+//! cross-purpose replay: signing material for request and response are
+//! disjoint, and a PoW solution for one cannot be reused for the other.
 //!
-//! Threat model и full lifecycle описаны в the linked plan doc; это
-//! module ships only the wire-level primitives (Slice 1 scope) и does
+//! Threat model and full lifecycle described in the linked plan doc; this
+//! module ships only the wire-level primitives (Slice 1 scope) and does
 //! NOT perform live network dispatch (that's Slice 3+ work).
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -24,36 +24,36 @@ use crate::discovery::MAX_TRANSPORT_URI_LEN;
 
 // ── Public constants ────────────────────────────────────────────────
 
-/// Domain separation tag для the request's signature input.  Prepended
-/// before `signable_bytes` так а sig от one purpose cannot be replayed
-/// против а message of another type.  Versioned (`v1`) so future wire
+/// Domain separation tag for the request's signature input.  Prepended
+/// before `signable_bytes` so a sig from one purpose cannot be replayed
+/// against a message of another type.  Versioned (`v1`) so future wire
 /// format bumps stay disjoint.
 pub const REQUEST_SIG_DOMAIN: &[u8] = b"veil-rendezvous-request:v1\0";
 
-/// Domain separation tag для the response's signature input.  Disjoint
-/// от [`REQUEST_SIG_DOMAIN`] so а valid request signature cannot pass
-/// response verification и vice versa.
+/// Domain separation tag for the response's signature input.  Disjoint
+/// from [`REQUEST_SIG_DOMAIN`] so a valid request signature cannot pass
+/// response verification and vice versa.
 pub const RESPONSE_SIG_DOMAIN: &[u8] = b"veil-rendezvous-response:v1\0";
 
-/// Domain separation tag для the request's PoW canonical form.
-/// Distinct от signature domains so а PoW solution computed против
-/// the request body cannot be re-applied к (say) identity-mining
-/// что shares the BLAKE3 primitive.
+/// Domain separation tag for the request's PoW canonical form.
+/// Distinct from signature domains so a PoW solution computed against
+/// the request body cannot be re-applied to (say) identity-mining
+/// that shares the BLAKE3 primitive.
 pub const POW_DOMAIN: &[u8] = b"veil-rendezvous-pow:v1\0";
 
-/// Replay-tolerance window (seconds).  Requests с `|now - timestamp|`
+/// Replay-tolerance window (seconds).  Requests with `|now - timestamp|`
 /// outside this window are silently dropped — anti-replay protection
-/// для long-captured PoW solutions.  Symmetric около `now` to be
-/// robust к minor clock skew (~5 min на both directions).
+/// for long-captured PoW solutions.  Symmetric around `now` to be
+/// robust to minor clock skew (~5 min in both directions).
 pub const REPLAY_WINDOW_SECS: u64 = 300;
 
-/// Maximum allowed PoW difficulty в leading-zero-bits.  Bound prevents
-/// а malicious requester от claiming an unverifiable difficulty (e.g.
+/// Maximum allowed PoW difficulty in leading-zero-bits.  Bound prevents
+/// a malicious requester from claiming an unverifiable difficulty (e.g.
 /// 2^32 — verifier would still pass but the value is meaningless).
 /// 64 bits = ~10^19 hashes, far beyond practical compute budgets.
 pub const MAX_POW_DIFFICULTY: u32 = 64;
 
-/// Minimum sensible PoW difficulty.  Set к 8 bits (256 expected
+/// Minimum sensible PoW difficulty.  Set to 8 bits (256 expected
 /// attempts) so even minimal "demonstration" deployments require some
 /// CPU expenditure.  Production defaults run higher (24-28 bits per
 /// the PLAN doc).
@@ -61,9 +61,9 @@ pub const MIN_POW_DIFFICULTY: u32 = 8;
 
 // ── RequestEphemeralEndpointPayload ─────────────────────────────────
 
-/// Initiator's signed request asking а target node к bind an ephemeral
-/// listener.  Routed к the target через the existing OVL1 session
-/// fabric (typically relayed by а mediator с whom both initiator и
+/// Initiator's signed request asking a target node to bind an ephemeral
+/// listener.  Routed to the target through the existing OVL1 session
+/// fabric (typically relayed by a mediator with whom both initiator and
 /// target have active sessions).
 ///
 /// Wire layout:
@@ -72,7 +72,7 @@ pub const MIN_POW_DIFFICULTY: u32 = 8;
 /// [32..64]   requester_pubkey    [u8; 32]   (Ed25519 verifying key)
 /// [64..72]   timestamp_unix      u64 BE     (anti-replay anchor)
 /// [72..76]   pow_difficulty      u32 BE     (claimed; verifier re-checks)
-/// [76..84]   pow_nonce           u64 BE     (such что BLAKE3(POW_DOMAIN ||
+/// [76..84]   pow_nonce           u64 BE     (such that BLAKE3(POW_DOMAIN ||
 ///                                            signable_bytes) has >=
 ///                                            pow_difficulty leading zero bits)
 /// [84..148]  requester_sig       [u8; 64]   (Ed25519 sig over REQUEST_SIG_DOMAIN
@@ -86,22 +86,22 @@ pub const MIN_POW_DIFFICULTY: u32 = 8;
 /// Wire size: 148 bytes (fixed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestEphemeralEndpointPayload {
-    /// Identity of the node the initiator wants к dial.  Equals
+    /// Identity of the node the initiator wants to dial.  Equals
     /// `BLAKE3(target_identity_pubkey)`.
     pub target_node_id: [u8; 32],
     /// Initiator's Ed25519 verifying key.  Identifies the requester
-    /// и binds the PoW solution к this specific entity (PoW cannot
-    /// be transferred к another requester).
+    /// and binds the PoW solution to this specific entity (PoW cannot
+    /// be transferred to another requester).
     pub requester_pubkey: [u8; 32],
     /// Unix timestamp when the request was issued — anchors the
-    /// replay-window check.  Verifier rejects requests с
+    /// replay-window check.  Verifier rejects requests with
     /// `|now - timestamp| > REPLAY_WINDOW_SECS`.
     pub timestamp_unix: u64,
-    /// Claimed PoW difficulty в leading-zero-bits over
+    /// Claimed PoW difficulty in leading-zero-bits over
     /// `BLAKE3(POW_DOMAIN || signable_bytes())`.  Verifier re-counts
-    /// the actual leading zeros и rejects if below operator-configured
-    /// minimum (separate от this self-declared value, which is included
-    /// в the signable surface so а stripping mediator cannot
+    /// the actual leading zeros and rejects if below operator-configured
+    /// minimum (separate from this self-declared value, which is included
+    /// in the signable surface so a stripping mediator cannot
     /// downgrade it).
     pub pow_difficulty: u32,
     /// PoW nonce — varied by the miner until
@@ -109,16 +109,16 @@ pub struct RequestEphemeralEndpointPayload {
     /// pow_difficulty`.
     pub pow_nonce: u64,
     /// Ed25519 signature over `REQUEST_SIG_DOMAIN || signable_bytes()`
-    /// under `requester_pubkey`.  Prevents another node от replaying
-    /// somebody else's PoW solution с а forged requester_pubkey.
+    /// under `requester_pubkey`.  Prevents another node from replaying
+    /// somebody else's PoW solution with a forged requester_pubkey.
     pub requester_sig: [u8; 64],
 }
 
-/// Fixed wire size of а serialized [`RequestEphemeralEndpointPayload`].
+/// Fixed wire size of a serialized [`RequestEphemeralEndpointPayload`].
 pub const REQUEST_WIRE_SIZE: usize = 32 + 32 + 8 + 4 + 8 + 64;
 
 impl RequestEphemeralEndpointPayload {
-    /// Bytes covered by both the signature и the PoW canonical form.
+    /// Bytes covered by both the signature and the PoW canonical form.
     /// Excludes `requester_sig` itself (sig signs the rest).  PoW input
     /// is `POW_DOMAIN || signable_bytes()`; signature input is
     /// `REQUEST_SIG_DOMAIN || signable_bytes()`.
@@ -132,7 +132,7 @@ impl RequestEphemeralEndpointPayload {
         buf
     }
 
-    /// Encode к the fixed-size wire format.
+    /// Encode to the fixed-size wire format.
     pub fn encode(&self) -> [u8; REQUEST_WIRE_SIZE] {
         let mut buf = [0u8; REQUEST_WIRE_SIZE];
         buf[0..32].copy_from_slice(&self.target_node_id);
@@ -144,7 +144,7 @@ impl RequestEphemeralEndpointPayload {
         buf
     }
 
-    /// Decode wire bytes с structural validation only.  Caller MUST
+    /// Decode wire bytes with structural validation only.  Caller MUST
     /// separately invoke [`verify_request_ephemeral_endpoint`] before
     /// trusting the payload — decode does NOT check sig, PoW,
     /// timestamp window, or any policy.
@@ -169,7 +169,7 @@ impl RequestEphemeralEndpointPayload {
 // ── EphemeralEndpointResponsePayload ────────────────────────────────
 
 /// Target's signed response carrying the freshly-bound ephemeral URI
-/// + per-request PSK + TTL.  Routed back к the initiator через the
+/// + per-request PSK + TTL.  Routed back to the initiator through the
 ///   same path the request arrived on.
 ///
 /// Wire layout:
@@ -177,14 +177,14 @@ impl RequestEphemeralEndpointPayload {
 /// [0..32]    target_node_id      [u8; 32]   (target's own node_id; echoed)
 /// [32..64]   requester_pubkey    [u8; 32]   (echoes the request's requester
 ///                                            field — verifier checks this
-///                                            matches its own pubkey so а
-///                                            response intended для another
-///                                            peer cannot be replayed к it)
+///                                            matches its own pubkey so a
+///                                            response intended for another
+///                                            peer cannot be replayed to it)
 /// [64..72]   valid_until_unix    u64 BE     (URI expiry; after this the
 ///                                            target's listener is gone)
 /// [72..74]   transport_len       u16 BE     (≤ MAX_TRANSPORT_URI_LEN)
 /// [74..L]    transport_uri       utf8       (e.g. "obfs4-tcp://1.2.3.4:51237")
-/// [L..L+32]  psk                 [u8; 32]   (one-shot PSK для this dial)
+/// [L..L+32]  psk                 [u8; 32]   (one-shot PSK for this dial)
 /// [L+32..L+96] sig               [u8; 64]   (Ed25519 sig over RESPONSE_SIG_DOMAIN
 ///                                            || signable_bytes() under
 ///                                            target's identity_pk)
@@ -194,29 +194,29 @@ impl RequestEphemeralEndpointPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EphemeralEndpointResponsePayload {
     /// Target's node_id — equals `BLAKE3(target_identity_pubkey)`.
-    /// Echoed so the initiator can quickly cross-check it received а
-    /// response от the intended node before signature verify.
+    /// Echoed so the initiator can quickly cross-check it received a
+    /// response from the intended node before signature verify.
     pub target_node_id: [u8; 32],
     /// Echoes the request's `requester_pubkey` field.  Initiator MUST
     /// check this matches its own pubkey on receive — prevents
-    /// а malicious mediator от replaying а response originally signed
-    /// для а different requester.
+    /// a malicious mediator from replaying a response originally signed
+    /// for a different requester.
     pub requester_pubkey: [u8; 32],
-    /// Unix timestamp at which the ephemeral listener will be гарантированно
+    /// Unix timestamp at which the ephemeral listener will be guaranteed
     /// dropped.  Initiator MUST dial before this time.
     pub valid_until_unix: u64,
-    /// Transport URI к dial.  UTF-8 string, capped at
+    /// Transport URI to dial.  UTF-8 string, capped at
     /// [`MAX_TRANSPORT_URI_LEN`].
     pub transport_uri: String,
-    /// One-shot PSK для the obfs4/wireformat handshake against the
+    /// One-shot PSK for the obfs4/wireformat handshake against the
     /// ephemeral listener.  Unique per request; verifier on the target
-    /// side wires это PSK into the on-demand listener's
+    /// side wires this PSK into the on-demand listener's
     /// `TransportContext` during bind.
     pub psk: [u8; 32],
     /// Ed25519 signature over `RESPONSE_SIG_DOMAIN || signable_bytes()`
     /// under target's identity_pk.  Verifier MUST resolve the target's
     /// pubkey separately (e.g. by `BLAKE3(pubkey) == target_node_id`)
-    /// и validate against it.
+    /// and validate against it.
     pub sig: [u8; 64],
 }
 
@@ -234,7 +234,7 @@ impl EphemeralEndpointResponsePayload {
         buf
     }
 
-    /// Encode к wire bytes.  Variable length (depends on URI length).
+    /// Encode to wire bytes.  Variable length (depends on URI length).
     pub fn encode(&self) -> Vec<u8> {
         let uri_bytes = self.transport_uri.as_bytes();
         let total = 32 + 32 + 8 + 2 + uri_bytes.len() + 32 + 64;
@@ -249,7 +249,7 @@ impl EphemeralEndpointResponsePayload {
         buf
     }
 
-    /// Decode wire bytes с structural validation.  Caller MUST
+    /// Decode wire bytes with structural validation.  Caller MUST
     /// separately invoke [`verify_ephemeral_endpoint_response`] before
     /// trusting it.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
@@ -300,9 +300,9 @@ impl EphemeralEndpointResponsePayload {
 
 // ── PoW primitives ──────────────────────────────────────────────────
 
-/// Count leading-zero **bits** в а 32-byte BLAKE3 hash.  Used as the
+/// Count leading-zero **bits** in a 32-byte BLAKE3 hash.  Used as the
 /// PoW difficulty measurement.  An empty / all-zero hash returns 256;
-/// а hash starting с `0x80` returns 0; etc.
+/// a hash starting with `0x80` returns 0; etc.
 pub fn pow_leading_zero_bits(hash: &[u8; 32]) -> u32 {
     let mut zeros = 0u32;
     for &byte in hash {
@@ -316,13 +316,13 @@ pub fn pow_leading_zero_bits(hash: &[u8; 32]) -> u32 {
     zeros
 }
 
-/// Compute the PoW hash для а request payload's canonical form.
+/// Compute the PoW hash for a request payload's canonical form.
 /// Returns the BLAKE3 hash bytes; caller uses [`pow_leading_zero_bits`]
 /// to derive the difficulty measurement.
 ///
 /// Input shape: `POW_DOMAIN || signable_bytes()`.  Domain prefix
-/// prevents а PoW computed для one purpose от satisfying а different
-/// difficulty target elsewhere в the protocol.
+/// prevents a PoW computed for one purpose from satisfying a different
+/// difficulty target elsewhere in the protocol.
 pub fn pow_hash(canonical: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(POW_DOMAIN.len() + canonical.len());
     input.extend_from_slice(POW_DOMAIN);
@@ -330,7 +330,7 @@ pub fn pow_hash(canonical: &[u8]) -> [u8; 32] {
     *blake3::hash(&input).as_bytes()
 }
 
-/// Check whether `payload`'s embedded `pow_nonce` solves а PoW puzzle
+/// Check whether `payload`'s embedded `pow_nonce` solves a PoW puzzle
 /// at the declared difficulty.  Verifier-side primitive — called as
 /// step (a) of [`verify_request_ephemeral_endpoint`].
 pub fn pow_solution_satisfies(payload: &RequestEphemeralEndpointPayload) -> bool {
@@ -339,26 +339,26 @@ pub fn pow_solution_satisfies(payload: &RequestEphemeralEndpointPayload) -> bool
     pow_leading_zero_bits(&hash) >= payload.pow_difficulty
 }
 
-/// Mine а `pow_nonce` such что [`pow_solution_satisfies`] returns true
-/// для the resulting payload.  Mutates `payload.pow_nonce` в-place.
-/// Returns the number of attempts taken (useful для observability).
+/// Mine a `pow_nonce` such that [`pow_solution_satisfies`] returns true
+/// for the resulting payload.  Mutates `payload.pow_nonce` in-place.
+/// Returns the number of attempts taken (useful for observability).
 ///
-/// **Hot loop** — caller should be prepared для CPU-bound work
-/// proportional к `2^pow_difficulty` expected attempts.  At difficulty
-/// 24 expect ~16M tries (~0.5 seconds на typical 2-vCPU VPS); above 28
-/// the cost grows fast enough к notice.
+/// **Hot loop** — caller should be prepared for CPU-bound work
+/// proportional to `2^pow_difficulty` expected attempts.  At difficulty
+/// 24 expect ~16M tries (~0.5 seconds on typical 2-vCPU VPS); above 28
+/// the cost grows fast enough to notice.
 ///
-/// Refuses if `pow_difficulty` exceeds [`MAX_POW_DIFFICULTY`] — а
-/// guard so honest miners don't accidentally spin forever on а garbage
+/// Refuses if `pow_difficulty` exceeds [`MAX_POW_DIFFICULTY`] — a
+/// guard so honest miners don't accidentally spin forever on a garbage
 /// difficulty value.
 pub fn mine_pow_nonce(payload: &mut RequestEphemeralEndpointPayload) -> Result<u64, ProtoError> {
     mine_pow_nonce_with_progress(payload, u64::MAX, |_| {})
 }
 
 /// Same as [`mine_pow_nonce`] but invokes `progress(attempts_so_far)`
-/// every `report_every` attempts.  Useful для UI spinners during long
-/// mining sessions при production-grade difficulties (24-28 bits ⇒
-/// 0.5–10 s wall-clock на а 2-vCPU VPS).  Pass `u64::MAX` to disable
+/// every `report_every` attempts.  Useful for UI spinners during long
+/// mining sessions at production-grade difficulties (24-28 bits ⇒
+/// 0.5–10 s wall-clock on a 2-vCPU VPS).  Pass `u64::MAX` to disable
 /// reporting (matches [`mine_pow_nonce`] behaviour).
 ///
 /// The callback runs synchronously inside the mining hot-loop — keep
@@ -434,14 +434,14 @@ pub fn mine_pow_nonce_cancellable(
 
 // ── Sign / verify helpers ───────────────────────────────────────────
 
-/// Build + sign а request payload с the given PoW solution.  Caller
+/// Build + sign a request payload with the given PoW solution.  Caller
 /// is responsible for mining the PoW first (use [`mine_pow_nonce`])
-/// or supplying а pre-computed `pow_nonce`.
+/// or supplying a pre-computed `pow_nonce`.
 ///
 /// Does NOT validate the PoW solution itself — callers can either
-/// (a) mine before calling this, или (b) sign а draft payload then
-/// run [`mine_pow_nonce`] AFTER (но note that mining mutates `pow_nonce`
-/// which IS included в signable_bytes — so sig must be recomputed
+/// (a) mine before calling this, or (b) sign a draft payload then
+/// run [`mine_pow_nonce`] AFTER (but note that mining mutates `pow_nonce`
+/// which IS included in signable_bytes — so sig must be recomputed
 /// after mining).  For simplicity, mine-then-sign is the recommended
 /// order.
 pub fn sign_request_ephemeral_endpoint(
@@ -468,18 +468,18 @@ pub fn sign_request_ephemeral_endpoint(
     draft
 }
 
-/// Verify а request payload.  Returns `Ok(())` iff:
-/// 1. `requester_pubkey` is а valid Ed25519 pubkey.
-/// 2. `requester_sig` valid под `REQUEST_SIG_DOMAIN || signable_bytes()`
-///    под `requester_pubkey`.
+/// Verify a request payload.  Returns `Ok(())` iff:
+/// 1. `requester_pubkey` is a valid Ed25519 pubkey.
+/// 2. `requester_sig` valid under `REQUEST_SIG_DOMAIN || signable_bytes()`
+///    under `requester_pubkey`.
 /// 3. `pow_difficulty` is in `[min_difficulty, MAX_POW_DIFFICULTY]`.
 /// 4. `pow_solution_satisfies(payload)` — PoW hash has at least
 ///    `pow_difficulty` leading zeros.
 /// 5. `|now_unix - timestamp_unix| <= REPLAY_WINDOW_SECS`.
 ///
-/// `min_difficulty` is а **policy** parameter set by the verifier
-/// (typically от `[listen.on_demand].pow_difficulty` config); included
-/// here so the wire-layer primitive can be called с different policies
+/// `min_difficulty` is a **policy** parameter set by the verifier
+/// (typically from `[listen.on_demand].pow_difficulty` config); included
+/// here so the wire-layer primitive can be called with different policies
 /// per-listener.
 pub fn verify_request_ephemeral_endpoint(
     payload: &RequestEphemeralEndpointPayload,
@@ -530,7 +530,7 @@ pub fn verify_request_ephemeral_endpoint(
     Ok(())
 }
 
-/// Build + sign а response payload.  Validates the transport URI
+/// Build + sign a response payload.  Validates the transport URI
 /// length up-front so callers cannot accidentally produce wire-invalid
 /// frames.
 pub fn sign_ephemeral_endpoint_response(
@@ -564,14 +564,14 @@ pub fn sign_ephemeral_endpoint_response(
     Ok(draft)
 }
 
-/// Verify а response payload.  Returns `Ok(())` iff:
+/// Verify a response payload.  Returns `Ok(())` iff:
 /// 1. `target_pubkey` valid Ed25519 key.
 /// 2. `BLAKE3(target_pubkey) == payload.target_node_id` — identity binding.
 /// 3. `payload.requester_pubkey == expected_requester_pubkey` — anti-
 ///    replay-for-someone-else (verifier supplies its own pubkey).
 /// 4. `payload.sig` valid under `RESPONSE_SIG_DOMAIN || signable_bytes()`
-///    под `target_pubkey`.
-/// 5. `now_unix < payload.valid_until_unix` — endpoint не expired.
+///    under `target_pubkey`.
+/// 5. `now_unix < payload.valid_until_unix` — endpoint not expired.
 pub fn verify_ephemeral_endpoint_response(
     payload: &EphemeralEndpointResponsePayload,
     target_pubkey: &[u8; 32],
@@ -638,7 +638,7 @@ mod tests {
         let requester_sk = test_sk(requester_sk_seed);
         let requester_pk = requester_sk.verifying_key().to_bytes();
 
-        // Build draft с pow_nonce=0, mine, then sign.  Difficulty kept
+        // Build draft with pow_nonce=0, mine, then sign.  Difficulty kept
         // low (8 bits) so the test mines quickly.
         let mut draft = RequestEphemeralEndpointPayload {
             target_node_id,
@@ -649,7 +649,7 @@ mod tests {
             requester_sig: [0u8; 64],
         };
         mine_pow_nonce(&mut draft).unwrap();
-        // Re-sign after mining (mining mutates pow_nonce which is в
+        // Re-sign after mining (mining mutates pow_nonce which is in
         // signable bytes).
         let signed = sign_request_ephemeral_endpoint(
             target_node_id,
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn request_verify_rejects_excess_max_difficulty() {
-        // Construct а draft с pow_difficulty > MAX (e.g. 100) — signed
+        // Construct a draft with pow_difficulty > MAX (e.g. 100) — signed
         // properly but verify must refuse.
         let target_sk = test_sk(13);
         let target_pk = target_sk.verifying_key().to_bytes();
@@ -843,13 +843,13 @@ mod tests {
 
     #[test]
     fn request_verify_rejects_pow_failure_without_sig_tamper() {
-        // Build а valid sig but stick а PoW solution что doesn't meet the
-        // difficulty.  Hard к do honestly — we need а payload где sig is
+        // Build a valid sig but stick a PoW solution that doesn't meet the
+        // difficulty.  Hard to do honestly — we need a payload where sig is
         // valid but PoW fails.  Trick: difficulty=0 satisfies any hash;
-        // raise difficulty в the verify call.  Actually we already cover
+        // raise difficulty in the verify call.  Actually we already cover
         // this via `request_verify_rejects_below_min_difficulty`.  Here
-        // we test the OPPOSITE: claim high difficulty с sig valid but PoW
-        // nonce не actually mined.
+        // we test the OPPOSITE: claim high difficulty with sig valid but PoW
+        // nonce not actually mined.
         let target_sk = test_sk(21);
         let target_pk = target_sk.verifying_key().to_bytes();
         let target_node_id = *blake3::hash(&target_pk).as_bytes();
@@ -874,8 +874,8 @@ mod tests {
 
     #[test]
     fn request_and_response_sig_domains_disjoint() {
-        // А signed request must NOT verify когда treated as а response
-        // и vice versa — domain prefix bytes differ.
+        // A signed request must NOT verify when treated as a response
+        // and vice versa — domain prefix bytes differ.
         assert_ne!(REQUEST_SIG_DOMAIN, RESPONSE_SIG_DOMAIN);
         assert_ne!(REQUEST_SIG_DOMAIN, POW_DOMAIN);
         assert_ne!(RESPONSE_SIG_DOMAIN, POW_DOMAIN);
@@ -932,7 +932,7 @@ mod tests {
         let requester_pk = test_sk(50).verifying_key().to_bytes();
         let (mut resp, target_pk) =
             build_signed_response(51, requester_pk, 1_700_000_300, "obfs4-tcp://1.2.3.4:51234");
-        // Tamper с target_node_id so the BLAKE3(target_pk) check fails.
+        // Tamper with target_node_id so the BLAKE3(target_pk) check fails.
         resp.target_node_id[0] ^= 0x01;
         let err =
             verify_ephemeral_endpoint_response(&resp, &target_pk, &requester_pk, 1_700_000_100)
@@ -942,8 +942,8 @@ mod tests {
 
     #[test]
     fn response_verify_rejects_replay_to_different_requester() {
-        // А response signed для requester_A is sent к requester_B (B
-        // tries к verify it под its own pubkey).  Must reject.
+        // A response signed for requester_A is sent to requester_B (B
+        // tries to verify it under its own pubkey).  Must reject.
         let requester_a_pk = test_sk(60).verifying_key().to_bytes();
         let requester_b_pk = test_sk(61).verifying_key().to_bytes();
         let (resp, target_pk) = build_signed_response(
@@ -1030,14 +1030,14 @@ mod tests {
 
     #[test]
     fn pow_domain_prevents_cross_replay_to_response() {
-        // А PoW solution mined against the request canonical (с
+        // A PoW solution mined against the request canonical (with
         // POW_DOMAIN prefix) must NOT satisfy ANY response-canonical PoW
-        // (если we were к ever add one — а domain-separation
-        // sanity check).  Here we just confirm domain bytes differ и
-        // hashes therefore disjoint в expectation.
+        // (if we were to ever add one — a domain-separation
+        // sanity check).  Here we just confirm domain bytes differ and
+        // hashes therefore disjoint in expectation.
         let canonical = b"shared canonical bytes";
         let pow = pow_hash(canonical);
-        // Compute what the hash WOULD be с RESPONSE_SIG_DOMAIN prefix
+        // Compute what the hash WOULD be with RESPONSE_SIG_DOMAIN prefix
         // — should differ.
         let mut response_input = Vec::new();
         response_input.extend_from_slice(RESPONSE_SIG_DOMAIN);

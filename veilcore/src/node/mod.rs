@@ -12,8 +12,8 @@ pub mod discovery;
 pub use veil_dispatcher as dispatcher;
 pub mod gateway;
 pub mod gateway_list;
-// Phase 4: identity re-export shim moved к veil-node-runtime as identity_local
-// (publisher_dht + anonymity_x25519 stayed с runtime).  Existing
+// Phase 4: identity re-export shim moved to veil-node-runtime as identity_local
+// (publisher_dht + anonymity_x25519 stayed with runtime).  Existing
 // `crate::node::identity::*` users continue via this re-export of veil-
 // identity at the same path.
 pub mod identity {
@@ -40,10 +40,10 @@ pub mod transfer;
 pub mod transport_hints;
 pub mod update;
 
-// Phase 4 (veilcore extraction): runtime + admin + adapters moved к
+// Phase 4 (veilcore extraction): runtime + admin + adapters moved to
 // `veil-node-runtime` sibling crate.  Audit batch 2026-05-21 Phase
 // D12 pruned the 25+ shim re-exports here; consumers use direct
-// `veil_node_runtime::*` paths.  Only the top-level trio kept as а
+// `veil_node_runtime::*` paths.  Only the top-level trio kept as a
 // convenience because it's used by veil-cli error-mapping and
 // runtime-entry glue everywhere.
 
@@ -108,8 +108,8 @@ mod peer_lru_cache_tests {
     }
 }
 
-// LRU peer cache: canonical impl lives в `veil_types::PeerLruCache` since
-// Phase 3 prep (veilcore extraction); consumers import от there directly.
-// `NodeState`, `LinkId`, `PeerSource`, и other runtime-side types likewise
-// больше не re-exported here (audit batch 2026-05-21 Phase D12) — consumers
+// LRU peer cache: canonical impl lives in `veil_types::PeerLruCache` since
+// Phase 3 prep (veilcore extraction); consumers import from there directly.
+// `NodeState`, `LinkId`, `PeerSource`, and other runtime-side types likewise
+// are no longer re-exported here (audit batch 2026-05-21 Phase D12) — consumers
 // use `veil_node_runtime::{state,types}::*` directly.

@@ -102,8 +102,8 @@ When bandwidth mimicry is enabled, log a WARN-level message at startup:
 
 ```
 bandwidth_mimicry.enabled  profile=chrome-browsing
-  warning="Output gating active — выходящий traffic latency increased by ~50-200 ms.
-  Match the profile к your target jurisdiction's DPI classifier: wrong
+  warning="Output gating active — outbound traffic latency increased by ~50-200 ms.
+  Match the profile to your target jurisdiction's DPI classifier: wrong
   profile choice may degrade censorship resistance.  See PLAN_BANDWIDTH_MIMICRY.md"
 ```
 

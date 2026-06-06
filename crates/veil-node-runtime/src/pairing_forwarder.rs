@@ -1,12 +1,12 @@
-//! IPC → runtime adapter для multi-device pairing ceremony
+//! IPC → runtime adapter for multi-device pairing ceremony
 //! (Epic 489.8).
 //!
 //! Wraps the [`veil_identity::pair_runtime::PairingSource`] /
-//! `PairingTarget` state machines с one-at-a-time semantics — а
+//! `PairingTarget` state machines with one-at-a-time semantics — a
 //! fresh `create_invite` / `consume_uri` drops any in-flight
-//! ceremony on that side.  Source и Target ceremonies live в
-//! independent `Mutex<Option<...>>` slots so а single daemon can
-//! act как both sides of а pairing simultaneously (rare, но е.g.
+//! ceremony on that side.  Source and Target ceremonies live in
+//! independent `Mutex<Option<...>>` slots so a single daemon can
+//! act as both sides of a pairing simultaneously (rare, but e.g.
 //! testing scenarios).
 
 use std::path::PathBuf;
@@ -26,32 +26,32 @@ use veil_observability::NodeLogger;
 pub const PAIR_INVITE_TTL_SECS: u64 = 600;
 
 /// Placeholder endpoint string baked into the rendered PairingUri.
-/// The QR-based pairing flow does not actually rely на the URI's
+/// The QR-based pairing flow does not actually rely on the URI's
 /// transport endpoint (the IPC layer ferrying bytes both directions
-/// is application-mediated).  The endpoint field remains в the wire
-/// format для CLI backward-compat и for future direct-network
-/// pairing.  An empty endpoint fails URI validation, so we use а
-/// sentinel scheme `app://manual` that any reader can identify как
+/// is application-mediated).  The endpoint field remains in the wire
+/// format for CLI backward-compat and for future direct-network
+/// pairing.  An empty endpoint fails URI validation, so we use a
+/// sentinel scheme `app://manual` that any reader can identify as
 /// "do not dial; transport is OOB".
 pub const PAIR_MANUAL_ENDPOINT: &str = "app://manual";
 
-/// Default instance label persisted на `save_paired_target_state`.
-/// Operator can rename later via а dedicated CLI command; for the
+/// Default instance label persisted on `save_paired_target_state`.
+/// Operator can rename later via a dedicated CLI command; for the
 /// IPC-driven flow the daemon doesn't know the user's display name
-/// for this device, so we ship а neutral label.  TODO Phase 4:
+/// for this device, so we ship a neutral label.  TODO Phase 4:
 /// surface instance_label as an optional ConsumeUri payload field.
 pub const DEFAULT_PAIRED_INSTANCE_LABEL: &str = "paired-device";
 
 pub struct PairingForwarder {
     logger: Arc<NodeLogger>,
-    /// `<veil_dir>` где master.enc / identity_document.bin /
-    /// instance.toml live — needed by `handle_confirm` (Source) и
-    /// `build_confirm` (Target) к persist the updated identity files.
+    /// `<veil_dir>` where master.enc / identity_document.bin /
+    /// instance.toml live — needed by `handle_confirm` (Source) and
+    /// `build_confirm` (Target) to persist the updated identity files.
     veil_dir: PathBuf,
-    /// Active sovereign identity handle.  `None` если the daemon
-    /// runs against а legacy non-sovereign identity (pre-Epic 462) —
-    /// pairing requires а sovereign identity by definition (it adds
-    /// а subkey к the IdentityDocument).
+    /// Active sovereign identity handle.  `None` if the daemon
+    /// runs against a legacy non-sovereign identity (pre-Epic 462) —
+    /// pairing requires a sovereign identity by definition (it adds
+    /// a subkey to the IdentityDocument).
     sovereign: Option<Arc<veil_identity::sovereign::SovereignIdentity>>,
     /// Source-side ceremony state — `Some` between `create_invite`
     /// and `handle_confirm` completion / abort.
@@ -105,13 +105,13 @@ impl PairSourceSink for PairingForwarder {
         // Load master_seed.  master.enc is the canonical at-rest form
         // (encrypted via Argon2id-derived KEK + AEAD).  Empty password
         // is rejected upstream by the IPC layer's `BadPassword` path,
-        // но we double-check here defensively.
+        // but we double-check here defensively.
         let pw = match master_password {
             Some(p) if !p.trim().is_empty() => p,
             _ => {
                 return PairSourceCreateOutcome::NotConfigured(
-                    "master_password is required к decrypt master.enc \
-                     для pairing-source ceremony"
+                    "master_password is required to decrypt master.enc \
+                     for pairing-source ceremony"
                         .into(),
                 );
             }
@@ -160,7 +160,7 @@ impl PairSourceSink for PairingForwarder {
             }
         };
 
-        // Build the source state и replace any in-flight ceremony.
+        // Build the source state and replace any in-flight ceremony.
         let source = PairingSource::new(
             sov.document.clone(),
             identity_sk,
@@ -224,9 +224,9 @@ impl PairSourceSink for PairingForwarder {
         use veil_identity::sovereign_flow::IDENTITY_DOCUMENT_FILE;
         use veil_util::atomic_write;
 
-        // Take() so а completed (or aborted) ceremony drops state
-        // unconditionally — the appended IdentityKey already lives в
-        // the in-memory document, so wrapping back на error doesn't
+        // Take() so a completed (or aborted) ceremony drops state
+        // unconditionally — the appended IdentityKey already lives in
+        // the in-memory document, so wrapping back on error doesn't
         // help anyway.
         let mut guard = match self.source.lock() {
             Ok(g) => g,
@@ -387,15 +387,15 @@ impl PairTargetSink for PairingForwarder {
             };
             // sig_key_idx = the index that source appended for this target.
             // After source.handle_hello and target.handle_cert this is the
-            // last entry в `identity_keys`.  Compute defensively.
+            // last entry in `identity_keys`.  Compute defensively.
             if doc.identity_keys.is_empty() {
                 return PairTargetBuildConfirmOutcome::InternalError(
                     "document has no identity_keys after Cert verify".into(),
                 );
             }
             let sig_key_idx = (doc.identity_keys.len() - 1) as u16;
-            // identity_sk seed copy — Этап 6 slice 6i: mlocked storage
-            // for the brief copy between target ownership и disk persist.
+            // identity_sk seed copy — Stage 6 slice 6i: mlocked storage
+            // for the brief copy between target ownership and disk persist.
             let seed_ref = target.target_identity_sk_seed();
             let mut seed_copy: veil_util::sensitive_bytes::SensitiveBytesN<32> =
                 veil_util::sensitive_bytes::SensitiveBytesN::new();

@@ -269,7 +269,7 @@ pub(crate) fn apply_profile_defaults(
             // explicit `[session].max_age_secs = 0` override.
             loaded.session.max_age_secs = Some(1_800);
             // b: per-peer byte-rate cap. Composes
-            // orthogonally с node-aggregate `capacity.max_inbound_
+            // orthogonally with node-aggregate `capacity.max_inbound_
             // bandwidth_kbps` — node-aggregate prevents
             // total runaway, per-peer prevents single-peer-flood
             // from saturating the user's cellular quota even when
@@ -277,8 +277,8 @@ pub(crate) fn apply_profile_defaults(
             // scenario: single sybil peer gets through all upper
             // defences, sends 100 KB/s of garbage frames to mobile
             // user → without per-peer cap, eats user's monthly
-            // 1-5 GB cellular quota в ~10 hours). 64 KB/s = 512
-            // kbps per peer is enough для real chat / signaling
+            // 1-5 GB cellular quota in ~10 hours). 64 KB/s = 512
+            // kbps per peer is enough for real chat / signaling
             // patterns, blocks the runaway-flood scenario. Default
             // burst = 4× rate (256 KB) absorbs legitimate-but-
             // bursty traffic on first frame.
@@ -565,22 +565,22 @@ impl ConfigCommandService {
         issued_at_override: Option<u64>,
         to_stdout: bool,
     ) -> veil_cfg::Result<()> {
-        // Step 1 — load the parsed config к extract the identity keys.
+        // Step 1 — load the parsed config to extract the identity keys.
         // Note: this implicitly verifies any existing signature (warn-
-        // only) — operators get а chance к see "current signature is
+        // only) — operators get a chance to see "current signature is
         // OK" before re-signing.
         let (config_path, loaded) = context.config().load_existing()?;
         let identity = loaded.identity.as_ref().ok_or_else(|| {
             veil_cfg::ConfigError::CommandFailed(
-                "config.identity is empty — `config sign` needs а keypair \
-                 к sign with.  Run `veil-cli identity create` first."
+                "config.identity is empty — `config sign` needs a keypair \
+                 to sign with.  Run `veil-cli identity create` first."
                     .to_owned(),
             )
         })?;
         if identity.public_key.is_empty() || identity.private_key.is_empty() {
             return Err(veil_cfg::ConfigError::CommandFailed(
                 "config.identity.{public_key,private_key} must both be \
-                 non-empty к sign — partial keypair detected."
+                 non-empty to sign — partial keypair detected."
                     .to_owned(),
             ));
         }
@@ -608,7 +608,7 @@ impl ConfigCommandService {
         )
         .map_err(|e| veil_cfg::ConfigError::CommandFailed(format!("sign config: {e}")))?;
 
-        // Step 5 — emit OR write atomically back к the file.
+        // Step 5 — emit OR write atomically back to the file.
         if to_stdout {
             context.io.emit(OutputEvent::config_contents(signed));
         } else {
@@ -616,7 +616,7 @@ impl ConfigCommandService {
             context.io.emit(OutputEvent::message(format!(
                 "signed config at {} (algo={:?}, issued_at_unix={issued_at}, \
                  issuer_pk={}…); subsequent loads will verify the signature \
-                 и WARN on failure — see veil_cfg.signed_config logs",
+                 and WARN on failure — see veil_cfg.signed_config logs",
                 config_path.display(),
                 identity.algo,
                 &identity.public_key[..identity.public_key.len().min(16)],
@@ -1219,7 +1219,7 @@ mod tests {
         session_baseline_with_mobile_tweaks.max_age_secs = Some(1_800);
         assert_eq!(
             config.session, session_baseline_with_mobile_tweaks,
-            "mobile profile may ONLY tweak session.max_concurrent и \
+            "mobile profile may ONLY tweak session.max_concurrent and \
              session.max_age_secs; every other [session] knob must match baseline"
         );
 
@@ -1312,7 +1312,7 @@ mod tests {
         );
     }
 
-    // ── ConfigCommand::Sign (Этап 11 slice 11b) ────────────────────────
+    // ── ConfigCommand::Sign (Phase 11 slice 11b) ────────────────────────
 
     /// `config sign --stdout` produces signed output that verifies under
     /// the same keypair and against the canonical-message rules from
@@ -1320,7 +1320,7 @@ mod tests {
     #[test]
     fn epic11b_config_sign_stdout_produces_verifiable_envelope() {
         let keypair = crate::test_support::ed25519_keypair();
-        // Minimal config с identity + а representative `[global]` field
+        // Minimal config with identity + a representative `[global]` field
         // so the canonical TOML body is non-empty.
         let raw_config = format!(
             "[global]\nruntime_flavor = \"multi_thread\"\n\n\
@@ -1362,7 +1362,7 @@ mod tests {
         let signed = context.io.output.clone();
         assert!(
             signed.starts_with("# VEIL_CONFIG_SIGNATURE_V1: "),
-            "stdout output must begin с the signature header; got: {}",
+            "stdout output must begin with the signature header; got: {}",
             &signed[..signed.len().min(80)],
         );
         let verified =
@@ -1394,7 +1394,7 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains("config.identity is empty") || msg.contains("identity create"),
-            "error must direct operator к `identity create`; got: {msg}",
+            "error must direct operator to `identity create`; got: {msg}",
         );
     }
 }

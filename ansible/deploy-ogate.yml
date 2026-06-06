@@ -76,14 +76,14 @@
     # many tokio await points (IPC → mpsc → PriorityQueue → encrypt →
     # wire-channel → TCP), each one a scheduling round-trip. Bigger MTU
     # Phase E24 (2026-05-22): MTU=16000 — sweet spot found via testnet
-    # MTU-sweep с padding disabled (Phase E23) + ack-skip (Phase E24).
-    # Throughput scaling almost linear с MTU up к 16K bucket boundary:
+    # MTU-sweep with padding disabled (Phase E23) + ack-skip (Phase E24).
+    # Throughput scaling almost linear with MTU up to 16K bucket boundary:
     #   1500 → 166 Mbps  | 3000 → 296 Mbps  | 9000 → 612 Mbps
     #   16000 → 786 Mbps single-stream / 849 Mbps -P 4
     #   32000+ → delivery stalls (frame-size > bufpool 16 KiB bucket).
     # ogate runs across ConfigType=tcp/obfs4 underlays, where TCP itself
     # segments these IP packets transparently — there's no requirement
-    # к fit в 1500 B Ethernet frames.
+    # to fit in 1500 B Ethernet frames.
     ogate_mtu: 16000
     ogate_prefix_v4: 16
     ogate_endpoint_id: 1

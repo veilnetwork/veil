@@ -103,20 +103,20 @@ pub struct IpcClientState {
     /// `STREAM_CLOSE`.  Cross-client hijack is prevented downstream by
     /// checking that incoming `STREAM_DATA`/`STREAM_CLOSE`/`STREAM_WINDOW`
     /// frames reference a `stream_id` that is in either this set or
-    /// `owned_streams_acceptor` — без such а check, any local IPC client
+    /// `owned_streams_acceptor` — without such a check, any local IPC client
     /// could push bytes into / close another client's stream by simply
     /// guessing the `stream_id`.
     owned_streams_opener: std::collections::HashSet<u32>,
     /// Streams this client is the acceptor (this client is the **B
     /// side**) of, populated by the per-endpoint forwarder task when it
-    /// translates an `AppMessage::StreamOpen` into а `STREAM_OPEN_INBOUND`
+    /// translates an `AppMessage::StreamOpen` into a `STREAM_OPEN_INBOUND`
     /// IPC frame, cleared when the matching `AppMessage::StreamClose`
     /// arrives.  Held behind `Arc<Mutex<_>>` because the forwarder runs
-    /// in а separate task от the IPC read loop that updates
+    /// in a separate task from the IPC read loop that updates
     /// `owned_streams_opener`.  Pre-fix the acceptor never claimed
     /// ownership at all, so every `STREAM_DATA` frame from the acceptor
-    /// SDK was silently dropped by the server — turning а documented
-    /// bidirectional stream into а one-way pipe (HIGH-1, audit batch
+    /// SDK was silently dropped by the server — turning a documented
+    /// bidirectional stream into a one-way pipe (HIGH-1, audit batch
     /// 2026-05-23).
     owned_streams_acceptor: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     /// rolling token-bucket rate
@@ -220,8 +220,8 @@ impl IpcClientState {
     }
 
     /// Returns true iff this client is the acceptor (B side) of `stream_id`
-    /// — i.e. the per-endpoint forwarder has translated а matching
-    /// `AppMessage::StreamOpen` into а `STREAM_OPEN_INBOUND` frame on this
+    /// — i.e. the per-endpoint forwarder has translated a matching
+    /// `AppMessage::StreamOpen` into a `STREAM_OPEN_INBOUND` frame on this
     /// connection.
     pub(super) fn owns_stream_as_acceptor(&self, stream_id: u32) -> bool {
         self.owned_streams_acceptor
@@ -232,8 +232,8 @@ impl IpcClientState {
 
     /// Drop ownership when the stream closes from this client's side, so
     /// the HashSet doesn't grow unboundedly across long-running clients.
-    /// Removes from both the opener и acceptor sets — а connection can
-    /// only ever be one side of any given stream_id, и the lookup is
+    /// Removes from both the opener and acceptor sets — a connection can
+    /// only ever be one side of any given stream_id, and the lookup is
     /// O(1) anyway.
     pub(super) fn release_stream(&mut self, stream_id: u32) {
         self.owned_streams_opener.remove(&stream_id);
@@ -264,11 +264,11 @@ impl IpcClientState {
         ids.into_iter().collect()
     }
 
-    /// Clone the acceptor-side ownership handle for а forwarder task.
+    /// Clone the acceptor-side ownership handle for a forwarder task.
     /// The per-endpoint `forward_endpoint` future updates this set when
     /// it translates `AppMessage::StreamOpen`/`StreamClose` into IPC
     /// frames, so the read loop on this connection can authorise
-    /// outbound STREAM_DATA frames від the acceptor SDK.
+    /// outbound STREAM_DATA frames from the acceptor SDK.
     pub(crate) fn acceptor_streams_handle(
         &self,
     ) -> Arc<std::sync::Mutex<std::collections::HashSet<u32>>> {
@@ -291,7 +291,7 @@ impl IpcClientState {
     }
 
     /// Clone the shared delivery-tx channel — used by stream openers to
-    /// register а new outbound stream against this client's frame writer.
+    /// register a new outbound stream against this client's frame writer.
     pub(crate) fn delivery_tx_clone(&self) -> mpsc::Sender<veil_bufpool::PooledShared> {
         self.delivery_tx.clone()
     }
@@ -318,8 +318,8 @@ impl IpcClientState {
     ) {
         // Capture the endpoint's (app_id, endpoint_id) identity so the
         // forwarder can label inbound-stream notifications  the
-        // correct routing key.  Без this the SDK would не know which
-        // bound `AppHandle` к dispatch the inbound notification к.
+        // correct routing key.  Without this the SDK would not know which
+        // bound `AppHandle` to dispatch the inbound notification to.
         let endpoint_app_id = handle.key().app_id;
         let endpoint_id = handle.key().endpoint_id;
         self.handles.push((handle, socket_path));
@@ -387,7 +387,7 @@ async fn forward_endpoint(
     metrics: Option<Arc<dyn IpcMetrics>>,
     // Audit batch 2026-05-24 (M2): `std::sync::Mutex` (NOT tokio::sync)
     // is correct here — critical sections are pure-sync `.insert()` /
-    // `.remove()`, no `.await` between lock-acquire и lock-release.
+    // `.remove()`, no `.await` between lock-acquire and lock-release.
     // Workspace clippy lint `await_holding_lock = "deny"` enforces this
     // invariant compile-time.  Do NOT add an `.await` inside any
     // [lock-acquire] block here.
@@ -422,7 +422,7 @@ async fn forward_endpoint(
                 encode_ipc_frame(LocalAppMsg::AppDeliver as u16, &deliver.encode())
             }
             AppMessage::Data(p) => {
-                // Bridge: AppDataPayload still carries Vec (stream path не horizontal-pool yet).
+                // Bridge: AppDataPayload still carries Vec (stream path not horizontal-pool yet).
                 let deliver = AppDeliverPayload {
                     src_node_id: local_node_id,
                     src_app_id: [0u8; 32], // AppDataPayload is an older path without src_app_id
@@ -437,15 +437,15 @@ async fn forward_endpoint(
                 src_node_id,
                 initial_window,
             } => {
-                // Notify the bound app that а remote peer opened а stream к
+                // Notify the bound app that a remote peer opened a stream to
                 // it.  Uses the dedicated `StreamOpenInbound` variant
                 // (Phase 6.51 follow-up) — historically this was incorrectly
                 // emitted as `StreamOpenOk` which collided  the
-                // reply-к-outbound semantic and caused SDK clients к
+                // reply-to-outbound semantic and caused SDK clients to
                 // silently drop inbound streams.
                 //
                 // Claim acceptor-side ownership BEFORE writing the wire
-                // frame.  The SDK may pipeline а STREAM_DATA reply on the
+                // frame.  The SDK may pipeline a STREAM_DATA reply on the
                 // very same IPC socket; if it raced ahead of this insert,
                 // the read loop's authorisation check would reject the
                 // first acceptor STREAM_DATA frame.  Set-then-write ensures
@@ -469,9 +469,9 @@ async fn forward_endpoint(
                 encode_ipc_frame(LocalAppMsg::StreamData as u16, &payload.encode())
             }
             AppMessage::StreamClose { stream_id } => {
-                // Drop acceptor-side ownership so а later STREAM_DATA with
-                // this id (e.g. а racy SDK send after the close) cannot
-                // mis-route into а brand-new stream that happens к re-use
+                // Drop acceptor-side ownership so a later STREAM_DATA with
+                // this id (e.g. a racy SDK send after the close) cannot
+                // mis-route into a brand-new stream that happens to re-use
                 // the same id later.
                 acceptor_streams
                     .lock()
@@ -553,11 +553,11 @@ pub struct IpcServer {
     /// E2E-encrypted before being wrapped in a `DeliveryEnvelope`.
     peer_mlkem_keys: Option<Arc<std::sync::RwLock<veil_e2e::PeerMlKemCache>>>,
     /// Cold-start ML-KEM-EK resolver — Epic 486.1 slice 3 (audit batch
-    /// 2026-05-23).  When `Some(...)` AND the cache lookup misses в
-    /// `handle_ipc_send`, the handler invokes the resolver к fetch +
-    /// verify + cache the recipient's EK от the DHT.  `None`
+    /// 2026-05-23).  When `Some(...)` AND the cache lookup misses in
+    /// `handle_ipc_send`, the handler invokes the resolver to fetch +
+    /// verify + cache the recipient's EK from the DHT.  `None`
     /// preserves the legacy "no key → NO_E2E_KEY error" semantics
-    /// exactly (используется тестами + setup'ом без full NodeRuntime).
+    /// exactly (used by tests + setup without full NodeRuntime).
     mlkem_ek_resolver: Option<Arc<dyn veil_types::MlKemEkResolver>>,
     /// Optional live-capture broadcast channel (shared with FrameDispatcher).
     /// When set, the IPC server emits plaintext capture events before E2E encryption.
@@ -611,20 +611,20 @@ pub struct IpcServer {
     peer_list_provider: Option<Arc<dyn crate::PeerListProvider>>,
     /// P-Net status provider — answers `LocalAppMsg::PnetStatusQuery`
     /// by surfacing the daemon's per-session MembershipCert verification
-    /// result.  Apps (ogate / oproxy / SDK) use this к gate their
+    /// result.  Apps (ogate / oproxy / SDK) use this to gate their
     /// admission on the daemon's already-verified cert instead of
-    /// keeping а separate static `allowed_node_ids` list.  Without it,
+    /// keeping a separate static `allowed_node_ids` list.  Without it,
     /// the handler replies `admitted=false / has_cert=false` so strict-
-    /// p_net apps fall back к their secondary admission path.
+    /// p_net apps fall back to their secondary admission path.
     pnet_status_provider: Option<Arc<dyn crate::PnetStatusProvider>>,
     /// Bootstrap-URI join sink — handles
     /// `LocalAppMsg::JoinBootstrapUri` requests by decoding the URI
     /// and registering the resulting peer. Without it, the handler
-    /// replies с status `INTERNAL_ERROR` + "feature not wired".
+    /// replies with status `INTERNAL_ERROR` + "feature not wired".
     bootstrap_join_sink: Option<Arc<dyn crate::BootstrapJoinSink>>,
     /// Mobile-status provider — answers
     /// `LocalAppMsg::GetMobileStatus` with battery + tier + factor
-    /// snapshot. Without it, replies с a default zero-state payload
+    /// snapshot. Without it, replies with a default zero-state payload
     /// (apps see "feature off / no battery info" cleanly).
     mobile_status_provider: Option<Arc<dyn crate::MobileStatusProvider>>,
     /// Push-event bus. When set, every connected IPC
@@ -634,47 +634,47 @@ pub struct IpcServer {
     /// receiver — feature off, no protocol error).
     event_bus: Option<Arc<crate::EventBus>>,
     /// audit M6: bounded set of permits gating concurrent IPC
-    /// clients. Without it а local user spawning thousands of socket
-    /// connections each pre-allocates up к 16 MiB on HELLO body read
+    /// clients. Without it a local user spawning thousands of socket
+    /// connections each pre-allocates up to 16 MiB on HELLO body read
     /// → multi-GiB transient memory. At cap, new connections drop
     /// immediately (no queue — queue would itself be unbounded).
     client_semaphore: Arc<tokio::sync::Semaphore>,
     ///.2: hook the IPC handler calls when an app sets/clears
-    /// а sealed push envelope on а rendezvous-publisher entry. When `None`
-    /// the handler responds с status `NoMatchingRendezvous` (feature off
+    /// a sealed push envelope on a rendezvous-publisher entry. When `None`
+    /// the handler responds with status `NoMatchingRendezvous` (feature off
     /// gracefully). Wired by the daemon so apps can register FCM/APNs
-    /// tokens via а single `LocalAppMsg::SetPushEnvelope` IPC frame.
+    /// tokens via a single `LocalAppMsg::SetPushEnvelope` IPC frame.
     push_envelope_sink: Option<Arc<dyn crate::PushEnvelopeSink>>,
     ///.4 P2: mailbox backend (offline store-and-forward).
-    /// When `None` the IPC handlers reply с `NotMailboxRelay` (put) или
+    /// When `None` the IPC handlers reply with `NotMailboxRelay` (put) or
     /// empty list (fetch) / `removed = 0` (ack) — feature off gracefully.
     /// Wired by the daemon if the operator opted into mailbox role.
     mailbox_backend: Option<Arc<dyn crate::MailboxBackend>>,
     ///.4 P4: outbox backend (sender-side peer-sync store).
-    /// When `None` the IPC handlers reply с empty list / removed=0 /
+    /// When `None` the IPC handlers reply with empty list / removed=0 /
     /// stored=false — feature off gracefully.
     outbox_backend: Option<Arc<dyn crate::OutboxBackend>>,
     ///.4 P5c: rendezvous-replica resolver. When `None`
-    /// the IPC handler replies с empty list (apps see "no replica
+    /// the IPC handler replies with empty list (apps see "no replica
     /// found" — same as DHT miss).
     rendezvous_resolver: Option<Arc<dyn crate::RendezvousReplicaResolver>>,
     /// Epic 489.7 generator side: hook the IPC handler calls when an
     /// app sends `LocalAppMsg::CreateBootstrapInvite`.  When `None`
-    /// the handler replies с status `INTERNAL_ERROR` + "feature not
+    /// the handler replies with status `INTERNAL_ERROR` + "feature not
     /// wired" so consumer apps can detect missing daemon support
     /// cleanly (same pattern as the other sinks).
     bootstrap_invite_create_sink: Option<Arc<dyn crate::BootstrapInviteCreateSink>>,
     /// Epic 489.8 multi-device pairing: Source side ceremony adapter.
-    /// Manages а single in-flight ceremony state per daemon instance.
+    /// Manages a single in-flight ceremony state per daemon instance.
     pair_source_sink: Option<Arc<dyn crate::PairSourceSink>>,
     /// Epic 489.8 multi-device pairing: Target side ceremony adapter.
     pair_target_sink: Option<Arc<dyn crate::PairTargetSink>>,
 }
 
-/// Maximum concurrent IPC client connections held по the server.
-/// Sized для realistic deployment: а single phone/desktop has < 10 apps using
-/// veil simultaneously; 256 leaves slack для test harnesses и edge cases
-/// like а browser extension с many tabs each holding a separate handle.
+/// Maximum concurrent IPC client connections held by the server.
+/// Sized for realistic deployment: a single phone/desktop has < 10 apps using
+/// veil simultaneously; 256 leaves slack for test harnesses and edge cases
+/// like a browser extension with many tabs each holding a separate handle.
 pub const MAX_IPC_CONCURRENT_CLIENTS: usize = 256;
 
 /// Inter-session idle timeout for an established IPC connection (audit U3).
@@ -710,7 +710,7 @@ impl IpcServer {
             // IPC APP_SEND rate cap. 1000 fps × MTU 65 KB = ~520 Mbps —
             // exactly the testnet ceiling we observed on ogate iperf.
             // For tunnel-style high-throughput apps (ogate) 1000 fps is
-            // way too low; raised к а high ceiling that still prevents
+            // way too low; raised to a high ceiling that still prevents
             // runaway floods (`0` would disable entirely). Operators
             // chasing higher throughput tune this via `with_max_send_rate()`.
             max_send_rate: 1_000_000,
@@ -760,10 +760,10 @@ impl IpcServer {
         self
     }
 
-    /// Attach а bootstrap-invite-create sink (Epic 489.7 generator
+    /// Attach a bootstrap-invite-create sink (Epic 489.7 generator
     /// side).  When set, `LocalAppMsg::CreateBootstrapInvite` is
-    /// dispatched к the sink, which assembles the daemon's own
-    /// invite URI.  Without it, the handler replies с status
+    /// dispatched to the sink, which assembles the daemon's own
+    /// invite URI.  Without it, the handler replies with status
     /// `INTERNAL_ERROR` + "feature not wired".
     pub fn with_bootstrap_invite_create_sink(
         mut self,
@@ -865,9 +865,9 @@ impl IpcServer {
     }
 
     /// Attach the cold-start ML-KEM-EK resolver.  When the `with_e2e_keys`
-    /// cache misses for а target node_id, the IPC send-handler invokes
-    /// this resolver к fetch the recipient's EK от the DHT (instance
-    /// registry walk + cert chain verification) и cache it на success.
+    /// cache misses for a target node_id, the IPC send-handler invokes
+    /// this resolver to fetch the recipient's EK from the DHT (instance
+    /// registry walk + cert chain verification) and cache it on success.
     /// Without the resolver, cache misses surface as `NO_E2E_KEY` errors
     /// (legacy behaviour preserved).  Epic 486.1 slice 3, audit batch
     /// 2026-05-23.
@@ -966,18 +966,18 @@ impl IpcServer {
 
     /// Attach a peer-list provider. When set
     /// `LocalAppMsg::GetPeers` snapshots active sessions via the
-    /// provider and replies с `PeersList`. Without it, the reply is
+    /// provider and replies with `PeersList`. Without it, the reply is
     /// always empty.
     pub fn with_peer_list_provider(mut self, provider: Arc<dyn crate::PeerListProvider>) -> Self {
         self.peer_list_provider = Some(provider);
         self
     }
 
-    /// Attach а P-Net status provider. When set
-    /// `LocalAppMsg::PnetStatusQuery` is routed to the provider и the
+    /// Attach a P-Net status provider. When set
+    /// `LocalAppMsg::PnetStatusQuery` is routed to the provider and the
     /// reply carries verified MembershipCert state.  Without it, the
-    /// reply is always `admitted=false / has_cert=false` so apps в
-    /// strict p_net mode reject и fall back к their secondary path.
+    /// reply is always `admitted=false / has_cert=false` so apps in
+    /// strict p_net mode reject and fall back to their secondary path.
     pub fn with_pnet_status_provider(
         mut self,
         provider: Arc<dyn crate::PnetStatusProvider>,
@@ -989,7 +989,7 @@ impl IpcServer {
     /// Attach a bootstrap-join sink. When set
     /// `LocalAppMsg::JoinBootstrapUri` is dispatched to the sink for
     /// URI decode + verify + peer registration. Without it, the
-    /// handler replies с status `INTERNAL_ERROR` so apps can detect
+    /// handler replies with status `INTERNAL_ERROR` so apps can detect
     /// "feature not wired" cleanly.
     pub fn with_bootstrap_join_sink(mut self, sink: Arc<dyn crate::BootstrapJoinSink>) -> Self {
         self.bootstrap_join_sink = Some(sink);
@@ -999,7 +999,7 @@ impl IpcServer {
     /// Attach a mobile-status provider. When set
     /// `LocalAppMsg::GetMobileStatus` snapshots the daemon's current
     /// mobile/battery state via the provider. Without it, replies
-    /// с a default zero-state payload — apps see the feature как off
+    /// with a default zero-state payload — apps see the feature as off
     /// rather than a protocol error.
     pub fn with_mobile_status_provider(
         mut self,
@@ -1116,11 +1116,11 @@ impl IpcServer {
     ) -> std::io::Result<()> {
         std::fs::create_dir_all(&runtime_dir)?;
         let (listener, actual_name, token) = veil_local_transport::bind_named_pipe(&pipe_name)?;
-        // route the token write через
+        // route the token write through
         // `write_token_file` for hex-buffer zeroize parity with the
         // TCP backend. On Windows the `mode(0o600)` is a no-op (NTFS
-        // ACLs would need а separate mechanism —), but
-        // the runtime-dir ACL inherited на `create_dir_all` already
+        // ACLs would need a separate mechanism —), but
+        // the runtime-dir ACL inherited on `create_dir_all` already
         // restricts to the local user. The pipe-name sidecar is non-
         // secret discovery data; plain write is fine.
         std::fs::write(runtime_dir.join(IPC_PIPE_FILENAME), actual_name.as_bytes())?;
@@ -1141,14 +1141,14 @@ impl IpcServer {
         let mut shutdown_rx = self.shutdown_rx.clone();
 
         // A2 glue: periodic stream-idle reaper. The
-        // primitive shipped в `IpcStreamTable` (commit `6a1588b`) exposed
+        // primitive shipped in `IpcStreamTable` (commit `6a1588b`) exposed
         // `reap_stale(idle_timeout) -> Vec<u32>`; this is the caller-side
-        // wiring that makes it actually fire. Без а periodic invocation
-        // а stream that broke без а CLOSE frame would sit в the table
-        // forever, holding the per-stream watermarks и (more importantly)
+        // wiring that makes it actually fire. Without a periodic invocation
+        // a stream that broke without a CLOSE frame would sit in the table
+        // forever, holding the per-stream watermarks and (more importantly)
         // the slot's window-update buffer. Slow-reader DoS protected.
         //
-        // 60 s tick is а compromise: shorter would burn CPU on no-op
+        // 60 s tick is a compromise: shorter would burn CPU on no-op
         // sweeps; longer leaves orphaned streams alive past the
         // `DEFAULT_STREAM_IDLE_TIMEOUT = 5 min` window long enough to
         // matter under sustained orphan-rate. Reaper exits when the
@@ -1195,15 +1195,15 @@ impl IpcServer {
 
         let result = self.accept_loop_inner(listener, &mut shutdown_rx).await;
 
-        // Reaper task exits on its own when shutdown_rx fires; reach в
-        // и await its completion so it doesn't leak past `run`'s scope.
+        // Reaper task exits on its own when shutdown_rx fires; reach in
+        // and await its completion so it doesn't leak past `run`'s scope.
         let _ = reaper_handle.await;
 
         result
     }
 
-    /// Inner accept loop split out от [`Self::accept_loop`] so the
-    /// outer wrapper can spawn а parallel reaper task без duplicating
+    /// Inner accept loop split out from [`Self::accept_loop`] so the
+    /// outer wrapper can spawn a parallel reaper task without duplicating
     /// the shutdown / accept select logic.
     async fn accept_loop_inner(
         &mut self,
@@ -1220,10 +1220,10 @@ impl IpcServer {
                 }
                 accepted = listener.accept_raw() => {
                     // slow-loris fix: `accept_raw` returns
-                    // immediately после kernel TCP-accept, без awaiting
+                    // immediately after kernel TCP-accept, without awaiting
                     // the 32-byte token handshake. The handshake (which
-                    // can stall up к TOKEN_READ_TIMEOUT=3s on а malicious
-                    // client) runs inside the spawned task ниже, so the
+                    // can stall up to TOKEN_READ_TIMEOUT=3s on a malicious
+                    // client) runs inside the spawned task below, so the
                     // accept loop is never blocked by stragglers.
                     if let Ok((pending, peer_info)) = accepted {
                         // audit U9: enforce the per-connection peer-uid match as
@@ -1241,8 +1241,8 @@ impl IpcServer {
                             continue;
                         }
                         // audit M6: cap concurrent IPC clients.
-                        // Без semaphore а local user can spawn thousands of
-                        // unix-socket connections, each pre-allocating up к
+                        // Without semaphore a local user can spawn thousands of
+                        // unix-socket connections, each pre-allocating up to
                         // 16 MiB on HELLO body read → multi-GiB transient OOM.
                         // try_acquire_owned drops the new connection if cap
                         // reached (queue would itself be unbounded).
@@ -1289,14 +1289,14 @@ impl IpcServer {
                         let pair_source_sink = self.pair_source_sink.clone();
                         let pair_target_sink = self.pair_target_sink.clone();
                         tokio::spawn(async move {
-                            // Hold the M6 semaphore permit для the lifetime of
+                            // Hold the M6 semaphore permit for the lifetime of
                             // the client task — drops automatically when task
-                            // exits, releasing the slot для the next accept.
+                            // exits, releasing the slot for the next accept.
                             let _permit = permit;
                             // complete the token-handshake step
                             // here (off the accept loop). Failures (timeout
                             // mismatch, EOF) drop the connection silently —
-                            // typical for а probe или misconfigured client.
+                            // typical for a probe or misconfigured client.
                             let stream = match pending.verify().await {
                                 Ok(s) => s,
                                 Err(_) => return,
@@ -1443,7 +1443,7 @@ async fn handle_ipc_client(
             ));
         }
         // exact-size guard. decode_header bounds
-        // body_len by MAX_FRAME_BODY (16 MiB); we tighten к the actual
+        // body_len by MAX_FRAME_BODY (16 MiB); we tighten to the actual
         // payload size before allocating.
         if header.body_len as usize != AppIpcHelloPayload::WIRE_SIZE {
             return Err(std::io::Error::new(
@@ -1576,7 +1576,7 @@ async fn handle_ipc_client(
             // the bus capacity — surface it on stderr but keep the
             // connection alive (the SDK just missed an intermediate state
             // not a fatal protocol error). RecvError::Closed only fires
-            // when every Sender has dropped; treat that как "bus gone for
+            // when every Sender has dropped; treat that as "bus gone for
             // good" and stop polling that arm.
             event_recv = async {
                 match event_rx.as_mut() {
@@ -1680,11 +1680,11 @@ async fn handle_ipc_client(
                     }
                     Ok(LocalAppMsg::StreamData) => {
                         if let Ok(p) = StreamDataPayload::decode(&body) {
-                            // Route based на the client's role on this
+                            // Route based on the client's role on this
                             // stream.  Opener (A) → forward to B endpoint;
                             // acceptor (B) → forward to A delivery channel.
                             // Cross-client hijack is closed by the
-                            // ownership check itself: а frame from а
+                            // ownership check itself: a frame from a
                             // client that is neither opener nor acceptor
                             // of `stream_id` is silently dropped.  Pre-fix
                             // only opener ownership was tracked, so every
@@ -1785,12 +1785,12 @@ async fn handle_ipc_client(
                     }
                     Ok(LocalAppMsg::StreamWindow) => {
                         // STREAM_WINDOW from the acceptor (B) restores
-                        // А's send-side budget; the opener cannot legally
-                        // emit а window update (it has no "budget on the
-                        // other side" к refresh).  Reject frames from
-                        // opener clients так чтобы а compromised opener
-                        // cannot inflate а stream's A→B credit beyond what
-                        // the acceptor has actually committed к read.
+                        // A's send-side budget; the opener cannot legally
+                        // emit a window update (it has no "budget on the
+                        // other side" to refresh).  Reject frames from
+                        // opener clients so so that a compromised opener
+                        // cannot inflate a stream's A→B credit beyond what
+                        // the acceptor has actually committed to read.
                         if let Ok(p) = StreamWindowPayload::decode(&body)
                             && client_state.owns_stream_as_acceptor(p.stream_id) {
                                 stream_table.window_update_from_b(p.stream_id, p.increment);

@@ -116,7 +116,7 @@ impl HotStandbyController {
     /// field. Returns the old value for logging. audit
     /// cleanup: only test-side caller exists today; if
     /// reload-pipeline ever wires this, drop the cfg + add the call
-    /// site в the same commit so production-compile signal goes live.
+    /// site in the same commit so production-compile signal goes live.
     pub fn clear_alt_uri(&self, peer_id: &NodeId) -> Option<String> {
         self.alt_uris
             .lock()
@@ -269,20 +269,20 @@ impl HotStandbyController {
         self.spawn_handoff_probe(peer_id, session_id, tx_key, uri_str, "auto_swap")
     }
 
-    /// Rotation-trigger entry point (Q.7 audit batch).  Called когда
-    /// the session's lifetime deadline expires и we want к make-before-
-    /// break swap к а fresh underlying TCP+TLS connection (defeats DPI
+    /// Rotation-trigger entry point (Q.7 audit batch).  Called when
+    /// the session's lifetime deadline expires and we want to make-before-
+    /// break swap to a fresh underlying TCP+TLS connection (defeats DPI
     /// flow-lifetime fingerprinting).
     ///
-    /// Prefers `alt_uri_for(peer_id)` если registered — gives true
-    /// transport-diversity (e.g. swap от webtunnel-wss к obfs4-tcp).
-    /// Falls back к the caller-supplied `primary_uri` for **same-URI
-    /// rotation**: the probe dials а new TCP+TLS connection к the same
+    /// Prefers `alt_uri_for(peer_id)` if registered — gives true
+    /// transport-diversity (e.g. swap from webtunnel-wss to obfs4-tcp).
+    /// Falls back to the caller-supplied `primary_uri` for **same-URI
+    /// rotation**: the probe dials a new TCP+TLS connection to the same
     /// host:port the session is currently on.  From DPI's view, the old
-    /// flow ends + а new HTTPS handshake starts к the same server —
-    /// indistinguishable от а browser tab being closed и а new one
-    /// opened к the same site.  The session keys + AEAD counter survive
-    /// intact (см. `warm_probe.rs` doc на 3-frame handoff protocol),
+    /// flow ends + a new HTTPS handshake starts to the same server —
+    /// indistinguishable from a browser tab being closed and a new one
+    /// opened to the same site.  The session keys + AEAD counter survive
+    /// intact (see `warm_probe.rs` doc on 3-frame handoff protocol),
     /// so app traffic flows continuously across the swap.
     ///
     /// Same non-blocking + flap-damping semantics as `try_auto_trigger`.
@@ -294,7 +294,7 @@ impl HotStandbyController {
         tx_key: [u8; 32],
     ) -> bool {
         // Prefer alt_uri when available — true transport-diversity
-        // beats same-URI rotation для anti-DPI even though both
+        // beats same-URI rotation for anti-DPI even though both
         // achieve TCP-level rotation.
         let uri_str = self
             .alt_uri_for(&peer_id)
@@ -302,10 +302,10 @@ impl HotStandbyController {
         self.spawn_handoff_probe(peer_id, session_id, tx_key, uri_str, "rotation")
     }
 
-    /// Internal helper: validate URI, register swap attempt с flap
-    /// damping, spawn а warm probe and one-shot handoff task.  Shared
-    /// by `try_auto_trigger` (failure-driven) и `try_rotation_trigger`
-    /// (timer-driven) — they only differ в how the URI is chosen.
+    /// Internal helper: validate URI, register swap attempt with flap
+    /// damping, spawn a warm probe and one-shot handoff task.  Shared
+    /// by `try_auto_trigger` (failure-driven) and `try_rotation_trigger`
+    /// (timer-driven) — they only differ in how the URI is chosen.
     fn spawn_handoff_probe(
         &self,
         peer_id: NodeId,
@@ -629,13 +629,13 @@ mod tests {
 
     // ── Q.7 audit batch: try_rotation_trigger ─────────────────────
     //
-    // The rotation trigger differs от try_auto_trigger в that it
-    // accepts а `primary_uri` fallback — when no alt_uri is set, it
+    // The rotation trigger differs from try_auto_trigger in that it
+    // accepts a `primary_uri` fallback — when no alt_uri is set, it
     // dials the SAME URI the session is currently on (same-URI
     // rotation).  Tests below cover that fallback + the alt_uri
-    // precedence.  We need а tokio runtime for these because the
+    // precedence.  We need a tokio runtime for these because the
     // spawn_handoff_probe path enters `tokio::spawn` once URI parsing
-    // и flap damping succeed.
+    // and flap damping succeed.
 
     #[tokio::test]
     async fn try_rotation_trigger_uses_alt_uri_when_set() {
@@ -649,9 +649,9 @@ mod tests {
 
     #[tokio::test]
     async fn try_rotation_trigger_falls_back_to_primary_uri() {
-        // No alt_uri registered → fall back к primary_uri (same-URI
+        // No alt_uri registered → fall back to primary_uri (same-URI
         // rotation).  This is the main Q.7 codepath since most peers
-        // don't configure а separate alt_uri.
+        // don't configure a separate alt_uri.
         let c = test_controller(4);
         let peer = NodeId::from([0x88u8; 32]);
         assert!(c.alt_uri_for(&peer).is_none());
@@ -661,7 +661,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_rotation_trigger_rejects_malformed_primary_uri() {
-        // Bad URI → URI parse fails → returns false без spawning.
+        // Bad URI → URI parse fails → returns false without spawning.
         let c = test_controller(4);
         let peer = NodeId::from([0x99u8; 32]);
         let ok = c.try_rotation_trigger(peer, "not a valid uri at all", [0u8; 32], [0u8; 32]);

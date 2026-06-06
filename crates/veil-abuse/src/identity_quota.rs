@@ -56,13 +56,13 @@ pub const DEFAULT_IDLE_CLEANUP_SECS: u64 = 6 * 3600;
 /// Result of a `try_allow` call.
 ///
 /// cleanup: production callers chain `.is_allowed` (bool
-/// extractor) и never pattern-match the payload fields (`current`, `cap`
-/// `retry_after`). Fields are intentionally kept так что tests can introspect
-/// quota arithmetic AND чтобы а future `RATE_LIMITED` wire response can
-/// carry retry-after hints без а breaking change. When the wire response
-/// lands, switch dispatcher call sites из `if!try_allow.is_allowed` к
-/// matching `QuotaDecision::RateLimited { retry_after.. }` и плумб'нуть
-/// `retry_after` в the response carrier.
+/// extractor) and never pattern-match the payload fields (`current`, `cap`
+/// `retry_after`). Fields are intentionally kept so that tests can introspect
+/// quota arithmetic AND so that a future `RATE_LIMITED` wire response can
+/// carry retry-after hints without a breaking change. When the wire response
+/// lands, switch dispatcher call sites from `if!try_allow.is_allowed` to
+/// matching `QuotaDecision::RateLimited { retry_after.. }` and plumb
+/// `retry_after` in the response carrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaDecision {
     /// Write is within the quota and has been recorded.
@@ -261,7 +261,7 @@ impl IdentityWriteQuota {
 
     /// Number of identities tracked. cleanup: was `pub`
     /// claiming "metrics", but no AdminCommand / metrics gauge / IPC consumer
-    /// surfaced это; downgraded к `#[cfg(test)]` test-only. Re-promote to
+    /// surfaced this; downgraded to `#[cfg(test)]` test-only. Re-promote to
     /// pub when an actual consumer ships.
     #[cfg(test)]
     pub(crate) fn tracked_identities(&self) -> usize {
@@ -273,9 +273,9 @@ impl IdentityWriteQuota {
     }
 
     /// Drop every bucket — cleanup: doc claimed "for tests
-    /// and emergency operator intervention" но никаких production callers
-    /// никогда не было. Test-only до тех пор пока `AdminCommand::ResetQuotas`
-    /// не появится.
+    /// and emergency operator intervention" but no production callers
+    /// ever existed. Test-only until `AdminCommand::ResetQuotas`
+    /// lands.
     #[cfg(test)]
     pub(crate) fn reset(&self) {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());

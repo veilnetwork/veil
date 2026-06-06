@@ -25,15 +25,15 @@ use veil_observability::{NodeLogger, NodeMetrics};
 // ── audit hardening constants ──────────────────────────────
 //
 // Pre-fix the metrics HTTP server had no read timeout, no concurrent-
-// request cap, и optionally no auth (docs/MONITORING.md promised
+// request cap, and optionally no auth (docs/MONITORING.md promised
 // `auth_token` but `MetricsConfig` lacked the field). Now:
 // * Reads are bounded by [`READ_TIMEOUT`] — slow-loris attackers cannot
-// tie up а tokio task indefinitely.
-// * Concurrent in-flight serve_connection futures capped by а
+// tie up a tokio task indefinitely.
+// * Concurrent in-flight serve_connection futures capped by a
 // [`Semaphore`] of size [`MAX_CONCURRENT_REQUESTS`] — bursty
 // reconnaissance that would otherwise spawn unbounded tasks now
 // queues / drops.
-// * When `auth_token` is configured, every request must carry а
+// * When `auth_token` is configured, every request must carry a
 // matching bearer header (constant-time comparison).
 //
 // Defaults are conservative; operators that need higher throughput can
@@ -41,14 +41,14 @@ use veil_observability::{NodeLogger, NodeMetrics};
 // expectations.
 
 /// HTTP request read deadline. Real Prometheus scrapes finish requests
-/// within а few milliseconds; 5 s is generous и still tight enough к
+/// within a few milliseconds; 5 s is generous and still tight enough to
 /// shed slow-loris.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Max concurrent in-flight HTTP serve futures. When the cap is hit
 /// new accepts are dropped (TCP connection closed without serve) so
-/// reconnaissance that would spawn а task per connect cannot exhaust
-/// memory. 16 covers а typical Prometheus scrape interval (15 s) с
+/// reconnaissance that would spawn a task per connect cannot exhaust
+/// memory. 16 covers a typical Prometheus scrape interval (15 s) with
 /// healthy headroom.
 pub const MAX_CONCURRENT_REQUESTS: usize = 16;
 
@@ -79,12 +79,12 @@ pub struct RuntimeSummary {
 ///
 /// audit: `auth_token` (when `Some`) is constant-time-compared
 /// against every request's `Authorization: Bearer …` header. Requests
-/// без the matching header get а `401 Unauthorized`. When `None`, all
+/// without the matching header get a `401 Unauthorized`. When `None`, all
 /// endpoints are unauthenticated (intended for loopback binds).
-/// state-size probe. Cheap holder of Arc references к
+/// state-size probe. Cheap holder of Arc references to
 /// the daemon's in-memory data-structure roots; the metrics HTTP server
 /// snapshots their `.len` / byte-count gauges at /metrics scrape time
-/// и appends Prometheus lines. Operator visibility into которые structs
+/// and appends Prometheus lines. Operator visibility into which structs
 /// hold the resident heap when chaos-ban-style load creates transient
 /// teardown buffers (route_cache demotes, session_outbox backlog
 /// chunk_reassembler in-flight, etc.).
@@ -107,10 +107,10 @@ pub struct RuntimeStateProbe {
 }
 
 impl RuntimeStateProbe {
-    /// Render а snapshot as Prometheus exposition lines (appended at
-    /// scrape time к the main metrics body). Each gauge name uses the
-    /// `veil_state_*` namespace к visually separate "runtime state
-    /// gauges" от cumulative counters.
+    /// Render a snapshot as Prometheus exposition lines (appended at
+    /// scrape time to the main metrics body). Each gauge name uses the
+    /// `veil_state_*` namespace to visually separate "runtime state
+    /// gauges" from cumulative counters.
     pub fn render_prometheus(&self) -> String {
         let live_sessions = self.live_sessions.lock().map(|g| g.len()).unwrap_or(0);
         let (tx_registry, tx_queue_total, tx_queue_est_bytes) = self
@@ -176,7 +176,7 @@ impl RuntimeStateProbe {
             .map(|g| g.len())
             .unwrap_or(0);
         // DHT sub-stores: store (value-store entries), transport_cache
-        // lookup_cache — all accessible через KademliaService accessors.
+        // lookup_cache — all accessible through KademliaService accessors.
         let dht_store = self.dispatcher.dht.store_len();
         let dht_transport_cache = self.dispatcher.dht.transport_cache_len();
         let dht_lookup_cache = self.dispatcher.dht.lookup_cache_len();
@@ -191,10 +191,10 @@ impl RuntimeStateProbe {
              # HELP veil_state_session_tx_queue_total Frames currently queued across all per-peer mpsc senders\n\
              # TYPE veil_state_session_tx_queue_total gauge\n\
              veil_state_session_tx_queue_total {tx_queue_total}\n\
-             # HELP veil_state_session_tx_queue_estimated_bytes Worst-case bytes buffered in per-peer mpsc queues (capacity × peers × 16 KiB avg-frame estimate; real frames range от 64 B keepalives к 60 KiB DATA)\n\
+             # HELP veil_state_session_tx_queue_estimated_bytes Worst-case bytes buffered in per-peer mpsc queues (capacity × peers × 16 KiB avg-frame estimate; real frames range from 64 B keepalives to 60 KiB DATA)\n\
              # TYPE veil_state_session_tx_queue_estimated_bytes gauge\n\
              veil_state_session_tx_queue_estimated_bytes {tx_queue_est_bytes}\n\
-             # HELP veil_state_session_outbox Number of peers с registered RPC outboxes\n\
+             # HELP veil_state_session_outbox Number of peers with registered RPC outboxes\n\
              # TYPE veil_state_session_outbox gauge\n\
              veil_state_session_outbox {outbox}\n\
              # HELP veil_state_ban_list Number of banned peers\n\
@@ -203,7 +203,7 @@ impl RuntimeStateProbe {
              # HELP veil_state_dht_routing_contacts Contacts in DHT routing table\n\
              # TYPE veil_state_dht_routing_contacts gauge\n\
              veil_state_dht_routing_contacts {dht_contacts}\n\
-             # HELP veil_state_route_cache_destinations Distinct destinations в route cache\n\
+             # HELP veil_state_route_cache_destinations Distinct destinations in route cache\n\
              # TYPE veil_state_route_cache_destinations gauge\n\
              veil_state_route_cache_destinations {route_cache_dst}\n\
              # HELP veil_state_route_cache_routes Total (dst,route) pairs across all destinations\n\
@@ -212,7 +212,7 @@ impl RuntimeStateProbe {
              # HELP veil_state_chunk_reassembler_transfers In-progress chunked transfers\n\
              # TYPE veil_state_chunk_reassembler_transfers gauge\n\
              veil_state_chunk_reassembler_transfers {chunk_transfers}\n\
-             # HELP veil_state_chunk_reassembler_bytes Bytes buffered в chunked transfers\n\
+             # HELP veil_state_chunk_reassembler_bytes Bytes buffered in chunked transfers\n\
              # TYPE veil_state_chunk_reassembler_bytes gauge\n\
              veil_state_chunk_reassembler_bytes {chunk_bytes}\n\
              # HELP veil_state_pending_recursive DHT recursive-query correlator entries\n\
@@ -259,13 +259,13 @@ pub async fn spawn_metrics_http(
 ) -> Result<(String, JoinHandle<()>)> {
     let uri = TransportUri::parse(listen_uri)?;
 
-    // Non-loopback bind без auth_token publishes role / sessions /
-    // mailbox / dht state к the entire network. Behaviour:
+    // Non-loopback bind without auth_token publishes role / sessions /
+    // mailbox / dht state to the entire network. Behaviour:
     //
     // * `allow_unauthenticated_remote = false` (default) → fail-closed:
-    //   refuse to spawn the listener. The operator must either bind к
-    //   loopback, set а bearer `auth_token`, OR set the explicit opt-in
-    //   flag below if their deployment has а meaningful network boundary
+    //   refuse to spawn the listener. The operator must either bind to
+    //   loopback, set a bearer `auth_token`, OR set the explicit opt-in
+    //   flag below if their deployment has a meaningful network boundary
     //   (firewall / Tailscale / VPN) protecting the metrics port.
     //
     // * `allow_unauthenticated_remote = true` → warn-only: keep prior
@@ -276,12 +276,12 @@ pub async fn spawn_metrics_http(
         if !allow_unauthenticated_remote {
             return Err(NodeError::Config(veil_cfg::ConfigError::ValidationFailed(
                 format!(
-                    "metrics.listen={listen_uri} is non-loopback и auth_token \
+                    "metrics.listen={listen_uri} is non-loopback and auth_token \
                      is not set. /admin/state/dump would expose role/sessions/\
-                     mailbox/dht state к anyone who reaches the port. Either:\n\
-                     (a) bind к 127.0.0.1 (loopback only), OR\n\
-                     (b) set `auth_token` в `[metrics]` config (bearer auth), OR\n\
-                     (c) set `allow_unauthenticated_remote_metrics = true` если \
+                     mailbox/dht state to anyone who reaches the port. Either:\n\
+                     (a) bind to 127.0.0.1 (loopback only), OR\n\
+                     (b) set `auth_token` in `[metrics]` config (bearer auth), OR\n\
+                     (c) set `allow_unauthenticated_remote_metrics = true` if \
                      your network is firewalled/Tailscale-scoped."
                 ),
             )));
@@ -289,9 +289,9 @@ pub async fn spawn_metrics_http(
         logger.warn(
             "metrics.unauthenticated_remote",
             format!(
-                "metrics.listen={listen_uri} но auth_token не set; opt-in via \
+                "metrics.listen={listen_uri} but auth_token is not set; opt-in via \
                  `allow_unauthenticated_remote_metrics = true` accepted. \
-                 /admin/state/dump exposes role/sessions/mailbox/dht state к \
+                 /admin/state/dump exposes role/sessions/mailbox/dht state to \
                  any host that can reach the port — ensure your firewall / \
                  Tailscale scope is correct."
             ),
@@ -313,7 +313,7 @@ pub async fn spawn_metrics_http(
                 accepted = listener.accept() => match accepted {
                     Ok(connection) => {
                         // cap concurrent in-flight requests.
-                        // `try_acquire_owned` drops the connection если we
+                        // `try_acquire_owned` drops the connection if we
                         // are already at MAX_CONCURRENT_REQUESTS — better
                         // than queueing accepts (would let memory grow on
                         // sustained scrape-DoS).
@@ -344,8 +344,8 @@ pub async fn spawn_metrics_http(
     Ok((local_addr, handle))
 }
 
-/// audit: returns true для `tcp://127.0.0.1:*`
-/// `tcp://[::1]:*`, или `tcp://localhost:*`. Used к decide whether
+/// audit: returns true for `tcp://127.0.0.1:*`
+/// `tcp://[::1]:*`, or `tcp://localhost:*`. Used to decide whether
 /// the unauth-warning fires on metrics startup.
 pub fn is_loopback_listen(uri: &str) -> bool {
     let after_scheme = match uri.split_once("://") {
@@ -357,16 +357,16 @@ pub fn is_loopback_listen(uri: &str) -> bool {
         || after_scheme.starts_with("localhost:")
 }
 
-/// audit: parse `Authorization: Bearer <token>` от raw
+/// audit: parse `Authorization: Bearer <token>` from raw
 /// HTTP request bytes. Returns the token slice (without the "Bearer "
-/// prefix) или `None` if missing/malformed.
+/// prefix) or `None` if missing/malformed.
 ///
 /// Header parsing is case-insensitive on the field name (per RFC 7230
 /// §3.2: header field names are case-insensitive).
 pub fn extract_bearer_token(request: &str) -> Option<&str> {
     for line in request.lines() {
         // Skip lines without `:` — including the request-line ("GET... HTTP/1.1")
-        // и malformed headers. Use continue (not `?`) so we keep scanning.
+        // and malformed headers. Use continue (not `?`) so we keep scanning.
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
@@ -384,10 +384,10 @@ pub fn extract_bearer_token(request: &str) -> Option<&str> {
     None
 }
 
-/// audit: constant-time string comparison для bearer-token
+/// audit: constant-time string comparison for bearer-token
 /// validation. Avoids byte-by-byte timing leak that would let an
-/// attacker incrementally guess а valid token. Length-mismatch returns
-/// false без touching the bytes.
+/// attacker incrementally guess a valid token. Length-mismatch returns
+/// false without touching the bytes.
 pub fn bearer_token_matches(expected: &str, presented: &str) -> bool {
     use subtle::ConstantTimeEq;
     if expected.len() != presented.len() {
@@ -431,17 +431,17 @@ async fn serve_stream(
 ) -> Result<()> {
     let mut buf = vec![0_u8; 4096];
     // audit: bound the read. Slow-loris attackers
-    // отправляющие incomplete headers (no `\r\n\r\n`) would otherwise
+    // clients sending incomplete headers (no `\r\n\r\n`) would otherwise
     // hold this future indefinitely. On timeout, drop the connection.
     let read = match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut buf)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => return Err(e.into()),
         Err(_) => {
-            // Timeout — log и close.
+            // Timeout — log and close.
             logger.warn(
                 "metrics.read_timeout",
                 format!(
-                    "dropped connection после {} s without complete request",
+                    "dropped connection after {} s without complete request",
                     READ_TIMEOUT.as_secs()
                 ),
             );
@@ -455,7 +455,7 @@ async fn serve_stream(
     let req_path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
     // audit: bearer auth. When configured, every request
-    // must carry а matching `Authorization: Bearer <token>` header.
+    // must carry a matching `Authorization: Bearer <token>` header.
     // Constant-time comparison via subtle (peer-controlled timing on
     // single-byte mismatches would leak the token byte-by-byte).
     if let Some(expected) = auth_token.as_ref().as_ref() {
@@ -483,10 +483,10 @@ async fn serve_stream(
     let (status_code, content_type, body): (&str, &str, String) = if req_path == path
         || req_path == path.trim_end_matches('/')
     {
-        // bufpool: append global frame-pool stats к prometheus
+        // bufpool: append global frame-pool stats to prometheus
         // output AT SCRAPE TIME (cheap — single load of 5 atomics + 3
-        // bucket-cached counts). Avoids cross-crate dep между bufpool
-        // (must stay а leaf crate) и observability (lower-level than
+        // bucket-cached counts). Avoids cross-crate dep between bufpool
+        // (must stay a leaf crate) and observability (lower-level than
         // veilcore).
         let pool_stats = veil_bufpool::global().stats();
         let pool_lines = format!(
@@ -710,8 +710,8 @@ mod tests {
 
     // ── audit hardening tests ────────────────────────────
 
-    /// Helper for auth tests: same as `http_request` but takes а
-    /// configured auth_token и returns the full response.
+    /// Helper for auth tests: same as `http_request` but takes a
+    /// configured auth_token and returns the full response.
     async fn http_request_with_auth(
         request: &str,
         metrics: Arc<NodeMetrics>,

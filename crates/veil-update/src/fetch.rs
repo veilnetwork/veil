@@ -28,7 +28,7 @@
 //! signed N URLs into the manifest, the client tries them in
 //! order until one returns valid content. Mid-list failures are
 //! treated as transient (network blip, single-CDN outage
-//! transient TLS error) and не aborts the update — only after
+//! transient TLS error) and not aborts the update — only after
 //! ALL URLs fail does the helper return Err.
 
 use sha2::{Digest, Sha256};

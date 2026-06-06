@@ -49,20 +49,20 @@ impl PexState {
             // verify node_id ↔ public_key binding BEFORE
             // any storage / persistence path. Per the canonical rule
             //`node_id = BLAKE3(public_key_raw_bytes)`. Without
-            // this check, а malicious PEX responder ships fabricated triples
+            // this check, a malicious PEX responder ships fabricated triples
             // `(victim_node_id, attacker_addr, attacker_pubkey)` which then
-            // get persisted к node.toml; every restart burns handshake
-            // budget dialing the attacker's address. Combined с а sybil
+            // get persisted to node.toml; every restart burns handshake
+            // budget dialing the attacker's address. Combined with a sybil
             // cluster, the table is poisoned BEFORE the handshake-time
             // identity check fires.
             //
             // Only check non-empty public_key — older PexPeer wire format
-            // shipped с empty pubkey field (legacy peers). Empty case
-            // falls through к the existing handshake-time check. Shared with
+            // shipped with empty pubkey field (legacy peers). Empty case
+            // falls through to the existing handshake-time check. Shared with
             // the `handle_result` fan-out filter via `pex_binding_ok` (M-F).
             if !pex_binding_ok(&peer) {
-                // Drop silently — а separate metric (binding_mismatch_total)
-                // can be plumbed in а follow-up if forensics matter.
+                // Drop silently — a separate metric (binding_mismatch_total)
+                // can be plumbed in a follow-up if forensics matter.
                 continue;
             }
             // Reject wildcard transports — every peer that receives such an

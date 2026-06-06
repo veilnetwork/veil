@@ -1,7 +1,7 @@
 //! decomposition : encapsulates
 //! session-rotation deadline.
 //!
-//! Was inline в `SessionRunner::run`:
+//! Was inline in `SessionRunner::run`:
 //! * computed-once initialization with ±10 % jitter
 //! * `rotation_enabled` flag derived as `current_session_max_age_secs > 0`
 //! * Timer-arm `if let Some(deadline) = session_rotate_at && now >= deadline { return; }`
@@ -11,13 +11,13 @@
 //! minutes (jittered). The caller (outbound connector) reconnects
 //! naturally via existing reconnect logic; the NEW session gets the
 //! same Chrome ClientHello fingerprint, making the rotation pattern
-//! indistinguishable от а normal HTTPS browser session ending и а
+//! indistinguishable from a normal HTTPS browser session ending and a
 //! new one starting. No "rotation goodbye" frame — that would
-//! itself be а fingerprint; ordinary HTTPS sessions end с а TCP
-//! close, not а custom protocol message.
+//! itself be a fingerprint; ordinary HTTPS sessions end with a TCP
+//! close, not a custom protocol message.
 //!
 //! Jitter is computed ONCE per session (not per timer tick) so
-//! rotation cadence stays predictable для а single session, just
+//! rotation cadence stays predictable for a single session, just
 //! unpredictable across the fleet.
 
 use std::time::Duration;
@@ -28,19 +28,19 @@ pub struct SessionRotationDeadline {
 }
 
 impl SessionRotationDeadline {
-    /// Compute а rotation deadline.  Reads the globals set by
-    /// `set_session_rotation_range` / `set_session_max_age_secs` в
-    /// runner.rs (managed by admin/config reload paths).  Returns а
-    /// deadline of `None` если rotation is disabled (both bounds 0).
+    /// Compute a rotation deadline.  Reads the globals set by
+    /// `set_session_rotation_range` / `set_session_max_age_secs` in
+    /// runner.rs (managed by admin/config reload paths).  Returns a
+    /// deadline of `None` if rotation is disabled (both bounds 0).
     ///
     /// **Two sampling modes:**
-    /// * **Range mode** (both `min > 0` и `max > 0`): deadline drawn
-    ///   uniformly из `[min, max]` seconds.  Set by the new
+    /// * **Range mode** (both `min > 0` and `max > 0`): deadline drawn
+    ///   uniformly from `[min, max]` seconds.  Set by the new
     ///   `[transport.rotation]` config section — wider entropy hides
-    ///   the rotation cadence от per-fleet correlation attacks.
+    ///   the rotation cadence from per-fleet correlation attacks.
     /// * **Point + jitter mode** (only `max > 0`, `min == 0`): legacy
     ///   `±10 %` jitter around `max`.  Backed by the deprecated
-    ///   `session.max_age_secs` knob — preserved для back-compat но
+    ///   `session.max_age_secs` knob — preserved for back-compat but
     ///   the new range mode is strictly more flexible.
     pub fn compute(now: Instant) -> Self {
         let (min_secs, max_secs) = crate::runner::current_session_rotation_range();
@@ -49,7 +49,7 @@ impl SessionRotationDeadline {
         }
         use rand_core::{OsRng, RngCore};
         let jittered_ms = if min_secs > 0 && min_secs <= max_secs {
-            // Range mode: uniform sample в [min_ms, max_ms].
+            // Range mode: uniform sample in [min_ms, max_ms].
             let min_ms = min_secs.saturating_mul(1000);
             let max_ms = max_secs.saturating_mul(1000);
             let span_ms = max_ms.saturating_sub(min_ms);
@@ -78,24 +78,24 @@ impl SessionRotationDeadline {
     }
 
     /// Test-only — production checks rotation via `is_due(now)` only.
-    /// Kept under `#[cfg(test)]` к avoid encouraging callers к read
+    /// Kept under `#[cfg(test)]` to avoid encouraging callers to read
     /// the deadline directly (which would let them race against the
     /// `is_due` check semantics).
     pub fn enabled(&self) -> bool {
         self.deadline.is_some()
     }
 
-    /// The pending deadline instant если rotation is armed, или `None`
-    /// when rotation is disabled.  Production callers use this к fold
+    /// The pending deadline instant if rotation is armed, or `None`
+    /// when rotation is disabled.  Production callers use this to fold
     /// the rotation wake-up into `compute_sleep_deadline` so the
-    /// session loop actually emerges от `await_next_input` at the
+    /// session loop actually emerges from `await_next_input` at the
     /// rotation instant even in an idle session (Q.7 audit batch).
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
-    /// True iff а deadline is set AND `now` has reached it — caller
-    /// should `return` от `run` to gracefully close the session.
+    /// True iff a deadline is set AND `now` has reached it — caller
+    /// should `return` from `run` to gracefully close the session.
     pub fn is_due(&self, now: Instant) -> bool {
         self.deadline.is_some_and(|d| now >= d)
     }
@@ -106,8 +106,8 @@ mod tests {
     use super::*;
 
     /// Lock used by the existing `set_session_max_age_secs_pct` tests
-    /// в runner.rs's tests module. Re-grabbing the same lock here
-    /// keeps slice-7 unit tests serialised с those.
+    /// in runner.rs's tests module. Re-grabbing the same lock here
+    /// keeps slice-7 unit tests serialised with those.
     fn rotation_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::OnceLock;
         static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
@@ -123,7 +123,7 @@ mod tests {
             // resets max AND min in one call, vs the legacy single-
             // value setter which only touches max (and the runner-
             // level `set_session_max_age_secs` further zeros min as
-            // а side-effect — see its doc).  Be explicit к keep the
+            // a side-effect — see its doc).  Be explicit to keep the
             // teardown reasoning robust if either setter changes.
             crate::runner::set_session_rotation_range(0, 0);
         }
@@ -200,8 +200,8 @@ mod tests {
     async fn range_mode_equal_min_max_yields_exact_deadline() {
         let _g = rotation_lock();
         let _r = RotationRestore;
-        // Degenerate "range" where min == max should behave like а
-        // point с no jitter (within ms granularity).
+        // Degenerate "range" where min == max should behave like a
+        // point with no jitter (within ms granularity).
         crate::runner::set_session_rotation_range(600, 600);
         let now = Instant::now();
         let r = SessionRotationDeadline::compute(now);
@@ -223,12 +223,12 @@ mod tests {
     async fn range_mode_min_above_max_clamps_safely() {
         let _g = rotation_lock();
         let _r = RotationRestore;
-        // Defensive: validation prevents this, но если someone calls
-        // the setter directly с reversed args, we should not panic.
+        // Defensive: validation prevents this, but if someone calls
+        // the setter directly with reversed args, we should not panic.
         crate::runner::set_session_rotation_range(7_200, 3_600);
         let r = SessionRotationDeadline::compute(Instant::now());
         assert!(r.enabled());
-        // Min gets clamped к max internally; deadline ≈ 3600 s.
+        // Min gets clamped to max internally; deadline ≈ 3600 s.
         let d = r.deadline().unwrap();
         let now = Instant::now();
         assert!(d <= now + Duration::from_secs(3_605));

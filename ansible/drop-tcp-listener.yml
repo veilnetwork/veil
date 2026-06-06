@@ -4,8 +4,8 @@
 # obfs4-handshake connections.
 #
 # IMPORTANT: run AFTER `switch-bootstraps-to-obfs4.yml` is applied
-# everywhere — otherwise external peers що hold а stale tcp:// URI
-# (via PEX gossip) won't be able к reach this node.
+# everywhere — otherwise external peers that hold a stale tcp:// URI
+# (via PEX gossip) won't be able to reach this node.
 #
 # Run:
 #   ansible-playbook -i inventory.yml drop-tcp-listener.yml --limit all
@@ -21,7 +21,7 @@
         cmd: |
           # Multi-line listen= block; check for `transport = "tcp://...`
           # inside the block (not bootstrap_peers — those are already
-          # rewritten к obfs4-tcp by switch-bootstraps playbook).
+          # rewritten to obfs4-tcp by switch-bootstraps playbook).
           python3 << 'PYEOF'
           path = "/var/lib/veil/node.toml"
           with open(path) as f:
@@ -43,7 +43,7 @@
       register: check_result
       changed_when: false
 
-    - name: Skip если already obfs4-only
+    - name: Skip if already obfs4-only
       ansible.builtin.meta: end_host
       when: check_result.stdout != "has-tcp"
 
@@ -55,7 +55,7 @@
           path = "/var/lib/veil/node.toml"
           with open(path) as f:
               src = f.read()
-          # Match the multi-line listen= block, drop entries що have
+          # Match the multi-line listen= block, drop entries that have
           # `transport = "tcp://...:5555"`, keep obfs4-tcp:// entries.
           listen_pattern = re.compile(r'^(listen\s*=\s*\[)(.*?)(\n\])', re.DOTALL | re.MULTILINE)
           def filter_entries(m):
@@ -86,7 +86,7 @@
         name: veil.service
         state: restarted
 
-    - name: Wait для metrics endpoint
+    - name: Wait for metrics endpoint
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 60); do
@@ -121,7 +121,7 @@
       ansible.builtin.debug:
         msg: "5555: {{ sock_5555.stdout }}  5556: {{ sock_5556.stdout }}"
 
-    - name: Wait для live veil session
+    - name: Wait for live veil session
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 30); do

@@ -78,8 +78,8 @@ pub const MAX_BEACONS_PER_IP_PER_WINDOW: u32 = 10;
 /// Sliding window for beacon rate limiting.
 pub const BEACON_WINDOW: Duration = Duration::from_secs(60);
 
-/// /24 (IPv4) or /48 (IPv6) prefix used к bound а single subnet's
-/// share of the rate-limiter slots. Without this, а distributed
+/// /24 (IPv4) or /48 (IPv6) prefix used to bound a single subnet's
+/// share of the rate-limiter slots. Without this, a distributed
 /// /24-flood evicts legitimate gateway entries while staying under
 /// the per-IP threshold.
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
@@ -103,9 +103,9 @@ impl SubnetKey {
     }
 }
 
-/// Maximum slots per /24 (IPv4) or /48 (IPv6) — а single subnet cannot
+/// Maximum slots per /24 (IPv4) or /48 (IPv6) — a single subnet cannot
 /// occupy more than 64 of the 8192 global slots. Bounds the subnet's
-/// share к ~0.8 % of the table, preventing slow-rate distributed-flood
+/// share to ~0.8 % of the table, preventing slow-rate distributed-flood
 /// eviction attacks.
 const MAX_PER_SUBNET: usize = 64;
 
@@ -138,9 +138,9 @@ impl BeaconRateLimiter {
         let now = Instant::now();
         let subnet = SubnetKey::from_ip(addr);
         let is_new_ip = !self.counts.contains_key(&addr);
-        // Per-subnet cap: prevents а /24-flood
-        // от evicting legitimate gateway entries via time-based stale-eviction
-        // while staying под the per-IP rate threshold. Only checked для new IPs;
+        // Per-subnet cap: prevents a /24-flood
+        // from evicting legitimate gateway entries via time-based stale-eviction
+        // while staying under the per-IP rate threshold. Only checked for new IPs;
         // already-tracked IPs continue working irrespective of subnet count.
         if is_new_ip {
             let subnet_count = self.per_subnet.get(&subnet).copied().unwrap_or(0);
@@ -148,7 +148,7 @@ impl BeaconRateLimiter {
                 return false;
             }
         }
-        // Global cap к prevent unbounded growth from spoofed source IPs.
+        // Global cap to prevent unbounded growth from spoofed source IPs.
         if is_new_ip && self.counts.len() >= MAX_GLOBAL_SLOTS {
             self.evict_stale();
             // If still at cap after eviction, reject the newcomer.
@@ -172,7 +172,7 @@ impl BeaconRateLimiter {
     }
 
     /// Evict entries whose window has fully expired (optional housekeeping).
-    /// Also rebuilds the per-subnet count к stay в sync с `counts`.
+    /// Also rebuilds the per-subnet count to stay in sync with `counts`.
     pub fn evict_stale(&mut self) {
         let now = Instant::now();
         let window = self.window;
@@ -717,8 +717,8 @@ impl BeaconReceiver {
         }
     }
 
-    /// SECURITY (audit 2026-05-29, A5): require every accepted beacon к
-    /// carry а valid signature.  When enabled, unsigned beacons are
+    /// SECURITY (audit 2026-05-29, A5): require every accepted beacon to
+    /// carry a valid signature.  When enabled, unsigned beacons are
     /// dropped (logged at `warn`) rather than accepted as "legacy".
     /// Recommended on for non-loopback realms; ON by default — pass
     /// `false` only for back-compat with existing unsigned-beacon deployments.
@@ -792,8 +792,8 @@ impl BeaconReceiver {
         } else if self.require_signed {
             // SECURITY (audit 2026-05-29, A5): in require-signed mode an
             // unsigned beacon is dropped, not accepted as legacy — an
-            // on-link attacker must not be able к register/redirect
-            // neighbor links или inject IS_GATEWAY entries без а key.
+            // on-link attacker must not be able to register/redirect
+            // neighbor links or inject IS_GATEWAY entries without a key.
             log::warn!(
                 "mesh.beacon: unsigned beacon from {sender_addr} dropped \
                  (require_signed_beacons=true)"

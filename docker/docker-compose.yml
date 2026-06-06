@@ -50,12 +50,12 @@ services:
         fi
 
         # Make certs readable ONLY by the veil container (uid 999, gid 999):
-        #   * Dirs `live` и `archive` → 0750, owned root:999 (group=veil)
+        #   * Dirs `live` and `archive` → 0750, owned root:999 (group=veil)
         #     so non-veil-group processes inside the volume cannot traverse.
         #   * `privkey.pem` → 0640 root:999 — group-read for veil, NO world.
         #   * `fullchain.pem` / `chain.pem` / `cert.pem` → 0644 (public material).
         # Previous `chmod -R a+rX` made privkey.pem world-readable, leaking the
-        # TLS private key к any process / sidecar with access to the volume.
+        # TLS private key to any process / sidecar with access to the volume.
         chown -R root:999 /etc/letsencrypt/live /etc/letsencrypt/archive
         chmod -R 0750 /etc/letsencrypt/live /etc/letsencrypt/archive
         find /etc/letsencrypt/live /etc/letsencrypt/archive -name 'privkey*.pem' -exec chmod 0640 {} +
@@ -70,7 +70,7 @@ services:
           echo "[certbot] attempting renewal"
           certbot renew --standalone --non-interactive $${STAGING_FLAG} || true
           # Re-apply restrictive perms after renew (certbot rewrites files
-          # с default 0600 root:root; we restore group-read для veil only).
+          # with default 0600 root:root; we restore group-read for veil only).
           chown -R root:999 /etc/letsencrypt/live /etc/letsencrypt/archive
           chmod -R 0750 /etc/letsencrypt/live /etc/letsencrypt/archive
           find /etc/letsencrypt/live /etc/letsencrypt/archive -name 'privkey*.pem' -exec chmod 0640 {} +

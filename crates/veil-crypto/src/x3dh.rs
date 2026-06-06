@@ -269,9 +269,9 @@ pub fn mlkem_decapsulate_raw(
 //
 // `mlkem_encapsulate_raw` / `mlkem_decapsulate_raw` re-parse the EK / DK
 // from bytes on every call. For one-shot session establishment that's
-// fine (the parse cost is small absolute time). But для re-keying flows
-// что hit the same peer many times in a row (mid-session forward-secrecy
-// rotation, например) we can cache the parsed structure once и reuse it
+// fine (the parse cost is small absolute time). But for re-keying flows
+// that hit the same peer many times in a row (mid-session forward-secrecy
+// rotation, for example) we can cache the parsed structure once and reuse it
 // across hundreds of encap / decap operations.
 //
 // Measured cost breakdown (bench `veilcore/benches/hybrid_kex.rs`):
@@ -290,17 +290,17 @@ pub fn mlkem_decapsulate_raw(
 // fine. Saving 75 µs once in the lifetime of a TCP connection is
 // not worth API complexity.
 // * Repeated decap against the same DK (sender uses the same prekey
-// bundle для many messages, OR receiver does many rekey rounds на
+// bundle for many messages, OR receiver does many rekey rounds on
 // a long-lived session): use `PreparedDecapsulator::from_seed` once
-// при session start, then `decapsulate` за hot-path call. The
-// sender side (prepared encap) saves nothing measurable; стик the
+// with session start, then `decapsulate` for hot-path call. The
+// sender side (prepared encap) saves nothing measurable; stick with the
 // simpler raw API there.
 //
 // Both prepared types hold secret material — wrap in `Arc<Mutex<…>>` if
 // shared across tasks; consume / drop promptly otherwise.
 
-/// Parsed ML-KEM-768 encapsulation key. Cheap к build once и reuse
-/// для many encapsulations against the same recipient. Wraps an
+/// Parsed ML-KEM-768 encapsulation key. Cheap to build once and reuse
+/// for many encapsulations against the same recipient. Wraps an
 /// internal `EK768` so the public API doesn't leak the underlying
 /// crate's type.
 pub struct PreparedEncapsulator {
@@ -337,7 +337,7 @@ impl PreparedEncapsulator {
 
 /// Parsed ML-KEM-768 decapsulation key. The seed → DK expansion runs
 /// [`Self::from_seed`]; subsequent `decapsulate` calls skip it.
-/// Holds the secret material — wrap in `Arc` if you want к share
+/// Holds the secret material — wrap in `Arc` if you want to share
 /// across tasks; consume / drop promptly otherwise.
 pub struct PreparedDecapsulator {
     inner: DK768,
@@ -346,8 +346,8 @@ pub struct PreparedDecapsulator {
 impl PreparedDecapsulator {
     /// Run the ML-KEM key-derivation to expand the 64-byte seed into
     /// the full DK structure. This is the part of `mlkem_decapsulate_raw`
-    /// что dominates its 200-µs cost — caching it here lets callers
-    /// run many decap operations за фракцию того времени.
+    /// that dominates its 200-µs cost — caching it here lets callers
+    /// run many decap operations in a fraction of the time.
     pub fn from_seed(decapsulation_seed: &[u8; ML_KEM_768_DK_SEED_LEN]) -> Result<Self, X3dhError> {
         Ok(Self {
             inner: parse_dk_seed(decapsulation_seed)?,
@@ -785,8 +785,8 @@ mod tests {
 
     #[test]
     fn mlkem_encap_decap_raw_roundtrip() {
-        // Sender encapsulates под freshly-generated EK; receiver
-        // decapsulates с the matching DK seed; both arrive at the
+        // Sender encapsulates under freshly-generated EK; receiver
+        // decapsulates with the matching DK seed; both arrive at the
         // SAME 32-byte shared secret.
         let (ek, dk_seed) = generate_prekey();
         let (ct, ss_sender) = mlkem_encapsulate_raw(&ek).expect("encap");
@@ -817,7 +817,7 @@ mod tests {
 
     #[test]
     fn mlkem_encapsulate_raw_rejects_wrong_length_ek() {
-        // EK with 1 extra byte is rejected при decode.
+        // EK with 1 extra byte is rejected with decode.
         let mut ek = vec![0u8; ML_KEM_768_EK_LEN + 1];
         ek[0] = 0x42;
         let err = mlkem_encapsulate_raw(&ek).unwrap_err();
@@ -835,8 +835,8 @@ mod tests {
         let prepared_ek = PreparedEncapsulator::from_bytes(&ek).expect("prepare ek");
         let prepared_dk = PreparedDecapsulator::from_seed(&dk_seed).expect("prepare dk");
 
-        // Three encaps in a row через the cache — each one runs ML-KEM
-        // encap (different randomness) и produces a different
+        // Three encaps in a row through the cache — each one runs ML-KEM
+        // encap (different randomness) and produces a different
         // (ct, ss) pair. But each ss MUST decap correctly.
         for _ in 0..3 {
             let (ct, ss_sender) = prepared_ek.encapsulate();
@@ -847,7 +847,7 @@ mod tests {
             let ss_recv_prepared = prepared_dk.decapsulate(&ct).expect("prepared decap");
             assert_eq!(*ss_sender, *ss_recv_prepared);
 
-            // Cross-check: raw decap is bit-equal к prepared decap.
+            // Cross-check: raw decap is bit-equal to prepared decap.
             let ss_recv_raw = mlkem_decapsulate_raw(&dk_seed, &ct).expect("raw decap");
             assert_eq!(*ss_recv_raw, *ss_recv_prepared);
         }
@@ -868,8 +868,8 @@ mod tests {
         // Seed slice with 1 fewer byte fails parse.
         let bad: Vec<u8> = vec![0u8; ML_KEM_768_DK_SEED_LEN - 1];
         let bad_arr = bad.as_slice();
-        // Need а fixed-size array to call from_seed; build it dynamically.
-        // Using a 64-byte seed matches signature; fail mode tested через
+        // Need a fixed-size array to call from_seed; build it dynamically.
+        // Using a 64-byte seed matches signature; fail mode tested through
         // the underlying parse helper.
         let res = parse_dk_seed(bad_arr);
         assert!(matches!(res, Err(X3dhError::InvalidDecapsulationSeed(_))));

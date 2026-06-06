@@ -29,9 +29,9 @@ const WRITER_CLOSED: &str = "veil IPC writer task closed";
 pub struct VeilStream {
     stream_id: u32,
     writer: SharedWriter,
-    /// Incoming data/close events from the reader task.  Bounded к
-    /// `STREAM_EVENT_QUEUE_CAP`; а slow consumer что fills the queue
-    /// has its stream silently closed (visible через `recv()` → None
+    /// Incoming data/close events from the reader task.  Bounded to
+    /// `STREAM_EVENT_QUEUE_CAP`; a slow consumer that fills the queue
+    /// has its stream silently closed (visible through `recv()` → None
     /// → EOF), preventing unbounded SDK-side memory growth.
     rx: mpsc::Receiver<StreamEvent>,
     /// Backpressure-aware sender for the `AsyncWrite` poll paths. Wraps a

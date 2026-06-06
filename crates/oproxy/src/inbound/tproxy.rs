@@ -3,23 +3,23 @@
 //!
 //! # How it works
 //!
-//! 1. Operator sets up iptables / nftables к redirect transit traffic
-//!    к the local listener:
+//! 1. Operator sets up iptables / nftables to redirect transit traffic
+//!    to the local listener:
 //!    ```text
 //!    iptables -t mangle -A PREROUTING -p tcp \
 //!        --dport 80 -j TPROXY --tproxy-mark 0x1/0x1 \
 //!        --on-port 12345
 //!    ```
-//!    Plus а matching `ip rule` + `ip route local` setup so the kernel
-//!    delivers the packets к the listener instead of routing them
+//!    Plus a matching `ip rule` + `ip route local` setup so the kernel
+//!    delivers the packets to the listener instead of routing them
 //!    outbound.
-//! 2. The listener socket is created с `IP_TRANSPARENT = 1` (so the
-//!    kernel accepts connections destined к any address) и `MARK`
-//!    set к match the iptables rule.
+//! 2. The listener socket is created with `IP_TRANSPARENT = 1` (so the
+//!    kernel accepts connections destined to any address) and `MARK`
+//!    set to match the iptables rule.
 //! 3. For each accepted connection, recover the **original** destination
-//!    address via `getsockopt(SOL_IP, SO_ORIGINAL_DST)` (Linux) или the
+//!    address via `getsockopt(SOL_IP, SO_ORIGINAL_DST)` (Linux) or the
 //!    equivalent FreeBSD ipfw mechanism.
-//! 4. Forward к the veil server using `(orig_dst.ip, orig_dst.port)`.
+//! 4. Forward to the veil server using `(orig_dst.ip, orig_dst.port)`.
 //!
 //! # Platform support
 //!
@@ -27,14 +27,14 @@
 //!   Linux kernel surface).
 //! * **FreeBSD / macOS / Windows** — **not supported**.  FreeBSD's
 //!   `ipfw fwd` + `getpeername` path was never finished (stubs in
-//!   [`tproxy_unix`] returned а runtime error from the first accept);
-//!   macOS would need pfctl + а divert socket с kernel reads;
-//!   Windows would need WinDivert + а kernel driver.  All three return
-//!   а descriptive error at startup so operators learn the gap
+//!   [`tproxy_unix`] returned a runtime error from the first accept);
+//!   macOS would need pfctl + a divert socket with kernel reads;
+//!   Windows would need WinDivert + a kernel driver.  All three return
+//!   a descriptive error at startup so operators learn the gap
 //!   before traffic ever lands.
 //!
 //! Operators on FreeBSD / macOS / Windows should use the SOCKS5 / HTTP
-//! inbounds и configure their applications к point at them.
+//! inbounds and configure their applications to point at them.
 
 use std::sync::Arc;
 
@@ -64,13 +64,13 @@ pub async fn run(
     .await
 }
 
-/// FreeBSD fail-fast: the previous build path bound а listener и only
-/// failed на the first accepted connection, which made operators believe
+/// FreeBSD fail-fast: the previous build path bound a listener and only
+/// failed on the first accepted connection, which made operators believe
 /// TProxy was working (the listener was visible in `sockstat`) until
-/// real traffic landed.  Audit batch 2026-05-23: gate this к а startup
+/// real traffic landed.  Audit batch 2026-05-23: gate this to a startup
 /// error like macOS / Windows.  Re-open trigger: someone actually
 /// implements pf+divert OR ipfw fwd + getpeername — restore the
-/// `cfg(target_os = "freebsd")` к the linux branch above.
+/// `cfg(target_os = "freebsd")` to the linux branch above.
 #[cfg(not(target_os = "linux"))]
 pub async fn run(
     _listen_addr: String,
@@ -82,7 +82,7 @@ pub async fn run(
 ) -> Result<()> {
     Err(anyhow::anyhow!(
         "TProxy inbound is not supported on this platform. \
-         Linux / Keenetic only.  Use SOCKS5 или HTTP inbound on \
+         Linux / Keenetic only.  Use SOCKS5 or HTTP inbound on \
          FreeBSD / macOS / Windows."
     ))
 }

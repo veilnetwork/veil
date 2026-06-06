@@ -1,11 +1,11 @@
 //! RAII guard ensuring session teardown invariants run regardless of how
 //! the owning struct (`AttachedDebugSession`) is dropped — normal close,
-//! panic, или async cancellation.
+//! panic, or async cancellation.
 //!
 //! ## Canonical lock-acquisition order
 //!
-//! All paths that need more than one of these MUST acquire them в this
-//! exact order; deviation risks а runtime deadlock under load.
+//! All paths that need more than one of these MUST acquire them in this
+//! exact order; deviation risks a runtime deadlock under load.
 //!
 //! 1. `route_cache`                  (RwLock)
 //! 2. `live_sessions`                (Mutex)
@@ -16,7 +16,7 @@
 //! 7. `sessions_per_ip`              (Mutex)
 //! 8. `reputation`                   (Mutex; admin paths)
 //!
-//! `SessionGuard::drop` follows а strict subset:
+//! `SessionGuard::drop` follows a strict subset:
 //! `live_sessions → session_registry → sessions_per_ip → reputation`.
 
 use std::collections::BTreeMap;
@@ -36,21 +36,21 @@ pub struct SessionGuard {
     link_id: LinkId,
     logger: Arc<NodeLogger>,
     metrics: Option<Arc<NodeMetrics>>,
-    /// OVL1 session_id — always present after а successful OVL1 handshake.
+    /// OVL1 session_id — always present after a successful OVL1 handshake.
     /// Removed from the `SessionRegistry` on drop.
     session_id: [u8; 32],
     session_registry: Arc<Mutex<SessionRegistry>>,
-    /// Source IP address (inbound connections only).  Used к decrement
+    /// Source IP address (inbound connections only).  Used to decrement
     /// the per-IP session counter when this session ends.
     source_ip: Option<IpAddr>,
     /// Shared per-IP session counter map.
     sessions_per_ip: Arc<IpSlotTable>,
-    /// Peer node_id для reputation tracking on session close.
+    /// Peer node_id for reputation tracking on session close.
     peer_node_id: [u8; 32],
     /// Shared reputation tracker — `session_closed` called on drop.
     reputation: Option<Arc<Mutex<ReputationTracker>>>,
     /// Shared push-event bus — publish `SESSIONS_CHANGED` on drop so
-    /// connected apps see live counts decrement в real time.
+    /// connected apps see live counts decrement in real time.
     event_bus: Arc<veil_ipc::EventBus>,
 }
 
@@ -87,16 +87,16 @@ impl SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        // Snapshot-then-publish: take each lock briefly к mutate its
+        // Snapshot-then-publish: take each lock briefly to mutate its
         // map, then release before doing observable side-effects
         // (event_bus.publish, reputation notify, log).  Keeps the
-        // teardown latency tail bounded: а slow event-bus subscriber или
-        // а panic в reputation cannot stall live_sessions /
+        // teardown latency tail bounded: a slow event-bus subscriber or
+        // a panic in reputation cannot stall live_sessions /
         // session_registry / sessions_per_ip past the snapshot point.
 
         // ── state mutations under locks (canonical order) ──────
 
-        // live_sessions: remove this entry, observe new total для the
+        // live_sessions: remove this entry, observe new total for the
         // SESSIONS_CHANGED publish below.
         let new_count = {
             let mut sessions = lock!(self.live_sessions);
@@ -104,12 +104,12 @@ impl Drop for SessionGuard {
             sessions.len()
         };
 
-        // session_registry: resolve sovereign identity для reputation
+        // session_registry: resolve sovereign identity for reputation
         // BEFORE removing the session entry — the registry is the only
-        // holder of the peer→identity binding, и the reputation tracker
-        // keys на node_id (rotation-stable), not the per-device peer_id.
-        // Legacy peers without а sovereign identity fall back к peer_id
-        // as а degenerate identifier so legacy reputation behaviour is
+        // holder of the peer→identity binding, and the reputation tracker
+        // keys on node_id (rotation-stable), not the per-device peer_id.
+        // Legacy peers without a sovereign identity fall back to peer_id
+        // as a degenerate identifier so legacy reputation behaviour is
         // unchanged.  Single lock acquisition.
         let identity_for_rep = {
             let mut reg = lock!(self.session_registry);
@@ -120,9 +120,9 @@ impl Drop for SessionGuard {
             id
         };
 
-        // sessions_per_ip: decrement counter для inbound connections.
+        // sessions_per_ip: decrement counter for inbound connections.
         // Released via IpSlotTable::release which atomically decrements
-        // both per_ip и per_subnet maps under one Mutex.
+        // both per_ip and per_subnet maps under one Mutex.
         if let Some(ip) = self.source_ip {
             self.sessions_per_ip.release(ip);
         }
@@ -134,9 +134,9 @@ impl Drop for SessionGuard {
         }
 
         // event_bus.publish is `tokio::sync::broadcast::send` — non-
-        // blocking, drops к slow subscribers rather than backpressuring
-        // us.  Still, keep it outside the map locks so а subscriber
-        // observation re-entering our locks via а handler sees а
+        // blocking, drops to slow subscribers rather than backpressuring
+        // us.  Still, keep it outside the map locks so a subscriber
+        // observation re-entering our locks via a handler sees a
         // consistent state.
         let count_u16 = new_count.min(u16::MAX as usize) as u16;
         self.event_bus.publish(veil_proto::EventPayload {
@@ -145,8 +145,8 @@ impl Drop for SessionGuard {
         });
 
         // Reputation tracker keys on sovereign node_id (rotation-stable).
-        // Last so а panic inside `session_closed` poisons only the
-        // reputation mutex, не the more critical state mutexes above.
+        // Last so a panic inside `session_closed` poisons only the
+        // reputation mutex, not the more critical state mutexes above.
         if let Some(ref rep) = self.reputation {
             lock!(rep).session_closed(identity_for_rep.into());
         }

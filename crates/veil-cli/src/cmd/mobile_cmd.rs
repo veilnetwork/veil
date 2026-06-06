@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn epic483_1_on_off_clap_value_enum_parses_canonical_forms() {
         // clap's value_enum derive generates the parser; sanity-check
-        // that `on` and `off` both parse как expected so a future
+        // that `on` and `off` both parse as expected so a future
         // refactor that reorders / renames variants is caught.
         let on = OnOff::from_str("on", /* ignore_case */ true).unwrap();
         let off = OnOff::from_str("off", true).unwrap();

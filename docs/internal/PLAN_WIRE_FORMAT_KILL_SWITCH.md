@@ -61,7 +61,7 @@ impl WireFormatVariant {
             Self::V2 => b"obfs4-auth-key-v2",
         }
     }
-    // … same для auth_mac_context, name, etc.
+    // … same for auth_mac_context, name, etc.
 }
 ```
 
@@ -77,7 +77,7 @@ let variant = WireFormatVariant::V1;  // hard-coded
 
 // Phase 2:
 let accepted_variants = config.obfs4_accept_variants(); // e.g., [V2, V1]
-let variant = detect_variant_от_client(&buf, &accepted_variants)?;
+let variant = detect_variant_from_client(&buf, &accepted_variants)?;
 ```
 
 Variant detection happens in the handshake's first flight: try MAC verification against each variant's `auth_mac_context`, in the operator-configured priority order. A wrong variant means a silent drop — the same as a wrong PSK today, which preserves the anti-probe property.
@@ -89,7 +89,7 @@ A client-side change in the connect path:
 ```rust
 [transport]
 obfs4_variant_preferred = "v2"    # try v2 first
-obfs4_variant_fallback  = ["v1"]  # drop к v1 if v2 server doesn't respond
+obfs4_variant_fallback  = ["v1"]  # drop to v1 if v2 server doesn't respond
 ```
 
 Implementation: connect with V2 first; if the server silently drops it (a ~5 s timeout), reconnect with V1. This state is per-connection, so a mixed-deployment cluster heals without operator intervention.
@@ -98,7 +98,7 @@ Implementation: connect with V2 first; if the server silently drops it (a ~5 s t
 
 ```yaml
 # ansible/playbook-rotate-wire-variant.yml
-- name: Rotate к obfs4 V2 across testnet
+- name: Rotate to obfs4 V2 across testnet
   hosts: all
   serial: 1
   tasks:

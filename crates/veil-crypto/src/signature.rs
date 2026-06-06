@@ -10,13 +10,13 @@ use veil_types::SignatureAlgorithm;
 
 /// Published constant from pqcrypto-falcon — Falcon-1024 pubkey is exactly
 /// 1793 bytes on every supported backend (CLEAN / AVX2 / AArch64).  Pinned
-/// here as а compile-time const so the hybrid split helper can be а pure
+/// here as a compile-time const so the hybrid split helper can be a pure
 /// slice operation without re-querying the FFI module.
 const FALCON1024_PK_LEN: usize = 1793;
 
-/// Hybrid public-key wire length для Ed25519 + Falcon-1024 (Этап 10):
+/// Hybrid public-key wire length for Ed25519 + Falcon-1024 (Phase 10):
 /// 32 (ed25519) + 1793 (falcon-1024) = 1825 bytes.  Fixed-size layout
-/// (no length prefix needed because both components have известные sizes).
+/// (no length prefix needed because both components have known sizes).
 const HYBRID_1024_PK_LEN: usize = 32 + FALCON1024_PK_LEN;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -79,13 +79,13 @@ pub fn generate_keypair(algo: SignatureAlgorithm) -> GeneratedKeyPair {
             let (fal_pk, fal_sk) = falcon512::keypair();
             let fal_pk_bytes = fal_pk.as_bytes();
             let fal_sk_bytes = fal_sk.as_bytes();
-            // Audit batch 2026-05-25 phase M: convert от `assert_eq!`
-            // (stripped в release с panic-on-debug-only) к
+            // Audit batch 2026-05-25 phase M: convert from `assert_eq!`
+            // (stripped in release with panic-on-debug-only) to
             // unconditional panic.  If pqcrypto-falcon ever regresses
             // the published Falcon-512 size constant, release builds
             // would silently generate malformed hybrid keys whose pk
             // layout no longer match `split_hybrid_pk` (32 + 897).
-            // Хочется fail-loudly везде, не только в debug.
+            // We want to fail-loudly everywhere, not only in debug.
             if fal_pk_bytes.len() != 897 {
                 panic!(
                     "Falcon-512 pubkey size invariant changed: expected 897, got {} — \
@@ -111,8 +111,8 @@ pub fn generate_keypair(algo: SignatureAlgorithm) -> GeneratedKeyPair {
             }
         }
         SignatureAlgorithm::Ed25519Falcon1024Hybrid => {
-            // hybrid mode for Falcon-1024 (Этап 10) — same construction
-            // as the Falcon-512 hybrid above но swaps the PQ component
+            // hybrid mode for Falcon-1024 (Phase 10) — same construction
+            // as the Falcon-512 hybrid above but swaps the PQ component
             // for Falcon-1024.  pk layout = ed_pk(32) || falcon_pk(1793)
             // (HYBRID_1024_PK_LEN = 1825); sk layout = ed_sk(32) ||
             // u16_le(falcon_sk_len) || falcon_sk (typically ~2305 bytes).
@@ -213,11 +213,11 @@ pub fn sign_message(
             let fal_sig_bytes = fal_sig.as_bytes();
 
             // Enforce verifier-side cap (`MAX_FALCON_SIG_BYTES = 768`)
-            // on the sign side too — fail fast если а future
-            // `pqcrypto-falcon` regression OR а patched build produces
+            // on the sign side too — fail fast if a future
+            // `pqcrypto-falcon` regression OR a patched build produces
             // signatures que verifiers would reject anyway.  Previously
             // signer only paid the verifier cap implicitly; explicit
-            // check turns а silent compat-break into а clean error.
+            // check turns a silent compat-break into a clean error.
             if fal_sig_bytes.len() > MAX_FALCON_SIG_BYTES {
                 return Err(ConfigError::InvalidCryptoMaterial {
                     algo: algo.to_string(),
@@ -333,28 +333,28 @@ fn split_hybrid_pk(pk: &[u8]) -> Result<(&[u8], &[u8])> {
 /// split a hybrid signature blob into its (ed25519_sig
 /// falcon_sig) components. Wire format produced by `sign_message`:
 /// `[64 B ed_sig][2 B u16-LE falcon_sig_len][falcon_sig_len B falcon_sig]`.
-/// tightened от 1024 → 768. Falcon-512 sigs
-/// are variable-length 600-752 B per NIST spec; 768 leaves а 16-byte
-/// margin for the rare upper-tail samples без the prior 272-byte gap
-/// that gave attackers free CPU amplification space. Без this cap
-/// an adversary-supplied hybrid sig с `fal_len = 65535` would force
-/// the verifier к hand up к ~64 KiB к pqcrypto-falcon's parser per
-/// verification — CPU-amplification vector against а busy DHT-store
-/// endpoint. 768 B is а hard ceiling that crosses every Falcon-512
+/// tightened from 1024 → 768. Falcon-512 sigs
+/// are variable-length 600-752 B per NIST spec; 768 leaves a 16-byte
+/// margin for the rare upper-tail samples without the prior 272-byte gap
+/// that gave attackers free CPU amplification space. Without this cap
+/// an adversary-supplied hybrid sig with `fal_len = 65535` would force
+/// the verifier to hand up to ~64 KiB to pqcrypto-falcon's parser per
+/// verification — CPU-amplification vector against a busy DHT-store
+/// endpoint. 768 B is a hard ceiling that crosses every Falcon-512
 /// implementation in practice.
 pub const MAX_FALCON_SIG_BYTES: usize = 768;
 
-/// Verifier-side cap on the Falcon-1024 component of а hybrid signature
-/// (Этап 10).  pqcrypto-falcon's Falcon-1024 `CRYPTO_BYTES` constant is
-/// 1462 — the hard upper bound на any valid Falcon-1024 detached
+/// Verifier-side cap on the Falcon-1024 component of a hybrid signature
+/// (Phase 10).  pqcrypto-falcon's Falcon-1024 `CRYPTO_BYTES` constant is
+/// 1462 — the hard upper bound on any valid Falcon-1024 detached
 /// signature.  We cap at exactly 1462 to reject malformed signatures
 /// without leaving CPU-amplification headroom.  An adversary-supplied
-/// hybrid sig с `fal_len = 65535` would otherwise force the verifier
-/// к hand up к ~64 KiB к pqcrypto-falcon's parser per verification.
+/// hybrid sig with `fal_len = 65535` would otherwise force the verifier
+/// to hand up to ~64 KiB to pqcrypto-falcon's parser per verification.
 pub const MAX_FALCON1024_SIG_BYTES: usize = 1462;
 
-/// Split а hybrid-1024 private-key blob into its (ed25519_sk, falcon_sk)
-/// components.  Wire format identical к the Falcon-512 hybrid SK shape:
+/// Split a hybrid-1024 private-key blob into its (ed25519_sk, falcon_sk)
+/// components.  Wire format identical to the Falcon-512 hybrid SK shape:
 /// `[32 B ed_sk][2 B u16-LE falcon_sk_len][falcon_sk_len B falcon_sk]`.
 fn split_hybrid_1024_sk(sk: &[u8]) -> Result<(&[u8], &[u8])> {
     if sk.len() < 34 {
@@ -379,7 +379,7 @@ fn split_hybrid_1024_sk(sk: &[u8]) -> Result<(&[u8], &[u8])> {
     Ok((ed_sk, fal_sk))
 }
 
-/// Split а hybrid-1024 public-key blob into its (ed25519_pk, falcon_pk)
+/// Split a hybrid-1024 public-key blob into its (ed25519_pk, falcon_pk)
 /// components.  Wire format: `[32 B ed_pk][1793 B falcon_pk]` —
 /// `HYBRID_1024_PK_LEN` total, fixed-size (no length prefix).
 fn split_hybrid_1024_pk(pk: &[u8]) -> Result<(&[u8], &[u8])> {
@@ -394,8 +394,8 @@ fn split_hybrid_1024_pk(pk: &[u8]) -> Result<(&[u8], &[u8])> {
     Ok((&pk[..32], &pk[32..]))
 }
 
-/// Split а hybrid-1024 signature blob into its (ed25519_sig, falcon_sig)
-/// components.  Wire format identical к the Falcon-512 hybrid sig shape:
+/// Split a hybrid-1024 signature blob into its (ed25519_sig, falcon_sig)
+/// components.  Wire format identical to the Falcon-512 hybrid sig shape:
 /// `[64 B ed_sig][2 B u16-LE fal_sig_len][fal_sig_len B fal_sig]`.
 /// `fal_sig_len` is bounded by `MAX_FALCON1024_SIG_BYTES = 1462`.
 fn split_hybrid_1024_sig(sig: &[u8]) -> Result<(&[u8], &[u8])> {
@@ -588,9 +588,9 @@ pub fn verify_message(
             Ok(())
         }
         SignatureAlgorithm::Ed25519Falcon1024Hybrid => {
-            // Этап 10: parallel hybrid verify for Falcon-1024.  BOTH
+            // Phase 10: parallel hybrid verify for Falcon-1024.  BOTH
             // signatures must validate — failure of either component is
-            // а hard fail (no fallback к classical-only acceptance).
+            // a hard fail (no fallback to classical-only acceptance).
             let pk_bytes = decode_public_key(algo, public_key_base64)?;
             let (ed_pk_bytes, fal_pk_bytes) = split_hybrid_1024_pk(&pk_bytes)?;
             let (ed_sig_bytes, fal_sig_bytes) = split_hybrid_1024_sig(signature)?;
@@ -676,9 +676,9 @@ pub fn decode_public_key(algo: SignatureAlgorithm, value: &str) -> Result<Vec<u8
             //
             // Audit batch 2026-05-25 phase M: previously used
             // `.try_into().expect("split_hybrid_pk guarantees 32 B")`
-            // — а runtime invariant cross-coupling между этой функцией
-            // и `split_hybrid_pk` (line ~200).  Verify locally instead:
-            // if а future refactor breaks the contract, return clean
+            // — a runtime invariant cross-coupling between this function
+            // and `split_hybrid_pk` (line ~200).  Verify locally instead:
+            // if a future refactor breaks the contract, return clean
             // ConfigError rather than panic.
             let ed_pk_arr: [u8; 32] =
                 ed_pk
@@ -894,7 +894,7 @@ mod tests {
         // at verify time.) The length-check above is the actionable test.
     }
 
-    // ── Этап 10: Ed25519 + Falcon-1024 hybrid round-trip suite ────────
+    // ── Phase 10: Ed25519 + Falcon-1024 hybrid round-trip suite ────────
 
     /// Hybrid-1024 keypair generation + sign + verify round-trip.
     #[test]
@@ -910,12 +910,12 @@ mod tests {
             "hybrid-1024 pk = ed_pk(32) + falcon_pk(1793)"
         );
 
-        // Sign + verify а sample message.
+        // Sign + verify a sample message.
         let msg = b"etap10 hybrid-1024 test message";
         let sig =
             sign_message(keypair.algo, &keypair.public_key, &keypair.private_key, msg).unwrap();
         // Sig: 64 (ed25519) + 2 (length prefix) + falcon_sig (variable,
-        // up к 1462 B for falcon-1024).  Minimum sane lower bound: ~100 B.
+        // up to 1462 B for falcon-1024).  Minimum sane lower bound: ~100 B.
         assert!(
             sig.len() >= 64 + 2 + 100,
             "hybrid-1024 sig too short: {}",
@@ -925,8 +925,8 @@ mod tests {
     }
 
     /// Tampered hybrid-1024 sig must fail verify — both components
-    /// independently.  Flipping one byte в either ed25519 or falcon
-    /// component is а hard fail (no fallback к single-component
+    /// independently.  Flipping one byte in either ed25519 or falcon
+    /// component is a hard fail (no fallback to single-component
     /// "good enough" acceptance).
     #[test]
     fn etap10_hybrid_1024_tampered_sig_rejected() {
@@ -973,7 +973,7 @@ mod tests {
     }
 
     /// Wire-byte mapping: SignatureAlgorithm::wire_byte() returns 4 for
-    /// the new Ed25519Falcon1024Hybrid variant, и from_wire_byte() round-
+    /// the new Ed25519Falcon1024Hybrid variant, and from_wire_byte() round-
     /// trips the value correctly.
     #[test]
     fn etap10_hybrid_1024_wire_byte_roundtrip() {
@@ -984,7 +984,7 @@ mod tests {
         );
     }
 
-    /// Hybrid-1024 является post-quantum AND has-classical-component —
+    /// Hybrid-1024 is post-quantum AND has-classical-component —
     /// the predicates that gate `--require-pq` / legacy-verify decisions
     /// recognise the new variant correctly.
     #[test]
@@ -993,8 +993,8 @@ mod tests {
         assert!(SignatureAlgorithm::Ed25519Falcon1024Hybrid.has_classical_component());
     }
 
-    /// A hybrid-512 signature must NOT validate under а hybrid-1024
-    /// public key — algorithm pinning has к be enforced.  This guards
+    /// A hybrid-512 signature must NOT validate under a hybrid-1024
+    /// public key — algorithm pinning has to be enforced.  This guards
     /// against accidental cross-algo confusion attacks at the cap
     /// boundary.
     #[test]
@@ -1009,9 +1009,9 @@ mod tests {
             msg,
         )
         .unwrap();
-        // Try to verify the 512-hybrid sig under а 1024-hybrid pk.  The
-        // pk-length check fires first (1825 vs 929 bytes), но any path
-        // через verify_message must end в Err.
+        // Try to verify the 512-hybrid sig under a 1024-hybrid pk.  The
+        // pk-length check fires first (1825 vs 929 bytes), but any path
+        // through verify_message must end in Err.
         assert!(
             verify_message(
                 SignatureAlgorithm::Ed25519Falcon1024Hybrid,

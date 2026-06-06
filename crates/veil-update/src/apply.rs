@@ -229,7 +229,7 @@ pub struct ApplyOutcome {
     /// to `<install_path>.update-old` to make room for the new
     /// binary. `None` on POSIX (atomic rename clobbers without
     /// relocation) AND on Windows when `install_path` didn't
-    /// exist (fresh install). Caller renders this в operator
+    /// exist (fresh install). Caller renders this in operator
     /// message ("old binary kept at X — will be deleted on next
     /// startup") and the next-startup `cleanup_stale_update_artifacts`
     /// removes the leftover.
@@ -380,7 +380,7 @@ pub fn apply_update_with_options(
     let binary_marked_executable = cfg!(unix);
 
     // Step 3a (Windows-only):.old-shuffle to make room for the
-    // new binary BEFORE the rename. Windows' MoveFileEx с
+    // new binary BEFORE the rename. Windows' MoveFileEx with
     // REPLACE_EXISTING fails ERROR_ACCESS_DENIED when the target
     // is the running.exe — but RENAMING the running.exe to a
     // different name IS allowed (NTFS lets you rename an open
@@ -394,7 +394,7 @@ pub fn apply_update_with_options(
     // handle holds it).
     //
     // POSIX skips this entirely — atomic rename clobbers the
-    // existing install_path и the kernel keeps the old inode
+    // existing install_path and the kernel keeps the old inode
     // alive on the running process. See module-level rustdoc.
     let previous_binary_relocated_to =
         relocate_running_binary_if_needed(install_path).map_err(|e| {
@@ -407,7 +407,7 @@ pub fn apply_update_with_options(
 
     // Step 3b: atomic rename of staging → install_path. After
     // 3a the install_path either doesn't exist (Windows
-    // shuffle-out) or doesn't exist в any meaningful sense
+    // shuffle-out) or doesn't exist in any meaningful sense
     // (POSIX clobber semantics) — either way the rename succeeds.
     if let Err(e) = std::fs::rename(&tmp_path, install_path) {
         // Best-effort cleanup of the staging file so we don't
@@ -425,18 +425,18 @@ pub fn apply_update_with_options(
     }
 
     // fsync the parent directory. `rename` is
-    // atomic в kernel но not durable until the directory entry is
-    // flushed. Without this, а power loss between the rename и the
+    // atomic in kernel but not durable until the directory entry is
+    // flushed. Without this, a power loss between the rename and the
     // next sync barrier can roll back the directory entry — the
-    // install_path inode survives но the dirent points back к the
-    //.tmp path, leaving the user с a half-applied update.
+    // install_path inode survives but the dirent points back to the
+    //.tmp path, leaving the user with a half-applied update.
     //
     // POSIX: open(parent, O_RDONLY) then fsync. Windows: documented
-    // not к support directory fsync; std skips it on this platform.
-    // Best-effort — а fsync failure here means the update is committed
-    // to page cache но not к disk, which is the same risk as а power
+    // not to support directory fsync; std skips it on this platform.
+    // Best-effort — a fsync failure here means the update is committed
+    // to page cache but not to disk, which is the same risk as a power
     // loss in the immediate window after rename. Don't fail the
-    // apply: the bytes ARE on disk under the tmp path on retry, и а
+    // apply: the bytes ARE on disk under the tmp path on retry, and a
     // subsequent apply will re-stage cleanly.
     if let Some(parent) = install_path.parent()
         && let Ok(dir_file) = std::fs::File::open(parent)
@@ -511,7 +511,7 @@ pub fn cleanup_stale_update_artifacts(install_path: &Path) -> Vec<PathBuf> {
 /// relocate).
 ///
 /// POSIX returns `Ok(None)` unconditionally — atomic rename
-/// clobbers the existing target и the kernel keeps the old
+/// clobbers the existing target and the kernel keeps the old
 /// inode alive on the running process, no shuffle needed.
 #[cfg(windows)]
 fn relocate_running_binary_if_needed(install_path: &Path) -> std::io::Result<Option<PathBuf>> {
@@ -523,7 +523,7 @@ fn relocate_running_binary_if_needed(install_path: &Path) -> std::io::Result<Opt
     // previous failed apply that didn't recover all the way).
     // Ignoring errors — it may be locked by an even older
     // running process; if so, the rename below will fail loudly
-    // и operator gets a clear "old binary handle held" diagnostic.
+    // and operator gets a clear "old binary handle held" diagnostic.
     let _ = std::fs::remove_file(&old_path);
     std::fs::rename(install_path, &old_path)?;
     Ok(Some(old_path))
@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn epic484_3_posix_apply_does_not_produce_update_old_artifact() {
         // POSIX semantics: atomic rename clobbers existing
-        // install_path и kernel keeps old inode alive on running
+        // install_path and kernel keeps old inode alive on running
         // process — no.old-shuffle needed, no.update-old artifact
         // produced. Outcome's previous_binary_relocated_to MUST
         // be None on POSIX so operator log doesn't say "old binary
@@ -1096,9 +1096,9 @@ mod tests {
     #[test]
     fn epic484_3_cleanup_stale_artifacts_partial_only_removes_what_exists() {
         // Only.update-old present.update-tmp absent → cleanup
-        // removes the.update-old и returns it; doesn't error on
+        // removes the.update-old and returns it; doesn't error on
         // the absent.update-tmp. Verifies we don't accidentally
-        // require BOTH to be present для cleanup to work.
+        // require BOTH to be present for cleanup to work.
         let dir = unique_dir("cleanup-partial");
         let install = dir.join("veil");
         std::fs::write(&install, b"current binary").unwrap();
@@ -1259,8 +1259,14 @@ mod tests {
         let keyed = InstalledVersionStore::with_hmac_key(state.clone(), [0x5Au8; 32]);
         let payload = b"binary";
         let manifest = fixture_manifest(2_000_000_000, sha256_of(payload));
-        let err = apply_update(&manifest, payload, &install, &keyed, env!("CARGO_PKG_VERSION"))
-            .unwrap_err();
+        let err = apply_update(
+            &manifest,
+            payload,
+            &install,
+            &keyed,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ApplyError::LegacyStateMigrationRequired),
             "default apply over a legacy no-mac keyed file must fail closed, got {err:?}"
@@ -1300,8 +1306,14 @@ mod tests {
 
         let payload = b"replayed older binary";
         let manifest = fixture_manifest(1_500_000_000, sha256_of(payload));
-        let err = apply_update(&manifest, payload, &install, &keyed, env!("CARGO_PKG_VERSION"))
-            .unwrap_err();
+        let err = apply_update(
+            &manifest,
+            payload,
+            &install,
+            &keyed,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ApplyError::LegacyStateMigrationRequired),
             "stripped-mac lowered floor must be rejected, got {err:?}"

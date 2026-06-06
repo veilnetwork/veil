@@ -452,7 +452,7 @@ FETCH: recipient → MAILBOX_FETCH(after_seq) → mailbox_node → entries[]
 ACK:   recipient → MAILBOX_ACK(up_to_seq) → mailbox_node
 ```
 
-Backends: `memory` (не сохраняется на диск), `wal` (crash-safe WAL), `rocksdb` (требует feature `rocksdb-cold`, активен по умолчанию).
+Backends: `memory` (not persisted to disk), `wal` (crash-safe WAL), `rocksdb` (requires the `rocksdb-cold` feature, enabled by default).
 
 ---
 

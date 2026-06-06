@@ -97,7 +97,7 @@ impl SessionOutbox {
 
     /// Register a new session and return the outbox receiver for that peer.
     pub fn register(&self, peer_id: impl Into<NodeId>) -> mpsc::Receiver<OutboxRequest> {
-        // H9 ergonomic accept: see `send_request` для rationale.
+        // H9 ergonomic accept: see `send_request` for rationale.
         let peer_id: NodeId = peer_id.into();
         let (tx, rx) = mpsc::channel(self.capacity);
         lock!(self.senders).insert(*peer_id.as_bytes(), tx);
@@ -106,7 +106,7 @@ impl SessionOutbox {
 
     /// Remove the sender for `peer_id` (called when the session closes).
     pub fn unregister(&self, peer_id: impl Into<NodeId>) {
-        // H9 ergonomic accept: see `send_request` для rationale.
+        // H9 ergonomic accept: see `send_request` for rationale.
         let peer_id: NodeId = peer_id.into();
         lock!(self.senders).remove(peer_id.as_bytes());
     }
@@ -132,9 +132,9 @@ impl SessionOutbox {
         request_id: u32,
         frame: Vec<u8>,
     ) -> Option<oneshot::Receiver<Option<Vec<u8>>>> {
-        // H9 ergonomic accept: take `impl Into<NodeId>` so callers с
-        // raw `[u8; 32]` (session/runtime hot path) и future `NodeId`
-        // callers both work без explicit conversion.
+        // H9 ergonomic accept: take `impl Into<NodeId>` so callers with
+        // raw `[u8; 32]` (session/runtime hot path) and future `NodeId`
+        // callers both work without explicit conversion.
         let peer_id: NodeId = peer_id.into();
         let (response_tx, response_rx) = oneshot::channel();
         let req = OutboxRequest {
@@ -162,7 +162,7 @@ impl SessionOutbox {
     /// is `0` which the SessionRunner pending-response map will never
     /// match, so the entry naturally TTL-evicts.
     pub fn send_oneway(&self, peer_id: impl Into<NodeId>, frame: Vec<u8>) -> bool {
-        // H9 ergonomic accept: see `send_request` для rationale.
+        // H9 ergonomic accept: see `send_request` for rationale.
         let peer_id: NodeId = peer_id.into();
         let (response_tx, _response_rx) = oneshot::channel();
         let req = OutboxRequest {
@@ -190,10 +190,10 @@ impl SessionOutbox {
 // ── FrameRouter trait impl ───────────────────────────────────────────────────
 //
 // Phase 2 session 2 (veilcore extraction): impl block moved here
-// от `veilcore::node::dht_glue.rs` так veilcore не violates Rust's
-// orphan rule once session moved к а sibling crate (`FrameRouter` is
-// veil-dht's trait и `SessionOutbox` is now veil-session's struct
-// — neither is local к veilcore).
+// from `veilcore::node::dht_glue.rs` so veilcore does not violate Rust's
+// orphan rule once session moved to a sibling crate (`FrameRouter` is
+// veil-dht's trait and `SessionOutbox` is now veil-session's struct
+// — neither is local to veilcore).
 
 impl veil_dht::FrameRouter for SessionOutbox {
     fn send_request(

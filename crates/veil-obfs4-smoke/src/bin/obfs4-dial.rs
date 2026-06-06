@@ -1,4 +1,4 @@
-//! Quick dial smoke test: connect к а remote `obfs4-tcp://host:port`
+//! Quick dial smoke test: connect to a remote `obfs4-tcp://host:port`
 //! and complete the handshake.  Reports success/failure.
 //!
 //! Usage: `obfs4-dial <host:port> <psk_b64_file>`

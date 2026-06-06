@@ -1,42 +1,42 @@
 //! Invite-bundle: compact signed credential for out-of-band sharing of
-//! а trusted veil listener's contact info.
+//! a trusted veil listener's contact info.
 //!
 //! ## Use case
 //!
-//! Alice runs an veil node с а `visibility = "trusted"` listener
-//! (not advertised в DHT/PEX).  Bob wants k connect.  Alice generates an
+//! Alice runs an veil node with a `visibility = "trusted"` listener
+//! (not advertised in DHT/PEX).  Bob wants k connect.  Alice generates an
 //! invite-bundle containing:
 //! - Listener's `transport` URI (`obfs4-tcp://1.2.3.4:7821`, etc).
 //! - Listener's PSK (so Bob's obfs4 handshake succeeds).
 //! - Alice's `node_id` + verifying-key fingerprint.
 //! - Expiry timestamp.
-//! - Ed25519 signature от Alice's identity key over the canonical body.
+//! - Ed25519 signature from Alice's identity key over the canonical body.
 //!
-//! Alice displays it as QR на а screen / paste-able text.  Bob's veil
-//! daemon scans или imports the bundle, adds it к `bootstrap_peers` +
-//! drops the PSK into а psk-file.  Subsequent connections use the
+//! Alice displays it as QR on a screen / paste-able text.  Bob's veil
+//! daemon scans or imports the bundle, adds it to `bootstrap_peers` +
+//! drops the PSK into a psk-file.  Subsequent connections use the
 //! trusted listener.
 //!
 //! ## Format
 //!
 //! Wire: CBOR-encoded `InviteBundleV1` → base32 (RFC 4648, no padding)
-//! → optionally rendered к QR via `qrcode` crate.
+//! → optionally rendered to QR via `qrcode` crate.
 //!
-//! Length: typically 250-350 bytes на base32 (depends on URI length and
-//! label).  Fits в QR code v10-15 (mobile camera reads fine).
+//! Length: typically 250-350 bytes on base32 (depends on URI length and
+//! label).  Fits in QR code v10-15 (mobile camera reads fine).
 //!
 //! ## Threat model
 //!
-//! - Anyone holding а bundle CAN connect к the listener (PSK + URI are
-//!   enough).  Bundle is а **bearer credential**.  Operator должен
-//!   distribute через а private channel (Signal, USB stick, QR
+//! - Anyone holding a bundle CAN connect to the listener (PSK + URI are
+//!   enough).  Bundle is a **bearer credential**.  Operator must
+//!   distribute through a private channel (Signal, USB stick, QR
 //!   shown briefly).
 //! - Ed25519 sig over the body prevents tampering (someone editing the
-//!   transport URI к redirect к а malicious endpoint will break sig).
-//! - Expiry limits damage if а bundle leaks: после the date passes the
+//!   transport URI to redirect to a malicious endpoint will break sig).
+//! - Expiry limits damage if a bundle leaks: after the date passes the
 //!   bundle is no longer accepted (receiver checks `now < expiry`).
 //! - **No** revocation built into the bundle itself; operator must
-//!   rotate the PSK или change the listener allowlist к invalidate а
+//!   rotate the PSK or change the listener allowlist to invalidate a
 //!   leaked bundle's access.
 
 #![forbid(unsafe_code)]
@@ -50,13 +50,13 @@ use serde::{Deserialize, Serialize};
 /// Current wire format version.  Bump when CBOR field set changes.
 pub const INVITE_VERSION: u8 = 1;
 
-/// Domain-separation tag для the Ed25519 signature.  Prepended before
-/// canonical body bytes so sig от one purpose isn't replayable as а
-/// sig для another.
+/// Domain-separation tag for the Ed25519 signature.  Prepended before
+/// canonical body bytes so sig from one purpose isn't replayable as a
+/// sig for another.
 pub const INVITE_SIG_DOMAIN: &[u8] = b"veil-invite:v1\0";
 
-/// Max transport URI length (UTF-8 bytes).  Matches the limit на
-/// `SignedTransportAnnouncement` для consistency.
+/// Max transport URI length (UTF-8 bytes).  Matches the limit on
+/// `SignedTransportAnnouncement` for consistency.
 pub const MAX_TRANSPORT_URI_LEN: usize = 240;
 
 /// Max human-readable label length.
@@ -100,7 +100,7 @@ pub enum InviteError {
 // ── Bundle structure ────────────────────────────────────────────────────────
 
 /// Invite bundle (CBOR-serializable).  All field names are short
-/// (1-2 chars) к minimize wire size в the encoded form.
+/// (1-2 chars) to minimize wire size in the encoded form.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InviteBundleV1 {
     /// Wire format version.
@@ -113,7 +113,7 @@ pub struct InviteBundleV1 {
     pub vk: Vec<u8>,
     /// Transport URI (e.g. `obfs4-tcp://1.2.3.4:7821`).
     pub tr: String,
-    /// Pre-shared key (32 bytes) для this listener's obfs4 handshake.
+    /// Pre-shared key (32 bytes) for this listener's obfs4 handshake.
     #[serde(with = "serde_bytes")]
     pub psk: Vec<u8>,
     /// Unix-seconds expiry.  Receivers reject bundles when
@@ -121,7 +121,7 @@ pub struct InviteBundleV1 {
     pub exp: u64,
     /// Optional human-readable label ("alice's home node").
     pub lbl: Option<String>,
-    /// Ed25519 signature над canonical body (see `signable_bytes`).
+    /// Ed25519 signature over canonical body (see `signable_bytes`).
     #[serde(with = "serde_bytes")]
     pub sig: Vec<u8>,
 }
@@ -132,7 +132,7 @@ mod serde_bytes {
         s.serialize_bytes(bytes)
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        // Accept либо raw bytes либо byte-array sequence (CBOR major-2
+        // Accept either raw bytes either byte-array sequence (CBOR major-2
         // OR major-4 of u8).
         use serde::Deserialize;
         let b: ciborium::Value = ciborium::Value::deserialize(d)?;
@@ -174,7 +174,7 @@ impl InviteBundleV1 {
         buf
     }
 
-    /// Encode к CBOR bytes.
+    /// Encode to CBOR bytes.
     pub fn to_cbor(&self) -> Result<Vec<u8>, InviteError> {
         let mut out = Vec::new();
         ciborium::ser::into_writer(self, &mut out)
@@ -182,7 +182,7 @@ impl InviteBundleV1 {
         Ok(out)
     }
 
-    /// Decode от CBOR bytes.
+    /// Decode from CBOR bytes.
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, InviteError> {
         let bundle: Self =
             ciborium::de::from_reader(bytes).map_err(|e| InviteError::CborDecode(e.to_string()))?;
@@ -203,12 +203,12 @@ impl InviteBundleV1 {
         Ok(bundle)
     }
 
-    /// Encode к base32 text (compact ASCII, suitable для QR / copy-paste).
+    /// Encode to base32 text (compact ASCII, suitable for QR / copy-paste).
     pub fn to_base32(&self) -> Result<String, InviteError> {
         Ok(BASE32_NOPAD.encode(&self.to_cbor()?))
     }
 
-    /// Decode от base32 text.
+    /// Decode from base32 text.
     pub fn from_base32(s: &str) -> Result<Self, InviteError> {
         let bytes = BASE32_NOPAD
             .decode(s.trim().as_bytes())
@@ -216,8 +216,8 @@ impl InviteBundleV1 {
         Self::from_cbor(&bytes)
     }
 
-    /// Render а Unicode-art QR code suitable для terminal display.
-    /// Returns string с each row separated by `\n`.
+    /// Render a Unicode-art QR code suitable for terminal display.
+    /// Returns string with each row separated by `\n`.
     pub fn to_qr_ansi(&self) -> Result<String, InviteError> {
         let text = self.to_base32()?;
         let code = qrcode::QrCode::new(text.as_bytes())
@@ -229,14 +229,14 @@ impl InviteBundleV1 {
             .build())
     }
 
-    /// Verify the bundle's signature и age.
+    /// Verify the bundle's signature and age.
     ///
     /// Checks (in order):
-    /// 1. `nid` length = 32 и `vk` length = 32.
-    /// 2. `nid == BLAKE3(vk)` (identity binding — sig under а given vk
-    ///    only meaningful if vk hashes к the claimed node_id).
+    /// 1. `nid` length = 32 and `vk` length = 32.
+    /// 2. `nid == BLAKE3(vk)` (identity binding — sig under a given vk
+    ///    only meaningful if vk hashes to the claimed node_id).
     /// 3. Ed25519 sig over `INVITE_SIG_DOMAIN || signable_bytes`
-    ///    verifies против `vk`.
+    ///    verifies against `vk`.
     /// 4. `now_unix < exp` (not expired).
     pub fn verify(&self, now_unix: u64) -> Result<(), InviteError> {
         if self.nid.len() != 32 || self.vk.len() != 32 || self.sig.len() != 64 {
@@ -276,12 +276,12 @@ impl InviteBundleV1 {
 // ── Bundle creation helper ──────────────────────────────────────────────────
 
 /// Build + sign an `InviteBundleV1`.  Validates input lengths up-front
-/// (transport URI, label, PSK) и returns an error before touching the
+/// (transport URI, label, PSK) and returns an error before touching the
 /// signing key if any cap is exceeded.
 ///
 /// `signing_key`'s public part must match the `nid` parameter
-/// (otherwise verify() will reject).  Caller is responsible для
-/// sourcing the signing_key от the owner's identity key.
+/// (otherwise verify() will reject).  Caller is responsible for
+/// sourcing the signing_key from the owner's identity key.
 pub fn create_bundle(
     signing_key: &SigningKey,
     transport: String,
@@ -468,7 +468,7 @@ mod tests {
         assert!(matches!(err, InviteError::TransportTooLong(_)));
     }
 
-    /// Two different invites (different PSK) sign к different bytes.
+    /// Two different invites (different PSK) sign to different bytes.
     #[test]
     fn different_psk_yields_different_sig() {
         let a = create_bundle(
@@ -490,7 +490,7 @@ mod tests {
         assert_ne!(a.sig, b.sig);
     }
 
-    /// Wire length sanity: typical bundle fits в QR-friendly size.
+    /// Wire length sanity: typical bundle fits in QR-friendly size.
     #[test]
     fn wire_length_within_qr_budget() {
         let b = sample_bundle();
@@ -505,7 +505,7 @@ mod tests {
         );
     }
 
-    /// PSK is high-entropy; bundle should fail clean if PSK не 32 bytes.
+    /// PSK is high-entropy; bundle should fail clean if PSK not 32 bytes.
     #[test]
     fn psk_must_be_32_bytes() {
         let mut b = sample_bundle();

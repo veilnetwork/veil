@@ -1626,7 +1626,7 @@ impl StorePayload {
         }
         let sig_flag = buf[value_end];
         let (ed25519_pubkey, ed25519_sig) = if sig_flag == 0x01 {
-            // Build offsets с checked_add chain.
+            // Build offsets with checked_add chain.
             let pk_start = value_end.checked_add(1).ok_or(ProtoError::BufferTooShort {
                 need: usize::MAX,
                 got: buf.len(),

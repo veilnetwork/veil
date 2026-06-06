@@ -1,13 +1,13 @@
 //! Mailbox handlers (`MailboxPut` / `MailboxFetch` / `MailboxAck`).
 //!
-//! Mailbox = offline store-and-forward for а receiver that's currently
+//! Mailbox = offline store-and-forward for a receiver that's currently
 //! offline.  Apps deposit encrypted blobs through `MailboxPut`; the
-//! recipient's app pulls them through `MailboxFetch` и acknowledges
-//! receipt through `MailboxAck`.  The backend (если wired) enforces
-//! per-receiver и global byte / blob quotas plus rate limits;
-//! authentication on fetch / ack is done через `auth_cookie` verified
-//! against rendezvous-publisher entries.  Когда no backend is wired,
-//! `MailboxPut` returns `NotMailboxRelay` и `MailboxFetch` / `MailboxAck`
+//! recipient's app pulls them through `MailboxFetch` and acknowledges
+//! receipt through `MailboxAck`.  The backend (if wired) enforces
+//! per-receiver and global byte / blob quotas plus rate limits;
+//! authentication on fetch / ack is done through `auth_cookie` verified
+//! against rendezvous-publisher entries.  When no backend is wired,
+//! `MailboxPut` returns `NotMailboxRelay` and `MailboxFetch` / `MailboxAck`
 //! return empty / `false` respectively (feature off gracefully).
 
 use std::sync::Arc;
@@ -100,7 +100,7 @@ pub(crate) async fn handle_mailbox_fetch(
 ) -> std::io::Result<()> {
     // Recipient's app pulls all pending blobs.  `auth_cookie` is verified
     // by the backend against rendezvous-publisher entries.  Mismatch /
-    // no-mailbox → empty list (no distinction, so cookie isn't а probing
+    // no-mailbox → empty list (no distinction, so cookie isn't a probing
     // oracle).  Cap entries returned per IPC frame; caller can re-fetch
     // if the cap is hit (acks make subsequent fetches return the next
     // batch).

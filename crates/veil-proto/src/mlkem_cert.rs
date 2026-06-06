@@ -109,13 +109,13 @@ impl MlKemKeyCert {
         out
     }
 
-    /// Decode wire bytes к а fully-populated certificate.
+    /// Decode wire bytes to a fully-populated certificate.
     ///
     /// demo migration: replaced ~10 hand-rolled cursor
-    /// calls с [`BoundedDecoder`] which encapsulates buf+pos so а new
+    /// calls with [`BoundedDecoder`] which encapsulates buf+pos so a new
     /// reader can't accidentally drift the cursor. Trailing-bytes
-    /// rejection moved к `assert_eof`. Net: ~25 lines deleted, the
-    /// remaining flow is а straight-line read sequence без cursor
+    /// rejection moved to `assert_eof`. Net: ~25 lines deleted, the
+    /// remaining flow is a straight-line read sequence without cursor
     /// arithmetic visible at the call site.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
         if buf.len() > MAX_MLKEM_CERT_BYTES {
@@ -142,10 +142,10 @@ impl MlKemKeyCert {
         let mlkem_algo = d.read_u8("mlkem_cert.algo")?;
         let expected_ek_len = ek_len_for_algo(mlkem_algo)?;
 
-        // Read u16 pubkey_len с algo-specific equality check; cannot use
+        // Read u16 pubkey_len with algo-specific equality check; cannot use
         // `read_u16_prefixed_bytes` directly since we need exact-length
-        // (not <= max) и а custom error message. Read length explicitly
-        // и then the body via `read_bytes`.
+        // (not <= max) and a custom error message. Read length explicitly
+        // and then the body via `read_bytes`.
         let pk_len = d.read_u16("mlkem_cert.pubkey_len")? as usize;
         if pk_len != expected_ek_len {
             return Err(ProtoError::Malformed(format!(
@@ -164,7 +164,7 @@ impl MlKemKeyCert {
         let cert_version = d.read_u64("mlkem_cert.cert_version")?;
         let signing_identity_key_idx = d.read_u16("mlkem_cert.signing_key_idx")?;
 
-        // sig_len с custom "must be > 0 AND <= MAX_SIG_BYTES" rule —
+        // sig_len with custom "must be > 0 AND <= MAX_SIG_BYTES" rule —
         // again can't use `read_u16_prefixed_bytes` (allows 0-len).
         let sig_len = d.read_u16("mlkem_cert.sig_len")? as usize;
         if sig_len == 0 || sig_len > MAX_SIG_BYTES {
@@ -231,7 +231,7 @@ impl MlKemKeyCert {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 // ad-hoc `read_array` removed; use `BoundedDecoder::read_array`
-// which has identical semantics but lives с the cursor primitive.
+// which has identical semantics but lives with the cursor primitive.
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 

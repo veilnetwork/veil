@@ -1,16 +1,16 @@
 //! Integration / smoke tests for the `obfs4-tcp://` transport.
 //!
 //! Validates the full registry path (URI parse → registry lookup →
-//! Transport::connect/bind via trait object) на real TCP sockets,
-//! not duplex streams.  Approximates что а deployed daemon does.
+//! Transport::connect/bind via trait object) on real TCP sockets,
+//! not duplex streams.  Approximates that a deployed daemon does.
 //!
 //! Two-process smoke test (`obfs4_smoke_two_node`):
 //! - One side binds, another connects.
 //! - Pushes 64 KiB of plaintext payload each way.
 //! - Confirms exact byte-for-byte roundtrip.
-//! - Independently captures bytes на the wire by interposing а
+//! - Independently captures bytes on the wire by interposing a
 //!   forwarder socket between the two halves; asserts no OVL1 magic
-//!   appears в the captured traffic.
+//!   appears in the captured traffic.
 
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ fn ctx_with_psk(psk: [u8; 32]) -> Arc<TransportContext> {
 }
 
 /// Full registry path: parse `obfs4-tcp://127.0.0.1:0` → registry
-/// resolves к `Obfs4TcpTransport` → bind → accept → connect →
+/// resolves to `Obfs4TcpTransport` → bind → accept → connect →
 /// round-trip bytes.  No magic in the wire.
 #[tokio::test]
 async fn obfs4_smoke_two_node() {
@@ -71,7 +71,7 @@ async fn obfs4_smoke_two_node() {
 
     let payload = {
         let mut p = vec![0u8; 1024];
-        // Embed OVL1 magic в the payload — if it appears на the wire,
+        // Embed OVL1 magic in the payload — if it appears on the wire,
         // the framing layer is broken.
         for chunk in p.chunks_mut(32) {
             let n = 4.min(chunk.len());
@@ -90,8 +90,8 @@ async fn obfs4_smoke_two_node() {
     assert_eq!(server_got, payload, "server saw plaintext payload");
 }
 
-/// Active-probe scenario: an attacker що doesn't know the PSK connects
-/// и attempts the handshake.  Server must silent-drop; client surfaces
+/// Active-probe scenario: an attacker that doesn't know the PSK connects
+/// and attempts the handshake.  Server must silent-drop; client surfaces
 /// an error.
 #[tokio::test]
 async fn obfs4_smoke_active_probe_rejected() {
@@ -135,7 +135,7 @@ fn obfs4_tcp_uri_parses_and_renders() {
     assert_eq!(parsed.scheme(), "obfs4-tcp");
     assert_eq!(parsed.to_string(), "obfs4-tcp://10.0.0.1:9000");
 
-    // IPv6 host wrapped в brackets.
+    // IPv6 host wrapped in brackets.
     let parsed6 = TransportUri::parse("obfs4-tcp://[::1]:9000").unwrap();
     assert_eq!(parsed6.scheme(), "obfs4-tcp");
     assert_eq!(parsed6.to_string(), "obfs4-tcp://[::1]:9000");
@@ -152,7 +152,7 @@ fn registry_default_includes_obfs4_tcp() {
     assert_eq!(t.scheme(), "obfs4-tcp");
 }
 
-/// Listening на а wildcard host should get correctly rewritten.
+/// Listening on a wildcard host should get correctly rewritten.
 #[test]
 fn obfs4_tcp_wildcard_host_rewrite() {
     let rewritten = veil_transport::rewrite_wildcard_host(

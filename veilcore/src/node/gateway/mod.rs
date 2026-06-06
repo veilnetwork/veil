@@ -1,8 +1,8 @@
 //! Re-export shim for the extracted [`veil-gateway`](veil_gateway) crate.
 //!
 //! Phase 3 prep (veilcore extraction): the gateway service (ATTACH /
-//! DETACH / KEEPALIVE handlers for Core-node leaves) и its sub-modules
-//! (attachment / endpoint / lease) moved к the veil-gateway sibling
+//! DETACH / KEEPALIVE handlers for Core-node leaves) and its sub-modules
+//! (attachment / endpoint / lease) moved to the veil-gateway sibling
 //! crate alongside the existing `GatewayList` scoring/failover code.
 //! Existing call sites use `crate::node::gateway::*` — preserved via
 //! re-export.

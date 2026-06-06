@@ -1,6 +1,6 @@
 // Pairing UX (Epic 489.7) — QR-scan + manual-paste invite consumption.
 //
-// Three entry points для the new-user (consume) side:
+// Three entry points for the new-user (consume) side:
 //   1. QR scan via `mobile_scanner` package — primary path, fastest UX.
 //   2. Manual paste field — fallback when camera unavailable / scan fails.
 //   3. HTTPS bootstrap URL field — for `https://invite.example.com/...`
@@ -9,8 +9,8 @@
 // All three converge to [VeilClient.joinBootstrapUri], so the
 // passphrase-prompt / signed-verify logic lives in one place.
 //
-// Generator side (existing user shares their own invite as а QR) lives
-// в the companion file [`share_invite.dart`](share_invite.dart) —
+// Generator side (existing user shares their own invite as a QR) lives
+// in the companion file [`share_invite.dart`](share_invite.dart) —
 // `VeilShareInviteDialog`.  Both files cover the QR-code-pairing
 // flow end-to-end.
 //
@@ -35,24 +35,24 @@ import 'types.dart';
 /// Material-3 pairing dialog.  Shows tabs for three pairing methods +
 /// inline passphrase prompt + actionable error states.
 ///
-/// Returns the final [JoinBootstrapResult] на pop (or `null` if the
+/// Returns the final [JoinBootstrapResult] on pop (or `null` if the
 /// user dismissed without completing).
 class VeilPairingDialog extends StatefulWidget {
   const VeilPairingDialog({
     required this.client,
-    this.title = 'Pair with а peer',
+    this.title = 'Pair with a peer',
     this.expectedIssuerPk,
     super.key,
   });
 
-  /// Bound veil client — used к invoke [VeilClient.joinBootstrapUri].
+  /// Bound veil client — used to invoke [VeilClient.joinBootstrapUri].
   final VeilClient client;
 
   /// Dialog header text.
   final String title;
 
   /// For signed invites only: base64-encoded issuer Ed25519 pubkey.
-  /// Required для `veil:signed-invite?…` URIs; leave null for
+  /// Required for `veil:signed-invite?…` URIs; leave null for
   /// plain / encrypted invites.
   final String? expectedIssuerPk;
 
@@ -92,9 +92,9 @@ class _VeilPairingDialogState extends State<VeilPairingDialog>
 
   /// Single entry-point all three flows funnel through.  Calls
   /// [VeilClient.joinBootstrapUri], handles passphrase-required
-  /// status by re-prompting и retrying, и updates local state с the
-  /// result.  Returns `true` if the result is а terminal "good" outcome
-  /// ([JoinBootstrapStatus.ok] или [alreadyRegistered]) — the dialog
+  /// status by re-prompting and retrying, and updates local state with the
+  /// result.  Returns `true` if the result is a terminal "good" outcome
+  /// ([JoinBootstrapStatus.ok] or [alreadyRegistered]) — the dialog
   /// pops on `true`.
   Future<bool> _attemptJoin(
     String uri, {
@@ -108,7 +108,7 @@ class _VeilPairingDialogState extends State<VeilPairingDialog>
       _lastDetail = null;
     });
     // Precedence-explicit: prefer the explicit override, else fall
-    // back к the inline-prompt field (если оператор уже ввёл
+    // back to the inline-prompt field (if operator already entered
     // passphrase), else NULL.
     final pw = overridePassword ??
         (_passwordController.text.isEmpty
@@ -132,7 +132,7 @@ class _VeilPairingDialogState extends State<VeilPairingDialog>
           return true;
         case JoinBootstrapStatus.passwordRequired:
         case JoinBootstrapStatus.passwordWrong:
-          // Surface а passphrase prompt inline; user retries.
+          // Surface a passphrase prompt inline; user retries.
           return false;
         default:
           // Terminal error — keep dialog open, show status banner.
@@ -235,8 +235,8 @@ class _VeilPairingDialogState extends State<VeilPairingDialog>
       child: MobileScanner(
         onDetect: _onBarcodeDetect,
         errorBuilder: (context, error, _) {
-          // Cache the error К surface а fallback hint; the widget will
-          // rebuild с the error variant of this tab.
+          // Cache the error To surface a fallback hint; the widget will
+          // rebuild with the error variant of this tab.
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (!mounted) return;
             setState(() => _scanError = error.errorDetails?.message ?? 'unknown');
@@ -252,7 +252,7 @@ class _VeilPairingDialogState extends State<VeilPairingDialog>
     for (final code in capture.barcodes) {
       final raw = code.rawValue;
       if (raw == null || raw.isEmpty) continue;
-      // Pause scanner и attempt the join.  If the join needs а
+      // Pause scanner and attempt the join.  If the join needs a
       // passphrase, the dialog UI surfaces the prompt inline.
       _attemptJoin(raw);
       return;
@@ -306,7 +306,7 @@ class _VeilPairingDialogState extends State<VeilPairingDialog>
           ),
           const SizedBox(height: 4),
           Text(
-            'Used when sharing invites через regular messaging apps. '
+            'Used when sharing invites through regular messaging apps. '
             'Daemon fetches the invite bundle over HTTPS.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
@@ -389,13 +389,13 @@ class _VeilPairingDialogState extends State<VeilPairingDialog>
         return (
           Icons.password,
           cs.error,
-          'Wrong passphrase — check case / spaces и try again',
+          'Wrong passphrase — check case / spaces and try again',
         );
       case JoinBootstrapStatus.signatureInvalid:
         return (
           Icons.gpp_bad,
           cs.error,
-          'Signature did not verify — invite is tampered or from а '
+          'Signature did not verify — invite is tampered or from a '
               'different issuer',
         );
       case JoinBootstrapStatus.internalError:
@@ -403,7 +403,7 @@ class _VeilPairingDialogState extends State<VeilPairingDialog>
         return (
           Icons.error,
           cs.error,
-          'Daemon could not process this invite — check connection и retry',
+          'Daemon could not process this invite — check connection and retry',
         );
     }
   }

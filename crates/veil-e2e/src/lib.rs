@@ -68,14 +68,14 @@ pub enum E2eError {
     MetaPlaintextTooShort(usize),
 
     /// ML-KEM key file exists but cannot be decoded. Refusing to silently
-    /// regenerate — that would destroy the existing DK seed и orphan every
-    /// E2E mailbox payload encrypted к the old EK. Operator must either
+    /// regenerate — that would destroy the existing DK seed and orphan every
+    /// E2E mailbox payload encrypted to the old EK. Operator must either
     /// supply the correct passphrase, restore the file from backup, or
-    /// explicitly delete `mlkem.key` к force fresh generation.
+    /// explicitly delete `mlkem.key` to force fresh generation.
     #[error(
         "ML-KEM key file at {path} exists but could not be decoded \
          (wrong passphrase, corrupt file, or unknown PEM format). Refusing \
-         to regenerate; delete the file explicitly если you intended а fresh keypair."
+         to regenerate; delete the file explicitly if you intended a fresh keypair."
     )]
     MlKemKeyUnreadable { path: std::path::PathBuf },
 
@@ -277,7 +277,7 @@ pub fn meta_encrypt(
 /// `envelope_payload` must start with [`veil_proto::META_E2E_MARKER`] (`0xE3`).
 /// A missing marker is rejected with [`E2eError::Proto`] — previously the
 /// loader silently accepted marker-less payloads via `unwrap_or`, weakening
-/// the format contract и making it harder к catch protocol bugs where
+/// the format contract and making it harder to catch protocol bugs where
 /// callers forgot the prepend.
 ///
 /// Returns `(sender_node_id, src_app_id, app_id, endpoint_id, application_payload)`.
@@ -417,8 +417,8 @@ fn decode_pem(pem: &str) -> Option<Vec<u8>> {
 //
 // **v1 (legacy, 92 bytes blob)** — fixed BLAKE3-derived salt, Argon2id
 // `m_cost=256 KiB, t=3, p=1`. Same passphrase across nodes → same
-// derived key → rainbow-table risk и cross-node compromise scope. Kept
-// для read-back compat only; **never written** by post-audit builds.
+// derived key → rainbow-table risk and cross-node compromise scope. Kept
+// for read-back compat only; **never written** by post-audit builds.
 //
 // ```text
 // [0..12]  nonce
@@ -427,7 +427,7 @@ fn decode_pem(pem: &str) -> Option<Vec<u8>> {
 //
 // **v2 (current, 113 bytes blob)** — random 16-byte salt per file +
 // in-band Argon2id params (so future tuning doesn't break old files).
-// Defaults: `m=32 MiB, t=3, p=1` — ~50-100 ms на typical hardware,
+// Defaults: `m=32 MiB, t=3, p=1` — ~50-100 ms on typical hardware,
 // rainbow-table-resistant, per-file unique derivation.
 //
 // ```text
@@ -445,8 +445,8 @@ fn decode_pem(pem: &str) -> Option<Vec<u8>> {
 /// v2 encrypted-PEM version byte.
 const ENC_PEM_V2: u8 = 0x02;
 
-/// v2 default Argon2id memory cost in KiB. 32 MiB strikes а balance between
-/// startup time (~50-100 ms typical) и offline-attack resistance.
+/// v2 default Argon2id memory cost in KiB. 32 MiB strikes a balance between
+/// startup time (~50-100 ms typical) and offline-attack resistance.
 const ENC_PEM_V2_M_COST_KIB: u32 = 32 * 1024;
 const ENC_PEM_V2_T_COST: u32 = 3;
 const ENC_PEM_V2_P_COST: u32 = 1;
@@ -457,20 +457,20 @@ const ENC_PEM_V1_M_COST_KIB: u32 = 256;
 const ENC_PEM_V1_T_COST: u32 = 3;
 const ENC_PEM_V1_P_COST: u32 = 1;
 
-/// Derive a 32-byte AEAD key from а passphrase using Argon2id с
-/// caller-supplied salt и cost params.
+/// Derive a 32-byte AEAD key from a passphrase using Argon2id with
+/// caller-supplied salt and cost params.
 ///
-/// # Memory hygiene (Этап 6 slice 6f)
+/// # Memory hygiene (Phase 6 slice 6f)
 ///
 /// Returns [`SensitiveBytesN<32>`] — pages pinned via `mlock(2)` when
-/// `RLIMIT_MEMLOCK` permits, falls back к а zeroize-on-drop
-/// `Zeroizing<Vec<u8>>` когда the budget is exhausted (same protection
-/// posture as the pre-Этап-6 `Zeroizing<[u8; 32]>`).  The mlocked path
-/// closes the swap-к-disk vector for the Argon2-derived ML-KEM DK-seed
-/// encryption key — these keys ара the **on-disk root-of-trust** для
-/// the `mlkem.key` file, и if they leak via swap, anyone с read access
-/// к the host's `mlkem.key` AND the swap partition can decrypt the
-/// node's persistent ML-KEM decapsulation seed.  Parallel к slice 6d's
+/// `RLIMIT_MEMLOCK` permits, falls back to a zeroize-on-drop
+/// `Zeroizing<Vec<u8>>` when the budget is exhausted (same protection
+/// posture as the pre-Phase-6 `Zeroizing<[u8; 32]>`).  The mlocked path
+/// closes the swap-to-disk vector for the Argon2-derived ML-KEM DK-seed
+/// encryption key — these keys are the **on-disk root-of-trust** for
+/// the `mlkem.key` file, and if they leak via swap, anyone with read access
+/// to the host's `mlkem.key` AND the swap partition can decrypt the
+/// node's persistent ML-KEM decapsulation seed.  Parallel to slice 6d's
 /// `veil-identity::master_file::derive_key`.
 fn derive_key_from_passphrase(
     passphrase: &str,
@@ -502,7 +502,7 @@ fn derive_key_v1(passphrase: &str) -> veil_util::sensitive_bytes::SensitiveBytes
     )
 }
 
-/// Encrypt DK seed → v2 PEM с random salt и embedded KDF params.
+/// Encrypt DK seed → v2 PEM with random salt and embedded KDF params.
 fn encode_pem_encrypted(seed: &[u8; DK_SEED_BYTES], passphrase: &str) -> String {
     use chacha20poly1305::{
         ChaCha20Poly1305, Key, Nonce,
@@ -545,7 +545,7 @@ fn encode_pem_encrypted(seed: &[u8; DK_SEED_BYTES], passphrase: &str) -> String 
 
 /// Decrypt DK seed from encrypted PEM. Auto-detects v1 / v2 by first
 /// decoded byte. v1 returns the seed but the caller (loader) re-writes
-/// in v2 на success → see auto-upgrade path в
+/// in v2 on success → see auto-upgrade path in
 /// `load_or_generate_mlkem_key_encrypted`.
 fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
     use chacha20poly1305::{
@@ -586,18 +586,18 @@ fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
         let m_cost = u32::from_be_bytes(blob[17..21].try_into().ok()?);
         let t_cost = u32::from_be_bytes(blob[21..25].try_into().ok()?);
         let p_cost = u32::from_be_bytes(blob[25..29].try_into().ok()?);
-        // Sanity-clamp KDF params к prevent а malicious file forcing
+        // Sanity-clamp KDF params to prevent a malicious file forcing
         // multi-GiB Argon2 allocation. 1 GiB max memory, 1000 iter max
         // — generous upper bounds beyond which the caller's CPU/RAM
         // would be the constraint anyway.
         //
-        // Audit batch 2026-05-25 phase L: individual-cap'и hadn't
+        // Audit batch 2026-05-25 phase L: individual caps hadn't
         // covered the **product** of m_cost × t_cost.  Worst case at
         // max individual caps: m=1 GiB × t=1000 ≈ 50–100 s of KDF
-        // burn on commodity hardware — а 100× hot-path startup stall
+        // burn on commodity hardware — a 100× hot-path startup stall
         // if attacker placeholders the key file.  Add product cap at
-        // 256 GiB·iter (sufficient для legitimate Argon2 schedules:
-        // OWASP recommends m=64 MiB t=3 = 192 MiB·iter, или
+        // 256 GiB·iter (sufficient for legitimate Argon2 schedules:
+        // OWASP recommends m=64 MiB t=3 = 192 MiB·iter, or
         // m=256 MiB t=2 = 512 MiB·iter, both well within budget).
         if m_cost > 1_048_576 || t_cost > 1000 || p_cost > 64 || p_cost == 0 {
             return None;
@@ -626,7 +626,7 @@ fn decode_pem_encrypted(pem: &str, passphrase: &str) -> Option<Vec<u8>> {
 }
 
 /// `true` if the encrypted PEM uses v2 wire format. Used by the loader
-/// to decide whether к re-write а freshly-decoded file in the new format.
+/// to decide whether to re-write a freshly-decoded file in the new format.
 fn is_v2_encrypted_pem(pem: &str) -> bool {
     let mut inside = false;
     let mut b64 = String::new();
@@ -653,9 +653,9 @@ fn is_v2_encrypted_pem(pem: &str) -> bool {
 /// Load ML-KEM key with optional passphrase encryption.
 ///
 /// Semantics (fail-closed):
-/// * If the file **does not exist**, a fresh keypair is generated и
-///   atomically written к `path` с mode `0o600` (Unix). The freshly
-///   generated key и encapsulation key are returned.
+/// * If the file **does not exist**, a fresh keypair is generated and
+///   atomically written to `path` with mode `0o600` (Unix). The freshly
+///   generated key and encapsulation key are returned.
 /// * If the file **exists**:
 ///   - With `passphrase = Some(...)`: try encrypted PEM, then plaintext PEM
 ///     (auto-upgrade — re-encrypt plaintext under passphrase).
@@ -663,9 +663,9 @@ fn is_v2_encrypted_pem(pem: &str) -> bool {
 ///   - If decoding fails in any path (wrong passphrase, corrupt file,
 ///     unknown PEM format), return [`E2eError::MlKemKeyUnreadable`]
 ///     **without overwriting the file**. The previous loader silently
-///     generated а fresh keypair и overwrote the file, destroying the
-///     existing DK seed и orphaning every E2E mailbox payload encrypted
-///     к the previous EK. That fall-through is a data-loss bug; this
+///     generated a fresh keypair and overwrote the file, destroying the
+///     existing DK seed and orphaning every E2E mailbox payload encrypted
+///     to the previous EK. That fall-through is a data-loss bug; this
 ///     loader fails closed instead.
 ///
 /// I/O errors during read or atomic write are returned as
@@ -675,13 +675,13 @@ pub fn load_or_generate_mlkem_key_encrypted(
     path: &Path,
     passphrase: Option<&str>,
 ) -> Result<([u8; EK_BYTES], [u8; DK_SEED_BYTES]), E2eError> {
-    // Read existing file. Distinguish "not found" (→ generate) от other
-    // I/O errors (→ propagate) к avoid silent regeneration on transient
-    // failures (e.g. EACCES from а too-restrictive parent dir, EIO from
-    // а failing disk).
+    // Read existing file. Distinguish "not found" (→ generate) from other
+    // I/O errors (→ propagate) to avoid silent regeneration on transient
+    // failures (e.g. EACCES from a too-restrictive parent dir, EIO from
+    // a failing disk).
     match std::fs::read_to_string(path) {
         Ok(pem) => {
-            // Try encrypted PEM first if а passphrase is set.
+            // Try encrypted PEM first if a passphrase is set.
             if let Some(pass) = passphrase
                 && pem.contains(PEM_ENC_HEADER)
             {
@@ -692,11 +692,11 @@ pub fn load_or_generate_mlkem_key_encrypted(
                     let ek_arr = dk.encapsulation_key().to_bytes();
                     let ek: [u8; EK_BYTES] = ek_arr.as_slice().try_into().expect("EK size");
 
-                    // v1 → v2 auto-upgrade. v1 used а fixed BLAKE3-derived salt и
+                    // v1 → v2 auto-upgrade. v1 used a fixed BLAKE3-derived salt and
                     // 256 KiB Argon2id — rainbow-table risk + cross-file
-                    // attack-amortisation. v2 uses random per-file salt и
-                    // 32 MiB Argon2id с embedded params. Re-write atomically;
-                    // failure is non-fatal (key still в memory, retry next start).
+                    // attack-amortisation. v2 uses random per-file salt and
+                    // 32 MiB Argon2id with embedded params. Re-write atomically;
+                    // failure is non-fatal (key still in memory, retry next start).
                     if !is_v2_encrypted_pem(&pem) {
                         let seed_arr: [u8; DK_SEED_BYTES] =
                             seed.clone().try_into().expect("DK_SEED_BYTES");
@@ -706,9 +706,9 @@ pub fn load_or_generate_mlkem_key_encrypted(
 
                     return Ok((ek, seed.try_into().expect("DK_SEED_BYTES")));
                 }
-                // Encrypted header found но decode failed → wrong passphrase
-                // или corrupt blob. DO NOT fall through к plaintext attempt
-                // или к regeneration — operator must resolve.
+                // Encrypted header found but decode failed → wrong passphrase
+                // or corrupt blob. DO NOT fall through to plaintext attempt
+                // or to regeneration — operator must resolve.
                 return Err(E2eError::MlKemKeyUnreadable {
                     path: path.to_path_buf(),
                 });
@@ -722,11 +722,11 @@ pub fn load_or_generate_mlkem_key_encrypted(
                 let ek_arr = dk.encapsulation_key().to_bytes();
                 let ek: [u8; EK_BYTES] = ek_arr.as_slice().try_into().expect("EK size");
 
-                // Auto-upgrade: if passphrase is set и file is plaintext →
-                // re-encrypt в-place via atomic_write. Failure к re-encrypt
+                // Auto-upgrade: if passphrase is set and file is plaintext →
+                // re-encrypt in-place via atomic_write. Failure to re-encrypt
                 // is non-fatal: we still have the key in memory; the
                 // upgrade can be retried at next startup. Logged via Result
-                // discard since this function doesn't have а logger handle.
+                // discard since this function doesn't have a logger handle.
                 if let Some(pass) = passphrase {
                     let seed_arr: [u8; DK_SEED_BYTES] =
                         seed.clone().try_into().expect("DK_SEED_BYTES");
@@ -743,7 +743,7 @@ pub fn load_or_generate_mlkem_key_encrypted(
             })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Fresh install — generate и atomically write.
+            // Fresh install — generate and atomically write.
             let (ek, dk_seed) = generate_keypair();
             let pem = if let Some(pass) = passphrase {
                 encode_pem_encrypted(&dk_seed, pass)
@@ -921,7 +921,7 @@ mod tests {
     // ── loader fail-closed tests ──────────────────────────────────────────
     //
     // Verifies the post-fix contract: existing-but-unreadable files MUST NOT
-    // be silently regenerated. The previous loader had а fall-through that
+    // be silently regenerated. The previous loader had a fall-through that
     // destroyed the existing DK seed on wrong-passphrase or corrupt-file.
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
@@ -1007,7 +1007,7 @@ mod tests {
         let (ek1, _dk1) = load_or_generate_mlkem_key_encrypted(&path, None).unwrap();
         let plain_pem = std::fs::read_to_string(&path).unwrap();
         assert!(plain_pem.contains(PEM_HEADER));
-        // Now re-load with passphrase — should auto-upgrade в-place.
+        // Now re-load with passphrase — should auto-upgrade in-place.
         let (ek2, _dk2) = load_or_generate_mlkem_key_encrypted(&path, Some("upgraded")).unwrap();
         assert_eq!(ek1, ek2, "key must be preserved across auto-upgrade");
         let upgraded_pem = std::fs::read_to_string(&path).unwrap();
@@ -1017,9 +1017,9 @@ mod tests {
 
     // ── v2 encrypted PEM format tests ─────────────────────────────────────
 
-    /// Helper: encode а DK seed in legacy v1 format (fixed BLAKE3 salt,
+    /// Helper: encode a DK seed in legacy v1 format (fixed BLAKE3 salt,
     /// 256 KiB Argon2id). Used to verify that v1 files written by
-    /// pre-audit binaries still decode и auto-upgrade.
+    /// pre-audit binaries still decode and auto-upgrade.
     fn encode_pem_encrypted_v1(seed: &[u8; DK_SEED_BYTES], passphrase: &str) -> String {
         use chacha20poly1305::{
             ChaCha20Poly1305, Key, Nonce,
@@ -1042,12 +1042,12 @@ mod tests {
     #[test]
     fn v2_roundtrip_uses_random_salt() {
         let (_, dk_seed) = generate_keypair();
-        // Encrypt the same seed twice с the same passphrase. Random salt +
+        // Encrypt the same seed twice with the same passphrase. Random salt +
         // random nonce mean the on-wire blobs MUST differ.
         let pem_a = encode_pem_encrypted(&dk_seed, "pass-a");
         let pem_b = encode_pem_encrypted(&dk_seed, "pass-a");
         assert_ne!(pem_a, pem_b, "v2 must use random salt per encrypt");
-        // Both must decrypt back к the original seed.
+        // Both must decrypt back to the original seed.
         let dec_a = decode_pem_encrypted(&pem_a, "pass-a").unwrap();
         let dec_b = decode_pem_encrypted(&pem_b, "pass-a").unwrap();
         assert_eq!(dec_a.as_slice(), dk_seed.as_slice());
@@ -1065,12 +1065,12 @@ mod tests {
     fn v1_backcompat_decodes() {
         let (_, dk_seed) = generate_keypair();
         let v1_pem = encode_pem_encrypted_v1(&dk_seed, "legacy-pass");
-        // is_v2 should return false для v1 blob.
+        // is_v2 should return false for v1 blob.
         assert!(
             !is_v2_encrypted_pem(&v1_pem),
             "v1 must not be detected as v2"
         );
-        // Decode should still work через the v1 fallback path.
+        // Decode should still work through the v1 fallback path.
         let decoded = decode_pem_encrypted(&v1_pem, "legacy-pass").unwrap();
         assert_eq!(decoded.as_slice(), dk_seed.as_slice());
     }
@@ -1086,7 +1086,7 @@ mod tests {
     fn loader_auto_upgrades_v1_to_v2() {
         let path = tmp_path("v1_v2_upgrade");
         let _ = std::fs::remove_file(&path);
-        // Write а v1-format encrypted file directly.
+        // Write a v1-format encrypted file directly.
         let (_, dk_seed) = generate_keypair();
         let v1_pem = encode_pem_encrypted_v1(&dk_seed, "shared-pass");
         std::fs::write(&path, v1_pem.as_bytes()).unwrap();
@@ -1094,19 +1094,19 @@ mod tests {
         let read_back = std::fs::read_to_string(&path).unwrap();
         assert!(
             !is_v2_encrypted_pem(&read_back),
-            "test fixture must start как v1"
+            "test fixture must start as v1"
         );
-        // Now load с the correct passphrase — should decrypt и auto-upgrade.
+        // Now load with the correct passphrase — should decrypt and auto-upgrade.
         let (_, dk_loaded) =
             load_or_generate_mlkem_key_encrypted(&path, Some("shared-pass")).unwrap();
         assert_eq!(dk_loaded, dk_seed, "key must round-trip across upgrade");
-        // File должно теперь быть в v2 format.
+        // File must now be in v2 format.
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(
             is_v2_encrypted_pem(&after),
             "loader must auto-upgrade v1 → v2"
         );
-        // Re-load to confirm v2 path также работает.
+        // Re-load to confirm v2 path also works.
         let (_, dk_reloaded) =
             load_or_generate_mlkem_key_encrypted(&path, Some("shared-pass")).unwrap();
         assert_eq!(dk_reloaded, dk_seed);
@@ -1115,7 +1115,7 @@ mod tests {
 
     #[test]
     fn v2_rejects_unreasonable_kdf_params() {
-        // Craft а v2 blob с m_cost = 2 GiB (above 1 GiB sanity clamp).
+        // Craft a v2 blob with m_cost = 2 GiB (above 1 GiB sanity clamp).
         let mut blob = Vec::new();
         blob.push(ENC_PEM_V2);
         blob.extend_from_slice(&[0u8; 16]); // salt
@@ -1136,7 +1136,7 @@ mod tests {
     fn v2_wire_format_size() {
         let (_, dk_seed) = generate_keypair();
         let pem = encode_pem_encrypted(&dk_seed, "test-pass");
-        // Find the base64 line(s) and decode к count raw bytes.
+        // Find the base64 line(s) and decode to count raw bytes.
         let mut inside = false;
         let mut b64 = String::new();
         for line in pem.lines() {
@@ -1165,7 +1165,7 @@ mod tests {
         // Hard-reject payloads without leading META_E2E_MARKER.
         let (ek, dk) = generate_keypair();
         let dst_id = [0xBBu8; 32];
-        // Encode a valid E2E envelope без the marker prefix.
+        // Encode a valid E2E envelope without the marker prefix.
         let env =
             meta_encrypt(&ek, &[1u8; 32], &[2u8; 32], &[3u8; 32], 0, &dst_id, b"data").unwrap();
         // Strip the marker (first byte) — should now fail decode.
@@ -1182,10 +1182,10 @@ mod tests {
         }
     }
 
-    // ── Этап 6 slice 6f: derive_key_from_passphrase migration ─────────
+    // ── Phase 6 slice 6f: derive_key_from_passphrase migration ─────────
 
-    /// AEAD round-trip works identically after migrating от
-    /// `Zeroizing<[u8; 32]>` к `SensitiveBytesN<32>` storage — proves
+    /// AEAD round-trip works identically after migrating from
+    /// `Zeroizing<[u8; 32]>` to `SensitiveBytesN<32>` storage — proves
     /// the Argon2-derived key flows correctly through the new
     /// `SensitiveBytesN::as_array()` path.
     #[test]
@@ -1202,14 +1202,14 @@ mod tests {
         );
     }
 
-    /// `derive_key_v1` legacy path also round-trips через the new
-    /// storage type — guards against accidental regression в the
+    /// `derive_key_v1` legacy path also round-trips through the new
+    /// storage type — guards against accidental regression in the
     /// v1-compatibility path which uses different cost params.
     #[test]
     fn etap6_slice6f_v1_legacy_path_still_decrypts() {
-        // We can't easily synthesize а v1 PEM here без duplicating
+        // We can't easily synthesize a v1 PEM here without duplicating
         // the encoder logic, so verify the SensitiveBytesN-backed
-        // `derive_key_v1` produces deterministic bytes via а
+        // `derive_key_v1` produces deterministic bytes via a
         // double-derive equality check (instead of byte-comparison
         // which the type doesn't expose directly).
         let passphrase = "etap6-slice6f-legacy";

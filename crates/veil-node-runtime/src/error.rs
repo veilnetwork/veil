@@ -23,12 +23,12 @@ pub enum NodeError {
 pub type Result<T> = std::result::Result<T, NodeError>;
 
 // Phase 2 session 2 prep: session/handshake.rs defines its own narrow
-// `HandshakeError` к avoid а dep on veilcore::node::error (which
-// references `veil_transport::TransportError` и thus cannot move к
-// the upcoming `veil-session` sibling crate без cycle).  This
+// `HandshakeError` to avoid a dep on veilcore::node::error (which
+// references `veil_transport::TransportError` and thus cannot move to
+// the upcoming `veil-session` sibling crate without cycle).  This
 // From-impl preserves the legacy ergonomic chain — runtime callers
-// of `perform_ovl1_handshake` continue к use `?` against а
-// `Result<T, NodeError>` signature без surface-level changes.
+// of `perform_ovl1_handshake` continue to use `?` against a
+// `Result<T, NodeError>` signature without surface-level changes.
 impl From<veil_session::handshake::HandshakeError> for NodeError {
     fn from(e: veil_session::handshake::HandshakeError) -> Self {
         NodeError::Handshake(e.0)

@@ -3,10 +3,10 @@
 // Plumbs:
 //   * `WidgetsBindingObserver` → `VeilClient.setBackgroundMode` so
 //     the daemon scales keepalive cadence + suppresses background
-//     maintenance when the host moves к lowPower.
+//     maintenance when the host moves to lowPower.
 //   * `connectivity_plus` stream → `VeilClient.notifyNetworkChanged`
-//     so the daemon eager-rebuilds sessions on а Wi-Fi → Cellular flip
-//     (instead of waiting for а keepalive timeout to notice dead sockets).
+//     so the daemon eager-rebuilds sessions on a Wi-Fi → Cellular flip
+//     (instead of waiting for a keepalive timeout to notice dead sockets).
 //
 // Usage:
 //
@@ -34,10 +34,10 @@ import 'client.dart';
 import 'types.dart';
 
 /// Lifecycle + network-state observer that translates platform events
-/// into FFI calls on а bound [VeilClient].
+/// into FFI calls on a bound [VeilClient].
 ///
-/// Safe к use even if some `attach*` calls are skipped — each method
-/// is independent.  All registrations are reversible через [dispose].
+/// Safe to use even if some `attach*` calls are skipped — each method
+/// is independent.  All registrations are reversible through [dispose].
 class VeilLifecycleBinding with WidgetsBindingObserver {
   VeilLifecycleBinding(this._client);
 
@@ -48,17 +48,17 @@ class VeilLifecycleBinding with WidgetsBindingObserver {
 
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
-  /// Last tier we pushed к the daemon — debounces redundant calls when
+  /// Last tier we pushed to the daemon — debounces redundant calls when
   /// Flutter delivers identical `didChangeAppLifecycleState` events
   /// (happens on iOS during transitions).
   MobileBackgroundMode? _lastPushedTier;
 
-  /// Last network kind we pushed к the daemon — same debouncing
-  /// rationale; connectivity_plus emits duplicate events во время
+  /// Last network kind we pushed to the daemon — same debouncing
+  /// rationale; connectivity_plus emits duplicate events during
   /// rapid switches.
   NetworkKind? _lastPushedNet;
 
-  /// Register as а [WidgetsBindingObserver] so app-lifecycle changes
+  /// Register as a [WidgetsBindingObserver] so app-lifecycle changes
   /// drive `setBackgroundMode`.  Mapping:
   ///   * [AppLifecycleState.resumed] → [MobileBackgroundMode.foreground]
   ///   * [AppLifecycleState.inactive] → [MobileBackgroundMode.active]
@@ -74,7 +74,7 @@ class VeilLifecycleBinding with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _appLifecycleAttached = true;
     // Push current state synchronously.  On cold start that's typically
-    // `resumed`, но this also handles "binding created mid-paused"
+    // `resumed`, but this also handles "binding created mid-paused"
     // (background-isolate-spawned-while-app-in-background) cases.
     final initial = WidgetsBinding.instance.lifecycleState;
     if (initial != null) {
@@ -83,8 +83,8 @@ class VeilLifecycleBinding with WidgetsBindingObserver {
     }
   }
 
-  /// Subscribe к `connectivity_plus` и translate each emitted
-  /// connectivity-result list к а [NetworkKind] sent to the daemon
+  /// Subscribe to `connectivity_plus` and translate each emitted
+  /// connectivity-result list to a [NetworkKind] sent to the daemon
   /// via [VeilClient.notifyNetworkChanged].
   ///
   /// Mapping favours the "richest" simultaneous attachment:
@@ -95,7 +95,7 @@ class VeilLifecycleBinding with WidgetsBindingObserver {
   ///   * vpn / bluetooth / other → [NetworkKind.unknown]
   ///
   /// Wi-Fi + cellular simultaneously (rare, e.g. tethering) → wifi
-  /// wins (cheapest plan для the daemon's rate-control heuristics).
+  /// wins (cheapest plan for the daemon's rate-control heuristics).
   ///
   /// Pushes the current connectivity immediately by querying
   /// `Connectivity.checkConnectivity()`.
@@ -104,16 +104,16 @@ class VeilLifecycleBinding with WidgetsBindingObserver {
     if (_connectivitySub != null) return;
     final conn = Connectivity();
     // Push current state before subscribing — keeps daemon in sync
-    // на cold start where no event has fired yet.
+    // on cold start where no event has fired yet.
     try {
       final current = await conn.checkConnectivity();
       _maybePushNet(_resultsToNetworkKind(current));
     } catch (_) {
       // Platform-side init can fail on rare Android OEMs (locked-down
       // perms).  Swallow — the stream subscription below will catch up
-      // как soon as the OS delivers а real event.
+      // as soon as the OS delivers a real event.
     }
-    if (_disposed) return; // raced а dispose() while awaiting init
+    if (_disposed) return; // raced a dispose() while awaiting init
     _connectivitySub = conn.onConnectivityChanged.listen(
       (results) => _maybePushNet(_resultsToNetworkKind(results)),
       onError: (_) {
@@ -147,8 +147,8 @@ class VeilLifecycleBinding with WidgetsBindingObserver {
 
   // ── Internal helpers ──────────────────────────────────────────────
 
-  /// Map Flutter lifecycle states к the daemon's tier byte.
-  /// Returns null для states we don't translate ([detached] — app
+  /// Map Flutter lifecycle states to the daemon's tier byte.
+  /// Returns null for states we don't translate ([detached] — app
   /// is being torn down, no point notifying).
   static MobileBackgroundMode? _lifecycleStateToTier(AppLifecycleState s) {
     switch (s) {
@@ -164,8 +164,8 @@ class VeilLifecycleBinding with WidgetsBindingObserver {
     }
   }
 
-  /// Map а list of ConnectivityResult (newer connectivity_plus API
-  /// returns multiple simultaneously-active types) к а single
+  /// Map a list of ConnectivityResult (newer connectivity_plus API
+  /// returns multiple simultaneously-active types) to a single
   /// [NetworkKind] using the priority hierarchy documented above.
   static NetworkKind _resultsToNetworkKind(List<ConnectivityResult> rs) {
     if (rs.isEmpty || rs.every((r) => r == ConnectivityResult.none)) {
@@ -174,18 +174,18 @@ class VeilLifecycleBinding with WidgetsBindingObserver {
     if (rs.contains(ConnectivityResult.wifi)) return NetworkKind.wifi;
     if (rs.contains(ConnectivityResult.ethernet)) return NetworkKind.ethernet;
     if (rs.contains(ConnectivityResult.mobile)) return NetworkKind.cellular;
-    // vpn / bluetooth / other — daemon doesn't have а specific tier,
-    // surface as unknown so it falls к its default keepalive/probe path.
+    // vpn / bluetooth / other — daemon doesn't have a specific tier,
+    // surface as unknown so it falls to its default keepalive/probe path.
     return NetworkKind.unknown;
   }
 
   void _maybePushTier(MobileBackgroundMode tier) {
     if (_lastPushedTier == tier) return;
     _lastPushedTier = tier;
-    // Fire-and-forget; setBackgroundMode is а one-shot daemon call.
+    // Fire-and-forget; setBackgroundMode is an one-shot daemon call.
     _client.setBackgroundMode(tier).catchError((_) {
       // Daemon might be closed by now — already-closed exception is
-      // fine, anything else is logged по the FFI layer.  No-op here.
+      // fine, anything else is logged by the FFI layer.  No-op here.
     });
   }
 

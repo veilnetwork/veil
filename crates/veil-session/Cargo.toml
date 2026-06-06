@@ -2,7 +2,7 @@
 name = "veil-session"
 version = "0.1.0"
 edition = "2024"
-description = "OVL1 session state machine — post-handshake frame loop, handoff, hot-standby, PoW-rendezvous, tx-registry. Phase 2 of veilcore extraction (см. docs/en/PLAN_VEILCORE_EXTRACTION.md)."
+description = "OVL1 session state machine — post-handshake frame loop, handoff, hot-standby, PoW-rendezvous, tx-registry. Phase 2 of veilcore extraction (see docs/en/PLAN_VEILCORE_EXTRACTION.md)."
 license = "AGPL-3.0-or-later"
 
 [dependencies]

@@ -1,7 +1,7 @@
 // Pure-Dart unit tests for the push-envelope sealing primitive +
 // status code constants (Epic 489.10).  Native FFI sealing requires
-// the daemon `.so` к be loaded — those tests run в the integration
-// suite на CI с the mobile-build artifacts.
+// the daemon `.so` to be loaded — those tests run in the integration
+// suite on CI with the mobile-build artifacts.
 
 import 'dart:typed_data';
 
@@ -10,16 +10,16 @@ import 'package:veil_flutter/veil_flutter.dart';
 
 void main() {
   group('Push public exports', () {
-    test('VeilPush resolves через root', () {
+    test('VeilPush resolves through root', () {
       const t = VeilPush;
       expect(t.toString(), 'VeilPush');
     });
 
-    test('drainMailbox signature is а Future<List<MailboxBlob>>', () {
-      // Compile-time-only assertion via type inference: assigning к
-      // `Future<List<MailboxBlob>> Function(...)` would fail на signature
+    test('drainMailbox signature is a Future<List<MailboxBlob>>', () {
+      // Compile-time-only assertion via type inference: assigning to
+      // `Future<List<MailboxBlob>> Function(...)` would fail on signature
       // drift.  Body is unreachable (test verifies the type, not runtime
-      // — а real drain needs an open daemon).
+      // — a real drain needs an open daemon).
       const Future<List<MailboxBlob>> Function({
         required String socketPath,
         required Uint8List receiverId,
@@ -37,7 +37,7 @@ void main() {
       expect(WakePayloadVerdict.fromWire(3), WakePayloadVerdict.malformedLength);
     });
 
-    test('fromWire maps unknown bytes к unknown', () {
+    test('fromWire maps unknown bytes to unknown', () {
       expect(WakePayloadVerdict.fromWire(99), WakePayloadVerdict.unknown);
       expect(WakePayloadVerdict.fromWire(255), WakePayloadVerdict.unknown);
       expect(WakePayloadVerdict.fromWire(-1), WakePayloadVerdict.unknown);
@@ -53,7 +53,7 @@ void main() {
 
   group('Wake-HMAC public surface (slice 4.3.3)', () {
     test('generateWakeHmacKey signature returns Uint8List', () {
-      // Compile-time-only assertion — а real call needs the FFI lib loaded.
+      // Compile-time-only assertion — a real call needs the FFI lib loaded.
       const Uint8List Function() genFn = VeilPush.generateWakeHmacKey;
       expect(genFn, isNotNull);
     });
@@ -91,7 +91,7 @@ void main() {
       expect(wakeFn, isNotNull);
     });
 
-    test('storeWakeHmacKey signature accepts а raw key', () {
+    test('storeWakeHmacKey signature accepts a raw key', () {
       const Future<void> Function(Uint8List) storeFn =
           VeilPush.storeWakeHmacKey;
       expect(storeFn, isNotNull);

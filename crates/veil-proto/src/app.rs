@@ -228,7 +228,7 @@ pub struct AppSendPayload {
     pub app_id: [u8; 32],
     /// Destination endpoint.
     pub endpoint_id: u32,
-    /// Datagram payload. d: pool-backed для chat_node 60 KB-frame
+    /// Datagram payload. d: pool-backed for chat_node 60 KB-frame
     /// load — eliminates the `.to_vec` 60 KB malloc per inbound msg
     /// previously fueling jemalloc dirty-page retention.
     pub data: veil_bufpool::PooledShared,
@@ -285,7 +285,7 @@ impl AppSendPayload {
             });
         }
         // d: pool the data field (eliminates 60 KB malloc per OVL1
-        // AppSend frame на receiver side — symmetric с the IPC inbound
+        // AppSend frame on receiver side — symmetric with the IPC inbound
         // path's AppIpcSendPayload decode).
         let mut pooled = veil_bufpool::global().acquire(data_len);
         pooled.as_vec_mut().extend_from_slice(&buf[72..end]);

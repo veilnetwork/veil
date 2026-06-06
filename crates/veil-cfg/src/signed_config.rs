@@ -1,7 +1,7 @@
-//! Operator-signed config file (Этап 11 slice 11a).
+//! Operator-signed config file (Phase 11 slice 11a).
 //!
-//! Wraps а TOML config string with an Ed25519 / Falcon-512 signature
-//! from the operator's identity keypair.  The signature lives в а
+//! Wraps a TOML config string with an Ed25519 / Falcon-512 signature
+//! from the operator's identity keypair.  The signature lives in a
 //! single comment-line header at the top of the config file:
 //!
 //! ```toml
@@ -11,31 +11,31 @@
 //! ...
 //! ```
 //!
-//! Comment lines are stripped before signing / verifying так that the
-//! signed payload is "the TOML без the signature header", letting
+//! Comment lines are stripped before signing / verifying so that the
+//! signed payload is "the TOML without the signature header", letting
 //! the operator embed the signature back into the same file.  Multi-
-//! line headers ара concatenated если the base64 wraps:
+//! line headers are concatenated if the base64 wraps:
 //!
 //! ```toml
 //! # VEIL_CONFIG_SIGNATURE_V1: chunk1
 //! # VEIL_CONFIG_SIGNATURE_V1: chunk2
 //! ```
 //!
-//! # Why this matters для production hardening
+//! # Why this matters for production hardening
 //!
-//! Pre-signing, the config.toml file is а plain text blob lying на
-//! the operator's disk.  Anyone с filesystem write access (а container
-//! escape, а compromised SSH key, а disgruntled admin) could tamper
-//! the config: redirect bootstrap peers к а malicious bundle issuer,
+//! Pre-signing, the config.toml file is a plain text blob lying on
+//! the operator's disk.  Anyone with filesystem write access (a container
+//! escape, a compromised SSH key, a disgruntled admin) could tamper
+//! the config: redirect bootstrap peers to a malicious bundle issuer,
 //! flip `legacy_allow_unsigned_bootstrap = true`, lower the rendezvous
-//! anycast policy from `signed_only` к `best_effort`, etc.  None of
-//! these changes need а daemon restart — the next `node reload` picks
+//! anycast policy from `signed_only` to `best_effort`, etc.  None of
+//! these changes need a daemon restart — the next `node reload` picks
 //! them up.
 //!
-//! Signed configs let operators **pin the trusted config bytes к а
-//! known issuer key**.  The daemon refuses к load а signed config
-//! that doesn't match the expected pubkey OR has been tampered после
-//! signing.  Unsigned configs continue к load но surface а warn so
+//! Signed configs let operators **pin the trusted config bytes to a
+//! known issuer key**.  The daemon refuses to load a signed config
+//! that doesn't match the expected pubkey OR has been tampered after
+//! signing.  Unsigned configs continue to load but surface a warn so
 //! operators see "your config is not signed; tamper protection is off"
 //! every startup.
 //!
@@ -44,29 +44,29 @@
 //! Defends against:
 //! * **Tampered config bytes**: byte-level tamper invalidates the
 //!   signature; verification fails.
-//! * **Substitute config file**: а wholly attacker-issued config from
-//!   а different keypair fails the issuer-pinning check.
+//! * **Substitute config file**: a wholly attacker-issued config from
+//!   a different keypair fails the issuer-pinning check.
 //! * **Replay of an old signed config**: `issued_at_unix` is covered
-//!   by the signature; loaders can reject configs older than а
+//!   by the signature; loaders can reject configs older than a
 //!   freshness window if needed (not enforced here — caller's choice).
 //!
 //! Does NOT defend against:
 //! * **Operator's identity_sk compromise**: rotate the operator
-//!   keypair, ship а new signed config.
-//! * **Filesystem-level config replacement при daemon startup**: а
+//!   keypair, ship a new signed config.
+//! * **Filesystem-level config replacement at daemon startup**: a
 //!   container escape that replaces config.toml between filesystem
-//!   freeze и daemon read can still bypass verification.  Operators
-//!   concerned about this need а full-system signed-boot stack.
+//!   freeze and daemon read can still bypass verification.  Operators
+//!   concerned about this need a full-system signed-boot stack.
 //! * **Backward compat — unsigned configs still load**: by design.
-//!   Phase 1 enforcement (warn-on-unsigned) gives operators а grace
-//!   window к sign their existing configs; phase 2 (refuse-unsigned)
-//!   is а separate operator-opt-in flip via а `require_signed_config`
-//!   global flag (not shipped в this slice).
+//!   Phase 1 enforcement (warn-on-unsigned) gives operators a grace
+//!   window to sign their existing configs; phase 2 (refuse-unsigned)
+//!   is a separate operator-opt-in flip via a `require_signed_config`
+//!   global flag (not shipped in this slice).
 //!
 //! # Wire format (single envelope, base64-encoded)
 //!
 //! The base64 blob inside `# VEIL_CONFIG_SIGNATURE_V1:` headers
-//! decodes к:
+//! decodes to:
 //!
 //! ```text
 //! [0..2] magic = "SC" (Signed-Config)
@@ -88,8 +88,8 @@
 //! + issued_at_unix.to_string
 //! ```
 //!
-//! Domain prefix prevents cross-protocol signature reuse (а signed
-//! bundle signature can't be repurposed as а signed config signature
+//! Domain prefix prevents cross-protocol signature reuse (a signed
+//! bundle signature can't be repurposed as a signed config signature
 //! — different `veil-signed-...:v1` prefix).
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -103,7 +103,7 @@ pub const SIGNED_CONFIG_HEADER_PREFIX: &str = "# VEIL_CONFIG_SIGNATURE_V1: ";
 
 /// Hard cap on the issuer pubkey base64 length.  Mirrors the
 /// rendezvous-ad cap: Falcon-512 base64 pubkey is ~1196 chars, cap at
-/// 2048 для slack and future PQ algos.
+/// 2048 for slack and future PQ algos.
 pub const MAX_ISSUER_PK_LEN: usize = 2048;
 /// Hard cap on the signature raw bytes length.  Same rationale.
 pub const MAX_SIGNATURE_LEN: usize = 2048;
@@ -111,7 +111,7 @@ pub const MAX_SIGNATURE_LEN: usize = 2048;
 #[derive(Debug, thiserror::Error)]
 pub enum SignedConfigError {
     #[error(
-        "config has no signature header: bytes need а `{SIGNED_CONFIG_HEADER_PREFIX}` line near the top"
+        "config has no signature header: bytes need a `{SIGNED_CONFIG_HEADER_PREFIX}` line near the top"
     )]
     NoSignatureHeader,
     #[error("config signature header is malformed (base64 decode failed): {0}")]
@@ -124,7 +124,7 @@ pub enum SignedConfigError {
     IssuerPkTooLarge { got: usize },
     #[error("signature_len {got} > {MAX_SIGNATURE_LEN} cap")]
     SignatureTooLarge { got: usize },
-    #[error("signature verification failed (wrong key, tampered config, или algorithm mismatch)")]
+    #[error("signature verification failed (wrong key, tampered config, or algorithm mismatch)")]
     Verify,
     #[error("issuer pubkey does not match the pinned expected key")]
     IssuerMismatch,
@@ -135,33 +135,33 @@ pub enum SignedConfigError {
 }
 
 /// Outcome of [`verify_signed_config`].  Holds the canonical unsigned
-/// TOML что caller can pass through к the existing TOML parser, plus
+/// TOML that caller can pass through to the existing TOML parser, plus
 /// the verified envelope metadata.
 #[derive(Debug, Clone)]
 pub struct VerifiedConfig {
     /// The TOML content WITHOUT the signature header lines — pass this
-    /// к the regular `toml::from_str` / `Config` decode path.
+    /// to the regular `toml::from_str` / `Config` decode path.
     pub unsigned_toml: String,
-    /// Issuer pubkey что the signature verified against (base64).
+    /// Issuer pubkey that the signature verified against (base64).
     pub issuer_pk: String,
     /// Signature algorithm that issued the signature.
     pub issuer_algo: SignatureAlgorithm,
-    /// Unix timestamp embedded в the signed envelope.  Caller may
-    /// enforce а freshness window if needed (this module does not).
+    /// Unix timestamp embedded in the signed envelope.  Caller may
+    /// enforce a freshness window if needed (this module does not).
     pub issued_at_unix: u64,
 }
 
-/// Sign а raw TOML config string и return the **same TOML с the
-/// signature header prepended** ready к save back to disk.
+/// Sign a raw TOML config string and return the **same TOML with the
+/// signature header prepended** ready to save back to disk.
 ///
 /// * `content` — the TOML config string to sign.  Should NOT already
-///   contain а signature header (it would be stripped and replaced —
+///   contain a signature header (it would be stripped and replaced —
 ///   caller's choice if that's the intent).
 /// * `issuer_pk` / `issuer_sk` — the operator's keypair (base64-encoded
 ///   public key, base64-encoded private key — same encoding as
 ///   `IdentityConfig`).
 /// * `issuer_algo` — must match the keypair.
-/// * `issued_at_unix` — unix timestamp embedded в the signed envelope.
+/// * `issued_at_unix` — unix timestamp embedded in the signed envelope.
 pub fn sign_config(
     content: &str,
     issuer_pk: &str,
@@ -195,8 +195,8 @@ pub fn sign_config(
     );
     let envelope_b64 = BASE64.encode(&envelope);
 
-    // Step 2: prepend signature header(s) к the canonical config.  We
-    // split the base64 при ~72 chars per line для readability (matches
+    // Step 2: prepend signature header(s) to the canonical config.  We
+    // split the base64 at ~72 chars per line for readability (matches
     // PEM convention; many editors wrap longer lines anyway).
     let header_lines = wrap_envelope_b64(&envelope_b64);
     let mut out = String::with_capacity(content.len() + header_lines.len() * 80);
@@ -207,22 +207,22 @@ pub fn sign_config(
     }
     out.push('\n');
     // Use the already-trimmed canonical so the output's body matches
-    // what we signed byte-for-byte.  Add а trailing newline so editors
-    // что enforce "files end in а newline" don't perturb on save.
+    // what we signed byte-for-byte.  Add a trailing newline so editors
+    // that enforce "files end in a newline" don't perturb on save.
     out.push_str(&canonical);
     out.push('\n');
     Ok(out)
 }
 
-/// Verify а config file's signature и return the unsigned TOML for
+/// Verify a config file's signature and return the unsigned TOML for
 /// the regular Config parser.
 ///
-/// * `content` — the raw TOML file contents (с signature header).
+/// * `content` — the raw TOML file contents (with signature header).
 /// * `expected_issuer_pk` — if `Some(pk)`, the signature MUST be issued
-///   by this pubkey OR verification fails с `IssuerMismatch`.  If `None`,
+///   by this pubkey OR verification fails with `IssuerMismatch`.  If `None`,
 ///   verification succeeds as long as the envelope is internally
-///   consistent (degraded mode — same as `verify_signed_bundle` без
-///   а pin; operators concerned about substitution should pin).
+///   consistent (degraded mode — same as `verify_signed_bundle` without
+///   a pin; operators concerned about substitution should pin).
 pub fn verify_signed_config(
     content: &str,
     expected_issuer_pk: Option<&str>,
@@ -258,8 +258,8 @@ pub fn verify_signed_config(
     })
 }
 
-/// Quick check: does the content carry а signature header at all?
-/// Used by the loader к decide between the verify path и the
+/// Quick check: does the content carry a signature header at all?
+/// Used by the loader to decide between the verify path and the
 /// "unsigned config" warn-and-accept path.
 pub fn has_signature_header(content: &str) -> bool {
     content
@@ -270,15 +270,15 @@ pub fn has_signature_header(content: &str) -> bool {
 
 // ── Internal helpers ──────────────────────────────────────────────
 
-/// Strip lines starting с the signature-header prefix AND normalise
-/// edge whitespace.  The result is the canonical TOML что signing /
+/// Strip lines starting with the signature-header prefix AND normalise
+/// edge whitespace.  The result is the canonical TOML that signing /
 /// verifying operates on byte-for-byte identically regardless of where
 /// the signature header was injected (top of file, blank lines around
-/// it, trailing newline differences между editors).
+/// it, trailing newline differences between editors).
 ///
 /// Trimming edge whitespace is safe because TOML's parsing tolerates
-/// leading и trailing whitespace; the operator's actual config bytes
-/// между `[section]` markers ара preserved verbatim.
+/// leading and trailing whitespace; the operator's actual config bytes
+/// between `[section]` markers are preserved verbatim.
 fn strip_signature_headers(content: &str) -> String {
     let joined = content
         .lines()
@@ -394,9 +394,9 @@ fn decode_envelope(
     Ok((issuer_algo, issued_at_unix, issuer_pk, signature))
 }
 
-/// Extract the concatenated base64 envelope string от signature header
-/// lines в the config content.  Multiple header lines are concatenated
-/// в order encountered (allows base64 wrapping для long signatures).
+/// Extract the concatenated base64 envelope string from signature header
+/// lines in the config content.  Multiple header lines are concatenated
+/// in order encountered (allows base64 wrapping for long signatures).
 fn extract_envelope_b64(content: &str) -> Result<String, SignedConfigError> {
     let mut chunks = Vec::new();
     for line in content.lines().take(50) {
@@ -410,9 +410,9 @@ fn extract_envelope_b64(content: &str) -> Result<String, SignedConfigError> {
     Ok(chunks.concat())
 }
 
-/// Wrap а base64 string at ~72 chars per line для readable storage в
-/// the config file.  Matches PEM convention (76 chars без overflow,
-/// rounded down к а multiple of 4 для base64-friendly chunking).
+/// Wrap a base64 string at ~72 chars per line for readable storage in
+/// the config file.  Matches PEM convention (76 chars without overflow,
+/// rounded down to a multiple of 4 for base64-friendly chunking).
 fn wrap_envelope_b64(b64: &str) -> Vec<String> {
     const LINE_WIDTH: usize = 72;
     b64.as_bytes()
@@ -453,8 +453,8 @@ private_key = "xyz..."
         assert_eq!(verified.issuer_pk, kp.public_key);
         assert_eq!(verified.issued_at_unix, 1_700_000_000);
         assert_eq!(verified.issuer_algo, SignatureAlgorithm::Ed25519);
-        // unsigned_toml round-trips к the original (modulo leading
-        // whitespace что the sign call trims).
+        // unsigned_toml round-trips to the original (modulo leading
+        // whitespace that the sign call trims).
         assert!(verified.unsigned_toml.contains("node_role = \"core\""));
         assert!(!verified.unsigned_toml.contains(SIGNED_CONFIG_HEADER_PREFIX));
     }
@@ -470,7 +470,7 @@ private_key = "xyz..."
             1_700_000_000,
         )
         .unwrap();
-        // Tamper: flip "core" к "edge" в the role field — keeps TOML
+        // Tamper: flip "core" to "edge" in the role field — keeps TOML
         // syntactically valid but invalidates the signature.
         let tampered = signed.replace("node_role = \"core\"", "node_role = \"edge\"");
         let err = verify_signed_config(&tampered, Some(&kp.public_key)).unwrap_err();
@@ -496,8 +496,8 @@ private_key = "xyz..."
     #[test]
     fn verify_accepts_unpinned_mode() {
         // No pin → signature integrity only (degraded mode).  Useful
-        // когда operator distributes the pubkey OOB but does not pin
-        // its base64 form в the binary.
+        // when operator distributes the pubkey OOB but does not pin
+        // its base64 form in the binary.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let signed = sign_config(
             fixture_config(),
@@ -514,7 +514,7 @@ private_key = "xyz..."
     #[test]
     fn verify_rejects_missing_signature_header() {
         // Plain unsigned TOML — verify_signed_config refuses, caller
-        // must fall back к the unsigned-load path.
+        // must fall back to the unsigned-load path.
         let err = verify_signed_config(fixture_config(), None).unwrap_err();
         assert!(matches!(err, SignedConfigError::NoSignatureHeader));
     }
@@ -536,10 +536,10 @@ private_key = "xyz..."
 
     #[test]
     fn cross_protocol_replay_blocked_by_domain_prefix() {
-        // Sign а config с timestamp T.  Try к use that signature on
-        // а CRAFTED message that omits the domain prefix.  Verify must
+        // Sign a config with timestamp T.  Try to use that signature on
+        // a CRAFTED message that omits the domain prefix.  Verify must
         // reject (signature was issued under the prefixed message).
-        // This test verifies the domain prefix is actually included в
+        // This test verifies the domain prefix is actually included in
         // the signed payload.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let signed = sign_config(
@@ -551,8 +551,8 @@ private_key = "xyz..."
         )
         .unwrap();
         // Direct verify using the underlying primitive without the
-        // domain prefix MUST fail.  This catches а refactor что
-        // forgets к include the prefix.
+        // domain prefix MUST fail.  This catches a refactor that
+        // forgets to include the prefix.
         let canonical = strip_signature_headers(&signed);
         let no_prefix_message = format!("{canonical}\n{}", 1_700_000_000u64);
         let envelope_b64 = extract_envelope_b64(&signed).unwrap();
@@ -564,7 +564,7 @@ private_key = "xyz..."
     #[test]
     fn multi_line_envelope_concatenates() {
         // Long Falcon-512 signatures wrap across multiple `#`-prefixed
-        // lines.  Test simulates that by hand-constructing а wrapped
+        // lines.  Test simulates that by hand-constructing a wrapped
         // header.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let signed = sign_config(
@@ -601,7 +601,7 @@ private_key = "xyz..."
 
     #[test]
     fn version_byte_mismatch_surfaces_structured_error() {
-        // Hand-build an envelope с version byte = 99.
+        // Hand-build an envelope with version byte = 99.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let canonical = strip_signature_headers(fixture_config());
         let msg = build_signed_message(&canonical, 1_700_000_000);

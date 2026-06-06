@@ -40,14 +40,14 @@ pub enum RuntimeService {
     PowPendingCleanup,
     GatewayEviction,
     /// Periodic prune of expired `HandoffRegistry` entries. The registry
-    /// auto-prunes on `insert`/`consume` but а quiet session may accumulate
+    /// auto-prunes on `insert`/`consume` but a quiet session may accumulate
     /// stale entries between operations; this background tick guarantees
     /// bounded steady-state memory usage. See `services::spawn_handoff_prune`.
     HandoffPrune,
-    /// Periodic prune of closed-channel entries в `SessionTxRegistry`.
+    /// Periodic prune of closed-channel entries in `SessionTxRegistry`.
     /// Audit batch 2026-05-24 (M4): `prune_closed` previously fired only
     /// on the `&mut self` register/unregister paths.  Pure broadcast
-    /// workloads (mesh-hub nodes без new session churn) could accumulate
+    /// workloads (mesh-hub nodes without new session churn) could accumulate
     /// closed entries indefinitely.  This tick guarantees bounded growth.
     TxRegistryPrune,
 
@@ -79,7 +79,7 @@ pub enum RuntimeService {
     SovereignIdentityRepublish,
 
     // ── P-Net (private veil network) ──────────────────────────────────
-    /// Periodic poll of the local DHT store для PBAN-prefixed records,
+    /// Periodic poll of the local DHT store for PBAN-prefixed records,
     /// verifying and applying them to the local `BanList`. Spawned only
     /// when `[network].mode = "private"` and the membership cert loads
     /// successfully at startup — public-mode nodes get no-op behaviour.

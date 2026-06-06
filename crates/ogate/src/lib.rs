@@ -15,11 +15,11 @@
 pub mod app_cert_gate;
 pub mod app_id;
 pub mod batch;
-// `bridge` pulls в `veilclient::VeilClient`, which is itself
+// `bridge` pulls in `veilclient::VeilClient`, which is itself
 // `#[cfg(unix)]`-gated (Unix-domain-socket IPC).  Skip it on Windows
-// cross-compile к keep the workspace `cargo check --target
-// x86_64-pc-windows-gnu` gate green — the `ogate` binary as а whole
-// is а daemon that requires UDS, so Windows builds are CI-only.
+// cross-compile to keep the workspace `cargo check --target
+// x86_64-pc-windows-gnu` gate green — the `ogate` binary as a whole
+// is a daemon that requires UDS, so Windows builds are CI-only.
 #[cfg(unix)]
 pub mod bridge;
 pub mod cert_message;

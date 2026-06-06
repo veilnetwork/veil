@@ -2,10 +2,10 @@
 //! battery-and-background-mode keepalive-interval recompute logic
 //!
 //!
-//! Was inline в the Timer arm of `SessionRunner::run` (~30 LoC):
+//! Was inline in the Timer arm of `SessionRunner::run` (~30 LoC):
 //! every `BATTERY_CHECK_INTERVAL` (60 s) the runner reads
 //! `local_battery_level` + `current_mobile_background_keepalive_factor`
-//! и if either changed since the previous tick, recomputes the
+//! and if either changed since the previous tick, recomputes the
 //! effective `keepalive_interval` as
 //! `base_keepalive_interval × battery_scale × bg_factor`.
 //!
@@ -17,7 +17,7 @@
 //! The closure-based `maybe_recompute` API lets the caller defer the
 //! actual `local_battery_level` syscall (which on Linux walks
 //! `/sys/class/power_supply`) until the check interval is due AND
-//! makes the math unit-testable без а production-IO dependency.
+//! makes the math unit-testable without a production-IO dependency.
 //!
 //! Sentinel initialisation:
 //! * `last_level = 255` (impossible real reading) → forces recompute
@@ -42,7 +42,7 @@ pub struct BatteryAdjustedKeepalive {
 
 impl BatteryAdjustedKeepalive {
     /// Battery reading currently in use (last sampled value, or sentinel
-    /// 255 if no check has fired yet). Used by the runner для the
+    /// 255 if no check has fired yet). Used by the runner for the
     /// outbound-batch deferral gate (`current_outbound_batch_window`).
     pub fn last_level(&self) -> u8 {
         self.last_level
@@ -50,7 +50,7 @@ impl BatteryAdjustedKeepalive {
 
     /// Instant of the next due battery check. Folded into the runner's
     /// `sleep_until` calculation so the timer wakes exactly when this
-    /// helper has work к do.
+    /// helper has work to do.
     pub fn next_check(&self) -> Instant {
         self.next_check
     }
@@ -79,13 +79,13 @@ impl BatteryAdjustedKeepalive {
     }
 
     /// Wraps the inline pattern:
-    /// 1. Если `now < next_check`, return `None` (no work due).
-    /// 2. Otherwise, advance `next_check` by `check_interval` и call
-    ///    `sample` к get current readings.
-    /// 3. Если readings unchanged AND we're not on the first check
+    /// 1. If `now < next_check`, return `None` (no work due).
+    /// 2. Otherwise, advance `next_check` by `check_interval` and call
+    ///    `sample` to get current readings.
+    /// 3. If readings unchanged AND we're not on the first check
     ///    return `None`.
     /// 4. Otherwise, recompute scaled keepalive interval. Returns
-    ///    `None` если `base_interval` is zero (keepalive disabled —
+    ///    `None` if `base_interval` is zero (keepalive disabled —
     ///    matches the inline guard `if self.base_keepalive_interval
     ///.as_secs > 0`).
     /// 5. Otherwise, return `Some(new_interval)`.
@@ -138,7 +138,7 @@ mod tests {
     async fn first_check_with_low_battery_returns_scaled_low() {
         let mut bk = fixture(Duration::from_secs(30));
         let now = Instant::now();
-        // First call: next_check == Instant::now от ::new, so the
+        // First call: next_check == Instant::now from ::new, so the
         // check fires. level=10 < threshold_low=20 ⇒ scale_low=4×.
         let result = bk.maybe_recompute(now, || (10, 1));
         assert_eq!(
@@ -192,7 +192,7 @@ mod tests {
         let mut bk = fixture(Duration::from_secs(30));
         let now = Instant::now();
         let _ = bk.maybe_recompute(now, || (10, 1));
-        // Second call с `now` LESS than next_check (next_check =
+        // Second call with `now` LESS than next_check (next_check =
         // start + 60s, we're calling at start + 5s).
         let early = now + Duration::from_secs(5);
         // Sample closure must not be called when check isn't due.

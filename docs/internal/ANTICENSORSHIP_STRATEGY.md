@@ -1,6 +1,6 @@
 # Anti-censorship strategy
 
-> Threat-modelled against **VAS Experts СКАТ DPI** (Russian carrier-grade
+> Threat-modelled against **VAS Experts SKAT DPI** (Russian carrier-grade
 > DPI deployed by major ISPs).  Reference: [VAS Experts wiki](https://wiki.vasexperts.ru/),
 > sourced 2026-05-20 from the changelog beta (14.2) + filtration settings +
 > DNS substitution + AS priority pages.
@@ -11,9 +11,9 @@
 
 ## Threat baseline
 
-VAS Experts СКАТ is a carrier-grade DPI with the following known
+VAS Experts SKAT is a carrier-grade DPI with the following known
 capabilities, sourced directly from their vendor wiki (links inline in
-each row).  Russia-deployed carriers using СКАТ include Rostelecom, MTS,
+each row).  Russia-deployed carriers using SKAT include Rostelecom, MTS,
 MegaFon and regional operators; the method set is a representative
 baseline for the "sophisticated nation-state ISP DPI" that veil must
 defend against.
@@ -53,8 +53,8 @@ to `black_list_redirect`; HTTPS gets a connection reset.
 | — | Wildcard domain match support | same |
 
 Critical: **DNS HTTPS record (RFC 9460) parsing** means ECH (Encrypted
-ClientHello) and SVCB indirection don't bypass СКАТ if they go through
-ordinary DNS — СКАТ rewrites the HTTPS record itself.
+ClientHello) and SVCB indirection don't bypass SKAT if they go through
+ordinary DNS — SKAT rewrites the HTTPS record itself.
 
 ### 4. TLS / SNI / cert analysis
 
@@ -160,7 +160,7 @@ Cross-mapping to the 35 methods above.  Status legend: ✅ closed,
 | 6 | block_options=2 (all ports on IP) | Same root cause as #4 |
 | 14 | FakeSNI detection (SNI/IP mismatch) | tls-boring SNI = CDN domain but our IP isn't CDN — heuristic catches it |
 | 15 | FakeTLS detection with validation | Pure `tls://` transport's server-side doesn't behave like a real HTTPS site — DPI active-probes for HTTP responses |
-| 16 | IPSNI rollback to base protocol | When SNI doesn't match an expected pattern for that IP, СКАТ falls back to an IP-classifier |
+| 16 | IPSNI rollback to base protocol | When SNI doesn't match an expected pattern for that IP, SKAT falls back to an IP-classifier |
 | 17 | IP/SNI priority enforcement | IP rule wins over SNI rule — wire-level SNI tricks insufficient |
 | 22-23 | AS drop/pass priority | Hosting AS may be blocked entirely; single-host can't escape AS scope |
 

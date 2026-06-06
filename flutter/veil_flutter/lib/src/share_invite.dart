@@ -1,8 +1,8 @@
 // Bootstrap-invite share UI (Epic 489.7 generator side).
 //
-// Companion к `VeilPairingDialog` (consume side): existing user
+// Companion to `VeilPairingDialog` (consume side): existing user
 // opens this dialog to render their own daemon's bootstrap-invite URI
-// as а QR code (primary path) plus the raw URI string как fallback
+// as a QR code (primary path) plus the raw URI string as fallback
 // for paste-into-messaging-channel.  Optional passphrase encrypts the
 // envelope (`veil:pair?…`) for sharing on public channels.
 //
@@ -22,8 +22,8 @@ import 'package:qr_flutter/qr_flutter.dart';
 import 'client.dart';
 import 'types.dart';
 
-/// Material-3 dialog that fetches а bootstrap-invite URI from the
-/// connected [VeilClient] и displays it as а QR code + copy-button.
+/// Material-3 dialog that fetches a bootstrap-invite URI from the
+/// connected [VeilClient] and displays it as a QR code + copy-button.
 /// Optional passphrase toggle encrypts the envelope.
 class VeilShareInviteDialog extends StatefulWidget {
   const VeilShareInviteDialog({
@@ -32,7 +32,7 @@ class VeilShareInviteDialog extends StatefulWidget {
     super.key,
   });
 
-  /// Bound veil client — used к invoke [VeilClient.createBootstrapInvite].
+  /// Bound veil client — used to invoke [VeilClient.createBootstrapInvite].
   final VeilClient client;
 
   /// Dialog header text.
@@ -52,8 +52,8 @@ class _VeilShareInviteDialogState extends State<VeilShareInviteDialog> {
   @override
   void initState() {
     super.initState();
-    // Auto-fetch the plain (unencrypted) invite на open.  User toggles
-    // encryption + retries if they want к share over а public channel.
+    // Auto-fetch the plain (unencrypted) invite on open.  User toggles
+    // encryption + retries if they want to share over a public channel.
     WidgetsBinding.instance.addPostFrameCallback((_) => _fetch());
   }
 
@@ -92,7 +92,7 @@ class _VeilShareInviteDialogState extends State<VeilShareInviteDialog> {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text('Invite URI copied к clipboard'),
+        content: Text('Invite URI copied to clipboard'),
         duration: Duration(seconds: 2),
       ),
     );
@@ -157,10 +157,10 @@ class _VeilShareInviteDialogState extends State<VeilShareInviteDialog> {
         return _buildOkBox(result.uri);
       case CreateBootstrapInviteStatus.notConfigured:
         return _buildErrorBox(
-          'Identity не configured',
+          'Identity not configured',
           result.detail ??
               'Daemon has no [identity] or no [[listen]] entry.  Run '
-                  '`veil-cli identity standalone` + add а listen address.',
+                  '`veil-cli identity standalone` + add a listen address.',
         );
       case CreateBootstrapInviteStatus.badPassword:
         return _buildErrorBox(
@@ -269,7 +269,7 @@ class _VeilShareInviteDialogState extends State<VeilShareInviteDialog> {
           contentPadding: EdgeInsets.zero,
           title: const Text('Encrypt with passphrase'),
           subtitle: const Text(
-            'Required when sharing over а public channel (Telegram, email…).  '
+            'Required when sharing over a public channel (Telegram, email…).  '
             'Receiver must supply the same passphrase.',
           ),
           value: _useEncryption,
@@ -299,7 +299,7 @@ class _VeilShareInviteDialogState extends State<VeilShareInviteDialog> {
             alignment: Alignment.centerRight,
             child: FilledButton.icon(
               icon: const Icon(Icons.lock),
-              label: const Text('Regenerate с passphrase'),
+              label: const Text('Regenerate with passphrase'),
               onPressed: _busy ||
                       _passwordController.text.trim().isEmpty
                   ? null

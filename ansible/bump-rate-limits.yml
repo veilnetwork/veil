@@ -4,9 +4,9 @@
 # Default (post audit batch 2026-05-22): `rate_limit_fps = 200_000`,
 # `rate_limit_burst = 400_000` → **2 Gbps per peer** baseline at MTU 1500
 # (200K × 1500 = 300 MB/s headroom; 2 Gbps = ~167K fps).  This playbook is
-# kept as а one-off override knob: testnet may want **higher** для
-# multi-Gbps stress (rate_limit_fps = 500_000 ≈ 6 Gbps per peer), или
-# lower когда constraining specific peer-pairs.
+# kept as a one-off override knob: testnet may want **higher** for
+# multi-Gbps stress (rate_limit_fps = 500_000 ≈ 6 Gbps per peer), or
+# lower when constraining specific peer-pairs.
 #
 # Idempotent — re-runs only replace the block if values differ.
 #
@@ -24,7 +24,7 @@
   vars:
     # 200K fps × 1500 B/frame = 300 MB/s = 2.4 Gbps per peer (matches the
     # daemon's built-in default; explicit override keeps the value visible
-    # в node.toml for operator audit).
+    # in node.toml for operator audit).
     rate_limit_fps: 200000
     rate_limit_burst: 400000
 

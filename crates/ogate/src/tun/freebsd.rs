@@ -88,13 +88,13 @@ impl Device {
 
         let async_fd = AsyncFd::new(owned).map_err(TunError::Io)?;
 
-        // Audit batch 2026-05-24: NO Mutex wrap.  `AsyncFd::readable()` и
+        // Audit batch 2026-05-24: NO Mutex wrap.  `AsyncFd::readable()` and
         // `AsyncFd::writable()` are independent — both can have in-flight
-        // waiters on the same `&AsyncFd` simultaneously, и `try_io`
+        // waiters on the same `&AsyncFd` simultaneously, and `try_io`
         // re-checks the OS-level state per call.  The previous Mutex was
-        // а **read/write deadlock** — reader.lock() blocked across
-        // `readable().await`, starving the writer until а packet
-        // arrived, и vice versa.
+        // a **read/write deadlock** — reader.lock() blocked across
+        // `readable().await`, starving the writer until a packet
+        // arrived, and vice versa.
         Ok(Self {
             inner: Arc::new(async_fd),
             iface_name: cfg.iface_name.clone(),
@@ -121,20 +121,20 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// Read the next IP packet от the TUN device into а new Vec.
+    /// Read the next IP packet from the TUN device into a new Vec.
     pub async fn read_packet(&mut self) -> std::io::Result<Vec<u8>> {
         self.read_packet_with_prefix(0).await
     }
 
-    /// Read the next IP packet into а Vec що has `prefix` uninit bytes
+    /// Read the next IP packet into a Vec that has `prefix` uninit bytes
     /// reserved at the start (matches `standard.rs::Reader` API so the
     /// bridge can call `read_packet_with_prefix(APP_IPC_SEND_PREFIX_BYTES)`
-    /// uniformly across all platforms).  Audit batch 2026-05-24: added к
-    /// close the FreeBSD-specific compile-break где bridge.rs invoked а
-    /// method що did not exist on this backend.
+    /// uniformly across all platforms).  Audit batch 2026-05-24: added to
+    /// close the FreeBSD-specific compile-break where bridge.rs invoked a
+    /// method that did not exist on this backend.
     pub async fn read_packet_with_prefix(&mut self, prefix: usize) -> std::io::Result<Vec<u8>> {
         // 65_535 = max IP datagram size; FreeBSD `/dev/tun` returns one
-        // packet per read когда TUNSIFHEAD=0 (raw mode).
+        // packet per read when TUNSIFHEAD=0 (raw mode).
         const PKT_CAP: usize = 65_535;
         let total = prefix + PKT_CAP;
         let mut buf = vec![0u8; total];
@@ -173,14 +173,14 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Write а full IP packet к the TUN device.
+    /// Write a full IP packet to the TUN device.
     ///
-    /// Treats а short write as `WriteZero` (previously а partial write
+    /// Treats a short write as `WriteZero` (previously a partial write
     /// returned `Ok(())`, silently truncating the IP datagram on the
-    /// wire which would corrupt headers и cause client confusion). TUN
+    /// wire which would corrupt headers and cause client confusion). TUN
     /// on FreeBSD historically writes atomically (one packet = one
-    /// write syscall); а short return value indicates kernel pushback
-    /// или а driver bug — best к surface it as an error rather than
+    /// write syscall); a short return value indicates kernel pushback
+    /// or a driver bug — best to surface it as an error rather than
     /// swallow it.
     pub async fn write_packet(&mut self, packet: &[u8]) -> std::io::Result<()> {
         loop {

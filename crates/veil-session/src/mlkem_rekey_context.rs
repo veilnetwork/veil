@@ -2,17 +2,17 @@
 //! intra-session ML-KEM E2E key-rotation FSM + byte/time threshold
 //! gating.
 //!
-//! Was four scattered inline references в `SessionRunner::run`:
+//! Was four scattered inline references in `SessionRunner::run`:
 //! * init triplet (state, bytes_since_rekey, last_rekey_at) at top of run
 //! * threshold check before drain (idle && over-threshold ⇒ enter AwaitingAck)
-//! * bytes accumulation на every tx/rx (3 call sites)
+//! * bytes accumulation on every tx/rx (3 call sites)
 //! * `MlKemRekeyAck` arrival handler (extract dk_seed, reset bytes/last_rekey_at)
 //!
 //! Pure refactor of the state machine; the actual ML-KEM keypair
-//! generation, frame encoding, и dispatcher dk-cache mutation stay
-//! at the call site (those are intertwined с `&mut self` access к
-//! `per_session_mlkem_dk` / `peer_mlkem_keys`, и moving them would
-//! turn this slice into а much bigger one).
+//! generation, frame encoding, and dispatcher dk-cache mutation stay
+//! at the call site (those are intertwined with `&mut self` access to
+//! `per_session_mlkem_dk` / `peer_mlkem_keys`, and moving them would
+//! turn this slice into a much bigger one).
 //!
 //! API mirrors the structurally-similar rekey state idiom
 //! (covered the rx_cipher_prev grace buffer; this slice
@@ -28,12 +28,12 @@ use veil_e2e::DK_SEED_BYTES;
 pub enum MlKemRekeyState {
     /// No ML-KEM rekey in progress.
     Idle,
-    /// We sent `MlKemRekeyEk` с а new encapsulation key и are waiting
-    /// for `MlKemRekeyAck` от the peer. `dk_seed` is the 64-byte seed
-    /// от which the decapsulation key для the new `ek` was derived.
-    /// Once the peer acks, we commit `dk_seed` к
+    /// We sent `MlKemRekeyEk` with a new encapsulation key and are waiting
+    /// for `MlKemRekeyAck` from the peer. `dk_seed` is the 64-byte seed
+    /// from which the decapsulation key for the new `ek` was derived.
+    /// Once the peer acks, we commit `dk_seed` to
     /// `per_session_mlkem_dk[peer_id]` so the dispatcher can decrypt
-    /// future E2E messages от the peer that were encrypted с the new
+    /// future E2E messages from the peer that were encrypted with the new
     /// key.
     AwaitingAck { dk_seed: [u8; DK_SEED_BYTES] },
 }
@@ -65,7 +65,7 @@ impl MlKemRekeyContext {
         matches!(self.state, MlKemRekeyState::AwaitingAck { .. })
     }
 
-    /// Saturating add к the bytes-since-last-rekey counter. Called
+    /// Saturating add to the bytes-since-last-rekey counter. Called
     /// for every tx / rx body byte to track session traffic against
     /// the rekey threshold.
     pub fn record_bytes(&mut self, n: u64) {
@@ -75,28 +75,28 @@ impl MlKemRekeyContext {
     /// Test whether either threshold is crossed. Caller should also
     /// check `is_idle` AND that ML-KEM infrastructure (per_session
     /// _mlkem_dk + peer_mlkem_keys) is wired up before initiating —
-    /// extracting those checks would couple this struct к
+    /// extracting those checks would couple this struct to
     /// `SessionRunner` internals.
     pub fn should_initiate_rekey(&self, now: Instant) -> bool {
         self.bytes_since_rekey >= self.bytes_threshold
             || now.duration_since(self.last_rekey_at) >= self.time_threshold
     }
 
-    /// Transition к `AwaitingAck` с the freshly-generated dk_seed.
+    /// Transition to `AwaitingAck` with the freshly-generated dk_seed.
     /// Caller must have just pushed the matching `MlKemRekeyEk` frame
     /// onto the priority queue.
     pub fn enter_awaiting_ack(&mut self, dk_seed: [u8; DK_SEED_BYTES]) {
         self.state = MlKemRekeyState::AwaitingAck { dk_seed };
     }
 
-    /// Atomically transitions от `AwaitingAck` back к `Idle`
+    /// Atomically transitions from `AwaitingAck` back to `Idle`
     /// returning the stashed `dk_seed`. Resets bytes-since-rekey
-    /// и last_rekey_at on success.
+    /// and last_rekey_at on success.
     ///
-    /// Returns `None` если we were not actually в `AwaitingAck` — а
+    /// Returns `None` if we were not actually in `AwaitingAck` — a
     /// rare FSM-invariant violation that could happen if the same
     /// session received two `MlKemRekeyAck` frames back-to-back.
-    /// Callers should log а warning in that case.
+    /// Callers should log a warning in that case.
     pub fn take_dk_seed_on_ack(&mut self, now: Instant) -> Option<[u8; DK_SEED_BYTES]> {
         match std::mem::replace(&mut self.state, MlKemRekeyState::Idle) {
             MlKemRekeyState::AwaitingAck { dk_seed } => {
@@ -140,7 +140,7 @@ mod tests {
     async fn record_bytes_saturates_on_u64_max() {
         let mut ctx = MlKemRekeyContext::new(100, 60);
         ctx.record_bytes(u64::MAX);
-        ctx.record_bytes(1); // would overflow без saturating_add
+        ctx.record_bytes(1); // would overflow without saturating_add
         assert!(ctx.should_initiate_rekey(Instant::now()));
     }
 
@@ -178,14 +178,14 @@ mod tests {
         assert!(ctx.is_idle(), "state must transition back to Idle");
         assert!(
             !ctx.should_initiate_rekey(now_after),
-            "bytes-since-rekey must reset к 0 after ack"
+            "bytes-since-rekey must reset to 0 after ack"
         );
     }
 
     #[tokio::test]
     async fn take_dk_seed_returns_none_when_not_awaiting_ack() {
         let mut ctx = MlKemRekeyContext::new(1000, 60);
-        // Never entered AwaitingAck — the ack is а protocol violation.
+        // Never entered AwaitingAck — the ack is a protocol violation.
         let result = ctx.take_dk_seed_on_ack(Instant::now());
         assert_eq!(result, None);
         assert!(ctx.is_idle());

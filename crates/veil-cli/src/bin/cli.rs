@@ -1,10 +1,10 @@
 // jemalloc as global allocator on Linux — glibc malloc fragments badly
 // under bursty mixed-size allocation patterns (60 KB frames + many small
-// frame metadata + Arc/String churn от session reconnects). On veil
+// frame metadata + Arc/String churn from session reconnects). On veil
 // bootstrap hosts this manifested as ~5-10 MB/min RSS growth that did
-// not correspond к live-data growth and would not return к OS even when
+// not correspond to live-data growth and would not return to OS even when
 // traffic stopped — pure fragmentation overhead. jemalloc's arena +
-// dirty-page reuse model handles this workload без ambient retention.
+// dirty-page reuse model handles this workload without ambient retention.
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -13,8 +13,8 @@ fn main() {
     // Initialise the `log` facade so all `log::debug!()` / `log::info!()` /
     // `log::warn!()` / `log::error!()` events across the workspace (and the
     // dependency graph) reach stderr.  Audit batch 2026-05-23: pre-fix no
-    // backend was registered, so every call was а silent no-op — diagnostic
-    // events like `route.discovery.start` (veil-ipc::handlers::send) и
+    // backend was registered, so every call was a silent no-op — diagnostic
+    // events like `route.discovery.start` (veil-ipc::handlers::send) and
     // route-cache internals were invisible during incident triage.
     //
     // Operator-controlled via `RUST_LOG`:

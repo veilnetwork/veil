@@ -1,21 +1,21 @@
 ---
-# Deploy + activate hourly logrotate для veil daemon logs.
+# Deploy + activate hourly logrotate for veil daemon logs.
 #
 # Background (2026-05-13 incident):
 # - chaos-ban + chat_node load → veil.log writes ~70-230 MB/h
-# - Default logrotate.timer runs daily → log grows к 5 GB before first rotation
+# - Default logrotate.timer runs daily → log grows to 5 GB before first rotation
 # - One host (b1) hit 100% disk = ansible UNREACHABLE = unrecoverable
-#   без manual SSH (no `tmp dir` к stage commands)
+#   without manual SSH (no `tmp dir` to stage commands)
 #
 # Fix: separate `veil-logrotate.service` + `.timer` (hourly), runs ONLY
 # against `/etc/logrotate.d/veil` so it doesn't fight the system daily
-# timer.  `copytruncate` semantics в the config preserve the daemon's
+# timer.  `copytruncate` semantics in the config preserve the daemon's
 # `StandardOutput=append:` file descriptor — no veil restart needed.
 #
 # Apply:
 #   cd ansible && ansible-playbook -i inventory.yml deploy-logrotate.yml
 #
-# Idempotent — safe к re-run.  Triggers а daemon-reload only когда
+# Idempotent — safe to re-run.  Triggers a daemon-reload only when
 # unit files actually change.
 
 - name: Deploy veil logrotate
@@ -23,7 +23,7 @@
   become: true
 
   tasks:
-    - name: Ensure /etc/logrotate.d/veil exists с 200 MB cap
+    - name: Ensure /etc/logrotate.d/veil exists with 200 MB cap
       ansible.builtin.copy:
         src: templates/logrotate-veil.conf
         dest: /etc/logrotate.d/veil
@@ -49,7 +49,7 @@
         mode: "0644"
       register: timer_changed
 
-    - name: systemd daemon-reload (only когда unit files changed)
+    - name: systemd daemon-reload (only when unit files changed)
       ansible.builtin.systemd:
         daemon_reload: true
       when: service_changed.changed or timer_changed.changed

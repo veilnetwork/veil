@@ -2,91 +2,91 @@
 //!
 //! ## Why this exists
 //!
-//! Even after а DPI-fingerprint regression suite ([`veil-fingerprint`])
-//! и Chrome-mimic crypto layers (`tls-boring`, QUIC Chrome transport
-//! params), а sufficiently determined adversary targeting OVL1
-//! specifically может publish а fingerprint что matches our exact obfs4
+//! Even after a DPI-fingerprint regression suite ([`veil-fingerprint`])
+//! and Chrome-mimic crypto layers (`tls-boring`, QUIC Chrome transport
+//! params), a sufficiently determined adversary targeting OVL1
+//! specifically may publish a fingerprint that matches our exact obfs4
 //! variant.  Possible vectors:
 //!
 //! * Length-distribution fingerprint of the obfs4 padding (our padding
-//!   constants leak а small but measurable statistical signal).
+//!   constants leak a small but measurable statistical signal).
 //! * Initial handshake byte-pattern fingerprint (elligator2 representative
-//!   bytes have а specific Curve25519-affine structure).
+//!   bytes have a specific Curve25519-affine structure).
 //! * Timing signatures of the handshake retransmission pattern.
 //!
-//! When such а fingerprint surfaces, we want к **rotate к а fresh
-//! variant** без а binary rebuild + global redeployment cycle:
+//! When such a fingerprint surfaces, we want to **rotate to a fresh
+//! variant** without a binary rebuild + global redeployment cycle:
 //!
-//! 1. Operator flips а config flag selecting а different variant.
+//! 1. Operator flips a config flag selecting a different variant.
 //! 2. Server immediately advertises both old + new on listen.
-//! 3. Clients pre-loaded с the new variant connect on the new wire.
+//! 3. Clients pre-loaded with the new variant connect on the new wire.
 //! 4. Once enough clients have migrated, operator drops the old.
 //!
 //! ## What this module ships **today** (Phase 1)
 //!
 //! * The variant enum — currently has one variant `V1` (the obfs4
-//!   format shipped в Phase 1b/c, 2025).  Adding а `V2` is а matter
+//!   format shipped in Phase 1b/c, 2025).  Adding a `V2` is a matter
 //!   of adding the enum variant + setting different HKDF labels +
 //!   different padding constants.
 //! * Domain-separation labels keyed by variant (`auth_mac_context`,
-//!   `hkdf_auth_key_info`) — so а V2 variant's auth-key derivation
-//!   produces different keys от V1, guaranteeing wire-level
-//!   distinction даже если the surface byte layout is identical.
+//!   `hkdf_auth_key_info`) — so a V2 variant's auth-key derivation
+//!   produces different keys from V1, guaranteeing wire-level
+//!   distinction even if the surface byte layout is identical.
 //!
-//! ## What lands в the future epic when triggered (Phase 2)
+//! ## What lands in the future epic when triggered (Phase 2)
 //!
 //! * Multiple concurrent variant accept on the server side
 //!   (`HandshakePolicy::AcceptAll([V1, V2])`).
-//! * Client-side variant probe + fallback (try V2 first, drop к V1
+//! * Client-side variant probe + fallback (try V2 first, drop to V1
 //!   if server doesn't acknowledge within timeout).
 //! * Per-variant padding constants overrides (different distribution
-//!   shapes к break the length-fingerprint correlation).
+//!   shapes to break the length-fingerprint correlation).
 //! * Operator-config selection: `[transport] obfs4_variant = "v2"`.
 //!
 //! See [`docs/internal/PLAN_WIRE_FORMAT_KILL_SWITCH.md`](../../../docs/internal/PLAN_WIRE_FORMAT_KILL_SWITCH.md)
 //! for the design + activation playbook.
 
-/// Wire-format variant identifier.  Currently has а single variant —
-/// **the kill-switch architecture is а Phase-1 landing pad**.  Future
-/// variants are added by extending the enum + the lookup tables в
+/// Wire-format variant identifier.  Currently has a single variant —
+/// **the kill-switch architecture is a Phase-1 landing pad**.  Future
+/// variants are added by extending the enum + the lookup tables in
 /// `auth_mac_context` / `hkdf_auth_key_info`.
 ///
-/// `#[non_exhaustive]` allows callers к match on the enum без forcing
-/// а downstream rebuild когда а new variant lands (defensive against
+/// `#[non_exhaustive]` allows callers to match on the enum without forcing
+/// a downstream rebuild when a new variant lands (defensive against
 /// the variant-rotation use case).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WireFormatVariant {
-    /// Obfs4 как shipped в Phase 1b/c (2025).  Domain-separation
+    /// Obfs4 as shipped in Phase 1b/c (2025).  Domain-separation
     /// labels: `b"obfs4-auth-key-v1"` / `b"obfs4-auth-v1:"`.  Client's
     /// first-frame MAC has **no variant tag** (backwards compat —
     /// pre-kill-switch wire format).  Padding range: 0..=128.
     #[default]
     V1,
-    /// Obfs4 V2 — Phase 2 kill-switch variant.  Distinct от V1 by:
+    /// Obfs4 V2 — Phase 2 kill-switch variant.  Distinct from V1 by:
     /// * Different HKDF auth-key info label (`b"obfs4-auth-key-v2"`)
     /// * Different AUTH MAC context (`b"obfs4-auth-v2:"`)
-    /// * Client first-frame MAC includes а variant tag (`b"obfs4-v2:"`)
-    ///   prefixed к the HMAC input — V1 server cannot validate а V2
-    ///   client's MAC (silent-drop), и V2 server can identify V2
+    /// * Client first-frame MAC includes a variant tag (`b"obfs4-v2:"`)
+    ///   prefixed to the HMAC input — V1 server cannot validate a V2
+    ///   client's MAC (silent-drop), and V2 server can identify V2
     ///   clients on first frame.
-    /// * Padding range tightened к 0..=96 (от V1's 0..=128) — breaks
+    /// * Padding range tightened to 0..=96 (from V1's 0..=128) — breaks
     ///   length-distribution fingerprint correlation across variants.
     ///
-    /// Ship-when-activated: only enable on production hosts when а
-    /// fingerprint-signature trigger fires (см.
+    /// Ship-when-activated: only enable on production hosts when a
+    /// fingerprint-signature trigger fires (see
     /// `docs/internal/PLAN_WIRE_FORMAT_KILL_SWITCH.md`).  Mixed-version
     /// rollout supported through the server's `accept_variants` config
-    /// и the client's `variant_fallback_chain`.
+    /// and the client's `variant_fallback_chain`.
     V2,
 }
 
 impl WireFormatVariant {
-    /// HKDF "info" string used to derive the auth-key от the shared
-    /// secret.  Different per variant — guarantees что а V2 client
-    /// connecting к а V1 server produces incompatible auth-keys даже
-    /// если the surface byte layout were identical, so the server's
-    /// silent-drop on MAC failure protects both sides от
+    /// HKDF "info" string used to derive the auth-key from the shared
+    /// secret.  Different per variant — guarantees that a V2 client
+    /// connecting to a V1 server produces incompatible auth-keys even
+    /// if the surface byte layout were identical, so the server's
+    /// silent-drop on MAC failure protects both sides from
     /// version-mismatch issues.
     pub const fn hkdf_auth_key_info(&self) -> &'static [u8] {
         match self {
@@ -104,15 +104,15 @@ impl WireFormatVariant {
         }
     }
 
-    /// Variant tag prefixed к the HMAC input для the client's first
+    /// Variant tag prefixed to the HMAC input for the client's first
     /// frame.  V1 returns an empty slice (no tag — backwards compat
-    /// с pre-kill-switch wire format).  V2+ include а variant-specific
-    /// tag так что а V1 server's MAC computation differs от а V2
-    /// client's, и vice versa — на MAC verify mismatch the server
+    /// with pre-kill-switch wire format).  V2+ include a variant-specific
+    /// tag so that a V1 server's MAC computation differs from a V2
+    /// client's, and vice versa — on MAC verify mismatch the server
     /// silent-drops.
     ///
-    /// **Wire-level distinguisher** между variants на the very first
-    /// flight — no need для а separate version byte on the wire,
+    /// **Wire-level distinguisher** between variants on the very first
+    /// flight — no need for a separate version byte on the wire,
     /// preserves the obfs4 "first frame looks random" property.
     pub const fn first_frame_mac_tag(&self) -> &'static [u8] {
         match self {
@@ -121,8 +121,8 @@ impl WireFormatVariant {
         }
     }
 
-    /// Maximum random-padding length added к handshake messages.  V1
-    /// uses 128; V2 uses 96 к break length-distribution fingerprint
+    /// Maximum random-padding length added to handshake messages.  V1
+    /// uses 128; V2 uses 96 to break length-distribution fingerprint
     /// correlation across variants (different overall message-length
     /// distribution).
     pub const fn max_handshake_padding(&self) -> usize {
@@ -132,8 +132,8 @@ impl WireFormatVariant {
         }
     }
 
-    /// Human-readable variant name — для operator-config strings
-    /// и log lines.
+    /// Human-readable variant name — for operator-config strings
+    /// and log lines.
     pub fn name(&self) -> &'static str {
         match self {
             Self::V1 => "v1",
@@ -141,8 +141,8 @@ impl WireFormatVariant {
         }
     }
 
-    /// Parse а config-string identifier.  Operators set
-    /// `[transport] obfs4_variant = "v1"` (или "v2" once Phase 2
+    /// Parse a config-string identifier.  Operators set
+    /// `[transport] obfs4_variant = "v1"` (or "v2" once Phase 2
     /// activated).
     pub fn from_config_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -152,7 +152,7 @@ impl WireFormatVariant {
         }
     }
 
-    /// All known variants, ordered от newest к oldest — used by
+    /// All known variants, ordered from newest to oldest — used by
     /// servers configured to "advertise everything we support" via
     /// `accept_variants = ["v2", "v1"]`.
     pub fn all() -> &'static [Self] {
@@ -164,8 +164,8 @@ impl WireFormatVariant {
 mod tests {
     use super::*;
 
-    /// Anchor test — pins the v1 labels к the bytes currently used
-    /// в `ntor.rs`.  Adding а v2 must not change v1's labels (would
+    /// Anchor test — pins the v1 labels to the bytes currently used
+    /// in `ntor.rs`.  Adding a v2 must not change v1's labels (would
     /// break cross-version handshake-by-MAC-silent-drop guarantee).
     #[test]
     fn v1_labels_match_legacy_constants() {
@@ -231,9 +231,9 @@ mod tests {
         assert!(variants.contains(&WireFormatVariant::V2));
         assert_eq!(variants.len(), 2);
         // Newest-first ordering matters: server's `accept_variants =
-        // WireFormatVariant::all()` defaults к preferring V2 over V1
+        // WireFormatVariant::all()` defaults to preferring V2 over V1
         // (matches the kill-switch activation expectation — V2 ships
-        // когда trigger fires, V1 stays accepted для grace period).
+        // when trigger fires, V1 stays accepted for grace period).
         assert_eq!(variants[0], WireFormatVariant::V2);
         assert_eq!(variants[1], WireFormatVariant::V1);
     }
@@ -241,14 +241,14 @@ mod tests {
     #[test]
     fn v1_first_frame_mac_tag_is_empty() {
         // Backwards-compat anchor: pre-kill-switch wire format
-        // included NO tag в the first-frame MAC.  V2 cannot regress
+        // included NO tag in the first-frame MAC.  V2 cannot regress
         // V1's wire shape.
         assert_eq!(WireFormatVariant::V1.first_frame_mac_tag(), b"");
     }
 
     #[test]
     fn v2_first_frame_mac_tag_distinguishes_from_v1() {
-        // V2 MUST have а non-empty distinct tag — otherwise V1 server
+        // V2 MUST have a non-empty distinct tag — otherwise V1 server
         // would accept V2 client (same MAC input → same expected MAC).
         let v2_tag = WireFormatVariant::V2.first_frame_mac_tag();
         assert!(!v2_tag.is_empty());
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn v2_labels_distinguish_from_v1() {
-        // All three label surfaces must be distinct между V1 и V2 —
+        // All three label surfaces must be distinct between V1 and V2 —
         // anchor the kill-switch's "different variants produce
         // incompatible keys + MACs" invariant.
         assert_ne!(

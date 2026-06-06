@@ -38,7 +38,7 @@ serde_json = "1.0"
 thiserror = "2.0"
 # tokio for the shared `build_tokio_runtime` factory used by veil-cli,
 # ogate, oproxy. Light features: just rt + rt-multi-thread. All consumer
-# crates already pull а fuller tokio anyway.
+# crates already pull a fuller tokio anyway.
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread"] }
 toml = "0.9"
 toml_edit = "0.22"

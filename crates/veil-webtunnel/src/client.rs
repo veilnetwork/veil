@@ -1,25 +1,25 @@
-//! Client-side webtunnel connector — counterpart к [`crate::WebtunnelRouter`].
+//! Client-side webtunnel connector — counterpart to [`crate::WebtunnelRouter`].
 //!
 //! Phase 5c of [`docs/internal/PLAN_TRANSPORT_OBFUSCATION.md`](../../docs/internal/PLAN_TRANSPORT_OBFUSCATION.md).
 //!
 //! Given an already-TLS-terminated stream (typically `wss://` connected
-//! via `veil-transport::websocket` or а plain TLS wrapper), the
+//! via `veil-transport::websocket` or a plain TLS wrapper), the
 //! client:
 //!
-//! 1. Generates а fresh random `Sec-WebSocket-Key` (16 random bytes,
+//! 1. Generates a fresh random `Sec-WebSocket-Key` (16 random bytes,
 //!    base64-encoded per RFC 6455).
-//! 2. Sends an HTTP/1.1 GET request с the configured secret path,
-//!    standard WebSocket upgrade headers, и the operator-supplied
-//!    `X-Veil-Auth` (или whatever header name the matcher expects).
-//! 3. Reads the server's response.  Verifies 101 Switching Protocols и
+//! 2. Sends an HTTP/1.1 GET request with the configured secret path,
+//!    standard WebSocket upgrade headers, and the operator-supplied
+//!    `X-Veil-Auth` (or whatever header name the matcher expects).
+//! 3. Reads the server's response.  Verifies 101 Switching Protocols and
 //!    that `Sec-WebSocket-Accept` matches the expected derived value.
-//! 4. Returns the upgraded `WebSocketStream` ready для binary-frame I/O.
+//! 4. Returns the upgraded `WebSocketStream` ready for binary-frame I/O.
 //!
-//! If the server returned **anything other than 101** (typically а
+//! If the server returned **anything other than 101** (typically a
 //! decoy HTML page when our path/auth was wrong), the client surfaces
 //! `ClientError::DecoyReceived` so the caller knows tunnel mode wasn't
 //! activated.  Caller closes the connection without retrying — retry
-//! с the same wrong credentials yields the same decoy.
+//! with the same wrong credentials yields the same decoy.
 
 #![allow(clippy::result_large_err)]
 
@@ -57,17 +57,17 @@ pub enum ClientError {
 /// Per-server connection credentials.  Constructed once and reused
 /// across many connect attempts.
 pub struct WebtunnelClient {
-    /// Path that activates tunnel mode на the server.
+    /// Path that activates tunnel mode on the server.
     secret_path: String,
     /// Host header value (real production: domain of the server).
-    /// Defaults к `"example.com"`; operators should set к the actual
-    /// TLS SNI host для realistic-looking requests.
+    /// Defaults to `"example.com"`; operators should set to the actual
+    /// TLS SNI host for realistic-looking requests.
     host: String,
     /// Optional auth-header credentials.  When set, both name + token
     /// must match what the server's `SecretMatcher` expects.
     auth: Option<(String, Vec<u8>)>,
-    /// Additional headers к send (e.g. realistic User-Agent).  Phase
-    /// 5c default: а common browser UA so we don't stick out.
+    /// Additional headers to send (e.g. realistic User-Agent).  Phase
+    /// 5c default: a common browser UA so we don't stick out.
     extra_headers: Vec<(String, String)>,
 }
 
@@ -110,7 +110,7 @@ impl WebtunnelClient {
     }
 
     /// Replace the default browser-style extra headers.  Operators
-    /// що want к match а specific real site's request fingerprint
+    /// that want to match a specific real site's request fingerprint
     /// can supply their own list.
     pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.extra_headers = headers;
@@ -118,7 +118,7 @@ impl WebtunnelClient {
     }
 
     /// Perform the webtunnel handshake on the supplied raw stream.
-    /// Returns the upgraded `WebSocketStream` ready для binary I/O.
+    /// Returns the upgraded `WebSocketStream` ready for binary I/O.
     pub async fn connect<S>(&self, mut stream: S) -> Result<WebSocketStream<S>, ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -134,7 +134,7 @@ impl WebtunnelClient {
             return Err(ClientError::InvalidRequestComponent("host"));
         }
 
-        // Generate а random 16-byte Sec-WebSocket-Key per RFC 6455.
+        // Generate a random 16-byte Sec-WebSocket-Key per RFC 6455.
         let mut key_bytes = [0u8; 16];
         rand::rng().fill_bytes(&mut key_bytes);
         let sec_key = BASE64.encode(key_bytes);
@@ -154,7 +154,7 @@ impl WebtunnelClient {
             req.push_str(": ");
             // Auth tokens are typically printable ASCII; if not, the
             // operator's deployment is misconfigured.  We base64 non-
-            // ASCII tokens к keep the header line valid.
+            // ASCII tokens to keep the header line valid.
             if token.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
                 req.push_str(std::str::from_utf8(token).expect("checked ASCII"));
             } else {
@@ -182,7 +182,7 @@ impl WebtunnelClient {
         }
         if !residual.is_empty() {
             // Server sent bytes past the 101 boundary before we asked
-            // для them — odd but не protocol-correct yet (WS frames
+            // for them — odd but not protocol-correct yet (WS frames
             // start after the upgrade); reject defensively.
             return Err(ClientError::BadResponse(
                 "server sent data before WebSocket upgrade completed".to_owned(),
@@ -207,9 +207,9 @@ impl WebtunnelClient {
 
 // ── Response-reading helpers ─────────────────────────────────────────────────
 
-/// Read HTTP response headers до `\r\n\r\n`.  Returns the status line
-/// (e.g. "HTTP/1.1 101 Switching Protocols"), а list of (name, value)
-/// header pairs, и any residual bytes read past the boundary.
+/// Read HTTP response headers until `\r\n\r\n`.  Returns the status line
+/// (e.g. "HTTP/1.1 101 Switching Protocols"), a list of (name, value)
+/// header pairs, and any residual bytes read past the boundary.
 async fn read_response_headers<S>(
     stream: &mut S,
 ) -> Result<(String, Vec<(String, Vec<u8>)>, Vec<u8>), ClientError>
@@ -310,7 +310,7 @@ mod tests {
         let server_result = server_task.await.unwrap();
         let mut ws_server = server_result.expect("server should hand back WebSocketStream");
 
-        // Round-trip а binary frame.
+        // Round-trip a binary frame.
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         ws_client
@@ -349,7 +349,7 @@ mod tests {
             other => panic!("expected DecoyReceived, got {other:?}"),
         }
 
-        // Server должно return ServedDecoy.
+        // Server must return ServedDecoy.
         let server_result = server_task.await.unwrap();
         assert!(server_result.is_err());
     }
@@ -388,7 +388,7 @@ mod tests {
         assert!(parse_status_code("HTTP/1.1").is_err());
     }
 
-    /// Verify the matcher contract — ensures parity между client и
+    /// Verify the matcher contract — ensures parity between client and
     /// server expectations.
     #[test]
     fn matcher_recognizes_client_credentials() {

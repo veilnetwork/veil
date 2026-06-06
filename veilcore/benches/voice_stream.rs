@@ -90,7 +90,7 @@ fn bench_voice_streams(c: &mut Criterion) {
                         [0u8; 32], // src_app_id
                         app_id,
                         endpoint_id,
-                        // d: route_ipc_deliver принимает PooledShared.
+                        // d: route_ipc_deliver accepts PooledShared.
                         veil_bufpool::pooled_shared_from_vec(payload.clone()),
                     );
                     if delivered {
@@ -111,14 +111,14 @@ fn bench_voice_streams(c: &mut Criterion) {
             //
             // Loss is **cumulative** across all criterion warmup + sample
             // iterations.  As the benchmark runs longer, drop counters
-            // monotonically grow и the percentage trends upward as the
-            // background drain task falls further behind the sender on а
-            // shared CI runner (observed 5.37% после ~16 iterations on
+            // monotonically grow and the percentage trends upward as the
+            // background drain task falls further behind the sender on a
+            // shared CI runner (observed 5.37% after ~16 iterations on
             // ubuntu-latest, audit 2026-05-27 phase Q.4).  Treat the
             // throughput number (criterion's primary output) as the
-            // perf signal; this line is purely diagnostic.  Asserting на
-            // а cumulative loss bound is meaningless — а real regression
-            // would show в the throughput delta vs. baseline.
+            // perf signal; this line is purely diagnostic.  Asserting on
+            // a cumulative loss bound is meaningless — a real regression
+            // would show in the throughput delta vs. baseline.
             eprintln!("[voice_stream] sent={sent} dropped={dropped} loss={loss_pct:.4}%");
         }
     });

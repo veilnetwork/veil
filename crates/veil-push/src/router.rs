@@ -1,7 +1,7 @@
 //! Multi-provider [`PushDispatcher`] that routes by `PushToken.provider`.
 //!
 //!.4 P6. Operators who configure both
-//! FCM (для Android) and APNs (для iOS) need a single
+//! FCM (for Android) and APNs (for iOS) need a single
 //! [`PushDispatcher`] handle the runtime can wire into the push task.
 //! [`ProviderRouter`] holds optional dispatchers for each provider
 //! and dispatches based on the token tag.
@@ -16,7 +16,7 @@
 //! error out — no per-provider branching).
 //! Lets operators ship Android-only or iOS-only deployments
 //! without an `unimplemented!` placeholder dispatcher.
-//! Tests can swap individual provider impls без touching the
+//! Tests can swap individual provider impls without touching the
 //! router itself.
 
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use crate::{PushDispatcher, PushError, PushProvider, PushToken};
 /// to clone via `Arc`.
 pub struct ProviderRouter {
     /// Dispatcher [`PushProvider::Fcm`]. `None` → tokens for
-    /// Android receivers fail с `ProviderNotConfigured(Fcm)`.
+    /// Android receivers fail with `ProviderNotConfigured(Fcm)`.
     fcm: Option<Arc<dyn PushDispatcher>>,
     /// Dispatcher [`PushProvider::Apns`].
     apns: Option<Arc<dyn PushDispatcher>>,

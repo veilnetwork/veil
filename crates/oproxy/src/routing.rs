@@ -1,16 +1,16 @@
-//! Per-target routing policy для oproxy-client.
+//! Per-target routing policy for oproxy-client.
 //!
-//! Resolves each `(host, port)` к а concrete [`ProxyMode`] using the
+//! Resolves each `(host, port)` to a concrete [`ProxyMode`] using the
 //! `[routing]` section of `ClientConfig`:
 //!
-//! 1. Walk `rules` в order; first match wins.
+//! 1. Walk `rules` in order; first match wins.
 //! 2. If no rule matches, use `default`.
 //!
 //! `host` is matched against `host_suffix` / `host_exact` (case-
 //! insensitive).  If `host` parses as an IP literal, it's also matched
 //! against `cidr`.  Port range matches against `port_range`.
 //!
-//! Direct connect и fallback semantics are implemented в the inbound
+//! Direct connect and fallback semantics are implemented in the inbound
 //! handlers via [`open_direct_and_bridge`].
 //!
 //! Audit batch 2026-05-23.
@@ -23,10 +23,10 @@ use tokio::net::TcpStream;
 
 use crate::config::{FallbackMode, ProxyMode, RoutingConfig, RoutingRule};
 
-/// Effective routing decision for а single `(host, port)`: which mode
-/// к use AND which fallback к apply если veil fails.  The fallback
-/// component is meaningful только when `mode = Veil`; для `Direct` /
-/// `Block` it's ignored (но still carried so callers don't have к
+/// Effective routing decision for a single `(host, port)`: which mode
+/// to use AND which fallback to apply if veil fails.  The fallback
+/// component is meaningful only when `mode = Veil`; for `Direct` /
+/// `Block` it's ignored (but still carried so callers don't have to
 /// special-case).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Decision {
@@ -34,7 +34,7 @@ pub struct Decision {
     pub fallback: FallbackMode,
 }
 
-/// Resolve а `(host, port)` к the routing decision chosen by the
+/// Resolve a `(host, port)` to the routing decision chosen by the
 /// configured policy.  Per-rule `fallback` overrides the global
 /// `[routing] fallback`; unmatched-default uses the global.
 pub fn resolve(cfg: &RoutingConfig, host: &str, port: u16) -> Decision {
@@ -53,9 +53,9 @@ pub fn resolve(cfg: &RoutingConfig, host: &str, port: u16) -> Decision {
 }
 
 fn rule_matches(rule: &RoutingRule, host: &str, port: u16) -> bool {
-    // А rule is а conjunction: every supplied field must match.  Empty
-    // fields are wildcards.  Если ALL fields are empty, the rule matches
-    // everything (intentional: lets operators flip the default via а
+    // A rule is a conjunction: every supplied field must match.  Empty
+    // fields are wildcards.  If ALL fields are empty, the rule matches
+    // everything (intentional: lets operators flip the default via a
     // single all-wildcard rule).
     let host_lower = host.to_ascii_lowercase();
 
@@ -75,8 +75,8 @@ fn rule_matches(rule: &RoutingRule, host: &str, port: u16) -> bool {
                 return false;
             }
         } else {
-            // Не IP literal → cidr can't match.  Reject (rule does not
-            // apply к hostname targets).
+            // Not IP literal → cidr can't match.  Reject (rule does not
+            // apply to hostname targets).
             return false;
         }
     }
@@ -90,7 +90,7 @@ fn rule_matches(rule: &RoutingRule, host: &str, port: u16) -> bool {
 
 fn cidr_contains(cidr_str: &str, ip: IpAddr) -> bool {
     let Some((net, prefix_str)) = cidr_str.split_once('/') else {
-        // No prefix → treat as /32 (v4) или /128 (v6).
+        // No prefix → treat as /32 (v4) or /128 (v6).
         return cidr_str.parse::<IpAddr>().is_ok_and(|n| n == ip);
     };
     let Ok(prefix) = prefix_str.parse::<u8>() else {
@@ -239,8 +239,8 @@ pub(crate) async fn connect_direct_vetted(target: &str, allow_private: bool) -> 
         Some(addrs[0])
     };
 
-    // Audit batch 2026-05-24: bound на а blackhole target.  Without this,
-    // а dst routed к а silent IP holds the task for the OS default
+    // Audit batch 2026-05-24: bound on a blackhole target.  Without this,
+    // a dst routed to a silent IP holds the task for the OS default
     // connect-retry budget (~2-3 min on Linux).
     let connect_fut = async {
         match connect_addr {
@@ -252,16 +252,16 @@ pub(crate) async fn connect_direct_vetted(target: &str, allow_private: bool) -> 
         .await
         .map_err(|_| {
             anyhow!(
-                "direct TCP connect к {target} timed out ({:?})",
+                "direct TCP connect to {target} timed out ({:?})",
                 crate::timeouts::DIRECT_CONNECT_TIMEOUT
             )
         })?
         .with_context(|| format!("direct TCP connect to {target} failed"))
 }
 
-/// Open а direct outbound TCP socket к `host:port` и bridge it
-/// bidirectionally с the inbound stream.  Used by both the
-/// `Direct` proxy mode и the `Fallback::Direct` recovery path.
+/// Open a direct outbound TCP socket to `host:port` and bridge it
+/// bidirectionally with the inbound stream.  Used by both the
+/// `Direct` proxy mode and the `Fallback::Direct` recovery path.
 /// SSRF-filtered via [`connect_direct_vetted`] unless `allow_private`.
 pub async fn open_direct_and_bridge(
     inbound: TcpStream,
@@ -289,14 +289,14 @@ pub async fn open_direct_and_bridge(
     Ok(())
 }
 
-/// Resolve mode и dispatch — used by inbound handlers.  Returns
-/// `Ok(true)` if the connection was handled (either successfully или с
-/// а graceful close); `Ok(false)` if the policy was `Block`; `Err`
-/// для unexpected I/O failure.
+/// Resolve mode and dispatch — used by inbound handlers.  Returns
+/// `Ok(true)` if the connection was handled (either successfully or with
+/// a graceful close); `Ok(false)` if the policy was `Block`; `Err`
+/// for unexpected I/O failure.
 ///
 /// `try_veil` — closure that attempts the veil path; returns
-/// `Err` если veil leg failed (server unreachable / timeout / etc.).
-/// Caller passes а small async fn that closes over the AppHandle и
+/// `Err` if veil leg failed (server unreachable / timeout / etc.).
+/// Caller passes a small async fn that closes over the AppHandle and
 /// `(host, port)`.
 pub async fn dispatch<F, Fut>(
     cfg: &RoutingConfig,
@@ -330,7 +330,7 @@ where
                 }
                 crate::config::FallbackMode::Direct => {
                     log::warn!(
-                        "oproxy.routing: veil failed для {host}:{port}, falling back direct: {err}"
+                        "oproxy.routing: veil failed for {host}:{port}, falling back direct: {err}"
                     );
                     open_direct_and_bridge(inbound, host, port, cfg.allow_private).await?;
                     Ok(true)
@@ -382,7 +382,7 @@ mod tests {
         }
     }
 
-    // Shorthand для existing tests что только check the resolved mode.
+    // Shorthand for existing tests that only check the resolved mode.
     fn resolve_mode(cfg: &RoutingConfig, host: &str, port: u16) -> ProxyMode {
         resolve(cfg, host, port).mode
     }
@@ -470,7 +470,7 @@ mod tests {
         assert_eq!(resolve_mode(&cfg, "10.0.0.5", 22), ProxyMode::Direct);
         assert_eq!(resolve_mode(&cfg, "10.255.255.255", 22), ProxyMode::Direct);
         assert_eq!(resolve_mode(&cfg, "172.16.0.1", 22), ProxyMode::Veil);
-        // Hostname (not IP literal) does NOT match а cidr rule.
+        // Hostname (not IP literal) does NOT match a cidr rule.
         assert_eq!(resolve_mode(&cfg, "10.example.com", 22), ProxyMode::Veil);
     }
 
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn conjunction_of_fields_in_single_rule() {
-        // Rule: tcp к 192.168.0.0/16 на port 22 only → Direct.
+        // Rule: tcp to 192.168.0.0/16 on port 22 only → Direct.
         let r = RoutingRule {
             host_suffix: None,
             host_exact: None,
@@ -594,9 +594,9 @@ mod tests {
             default: ProxyMode::Direct,
             fallback: FallbackMode::Direct, // global default
             rules: vec![
-                // 10.0.0.0/8 — veil с fallback к direct (inherits global)
+                // 10.0.0.0/8 — veil with fallback to direct (inherits global)
                 rule_cidr_with_fallback("10.0.0.0/8", ProxyMode::Veil, None),
-                // 172.16.0.0/12 — veil с per-rule "fail" override
+                // 172.16.0.0/12 — veil with per-rule "fail" override
                 rule_cidr_with_fallback("172.16.0.0/12", ProxyMode::Veil, Some(FallbackMode::Fail)),
             ],
             allow_private: false,
@@ -611,8 +611,8 @@ mod tests {
         assert_eq!(d172.fallback, FallbackMode::Fail); // per-rule override
     }
 
-    /// Documents the user-asked scenario от audit batch 2026-05-24:
-    /// * 10.0.0.0/8  → veil, fallback к direct
+    /// Documents the user-asked scenario from audit batch 2026-05-24:
+    /// * 10.0.0.0/8  → veil, fallback to direct
     /// * 172.16.0.0/12 → veil, no fallback
     /// * 192.168.0.0/16 → direct (never veil)
     #[test]
@@ -628,7 +628,7 @@ mod tests {
             allow_private: false,
         };
 
-        // 10.x.x.x — veil, fall back к direct on failure
+        // 10.x.x.x — veil, fall back to direct on failure
         let d = resolve(&cfg, "10.42.1.1", 5432);
         assert_eq!(d.mode, ProxyMode::Veil);
         assert_eq!(d.fallback, FallbackMode::Direct);
@@ -638,7 +638,7 @@ mod tests {
         assert_eq!(d.mode, ProxyMode::Veil);
         assert_eq!(d.fallback, FallbackMode::Fail);
 
-        // 172.32.x — does NOT match /12 (12.0..31.255 only), falls through к default
+        // 172.32.x — does NOT match /12 (12.0..31.255 only), falls through to default
         let d = resolve(&cfg, "172.32.0.1", 5432);
         assert_eq!(d.mode, ProxyMode::Veil); // default
         assert_eq!(d.fallback, FallbackMode::Fail); // global

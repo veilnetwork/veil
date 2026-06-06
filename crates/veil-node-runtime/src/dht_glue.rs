@@ -21,10 +21,10 @@ use veil_routing::{probe::RttTable, vivaldi::VivaldiCoord};
 pub type PeerVivaldiCache = Arc<RwLock<HashMap<NodeIdBytes, (VivaldiCoord, Instant)>>>;
 
 // ── FrameRouter ───────────────────────────────────────────────────────────────
-// `impl veil_dht::FrameRouter for SessionOutbox` moved к
-// `veil_session::outbox` после Phase 2 session 2 — see
+// `impl veil_dht::FrameRouter for SessionOutbox` moved to
+// `veil_session::outbox` after Phase 2 session 2 — see
 // `crates/veil-session/src/outbox.rs`.  Orphan-rule consequence:
-// neither trait nor struct is local к veilcore after the move.
+// neither trait nor struct is local to veilcore after the move.
 
 // ── RttHint ───────────────────────────────────────────────────────────────────
 

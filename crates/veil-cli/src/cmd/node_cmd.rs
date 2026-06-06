@@ -32,9 +32,9 @@ pub fn handle_node_command<I: CommandIo, O: ConfigOps>(
         NodeCommand::Restart => request_node_command(&mut context, node::AdminCommand::Restart),
         NodeCommand::Reload => request_node_command(&mut context, node::AdminCommand::Reload),
         NodeCommand::ApplyConfig { path, persist } => {
-            // Read the TOML content от disk or stdin. Use std::io
-            // directly — at this point we ара still in the CLI process
-            // before connecting к the daemon's admin socket.
+            // Read the TOML content from disk or stdin. Use std::io
+            // directly — at this point we are still in the CLI process
+            // before connecting to the daemon's admin socket.
             let toml_content = if path.as_os_str() == "-" {
                 let mut buf = String::new();
                 std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(|e| {
@@ -182,11 +182,11 @@ fn run_node<I: CommandIo, O: ConfigOps>(
     daemon_child: bool,
     defer_init: bool,
 ) -> veil_cfg::Result<()> {
-    // **--defer-init**: daemon boots с а stub config + ephemeral identity,
-    // awaits а runtime `admin apply-config` к provide the real config.
+    // **--defer-init**: daemon boots with a stub config + ephemeral identity,
+    // awaits a runtime `admin apply-config` to provide the real config.
     // Background-spawn mode is unsupported (the child would inherit the
     // stub temp-dir but lose access on parent exit) — caller must use
-    // `--foreground` together с `--defer-init`.
+    // `--foreground` together with `--defer-init`.
     if defer_init {
         if !foreground {
             return Err(veil_cfg::ConfigError::ValidationFailed(
@@ -302,7 +302,7 @@ fn request_node_command<I: CommandIo, O: ConfigOps>(
                 }
             };
             // b: per-peer byte cap row. Only printed when
-            // operator opted в (cap >= 0) so non-mobile deployments
+            // operator opted in (cap >= 0) so non-mobile deployments
             // don't see noise about a feature they didn't enable.
             // When enabled, drop ratio gives operator decision aid:
             // 0% = "cap well-tuned"; high % = "cap may break legit
@@ -1423,7 +1423,7 @@ mod tests {
         // Non-mobile node: defaults — bg mode off, multiplier 1
         // (factor 1 = no scaling), AC sentinel battery 100, no
         // threshold configured. Operator sees "everything at
-        // baseline" с no scaling activity.
+        // baseline" with no scaling activity.
         let r = render_mobile_status(&sample_mobile_status(false, 1, 1, 100, None, 4, 1));
         let bg_line = r.lines().find(|l| l.contains("background mode")).unwrap();
         assert!(
@@ -1456,7 +1456,7 @@ mod tests {
         let bg_line = r.lines().find(|l| l.contains("background mode")).unwrap();
         assert!(
             bg_line.contains("ACTIVE"),
-            "ACTIVE must be uppercase для visibility: {bg_line}"
+            "ACTIVE must be uppercase for visibility: {bg_line}"
         );
         assert!(
             bg_line.contains("60×"),
@@ -1469,7 +1469,7 @@ mod tests {
         // Phone at 25% with threshold=30 + multiplier=4 → battery
         // factor 4, route-probes throttled. Renderer surfaces
         // "below threshold; route-probes stretched 4×" so
-        // operator sees connection between current battery и
+        // operator sees connection between current battery and
         // observed slower route-probe cadence.
         let r = render_mobile_status(&sample_mobile_status(false, 1, 1, 25, Some(30), 4, 4));
         let bat_line = r.lines().find(|l| l.contains("battery level")).unwrap();
@@ -1506,15 +1506,15 @@ mod tests {
     fn epic484_5_mobile_status_clamping_caps_documented_in_output() {
         // Operator sees the MAX cap inline so they understand why
         // an absurd misconfig gets clamped. Verify both caps
-        // appear в output (background MAX=120, battery MAX=16).
+        // appear in output (background MAX=120, battery MAX=16).
         let r = render_mobile_status(&sample_mobile_status(true, 60, 60, 50, Some(30), 4, 1));
         assert!(
             r.contains("MAX=120"),
-            "background MAX cap must appear для operator awareness: {r}"
+            "background MAX cap must appear for operator awareness: {r}"
         );
         assert!(
             r.contains("MAX=16"),
-            "battery MAX cap must appear для operator awareness: {r}"
+            "battery MAX cap must appear for operator awareness: {r}"
         );
     }
 

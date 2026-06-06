@@ -1,20 +1,20 @@
-//! m: slab-allocated shared cells для `PooledShared`.
+//! m: slab-allocated shared cells for `PooledShared`.
 //!
 //! ## Problem
 //!
-//! Each `Pooled::into_shared` или `pooled_shared_from_vec` previously
+//! Each `Pooled::into_shared` or `pooled_shared_from_vec` previously
 //! ran `Arc::new(PooledSharedInner{…})`, allocating ~64 bytes from jemalloc
-//! every time. At sustained ~14k frames/sec на а forwarder bootstrap
+//! every time. At sustained ~14k frames/sec on a forwarder bootstrap
 //! that's ~900 KB/sec of small-bin allocator churn outside the bufpool —
 //! enough to keep jemalloc's small-bin arena dirty faster than
 //! `dirty_decay_ms=1000` could release pages. Result: linear RSS growth
-//! ~5 MiB/min на high-throughput hosts despite ALL upstream buffers
-//! capped, queue gauges flat, и pool serving 99.99 % cache-hits.
+//! ~5 MiB/min on high-throughput hosts despite ALL upstream buffers
+//! capped, queue gauges flat, and pool serving 99.99 % cache-hits.
 //!
 //! ## Design
 //!
-//! Replace `Arc<PooledSharedInner>` с а custom refcounted handle that
-//! points into а pre-allocated slab of fixed-size cells.
+//! Replace `Arc<PooledSharedInner>` with a custom refcounted handle that
+//! points into a pre-allocated slab of fixed-size cells.
 //!
 //! ```text
 //! static SHARED_SLAB: SharedSlab = SharedSlab {
@@ -27,18 +27,18 @@
 //! * `refcount: AtomicUsize` — Arc-style strong count (no weak refs).
 //! * `inner: UnsafeCell<MaybeUninit<PooledSharedInner>>` — payload.
 //!
-//! When the slab is full, callers fall back к heap-allocated
+//! When the slab is full, callers fall back to heap-allocated
 //! `Box<SharedCell>` (counter: `fallback_alloc_total`). This keeps
-//! correctness под burst load while making the steady state allocation-
+//! correctness under burst load while making the steady state allocation-
 //! free.
 //!
 //! ## Safety
 //!
-//! Standard Arc patterns с manual control:
+//! Standard Arc patterns with manual control:
 //! Release ordering on `fetch_sub`, Acquire fence on last-decrement.
 //! `MaybeUninit` prevents Drop running on uninitialised cells.
 //! Cells in the freelist are logically uninitialised; their `inner`
-//! field is NOT dropped until the next `acquire` initialises и
+//! field is NOT dropped until the next `acquire` initialises and
 //! uses it.
 
 use std::cell::UnsafeCell;
@@ -50,29 +50,29 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::PooledSharedInner;
 
-/// Default slab size — sized к cover steady-state inflight count
-/// (~8 sessions × 64-frame queues × 4 stages ≈ 2k) с headroom.
+/// Default slab size — sized to cover steady-state inflight count
+/// (~8 sessions × 64-frame queues × 4 stages ≈ 2k) with headroom.
 /// At ~80 bytes per cell that's ~320 KiB pre-allocated at process
-/// startup, освобождаемая only at process exit.
+/// startup, released only at process exit.
 pub const DEFAULT_SLAB_CELLS: usize = 4096;
 
 /// Single slab cell — Arc-style refcount + payload. Layout is
 /// load-bearing: `refcount` MUST be `AtomicUsize` for cross-thread
 /// release/acquire semantics; the payload is `MaybeUninit` so we
-/// can leave cells logically uninitialised while на the freelist
-/// без double-dropping.
+/// can leave cells logically uninitialised while on the freelist
+/// without double-dropping.
 #[repr(C)]
 pub(crate) struct SharedCell {
     pub(crate) refcount: AtomicUsize,
     pub(crate) inner: UnsafeCell<MaybeUninit<PooledSharedInner>>,
     /// Slab index for return-to-freelist on last drop. `u32::MAX`
-    /// flags а heap-fallback cell (Box::leak, freed normally).
+    /// flags a heap-fallback cell (Box::leak, freed normally).
     pub(crate) slot: u32,
 }
 
-// SAFETY: SharedCell is heap-allocated и refcount uses atomic
+// SAFETY: SharedCell is heap-allocated and refcount uses atomic
 // operations; the UnsafeCell content is read only while refcount > 0
-// и read-only (PooledSharedInner has Deref<Target=[u8]> but no
+// and read-only (PooledSharedInner has Deref<Target=[u8]> but no
 // interior mutation), so multi-thread access via shared reference is
 // sound when refcount > 1.
 unsafe impl Send for SharedCell {}
@@ -98,8 +98,8 @@ impl SharedSlab {
                 inner: UnsafeCell::new(MaybeUninit::uninit()),
                 slot: i as u32,
             });
-            // Pre-populate freelist в reverse so pop returns 0, 1, 2…
-            // первый, simplifying determinism in tests.
+            // Pre-populate freelist in reverse so pop returns 0, 1, 2…
+            // first, simplifying determinism in tests.
             free.push((cap - 1 - i) as u32);
         }
         Self {
@@ -110,9 +110,9 @@ impl SharedSlab {
         }
     }
 
-    /// Acquire а cell from the slab. When the slab is empty, allocates
-    /// а heap fallback cell (Box::leak) и increments
-    /// `fallback_alloc_total`. The returned pointer is non-null и
+    /// Acquire a cell from the slab. When the slab is empty, allocates
+    /// a heap fallback cell (Box::leak) and increments
+    /// `fallback_alloc_total`. The returned pointer is non-null and
     /// remains valid until the last `PooledSharedRef` referencing it
     /// drops.
     pub(crate) fn acquire(&'static self, init: PooledSharedInner) -> NonNull<SharedCell> {
@@ -128,8 +128,8 @@ impl SharedSlab {
             cell.refcount.store(1, Ordering::Relaxed);
             NonNull::from(cell)
         } else {
-            // Slab exhausted — leak а heap-allocated cell. `slot=u32::MAX`
-            // tells `release` to free it via Box rather than return к
+            // Slab exhausted — leak a heap-allocated cell. `slot=u32::MAX`
+            // tells `release` to free it via Box rather than return to
             // the slab.
             self.fallback_alloc_total.fetch_add(1, Ordering::Relaxed);
             let boxed = Box::new(SharedCell {
@@ -137,7 +137,7 @@ impl SharedSlab {
                 inner: UnsafeCell::new(MaybeUninit::new(init)),
                 slot: u32::MAX,
             });
-            // SAFETY: Box::leak returns а valid &'static reference;
+            // SAFETY: Box::leak returns a valid &'static reference;
             // we control the de-allocation in `release`.
             let r: &'static SharedCell = Box::leak(boxed);
             NonNull::from(r)
@@ -163,22 +163,22 @@ impl SharedSlab {
     }
 
     /// Called from `PooledSharedRef::drop` on the last decrement (rc→0).
-    /// Drops the payload в place и returns the cell к the freelist
-    /// (or frees the Box if it was а fallback cell).
+    /// Drops the payload in place and returns the cell to the freelist
+    /// (or frees the Box if it was a fallback cell).
     ///
     /// # Safety
     /// Caller MUST guarantee this is the LAST reference (rc dropped 1→0)
-    /// и that no other thread holds а pointer к the cell. An Acquire
-    /// fence at the call site is required к synchronise с the prior
+    /// and that no other thread holds a pointer to the cell. An Acquire
+    /// fence at the call site is required to synchronise with the prior
     /// Release stores from other references.
     pub(crate) unsafe fn release(&'static self, ptr: NonNull<SharedCell>) {
         let cell: &SharedCell = unsafe { ptr.as_ref() };
-        // Drop the payload в place. After this `inner` is logically
+        // Drop the payload in place. After this `inner` is logically
         // uninitialised again.
         unsafe { (*cell.inner.get()).assume_init_drop() };
 
         if cell.slot == u32::MAX {
-            // Heap-fallback cell — reconstruct the Box и let it drop.
+            // Heap-fallback cell — reconstruct the Box and let it drop.
             // SAFETY: we created this via `Box::leak`, so `Box::from_raw`
             // is sound. The cell's `inner` was just dropped above;
             // dropping the Box now will free the SharedCell allocation.
@@ -232,7 +232,7 @@ pub(crate) fn global() -> &'static SharedSlab {
 }
 
 /// Acquire a refcounted slab cell, writing `inner` into the slot.
-/// Returns а raw pointer that the caller wraps в `PooledShared`.
+/// Returns a raw pointer that the caller wraps in `PooledShared`.
 pub(crate) fn acquire(inner: PooledSharedInner) -> NonNull<SharedCell> {
     global().acquire(inner)
 }
@@ -251,13 +251,13 @@ pub(crate) unsafe fn clone_cell(cell: NonNull<SharedCell>) {
     // Relaxed is sufficient for clone: the new ref doesn't observe
     // anything beyond what the cloning thread already saw.
     let prev = c.refcount.fetch_add(1, Ordering::Relaxed);
-    // Guard против refcount overflow (impossible in practice but
+    // Guard against refcount overflow (impossible in practice but
     // defensive — Rust's std::sync::Arc does the same check).
     debug_assert!(prev > 0, "clone of dropped SharedCell");
     debug_assert!(prev < usize::MAX / 2, "refcount near overflow");
 }
 
-/// Decrement refcount on `cell`; if it hits zero, return the cell к
+/// Decrement refcount on `cell`; if it hits zero, return the cell to
 /// the slab freelist (or free the heap fallback).
 ///
 /// # Safety
@@ -266,17 +266,17 @@ pub(crate) unsafe fn clone_cell(cell: NonNull<SharedCell>) {
 /// reused by another thread immediately).
 pub(crate) unsafe fn drop_cell(cell: NonNull<SharedCell>) {
     let c = unsafe { cell.as_ref() };
-    // Release on decrement к synchronise our writes к the payload с
+    // Release on decrement to synchronise our writes to the payload with
     // other threads' Acquire on the last decrement. Matches Arc.
     let prev = c.refcount.fetch_sub(1, Ordering::Release);
     if prev != 1 {
         return;
     }
     // We just observed the 1→0 transition. Issue an Acquire fence so
-    // we synchronise с all prior Release decrements от other threads.
+    // we synchronise with all prior Release decrements from other threads.
     fence(Ordering::Acquire);
     // SAFETY: refcount was 1 before our decrement, so no other thread
-    // holds а pointer к the cell. Release к the slab.
+    // holds a pointer to the cell. Release to the slab.
     unsafe { global().release(cell) };
 }
 
@@ -285,7 +285,7 @@ mod tests {
     use super::*;
 
     fn dummy_inner() -> PooledSharedInner {
-        // Minimal inner с орфан pool — drop is a no-op for bucket_idx=None.
+        // Minimal inner with an orphan pool — drop is a no-op for bucket_idx=None.
         PooledSharedInner {
             buf: Vec::new(),
             bucket_idx: None,
@@ -316,16 +316,16 @@ mod tests {
             drop_cell(p);
         }
         let stats_after = stats();
-        // Cell returned к slab — inflight should be back to whatever it
-        // was before. (Not strictly equal в parallel tests, но
+        // Cell returned to slab — inflight should be back to whatever it
+        // was before. (Not strictly equal in parallel tests, but
         // inflight should not have grown beyond the snapshot's peak.)
         assert!(stats_after.cells_inflight <= stats_before.cells_inflight.max(1));
     }
 
     #[test]
     fn slab_exhaustion_falls_back_to_heap() {
-        // Build а private mini-slab so other parallel tests don't
-        // race с us on the global one.
+        // Build a private mini-slab so other parallel tests don't
+        // race with us on the global one.
         let local: &'static SharedSlab = Box::leak(Box::new(SharedSlab::new(2)));
         let a = local.acquire(dummy_inner());
         let b = local.acquire(dummy_inner());
@@ -334,13 +334,13 @@ mod tests {
         unsafe {
             // Release in mixed order to exercise both paths.
             //
-            // SAFETY: each pointer is а valid SharedCell с rc=1.
+            // SAFETY: each pointer is a valid SharedCell with rc=1.
             let cell_a = a.as_ref();
             let cell_b = b.as_ref();
             let cell_c = c.as_ref();
             // Force the slab pointer indirection to use `local` (not
             // global) by calling.release directly. Mimics
-            // drop_cell's flow без routing к the wrong slab.
+            // drop_cell's flow without routing to the wrong slab.
             cell_a.refcount.fetch_sub(1, Ordering::Release);
             fence(Ordering::Acquire);
             local.release(a);

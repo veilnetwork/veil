@@ -193,8 +193,8 @@ impl Default for BuiltinAppHost {
 
 impl Drop for BuiltinAppHost {
     /// Best-effort cleanup when the host is dropped without an explicit
-    /// `shutdown.await`. Fires the shutdown watch и aborts every
-    /// outstanding task. Necessary for the NodeRuntime path где stop
+    /// `shutdown.await`. Fires the shutdown watch and aborts every
+    /// outstanding task. Necessary for the NodeRuntime path where stop
     /// runs in a sync `Drop` context (e.g. on panic-unwind) — async
     /// shutdown is unavailable, abort is the only fallback. Tasks
     /// that registered on `ctx.shutdown` may have already exited

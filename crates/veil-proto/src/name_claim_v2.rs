@@ -412,8 +412,9 @@ mod tests {
 
     #[test]
     fn normalize_rejects_unicode() {
-        // Cyrillic, looks like ASCII — classic homoglyph attack.
-        let err = normalize_name("alice").unwrap_err();
+        // Cyrillic 'а' (U+0430), looks like ASCII 'a' — classic homoglyph
+        // attack. INTENTIONAL non-ASCII test input; do not "fix" to Latin.
+        let err = normalize_name("аlice").unwrap_err();
         assert!(matches!(err, NameError::InvalidChar(_)), "{err:?}");
 
         // Accented Latin.
@@ -577,7 +578,7 @@ mod tests {
         bytes.extend_from_slice(&NAME_CLAIM_MAGIC);
         bytes.push(NAME_CLAIM_V1);
         bytes.extend_from_slice(&c.node_id);
-        // Put a valid UTF-8 multibyte character (cyrillic 'а' = C2 B0? actually C3 A0...).
+        // Put a valid UTF-8 multibyte character (cyrillic 'a' = C2 B0? actually C3 A0...).
         // Use a byte > 0x7F to ensure is_allowed_byte rejects it.
         let bad_name = &[0xC3, 0xA1]; // "á"
         bytes.push(bad_name.len() as u8);

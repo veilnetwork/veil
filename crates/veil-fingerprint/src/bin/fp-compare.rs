@@ -1,8 +1,8 @@
 //! `fp-compare` — pairwise n-gram fingerprint comparison CLI.
 //!
-//! Operator-facing diagnostic: takes two byte-streams (raw .bin или
-//! .pcap captures) и prints chi² / KL-divergence + а pass/fail signal
-//! against а configurable threshold.
+//! Operator-facing diagnostic: takes two byte-streams (raw .bin or
+//! .pcap captures) and prints chi² / KL-divergence + a pass/fail signal
+//! against a configurable threshold.
 //!
 //! ## Usage
 //!
@@ -10,27 +10,27 @@
 //! fp-compare [OPTIONS] <SAMPLE> <REFERENCE>
 //!
 //! ARGS:
-//!   <SAMPLE>     Path к the sample byte stream (your veil capture).
-//!   <REFERENCE>  Path к the reference byte stream (Chrome HTTPS, uniform
-//!                random, или another veil run).
+//!   <SAMPLE>     Path to the sample byte stream (your veil capture).
+//!   <REFERENCE>  Path to the reference byte stream (Chrome HTTPS, uniform
+//!                random, or another veil run).
 //!
 //! OPTIONS:
 //!   --n <N>            N-gram length 1..=4 (default 1 = unigram).
 //!   --port <PORT>      Filter pcap by TCP/UDP port (either src or dst).
-//!                      Ignored для raw .bin files.
+//!                      Ignored for raw .bin files.
 //!   --threshold <CHI²> Pass/fail threshold for chi-squared (default 0.05).
 //!                      Sample chi² < threshold ⇒ pass (looks like ref).
-//!   --pcap-sample      Treat SAMPLE as а pcap file.
-//!   --pcap-reference   Treat REFERENCE as а pcap file.
+//!   --pcap-sample      Treat SAMPLE as a pcap file.
+//!   --pcap-reference   Treat REFERENCE as a pcap file.
 //! ```
 //!
 //! ## Exit codes
 //!
-//! - 0 — chi² и KL both below threshold (pass; sample looks like reference).
+//! - 0 — chi² and KL both below threshold (pass; sample looks like reference).
 //! - 1 — chi² OR KL above threshold (fail; statistically distinguishable).
 //! - 2 — usage error / I/O failure / corrupted input.
 //!
-//! Use в CI / regression scripts:
+//! Use in CI / regression scripts:
 //!
 //! ```bash
 //! cargo run -p veil-fingerprint --features pcap --bin fp-compare -- \
@@ -67,7 +67,7 @@ fn print_usage() {
            --pcap-sample      Parse SAMPLE as pcap (.pcap/.pcapng)\n  \
            --pcap-reference   Parse REFERENCE as pcap\n\n\
          EXIT CODES:\n  \
-           0 — chi² и KL both below threshold (pass)\n  \
+           0 — chi² and KL both below threshold (pass)\n  \
            1 — distinguishable (fail)\n  \
            2 — I/O error or usage error"
     );
@@ -95,7 +95,7 @@ fn parse_args() -> Result<Args, String> {
                 i += 1;
                 n = raw
                     .get(i)
-                    .ok_or("--n needs а value")?
+                    .ok_or("--n needs a value")?
                     .parse()
                     .map_err(|e| format!("--n: {e}"))?;
             }
@@ -103,7 +103,7 @@ fn parse_args() -> Result<Args, String> {
                 i += 1;
                 port_filter = Some(
                     raw.get(i)
-                        .ok_or("--port needs а value")?
+                        .ok_or("--port needs a value")?
                         .parse()
                         .map_err(|e| format!("--port: {e}"))?,
                 );
@@ -112,7 +112,7 @@ fn parse_args() -> Result<Args, String> {
                 i += 1;
                 threshold = raw
                     .get(i)
-                    .ok_or("--threshold needs а value")?
+                    .ok_or("--threshold needs a value")?
                     .parse()
                     .map_err(|e| format!("--threshold: {e}"))?;
             }
@@ -168,7 +168,7 @@ fn load_into_model(
         {
             let _ = port_filter; // suppress unused-var warning
             return Err(format!(
-                "{}: pcap support not compiled in — rebuild с --features pcap",
+                "{}: pcap support not compiled in — rebuild with --features pcap",
                 path.display()
             ));
         }

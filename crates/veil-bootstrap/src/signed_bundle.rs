@@ -279,7 +279,7 @@ fn decode_body(buf: &[u8]) -> Result<DecodedBody<'_>, SignedBundleError> {
     }
     let algo_byte = read(buf, &mut p, 1)?[0];
     let issuer_algo = algo_from_u8(algo_byte)?;
-    // replaced `try_into.unwrap` cluster с
+    // replaced `try_into.unwrap` cluster with
     // `read_u*_be` helpers — same wire format, no `.unwrap`.
     let pk_len = read_u16_be(buf, &mut p)? as usize;
     let issuer_pk = read(buf, &mut p, pk_len)?;

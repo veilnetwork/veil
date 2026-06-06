@@ -501,8 +501,8 @@ impl FrameDispatcher {
                 if let Some(m) = &self.metrics {
                     m.inc_backpressure_received();
                 }
-                // j: demoted к DEBUG. Backpressure signals fire
-                // every congestion window adjustment под heavy load; aggregate
+                // j: demoted to DEBUG. Backpressure signals fire
+                // every congestion window adjustment under heavy load; aggregate
                 // visibility via `veil_backpressure_received_total` counter.
                 self.logger.debug(
                     "session.backpressure_received",

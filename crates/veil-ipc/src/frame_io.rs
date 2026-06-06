@@ -1,14 +1,14 @@
 //! Low-level frame I/O helpers for IPC transport.
 //!
-//! Three small async functions read и write `OVL1`-framed IPC payloads on
-//! top of `crate::transport::{IpcReadHalf, IpcWriteHalf, IpcStream}`, plus а
-//! sync encoder that builds а complete pooled frame buffer for queueing
+//! Three small async functions read and write `OVL1`-framed IPC payloads on
+//! top of `crate::transport::{IpcReadHalf, IpcWriteHalf, IpcStream}`, plus a
+//! sync encoder that builds a complete pooled frame buffer for queueing
 //! before flushing.
 //!
 //! Pooled-buffer rationale: the daemon → chat-node delivery path runs at
 //! ~200 frames/sec × 60 KiB encrypted payloads.  Reusing buffers from
 //! `veil_bufpool::global()` eliminates the dominant `Vec` allocation that
-//! previously fed both jemalloc dirty-page retention и the bounded delivery
+//! previously fed both jemalloc dirty-page retention and the bounded delivery
 //! channel; without pooling, default-decay jemalloc holds ~100-200 MiB RSS
 //! that the process never reclaims.
 
@@ -16,11 +16,11 @@ use crate::transport::{IpcReadHalf, IpcStream, IpcWriteHalf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use veil_proto::{FrameFamily, FrameHeader, codec};
 
-/// Build а complete IPC OVL1 frame (`LocalApp` family) from а `msg_type` и
+/// Build a complete IPC OVL1 frame (`LocalApp` family) from a `msg_type` and
 /// `body` bytes, allocating from the global buffer pool.
 ///
 /// Debug-asserts that `body.len() <= u32::MAX`; release builds saturate to
-/// `u32::MAX` because callers don't have а fallible signature, but this
+/// `u32::MAX` because callers don't have a fallible signature, but this
 /// case is unreachable in practice — `MAX_FRAME_BODY` is 16 MiB.
 pub(crate) fn encode_ipc_frame(msg_type: u16, body: &[u8]) -> veil_bufpool::PooledShared {
     debug_assert!(
@@ -38,13 +38,13 @@ pub(crate) fn encode_ipc_frame(msg_type: u16, body: &[u8]) -> veil_bufpool::Pool
     p.into_shared()
 }
 
-/// Hard upper-bound on the time а frame body может ждать после header
-/// successful read. Без deadline, а local IPC client может объявить body
-/// до 16 MiB and never push it — pinning RSS until the connection drops.
+/// Hard upper-bound on the time a frame body can wait after header
+/// successful read. Without deadline, a local IPC client can declare a body of
+/// up to 16 MiB and never push it — pinning RSS until the connection drops.
 /// At 256 clients × 16 MiB this is up to 4 GiB of pinned buffers.
 ///
-/// 30 seconds is generous даже для legacy slow disks / fuse FS на the
-/// app side, и still bounds the worst-case memory exposure к
+/// 30 seconds is generous even for legacy slow disks / fuse FS on the
+/// app side, and still bounds the worst-case memory exposure to
 /// `256 clients × 16 MiB × 30 s` of windowed risk.
 pub(crate) const BODY_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -52,11 +52,11 @@ pub(crate) const BODY_READ_DEADLINE: std::time::Duration = std::time::Duration::
 ///
 /// Acquires the body buffer from the global pool — see module docs for the
 /// jemalloc-retention rationale.  `decode_header` already rejects bodies
-/// larger than `MAX_FRAME_BODY`, so the acquisition is bounded в bytes.
-/// **Body read** is also bounded в time by [`BODY_READ_DEADLINE`]: после
+/// larger than `MAX_FRAME_BODY`, so the acquisition is bounded in bytes.
+/// **Body read** is also bounded in time by [`BODY_READ_DEADLINE`]: after
 /// successful header, the client must finish pushing body within 30 s
 /// or the read returns `TimedOut`. Closes the local-IPC memory-DoS
-/// vector where а stuck client kept а 16-MiB buffer pinned indefinitely.
+/// vector where a stuck client kept a 16-MiB buffer pinned indefinitely.
 pub(crate) async fn read_frame(
     rh: &mut IpcReadHalf,
 ) -> std::io::Result<(FrameHeader, veil_bufpool::Pooled)> {
@@ -85,7 +85,7 @@ pub(crate) async fn read_frame(
     Ok((header, body))
 }
 
-/// Encode и write а framed message to а split write half.
+/// Encode and write a framed message to a split write half.
 pub(crate) async fn write_frame_wh(
     wh: &mut IpcWriteHalf,
     family: u8,
@@ -104,7 +104,7 @@ pub(crate) async fn write_frame_wh(
     Ok(())
 }
 
-/// Encode и write а framed message to а non-split `IpcStream`.
+/// Encode and write a framed message to a non-split `IpcStream`.
 pub(crate) async fn write_frame_stream(
     stream: &mut IpcStream,
     family: u8,

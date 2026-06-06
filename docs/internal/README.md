@@ -32,21 +32,21 @@ anonymity stack, not here.
    ┌─────────▼──────────────────────────────────────────┐
    │ L7  Transport obfuscation                          │
    │     • obfs4 framing (ScrambleSuit successor)       │
-   │     • webtunnel (HTTPS-mimic с reverse proxy)      │
+   │     • webtunnel (HTTPS-mimic with reverse proxy)   │
    │     • FakeTLS (per-listener TLS-fingerprint clone) │
    │     • ECH opt-in (encrypted SNI)                   │
    ├────────────────────────────────────────────────────┤
    │ L6  Wire-format kill-switch                        │
-   │     • Magic ротация если variant published         │
+   │     • Magic rotation when variant published        │
    │     • Capability negotiation forward-compat        │
    ├────────────────────────────────────────────────────┤
    │ L5  Traffic mimicry                                │
    │     • Bandwidth-shaping profiles (HTTPS-burst, ... │
-   │     • Padding frames до MTU                        │
+   │     • Padding frames to MTU                        │
    ├────────────────────────────────────────────────────┤
    │ L4  Listener stealth                               │
    │     • PoW-gated rendezvous (port closed by default)│
-   │     • On-demand bind после verified handshake      │
+   │     • On-demand bind after verified handshake      │
    │     • Stealth visibility (DHT-suppressed)          │
    ├────────────────────────────────────────────────────┤
    │ L3  Bridge / gateway transit                       │
@@ -61,7 +61,7 @@ anonymity stack, not here.
    │ L1  Continuous validation                          │
    │     • Fingerprint regression suite (FINGERPRINT_*) │
    │     • n-gram analysis on outgoing wire traces      │
-   │     • CI-gated против JA3/JA4 drift                │
+   │     • CI-gated against JA3/JA4 drift               │
    └────────────────────────────────────────────────────┘
 ```
 
@@ -107,7 +107,7 @@ chooses the posture based on the target jurisdiction and risk tolerance.
 
 | File | Topic |
 |------|-------|
-| [`ANTICENSORSHIP_STRATEGY.md`](ANTICENSORSHIP_STRATEGY.md) | Full threat model, DPI vendor analysis (VAS Experts СКАТ etc), 35 evasion methods, roadmap |
+| [`ANTICENSORSHIP_STRATEGY.md`](ANTICENSORSHIP_STRATEGY.md) | Full threat model, DPI vendor analysis (VAS Experts SKAT etc), 35 evasion methods, roadmap |
 | [`censorship-target.md`](censorship-target.md) | Per-jurisdiction deployment guidance (operator-side) |
 | [`dpi-evasion.md`](dpi-evasion.md) | Architecture summary of what's built vs. planned |
 | [`DEPLOYMENT_HARDENING.md`](DEPLOYMENT_HARDENING.md) | Operator-side gap closure: CDN, AS-level, hosting choices |

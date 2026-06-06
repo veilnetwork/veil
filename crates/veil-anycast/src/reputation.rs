@@ -1,35 +1,35 @@
 //! Per-resolver-local anycast reputation slice.
 //!
-//! Phase A of the "Anycast quorum" mitigation: every resolver keeps а
-//! local count of (node_id, service_tag) → failure counter и applies it
-//! as а penalty during sort in [`crate::AnycastService::resolve`]. There
-//! is no wire protocol change и no cross-resolver gossip — а sybil that
+//! Phase A of the "Anycast quorum" mitigation: every resolver keeps a
+//! local count of (node_id, service_tag) → failure counter and applies it
+//! as a penalty during sort in [`crate::AnycastService::resolve`]. There
+//! is no wire protocol change and no cross-resolver gossip — a sybil that
 //! poisons one resolver's view does not affect any other resolver.
 //!
 //! ## Threat model addressed
 //!
 //! [`crate::AnycastService`] already breaks deterministic "score=0 wins"
-//! via XOR-distance tiebreak. That helps against а universal eclipse but
-//! does nothing against а sybil close к а particular resolver in XOR space.
-//! With reputation в the loop, even an XOR-close sybil pays а penalty per
+//! via XOR-distance tiebreak. That helps against a universal eclipse but
+//! does nothing against a sybil close to a particular resolver in XOR space.
+//! With reputation in the loop, even an XOR-close sybil pays a penalty per
 //! observed failure — after enough failures the sybil drops below honest
 //! candidates regardless of XOR proximity.
 //!
 //! ## What we deliberately do NOT do
 //!
 //! **No successes are tracked.** "I served the request" is peer-controlled
-//! at the wire level; counting successes lets а sybil rapid-fire 1-byte
-//! responses к inflate its own reputation. Failures are observable end-to-
-//! end (timeout, conn-refused, validation failure) и can't be self-faked.
+//! at the wire level; counting successes lets a sybil rapid-fire 1-byte
+//! responses to inflate its own reputation. Failures are observable end-to-
+//! end (timeout, conn-refused, validation failure) and can't be self-faked.
 //!
 //! **No decay over wall-clock time.** Failure counters are bounded only by
-//! LRU eviction — а stale node that hasn't been queried in days gets evicted
-//! as new entries flow in. Decay-on-time would let а sybil "wait out" its
+//! LRU eviction — a stale node that hasn't been queried in days gets evicted
+//! as new entries flow in. Decay-on-time would let a sybil "wait out" its
 //! penalty between attack waves; LRU-only means the entry persists as long
 //! as that resolver keeps querying that tag, which is what we want.
 //!
 //! **No cross-resolver sharing.** Phase B (gossip / signed reputation
-//! attestations) is out of scope. Per-resolver-local is а conservative
+//! attestations) is out of scope. Per-resolver-local is a conservative
 //! starting point: zero wire surface, zero new attack vectors, but still
 //! materially raises the cost of poisoning any individual resolver.
 
@@ -41,26 +41,26 @@ use veil_util::lock;
 
 /// Max number of (node_id, service_tag) entries kept in memory before LRU
 /// eviction kicks in. Each entry is ~48 bytes (32 + 4 + 12 counter), so
-/// 4096 ≈ 200 KiB which is а fine bound even on resource-constrained nodes.
+/// 4096 ≈ 200 KiB which is a fine bound even on resource-constrained nodes.
 pub const REPUTATION_LRU_CAP: usize = 4096;
 
 /// Score penalty added per recorded failure. The penalty is applied
-/// **linearly** к the existing peer-claimed `AnycastRecord.score` during
-/// sort, so honest operators advertising scores в the low-100s outrank
-/// а sybil after ~2–3 observed failures.
+/// **linearly** to the existing peer-claimed `AnycastRecord.score` during
+/// sort, so honest operators advertising scores in the low-100s outrank
+/// a sybil after ~2–3 observed failures.
 ///
 /// Tuning rationale: scores are u16 (range 0..=65535) but real deployments
-/// typically advertise в the 0..1000 range (latency-derived). 500 per
-/// failure pushes а compromised peer past most honest tiers within а
+/// typically advertise in the 0..1000 range (latency-derived). 500 per
+/// failure pushes a compromised peer past most honest tiers within a
 /// handful of observed misbehaviours without saturating the u32 offset
 /// even at adversarial-counter levels.
 pub const FAILURE_PENALTY_PER: u32 = 500;
 
 /// In-memory counter for one (node_id, service_tag) pair.
 ///
-/// `last_touch` is а monotonic logical tick — incremented on every
-/// `record_failure` или offset query — used purely for LRU eviction
-/// ordering. It is NOT а timestamp и has no semantics beyond "more
+/// `last_touch` is a monotonic logical tick — incremented on every
+/// `record_failure` or offset query — used purely for LRU eviction
+/// ordering. It is NOT a timestamp and has no semantics beyond "more
 /// recently touched > less recently touched".
 #[derive(Default, Debug, Clone, Copy)]
 struct Counter {
@@ -94,9 +94,9 @@ impl AnycastReputation {
         Self::default()
     }
 
-    /// Reputation slice with а custom LRU capacity. Use in tests or in
+    /// Reputation slice with a custom LRU capacity. Use in tests or in
     /// memory-constrained environments. Capacity of 0 disables tracking
-    /// entirely (every insert is а no-op; offset always returns 0).
+    /// entirely (every insert is a no-op; offset always returns 0).
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
@@ -112,7 +112,7 @@ impl AnycastReputation {
     /// Record one observed failure (timeout, conn-refused, validation
     /// reject) for the candidate `node_id` under `service_tag`.
     ///
-    /// Caller responsibility: only invoke after а concrete failure signal
+    /// Caller responsibility: only invoke after a concrete failure signal
     /// — not for "request slow" or "client cancelled". False positives
     /// here directly hurt honest operators.
     pub fn record_failure(&self, node_id: [u8; 32], service_tag: [u8; 4]) {
@@ -127,7 +127,7 @@ impl AnycastReputation {
 
         if inner.by_key.len() > self.cap {
             // Evict the single oldest entry. O(n) scan but only on insert-
-            // past-cap, which is rare на typical workloads.
+            // past-cap, which is rare on typical workloads.
             if let Some(victim_key) = inner
                 .by_key
                 .iter()
@@ -143,7 +143,7 @@ impl AnycastReputation {
     /// have been recorded. The offset is added to the peer-claimed score
     /// during sort in [`crate::AnycastService::resolve`].
     ///
-    /// Querying the offset touches the entry для LRU purposes так что
+    /// Querying the offset touches the entry for LRU purposes so that
     /// frequently-consulted entries stay resident.
     pub fn score_offset(&self, node_id: [u8; 32], service_tag: [u8; 4]) -> u32 {
         if self.cap == 0 {
@@ -225,16 +225,16 @@ mod tests {
     #[test]
     fn lru_evicts_oldest_when_over_cap() {
         let rep = AnycastReputation::with_capacity(3);
-        // Insert 3 entries — все остаются.
+        // Insert 3 entries — all remain.
         rep.record_failure([0x01; 32], *b"mbox");
         rep.record_failure([0x02; 32], *b"mbox");
         rep.record_failure([0x03; 32], *b"mbox");
         assert_eq!(rep.entry_count(), 3);
 
-        // Touch the first to bump its last_touch к the most recent tick.
+        // Touch the first to bump its last_touch to the most recent tick.
         let _ = rep.score_offset([0x01; 32], *b"mbox");
 
-        // Insert а 4th — over cap. Victim should be 0x02 (oldest now что
+        // Insert a 4th — over cap. Victim should be 0x02 (oldest now that
         // 0x01 was just touched).
         rep.record_failure([0x04; 32], *b"mbox");
         assert_eq!(rep.entry_count(), 3);
@@ -266,7 +266,7 @@ mod tests {
         for _ in 0..10 {
             rep.record_failure([0xAA; 32], *b"mbox");
         }
-        // Direct poke into the counter to push it close к saturation.
+        // Direct poke into the counter to push it close to saturation.
         {
             let mut inner = lock!(rep.inner);
             let c = inner.by_key.get_mut(&([0xAA; 32], *b"mbox")).unwrap();

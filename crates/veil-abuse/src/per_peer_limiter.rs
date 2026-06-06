@@ -8,12 +8,12 @@
 //!
 //! **The defence depends on `peer_id` being authenticated at the session /
 //! dispatcher layer.**  `PerPeerLimiter` keys its HashMap by `[u8; 32]`
-//! peer_id — if а malicious peer could forge that ID per-frame, it would
-//! get а fresh token bucket per fake ID и trivially bypass the limit.
+//! peer_id — if a malicious peer could forge that ID per-frame, it would
+//! get a fresh token bucket per fake ID and trivially bypass the limit.
 //!
-//! Authentication invariant: every frame delivered к а handler с а
-//! `peer_id` argument must come от а session that completed OVL1 handshake
-//! и signature verification (см. `SessionRunner::run`).  Tests / fixtures
+//! Authentication invariant: every frame delivered to a handler with a
+//! `peer_id` argument must come from a session that completed OVL1 handshake
+//! and signature verification (see `SessionRunner::run`).  Tests / fixtures
 //! that bypass this MUST not leak into production code paths.
 
 use std::{
@@ -79,7 +79,7 @@ pub struct PerPeerLimiter {
     bytes_allowed_total: u64,
     /// Cumulative bytes REJECTED by `allow_bytes` for being over
     /// the per-peer cap. Operator looks at this to decide if the
-    /// cap is "well-tuned" (low/zero drops) или "breaking legit
+    /// cap is "well-tuned" (low/zero drops) or "breaking legit
     /// traffic" (constant drops).
     bytes_dropped_total: u64,
 }
@@ -135,10 +135,10 @@ impl PerPeerLimiter {
     pub fn allow_bytes(&mut self, peer_id: [u8; 32], byte_count: usize) -> bool {
         let bps = match self.bytes_per_sec {
             Some(r) => r,
-            // Enforcement disabled: bytes pass через без accounting
-            // которое обновлялось бы конкурентно with (more
+            // Enforcement disabled: bytes pass through without accounting
+            // that would be updated concurrently with the (more
             // visible) node-aggregate `BandwidthGate.total_bytes`
-            // counter. Avoid double-counting на the audit surface.
+            // counter. Avoid double-counting on the audit surface.
             None => return true,
         };
         // Cap byte_entries to the same limit as frame-rate entries.
@@ -197,7 +197,7 @@ impl PerPeerLimiter {
     /// Cumulative bytes admitted by `allow_bytes` since this
     /// limiter was created OR last reload. `0` when byte-rate
     /// enforcement is not enabled (the early-return `true` path
-    /// doesn't account, к avoid double-counting с node-aggregate
+    /// doesn't account, to avoid double-counting with node-aggregate
     /// `BandwidthGate.total_bytes`).
     pub fn bytes_allowed_total(&self) -> u64 {
         self.bytes_allowed_total
@@ -205,7 +205,7 @@ impl PerPeerLimiter {
 
     /// Cumulative bytes REJECTED by `allow_bytes` for being over
     /// the per-peer cap. Operator-facing — looks at this to decide
-    /// if the cap is "well-tuned" (low/zero drops) или "breaking
+    /// if the cap is "well-tuned" (low/zero drops) or "breaking
     /// legit traffic" (constant drops). `0` when byte-rate
     /// enforcement is not enabled.
     pub fn bytes_dropped_total(&self) -> u64 {
@@ -407,7 +407,7 @@ mod tests {
     fn epic483_6b_byte_counters_zero_when_enforcement_disabled() {
         // Enforcement off (no with_byte_rate call) → allow_bytes
         // returns true unconditionally AND counters stay at zero
-        // (avoid double-counting с node-aggregate BandwidthGate).
+        // (avoid double-counting with node-aggregate BandwidthGate).
         let mut lim = PerPeerLimiter::new(1.0, 1.0, Duration::from_secs(60));
         assert!(lim.allow_bytes([1u8; 32], 1024));
         assert!(lim.allow_bytes([1u8; 32], 1024));
@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn epic483_6b_byte_counters_accumulate_when_enforcement_enabled() {
         // Cap = 1 KB/sec, burst = 2 KB. Sending 2 KB consumes
-        // burst; next 100 bytes gets dropped (no time для refill).
+        // burst; next 100 bytes gets dropped (no time for refill).
         let mut lim =
             PerPeerLimiter::new(1.0, 1.0, Duration::from_secs(60)).with_byte_rate(1024.0, 2048.0);
         let p = [1u8; 32];
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn epic483_6b_byte_counters_per_peer_isolated_in_aggregate() {
         // Two peers each send 2 KB through 2 KB burst → both
-        // succeed. Aggregate counter sums across peers (это
+        // succeed. Aggregate counter sums across peers (this
         // node-wide stat, not per-peer).
         let mut lim =
             PerPeerLimiter::new(1.0, 1.0, Duration::from_secs(60)).with_byte_rate(1024.0, 2048.0);
@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn epic483_6b_byte_counters_track_drops_separately_from_admits() {
         // Burst exhausted by first call; subsequent drops accumulate
-        // separately. Lock в the separation so a renaming refactor
+        // separately. Lock in the separation so a renaming refactor
         // (e.g. swap allowed/dropped fields) gets caught.
         let mut lim =
             PerPeerLimiter::new(1.0, 1.0, Duration::from_secs(60)).with_byte_rate(1024.0, 1024.0);

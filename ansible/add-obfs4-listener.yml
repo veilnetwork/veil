@@ -31,7 +31,7 @@
       register: listen_line
       changed_when: false
 
-    - name: Fail если listen line not found
+    - name: Fail if listen line not found
       ansible.builtin.fail:
         msg: "No listen= line in /var/lib/veil/node.toml"
       when: listen_line.stdout == ""
@@ -51,10 +51,10 @@
           ]
 
     # Only replace the TOP-LEVEL listen line — the one before any
-    # [section] header.  Using ansible.builtin.replace с а regex що
+    # [section] header.  Using ansible.builtin.replace with a regex that
     # matches `^listen\s*=` would clobber `[metrics] listen` too, which
-    # is а string field.  Use Python для clean multi-line replacement.
-    - name: Replace TOP-LEVEL listen line с two-entry version
+    # is a string field.  Use Python for clean multi-line replacement.
+    - name: Replace TOP-LEVEL listen line with two-entry version
       ansible.builtin.shell:
         cmd: |
           python3 << 'PYEOF'
@@ -90,7 +90,7 @@
         name: veil.service
         state: restarted
 
-    - name: Wait для metrics endpoint
+    - name: Wait for metrics endpoint
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 60); do
@@ -109,7 +109,7 @@
       ansible.builtin.debug:
         var: wait_result.stdout
 
-    - name: Check journal для obfs4-tcp listen confirmation
+    - name: Check journal for obfs4-tcp listen confirmation
       ansible.builtin.shell:
         cmd: |
           journalctl -u veil.service --since "1 minute ago" --no-pager | \
@@ -129,9 +129,9 @@
 
     - name: Show socket check
       ansible.builtin.debug:
-        msg: "TCP listening на port {{ obfs4_port | default(obfs4_port_default) }}: {{ sock_check.stdout }}"
+        msg: "TCP listening on port {{ obfs4_port | default(obfs4_port_default) }}: {{ sock_check.stdout }}"
 
-    - name: Fail если socket not bound
+    - name: Fail if socket not bound
       ansible.builtin.fail:
         msg: "obfs4-tcp listener did NOT bind on {{ obfs4_port | default(obfs4_port_default) }}"
       when: sock_check.stdout | int < 1

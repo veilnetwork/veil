@@ -1,29 +1,29 @@
 //! Tokio-runtime configuration + factory helpers shared across binaries
 //! (veil-cli, ogate, oproxy).
 //!
-//! Each binary used к ship its own ad-hoc tokio init (veil-cli used
+//! Each binary used to ship its own ad-hoc tokio init (veil-cli used
 //! `GlobalConfig`, ogate read env vars `OGATE_RUNTIME` / `OGATE_WORKERS`,
 //! oproxy hard-coded `#[tokio::main(flavor = "multi_thread",
 //! worker_threads = 4)]`).  Audit batch 2026-05-23 consolidates them
-//! around а single struct + builder so operators get the same knobs
+//! around a single struct + builder so operators get the same knobs
 //! everywhere.
 
 use crate::model::RuntimeFlavor;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Tokio runtime knobs.  Designed к be embedded in any operator-facing
-/// TOML config under а `[runtime]` section, или flattened into а larger
+/// Tokio runtime knobs.  Designed to be embedded in any operator-facing
+/// TOML config under a `[runtime]` section, or flattened into a larger
 /// section (current use: `GlobalConfig`).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// `current_thread` (single-thread executor) или `multi_thread`
-    /// (work-stealing pool).  Defaults к multi-thread.
+    /// `current_thread` (single-thread executor) or `multi_thread`
+    /// (work-stealing pool).  Defaults to multi-thread.
     ///
-    /// Accepts both `flavor` и `runtime_flavor` keys на input (the
-    /// latter for backward-compat с older `[global]` configs that
-    /// used а flat schema).
+    /// Accepts both `flavor` and `runtime_flavor` keys on input (the
+    /// latter for backward-compat with older `[global]` configs that
+    /// used a flat schema).
     #[serde(default, alias = "runtime_flavor")]
     pub flavor: RuntimeFlavor,
 
@@ -32,12 +32,12 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_threads: Option<u16>,
 
-    /// Cap для `spawn_blocking` thread pool.  `None` → tokio default
+    /// Cap for `spawn_blocking` thread pool.  `None` → tokio default
     /// (= 512).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_blocking_threads: Option<u16>,
 
-    /// Idle timeout (milliseconds) before а worker thread is parked.
+    /// Idle timeout (milliseconds) before a worker thread is parked.
     /// `None` → tokio default (= 10 s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_keep_alive_ms: Option<u64>,
@@ -48,15 +48,15 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_name: Option<String>,
 
-    /// Per-thread stack size в bytes.  `None` → tokio default (= 2 MiB).
+    /// Per-thread stack size in bytes.  `None` → tokio default (= 2 MiB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_stack_size: Option<usize>,
 }
 
 impl RuntimeConfig {
-    /// Merge env-var overrides into а `RuntimeConfig`.  Used by ogate /
-    /// oproxy для backward-compatible deployments where existing systemd
-    /// units pass tuning через environment.  The env layer ALWAYS wins
+    /// Merge env-var overrides into a `RuntimeConfig`.  Used by ogate /
+    /// oproxy for backward-compatible deployments where existing systemd
+    /// units pass tuning through environment.  The env layer ALWAYS wins
     /// over the file when set (operator intent: "I added this var to
     /// override the config").
     ///
@@ -67,13 +67,13 @@ impl RuntimeConfig {
     /// * `<PREFIX>_WORKERS` — integer worker count
     /// * `<PREFIX>_MAX_BLOCKING_THREADS` — integer blocking pool cap
     ///
-    /// Pass а short uppercase prefix like `OGATE` or `OPROXY`.
+    /// Pass a short uppercase prefix like `OGATE` or `OPROXY`.
     pub fn apply_env_overrides(&mut self, prefix: &str) {
         if let Ok(v) = std::env::var(format!("{prefix}_RUNTIME")) {
             match v.as_str() {
                 "current_thread" => self.flavor = RuntimeFlavor::CurrentThread,
                 "multi_thread" => self.flavor = RuntimeFlavor::MultiThread,
-                _ => {} // ignore garbage so а typo doesn't break the daemon
+                _ => {} // ignore garbage so a typo doesn't break the daemon
             }
         }
         if let Ok(v) = std::env::var(format!("{prefix}_WORKERS"))
@@ -89,11 +89,11 @@ impl RuntimeConfig {
     }
 }
 
-/// Build а `tokio::runtime::Runtime` from а `RuntimeConfig`.
+/// Build a `tokio::runtime::Runtime` from a `RuntimeConfig`.
 ///
 /// Guards against zero values (`worker_threads(0)` panics inside tokio)
-/// by treating them as "leave unset" — the validator emits warnings но
-/// not all binaries run а validator.
+/// by treating them as "leave unset" — the validator emits warnings but
+/// not all binaries run a validator.
 pub fn build_tokio_runtime(cfg: &RuntimeConfig) -> std::io::Result<tokio::runtime::Runtime> {
     let mut builder = match cfg.flavor {
         RuntimeFlavor::CurrentThread => tokio::runtime::Builder::new_current_thread(),
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn env_overrides_apply() {
-        // Use а unique prefix per-test к avoid cross-test contamination
+        // Use a unique prefix per-test to avoid cross-test contamination
         // from leaked vars.
         let prefix = "VEILCFG_TEST_RT";
         unsafe {

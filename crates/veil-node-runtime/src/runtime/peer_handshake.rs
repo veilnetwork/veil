@@ -1,15 +1,15 @@
-//! Peer-handshake plumbing: drive а raw transport stream через `OVL1`
+//! Peer-handshake plumbing: drive a raw transport stream through `OVL1`
 //! handshake, install per-peer state into the session registry / caches,
-//! и attach the surviving session к the runtime as an
+//! and attach the surviving session to the runtime as an
 //! [`AttachedDebugSession`][].
 //!
 //! Three entry points:
 //!
 //! - [`register_connection_session`][] — main async pipeline that
-//!   handshakes а freshly-accepted (or freshly-dialed) transport stream,
-//!   verifies expected-peer invariants when applicable, и yields an
+//!   handshakes a freshly-accepted (or freshly-dialed) transport stream,
+//!   verifies expected-peer invariants when applicable, and yields an
 //!   `AttachedDebugSession`.  Drives RAII slot tracking via `IpSlotGuard`
-//!   и delegates teardown к `SessionGuard`.
+//!   and delegates teardown to `SessionGuard`.
 //! - [`cache_peer_handshake_state`][] — synchronous "commit" of one
 //!   completed `OvlHandshakeResult` into the seven per-peer caches.
 //! - [`peer_transport_context`][] — TLS-context fork-and-augment helper
@@ -49,7 +49,7 @@ pub struct RemoteHandshakeInfo {
     /// Base64-encoded public key (same encoding as `PeerConfigEntry.public_key`).
     pub public_key: String,
     pub nonce: String,
-    /// Session keying material derived от the X25519/ML-KEM shared secret.
+    /// Session keying material derived from the X25519/ML-KEM shared secret.
     pub session_keys: SessionKeys,
     /// Peer's last-known DHT discoverability preference extracted from
     /// `CapabilitiesPayload.discovery_mode`.
@@ -57,7 +57,7 @@ pub struct RemoteHandshakeInfo {
 }
 
 /// Per-peer identity invariants asserted by outbound dialers — the peer
-/// the operator configured к connect к (peer_id, public_key, node_id,
+/// the operator configured to connect to (peer_id, public_key, node_id,
 /// nonce).  Compared against the actual handshake result by
 /// [`verify_remote_peer_identity`][].
 #[derive(Clone)]
@@ -73,13 +73,13 @@ pub enum PeerVerificationError {
     NonceMismatch,
 }
 
-/// commit per-peer state from а completed OVL1 handshake.
+/// commit per-peer state from a completed OVL1 handshake.
 ///
 /// Extracted from `register_connection_session`.  Populates the session
-/// registry entry и seven per-peer caches (pubkey, role bits с
+/// registry entry and seven per-peer caches (pubkey, role bits with
 /// reputation-aware role downgrade, cap-flags, ML-KEM EK, battery,
-/// Vivaldi, hot-standby alt URI) от а single handshake result.  All work
-/// is synchronous — the caller remains responsible для any `await` points.
+/// Vivaldi, hot-standby alt URI) from a single handshake result.  All work
+/// is synchronous — the caller remains responsible for any `await` points.
 pub fn cache_peer_handshake_state(
     runtime: &SessionRuntimeContext,
     r: &OvlHandshakeResult,
@@ -89,28 +89,28 @@ pub fn cache_peer_handshake_state(
     // LOCK ORDER: canonical workspace-wide order (see session_guard.rs) is
     // `session_registry` (#3) → `peer_sovereign_identities` (#5).  However
     // the SessionEntry insert needs the `validated` value computed from
-    // the sovereign cache, и holding both locks simultaneously в inverted
-    // order would create а deadlock cycle against future code that takes
-    // them в canonical order.
+    // the sovereign cache, and holding both locks simultaneously in inverted
+    // order would create a deadlock cycle against future code that takes
+    // them in canonical order.
     //
     // We split the work into two sequential critical sections instead:
     //   (1) take `peer_sovereign_identities`, compute `validated`, drop.
-    //   (2) take `session_registry`, insert SessionEntry с `validated`.
+    //   (2) take `session_registry`, insert SessionEntry with `validated`.
     //
-    // А reader racing between (1) и (2) sees either old-registry +
-    // old-sovereign OR new-registry + new-sovereign — never а cross-
+    // A reader racing between (1) and (2) sees either old-registry +
+    // old-sovereign OR new-registry + new-sovereign — never a cross-
     // generation pair, because `validated` snapshot is captured at (1)
-    // и applied at (2).
+    // and applied at (2).
     let validated = {
         use veil_proto::budget::MAX_PEER_SOVEREIGN_IDENTITIES;
         let mut sovereign_g = lock!(runtime.identity.peer_sovereign_identities);
         match r.validated_sovereign_identity.clone() {
             Some(v) => {
-                // Full handshake completed — update the cache для future
+                // Full handshake completed — update the cache for future
                 // resumption events.  Cap unbounded HashMap growth.
                 // Random eviction (HashMap iter is non-deterministic) is
                 // acceptable here — cache hit/miss only affects resumption
-                // fast-path; missed entries trigger а full handshake.
+                // fast-path; missed entries trigger a full handshake.
                 if sovereign_g.len() >= MAX_PEER_SOVEREIGN_IDENTITIES
                     && !sovereign_g.contains_key(&peer_id)
                     && let Some(k) = sovereign_g.keys().next().copied()
@@ -122,8 +122,8 @@ pub fn cache_peer_handshake_state(
             }
             None => {
                 // Resumption path — look up the cached binding if we
-                // recorded one earlier.  Cached sovereign bindings от the
-                // resumption fast path are trusted unconditionally; а
+                // recorded one earlier.  Cached sovereign bindings from the
+                // resumption fast path are trusted unconditionally; a
                 // compromised subkey is mitigated by the document's short
                 // `valid_until_unix` window.
                 sovereign_g.get(&peer_id).cloned()
@@ -140,10 +140,10 @@ pub fn cache_peer_handshake_state(
         remote_role: r.remote_role,
         validated_sovereign_identity: validated,
     });
-    // Cache the peer's raw public key для signature verification.  Skip
+    // Cache the peer's raw public key for signature verification.  Skip
     // if public_key is empty — this happens during session resumption
     // (fast-path reconnect via ticket) where the synthetic IdentityPayload
-    // has no key.  Overwriting с empty would break routing-sig verify.
+    // has no key.  Overwriting with empty would break routing-sig verify.
     if !r.remote_identity_payload.public_key.is_empty() {
         lock!(runtime.identity.peer_pubkeys).insert_lru(
             r.remote_identity_payload.node_id,
@@ -163,7 +163,7 @@ pub fn cache_peer_handshake_state(
             veil_proto::budget::MAX_PEER_PUBKEYS_CACHE,
         );
     }
-    // Cache peer capability flags для relay filtering.
+    // Cache peer capability flags for relay filtering.
     {
         let mut flags_cache = runtime
             .dispatcher
@@ -182,9 +182,9 @@ pub fn cache_peer_handshake_state(
         );
     }
     // Cache the peer's ML-KEM-768 encapsulation key.  Enforce
-    // `MAX_PEER_MLKEM_CACHE` hard-cap с oldest-entry LRU eviction к
+    // `MAX_PEER_MLKEM_CACHE` hard-cap with oldest-entry LRU eviction to
     // prevent unbounded growth under peer-churn flood (TTL-only eviction
-    // could let the map reach ~12 MiB с а 1-hour TTL).
+    // could let the map reach ~12 MiB with a 1-hour TTL).
     if let Some(ref ek) = r.remote_identity_payload.mlkem_pubkey {
         let mut cache = wlock!(runtime.identity.peer_mlkem_keys);
         if cache.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
@@ -204,9 +204,9 @@ pub fn cache_peer_handshake_state(
     if let Some(bat) = r.remote_battery {
         lock!(runtime.rtt_table).update_battery(r.remote_identity_payload.node_id, bat);
     }
-    // Store the peer's Vivaldi coordinate для RTT-aware routing.  Reject
-    // non-finite coordinates — а malicious peer could send NaN/∞ к poison
-    // the local Vivaldi estimate и corrupt routing.
+    // Store the peer's Vivaldi coordinate for RTT-aware routing.  Reject
+    // non-finite coordinates — a malicious peer could send NaN/∞ to poison
+    // the local Vivaldi estimate and corrupt routing.
     if let Some((vx, vy, vh)) = r.remote_vivaldi {
         if vx.is_finite() && vy.is_finite() && vh.is_finite() && vh >= 0.0 {
             let now = std::time::Instant::now();
@@ -258,8 +258,8 @@ pub fn cache_peer_handshake_state(
             ),
         );
     }
-    // S2.A part 3: stash the verified MembershipCert (если any) so
-    // PnetStatusProvider can surface it к IPC consumers (ogate / oproxy).
+    // S2.A part 3: stash the verified MembershipCert (if any) so
+    // PnetStatusProvider can surface it to IPC consumers (ogate / oproxy).
     if let Some(cert) = &r.verified_membership_cert
         && let Ok(mut g) = runtime.verified_peer_certs.write()
     {
@@ -295,7 +295,7 @@ pub async fn register_connection_session(
     let remote_addr = peer.remote_addr.map(|addr| addr.to_string());
     let description = peer.description.clone();
 
-    // Per-source-IP session limit — applies only к inbound connections.
+    // Per-source-IP session limit — applies only to inbound connections.
     let source_ip: Option<std::net::IpAddr> = if matches!(source, SessionSource::Inbound(_)) {
         peer.remote_addr.map(|sa| sa.ip())
     } else {
@@ -308,8 +308,8 @@ pub async fn register_connection_session(
         return Err(err);
     }
 
-    // Arm the RAII guard so а future cancellation between
-    // `check_and_reserve_ip_slot` и `SessionGuard` construction cannot
+    // Arm the RAII guard so a future cancellation between
+    // `check_and_reserve_ip_slot` and `SessionGuard` construction cannot
     // leak the slot.
     let mut _ip_slot_guard =
         source_ip.map(|ip| IpSlotGuard::arm(ip, Arc::clone(&runtime.sessions_per_ip)));
@@ -327,12 +327,12 @@ pub async fn register_connection_session(
     };
 
     // On inbound connections, peek the first 24 bytes before kicking off
-    // the OVL1 handshake.  If they form а `SessionMsg::HandoffAttach`
-    // header и the HMAC verifies против а pending handoff в
+    // the OVL1 handshake.  If they form a `SessionMsg::HandoffAttach`
+    // header and the HMAC verifies against a pending handoff in
     // `handoff_registry`, this socket is the warm-standby continuation of
     // an existing session — we push it into the matching runner's
-    // `swap_rx` и return without touching handshake.  Otherwise
-    // `peek_and_dispatch` hands us back а `PrefixedStream` that replays
+    // `swap_rx` and return without touching handshake.  Otherwise
+    // `peek_and_dispatch` hands us back a `PrefixedStream` that replays
     // the peeked bytes so the handshake sees its normal input.
     if matches!(source, SessionSource::Inbound(_)) {
         use crate::runtime::handoff::{PeekOutcome, peek_and_dispatch};
@@ -449,10 +449,10 @@ pub async fn register_connection_session(
                 .map(|g| g.is_banned(&peer_id))
                 .unwrap_or(false)
         };
-        // S3: peer's source SocketAddr (на the inbound side) drives the
+        // S3: peer's source SocketAddr (on the inbound side) drives the
         // outbound ATTACH frame's OBSERVED_ADDR_TLV — STUN-style auto-IP
-        // discovery так remote learns its public address. Outbound side
-        // doesn't emit (irrelevant: we initiated the dial и already know
+        // discovery so remote learns its public address. Outbound side
+        // doesn't emit (irrelevant: we initiated the dial and already know
         // our partner's address).
         let peer_observed_addr_for_attach = if matches!(source, SessionSource::Inbound(_)) {
             peer.remote_addr
@@ -626,11 +626,11 @@ pub async fn register_connection_session(
         );
     }
 
-    // **Phase 4 allowlist check**: для inbound connections, if the
-    // hitting listener has а non-empty `allowlist_node_ids` config, the
+    // **Phase 4 allowlist check**: for inbound connections, if the
+    // hitting listener has a non-empty `allowlist_node_ids` config, the
     // remote peer's node_id MUST be present.  Independent of PSK/TLS —
-    // raises the bar even если those credentials leak.  Outbound
-    // connections skip это check (we already validated identity through
+    // raises the bar even if those credentials leak.  Outbound
+    // connections skip this check (we already validated identity through
     // configured `peer_pubkey`).
     if let (SessionSource::Inbound(_), Some(handle)) = (&source, listener_handle) {
         let remote_nid_hex: String = remote_identity
@@ -659,7 +659,7 @@ pub async fn register_connection_session(
             runtime.logger.info(
                 "session.allowlist_reject",
                 format!(
-                    "link_id={} listener_handle={} remote_node_id={} — not в listener allowlist",
+                    "link_id={} listener_handle={} remote_node_id={} — not in listener allowlist",
                     link_id, handle, remote_nid_hex,
                 ),
             );
@@ -696,20 +696,20 @@ pub async fn register_connection_session(
                 runtime.defaults.max_concurrent, link_id,
             )));
         }
-        // Atomic cap+dup+reserve с deterministic direction policy.
+        // Atomic cap+dup+reserve with deterministic direction policy.
         //
-        // The legacy `try_register_unique` had а symmetric race: when both
-        // peers А and B dialed each other simultaneously, both completed
+        // The legacy `try_register_unique` had a symmetric race: when both
+        // peers A and B dialed each other simultaneously, both completed
         // handshake → both saw "duplicate" on inbound → both rejected →
         // BOTH sides killed their outbounds (peer closed our outbound
         // FROM ITS OWN inbound rejection).  Net: 0 sessions, immediate
         // reconnect storm.
         //
-        // Phase E20 fix: `try_register_directional` enforces а deterministic
-        // policy — для pair (A, B) с hex(A) < hex(B), the A→B connection
+        // Phase E20 fix: `try_register_directional` enforces a deterministic
+        // policy — for pair (A, B) with hex(A) < hex(B), the A→B connection
         // survives.  Smaller node accepts only its outbound; larger node
         // accepts only its inbound.  Both sides converge on the same
-        // surviving TCP connection без an explicit negotiation step.
+        // surviving TCP connection without an explicit negotiation step.
         let remote_nid = *remote_identity.node_id.as_bytes();
         let local_nid = *runtime.identity.local_identity.node_id.as_bytes();
         let new_is_outbound = matches!(source, SessionSource::Outbound(_));
@@ -778,10 +778,10 @@ pub async fn register_connection_session(
             link_id, source, session_state, remote_identity.node_id
         ),
     );
-    // Notify reputation tracker of session open, keyed на sovereign
+    // Notify reputation tracker of session open, keyed on sovereign
     // node_id.  At this point the session has just been registered via
     // `cache_peer_handshake_state`, so `node_id_for_peer` returns
-    // `Some(...)` для sovereign peers; legacy peers fall back к peer_id.
+    // `Some(...)` for sovereign peers; legacy peers fall back to peer_id.
     if let Some(ref rep) = runtime.dispatcher.reputation {
         let peer_id = *remote_identity.node_id.as_bytes();
         let identity_for_rep = lock!(runtime.session_registry)
@@ -825,7 +825,7 @@ pub async fn register_connection_session(
         ),
     };
     // SessionGuard now owns the slot — disarm our IpSlotGuard so its
-    // Drop is а no-op.  SessionGuard's Drop will decrement on session
+    // Drop is a no-op.  SessionGuard's Drop will decrement on session
     // close, exactly as before the RAII refactor.
     if let Some(g) = _ip_slot_guard.as_mut() {
         g.disarm();
@@ -838,9 +838,9 @@ pub fn verify_remote_peer_identity(
     expected_peer: &ExpectedPeerIdentity,
 ) -> std::result::Result<(), PeerVerificationError> {
     // When `public_key` is empty the peer was discovered dynamically
-    // (e.g. via mesh beacon) и we perform node-id-only verification:
+    // (e.g. via mesh beacon) and we perform node-id-only verification:
     // confirm that `blake3(handshake_public_key) == expected node_id`.
-    // This is TOFU (trust on first use) — sufficient для autodiscovered
+    // This is TOFU (trust on first use) — sufficient for autodiscovered
     // local-mesh gateways.
     if !expected_peer.public_key.is_empty()
         && remote_identity.public_key != expected_peer.public_key
@@ -858,7 +858,7 @@ pub fn verify_remote_peer_identity(
         )));
     }
 
-    // Skip nonce check для dynamically-discovered peers (no nonce in beacon).
+    // Skip nonce check for dynamically-discovered peers (no nonce in beacon).
     if !expected_peer.nonce.is_empty() && remote_identity.nonce != expected_peer.nonce {
         return Err(PeerVerificationError::NonceMismatch);
     }

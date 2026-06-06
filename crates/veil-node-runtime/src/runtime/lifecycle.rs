@@ -308,12 +308,12 @@ impl NodeRuntime {
     pub async fn apply_reload_after_stop(&mut self, config: veil_cfg::Config) -> Result<()> {
         self.transport_ctx = Arc::new(veil_cfg::transport_glue::context_from_config(&config)?);
         // identity bundle is `Arc<IdentityState>` — can't
-        // mutate fields через deref. Build а fresh IdentityState reusing
+        // mutate fields via deref. Build a fresh IdentityState reusing
         // existing Arc-clones for the peer caches (those are interior-mutable
-        // already; their Arc<Mutex<...>> contents persist) и а freshly-made
+        // already; their Arc<Mutex<...>> contents persist) and a freshly-made
         // local_identity, then swap the bundle Arc. Downstream NodeServices
         // / SessionRuntimeContext clones held the previous bundle's local_id;
-        // after this swap они continue к see the OLD local_identity until
+        // after this swap they continue to see the OLD local_identity until
         // their own contexts are rebuilt — matches pre-PR5 semantics where
         // NodeServices.local_identity was the same stale Arc clone.
         let new_local_identity = Arc::new(HandshakeIdentity::from_config(&config)?);
@@ -337,8 +337,8 @@ impl NodeRuntime {
         // signals. Threshold + window are independent atomics so
         // operator who only flips outbound batching (not maintenance
         // throttling) still sees the window apply correctly — the
-        // gating predicate в `current_outbound_batch_window` requires
-        // BOTH threshold AND window к be set.
+        // gating predicate in `current_outbound_batch_window` requires
+        // BOTH threshold AND window to be set.
         veil_session::runner::set_mobile_low_battery_threshold_pct(
             config.mobile.low_battery_threshold_pct,
         );
@@ -351,32 +351,32 @@ impl NodeRuntime {
         // new sessions opened after this reload pick up the new
         // value. Operator who bumped max_age sees the change
         // applied gradually as old sessions rotate naturally —
-        // not a sync-storm от админ reload.
+        // not a sync-storm from admin reload.
         //
         // Precedence (Q.7 audit batch — censor-evasion):
         //   1. `[transport.rotation]` range knob (new) — preferred.
         //   2. `session.max_age_secs` (deprecated single-value) —
-        //      back-compat fallback only когда rotation is disabled
+        //      back-compat fallback only when rotation is disabled
         //      at the new section AND set at the legacy field.
         if let Some((min, max)) = config.transport.rotation.resolved_range() {
             veil_session::runner::set_session_rotation_range(min, max);
             // Quiet the deprecation noise if the operator is using the
-            // modern knob — но if they ALSO set the legacy field, warn
+            // modern knob — but if they ALSO set the legacy field, warn
             // that we're ignoring it (so they don't think it's active).
             if config.session.max_age_secs.is_some() {
                 self.logger.warn(
                     "config.session.max_age_secs.shadowed",
                     "session.max_age_secs is set but [transport.rotation] takes precedence — \
-                     remove session.max_age_secs from the config к silence this warning",
+                     remove session.max_age_secs from the config to silence this warning",
                 );
             }
         } else if let Some(secs) = config.session.max_age_secs {
             self.logger.warn(
                 "config.session.max_age_secs.deprecated",
                 format!(
-                    "session.max_age_secs={secs} is DEPRECATED — migrate к the \
+                    "session.max_age_secs={secs} is DEPRECATED — migrate to the \
                      [transport.rotation] section (min_lifetime_secs + max_lifetime_secs, \
-                     -1 на обоих для disable) для range-based jitter that defeats \
+                     -1 on both to disable) for range-based jitter that defeats \
                      fleet-correlation DPI fingerprinting"
                 ),
             );
@@ -763,7 +763,7 @@ impl NodeRuntime {
             local_node_id: reload_node_id,
             session_tx_registry: Some(Arc::clone(&self.session_tx_registry)),
             // Preserve the existing rendezvous weak ref across reload so
-            // in-flight handle_request tasks keep upgrading к the same
+            // in-flight handle_request tasks keep upgrading to the same
             // strong controller.
             rendezvous_weak: Arc::clone(&self.dispatcher.rendezvous_weak),
             session_registry: Some(Arc::clone(&self.session_registry)),
@@ -866,7 +866,7 @@ impl NodeRuntime {
             introduce_replay_cache: Arc::clone(&self.dispatcher.introduce_replay_cache),
             // reload preserves the rendezvous
             // registry so currently-registered cookies survive without
-            // forcing a re-registration round-trip от every receiver.
+            // forcing a re-registration round-trip from every receiver.
             rendezvous_registry: self.dispatcher.rendezvous_registry.clone(),
         }
     }
@@ -878,9 +878,9 @@ impl NodeRuntime {
     /// tunables that are picked up from the new config without any restart.
     pub fn refresh_runtime_tuning(&mut self, config: &veil_cfg::Config) {
         // H10 stage-B (4/N): rebuild the SessionDefaults
-        // bundle on reload. Same shape as the constructor: 16 args в
-        // declaration order. Returning а fresh `Arc<SessionDefaults>` ratherthan mutating через interior mutability matches the
-        // existing reload pattern (`self.mobile = Arc::new(...)` ниже).
+        // bundle on reload. Same shape as the constructor: 16 args in
+        // declaration order. Returning a fresh `Arc<SessionDefaults>` rather than mutating via interior mutability matches the
+        // existing reload pattern (`self.mobile = Arc::new(...)` below).
         self.defaults = super::session_defaults::SessionDefaults::new(
             std::time::Duration::from_secs(config.session.keepalive_interval_secs),
             std::time::Duration::from_secs(config.session.idle_timeout_secs),
@@ -893,7 +893,7 @@ impl NodeRuntime {
             config.session.max_concurrent,
             config.session.max_per_ip,
             // previously frozen — operator could edit the limit
-            // в config но `reload` would silently ignore it (admission
+            // in config but `reload` would silently ignore it (admission
             // control kept using the original value).
             config.session.max_per_subnet,
             std::time::Duration::from_secs(config.gateway.keepalive_interval_secs),
@@ -903,9 +903,9 @@ impl NodeRuntime {
         );
         // rebuild mobile state on reload. Preserve
         // the existing `mobile_background_mode` AtomicBool (its current
-        // foreground/background state must survive а config reload —
-        // resetting к false would break mobile clients mid-suspension).
-        // Battery snapshots refresh от the new config.
+        // foreground/background state must survive a config reload —
+        // resetting to false would break mobile clients mid-suspension).
+        // Battery snapshots refresh from the new config.
         self.mobile = std::sync::Arc::new(super::mobile_state::MobileState::new(
             std::sync::Arc::clone(&self.mobile.mobile_background_mode),
             config.session.battery_keepalive_scale_low,

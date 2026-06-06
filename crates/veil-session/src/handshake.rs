@@ -36,14 +36,14 @@ use veil_proto::{
 // Phase 2 session 2 prep: session/handshake.rs previously used
 // `HandshakeError(String)` from veilcore.  Decoupling session
 // from `crate::node::error::NodeError` is needed before the session
-// module can move к а sibling `veil-session` crate (the broader
+// module can move to a sibling `veil-session` crate (the broader
 // `NodeError` enum references `veil_transport::TransportError` which
-// creates а crate dep cycle с veil-transport ← veil-error).
+// creates a crate dep cycle with veil-transport ← veil-error).
 //
-// `HandshakeError` is а narrow String-wrapping error specific к the
+// `HandshakeError` is a narrow String-wrapping error specific to the
 // OVL1 handshake path.  Veilcore provides `impl From<HandshakeError>
-// for NodeError` (см. `node/error.rs`) so existing callers of
-// `perform_ovl1_handshake` continue к use `?` against а `NodeError`-
+// for NodeError` (see `node/error.rs`) so existing callers of
+// `perform_ovl1_handshake` continue to use `?` against a `NodeError`-
 // returning function signature without surface-level changes.
 
 /// Narrow error type emitted by the OVL1 handshake.  String payload
@@ -53,27 +53,27 @@ use veil_proto::{
 pub struct HandshakeError(pub String);
 
 /// Result alias used throughout session/handshake.rs.  Shadows the
-/// shorter `Result` import previously sourced от `crate::node::error`.
+/// shorter `Result` import previously sourced from `crate::node::error`.
 pub type Result<T> = std::result::Result<T, HandshakeError>;
 
 // ── LocalHandshakeIdentity trait ─────────────────────────────────────────────
 //
 // Phase 2 session 2 prep: session/handshake.rs previously took
 // `local: &crate::node::local_identity::HandshakeIdentity` directly,
-// which is veilcore-internal и blocks moving session к а sibling
+// which is veilcore-internal and blocks moving session to a sibling
 // crate.  The trait below exposes just the five accessors `perform_ovl1
-// _handshake` actually reads, so callers can pass any type що holds
+// _handshake` actually reads, so callers can pass any type that holds
 // the handshake's signing material (production = veilcore's
 // `HandshakeIdentity`; tests can mock).
 //
-// `HandshakeIdentity` impls the trait at the definition site (см.
+// `HandshakeIdentity` impls the trait at the definition site (see
 // `veilcore/src/node/local_identity.rs`).
 
 /// Abstraction over the local node's handshake signing material.
-/// Read by [`perform_ovl1_handshake`] на every connection accept/dial.
+/// Read by [`perform_ovl1_handshake`] on every connection accept/dial.
 /// `Send + Sync` bounds are mandatory: the handshake future crosses
 /// `tokio::spawn` boundaries, so any `&dyn LocalHandshakeIdentity`
-/// captured в it must be sendable.
+/// captured in it must be sendable.
 pub trait LocalHandshakeIdentity: Send + Sync {
     /// Signature algorithm (Ed25519 / Falcon-512 / ...).
     fn algo(&self) -> SignatureAlgorithm;
@@ -81,7 +81,7 @@ pub trait LocalHandshakeIdentity: Send + Sync {
     fn public_key(&self) -> &str;
     /// Base64-encoded private key (signing key).
     fn private_key(&self) -> &str;
-    /// Random nonce — emitted в the HELLO frame, anti-replay binding.
+    /// Random nonce — emitted in the HELLO frame, anti-replay binding.
     fn nonce(&self) -> &str;
     /// 32-byte BLAKE3 node identity.
     fn node_id(&self) -> &veil_cfg::NodeId;
@@ -89,7 +89,7 @@ pub trait LocalHandshakeIdentity: Send + Sync {
 
 // Blanket impl: callers commonly hold the identity inside an `Arc`.
 // Auto-coercion `&Arc<T> → &dyn Trait` requires `Arc<T>: Trait`; this
-// impl forwards к the inner.  Avoids а surface-level rewrite of the
+// impl forwards to the inner.  Avoids a surface-level rewrite of the
 // 3 existing callers (peer_handshake.rs, admin.rs, runtime/tests.rs)
 // que all hold `Arc<HandshakeIdentity>`.
 impl<T: LocalHandshakeIdentity + ?Sized> LocalHandshakeIdentity for std::sync::Arc<T> {
@@ -144,20 +144,20 @@ pub struct SovereignHandshakeCtx<'a> {
 
     /// local ML-KEM-768 decapsulation seed.
     /// When present AND `peer_mlkem_ek_override` (or peer's published
-    /// mlkem_cert при production lookup) is also available, the
+    /// mlkem_cert at production lookup) is also available, the
     /// handshake advertises `SUPPORTS_HYBRID_KEX` and engages the
     /// post-quantum hybrid session-key derivation path. `None`
     /// keeps the classical X25519-only path; legacy peers stay
     /// unchanged.
     pub local_mlkem_dk_seed: Option<&'a [u8; 64]>,
     // audit cleanup: speculative `peer_mlkem_ek`
-    // placeholder removed. Original intent (Epic 486.1 slice 3) was к
-    // surface а DHT-published PrekeyBundle EK at handshake time для
+    // placeholder removed. Original intent (Epic 486.1 slice 3) was to
+    // surface a DHT-published PrekeyBundle EK at handshake time for
     // cold-start hybrid-KEX. The functionality is partially covered by
     // `peer_mlkem_keys` cache + `meta_encrypt`/mailbox already; slice 3
     // had no scheduled date. If/when scheduled, re-add the field — one
-    // line, trivial. Keeping а speculative placeholder unread bloated
-    // search results и confused readers ("where is this used?" → nowhere).
+    // line, trivial. Keeping a speculative placeholder unread bloated
+    // search results and confused readers ("where is this used?" → nowhere).
 }
 
 // `NegotiatedCapabilities` was a unit-struct with methods that
@@ -207,21 +207,21 @@ pub struct OvlHandshakeResult {
     /// `node_id` via `SessionRegistry::peer_id_for_identity`.
     pub validated_sovereign_identity: Option<ValidatedIdentity>,
     /// The verified `MembershipCert` the peer presented in HELLO, when
-    /// P-Net is enabled и verification succeeded.  `None` for public
-    /// mode (no gate configured) или legacy peers (no cert blob).
-    /// Daemon stores this в its per-peer cert cache so IPC consumers
+    /// P-Net is enabled and verification succeeded.  `None` for public
+    /// mode (no gate configured) or legacy peers (no cert blob).
+    /// Daemon stores this in its per-peer cert cache so IPC consumers
     /// (ogate / oproxy) can query peer admission status without
     /// re-running the verify path.
     pub verified_membership_cert: Option<veil_types::MembershipCert>,
     /// **Observed source address** — STUN-style auto-IP-discovery.
     /// `Some(addr)` ⇒ the remote peer included an
-    /// `OBSERVED_ADDR_TLV_TAG` (0x0014) extension в the ATTACH frame
-    /// telling us "this is the source-address you appeared as к me".
-    /// `None` ⇒ peer didn't emit the TLV (legacy peer) или extraction
+    /// `OBSERVED_ADDR_TLV_TAG` (0x0014) extension in the ATTACH frame
+    /// telling us "this is the source-address you appeared as to me".
+    /// `None` ⇒ peer didn't emit the TLV (legacy peer) or extraction
     /// failed.
     ///
-    /// Useful для NAT-mapped hosts что don't know their public IP:
-    /// the daemon can log "your public address appears к be …" или
+    /// Useful for NAT-mapped hosts that don't know their public IP:
+    /// the daemon can log "your public address appears to be …" or
     /// auto-populate an `advertise = "..."` URI.
     pub remote_observed_addr: Option<std::net::SocketAddr>,
 }
@@ -318,29 +318,29 @@ pub async fn perform_ovl1_handshake<S>(
     anonymity_relay_capable: bool,
     // q: optional early ban-check. When `Some`, called
     // on the inbound side immediately after decoding the peer's HELLO
-    // frame (we now know `remote_id`) и BEFORE the expensive Falcon-512
+    // frame (we now know `remote_id`) and BEFORE the expensive Falcon-512
     // signature verify + ML-KEM key encapsulation + cache writes. On
-    // `true`, the handshake aborts early с а dedicated error variant.
+    // `true`, the handshake aborts early with a dedicated error variant.
     // Saves ~50 ms CPU + ~30 KiB allocator churn per rejected banned-
     // peer connection attempt — at chaos-ban-driven ~30 connect/sec
     // rates this is ~900 KiB/sec of avoided churn. Outbound side
     // (`known_remote_id.is_some`) skips this check because the
-    // initiator chose to dial. Callback type uses а type-erased
+    // initiator chose to dial. Callback type uses a type-erased
     // `dyn Fn` so the handshake module stays free of `ban_list` coupling.
     is_banned: Option<&(dyn Fn([u8; 32]) -> bool + Send + Sync)>,
     // P-Net Phase 2c: private-veil-network access gate. When
-    // `Some`, the local node is configured as а member of а private
-    // network — local cert blob is included in outbound HELLO и peer's
+    // `Some`, the local node is configured as a member of a private
+    // network — local cert blob is included in outbound HELLO and peer's
     // cert blob is verified after the inbound HELLO. `None` keeps the
     // current public-veil behaviour: peers connect freely, no cert
     // exchange.
     network_gate: Option<&veil_identity::network_access::NetworkAccessGate>,
     // S3: peer's source SocketAddr as observed on our transport layer.
     // When `Some` AND we're the accepting side (inbound), emit an
-    // `OBSERVED_ADDR_TLV_TAG` extension в the outbound ATTACH so the
+    // `OBSERVED_ADDR_TLV_TAG` extension in the outbound ATTACH so the
     // peer learns its public address (STUN-style auto-discovery).
-    // `None` ⇒ TLV не emitted (preserves wire-compat с legacy peers
-    // и avoids fake responses от client-side handshakes that don't
+    // `None` ⇒ TLV not emitted (preserves wire-compat with legacy peers
+    // and avoids fake responses from client-side handshakes that don't
     // know the partner's address).
     peer_observed_addr: Option<std::net::SocketAddr>,
 ) -> Result<OvlHandshakeResult>
@@ -362,7 +362,7 @@ where
         ovl1_major: VERSION as u16,
         node_id: local_node_id_bytes,
         resume_ticket: hello_ticket_blob,
-        // P-Net Phase 2c: include our membership cert if we're in а
+        // P-Net Phase 2c: include our membership cert if we're in a
         // private network. Public-mode (`network_gate = None`) leaves
         // the field unset → existing TLV-less HELLO on the wire.
         membership_cert_blob: network_gate.map(|g| g.local_cert_blob.clone()),
@@ -406,7 +406,7 @@ where
 
         // q: early ban-check. At this point we've spent
         // ~1 KiB of allocator activity (one HELLO frame read + decode);
-        // continuing с this peer would burn ~50 ms CPU on Falcon-512
+        // continuing with this peer would burn ~50 ms CPU on Falcon-512
         // signature verification + ML-KEM encapsulation + ~30 KiB on
         // cache writes. Under chaos-ban-driven ~30/sec connect attempts
         // from banned peers, this saves ~900 KiB/sec of allocator churn
@@ -460,12 +460,12 @@ where
 
     // ── P-Net Phase 2c: verify peer membership cert ─────────────────
     //
-    // When the local node is а member of а private veil (`network_gate
-    // = Some`), the peer must present а valid cert signed by the same
-    // owner и bound к the same `network_id`. Verification runs AFTER the
-    // ban check (so banned peers don't pay the crypto cost) и BEFORE
+    // When the local node is a member of a private veil (`network_gate
+    // = Some`), the peer must present a valid cert signed by the same
+    // owner and bound to the same `network_id`. Verification runs AFTER the
+    // ban check (so banned peers don't pay the crypto cost) and BEFORE
     // any identity / capabilities / key-agreement exchange (so cert
-    // failure aborts с minimal allocator churn). Public-mode nodes
+    // failure aborts with minimal allocator churn). Public-mode nodes
     // (gate = None) skip this entirely, preserving the open-veil
     // behaviour.
     let verified_membership_cert: Option<veil_types::MembershipCert> =
@@ -581,13 +581,13 @@ where
                         validated_sovereign_identity: None,
                         // Ticket resumption inherits the original session's
                         // cert verification — we trust the ticket-binding
-                        // step, не re-verify cert here.  The cache entry
-                        // от the original handshake stays valid через the
+                        // step, not re-verify cert here.  The cache entry
+                        // from the original handshake stays valid through the
                         // session's lifetime.
                         verified_membership_cert: None,
                         // S3: ticket resumption skips ATTACH exchange,
                         // so no observed-addr is learned here. Apps
-                        // querying их public IP must rely on the original
+                        // querying their public IP must rely on the original
                         // full-handshake's result.
                         remote_observed_addr: None,
                     });
@@ -826,9 +826,9 @@ where
 /// empty slice emits no TLV (wire-compatible with legacy peers).
 ///
 /// `peer_observed_addr` is the source `SocketAddr` que the remote peer
-/// appeared as on our transport layer; included в the ATTACH so the
+/// appeared as on our transport layer; included in the ATTACH so the
 /// peer learns its public address (S3: STUN-style auto-discovery).
-/// `None` ⇒ TLV is not emitted (legacy peers continue к work).
+/// `None` ⇒ TLV is not emitted (legacy peers continue to work).
 pub fn build_local_attach_bytes(
     role: NodeRole,
     vivaldi: Option<(f64, f64, f64)>,
@@ -950,12 +950,12 @@ async fn complete_handshake_from_capabilities<S>(
     vivaldi: Option<(f64, f64, f64)>,
     local_node_id_bytes: [u8; 32],
     remote_identity: IdentityPayload,
-    // Raw bytes of the locally-sent и remotely-received IDENTITY frame
-    // bodies.  Bound к the transcripts here so SESSION_CONFIRM MAC
-    // commits к the `mlkem_pubkey` / `public_key` / `nonce` fields —
-    // closes the audit H1 gap where а MITM could swap а post-handshake
-    // field без detection (the IDENTITY exchange happens BEFORE the
-    // hashers exist, so neither side's body was previously bound к the
+    // Raw bytes of the locally-sent and remotely-received IDENTITY frame
+    // bodies.  Bound to the transcripts here so SESSION_CONFIRM MAC
+    // commits to the `mlkem_pubkey` / `public_key` / `nonce` fields —
+    // closes the audit H1 gap where a MITM could swap a post-handshake
+    // field without detection (the IDENTITY exchange happens BEFORE the
+    // hashers exist, so neither side's body was previously bound to the
     // MAC).
     local_identity_bytes: &[u8],
     remote_identity_bytes: &[u8],
@@ -968,8 +968,8 @@ async fn complete_handshake_from_capabilities<S>(
     // caller's per-peer cert cache. `None` in public mode or when the
     // peer presented no cert.
     verified_membership_cert: Option<veil_types::MembershipCert>,
-    // S3: peer's observed SocketAddr — when `Some`, included в outbound
-    // ATTACH frame's OBSERVED_ADDR_TLV для STUN-style auto-IP-discovery.
+    // S3: peer's observed SocketAddr — when `Some`, included in outbound
+    // ATTACH frame's OBSERVED_ADDR_TLV for STUN-style auto-IP-discovery.
     peer_observed_addr: Option<std::net::SocketAddr>,
 ) -> Result<OvlHandshakeResult>
 where
@@ -1001,8 +1001,8 @@ where
 
     // IDENTITY frame binding (Wave 4 / audit H1).  The IDENTITY exchange
     // happens BEFORE the transcript hashers exist, so neither side's body
-    // was previously bound к SESSION_CONFIRM.  This left `mlkem_pubkey`
-    // un-bound: а MITM swapping the field в transit would only diverge
+    // was previously bound to SESSION_CONFIRM.  This left `mlkem_pubkey`
+    // un-bound: a MITM swapping the field in transit would only diverge
     // the X25519/MAC paths indirectly via `validated_sovereign_identity`.
     // Feed both bodies now so the MAC commits explicitly.
     local_transcript.update(local_identity_bytes);
@@ -1024,13 +1024,13 @@ where
         caps.flags |= cap_flags::ANONYMITY_RELAY;
     }
     // advertise SUPPORTS_HYBRID_KEX iff we
-    // have ML-KEM material to back it up (local DK seed для
+    // have ML-KEM material to back it up (local DK seed for
     // decapsulation when we're the receiver, AND we know the peer's
     // mlkem_pubkey will be carried in IDENTITY). Negotiation is
-    // double-sided: peers without the bit fall through к the
+    // double-sided: peers without the bit fall through to the
     // classical X25519-only path unchanged. Cache the dk_seed
     // pointer up-front because `sovereign_ctx` gets moved later
-    // когда the IDENTITY_PROOF branch consumes it.
+    // when the IDENTITY_PROOF branch consumes it.
     let local_mlkem_dk_seed: Option<&[u8; 64]> =
         sovereign_ctx.as_ref().and_then(|c| c.local_mlkem_dk_seed);
     if local_mlkem_dk_seed.is_some() {
@@ -1251,8 +1251,8 @@ where
     // SENDS the CT, the larger RECEIVES. Same convention as
     // `derive_session_keys`'s tx/rx swap, so both sides agree without
     // explicit role signalling. Both sides then mix the resulting
-    // ML-KEM shared secret с the existing X25519 secret и replace
-    // `session_keys` через `derive_hybrid_session_keys`.
+    // ML-KEM shared secret with the existing X25519 secret and replace
+    // `session_keys` through `derive_hybrid_session_keys`.
     //
     // Failure modes (peer misadvertised, missing EK, encap/decap
     // failure) surface as Handshake errors — we DO NOT silently
@@ -1277,9 +1277,9 @@ where
 
         let send_first = local_node_id_bytes <= remote_identity.node_id;
         let mlkem_secret_zeroizing = if send_first {
-            // We encapsulate под the peer's static ML-KEM EK and
+            // We encapsulate under the peer's static ML-KEM EK and
             // ship the CT. The shared secret comes back from
-            // `mlkem_encapsulate_raw`; HKDF combines it с X25519.
+            // `mlkem_encapsulate_raw`; HKDF combines it with X25519.
             let (ct_bytes, ss_bytes) =
                 veil_crypto::x3dh::mlkem_encapsulate_raw(peer_ek).map_err(|e| {
                     HandshakeError(format!(
@@ -1337,10 +1337,10 @@ where
         // Re-derive session keys mixing X25519 + ML-KEM. This is the
         // key swap the bench measures. `shared_secret` (X25519) is
         // still consumed by `compute_confirm_mac` below — that MAC
-        // commits к the X25519 secret и the transcript hash, both of
+        // commits to the X25519 secret and the transcript hash, both of
         // which were computed BEFORE this swap, so the MAC remains
-        // valid и both sides arrive at the same composite. The
-        // session_keys re-binding takes effect для SESSION_CONFIRM
+        // valid and both sides arrive at the same composite. The
+        // session_keys re-binding takes effect for SESSION_CONFIRM
         // and the post-handshake AEAD.
         session_keys = veil_crypto::session_kdf::derive_hybrid_session_keys(
             &shared_secret,
@@ -1697,8 +1697,8 @@ mod tests {
     /// In-test impl of [`LocalHandshakeIdentity`].  Phase 2 session 2 prep:
     /// session/handshake.rs no longer references the veilcore-private
     /// `HandshakeIdentity` struct directly — tests use this minimal mock
-    /// instead, so the file can move к the upcoming veil-session
-    /// sibling crate без а dep on veilcore.
+    /// instead, so the file can move to the upcoming veil-session
+    /// sibling crate without a dep on veilcore.
     #[derive(Clone)]
     struct TestHandshakeIdentity {
         algo: SignatureAlgorithm,
@@ -1772,14 +1772,14 @@ mod tests {
             &[],
             false,
             None,
-            None, // P-Net: no network gate в test fixture
-            None, // S3: no peer_observed_addr в test fixture
+            None, // P-Net: no network gate in test fixture
+            None, // S3: no peer_observed_addr in test fixture
         )
         .await
         .expect("OVL1 handshake succeeds")
     }
 
-    /// Variant of `run_side` that supplies а `peer_observed_addr` —
+    /// Variant of `run_side` that supplies a `peer_observed_addr` —
     /// drives the S3 STUN-style auto-IP-discovery path.
     async fn run_side_with_observed_addr<S>(
         mut stream: S,
@@ -1841,8 +1841,8 @@ mod tests {
             &[],
             true,
             None,
-            None, // P-Net: no network gate в test fixture
-            None, // S3: no peer_observed_addr в test fixture
+            None, // P-Net: no network gate in test fixture
+            None, // S3: no peer_observed_addr in test fixture
         )
         .await
         .expect("OVL1 handshake succeeds")
@@ -1970,14 +1970,14 @@ mod tests {
         assert!(r2.validated_sovereign_identity.is_none());
     }
 
-    /// S3: end-to-end auto-IP-discovery.  Server side feeds а fake
+    /// S3: end-to-end auto-IP-discovery.  Server side feeds a fake
     /// peer SocketAddr into the handshake; client side reads it back
     /// from `OvlHandshakeResult.remote_observed_addr`.
     #[tokio::test]
     async fn observed_addr_roundtrips_through_attach() {
         let (a, b) = duplex(64 * 1024);
-        // Server (accepting side) "sees" the client as coming от 203.0.113.42:31415.
-        // In production this is the actual remote SocketAddr от accept().
+        // Server (accepting side) "sees" the client as coming from 203.0.113.42:31415.
+        // In production this is the actual remote SocketAddr from accept().
         let fake_peer_addr: std::net::SocketAddr = "203.0.113.42:31415".parse().unwrap();
         let server_task = tokio::spawn(run_side_with_observed_addr(
             a,
@@ -1992,7 +1992,7 @@ mod tests {
         let server_r = server_r.unwrap();
         let client_r = client_r.unwrap();
 
-        // Client learns its public address от server's ATTACH TLV.
+        // Client learns its public address from server's ATTACH TLV.
         assert_eq!(
             client_r.remote_observed_addr,
             Some(fake_peer_addr),
@@ -2002,7 +2002,7 @@ mod tests {
         // therefore parses no observed_addr.
         assert_eq!(
             server_r.remote_observed_addr, None,
-            "server should not learn an observed_addr когда client didn't emit"
+            "server should not learn an observed_addr when client didn't emit"
         );
     }
 
@@ -2097,8 +2097,8 @@ mod tests {
                 &[],
                 false,
                 None,
-                None, // P-Net: no network gate в test fixture
-                None, // S3: no peer_observed_addr в test fixture
+                None, // P-Net: no network gate in test fixture
+                None, // S3: no peer_observed_addr in test fixture
             )
             .await
             .expect("alice handshake ok")
@@ -2128,8 +2128,8 @@ mod tests {
                 &[],
                 false,
                 None,
-                None, // P-Net: no network gate в test fixture
-                None, // S3: no peer_observed_addr в test fixture
+                None, // P-Net: no network gate in test fixture
+                None, // S3: no peer_observed_addr in test fixture
             )
             .await
             .expect("bob handshake ok")
@@ -2221,8 +2221,8 @@ mod tests {
                 &[],
                 false,
                 None,
-                None, // P-Net: no network gate в test fixture
-                None, // S3: no peer_observed_addr в test fixture
+                None, // P-Net: no network gate in test fixture
+                None, // S3: no peer_observed_addr in test fixture
             )
             .await
             .expect("alice handshake ok")
@@ -2278,8 +2278,8 @@ mod tests {
                 &[],
                 false,
                 None,
-                None, // P-Net: no network gate в test fixture
-                None, // S3: no peer_observed_addr в test fixture
+                None, // P-Net: no network gate in test fixture
+                None, // S3: no peer_observed_addr in test fixture
             )
             .await
         });
@@ -2365,8 +2365,8 @@ mod tests {
                 &[],
                 false,
                 None,
-                None, // P-Net: no network gate в test fixture
-                None, // S3: no peer_observed_addr в test fixture
+                None, // P-Net: no network gate in test fixture
+                None, // S3: no peer_observed_addr in test fixture
             )
             .await
             .expect("server full handshake")
@@ -2390,8 +2390,8 @@ mod tests {
                     &[],
                     false,
                     None,
-                    None, // P-Net: no network gate в test fixture
-                    None, // S3: no peer_observed_addr в test fixture
+                    None, // P-Net: no network gate in test fixture
+                    None, // S3: no peer_observed_addr in test fixture
                 )
                 .await
                 .expect("client full handshake")
@@ -2448,8 +2448,8 @@ mod tests {
                 &[],
                 false,
                 None,
-                None, // P-Net: no network gate в test fixture
-                None, // S3: no peer_observed_addr в test fixture
+                None, // P-Net: no network gate in test fixture
+                None, // S3: no peer_observed_addr in test fixture
             )
             .await
             .expect("server fast-path handshake")
@@ -2473,8 +2473,8 @@ mod tests {
                     &[],
                     false,
                     None,
-                    None, // P-Net: no network gate в test fixture
-                    None, // S3: no peer_observed_addr в test fixture
+                    None, // P-Net: no network gate in test fixture
+                    None, // S3: no peer_observed_addr in test fixture
                 )
                 .await
                 .expect("client fast-path handshake")
@@ -2610,8 +2610,8 @@ mod tests {
                 &[],
                 false,
                 None,
-                None, // P-Net: no network gate в test fixture
-                None, // S3: no peer_observed_addr в test fixture
+                None, // P-Net: no network gate in test fixture
+                None, // S3: no peer_observed_addr in test fixture
             )
             .await
             .unwrap()
@@ -2641,8 +2641,8 @@ mod tests {
                 &[],
                 false,
                 None,
-                None, // P-Net: no network gate в test fixture
-                None, // S3: no peer_observed_addr в test fixture
+                None, // P-Net: no network gate in test fixture
+                None, // S3: no peer_observed_addr in test fixture
             )
             .await
             .unwrap()

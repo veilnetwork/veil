@@ -98,11 +98,11 @@ fn decode_header_inner(buf: &[u8], max_body: u32) -> Result<FrameHeader, ProtoEr
     let stream_id = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
     let request_id = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);
 
-    // strict header_len: OVL1 v1 frames have а fixed 24-byte
-    // header (no TLV extensions yet). Reject any other value к prevent
-    // future-version-confusion attacks where а peer claims а larger
+    // strict header_len: OVL1 v1 frames have a fixed 24-byte
+    // header (no TLV extensions yet). Reject any other value to prevent
+    // future-version-confusion attacks where a peer claims a larger
     // header AND smuggles control bytes. When TLV extensions ship, this
-    // check becomes а range: `if !(HEADER_SIZE as u16..=MAX_TLV_HEADER).contains(&header_len)`.
+    // check becomes a range: `if !(HEADER_SIZE as u16..=MAX_TLV_HEADER).contains(&header_len)`.
     if header_len as usize != crate::HEADER_SIZE {
         return Err(ProtoError::Malformed(format!(
             "header_len={header_len} but expected {} (OVL1 v1 has no TLV header extensions)",

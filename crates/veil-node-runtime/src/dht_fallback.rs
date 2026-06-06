@@ -1,11 +1,11 @@
 //! iterative-DHT route-discovery fallback.
 //!
 //! When `miss_handler`'s legacy `RouteRequest` flood (TTL=7) exhausts its
-//! retry budget без finding а route to `target`, this module fires а
-//! `RecursiveQuery(FIND_NODE, target_key=target)` за target и waits for
+//! retry budget without finding a route to `target`, this module fires a
+//! `RecursiveQuery(FIND_NODE, target_key=target)` for target and waits for
 //! the signed `RecursiveResponse` to come back. Dispatcher's
 //! `handle_recursive_response` automatically populates `route_cache` from
-//! the returned contacts (routing.rs:2173-2186) и fires `route_updated`;
+//! the returned contacts (routing.rs:2173-2186) and fires `route_updated`;
 //! `miss_handler`'s second `wait_for_route` round picks it up; app-layer
 //! retry uses DELIVERY_FORWARD over the new relay-chain hop.
 //!
@@ -18,17 +18,17 @@
 //!   `pending_recursive` map is occupied past
 //!   `dht_fallback_backpressure_threshold_pct` of
 //!   `MAX_PENDING_RECURSIVE`, new fallback attempts return `false`
-//!   without enqueueing. Prevents pile-on under load. Bumped как
+//!   without enqueueing. Prevents pile-on under load. Bumped as
 //!   `dht_fallback_skipped_backpressure_total` metric.
 //!
 //! * **5c (adaptive timeout)** — opt-in via `dht_fallback_adaptive`.
 //!   Tracks the last 20 outcomes; if recent miss-rate > 50% the
-//!   effective timeout climbs 1.5× (up к 60s clamp), if < 10% it
-//!   drops 0.67× (down к 1s clamp). Logged at info level whenever
+//!   effective timeout climbs 1.5× (up to 60s clamp), if < 10% it
+//!   drops 0.67× (down to 1s clamp). Logged at info level whenever
 //!   the effective timeout shifts.
 //!
 //! * **5d (per-priority multiplier)** — the trait method now takes
-//!   а `priority` byte (carried from `route_miss_tx`'s
+//!   a `priority` byte (carried from `route_miss_tx`'s
 //!   `(target, traffic_class)` channel item). Effective timeout is
 //!   `baseline × interactive_mult / 100` for INTERACTIVE
 //!   `× background_mult / 100` for BACKGROUND. Other priority bytes
@@ -53,8 +53,8 @@ use veil_proto::family::{FrameFamily, RoutingMsg};
 use veil_proto::header::{FrameHeader, priority};
 use veil_proto::routing::{RecursiveQueryPayload, recursive_query_type};
 
-/// Sliding-window size для adaptive-timeout outcome tracking.
-/// 20 is а balance between fast reaction к topology change и stability
+/// Sliding-window size for adaptive-timeout outcome tracking.
+/// 20 is a balance between fast reaction to topology change and stability
 /// against jitter.
 const ADAPTIVE_WINDOW: usize = 20;
 
@@ -64,25 +64,25 @@ const ADAPTIVE_WINDOW: usize = 20;
 const TIMEOUT_FLOOR_MS: u64 = 1_000;
 const TIMEOUT_CEIL_MS: u64 = 60_000;
 
-/// Wires а `RecursiveQuery(FIND_NODE)` initiator into the `miss_handler`
+/// Wires a `RecursiveQuery(FIND_NODE)` initiator into the `miss_handler`
 /// pipeline. Captures config knobs at construction time; updates would
-/// require а node reload (same pattern as other routing config).
+/// require a node reload (same pattern as other routing config).
 pub struct DhtRouteFallback {
     services: NodeServices,
     /// Baseline timeout in milliseconds.
     baseline_timeout_ms: u64,
     /// b: `pending_recursive` occupancy fraction beyond which new
-    /// attempts are dropped without enqueueing. Stored as а raw count
+    /// attempts are dropped without enqueueing. Stored as a raw count
     /// (already-multiplied) for cheap comparison on every attempt.
     backpressure_cap: usize,
     /// c: whether adaptive timeout scaling is enabled.
     adaptive: bool,
     /// c: ring of last `ADAPTIVE_WINDOW` outcomes (true=resolved).
-    /// Read/written behind а Mutex; lock is held only for а ring push +
+    /// Read/written behind a Mutex; lock is held only for a ring push +
     /// miss-rate calc (~few µs), no I/O across the lock.
     outcomes: Mutex<std::collections::VecDeque<bool>>,
     /// c: current effective timeout ms (adaptive scales this).
-    /// AtomicU64 so reads avoid the Mutex. Surfaced as а Prometheus
+    /// AtomicU64 so reads avoid the Mutex. Surfaced as a Prometheus
     /// gauge `veil_dht_fallback_effective_timeout_ms`.
     effective_timeout_ms: AtomicU64,
     /// d: [interactive_mult, background_mult] in percent (100 =
@@ -100,8 +100,8 @@ impl DhtRouteFallback {
     ) -> Self {
         let bp_cap =
             (MAX_PENDING_RECURSIVE as u64 * u64::from(backpressure_threshold_pct) / 100) as usize;
-        // Seed the gauge с the baseline so dashboards have а value
-        // immediately после node start, не only after the first
+        // Seed the gauge with the baseline so dashboards have a value
+        // immediately after node start, not only after the first
         // adaptive adjustment.
         if let Some(metrics) = services.metrics.as_ref() {
             metrics.set_dht_fallback_effective_timeout_ms(timeout_ms);
@@ -118,7 +118,7 @@ impl DhtRouteFallback {
     }
 
     /// d: compute effective timeout for the given priority. Clamped
-    /// к [TIMEOUT_FLOOR_MS, TIMEOUT_CEIL_MS] after multiplier application
+    /// to [TIMEOUT_FLOOR_MS, TIMEOUT_CEIL_MS] after multiplier application
     /// so misconfigured knobs can't break the safety invariant.
     fn priority_scaled_ms(&self, priority: u8) -> u64 {
         let baseline = self.effective_timeout_ms.load(Ordering::Relaxed);
@@ -131,7 +131,7 @@ impl DhtRouteFallback {
         scaled.clamp(TIMEOUT_FLOOR_MS, TIMEOUT_CEIL_MS)
     }
 
-    /// c: record an outcome и (if adaptive) adjust the effective
+    /// c: record an outcome and (if adaptive) adjust the effective
     /// timeout based on the rolling miss-rate.
     fn record_outcome(&self, resolved: bool) {
         if !self.adaptive {
@@ -186,8 +186,8 @@ impl IterativeDhtFallback for DhtRouteFallback {
 
             // ── backpressure-aware skip ────────────────────────
             // If `pending_recursive` is already near cap, piling another
-            // attempt only worsens the situation. Drop early и signal
-            // up. The metric makes this visible к operators.
+            // attempt only worsens the situation. Drop early and signal
+            // up. The metric makes this visible to operators.
             {
                 let m = lock!(services.dispatcher.pending_recursive);
                 if m.len() >= self.backpressure_cap {
@@ -201,7 +201,7 @@ impl IterativeDhtFallback for DhtRouteFallback {
             // ── priority-aware effective timeout ───────────────
             let timeout = Duration::from_millis(self.priority_scaled_ms(priority));
 
-            // Build the RecursiveQuery(FIND_NODE) frame с а fresh 16-byte
+            // Build the RecursiveQuery(FIND_NODE) frame with a fresh 16-byte
             // query_id. TTL=40 matches the production recursive-DHT
             // path-length budget.
             let mut query_id = [0u8; 16];
@@ -227,10 +227,10 @@ impl IterativeDhtFallback for DhtRouteFallback {
             // Register the oneshot so dispatcher's response handler can
             // wake us when the signed RecursiveResponse arrives. See
             // dispatcher/routing.rs:2173-2186 — for FIND_NODE the
-            // dispatcher inserts each returned 32-byte node_id as а
+            // dispatcher inserts each returned 32-byte node_id as a
             // candidate next-hop for `target_key` at score=50_000
-            // hops=2. So even если our oneshot times out, the cache
-            // may still have been seeded by partial responses от
+            // hops=2. So even if our oneshot times out, the cache
+            // may still have been seeded by partial responses from
             // intermediate forwarders along the path.
             let (tx, rx) = oneshot::channel::<Vec<u8>>();
             {
@@ -251,7 +251,7 @@ impl IterativeDhtFallback for DhtRouteFallback {
             }
 
             // Pick top-2 closest active session peers (sorted by XOR
-            // distance к target_key) — mirrors `runtime::dht_recursive_get`
+            // distance to target_key) — mirrors `runtime::dht_recursive_get`
             // fan-out. Sends fire-and-forget.
             let mut peers: Vec<[u8; 32]> = rlock!(services.session_tx_registry).peer_ids();
             if peers.is_empty() {
@@ -272,7 +272,7 @@ impl IterativeDhtFallback for DhtRouteFallback {
                 }
             }
 
-            // Wait для the response OR timeout, и feed the outcome к
+            // Wait for the response OR timeout, and feed the outcome to
             // adaptive accumulator.
             let resolved = matches!(tokio::time::timeout(timeout, rx).await, Ok(Ok(_)));
             self.record_outcome(resolved);

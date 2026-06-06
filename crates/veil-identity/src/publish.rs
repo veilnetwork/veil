@@ -496,7 +496,7 @@ pub async fn publish_name_claim(
 /// `migration::sign_migration_cert`); this helper just routes the
 /// put. Caller MUST publish the new identity's `IdentityDocument`
 /// before publishing this cert — otherwise resolvers following the
-/// chain will see a cert pointing at a missing target и surface
+/// chain will see a cert pointing at a missing target and surface
 /// `IdentityNotFound`.
 pub async fn publish_migration_cert(
     cert_bytes: &[u8],

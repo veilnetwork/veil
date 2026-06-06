@@ -1,40 +1,40 @@
 //! PoW-gated rendezvous controller (server-side) — Slice 3 of the
 //! PoW-Gated Rendezvous epic ([`docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`]).
 //!
-//! Owns the full lifecycle of one node's response к incoming rendezvous
+//! Owns the full lifecycle of one node's response to incoming rendezvous
 //! requests:
 //!
 //! 1. **Decode + verify** the `RequestEphemeralEndpointPayload` (wire
-//!    primitives живут в `veil-proto::rendezvous`, Slice 1).
+//!    primitives live in `veil-proto::rendezvous`, Slice 1).
 //! 2. **Target check** — `payload.target_node_id` must equal our own
 //!    `local_node_id`; rendezvous requests are not relay-forwarded
 //!    blindly.
-//! 3. **Rate limit** by `requester_pubkey` — protects against а PoW-
-//!    funded requester что mines once и burst-replays.
+//! 3. **Rate limit** by `requester_pubkey` — protects against a PoW-
+//!    funded requester that mines once and burst-replays.
 //! 4. **Concurrent slot semaphore** — caps in-flight on-demand
 //!    listeners.  Beyond the cap the request is rejected; legitimate
-//!    requesters retry after а short backoff.
+//!    requesters retry after a short backoff.
 //! 5. **Bind a slot** via `veil-transport::on_demand::bind_on_demand`
-//!    (Slice 2) — probe-bind а random port.
+//!    (Slice 2) — probe-bind a random port.
 //! 6. **Generate fresh PSK** — per-request 32-byte secret, transports
 //!    embed it through their listener context.
 //! 7. **Build URI + invoke caller-supplied bind closure** — wraps the
-//!    TCP socket с obfs4-tcp/wss/quic + spawns the dedicated accept
+//!    TCP socket with obfs4-tcp/wss/quic + spawns the dedicated accept
 //!    task that respects the lifecycle handle (TTL + accept budget).
 //! 8. **Sign EphemeralEndpointResponse** + return the wire bytes for
-//!    the dispatcher arm к ship back over the session.
+//!    the dispatcher arm to ship back over the session.
 //!
 //! ## Scope (Slice 3)
 //!
-//! This module is а **standalone, testable controller**.  The
-//! dispatcher arm в `node::session::runner` что hands incoming
-//! `SessionMsg::RequestEphemeralEndpoint` bodies к [`RendezvousController::handle_request`]
-//! lives в Slice 5 — bundled с config integration so the wiring lands
-//! atomically.  Until then this module is `pub` + unused в
+//! This module is a **standalone, testable controller**.  The
+//! dispatcher arm in `node::session::runner` that hands incoming
+//! `SessionMsg::RequestEphemeralEndpoint` bodies to [`RendezvousController::handle_request`]
+//! lives in Slice 5 — bundled with config integration so the wiring lands
+//! atomically.  Until then this module is `pub` + unused in
 //! production paths.
 //!
-//! Tests inject а recording [`BindClosure`] that captures `(uri, psk
-//! lifecycle)` tuples; the controller is verified in-process с no
+//! Tests inject a recording [`BindClosure`] that captures `(uri, psk
+//! lifecycle)` tuples; the controller is verified in-process with no
 //! real-world bind round-trips required.
 
 use std::collections::HashMap;
@@ -59,13 +59,13 @@ use veil_proto::rendezvous::{
 // ── Configuration ───────────────────────────────────────────────────
 
 /// Operator-tunable rendezvous policy.  All fields chosen at
-/// `RendezvousController::new` time and immutable afterwards (а reload
+/// `RendezvousController::new` time and immutable afterwards (a reload
 /// rebuilds the controller).
 #[derive(Debug, Clone)]
 pub struct RendezvousPolicy {
     /// Minimum acceptable PoW difficulty (leading-zero-bits) for
-    /// incoming requests.  Verifier rejects requests claiming а lower
-    /// difficulty.  Production defaults на 24 bits (~0.5 sec CPU on а
+    /// incoming requests.  Verifier rejects requests claiming a lower
+    /// difficulty.  Production defaults to 24 bits (~0.5 sec CPU on a
     /// typical 2-vCPU VPS).
     pub min_pow_difficulty: u32,
 
@@ -75,12 +75,12 @@ pub struct RendezvousPolicy {
     /// Number of requests allowed within `rate_window` per requester.
     pub rate_burst: u32,
 
-    /// Maximum concurrent on-demand listeners в flight.  Protects FD
-    /// table from а PoW-funded burst.
+    /// Maximum concurrent on-demand listeners in flight.  Protects FD
+    /// table from a PoW-funded burst.
     pub max_concurrent_slots: usize,
 
     /// Per-slot config (port range, TTL, accept budget, retry count).
-    /// Primary advertise destination — used когда `extra_destinations`
+    /// Primary advertise destination — used when `extra_destinations`
     /// is empty.  Otherwise the controller round-robins between
     /// [primary] ++ extras on each grant.
     pub slot_config: OnDemandConfig,
@@ -94,13 +94,13 @@ pub struct RendezvousPolicy {
 
     /// Follow-up #2: multi-stealth-listener support.  Each entry
     /// contributes an additional bind destination (separate port
-    /// range / interface / advertise host) что shares the unified
+    /// range / interface / advertise host) that shares the unified
     /// policy fields (pow_difficulty, rate limits, concurrent-slot
     /// cap, signing identity).  Controller round-robins between
     /// `[primary]` (built from `slot_config`/`advertise_host`/`scheme`)
-    /// + every entry в this Vec на each grant — гарантирует even
-    ///   utilization across all configured stealth surfaces без
-    ///   requiring the caller к pre-decide which surface а requester
+    /// + every entry in this Vec on each grant — guarantees even
+    ///   utilization across all configured stealth surfaces without
+    ///   requiring the caller to pre-decide which surface a requester
     ///   will land on.  Empty Vec keeps the single-destination
     ///   behavior bit-for-bit.
     pub extra_destinations: Vec<AdvertiseDestination>,
@@ -109,7 +109,7 @@ pub struct RendezvousPolicy {
 /// Follow-up #2: one additional bind destination (port range +
 /// advertise host) sharing the unified rendezvous policy.  Mirrors
 /// the trio (`slot_config`, `advertise_host`, `scheme`) carried
-/// directly on `RendezvousPolicy` для the primary destination.
+/// directly on `RendezvousPolicy` for the primary destination.
 #[derive(Debug, Clone)]
 pub struct AdvertiseDestination {
     pub slot_config: OnDemandConfig,
@@ -168,7 +168,7 @@ impl RendezvousPolicy {
     }
 }
 
-/// Helper builder that parses а `[listen.on_demand]`-style config block
+/// Helper builder that parses a `[listen.on_demand]`-style config block
 /// (string-based durations) into an `OnDemandConfig`.  Reuses the
 /// Phase 5f duration parser.
 pub fn slot_config_from_strings(
@@ -190,14 +190,14 @@ pub fn slot_config_from_strings(
 }
 
 impl RendezvousPolicy {
-    /// Build а policy от an operator's `[listen.on_demand]` config block,
+    /// Build a policy from an operator's `[listen.on_demand]` config block,
     /// completing the missing pieces (host / scheme / advertise_host)
     /// that the config schema doesn't carry directly.
     ///
     /// `bind_host` is the local bind address (typically `"0.0.0.0"`);
-    /// `advertise_host` is the publicly-reachable host advertised к
-    /// requesters в the EphemeralEndpointResponse URI; `scheme` is the
-    /// URI scheme used к compose the response (e.g. `"obfs4-tcp"`).
+    /// `advertise_host` is the publicly-reachable host advertised to
+    /// requesters in the EphemeralEndpointResponse URI; `scheme` is the
+    /// URI scheme used to compose the response (e.g. `"obfs4-tcp"`).
     pub fn from_on_demand_config(
         cfg: &veil_cfg::OnDemandListenConfig,
         bind_host: &str,
@@ -247,22 +247,22 @@ pub enum PolicyError {
 
 /// Caller-supplied bridge between the controller and the actual
 /// `TransportRegistry::bind` + accept-task spawn.  Lives outside this
-/// module so the controller can be tested с а mock что records what
-/// it received, и so Slice 5 can wire the real binding logic против
-/// the runtime's `TransportRegistry` + `TransportContext` без а
+/// module so the controller can be tested with a mock that records what
+/// it received, and so Slice 5 can wire the real binding logic against
+/// the runtime's `TransportRegistry` + `TransportContext` without a
 /// circular dependency.
 ///
 /// Contract: after the controller invokes `bind`, the closure MUST:
 /// 1. Construct the actual `Box<dyn TransportListener>` for the given
-///    URI с the per-request PSK installed в the listener context.
-/// 2. Spawn а dedicated accept task that respects `lifecycle` (exits
+///    URI with the per-request PSK installed in the listener context.
+/// 2. Spawn a dedicated accept task that respects `lifecycle` (exits
 ///    on TTL OR when `note_accept()` returns 1).
-/// 3. Drop the listener когда the accept task exits.
+/// 3. Drop the listener when the accept task exits.
 ///
 /// Returns an error iff (1) failed — the controller will surface that
-/// as a `RejectReason::BindFailed` к the caller, AND the slot's
+/// as a `RejectReason::BindFailed` to the caller, AND the slot's
 /// lifecycle handle should be `shutdown()` to release any concurrent-
-/// slot permit (controller does this automatically на drop of the
+/// slot permit (controller does this automatically on drop of the
 /// permit guard).
 pub trait BindClosure: Send + Sync + 'static {
     fn bind(
@@ -277,7 +277,7 @@ pub trait BindClosure: Send + Sync + 'static {
 
 /// Simple sliding-window-per-pubkey rate limiter.  Bounded growth: the
 /// outer `HashMap` is pruned on each insertion that finds itself > 2×
-/// `rate_burst * max_concurrent_slots` (а very loose bound — at typical
+/// `rate_burst * max_concurrent_slots` (a very loose bound — at typical
 /// production settings (burst=3, slots=16) we cap at ~96 entries
 /// before pruning, which is negligible memory).
 #[derive(Debug)]
@@ -300,9 +300,9 @@ impl RateLimiter {
         }
     }
 
-    /// Check + record а grant attempt.  Returns true iff the requester
-    /// is within budget; false если they would exceed the burst.  On
-    /// `true` an entry is appended к their history.
+    /// Check + record a grant attempt.  Returns true iff the requester
+    /// is within budget; false if they would exceed the burst.  On
+    /// `true` an entry is appended to their history.
     fn allow(&mut self, requester: [u8; 32], now: Instant) -> bool {
         let entry = self.state.entry(requester).or_default();
         // Prune any timestamps outside the window.
@@ -314,7 +314,7 @@ impl RateLimiter {
 
         // Optional global prune to bound memory.  Cheap: drop the
         // entry entirely if its history is empty AND it's an older
-        // key; this keeps the map к size О(active requesters в window).
+        // key; this keeps the map to size O(active requesters in window).
         if self.state.len() > self.soft_cap {
             self.state.retain(|_, ts| {
                 ts.retain(|t| now.duration_since(*t) <= self.window);
@@ -335,8 +335,8 @@ impl RateLimiter {
 
 /// PoW-gated rendezvous controller — entry point for incoming
 /// `SessionMsg::RequestEphemeralEndpoint` bodies.  Owns the rate
-/// limiter, concurrent-slot semaphore, signing key, и delegates the
-/// actual bind к the caller-supplied closure.
+/// limiter, concurrent-slot semaphore, signing key, and delegates the
+/// actual bind to the caller-supplied closure.
 pub struct RendezvousController {
     policy: RendezvousPolicy,
     local_node_id: [u8; 32],
@@ -346,18 +346,18 @@ pub struct RendezvousController {
     binder: Arc<dyn BindClosure>,
     /// Optional metrics handle.  When `Some`, every dispatch path
     /// increments the relevant counter (received / granted /
-    /// rejected_*).  `None` keeps the controller usable в isolated
-    /// unit tests without scaffolding а NodeMetrics fixture.
+    /// rejected_*).  `None` keeps the controller usable in isolated
+    /// unit tests without scaffolding a NodeMetrics fixture.
     metrics: Option<Arc<veil_observability::NodeMetrics>>,
     /// Follow-up #2: round-robin cursor over the destination pool
     /// (`[primary] ++ policy.extra_destinations`).  `fetch_add(1)`
     /// per grant guarantees even fan-out across all advertise
-    /// surfaces без any per-bind state inspection.
+    /// surfaces without any per-bind state inspection.
     next_destination: AtomicUsize,
 }
 
 impl RendezvousController {
-    /// Construct.  Validates the policy и precomputes the rate
+    /// Construct.  Validates the policy and precomputes the rate
     /// limiter + semaphore.  `metrics` is optional; tests pass
     /// `None`, production passes the runtime's `NodeMetrics`.
     pub fn new(
@@ -369,7 +369,7 @@ impl RendezvousController {
         Self::new_with_metrics(policy, local_node_id, signing_key, binder, None)
     }
 
-    /// Construct с an explicit `NodeMetrics` handle.
+    /// Construct with an explicit `NodeMetrics` handle.
     pub fn new_with_metrics(
         policy: RendezvousPolicy,
         local_node_id: [u8; 32],
@@ -403,7 +403,7 @@ impl RendezvousController {
     /// Follow-up #2: number of advertise destinations the controller
     /// rotates between.  Always ≥ 1 (the primary destination from
     /// `policy.slot_config`/`advertise_host`/`scheme`); equals
-    /// `1 + policy.extra_destinations.len()` когда multi-stealth is
+    /// `1 + policy.extra_destinations.len()` when multi-stealth is
     /// configured.
     pub fn destination_count(&self) -> usize {
         1 + self.policy.extra_destinations.len()
@@ -411,7 +411,7 @@ impl RendezvousController {
 
     /// Follow-up #2: pick the next destination's (slot_config,
     /// advertise_host, scheme) triple round-robin.  Pure read —
-    /// callers may discard the result без advancing.
+    /// callers may discard the result without advancing.
     fn pick_destination(&self) -> (OnDemandConfig, &str, &str) {
         let total = 1 + self.policy.extra_destinations.len();
         if total == 1 {
@@ -440,7 +440,7 @@ impl RendezvousController {
 
     /// Handle one incoming request body.  Pure entrypoint: decode +
     /// verify + decide + (if granted) bind + sign response.  Caller
-    /// (dispatcher arm в Slice 5) ships the returned bytes back over
+    /// (dispatcher arm in Slice 5) ships the returned bytes back over
     /// the session.
     pub async fn handle_request(&self, body: &[u8]) -> RequestOutcome {
         if let Some(m) = self.metrics.as_ref() {
@@ -495,7 +495,7 @@ impl RendezvousController {
             }
         }
 
-        // 5. Acquire а concurrent-slot permit.
+        // 5. Acquire a concurrent-slot permit.
         let permit = match Arc::clone(&self.slot_semaphore).try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -506,7 +506,7 @@ impl RendezvousController {
             }
         };
 
-        // 6. Probe-bind а slot.  Follow-up #2: pick а destination
+        // 6. Probe-bind a slot.  Follow-up #2: pick a destination
         //    round-robin if multiple stealth listeners are configured.
         let (slot_cfg, advertise_host, scheme) = self.pick_destination();
         let slot_ttl = slot_cfg.ttl;
@@ -540,9 +540,9 @@ impl RendezvousController {
             )));
         }
 
-        // 9. Listener bound — bump the in-use gauge.  Pair с а task
-        //    что watches the lifecycle и decrements когда it retires
-        //    (TTL or accept-exhaustion), при the same time releasing
+        // 9. Listener bound — bump the in-use gauge.  Pair with a task
+        //    that watches the lifecycle and decrements when it retires
+        //    (TTL or accept-exhaustion), at the same time releasing
         //    the slot permit.
         if let Some(m) = self.metrics.as_ref() {
             m.inc_rendezvous_slots_in_use();
@@ -551,15 +551,15 @@ impl RendezvousController {
         let metrics_for_decrement = self.metrics.clone();
         tokio::spawn(async move {
             lifecycle_for_permit.await_ttl_or_shutdown().await;
-            drop(permit); // releases а semaphore slot
+            drop(permit); // releases a semaphore slot
             if let Some(m) = metrics_for_decrement {
                 m.dec_rendezvous_slots_in_use();
             }
         });
 
-        // 10. Sign the response.  Follow-up #2: TTL comes от the
+        // 10. Sign the response.  Follow-up #2: TTL comes from the
         //     picked destination's slot_config, NOT the primary's
-        //     (multi-stealth с heterogeneous TTLs — each destination
+        //     (multi-stealth with heterogeneous TTLs — each destination
         //     has its own).
         let valid_until_unix = now_unix.saturating_add(slot_ttl.as_secs());
         let response = match sign_ephemeral_endpoint_response(
@@ -607,9 +607,9 @@ impl RendezvousController {
 /// Result of one rendezvous request handling cycle.
 #[derive(Debug)]
 pub enum RequestOutcome {
-    /// Request accepted, listener bound, response signed и ready to
-    /// ship.  Caller (Slice 5 dispatcher arm) wraps the bytes в an
-    /// `EphemeralEndpointResponse` frame и sends к the requester
+    /// Request accepted, listener bound, response signed and ready to
+    /// ship.  Caller (Slice 5 dispatcher arm) wraps the bytes in an
+    /// `EphemeralEndpointResponse` frame and sends to the requester
     /// over the existing session.
     Granted {
         response_bytes: Vec<u8>,
@@ -623,7 +623,7 @@ pub enum RequestOutcome {
 
 #[derive(Debug)]
 pub enum RejectReason {
-    /// Wire bytes don't decode as а valid request structure.
+    /// Wire bytes don't decode as a valid request structure.
     Decode(String),
     /// Verify failure: sig, PoW, or replay-window.
     Verify(String),
@@ -633,7 +633,7 @@ pub enum RejectReason {
     RateLimited,
     /// Concurrent in-flight slot semaphore exhausted.
     ConcurrencyExhausted,
-    /// `bind_on_demand` failed (port range exhausted) или the caller-
+    /// `bind_on_demand` failed (port range exhausted) or the caller-
     /// supplied bind closure failed (e.g. obfs4 wrap error).
     BindFailed(String),
 }
@@ -662,7 +662,7 @@ mod tests {
         SigningKey::from_bytes(&[seed; 32])
     }
 
-    /// Mock binder что records every bind call.  Captures (uri, psk
+    /// Mock binder that records every bind call.  Captures (uri, psk
     /// lifecycle) so tests can assert what the controller passed.
     #[derive(Default)]
     #[allow(clippy::type_complexity)] // test-fixture mutex of recorded tuples
@@ -798,16 +798,16 @@ mod tests {
                 port,
                 response_payload,
             } => {
-                // Port должен be в the configured range.
+                // Port must be in the configured range.
                 assert!((30000..=60000).contains(&port));
-                // URI должен use the operator's advertise_host, NOT the
-                // bind host (controller composes с scheme/advertise_host).
+                // URI must use the operator's advertise_host, NOT the
+                // bind host (controller composes with scheme/advertise_host).
                 let calls = binder.calls.lock().unwrap();
                 assert_eq!(calls.len(), 1);
                 let (uri, _psk, _lifecycle) = &calls[0];
                 assert!(uri.starts_with("obfs4-tcp://example.com:"));
                 assert!(uri.ends_with(&port.to_string()));
-                // Response должен verify under the target's pubkey from
+                // Response must verify under the target's pubkey from
                 // the initiator's POV.
                 let target_pk = target_sk.verifying_key().to_bytes();
                 let requester_pk = requester_sk.verifying_key().to_bytes();
@@ -818,10 +818,10 @@ mod tests {
                     now_unix(),
                 )
                 .expect("signed response must verify");
-                // PSK passed к binder должен match the one в the
+                // PSK passed to binder must match the one in the
                 // signed response.
                 assert_eq!(calls[0].1, response_payload.psk);
-                // response_bytes should decode back к the same payload.
+                // response_bytes should decode back to the same payload.
                 let decoded = EphemeralEndpointResponsePayload::decode(&response_bytes).unwrap();
                 assert_eq!(decoded, response_payload);
             }
@@ -904,7 +904,7 @@ mod tests {
         let binder = Arc::new(RecordingBinder::default());
         let mut p = default_policy();
         p.rate_burst = 100;
-        p.max_concurrent_slots = 16; // headroom для 6 concurrent
+        p.max_concurrent_slots = 16; // headroom for 6 concurrent
         // Use distinct advertise_hosts so we can observe round-robin
         // simply by reading the URIs the binder records.
         p.advertise_host = "host-A.example".to_owned();
@@ -945,7 +945,7 @@ mod tests {
         let hosts: Vec<&str> = calls
             .iter()
             .map(|(uri, _, _)| {
-                // Extract host token between "://" и ":<port>".
+                // Extract host token between "://" and ":<port>".
                 let after_scheme = uri.split("://").nth(1).unwrap();
                 after_scheme.split(':').next().unwrap()
             })
@@ -968,7 +968,7 @@ mod tests {
         policy.rate_burst = 10;
         let controller =
             RendezvousController::new(policy, target_nid, target_sk, binder.clone()).unwrap();
-        // Two distinct requests с different timestamps so they're
+        // Two distinct requests with different timestamps so they're
         // both valid AND don't collide on signed bytes.
         let body1 = build_signed_request(target_nid, &requester_sk, 8, now_unix());
         let body2 = build_signed_request(target_nid, &requester_sk, 8, now_unix() + 1);
@@ -1006,7 +1006,7 @@ mod tests {
         let binder = Arc::new(RecordingBinder::default());
         let controller =
             RendezvousController::new(default_policy(), our_nid, our_sk, binder.clone()).unwrap();
-        // Request addressed к а DIFFERENT node_id.
+        // Request addressed to a DIFFERENT node_id.
         let other_nid = [0xFFu8; 32];
         let body = build_signed_request(other_nid, &requester_sk, 8, now_unix());
         let outcome = controller.handle_request(&body).await;
@@ -1025,7 +1025,7 @@ mod tests {
             RendezvousController::new(default_policy(), target_nid, target_sk, binder.clone())
                 .unwrap();
         let mut body = build_signed_request(target_nid, &requester_sk, 8, now_unix());
-        // Tamper с the signature bytes (last 64 bytes).
+        // Tamper with the signature bytes (last 64 bytes).
         let len = body.len();
         body[len - 1] ^= 0x01;
         let outcome = controller.handle_request(&body).await;
@@ -1044,7 +1044,7 @@ mod tests {
         policy.min_pow_difficulty = 16;
         let controller =
             RendezvousController::new(policy, target_nid, target_sk, binder.clone()).unwrap();
-        // Build а request с difficulty 8 — below the controller's
+        // Build a request with difficulty 8 — below the controller's
         // required min of 16.
         let body = build_signed_request(target_nid, &requester_sk, 8, now_unix());
         let outcome = controller.handle_request(&body).await;
@@ -1092,7 +1092,7 @@ mod tests {
             let outcome = controller.handle_request(&body).await;
             assert!(
                 matches!(outcome, RequestOutcome::Granted { .. }),
-                "request {i} должен grant",
+                "request {i} must grant",
             );
         }
         let body = build_signed_request(target_nid, &requester_sk, 8, ts_base + 2);
@@ -1110,11 +1110,11 @@ mod tests {
         let mut policy = default_policy();
         policy.max_concurrent_slots = 1;
         policy.rate_burst = 100;
-        // TTL long enough что the first listener's permit isn't released.
+        // TTL long enough that the first listener's permit isn't released.
         policy.slot_config.ttl = Duration::from_secs(300);
         let controller =
             RendezvousController::new(policy, target_nid, target_sk, binder.clone()).unwrap();
-        // Use TWO distinct requesters так rate limit doesn't fire.
+        // Use TWO distinct requesters so rate limit doesn't fire.
         let rsk1 = test_sk(17);
         let rsk2 = test_sk(18);
         let body1 = build_signed_request(target_nid, &rsk1, 8, now_unix());
@@ -1191,11 +1191,11 @@ mod tests {
     fn rate_limiter_soft_cap_prunes_idle_entries() {
         let mut rl = RateLimiter::new(Duration::from_millis(50), 1, 4);
         let now = Instant::now();
-        // Fill soft cap с unique pubkeys.
+        // Fill soft cap with unique pubkeys.
         for i in 0..6u8 {
             rl.allow([i; 32], now);
         }
-        // Wait past window THEN add а new entry — prune should kick in.
+        // Wait past window THEN add a new entry — prune should kick in.
         let later = now + Duration::from_millis(100);
         rl.allow([0xFFu8; 32], later);
         assert!(rl.state.len() <= 5, "expected prune to bound map");
@@ -1207,7 +1207,7 @@ mod tests {
     fn fresh_psk_returns_different_values() {
         let a = fresh_psk();
         let b = fresh_psk();
-        // Astronomically unlikely к collide.
+        // Astronomically unlikely to collide.
         assert_ne!(a, b);
     }
 
@@ -1361,8 +1361,8 @@ mod tests {
         let binder = Arc::new(RecordingBinder::default());
         let controller =
             RendezvousController::new(default_policy(), target_nid, target_sk, binder).unwrap();
-        // Construct а request с pow_difficulty > MAX (e.g. 100) — sign
-        // but don't mine (PoW would fail too но verify checks the
+        // Construct a request with pow_difficulty > MAX (e.g. 100) — sign
+        // but don't mine (PoW would fail too but verify checks the
         // bound first).
         let requester_pk = requester_sk.verifying_key().to_bytes();
         let signed = sign_request_ephemeral_endpoint(

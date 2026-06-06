@@ -38,26 +38,26 @@ use crate::{RoutingLogger, RoutingMetrics};
 
 /// iterative-DHT fallback.
 ///
-/// When the legacy `RouteRequest` flood (TTL=7) exhausts its retries без
-/// finding а route, the miss-handler can optionally invoke this trait to
-/// run а Kademlia-style iterative `find_node_iterative` against the DHT
-/// resolve the target's transport URI, и trigger а direct outbound dial.
-/// This bypasses both `RouteRequest TTL=7` и `MAX_RELAY_HOPS=16` limits —
-/// useful когда the topology requires reaching peers > 16 hops away in а
+/// When the legacy `RouteRequest` flood (TTL=7) exhausts its retries without
+/// finding a route, the miss-handler can optionally invoke this trait to
+/// run a Kademlia-style iterative `find_node_iterative` against the DHT
+/// resolve the target's transport URI, and trigger a direct outbound dial.
+/// This bypasses both `RouteRequest TTL=7` and `MAX_RELAY_HOPS=16` limits —
+/// useful when the topology requires reaching peers > 16 hops away in a
 /// relay chain (adversarial partition / sparse mesh / pathological cases).
 ///
 /// `veil-routing` defines only the trait k keep crate-graph clean
-/// (the concrete impl lives в veilcore where veil-dht is reachable).
-/// `None` disables the fallback и preserves pre-refactor behaviour exactly.
+/// (the concrete impl lives in veilcore where veil-dht is reachable).
+/// `None` disables the fallback and preserves pre-refactor behaviour exactly.
 pub trait IterativeDhtFallback: Send + Sync {
-    /// Attempt к resolve `target` via iterative DHT walk + dial. Returns
-    /// `true` once the route_cache shows а hop (either direct session
+    /// Attempt to resolve `target` via iterative DHT walk + dial. Returns
+    /// `true` once the route_cache shows a hop (either direct session
     /// established or relay-able next-hop learned), `false` on hard miss
-    /// (target absent от DHT, all dials failed, walker timeout, etc.).
+    /// (target absent from DHT, all dials failed, walker timeout, etc.).
     ///
     /// `priority` is the original message's traffic-class byte (
     /// — INTERACTIVE / BACKGROUND / etc.). Impl scales the timeout by
-    /// `dht_fallback_priority_mult` so interactive flows fast-fail и
+    /// `dht_fallback_priority_mult` so interactive flows fast-fail and
     /// background flows tolerate longer DHT walks.
     fn try_resolve_and_dial<'a>(
         &'a self,
@@ -72,7 +72,7 @@ pub struct MissHandlerCtx {
     pub shutdown_rx: watch::Receiver<bool>,
     /// channel item now carries `(target, priority)`.
     /// Priority is the original frame's traffic-class byte so the fallback
-    /// can choose between fast-fail (INTERACTIVE) и tolerant (BACKGROUND)
+    /// can choose between fast-fail (INTERACTIVE) and tolerant (BACKGROUND)
     /// timeout budgets.
     pub rx: mpsc::Receiver<([u8; 32], u8)>,
     pub broadcaster: Arc<dyn FrameBroadcaster>,
@@ -89,7 +89,7 @@ pub struct MissHandlerCtx {
     pub partition_threshold: f64,
     /// optional iterative-DHT fallback invoked after the
     /// `RouteRequest` retry budget exhausts. `None` preserves legacy
-    /// behaviour (record partition event, drop message). Wired в
+    /// behaviour (record partition event, drop message). Wired in
     /// veilcore via `DhtRouteFallback`.
     pub iterative_dht_fallback: Option<Arc<dyn IterativeDhtFallback>>,
 }
@@ -99,7 +99,7 @@ pub struct MissHandlerCtx {
 const DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Compact 8-hex-char prefix for log formatting (avoids dragging
-/// veilcore's `hex_short` helper through а crate boundary).
+/// veilcore's `hex_short` helper through a crate boundary).
 fn hex_short_8(id: &[u8; 32]) -> String {
     let mut s = String::with_capacity(8);
     for b in &id[..4] {
@@ -133,7 +133,7 @@ async fn run(ctx: MissHandlerCtx) {
         std::collections::HashMap::new();
     // priority-aware deduplication ignored — same
     // destination dedups regardless of priority (we only need ONE
-    // resolution для а target; the priority just informs the timeout).
+    // resolution for a target; the priority just informs the timeout).
     // Periodic cleanup keeps the dedup map bounded even when no miss events
     // arrive for a long time.
     let mut cleanup_ticker = tokio::time::interval(DEDUP_TTL * 10);
@@ -172,9 +172,9 @@ async fn run(ctx: MissHandlerCtx) {
                     &dst, &route_cache, &route_updated, route_request_backoff_ms,
                 ).await;
 
-                // iterative-DHT fallback. Triggered ONLY если
-                // legacy `RouteRequest` flood exhausted its retries без а route.
-                // Behaviour-preserving: `None` skips this block entirely и we
+                // iterative-DHT fallback. Triggered ONLY if
+                // legacy `RouteRequest` flood exhausted its retries without a route.
+                // Behaviour-preserving: `None` skips this block entirely and we
                 // record the partition event below.
                 if !found && let Some(fallback) = iterative_dht_fallback.as_ref() {
                     logger.info(
@@ -187,7 +187,7 @@ async fn run(ctx: MissHandlerCtx) {
                     let resolved = fallback.try_resolve_and_dial(dst, priority).await;
                     if resolved {
                         // Iterative walk + dial succeeded; route_cache may
-                        // already have а hop OR the dial-handshake will
+                        // already have a hop OR the dial-handshake will
                         // populate it shortly. Wait one more backoff round.
                         found = wait_for_route(
                             &dst, &route_cache, &route_updated, route_request_backoff_ms,

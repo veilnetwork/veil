@@ -1,15 +1,15 @@
 //! P-Net DHT-replicated ban sync.
 //!
-//! In а private veil network (`[network].mode = "private"`) admin
-//! nodes publish signed `BanEntry` records to the DHT при ban time.
+//! In a private veil network (`[network].mode = "private"`) admin
+//! nodes publish signed `BanEntry` records to the DHT at ban time.
 //! Every member periodically polls its local DHT store for ban entries
-//! и applies them к the in-memory `BanList`, so an admin's decision
-//! propagates network-wide вне зависимости от which node typed the
+//! and applies them to the in-memory `BanList`, so an admin's decision
+//! propagates network-wide regardless of which node typed the
 //! command.
 //!
 //! Public-mode nodes never construct this task (gate is `None`), so
 //! their bans stay node-local — preserving the user's explicit
-//! "publish-only-as-owner" constraint в open networks.
+//! "publish-only-as-owner" constraint in open networks.
 
 use std::sync::Arc;
 
@@ -27,15 +27,15 @@ use super::{NodeRuntime, lock_tasks, supervised_spawn};
 pub const MAX_PUBLISH_REASON_LEN: usize = veil_types::MAX_BAN_REASON_LEN;
 
 /// Periodic interval at which every member walks its DHT store for
-/// PBAN entries и refreshes its local `BanList`. Inexpensive: scan is
-/// O(|stored entries|) + small fixed verifies. 60 s strikes а balance
-/// between propagation lag и CPU spend on idle clusters.
+/// PBAN entries and refreshes its local `BanList`. Inexpensive: scan is
+/// O(|stored entries|) + small fixed verifies. 60 s strikes a balance
+/// between propagation lag and CPU spend on idle clusters.
 pub const APPLY_INTERVAL_SECS: u64 = 60;
 
 /// Errors returned by [`NodeRuntime::publish_p_net_ban`].
 #[derive(Debug, thiserror::Error)]
 pub enum PublishBanError {
-    #[error("[network] not configured — this is а public-mode node")]
+    #[error("[network] not configured — this is a public-mode node")]
     NoGate,
     #[error("local cert decode failed: {0}")]
     BadLocalCert(String),
@@ -91,18 +91,18 @@ impl PreparedBan {
 }
 
 impl NodeRuntime {
-    /// Author а signed `BanEntry`, store it locally, и apply it к the local
+    /// Author a signed `BanEntry`, store it locally, and apply it to the local
     /// `BanList` — the synchronous half. Returns a [`PreparedBan`] whose
     /// [`PreparedBan::replicate`] performs the async DHT fan-out. Split out
     /// (audit cycle-6 T7) so the admin handler can drop the `NodeRuntime` lock
     /// before the network await. `publish_p_net_ban` chains both for callers
     /// that don't hold the lock.
     ///
-    /// Requires `[network].mode = "private"`, а local membership cert
-    /// flagged `admin: true`, и а live identity Ed25519 signing key
+    /// Requires `[network].mode = "private"`, a local membership cert
+    /// flagged `admin: true`, and a live identity Ed25519 signing key
     /// (the cert's `admin_pubkey` derives of it). All three pre-
     /// conditions are static at startup, so failures here generally
-    /// indicate а misconfiguration rather than transient state.
+    /// indicate a misconfiguration rather than transient state.
     pub fn prepare_p_net_ban(
         &self,
         banned_node_id: [u8; 32],
@@ -149,7 +149,7 @@ impl NodeRuntime {
         // Defence-in-depth: re-verify what we just signed before
         // shipping. Catches any silent invariant violation (e.g.
         // mismatched algos) at the publish boundary instead of letting
-        // the receiver reject и log а cryptic error.
+        // the receiver reject and log a cryptic error.
         verify_ban_entry(
             &entry,
             &gate.expected_network_id,
@@ -163,7 +163,7 @@ impl NodeRuntime {
         let key = ban_dht_key(&gate.expected_network_id, &banned_node_id);
 
         // Apply locally immediately. Don't wait for the DHT scanner —
-        // the admin's own session set should reflect the ban в the next
+        // the admin's own session set should reflect the ban in the next
         // dispatch step.
         {
             let mut bl = lock!(self.ban_list);
@@ -172,8 +172,8 @@ impl NodeRuntime {
 
         // The async fan-out lives in `PreparedBan::replicate` so the caller can
         // drop the NodeRuntime lock first. Our gate accepts the PBAN value at
-        // `handle_store` time on every receiver, so remote nodes ingest и (on
-        // their next apply tick) push к their own `BanList`.
+        // `handle_store` time on every receiver, so remote nodes ingest and (on
+        // their next apply tick) push to their own `BanList`.
         Ok(PreparedBan {
             dht: Arc::clone(&self.dht),
             session_outbox: Arc::clone(&self.session_outbox),
@@ -200,11 +200,11 @@ impl NodeRuntime {
 
     /// Periodic background task: every `APPLY_INTERVAL_SECS` seconds
     /// scan the local DHT store for PBAN-prefixed values, verify each,
-    /// и apply к `BanList`. Idempotent — re-running on already-banned
-    /// node IDs is а cheap `is_banned` check.
+    /// and apply to `BanList`. Idempotent — re-running on already-banned
+    /// node IDs is a cheap `is_banned` check.
     ///
     /// Spawned only when the network gate is wired (private mode);
-    /// public-mode nodes don't have ban records к sync.
+    /// public-mode nodes don't have ban records to sync.
     pub fn spawn_p_net_ban_sync_task(&mut self) {
         let Some(gate) = self.network_gate.as_ref().map(Arc::clone) else {
             return; // public mode — no sync needed

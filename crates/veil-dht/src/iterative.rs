@@ -435,18 +435,18 @@ pub async fn find_value_iterative(
                         }
                         let r_dist = xor_distance(&r.node_id, &key);
                         // Audit batch 2026-05-25 phase L (cross-audit
-                        // closure): unify eclipse filter с
+                        // closure): unify eclipse filter with
                         // `find_node_iterative` (line 293) — strict
                         // progress `r_dist < peer_dist`.  Previously
-                        // FIND_VALUE used а legacy `half_r_dist >
+                        // FIND_VALUE used a legacy `half_r_dist >
                         // peer_dist` check that admitted same-distance
                         // contacts, leaving an asymmetric Sybil-eclipse
                         // window: FIND_NODE was protected (strict
                         // filter) but FIND_VALUE was not.  Attackers
-                        // publishing Sybils close к а target key could
-                        // funnel resolution к forged values
+                        // publishing Sybils close to a target key could
+                        // funnel resolution to forged values
                         // (sovereign-identity lookup, name-claim
-                        // resolve, mlkem-cert fetch).  Unifying к the
+                        // resolve, mlkem-cert fetch).  Unifying to the
                         // strict filter closes the asymmetry.
                         if r_dist >= peer_dist {
                             continue;

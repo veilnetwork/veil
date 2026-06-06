@@ -63,9 +63,9 @@ pub mod sink_impl;
 
 // ── build_own_host_candidates ────────────────────────────────────────────────
 //
-// Inlined helper: builds RFC 8445 ICE host candidates от listen URIs.
-// Sat at an awkward intersection (proto + transport types) когда extracted
-// от veilcore's util.rs; kept dispatcher-local here.
+// Inlined helper: builds RFC 8445 ICE host candidates from listen URIs.
+// Sat at an awkward intersection (proto + transport types) when extracted
+// from veilcore's util.rs; kept dispatcher-local here.
 pub fn build_own_host_candidates(listen_uris: &[String]) -> Vec<veil_proto::control::NatCandidate> {
     use std::net::IpAddr;
     use veil_proto::control::{NatCandidate, candidate_type};
@@ -109,7 +109,7 @@ pub fn build_own_host_candidates(listen_uris: &[String]) -> Vec<veil_proto::cont
 pub struct PowPendingTable {
     /// Maps `challenge_nonce → (requester_node_id, difficulty, request_id, issued_at)`.
     /// `request_id` echoes the originating `RouteRequestPayload.request_id` so the
-    /// deferred `RouteResponse` (sent after PoW verify (Уровень 1)) can be
+    /// deferred `RouteResponse` (sent after PoW verify (Level 1)) can be
     /// correlated by the requester.
     map: HashMap<[u8; 32], ([u8; 32], u8, u32, Instant)>,
     /// Insertion-order index for O(log n) oldest-first eviction.
@@ -205,17 +205,17 @@ pub struct CryptoContext {
     /// * Rotate `mlkem_dk_seed` on a configurable schedule and re-derive EK.
     /// * Use ephemeral ML-KEM per session (requires a second round-trip).
     ///
-    /// # Memory hygiene (Этап 6 slice 6g)
+    /// # Memory hygiene (Phase 6 slice 6g)
     ///
     /// Backed by [`veil_util::sensitive_bytes::SensitiveBytesN<64>`] —
     /// the 64-byte DK seed is pinned via `mlock(2)` when `RLIMIT_MEMLOCK`
-    /// permits, falls back к а zeroize-on-drop `Zeroizing<Vec<u8>>`
-    /// otherwise.  Closing the swap-к-disk vector matters more here than
+    /// permits, falls back to a zeroize-on-drop `Zeroizing<Vec<u8>>`
+    /// otherwise.  Closing the swap-to-disk vector matters more here than
     /// for any session-scoped key: the DK seed is **process-lifetime**
-    /// (rotation is а manual operator action — see mitigation note
-    /// above), so если pages holding it land on disk under sustained
-    /// memory pressure, **every E2E ciphertext ever sent к this node**
-    /// becomes recoverable by anyone с read access к the swap partition.
+    /// (rotation is a manual operator action — see mitigation note
+    /// above), so if pages holding it land on disk under sustained
+    /// memory pressure, **every E2E ciphertext ever sent to this node**
+    /// becomes recoverable by anyone with read access to the swap partition.
     pub mlkem_dk_seed:
         Arc<veil_util::sensitive_bytes::SensitiveBytesN<{ veil_e2e::DK_SEED_BYTES }>>,
     /// Peer ML-KEM-768 encapsulation-key cache: `peer_id → (ek_bytes, cached_at)`.
@@ -253,9 +253,9 @@ pub struct CryptoContext {
     /// `mlkem_dk_seed`. Entries are removed when the corresponding session closes
     /// so stale ephemeral keys do not accumulate.
     ///
-    /// Этап 6 slice 6h — value type changed от `[u8; 64]` к
-    /// `SensitiveBytesN<64>` so per-session DK seeds ара mlocked
-    /// while the session is open (closes the swap-к-disk vector for
+    /// Phase 6 slice 6h — value type changed from `[u8; 64]` to
+    /// `SensitiveBytesN<64>` so per-session DK seeds are mlocked
+    /// while the session is open (closes the swap-to-disk vector for
     /// the hours-long session lifetime).
     pub per_session_mlkem_dk: Arc<
         Mutex<
@@ -342,7 +342,7 @@ pub struct AbuseContext {
 // call sites compiling unchanged.
 pub use veil_dispatcher_state::{CaptureEvent, DiagEvent, PendingRecursive};
 
-/// type alias для the route-miss channel sender.
+/// type alias for the route-miss channel sender.
 /// Carries `(target_node_id, traffic_class)` so the iterative-DHT
 /// fallback can apply priority-aware timeout multipliers.
 pub type RouteMissTx = mpsc::Sender<([u8; 32], u8)>;
@@ -584,9 +584,9 @@ impl TraceBuffer {
 
 // ── DispatchResult ────────────────────────────────────────────────────────────
 //
-// Phase 2 session 2 prep: type moved к `session::dispatcher_sink`
+// Phase 2 session 2 prep: type moved to `session::dispatcher_sink`
 // (it is the return type of the `DispatcherSink::dispatch` trait method,
-// и lives alongside the trait that uses it).  Re-exported here so
+// and lives alongside the trait that uses it).  Re-exported here so
 // existing call sites — `dispatcher::routing::*`, etc. — keep compiling
 // unchanged.
 pub use veil_session::dispatcher_sink::DispatchResult;
@@ -600,21 +600,21 @@ pub use veil_session::dispatcher_sink::DispatchResult;
 /// # Lock ordering
 ///
 /// Canonical workspace-wide acquire order (see also
-/// `runtime/session_guard.rs` для the session-side fields).  When multiple
-/// mutexes must be acquired simultaneously, always take them в this order
-/// к prevent deadlock:
+/// `runtime/session_guard.rs` for the session-side fields).  When multiple
+/// mutexes must be acquired simultaneously, always take them in this order
+/// to prevent deadlock:
 ///
 /// 1. `route_cache`              (RwLock)
 /// 2. `session_tx_registry`      (RwLock)
 /// 3. `ban_list`                 (Mutex)
 /// 4. `violation_tracker`        (Mutex)
 ///
-/// Common idiom для send paths: snapshot а `route_cache.lookup(...)` into
-/// а local `Option<[u8; 32]>` BEFORE acquiring `wlock!(session_tx_registry)`,
-/// then use the snapshot in the fallback branch когда direct `send_to`
-/// fails.  Holding both locks simultaneously inverts the order и creates
-/// а deadlock cycle against the symmetric callers в routing.rs:1845, 2236
-/// и delivery.rs.
+/// Common idiom for send paths: snapshot a `route_cache.lookup(...)` into
+/// a local `Option<[u8; 32]>` BEFORE acquiring `wlock!(session_tx_registry)`,
+/// then use the snapshot in the fallback branch when direct `send_to`
+/// fails.  Holding both locks simultaneously inverts the order and creates
+/// a deadlock cycle against the symmetric callers in routing.rs:1845, 2236
+/// and delivery.rs.
 #[derive(Clone)]
 pub struct FrameDispatcher {
     pub role: NodeRole,
@@ -648,8 +648,8 @@ pub struct FrameDispatcher {
     /// PoW-Gated Rendezvous epic; see
     /// `docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`).  `None` when no
     /// `visibility = "stealth"` listener is configured.  Stored as
-    /// `Weak` к break the `dispatcher → controller → binder →
-    /// SessionRuntimeContext → dispatcher` strong-ref cycle что
+    /// `Weak` to break the `dispatcher → controller → binder →
+    /// SessionRuntimeContext → dispatcher` strong-ref cycle that
     /// would otherwise leak on reload.  Strong Arc lives on
     /// `NodeRuntime`; this weak ref upgrades transiently on each
     /// dispatch.
@@ -729,7 +729,7 @@ pub struct FrameDispatcher {
     /// Number of leading zero bits required in the PoW puzzle. `0` disables
     /// PoW challenges (acceptor sends no `PowChallenge` on `RouteRequest`).
     ///
-    /// (Уровень 1): when `> 0`, the `RouteResponse` carrying our
+    /// (Level 1): when `> 0`, the `RouteResponse` carrying our
     /// listen transports is *deferred* until the requester returns a valid
     /// `PowResponse` — probing-by-id no longer leaks transports for free.
     pub pow_difficulty: u8,
@@ -739,7 +739,7 @@ pub struct FrameDispatcher {
     /// `request_id` is echoed back into the deferred `RouteResponse`.
     pub pow_pending: Arc<Mutex<PowPendingTable>>,
 
-    /// (Уровень 2): controls who learns our listen transports
+    /// (Level 2): controls who learns our listen transports
     /// via `RouteResponse`. See [`veil_cfg::DiscoveryMode`].
     pub discovery_mode: veil_cfg::DiscoveryMode,
 
@@ -764,7 +764,7 @@ pub struct FrameDispatcher {
     /// Capture-debug under chat-node load was 10 MB/s @ 10K pkt/s
     /// pre-fix; this caps the broadcast amplification at ~100 KB/s
     /// per peer × the 256 B body preview = ~25 KB/s/peer maximum
-    /// or ~175 KB/s on а full 7-peer mesh.
+    /// or ~175 KB/s on a full 7-peer mesh.
     pub capture_rate_limit: Arc<veil_dispatcher_state::CaptureRateLimiter>,
 
     // ── Route convergence ──────────────────────────────────────────
@@ -772,9 +772,9 @@ pub struct FrameDispatcher {
     /// not be routed (no direct session, no route-cache hit), the
     /// `(destination_node_id, traffic_class)` pair is pushed here so the
     /// background route-miss handler can trigger an on-demand
-    /// `ROUTE_REQUEST` flood и retry delivery. :
+    /// `ROUTE_REQUEST` flood and retry delivery. :
     /// channel item gained the traffic_class byte so the iterative-DHT
-    /// fallback can pick а priority-aware timeout budget.
+    /// fallback can pick a priority-aware timeout budget.
     pub route_miss_tx: Arc<Mutex<Option<RouteMissTx>>>,
 
     // ── Neighbor scoring ─────────────────────────────────────────
@@ -1058,41 +1058,41 @@ pub struct FrameDispatcher {
     /// configured as a rendezvous (operators opt in by enabling the
     /// `[anonymity].rendezvous_capable` flag); receivers register
     /// cookies via `RelayChainMsg::RegisterRendezvous` frames over an
-    /// established OVL1 session, и the rendezvous forwards inbound
+    /// established OVL1 session, and the rendezvous forwards inbound
     /// `IntroducePayload` frames to the matching subscriber.
     pub rendezvous_registry: Option<Arc<veil_anonymity::rendezvous::RendezvousRegistry>>,
 }
 
-/// Constant-time pad applied к banned-peer drops в `dispatch()`.
+/// Constant-time pad applied to banned-peer drops in `dispatch()`.
 ///
 /// Phase 5q's early-ban-check returns `NoResponse` immediately on
-/// `is_banned`, saving the CPU of full-pipeline processing для frames
-/// от banned peers.  Without padding, the dispatch-latency divergence
+/// `is_banned`, saving the CPU of full-pipeline processing for frames
+/// from banned peers.  Without padding, the dispatch-latency divergence
 /// (banned ≈ single-digit µs vs normal ≈ 30-300 µs) leaks ban-list
-/// membership к an observer measuring response timing — an attacker
-/// can enumerate the ban-list or detect that they were just banned и
+/// membership to an observer measuring response timing — an attacker
+/// can enumerate the ban-list or detect that they were just banned and
 /// rotate identities before the progressive-ban duration spikes.
 ///
-/// We spin-pad banned drops к а constant deadline measured от the
+/// We spin-pad banned drops to a constant deadline measured from the
 /// top of `dispatch()` so the externally-observable latency
-/// distribution matches normal frames в expectation.  50 µs is the
-/// observed median dispatch time под chat-node load (Ping → Pong,
+/// distribution matches normal frames in expectation.  50 µs is the
+/// observed median dispatch time under chat-node load (Ping → Pong,
 /// AppOpen ack, etc.); tighter pads risk being shorter than the
-/// natural-frame fast-tail и still leaking; longer pads waste CPU
-/// for marginal additional masking.  Tune via а profile-driven
-/// retarget if а deployment shows а materially different distribution.
+/// natural-frame fast-tail and still leaking; longer pads waste CPU
+/// for marginal additional masking.  Tune via a profile-driven
+/// retarget if a deployment shows a materially different distribution.
 ///
 /// Cost: ~50 µs of CPU spin-loop per banned frame.  Phase 5q's CPU
-/// savings drop от "full pipeline avoided" к "full pipeline minus
+/// savings drop from "full pipeline avoided" to "full pipeline minus
 /// 50 µs avoided" — still net positive vs paying the full pipeline
 /// (which is the constant-time-via-process-anyway alternative).
 const BAN_DROP_PAD: std::time::Duration = std::time::Duration::from_micros(50);
 
 #[inline]
 fn spin_pad_until(deadline: std::time::Instant) {
-    // Tight busy-wait. `spin_loop` is а pause hint к the CPU (PAUSE on
-    // x86, YIELD on ARM) so we don't burn а full execution slot per
-    // iteration. Sub-100 µs blocking in а sync function inside an async
+    // Tight busy-wait. `spin_loop` is a pause hint to the CPU (PAUSE on
+    // x86, YIELD on ARM) so we don't burn a full execution slot per
+    // iteration. Sub-100 µs blocking in a sync function inside an async
     // task is fine — tokio's runtime tolerates spin durations much
     // shorter than its scheduling quantum.
     while std::time::Instant::now() < deadline {
@@ -1177,13 +1177,13 @@ impl FrameDispatcher {
         {
             return;
         }
-        // H9 ergonomic accept: see `dispatch()` для rationale.
+        // H9 ergonomic accept: see `dispatch()` for rationale.
         let peer_id: NodeId = peer_id.into();
         // per-peer rate limit on capture
         // emission. Drops events past 100/s/peer; the cap protects
         // the broadcast channel under chat-node load (10K pkt/s ×
         // 60 KB frames was 600 MB/s pre-fix). Done BEFORE the
-        // mutex acquire so а throttled peer doesn't pay the lock.
+        // mutex acquire so a throttled peer doesn't pay the lock.
         if !self.capture_rate_limit.allow(*peer_id.as_bytes()) {
             return;
         }
@@ -1235,15 +1235,15 @@ impl FrameDispatcher {
         // the ban-check.
         let dispatch_start = std::time::Instant::now();
         // H9 ergonomic accept: take `impl Into<NodeId>` rather
-        // than `NodeId` directly so callers с raw `[u8; 32]` (session
+        // than `NodeId` directly so callers with raw `[u8; 32]` (session
         // runner, tests) don't need an explicit `.into()` at every
         // call site. The conversion happens once here at the top
-        // of the body; the rest of the fn works с the typed `NodeId`.
+        // of the body; the rest of the fn works with the typed `NodeId`.
         let peer_id: NodeId = peer_id.into();
         // ── Live capture ──────────────────────────────────────────
         // Fast-path: skip the mutex entirely when no capture subscriber is active.
-        // rate-limited per peer (100/s) и body
-        // truncated к 256 B preview so heavy chat-node load can't pump
+        // rate-limited per peer (100/s) and body
+        // truncated to 256 B preview so heavy chat-node load can't pump
         // 10 MB/s through the broadcast channel.
         if self
             .capture_active
@@ -1274,8 +1274,8 @@ impl FrameDispatcher {
             // here would feed back into record_violation and spiral the
             // progressive ban duration to max within a single frame burst.
             //
-            // Pad к `BAN_DROP_PAD` before returning so dispatch-latency
-            // observers cannot distinguish banned от not-banned peers
+            // Pad to `BAN_DROP_PAD` before returning so dispatch-latency
+            // observers cannot distinguish banned from not-banned peers
             // (see const docstring).
             spin_pad_until(dispatch_start + BAN_DROP_PAD);
             return DispatchResult::NoResponse;
@@ -1692,7 +1692,7 @@ mod tests {
         );
     }
 
-    /// Banned-peer drops must spin-pad к `BAN_DROP_PAD` к close the
+    /// Banned-peer drops must spin-pad to `BAN_DROP_PAD` to close the
     /// dispatch-latency timing side-channel.  Without the pad, an
     /// observer measuring response timing can enumerate the ban-list
     /// (banned ≈ µs, not-banned ≈ tens-of-µs).
@@ -1703,8 +1703,8 @@ mod tests {
         d.abuse.ban_list.lock().unwrap().ban(banned, "test", None);
         let hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
 
-        // Take the worst (min) of а small batch к suppress scheduler noise:
-        // если ANY iteration is shorter than the pad, the pad is broken.
+        // Take the worst (min) of a small batch to suppress scheduler noise:
+        // if ANY iteration is shorter than the pad, the pad is broken.
         let mut min_elapsed = std::time::Duration::from_secs(1);
         for _ in 0..8 {
             let start = std::time::Instant::now();
@@ -1718,7 +1718,7 @@ mod tests {
 
         assert!(
             min_elapsed >= BAN_DROP_PAD,
-            "banned drop must spin-pad к at least {BAN_DROP_PAD:?}, observed min {min_elapsed:?}"
+            "banned drop must spin-pad to at least {BAN_DROP_PAD:?}, observed min {min_elapsed:?}"
         );
         // Upper bound: pad should NOT balloon under spin-loop measurement
         // noise.  Allow 10× headroom for scheduler/timer jitter; anything
@@ -2524,14 +2524,14 @@ mod tests {
         let rr_hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16);
         let result = disp_c.dispatch(&rr_hdr, &req.encode(), a_id);
 
-        // Уровень 1: RouteResponse is now DEFERRED behind
+        // Level 1: RouteResponse is now DEFERRED behind
         // the PoW gate. The dispatcher returns NoResponse here and
         // sends only a PowChallenge — the RouteResponse with our
         // listen transports arrives only after the requester returns
         // a valid PowResponse (Step 4 below).
         assert!(
             matches!(result, DispatchResult::NoResponse),
-            "Уровень 1: RouteRequest with PoW must return NoResponse (RouteResponse deferred), got {result:?}",
+            "Level 1: RouteRequest with PoW must return NoResponse (RouteResponse deferred), got {result:?}",
         );
 
         // C must have enqueued a PowChallenge to A via tx_registry.
@@ -2552,7 +2552,7 @@ mod tests {
         // No RouteResponse should be in the outbox yet.
         assert!(
             rx_a.try_recv().is_err(),
-            "Уровень 1: RouteResponse must not be enqueued before PowResponse",
+            "Level 1: RouteResponse must not be enqueued before PowResponse",
         );
 
         // ── Step 2: A dispatches the PowChallenge ─────────────────────────────
@@ -2586,7 +2586,7 @@ mod tests {
             "PowResponse on acceptor must return NoResponse, got {result3:?}",
         );
 
-        // Уровень 1: After verifying the PoW solution C
+        // Level 1: After verifying the PoW solution C
         // must enqueue BOTH the deferred RouteResponse (carrying our
         // listen transports) AND the legacy PowAccept (signalling
         // bootstrap complete). Order: RouteResponse first, then
@@ -2852,7 +2852,7 @@ mod tests {
 
     // ── tests ────────────────────────────────────────────────────
 
-    /// Уровень 1: A `RouteRequest` to a target with `pow_difficulty > 0` must
+    /// Level 1: A `RouteRequest` to a target with `pow_difficulty > 0` must
     /// NOT leak the target's listen transports until the requester returns a
     /// valid `PowResponse`. Probing-by-id is no longer free.
     #[test]
@@ -2903,7 +2903,7 @@ mod tests {
             assert_ne!(
                 h.msg_type,
                 RoutingMsg::RouteResponse as u16,
-                "Уровень 1 leak: victim disclosed RouteResponse before PoW",
+                "Level 1 leak: victim disclosed RouteResponse before PoW",
             );
             if h.msg_type == RoutingMsg::PowChallenge as u16 {
                 saw_challenge = true;
@@ -2914,7 +2914,7 @@ mod tests {
         let _ = std::mem::size_of::<RouteResponsePayload>(); // touch the import
     }
 
-    /// Уровень 1: With PoW disabled (`pow_difficulty = 0`) the legacy fast
+    /// Level 1: With PoW disabled (`pow_difficulty = 0`) the legacy fast
     /// path is preserved — RouteResponse with transports comes back
     /// immediately. Operators who opt out of PoW gating get the original
     /// behaviour.
@@ -2961,7 +2961,7 @@ mod tests {
         assert_eq!(resp.transports, vec!["tcp://10.0.0.1:9000"]);
     }
 
-    /// Уровень 2 ContactsOnly: Probes from peers absent from `peer_pubkeys`
+    /// Level 2 ContactsOnly: Probes from peers absent from `peer_pubkeys`
     /// are silently dropped — neither a PowChallenge nor a RouteResponse
     /// is emitted. Even existence of the target stays hidden.
     #[test]
@@ -3002,7 +3002,7 @@ mod tests {
         );
     }
 
-    /// Уровень 2 IntroductionOnly: `RouteResponse` carries `relay_ids` but
+    /// Level 2 IntroductionOnly: `RouteResponse` carries `relay_ids` but
     /// never `transports`, regardless of PoW state — node steers requesters
     /// through dedicated relay infrastructure.
     #[test]
@@ -5755,13 +5755,13 @@ mod tests {
 
     // ── via-spoof violation ──────────────────────────────
 
-    /// А RouteAnnounce whose `via_node_id` does not match the
+    /// A RouteAnnounce whose `via_node_id` does not match the
     /// transport-layer sender is an attacker spoofing the relay identity
     /// to impersonate another node. Post-461.7 this is a `Violation`
     /// (ban-worthy), not the old rate-limited silent drop — every legit
     /// relay re-signs and sets `via = self`, so divergence is malicious by
     /// construction.  Closes the "unknown origin gossip forward" Sybil path
-    /// without а wire-format change.
+    /// without a wire-format change.
     /// Audit M6: an authenticated-but-malicious relay advertising the victim
     /// with `seq = u32::MAX` must NOT suppress a legitimate route to the victim
     /// arriving via a different relay. Origin-only keying poisoned
@@ -6237,28 +6237,28 @@ mod tests {
         );
     }
 
-    // ── Этап 6 slice 6g: mlkem_dk_seed SensitiveBytesN<64> migration ──
+    // ── Phase 6 slice 6g: mlkem_dk_seed SensitiveBytesN<64> migration ──
 
     /// Verifies the persistent ML-KEM DK seed field correctly uses
-    /// `SensitiveBytesN<64>` storage и exposes а `&[u8; 64]` view к
+    /// `SensitiveBytesN<64>` storage and exposes a `&[u8; 64]` view to
     /// downstream readers (delivery.rs decap path uses `.as_array()`).
-    /// Guards against accidental regression к а plain `[u8; 64]` field
-    /// что would silently lose the mlock-when-possible guarantee.
+    /// Guards against accidental regression to a plain `[u8; 64]` field
+    /// that would silently lose the mlock-when-possible guarantee.
     #[test]
     fn etap6_slice6g_mlkem_dk_seed_is_sensitive_bytes_n() {
         let dispatcher = make_test_dispatcher(NodeRole::Core);
-        // SensitiveBytesN<64> exposes а 64-byte array view — any other
+        // SensitiveBytesN<64> exposes a 64-byte array view — any other
         // storage type would fail this signature at compile time.
         let view: &[u8; veil_e2e::DK_SEED_BYTES] = dispatcher.crypto.mlkem_dk_seed.as_array();
         assert_eq!(view.len(), 64);
-        // Test fixture initialises с zero seed (SensitiveBytesN::new).
+        // Test fixture initialises with zero seed (SensitiveBytesN::new).
         assert!(view.iter().all(|&b| b == 0));
     }
 
-    // ── Этап 6 slice 6h: per_session_mlkem_dk SensitiveBytesN<64> ─────
+    // ── Phase 6 slice 6h: per_session_mlkem_dk SensitiveBytesN<64> ─────
 
     /// `per_session_mlkem_dk` value type is `SensitiveBytesN<64>` —
-    /// inserting а raw `[u8; 64]` via `from_bytes` и reading back via
+    /// inserting a raw `[u8; 64]` via `from_bytes` and reading back via
     /// `.as_array()` round-trips the byte content while the storage
     /// itself is mlocked (or fallback-zeroize'd).
     #[test]
@@ -6284,15 +6284,15 @@ mod tests {
         assert_eq!(
             read_back,
             Some(dk_seed),
-            "per_session DK seed must round-trip через SensitiveBytesN storage"
+            "per_session DK seed must round-trip through SensitiveBytesN storage"
         );
     }
 
-    /// Removing an entry от `per_session_mlkem_dk` drops the
+    /// Removing an entry from `per_session_mlkem_dk` drops the
     /// `SensitiveBytesN<64>` value, triggering the inner
     /// zeroize-on-drop (mlocked variant unmaps via MlockedBytes::drop,
     /// fallback variant via Zeroizing<Vec<u8>>::drop).  This test
-    /// verifies the remove pathway compiles + executes без panic;
+    /// verifies the remove pathway compiles + executes without panic;
     /// the wipe itself is enforced by the type system.
     #[test]
     fn etap6_slice6h_per_session_dk_remove_drops_value() {

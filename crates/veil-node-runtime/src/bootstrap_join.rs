@@ -23,9 +23,9 @@ use veil_bootstrap::{
 use veil_cfg::{BootstrapPeer, NodeId};
 use veil_observability::NodeLogger;
 
-/// Synthetic peer-id range для apps-added bootstrap peers. High bit
+/// Synthetic peer-id range for apps-added bootstrap peers. High bit
 /// plus the `0x800_0000` marker keeps these distinct from configured
-/// peers (small u32) и bootstrap-from-config (`0x8000_0000` range
+/// peers (small u32) and bootstrap-from-config (`0x8000_0000` range
 /// from `service_tasks::spawn_bootstrap_task`). Each new app-added
 /// peer claims the next slot via an atomic counter.
 pub const APP_ADDED_PEER_ID_BASE: u32 = 0x8800_0000;
@@ -35,14 +35,14 @@ pub const APP_ADDED_PEER_ID_BASE: u32 = 0x8800_0000;
 pub struct BootstrapJoinForwarder {
     logger: Arc<NodeLogger>,
     state: Arc<Mutex<NodeState>>,
-    /// Counter для synthetic peer_ids assigned to app-added peers.
+    /// Counter for synthetic peer_ids assigned to app-added peers.
     /// Atomic so concurrent IPC requests don't collide.
     next_peer_id_offset: Arc<std::sync::atomic::AtomicU32>,
     /// Same DHT routing table the bootstrap-task adds contacts to —
     /// app-added peers get the same treatment so iterative lookups
     /// can route through them.
     dht: Arc<veil_dht::KademliaService>,
-    /// Notify shared с the gateway-failover loop — kicked after a
+    /// Notify shared with the gateway-failover loop — kicked after a
     /// successful join so the failover task picks up the new peer
     /// immediately rather than waiting for its periodic poll.
     gateway_failover_notify: Arc<tokio::sync::Notify>,
@@ -66,8 +66,8 @@ impl BootstrapJoinForwarder {
 
     /// Decode the URI through the appropriate bootstrap-invite path.
     /// Mirrors `crate::cmd::bootstrap_cmd::decode_any_uri` but returns
-    /// `BootstrapJoinOutcome` directly so the IPC handler can map к
-    /// wire status codes без a translation layer.
+    /// `BootstrapJoinOutcome` directly so the IPC handler can map to
+    /// wire status codes without a translation layer.
     fn decode_any(
         &self,
         uri: &str,
@@ -171,7 +171,7 @@ impl BootstrapJoinSink for BootstrapJoinForwarder {
         };
         let node_id_bytes = *node_id.as_bytes();
 
-        // Idempotent: if a peer with this node_id is already в state
+        // Idempotent: if a peer with this node_id is already in state
         // return ALREADY_REGISTERED instead of double-registering.
         // Holding the state lock for the entire op avoids a TOCTOU
         // race with a concurrent join request for the same peer.
@@ -210,26 +210,26 @@ impl BootstrapJoinSink for BootstrapJoinForwarder {
             tls_cert: peer.tls_cert.clone(),
             tls_key: None,
             tls_ca_cert: peer.tls_ca_cert.clone(),
-            // Bootstrap-only — после first FIND_NODE the session may
+            // Bootstrap-only — after first FIND_NODE the session may
             // be closed; if the peer is genuinely useful (responds to
             // queries, gets selected by routing layer) it stays via
             // discovered-peer cache. Apps that want a
             // sticky pinned peer should use a different IPC path
-            // (currently не exposed; future follow-up).
+            // (currently not exposed; future follow-up).
             bootstrap_only: true,
             source: PeerSource::Bootstrap,
         };
 
         // Insert into state.peers. Once inserted, `connect_peer_active`
         // can resolve peer_id → entry; without this insert the
-        // outbound-connector task spawned below would fail к find the
+        // outbound-connector task spawned below would fail to find the
         // peer config and exit immediately.
         st.peers.insert(peer_id, entry.clone());
         drop(st);
 
-        // Add к DHT routing table — same as bootstrap-task does for
-        // configured peers. Lets iterative FIND_NODE walks через
-        // this peer работать.
+        // Add to DHT routing table — same as bootstrap-task does for
+        // configured peers. Lets iterative FIND_NODE walks through
+        // this peer work.
         self.dht.add_contact(veil_dht::routing::Contact::new(
             node_id_bytes,
             &peer.transport,
@@ -242,7 +242,7 @@ impl BootstrapJoinSink for BootstrapJoinForwarder {
         // already polls state.peers periodically and spawns connector
         // tasks for entries it hasn't seen, so the new peer gets dialed
         // within ~5 s rather than ~60 s without the kick. Tradeoff:
-        // saves a complex sink → runtime upcall; cost is up к 5 s
+        // saves a complex sink → runtime upcall; cost is up to 5 s
         // latency before first dial attempt.
         self.gateway_failover_notify.notify_waiters();
 

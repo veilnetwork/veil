@@ -1,11 +1,11 @@
 //! S2.B: server-side app-layer cert verifier.
 //!
 //! When operator configures `app_cert_trusted_owner_pubkey` +
-//! `app_cert_owner_algo` + `app_cert_network_id` в server.toml,
+//! `app_cert_owner_algo` + `app_cert_network_id` in server.toml,
 //! oproxy-server builds an [`AppCertGate`] at startup which holds the
 //! parsed authority parameters.  Per-stream: server reads the wire
-//! preamble (см. `wire::read_stream_prefix`), passes the cert blob к
-//! [`AppCertGate::verify`], и admits / rejects.
+//! preamble (see. `wire::read_stream_prefix`), passes the cert blob to
+//! [`AppCertGate::verify`], and admits / rejects.
 
 use anyhow::{Result, anyhow};
 use veil_identity::network_cert::{decode_cert_blob, verify_membership_cert};
@@ -19,8 +19,8 @@ pub struct AppCertGate {
 }
 
 impl AppCertGate {
-    /// Build от config fields.  Fails если any field is missing,
-    /// network_id is malformed, или owner pubkey can't be base64-decoded.
+    /// Build from config fields.  Fails if any field is missing,
+    /// network_id is malformed, or owner pubkey can't be base64-decoded.
     pub fn from_config(
         owner_pubkey_b64: &str,
         owner_algo: SignatureAlgorithm,

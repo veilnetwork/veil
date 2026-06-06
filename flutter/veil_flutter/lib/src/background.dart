@@ -1,16 +1,16 @@
-// Foreground-service control от Dart side (Epic 489.6).
+// Foreground-service control from Dart side (Epic 489.6).
 //
 // Problem: Android aggressively kills backgrounded processes after
-// ~5-15 minutes.  Without а foreground service, the veil daemon
-// embedded в the Flutter process stops receiving messages whenever
+// ~5-15 minutes.  Without a foreground service, the veil daemon
+// embedded in the Flutter process stops receiving messages whenever
 // the user backgrounds the app.
 //
-// Solution: а Kotlin foreground service ([`VeilDaemonService`])
-// that displays а persistent notification.  Android treats services
-// с visible notifications as "doing user-visible work" и leaves
+// Solution: a Kotlin foreground service ([`VeilDaemonService`])
+// that displays a persistent notification.  Android treats services
+// with visible notifications as "doing user-visible work" and leaves
 // them alone.
 //
-// Lifecycle integration pattern для consumer apps:
+// Lifecycle integration pattern for consumer apps:
 //
 // ```dart
 // class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
@@ -30,7 +30,7 @@
 //
 //   @override
 //   void didChangeAppLifecycleState(AppLifecycleState state) {
-//     // When app goes к background, the foreground service keeps the
+//     // When app goes to background, the foreground service keeps the
 //     // process alive.  When user explicitly stops the daemon (logout),
 //     // call VeilBackground.stop() so Android can reclaim the process.
 //   }
@@ -40,8 +40,8 @@
 // Platform support: Android only.  iOS doesn't have an equivalent
 // "stay alive forever" mechanism — it uses BGProcessingTask + push
 // notifications instead (Epic 489.10).  Calling `start` on iOS / linux
-// / macos / windows is а silent no-op so cross-platform code doesn't
-// need а platform check.
+// / macos / windows is a silent no-op so cross-platform code doesn't
+// need a platform check.
 
 import 'dart:io' show Platform;
 
@@ -57,14 +57,14 @@ const MethodChannel _channel = MethodChannel('veil_flutter/lifecycle');
 /// can `VeilBackground.start(...)` rather than worrying about
 /// import collisions.
 class VeilBackground {
-  VeilBackground._();  // не instantiable
+  VeilBackground._();  // not instantiable
 
   /// Start the foreground service.  Returns immediately; the service
   /// itself takes over keeping the process alive.
   ///
-  /// [title] и [text] populate the persistent notification visible
-  /// в the status bar.  When omitted, the plugin uses defaults
-  /// suitable for а connection-maintaining service ("Veil running").
+  /// [title] and [text] populate the persistent notification visible
+  /// in the status bar.  When omitted, the plugin uses defaults
+  /// suitable for a connection-maintaining service ("Veil running").
   ///
   /// Idempotent — calling start when the service is already running
   /// just refreshes the notification text.

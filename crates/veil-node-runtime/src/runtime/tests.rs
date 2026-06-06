@@ -239,14 +239,14 @@ async fn metrics_counters_move_on_session_lifecycle() {
 
 // Audit batch 2026-05-24: probabilistically flaky after Phase E20
 // directional dedup landed (commit 4caea9b, 2026-05-22).  The test
-// uses а randomly-generated sovereign identity для the runtime AND
+// uses a randomly-generated sovereign identity for the runtime AND
 // `test_support::valid_identity()` (cached, also random per process)
 // for the test peer.  When `hex(runtime) > hex(peer_pubkey-derived
-// node_id)`, runtime keeps INBOUND для that peer и its own outbound
+// node_id)`, runtime keeps INBOUND for that peer and its own outbound
 // dial is policy-rejected as "duplicate" — test fails at the
 // "outbound session appears" timeout.  ~50% pass rate.  Fix requires
-// either pinning the sovereign identity к а node_id that always
-// orders below the test peer's, OR rewriting the test к bind а
+// either pinning the sovereign identity to a node_id that always
+// orders below the test peer's, OR rewriting the test to bind a
 // listener on the runtime + dialing from the peer side instead.
 // Marked `#[ignore]` until that rework lands.
 #[ignore = "Phase E20 directional dedup makes this probabilistic; see comment"]
@@ -369,8 +369,8 @@ async fn outbound_reconnect_happens_after_disconnect() {
 // Audit batch 2026-05-25 phase M: same Phase E20 dedup interaction as
 // the other runtime::tests::outbound_* tests — random sovereign identity
 // vs cached test-peer identity makes session establishment probabilistic.
-// Test hangs indefinitely waiting for а session that policy may never
-// allow.  Aligned с the other ignored siblings (CI green-up phase G).
+// Test hangs indefinitely waiting for a session that policy may never
+// allow.  Aligned with the other ignored siblings (CI green-up phase G).
 #[ignore = "Phase E20 directional dedup makes this probabilistic; see runtime_creates_outbound_session_for_configured_peer comment"]
 #[tokio::test(flavor = "current_thread")]
 async fn outbound_session_rejects_mismatched_peer_identity() {
@@ -938,8 +938,8 @@ where
         &[],
         false,
         None,
-        None, // P-Net: no network gate в this fixture
-        None, // S3: no peer_observed_addr в this fixture
+        None, // P-Net: no network gate in this fixture
+        None, // S3: no peer_observed_addr in this fixture
     )
     .await
     .expect("OVL1 handshake succeeds")
@@ -1692,7 +1692,7 @@ pub fn session_guard_drop_publishes_sessions_changed() {
     let sessions_per_ip = Arc::new(super::ip_slot::IpSlotTable::new());
 
     // Drop a freshly-built guard immediately so we test the publish
-    // path в isolation (no insert path running here).
+    // path in isolation (no insert path running here).
     let link_id = LinkId::new(42);
     let guard = SessionGuard::new(
         Arc::clone(&live_sessions),
@@ -1712,13 +1712,13 @@ pub fn session_guard_drop_publishes_sessions_changed() {
     let event = rx.try_recv().expect("event published on guard drop");
     assert_eq!(event.kind, event_kind::SESSIONS_CHANGED);
     // BTreeMap was empty, remove of absent key still publishes
-    // count=0 (current live count) — что the contract.
+    // count=0 (current live count) — that the contract.
     assert_eq!(event.payload, 0u16.to_be_bytes().to_vec());
 }
 
 // ── sim hot-standby template-URI fix ───────────────────────
 // TASKS.md row "Hot-standby auto-swap to template tcp://127.0.0.1:0".
-// Verify the helpers that drive port-0 substitution в the per-handshake
+// Verify the helpers that drive port-0 substitution in the per-handshake
 // `local_advertised_transports` snapshot.
 
 #[test]

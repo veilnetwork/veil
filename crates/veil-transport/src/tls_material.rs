@@ -25,10 +25,10 @@ pub fn load_certificates_from_file(path: &Path) -> Result<Vec<CertificateDer<'st
         ))
     })?;
     if bytes.starts_with(b"-----BEGIN") {
-        // followup: migrated от unmaintained `rustls-pemfile`
-        // (RUSTSEC-2025-0134) к the native `PemObject` trait в
+        // followup: migrated from unmaintained `rustls-pemfile`
+        // (RUSTSEC-2025-0134) to the native `PemObject` trait in
         // `rustls-pki-types ≥ 1.14`. Iterates only CERTIFICATE-kind
-        // sections; other section kinds (private keys, etc.) ара
+        // sections; other section kinds (private keys, etc.) are
         // silently skipped by `pem_slice_iter`'s filter, which matches
         // the prior `rustls_pemfile::certs` behaviour.
         let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&bytes)
@@ -56,7 +56,7 @@ pub fn load_private_key_from_file(path: &Path) -> Result<PrivateKeyDer<'static>>
     if bytes.starts_with(b"-----BEGIN") {
         // followup: `PrivateKeyDer::from_pem_slice`
         // handles all three private-key kinds (PKCS#1 RSA, SEC1 EC
-        // PKCS#8) в а single pass thanks к the type's `PemObject` impl
+        // PKCS#8) in a single pass thanks to the type's `PemObject` impl
         // (see rustls-pki-types/src/lib.rs:171). Replaces the
         // unmaintained `rustls-pemfile` 3-pass scan (pkcs8 → ec → rsa)
         // closing RUSTSEC-2025-0134.

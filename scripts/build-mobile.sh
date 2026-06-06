@@ -3,7 +3,7 @@
 #
 # Builds the C-ABI shared library for the Android + iOS + desktop
 # targets that the Flutter plugin's pubspec.yaml supports.  Output goes
-# under target/<triple>/release/ as both .so/.dylib (cdylib) и .a
+# under target/<triple>/release/ as both .so/.dylib (cdylib) and .a
 # (staticlib).  Flutter Android plugin loads .so at runtime; iOS links
 # the .a into the universal binary.
 #
@@ -22,7 +22,7 @@
 # configured targets in MOBILE_TARGETS are built sequentially.  Pass
 # `--release-features` to override the cargo --features flag (default:
 # veil-bootstrap/allow-empty-seeds for testnet builds — production
-# must drop this и provide BUILTIN_SEEDS).
+# must drop this and provide BUILTIN_SEEDS).
 
 set -euo pipefail
 
@@ -89,15 +89,15 @@ build_one() {
       cd "$REPO_ROOT" && cargo build "${cargo_args[@]}"
     fi
   elif [[ "$triple" == *apple-ios* ]]; then
-    # iOS distribution ships а staticlib через xcframework; Apple disallows
+    # iOS distribution ships a staticlib through xcframework; Apple disallows
     # third-party dylibs in iOS apps.  Cargo's default cdylib emit fails on
     # native macOS hosts because zstd-sys emits `__chkstk_darwin` calls that
     # are not in iOS clang_rt under the default 10.0 deployment target.
     # `cargo rustc --crate-type staticlib` skips the cdylib link entirely.
     #
-    # Bindgen workaround для iOS simulator triples: Rust shortens к `-sim`,
+    # Bindgen workaround for iOS simulator triples: Rust shortens to `-sim`,
     # but clang expects the full `-simulator` suffix in the target triple.
-    # Without this, librocksdb-sys' bindgen step dies с
+    # Without this, librocksdb-sys' bindgen step dies with
     # `version 'sim' in target triple 'arm64-apple-ios-sim' is invalid`.
     case "$triple" in
       aarch64-apple-ios-sim)

@@ -31,8 +31,8 @@ pub(crate) fn read_u8(buf: &[u8], pos: &mut usize, field: &'static str) -> Resul
 /// Read big-endian `u16` at `*pos`, advance cursor by 2.
 /// `checked_add` defends 32-bit-debug-build panic on
 /// pos+N wraparound. Release builds were already safe (the wrapped
-/// `buf.get(start..wrapped)` returns None), но debug builds panic при
-/// integer add overflow — affecting fuzzing и CI.
+/// `buf.get(start..wrapped)` returns None), but debug builds panic on
+/// integer add overflow — affecting fuzzing and CI.
 #[inline(always)]
 pub(crate) fn read_u16(
     buf: &[u8],
@@ -90,9 +90,9 @@ pub(crate) fn read_u64(
 
 /// Read fixed-size byte array at `*pos`, advance cursor by `N`. Free-function
 /// counterpart [`BoundedDecoder::read_array`] for callers that already track
-/// their own `pos` cursor (D6: 7 hand-rolled `read_array` copies в
+/// their own `pos` cursor (D6: 7 hand-rolled `read_array` copies in
 /// pairing_invite/name_claim_v2/instance_registry/identity_document/prekey_bundle/
-/// recipient/identity_proof migrate к this canonical version).
+/// recipient/identity_proof migrate to this canonical version).
 #[inline(always)]
 pub(crate) fn read_array<const N: usize>(
     buf: &[u8],
@@ -139,25 +139,25 @@ pub(crate) fn read_bytes(
 //
 // 1. **Encapsulation** — buf + pos held in one struct, no chance of forgetting
 // to advance `pos` or accidentally feeding the wrong cursor to the next
-// call. Refactoring а decoder doesn't desync state.
+// call. Refactoring a decoder doesn't desync state.
 //
 // 2. **Length-prefixed-with-cap** — the most common protocol pattern is "read
-// а u16/u32 length, validate ≤ MAX, read that many bytes." Pre-R3 every
+// a u16/u32 length, validate ≤ MAX, read that many bytes." Pre-R3 every
 // decoder hand-rolled this 4-line idiom (~50 sites across `veil-proto`).
-// `read_u16_prefixed_bytes(max, field)` does it in one call с consistent
+// `read_u16_prefixed_bytes(max, field)` does it in one call with consistent
 // error shape (`ValueTooLarge` instead of ad-hoc strings).
 //
-// 3. **Trailing-bytes guard** — `assert_eof` rejects garbage bytes after а
+// 3. **Trailing-bytes guard** — `assert_eof` rejects garbage bytes after a
 // well-formed payload. Pre-R3, ~30% of decoders silently ignored trailers
-// (а DoS amplifier / API ambiguity vector); the rest hand-checked.
+// (a DoS amplifier / API ambiguity vector); the rest hand-checked.
 //
 // Migration strategy: NEW decoders use `BoundedDecoder`; old decoders migrate
-// when touched. Both styles compose c the same `ProtoError` taxonomy и share
+// when touched. Both styles compose c the same `ProtoError` taxonomy and share
 // the underlying cursor helpers, so mixing-and-matching is fine.
 
-/// Stateful decoder holding а byte buffer + read cursor.
+/// Stateful decoder holding a byte buffer + read cursor.
 ///
-/// Construction is а pure borrow — no allocation, no validation. Each
+/// Construction is a pure borrow — no allocation, no validation. Each
 /// `read_*` method advances the cursor on success; on failure the cursor
 /// position is unspecified (caller treats the decode as failed).
 ///
@@ -168,13 +168,13 @@ pub struct BoundedDecoder<'a> {
 }
 
 impl<'a> BoundedDecoder<'a> {
-    /// Wrap а buffer for sequential decoding starting at offset 0.
+    /// Wrap a buffer for sequential decoding starting at offset 0.
     #[inline(always)]
     pub fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
-    /// Read а single u8 at the cursor, advance by 1.
+    /// Read a single u8 at the cursor, advance by 1.
     #[inline(always)]
     pub fn read_u8(&mut self, field: &'static str) -> Result<u8, ProtoError> {
         read_u8(self.buf, &mut self.pos, field)
@@ -192,18 +192,18 @@ impl<'a> BoundedDecoder<'a> {
         read_u64(self.buf, &mut self.pos, field)
     }
 
-    /// Read а fixed-size byte array at the cursor, advance by `N`.
+    /// Read a fixed-size byte array at the cursor, advance by `N`.
     ///
-    /// Const-generic length avoids а runtime allocation; use this for
+    /// Const-generic length avoids a runtime allocation; use this for
     /// known-fixed sizes (32-byte node_id, 16-byte instance_id, etc.).
     ///
-    /// Audit batch 2026-05-25 phase M: use `checked_add` для the end
-    /// offset к match the free-function helpers (`read_u8`, `read_u16`,
-    /// `read_u32`, `read_u64`, `read_bytes`).  Without it, а 32-bit
-    /// debug build could panic on `self.pos + N` overflow if а decoder
-    /// somehow accumulated а pos near `usize::MAX`; in release the wrap
-    /// would silently slice into garbage, leading к а decode-error or
-    /// — worse — а valid-looking-but-corrupt parse.  Slice `get()`
+    /// Audit batch 2026-05-25 phase M: use `checked_add` for the end
+    /// offset to match the free-function helpers (`read_u8`, `read_u16`,
+    /// `read_u32`, `read_u64`, `read_bytes`).  Without it, a 32-bit
+    /// debug build could panic on `self.pos + N` overflow if a decoder
+    /// somehow accumulated a pos near `usize::MAX`; in release the wrap
+    /// would silently slice into garbage, leading to a decode-error or
+    /// — worse — a valid-looking-but-corrupt parse.  Slice `get()`
     /// returns `None` on out-of-bounds so error path stays the same.
     #[inline(always)]
     pub fn read_array<const N: usize>(
@@ -224,24 +224,24 @@ impl<'a> BoundedDecoder<'a> {
         Ok(out)
     }
 
-    /// Read `len` bytes at the cursor into а new `Vec`, advance by `len`.
+    /// Read `len` bytes at the cursor into a new `Vec`, advance by `len`.
     #[inline(always)]
     pub fn read_bytes(&mut self, len: usize, field: &'static str) -> Result<Vec<u8>, ProtoError> {
         read_bytes(self.buf, &mut self.pos, len, field)
     }
 
-    /// Reject а decode if any bytes remain unread.
+    /// Reject a decode if any bytes remain unread.
     ///
     /// ** seven other previously-public
     /// helper methods (`pos`, `remaining`, `read_u32`
     /// `read_u16_prefixed_bytes`, `read_u32_prefixed_bytes`
     /// `read_u8_prefixed_string`, `skip_remaining`) were removed because
     /// they had no callers — `BoundedDecoder` introduction (
-    /// R3) only migrated `mlkem_cert.rs`, и the rest of the proto
+    /// R3) only migrated `mlkem_cert.rs`, and the rest of the proto
     /// decoders kept using the cursor-based free functions directly.
-    /// If а future migration epic completes the surface (all proto
-    /// decoders на `BoundedDecoder`), restore the helpers from git
-    /// history (commit предшествующий cleanup).
+    /// If a future migration epic completes the surface (all proto
+    /// decoders on `BoundedDecoder`), restore the helpers from git
+    /// history (commit preceding cleanup).
     pub fn assert_eof(&self) -> Result<(), ProtoError> {
         if self.pos < self.buf.len() {
             return Err(ProtoError::TrailingBytes {

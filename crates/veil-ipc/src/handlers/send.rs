@@ -4,9 +4,9 @@
 //! the per-client rate limiter, then either delivers locally (when
 //! `dst_node_id` matches the daemon's own node-id), sends directly over an
 //! authenticated session, or relays through the route cache (with reactive
-//! route discovery когда the cache is empty).
+//! route discovery when the cache is empty).
 //!
-//! E2E encryption: when а ML-KEM encapsulation key is cached for the
+//! E2E encryption: when a ML-KEM encapsulation key is cached for the
 //! recipient, the payload is sealed before relay.  `meta_encrypt` is used
 //! for `anonymous=true` sends so outer envelope fields are zeroed and
 //! relays cannot learn sender identity.
@@ -14,9 +14,9 @@
 //! Large payloads (>`MAX_ENVELOPE_PAYLOAD`) are fragmented into
 //! `ChunkManifest` + `Chunk` frames before relay.
 //!
-//! Pre-encryption capture: when the operator enables live-capture, а
+//! Pre-encryption capture: when the operator enables live-capture, a
 //! plaintext `CaptureEvent` is emitted before E2E sealing so operators
-//! see what the app intended к send в addition к the encrypted envelope.
+//! see what the app intended to send in addition to the encrypted envelope.
 
 use std::sync::{Mutex, RwLock};
 
@@ -228,9 +228,9 @@ pub(crate) struct IpcSendContext<'a> {
     pub(crate) route_updated: Option<&'a tokio::sync::Notify>,
     pub(crate) peer_mlkem_keys: Option<&'a std::sync::RwLock<veil_e2e::PeerMlKemCache>>,
     /// Epic 486.1 slice 3: cold-start ML-KEM EK resolver.  When the cache
-    /// lookup misses в the relay-encrypted path, the handler invokes this
-    /// resolver к fetch + verify + cache the recipient's EK от the DHT.
-    /// `None` preserves legacy behaviour exactly (тест fixtures + setups
+    /// lookup misses in the relay-encrypted path, the handler invokes this
+    /// resolver to fetch + verify + cache the recipient's EK from the DHT.
+    /// `None` preserves legacy behaviour exactly (test fixtures + setups
     /// without full NodeRuntime).
     pub(crate) mlkem_ek_resolver: Option<&'a (dyn veil_types::MlKemEkResolver + 'a)>,
     pub(crate) capture_tx: Option<
@@ -371,9 +371,9 @@ pub(crate) async fn handle_ipc_send(
                     // Epic 486.1 slice 3 (audit batch 2026-05-23): cold-start
                     // cache miss → attempt DHT-based EK resolution.  The
                     // resolver walks `IdentityDocument` → `InstanceRegistry`
-                    // → `MlKemKeyCert` под the canonical DHT keys и writes
+                    // → `MlKemKeyCert` under the canonical DHT keys and writes
                     // back to `peer_mlkem_keys` on success, so subsequent
-                    // sends к the same peer hit the fast path.  `None` after
+                    // sends to the same peer hit the fast path.  `None` after
                     // this still surfaces as `NO_E2E_KEY` (legacy behaviour
                     // preserved).
                     if recipient_ek.is_none()
@@ -459,7 +459,7 @@ pub(crate) async fn handle_ipc_send(
                 } else {
                     // No E2E infrastructure — send plaintext. send.data is
                     // PooledShared; copy to Vec for the relay-send
-                    // path which needs owned bytes для hashing + signing.
+                    // path which needs owned bytes for hashing + signing.
                     (*send.data).to_vec()
                 };
 
@@ -709,11 +709,11 @@ pub(crate) async fn handle_ipc_send(
     }
 
     // APP_SEND_OK — fire-and-forget clients (e.g. ogate) skip the ack.
-    // Phase E24 (2026-05-22): writing AppSendOk per APP_SEND added а full
+    // Phase E24 (2026-05-22): writing AppSendOk per APP_SEND added a full
     // IPC frame syscall round-trip per IP packet on the hot path —
     // single-stream throughput cap measured ~150 Mbps (12K pps) before
     // and after this fix.  Honoring `require_ack=false` halves the IPC
-    // syscall count per send и frees enough budget to push pps higher.
+    // syscall count per send and frees enough budget to push pps higher.
     if send.require_ack {
         let ok_hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppSendOk as u16);
         wh.write_all(&codec::encode_header(&ok_hdr)).await
@@ -832,7 +832,7 @@ fn emit_e2e_plaintext_capture(
             .as_micros() as u64;
         // e2e plaintext capture also gets the
         // 256 B truncation. The IPC site doesn't go through the
-        // dispatcher rate limiter (this is а pre-encryption preview
+        // dispatcher rate limiter (this is a pre-encryption preview
         // emitted once per delivery — not per-frame), so per-peer
         // rate limit is unnecessary here.
         let ev = veil_dispatcher_state::CaptureEvent::new_truncated(

@@ -1,10 +1,10 @@
 //! Private-veil-network access gate.
 //!
 //! `NetworkAccessGate` encapsulates the local network's membership
-//! policy: which `network_id` we belong к, the owner pubkey that issued
-//! certs, the local cert blob к present at handshake. The gate's
-//! [`Self::verify_peer`] method takes а peer's HELLO-side cert blob и
-//! either returns the decoded cert (admission) or а typed error
+//! policy: which `network_id` we belong to, the owner pubkey that issued
+//! certs, the local cert blob to present at handshake. The gate's
+//! [`Self::verify_peer`] method takes a peer's HELLO-side cert blob and
+//! either returns the decoded cert (admission) or a typed error
 //! (rejection).
 //!
 //! Constructed once at `NodeRuntime` startup from `[network]` config;
@@ -19,12 +19,12 @@ use crate::network_cert::{
 };
 use veil_types::{MembershipCert, SignatureAlgorithm};
 
-/// Cached, validated network handshake context. Cheap к clone (Vec
+/// Cached, validated network handshake context. Cheap to clone (Vec
 /// internals + HashSet); shared across handshake invocations via
-/// `Arc` от the runtime.
+/// `Arc` from the runtime.
 #[derive(Debug, Clone)]
 pub struct NetworkAccessGate {
-    /// Bincode-encoded `MembershipCert` blob к present в our outbound
+    /// Bincode-encoded `MembershipCert` blob to present in our outbound
     /// HELLO. Pre-encoded at startup so the hot handshake path doesn't
     /// pay serialisation cost per connection.
     pub local_cert_blob: Vec<u8>,
@@ -36,19 +36,19 @@ pub struct NetworkAccessGate {
     /// config so handshake path doesn't pay base64 decode cost).
     pub owner_pubkey_bytes: Vec<u8>,
     /// Admin allowlist (defense-in-depth). Only certs whose
-    /// `member_node_id` falls в this set are treated as admin. Empty
-    /// set = "any cert с `admin: true` flag is honoured" (config-
+    /// `member_node_id` falls in this set are treated as admin. Empty
+    /// set = "any cert with `admin: true` flag is honoured" (config-
     /// driven trust). Used during DHT ban-record verification (P-Net
     /// Phase 3), not at handshake time.
     pub admin_node_ids: HashSet<[u8; 32]>,
 }
 
-/// Result variants для peer-cert verification at handshake time.
+/// Result variants for peer-cert verification at handshake time.
 #[derive(Debug, thiserror::Error)]
 pub enum GateError {
-    /// Peer's HELLO did не include а `membership_cert_blob` TLV. Local
+    /// Peer's HELLO did not include a `membership_cert_blob` TLV. Local
     /// network is private → rejection.
-    #[error("peer did not present а membership cert (network is private)")]
+    #[error("peer did not present a membership cert (network is private)")]
     MissingCert,
     /// Cert verification failed (sig / expiry / wrong network / wrong
     /// algo / version).
@@ -57,10 +57,10 @@ pub enum GateError {
     /// Cert blob wire-format decode failed.
     #[error("cert blob decode failed: {0}")]
     Decode(#[from] CertDecodeError),
-    /// Cert's `member_node_id` does не match the peer's authenticated
-    /// `node_id`. Anti-replay: stops Alice от presenting Bob's cert.
+    /// Cert's `member_node_id` does not match the peer's authenticated
+    /// `node_id`. Anti-replay: stops Alice from presenting Bob's cert.
     #[error(
-        "cert is не для this peer: cert.member_node_id={cert_node_id_hex} peer_node_id={peer_node_id_hex}"
+        "cert is not for this peer: cert.member_node_id={cert_node_id_hex} peer_node_id={peer_node_id_hex}"
     )]
     NotForThisPeer {
         cert_node_id_hex: String,
@@ -73,13 +73,13 @@ pub enum GateError {
 pub enum GateLoadError {
     #[error("[network] requires `{0}` when mode = \"private\"")]
     MissingField(&'static str),
-    #[error("network.network_id is не valid 64-char lowercase hex: {0}")]
+    #[error("network.network_id is not valid 64-char lowercase hex: {0}")]
     InvalidNetworkId(String),
-    #[error("network.owner_pubkey is не valid base64: {0}")]
+    #[error("network.owner_pubkey is not valid base64: {0}")]
     InvalidOwnerPubkey(String),
-    #[error("network.admin_node_ids[{index}] is не valid 64-char hex: {err}")]
+    #[error("network.admin_node_ids[{index}] is not valid 64-char hex: {err}")]
     InvalidAdminNodeId { index: usize, err: String },
-    #[error("failed к read membership cert at `{path}`: {io}")]
+    #[error("failed to read membership cert at `{path}`: {io}")]
     CertReadFailed { path: String, io: String },
     #[error("membership cert at `{path}` is malformed: {err}")]
     CertDecodeFailed { path: String, err: String },
@@ -93,18 +93,18 @@ fn decode_hex_32(hex: &str) -> Result<[u8; 32], &'static str> {
 }
 
 impl NetworkAccessGate {
-    /// Build а gate из а fully-validated `[network]` config block. Returns
+    /// Build a gate from a fully-validated `[network]` config block. Returns
     /// `Ok(None)` for `mode = "public"` (or missing config) — caller
-    /// treats this as "не private network, skip handshake gate".
+    /// treats this as "not private network, skip handshake gate".
     /// Returns `Ok(Some(gate))` for `mode = "private"` with everything
-    /// loaded и parsed; returns `Err` if cert file read fails, cert blob
-    /// is malformed, owner pubkey is не valid base64, or `network_id` /
-    /// `admin_node_ids` are не valid 32-byte hex.
+    /// loaded and parsed; returns `Err` if cert file read fails, cert blob
+    /// is malformed, owner pubkey is not valid base64, or `network_id` /
+    /// `admin_node_ids` are not valid 32-byte hex.
     ///
     /// Validation upstream (cfg::validate::structural) already enforces
     /// that the required fields are present when `mode = private`, so
     /// `unwrap`s on `Option::as_ref` are safe here — we re-check defensively
-    /// в case the gate is constructed без going through validation.
+    /// in case the gate is constructed without going through validation.
     pub fn from_config(cfg: &veil_types::NetworkConfig) -> Result<Option<Self>, GateLoadError> {
         if !matches!(cfg.mode, veil_types::NetworkMode::Private) {
             return Ok(None);
@@ -137,7 +137,7 @@ impl NetworkAccessGate {
                 path: cert_path.to_owned(),
                 io: e.to_string(),
             })?;
-        // Sanity-decode (without verifying signature) к catch corruption
+        // Sanity-decode (without verifying signature) to catch corruption
         // at startup. The handshake path will verify on every use.
         crate::network_cert::decode_cert_blob(&local_cert_blob).map_err(|e| {
             GateLoadError::CertDecodeFailed {
@@ -164,7 +164,7 @@ impl NetworkAccessGate {
         }))
     }
 
-    /// Verify а peer's cert blob и confirm it authorises the given
+    /// Verify a peer's cert blob and confirm it authorises the given
     /// `peer_node_id`. Returns the decoded cert on success (caller can
     /// inspect `admin` flag, cache, etc.).
     ///
@@ -181,7 +181,7 @@ impl NetworkAccessGate {
     ) -> Result<MembershipCert, GateError> {
         let blob = blob.ok_or(GateError::MissingCert)?;
         let cert: MembershipCert = decode_cert_blob(blob)?;
-        // Cheap identity check first so а wrong-peer cert doesn't burn
+        // Cheap identity check first so a wrong-peer cert doesn't burn
         // signature CPU.
         if &cert.member_node_id != peer_node_id {
             return Err(GateError::NotForThisPeer {
@@ -199,9 +199,9 @@ impl NetworkAccessGate {
         Ok(cert)
     }
 
-    /// Test-only helper к check whether а decoded cert's
-    /// `member_node_id` is в the configured admin allowlist. Used by
-    /// P-Net Phase 3 ban-record verification и by admin-CLI guards.
+    /// Test-only helper to check whether a decoded cert's
+    /// `member_node_id` is in the configured admin allowlist. Used by
+    /// P-Net Phase 3 ban-record verification and by admin-CLI guards.
     pub fn is_admin(&self, cert: &MembershipCert) -> bool {
         if !cert.admin {
             return false;
@@ -214,15 +214,15 @@ impl NetworkAccessGate {
         self.admin_node_ids.contains(&cert.member_node_id)
     }
 
-    /// Verify а P-Net ban blob at DHT-ingest time.
+    /// Verify a P-Net ban blob at DHT-ingest time.
     ///
     /// Order of checks (cheap first):
     /// 1. Blob carries the `PBAN` magic prefix (caller already checked).
-    /// 2. Blob decodes к а `BanEntry`.
+    /// 2. Blob decodes to a `BanEntry`.
     /// 3. Cert + admin signature chain verifies against this network.
-    /// 4. Admin cert's `member_node_id` is в the optional allowlist.
+    /// 4. Admin cert's `member_node_id` is in the optional allowlist.
     /// 5. DHT key matches `ban_dht_key(network_id, banned_node_id)` —
-    ///    prevents misfiled records от landing under а ban-key bucket.
+    ///    prevents misfiled records from landing under a ban-key bucket.
     fn verify_ban_blob_inner(&self, key: &[u8; 32], value: &[u8]) -> bool {
         let entry = match decode_ban_blob(value) {
             Ok(e) => e,
@@ -380,7 +380,7 @@ mod tests {
         let member = [0xCCu8; 32];
         let cert = make_signed_cert(&sk, net, member, 5000, false);
         let mut gate = make_gate(net, pk);
-        gate.admin_node_ids.insert(member); // even в allowlist
+        gate.admin_node_ids.insert(member); // even in allowlist
         assert!(!gate.is_admin(&cert));
     }
 
@@ -395,8 +395,8 @@ mod tests {
         let admin_pk = admin_sk.verifying_key().to_bytes();
         let admin_node_id = *blake3::hash(&admin_pk).as_bytes();
         // Cert expiry must exceed wall-clock time (the gate's
-        // `verify_ban_record` uses `SystemTime::now()`). Pick а year
-        // far enough в the future to outlive any practical CI runner.
+        // `verify_ban_record` uses `SystemTime::now()`). Pick a year
+        // far enough in the future to outlive any practical CI runner.
         let valid_until = u64::MAX / 2;
         let admin_cert = make_signed_cert(owner_sk, network_id, admin_node_id, valid_until, true);
         let admin_cert_blob = encode_cert_blob(&admin_cert);
@@ -441,7 +441,7 @@ mod tests {
         let banned = [0xBBu8; 32];
         let blob = build_ban_blob_for(&owner_sk, &admin_sk, net, banned);
         let gate = make_gate(net, owner_pk);
-        // Wrong key — even с а valid blob, must reject.
+        // Wrong key — even with a valid blob, must reject.
         let bad_key = [0xFFu8; 32];
         assert!(!gate.verify_ban_record(&bad_key, &blob));
     }
@@ -467,7 +467,7 @@ mod tests {
         let banned = [0xBBu8; 32];
         let blob = build_ban_blob_for(&owner_sk, &admin_sk, net, banned);
         let mut gate = make_gate(net, owner_pk);
-        // Restrict allowlist к а different admin.
+        // Restrict allowlist to a different admin.
         gate.admin_node_ids.insert([0xEEu8; 32]);
         let key = crate::network_ban::ban_dht_key(&net, &banned);
         assert!(!gate.verify_ban_record(&key, &blob));

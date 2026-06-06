@@ -4,7 +4,7 @@
 # `stealth_listen_id` (default 0x00000005) from the top-level
 # `listen = [...]` array, then restarts veil.
 #
-# Idempotent: skips если no entry с matching id is found.
+# Idempotent: skips if no entry with matching id is found.
 #
 # Run:
 #   ansible-playbook -i inventory.yml revert-stealth-canary.yml \
@@ -41,13 +41,13 @@
               src = f.read()
           # Strip ", { id = "{target_id}" ... }" — match the leading
           # comma + space + the full inline-table balanced through any
-          # nested braces.  Use а DOTALL pattern + balance-counter.
+          # nested braces.  Use a DOTALL pattern + balance-counter.
           marker = re.search(
               r',\s*\{\s*id\s*=\s*"' + re.escape(target_id) + r'"',
               src,
           )
           if not marker:
-              sys.stderr.write(f"ERROR: no inline entry с id={target_id} found\n")
+              sys.stderr.write(f"ERROR: no inline entry with id={target_id} found\n")
               sys.exit(1)
           start = marker.start()
           # Find the matching closing `}` for the inline table starting
@@ -90,7 +90,7 @@
         name: veil.service
         state: restarted
 
-    - name: Wait для metrics endpoint
+    - name: Wait for metrics endpoint
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 60); do
@@ -117,5 +117,5 @@
       ansible.builtin.debug:
         msg: |
           ✅ Stealth listener reverted on {{ inventory_hostname }}.
-          rendezvous.controller.wired в the last 30 sec: {{ post_revert_wired.stdout }}
-          (Should be 0 — controller не attached because no stealth listener configured.)
+          rendezvous.controller.wired in the last 30 sec: {{ post_revert_wired.stdout }}
+          (Should be 0 — controller not attached because no stealth listener configured.)

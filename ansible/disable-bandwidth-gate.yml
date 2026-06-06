@@ -1,13 +1,13 @@
 ---
 # Disable node-aggregate inbound/outbound bandwidth gate on the testnet.
 #
-# Default `max_in/outbound_bandwidth_kbps = 100_000` (declared в kbps but
-# the gate impl multiplies by 1024, так effective steady rate ≈ 100 MiB/s
+# Default `max_in/outbound_bandwidth_kbps = 100_000` (declared in kbps but
+# the gate impl multiplies by 1024, so effective steady rate ≈ 100 MiB/s
 # = ~800 Mbit/s, burst ≈ 195 MiB). Under iperf-scale load TCP bursts past
 # the gate → silent frame drops → AEAD counter desync → session.violation
 # → auto_ban → 10-20s stall. See `bandwidth_gate.rs:78` for the drop site.
 #
-# Setting both to `-1` маps `BandwidthGate::new(0)` (unlimited) — the
+# Setting both to `-1` maps `BandwidthGate::new(0)` (unlimited) — the
 # `if val < 0 { 0 }` branch in `NodeCapacityConfig::bandwidth_kbps_to_gate`.
 #
 # Run:

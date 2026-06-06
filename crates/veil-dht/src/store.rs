@@ -29,13 +29,13 @@ type ValuePredicate<'a> = dyn Fn(&[u8]) -> bool + 'a;
 /// Production: `RocksDbCold` (wraps `rocksdb::DB`).
 pub trait ColdBackend: Send + Sync + std::fmt::Debug {
     fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>>;
-    /// Insert `(key, value)` into cold storage.  Returns the entry що
+    /// Insert `(key, value)` into cold storage.  Returns the entry that
     /// was evicted by an internal capacity check, if any, so the
     /// caller (typically [`TieredStore`]) can keep byte/metric counters
     /// in sync.  Returns `None` when no eviction occurred (room was
     /// available, OR the backend evicts asynchronously /
     /// compaction-driven — RocksDB).  Audit batch 2026-05-23: signature
-    /// expanded к return the evicted entry для byte-cap bookkeeping.
+    /// expanded to return the evicted entry for byte-cap bookkeeping.
     fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> Option<([u8; 32], Vec<u8>)>;
     fn remove(&mut self, key: &[u8; 32]);
     fn contains(&self, key: &[u8; 32]) -> bool;
@@ -73,10 +73,10 @@ pub trait ColdBackend: Send + Sync + std::fmt::Debug {
     fn retain_newer_than(&mut self, _cutoff: Instant) -> Vec<([u8; 32], u64)> {
         Vec::new()
     }
-    /// Remove и return the OLDEST entry, если any.  Used by
-    /// [`TieredStore`] для byte-cap eviction when the global
+    /// Remove and return the OLDEST entry, if any.  Used by
+    /// [`TieredStore`] for byte-cap eviction when the global
     /// `max_bytes` budget is exceeded.  Default implementation
-    /// returns `None` (backends без age-ordering opt out — their
+    /// returns `None` (backends without age-ordering opt out — their
     /// own internal compaction handles eviction).
     fn evict_oldest(&mut self) -> Option<([u8; 32], Vec<u8>)> {
         None
@@ -131,7 +131,7 @@ impl ColdBackend for InMemoryCold {
 
     fn put(&mut self, key: [u8; 32], value: Vec<u8>) -> Option<([u8; 32], Vec<u8>)> {
         let ts = Instant::now();
-        // Evict if at capacity (return evicted entry для byte-cap bookkeeping).
+        // Evict if at capacity (return evicted entry for byte-cap bookkeeping).
         let mut evicted: Option<([u8; 32], Vec<u8>)> = None;
         if self.entries.len() >= self.capacity
             && !self.entries.contains_key(&key)
@@ -636,8 +636,8 @@ pub const ORIGIN_INTERNAL: [u8; 32] = [0u8; 32];
 
 /// Synthetic origin id used by legacy unsigned STOREs (accepted only when
 /// [`crate::DhtRuntimeConfig::allow_unsigned_store`] is `true`).  All
-/// unsigned records on а node share this single bucket, so the per-origin
-/// cap functions as а collective ceiling for the inner-sig deployment
+/// unsigned records on a node share this single bucket, so the per-origin
+/// cap functions as a collective ceiling for the inner-sig deployment
 /// pattern.
 pub const ORIGIN_UNSIGNED: [u8; 32] = [0xFFu8; 32];
 
@@ -663,21 +663,21 @@ pub struct TieredStore {
 
     /// Running sum of bytes stored across both tiers (audit batch
     /// 2026-05-23 — DHT byte-cap).  Maintained incrementally on
-    /// every put/remove/eviction.  Use [`Self::total_bytes`] для
+    /// every put/remove/eviction.  Use [`Self::total_bytes`] for
     /// access — the field is private so the invariant cannot be
-    /// trampled by а sibling crate.
+    /// trampled by a sibling crate.
     total_bytes: u64,
 
-    /// Optional global byte budget.  When `Some(N)`, а put що would
+    /// Optional global byte budget.  When `Some(N)`, a put that would
     /// push `total_bytes` past `N` triggers eviction of the oldest
     /// entries (cold first, then hot demoted-and-evicted) until the
     /// new value fits.  If the new value alone exceeds the cap, the
     /// put is refused (value silently dropped — sender sees the
-    /// daemon-side rejection как а regular DHT-store failure).
+    /// daemon-side rejection as a regular DHT-store failure).
     /// Default `None` (no cap, backward-compat).
     max_bytes: Option<u64>,
 
-    /// Per-origin byte tracking (Этап 11e).  Maps signer-origin id к the
+    /// Per-origin byte tracking (Phase 11e).  Maps signer-origin id to the
     /// number of bytes that origin currently occupies across both tiers.
     /// [`ORIGIN_INTERNAL`] entries are tracked but exempt from the cap
     /// check; everything else is capped at [`Self::per_origin_max_bytes`].
@@ -689,7 +689,7 @@ pub struct TieredStore {
     /// [`Self::put`] (no origin) inherit `ORIGIN_INTERNAL` automatically.
     entry_origin: HashMap<[u8; 32], [u8; 32]>,
 
-    /// Optional per-origin byte cap.  When `Some(N)`, а
+    /// Optional per-origin byte cap.  When `Some(N)`, a
     /// [`Self::put_with_origin`] whose origin is non-internal AND whose
     /// `origin_bytes[origin] - existing_for_this_key + new_bytes`
     /// exceeds `N` is refused outright (the put returns `false`).
@@ -742,19 +742,19 @@ impl TieredStore {
         }
     }
 
-    /// Builder-style: enable а global byte-cap.  Returns `Self` so
-    /// callers can chain после `new` / `with_cold`.  Operators set this
-    /// from `[dht] max_store_bytes` в the daemon config.
+    /// Builder-style: enable a global byte-cap.  Returns `Self` so
+    /// callers can chain after `new` / `with_cold`.  Operators set this
+    /// from `[dht] max_store_bytes` in the daemon config.
     #[must_use]
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
         self.max_bytes = Some(max_bytes);
         self
     }
 
-    /// Builder-style: enable the per-origin byte cap (Этап 11e).  Returns
+    /// Builder-style: enable the per-origin byte cap (Phase 11e).  Returns
     /// `Self` so callers can chain after `new` / `with_cold` / `with_max_bytes`.
     /// Operators set this from `[dht] per_origin_max_bytes` in the daemon
-    /// config — а conservative ceiling (e.g. 64 KiB) bounds how much а
+    /// config — a conservative ceiling (e.g. 64 KiB) bounds how much a
     /// single misbehaving signer can write before its puts start being
     /// refused at the local node.
     #[must_use]
@@ -774,7 +774,7 @@ impl TieredStore {
         self.max_bytes
     }
 
-    /// Bytes currently held by а specific origin.  O(1) — backed by the
+    /// Bytes currently held by a specific origin.  O(1) — backed by the
     /// `origin_bytes` map. Returns `0` for unknown origins.
     pub fn origin_bytes(&self, origin: &[u8; 32]) -> u64 {
         self.origin_bytes.get(origin).copied().unwrap_or(0)
@@ -807,15 +807,15 @@ impl TieredStore {
         None
     }
 
-    /// Get а value AND its hot-tier `inserted_at` timestamp.  Used by
-    /// layers что need per-entry freshness independent of the store-
+    /// Get a value AND its hot-tier `inserted_at` timestamp.  Used by
+    /// layers that need per-entry freshness independent of the store-
     /// wide TTL (audit batch 2026-05-25 phase N — anycast resolve uses
     /// this to drop records whose record-level `ttl` has elapsed even
     /// though the store-wide TTL hasn't yet evicted them).
     ///
     /// Returns `(value, inserted_at)` if present, `None` otherwise.
-    /// Like [`Self::get`], promotes cold-tier hits к hot (the promotion
-    /// stamps а fresh `Instant::now()`; callers что need the original
+    /// Like [`Self::get`], promotes cold-tier hits to hot (the promotion
+    /// stamps a fresh `Instant::now()`; callers that need the original
     /// publish-time should not rely on this for records that have just
     /// surfaced from cold tier).
     pub fn get_with_meta(&mut self, key: &[u8; 32]) -> Option<(&Vec<u8>, Instant)> {
@@ -835,11 +835,11 @@ impl TieredStore {
 
     /// Insert or update a key-value pair. Goes into hot tier.
     ///
-    /// When [`Self::max_bytes`] is set и the new value would push the
+    /// When [`Self::max_bytes`] is set and the new value would push the
     /// total past the cap, evicts the oldest entries (cold first, then
     /// hot demoted-and-evicted) until the value fits.  If the value
     /// alone is larger than the cap, the put is refused (returns
-    /// silently — callers що need а success/refusal signal should
+    /// silently — callers that need a success/refusal signal should
     /// pre-check `value.len() as u64 <= max_bytes`).
     pub fn put(&mut self, key: [u8; 32], value: Vec<u8>) {
         let _ = self.put_with_origin_at(key, value, ORIGIN_INTERNAL, Instant::now());
@@ -850,13 +850,13 @@ impl TieredStore {
         let _ = self.put_with_origin_at(key, value, ORIGIN_INTERNAL, ts);
     }
 
-    /// Insert or update а key-value pair carrying an explicit origin
-    /// (Этап 11e).  Returns `true` on accept, `false` if refused by either
+    /// Insert or update a key-value pair carrying an explicit origin
+    /// (Phase 11e).  Returns `true` on accept, `false` if refused by either
     /// the global byte cap (oversized value) or the per-origin cap.
     ///
     /// `origin` must be the 32-byte signer id of the entity that
     /// authorised the STORE — typically the Ed25519 / Falcon-512 pubkey
-    /// или а derived 32-byte identifier.  Use [`ORIGIN_INTERNAL`] for
+    /// or a derived 32-byte identifier.  Use [`ORIGIN_INTERNAL`] for
     /// trusted internal writes (mailbox replication, republish, raw
     /// `store_local`) — those bypass the per-origin cap.  Use
     /// [`ORIGIN_UNSIGNED`] when accepting legacy unsigned STOREs (the
@@ -866,8 +866,8 @@ impl TieredStore {
         self.put_with_origin_at(key, value, origin, Instant::now())
     }
 
-    /// Like [`Self::put_with_origin`] но with а caller-supplied timestamp.
-    /// Useful for snapshot-restore paths и unit tests що need а
+    /// Like [`Self::put_with_origin`] but with a caller-supplied timestamp.
+    /// Useful for snapshot-restore paths and unit tests that need a
     /// deterministic clock.
     pub fn put_with_origin_at(
         &mut self,
@@ -901,7 +901,7 @@ impl TieredStore {
         }
 
         // 1. Drop the previous value's bytes for this key (if any) — done
-        //    by calling remove(), which adjusts total_bytes и origin_bytes
+        //    by calling remove(), which adjusts total_bytes and origin_bytes
         //    appropriately.
         self.remove(&key);
 
@@ -911,7 +911,7 @@ impl TieredStore {
         {
             // Value alone exceeds the budget — drop silently.  Caller
             // can pre-check via `total_bytes()` / `max_bytes()` to
-            // distinguish "won't fit" от "succeeded but evicted others".
+            // distinguish "won't fit" from "succeeded but evicted others".
             return false;
         }
 
@@ -936,14 +936,14 @@ impl TieredStore {
                 }
                 // Both tiers empty but the cap is still exceeded — the
                 // cap is smaller than `new_bytes`.  Already handled by
-                // the explicit `new_bytes > cap` check above, но defence
-                // в depth: bail out of the loop.
+                // the explicit `new_bytes > cap` check above, but defence
+                // in depth: bail out of the loop.
                 break;
             }
         }
 
         // 4. Insert into hot.  insert_hot maintains total_bytes for the
-        //    hot side и handles hot-overflow demotion.
+        //    hot side and handles hot-overflow demotion.
         self.entry_origin.insert(key, origin);
         *self.origin_bytes.entry(origin).or_insert(0) += new_bytes;
         self.insert_hot(key, value, ts);
@@ -951,7 +951,7 @@ impl TieredStore {
     }
 
     /// Decrement [`Self::total_bytes`] and per-origin tracking when an
-    /// entry is evicted out-of-band (cold backend's own LRU кеш or
+    /// entry is evicted out-of-band (cold backend's own LRU cache or
     /// hot-overflow demote-and-drop).  Internal helper — call sites must
     /// have already removed the entry from its tier.
     fn account_eviction(&mut self, key: &[u8; 32], bytes: u64) {
@@ -966,7 +966,7 @@ impl TieredStore {
         }
     }
 
-    /// Look up the byte size of а stored value, irrespective of tier.
+    /// Look up the byte size of a stored value, irrespective of tier.
     /// Used by the per-origin cap delta check.  Returns `0` if absent.
     fn value_bytes(&self, key: &[u8; 32]) -> u64 {
         if let Some((v, _)) = self.hot.get(key) {
@@ -983,7 +983,7 @@ impl TieredStore {
             removed_bytes = removed_bytes.saturating_add(val.len() as u64);
         }
         // Cold doesn't return the removed value from its `remove` API.
-        // Get the value first so we can subtract its bytes от the total.
+        // Get the value first so we can subtract its bytes from the total.
         if let Some(val) = self.cold.get(key) {
             removed_bytes = removed_bytes.saturating_add(val.len() as u64);
         }
@@ -1171,7 +1171,7 @@ impl TieredStore {
         // Account for the new bytes (total_bytes invariant: sum of all
         // values across both tiers).  Caller must NOT have already
         // inserted into hot when calling this — invariant enforced by
-        // private visibility и call-sites що come через put_at.
+        // private visibility and call-sites that come through put_at.
         self.total_bytes = self.total_bytes.saturating_add(value.len() as u64);
         self.hot.insert(key, (value, ts));
         self.hot_order.insert((ts, key), ());
@@ -1179,8 +1179,8 @@ impl TieredStore {
 
     /// Demote the oldest hot entry to cold.  total_bytes is unchanged
     /// (bytes move from hot to cold) UNLESS cold's internal eviction
-    /// kicks in, в which case the returned evicted entry's bytes ара
-    /// subtracted from the running total и its per-origin slot is
+    /// kicks in, in which case the returned evicted entry's bytes are
+    /// subtracted from the running total and its per-origin slot is
     /// decremented.
     fn demote_oldest_hot(&mut self) {
         if let Some(&(ts, key)) = self.hot_order.keys().next()
@@ -1309,7 +1309,7 @@ mod tests {
 
     // ── Byte-cap (audit batch 2026-05-23) ─────────────────────────────
 
-    /// Sanity check: `total_bytes` tracks puts и removes incrementally.
+    /// Sanity check: `total_bytes` tracks puts and removes incrementally.
     #[test]
     fn total_bytes_tracks_put_and_remove() {
         let mut store = TieredStore::new(2, 10);
@@ -1318,7 +1318,7 @@ mod tests {
         assert_eq!(store.total_bytes(), 100);
         store.put([2u8; 32], vec![0u8; 250]);
         assert_eq!(store.total_bytes(), 350);
-        // Overwrite [1] с а smaller value — counter must reflect the delta.
+        // Overwrite [1] with a smaller value — counter must reflect the delta.
         store.put([1u8; 32], vec![0u8; 30]);
         assert_eq!(store.total_bytes(), 280);
         store.remove(&[1u8; 32]);
@@ -1327,7 +1327,7 @@ mod tests {
         assert_eq!(store.total_bytes(), 0);
     }
 
-    /// `with_max_bytes` evicts oldest entries until а new value fits.
+    /// `with_max_bytes` evicts oldest entries until a new value fits.
     #[test]
     fn byte_cap_evicts_oldest_until_new_value_fits() {
         // Hot/cold capacities generous — only the byte cap should bite.
@@ -1353,14 +1353,14 @@ mod tests {
         );
     }
 
-    /// New value что alone exceeds the cap is refused outright — store
+    /// New value that alone exceeds the cap is refused outright — store
     /// state preserved.
     #[test]
     fn byte_cap_refuses_oversized_value() {
         let mut store = TieredStore::new(8, 8).with_max_bytes(100);
         store.put([1u8; 32], vec![0u8; 50]);
         assert_eq!(store.total_bytes(), 50);
-        // Trying to insert а 200-byte value when cap is 100 must fail.
+        // Trying to insert a 200-byte value when cap is 100 must fail.
         store.put([2u8; 32], vec![0u8; 200]);
         assert!(
             store.get(&[2u8; 32]).is_none(),
@@ -1380,8 +1380,8 @@ mod tests {
     fn byte_cap_overwrite_respects_delta() {
         let mut store = TieredStore::new(8, 8).with_max_bytes(200);
         store.put([1u8; 32], vec![0u8; 150]);
-        // Overwriting [1] с а 200-byte value should succeed (releases the
-        // 150 already counted, then inserts 200 — fits в cap).
+        // Overwriting [1] with a 200-byte value should succeed (releases the
+        // 150 already counted, then inserts 200 — fits in cap).
         store.put([1u8; 32], vec![0u8; 200]);
         assert_eq!(store.total_bytes(), 200);
         assert_eq!(store.get(&[1u8; 32]).map(|v| v.len()), Some(200));
@@ -1394,7 +1394,7 @@ mod tests {
         store.put([1u8; 32], vec![0u8; 100]);
         store.put([2u8; 32], vec![0u8; 100]); // [1] → cold
         assert_eq!(store.total_bytes(), 200);
-        // Force-evict everything via а TTL of 1 ns.
+        // Force-evict everything via a TTL of 1 ns.
         store.retain_fresh(Instant::now(), std::time::Duration::from_nanos(1), |_| {
             false
         });
@@ -1407,7 +1407,7 @@ mod tests {
         assert_eq!(store.cold_len(), 0);
     }
 
-    // ── Per-origin byte cap (Этап 11e) ────────────────────────────────
+    // ── Per-origin byte cap (Phase 11e) ────────────────────────────────
 
     /// Per-origin tracking accumulates bytes by signer id.
     #[test]
@@ -1424,7 +1424,7 @@ mod tests {
         assert_eq!(store.total_bytes(), 350);
     }
 
-    /// Per-origin cap refuses а put что would push the signer past the
+    /// Per-origin cap refuses a put that would push the signer past the
     /// budget — other signers stay unaffected.
     #[test]
     fn per_origin_cap_refuses_noisy_signer() {
@@ -1436,8 +1436,8 @@ mod tests {
         // [3] @ 100 bytes would put noisy at 300 > cap 250 — refused.
         assert!(!store.put_with_origin([3u8; 32], vec![0u8; 100], noisy));
         assert_eq!(store.origin_bytes(&noisy), 200, "noisy state preserved");
-        // Polite signer with а full 250-byte put still succeeds — caps
-        // are per-origin не shared.
+        // Polite signer with a full 250-byte put still succeeds — caps
+        // are per-origin not shared.
         assert!(store.put_with_origin([4u8; 32], vec![0u8; 250], polite));
         assert_eq!(store.origin_bytes(&polite), 250);
     }
@@ -1474,7 +1474,7 @@ mod tests {
     #[test]
     fn internal_origin_bypasses_cap() {
         let mut store = TieredStore::new(8, 8).with_per_origin_max_bytes(50);
-        // Internal путь — should accept 200 bytes despite а 50-byte cap.
+        // Internal path — should accept 200 bytes despite a 50-byte cap.
         store.put([1u8; 32], vec![0u8; 200]);
         assert_eq!(store.total_bytes(), 200);
         assert!(store.get(&[1u8; 32]).is_some());
@@ -1488,7 +1488,7 @@ mod tests {
         store.put_with_origin([1u8; 32], vec![0u8; 100], alice);
         store.put_with_origin([2u8; 32], vec![0u8; 100], alice);
         assert_eq!(store.origin_bytes(&alice), 200);
-        // Evict everything with а TTL of 1 ns.
+        // Evict everything with a TTL of 1 ns.
         store.retain_fresh(Instant::now(), std::time::Duration::from_nanos(1), |_| {
             false
         });
@@ -1496,8 +1496,8 @@ mod tests {
         assert_eq!(store.total_bytes(), 0);
     }
 
-    /// Unsigned-origin (legacy STOREs) shares а single bucket — fills
-    /// collectively und hits the cap as а group.
+    /// Unsigned-origin (legacy STOREs) shares a single bucket — fills
+    /// collectively und hits the cap as a group.
     #[test]
     fn unsigned_origin_shares_single_bucket() {
         let mut store = TieredStore::new(8, 8).with_per_origin_max_bytes(150);

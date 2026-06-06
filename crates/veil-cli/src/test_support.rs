@@ -1,9 +1,9 @@
 //! Cross-crate test-fixture helpers (Phase 4/5 extraction left identical
-//! copies в veil-cfg, veil-cli, veil-node-runtime, veilcore).
+//! copies in veil-cfg, veil-cli, veil-node-runtime, veilcore).
 //! Each copy is referenced by ITS crate's own #[cfg(test)] code only;
 //! dead_code suppressed crate-wide for the module because some fixtures
-//! (`scratch_dir`, `fast_pow_params`, `identity_with_*_nonce`) ара used
-//! только subsets of the four crates yet must stay identical для
+//! (`scratch_dir`, `fast_pow_params`, `identity_with_*_nonce`) are used
+//! only subsets of the four crates yet must stay identical for
 //! handoff-readability.  Audit anchor: TASKS.md audit batch 2026-05-22.
 #![allow(dead_code)]
 

@@ -1,10 +1,10 @@
-// Audit batch 2026-05-22: module-level allow для two style lints
-// що ара not actionable without invasive rewrites:
-//   * `doc_overindented_list_items` — multi-paragraph numbered lists в
+// Audit batch 2026-05-22: module-level allow for two style lints
+// that are not actionable without invasive rewrites:
+//   * `doc_overindented_list_items` — multi-paragraph numbered lists in
 //     module-level docstrings would lose readability if re-indented to
 //     match clippy's 3-space rule.
-//   * `field_reassign_with_default` — а handful of test fixtures build
-//     `Config::default()` then mutate а few listen entries; inlining
+//   * `field_reassign_with_default` — a handful of test fixtures build
+//     `Config::default()` then mutate a few listen entries; inlining
 //     `..Default::default()` produces less-readable test setup.
 #![allow(
     clippy::doc_overindented_list_items,
@@ -40,18 +40,18 @@ mod sovereign_republish;
 mod update_check;
 mod uri_helpers;
 // Phase 2 pre-work (veilcore extraction): `handoff` + `hot_standby`
-// moved к `veil_session::` to break session → runtime cycle.
+// moved to `veil_session::` to break session → runtime cycle.
 // See `docs/en/PLAN_VEILCORE_EXTRACTION.md`.  Backwards-compat re-
-// exports preserved here для existing `crate::runtime::handoff::*`
+// exports preserved here for existing `crate::runtime::handoff::*`
 // / `::hot_standby::*` callers.
 pub use veil_session::handoff;
 pub use veil_session::hot_standby;
 // test-only debug accessors on `NodeRuntime`. All `debug_*`
 // methods are consumed exclusively by `sim::scenarios` and integration
 // tests — verified by grep across workspace.  Phase 4 (veilcore extraction):
-// `#[cfg(test)]` removed so cross-crate tests в veilcore (chaos_sim, scenarios)
-// can reach `runtime.debug_*` methods.  Production cost: negligible (методы
-// небольшие и не called вне tests).
+// `#[cfg(test)]` removed so cross-crate tests in veilcore (chaos_sim, scenarios)
+// can reach `runtime.debug_*` methods.  Production cost: negligible (methods
+// small and not called outside tests).
 mod debug;
 mod inspect;
 
@@ -130,11 +130,11 @@ pub struct NodeServices {
     registry: Arc<TransportRegistry>,
     transport_ctx: Arc<TransportContext>,
     /// cleanup (post-PR5): identity-domain bundle cloned
-    /// (Arc) от NodeRuntime at access time. Pre-cleanup NodeServices
+    /// (Arc) from NodeRuntime at access time. Pre-cleanup NodeServices
     /// held 7 separate identity fields (local_identity, peer_pubkeys
     /// peer_sovereign_identities, peer_roles, mlkem_ek, peer_mlkem_keys
     /// per_session_mlkem_dk) + sovereign_identity — net 8 sibling fields
-    /// cloned individually. Bundling collapses к 1 Arc.
+    /// cloned individually. Bundling collapses to 1 Arc.
     pub identity: Arc<identity_state::IdentityState>,
     state: Arc<Mutex<NodeState>>,
     /// live-session map (link-level metadata) — moved out of
@@ -153,16 +153,16 @@ pub struct NodeServices {
     /// `spawn_gateway_autodiscover_loop` waits on this in addition to its
     /// periodic poll so failover lag drops from ~5 s to sub-second.
     pub gateway_failover_notify: Arc<tokio::sync::Notify>,
-    /// notification handle fired by mobile-event sink на
+    /// notification handle fired by mobile-event sink on
     /// `NetworkChanged` (WiFi ↔ Cellular flip). Wakes every
-    /// outbound-connector reconnect loop из its sleep so reconnect
+    /// outbound-connector reconnect loop from its sleep so reconnect
     /// attempts fire IMMEDIATELY on the new local interface instead of
     /// waiting for the 30-s pre-check sleep + 30-s+ TCP keepalive
-    /// timeout that the old (now-stale) connection takes к surface as
-    /// dead. Pairs с `force_reconnect_all_peers` runtime method
+    /// timeout that the old (now-stale) connection takes to surface as
+    /// dead. Pairs with `force_reconnect_all_peers` runtime method
     /// which unregisters stale `session_tx_registry` entries to
     /// invalidate `has_session` pre-check + drops sender channels
-    /// (causes session-runners к exit on channel-closed branch).
+    /// (causes session-runners to exit on channel-closed branch).
     /// Recovery latency on network change drops from ~30-90 s to ~1-3 s.
     pub force_reconnect_notify: Arc<tokio::sync::Notify>,
     /// shared push-event bus, mirrored from `NodeRuntime` so
@@ -184,12 +184,12 @@ pub struct NodeServices {
     /// Outbound-connector populates it post-handshake-complete so the
     /// next cold start can use these peers as bootstrap fallbacks.
     pub discovered_peers_cache: Arc<Mutex<veil_bootstrap::DiscoveredPeerCache>>,
-    /// finish: anonymity-domain state шарится через
-    /// `Arc<AnonymityState>` между `NodeRuntime`, `NodeServices` и
+    /// finish: anonymity-domain state is shared through
+    /// `Arc<AnonymityState>` between `NodeRuntime`, `NodeServices` and
     /// `SessionRuntimeContext` — single source of truth, snapshot
     /// semantics preserved (Arc clone = point-in-time view since the
-    /// inner struct is treated immutably; reload swaps а fresh `Arc`
-    /// on `NodeRuntime` без disturbing in-flight clones).
+    /// inner struct is treated immutably; reload swaps a fresh `Arc`
+    /// on `NodeRuntime` without disturbing in-flight clones).
     pub anonymity: Arc<anonymity_state::AnonymityState>,
     // cleanup: peer_pubkeys / peer_sovereign_identities
     // / peer_roles / mlkem_ek / peer_mlkem_keys / per_session_mlkem_dk
@@ -230,13 +230,13 @@ pub struct NodeServices {
     /// the operator has locked out. Empty = accept any supported.
     pub allowed_peer_algos: Vec<veil_cfg::SignatureAlgorithm>,
     /// P-Net Phase 2d: private-network membership gate. Loaded once
-    /// от `[network]` config at startup; `None` in public mode.
+    /// from `[network]` config at startup; `None` in public mode.
     pub network_gate: Option<Arc<veil_identity::network_access::NetworkAccessGate>>,
     /// Per-peer verified MembershipCert cache.  Populated at OVL1
-    /// handshake-time когда `network_gate.verify_peer()` succeeds.
-    /// Exposed к IPC consumers (ogate / oproxy) via
-    /// `LocalAppMsg::PnetStatusQuery` so apps can gate admission на
-    /// the daemon's already-performed verify без maintaining their
+    /// handshake-time when `network_gate.verify_peer()` succeeds.
+    /// Exposed to IPC consumers (ogate / oproxy) via
+    /// `LocalAppMsg::PnetStatusQuery` so apps can gate admission on
+    /// the daemon's already-performed verify without maintaining their
     /// own static `allowed_node_ids` list.  Empty in public mode
     /// (gate=None) — IPC queries always reply `has_cert=false`.
     pub verified_peer_certs:
@@ -245,11 +245,11 @@ pub struct NodeServices {
 
 #[derive(Clone)]
 pub struct SessionRuntimeContext {
-    /// cleanup: identity-domain bundle cloned (Arc) от
+    /// cleanup: identity-domain bundle cloned (Arc) from
     /// NodeServices at context build. Pre-cleanup SessionRuntimeContext
     /// held 7 separate identity fields + sovereign_identity = 8 sibling
     /// fields, all Arc-clones of the same upstream sources. Bundling
-    /// collapses к 1 Arc.
+    /// collapses to 1 Arc.
     pub identity: Arc<identity_state::IdentityState>,
     state: Arc<Mutex<NodeState>>,
     /// live-session metadata, co-located with `NodeRuntime.live_sessions`.
@@ -270,8 +270,8 @@ pub struct SessionRuntimeContext {
     // moved into the `identity: Arc<IdentityState>` bundle near top of
     // struct. Reads through `runtime.identity.<field>`.
     /// finish: shared anonymity state, cloned (Arc)
-    /// от `NodeServices` at context build. Reads `.relay_capable` at
-    /// handshake time для the `ANONYMITY_RELAY` capability flag.
+    /// from `NodeServices` at context build. Reads `.relay_capable` at
+    /// handshake time for the `ANONYMITY_RELAY` capability flag.
     anonymity: Arc<anonymity_state::AnonymityState>,
     /// Per-IP session counter: limits inbound connections from a single source IP.
     sessions_per_ip: Arc<ip_slot::IpSlotTable>,
@@ -279,37 +279,37 @@ pub struct SessionRuntimeContext {
     /// Updated on `ProtoError::InvalidMagic`-class failures; checked at accept.
     pub scanner_shield: Arc<veil_abuse::scanner_shield::ScannerShield>,
     /// H10 stage-B (4/N): session-defaults bundle cloned (Arc)
-    /// от NodeServices at session-context build. Reads `keepalive_interval`
+    /// from NodeServices at session-context build. Reads `keepalive_interval`
     /// / `idle_timeout` / `max_pending_responses` / ... / `max_per_subnet`
-    /// through this handle (16 fields collapsed к 1).
+    /// through this handle (16 fields collapsed to 1).
     defaults: Arc<session_defaults::SessionDefaults>,
     /// RTT probe table — used to decide whether to send an immediate probe.
     rtt_table: Arc<Mutex<RttTable>>,
     /// Path to the on-disk config file, used to persist nonce updates.
     config_path: PathBuf,
     /// NodeRuntime decomposition: mobile / battery-tier
-    /// state cloned (Arc) от NodeServices at session-context build.
+    /// state cloned (Arc) from NodeServices at session-context build.
     mobile: Arc<mobile_state::MobileState>,
     /// H10 stage-B: session-resumption-domain
-    /// state cloned (Arc) от NodeServices at session-context build.
+    /// state cloned (Arc) from NodeServices at session-context build.
     /// Reads `.ticket_issuer` / `.peer_tickets` through this handle.
     resumption: Arc<resumption_state::ResumptionState>,
     // cleanup: sovereign_identity moved into the
     // `identity: Arc<IdentityState>` bundle near top of struct.
     // d removed the persistent `revocation_cache` field.
     /// H10 stage-B: hot-standby handoff-domain
-    /// state cloned (Arc) от NodeServices at session-context build. Reads
+    /// state cloned (Arc) from NodeServices at session-context build. Reads
     /// `.registry` / `.swap_registry` / `.ack_waiters` / `.controller` /
     /// `.auto_trigger_after_write_errors` through this handle.
     handoff: Arc<handoff_runtime::HandoffRuntime>,
     /// peer-algo allow-list (empty = accept any supported).
     allowed_peer_algos: Vec<veil_cfg::SignatureAlgorithm>,
     /// P-Net Phase 2d: optional private-network membership gate.
-    /// `Some` когда `[network].mode = "private"` — handshake will
-    /// include local cert in HELLO и reject peers без а valid cert.
+    /// `Some` when `[network].mode = "private"` — handshake will
+    /// include local cert in HELLO and reject peers without a valid cert.
     /// `None` keeps existing public-veil behaviour.
     pub network_gate: Option<Arc<veil_identity::network_access::NetworkAccessGate>>,
-    /// Per-peer verified MembershipCert cache, cloned (Arc) от
+    /// Per-peer verified MembershipCert cache, cloned (Arc) from
     /// NodeServices.  Handshake stores into it on successful
     /// `network_gate.verify_peer()`.
     pub verified_peer_certs:
@@ -360,14 +360,14 @@ pub struct AttachedDebugSession {
 /// Captures everything an operator needs to answer "why am I (not)
 /// PoW-Gated Rendezvous endpoint returned by
 /// [`NodeRuntime::request_rendezvous_endpoint`].  Caller dials
-/// `transport_uri` с the embedded `psk` as the obfs4 pre-shared key;
+/// `transport_uri` with the embedded `psk` as the obfs4 pre-shared key;
 /// `valid_until_unix` is the wall-clock deadline beyond which the
 /// target's on-demand listener will have retired.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RendezvousEndpoint {
     /// Transport URI to dial (e.g. `"obfs4-tcp://example.com:51237"`).
     pub transport_uri: String,
-    /// Per-request 32-byte PSK для the obfs4 handshake.
+    /// Per-request 32-byte PSK for the obfs4 handshake.
     pub psk: [u8; 32],
     /// Unix-timestamp expiry of the on-demand listener slot.
     pub valid_until_unix: u64,
@@ -380,17 +380,17 @@ pub enum RendezvousClientError {
     BadDifficulty(String),
     #[error("target_node_id != BLAKE3(target_pubkey)")]
     TargetIdentityMismatch,
-    #[error("no active session peers to relay через")]
+    #[error("no active session peers to relay through")]
     NoPeers,
     #[error("pending-recursive table at cap; retry later")]
     PendingTableFull,
-    #[error("send_to failed для all closest peers")]
+    #[error("send_to failed for all closest peers")]
     SendFailed,
     #[error("PoW mining failed: {0}")]
     Mining(String),
     #[error("recursive-response wait timed out")]
     Timeout,
-    #[error("recursive-response oneshot channel closed без а response")]
+    #[error("recursive-response oneshot channel closed without a response")]
     ChannelClosed,
     #[error("response payload was empty")]
     EmptyResponse,
@@ -557,18 +557,18 @@ pub struct NodeRuntime {
     pub discovered_peers_cache: Arc<Mutex<veil_bootstrap::DiscoveredPeerCache>>,
     /// decomposition PR1: anonymity-domain state
     /// (relay_capable / advertised_bps / x25519_sk / rendezvous_publisher_entries)
-    /// extracted into а dedicated [`Arc<AnonymityState>`]. See
-    /// `node/runtime/anonymity_state.rs` для rationale. Pre-PR1 these
+    /// extracted into a dedicated [`Arc<AnonymityState>`]. See
+    /// `node/runtime/anonymity_state.rs` for rationale. Pre-PR1 these
     /// fields lived directly on `NodeRuntime`.
     pub anonymity: Arc<anonymity_state::AnonymityState>,
     // `mobile_background_mode` moved into `MobileState`
     // (see field below: `pub mobile: Arc<MobileState>`).
     /// NodeRuntime decomposition: mailbox-domain state
     /// (`mailbox`, `outbox` handles) extracted into [`Arc<MailboxState>`].
-    /// Pre-PR2 these were two sibling fields; collapsing к one bundle
-    /// matches the `AnonymityState` PR1 pattern и gives slice-3
+    /// Pre-PR2 these were two sibling fields; collapsing to one bundle
+    /// matches the `AnonymityState` PR1 pattern and gives slice-3
     /// follow-ups (per-sender quota counters, capability policy state)
-    /// а typed home. See `node/runtime/mailbox_state.rs`.
+    /// a typed home. See `node/runtime/mailbox_state.rs`.
     pub mailbox_state: Arc<mailbox_state::MailboxState>,
     ///.4 P5b: host for built-in app
     /// services (mailbox, future echo / time-sync etc.). Tasks
@@ -580,7 +580,7 @@ pub struct NodeRuntime {
     /// extracted into [`Arc<RoutingState>`]. Pre-PR4 these were 4
     /// sibling fields; bundle-then-Arc collapses them to one. See
     /// `node/runtime/routing_state.rs`. Inner Arcs remain individually
-    /// lockable; reload mutates inner values, не swaps the bundle Arc
+    /// lockable; reload mutates inner values, not swaps the bundle Arc
     /// so downstream Arc-clone holders observe new state automatically.
     pub routing: Arc<routing_state::RoutingState>,
     /// Per-peer rate limiter (shared across all incoming frame paths).
@@ -600,21 +600,21 @@ pub struct NodeRuntime {
     metrics_endpoint: Option<String>,
     shutdown_tx: Option<watch::Sender<bool>>,
     /// Phase 5f Step 3 — keep ephemeral-rotator shutdown senders alive
-    /// для the lifetime of the runtime.  Each entry is the watch
+    /// for the lifetime of the runtime.  Each entry is the watch
     /// sender returned by `spawn_ephemeral_rotator`; dropping it
-    /// signals the rotator loop к exit via its internal
+    /// signals the rotator loop to exit via its internal
     /// `shutdown_rx.changed()` arm.  Holding them prevents the rotators
-    /// от exiting immediately on startup.  On stop/reload these senders are
+    /// from exiting immediately on startup.  On stop/reload these senders are
     /// drained into `StopTasksContext` and `do_stop_tasks` sends `true` on each
     /// (graceful exit ahead of the JoinHandle abort), so the list does not
     /// accumulate stale senders across reloads (audit M7).
     ephemeral_rotator_shutdowns: Mutex<Vec<watch::Sender<bool>>>,
-    /// Strong handle к the PoW-Gated Rendezvous controller (Slice 5b
-    /// of the epic).  Wrapped в `Mutex<Option<...>>` so it can be set
-    /// post-construction (after `spawn_listeners` discovers а
-    /// `visibility = "stealth"` listener) и cleared explicitly on
-    /// `Drop` к break the `controller → binder → dispatcher` cycle
-    /// (see `FrameDispatcher::rendezvous_weak`).  `None` когда no
+    /// Strong handle to the PoW-Gated Rendezvous controller (Slice 5b
+    /// of the epic).  Wrapped in `Mutex<Option<...>>` so it can be set
+    /// post-construction (after `spawn_listeners` discovers a
+    /// `visibility = "stealth"` listener) and cleared explicitly on
+    /// `Drop` to break the `controller → binder → dispatcher` cycle
+    /// (see `FrameDispatcher::rendezvous_weak`).  `None` when no
     /// stealth listener is configured.
     pub rendezvous_controller: Mutex<Option<Arc<veil_session::rendezvous::RendezvousController>>>,
     tasks: Arc<Mutex<RuntimeTasks>>,
@@ -642,23 +642,23 @@ pub struct NodeRuntime {
     /// and similar pre-handshake decode errors.
     pub scanner_shield: Arc<veil_abuse::scanner_shield::ScannerShield>,
     /// Pre-spawn cap on concurrent inbound handshake tasks. Capacity =
-    /// `max(4 × max_concurrent, 1024)` derived от session defaults at
+    /// `max(4 × max_concurrent, 1024)` derived from session defaults at
     /// runtime-start time. The accept loop `try_acquire_owned`s before
-    /// `spawn_inbound_session`; permit is held by the spawned task и
+    /// `spawn_inbound_session`; permit is held by the spawned task and
     /// drops on handshake completion / failure / timeout. Without this
     /// cap an inbound TCP flood pinned ~5 KB per pending task before the
     /// post-handshake `live_sessions.len >= max_concurrent` gate kicked in.
     pub inbound_handshake_sem: Arc<tokio::sync::Semaphore>,
     /// ML-KEM-768 decapsulation-key seed (private, 64 bytes).
     /// (Stays outside the IdentityState bundle: it's the local-only
-    /// secret half of mlkem_ek и has different access patterns —
+    /// secret half of mlkem_ek and has different access patterns —
     /// only the dispatcher reads it, never cloned into per-session
     /// contexts.)
     ///
-    /// Этап 6 slice 6g — backed by `SensitiveBytesN<64>` (mlocked when
+    /// Phase 6 slice 6g — backed by `SensitiveBytesN<64>` (mlocked when
     /// `RLIMIT_MEMLOCK` permits, zeroize-on-drop fallback otherwise).
-    /// See `FrameDispatcher::mlkem_dk_seed` rustdoc для threat model
-    /// и why pinning matters more here than для session-scoped keys.
+    /// See `FrameDispatcher::mlkem_dk_seed` rustdoc for threat model
+    /// and why pinning matters more here than for session-scoped keys.
     pub mlkem_dk_seed:
         Arc<veil_util::sensitive_bytes::SensitiveBytesN<{ veil_e2e::DK_SEED_BYTES }>>,
     /// Pending diagnostic reply channels: `seq → Sender<DiagEvent>`.
@@ -669,10 +669,10 @@ pub struct NodeRuntime {
         >,
     >,
     /// H10 stage-B (4/N): session-defaults bundle (16 pure-value
-    /// config knobs derived от config.session / config.gateway /
+    /// config knobs derived from config.session / config.gateway /
     /// config.connection) extracted into [`Arc<SessionDefaults>`].
     /// See `node/runtime/session_defaults.rs`. Shared by Arc-clone
-    /// with NodeServices и SessionRuntimeContext at boundary builds.
+    /// with NodeServices and SessionRuntimeContext at boundary builds.
     pub defaults: Arc<session_defaults::SessionDefaults>,
     /// NodeRuntime decomposition: mobile / battery-
     /// tier state extracted into [`Arc<MobileState>`]. Pre-PR3 these
@@ -695,14 +695,14 @@ pub struct NodeRuntime {
     /// ranked list of known Gateway peers for multi-gateway failover.
     gateway_list: Arc<Mutex<veil_gateway::GatewayList>>,
     /// wall-clock instant when the ML-KEM decapsulation-key seed
-    /// was loaded (or generated) for this node lifetime. Used as а fallback
-    /// for `mlkem_key_age_secs` если the on-disk key file's mtime cannot be
+    /// was loaded (or generated) for this node lifetime. Used as a fallback
+    /// for `mlkem_key_age_secs` if the on-disk key file's mtime cannot be
     /// read (which is the authoritative source: it survives restarts so
     /// "key age" tracks keypair lifetime, not process uptime).
     mlkem_key_loaded_at: Instant,
-    /// Path к the ML-KEM key PEM on disk. Used by `mlkem_key_age_secs`
-    /// к compute key age from file mtime — this is the only signal that
-    /// survives daemon restart и actually reflects key lifetime для
+    /// Path to the ML-KEM key PEM on disk. Used by `mlkem_key_age_secs`
+    /// to compute key age from file mtime — this is the only signal that
+    /// survives daemon restart and actually reflects key lifetime for
     /// rotation planning (rather than process uptime).
     mlkem_key_path: std::path::PathBuf,
     /// channel for on-demand DHT discovery triggers.
@@ -711,13 +711,13 @@ pub struct NodeRuntime {
     /// H10 stage-B: session-resumption-domain state extracted into
     /// [`Arc<ResumptionState>`]. `ticket_issuer` rotated every
     /// `TICKET_KEY_ROTATION_SECS` seconds; per-peer `peer_tickets`
-    /// presented в HELLO TLV on reconnect. See
+    /// presented in HELLO TLV on reconnect. See
     /// `node/runtime/resumption_state.rs`.
     pub resumption: Arc<resumption_state::ResumptionState>,
     /// H10 stage-B: PEX-domain runtime state extracted into an owned
     /// `PexRuntime` bundle. Plain struct (not `Arc<...>`) because the
     /// `Option<Receiver>` fields require `&mut self` access via
-    /// `.take()` at task-spawn time, и `Arc<Mutex<_>>` would add а
+    /// `.take()` at task-spawn time, and `Arc<Mutex<_>>` would add a
     /// lock that nobody contends on. See `node/runtime/pex_runtime.rs`.
     pex: pex_runtime::PexRuntime,
     /// optional sovereign-identity handle loaded from disk at
@@ -733,12 +733,12 @@ pub struct NodeRuntime {
     /// `SessionRuntimeContext` at session-admit time.
     allowed_peer_algos: Vec<veil_cfg::SignatureAlgorithm>,
     /// P-Net Phase 2d: private-network membership gate. Loaded once
-    /// от `[network]` config at startup. `Some` → handshake-time
+    /// from `[network]` config at startup. `Some` → handshake-time
     /// cert exchange + verification; `None` → public-mode behaviour.
     pub network_gate: Option<Arc<veil_identity::network_access::NetworkAccessGate>>,
     /// Per-peer verified MembershipCert cache.  Populated at OVL1
-    /// handshake-time когда `network_gate.verify_peer()` succeeds,
-    /// read by `PnetStatusProvider` для IPC consumer queries.
+    /// handshake-time when `network_gate.verify_peer()` succeeds,
+    /// read by `PnetStatusProvider` for IPC consumer queries.
     pub verified_peer_certs:
         Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], veil_types::MembershipCert>>>,
     /// audit log for mutating admin commands. `None`
@@ -757,7 +757,7 @@ impl Drop for NodeRuntime {
         //       → session_ctx → dispatcher
         // Clear the dispatcher's weak ref + drop our strong Arc so the
         // controller's drop chain runs cleanly.  Weak::upgrade() will
-        // now return None in any в-flight dispatch task.
+        // now return None in any in-flight dispatch task.
         if let Some(dispatcher_weak_lock) =
             self.dispatcher.rendezvous_weak.lock().ok().as_deref_mut()
         {
@@ -820,8 +820,8 @@ where
     })
 }
 
-// Phase 2 pre-work (veilcore extraction): moved к `veil_util`
-// so session-side callers can reach it без cycling через runtime.  This
+// Phase 2 pre-work (veilcore extraction): moved to `veil_util`
+// so session-side callers can reach it without cycling through runtime.  This
 // shim preserves backwards compat for existing
 // `crate::runtime::local_battery_level()` callsites.
 pub use veil_util::local_battery_level;
@@ -886,19 +886,19 @@ impl NodeRuntime {
 
         let logger = Arc::new(veil_cfg::observability_glue::logger_from_config(&config)?);
 
-        // Pin the process address space in RAM против swap-out before
+        // Pin the process address space in RAM against swap-out before
         // loading any key material. `mlockall(MCL_CURRENT | MCL_FUTURE)`
         // covers ALL future allocations, including key bytes inside
         // upstream crates (chacha20poly1305 internal GenericArray,
-        // ed25519_dalek SigningKey seed) that можно нельзя reach с
+        // ed25519_dalek SigningKey seed) that cannot be reached with
         // per-buffer wrappers. Linux only; macOS / Windows / *BSD log
-        // as "unsupported" и continue with swap risk accepted.
+        // as "unsupported" and continue with swap risk accepted.
         //
-        // Failure path: log а warn but DO NOT refuse to start. Cheap
-        // VPS deployments may run без `LimitMEMLOCK=infinity`; refusing
+        // Failure path: log a warn but DO NOT refuse to start. Cheap
+        // VPS deployments may run without `LimitMEMLOCK=infinity`; refusing
         // to boot would break those deployments. Operators raising
         // sustained-load servers should set `ulimit -l unlimited` (or
-        // `LimitMEMLOCK=infinity` в systemd unit) и check the log line
+        // `LimitMEMLOCK=infinity` in systemd unit) and check the log line
         // confirms `Locked`.
         match veil_util::mlock::try_mlockall_current_future() {
             veil_util::mlock::MlockallOutcome::Locked => {
@@ -910,7 +910,7 @@ impl NodeRuntime {
             veil_util::mlock::MlockallOutcome::Unsupported => {
                 logger.info(
                     "node.mlock.unsupported",
-                    "mlockall not supported on this platform; key material may swap к disk",
+                    "mlockall not supported on this platform; key material may swap to disk",
                 );
             }
             veil_util::mlock::MlockallOutcome::BudgetExhausted { errno_str } => {
@@ -948,7 +948,7 @@ impl NodeRuntime {
             .to_path_buf();
         let mlkem_key_path = veil_dir_path.join("mlkem.key");
         // Resolve passphrase via the priority cascade: prompt > env > file >
-        // inline. Wrapped в Zeroizing<String> so the heap contents are wiped
+        // inline. Wrapped in Zeroizing<String> so the heap contents are wiped
         // when this binding drops at end of `start`.
         let key_passphrase = crate::key_passphrase::resolve_key_passphrase(&config, &logger)?;
         let (mlkem_ek_arr, mlkem_dk_arr) = veil_e2e::load_or_generate_mlkem_key_encrypted(
@@ -961,8 +961,8 @@ impl NodeRuntime {
         // wipes the String's heap allocation on this line.
         drop(key_passphrase);
         let mlkem_ek = Arc::new(mlkem_ek_arr);
-        // Этап 6 slice 6g — wrap the long-lived DK seed in а
-        // SensitiveBytesN<64> wrapper so the bytes ара mlock-pinned
+        // Phase 6 slice 6g — wrap the long-lived DK seed in a
+        // SensitiveBytesN<64> wrapper so the bytes are mlock-pinned
         // (or zeroize-on-drop fallback) for the process lifetime.  The
         // raw `[u8; 64]` from `load_or_generate_mlkem_key_encrypted`
         // gets copied into the mlocked storage and the source array
@@ -1073,7 +1073,7 @@ impl NodeRuntime {
         // create Vivaldi arcs here so they can be shared with both DHT and dispatcher.
         let shared_vivaldi = Arc::new(Mutex::new(VivaldiCoord::new()));
         #[allow(clippy::type_complexity)]
-        // p: pre-size к MAX_PEER_VIVALDI_CACHE (avoids rehash).
+        // p: pre-size to MAX_PEER_VIVALDI_CACHE (avoids rehash).
         let shared_peer_vivaldi: Arc<
             std::sync::RwLock<
                 std::collections::HashMap<NodeIdBytes, (VivaldiCoord, std::time::Instant)>,
@@ -1081,9 +1081,9 @@ impl NodeRuntime {
         > = Arc::new(std::sync::RwLock::new(
             std::collections::HashMap::with_capacity(veil_proto::budget::MAX_PEER_VIVALDI_CACHE),
         ));
-        // P-Net Phase 3b: build the auth gate БЕФОРЕ the DHT so that
+        // P-Net Phase 3b: build the auth gate BEFORE the DHT so that
         // STOREs carrying the `PBAN` magic prefix can be verified at
-        // ingest time. Public-mode nodes (or нодев with no `[network]`
+        // ingest time. Public-mode nodes (or nodes with no `[network]`
         // block) leave `network_gate_arc` = None; the DHT path treats
         // that as "reject all PBAN STOREs".
         let network_gate_arc: Option<Arc<veil_identity::network_access::NetworkAccessGate>> =
@@ -1226,12 +1226,12 @@ impl NodeRuntime {
             )
             .expect("ban_threshold clamped to >= 1 — invariant in this call site"),
         ));
-        // p: pre-size all peer-cache HashMaps к their caps
-        // так что inserts up к the cap не вызывают `reserve_rehash`
+        // p: pre-size all peer-cache HashMaps to their caps
+        // so that inserts up to the cap do not trigger `reserve_rehash`
         // transient allocations. jeprof callgraph showed
         // ~49 MiB of jemalloc dirty pages pinned by these rehash events
-        // на bootstrap'е под chaos-ban peer churn. Pre-allocation costs
-        // ~80 KiB total upfront в exchange for а flat allocator footprint.
+        // on bootstrap'e under chaos-ban peer churn. Pre-allocation costs
+        // ~80 KiB total upfront in exchange for a flat allocator footprint.
         let peer_pubkeys: veil_types::PeerPubkeysCache = Arc::new(Mutex::new(
             veil_types::PeerLruCache::with_capacity(veil_proto::budget::MAX_PEER_PUBKEYS_CACHE),
         ));
@@ -1261,8 +1261,8 @@ impl NodeRuntime {
                 veil_e2e::PeerMlKemCache::with_capacity(veil_proto::budget::MAX_PEER_MLKEM_CACHE),
             ));
         // per-session ephemeral ML-KEM DK seeds (key = peer_id, value =
-        // SensitiveBytesN<64>-wrapped dk_seed).  Этап 6 slice 6h —
-        // values ара mlocked while the session is open.
+        // SensitiveBytesN<64>-wrapped dk_seed).  Phase 6 slice 6h —
+        // values are mlocked while the session is open.
         let shared_per_session_mlkem_dk: Arc<
             Mutex<
                 std::collections::HashMap<
@@ -1524,7 +1524,7 @@ impl NodeRuntime {
         // from `mailbox.enabled` — every node sends, so every node
         // benefits from peer-sync retransmits when contacts come back
         // online. Failure to open is non-fatal: outbox stays None and
-        // the peer-sync IPC handlers respond с graceful "feature off".
+        // the peer-sync IPC handlers respond with graceful "feature off".
         let outbox_handle: Option<Arc<veil_mailbox::Outbox>> =
             match veil_mailbox::Outbox::open(&veil_dir_path, veil_mailbox::OutboxConfig::default())
             {
@@ -1672,7 +1672,7 @@ impl NodeRuntime {
             // session alias registry (empty; populated by SessionRunner).
             alias_registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
             // NAT traversal — observed peer addresses (empty; populated by on_session_opened).
-            // p: pre-size к MAX_PEER_OBSERVED_ADDRS (avoids rehash spikes).
+            // p: pre-size to MAX_PEER_OBSERVED_ADDRS (avoids rehash spikes).
             peer_observed_addrs: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::with_capacity(
                     veil_proto::budget::MAX_PEER_OBSERVED_ADDRS,
@@ -1771,10 +1771,10 @@ impl NodeRuntime {
                 .as_ref()
                 .map(|_| Arc::new(veil_anonymity::rendezvous::RendezvousRegistry::default())),
         });
-        // cleanup: pre-build the hot-standby controller и
+        // cleanup: pre-build the hot-standby controller and
         // its prerequisite Arcs (handoff_ack_waiters, swap_registry)
-        // before the runtime literal so the literal can hold а direct
-        // Arc clone instead of а throwaway placeholder that gets
+        // before the runtime literal so the literal can hold a direct
+        // Arc clone instead of a throwaway placeholder that gets
         // replaced post-construction. All inputs are already bound at
         // this point: `registry` (line 1027), `transport_ctx` (line 948)
         // `shared_session_tx_registry` (line 1355), `logger` (line 947).
@@ -1790,7 +1790,7 @@ impl NodeRuntime {
                 config.hot_standby.clone(),
                 Arc::clone(&logger),
             ));
-        // Apply per-peer alt_uri от config к the pre-built controller.
+        // Apply per-peer alt_uri from config to the pre-built controller.
         // Pre-cleanup, this loop ran AFTER the runtime literal's
         // placeholder was replaced; running here lets the runtime
         // literal hold an already-populated Arc.
@@ -1806,10 +1806,10 @@ impl NodeRuntime {
             foreground_mode,
             registry,
             transport_ctx,
-            // identity bundle built below после the
+            // identity bundle built below after the
             // builder so the local closures that need `local_identity`
             // / `mlkem_ek` / etc. above can still reference the local
-            // var bindings. See `identity:` field assignment ниже.
+            // var bindings. See `identity:` field assignment below.
             logger: Arc::clone(&logger),
             metrics: metrics.clone(),
             hint_registry,
@@ -1880,14 +1880,14 @@ impl NodeRuntime {
                 }
             })),
             // decomposition PR1: bundle the four
-            // anonymity-related fields into а dedicated AnonymityState.
+            // anonymity-related fields into a dedicated AnonymityState.
             // Reuses the SAME x25519 Arc that was passed into the
             // dispatcher above, so the publish task (which reads the
             // field on NodeRuntime) and the inbound RelayChain handler
             // (which reads the dispatcher's field) operate on the same
             // key. When relay is disabled, both are None — but we
             // still need *some* SK for `tick_publish_relay_directory_entry`
-            // to be а no-op, so fall back to а fresh ephemeral so the
+            // to be a no-op, so fall back to a fresh ephemeral so the
             // type signature stays `Arc<StaticSecret>`. The publish
             // helper's `relay_capable = false` early-return guards
             // against this fallback ever being used.
@@ -1959,7 +1959,7 @@ impl NodeRuntime {
             pending_diag: Arc::clone(&shared_pending_diag),
             // H10 stage-B (4/N): 16 session-config knobs collapsed
             // into one `Arc<SessionDefaults>`. Same Arc is cloned into
-            // NodeServices и SessionRuntimeContext at boundary builds.
+            // NodeServices and SessionRuntimeContext at boundary builds.
             defaults: session_defaults::SessionDefaults::new(
                 std::time::Duration::from_secs(config.session.keepalive_interval_secs),
                 std::time::Duration::from_secs(config.session.idle_timeout_secs),
@@ -2026,15 +2026,15 @@ impl NodeRuntime {
             ),
             // sovereign_identity now lives inside the
             // `identity: Arc<IdentityState>` bundle initialised earlier
-            // в this literal. Local var consumed by the IdentityState
-            // ctor; nothing else к assign here.
+            // in this literal. Local var consumed by the IdentityState
+            // ctor; nothing else to assign here.
             // H10 stage-B: 5 handoff fields collapsed into
             // one `Arc<HandoffRuntime>` bundle. hot_standby_controller_arc
-            // is built once before the runtime literal от pre-extracted
+            // is built once before the runtime literal from pre-extracted
             // Arcs (registry / transport_ctx / shared_session_tx_registry
             // / handoff_ack_waiters_arc / swap_registry_arc / logger);
-            // pre-cleanup, а throwaway "placeholder" was constructed
-            // here и immediately replaced after the literal closed
+            // pre-cleanup, a throwaway "placeholder" was constructed
+            // here and immediately replaced after the literal closed
             // because the real Arcs weren't addressable yet through
             // `runtime.x`.
             handoff: Arc::new(handoff_runtime::HandoffRuntime::new(
@@ -2052,7 +2052,7 @@ impl NodeRuntime {
             network_gate: network_gate_arc.clone(),
             // S2.A part 3: per-peer verified-cert cache. Filled by
             // handshake on successful verify_peer; read by PnetStatusProvider
-            // when an IPC consumer (ogate/oproxy) queries а peer's
+            // when an IPC consumer (ogate/oproxy) queries a peer's
             // admission state.
             verified_peer_certs: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             // open the admin audit log next to the config
@@ -2090,7 +2090,7 @@ impl NodeRuntime {
         // deferred : prime the outbound-batch
         // signals. Default config: threshold = None → disabled
         // sentinel; window = None → 0. Both must be configured
-        // for coalescing to engage (gated в `current_outbound_batch_window`).
+        // for coalescing to engage (gated in `current_outbound_batch_window`).
         veil_session::runner::set_mobile_low_battery_threshold_pct(
             config.mobile.low_battery_threshold_pct,
         );
@@ -2099,13 +2099,13 @@ impl NodeRuntime {
         );
         // prime the global session-rotation interval
         // (0 = disabled). Runtime-side clamp ensures any value
-        // < 60 gets pushed up к the floor, defending против
+        // < 60 gets pushed up to the floor, defending against
         // misconfig OR validation bypass.
         //
-        // Precedence (mirrors the reload path в lifecycle.rs):
+        // Precedence (mirrors the reload path in lifecycle.rs):
         //   1. `[transport.rotation]` range knob (new) — preferred.
         //   2. `session.max_age_secs` (deprecated single-value) —
-        //      back-compat fallback only когда the new section is
+        //      back-compat fallback only when the new section is
         //      disabled (`-1`/`-1`) AND legacy field is set.
         if let Some((min, max)) = config.transport.rotation.resolved_range() {
             veil_session::runner::set_session_rotation_range(min, max);
@@ -2113,16 +2113,16 @@ impl NodeRuntime {
                 runtime.logger.warn(
                     "config.session.max_age_secs.shadowed",
                     "session.max_age_secs is set but [transport.rotation] takes precedence — \
-                     remove session.max_age_secs from the config к silence this warning",
+                     remove session.max_age_secs from the config to silence this warning",
                 );
             }
         } else if let Some(secs) = config.session.max_age_secs {
             runtime.logger.warn(
                 "config.session.max_age_secs.deprecated",
                 format!(
-                    "session.max_age_secs={secs} is DEPRECATED — migrate к the \
+                    "session.max_age_secs={secs} is DEPRECATED — migrate to the \
                      [transport.rotation] section (min_lifetime_secs + max_lifetime_secs, \
-                     -1 на обоих для disable) для range-based jitter that defeats \
+                     -1 on both for disable) for range-based jitter that defeats \
                      fleet-correlation DPI fingerprinting"
                 ),
             );
@@ -2131,9 +2131,9 @@ impl NodeRuntime {
             veil_session::runner::set_session_rotation_range(0, 0);
         }
         // cleanup: hot_standby_controller + per-peer
-        // alt_uri now built before the runtime literal (см. above).
-        // Pre-cleanup, this block replaced а throwaway placeholder
-        // controller; the placeholder is gone, this block с ним.
+        // alt_uri now built before the runtime literal (see. above).
+        // Pre-cleanup, this block replaced a throwaway placeholder
+        // controller; the placeholder is gone, this block with it.
         // –164: restore snapshots only when persistence is globally enabled.
         if config.persist_enabled {
             // restore route cache from snapshot before accepting connections.
@@ -2327,10 +2327,10 @@ impl NodeRuntime {
         self.metrics.as_ref().map(|m| m.snapshot())
     }
 
-    /// Seconds since the ML-KEM keypair was created — measured от the on-disk
+    /// Seconds since the ML-KEM keypair was created — measured from the on-disk
     /// PEM file's mtime, which survives daemon restart (so this metric
-    /// genuinely reflects keypair lifetime для rotation planning).
-    /// Falls back к "seconds since load в this process" if file metadata
+    /// genuinely reflects keypair lifetime for rotation planning).
+    /// Falls back to "seconds since load in this process" if file metadata
     /// cannot be read (e.g. permission error, deleted underneath us).
     pub fn mlkem_key_age_secs(&self) -> u64 {
         if let Ok(meta) = std::fs::metadata(&self.mlkem_key_path)
@@ -2459,29 +2459,29 @@ impl NodeRuntime {
     /// PoW-Gated Rendezvous initiator helper — Slice 9 follow-up of
     /// the epic (closes the response-await gap left out of Slice 4
     /// scope, where the SDK shipped only the build/parse primitives
-    /// без the dispatch + correlation glue).
+    /// without the dispatch + correlation glue).
     ///
     /// Flow:
-    /// 1. Build а signed `RequestEphemeralEndpointPayload` (mines PoW
+    /// 1. Build a signed `RequestEphemeralEndpointPayload` (mines PoW
     ///    at `pow_difficulty` against the canonical form)
-    /// 2. Wrap в `RecursiveQuery{query_type=RENDEZVOUS_REQUEST}` с а
-    ///    fresh 16-byte `query_id` и `target_key = target_node_id`
-    /// 3. Register а `PendingRecursive` entry under `query_id` so
+    /// 2. Wrap in `RecursiveQuery{query_type=RENDEZVOUS_REQUEST}` with a
+    ///    fresh 16-byte `query_id` and `target_key = target_node_id`
+    /// 3. Register a `PendingRecursive` entry under `query_id` so
     ///    the existing `handle_recursive_response` arm fires our
     ///    oneshot when the matching response arrives
-    /// 4. Ship the encoded frame к the closest active session peers
-    ///    (sorted by XOR distance к `target_node_id`)
-    /// 5. Await the oneshot up к `timeout`
+    /// 4. Ship the encoded frame to the closest active session peers
+    ///    (sorted by XOR distance to `target_node_id`)
+    /// 5. Await the oneshot up to `timeout`
     /// 6. Validate the recursive response:
-    ///    a. `responder_pubkey == target_pubkey` (binding к the
+    ///    a. `responder_pubkey == target_pubkey` (binding to the
     ///       expected target identity)
-    ///    b. Outer envelope sig verify под `target_pubkey` over
+    ///    b. Outer envelope sig verify under `target_pubkey` over
     ///       `query_id || payload`
     ///    c. Inner `EphemeralEndpointResponsePayload` runs through
     ///       `verify_ephemeral_endpoint_response` (identity binding,
     ///       requester echo, TTL)
     /// 7. Return the recovered `(transport_uri, psk, valid_until_unix)`
-    ///    triple — caller dials the URI с the embedded PSK
+    ///    triple — caller dials the URI with the embedded PSK
     pub async fn request_rendezvous_endpoint(
         &self,
         target_node_id: [u8; 32],
@@ -2513,7 +2513,7 @@ impl NodeRuntime {
             return Err(RendezvousClientError::TargetIdentityMismatch);
         }
 
-        // Pick closest active peers к forward к.
+        // Pick closest active peers to forward to.
         let mut peers: Vec<[u8; 32]> = rlock!(self.session_tx_registry).peer_ids();
         if peers.is_empty() {
             return Err(RendezvousClientError::NoPeers);
@@ -2589,7 +2589,7 @@ impl NodeRuntime {
         );
         let inner_bytes = signed.encode().to_vec();
 
-        // Stage 2: wrap в RecursiveQuery + register pending.
+        // Stage 2: wrap in RecursiveQuery + register pending.
         let local_node_id = *self.identity.local_identity.node_id.as_bytes();
         let query_id: [u8; 16] = {
             use rand_core::RngCore;
@@ -2633,8 +2633,8 @@ impl NodeRuntime {
             );
         }
 
-        // Stage 3: send к top-2 closest peers (matches dht_recursive_get
-        // fan-out — gives redundancy без noisy duplication).
+        // Stage 3: send to top-2 closest peers (matches dht_recursive_get
+        // fan-out — gives redundancy without noisy duplication).
         {
             let guard = rlock!(self.session_tx_registry);
             let mut sent = 0;
@@ -2653,19 +2653,19 @@ impl NodeRuntime {
         }
 
         // Stage 4: await response + dispatcher's outer-envelope sig was
-        // ALREADY verified в `handle_recursive_response` (line 2369-2383
+        // ALREADY verified in `handle_recursive_response` (line 2369-2383
         // — `claimed_responder_id == BLAKE3(responder_pubkey)` +
         // ed25519 sig over `query_id || payload`).  So `payload` here
-        // is trusted-from-the-claimed-responder, но we still must:
+        // is trusted-from-the-claimed-responder, but we still must:
         // (a) confirm the responder_pubkey we expected matched, and
         // (b) verify the INNER `EphemeralEndpointResponsePayload`.
         //
         // Subtle: `handle_recursive_response` doesn't pass the
-        // responder_pubkey back через the oneshot — only `resp.payload`.
+        // responder_pubkey back through the oneshot — only `resp.payload`.
         // So we cannot enforce (a) here.  Inner sig + identity-binding
-        // checks below close the gap: inner is sig'd by target_sk и
+        // checks below close the gap: inner is sig'd by target_sk and
         // the identity binding ensures BLAKE3(inner_responder) ==
-        // target_node_id.  А wrong-target response would fail the
+        // target_node_id.  A wrong-target response would fail the
         // inner verify.  Defense-in-depth — the outer envelope's sig
         // helps mediators reject forgeries at relay time, but the
         // initiator's source-of-truth is the inner identity binding.
@@ -2675,8 +2675,8 @@ impl NodeRuntime {
         let payload = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(p)) if !p.is_empty() => p,
             Ok(Ok(_)) => {
-                // Empty payload — controller sent а nominal response с
-                // empty body (shouldn't happen в well-formed flow).
+                // Empty payload — controller sent a nominal response with
+                // empty body (shouldn't happen in well-formed flow).
                 return Err(RendezvousClientError::EmptyResponse);
             }
             Ok(Err(_)) => return Err(RendezvousClientError::ChannelClosed),
@@ -2693,7 +2693,7 @@ impl NodeRuntime {
             .map_err(|e| RendezvousClientError::Verify(format!("inner: {e}")))?;
         // Defense-in-depth: also enforce target_pubkey is the right
         // shape (already covered by verify_ephemeral_endpoint_response
-        // через `from_bytes` но we double-check).
+        // through `from_bytes` but we double-check).
         let _ = VerifyingKey::from_bytes(&target_pubkey)
             .map_err(|e| RendezvousClientError::Verify(format!("bad target_pubkey: {e}")))?;
 
@@ -2918,23 +2918,23 @@ impl NodeRuntime {
     /// `target_app_id` + `target_endpoint_id` address the destination
     /// app endpoint at the receiver — same model as direct delivery
     /// (`AppMsg::AppSend`). Receiver's Final-hop dispatcher decodes
-    /// the payload as an [`veil_proto::AppDeliverPayload`] и feeds
+    /// the payload as an [`veil_proto::AppDeliverPayload`] and feeds
     /// it into the local `AppEndpointRegistry`
     /// so any IPC client bound to that endpoint receives the message
     /// through its existing `IncomingMessage` channel. No special
     /// "anonymity inbox" — apps don't need to know the message
-    /// arrived через onion.
+    /// arrived through onion.
     ///
     /// `src_app_id` is the sender's app handle that the receiver sees
     /// in `IncomingMessage.src_app_id`. Pass `[0u8; 32]` to identify
-    /// as "anonymous app" (receiver сможет identify только by content).
-    /// `src_node_id` always wire'ится как `[0u8; 32]` — the whole
+    /// as "anonymous app" (receiver can identify only by content).
+    /// `src_node_id` always wire'd as `[0u8; 32]` — the whole
     /// point of anonymity is to hide the sender's node_id; circuit
     /// design ensures the relays don't know it either.
     ///
     /// Errors out (without sending anything) when:
     /// * `hop_count == 0` or `> 5` (cell budget)
-    /// * `data` (после AppDeliverPayload framing) exceeds the
+    /// * `data` (after AppDeliverPayload framing) exceeds the
     ///   per-hop-count cap
     /// * fewer than `hop_count - 1` usable relays found in our
     ///   local routing table + DHT cache.
@@ -2960,7 +2960,7 @@ impl NodeRuntime {
         };
 
         // Wrap data in `AppDeliverPayload` so the receiver's
-        // Final-hop dispatcher can route к the addressed endpoint.
+        // Final-hop dispatcher can route to the addressed endpoint.
         // src_node_id stays zero — anonymity guarantees the receiver
         // does NOT learn the sender's node identity at this layer
         // (replies require a separate rendezvous flow).
@@ -3030,12 +3030,12 @@ impl NodeRuntime {
         };
 
         // Anti-censorship AS-diversity extractor — snapshots already-
-        // dialed peers' IPs от discovered_peers_cache + builds а
+        // dialed peers' IPs from discovered_peers_cache + builds a
         // node_id → /16 (IPv4) / /32 (IPv6) prefix map.  Used by the
-        // circuit picker к enforce "no two hops в the same /16" даже
-        // когда relay-directory wire format doesn't carry IP/ASN.
-        // Unknown relays получают `None` (graceful degradation —
-        // picker accepts them без а diversity gate).
+        // circuit picker to enforce "no two hops in the same /16" even
+        // when relay-directory wire format doesn't carry IP/ASN.
+        // Unknown relays get `None` (graceful degradation —
+        // picker accepts them without a diversity gate).
         let diversity_map = build_as_diversity_map(&self.discovered_peers_cache);
         let diversity_key_of =
             move |node_id: &[u8; 32]| -> Option<String> { diversity_map.get(node_id).cloned() };
@@ -3072,21 +3072,21 @@ impl NodeRuntime {
         Ok(())
     }
 
-    /// register an `auth_cookie` с the named
+    /// register an `auth_cookie` with the named
     /// rendezvous-relay node so inbound `IntroducePayload` frames
-    /// matching that cookie are forwarded к us over the established
+    /// matching that cookie are forwarded to us over the established
     /// OVL1 session.
     ///
-    /// Caller MUST already have a live session к `rendezvous_node_id`
+    /// Caller MUST already have a live session to `rendezvous_node_id`
     /// — typically by adding it as a configured peer or by dialing
-    /// out via `connect_peer(...)`. Без a session this is a
+    /// out via `connect_peer(...)`. Without a session this is a
     /// silent no-op (no synchronous error — receiver learns from
     /// "no traffic flowing" timeout). Receiver's anonymity_x25519_pk
-    /// is sent для audit/log purposes; the actual decryption uses
+    /// is sent for audit/log purposes; the actual decryption uses
     /// the local `anonymity_x25519_sk`.
     ///
-    /// Caller is responsible для periodically republishing the
-    /// matching `RendezvousAd` к DHT с this cookie + this rendezvous'
+    /// Caller is responsible for periodically republishing the
+    /// matching `RendezvousAd` to DHT with this cookie + this rendezvous'
     /// node_id + `receiver_x25519_pk`.
     pub fn register_with_rendezvous(&self, rendezvous_node_id: NodeId, auth_cookie: [u8; 16]) {
         use veil_anonymity::rendezvous::RegisterRendezvousPayload;
@@ -3122,14 +3122,14 @@ impl NodeRuntime {
 
     /// send an anonymous message via a rendezvous
     /// relay. Solves the CGN-NAT receiver problem: receiver does NOT
-    /// need direct inbound reachability — only an outbound session к
+    /// need direct inbound reachability — only an outbound session to
     /// the rendezvous, which the receiver opens normally.
     ///
     /// `ad` carries everything the sender needs: rendezvous_node_id
     /// receiver_node_id, auth_cookie, receiver_x25519_pk. Sender
-    /// builds an Introduce ciphertext encrypted к receiver_x25519_pk
+    /// builds an Introduce ciphertext encrypted to receiver_x25519_pk
     /// (rendezvous CANNOT decrypt — only the receiver can)
-    /// wraps it as IntroducePayload, и sends through onion-routed
+    /// wraps it as IntroducePayload, and sends through onion-routed
     /// Final-hop = rendezvous_node_id.
     ///
     /// Caller MUST verify `ad` (signature + freshness) before calling
@@ -3158,11 +3158,11 @@ impl NodeRuntime {
         };
         let app_deliver_bytes = app_deliver.encode();
 
-        // Step 2: seal к receiver_x25519_pk. Rendezvous cannot read
+        // Step 2: seal to receiver_x25519_pk. Rendezvous cannot read
         // this — only the receiver after their `decrypt_introduce`.
         // encrypt_introduce only fails on AEAD library error (vanishingly
         // rare); treat as PayloadTooLarge for surface-level error
-        // reporting (caller's recourse is the same: shrink payload или
+        // reporting (caller's recourse is the same: shrink payload or
         // retry).
         let ciphertext =
             encrypt_introduce(&app_deliver_bytes, &ad.receiver_x25519_pk).map_err(|_| {
@@ -3193,10 +3193,10 @@ impl NodeRuntime {
         payload_bytes.push(final_hop_kind::INTRODUCE);
         payload_bytes.extend_from_slice(&intro_bytes);
 
-        // Step 5: build + dispatch the onion cell с rendezvous_node_id
+        // Step 5: build + dispatch the onion cell with rendezvous_node_id
         // as the Final-hop target. Rendezvous's anonymity_x25519_pk
         // is needed for the outermost onion layer; we look it up from
-        // its directory entry (shipped в).
+        // its directory entry (shipped in).
         use veil_anonymity::{
             directory::{
                 DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
@@ -3256,8 +3256,8 @@ impl NodeRuntime {
             Some(estimated_ms.min(u32::MAX as f64) as u32)
         };
 
-        // Anti-censorship AS-diversity extractor (same shape как
-        // send_anonymous) — see the helper comments в that function.
+        // Anti-censorship AS-diversity extractor (same shape as
+        // send_anonymous) — see the helper comments in that function.
         let diversity_map = build_as_diversity_map(&self.discovered_peers_cache);
         let diversity_key_of =
             move |node_id: &[u8; 32]| -> Option<String> { diversity_map.get(node_id).cloned() };
@@ -3295,12 +3295,12 @@ impl NodeRuntime {
     /// so senders looking up `rendezvous_ad_dht_key(local_node_id)`
     /// always see a fresh entry.
     ///
-    /// Caller MUST also have an OVL1 session open к `rendezvous_node_id`
-    /// и have called `register_with_rendezvous` to register the cookie
+    /// Caller MUST also have an OVL1 session open to `rendezvous_node_id`
+    /// and have called `register_with_rendezvous` to register the cookie
     /// on the rendezvous side. This API only wires the DHT-publish
     /// half; the OVL1-session half is the caller's responsibility.
     ///
-    /// Idempotent: registering a second entry с the same
+    /// Idempotent: registering a second entry with the same
     /// `(rendezvous_node_id, auth_cookie)` replaces the validity
     /// window in-place rather than duplicating.
     pub fn register_rendezvous_publisher(
@@ -3318,11 +3318,11 @@ impl NodeRuntime {
     }
 
     /// same as [`Self::register_rendezvous_publisher`] but
-    /// associates а sealed push envelope с the publication. The
-    /// envelope (FCM/APNs token sealed для а trusted push-relay) is
-    /// embedded в every signed ad refresh until [`Self::set_rendezvous_push_envelope`]
+    /// associates a sealed push envelope with the publication. The
+    /// envelope (FCM/APNs token sealed for a trusted push-relay) is
+    /// embedded in every signed ad refresh until [`Self::set_rendezvous_push_envelope`]
     /// updates it OR the entry is unregistered. Empty `push_envelope`
-    /// is equivalent к the no-push API.
+    /// is equivalent to the no-push API.
     pub fn register_rendezvous_publisher_with_push(
         &self,
         rendezvous_node_id: [u8; 32],
@@ -3335,12 +3335,12 @@ impl NodeRuntime {
             auth_cookie,
             validity_window_secs,
             push_envelope,
-            // .10 slice 4.3.2: defaults к empty (HMAC opt-out — receiver
-            // upgrades via а separate IPC call wired in slice 4.3.3).
+            // .10 slice 4.3.2: defaults to empty (HMAC opt-out — receiver
+            // upgrades via a separate IPC call wired in slice 4.3.3).
             wake_hmac_envelope: Vec::new(),
         };
         let mut entries = lock!(self.anonymity.rendezvous_publisher_entries);
-        // Replace existing entry с same (rendezvous, cookie) pair.
+        // Replace existing entry with same (rendezvous, cookie) pair.
         if let Some(pos) = entries.iter().position(|e| {
             e.rendezvous_node_id == rendezvous_node_id && e.auth_cookie == auth_cookie
         }) {
@@ -3352,11 +3352,11 @@ impl NodeRuntime {
 
     /// update only the push envelope on an existing
     /// rendezvous-publisher entry (matched by `rendezvous_node_id` +
-    /// `auth_cookie`). Returns `true` если the entry was found и
-    /// updated; `false` если no matching entry exists (caller should
+    /// `auth_cookie`). Returns `true` if the entry was found and
+    /// updated; `false` if no matching entry exists (caller should
     /// register first). Use this when the FCM/APNs token rotates or
     /// the user toggles push notifications on/off — pass empty `Vec`
-    /// к clear push without disrupting the rendezvous publication.
+    /// to clear push without disrupting the rendezvous publication.
     pub fn set_rendezvous_push_envelope(
         &self,
         rendezvous_node_id: [u8; 32],
@@ -3376,15 +3376,15 @@ impl NodeRuntime {
     }
 
     /// Update only the wake-HMAC envelope on an existing rendezvous-
-    /// publisher entry (Epic 489.10 slice 4.3.4 — analog к
+    /// publisher entry (Epic 489.10 slice 4.3.4 — analog to
     /// [`Self::set_rendezvous_push_envelope`]).  Matched by
-    /// `(rendezvous_node_id, auth_cookie)`.  Returns `true` если the
-    /// entry was found и updated; `false` если no matching entry
+    /// `(rendezvous_node_id, auth_cookie)`.  Returns `true` if the
+    /// entry was found and updated; `false` if no matching entry
     /// exists (caller should register first).
     ///
     /// Use when the receiver's [`veil_crypto::wake_hmac::WakeHmacKey`]
     /// rotates (identity-epoch change OR opt-in / opt-out of HMAC
-    /// wakeup).  Pass empty `Vec` к clear the envelope без disrupting
+    /// wakeup).  Pass empty `Vec` to clear the envelope without disrupting
     /// the rendezvous publication (receiver falls back to the legacy
     /// rate-limited wake path).
     pub fn set_rendezvous_wake_hmac_envelope(
@@ -3406,9 +3406,9 @@ impl NodeRuntime {
     }
 
     /// drop a rendezvous publication. Stops the
-    /// maintenance tick от refreshing the corresponding ad; the
+    /// maintenance tick from refreshing the corresponding ad; the
     /// existing ad in DHT will lapse naturally on `valid_until`.
-    /// Returns `true` if the entry was found и removed.
+    /// Returns `true` if the entry was found and removed.
     pub fn unregister_rendezvous_publisher(
         &self,
         rendezvous_node_id: [u8; 32],
@@ -4130,9 +4130,9 @@ impl NodeServices {
         // walk any MigrationCert chain rooted at the
         // requested `node_id` until either a steady-state document is
         // reached or the depth/cycle bounds are hit. Each hop's cert
-        // signature is verified против the CURRENT document's master
+        // signature is verified against the CURRENT document's master
         // pubkey, so a sybil who only controls the DHT cannot forge a
-        // migration — they'd need the old master's secret к mint a
+        // migration — they'd need the old master's secret to mint a
         // cert binding their own pubkey.
         let mut current_node_id = node_id;
         let mut visited: Vec<[u8; 32]> = vec![current_node_id];
@@ -4236,8 +4236,8 @@ impl NodeServices {
             ALGO_ED25519, ALGO_ED25519_FALCON512_HYBRID, ALGO_FALCON512, IdentityDocument,
         };
 
-        // Tier-ranking helper duplicated locally (it lives privately в
-        // both migration.rs и resolver.rs; keeping a 5-line copy beats
+        // Tier-ranking helper duplicated locally (it lives privately in
+        // both migration.rs and resolver.rs; keeping a 5-line copy beats
         // making the function pub).
         fn tier_rank(algo: u8) -> u8 {
             match algo {
@@ -4256,9 +4256,9 @@ impl NodeServices {
             return Ok(None);
         }
 
-        // Need the OLD master pubkey к verify cert signatures. The
+        // Need the OLD master pubkey to verify cert signatures. The
         // previous hop's resolve_one_identity_doc just mirrored the
-        // current document into the local store; pull it back за
+        // current document into the local store; pull it back for
         // free (no second quorum round-trip).
         let doc_key = IdentityDocument::dht_key(&old_node_id);
         let old_master_b64 = match self.dht.get_local(&doc_key) {
@@ -4305,9 +4305,9 @@ impl NodeServices {
         {
             return Err(ResolveError::MigrationCertMalformed(msg));
         }
-        // All replicas signed но none verified — treat as "no
+        // All replicas signed but none verified — treat as "no
         // migration published" (defence against a sybil spamming
-        // junk under the cert key к stall name resolution).
+        // junk under the cert key to stall name resolution).
         Ok(best)
     }
 
@@ -4670,20 +4670,20 @@ impl NodeServices {
         None
     }
 
-    /// Anti-censorship: wrap а failed-direct dial through an operator-
+    /// Anti-censorship: wrap a failed-direct dial through an operator-
     /// configured SOCKS proxy (typically local Tor on
     /// `socks5://127.0.0.1:9050`).  Closes #22/#23/#27 partially —
-    /// Tor's exit nodes are в diverse ASes by design, so an AS-level
+    /// Tor's exit nodes are in diverse ASes by design, so an AS-level
     /// block on the operator's host is bypassed via the proxy hop.
     ///
-    /// Returns `None` если:
+    /// Returns `None` if:
     /// * `transport.outbound_socks_fallback_proxy` is unset (default —
     ///   feature opt-in)
-    /// * the primary URI's scheme cannot be wrapped в SOCKS
-    ///   (`Self::Quic`, `Self::Unix`, etc. — SOCKS5 is а TCP-only
+    /// * the primary URI's scheme cannot be wrapped in SOCKS
+    ///   (`Self::Quic`, `Self::Unix`, etc. — SOCKS5 is a TCP-only
     ///   transport)
-    /// * the proxy URL is unparseable as а SOCKS URI
-    /// * the proxy itself fails к connect (logged, returns None)
+    /// * the proxy URL is unparseable as a SOCKS URI
+    /// * the proxy itself fails to connect (logged, returns None)
     async fn socks_fallback_dial(
         &self,
         primary_uri: &TransportUri,
@@ -4693,8 +4693,8 @@ impl NodeServices {
         let (proxy_host, proxy_port, target_host, target_port) =
             crate::socks_fallback::compose_socks_fallback(proxy_str, primary_uri)?;
 
-        // Construct а `socks://<proxy>/<target_host>:<target_port>`
-        // URI и dial via the existing SOCKS transport.
+        // Construct a `socks://<proxy>/<target_host>:<target_port>`
+        // URI and dial via the existing SOCKS transport.
         let socks_uri_str = format!(
             "socks://{}:{}/{}:{}",
             proxy_host, proxy_port, target_host, target_port,
@@ -4807,7 +4807,7 @@ impl NodeServices {
                     {
                         // Anti-censorship: operator-configured SOCKS
                         // fallback (typically local Tor) succeeded
-                        // when both direct и NAT-traversal failed.
+                        // when both direct and NAT-traversal failed.
                         self.logger.info(
                             "peer.connect.socks_fallback_success",
                             format!("peer_id={peer_id} primary_err={primary_err_str}"),
@@ -5113,10 +5113,10 @@ pub fn spawn_inbound_session(
             // session resumption is always enabled post-removal
             // of NegotiatedCapabilities. Issue a ticket unconditionally.
             //
-            // audit MEDIUM: peer_instance_id зашит [0; 16] до того
-            // как sovereign-identity multi-instance metadata пройдёт через
+            // audit MEDIUM: peer_instance_id is hardcoded to [0; 16] until
+            // sovereign-identity multi-instance metadata passes through
             // handshake. When the handshake delivers peer's device/instance
-            // ID, replace `[0u8; 16]` с the real value к avoid AEAD nonce
+            // ID, replace `[0u8; 16]` with the real value to avoid AEAD nonce
             // reuse risk when two instances of the same identity resume
             // concurrently. See `TicketIssuer::issue_for_instance` docstring.
             let ticket_to_send = {
@@ -5192,10 +5192,10 @@ pub fn spawn_inbound_session(
                         .handoff
                         .auto_trigger_after_write_errors,
                 },
-                // Inbound side: we accepted а connection but don't have а
-                // dialable URI для the peer (their source IP+port is
+                // Inbound side: we accepted a connection but don't have a
+                // dialable URI for the peer (their source IP+port is
                 // ephemeral — see `inbound_transport` doc below).  Rotation-
-                // initiation always comes от the outbound side, so leaving
+                // initiation always comes from the outbound side, so leaving
                 // this `None` is correct (server side accepts handoffs but
                 // doesn't initiate them).
                 primary_uri: None,
@@ -5314,10 +5314,10 @@ pub fn listen_transport_context(
         ctx = ctx.with_server_identity_from_files(Path::new(cert), Path::new(key))?;
     }
     // Per-listener PSK override.  When the listen entry specifies its
-    // own `psk_file`, load that 32-byte PSK и override the cloned ctx's
+    // own `psk_file`, load that 32-byte PSK and override the cloned ctx's
     // `obfs4_psk`.  `Obfs4TcpTransport::bind` will then use the
-    // listener-specific PSK для verifying inbound MACs.  When не set,
-    // the global PSK от `transport.obfs4_psk_file` is preserved.
+    // listener-specific PSK for verifying inbound MACs.  When not set,
+    // the global PSK from `transport.obfs4_psk_file` is preserved.
     if let Some(ref path) = listen.psk_file {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
@@ -5330,14 +5330,14 @@ pub fn listen_transport_context(
         })?;
         let decoded = BASE64.decode(raw.trim()).map_err(|e| {
             veil_cfg::ConfigError::ValidationFailed(format!(
-                "listen {} psk_file: invalid base64 в {}: {e}",
+                "listen {} psk_file: invalid base64 in {}: {e}",
                 listen.listen_id,
                 path.display()
             ))
         })?;
         if decoded.len() != 32 {
             return Err(veil_cfg::ConfigError::ValidationFailed(format!(
-                "listen {} psk_file: expected 32 bytes, got {} в {}",
+                "listen {} psk_file: expected 32 bytes, got {} in {}",
                 listen.listen_id,
                 decoded.len(),
                 path.display()
@@ -5406,9 +5406,9 @@ mod listen_visibility_tests {
     }
 
     /// Mixed config: public listener advertised, trusted listener skipped.
-    /// Demonstrates the common deployment где node hosts ОДНОВРЕМЕННО
-    /// а public listener (для general network) + а family-only listener
-    /// (for relatives, не gossiped).
+    /// Demonstrates the common deployment where node hosts SIMULTANEOUSLY
+    /// a public listener (for general network) + a family-only listener
+    /// (for relatives, not gossiped).
     #[test]
     fn mixed_visibility_only_advertises_public() {
         let mut cfg = Config::default();
@@ -5512,7 +5512,7 @@ mod listen_psk_tests {
         std::fs::remove_file(path).ok();
     }
 
-    /// PSK file с wrong length → error (not silent fallback).
+    /// PSK file with wrong length → error (not silent fallback).
     #[test]
     fn psk_file_wrong_length_rejected() {
         use base64::Engine;
@@ -5528,7 +5528,7 @@ mod listen_psk_tests {
         std::fs::remove_file(path).ok();
     }
 
-    /// PSK file с invalid base64 → error.
+    /// PSK file with invalid base64 → error.
     #[test]
     fn psk_file_invalid_base64_rejected() {
         let path = write_psk_file("!!!not valid base64!!!");
@@ -5546,15 +5546,15 @@ pub fn lock_state(state: &Arc<Mutex<NodeState>>) -> MutexGuard<'_, NodeState> {
 }
 
 /// Anti-censorship AS-diversity extractor: snapshots already-dialed
-/// peers' IPs от `discovered_peers_cache` и builds а node_id → prefix
+/// peers' IPs from `discovered_peers_cache` and builds a node_id → prefix
 /// map.  Returned Strings have the form `"v4:a.b"` (first 16 bits of
-/// IPv4) или `"v6:xxxx:yyyy"` (first 32 bits of IPv6).  Unknown peers
-/// (никогда не dialed) absent от the map — `pick_circuit_hops_*_with_diversity`
-/// degrades gracefully на None keys.
+/// IPv4) or `"v6:xxxx:yyyy"` (first 32 bits of IPv6).  Unknown peers
+/// (never not dialed) absent from the map — `pick_circuit_hops_*_with_diversity`
+/// degrades gracefully on None keys.
 ///
 /// Anti-censorship Epic 482.x wire-up: closes "adversary controls 3+
-/// relays в one /16" vector — picker enforces distinct /16s даже
-/// когда relay-directory wire format doesn't carry IP/ASN.  See
+/// relays in one /16" vector — picker enforces distinct /16s even
+/// when relay-directory wire format doesn't carry IP/ASN.  See
 /// `crates/veil-anonymity/src/sender.rs::build_outbound_anonymous_cell_with_diversity`
 /// for the consumer side.
 pub fn build_as_diversity_map(
@@ -5565,7 +5565,7 @@ pub fn build_as_diversity_map(
     let cache = lock!(discovered_peers_cache);
     for peer in cache.snapshot() {
         // `BootstrapPeer.public_key` is base64; we need node_id (raw
-        // 32 bytes) для the map key.  Derive node_id = BLAKE3(pubkey).
+        // 32 bytes) for the map key.  Derive node_id = BLAKE3(pubkey).
         let pk_b64 = peer.public_key.as_str();
         use base64::{Engine, engine::general_purpose::STANDARD};
         let pk_bytes = match STANDARD.decode(pk_b64) {
@@ -5574,7 +5574,7 @@ pub fn build_as_diversity_map(
         };
         let node_id: [u8; 32] = *blake3::hash(&pk_bytes).as_bytes();
 
-        // Extract IP host от the transport URI и derive а prefix key.
+        // Extract IP host from the transport URI and derive a prefix key.
         let Ok(uri) = TransportUri::parse(&peer.transport) else {
             continue;
         };
@@ -5587,8 +5587,8 @@ pub fn build_as_diversity_map(
             let seg = v6.segments();
             map.insert(node_id, format!("v6:{:04x}:{:04x}", seg[0], seg[1]));
         }
-        // Hostname (non-numeric) — skip; resolving к IP would need
-        // а live DNS lookup которое не fits во в-memory closure path.
+        // Hostname (non-numeric) — skip; resolving to IP would need
+        // a live DNS lookup which does not fit into the in-memory closure path.
     }
     map
 }
@@ -5664,10 +5664,10 @@ pub fn build_advertised_transports(config: &Config) -> Vec<String> {
         .iter()
         .filter(|l| {
             // **Visibility gate** (Phase 3): only `Public` listeners get
-            // their transports advertised через PEX + DHT (`SignedTransport-
+            // their transports advertised through PEX + DHT (`SignedTransport-
             // Announcement` publish + `ResolveTransport` responses).
-            // `Trusted` и `Hidden` listeners stay invisible на the
-            // network — peers learn о них только через invite-bundles.
+            // `Trusted` and `Hidden` listeners stay invisible on the
+            // network — peers learn about them only through invite-bundles.
             l.visibility.is_advertisable()
         })
         .filter_map(|l| {
@@ -5698,7 +5698,7 @@ pub fn build_advertised_transports(config: &Config) -> Vec<String> {
 /// must set an explicit non-zero value (e.g. `u64::MAX` for per-sender).
 /// Pre-fix `quota_per_sender_bytes == 0` mapped to `u64::MAX`, which made
 /// the default-config deployment silently unsafe — one OVL1 sender could
-/// fill a receiver's 100 MiB cap в ~2 min.
+/// fill a receiver's 100 MiB cap in ~2 min.
 pub fn build_mailbox_runtime_config(
     cfg: &veil_cfg::MailboxConfig,
     local_node_id: [u8; 32],

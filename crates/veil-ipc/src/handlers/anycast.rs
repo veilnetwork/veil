@@ -1,13 +1,13 @@
-//! Anycast и transport-hint handlers.
+//! Anycast and transport-hint handlers.
 //!
 //! Anycast: service-tag → candidate node-ids resolution.  Apps advertise
-//! themselves as serving а tag (`AnycastAdvertise`), withdraw later
-//! (`AnycastWithdraw`), и other apps look up по tag (`AnycastResolve`).
-//! When no `AnycastService` is wired the resolve returns an empty list и
+//! themselves as serving a tag (`AnycastAdvertise`), withdraw later
+//! (`AnycastWithdraw`), and other apps look up by tag (`AnycastResolve`).
+//! When no `AnycastService` is wired the resolve returns an empty list and
 //! advertise / withdraw silently no-op (feature off gracefully).
 //!
 //! Transport-hint query: returns the daemon's per-scheme connect-success
-//! rates so apps can prefer а transport that's currently working better.
+//! rates so apps can prefer a transport that's currently working better.
 //! When no `TransportHintRegistry` is wired the result is empty.
 
 use std::sync::Arc;

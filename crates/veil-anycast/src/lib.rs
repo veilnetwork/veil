@@ -17,7 +17,7 @@
 //! # Security considerations — discovery layer with optional owner-signing
 //!
 //! `AnycastRecord.score` is **peer-controlled**: a node can claim `score = 0`
-//! to win anycast traffic for а service tag. Two shipped layers bound the abuse,
+//! to win anycast traffic for a service tag. Two shipped layers bound the abuse,
 //! and one honesty gap remains deferred.
 //!
 //! ## Owner-signing (shipped)
@@ -50,11 +50,11 @@
 //! ## Acceptable use
 //!
 //! Use `AnycastService` for:
-//! **Best-effort service discovery** in environments где the worst-case
-//! outcome of а sybil capture is "client falls back к а direct lookup
-//! on the known service identity" — i.e. anycast is а latency-saving
-//! hint, not а trust anchor.
-//! **Sharded internal infrastructure** где the resolver и provider are
+//! **Best-effort service discovery** in environments where the worst-case
+//! outcome of a sybil capture is "client falls back to a direct lookup
+//! on the known service identity" — i.e. anycast is a latency-saving
+//! hint, not a trust anchor.
+//! **Sharded internal infrastructure** where the resolver and provider are
 //! under the same operator's control (sybil attacks require attacker
 //! control of the resolver's local DHT view, which they don't have).
 //!
@@ -64,10 +64,10 @@
 //! resolve via signed records ([`veil_proto::identity_document`]
 //! [`veil_proto::name_claim_v2`]) instead.
 //! **Bootstrap discovery** of seed peers in untrusted environments —
-//! use [`veil_proto::transport_hints`] (signed-by-issuer) или the
-//! bootstrap-bundle path с pinned `BUILTIN_SEEDS`.
-//! **First-time service-owner authentication** — а sybil might be the
-//! first record returned; the caller has no way к tell who the canonical
+//! use [`veil_proto::transport_hints`] (signed-by-issuer) or the
+//! bootstrap-bundle path with pinned `BUILTIN_SEEDS`.
+//! **First-time service-owner authentication** — a sybil might be the
+//! first record returned; the caller has no way to tell who the canonical
 //! owner is until owner-signing lands.
 
 use std::sync::Arc;
@@ -82,16 +82,16 @@ pub use reputation::AnycastReputation;
 
 // ── Policy ────────────────────────────────────────────────────────────────────
 
-/// Resolution policy applied к [`AnycastService::resolve`].
+/// Resolution policy applied to [`AnycastService::resolve`].
 ///
 /// The IPC anycast handler routes through `resolve`, so this controls the
-/// daemon-wide trust posture для anycast lookups regardless of каких
+/// daemon-wide trust posture for anycast lookups regardless of any
 /// service tags they target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AnycastResolvePolicy {
-    /// Accept ANY record (signed или unsigned).  A Sybil publishing an unsigned
-    /// record с `score = 0` wins resolution если they're XOR-close to the
-    /// resolver (mitigation: their identity remains а sybil cost).  Use это для
+    /// Accept ANY record (signed or unsigned).  A Sybil publishing an unsigned
+    /// record with `score = 0` wins resolution if they're XOR-close to the
+    /// resolver (mitigation: their identity remains a sybil cost).  Use this for
     /// legacy / discovery-only deployments.
     ///
     /// audit cycle-6 (T2): no longer the default — secure-by-default is now the
@@ -99,30 +99,30 @@ pub enum AnycastResolvePolicy {
     /// deployments to preserve). Opt down to `BestEffort` explicitly for
     /// discovery-only use.
     BestEffort,
-    /// Return ONLY candidates с а valid owner-signed Ed25519 record
-    /// ([`AnycastRecord::verify_signature`]).  Unsigned (v1) records ара
-    /// silently dropped.  Use это для trust-sensitive routing (mailbox,
+    /// Return ONLY candidates with a valid owner-signed Ed25519 record
+    /// ([`AnycastRecord::verify_signature`]).  Unsigned (v1) records are
+    /// silently dropped.  Use this for trust-sensitive routing (mailbox,
     /// payment, service-discovery in production).  Operators publishing
     /// service records MUST call [`AnycastService::advertise_signed`].
     ///
-    /// **Caveat**: this policy verifies signature INTEGRITY only — а
-    /// sybil can mint а valid signature под their own key while claiming
+    /// **Caveat**: this policy verifies signature INTEGRITY only — a
+    /// sybil can mint a valid signature under their own key while claiming
     /// another node's `node_id`, and `SignedOnly` will accept it.  For
     /// closing that gap use [`AnycastResolvePolicy::SignedBound`].
     SignedOnly,
-    /// Return ONLY candidates с а valid signature AND а provable
-    /// owner-binding (`BLAKE3(owner_pubkey) == node_id`, см.
+    /// Return ONLY candidates with a valid signature AND a provable
+    /// owner-binding (`BLAKE3(owner_pubkey) == node_id`, see.
     /// [`AnycastRecord::verify_owner_binding`]).  Records whose signature
-    /// is valid but whose embedded pubkey does NOT hash к the claimed
-    /// `node_id` ара dropped — this closes the "forge the binding while
-    /// signing с your own key" sybil vector що `SignedOnly` cannot
+    /// is valid but whose embedded pubkey does NOT hash to the claimed
+    /// `node_id` are dropped — this closes the "forge the binding while
+    /// signing with your own key" sybil vector that `SignedOnly` cannot
     /// detect.  Records using sovereign-identity subkeys
-    /// (`sig_key_idx > 0`) ара also dropped because verifying them
+    /// (`sig_key_idx > 0`) are also dropped because verifying them
     /// requires an async DHT identity-document lookup, which doesn't fit
-    /// the synchronous `resolve` API; callers що need subkey support
+    /// the synchronous `resolve` API; callers that need subkey support
     /// should use `SignedOnly` + perform the identity-doc check themselves.
     ///
-    /// Use this for trust-sensitive routing где the cost of accepting а
+    /// Use this for trust-sensitive routing where the cost of accepting a
     /// spoofed-binding record is high (e.g. mailbox-routing of PII,
     /// payment-channel endpoint discovery, sovereign identity-bound
     /// service-discovery). audit cycle-6 (T2): this is now the DEFAULT.
@@ -134,18 +134,18 @@ pub enum AnycastResolvePolicy {
 
 /// Anycast service-address resolution engine.
 ///
-/// Clone-cheap: wraps an `Arc<KademliaService>` и an `Arc<AnycastReputation>`.
+/// Clone-cheap: wraps an `Arc<KademliaService>` and an `Arc<AnycastReputation>`.
 #[derive(Clone)]
 pub struct AnycastService {
     dht: Arc<KademliaService>,
     local_node_id: [u8; 32],
     reputation: Arc<AnycastReputation>,
     policy: AnycastResolvePolicy,
-    /// Audit batch 2026-05-25 phase O: optional sovereign signing key для
+    /// Audit batch 2026-05-25 phase O: optional sovereign signing key for
     /// auto-signing IPC-initiated advertisements.  When `Some`, [`Self::
-    /// advertise`] writes а v2 signed record (с the supplied
-    /// `sig_key_idx`); when `None`, advertise stays на the legacy
-    /// unsigned v1 path для backwards-compatibility with peers that
+    /// advertise`] writes a v2 signed record (with the supplied
+    /// `sig_key_idx`); when `None`, advertise stays on the legacy
+    /// unsigned v1 path for backwards-compatibility with peers that
     /// don't have sovereign identity wired.  Set via [`Self::with_
     /// signing_key`] at daemon startup once the sovereign master
     /// signing key is loaded.
@@ -163,9 +163,9 @@ impl AnycastService {
         }
     }
 
-    /// Construct с а pre-existing reputation slice. Use when the caller
-    /// wants к share one ledger across multiple `AnycastService` instances
-    /// (e.g. testing, or а node що splits resolution between several
+    /// Construct with a pre-existing reputation slice. Use when the caller
+    /// wants to share one ledger across multiple `AnycastService` instances
+    /// (e.g. testing, or a node that splits resolution between several
     /// service-tag families but wants unified penalty accounting).
     pub fn with_reputation(
         dht: Arc<KademliaService>,
@@ -184,7 +184,7 @@ impl AnycastService {
     /// Replace the runtime resolution policy.  Builder-style; returns
     /// `Self` so callers can chain after `new` / `with_reputation`.
     /// Daemons construct AnycastService from config and chain this
-    /// к match the operator's trust posture.
+    /// to match the operator's trust posture.
     #[must_use]
     pub fn with_policy(mut self, policy: AnycastResolvePolicy) -> Self {
         self.policy = policy;
@@ -192,10 +192,10 @@ impl AnycastService {
     }
 
     /// Audit batch 2026-05-25 phase O (cross-audit #3 closure): wire
-    /// в the daemon's sovereign signing key so all subsequent
+    /// in the daemon's sovereign signing key so all subsequent
     /// `advertise()` calls — including those initiated through the
     /// IPC `AnycastAdvertise` opcode — publish v2 signed records.
-    /// Closes the cross-audit gap где IPC apps published unsigned v1
+    /// Closes the cross-audit gap where IPC apps published unsigned v1
     /// records that were silently dropped by resolvers running
     /// `SignedOnly` / `SignedBound` policy.
     ///
@@ -214,15 +214,15 @@ impl AnycastService {
         self
     }
 
-    /// Current resolve policy.  Surfaced для diagnostic /
+    /// Current resolve policy.  Surfaced for diagnostic /
     /// admin-debug commands.
     pub fn policy(&self) -> AnycastResolvePolicy {
         self.policy
     }
 
-    /// Access the underlying reputation ledger. Callers что observe а
+    /// Access the underlying reputation ledger. Callers that observe a
     /// failed resolve (timeout, conn-refused, wrong response) should
-    /// invoke [`AnycastReputation::record_failure`] так что the offending
+    /// invoke [`AnycastReputation::record_failure`] so that the offending
     /// node gets penalized on the next sort.
     pub fn reputation(&self) -> &Arc<AnycastReputation> {
         &self.reputation
@@ -235,10 +235,10 @@ impl AnycastService {
     /// Call periodically (every `ttl_secs / 2`) to keep the entry fresh.
     pub fn advertise(&self, service_tag: [u8; 4], score: u16, ttl_secs: u32) {
         // Audit batch 2026-05-25 phase O: auto-sign if the daemon
-        // wired а signing key через `with_signing_key`.  IPC apps
+        // wired a signing key through `with_signing_key`.  IPC apps
         // calling `AnycastAdvertise` keep their existing wire format
-        // (unsigned IPC payload), но the daemon-side advertise now
-        // produces а signed v2 DHT record так что resolvers running
+        // (unsigned IPC payload), but the daemon-side advertise now
+        // produces a signed v2 DHT record so that resolvers running
         // `SignedOnly` / `SignedBound` admit it.  Cross-audit #3.
         if let Some((sk, idx)) = &self.signing_key {
             self.advertise_signed(service_tag, score, ttl_secs, *idx, sk);
@@ -256,19 +256,19 @@ impl AnycastService {
             node_id: self.local_node_id,
             score,
             ttl: ttl_secs,
-            // Legacy v1 advertise — see `advertise_signed` для v2 owner-signed records.
+            // Legacy v1 advertise — see `advertise_signed` for v2 owner-signed records.
             signature: None,
         });
         self.dht.store_local(key, list.encode());
     }
 
-    /// **v2 owner-signed** advertise. Publishes а record signed с the
-    /// supplied Ed25519 key; resolvers с trust-sensitive policy can
-    /// reject unsigned (v1) records или records с signatures that don't
-    /// verify. Recommended для service-discovery in production.
+    /// **v2 owner-signed** advertise. Publishes a record signed with the
+    /// supplied Ed25519 key; resolvers with trust-sensitive policy can
+    /// reject unsigned (v1) records or records with signatures that don't
+    /// verify. Recommended for service-discovery in production.
     ///
-    /// Caller is responsible для making sure `signing_key`'s pubkey is
-    /// bound к `self.local_node_id` (typically through а sovereign
+    /// Caller is responsible for making sure `signing_key`'s pubkey is
+    /// bound to `self.local_node_id` (typically through a sovereign
     /// identity document). Without that binding the signature is only
     /// integrity-attestation, not ownership-attestation.
     pub fn advertise_signed(
@@ -338,14 +338,14 @@ impl AnycastService {
     }
 
     /// **Signed-only** variant. Returns ONLY candidates whose record carries
-    /// а valid Ed25519 owner-signature ([`AnycastRecord::verify_signature`]).
-    /// Use for trust-sensitive routing где accepting unsigned (v1) records
+    /// a valid Ed25519 owner-signature ([`AnycastRecord::verify_signature`]).
+    /// Use for trust-sensitive routing where accepting unsigned (v1) records
     /// would re-open the score=0 sybil vector. Sigs are verified per-record
-    /// inline; failure-к-verify silently drops the record (no error
+    /// inline; failure-to-verify silently drops the record (no error
     /// surfaced — same FIFO semantics as malformed records).
     ///
-    /// Caller is responsible separately для checking that the embedded
-    /// `owner_pubkey` corresponds к the claimed `node_id` (identity binding);
+    /// Caller is responsible separately for checking that the embedded
+    /// `owner_pubkey` corresponds to the claimed `node_id` (identity binding);
     /// this method only validates signature integrity, not ownership.
     /// Use [`Self::resolve_signed_bound`] when the daemon should also
     /// enforce the `BLAKE3(owner_pubkey) == node_id` binding.
@@ -363,11 +363,11 @@ impl AnycastService {
     }
 
     /// **Signed + owner-bound** variant.  Returns ONLY candidates whose
-    /// record carries а valid Ed25519 signature AND whose embedded
-    /// `owner_pubkey` provably corresponds к the claimed `node_id` via
+    /// record carries a valid Ed25519 signature AND whose embedded
+    /// `owner_pubkey` provably corresponds to the claimed `node_id` via
     /// [`AnycastRecord::verify_owner_binding`] (`BLAKE3(owner_pubkey) ==
     /// node_id`, `sig_key_idx == 0`).  Use for trust-sensitive routing
-    /// где а sybil with their own valid Ed25519 key MUST NOT be able к
+    /// where a sybil with their own valid Ed25519 key MUST NOT be able to
     /// claim someone else's `node_id`.
     pub fn resolve_signed_bound(
         &self,
@@ -391,21 +391,21 @@ impl AnycastService {
     ) -> AnycastResultPayload {
         let key = AnycastRecord::dht_key(service_tag);
         // Audit batch 2026-05-25 phase N: per-record TTL enforcement.
-        // Pre-fix, `AnycastRecord::ttl` was declared в the wire format
-        // но not consulted on resolve — stale records survived in the
+        // Pre-fix, `AnycastRecord::ttl` was declared in the wire format
+        // but not consulted on resolve — stale records survived in the
         // store until the DHT-wide TTL evicted them (potentially
-        // hours).  Resolves were returning routes к long-departed
-        // publishers, producing blackholes у destinations что had
+        // hours).  Resolves were returning routes to long-departed
+        // publishers, producing blackholes at destinations that had
         // long since stopped advertising.  Now we fetch the entry's
         // hot-tier `inserted_at` via `get_local_with_meta`, compute
-        // age, и drop records where `age >= record.ttl`.  No wire
-        // change — the `ttl` field always existed в the record.
+        // age, and drop records where `age >= record.ttl`.  No wire
+        // change — the `ttl` field always existed in the record.
         let entry = self.dht.get_local_with_meta(&key);
         let now = std::time::Instant::now();
         // (node_id, effective_score) — effective_score = peer-claimed score
         // PLUS resolver-local reputation penalty. u32 not u16 because
         // saturating-add of repeated failures can overflow the u16 score
-        // domain — we don't need the original score back, only а stable
+        // domain — we don't need the original score back, only a stable
         // sort key, so widening is safe.
         let mut candidates: Vec<([u8; 32], u32)> = entry
             .map(|(b, inserted_at)| {
@@ -414,10 +414,10 @@ impl AnycastService {
                     .0
                     .into_iter()
                     .filter(|r| {
-                        // Per-record TTL: drop expired.  TTL=0 в the
-                        // wire format means "no TTL", treated как
-                        // "always fresh" для backwards compatibility
-                        // с pre-fix records.
+                        // Per-record TTL: drop expired.  TTL=0 in the
+                        // wire format means "no TTL", treated as
+                        // "always fresh" for backwards compatibility
+                        // with pre-fix records.
                         if r.ttl > 0 && age.as_secs() >= r.ttl as u64 {
                             return false;
                         }
@@ -431,7 +431,7 @@ impl AnycastService {
                         if !require_signed {
                             return true;
                         }
-                        // Trust-policy gate: drop unsigned records и records
+                        // Trust-policy gate: drop unsigned records and records
                         // whose embedded sig doesn't verify under owner_pubkey.
                         r.verify_signature().is_ok()
                     })
@@ -450,9 +450,9 @@ impl AnycastService {
         // priority; but tied scores (incl. attacker-fabricated `0`) fall
         // back to the resolver-specific XOR ordering, which Sybil can't
         // game uniformly. Reputation penalty stacks on top of score
-        // so misbehaving peers drop below honest tiers after а handful of
+        // so misbehaving peers drop below honest tiers after a handful of
         // observed failures (see `reputation::FAILURE_PENALTY_PER`).
-        // Final tiebreak by node_id keeps determinism для true ties.
+        // Final tiebreak by node_id keeps determinism for true ties.
         let local = self.local_node_id;
         candidates.sort_by(|a, b| {
             a.1.cmp(&b.1)
@@ -527,7 +527,7 @@ mod tests {
         let key = make_signing_key(0x42);
         let r = AnycastRecord::sign(*b"mbox", [0xAA; 32], 5, 3600, 0, &key);
         let mut blob = r.encode();
-        // Flip а byte в score field (offset 38 = bytes 38..40 score).
+        // Flip a byte in score field (offset 38 = bytes 38..40 score).
         blob[38] ^= 0x01;
         let tampered = AnycastRecord::decode(&blob).unwrap();
         // Sig must reject the tampered record.
@@ -538,7 +538,7 @@ mod tests {
     fn v2_wrong_key_rejected() {
         let key_a = make_signing_key(0xAA);
         let key_b = make_signing_key(0xBB);
-        // Sign с key_a but overwrite owner_pubkey with key_b's.
+        // Sign with key_a but overwrite owner_pubkey with key_b's.
         let mut r = AnycastRecord::sign(*b"mbox", [0xAA; 32], 5, 3600, 0, &key_a);
         if let Some(s) = r.signature.as_mut() {
             s.owner_pubkey = key_b.verifying_key().to_bytes();
@@ -588,9 +588,9 @@ mod tests {
     fn resolve_signed_only_filters_v1_records() {
         let svc = make_service(0xCC);
         let key = make_signing_key(0xCC);
-        // Advertise один unsigned (legacy) + один signed.
+        // Advertise one unsigned (legacy) + one signed.
         svc.advertise(*b"mbox", 10, 3600);
-        // Add а second signed entry under а different node_id manually.
+        // Add a second signed entry under a different node_id manually.
         let dht_key = AnycastRecord::dht_key(*b"mbox");
         let mut list = AnycastList::decode(&svc.dht.get_local(&dht_key).unwrap_or_default());
         list.upsert(AnycastRecord::sign(*b"mbox", [0xDD; 32], 5, 3600, 0, &key));
@@ -604,10 +604,10 @@ mod tests {
         assert_eq!(r_signed.node_ids[0], [0xDD; 32]);
     }
 
-    /// `with_policy(SignedOnly)` makes `resolve()` behave как
-    /// `resolve_signed_only` без needing а separate IPC opcode.  Closes
-    /// the audit-flagged gap "anycast hardening частично реализован но
-    /// IPC/runtime использует обычный resolve" (Phase C11, 2026-05-22).
+    /// `with_policy(SignedOnly)` makes `resolve()` behave as
+    /// `resolve_signed_only` without needing a separate IPC opcode.  Closes
+    /// the audit-flagged gap "anycast hardening partially implemented but
+    /// IPC/runtime uses the ordinary resolve" (Phase C11, 2026-05-22).
     #[test]
     fn resolve_with_signed_only_policy_filters_v1() {
         let svc = make_service(0xCC).with_policy(AnycastResolvePolicy::SignedOnly);
@@ -624,7 +624,7 @@ mod tests {
     }
 
     /// `with_policy(BestEffort)` retains default behaviour — both
-    /// signed и unsigned records returned.
+    /// signed and unsigned records returned.
     #[test]
     fn resolve_with_best_effort_policy_returns_all() {
         let svc = make_service(0xCC).with_policy(AnycastResolvePolicy::BestEffort);
@@ -701,13 +701,13 @@ mod tests {
     }
 
     /// Audit batch 2026-05-25 phase N: per-record TTL must filter
-    /// stale records on resolve.  Pre-fix the `ttl` field в the
+    /// stale records on resolve.  Pre-fix the `ttl` field in the
     /// wire record was advisory only — resolve returned expired
     /// records until the DHT-wide TTL evicted them (potentially
     /// hours).  Now resolve drops records whose `age >= ttl`.
     ///
-    /// Uses а 1-second TTL + 1.2-second sleep к keep the test fast
-    /// while still crossing the boundary с some margin для CI
+    /// Uses a 1-second TTL + 1.2-second sleep to keep the test fast
+    /// while still crossing the boundary with some margin for CI
     /// scheduler jitter.
     #[test]
     fn resolve_drops_records_past_their_ttl() {
@@ -715,25 +715,21 @@ mod tests {
         svc.advertise(*b"ttl0", 7, 1); // 1 s record TTL
         // Immediate resolve sees the record.
         let immediate = svc.resolve(*b"ttl0", 8);
-        assert_eq!(
-            immediate.node_ids.len(),
-            1,
-            "fresh record должен быть returned"
-        );
-        // Cross the TTL boundary с margin для slow CI runners.
+        assert_eq!(immediate.node_ids.len(), 1, "fresh record must be returned");
+        // Cross the TTL boundary with margin for slow CI runners.
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let expired = svc.resolve(*b"ttl0", 8);
         assert_eq!(
             expired.node_ids.len(),
             0,
-            "expired record должен быть filtered out"
+            "expired record must be filtered out"
         );
     }
 
     /// TTL=0 means "no per-record expiry"; resolve preserves
     /// pre-phase-N behaviour where records lived until DHT eviction.
-    /// Backwards-compat для records published by pre-fix peers что не
-    /// set а meaningful ttl.
+    /// Backwards-compat for records published by pre-fix peers that did not
+    /// set a meaningful ttl.
     #[test]
     fn resolve_keeps_ttl_zero_records_indefinitely() {
         let svc = make_service(0xE2);
@@ -744,7 +740,7 @@ mod tests {
     }
 
     /// Audit batch 2026-05-25 phase O: `with_signing_key` makes
-    /// `advertise()` auto-publish а v2 signed record so `SignedOnly`
+    /// `advertise()` auto-publish a v2 signed record so `SignedOnly`
     /// / `SignedBound` resolvers admit it.  Without the signing key
     /// (default state) advertise stays on the legacy v1 path.
     #[test]
@@ -759,18 +755,18 @@ mod tests {
             .with_signing_key(Arc::new(key.clone()), 0);
 
         svc.advertise(*b"sig1", 11, 3600);
-        // Inspect what we wrote in DHT — must be а v2 signed record.
+        // Inspect what we wrote in DHT — must be a v2 signed record.
         let dht_key = AnycastRecord::dht_key(*b"sig1");
         let blob = dht.get_local(&dht_key).expect("DHT entry present");
         let list = AnycastList::decode(&blob);
         assert_eq!(list.0.len(), 1, "exactly one local record");
         assert!(
             list.0[0].signature.is_some(),
-            "with_signing_key должен produce а v2 signed record"
+            "with_signing_key must produce a v2 signed record"
         );
         assert!(
             list.0[0].verify_signature().is_ok(),
-            "signature должна verify under embedded owner_pubkey"
+            "signature must verify under embedded owner_pubkey"
         );
 
         // SignedOnly resolve should admit our own record.
@@ -796,7 +792,7 @@ mod tests {
     fn reputation_penalty_demotes_misbehaver() {
         // Sybil-style scenario: attacker advertises score=0 (best),
         // honest node advertises score=300. By default sybil wins.
-        // After а few recorded failures against the sybil, honest
+        // After a few recorded failures against the sybil, honest
         // node should sort above it.
         let dht = Arc::new(KademliaService::new([0xA0; 32]));
         let resolver = AnycastService::new(Arc::clone(&dht), [0xA0; 32])
@@ -824,14 +820,14 @@ mod tests {
         );
         assert_eq!(before.node_ids[1], [0x11; 32]);
 
-        // Record а failure против sybil. Single failure = +500 penalty,
+        // Record a failure against sybil. Single failure = +500 penalty,
         // so effective score 0 + 500 = 500 > honest 300 → honest wins.
         resolver.reputation().record_failure([0xFF; 32], tag);
 
         let after = resolver.resolve(tag, 8);
         assert_eq!(
             after.node_ids[0], [0x11; 32],
-            "honest promoted над penalized sybil"
+            "honest promoted over penalized sybil"
         );
         assert_eq!(after.node_ids[1], [0xFF; 32]);
     }
@@ -865,14 +861,14 @@ mod tests {
         let mbox = resolver.resolve(*b"mbox", 8);
         assert_eq!(mbox.node_ids[0], [0x11; 32]);
 
-        // "gate" → candidate still wins (no penalty там).
+        // "gate" → candidate still wins (no penalty there).
         let gate = resolver.resolve(*b"gate", 8);
         assert_eq!(gate.node_ids[0], [0xFF; 32]);
     }
 
     // ── SignedBound policy (audit batch 2026-05-23) ────────────────
 
-    /// Derive а node_id от an Ed25519 signing-key the same way the
+    /// Derive a node_id from an Ed25519 signing-key the same way the
     /// production sovereign-identity layer does (`BLAKE3(pubkey)`).
     fn bound_node_id_for(key: &SigningKey) -> [u8; 32] {
         *blake3::hash(&key.verifying_key().to_bytes()).as_bytes()
@@ -880,17 +876,17 @@ mod tests {
 
     #[test]
     fn resolve_signed_bound_filters_unbound_records() {
-        // Build а DHT containing three records under one service tag:
+        // Build a DHT containing three records under one service tag:
         //   1. Signed + BOUND   (BLAKE3(pubkey) == node_id) — kept
-        //   2. Signed + UNBOUND (claims а foreign node_id)   — dropped
+        //   2. Signed + UNBOUND (claims a foreign node_id)   — dropped
         //   3. Unsigned v1                                    — dropped
         let key_bound = make_signing_key(0x11);
         let bound_node_id = bound_node_id_for(&key_bound);
         let key_unbound = make_signing_key(0x22);
-        // node_id is а foreign value, NOT derived от key_unbound.
+        // node_id is a foreign value, NOT derived from key_unbound.
         let unbound_node_id = [0xEE; 32];
 
-        // svc uses а fresh DHT; we'll write all 3 records directly.
+        // svc uses a fresh DHT; we'll write all 3 records directly.
         let dht = Arc::new(KademliaService::new([0xA0; 32]));
         let svc = AnycastService::new(Arc::clone(&dht), [0xA0; 32]);
         let dht_key = AnycastRecord::dht_key(*b"mbox");
@@ -912,7 +908,7 @@ mod tests {
             0,
             &key_unbound,
         ));
-        // Add unsigned v1 record за хорошую меру.
+        // Add unsigned v1 record for good measure.
         list.upsert(AnycastRecord {
             service_tag: *b"mbox",
             node_id: [0x33; 32],
@@ -950,7 +946,7 @@ mod tests {
 
     #[test]
     fn resolve_with_signed_bound_policy_via_cfg_works() {
-        // Same scenario as the explicit `resolve_signed_bound` test, но
+        // Same scenario as the explicit `resolve_signed_bound` test, but
         // driven through the `with_policy` builder so cfg-side wiring
         // is exercised end-to-end.
         let key_bound = make_signing_key(0x44);
@@ -993,9 +989,9 @@ mod tests {
 
     #[test]
     fn resolve_signed_bound_drops_subkey_records() {
-        // Even с а valid BLAKE3 binding, sig_key_idx > 0 must be
+        // Even with a valid BLAKE3 binding, sig_key_idx > 0 must be
         // dropped under SignedBound (async identity-doc lookup
-        // required, не in-scope для the sync resolve path).
+        // required, not in-scope for the sync resolve path).
         let key = make_signing_key(0x66);
         let derived_id = bound_node_id_for(&key);
 
@@ -1003,7 +999,7 @@ mod tests {
         let svc = AnycastService::new(Arc::clone(&dht), [0xA0; 32]);
         let dht_key = AnycastRecord::dht_key(*b"sub1");
         let mut list = AnycastList::default();
-        // sig_key_idx = 3 (subkey flow) даже с матчащимся node_id.
+        // sig_key_idx = 3 (subkey flow) even with a matching node_id.
         list.upsert(AnycastRecord::sign(*b"sub1", derived_id, 5, 3600, 3, &key));
         dht.store_local(dht_key, list.encode());
 
@@ -1018,14 +1014,14 @@ mod tests {
 
     #[test]
     fn reputation_does_not_affect_signed_filter() {
-        // Signed-only filter is а binary trust gate (drop unsigned).
-        // Reputation должна apply на top of the filter — penalize within
-        // the signed set, but не promote unsigned records.
+        // Signed-only filter is a binary trust gate (drop unsigned).
+        // Reputation must apply on top of the filter — penalize within
+        // the signed set, but not promote unsigned records.
         let svc = make_service(0xCC);
         let key = make_signing_key(0xCC);
         let dht_key = AnycastRecord::dht_key(*b"mbox");
 
-        // Insert один unsigned + два signed records.
+        // Insert one unsigned + two signed records.
         svc.advertise(*b"mbox", 0, 3600); // unsigned, score=0 (would win sans filter)
         let mut list = AnycastList::decode(&svc.dht.get_local(&dht_key).unwrap_or_default());
         list.upsert(AnycastRecord::sign(

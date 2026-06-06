@@ -2,7 +2,7 @@
 name = "veil-bufpool"
 version = "0.1.0"
 edition = "2024"
-description = "Size-bucketed buffer pool for hot-path frame allocations (2026-05-13 OOM follow-up). Returns Vec<u8>-equivalent storage to the kernel between bursts so RSS stays flat under sustained throughput; complementary к jemalloc which already reduces fragmentation but doesn't eliminate burst-induced page-residency."
+description = "Size-bucketed buffer pool for hot-path frame allocations (2026-05-13 OOM follow-up). Returns Vec<u8>-equivalent storage to the kernel between bursts so RSS stays flat under sustained throughput; complementary to jemalloc which already reduces fragmentation but doesn't eliminate burst-induced page-residency."
 license = "AGPL-3.0-or-later"
 
 [dependencies]
@@ -10,7 +10,7 @@ license = "AGPL-3.0-or-later"
 [dev-dependencies]
 criterion = "0.5"
 
-# Bench needs jemalloc к match production allocator (veil-cli binary).
+# Bench needs jemalloc to match production allocator (veil-cli binary).
 # Without this, bench would compare pool-vs-malloc under glibc, which would
 # show artificially-large pool wins (glibc is the worse baseline we already
 # moved away from).

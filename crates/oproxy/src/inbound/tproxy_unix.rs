@@ -4,9 +4,9 @@
 //! retrieve the original destination of redirected connections.
 //!
 //! FreeBSD support was removed in the audit batch 2026-05-23 — the
-//! previous `ipfw fwd` + `getpeername` path was а stub that compiled
-//! но failed at runtime on the first accept.  Re-add к
-//! `crates/oproxy/src/inbound/{mod,tproxy}.rs` cfg-gates when а real
+//! previous `ipfw fwd` + `getpeername` path was a stub that compiled
+//! but failed at runtime on the first accept.  Re-add to
+//! `crates/oproxy/src/inbound/{mod,tproxy}.rs` cfg-gates when a real
 //! FreeBSD path (pf + divert OR ipfw fwd + getpeername) is implemented.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -37,7 +37,7 @@ pub async fn run(
     routing: Arc<RoutingConfig>,
     semaphore: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
-    // Bind с IP_TRANSPARENT set so the kernel accepts non-local destinations.
+    // Bind with IP_TRANSPARENT set so the kernel accepts non-local destinations.
     let listener = bind_transparent(&listen_addr)
         .with_context(|| format!("bind TProxy listener {listen_addr}"))?;
     log::info!(
@@ -45,7 +45,7 @@ pub async fn run(
          Operator must wire matching iptables -j TPROXY rule + ip rule + ip route."
     );
     loop {
-        // Audit batch 2026-05-24 (M8): semaphore gating, см. socks5.rs.
+        // Audit batch 2026-05-24 (M8): semaphore gating, see. socks5.rs.
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(p) => p,
             Err(_closed) => return Ok(()),
@@ -54,11 +54,11 @@ pub async fn run(
         let orig_dst = match get_original_dst(&stream) {
             Ok(addr) => addr,
             Err(e) => {
-                log::warn!("oproxy.tproxy: SO_ORIGINAL_DST failed для {peer}: {e}");
+                log::warn!("oproxy.tproxy: SO_ORIGINAL_DST failed for {peer}: {e}");
                 continue;
             }
         };
-        log::debug!("oproxy.tproxy: accept от {peer} → orig dst {orig_dst}");
+        log::debug!("oproxy.tproxy: accept from {peer} → orig dst {orig_dst}");
         let h = Arc::clone(&app_handle);
         let r = Arc::clone(&routing);
         tokio::spawn(async move {
@@ -74,7 +74,7 @@ pub async fn run(
     }
 }
 
-/// Create а TCP listener with `IP_TRANSPARENT = 1`.  Returns а tokio
+/// Create a TCP listener with `IP_TRANSPARENT = 1`.  Returns a tokio
 /// `TcpListener` ready for `accept()`.
 fn bind_transparent(listen_addr: &str) -> Result<TcpListener> {
     use std::net::TcpListener as StdListener;
@@ -94,7 +94,7 @@ fn bind_transparent(listen_addr: &str) -> Result<TcpListener> {
         if rc != 0 {
             return Err(anyhow!(
                 "setsockopt(IP_TRANSPARENT) failed: {} \
-                 (requires CAP_NET_ADMIN или root)",
+                 (requires CAP_NET_ADMIN or root)",
                 std::io::Error::last_os_error(),
             ));
         }
@@ -105,11 +105,11 @@ fn bind_transparent(listen_addr: &str) -> Result<TcpListener> {
     TcpListener::from_std(std_listener).context("tokio from_std")
 }
 
-/// Retrieve the original destination of а connection redirected via
-/// the netfilter mangle table (Linux / Keenetic) или ipfw fwd (FreeBSD).
+/// Retrieve the original destination of a connection redirected via
+/// the netfilter mangle table (Linux / Keenetic) or ipfw fwd (FreeBSD).
 fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
     let fd = stream.as_raw_fd();
-    // Try IPv4 first (most common); fall back к IPv6.
+    // Try IPv4 first (most common); fall back to IPv6.
     if let Ok(addr) = get_original_dst_v4(fd) {
         return Ok(addr);
     }

@@ -19,7 +19,7 @@ pub struct IncomingMessage {
     pub data: Vec<u8>,
 }
 
-/// А remote peer opened а byte-stream к this endpoint.  Returned by
+/// A remote peer opened a byte-stream to this endpoint.  Returned by
 /// [`AppHandle::accept_stream`] / [`AppReceiver::accept_stream`].
 pub struct IncomingStream {
     /// Live byte-pipe — implements `AsyncRead` + `AsyncWrite`.
@@ -40,8 +40,8 @@ pub struct AppHandle {
     pub(crate) rx: mpsc::Receiver<IncomingMessage>,
     /// Inbound-stream notifications (Phase 6.51 follow-up — closes
     /// the SDK gap that prevented server-side proxy / mailbox / etc.
-    /// от being built outside the daemon).  Populated by the
-    /// reader-task dispatch when а remote peer opens а stream к
+    /// from being built outside the daemon).  Populated by the
+    /// reader-task dispatch when a remote peer opens a stream to
     /// this bound endpoint.
     pub(crate) inbound_streams_rx: mpsc::Receiver<IncomingStream>,
 }
@@ -65,11 +65,11 @@ impl AppHandle {
         }
     }
 
-    /// Wait для the next incoming stream opened by а remote peer.
+    /// Wait for the next incoming stream opened by a remote peer.
     ///
     /// Returns `None` when the IPC connection k the daemon closes.
     /// Each accepted stream carries its initiator's `src_node_id`
-    /// — callers что want к enforce an allowlist (server-side proxy
+    /// — callers that want to enforce an allowlist (server-side proxy
     /// authz, etc.) check it before bridging.
     pub async fn accept_stream(&mut self) -> Option<IncomingStream> {
         self.inbound_streams_rx.recv().await
@@ -94,16 +94,16 @@ impl AppHandle {
     /// fail to drain).
     ///
     /// Returns `(AppSender, AppReceiver)`.  Both halves remain
-    /// associated с the original endpoint binding; dropping either
+    /// associated with the original endpoint binding; dropping either
     /// does NOT unbind (the binding lives until BOTH halves are
     /// dropped, plus any unbind frame the daemon expects).
     ///
     /// Audit batch 2026-05-25 phase M (cross-audit closure):
     /// `AppReceiver` carries both the datagram `rx` AND the inbound-
     /// stream `inbound_streams_rx`.  Pre-fix the split dropped
-    /// `inbound_streams_rx` silently, leaving callers что had bound
-    /// для server-side stream-accept (mailbox proxy, oproxy server,
-    /// mesh bridge) без а way к dispatch on accept post-split.
+    /// `inbound_streams_rx` silently, leaving callers that had bound
+    /// for server-side stream-accept (mailbox proxy, oproxy server,
+    /// mesh bridge) without a way to dispatch on accept post-split.
     /// Now both receive-capabilities survive the split.
     pub fn into_split(self) -> (AppSender, AppReceiver) {
         // AppHandle has a Drop that sends UNBIND; we need to move
@@ -399,8 +399,8 @@ impl AppSender {
     /// `Vec<u8>`) to skip the slice→Vec copy `send` performs internally.
     ///
     /// Hot path goes through `SharedWriter::write_app_ipc_send_owned`
-    /// which builds the IPC frame в а single buffer — one allocation,
-    /// one copy of `data`.  See its doc-comment для why this matters.
+    /// which builds the IPC frame in a single buffer — one allocation,
+    /// one copy of `data`.  See its doc-comment for why this matters.
     pub async fn send_owned(
         &self,
         dst_node_id: [u8; 32],
@@ -423,11 +423,11 @@ impl AppSender {
             .await
     }
 
-    /// Zero-DATA-copy send: caller supplies а `Vec<u8>` that already has
+    /// Zero-DATA-copy send: caller supplies a `Vec<u8>` that already has
     /// [`crate::APP_IPC_SEND_PREFIX_BYTES`] uninit bytes reserved at the
     /// FRONT, then the datagram payload contiguous behind it.  SDK fills
-    /// the prefix in place с FrameHeader + AppIpcSendPayload fixed fields
-    /// и forwards the whole `buf` к the IPC writer task — no payload
+    /// the prefix in place with FrameHeader + AppIpcSendPayload fixed fields
+    /// and forwards the whole `buf` to the IPC writer task — no payload
     /// memcpy whatsoever.
     ///
     /// Used by ogate's solo-ship hot path where the TUN reader allocates
@@ -511,9 +511,9 @@ impl AppSender {
 /// Receive-only half of an [`AppHandle`]. Returned by
 /// [`AppHandle::into_split`] alongside an [`AppSender`].
 ///
-/// Carries both the datagram-rx и inbound-stream-rx halves so callers
-/// что bound serving an inbound stream protocol (proxy server,
-/// mailbox bridge) keep access к [`Self::accept_stream`] after the
+/// Carries both the datagram-rx and inbound-stream-rx halves so callers
+/// that bound serving an inbound stream protocol (proxy server,
+/// mailbox bridge) keep access to [`Self::accept_stream`] after the
 /// split.
 pub struct AppReceiver {
     rx: mpsc::Receiver<IncomingMessage>,
@@ -527,9 +527,9 @@ impl AppReceiver {
         Ok(self.rx.recv().await)
     }
 
-    /// Wait для the next incoming stream opened by а remote peer.
+    /// Wait for the next incoming stream opened by a remote peer.
     /// Audit batch 2026-05-25 phase M — mirror of
-    /// [`AppHandle::accept_stream`].  Без this, the split-API consumer
+    /// [`AppHandle::accept_stream`].  Without this, the split-API consumer
     /// could not serve stream-based protocols (oproxy server, mailbox
     /// drain) on the receive side.
     pub async fn accept_stream(&mut self) -> Option<IncomingStream> {

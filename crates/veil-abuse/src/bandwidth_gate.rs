@@ -19,8 +19,8 @@ use super::rate_limiter::TokenBucket;
 ///
 /// # Units note
 ///
-/// The `kbps` суффикс в `NodeCapacityConfig::max_inbound_bandwidth_kbps`
-/// и [`Self::new`]'s `max_kbps` parameter is **misleading**: by industry
+/// The `kbps` suffix in `NodeCapacityConfig::max_inbound_bandwidth_kbps`
+/// and [`Self::new`]'s `max_kbps` parameter is **misleading**: by industry
 /// convention "kbps" = **kilobits per second** (decimal, ÷8), but this
 /// gate's math (`bytes_per_sec = kbps * 1024.0`) treats it as **kibibytes
 /// per second** (binary, ×1024). Default config value `100_000` therefore
@@ -29,9 +29,9 @@ use super::rate_limiter::TokenBucket;
 ///   ≈ **820 Mbit/s** (NOT 100 Mbit/s as the name implies).
 /// * Burst capacity: `2 × steady = ~195 MiB`.
 ///
-/// Operators tuning the gate должны интерпретировать the config value
+/// Operators tuning the gate must interpret the config value
 /// as **KiB/s** (binary kibibytes/sec), not kilobits/sec. A future cleanup
-/// (tracked in audit follow-up) will rename the field к
+/// (tracked in audit follow-up) will rename the field to
 /// `max_inbound_kib_per_sec` to remove the ambiguity.
 #[derive(Debug)]
 pub struct BandwidthGate {

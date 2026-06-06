@@ -105,13 +105,13 @@ impl PeerBatch {
         self.buf[1] = self.count;
     }
 
-    /// Should the batch be flushed на size/count grounds RIGHT NOW
+    /// Should the batch be flushed on size/count grounds RIGHT NOW
     /// (timer-independent)?
     pub fn should_flush(&self, byte_threshold: usize) -> bool {
         self.count as usize >= BATCH_MAX_COUNT || self.buf.len() >= byte_threshold
     }
 
-    /// Drain the batch into а Vec<u8>, ready to hand off to `AppSender::send_owned`.
+    /// Drain the batch into a Vec<u8>, ready to hand off to `AppSender::send_owned`.
     /// Leaves an empty (header-only) batch behind so the slot can be reused.
     pub fn take(&mut self) -> Vec<u8> {
         // Take the full envelope by swap; reinitialize header in place.
@@ -125,9 +125,9 @@ impl PeerBatch {
     }
 }
 
-/// Zero-copy iterator over а received batch envelope.
+/// Zero-copy iterator over a received batch envelope.
 ///
-/// Skips truncated trailing records — а malformed batch yields the valid
+/// Skips truncated trailing records — a malformed batch yields the valid
 /// prefix and stops.  Caller must run `is_batch_envelope` first.
 pub struct BatchIter<'a> {
     data: &'a [u8],
@@ -136,7 +136,7 @@ pub struct BatchIter<'a> {
 }
 
 impl<'a> BatchIter<'a> {
-    /// Construct over а buffer that starts с `BATCH_MAGIC`.
+    /// Construct over a buffer that starts with `BATCH_MAGIC`.
     pub fn new(data: &'a [u8]) -> Self {
         let (count, pos) = if data.len() >= 2 && data[0] == BATCH_MAGIC {
             (data[1], 2)
@@ -187,7 +187,7 @@ impl EgressBatches {
         Self::default()
     }
 
-    /// Returns а `&mut PeerBatch` for `peer`, creating it lazily.  Caller
+    /// Returns a `&mut PeerBatch` for `peer`, creating it lazily.  Caller
     /// supplies the precomputed `app_id` so the batch envelope carries it.
     pub fn get_or_create(&mut self, peer: NodeId, app_id: [u8; 32]) -> &mut PeerBatch {
         self.by_peer
@@ -195,8 +195,8 @@ impl EgressBatches {
             .or_insert_with(|| PeerBatch::new(app_id))
     }
 
-    /// Mutable access к the per-peer batch без implicit creation. Caller uses
-    /// this к flush а pending batch immediately before shipping а solo packet
+    /// Mutable access to the per-peer batch without implicit creation. Caller uses
+    /// this to flush a pending batch immediately before shipping a solo packet
     /// (out-of-band order preservation).
     pub fn peek_mut(&mut self, peer: &NodeId) -> Option<&mut PeerBatch> {
         self.by_peer.get_mut(peer)
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn non_magic_envelope_yields_nothing() {
-        // BatchIter::new on а non-batch payload yields zero items.
+        // BatchIter::new on a non-batch payload yields zero items.
         let ip = vec![0x45u8, 0x00, 0x00, 0x14];
         let pkts: Vec<&[u8]> = BatchIter::new(&ip).collect();
         assert!(pkts.is_empty());
@@ -295,7 +295,7 @@ mod tests {
         let mut b = PeerBatch::new([0u8; 32]);
         b.push(&vec![0u8; 1000]);
         assert!(!b.should_flush(60_000));
-        // Push enough к cross threshold.
+        // Push enough to cross threshold.
         for _ in 0..70 {
             b.push(&vec![0u8; 1000]);
         }

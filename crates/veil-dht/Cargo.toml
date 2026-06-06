@@ -34,7 +34,7 @@ pqcrypto-traits = "0.3"
 rocksdb = { version = "0.22", optional = true }
 
 [dev-dependencies]
-# `test-util` enables tokio::time::pause/advance для churn sim tests
+# `test-util` enables tokio::time::pause/advance for churn sim tests
 # (epic485_1_c_24h_churn_does_not_amplify_sybil_eclipse).
 tokio = { version = "1.42", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "test-util"] }
 # Scratch dir for the RocksDB cold-tier durability test (rocksdb-cold only).

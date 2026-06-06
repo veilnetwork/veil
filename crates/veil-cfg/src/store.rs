@@ -31,18 +31,18 @@ pub fn prepare_init_path(path: &Path, force: bool) -> Result<PathBuf> {
 
 /// Read and parse a config file, inferring the format from the extension.
 ///
-/// Этап 11 slice 11a/c/d — если the file carries а
+/// Phase 11 slice 11a/c/d — if the file carries a
 /// `# VEIL_CONFIG_SIGNATURE_V1: …` header, the envelope is verified
 /// before the underlying TOML is parsed.  Behaviour depends on the
 /// post-parse `global.require_signed_config` flag:
 ///
 /// * **Default `false` (phase 1, warn-only)**: signed-but-tampered
-///   configs AND unsigned configs both load с а WARN log so operators
-///   have а grace window к sign their existing configs.
-/// * **`true` (phase 2 — slice 11d)**: loading FAILS с
-///   `ConfigError::SignedConfigEnforced` если the load went down either
+///   configs AND unsigned configs both load with a WARN log so operators
+///   have a grace window to sign their existing configs.
+/// * **`true` (phase 2 — slice 11d)**: loading FAILS with
+///   `ConfigError::SignedConfigEnforced` if the load went down either
 ///   the unsigned-config OR the verify-failed branch.  Operators flip
-///   this after every machine в the fleet has been signed AND verified.
+///   this after every machine in the fleet has been signed AND verified.
 pub fn load_config(path: &Path) -> Result<Config> {
     let format = FileFormat::from_path(path)?;
     let content = fs::read_to_string(path)?;
@@ -53,8 +53,8 @@ pub fn load_config(path: &Path) -> Result<Config> {
     // the `Verified` branch.
     if parsed.global.require_signed_config && !matches!(sig_status, SignedConfigStatus::Verified) {
         return Err(crate::ConfigError::CommandFailed(format!(
-            "config '{}' requires а valid signature (global.require_signed_config = true) \
-             but verification surfaced а non-Verified state ({:?}).  Sign the file via \
+            "config '{}' requires a valid signature (global.require_signed_config = true) \
+             but verification surfaced a non-Verified state ({:?}).  Sign the file via \
              `veil-cli config sign`, ensure {} env-var matches the operator's pubkey \
              if pinning is desired, AND restart.",
             path.display(),
@@ -87,9 +87,9 @@ pub fn load_config_str(content: &str, path: &Path) -> Result<Config> {
     Ok(parsed)
 }
 
-/// Outcome от [`preprocess_signed_config`] что `load_config` uses к
-/// gate enforcement.  Stored separately от the returned body string
-/// so phase-2 enforcement can refuse к load even after the body parses
+/// Outcome from [`preprocess_signed_config`] that `load_config` uses to
+/// gate enforcement.  Stored separately from the returned body string
+/// so phase-2 enforcement can refuse to load even after the body parses
 /// successfully.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignedConfigStatus {
@@ -97,42 +97,42 @@ pub enum SignedConfigStatus {
     Unsigned,
     /// Signature header present AND verified successfully.
     Verified,
-    /// Signature header present но verification failed (tamper,
+    /// Signature header present but verification failed (tamper,
     /// stale pin, malformed envelope).
     VerifyFailed,
 }
 
-/// Environment variable (Этап 11 slice 11c) что pins the trusted
+/// Environment variable (Phase 11 slice 11c) that pins the trusted
 /// config-issuer pubkey for hard-fail-on-mismatch verification.  When
-/// set, signed configs that don't match this key surface а warn-level
+/// set, signed configs that don't match this key surface a warn-level
 /// log via the verify-failed branch (Phase 1 still loads; phase 2's
 /// `require_signed_config = true` flag will refuse).  When unset,
-/// `preprocess_signed_config` falls back к unpinned mode (envelope
+/// `preprocess_signed_config` falls back to unpinned mode (envelope
 /// integrity only — degraded posture but still better than no
 /// verification).
 ///
-/// Choosing env-var over а config field: pinning inside `config.toml`
-/// itself is chicken-and-egg — а tampered config could simply remove
-/// the pin.  Env vars live в the systemd unit / Docker compose /
-/// Kubernetes manifest, separately от the operator's config bytes.
+/// Choosing env-var over a config field: pinning inside `config.toml`
+/// itself is chicken-and-egg — a tampered config could simply remove
+/// the pin.  Env vars live in the systemd unit / Docker compose /
+/// Kubernetes manifest, separately from the operator's config bytes.
 pub const TRUSTED_CONFIG_ISSUER_PUBKEY_ENV: &str = "VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY";
 
-/// Internal: surface the signed-config envelope on load и normalise
+/// Internal: surface the signed-config envelope on load and normalise
 /// the body for the TOML parser.  Three branches:
 ///
 /// 1. **No signature header** → warn-level log surfacing the
 ///    "tamper protection off" state.  Return raw content unchanged.
-/// 2. **Signature header + verify Ok** → info-level log с the issuer
-///    pubkey fingerprint и issued_at timestamp.  Return the canonical
-///    unsigned TOML что the verifier already stripped + trimmed.
-/// 3. **Signature header + verify Err** → warn-level log с the
-///    structured error и а "loading anyway" disclaimer.  Strip the
-///    header lines от the raw content so the TOML still parses;
-///    operator sees the warn в logs и can investigate.
+/// 2. **Signature header + verify Ok** → info-level log with the issuer
+///    pubkey fingerprint and issued_at timestamp.  Return the canonical
+///    unsigned TOML that the verifier already stripped + trimmed.
+/// 3. **Signature header + verify Err** → warn-level log with the
+///    structured error and a "loading anyway" disclaimer.  Strip the
+///    header lines from the raw content so the TOML still parses;
+///    operator sees the warn in logs and can investigate.
 ///
 /// If `VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY` env-var is set, verification
-/// runs в pinned mode (signature must match the pinned pubkey OR fall
-/// к branch 3); otherwise it runs в unpinned mode (envelope integrity
+/// runs in pinned mode (signature must match the pinned pubkey OR fall
+/// to branch 3); otherwise it runs in unpinned mode (envelope integrity
 /// only).
 fn preprocess_signed_config(content: &str, path: &Path) -> (String, SignedConfigStatus) {
     let pinned = std::env::var(TRUSTED_CONFIG_ISSUER_PUBKEY_ENV).ok();
@@ -141,8 +141,8 @@ fn preprocess_signed_config(content: &str, path: &Path) -> (String, SignedConfig
 
 /// Testable inner: same as [`preprocess_signed_config`] but accepts
 /// the trusted-issuer pubkey explicitly instead of reading the env-var.
-/// Production callers go through the env-var wrapper; tests pass а
-/// concrete `Some(pk)` или `None` directly so they don't race on
+/// Production callers go through the env-var wrapper; tests pass a
+/// concrete `Some(pk)` or `None` directly so they don't race on
 /// process-global env state.
 fn preprocess_signed_config_with_pin(
     content: &str,
@@ -187,10 +187,10 @@ fn preprocess_signed_config_with_pin(
         Err(e) => {
             log::warn!(
                 "veil_cfg.signed_config_verify_failed \
-                 config '{}' has а signature header but verification \
+                 config '{}' has a signature header but verification \
                  failed: {}.  Loading anyway (refusal is opt-in via \
-                 а future `require_signed_config = true` global flag). \
-                 Investigate immediately — possible tamper или \
+                 a future `require_signed_config = true` global flag). \
+                 Investigate immediately — possible tamper or \
                  stale {} env-var pin.",
                 path.display(),
                 e,
@@ -206,37 +206,37 @@ fn preprocess_signed_config_with_pin(
     }
 }
 
-/// Parse а TOML config string directly без filesystem access.
+/// Parse a TOML config string directly without filesystem access.
 ///
 /// Used by runtime config-injection paths (e.g. `admin apply-config`)
-/// where the caller hands в the TOML content bytes (typically from а
-/// secure storage backend на the messenger side) и does not want
-/// the intermediate plaintext к leak к а readable inode.
+/// where the caller hands in the TOML content bytes (typically from a
+/// secure storage backend on the messenger side) and does not want
+/// the intermediate plaintext to leak to a readable inode.
 pub fn parse_toml_str(content: &str) -> Result<Config> {
     format::backend(FileFormat::Toml).load(content)
 }
 
-/// Build а **stub** Config с а freshly-generated ephemeral Ed25519
-/// identity и empty peer / listen lists.  Used by the `--defer-init`
+/// Build a **stub** Config with a freshly-generated ephemeral Ed25519
+/// identity and empty peer / listen lists.  Used by the `--defer-init`
 /// startup mode (`veil-cli node run --defer-init`) so the daemon
-/// can boot без а real config and immediately serve `admin apply-config`
+/// can boot without a real config and immediately serve `admin apply-config`
 /// requests over its admin socket.
 ///
-/// The identity is а fresh keypair с а PoW-mined nonce satisfying
-/// `crypto::DEFAULT_POW_DIFFICULTY` — same as а real production identity
+/// The identity is a fresh keypair with a PoW-mined nonce satisfying
+/// `crypto::DEFAULT_POW_DIFFICULTY` — same as a real production identity
 /// so the daemon's own validation passes.  Mining takes ~1-5 s on
-/// typical hardware (16 bits в test-low-difficulty, 24 bits otherwise).
+/// typical hardware (16 bits in test-low-difficulty, 24 bits otherwise).
 ///
 /// The returned config has:
 /// * One [identity] block (Ed25519, ephemeral keypair)
 /// * Empty `peers`, `listen`, `bootstrap_peers`
 /// * Default global / mobile / etc. config blocks
 ///
-/// **Lifecycle**: the caller writes this config к а temp dir и passes
-/// the path к `NodeRuntime::start`.  The first `admin apply-config`
-/// triggers а full reload, replacing the stub identity with the real
-/// one.  The temp dir lives только for the daemon's process lifetime
-/// и does not need к be cleaned up explicitly — modern OSes reap
+/// **Lifecycle**: the caller writes this config to a temp dir and passes
+/// the path to `NodeRuntime::start`.  The first `admin apply-config`
+/// triggers a full reload, replacing the stub identity with the real
+/// one.  The temp dir lives only for the daemon's process lifetime
+/// and does not need to be cleaned up explicitly — modern OSes reap
 /// `$TMPDIR` on reboot.
 pub fn build_stub_config_with_ephemeral_identity() -> Result<Config> {
     use crate::model::{IdentityConfig, SignatureAlgorithm};
@@ -288,7 +288,7 @@ pub fn build_stub_config_with_ephemeral_identity() -> Result<Config> {
             key_passphrase: None,
             key_passphrase_file: None,
             // Don't prompt — stub mode is non-interactive by definition
-            // (the messenger app is не going к answer а tty).
+            // (the messenger app is not going to answer a tty).
             key_passphrase_prompt: false,
             // Don't burn CPU on background nonce-mining for the stub
             // identity — it will be replaced almost immediately by the
@@ -394,11 +394,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    // ── Этап 11 slice 11c: env-var pinned-verification path ──────────
+    // ── Phase 11 slice 11c: env-var pinned-verification path ──────────
 
-    /// Sign а minimal config, then run the inner preprocessor с
+    /// Sign a minimal config, then run the inner preprocessor with
     /// pinned-mode set to the correct issuer pubkey → load Ok branch
-    /// fires и the body is the canonical unsigned TOML.
+    /// fires and the body is the canonical unsigned TOML.
     #[test]
     fn epic11c_preprocess_with_pin_accepts_matching_issuer() {
         let kp = veil_crypto::generate_keypair(crate::SignatureAlgorithm::Ed25519);
@@ -420,9 +420,9 @@ mod tests {
         assert!(!preprocessed.contains("VEIL_CONFIG_SIGNATURE_V1"));
     }
 
-    /// Pin к а DIFFERENT pubkey: verification surfaces `IssuerMismatch`
-    /// и falls к the warn-and-strip degraded branch.  Body still loads
-    /// (phase 1 graceful degradation); operator sees the warn в logs.
+    /// Pin to a DIFFERENT pubkey: verification surfaces `IssuerMismatch`
+    /// and falls to the warn-and-strip degraded branch.  Body still loads
+    /// (phase 1 graceful degradation); operator sees the warn in logs.
     #[test]
     fn epic11c_preprocess_with_pin_falls_back_on_mismatch() {
         let kp_a = veil_crypto::generate_keypair(crate::SignatureAlgorithm::Ed25519);
@@ -442,7 +442,7 @@ mod tests {
             Some(&kp_b.public_key), // wrong pin
         );
         // Body still loads (phase-1 graceful degradation), but the
-        // signature-header lines ара stripped so the TOML parses.
+        // signature-header lines are stripped so the TOML parses.
         assert!(preprocessed.contains("runtime_flavor = \"multi_thread\""));
         assert!(!preprocessed.contains("VEIL_CONFIG_SIGNATURE_V1"));
     }
@@ -466,7 +466,7 @@ mod tests {
         assert!(preprocessed.contains("runtime_flavor = \"multi_thread\""));
     }
 
-    // ── Этап 11 slice 11d: SignedConfigStatus enum + load enforcement ──
+    // ── Phase 11 slice 11d: SignedConfigStatus enum + load enforcement ──
 
     /// Status enum returned by the inner preprocessor matches the three
     /// post-preprocess branches that `load_config` checks against the
@@ -520,9 +520,9 @@ mod tests {
         assert_eq!(status, SignedConfigStatus::VerifyFailed);
     }
 
-    /// End-to-end enforcement check: write а require_signed_config-true
+    /// End-to-end enforcement check: write a require_signed_config-true
     /// config that is itself UNSIGNED → `load_config` returns an Err
-    /// directing the operator к sign и restart.
+    /// directing the operator to sign and restart.
     #[test]
     fn epic11d_require_signed_config_refuses_unsigned_load() {
         let unique = SystemTime::now()
@@ -540,15 +540,15 @@ mod tests {
         let err = load_config(&path).expect_err("must refuse unsigned config");
         let msg = format!("{err}");
         assert!(
-            msg.contains("requires а valid signature") || msg.contains("Sign the file"),
-            "error must direct operator к sign + restart; got: {msg}",
+            msg.contains("requires a valid signature") || msg.contains("Sign the file"),
+            "error must direct operator to sign + restart; got: {msg}",
         );
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Opposite path: а require_signed_config-true config that IS
+    /// Opposite path: a require_signed_config-true config that IS
     /// properly signed loads cleanly.
     #[test]
     fn epic11d_require_signed_config_accepts_properly_signed_load() {
@@ -580,7 +580,7 @@ mod tests {
         // Note: load_config reads VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY
         // env-var.  We don't set it here so verification runs unpinned —
         // matches the production deployment mode where some operators
-        // sign но don't pin.  Verified status is still produced.
+        // sign but don't pin.  Verified status is still produced.
         let loaded = load_config(&path).expect("signed config must load");
         assert!(loaded.global.require_signed_config);
 

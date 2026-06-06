@@ -167,7 +167,7 @@ impl ChunkReassembler {
 
     /// Total bytes currently held across all in-progress transfers.
     /// Bounded by `MAX_REASSEMBLY_BYTES`; operators watch this gauge
-    /// к catch chunked-transfer leaks AND to size memory budgets.
+    /// to catch chunked-transfer leaks AND to size memory budgets.
     pub fn buffered_bytes(&self) -> usize {
         self.total_buffered
     }

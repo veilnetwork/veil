@@ -5,7 +5,7 @@
 //! `(B, content_id)`. The outbox lets A re-send any message B
 //! claims it didn't get when the two peers next sync.
 //!
-//! ## Why a separate store от mailbox
+//! ## Why a separate store from mailbox
 //!
 //! **Lifecycle is different.** Mailbox blobs live until the
 //! recipient acks (or TTL expires); outbox entries live until the
@@ -55,7 +55,7 @@ const OUTBOX_TABLE_ENTRIES: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("outbox_entries_v1");
 const OUTBOX_TABLE_EVICT: TableDefinition<&[u8], ()> = TableDefinition::new("outbox_eviction_v1");
 /// single-row metadata table holding the running
-/// total-blob-bytes counter. Kept в а separate redb table to avoid
+/// total-blob-bytes counter. Kept in a separate redb table to avoid
 /// ABI churn on the entries table.
 const OUTBOX_TABLE_META: TableDefinition<&str, u64> = TableDefinition::new("outbox_meta_v1");
 const META_KEY_TOTAL_BYTES: &str = "total_bytes";
@@ -71,17 +71,17 @@ pub const DEFAULT_OUTBOX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 pub const MAX_FIND_MISSING_RESULTS: usize = 256;
 
 /// per-blob hard cap. Voice messages + small
-/// attachments fit comfortably under 4 MiB; anything bigger из а local
-/// IPC client smells like а bug или а flood attempt. Bound is independent
+/// attachments fit comfortably under 4 MiB; anything bigger from a local
+/// IPC client smells like a bug or a flood attempt. Bound is independent
 /// of the protocol's `MAX_FRAME_BODY` so the daemon never persists
-/// adversarially-large blobs even если а compromised app sends them.
+/// adversarially-large blobs even if a compromised app sends them.
 pub const MAX_OUTBOX_BLOB_BYTES: usize = 4 * 1024 * 1024;
 
 /// default cap on aggregate blob bytes across the
 /// outbox. 50 MiB ~ 12 voice messages or hundreds of text messages;
-/// keeps the per-device disk footprint bounded under а sender's local
-/// IPC-flood attack. Hit either expands ack/prune cadence или surfaces
-/// the failure к the app as а fast-failed send.
+/// keeps the per-device disk footprint bounded under a sender's local
+/// IPC-flood attack. Hit either expands ack/prune cadence or surfaces
+/// the failure to the app as a fast-failed send.
 pub const DEFAULT_OUTBOX_QUOTA_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Configuration for an [`Outbox`].
@@ -142,11 +142,11 @@ impl Outbox {
         let db_path = dir.join("outbox.db");
         let db = Database::create(&db_path)?;
         // ensure the metadata table exists and
-        // initialize the total-bytes counter on first open или upgrade
+        // initialize the total-bytes counter on first open or upgrade
         // (existing DBs from before #8 won't have the table OR the key).
         // If the key is missing AND entries already exist, walk the
-        // entries table once к compute the true initial total — avoids
-        // а stale counter forever underreporting on legacy DBs.
+        // entries table once to compute the true initial total — avoids
+        // a stale counter forever underreporting on legacy DBs.
         let txn = db.begin_write()?;
         {
             let _ = txn.open_table(OUTBOX_TABLE_ENTRIES)?;
@@ -193,10 +193,10 @@ impl Outbox {
     /// re-send extends the TTL window).
     ///
     /// rejects blobs above [`MAX_OUTBOX_BLOB_BYTES`]
-    /// with [`MailboxError::BlobTooLarge`], и rejects puts that would
+    /// with [`MailboxError::BlobTooLarge`], and rejects puts that would
     /// push aggregate bytes above `config.quota_total_bytes` with
     /// [`MailboxError::OutboxQuotaExceeded`]. Both checks fire before
-    /// any DB write so а flooding caller cannot grow the database.
+    /// any DB write so a flooding caller cannot grow the database.
     pub fn put(
         &self,
         receiver_id: [u8; 32],
@@ -220,8 +220,8 @@ impl Outbox {
             let key = make_key(&receiver_id, &content_id);
             // If a stale entry exists, remove its eviction-index row
             // so we don't leak a never-pruned timestamp. Also remember
-            // its blob.len so the quota check below treats а replace
-            // as а delta, не а pure add.
+            // its blob.len so the quota check below treats a replace
+            // as a delta, not a pure add.
             let stale_record = entries.get(key.as_slice())?.map(|g| g.value().to_vec());
             let mut old_blob_len: u64 = 0;
             if let Some(record) = stale_record {
@@ -584,7 +584,7 @@ mod tests {
         o.put(recv, [b'B'; 32], vec![]).unwrap();
         clk.store(200, Ordering::SeqCst);
         let pruned = o.prune_expired().unwrap();
-        // Cutoff = 200-100 = 100. A (ts=0) и B (ts=50) both pruned.
+        // Cutoff = 200-100 = 100. A (ts=0) and B (ts=50) both pruned.
         assert_eq!(pruned, 2);
         assert_eq!(o.len().unwrap(), 0);
     }
@@ -671,10 +671,10 @@ mod tests {
         let cid = [b'A'; 32];
         o.put(recv, cid, vec![0; 100]).unwrap();
         assert_eq!(o.total_blob_bytes().unwrap(), 100);
-        // Re-put same key с larger blob → counter goes к new size, не sum.
+        // Re-put same key with larger blob → counter goes to new size, not sum.
         o.put(recv, cid, vec![0; 300]).unwrap();
         assert_eq!(o.total_blob_bytes().unwrap(), 300);
-        // Re-put same key с smaller blob → counter shrinks.
+        // Re-put same key with smaller blob → counter shrinks.
         o.put(recv, cid, vec![0; 50]).unwrap();
         assert_eq!(o.total_blob_bytes().unwrap(), 50);
     }

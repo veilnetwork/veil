@@ -42,23 +42,23 @@ use crate::outbox::OutboxRequest;
 use crate::priority_queue::PriorityQueue;
 use crate::tx_registry::PriorityFrame;
 
-/// Shared map от peer node-id к ephemeral ML-KEM decapsulation-key seed
-/// (Этап 6 slice 6h).  Used by `SessionRunner` and
+/// Shared map from peer node-id to ephemeral ML-KEM decapsulation-key seed
+/// (Phase 6 slice 6h).  Used by `SessionRunner` and
 /// `CryptoContext`/`FrameDispatcher`.
 ///
 /// # Memory hygiene
 ///
-/// Values ара `SensitiveBytesN<64>` — pages pinned via `mlock(2)` when
-/// `RLIMIT_MEMLOCK` permits, fall back к `Zeroizing<Vec<u8>>` otherwise.
-/// Closes the swap-к-disk vector for session-lifetime ephemeral PQ
-/// secrets: если pages holding а DK seed land on disk during the
-/// session, anyone с read access к the swap partition can decapsulate
-/// any E2E ciphertext sent к this node within that session window.
+/// Values are `SensitiveBytesN<64>` — pages pinned via `mlock(2)` when
+/// `RLIMIT_MEMLOCK` permits, fall back to `Zeroizing<Vec<u8>>` otherwise.
+/// Closes the swap-to-disk vector for session-lifetime ephemeral PQ
+/// secrets: if pages holding a DK seed land on disk during the
+/// session, anyone with read access to the swap partition can decapsulate
+/// any E2E ciphertext sent to this node within that session window.
 ///
-/// Insertion takes а raw `[u8; 64]` (the output of
-/// `veil_e2e::generate_keypair`) и wraps it via
-/// `SensitiveBytesN::from_bytes`; reads use `.as_array()` к expose а
-/// `&[u8; 64]` view к the ml-kem decap call.
+/// Insertion takes a raw `[u8; 64]` (the output of
+/// `veil_e2e::generate_keypair`) and wraps it via
+/// `SensitiveBytesN::from_bytes`; reads use `.as_array()` to expose a
+/// `&[u8; 64]` view to the ml-kem decap call.
 pub type PerSessionMlKemDk = Arc<
     Mutex<
         std::collections::HashMap<
@@ -84,8 +84,8 @@ impl Drop for BudgetGuard {
     fn drop(&mut self) {
         // Audit batch 2026-05-24 (L1): `Release` ordering ensures the
         // decrement is globally visible BEFORE any subsequent budget
-        // read (e.g. а hot-path `budget > 0` check на another thread).
-        // `Relaxed` was sufficient под single-thread executor but
+        // read (e.g. a hot-path `budget > 0` check on another thread).
+        // `Relaxed` was sufficient under single-thread executor but
         // multi-thread runtime can observe stale-by-one values.
         self.budget
             .fetch_sub(self.difficulty, std::sync::atomic::Ordering::Release);
@@ -93,8 +93,8 @@ impl Drop for BudgetGuard {
 }
 
 // Slice 31: `AliasGuard` (now `SessionAliasGuard`) + its constructor
-// moved к `session::session_alias_guard` для consistency с slices 22-30.
-// See module-doc там for rationale.
+// moved to `session::session_alias_guard` for consistency with slices 22-30.
+// See module-doc there for rationale.
 
 // ── await_next_input ──────────────────────────────────────────────────────────
 
@@ -185,23 +185,23 @@ async fn await_next_input(
 
 // ── SessionRunner ─────────────────────────────────────────────────────────────
 
-/// Outcome от `decrypt_frame_body`: either the raw bytes are already
+/// Outcome from `decrypt_frame_body`: either the raw bytes are already
 /// the plaintext (no-cipher path, rare — only handshake-leading
-/// b bufpool: outcome от `decrypt_frame_body_in_place`. Allows
-/// the caller к borrow plaintext directly from the input buffer in
+/// b bufpool: outcome from `decrypt_frame_body_in_place`. Allows
+/// the caller to borrow plaintext directly from the input buffer in
 /// the common case (no plaintext allocation).
 ///
 /// The earlier `DecryptOutcome` enum + `decrypt_frame_body` heap-alloc
-/// fallback were the rollback path для the `bufpool-plaintext` feature
-/// flag; both removed after validation completed. If а rollback ever
-/// needed restore от git history.
+/// fallback were the rollback path for the `bufpool-plaintext` feature
+/// flag; both removed after validation completed. If a rollback ever
+/// needed restore from git history.
 pub enum DecryptInPlaceOutcome {
-    /// No cipher или empty body — caller uses the input slice as-is.
+    /// No cipher or empty body — caller uses the input slice as-is.
     Passthrough,
     /// In-place decrypt succeeded — input buffer now contains plaintext
     /// (length shrunk by `AEAD_OVERHEAD`). Zero-allocation success path.
     InPlace,
-    /// Rekey-grace fallback fired — prev-cipher allocated а new plaintext
+    /// Rekey-grace fallback fired — prev-cipher allocated a new plaintext
     /// buffer. Rare; only fires during the 30 s window post-rekey while
     /// the prev cipher remains armed in `RekeyRxGraceBuffer`.
     GracePlaintext(Vec<u8>),
@@ -215,11 +215,11 @@ pub enum DecryptInPlaceOutcome {
 /// freshly-derived keys.  The ML-KEM entries — `peer_mlkem_keys` (peer's
 /// public encapsulation cache) and `per_session_mlkem_dk` (this node's
 /// ephemeral decapsulation seed) — feed the hybrid-rekey path that
-/// mixes а post-quantum shared secret into the new symmetric keys.
+/// mixes a post-quantum shared secret into the new symmetric keys.
 ///
-/// All four are `Option` so test fixtures и minimal-runtime builds can
+/// All four are `Option` so test fixtures and minimal-runtime builds can
 /// run without crypto (`None` everywhere = pure plaintext frames, used
-/// by а handful of decode/encode unit tests).
+/// by a handful of decode/encode unit tests).
 pub struct CryptoState {
     /// AEAD cipher for outgoing frame bodies; `None` when encryption
     /// is not in use (handshake phase or no-crypto tests).
@@ -227,10 +227,10 @@ pub struct CryptoState {
     /// AEAD cipher for incoming frame bodies; `None` when encryption
     /// is not in use.
     pub rx_cipher: Option<SessionCipher>,
-    /// Peer ML-KEM-768 encapsulation-key cache.  When the peer sends а
+    /// Peer ML-KEM-768 encapsulation-key cache.  When the peer sends a
     /// `MlKemRekeyEk` frame, the runner updates
     /// `peer_mlkem_keys[peer_id]` to the new encapsulation key so
-    /// subsequent E2E messages к this peer use the rotated key.
+    /// subsequent E2E messages to this peer use the rotated key.
     pub peer_mlkem_keys: Option<Arc<std::sync::RwLock<veil_e2e::PeerMlKemCache>>>,
     /// Per-session ephemeral ML-KEM-768 decapsulation-key seed.  When
     /// we complete our own `MlKemRekeyEk` → `MlKemRekeyAck` exchange,
@@ -431,21 +431,21 @@ pub struct SessionRunner {
     pub hot_standby: HotStandbyState,
 
     /// **Primary transport URI** of this session (the URI the outbound
-    /// connector dialed, или `None` if this is an inbound-accepted
-    /// session where the local side doesn't know а dialable URI for
+    /// connector dialed, or `None` if this is an inbound-accepted
+    /// session where the local side doesn't know a dialable URI for
     /// the peer).
     ///
     /// Used by the rotation-deadline → hot-standby trigger path
-    /// (Q.7 audit batch) to dial **the same URI again** для true
-    /// zero-gap make-before-break когда no separate `alt_uri` is
-    /// configured.  Without this, rotation against а single-URI peer
-    /// falls back к the legacy "close + reconnect" path (~1 s gap).
+    /// (Q.7 audit batch) to dial **the same URI again** for true
+    /// zero-gap make-before-break when no separate `alt_uri` is
+    /// configured.  Without this, rotation against a single-URI peer
+    /// falls back to the legacy "close + reconnect" path (~1 s gap).
     ///
     /// Inbound sessions leave it `None` — the local side never
-    /// initiates rotation от the accept side (the peer who dialed us
-    /// is responsible для its own connection lifecycle); the field
+    /// initiates rotation from the accept side (the peer who dialed us
+    /// is responsible for its own connection lifecycle); the field
     /// being absent simply makes `fire_hot_standby_trigger` fall back
-    /// к the `alt_uri_for(peer_id)` lookup as before.
+    /// to the `alt_uri_for(peer_id)` lookup as before.
     pub primary_uri: Option<String>,
 }
 
@@ -473,11 +473,11 @@ pub const WRITE_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// this also caps the burst rate at which the wire channel fills —
 /// prevents a single-iteration spike from monopolising channel slots
 /// before the writer task drains them.
-// Phase E22 (2026-05-22): bumped от 16 к 256 для high-throughput
+// Phase E22 (2026-05-22): bumped from 16 to 256 for high-throughput
 // workloads (ogate-tunnel, bulk-transfer apps).  At 16 the priority-queue
-// dropped 64K frames в 12 s during iperf через ogate — drain couldn't
+// dropped 64K frames in 12 s during iperf through ogate — drain couldn't
 // match enqueue rate.  256 absorbs typical 2 Gbps-per-peer bursts
-// (~167K fps × 1.5 ms tokio-tick = ~250 frames) без overrun.  Worst-case
+// (~167K fps × 1.5 ms tokio-tick = ~250 frames) without overrun.  Worst-case
 // burst latency: 256 × ~3 µs/frame = ~750 µs per drain pass, still
 // well below the cover-traffic / keepalive scheduling granularity.
 pub const PQ_DRAIN_FRAMES_PER_PASS: usize = 256;
@@ -619,11 +619,11 @@ impl SessionRunner {
         }
     }
 
-    /// Emit the pre-encrypted SESSION_TICKET blob (если queued by the
+    /// Emit the pre-encrypted SESSION_TICKET blob (if queued by the
     /// caller via `ticket_to_send`) before the main loop starts.
     ///
-    /// Returns `Ok` if а ticket was sent successfully OR if no
-    /// ticket was queued. Returns `Err` если а cipher или wire-
+    /// Returns `Ok` if a ticket was sent successfully OR if no
+    /// ticket was queued. Returns `Err` if a cipher or wire-
     /// channel error happened — caller must propagate the early-exit
     /// to match the original inline `return`.
     fn send_pending_session_ticket(
@@ -656,12 +656,12 @@ impl SessionRunner {
         Ok(())
     }
 
-    /// Register session aliases (compact 8-byte handles для
-    /// RouteAnnounceAliased / RouteWithdrawAliased gossip) и return
-    /// а guard so the runner's `Drop` cleanup automatically
-    /// unregisters.  Slice 31: delegates к
+    /// Register session aliases (compact 8-byte handles for
+    /// RouteAnnounceAliased / RouteWithdrawAliased gossip) and return
+    /// a guard so the runner's `Drop` cleanup automatically
+    /// unregisters.  Slice 31: delegates to
     /// [`crate::session_alias_guard::register_session_aliases_with_drop_guard`]
-    /// — see там for full docs.
+    /// — see there for full docs.
     fn register_session_aliases_with_drop_guard(
         &self,
     ) -> Option<crate::session_alias_guard::SessionAliasGuard> {
@@ -683,9 +683,9 @@ impl SessionRunner {
     /// `HandoffInit` send fails cleanly and the session falls back to
     /// legacy reconnect-with-handshake.
     ///
-    /// Slice 29: counter + threshold logic encapsulated в
+    /// Slice 29: counter + threshold logic encapsulated in
     /// [`crate::write_error_tracker::WriteErrorTracker`].
-    /// This method now just delegates + дает naming для the trigger
+    /// This method now just delegates + gives naming for the trigger
     /// reason string.
     fn on_primary_write_error(&self, tracker: &mut crate::write_error_tracker::WriteErrorTracker) {
         use crate::write_error_tracker::TriggerFire;
@@ -710,18 +710,18 @@ impl SessionRunner {
     }
 
     /// Initiator-side `RekeyAck` frame handler.  Mirror of
-    /// `handle_rekey_init_arm` but для the initiator path — we sent а
-    /// `RekeyInit`, peer replied с their own ephemeral pubkey, now we
-    /// derive new keys и switch ciphers.
+    /// `handle_rekey_init_arm` but for the initiator path — we sent a
+    /// `RekeyInit`, peer replied with their own ephemeral pubkey, now we
+    /// derive new keys and switch ciphers.
     ///
     /// Like the responder helper, stashes the OLD `rx_cipher` into the
-    /// shared `rx_cipher_prev` grace ring before swapping к NEW —
-    /// without this, in-flight peer frames sealed с peer's OLD tx
+    /// shared `rx_cipher_prev` grace ring before swapping to NEW —
+    /// without this, in-flight peer frames sealed with peer's OLD tx
     /// (sent BEFORE peer received our RekeyAck) cannot decrypt with our
-    /// NEW rx и trigger `session.violation` → ban. The initiator-side
-    /// asymmetry that used к exist here surfaced as а stall pattern
+    /// NEW rx and trigger `session.violation` → ban. The initiator-side
+    /// asymmetry that used to exist here surfaced as a stall pattern
     /// under iperf-scale throughput (every byte-threshold-driven rekey
-    /// was а race с in-flight frames).
+    /// was a race with in-flight frames).
     ///
     /// Returns [`ControlFlow::Break`] to tear the session down when the peer's
     /// rekey ephemeral is non-contributory (a downgrade-toward-known-secret
@@ -738,10 +738,10 @@ impl SessionRunner {
             && let Ok(payload) = RekeyPayload::decode(body)
         {
             // RTT measurement: tag elapsed since RekeyInit push so
-            // оператор может видеть ack-arrival distribution и
-            // проверить — does it ever approach 30s grace?
+            // operator can observe ack-arrival distribution and
+            // verify — does it ever approach 30s grace?
             let init_to_ack_ms = rekey.last_rekey_at().elapsed().as_millis();
-            // l: demoted к DEBUG. Aggregate rate visible via
+            // l: demoted to DEBUG. Aggregate rate visible via
             // `veil_rekey_ack_received_total` counter.
             self.logger.debug(
                 "session.rekey.ack.rx",
@@ -756,17 +756,17 @@ impl SessionRunner {
                 m.inc_rekey_ack_received();
             }
             let Some(keypair) = rekey.take_initiator_keypair() else {
-                // FSM invariant violated: state changed between guard и take.
-                // Treat as а no-op к avoid panicking the session.
+                // FSM invariant violated: state changed between guard and take.
+                // Treat as a no-op to avoid panicking the session.
                 return ControlFlow::Continue(());
             };
             let shared = match kex::compute_shared_secret(keypair, &payload.ephemeral_pubkey) {
                 Ok(s) => s,
                 Err(e) => {
                     // Peer's rekey ephemeral was non-contributory — abort
-                    // the rekey AND tear the session down: continuing с
-                    // the existing keys against а peer that just tried к
-                    // negotiate down к а known-secret is unsafe.
+                    // the rekey AND tear the session down: continuing with
+                    // the existing keys against a peer that just tried to
+                    // negotiate down to a known-secret is unsafe.
                     self.logger.warn(
                         "session.rekey.non_contributory",
                         format!("peer_id={} error={}", hex_short(&self.peer_id), e),
@@ -782,9 +782,9 @@ impl SessionRunner {
             );
             // Stash the OLD rx_cipher into the grace ring before swapping.
             // Mirrors the responder-side stash in `handle_rekey_init_arm`.
-            // Без этого in-flight peer frames sealed с peer's OLD tx
-            // (sent BEFORE peer's RekeyAck reached us) cannot decrypt с
-            // NEW rx и trigger session.violation under iperf-scale load.
+            // Without this in-flight peer frames sealed with peer's OLD tx
+            // (sent BEFORE peer's RekeyAck reached us) cannot decrypt with
+            // NEW rx and trigger session.violation under iperf-scale load.
             if let Some(old) = self.crypto.rx_cipher.take() {
                 let now = tokio::time::Instant::now();
                 let outcome = rx_cipher_prev.push(old, now);
@@ -807,7 +807,7 @@ impl SessionRunner {
             self.crypto.rx_cipher = Some(SessionCipher::new(&new_keys.rx_key, true));
             self.session_id = new_keys.session_id;
             rekey.record_rekey_complete(tokio::time::Instant::now());
-            // l: demoted к DEBUG.
+            // l: demoted to DEBUG.
             self.logger.debug(
                 "session.rekey.complete",
                 format!(
@@ -823,8 +823,8 @@ impl SessionRunner {
     }
 
     /// Handler for incoming `SessionMsg::RekeyKeptInit`. The peer (with
-    /// lower node_id) is signaling that they kept their own init и dropped
-    /// ours during а mutual-rekey-init collision — our pending init won't
+    /// lower node_id) is signaling that they kept their own init and dropped
+    /// ours during a mutual-rekey-init collision — our pending init won't
     /// be ACK'd. Reset our state to `Idle` so we stop waiting, and push
     /// `last_rekey_at` to "now" so the time-threshold rekey trigger doesn't
     /// fire immediately again. This breaks the collision-loop pattern that
@@ -841,16 +841,16 @@ impl SessionRunner {
         self.logger.info(
             "session.rekey.collision.kept_init.rx",
             format!(
-                "peer_id={} gen={} — peer signaled their init wins; resetting к Idle",
+                "peer_id={} gen={} — peer signaled their init wins; resetting to Idle",
                 hex_short(&self.peer_id),
                 rekey.generation()
             ),
         );
     }
 
-    /// PQ-rekey responder. Peer sent а fresh ML-KEM EK; we update our
-    /// cache so future outgoing E2E messages к them are encapsulated
-    /// under the new key, then reply с an empty `MlKemRekeyAck`.
+    /// PQ-rekey responder. Peer sent a fresh ML-KEM EK; we update our
+    /// cache so future outgoing E2E messages to them are encapsulated
+    /// under the new key, then reply with an empty `MlKemRekeyAck`.
     ///
     /// `ControlFlow::Break` is returned on cipher/wire-write failure
     /// (same session-fatal contract as the X25519 rekey path).
@@ -904,8 +904,8 @@ impl SessionRunner {
 
     /// PQ-rekey initiator. Peer acknowledged our new EK; commit the
     /// pending DK seed so the dispatcher can decrypt future E2E
-    /// messages encrypted с our new EK. FSM-invariant violations log
-    /// а warning и no-op.
+    /// messages encrypted with our new EK. FSM-invariant violations log
+    /// a warning and no-op.
     fn handle_mlkem_rekey_ack_arm(
         &mut self,
         mlkem_rekey: &mut crate::mlkem_rekey_context::MlKemRekeyContext,
@@ -929,8 +929,8 @@ impl SessionRunner {
                 return;
             };
             // cap unbounded HashMap growth. Random
-            // eviction is acceptable — а missed dk-cache entry forces the
-            // next rekey к perform а full ML-KEM exchange.
+            // eviction is acceptable — a missed dk-cache entry forces the
+            // next rekey to perform a full ML-KEM exchange.
             {
                 use veil_proto::budget::MAX_PER_SESSION_MLKEM_DK;
                 let mut g = lock!(dk_map);
@@ -940,11 +940,11 @@ impl SessionRunner {
                 {
                     g.remove(&k);
                 }
-                // Этап 6 slice 6h — wrap the raw dk_seed в mlocked
+                // Phase 6 slice 6h — wrap the raw dk_seed in mlocked
                 // SensitiveBytesN<64> storage before stash.  The source
-                // [u8; 64] continues к live на the stack для one more
-                // instruction; that stack copy is а brief tail-leak що
-                // future slices can close через generate_keypair signature
+                // [u8; 64] continues to live on the stack for one more
+                // instruction; that stack copy is a brief tail-leak that
+                // future slices can close through generate_keypair signature
                 // changes (out of scope here).
                 g.insert(
                     self.peer_id,
@@ -956,17 +956,17 @@ impl SessionRunner {
         }
     }
 
-    /// Hot-standby `HandoffInit` handler. Peer announces it's about к
-    /// swap к а warm transport; we stash the rx_key + nonce keyed на
-    /// `(session_id, peer_id)` в the `HandoffRegistry` so that когда
+    /// Hot-standby `HandoffInit` handler. Peer announces it's about to
+    /// swap to a warm transport; we stash the rx_key + nonce keyed on
+    /// `(session_id, peer_id)` in the `HandoffRegistry` so that when
     /// the peer's warm socket arrives, we can verify the inbound HMAC
-    /// и accept the swap. Then emit а `HandoffAck` on the primary
+    /// and accept the swap. Then emit a `HandoffAck` on the primary
     /// AEAD session via the priority-queue flush (same pattern as
     /// `RekeyAck`).
     ///
     /// All failure paths (bad payload / no raw_session_keys / no
-    /// registry) log а warning или record а violation и no-op back
-    /// к the caller's `continue`. No frame is sent directly, so
+    /// registry) log a warning or record a violation and no-op back
+    /// to the caller's `continue`. No frame is sent directly, so
     /// no session-fatal failure mode.
     fn handle_handoff_init_arm(
         &mut self,
@@ -980,7 +980,7 @@ impl SessionRunner {
                 return;
             }
         };
-        // We need the receive-side AEAD key к hand к the registry —
+        // We need the receive-side AEAD key to hand to the registry —
         // this is the key that peer-side HMAC will be verifiable against
         // on the warm socket. For the handoff protocol, "rx_key" on
         // this side matches "tx_key" on the peer's side under OVL1 DH.
@@ -1030,7 +1030,7 @@ impl SessionRunner {
         );
     }
 
-    /// b bufpool: decrypt-in-place AEAD decrypt path для а freshly-read frame body.
+    /// b bufpool: decrypt-in-place AEAD decrypt path for a freshly-read frame body.
     ///
     /// Hot path: invokes `cipher.open_in_place(raw_body, &aad)` so the
     /// plaintext is written into the same pooled buffer that held the
@@ -1040,20 +1040,20 @@ impl SessionRunner {
     ///
     /// Rekey-grace fallback: when current cipher
     /// fails AND `rx_cipher_prev` is non-empty, the buffer is now
-    /// CORRUPTED by the failed in-place attempt — мы cannot retry against
+    /// CORRUPTED by the failed in-place attempt — we cannot retry against
     /// the prev ciphers on the same buffer. To preserve correctness, the
-    /// caller must hand us а pre-captured snapshot of the original
+    /// caller must hand us a pre-captured snapshot of the original
     /// ciphertext (see `decrypt_frame_body_in_place_with_snapshot`); we
-    /// fall back к the heap-allocating [`SessionCipher::open`] on that
+    /// fall back to the heap-allocating [`SessionCipher::open`] on that
     /// snapshot. Snapshot is captured ONLY when prev-ciphers are armed
     /// (~ 30 s post-rekey window) — fast path skips the copy entirely.
     ///
     /// Outcomes:
-    /// `Passthrough` — no cipher или empty body; raw_body is the plaintext
+    /// `Passthrough` — no cipher or empty body; raw_body is the plaintext
     /// `InPlace` — in-place decrypt succeeded; raw_body contains plaintext
-    /// `GracePlaintext(Vec)` — fallback к prev cipher; plaintext allocated
+    /// `GracePlaintext(Vec)` — fallback to prev cipher; plaintext allocated
     /// separately (rare, only during rekey grace)
-    /// `ControlFlow::Break` — nonce overflow или decrypt-failed-without-
+    /// `ControlFlow::Break` — nonce overflow or decrypt-failed-without-
     /// grace; caller should tear down the session
     fn decrypt_frame_body_in_place(
         &mut self,
@@ -1123,8 +1123,8 @@ impl SessionRunner {
                         if let Some(m) = &self.metrics {
                             m.inc_rekey_decrypt_fallback();
                         }
-                        // j: demoted к DEBUG. Fallback decrypts
-                        // fire ~1/sec под rekey churn; aggregate visibility via
+                        // j: demoted to DEBUG. Fallback decrypts
+                        // fire ~1/sec under rekey churn; aggregate visibility via
                         // `veil_rekey_decrypt_fallback_total` counter.
                         self.logger.debug(
                             "session.decrypt.fallback",
@@ -1162,29 +1162,29 @@ impl SessionRunner {
     }
 
     /// Compute the `await_next_input` sleep deadline for the next
-    /// iteration of the runner's main `select!`.  Combines up к seven
+    /// iteration of the runner's main `select!`.  Combines up to seven
     /// independent timer sources:
     ///
-    /// * **battery_keepalive** — always: 60s tick для re-sampling battery
+    /// * **battery_keepalive** — always: 60s tick for re-sampling battery
     ///   level + mobile-bg-keepalive factor.
     /// * **idle_deadline** — when `timer_enabled` (idle-timeout enabled):
-    ///   the cap-time после which we close а silent session.
+    ///   the cap-time after which we close a silent session.
     /// * **next_keepalive** — when `keepalive_enabled`: the time of our
     ///   next outgoing Keepalive frame.
     /// * **next_cover** — when `cover_enabled`: time
     ///   of our next discardable padding frame.
     /// * **stall_trigger_deadline** — when `idle_enabled` AND the trigger
-    ///   hasn't already fired для this stall episode: 2/3 · idle_timeout
-    ///   wake-up для the proactive rx-stall trigger.
-    /// * **keepalive_probe_deadline** — when а probe is in flight: the
+    ///   hasn't already fired for this stall episode: 2/3 · idle_timeout
+    ///   wake-up for the proactive rx-stall trigger.
+    /// * **keepalive_probe_deadline** — when a probe is in flight: the
     ///   `pending_keepalive_ack_since + keepalive_probe_timeout` deadline
     ///   for the TX-health check.
     /// * **coalesce_until** — when outbound batching is engaged (
     ///   deferred): time when the batch window expires.
     ///
-    /// Pure function на the supplied inputs — no `self` state read.
-    /// Lifted out as а free associated fn rather than а method so the
-    /// caller can pre-compute the inputs once и feed them в.
+    /// Pure function on the supplied inputs — no `self` state read.
+    /// Lifted out as a free associated fn rather than a method so the
+    /// caller can pre-compute the inputs once and feed them in.
     #[allow(clippy::too_many_arguments)] // 7 independent timer sources; structs would obscure the contract
     #[allow(clippy::too_many_arguments)]
     fn compute_sleep_deadline(
@@ -1208,14 +1208,14 @@ impl SessionRunner {
                 idle_deadline
             };
             // Cover-traffic deadline (anti-DPI). Always included when
-            // cover_enabled — on fire we emit а Padding frame от the
+            // cover_enabled — on fire we emit a Padding frame from the
             // timer branch.
             if timers.cover_enabled() {
                 kd = kd.min(timers.next_cover());
             }
-            // stage (c.2): wake к catch the rx-stall threshold
+            // stage (c.2): wake to catch the rx-stall threshold
             // at 2/3 · idle_timeout. Only matters when we haven't
-            // already fired the trigger для this stall episode.
+            // already fired the trigger for this stall episode.
             if timers.idle_enabled() && !stall_trigger_fired {
                 kd = kd.min(timers.stall_trigger_deadline());
             }
@@ -1233,9 +1233,9 @@ impl SessionRunner {
             Some(bat)
         };
         // deferred : fold the coalesce deadline in so
-        // the runner emerges от `await_next_input` exactly when the
+        // the runner emerges from `await_next_input` exactly when the
         // batch window expires. Without this the runner would sit idle
-        // (no input, no timer expiry) и deferred frames would only
+        // (no input, no timer expiry) and deferred frames would only
         // flush when the next external event arrived — defeating the
         // bounded-latency contract.
         let with_coalesce = match (timer_deadline, coalesce_until) {
@@ -1243,12 +1243,12 @@ impl SessionRunner {
             (None, Some(c)) => Some(c),
             (s, None) => s,
         };
-        // **Q.7 audit batch**: fold the rotation deadline в too,
-        // otherwise the `NextInput::Timer` arm никогда не gets reached
-        // в an idle session (keepalive=0, no app traffic) и the deadline
+        // **Q.7 audit batch**: fold the rotation deadline in too,
+        // otherwise the `NextInput::Timer` arm never gets reached
+        // in an idle session (keepalive=0, no app traffic) and the deadline
         // never fires.  Production sessions usually have non-zero
-        // keepalive so the timer fires regularly, но idle / test
-        // configurations need this explicit wake-up к make rotation
+        // keepalive so the timer fires regularly, but idle / test
+        // configurations need this explicit wake-up to make rotation
         // actually trigger.
         match (with_coalesce, rotation_deadline) {
             (Some(s), Some(r)) => Some(s.min(r)),
@@ -1258,8 +1258,8 @@ impl SessionRunner {
     }
 
     /// X25519 session-rekey threshold check. Fires when the session
-    /// is encrypted, has а valid session_id, и no rekey is already
-    /// в flight. Triggers (`RekeyTrigger`):
+    /// is encrypted, has a valid session_id, and no rekey is already
+    /// in flight. Triggers (`RekeyTrigger`):
     /// * **byte threshold** — `rekey_bytes_threshold` accumulated TX+RX
     ///   bytes since the last rekey.
     /// * **time threshold** — `rekey_time_threshold_secs` elapsed
@@ -1267,10 +1267,10 @@ impl SessionRunner {
     /// * **nonce watermark** — either
     ///   cipher's frame counter approaches 2^64. Logged separately
     ///   so operators can distinguish proactive cipher-counter rekeys
-    ///   от the regular byte/time-driven cadence.
+    ///   from the regular byte/time-driven cadence.
     ///
-    /// Emits а `SessionMsg::RekeyInit` on the priority queue at
-    /// `INTERACTIVE` и transitions `rekey` к `AwaitingAck`.
+    /// Emits a `SessionMsg::RekeyInit` on the priority queue at
+    /// `INTERACTIVE` and transitions `rekey` to `AwaitingAck`.
     fn maybe_initiate_x25519_rekey(
         &mut self,
         rekey: &mut crate::rekey_context::RekeyContext,
@@ -1325,7 +1325,7 @@ impl SessionRunner {
         );
         // 6.33 visibility: log the trigger reason so operators
         // can judge (a) byte vs time vs nonce-pressure mix.
-        // l: demoted к DEBUG. `veil_rekey_init_sent_total`.
+        // l: demoted to DEBUG. `veil_rekey_init_sent_total`.
         self.logger.debug(
             "session.rekey.init.tx",
             format!(
@@ -1343,10 +1343,10 @@ impl SessionRunner {
 
     /// ML-KEM E2E key rotation threshold check.  Only fires when E2E
     /// key infrastructure is fully wired (`per_session_mlkem_dk` +
-    /// `peer_mlkem_keys` both Some) и no rotation is already в flight.
-    /// Emits а `SessionMsg::MlKemRekeyEk` carrying the new
-    /// encapsulation key и transitions `mlkem_rekey` к `AwaitingAck`.
-    /// The peer's `RekeyAck` commit-on-receive path lives в
+    /// `peer_mlkem_keys` both Some) and no rotation is already in flight.
+    /// Emits a `SessionMsg::MlKemRekeyEk` carrying the new
+    /// encapsulation key and transitions `mlkem_rekey` to `AwaitingAck`.
+    /// The peer's `RekeyAck` commit-on-receive path lives in
     /// `handle_mlkem_rekey_ack_arm`.
     fn maybe_initiate_mlkem_rekey(
         &mut self,
@@ -1378,19 +1378,19 @@ impl SessionRunner {
 
     /// Drain the per-session outbox channel into the priority queue.
     /// Called at the top of each `select!` iteration; pulls every
-    /// queued frame от `outbox.try_recv` until `Empty`.
+    /// queued frame from `outbox.try_recv` until `Empty`.
     ///
     /// backstop: if the peer didn't negotiate chunking
     /// (`ovl1_minor < 2`) we drop incoming `CHUNK`-flagged frames
     /// rather than wire them through, even though the IPC send path
-    /// already guards с `chunking_supported` — defensive belt-and-
+    /// already guards with `chunking_supported` — defensive belt-and-
     /// braces.
     ///
-    /// Returns `Break` если the channel's `Sender` half has been
-    /// dropped (— `SessionTxRegistry::unregister` от
+    /// Returns `Break` if the channel's `Sender` half has been
+    /// dropped (— `SessionTxRegistry::unregister` from
     /// `ban_node` / `kill_session` / session close). The caller
     /// returns from `run` so the `SessionGuard` drops, the TCP
-    /// connection FINs cleanly, и banned peers stop receiving frames.
+    /// connection FINs cleanly, and banned peers stop receiving frames.
     fn drain_outbox_into_pq(
         &self,
         outbox: &mut mpsc::Receiver<crate::tx_registry::PriorityFrame>,
@@ -1419,13 +1419,13 @@ impl SessionRunner {
     }
 
     /// Drain the per-session RPC outbox into the priority queue,
-    /// registering each request's response channel в `pending_responses`
+    /// registering each request's response channel in `pending_responses`
     /// keyed by `request_id`.
     ///
     /// Cap + TTL eviction (`evict_expired` + `evict_oldest_if_at_capacity`)
     /// runs once per inserted request so the response table stays
     /// bounded under sustained RPC traffic. Frame is pushed at
-    /// `INTERACTIVE` priority к match the latency expectation of
+    /// `INTERACTIVE` priority to match the latency expectation of
     /// request-response patterns.
     fn drain_rpc_outbox_into_pq(
         &self,
@@ -1452,10 +1452,10 @@ impl SessionRunner {
     /// `MAX_PEER_TICKETS` to prevent unbounded growth — oldest entry
     /// (`min issued_at`) is evicted on insert when full.
     ///
-    /// Silently no-ops если `peer_tickets` store is not configured OR
+    /// Silently no-ops if `peer_tickets` store is not configured OR
     /// the body length doesn't match `SESSION_TICKET_ENCRYPTED_SIZE`
     /// OR `raw_session_keys` is not available (we don't have the keys
-    /// к pair с the ticket blob).
+    /// to pair with the ticket blob).
     fn handle_ticket_arm(&mut self, body: &[u8]) {
         if let (Some(store), Some((tx_key, rx_key, session_id))) =
             (self.peer_tickets.as_ref(), self.raw_session_keys)
@@ -1487,8 +1487,8 @@ impl SessionRunner {
     }
 
     /// `TransportMigrationNotify` receiver-side handler.  Peer is
-    /// announcing they've bound а new listener URI (ephemeral-port
-    /// rotation, Phase 5b/5e) and want us к update our cache so future
+    /// announcing they've bound a new listener URI (ephemeral-port
+    /// rotation, Phase 5b/5e) and want us to update our cache so future
     /// reconnects dial the new address.
     ///
     /// Path:
@@ -1496,16 +1496,16 @@ impl SessionRunner {
     /// 2. Sig-verify against the peer's handshake-attested pubkey.
     ///    The peer_id self-binding (`node_id == BLAKE3(pubkey)`) is
     ///    re-checked inside `verify_transport_migration_notify`; both
-    ///    must hold for the new URI к displace the cached one.
+    ///    must hold for the new URI to displace the cached one.
     /// 3. Reject IF the announced `node_id` doesn't match our session's
-    ///    `peer_id` — а valid sig for ANOTHER node is not authorization
-    ///    к update this peer's cache entry.
+    ///    `peer_id` — a valid sig for ANOTHER node is not authorization
+    ///    to update this peer's cache entry.
     /// 4. Insert `(peer_id, new_transport)` into the DHT transport-cache.
-    ///    Subsequent `ResolveTransport` lookups skip the round-trip и
+    ///    Subsequent `ResolveTransport` lookups skip the round-trip and
     ///    return the announced URI directly.
     /// 5. Replay-window failures (issued_at skew > 5 min) silently drop
-    ///    с а debug-level log — old captures replayed long after the
-    ///    fact must not displace а live entry, but recording them as
+    ///    with a debug-level log — old captures replayed long after the
+    ///    fact must not displace a live entry, but recording them as
     ///    abuse violations would surface false positives on clock-skewed
     ///    peers.
     pub fn handle_transport_migration_notify_arm(&mut self, body: &[u8]) {
@@ -1521,8 +1521,8 @@ impl SessionRunner {
         };
 
         // Announced node_id MUST match the session's peer_id.  Without
-        // this check, а compromised-but-not-pwned peer could forward
-        // someone else's signed notify к poison our cache for а third
+        // this check, a compromised-but-not-pwned peer could forward
+        // someone else's signed notify to poison our cache for a third
         // party.  Self-only sender, no relay semantics.
         if payload.node_id != self.peer_id {
             self.record_violation("TransportMigrationNotify: node_id != session peer_id");
@@ -1531,8 +1531,8 @@ impl SessionRunner {
 
         // Recover the peer's Ed25519 pubkey from the handshake-stored
         // base64 string.  `peer_public_key` is `None` for server-role
-        // sessions where the handshake didn't carry а full pubkey
-        // (older protocol versions); in that case there's nothing к
+        // sessions where the handshake didn't carry a full pubkey
+        // (older protocol versions); in that case there's nothing to
         // verify against, drop silently.
         let pubkey_b64 = match self.peer_public_key.as_ref() {
             Some(s) => s,
@@ -1574,11 +1574,11 @@ impl SessionRunner {
 
         if let Err(e) = verify_transport_migration_notify(&payload, &pubkey, now_unix) {
             // Replay-window failures are expected on clock-skewed peers
-            // и shouldn't poison the violation tracker.  Treat ANY
-            // verify failure as debug-only — а forged sig from а
+            // and shouldn't poison the violation tracker.  Treat ANY
+            // verify failure as debug-only — a forged sig from a
             // genuinely hostile peer would still be caught by the
             // node_id self-binding above (since the attacker can't
-            // produce а valid sig under the real peer's key).
+            // produce a valid sig under the real peer's key).
             self.logger.debug(
                 "session.migration.notify.verify_failed",
                 format!("peer_id={} reason={e}", hex_short(&self.peer_id),),
@@ -1587,8 +1587,8 @@ impl SessionRunner {
         }
 
         // Push the new URI into the cache.  `insert` overwrites any
-        // older entry under the same node_id и refreshes the TTL clock
-        // — exactly what we want после а deliberate migration.
+        // older entry under the same node_id and refreshes the TTL clock
+        // — exactly what we want after a deliberate migration.
         {
             let cache = self.dispatcher.dht().transport_cache();
             let mut c = lock!(cache);
@@ -1606,19 +1606,19 @@ impl SessionRunner {
     }
 
     /// PoW-Gated Rendezvous request handler — Slice 5b of the epic.
-    /// Spawns а task that runs the controller's full 10-step
+    /// Spawns a task that runs the controller's full 10-step
     /// orchestration (decode → verify → rate-limit → concurrent-slot
     /// → bind → sign-response).  On `Granted`, builds the
-    /// `SessionMsg::EphemeralEndpointResponse` frame и pushes it back
-    /// к the same peer через `session_tx_registry.send_to`.  On
-    /// `Rejected`, silently drops (DoS-resistance — а bare rejection
-    /// would still cost а CPU + bandwidth response).
+    /// `SessionMsg::EphemeralEndpointResponse` frame and pushes it back
+    /// to the same peer through `session_tx_registry.send_to`.  On
+    /// `Rejected`, silently drops (DoS-resistance — a bare rejection
+    /// would still cost a CPU + bandwidth response).
     ///
-    /// **Weak-upgrade pattern:** the dispatcher's strong Arc к the
-    /// controller is replaced by а Weak ref so the
+    /// **Weak-upgrade pattern:** the dispatcher's strong Arc to the
+    /// controller is replaced by a Weak ref so the
     /// `dispatcher → controller → binder → SessionRuntimeContext →
     /// dispatcher` strong-ref cycle doesn't leak on reload.  Each
-    /// dispatch upgrades the Weak; если the strong Arc is gone (no
+    /// dispatch upgrades the Weak; if the strong Arc is gone (no
     /// stealth listener configured OR runtime shutting down), the
     /// dispatch silently drops.
     fn handle_rendezvous_request_arm(&self, body: &[u8]) {
@@ -1636,7 +1636,7 @@ impl SessionRunner {
                     self.logger.debug(
                         "rendezvous.request.no_controller",
                         format!(
-                            "peer_id={} dropped (stealth listener не configured)",
+                            "peer_id={} dropped (stealth listener not configured)",
                             hex_short(&self.peer_id),
                         ),
                     );
@@ -1645,7 +1645,7 @@ impl SessionRunner {
             }
         };
 
-        // Hand the body к а task — handle_request is async (binder
+        // Hand the body to a task — handle_request is async (binder
         // does the actual bind).  Capture peer_id + session_tx_registry
         // ref for shipping the response back.
         let body_vec = body.to_vec();
@@ -1666,7 +1666,7 @@ impl SessionRunner {
                     ..
                 } => {
                     // Build SessionMsg::EphemeralEndpointResponse frame
-                    // и push back на the same session.
+                    // and push back on the same session.
                     let mut hdr = FrameHeader::new(
                         FrameFamily::Session as u8,
                         SessionMsg::EphemeralEndpointResponse as u16,
@@ -1710,7 +1710,7 @@ impl SessionRunner {
                     }
                 }
                 RequestOutcome::Rejected(reason) => {
-                    // Don't ship а rejection wire frame — DoS-resistance.
+                    // Don't ship a rejection wire frame — DoS-resistance.
                     // Logging only.
                     let kind = match reason {
                         RejectReason::Decode(_) => "decode",
@@ -1730,14 +1730,14 @@ impl SessionRunner {
     }
 
     /// `HandoffAck` receiver-side forwarder.  Initiator was waiting
-    /// for а ready-к-swap signal от the peer; we received it, forward
-    /// the nonce к the initiator's one-shot channel (registered в
+    /// for a ready-to-swap signal from the peer; we received it, forward
+    /// the nonce to the initiator's one-shot channel (registered in
     /// `handoff_ack_waiters` keyed by `session_id`).
     ///
     /// Missing-waiter case is silently logged at debug — the peer's
     /// pending handoff is already stashed, so any initiator
     /// retry will time out cleanly via the registry's TTL. Bad-payload
-    /// path records а violation и no-ops.
+    /// path records a violation and no-ops.
     fn handle_handoff_ack_arm(&mut self, body: &[u8]) {
         let ack = match veil_proto::session::HandoffAckPayload::decode(body) {
             Ok(p) => p,
@@ -1776,15 +1776,15 @@ impl SessionRunner {
     /// manipulation + collision resolution + grace-buffer stashing.
     ///
     /// The **mutual-rekey-init collision resolver** matters: if both
-    /// peers crossed the byte-threshold within RTT и each side
+    /// peers crossed the byte-threshold within RTT and each side
     /// simultaneously sent `RekeyInit` while still `AwaitingAck`,
-    /// lexicographic node_id ordering chooses а single initiator
-    /// (lower id wins).  Without this every collision ended в
+    /// lexicographic node_id ordering chooses a single initiator
+    /// (lower id wins).  Without this every collision ended in
     /// terminal AEAD-decrypt failure → session.violation → teardown.
     ///
     /// Returns:
     ///
-    /// * `Continue` — caller should `continue` к the next select-loop iteration.
+    /// * `Continue` — caller should `continue` to the next select-loop iteration.
     /// * `Break` — caller should `return` from `run` (cipher /
     ///   wire-write error — session is unrecoverable).
     fn handle_rekey_init_arm(
@@ -1802,7 +1802,7 @@ impl SessionRunner {
             && self.crypto.rx_cipher.is_some()
             && let Ok(payload) = RekeyPayload::decode(body)
         {
-            // l: demoted к DEBUG. `veil_rekey_init_received_total`.
+            // l: demoted to DEBUG. `veil_rekey_init_received_total`.
             self.logger.debug(
                 "session.rekey.init.rx",
                 format!(
@@ -1817,8 +1817,8 @@ impl SessionRunner {
             // Mutual rekey-init collision resolver — see method docstring
             // for the full incident write-up. Both peers run the same
             // comparison; lower lexicographic node_id keeps its initiator
-            // role и drops the peer's init, higher node_id aborts own
-            // init и falls through к the responder path below.
+            // role and drops the peer's init, higher node_id aborts own
+            // init and falls through to the responder path below.
             if rekey.is_awaiting_ack() {
                 if self.local_node_id < self.peer_id {
                     self.logger.info(
@@ -1826,19 +1826,19 @@ impl SessionRunner {
                         format!("peer_id={} gen={} local_node_id<peer_id — keeping own init, dropping peer's",
                             hex_short(&self.peer_id), rekey.generation()),
                     );
-                    // Inform the peer that their init has been dropped и
+                    // Inform the peer that their init has been dropped and
                     // ours is the authoritative one. Without this signal
-                    // peer's FSM is still в AwaitingAck (own init pending
-                    // ACK that will never come) и under high-throughput
-                    // both sides re-cross the byte threshold near-simul и
-                    // collide again — leading к the rekey-storm pattern.
+                    // peer's FSM is still in AwaitingAck (own init pending
+                    // ACK that will never come) and under high-throughput
+                    // both sides re-cross the byte threshold near-simul and
+                    // collide again — leading to the rekey-storm pattern.
                     let kept_init_hdr = FrameHeader::new(
                         FrameFamily::Session as u8,
                         SessionMsg::RekeyKeptInit as u16,
                     );
                     let kept_init_frame = encode_header(&kept_init_hdr).to_vec();
                     // empty body — but RekeyKeptInit must still be AEAD-encrypted
-                    // (current keys) to prove session-membership к the peer.
+                    // (current keys) to prove session-membership to the peer.
                     let wire_kept_init = {
                         let Some(cipher) = self.crypto.tx_cipher.as_mut() else {
                             return ControlFlow::Continue(());
@@ -1912,7 +1912,7 @@ impl SessionRunner {
                 self.on_primary_write_error(write_error_count);
                 return ControlFlow::Break(());
             }
-            // l: demoted к DEBUG. `veil_rekey_ack_sent_total`.
+            // l: demoted to DEBUG. `veil_rekey_ack_sent_total`.
             self.logger.debug(
                 "session.rekey.ack.tx",
                 format!(
@@ -1925,7 +1925,7 @@ impl SessionRunner {
                 m.inc_rekey_ack_sent();
             }
 
-            // 6.47-stash the OLD rx cipher as а
+            // 6.47-stash the OLD rx cipher as a
             // fallback for in-flight frames the initiator sent BEFORE it
             // received our RekeyAck (those are still encrypted with OLD
             // tx). Without this, the cluster develops transient decrypt-
@@ -1955,7 +1955,7 @@ impl SessionRunner {
             self.crypto.rx_cipher = Some(SessionCipher::new(&new_keys.rx_key, true));
             self.session_id = new_keys.session_id;
             rekey.record_rekey_complete(tokio::time::Instant::now());
-            // l: demoted к DEBUG.
+            // l: demoted to DEBUG.
             self.logger.debug(
                 "session.rekey.complete",
                 format!(
@@ -1974,16 +1974,16 @@ impl SessionRunner {
     /// a single call-site pattern and flap-damping is applied once per
     /// degradation event regardless of which signal raised it.
     ///
-    /// Returns `true` iff а warm-probe task was spawned (controller is
+    /// Returns `true` iff a warm-probe task was spawned (controller is
     /// configured, `alt_uri` known, flap damping accepted).  Returns
     /// `false` for any "fire-and-forget would no-op" case — caller can
     /// use this signal to teardown the session, since the primary is
     /// known-degraded and no failover is possible (audit batch 2026-05-24
-    /// M5: testnet hosts run без an `alt_uri` configured, so the
+    /// M5: testnet hosts run without an `alt_uri` configured, so the
     /// `keepalive_probe_timeout` trigger fires once but `try_auto_trigger`
-    /// returns `false`, the `OnceTrigger` prevents re-firing, и the
-    /// session zombies forever — каждый `outbound_connector` reconnect
-    /// сталкивается с stale `session_tx_registry` entry → permanent split).
+    /// returns `false`, the `OnceTrigger` prevents re-firing, and the
+    /// session zombies forever — every `outbound_connector` reconnect
+    /// collides with the stale `session_tx_registry` entry → permanent split).
     #[must_use]
     fn fire_hot_standby_trigger(&self, reason: &str) -> bool {
         let Some(ctrl) = self.hot_standby.controller.as_ref() else {
@@ -2003,13 +2003,13 @@ impl SessionRunner {
             format!("peer_id={} reason={reason}", hex_short(&self.peer_id)),
         );
         // **Q.7 audit batch**: `rotation_deadline` is the only failure-
-        // type reason that genuinely benefits от same-URI fallback —
+        // type reason that genuinely benefits from same-URI fallback —
         // the wire is still healthy, we just want fresh TCP+TLS bytes
-        // на the line.  All other reasons (`write_error_threshold`,
+        // on the line.  All other reasons (`write_error_threshold`,
         // `rx_stall`, `keepalive_probe_timeout`, `writer_closed`)
         // indicate the primary IS degraded, so same-
         // URI would just hit the same problem — keep them on the
-        // alt_uri-only path к avoid wasted dials.
+        // alt_uri-only path to avoid wasted dials.
         if reason == "rotation_deadline"
             && let Some(primary_uri) = self.primary_uri.as_deref()
         {
@@ -2020,12 +2020,12 @@ impl SessionRunner {
                 tx_key,
             );
         }
-        // Fallback path для:
+        // Fallback path for:
         //   * non-rotation reasons (`write_error_threshold`, `rx_stall`,
         //     `keepalive_probe_timeout`, `writer_closed`) — primary is
         //     degraded, only alt_uri makes sense.
-        //   * rotation reason без primary_uri (inbound-accepted session).
-        //     Server side doesn't initiate rotation в practice, но this
+        //   * rotation reason without primary_uri (inbound-accepted session).
+        //     Server side doesn't initiate rotation in practice, but this
         //     branch keeps the safety property.
         ctrl.try_auto_trigger(self.peer_id.into(), self.session_id, tx_key)
     }
@@ -2107,21 +2107,21 @@ impl SessionRunner {
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// Global TLS-bucket-padding flag (Phase E23, 2026-05-22).  When `true`,
-/// `coalesce_with_padding` pads each outbound frame к the nearest bucket
-/// в `TLS_BUCKET_SIZES` ([1300, 4096, 16384]) — DPI hardening: TLS
+/// `coalesce_with_padding` pads each outbound frame to the nearest bucket
+/// in `TLS_BUCKET_SIZES` ([1300, 4096, 16384]) — DPI hardening: TLS
 /// records look like generic HTTPS traffic.  When `false`, frames go
-/// out at their natural encrypted size без padding overhead.
+/// out at their natural encrypted size without padding overhead.
 ///
-/// Default **OFF** (changed от previous unconditional ON).  Testnet
-/// iperf через ogate revealed unconditional padding inflated single-
-/// stream wire traffic ~2.5× (1612 B → 4096 B bucket) и pinned the
-/// veil daemon at 70 % single-thread CPU около ~110 Mbps even
-/// though all explicit drop counters читали ZERO.
+/// Default **OFF** (changed from previous unconditional ON).  Testnet
+/// iperf through ogate revealed unconditional padding inflated single-
+/// stream wire traffic ~2.5× (1612 B → 4096 B bucket) and pinned the
+/// veil daemon at 70 % single-thread CPU around ~110 Mbps even
+/// though all explicit drop counters read ZERO.
 ///
-/// Operators in adversarial-DPI environments flip это via
+/// Operators in adversarial-DPI environments flip this via
 /// [`set_padding_enabled`] before the session-runner starts;
 /// runtime config-wiring (`PaddingPolicy.mode = Adaptive|Full`)
-/// belongs к а follow-up commit.
+/// belongs to a follow-up commit.
 static PADDING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Toggle TLS-bucket frame padding on the outbound hot path.
@@ -2129,8 +2129,8 @@ pub fn set_padding_enabled(on: bool) {
     PADDING_ENABLED.store(on, Ordering::Relaxed);
 }
 
-/// `true` если TLS-bucket frame padding is currently enabled.  Surfaced
-/// для diagnostic / admin-debug commands.
+/// `true` if TLS-bucket frame padding is currently enabled.  Surfaced
+/// for diagnostic / admin-debug commands.
 pub fn padding_enabled() -> bool {
     PADDING_ENABLED.load(Ordering::Relaxed)
 }
@@ -2150,16 +2150,16 @@ static MOBILE_BACKGROUND_KEEPALIVE_MULTIPLIER: AtomicU32 = AtomicU32::new(1);
 /// above — avoids threading a new field through 22+ SessionRunner
 /// construction sites.
 ///
-/// Paired с [`SESSION_MIN_AGE_SECS`] для range-based sampling.  When
-/// rotation is enabled, each session draws а deadline uniformly из
-/// the `[min, max]` window — see [`crate::rotation_deadline`] для why
-/// а range (not а point с ±10 %) prevents per-fleet rotation-cadence
+/// Paired with [`SESSION_MIN_AGE_SECS`] for range-based sampling.  When
+/// rotation is enabled, each session draws a deadline uniformly from
+/// the `[min, max]` window — see [`crate::rotation_deadline`] for why
+/// a range (not a point with ±10 %) prevents per-fleet rotation-cadence
 /// fingerprinting.
 static SESSION_MAX_AGE_SECS: AtomicU64 = AtomicU64::new(0);
 
-/// connection-rotation **minimum** lifetime (seconds). Paired с
+/// connection-rotation **minimum** lifetime (seconds). Paired with
 /// [`SESSION_MAX_AGE_SECS`].  When `0`, the rotation-deadline computer
-/// falls back к the legacy `±10 %` jitter around `SESSION_MAX_AGE_SECS`.
+/// falls back to the legacy `±10 %` jitter around `SESSION_MAX_AGE_SECS`.
 /// Set from `cfg.transport.rotation.min_lifetime_secs` at runtime
 /// startup + reload.
 ///
@@ -2167,7 +2167,7 @@ static SESSION_MAX_AGE_SECS: AtomicU64 = AtomicU64::new(0);
 static SESSION_MIN_AGE_SECS: AtomicU64 = AtomicU64::new(0);
 
 /// Hard floor on session rotation interval — defends against
-/// misconfig / malicious config push that would force рапид
+/// misconfig / malicious config push that would force rapid
 /// reconnect storms. Mirrors the validation rule so even a
 /// runtime call bypassing config-validate cannot push below.
 pub const MIN_SESSION_MAX_AGE_SECS: u64 = 60;
@@ -2181,7 +2181,7 @@ pub const MAX_MOBILE_BACKGROUND_KEEPALIVE_MULTIPLIER: u32 = 120;
 /// Hardcoded per-tier multiplier for the `Active` tier:
 /// background-but-UI-alive sessions get 2× longer keepalive — modest
 /// power savings without committing to the more aggressive LowPower
-/// stretch (the user может switch back to foreground at any second).
+/// stretch (the user can switch back to foreground at any second).
 pub const MOBILE_ACTIVE_TIER_MULTIPLIER: u32 = 2;
 
 /// Set the mobile background-mode tier. Values:
@@ -2195,7 +2195,7 @@ pub fn set_mobile_background_tier(tier: u8) {
     MOBILE_BACKGROUND_TIER.store(clamped, Ordering::Relaxed);
 }
 
-/// Legacy bool API — preserved для admin-command callers.
+/// Legacy bool API — preserved for admin-command callers.
 /// Maps `false` → Foreground (tier 0), `true` → LowPower (tier 2).
 /// New code should use [`set_mobile_background_tier`] directly to access
 /// the Active middle tier.
@@ -2215,8 +2215,8 @@ pub fn set_mobile_background_keepalive_multiplier(multiplier: u32) {
 }
 
 /// Read the current mobile background-mode tier.
-/// Exposed для diagnostic snapshots
-/// и tests. Production callers use this via `mobile_status_provider.rs`
+/// Exposed for diagnostic snapshots
+/// and tests. Production callers use this via `mobile_status_provider.rs`
 /// to populate the IPC payload's `background_tier` byte.
 pub fn current_mobile_background_tier() -> u8 {
     MOBILE_BACKGROUND_TIER.load(Ordering::Relaxed)
@@ -2262,15 +2262,15 @@ pub fn current_mobile_background_keepalive_multiplier() -> u32 {
 // is set, the session runner defers the priority-queue drain pass while
 // the queue head priority is BULK or BACKGROUND, up to `window_ms`
 // since the previous flush. INTERACTIVE / REALTIME frames bypass the
-// delay: они sit at queue head thanks к WRR ordering, so peek returns
-// them и drain proceeds immediately.
+// delay: they sit at queue head thanks to WRR ordering, so peek returns
+// them and drain proceeds immediately.
 //
 // Two signals (battery threshold + window) are stored as process-global
 // atomics — same pattern as `MOBILE_BACKGROUND_KEEPALIVE_MULTIPLIER`
 // avoids threading mobile config through 22+ SessionRunner construction
 // sites. Default `(threshold = DISABLED_SENTINEL, window = 0)` ⇒
 // `current_outbound_batch_window` returns `None` and the runner's
-// drain path stays identical к pre-slice baseline.
+// drain path stays identical to pre-slice baseline.
 
 /// Sentinel for "battery awareness disabled" — mirrors
 /// `veil_proto::ipc::MOBILE_LOW_BATTERY_THRESHOLD_DISABLED`.
@@ -2281,7 +2281,7 @@ static MOBILE_LOW_BATTERY_THRESHOLD_PCT: AtomicU8 =
 static MOBILE_OUTBOUND_BATCH_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror of `MobileConfig::MAX_OUTBOUND_BATCH_WINDOW_MS` — defended
-/// at the global-signal layer so even а runtime call bypassing config
+/// at the global-signal layer so even a runtime call bypassing config
 /// validation cannot stretch coalescing past 1 s (which would risk
 /// stalling 1-second-cadence ROUTE_PROBE liveness).
 pub const MAX_MOBILE_OUTBOUND_BATCH_WINDOW_MS: u32 = 1000;
@@ -2296,7 +2296,7 @@ pub fn set_mobile_low_battery_threshold_pct(threshold: Option<u8>) {
 }
 
 /// Set the outbound-batch window in milliseconds.
-/// `0` disables coalescing. Clamped к `MAX_MOBILE_OUTBOUND_BATCH_WINDOW_MS`.
+/// `0` disables coalescing. Clamped to `MAX_MOBILE_OUTBOUND_BATCH_WINDOW_MS`.
 pub fn set_mobile_outbound_batch_window_ms(ms: u32) {
     let clamped = ms.min(MAX_MOBILE_OUTBOUND_BATCH_WINDOW_MS);
     MOBILE_OUTBOUND_BATCH_WINDOW_MS.store(clamped, Ordering::Relaxed);
@@ -2332,11 +2332,11 @@ pub fn current_outbound_batch_window(battery_pct: u8) -> Option<std::time::Durat
 /// against bypass). Called from runtime startup + reload with
 /// the value from `cfg.session.max_age_secs`.
 ///
-/// **Range-aware variant:** [`set_session_rotation_range`] — pass а
+/// **Range-aware variant:** [`set_session_rotation_range`] — pass a
 /// `(min, max)` pair (sampled uniformly per session).  This single-
-/// value form is preserved для back-compat с the deprecated
+/// value form is preserved for back-compat with the deprecated
 /// `cfg.session.max_age_secs`; internally it sets `min = 0` so the
-/// rotation-deadline computer falls к its legacy `±10 %` jitter path.
+/// rotation-deadline computer falls to its legacy `±10 %` jitter path.
 pub fn set_session_max_age_secs(secs: u64) {
     let stored = if secs == 0 {
         0
@@ -2347,17 +2347,17 @@ pub fn set_session_max_age_secs(secs: u64) {
     // Single-value mode: clear the min so SessionRotationDeadline
     // takes the legacy ±10 % jitter codepath.  Callers using the
     // range form must call `set_session_rotation_range` (which
-    // overrides both atomics atomically-enough — we accept а brief
-    // observable transient since this is а config-reload-time call).
+    // overrides both atomics atomically-enough — we accept a brief
+    // observable transient since this is a config-reload-time call).
     SESSION_MIN_AGE_SECS.store(0, Ordering::Relaxed);
 }
 
 /// Set the session-rotation **range** (seconds).  Each new session
-/// draws а deadline uniformly из `[min, max]`.  Passing `(0, 0)`
-/// disables rotation entirely.  Both values are clamped UP к
-/// `MIN_SESSION_MAX_AGE_SECS` если non-zero (mirrors the validation
+/// draws a deadline uniformly from `[min, max]`.  Passing `(0, 0)`
+/// disables rotation entirely.  Both values are clamped UP to
+/// `MIN_SESSION_MAX_AGE_SECS` if non-zero (mirrors the validation
 /// floor — defends against bypassed config push).  If `min > max`
-/// after clamping, `min` is clamped down к `max`.
+/// after clamping, `min` is clamped down to `max`.
 ///
 /// Called from runtime startup + reload with the resolved range from
 /// `cfg.transport.rotation.{min,max}_lifetime_secs` (see
@@ -2375,9 +2375,9 @@ pub fn set_session_rotation_range(min_secs: u64, max_secs: u64) {
             .max(MIN_SESSION_MAX_AGE_SECS)
             .min(max_stored.max(1))
     };
-    // Order matters: store max first so а concurrent reader of
+    // Order matters: store max first so a concurrent reader of
     // `current_session_rotation_range` never observes min > max
-    // (it'd then clamp min к max и behave correctly).
+    // (it'd then clamp min to max and behave correctly).
     SESSION_MAX_AGE_SECS.store(max_stored, Ordering::Relaxed);
     SESSION_MIN_AGE_SECS.store(min_stored, Ordering::Relaxed);
 }
@@ -2389,32 +2389,32 @@ pub fn current_session_max_age_secs() -> u64 {
     SESSION_MAX_AGE_SECS.load(Ordering::Relaxed)
 }
 
-/// **Test-only escape hatch** — set the rotation range без the
+/// **Test-only escape hatch** — set the rotation range without the
 /// production-side floor clamp at [`MIN_SESSION_MAX_AGE_SECS`].
-/// Integration tests need к exercise the deadline-fires-runner-closes
-/// path в seconds, не minutes, but the production setter rightly
-/// pushes sub-60 s values UP к defend против misconfig.  This bypass
+/// Integration tests need to exercise the deadline-fires-runner-closes
+/// path in seconds, not minutes, but the production setter rightly
+/// pushes sub-60 s values UP to defend against misconfig.  This bypass
 /// preserves the production setter's invariants (production code does
-/// NOT call this), но lets the test suite stage а 1-2 s rotation
-/// window и verify the timer actually wakes the runner.
+/// NOT call this), but lets the test suite stage a 1-2 s rotation
+/// window and verify the timer actually wakes the runner.
 ///
-/// `#[doc(hidden)]` signals "internal API; не use в production code"
-/// без needing the integration-test crate к live alongside `#[cfg(test)]`
-/// (integration tests are external crates и can't see cfg-test items).
+/// `#[doc(hidden)]` signals "internal API; not use in production code"
+/// without needing the integration-test crate to live alongside `#[cfg(test)]`
+/// (integration tests are external crates and can't see cfg-test items).
 #[doc(hidden)]
 pub fn set_session_rotation_range_unchecked_for_tests(min_secs: u64, max_secs: u64) {
     SESSION_MAX_AGE_SECS.store(max_secs, Ordering::Relaxed);
     SESSION_MIN_AGE_SECS.store(min_secs, Ordering::Relaxed);
 }
 
-/// Resolved `(min, max)` rotation range, или `(0, 0)` if disabled.
+/// Resolved `(min, max)` rotation range, or `(0, 0)` if disabled.
 /// When `min == 0 && max > 0`, callers should treat this as legacy
-/// single-value mode (point с ±10 % jitter); when both > 0,
-/// callers sample uniformly из the closed interval.
+/// single-value mode (point with ±10 % jitter); when both > 0,
+/// callers sample uniformly from the closed interval.
 pub fn current_session_rotation_range() -> (u64, u64) {
     let max = SESSION_MAX_AGE_SECS.load(Ordering::Relaxed);
     let min = SESSION_MIN_AGE_SECS.load(Ordering::Relaxed);
-    // Defensive: если а concurrent setter writes out-of-order и we
+    // Defensive: if a concurrent setter writes out-of-order and we
     // see min > max, clamp.  Same reasoning as in `set_…_range`.
     if min > max && max > 0 {
         (max, max)
@@ -2440,11 +2440,11 @@ pub fn jitter_keepalive_interval(base: std::time::Duration) -> std::time::Durati
     std::time::Duration::from_millis(ms.max(1))
 }
 
-/// Returns the encrypted wire as а `PooledShared` — backing buffer
-/// comes от the global pool и returns there on Drop after the wire
-/// writer flushes к the socket. This closes the loop for the largest
+/// Returns the encrypted wire as a `PooledShared` — backing buffer
+/// comes from the global pool and returns there on Drop after the wire
+/// writer flushes to the socket. This closes the loop for the largest
 /// outbound allocator (chat_node-style 60 KB frames): same buffer
-/// recycles across hundreds of frames без touching the system
+/// recycles across hundreds of frames without touching the system
 /// allocator. Callers send the `PooledShared` through `wire_tx`
 ///
 pub fn apply_tx_cipher(
@@ -2455,7 +2455,7 @@ pub fn apply_tx_cipher(
     use veil_proto::header::HEADER_SIZE;
     if frame.len() <= HEADER_SIZE {
         // Header-only frame (no body to encrypt). Wrap the input slice
-        // through а pool copy — these are infrequent (handshake/keepalive
+        // through a pool copy — these are infrequent (handshake/keepalive
         // territory) so the extra copy is negligible vs maintaining
         // separate non-pooled call paths.
         return Some(veil_bufpool::pooled_shared_from_vec(frame.to_vec()));
@@ -2464,12 +2464,12 @@ pub fn apply_tx_cipher(
     let h = decode_header(frame).ok()?;
     let aad = frame_aad(h.family, h.msg_type);
     // i: encrypt directly into the pool buffer instead of
-    // allocating а fresh `Vec<u8>` via `cipher.seal(...)`. At 15 k frames/sec
-    // on а bootstrap that path produced ~900 MiB/sec of small-arena churn —
-    // bypassing the bufpool entirely и pinning dirty pages в jemalloc faster
+    // allocating a fresh `Vec<u8>` via `cipher.seal(...)`. At 15 k frames/sec
+    // on a bootstrap that path produced ~900 MiB/sec of small-arena churn —
+    // bypassing the bufpool entirely and pinning dirty pages in jemalloc faster
     // than `dirty_decay_ms=1000` could release them. The pool buffer holds
     // `[header | plaintext | tag]`; we encrypt the plaintext slice in-place
-    // append the 16-byte detached tag, и patch the header's body_len.
+    // append the 16-byte detached tag, and patch the header's body_len.
     let plaintext_len = plaintext_body.len();
     let ct_total = plaintext_len + veil_crypto::session_cipher::AEAD_OVERHEAD;
     let mut out_hdr = h;
@@ -2480,7 +2480,7 @@ pub fn apply_tx_cipher(
         .extend_from_slice(&encode_header(&out_hdr));
     out_pooled.as_vec_mut().extend_from_slice(plaintext_body);
     // Encrypt the plaintext region of the pool buffer in place; on success
-    // получаем 16-byte tag к append. Bounds: we just wrote exactly
+    // obtain the 16-byte tag to append. Bounds: we just wrote exactly
     // `plaintext_len` bytes after the header, so the slice is well-defined.
     let pt_start = HEADER_SIZE;
     let pt_end = HEADER_SIZE + plaintext_len;
@@ -2651,10 +2651,10 @@ impl SessionRunner {
             PriorityQueue::new(self.qos_weights)
         };
         // Pending RPC responses: request_id → oneshot sender.
-        // Bounded к max_pending_responses; entries older than
-        // pending_response_ttl are evicted к prevent DoS via fake
-        // request_ids.  See `pending_response_table.rs` для the
-        // asymmetry between try_recv-drain и select-arm insert paths.
+        // Bounded to max_pending_responses; entries older than
+        // pending_response_ttl are evicted to prevent DoS via fake
+        // request_ids.  See `pending_response_table.rs` for the
+        // asymmetry between try_recv-drain and select-arm insert paths.
         let mut pending_responses = crate::pending_response_table::PendingResponseTable::new(
             self.max_pending_responses,
             self.pending_response_ttl,
@@ -2699,26 +2699,26 @@ impl SessionRunner {
         // on_primary_write_error. Not reset on successful write — a
         // half-dead primary may flap between OK and err, and we want the
         // trigger to fire on cumulative failure within the session's life.
-        // Slice 29: counter + threshold compare encapsulated в
-        // `WriteErrorTracker`.  Threshold pulled от hot-standby config
-        // — zero disables auto-trigger (default for sessions без а
+        // Slice 29: counter + threshold compare encapsulated in
+        // `WriteErrorTracker`.  Threshold pulled from hot-standby config
+        // — zero disables auto-trigger (default for sessions without a
         // hot-standby setup).
         let mut write_error_count = crate::write_error_tracker::WriteErrorTracker::new(
             self.hot_standby.auto_trigger_after_write_errors,
         );
         // OnceTrigger fires once per stall event — caller resets it
-        // on any incoming frame so а subsequent stall can re-fire.
+        // on any incoming frame so a subsequent stall can re-fire.
         let mut stall_trigger = crate::once_trigger::OnceTrigger::new();
         // Ledger of the OLDEST unacked outgoing Keepalive timestamp.
-        // Armed when we send а Keepalive и no prior probe is pending;
+        // Armed when we send a Keepalive and no prior probe is pending;
         // cleared on incoming KeepaliveAck.  If
         // `now - oldest >= keepalive_probe_timeout` AND no ack has
-        // arrived, the TX leg of the primary is considered broken и
+        // arrived, the TX leg of the primary is considered broken and
         // we fire the hot-standby trigger.  Distinct from rx_stall:
         // rx_stall is masked by the peer's own keepalives flowing IN
         // while our keepalives fail to go OUT (Windows Firewall
         // half-block scenario).  `try_arm` preserves the oldest-armed
-        // invariant — а keepalive sent while а probe is already в
+        // invariant — a keepalive sent while a probe is already in
         // flight does NOT advance the timestamp.
         let mut pending_keepalive_probe = crate::keepalive_emit::PendingKeepaliveProbe::new();
         let mut keepalive_probe_trigger = crate::once_trigger::OnceTrigger::new();
@@ -2733,10 +2733,10 @@ impl SessionRunner {
         let keepalive_probe_timeout = self.keepalive_interval;
 
         // ── Backpressure state ────────────────────────────────────
-        // When the peer exceeds its rate limit, we send а Backpressure
-        // control frame so the peer marks us as congested и
-        // redistributes traffic.  Rate-limit drops NEVER escalate к
-        // violations — а relay peer can't reduce forwarded traffic, so
+        // When the peer exceeds its rate limit, we send a Backpressure
+        // control frame so the peer marks us as congested and
+        // redistributes traffic.  Rate-limit drops NEVER escalate to
+        // violations — a relay peer can't reduce forwarded traffic, so
         // banning it would worsen the situation.
         const BP_SIGNAL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
         let mut bp_signal = crate::backpressure_signal::BackpressureSignal::new(BP_SIGNAL_COOLDOWN);
@@ -2759,10 +2759,10 @@ impl SessionRunner {
             self.rekey.bytes_threshold,
             self.rekey.time_threshold_secs,
         );
-        // hardening: после responder switches к NEW
-        // rx_cipher на rekey, the OLD cipher must be retained briefly
+        // hardening: after responder switches to NEW
+        // rx_cipher on rekey, the OLD cipher must be retained briefly
         // so in-flight initiator frames sent BEFORE the initiator
-        // received the RekeyAck (and thus still encrypted с OLD tx)
+        // received the RekeyAck (and thus still encrypted with OLD tx)
         // can be decrypted via fallback. Without this, the cluster
         // experiences a transient AEAD-failure storm at every rekey
         // (~21 rekeys per session at 18 MiB/s sustained traffic).
@@ -2772,18 +2772,18 @@ impl SessionRunner {
         // than frame-count-based. Frame-count grace exhausted faster
         // than RTT covers RekeyAck arrival under chat-node load —
         // 256 frames @ ~80-100 fps = ~3 s of cover, but cross-country
-        // VPS RTT can spike past that during busy hours, leading к
+        // VPS RTT can spike past that during busy hours, leading to
         // sporadic decrypt-failure session teardowns (incident note
-        // 30 s window adapts naturally к traffic rate
-        // (high or idle) и comfortably covers any realistic
+        // 30 s window adapts naturally to traffic rate
+        // (high or idle) and comfortably covers any realistic
         // RekeyInit→RekeyAck round-trip. Memory cost: one extra
         // SessionCipher per session for ≤ 30 s — negligible.
         // keep a small ring of previous rx
         // ciphers so back-to-back rekeys (gen-N-1 already in grace
         // when gen-N rekey starts) do not orphan in-flight frames
         // encrypted with gen-N-2 and trigger a session-teardown
-        // decrypt-failure storm.  `RekeyRxGraceBuffer` is а FIFO ring
-        // с TTL prune + cap-evict + newest-first try-open.
+        // decrypt-failure storm.  `RekeyRxGraceBuffer` is a FIFO ring
+        // with TTL prune + cap-evict + newest-first try-open.
         const REKEY_RX_PREV_CAP: usize = 16;
         const REKEY_RX_GRACE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
         let mut rx_cipher_prev = crate::rekey_rx_grace_buffer::RekeyRxGraceBuffer::new(
@@ -2802,9 +2802,9 @@ impl SessionRunner {
         let idle_timeout = self.idle_timeout;
         let keepalive_enabled = !keepalive_interval.is_zero();
         let idle_enabled = idle_timeout > std::time::Duration::ZERO;
-        // rotation deadline is checked в the Timer arm
+        // rotation deadline is checked in the Timer arm
         // so timer must fire even when keepalive + idle_timeout are
-        // both disabled (rare but happens в test fixtures + relay-
+        // both disabled (rare but happens in test fixtures + relay-
         // only configs). Without this, a keepalive-disabled session
         // with rotation configured would never rotate.
         // Note: session_rotation is computed below; we don't have it yet here
@@ -2837,7 +2837,7 @@ impl SessionRunner {
         // deferred : outbound-batch coalescer holds the timestamp of
         // the last priority-queue drain pass + provides the "should
         // this drain be deferred?" check.  Slice 30 (architecture
-        // backlog): logic encapsulated в
+        // backlog): logic encapsulated in
         // `crate::outbound_batch_coalescer::OutboundBatchCoalescer`.
         let mut outbound_coalescer = crate::outbound_batch_coalescer::OutboundBatchCoalescer::new(
             tokio::time::Instant::now(),
@@ -2911,7 +2911,7 @@ impl SessionRunner {
                     }
                     // Opportunistic grace-ring prune (audit batch 2026-05-21
                     // Phase E17): RekeyRxGraceBuffer::prune_expired runs
-                    // только on decrypt attempts.  При stuck rekey + silent
+                    // only on decrypt attempts.  On a stuck rekey + silent
                     // peer (no inbound frames), old rx ciphers sit in the
                     // buffer for the full 30 s grace window unused.
                     // Cover-due tick fires every cover-interval (~30 s), so
@@ -2969,13 +2969,13 @@ impl SessionRunner {
                     // outbound is policy-rejected.  Net: permanent split
                     // until daemon restart (testnet node3 was stuck like
                     // this for 4h56m; first M5 fix gated on `controller.
-                    // is_none()` alone и regressed within 30 min because
-                    // testnet hot-standby IS wired but без an `alt_uri`).
+                    // is_none()` alone and regressed within 30 min because
+                    // testnet hot-standby IS wired but without an `alt_uri`).
                     // Fix: tear down whenever the trigger fires and the
-                    // controller couldn't spawn а warm probe — that's
-                    // the signal that no failover is available, и
+                    // controller couldn't spawn a warm probe — that's
+                    // the signal that no failover is available, and
                     // letting the session zombie indefinitely is strictly
-                    // worse than forcing а fresh reconnect.
+                    // worse than forcing a fresh reconnect.
                     if keepalive_enabled
                         && !keepalive_probe_trigger.has_fired()
                         && keepalive_probe_timeout > std::time::Duration::ZERO
@@ -2994,7 +2994,7 @@ impl SessionRunner {
                         return;
                     }
                 }
-                // Rekey-threshold checks — both no-op unless а fresh
+                // Rekey-threshold checks — both no-op unless a fresh
                 // rekey is needed (X25519 cipher rotation +
                 // nonce-watermark, PQ E2E key rotation respectively).
                 self.maybe_initiate_x25519_rekey(&mut rekey, &mut pq);
@@ -3066,7 +3066,7 @@ impl SessionRunner {
                         // pre-handshake because the padding frame itself
                         // is an encrypted session frame.
                         let tx_len = outgoing.len() as u64;
-                        // outgoing is already а PooledShared — pass through.
+                        // outgoing is already a PooledShared — pass through.
                         if Self::push_wire(&wire_tx, outgoing.clone(), &self.metrics).is_err() {
                             self.on_primary_write_error(&mut write_error_count);
                             return;
@@ -3078,7 +3078,7 @@ impl SessionRunner {
                         mlkem_rekey.record_bytes(tx_len);
                     }
                 }
-                // deferred : stamp the coalescer's last-drain time after а
+                // deferred : stamp the coalescer's last-drain time after a
                 // successful drain pass (any frames emitted). Doing it
                 // unconditionally would let the deadline creep forward
                 // even on no-op iterations — caller would never get the
@@ -3086,10 +3086,10 @@ impl SessionRunner {
                 if drained_this_pass > 0 {
                     outbound_coalescer.record_drain(tokio::time::Instant::now());
                 }
-                // `compute_sleep_deadline` folds up к 7 independent
+                // `compute_sleep_deadline` folds up to 7 independent
                 // timer sources (battery, idle, keepalive, cover, rx-
                 // stall trigger, keepalive-probe timeout, coalesce
-                // window).  See its docstring для the full matrix.
+                // window).  See its docstring for the full matrix.
                 let sleep_until = Self::compute_sleep_deadline(
                     &timers,
                     &battery_keepalive,
@@ -3132,7 +3132,7 @@ impl SessionRunner {
                         writer_handle = new_handle;
                         timers.note_swap(tokio::time::Instant::now());
                         // stage (c.2): the swap clears any prior
-                        // rx-stall condition, so а subsequent stall can
+                        // rx-stall condition, so a subsequent stall can
                         // legitimately re-fire the trigger.
                         stall_trigger.clear();
                         continue;
@@ -3140,9 +3140,9 @@ impl SessionRunner {
                     NextInput::RpcRequest(req) => {
                         let now = tokio::time::Instant::now();
                         // NOTE: capacity-evict deliberately omitted here —
-                        // the drain-loop path в Step 1b does the
+                        // the drain-loop path in Step 1b does the
                         // capacity check for batched arrivals. See
-                        // `PendingResponseTable` doc-comment для the
+                        // `PendingResponseTable` doc-comment for the
                         // asymmetry rationale.
                         pending_responses.evict_expired(now);
                         pending_responses.insert(req.request_id, req.response_tx, now);
@@ -3161,42 +3161,42 @@ impl SessionRunner {
                         // Defeats long-lived-connection DPI fingerprint by
                         // forcing fresh TCP+TLS handshake every N minutes.
                         //
-                        // **Phase 2 (Q.7 audit batch)**: prefer а hot-
+                        // **Phase 2 (Q.7 audit batch)**: prefer a hot-
                         // standby make-before-break swap if an `alt_uri`
                         // is registered for the peer.  This gives true
                         // zero-gap rotation — the new transport completes
                         // its OVL1 handshake AND the 3-frame handoff
                         // protocol fully BEFORE the old stream is dropped,
-                        // so AEAD state + nonce counters survive intact и
+                        // so AEAD state + nonce counters survive intact and
                         // queued frames continue flowing through the
                         // same `SessionTxRegistry` sender.
                         //
                         // If hot-standby refuses (no alt_uri, flap
-                        // damping triggered, или URI parse failed), fall
-                        // back к the legacy graceful-close path: just
-                        // return from `run` и let the outbound connector
+                        // damping triggered, or URI parse failed), fall
+                        // back to the legacy graceful-close path: just
+                        // return from `run` and let the outbound connector
                         // re-dial (≈1 s gap).  Either way DPI sees the
-                        // old TCP close + а new TCP+TLS handshake — а
-                        // pattern indistinguishable от а browser tab
-                        // ending и а new one starting.  No "rotation
+                        // old TCP close + a new TCP+TLS handshake — a
+                        // pattern indistinguishable from a browser tab
+                        // ending and a new one starting.  No "rotation
                         // goodbye" frame is sent — that would itself be
-                        // а fingerprint.
+                        // a fingerprint.
                         if session_rotation.is_due(now) {
                             if self.fire_hot_standby_trigger("rotation_deadline") {
-                                // Make-before-break is now in flight в
+                                // Make-before-break is now in flight in
                                 // the background warm-probe task.  Re-
                                 // arm the deadline so we don't re-fire
-                                // before the swap completes (на success
-                                // the runner sees `SwapStream` через
-                                // `swap_rx` и rebinds the stream
+                                // before the swap completes (on success
+                                // the runner sees `SwapStream` through
+                                // `swap_rx` and rebinds the stream
                                 // in-place — same session, new
-                                // transport).  Picks а fresh random
-                                // window из `[min, max]`.
+                                // transport).  Picks a fresh random
+                                // window from `[min, max]`.
                                 session_rotation =
                                     crate::rotation_deadline::SessionRotationDeadline::compute(now);
                                 continue;
                             }
-                            // No alt_uri available (или flap-damped).
+                            // No alt_uri available (or flap-damped).
                             // Graceful close: just return from `run`.
                             // The caller cleans up.  Pre-Q.7 behaviour
                             // preserved bit-for-bit.
@@ -3297,21 +3297,21 @@ impl SessionRunner {
             // (16 MiB), so this allocation is bounded even in adversarial cases.
             //
             // bufpool refactor: the encrypted frame body buffer is
-            // acquired от the global bufpool instead of а fresh
+            // acquired from the global bufpool instead of a fresh
             // `Vec::with_capacity`.  Pool capacity is controlled by the
             // `VEIL_BUFPOOL_CAP` env var (default 64 buffers/bucket);
-            // when set к 0 every acquire falls through к а direct heap
-            // alloc (behaviourally identical к pre-pool code).  The
+            // when set to 0 every acquire falls through to a direct heap
+            // alloc (behaviourally identical to pre-pool code).  The
             // `Pooled` handle drops at the end of this scope iteration —
-            // returning the buffer к the pool's cache OR freeing it к heap.
+            // returning the buffer to the pool's cache OR freeing it to heap.
             let body_len = header.body_len as usize;
             let mut raw_body = veil_bufpool::global().acquire(body_len);
             raw_body.as_vec_mut().resize(body_len, 0);
             // slow-loris hardening: authenticated peer that
-            // announced а body_len и then stops sending data should not be
-            // able к pin а pool buffer + this task indefinitely. 30 s is
+            // announced a body_len and then stops sending data should not be
+            // able to pin a pool buffer + this task indefinitely. 30 s is
             // far above the 95-th percentile body-arrival latency on any
-            // realistic link и bounds the worst-case memory exposure.
+            // realistic link and bounds the worst-case memory exposure.
             if header.body_len > 0 {
                 const BODY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
                 match tokio::time::timeout(BODY_DEADLINE, read_half.read_exact(&mut raw_body[..]))
@@ -3384,8 +3384,8 @@ impl SessionRunner {
                 match SessionMsg::try_from(header.msg_type) {
                     Ok(SessionMsg::RekeyInit) => {
                         // Responder-path cipher swap + collision
-                        // resolver + grace-buffer stash. Break на
-                        // cipher / wire-write errors что should tear
+                        // resolver + grace-buffer stash. Break on
+                        // cipher / wire-write errors that should tear
                         // down the session.
                         match self.handle_rekey_init_arm(
                             body,
@@ -3408,10 +3408,10 @@ impl SessionRunner {
                     }
                     Ok(SessionMsg::RekeyKeptInit) => {
                         // Peer (lower node_id) told us they kept their own
-                        // init и dropped ours — our pending init won't be
-                        // ACK'd. Reset our FSM to Idle и push last_rekey_at
+                        // init and dropped ours — our pending init won't be
+                        // ACK'd. Reset our FSM to Idle and push last_rekey_at
                         // forward so we don't immediately re-cross the
-                        // threshold и re-collide.
+                        // threshold and re-collide.
                         self.handle_rekey_kept_init_arm(&mut rekey);
                         continue;
                     }
@@ -3475,18 +3475,18 @@ impl SessionRunner {
                         );
                         continue;
                     }
-                    // Phase 5e: peer is informing us they've moved к а new
+                    // Phase 5e: peer is informing us they've moved to a new
                     // transport URI (ephemeral-port rotation).  Decode +
                     // sig-verify the payload, then refresh the DHT
                     // transport-cache so subsequent reconnect attempts
-                    // dial the new URI без а round-trip к the resolver.
+                    // dial the new URI without a round-trip to the resolver.
                     Ok(SessionMsg::TransportMigrationNotify) => {
                         self.handle_transport_migration_notify_arm(body);
                         continue;
                     }
                     // Slice 5b of the PoW-Gated Rendezvous epic: requester
-                    // is asking us к provision an ephemeral listener.
-                    // Spawn а task that runs the controller; sends а
+                    // is asking us to provision an ephemeral listener.
+                    // Spawn a task that runs the controller; sends a
                     // signed response back on Granted, silently drops
                     // on Rejected (DoS-resistant).
                     Ok(SessionMsg::RequestEphemeralEndpoint) => {
@@ -3534,7 +3534,7 @@ impl SessionRunner {
                 && let Some(tx) = pending_responses.take(header.request_id)
             {
                 // Copy plaintext into an owned Vec for the oneshot receiver.
-                // `body` is а slice borrowed от raw_body (which returns to
+                // `body` is a slice borrowed from raw_body (which returns to
                 // pool soon); the receiver needs an owned copy.
                 let _ = tx.send(Some(body.to_vec()));
                 continue; // consumed — do not dispatch
@@ -3544,7 +3544,7 @@ impl SessionRunner {
             let result = self.dispatcher.dispatch(&header, body, self.peer_id);
 
             // `process_dispatch_result` returns `true` when the runner
-            // loop should break (session close due к cipher error / fatal
+            // loop should break (session close due to cipher error / fatal
             // write error).
             if self.process_dispatch_result(
                 result,
@@ -3586,13 +3586,13 @@ impl SessionRunner {
     }
 
     /// Epic 459 transport-swap plumbing.  Tears down the OLD writer
-    /// task + channel и spawns а fresh one against the new transport,
+    /// task + channel and spawns a fresh one against the new transport,
     /// preserving ALL AEAD state (`tx_cipher` / `rx_cipher` /
     /// `session_id` stay on `self`).
     ///
     /// **Safety of the swap point**: caller (the `NextInput::SwapStream`
-    /// arm в `run`) is **between frames** — no partial header has been
-    /// consumed и the priority-queue flush has already completed.
+    /// arm in `run`) is **between frames** — no partial header has been
+    /// consumed and the priority-queue flush has already completed.
     /// In-flight bytes cannot tear across transports.
     ///
     /// The peer's side must have already swapped its own stream at
@@ -3637,7 +3637,7 @@ impl SessionRunner {
     /// Handle the six DispatchResult variants emitted by
     /// `FrameDispatcher::dispatch`.
     ///
-    /// Returns `true` если the caller's run-loop should `break`
+    /// Returns `true` if the caller's run-loop should `break`
     /// (cipher error during response encryption, or push_wire fatal
     /// error).  Returns `false` otherwise — caller continues the loop.
     fn process_dispatch_result(
@@ -3699,10 +3699,10 @@ impl SessionRunner {
                         veil_bufpool::pooled_shared_from_vec(bp_frame)
                     };
                     // backpressure signal is fire-and-forget;
-                    // a stalled write here is а strong indication
+                    // a stalled write here is a strong indication
                     // the peer's recv buffer is itself full — ironic
-                    // because that's the case the BP signal exists к
-                    // mitigate.  Use the timeout-wrapped write so а
+                    // because that's the case the BP signal exists to
+                    // mitigate.  Use the timeout-wrapped write so a
                     // stalled BP send doesn't pin the entire runner;
                     // metric increments either way (visible "BP signal
                     // skipped because peer was already saturated").
@@ -3710,18 +3710,18 @@ impl SessionRunner {
                 }
             }
             DispatchResult::NotHandled => {
-                // Session-layer frames (e.g. handshake replay) ара silently
+                // Session-layer frames (e.g. handshake replay) are silently
                 // ignored post-handshake.
             }
             DispatchResult::SolvePow(challenge) => {
-                // Spawn а blocking task к solve the PoW puzzle, then route the
+                // Spawn a blocking task to solve the PoW puzzle, then route the
                 // PowResponse back toward the acceptor.
                 use veil_proto::{
                     budget::MAX_POW_ACTIVE_DIFFICULTY_SUM, family::RoutingMsg,
                     routing::PowResponsePayload,
                 };
                 use veil_routing::pow::solve_pow;
-                // Inline helper: encode а FAMILY_ROUTING frame.
+                // Inline helper: encode a FAMILY_ROUTING frame.
                 // (Previously `crate::node::dispatcher::encode_routing_frame`;
                 // inlined here to avoid veil-session→veilcore dep.)
                 fn encode_routing_frame(msg: RoutingMsg, body: &[u8]) -> Vec<u8> {
@@ -3736,7 +3736,7 @@ impl SessionRunner {
                     out
                 }
 
-                // Global cap на concurrent blocking solver tasks.
+                // Global cap on concurrent blocking solver tasks.
                 let permit = match self.dispatcher.pow_solver_semaphore().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
@@ -3751,8 +3751,8 @@ impl SessionRunner {
                 // Cap total difficulty in flight.  Safety: fetch_add
                 // returns the *previous* value, so `prev + difficulty`
                 // is the new value after the add.  This check is
-                // correct even под concurrency: each thread atomically
-                // reserves its slice of the budget и then immediately
+                // correct even under concurrency: each thread atomically
+                // reserves its slice of the budget and then immediately
                 // verifies it didn't exceed the cap.
                 let difficulty = u64::from(challenge.difficulty);
                 let budget = self.dispatcher.pow_active_difficulty();
@@ -3767,7 +3767,7 @@ impl SessionRunner {
                     );
                     return false;
                 }
-                // RAII guard — decrements budget на drop regardless of
+                // RAII guard — decrements budget on drop regardless of
                 // how the task exits (early return, panic, cancellation).
                 let budget_guard = BudgetGuard {
                     budget: Arc::clone(&budget),
@@ -3794,8 +3794,8 @@ impl SessionRunner {
                                     "session.solve_pow",
                                     format!("spawn_blocking panicked: {e}"),
                                 );
-                                // do NOT send а zero-solution PowResponse —
-                                // the acceptor would treat it as а Violation.
+                                // do NOT send a zero-solution PowResponse —
+                                // the acceptor would treat it as a Violation.
                                 // Simply drop the challenge.
                                 return;
                             }
@@ -3815,11 +3815,11 @@ impl SessionRunner {
                         // canonical route_cache→registry order in
                         // routing.rs.  Holding registry-write while
                         // acquiring route_cache-read (the prior order)
-                        // could deadlock against а thread taking them in
+                        // could deadlock against a thread taking them in
                         // canonical order.
                         let next_hop = rlock!(dispatcher.route_cache()).lookup(&acceptor);
                         let guard = wlock!(reg);
-                        // Try direct session к acceptor first; fall back
+                        // Try direct session to acceptor first; fall back
                         // via route cache then via the peer who sent
                         // us the challenge.
                         if !guard.send_to(
@@ -3842,7 +3842,7 @@ use veil_util::hex_short;
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 //
-// Test module body (~5257 LoC) extracted к sibling file `runner_tests.rs`
-// для file-size sanity. `#[path]` attribute keeps it scoped as а child
-// module of `runner` so all `super::*` imports still resolve и
+// Test module body (~5257 LoC) extracted to sibling file `runner_tests.rs`
+// for file-size sanity. `#[path]` attribute keeps it scoped as a child
+// module of `runner` so all `super::*` imports still resolve and
 // `pub` visibility from runner's items is preserved.

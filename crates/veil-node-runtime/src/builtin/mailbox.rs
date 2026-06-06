@@ -46,7 +46,7 @@ use super::host::{BuiltinAppHost, BuiltinEndpoint, ServiceContext, ServiceSpec};
 
 /// Trigger sent over the mpsc to the push-dispatch task. Mirrors
 /// the type used by `MailboxIpcBridge` in `service_tasks.rs` — both
-/// the IPC bridge и the built-in app service feed the same task.
+/// the IPC bridge and the built-in app service feed the same task.
 pub struct PushTrigger {
     /// Receiver whose envelope is being unsealed and dispatched.
     pub receiver_id: [u8; 32],
@@ -67,10 +67,10 @@ pub struct PushTrigger {
 /// `MailboxPut` faster than the push-dispatch task drains would cause
 /// unbounded queue growth (RAM DoS). At ~80-100 push triggers/sec
 /// healthy steady-state, 512-deep buffer absorbs ~5 seconds of burst.
-/// On overflow `try_send` returns `Full(...)` и the trigger is
-/// dropped с а warn-level log (the mailbox-stored blob is still
-/// accessible via fetch — push is а wake hint, not а data delivery
-/// channel, so dropping а trigger only delays notification, не teryt
+/// On overflow `try_send` returns `Full(...)` and the trigger is
+/// dropped with a warn-level log (the mailbox-stored blob is still
+/// accessible via fetch — push is a wake hint, not a data delivery
+/// channel, so dropping a trigger only delays notification, does not lose
 /// the message itself).
 pub const PUSH_TRIGGER_QUEUE_CAP: usize = 512;
 
@@ -80,7 +80,7 @@ pub const PUSH_TRIGGER_QUEUE_CAP: usize = 512;
 ///
 /// `mailbox` is the shared storage handle. `push_trigger_tx` is the
 /// channel the configured push dispatcher consumes from; pass `None`
-/// to disable push triggering (e.g. relay running без anonymity X25519
+/// to disable push triggering (e.g. relay running without anonymity X25519
 /// secret — without a key it can't unseal envelopes anyway).
 pub fn spawn_mailbox_app_service(
     host: &mut BuiltinAppHost,
@@ -134,7 +134,7 @@ pub fn handle_put_message(
         } => (src_node_id, data),
         // The other AppMessage variants (StreamOpen / StreamData /
         // RtData / etc.) shouldn't address the PUT endpoint — we use
-        // datagram delivery only. Drop с a debug log.
+        // datagram delivery only. Drop with a debug log.
         other => {
             log::debug!("veil-mailbox: ignoring non-Deliver AppMessage on PUT endpoint: {other:?}",);
             return;
@@ -172,8 +172,8 @@ pub fn handle_put_message(
     // route through `put_with_capability` so
     // the relay's `MailboxConfig::require_capability_token` policy gate
     // is honored. Token bytes (if any) come from the new optional
-    // trailer на the wire. When the policy is `false` (default) и no
-    // token is present, this entry-point delegates к the legacy `put`
+    // trailer on the wire. When the policy is `false` (default) and no
+    // token is present, this entry-point delegates to the legacy `put`
     // path unchanged.
     //
     // SECURITY (audit 2026-05-29, A6 — per-sender quota integrity): use
@@ -182,10 +182,10 @@ pub fn handle_put_message(
     // The mailbox keys its per-sender byte quota (TABLE_SENDER_BYTES) on
     // this value AND persists it for eviction-time counter bookkeeping.
     // Keying on the spoofable `req.sender_id` let an attacker (a) rotate
-    // their claimed sender_id к evade their own quota slice, or (b) set
-    // it к а victim's id к exhaust the victim's slice.  `src_node_id` is
+    // their claimed sender_id to evade their own quota slice, or (b) set
+    // it to a victim's id to exhaust the victim's slice.  `src_node_id` is
     // cryptographically bound by the session handshake, so neither is
-    // possible.  Note: `req.sender_id` is а documented UNAUTHENTICATED
+    // possible.  Note: `req.sender_id` is a documented UNAUTHENTICATED
     // hint — the receiver must never trust it; the real sender identity
     // is conveyed inside the opaque E2E `blob`.  Surfacing the truthful
     // authenticated source as the stored hint is strictly safer.
@@ -268,9 +268,9 @@ pub fn handle_put_message(
             );
         }
         // capability-policy rejections. Logged
-        // at info level — а probing client с no token (or а stale token)
+        // at info level — a probing client with no token (or a stale token)
         // is the expected fail mode for the policy's purpose. Operators
-        // bump к DEBUG только если digging into а specific deployment
+        // bump to DEBUG only if digging into a specific deployment
         // misconfiguration.
         PutOutcome::CapabilityRequired => {
             log::info!(
@@ -285,7 +285,7 @@ pub fn handle_put_message(
             );
         }
         // per-sender quota miss. Same INFO
-        // level as capability rejections — а high-rate sender is more
+        // level as capability rejections — a high-rate sender is more
         // likely an over-eager legitimate client than an attack.
         PutOutcome::QuotaPerSenderExceeded {
             current_bytes,
@@ -471,7 +471,7 @@ mod tests {
         let sender = registry
             .get_sender(MAILBOX_APP_ID, MAILBOX_PUT_ENDPOINT_ID)
             .unwrap();
-        // Truncated payload — must be dropped без crashing the service.
+        // Truncated payload — must be dropped without crashing the service.
         sender
             .try_send(AppMessage::Deliver {
                 src_node_id: [3u8; 32],
@@ -502,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn t1_4_p5b_app_service_ignores_non_deliver_messages() {
         // Send AppMessage::DeliveryStage (which shouldn't address PUT
-        // endpoint в нормальном flow) — service must drop and stay alive.
+        // endpoint in normal flow) — service must drop and stay alive.
         let (mailbox, _tmp) = fresh_mailbox();
         let mut host = BuiltinAppHost::new();
         let registry = Arc::new(AppEndpointRegistry::new());

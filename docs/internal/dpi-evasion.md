@@ -105,58 +105,58 @@ Out of scope for Epic 480:
 
 ## obfs4 transport (`obfs4-tcp://`)
 
-**Status**: implemented, registered в default TransportRegistry.
+**Status**: implemented, registered in the default TransportRegistry.
 
-obfs4 is а pluggable transport originally от Tor's pluggable-transports
+obfs4 is a pluggable transport originally from Tor's pluggable-transports
 project.  Veil's implementation ships in [`crates/veil-obfs4`](../../crates/veil-obfs4)
-и is wired as а Transport impl in [`veil-transport::obfs4_tcp`](../../crates/veil-transport/src/obfs4_tcp.rs).
+and is wired as a Transport impl in [`veil-transport::obfs4_tcp`](../../crates/veil-transport/src/obfs4_tcp.rs).
 
-Comparison к tls-boring:
+Comparison to tls-boring:
 
 | Property                       | `tls-boring` + `wss://`  | `obfs4-tcp://`             |
 |--------------------------------|--------------------------|----------------------------|
-| Wire bytes look like           | TLS 1.3 c Chrome JA3     | uniformly random           |
+| Wire bytes look like           | TLS 1.3 w/ Chrome JA3    | uniformly random           |
 | Wire fingerprint               | matches real HTTPS       | none — no protocol probe   |
 | Active-probe resistance        | medium (needs webtunnel) | yes (silent-drop bad MAC)  |
 | Needs TLS CA chain             | yes                      | no                         |
-| Censor strategy що blocks it   | block ALL TLS port 443?  | block ALL random-byte TCP? |
-| Operator cost                  | TLS cert + reasonable SNI | distribute PSK к peers     |
+| Censor strategy that blocks it | block ALL TLS port 443?  | block ALL random-byte TCP? |
+| Operator cost                  | TLS cert + reasonable SNI | distribute PSK to peers    |
 
-**When к prefer obfs4 over tls-boring:**
-- Embedded targets без а TLS stack (resource-constrained routers).
-- Environments где TLS itself is heuristically flagged as suspicious
+**When to prefer obfs4 over tls-boring:**
+- Embedded targets without a TLS stack (resource-constrained routers).
+- Environments where TLS itself is heuristically flagged as suspicious
   (some authoritarian networks).
-- Test deployments що need anti-DPI без а cert PKI.
+- Test deployments that need anti-DPI without a cert PKI.
 
-**When к prefer tls-boring + wss:**
-- Public-internet deployments що can blend с real HTTPS traffic.
-- Operator has access к а real domain + cert.
-- Production: easier к operate, fewer secrets к distribute.
+**When to prefer tls-boring + wss:**
+- Public-internet deployments that can blend with real HTTPS traffic.
+- Operator has access to a real domain + cert.
+- Production: easier to operate, fewer secrets to distribute.
 
-obfs4 PSK distribution: Phase 3-interim ships а single network-wide
-`obfs4_psk` в `TransportContext`.  Per-peer PSKs via signed
-`transport_hints` are а follow-up; track в [docs/internal/PLAN_TRANSPORT_OBFUSCATION.md](PLAN_TRANSPORT_OBFUSCATION.md).
+obfs4 PSK distribution: Phase 3-interim ships a single network-wide
+`obfs4_psk` in `TransportContext`.  Per-peer PSKs via signed
+`transport_hints` are a follow-up; track in [docs/internal/PLAN_TRANSPORT_OBFUSCATION.md](PLAN_TRANSPORT_OBFUSCATION.md).
 
-## webtunnel anti-probe для `wss://` / `tls://`
+## webtunnel anti-probe for `wss://` / `tls://`
 
 **Status**: library complete, transport integration deferred.
 
 webtunnel addresses the **active-probe** gap left by plain TLS.  An
-operator що deploys veil на а public server can wrap it с
-`veil-webtunnel`: incoming connections що don't carry the secret
-path + auth header receive а decoy response (looks like а regular HTTPS
-site); only requests с matching credentials trigger а WebSocket upgrade.
+operator that deploys veil on a public server can wrap it with
+`veil-webtunnel`: incoming connections that don't carry the secret
+path + auth header receive a decoy response (looks like a regular HTTPS
+site); only requests with matching credentials trigger a WebSocket upgrade.
 
 Library pieces:
 - [`SecretMatcher`](../../crates/veil-webtunnel/src/matcher.rs) —
   constant-time path + auth-header match.
 - [`DecoyProvider`](../../crates/veil-webtunnel/src/decoy.rs) trait
-  с `StaticStringDecoy` + `StaticDirectoryDecoy` impls.
+  with `StaticStringDecoy` + `StaticDirectoryDecoy` impls.
 - [`WebtunnelRouter`](../../crates/veil-webtunnel/src/router.rs) —
-  server-side HTTP entry point що runs the matcher + decoy / upgrade.
+  server-side HTTP entry point that runs the matcher + decoy / upgrade.
 - [`WebtunnelClient`](../../crates/veil-webtunnel/src/client.rs) —
   client-side connector with realistic browser headers.
 
-Transport-trait integration (а `webtunnel+wss://` URI scheme) is
-deferred — operators currently wire webtunnel manually as а pre-WSS
+Transport-trait integration (a `webtunnel+wss://` URI scheme) is
+deferred — operators currently wire webtunnel manually as a pre-WSS
 gate.  See `PLAN_TRANSPORT_OBFUSCATION.md` Phase 5d–5e.

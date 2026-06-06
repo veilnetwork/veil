@@ -7,7 +7,7 @@
 /// Shared per-runtime context (DNS resolver, TLS material, metrics hooks).
 pub mod context;
 /// HTTPS RR (RFC 9460) lookups for real TLS ECH config resolution
-/// (Этап 10 slice 3).
+/// (Phase 10 slice 3).
 pub mod ech_dns;
 /// Ephemeral random-port binder (anti-port-clustering snowflake mode).
 pub mod ephemeral;
@@ -66,7 +66,7 @@ pub use uri::{TransportStack, TransportUri, Wrapper, rewrite_wildcard_host};
 
 // Anti-censorship Phase 2 kill-switch: re-export the obfs4 wire-format
 // variant type so veilcore's config-glue layer can parse operator
-// config strings без adding а direct veil-obfs4 dep.
+// config strings without adding a direct veil-obfs4 dep.
 pub use veil_obfs4::WireFormatVariant;
 
 #[cfg(test)]

@@ -87,17 +87,17 @@ pub enum TransportUri {
         sni: Option<String>,
         alpn: Vec<Vec<u8>>,
     },
-    /// TCP wrapped с obfs4-style anti-DPI handshake + framing.
+    /// TCP wrapped with obfs4-style anti-DPI handshake + framing.
     /// PSK is supplied separately (TransportContext field) — embedding
-    /// it в the URI would leak it through logs / hint publishes.
+    /// it in the URI would leak it through logs / hint publishes.
     Obfs4Tcp {
         host: String,
         port: u16,
     },
-    /// Webtunnel-over-WSS: TLS-encrypted WebSocket tunnel що looks like
-    /// а regular HTTPS site до an active prober.  Decoy content served
-    /// on bad credentials; tunnel mode activated с secret path + auth
-    /// header (sourced от TransportContext.webtunnel_*).
+    /// Webtunnel-over-WSS: TLS-encrypted WebSocket tunnel that looks like
+    /// a regular HTTPS site to an active prober.  Decoy content served
+    /// on bad credentials; tunnel mode activated with secret path + auth
+    /// header (sourced from TransportContext.webtunnel_*).
     WebtunnelWss {
         host: String,
         port: u16,
@@ -130,8 +130,8 @@ impl TransportUri {
     }
 
     /// Returns the host string for any host-bearing variant, regardless
-    /// of encryption status.  Differs от [`plaintext_host`] (which only
-    /// returns hosts visible на the wire к DPI for warning purposes).
+    /// of encryption status.  Differs from [`plaintext_host`] (which only
+    /// returns hosts visible on the wire to DPI for warning purposes).
     /// `None` for `unix`.
     pub fn host(&self) -> Option<&str> {
         match self {
@@ -162,7 +162,7 @@ impl TransportUri {
             // Socks tunnels TCP through a proxy — the hop from proxy to target
             // is plaintext regardless of how we reach the proxy.
             Self::Socks { target_host, .. } => Some(target_host.as_str()),
-            // Obfs4Tcp wraps plaintext TCP с AEAD framing — wire bytes
+            // Obfs4Tcp wraps plaintext TCP with AEAD framing — wire bytes
             // are statistically random, so DPI cannot read OVL1.
             // `None` matches the encrypted-transport classification.
             Self::Obfs4Tcp { .. } => None,
@@ -739,8 +739,8 @@ mod tests {
 
     /// Regression: `host()` returns the host regardless of wire-level
     /// encryption.  Caught at the live PoW-Rendezvous canary deploy on
-    /// node1 — the wire-up code был mistakenly using `plaintext_host`
-    /// для extracting bind/advertise hosts от obfs4-tcp listeners,
+    /// node1 — the wire-up code was mistakenly using `plaintext_host`
+    /// for extracting bind/advertise hosts from obfs4-tcp listeners,
     /// which returns None.
     #[test]
     fn host_returns_for_all_host_bearing_schemes() {

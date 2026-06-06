@@ -30,7 +30,7 @@ const ATYP_IPV6: u8 = 0x04;
 const NO_AUTH: u8 = 0x00;
 
 /// Accept-loop driver.  Returns only on accept-error (which kills the
-/// listener) — caller wraps в an outer task.
+/// listener) — caller wraps in an outer task.
 pub async fn run(
     listen_addr: String,
     app_handle: Arc<AppSender>,
@@ -45,18 +45,18 @@ pub async fn run(
     log::info!("oproxy.socks5: listening on {listen_addr}");
     loop {
         // Audit batch 2026-05-24 (M8): acquire permit BEFORE accept.
-        // Когда listener at capacity, accept() blocks → TCP backpressure
-        // к client; daemon never spawns more than N concurrent tasks.
+        // When listener at capacity, accept() blocks → TCP backpressure
+        // to client; daemon never spawns more than N concurrent tasks.
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(p) => p,
             Err(_closed) => return Ok(()), // Semaphore closed — graceful shutdown.
         };
         let (stream, peer) = listener.accept().await.context("accept SOCKS5")?;
-        log::debug!("oproxy.socks5: accept от {peer}");
+        log::debug!("oproxy.socks5: accept from {peer}");
         let h = Arc::clone(&app_handle);
         let r = Arc::clone(&routing);
         tokio::spawn(async move {
-            // Hold permit для the lifetime of the task; released on drop.
+            // Hold permit for the lifetime of the task; released on drop.
             let _permit = permit;
             if let Err(e) = handle_connection(stream, h, server_node_id, server_app_id, r).await {
                 log::debug!("oproxy.socks5: peer {peer} dropped: {e}");
@@ -72,8 +72,8 @@ async fn handle_connection(
     server_app_id: [u8; 32],
     routing: Arc<RoutingConfig>,
 ) -> Result<()> {
-    // Audit batch 2026-05-24: wrap the entire SOCKS5 handshake phase в
-    // а timeout so slow clients cannot tie up а task indefinitely.
+    // Audit batch 2026-05-24: wrap the entire SOCKS5 handshake phase in
+    // a timeout so slow clients cannot tie up a task indefinitely.
     let (host, port) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         // Step 1 — method-select.
         let mut hdr = [0u8; 2];
@@ -153,10 +153,10 @@ async fn handle_connection(
             .context("read port")?;
         let port = u16::from_be_bytes(port_buf);
 
-        // Step 3 — confirm к the SOCKS client (return success BEFORE
-        // opening the veil stream so the client может start streaming
+        // Step 3 — confirm to the SOCKS client (return success BEFORE
+        // opening the veil stream so the client can start streaming
         // immediately).  Tactic mirrors v2ray / xray behavior: best-effort
-        // optimistic ack; если the veil stream открыть to NOT open,
+        // optimistic ack; if the veil stream open to NOT open,
         // the subsequent write would simply close the connection.
         write_reply(&mut stream, 0x00)
             .await
@@ -167,7 +167,7 @@ async fn handle_connection(
     .await
     .map_err(|_| anyhow!("SOCKS5 handshake timeout ({HANDSHAKE_TIMEOUT:?})"))??;
 
-    // Step 4 — dispatch к the routing layer (veil / direct / block
+    // Step 4 — dispatch to the routing layer (veil / direct / block
     // + optional fallback).
     bridge_via_routing(
         app_handle,
@@ -181,7 +181,7 @@ async fn handle_connection(
     .await
 }
 
-/// Build + write а SOCKS5 reply with the given status byte.  BND fields
+/// Build + write a SOCKS5 reply with the given status byte.  BND fields
 /// are all-zero (clients ignore).
 async fn write_reply(stream: &mut TcpStream, status: u8) -> std::io::Result<()> {
     // Layout: `VER REP RSV ATYP BND_ADDR BND_PORT`.  Reply atyp = IPv4

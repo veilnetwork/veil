@@ -54,7 +54,7 @@ The recommended path is to put Caddy 2.10+ in front of veil's TLS listener. (Cad
 ECH config + private key generation:
 
 ```bash
-# Generate а HPKE keypair (Caddy 2.10+ ships а helper command).
+# Generate a HPKE keypair (Caddy 2.10+ ships a helper command).
 caddy ech generate-key > /etc/caddy/ech-key.pem
 caddy ech show-public-config /etc/caddy/ech-key.pem > /tmp/ech-config.bin
 
@@ -82,7 +82,7 @@ In `crates/veil-transport/src/tls.rs` (and the parallel sites in `context.rs`):
 use rustls::client::{EchConfig, EchMode};
 use rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
 
-// При построении ClientConfig:
+// When building the ClientConfig:
 let ech_mode = if let Some(ech_bytes) = ctx.ech_config_list_bytes.as_ref() {
     let ech = EchConfig::new(ech_bytes.as_slice().into(), ALL_SUPPORTED_SUITES)
         .map_err(|e| TransportError::Tls(format!("ECH config invalid: {e}")))?;

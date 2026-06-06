@@ -2,7 +2,7 @@
 name = "veil-dispatcher"
 version = "0.1.0"
 edition = "2024"
-description = "OVL1 frame dispatcher: routes incoming frames (control, session, discovery, app, anonymity, delivery, routing) к the correct service plane. Phase 3 of veilcore extraction."
+description = "OVL1 frame dispatcher: routes incoming frames (control, session, discovery, app, anonymity, delivery, routing) to the correct service plane. Phase 3 of veilcore extraction."
 license = "AGPL-3.0-or-later"
 
 [dependencies]

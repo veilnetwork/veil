@@ -1,9 +1,9 @@
 //! `impl DispatcherSink for FrameDispatcher` block.
 //!
-//! Phase 2 session 2 (veilcore extraction): trait moved к
+//! Phase 2 session 2 (veilcore extraction): trait moved to
 //! [`veil_session::dispatcher_sink::DispatcherSink`] sibling crate;
-//! impl stays here next к [`FrameDispatcher`]'s definition (Rust
-//! orphan rule: impl block must live в the crate where one of the
+//! impl stays here next to [`FrameDispatcher`]'s definition (Rust
+//! orphan rule: impl block must live in the crate where one of the
 //! involved types is local).
 
 use std::sync::atomic::AtomicU64;

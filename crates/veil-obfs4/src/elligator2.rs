@@ -1,29 +1,29 @@
-//! Elligator2 wrapper над `curve25519-elligator2`.
+//! Elligator2 wrapper over `curve25519-elligator2`.
 //!
-//! Elligator2 is а bijection between а subset of Curve25519 points и
-//! uniformly-random 32-byte strings.  When the obfs4 handshake sends а
+//! Elligator2 is a bijection between a subset of Curve25519 points and
+//! uniformly-random 32-byte strings.  When the obfs4 handshake sends a
 //! Curve25519 public key, it actually sends the elligator2 *representative*
-//! of що key — а 32-byte string statistically indistinguishable от random
-//! noise.  Without elligator2, the bias в standard X25519 pubkey encoding
-//! (~1 bit in the high byte) is detectable by а sophisticated DPI.
+//! of that key — a 32-byte string statistically indistinguishable from random
+//! noise.  Without elligator2, the bias in standard X25519 pubkey encoding
+//! (~1 bit in the high byte) is detectable by a sophisticated DPI.
 //!
 //! ## Key generation flow
 //!
-//! 1. Generate а fresh random 32-byte private key.
-//! 2. Compute its Montgomery pubkey + try к elligator-encode.
-//! 3. Encoding succeeds for ~50% of keys (those whose pubkey has а
+//! 1. Generate a fresh random 32-byte private key.
+//! 2. Compute its Montgomery pubkey + try to elligator-encode.
+//! 3. Encoding succeeds for ~50% of keys (those whose pubkey has a
 //!    "square representative" on the curve).  If encoding returns
-//!    `None`, retry с а fresh private key.
+//!    `None`, retry with a fresh private key.
 //! 4. Retry limit: 64 attempts (`P_failure ≈ 5.4e-20` — effectively never).
 //!
 //! ## Two-way mapping
 //!
-//! - `private_key → representative` is а **probabilistic** map (~50% rate).
+//! - `private_key → representative` is a **probabilistic** map (~50% rate).
 //! - `representative → public_key` is **always** defined.
 //!
 //! Domain separation: each side generates ONE elligator-encodable
 //! ephemeral key per handshake.  Long-term identity keys never go
-//! through elligator2 — they live в `transport_hints`.
+//! through elligator2 — they live in `transport_hints`.
 
 use curve25519_elligator2::{MapToPointVariant, MontgomeryPoint, Randomized};
 use rand::RngCore;
@@ -32,24 +32,24 @@ use zeroize::Zeroize;
 use super::HandshakeError;
 
 /// Number of retries when generating an elligator-encodable keypair.
-/// `(1/2)^64 ≈ 5.4e-20` failure probability, so this is effectively а
-/// guard against а broken RNG, not real workload.
+/// `(1/2)^64 ≈ 5.4e-20` failure probability, so this is effectively a
+/// guard against a broken RNG, not real workload.
 pub const ELLIGATOR_RETRY_LIMIT: usize = 64;
 
 /// Length of an elligator2 representative on the wire.
 pub const REPRESENTATIVE_LEN: usize = 32;
 
-/// Length of а Curve25519 private key.
+/// Length of a Curve25519 private key.
 pub const PRIVATE_KEY_LEN: usize = 32;
 
 /// An elligator-encodable ephemeral keypair.
 ///
-/// Holds the 32-byte private scalar и the precomputed 32-byte
+/// Holds the 32-byte private scalar and the precomputed 32-byte
 /// representative.  `Zeroize` on drop clears the private bytes.
 pub struct ElligatorKeypair {
     private: [u8; PRIVATE_KEY_LEN],
     representative: [u8; REPRESENTATIVE_LEN],
-    /// Elligator2 needs а 1-byte "tweak" parameter (used to randomise
+    /// Elligator2 needs a 1-byte "tweak" parameter (used to randomise
     /// the parity bit of the encoded point).  Kept alongside the
     /// representative because decoders need both.
     tweak: u8,
@@ -62,10 +62,10 @@ impl Drop for ElligatorKeypair {
 }
 
 impl ElligatorKeypair {
-    /// Generate а fresh elligator-encodable ephemeral keypair.  Retries
-    /// internally if а given private key produces а pubkey без а valid
+    /// Generate a fresh elligator-encodable ephemeral keypair.  Retries
+    /// internally if a given private key produces a pubkey without a valid
     /// representative.  Returns `Err(NoRepresentative)` only when the
-    /// retry limit is exhausted — effectively never for а sound RNG.
+    /// retry limit is exhausted — effectively never for a sound RNG.
     pub fn generate() -> Result<Self, HandshakeError> {
         let mut private = [0u8; PRIVATE_KEY_LEN];
         let mut rng = rand::rng();
@@ -88,9 +88,9 @@ impl ElligatorKeypair {
         Err(HandshakeError::NoRepresentative)
     }
 
-    /// Test/internal: construct от pre-supplied scalar + tweak.
+    /// Test/internal: construct from pre-supplied scalar + tweak.
     /// Returns `None` if the scalar doesn't have an elligator
-    /// representative с given tweak (use в tests where determinism
+    /// representative with given tweak (use in tests where determinism
     /// matters).
     #[doc(hidden)]
     pub fn from_private_for_test(private: [u8; 32], tweak: u8) -> Option<Self> {
@@ -103,26 +103,26 @@ impl ElligatorKeypair {
     }
 
     /// 32-byte elligator2 representative.  This is what gets sent over
-    /// the wire — uniformly-random-looking к а DPI observer.
+    /// the wire — uniformly-random-looking to a DPI observer.
     pub fn representative(&self) -> &[u8; REPRESENTATIVE_LEN] {
         &self.representative
     }
 
     /// Tweak byte chosen at generation.  Sent alongside the
-    /// representative on the wire (1 extra byte).  Required для
+    /// representative on the wire (1 extra byte).  Required for
     /// decoding by the peer.
     pub fn tweak(&self) -> u8 {
         self.tweak
     }
 
-    /// 32-byte private key (Curve25519 scalar).  Used для ECDH с the
-    /// peer's decoded pubkey.  Caller must keep это secret.
+    /// 32-byte private key (Curve25519 scalar).  Used for ECDH with the
+    /// peer's decoded pubkey.  Caller must keep this secret.
     pub fn private(&self) -> &[u8; PRIVATE_KEY_LEN] {
         &self.private
     }
 
-    /// Compute the Montgomery public key для this private scalar.
-    /// Used by tests и debug paths; on-wire we send the representative
+    /// Compute the Montgomery public key for this private scalar.
+    /// Used by tests and debug paths; on-wire we send the representative
     /// instead.
     pub fn public(&self) -> MontgomeryPoint {
         MontgomeryPoint::from_representative::<Randomized>(&self.representative)
@@ -130,7 +130,7 @@ impl ElligatorKeypair {
     }
 }
 
-/// Decode an elligator2 representative back к а Curve25519 public point.
+/// Decode an elligator2 representative back to a Curve25519 public point.
 /// Always succeeds (elligator's forward map is total).
 pub fn decode_representative(repr: &[u8; REPRESENTATIVE_LEN]) -> MontgomeryPoint {
     MontgomeryPoint::from_representative::<Randomized>(repr)
@@ -138,9 +138,9 @@ pub fn decode_representative(repr: &[u8; REPRESENTATIVE_LEN]) -> MontgomeryPoint
 }
 
 /// ECDH: scalar × point.  Returns the shared 32-byte secret.  Uses
-/// the crate's `mul_clamped`, що applies RFC 7748 §5 clamping internally
-/// и does а direct Montgomery ladder (does NOT reduce the scalar mod
-/// curve order, що `Scalar::from_bytes_mod_order` would do — wrong для X25519).
+/// the crate's `mul_clamped`, that applies RFC 7748 §5 clamping internally
+/// and does a direct Montgomery ladder (does NOT reduce the scalar mod
+/// curve order, that `Scalar::from_bytes_mod_order` would do — wrong for X25519).
 pub fn ecdh(private: &[u8; PRIVATE_KEY_LEN], peer_public: &MontgomeryPoint) -> [u8; 32] {
     let result = peer_public.mul_clamped(*private);
     result.0
@@ -190,7 +190,7 @@ mod tests {
     /// Statistical sanity: 1000 representatives must look uniformly
     /// distributed.  Spot-check: byte 0 across the corpus must visit
     /// at least ~half of all possible u8 values.  Strict statistical
-    /// tests (chi-square) are в Phase 6.
+    /// tests (chi-square) are in Phase 6.
     #[test]
     fn representatives_spread_byte_values() {
         let mut seen = std::collections::HashSet::new();

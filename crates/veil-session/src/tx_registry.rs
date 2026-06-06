@@ -126,14 +126,14 @@ impl SessionTxRegistry {
 
     /// Prune entries whose mpsc channel is closed (peer's SessionRunner
     /// exited). Called from every `&mut self` path so stale senders
-    /// don't drift indefinitely under а pure read-heavy workload.
+    /// don't drift indefinitely under a pure read-heavy workload.
     ///
     /// Audit batch 2026-05-24 (M4): also exposed via the public wrapper
     /// [`Self::prune_closed_external`] so periodic maintenance tasks can
-    /// trigger pruning on hosts с pure broadcast workloads (mesh-hub
-    /// nodes where `send_to_all*` is hot но `register()` rarely fires).
+    /// trigger pruning on hosts with pure broadcast workloads (mesh-hub
+    /// nodes where `send_to_all*` is hot but `register()` rarely fires).
     /// Without periodic pruning, closed-channel entries accumulate
-    /// indefinitely на such hosts.
+    /// indefinitely on such hosts.
     fn prune_closed(&mut self) {
         let dead: Vec<NodeIdBytes> = self
             .senders
@@ -149,10 +149,10 @@ impl SessionTxRegistry {
     /// Public wrapper for [`Self::prune_closed`].  Returns the number
     /// of stale entries removed (for metrics / log output).  Caller must
     /// hold the outer `RwLock` write guard — that's how registry mutation
-    /// is gated в the runtime.
+    /// is gated in the runtime.
     ///
-    /// Audit batch 2026-05-24 (M4): add а periodic maintenance task in
-    /// the node runtime that calls this every ~60 s так что а mesh-hub
+    /// Audit batch 2026-05-24 (M4): add a periodic maintenance task in
+    /// the node runtime that calls this every ~60 s so that a mesh-hub
     /// running pure-broadcast traffic never accumulates closed entries.
     pub fn prune_closed_external(&mut self) -> usize {
         let before = self.senders.len();
@@ -201,24 +201,24 @@ impl SessionTxRegistry {
         Some(rx)
     }
 
-    /// Direction-aware atomic register с deterministic dedup.
+    /// Direction-aware atomic register with deterministic dedup.
     ///
-    /// **Problem**: symmetric outbound dials between two peers A и B race
+    /// **Problem**: symmetric outbound dials between two peers A and B race
     /// each other.  Both sides establish handshake successfully → both
-    /// receive а "duplicate" inbound mid-completion → both reject their
-    /// own inbound → BOTH sides' outbounds симметрично get killed (peer
+    /// receive a "duplicate" inbound mid-completion → both reject their
+    /// own inbound → BOTH sides' outbounds symmetrically get killed (peer
     /// closed our outbound = our session sees EOF).  Net: 0 surviving
     /// sessions; immediate reconnect race; loop forever.
     ///
     /// **Solution**: deterministic winner-selection based on
     /// lexicographic `node_id` ordering.  Both sides agree which
-    /// underlying TCP connection survives без an explicit negotiation:
+    /// underlying TCP connection survives without an explicit negotiation:
     ///
     /// * Convention: pair `(A, B)` with `hex(A) < hex(B)` keeps the
-    ///   `A → B` connection.  On A's side это outbound; on B's side inbound.
-    /// * Each side accepts only the session quя the convention favors
-    ///   и rejects the symmetric-direction one BEFORE registering.
-    /// * Loser-side caller is signaled к shutdown its transport.
+    ///   `A → B` connection.  On A's side this outbound; on B's side inbound.
+    /// * Each side accepts only the session that the convention favors
+    ///   and rejects the symmetric-direction one BEFORE registering.
+    /// * Loser-side caller is signaled to shutdown its transport.
     ///
     /// Returns:
     /// * `Some(rx)` — accepted as the canonical session.  Caller proceeds.
@@ -232,24 +232,24 @@ impl SessionTxRegistry {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
 
-        // Determine which direction we should keep для этого peer.
+        // Determine which direction we should keep for this peer.
         // Smaller-node_id side keeps its outbound; larger keeps its inbound.
-        // Both sides reach the same conclusion (lex order is total и symmetric).
+        // Both sides reach the same conclusion (lex order is total and symmetric).
         let local_is_smaller = local_node_id.as_slice() < peer_id.as_slice();
         let we_keep_outbound = local_is_smaller;
         let new_matches_policy = we_keep_outbound == new_is_outbound;
 
         // Policy violation: regardless of existing state, reject.
-        // The peer на the other side will accept the symmetric-direction
-        // session (which IS policy-compliant from their POV), и both
+        // The peer on the other side will accept the symmetric-direction
+        // session (which IS policy-compliant from their POV), and both
         // sides converge on the same surviving TCP connection.
         if !new_matches_policy {
             return None;
         }
 
         // Policy-compliant.  Accept iff no existing session OR existing
-        // is stale (closed).  Don't replace а live policy-compliant
-        // session — the first к register wins для that direction.
+        // is stale (closed).  Don't replace a live policy-compliant
+        // session — the first to register wins for that direction.
         if let Some(existing) = self.senders.get(&peer_id)
             && !existing.is_closed()
         {
@@ -371,7 +371,7 @@ impl SessionTxRegistry {
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Stale entry — closed receiver. Cleanup deferred к next
+                // Stale entry — closed receiver. Cleanup deferred to next
                 // write-lock op (prune_closed).
                 false
             }
@@ -516,7 +516,7 @@ mod tests {
         reg.send_to_all(veil_bufpool::pooled_shared_from_vec(b"probe".to_vec())); // tolerate closed
         // Stale entry survives the read-only broadcast (lazy cleanup):
         assert_eq!(reg.len(), 1);
-        // Trigger а write-lock op → prune_closed fires:
+        // Trigger a write-lock op → prune_closed fires:
         let _rx2 = reg.register([99u8; 32]);
         assert_eq!(reg.len(), 1, "registering a fresh peer prunes [2u8;32]");
     }
@@ -540,12 +540,12 @@ mod tests {
         let peer_b = [11u8; 32];
         let _rx_a = reg.register(peer_a);
         let _rx_b = reg.register(peer_b);
-        // Both peers registered at ~same Instant. Send only к B —
+        // Both peers registered at ~same Instant. Send only to B —
         // its last_active bumps; A stays at register-time value.
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         let bytes = veil_bufpool::pooled_shared_from_vec(b"x".to_vec());
         assert!(reg.send_to_arc(&peer_b, INTERACTIVE, bytes));
-        // evict_lru(1) should drop А (older last_active) not B.
+        // evict_lru(1) should drop A (older last_active) not B.
         let evicted = reg.evict_lru(1);
         assert_eq!(evicted, 1);
         assert!(!reg.has_session(&peer_a), "older peer A evicted");

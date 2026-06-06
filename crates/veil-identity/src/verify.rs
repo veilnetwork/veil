@@ -62,12 +62,12 @@ pub struct ValidatedIdentity {
     pub active_instance_id: [u8; 16],
 }
 
-/// Clock-skew tolerance applied к all `valid_from` / `issued_at`
+/// Clock-skew tolerance applied to all `valid_from` / `issued_at`
 /// lower-bound checks on identity wire formats.
 ///
 /// **Interactive tier** — see
-/// [`veil_proto::time_validity::INTERACTIVE_SKEW_SECS`].  Pinned к
-/// the central policy так что future audits / refactors сохраняют
+/// [`veil_proto::time_validity::INTERACTIVE_SKEW_SECS`].  Pinned to
+/// the central policy so that future audits / refactors preserve the
 /// cross-site invariant ("the user is waiting on this packet").
 ///
 /// 60 s admits NTP drift + one human-scale retry without
@@ -77,10 +77,10 @@ pub const TIME_VALIDITY_SKEW_SECS: u64 = veil_proto::time_validity::INTERACTIVE_
 /// audit follow-up: max declared-vs-actual hour drift
 /// accepted on `IdentityProof.freshness_hour` checks. ±1 hour ⇒
 /// freshness window of ~2 hours total — captures producers running
-/// briefly with а wrong clock without admitting а cached proof from
-/// arbitrary time в the past. Matches the existing
+/// briefly with a wrong clock without admitting a cached proof from
+/// arbitrary time in the past. Matches the existing
 /// `NAME_CLAIM_FRESHNESS_HOUR_SKEW = 2` semantics (NameClaim resolver
-/// uses а ±2-hour window; proofs are tighter because they are minted
+/// uses a ±2-hour window; proofs are tighter because they are minted
 /// per-handshake, not republished hourly).
 pub const FRESHNESS_HOUR_SKEW: u64 = 1;
 
@@ -163,8 +163,8 @@ pub fn verify_identity_document(
     // same const, so the branch was unreachable.  Magic + version are
     // enforced upstream by `IdentityDocument::decode` (the single
     // source of truth); hand-constructed structs that bypass decode
-    // are а callers-responsibility issue caught by tests / fuzz, not
-    // by а defensive runtime check that compared а const к itself.
+    // are a callers-responsibility issue caught by tests / fuzz, not
+    // by a defensive runtime check that compared a const to itself.
 
     // 1. node_id must bind to master_pubkey.
     let computed = compute_node_id(&doc.master_pubkey);
@@ -176,10 +176,10 @@ pub fn verify_identity_document(
     }
 
     // 3. Freshness window — both bounds. audit follow-up
-    // added the lower-bound check; pre-fix а document с
+    // added the lower-bound check; pre-fix a document with
     // `issued_at_unix` set to "today + 30 days" would silently
-    // verify, which would let а compromised master sign а document
-    // that activates AFTER а revocation window.
+    // verify, which would let a compromised master sign a document
+    // that activates AFTER a revocation window.
     if now_unix_secs > doc.valid_until_unix {
         return Err(VerifyError::Expired {
             now: now_unix_secs,
@@ -187,9 +187,9 @@ pub fn verify_identity_document(
         });
     }
     // `issued_at_unix == 0` is the legacy / unset sentinel — never
-    // reject on it (some publish-side helpers и all pre-refactor
+    // reject on it (some publish-side helpers and all pre-refactor
     // identities serialize zero by default). Real producers always
-    // pass `now`, so а value > now + skew can only mean intentional
+    // pass `now`, so a value > now + skew can only mean intentional
     // future-dating.
     if doc.issued_at_unix > 0 && now_unix_secs + TIME_VALIDITY_SKEW_SECS < doc.issued_at_unix {
         return Err(VerifyError::NotYetValid {
@@ -352,7 +352,7 @@ fn verify_sig_raw(
             .map_err(|_| VerifyError::DocumentSigInvalid)
         }
         veil_proto::identity_document::ALGO_ED25519_FALCON1024_HYBRID => {
-            // Этап 10 follow-up: Falcon-1024 hybrid IdentityDocument
+            // Phase 10 follow-up: Falcon-1024 hybrid IdentityDocument
             // verify.  Same delegation pattern as the 512-hybrid arm
             // above; both component signatures must verify under the
             // canonical `veil-crypto` hybrid-1024 path.
@@ -482,14 +482,14 @@ pub fn verify_identity_proof(
         });
     }
     // 4''. `freshness_hour` enforcement.
-    // The wire field has been carried through encode/decode и
-    // producers always set it к `floor(now / 3600)` at sign time
+    // The wire field has been carried through encode/decode and
+    // producers always set it to `floor(now / 3600)` at sign time
     // (`publish::sign_identity_proof`). Pre-fix the verifier
-    // accepted any value, so а stale proof captured 5 days ago
+    // accepted any value, so a stale proof captured 5 days ago
     // could be replayed unmodified. Skew window is FRESHNESS_HOUR_SKEW
-    // hours (±1) к accept producers с briefly-wrong clocks.
+    // hours (±1) to accept producers with briefly-wrong clocks.
     // Producers carrying `freshness_hour == 0` predate this field
-    // (legacy / uninitialized) и are accepted silently — same
+    // (legacy / uninitialized) and are accepted silently — same
     // "0-as-sentinel" rule as the other lower-bound fields.
     if proof.freshness_hour > 0 {
         let actual_hour = now_unix_secs / 3600;
@@ -639,7 +639,7 @@ fn verify_proof_sig(
             .map_err(|_| ProofVerifyError::EphemeralSigInvalid)
         }
         veil_proto::identity_document::ALGO_ED25519_FALCON1024_HYBRID => {
-            // Этап 10 follow-up: Falcon-1024 hybrid IdentityProof
+            // Phase 10 follow-up: Falcon-1024 hybrid IdentityProof
             // verify.  Same delegation pattern as the 512-hybrid arm.
             use base64::Engine as _;
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(public_key);
@@ -1003,7 +1003,7 @@ mod tests {
     #[test]
     fn accepts_issued_at_within_skew_window() {
         let mut f = build_fixture();
-        // Set issued_at exactly at `now + skew` — the verifier uses а strict
+        // Set issued_at exactly at `now + skew` — the verifier uses a strict
         // `<` on the lower-bound comparison, so equality should pass.
         f.doc.issued_at_unix = f.now_unix_secs + TIME_VALIDITY_SKEW_SECS;
         let ss = f._sub_sk.clone();
@@ -1012,13 +1012,13 @@ mod tests {
             .expect("issued_at exactly at +skew must accept");
     }
 
-    /// `IdentityKey.valid_from_unix` set into the future ⇒ reject с
-    /// `KeyNotYetValid` (separate variant from the document-level one к
-    /// surface the offending subkey index в logs).
+    /// `IdentityKey.valid_from_unix` set into the future ⇒ reject with
+    /// `KeyNotYetValid` (separate variant from the document-level one to
+    /// surface the offending subkey index in logs).
     #[test]
     fn rejects_future_dated_identity_key() {
         let mut f = build_fixture();
-        // Future-date the per-key valid_from + re-sign the master cert и
+        // Future-date the per-key valid_from + re-sign the master cert and
         // document_sig (canonical bytes change so all signatures must be
         // refreshed).
         let new_valid_from = f.now_unix_secs + 3600;
@@ -1043,7 +1043,7 @@ mod tests {
 
     // ── verify_identity_proof — audit lower-bound + freshness ─
 
-    /// Build а minimal IdentityProof structure с correct node_id / device_id
+    /// Build a minimal IdentityProof structure with correct node_id / device_id
     /// bindings (so the verifier reaches the time-validity checks before
     /// failing on hash mismatch). Signatures are blank — sufficient for
     /// tests that intentionally trigger early-reject paths (steps 4' / 4'').
@@ -1074,9 +1074,9 @@ mod tests {
         }
     }
 
-    /// Pre-fix а proof с `key_valid_from_unix` 1 day in the future would
+    /// Pre-fix a proof with `key_valid_from_unix` 1 day in the future would
     /// silently pass (since only `valid_until` was checked). Post-fix
-    /// reject с `KeyNotYetValid` BEFORE the master-sig verification —
+    /// reject with `KeyNotYetValid` BEFORE the master-sig verification —
     /// proven by reaching this error variant rather than `MasterCertInvalid`
     /// (signatures are dummy bytes).
     #[test]
@@ -1091,7 +1091,7 @@ mod tests {
         );
     }
 
-    /// `freshness_hour` declares а value 5 hours in the past — past the
+    /// `freshness_hour` declares a value 5 hours in the past — past the
     /// ±FRESHNESS_HOUR_SKEW = 1 window — so the verifier must reject.
     /// Confirms the wire field is no longer ignored.
     #[test]
@@ -1109,7 +1109,7 @@ mod tests {
 
     /// Boundary: `freshness_hour` exactly 1 hour in the past ⇒ within
     /// FRESHNESS_HOUR_SKEW → must reach signature-verification (and thus
-    /// fail с `MasterCertInvalid` since dummy sigs). This proves the
+    /// fail with `MasterCertInvalid` since dummy sigs). This proves the
     /// freshness check itself does not over-reject.
     #[test]
     fn proof_freshness_hour_within_skew_reaches_sig_check() {

@@ -1,21 +1,21 @@
 //! `oproxy-client` — standalone proxy client binary.
 //!
-//! Connects к а local veil daemon's app socket, binds an endpoint
-//! под the configured `app_name`, и runs one OR more inbound listeners
-//! (SOCKS5 / HTTP / TProxy) forwarding traffic через veil к а
+//! Connects to a local veil daemon's app socket, binds an endpoint
+//! under the configured `app_name`, and runs one OR more inbound listeners
+//! (SOCKS5 / HTTP / TProxy) forwarding traffic through veil to a
 //! configured upstream `(server_node_id, server_app_name)` pair.
 //!
-//! Each connection is dispatched через the `[routing]` policy (veil
-//! / direct / block + optional direct-fallback на veil failure).
+//! Each connection is dispatched through the `[routing]` policy (veil
+//! / direct / block + optional direct-fallback on veil failure).
 //!
 //! Usage:
 //!   oproxy-client --config /etc/oproxy/client.toml
 
 // oproxy-client depends on `veilclient::VeilClient`, which is
 // itself `#[cfg(unix)]`-gated (Unix-domain socket IPC).  Wrap the
-// entire bin content в а `#[cfg(unix)] mod imp` so cross-compile к
+// entire bin content in a `#[cfg(unix)] mod imp` so cross-compile to
 // x86_64-pc-windows-gnu doesn't trip on the unresolved `AppSender`
-// import от oproxy::connector.  Windows stub main exits с error.
+// import from oproxy::connector.  Windows stub main exits with error.
 #[cfg(not(unix))]
 fn main() -> std::process::ExitCode {
     eprintln!("oproxy-client is not supported on this platform (Unix-family only).");
@@ -47,13 +47,13 @@ mod imp {
         about = "Veil-network proxy client (SOCKS5 / HTTP / TProxy → veil)"
     )]
     struct Args {
-        /// Path к а TOML config file (см. `crates/oproxy/README.md`).
+        /// Path to a TOML config file (see `crates/oproxy/README.md`).
         #[arg(long, value_name = "PATH", required_unless_present = "gen_config")]
         config: Option<PathBuf>,
 
-        /// Print а commented default-config TOML template к stdout и exit.
-        /// Operators run this once, redirect к а file, edit the placeholders
-        /// (`server_node_id`, `[[inbound]]` listeners), then start с
+        /// Print a commented default-config TOML template to stdout and exit.
+        /// Operators run this once, redirect to a file, edit the placeholders
+        /// (`server_node_id`, `[[inbound]]` listeners), then start with
         /// `--config <path>`.
         ///
         /// Example:
@@ -80,7 +80,7 @@ mod imp {
             .config
             .expect("clap should have required --config when --gen-config absent");
 
-        // Audit batch 2026-05-24 (M6): warn если config file is loose-mode.
+        // Audit batch 2026-05-24 (M6): warn if config file is loose-mode.
         oproxy::config::warn_loose_config_perms(&config_path);
 
         // Load config first so we can derive runtime + logging knobs from
@@ -100,23 +100,23 @@ mod imp {
             }
         };
 
-        // Initialise logger от config; `RUST_LOG` env var still wins (per
+        // Initialise logger from config; `RUST_LOG` env var still wins (per
         // env_logger's `from_env` semantics) — operators retain debug
-        // ergonomics.  When `[logging] file` is set, route output к the
+        // ergonomics.  When `[logging] file` is set, route output to the
         // file instead of stderr.
         if let Err(e) = oproxy::init_oproxy_logger("oproxy-client", &cfg.logging) {
             eprintln!("oproxy-client: failed to init logger: {e}");
             return std::process::ExitCode::FAILURE;
         }
 
-        // S2.B: load app-cert blob если configured.  Fail-fast если the
-        // file can't be read — better than launching и silently sending
+        // S2.B: load app-cert blob if configured.  Fail-fast if the
+        // file can't be read — better than launching and silently sending
         // no preamble.
         let app_cert_blob: Option<Vec<u8>> = match &cfg.app_cert_path {
             Some(path) => match std::fs::read(path) {
                 Ok(bytes) => {
                     log::info!(
-                        "oproxy-client: loaded app-cert blob ({} B) от {}",
+                        "oproxy-client: loaded app-cert blob ({} B) from {}",
                         bytes.len(),
                         path.display()
                     );
@@ -124,7 +124,7 @@ mod imp {
                 }
                 Err(e) => {
                     eprintln!(
-                        "oproxy-client: failed к read app_cert_path={}: {e}",
+                        "oproxy-client: failed to read app_cert_path={}: {e}",
                         path.display()
                     );
                     return std::process::ExitCode::FAILURE;
@@ -166,7 +166,7 @@ mod imp {
         );
 
         log::info!(
-            "oproxy-client: connecting к daemon socket {}",
+            "oproxy-client: connecting to daemon socket {}",
             cfg.socket_path.display()
         );
         let client = VeilClient::connect(&cfg.socket_path)
@@ -181,10 +181,10 @@ mod imp {
             .bind(oproxy::CLIENT_NAMESPACE, oproxy::CLIENT_BIND_NAME, 0)
             .await
             .context("bind local app endpoint")?;
-        // Audit batch 2026-05-24 (M9): use `into_split()` к get an AppSender
-        // что implements `&self`-only `open_stream`.  Previously wrapped в
-        // `Arc<Mutex<AppHandle>>`, but `.lock().await` was held *через* the
-        // `open_stream().await` call — а single hung veil-peer blocked
+        // Audit batch 2026-05-24 (M9): use `into_split()` to get an AppSender
+        // that implements `&self`-only `open_stream`.  Previously wrapped in
+        // `Arc<Mutex<AppHandle>>`, but `.lock().await` was held *through* the
+        // `open_stream().await` call — a single hung veil-peer blocked
         // ALL other concurrent SOCKS5/HTTP connect attempts.  oproxy-client
         // never reads inbound messages on this endpoint (only opens streams),
         // so the receiver-half is dropped immediately.
@@ -204,7 +204,7 @@ mod imp {
         );
 
         // Audit batch 2026-05-24 (M8): per-listener semaphore caps concurrent
-        // sessions.  Each listener gets its OWN semaphore (не shared) — а
+        // sessions.  Each listener gets its OWN semaphore (not shared) — a
         // SOCKS5 flood does not starve the HTTP path.
         let limit_per_listener = cfg.limits.max_concurrent_per_listener;
         log::info!("oproxy-client: max_concurrent_per_listener={limit_per_listener}");
@@ -255,7 +255,7 @@ mod imp {
             tasks.push(task);
         }
 
-        // Wait для shutdown signal или task panic.
+        // Wait for shutdown signal or task panic.
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 log::info!("oproxy-client: SIGINT received, shutting down");
@@ -267,9 +267,9 @@ mod imp {
         Ok(())
     }
 
-    /// Wait для the first task в the vector к complete.  Simple
-    /// poll-based implementation — avoids а `futures` crate dependency
-    /// just для this one-shot select.
+    /// Wait for the first task in the vector to complete.  Simple
+    /// poll-based implementation — avoids a `futures` crate dependency
+    /// just for this one-shot select.
     async fn futures_first(mut tasks: Vec<tokio::task::JoinHandle<()>>) {
         if tasks.is_empty() {
             std::future::pending::<()>().await;

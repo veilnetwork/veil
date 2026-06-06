@@ -44,9 +44,9 @@ pub fn handle_invite_command<I: CommandIo, O: ConfigOps>(
     }
 }
 
-// Loose sanity ceiling — `veil-invite` does not enforce а max
+// Loose sanity ceiling — `veil-invite` does not enforce a max
 // validity itself; we cap at 1 year here so operators can't accidentally
-// emit а bundle that survives а multi-year rotation cadence.
+// emit a bundle that survives a multi-year rotation cadence.
 const MAX_VALIDITY_SECS: u64 = 365 * 24 * 3600;
 
 fn now_unix() -> u64 {
@@ -99,15 +99,15 @@ fn create_invite<I: CommandIo, O: ConfigOps>(
     if matches!(listen.visibility, Visibility::Public) {
         return Err(veil_cfg::ConfigError::ValidationFailed(format!(
             "listener {listener_id} has visibility=public — public listeners are advertised \
-             via PEX/DHT, so an invite bundle would just leak а redundant PSK. \
+             via PEX/DHT, so an invite bundle would just leak a redundant PSK. \
              Mark the listener `visibility = \"trusted\"` or `\"hidden\"` first.",
         )));
     }
 
     let psk_path = listen.psk_file.clone().ok_or_else(|| {
         veil_cfg::ConfigError::ValidationFailed(format!(
-            "listener {listener_id} has no `psk_file` — invite bundles must embed а PSK; \
-             configure `psk_file = \"…\"` or fall back к а deployment-wide \
+            "listener {listener_id} has no `psk_file` — invite bundles must embed a PSK; \
+             configure `psk_file = \"…\"` or fall back to a deployment-wide \
              `transport.obfs4_psk_file` AND set it explicitly on the listener.",
         ))
     })?;
@@ -139,7 +139,7 @@ fn create_invite<I: CommandIo, O: ConfigOps>(
     if let Some(file) = output {
         write_file_0o600(&file, text.as_bytes())?;
         context.io.emit(OutputEvent::message(format!(
-            "wrote invite bundle к {} ({} bytes base32 | nid={} | exp_unix={}){}",
+            "wrote invite bundle to {} ({} bytes base32 | nid={} | exp_unix={}){}",
             file.display(),
             text.len(),
             short_hex(&bundle.nid),
@@ -173,7 +173,7 @@ fn accept_invite<I: CommandIo, O: ConfigOps>(
     })?;
 
     // Drop PSK before mutating config so the operator can't be left
-    // в а half-installed state (PSK missing but bootstrap_peers
+    // in a half-installed state (PSK missing but bootstrap_peers
     // appended).  Filesystem write first, config edit second.
     let (config_path, mut config) = context.config().load_existing()?;
     let psk_path = match psk_out {
@@ -239,8 +239,8 @@ fn decode_invite<I: CommandIo, O: ConfigOps>(
     let bundle = InviteBundleV1::from_base32(&raw).map_err(|e| {
         veil_cfg::ConfigError::ValidationFailed(format!("decode invite bundle: {e}"))
     })?;
-    // `verify` checks sig + identity binding + expiry.  Decode is а
-    // diagnostic so we still call it (а bundle that fails verify isn't
+    // `verify` checks sig + identity binding + expiry.  Decode is a
+    // diagnostic so we still call it (a bundle that fails verify isn't
     // worth printing) but report expiry separately for clarity.
     let verified = bundle.verify(now_unix());
     let verify_status = match &verified {
@@ -290,7 +290,7 @@ fn read_psk_file(path: &Path) -> veil_cfg::Result<[u8; 32]> {
     })?;
     if bytes.len() != 32 {
         return Err(veil_cfg::ConfigError::ValidationFailed(format!(
-            "psk file {} decoded к {} bytes, expected 32",
+            "psk file {} decoded to {} bytes, expected 32",
             path.display(),
             bytes.len(),
         )));
@@ -497,7 +497,7 @@ mod tests {
 
         fn write_raw_config(&self, _path: &Path, _content: &str) -> veil_cfg::Result<()> {
             // Slice 11b: test stub — fixture acks the
-            // raw-write path without persisting к disk.
+            // raw-write path without persisting to disk.
             Ok(())
         }
     }
@@ -516,11 +516,11 @@ mod tests {
         let inviter_config_path = inviter_dir.path().join("node.toml");
         let inviter_psk_path = inviter_dir.path().join("listener.psk");
 
-        // Write а 32-byte PSK base64-encoded к the psk_file location.
+        // Write a 32-byte PSK base64-encoded to the psk_file location.
         let psk_bytes = [0x77u8; 32];
         std::fs::write(&inviter_psk_path, STANDARD.encode(psk_bytes)).unwrap();
 
-        // Generate а deterministic Ed25519 identity для the inviter.
+        // Generate a deterministic Ed25519 identity for the inviter.
         let sk = SigningKey::from_bytes(&[0x42u8; 32]);
         let pk_b64 = STANDARD.encode(sk.verifying_key().to_bytes());
         let sk_b64 = STANDARD.encode(sk.to_bytes());
@@ -553,8 +553,8 @@ mod tests {
             ops: inviter_ops,
         };
 
-        // Emit the bundle к а file so we don't have к parse stdout
-        // mixed с the trailing comment line.
+        // Emit the bundle to a file so we don't have to parse stdout
+        // mixed with the trailing comment line.
         let bundle_path = inviter_dir.path().join("invite.txt");
         create_invite(
             &mut inviter_ctx,
@@ -589,7 +589,7 @@ mod tests {
         accept_invite(&mut recipient_ctx, &bundle_path, None, false)
             .expect("accept_invite must succeed");
 
-        // (a) PSK file written к the default path (under recipient's
+        // (a) PSK file written to the default path (under recipient's
         //     config dir, hex-encoded node_id filename).
         let expected_nid = *blake3::hash(&sk.verifying_key().to_bytes()).as_bytes();
         let nid_hex: String = expected_nid.iter().map(|b| format!("{b:02x}")).collect();
@@ -602,7 +602,7 @@ mod tests {
         let saved_psk = STANDARD.decode(saved_psk_b64.trim()).unwrap();
         assert_eq!(saved_psk, psk_bytes, "PSK round-trip mismatch");
 
-        // (b) bootstrap_peers appended с the inviter's pubkey.
+        // (b) bootstrap_peers appended with the inviter's pubkey.
         let after = recipient_state.borrow();
         assert_eq!(after.bootstrap_peers.len(), 1);
         let added = &after.bootstrap_peers[0];
@@ -621,8 +621,8 @@ mod tests {
         let psk_path = dir.path().join("listener.psk");
         std::fs::write(&psk_path, STANDARD.encode([0x11u8; 32])).unwrap();
 
-        // Build а bundle directly via the veil-invite crate (no need
-        // к round-trip through create_invite — это test focuses on
+        // Build a bundle directly via the veil-invite crate (no need
+        // to round-trip through create_invite — this test focuses on
         // accept's dedup behaviour).
         let sk = SigningKey::from_bytes(&[0x88u8; 32]);
         let exp = std::time::SystemTime::now()

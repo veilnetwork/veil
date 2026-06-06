@@ -71,7 +71,7 @@ are defensive hardening visible only on adversary-shaped input.
 
 - **Phase K** (`a208737`) — gitignore stend secrets; clippy `await_holding_lock`
   attributes on phase650b serialization tests.
-- **Phase L** (`3d698f9`) — DHT `find_value` filter consistency с `find_node`;
+- **Phase L** (`3d698f9`) — DHT `find_value` filter consistency with `find_node`;
   Argon2 product cap `MAX_KDF_PRODUCT_KIB = 256 GiB·iter`; admin request
   DoS cap `MAX_ADMIN_REQUEST_BYTES = 64 KiB`; verified e2e ML-KEM HKDF
   binding already covers `dst_id` (audit FP).
@@ -88,7 +88,7 @@ are defensive hardening visible only on adversary-shaped input.
   anycast records via `SovereignIdentity::ed25519_signing_key()`.
 - **Phase P** (`56a76b1`) — 4 defense-in-depth fixes:
   `MetricsConfig` deny_unknown_fields; bootstrap clock-broken fail-closed;
-  FCM `expires_in` clamped к `[60, 7200] s`; update-manifest `issuer_pk`
+  FCM `expires_in` clamped to `[60, 7200] s`; update-manifest `issuer_pk`
   per-algorithm caps (Ed25519=128 / Falcon-512=1280 / Hybrid=1408 B).
 
 ## Wave 1: Scalable Routing (Epics 294-323)

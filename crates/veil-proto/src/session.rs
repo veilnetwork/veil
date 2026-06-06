@@ -48,9 +48,9 @@ pub struct HelloPayload {
     pub resume_ticket: Option<EncryptedTicket>,
     /// Private-network membership cert blob (bincode-encoded
     /// `veil_types::MembershipCert`). Set when the sender's local
-    /// config has `[network].mode = "private"`. Receivers в private
+    /// config has `[network].mode = "private"`. Receivers in private
     /// mode reject HELLO without it; public-mode receivers ignore the
-    /// TLV для forward compat.
+    /// TLV for forward compat.
     pub membership_cert_blob: Option<Vec<u8>>,
 }
 
@@ -61,7 +61,7 @@ impl HelloPayload {
     /// Encode to wire bytes.
     ///
     /// If `resume_ticket` is set, appends a TLV entry after the fixed region.
-    /// Same для `membership_cert_blob`.
+    /// Same for `membership_cert_blob`.
     pub fn encode(&self) -> Vec<u8> {
         let resume_tlv_len = self.resume_ticket.as_ref().map_or(0, |t| 1 + 2 + t.len());
         let cert_tlv_len = self
@@ -301,14 +301,14 @@ pub mod cap_flags {
     /// peer as a circuit candidate even if `CAN_RELAY` is set.
     pub const ANONYMITY_RELAY: u8 = 1 << 2;
     /// peer supports the post-quantum hybrid
-    /// session-key derivation path. When BOTH peers set this bit и
-    /// have ML-KEM material к exchange (initiator: knows responder's
+    /// session-key derivation path. When BOTH peers set this bit and
+    /// have ML-KEM material to exchange (initiator: knows responder's
     /// EK; responder: holds its own ML-KEM DK seed), the handshake
-    /// inserts a `SessionMsg::HybridKexCt` frame между `IdentityProof`
+    /// inserts a `SessionMsg::HybridKexCt` frame between `IdentityProof`
     /// and `SessionConfirm`, and replaces the classical SessionKeys
-    /// from `derive_session_keys` с
+    /// from `derive_session_keys` with
     /// `derive_hybrid_session_keys(x25519_secret, mlkem_secret...)`.
-    /// Legacy peers that don't set this bit fall through к the
+    /// Legacy peers that don't set this bit fall through to the
     /// classical X25519-only path unchanged.
     pub const SUPPORTS_HYBRID_KEX: u8 = 1 << 3;
 }
@@ -912,25 +912,25 @@ pub const VISIBILITY_SCOPE_TLV_TAG: u16 = 0x0012;
 /// ```
 pub const CUSTOM_TTL_TLV_TAG: u16 = 0x0013;
 
-/// TLV tag для the peer's **observed source address** — STUN-style
+/// TLV tag for the peer's **observed source address** — STUN-style
 /// auto-discovery of one's own public IP/port via the daemon counterpart.
 ///
 /// Server side (the side accepting an incoming OVL1 connection) captures
-/// the remote `SocketAddr` from the TCP/TLS/QUIC layer и echoes it back
-/// in ATTACH. Client side (initiator) parses the TLV и learns "this is
-/// the address you appeared as к my counterpart" — useful для NAT-mapped
-/// hosts that don't know their public IP, и для operators wanting к
+/// the remote `SocketAddr` from the TCP/TLS/QUIC layer and echoes it back
+/// in ATTACH. Client side (initiator) parses the TLV and learns "this is
+/// the address you appeared as to my counterpart" — useful for NAT-mapped
+/// hosts that don't know their public IP, and for operators wanting to
 /// auto-fill an `advertise = "..."` URI without external STUN-like tools.
 ///
 /// Wire layout (19 bytes fixed):
 /// ```text
 /// [0]    family       u8 (4 = IPv4, 6 = IPv6)
-/// [1..17] addr        [u8; 16] (IPv4 addr placed в first 4 bytes when family=4)
+/// [1..17] addr        [u8; 16] (IPv4 addr placed in first 4 bytes when family=4)
 /// [17..19] port       u16 BE
 /// ```
 ///
 /// Always sent in IPv6-mapped form on the wire to keep the field width
-/// fixed; the family byte tells the parser how к interpret the bytes.
+/// fixed; the family byte tells the parser how to interpret the bytes.
 pub const OBSERVED_ADDR_TLV_TAG: u16 = 0x0014;
 pub const OBSERVED_ADDR_TLV_LEN: usize = 19;
 
@@ -953,7 +953,7 @@ pub fn encode_observed_addr(addr: std::net::SocketAddr) -> [u8; OBSERVED_ADDR_TL
     buf
 }
 
-/// Decode the observed-address TLV value back к а `SocketAddr`.
+/// Decode the observed-address TLV value back to a `SocketAddr`.
 /// Returns `None` on invalid family byte or short buffer.
 pub fn decode_observed_addr(buf: &[u8]) -> Option<std::net::SocketAddr> {
     if buf.len() < OBSERVED_ADDR_TLV_LEN {
@@ -1182,10 +1182,10 @@ impl SleepAdvertisementPayload {
 
 // ── TransportMigrationNotifyPayload ───────────────────────────────────────────
 
-/// Inform peer что the sender is moving к а new transport URI.  Used
+/// Inform peer that the sender is moving to a new transport URI.  Used
 /// by ephemeral-port rotation (Phase 5b of per-listener visibility plan):
 /// before the sender's old listener closes, it broadcasts this message
-/// к each active session so peers learn the new URI без waiting на DHT
+/// to each active session so peers learn the new URI without waiting on DHT
 /// re-resolution.
 ///
 /// Wire layout:
@@ -1200,7 +1200,7 @@ impl SleepAdvertisementPayload {
 ///
 /// `signable_bytes` covers `node_id || new_expiry_unix || issued_at_unix ||
 /// new_transport_len_be || new_transport_utf8` (everything except the
-/// trailing sig).  Receiver verifies sig против node_id's `identity_pubkey`
+/// trailing sig).  Receiver verifies sig against node_id's `identity_pubkey`
 /// from the existing session's handshake context.
 ///
 /// **Replay tolerance**: receiver accepts iff `|issued_at - now| ≤
@@ -1210,8 +1210,8 @@ impl SleepAdvertisementPayload {
 pub struct TransportMigrationNotifyPayload {
     /// Announcing node's `node_id`.
     pub node_id: [u8; 32],
-    /// Unix timestamp при which the NEW URI's announcement should expire.
-    /// Beyond это, peers SHOULD revert к DHT lookup.
+    /// Unix timestamp with which the NEW URI's announcement should expire.
+    /// Beyond this, peers SHOULD revert to DHT lookup.
     pub new_expiry_unix: u64,
     /// Unix timestamp when the notify was issued (replay anchor).
     pub issued_at_unix: u64,
@@ -1223,11 +1223,11 @@ pub struct TransportMigrationNotifyPayload {
 }
 
 /// Maximum length of `new_transport` field (UTF-8 bytes).  Matches
-/// [`crate::discovery::MAX_TRANSPORT_URI_LEN`] для consistency.
+/// [`crate::discovery::MAX_TRANSPORT_URI_LEN`] for consistency.
 pub const MAX_TRANSPORT_URI_LEN: usize = 240;
 
-/// Replay-tolerance window (seconds).  Notifies с `|issued_at - now|`
-/// outside this window are silently dropped без error.
+/// Replay-tolerance window (seconds).  Notifies with `|issued_at - now|`
+/// outside this window are silently dropped without error.
 pub const MIGRATION_REPLAY_WINDOW_SECS: u64 = 300;
 
 impl TransportMigrationNotifyPayload {
@@ -1243,7 +1243,7 @@ impl TransportMigrationNotifyPayload {
         buf
     }
 
-    /// Encode к wire bytes.  Variable length (depends on URI length).
+    /// Encode to wire bytes.  Variable length (depends on URI length).
     pub fn encode(&self) -> Vec<u8> {
         let transport_bytes = self.new_transport.as_bytes();
         let total = 32 + 8 + 8 + 2 + transport_bytes.len() + 64;
@@ -1257,7 +1257,7 @@ impl TransportMigrationNotifyPayload {
         buf
     }
 
-    /// Decode wire bytes с structural validation.  Caller still needs к
+    /// Decode wire bytes with structural validation.  Caller still needs to
     /// verify the Ed25519 signature against the issuer's identity_pubkey
     /// using [`verify_transport_migration_notify`].
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
@@ -1302,13 +1302,13 @@ impl TransportMigrationNotifyPayload {
     }
 }
 
-/// Domain-separation tag для the Ed25519 signature input.  Prepended
-/// before `signable_bytes` так sig from one purpose can't be replayed
-/// як sig для another.
+/// Domain-separation tag for the Ed25519 signature input.  Prepended
+/// before `signable_bytes` so sig from one purpose can't be replayed
+/// as sig for another.
 pub const MIGRATION_SIG_DOMAIN: &[u8] = b"veil-transport-migration:v1\0";
 
-/// Sign а migration notify body with the sender's Ed25519 signing key.
-/// Builds the payload с the computed signature filled in.
+/// Sign a migration notify body with the sender's Ed25519 signing key.
+/// Builds the payload with the computed signature filled in.
 pub fn sign_transport_migration_notify(
     node_id: [u8; 32],
     new_expiry_unix: u64,
@@ -1332,9 +1332,9 @@ pub fn sign_transport_migration_notify(
     draft
 }
 
-/// Verify а migration notify.  Returns `Ok(())` iff:
-/// 1. Sig is а valid Ed25519 signature over `MIGRATION_SIG_DOMAIN ||
-///    signable_bytes` под `pubkey`.
+/// Verify a migration notify.  Returns `Ok(())` iff:
+/// 1. Sig is a valid Ed25519 signature over `MIGRATION_SIG_DOMAIN ||
+///    signable_bytes` under `pubkey`.
 /// 2. `node_id` equals `BLAKE3(pubkey)` (identity binding).
 /// 3. `|issued_at_unix - now_unix| ≤ MIGRATION_REPLAY_WINDOW_SECS`.
 ///
@@ -1626,7 +1626,7 @@ impl SessionTicket {
 // ── hybrid-kex ML-KEM ciphertext payload ───────────────
 
 /// Payload of `SessionMsg::HybridKexCt`. Carries the 1088-byte
-/// ML-KEM-768 ciphertext from the initiator к the responder.
+/// ML-KEM-768 ciphertext from the initiator to the responder.
 ///
 /// Wire layout:
 /// ```text
@@ -1638,7 +1638,7 @@ impl SessionTicket {
 /// CT length, so a future PQ algo upgrade (ML-KEM-1024 has a
 /// 1568-byte CT) can drop in without a wire-format bump. Decoders
 /// reject malformed frames AND any trailing bytes after the declared
-/// CT length к catch buggy peers early.
+/// CT length to catch buggy peers early.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridKexCtPayload {
     /// ML-KEM-768 ciphertext (caller validates length).
@@ -1914,7 +1914,7 @@ mod tests {
         assert_eq!(encoded[0], 6);
         let decoded = decode_observed_addr(&encoded).expect("roundtrip");
         // Note: SocketAddrV6 carries flowinfo/scope_id; encode normalises them
-        // к 0 so we compare only ip + port.
+        // to 0 so we compare only ip + port.
         assert_eq!(decoded.ip().to_string(), original.ip().to_string());
         assert_eq!(decoded.port(), original.port());
     }
@@ -1980,9 +1980,9 @@ mod tests {
 
     #[test]
     fn hello_rejects_oversized_membership_cert_tlv() {
-        // Manually construct а HELLO wire с а TLV body 2049 bytes
+        // Manually construct a HELLO wire with a TLV body 2049 bytes
         // (one more than MAX_MEMBERSHIP_CERT_SIZE). Decoder must skip
-        // the cert silently, не propagate it.
+        // the cert silently, not propagate it.
         let mut buf = Vec::new();
         buf.extend_from_slice(&1u16.to_be_bytes()); // ovl1_major
         buf.extend_from_slice(&node_id(0xAA)); // node_id
@@ -2573,7 +2573,7 @@ mod tests {
 
     #[test]
     fn hybrid_kex_cap_flag_disjoint_from_others() {
-        // SUPPORTS_HYBRID_KEX must not collide с CAN_RELAY
+        // SUPPORTS_HYBRID_KEX must not collide with CAN_RELAY
         // SUPPORTS_SOVEREIGN_IDENTITY, or ANONYMITY_RELAY — otherwise
         // a peer setting one bit accidentally engages another.
         assert_eq!(cap_flags::SUPPORTS_HYBRID_KEX, 1 << 3);
@@ -2681,7 +2681,7 @@ mod tests {
             "obfs4-tcp://1.2.3.4:9000".to_owned(),
             &sk,
         );
-        // Verify в the replay window.
+        // Verify in the replay window.
         assert!(verify_transport_migration_notify(&payload, &pubkey, 1_699_999_910).is_ok());
     }
 
@@ -2716,7 +2716,7 @@ mod tests {
             "obfs4-tcp://1.2.3.4:9000".to_owned(),
             &sk_a,
         );
-        // Verify против wrong pubkey fails (identity binding check).
+        // Verify against wrong pubkey fails (identity binding check).
         assert!(verify_transport_migration_notify(&payload, &pubkey_b, 1_699_999_910).is_err());
     }
 
@@ -2739,7 +2739,7 @@ mod tests {
 
     #[test]
     fn migration_notify_oversized_uri_rejected() {
-        // Encode а payload с URI exactly MAX_TRANSPORT_URI_LEN + 1.
+        // Encode a payload with URI exactly MAX_TRANSPORT_URI_LEN + 1.
         let huge = "x".repeat(MAX_TRANSPORT_URI_LEN + 1);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0u8; 32]); // node_id

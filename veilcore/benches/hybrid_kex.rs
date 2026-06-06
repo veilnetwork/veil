@@ -13,21 +13,21 @@
 //!    from the underlying KEM/DH operations. Difference is the
 //!    pure-key-schedule overhead a session pays at handshake time.
 //!
-//! 2. `mlkem_kem` — `mlkem_encapsulate_raw` (sender side) и
-//!    `mlkem_decapsulate_raw` (receiver side) на ML-KEM-768. These
-//!    are the dominant CPU cost of the hybrid path и land на ONE
+//! 2. `mlkem_kem` — `mlkem_encapsulate_raw` (sender side) and
+//!    `mlkem_decapsulate_raw` (receiver side) on ML-KEM-768. These
+//!    are the dominant CPU cost of the hybrid path and land on ONE
 //!    side of the handshake each.
 //!
-//! 3. `mlkem_kem_prepared` — same operations BUT через the
+//! 3. `mlkem_kem_prepared` — same operations BUT through the
 //!    `PreparedEncapsulator` / `PreparedDecapsulator` cache types
-//!    что parse the EK / DK seed once и reuse it across calls.
+//!    that parse the EK / DK seed once and reuse it across calls.
 //!    Quantifies how much of group 2's cost is pure parse overhead
-//!    vs actual cryptographic work. Relevant для re-keying flows
+//!    vs actual cryptographic work. Relevant for re-keying flows
 //!    (mid-session forward-secrecy rotation) where the same peer
 //!    gets encap'd / decap'd repeatedly.
 //!
 //! 4. `kex_full` — end-to-end "what one party computes at handshake
-//!    time" for both the classical X25519-only path и the hybrid
+//!    time" for both the classical X25519-only path and the hybrid
 //!    path. Hybrid sender-side = encapsulate + HKDF;
 //!    hybrid receiver-side = decapsulate + HKDF. The classical
 //!    path is the X25519 shared-secret + HKDF. Numbers feed
@@ -90,8 +90,8 @@ fn bench_mlkem_kem(c: &mut Criterion) {
 /// `PreparedEncapsulator` / `PreparedDecapsulator` ONCE outside the
 /// benchmarked closure, then runs encap / decap repeatedly against
 /// the cache. Speedup over `mlkem_kem` group quantifies how much of
-/// the per-call cost was pure parse overhead (EK validation для
-/// encap; full DK seed-expansion для decap, matching the cost of
+/// the per-call cost was pure parse overhead (EK validation for
+/// encap; full DK seed-expansion for decap, matching the cost of
 /// keygen-from-seed).
 fn bench_mlkem_kem_prepared(c: &mut Criterion) {
     let mut g = c.benchmark_group("mlkem_kem_prepared");
@@ -110,7 +110,7 @@ fn bench_mlkem_kem_prepared(c: &mut Criterion) {
     });
 
     // Cost of the parse step alone — `from_bytes` / `from_seed` are
-    // what the prepared path amortises. Useful для operators
+    // what the prepared path amortises. Useful for operators
     // estimating "should I pay the per-session prepare cost OR per-call
     // raw cost".
     g.bench_function(BenchmarkId::new("mlkem768", "prepare_ek"), |b| {

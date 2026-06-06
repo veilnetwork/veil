@@ -2,26 +2,26 @@
 //! in-flight RPC request_id → oneshot::Sender so the runner can match
 //! incoming response frames to the originating waiter.
 //!
-//! Was three duplicated inline blocks в `SessionRunner::run`:
+//! Was three duplicated inline blocks in `SessionRunner::run`:
 //! * the `rpc_outbox` try_recv drain loop (TTL evict + capacity evict + dedupe + insert)
 //! * the `NextInput::RpcRequest` select-arm (TTL evict + dedupe + insert; no capacity evict — see note below)
-//! * the `NextInput::Timer` arm (TTL evict only, для quiet-period housekeeping)
+//! * the `NextInput::Timer` arm (TTL evict only, for quiet-period housekeeping)
 //!
-//! Plus the take-on-receipt block в the response-matching path (line ~2577 pre-extraction).
+//! Plus the take-on-receipt block in the response-matching path (line ~2577 pre-extraction).
 //!
 //! **Asymmetry preserved verbatim:** the `RpcRequest` select-arm path
 //! does NOT call `evict_oldest_if_at_capacity` — only the drain-loop
-//! path does. This may be а latent bug (capacity check missed when
+//! path does. This may be a latent bug (capacity check missed when
 //! requests arrive one-at-a-time via select! rather than batched
-//! through try_recv) but extracting the structure is а pure refactor;
-//! we don't change semantics here. Если future analysis shows the
+//! through try_recv) but extracting the structure is a pure refactor;
+//! we don't change semantics here. If future analysis shows the
 //! asymmetry was unintentional, both paths can call
-//! `evict_oldest_if_at_capacity` в а separate one-line slice (gate
+//! `evict_oldest_if_at_capacity` in a separate one-line slice (gate
 //! tests will catch any regression).
 //!
 //! Invariant: `table.len == deadline_index.len` at all times.
 //! Every code path that mutates one of the two backing collections
-//! mutates the other в the same call. External callers see only the
+//! mutates the other in the same call. External callers see only the
 //! struct's methods; the internal collections are private.
 
 use std::collections::{BTreeMap, HashMap};
@@ -29,20 +29,20 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-/// One pending entry: timestamp (used as deadline-index key и for TTL
+/// One pending entry: timestamp (used as deadline-index key and for TTL
 /// arithmetic) plus the oneshot sender that the runner fulfils when
-/// the matching response frame arrives. When а pending entry is
+/// the matching response frame arrives. When a pending entry is
 /// evicted (TTL expiry, capacity overflow, dedupe replacement), the
-/// sender receives `None` so the awaiting caller can return а
+/// sender receives `None` so the awaiting caller can return a
 /// well-defined "no response" rather than block forever.
 pub type PendingEntry = (Instant, oneshot::Sender<Option<Vec<u8>>>);
 
 pub struct PendingResponseTable {
     table: HashMap<u32, PendingEntry>,
     /// Deadline-ordered index of `(inserted_at, request_id)` —
-    /// composite key к survive same-Instant collisions when two
-    /// requests are inserted within а single tokio::time tick.
-    /// Provides O(log n) front-eviction по deadline.
+    /// composite key to survive same-Instant collisions when two
+    /// requests are inserted within a single tokio::time tick.
+    /// Provides O(log n) front-eviction by deadline.
     deadline_index: BTreeMap<(Instant, u32), ()>,
     capacity: usize,
     ttl: Duration,
@@ -59,7 +59,7 @@ impl PendingResponseTable {
     }
 
     /// Test-only accessor; production reads accumulation via
-    /// `evict_oldest_if_at_capacity` (which gates на capacity
+    /// `evict_oldest_if_at_capacity` (which gates on capacity
     /// internally) — no callsite outside tests needs raw length.
     pub fn len(&self) -> usize {
         debug_assert_eq!(
@@ -70,7 +70,7 @@ impl PendingResponseTable {
         self.table.len()
     }
 
-    /// `true` если no pending entry registered.  Companion к [`Self::len`].
+    /// `true` if no pending entry registered.  Companion to [`Self::len`].
     pub fn is_empty(&self) -> bool {
         self.table.is_empty()
     }
@@ -89,9 +89,9 @@ impl PendingResponseTable {
         }
     }
 
-    /// Evict the single oldest entry если we're at-or-over capacity.
-    /// Used by the drain-loop path к avoid unbounded growth when
-    /// peers spam request_ids that never get а matching response.
+    /// Evict the single oldest entry if we're at-or-over capacity.
+    /// Used by the drain-loop path to avoid unbounded growth when
+    /// peers spam request_ids that never get a matching response.
     pub fn evict_oldest_if_at_capacity(&mut self) {
         if self.table.len() < self.capacity {
             return;
@@ -105,11 +105,11 @@ impl PendingResponseTable {
         }
     }
 
-    /// Insert `(request_id → response_tx)` at `now`. Если there's
-    /// already an entry с the same request_id, the existing waiter
-    /// receives `None` и the new entry takes over. Same-key dedupe
+    /// Insert `(request_id → response_tx)` at `now`. If there's
+    /// already an entry with the same request_id, the existing waiter
+    /// receives `None` and the new entry takes over. Same-key dedupe
     /// preserves the invariant that exactly one waiter is alive per
-    /// request_id at а time.
+    /// request_id at a time.
     pub fn insert(
         &mut self,
         request_id: u32,
@@ -124,9 +124,9 @@ impl PendingResponseTable {
         self.table.insert(request_id, (now, response_tx));
     }
 
-    /// Take the entry для `request_id` — used when а matching response
-    /// frame arrives и we need к wake the waiter с `Some(body)`. Returns
-    /// `None` если either the request_id was never registered OR was
+    /// Take the entry for `request_id` — used when a matching response
+    /// frame arrives and we need to wake the waiter with `Some(body)`. Returns
+    /// `None` if either the request_id was never registered OR was
     /// already evicted (TTL or capacity).
     pub fn take(&mut self, request_id: u32) -> Option<oneshot::Sender<Option<Vec<u8>>>> {
         let (inserted, tx) = self.table.remove(&request_id)?;
@@ -146,12 +146,12 @@ mod tests {
         let (tx_fresh, mut rx_fresh) = oneshot::channel();
         let now0 = Instant::now();
         table.insert(1, tx_old, now0);
-        // Advance virtual time: tokio Instant::now doesn't move в test
-        // automatically; we just pass а later Instant to evict_expired.
+        // Advance virtual time: tokio Instant::now doesn't move in test
+        // automatically; we just pass a later Instant to evict_expired.
         let later = now0 + Duration::from_millis(60);
         table.insert(2, tx_fresh, later);
         table.evict_expired(later);
-        // Old entry hit TTL и was evicted; fresh entry remains.
+        // Old entry hit TTL and was evicted; fresh entry remains.
         assert_eq!(table.len(), 1);
         assert!(
             matches!(rx_old.try_recv(), Ok(None)),

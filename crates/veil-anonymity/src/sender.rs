@@ -120,7 +120,7 @@ pub fn build_outbound_anonymous_cell<F>(
 where
     F: Fn(&[u8; 32]) -> Option<u32>,
 {
-    // Backwards-compat shim — production callers should switch к the
+    // Backwards-compat shim — production callers should switch to the
     // `_with_diversity` variant for AS-correlation resistance.  The
     // `|_| None` extractor lets every candidate pass the diversity
     // gate (effectively disabling it), preserving legacy behavior.
@@ -135,24 +135,24 @@ where
     )
 }
 
-/// Like [`build_outbound_anonymous_cell`] но additionally enforces
-/// AS / netblock diversity между picked relay hops.  Anti-censorship
-/// Epic 482.x — closes the "adversary controlling 3+ relays в one /16
-/// (Hetzner, OVH, AWS-eu) can occupy ALL hops of а circuit" vector.
+/// Like [`build_outbound_anonymous_cell`] but additionally enforces
+/// AS / netblock diversity between picked relay hops.  Anti-censorship
+/// Epic 482.x — closes the "adversary controlling 3+ relays in one /16
+/// (Hetzner, OVH, AWS-eu) can occupy ALL hops of a circuit" vector.
 ///
-/// `diversity_key_of` maps а relay's `node_id` к an opaque key — typically
+/// `diversity_key_of` maps a relay's `node_id` to an opaque key — typically
 /// the first 16 bits of its IPv4 address (returned as `Some("v4:a.b")`)
 /// or 32 bits of IPv6 (`Some("v6:xxxx:yyyy")`).  Returning `None` for
-/// а candidate disables the diversity constraint для that relay (graceful
-/// degradation — better к pick а no-key candidate than fail к build the
+/// a candidate disables the diversity constraint for that relay (graceful
+/// degradation — better to pick a no-key candidate than fail to build the
 /// circuit entirely).
 ///
 /// **Call-site responsibility:** the closure typically consults the
-/// caller's `DiscoveredPeerCache` или session-tx-registry к look up
+/// caller's `DiscoveredPeerCache` or session-tx-registry to look up
 /// known IPs of relays we've already dialed.  Unknown relays receive
 /// the "no constraint" treatment.  Future slice: extend the
-/// `RelayDirectoryEntry` wire format с advertised_ip/asn so the
-/// closure can derive keys for ALL candidates даже без а prior dial.
+/// `RelayDirectoryEntry` wire format with advertised_ip/asn so the
+/// closure can derive keys for ALL candidates even without a prior dial.
 pub fn build_outbound_anonymous_cell_with_diversity<F, K>(
     payload: &[u8],
     discovered_candidates: &[DiscoveredRelay],
@@ -203,24 +203,24 @@ where
             .cloned()
             .collect();
         // AS-diversity selection (anti-censorship Epic 482.x wire-up):
-        // delegates к `pick_circuit_hops_latency_aware_with_diversity`
-        // с the caller-supplied `diversity_key_of` extractor.  When
-        // the caller passes а `|_| None` extractor, behavior degrades
+        // delegates to `pick_circuit_hops_latency_aware_with_diversity`
+        // with the caller-supplied `diversity_key_of` extractor.  When
+        // the caller passes a `|_| None` extractor, behavior degrades
         // gracefully to legacy "no diversity" (every candidate gets
         // accepted regardless of AS prefix).  Production callers (sender
-        // в veilcore) supply а closure что consults their local
+        // in veilcore) supply a closure that consults their local
         // `DiscoveredPeerCache` so already-dialed peers contribute
-        // their /16 prefix к the diversity gate.
+        // their /16 prefix to the diversity gate.
         //
         // Future tightening: extend `RelayDirectoryEntry` wire format
-        // с advertised_ip/asn so unknown relays also get keys — currently
-        // they pass через as "unkeyed candidates" по the picker's
+        // with advertised_ip/asn so unknown relays also get keys — currently
+        // they pass through as "unkeyed candidates" by the picker's
         // graceful-degradation rule.
         //
-        // Fallback к latency-only если the diversity picker can't find
+        // Fallback to latency-only if the diversity picker can't find
         // `n_relays` distinct-key candidates (e.g., all candidates share
         // the same /16, or the extractor returns None for everyone).
-        // This keeps а partial-AS-protection circuit working when а
+        // This keeps a partial-AS-protection circuit working when a
         // strict-diversity circuit would fail outright.
         let picked = pick_circuit_hops_latency_aware_with_diversity(
             &pool,
@@ -572,7 +572,7 @@ mod tests {
 
     // ── AS-diversity wire-up tests (Epic 482.x follow-up) ────────
 
-    /// `_with_diversity` с а constant-None extractor degrades к the
+    /// `_with_diversity` with a constant-None extractor degrades to the
     /// legacy "no diversity" behaviour — picker accepts everyone.
     #[test]
     fn epic482_diversity_extractor_none_degrades_to_legacy() {
@@ -592,20 +592,20 @@ mod tests {
             3,
         )
         .expect("None-extractor must degrade gracefully");
-        // First hop is а relay (not the target).
+        // First hop is a relay (not the target).
         assert_ne!(first_hop, target_id);
     }
 
-    /// Когда two relays share the same AS prefix, picker must
-    /// reject один of them — но fall back на the legacy non-diversity
+    /// When two relays share the same AS prefix, picker must
+    /// reject one of them — but fall back to the legacy non-diversity
     /// picker rather than fail outright.  Test asserts the fallback
-    /// fires (circuit builds successfully) и at least one hop carries
-    /// а distinct key.
+    /// fires (circuit builds successfully) and at least one hop carries
+    /// a distinct key.
     #[test]
     fn epic482_diversity_fallback_to_latency_when_strict_diversity_unsatisfiable() {
-        // Two relays на the same /16 + one more не в pool.  Strict
-        // diversity needs 2 distinct /16s для 2 relay hops — impossible
-        // с only 2 relays sharing one /16.  Expectation: fallback к
+        // Two relays on the same /16 + one more not in pool.  Strict
+        // diversity needs 2 distinct /16s for 2 relay hops — impossible
+        // with only 2 relays sharing one /16.  Expectation: fallback to
         // pick_circuit_hops_latency_aware fires, circuit still builds.
         let (_, relay1) = fresh_relay(0x01);
         let (_, relay2) = fresh_relay(0x02);
@@ -625,12 +625,12 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "fallback к latency-aware должен succeed: {:?}",
+            "fallback to latency-aware must succeed: {:?}",
             result.err()
         );
     }
 
-    /// Когда two relays have distinct AS keys, picker should select
+    /// When two relays have distinct AS keys, picker should select
     /// both (strict-diversity path succeeds).  Latency-aware fallback
     /// NOT consulted.
     #[test]
@@ -641,7 +641,7 @@ mod tests {
         let mut target_id = [0u8; 32];
         target_id[0] = 0xCC;
 
-        // Relay1 в /16 "10.0", relay2 в /16 "20.0".  Distinct AS,
+        // Relay1 in /16 "10.0", relay2 in /16 "20.0".  Distinct AS,
         // strict-diversity path succeeds.
         let as_keys: std::collections::HashMap<u8, &'static str> =
             [(0x01, "v4:10.0"), (0x02, "v4:20.0")]
@@ -665,7 +665,7 @@ mod tests {
         // Lower-RTT relay (0x01) wins first hop.
         assert_eq!(first_hop[0], 0x01);
 
-        // Sanity-check the full circuit peels через both relays + target.
+        // Sanity-check the full circuit peels through both relays + target.
         let to_relay2 = match peel_anonymous_cell(&cell, &sk_relay1).unwrap() {
             CellPeelResult::Forward {
                 next_hop,
