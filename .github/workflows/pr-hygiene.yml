@@ -58,6 +58,9 @@ jobs:
       - name: '#[allow(dead_code)] anchor policy'
         run: ./scripts/check-allow-dead-code-anchors.sh
 
+      - name: Cyrillic policy (runtime strings + CI tooling)
+        run: ./scripts/check-cyrillic-runtime-strings.sh
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --version "^0.22" --locked
 

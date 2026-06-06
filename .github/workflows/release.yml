@@ -3,10 +3,10 @@ name: release
 # Epic 484.1: deterministic release builds + signed UpdateManifest.
 #
 # Manually triggered (workflow_dispatch) — operator picks version,
-# decides whether к draft a fresh GitHub Release or attach к existing
-# tag.  Matrix builds for each supported target run в parallel; per-
+# decides whether to draft a fresh GitHub Release or attach to existing
+# tag.  Matrix builds for each supported target run in parallel; per-
 # target artifacts (binary + sha256.txt + manifest.bin) are uploaded
-# к the GitHub Release.
+# to the GitHub Release.
 #
 # Required GitHub repo secret:
 #   VEIL_RELEASE_IDENTITY_TOML — full TOML body of the issuer
@@ -15,8 +15,8 @@ name: release
 #                                   release-signing key, distinct
 #                                   from any node identity.
 #
-# Verification (any user can run this локально):
-#   1. Download `veil-cli-<triple>` + `manifest.bin` от Release.
+# Verification (any user can run this locally):
+#   1. Download `veil-cli-<triple>` + `manifest.bin` from Release.
 #   2. `sha256sum veil-cli-<triple>` matches `binary_sha256` field
 #      decoded from the published manifest.
 #   3. Independent rebuild: clone repo, checkout same tag, run
@@ -26,7 +26,7 @@ name: release
 #
 # Determinism enforced by `scripts/build-release.sh`:
 #   * `SOURCE_DATE_EPOCH` pinned to the tagged commit's author date.
-#   * `cargo build --locked` so Cargo.lock is не resolved fresh.
+#   * `cargo build --locked` so Cargo.lock is not resolved fresh.
 #   * `RUSTFLAGS=--remap-path-prefix` strips host paths from debug info.
 #   * `CARGO_INCREMENTAL=0` so no per-machine state leaks in.
 
@@ -48,7 +48,7 @@ on:
         default: false
 
 permissions:
-  contents: write  # для release-attach
+  contents: write  # for release-attach
 
 jobs:
   build:
@@ -60,10 +60,10 @@ jobs:
           - triple: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
           # Static-musl build: same x86_64 platform but linked against
-          # musl libc.  Produced specifically для older Linux distros
+          # musl libc.  Produced specifically for older Linux distros
           # whose glibc lacks symbols GitHub's ubuntu-latest images bring
-          # (the runner pins а very recent glibc — binaries built there
-          # otherwise fail на old hosts с "GLIBC_2.39 not found").
+          # (the runner pins a very recent glibc — binaries built there
+          # otherwise fail on old hosts with "GLIBC_2.39 not found").
           # musl artifact runs on any Linux kernel ≥ 3.2 regardless of
           # the host's libc version.
           - triple: x86_64-unknown-linux-musl
@@ -172,13 +172,13 @@ jobs:
           # pulls <cstdint> in transitively, so rocksdb's headers compile without it.
           CXXFLAGS: ''
         run: |
-          # Phase 6.50.b audit fix: switched от allow-empty-seeds к
-          # production-seeds.  Pre-fix а CI release artifact for Windows
-          # would be built without builtin seeds, producing а binary that
-          # won't bootstrap без manual peer config.  Now matches the
+          # Phase 6.50.b audit fix: switched from allow-empty-seeds to
+          # production-seeds.  Pre-fix a CI release artifact for Windows
+          # would be built without builtin seeds, producing a binary that
+          # won't bootstrap without manual peer config.  Now matches the
           # Unix path through scripts/build-release.sh (which also
-          # defaults к production-seeds).  For testnet artifacts use
-          # а separate workflow that explicitly opts in.
+          # defaults to production-seeds).  For testnet artifacts use
+          # a separate workflow that explicitly opts in.
           cargo build --release --target ${{ matrix.triple }} --locked \
             --bin veil-cli --bin ogate --bin oproxy-client --bin oproxy-server \
             --features veil-bootstrap/production-seeds
@@ -221,7 +221,7 @@ jobs:
         with:
           path: artifacts/
 
-      - name: Rename per-triple для release upload
+      - name: Rename per-triple for release upload
         shell: bash
         run: |
           mkdir -p out/
@@ -245,7 +245,7 @@ jobs:
           done
           ls -la out/
 
-      - name: Attach к Release
+      - name: Attach to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ inputs.version }}
