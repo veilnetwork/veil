@@ -42,7 +42,7 @@ pub(crate) async fn handle_stream_open(
     app_registry: &AppEndpointRegistry,
     stream_table: &IpcStreamTable,
     src_node_id: &[u8; 32],
-    session_tx_registry: Option<&dyn FrameBroadcaster>,
+    session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
     stream_bridge: Option<&IpcStreamBridge>,
 ) -> std::io::Result<()> {
     // Per-client stream-open quota: refuse new opens once the cumulative
@@ -172,7 +172,7 @@ async fn handle_stream_open_remote(
     p: &StreamOpenPayload,
     client_state: &mut IpcClientState,
     stream_table: &IpcStreamTable,
-    broadcaster: &dyn FrameBroadcaster,
+    broadcaster: Arc<dyn FrameBroadcaster>,
     bridge: &IpcStreamBridge,
 ) -> std::io::Result<()> {
     use std::sync::atomic::Ordering;
@@ -196,7 +196,13 @@ async fn handle_stream_open_remote(
         .insert((dst, wire_stream_id), data_tx);
 
     // Send AppOpen to the remote node.
-    if !send_app_open(broadcaster, &dst, wire_stream_id, p.app_id, p.endpoint_id) {
+    if !send_app_open(
+        broadcaster.as_ref(),
+        &dst,
+        wire_stream_id,
+        p.app_id,
+        p.endpoint_id,
+    ) {
         deregister_wire_stream(bridge, &dst, wire_stream_id);
         return reply_stream_open_err(wh, stream_open_err::NO_SESSION).await;
     }
@@ -223,7 +229,13 @@ async fn handle_stream_open_remote(
         // cannot reserve a local IPC stream-id (table at capacity). Tell the
         // remote to release its half before tearing down our registrations,
         // otherwise it leaks the accepted stream until its own idle reaper.
-        send_app_close(broadcaster, &dst, wire_stream_id, p.app_id, p.endpoint_id);
+        send_app_close(
+            broadcaster.as_ref(),
+            &dst,
+            wire_stream_id,
+            p.app_id,
+            p.endpoint_id,
+        );
         deregister_wire_stream(bridge, &dst, wire_stream_id);
         return reply_stream_open_err(wh, stream_open_err::CAPACITY_REACHED).await;
     };
@@ -239,8 +251,11 @@ async fn handle_stream_open_remote(
         ipc_stream_id,
         dst,
         wire_stream_id,
+        p.app_id,
+        p.endpoint_id,
         Arc::clone(&bridge.veil_stream_rx),
         stream_table.clone(),
+        Arc::clone(&broadcaster),
     ));
 
     let ok = StreamOpenOkPayload {
@@ -261,32 +276,57 @@ async fn handle_stream_open_remote(
 /// remote closes (the dispatcher drops the sender) or the client's delivery
 /// channel is gone, cleaning up the bridge tables and — if it was the first to
 /// close the stream — notifying the client with a `STREAM_CLOSE`.
+// Threads the per-stream identity (dst/wire/app/endpoint) plus the broadcaster
+// needed to emit a wire AppClose on local-backpressure teardown; splitting into
+// a struct would obscure the plain spawn call site for no real benefit.
+#[allow(clippy::too_many_arguments)]
 async fn run_remote_stream_bridge(
     mut data_rx: mpsc::Receiver<Vec<u8>>,
     delivery_tx: mpsc::Sender<veil_bufpool::PooledShared>,
     ipc_stream_id: u32,
     dst_node_id: [u8; 32],
     wire_stream_id: u32,
+    app_id: [u8; 32],
+    endpoint_id: u32,
     veil_stream_rx: VeilStreamRxMap,
     stream_table: IpcStreamTable,
+    broadcaster: Arc<dyn FrameBroadcaster>,
 ) {
+    let mut local_backpressure = false;
     while let Some(data) = data_rx.recv().await {
         let frame = encode_stream_data(ipc_stream_id, &data);
         if delivery_tx.try_send(frame).is_err() {
             // Client's delivery channel is full or gone — tear the stream down.
+            local_backpressure = true;
             break;
         }
     }
     // `data_rx` closed: the dispatcher dropped the sender on inbound AppClose
-    // (remote-initiated close) or on backpressure. Remove our registration and,
-    // if WE are the side that closes the table entry first (i.e. the local
-    // STREAM_CLOSE arm has not already removed it), notify the client.
+    // (remote-initiated close) or we broke out on local backpressure. Remove our
+    // registration and, if WE are the side that closes the table entry first
+    // (i.e. the local STREAM_CLOSE arm has not already removed it), notify the
+    // client.
     veil_stream_rx
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&(dst_node_id, wire_stream_id));
     if stream_table.close_remote(ipc_stream_id).is_some() {
         let _ = delivery_tx.try_send(encode_stream_close(ipc_stream_id));
+    }
+    // If we tore the stream down because the LOCAL client stopped reading
+    // (backpressure), the remote peer's wire-side stream is still OPEN — it never
+    // saw an AppClose. Send one now so the peer releases its half immediately
+    // instead of leaking the wire stream until its own idle reaper fires.
+    // (When `data_rx` simply closed, the remote already initiated the close, so
+    // no AppClose is owed — mirrors the capacity-reached path above.)
+    if local_backpressure {
+        send_app_close(
+            broadcaster.as_ref(),
+            &dst_node_id,
+            wire_stream_id,
+            app_id,
+            endpoint_id,
+        );
     }
 }
 
@@ -396,6 +436,23 @@ mod tests {
     use super::*;
     use veil_proto::{StreamClosePayload, StreamDataPayload, header::HEADER_SIZE};
 
+    /// Test `FrameBroadcaster` that captures every `(peer, frame)` sent so a
+    /// test can assert e.g. that a wire `AppClose` went out on teardown.
+    #[derive(Default)]
+    struct CapturingBroadcaster {
+        sent: std::sync::Mutex<Vec<([u8; 32], Vec<u8>)>>,
+    }
+    impl FrameBroadcaster for CapturingBroadcaster {
+        fn send_to(&self, peer_id: &[u8; 32], _priority: u8, bytes: Vec<u8>) -> bool {
+            self.sent.lock().unwrap().push((*peer_id, bytes));
+            true
+        }
+        fn send_to_all_with_priority(&self, _priority: u8, _bytes: std::sync::Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            Vec::new()
+        }
+    }
+
     /// Decode a LocalApp IPC frame into `(msg_type, body)`.
     fn parse_local_frame(frame: &[u8]) -> (u16, Vec<u8>) {
         let hdr = veil_proto::codec::decode_header(frame).expect("decode header");
@@ -425,8 +482,11 @@ mod tests {
             ipc_id,
             dst,
             wire_id,
+            [1u8; 32],
+            9,
             Arc::clone(&osr),
             table.clone(),
+            Arc::new(CapturingBroadcaster::default()) as Arc<dyn FrameBroadcaster>,
         ));
 
         // Inbound remote bytes → a STREAM_DATA frame addressed to `ipc_id`.
@@ -451,6 +511,61 @@ mod tests {
         assert!(
             table.remote_route(ipc_id).is_none(),
             "remote entry must be cleaned up after close"
+        );
+    }
+
+    /// M-2 (audit): when the LOCAL client stops reading and its delivery channel
+    /// fills, the bridge must send a wire `AppClose` to the remote peer so it
+    /// releases its half immediately — not just close the local side and leak
+    /// the remote wire-stream until its idle reaper.
+    #[tokio::test]
+    async fn remote_bridge_backpressure_sends_wire_app_close() {
+        let table = IpcStreamTable::new();
+        let dst = [4u8; 32];
+        let wire_id = 88u32;
+        let app_id = [7u8; 32];
+        let endpoint_id = 5u32;
+        let ipc_id = table
+            .open_remote(dst, wire_id, app_id, endpoint_id)
+            .unwrap();
+        let osr: VeilStreamRxMap =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(8);
+        osr.lock().unwrap().insert((dst, wire_id), data_tx.clone());
+        // Delivery channel cap 1 that we never drain (rx held so it's FULL, not
+        // closed): the 2nd inbound frame can't be delivered → backpressure.
+        let (delivery_tx, _delivery_rx) = mpsc::channel::<veil_bufpool::PooledShared>(1);
+        let bc = Arc::new(CapturingBroadcaster::default());
+        let handle = tokio::spawn(run_remote_stream_bridge(
+            data_rx,
+            delivery_tx,
+            ipc_id,
+            dst,
+            wire_id,
+            app_id,
+            endpoint_id,
+            Arc::clone(&osr),
+            table.clone(),
+            Arc::clone(&bc) as Arc<dyn FrameBroadcaster>,
+        ));
+        data_tx.send(b"a".to_vec()).await.unwrap(); // fills the cap-1 delivery
+        data_tx.send(b"b".to_vec()).await.unwrap(); // can't be delivered
+        drop(data_tx);
+        handle.await.unwrap();
+
+        let sent = bc.sent.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            1,
+            "exactly one wire frame (the AppClose) on backpressure teardown"
+        );
+        let (peer, frame) = &sent[0];
+        assert_eq!(peer, &dst, "AppClose must target the remote peer");
+        let hdr = veil_proto::codec::decode_header(frame).expect("decode wire header");
+        assert_eq!(
+            hdr.msg_type,
+            AppMsg::AppClose as u16,
+            "teardown frame must be an AppClose"
         );
     }
 }

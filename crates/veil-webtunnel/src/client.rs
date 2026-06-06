@@ -163,6 +163,12 @@ impl WebtunnelClient {
             req.push_str("\r\n");
         }
         for (k, v) in &self.extra_headers {
+            // Same control-byte guard as host/secret_path: an operator-supplied
+            // header name/value with a CR/LF would inject headers / smuggle a
+            // request.
+            if !is_request_component_safe(k) || !is_request_component_safe(v) {
+                return Err(ClientError::InvalidRequestComponent("extra_header"));
+            }
             req.push_str(k);
             req.push_str(": ");
             req.push_str(v);

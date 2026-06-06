@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use veil_util::lock;
 
@@ -56,6 +57,20 @@ pub const REPUTATION_LRU_CAP: usize = 4096;
 /// even at adversarial-counter levels.
 pub const FAILURE_PENALTY_PER: u32 = 500;
 
+/// How long a candidate stays "recently issued". Only candidates the daemon
+/// actually returned to a client within this window may be the subject of an
+/// app-reported failure — this binds [`AnycastReputation::record_failure_if_issued`]
+/// to a real resolve so a local IPC app cannot penalize an arbitrary honest
+/// node it was never offered.
+const ISSUED_TTL: Duration = Duration::from_secs(600);
+/// Cap on the issued-candidate ledger (≈ 8192 × ~48 B).
+const ISSUED_CAP: usize = 8192;
+/// Global rate-limit for app-reported failures: at most `MAX_REPORTS_PER_WINDOW`
+/// honored reports per `REPORT_WINDOW`, so a local app can't rapidly poison the
+/// ledger even for legitimately-issued candidates.
+const REPORT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_REPORTS_PER_WINDOW: u32 = 128;
+
 /// In-memory counter for one (node_id, service_tag) pair.
 ///
 /// `last_touch` is a monotonic logical tick — incremented on every
@@ -71,6 +86,12 @@ struct Counter {
 #[derive(Default)]
 struct Inner {
     by_key: HashMap<([u8; 32], [u8; 4]), Counter>,
+    /// Candidates recently RETURNED to a client (`(node_id, tag)` → expiry).
+    /// A failure report is honored only for a key present + unexpired here.
+    issued: HashMap<([u8; 32], [u8; 4]), Instant>,
+    /// Global token-bucket window for app-reported failures.
+    reports_window_start: Option<Instant>,
+    reports_in_window: u32,
 }
 
 /// Bounded, in-memory failure ledger.
@@ -139,6 +160,80 @@ impl AnycastReputation {
         }
     }
 
+    /// Note that `node_id` was just RETURNED to a client as a candidate for
+    /// `service_tag`. Only candidates the daemon actually handed out (within
+    /// [`ISSUED_TTL`]) may later be the subject of a failure report — this binds
+    /// app-reported failures to a real resolve (see
+    /// [`Self::record_failure_if_issued`]). Bounded ledger with TTL pruning.
+    pub fn note_issued(&self, node_id: [u8; 32], service_tag: [u8; 4]) {
+        if self.cap == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut inner = lock!(self.inner);
+        inner
+            .issued
+            .insert((node_id, service_tag), now + ISSUED_TTL);
+        if inner.issued.len() > ISSUED_CAP {
+            // Drop expired first; if still over cap, drop the soonest-to-expire.
+            inner.issued.retain(|_, exp| *exp > now);
+            while inner.issued.len() > ISSUED_CAP {
+                if let Some(k) = inner
+                    .issued
+                    .iter()
+                    .min_by_key(|(_, e)| **e)
+                    .map(|(k, _)| *k)
+                {
+                    inner.issued.remove(&k);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Record an APP-REPORTED failure, but ONLY if (a) `node_id` was recently
+    /// issued to a client for `service_tag` (so a local IPC app cannot penalize
+    /// a node it was never offered) AND (b) the global report rate-limit allows
+    /// it. Returns `true` if the failure was recorded, `false` if the report was
+    /// rejected (unknown/expired candidate or rate-limited).
+    ///
+    /// This is the gate for the IPC `AnycastReportFailure` opcode. Trusted
+    /// internal callers that have already attributed a failure end-to-end should
+    /// use [`Self::record_failure`] directly.
+    #[must_use]
+    pub fn record_failure_if_issued(&self, node_id: [u8; 32], service_tag: [u8; 4]) -> bool {
+        if self.cap == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        {
+            let mut inner = lock!(self.inner);
+            // (a) issued-binding: must have been handed out + not expired.
+            match inner.issued.get(&(node_id, service_tag)) {
+                Some(exp) if *exp > now => {}
+                _ => return false,
+            }
+            // (b) global rate-limit (token bucket over REPORT_WINDOW).
+            let reset = match inner.reports_window_start {
+                Some(start) => now.duration_since(start) >= REPORT_WINDOW,
+                None => true,
+            };
+            if reset {
+                inner.reports_window_start = Some(now);
+                inner.reports_in_window = 0;
+            }
+            if inner.reports_in_window >= MAX_REPORTS_PER_WINDOW {
+                return false;
+            }
+            inner.reports_in_window += 1;
+        }
+        // Lock released above; `record_failure` re-locks (std Mutex is not
+        // reentrant). The brief gap is acceptable for this local-trust path.
+        self.record_failure(node_id, service_tag);
+        true
+    }
+
     /// Score offset for `node_id` under `service_tag`. Zero if no failures
     /// have been recorded. The offset is added to the peer-claimed score
     /// during sort in [`crate::AnycastService::resolve`].
@@ -181,6 +276,27 @@ mod tests {
         let rep = AnycastReputation::new();
         rep.record_failure([0xAA; 32], *b"mbox");
         assert_eq!(rep.score_offset([0xAA; 32], *b"mbox"), FAILURE_PENALTY_PER);
+    }
+
+    #[test]
+    fn report_failure_requires_issued_candidate() {
+        // M-3 (audit): an app-reported failure is only honored for a candidate
+        // the daemon actually issued — a local IPC app cannot penalize an
+        // arbitrary honest node it was never offered.
+        let rep = AnycastReputation::new();
+        let node = [0xCC; 32];
+        let tag = *b"mbox";
+        // Never issued → report rejected, no penalty.
+        assert!(!rep.record_failure_if_issued(node, tag));
+        assert_eq!(rep.score_offset(node, tag), 0);
+        // Issued → report honored, penalty applied.
+        rep.note_issued(node, tag);
+        assert!(rep.record_failure_if_issued(node, tag));
+        assert_eq!(rep.score_offset(node, tag), FAILURE_PENALTY_PER);
+        // A different, never-issued node still can't be penalized.
+        let other = [0xDD; 32];
+        assert!(!rep.record_failure_if_issued(other, tag));
+        assert_eq!(rep.score_offset(other, tag), 0);
     }
 
     #[test]

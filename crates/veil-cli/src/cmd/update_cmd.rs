@@ -37,7 +37,12 @@ pub fn handle_update_command<I: CommandIo, O: ConfigOps>(
         UpdateCommand::Check => update_check(&mut context),
         UpdateCommand::Apply {
             allow_legacy_state_migration,
-        } => update_apply(&mut context, allow_legacy_state_migration),
+            migrate_min_release_unix,
+        } => update_apply(
+            &mut context,
+            allow_legacy_state_migration,
+            migrate_min_release_unix,
+        ),
         UpdateCommand::SignManifest(args) => update_sign_manifest(&mut context, args),
     }
 }
@@ -280,6 +285,7 @@ fn installed_version_mac_key() -> Option<[u8; 32]> {
 fn update_apply<I: CommandIo, O: ConfigOps>(
     context: &mut CommandContext<'_, I, O>,
     allow_legacy_state_migration: bool,
+    migrate_min_release_unix: Option<u64>,
 ) -> veil_cfg::Result<()> {
     let (_, config) = context.config().load_existing()?;
 
@@ -387,6 +393,7 @@ fn update_apply<I: CommandIo, O: ConfigOps>(
         env!("CARGO_PKG_VERSION"),
         &ApplyOptions {
             allow_legacy_state_migration,
+            legacy_migration_floor: migrate_min_release_unix,
         },
     )
     .map_err(map_apply_err)?;
@@ -554,6 +561,7 @@ mod tests {
         let args = UpdateArgs {
             command: UpdateCommand::Apply {
                 allow_legacy_state_migration: false,
+                migrate_min_release_unix: None,
             },
         };
         let err = handle_update_command(context, args).unwrap_err();
@@ -581,6 +589,7 @@ mod tests {
         let args = UpdateArgs {
             command: UpdateCommand::Apply {
                 allow_legacy_state_migration: false,
+                migrate_min_release_unix: None,
             },
         };
         let err = handle_update_command(context, args).unwrap_err();

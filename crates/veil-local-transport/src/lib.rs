@@ -134,7 +134,9 @@ pub async fn write_token_file(path: &Path, token: &LocalToken) -> std::io::Resul
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::remove_file(path);
+    // No `remove_file` pre-step: `write_owner_only` (atomic_write) replaces the
+    // target via a hardened staged rename, which avoids the symlink/TOCTOU
+    // window that an unlink-then-create sequence opens.
     // hex-encoded copy is a heap String — zeroize it
     // before drop so the token bytes don't linger in heap memory
     // after this function returns. The on-disk file is the published
@@ -164,7 +166,6 @@ pub async fn write_port_file(path: &Path, port: u16) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::remove_file(path);
     write_owner_only(path, port.to_string().as_bytes())
 }
 
@@ -190,29 +191,16 @@ pub async fn read_port_file(path: &Path) -> std::io::Result<u16> {
 /// On non-Unix the mode bits are ignored (NTFS ACLs would need a separate
 /// mechanism —).
 fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-
-    #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?
-    };
-
-    #[cfg(not(unix))]
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
+    // Hardened against symlink / TOCTOU on the sidecar path: delegate to
+    // `veil_util::atomic_write`, which stages to an UNPREDICTABLE
+    // `<path>.tmp.<getrandom-hex>` opened `O_EXCL` + `O_NOFOLLOW` at mode
+    // `0o600` (Unix), fsyncs, and atomically renames over `path` — replacing a
+    // symlink rather than following it. This closes the previous
+    // `remove_file` + `create(true)` window where a local attacker with write
+    // access to a misconfigured runtime dir could pre-place a symlink and
+    // capture/redirect the token/port write (the Unix-socket bind is already
+    // hardened separately in `bind_unix`).
+    veil_util::atomic_write(path, bytes)
 }
 
 // ── PeerInfo ──────────────────────────────────────────────────────────────────

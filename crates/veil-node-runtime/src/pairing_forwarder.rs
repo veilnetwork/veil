@@ -38,8 +38,9 @@ pub const PAIR_MANUAL_ENDPOINT: &str = "app://manual";
 /// Default instance label persisted on `save_paired_target_state`.
 /// Operator can rename later via a dedicated CLI command; for the
 /// IPC-driven flow the daemon doesn't know the user's display name
-/// for this device, so we ship a neutral label.  TODO Phase 4:
-/// surface instance_label as an optional ConsumeUri payload field.
+/// for this device, so we ship a neutral label.  (Phase 4 shipped the
+/// optional `instance_label` ConsumeUri payload field — see `consume_uri`
+/// below; this default applies only when the peer supplies none.)
 pub const DEFAULT_PAIRED_INSTANCE_LABEL: &str = "paired-device";
 
 pub struct PairingForwarder {

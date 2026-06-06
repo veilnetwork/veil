@@ -122,10 +122,12 @@ pub enum ApplyError {
     /// (`ApplyOptions::allow_legacy_state_migration`, surfaced as the CLI
     /// `--allow-legacy-state-migration` flag).
     #[error(
-        "installed-version state is unauthenticated (legacy, no MAC) — refusing to \
-         adopt it automatically because a stripped MAC can re-open the anti-downgrade \
-         window; re-run with --allow-legacy-state-migration to perform the one-time \
-         authenticated migration"
+        "installed-version state is unauthenticated (legacy, no MAC): refusing \
+         automatically, because a stripped MAC can re-open the anti-downgrade \
+         window. ONLY if this host has a GENUINE pre-authentication state file, \
+         re-run on a trusted host with --allow-legacy-state-migration — and \
+         prefer --migrate-min-release-unix <unix> to assert the anti-downgrade \
+         floor, because the unauthenticated file's own value is NOT trusted"
     )]
     LegacyStateMigrationRequired,
     /// cycle-7 hardening: the manifest's `min_compatible_version` is present but
@@ -254,6 +256,15 @@ pub struct ApplyOptions {
     /// because a stripped MAC would otherwise re-open the anti-downgrade
     /// window. Set `true` only for the deliberate operator-driven migration.
     pub allow_legacy_state_migration: bool,
+    /// Operator-asserted anti-downgrade floor (unix seconds) for an AUTHORIZED
+    /// legacy migration. During such a migration the on-disk `release_unix` is
+    /// UNAUTHENTICATED (no MAC) and is therefore NOT trusted; the anti-downgrade
+    /// check uses THIS value instead (default `0` = accept the signature-,
+    /// freshness-, platform-verified manifest as the new baseline). Lets the
+    /// operator vouch for a minimum so a stripped/lowered state file cannot wave
+    /// through an older but still-validly-signed manifest. Ignored on the normal
+    /// (authenticated / fresh-install) path.
+    pub legacy_migration_floor: Option<u64>,
 }
 
 /// Apply a fetched + verified update. Steps in order:
@@ -329,11 +340,27 @@ pub fn apply_update_with_options(
     if migrated_legacy_state && !opts.allow_legacy_state_migration {
         return Err(ApplyError::LegacyStateMigrationRequired);
     }
-    let installed = installed_opt.unwrap_or(0);
-    if manifest.release_unix <= installed {
+    // Anti-downgrade floor. Normal (authenticated / fresh-install) apply uses the
+    // trusted recorded value. On an AUTHORIZED legacy migration the on-disk value
+    // is UNAUTHENTICATED (no MAC) and could have been stripped + lowered by a
+    // local writer, so we DO NOT use it — we use the operator-asserted floor
+    // (`legacy_migration_floor`, default 0). `store.write(manifest.release_unix)`
+    // below records the new floor MAC-authenticated, so normal anti-downgrade
+    // resumes on the very next apply.
+    // `previous` is informational only (recorded in the outcome). The
+    // anti-downgrade GATE uses `previous` on the normal path, but on an
+    // authorized legacy migration it uses the operator-asserted floor instead —
+    // the on-disk `previous` is unauthenticated and must not gate.
+    let previous = installed_opt.unwrap_or(0);
+    let anti_downgrade_floor = if migrated_legacy_state {
+        opts.legacy_migration_floor.unwrap_or(0)
+    } else {
+        previous
+    };
+    if manifest.release_unix <= anti_downgrade_floor {
         return Err(ApplyError::AntiDowngrade {
             manifest: manifest.release_unix,
-            installed,
+            installed: anti_downgrade_floor,
         });
     }
 
@@ -451,7 +478,7 @@ pub fn apply_update_with_options(
     store.write(manifest.release_unix)?;
 
     Ok(ApplyOutcome {
-        previous_release_unix: installed,
+        previous_release_unix: previous,
         new_release_unix: manifest.release_unix,
         install_path: install_path.to_path_buf(),
         binary_marked_executable,
@@ -1173,6 +1200,7 @@ mod tests {
             env!("CARGO_PKG_VERSION"),
             &ApplyOptions {
                 allow_legacy_state_migration: true,
+                legacy_migration_floor: None,
             },
         )
         .unwrap();
@@ -1321,6 +1349,44 @@ mod tests {
         assert!(
             !install.exists(),
             "no binary may be written on the strip-mac downgrade path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn c08_migration_ignores_unauthenticated_file_floor() {
+        // M-1 (audit): during an AUTHORIZED legacy migration the unauthenticated
+        // file's own release_unix must NOT gate anti-downgrade. An attacker who
+        // stripped the MAC and lowered the floor to 0 must not wave through an
+        // older signed manifest — the operator-asserted floor is used instead.
+        let dir = unique_dir("c08-migrate-floor");
+        let install = dir.join("veil");
+        let state = dir.join("installed.json");
+        // Attacker leaves a no-mac file with a LOWERED floor (0).
+        InstalledVersionStore::new(state.clone()).write(0).unwrap();
+        let keyed = InstalledVersionStore::with_hmac_key(state.clone(), [0x5Au8; 32]);
+        let payload = b"older replayed binary";
+        let manifest = fixture_manifest(1_500_000_000, sha256_of(payload));
+        // Operator vouches the host legitimately reached >= 2_000_000_000.
+        let err = apply_update_with_options(
+            &manifest,
+            payload,
+            &install,
+            &keyed,
+            env!("CARGO_PKG_VERSION"),
+            &ApplyOptions {
+                allow_legacy_state_migration: true,
+                legacy_migration_floor: Some(2_000_000_000),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::AntiDowngrade { .. }),
+            "older manifest must be rejected against the OPERATOR floor, not the file's 0; got {err:?}"
+        );
+        assert!(
+            !install.exists(),
+            "no binary written on the rejected migration"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

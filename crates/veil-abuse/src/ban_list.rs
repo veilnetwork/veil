@@ -86,8 +86,25 @@ impl BanList {
         if let Some(old_entry) = self.entries.get(&peer_id) {
             self.eviction_order.remove(&old_entry.seq);
         } else if self.entries.len() >= veil_proto::budget::MAX_BAN_LIST_SIZE {
-            // O(log n): pop the oldest-inserted entry to make room.
-            if let Some((&seq, &victim_id)) = self.eviction_order.iter().next() {
+            // Make room WITHOUT silently lifting a still-active manual/permanent
+            // ban. An attacker who can drive 8192+ distinct (PoW-gated) peers to
+            // be banned would otherwise FIFO-evict an operator's standing manual
+            // ban. Eviction preference: (1) an already-expired entry, (2) else
+            // the oldest NON-manual (temporary) ban, (3) only if every entry is
+            // an unexpired manual ban — pathological, since manual bans are
+            // operator-set and rare vs the cap — fall back to the oldest.
+            let victim = self
+                .eviction_order
+                .iter()
+                .find(|(_, id)| self.entries.get(*id).is_some_and(|e| e.is_expired(now)))
+                .or_else(|| {
+                    self.eviction_order
+                        .iter()
+                        .find(|(_, id)| self.entries.get(*id).is_some_and(|e| !e.manual))
+                })
+                .or_else(|| self.eviction_order.iter().next())
+                .map(|(&seq, &id)| (seq, id));
+            if let Some((seq, victim_id)) = victim {
                 self.eviction_order.remove(&seq);
                 self.entries.remove(&victim_id);
             }
