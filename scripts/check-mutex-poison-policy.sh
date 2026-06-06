@@ -2,18 +2,18 @@
 # Phase 6.50.b-followup: Mutex poison-recovery policy enforcement.
 #
 # Workspace policy (existing since Epic 411.2):
-#   All `std::sync::Mutex` и `std::sync::RwLock` acquisitions в production
-#   code MUST go через the `lock!`/`rlock!`/`wlock!` macros defined в
-#   `veilcore/src/lib.rs` и `crates/veil-util/src/lib.rs`.  Those
-#   macros wrap `.lock()` / `.read()` / `.write()` с `unwrap_or_else(
-#   |p| p.into_inner())` so panic-while-holding-mutex по some
-#   prior holder does NOT cascade к а secondary panic on the next
+#   All `std::sync::Mutex` and `std::sync::RwLock` acquisitions in production
+#   code MUST go through the `lock!`/`rlock!`/`wlock!` macros defined in
+#   `veilcore/src/lib.rs` and `crates/veil-util/src/lib.rs`.  Those
+#   macros wrap `.lock()` / `.read()` / `.write()` with `unwrap_or_else(
+#   |p| p.into_inner())` so panic-while-holding-mutex by some
+#   prior holder does NOT cascade to a secondary panic on the next
 #   `.lock().expect()` / `.lock().unwrap()` (which would silently
-#   abort the holder task, или — at а FFI boundary — be UB).
+#   abort the holder task, or — at a FFI boundary — be UB).
 #
-# This script catches drift: any raw `.lock().expect(...)` или
-# `.lock().unwrap()` site that lives OUTSIDE а `mod tests`/`tests.rs`
-# context.  Test code is exempt because а poisoned mutex в а test =
+# This script catches drift: any raw `.lock().expect(...)` or
+# `.lock().unwrap()` site that lives OUTSIDE a `mod tests`/`tests.rs`
+# context.  Test code is exempt because a poisoned mutex in a test =
 # test failure (which is the desired outcome anyway).
 #
 # Anchor: see TASKS.md "Phase 6.50.b security & quality audit closeout"
@@ -59,7 +59,7 @@ TEST_FILE_PATTERNS = (
 
 
 def find_test_mod_start(path: str) -> int | None:
-    """Return the 1-based line number где `mod tests {` (or similar) starts."""
+    """Return the 1-based line number where `mod tests {` (or similar) starts."""
     pattern = re.compile(r"^\s*mod\s+(tests?|integration_tests|.+_tests)\b.*\{?\s*$")
     with open(path, encoding="utf-8", errors="replace") as f:
         for i, line in enumerate(f.readlines(), start=1):
@@ -83,7 +83,7 @@ _POISON_RE = re.compile(
 
 
 def find_violations(path: str):
-    """Return list of (line_no, code) для raw Mutex/RwLock guard
+    """Return list of (line_no, code) for raw Mutex/RwLock guard
     acquisitions that bypass the poison-recovering macros, outside the
     file's `mod tests` block.  Handles single-line AND multiline forms."""
     test_start = find_test_mod_start(path)
@@ -138,17 +138,17 @@ for d in ("veilcore/src", "crates", "veilclient/src"):
 
 if violations:
     print("VIOLATIONS — production sites must use lock!/rlock!/wlock! macro:")
-    print("(see veilcore/src/lib.rs или veil-util/src/lib.rs для definitions)")
+    print("(see veilcore/src/lib.rs or veil-util/src/lib.rs for definitions)")
     print()
     for p, ln, src in violations:
         print(f"  {p}:{ln}")
         print(f"    {src}")
         print()
     print(f"Found {len(violations)} violation(s).")
-    print("Fix: replace `mutex_expr.lock().unwrap()` с `lock!(mutex_expr)`,")
-    print("OR move the site into а `mod tests` block если it's test-only.")
+    print("Fix: replace `mutex_expr.lock().unwrap()` with `lock!(mutex_expr)`,")
+    print("OR move the site into a `mod tests` block if it's test-only.")
     sys.exit(1)
 
 print("OK: zero production-path .lock().unwrap()/.lock().expect() sites.")
-print("Policy enforced: workspace Mutex acquisitions go через lock!/rlock!/wlock!.")
+print("Policy enforced: workspace Mutex acquisitions go through lock!/rlock!/wlock!.")
 PYEOF

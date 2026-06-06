@@ -9,13 +9,13 @@
 #      lines above (typical: cross-platform stub helpers).
 #
 # Without this discipline, `dead_code` warnings pile up until
-# someone adds а blanket allow at module scope, which then
+# someone adds a blanket allow at module scope, which then
 # silently swallows future actual dead code.  The lint anchor
-# forces the author к articulate the placeholder reason или
+# forces the author to articulate the placeholder reason or
 # delete the symbol.
 #
 # Usage: invoke from repo root.  Exits non-zero on violations.
-# Suitable для CI invocation OR git pre-commit hook.
+# Suitable for CI invocation OR git pre-commit hook.
 
 set -euo pipefail
 
@@ -23,18 +23,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 violations=0
 total=0
 
-# `grep -rn` returns "path:line:content" — split на ':' once
-# для path и line.  --include='*.rs' ограничивает Rust files.
-# Only match lines где `#[allow(dead_code)]` is the actual attribute
+# `grep -rn` returns "path:line:content" — split on ':' once
+# for path and line.  --include='*.rs' restricts to Rust files.
+# Only match lines where `#[allow(dead_code)]` is the actual attribute
 # (whitespace + #[) — skips `// ... #[allow(dead_code)] ...` references
-# в comments / doc-strings.
+# in comments / doc-strings.
 while IFS= read -r match; do
     file="${match%%:*}"
     rest="${match#*:}"
     line="${rest%%:*}"
     content="${rest#*:}"
-    # Skip if the match is inside а `//` comment.  Test: trim leading
-    # whitespace; require the attribute к start the line.
+    # Skip if the match is inside a `//` comment.  Test: trim leading
+    # whitespace; require the attribute to start the line.
     trimmed="${content#"${content%%[![:space:]]*}"}"
     case "$trimmed" in
         '#[allow(dead_code)]'*) ;;        # actual attribute — keep
@@ -42,7 +42,7 @@ while IFS= read -r match; do
     esac
     total=$((total + 1))
 
-    # Look at the 3 lines above the attribute для anchor markers.
+    # Look at the 3 lines above the attribute for anchor markers.
     # awk's NR is 1-based; we want lines [line-3, line-1] inclusive.
     above=$(awk -v line="$line" 'NR >= line - 3 && NR < line { print }' "$file")
     if echo "$above" | grep -qE '^\s*///|^\s*#\[cfg\('; then
