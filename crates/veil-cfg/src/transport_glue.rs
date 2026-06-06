@@ -134,6 +134,20 @@ pub fn context_from_config(config: &Config) -> Result<TransportContext> {
             ))
         })?;
         let token = raw.trim().as_bytes().to_vec();
+        // F7: reject a too-short/empty token. The webtunnel auth token is the
+        // probe-resistance secret a client must present to be served the real
+        // tunnel; a weak token is guessable and defeats the whole point. Require
+        // at least 32 bytes of secret.
+        const MIN_WEBTUNNEL_TOKEN_BYTES: usize = 32;
+        if token.len() < MIN_WEBTUNNEL_TOKEN_BYTES {
+            return Err(TransportError::Unsupported(format!(
+                "webtunnel_auth_token_file {}: token is {} bytes after trimming; \
+                 require at least {MIN_WEBTUNNEL_TOKEN_BYTES} bytes of secret \
+                 (generate e.g. `head -c 32 /dev/urandom | base64`)",
+                token_path.display(),
+                token.len(),
+            )));
+        }
         ctx.webtunnel_auth_token = Some(Arc::new(token));
     }
     if let Some(ref dir) = config.transport.webtunnel_decoy_dir {
