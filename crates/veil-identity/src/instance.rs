@@ -29,8 +29,8 @@
 //! file carries no secrets; file mode is the user-configurable
 //! default.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use rand_core::{OsRng, RngCore};
@@ -122,7 +122,11 @@ impl LocalInstance {
             )));
         }
         let encoded = self.encode();
-        write_atomically(path, &encoded)?;
+        // Hardened atomic write: unpredictable getrandom tmp suffix + O_EXCL +
+        // O_NOFOLLOW + mode 0o600 + parent fsync (symlink/TOCTOU-resistant,
+        // owner-only). Replaces a weaker local copy that used a predictable
+        // `.tmp` name with no O_EXCL/O_NOFOLLOW/mode hardening.
+        veil_util::atomic_write(path, &encoded)?;
         Ok(())
     }
 
@@ -205,32 +209,6 @@ fn truncate_utf8_to_bytes(s: &mut String, limit: usize) {
         end -= 1;
     }
     s.truncate(end);
-}
-
-fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        veil_util::create_dir_all_with_eacces_retry(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    let write_res = veil_util::with_eacces_retry(|| {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        Ok(())
-    });
-    if let Err(e) = write_res {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
