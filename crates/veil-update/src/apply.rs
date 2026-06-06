@@ -73,7 +73,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::installed_version::{InstalledVersionError, InstalledVersionStore};
-use super::manifest::{BINARY_SHA256_LEN, UpdateManifest};
+use super::manifest::{BINARY_SHA256_LEN, VerifiedManifest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -287,7 +287,7 @@ pub struct ApplyOptions {
 /// version once the product is versioned independently of `veil-update`
 /// (C-07).
 pub fn apply_update(
-    manifest: &UpdateManifest,
+    manifest: &VerifiedManifest,
     binary_bytes: &[u8],
     install_path: &Path,
     store: &InstalledVersionStore,
@@ -308,7 +308,7 @@ pub fn apply_update(
 /// legacy no-MAC state migration is DISABLED). Use this variant only on the
 /// deliberate operator-authorized migration path.
 pub fn apply_update_with_options(
-    manifest: &UpdateManifest,
+    manifest: &VerifiedManifest,
     binary_bytes: &[u8],
     install_path: &Path,
     store: &InstalledVersionStore,
@@ -600,7 +600,7 @@ mod tests {
         dir
     }
 
-    fn fixture_manifest(release_unix: u64, sha256: [u8; 32]) -> UpdateManifest {
+    fn fixture_manifest(release_unix: u64, sha256: [u8; 32]) -> VerifiedManifest {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         // Use the RUNNING host's platform so the U5 platform gate
         // (`host_matches_platform_target`) passes regardless of which OS/arch
@@ -623,7 +623,10 @@ mod tests {
             SignatureAlgorithm::Ed25519,
         )
         .unwrap();
-        decode_manifest(&bytes).unwrap()
+        // Tests here exercise apply-side mechanics (file swap, anti-downgrade,
+        // platform/version gates), not signature verification — wrap without
+        // re-verifying via the cfg(test)-only constructor.
+        VerifiedManifest::assume_verified(decode_manifest(&bytes).unwrap())
     }
 
     /// audit U5: `host_matches_platform_target` rejects a clearly-foreign OS or
@@ -704,7 +707,7 @@ mod tests {
             SignatureAlgorithm::Ed25519,
         )
         .unwrap();
-        let manifest = decode_manifest(&bytes).unwrap();
+        let manifest = VerifiedManifest::assume_verified(decode_manifest(&bytes).unwrap());
         let err = apply_update(
             &manifest,
             payload,
