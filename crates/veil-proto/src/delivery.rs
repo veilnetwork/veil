@@ -417,131 +417,15 @@ impl DeliveryStatusPayload {
 /// manifest of the same transfer share this ID.
 pub type TransferId = [u8; 16];
 
-/// Flag set on a `DeliveryMsg::ChunkManifest` or `DeliveryMsg::Chunk` frame
-/// to distinguish chunked-transfer frames from ordinary delivery frames.
-///
-/// Encoded in the `FrameHeader.flags` field (not yet used by OVL1 — reserved
-/// bits are zero on older versions and ignored on read, so this is
-/// wire-backward-compatible).
-pub const IS_CHUNK_FLAG: u16 = 0x0001;
-
-/// Manifest for a chunked transfer.
-///
-/// Sent before any `Chunk` frames. The receiver creates a `ReassemblyState`
-/// on receipt and waits for all `chunk_count` chunks to arrive.
-///
-/// Wire layout (fixed, 92 bytes):
-/// ```text
-/// [0..16] transfer_id [u8; 16]
-/// [16..48] content_id [u8; 32] (matches the logical DeliveryEnvelope content_id)
-/// [48..52] total_size u32 BE (total payload bytes across all chunks)
-/// [52..56] chunk_count u32 BE
-/// [56..60] max_chunk_bytes u32 BE (max body bytes per chunk frame, ≤ MAX_CHUNK_PAYLOAD)
-/// [60..92] content_hash [u8; 32] (BLAKE3 over the complete reassembled payload)
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkManifestPayload {
-    /// Unique transfer identifier shared by all chunks of this manifest.
-    pub transfer_id: TransferId,
-    /// Content id of the fully-reassembled payload.
-    pub content_id: [u8; 32],
-    /// Total payload size in bytes.
-    pub total_size: u32,
-    /// Number of chunk frames that follow this manifest.
-    pub chunk_count: u32,
-    /// Max bytes of payload per chunk (≤ `MAX_CHUNK_PAYLOAD`).
-    pub max_chunk_bytes: u32,
-    /// BLAKE3 hash of the reassembled payload.
-    pub content_hash: [u8; 32],
-}
-
-impl ChunkManifestPayload {
-    /// Fixed wire size.
-    pub const WIRE_SIZE: usize = 16 + 32 + 4 + 4 + 4 + 32; // 92
-
-    /// Encode to the fixed 92-byte layout.
-    pub fn encode(&self) -> [u8; Self::WIRE_SIZE] {
-        let mut buf = [0u8; Self::WIRE_SIZE];
-        buf[0..16].copy_from_slice(&self.transfer_id);
-        buf[16..48].copy_from_slice(&self.content_id);
-        buf[48..52].copy_from_slice(&self.total_size.to_be_bytes());
-        buf[52..56].copy_from_slice(&self.chunk_count.to_be_bytes());
-        buf[56..60].copy_from_slice(&self.max_chunk_bytes.to_be_bytes());
-        buf[60..92].copy_from_slice(&self.content_hash);
-        buf
-    }
-
-    /// Parse from a 92-byte buffer.
-    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
-        if buf.len() < Self::WIRE_SIZE {
-            return Err(ProtoError::BufferTooShort {
-                need: Self::WIRE_SIZE,
-                got: buf.len(),
-            });
-        }
-        Ok(Self {
-            transfer_id: super::read_array::<16>(buf, 0)?,
-            content_id: super::read_array::<32>(buf, 16)?,
-            total_size: u32::from_be_bytes([buf[48], buf[49], buf[50], buf[51]]),
-            chunk_count: u32::from_be_bytes([buf[52], buf[53], buf[54], buf[55]]),
-            max_chunk_bytes: u32::from_be_bytes([buf[56], buf[57], buf[58], buf[59]]),
-            content_hash: super::read_array::<32>(buf, 60)?,
-        })
-    }
-}
-
-/// A single chunk of a fragmented payload.
-///
-/// Wire layout (variable):
-/// ```text
-/// [0..16] transfer_id [u8; 16]
-/// [16..20] chunk_index u32 BE (0-based)
-/// [20..N] data bytes (body of this chunk)
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkPayload {
-    /// Transfer id shared with the preceding `ChunkManifestPayload`.
-    pub transfer_id: TransferId,
-    /// Zero-based chunk index within the transfer.
-    pub chunk_index: u32,
-    /// Chunk bytes (up to `max_chunk_bytes`).
-    pub data: Vec<u8>,
-}
-
-impl ChunkPayload {
-    /// Size of the fixed-width header (before `data`).
-    pub const HEADER_SIZE: usize = 16 + 4; // 20
-
-    /// Encode to wire bytes.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.data.len());
-        buf.extend_from_slice(&self.transfer_id);
-        buf.extend_from_slice(&self.chunk_index.to_be_bytes());
-        buf.extend_from_slice(&self.data);
-        buf
-    }
-
-    /// Parse from wire bytes.
-    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
-        if buf.len() < Self::HEADER_SIZE {
-            return Err(ProtoError::BufferTooShort {
-                need: Self::HEADER_SIZE,
-                got: buf.len(),
-            });
-        }
-        Ok(Self {
-            transfer_id: super::read_array::<16>(buf, 0)?,
-            chunk_index: u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]),
-            data: buf[Self::HEADER_SIZE..].to_vec(),
-        })
-    }
-}
+// (Obsolete `IS_CHUNK_FLAG` / `ChunkManifestPayload` / `ChunkPayload` — the old
+// direct-chunk frame types — were removed with the orphaned `veil-transfer`
+// crate after H-B replaced them with `ChunkedEnvelopePayload` below.)
 
 // ── ChunkedEnvelopePayload (relay-preserving large-payload chunking) ──
 //
-// Unlike `ChunkManifestPayload`/`ChunkPayload` (which ride direct
-// `DeliveryMsg::ChunkManifest`/`Chunk` frames to a peer we have a session
-// with), a `ChunkedEnvelopePayload` is the *body of an ordinary
+// Unlike the obsolete direct-chunk frames (removed with `veil-transfer`), which
+// rode `DeliveryMsg::ChunkManifest`/`Chunk` straight to a peer we have a session
+// with, a `ChunkedEnvelopePayload` is the *body of an ordinary
 // `DeliveryEnvelope`*: the sender splits an oversized envelope payload into N
 // pieces, wraps each piece in this header, and ships each as a normal
 // `DeliveryMsg::Forward` envelope. Every chunk therefore relays hop-by-hop over
