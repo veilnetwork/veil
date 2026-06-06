@@ -32,10 +32,12 @@ services:
       # manage Grafana (it was only disabled because anonymous==Admin made login
       # pointless — which was the problem).
       GF_AUTH_DISABLE_LOGIN_FORM: "false"
-      # Admin password from the environment. The testnet value is a placeholder
-      # fallback ONLY — export GRAFANA_ADMIN_PASSWORD (e.g. via a .env file)
-      # before exposing this beyond a trusted host.
-      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-veil-testnet}"
+      # Admin password from the environment — MANDATORY (F8). There is no
+      # predictable fallback: a forgotten override when this compose is moved to
+      # a reachable host previously left a guessable `veil-testnet` admin login.
+      # `:?` makes `docker compose up` fail fast until GRAFANA_ADMIN_PASSWORD is
+      # set (export it, e.g. via a .env file).
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD (no default admin password)}"
     volumes:
       - ./grafana-provisioning:/etc/grafana/provisioning:ro
       - ./grafana-dashboards:/var/lib/grafana/dashboards:ro

@@ -16,6 +16,15 @@
 set -eu
 
 : "${HOST:?HOST env variable is required (DNS name the cert was issued for)}"
+# F8: HOST is interpolated into filesystem paths (/etc/letsencrypt/live/$HOST)
+# and into the advertised transport URI, so a value containing path separators,
+# shell metacharacters, or control chars could traverse paths or inject. Accept
+# only a conservative DNS hostname charset (letters, digits, dot, hyphen).
+case "$HOST" in
+    *[!a-zA-Z0-9.-]* | "" | -* | *..*)
+        echo "invalid HOST '$HOST' — expected a DNS hostname (a-z 0-9 . -)" >&2
+        exit 1 ;;
+esac
 : "${EMAIL:=admin@${HOST}}"
 : "${ROLE:=core}"
 : "${DIFFICULTY:=24}"
