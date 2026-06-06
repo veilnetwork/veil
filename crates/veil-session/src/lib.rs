@@ -43,6 +43,14 @@ pub mod tx_registry;
 pub mod warm_probe;
 pub mod write_error_tracker;
 
+// `SessionFsm` is a REFERENCE / validation handshake state machine: it is
+// exercised by this crate's own tests and by veilcore's cross-crate
+// integration tests (which drive a real two-node handshake against it), but it
+// is NOT the production driver. The live path is the straight-line
+// `handshake::perform_ovl1_handshake`, which enforces phase ordering via the
+// transcript hash; wiring the FSM into it as a second barrier is a documented
+// deferral (see `handshake.rs`). Kept public so downstream test/sim code can
+// reuse the model.
 pub use fsm::{SessionFsm, SessionHandshakeData, SessionPhase};
 pub use manager::{RemoteRole, SessionEntry, SessionId, SessionRegistry};
 pub use outbox::SessionOutbox;
