@@ -48,10 +48,12 @@ pub fn load_config(path: &Path) -> Result<Config> {
     let content = fs::read_to_string(path)?;
     let (toml_body, sig_status) = preprocess_signed_config(&content, path);
     let parsed = format::backend(format).load(&toml_body)?;
-    // Phase-2 enforcement check: if the operator opted in by setting
-    // `global.require_signed_config = true`, refuse k load anything but
-    // the `Verified` branch.
-    if parsed.global.require_signed_config && !matches!(sig_status, SignedConfigStatus::Verified) {
+    // Phase-2 enforcement check: enforcement is demanded by EITHER the in-body
+    // `global.require_signed_config = true` OR the external, tamper-proof
+    // `VEIL_CONFIG_REQUIRE_SIGNED` env-var (F3) — so a config tampered to clear
+    // the in-body flag cannot self-disable the signature requirement.
+    let require_signed = parsed.global.require_signed_config || external_require_signed_config();
+    if require_signed && !matches!(sig_status, SignedConfigStatus::Verified) {
         return Err(crate::ConfigError::CommandFailed(format!(
             "config '{}' requires a valid signature (global.require_signed_config = true) \
              but verification surfaced a non-Verified state ({:?}).  Sign the file via \
@@ -75,13 +77,27 @@ pub fn load_config(path: &Path) -> Result<Config> {
 /// daemon would refuse to boot on the next start. `path` is used only for the
 /// signature-pin lookup + error context (TOML format assumed for the IPC apply).
 pub fn load_config_str(content: &str, path: &Path) -> Result<Config> {
+    load_config_str_with_policy(content, path, external_require_signed_config())
+}
+
+/// `load_config_str` with the external enforcement signal injected explicitly
+/// (production goes through the env-var wrapper above; tests pass the bool
+/// directly to avoid mutating process-global env state — same pattern as
+/// `preprocess_signed_config_with_pin`).
+fn load_config_str_with_policy(
+    content: &str,
+    path: &Path,
+    external_require: bool,
+) -> Result<Config> {
     let (toml_body, sig_status) = preprocess_signed_config(content, path);
     let parsed = format::backend(FileFormat::Toml).load(&toml_body)?;
-    if parsed.global.require_signed_config && !matches!(sig_status, SignedConfigStatus::Verified) {
+    let require_signed = parsed.global.require_signed_config || external_require;
+    if require_signed && !matches!(sig_status, SignedConfigStatus::Verified) {
         return Err(crate::ConfigError::CommandFailed(format!(
-            "applied config requires a valid signature (global.require_signed_config = true) \
-             but verification surfaced a non-Verified state ({sig_status:?}); sign it via \
-             `veil-cli config sign` (set {TRUSTED_CONFIG_ISSUER_PUBKEY_ENV} to pin the issuer)",
+            "applied config requires a valid signature (global.require_signed_config = true \
+             OR {REQUIRE_SIGNED_CONFIG_ENV} set) but verification surfaced a non-Verified \
+             state ({sig_status:?}); sign it via `veil-cli config sign` (set \
+             {TRUSTED_CONFIG_ISSUER_PUBKEY_ENV} to pin the issuer)",
         )));
     }
     Ok(parsed)
@@ -116,6 +132,31 @@ pub enum SignedConfigStatus {
 /// the pin.  Env vars live in the systemd unit / Docker compose /
 /// Kubernetes manifest, separately from the operator's config bytes.
 pub const TRUSTED_CONFIG_ISSUER_PUBKEY_ENV: &str = "VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY";
+
+/// External, trusted enforcement signal for "config must be signed" (F3).
+///
+/// `global.require_signed_config` lives inside the config body, which an
+/// attacker with config-write access can strip alongside the signature envelope
+/// (set it `false`, remove the header → the loader parses the tampered body and
+/// never demands a signature). The enforcement DECISION must therefore also be
+/// sourceable from OUTSIDE the mutable config — same rationale as the issuer pin
+/// above. When this env-var is truthy (`1`/`true`/`yes`, case-insensitive),
+/// signed-config enforcement is forced ON regardless of the in-body flag, so a
+/// tampered config cannot self-disable the requirement. The in-body flag is
+/// retained as a convenience default (and preserves the gradual-rollout grace
+/// window); operators who need tamper-proof enforcement set this env-var in
+/// their systemd unit / Docker compose / K8s manifest.
+pub const REQUIRE_SIGNED_CONFIG_ENV: &str = "VEIL_CONFIG_REQUIRE_SIGNED";
+
+/// `true` iff [`REQUIRE_SIGNED_CONFIG_ENV`] is set to a truthy value.
+fn external_require_signed_config() -> bool {
+    std::env::var(REQUIRE_SIGNED_CONFIG_ENV)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
+}
 
 /// Internal: surface the signed-config envelope on load and normalise
 /// the body for the TOML parser.  Three branches:
@@ -445,6 +486,41 @@ mod tests {
         // signature-header lines are stripped so the TOML parses.
         assert!(preprocessed.contains("runtime_flavor = \"multi_thread\""));
         assert!(!preprocessed.contains("VEIL_CONFIG_SIGNATURE_V1"));
+    }
+
+    /// F3: an UNSIGNED config with no in-body `require_signed_config` must load
+    /// when no external enforcement is set (grace window), but MUST be refused
+    /// when the external `VEIL_CONFIG_REQUIRE_SIGNED` signal is on — even though
+    /// the (attacker-mutable) in-body flag is absent/false. This is the bypass
+    /// the in-config-only flag could not close.
+    #[test]
+    fn f3_external_require_signed_enforces_on_unsigned_config() {
+        let raw = "[global]\nruntime_flavor = \"multi_thread\"\n"; // unsigned, no flag
+        let path = Path::new("/tmp/f3-config.toml");
+        // No external enforcement → loads (phase-1 grace).
+        assert!(
+            load_config_str_with_policy(raw, path, false).is_ok(),
+            "unsigned config must load when neither in-body flag nor env demands signing"
+        );
+        // External enforcement ON → refused despite the absent in-body flag.
+        let err = load_config_str_with_policy(raw, path, true)
+            .expect_err("external require-signed must refuse an unsigned config");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("requires a valid signature"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// F3 regression: the in-body flag still enforces on its own (external off).
+    #[test]
+    fn f3_in_body_require_signed_still_enforced() {
+        let raw = "[global]\nruntime_flavor = \"multi_thread\"\nrequire_signed_config = true\n";
+        let path = Path::new("/tmp/f3-config2.toml");
+        assert!(
+            load_config_str_with_policy(raw, path, false).is_err(),
+            "in-body require_signed_config=true must still refuse an unsigned config"
+        );
     }
 
     /// Unpinned mode (`None`) accepts any internally-consistent envelope,
