@@ -1,186 +1,188 @@
-# Hot-standby: переключение transport'а
+# Горячий резерв: смена транспорта
 
-Смежно с [adaptive-failover.md](adaptive-failover.md), который оценивает
-и переключает **маршруты** (записи `next_hop → dst` в `RouteCache`),
-этот документ описывает **transport'ы** на одной уже установленной
-сессии: если peer, с которым мы говорим, всё ещё достижим, но socket,
-который мы используем, начинает сбоить — TCP RST от middlebox'а,
-повреждение TLS record'ов, congestion collapse на QUIC — мы хотим
-*сохранить сессию* (тот же `session_id`, те же AEAD-ciphers, те же
-согласованные capabilities) и поменять только байтовый pipe под ней.
+Родственный документ [adaptive-failover.md](adaptive-failover.md) оценивает и
+переключает **маршруты** — записи `next_hop → dst` в `RouteCache`. Здесь же
+речь о **транспортах** (способах передачи: TCP, TLS, QUIC и подобных) на одной
+сессии, которая *уже* установлена. Случай, который нас интересует: сосед всё
+ещё достижим, но сокет, через который мы работаем, начинает сбоить. Middlebox
+(промежуточный сетевой узел) шлёт TCP RST, портятся TLS-записи, на QUIC
+наступает congestion collapse (обвал перегрузки). Мы хотим *сохранить сессию*
+— тот же `session_id`, те же AEAD-шифры, те же согласованные возможности — и
+сменить только канал передачи под ней.
 
-Альтернатива — свежий OVL1 handshake на другом socket'е — дорогая
-(PoW-bound identity exchange, kex, derivation cipher'ов), и она
-сжигает pending request ID'ы сессии, peer-aliases и любое неоконченное
-rekey-состояние. Hot-standby всего этого избегает.
+Очевидная альтернатива — свежий OVL1-handshake на другом сокете. Это дорого:
+заново выполняется PoW-обмен идентичностями, обмен ключами (kex) и вывод
+шифров. Хуже того, при этом сгорают незавершённые request ID сессии, её
+peer-алиасы и любое неоконченное состояние перегенерации ключей (rekey).
+Горячий резерв всего этого избегает.
 
 ---
 
 ## Статус
 
-Фича выкатывается по стадиям. Таблица ниже отслеживает, что уже в
-дереве, а что отложено за version gate.
+Возможность выкатывается по стадиям. Таблица ниже показывает, что уже в
+дереве, а что отложено за version gate (порогом версии).
 
-| Stage | Scope | Status |
+| Стадия | Содержание | Статус |
 |-------|-------|--------|
-| **(a) Swap-point в runner'е** | `SessionRunner.swap_rx: Option<Receiver<BoxIoStream>>` + `NextInput::SwapStream(..)` обрабатывается между frame'ами в `run()`, так что `self.stream` атомарно подменяется без касания AEAD-state'а. | в дереве (2026-04-24) |
-| **(b) Warm-probe task** | Per-session one-shot `WarmProbe`, который дозванивается до alt-URI и выполняет handoff с challenge-response (T1): `HandoffInit`/`HandoffAck` поверх primary, затем bare `HandoffAttach`-announce + `HandoffChallenge(24)` + `HandoffResponse(25)` на warm socket'е. Запускается оператором через admin-команду `node swap-transport` либо автоматически из (c). | в дереве (2026-04-24) |
-| **(c) Trigger-логика** | Последовательные write-ошибки + `rx_stall` (idle_timeout × 2/3 без RX) + `primary_closed` (peer FIN/RST). Все три сходятся в `HotStandbyController::try_auto_trigger` с per-peer flap damping. | в дереве (2026-04-24); см. ограничения ниже |
-| **(c.3) Авто-обнаружение peer capabilities** | TLV `ADVERTISED_TRANSPORTS_TLV_TAG=0x0012` в AttachPayload передаёт активные `[[listen]]` URI каждой стороны. Controller автоматически заполняет `alt_uri_for` любым advertised URI, отличающимся от primary. | в дереве (2026-04-24) |
-| **(d) Cross-peer handoff protocol** | `SessionMsg::HandoffInit` + `HandoffAck` поверх AEAD-сессии, затем на warm socket'е `HandoffAttach` + `HandoffChallenge(24)` + `HandoffResponse(25)`; `peek_and_dispatch` на каждом входящем socket'е делает `peek` (не consume) pending-записи, отправляет свежий `HandoffChallenge` и привязывает socket к `swap_rx` уже существующего runner'а только после того, как HMAC из `HandoffResponse` проходит проверку. | в дереве (2026-04-24) |
+| **(a) Точка подмены в runner'е** | `SessionRunner.swap_rx: Option<Receiver<BoxIoStream>>` + `NextInput::SwapStream(..)` обрабатывается между кадрами в `run()`, так что `self.stream` подменяется атомарно, без касания AEAD-состояния. | в дереве (2026-04-24) |
+| **(b) Задача прогрева (warm-probe)** | Одноразовый `WarmProbe` на сессию. Он дозванивается до alt-URI и выполняет передачу с проверкой «запрос-ответ» (challenge-response, T1): `HandoffInit`/`HandoffAck` поверх основного канала, затем голый анонс `HandoffAttach` + `HandoffChallenge(24)` + `HandoffResponse(25)` на прогретом сокете. Запускается оператором через админ-команду `node swap-transport` либо автоматически из (c). | в дереве (2026-04-24) |
+| **(c) Логика срабатывания** | Подряд идущие ошибки записи + `rx_stall` (idle_timeout × 2/3 без приёма) + `primary_closed` (FIN/RST от соседа). Все три сходятся в `HotStandbyController::try_auto_trigger` с подавлением дребезга (flap damping) на каждого соседа. | в дереве (2026-04-24); см. ограничения ниже |
+| **(c.3) Авто-обнаружение возможностей соседа** | Поле TLV `ADVERTISED_TRANSPORTS_TLV_TAG=0x0012` в AttachPayload передаёт активные URI из `[[listen]]` каждой стороны. Контроллер автоматически заполняет `alt_uri_for` любым объявленным URI, который отличается от основного. | в дереве (2026-04-24) |
+| **(d) Протокол передачи между соседями** | `SessionMsg::HandoffInit` + `HandoffAck` поверх AEAD-сессии, затем на прогретом сокете `HandoffAttach` + `HandoffChallenge(24)` + `HandoffResponse(25)`. На каждом входящем сокете `peek_and_dispatch` подсматривает (`peek`, не извлекая) ожидающую запись, шлёт свежий `HandoffChallenge` и привязывает сокет к `swap_rx` уже существующего runner'а только после того, как HMAC из `HandoffResponse` проходит проверку. | в дереве (2026-04-24) |
 
-### Стадия (c.2.2) — keepalive-probe timeout
+### Стадия (c.2.2) — тайм-аут пробы keepalive
 
-При half-block'е Windows Firewall'ом (исходящий A → B дропается, B → A
-ещё течёт) ни `rx_stall`, ни `write_error_threshold` не срабатывают
-надёжно. `rx_stall` не срабатывает, потому что собственные keepalive и
-frame'ы со стороны B продолжают долетать до A, обновляя `last_rx`.
-`write_error_threshold` не срабатывает, потому что Windows TCP молча
-буферизует записи A в SNDBUF в течение всех ~30 с retransmission-квоты
-прежде чем вернуть ошибку — а к тому моменту TCP на стороне B уже
-сдаётся и закрывает socket, отправляя runner A в ветку `primary_closed`.
+Рассмотрим частичную блокировку (half-block) фаерволом Windows: исходящий
+трафик A → B отбрасывается, но B → A ещё течёт. Здесь ни `rx_stall`, ни
+`write_error_threshold` не срабатывают надёжно. `rx_stall` молчит, потому что
+собственные keepalive (пакеты поддержания связи) и кадры со стороны B
+продолжают долетать до A и обновляют `last_rx`. `write_error_threshold` молчит,
+потому что TCP в Windows тихо буферизует записи A в SNDBUF все ~30 с квоты на
+повторную передачу, прежде чем вернуть ошибку. К этому моменту TCP на стороне B
+уже сдаётся и закрывает сокет, отправляя runner A в ветку `primary_closed`.
 
-Fix: трекать ack'и на собственные keepalive A. В OVL1 уже есть
-`ControlMsg::KeepaliveAck`; стадия (c.2.2) подключает его к
-hot-standby-trigger'у. Flow:
+Решение: отслеживать подтверждения (ack) на собственные keepalive стороны A. В
+OVL1 уже есть `ControlMsg::KeepaliveAck`; стадия (c.2.2) подключает его к
+срабатыванию горячего резерва. Ход:
 
-1. Runner отправляет `ControlMsg::Keepalive`; если
-   `pending_keepalive_ack_since` равно `None`, записывает текущее
-   время. (Сохранение самого старого unacked-timestamp'а даёт самое
-   широкое окно для легитимной latency.)
-2. Dispatcher peer'а отвечает `ControlMsg::KeepaliveAck` — это уже
-   было в протоколе, просто ни на что не влияло.
-3. Runner перехватывает `KeepaliveAck` до общего вызова dispatcher'а,
-   очищает `pending_keepalive_ack_since` и сбрасывает trigger-fired-флаг.
-4. Тик таймера: если `pending_keepalive_ack_since.is_some() && now - t >=
+1. Runner отправляет `ControlMsg::Keepalive`. Если
+   `pending_keepalive_ack_since` равно `None`, он записывает текущее время.
+   (Хранение *самого старого* неподтверждённого момента даёт самое широкое
+   окно для законной задержки.)
+2. Диспетчер соседа отвечает `ControlMsg::KeepaliveAck`. Это сообщение уже было
+   в протоколе, просто раньше ни на что не влияло.
+3. Runner перехватывает `KeepaliveAck` до общего вызова диспетчера, очищает
+   `pending_keepalive_ack_since` и сбрасывает флаг сработавшего триггера.
+4. На тике таймера: если `pending_keepalive_ack_since.is_some() && now - t >=
    keepalive_probe_timeout`, вызывается
    `fire_hot_standby_trigger("keepalive_probe_timeout")`. По умолчанию
-   `keepalive_probe_timeout = 1 × keepalive_interval`. (Изначально
-   зашипано как 2 ×; валидация на двух хостах в Windows LAN показала,
-   что TCP станции выдаёт RST за ~25-30 с после firewall-блока, что
-   опережало probe 2 × 10 с = 20 с на несколько секунд. 1 × interval
-   стреляет probe'ом с комфортным запасом до OS-level RST, так что
-   `HandoffInit` всё ещё успевает уехать по живой primary.)
+   `keepalive_probe_timeout = 1 × keepalive_interval`. (Изначально было зашито
+   как 2 ×. Проверка на двух хостах в Windows LAN показала, что TCP станции
+   выдаёт RST за ~25-30 с после блокировки фаерволом, опережая пробу 2 × 10 с =
+   20 с на несколько секунд. При 1 × interval проба срабатывает с комфортным
+   запасом до RST на уровне ОС, так что `HandoffInit` ещё успевает уехать по
+   живому основному каналу.)
 
-#### Тюнинг для синтетических firewall-block тестов
+#### Настройка для синтетических тестов с блокировкой фаерволом
 
-На LAN с правилом Windows Firewall, инжектирующим outbound-block, TCP
-peer'а сдаётся за **~9 секунд** (не 25-30 с, которые мы видим, когда
-правило неэффективно из-за DNS-mismatch'а). Чтобы увидеть, как
-срабатывает c.2.2 в этом синтетическом сценарии, уменьши
-`keepalive_interval_secs`, чтобы probe-deadline попал внутрь окна 9 с:
+В локальной сети, где фаервол Windows подставляет правило блокировки
+исходящего трафика, TCP соседа сдаётся за **~9 секунд** — не за 25-30 с,
+которые мы видим, когда правило не работает из-за несовпадения DNS. Чтобы
+увидеть, как c.2.2 срабатывает в этом синтетическом сценарии, уменьши
+`keepalive_interval_secs` так, чтобы крайний срок пробы попал внутрь этого окна
+в 9 с:
 
     [session]
     keepalive_interval_secs = 3
     idle_timeout_secs       = 20
 
-При `keepalive_interval = 3 s` первый keepalive jitter'ит в
-[1.5, 4.5]; `probe_timeout` тоже 3 с, так что probe срабатывает
-примерно в `T = 4.5 + 3 = 7.5 s`, с комфортным запасом до OS-level
-RST на `~9 s`.
+При `keepalive_interval = 3 s` первый keepalive дрожит (jitter) в пределах
+[1.5, 4.5]. `probe_timeout` тоже 3 с, так что проба срабатывает примерно в
+`T = 4.5 + 3 = 7.5 s` — с комфортным запасом до RST на уровне ОС в `~9 s`.
 
-В production'е (`keepalive_interval_secs = 30`, default) primary
-**не** умирает так быстро — TCP retransmission отрабатывает полную
-квоту, давая ~60 с полу-сломанного состояния, в которое probe успевает
-выстрелить. Никакого тюнинга не требуется.
+В production (`keepalive_interval_secs = 30` по умолчанию) основной канал **не**
+умирает так быстро. Повторная передача TCP отрабатывает полную квоту, что
+оставляет ~60 с полусломанного состояния, в которое проба успевает выстрелить.
+Никакой настройки не требуется.
 
-`sleep_until` в runner'е теперь учитывает probe-deadline, так что
-проверка действительно просыпается. Также пофикшен `keepalive_enabled`
-— он теперь считает sub-second интервалы включёнными (раньше
-`as_secs() > 0` округлял 50 ms вниз до 0, оставляя probe dormant'ом).
+С этой стадией приехали две вспомогательные правки. `sleep_until` в runner'е
+теперь учитывает крайний срок пробы, так что проверка действительно
+просыпается вовремя. А `keepalive_enabled` теперь считает интервалы меньше
+секунды включёнными — раньше `as_secs() > 0` округлял 50 ms вниз до 0 и
+оставлял пробу спящей.
 
-Покрыто unit-тестом `keepalive_probe_timeout_fires_trigger_when_no_ack`:
-fixture принимает записи, но не доставляет ни байта (нет ack), runner
-стреляет trigger'ом в пределах 2 × keepalive_interval.
+Это покрыто unit-тестом `keepalive_probe_timeout_fires_trigger_when_no_ack`:
+стенд принимает записи, но не доставляет ни байта (подтверждение не приходит
+никогда), и runner срабатывает в пределах 2 × keepalive_interval.
 
-### Прежний gap на Windows firewall half-block — закрыт
+### Прежний пробел при частичной блокировке фаерволом Windows — закрыт
 
-До c.2.2 runner молча выходил по `NextInput::Closed` без
-hot-standby-сигнала; сессия переустанавливалась через полный OVL1
-handshake вместо warm-probe handoff'а. `NextInput::Closed` теперь
-также логирует `session.primary_closed` и стреляет trigger'ом
-последний раз — defence-in-depth, хотя к тому моменту `HandoffInit`
-уже не может уехать по мёртвой primary. Keepalive-probe timeout из
-c.2.2 стреляет ГОРАЗДО раньше, чем `primary_closed`, так что этот
-путь срабатывает только тогда, когда и rx_stall, И keepalive-probe
-каким-то образом упустили деградацию (полная network partition на
-receive-стороне, где никакие keepalive не доходят).
+До c.2.2 runner молча выходил по `NextInput::Closed` без сигнала горячему
+резерву. Сессия тогда переустанавливалась через полный OVL1-handshake вместо
+передачи через прогретую пробу. Теперь `NextInput::Closed` тоже логирует
+`session.primary_closed` и срабатывает в последний раз — как защита в глубину
+(defence-in-depth), хотя к этому моменту `HandoffInit` уже не может уехать по
+мёртвому основному каналу. Тайм-аут пробы keepalive из c.2.2 срабатывает
+ГОРАЗДО раньше, чем `primary_closed`, так что этот путь задействуется только
+тогда, когда и rx_stall, И проба keepalive каким-то образом упустили
+деградацию. А это значит полное разделение сети (network partition) на стороне
+приёма, где никакие keepalive не доходят вовсе.
 
-Swap-point стадии (a) — это контракт, на который опираются остальные
+Точка подмены стадии (a) — это контракт, на который опираются остальные
 стадии. Его корректность доказывают два unit-теста в
 [crates/veil-session/src/runner.rs](../../crates/veil-session/src/runner.rs):
 
-- `swap_redirects_runner_to_new_stream_without_reset` — runner,
-  обслуживающий Ping→Pong на duplex A, получает duplex B через
-  `swap_tx.send`; следующий Ping на B получает Pong, runner не
-  заходит в handshake и не дропает сессию.
-- `swap_preserves_aead_counter_across_transports` — тот же flow с
-  настоящими экземплярами `SessionCipher`. Если бы runner
-  реинициализировал `rx_cipher` при swap'е, второй Ping на B проплыл
-  бы мимо `rx_cipher.open()` с counter=2, в то время как runner
-  ожидает counter=1, молча дропая frame. 2-секундный timeout теста
-  обеспечивает negative case.
+- `swap_redirects_runner_to_new_stream_without_reset` — runner, обслуживающий
+  Ping→Pong на дуплексе A, получает дуплекс B через `swap_tx.send`. Следующий
+  Ping на B получает Pong, и runner при этом не заходит в handshake и не
+  сбрасывает сессию.
+- `swap_preserves_aead_counter_across_transports` — тот же ход, но с
+  настоящими экземплярами `SessionCipher`. Если бы runner переинициализировал
+  `rx_cipher` при подмене, второй Ping на B проплыл бы мимо `rx_cipher.open()`
+  со счётчиком counter=2, тогда как runner ожидает counter=1, молча отбросив
+  кадр. 2-секундный тайм-аут теста обеспечивает проверку этого отрицательного
+  случая.
 
 ---
 
-## Безопасность swap'а — почему "между frame'ами" достаточно
+## Безопасность подмены — почему «между кадрами» достаточно
 
-Каждый байт wire-трафика принадлежит ровно одному `FrameHeader + body`.
-Runner потребляет frame'ы в two-phase loop'е:
+Каждый байт трафика на проводе принадлежит ровно одному `FrameHeader + body`.
+Runner потребляет кадры в двухфазном цикле:
 
-1. `await_next_input` блокируется, пока **одно** из {первый байт
-   следующего frame'а, outbox-frame, rpc-request, swap-stream, timer}
-   не будет готово.
-2. Если выигрывает `Byte(b)`, runner дочитывает остаток header'а через
-   `read_exact`, расшифровывает + dispatch'ит body, возвращается в loop.
+1. `await_next_input` блокируется, пока не будет готово **одно** из:
+   первый байт следующего кадра, исходящий кадр, RPC-запрос, поток подмены
+   или таймер.
+2. Если выигрывает `Byte(b)`, runner дочитывает остаток заголовка через
+   `read_exact`, расшифровывает и направляет тело на обработку, затем
+   возвращается в цикл.
 
-Результат `SwapStream` может выиграть только на шаге 1. Поэтому swap
-происходит, когда wire в чистом состоянии: ни одного байта
-in-progress frame'а не было потреблено на старом stream'е. На стороне
-записи priority-queue flush в начале каждой итерации уже завершён
-прежде, чем входим в `await_next_input`, так что никакой частичной
-записи тоже не висит.
+Результат `SwapStream` может выиграть только на шаге 1. Поэтому подмена
+происходит, когда провод в чистом состоянии: на старом потоке не потреблено ни
+одного байта незавершённого кадра. Со стороны записи тоже чисто — сброс
+очереди по приоритету в начале каждой итерации уже завершён к моменту входа в
+`await_next_input`, так что никакой частичной записи в полёте нет.
 
-**Peer**, разумеется, не видит наш scheduler; он может всё ещё быть
-посередине frame'а на старом transport'е, когда наша сторона его
-сбрасывает. Поэтому follow-up (d) вводит синхронный handoff protocol с
-challenge-response (T1): на warm socket'е отправляется bare
-`HandoffAttach { session_id }`, после чего receiver выдаёт свежий
-per-socket `HandoffChallenge` (32 байта `OsRng`), а initiator должен
-доказать владение session-ключом, ответив `HandoffResponse` с
-`hmac = BLAKE3::keyed(tx_key)(session_id || challenge)`. Frame'ы на НОВОМ
-transport'е начинают течь только после того, как receiver пересчитает
-HMAC через `rx_key` и подтвердит совпадение constant-time-сравнением
-(replay'нутый attach получает другой challenge и не может быть отвечен
-без session-ключа). Байты, оставшиеся на старом wire после этой точки,
-отбрасываются TCP/TLS close'ом с обеих сторон.
+**Сосед**, разумеется, не видит наш планировщик. Он может всё ещё быть
+посередине кадра на старом транспорте, когда наша сторона его сбрасывает.
+Поэтому следующий шаг (d) вводит синхронный протокол передачи с проверкой
+«запрос-ответ» (challenge-response, T1). На прогретом сокете отправляется голый
+`HandoffAttach { session_id }`. Получатель выдаёт свежий `HandoffChallenge` на
+этот сокет (32 байта из `OsRng`). Затем инициатор должен доказать владение
+ключом сессии, ответив `HandoffResponse` с
+`hmac = BLAKE3::keyed(tx_key)(session_id || challenge)`. Кадры на НОВОМ
+транспорте начинают течь только после того, как получатель пересчитает HMAC
+через `rx_key` и подтвердит совпадение сравнением за постоянное время
+(constant-time). Повторно проигранный attach получает другой challenge, на
+который нельзя ответить без ключа сессии. Байты, оставшиеся на старом проводе
+после этой точки, отбрасываются закрытием TCP/TLS с обеих сторон.
 
 ---
 
-## Чем это отличается от session resumption
+## Чем это отличается от возобновления сессии
 
-Session resumption (`SESSION_TICKET`) — это *холодный* путь: текущая
-сессия уже снесена, client передоzванивается, пропуская PoW/kex
-proигрыванием ticket'а. Ciphers и request-id-state всё равно строятся
-с нуля; RTT = dial + handshake + 1 RTT.
+Возобновление сессии (session resumption, `SESSION_TICKET`) — это *холодный*
+путь. Текущая сессия уже снесена, поэтому клиент перезванивает и проигрывает
+билет (ticket), чтобы пропустить PoW и kex. Шифры и состояние request-id всё
+равно строятся с нуля, а цена пути — dial + handshake + 1 RTT.
 
-Hot-standby — это *горячий* путь: сессия никогда не сносится. RTT =
-один round-trip `HandoffInit` / `HandoffAck` поверх уже активной
-зашифрованной сессии плюс сколько уйдёт у warm probe на то, чтобы
-перестать быть idle и начать нести реальные frame'ы. В пределе
-(probe держится свежим через L2 / QUIC 0-RTT на тот же advertised
-address) RTT swap'а равен нулю поверх connect-latency нового
-transport'а.
+Горячий резерв — это *горячий* путь. Сессия никогда не сносится. Цена — один
+round-trip `HandoffInit` / `HandoffAck` поверх ещё активной зашифрованной
+сессии плюс то время, которое уйдёт у прогретой пробы на то, чтобы перестать
+простаивать и начать нести реальные кадры. В пределе — когда проба держится
+свежей через L2 или QUIC 0-RTT на тот же объявленный адрес — RTT подмены равен
+нулю поверх задержки подключения нового транспорта.
 
-Оба механизма сосуществуют: hot-standby всегда предпочтительнее;
-resumption — fallback на случай, когда сессия реально умерла (оба
-transport'а упали одновременно, или peer перезагрузился).
+Оба механизма сосуществуют. Горячий резерв всегда предпочтительнее;
+возобновление — это запасной путь на случай, когда сессия реально умерла: оба
+транспорта упали одновременно или сосед перезагрузился.
 
 ---
 
 ## Конфигурация (планируется для стадий b/c)
 
-Предлагаемые ручки в `[session.hot_standby]`:
+Предлагаемые настройки живут в `[session.hot_standby]`:
 
     [session.hot_standby]
     enabled              = false        # opt-in; per-peer privacy impact
@@ -194,5 +196,5 @@ transport'а упали одновременно, или peer перезагру
     swap_on_rtt_multiplier = 4.0        # если keepalive RTT > 4× median → swap
     max_swaps_per_minute = 4            # flap-damping ceiling
 
-Их пока не существует; стадия (b) вводит `enabled` + `alt_scheme_order`;
-стадия (c) вводит trigger-пороги.
+Их пока не существует. Стадия (b) вводит `enabled` и `alt_scheme_order`;
+стадия (c) вводит пороги срабатывания.

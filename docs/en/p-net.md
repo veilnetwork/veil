@@ -1,9 +1,14 @@
 # P-Net: Private Veil Networks
 
-P-Net (Private Network mode) restricts veil membership to nodes
-holding a membership certificate signed by a network owner. Public-mode
-(default) accepts any peer; P-Net rejects unauthenticated peers at the
-OVL1 handshake gate.
+By default, a Veil network is public: any node may join. P-Net (Private
+Network mode) locks that down. Only nodes holding a **membership
+certificate** — a signed credential proving they belong — are let in.
+The certificate must be signed by the **network owner**, the person who
+controls the network.
+
+The check happens at the OVL1 handshake, the moment two nodes first
+establish a secure session. A node without a valid certificate is turned
+away before that session opens.
 
 ## Trust model
 
@@ -17,19 +22,27 @@ Membership Cert (per node, includes node_id + admin flag + valid_until)
 P-Net Member (admitted to private network)
 ```
 
-Two member roles:
+A certificate grants one of two roles:
 
-* **Admin** (`admin: true` in cert) — can issue DHT-replicated bans that
-  propagate to every member. Typically run on bootstrap nodes.
-* **Member** (`admin: false`) — connects only. Local-only bans stay on
-  the host (no DHT replication).
+* **Admin** (`admin: true` in the cert) — can issue network-wide bans.
+  These bans replicate over the DHT (the network's shared directory) and
+  reach every member. Admins usually run on bootstrap nodes, the
+  long-lived nodes others use to join.
+* **Member** (`admin: false`) — can connect, nothing more. A member can
+  still ban a peer, but the ban stays on that one host and is never
+  shared.
 
-## Why two ban scopes
+## Why bans have two scopes
 
-Public mode keeps bans node-local (anti-DoS — a malicious peer can't
-poison the cluster's ban table). Private mode trusts admins to author
-network-wide bans because admin certs are issued by a trusted owner;
-this lets you manage a private cluster from any admin node.
+In public mode, every ban stays on the node that issued it. This is
+deliberate: it stops a malicious peer from poisoning the whole cluster's
+ban table — a denial-of-service trick that would let one bad actor lock
+everyone out.
+
+Private mode can relax this. An admin's network-wide bans are trusted
+because admin certificates come from the owner, and the owner is
+trusted by definition. So you can ban a node once, from any admin node,
+and have it take effect everywhere.
 
 ## Operator setup
 
@@ -41,8 +54,9 @@ veil-cli network gen-owner \
   --priv-out /etc/veil/owner.priv
 ```
 
-Keep `owner.priv` **OFFLINE** (USB hardware token, encrypted backup).
-Anyone holding it can sign new admin certs.
+Keep `owner.priv` **offline** — on a USB hardware token or an encrypted
+backup, never on a connected machine. Anyone who holds this key can sign
+new admin certificates and take over the network.
 
 ### 2. Generate the network ID (one-time)
 
@@ -51,7 +65,8 @@ veil-cli network gen-network-id
 # network_id = 948b97b51b...ea87
 ```
 
-Save the 64-char hex string — every member needs it in their config.
+Save this 64-character hex string. Every member needs it in their
+config, and it is what binds a certificate to your network specifically.
 
 ### 3. Sign a cert per member
 
@@ -78,12 +93,13 @@ veil-cli network sign-member \
 
 #### Expiry options
 
-By default the cert expires after `--valid-days` days (365 if omitted).
-Members must rotate before expiry or get a fresh cert from the owner.
+By default a cert expires after `--valid-days` days (365 if you omit the
+flag). Before that day arrives, the member must rotate — get a fresh
+cert from the owner — or it will be locked out.
 
-For fleet nodes where rotation is a logistical hassle (embedded
-devices, air-gapped backups), pass `--no-expiry` to mint a
-never-expiring cert:
+Rotation is a chore for fleet nodes you can't easily reach: embedded
+devices, air-gapped backups, and the like. For those, pass `--no-expiry`
+to mint a cert that never expires.
 
 ```bash
 # Never-expiring cert — only revocable via DHT ban or owner-key rotation:
@@ -96,15 +112,20 @@ veil-cli network sign-member \
   --out /etc/veil/network.cert
 ```
 
-On the wire this is encoded as `valid_until_unix = 0` (sentinel).
-The `verify-cert` and `inspect-cert` subcommands show `NEVER` instead
-of a unix timestamp. Trade-off: revoking a single device without
-rotating the owner key requires DHT-ban propagation; if the device is
-offline / air-gapped, the ban won't reach it until it re-joins.
+On the wire, a never-expiring cert is encoded as `valid_until_unix = 0`
+(a sentinel value — zero means "no expiry" rather than an actual date).
+The `verify-cert` and `inspect-cert` subcommands print `NEVER` in place
+of a timestamp.
 
-Where to get a node's `node_id`: it's `BLAKE3(public_key)` of the node's
-identity keypair (the `public_key` field in `[identity]` block of
-`node.toml`). Use `blake3sum` or the helper in the controller's
+There is a catch. To revoke one such device, short of rotating the owner
+key, you have to ban it over the DHT. If that device is offline or
+air-gapped, the ban can't reach it until it re-joins the network — so it
+stays trusted in the meantime.
+
+You'll need each member's `node_id` for the steps above. A `node_id` is
+`BLAKE3(public_key)` — the BLAKE3 hash of the node's identity public key
+(the `public_key` field in the `[identity]` block of `node.toml`).
+Compute it with `blake3sum`, or with the helper in the controller's
 `build-testnet-configs.py` script.
 
 ### 4. Configure the node
@@ -130,9 +151,11 @@ admin_node_ids = [
 
 ### 5. Restart
 
-The handshake gate is built at runtime startup. After restart the node
-will require certs from incoming peers and will present its own cert in
-outbound HELLO.
+The handshake gate — the check that enforces all of this — is built once
+when the node starts. So the new settings only take effect after a
+restart. From then on, the node demands a cert from every incoming peer
+and presents its own cert in the outbound HELLO, the first message of
+the handshake.
 
 ## Issuing a ban from an admin node
 
@@ -140,28 +163,33 @@ outbound HELLO.
 veil-cli network ban <NODE_ID_HEX> --reason "spam"
 ```
 
-This goes through the local admin IPC socket → `AdminCommand::PNetBan`
-→ signs a `BanEntry` with the node's identity key → fans out to K
-closest peers via DHT replication → applies locally too. Other members
-pick up the ban on their next `p_net_ban_sync` tick (~60 s).
+Here is what that command sets in motion. It travels over the local
+admin IPC socket (the private channel between the CLI and the running
+daemon) as an `AdminCommand::PNetBan`. The daemon signs a `BanEntry`
+with the node's identity key, applies it locally, and fans it out over
+the DHT to the K closest peers. Every other member picks the ban up on
+its next `p_net_ban_sync` tick, roughly every 60 s.
 
-Verify on receivers:
+Confirm it landed on the receiving nodes:
 ```bash
 veil-cli peers banned
 ```
 
 ## App-layer admission (ogate / oproxy)
 
-The daemon's P-Net gate decides whether a peer can establish an OVL1
-session at all.  Apps running atop the daemon — ogate (TUN bridge),
-oproxy (SOCKS5/HTTP proxy) — can delegate their own admission decision
-to the daemon's already-performed verify, instead of maintaining their
-own static `allowed_node_ids` list.
+The daemon's P-Net gate decides whether a peer may open an OVL1 session
+at all. Apps that run on top of the daemon face the same question for
+their own traffic — ogate (a TUN bridge that carries IP packets) and
+oproxy (a SOCKS5/HTTP proxy). Rather than keep their own static
+`allowed_node_ids` list, they can reuse the verification the daemon has
+already done.
 
-The mechanism: each app queries `LocalAppMsg::PnetStatusQuery` over its
-IPC socket and reads the daemon's cached `MembershipCert` for the
-peer.  Daemon-side: cert is stored at handshake-time in a per-peer
-`verified_peer_certs` map and exposed by `PnetStatusProvider`.
+It works like this. Each app sends a `LocalAppMsg::PnetStatusQuery` over
+its IPC socket and reads back the `MembershipCert` the daemon cached for
+that peer. On the daemon side, the cert is saved at handshake time in a
+per-peer `verified_peer_certs` map and served out through
+`PnetStatusProvider`. So the app never verifies anything itself — it
+just asks the daemon what it already knows.
 
 ### oproxy-server
 
@@ -173,15 +201,18 @@ allowed_node_ids = []   # empty + pnet_required=true → "trust any cert-verifie
 allow_all = false        # not needed when pnet_required is set
 ```
 
-Behaviour on incoming stream:
+What happens when a stream comes in:
 
-1. Source `node_id` checked against `allowed_node_ids` (existing gate).
-2. If `pnet_required = true`, additional `peer_pnet_status(&src)` IPC
-   query.  Rejects with `Denied` if either `admitted=false` or
-   `has_cert=false`.
+1. The source `node_id` is checked against `allowed_node_ids`, the
+   existing gate.
+2. If `pnet_required = true`, oproxy also asks the daemon, via a
+   `peer_pnet_status(&src)` IPC query. It rejects the stream with
+   `Denied` if the peer is not admitted (`admitted=false`) or has no
+   cert (`has_cert=false`).
 
-Daemon RPC failure ⇒ fail-closed (the operator opted into the strict
-gate; falling back open would defeat the point).
+If that query to the daemon fails, oproxy fails closed — it denies the
+stream rather than letting it through. You asked for the strict gate;
+defaulting to open on an error would quietly undo it.
 
 ### ogate
 
@@ -196,15 +227,19 @@ node_id = "deadbeef..."
 addr_v4 = "10.99.0.2"
 ```
 
-Behaviour on startup and on SIGHUP reload:
+What happens at startup, and again on a SIGHUP reload (the signal that
+tells ogate to re-read its config):
 
-1. ogate connects to daemon.
-2. Iterates `[[peers]]`; for each entry, calls `peer_pnet_status`.
-3. Filters out peers without `has_cert && admitted` (warns about each drop).
-4. Builds routing table from the filtered list.
+1. ogate connects to the daemon.
+2. It walks the `[[peers]]` list and calls `peer_pnet_status` for each
+   entry.
+3. It drops any peer that isn't both cert-bearing and admitted
+   (`has_cert && admitted`), logging a warning for each one dropped.
+4. It builds its routing table from the peers that survived.
 
-Combine with `mode = "authorized"` for defence-in-depth — peer must BOTH
-have a verified cert AND be in the `[[peers]]` list.
+Pair this with `mode = "authorized"` for defence in depth — two
+independent checks instead of one. A peer must both carry a verified
+cert and appear in the `[[peers]]` list.
 
 ### Operator flow
 
@@ -244,11 +279,12 @@ sudo systemctl restart oproxy-server
 
 ## Ansible rollout
 
-The repo ships `ansible/deploy-pnet.yml` (rollout) and
-`ansible/revert-pnet.yml` (back to public mode). Both are `serial: 1`
-rolling — cluster keeps a quorum during the switch.
+The repo ships two playbooks: `ansible/deploy-pnet.yml` switches a
+cluster to private mode, and `ansible/revert-pnet.yml` switches it back
+to public. Both run `serial: 1` — one host at a time — so the cluster
+keeps a quorum throughout and never goes fully dark.
 
-Prerequisites on the controller:
+Before you run them, the controller needs:
 - `/tmp/pnet/owner.pub` + `/tmp/pnet/owner.priv` + `/tmp/pnet/network_id.hex`
 - One cert per host at `/tmp/pnet/<cfg-name>.cert` (cfg-name = b1/b2/b3 +
   n1..n5 — see the `inv_to_cfg` map in `deploy-pnet.yml`).
@@ -263,17 +299,20 @@ ansible-playbook -i inventory.yml revert-pnet.yml
 
 ## Architecture notes
 
-* **Cert verification cost**: 1 Ed25519 signature verify (~30 μs on
-  modern x86). Handshake gate verifies on every inbound; cert is
-  re-decoded on every handshake (not cached) so admin-allowlist
-  changes take effect immediately on reload.
-* **Ban propagation latency**: ≤60 s (apply task interval). For faster
-  propagation, every admin host could issue redundant bans, but the DHT
-  fan-out (K=8 closest) usually covers the cluster within one tick
-  anyway.
-* **DHT key derivation**: `BLAKE3(network_id || ":bans:" || banned_node_id)`.
-  Receivers verify ban signature **and** that the key matches —
-  prevents misfiling a ban under a wrong key.
+* **Cost of verifying a cert**: one Ed25519 signature check, about
+  ~30 μs on a modern x86 chip — cheap. The gate runs it on every inbound
+  connection. The cert is re-decoded each handshake and never cached, so
+  a change to the admin allowlist takes effect the moment you reload, not
+  after the next restart.
+* **How long a ban takes to spread**: ≤60 s, set by the apply task's
+  interval. You could speed it up by having every admin host issue the
+  same ban, but the DHT fan-out (to the K=8 closest peers) usually blankets
+  the cluster within a single tick anyway.
+* **How the DHT key is derived**:
+  `BLAKE3(network_id || ":bans:" || banned_node_id)`. A receiver checks
+  both the ban's signature **and** that it was filed under the matching
+  key. That second check stops anyone from filing a ban under the wrong
+  key.
 
 ## Related code
 
@@ -296,11 +335,15 @@ ansible-playbook -i inventory.yml revert-pnet.yml
 
 ## Limitations / open work
 
-* **No revocation list**: a compromised admin cert remains valid until
-  its `valid_until_unix` elapses. Rotate admin certs by re-issuing with
-  a new admin keypair and redistributing.
-* **Owner-key compromise is catastrophic**: anyone holding the owner
-  privkey can mint admin certs that gate-pass everywhere. Treat it
-  like a root CA key — air-gapped, HSM, or paper backup.
-* **Cross-network connectivity**: an admin on Network A cannot bridge to
-  Network B. Each network is a disjoint trust domain.
+* **No revocation list**: there is no way to cancel a single cert on
+  demand. A stolen admin cert stays valid until its `valid_until_unix`
+  passes. To retire admin certs early, re-issue them under a new admin
+  keypair and redistribute.
+* **Losing the owner key is catastrophic**: whoever holds the owner
+  private key can mint admin certs that pass the gate anywhere. Guard it
+  like a root CA key — the master key of a certificate authority — kept
+  air-gapped, in an HSM (a tamper-resistant key device), or on a paper
+  backup.
+* **No bridging between networks**: an admin on Network A cannot reach
+  into Network B. Each network is its own separate trust domain, with no
+  overlap.

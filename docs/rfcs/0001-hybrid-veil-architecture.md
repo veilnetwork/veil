@@ -8,13 +8,13 @@
 
 ## Summary
 
-This RFC defines the complete wire protocol, data model, and component architecture for the veil network stack (`OVL1`). It serves as the authoritative reference for all on-wire formats, DHT key derivation formulas, and milestone acceptance criteria.
+This RFC defines the wire protocol, data model, and component architecture for the veil network stack (`OVL1`). "On-wire" here means the exact byte layout of data as it travels between nodes. This document is the authoritative reference for those formats, for the DHT key-derivation formulas, and for the milestone acceptance criteria. (The DHT, the distributed hash table, is the network's shared directory for finding nodes.)
 
 ---
 
 ## 1. Invariants
 
-These are fixed and must not change without a new RFC superseding this one.
+These are the load-bearing facts of the protocol. They are fixed: nothing here changes without a new RFC that supersedes this one.
 
 ### 1.1 Node identity
 
@@ -58,9 +58,10 @@ content_id = BLAKE3(app_id || content_type || payload)
 | `leaf` | ❌ never  | yes (client)    | no             |
 | `core` | ✅ yes (K=20) | yes (server) | yes           |
 
-One binary, two roles. Selected via config `[Identity] role = "leaf" | "core"`.
-Core nodes handle DHT, relay/forwarding, gateway (attachment records), and mailbox.
-Gateway functionality can be disabled per-node via `[gateway] enabled = false`.
+One binary, two roles, chosen in config with `[Identity] role = "leaf" | "core"`.
+A core node does the heavy lifting: DHT membership, relaying and forwarding,
+gateway duties (publishing attachment records for leaves), and mailbox storage.
+You can turn off the gateway role on a given node with `[gateway] enabled = false`.
 
 ### 1.5 Plane separation
 
@@ -307,7 +308,7 @@ Initiator                       Responder
 
 ### 4.2 Key agreement
 
-X25519 ephemeral Diffie-Hellman with HKDF-SHA256 key derivation. The derived symmetric key is used for AEAD encryption (ChaCha20-Poly1305) of subsequent frames.
+Each session derives a fresh shared secret using X25519 ephemeral Diffie-Hellman — a key exchange where both sides use one-time keys, so a compromised long-term key can't unlock past sessions. That secret is run through HKDF-SHA256 to produce a symmetric key, which then encrypts every following frame with ChaCha20-Poly1305 (an AEAD cipher — it protects both the secrecy and the integrity of the data in one step).
 
 ### 4.3 Signature algorithms
 
@@ -358,28 +359,28 @@ Alice                  Core                  Bob
 
 ### 6.2 Relay fallback
 
-If hole punching fails within the deadline (configurable, default 500 ms), the initiator sends `NAT_RELAY_REQUEST` to a `Core` node. The relay creates a bidirectional `Forward` tunnel between the two peers.
+Hole punching is the trick of getting two nodes behind home routers to connect directly. If it fails to land within the deadline (configurable, default 500 ms), the initiator falls back: it sends `NAT_RELAY_REQUEST` to a `Core` node, which sets up a two-way `Forward` tunnel between the two peers and shuttles their traffic through itself.
 
-Only `Core` nodes may accept `NAT_RELAY_REQUEST` (`RelayFallback::core_should_relay`). Legacy `Gateway` role was removed in Epic 435 and rolled into `Core`.
+Only `Core` nodes may accept a `NAT_RELAY_REQUEST` (`RelayFallback::core_should_relay`). The old `Gateway` role was removed in Epic 435 and folded into `Core`.
 
 ---
 
 ## 7. QUIC multi-stream transport
 
-For QUIC transport sessions, frames are split across QUIC streams by priority to eliminate head-of-line blocking:
+On a QUIC transport session, frames are split across separate QUIC streams by priority. This avoids head-of-line blocking — the problem where one stalled packet holds up everything queued behind it.
 
 | Priority | QUIC stream type |
 |---|---|
 | `REALTIME` (0) | Unidirectional `open_uni()` |
 | `INTERACTIVE`, `BULK`, `BACKGROUND` | Bidirectional `open_bi()` |
 
-Each veil `stream_id` maps to one QUIC stream, created lazily on first use. Quinn's built-in CUBIC/BBR congestion control applies per-stream automatically.
+Each veil `stream_id` maps to one QUIC stream, opened lazily on first use. Quinn (the QUIC library) applies its built-in CUBIC/BBR congestion control per stream automatically.
 
 ---
 
 ## 8. TUN/TAP virtual interface
 
-The `tun-interface` feature enables a virtual TUN network device:
+The `tun-interface` feature sets up a virtual TUN network device — a software network interface the operating system treats like a real one, letting veil carry raw IP traffic:
 
 ```
 [OS network stack] ↕ TUN (10.99.0.1/16)
@@ -421,7 +422,7 @@ Priority is encoded in `FrameHeader.flags` bits `[1:0]`.
 
 ## 10. SOCKS5 proxy
 
-A SOCKS5 ingress proxy allows any TCP application to tunnel traffic through the veil:
+A SOCKS5 ingress proxy lets any TCP application send its traffic through the veil. SOCKS5 is a standard proxy protocol most apps already know how to use, so no app changes are needed:
 
 ```
 [App] → SOCKS5(localhost:1080) → [Local Node] → APP_STREAM → [Exit Node] → TCP → [Target]
@@ -443,7 +444,7 @@ Only `Core` and `Gateway` nodes with `exit.enabled = true` accept exit proxy con
 
 ## 11. Mailbox
 
-Mailbox provides store-and-forward delivery for offline/intermittent nodes.
+The mailbox provides store-and-forward delivery for nodes that are offline or come and go. A core node holds a message until the recipient reconnects to collect it.
 
 ```
 PUT:   sender → MAILBOX_PUT → mailbox_node
@@ -495,12 +496,12 @@ All items below correspond to epics in `TASKS.md`.
 
 ## 13. Security considerations
 
-- **Authentication**: All sessions require identity verification via Ed25519 or Falcon-512 public keys.
-- **Integrity**: DHT records are optionally signed by originating nodes (`DhtValue.signature`, `AnnounceAttachmentPayload.signature`). Receivers should reject records with invalid signatures.
-- **Replay prevention**: `seq_no` fields provide monotonic ordering; receivers should reject records with `seq_no` lower than the last accepted value from the same node.
-- **Rate limiting**: All peer connections subject to configurable frame-rate limits with exponential backoff and temporary bans on excessive violations.
-- **PoW admission**: Optional BLAKE3 proof-of-work on identity phase prevents cheap Sybil registration.
-- **Exit proxy authorization**: Exit proxy connections only accepted by nodes with explicit `exit.enabled = true` capability. Role check enforced: `Core` or `Gateway` only.
+- **Authentication**: Every session verifies the peer's identity against an Ed25519 or Falcon-512 public key.
+- **Integrity**: A node may sign the DHT records it originates (`DhtValue.signature`, `AnnounceAttachmentPayload.signature`). Receivers should reject any record whose signature doesn't check out.
+- **Replay prevention**: The `seq_no` field gives records a monotonic order (it only ever counts up). A receiver should reject any record whose `seq_no` is below the last value it accepted from that same node.
+- **Rate limiting**: Every peer connection is held to a configurable frame-rate limit. Repeat offenders get exponential backoff and, if they keep it up, a temporary ban.
+- **PoW admission**: An optional BLAKE3 proof-of-work on the identity phase makes Sybil registration — flooding the network with cheap throwaway identities — expensive instead.
+- **Exit proxy authorization**: A node only accepts exit-proxy connections if it sets `exit.enabled = true`, and only the `Core` or `Gateway` roles are allowed to.
 
 ---
 

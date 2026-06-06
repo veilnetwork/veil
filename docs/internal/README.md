@@ -1,24 +1,24 @@
 # Internal — Censorship-Resistance Architecture
 
-> **Scope:** documentation что разкрывает анти-censorship посуру
-> проекта. Содержимое НЕ должно линковаться из публичных индексов
-> и НЕ должно упоминаться в outward-facing документах.
+> **Scope:** documentation that reveals the project's anti-censorship
+> posture. Its contents must NOT be linked from public indexes
+> and must NOT be mentioned in outward-facing documents.
 >
-> **Audience:** core maintainers, operators of bridges/gateways, и
-> security researchers с explicit access agreement.
+> **Audience:** core maintainers, operators of bridges/gateways, and
+> security researchers with an explicit access agreement.
 
 ---
 
-## 0. Threat model в одном абзаце
+## 0. Threat model in one paragraph
 
-Adversary — well-resourced (state-level или равноценный): owns the
-local access network, может выполнять active probing, DPI на
-fingerprint уровне (JA3/JA4/TLS-record-pattern/n-gram analysis),
-IP-blacklisting, port-scanning known veil endpoints, и traffic
-correlation analysis. Цель — обеспечить delivery даже когда adversary
-блокирует все известные fingerprint'ы протокола; цель НЕ —
-анонимность от self-hostile network operator (это отдельный threat
-model в anonymity stack, не здесь).
+The adversary is well-resourced (state-level or equivalent): they own the
+local access network and can run active probing, fingerprint-level DPI
+(JA3/JA4/TLS-record-pattern/n-gram analysis), IP-blacklisting,
+port-scanning of known veil endpoints, and traffic-correlation analysis.
+The goal is to guarantee delivery even when the adversary blocks every
+known protocol fingerprint. The goal is NOT anonymity from a
+self-hostile network operator — that is a separate threat model in the
+anonymity stack, not here.
 
 ---
 
@@ -65,15 +65,15 @@ model в anonymity stack, не здесь).
    └────────────────────────────────────────────────────┘
 ```
 
-Каждый слой задокументирован отдельно — см. §3 catalog.
+Each layer is documented separately — see the §3 catalog.
 
 ---
 
 ## 2. Activation philosophy
 
-**Не всё включается одновременно.** Default config — open, neutral,
-TCP-only — отдаёт baseline функциональность. Каждая фича из L4-L7
-opt-in через config:
+**Not everything is enabled at once.** The default config — open, neutral,
+TCP-only — delivers baseline functionality. Each feature in L4-L7 is
+opt-in through the config:
 
 ```toml
 [transport.obfs4]      # opt-in
@@ -95,9 +95,9 @@ profile = "https-burst"
 enabled = true
 ```
 
-Reason: некоторые слои (e.g. ECH) могут активно паливать узел в
-jurisdictions где их использование отслеживается. Operator выбирает
-posture на основе target jurisdiction и risk tolerance, не код.
+Reason: some layers (e.g. ECH) can actively expose a node in
+jurisdictions where their use is tracked. The operator — not the code —
+chooses the posture based on the target jurisdiction and risk tolerance.
 
 ---
 
@@ -107,7 +107,7 @@ posture на основе target jurisdiction и risk tolerance, не код.
 
 | File | Topic |
 |------|-------|
-| [`ANTICENSORSHIP_STRATEGY.md`](ANTICENSORSHIP_STRATEGY.md) | Полный threat model, DPI vendor analysis (VAS Experts СКАТ etc), 35 evasion methods, roadmap |
+| [`ANTICENSORSHIP_STRATEGY.md`](ANTICENSORSHIP_STRATEGY.md) | Full threat model, DPI vendor analysis (VAS Experts СКАТ etc), 35 evasion methods, roadmap |
 | [`censorship-target.md`](censorship-target.md) | Per-jurisdiction deployment guidance (operator-side) |
 | [`dpi-evasion.md`](dpi-evasion.md) | Architecture summary of what's built vs. planned |
 | [`DEPLOYMENT_HARDENING.md`](DEPLOYMENT_HARDENING.md) | Operator-side gap closure: CDN, AS-level, hosting choices |
@@ -118,14 +118,14 @@ posture на основе target jurisdiction и risk tolerance, не код.
 |------|-------|
 | [`PLAN_TRANSPORT_OBFUSCATION.md`](PLAN_TRANSPORT_OBFUSCATION.md) | obfs4 + FakeTLS implementation plan |
 | [`PLAN_ECH_OPT_IN.md`](PLAN_ECH_OPT_IN.md) | Encrypted Client Hello opt-in |
-| [`webtunnel-letsencrypt.md`](webtunnel-letsencrypt.md) | webtunnel-via-Caddy с per-host LE certs |
+| [`webtunnel-letsencrypt.md`](webtunnel-letsencrypt.md) | webtunnel-via-Caddy with per-host LE certs |
 
 ### Listener / discovery stealth
 
 | File | Topic |
 |------|-------|
-| [`PLAN_POW_GATED_RENDEZVOUS.md`](PLAN_POW_GATED_RENDEZVOUS.md) | On-demand listener bind после PoW-verified handshake |
-| [`PLAN_WIRE_FORMAT_KILL_SWITCH.md`](PLAN_WIRE_FORMAT_KILL_SWITCH.md) | Magic-rotation механизм когда variant скомпрометирован |
+| [`PLAN_POW_GATED_RENDEZVOUS.md`](PLAN_POW_GATED_RENDEZVOUS.md) | On-demand listener bind after a PoW-verified handshake |
+| [`PLAN_WIRE_FORMAT_KILL_SWITCH.md`](PLAN_WIRE_FORMAT_KILL_SWITCH.md) | Magic-rotation mechanism for when a variant is compromised |
 
 ### Traffic shaping
 
@@ -137,69 +137,69 @@ posture на основе target jurisdiction и risk tolerance, не код.
 
 | File | Topic |
 |------|-------|
-| [`FINGERPRINT_REGRESSION.md`](FINGERPRINT_REGRESSION.md) | n-gram analysis, JA3/JA4 drift detection в CI |
+| [`FINGERPRINT_REGRESSION.md`](FINGERPRINT_REGRESSION.md) | n-gram analysis, JA3/JA4 drift detection in CI |
 
 ---
 
-## 4. Cross-references к public docs
+## 4. Cross-references to public docs
 
-Эти public docs описывают building blocks но НЕ их анти-censorship
-применение. При работе с public-facing review:
+These public docs describe the building blocks but NOT their
+anti-censorship application. When working on a public-facing review:
 
 - [`../en/WIRE_PROTOCOL.md`](../en/WIRE_PROTOCOL.md) — frame format
-  и Padding (упоминается как "passive traffic analysis defense", не
-  как DPI evasion).
+  and Padding (mentioned as a "passive traffic analysis defense", not
+  as DPI evasion).
 - [`../en/HOW_IT_WORKS.md`](../en/HOW_IT_WORKS.md) / [`../ru/HOW_IT_WORKS.md`](../ru/HOW_IT_WORKS.md)
-  — neutral overview, не упоминает obfuscation.
+  — neutral overview, does not mention obfuscation.
 - [`../en/SECURITY.md`](../en/SECURITY.md) — Sybil/eclipse/replay
-  defense (generic P2P), не upstream censorship.
+  defense (generic P2P), not upstream censorship.
 - [`../en/p-net.md`](../en/p-net.md) — private networks (membership
-  certs), не bypass; но в качестве deployment compartment может
-  использоваться вместе.
+  certs), not bypass; but it can be used alongside as a deployment
+  compartment.
 - [`../en/protocol-spec.md`](../en/protocol-spec.md) / [`../ru/protocol-spec.md`](../ru/protocol-spec.md)
-  — half-cap DHT discussion framed как "scanner-resistance", не
+  — half-cap DHT discussion framed as "scanner-resistance", not
   "censorship-resistance".
 
 ---
 
-## 5. Что НЕ держать в internal/
+## 5. What NOT to keep in internal/
 
-- Generic security (Sybil/eclipse/replay) — это в `../en/SECURITY.md`.
-- Identity model (Falcon/Ed25519 hybrid) — public, в
+- Generic security (Sybil/eclipse/replay) — that lives in `../en/SECURITY.md`.
+- Identity model (Falcon/Ed25519 hybrid) — public, in
   `../en/identity-model.md`.
 - Hot-standby, NAT traversal, route_cache — public, generic
   reliability features.
 - Capacity planning, monitoring, troubleshooting — operator concerns,
   public.
 
-Правило большого пальца: если документ может быть прочитан как
-"мы строим distributed P2P" без указания на конкретного adversary —
-он public. Если он называет adversary, эксплуатируемые DPI signatures,
-конкретные jurisdictions, или способы избежать identifiable traffic
-patterns — он internal.
+Rule of thumb: if a document can be read as "we are building a
+distributed P2P" without pointing at a specific adversary, it is
+public. If it names the adversary, the DPI signatures it exploits,
+specific jurisdictions, or ways to avoid identifiable traffic
+patterns, it is internal.
 
 ---
 
 ## 6. Repository migration note
 
-Этот subdir создан в рамках audit batch 2026-05-23 как подготовка к
-будущему anonymous repo. Цель — на первом этапе публичного
-existence'а проекта НЕ привлекать внимание к анти-censorship
-функциональности через docs.
+This subdir was created as part of the 2026-05-23 audit batch in
+preparation for a future anonymous repo. The goal is to NOT draw
+attention to the anti-censorship functionality through the docs during
+the project's first phase of public existence.
 
-Functionality сама по себе остаётся в коде (transport adapters,
-fingerprint module, traffic shaping). Posture скрыта в **descriptions**:
-public-facing документация описывает все features в нейтральных
-терминах ("transport adapters", "traffic privacy", "stealth
-listeners"). Только internal docs объясняют *почему* они построены
-именно так.
+The functionality itself stays in the code (transport adapters,
+fingerprint module, traffic shaping). The posture is hidden in the
+**descriptions**: public-facing documentation describes all features in
+neutral terms ("transport adapters", "traffic privacy", "stealth
+listeners"). Only the internal docs explain *why* they are built the way
+they are.
 
-Future steps когда rep становится publicly visible:
-1. Изначально internal/ не упоминается в README или index.md.
-2. После некоторого initial period — добавить ссылку с честной
-   объяснительной запиской об audience.
+Future steps once the repo becomes publicly visible:
+1. At first, internal/ is not mentioned in the README or index.md.
+2. After some initial period, add a link with an honest explanatory
+   note about the audience.
 3. Operator-side docs (censorship-target.md, DEPLOYMENT_HARDENING.md)
-   могут быть переведены в "operator handbook" — отдельный канал с
+   can be moved into an "operator handbook" — a separate channel with
    restricted access.
 
 ---
@@ -208,13 +208,13 @@ Future steps когда rep становится publicly visible:
 
 | Term | Meaning here |
 |------|--------------|
-| DPI | Deep Packet Inspection — L7-уровневый трафик-классификатор |
+| DPI | Deep Packet Inspection — an L7-level traffic classifier |
 | JA3 / JA4 | TLS ClientHello fingerprints; identifying TLS stacks |
 | obfs4 | Pluggable Transport, ScrambleSuit-successor (Tor project) |
 | webtunnel | HTTPS-mimicking transport (Tor project) |
 | FakeTLS | Per-listener TLS-fingerprint cloning of legitimate sites |
 | ECH | Encrypted Client Hello (RFC 9460); encrypts SNI |
-| Active probe | Adversary's targeted handshake to verify suspected endpoint |
-| Half-cap | DHT FIND_NODE response limit ≤ K/2 to slow enumeration |
-| Stealth listener | Listener bound only after PoW-verified rendezvous; ss -tlnp shows nothing |
-| Variant rotation | Changing wire-format magic when current signature is identified |
+| Active probe | A targeted handshake the adversary sends to confirm a suspected endpoint |
+| Half-cap | Capping each DHT FIND_NODE response at ≤ K/2 entries to slow down enumeration |
+| Stealth listener | A listener that binds only after a PoW-verified rendezvous, so ss -tlnp shows nothing |
+| Variant rotation | Changing the wire-format magic once the current signature has been identified |

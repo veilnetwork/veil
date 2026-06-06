@@ -2,8 +2,10 @@
 
 Версия: **1** (magic `0x4F564C31`), minor = 1.
 
+Это основной справочник по формату OVL1 на проводе — двоичному протоколу, на котором узлы Veil общаются между собой. Документ намеренно точен: имена полей, байтовые смещения и константы здесь совпадают с кодом.
+
 > Для архитектурного обзора — [ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md).
-> Для быстрой справки по wire-формату — [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
+> Для быстрой справки по формату на проводе — [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
 
 ---
 
@@ -20,8 +22,8 @@ node_id = BLAKE3(raw_public_key_bytes)   // 32 байта
 Свойства:
 - Стабильный глобальный идентификатор — не зависит от IP, местоположения, транспорта
 - Привязан к криптографическому ключу
-- Алгоритм хэширования: BLAKE3, вход: raw bytes публичного ключа (не base64-строка)
-- Представляется как 64-символьный hex-string в CLI и конфиге
+- Алгоритм хэширования: BLAKE3, на вход подаются сырые байты публичного ключа (не base64-строка)
+- В CLI и конфиге записывается как 64-символьная hex-строка
 
 ### 1.2 app_id
 
@@ -33,16 +35,17 @@ app_id = BLAKE3-derive_key(
 )     // 32 байта
 ```
 
-`app_namespace` и `app_name` — UTF-8 строки произвольного содержания, выбираемые
-разработчиком приложения (convention: reverse-DNS, например `"com.example.chat"`
-+ `"main"`). На wire-уровне ограничены 255 байт каждая (см. §9.3 `AppBind`).
+`app_namespace` и `app_name` — UTF-8-строки произвольного содержания. Их выбирает
+разработчик приложения (по соглашению — обратный DNS, например `"com.example.chat"`
++ `"main"`). На проводе каждая ограничена 255 байтами (см. §9.3 `AppBind`).
 
-**Length-prefixes и domain separator обязательны** — без них наивная конкатенация
-даёт коллизии: `("foo","bar")` и `("fo","obar")` оба склеиваются в `"foobar"`
-и дают одинаковый digest.  v1 derivation гарантирует уникальность.
+Префиксы длины и доменный разделитель (строка `context`) **обязательны**. Без них
+наивная склейка даёт коллизии: `("foo","bar")` и `("fo","obar")` обе склеиваются в
+`"foobar"` и дали бы одинаковый хэш. Формула v1 выше держит каждое поле раздельно,
+поэтому результат уникален.
 
-Для IPC-приложений в ephemeral-режиме (по умолчанию) формула расширена
-16-байтным `client_token`, выдаваемым узлом в `AppHelloOk`:
+Для IPC-приложений в эфемерном режиме (по умолчанию) формула дополняется
+16-байтным `client_token`, который узел выдаёт в `AppHelloOk`:
 
 ```text
 ephemeral_app_id = BLAKE3-derive_key(
@@ -52,9 +55,10 @@ ephemeral_app_id = BLAKE3-derive_key(
 )
 ```
 
-Это делает `app_id` уникальным per-connection — два процесса на одном узле,
-биндящие один и тот же `(namespace, name)`, получают разные адреса. Для
-well-known сервисов используется стабильная форма выше (через `bind_named`).
+Так `app_id` становится уникальным для каждого соединения: два процесса на одном
+узле, привязывающие одну и ту же пару `(namespace, name)`, всё равно получают разные
+адреса. Широко известным сервисам, которым нужен фиксированный адрес, вместо этого
+служит стабильная форма выше (через `bind_named`).
 
 Адрес конечной точки приложения:
 
@@ -72,13 +76,15 @@ AppAddress {
 content_id = BLAKE3(payload_bytes)   // 32 байта
 ```
 
-Используется для дедупликации сообщений в transit.
+Это отпечаток тела сообщения. По нему узлы распознают и отбрасывают дубликаты, пока сообщение в пути.
 
 ---
 
-## 2. Wire-формат фреймов
+## 2. Формат кадров на проводе
 
-### 2.1 Заголовок фрейма (FrameHeader)
+Каждое сообщение OVL1 — это *кадр* (frame): фиксированный заголовок в 24 байта, за которым идёт тело. Заголовок говорит, что это за сообщение и какой длины тело; для уровня кадрирования само тело непрозрачно.
+
+### 2.1 Заголовок кадра (FrameHeader)
 
 Фиксированный заголовок — **24 байта**:
 
@@ -97,7 +103,7 @@ Offset  Len  Тип    Описание
  24      ?   bytes  Body (body_len байт)
 ```
 
-### 2.2 Флаги фрейма (flags, биты)
+### 2.2 Флаги кадра (flags, биты)
 
 | Бит | Имя | Описание |
 |-----|-----|----------|
@@ -107,6 +113,8 @@ Offset  Len  Тип    Описание
 | 4..15 | reserved | Зарезервировано, должны быть 0 |
 
 ### 2.3 Family — семейства протоколов
+
+*Семейство* (Family) объединяет родственные типы сообщений. Байт `Family` в заголовке выбирает группу, а `msg_type` — уже конкретное сообщение внутри неё. Каждое семейство отвечает за свою функциональную область протокола: сессии, обнаружение, доставку и так далее.
 
 | Family | Число | Назначение |
 |--------|-------|------------|
@@ -127,9 +135,9 @@ Offset  Len  Тип    Описание
 
 ## 3. Session Plane (Family 0)
 
-### 3.1 Handshake
+### 3.1 Рукопожатие (handshake)
 
-OVL1-handshake — асимметричный, инициируемый клиентом. Последовательность:
+Прежде чем обмениваться чем-либо ещё, два узла проводят *рукопожатие* — короткий вступительный диалог, который подтверждает личности и согласует ключи шифрования. Оно асимметрично: ведёт сторона, которая инициирует соединение (инициатор), а другая (отвечающий) отвечает. Обмен идёт в таком порядке:
 
 ```
 Initiator                              Responder
@@ -180,22 +188,29 @@ Initiator                              Responder
                                   forward-compat default)
 ```
 
-**Backward-compat:** legacy peers отправляют 2 байта (без `discovery_mode`); decoder default'ит missing byte на `0` (Public) — legacy peers не имели концепции opt-in privacy и были фактически Public. Decoder принимает `>= 2` байт.
+**Обратная совместимость:** старые пиры присылают всего 2 байта, без поля
+`discovery_mode`. Декодер заполняет недостающий байт нулём (`0` = Public) — эти пиры
+появились до приватности по выбору, так что Public для них — верное значение по
+умолчанию. Принимается любая полезная нагрузка длиной `>= 2` байт.
 
-**discovery_mode семантика:**
+**Что означает `discovery_mode`.** Поле задаёт, насколько узел готов быть найденным
+незнакомцами:
 
-- `Public` — peer хочет быть discoverable через DHT-walk; FIND_NODE responses от других узлов будут включать его.
-- `ContactsOnly` — peer должен быть исключён из FIND_NODE responses; reachable только через direct sessions с already-handshake'd контактами или pre-shared bootstrap.
-- `IntroductionOnly` — то же что `ContactsOnly` для FIND_NODE; дополнительно RouteResponse строго обязан стрипать `transports[]` (см. §3.6).
+- `Public` — пир хочет быть находимым через обход DHT (поиск, прыгающий по распределённой хеш-таблице; см. §5.5); в ответах FIND_NODE от других узлов он будет присутствовать.
+- `ContactsOnly` — пир полностью исключается из ответов FIND_NODE; до него можно дотянуться только через прямую сессию с контактом, с которым уже было рукопожатие, либо через заранее заданный список начального подключения (bootstrap).
+- `IntroductionOnly` — то же, что `ContactsOnly`, для FIND_NODE, и строже: RouteResponse обязан вырезать `transports[]` (см. §3.6), так что даже успешный поиск маршрута не вернёт адреса.
 
-Legacy fields:
-- Role bits `RELAY (0x02)`, `GATEWAY (0x04)`, `CORE_ROUTER (0x10)` — удалены.
-- Cap flags `CAN_MAILBOX=0x02`, `CAN_GATEWAY_LOCAL_MESH=0x04`, `CAN_PARTICIPATE_DHT=0x08`, `CAN_ACCEPT_APP_STREAMS=0x10`, `CAN_STORE=0x20`, `SUPPORTS_TRANSIT=0x40` — никогда не читались, удалены.
-- Wire-format ужат с 12 байт (legacy) → 2 байт → 3 байт.
+Устаревшие поля:
+- Биты ролей `RELAY (0x02)`, `GATEWAY (0x04)`, `CORE_ROUTER (0x10)` — удалены.
+- Флаги возможностей `CAN_MAILBOX=0x02`, `CAN_GATEWAY_LOCAL_MESH=0x04`, `CAN_PARTICIPATE_DHT=0x08`, `CAN_ACCEPT_APP_STREAMS=0x10`, `CAN_STORE=0x20`, `SUPPORTS_TRANSIT=0x40` — их никто никогда не читал, поэтому удалены.
+- Формат на проводе со временем ужался: 12 байт (старый) → 2 байта → 3 байта.
 
 ### 3.5 SessionKeys (производные ключи)
 
-После обмена ephemeral **X25519** (это NOT identity key — identity, Ed25519/Falcon-512, используется только для подписи в `IdentityPayload`):
+Сессионные ключи стороны выводят из эфемерного обмена Диффи — Хеллмана на **X25519** —
+одноразовой пары ключей, сгенерированной только для этой сессии. Не путайте его с
+ключом личности (Ed25519/Falcon-512): тот лишь подписывает `IdentityPayload` и ничего
+не шифрует. Вывод устроен так:
 
 ```
 shared_secret = X25519(my_ephemeral_priv, peer_ephemeral_pub)
@@ -211,18 +226,22 @@ info = "ovl1-session-v1"
                    else                                 → (key_b, key_a)
 ```
 
-`tx_key` — для шифрования исходящих фреймов; `rx_key` — для расшифровки входящих.
-Lex-order по `node_id` гарантирует, что у инициатора и у респондента
-`tx_key`/`rx_key` поменены местами: alice.tx == bob.rx и наоборот.
+`tx_key` шифрует исходящие кадры, `rx_key` расшифровывает входящие. Лексикографическое
+упорядочивание двух `node_id` гарантирует, что у инициатора и отвечающего `tx_key` и
+`rx_key` окажутся поменяны местами: alice.tx равен bob.rx, и наоборот. Именно это и
+позволяет каждой стороне расшифровать то, что прислала другая.
 
-Фреймы шифруются **ChaCha20-Poly1305** (по 32-байтному ключу `tx_key` /`rx_key`,
-12-байтный счётчик-nonce per-direction; AAD — заголовок фрейма).
+Кадры шифруются алгоритмом **ChaCha20-Poly1305** (аутентифицирующий шифр): 32-байтным
+ключом `tx_key`/`rx_key`, 12-байтным счётчиком-nonce, своим на каждое направление, а
+заголовок кадра идёт как дополнительные аутентифицируемые данные (AAD) — данные,
+которые аутентифицируются, но не шифруются.
 
-`session_id` (32 байта) — публичный идентификатор, кладётся в
-`SessionConfirmPayload` и используется как chain-salt для последующих rekey.
+`session_id` (32 байта) — публичный идентификатор. Он едет в `SessionConfirmPayload`,
+а затем служит затравкой соли для последующих перевыработок ключей (rekey, §3.7).
 
-Identity-key (Ed25519/Falcon-512) в этой derivation **не участвует**: forward
-secrecy — компрометация long-term identity ключа не раскрывает прошлые сессии.
+Ключ личности (Ed25519/Falcon-512) в этом выводе **не участвует**. Это сделано
+намеренно и даёт прямую секретность (forward secrecy): даже если долгоживущий ключ
+личности позже утечёт, прошлые сессии останутся запечатанными.
 
 ### 3.6 KeepalivePayload
 
@@ -230,11 +249,23 @@ secrecy — компрометация long-term identity ключа не рас
 [0..8]   timestamp_secs  u64 BE
 ```
 
-Отправляется с интервалом `session.keepalive_interval_secs`. При отсутствии активности дольше `session.idle_timeout_secs` — сессия закрывается.
+Keepalive уходит каждые `session.keepalive_interval_secs` — как знак, что сессия ещё жива. Если ничего не приходит дольше `session.idle_timeout_secs`, сессия считается мёртвой и закрывается.
 
-### 3.7 Rekey (перемена ключей)
+### 3.7 Rekey (смена ключей)
 
-Инициируется при превышении `REKEY_BYTES_THRESHOLD` = 128 ГиБ или `REKEY_TIME_THRESHOLD_SECS` = 32 дня (2 764 800 с). Оба порога настраиваются в конфиге: `[session] rekey_bytes_threshold` и `[session] rekey_time_threshold_secs` — высокочувствительные деплои могут опустить их явно. Байтовый порог `MLKEM_REKEY_BYTES_THRESHOLD` теперь равен 128 ГиБ (как и `REKEY_BYTES_THRESHOLD`); от основных порогов отличается только временной `MLKEM_REKEY_TIME_THRESHOLD_SECS` = 1 час, который выравнивает forward-secrecy окно X25519 сессионного ключа с ML-KEM E2E-ключом.
+Долгоживущая сессия время от времени заводит свежие ключи — это *перевыработка ключей*
+(rekey), — чтобы ни один ключ не защищал слишком много трафика и не жил слишком долго.
+Она срабатывает при переходе любого из порогов: `REKEY_BYTES_THRESHOLD` = 128 ГиБ
+переданного трафика или `REKEY_TIME_THRESHOLD_SECS` = 32 дня (2 764 800 с) по часам.
+Оба настраиваются в конфиге через `[session] rekey_bytes_threshold` и
+`[session] rekey_time_threshold_secs`, и высокочувствительные развёртывания могут
+намеренно их понизить.
+
+У постквантового слоя (ML-KEM) есть свои, параллельные часы перевыработки. Его байтовый
+бюджет `MLKEM_REKEY_BYTES_THRESHOLD` теперь равен 128 ГиБ — как и `REKEY_BYTES_THRESHOLD`.
+Отличается только таймер: `MLKEM_REKEY_TIME_THRESHOLD_SECS` = 1 час. Это короткое окно
+держит горизонт прямой секретности сессионного ключа X25519 в ногу со сквозным (E2E)
+ключом ML-KEM.
 
 ```
 Initiator ── RekeyInit ──► Responder   (новый ephemeral X25519 pubkey)
@@ -287,7 +318,7 @@ info       = "ovl1-session-rekey-v1"
 [51..51+len]     payload     bytes
 ```
 
-Каждый узел, получивший новое (непросмотренное) сообщение, доставляет его локально и форвардит к **K случайным соседям** с `ttl - 1`. Дедупликация по `msg_id`.
+Когда узел впервые видит сообщение, он доставляет его локально и пересылает копию **K случайным соседям** с `ttl - 1`. Каждый узел запоминает уже виденные `msg_id`, поэтому дубликаты дальше не расходятся.
 
 ### 4.5 NAT — NatProbeRequestPayload / NatProbeReplyPayload
 
@@ -312,17 +343,18 @@ info       = "ovl1-session-rekey-v1"
 
 ## 5. Discovery Plane (Family 2) — DHT (Kademlia)
 
-### 5.1 FindNode (V2 only — V1 removed)
+### 5.1 FindNode (только V2 — V1 удалён)
 
-V1 `FindNode` (slot 0) and `FindNodeResponse` (slot 8) — wire layout:
-target+k → `Vec<NodeContact{node_id, transport}>` — were dropped.
-V1 returned a transport per contact in the same RTT, which leaked the
-routing graph en masse and made network-wide enumeration trivially
-cheap.  All FIND_NODE traffic now goes through V2 + `ResolveTransport`
-(§5.4.1).  Senders that emit slots 0 / 8 fail `DiscoveryMsg::try_from`
-→ `Violation` in the dispatcher.
+Исходные сообщения V1 — `FindNode` (слот 0) и `FindNodeResponse` (слот 8), с раскладкой
+target+k → `Vec<NodeContact{node_id, transport}>` — убраны. Беда V1 была в том, что один
+ответ выдавал *транспорт* (адрес, который набирают) для каждого контакта, и всё это за
+один обход (RTT). Так граф маршрутизации утекал оптом, а перечислить всю сеть становилось
+до смешного дёшево. Теперь весь трафик FIND_NODE идёт через V2 плюс отдельный шаг
+`ResolveTransport` (§5.4.1). Отправитель, который всё ещё шлёт слот 0 или 8, не проходит
+`DiscoveryMsg::try_from` и помечается диспетчером как `Violation`.
 
-**`NodeContact`** is retained as a wire-helper for the `FindValue` not-found branch:
+**`NodeContact`** сохранён лишь как вспомогательная структура на проводе для ветки «не
+найдено» у `FindValue`:
 
 ```text
 [0..32]  node_id       [u8; 32]
@@ -330,35 +362,35 @@ cheap.  All FIND_NODE traffic now goes through V2 + `ResolveTransport`
 [34..N]  transport     bytes  (URI строка)
 ```
 
-Начиная с **C-06** ветка «не найдено» у `FindValue` обнуляет это поле
-(`transport_len = 0`, пустой URI): как и FIND_NODE V2, она возвращает **только
-node_id**, а запрашивающая сторона до-разрешает транспорт каждого узла по
-требованию через `ResolveTransport` (§5.4.1). Это закрывает ту же массовую
-утечку графа маршрутизации и на пути value-lookup; итеративный/рекурсивный обход
-всё равно сходится, потому что транспорты разрешаются hop-by-hop, а не
-встраиваются в ответ (см. регрессию на цепочке из 64 узлов в
-`crates/veil-dht/src/iterative.rs`).
+Начиная с **C-06**, эта ветка «не найдено» обнуляет поле транспорта
+(`transport_len = 0`, пустой URI). Как и FIND_NODE V2, она возвращает **только
+node_id**, а запрашивающая сторона затем по требованию разрешает транспорт каждого
+узла через `ResolveTransport` (§5.4.1). Это закрывает ту же массовую утечку графа
+маршрутизации и на пути поиска значения. Итеративный (и рекурсивный) обход всё равно
+сходится, потому что транспорты разрешаются от прыжка к прыжку, а не встраиваются в
+ответ, — регрессионный тест на цепочке из 64 узлов в
+`crates/veil-dht/src/iterative.rs` стережёт ровно это.
 
-#### 5.2.1 discovery_mode filter + half-cap
+#### 5.2.1 Фильтр discovery_mode + ограничение вполовину
 
-The V2 FIND_NODE (`handle_find_node_v2`) and `FindValue` not-found
-fallback both apply two levels of filtering before returning contacts
-(via the shared `ranked_public_contacts` helper):
+И V2 FIND_NODE (`handle_find_node_v2`), и запасной путь «не найдено» у `FindValue`
+сначала прогоняют возвращаемые контакты через два фильтра — через общий помощник
+`ranked_public_contacts`:
 
-1. **Public-only filter:** peers с `discovery_mode != Public` (declared в `CapabilitiesPayload.discovery_mode` при handshake) исключаются из ответа. Это закрывает enumeration-leak для opt-in privacy узлов: `ContactsOnly` / `IntroductionOnly` peer не появится в ответах других узлов на FIND_NODE — и поэтому невидим для DHT-walk сканеров.
+1. **Фильтр «только Public».** Пиры, у которых `discovery_mode` не равен `Public` (объявлен в `CapabilitiesPayload.discovery_mode` при рукопожатии), выбрасываются из ответа. Именно это закрывает утечку перечисления для узлов с приватностью по выбору: пир `ContactsOnly` или `IntroductionOnly` не появится в чужих ответах на FIND_NODE, так что сканеры, обходящие DHT, его попросту не увидят.
 
-2. **Half-cap:** возвращается не более `min(K_requested, K_local, ceil(N_public / 2))` контактов, где `N_public` — количество Public peers в нашем routing table. Заставляет атакующего, перечисляющего Public-сеть, сделать **минимум 2× больше FIND_NODE-запросов** для покрытия полной carto. Smallest case: с 1 Public peer возвращается 1 (Kademlia connectivity preserved).
+2. **Ограничение вполовину (half-cap).** Ответ возвращает не более `min(K_requested, K_local, ceil(N_public / 2))` контактов, где `N_public` — сколько Public-пиров лежит в нашей таблице маршрутизации. Ограничение половиной означает, что атакующему, картирующему Public-сеть, придётся послать **минимум вдвое больше запросов FIND_NODE**, чтобы покрыть её целиком. Крайний случай тоже работает: с одним Public-пиром возвращается один, так что связность Kademlia сохраняется.
 
 Аналогичная фильтрация применяется в:
 
 - `handle_find_value::FindValueResponse::Nodes` (closest-nodes fallback)
 - `handle_recursive_query::FIND_NODE` (через `find_closest_public_node_ids` helper)
 
-**НЕ фильтруется** internal routing (`find_closest_nodes` для next-hop selection, NeighborOffer) — там фильтр сломал бы маршрутизацию через privacy-opt-in узлы как relay.
+**Не фильтруется** внутренняя маршрутизация — `find_closest_nodes` для выбора следующего прыжка и NeighborOffer. Фильтр там сломал бы маршрутизацию через узлы с приватностью по выбору, работающие как ретрансляторы, а это ровно то, чего мы не хотим.
 
-**Threat model:** scanner-resistance — passive enumeration по DHT FIND_NODE. Ранее сканер одним FIND_NODE получал K transports → ~10 RTT enumeration всех Public-узлов в /20 keyspace → полная карта адресов за минуты. Half-cap + Public-only делает enumeration ≥ 2× медленнее и невозможным для opt-in privacy узлов вообще.
+**Модель угроз.** Цель — устойчивость к сканерам при пассивном перечислении через DHT FIND_NODE. До этой меры сканер одним FIND_NODE вытягивал K транспортов, обходил всё Public-пространство ключей примерно за 10 обходов для /20 и за минуты получал полную карту адресов. Ограничение вполовину вместе с фильтром «только Public» делает такой обход для Public-узлов минимум вдвое медленнее, а для узлов с приватностью по выбору — невозможным.
 
-**Limitation:** Public-узлы (default config) по-прежнему перечисляемы (хотя порциями ≤50%). Для полного decoupling routing graph от address graph — см. Decoupled transport resolution / hidden services (planned).
+**Ограничение.** Public-узлы (конфигурация по умолчанию) всё ещё перечислимы, просто порциями не больше половины таблицы за раз. Полное разделение графа маршрутизации и графа адресов — задача на будущее: см. Decoupled transport resolution / hidden services (в планах).
 
 ### 5.3 StorePayload
 
@@ -371,7 +403,7 @@ fallback both apply two levels of filtering before returning contacts
 
 ### 5.4 AnnounceAttachmentPayload
 
-Объявление leaf → gateway, публикуется в DHT. Точный формат — [`proto/discovery.rs::AnnounceAttachmentPayload`](../../crates/veil-proto/src/discovery.rs):
+Когда лист привязывается к шлюзу (gateway), он публикует эту запись в DHT, чтобы другие могли узнать, какие Core-узлы его сейчас обслуживают. Точный формат лежит в [`proto/discovery.rs::AnnounceAttachmentPayload`](../../crates/veil-proto/src/discovery.rs):
 
 ```text
 [0..32]   node_id          [u8; 32]
@@ -393,15 +425,15 @@ fallback both apply two levels of filtering before returning contacts
 
 ### 5.4.1 V2 FIND_NODE + ResolveTransport
 
-**Wire-protocol.** `DiscoveryMsg` слоты 10-14:
+**Протокол на проводе.** `DiscoveryMsg`, слоты 10-14:
 
 | msg_type | Имя | Body |
 |---|---|---|
 | 10 | `FindNodeV2` | `FindNodeV2Payload` (32 байт target + 1 байт k) |
 | 11 | `FindNodeV2Response` | `FindNodeV2Response` (count u8 + node_ids `[u8; 32] × count`) |
 | 12 | `ResolveTransport` | `ResolveTransportPayload` (52 байт: 32 node_id + 4 time_bucket BE + 16 pow_nonce) |
-| 13 | `ResolveTransportResponse` | `ResolveTransportResponse` — carries `Option<SignedTransportAnnouncement>` |
-| 14 | `AnnounceTransport` | `SignedTransportAnnouncement` — fire-and-forget post-handshake gossip |
+| 13 | `ResolveTransportResponse` | `ResolveTransportResponse` — несёт `Option<SignedTransportAnnouncement>` |
+| 14 | `AnnounceTransport` | `SignedTransportAnnouncement` — рассылка «отправил и забыл» после рукопожатия |
 
 **FindNodeV2Response** (variable):
 ```text
@@ -409,7 +441,7 @@ fallback both apply two levels of filtering before returning contacts
 [1..1+count*32]      node_ids    [u8; 32] × count
 ```
 
-**Нет transport-полей** (в отличие от удалённой V1 — см. §5.1). Caller знает только node_id'ы, должен отдельно вызвать `ResolveTransport` для каждого, чей transport ему действительно нужен.
+Обратите внимание: **транспортных полей здесь нет**, в отличие от удалённой V1 (§5.1). Вызывающая сторона узнаёт только node_id; для каждого узла, до которого ей действительно надо дотянуться, она отдельно вызывает `ResolveTransport` и получает адрес.
 
 **ResolveTransportResponse** (variable):
 ```text
@@ -422,15 +454,15 @@ fallback both apply two levels of filtering before returning contacts
                                             в свой Contact, типично — handshake-complete time)
 ```
 
-`not_found` возвращается когда:
-- У resolver'a нет `Contact` для запрошенного `node_id` в routing table.
-- Контакт есть, но `discovery_mode != Public` (privacy-фильтр — non-Public peer's существование не подтверждается через этот RPC; aggregate с unknown-case намеренный — сливать "знаю, но не скажу" даёт атакующему signal).
+Резолвер отвечает `not_found` в двух случаях:
+- В его таблице маршрутизации нет `Contact` для запрошенного `node_id`.
+- Контакт есть, но его `discovery_mode` не равен `Public`. Это фильтр приватности: само существование non-Public-пира через этот RPC не подтверждается. Объединять этот случай с «никогда о нём не слышал» — намеренно: отдельный ответ «знаю, но не скажу» сам стал бы сигналом, которым воспользовался бы атакующий.
 
-**Threat-model.** Ранее любой FIND_NODE одним RTT возвращал K transports → массовый scan строит cargo IP за O(N/K) RTT (~10 RTT для 200 Public-узлов в /20 keyspace). DHT-walker теперь использует V2 по умолчанию — каждый transport требует отдельный RPC → cumulative cost O(N) RTT, **~10× медленнее**. PoW-gate + signed responses добавляют per-resolve CPU cost (~17ms BLAKE3) + cache-poisoning resistance.
+**Модель угроз.** Раньше любой FIND_NODE за один обход возвращал K транспортов, так что массовое сканирование картировало сеть за O(N/K) обходов (~10 обходов для 200 Public-узлов в пространстве ключей /20). Обходчик DHT теперь по умолчанию использует V2, где каждый транспорт стоит отдельного RPC, — суммарная стоимость O(N) обходов, сканировать примерно **в 10 раз медленнее**. PoW-затвор и подписанные ответы накручивают ещё: работа CPU на каждое разрешение (~17 мс BLAKE3) и устойчивость к отравлению кэша.
 
-**Status:** wire-types + handlers + in-memory cache + V2-flow integrated в `NetworkPeerQuerier`. **Defense активна** — outbound DHT-walks используют V2-flow по умолчанию (`FindNodeV2 → node_ids → cache lookup → ResolveTransport(id) on miss`). V1 удалён — wire слоты 0/8 → `Violation`.
+**Состояние.** Типы на проводе, обработчики, кэш в памяти и поток V2 — всё вшито в `NetworkPeerQuerier`. **Защита активна**: исходящие обходы DHT по умолчанию идут по потоку V2 (`FindNodeV2 → node_ids → поиск в кэше → ResolveTransport(id) при промахе`). V1 удалён — слоты на проводе 0/8 отвергаются как `Violation`.
 
-**PoW gate.** `ResolveTransportPayload`:
+**PoW-затвор.** `ResolveTransportPayload`:
 
 ```text
 [0..32]    node_id      [u8; 32]   — what to resolve
@@ -438,20 +470,20 @@ fallback both apply two levels of filtering before returning contacts
 [36..52]   pow_nonce    [u8; 16]   — solution
 ```
 
-The PoW input hash is
+Входной хэш для PoW:
 
 ```text
 BLAKE3( "epic475.4b/resolve_pow/v1" || requester_node_id[32] ||
          target_node_id[32] || time_bucket_be[4] || pow_nonce[16] )
 ```
 
-`requester_node_id` is the OVL1-session-authenticated `peer_id` on the responder (not on the wire — taken from session context).  Server accepts iff `leading_zero_bits(hash) ≥ RESOLVE_POW_DIFFICULTY` AND `|time_bucket − now_bucket| ≤ RESOLVE_POW_TIME_WINDOW_BUCKETS`.  Defaults: `RESOLVE_POW_DIFFICULTY = 16` (median ~7 ms client mining on a fast x86 core, ~14 ms on low-end ARM); `RESOLVE_POW_BUCKET_SECONDS = 60`; `RESOLVE_POW_TIME_WINDOW_BUCKETS = 1` (≈ 120 s replay window).
+`requester_node_id` на проводе не передаётся. Отвечающий берёт его из контекста сессии — это `peer_id`, который сессия OVL1 уже аутентифицировала. Сервер принимает доказательство, только если выполнены оба условия: `leading_zero_bits(hash) ≥ RESOLVE_POW_DIFFICULTY` и `|time_bucket − now_bucket| ≤ RESOLVE_POW_TIME_WINDOW_BUCKETS`. Значения по умолчанию: `RESOLVE_POW_DIFFICULTY = 16` (медиана ~7 мс на добычу на быстром ядре x86, ~14 мс на слабом ARM), `RESOLVE_POW_BUCKET_SECONDS = 60` и `RESOLVE_POW_TIME_WINDOW_BUCKETS = 1` (окно повтора около 120 с).
 
-PoW failure (invalid solution OR stale bucket OR wrong target / wrong requester binding) → silent `not_found` response, NOT a `Violation` — verification cost is one BLAKE3 hash (~1 µs) so per-peer dht_quota already bounds CPU spend; raising failures to violations would create a clock-drift false-positive eviction path.  Legacy senders without the PoW fields (32-byte payload) fail decode → `Violation` from the dispatcher.
+Неудачный PoW — плохое решение, устаревший интервал или неверная привязка цели/запросившего — получает тихий `not_found`, а **не** `Violation`. Логика такая: проверка доказательства — это один хэш BLAKE3 (~1 мкс), так что лимит `dht_quota` на каждого пира и без того ограничивает расход CPU, а считать неудачи нарушениями — значит превратить обычный уход часов в путь ложноположительного выселения. А вот старые отправители, у которых полей PoW нет вовсе (полезная нагрузка в 32 байта), не проходят декодирование и *получают* `Violation` от диспетчера.
 
-Cumulative attacker cost goes from `O(N) RTT` to `O(N) × ~7 ms CPU` per probed `node_id` — for a `/20` keyspace (~200 Public peers) that's ~1.5 s of single-core mining for one full enumeration sweep, and the cost scales linearly with target set size while honest clients pay it only once per cache miss.
+Итог: стоимость для атакующего растёт с `O(N) обходов` до `O(N) × ~7 мс` CPU на каждый прощупанный `node_id`. Для пространства ключей `/20` (~200 Public-пиров) это около 1,5 с добычи на одном ядре за один полный проход перечисления, и она линейно растёт с размером набора целей — тогда как честный клиент платит её лишь однажды, при промахе кэша.
 
-**Signed responses.** `ResolveTransportResponse.transport: Option<String>` carries `Option<SignedTransportAnnouncement>`:
+**Подписанные ответы.** `ResolveTransportResponse.transport: Option<String>` несёт `Option<SignedTransportAnnouncement>`:
 
 ```text
 [0..32]    node_id          [u8; 32]
@@ -462,47 +494,47 @@ Cumulative attacker cost goes from `O(N) RTT` to `O(N) × ~7 ms CPU` per probed 
 [138..N]   transport        UTF-8 (≤ MAX_TRANSPORT_URI_LEN = 256)
 ```
 
-The signing input is
+Вход для подписи:
 
 ```text
 BLAKE3( "epic475.4c/transport_announce/v1" || node_id ||
          expiry_unix_be || transport_len_be || transport_utf8 )
 ```
 
-Each node mints its own bundle at startup (validity = 30 days; `ANNOUNCEMENT_VALIDITY_SECS`) and **gossips it via `DiscoveryMsg::AnnounceTransport` (slot 14) on every handshake-complete** (one fire-and-forget frame per session, both inbound and outbound paths).  Receivers verify and store under `transport_announcements: HashMap<node_id, …>` on `KademliaService`; `handle_resolve_transport` returns the cached bundle verbatim, so the resolver only relays what the target itself signed.  The maintenance tick prunes orphan announcements (peers no longer in the routing table).
+Каждый узел при старте выпускает свой набор (действителен 30 дней, по `ANNOUNCEMENT_VALIDITY_SECS`) и **рассылает его через `DiscoveryMsg::AnnounceTransport` (слот 14) при каждом завершённом рукопожатии** — один кадр «отправил и забыл» на сессию, и на входящем, и на исходящем пути. Получатели проверяют его и сохраняют в `transport_announcements: HashMap<node_id, …>` на `KademliaService`. Затем `handle_resolve_transport` отдаёт кэшированный набор дословно, так что резолвер передаёт лишь то, что подписала сама цель. Тик обслуживания вычищает осиротевшие объявления — пиров, выпавших из таблицы маршрутизации.
 
-**Walker verification (`NetworkPeerQuerier`).** Before inserting any resolved transport into `TransportCache`, the walker checks:
-1. `BLAKE3(identity_pubkey) == announcement.node_id` — pubkey ↔ identity binding.
-2. Ed25519 signature is valid over the canonical input.
-3. `expiry_unix > now()`.
-4. `announcement.node_id == requested node_id` (defence-in-depth: even if the resolver attached a valid announcement for the wrong peer, the walker discards it).
+**Проверка обходчиком (`NetworkPeerQuerier`).** Прежде чем положить любой разрешённый транспорт в `TransportCache`, обходчик проверяет четыре вещи:
+1. `BLAKE3(identity_pubkey) == announcement.node_id` — публичный ключ привязан к личности.
+2. Подпись Ed25519 верна для канонического входа.
+3. `expiry_unix > now()` — набор не просрочен.
+4. `announcement.node_id == requested node_id` — защита в глубину: даже если резолвер приложил действительное объявление не для того пира, обходчик его выбрасывает.
 
-A malicious resolver can still **deny** existence (`not_found`) but cannot **redirect** traffic to attacker-controlled infrastructure: that would require forging an Ed25519 signature whose pubkey hashes to the target's `node_id`.
+Так что вредоносный резолвер может **отрицать** существование пира (`not_found`), но не может **перенаправить** трафик на подконтрольную атакующему инфраструктуру. Перенаправление потребовало бы подделать подпись Ed25519, чей публичный ключ хэшируется в `node_id` цели, — а в этом и весь смысл привязки.
 
-The dispatcher additionally enforces `announcement.node_id == session_peer_id` on `AnnounceTransport` — peers can only announce *their own* node_id, blocking gossip-flood pollution attacks.
+Диспетчер добавляет ещё одну проверку: на `AnnounceTransport` он требует `announcement.node_id == session_peer_id`. Пир может объявлять только *свой* node_id, что блокирует атаки засорения через лавину рассылок.
 
-**On-disk persistence.** The `transport_announcements: HashMap<node_id, SignedTransportAnnouncement>` map is periodically flushed to a JSON snapshot (default every 120 s + a final flush on clean shutdown).  On restart the snapshot is re-loaded; each entry's signature, pubkey↔node_id binding, and non-expiry are re-verified — failures are silently dropped.
+**Хранение на диске.** Карта `transport_announcements: HashMap<node_id, SignedTransportAnnouncement>` по таймеру сбрасывается в JSON-снимок (по умолчанию каждые 120 с плюс финальный сброс при чистом завершении). При перезапуске снимок загружается заново, и каждая запись перепроверяется — подпись, привязка публичного ключа к node_id и непросроченность, — а любая неудача молча отбрасывается.
 
-Why JSON instead of the in-memory binary layout: each entry is small (~250 B JSON), the file is operator-grep-able, and the tamper-resistance comes from the signatures (verified on load), not from the on-disk format.  An attacker who edits the file can downgrade availability (drop entries → walker has to re-handshake) but **cannot** inject forged transports — they'd need an Ed25519 keypair whose pubkey hashes to a target's node_id.
+Почему JSON, а не двоичная раскладка из памяти? Каждая запись крошечная (~250 Б в JSON), файл остаётся доступным оператору для grep, а устойчивость к подделке даёт не формат файла, а подписи (перепроверяемые при загрузке). Тот, кто отредактирует файл, способен лишь подпортить доступность — выкинуть записи, после чего обходчику придётся заново пожать руки, — но **не** способен подсунуть поддельные транспорты, ведь для этого нужна пара ключей Ed25519, чей публичный ключ хэшируется в node_id цели.
 
-Config knobs (`[dht]`):
-- `transport_announcements_persist_path: Option<String>` — `None` disables.
-- `transport_announcements_persist_interval_secs: u64` — default 120.
+Ручки конфигурации (`[dht]`):
+- `transport_announcements_persist_path: Option<String>` — `None` отключает хранение.
+- `transport_announcements_persist_interval_secs: u64` — по умолчанию 120.
 
-The `TransportCache` itself is intentionally **not** persisted — it's a derivation of verified announcements, and the next walk repopulates it on demand.
+Сам `TransportCache` намеренно **не** сохраняется. Это всего лишь производное от проверенных объявлений, и следующий обход наполняет его заново по требованию.
 
-**Remaining caveats:**
-- Каждое `ResolveTransport` дополнительно потребляет токен `dht_quota` (existing per-peer rate-limit) поверх PoW.
-- Key rotation invalidates all outstanding announcements signed by the old key — peers re-gossip on next handshake (no graceful migration window yet).
+**Что остаётся помнить:**
+- Каждое `ResolveTransport` вдобавок тратит токен `dht_quota` (существующий лимит частоты на пира) поверх PoW.
+- Смена ключа аннулирует все ещё действующие объявления, подписанные старым. Пиры рассылают их заново при следующем рукопожатии — плавного окна миграции пока нет.
 
 ### 5.5 Алгоритм Kademlia
 
-- **K** = 20 (k-bucket size — классическая константа Kademlia)
-- **α** = 3 (параллельные запросы за раунд)
-- **max_rounds** = 20
-- XOR-метрика расстояния: `dist(a, b) = a XOR b`
-- Lookup: итеративный, α параллельных FindNode в раунд, пока не улучшается результат или не исчерпаны раунды
-- Anti-eclipse: максимум `K/4 = 5` контактов из одного /24 IPv4 (или /48 IPv6) в bucket'е
+- **K** = 20 — размер k-бакета, классическая константа Kademlia.
+- **α** = 3 — сколько запросов идёт параллельно в каждом раунде.
+- **max_rounds** = 20.
+- Метрика расстояния — XOR: `dist(a, b) = a XOR b`.
+- Поиск итеративный: α параллельных запросов FindNode в раунд, и так пока результат не перестанет улучшаться или не кончатся раунды.
+- Защита от затмения (anti-eclipse): не более `K/4 = 5` контактов из одной подсети /24 IPv4 (или /48 IPv6) на бакет, чтобы одна сеть не забила бакет целиком.
 
 ### 5.6 DeletePayload (multi-algo)
 
@@ -515,10 +547,10 @@ The `TransportCache` itself is intentionally **not** persisted — it's a deriva
 [+slen]           signature   bytes (зависит от algo: 64 Ed25519, ~666 Falcon-512; гибриды несут оба)
 ```
 
-Валидация:
-1. `algo ∈ {0, 1, 2, 3, 4}` (любое значение `SignatureAlgorithm::from_wire_byte`, включая гибриды — U1, чтобы узлы с гибридной идентичностью могли удалять свои записи, а не только владельцы Ed25519/Falcon-512);
-2. `crypto::verify_message(algo, public_key, key_bytes, signature) = Ok`;
-3. `BLAKE3(public_key) == key` — удалить может только владелец self-owned ключа.
+Проверка идёт в три шага:
+1. `algo ∈ {0, 1, 2, 3, 4}` — любое значение, которое принимает `SignatureAlgorithm::from_wire_byte`, включая гибриды. Приём гибридов (изменение `U1`) позволяет узлам с гибридной личностью удалять свои записи, а не только владельцам Ed25519/Falcon-512.
+2. `crypto::verify_message(algo, public_key, key_bytes, signature) = Ok` — подпись сходится.
+3. `BLAKE3(public_key) == key` — ключ принадлежит сам себе, так что удалить его может только владелец.
 
 ---
 
@@ -558,7 +590,7 @@ The `TransportCache` itself is intentionally **not** persisted — it's a deriva
 [34..]   seqs[]             u64 LE × count
 ```
 
-Подтверждение конкретных (не обязательно последовательных) seq-номеров. Максимальный batch: `MAX_MAILBOX_ACK_BATCH = 256`.
+Подтверждает конкретные seq-номера, не обязательно идущие подряд. В одной пачке их не больше `MAX_MAILBOX_ACK_BATCH = 256`.
 
 ### 6.4 DeliveryStatusPayload
 
@@ -569,11 +601,11 @@ The `TransportCache` itself is intentionally **not** persisted — it's a deriva
 
 ---
 
-## 7. E2E-шифрование
+## 7. Сквозное (E2E) шифрование
 
-Когда `payload[0] == 0xE2` в `DeliveryEnvelope` — payload зашифрован E2E.
+Сквозное (end-to-end, E2E) шифрование запечатывает сообщение так, что вскрыть его может только конечный получатель — ретрансляторы посередине несут запечатанные байты. Конверт `DeliveryEnvelope`, у которого `payload[0] == 0xE2`, зашифрован сквозным шифрованием; этот первый байт и есть метка.
 
-### 7.1 Wire-формат E2eEnvelope (payload[1..])
+### 7.1 Формат E2eEnvelope на проводе (payload[1..])
 
 ```text
 [0]           version         u8 = 1
@@ -603,9 +635,9 @@ The `TransportCache` itself is intentionally **not** persisted — it's a deriva
 
 ### 7.3 Управление ключами
 
-- Encapsulation key (публичный, 1184 байта) публикуется в DHT при регистрации IPC-эндпоинта
-- Decapsulation key (приватный, seed 64 байта) хранится в памяти узла
-- TTL кэша ключей: `ipc.e2e_key_ttl_secs` (по умолчанию 3600 сек)
+- Ключ инкапсуляции (публичный ключ ML-KEM, 1184 байта) публикуется в DHT при регистрации IPC-эндпоинта, чтобы отправители могли его найти.
+- Ключ декапсуляции (парный приватный ключ, 64-байтный seed) никогда не покидает память узла.
+- Разрешённые ключи кэшируются на `ipc.e2e_key_ttl_secs` (по умолчанию 3600 сек).
 
 ---
 
@@ -683,7 +715,7 @@ BLAKE3(challenge || solution).leading_zero_bits() >= difficulty
 
 #### 8.4.1 PoW-gated discovery
 
-Когда у узла-цели сконфигурирован `abuse.pow_min_difficulty > 0`, **`RouteResponse` (с `transports`) откладывается до решения PoW**:
+Если у узла-цели задан `abuse.pow_min_difficulty > 0`, он **придерживает `RouteResponse` (тот, что несёт `transports`), пока запросивший не решит PoW**:
 
 ```
 Requester ── RouteRequest{target=victim, requester=us} ──► Victim
@@ -696,19 +728,19 @@ Requester ◄── RouteResponse{transports, mlkem_pk, sig} ─── Victim   
 Requester ◄── PowAccept{transport} ───────────────────────── Victim   (legacy backward-compat, signals "session bootstrap ОК")
 ```
 
-**Без PoW (`pow_min_difficulty = 0`):** `RouteResponse` отправляется сразу же при получении `RouteRequest` (legacy поведение).
+**Без PoW (`pow_min_difficulty = 0`):** `RouteResponse` уходит сразу же, как только приходит `RouteRequest`, — прежнее поведение.
 
-**Зачем:** без PoW-гейта любой узел мог бесплатно отправить `RouteRequest{target=X}` для произвольного `X` и получить обратно `RouteResponse{transports[X]}` — раскрытие IP/порта по `node_id`. PoW-гейт делает probe-by-id платным.
+**Зачем это нужно.** Без затвора любой узел мог бесплатно выстрелить `RouteRequest{target=X}` для любого `X` на свой вкус и получить обратно `RouteResponse{transports[X]}` — то есть выдать IP и порт X, имея на руках лишь его `node_id`. PoW-затвор делает прощупывание по id настоящей работой.
 
 #### 8.4.2 DiscoveryMode
 
-Дополнительный конфиг `[routing] discovery_mode` (default: `public`):
+Дополнительный параметр конфигурации `[routing] discovery_mode` (по умолчанию `public`):
 
-| Mode | Поведение |
+| Режим | Поведение |
 |---|---|
-| `public` | Текущее. Если `pow_min_difficulty > 0` — gated через PoW; иначе — immediate `RouteResponse`. |
-| `contacts_only` | `RouteRequest` от requester'а вне `peer_pubkeys` (не handshake'ались) **молча дропаются** — ни `PowChallenge`, ни `RouteResponse`. Существование узла остаётся скрыто. |
-| `introduction_only` | `RouteResponse.transports` всегда пустой. Requester должен подключаться через один из `relay_ids` (Tor-style introduction approximation без rendezvous). |
+| `public` | По умолчанию. При `pow_min_difficulty > 0` ответ закрыт затвором PoW; иначе `RouteResponse` уходит сразу. |
+| `contacts_only` | `RouteRequest` от запросившего вне `peer_pubkeys` (с кем мы не пожимали руки) **молча отбрасывается** — ни `PowChallenge`, ни `RouteResponse`. Существование узла остаётся скрыто. |
+| `introduction_only` | `RouteResponse.transports` всегда пуст. Запросившему приходится подключаться через один из `relay_ids` — грубое приближение к интродукции в стиле Tor, без рандеву. |
 
 ---
 
@@ -716,9 +748,9 @@ Requester ◄── PowAccept{transport} ─────────────
 
 ### 9.1 Протокол соединения
 
-Локальное приложение подключается к IPC-серверу через `ipc.socket_uri` (Unix-сокет `unix:///path` или TCP-loopback `tcp://127.0.0.1:port`).
+Так локальное приложение общается с узлом, рядом с которым работает, — это IPC, межпроцессное взаимодействие на одной машине. Приложение подключается к IPC-серверу узла по `ipc.socket_uri`: либо Unix-сокет (`unix:///path`), либо адрес TCP-петли (`tcp://127.0.0.1:port`).
 
-Каждое сообщение: `u16 BE msg_type` + `u32 BE body_len` + тело.
+Каждое сообщение на этом сокете кадрируется просто: `u16 BE msg_type`, затем `u32 BE body_len`, затем тело.
 
 Версия протокола: `IPC_PROTOCOL_VERSION = 1`.
 
@@ -756,7 +788,7 @@ App                              Node
 | StreamOpenErr | 12 | Node→App | Ошибка открытия потока |
 | StreamData | 13 | Bidirectional | Данные потока |
 | StreamClose | 14 | Bidirectional | Закрыть поток |
-| StreamWindow | 15 | Bidirectional | Увеличить send-window |
+| StreamWindow | 15 | Bidirectional | Увеличить окно отправки |
 | StreamRtData | 16 | Bidirectional | Realtime-данные потока |
 | AppSendFailed | 17 | Node→App | Доставка не удалась (require_ack) |
 | AppRtSend | 18 | App→Node | Outbound realtime-фрейм |
@@ -774,14 +806,16 @@ App                              Node
 [M..M+4] endpoint_id    u32 BE (1..65535)
 ```
 
-Ответ AppBindOk содержит `app_id [u8; 32]` — см. §1.2 для точной формулы (length-prefixed BLAKE3 `derive_key`).  В ephemeral-режиме (дефолт) используется `ephemeral_app_id` с mix'инг'ом `client_token`; в `bind_named` — стабильная форма `app_id`.
+Ответ AppBindOk несёт `app_id [u8; 32]` — точная формула в §1.2 (BLAKE3 `derive_key` с префиксами длины). В эфемерном режиме (по умолчанию) узел возвращает `ephemeral_app_id`, подмешивая `client_token`; при `bind_named` — вместо этого стабильный `app_id`.
 
-### 9.5 Управление потоками (Stream Flow Control)
+### 9.5 Управление потоком (Stream Flow Control)
 
-- **Send window**: отправитель отслеживает оставшееся окно; блокируется при `window = 0`
-- **StreamWindow**: получатель отправляет для увеличения окна отправителя
-- **Initial window**: `STREAM_INITIAL_WINDOW` (по умолчанию 256 КиБ)
-- **Максимальное окно**: `MAX_STREAM_SEND_WINDOW = 16 МБ`
+Управление потоком не даёт быстрому отправителю захлестнуть медленного получателя. Работает по схеме кредитов (окна):
+
+- **Окно отправки** — отправитель следит, сколько ещё может отправить, и блокируется, как только окно дойдёт до `0`.
+- **StreamWindow** — получатель шлёт это сообщение, чтобы выдать ещё кредита и тем расширить окно отправителя.
+- **Начальное окно** — `STREAM_INITIAL_WINDOW` (по умолчанию 256 КиБ).
+- **Максимальное окно** — `MAX_STREAM_SEND_WINDOW = 16 МБ`.
 
 ---
 
@@ -825,21 +859,21 @@ App                              Node
 | Leaf | 0x01 | Нет | Нет | Нет | Нет | Мобильные/IoT |
 | Core | 0x08 | Да (K=20) | Да | Да | Да | Серверы, VPS |
 
-Legacy-коды 0x02 (Relay), 0x04 (Gateway), 0x10 (CoreRouter) удалены;
-от старых пиров такие значения отбрасываются.
+Устаревшие коды 0x02 (Relay), 0x04 (Gateway), 0x10 (CoreRouter) удалены; если старый
+пир всё ещё пришлёт такой, он отбрасывается.
 
-**Leaf-узел:**
-- Работает через Core-ноду (attachment lease)
-- Mailbox хранится на Core-нодах
-- Не принимает входящих соединений от произвольных узлов
-- Минимальные требования к ресурсам
+**Leaf-узел** — лёгкая роль для телефонов, IoT и всего, что сидит за NAT:
+- Дотягивается до сети через Core-узел, по аренде привязки (attachment lease).
+- Держит свой mailbox на Core-узлах, а не локально.
+- Не принимает входящих соединений от произвольных узлов.
+- Требует минимум ресурсов.
 
-**Core-узел:**
-- Полноценный участник DHT (K=20), relay, forwarding
-- Gateway: обслуживает attachment-записи leaf-узлов (отключается через `[gateway] enabled = false`)
-- Хранит mailbox для офлайн-получателей
-- Обслуживает FindNode/FindValue/Store/Delete
-- Рекомендуемая сложность PoW ≥ 24 (дефолт `16`; `MAX_POW_DIFFICULTY = 24` — жёсткий потолок), высокий аптайм (24/7)
+**Core-узел** — всегда включённая роль для серверов и VPS:
+- Полноценный участник DHT (K=20); ретранслирует и пересылает трафик.
+- Работает шлюзом, обслуживая записи привязок leaf-узлов (отключается через `[gateway] enabled = false`).
+- Держит mailbox для получателей, которые сейчас офлайн.
+- Обслуживает FindNode/FindValue/Store/Delete.
+- Должен держать сложность PoW ≥ 24 (по умолчанию `16`, а `MAX_POW_DIFFICULTY = 24` — жёсткий потолок) и работать круглосуточно (24/7).
 
 ---
 
@@ -854,8 +888,8 @@ Legacy-коды 0x02 (Relay), 0x04 (Gateway), 0x10 (CoreRouter) удалены;
 | Ed25519+Falcon512 (гибрид) | 3 | 929 байт | composite | Ed25519 ‖ Falcon-512 |
 | Ed25519+Falcon1024 (гибрид) | 4 | 1825 байт | composite | Ed25519 ‖ Falcon-1024 |
 
-`algo`-байт используется в `IdentityPayload`, `DeletePayload`, mesh-beacon и PEX-подписи.
-Session-handshake (`KeyAgreementPayload`) применяет иную конвенцию: 1 = Ed25519, 2 = Falcon512.
+Байт `algo` появляется в `IdentityPayload`, `DeletePayload`, mesh-беаконе и PEX-подписях.
+Одно исключение: сессионное рукопожатие (`KeyAgreementPayload`) использует иное соглашение — 1 = Ed25519, 2 = Falcon512.
 
 ### 12.2 Session KDF
 
@@ -872,8 +906,8 @@ info = "ovl1-session-v1"
                    else                               → (key_b, key_a)
 ```
 
-Подробности в §3.5. Отдельного `mac_key` нет — целостность покрыта AEAD-tag
-(ChaCha20-Poly1305) и handshake-MAC в `SessionConfirm`
+Полностью — в §3.5. Отдельного `mac_key` нет: целостность даёт AEAD-тег
+(ChaCha20-Poly1305) на каждом кадре плюс handshake-MAC внутри `SessionConfirm`
 (`BLAKE3("ovl1-session-confirm-v1" ‖ shared_secret ‖ small_id ‖ large_id)`).
 
 ### 12.3 Frame Encryption
@@ -934,7 +968,7 @@ content_id = BLAKE3(payload)              // 32 байта
 
 ## 13. Бюджеты и лимиты
 
-Все константы определены в `crates/veil-proto/src/budget.rs`.
+Это жёсткие потолки, которые держат память и CPU узла в рамках под нагрузкой. Все они определены в `crates/veil-proto/src/budget.rs`.
 
 | Константа | Значение | Описание |
 |-----------|---------|----------|
@@ -952,7 +986,7 @@ content_id = BLAKE3(payload)              // 32 байта
 | `MAX_VIOLATION_TRACKER_SIZE` | 8192 | Записей в ViolationTracker |
 | `dht.max_store_entries` (config) | 25 000 | KV-пар в DHT-хранилище (настраивается в `[dht]`, не константа; операторы с большим объёмом RAM поднимают явно) |
 | `MAX_DHT_VALUE_BYTES` | 16384 (16 КиБ) | Байт в одном DHT-значении |
-| `MAX_PENDING_ACK_ENTRIES` | 1024 | In-flight require_ack сообщений |
+| `MAX_PENDING_ACK_ENTRIES` | 1024 | Сообщений require_ack в полёте |
 | `MAX_DELIVERY_ATTEMPTS` | 3 | Попыток доставки с require_ack |
 | `DELIVERY_ACK_TIMEOUT_MS` | 5000 | Таймаут одной попытки (мс) |
 | `MAX_TRANSPORT_ADDRS` | 32 | URI в RouteResponse |
@@ -962,12 +996,12 @@ content_id = BLAKE3(payload)              // 32 байта
 | `MAX_TRANSPORT_STR_LEN` | 255 | Байт в транспортном URI |
 | `MAX_NODES_PER_RESPONSE` | 32 | Узлов в FindNodeResponse |
 | `MAX_IPC_ENDPOINTS_PER_CLIENT` | 64 | Эндпоинтов на один IPC-клиент |
-| `MAX_FORWARD_SEEN_SET_SIZE` | 100000 | Записей в relay dedup-кэше |
-| `FORWARD_SEEN_SET_TTL_SECS` | 60 | TTL записи в dedup-кэше |
-| `MAX_BEACON_DEDUP_ENTRIES` | 4096 | Записей в beacon dedup-карте |
+| `MAX_FORWARD_SEEN_SET_SIZE` | 100000 | Записей в кэше дедупликации ретрансляции |
+| `FORWARD_SEEN_SET_TTL_SECS` | 60 | TTL записи в кэше дедупликации |
+| `MAX_BEACON_DEDUP_ENTRIES` | 4096 | Записей в карте дедупликации беаконов |
 | `MAX_TOTAL_STREAMS` | 65536 | Всего открытых потоков |
 | `MAX_STREAMS_PER_PEER` | 256 | Потоков на одного пира |
-| `MAX_STREAM_SEND_WINDOW` | 16 МБ | Максимальное send-окно потока |
+| `MAX_STREAM_SEND_WINDOW` | 16 МБ | Максимальное окно отправки потока |
 | `REKEY_BYTES_THRESHOLD` | 128 ГиБ | Байт до смены ключей сессии (конфиг: `[session] rekey_bytes_threshold`) |
 | `REKEY_TIME_THRESHOLD_SECS` | 2 764 800 (32 дня) | Секунд до смены ключей сессии (конфиг: `[session] rekey_time_threshold_secs`) |
 | `MAX_POW_DIFFICULTY` | 24 | Максимальная сложность PoW |

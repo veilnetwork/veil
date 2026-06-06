@@ -1,27 +1,38 @@
-# ogate: Veil-Network TUN Bridge
+# ogate: an IP bridge over Veil
 
-`ogate` is a user-space app that turns the veil network into a virtual
-private LAN. Each host opens a TUN device with a configured IPv4/IPv6
-address; ogate forwards IP packets between that TUN and veil peers
-based on a per-network peer table.
+`ogate` lets a group of machines talk to each other over Veil as if they
+shared an ordinary office network — a **virtual LAN** (Local Area
+Network). Each machine gets a private IP address, and from then on you
+can `ping` it, SSH into it, or run any normal IP app, even though the
+machines are scattered across the internet.
 
-Two access modes:
+It works through a **TUN device**: a virtual network card the operating
+system hands to a program instead of to real hardware. Anything the
+machine sends to that card, `ogate` picks up and forwards to the right
+Veil peer; anything that arrives from a peer, `ogate` writes back to the
+card. Each host opens one TUN device with a configured IPv4/IPv6
+address, and `ogate` routes IP packets between it and the other peers
+using a peer table you supply.
 
-* **`open`** — any peer that knows the (network, app) pair can send
+There are two ways to decide who is allowed in:
+
+* **`open`** — any peer that knows the `(network, app)` pair can send
   packets in.
-* **`authorized`** — only peers whose `node_id` is in the per-network
-  `peers[]` allowlist are accepted, AND their packet's source IP must
-  match the peer's declared virtual IP (anti-spoof).
+* **`authorized`** — only peers whose `node_id` is on the network's
+  `peers[]` allowlist get through. On top of that, a packet's source IP
+  must match the virtual IP that peer is supposed to use. This stops a
+  peer from impersonating someone else's address (anti-spoofing).
 
-`ogate` is an *application* layered on top of the veil daemon's IPC
-(it is NOT part of the daemon itself). One veil daemon can serve
-multiple `ogate` instances simultaneously — different `(network, app)`
-pairs give different IPC bindings.
+`ogate` is an ordinary *application* that sits on top of the Veil daemon
+and talks to it — it is **not** part of the daemon. One daemon can serve
+several `ogate` instances at once: each `(network, app)` pair gets its
+own private channel to the daemon.
 
-## Layering vs P-Net
+## How it layers with P-Net
 
-`ogate`'s access mode is independent of the veil's [P-Net](p-net.md)
-membership mode:
+`ogate`'s access mode is a separate decision from how you've set up
+[P-Net](p-net.md) (Veil's network-level membership). The two combine
+like this:
 
 | Veil mode | ogate mode | Effect |
 |---|---|---|
@@ -30,8 +41,7 @@ membership mode:
 | private (P-Net) | open | any P-Net member joins the LAN |
 | private (P-Net) | authorized | two-level allowlist (P-Net + ogate) |
 
-Use `authorized` for any LAN where untrusted peers might exist on the
-veil.
+If untrusted peers might be on the Veil network, use `authorized`.
 
 ## Platforms
 
@@ -42,8 +52,9 @@ veil.
 | Windows | `tun` crate (WinTun) | crate handles ipv4; ipv6 via `netsh` |
 | FreeBSD | raw `/dev/tunN` + `TUNSIFHEAD` ioctl | `ifconfig inet ... up` |
 
-FreeBSD requires `iface_name = "tunN"` (kernel-assigned). Rename later
-with `ifconfig tunN name myiface` if you want a friendlier label.
+On FreeBSD `iface_name` must start with `tun` — the kernel assigns the
+number. Want a friendlier label? Rename it after startup with
+`ifconfig tunN name myiface`.
 
 ## Configuration
 
@@ -74,26 +85,34 @@ addr_v4 = "10.99.0.3"
 name    = "host-c"
 ```
 
-Required: at least one of `local_addr_v4` or `local_addr_v6`, plus a
-matching peers list.
+You need at least one of `local_addr_v4` or `local_addr_v6`, plus a
+peers list to match.
 
-### How subnets / IPs are assigned
+### How subnets and IPs get assigned
 
-Statically, via this config file. The operator picks the subnet and
-each peer's virtual IP. **All peers in a network must share the same
-subnet** and **must mirror each other's IP assignments** — host A's
-`local_addr_v4` is host B's `peers[A].addr_v4` and vice versa. Mismatches
-in authorized mode are dropped as spoofed source IP.
+You assign them by hand, in this config file. (A **subnet** is just the
+block of addresses your virtual LAN uses — for example `10.99.0.0/24`.)
+You pick the subnet, then pick one virtual IP for each peer. Two rules
+keep everyone in sync:
 
-For dynamic / deterministic assignment (e.g. derive IP from `node_id`),
-the design notes in [`../../crates/ogate/README.md`](../../crates/ogate/README.md)
-list alternatives but no automated registry is shipped today.
+* **Every peer in a network shares the same subnet.**
+* **The peer tables mirror each other.** Host A's `local_addr_v4` is
+  host B's `peers[A].addr_v4`, and the other way around.
 
-## App-id derivation
+In `authorized` mode, a packet whose source IP doesn't match the table
+is dropped as a spoofed address.
 
-Each ogate binding is `app_id = BLAKE3(node_id || "ogate.<network>" || <app>)`.
-Both peers can pre-compute each other's app_ids locally — no peer-list
-harvest is needed.
+Want addresses handed out automatically — say, derived from each
+`node_id` — instead of by hand? The design notes in
+[`../../crates/ogate/README.md`](../../crates/ogate/README.md) sketch
+some options, but there's no automated registry today.
+
+## How the app_id is derived
+
+Every ogate channel has an `app_id` that identifies it. It's computed as
+`app_id = BLAKE3(node_id || "ogate.<network>" || <app>)`. Because it's
+pure math, each peer can work out the other's `app_id` on its own — no
+need to fetch a peer list from anywhere.
 
 ```bash
 $ ogate app-id --network homenet --node-id $(cat host-a.nodeid)
@@ -129,18 +148,25 @@ addr_v4 = "10.99.0.2"
 name    = "host-b"
 ```
 
-### 3. Mirror on host B
+### 3. Mirror it on host B
 
-`local_addr_v4 = "10.99.0.2"` and a peer entry for host A at `10.99.0.1`.
+Set `local_addr_v4 = "10.99.0.2"`, and add a peer entry for host A at
+`10.99.0.1`.
 
-### 4. Run on both hosts (as the daemon user, with CAP_NET_ADMIN)
+### 4. Run it on both hosts (as the daemon user, with CAP_NET_ADMIN)
 
-ogate connects to the daemon's app socket over IPC. The daemon's
-peer-uid gate (U9) **drops any IPC connection whose peer uid differs
-from the daemon's uid — there is no root exception** — so ogate must run
-as the *same* user as the veil daemon (e.g. `veil`), NOT as root.
-Opening the TUN device needs `CAP_NET_ADMIN`; grant it to that user
-instead of running as root:
+Two things decide which user `ogate` runs as.
+
+First, `ogate` connects to the daemon over a local channel, and the
+daemon's peer-uid gate (U9) **drops any connection coming from a
+different user than its own — root included, no exceptions.** So `ogate`
+has to run as the *same* user as the Veil daemon (say, `veil`), not as
+root.
+
+Second, opening a TUN device normally needs root. You don't have to run
+as root, though: grant just the one capability that allows it,
+`CAP_NET_ADMIN` (the Linux permission to manage network interfaces), to
+that same user.
 
 ```bash
 # One-time: let the daemon user open TUN without root.
@@ -156,9 +182,10 @@ sudo -u veil ogate up --config /etc/ogate/ogate.toml
 ping 10.99.0.2   # from host A
 ```
 
-## Hot reload (SIGHUP)
+## Reloading without a restart (SIGHUP)
 
-Edit the config, then signal the running process:
+You can change some settings on a running bridge without stopping it.
+Edit the config, then send the process a SIGHUP signal:
 
 ```bash
 sudo kill -HUP "$(pidof ogate)"
@@ -168,18 +195,20 @@ sudo ogate reload --pid "$(pidof ogate)"
 sudo systemctl reload ogate
 ```
 
-The bridge re-reads the config and atomically swaps the routing state.
-No in-flight packets are dropped.
+The bridge re-reads the config and swaps in the new routing in one
+atomic step. Packets already in flight aren't dropped.
 
-**Reloadable**: `mode`, `peers[]`.
+**Can be reloaded:** `mode`, `peers[]`.
 
-**Not reloadable** (restart required): `network`, `app`, `endpoint_id`,
+**Needs a full restart:** `network`, `app`, `endpoint_id`,
 `iface_name`, `mtu`, `local_addr_v4`, `local_addr_v6`, `prefix_v4`,
-`prefix_v6`, `socket_path`. Attempts to change them via SIGHUP are
-rejected with a warning and the current state is kept.
+`prefix_v6`, `socket_path`. If you try to change one of these with a
+SIGHUP, the bridge warns you and keeps running as it was.
 
-Reload errors (parse / validate / unsupported field change) are logged
-and the previous state stays active — there is no broken-state window.
+If a reload fails for any reason — a typo in the file, a value that
+doesn't validate, or an attempt to change a restart-only field — it's
+logged and the old config stays live. There's never a moment where the
+bridge is left in a broken state.
 
 ## CLI
 
@@ -216,12 +245,15 @@ sudo -u veil ogate show --config /etc/ogate/ogate.toml
 sudo -u veil ogate up --config /etc/ogate/ogate.toml
 ```
 
-## Runtime + logging configuration
+## Runtime and logging configuration
 
-Both can be tuned per config (the same schema is also available in
-`veil-cli` and `oproxy`).
+You can tune both of these in the config file. The same settings work in
+`veil-cli` and `oproxy` too.
 
-### `[runtime]` — tokio knobs
+### `[runtime]` — async runtime settings
+
+These control the async runtime (tokio) that `ogate` runs on — mostly
+how many threads it uses.
 
 ```toml
 [runtime]
@@ -233,12 +265,13 @@ thread_name          = "ogate"
 thread_stack_size    = 2097152
 ```
 
-All fields optional. `flavor` accepts the legacy alias
-`runtime_flavor`. Zero values for `worker_threads` /
-`max_blocking_threads` are treated as "leave unset" (the factory
-guards against the tokio-internal panic on `0`).
+Every field is optional. `flavor` also accepts the old name
+`runtime_flavor`. Setting `worker_threads` or `max_blocking_threads` to
+zero means "leave it unset" — this guards against a tokio panic that a
+literal `0` would otherwise cause.
 
-**Env-var overrides** (set after config load — wins over file):
+**Environment-variable overrides** — applied after the config is loaded,
+so they win over the file:
 
 | Env var | Effect |
 |---|---|
@@ -246,10 +279,13 @@ guards against the tokio-internal panic on `0`).
 | `OGATE_WORKERS` | worker thread count |
 | `OGATE_MAX_BLOCKING_THREADS` | blocking pool cap |
 
-Backward-compat path for pre-`[runtime]` systemd units that pass
-tuning via env.
+These exist mainly so older systemd units — written before the
+`[runtime]` section existed — keep working when they pass tuning through
+the environment.
 
-### `[logging]` — output knobs
+### `[logging]` — log output settings
+
+These control what gets logged and where it goes.
 
 ```toml
 [logging]
@@ -260,11 +296,11 @@ file   = "/var/log/ogate.log"      # optional — defaults to stderr
 
 | Field | Default | Description |
 |---|---|---|
-| `level` | `info` | Min level emitted. `off` disables the logger entirely (no subscriber registered — zero overhead, completely silent). |
-| `format` | `text` | `text` = human-readable; `json` = one structured event per line. |
-| `file` | (stderr) | Optional log file. Logs are *appended* (created if absent). Parent directory must exist. Writer is non-blocking so concurrent log calls do not stall on disk I/O. |
+| `level` | `info` | The lowest level that gets logged. `off` turns the logger off completely — nothing is registered, so it costs nothing and stays totally silent. |
+| `format` | `text` | `text` = easy to read by eye; `json` = one structured event per line, for machines. |
+| `file` | (stderr) | Optional log file. New lines are *appended* (the file is created if it doesn't exist), and the parent directory has to exist already. Writing is non-blocking, so logging never stalls on slow disk I/O. |
 
-**Precedence** (high → low):
+**Which setting wins** (highest to lowest):
 
 1. `RUST_LOG` env var (always wins when set)
 2. CLI `-v` / `-vv` flags (when > 0)
@@ -295,12 +331,13 @@ format = "text"
 RUST_LOG="ogate=debug,veilclient=info" sudo -u veil ogate up --config /etc/ogate/ogate.toml
 ```
 
-## Ansible rollout
+## Rolling it out with Ansible
 
-The repo ships `ansible/deploy-ogate.yml` (rollout) and
-`ansible/remove-{chat,chaos-ban}.yml` (cleanup of older test workloads).
-Rolling deploy (`serial: 1`), per-host config rendered from
-`manifest.json` + an `host_to_ogate_addr` map declared in the playbook.
+The repo ships two playbooks: `ansible/deploy-ogate.yml` to roll `ogate`
+out, and `ansible/remove-{chat,chaos-ban}.yml` to clean up some older
+test workloads. The deploy goes one host at a time (`serial: 1`), and
+each host's config is rendered from `manifest.json` plus an
+`host_to_ogate_addr` map declared in the playbook.
 
 ```bash
 # Roll out:
@@ -315,36 +352,41 @@ ansible all -i inventory.yml -m systemd \
     -a "name=ogate state=stopped enabled=no" --become
 ```
 
-The current testnet runs `mode=authorized` over `192.168.0.0/16`:
+The current test network runs `mode=authorized` over `192.168.0.0/16`:
 * bootstraps: `192.168.0.1`–`.3`
 * leaf nodes: `192.168.0.11`–`.15`
 
-## Architecture notes
+## How it works under the hood
 
-* **Transport**: each TUN-side IP packet is wrapped in an `AppIpcSend`
-  message via the IPC handle and forwarded by the daemon as a normal
-  veil datagram. ogate does NOT use the deprecated daemon-side
-  `Tunnel` family.
-* **Cost per packet**: TUN read → unix socket write → daemon E2E
-  encrypt → wire → daemon decrypt → unix socket → TUN write. Unix
-  domain IPC handles 100k+ small messages/sec on Linux, so the
-  per-packet bottleneck is more likely the daemon's crypto or the
-  network than ogate itself.
-* **Authorization**: enforced at app layer on ingress. In `authorized`
-  mode each received packet is checked against the peer table for both
-  `src_node_id` membership AND `src_ip` ≡ `peers[src_node_id].addr_*`.
-* **Anti-spoof**: in `authorized` mode a peer cannot inject packets
-  claiming a virtual IP that is not theirs.
+* **Transport**: every IP packet coming off the TUN device is wrapped in
+  an `AppIpcSend` message, handed to the daemon, and sent out as an
+  ordinary Veil datagram. `ogate` does **not** use the old, deprecated
+  `Tunnel` message family on the daemon side.
+* **What each packet costs**: read from TUN → write to the local socket
+  → daemon encrypts it end to end → onto the wire → daemon decrypts →
+  back over the socket → write to TUN. That local socket handles well
+  over 100,000 small messages a second on Linux, so if anything is the
+  bottleneck it's far more likely the daemon's crypto or the network
+  itself than `ogate`.
+* **Authorization** happens in `ogate` itself, as packets arrive. In
+  `authorized` mode every incoming packet is checked twice: that its
+  `src_node_id` is in the peer table, AND that its `src_ip` matches
+  `peers[src_node_id].addr_*`.
+* **Anti-spoofing**: because of that second check, in `authorized` mode
+  a peer can't slip in packets pretending to come from a virtual IP that
+  isn't theirs.
 
-## Limitations / open work
+## Limitations and open work
 
-* No route management beyond the implicit subnet route — host routes
-  through peers must be added manually with `ip route` / `route add`.
-* No NAT / forwarding — `ogate` is endpoint-only; if you want gateway
-  semantics, set `net.ipv4.ip_forward=1` (Linux) and add NAT rules
-  yourself.
-* Performance not benchmarked yet. Measure with `iperf3` before
-  optimising.
+* It doesn't manage routes beyond the one subnet route it sets up for
+  you. If you need a route to a specific host through a peer, add it by
+  hand with `ip route` / `route add`.
+* No NAT or forwarding. `ogate` is an endpoint, not a **gateway** (a
+  machine that passes traffic on to other networks). If you want it to
+  behave like one, turn on forwarding yourself — `net.ipv4.ip_forward=1`
+  on Linux — and add your own NAT rules.
+* Performance hasn't been benchmarked. Measure with `iperf3` before you
+  reach for any optimizations.
 
 ## Related code
 

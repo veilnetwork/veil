@@ -92,18 +92,18 @@ connections to be rejected, but if both sides ban, neither will retry-loop.
    Persisted state — bans, DHT values, identity, mailbox WAL — survives.
 5. **Verify:** `veil-cli node show` → check `version:` matches expected build.
 
-The wire protocol is OVL1 throughout the running stack.  Two binaries
-that differ only in non-wire-format code (routing internals, log
-formatting, defaults) are fully interoperable — no co-ordinated
-fleet-wide upgrade is required.  When wire format changes (next major
+The wire protocol is OVL1 throughout the running stack. Two binaries that
+differ only in non-wire-format code — routing internals, log formatting,
+defaults — are fully interoperable. You do not need a co-ordinated
+fleet-wide upgrade. When the wire format itself changes (the next major
 version), follow the version-skew matrix in [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
 
 ## Seed Node Setup
 
-A seed node is a long-lived public node whose `(public_key, transport, nonce)`
-ships hard-coded in `node/bootstrap/seeds.rs::BUILTIN_SEEDS`.  Fresh nodes
-with no `[[peers]]` and no `bootstrap_peers` configuration use these to
-join the network.
+A seed node is a long-lived public node. Its `(public_key, transport, nonce)`
+ships hard-coded in `node/bootstrap/seeds.rs::BUILTIN_SEEDS`. A fresh node
+with no `[[peers]]` and no `bootstrap_peers` configured uses these seeds to
+join the network for the first time.
 
 ### Pre-deploy checklist
 
@@ -160,8 +160,8 @@ will fail the build if `BUILTIN_SEEDS` is empty AND neither
 
 - Run **at least 3** seeds across **different network providers and
   geographic regions** — losing one seed must not break network bootstrap.
-- Keep seed identities in offline cold storage (laptop + paper backup).
-  Recovery from a lost seed is a fleet-wide rebuild, not a runtime concern.
+- Keep seed identities in offline cold storage (a laptop plus a paper
+  backup). Losing one means rebuilding the fleet, not a runtime fix.
 - Rotate one seed at a time; never simultaneously.
 
 ### `.onion` bootstrap source (Tor) — last-resort censorship escape
@@ -246,12 +246,13 @@ without `-c` (when the user has read access to the socket).
 
 ## Memory locking (RLIMIT_MEMLOCK / CAP_IPC_LOCK)
 
-Since Stage 6, the daemon attempts to `mlock(2)` every secret-key
-allocation — session AEAD keys, session_kdf intermediate OKM, and
-(via follow-up slices) identity_sk / master_seed / peer_mlkem cache.
-This closes the **swap-to-disk leak** vector: an attacker with
-adversary-time physical disk access could otherwise recover keys
-from swap minutes-to-days after the session closed.
+Since Stage 6, the daemon pins every secret-key allocation in RAM with
+`mlock(2)` (the syscall that stops a memory page from being swapped to
+disk). This covers session AEAD keys, session_kdf intermediate OKM, and —
+via follow-up slices — identity_sk, master_seed, and the peer_mlkem cache.
+The point is to close the **swap-to-disk leak** vector. Without it, an
+attacker with later physical access to the disk could recover keys from
+swap minutes to days after the session closed.
 
 The mlock'd regions are additionally tagged with `MADV_DONTDUMP`
 (Linux) or `MADV_NOCORE` (FreeBSD / NetBSD), excluding them from
@@ -849,12 +850,11 @@ veil-cli peers ban <node_id_hex>
 
 ## Default Tuning Guidance
 
-Defaults target a mid-size Core node (≥4 GB RAM, ≥100 Mbps).  For
-**constrained seeds** (2 GB RAM, shared VM) or **hardened public
-nodes**, several values warrant explicit override.  Pre-deployment
-review of this section is **strongly recommended** — the wrong
-default on public infra is the difference between a stable node and
-an OOM loop.
+The defaults target a mid-size Core node (≥4 GB RAM, ≥100 Mbps). On a
+**constrained seed** (2 GB RAM, shared VM) or a **hardened public node**,
+several values are worth overriding. Read this section before you deploy.
+On public infrastructure, the wrong default is the difference between a
+stable node and an out-of-memory loop.
 
 ### RAM budget
 
@@ -867,11 +867,10 @@ Steady-state memory is dominated by three structures:
 | Route cache | `~200 bytes` per (dst, hop) pair | `~ K × 256` typical | <100 MiB |
 | Mailbox WAL | disk-backed; RAM only for hot index | bounded by TTL | <500 MiB |
 
-Worst-case is pathological (every session's queue full, every DHT
-slot occupied).  Realistic steady-state on a public seed with ~5 000
-active sessions and partial DHT fill is **~1–2 GB** — but you must
-cap `max_concurrent` and `max_store_entries` to get there from the
-defaults.
+The worst case is pathological: every session's queue full, every DHT
+slot occupied. Realistic steady-state on a public seed with ~5 000 active
+sessions and a partial DHT fill is **~1–2 GB**. To get there from the
+defaults, though, you must cap `max_concurrent` and `max_store_entries`.
 
 ### Recommended overrides by deployment profile
 

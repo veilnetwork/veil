@@ -9,17 +9,17 @@
 > (GREASE + auto-detect), not config-gated. Server-side ECH stays out of scope
 > (rustls API). Treat the design below as rationale, not pending work.
 
-Anti-censorship strategy P0-followup — closes DPI method #14 (FakeSNI heuristic) **without** requiring CDN domain fronting.
+Anti-censorship strategy P0-followup. This closes DPI method #14 (the FakeSNI heuristic) **without** requiring CDN domain fronting. ECH means Encrypted Client Hello: it hides the SNI — the website name your client normally sends in the clear during a TLS handshake — so a censor can't read which site you're reaching.
 
 ## Why opt-in, not default
 
-ECH ClientHello is а strong signal к DPI in 2026:
+To a DPI box in 2026, an ECH ClientHello is itself a strong signal:
 
-* Adoption is rising (Cloudflare ECH'd ~30% of HTTPS by Q1 2026, Apple/Mozilla shipped client support в 2024-2025) but still а minority of total HTTPS traffic.
-* А DPI classifier que sees ECH-marked ClientHello flags the connection как "encrypted-SNI traffic" — distinct category от ordinary HTTPS.
-* For deployments в jurisdictions где ECH-marked traffic is itself а target (Russia's TSPU has shipped ECH-blocking rules), enabling ECH may **worsen** the censorship profile rather than improve it.
+* Adoption is rising — Cloudflare ECH'd about 30% of HTTPS by Q1 2026, and Apple and Mozilla shipped client support in 2024-2025 — but it is still a minority of total HTTPS traffic.
+* A DPI classifier that sees an ECH-marked ClientHello flags the connection as "encrypted-SNI traffic," a distinct category from ordinary HTTPS.
+* In jurisdictions where ECH-marked traffic is itself a target — Russia's TSPU has shipped ECH-blocking rules — enabling ECH may **worsen** your censorship profile rather than improve it.
 
-**Conclusion:** ship ECH as an opt-in feature, default OFF, с clear operator-facing warning что enabling в hostile-DPI environments may degrade censorship resistance.
+**Conclusion:** ship ECH as an opt-in feature, default OFF, with a clear operator-facing warning that turning it on in a hostile-DPI environment can degrade censorship resistance.
 
 ## Activation prerequisites
 
@@ -27,18 +27,18 @@ When/if ECH activation is triggered:
 
 ### 1. rustls crypto provider swap: ring → aws_lc_rs
 
-The `rustls 0.23` ECH API requires HPKE primitives, и those live in the `aws_lc_rs` feature path только (Ring lacks HPKE in rustls 0.23 — checked 2026-05-21).  Activation steps:
+The `rustls 0.23` ECH API needs HPKE primitives. (HPKE is Hybrid Public Key Encryption, the scheme ECH uses to seal the ClientHello.) Those primitives live only in the `aws_lc_rs` feature path — Ring lacks HPKE in rustls 0.23, checked 2026-05-21. Activation steps:
 
-* `crates/veil-transport/Cargo.toml`: swap `rustls = { features = ["ring"] }` → `rustls = { features = ["aws_lc_rs"] }` (или dual-feature `["ring", "aws_lc_rs"]` если ring is needed для legacy paths).
-* `quinn = { features = ["runtime-tokio", "rustls-ring"] }` → `"rustls-aws-lc-rs"` matching.
-* Binary size impact: ~5-7 MB increase от aws-lc-rs C library bundle.  Acceptable but visible in CI artifact sizes.
-* Test matrix expansion: all TLS / QUIC unit tests run против the new crypto provider — surface bugs где behaviour differs.
+* `crates/veil-transport/Cargo.toml`: swap `rustls = { features = ["ring"] }` for `rustls = { features = ["aws_lc_rs"] }`. Use the dual feature `["ring", "aws_lc_rs"]` if ring is still needed for legacy paths.
+* Match it on the QUIC side: `quinn = { features = ["runtime-tokio", "rustls-ring"] }` becomes `"rustls-aws-lc-rs"`.
+* Binary size goes up by roughly 5-7 MB from the aws-lc-rs C library bundle. Acceptable, but it will show in CI artifact sizes.
+* The test matrix grows: every TLS and QUIC unit test reruns against the new crypto provider, which surfaces any bug where behaviour differs.
 
 ### 2. Server-side ECH support: Caddy 2.10+ in front
 
-rustls 0.23 server-side ECH support is **not exposed** via the high-level `ServerConfig` API; implementing it requires hand-rolled HPKE-decrypt + ClientHello-reassembly.  Out of scope.
+The high-level `ServerConfig` API in rustls 0.23 does **not** expose server-side ECH. Implementing it by hand would mean rolling your own HPKE-decrypt plus ClientHello reassembly. Out of scope.
 
-Recommended path: deploy Caddy 2.10+ в front of veil's TLS listener (extends the existing `deploy-webtunnel-autotls.yml` pattern):
+The recommended path is to put Caddy 2.10+ in front of veil's TLS listener. (Caddy is a web server that can terminate TLS and serve as a reverse proxy.) This extends the existing `deploy-webtunnel-autotls.yml` pattern:
 
 ```caddy
 {{ veil_host }} {
@@ -64,7 +64,7 @@ base64 -w 0 /tmp/ech-config.bin
 
 ### 3. DNS HTTPS RR record publication
 
-The operator publishes the ECH public config in а DNS `HTTPS` resource record (RFC 9460) for the veil host:
+The operator publishes the ECH public config in a DNS `HTTPS` resource record (RFC 9460) for the veil host:
 
 ```dns
 veil.example.  IN HTTPS  1 . alpn="h2" ech="AEAAAH..."
@@ -72,11 +72,11 @@ veil.example.  IN HTTPS  1 . alpn="h2" ech="AEAAAH..."
                                           base64-encoded ECH config
 ```
 
-Most DNS providers (Cloudflare, Route53, deSEC) support HTTPS RR як of 2025-2026.  Rotation: re-run `caddy ech generate-key` quarterly, update the HTTPS record, leave the old key valid для ~24h overlap.
+Most DNS providers — Cloudflare, Route53, deSEC — support HTTPS RR as of 2025-2026. To rotate: re-run `caddy ech generate-key` quarterly, update the HTTPS record, and leave the old key valid for a ~24h overlap.
 
 ### 4. Client-side rustls wire-up
 
-In `crates/veil-transport/src/tls.rs` (and parallel sites в `context.rs`):
+In `crates/veil-transport/src/tls.rs` (and the parallel sites in `context.rs`):
 
 ```rust
 use rustls::client::{EchConfig, EchMode};
@@ -100,11 +100,11 @@ let builder = if let Some(mode) = ech_mode {
 let config = builder.with_root_certificates(roots).with_no_client_auth();
 ```
 
-`with_ech` pins TLS 1.3 only (ECH requires it).  Existing TLS 1.2 fallback paths must continue к work для non-ECH connections.
+`with_ech` pins TLS 1.3 only, because ECH requires it. The existing TLS 1.2 fallback paths must keep working for non-ECH connections.
 
 ### 5. Operator config schema
 
-Add к `Config::transport`:
+Add to `Config::transport`:
 
 ```toml
 [transport]
@@ -112,11 +112,11 @@ ech_enabled = false             # default — opt-in only
 ech_config_list_file = "/etc/veil/ech-config.bin"  # operator-supplied
 ```
 
-Where the file contains the raw ECH config list bytes (matches what Caddy emits).  When `ech_enabled = true` but the file is missing или unparseable, daemon fails-fast at startup с а clear error.
+The file holds the raw ECH config list bytes — the same thing Caddy emits. When `ech_enabled = true` but the file is missing or unparseable, the daemon fails fast at startup with a clear error.
 
 ### 6. Runtime warning
 
-When ECH is enabled, log а WARN-level message at startup:
+When ECH is enabled, log a WARN-level message at startup:
 
 ```
 ech.enabled  warning="ECH is enabled — verify your target jurisdiction's DPI does NOT actively block ECH ClientHellos. See docs/internal/PLAN_ECH_OPT_IN.md for rationale."
@@ -126,33 +126,33 @@ ech.enabled  warning="ECH is enabled — verify your target jurisdiction's DPI d
 
 Open the ECH-activation epic and start the prerequisite swap when ANY of:
 
-1. **CDN-fronting unavailable**: operator deploys в а jurisdiction где Cloudflare / Fastly / Bunny.net are blocked, и multi-CDN failover is infeasible.  ECH becomes the most-realistic SNI-hiding option.
-2. **ECH adoption rate ≥ 50%**: ECH ClientHello becomes statistically ordinary rather than а minority signal.  Track Cloudflare's published ECH stats; their public dashboard exceeds 50% sustained → trigger.
-3. **Specific deployment request**: operator с а high-sensitivity threat model explicitly requests ECH support (e.g., dissident-network with а dedicated security review).
+1. **CDN-fronting unavailable.** The operator deploys in a jurisdiction where Cloudflare, Fastly, and Bunny.net are blocked, and multi-CDN failover is infeasible. ECH then becomes the most realistic way to hide the SNI.
+2. **ECH adoption rate ≥ 50%.** The ECH ClientHello becomes statistically ordinary rather than a minority signal. Track Cloudflare's published ECH stats; once their public dashboard holds above 50%, trigger.
+3. **Specific deployment request.** An operator with a high-sensitivity threat model explicitly asks for ECH support — for example, a dissident network with a dedicated security review.
 
-Until one of these fires, **DEPLOYMENT_HARDENING.md's CDN-fronting recommendation is the preferred answer to #14**.  CDN fronting closes #14 без code changes, без crypto-provider swap, без adoption-rate risk.
+Until one of these fires, **the CDN-fronting recommendation in DEPLOYMENT_HARDENING.md is the preferred answer to #14**. CDN fronting closes #14 with no code changes, no crypto-provider swap, and no adoption-rate risk.
 
 ## Estimated scope (when activation triggered)
 
 | Slice | LoC | Sessions |
 |---|---|---|
 | Crypto provider swap (ring → aws_lc_rs) | ~50 LoC + test surface re-validation | 1 |
-| Config schema + ECH wire-up в TLS / QUIC | ~250 LoC | 1 |
+| Config schema + ECH wire-up in TLS / QUIC | ~250 LoC | 1 |
 | Caddy 2.10+ playbook (`deploy-webtunnel-autotls-ech.yml`) + cert tooling | ~150 LoC ops + docs | 0.5 |
 | Cross-host integration test (live ECH handshake) | ~200 LoC | 0.5-1 |
 | **Total** | **~650 LoC** | **3 sessions** |
 
-Plus the test-matrix work for the crypto-provider swap (could expand significantly если behaviour differences surface — track separately).
+Plus the test-matrix work for the crypto-provider swap. That could expand significantly if behaviour differences surface, so track it separately.
 
-## Composition с current anti-censorship layers
+## How this composes with current anti-censorship layers
 
 | Closes | Layer | Status |
 |---|---|---|
-| #14 без CDN | ECH | 🧊 design landing-pad (this doc) |
-| #14 с CDN | CDN fronting | ⬜ operator-side ([`DEPLOYMENT_HARDENING.md`](DEPLOYMENT_HARDENING.md)) |
+| #14 without CDN | ECH | 🧊 design landing-pad (this doc) |
+| #14 with CDN | CDN fronting | ⬜ operator-side ([`DEPLOYMENT_HARDENING.md`](DEPLOYMENT_HARDENING.md)) |
 | #2, #3, #5 | tls-boring Chrome ClientHello | ✅ shipped (Epic 488) |
 | #14 partial | Caddy + Let's Encrypt fronting | ✅ shipped (P1 #3) |
 
-ECH и CDN-fronting are **alternatives**, не complements — operator picks whichever fits their threat model (CDN fronting = adopted broadly, ECH = more direct но requires DPI tolerance).
+ECH and CDN-fronting are **alternatives**, not complements. The operator picks whichever fits their threat model: CDN fronting is broadly adopted, while ECH is more direct but requires the local DPI to tolerate it.
 
-See [`docs/internal/ANTICENSORSHIP_STRATEGY.md`](ANTICENSORSHIP_STRATEGY.md) для the full DPI threat-model + roadmap.
+See [`docs/internal/ANTICENSORSHIP_STRATEGY.md`](ANTICENSORSHIP_STRATEGY.md) for the full DPI threat model and roadmap.

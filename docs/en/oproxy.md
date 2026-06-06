@@ -1,8 +1,16 @@
 # oproxy: Veil-Network Proxy Bridge
 
-Two-binary system that tunnels local proxy traffic (SOCKS5 / HTTP /
-transparent) through an veil-network session to a remote exit node,
-then on to the real internet.
+oproxy lets an app on your machine reach the internet *through* Veil.
+A **proxy** is just a middleman: your app hands it a request, and the
+proxy fetches the answer on your behalf. Here the proxy isn't a single
+server — it's two small programs joined by a Veil session, so your
+traffic travels the network end to end before it surfaces.
+
+The app speaks one of three common proxy dialects — **SOCKS5**, **HTTP**,
+or **transparent** (explained under [Inbound modes](#inbound-modes)).
+oproxy carries that traffic over a Veil session to a remote **exit
+node** — the point where your traffic leaves Veil and steps onto the
+open internet — and from there to the real site.
 
 ```
 [local app]
@@ -23,25 +31,48 @@ then on to the real internet.
 [real internet]
 ```
 
-`oproxy-client` and `oproxy-server` both connect to a **local veil
-daemon** on their respective hosts; the proxy traffic flows over the
-veil between those two daemons. Russian translation:
+The two halves are `oproxy-client` (next to your app) and
+`oproxy-server` (out at the exit). Each one talks to a **local Veil
+daemon** — the background program that keeps your node on the network —
+running on its own host. The proxy traffic flows over Veil between
+those two daemons, so neither program ever opens a connection straight
+across the open internet. Russian translation:
 [oproxy.md](../ru/oproxy.md).
 
-## Why veil instead of a plain HTTPS proxy
+## Why Veil instead of a plain HTTPS proxy
 
-- **End-to-end veil encryption** — peers can't be impersonated
-  even if a CA is compromised; identities are sovereign keypairs.
-- **No exposed cleartext port on the server** — the server doesn't
-  listen on any public IP for proxy traffic; all flow is veil-
-  tunnelled. Public surface is the veil daemon itself.
-- **Custom app names** — multiple proxy services can coexist on one
-  daemon without port collisions (each gets a distinct `app_id`
-  derived from its name).
-- **`node_id` allowlist on the server** — drop unauthorized peers at
-  the app layer; no firewall rules, no certs, no rotation hassles.
+A normal proxy listens on a public port and leans on TLS certificates
+to prove who it is. Running it over Veil sidesteps the usual headaches:
+
+- **End-to-end Veil encryption.** A peer can't be impersonated, even
+  if a certificate authority (the company that vouches for a site's
+  identity) is compromised. Each identity is its own keypair, owned
+  by no one else.
+- **No open port on the server.** The server never listens on a public
+  IP for proxy traffic — it all rides inside the Veil tunnel. The only
+  thing exposed to the world is the Veil daemon itself.
+- **Custom app names.** Several proxy services can share one daemon
+  without fighting over ports. Each gets its own `app_id`, derived
+  from its name.
+- **A `node_id` allowlist on the server.** You decide which peers are
+  allowed and turn the rest away right at the app — no firewall rules,
+  no certificates, no rotation to babysit.
 
 ## Inbound modes
+
+An **inbound mode** is simply how a local app hands its traffic to
+`oproxy-client`. Pick whichever your app already speaks:
+
+- **SOCKS5** — a widely supported proxy protocol. The app says "connect
+  me to this host and port," and the proxy does it. Most browsers and
+  tools like `curl` understand it out of the box.
+- **HTTP** — the proxy mode built into web browsers and the
+  `HTTP_PROXY` environment variable. Good when an app only knows how to
+  talk to an HTTP proxy.
+- **Transparent** (TProxy) — no per-app setting at all. You point a
+  whole machine or network through oproxy and it captures the traffic
+  invisibly. Handy as a gateway, but it needs Linux and some firewall
+  rules (see [below](#setting-up-tproxy-on-linux--keenetic)).
 
 | Mode    | Use case                                    | Platforms |
 |---------|---------------------------------------------|-----------|
@@ -49,15 +80,19 @@ veil between those two daemons. Russian translation:
 | HTTP    | Browser HTTP/HTTPS proxy (`HTTP_PROXY=...`) | All |
 | TProxy  | Transparent gateway (`iptables -j TPROXY`)  | Linux / Keenetic only |
 
-Multiple inbound listeners can run concurrently on the same client.
+You can run several inbound modes at once on the same client — say
+SOCKS5 and HTTP side by side — each on its own port.
 
 ---
 
 ## `oproxy-client`
 
-Standalone binary. Connects to the local veil daemon, binds an
-endpoint, listens locally for one or more inbound modes, and tunnels
-each connection to the configured upstream `(server_node_id,
+This is the half that runs next to your app. It's a single standalone
+binary. On startup it connects to the local Veil daemon, claims an
+endpoint on it, and listens locally for one or more of the inbound
+modes above. Every connection it accepts gets tunnelled to the
+**upstream** server you configured — "upstream" just meaning the next
+hop toward the internet, here named by `(server_node_id,
 server_app_name)`.
 
 ```bash
@@ -82,12 +117,13 @@ sudo vim /etc/oproxy/client.toml
 sudo -u veil oproxy-client --config /etc/oproxy/client.toml
 ```
 
-> **Run as the daemon user, never root.** The veil daemon enforces a
-> kernel-level peer-uid match (`SO_PEERCRED` / `getpeereid`) on its IPC
-> socket and drops any connection from a different uid — root included.
-> Run `oproxy-client` as whatever user the daemon runs as (here
-> `veil`). TProxy still needs `CAP_NET_ADMIN`; grant it to that user
-> (e.g. `setcap cap_net_admin+ep`) instead of running as root.
+> **Run as the daemon user, never root.** The Veil daemon checks, down
+> in the kernel, that whoever connects to its IPC socket has the same
+> user id as the daemon itself (`SO_PEERCRED` / `getpeereid`). Anyone
+> else is dropped — root included. So run `oproxy-client` as the same
+> user the daemon runs as (here, `veil`). Transparent mode still needs
+> the `CAP_NET_ADMIN` capability; grant just that one capability to the
+> user (e.g. `setcap cap_net_admin+ep`) rather than reaching for root.
 
 ### Minimal config
 
@@ -160,9 +196,11 @@ file  = "/var/log/oproxy-client.log" # optional — defaults to stderr
 
 ## `oproxy-server`
 
-Standalone binary. Binds an veil app endpoint via IPC, accepts
-incoming veil streams, and bridges each one to its requested TCP
-destination.
+This is the exit half — the program that actually reaches the internet
+for you. It's a single standalone binary too. It claims a Veil app
+endpoint through the local daemon, accepts the incoming Veil streams
+from clients, and for each one opens a plain TCP connection to the host
+and port the client asked for, then ferries bytes between the two.
 
 ```bash
 oproxy-server --config /etc/oproxy/server.toml
@@ -215,29 +253,47 @@ level = "info"
 file  = "/var/log/oproxy-server.log"
 ```
 
-`app_id` is derived deterministically from the server's `node_id` +
-`app_name`: clients with the matching `server_app_name` compute the
-same bytes locally and dial that exact endpoint.
+There's no shared secret to copy around. The `app_id` is computed
+straight from the server's `node_id` plus its `app_name`, and the same
+inputs always give the same result. A client that knows the server's
+`node_id` and sets a matching `server_app_name` works out that same
+`app_id` on its own and dials that exact endpoint.
 
 ---
 
 ## Routing modes (client)
 
-The `[routing]` section drives per-target dispatch. For each
-`(host, port)` the client receives over its inbound listeners, the
-routing engine walks `rules` in order (first match wins) and applies
-the matched rule's `action`. If no rule matches, the global `default`
-applies.
+By default every connection goes through Veil. But you don't always
+want that — local addresses, for instance, are quicker to reach
+directly. **Routing** is the client deciding, per destination, *which
+way* a connection should go. The optional `[routing]` section in the
+config is where you set those decisions.
+
+It works like a short checklist. For each `(host, port)` an app asks
+for, the client runs down your `rules` from top to bottom and stops at
+the first one that matches, then does what that rule's `action` says.
+If nothing matches, it falls back to the global `default`.
 
 ### Actions
 
+There are three things a rule (or the default) can do with a connection:
+
 | Action    | Behaviour |
 |-----------|-----------|
-| `veil` | Open an veil stream to `(server_node_id, server_app_name)` |
+| `veil` | Open a Veil stream to `(server_node_id, server_app_name)` |
 | `direct`  | Skip veil; TCP-connect directly from the local host |
 | `block`   | Refuse with a SOCKS5 / HTTP error reply |
 
-### Rule fields (all optional — empty = wildcard; rule is a conjunction)
+In plain terms: `veil` sends it through the tunnel, `direct` connects
+straight from this machine without Veil, and `block` refuses the
+connection outright.
+
+### Rule fields
+
+A rule is a set of conditions plus an action. Every field below except
+`action` is optional, and a field you leave out matches anything. When
+a rule lists several conditions, **all** of them must hold for it to
+match — they're combined with AND, not OR.
 
 | Field | Matches |
 |---|---|
@@ -248,30 +304,47 @@ applies.
 | `action`      | (required) one of `veil` / `direct` / `block` |
 | `fallback`    | per-rule override; one of `direct` / `fail` |
 
-**Note**: `cidr` matches IP literals only — hostnames are not
-DNS-resolved on the client. Use `host_suffix` for hostname-based
-rules.
+A **CIDR** is a way to write a whole block of IP addresses at once —
+for example `10.0.0.0/8` covers every address starting with `10.`.
 
-### Fallback semantics
+**Note:** `cidr` only matches when the host is written as a literal IP
+address. The client never looks up hostnames in DNS — the internet's
+phone book that turns a name like `example.com` into an IP — so a
+`cidr` rule won't catch a target given by name. For name-based rules,
+reach for `host_suffix` instead.
 
-Applies only when `action = "veil"` and the veil path fails
-(server unreachable, timeout, denied, or rejected).
+### What happens when Veil is down (fallback)
+
+**Fallback** is the backup plan for when a `veil` action can't get
+through — the server is unreachable, the request times out, or it gets
+turned away. It only comes into play for `action = "veil"`; `direct`
+and `block` have nothing to fall back from.
 
 | `fallback` | On veil failure |
 |---|---|
 | `fail` | Return CONNECT failure to the inbound client (no recovery) |
 | `direct` | Silently TCP-connect direct from the local host, then bridge |
 
-The fallback opportunity exists only during phases 1–3 of the
-veil handshake (open stream / write connect header / read status
-reply). Once Phase 4 (bridge) starts, payload bytes are flowing on
-both sides — the connection is committed and any failure passes
-through to the inbound client.
+So `fail` gives up and reports the error to your app, while `direct`
+quietly retries the connection straight from this machine instead.
 
-Per-rule `fallback` overrides the global `[routing] fallback`. If
-omitted on a rule, the global value applies.
+There's a catch on timing. The backup plan is only available while
+Veil is still setting the connection up — the first three steps of the
+handshake (open the stream, send the connect header, read back the
+status reply). Once step four begins and real data is moving in both
+directions, the connection is committed: nothing can be retried, and
+any later failure is passed straight back to your app.
 
-### Example: RFC1918 split
+A `fallback` written on a rule overrides the global `[routing]
+fallback` for that rule. Leave it off and the rule uses the global
+value.
+
+### Example: send LAN traffic direct, everything else via Veil
+
+"RFC1918" is the standard that set aside the private address ranges
+your home and office networks use — `10.x`, `172.16–31.x`, and
+`192.168.x`. This example treats each of those a little differently
+while routing everything else through Veil.
 
 ```toml
 [routing]
@@ -293,7 +366,7 @@ cidr   = "192.168.0.0/16"
 action = "direct"      # 192.168/16 — never use veil
 ```
 
-Resulting per-target behaviour:
+Reading that back, here's where each kind of target ends up:
 
 | Target          | mode    | on veil failure |
 |-----------------|---------|---------------------|
@@ -306,8 +379,10 @@ Resulting per-target behaviour:
 
 ## Runtime + logging configuration
 
-Shared schema with `veil-cli` and `ogate`. Both sections are
-optional; if omitted, sensible defaults apply.
+These two sections tune the engine and the logs. They use the same
+format as `veil-cli` and `ogate`, so settings carry over if you've
+configured those. Both are optional — skip them and reasonable defaults
+take over.
 
 ### `[runtime]`
 
@@ -321,7 +396,9 @@ thread_name          = "oproxy-client"
 thread_stack_size    = 2097152
 ```
 
-**Env-var overrides** (apply after config load, win over file):
+You can also set these from the environment. An environment variable
+is read after the config file and wins over it, which makes it handy
+for a one-off override without editing the file:
 
 | Env var | Effect |
 |---|---|
@@ -342,7 +419,8 @@ file  = "/var/log/oproxy.log"   # optional — defaults to stderr
 | `level` | `info` | Min level emitted. `off` skips logger init entirely (zero log output, including warnings/errors). |
 | `file` | (stderr) | Optional log file. Logs are appended (file created if absent). Parent directory must exist. |
 
-`RUST_LOG` env var overrides `level`:
+The `RUST_LOG` environment variable overrides `level` when you need
+more detail for a single run:
 
 ```bash
 RUST_LOG=oproxy=debug oproxy-client --config client.toml
@@ -351,6 +429,11 @@ RUST_LOG=oproxy=debug oproxy-client --config client.toml
 ---
 
 ## Setting up TProxy on Linux / Keenetic
+
+Transparent mode needs a hand from the kernel: a few firewall rules to
+nudge passing traffic over to oproxy's listener. `iptables` is the
+Linux tool for those rules. This set marks TCP traffic to port 80 and
+sends it to the listener on port 12345:
 
 ```bash
 # Mark + route transit traffic to the listener:
@@ -362,15 +445,21 @@ ip route add local 0.0.0.0/0 dev lo table 100
 oproxy-client --config client.toml
 ```
 
-The listener accepts connections to any destination and retrieves the
-original target via `SO_ORIGINAL_DST`. Requires `CAP_NET_ADMIN`.
+With that in place, the listener takes connections aimed at any
+destination and recovers where each one was really headed via
+`SO_ORIGINAL_DST` (a kernel feature that remembers the original target
+after the firewall redirects a connection). This needs the
+`CAP_NET_ADMIN` capability.
 
 ---
 
 ## Wire protocol (oproxy-client ↔ oproxy-server)
 
-After the veil stream is open, the client sends a connect header
-and waits for a status reply:
+This part is for the curious — you don't need it to use oproxy. It's
+the little handshake the two halves speak once a Veil stream is open,
+before any of your app's data flows. The client sends a short header
+naming the host and port it wants, and the server answers with a
+one-byte status:
 
 ```text
 client → server:   [host_len u16 BE][host UTF-8][port u16 BE]
@@ -384,10 +473,11 @@ server → client:   [status u8]
 | `0x02` | Connect failed (DNS / TCP error) |
 | `0x03` | Bad request (malformed header) |
 
-On non-OK status the server closes the stream after replying. The
-client's `fallback` decision is based on this status (Denied / Connect
-failed / Bad request all qualify as recoverable failures during
-phases 1–3).
+If the status is anything but `0x00`, the server sends it and then
+closes the stream. That status is what the client's `fallback` decision
+hangs on: Denied, Connect failed, and Bad request all count as
+recoverable failures during the first three steps, so a `direct`
+fallback can still step in.
 
 ---
 
@@ -402,10 +492,13 @@ phases 1–3).
 
 ## Limitations / open work
 
-- No UDP forwarding (TCP only).
-- No DNS resolution on the client — hostnames are forwarded
-  literally to the server, which does its own DNS lookup. This means
-  `cidr`-based routing rules don't catch hostname targets (use
-  `host_suffix` for those).
-- FreeBSD TProxy support is currently stubbed (returns startup error);
-  use SOCKS5 on FreeBSD instead.
+A few things oproxy doesn't do yet — worth knowing before you lean on it:
+
+- **TCP only.** There's no UDP forwarding, so anything that relies on
+  UDP (some games and video calls) won't go through.
+- **The client doesn't resolve names.** It forwards hostnames as-is to
+  the server, which does its own DNS lookup. That's why a `cidr`
+  routing rule never matches a target given by name — use `host_suffix`
+  for those.
+- **No transparent mode on FreeBSD.** TProxy there is just a stub and
+  exits with an error at startup; use SOCKS5 on FreeBSD instead.

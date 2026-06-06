@@ -1,12 +1,13 @@
 # Installation & First Node
 
-This guide takes you from a single `curl` command to a running veil node —
-whether you have never touched the project before or you are an operator
-standing up a fleet.
+This guide takes you from a single `curl` command to a running veil node. It
+works whether this is your first time here or you're an operator standing up a
+whole fleet of servers.
 
-The installer downloads **prebuilt, sha256-verified** binaries from GitHub
-Releases. No Rust toolchain is required (that is only needed if you
-[build from source](#build-from-source)).
+The installer downloads ready-made programs from GitHub Releases and checks each
+one with **sha256** — a fingerprint that proves the file arrived intact and
+unaltered. You don't need a Rust toolchain (the set of tools that compile Rust
+source code); that's only for when you [build from source](#build-from-source).
 
 ---
 
@@ -33,22 +34,22 @@ veil-cli node run         # start in the background
 veil-cli node show        # node id, uptime, peers
 ```
 
-That's it. Read on to install the gateway/proxy tools, run a public server, or
-tune the install.
+That's it — you're on the network. Read on to add the gateway and proxy tools,
+run a public server, or fine-tune the install.
 
 ---
 
 ## What gets installed
 
-By default only **`veil-cli`** (the node + self-updater) is installed, into a
-per-user directory that needs no `sudo`:
+By default you get just **`veil-cli`** — the node itself, which can also update
+itself. It lands in a folder owned by you, so no `sudo` is needed:
 
 | Platform | Location |
 |----------|----------|
 | Linux / macOS | `~/.veil/bin` (added to `PATH` via `~/.veil/env`) |
 | Windows | `%USERPROFILE%\.veil\bin` (added to your user `PATH`) |
 
-You can install any subset of the four binaries:
+There are four programs in total, and you can install any mix of them:
 
 | Binary | Role | Side |
 |--------|------|------|
@@ -57,7 +58,7 @@ You can install any subset of the four binaries:
 | `oproxy-client` | Local SOCKS5 / HTTP / TProxy → veil | client |
 | `oproxy-server` | Veil exit / proxy server | server |
 
-Install more than the node:
+To install more than the node:
 
 ```sh
 # everything (node + ogate + oproxy client & server)
@@ -79,8 +80,9 @@ On Windows:
 
 ### Client / leaf (default)
 
-A leaf connects *out* to the network; it needs no public address and works
-behind NAT.
+A *leaf* is a node that reaches *out* to the network rather than accepting
+incoming connections. It needs no public address and works fine behind NAT (the
+router that shares one public address among the devices on your home network).
 
 ```sh
 veil-cli config init --profile mobile   # battery-aware leaf (or omit --profile for plain dev)
@@ -89,14 +91,17 @@ veil-cli node show                       # status
 veil-cli node stop                       # graceful stop
 ```
 
-Useful inspection commands: `node health`, `node bandwidth`, `node metrics`,
-`node bootstrap-status` (what fallbacks you have if a seed IP is blocked).
+A few commands to look under the hood: `node health`, `node bandwidth`,
+`node metrics`, and `node bootstrap-status` — the last one shows your backup
+routes into the network in case a seed IP gets blocked.
 
 ### Server / relay (public listener)
 
-A server advertises a public listener that other nodes bootstrap from. Use the
-`censorship-target` profile (binds `wss://0.0.0.0:443`, sets a decoy SNI, enables
-mesh) and a higher PoW difficulty:
+A server opens a public door — a *listener* — that other nodes use as their way
+into the network. Use the `censorship-target` profile (it binds
+`wss://0.0.0.0:443`, sets a decoy SNI so the connection looks like a different
+website, and turns on mesh mode) together with a higher Proof-of-Work
+difficulty:
 
 ```sh
 veil-cli config init --profile censorship-target --difficulty 24
@@ -105,9 +110,10 @@ veil-cli config show
 veil-cli node run
 ```
 
-For a **hardened, always-on server** (dedicated `veil` user, `/var/lib/veil`
-data dir, a `systemd` unit, and the public join blob printed at the end), use the
-build-from-source provisioning script instead:
+For a **hardened, always-on server**, use the build-from-source provisioning
+script instead. It sets up a dedicated `veil` user, a `/var/lib/veil` data
+directory, and a `systemd` service, then prints the public join blob (the short
+string others use to connect to you) at the end:
 
 ```sh
 sudo PUBLIC_IP=203.0.113.10 LISTEN_PORT=443 ROLE=core \
@@ -117,17 +123,20 @@ sudo PUBLIC_IP=203.0.113.10 LISTEN_PORT=443 ROLE=core \
 See the [Administrator Guide](admin-guide.md) and [Operations](OPERATIONS.md) for
 transports, metrics, and fleet management.
 
-> **Censorship-resistant transports.** The default binaries already include the
-> `tls-boring` fingerprint-rotation backend. For the strongest unobservability,
-> review [p-net.md](p-net.md) and the `censorship-target` notes printed into your
+> **Censorship-resistant transports.** The default binaries already ship with
+> `tls-boring`, which keeps rotating the connection's fingerprint so it never
+> looks the same twice. To make your traffic as hard to spot as possible, read
+> [p-net.md](p-net.md) and the `censorship-target` notes written into your
 > config.
 
 ---
 
 ## ogate — IP over veil
 
-`ogate` bridges real IP traffic across the veil (a virtual LAN). It needs a
-TUN device, so it runs with `CAP_NET_ADMIN` / root (or Administrator on Windows).
+`ogate` carries ordinary IP traffic across veil, so a group of machines feels
+like one private local network even though they're far apart. To do that it
+creates a TUN device (a virtual network card), which is why it needs
+`CAP_NET_ADMIN` or root — or Administrator on Windows.
 
 ```sh
 ogate gen-config -o ogate.toml          # commented template
@@ -142,7 +151,8 @@ Full reference: [ogate.md](ogate.md).
 
 ## oproxy — proxy client & server
 
-Forward local app traffic through the veil to an exit server.
+Send the traffic from apps on your machine through veil and out to an exit
+server, which makes the requests on your behalf.
 
 **Client** (your machine — a local SOCKS5/HTTP proxy):
 
@@ -159,14 +169,16 @@ oproxy-server --gen-config > oproxy-server.toml
 oproxy-server --config oproxy-server.toml
 ```
 
-Per-target routing (veil / direct / block) and failover are documented in
+You can route each destination differently (through veil, straight out, or
+blocked) and set up automatic failover — both are covered in
 [oproxy.md](oproxy.md).
 
 ---
 
 ## Installer options
 
-`install.sh` flags (pass after `sh -s --` when piping):
+These are the flags `install.sh` understands. When you pipe the script into
+`sh`, put them after `sh -s --`:
 
 | Flag | Meaning |
 |------|---------|
@@ -193,32 +205,37 @@ either platform.
 
 ## Updating
 
-`veil-cli` can update itself from the operator's signed manifest:
+`veil-cli` can update itself. It pulls a *manifest* — a small file the operator
+has signed to vouch for the new version — and upgrades from there:
 
 ```sh
 veil-cli update check
 veil-cli update apply       # verifies the signature before swapping the binary
 ```
 
-Or just re-run the installer — it always fetches the latest release. For
-`ogate` / `oproxy`, re-run the installer (they ship as plain service binaries).
+Or just run the installer again; it always grabs the latest release. To update
+`ogate` or `oproxy`, run the installer again — they're plain service programs
+with no self-update of their own.
 
 ---
 
 ## Verifying what you installed
 
-The installer checks each binary's SHA-256 against the published
-`sha256-<triple>.txt` before installing. To re-verify by hand:
+Before installing anything, the installer compares each binary's SHA-256
+fingerprint against the published `sha256-<triple>.txt`. If you'd like to check
+again yourself:
 
 ```sh
 sha256sum ~/.veil/bin/veil-cli
 # compare against the sha256-<triple>.txt asset on the Release page
 ```
 
-Releases are also accompanied by a **signed `manifest-<triple>.bin`** (an
-`UpdateManifest` signed with a cold-storage release key). Independent verifiers
-can rebuild from the tagged commit with `scripts/build-release.sh` and confirm a
-byte-identical SHA-256 — see [release.yml](../../.github/workflows/release.yml).
+Every release also comes with a **signed `manifest-<triple>.bin`** — an
+`UpdateManifest` signed with a release key kept in cold storage (offline, so it
+can't be stolen over the network). If you want to confirm nothing was tampered
+with, you can rebuild from the tagged commit with `scripts/build-release.sh` and
+check that you get a byte-for-byte identical SHA-256 — see
+[release.yml](../../.github/workflows/release.yml).
 
 ---
 
@@ -236,16 +253,18 @@ Remove-Item -Recurse -Force $env:USERPROFILE\.veil
 # then remove the bin dir from PATH (System > Environment Variables)
 ```
 
-Node data (config + identity + persisted state) lives in the platform config
-directory; `veil-cli config locate` prints the path if you also want to wipe it.
+Your node's data — its config, identity, and saved state — lives in a separate
+folder set by your operating system. If you want to wipe that too, run
+`veil-cli config locate` to see exactly where it is.
 
 ---
 
 ## Build from source
 
-Needed only for platforms without a prebuilt binary (e.g. **Intel macOS**), or to
-develop. The default features pull in **BoringSSL (`tls-boring`)** and
-**RocksDB (`rocksdb-cold`)**, so a C/C++ toolchain is required:
+You only need this if there's no ready-made binary for your platform (for
+example **Intel macOS**), or if you want to work on the code. The default build
+pulls in **BoringSSL (`tls-boring`)** and **RocksDB (`rocksdb-cold`)**, both
+written in C/C++, so you'll need a C/C++ toolchain to compile them:
 
 ```sh
 # Debian/Ubuntu prerequisites for the default (BoringSSL + RocksDB) build:
@@ -258,14 +277,16 @@ cargo build --release --bin veil-cli --bin ogate --bin oproxy-client --bin oprox
 # binaries land in target/release/
 ```
 
-For reproducible, signed release builds use `scripts/build-release.sh --target <triple>`.
-To cross-compile a static Linux binary from macOS, see `scripts/cross-build-linux-musl.sh`.
+For signed, reproducible release builds — ones anyone can rebuild and get the
+exact same bytes — use `scripts/build-release.sh --target <triple>`. To build a
+static Linux binary on a macOS machine, see `scripts/cross-build-linux-musl.sh`.
 
 ---
 
 ## Supported platforms
 
-Prebuilt binaries are published for:
+We publish ready-made binaries for these targets (each named by its *triple* —
+the CPU + OS + libc combination it's built for):
 
 | Triple | Notes |
 |--------|-------|
@@ -275,17 +296,20 @@ Prebuilt binaries are published for:
 | `aarch64-apple-darwin` | Apple Silicon macOS |
 | `x86_64-pc-windows-msvc` | Windows 10/11 (x64) |
 
-Intel macOS (`x86_64-apple-darwin`) and ARM64 Windows have no prebuilt binary —
-[build from source](#build-from-source) or run the x64 build under emulation.
+There's no ready-made binary for Intel macOS (`x86_64-apple-darwin`) or ARM64
+Windows. On those, [build from source](#build-from-source) or run the x64 build
+under emulation.
 
 ---
 
-## Security of `curl … | sh`
+## Is `curl … | sh` safe?
 
-The script is fetched over HTTPS (TLS 1.2+), verifies every binary's SHA-256
-before install, never needs root for the default per-user install, and touches
-only `~/.veil` plus your shell profile's `PATH` line. If you prefer to read
-before running, download it first:
+Piping a script straight into your shell makes some people nervous, and that's
+fair. Here's what this one actually does: it downloads over HTTPS (TLS 1.2 or
+newer, so the connection is encrypted), checks every binary's SHA-256 before
+installing, never asks for root in the default per-user install, and only
+touches `~/.veil` plus the one `PATH` line it adds to your shell profile. If
+you'd rather read it first, download it and look before you run it:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.sh

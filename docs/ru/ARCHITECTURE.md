@@ -1,8 +1,13 @@
 # Архитектура veil-сети
 
-> Для исчерпывающего source-level walkthrough'а см. [ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md).
+Это обзор на одну страницу: слои, через которые проходит сообщение, два вида
+узлов и детали, из которых всё собрано. Подробный разбор по исходному коду
+см. в [ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md).
 
 ## Слои
+
+Любое сообщение идёт сверху вниз через эти слои. У каждого слоя одна задача, и
+он передаёт работу следующему.
 
 ```
 Application Layer     App ←→ IPC ←→ AppEndpointRegistry
@@ -32,13 +37,25 @@ Transport Layer       TCP / TLS / QUIC / WebSocket (ws,wss) / Unix / SOCKS5
 | Leaf | - | - | - | - | Мобильные клиенты, IoT, лёгкие клиенты |
 | Core | да (K=20) | да | да | да (опционально) | Полноценный участник сети |
 
-Все Core-узлы равноправны: DHT, relay/forwarding, mailbox, PoW ≥ 24 бит.
-Gateway-функциональность (attachment records для leaf-узлов) включается флагом `CAN_GATEWAY_LOCAL_MESH`
-в capabilities; конфигурируется через `[gateway] enabled = false`.
-Legacy-роли `Relay / Gateway / CoreRouter` не входят в протокол — в сети ровно
-две роли.
+Ролей ровно две. **Leaf** — лёгкий клиент (телефон, IoT-устройство): он
+подключается сам, но ничего не хранит. **Core** — полноценный участник: держит
+DHT, ретранслирует и пересылает трафик, ведёт mailbox и добывает доказательство
+работы (PoW) не меньше чем на 24 бита.
+
+Все Core-узлы равноправны — ни один не главнее другого. Единственное
+необязательное дополнение — роль шлюза (gateway): узел хранит записи привязки
+(attachment records) от имени leaf-узлов. Она включается флагом
+`CAN_GATEWAY_LOCAL_MESH` в списке возможностей узла, а отключить её можно через
+`[gateway] enabled = false`.
+
+Прежние названия ролей `Relay / Gateway / CoreRouter` в протокол не входят.
+Две роли, и всё.
 
 ## Поток данных: доставка сообщений
+
+Что происходит, когда одно приложение шлёт сообщение другому. Быстрый путь идёт
+по кэшу маршрутов; если там промах, узел уходит на поиск через DHT; а если и так
+не удаётся достучаться до живого получателя, сообщение ждёт в mailbox.
 
 ```
 Sender App
@@ -55,41 +72,54 @@ Sender App
 
 ## Маршрутизация
 
-- **Gossip**: ROUTE_ANNOUNCE с TTL=2 (только локальные соседи)
-- **DHT forwarding**: RecursiveRelay O(log N) hop'ов через Kademlia closest nodes
-- **Route cache**: TTL-based, адаптивная ёмкость, reverse path caching
-- **Scoring**: RTT + Vivaldi + jitter + congestion + battery
+Как узел решает, куда отправить сообщение дальше. Вместе работают четыре
+механизма:
+
+- **Gossip** (слухи): ROUTE_ANNOUNCE с TTL=2 (только локальные соседи)
+- **Пересылка через DHT**: RecursiveRelay за O(log N) переходов через ближайшие узлы Kademlia
+- **Кэш маршрутов**: с истечением по TTL, адаптивная ёмкость, кэширование обратного пути
+- **Оценка**: RTT + Vivaldi + джиттер + загруженность + заряд батареи
 
 ## Слои безопасности
 
-1. **Identity**: Ed25519 **или** Falcon-512 signing key + PoW mining (24+ бит, адаптивно)
-2. **Handshake**: X25519 + ML-KEM-768 гибридный key exchange
-3. **Session**: per-frame шифрование ChaCha20-Poly1305 AEAD (rekey на 128 GiB, 32 дня или wrap'е nonce-counter'а — конфигурируется)
-4. **E2E**: ML-KEM-768 encapsulation для непрозрачного для relay'я payload'а (маркеры `0xE2`/`0xE3`)
-5. **Anti-abuse**: per-IP session limit (32) → PoW challenge → rate limiter → violation tracker → ban list
-6. **Reputation**: uptime + relay success + peer vouches; transit gate 200 points
-7. **DHT ownership**: подписанный STORE; подписанный DELETE с BLAKE3(pk)==key
+Безопасность построена слоями: каждый пункт ниже — самостоятельная защита, так
+что брешь в одном не разваливает остальные. AEAD здесь — *шифрование с
+аутентификацией данных*: оно и скрывает содержимое, и ловит любую подмену.
 
-## Threading-модель
+1. **Личность**: ключ подписи Ed25519 **или** Falcon-512 + добыча PoW (от 24 бит, адаптивно)
+2. **Рукопожатие**: гибридный обмен ключами X25519 + ML-KEM-768
+3. **Сессия**: пофреймовое шифрование ChaCha20-Poly1305 AEAD (смена ключей на 128 GiB, через 32 дня или при переполнении счётчика nonce — настраивается)
+4. **Сквозное шифрование (E2E)**: инкапсуляция ML-KEM-768 для полезной нагрузки, непрозрачной для ретранслятора (маркеры `0xE2`/`0xE3`)
+5. **Защита от злоупотреблений**: лимит сессий на один IP (32) → задача PoW → ограничитель частоты → учёт нарушений → бан-лист
+6. **Репутация**: время в сети + успешные ретрансляции + поручительства соседей; порог транзита 200 очков
+7. **Владение записью в DHT**: подписанный STORE; подписанный DELETE с BLAKE3(pk)==key
 
-- **Tokio runtime**: весь async I/O, управление сессиями, периодические задачи
-- **Shared state**: `Arc<Mutex<_>>` для кэшей, `Arc<AtomicU64>` для счётчиков
-- **Без вложенных lock'ов**: single-lock-at-a-time соглашение предотвращает deadlock'и
-- **Dispatcher**: синхронный dispatch на `FrameHeader` → `DispatchResult` (никакого async в hot path)
+## Модель потоков
+
+Узел работает на одной асинхронной среде выполнения и намеренно держит работу с
+блокировками простой: большинство ошибок параллелизма родом из запутанных
+блокировок — поэтому их здесь нет.
+
+- **Среда выполнения Tokio**: весь async I/O, управление сессиями, периодические задачи
+- **Общее состояние**: `Arc<Mutex<_>>` для кэшей, `Arc<AtomicU64>` для счётчиков
+- **Без вложенных блокировок**: правило «одна блокировка за раз» (single-lock-at-a-time) предотвращает взаимоблокировки
+- **Диспетчер**: синхронная диспетчеризация по `FrameHeader` → `DispatchResult` (никакого async на горячем пути)
 
 ## Ключевые подсистемы
 
+Основные части и где каждая лежит в дереве исходников.
+
 | Подсистема | Модуль | Назначение |
 |-----------|--------|------------|
-| Kademlia DHT | `node/dht/` | Распределённая хэш-таблица, iterative lookup, store/find |
-| Mailbox | `node/mailbox/` | Хранение offline-сообщений, WAL-персистентность, шардированные реплики |
-| Route Cache | `node/routing/` | Next-hop lookup, multi-path scoring, адаптивная ёмкость |
-| Session | `node/session/` | AEAD-сессии, TX registry, WRR scheduling, hibernate |
-| Discovery | `node/discovery/` | Attachment records, app endpoints, name service |
-| Mesh | `node/mesh/` | UDP beacon, локальное обнаружение, gateway bridge |
-| NAT | `node/nat/` | Hole punching, relay-туннели, observed address |
-| Transport | `transport/` | TCP, TLS, QUIC, WebSocket, SOCKS5, fingerprint |
-| Congestion | `node/congestion.rs` | Real-time мониторинг нагрузки, backpressure (>78% → drop transit) |
-| Reputation | `node/reputation.rs` | Per-peer trust score, transit gate |
-| Memory | `node/memory.rs` | Глобальный RAM-бюджет, priority-based eviction |
+| Kademlia DHT | `node/dht/` | Распределённая хэш-таблица, итеративный поиск, запись/поиск |
+| Mailbox | `node/mailbox/` | Хранение офлайн-сообщений, журнал упреждающей записи (WAL), шардированные реплики |
+| Route Cache | `node/routing/` | Поиск следующего узла, оценка по нескольким путям, адаптивная ёмкость |
+| Session | `node/session/` | AEAD-сессии, реестр передачи (TX), планирование WRR, спящий режим |
+| Discovery | `node/discovery/` | Записи привязки, точки входа приложений, служба имён |
+| Mesh | `node/mesh/` | UDP-маяк, локальное обнаружение, мост к шлюзу |
+| NAT | `node/nat/` | Пробивка NAT, туннели через ретранслятор, наблюдаемый адрес |
+| Transport | `transport/` | TCP, TLS, QUIC, WebSocket, SOCKS5, отпечаток |
+| Congestion | `node/congestion.rs` | Мониторинг нагрузки в реальном времени, обратное давление (>78% → сброс транзита) |
+| Reputation | `node/reputation.rs` | Доверие к каждому соседу, порог транзита |
+| Memory | `node/memory.rs` | Глобальный бюджет RAM, вытеснение по приоритету |
 | Adaptive | `cfg/adaptive.rs` | Оценка размера сети, масштабирование параметров |
