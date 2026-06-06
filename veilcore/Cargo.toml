@@ -96,7 +96,6 @@ veil-reputation = { path = "../crates/veil-reputation" }
 veil-routing = { path = "../crates/veil-routing" }
 veil-session = { path = "../crates/veil-session" }
 veil-proto = { path = "../crates/veil-proto" }
-veil-transfer = { path = "../crates/veil-transfer" }
 veil-transport = { path = "../crates/veil-transport" }
 veil-types = { path = "../crates/veil-types" }
 veil-update = { path = "../crates/veil-update" }

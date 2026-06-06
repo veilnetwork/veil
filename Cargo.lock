@@ -4652,15 +4652,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "veil-transfer"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "rand_core 0.6.4",
- "veil-proto",
-]
-
-[[package]]
 name = "veil-transport"
 version = "0.1.0"
 dependencies = [
@@ -4880,7 +4871,6 @@ dependencies = [
  "veil-reputation",
  "veil-routing",
  "veil-session",
- "veil-transfer",
  "veil-transport",
  "veil-types",
  "veil-update",

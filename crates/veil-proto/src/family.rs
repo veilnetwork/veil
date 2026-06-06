@@ -379,12 +379,12 @@ impl TryFrom<u16> for DiscoveryMsg {
 pub enum DeliveryMsg {
     Forward = 3,
     DeliveryStatus = 4,
-    /// sent before the first `Chunk` frame; describes the full
-    /// transfer so the receiver can allocate a `ReassemblyState`.
-    /// Body is `ChunkManifestPayload` (92 bytes fixed).
+    /// OBSOLETE direct-chunk manifest (pre-H-B). No longer emitted; the
+    /// dispatcher drops these frames. Large payloads now ride relay-preserving
+    /// `ChunkedEnvelopePayload` over `Forward`. Variant kept for wire-compat.
     ChunkManifest = 7,
-    /// one fragment of a chunked transfer.
-    /// Body is `ChunkPayload` (20-byte header + variable data).
+    /// OBSOLETE direct-chunk fragment (pre-H-B). Dropped on receipt; see
+    /// `ChunkManifest`.
     Chunk = 8,
     /// stateless transit relay — lightweight header, no per-flow session state.
     /// Body is `TransitFramePayload`.
