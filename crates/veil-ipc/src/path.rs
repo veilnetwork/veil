@@ -107,19 +107,21 @@ pub fn resolve_ipc_endpoint(
                         "ipc.socket_uri: TCP host must be loopback, got `{host}`"
                     )));
                 }
-                // `SocketAddr::parse` does not resolve hostnames; map the
-                // accepted `localhost` alias to a loopback literal.
-                let host_ip = if host == "localhost" {
-                    "127.0.0.1"
-                } else {
-                    host.as_str()
+                // `SocketAddr::parse` does not resolve hostnames and requires
+                // IPv6 literals in bracket form, so normalize the accepted
+                // loopback aliases (only loopback reaches here — checked above):
+                // `localhost`/`127.0.0.1` → `127.0.0.1:port`, `::1` → `[::1]:port`
+                // (F11: the bare `::1:port` the old code built failed to parse).
+                let hostport = match host.as_str() {
+                    "::1" => format!("[::1]:{port}"),
+                    "localhost" | "127.0.0.1" => format!("127.0.0.1:{port}"),
+                    other => format!("{other}:{port}"),
                 };
-                let bind_addr: std::net::SocketAddr =
-                    format!("{host_ip}:{port}").parse().map_err(|e| {
-                        IpcEndpointError::Validation(format!(
-                            "ipc.socket_uri: invalid tcp address {host}:{port} — {e}"
-                        ))
-                    })?;
+                let bind_addr: std::net::SocketAddr = hostport.parse().map_err(|e| {
+                    IpcEndpointError::Validation(format!(
+                        "ipc.socket_uri: invalid tcp address {host}:{port} — {e}"
+                    ))
+                })?;
                 let runtime_dir = query_runtime_dir
                     .map(PathBuf::from)
                     .or_else(|| config_dir.map(|p| p.to_path_buf()))
