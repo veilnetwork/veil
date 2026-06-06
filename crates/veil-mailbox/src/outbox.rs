@@ -272,33 +272,60 @@ impl Outbox {
         start[..32].copy_from_slice(&receiver_id);
         let mut end = [0xFFu8; KEY_LEN];
         end[..32].copy_from_slice(&receiver_id);
-        let mut out: Vec<OutboxEntry> = Vec::new();
+
+        // Pass 1: select the MAX_FIND_MISSING_RESULTS OLDEST missing entries
+        // WITHOUT materializing every blob. The record is `ts(8) || blob_len(4)
+        // || blob`, so the timestamp is read from the header alone. A bounded
+        // max-heap on `deposited_at` keeps only the oldest `cap` (deposited_at,
+        // content_id) pairs (each ~40 B) — peak memory is the result cap, not
+        // the whole outbox (which previously pushed every full blob, then
+        // truncated). Mirrors the bounded `Mailbox::fetch` (audit U10).
+        let mut heap: std::collections::BinaryHeap<(u64, [u8; 32])> =
+            std::collections::BinaryHeap::new();
         for entry in entries.range::<&[u8]>(start.as_slice()..=end.as_slice())? {
             let (k, v) = entry?;
             let key_bytes = k.value();
             if key_bytes.len() != KEY_LEN || key_bytes[..32] != receiver_id {
                 continue;
             }
-            let mut content_id = [0u8; 32];
-            content_id.copy_from_slice(&key_bytes[32..]);
-            let (deposited_at, blob) = decode_record(v.value())?;
+            let val = v.value();
+            if val.len() < 12 {
+                continue; // corrupt/short header — skip (decode would error later)
+            }
+            let deposited_at = u64::from_be_bytes(val[..8].try_into().unwrap());
             if deposited_at < since {
                 continue;
             }
+            let mut content_id = [0u8; 32];
+            content_id.copy_from_slice(&key_bytes[32..]);
             if bloom.contains(&content_id) {
                 // Receiver claims to have it. Skip.
                 continue;
             }
-            out.push(OutboxEntry {
-                receiver_id,
-                content_id,
-                deposited_at,
-                blob,
-            });
+            heap.push((deposited_at, content_id));
+            if heap.len() > MAX_FIND_MISSING_RESULTS {
+                heap.pop(); // evicts the NEWEST (largest ts) → keep the oldest cap
+            }
         }
-        // Oldest first.
-        out.sort_by_key(|e| e.deposited_at);
-        out.truncate(MAX_FIND_MISSING_RESULTS);
+
+        // Pass 2: load blobs for exactly the selected survivors, oldest-first.
+        let mut selected: Vec<(u64, [u8; 32])> = heap.into_vec();
+        selected.sort_by_key(|(ts, _)| *ts);
+        let mut out: Vec<OutboxEntry> = Vec::with_capacity(selected.len());
+        for (_, content_id) in selected {
+            let mut key = [0u8; KEY_LEN];
+            key[..32].copy_from_slice(&receiver_id);
+            key[32..].copy_from_slice(&content_id);
+            if let Some(v) = entries.get(key.as_slice())? {
+                let (deposited_at, blob) = decode_record(v.value())?;
+                out.push(OutboxEntry {
+                    receiver_id,
+                    content_id,
+                    deposited_at,
+                    blob,
+                });
+            }
+        }
         Ok(out)
     }
 
@@ -489,6 +516,31 @@ mod tests {
         let bf = BloomFilter::for_capacity(100, 0.01);
         let missing = o.find_missing(recv, 0, &bf).unwrap();
         assert_eq!(missing.len(), 2);
+    }
+
+    #[test]
+    fn t1_4_p4_outbox_find_missing_caps_results_oldest_first() {
+        let (o, _tmp, _clk) = fresh(OutboxConfig::default());
+        let recv = [1u8; 32];
+        let n = MAX_FIND_MISSING_RESULTS + 7;
+        for i in 0..n {
+            let mut cid = [0u8; 32];
+            cid[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            o.put(recv, cid, vec![0u8; 16]).unwrap();
+        }
+        let bf = BloomFilter::for_capacity(1000, 0.01);
+        let missing = o.find_missing(recv, 0, &bf).unwrap();
+        assert_eq!(
+            missing.len(),
+            MAX_FIND_MISSING_RESULTS,
+            "result set must be capped regardless of how many match"
+        );
+        for w in missing.windows(2) {
+            assert!(
+                w[0].deposited_at <= w[1].deposited_at,
+                "results must be oldest-first"
+            );
+        }
     }
 
     #[test]

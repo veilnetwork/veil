@@ -1971,7 +1971,13 @@ async fn handle_ipc_client(
                         .await?;
                     }
                     Ok(LocalAppMsg::MailboxAck) => {
-                        handle_mailbox_ack(&mut wh, &body, mailbox_backend.as_ref()).await?;
+                        handle_mailbox_ack(
+                            &mut wh,
+                            &body,
+                            &mut client_state,
+                            mailbox_backend.as_ref(),
+                        )
+                        .await?;
                     }
                     Ok(LocalAppMsg::OutboxPut) => {
                         handle_outbox_put(

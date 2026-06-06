@@ -120,7 +120,7 @@ pub(crate) async fn handle_bind(
         Ok((handle, rx)) => {
             // Create per-app socket marker in PerApp mode.
             let socket_path = if !ephemeral {
-                app_socket_dir.map(|dir| build_per_app_socket(dir, &app_id))
+                app_socket_dir.and_then(|dir| build_per_app_socket(dir, &app_id))
             } else {
                 None
             };
@@ -158,7 +158,13 @@ pub(crate) async fn handle_bind(
 /// dropped immediately as the daemon never serves on it; the node stays
 /// as an ownership marker until unbind).  On non-Unix platforms an empty
 /// marker file is created instead — filesystem ACLs still apply.
-fn build_per_app_socket(dir: &Path, app_id: &[u8; 32]) -> PathBuf {
+///
+/// Returns `Some(path)` ONLY when the marker was actually created (and, on
+/// Unix, locked to 0o600); returns `None` on any failure so the caller does
+/// not record an ownership marker that does not exist. The bind itself does
+/// not fail on a marker hiccup — the marker is an auxiliary ownership signal,
+/// not the registration of record.
+fn build_per_app_socket(dir: &Path, app_id: &[u8; 32]) -> Option<PathBuf> {
     let hex_id: String = app_id.iter().fold(String::with_capacity(64), |mut s, b| {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
@@ -168,15 +174,25 @@ fn build_per_app_socket(dir: &Path, app_id: &[u8; 32]) -> PathBuf {
     let _ = std::fs::remove_file(&path);
     #[cfg(unix)]
     {
-        if let Ok(_listener) = std::os::unix::net::UnixListener::bind(&path) {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(&path, perms);
+        use std::os::unix::fs::PermissionsExt;
+        // Bind must succeed for the marker to exist at all.
+        if std::os::unix::net::UnixListener::bind(&path).is_err() {
+            return None;
         }
+        // Lock to owner-only; if chmod fails we must NOT leave a looser-perm
+        // marker behind — remove it and report no marker.
+        let perms = std::fs::Permissions::from_mode(0o600);
+        if std::fs::set_permissions(&path, perms).is_err() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some(path)
     }
     #[cfg(not(unix))]
     {
-        let _ = std::fs::File::create(&path);
+        match std::fs::File::create(&path) {
+            Ok(_) => Some(path),
+            Err(_) => None,
+        }
     }
-    path
 }
