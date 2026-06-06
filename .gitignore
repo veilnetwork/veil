@@ -28,7 +28,7 @@ ssl/cert.pem
 
 # Library/plugin convention: pubspec.lock is NOT committed (Dart
 # pub.dev guideline — applications commit their own lock, libraries
-# resolve fresh).  veil_flutter is а plugin library.
+# resolve fresh).  veil_flutter is a plugin library.
 flutter/veil_flutter/pubspec.lock
 flutter/veil_flutter/example/pubspec.lock
 

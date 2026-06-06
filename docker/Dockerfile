@@ -2,9 +2,9 @@
 FROM rust:1-bookworm AS build
 
 # Phase 6.50.b audit fix: production default.  Pre-fix the Dockerfile
-# baked в `allow-empty-seeds`, producing а container image что won't
-# bootstrap without operator-supplied peers.  Now defaults к
-# `production-seeds`.  Override at build time для testnet:
+# baked in `allow-empty-seeds`, producing a container image that won't
+# bootstrap without operator-supplied peers.  Now defaults to
+# `production-seeds`.  Override at build time for testnet:
 #     docker build --build-arg CARGO_FEATURES="allow-empty-seeds" .
 # (audit M-6: dropped the non-existent `quic-session` feature that failed
 # every build; the default features rocksdb-cold + tls-boring are applied
