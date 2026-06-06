@@ -3895,9 +3895,25 @@ impl NodeServices {
         key: [u8; 32],
         n_replicas: usize,
         timeout: std::time::Duration,
+        // F1 (DHT cache-poisoning): a local cache value is an OPTIMIZATION, not a
+        // trust boundary. The identity-family STORE path stores NM/ID/IR/MC
+        // bytes after STRUCTURAL decode only (verification is deferred to read),
+        // so a peer can park a structurally-valid but cryptographically-invalid
+        // value under a target key. The single-replica local fast path then
+        // short-circuits remote quorum and the resolver fails verification with
+        // no fallback — a targeted resolve DoS (and, for names, a quorum bypass).
+        // The fast path is now taken ONLY when `validate` accepts the local
+        // bytes; otherwise we fall through to remote quorum (the resolver's
+        // post-quorum `store_local` then repairs the poisoned shard). Pass
+        // `|_| true` to preserve the old unconditional fast path.
+        validate: impl Fn(&[u8]) -> bool,
     ) -> Vec<Vec<u8>> {
-        // Local fast path — see method doc.
-        if let Some(value) = self.dht.get_local(&key) {
+        // Validated local fast path. A local value that fails `validate`
+        // (poisoned / unverifiable) does NOT short-circuit — it falls through to
+        // the remote quorum below.
+        if let Some(value) = self.dht.get_local(&key)
+            && validate(&value)
+        {
             return vec![value];
         }
         let n = n_replicas.clamp(1, veil_proto::budget::DHT_REPLICATION_K);
@@ -4192,7 +4208,14 @@ impl NodeServices {
         // quorum policy preserved verbatim — N replicas
         // queried, ≥QUORUM matches required, anti-sybil at resolve.
         let replicas = self
-            .dht_get_replicated(key, RESOLVE_MAX_REPLICAS, timeout)
+            .dht_get_replicated(key, RESOLVE_MAX_REPLICAS, timeout, |bytes| {
+                // Self-validating: a forged document cannot have
+                // node_id == BLAKE3(its master), so a local doc that decodes for
+                // `node_id` AND verifies is authoritative — trust the fast path.
+                matches!(IdentityDocument::decode(bytes), Ok(d)
+                    if d.node_id == node_id
+                        && verify_identity_document(&d, now_unix_secs).is_ok())
+            })
             .await;
         let bytes = pick_quorum_match(&replicas, RESOLVE_QUORUM_THRESHOLD).ok_or_else(|| {
             if replicas.is_empty() {
@@ -4252,17 +4275,12 @@ impl NodeServices {
         }
 
         let cert_key = migration_cert_dht_key(&old_node_id);
-        let replicas = self
-            .dht_get_replicated(cert_key, RESOLVE_MAX_REPLICAS, timeout)
-            .await;
-        if replicas.is_empty() {
-            return Ok(None);
-        }
 
         // Need the OLD master pubkey to verify cert signatures. The
         // previous hop's resolve_one_identity_doc just mirrored the
         // current document into the local store; pull it back for
-        // free (no second quorum round-trip).
+        // free (no second quorum round-trip). Fetched BEFORE the replica
+        // query so the fast-path validator (F1) can verify a local cert.
         let doc_key = IdentityDocument::dht_key(&old_node_id);
         let old_master_b64 = match self.dht.get_local(&doc_key) {
             Some(bytes) => match IdentityDocument::decode(&bytes) {
@@ -4271,6 +4289,19 @@ impl NodeServices {
             },
             None => return Ok(None), // no current doc → can't verify cert
         };
+
+        let replicas = self
+            .dht_get_replicated(cert_key, RESOLVE_MAX_REPLICAS, timeout, |bytes| {
+                // Verify the local cert against the old master before trusting the
+                // fast path (F1); a poisoned/unverifiable local cert falls through
+                // to remote quorum instead of hiding a real published migration.
+                matches!(decode_migration_cert(bytes), Ok(c)
+                    if verify_migration_cert(&c, &old_master_b64, now_unix_secs).is_ok())
+            })
+            .await;
+        if replicas.is_empty() {
+            return Ok(None);
+        }
 
         let mut best: Option<MigrationCert> = None;
         let mut first_decode_err: Option<String> = None;
@@ -4343,7 +4374,17 @@ impl NodeServices {
         // close to the name's keyspace slot can't single-handedly
         // serve a forged NameClaim binding `@alice → attacker_id`.
         let claim_replicas = self
-            .dht_get_replicated(claim_key, RESOLVE_MAX_REPLICAS, timeout)
+            .dht_get_replicated(claim_key, RESOLVE_MAX_REPLICAS, timeout, |bytes| {
+                // Name authority is QUORUM, not self-signature: a self-consistent
+                // forged claim (@name -> attacker, signed by attacker) would pass
+                // any cryptographic self-check. So the local fast path is trusted
+                // ONLY for names WE published (claim.node_id == our id) — every
+                // other name must clear remote quorum below. Closes the
+                // cache-poison name-hijack while keeping offline self-resolution.
+                matches!(NameClaim::decode(bytes), Ok(c)
+                    if c.name == normalized
+                        && c.node_id == *self.identity.local_identity.node_id.as_bytes())
+            })
             .await;
         let claim_bytes =
             pick_quorum_match(&claim_replicas, RESOLVE_QUORUM_THRESHOLD).ok_or_else(|| {
