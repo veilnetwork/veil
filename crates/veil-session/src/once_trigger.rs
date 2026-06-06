@@ -93,7 +93,7 @@ mod tests {
         let mut t = OnceTrigger::new();
         t.try_fire();
         t.clear();
-        assert!(!t.has_fired(), "clear() must put trigger back в Idle");
+        assert!(!t.has_fired(), "clear() must put trigger back in Idle");
         assert!(t.try_fire(), "post-clear try_fire must succeed once");
         assert!(!t.try_fire(), "post-clear second fire still bounded");
     }

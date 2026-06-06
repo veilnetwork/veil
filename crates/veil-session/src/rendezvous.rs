@@ -899,7 +899,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_robin_picks_destinations_evenly() {
-        // 3 destinations, 6 grants — each destination сhould fire twice.
+        // 3 destinations, 6 grants — each destination should fire twice.
         let (target_nid, target_sk) = target_identity(20);
         let binder = Arc::new(RecordingBinder::default());
         let mut p = default_policy();

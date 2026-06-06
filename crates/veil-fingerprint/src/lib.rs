@@ -319,7 +319,7 @@ mod tests {
         // Conservative bound — random/random unigram chi² at 200 k
         // samples lands ≈ 0.002; threshold 0.01 sits comfortably
         // above the noise floor while still tripping on а real
-        // distribution shift (biased samples хit > 0.3 в the
+        // distribution shift (biased samples hit > 0.3 in the
         // sibling test).
         assert!(
             chi < 0.01,
@@ -375,6 +375,6 @@ mod tests {
     fn baseline_is_deterministic_for_same_seed() {
         let a = uniform_random_baseline(123, 1000);
         let b = uniform_random_baseline(123, 1000);
-        assert_eq!(a, b, "seeded baseline должен be deterministic");
+        assert_eq!(a, b, "seeded baseline must be deterministic");
     }
 }

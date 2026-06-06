@@ -37,7 +37,7 @@ impl MobileStatusProvider for RuntimeMobileStatus {
         let multiplier = veil_session::runner::current_mobile_background_keepalive_multiplier();
         let factor = veil_session::runner::current_mobile_background_keepalive_factor();
 
-        // Battery + low-battery throttle factor — мirror
+        // Battery + low-battery throttle factor — mirror
         // `MobileConfig::battery_multiplier` semantics. Sentinels:
         // battery=100 means AC / unknown (never throttled); threshold=255
         // means feature disabled.

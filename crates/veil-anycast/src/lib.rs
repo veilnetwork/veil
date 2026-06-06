@@ -636,7 +636,7 @@ mod tests {
         list.upsert(AnycastRecord::sign(*b"mbox", [0xDD; 32], 5, 3600, 0, &key));
         svc.dht.store_local(dht_key, list.encode());
         let r = svc.resolve(*b"mbox", 32);
-        assert_eq!(r.node_ids.len(), 2, "BestEffort accepts both v1 и signed");
+        assert_eq!(r.node_ids.len(), 2, "BestEffort accepts both v1 and signed");
     }
 
     #[test]

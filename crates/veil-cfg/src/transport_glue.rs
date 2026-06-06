@@ -233,7 +233,7 @@ mod bandwidth_mimicry_failclosed_tests {
         cfg.transport.bandwidth_mimicry_enabled = true;
         cfg.transport.experimental_allow_noop_mimicry = true;
         // Should succeed (operator explicitly acknowledged the no-op).
-        let _ = context_from_config(&cfg).expect("ack flag pairs с enabled — daemon must start");
+        let _ = context_from_config(&cfg).expect("ack flag pairs with enabled — daemon must start");
     }
 
     #[test]

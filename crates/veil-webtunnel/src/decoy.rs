@@ -313,7 +313,7 @@ impl ReverseProxyDecoy {
         };
         let port: u16 = port_s
             .parse()
-            .map_err(|_| DecoyError::NotFound(format!("bad backend port в {}", self.backend)))?;
+            .map_err(|_| DecoyError::NotFound(format!("bad backend port in {}", self.backend)))?;
         Ok((host.to_owned(), port, prefix.to_owned()))
     }
 }

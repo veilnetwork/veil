@@ -592,7 +592,11 @@ mod tests {
 
         let addr_a = realm_a.local_addr().unwrap();
         let neighbors_a = NeighborTable::new();
-        let mut receiver_a = realm_a.make_beacon_receiver(neighbors_a.clone());
+        // legacy opt-out: these discovery/rate-limit tests use unsigned beacons
+        // (`new_basic`); the default now requires signed.
+        let mut receiver_a = realm_a
+            .make_beacon_receiver(neighbors_a.clone())
+            .with_require_signed(false);
 
         // B sends beacons directly to A's address (unicast on loopback).
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -680,7 +684,11 @@ mod tests {
             .unwrap();
         let addr_a = realm_a.local_addr().unwrap();
         let neighbors_a = NeighborTable::new();
-        let mut receiver_a = realm_a.make_beacon_receiver(neighbors_a.clone());
+        // legacy opt-out: these discovery/rate-limit tests use unsigned beacons
+        // (`new_basic`); the default now requires signed.
+        let mut receiver_a = realm_a
+            .make_beacon_receiver(neighbors_a.clone())
+            .with_require_signed(false);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let _task = realm_b
@@ -724,7 +732,11 @@ mod tests {
 
         let addr_a = realm_a.local_addr().unwrap();
         let neighbors_a = NeighborTable::new();
-        let mut receiver_a = realm_a.make_beacon_receiver(neighbors_a.clone());
+        // legacy opt-out: these discovery/rate-limit tests use unsigned beacons
+        // (`new_basic`); the default now requires signed.
+        let mut receiver_a = realm_a
+            .make_beacon_receiver(neighbors_a.clone())
+            .with_require_signed(false);
 
         // Flood: send MAX+1 beacons from B using distinct node IDs (so the
         // "already in table" check doesn't short-circuit the rate limiter).

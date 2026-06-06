@@ -156,6 +156,17 @@ pub fn wrap_for_hop_kind(
     let ephemeral_pk = X25519PublicKey::from(&ephemeral_sk).to_bytes();
     let hop_pk = X25519PublicKey::from(*hop_pk_bytes);
     let shared = ephemeral_sk.diffie_hellman(&hop_pk);
+    // `hop_pk` is a trusted local routing pubkey (fixed at circuit-build time),
+    // not attacker-controlled per message, and this constructor is infallible
+    // by contract. A non-contributory result here can only mean a relay
+    // published a low-order key, which weakens only the SENDER's own layer — so
+    // we assert it in debug/test rather than ripple a `Result` through every
+    // circuit-build call site. The attacker-controlled `unwrap_at_hop` path is
+    // the one that fails closed.
+    debug_assert!(
+        shared.was_contributory(),
+        "onion wrap: hop pubkey is non-contributory (low-order) — relay published a bad key"
+    );
 
     let aead_key = derive_aead_key(shared.as_bytes());
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -214,6 +225,13 @@ pub fn unwrap_at_hop_kind(
     let ciphertext = &envelope[EPHEMERAL_PK_LEN + NONCE_LEN..];
 
     let shared = hop_sk.diffie_hellman(&X25519PublicKey::from(ephemeral_pk));
+    // Reject a non-contributory (low-order) ephemeral_pk. It is attacker-
+    // controlled (read straight off the wire above), and a small-order point
+    // forces a known shared secret — fail closed instead of deriving an AEAD
+    // key off it. Mirrors the rendezvous decrypt path.
+    if !shared.was_contributory() {
+        return Err(OnionError::Aead);
+    }
     let aead_key = derive_aead_key(shared.as_bytes());
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&aead_key));

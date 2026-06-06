@@ -1357,7 +1357,7 @@ mod tests {
         };
 
         ConfigCommandService::sign(&mut context, Some(1_700_000_000), /* stdout */ true)
-            .expect("sign must succeed на а well-formed config");
+            .expect("sign must succeed on a well-formed config");
 
         let signed = context.io.output.clone();
         assert!(

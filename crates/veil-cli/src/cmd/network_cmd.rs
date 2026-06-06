@@ -362,7 +362,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&priv_path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "priv key must be 0600 на Unix");
+            assert_eq!(mode & 0o777, 0o600, "priv key must be 0600 on Unix");
         }
     }
 

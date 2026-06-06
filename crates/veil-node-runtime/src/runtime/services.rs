@@ -1048,7 +1048,7 @@ impl NodeRuntime {
         })?;
         // Use TransportUri::host() (not plaintext_host) — plaintext_host
         // returns None for AEAD/TLS schemes by design (DPI-visibility
-        // classification).  Стealth listeners primarily use obfs4-tcp
+        // classification).  Stealth listeners primarily use obfs4-tcp
         // where plaintext_host=None, но we still need the host string
         // для composing the response URI.
         let primary_advertise_host = primary_parsed

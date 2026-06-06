@@ -150,7 +150,7 @@ pub async fn run(
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(&path, template)?;
-                    eprintln!("wrote default ogate config к {}", path.display());
+                    eprintln!("wrote default ogate config to {}", path.display());
                     eprintln!("edit it (network, peers, local_addr_v4) then:");
                     eprintln!("    ogate up --config {}", path.display());
                 }

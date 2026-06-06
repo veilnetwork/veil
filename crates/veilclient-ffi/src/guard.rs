@@ -149,7 +149,7 @@ pub(crate) type FfiPreludeOutcome = Result<(), c_int>;
 /// `op_name` is embedded в the error message ("<op_name> called from
 /// inside a Tokio runtime — would deadlock") so consumers can identify
 /// which FFI fn tripped.  Keep this а static literal matching the fn
-/// name; doc-comment lint катches mismatches at review time.
+/// name; doc-comment lint catches mismatches at review time.
 ///
 /// # Safety
 ///

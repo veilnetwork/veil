@@ -39,7 +39,7 @@ pub struct MobileState {
     /// (clamped at `MAX_BACKGROUND_KEEPALIVE_MULTIPLIER`) so sessions
     /// survive OS-level app suspension. Atomic — flipped без holding
     /// any locks; session runners read on every keepalive recomputation
-    /// tick. Кept across reload (the operator-controlled multiplier
+    /// tick. Kept across reload (the operator-controlled multiplier
     /// snapshot lives elsewhere).
     pub mobile_background_mode: Arc<AtomicBool>,
 

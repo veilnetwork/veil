@@ -117,7 +117,7 @@ pub async fn try_veil_setup_and_bridge(
         None => {
             return Err((
                 inbound,
-                anyhow!("host `{host}` invalid (empty или > 255 bytes)"),
+                anyhow!("host `{host}` invalid (empty or > 255 bytes)"),
             ));
         }
     };
@@ -150,7 +150,7 @@ pub async fn try_veil_setup_and_bridge(
     if status != ConnectStatus::Ok {
         return Err((
             inbound,
-            anyhow!("server rejected connect к {host}:{port}: {status:?}"),
+            anyhow!("server rejected connect to {host}:{port}: {status:?}"),
         ));
     }
 
@@ -216,7 +216,7 @@ async fn try_veil_setup_and_bridge_with_prelude(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            return Err((inbound, anyhow!("open veil stream к {host}:{port}: {e}")));
+            return Err((inbound, anyhow!("open veil stream to {host}:{port}: {e}")));
         }
         Err(_) => {
             return Err((
@@ -302,7 +302,7 @@ async fn open_direct_with_prelude_and_bridge(
     outbound
         .write_all(&prelude)
         .await
-        .context("write prelude к direct target")?;
+        .context("write prelude to direct target")?;
     log::debug!("oproxy.routing.direct.prelude: bridged {target}");
     let (mut in_r, mut in_w) = inbound.into_split();
     let (mut out_r, mut out_w) = outbound.into_split();

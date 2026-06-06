@@ -15,11 +15,11 @@
 //! [..] version_str ASCII semver "1.2.3" (≤ 64 B)
 //! [..] min_version_len u8
 //! [..] min_compatible_version ASCII semver (≤ 64 B; oldest version
-//! that may upgrade to this. NOTE (audit cycle-5): carried +
-//! signed but NOT yet ENFORCED — no code compares the
-//! installed version against it, so a client several versions
-//! behind is not actually refused. Deferred receiver-side
-//! gate, see TASKS.md; NOT a live security baseline today.)
+//! that may upgrade to this. ENFORCED on apply: `apply_update`
+//! refuses when the running binary's version is below this
+//! (see `min_compatible_satisfied`). An empty value means "no
+//! constraint"; a present-but-malformed value is rejected
+//! fail-closed.)
 //! [..] platform_target_len u8
 //! [..] platform_target ASCII (≤ 64 B): "linux-x86_64"
 //! "linux-aarch64", "macos-aarch64"
