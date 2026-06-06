@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros"] }
 tokio-util = "0.7"
 bytes = "1"
 ed25519-dalek = "2"
-thiserror = "1"
+thiserror = "2.0"
 
 [features]
 # Forward veilcore/veil-bootstrap feature flags so downstream
