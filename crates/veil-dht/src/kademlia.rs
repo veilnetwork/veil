@@ -1077,16 +1077,28 @@ impl KademliaService {
         lock!(self.inner).store.peek(key)
     }
 
-    /// Handle NEIGHBOR_OFFER: register the offering peer in the routing table.
+    /// Handle a NEIGHBOR_OFFER from an authenticated peer `source`.
     ///
     /// The `addr` bytes are interpreted as a UTF-8 transport string (e.g.
     /// "127.0.0.1:9000"); non-UTF-8 bytes are base64-encoded as a fallback.
-    pub fn handle_neighbor_offer(&self, payload: &veil_proto::control::NeighborOfferPayload) {
+    ///
+    /// The offered `(node_id, transport)` is peer-claimed and unverified, so it
+    /// goes through the source-tracked pending pool (`add_contact_unverified_from`)
+    /// — NOT straight into the live routing table — and is promoted only on a
+    /// successful OVL1 handshake with the claimed `node_id`. This matches the
+    /// FIND_NODE-response and PEX-walk ingress paths and closes an
+    /// eclipse/route-poisoning vector where a peer could inject a
+    /// `victim_node_id → attacker_endpoint` mapping directly into the table.
+    pub fn handle_neighbor_offer(
+        &self,
+        source: NodeIdBytes,
+        payload: &veil_proto::control::NeighborOfferPayload,
+    ) {
         let transport = String::from_utf8(payload.addr.clone()).unwrap_or_else(|e| {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, e.into_bytes())
         });
         let contact = Contact::new(payload.node_id, transport);
-        lock!(self.inner).routing.insert(contact);
+        self.add_contact_unverified_from(source, contact);
     }
 
     /// Add a node to the routing table (called when a peer is heard).
@@ -1880,6 +1892,36 @@ mod tests {
         assert!(
             svc.find_closest_nodes(&peer, 16).is_empty(),
             "unverified contact must be invisible to find_closest"
+        );
+    }
+
+    #[test]
+    fn neighbor_offer_routes_through_pending_pool() {
+        // A peer-claimed NeighborOffer must NOT land directly in the live
+        // routing table (eclipse/route-poisoning vector); it goes through the
+        // source-tracked pending pool like every other untrusted-contact ingress.
+        let svc = service(0);
+        let source = [0x11u8; 32];
+        let offered = [0xAAu8; 32];
+        let payload = veil_proto::control::NeighborOfferPayload {
+            node_id: offered,
+            addr: b"tcp://attacker:1".to_vec(),
+            flags: 0,
+        };
+        svc.handle_neighbor_offer(source, &payload);
+        assert_eq!(
+            svc.routing_table_size(),
+            0,
+            "NeighborOffer must NOT enter the live routing table directly"
+        );
+        assert_eq!(
+            svc.pending_contacts_count(),
+            1,
+            "offer must land in the source-tracked pending pool"
+        );
+        assert!(
+            svc.find_closest_nodes(&offered, 16).is_empty(),
+            "unverified offer must be invisible to find_closest"
         );
     }
 
