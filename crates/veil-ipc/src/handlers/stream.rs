@@ -282,7 +282,7 @@ async fn handle_stream_open_remote(
 #[allow(clippy::too_many_arguments)]
 async fn run_remote_stream_bridge(
     mut data_rx: mpsc::Receiver<Vec<u8>>,
-    delivery_tx: mpsc::Sender<veil_bufpool::PooledShared>,
+    delivery_tx: impl Into<crate::server::DeliveryQueueTx>,
     ipc_stream_id: u32,
     dst_node_id: [u8; 32],
     wire_stream_id: u32,
@@ -292,6 +292,7 @@ async fn run_remote_stream_bridge(
     stream_table: IpcStreamTable,
     broadcaster: Arc<dyn FrameBroadcaster>,
 ) {
+    let delivery_tx = delivery_tx.into();
     let mut local_backpressure = false;
     while let Some(data) = data_rx.recv().await {
         let frame = encode_stream_data(ipc_stream_id, &data);

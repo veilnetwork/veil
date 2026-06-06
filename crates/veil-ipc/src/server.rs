@@ -3,6 +3,7 @@
 //! handshake, and manages per-client state.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::frame_io::{encode_ipc_frame, read_frame, write_frame_stream, write_frame_wh};
@@ -69,11 +70,101 @@ const IPC_QUERY_BURST: u32 = 30;
 const IPC_PUT_REFILL_PER_SEC: f32 = 50.0;
 const IPC_PUT_BURST: u32 = 200;
 
+/// Byte-budgeted, clone-able sender for a client's veil→IPC delivery queue.
+///
+/// The underlying mpsc is bounded by frame COUNT (`DELIVERY_CHANNEL_CAP`), but a
+/// single reassembled delivery can be many MiB (a relay-chunked transfer joins
+/// up to `MAX_REASSEMBLY_BYTES` before the app reads it), so a full count-queue
+/// could pin gigabytes against a slow / non-reading client. This wrapper also
+/// caps total IN-FLIGHT BYTES: `try_send` refuses (reported as `Full`, i.e. the
+/// frame is dropped + counted exactly like a count-full queue) once the queued
+/// bytes would exceed `max_bytes`. The socket-writer drain decrements the shared
+/// counter as each frame is pulled off the queue.
+#[derive(Clone)]
+pub(crate) struct DeliveryQueueTx {
+    tx: mpsc::Sender<veil_bufpool::PooledShared>,
+    inflight_bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
+}
+
+impl DeliveryQueueTx {
+    /// Enqueue a frame, refusing once the per-client in-flight byte budget would
+    /// be exceeded (returns `Full(frame)`, matching the count-cap behaviour).
+    pub(crate) fn try_send(
+        &self,
+        frame: veil_bufpool::PooledShared,
+    ) -> Result<(), mpsc::error::TrySendError<veil_bufpool::PooledShared>> {
+        let len = frame.len();
+        // Reserve the byte budget with a CAS loop (no transient over-count), then
+        // roll back if the bounded channel itself rejects the frame.
+        let mut cur = self.inflight_bytes.load(Ordering::Acquire);
+        loop {
+            if cur.saturating_add(len) > self.max_bytes {
+                return Err(mpsc::error::TrySendError::Full(frame));
+            }
+            match self.inflight_bytes.compare_exchange_weak(
+                cur,
+                cur + len,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        match self.tx.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.inflight_bytes.fetch_sub(len, Ordering::AcqRel);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Test-only: wrap a raw sender with an effectively-unbounded byte budget so
+/// existing tests that build a bare `mpsc::channel` pass straight through the
+/// `impl Into<DeliveryQueueTx>` parameters without each call site changing.
+#[cfg(test)]
+impl From<mpsc::Sender<veil_bufpool::PooledShared>> for DeliveryQueueTx {
+    fn from(tx: mpsc::Sender<veil_bufpool::PooledShared>) -> Self {
+        Self {
+            tx,
+            inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            max_bytes: usize::MAX,
+        }
+    }
+}
+
+/// Create a byte-budgeted delivery queue: the clone-able sender, the receiver
+/// the socket-writer loop drains, and the shared in-flight-bytes counter the
+/// drain decrements (by each frame's length) after pulling a frame off.
+fn delivery_queue(
+    count_cap: usize,
+    max_bytes: usize,
+) -> (
+    DeliveryQueueTx,
+    mpsc::Receiver<veil_bufpool::PooledShared>,
+    Arc<AtomicUsize>,
+) {
+    let (tx, rx) = mpsc::channel::<veil_bufpool::PooledShared>(count_cap);
+    let inflight = Arc::new(AtomicUsize::new(0));
+    (
+        DeliveryQueueTx {
+            tx,
+            inflight_bytes: Arc::clone(&inflight),
+            max_bytes,
+        },
+        rx,
+        inflight,
+    )
+}
+
 pub struct IpcClientState {
     /// RAII guards paired with optional per-app socket paths.
     handles: Vec<(EndpointHandle, Option<PathBuf>)>,
     /// Sender side of the delivery channel (cloned per forwarder task).
-    delivery_tx: mpsc::Sender<veil_bufpool::PooledShared>,
+    delivery_tx: DeliveryQueueTx,
     /// Metrics handle for counting dropped IPC frames.
     metrics: Option<Arc<dyn IpcMetrics>>,
     /// Local node identity, needed by forwarder to encode APP_DELIVER frames.
@@ -143,14 +234,14 @@ pub struct IpcClientState {
 
 impl IpcClientState {
     fn new(
-        delivery_tx: mpsc::Sender<veil_bufpool::PooledShared>,
+        delivery_tx: impl Into<DeliveryQueueTx>,
         node_id: [u8; 32],
         client_token: [u8; 16],
         metrics: Option<Arc<dyn IpcMetrics>>,
     ) -> Self {
         Self {
             handles: Vec::new(),
-            delivery_tx,
+            delivery_tx: delivery_tx.into(),
             metrics,
             node_id,
             client_token,
@@ -292,7 +383,7 @@ impl IpcClientState {
 
     /// Clone the shared delivery-tx channel — used by stream openers to
     /// register a new outbound stream against this client's frame writer.
-    pub(crate) fn delivery_tx_clone(&self) -> mpsc::Sender<veil_bufpool::PooledShared> {
+    pub(crate) fn delivery_tx_clone(&self) -> DeliveryQueueTx {
         self.delivery_tx.clone()
     }
 
@@ -380,7 +471,7 @@ impl Drop for IpcClientState {
 /// the appropriate IPC frame, pushes to the per-client delivery channel.
 async fn forward_endpoint(
     mut rx: mpsc::Receiver<AppMessage>,
-    tx: mpsc::Sender<veil_bufpool::PooledShared>,
+    tx: impl Into<DeliveryQueueTx>,
     local_node_id: [u8; 32],
     endpoint_app_id: [u8; 32],
     endpoint_id: u32,
@@ -393,6 +484,7 @@ async fn forward_endpoint(
     // [lock-acquire] block here.
     acceptor_streams: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
 ) {
+    let tx = tx.into();
     while let Some(msg) = rx.recv().await {
         let frame = match msg {
             AppMessage::Send(p) => {
@@ -1504,8 +1596,10 @@ async fn handle_ipc_client(
 
     // ── Step 4: split socket + bidirectional message loop ───────────────
     let (mut rh, mut wh) = stream.into_split();
-    let (delivery_tx, mut delivery_rx) =
-        mpsc::channel::<veil_bufpool::PooledShared>(veil_proto::budget::DELIVERY_CHANNEL_CAP);
+    let (delivery_tx, mut delivery_rx, delivery_inflight) = delivery_queue(
+        veil_proto::budget::DELIVERY_CHANNEL_CAP,
+        veil_proto::budget::MAX_DELIVERY_INFLIGHT_BYTES,
+    );
     let mut client_state = IpcClientState::new(delivery_tx, node_id, client_token, metrics);
     let mut rate_limiter: Option<TokenBucket> = if max_send_rate > 0 {
         Some(TokenBucket::new(max_send_rate as f64, max_send_rate as f64))
@@ -1562,6 +1656,9 @@ async fn handle_ipc_client(
         tokio::select! {
             // Incoming veil → IPC delivery
             Some(frame_bytes) = delivery_rx.recv() => {
+                // Release the in-flight byte budget reserved at enqueue as soon
+                // as the frame leaves the queue for the socket.
+                delivery_inflight.fetch_sub(frame_bytes.len(), Ordering::AcqRel);
                 idle.as_mut().reset(bump());
                 if wh.write_all(&frame_bytes).await.is_err() {
                     break;
@@ -2076,6 +2173,31 @@ mod tcp_backend_tests;
 #[cfg(test)]
 mod put_rate_limit_tests {
     use super::*;
+
+    /// M-4: the delivery queue enforces a BYTE budget independent of the frame
+    /// count cap — a slow/non-reading client cannot pin more than `max_bytes`,
+    /// and draining a frame frees its bytes for the next enqueue.
+    #[test]
+    fn delivery_queue_byte_budget_binds_before_count() {
+        // Generous count cap (100), tight byte budget (100 bytes).
+        let (tx, mut rx, inflight) = delivery_queue(100, 100);
+        let frame = || veil_bufpool::pooled_shared_from_vec(vec![0u8; 40]);
+        assert!(tx.try_send(frame()).is_ok()); // 40 in flight
+        assert!(tx.try_send(frame()).is_ok()); // 80 in flight
+        // 80 + 40 = 120 > 100 → refused as Full even though only 2/100 slots used.
+        assert!(matches!(
+            tx.try_send(frame()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        assert_eq!(inflight.load(Ordering::Acquire), 80);
+        // Drain one frame the way the socket-writer loop does → frees 40 bytes.
+        let got = rx.try_recv().expect("a frame is queued");
+        inflight.fetch_sub(got.len(), Ordering::AcqRel);
+        assert_eq!(inflight.load(Ordering::Acquire), 40);
+        // Budget is available again.
+        assert!(tx.try_send(frame()).is_ok());
+        assert_eq!(inflight.load(Ordering::Acquire), 80);
+    }
 
     /// audit cycle-6 (A9): the per-client MailboxPut bucket allows up to
     /// `IPC_PUT_BURST` immediate puts, then denies until it refills — separate
