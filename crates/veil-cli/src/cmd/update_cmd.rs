@@ -370,8 +370,11 @@ fn update_apply<I: CommandIo, O: ConfigOps>(
 
     // Step 2: fetch the binary from the manifest's URLs (failover
     // built into fetch_binary_via_https; SHA-256 verified by the
-    // helper before bytes return; apply_update verifies AGAIN
-    // defence-in-depth).
+    // helper before bytes return; apply_update recomputes the SHA-256
+    // AGAIN defence-in-depth). The manifest itself is a `VerifiedManifest`
+    // (the checker verified the issuer signature at fetch time) — that type
+    // is what lets it reach `apply_update`, which does not re-check the
+    // signature.
     let binary_bytes = runtime
         .block_on(fetch_binary_via_https(
             &manifest.binary_urls,

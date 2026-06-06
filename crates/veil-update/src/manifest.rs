@@ -454,6 +454,71 @@ pub fn verify_manifest(
     .map_err(|_| ManifestError::Verify)
 }
 
+/// A manifest that has passed [`verify_manifest`] — signature, issuer match,
+/// anti-downgrade, and freshness all checked.
+///
+/// [`VerifiedManifest::verify`] is the ONLY (non-test) constructor, so a
+/// `&VerifiedManifest` in a function signature is a compile-time proof that
+/// verification ran. [`crate::apply::apply_update`] takes `&VerifiedManifest`
+/// for exactly this reason: apply does NOT re-check the issuer signature
+/// (it recomputes the binary SHA-256 and re-enforces anti-downgrade, but
+/// trusts the signature was already verified at fetch time). Before this
+/// newtype that trust was a convention guarded only by a doc-comment; now the
+/// type system enforces it — you cannot reach `apply_update` without first
+/// constructing a `VerifiedManifest`.
+///
+/// Field access is read-only via [`Deref`](std::ops::Deref), so the "verified"
+/// invariant cannot be mutated away after construction.
+#[derive(Debug, Clone)]
+pub struct VerifiedManifest(UpdateManifest);
+
+impl VerifiedManifest {
+    /// Run [`verify_manifest`] (see it for the exact checks and their order)
+    /// and, on success, wrap the manifest as proof-of-verification. The only
+    /// production constructor.
+    pub fn verify(
+        manifest: UpdateManifest,
+        expected_issuer_pk: Option<&str>,
+        installed_release_unix: Option<u64>,
+        now_unix_secs: Option<u64>,
+    ) -> Result<Self, ManifestError> {
+        verify_manifest(
+            &manifest,
+            expected_issuer_pk,
+            installed_release_unix,
+            now_unix_secs,
+        )?;
+        Ok(Self(manifest))
+    }
+
+    /// Borrow the verified manifest.
+    pub fn manifest(&self) -> &UpdateManifest {
+        &self.0
+    }
+
+    /// Consume and return the inner manifest, dropping the verification proof.
+    pub fn into_inner(self) -> UpdateManifest {
+        self.0
+    }
+
+    /// TEST ONLY — wrap a manifest WITHOUT verifying it. Exists so unit tests
+    /// that exercise apply-side logic (SHA-256 mismatch, anti-downgrade,
+    /// platform/version gates) can build the input without re-signing. Gated to
+    /// `cfg(test)` and crate-private so it can never short-circuit verification
+    /// on a real apply path.
+    #[cfg(test)]
+    pub(crate) fn assume_verified(manifest: UpdateManifest) -> Self {
+        Self(manifest)
+    }
+}
+
+impl std::ops::Deref for VerifiedManifest {
+    type Target = UpdateManifest;
+    fn deref(&self) -> &UpdateManifest {
+        &self.0
+    }
+}
+
 fn canonical_message(
     release_unix: u64,
     version: &str,
