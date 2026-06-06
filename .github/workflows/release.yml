@@ -90,7 +90,7 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
@@ -100,8 +100,9 @@ jobs:
         run: echo "value=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.triple }}
 
       - name: Install ARM64 Linux cross-linker
@@ -120,7 +121,8 @@ jobs:
           # C/C++ deps without an external toolchain download. zig and
           # cargo-zigbuild both install from PyPI (reliable). build-release.sh
           # then runs `cargo zigbuild` for this target via VEIL_CARGO_CMD.
-          pip3 install --user cargo-zigbuild ziglang
+          # Pinned for reproducibility — bump deliberately (supply-chain).
+          pip3 install --user "cargo-zigbuild==0.22.3" "ziglang==0.16.0"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "VEIL_CARGO_CMD=zigbuild" >> "$GITHUB_ENV"
 
@@ -204,7 +206,7 @@ jobs:
             --binary-url 'https://github.com/${{ github.repository }}/releases/download/v${{ inputs.version }}/veil-cli-${{ matrix.triple }}'
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.triple }}
           path: target/release-artifacts/${{ matrix.triple }}/
@@ -214,10 +216,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts/
 
@@ -246,7 +248,7 @@ jobs:
           ls -la out/
 
       - name: Attach to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: v${{ inputs.version }}
           name: Release v${{ inputs.version }}
