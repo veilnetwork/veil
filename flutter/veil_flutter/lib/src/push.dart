@@ -161,13 +161,10 @@ class VeilPush {
   ///     wakes degrade to the rate-limited ([_minWakeupGap]) wake-only
   ///     path, where a leaked push token can still drive battery-DoS /
   ///     presence-oracle attacks.
-  ///   * A NO-ARG `VeilPush.drainMailbox()` convenience. The
-  ///     explicit-args `drainMailbox({socketPath, receiverId,
-  ///     authCookie})` already EXISTS (see below) and is fully wired;
-  ///     only the zero-arg form — which would read a plugin-persisted
-  ///     IPC socket path + receiver creds from platform-secure storage
-  ///     so callers need pass nothing — is deferred (that persistence
-  ///     is the unwired part).
+  ///   * A NO-ARG `VeilPush.drainMailbox()` convenience is NOT provided and
+  ///     none is promised (see the "Design note" on `drainMailbox` below).
+  ///     Use the explicit-args `drainMailbox({socketPath, receiverId,
+  ///     authCookie})`, which already EXISTS and is fully wired.
   static Future<void> handleWakeup({
     Future<void> Function()? onWake,
     Uint8List? wakePayload,

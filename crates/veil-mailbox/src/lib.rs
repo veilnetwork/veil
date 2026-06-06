@@ -513,8 +513,22 @@ impl Mailbox {
     pub fn open(veil_dir: &Path, config: MailboxConfig) -> Result<Self, MailboxError> {
         let dir = veil_dir.join("mailbox");
         std::fs::create_dir_all(&dir)?;
+        // Owner-only dir: the stored blobs are E2E ciphertext, but the metadata
+        // (sender/receiver ids, deposit timestamps, sizes) would otherwise be
+        // world-readable on a multi-user host. Matches the 0o600/0o700 discipline
+        // used for keystore / IPC token files. Best-effort on non-Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
         let db_path = dir.join("blobs.db");
         let db = Database::create(&db_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        }
         // Touch tables so an empty DB has the schema initialised.
         let txn = db.begin_write()?;
         {

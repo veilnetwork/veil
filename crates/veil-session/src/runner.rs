@@ -1380,12 +1380,6 @@ impl SessionRunner {
     /// Called at the top of each `select!` iteration; pulls every
     /// queued frame from `outbox.try_recv` until `Empty`.
     ///
-    /// backstop: if the peer didn't negotiate chunking
-    /// (`ovl1_minor < 2`) we drop incoming `CHUNK`-flagged frames
-    /// rather than wire them through, even though the IPC send path
-    /// already guards with `chunking_supported` — defensive belt-and-
-    /// braces.
-    ///
     /// Returns `Break` if the channel's `Sender` half has been
     /// dropped (— `SessionTxRegistry::unregister` from
     /// `ban_node` / `kill_session` / session close). The caller
