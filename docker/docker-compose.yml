@@ -15,7 +15,10 @@
 services:
   # ── Cert issuer + renewer (standalone HTTP-01) ──────────────────────────
   certbot:
-    image: certbot/certbot:latest
+    # F8: pinned by immutable digest (was the mutable `:latest` tag) for
+    # reproducible, supply-chain-stable builds. Bump deliberately by resolving
+    # the new digest: `docker buildx imagetools inspect certbot/certbot:latest`.
+    image: certbot/certbot:latest@sha256:0107d084c225631fc64a8313e19adb07275f7296fde338f7dfa93986c80b2e3e
     container_name: veil-certbot
     restart: unless-stopped
     # HTTP-01 challenge needs port 80.  Renewal does the same; certbot

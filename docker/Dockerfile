@@ -41,8 +41,8 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system veil \
-    && useradd --system --gid veil --home-dir /var/lib/veil \
+    && groupadd --system --gid 999 veil \
+    && useradd --system --uid 999 --gid veil --home-dir /var/lib/veil \
         --no-create-home --shell /usr/sbin/nologin veil \
     && install -d -m 0700 -o veil -g veil /var/lib/veil
 
