@@ -43,7 +43,7 @@ pub fn handle_update_command<I: CommandIo, O: ConfigOps>(
 /// build a signed `UpdateManifest` blob for a freshly-built
 /// binary. Computes SHA-256 of the binary file, loads the issuer
 /// identity from a TOML config file, signs, and writes the manifest
-/// bytes к stdout / `--output`.
+/// bytes to stdout / `--output`.
 fn update_sign_manifest<I: CommandIo, O: ConfigOps>(
     context: &mut CommandContext<'_, I, O>,
     args: super::cli::SignManifestArgs,

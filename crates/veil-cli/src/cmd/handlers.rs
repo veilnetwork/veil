@@ -19,10 +19,10 @@ pub trait ConfigOps {
     fn read_raw_config(&self, path: &Path) -> veil_cfg::Result<String>;
     fn load_config(&self, path: &Path) -> veil_cfg::Result<veil_cfg::Config>;
     fn save_config(&self, path: &Path, config: &veil_cfg::Config) -> veil_cfg::Result<()>;
-    /// Atomically write а raw string back к the config file.  Used
+    /// Atomically write a raw string back to the config file.  Used
     /// by `config sign` (slice 11b) — the signed output includes
-    /// comment-line signature headers что `save_config` would lose
-    /// (it round-trips через the parsed Config struct).
+    /// comment-line signature headers that `save_config` would lose
+    /// (it round-trips through the parsed Config struct).
     fn write_raw_config(&self, path: &Path, content: &str) -> veil_cfg::Result<()>;
 }
 
@@ -546,17 +546,17 @@ impl ConfigCommandService {
         Ok(())
     }
 
-    /// Sign the active config file в place using the operator's
-    /// `[identity]` keypair (Этап 11 slice 11b).  Calls
-    /// `veil_cfg::signed_config::sign_config` с the raw file
-    /// content + identity keys и writes the result back atomically
-    /// (or prints к stdout if `--stdout`).
+    /// Sign the active config file in place using the operator's
+    /// `[identity]` keypair (slice 11b).  Calls
+    /// `veil_cfg::signed_config::sign_config` with the raw file
+    /// content + identity keys and writes the result back atomically
+    /// (or prints to stdout if `--stdout`).
     ///
     /// Pre-conditions:
     /// * `[identity].public_key` / `[identity].private_key` must both be
-    ///   present (the active config — same keys used для bootstrap-bundle
+    ///   present (the active config — same keys used for bootstrap-bundle
     ///   signing).
-    /// * If `issued_at_unix` is None, defaults к `SystemTime::now()`.
+    /// * If `issued_at_unix` is None, defaults to `SystemTime::now()`.
     ///
     /// Re-signing an already-signed config replaces the previous
     /// signature header (the canonical-message stripping is idempotent).
@@ -1276,7 +1276,7 @@ mod tests {
     /// mobile profile sets connection-rotation interval
     /// to defeat long-lived-connection DPI fingerprint. Lock in
     /// the 30-min cadence so a future edit doesn't silently drift
-    /// и lose the censorship-resistance property.
+    /// and lose the censorship-resistance property.
     #[test]
     fn epic488_1_mobile_profile_sets_session_rotation_interval() {
         let mut config = veil_cfg::Config::default();
@@ -1290,7 +1290,7 @@ mod tests {
 
     /// b: mobile profile sets per-peer byte-rate cap.
     /// Lock in the 64 KB/s value so a future edit doesn't drift
-    /// и lose the single-peer-flood defence.
+    /// and lose the single-peer-flood defence.
     #[test]
     fn epic483_6b_mobile_profile_sets_per_peer_byte_rate() {
         let mut config = veil_cfg::Config::default();
@@ -1314,9 +1314,9 @@ mod tests {
 
     // ── ConfigCommand::Sign (Этап 11 slice 11b) ────────────────────────
 
-    /// `config sign --stdout` produces signed output что verifies under
-    /// the same keypair и against the canonical-message rules from
-    /// slice 11a.  Uses MockConfigOps so the test runs без disk I/O.
+    /// `config sign --stdout` produces signed output that verifies under
+    /// the same keypair and against the canonical-message rules from
+    /// slice 11a.  Uses MockConfigOps so the test runs without disk I/O.
     #[test]
     fn epic11b_config_sign_stdout_produces_verifiable_envelope() {
         let keypair = crate::test_support::ed25519_keypair();
@@ -1376,7 +1376,7 @@ mod tests {
         );
     }
 
-    /// Missing `[identity]` block surfaces а structured error before
+    /// Missing `[identity]` block surfaces a structured error before
     /// any write happens — protects operators against accidentally
     /// trashing an unsigned-by-design config.
     #[test]

@@ -609,17 +609,17 @@ fn restore<I: CommandIo>(
 
 // ── migrate ─────────────────────────────────────────────────────
 
-/// Mint a `MigrationCert` linking `<--from>`'s OLD identity к
+/// Mint a `MigrationCert` linking `<--from>`'s OLD identity to
 /// `<--to>`'s NEW identity, signed by the OLD master keypair. CLI
-/// surface for.
+/// surface for `identity migrate`.
 ///
 /// Behaviour:
 /// 1. Load OLD `IdentityDocument` from `<--from>/identity_document.bin`
 ///    to get old_node_id + old_master_algo + old_master_pubkey.
 /// 2. Authenticate the OLD master by:
-///    decoding `--from-phrase-file` к recover the BIP-39 seed
-///    (mandatory для ed25519/hybrid OLD masters), OR
-///    decrypting `<--from>/master.enc` с `--from-password-file`.
+///    decoding `--from-phrase-file` to recover the BIP-39 seed
+///    (mandatory for ed25519/hybrid OLD masters), OR
+///    decrypting `<--from>/master.enc` with `--from-password-file`.
 ///    For hybrid/falcon OLD masters, additionally read the
 ///    `<--from>/master_falcon.bin` (or `--from-master-falcon-file`)
 ///    to recover the Falcon half.
@@ -630,11 +630,11 @@ fn restore<I: CommandIo>(
 ///    → extract new_node_id + new_master_algo + new_master_pubkey.
 /// 5. Call `migration::sign_migration_cert` (which enforces the
 ///    non-downgrade rule: hybrid → ed25519 rejected).
-/// 6. Atomic-write the cert blob к `--cert-out` (default
+/// 6. Atomic-write the cert blob to `--cert-out` (default
 ///    `<--to>/migration_cert.bin`, mode 0o644 since the cert is
 ///    signed-public material, not secret).
-/// 7. Print summary с the DHT key для manual `node dht put` if the
-///    operator wants к bypass the daemon's auto-publish path.
+/// 7. Print a summary with the DHT key for a manual `node dht put` if the
+///    operator wants to bypass the daemon's auto-publish path.
 fn migrate<I: CommandIo>(
     io: &mut I,
     args: super::cli::IdentityMigrateArgs,
@@ -941,13 +941,13 @@ fn migrate<I: CommandIo>(
 }
 
 /// publish the just-minted MigrationCert via
-/// `AdminCommand::DhtPublishReplicated` (path — local store +
-/// fan-out к K closest live peers). Mirror of `bootstrap publish`'s
+/// `AdminCommand::DhtPublishReplicated` (local store +
+/// fan-out to K closest live peers). Mirror of `bootstrap publish`'s
 /// admin-socket plumbing in `cmd/handlers.rs`.
 ///
 /// Failure modes (socket missing, daemon refuses, peer-publish times
 /// out) are surfaced as `IdentityCliError::Internal` with a pointer
-/// at the cert file (which is ALREADY persisted к disk before we
+/// at the cert file (which is ALREADY persisted to disk before we
 /// reach this function), so a manual `node dht put` retry stays
 /// possible.
 fn publish_cert_via_admin_socket<I: CommandIo>(
@@ -2243,9 +2243,9 @@ mod tests {
         );
     }
 
-    /// hybrid create на CLI level. Verifies the algo-byte
+    /// hybrid create at the CLI level. Verifies the algo-byte
     /// reaches sovereign_flow, master_falcon.bin lands in veil_dir
-    /// и the output `master_algo` line shows `ed25519+falcon512`.
+    /// and the output `master_algo` line shows `ed25519+falcon512`.
     #[test]
     fn create_with_algo_hybrid_writes_falcon_master() {
         let dir = tempdir();
@@ -2382,7 +2382,7 @@ mod tests {
     }
 
     /// full `identity migrate` happy-path — Ed25519 OLD
-    /// → hybrid NEW, mints a cert that decodes + verifies против OLD
+    /// → hybrid NEW, mints a cert that decodes + verifies against OLD
     /// master pubkey.
     #[test]
     fn migrate_ed25519_to_hybrid_produces_verifiable_cert() {
@@ -2458,7 +2458,7 @@ mod tests {
     }
 
     /// non-downgrade enforcement — hybrid OLD → ed25519 NEW
-    /// must be rejected by `migrate` (delegates к
+    /// must be rejected by `migrate` (delegates to
     /// `sign_migration_cert`'s SecurityDowngrade).
     #[test]
     fn migrate_rejects_security_downgrade() {
@@ -2502,7 +2502,7 @@ mod tests {
         }
     }
 
-    ///from и --to point at the same node_id is a
+    /// --from and --to pointing at the same node_id is a
     /// no-op operator error — fail fast.
     #[test]
     fn migrate_rejects_same_node_id() {
@@ -2536,9 +2536,9 @@ mod tests {
         }
     }
 
-    /// `--publish-immediately` без running daemon на
+    /// `--publish-immediately` without a running daemon on the
     /// admin-socket fails gracefully — the cert STILL lands on disk
-    /// (so retry stays possible), и the error message points operator
+    /// (so retry stays possible), and the error message points the operator
     /// at the manual `node dht put` workaround.
     #[test]
     fn migrate_publish_immediately_falls_through_when_daemon_missing() {
@@ -2627,8 +2627,8 @@ mod tests {
         }
     }
 
-    /// ext: standalone Falcon-512 create требует
-    ///accept-no-recovery; без него CLI выбрасывает loud-error.
+    /// ext: standalone Falcon-512 create requires
+    /// --accept-no-recovery; without it the CLI raises a loud error.
     #[test]
     fn create_falcon512_requires_accept_no_recovery() {
         let dir = tempdir();
@@ -2647,9 +2647,9 @@ mod tests {
         }
     }
 
-    /// ext: standalone Falcon-512 create с
-    ///accept-no-recovery emits the loud warning, skips BIP-39
-    /// phrase, и persists master_falcon.bin с master_algo=2.
+    /// ext: standalone Falcon-512 create with
+    /// --accept-no-recovery emits the loud warning, skips the BIP-39
+    /// phrase, and persists master_falcon.bin with master_algo=2.
     #[test]
     fn create_falcon512_with_accept_no_recovery_skips_phrase() {
         let dir = tempdir();
@@ -2747,8 +2747,8 @@ mod tests {
         );
     }
 
-    /// ext: standalone Falcon-512 restore без bundle fails
-    /// с pointer at master_falcon.bin (NOT at any phrase-related fix).
+    /// ext: standalone Falcon-512 restore without a bundle fails
+    /// with a pointer at master_falcon.bin (NOT at any phrase-related fix).
     #[test]
     fn restore_falcon512_rejects_missing_bundle() {
         let fresh_dir = tempdir();
@@ -2772,8 +2772,8 @@ mod tests {
         }
     }
 
-    /// hybrid restore без --master-falcon-file fails fast
-    /// с a clear operator-facing message (no silent degrade к
+    /// hybrid restore without --master-falcon-file fails fast
+    /// with a clear operator-facing message (no silent degrade to
     /// Ed25519-only).
     #[test]
     fn restore_hybrid_rejects_missing_master_falcon_file() {
