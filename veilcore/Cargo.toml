@@ -137,7 +137,6 @@ rustls = "0.23"
 rustls-pki-types = "1.14"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-socket2 = "0.5"
 thiserror = "2.0"
 # Terminal-echo-disabled password prompt for interactive key_passphrase_prompt.
 # Pure-Rust, no C deps, stdlib + termios on Unix / Win32 console on Windows.
