@@ -715,7 +715,9 @@ fn update_manifest_url_must_be_https(config: &Config) -> bool {
         .update
         .manifest_urls
         .iter()
-        .any(|url| !url.starts_with("https://"))
+        // Scheme is case-insensitive (RFC 3986); match the fetch layer
+        // which compares case-insensitively.
+        .any(|url| !url.to_ascii_lowercase().starts_with("https://"))
 }
 
 fn update_check_interval_too_frequent(config: &Config) -> bool {

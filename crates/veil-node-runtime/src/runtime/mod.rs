@@ -1696,7 +1696,8 @@ impl NodeRuntime {
             // congestion monitor.
             congestion_monitor: Some(Arc::clone(&shared_congestion_monitor)),
             reputation: Some(Arc::clone(&shared_reputation)),
-            // gateway list — placeholder; wired in via rebuild below.
+            // gateway list — provisional initial value; the live list is
+            // wired in via the rebuild below.
             gateway_list: Some(Arc::clone(&shared_gateway_list)),
             prefer_internet_gateway: config.connection.prefer_internet_gateway,
             exit_diversification: config.connection.exit_diversification,
