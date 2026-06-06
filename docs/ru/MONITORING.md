@@ -1,12 +1,20 @@
 # Руководство по мониторингу
 
-> Операционный справочник: за чем смотреть, зачем и когда алертить. Парный
-> документ к [OPERATIONS.md](OPERATIONS.md) (deployment) и
+> Справочник оператора для наблюдения за работающим узлом: за чем смотреть,
+> почему это важно и когда поднимать оповещение. Читайте вместе с
+> [OPERATIONS.md](OPERATIONS.md) (развёртывание) и
 > [TROUBLESHOOTING.md](TROUBLESHOOTING.md) (реагирование на инциденты).
 
-## Настройка exporter'а
+## Настройка экспортёра
 
-Включите Prometheus exporter в `config.toml`:
+Узел сообщает о своём состоянии в виде **метрик** — именованных чисел вроде
+«активных сессий» или «неудавшихся подключений», которые вы измеряете во
+времени. Veil отдаёт их в формате, который читает [Prometheus](https://prometheus.io).
+Prometheus — это инструмент, который собирает метрики со множества машин и
+хранит их, чтобы можно было строить графики и слать оповещения. Компонент,
+который их отдаёт, называют экспортёром.
+
+Чтобы включить экспортёр, добавьте в `config.toml`:
 
 ```toml
 [metrics]
@@ -15,7 +23,7 @@ path        = "/metrics"          # default
 auth_token  = "abcd1234..."       # optional bearer token; clients send `Authorization: Bearer …`
 ```
 
-Перезапустите узел, проверьте:
+Перезапустите узел и проверьте, что точка отдачи отвечает:
 
 ```bash
 curl http://127.0.0.1:9090/metrics
@@ -23,109 +31,119 @@ curl http://127.0.0.1:9090/metrics
 curl -H "Authorization: Bearer abcd1234..." http://127.0.0.1:9090/metrics
 ```
 
-Каждая метрика репортится один раз за scrape, без labels кроме неявного
-`instance`, который инжектит Prometheus. Все counter'ы — монотонные
-`u64`; gauge'и могут быть `f64` (Vivaldi coords) или `usize`.
+Сбор (scrape) — это одно чтение точки отдачи со стороны Prometheus. Каждая
+метрика появляется один раз за сбор. Единственная метка, которую к ней
+добавляют, — `instance`; её проставляет сам Prometheus, чтобы пометить, с какого
+узла снято значение. Ниже встречаются два вида метрик. **Счётчик** (counter)
+только растёт — он считает события с момента запуска (здесь это всегда `u64`).
+**Датчик** (gauge) — это текущее значение, которое может и расти, и падать, как
+указатель уровня топлива; датчики бывают `f64` (координаты Vivaldi) или `usize`.
 
 ## Справочник метрик
 
-Категории упорядочены по ops-utility.
+Разделы ниже примерно упорядочены по тому, как часто к ним обращаются.
 
-### Liveness / capacity
+### Жизнеспособность и ёмкость (liveness / capacity)
 
-| Метрика | Тип | Смысл | Алертить если |
+| Метрика | Тип | Смысл | Оповещать если |
 |--------|------|---------|----------|
-| `veil_active_sessions` | gauge | OVL1 сессии, установленные сейчас | `> 0.8 × max_concurrent` в течение 5 м |
-| `veil_configured_peers` | gauge | Число `[[peers]]` записей | резкое падение = аномалия config-reload |
-| `veil_inbound_sessions_total` | counter | Кумулятивные inbound handshakes | spike по rate = scan / abuse |
-| `veil_outbound_connect_attempts_total` | counter | Кумулятивные outbound dial-попытки | spike по rate = peer churn / нестабильность сети |
-| `veil_outbound_connect_failures_total` | counter | Failed outbound dials | failure-ratio > 50 % за 10 м = upstream peer лёг |
-| `veil_session_handshake_failures_total` | counter | Inbound handshake-ошибки (auth / cipher / proto) | spike по rate = scanner или version-skew |
+| `veil_active_sessions` | gauge | Сессии OVL1, установленные прямо сейчас | `> 0.8 × max_concurrent` в течение 5 м |
+| `veil_configured_peers` | gauge | Число записей `[[peers]]` | резкое падение = сбой при перечитывании конфигурации |
+| `veil_inbound_sessions_total` | counter | Все входящие рукопожатия с момента запуска | всплеск частоты = сканирование или злоупотребление |
+| `veil_outbound_connect_attempts_total` | counter | Все исходящие попытки подключения с момента запуска | всплеск частоты = текучка соседей или нестабильность сети |
+| `veil_outbound_connect_failures_total` | counter | Неудавшиеся исходящие подключения | доля неудач > 50 % за 10 м = вышестоящий сосед лёг |
+| `veil_session_handshake_failures_total` | counter | Ошибки входящего рукопожатия (аутентификация / шифр / протокол) | всплеск частоты = сканер или расхождение версий |
 
-### Routing (самая просматриваемая секция)
+### Маршрутизация (routing) — самый просматриваемый раздел
 
-| Метрика | Тип | Смысл | Алертить если |
+| Метрика | Тип | Смысл | Оповещать если |
 |--------|------|---------|----------|
-| `veil_route_miss_total` | counter | DELIVERY-кадры без route к dst | `> 100/s` в течение 5 м → фрагментация mesh'а; проверьте DHT |
-| `veil_discovery_triggered_total` | counter | Запущен reactive route discovery (RecursiveQuery) | резкий spike коррелирует со spike'ом route_miss |
-| `veil_route_recovery_total` | counter | Успешные re-route'ы после смерти primary hop | высокий = нестабильный upstream peer |
-| `veil_route_selection_avg_rtt_ms` | gauge (мс) | Средний RTT выбранного next-hop | растущий тренд = congestion в сети |
-| `veil_network_reachability_score` | gauge (0-100) | Композитная метрика reachability | `< 50` в течение 5 м = isolation alarm |
+| `veil_route_miss_total` | counter | Кадры DELIVERY, для которых нет маршрута к получателю | `> 100/s` в течение 5 м → фрагментация сети; проверьте DHT |
+| `veil_discovery_triggered_total` | counter | Запущен реактивный поиск маршрута (RecursiveQuery) | резкий всплеск совпадает со всплеском route_miss |
+| `veil_route_recovery_total` | counter | Удачные перестроения маршрута после гибели основного транзита | высокий = нестабильный вышестоящий сосед |
+| `veil_route_selection_avg_rtt_ms` | gauge (мс) | Средний RTT (время обхода туда-обратно) выбранного следующего транзита | растущий тренд = перегрузка сети |
+| `veil_network_reachability_score` | gauge (0-100) | Сводная оценка достижимости | `< 50` в течение 5 м = сигнал изоляции |
 
-### DHT health
+### Состояние DHT
 
-| Метрика | Тип | Смысл | Алертить если |
+| Метрика | Тип | Смысл | Оповещать если |
 |--------|------|---------|----------|
-| `veil_dht_store_total` | counter | Обслуженные DHT STORE-операции | резкое падение до 0 = mesh isolation |
-| `veil_dht_lookup_total` | counter | Обслуженные DHT FIND_VALUE / FIND_NODE | падение = peer'ы ушли |
-| `veil_storage_evictions_total` | counter | DHT-записи вытеснены по capacity | высокий = `max_store_entries` слишком низкий |
+| `veil_dht_store_total` | counter | Обслуженные операции DHT STORE | резкое падение до 0 = изоляция от сети |
+| `veil_dht_lookup_total` | counter | Обслуженные запросы DHT FIND_VALUE / FIND_NODE | падение = соседи ушли |
+| `veil_storage_evictions_total` | counter | Записи DHT вытеснены по нехватке места | высокий = `max_store_entries` слишком мал |
 
-#### Iterative-DHT fallback (восстановление маршрутов)
+#### Запасной путь через итеративный DHT (восстановление маршрутов)
 
-Когда прямой routing промахивается, узел откатывается на итеративный
-DHT-lookup, чтобы перерезолвить transport. Эти сигналы отслеживают
-фрагментацию mesh'а и здоровье fallback'а:
+Когда узел не может проложить кадр напрямую, он пробует запасной путь:
+итеративный поиск в DHT, который ищет свежий транспорт до получателя.
+(Итеративный — значит узел идёт по DHT транзит за транзитом, а не полагается на
+готовый ответ из кэша.) Эти метрики показывают, как часто запасной путь
+срабатывает и удаётся ли он, — раннее свидетельство фрагментации сети:
 
-| Метрика | Тип | Смысл | Алертить если |
+| Метрика | Тип | Смысл | Оповещать если |
 |--------|------|---------|----------|
-| `veil_dht_fallback_triggered_total` | counter | Запущены итеративные DHT-fallback'и после route miss | рост относительно трафика = деградация прямого routing'а |
-| `veil_dht_fallback_resolved_total` | counter | Fallback'и, перерезолвившие рабочий transport | должно идти вровень с `triggered`; разрыв = нерезолвимые маршруты |
-| `veil_dht_fallback_miss_total` | counter | Fallback'и, не нашедшие маршрут | рост = маршруты нерезолвимы → фрагментация mesh'а |
-| `veil_dht_fallback_skipped_backpressure_total` | counter | Fallback'и подавлены под backpressure | spike'и = fallback сбрасывается под нагрузкой |
-| `veil_dht_fallback_effective_timeout_ms` | gauge (мс) | Текущий адаптивный fallback-timeout | нестабильные скачки = congestion / нестабильность RTT |
+| `veil_dht_fallback_triggered_total` | counter | Запущены итеративные обращения к DHT после промаха маршрута | рост относительно трафика = прямая маршрутизация деградирует |
+| `veil_dht_fallback_resolved_total` | counter | Обращения, заново нашедшие рабочий транспорт | должно идти вровень с `triggered`; разрыв = неразрешимые маршруты |
+| `veil_dht_fallback_miss_total` | counter | Обращения, не нашедшие маршрут | рост = маршруты неразрешимы → фрагментация сети |
+| `veil_dht_fallback_skipped_backpressure_total` | counter | Обращения подавлены из-за встречного давления (backpressure) | всплески = запасной путь сбрасывается под нагрузкой |
+| `veil_dht_fallback_effective_timeout_ms` | gauge (мс) | Текущий адаптивный таймаут запасного пути | нестабильные скачки = перегрузка или нестабильность RTT |
 
-### Mailbox (offline-доставка)
+### Почтовый ящик (доставка офлайн-получателям)
 
-> Глубина mailbox'а **не экспозится в Prometheus**. Единственный
-> доступный сигнал — поле `mailbox_entries` в admin HTTP state dump
-> (`veil-cli node metrics` или admin HTTP `/state` JSON/text).
-> Никаких `veil_mailbox_*` counter'ов или gauge'ей нет.
+Почтовый ящик хранит сообщения для получателей, которые сейчас не в сети, чтобы
+передать их, как только те снова подключатся.
+
+> Глубина почтового ящика **в Prometheus не отдаётся**. Единственное место, где
+> её видно, — поле `mailbox_entries` в выгрузке состояния через admin HTTP
+> (выполните `veil-cli node metrics` или прочитайте точку admin HTTP `/state` как
+> JSON или текст). Счётчиков и датчиков `veil_mailbox_*` нет.
 
 | Поле | Источник | Смысл | На что смотреть |
 |------|----------|-------|-----------------|
-| `mailbox_entries` | admin HTTP state dump (JSON/text), не Prometheus | Envelope'ы, лежащие сейчас в локальном mailbox-хранилище | устойчивый рост = получатели остаются offline / копится backlog |
+| `mailbox_entries` | выгрузка состояния admin HTTP (JSON/текст), не Prometheus | Конверты, лежащие сейчас в локальном почтовом хранилище | устойчивый рост = получатели остаются не в сети / копится очередь |
 
-### Congestion / abuse
+### Перегрузка и злоупотребление (congestion / abuse)
 
-| Метрика | Тип | Смысл | Алертить если |
+| Метрика | Тип | Смысл | Оповещать если |
 |--------|------|---------|----------|
-| `veil_rate_limit_drops_total` | counter | Inbound кадры дропнуты per-peer rate limiter'ом | `> 10/s` в течение 2 м → DoS или misconfigured peer |
-| `veil_backpressure_received_total` | counter | Backpressure-сигналы от peer'ов | ramp-up = наш outbound congesting downstream |
-| `veil_unknown_origin_gossip_rejected_total` | counter | RouteAnnounce/RouteWithdraw-кадры отклонены, т.к. `via_node_id` не совпал с transport-отправителем (via-spoof) | устойчиво = malicious relay или version-skew |
-| `veil_exit_proxy_dest_denied_total` | counter | Exit-proxy CONNECT-цели отклонены (loopback / private / link-local / metadata) | spike = SSRF-подобное зондирование |
-| `veil_socks5_accepts_throttled_total` | counter | Inbound SOCKS5 accept'ы throttled (saturated `MAX_SOCKS_CONCURRENT`) | устойчиво = overload или abuse |
-| `veil_ban_actions_total` | counter | Manual или auto баны применены | spike = под атакой |
-| `veil_session_tx_drops_total` | counter | Outbound кадры дропнуты (TX queue full) | `> 50/s` в течение 5 м = overload |
-| `veil_session_outbox_drops_total` | counter | Outbox channel saturation drops | аналогично |
-| `veil_ipc_delivery_drops_total` | counter | Local-app channel saturation | app не выгребает свой IPC |
+| `veil_rate_limit_drops_total` | counter | Входящие кадры отброшены ограничителем частоты по соседу | `> 10/s` в течение 2 м → DoS или неверно настроенный сосед |
+| `veil_backpressure_received_total` | counter | Сигналы встречного давления (backpressure) от соседей | нарастание = наша исходящая нагрузка перегружает соседей ниже по потоку |
+| `veil_unknown_origin_gossip_rejected_total` | counter | Кадры RouteAnnounce/RouteWithdraw отклонены, так как `via_node_id` не совпал с отправителем на транспорте (подмена via) | устойчиво = вредоносный ретранслятор или расхождение версий |
+| `veil_exit_proxy_dest_denied_total` | counter | Цели CONNECT через выходной прокси отклонены (loopback / private / link-local / metadata) | всплеск = зондирование в духе SSRF |
+| `veil_socks5_accepts_throttled_total` | counter | Входящие подключения SOCKS5 придержаны (исчерпан `MAX_SOCKS_CONCURRENT`) | устойчиво = перегрузка или злоупотребление |
+| `veil_ban_actions_total` | counter | Применены баны, вручную или автоматически | всплеск = идёт атака |
+| `veil_session_tx_drops_total` | counter | Исходящие кадры отброшены (очередь передачи переполнена) | `> 50/s` в течение 5 м = перегрузка |
+| `veil_session_outbox_drops_total` | counter | Потери из-за переполнения канала исходящих | то же самое |
+| `veil_ipc_delivery_drops_total` | counter | Переполнение канала к локальному приложению | приложение не выгребает свой IPC |
 
-### E2E / crypto
+### Сквозное шифрование и криптография (E2E / crypto)
 
-| Метрика | Тип | Смысл | Алертить если |
+| Метрика | Тип | Смысл | Оповещать если |
 |--------|------|---------|----------|
-| `veil_decrypt_failures_total` | counter | E2E AEAD decrypt-ошибки | устойчиво = key drift / replay-попытка |
-| `mlkem_key_age_secs` (только admin RPC) | gauge | Возраст локального ML-KEM keypair'а (mtime файла) | `> 30 д` → запланируйте ротацию. **Не экспозится через Prometheus** — запрашивайте через `veil-cli node metrics`. |
+| `veil_decrypt_failures_total` | counter | Ошибки расшифровки AEAD на сквозном уровне | устойчиво = расхождение ключей или попытка повтора (replay) |
+| `mlkem_key_age_secs` (только admin RPC) | gauge | Возраст локальной пары ключей ML-KEM (время изменения файла) | `> 30 д` → запланируйте ротацию. **Через Prometheus не отдаётся** — запрашивайте через `veil-cli node metrics`. |
 
-### Vivaldi coordinates (оценка сетевой дистанции)
+### Координаты Vivaldi (оценка сетевого расстояния)
 
-| Метрика | Тип | Смысл | Алертить если |
+| Метрика | Тип | Смысл | Оповещать если |
 |--------|------|---------|----------|
-| `veil_vivaldi_prediction_error_ms` | gauge (мс) | Средняя ошибка Vivaldi prediction | `> 100 мс` → алгоритм не сходится; проверьте time-sync |
-| `veil_vivaldi_coord_x/y/height/error` | gauge | Сырой coord state | informational; для дебага |
+| `veil_vivaldi_prediction_error_ms` | gauge (мс) | Средняя ошибка предсказания Vivaldi | `> 100 мс` → алгоритм не сходится; проверьте синхронизацию времени |
+| `veil_vivaldi_coord_x/y/height/error` | gauge | Сырое состояние координат | для справки; для отладки |
 
-### Real-time (QUIC realtime)
+### Передача в реальном времени (QUIC realtime)
 
-| Метрика | Тип | Смысл | Алертить если |
+| Метрика | Тип | Смысл | Оповещать если |
 |--------|------|---------|----------|
-| `veil_rt_frames_rx_total` | counter | Получены realtime-кадры | flat = call setup сломан |
-| `veil_rt_frames_tx_total` | counter | Отправлены realtime-кадры | расхождение с rx → асимметричная потеря |
-| `veil_rt_seq_gaps_total` | counter | Out-of-order / dropped realtime-кадры | высокий = проблема с jitter |
+| `veil_rt_frames_rx_total` | counter | Принятые кадры реального времени | ноль = установка вызова не работает |
+| `veil_rt_frames_tx_total` | counter | Отправленные кадры реального времени | расхождение с приёмом → асимметричная потеря |
+| `veil_rt_seq_gaps_total` | counter | Кадры реального времени с нарушением порядка или потерянные | высокий = проблема с джиттером (дрожанием задержки) |
 
-## Рекомендуемый набор алертов
+## Рекомендуемый набор оповещений
 
-Starter [`alerting.yml`](../alerting.yml) лежит в репо. Подстраивайте
-пороги под размер вашего флота; дефолты предполагают single-host узлы
-на commodity-железе.
+В репозитории лежит готовый для начала [`alerting.yml`](../alerting.yml) —
+его можно сразу подключить к Prometheus. Считайте пороги отправной точкой и
+подстраивайте под размер вашего парка узлов: значения по умолчанию рассчитаны на
+одиночные узлы на обычном железе.
 
 ```yaml
 groups:
@@ -181,50 +199,57 @@ groups:
       #     summary: "{{ $labels.instance }} ML-KEM key > 30 days — schedule rotation"
 ```
 
-## Grafana dashboard
+## Панель Grafana
 
-Reference dashboard JSON лежит в `docs/grafana/`. Импортируется через
-Grafana UI → "+" → Import → Upload JSON. Ключевые панели:
+[Grafana](https://grafana.com) рисует метрики в виде графиков на панели
+(dashboard) — это один экран с графиками. Готовая панель поставляется в виде
+JSON в `docs/grafana/`. Чтобы загрузить её, откройте интерфейс Grafana → «+» →
+Import → Upload JSON. Ключевые секции панели:
 
-1. **Connectivity** — `active_sessions`, `configured_peers`, reachability
-   gauge, outbound failure ratio.
-2. **Routing health** — route_miss rate, discovery_triggered rate,
-   route_recovery rate, средний RTT, route-cache hit ratio (derived).
-3. **DHT** — store/lookup rate, evictions rate, contacts в routing
-   table (из `node dht routing | wc -l` exec dashboard, или через
-   будущий export).
-4. **Mailbox** — глубина `mailbox_entries` из admin HTTP state dump
-   (не Prometheus; через exec/JSON-datasource панель).
-5. **Abuse** — rate-limit drops, ban actions, unknown-origin gossip
-   rejects, exit-proxy denials, SOCKS5 accept throttles.
-6. **Crypto / E2E** — decrypt failures rate, ML-KEM key age.
+1. **Связность** — `active_sessions`, `configured_peers`, датчик достижимости,
+   доля неудачных исходящих подключений.
+2. **Состояние маршрутизации** — частота route_miss, частота
+   discovery_triggered, частота route_recovery, средний RTT, доля попаданий в
+   кэш маршрутов (вычисляемая).
+3. **DHT** — частота store/lookup, частота вытеснений, число контактов в таблице
+   маршрутизации (из самодельной панели `node dht routing | wc -l` или через
+   будущую отдачу метрик).
+4. **Почтовый ящик** — глубина `mailbox_entries` из выгрузки состояния admin
+   HTTP (не Prometheus; через панель с источником данных exec/JSON).
+5. **Злоупотребление** — отброшенные ограничителем частоты, действия по банам,
+   отклонённый gossip с неизвестным источником, отказы выходного прокси,
+   придержанные подключения SOCKS5.
+6. **Криптография** — частота ошибок расшифровки, возраст ключа ML-KEM.
 
 ## Куда смотреть в первую очередь, когда что-то не так
 
-1. **`up{job="veil"}`** — а Prometheus вообще достучался до узла?
-   Если нет — узел может быть жив, но admin/metrics endpoint забинден
-   не на тот интерфейс; проверьте `[metrics].listen` и firewall.
+Идите по списку сверху вниз. Каждый шаг отсекает одну частую причину.
 
-2. **`active_sessions`** — соответствует ожиданиям? Падение = upstream
-   peer outage или локальное изменение конфига.
+1. **`up{job="veil"}`** — Prometheus вообще достучался до узла? Если нет, узел
+   вполне может быть жив, а его точка отдачи метрик привязана не к тому
+   интерфейсу. Проверьте `[metrics].listen` и брандмауэр.
 
-3. **`outbound_connect_failures_total / outbound_connect_attempts_total`**
-   ratio — устойчиво высокий failure ratio = DNS / firewall / проблема с
-   reachability bootstrap-peer'а.
+2. **`active_sessions`** — число соответствует ожиданиям? Падение обычно значит,
+   что вышестоящий сосед упал или кто-то поменял локальную конфигурацию.
 
-4. **rate `route_miss_total`** — высокий → проверьте `node dht routing`
-   для k-bucket fill, потом `peers banned` для непреднамеренных банов.
+3. **`outbound_connect_failures_total / outbound_connect_attempts_total`** —
+   отношение этих двух. Если оно держится высоким, узел не достаёт до внешнего
+   мира: подозревайте DNS, брандмауэр или недостижимый узел первичного
+   подключения.
 
-5. **rate `ban_actions_total`** — spike коррелирует с атакой;
-   `veil-cli peers banned` чтобы посмотреть, какие `node_id` банятся
-   и почему.
+4. **частота `route_miss_total`** — если высокая, проверьте `node dht routing`,
+   насколько заполнены k-бакеты, затем `peers banned` — вдруг вы кого-то
+   забанили по ошибке.
 
-Для конкретного маппинга симптом → диагноз → fix см.
+5. **частота `ban_actions_total`** — всплеск совпадает с атакой. Запустите
+   `veil-cli peers banned`, чтобы увидеть, какие `node_id` банятся и почему.
+
+Полный разбор симптом → диагноз → исправление см. в
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
-## CLI snapshot (без Prometheus)
+## Снимок через CLI (без Prometheus)
 
-Для разовой инспекции без scraping'а:
+Когда нужен быстрый взгляд, а Prometheus не настроен:
 
 ```bash
 veil-cli node metrics
@@ -233,7 +258,7 @@ veil-cli node metrics
 # одну строку-подсказку вместо 35 нулевых counter'ов.
 ```
 
-Для real-time tail значимых событий без metrics scrape:
+Чтобы следить за значимыми событиями вживую, совсем без метрик, читайте лог в реальном времени:
 
 ```bash
 journalctl -fu veil-node | grep -E "WARN|ERROR|session.banned|route.discovery.miss|recursive.response.relay_dropped"

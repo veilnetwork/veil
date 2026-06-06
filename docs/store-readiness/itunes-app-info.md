@@ -1,7 +1,7 @@
 # iTunes Connect / App Store Connect — Encryption questions
 
-Apple asks every app submission whether it uses encryption.  Wrong
-answers can stall а review for а week.  Use these answers verbatim.
+Apple asks every app submission whether it uses encryption. A wrong
+answer can stall a review for a week. Use these answers verbatim.
 
 ## App Information → Encryption
 
@@ -14,20 +14,20 @@ encryption exemption)**
 > encryption that is exempt under Section 740.17(b)(1) of the U.S.
 > Export Administration Regulations [...].
 
-(All veil's cryptographic primitives qualify под Note 3 mass-market
-provisions.)
+(All of veil's cryptographic primitives qualify under the Note 3
+mass-market provisions.)
 
 **Q: Is your app exempt from upload of compliance documentation under
 ENC?**
 > ✅ Your app is exempt because:
-> * it has been authorized к ship under §740.17(b)(1) (with а filed
+> * it has been authorized to ship under §740.17(b)(1) (with a filed
 >   ERN);
 > * cryptographic functions are NOT user-restricted (ANY user
 >   downloading the app gets the same crypto);
 > * the symmetric key length is ≤ 256 bits.
 
-**Required upload:** annual encryption-status letter referencing the
-ERN.  Template:
+**Required upload:** the annual encryption-status letter referencing
+the ERN. Template:
 
 ```
 [Date]
@@ -58,30 +58,30 @@ Sincerely,
 ## Build Settings
 
 In Xcode → Build Settings, set `ITSAppUsesNonExemptEncryption = NO`
-в the Info.plist:
+in the Info.plist:
 
 ```xml
 <key>ITSAppUsesNonExemptEncryption</key>
 <false/>
 ```
 
-This skips Apple's per-build prompt asking the same question, и
-locks the answer at build time so а consumer-app developer can't
-accidentally set it to YES (which would trigger а review pause).
+This skips Apple's per-build prompt asking the same question, and it
+locks the answer at build time, so a consumer-app developer can't
+accidentally set it to YES (which would trigger a review pause).
 
 ## Per-jurisdiction availability
 
 Set in App Store Connect → Pricing and Availability:
 
-* **Available territories:** All except those subject к OFAC
+* **Available territories:** All except those subject to OFAC
   sanctions (Cuba, Iran, North Korea, Syria, Crimea, etc.).
-* Apple maintains the up-to-date sanctioned-list — use the platform
-  default ("All") which Apple filters automatically.
+* Apple maintains the up-to-date sanctioned list — use the platform
+  default ("All"), which Apple filters automatically.
 
 ## TestFlight notes
 
-TestFlight builds are subject к the same export-control rules.  Use
-the SAME ERN; no separate filing.  Add the operator's tester roster
-к "Internal Testers" before submit, otherwise а реviewer cannot
-register / pair / verify push (veil needs а second party к pair
-с before any messaging works).
+TestFlight builds are subject to the same export-control rules. Use
+the SAME ERN; no separate filing. Add the operator's tester roster
+to "Internal Testers" before you submit. Otherwise a reviewer can't
+register, pair, or verify push — veil needs a second party to pair
+with before any messaging works.

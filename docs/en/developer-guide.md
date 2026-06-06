@@ -2,9 +2,10 @@
 
 ## Project Structure
 
-The project is a workspace of many `crates/veil-*` crates. Implementations
-live in those crates; `veilcore/` is now a thin facade aggregator crate,
-and the `veil-cli` binary has been split into a separate crate `crates/veil-cli`.
+The project is a Cargo workspace built from many `crates/veil-*` crates. The
+real implementations live there. `veilcore/` is now just a thin facade that
+re-exports them, and the `veil-cli` binary lives in its own crate,
+`crates/veil-cli`.
 
 ```
 veil/
@@ -48,10 +49,10 @@ veil/
 └── specification.md            # Original specification (RU)
 ```
 
-> Note: the binary is now `crates/veil-cli` (`src/bin/cli.rs`).
+> Note: the binary now lives at `crates/veil-cli` (`src/bin/cli.rs`).
 > `veilcore/src/node/*.rs` and `crates/veil-proto/src/lib.rs` are re-export
 > facades over the `crates/veil-*` crates (veil-dht, veil-session,
-> veil-proto, veil-transport, etc.); the `crates/veil-cli/src/bin/`
+> veil-proto, veil-transport, and so on). The old `crates/veil-cli/src/bin/`
 > directory no longer exists.
 
 ---
@@ -88,12 +89,12 @@ veil/
 
 ## NodeRuntime (`node/runtime.rs`, ~7600 lines)
 
-The central event loop. It implements:
+This is the central event loop. It handles four jobs:
 
-- **Lifecycle**: starting/stopping listeners, connecting to peers, signal handling (SIGHUP)
-- **Session management**: accepting inbound → handshake → registration; reconnecting outbound with exponential backoff
-- **Background tasks**: DHT republish, gateway cleanup, mailbox cleanup, periodic state persistence (routes, RTT, Vivaldi, gateways, peer pubkeys)
-- **Frame dispatch**: after the handshake, passes decoded frames to the `FrameDispatcher`
+- **Lifecycle**: starting and stopping listeners, connecting to peers, and handling signals (SIGHUP)
+- **Session management**: accepting an inbound connection, running the handshake, then registering the session; and reconnecting outbound links with exponential backoff
+- **Background tasks**: DHT republish, gateway cleanup, mailbox cleanup, and periodic state persistence (routes, RTT, Vivaldi, gateways, peer pubkeys)
+- **Frame dispatch**: once the handshake is done, it passes decoded frames to the `FrameDispatcher`
 
 **Key structures:**
 
@@ -131,7 +132,8 @@ struct SessionRuntimeContext {
 
 ## FrameDispatcher (`node/dispatcher/mod.rs`)
 
-Receives a decoded frame from the session runner and routes it by `family`:
+Takes a decoded frame from the session runner and routes it by its `family`
+(the message category — control, discovery, delivery, and so on):
 
 ```rust
 pub async fn dispatch(
@@ -191,20 +193,20 @@ pub async fn perform_ovl1_handshake(
 ) -> Result<OvlHandshakeResult>
 ```
 
-Returns an `OvlHandshakeResult` with `session_keys`, `node_id`, `remote_role`, `remote_identity_payload`, `remote_capabilities`, `remote_attach`.
+It returns an `OvlHandshakeResult` carrying `session_keys`, `node_id`, `remote_role`, `remote_identity_payload`, `remote_capabilities`, and `remote_attach`.
 
 ### Session Runner
 
-After the handshake, a `SessionRunner` is created:
+Once the handshake succeeds, a `SessionRunner` takes over. On each loop it:
 
-1. Reads frames from the transport
-2. Decodes the header + body
-3. Verifies the ChaCha20-Poly1305 MAC (if `flags.encrypted`)
+1. Reads a frame from the transport
+2. Decodes the header and body
+3. Verifies the ChaCha20-Poly1305 MAC (when `flags.encrypted` is set)
 4. Calls `FrameDispatcher::dispatch()`
-5. Sends the response via `SessionOutbox`
-6. Checks keepalive/idle timeout
+5. Sends any response back via `SessionOutbox`
+6. Checks the keepalive and idle timeouts
 
-**Frame prioritization**: Weighted Round-Robin by `flags.priority`:
+**Frame prioritization** uses a Weighted Round-Robin scheme keyed on `flags.priority`. Higher-priority traffic gets a bigger share of each round:
 - RT (0): weight 8
 - Interactive (1): weight 4
 - Bulk (2): weight 2
@@ -214,7 +216,9 @@ After the handshake, a `SessionRunner` is created:
 
 ## Proto Layer (`proto/`)
 
-Wire formats are implemented without external libraries — only `encode() → Vec<u8>` and `decode(&[u8]) → Result<Self, ProtoError>`.
+This layer defines the wire formats — the exact byte layout of every message on
+the network. They are hand-rolled, with no external serialization library: each
+type gets an `encode() → Vec<u8>` and a `decode(&[u8]) → Result<Self, ProtoError>`.
 
 ```
 proto/
@@ -307,7 +311,8 @@ mod tests {
 
 ### MailboxService (`node/mailbox/`)
 
-Interface:
+Stores messages for recipients who are offline. The backend is pluggable behind
+this trait:
 ```rust
 pub trait MailboxBackend: Send + Sync {
     fn put(&self, envelope: DeliveryEnvelope) -> Option<u64>;        // → seq
@@ -328,7 +333,7 @@ Adding a new backend:
 
 ### AppEndpointRegistry (`node/app/registry.rs`)
 
-Multiplexes IPC messages to registered applications:
+Routes incoming IPC messages to the right registered application:
 
 ```rust
 pub struct AppEndpointRegistry { ... }
@@ -356,7 +361,9 @@ impl KademliaService {
 }
 ```
 
-**Caution:** Cross-node iterative lookups (`find_value` over the network) require sending frames through sessions. Request them via `dispatcher/discovery.rs`, not directly through `KademliaService`.
+**Caution:** an iterative lookup that crosses nodes (`find_value` over the
+network) has to send frames through live sessions. Drive those through
+`dispatcher/discovery.rs`, not directly through `KademliaService`.
 
 ### RouteCache (`node/routing/cache.rs`)
 
@@ -369,11 +376,13 @@ impl RouteCache {
 }
 ```
 
-ECMP: when there are multiple paths with a `score` within `ecmp_score_band` (±20%), a random one is chosen.
+ECMP (equal-cost multi-path): when several paths have a `score` within
+`ecmp_score_band` of each other (±20%), the cache picks one at random to spread
+the load.
 
 ### ControlPlaneService (`node/control.rs`)
 
-Manages RTT measurements (RouteProbe/Reply):
+Handles round-trip-time (RTT) measurement via the RouteProbe/Reply exchange:
 
 ```rust
 impl ControlPlaneService {
@@ -389,7 +398,7 @@ impl ControlPlaneService {
 
 ### The `lock!` Macro
 
-All Mutex locks are taken through `lock!`:
+Always take a Mutex lock through `lock!`, never with a raw `.lock().unwrap()`:
 
 ```rust
 // Correct:
@@ -400,17 +409,18 @@ table.insert(...);
 self.route_cache.lock().unwrap()
 ```
 
-The macro recovers from a poisoned mutex with a warning in the log. It is defined in `lib.rs`.
+If the mutex is poisoned (a thread panicked while holding it), the macro recovers
+the guard and logs a warning instead of panicking. It is defined in `lib.rs`.
 
 ### `Arc<Mutex<_>>` vs `Arc<RwLock<_>>`
 
-- `Arc<Mutex<_>>` — the standard for mutable state (always)
-- `Arc<RwLock<_>>` — only if it is provably read many times without writes (rarely)
-- All `Arc<Mutex<_>>` are used with `lock!` (not `.lock().unwrap()`)
+- `Arc<Mutex<_>>` — the default for shared mutable state; reach for this first
+- `Arc<RwLock<_>>` — only when reads provably dominate and writes are rare
+- Every `Arc<Mutex<_>>` is locked through `lock!`, never `.lock().unwrap()`
 
 ### Hex Formatting
 
-Use the utilities from the `veil-util` crate:
+Format byte IDs with the helpers in the `veil-util` crate — don't hand-roll it:
 
 ```rust
 // 32-byte ID (full hex, 64 characters)
@@ -423,9 +433,10 @@ veil_util::hex_short(&node_id)
 node_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
 ```
 
-### Performance and Cast Size
+### Narrowing Casts
 
-**Always** check before `as u16` / `as u8`:
+**Always** assert the length fits before an `as u16` or `as u8` cast — a silent
+truncation here corrupts the wire format:
 
 ```rust
 // Correct:
@@ -438,7 +449,7 @@ let len = data.len() as u16;
 
 ### Logging
 
-The project uses the `log` crate (not `tracing`):
+The project logs through the `log` crate, not `tracing`:
 
 ```rust
 log::debug!("route.cache.insert dst={} via={} score={}", hex_short(&dst), hex_short(&via), score);
@@ -449,9 +460,9 @@ log::error!("config.save.failed: {e}");
 
 ### Async and Blocking
 
-- All I/O is async via tokio
-- Heavy computations (PoW, Falcon512 keygen) → `tokio::task::spawn_blocking`
-- `Mutex` (not `tokio::sync::Mutex`) — for short critical sections
+- All I/O is async, on top of tokio
+- Move heavy CPU work (PoW, Falcon512 keygen) onto `tokio::task::spawn_blocking` so it doesn't stall the runtime
+- Use a plain `Mutex` (not `tokio::sync::Mutex`) for short critical sections
 
 ---
 
@@ -546,7 +557,8 @@ cargo fuzz run fuzz_proto_decode
 
 ## Known Limitations and Stubs
 
-The following components are **stubs** or have an incomplete implementation:
+These components are **stubs** or only partly implemented — don't assume they
+are production-ready:
 
 | Component | File | Status |
 |-----------|------|--------|
@@ -623,7 +635,8 @@ RoutingService.discover_route(target_node_id)
 
 ## Adding a New Transport
 
-To add a new transport (for example, BLUETOOTH_TCP):
+A transport is the layer that decides how bytes physically travel. To add one
+(say, BLUETOOTH_TCP):
 
 1. Implement the `TransportConnection` trait in `transport/`:
 
@@ -656,16 +669,18 @@ registry.register("bt", Box::new(BluetoothTransportFactory));
 
 ## Build Feature Flags
 
-The project uses Cargo feature flags for optional dependencies. It is important
-to distinguish between the **library crate** `veilcore` and the **user-facing binary**
-`veil-cli` (`crates/veil-cli`) — they have different defaults:
+Optional dependencies are gated behind Cargo feature flags. One thing to keep
+straight: the **library crate** `veilcore` and the **user-facing binary**
+`veil-cli` (`crates/veil-cli`) ship different defaults.
 
 - `veilcore` (library): `default = ["rocksdb-cold"]`.
-- `veil-cli` (the binary that users build and run):
-  `default = ["rocksdb-cold", "tls-boring"]`. That is, in shipped builds
-  BoringSSL and its browser-like JA3/JA4-fingerprint ClientHello (with rotation)
-  are enabled **by default**; `rustls` remains a fallback via
-  `--no-default-features`.
+- `veil-cli` (the binary users build and run):
+  `default = ["rocksdb-cold", "tls-boring"]`. So in shipped builds, BoringSSL and
+  its browser-like JA3/JA4-fingerprint ClientHello (with rotation) are on **by
+  default**. `rustls` stays available as a fallback via `--no-default-features`.
+
+  (JA3/JA4 fingerprints are how a network observer tags a TLS client by the shape
+  of its handshake; mimicking a browser's makes Veil traffic blend in.)
 
 | Flag | Crate | Effect |
 |------|-------|--------|
@@ -702,13 +717,13 @@ cargo check -p veil-cli --no-default-features
 
 ### Building on Windows (native)
 
-CI builds the full workspace on Linux; the `windows-test` job deliberately uses
-`-p veilcore --no-default-features` to skip the C/C++ crypto deps. Building
-the **default** feature set natively on Windows (BoringSSL via `btls-sys`,
-RocksDB, `ring`, `aws-lc-sys`, `pqcrypto-internals`) is possible but needs a
-specific toolchain, because the workspace `.cargo/config.toml` `[env]` forces
+CI builds the full workspace on Linux. The `windows-test` job deliberately runs
+`-p veilcore --no-default-features` to skip the C/C++ crypto deps. You *can*
+build the **default** feature set natively on Windows (BoringSSL via `btls-sys`,
+RocksDB, `ring`, `aws-lc-sys`, `pqcrypto-internals`), but it takes a specific
+toolchain. The reason: the workspace `.cargo/config.toml` `[env]` block forces
 GNU-driver flags (`CC=clang`, `CXX=clang++`, `CXXFLAGS=-include cstdint …`) that
-are tuned for the Linux runners.
+are tuned for the Linux runners, and those have to be overridden.
 
 Prerequisites:
 
@@ -719,8 +734,8 @@ Prerequisites:
 - **NASM** (BoringSSL / `ring` x86-64 assembly) — `winget install NASM.NASM`,
   installs to `%LOCALAPPDATA%\bin\NASM`.
 
-Then run cargo from a shell with this environment (paste once per PowerShell
-session, or wrap it in a `$PROFILE` function):
+Then run cargo from a shell with this environment set up. Paste it once per
+PowerShell session, or wrap it in a `$PROFILE` function:
 
 ```powershell
 # 1. MSVC env (INCLUDE/LIB) + bundled ninja/cmake on PATH
@@ -740,7 +755,7 @@ cargo build --workspace
 cargo clippy --workspace --all-targets
 ```
 
-Why each knob is needed:
+What each knob is for:
 
 - `CC/CXX=clang-cl` — `pqcrypto-internals` passes the MSVC flag `/arch:AVX2`,
   which only the `clang-cl` driver understands (plain `clang` errors out).
@@ -752,9 +767,9 @@ Why each knob is needed:
   cmake configure fails). `/FI` is the equivalent forced-include form; overriding
   the env var replaces the config value for this session.
 
-> Some example/bin targets are `#[cfg(unix)]`-only and will not compile under
-> `--all-targets` on Windows; scope to `--lib --tests` (or exclude the affected
-> crate) if you only need the library lint.
+> Some example and bin targets are `#[cfg(unix)]`-only, so they won't compile
+> under `--all-targets` on Windows. If you only need the library lint, scope to
+> `--lib --tests` (or exclude the affected crate).
 
 ---
 

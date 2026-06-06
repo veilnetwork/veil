@@ -5,23 +5,23 @@
 > (`[transport] bandwidth_mimicry_enabled` + `experimental_allow_noop_mimicry`;
 > without both, the daemon refuses to start — see
 > `crates/veil-cfg/src/transport_glue.rs`). What *is* shipped is the **byte
-> n-gram** model + pcap ingest in `crates/veil-fingerprint` (used for
-> regression validation) — this is **not** the timing-shape analyzer
+> n-gram** model plus pcap ingest in `crates/veil-fingerprint` (used for
+> regression validation). That is **not** the timing-shape analyzer
 > (`TimingProfile` / `shape_to_profile`) this plan needs. The timing analyzer,
 > the reference-profile library, and the output-gating layer are all still future
-> work; until then, use operator-side tc/qdisc.
+> work. Until they land, use operator-side tc/qdisc.
 
-Anti-censorship strategy P2 #7 — closes the throughput-shaping vector (#29-31: rating groups / quotas / DSCP) at the **wire level**, complementing the operator-side tc/qdisc option в [`DEPLOYMENT_HARDENING.md`](DEPLOYMENT_HARDENING.md).
+Anti-censorship strategy P2 #7. This closes the throughput-shaping vector (#29-31: rating groups, quotas, DSCP) at the **wire level**. It complements the operator-side tc/qdisc option in [`DEPLOYMENT_HARDENING.md`](DEPLOYMENT_HARDENING.md).
 
 ## Why opt-in, not default
 
-Bandwidth-profile mimicry shapes veil's outbound traffic к match а reference flow pattern (e.g., "looks like а YouTube/Netflix CDN download" — bursts followed by idle gaps).  Trade-offs:
+Bandwidth-profile mimicry shapes veil's outbound traffic to match a reference flow pattern — for example, "looks like a YouTube or Netflix CDN download," which is bursts of data followed by idle gaps. (DPI here means deep packet inspection: a censor's box that watches the shape of your traffic, not just its destination.) The trade-offs:
 
-* **Latency degradation**: mimicry forces output gating, increasing user-facing message latency by ~50-200 ms per flow (worse for interactive chat).
-* **Throughput cap**: matching а "typical browsing" profile caps veil's max throughput к ~5-20 Mbps regardless of available bandwidth.
-* **Profile-specificity**: each reference profile fits one DPI threat model — а "Netflix" profile passes Netflix-class classifiers but might **fail** classifiers expecting "WhatsApp"-like patterns.  Wrong profile choice could worsen the signal.
+* **Latency degradation.** Mimicry forces output gating, which adds roughly 50-200 ms of user-facing message latency per flow. That hurts interactive chat the most.
+* **Throughput cap.** Matching a "typical browsing" profile caps veil's top throughput at about 5-20 Mbps, no matter how much bandwidth is actually available.
+* **Profile-specificity.** Each reference profile fits exactly one DPI threat model. A "Netflix" profile passes Netflix-class classifiers, but it might **fail** a classifier that expects "WhatsApp"-like patterns. Pick the wrong profile and you can make the signal worse, not better.
 
-**Conclusion**: opt-in feature, default OFF.  Operators enable only when they observe production throughput-shaping blocks (DPI tagging veil traffic as "VPN-shaped" и slowing/dropping it).
+**Conclusion:** this is an opt-in feature, default OFF. Operators turn it on only after they see production throughput-shaping blocks — that is, DPI tagging veil traffic as "VPN-shaped" and then slowing or dropping it.
 
 ## Activation prerequisites
 
@@ -29,22 +29,22 @@ When/if bandwidth mimicry activation is triggered:
 
 ### 1. Empirical reference profiles
 
-Build а small library of "what does Chrome look like over time?" reference distributions:
+Build a small library of "what does Chrome look like over time?" reference distributions:
 
-* **Inter-packet interval histogram** — how long между outbound packets во время а typical browsing session?
-* **Burst-size distribution** — when bytes flow, how big are individual bursts?
-* **Idle-gap distribution** — how long are the idle periods между bursts?
+* **Inter-packet interval histogram** — how long between outbound packets during a typical browsing session?
+* **Burst-size distribution** — when bytes flow, how big is each individual burst?
+* **Idle-gap distribution** — how long are the idle periods between bursts?
 
-Capture via tcpdump on а baseline machine, extract через `veil-fingerprint`'s pcap-ingest path (already shipped — see [`FINGERPRINT_REGRESSION.md`](FINGERPRINT_REGRESSION.md)), но extend the analyzer to compute **timing distributions** (currently only byte n-grams).  Estimated ~300 LoC + capture infra.
+Capture the traffic with tcpdump on a baseline machine, then extract it through `veil-fingerprint`'s pcap-ingest path. That path already ships — see [`FINGERPRINT_REGRESSION.md`](FINGERPRINT_REGRESSION.md). The catch: the analyzer currently computes only byte n-grams, so it needs extending to compute **timing distributions** too. Estimated ~300 LoC plus capture infra.
 
-Recommended initial profiles:
-* `chrome-browsing` — modeled от ordinary Chrome HTTPS sessions (highest acceptance rate)
-* `cdn-download` — Netflix/YouTube-class flow (high-throughput tolerance)
-* `interactive-chat` — WhatsApp/Telegram-class (low-latency interactive)
+Recommended starting profiles:
+* `chrome-browsing` — modeled on ordinary Chrome HTTPS sessions (highest acceptance rate)
+* `cdn-download` — Netflix/YouTube-class flow (tolerates high throughput)
+* `interactive-chat` — WhatsApp/Telegram-class (low-latency, interactive)
 
-### 2. Timing-shape analyzer (companion к n-gram analyzer)
+### 2. Timing-shape analyzer (companion to the n-gram analyzer)
 
-`veil-fingerprint::timing` module — same API surface as `NGramModel` но keyed on inter-packet intervals:
+A `veil-fingerprint::timing` module — the same API surface as `NGramModel`, but keyed on inter-packet intervals:
 
 ```rust
 pub struct TimingProfile {
@@ -59,22 +59,22 @@ impl TimingProfile {
 }
 ```
 
-Estimated ~400 LoC + tests + CLI gating через `fp-compare` (extend the existing CLI к accept а `--timing` flag).
+Estimated ~400 LoC plus tests, plus CLI gating through `fp-compare` (extend the existing CLI to accept a `--timing` flag).
 
-### 3. Output gating layer в session writer
+### 3. Output gating layer in the session writer
 
-`veil-transport::session_writer::shape_to_profile()` — wraps the writer's `poll_write` к insert delays / coalesce packets matching the target profile's burst-size distribution.  Per-flow state machine.  ~500 LoC.
+A `veil-transport::session_writer::shape_to_profile()` function. It wraps the writer's `poll_write` to insert delays and coalesce packets so they match the target profile's burst-size distribution. It runs as a per-flow state machine. About 500 LoC.
 
-Hooks into existing `SessionRunner` outbound paths без а wire-format change — purely timing-layer modification.
+This hooks into the existing `SessionRunner` outbound paths with no wire-format change — it is purely a timing-layer modification.
 
 ### 4. Per-flow vs per-node policy choice
 
-Two activation models:
+There are two activation models:
 
-* **Per-node global** — all outbound traffic shaped к the same profile.  Simpler, но every flow inherits the latency cost.
-* **Per-flow opt-in** — application-side annotation (`app.send(... shape: Some(Profile::CdnDownload))`).  Granular но requires API/IPC surface changes.
+* **Per-node global** — shape all outbound traffic to the same profile. Simpler, but every flow pays the latency cost.
+* **Per-flow opt-in** — annotate from the application side (`app.send(... shape: Some(Profile::CdnDownload))`). More granular, but it needs API/IPC surface changes.
 
-Recommendation: ship **per-node** first (simpler), evolve к per-flow if operators report needing it.
+Recommendation: ship **per-node** first, since it is simpler, and move to per-flow only if operators report they need it.
 
 ### 5. Operator config schema
 
@@ -94,11 +94,11 @@ bandwidth_mimicry_profile = "chrome-browsing"
 bandwidth_mimicry_latency_ceiling_ms = 500
 ```
 
-When `bandwidth_mimicry_enabled = true` but `bandwidth_mimicry_profile` is unset, the daemon fails-fast at startup с а clear error.
+When `bandwidth_mimicry_enabled = true` but `bandwidth_mimicry_profile` is unset, the daemon fails fast at startup with a clear error.
 
 ### 6. Runtime warning
 
-When bandwidth mimicry is enabled, log а WARN-level message at startup:
+When bandwidth mimicry is enabled, log a WARN-level message at startup:
 
 ```
 bandwidth_mimicry.enabled  profile=chrome-browsing
@@ -109,13 +109,13 @@ bandwidth_mimicry.enabled  profile=chrome-browsing
 
 ## Activation triggers
 
-Open the bandwidth-mimicry epic и start the prerequisite analyzer + profile-capture work when ANY of:
+Open the bandwidth-mimicry epic and start the prerequisite analyzer and profile-capture work when ANY of these holds:
 
-1. **Production observation**: live testnet metrics show а statistically significant connection-success-rate dip correlated с specific ISPs / countries, AND the dip pattern matches "throughput-shaping classifier" (slow-after-burst pattern rather than direct block).  See [`OPERATIONS.md`](../en/OPERATIONS.md) Anomaly Watch section для baseline signals.
-2. **Specific deployment request**: high-sensitivity threat model (RU citizen-app, IR dissident network) с known DPI shaping rules per the operator's security review.
-3. **Reference-profile maturity**: independent project (Tor's Pluggable Transports working group, IETF QUIC-bias study) publishes а validated "Chrome bandwidth profile" reference distribution что can be adopted without empirical capture work.
+1. **Production observation.** Live testnet metrics show a statistically significant dip in connection-success rate tied to specific ISPs or countries, AND the dip pattern matches a "throughput-shaping classifier" — that is, a slow-after-burst pattern rather than an outright block. See the Anomaly Watch section of [`OPERATIONS.md`](../en/OPERATIONS.md) for the baseline signals.
+2. **Specific deployment request.** A high-sensitivity threat model (an RU citizen app, an IR dissident network) with DPI shaping rules already known from the operator's security review.
+3. **Reference-profile maturity.** An independent project — Tor's Pluggable Transports working group, or an IETF QUIC-bias study — publishes a validated "Chrome bandwidth profile" reference distribution we can adopt without doing the capture work ourselves.
 
-Until one of these fires, **operator-side tc/qdisc throttle** ([`DEPLOYMENT_HARDENING.md` Option B](DEPLOYMENT_HARDENING.md#29-31---throughput-shaping--rating-group-classifiers)) is the preferred mitigation — it doesn't require code changes и closes the same threat surface для most practical scenarios.
+Until one of these fires, the preferred mitigation is the **operator-side tc/qdisc throttle** ([`DEPLOYMENT_HARDENING.md` Option B](DEPLOYMENT_HARDENING.md#29-31---throughput-shaping--rating-group-classifiers)). It needs no code changes and closes the same threat surface for most practical scenarios.
 
 ## Estimated scope (when activation triggered)
 
@@ -128,9 +128,9 @@ Until one of these fires, **operator-side tc/qdisc throttle** ([`DEPLOYMENT_HARD
 | Cross-host integration tests | ~250 LoC | 1 |
 | **Total** | **~1450-1650 LoC** | **5 sessions** |
 
-Largest cost: profile capture (operator-side, multiple hosts under realistic load).  Mitigated если а published reference distribution becomes available.
+The largest cost is profile capture: operator-side, across multiple hosts under realistic load. A published reference distribution, if one becomes available, would cut that cost.
 
-## Composition с current anti-censorship layers
+## How this composes with current anti-censorship layers
 
 | Closes | Layer | Status |
 |---|---|---|
@@ -138,4 +138,4 @@ Largest cost: profile capture (operator-side, multiple hosts under realistic loa
 | #29-31 (operator-side, default) | tc/qdisc per-flow cap | ✅ documented ([`DEPLOYMENT_HARDENING.md`](DEPLOYMENT_HARDENING.md)) |
 | Validation infrastructure | `veil-fingerprint` n-gram engine + pcap ingest + fp-compare CLI | ✅ shipped (P2 #5) |
 
-See [`docs/internal/ANTICENSORSHIP_STRATEGY.md`](ANTICENSORSHIP_STRATEGY.md) для the full DPI threat-model + roadmap.
+See [`docs/internal/ANTICENSORSHIP_STRATEGY.md`](ANTICENSORSHIP_STRATEGY.md) for the full DPI threat model and roadmap.

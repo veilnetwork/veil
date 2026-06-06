@@ -4,12 +4,14 @@
 
 ## TL;DR
 
-The mesh subsystem already covers the **M leaf-nodes ↔ N gateway-nodes** use case
-that Epic 478 plans for: Local-realm peers discover each other via signed UDP beacons,
-forward `MeshFrame`s through `MeshForwarder` (Core relays only, TTL-bounded, dedup'd),
-and a `GatewayBridge` lifts realm-local frames into the global veil (and injects
-veil frames back into the realm).  Auto-discovery + auto-connect to up to N
-gateways already runs.
+The mesh subsystem already covers the **M leaf-nodes ↔ N gateway-nodes** case
+that Epic 478 plans for. A realm here is a local-network scope — a group of
+nodes that can see each other on the same LAN. Within a realm, peers find each
+other through signed UDP beacons. They forward `MeshFrame`s through the
+`MeshForwarder` (Core relays only, bounded by a time-to-live hop count, and
+de-duplicated). A `GatewayBridge` then lifts realm-local frames out into the
+global veil, and injects veil frames back into the realm. Auto-discovery and
+auto-connect to up to N gateways already runs.
 
 **Gaps to close in Epic 478:**
 
@@ -19,10 +21,10 @@ gateways already runs.
 4. BLE / Wi-Fi Direct transport adapters (only UDP + in-memory loopback today).
 5. User-facing diagnostics ("you're connected via gateway X, battery 90 %, latency 12 ms").
 
-The 2-hop forward chain (M → relay-Core → gateway → target) is **already supported**
-by `MeshForwarder::forward_with_cache` — multi-hop path through Core nodes works
-inside the realm; the gateway is then the egress.  No code change needed for that
-sub-task; sim test will assert it.
+The 2-hop forward chain (M → relay-Core → gateway → target) is **already
+supported** by `MeshForwarder::forward_with_cache`. A multi-hop path through
+Core nodes works inside the realm, and the gateway is the exit point. No code
+change is needed for that sub-task; a simulation test will assert it.
 
 ---
 
@@ -30,17 +32,20 @@ sub-task; sim test will assert it.
 
 ### Wire types ([`proto/mesh.rs`](../../crates/veil-proto/src/mesh.rs))
 
-- **`RealmId([u8; 16])`** — 128-bit opaque realm scope.  Special wildcard
-  `BROADCAST = [0xFF; 16]`.  `MeshForwarder::with_realm_id(...)` enforces realm
-  isolation (cross-realm frames silently dropped — Epic 243).
-- **`MeshFrame { realm_id, src_node_id, dst_node_id, ttl, payload }`** — 83-byte
-  header + variable payload.  `dst = [0xFF; 32]` = realm broadcast.  Payload is
-  `Arc<[u8]>` so `clone()` (per-hop) is refcount, not copy — broadcast fan-out
-  doesn't reallocate per neighbour.
+- **`RealmId([u8; 16])`** — a 128-bit opaque realm scope (the identifier for one
+  local-network group). The wildcard `BROADCAST = [0xFF; 16]` means "every
+  realm." `MeshForwarder::with_realm_id(...)` enforces realm isolation: frames
+  from another realm are silently dropped (Epic 243).
+- **`MeshFrame { realm_id, src_node_id, dst_node_id, ttl, payload }`** — an
+  83-byte header plus a variable payload. `dst = [0xFF; 32]` means a realm
+  broadcast. The payload is an `Arc<[u8]>`, so the per-hop `clone()` only bumps a
+  reference count instead of copying the bytes — a broadcast fan-out doesn't
+  reallocate the payload for each neighbour.
 - **`MeshBeaconPayload { node_id, realm_id, role_flags, veil_addr,
-  battery_level, algo, public_key, signature }`** — periodic neighbour discovery.
-  Receiver verifies `BLAKE3(public_key) == node_id` AND signature over the
-  unsigned body (Epic 406.5).  Bit flags: `IS_GATEWAY = 0x01`,
+  battery_level, algo, public_key, signature }`** — the periodic announcement a
+  node sends so neighbours can discover it. The receiver checks two things:
+  that `BLAKE3(public_key) == node_id`, and that the signature over the unsigned
+  body is valid (Epic 406.5). Bit flags: `IS_GATEWAY = 0x01`,
   `HAS_INTERNET = 0x02`, `IS_RELAY = 0x04`.
 - **`MeshAckPayload { status }`** — OK / NoRoute / TtlExpired.
 
@@ -49,53 +54,58 @@ sub-task; sim test will assert it.
 `MeshForwarder { local_id, role, neighbors: Arc<dyn MeshNeighborProvider>,
 local_realm_id, broadcast_seen }`
 
-- Only `Core` nodes forward transit (`Leaf` returns `NotRelay`).
-- TTL = 0 → drop.
-- src spoofing detection: drop frame whose `src_node_id == self.local_id`.
-- Realm isolation: drop if `frame.realm_id != local_realm_id`.
-- Unicast: lookup `link_to(dst)` → send.
-- Broadcast: dedup via `BroadcastSeenSet` (4096-cap, 10 s TTL), then fan-out
-  to every neighbour (skip self, skip dup).
-- `forward_with_cache(frame, route_cache)`: prefer-local ordering —
-  (1) direct local-mesh link → (2) `RouteCache` next-hop hint (veil relay)
-  → (3) plain `forward()` fallback.  Implements Epic 68.4 prefer-local rule.
+- Only `Core` nodes forward transit traffic (a `Leaf` returns `NotRelay`).
+- TTL = 0 → drop the frame.
+- Source-spoofing check: drop any frame whose `src_node_id == self.local_id`.
+- Realm isolation: drop the frame if `frame.realm_id != local_realm_id`.
+- Unicast: look up `link_to(dst)`, then send.
+- Broadcast: de-duplicate via `BroadcastSeenSet` (4096-entry cap, 10 s TTL),
+  then fan out to every neighbour (skipping self and any duplicate).
+- `forward_with_cache(frame, route_cache)` tries paths in prefer-local order:
+  (1) a direct local-mesh link, then (2) a `RouteCache` next-hop hint (a veil
+  relay), then (3) a plain `forward()` fallback. This implements the Epic 68.4
+  prefer-local rule.
 
 ### Gateway bridge ([`node/mesh/bridge.rs`](../../crates/veil-mesh/src/bridge.rs))
 
 `GatewayBridge { gateway_id, role, lifted: Arc<Mutex<Vec<LiftedEnvelope>>>,
 lift_seen, metrics }`
 
-- **Lift** (mesh → veil): caller hands a `MeshFrame` whose payload decodes as
-  `DeliveryEnvelope`, bridge dedupes by `content_id`, queues `LiftedEnvelope` for
-  the veil layer to drain.  Loop-prevention: `lift_seen` HashMap with 30 s TTL
-  + 4096-cap LRU eviction (Epic 461.4).
-- **Inject** (veil → mesh): wrap a `DeliveryEnvelope` into a `MeshFrame`
-  destined for a realm-local recipient; caller sends via `MeshForwarder`.
+- **Lift** (mesh → veil): the caller hands over a `MeshFrame` whose payload
+  decodes as a `DeliveryEnvelope`. The bridge de-duplicates by `content_id`,
+  then queues a `LiftedEnvelope` for the veil layer to drain. To prevent loops,
+  it tracks a `lift_seen` HashMap with a 30 s TTL and 4096-entry LRU eviction
+  (Epic 461.4).
+- **Inject** (veil → mesh): wrap a `DeliveryEnvelope` in a `MeshFrame` addressed
+  to a realm-local recipient. The caller then sends it via `MeshForwarder`.
 
 ### Neighbour table ([`node/mesh/neighbor.rs`](../../crates/veil-mesh/src/neighbor.rs))
 
 `NeighborTable { inner: Arc<Mutex<HashMap<[u8; 32], Arc<dyn LocalLink>>>> }`
 
-- `add(node_id, link)` — register (or replace) a link.  Capped at
-  `MAX_NEIGHBOR_TABLE_SIZE`; new entries beyond cap rejected (existing replaced
-  unconditionally).
-- `link_to(&node_id)` — read interface for `MeshForwarder`.
-- `prune_dead()` — drop links where `is_alive() == false`.
+- `add(node_id, link)` — register a link, or replace one for a node already in
+  the table. The table is capped at `MAX_NEIGHBOR_TABLE_SIZE`: a replacement
+  always goes through, but a brand-new entry past the cap is rejected.
+- `link_to(&node_id)` — the read interface `MeshForwarder` uses to find a link.
+- `prune_dead()` — drop any link where `is_alive() == false`.
 
 ### Discovery / beacon ([`node/mesh/beacon.rs`](../../crates/veil-mesh/src/beacon.rs))
 
-`BeaconSender` / `BeaconReceiver` over UDP broadcast/multicast.  Sender
-periodically (default 10 s) emits a signed `MeshBeaconPayload`.  Receiver:
+`BeaconSender` and `BeaconReceiver` run over UDP broadcast/multicast. The sender
+emits a signed `MeshBeaconPayload` on a timer (default 10 s). The receiver
+applies three checks:
 
-- **Per-IP rate limit** — `BeaconRateLimiter` 10 beacons/min/IP, 8192 IPs cap.
-- **Dedup window** — `mesh.beacon_dedup_window_secs` (default 3 s) drops
-  duplicate beacons from the same source.
-- On valid beacon with `IS_GATEWAY`, calls `AutoDiscoveredPeers::upsert(...)`.
+- **Per-IP rate limit** — `BeaconRateLimiter` allows 10 beacons/min/IP, with an
+  8192-IP cap.
+- **Dedup window** — `mesh.beacon_dedup_window_secs` (default 3 s) drops repeat
+  beacons from the same source.
+- On a valid beacon flagged `IS_GATEWAY`, it calls
+  `AutoDiscoveredPeers::upsert(...)`.
 
-`AutoDiscoveredPeers` — capped at **`MAX_AUTODISCOVERED_GATEWAYS = 8`** entries,
-TTL **60 s**, LRU-evicts least-recently-seen on cap hit.  Persisted to disk
-when `mesh.autodiscover_persist_path` is set; on restore TTL halved (30 s) so
-stale entries refresh quickly.
+`AutoDiscoveredPeers` is capped at **`MAX_AUTODISCOVERED_GATEWAYS = 8`** entries
+with a **60 s** TTL; on a cap hit it evicts the least-recently-seen entry. It is
+persisted to disk when `mesh.autodiscover_persist_path` is set. On restore the
+TTL is halved (to 30 s) so stale entries refresh quickly.
 
 ### Auto-connect loop ([`runtime/mesh_gateway.rs`](../../crates/veil-node-runtime/src/runtime/mesh_gateway.rs))
 
@@ -106,8 +116,8 @@ stale entries refresh quickly.
 3. If `active < mesh.autodiscover_max_concurrent` (default 3), pick the
    shortfall from `live_gateways()` (FIFO order) and spawn outbound sessions.
 
-Each auto-connected gateway gets a synthetic `PeerId` ≥ `0xC000_0000` so other
-code paths can recognise it as transient (vs operator-configured peers).
+Each auto-connected gateway gets a synthetic `PeerId` ≥ `0xC000_0000`, so other
+code paths can recognise it as transient rather than operator-configured.
 
 ### Config ([`veil_cfg::MeshConfig`](../../crates/veil-cfg/src/model.rs))
 
@@ -147,10 +157,11 @@ autodiscover_persist_path = "..."   # optional: cache discovered gateways across
 
 ## Out of scope for Epic 478
 
-- **Wire-format change** — none planned.  All gaps are operational / runtime / new
-  transport adapters; the mesh wire format is stable.
-- **Onion / circuit support** — separate Epic 482.  Mesh layer is plaintext
-  realm-local; encryption is upstream (E2E inside `DeliveryEnvelope` payload).
-- **Cross-realm bridging** — gateways already lift to the global veil; multi-realm
-  gateway (one node bridging realm A ↔ realm B) is plausible but not required
-  by current threat model.
+- **Wire-format change** — none planned. Every gap above is operational, a
+  runtime concern, or a new transport adapter; the mesh wire format is stable.
+- **Onion / circuit support** — handled by a separate Epic 482. The mesh layer
+  carries plaintext within a realm; encryption happens upstream, end-to-end
+  inside the `DeliveryEnvelope` payload.
+- **Cross-realm bridging** — gateways already lift frames into the global veil.
+  A multi-realm gateway (one node bridging realm A ↔ realm B directly) is
+  plausible, but the current threat model doesn't require it.

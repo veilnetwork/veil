@@ -2,20 +2,21 @@
 
 > **Audit:** 2026-04-27 · **Code:** master @ `619abfd` · **Epic:** 480
 
-State-level censors block veil traffic by:
-1. **DPI fingerprinting** the handshake byte pattern (JA3 / JA4 / OVL1
-   magic) → block by L7 payload.
-2. **Port blacklisting** the well-known veil port → block by L4
-   tuple.
-3. **IP blacklisting** known veil nodes → block by L3 prefix /
-   BGP-level filter.
-4. **Traffic-shape correlation** — even encrypted, the size + cadence
-   pattern of veil traffic differs from typical HTTPS, allowing
-   probabilistic identification.
+A state-level censor has four ways to block veil traffic:
 
-This doc summarises **what's already built** in veilcore to defeat
-each attack, and links to the user-facing guide that explains how an
-operator turns it on.  The deployment guide:
+1. **DPI fingerprinting.** Match the handshake byte pattern (JA3 / JA4
+   / OVL1 magic), then block by L7 payload. (DPI is deep packet
+   inspection — the censor reads packet contents, not just headers.)
+2. **Port blacklisting.** Block the well-known veil port by L4 tuple.
+3. **IP blacklisting.** Block known veil nodes by L3 prefix or a
+   BGP-level filter.
+4. **Traffic-shape correlation.** Even when traffic is encrypted, the
+   size and cadence of veil packets differ from typical HTTPS — enough
+   to identify a veil flow with decent probability.
+
+This doc covers **what veilcore already ships** to defeat each of those
+attacks, and links to the user-facing guide that explains how an
+operator turns it on. That deployment guide:
 [`docs/internal/censorship-target.md`](censorship-target.md).
 
 ---
@@ -38,8 +39,8 @@ operator turns it on.  The deployment guide:
 
 ## Wire-level evidence
 
-What an on-path observer sees for an veil connection on
-`wss://node.example:443` with `tls-boring` enabled and
+Here is what an on-path observer sees for a veil connection on
+`wss://node.example:443`, with `tls-boring` enabled and
 `default_sni = "www.cloudflare.com"`:
 
 ```text
@@ -63,7 +64,7 @@ What an on-path observer sees for an veil connection on
                  no distinctive veil sizes)
 ```
 
-Compared to a plain `tcp://node.example:9000` connection without
+Compare that to a plain `tcp://node.example:9000` connection without
 `tls-boring`:
 
 ```text
@@ -72,32 +73,33 @@ Compared to a plain `tcp://node.example:9000` connection without
                                 ↑ trivial DPI signature
 ```
 
-The tls-boring + WSS-on-443 combination is the production-target
-configuration.  Plain TCP is dev-only.
+The tls-boring + WSS-on-443 combination is the production target.
+Plain TCP is for development only.
 
 ---
 
 ## What's missing (Epic 480 follow-up)
 
-1. **480.5 — Config profile**: `veil-cli config init --profile censorship-target`
+1. **480.5 — Config profile.** `veil-cli config init --profile censorship-target`
    should generate a `config.toml` that flips all the right knobs by
-   default.  Today's operator has to read seven docs to assemble the
-   right config.
-2. **480.6 — DPI-resistance test harness**: capture our own ClientHello
-   bytes through the rustls and tls-boring code paths, compare to a
-   golden Chrome ClientHello capture, assert byte-equivalent for
-   tls-boring AND assert distinguishable for rustls.  Catches
-   regressions if upstream `btls` / `quinn-btls` change defaults.
-3. **480.7 — Operator-facing deployment guide**: the doc that pulls all
+   default. Right now an operator has to read seven docs to assemble
+   the right config by hand.
+2. **480.6 — DPI-resistance test harness.** Capture our own ClientHello
+   bytes through both the rustls and tls-boring code paths. Compare them
+   to a golden Chrome ClientHello capture, then assert byte-equivalence
+   for tls-boring and assert that rustls is distinguishable. This
+   catches regressions if upstream `btls` / `quinn-btls` change their
+   defaults.
+3. **480.7 — Operator-facing deployment guide.** The doc that pulls all
    this together and tells operators which knob to flip when.
    See [`docs/internal/censorship-target.md`](censorship-target.md).
 
 Out of scope for Epic 480:
 - Domain fronting / CDN-fronting (separate Epic 484, needs CDN
   partner integration).
-- Port hopping: marginal value vs config simplicity.  If censor
-  blocks IP, port hopping doesn't help.  If censor whitelists ports,
-  bind to 443 once.
+- Port hopping. Marginal value for the added config complexity. If the
+  censor blocks the IP, port hopping doesn't help; if the censor
+  whitelists ports, just bind to 443 once.
 
 ---
 

@@ -1,10 +1,10 @@
 # Fingerprint regression testing
 
-Anti-censorship strategy P2 #5 (Epic 488.2 carry-over) — closes the **validation** half of DPI method #33 (flow-cache state tracking + n-gram analysis).
+Anti-censorship strategy P2 #5 (Epic 488.2 carry-over) — closes the **validation** half of DPI method #33 (flow-cache state tracking + n-gram analysis). An n-gram here is a run of N consecutive bytes; counting how often each run appears gives a statistical fingerprint of the stream.
 
-OVL1's anti-censorship work на the wire (obfs4 AEAD framing, tls-boring Chrome ClientHello, QUIC Chrome transport params) makes the on-wire bytes statistically indistinguishable от reference HTTPS/CDN traffic.  But — without а regression suite — а feature addition (а new header field, а padding-pattern change, а protocol-version negotiation byte) could silently break that goal.
+OVL1's on-the-wire work (obfs4 AEAD framing, tls-boring Chrome ClientHello, QUIC Chrome transport params) makes veil's bytes statistically indistinguishable от reference HTTPS/CDN traffic. The risk: without а regression suite, one feature addition — а new header field, а padding-pattern change, а protocol-version negotiation byte — could quietly break that property and nobody would notice.
 
-The [`veil-fingerprint`](../../crates/veil-fingerprint/) crate ships the **analyzer engine**:
+The [`veil-fingerprint`](../../crates/veil-fingerprint/) crate ships the **analyzer engine** that guards against exactly that:
 
 * **`NGramModel`** — counts byte n-grams (unigram / bigram / trigram / quadgram) и normalises к а probability distribution.
 * **`kl_divergence`** + **`chi_squared`** — pairwise distance metrics.  Lower = "models look more alike".
@@ -47,13 +47,13 @@ Run these once per ENV (CI machine + dev machine) before pinning thresholds.
 | Bigram (65 k buckets) | 2 | 1 M | ≈ 0.06 | ≥ 2.0 |
 | Trigram (16 M buckets) | 3 | 1 M | ≈ 16 | ≥ 60 |
 
-Rule of thumb: **threshold = 3× random/random noise floor**.  Trips on real shifts без false-positives под natural seed-к-seed variance.
+Rule of thumb: set the **threshold to 3× the random/random noise floor**. That trips on а real shift без firing on the natural seed-к-seed variance.
 
 ## What this crate does **not** ship (deliberately)
 
-* **Real-world Tor / OpenVPN / WireGuard reference pcaps** — license + privacy concerns, и meaningful comparisons need hand-curated fixtures от diverse clients.  Future slice: ingest pcap-format files into the same `NGramModel` API.
-* **Live capture against running veil nodes** — out of scope for an in-process test crate.  Operator-side capture procedure below.
-* **А static "Chrome HTTPS" reference fixture** — the `tls-boring` ClientHello fingerprint test уже covers ClientHello shape; this crate stays domain-agnostic so the same analyzer can be pointed at any byte stream.
+* **Real-world Tor / OpenVPN / WireGuard reference pcaps.** Held back over license and privacy concerns, и а meaningful comparison needs hand-curated fixtures от diverse clients. Future slice: ingest pcap-format files into the same `NGramModel` API.
+* **Live capture against running veil nodes.** Out of scope for an in-process test crate. The operator-side capture procedure is below.
+* **А static "Chrome HTTPS" reference fixture.** The `tls-boring` ClientHello fingerprint test уже covers ClientHello shape, and this crate stays deliberately domain-agnostic — point the same analyzer at any byte stream.
 
 ## Operator-side capture procedure (future fixtures)
 
@@ -95,8 +95,8 @@ See [`docs/internal/ANTICENSORSHIP_STRATEGY.md`](ANTICENSORSHIP_STRATEGY.md) д�
 
 ## Re-open triggers
 
-Re-open the (Epic 488.2 carry-over) row in TASKS.md if:
+Re-open the (Epic 488.2 carry-over) row in TASKS.md if any of these happen:
 
-* А new DPI tool publishes а fingerprinting model targeting OVL1 specifically.
-* Wire-format change reviewer needs к verify "before / after" indistinguishability без relying on intuition.
-* Operator-side capture procedure becomes routine и needs CLI automation.
+* А new DPI tool publishes а fingerprinting model aimed at OVL1 specifically.
+* Someone reviewing а wire-format change needs к verify "before / after" indistinguishability без relying on intuition.
+* The operator-side capture procedure becomes routine и needs CLI automation.

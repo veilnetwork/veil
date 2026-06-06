@@ -1,37 +1,45 @@
 # Operator Runbook — Hybrid Identity Backup & Recovery
 
-This runbook covers the operator-side workflow for the post-quantum
-hybrid (`ed25519+falcon512`) identity algorithm: how to create a
-hybrid identity, what to back up, and how to restore it on a fresh
-machine. Read this **before** running `veil-cli identity create
---algo hybrid` in production.
+This is the operator's guide to the post-quantum *hybrid* identity
+(`ed25519+falcon512`). It walks you through creating a hybrid
+identity, deciding what to back up, and restoring it on a fresh
+machine. *Hybrid* just means the identity is built from two different
+key systems at once — see below. Read this **before** you run
+`veil-cli identity create --algo hybrid` in production.
 
-> **TL;DR**: hybrid identities require **two** independent backups —
-> the BIP-39 paper phrase **and** the `master_falcon.bin` keypair
-> file. Lose either one and the identity cannot be restored as
-> hybrid; the `node_id` will change.
+> **TL;DR**: a hybrid identity needs **two** separate backups — the
+> BIP-39 paper phrase **and** the `master_falcon.bin` file. (BIP-39 is
+> the standard way of writing a key down as 24 plain words; the file
+> holds the second key.) Lose either one and you cannot restore the
+> identity as hybrid — and your `node_id`, the address everyone knows
+> you by, will change.
 
 ## Why two backups
 
-A hybrid master key is two keypairs glued together:
+A hybrid master key is two keypairs glued together. A *keypair* is a
+matched public key (safe to share) and private key (kept secret):
 
 | Half | Algorithm | Recoverable from |
 |---|---|---|
 | Classical | Ed25519 | BIP-39 paper phrase (24 words) |
 | Post-quantum | Falcon-512 | `master_falcon.bin` file only |
 
-The BIP-39 phrase deterministically reproduces the Ed25519 half. The
-Falcon-512 half is generated fresh from `OsRng` at create time; there
-is no seed-derivation path for Falcon-512 (current pqcrypto-falcon
-crate doesn't expose one), so the only way to preserve the Falcon
-half is to keep the on-disk file.
+The phrase rebuilds the Ed25519 half exactly, every time — that is
+what the 24 words are for. Ed25519 is the classical signature scheme;
+Falcon-512 is the post-quantum one that stays safe even against a
+future quantum computer. The catch: the Falcon-512 half is rolled
+fresh from the system random generator (`OsRng`) when you create the
+identity. There is no way to regrow it from the phrase — the current
+pqcrypto-falcon crate doesn't offer one. So the only copy of the
+Falcon half is the file on disk. Lose the file, lose the half.
 
-The `node_id` is `BLAKE3(ed_pk(32) || falcon_pk(897))` = 929 bytes
-hashed. Lose the Falcon half and you cannot reproduce the original
-929-byte hybrid pubkey, which means restore would have to fall back
-to a fresh Falcon keypair — yielding a **different** `node_id`. Your
-@name registration, contacts, and reputation are anchored to the old
-`node_id` and would be lost.
+Here is why that matters. Your `node_id` is a hash of *both* public
+keys: `BLAKE3(ed_pk(32) || falcon_pk(897))`, 929 bytes hashed
+together. Without the Falcon half you can't reproduce that 929-byte
+pubkey, so a restore has no choice but to mint a fresh Falcon keypair
+— and that gives you a **different** `node_id`. Your @name
+registration, contacts, and reputation all hang off the old
+`node_id`, so they would be lost.
 
 ## Step 1: create a hybrid identity
 
@@ -77,15 +85,16 @@ down on paper, stamp it on metal, or otherwise store it offline:
 21. decorate    22. banner      23. sausage     24. label
 ```
 
-DO NOT save the phrase to a hot file unless you also encrypt it
-(`--password-file` will write `master.enc` for you, but the password
-itself is then your single point of failure — pick this only if you
-understand the trade-off).
+Do NOT save the phrase to a file on a live machine unless you also
+encrypt it. (`--password-file` will write an encrypted `master.enc`
+for you — but then the password becomes the one thing that can sink
+you. Choose this only if you're comfortable with that trade-off.)
 
 ### 2b. `master_falcon.bin` (digital)
 
-This file is **2191 bytes** of opaque binary data starting with the
-ASCII magic `OFAM`. Verify:
+This file is **2191 bytes** of opaque binary. It starts with the four
+ASCII bytes `OFAM` (a "magic" marker that lets tools recognize the
+file format at a glance). Verify it:
 
 ```bash
 xxd /var/lib/veil/master_falcon.bin | head -1
@@ -93,21 +102,22 @@ xxd /var/lib/veil/master_falcon.bin | head -1
 #           O F A M  ver 1   sk_len=1281 (0x501)
 ```
 
-Recommended storage:
-- **2-of-3 redundancy** across independent media — e.g. an encrypted
-  USB stick, an air-gapped second machine, and an encrypted cloud
-  storage bucket;
-- **Same protection class as the BIP-39 phrase** — anyone who has
-  this file plus the phrase has full PQ control of your identity;
-- **Verify periodically** that the file is still readable AND that
-  it still parses (use `veil-cli identity show` on a copy).
+How to store it:
+- **Keep at least 2 of 3 copies** on independent media — say, an
+  encrypted USB stick, an air-gapped second machine (one that never
+  touches the network), and an encrypted cloud bucket. Any two
+  surviving is enough.
+- **Guard it as carefully as the phrase.** Anyone holding this file
+  *and* the phrase has full post-quantum control of your identity.
+- **Check on it now and then.** Make sure each copy still reads back
+  *and* still parses — run `veil-cli identity show` on a copy.
 
-> Operators occasionally treat the Falcon file as "less critical"
-> than the BIP-39 phrase because the phrase recovers _something_ on
-> its own. **Do not.** A hybrid identity restored without the Falcon
-> file is no longer the same identity at the network layer — the
-> `node_id` differs, and every name claim, contact, and routing
-> entry rooted at the old `node_id` becomes orphaned.
+> It's tempting to treat the Falcon file as "less critical" than the
+> phrase, because the phrase recovers _something_ on its own. **Don't.**
+> A hybrid identity restored without the Falcon file is no longer the
+> same identity on the network — the `node_id` is different, and every
+> name claim, contact, and routing entry tied to the old `node_id` is
+> left stranded.
 
 ## Step 3: restore on a fresh machine
 
@@ -131,8 +141,8 @@ veil-cli identity show --veil-dir /var/lib/veil
 # master_algo: ed25519+falcon512
 ```
 
-If `--master-falcon-file` is omitted on a hybrid restore the CLI
-fails fast with:
+If you leave out `--master-falcon-file` on a hybrid restore, the CLI
+stops right away with:
 
 ```
 restore: --algo=hybrid requires --master-falcon-file pointing at the
@@ -140,14 +150,14 @@ preserved master_falcon.bin (the BIP-39 phrase alone cannot recover
 the post-quantum half — see docs/identity-hybrid-backup.md)
 ```
 
-This is intentional; there is no silent degrade path to Ed25519-only
-because that would change the `node_id` without warning.
+This is on purpose. There is no quiet fallback to Ed25519-only,
+because that would change your `node_id` without telling you.
 
-## Step 4: rotation between algorithms (`identity migrate`)
+## Step 4: switching algorithms (`identity migrate`)
 
-If you start out with a classical Ed25519 identity and want to
-upgrade to hybrid (or vice versa), the workflow is **migration**,
-not restore. Available as `veil-cli identity migrate`.
+Say you started with a classical Ed25519 identity and now want to
+upgrade to hybrid (or go the other way). That is a **migration**, not
+a restore — use `veil-cli identity migrate`.
 
 ### 4a. Create the new identity
 
@@ -160,14 +170,15 @@ veil-cli identity create --algo hybrid \
 ```
 
 This mints a fresh `node_id`. Save the new BIP-39 phrase **and** the
-new `master_falcon.bin` (same backup discipline as Step 2).
+new `master_falcon.bin` — same care as in Step 2.
 
 ### 4b. Mint the migration cert
 
-On a machine that has access to BOTH the OLD veil_dir AND the
-OLD master secrets (BIP-39 phrase OR `master.enc` password, plus
-the OLD `master_falcon.bin` if the OLD identity was hybrid /
-Falcon-only):
+A migration cert is a small signed note that says "the old identity
+now lives at the new one." Mint it on a machine that can reach BOTH
+the OLD veil_dir AND the OLD master secrets — the BIP-39 phrase (or
+the `master.enc` password), plus the OLD `master_falcon.bin` if the
+OLD identity was hybrid or Falcon-only:
 
 ```bash
 veil-cli identity migrate \
@@ -206,16 +217,17 @@ Two options:
 2. **Manual** — `veil-cli node dht put <dht_key> <cert_path>`
    against a running admin socket for immediate propagation.
 
-After publish, current resolvers pick up the chain automatically —
-`resolve_identity_verified(old_node_id)` returns
-the NEW identity, with the cycle/depth/non-downgrade safeguards
-described in `crates/veil-identity/src/resolver.rs`.
+Once it's published, anyone looking you up follows the chain on their
+own — `resolve_identity_verified(old_node_id)` returns the NEW
+identity. The lookup has built-in guards against loops, over-long
+chains, and downgrades, all described in
+`crates/veil-identity/src/resolver.rs`.
 
-### 4d. Security non-downgrade enforcement
+### 4d. You cannot migrate to a weaker algorithm
 
-The CLI's `migrate` command (and the underlying
-`migration::sign_migration_cert`) **rejects** any rotation that
-lowers the security tier:
+The `migrate` command — and the `migration::sign_migration_cert` call
+underneath it — **refuses** any switch that drops to a weaker security
+tier:
 
 | OLD → NEW | Status |
 |---|---|
@@ -227,41 +239,42 @@ lowers the security tier:
 | hybrid → ed25519 | **REJECTED** (loses Falcon component) |
 | hybrid → falcon512 | **REJECTED** (loses Ed25519 component) |
 
-Tier ordering: `ed25519 (1) < falcon512 (2) < ed25519+falcon512 (3)`.
+The tiers rank from weakest to strongest:
+`ed25519 (1) < falcon512 (2) < ed25519+falcon512 (3)`.
 
-A downgrade attempt fails at sign time with:
+Try to downgrade and the signing step fails with:
 
 ```
 migrate: sign_migration_cert: security downgrade rejected
 (old_algo=3, new_algo=1)
 ```
 
-This is a defence-in-depth check: even if the resolver-side check
-were bypassed (e.g. by an out-of-band cert injection), `sign` itself
-refuses to produce the cert blob.
+This is a belt-and-suspenders check. Even if someone slipped a cert
+past the lookup guards another way, `sign` itself still won't produce
+the cert.
 
-## Step 5: forensics — what to do if the Falcon file is lost
+## Step 5: what to do if the Falcon file is lost
 
-If the BIP-39 phrase survives but `master_falcon.bin` is destroyed,
-the operator has two choices:
+The phrase survived, but `master_falcon.bin` is gone. You have two
+options, and neither is painless:
 
 1. **Mint a new hybrid identity** (`identity create --algo hybrid`)
    and publish a MigrationCert from the old hybrid `node_id` to the
-   new one. The cert itself must be signed by the old master, which
-   requires the lost Falcon file — so this path is **only** open if
-   the Falcon file was lost recently and you still have a running
-   live process holding the master in memory. If the live process
-   is gone, the chain is broken.
+   new one. The catch: the cert has to be signed by the *old* master,
+   which needs the lost Falcon file. So this only works if you lost
+   the file recently AND a live process is still running with the
+   master loaded in memory. Once that process is gone, the chain
+   can't be made.
 
 2. **Mint a new Ed25519-only identity** (`identity create`, no
-   `--algo`) using the BIP-39-recovered seed for ONE half, accept
-   that the new `node_id` differs (BLAKE3(32 B) ≠ BLAKE3(929 B)),
-   and re-establish your @name and contacts from scratch. This is
-   the "lost everything" recovery — the only technically possible
-   path when the Falcon material is gone permanently.
+   `--algo`), using the phrase to recover one half. Accept that the
+   new `node_id` is different — it's now a hash of 32 bytes instead
+   of 929, so `BLAKE3(32 B) ≠ BLAKE3(929 B)` — and rebuild your @name
+   and contacts from scratch. This is the "lost everything" path, and
+   it's the only one left once the Falcon material is gone for good.
 
-The BIP-39 phrase alone is therefore **not sufficient** for hybrid
-recovery. Treat the two backups as a single recovery pair.
+So the phrase on its own is **not enough** to recover a hybrid
+identity. Treat the two backups as a single pair: you need both.
 
 ## Quick reference
 
@@ -275,13 +288,14 @@ recovery. Treat the two backups as a single recovery pair.
 ## Appendix A: standalone `--algo=falcon512`
 
 Standalone Falcon-512 (`--algo=falcon512`) is supported but **not
-recommended for production**. Read this section before considering it.
+recommended for production**. Read this section before you reach for
+it.
 
 ### What it is
 
-A pure post-quantum master keypair. There is **no** classical
-Ed25519 component, **no** BIP-39 paper-backup path, and **no**
-recovery channel beyond `master_falcon.bin`.
+A pure post-quantum master keypair, and nothing else. There is **no**
+classical Ed25519 half, **no** BIP-39 paper backup, and **no** way to
+recover it other than `master_falcon.bin`.
 
 ```
 node_id   = BLAKE3(falcon_pk(897 B))    // distinct from hybrid (BLAKE3(929 B))
@@ -291,30 +305,33 @@ master_sk     = OsRng-derived Falcon-512 SK, lives ONLY in master_falcon.bin
 
 ### Why you might want it
 
-- Pure-PQ deployment with no classical-key surface (no Ed25519 = no
-  CRQC-recoverable artifact, even theoretically).
-- Operator preference for not having a BIP-39 phrase as a forensic
-  artifact (the phrase IS recoverable but also IS a target).
-- Research / experimentation with pure post-quantum identities.
+- A pure post-quantum deployment with no classical key anywhere — no
+  Ed25519 means nothing a future quantum computer could ever unwind,
+  even in theory.
+- You'd rather not have a BIP-39 phrase lying around at all. The
+  phrase can recover your identity, but for that same reason it's also
+  a thing an attacker can go after.
+- Research or experiments with pure post-quantum identities.
 
 ### Why it's dangerous
 
-The BIP-39 phrase exists in the hybrid path **specifically to
-provide a paper-backup recovery channel**. Removing it means:
+In the hybrid path the BIP-39 phrase is there **for one reason: a
+paper backup you can fall back on**. Drop it and every one of these
+becomes fatal:
 
-- Loss of `master_falcon.bin` = total identity loss. No second
-  channel.
-- A mistyped path during backup = total identity loss.
-- A failing disk you didn't notice during backup = total identity
-  loss.
-- A stolen device with `master_falcon.bin` and no operator alert =
-  total identity compromise (no "rotate from the old phrase"
-  recovery option).
+- You lose `master_falcon.bin` — that's the whole identity gone, with
+  no second copy to fall back on.
+- You mistype a path during backup — identity gone.
+- A disk quietly fails mid-backup and you don't notice — identity
+  gone.
+- Someone steals a device holding `master_falcon.bin` and you never
+  get an alert — your identity is fully compromised, with no "rotate
+  from the old phrase" move left to make.
 
 ### Required acknowledgement
 
-The CLI refuses to mint a standalone Falcon-512 identity unless the
-operator passes `--accept-no-recovery`:
+The CLI won't mint a standalone Falcon-512 identity unless you pass
+`--accept-no-recovery` to say you understand there's no way back:
 
 ```bash
 veil-cli identity create --algo falcon512 --label foo \
@@ -331,13 +348,13 @@ Loss of that file = TOTAL identity loss with no paper backup.  Pass
 retains BIP-39-recoverable Ed25519 half.  See docs/identity-hybrid-backup.md.
 ```
 
-### What `create` emits for Falcon-512
+### What `create` prints for Falcon-512
 
-- The 24-word BIP-39 phrase block is **suppressed** — it doesn't
-  recover anything, so showing it would be misleading.
-- A loud `!!! WARNING ...` block prints on the operator stream.
-- `master_falcon.bin` is created in `<veil_dir>` and printed with
-  the `(PRESERVE — operator-side recovery medium)` annotation.
+- The 24-word BIP-39 block is **left out** — it can't recover
+  anything here, so printing it would only mislead you.
+- A loud `!!! WARNING ...` block prints to the operator stream.
+- `master_falcon.bin` is created in `<veil_dir>` and printed with the
+  note `(PRESERVE — operator-side recovery medium)`.
 
 ### Restore
 
@@ -348,24 +365,24 @@ veil-cli identity restore --algo falcon512 \
     --veil-dir /var/lib/veil
 ```
 
-`--phrase-file` is **not required** (and noisy-warned if supplied —
-the file is decoded for typo-detection but its bytes are not
-consumed). The bundle reproduces the `node_id` byte-for-byte.
+`--phrase-file` is **not required** here (and you'll get a loud
+warning if you pass it — the file is decoded only to catch typos, its
+bytes aren't used). The bundle reproduces the `node_id` byte for byte.
 
 ### Backup recommendation
 
-**3-of-3** redundancy. Standalone Falcon-512 has zero recovery
-buffer; one bad copy is one bad copy too few. For each backup:
+Keep **3 of 3** copies. Standalone Falcon-512 has no margin for error
+— one bad copy is already one too few. For every backup:
 
-1. Verify the file's `OFAM` magic header (`xxd | head -1`).
-2. Verify the parser succeeds (`veil-cli identity show` against
-   a temp restore-target).
-3. Refresh on a known schedule (quarterly, at minimum).
+1. Check the file's `OFAM` magic header (`xxd | head -1`).
+2. Check that it parses (`veil-cli identity show` against a temporary
+   restore target).
+3. Refresh on a set schedule — quarterly at the very least.
 
-If you cannot commit to 3-of-3, **use `--algo=hybrid` instead.** The
-hybrid path's classical half mitigates exactly the failure modes
-this section enumerates, at the cost of an extra 64 bytes of
-signature on each cert.
+If you can't commit to all three, **use `--algo=hybrid` instead.** The
+classical half of the hybrid path covers exactly the failure modes
+listed above, and it costs you only an extra 64 bytes of signature on
+each cert.
 
 ## See also
 

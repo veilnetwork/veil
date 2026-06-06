@@ -7,9 +7,9 @@
 * 🇬🇧 **[English](en/)** — [`en/index.md`](en/index.md)
 * 🇷🇺 **[Русский](ru/)** — [`ru/index.md`](ru/index.md)
 
-Some documents are currently available in only one language; the missing
-counterpart links to the available version with а translation-pending
-notice. Help with translations is welcome — edit the stub and open а PR.
+Some documents exist in only one language for now. Where а translation is
+missing, the stub links to the version that does exist and flags it as
+pending. Translations are welcome — fill in а stub and open а PR.
 
 ## Quick links / Быстрые ссылки
 
@@ -33,7 +33,7 @@ notice. Help with translations is welcome — edit the stub and open а PR.
 
 ## Subdirectories / Подразделы
 
-These are language-neutral or have not been split yet:
+These are language-neutral, or just haven't been split by language yet:
 
 * [`architecture/`](architecture/) — invariant decisions (foundation, mesh)
 * [`rfcs/`](rfcs/) — RFC index (`0001-hybrid-veil-architecture`)
@@ -42,13 +42,13 @@ These are language-neutral or have not been split yet:
 
 ## Adding а new document
 
-When creating new documentation:
+When you add а new doc:
 
-1. Decide the primary language (usually English for technical docs,
-   either for operator guides).
-2. Place the primary in `docs/<lang>/<name>.md`.
-3. Create а stub in the other language at `docs/<otherlang>/<name>.md`
-   pointing to the primary. Example stub:
+1. Pick the primary language — usually English for technical docs,
+   either one for operator guides.
+2. Put the primary file in `docs/<lang>/<name>.md`.
+3. Add а stub in the other language at `docs/<otherlang>/<name>.md` that
+   points back to the primary. For example:
    ```markdown
    # <Title> (translation pending)
    >

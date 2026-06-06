@@ -1,319 +1,318 @@
 # OpSec user guide
 
-Physical-security and social-engineering guidance for veil
-identity holders.  These are things veil **cannot** protect
-you from at the protocol layer — you have to do them yourself.
+**OpSec** — short for *operational security* — is the everyday habits that keep
+you safe: how you handle your secret words, your devices, and the people who ask
+you for things. This guide covers the parts Veil **cannot** protect you from in
+the software itself. Those are on you. The good news: the habits are simple, and
+this page walks through each one.
 
-For protocol defences, see [`identity-model.md`](identity-model.md).
-For recovery from compromise, see [`recovery.md`](recovery.md).
-
----
-
-## 1. The threat model veil *does* defend against
-
-- Passive wire-taps observing veil traffic.
-- Malicious DHT nodes serving forged records.
-- Compromised peers relaying stale revocations.
-- Attackers with one device's `identity_sk` trying to impersonate
-  the whole identity.
-- An offline owner vs. attackers trying to replay pre-revocation
-  records.
-- Name squatters trying to register `@alice` for themselves.
-- Eclipse attacks on `@name` resolution.
-
-The cryptographic primitives — BLAKE3 preimages, Ed25519 /
-Falcon-512 signatures, ChaCha20-Poly1305 AEAD, ML-KEM-768
-encapsulation, HKDF-SHA256 derivation, rarity-PoW — cover all of
-the above, assuming their security holds.
+For the protections built into the protocol, see
+[`identity-model.md`](identity-model.md). For how to recover after someone breaks
+in, see [`recovery.md`](recovery.md).
 
 ---
 
-## 2. The threat model veil does **NOT** defend against
+## 1. What Veil *does* defend against
 
-No protocol can defeat these; you have to own the defence:
+Your *threat model* is simply the list of dangers you're trying to guard
+against. Veil's software already handles this side of the list for you:
 
-1. **Shoulder-surfing during BIP-39 display.**  Anyone standing
-   behind you when you run `identity create` can photograph the
-   24 words with their phone and reconstruct your entire
-   identity.
-2. **Phishing "veil support asking for your phrase."**  There
-   is no such support.  Nobody needs your BIP-39 phrase to help
-   you.  If an email, chat message, or "tech support" call asks
-   for it, the sender is stealing your identity.
-3. **Screenshots / camera rolls / clipboards of your BIP-39
-   phrase.**  Any device that touches the phrase in plaintext
-   can leak it.
-4. **Keyloggers on the machine you use to type the phrase.**
-   The phrase is typed when restoring; a keylogger captures it.
-5. **Coercion — somebody with a wrench asking for your phrase.**
-   Veil has no duress-mode disclosure at present.
-6. **Physical theft of an unlocked device.**  The `identity_sk`
-   is held hot on the device.  If the device is unlocked when
-   stolen, the attacker has the key until you revoke.
-7. **Supply-chain attacks on the veil binary itself.**  If
-   the binary you run is backdoored, no protocol layer protects
-   you.  Verify signatures on release artefacts.
+- Someone quietly listening to your Veil traffic on the wire.
+- Bad nodes in the shared directory (the DHT) handing out forged records.
+- Compromised peers passing along out-of-date revocations — a *revocation* is the
+  notice that says "this key is no longer trusted, ignore it."
+- An attacker who stole one device's secret key (`identity_sk`) trying to
+  impersonate your whole identity.
+- An attacker replaying old records that were published *before* you revoked a
+  key, hoping you're offline and can't object.
+- Name squatters trying to grab `@alice` for themselves.
+- *Eclipse attacks* — where an attacker surrounds you with nodes they control —
+  aimed at hijacking how an `@name` is looked up.
+
+The cryptography under the hood — BLAKE3 preimages, Ed25519 / Falcon-512
+signatures, ChaCha20-Poly1305 AEAD, ML-KEM-768 encapsulation, HKDF-SHA256
+derivation, rarity-PoW — covers everything in that list, as long as those
+algorithms themselves stay unbroken.
+
+---
+
+## 2. What Veil does **NOT** defend against
+
+No software can stop the dangers below. Here the defence is up to you. (Your
+identity rests on a *BIP-39 phrase* — a list of 24 ordinary words that *is* your
+identity in human-readable form. Anyone who learns those words owns you.)
+
+1. **Someone reading over your shoulder while the words are on screen.** Anyone
+   standing behind you when you run `identity create` can photograph the 24 words
+   with their phone and rebuild your whole identity.
+2. **Phishing — "Veil support needs your phrase."** There is no such support.
+   Nobody needs your BIP-39 phrase to help you. If an email, chat message, or
+   "tech support" call asks for it, the sender is trying to steal your identity.
+3. **Screenshots, camera rolls, or clipboards holding your BIP-39 phrase.** Any
+   device that touches the phrase as plain text can leak it.
+4. **Keyloggers on the machine you type the phrase into.** A *keylogger* is
+   hidden software that records every keystroke. You type the phrase when
+   restoring, and it captures it.
+5. **Coercion — someone threatening you to hand over your phrase.** Veil has no
+   "duress mode" yet, so it can't help you here.
+6. **Physical theft of an unlocked device.** The secret key (`identity_sk`) lives
+   ready-to-use on the device. If the device is unlocked when it's stolen, the
+   thief holds the key until you revoke it.
+7. **A tampered Veil program.** If the copy of Veil you run has a hidden backdoor,
+   no part of the protocol can save you. Always check the signatures on the files
+   you download. (A *signature* is a cryptographic stamp that proves the file
+   really came from the Veil developers and wasn't altered.)
 
 ---
 
 ## 3. Physical-security checklist
 
-### 3.1. During `identity create`
+### 3.1. While you run `identity create`
 
-☐ Run on an **offline machine** if you take OpSec seriously.  A
-laptop with WiFi disabled is a reasonable first tier; an
-air-gapped machine that has never been online is the paranoia
-tier.
+☐ **Run it on an offline machine** if you're serious about this. A laptop with
+WiFi switched off is a sensible first step. A machine that has *never* touched the
+internet (an "air-gapped" machine) is the cautious extreme.
 
-☐ **Dim the screen.**  BIP-39 display leaks via reflections and
-shoulder-surfing.  Turn the brightness down, face a wall.
+☐ **Dim the screen.** The 24 words can leak through window reflections or over
+your shoulder. Turn the brightness down and face a wall.
 
-☐ **No cameras in view.**  Take a look around before the CLI
-shows the phrase.  Phones on tables with the camera visible,
-laptop webcams, ceiling-mounted security cams — all read the
-screen if they have line of sight.
+☐ **No cameras in view.** Glance around before the program shows the phrase.
+Phones lying face-up on a table, laptop webcams, ceiling security cameras — any of
+them can read the screen if it can see it.
 
-☐ **Write the phrase by hand on paper** before typing the
-confirmation words back.  The CLI will ask you to retype 3
-random words; that's the point — it's confirming you've
-written it down somewhere the CLI does not know about.
+☐ **Write the phrase down by hand, on paper,** before you type the confirmation
+words back. The program asks you to retype 3 random words on purpose: it's making
+sure you've recorded the phrase somewhere it can't see.
 
-☐ **Store the paper safely before the CLI session ends.**
-Fireproof safe, safe deposit box, or a sealed envelope in a
-location only you know.  The paper is more important than the
-laptop.
+☐ **Put the paper somewhere safe before you close the program.** A fireproof safe,
+a safe-deposit box, or a sealed envelope in a spot only you know. The paper
+matters more than the laptop.
 
-☐ **Do not photograph, scan, or otherwise digitise the paper**
-except through the purpose-built encrypted QR backup flow,
-which requires a password never stored on the same machine.
+☐ **Don't photograph, scan, or otherwise digitise the paper** — the one exception
+is the built-in encrypted QR backup, which protects the words with a password you
+keep on a *different* machine.
 
 ### 3.2. Daily use
 
-☐ Lock the screen whenever you step away.  `identity_sk` is
-held hot by the running veil process.  Screen-lock is the
-last line of defence.
+☐ **Lock the screen whenever you step away.** While Veil is running, your secret
+key (`identity_sk`) is loaded and ready to use. A locked screen is your last line
+of defence.
 
-☐ Disable auto-mount of USB storage.  A keylogger dropped from
-a plugged-in drive can intercept your next BIP-39 entry during
-a restore.
+☐ **Turn off auto-mount for USB drives.** If a plugged-in drive can run software
+on its own, it could drop a keylogger that captures the next phrase you type
+during a restore.
 
-☐ Use full-disk encryption on every device.  Prevents an
-attacker with physical access from extracting
-`~/.config/veil/identity.toml` offline.
+☐ **Turn on full-disk encryption on every device.** This stops anyone with
+physical access from copying `~/.config/veil/identity.toml` off the disk and
+reading it on another machine.
 
-☐ Treat the encrypted `master.enc` as only weakly confidential.
-Argon2id + ChaCha20-Poly1305 buys time — not forever — against
-a determined attacker with the file and unlimited GPUs.  Use a
-strong password (diceware, ≥ 6 words).
+☐ **Treat the encrypted `master.enc` file as only lightly protected.** Its
+encryption (Argon2id + ChaCha20-Poly1305) buys you time, not forever, against a
+determined attacker who has the file and plenty of GPUs. Protect it with a strong
+password — *diceware* (a passphrase built from random dictionary words), 6 words
+or more.
 
 ### 3.3. Pairing a new device
 
-☐ Pair **in person** when possible.  Hold both screens side by
-side; compare the 6-digit OOB code directly.
+☐ **Pair in person when you can.** Hold the two screens side by side and check
+that the 6-digit confirmation code matches. (This code is shown "out of band" —
+*OOB* for short — meaning on the screens themselves, not sent through the
+connection you're setting up, so an attacker on that connection can't fake it.)
 
-☐ If remote pairing is unavoidable, compare the OOB code over a
-**pre-established trusted channel** (phone call to a number you
-memorised before needing it; a signed video-call with both
-faces visible).  Do **NOT** compare via the same channel
-you're about to start using — an attacker controlling the
-channel could mediate both ends.
+☐ **If you must pair remotely, compare the code over a channel you already
+trust** — a phone call to a number you memorised *before* you needed it, or a
+video call where you can both see each other's faces. Do **NOT** compare it over
+the same channel you're about to start using: an attacker who controls that
+channel could sit in the middle and relay both sides.
 
-☐ **Abort if codes don't match.**  Mismatch means somebody is
-man-in-the-middling you.  The paired device becomes an attacker's
-device.  Aborting is always safe; reconfirming is not.
+☐ **Stop if the codes don't match.** A mismatch means someone is sitting between
+you and the other device — a *man-in-the-middle* attack — and the device you're
+pairing would become theirs. Stopping is always safe. Confirming anyway is not.
 
 ### 3.4. Recovery
 
-☐ Restore on a **clean device.**  Don't restore into the
-suspected-compromised machine you just had stolen back.  Buy
-fresh hardware, install veil from verified release
-artefacts, restore there.
+☐ **Restore onto a clean device.** Don't restore onto the machine you suspect was
+broken into — even if you just got it back from a thief. Buy fresh hardware,
+install Veil from files whose signatures you've checked, and restore there.
 
-☐ After a compromise, run
-`veil-cli identity status` and read every anomaly the
-watcher reports.  An attacker may have added an unauthorised
-device you need to revoke.
+☐ **After a break-in, run `veil-cli identity status` and read every warning it
+reports.** Veil's built-in watcher flags anything odd. An attacker may have added
+a device of their own that you'll need to revoke.
 
-☐ Rotate your safety numbers with contacts you care about.  A
-post-compromise identity has the same `identity_id` but new
-`identity_keys`, so the safety number changes.  Contacts will
-see an alert; have a call with them to re-confirm.
+☐ **Re-verify your safety numbers with the contacts who matter.** A *safety
+number* is a code two contacts compare to confirm they're really talking to each
+other. After a break-in, your identity keeps the same `identity_id` but gets new
+`identity_keys`, so that number changes. Your contacts will see an alert — call
+them and re-confirm in person or by voice.
 
 ---
 
-## 4. The phishing catalogue
+## 4. Phishing: the tricks to watch for
 
-Real-world attack patterns we expect to see:
+*Phishing* is when someone pretends to be trustworthy to talk you out of a secret.
+Here are the patterns we expect Veil users to run into.
 
 ### 4.1. "Veil support"
 
-Email / DM / forum post: *"Hi, we noticed suspicious activity
-on your @alice identity.  Please send us your BIP-39 phrase so
-we can secure it."*
+An email, direct message, or forum post says: *"Hi, we noticed suspicious activity
+on your @alice identity. Please send us your BIP-39 phrase so we can secure it."*
 
-**Never do this.**  No support organisation that exists now,
-ever existed, or ever will exist has any reason to see your
-phrase.  The phrase literally is your identity.  Handing it
-over hands the identity over.
+**Never do this.** No support team — present, past, or future — has any reason to
+see your phrase. The phrase *is* your identity. Hand it over and you've handed your
+identity over.
 
-### 4.2. Fake restore flow
+### 4.2. A fake restore screen
 
-A fake binary or website asks you to "paste your phrase here to
-verify you still control the identity."
+A fake program or website asks you to "paste your phrase here to verify you still
+control the identity."
 
-**Never do this either.**  The only legitimate BIP-39 entry is
-into the official `veil-cli identity restore` command
-running on a machine you trust.  Nothing else.
+**Never do this either.** The only place it's ever right to type your BIP-39
+phrase is into the real `veil-cli identity restore` command, on a machine you
+trust. Nowhere else.
 
-### 4.3. QR-scan hijack on pairing
+### 4.3. A hijacked QR scan while pairing
 
-During pairing, an attacker's app intercepts the QR scan and
-presents a forged OOB code.  Defence: the genuine OOB code is
-displayed on the source device (the one with master_seed), and
-the target device shows the same code *computed from the real
-pairing session key*.  If an attacker-in-the-middle is
-mediating, their fake target cannot display the source's code.
+While you pair two devices, an attacker's app intercepts the QR scan and shows a
+fake confirmation code. Here's why the design protects you: the real code appears
+on the source device (the one holding your `master_seed`), and the new device
+shows the same code, computed from the genuine shared key of that pairing session.
+An attacker sitting in the middle can't make their fake stand-in display the
+source's code.
 
-Mitigation in practice: **always compare codes visually** before
-tapping "confirm" on the source.  The security of the pairing
-depends on this step.
+What this means for you: **always compare the codes with your own eyes** before
+you tap "confirm" on the source device. The whole safety of pairing rests on this
+one step.
 
-### 4.4. Name-registration spoofing
+### 4.4. A look-alike name
 
-An attacker registers `@a1ice` (with a digit one) hoping you
-don't notice.  Or tries a look-alike where the "a" is replaced by
-the Cyrillic letter "a" (Unicode U+0430), which is visually
-identical to the Latin "a".
+An attacker registers `@a1ice` — with the digit one in place of the letter "l" —
+hoping you won't notice. Or they try swapping the Latin "a" for the Cyrillic
+letter "а" (Unicode U+0430), which looks identical.
 
-Protocol defence: veil's name whitelist is ASCII-only and
-forbids Unicode characters entirely, so the Cyrillic look-alike is
-rejected at decode time.  `@a1ice` is technically a valid distinct
-name, so
-**check the handle spelling before adding a contact**.  The safety
-number is the ultimate arbiter — two names with visually similar
-spellings have completely different 60-digit fingerprints.
+How the protocol helps: Veil only allows plain ASCII letters in names and blocks
+Unicode characters entirely, so the Cyrillic look-alike is rejected outright.
+`@a1ice`, though, is a perfectly valid name that just *looks* like yours — so
+**check the spelling of any handle before you add it as a contact**. The safety
+number settles all doubt: two names that look alike have completely different
+60-digit fingerprints. (A *fingerprint* is a short code derived from someone's
+keys — if two fingerprints differ, the keys differ, full stop.)
 
-### 4.5. "Please confirm this transaction by reading your
-    safety number"
+### 4.5. "Please confirm by reading me your safety number"
 
-Real safety-number verification is **you reading** the 60 digits
-to your contact over a trusted channel — not them reading them
-to you.  Reversing the direction lets an attacker feed you their
-forged number and have you confirm it.
+Genuine safety-number checking means **you read** the 60 digits *to* your contact
+over a trusted channel — never the other way around. If they read the number to
+you instead, an attacker can feed you their own fake number and trick you into
+confirming it.
 
 ---
 
-## 5. Backup hygiene
+## 5. Looking after your backups
 
-- **Multiple geographically-separated paper copies.**  One in your
-  home safe, one in a family member's or lawyer's hands.  A house
-  fire takes out one copy; a legal seizure takes out another; a
-  3-place distribution is robust against any single event.
-- **Rotate the encrypted file annually.**  Delete the old
-  `master.enc`, run `identity rotate-password`, save a new file
-  on fresh storage.  Limits exposure to key-storage corruption
-  over time.
-- **Test recovery annually.**  Restore on a scratch device,
-  confirm identity_id matches, wipe.  Described in
+- **Keep several paper copies in different places.** One in your home safe, one
+  with a family member or a lawyer. A house fire destroys one copy; a legal
+  seizure takes another; spreading them across 3 locations survives any single
+  mishap.
+- **Refresh the encrypted file once a year.** Delete the old `master.enc`, run
+  `identity rotate-password`, and save the new file on fresh storage. This limits
+  how long any single stored copy is exposed to slow decay or corruption.
+- **Test your recovery once a year.** Restore onto a spare device, confirm the
+  `identity_id` matches, then wipe that device clean. The steps are in
   [`recovery.md`](recovery.md) §7.
-- **Never write the phrase on anything connected to the
-  internet.**  Paper only.  Metal backup plates (for
-  water/fire/EMP resistance) are a reasonable upgrade for
-  paranoia-tier storage, widely available from hardware-wallet
-  vendors.
+- **Never write the phrase on anything connected to the internet.** Paper only.
+  Metal backup plates — which survive water, fire, and electrical surges better
+  than paper — are a reasonable upgrade if you want extra resilience; the same
+  vendors who sell hardware wallets sell them.
 
 ---
 
 ## 6. Choosing a password for the encrypted master file
 
-Argon2id with veil's defaults (64 MiB memory, 3 iterations, 4
-lanes) is slow: ~100 ms to derive on a laptop.  A 12-character
-random password survives about 2^70 guesses in expected wall-clock
-terms given a modern GPU cluster — a decade of budget even for a
-well-resourced attacker.
+Veil deliberately makes this password slow to test. With its defaults (Argon2id,
+64 MiB memory, 3 iterations, 4 lanes) each guess takes about 100 ms on a laptop.
+A 12-character random password then stands up to roughly 2^70 guesses in real
+elapsed time even against a modern cluster of GPUs — that's a decade of effort for
+a well-funded attacker. So pick a good one:
 
-- **Good**: 6-word diceware (`correct horse battery staple foo
-  bar`).  Easy to remember, ~77 bits of entropy.
-- **Better**: 7-8 words.  Adds a decade of breathing room.
-- **Do not use**:
-  - Passwords you've used elsewhere.
-  - Keyboard walks (`qwertyuiop`, `asdfghjkl`).
-  - Birthdays, names, anything guessable about you.
-  - Anything that autocomplete on your phone ever learned — the
-    phone's cloud backup may have learned it too.
+- **Good**: 6-word diceware (`correct horse battery staple foo bar`). Easy to
+  remember, with about 77 bits of *entropy* — a measure of how hard it is to
+  guess.
+- **Better**: 7 or 8 words. Buys another decade of breathing room.
+- **Don't use**:
+  - A password you've used anywhere else.
+  - Straight rows across the keyboard (`qwertyuiop`, `asdfghjkl`).
+  - Birthdays, names, or anything someone could guess about you.
+  - Anything your phone's autocomplete has ever learned — your phone's cloud
+    backup may have learned it too.
 
-Password managers are fine **provided** the password manager
-itself is not the same machine as where the encrypted file
-lives.  Cross-device hygiene matters.
-
----
-
-## 7. OpSec for developers using veil
-
-If you're building an app on veil:
-
-- **Never log `identity_sk`, `master_sk`, `app_state_secret`,
-  ML-KEM decapsulation seeds, or BIP-39 phrases.**  `Zeroizing`
-  wrappers in `veilcore` prevent accidental memory linger;
-  don't circumvent them.
-- **Don't display the master_seed to users outside the
-  `identity create`/`identity show --export-phrase` flows.**
-  The CLI's terminal-handling already ensures the phrase isn't
-  written to a scrollback log; arbitrary app code might not.
-- **Use the encrypted app-state primitive for contact lists
-  and profile blobs**, not your own ad-hoc encrypted DHT
-  record.  The primitive has reviewed AEAD binding and version
-  monotonicity; your ad-hoc version probably doesn't.
-- **Respect the safety-number UX.**  Display the fingerprint in
-  your contact detail view; surface the "Alice's safety number
-  changed" alert on rotation events.  Don't hide it behind a
-  debug menu.
+Password managers are fine, **as long as** the manager doesn't live on the same
+machine as the encrypted file. Keeping the two apart on separate devices is what
+matters.
 
 ---
 
-## 8. What to do if you suspect an active compromise
+## 7. OpSec for developers building on Veil
 
-1. **Physically disconnect** the suspected device from the
-   network (pull the cable, disable WiFi).
-2. **From a different, trusted device with master_seed
-   access**, revoke the compromised device's key.  There is no
-   one-shot `identity revoke` CLI yet: revocation is a
-   protocol-level operation — add the suspected device's
-   `identity_sk` public key to the `IdentityDocument.revoked_keys`
-   set, bump `document_version`, re-sign, and re-publish the
-   updated `IdentityDocument`.  Re-publish immediately and rely on
-   gossip / direct push so the revocation reaches currently-connected
-   peers in seconds rather than waiting for the next scheduled
-   republish tick.
-3. Run `veil-cli identity status`.  Note every anomaly
-   reported by the watcher.
-4. Revoke any other subkeys the watcher flagged as unauthorised.
-5. `veil-cli identity rotate` on the trusted device to
-   replace the compromised hot key.
-6. Contact your high-value peers out-of-band and let them know
-   to expect a safety-number change.
-7. Wipe the suspected device and restore fresh.  Do **not**
-   reuse it until you're confident how the compromise happened
-   (and that the root cause is gone — e.g. a persistent firmware
-   implant).
+If you're writing an app on top of Veil:
+
+- **Never log `identity_sk`, `master_sk`, `app_state_secret`, ML-KEM decapsulation
+  seeds, or BIP-39 phrases.** The `Zeroizing` wrappers in `veilcore` scrub these
+  from memory once they're done with; don't work around them.
+- **Don't show the `master_seed` to users outside the
+  `identity create` / `identity show --export-phrase` flows.** The CLI is careful
+  not to leave the phrase in your terminal's scroll-back history; your own code
+  might not be.
+- **Store contact lists and profile data with the built-in encrypted app-state
+  feature**, not a hand-rolled encrypted DHT record of your own. The built-in one
+  has been reviewed — it binds the data correctly and won't let an old version be
+  swapped back in. Your hand-rolled version probably hasn't been.
+- **Honour the safety-number experience.** Show the fingerprint in your
+  contact-details view, and surface the "Alice's safety number changed" alert
+  whenever keys rotate. Don't bury it in a debug menu.
 
 ---
 
-## 9. Things we might add later
+## 8. What to do if you think someone has broken in right now
 
-These are on the roadmap:
+Work through these in order:
 
-- **Shamir Secret Sharing** for master_seed.  Split into N
-  paper shares, recoverable from M < N.
-- **Hardware-key integration** (YubiKey / secure-enclave) for
-  hot `identity_sk`.
-- **Duress passwords** for the encrypted master file that
-  decrypt to a decoy-but-valid-looking minimal identity.
-- **Multi-sig master** (threshold signatures) for paranoid
-  rotation policies.
+1. **Cut the suspected device off from the network.** Pull the cable, switch off
+   WiFi — physically disconnect it.
+2. **From a different device you trust — one with access to your `master_seed` —
+   revoke the compromised device's key.** There's no one-step `identity revoke`
+   command yet, so you do it at the protocol level: add the suspected device's
+   `identity_sk` public key to the `IdentityDocument.revoked_keys` set, bump
+   `document_version`, re-sign, and re-publish the updated `IdentityDocument`.
+   Re-publish right away and lean on gossip / direct push, so the revocation
+   reaches the peers you're connected to within seconds instead of waiting for the
+   next scheduled republish.
+3. **Run `veil-cli identity status`.** Write down every anomaly the watcher
+   reports.
+4. **Revoke any other subkeys the watcher flagged as unauthorised.**
+5. **Run `veil-cli identity rotate` on the trusted device** to replace the
+   compromised live key with a fresh one.
+6. **Reach your most important contacts through some other channel** and warn them
+   that your safety number is about to change.
+7. **Wipe the suspected device and restore from scratch.** Do **not** use it again
+   until you understand how the break-in happened and you're sure the cause is
+   gone — for example, malware buried in the device's firmware that survives a
+   normal wipe.
 
-Until those ship, the user-OpSec practices on this page **are**
-the defence.
+---
+
+## 9. Things we may add later
+
+These are on the roadmap, not here yet:
+
+- **Shamir Secret Sharing** for the `master_seed` — split it into N paper shares
+  where any M of them (with M < N) can rebuild it, so losing a few is survivable.
+- **Hardware-key support** (YubiKey / secure enclave) for the live `identity_sk`,
+  keeping it off the main disk entirely.
+- **Duress passwords** for the encrypted master file: a second password that opens
+  a believable but harmless decoy identity, for when you're forced to unlock.
+- **Multi-signature master** (threshold signatures) so the most cautious users can
+  require several keys to approve a rotation.
+
+Until those land, the habits on this page **are** your defence.
 
 ---
 

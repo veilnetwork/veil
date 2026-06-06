@@ -11,29 +11,31 @@
 
 ## Why
 
-`veilcore/` is the last monolith. ~98 KLoC of Rust live under one Cargo
-target spanning runtime orchestration, session state machines, dispatcher
-routing, command-line / config plumbing, sim infrastructure, and built-in
-service hosts. Build time, cyclic dependencies, and "where does X live"
-discoverability all degrade with each new feature.
+`veilcore/` is the last monolith. Roughly 98 KLoC of Rust sit under a
+single Cargo target — runtime orchestration, session state machines,
+dispatcher routing, CLI and config plumbing, sim infrastructure, and the
+built-in service hosts, all in one place. Every new feature makes three
+things worse: build time, cyclic dependencies, and the "where does X live?"
+problem.
 
 Three concrete pains drive the extraction:
 
-1. **Build amplification.** Touching one file in `node/runtime/services.rs`
-   recompiles the entire 98 KLoC + the CLI binary. The session-runner
-   decomposition campaign (slices 25–28) repeatedly paid 60–90 s rebuild
-   tax per iteration.
-2. **Test isolation.** `cargo test -p veilcore` ranges from 3 min
-   (cold) to 90 s (warm) — most of the 90 s is unrelated tests. Splitting
-   targets gives focused per-crate test sweeps.
-3. **Hidden coupling.** `node/runtime/` re-imports from
-   `node/dispatcher/`, `node/session/`, `node/routing/`, and back. A real
-   crate boundary turns those into compile errors that surface the
-   coupling we'd rather decouple deliberately.
+1. **Build amplification.** Touch one file in `node/runtime/services.rs`
+   and you recompile the whole 98 KLoC plus the CLI binary. The
+   session-runner decomposition campaign (slices 25–28) paid a 60–90 s
+   rebuild tax on every single iteration.
+2. **Test isolation.** `cargo test -p veilcore` takes 3 min cold, 90 s
+   warm — and most of that 90 s is tests that have nothing to do with what
+   you changed. Splitting the target gives you focused, per-crate test
+   sweeps.
+3. **Hidden coupling.** `node/runtime/` imports from `node/dispatcher/`,
+   `node/session/`, and `node/routing/` — and they import back. A real
+   crate boundary turns each of those tangles into a compile error, so the
+   coupling we'd rather break shows itself instead of hiding.
 
-Non-goal: anything that touches **wire format**, **on-disk format**, or
-**public CLI surface**. This is a pure refactor — caller-visible behavior
-must stay byte-identical at every commit.
+One non-goal: anything that touches the **wire format**, the **on-disk
+format**, or the **public CLI surface**. This is a pure refactor —
+caller-visible behavior stays byte-identical at every commit.
 
 ## Current layout (size survey)
 
@@ -65,8 +67,9 @@ Top single-file offenders (worth keeping in mind while planning splits):
 ## Target topology
 
 Five new crates under `crates/`, plus a thin `veilcore` shell that
-re-exports them for downstream callers (preserves
-`use veilcore::node::NodeRuntime` ergonomics during transition):
+re-exports them for downstream callers. The shell keeps
+`use veilcore::node::NodeRuntime` working through the transition, so
+existing call sites don't churn:
 
 | New crate                  | Lifts from           | Approx LoC | Public surface                          |
 |----------------------------|----------------------|-----------:|-----------------------------------------|
@@ -91,10 +94,10 @@ veil-session ──→ veil-dispatcher ──→ veil-node-runtime
                                       veil-cli (binary)
 ```
 
-Acceptance: no cycle reported by `cargo deps`; each crate compiles in
-isolation; downstream crates (`veil-app`, `veil-ipc`, ...) only
-import from the new fine-grained crates, not from `veilcore` shim
-unless they need sim helpers.
+Acceptance, three checks: `cargo deps` reports no cycle; each crate
+compiles in isolation; and downstream crates (`veil-app`, `veil-ipc`, ...)
+import from the new fine-grained crates, reaching for the `veilcore` shim
+only when they actually need sim helpers.
 
 ## Risk inventory
 
@@ -109,10 +112,10 @@ unless they need sim helpers.
 
 ## Multi-session execution plan
 
-Each session is one crate carve-out + green CI + commit. Sessions are
-designed to be *independently revertible* — if Phase N introduces a
-performance regression or a subtle behavior shift, `git revert` it and
-the prior phases stay in place.
+One session = one crate carved out, CI green, committed. Each session is
+designed to be *independently revertible*: if Phase N brings a performance
+regression or a subtle behavior shift, `git revert` it and every prior
+phase stays put.
 
 ### Phase 1 — `veil-cfg` (smallest blast radius) — ✅ SHIPPED 2026-05-21
 
@@ -131,17 +134,18 @@ needed (re-export from veilcore lib.rs).
 > which imported cfg).
 >
 > **Original plan said**: move only `cfg/{mod, model, format/*, validate/*}.rs`.
-> **Issue found**: that subset isn't separable as a sibling crate because
-> mod.rs (which would move) declares `pub(crate) mod identity` etc.
-> referencing files (identity.rs, store.rs, transport_glue.rs etc.) that
-> stay in veilcore — Rust crate boundaries don't permit a module's
-> children to live in a different crate.
-> **Revised scope**: move the **entire** cfg/ tree (~5852 LoC).  Still
-> "smallest blast radius" since cfg has zero `node/*` dependencies.
+> **Issue found**: that subset can't stand alone as a sibling crate. The
+> mod.rs that would move declares `pub(crate) mod identity` and friends,
+> pointing at files (identity.rs, store.rs, transport_glue.rs, …) that
+> stay behind in veilcore — and Rust won't let a module's children live in
+> a different crate from the module.
+> **Revised scope**: move the **entire** cfg/ tree (~5852 LoC). Still the
+> "smallest blast radius," since cfg depends on nothing in `node/*`.
 
-**Why first:** Pure data + validators. Zero dependencies on `node/*`,
-zero async, no sim hooks. Fastest acceptance test (just ensure
-downstream `use veilcore::cfg::*` still resolves via re-export).
+**Why first:** It's pure data and validators — no dependencies on `node/*`,
+no async, no sim hooks. That also makes its acceptance test the fastest:
+just confirm downstream `use veilcore::cfg::*` still resolves through the
+re-export.
 
 **Steps:**
 1. `cargo new --lib crates/veil-cfg` ; copy entire `cfg/` tree.
@@ -465,9 +469,9 @@ needed:
 
 **Phase 4 actual-move attempts 2026-05-21 (both reverted)**:
 
-Two attempts shipped + reverted this session.  Each pass refined the
-path-rewrite tool.  Final attempt got from 318 → 130 → 12 errors before
-deeper-dep surprises forced a revert.
+Two attempts this session, both shipped and then reverted. Each pass
+sharpened the path-rewrite tool. The second got the error count from 318
+down to 130 and then to 12 — before deeper-dep surprises forced a revert.
 
 **Attempt 2 (refined tool) made meaningful progress**:
 * Disambiguated `super::X` patterns: SIBLING_MAP (veil-X crates) vs
@@ -496,12 +500,13 @@ deeper-dep surprises forced a revert.
   references that aren't inside `use crate::{...}` blocks.
 * Map `anonymity_x25519` to its actual sibling location.
 
-The trajectory (318 → 12 errors) shows the move IS tractable; the path-
-rewrite tool needs ~30 more minutes of refinement to close the final gap.
+The trajectory (318 → 12 errors) says the move is tractable. The
+path-rewrite tool just needs about 30 more minutes of refinement to close
+the last gap.
 
-Workspace cleanly compiles post-revert. ~38 commits shipped this session
-(Phase 2 + Phase 3 complete + Phase 4 prep + 2 attempted-move iterations
-with full documentation).
+Workspace compiles cleanly post-revert. About 38 commits shipped this
+session: Phase 2 and Phase 3 complete, Phase 4 prep, and the 2
+attempted-move iterations, all fully documented.
 
 **What worked**:
 * Crate skeleton creation + 25-crate dep list — straightforward.
@@ -521,12 +526,13 @@ with full documentation).
   treatment.
 
 **Lesson**:
-* The balanced-brace parser from Phase 2/3 sweeps doesn't handle ambiguous
-  `super::X` cases correctly when X could be either a sibling-crate or
-  an inside-this-crate-module.  Need a manual classification step OR a
-  more conservative script that only rewrites `super::X` when X is a KNOWN
-  sibling-crate alias (not when X might be `super::types::FooBar` where
-  `types` could be either veil-types or crate-local types.rs).
+* The balanced-brace parser from the Phase 2/3 sweeps trips on ambiguous
+  `super::X` cases — the ones where X might be a sibling crate or might be
+  a module inside this crate. The fix is either a manual classification
+  step, or a more conservative script: only rewrite `super::X` when X is a
+  *known* sibling-crate alias. Leave it alone when X could be something
+  like `super::types::FooBar`, where `types` might be veil-types or the
+  crate-local types.rs.
 
 **Phase 4 revised to 2-3 sessions**:
 
@@ -601,11 +607,11 @@ ones I've been touching for oproxy) all point to the new binary path.
 
 ## Total estimate
 
-10 sessions over ~2 working weeks if paced one per day, allowing for
-CI iteration and parallel-session coordination. Compress to ~1 week if
-two sessions run in series per day. Do NOT attempt in parallel — a
-single point of failure (a cycle exposed during one phase) needs the
-prior phase to roll back cleanly.
+10 sessions over about 2 working weeks at one per day, with room for CI
+iteration and parallel-session coordination. Run two sessions back-to-back
+per day and it compresses to roughly a week. Do NOT run them in parallel:
+when one phase exposes a cycle, the prior phase has to roll back cleanly,
+and that only works if the phases are stacked in order.
 
 **Revised 2026-05-21**: pre-Phase-1 cycle-break (commit `b728161`) +
 Phase 1 scope correction (now whole-cfg-tree instead of subset)
@@ -628,8 +634,8 @@ Every phase commit must:
    signature changes, no new pub items, no removed pub items in this
    refactor.
 
-If any of the five gates fail, the phase doesn't commit. Roll back, fix,
-re-attempt — do NOT paper over with feature flags or `#[allow(dead_code)]`.
+If any of the five gates fails, the phase doesn't commit. Roll back, fix,
+try again — do NOT paper over it with feature flags or `#[allow(dead_code)]`.
 
 ## Out of scope (explicit)
 
@@ -651,6 +657,6 @@ re-attempt — do NOT paper over with feature flags or `#[allow(dead_code)]`.
 - A new contributor reports "I can't find where X lives" after 30+ min
   searching — the layout has outgrown its discoverability budget.
 
-Until one of those fires, this plan stays parked. The cost of executing
-without a real motivating constraint is paid in 10 sessions of refactor
-churn for benefits that show up only under continued growth.
+Until one of those fires, this plan stays parked. Run it without a real
+motivating constraint and you pay 10 sessions of refactor churn up front,
+for benefits that only show up as the codebase keeps growing.

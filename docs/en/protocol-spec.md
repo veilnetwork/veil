@@ -2,6 +2,8 @@
 
 Version: **1** (magic `0x4F564C31`), minor = 1.
 
+This document is the authoritative wire-format reference for OVL1 — the on-the-wire protocol that Veil nodes speak to each other. It is precise by design. Field names, byte offsets, and constants here match the code.
+
 > For an architectural overview — [ARCHITECTURE_FULL.md](ARCHITECTURE_FULL.md).
 > For a quick wire-format reference — [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
 
@@ -33,17 +35,18 @@ app_id = BLAKE3-derive_key(
 )     // 32 bytes
 ```
 
-`app_namespace` and `app_name` are UTF-8 strings with arbitrary content, chosen by
-the application developer (convention: reverse-DNS, for example `"com.example.chat"`
-+ `"main"`). At the wire level they are limited to 255 bytes each (see §9.3 `AppBind`).
+`app_namespace` and `app_name` are UTF-8 strings with arbitrary content. The
+application developer picks them (convention: reverse-DNS, for example
+`"com.example.chat"` + `"main"`). On the wire they are limited to 255 bytes each
+(see §9.3 `AppBind`).
 
-**Length-prefixes and the domain separator are mandatory** — without them, naive
-concatenation produces collisions: `("foo","bar")` and `("fo","obar")` both
-concatenate to `"foobar"` and yield the same digest. The v1 derivation guarantees
-uniqueness.
+The length-prefixes and the domain separator (the `context` string) are
+**mandatory**. Without them, naive concatenation produces collisions: `("foo","bar")`
+and `("fo","obar")` both concatenate to `"foobar"` and would yield the same digest.
+The v1 derivation above keeps each input distinct, so the result is unique.
 
-For IPC applications in ephemeral mode (the default), the formula is extended
-with a 16-byte `client_token` issued by the node in `AppHelloOk`:
+For IPC applications in ephemeral mode (the default), the formula gains a 16-byte
+`client_token` that the node issues in `AppHelloOk`:
 
 ```text
 ephemeral_app_id = BLAKE3-derive_key(
@@ -53,9 +56,9 @@ ephemeral_app_id = BLAKE3-derive_key(
 )
 ```
 
-This makes the `app_id` unique per-connection — two processes on the same node
-binding the same `(namespace, name)` get different addresses. For
-well-known services the stable form above is used (via `bind_named`).
+This makes the `app_id` unique per connection: two processes on the same node that
+bind the same `(namespace, name)` still get different addresses. Well-known services
+that need a fixed address use the stable form above instead (via `bind_named`).
 
 The application endpoint address:
 
@@ -73,11 +76,13 @@ AppAddress {
 content_id = BLAKE3(payload_bytes)   // 32 bytes
 ```
 
-Used for deduplication of messages in transit.
+This is the fingerprint of a message body. Nodes use it to spot and drop duplicates while a message is in flight.
 
 ---
 
 ## 2. Frame Wire Format
+
+Every OVL1 message is a *frame*: a fixed 24-byte header followed by a body. The header says what kind of message it is and how long the body runs; the body is opaque to the framing layer.
 
 ### 2.1 Frame Header (FrameHeader)
 
@@ -109,6 +114,8 @@ Offset  Len  Type   Description
 
 ### 2.3 Family — Protocol Families
 
+A *family* groups related message types. The `Family` byte in the header picks the group; `msg_type` then picks the specific message within it. Each family owns one functional area of the protocol — sessions, discovery, delivery, and so on.
+
 | Family | Number | Purpose |
 |--------|-------|------------|
 | Session | 0 | OVL1 handshake, keepalive, rekey, resumption ticket, padding |
@@ -130,7 +137,7 @@ Offset  Len  Type   Description
 
 ### 3.1 Handshake
 
-The OVL1 handshake is asymmetric and client-initiated. Sequence:
+Before two nodes exchange anything else, they run a *handshake* — a short opening dialogue that proves identities and agrees on encryption keys. It is asymmetric: the side that dials out (the initiator) leads, and the other side (the responder) answers. The exchange runs in this order:
 
 ```
 Initiator                              Responder
@@ -181,22 +188,29 @@ Initiator                              Responder
                                   forward-compat default)
 ```
 
-**Backward-compat:** legacy peers send 2 bytes (without `discovery_mode`); the decoder defaults the missing byte to `0` (Public) — legacy peers had no concept of opt-in privacy and were effectively Public. The decoder accepts `>= 2` bytes.
+**Backward compatibility:** older peers send only 2 bytes, without the
+`discovery_mode` field. The decoder fills the missing byte with `0` (Public) —
+those peers predate opt-in privacy, so Public is the right default for them. Any
+payload of `>= 2` bytes is accepted.
 
-**discovery_mode semantics:**
+**What `discovery_mode` means.** It controls how willing a peer is to be found by
+strangers:
 
-- `Public` — the peer wants to be discoverable through a DHT-walk; FIND_NODE responses from other nodes will include it.
-- `ContactsOnly` — the peer must be excluded from FIND_NODE responses; reachable only through direct sessions with already-handshaked contacts or a pre-shared bootstrap.
-- `IntroductionOnly` — same as `ContactsOnly` for FIND_NODE; additionally, RouteResponse is strictly required to strip `transports[]` (see §3.6).
+- `Public` — the peer wants to be discoverable through a DHT walk (a search that hops across the distributed hash table; see §5.5). Other nodes will include it in their FIND_NODE responses.
+- `ContactsOnly` — keep the peer out of FIND_NODE responses entirely. It is reachable only through a direct session with a contact it has already handshaked with, or via a pre-shared bootstrap.
+- `IntroductionOnly` — same as `ContactsOnly` for FIND_NODE, and stricter still: RouteResponse must strip `transports[]` (see §3.6), so even a successful route lookup hands back no address.
 
 Legacy fields:
 - Role bits `RELAY (0x02)`, `GATEWAY (0x04)`, `CORE_ROUTER (0x10)` — removed.
-- Cap flags `CAN_MAILBOX=0x02`, `CAN_GATEWAY_LOCAL_MESH=0x04`, `CAN_PARTICIPATE_DHT=0x08`, `CAN_ACCEPT_APP_STREAMS=0x10`, `CAN_STORE=0x20`, `SUPPORTS_TRANSIT=0x40` — were never read, removed.
-- Wire format shrunk from 12 bytes (legacy) → 2 bytes → 3 bytes.
+- Cap flags `CAN_MAILBOX=0x02`, `CAN_GATEWAY_LOCAL_MESH=0x04`, `CAN_PARTICIPATE_DHT=0x08`, `CAN_ACCEPT_APP_STREAMS=0x10`, `CAN_STORE=0x20`, `SUPPORTS_TRANSIT=0x40` — nothing ever read them, so they were removed.
+- The wire format shrank over time: 12 bytes (legacy) → 2 bytes → 3 bytes.
 
 ### 3.5 SessionKeys (derived keys)
 
-After the ephemeral **X25519** exchange (this is NOT the identity key — the identity key, Ed25519/Falcon-512, is used only for signing in `IdentityPayload`):
+The two sides derive their session keys from an ephemeral **X25519** Diffie-Hellman
+exchange — a one-time key pair generated just for this session. Do not confuse it
+with the identity key (Ed25519/Falcon-512), which only signs the `IdentityPayload`
+and never encrypts anything. The derivation runs like this:
 
 ```
 shared_secret = X25519(my_ephemeral_priv, peer_ephemeral_pub)
@@ -212,18 +226,22 @@ info = "ovl1-session-v1"
                    else                                 → (key_b, key_a)
 ```
 
-`tx_key` is for encrypting outgoing frames; `rx_key` for decrypting incoming ones.
-The lexicographic ordering by `node_id` guarantees that the initiator and the
-responder have `tx_key`/`rx_key` swapped: alice.tx == bob.rx and vice versa.
+`tx_key` encrypts outgoing frames; `rx_key` decrypts incoming ones. Ordering the
+two `node_id`s lexicographically guarantees the initiator and responder end up with
+`tx_key` and `rx_key` swapped — so alice.tx equals bob.rx, and vice versa. That is
+what lets each side decrypt what the other sent.
 
-Frames are encrypted with **ChaCha20-Poly1305** (using the 32-byte key `tx_key` / `rx_key`,
-a 12-byte counter-nonce per-direction; AAD is the frame header).
+Frames are encrypted with **ChaCha20-Poly1305** (an authenticated cipher): the
+32-byte `tx_key`/`rx_key`, a 12-byte counter nonce kept per direction, and the frame
+header as additional authenticated data (AAD) — data that is authenticated but not
+encrypted.
 
-`session_id` (32 bytes) is a public identifier, placed in the
-`SessionConfirmPayload` and used as the chain-salt for subsequent rekeys.
+`session_id` (32 bytes) is a public identifier. It rides in the
+`SessionConfirmPayload` and later seeds the salt for rekeys (§3.7).
 
-The identity key (Ed25519/Falcon-512) is **not involved** in this derivation: forward
-secrecy — compromise of the long-term identity key does not reveal past sessions.
+The identity key (Ed25519/Falcon-512) plays **no part** in this derivation. That is
+deliberate, and it buys forward secrecy: even if the long-term identity key later
+leaks, past sessions stay sealed.
 
 ### 3.6 KeepalivePayload
 
@@ -231,11 +249,23 @@ secrecy — compromise of the long-term identity key does not reveal past sessio
 [0..8]   timestamp_secs  u64 BE
 ```
 
-Sent at the interval `session.keepalive_interval_secs`. When there is no activity for longer than `session.idle_timeout_secs`, the session is closed.
+A keepalive goes out every `session.keepalive_interval_secs` to show the session is still live. If nothing arrives for longer than `session.idle_timeout_secs`, the session is considered dead and closed.
 
 ### 3.7 Rekey (key change)
 
-Initiated when the `REKEY_BYTES_THRESHOLD` = 128 GiB or `REKEY_TIME_THRESHOLD_SECS` = 32 days (2,764,800 s) threshold is exceeded. Both thresholds are configurable: `[session] rekey_bytes_threshold` and `[session] rekey_time_threshold_secs` — highly sensitive deployments may lower them explicitly. The byte threshold `MLKEM_REKEY_BYTES_THRESHOLD` is now equal to 128 GiB (the same as `REKEY_BYTES_THRESHOLD`); it differs from the main thresholds only in the time-based `MLKEM_REKEY_TIME_THRESHOLD_SECS` = 1 hour, which aligns the forward-secrecy window of the X25519 session key with the ML-KEM E2E key.
+A long-lived session periodically swaps in fresh keys — a *rekey* — so that no single
+key protects too much traffic or stands for too long. It triggers when either
+threshold is crossed: `REKEY_BYTES_THRESHOLD` = 128 GiB of traffic, or
+`REKEY_TIME_THRESHOLD_SECS` = 32 days (2,764,800 s) of wall-clock time. Both are
+configurable via `[session] rekey_bytes_threshold` and
+`[session] rekey_time_threshold_secs`, and highly sensitive deployments may lower
+them on purpose.
+
+There is a second, parallel rekey clock for the post-quantum (ML-KEM) layer. Its byte
+budget, `MLKEM_REKEY_BYTES_THRESHOLD`, is now 128 GiB — the same as
+`REKEY_BYTES_THRESHOLD`. The only difference is its timer:
+`MLKEM_REKEY_TIME_THRESHOLD_SECS` = 1 hour. That short window keeps the forward-secrecy
+horizon of the X25519 session key in step with the ML-KEM end-to-end key.
 
 ```
 Initiator ── RekeyInit ──► Responder   (new ephemeral X25519 pubkey)
@@ -288,7 +318,7 @@ info       = "ovl1-session-rekey-v1"
 [51..51+len]     payload     bytes
 ```
 
-Each node that receives a new (unseen) message delivers it locally and forwards it to **K random neighbors** with `ttl - 1`. Deduplication is by `msg_id`.
+When a node sees a message for the first time, it delivers the message locally and forwards a copy to **K random neighbors** with `ttl - 1`. Each node tracks which `msg_id`s it has already seen, so duplicates stop spreading.
 
 ### 4.5 NAT — NatProbeRequestPayload / NatProbeReplyPayload
 
@@ -315,15 +345,17 @@ Each node that receives a new (unseen) message delivers it locally and forwards 
 
 ### 5.1 FindNode (V2 only — V1 removed)
 
-V1 `FindNode` (slot 0) and `FindNodeResponse` (slot 8) — wire layout:
-target+k → `Vec<NodeContact{node_id, transport}>` — were dropped.
-V1 returned a transport per contact in the same RTT, which leaked the
-routing graph en masse and made network-wide enumeration trivially
-cheap.  All FIND_NODE traffic now goes through V2 + `ResolveTransport`
-(§5.4.1).  Senders that emit slots 0 / 8 fail `DiscoveryMsg::try_from`
-→ `Violation` in the dispatcher.
+The original V1 messages — `FindNode` (slot 0) and `FindNodeResponse` (slot 8), whose
+layout was target+k → `Vec<NodeContact{node_id, transport}>` — have been dropped. The
+problem with V1 was that one response handed back a *transport* (the address you dial)
+for every contact, all in a single round trip. That leaked the routing graph wholesale
+and made it trivially cheap to enumerate the whole network. All FIND_NODE traffic now
+runs over V2 plus a separate `ResolveTransport` step (§5.4.1). A sender that still emits
+slots 0 or 8 fails `DiscoveryMsg::try_from` and is logged as a `Violation` by the
+dispatcher.
 
-**`NodeContact`** is retained as a wire-helper for the `FindValue` not-found branch:
+**`NodeContact`** survives only as a wire-helper for the "not found" branch of
+`FindValue`:
 
 ```text
 [0..32]  node_id       [u8; 32]
@@ -331,34 +363,34 @@ cheap.  All FIND_NODE traffic now goes through V2 + `ResolveTransport`
 [34..N]  transport     bytes  (URI string)
 ```
 
-Since **C-06** the `FindValue` not-found branch zeroes this field
-(`transport_len = 0`, empty URI): like FIND_NODE V2 it returns **node-ids
-only**, and the requester re-resolves each returned node's transport on demand
-via `ResolveTransport` (§5.4.1). This closes the same bulk routing-graph leak on
-the value-lookup path; the iterative/recursive walk still converges because
-transports are resolved hop-by-hop rather than inlined in the response (see the
-64-node linear-chain regression in `crates/veil-dht/src/iterative.rs`).
+Since **C-06**, that "not found" branch zeroes the transport field
+(`transport_len = 0`, empty URI). Like FIND_NODE V2, it returns **node-ids only**; the
+requester then resolves each node's transport on demand through `ResolveTransport`
+(§5.4.1). This plugs the same bulk routing-graph leak on the value-lookup path. The
+iterative (and recursive) walk still converges, because transports are resolved
+hop by hop instead of inlined in the response — the 64-node linear-chain regression
+test in `crates/veil-dht/src/iterative.rs` guards exactly this.
 
 #### 5.2.1 discovery_mode filter + half-cap
 
-The V2 FIND_NODE (`handle_find_node_v2`) and `FindValue` not-found
-fallback both apply two levels of filtering before returning contacts
-(via the shared `ranked_public_contacts` helper):
+V2 FIND_NODE (`handle_find_node_v2`) and the `FindValue` not-found fallback both run
+returned contacts through two filters first, via the shared `ranked_public_contacts`
+helper:
 
-1. **Public-only filter:** peers with `discovery_mode != Public` (declared in `CapabilitiesPayload.discovery_mode` at handshake) are excluded from the response. This closes the enumeration-leak for opt-in privacy nodes: a `ContactsOnly` / `IntroductionOnly` peer will not appear in other nodes' FIND_NODE responses — and is therefore invisible to DHT-walk scanners.
+1. **Public-only filter.** Peers whose `discovery_mode` is not `Public` (declared in `CapabilitiesPayload.discovery_mode` at handshake) are dropped from the response. This is what closes the enumeration leak for opt-in privacy nodes: a `ContactsOnly` or `IntroductionOnly` peer never shows up in anyone else's FIND_NODE responses, so DHT-walk scanners simply cannot see it.
 
-2. **Half-cap:** no more than `min(K_requested, K_local, ceil(N_public / 2))` contacts are returned, where `N_public` is the number of Public peers in our routing table. This forces an attacker enumerating the Public network to make **at least 2× more FIND_NODE requests** to cover the full carto. Smallest case: with 1 Public peer, 1 is returned (Kademlia connectivity preserved).
+2. **Half-cap.** A response returns at most `min(K_requested, K_local, ceil(N_public / 2))` contacts, where `N_public` is how many Public peers sit in our routing table. Capping at half means an attacker mapping the Public network must send **at least twice as many FIND_NODE requests** to cover it all. The smallest case still works: with 1 Public peer, 1 is returned, so Kademlia stays connected.
 
 Similar filtering is applied in:
 
 - `handle_find_value::FindValueResponse::Nodes` (closest-nodes fallback)
 - `handle_recursive_query::FIND_NODE` (via the `find_closest_public_node_ids` helper)
 
-**NOT filtered** is internal routing (`find_closest_nodes` for next-hop selection, NeighborOffer) — there the filter would break routing through privacy-opt-in nodes acting as relays.
+What is **not** filtered is internal routing — `find_closest_nodes` for next-hop selection, and NeighborOffer. Filtering there would break routing through privacy-opt-in nodes that are acting as relays, which is the opposite of what we want.
 
-**Threat model:** scanner-resistance — passive enumeration via DHT FIND_NODE. Previously a scanner obtained K transports with a single FIND_NODE → ~10 RTT enumeration of all Public nodes in a /20 keyspace → a full address map within minutes. Half-cap + Public-only makes enumeration ≥ 2× slower and impossible for opt-in privacy nodes at all.
+**Threat model.** The target is scanner resistance against passive enumeration over DHT FIND_NODE. Before this change, a scanner pulled K transports from a single FIND_NODE, walked the whole Public keyspace in roughly 10 round trips for a /20, and had a full address map within minutes. Half-cap plus Public-only makes that walk at least 2× slower for Public nodes, and impossible for opt-in privacy nodes.
 
-**Limitation:** Public nodes (default config) are still enumerable (although in chunks ≤50%). For full decoupling of the routing graph from the address graph — see Decoupled transport resolution / hidden services (planned).
+**Limitation.** Public nodes (the default config) are still enumerable, just in chunks of at most half the table at a time. Fully decoupling the routing graph from the address graph is future work — see Decoupled transport resolution / hidden services (planned).
 
 ### 5.3 StorePayload
 
@@ -371,7 +403,7 @@ Similar filtering is applied in:
 
 ### 5.4 AnnounceAttachmentPayload
 
-A leaf → gateway announcement, published in the DHT. The exact format — [`proto/discovery.rs::AnnounceAttachmentPayload`](../../crates/veil-proto/src/discovery.rs):
+When a leaf attaches to a gateway, it publishes this record in the DHT so others can find which Core nodes currently carry it. The exact format lives in [`proto/discovery.rs::AnnounceAttachmentPayload`](../../crates/veil-proto/src/discovery.rs):
 
 ```text
 [0..32]   node_id          [u8; 32]
@@ -409,7 +441,7 @@ The signature covers everything from `node_id` through `seq_no` inclusive (the b
 [1..1+count*32]      node_ids    [u8; 32] × count
 ```
 
-**No transport fields** (unlike the removed V1 — see §5.1). The caller knows only the node_ids, and must call `ResolveTransport` separately for each one whose transport it actually needs.
+Note there are **no transport fields** here, unlike the removed V1 (§5.1). The caller learns only the node-ids; for any node it actually wants to reach, it calls `ResolveTransport` separately to get the address.
 
 **ResolveTransportResponse** (variable):
 ```text
@@ -422,13 +454,13 @@ if found == 1:
                                             into its Contact, typically — handshake-complete time)
 ```
 
-`not_found` is returned when:
-- The resolver has no `Contact` for the requested `node_id` in its routing table.
-- A contact exists, but `discovery_mode != Public` (privacy filter — a non-Public peer's existence is not confirmed via this RPC; aggregating with the unknown-case is intentional — leaking "I know, but won't tell" gives an attacker a signal).
+The resolver answers `not_found` in two cases:
+- It has no `Contact` for the requested `node_id` in its routing table.
+- It has a contact, but that contact's `discovery_mode` is not `Public`. This is the privacy filter: a non-Public peer's very existence is not confirmed through this RPC. Folding this case together with "I've never heard of it" is deliberate — a distinct "I know it, but I won't tell you" answer would itself be a signal an attacker could exploit.
 
-**Threat-model.** Previously any FIND_NODE returned K transports in a single RTT → a mass scan builds the cargo IP in O(N/K) RTT (~10 RTT for 200 Public nodes in a /20 keyspace). The DHT-walker now uses V2 by default — each transport requires a separate RPC → cumulative cost O(N) RTT, **~10× slower**. The PoW-gate + signed responses add per-resolve CPU cost (~17ms BLAKE3) + cache-poisoning resistance.
+**Threat model.** Previously, any FIND_NODE returned K transports in one round trip, so a mass scan mapped the network in O(N/K) round trips (~10 RTT for 200 Public nodes in a /20 keyspace). The DHT walker now defaults to V2, where each transport costs its own RPC — cumulative cost O(N) round trips, roughly **10× slower** to scan. The PoW gate and signed responses pile on more: per-resolve CPU work (~17 ms of BLAKE3) and resistance to cache poisoning.
 
-**Status:** wire-types + handlers + in-memory cache + V2-flow integrated into `NetworkPeerQuerier`. **Defense is active** — outbound DHT-walks use the V2-flow by default (`FindNodeV2 → node_ids → cache lookup → ResolveTransport(id) on miss`). V1 is removed — wire slots 0/8 → `Violation`.
+**Status.** Wire types, handlers, the in-memory cache, and the V2 flow are all wired into `NetworkPeerQuerier`. **The defense is active**: outbound DHT walks use the V2 flow by default (`FindNodeV2 → node_ids → cache lookup → ResolveTransport(id) on a miss`). V1 is gone — wire slots 0/8 are rejected as a `Violation`.
 
 **PoW gate.** `ResolveTransportPayload`:
 
@@ -445,11 +477,11 @@ BLAKE3( "epic475.4b/resolve_pow/v1" || requester_node_id[32] ||
          target_node_id[32] || time_bucket_be[4] || pow_nonce[16] )
 ```
 
-`requester_node_id` is the OVL1-session-authenticated `peer_id` on the responder (not on the wire — taken from session context).  Server accepts iff `leading_zero_bits(hash) ≥ RESOLVE_POW_DIFFICULTY` AND `|time_bucket − now_bucket| ≤ RESOLVE_POW_TIME_WINDOW_BUCKETS`.  Defaults: `RESOLVE_POW_DIFFICULTY = 16` (median ~7 ms client mining on a fast x86 core, ~14 ms on low-end ARM); `RESOLVE_POW_BUCKET_SECONDS = 60`; `RESOLVE_POW_TIME_WINDOW_BUCKETS = 1` (≈ 120 s replay window).
+`requester_node_id` is not on the wire. The responder takes it from session context — it is the `peer_id` that the OVL1 session already authenticated. The server accepts the proof only if both hold: `leading_zero_bits(hash) ≥ RESOLVE_POW_DIFFICULTY`, and `|time_bucket − now_bucket| ≤ RESOLVE_POW_TIME_WINDOW_BUCKETS`. Defaults: `RESOLVE_POW_DIFFICULTY = 16` (a median of ~7 ms to mine on a fast x86 core, ~14 ms on low-end ARM), `RESOLVE_POW_BUCKET_SECONDS = 60`, and `RESOLVE_POW_TIME_WINDOW_BUCKETS = 1` (about a 120 s replay window).
 
-PoW failure (invalid solution OR stale bucket OR wrong target / wrong requester binding) → silent `not_found` response, NOT a `Violation` — verification cost is one BLAKE3 hash (~1 µs) so per-peer dht_quota already bounds CPU spend; raising failures to violations would create a clock-drift false-positive eviction path.  Legacy senders without the PoW fields (32-byte payload) fail decode → `Violation` from the dispatcher.
+A failed PoW — bad solution, stale bucket, or the wrong target/requester binding — gets a silent `not_found`, **not** a `Violation`. The reasoning: verifying the proof is a single BLAKE3 hash (~1 µs), so the per-peer `dht_quota` already caps how much CPU a peer can burn, and treating failures as violations would turn ordinary clock drift into a false-positive eviction path. Legacy senders that omit the PoW fields entirely (a 32-byte payload) fail to decode and *do* draw a `Violation` from the dispatcher.
 
-Cumulative attacker cost goes from `O(N) RTT` to `O(N) × ~7 ms CPU` per probed `node_id` — for a `/20` keyspace (~200 Public peers) that's ~1.5 s of single-core mining for one full enumeration sweep, and the cost scales linearly with target set size while honest clients pay it only once per cache miss.
+Net effect: an attacker's cost rises from `O(N) RTT` to `O(N) × ~7 ms` of CPU per probed `node_id`. For a `/20` keyspace (~200 Public peers) that is about 1.5 s of single-core mining for one full enumeration sweep, and it scales linearly with the size of the target set — while an honest client pays it just once, on a cache miss.
 
 **Signed responses.** `ResolveTransportResponse.transport: Option<String>` carries `Option<SignedTransportAnnouncement>`:
 
@@ -469,40 +501,40 @@ BLAKE3( "epic475.4c/transport_announce/v1" || node_id ||
          expiry_unix_be || transport_len_be || transport_utf8 )
 ```
 
-Each node mints its own bundle at startup (validity = 30 days; `ANNOUNCEMENT_VALIDITY_SECS`) and **gossips it via `DiscoveryMsg::AnnounceTransport` (slot 14) on every handshake-complete** (one fire-and-forget frame per session, both inbound and outbound paths).  Receivers verify and store under `transport_announcements: HashMap<node_id, …>` on `KademliaService`; `handle_resolve_transport` returns the cached bundle verbatim, so the resolver only relays what the target itself signed.  The maintenance tick prunes orphan announcements (peers no longer in the routing table).
+Each node mints its own bundle at startup (valid for 30 days, per `ANNOUNCEMENT_VALIDITY_SECS`) and **gossips it via `DiscoveryMsg::AnnounceTransport` (slot 14) every time a handshake completes** — one fire-and-forget frame per session, on both inbound and outbound paths. Receivers verify it and store it under `transport_announcements: HashMap<node_id, …>` on `KademliaService`. `handle_resolve_transport` then hands back the cached bundle verbatim, so a resolver only ever relays what the target itself signed. A maintenance tick prunes orphan announcements — peers that have dropped out of the routing table.
 
-**Walker verification (`NetworkPeerQuerier`).** Before inserting any resolved transport into `TransportCache`, the walker checks:
-1. `BLAKE3(identity_pubkey) == announcement.node_id` — pubkey ↔ identity binding.
-2. Ed25519 signature is valid over the canonical input.
-3. `expiry_unix > now()`.
-4. `announcement.node_id == requested node_id` (defence-in-depth: even if the resolver attached a valid announcement for the wrong peer, the walker discards it).
+**Walker verification (`NetworkPeerQuerier`).** Before it puts any resolved transport into `TransportCache`, the walker checks four things:
+1. `BLAKE3(identity_pubkey) == announcement.node_id` — the pubkey is bound to the identity.
+2. The Ed25519 signature is valid over the canonical input.
+3. `expiry_unix > now()` — the bundle has not expired.
+4. `announcement.node_id == requested node_id` — defence in depth: even if a resolver attaches a valid announcement for the *wrong* peer, the walker throws it out.
 
-A malicious resolver can still **deny** existence (`not_found`) but cannot **redirect** traffic to attacker-controlled infrastructure: that would require forging an Ed25519 signature whose pubkey hashes to the target's `node_id`.
+So a malicious resolver can **deny** that a peer exists (`not_found`), but it cannot **redirect** you to attacker-controlled infrastructure. Redirection would mean forging an Ed25519 signature whose pubkey hashes to the target's `node_id` — which is the whole point of the binding.
 
-The dispatcher additionally enforces `announcement.node_id == session_peer_id` on `AnnounceTransport` — peers can only announce *their own* node_id, blocking gossip-flood pollution attacks.
+The dispatcher adds one more guard: on `AnnounceTransport` it enforces `announcement.node_id == session_peer_id`. A peer may only announce *its own* node_id, which blocks gossip-flood pollution attacks.
 
-**On-disk persistence.** The `transport_announcements: HashMap<node_id, SignedTransportAnnouncement>` map is periodically flushed to a JSON snapshot (default every 120 s + a final flush on clean shutdown).  On restart the snapshot is re-loaded; each entry's signature, pubkey↔node_id binding, and non-expiry are re-verified — failures are silently dropped.
+**On-disk persistence.** The `transport_announcements: HashMap<node_id, SignedTransportAnnouncement>` map is flushed to a JSON snapshot on a timer (every 120 s by default, plus a final flush on a clean shutdown). On restart the snapshot is re-loaded, and every entry is re-verified — signature, pubkey↔node_id binding, and non-expiry — with any failure silently dropped.
 
-Why JSON instead of the in-memory binary layout: each entry is small (~250 B JSON), the file is operator-grep-able, and the tamper-resistance comes from the signatures (verified on load), not from the on-disk format.  An attacker who edits the file can downgrade availability (drop entries → walker has to re-handshake) but **cannot** inject forged transports — they'd need an Ed25519 keypair whose pubkey hashes to a target's node_id.
+Why JSON rather than the in-memory binary layout? Each entry is tiny (~250 B as JSON), the file stays greppable for an operator, and the tamper-resistance comes from the signatures (re-checked on load), not from the file format. Someone who edits the file can only hurt availability — drop entries, and the walker simply re-handshakes — but **cannot** inject forged transports, since that again needs an Ed25519 keypair whose pubkey hashes to the target's node_id.
 
 Config knobs (`[dht]`):
-- `transport_announcements_persist_path: Option<String>` — `None` disables.
+- `transport_announcements_persist_path: Option<String>` — `None` disables persistence.
 - `transport_announcements_persist_interval_secs: u64` — default 120.
 
-The `TransportCache` itself is intentionally **not** persisted — it's a derivation of verified announcements, and the next walk repopulates it on demand.
+The `TransportCache` itself is deliberately **not** persisted. It is just a derivation of verified announcements, and the next walk repopulates it on demand.
 
 **Remaining caveats:**
-- Each `ResolveTransport` additionally consumes a `dht_quota` token (the existing per-peer rate-limit) on top of PoW.
-- Key rotation invalidates all outstanding announcements signed by the old key — peers re-gossip on the next handshake (no graceful migration window yet).
+- Each `ResolveTransport` also spends a `dht_quota` token (the existing per-peer rate limit), on top of the PoW.
+- Rotating a key invalidates every outstanding announcement signed by the old one. Peers re-gossip on their next handshake — there is no graceful migration window yet.
 
 ### 5.5 The Kademlia Algorithm
 
-- **K** = 20 (k-bucket size — the classic Kademlia constant)
-- **α** = 3 (parallel queries per round)
-- **max_rounds** = 20
-- XOR distance metric: `dist(a, b) = a XOR b`
-- Lookup: iterative, α parallel FindNode per round, until the result no longer improves or the rounds are exhausted
-- Anti-eclipse: at most `K/4 = 5` contacts from one /24 IPv4 (or /48 IPv6) per bucket
+- **K** = 20 — the k-bucket size, the classic Kademlia constant.
+- **α** = 3 — how many queries run in parallel each round.
+- **max_rounds** = 20.
+- Distance metric is XOR: `dist(a, b) = a XOR b`.
+- Lookup is iterative: α parallel FindNode queries per round, repeated until the result stops improving or the rounds run out.
+- Anti-eclipse: at most `K/4 = 5` contacts from any single /24 IPv4 (or /48 IPv6) per bucket, so one network can't pack a bucket.
 
 ### 5.6 DeletePayload (multi-algo)
 
@@ -515,10 +547,10 @@ The `TransportCache` itself is intentionally **not** persisted — it's a deriva
 [+slen]           signature   bytes (algo-dependent: 64 Ed25519, ~666 Falcon-512; hybrids carry both)
 ```
 
-Validation:
-1. `algo ∈ {0, 1, 2, 3, 4}` (every `SignatureAlgorithm::from_wire_byte` value, incl. the hybrids — U1, so hybrid-identity nodes can delete their own records, not just Ed25519/Falcon-512 owners);
-2. `crypto::verify_message(algo, public_key, key_bytes, signature) = Ok`;
-3. `BLAKE3(public_key) == key` — only the owner of a self-owned key can delete it.
+Validation runs three checks:
+1. `algo ∈ {0, 1, 2, 3, 4}` — every value `SignatureAlgorithm::from_wire_byte` accepts, hybrids included. Accepting the hybrids (the `U1` change) lets hybrid-identity nodes delete their own records, not just Ed25519/Falcon-512 owners.
+2. `crypto::verify_message(algo, public_key, key_bytes, signature) = Ok` — the signature checks out.
+3. `BLAKE3(public_key) == key` — the key is self-owned, so only its owner can delete it.
 
 ---
 
@@ -558,7 +590,7 @@ Validation:
 [34..]   seqs[]             u64 LE × count
 ```
 
-Acknowledgement of specific (not necessarily consecutive) seq numbers. Maximum batch: `MAX_MAILBOX_ACK_BATCH = 256`.
+Acknowledges specific seq numbers, which need not be consecutive. A single batch holds at most `MAX_MAILBOX_ACK_BATCH = 256` of them.
 
 ### 6.4 DeliveryStatusPayload
 
@@ -571,7 +603,7 @@ Acknowledgement of specific (not necessarily consecutive) seq numbers. Maximum b
 
 ## 7. E2E Encryption
 
-When `payload[0] == 0xE2` in a `DeliveryEnvelope`, the payload is E2E-encrypted.
+End-to-end (E2E) encryption seals a message so that only the final recipient can open it — the relays in between carry sealed bytes. A `DeliveryEnvelope` whose `payload[0] == 0xE2` is E2E-encrypted; that leading byte is the marker.
 
 ### 7.1 E2eEnvelope Wire Format (payload[1..])
 
@@ -603,9 +635,9 @@ When `payload[0] == 0xE2` in a `DeliveryEnvelope`, the payload is E2E-encrypted.
 
 ### 7.3 Key Management
 
-- The encapsulation key (public, 1184 bytes) is published in the DHT when an IPC endpoint is registered
-- The decapsulation key (private, 64-byte seed) is held in the node's memory
-- Key cache TTL: `ipc.e2e_key_ttl_secs` (default 3600 sec)
+- The encapsulation key (the public ML-KEM key, 1184 bytes) is published in the DHT when an IPC endpoint registers, so senders can find it.
+- The decapsulation key (the matching private key, a 64-byte seed) never leaves the node's memory.
+- Resolved keys are cached for `ipc.e2e_key_ttl_secs` (default 3600 sec).
 
 ---
 
@@ -683,7 +715,7 @@ Constraints: `MAX_POW_DIFFICULTY = 24`, `MAX_CONCURRENT_POW_SOLVERS = 4`.
 
 #### 8.4.1 PoW-gated discovery
 
-When the target node has `abuse.pow_min_difficulty > 0` configured, **`RouteResponse` (with `transports`) is deferred until the PoW is solved**:
+If the target node is configured with `abuse.pow_min_difficulty > 0`, it **holds back the `RouteResponse` (the one carrying `transports`) until the requester solves a PoW**:
 
 ```
 Requester ── RouteRequest{target=victim, requester=us} ──► Victim
@@ -696,9 +728,9 @@ Requester ◄── RouteResponse{transports, mlkem_pk, sig} ─── Victim   
 Requester ◄── PowAccept{transport} ───────────────────────── Victim   (legacy backward-compat, signals "session bootstrap OK")
 ```
 
-**Without PoW (`pow_min_difficulty = 0`):** `RouteResponse` is sent immediately upon receiving the `RouteRequest` (legacy behavior).
+**Without PoW (`pow_min_difficulty = 0`):** the `RouteResponse` goes out as soon as the `RouteRequest` arrives — the legacy behavior.
 
-**Why:** without a PoW gate, any node could send a `RouteRequest{target=X}` for an arbitrary `X` for free and get back a `RouteResponse{transports[X]}` — disclosure of the IP/port by `node_id`. The PoW gate makes probe-by-id costly.
+**Why bother.** Without the gate, any node could fire off a `RouteRequest{target=X}` for any `X` it liked, for free, and get back `RouteResponse{transports[X]}` — handing over X's IP and port given nothing but its `node_id`. The PoW gate makes probing by id cost real work.
 
 #### 8.4.2 DiscoveryMode
 
@@ -706,9 +738,9 @@ An additional config option `[routing] discovery_mode` (default: `public`):
 
 | Mode | Behavior |
 |---|---|
-| `public` | Current. If `pow_min_difficulty > 0` — gated through PoW; otherwise — immediate `RouteResponse`. |
-| `contacts_only` | A `RouteRequest` from a requester outside `peer_pubkeys` (not handshaked) is **silently dropped** — neither `PowChallenge` nor `RouteResponse`. The node's existence stays hidden. |
-| `introduction_only` | `RouteResponse.transports` is always empty. The requester must connect through one of the `relay_ids` (Tor-style introduction approximation without rendezvous). |
+| `public` | The default. With `pow_min_difficulty > 0` the response is gated through PoW; otherwise the `RouteResponse` is immediate. |
+| `contacts_only` | A `RouteRequest` from a requester outside `peer_pubkeys` (one we have not handshaked with) is **silently dropped** — no `PowChallenge`, no `RouteResponse`. The node's existence stays hidden. |
+| `introduction_only` | `RouteResponse.transports` is always empty. The requester has to connect through one of the `relay_ids` — a rough, rendezvous-free approximation of Tor-style introduction. |
 
 ---
 
@@ -716,9 +748,9 @@ An additional config option `[routing] discovery_mode` (default: `public`):
 
 ### 9.1 Connection Protocol
 
-A local application connects to the IPC server through `ipc.socket_uri` (a Unix socket `unix:///path` or a TCP-loopback `tcp://127.0.0.1:port`).
+This is how a local app talks to the node it runs alongside — IPC, inter-process communication on the same machine. The app connects to the node's IPC server at `ipc.socket_uri`: either a Unix socket (`unix:///path`) or a TCP loopback address (`tcp://127.0.0.1:port`).
 
-Each message: `u16 BE msg_type` + `u32 BE body_len` + body.
+Each message on this socket is framed simply: `u16 BE msg_type`, then `u32 BE body_len`, then the body.
 
 Protocol version: `IPC_PROTOCOL_VERSION = 1`.
 
@@ -774,14 +806,16 @@ The `msg_type` values are from `LocalAppMsg` in [`proto/family.rs`](../../crates
 [M..M+4] endpoint_id    u32 BE (1..65535)
 ```
 
-The AppBindOk response contains `app_id [u8; 32]` — see §1.2 for the exact formula (length-prefixed BLAKE3 `derive_key`).  In ephemeral mode (default), `ephemeral_app_id` with `client_token` mixing is used; in `bind_named` — the stable form of `app_id`.
+The AppBindOk response carries the `app_id [u8; 32]` — §1.2 has the exact formula (length-prefixed BLAKE3 `derive_key`). In ephemeral mode (the default) the node returns an `ephemeral_app_id`, mixing in the `client_token`; under `bind_named` it returns the stable `app_id` instead.
 
 ### 9.5 Stream Flow Control
 
-- **Send window**: the sender tracks the remaining window; blocks when `window = 0`
-- **StreamWindow**: the receiver sends this to increase the sender's window
-- **Initial window**: `STREAM_INITIAL_WINDOW` (default 256 KiB)
-- **Maximum window**: `MAX_STREAM_SEND_WINDOW = 16 MB`
+Flow control keeps a fast sender from overrunning a slow receiver. It works on a credit (window) scheme:
+
+- **Send window** — the sender tracks how much it may still send and blocks once the window hits `0`.
+- **StreamWindow** — the receiver sends this message to grant more credit, growing the sender's window.
+- **Initial window** — `STREAM_INITIAL_WINDOW` (default 256 KiB).
+- **Maximum window** — `MAX_STREAM_SEND_WINDOW = 16 MB`.
 
 ---
 
@@ -825,21 +859,21 @@ The AppBindOk response contains `app_id [u8; 32]` — see §1.2 for the exact fo
 | Leaf | 0x01 | No | No | No | No | Mobile/IoT |
 | Core | 0x08 | Yes (K=20) | Yes | Yes | Yes | Servers, VPS |
 
-Legacy codes 0x02 (Relay), 0x04 (Gateway), 0x10 (CoreRouter) are removed;
-such values from old peers are discarded.
+The legacy codes 0x02 (Relay), 0x04 (Gateway), and 0x10 (CoreRouter) are gone; if an
+old peer still sends one, it is discarded.
 
-**Leaf node:**
-- Operates through a Core node (attachment lease)
-- The mailbox is stored on Core nodes
-- Does not accept inbound connections from arbitrary nodes
-- Minimal resource requirements
+**Leaf node** — the lightweight role, for phones, IoT, anything behind a NAT:
+- Reaches the network through a Core node, via an attachment lease.
+- Keeps its mailbox on Core nodes rather than locally.
+- Does not accept inbound connections from arbitrary nodes.
+- Needs minimal resources.
 
-**Core node:**
-- A full participant in the DHT (K=20), relay, forwarding
-- Gateway: serves the attachment records of leaf nodes (disabled via `[gateway] enabled = false`)
-- Stores the mailbox for offline recipients
-- Serves FindNode/FindValue/Store/Delete
-- Recommended PoW difficulty ≥ 24 (the default is `16`; `MAX_POW_DIFFICULTY = 24` is the hard cap), high uptime (24/7)
+**Core node** — the always-on role, for servers and VPS instances:
+- A full DHT participant (K=20), and it relays and forwards traffic.
+- Acts as a gateway, serving the attachment records of leaf nodes (turn this off with `[gateway] enabled = false`).
+- Holds the mailbox for recipients who are offline.
+- Serves FindNode/FindValue/Store/Delete.
+- Should run a PoW difficulty of ≥ 24 (the default is `16`, and `MAX_POW_DIFFICULTY = 24` is the hard ceiling) and stay up 24/7.
 
 ---
 
@@ -854,8 +888,8 @@ such values from old peers are discarded.
 | Ed25519+Falcon512 (hybrid) | 3 | 929 bytes | composite | Ed25519 ‖ Falcon-512 |
 | Ed25519+Falcon1024 (hybrid) | 4 | 1825 bytes | composite | Ed25519 ‖ Falcon-1024 |
 
-The `algo` byte is used in `IdentityPayload`, `DeletePayload`, mesh beacon, and PEX signatures.
-The session handshake (`KeyAgreementPayload`) applies a different convention: 1 = Ed25519, 2 = Falcon512.
+The `algo` byte appears in `IdentityPayload`, `DeletePayload`, the mesh beacon, and PEX signatures.
+One exception: the session handshake (`KeyAgreementPayload`) uses a different convention — 1 = Ed25519, 2 = Falcon512.
 
 ### 12.2 Session KDF
 
@@ -872,9 +906,9 @@ info = "ovl1-session-v1"
                    else                               → (key_b, key_a)
 ```
 
-Details in §3.5. There is no separate `mac_key` — integrity is covered by the AEAD tag
-(ChaCha20-Poly1305) and the handshake MAC in `SessionConfirm`
-(`BLAKE3("ovl1-session-confirm-v1" ‖ shared_secret ‖ small_id ‖ large_id)`).
+See §3.5 for the full story. There is no separate `mac_key`: integrity comes from the
+AEAD tag (ChaCha20-Poly1305) on each frame, plus the handshake MAC inside
+`SessionConfirm` (`BLAKE3("ovl1-session-confirm-v1" ‖ shared_secret ‖ small_id ‖ large_id)`).
 
 ### 12.3 Frame Encryption
 
@@ -934,7 +968,7 @@ content_id = BLAKE3(payload)              // 32 bytes
 
 ## 13. Budgets and Limits
 
-All constants are defined in `crates/veil-proto/src/budget.rs`.
+These are the hard caps that keep a node's memory and CPU bounded under load. All of them live in `crates/veil-proto/src/budget.rs`.
 
 | Constant | Value | Description |
 |-----------|---------|----------|

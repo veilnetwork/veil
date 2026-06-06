@@ -9,19 +9,21 @@
 ## Why
 
 `veilclient::AppHandle::open_stream(dst_node_id, app_id, endpoint_id)`
-sends a `STREAM_OPEN` IPC frame to the daemon. When `dst_node_id` matches
-the local daemon's node, the handler routes through the local
-`AppEndpointRegistry` and everything works. When `dst_node_id` is a
-**remote** peer's node, [crates/veil-ipc/src/handlers/stream.rs](../../crates/veil-ipc/src/handlers/stream.rs)
-currently returns `REMOTE_NOT_IMPLEMENTED` (since this commit) — previously
-it returned the misleading `NOT_FOUND`, and the SOCKS5/oproxy smoke test
-hung waiting on a stream that would never open.
+sends a `STREAM_OPEN` IPC frame to the daemon. (IPC — inter-process
+communication — is how the client SDK talks to the local daemon over a
+Unix socket.) When `dst_node_id` is the local daemon's own node, the
+handler routes through the local `AppEndpointRegistry` and everything
+works. When `dst_node_id` points at a **remote** peer instead,
+[crates/veil-ipc/src/handlers/stream.rs](../../crates/veil-ipc/src/handlers/stream.rs)
+returns `REMOTE_NOT_IMPLEMENTED` (as of this commit). It used to return
+the misleading `NOT_FOUND` — and the SOCKS5/oproxy smoke test would hang,
+waiting on a stream that was never going to open.
 
-Inter-node streams ARE already supported in the daemon for a *different*
-client surface — [veil-proxy::VeilConnector](../../crates/veil-proxy/src/veil_connector.rs)
-opens cross-node streams using wire-level [`AppOpen`](../../crates/veil-proto/src/family.rs)
-/`AppData`/`AppClose` frames. The IPC `STREAM_OPEN` path was never wired
-into that machinery.
+The daemon already knows how to open inter-node streams — just for a
+*different* client surface. [veil-proxy::VeilConnector](../../crates/veil-proxy/src/veil_connector.rs)
+does it with wire-level [`AppOpen`](../../crates/veil-proto/src/family.rs)
+/`AppData`/`AppClose` frames. The IPC `STREAM_OPEN` path was simply never
+wired into that machinery.
 
 ## Building blocks (already present)
 
@@ -42,10 +44,10 @@ into that machinery.
 
 ## Gaps to fill
 
-1. **Plumb `veil_stream_rx_map` + `pending_receipts` references from
-   the daemon (veilcore runtime) into the IPC server's `IpcSendContext`**.
-   Right now `IpcSendContext` has `session_tx_registry` but not the bridge
-   tables.
+1. **Pass the bridge tables into the IPC server.** The daemon (veilcore
+   runtime) holds `veil_stream_rx_map` + `pending_receipts`; the IPC
+   server's `IpcSendContext` needs references to them. Today
+   `IpcSendContext` carries `session_tx_registry` but not those two tables.
 2. **Add a remote branch to `handle_stream_open`** that:
    - Allocates a wire-level stream_id (local-side AtomicU32 counter
      analogous to VeilConnector's `stream_counter`).
@@ -160,10 +162,10 @@ local-pair sections with the remote-bridge variant).
 
 ## Total estimate
 
-3 sessions (Phase 2 + 3 + 4). The complexity is in cross-cutting state
-management, not algorithms — every primitive needed is already proven
-by VeilConnector. Risk is mostly "did I plumb the lifetime right in
-`IpcSendContext`."
+3 sessions (Phase 2 + 3 + 4). The hard part is the cross-cutting state
+management, not any algorithm — every primitive we need is already proven
+by VeilConnector. The main risk is mundane: did the lifetimes in
+`IpcSendContext` get plumbed right?
 
 ## Out of scope (explicit)
 
@@ -181,41 +183,41 @@ by VeilConnector. Risk is mostly "did I plumb the lifetime right in
 
 ## Re-open triggers
 
-This plan moves to active execution when:
-- Operator wants to expose application-level services accessible via
-  IPC SDK from remote daemons (mailbox bridges, custom services).
-- A second production smoke test or integration suite fails because of
-  this gap.
+This plan moves to active execution when one of these happens:
+- An operator wants to expose application-level services that remote
+  daemons can reach over the IPC SDK (mailbox bridges, custom services).
+- A second production smoke test or integration suite fails on this gap.
 
-Until one of these fires, the explicit `REMOTE_NOT_IMPLEMENTED` error
-from Phase 1 is sufficient — it makes the limitation visible without
-spending 3 sessions of refactor budget.
+Until then, the explicit `REMOTE_NOT_IMPLEMENTED` error from Phase 1 is
+enough. It makes the limitation visible, and it costs us nothing — no
+3-session refactor budget spent.
 
 ---
 
 ## Status snapshot (audit batch 2026-05-23)
 
-The cross-audit asked to "close" this row.  After a planning pass, the
+The cross-audit asked us to "close" this row. After a planning pass, the
 honest engineering call is:
 
-* **Phase 1 (clean error)** — shipped, in production.  Already meets the
-  bar for "limitation is visible, callers don't hang."
-* **Phases 2-4 (full implementation)** — remains a deferred epic.
-  Estimated 3 dedicated sessions per the breakdown above; the
-  complexity is in cross-cutting state management (wire stream-id
-  allocator coordination, bridge task per-stream lifecycle, dispatcher
-  inbound routing alignment), not algorithms.  Shipping a partial
-  Phase 3 (e.g. open-only without bridge task) is strictly worse than the
-  current Phase 1 status quo because it converts a clean error into a
-  silent hang on the first STREAM_DATA frame.
+* **Phase 1 (clean error)** — shipped, in production. It already clears
+  the bar that mattered: the limitation is visible, and callers no longer
+  hang.
+* **Phases 2-4 (full implementation)** — still a deferred epic. Budget
+  3 dedicated sessions, per the breakdown above. The hard part is the
+  cross-cutting state management — coordinating the wire stream-id
+  allocator, managing each bridge task's lifecycle, aligning dispatcher
+  inbound routing — not any algorithm. A partial Phase 3 (say, open-only
+  with no bridge task) would be strictly *worse* than where Phase 1 leaves
+  us: it trades a clean error for a silent hang on the first STREAM_DATA
+  frame.
 
 ### What operators can do today
 
-Applications that need cross-node streaming today should use the
-existing **[`veil_proxy::VeilConnector`](../../crates/veil-proxy/src/veil_connector.rs)**
-surface, also exposed via the `oproxy` binary (SOCKS5 / HTTP / TProxy
-inbounds).  It implements the same set of building blocks listed under
-"Building blocks" above and has been in production since Epic 33.
+If you need cross-node streaming right now, use the existing
+**[`veil_proxy::VeilConnector`](../../crates/veil-proxy/src/veil_connector.rs)**
+surface. It's also exposed through the `oproxy` binary (SOCKS5 / HTTP /
+TProxy inbounds). It's built on the same building blocks listed above, and
+it's been in production since Epic 33.
 
 * SDK applications can talk to the oproxy SOCKS5 endpoint instead of
   using `AppHandle::open_stream` for cross-node addresses.
@@ -293,13 +295,14 @@ landed, mapped to the plan above:
 
 **Not a partial Phase 3.** The bridge task ships in the same change as the
 handler, so the "silent hang on first STREAM_DATA" hazard the plan warned
-about does not apply.
+about never arises.
 
-**Still open (follow-up):** a true two-daemon end-to-end test. Investigated
-2026-06-03 and confirmed a dedicated effort (NOT a quick adaptation) — deferred
-for now; the in-process handshake + bridge + model tests cover the logic and
-the inbound path reuses the production-proven dispatcher / VeilConnector
-routing. Blockers, so the next attempt skips the re-discovery:
+**Still open (follow-up):** a true two-daemon end-to-end test. We looked
+into it on 2026-06-03 and confirmed it's a dedicated effort, not a quick
+adaptation — so it's deferred for now. The in-process handshake, bridge,
+and model tests already cover the logic, and the inbound path reuses the
+production-proven dispatcher / VeilConnector routing. Here are the blockers,
+written down so the next attempt skips the re-discovery:
 
 1. `veilcore::sim` (the only multi-daemon harness — `SimNetwork`/`SimNode`
    wrap real `NodeRuntime`s) is `#[cfg(test)]`-gated (veilcore/src/lib.rs),

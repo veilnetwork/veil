@@ -5,7 +5,7 @@
 > protocols.
 >
 > **Prerequisites:** you've worked through [`OPERATIONS.md`](../en/OPERATIONS.md)
-> and have a node that runs in dev mode.  This doc layers
+> and have a node that runs in dev mode. This doc adds a
 > censorship-resistance posture on top.
 >
 > **Related:** [DPI evasion architecture](dpi-evasion.md)
@@ -16,7 +16,7 @@
 
 ## What you're protecting against
 
-A real adversary looks like this:
+Here's what a real adversary brings to the table:
 
 | Capability | Examples |
 |---|---|
@@ -26,18 +26,20 @@ A real adversary looks like this:
 | Active probing | "this IP looks suspicious; let's connect and see if it answers in veil's protocol" |
 | Traffic-shape correlation | "user at this IP transfers 12 MB/min in TLS records of size 4096 — that's the veil pattern" |
 
-You can't defend against all of these with config alone — some require
-operational hygiene (rotate VPS providers, blend with a real CDN
-identity).  But the **wire-protocol defences** are config knobs that
-veilcore already implements.
+Config alone won't stop all of these. Some need operational hygiene —
+rotate VPS providers, blend in with a real CDN identity. But the
+**wire-protocol defences** are just config knobs, and veilcore already
+implements them.
 
 ---
 
 ## The minimum production-target config
 
-The `tls-boring` (BoringSSL) backend is **on by default** for `veil-cli`, so
-you get the Chrome-grade TLS ClientHello fingerprint out of the box. Build with
-production seeds plus the C toolchain BoringSSL + RocksDB need:
+The `tls-boring` (BoringSSL) backend ships **on by default** in `veil-cli`. You
+get the Chrome-grade TLS ClientHello fingerprint out of the box — TLS is the
+encrypted layer that wraps web traffic, and ClientHello is its opening message,
+whose exact shape can give a protocol away. Build with production seeds plus the
+C toolchain that BoringSSL and RocksDB need:
 
 ```bash
 sudo apt-get install -y cmake golang-go nasm ninja-build build-essential
@@ -45,10 +47,11 @@ cargo build --release -p veil-cli --features production-seeds
 ```
 
 > **Compile cost:** the default build links BoringSSL (`tls-boring`, via the
-> `btls` crate) + RocksDB. Adds ~ 3 MB to the binary, ~doubles compile time, and
-> needs `cmake`, `golang-go`, `nasm`, `ninja-build` on the build host. Build for
-> your operator's platform from a build server with these tools — DON'T try to
-> build on a router. (`--no-default-features` drops `tls-boring`.)
+> `btls` crate) and RocksDB. That adds ~ 3 MB to the binary, roughly doubles
+> compile time, and needs `cmake`, `golang-go`, `nasm`, `ninja-build` on the
+> build host. Build for your operator's platform on a build server that has
+> these tools — DON'T try to build on a router. (`--no-default-features` drops
+> `tls-boring`.)
 
 Then your `config.toml`:
 
@@ -131,40 +134,42 @@ add you to their `[[bootstrap_peers]]`.  See
 
 ## What this does NOT defeat
 
-- **End-to-end traffic analysis.** A censor with packet captures of
-  both endpoints can correlate timing/volume.  This requires
+- **End-to-end traffic analysis.** A censor who can capture packets at
+  both ends can correlate them by timing and volume. Stopping that needs
   anonymity at the routing layer (Epic 482, Tor-like circuits).
-- **Mass IP harvesting.** If your VPS IPs end up on a public block-list
-  (e.g. someone's "Suspected Tor" feed), the censor blocks them
-  cheaply.  Domain fronting (Epic 484) puts a CDN edge between you
-  and the censor's L3 filter.
-- **State-level VPS provider coercion.** If the host country can
-  compel your provider to drop traffic, no in-protocol defence helps.
-  Diversify across hostile jurisdictions.
+- **Mass IP harvesting.** If your VPS IPs land on a public block-list —
+  say, someone's "Suspected Tor" feed — the censor blocks them cheaply.
+  Domain fronting (Epic 484) puts a CDN edge between you and the censor's
+  L3 filter.
+- **State-level VPS provider coercion.** If the host country can lean on
+  your provider to drop your traffic, no in-protocol defence helps.
+  Spread your nodes across hostile jurisdictions.
 
 ---
 
 ## Verifying your deployment
 
-1. **Capture your ClientHello with Wireshark.**  Open a connection
-   to your veil server from the deploying host, capture the first
-   100 packets, decode TLS handshake.  Compare cipher_suites, extensions,
-   and supported_groups order against a captured Chrome handshake to
-   the same target — they should match exactly under `tls-boring`.
-2. **Test against a JA3 calculator.**  Ja3.tools or similar — paste
-   the captured ClientHello hex; the hash should equal
+1. **Capture your ClientHello with Wireshark.** Open a connection to
+   your veil server from the deploying host, grab the first 100 packets,
+   and decode the TLS handshake. Compare the order of cipher_suites,
+   extensions, and supported_groups against a captured Chrome handshake
+   to the same target — under `tls-boring` they should match exactly.
+2. **Test against a JA3 calculator** (a JA3 hash is a short fingerprint
+   of a TLS ClientHello). Paste the captured ClientHello hex into
+   Ja3.tools or similar; the hash should equal
    `771,4865-4866-4867-49195-49196,...` (current Chrome 120+ JA3).
-3. **Check SNI.**  Same capture, look at the TLS extensions block:
-   `server_name` should be the value of `default_sni` in your config,
-   NOT your VPS's actual hostname.
+3. **Check SNI.** SNI is the destination hostname sent in the clear
+   during a TLS handshake. In the same capture, look at the TLS
+   extensions block: `server_name` should hold the value of `default_sni`
+   from your config, NOT your VPS's actual hostname.
 4. **Run `veil-cli node mesh-status`** on a leaf node: it should
    list your gateway entry as `ACTIVE` with low RTT.
 5. **(Bonus, when 480.6 lands)** Run `cargo test dpi_fingerprint` —
    should green.  CI gate against regressions.
 
-If you can't get the Wireshark capture to look like Chrome's,
-**stop** — your build is wrong.  The most common causes:
-- Built with `--no-default-features` (dropping `tls-boring`) → rustls fingerprint slipped in.
-- `default_sni` not set → ClientHello carries the actual hostname.
+If the Wireshark capture won't look like Chrome's, **stop** — your build
+is wrong. The usual culprits:
+- Built with `--no-default-features`, which drops `tls-boring` and lets the rustls fingerprint slip in.
+- `default_sni` left unset, so the ClientHello carries the real hostname.
 - BoringSSL libssl version mismatch (rare) — rebuild with a clean
   `target/` directory.

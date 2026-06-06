@@ -1,29 +1,34 @@
-# Test plan: runtime-проверка NamedPipe на Windows
+# План тестирования: проверка именованного канала на Windows в работе
 
-> Cross-platform код (Linux dev box) проверяет только то, что новый
-> код **компилируется** под `x86_64-pc-windows-gnu`. Wire-protocol
-> поведение (bind / accept / token handshake / lifecycle pipe'а) надо
-> валидировать на реальном Windows-хосте. Прогони шаги ниже и
-> вернись с выводом; любой упавший тест — или любое сообщение об
-> ошибке, не совпадающее с ожидаемым паттерном — это настоящий баг.
+Именованный канал (named pipe) — это локальный канал межпроцессного
+взаимодействия в Windows, её примерный аналог Unix-сокета. Этот план
+проверяет, что админ- и IPC-сокеты veil работают поверх такого канала
+на реальном Windows-хосте.
 
-## Prerequisites
+> Сборка на Linux-машине разработчика доказывает лишь то, что новый код
+> **компилируется** под `x86_64-pc-windows-gnu`. Поведение на уровне
+> протокола — привязка, приём, рукопожатие по токену и жизненный цикл
+> канала — надо проверять на настоящем Windows. Прогони шаги ниже и
+> вернись с выводом. Любой упавший тест или любое сообщение об ошибке,
+> не совпадающее с ожидаемым образцом, — это настоящий баг.
 
-* Windows 10/11 (любая редакция; API не требует привилегированного
-  пользователя).
-* Собранный `target\debug\veil-cli.exe` из toolchain'а
-  `x86_64-pc-windows-msvc`. Linux-side cross-compile (`cargo check
-  --target x86_64-pc-windows-gnu`) — только для type-checking'а;
-  полная сборка под runtime-тесты делается на самом Windows
-  (`cargo build` из PowerShell в корне репо).
-* `cargo nextest run` из той же Windows-оболочки.
+## Что нужно заранее
 
-## Тест 1 — config init по умолчанию пишет `pipe://` admin-socket
+* Windows 10 или 11, любая редакция. API не требует
+  привилегированного пользователя.
+* `target\debug\veil-cli.exe`, собранный набором инструментов
+  `x86_64-pc-windows-msvc`. Кросс-компиляция на Linux
+  (`cargo check --target x86_64-pc-windows-gnu`) лишь проверяет типы;
+  полная сборка под эти проверки в работе делается на самом Windows
+  (`cargo build` из PowerShell в корне репозитория).
+* `cargo nextest run` из той же оболочки Windows.
 
-Сейчас `default_admin_socket_uri()` на не-Unix возвращает
-`"tcp://127.0.0.1:0"`. Этот тест проверяет, что оператор может
-**явно opt-in'нуться** на `pipe://` — дефолтный путь остаётся TCP
-для backward-compat.
+## Тест 1 — config init по умолчанию пишет админ-сокет `pipe://`
+
+На платформах, отличных от Unix, `default_admin_socket_uri()` сейчас
+возвращает `"tcp://127.0.0.1:0"`. Этот тест проверяет, что оператор
+может **явно включить** `pipe://`. По умолчанию остаётся TCP, поэтому
+старые настройки продолжают работать.
 
 ```powershell
 $tmp = New-TemporaryFile | %{ Remove-Item $_; $_.FullName + ".d" }
@@ -34,22 +39,25 @@ cargo run --bin veil-cli -- --config "$tmp\config.toml" config set global.admin_
 cargo run --bin veil-cli -- --config "$tmp\config.toml" config get global.admin_socket
 ```
 
-**Ожидается**: последняя строка печатает `pipe://veil-test-admin`
-(без ошибок).
+**Ожидается**: последняя строка печатает `pipe://veil-test-admin`, без
+ошибок.
 
-## Тест 2 — `node run --foreground` биндит named pipe и пишет sidecars
+## Тест 2 — `node run --foreground` привязывает именованный канал и пишет спутники
 
-> **Замечание (Windows):** background-режим `node run` требует
-> daemon-support'а, которого на Windows пока нет. Используй
-> `--foreground` на Windows, чтобы node остался привязан к текущей
-> оболочке.
+Спутник (sidecar) здесь — это небольшой файл, который узел кладёт рядом
+с конфигом, чтобы сообщить, как до него достучаться: например,
+`admin.pipe` (имя канала) и `admin.token` (токен доступа).
+
+> **Замечание (Windows):** запуск `node run` в фоне требует поддержки
+> демона, которой на Windows пока нет. Используй `--foreground` на
+> Windows, чтобы узел остался привязан к текущей оболочке.
 
 ```powershell
 # В одной оболочке стартуем node в foreground
 cargo run --bin veil-cli -- --config "$tmp\config.toml" node run --foreground
 ```
 
-В другой оболочке проверяем sidecar'ы:
+В другой оболочке проверяем спутники:
 
 ```powershell
 ls "$tmp"
@@ -60,32 +68,32 @@ Get-Content "$tmp\admin.token"
 # Должно напечатать: 64-символьную hex-строку
 ```
 
-Проверяем, что pipe реально забинден:
+Проверяем, что канал действительно привязан:
 
 ```powershell
 Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -eq "veil-test-admin" }
 ```
 
-**Ожидается**: показывает pipe. Если пусто — `bind_named_pipe`
-молча упал, смотри stderr ноды на `IO error`.
+**Ожидается**: канал появляется в списке. Если вывод пуст —
+`bind_named_pipe` молча упал; ищи в stderr узла `IO error`.
 
-## Тест 3 — `veil-cli node show` подключается через pipe
+## Тест 3 — `veil-cli node show` подключается через канал
 
-Во второй оболочке, пока node ещё работает:
+Во второй оболочке, пока узел ещё работает:
 
 ```powershell
 cargo run --bin veil-cli -- --config "$tmp\config.toml" node show
 ```
 
-**Ожидается**: печатает summary node'а (node_id, role, admin_socket
-и т. д.). Этот тест прогоняет:
-- `connect_admin_client_any` детектит sidecar `admin.pipe`
-- `connect_named_pipe` читает token + открывает
+**Ожидается**: печатает сводку об узле — node_id, role, admin_socket и
+так далее. Этот тест прогоняет весь путь целиком:
+- `connect_admin_client_any` находит спутник `admin.pipe`
+- `connect_named_pipe` читает токен и открывает
   `\\.\pipe\veil-test-admin`
-- Token handshake проходит
-- JSON request/response работает поверх pipe'а
+- рукопожатие по токену проходит
+- JSON-запрос и ответ ходят туда-обратно поверх канала
 
-## Тест 4 — неправильный token отвергается
+## Тест 4 — неправильный токен отвергается
 
 ```powershell
 # Портим sidecar с token'ом
@@ -93,14 +101,14 @@ cargo run --bin veil-cli -- --config "$tmp\config.toml" node show
 cargo run --bin veil-cli -- --config "$tmp\config.toml" node show
 ```
 
-**Ожидается**: ошибка вроде `admin protocol: token mismatch` или
-аналогичная. stderr ноды должен залогировать событие "token
-mismatch" / "admin.accept_rejected". **Node не должен крашиться** —
-`accept_rejected` это per-conn soft failure.
+**Ожидается**: ошибка в духе `admin protocol: token mismatch`. В stderr
+узла должно появиться событие "token mismatch" или
+"admin.accept_rejected". **Узел не должен падать** — `accept_rejected`
+это мягкий сбой в рамках одного соединения.
 
-## Тест 5 — node чисто завершается
+## Тест 5 — узел завершается чисто
 
-В оболочке ноды нажми `Ctrl+C`. Затем проверь, что sidecar'ы прибраны:
+В оболочке узла нажми `Ctrl+C`. Затем проверь, что спутники прибраны:
 
 ```powershell
 ls "$tmp"
@@ -109,7 +117,10 @@ Get-ChildItem \\.\pipe\ | Where-Object { $_.Name -eq "veil-test-admin" }
 # Pipe должен быть unbound.
 ```
 
-## Тест 6 — IPC поверх NamedPipe (параллельно тестам 1-5, но для IPC)
+## Тест 6 — IPC поверх именованного канала (то же, что тесты 1-5, но для IPC)
+
+IPC (межпроцессное взаимодействие) — это канал, по которому локальное
+приложение общается с узлом, отдельный от админ-сокета.
 
 ```powershell
 cargo run --bin veil-cli -- --config "$tmp\config.toml" config set ipc.enabled true
@@ -117,8 +128,8 @@ cargo run --bin veil-cli -- --config "$tmp\config.toml" config set ipc.socket_ur
 cargo run --bin veil-cli -- --config "$tmp\config.toml" node run
 ```
 
-В другой оболочке — проверяем sidecar'ы и IPC connectivity через
-Python-хелпер:
+В другой оболочке проверяем спутники и связь по IPC через
+Python-помощник:
 
 ```powershell
 ls "$tmp"
@@ -135,19 +146,21 @@ python .\examples\ovl_proto.py --help
 cargo nextest run --workspace
 ```
 
-**Ожидается**: 1363+ passed, 14+ skipped (pre-existing slow-sim-tests).
-0 failures. В частности, `node::local_transport::tests::*` должны
-пройти (они cross-platform — token codec, port-file roundtrip).
+**Ожидается**: 1363+ passed, 14+ skipped (давние медленные тесты
+симуляции), 0 failures. В частности, должны пройти
+`node::local_transport::tests::*` — они кросс-платформенные (кодек
+токена и круговой проход через файл порта).
 
 Если что-то упало — присылай вывод.
 
 ## Что прислать обратно
 
 * Тест 1: принял ли `config set` значение `pipe://`?
-* Тест 2: содержимое `admin.pipe` + длину `admin.token`. Показывает ли
+* Тест 2: содержимое `admin.pipe` и длину `admin.token`. Показывает ли
   `Get-ChildItem \\.\pipe\` запись `veil-test-admin`?
-* Тест 3: вывод `node show` (или ошибку).
-* Тест 4: чисто ли упала попытка с неправильным token'ом? Выжил ли node?
-* Тест 5: убраны ли sidecar'ы при shutdown'е?
-* Тест 6: `ls` от `$tmp` и любые IPC log-строки.
-* Тест 7: summary-строку nextest и любые failures с их stderr.
+* Тест 3: вывод `node show` или ошибку.
+* Тест 4: чисто ли упала попытка с неправильным токеном и выжил ли
+  узел?
+* Тест 5: прибраны ли спутники при завершении?
+* Тест 6: `ls` каталога `$tmp` и любые строки журнала по IPC.
+* Тест 7: итоговую строку nextest и любые упавшие тесты с их stderr.
