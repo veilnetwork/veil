@@ -42,7 +42,6 @@ members = [
     "crates/veil-session",
     "crates/veil-session-integration-tests",
     "crates/veil-proto",
-    "crates/veil-transfer",
     "crates/veil-transport",
     "crates/veil-types",
     "crates/veil-udp-obfs",

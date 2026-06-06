@@ -36,7 +36,6 @@ pub mod routing;
 // Phase 4 prep: `ScannerShield` → `veil-abuse::scanner_shield`.
 pub mod session;
 pub mod session_glue;
-pub mod transfer;
 pub mod transport_hints;
 pub mod update;
 

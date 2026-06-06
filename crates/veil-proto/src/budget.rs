@@ -887,16 +887,9 @@ pub const MAX_REASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
 /// in-memory chunks freed. The sender can retransmit from scratch.
 pub const CHUNK_REASSEMBLY_TTL_SECS: u64 = 300;
 
-/// maximum number of *concurrent* in-progress transfers
-/// per `ChunkReassembler`.
-///
-/// The reassembler already enforces `MAX_REASSEMBLY_BYTES` (total buffered
-/// across all transfers). Without this cap a peer could register many small
-/// manifests (each below the byte cap individually) and exhaust the
-/// `transfers` HashMap. With `MAX_REASSEMBLY_BYTES = 64 MiB` and a tiny
-/// average per-transfer footprint, an attacker could otherwise push the
-/// HashMap into the millions of entries.
-pub const MAX_TRANSFERS_CONCURRENT: usize = 256;
+// (Obsolete `MAX_TRANSFERS_CONCURRENT` removed with the `veil-transfer`
+// `ChunkReassembler`; the relay-chunking reassembler in veil-dispatcher uses its
+// own `MAX_CONCURRENT_TRANSFERS` cap.)
 
 // ── Implementation limits — channel capacities ────────────────────────────────
 
