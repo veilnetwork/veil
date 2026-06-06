@@ -182,11 +182,13 @@ fn min_compatible_satisfied(current: &str, min_compatible: &str) -> Result<(), A
 /// `manifest.platform_target` is operator-supplied free text and the codebase
 /// uses more than one convention (`"linux-x86_64"`,
 /// `"x86_64-unknown-linux-gnu"`), so a strict string compare would falsely
-/// reject valid same-platform manifests. Instead we reject ONLY when the target
-/// string clearly names a **foreign** OS or CPU architecture relative to the
-/// running host; an unrecognized string is accepted (the signature + sha256
-/// gates still apply). This catches the wrong-binary brick (a Windows binary
-/// overwriting a Linux install) without breaking legitimate updates.
+/// reject valid same-platform manifests. We accept ONLY when the target string
+/// positively names BOTH this host's OS and CPU arch (in any of the recognized
+/// token spellings); a foreign, typo'd, or otherwise unrecognized target is
+/// rejected fail-closed (F5). This catches the wrong-binary brick (a Windows
+/// binary overwriting a Linux install — and a mistyped target that the old
+/// fail-open path let through) without breaking legitimate updates, whose
+/// targets always name OS+arch (the release matrix uses full target triples).
 fn host_matches_platform_target(target: &str) -> bool {
     let t = target.to_ascii_lowercase();
     let has = |toks: &[&str]| toks.iter().any(|k| t.contains(k));
@@ -197,17 +199,25 @@ fn host_matches_platform_target(target: &str) -> bool {
     const X64: &[&str] = &["x86_64", "amd64", "x64"];
     const ARM64: &[&str] = &["aarch64", "arm64"];
 
+    // Fail-closed (F5): the target MUST POSITIVELY name this host's OS and CPU
+    // arch. A foreign, typo'd, or otherwise unrecognized target is now REJECTED
+    // (previously an unrecognized string was accepted — fail-open — which let a
+    // signed manifest with a mistyped/novel `platform_target` install the wrong
+    // binary and brick the host). The signature + sha256 gates still apply; this
+    // adds a fail-closed platform gate on top. Unknown HOST os/arch (a rustc
+    // target this build was not taught to classify) still accepts, since we
+    // cannot positively match what we cannot name.
     let os_ok = match std::env::consts::OS {
-        "windows" => !has(MAC) && !has(LIN) && !has(BSD),
-        "macos" => !has(WIN) && !has(LIN) && !has(BSD),
-        "linux" => !has(WIN) && !has(MAC) && !has(BSD),
-        "freebsd" => !has(WIN) && !has(MAC),
-        _ => true, // unknown host OS — do not gate
+        "windows" => has(WIN),
+        "macos" => has(MAC),
+        "linux" => has(LIN),
+        "freebsd" => has(BSD),
+        _ => true, // unknown host OS — cannot gate
     };
     let arch_ok = match std::env::consts::ARCH {
-        "x86_64" => !has(ARM64),
-        "aarch64" => !has(X64),
-        _ => true, // unknown host arch — do not gate
+        "x86_64" => has(X64),
+        "aarch64" => has(ARM64),
+        _ => true, // unknown host arch — cannot gate
     };
     os_ok && arch_ok
 }
@@ -670,14 +680,15 @@ mod tests {
             "x86_64-some-os"
         };
         assert!(!host_matches_platform_target(foreign_arch));
-        // Host platform accepted in both conventions; unknown format accepted.
+        // Host platform accepted in both conventions.
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
         assert!(host_matches_platform_target(&format!("{os}-{arch}")));
         assert!(host_matches_platform_target(&format!(
             "{arch}-unknown-{os}-gnu"
         )));
-        assert!(host_matches_platform_target("unrecognized-format"));
+        // F5: an unrecognized target is now REJECTED fail-closed (was accepted).
+        assert!(!host_matches_platform_target("unrecognized-format"));
     }
 
     /// audit U5: apply_update refuses a signed manifest whose platform_target
