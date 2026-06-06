@@ -47,7 +47,10 @@ impl FrameDispatcher {
                     Ok(p) => p,
                     Err(e) => return DispatchResult::Violation(format!("bad NeighborOffer: {e}")),
                 };
-                self.dht.handle_neighbor_offer(&payload);
+                // Pass the authenticated peer as the contact source so the
+                // unverified offer lands in the source-quota'd pending pool.
+                self.dht
+                    .handle_neighbor_offer(*node_id.as_bytes(), &payload);
                 DispatchResult::NoResponse
             }
 
