@@ -2,15 +2,15 @@
 //!
 //! Implements [`veil_ipc::BootstrapInviteCreateSink`] by snapshotting
 //! the daemon's `[identity]` keypair + first `[[listen]]` advertise URI
-//! at construction time, then assembling а canonical [`BootstrapPeer`]
-//! и handing к [`veil_bootstrap::invite::encode_uri`] (plain) или
+//! at construction time, then assembling a canonical [`BootstrapPeer`]
+//! and handing to [`veil_bootstrap::invite::encode_uri`] (plain) or
 //! [`veil_bootstrap::encrypted_invite::encrypt_invite`] (password
 //! variant) on every request.
 //!
-//! Snapshot-at-startup tradeoff: simpler than threading а live
-//! `Arc<RwLock<Config>>` through the IPC dispatch, и matches the CLI
+//! Snapshot-at-startup tradeoff: simpler than threading a live
+//! `Arc<RwLock<Config>>` through the IPC dispatch, and matches the CLI
 //! `bootstrap invite` command's behaviour (reads config off disk once
-//! per invocation).  Config reload spawns а fresh sink instance so the
+//! per invocation).  Config reload spawns a fresh sink instance so the
 //! snapshot stays current across `kill -HUP`.
 
 use std::sync::Arc;
@@ -22,38 +22,38 @@ use veil_cfg::BootstrapPeer;
 use veil_observability::NodeLogger;
 use veil_types::SignatureAlgorithm;
 
-/// Bridges `CreateBootstrapInvite` IPC requests к
+/// Bridges `CreateBootstrapInvite` IPC requests to
 /// `veil-bootstrap::invite::encode_uri` / `encrypt_invite`.
 pub struct BootstrapInviteCreator {
     logger: Arc<NodeLogger>,
-    /// Snapshot of `[identity]` algo + pubkey + nonce — needed к build
-    /// а [`BootstrapPeer`].  Private key is NOT snapshotted because
+    /// Snapshot of `[identity]` algo + pubkey + nonce — needed to build
+    /// a [`BootstrapPeer`].  Private key is NOT snapshotted because
     /// plain + encrypted invite paths don't sign — that's the
     /// signed-invite variant (future slice).
     algo: SignatureAlgorithm,
     public_key_b64: String,
     nonce_b64: String,
-    /// First `[[listen]]` entry's advertise URI (falls back к the bind
+    /// First `[[listen]]` entry's advertise URI (falls back to the bind
     /// transport if no explicit advertise is set).  Pre-resolved at
     /// snapshot time — matches the CLI's address-picking logic.
     transport: String,
-    /// `None` если the daemon's config has no `[identity]` или no
+    /// `None` if the daemon's config has no `[identity]` or no
     /// `[[listen]]` — sink returns `NotConfigured` outcome in that case.
     /// Wraps the runtime field so single-field absent-config errors
     /// don't require ferrying multiple flags.
     snapshot_ok: bool,
     /// Human-readable reason `snapshot_ok == false` (e.g. "no [identity]"
-    /// или "no [[listen]] entry").  Surfaced verbatim к the consumer as
+    /// or "no [[listen]] entry").  Surfaced verbatim to the consumer as
     /// the `NotConfigured` detail.
     snapshot_err: String,
 }
 
 impl BootstrapInviteCreator {
-    /// Build а fresh adapter snapshotting the relevant config fields.
-    /// Pass `None` для either `identity` или `transport` to mark the
+    /// Build a fresh adapter snapshotting the relevant config fields.
+    /// Pass `None` for either `identity` or `transport` to mark the
     /// daemon as not-configured-for-invite-creation — the sink will
-    /// reply [`BootstrapInviteCreateOutcome::NotConfigured`] на every
-    /// request с the reason string.
+    /// reply [`BootstrapInviteCreateOutcome::NotConfigured`] on every
+    /// request with the reason string.
     pub fn new(
         logger: Arc<NodeLogger>,
         identity: Option<(SignatureAlgorithm, String, String)>,
@@ -114,10 +114,10 @@ impl BootstrapInviteCreateSink for BootstrapInviteCreator {
         if !self.snapshot_ok {
             return BootstrapInviteCreateOutcome::NotConfigured(self.snapshot_err.clone());
         }
-        // Validate password — empty / whitespace-only is а common
+        // Validate password — empty / whitespace-only is a common
         // mistake (user pressed enter on the prompt); reject so the UI
         // can re-prompt rather than emitting an envelope encrypted
-        // under а trivial key.
+        // under a trivial key.
         if let Some(pw) = password
             && pw.trim().is_empty()
         {

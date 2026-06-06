@@ -45,33 +45,33 @@ pub struct OgateConfig {
     pub mode: AccessMode,
 
     /// **P-Net admission gate**.  When `true`, ogate queries the daemon's
-    /// verified-cert cache (см. [`veil_identity::network_access`])
-    /// at startup и on SIGHUP, и filters out any `[[peers]]` entry whose
-    /// peer hasn't presented а valid `MembershipCert`.  Combine с
-    /// `mode = "authorized"` для defence-in-depth: peer must BOTH
-    /// have а verified cert AND be в the configured `[[peers]]` list.
+    /// verified-cert cache (cf. [`veil_identity::network_access`])
+    /// at startup and on SIGHUP, and filters out any `[[peers]]` entry whose
+    /// peer hasn't presented a valid `MembershipCert`.  Combine with
+    /// `mode = "authorized"` for defence-in-depth: peer must BOTH
+    /// have a verified cert AND be in the configured `[[peers]]` list.
     ///
-    /// Default `false` — backward-compatible с pre-P-Net deployments
+    /// Default `false` — backward-compatible with pre-P-Net deployments
     /// where the operator gates statically.
     #[serde(default)]
     pub pnet_required: bool,
 
-    /// S2.B **app-layer cert authority** (server side).  Independent от
+    /// S2.B **app-layer cert authority** (server side).  Independent from
     /// daemon's P-Net.  When all three fields are set, ogate's ingress
-    /// path drops packets от peers что haven't presented а valid
+    /// path drops packets from peers that haven't presented a valid
     /// `MembershipCert` signed by `app_cert_trusted_owner_pubkey`.
-    /// The cert exchange happens via the cert message protocol (см.
-    /// [`crate::cert_message`]) и а per-peer verified cache.
+    /// The cert exchange happens via the cert message protocol (cf.
+    /// [`crate::cert_message`]) and a per-peer verified cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_cert_trusted_owner_pubkey: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_cert_owner_algo: Option<veil_types::SignatureAlgorithm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_cert_network_id: Option<String>,
-    /// S2.B (sender side): path к а signed `MembershipCert` blob.
-    /// When set, ogate emits а cert message к each configured peer at
-    /// startup и periodically thereafter; the peer caches the verified
-    /// node_id и admits subsequent IP packets.
+    /// S2.B (sender side): path to a signed `MembershipCert` blob.
+    /// When set, ogate emits a cert message to each configured peer at
+    /// startup and periodically thereafter; the peer caches the verified
+    /// node_id and admits subsequent IP packets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_cert_path: Option<PathBuf>,
 
@@ -107,36 +107,36 @@ pub struct OgateConfig {
     #[serde(default = "default_endpoint_id")]
     pub endpoint_id: u32,
 
-    /// Tokio-runtime knobs (shared schema с veil-cli). Optional —
+    /// Tokio-runtime knobs (shared schema with veil-cli). Optional —
     /// defaults work for typical deployments.  Env vars `OGATE_RUNTIME`,
     /// `OGATE_WORKERS`, `OGATE_MAX_BLOCKING_THREADS` STILL override these
-    /// values после loading the file (backward-compat с existing systemd
+    /// values after loading the file (backward-compat with existing systemd
     /// units that pass env-only tuning).
     #[serde(default)]
     pub runtime: RuntimeConfig,
 
     /// Egress batching config (Phase E27).  Audit batch 2026-05-24 (M13):
-    /// previously batching was а compile-time const (`BATCHING_ENABLED =
-    /// true`); during rolling upgrade а legacy receiver silently drops the
-    /// 0xB1-prefixed batch envelope as "не IPv4 / IPv6", causing а
-    /// blackhole без operator signal.  This section lets the operator
+    /// previously batching was a compile-time const (`BATCHING_ENABLED =
+    /// true`); during rolling upgrade a legacy receiver silently drops the
+    /// 0xB1-prefixed batch envelope as "not IPv4 / IPv6", causing a
+    /// blackhole without operator signal.  This section lets the operator
     /// flip batching off during mixed-version rollouts.
     #[serde(default)]
     pub batch: BatchConfig,
 
-    /// Logging output knobs.  Optional — если omitted, ogate honours
-    /// `RUST_LOG` env var с default `info`.
+    /// Logging output knobs.  Optional — if omitted, ogate honours
+    /// `RUST_LOG` env var with default `info`.
     #[serde(default)]
     pub logging: LoggingConfig,
 }
 
-/// Logging configuration for the `ogate` binary.  Translates к
+/// Logging configuration for the `ogate` binary.  Translates to
 /// `tracing-subscriber` filter + format + writer.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Minimum level emitted: `off` | `error` | `warn` | `info` |
-    /// `debug` | `trace`.  Default `info`.  Set `off` к suppress all
+    /// `debug` | `trace`.  Default `info`.  Set `off` to suppress all
     /// log output.  Overridden by `RUST_LOG` env var when set.
     #[serde(default)]
     pub level: LogLevel,
@@ -146,11 +146,11 @@ pub struct LoggingConfig {
     #[serde(default)]
     pub format: LogFormat,
 
-    /// Optional path to а log file.  `None` (default) ⇒ logs go к
-    /// stderr.  When set, logs are appended к the file (created if
-    /// absent).  Parent directory must exist.  Useful для systemd
-    /// units that pipe stderr к journald но want а separate
-    /// JSON-formatted log file для shipping.
+    /// Optional path to a log file.  `None` (default) ⇒ logs go to
+    /// stderr.  When set, logs are appended to the file (created if
+    /// absent).  Parent directory must exist.  Useful for systemd
+    /// units that pipe stderr to journald but want a separate
+    /// JSON-formatted log file for shipping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<std::path::PathBuf>,
 }
@@ -192,17 +192,17 @@ pub enum LogFormat {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchConfig {
-    /// Whether к coalesce small egress IP packets into 0xB1-prefixed
+    /// Whether to coalesce small egress IP packets into 0xB1-prefixed
     /// batch envelopes (Phase E27).  Legacy ogate peers (pre-E27) do
-    /// NOT understand this format и silently drop batch envelopes —
-    /// during rolling upgrades this manifests as а blackhole.
+    /// NOT understand this format and silently drop batch envelopes —
+    /// during rolling upgrades this manifests as a blackhole.
     ///
     /// **Recommended:**
-    /// * Set `false` when starting а rolling upgrade until ALL peers run
+    /// * Set `false` when starting a rolling upgrade until ALL peers run
     ///   an E27-or-newer build.
     /// * Set `true` (or omit) after the upgrade completes.
     ///
-    /// Default: `true` (preserves shipped behaviour для homogeneous
+    /// Default: `true` (preserves shipped behaviour for homogeneous
     /// deployments).
     #[serde(default = "BatchConfig::default_enabled")]
     pub enabled: bool,
@@ -241,7 +241,7 @@ pub struct PeerEntry {
 pub enum AccessMode {
     /// Any peer that knows the (network, app) pair can talk in.
     /// **Use only for testing / open networks**: any peer in the network
-    /// namespace can inject TUN traffic. Use [`Self::Authorized`] для
+    /// namespace can inject TUN traffic. Use [`Self::Authorized`] for
     /// production deployments.
     Open,
     /// Only peers listed in `peers[].node_id` are accepted on ingress AND
@@ -259,11 +259,11 @@ impl OgateConfig {
     /// Read a config from a TOML file.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path_ref = path.as_ref();
-        // Audit batch 2026-05-24 (M6): warn если config file is world/
+        // Audit batch 2026-05-24 (M6): warn if config file is world/
         // group-readable.  Config may carry sensitive metadata (peer
-        // node_ids, socket paths) и must not be tamper-able by
+        // node_ids, socket paths) and must not be tamper-able by
         // unprivileged users.  Logged at startup, not fatal — operators
-        // may have valid reasons (e.g. read-only mount under а group).
+        // may have valid reasons (e.g. read-only mount under a group).
         warn_loose_config_perms(path_ref);
         let bytes = std::fs::read_to_string(&path).map_err(|e| ConfigError::Io {
             path: path_ref.display().to_string(),
@@ -283,12 +283,12 @@ impl OgateConfig {
             return Err(ConfigError::Field("`app` must not be empty"));
         }
         if self.local_addr_v4.is_none() {
-            // `tun::standard::Device::new` requires `local_addr_v4` для
+            // `tun::standard::Device::new` requires `local_addr_v4` for
             // initial interface configuration (Linux TUNSETIFF, macOS utun,
-            // Windows WinTun all need an IPv4 address к bring the interface
+            // Windows WinTun all need an IPv4 address to bring the interface
             // up). IPv6-only config previously passed validate but failed
-            // at runtime с а cryptic "local_addr_v4 missing" error.
-            // Fail-fast here с а clear message instead.
+            // at runtime with a cryptic "local_addr_v4 missing" error.
+            // Fail-fast here with a clear message instead.
             return Err(ConfigError::Field(
                 "`local_addr_v4` is required (IPv6-only configurations not yet supported by the TUN backend)",
             ));
@@ -333,8 +333,8 @@ fn default_iface_name() -> String {
     "ogate0".to_owned()
 }
 /// TUN MTU.  Default 16000 (= bufpool's 16 KiB bucket size — the largest
-/// safe value before delivery ломается на bigger frames).  Phase E24
-/// (2026-05-22) measured MTU-sweep через ogate-tunnel:
+/// safe value before delivery breaks on bigger frames).  Phase E24
+/// (2026-05-22) measured MTU-sweep through ogate-tunnel:
 ///
 /// ```text
 /// MTU=1500   → 166 Mbps single TCP stream
@@ -344,11 +344,11 @@ fn default_iface_name() -> String {
 /// MTU=32000+ → delivery stalls (frame fragmentation OR bufpool overflow)
 /// ```
 ///
-/// Per-packet overhead в the veil pipeline (TUN read → AppSender::send
+/// Per-packet overhead in the veil pipeline (TUN read → AppSender::send
 /// → IPC frame → daemon dispatch → AEAD frame → TCP write) dominates
 /// throughput; fewer larger packets = far less aggregate overhead.
-/// Operators on links с MTU restrictions (PPPoE 1492, VPN nested) can
-/// override через `[ogate] mtu = 1500` в config.
+/// Operators on links with MTU restrictions (PPPoE 1492, VPN nested) can
+/// override through `[ogate] mtu = 1500` in config.
 fn default_mtu() -> u16 {
     16000
 }
@@ -378,18 +378,18 @@ pub enum ConfigError {
     Peer { index: usize, msg: &'static str },
 }
 
-/// Emit а warning если the config file is readable / writable by group
-/// или other.  Non-fatal.  Audit batch 2026-05-24 (M6).
+/// Emit a warning if the config file is readable / writable by group
+/// or other.  Non-fatal.  Audit batch 2026-05-24 (M6).
 #[cfg(unix)]
 fn warn_loose_config_perms(path: &Path) {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = std::fs::metadata(path) else {
-        return; // нет файла → каллер получит понятную ошибку при read
+        return; // no file → caller gets clear error on read
     };
     let mode = meta.mode() & 0o777;
     if mode & 0o077 != 0 {
-        // Use eprintln! (не tracing) because logger may не быть init'нут
-        // в момент config-load.
+        // Use eprintln! (not tracing) because logger may not be initialised
+        // in moment config-load.
         eprintln!(
             "ogate: config file {} mode 0{mode:o} permits group/other access. \
              Recommended: chmod 600 (config may contain peer node_ids).",
@@ -400,14 +400,14 @@ fn warn_loose_config_perms(path: &Path) {
 
 #[cfg(not(unix))]
 fn warn_loose_config_perms(_path: &Path) {
-    // Windows ACL check is out of scope для this audit batch.
+    // Windows ACL check is out of scope for this audit batch.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Minimal config parses и applies fail-closed default (`Authorized`).
+    /// Minimal config parses and applies fail-closed default (`Authorized`).
     /// Audit batch 2026-05-24 (L8): name pre-dates the default flip;
     /// previously expected `Open`.  Authorized is the safer default.
     #[test]
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(cfg.endpoint_id, 1);
         assert_eq!(cfg.mtu, 16000);
         assert!(cfg.peers.is_empty());
-        // Audit batch 2026-05-24 (M13): batching defaults к enabled.
+        // Audit batch 2026-05-24 (M13): batching defaults to enabled.
         assert!(cfg.batch.enabled);
     }
 

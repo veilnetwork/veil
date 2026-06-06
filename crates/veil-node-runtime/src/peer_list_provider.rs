@@ -34,14 +34,14 @@ impl PeerListProvider for LiveSessionsPeerList {
         for session in sessions.values() {
             // Skip sessions whose peer hasn't completed handshake yet —
             // a `node_id == None` entry means we don't know who's on the
-            // other end, which is useless for UI display и unsafe to
+            // other end, which is useless for UI display and unsafe to
             // surface (would let UI render "?" rows that confuse users).
             let Some(node_id) = session.node_id else {
                 continue;
             };
             // Skip duplicate node_ids — sessions map can transiently
             // hold a closing+opening pair for the same peer during a
-            // reconnect. UI wants distinct-peer rows, не link rows.
+            // reconnect. UI wants distinct-peer rows, not link rows.
             if peers
                 .iter()
                 .any(|p: &PeersListEntry| p.node_id == *node_id.as_bytes())
@@ -59,8 +59,8 @@ impl PeerListProvider for LiveSessionsPeerList {
             };
             let state_byte = match session.state {
                 // Both Active and DebugAttached map to "ACTIVE" for UI —
-                // DebugAttached is an operator-internal mode где session
-                // is bridged к admin debug stream, but the peer is still
+                // DebugAttached is an operator-internal mode where session
+                // is bridged to admin debug stream, but the peer is still
                 // online from the user's perspective.
                 SessionState::Active | SessionState::DebugAttached => peer_state::ACTIVE,
             };

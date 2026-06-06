@@ -1,9 +1,9 @@
 ---
 # Phase 5f Step 3c — revert the ephemeral-rotation canary.
-# Strips the `ephemeral = {...}` inline-table field из the targeted
-# [[listen]] entry и restarts the daemon.
+# Strips the `ephemeral = {...}` inline-table field from the targeted
+# [[listen]] entry and restarts the daemon.
 #
-# Idempotent: skips если no ephemeral field found.
+# Idempotent: skips if no ephemeral field found.
 #
 # Run:
 #   ansible-playbook -i inventory.yml revert-ephemeral-canary.yml \
@@ -17,7 +17,7 @@
     eph_listen_id: "0x00000002"
 
   tasks:
-    - name: Check if ephemeral field present в target listener
+    - name: Check if ephemeral field present in target listener
       ansible.builtin.shell:
         cmd: |
           python3 << 'PYEOF'
@@ -49,7 +49,7 @@
               src = f.read()
           # Within the inline-table { id = "...", ..., ephemeral = { ... } },
           # strip `, ephemeral = { ... }` substring.  The match is greedy
-          # to swallow the entire inner ephemeral table в one shot.
+          # to swallow the entire inner ephemeral table in one shot.
           inline_re = re.compile(
               r'(\{\s*id\s*=\s*"' + re.escape(target_id) + r'"[^}]*?)'
               r',\s*ephemeral\s*=\s*\{[^}]*\}'
@@ -71,7 +71,7 @@
         name: veil.service
         state: restarted
 
-    - name: Wait для metrics endpoint
+    - name: Wait for metrics endpoint
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 60); do
@@ -101,5 +101,5 @@
     - name: Show post-revert rotation count
       ansible.builtin.debug:
         msg: |
-          listen.rotation.spawned после revert: {{ rotation_post_revert.stdout }}
-          (Should be 0 — ephemeral block stripped, daemon restarted без rotator.)
+          listen.rotation.spawned after revert: {{ rotation_post_revert.stdout }}
+          (Should be 0 — ephemeral block stripped, daemon restarted without rotator.)

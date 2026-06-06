@@ -261,18 +261,18 @@ pub enum LocalListener {
     },
 }
 
-/// audit: а raw-accepted local connection that has not yet
-/// completed the token-handshake step. Caller obtains а `PendingStream`
-/// [`LocalListener::accept_raw`] и must call [`Self::verify`] (in
-/// а spawned task) к produce the authenticated [`LocalStream`].
+/// audit: a raw-accepted local connection that has not yet
+/// completed the token-handshake step. Caller obtains a `PendingStream`
+/// [`LocalListener::accept_raw`] and must call [`Self::verify`] (in
+/// a spawned task) to produce the authenticated [`LocalStream`].
 ///
-/// Splitting the handshake out от the accept loop is the slow-loris fix:
-/// pre-split, the accept loop awaited the 32-byte token read inline (с
-/// 3 s timeout), so an attacker connecting к loopback TCP и not sending
-/// а token blocked the entire accept loop для 3 s × N sequential
-/// attempts. Post-split, the accept loop returns immediately после
-/// the kernel-level TCP accept (μs); handshake runs in а task per
-/// connection и cannot stall concurrent legitimate connects.
+/// Splitting the handshake out from the accept loop is the slow-loris fix:
+/// pre-split, the accept loop awaited the 32-byte token read inline (with
+/// 3 s timeout), so an attacker connecting to loopback TCP and not sending
+/// a token blocked the entire accept loop for 3 s × N sequential
+/// attempts. Post-split, the accept loop returns immediately after
+/// the kernel-level TCP accept (μs); handshake runs in a task per
+/// connection and cannot stall concurrent legitimate connects.
 pub struct PendingStream {
     inner: PendingStreamInner,
 }
@@ -293,9 +293,9 @@ enum PendingStreamInner {
 
 impl PendingStream {
     /// Complete the per-backend token handshake. TCP / NamedPipe paths
-    /// read а 32-byte token [`TOKEN_READ_TIMEOUT`]; Unix returns
+    /// read a 32-byte token [`TOKEN_READ_TIMEOUT`]; Unix returns
     /// immediately (handshake-free, kernel SO_PEERCRED is the gate).
-    /// Returns а ready-к-use [`LocalStream`].
+    /// Returns a ready-to-use [`LocalStream`].
     pub async fn verify(self) -> std::io::Result<LocalStream> {
         match self.inner {
             #[cfg(unix)]
@@ -360,16 +360,16 @@ impl PendingStream {
 impl LocalListener {
     /// audit: accept the next raw inbound connection
     /// without performing the token-handshake step. Returns
-    /// immediately после the kernel TCP-accept (μs); каллер spawns
-    /// а task that calls [`PendingStream::verify`] к complete the
+    /// immediately after the kernel TCP-accept (μs); caller spawns
+    /// a task that calls [`PendingStream::verify`] to complete the
     /// 32-byte token check. This is the slow-loris fix: pre-split
-    /// а malicious client connecting к loopback TCP и not sending
-    /// а token would stall the accept loop для 3 s × N attempts.
-    /// Post-split, accept loop is не blocked by stragglers.
+    /// a malicious client connecting to loopback TCP and not sending
+    /// a token would stall the accept loop for 3 s × N attempts.
+    /// Post-split, accept loop is not blocked by stragglers.
     ///
     /// `PeerInfo::uid_matches_local` is preset based on the backend
     /// (Unix: kernel SO_PEERCRED; TCP / NamedPipe: presumed-true
-    /// confirmed когда `verify` succeeds).
+    /// confirmed when `verify` succeeds).
     pub async fn accept_raw(&self) -> std::io::Result<(PendingStream, PeerInfo)> {
         match self {
             #[cfg(unix)]
@@ -427,12 +427,12 @@ impl LocalListener {
         }
     }
 
-    /// Accept the next inbound connection и complete authentication
+    /// Accept the next inbound connection and complete authentication
     /// inline (legacy serial path). Backwards-compat wrapper for
     /// callers that don't need slow-loris protection (e.g. tests).
     /// **Production callers should use [`Self::accept_raw`] +
-    /// task-spawned [`PendingStream::verify`]** к keep the accept
-    /// loop responsive под slow handshake clients.
+    /// task-spawned [`PendingStream::verify`]** to keep the accept
+    /// loop responsive under slow handshake clients.
     pub async fn accept(&self) -> std::io::Result<(LocalStream, PeerInfo)> {
         let (pending, peer) = self.accept_raw().await?;
         let stream = pending.verify().await?;
@@ -463,7 +463,7 @@ impl LocalListener {
 ///
 /// Only constructed by the `NamedPipe` variant of `LocalStream` (Windows
 /// only). Gated to that target so non-Windows builds don't carry an
-/// unused trait в the public crate surface.
+/// unused trait in the public crate surface.
 #[cfg(windows)]
 pub trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
 #[cfg(windows)]
@@ -1075,12 +1075,12 @@ mod tests {
     }
 
     /// regression: `accept_raw` must NOT block on
-    /// а silent client. Pre-fix the accept loop awaited the 32-byte
-    /// token read inline (с 3 s timeout); attaching N silent clients
-    /// would stall the loop для 3 s × N seconds, blocking concurrent
+    /// a silent client. Pre-fix the accept loop awaited the 32-byte
+    /// token read inline (with 3 s timeout); attaching N silent clients
+    /// would stall the loop for 3 s × N seconds, blocking concurrent
     /// legitimate connects. Post-fix, `accept_raw` returns immediately
-    /// after kernel TCP-accept, и `pending.verify` (which the caller
-    /// runs in а spawned task) absorbs the stall.
+    /// after kernel TCP-accept, and `pending.verify` (which the caller
+    /// runs in a spawned task) absorbs the stall.
     #[tokio::test]
     async fn tcp_accept_raw_unblocked_by_silent_client() {
         let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1089,7 +1089,7 @@ mod tests {
         // Stall artist: connect, never send token.
         let _silent = tokio::net::TcpStream::connect(local_addr).await.unwrap();
 
-        // accept_raw must complete promptly — well под TOKEN_READ_TIMEOUT.
+        // accept_raw must complete promptly — well under TOKEN_READ_TIMEOUT.
         let start = std::time::Instant::now();
         let (silent_pending, _) =
             tokio::time::timeout(Duration::from_millis(500), listener.accept_raw())
@@ -1101,8 +1101,8 @@ mod tests {
             "accept_raw should be ~instant after kernel accept"
         );
 
-        // Legit client следом — accept_raw must still return promptly
-        // not waiting на the silent connection's handshake to time out.
+        // Legit client next — accept_raw must still return promptly
+        // not waiting on the silent connection's handshake to time out.
         let legit_handle =
             tokio::spawn(async move { connect_tcp(local_addr, &token).await.unwrap() });
         let start2 = std::time::Instant::now();
@@ -1124,7 +1124,7 @@ mod tests {
         drop(legit_stream);
 
         // Silent's verify will time out — that's fine, just ensure it
-        // resolves to PermissionDenied / TimedOut и не panics.
+        // resolves to PermissionDenied / TimedOut and not panics.
         let silent_res = silent_pending.verify().await;
         assert!(silent_res.is_err());
     }

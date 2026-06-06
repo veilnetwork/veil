@@ -496,7 +496,7 @@ impl FrameDispatcher {
             }
         }
         if p.target_node_id == self.local_node_id {
-            // ── Уровень 2: contacts-only discovery filter ─────
+            // ── Level 2: contacts-only discovery filter ─────
             // In `ContactsOnly` mode, silently drop probes from peers
             // we have no prior handshake with — no PowChallenge, no
             // RouteResponse. An attacker scanning random target_ids
@@ -508,7 +508,7 @@ impl FrameDispatcher {
                 }
             }
 
-            // ── Уровень 1: PoW-gate transport disclosure ──────
+            // ── Level 1: PoW-gate transport disclosure ──────
             // When PoW is configured, defer the `RouteResponse` (which
             // carries our listen transports) until the requester has
             // returned a valid `PowResponse`. Without this gate, a single
@@ -582,8 +582,8 @@ impl FrameDispatcher {
             // Rate-limit fan-out: a peer that sends RouteRequests faster than
             // MAX_DHT_OPS_PER_PEER_PER_WINDOW cannot amplify traffic to all peers.
             // Audit batch 2026-05-24: emit Violation instead of silent drop so
-            // persistent abuse escalates через violation_tracker к а ban; silent
-            // drop alone leaves the attacker invisible к escalation logic.
+            // persistent abuse escalates through violation_tracker to a ban; silent
+            // drop alone leaves the attacker invisible to escalation logic.
             if !lock!(self.abuse.dht_quota).allow(*peer_id.as_bytes()) {
                 return DispatchResult::Violation("RouteRequest DHT quota exceeded".to_string());
             }
@@ -817,7 +817,7 @@ impl FrameDispatcher {
                 return DispatchResult::Violation("PowResponse: invalid PoW solution".to_owned());
             }
 
-            // ── Уровень 1: deferred RouteResponse ──
+            // ── Level 1: deferred RouteResponse ──
             // The PoW solution proves the requester paid CPU cost for
             // discovery; only now do we disclose our listen transports
             // (or relay_ids in IntroductionOnly mode). `request_id`
@@ -1175,13 +1175,13 @@ impl FrameDispatcher {
 
         // (deferred slice cleanup): drop every rendezvous-
         // subscription registered FROM this peer. Without this, when
-        // a receiver's OVL1 session к the rendezvous closes — process
-        // restart, network blip, peer revoke — their cookies stay в
+        // a receiver's OVL1 session to the rendezvous closes — process
+        // restart, network blip, peer revoke — their cookies stay in
         // RendezvousRegistry forever (until manual unregister or
         // process restart). Senders trying to deliver via that cookie
         // would have their Introduce silently forwarded to a dead
-        // session, materializing as `send_to` failures и payload loss.
-        // After this hook, stale subscriptions get reaped с the closing
+        // session, materializing as `send_to` failures and payload loss.
+        // After this hook, stale subscriptions get reaped with the closing
         // session itself, eliminating the leak. No-op when this node
         // isn't running a rendezvous-registry (only relay-capable nodes
         // hold one).
@@ -1633,9 +1633,9 @@ impl FrameDispatcher {
             return DispatchResult::NoResponse;
         }
 
-        // j: demoted к DEBUG. Recursive DHT queries fire
-        // every routing fallback под chaos-ban-driven route_cache misses
-        // (~10/sec на bootstrap'е). Aggregate visibility сохранена через
+        // j: demoted to DEBUG. Recursive DHT queries fire
+        // every routing fallback under chaos-ban-driven route_cache misses
+        // (~10/sec on bootstrap). Aggregate visibility saved through
         // `veil_dht_lookup_total` / `veil_dht_fallback_*` counters.
         self.logger.debug(
             "recursive.query",
@@ -1691,7 +1691,7 @@ impl FrameDispatcher {
             if peer_id.as_bytes() != &self.local_node_id
                 && guard.send_to(peer_id.as_bytes(), prio, frame.clone())
             {
-                // l: demoted к DEBUG (high-freq under DHT fallback).
+                // l: demoted to DEBUG (high-freq under DHT fallback).
                 self.logger.debug(
                     "recursive.response.sent",
                     format!(
@@ -1704,7 +1704,7 @@ impl FrameDispatcher {
             }
             // 1. Direct session to originator — fast path.
             if guard.send_to(&q.reply_to, prio, frame.clone()) {
-                // l: demoted к DEBUG (high-freq under DHT fallback).
+                // l: demoted to DEBUG (high-freq under DHT fallback).
                 self.logger.debug(
                     "recursive.response.sent",
                     format!("via=direct reply_to={}", veil_util::hex_short(&q.reply_to)),
@@ -1717,7 +1717,7 @@ impl FrameDispatcher {
                 && &hop != peer_id.as_bytes()
                 && guard.send_to(&hop, prio, frame.clone())
             {
-                // l: demoted к DEBUG (high-freq under DHT fallback).
+                // l: demoted to DEBUG (high-freq under DHT fallback).
                 self.logger.debug(
                     "recursive.response.sent",
                     format!(
@@ -1741,7 +1741,7 @@ impl FrameDispatcher {
                     continue;
                 }
                 if guard.send_to(&next_hop, prio, frame.clone()) {
-                    // l: demoted к DEBUG.
+                    // l: demoted to DEBUG.
                     self.logger.debug(
                         "recursive.response.sent",
                         format!(
@@ -1769,7 +1769,7 @@ impl FrameDispatcher {
         match q.query_type {
             recursive_query_type::FIND_VALUE => {
                 if let Some(value) = self.dht.get_local(&q.target_key) {
-                    // l: demoted к DEBUG.
+                    // l: demoted to DEBUG.
                     self.logger.debug(
                         "recursive.answer.local",
                         format!(
@@ -1790,7 +1790,7 @@ impl FrameDispatcher {
                     // direct FIND_NODE. Internal routing (find_closest_nodes
                     // for next-hop selection on lines below) stays unfiltered.
                     let closest = self.dht.find_closest_public_node_ids(&q.target_key, 20);
-                    // l: demoted к DEBUG.
+                    // l: demoted to DEBUG.
                     self.logger.debug(
                         "recursive.answer.find_node",
                         format!(
@@ -1892,7 +1892,7 @@ impl FrameDispatcher {
                                     }
                                 }
                                 if let Some(via) = sent_via {
-                                    // l: demoted к DEBUG.
+                                    // l: demoted to DEBUG.
                                     self.logger.debug(
                                         "recursive.answer.piggyback_sent",
                                         format!(
@@ -1961,8 +1961,8 @@ impl FrameDispatcher {
                 if in_k_closest || q.target_key == self.local_node_id {
                     // SECURITY: validate the payload against the magic-prefix
                     // authenticator policy BEFORE writing to the local DHT.
-                    // The direct STORE path runs the same validation в
-                    // dispatch_discovery; without this gate, а recursive
+                    // The direct STORE path runs the same validation in
+                    // dispatch_discovery; without this gate, a recursive
                     // STORE could write arbitrary (key, value) pairs into
                     // the local TieredStore, bypassing the signed-store
                     // ownership invariants.
@@ -2007,11 +2007,11 @@ impl FrameDispatcher {
                 // PoW-Gated Rendezvous request — Slice 6b of the epic.
                 // Only act locally when `target_key == self.local_node_id`;
                 // otherwise fall through to greedy forwarding so the request
-                // reaches the actual target (we're а relay hop).
+                // reaches the actual target (we're a relay hop).
                 if q.target_key == self.local_node_id {
-                    // Upgrade the dispatcher's Weak ref к the controller.
+                    // Upgrade the dispatcher's Weak ref to the controller.
                     // None ⇒ no stealth listener configured locally —
-                    // request was misrouted; drop silently (don't sign а
+                    // request was misrouted; drop silently (don't sign a
                     // failure response: DoS-resistance).
                     let controller = {
                         let lock = match self.rendezvous_weak.lock() {
@@ -2031,9 +2031,9 @@ impl FrameDispatcher {
                         return DispatchResult::NoResponse;
                     };
 
-                    // Spawn а task so the async controller call doesn't
+                    // Spawn a task so the async controller call doesn't
                     // block the dispatch hot path.  send_response moves
-                    // через the closure capture above.
+                    // through the closure capture above.
                     let body = q.payload.clone();
                     let logger = Arc::clone(&self.logger);
                     let metrics = self.metrics.clone();
@@ -2065,12 +2065,12 @@ impl FrameDispatcher {
                                         veil_util::hex_short(&reply_to),
                                     ),
                                 );
-                                // DoS-resistant: don't ship а rejection
+                                // DoS-resistant: don't ship a rejection
                                 // response.  Initiator times out.
                                 return;
                             }
                         };
-                        // Sign the recursive-response envelope с the local
+                        // Sign the recursive-response envelope with the local
                         // identity key.  Initiator validates
                         // `BLAKE3(responder_pubkey) == target_node_id`.
                         let Some(key) = local_signing_key.as_ref() else {
@@ -2142,20 +2142,20 @@ impl FrameDispatcher {
                         logger.warn(
                             "rendezvous.recursive.response.no_route",
                             format!(
-                                "reply_to={} — granted но cannot route response",
+                                "reply_to={} — granted but cannot route response",
                                 veil_util::hex_short(&reply_to),
                             ),
                         );
-                        // Metrics: успешный grant считается через
+                        // Metrics: successful grant is considered through
                         // controller's own counters; routing-failure
-                        // здесь is а partial-success — counted via
-                        // existing send_to_failed_total через the
+                        // here is a partial-success — counted via
+                        // existing send_to_failed_total through the
                         // session_tx_registry's drop path.
                         let _ = metrics; // counters incremented in-controller
                     });
                     return DispatchResult::NoResponse;
                 }
-                // target_key ≠ local — fall through к greedy-forwarding.
+                // target_key ≠ local — fall through to greedy-forwarding.
             }
             _ => {
                 return DispatchResult::Violation(format!(
@@ -2189,12 +2189,12 @@ impl FrameDispatcher {
                 ),
             );
             // Audit batch 2026-05-24: emit Violation so persistent abuse
-            // escalates через violation_tracker к а ban.
+            // escalates through violation_tracker to a ban.
             return DispatchResult::Violation("RecursiveQuery DHT quota exceeded".to_string());
         }
 
         let closest = self.dht.find_closest_nodes(&q.target_key, 2);
-        // j: demoted к DEBUG (pairs с recursive.query above).
+        // j: demoted to DEBUG (pairs with recursive.query above).
         self.logger.debug(
             "recursive.forward",
             format!(
@@ -2392,17 +2392,17 @@ impl FrameDispatcher {
             match p.query_type {
                 recursive_query_type::FIND_NODE => {
                     // payload = concatenated 32-byte node_ids, closest to target_key.
-                    // Insert each candidate as а next-hop для `target_key`.  The
+                    // Insert each candidate as a next-hop for `target_key`.  The
                     // dedicated hop_count is unknown (recursive queries do not
-                    // report per-candidate distance on the wire); we use 2 as а
+                    // report per-candidate distance on the wire); we use 2 as a
                     // conservative default so direct RouteAnnounce(1-hop)
                     // learnings still outrank these inserts.
                     //
-                    // SECURITY: gate the bulk insert через `dht_contact_quota`
-                    // so а single attacker cannot inject up to 32 sybil hops
+                    // SECURITY: gate the bulk insert through `dht_contact_quota`
+                    // so a single attacker cannot inject up to 32 sybil hops
                     // per response (MAX_NODES_PER_RESPONSE), churning the
-                    // 1024-slot route_cache в seconds.  Direct RouteResponse
-                    // (line 661) уже использует the same quota — symmetry.
+                    // 1024-slot route_cache in seconds.  Direct RouteResponse
+                    // (line 661) already uses the same quota — symmetry.
                     if !lock!(self.abuse.dht_contact_quota).allow(*peer_id.as_bytes()) {
                         return DispatchResult::NoResponse;
                     }
@@ -2426,11 +2426,11 @@ impl FrameDispatcher {
                 recursive_query_type::FIND_VALUE
                     if !resp.payload.is_empty()
                         // SECURITY: the responder's `claimed_responder_id` is
-                        // signature-verified above, но that only proves the
+                        // signature-verified above, but that only proves the
                         // *responder* signed `query_id || payload` — it does NOT
-                        // bind the payload к `p.target_key`.  An attacker that
-                        // observes а `query_id` can race the legitimate holder
-                        // с а forged payload и poison our local DHT cache under
+                        // bind the payload to `p.target_key`.  An attacker that
+                        // observes a `query_id` can race the legitimate holder
+                        // with a forged payload and poison our local DHT cache under
                         // an attacker-chosen key.  Apply the same magic-prefix
                         // authenticator gate that direct STORE uses so only
                         // self-authenticating record types are mirror-cached…
@@ -2445,7 +2445,7 @@ impl FrameDispatcher {
                         && self.mirror_cache_key_ok(&resp.payload, &p.target_key) =>
                 {
                     // payload = raw value bytes; mirror into the local DHT so
-                    // subsequent lookups resolve без another round-trip.
+                    // subsequent lookups resolve without another round-trip.
                     self.dht.store_local(p.target_key, resp.payload.clone());
                 }
                 recursive_query_type::STORE => {
@@ -2485,7 +2485,7 @@ impl FrameDispatcher {
                 let prio = veil_proto::header::priority::INTERACTIVE;
                 // 1. Direct session to originator.
                 if guard.send_to(&reply_to, prio, frame.clone()) {
-                    // j: demoted к DEBUG (high-frequency under fallback).
+                    // j: demoted to DEBUG (high-frequency under fallback).
                     self.logger.debug(
                         "recursive.response.relayed",
                         format!(
@@ -2505,7 +2505,7 @@ impl FrameDispatcher {
                     && &hop != peer_id.as_bytes()
                     && guard.send_to(&hop, prio, frame.clone())
                 {
-                    // j: demoted к DEBUG (high-frequency under fallback).
+                    // j: demoted to DEBUG (high-frequency under fallback).
                     self.logger.debug(
                         "recursive.response.relayed",
                         format!(
@@ -2531,7 +2531,7 @@ impl FrameDispatcher {
                         continue;
                     }
                     if guard.send_to(&next_hop, prio, frame.clone()) {
-                        // j: demoted к DEBUG.
+                        // j: demoted to DEBUG.
                         self.logger.debug(
                             "recursive.response.relayed",
                             format!(
@@ -2557,8 +2557,8 @@ impl FrameDispatcher {
             // Response arrived but neither for us nor a query we forwarded.
             // Could be: query_id reverse_path expired (>30s old), or
             // duplicate response after timeout, or cross-talk.
-            // j: demoted к DEBUG. Orphan responses fire под
-            // route-cache TTL expiry; high-volume под chaos-ban churn.
+            // j: demoted to DEBUG. Orphan responses fire under
+            // route-cache TTL expiry; high-volume under chaos-ban churn.
             self.logger.debug(
                 "recursive.response.orphan",
                 format!(
@@ -2630,14 +2630,14 @@ impl FrameDispatcher {
         // dedicated (origin, via, version) seen-set distinct from RouteAnnounce's;
         // deferred as not worth the added hot-path state for this residual.
 
-        // h: demoted к DEBUG. Under chaos-ban-style
+        // h: demoted to DEBUG. Under chaos-ban-style
         // network churn this fires 40k+ times per second per bootstrap
-        // (5.5 M lines в 2 h на b1), spamming /var/log/veil/ at
+        // (5.5 M lines in 2 h on b1), spamming /var/log/veil/ at
         // ~630 MiB per hourly rotation and contributing measurable
-        // alloc/free churn в the daemon's hot path. Operational
+        // alloc/free churn in the daemon's hot path. Operational
         // visibility is preserved via metrics gauges (route_cache
-        // destinations/routes) и via the `RouteUpdate` action counter
-        // — both bounded и diff-able по Prometheus.
+        // destinations/routes) and via the `RouteUpdate` action counter
+        // — both bounded and diff-able by Prometheus.
         self.logger.debug(
             "route_update",
             format!(
@@ -3025,15 +3025,15 @@ mod slice8_rendezvous_integration_tests {
     //! End-to-end integration tests for the PoW-Gated Rendezvous epic.
     //! Drives the full path through the wire bytes:
     //!
-    //! 1. Initiator builds а signed PoW request (Slice 4)
-    //! 2. Wraps it в а `RecursiveQuery` envelope (Slice 6c)
+    //! 1. Initiator builds a signed PoW request (Slice 4)
+    //! 2. Wraps it in a `RecursiveQuery` envelope (Slice 6c)
     //! 3. Dispatcher's `handle_recursive_query` arm processes (Slice 6b)
     //! 4. Controller does verify+rate-limit+concurrent+bind dispatch (Slice 3)
     //! 5. Recording binder captures (URI, PSK) (test-only — production
     //!    binder does the real `registry.bind` + accept-task spawn)
     //! 6. Controller signs the response (Slice 1)
-    //! 7. Dispatcher arm packs the response в а `RecursiveResponse`
-    //!    с outer envelope sig'd by the target's identity key
+    //! 7. Dispatcher arm packs the response in a `RecursiveResponse`
+    //!    with outer envelope sig'd by the target's identity key
     //! 8. Sends back through `session_tx_registry.send_to(reply_to, ...)`
     //! 9. Initiator drains the mpsc receiver, decodes the frame,
     //!    parses + verifies the recursive response (Slice 6c client)
@@ -3061,7 +3061,7 @@ mod slice8_rendezvous_integration_tests {
     use veil_session::rendezvous::{BindClosure, RendezvousController, RendezvousPolicy};
 
     /// Recording binder — captures (uri, psk) and resolves immediately
-    /// с Ok.  No real bind work.
+    /// with Ok.  No real bind work.
     #[derive(Default)]
     struct RecordingBinder {
         calls: Arc<Mutex<Vec<(String, [u8; 32])>>>,
@@ -3079,8 +3079,8 @@ mod slice8_rendezvous_integration_tests {
         }
     }
 
-    /// Construct а FrameDispatcher с the target's identity wired into
-    /// `crypto.local_signing_key`, а fresh `session_tx_registry`, и а
+    /// Construct a FrameDispatcher with the target's identity wired into
+    /// `crypto.local_signing_key`, a fresh `session_tx_registry`, and a
     /// rendezvous controller attached via `rendezvous_weak`.  Returns
     /// the strong Arc<Controller> separately so the test can keep it
     /// alive across the dispatch call.
@@ -3094,20 +3094,20 @@ mod slice8_rendezvous_integration_tests {
         Arc<RwLock<SessionTxRegistry>>,
     ) {
         let mut dispatcher = make_test_dispatcher(NodeRole::Core);
-        // Install the target's identity into crypto (used к sign the
+        // Install the target's identity into crypto (used to sign the
         // outer recursive-response envelope).
         let crypto = Arc::get_mut(&mut dispatcher.crypto)
             .expect("test dispatcher crypto must be uniquely held");
         crypto.local_signing_key = Some(Arc::new(target_sk.clone()));
-        // Fix local_node_id к match the controller's expected target.
+        // Fix local_node_id to match the controller's expected target.
         dispatcher.local_node_id = target_node_id;
 
-        // Wire а real session_tx_registry so the dispatcher can send
+        // Wire a real session_tx_registry so the dispatcher can send
         // responses through it.
         let tx_registry = Arc::new(RwLock::new(SessionTxRegistry::new()));
         dispatcher.session_tx_registry = Some(Arc::clone(&tx_registry));
 
-        // Build the controller с recording binder.
+        // Build the controller with recording binder.
         let binder = Arc::new(RecordingBinder { calls: bind_calls });
         let policy = RendezvousPolicy {
             min_pow_difficulty: 8,
@@ -3153,7 +3153,7 @@ mod slice8_rendezvous_integration_tests {
 
         // Sender peer_id — represents the "previous-hop" relay through
         // which the recursive query arrived.  Per the reverse-path
-        // resolver, the response will be sent back к this peer first.
+        // resolver, the response will be sent back to this peer first.
         let sender_peer_id = [0x77u8; 32];
 
         // ── Setup ───────────────────────────────────────────────
@@ -3161,8 +3161,8 @@ mod slice8_rendezvous_integration_tests {
         let (dispatcher, _controller_keepalive, tx_registry) =
             dispatcher_with_rendezvous(target_sk.clone(), target_node_id, Arc::clone(&bind_calls));
 
-        // Register both the sender peer (reverse-path first hop) и the
-        // requester (reverse-path final destination) в session_tx_registry.
+        // Register both the sender peer (reverse-path first hop) and the
+        // requester (reverse-path final destination) in session_tx_registry.
         let mut sender_rx = {
             let mut reg = tx_registry.write().unwrap();
             reg.register(sender_peer_id)
@@ -3196,7 +3196,7 @@ mod slice8_rendezvous_integration_tests {
         );
         let request_bytes = signed.encode().to_vec();
 
-        // Wrap в recursive envelope (Slice 6c).
+        // Wrap in recursive envelope (Slice 6c).
         let query_id = [0xC0u8; 16];
         let recursive = RecursiveQueryPayload {
             query_id,
@@ -3214,13 +3214,13 @@ mod slice8_rendezvous_integration_tests {
             dispatcher.handle_recursive_query(&recursive_bytes, NodeId::from(sender_peer_id));
         assert!(matches!(result, DispatchResult::NoResponse));
 
-        // The dispatcher's arm spawns а tokio task; give it air to
+        // The dispatcher's arm spawns a tokio task; give it air to
         // run + the controller's permit-watchdog task too.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // ── Reverse-path: sender_peer (priority 0 в the resolver) ─
-        // Drain the sender peer's mpsc first — the arm sends к sender
-        // before falling к direct/cache.  Once it succeeds at sender,
+        // ── Reverse-path: sender_peer (priority 0 in the resolver) ─
+        // Drain the sender peer's mpsc first — the arm sends to sender
+        // before falling to direct/cache.  Once it succeeds at sender,
         // it returns.
         let frame_to_sender = tokio::time::timeout(Duration::from_secs(2), sender_rx.recv())
             .await
@@ -3231,7 +3231,7 @@ mod slice8_rendezvous_integration_tests {
         // won).
         assert!(
             requester_rx.try_recv().is_err(),
-            "response must route through sender (reverse-path first hop), not direct к requester",
+            "response must route through sender (reverse-path first hop), not direct to requester",
         );
 
         // ── Decode + verify (Slice 6c client) ───────────────────
@@ -3253,7 +3253,7 @@ mod slice8_rendezvous_integration_tests {
 
         // Manual full verify mirroring the Slice 6c client primitive
         // (cannot import veilclient::rendezvous from veilcore —
-        // would create а dep cycle).  Steps:
+        // would create a dep cycle).  Steps:
         //   1. query_id echo
         //   2. responder_pubkey == target_pk
         //   3. outer envelope sig verify
@@ -3305,7 +3305,7 @@ mod slice8_rendezvous_integration_tests {
     }
 
     /// Misrouted request (target_key ≠ local_node_id) must fall
-    /// through к greedy-forwarding without invoking the controller.
+    /// through to greedy-forwarding without invoking the controller.
     #[tokio::test]
     async fn slice8_misrouted_request_does_not_invoke_controller() {
         use veil_proto::rendezvous::{
@@ -3322,7 +3322,7 @@ mod slice8_rendezvous_integration_tests {
         let (dispatcher, _ctrl, _tx) =
             dispatcher_with_rendezvous(target_sk, target_node_id, Arc::clone(&bind_calls));
 
-        // Build а request addressed к а DIFFERENT target.
+        // Build a request addressed to a DIFFERENT target.
         let other_target = [0xFFu8; 32];
         let timestamp_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3359,27 +3359,27 @@ mod slice8_rendezvous_integration_tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // The binder must NOT have been called — controller's arm
-        // only runs когда `target_key == local_node_id`.
+        // only runs when `target_key == local_node_id`.
         let calls = bind_calls.lock().unwrap();
         assert_eq!(
             calls.len(),
             0,
-            "misrouted request must not trigger а bind (would fall through к forwarding)",
+            "misrouted request must not trigger a bind (would fall through to forwarding)",
         );
 
         // Suppress unused warning.
         let _ = target_pk;
     }
 
-    /// Request к self без а configured controller (rendezvous_weak
-    /// resolves к None) must drop silently.  No bind, no response.
+    /// Request to self without a configured controller (rendezvous_weak
+    /// resolves to None) must drop silently.  No bind, no response.
     #[tokio::test]
     async fn slice8_no_controller_drops_silently() {
         use veil_proto::rendezvous::{
             MIN_POW_DIFFICULTY, RequestEphemeralEndpointPayload, mine_pow_nonce,
             sign_request_ephemeral_endpoint,
         };
-        // Build а dispatcher без attaching the controller.
+        // Build a dispatcher without attaching the controller.
         let target_sk = SigningKey::from_bytes(&[0xCCu8; 32]);
         let target_pk = target_sk.verifying_key().to_bytes();
         let target_node_id = *blake3::hash(&target_pk).as_bytes();
@@ -3431,7 +3431,7 @@ mod slice8_rendezvous_integration_tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             sender_rx.try_recv().is_err(),
-            "no-controller path must NOT ship а response",
+            "no-controller path must NOT ship a response",
         );
     }
 }

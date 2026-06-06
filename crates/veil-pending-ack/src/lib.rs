@@ -196,8 +196,8 @@ impl PendingAckTracker {
 
     // cleanup: `peek_src_app_id` removed — ended up
     // using `ack_and_get_info` (consume on DELIVERED) at delivery.rs:1086, so
-    // this non-consuming peek had zero non-test callers. Re-introduce из git
-    // history if а stage-notification path needs the src_app_id without ACK.
+    // this non-consuming peek had zero non-test callers. Re-introduce from git
+    // history if a stage-notification path needs the src_app_id without ACK.
 
     /// Drive the timer: collect outcomes for all entries whose deadline has
     /// passed. Entries that still have attempts left are rescheduled;

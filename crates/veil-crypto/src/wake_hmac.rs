@@ -1,38 +1,38 @@
 //! Wake-up payload HMAC primitive (Epic 489.10 slice 4.3.1).
 //!
 //! Closes the leaked-push-token DoS / presence-oracle vector:
-//! pre-HMAC, anyone holding а receiver's FCM/APNs token could fire
-//! arbitrary silent pushes к burn battery (DoS) or measure network
-//! response latency к infer when the receiver is online (presence
-//! oracle).  Post-HMAC, only the legitimate mailbox-relay (которое
-//! holds the receiver's wake-HMAC key, sealed к its X25519 pubkey
-//! via [`super::push_envelope`] in а sibling slice) can mint а
+//! pre-HMAC, anyone holding a receiver's FCM/APNs token could fire
+//! arbitrary silent pushes to burn battery (DoS) or measure network
+//! response latency to infer when the receiver is online (presence
+//! oracle).  Post-HMAC, only the legitimate mailbox-relay (which
+//! holds the receiver's wake-HMAC key, sealed to its X25519 pubkey
+//! via [`super::push_envelope`] in a sibling slice) can mint a
 //! wake-up payload that the receiver's plugin will accept.
 //!
 //! # Threat model
 //!
 //! * **Receiver** (Mobile app) generates [`WakeHmacKey`] at startup
-//!   и persists it locally.  Wraps the key together с the push
+//!   and persists it locally.  Wraps the key together with the push
 //!   token via [`super::push_envelope`] (sibling slice 4.3.2 wire
 //!   field `wake_hmac_envelope`) so only the chosen push-relay
 //!   can decrypt and use it.
 //!
 //! * **Push-relay** (operator-run) decrypts the wake-HMAC key,
-//!   stores it associated с the receiver's `node_id`, и uses it
-//!   к sign wake-up payloads.  Compromised relay = forged wakeups
+//!   stores it associated with the receiver's `node_id`, and uses it
+//!   to sign wake-up payloads.  Compromised relay = forged wakeups
 //!   (battery DoS); same trust boundary as the existing sealed-
 //!   envelope design.
 //!
-//! * **Attacker** holding а leaked FCM/APNs token but NOT the
-//!   wake-HMAC key cannot forge а valid payload — receiver's
-//!   `verify_wake_payload` rejects the silent push silently, и
+//! * **Attacker** holding a leaked FCM/APNs token but NOT the
+//!   wake-HMAC key cannot forge a valid payload — receiver's
+//!   `verify_wake_payload` rejects the silent push silently, and
 //!   the plugin returns from `handleWakeup` without reconnecting
 //!   the daemon.  Result: zero battery cost, no observable network
 //!   reaction (presence oracle defeated).
 //!
 //! # Wire format
 //!
-//! The HMAC covers а fixed-layout 73-byte canonical preimage:
+//! The HMAC covers a fixed-layout 73-byte canonical preimage:
 //!
 //! ```text
 //! [0..6]     domain b"WAKEv1" — version + domain separator
@@ -41,7 +41,7 @@
 //! [46..78]   receiver_id [u8; 32] — receiver node_id binding
 //! ```
 //!
-//! Output is а 32-byte HMAC-SHA256 tag.  Total wake payload that
+//! Output is a 32-byte HMAC-SHA256 tag.  Total wake payload that
 //! the relay puts into the FCM/APNs body:
 //!
 //! ```text
@@ -50,26 +50,26 @@
 //! [40..72]  hmac [u8; 32]
 //! ```
 //!
-//! 72 bytes < FCM/APNs 4 KiB payload cap с lots of headroom.
+//! 72 bytes < FCM/APNs 4 KiB payload cap with lots of headroom.
 //!
 //! # Replay handling
 //!
-//! `ts` provides а natural freshness window — receivers reject payloads
+//! `ts` provides a natural freshness window — receivers reject payloads
 //! older than [`WAKE_FRESHNESS_SECS`] (currently 5 minutes).  Per-`content_id`
 //! replay caching is the receiver's responsibility (mailbox layer already
 //! tracks delivered content_ids via the existing `MailboxBlob` flow); this
-//! primitive does not maintain а replay set on its own to keep the API
-//! stateless и embedded-friendly.
+//! primitive does not maintain a replay set on its own to keep the API
+//! stateless and embedded-friendly.
 //!
 //! # Why HMAC-SHA256 (not Ed25519)
 //!
-//! Sign-verify with public-key crypto would let receivers verify в
-//! constant time without sharing а key, но requires the relay к hold
-//! а receiver-specific signing key — same secret-distribution shape
-//! as HMAC, with а 50× larger sig (64 vs 32 B) и а CPU-heavy verify
+//! Sign-verify with public-key crypto would let receivers verify in
+//! constant time without sharing a key, but requires the relay to hold
+//! a receiver-specific signing key — same secret-distribution shape
+//! as HMAC, with a 50× larger sig (64 vs 32 B) and a CPU-heavy verify
 //! that runs every silent push (a battery cost that HMAC avoids).
 //! HMAC is the established choice for "push relay confirms it
-//! is authorised к wake this device".
+//! is authorised to wake this device".
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -77,7 +77,7 @@ use zeroize::Zeroize;
 
 /// Domain-separation prefix bound into the HMAC preimage.  Bumping
 /// the version invalidates every previously-published `wake_hmac_envelope`
-/// — only do this on а security-relevant format change.
+/// — only do this on a security-relevant format change.
 pub const WAKE_HMAC_DOMAIN: &[u8; 6] = b"WAKEv1";
 
 /// HMAC-SHA256 tag length (32 bytes).
@@ -87,9 +87,9 @@ pub const WAKE_HMAC_TAG_LEN: usize = 32;
 /// and the existing sealed-envelope key-size cap).
 pub const WAKE_HMAC_KEY_LEN: usize = 32;
 
-/// Maximum age of а wake-payload `ts` before receivers reject it.
+/// Maximum age of a wake-payload `ts` before receivers reject it.
 /// 5 minutes balances clock-skew tolerance (consumer phones often
-/// drift ±60 s) against replay window — а stolen wake payload
+/// drift ±60 s) against replay window — a stolen wake payload
 /// expires before an attacker can systematically replay it.
 pub const WAKE_FRESHNESS_SECS: u64 = 300;
 
@@ -97,25 +97,25 @@ pub const WAKE_FRESHNESS_SECS: u64 = 300;
 pub const WAKE_PAYLOAD_LEN: usize = 8 + 32 + 32;
 
 /// Symmetric wake-up HMAC key.  Receiver generates once per identity
-/// (or rotation epoch), persists locally, и shares with the chosen
+/// (or rotation epoch), persists locally, and shares with the chosen
 /// push-relay via the sealed `wake_hmac_envelope` field on
 /// `RendezvousAd` (sibling slice 4.3.2).
 ///
-/// Implements [`Zeroize`] так that key bytes wipe on drop — leaked
-/// stack frames or core dumps don't preserve the key after а
+/// Implements [`Zeroize`] so that key bytes wipe on drop — leaked
+/// stack frames or core dumps don't preserve the key after a
 /// natural scope exit.
 #[derive(Clone)]
 pub struct WakeHmacKey(pub [u8; WAKE_HMAC_KEY_LEN]);
 
 impl WakeHmacKey {
-    /// Construct from raw bytes.  Caller asserts that `bytes` came от
-    /// а CSPRNG (e.g., `rand_core::OsRng`); this constructor does not
+    /// Construct from raw bytes.  Caller asserts that `bytes` came from
+    /// a CSPRNG (e.g., `rand_core::OsRng`); this constructor does not
     /// perform its own randomness check.
     pub fn from_bytes(bytes: [u8; WAKE_HMAC_KEY_LEN]) -> Self {
         Self(bytes)
     }
 
-    /// Generate а fresh random key using `OsRng`.  Use once per
+    /// Generate a fresh random key using `OsRng`.  Use once per
     /// identity rotation epoch.
     pub fn generate() -> Self {
         use rand_core::{OsRng, RngCore};
@@ -149,7 +149,7 @@ impl std::fmt::Debug for WakeHmacKey {
 
 /// Compute the wake-payload HMAC tag.
 ///
-/// Inputs ара the three observable wake-payload fields (ts, content_id,
+/// Inputs are the three observable wake-payload fields (ts, content_id,
 /// receiver_id); the domain prefix is added internally.  Caller emits
 /// `(ts, content_id, hmac)` over the wire; receiver re-derives
 /// the tag and compares.
@@ -160,7 +160,7 @@ pub fn compute_wake_hmac(
     receiver_id: &[u8; 32],
 ) -> [u8; WAKE_HMAC_TAG_LEN] {
     type HmacSha256 = Hmac<Sha256>;
-    // `new_from_slice` on а valid-length slice от an array does not
+    // `new_from_slice` on a valid-length slice from an array does not
     // fail in practice (HMAC accepts any-length key, the only error is
     // OOM on absurd lengths); but we propagate the documented `expect`
     // pattern that veil-obfs4's NTOR exposes for the same crate.
@@ -177,7 +177,7 @@ pub fn compute_wake_hmac(
 }
 
 /// Encode the receiver-observable wake-payload (`ts || content_id || hmac`)
-/// что the push-relay puts into the FCM/APNs payload body.
+/// that the push-relay puts into the FCM/APNs payload body.
 pub fn encode_wake_payload(
     ts: u64,
     content_id: &[u8; 32],
@@ -193,13 +193,13 @@ pub fn encode_wake_payload(
 /// Outcome of [`verify_wake_payload`].  Distinguishes the three failure
 /// modes the receiver may surface differently:
 ///
-/// * `Valid` — payload accepted; receiver proceeds к full drain.
+/// * `Valid` — payload accepted; receiver proceeds to full drain.
 /// * `TamperedOrForged` — HMAC mismatch; silent drop, no observable
 ///   network reaction.
 /// * `Expired` — `ts` outside the [`WAKE_FRESHNESS_SECS`] window
-///   relative к `now`; silent drop.  Distinguished от tampering так
-///   что the receiver can log а warn-level metric if the rate grows
-///   (suggests а clock-skew or replay attempt).
+///   relative to `now`; silent drop.  Distinguished from tampering so
+///   that the receiver can log a warn-level metric if the rate grows
+///   (suggests a clock-skew or replay attempt).
 /// * `MalformedLength` — input wasn't the expected 72 bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakePayloadVerdict {
@@ -209,11 +209,11 @@ pub enum WakePayloadVerdict {
     MalformedLength { got: usize },
 }
 
-/// Verify а wake payload received via OS push delivery.  Constant-time
+/// Verify a wake payload received via OS push delivery.  Constant-time
 /// HMAC comparison via the underlying [`hmac::Mac::verify_slice`].
 ///
 /// `now` is the receiver's current unix time — caller passes it explicitly
-/// so this stays а pure function (testable, no `SystemTime::now()`
+/// so this stays a pure function (testable, no `SystemTime::now()`
 /// side-effect).
 pub fn verify_wake_payload(
     key: &WakeHmacKey,
@@ -232,8 +232,8 @@ pub fn verify_wake_payload(
     let mut received_tag = [0u8; WAKE_HMAC_TAG_LEN];
     received_tag.copy_from_slice(&payload[40..72]);
 
-    // Freshness check first — а tampered payload с а stale ts is still
-    // tampered, but distinguishing expired-but-valid-shape от forged is
+    // Freshness check first — a tampered payload with a stale ts is still
+    // tampered, but distinguishing expired-but-valid-shape from forged is
     // useful operationally (operators see "clock skew" vs "active forging").
     let abs_skew = now.abs_diff(ts);
     if abs_skew > WAKE_FRESHNESS_SECS {
@@ -385,7 +385,7 @@ mod tests {
         let cid = fixture_content_id();
         let rid = fixture_receiver_id();
         let ts = 1_700_000_000;
-        // Forge with а wrong key — receiver does NOT have an oracle bit
+        // Forge with a wrong key — receiver does NOT have an oracle bit
         // saying "wrong key" vs "wrong content" — only Tampered/Forged.
         let mut wrong_key = [0u8; WAKE_HMAC_KEY_LEN];
         wrong_key[0] = 0xFF;
@@ -404,7 +404,7 @@ mod tests {
         let rid = fixture_receiver_id();
         let ts = 1_700_000_000;
         let tag = compute_wake_hmac(&key, ts, &cid, &rid);
-        // Encode payload с а DIFFERENT ts than the tag was computed for —
+        // Encode payload with a DIFFERENT ts than the tag was computed for —
         // simulates attacker rewriting the ts field of an intercepted payload.
         let mut payload = encode_wake_payload(ts + 1, &cid, &tag);
         // Verify under "now near ts+1" so freshness passes, only HMAC fails.
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_skew_in_either_direction() {
-        // Receiver's clock can drift в either direction relative к the
+        // Receiver's clock can drift in either direction relative to the
         // relay's clock.  The freshness check uses absolute skew so the
         // payload is rejected symmetrically.
         let key = fixture_key();
@@ -508,12 +508,12 @@ mod tests {
 
     #[test]
     fn key_zeroizes_on_drop() {
-        // Construct а key, copy its bytes к а separate buffer, drop the
-        // key, и confirm that scoped reference into the dropped key's
-        // memory does NOT preserve the bytes.  This is а behavioural
+        // Construct a key, copy its bytes to a separate buffer, drop the
+        // key, and confirm that scoped reference into the dropped key's
+        // memory does NOT preserve the bytes.  This is a behavioural
         // test — modern compilers / allocator reuse may overwrite the
         // memory anyway, but at minimum the Zeroize call ensures the
-        // bytes ара wiped at the moment of drop.
+        // bytes are wiped at the moment of drop.
         let bytes = {
             let k = WakeHmacKey::generate();
             let copy = *k.as_bytes();
@@ -522,17 +522,17 @@ mod tests {
         };
         // Without panicking, just confirm we observed real (non-zero)
         // bytes BEFORE drop — generate() uses OsRng so chances of an
-        // all-zero key ара 2^-256.
+        // all-zero key are 2^-256.
         let any_nonzero = bytes.iter().any(|&b| b != 0);
         assert!(
             any_nonzero,
-            "OsRng-generated key должна быть non-zero с overwhelming probability"
+            "OsRng-generated key must be non-zero with overwhelming probability"
         );
     }
 
     #[test]
     fn debug_format_redacts_key_bytes() {
-        // Defence against operators accidentally logging keys in а
+        // Defence against operators accidentally logging keys in a
         // string-formatted struct dump.
         let k = WakeHmacKey::from_bytes([0xAA; WAKE_HMAC_KEY_LEN]);
         let s = format!("{:?}", k);

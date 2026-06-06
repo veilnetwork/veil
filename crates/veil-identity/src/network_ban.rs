@@ -1,13 +1,13 @@
 //! Private-veil-network DHT-replicated ban records.
 //!
-//! In а private network (`[network].mode = "private"`) admins issue
+//! In a private network (`[network].mode = "private"`) admins issue
 //! signed `BanEntry` records that propagate via the DHT. Each member
-//! polls its DHT bucket for entries в the local `network_id`
-//! namespace, verifies them through this module, и applies the bans
+//! polls its DHT bucket for entries in the local `network_id`
+//! namespace, verifies them through this module, and applies the bans
 //! to its local `BanList`. Public-mode nodes never publish or apply
-//! these records — bans stay node-local там.
+//! these records — bans stay node-local there.
 //!
-//! Wire format и struct definition live в `veil-types`
+//! Wire format and struct definition live in `veil-types`
 //! ([`veil_types::BanEntry`]); this module owns the canonical body
 //! encoding + the chained verification logic.
 
@@ -31,10 +31,12 @@ pub enum BanVerifyError {
     AdminCertVerify(#[from] CertVerifyError),
     #[error("admin cert is not flagged admin (cert.admin = false)")]
     NotAdmin,
-    #[error("admin_cert.member_node_id ({cert_hex}) does не match ban admin_node_id ({entry_hex})")]
+    #[error(
+        "admin_cert.member_node_id ({cert_hex}) does not match ban admin_node_id ({entry_hex})"
+    )]
     AdminMismatch { cert_hex: String, entry_hex: String },
     #[error(
-        "admin_pubkey BLAKE3 ({pubkey_hex}) does не match admin cert's member_node_id ({cert_hex})"
+        "admin_pubkey BLAKE3 ({pubkey_hex}) does not match admin cert's member_node_id ({cert_hex})"
     )]
     AdminPubkeyMismatch {
         pubkey_hex: String,
@@ -46,7 +48,7 @@ pub enum BanVerifyError {
     ReasonTooLong { actual: usize, max: usize },
 }
 
-/// Build the canonical byte encoding of а ban entry's signed body.
+/// Build the canonical byte encoding of a ban entry's signed body.
 /// Layout (all big-endian):
 /// ```text
 /// [0]       version (u8)
@@ -55,10 +57,10 @@ pub enum BanVerifyError {
 /// [65..73]  issued_at_unix (u64 BE)
 /// [73..105] admin_node_id (32 bytes)
 /// [105..107] reason_len (u16 BE)
-/// [107..]   reason bytes (UTF-8, может быть пустым)
+/// [107..]   reason bytes (UTF-8, may be empty)
 /// ```
 /// `admin_pubkey` / `admin_cert_blob` / `admin_signature` are NOT in
-/// the signed body — they are carried alongside для verification.
+/// the signed body — they are carried alongside for verification.
 pub fn canonical_ban_body(entry: &BanEntry) -> Vec<u8> {
     let reason_bytes = entry.reason.as_bytes();
     let mut out = Vec::with_capacity(107 + reason_bytes.len());
@@ -76,7 +78,7 @@ pub fn canonical_ban_body(entry: &BanEntry) -> Vec<u8> {
     out
 }
 
-/// Verify а ban entry against the local network's owner pubkey.
+/// Verify a ban entry against the local network's owner pubkey.
 ///
 /// Cheap checks first; cryptographic verifies (cert sig + admin sig)
 /// last. Returns the decoded admin cert on success so callers can
@@ -152,7 +154,7 @@ pub fn verify_ban_entry(
     Ok(admin_cert)
 }
 
-/// Derive the DHT key для а ban record. Layout: BLAKE3(`network_id ||
+/// Derive the DHT key for a ban record. Layout: BLAKE3(`network_id ||
 /// ":bans:" || banned_node_id`). Stable across implementations — same
 /// inputs always produce same key so peers store / retrieve / dedupe
 /// consistently.
@@ -164,16 +166,16 @@ pub fn ban_dht_key(network_id: &[u8; 32], banned_node_id: &[u8; 32]) -> [u8; 32]
     *hasher.finalize().as_bytes()
 }
 
-/// Magic prefix that marks а DHT value as а P-Net ban blob. Receivers
-/// look at the first four bytes к decide whether к route the STORE
-/// payload через the ban-record verifier instead of the standard
+/// Magic prefix that marks a DHT value as a P-Net ban blob. Receivers
+/// look at the first four bytes to decide whether to route the STORE
+/// payload through the ban-record verifier instead of the standard
 /// signed-STORE path.
 pub const BAN_BLOB_MAGIC: &[u8; 4] = b"PBAN";
 
 /// Cap on encoded ban-blob size — defence against malicious peers
-/// flooding the DHT с oversized blobs. 4 KiB is comfortably larger
-/// than а typical Ed25519 blob (~520 bytes signed body) and still small
-/// enough that even а fully-loaded routing table can't exhaust memory.
+/// flooding the DHT with oversized blobs. 4 KiB is comfortably larger
+/// than a typical Ed25519 blob (~520 bytes signed body) and still small
+/// enough that even a fully-loaded routing table can't exhaust memory.
 pub const MAX_BAN_BLOB_SIZE: usize = 4096;
 
 /// Errors returned by [`decode_ban_blob`].
@@ -193,7 +195,7 @@ pub enum BanDecodeError {
     ReasonNotUtf8(String),
 }
 
-/// Encode а `BanEntry` к а DHT-storable blob. Layout (all big-endian):
+/// Encode a `BanEntry` to a DHT-storable blob. Layout (all big-endian):
 /// ```text
 /// [0..4]   PBAN magic (b"PBAN")
 /// [4]      version (u8)
@@ -245,8 +247,8 @@ pub fn encode_ban_blob(entry: &BanEntry) -> Vec<u8> {
     out
 }
 
-/// Decode а blob produced by [`encode_ban_blob`]. Verifies the PBAN
-/// magic, version byte, и field-length budgets but does NOT verify
+/// Decode a blob produced by [`encode_ban_blob`]. Verifies the PBAN
+/// magic, version byte, and field-length budgets but does NOT verify
 /// signatures — callers must run [`verify_ban_entry`] afterwards.
 pub fn decode_ban_blob(blob: &[u8]) -> Result<BanEntry, BanDecodeError> {
     if blob.len() > MAX_BAN_BLOB_SIZE {
@@ -328,8 +330,8 @@ pub fn decode_ban_blob(blob: &[u8]) -> Result<BanEntry, BanDecodeError> {
 }
 
 /// Cheap probe: does this blob start with the PBAN magic? Used by the
-/// DHT layer к route incoming STORE payloads to the P-Net auth gate
-/// без having к decode the full blob upfront.
+/// DHT layer to route incoming STORE payloads to the P-Net auth gate
+/// without having to decode the full blob upfront.
 pub fn is_ban_blob(blob: &[u8]) -> bool {
     blob.len() >= 4 && &blob[0..4] == BAN_BLOB_MAGIC
 }
@@ -442,8 +444,8 @@ mod tests {
         let admin_sk = SigningKey::generate(&mut OsRng);
         let net = [0x11u8; 32];
         let mut ban = make_ban(&owner_sk, &admin_sk, net, [0xBBu8; 32], "abuse");
-        // Replace cert с а non-admin one (re-sign for cert sig
-        // к remain valid; only the admin flag is flipped).
+        // Replace cert with a non-admin one (re-sign for cert sig
+        // to remain valid; only the admin flag is flipped).
         let admin_pk = admin_sk.verifying_key().to_bytes();
         let mut non_admin_cert = sign_admin_cert(&owner_sk, &admin_pk, net);
         non_admin_cert.admin = false;
@@ -459,14 +461,14 @@ mod tests {
 
     #[test]
     fn wrong_admin_pubkey_rejected() {
-        // Admin tries к present someone else's cert.
+        // Admin tries to present someone else's cert.
         let owner_sk = SigningKey::generate(&mut OsRng);
         let owner_pk = owner_sk.verifying_key().to_bytes().to_vec();
         let admin_a = SigningKey::generate(&mut OsRng);
         let admin_b = SigningKey::generate(&mut OsRng);
         let net = [0x11u8; 32];
         let mut ban = make_ban(&owner_sk, &admin_a, net, [0xBBu8; 32], "abuse");
-        // Swap pubkey к admin_b's; cert binding к admin_a remains.
+        // Swap pubkey to admin_b's; cert binding to admin_a remains.
         ban.admin_pubkey = admin_b.verifying_key().to_bytes().to_vec();
         let err = verify_ban_entry(&ban, &net, SignatureAlgorithm::Ed25519, &owner_pk, 5000)
             .expect_err("wrong pubkey");

@@ -63,7 +63,7 @@ futures = "0.3"
 libc = "0.2"
 log = "0.4"
 # Initialised in `cli.rs::main` so `log::*` facade events (used by
-# `try_lookup_or_discover`, dispatcher internals, и many helpers across
+# `try_lookup_or_discover`, dispatcher internals, and many helpers across
 # the workspace) actually reach stderr.  Without it those events were
 # silently dropped.  Audit batch 2026-05-23.
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
@@ -84,10 +84,10 @@ zeroize = "1"
 tikv-jemallocator = "0.6"
 
 # Windows Service mode — `veil-cli service install/uninstall/run`
-# registers the node с the Service Control Manager so it survives reboots
-# и logs к the Windows Event Log.  Non-Windows builds skip this dep entirely.
+# registers the node with the Service Control Manager so it survives reboots
+# and logs to the Windows Event Log.  Non-Windows builds skip this dep entirely.
 # Moved here when veil-cli was extracted into its own crate but the dep
-# stayed behind in veilcore/Cargo.toml, breaking cross-compile к
+# stayed behind in veilcore/Cargo.toml, breaking cross-compile to
 # x86_64-pc-windows-gnu (Linux→Windows CI gate).
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

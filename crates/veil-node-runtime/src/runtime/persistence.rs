@@ -1,10 +1,10 @@
-//! Disk persistence для runtime state — discovered peers и manual bans.
+//! Disk persistence for runtime state — discovered peers and manual bans.
 //!
-//! Both stores live alongside `config.toml` (one file per category) и use
-//! atomic-write semantics so а crash mid-write leaves the previous
+//! Both stores live alongside `config.toml` (one file per category) and use
+//! atomic-write semantics so a crash mid-write leaves the previous
 //! snapshot intact.  Loaders silently no-op when the file is missing
-//! (fresh install) или when JSON deserialization fails (operator edited
-//! и broke it — better к drop the stale snapshot than refuse к start).
+//! (fresh install) or when JSON deserialization fails (operator edited
+//! and broke it — better to drop the stale snapshot than refuse to start).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,7 @@ pub struct DiscoveredPeerSnapshot {
     source: PeerSource,
 }
 
-/// Path для the discovered-peers file, derived от config path.
+/// Path for the discovered-peers file, derived from config path.
 pub fn discovered_peers_path(config_path: &Path) -> PathBuf {
     config_path
         .parent()
@@ -35,10 +35,10 @@ pub fn discovered_peers_path(config_path: &Path) -> PathBuf {
         .join("peers_discovered.json")
 }
 
-/// Persist all non-configured peers from `state.peers` к disk.
+/// Persist all non-configured peers from `state.peers` to disk.
 ///
 /// Wildcard transports (`tcp://0.0.0.0:5555`, `[::]:...`) are stripped at
-/// persist time so а stale snapshot from before the wildcard filters
+/// persist time so a stale snapshot from before the wildcard filters
 /// landed can't poison the next startup [`load_discovered_peers`].
 pub fn persist_discovered_peers(state: &Arc<Mutex<NodeState>>, config_path: &Path) {
     let entries: Vec<DiscoveredPeerSnapshot> = {
@@ -65,7 +65,7 @@ pub fn persist_discovered_peers(state: &Arc<Mutex<NodeState>>, config_path: &Pat
     let _ = veil_util::atomic_write(&path, json.as_bytes());
 }
 
-/// Load previously-discovered peers from disk и spawn outbound connections.
+/// Load previously-discovered peers from disk and spawn outbound connections.
 pub fn load_discovered_peers(
     config_path: &Path,
     state: &Arc<Mutex<NodeState>>,
@@ -97,9 +97,9 @@ pub fn load_discovered_peers(
             continue;
         }
         // Drop stale wildcard snapshots — same defence as the PEX-receive
-        // и PEX-persist filters.  Без этого а snapshot saved before those
-        // filters landed would seed every restart с unreachable
-        // 0.0.0.0:5555 dial targets that self-connect к our own listener.
+        // and PEX-persist filters.  Without this a snapshot saved before those
+        // filters landed would seed every restart with unreachable
+        // 0.0.0.0:5555 dial targets that self-connect to our own listener.
         if is_wildcard_transport(&snap.transport) {
             continue;
         }
@@ -138,7 +138,7 @@ pub fn bans_path(config_path: &Path) -> PathBuf {
         .join("bans.json")
 }
 
-/// Persist manual bans к disk.
+/// Persist manual bans to disk.
 pub fn persist_bans(ban_list: &Arc<Mutex<BanList>>, config_path: &Path) {
     let entries: Vec<BanSnapshot> = {
         let bl = lock!(ban_list);

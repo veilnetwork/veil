@@ -5,9 +5,9 @@
 //!   1. `identity.key_passphrase_prompt = true` → interactive stdin prompt
 //!   2. `VEIL_KEY_PASSPHRASE` env var (wiped after read)
 //!   3. `identity.key_passphrase_file` → owner-only file
-//!   4. `identity.key_passphrase` → inline в config (WARN logged)
+//!   4. `identity.key_passphrase` → inline in config (WARN logged)
 //!
-//! The resolved passphrase is wrapped в [`Zeroizing<String>`] so its heap
+//! The resolved passphrase is wrapped in [`Zeroizing<String>`] so its heap
 //! contents are wiped when the binding goes out of scope. Caller typically:
 //!
 //! ```ignore
@@ -22,13 +22,13 @@
 //!   against backup leak AND local FS reader.
 //! * Source (2) env: protects against config leak; `/proc/PID/environ` is
 //!   readable by same-uid processes BEFORE the daemon `remove_var`s it.
-//! * Source (3) file: protects against config leak if file is on а separate
+//! * Source (3) file: protects against config leak if file is on a separate
 //!   path with restricted ACL (e.g. systemd `LoadCredential=` → ramfs).
 //! * Source (4) inline: zero protection against either leak; documented as
 //!   such, WARN at startup.
 //!
 //! What we don't do (yet): `mlock` against swap-out, `prctl(PR_SET_DUMPABLE,0)`
-//! against core-dump leak, или secure-page allocators. Those are separate
+//! against core-dump leak, or secure-page allocators. Those are separate
 //! defence-in-depth efforts.
 
 #[cfg(test)]
@@ -45,9 +45,9 @@ pub const ENV_VAR_NAME: &str = "VEIL_KEY_PASSPHRASE";
 /// Resolve the ML-KEM key passphrase from the highest-priority configured
 /// source. Returns `Ok(None)` if no source set (plaintext mlkem.key path).
 ///
-/// On error: I/O failure reading а passphrase file, prompt cancellation, or
+/// On error: I/O failure reading a passphrase file, prompt cancellation, or
 /// inconsistent config (none of the security-conscious sources resolved when
-/// they were requested). Caller propagates как `NodeError`.
+/// they were requested). Caller propagates as `NodeError`.
 pub fn resolve_key_passphrase(
     config: &Config,
     logger: &NodeLogger,
@@ -70,11 +70,11 @@ pub fn resolve_key_passphrase(
     }
 
     // 2. Env var. Wipe the env-var slot after read so subsequent fork/exec
-    //    doesn't inherit it. Same-uid /proc/PID/environ window is tiny но
-    //    nonzero — document as а known caveat (see module-level doc).
+    //    doesn't inherit it. Same-uid /proc/PID/environ window is tiny but
+    //    nonzero — document as a known caveat (see module-level doc).
     if let Ok(raw) = std::env::var(ENV_VAR_NAME) {
         // SAFETY: remove_var is unsafe in newer Rust because mutating the
-        // process environment is не thread-safe; we call it during startup
+        // process environment is not thread-safe; we call it during startup
         // before tokio runtime spawns any task, so no other thread reads env.
         unsafe {
             std::env::remove_var(ENV_VAR_NAME);
@@ -92,7 +92,7 @@ pub fn resolve_key_passphrase(
     if let Some(path) = &identity.key_passphrase_file {
         let raw = std::fs::read_to_string(path).map_err(|e| {
             NodeError::InvalidArgument(format!(
-                "failed к read key_passphrase_file {}: {e}",
+                "failed to read key_passphrase_file {}: {e}",
                 path.display()
             ))
         })?;
@@ -144,7 +144,7 @@ pub fn resolve_key_passphrase(
     Ok(None)
 }
 
-/// Test-only helper: read passphrase from а supplied reader instead of stdin.
+/// Test-only helper: read passphrase from a supplied reader instead of stdin.
 /// Mirrors the prompt path but uses any `BufRead` impl, so unit tests can
 /// pipe known input. Not exposed outside tests.
 #[cfg(test)]

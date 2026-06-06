@@ -2,11 +2,11 @@
 //!
 //! Two distinct service surfaces live here:
 //!
-//! * [`GatewayList`] — node-side aggregator що picks the best upstream
+//! * [`GatewayList`] — node-side aggregator that picks the best upstream
 //!   gateway peer (this file).
-//! * [`service::GatewayService`] — Core-node-side service що handles
-//!   incoming `ATTACH` / `DETACH` / `KEEPALIVE` от leaves (Phase 3 prep,
-//!   moved от `veilcore::node::gateway`).
+//! * [`service::GatewayService`] — Core-node-side service that handles
+//!   incoming `ATTACH` / `DETACH` / `KEEPALIVE` from leaves (Phase 3 prep,
+//!   moved from `veilcore::node::gateway`).
 //!
 //! Modules:
 

@@ -110,16 +110,16 @@ pub const MIN_T_COST: u32 = 1;
 pub const MIN_P_COST: u8 = 1;
 
 /// Maximum KDF parameters accepted on decode.
-/// Without an upper bound, an attacker-published invite с `m_cost_kib =
-/// u32::MAX` would ask `Argon2::new` к allocate 4 TiB on the victim
+/// Without an upper bound, an attacker-published invite with `m_cost_kib =
+/// u32::MAX` would ask `Argon2::new` to allocate 4 TiB on the victim
 /// machine when user pastes the URL — guaranteed OOM kill.
 ///
 /// Caps:
 /// * `MAX_M_COST_KIB = 1 GiB` — well above legit `DEFAULT_M_COST_KIB`
-///   (32 MiB) с slack для high-security operator preset; below the
+///   (32 MiB) with slack for high-security operator preset; below the
 ///   typical mobile RAM budget so worst-case Argon2 alloc is bounded.
-/// * `MAX_T_COST = 64` — legit caps типично 2-8; 64 leaves room для
-///   а 32× security upgrade без enabling 30-second per-decode CPU.
+/// * `MAX_T_COST = 64` — legit caps are typically 2-8; 64 leaves room for
+///   a 32× security upgrade without enabling 30-second per-decode CPU.
 /// * `MAX_P_COST = 16` — single device cores rarely benefit past 4-8;
 ///   16 covers high-end mobile / desktop.
 pub const MAX_M_COST_KIB: u32 = 1024 * 1024;
@@ -238,8 +238,8 @@ pub fn decrypt_invite(url: &str, password: &str) -> Result<BootstrapPeer, Encryp
         .map_err(|e| EncryptedInviteError::Base64(e.to_string()))?;
 
     let (m_cost_kib, t_cost, p_cost, salt, nonce, ciphertext) = decode_body(&body)?;
-    // lower-and-upper bound на attacker-supplied KDF params.
-    // Без upper bound an invite с `m_cost = u32::MAX` triggers 4 TiB OOM on paste.
+    // lower-and-upper bound on attacker-supplied KDF params.
+    // Without upper bound an invite with `m_cost = u32::MAX` triggers 4 TiB OOM on paste.
     if m_cost_kib < MIN_M_COST_KIB
         || t_cost < MIN_T_COST
         || p_cost < MIN_P_COST

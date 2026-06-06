@@ -352,9 +352,9 @@ final int Function(
 
 /// `_zeroize_with_password` variant — same contract as
 /// [veilRestoreIdentityFromPhraseZeroize] plus an optional
-/// passphrase that, if non-NULL, makes the daemon write а
+/// passphrase that, if non-NULL, makes the daemon write a
 /// passphrase-encrypted `master.enc` backup alongside the identity
-/// document.  Both phrase AND password buffers ара zeroed in place
+/// document.  Both phrase AND password buffers are zeroed in place
 /// before return (Argon2id 64 MiB defaults — production tier).
 final int Function(
   Pointer<Utf8>, // phrase (writable)
@@ -516,7 +516,7 @@ final int Function(
   Pointer<VeilHandle>,
   Pointer<Utf8>, // password (nullable)
   Pointer<Uint8>, // out_status
-  Pointer<Pointer<Utf8>>, // out_uri (malloc'd UTF-8 — caller frees с veil_free_string)
+  Pointer<Pointer<Utf8>>, // out_uri (malloc'd UTF-8 — caller frees with veil_free_string)
   Pointer<Pointer<Utf8>>, // err_out
 ) veilCreateBootstrapInvite = nativeLib
     .lookup<
@@ -649,9 +649,9 @@ final int Function(
             )>>('veil_mailbox_put_with_capability')
     .asFunction();
 
-// PUT variant carrying а sealed wake-HMAC envelope alongside the push
+// PUT variant carrying a sealed wake-HMAC envelope alongside the push
 // envelope + capability token (push wake-HMAC end-to-end).  The relay
-// stamps the wake_hmac_envelope into the wake-push it fires к the
+// stamps the wake_hmac_envelope into the wake-push it fires to the
 // receiver so the device can authenticate the wake before doing any
 // observable work.  Same status/`out_evicted`/err contract as the other
 // PUT variants; returns ≥0 status byte or <0 VEIL_ERR.
@@ -691,7 +691,7 @@ final int Function(
             )>>('veil_mailbox_put_with_wake_hmac')
     .asFunction();
 
-// Look up the rendezvous replicas advertised for а receiver.  Daemon
+// Look up the rendezvous replicas advertised for a receiver.  Daemon
 // allocates `*out_buf` (length-prefixed; layout documented in
 // `mailbox.dart::lookupRendezvousReplicas`) — caller MUST release it via
 // [veilFreeReplicaBuf].  Returns 0 on OK; <0 VEIL_ERR otherwise.
@@ -715,7 +715,7 @@ final int Function(
             )>>('veil_lookup_rendezvous_replicas')
     .asFunction();
 
-/// Release а replica buffer returned by [veilLookupRendezvousReplicas].
+/// Release a replica buffer returned by [veilLookupRendezvousReplicas].
 /// Both `ptr` AND `len` are required (matches the C ABI — daemon needs the
 /// length to reconstruct the boxed slice for deallocation).
 final void Function(Pointer<Uint8>, int) veilFreeReplicaBuf = nativeLib
@@ -848,18 +848,18 @@ final void Function(Pointer<VeilStreamFfi>) veilStreamClose = nativeLib
 
 // ── NativeFinalizer pointers ─────────────────────────────────────────────────
 //
-// NativeFinalizer attaches а C-callable cleanup function к а Dart object;
+// NativeFinalizer attaches a C-callable cleanup function to a Dart object;
 // the function fires once the Dart object becomes garbage-collected
-// WITHOUT а prior explicit `close()` call.  Acts as а safety-net против
-// forgotten-close leaks (every leaked handle keeps а tokio runtime + an
+// WITHOUT a prior explicit `close()` call.  Acts as a safety-net against
+// forgotten-close leaks (every leaked handle keeps a tokio runtime + an
 // Arc-counted bundle alive).
 //
-// NativeFinalizer wants а `Pointer<NativeFunction<Void Function(Pointer<Void>)>>`
-// — а type-erased pointer-к-function-of-pointer.  The C functions
+// NativeFinalizer wants a `Pointer<NativeFunction<Void Function(Pointer<Void>)>>`
+// — a type-erased pointer-to-function-of-pointer.  The C functions
 // `veil_close`, `veil_app_close`, `veil_stream_close` all match
 // this calling convention (one opaque-pointer arg, void return) so we
-// can look them up under the generic signature.  С-side double-free
-// guards mean а concurrent explicit close + GC finalizer is safe.
+// can look them up under the generic signature.  C-side double-free
+// guards mean a concurrent explicit close + GC finalizer is safe.
 
 final Pointer<NativeFunction<Void Function(Pointer<Void>)>>
     veilCloseFinalizerPtr = nativeLib
@@ -879,7 +879,7 @@ final Pointer<NativeFunction<Void Function(Pointer<Void>)>>
 
 // ── Multi-device pairing (Epic 489.8) ───────────────────────────────────────
 
-// Source-side status codes (mirror VEIL_PAIR_SOURCE_* в veilclient-ffi).
+// Source-side status codes (mirror VEIL_PAIR_SOURCE_* in veilclient-ffi).
 const int veilPairSourceOk = 0;
 const int veilPairSourceNotConfigured = 1;
 const int veilPairSourceAlreadyInProgress = 2;
@@ -899,7 +899,7 @@ const int veilPairTargetWrongState = 5;
 const int veilPairTargetInternalError = 6;
 
 /// Max ceremony frame size (64 KiB) — recommended caller buffer size
-/// для Hello / Cert / Confirm byte transfers.
+/// for Hello / Cert / Confirm byte transfers.
 const int veilMaxPairCeremonyBytes = 64 * 1024;
 
 /// OOB code length (6 ASCII digits).

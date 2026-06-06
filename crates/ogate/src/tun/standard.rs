@@ -107,8 +107,8 @@ impl Device {
     }
 
     /// Split into independent reader / writer halves via `tokio::io::split`.
-    /// MTU is passed к the reader so each TUN read allocates exactly
-    /// `mtu + headroom` bytes instead of а fixed 64 KiB.
+    /// MTU is passed to the reader so each TUN read allocates exactly
+    /// `mtu + headroom` bytes instead of a fixed 64 KiB.
     pub fn split(self) -> (Reader, Writer) {
         let (r, w) = tokio::io::split(self.dev);
         let read_size = self.mtu as usize + READ_HEADROOM;
@@ -123,9 +123,9 @@ impl Device {
 }
 
 /// Extra bytes allocated above the configured MTU per TUN read.  Covers
-/// possible IPv6 extension-header growth, kernel pad, и future MTU
+/// possible IPv6 extension-header growth, kernel pad, and future MTU
 /// raise-without-restart races.  256 bytes is a single TLB line on most
-/// archs так overhead is negligible.
+/// archs so overhead is negligible.
 const READ_HEADROOM: usize = 256;
 
 /// macOS utun prepends a 4-byte address-family header (big-endian) to every
@@ -143,7 +143,7 @@ const MACOS_UTUN_PI_AF_INET6: [u8; 4] = [0, 0, 0, 30];
 pub struct Reader {
     inner: ReadHalf<tun::AsyncDevice>,
     /// Per-read buffer size: `mtu + READ_HEADROOM`.  Replaces the old
-    /// fixed 64 KiB `vec![0u8; 65_535]`, which для MTU 16 000 wasted ~50 KiB
+    /// fixed 64 KiB `vec![0u8; 65_535]`, which for MTU 16 000 wasted ~50 KiB
     /// of zero-fill per packet.
     read_size: usize,
 }
@@ -152,14 +152,14 @@ impl Reader {
     /// Read the next IP packet from the device.
     ///
     /// Allocates `mtu + headroom` per read (vs. the prior fixed 64 KiB
-    /// `vec![0u8; 65_535]`) и uses `read_buf` to elide the zero-fill —
+    /// `vec![0u8; 65_535]`) and uses `read_buf` to elide the zero-fill —
     /// kernel writes exactly `n` valid bytes; the uninit tail beyond `n`
     /// is dropped by `truncate(n)` before the Vec leaves the function.
     pub async fn read_packet(&mut self) -> std::io::Result<Vec<u8>> {
         self.read_packet_with_prefix(0).await
     }
 
-    /// Read the next IP packet into а Vec that has `prefix` zero-filled bytes
+    /// Read the next IP packet into a Vec that has `prefix` zero-filled bytes
     /// reserved at the start.  Returned layout:
     /// ```text
     ///   [0..prefix]            zero-filled — caller overwrites these later
@@ -169,10 +169,10 @@ impl Reader {
     /// `prefix + n` is dropped via `truncate`.  The returned `Vec` is fully
     /// initialised — no caller can observe uninitialised heap bytes.
     ///
-    /// Use this on hot paths где the consumer (e.g. SDK
-    /// `send_prepared_app_ipc_send`) wants к prepend an IPC frame header
-    /// без copying the data: caller writes into `[0..prefix]` in place,
-    /// then forwards the full Vec к the writer task — zero memcopies of
+    /// Use this on hot paths where the consumer (e.g. SDK
+    /// `send_prepared_app_ipc_send`) wants to prepend an IPC frame header
+    /// without copying the data: caller writes into `[0..prefix]` in place,
+    /// then forwards the full Vec to the writer task — zero memcopies of
     /// the IP-packet body.
     pub async fn read_packet_with_prefix(&mut self, prefix: usize) -> std::io::Result<Vec<u8>> {
         let cap = prefix + self.read_size;

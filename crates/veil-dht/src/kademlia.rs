@@ -91,22 +91,22 @@ pub enum KademliaError {
     /// DHT key. Distinct from `UnsignedStoreRejected` (no sig at
     /// all) — this means a sig was supplied but doesn't verify.
     InvalidSignature,
-    /// STORE carried а P-Net `PBAN` magic prefix but the configured
+    /// STORE carried a P-Net `PBAN` magic prefix but the configured
     /// `NetworkAuthGate` rejected it (decode failure, wrong network,
     /// invalid chain-of-trust signature, or key ≠ derived ban-DHT key).
     /// Distinct from `InvalidSignature` so the receiver side can spot
     /// ban-record attacks separately from generic Ed25519 STORE abuse.
-    /// Also returned when а PBAN-prefixed STORE arrives but no auth gate
+    /// Also returned when a PBAN-prefixed STORE arrives but no auth gate
     /// is wired (public-mode node should not receive these).
     InvalidNetworkRecord,
     /// STORE rejected: the originating signer is already holding more
     /// bytes than the configured `[dht] per_origin_max_bytes` cap allows
-    /// (Этап 11e).  Possible attack indicator — а single signer trying
+    /// (Phase 11e).  Possible attack indicator — a single signer trying
     /// to occupy more storage than the per-origin budget permits.  Honest
-    /// signers normally hold а handful of records (NameClaim +
-    /// IdentityDocument + а small fan-out of AppEndpointEntry), so
+    /// signers normally hold a handful of records (NameClaim +
+    /// IdentityDocument + a small fan-out of AppEndpointEntry), so
     /// hitting this cap reliably means the signer is misbehaving.  Cap
-    /// is enforced locally — а peer that hits the cap on one node can
+    /// is enforced locally — a peer that hits the cap on one node can
     /// still place records on other nodes whose limits are higher.
     PerOriginByteCapExceeded,
 }
@@ -138,7 +138,7 @@ impl std::fmt::Display for KademliaError {
             ),
             Self::InvalidNetworkRecord => write!(
                 f,
-                "STORE rejected: P-Net ban record failed gate verification (или no gate wired)"
+                "STORE rejected: P-Net ban record failed gate verification (or no gate wired)"
             ),
             Self::PerOriginByteCapExceeded => write!(
                 f,
@@ -148,19 +148,19 @@ impl std::fmt::Display for KademliaError {
     }
 }
 
-/// One-shot deprecation warning emitted the first time а STORE is
+/// One-shot deprecation warning emitted the first time a STORE is
 /// accepted via the legacy `allow_unsigned_store = true` path.  Logged
 /// at `warn` so operators see it in normal cleanup-tick noise; subsequent
 /// unsigned STOREs are silent to avoid log spam.  Migration plan: once
-/// inner-sig deployments transition к explicit STORE-level signatures
-/// the default for `allow_unsigned_store` will flip к `false`.
+/// inner-sig deployments transition to explicit STORE-level signatures
+/// the default for `allow_unsigned_store` will flip to `false`.
 fn warn_unsigned_store_once() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
         log::warn!(
             "[dht] accepted unsigned STORE via allow_unsigned_store=true (legacy path) — \
-             plan migration to signed STOREs; see docs/OPERATIONS.md → 'Этап 11e migration'"
+             plan migration to signed STOREs; see docs/OPERATIONS.md → 'Phase 11e migration'"
         );
     }
 }
@@ -194,10 +194,10 @@ pub struct KademliaService {
     /// cache so a warm entry from one DHT-walk benefits subsequent walks.
     /// The maintenance task calls `evict_stale` on it periodically.
     transport_cache: Arc<Mutex<super::transport_cache::TransportCache>>,
-    /// per-node bounded LRU cache для FIND_NODE iterative
-    /// results. Cold lookup at trillion scale ≈ 4 секунды (O(log N)
+    /// per-node bounded LRU cache for FIND_NODE iterative
+    /// results. Cold lookup at trillion scale ≈ 4 seconds (O(log N)
     /// round-trips × per-hop RTT); cache hit ≈ 0. Critical for
-    /// interactive UX когда same target is queried repeatedly (e.g.
+    /// interactive UX when same target is queried repeatedly (e.g.
     /// popular relay's `relay_directory_dht_key`).
     /// Bounded LRU with TTL — see [`super::lookup_cache::LookupCache`].
     lookup_cache: Arc<Mutex<super::lookup_cache::LookupCache>>,
@@ -228,10 +228,10 @@ pub struct KademliaService {
     network_auth_gate: Option<Arc<dyn super::traits::NetworkAuthGate>>,
 }
 
-/// backlog: optional source material для re-minting the
+/// backlog: optional source material for re-minting the
 /// local node's `AnnounceTransport`. `Some((sk, transport_uri))`
 /// when the runtime threaded the identity SK + transport URI in;
-/// `None` otherwise (no re-mint task wired). Wrapped в Arc<Mutex>
+/// `None` otherwise (no re-mint task wired). Wrapped in Arc<Mutex>
 /// so the maintenance tick can read without contending on the main
 /// kademlia state lock.
 type LocalAnnouncementSource = Arc<Mutex<Option<(Arc<ed25519_dalek::SigningKey>, String)>>>;
@@ -336,8 +336,8 @@ impl KademliaInner {
         self.store.put(key, value);
     }
 
-    /// Insert or overwrite а key from а wire-level STORE, carrying the
-    /// originating signer id (Этап 11e).  Returns `true` on accept,
+    /// Insert or overwrite a key from a wire-level STORE, carrying the
+    /// originating signer id (Phase 11e).  Returns `true` on accept,
     /// `false` if refused by the per-origin byte cap.
     fn store_insert_with_origin(
         &mut self,
@@ -405,7 +405,7 @@ impl KademliaService {
     /// Wire the P-Net authentication gate. Call once at startup if
     /// `[network].mode = "private"`. Cloning is cheap (`Arc<dyn …>`);
     /// the gate's `verify_ban_record` runs on every STORE whose value
-    /// begins с `PBAN`.
+    /// begins with `PBAN`.
     pub fn set_network_auth_gate(&mut self, gate: Arc<dyn super::traits::NetworkAuthGate>) {
         self.network_auth_gate = Some(gate);
     }
@@ -432,8 +432,8 @@ impl KademliaService {
         Arc::clone(&self.transport_cache)
     }
 
-    /// metrics-only accessors для the heap-resident DHT
-    /// substructures. Operators watch these к correlate RSS с logical
+    /// metrics-only accessors for the heap-resident DHT
+    /// substructures. Operators watch these to correlate RSS with logical
     /// growth of the DHT state machine. Cheap O(1) locks.
     pub fn store_len(&self) -> usize {
         lock!(self.inner).store.len()
@@ -888,12 +888,12 @@ impl KademliaService {
                 return Err(KademliaError::NotInLocalShard);
             }
         }
-        // P-Net ban-record fast path. Values that start с the `PBAN`
-        // magic prefix are routed к the configured `NetworkAuthGate`
+        // P-Net ban-record fast path. Values that start with the `PBAN`
+        // magic prefix are routed to the configured `NetworkAuthGate`
         // instead of the standard Ed25519 signed-STORE check. The gate
         // owns full chain-of-trust verification (cert sig + admin sig +
         // key derives of ban target). Public-mode nodes leave the gate
-        // unset, в which case PBAN-prefixed STOREs are rejected.
+        // unset, in which case PBAN-prefixed STOREs are rejected.
         if payload.value.len() >= 4 && &payload.value[..4] == b"PBAN" {
             let Some(gate) = self.network_auth_gate.as_ref() else {
                 return Err(KademliaError::InvalidNetworkRecord);
@@ -909,7 +909,7 @@ impl KademliaService {
             return Ok(());
         }
         // signed-STORE enforcement.  `origin` selects the per-origin
-        // accounting bucket (Этап 11e) — signed STOREs use the signer
+        // accounting bucket (Phase 11e) — signed STOREs use the signer
         // pubkey, legacy unsigned STOREs share the `ORIGIN_UNSIGNED`
         // bucket.
         let origin = match (
@@ -926,10 +926,10 @@ impl KademliaService {
                 if !self.dht_config.allow_unsigned_store {
                     return Err(KademliaError::UnsignedStoreRejected);
                 }
-                // Dev/test/legacy fixture path — log а deprecation hint
+                // Dev/test/legacy fixture path — log a deprecation hint
                 // once per process so operators running with the legacy
-                // inner-sig deployment pattern know they should plan а
-                // migration к explicit STORE-level signatures.
+                // inner-sig deployment pattern know they should plan a
+                // migration to explicit STORE-level signatures.
                 warn_unsigned_store_once();
                 super::store::ORIGIN_UNSIGNED
             }
@@ -1033,11 +1033,11 @@ impl KademliaService {
         inner.store.get(key).cloned()
     }
 
-    /// Like [`Self::get_local`] но also returns the value's hot-tier
+    /// Like [`Self::get_local`] but also returns the value's hot-tier
     /// `inserted_at` timestamp.  Audit batch 2026-05-25 phase N: used
-    /// by anycast resolve to enforce per-record TTL без а wire-format
+    /// by anycast resolve to enforce per-record TTL without a wire-format
     /// extension — caller computes `now.duration_since(inserted_at)`
-    /// и compares к the record-level `ttl` field carried inside the
+    /// and compares to the record-level `ttl` field carried inside the
     /// stored value.
     pub fn get_local_with_meta(&self, key: &[u8; 32]) -> Option<(Vec<u8>, std::time::Instant)> {
         if let Some(m) = &self.metrics {
@@ -1599,12 +1599,12 @@ impl KademliaService {
     /// Returns the number of STORE frames successfully queued for transmission to
     /// remote peers (NOT including the local store). Returns 0 when the lookup
     /// produced no remote contacts (DHT is partitioned / single-node). Used by the
-    /// periodic re-replication task для observability — а sustained fan-out count
-    /// well below `DHT_REPLICATION_K` indicates either а partitioned routing table
+    /// periodic re-replication task for observability — a sustained fan-out count
+    /// well below `DHT_REPLICATION_K` indicates either a partitioned routing table
     /// OR persistent unreachable closest-peers, both of which warrant operator
     /// attention. Note: success here means "frame queued on the outbox", not
     /// "STORE acknowledged by the receiver" — the design is fire-and-forget by
-    /// нrequirement (acks would slow re-publish to RTT × K and create а DoS
+    /// requirement (acks would slow re-publish to RTT × K and create a DoS
     /// amplifier on slow peers).
     pub async fn store_replicated(
         &self,
@@ -1646,7 +1646,7 @@ impl KademliaService {
             // Fire-and-forget: drop the response channel (we don't wait for an ack).
             // `send_request` returns Some(receiver) when the frame was accepted
             // onto the outbox; None when there is no live session for the peer
-            // и the replica is genuinely lost on this round.
+            // and the replica is genuinely lost on this round.
             if outbox
                 .send_request(contact.node_id, request_id, frame)
                 .is_some()

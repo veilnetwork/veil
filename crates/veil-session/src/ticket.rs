@@ -48,25 +48,25 @@ pub const MAX_CONSUMED_TICKETS: usize = 8192;
 /// new tickets; both the current and previous key can decrypt received tickets
 /// (to handle the transition window).
 ///
-/// # Memory hygiene (Этап 6 slice 6e)
+/// # Memory hygiene (Phase 6 slice 6e)
 ///
 /// Backed by [`SensitiveBytesN<32>`] — heap pages pinned via `mlock(2)`
-/// when `RLIMIT_MEMLOCK` permits, falls back к а zeroize-on-drop
+/// when `RLIMIT_MEMLOCK` permits, falls back to a zeroize-on-drop
 /// `Zeroizing<Vec<u8>>` when the budget is exhausted (same protection
-/// as the pre-Этап-6 `[u8; 32]` field).  The mlocked path closes the
-/// swap-к-disk vector: this is а **process-lifetime** key, so if pages
+/// as the pre-Phase-6 `[u8; 32]` field).  The mlocked path closes the
+/// swap-to-disk vector: this is a **process-lifetime** key, so if pages
 /// holding it get evicted to swap, every issued session-resumption
-/// ticket up к the next rotation is decryptable by anyone with read
-/// access к the swap partition.  Pinning matters here more than for
+/// ticket up to the next rotation is decryptable by anyone with read
+/// access to the swap partition.  Pinning matters here more than for
 /// any other key in the system.
 ///
 /// `Drop` semantics are inherited from `SensitiveBytesN<32>`'s inner
-/// `SensitiveBytes` enum (both `Mlocked(MlockedBytes)` и
+/// `SensitiveBytes` enum (both `Mlocked(MlockedBytes)` and
 /// `Unlocked(Zeroizing<Vec<u8>>)` zeroize on drop).  `Clone` was
-/// previously available но never called в production code — removed
-/// here because cloning а mlocked key would require а second mlock
+/// previously available but never called in production code — removed
+/// here because cloning a mlocked key would require a second mlock
 /// allocation, doubling the budget cost AND defeating the
-/// single-ownership invariant что the rest of the system relies on.
+/// single-ownership invariant that the rest of the system relies on.
 /// Rotation can use ownership transfer (move old → previous, generate
 /// new) instead of cloning.
 pub struct TicketKey {
@@ -88,10 +88,10 @@ impl TicketKey {
         }
     }
 
-    /// Whether the underlying key bytes ара actually pinned via
-    /// `mlock(2)`.  Test/diagnostic hook — operators can surface а
-    /// Prometheus gauge using this к detect soft degradation в
-    /// `RLIMIT_MEMLOCK`-exhausted environments (containers без
+    /// Whether the underlying key bytes are actually pinned via
+    /// `mlock(2)`.  Test/diagnostic hook — operators can surface a
+    /// Prometheus gauge using this to detect soft degradation in
+    /// `RLIMIT_MEMLOCK`-exhausted environments (containers without
     /// `CAP_IPC_LOCK`, low-ulimit dev boxes).  Production code should
     /// not branch on this; both variants honour the same AEAD contract.
     pub fn is_mlocked(&self) -> bool {
@@ -150,21 +150,21 @@ impl TicketIssuer {
     ///
     /// # Test-only access (audit 2026-05-22)
     ///
-    /// **Threat что this gate prevents**: when two sovereign instances
+    /// **Threat that this gate prevents**: when two sovereign instances
     /// of the same identity both call `issue` concurrently they receive
-    /// tickets с identical plaintext (зависит от sym tx/rx keys derived
-    /// от identical handshake outputs); если both instances resume в
-    /// parallel, server side activates two sessions с the same
+    /// tickets with identical plaintext (depend on sym tx/rx keys derived
+    /// from identical handshake outputs); if both instances resume in
+    /// parallel, server side activates two sessions with the same
     /// `(tx_key, rx_key)`, both restarting AEAD nonce-counter at 0 →
     /// nonce reuse → AEAD plaintext recovery via ciphertext XOR.
     ///
-    /// The fn is gated к `#[cfg(test)]` so production callers cannot
-    /// reach it через а typo или а new migration that forgets к pass
+    /// The fn is gated to `#[cfg(test)]` so production callers cannot
+    /// reach it through a typo or a new migration that forgets to pass
     /// `peer_instance_id`.  Production uses [`Self::issue_for_instance`]
-    /// exclusively.  Re-gating это к а production-callable shim requires
-    /// either (а) shipping the multi-instance metadata propagation slice
-    /// для sovereign-identity (handshake carries peer device/instance ID)
-    /// OR (b) deriving instance-distinct session keys в the handshake KDF
+    /// exclusively.  Re-gating this to a production-callable shim requires
+    /// either (a) shipping the multi-instance metadata propagation slice
+    /// for sovereign-identity (handshake carries peer device/instance ID)
+    /// OR (b) deriving instance-distinct session keys in the handshake KDF
     /// so identical-instance plaintexts produce non-colliding nonces.
     #[cfg(test)]
     pub fn issue(
@@ -190,9 +190,9 @@ impl TicketIssuer {
         tx_key: [u8; 32],
         rx_key: [u8; 32],
     ) -> EncryptedTicket {
-        // H9 ergonomic accept: take `impl Into<NodeId>` so tests с raw
-        // `[u8; 32]` literals и production callers с `NodeId` both work
-        // без explicit conversion at the call site.
+        // H9 ergonomic accept: take `impl Into<NodeId>` so tests with raw
+        // `[u8; 32]` literals and production callers with `NodeId` both work
+        // without explicit conversion at the call site.
         let peer_id: NodeId = peer_id.into();
         let now = unix_now_secs();
         let ticket = SessionTicket {
@@ -272,7 +272,7 @@ impl TicketIssuer {
         // future is impossible under correct clocks; under rewind it
         // surfaces the inconsistency, so we reject. Tolerate up to the
         // **Interactive tier** skew (NTP convergence + VM pause/resume +
-        // one retry) — pinned к central policy
+        // one retry) — pinned to central policy
         // [`veil_proto::time_validity::INTERACTIVE_SKEW_SECS`].
         const MAX_TICKET_FUTURE_SKEW_SECS: u64 = veil_proto::time_validity::INTERACTIVE_SKEW_SECS;
         if ticket.issued_at > now.saturating_add(MAX_TICKET_FUTURE_SKEW_SECS) {
@@ -325,8 +325,8 @@ impl TicketIssuer {
     /// number of currently-tracked consumed
     /// tickets. audit cleanup: made
     /// `#[cfg(test)]` since no production caller exists. When
-    /// observability wires this into а Prometheus counter в the
-    /// future, drop the cfg AND add the wire-up в the same commit so
+    /// observability wires this into a Prometheus counter in the
+    /// future, drop the cfg AND add the wire-up in the same commit so
     /// the production-compile signal goes live, not silently dead.
     pub fn consumed_tickets_len(&self) -> usize {
         self.consumed_tickets.lock().map(|g| g.len()).unwrap_or(0)
@@ -567,10 +567,10 @@ mod tests {
         );
     }
 
-    // ── Этап 6 slice 6e: SensitiveBytesN<32> migration verification ────
+    // ── Phase 6 slice 6e: SensitiveBytesN<32> migration verification ────
 
     /// AEAD round-trip works identically after migrating from
-    /// `[u8; 32]` к `SensitiveBytesN<32>` storage — proves the key
+    /// `[u8; 32]` to `SensitiveBytesN<32>` storage — proves the key
     /// bytes flow correctly through `SensitiveBytesN::from_bytes` →
     /// `as_array()` → `ChaCha20Poly1305`.
     #[test]
@@ -590,12 +590,12 @@ mod tests {
 
     /// `is_mlocked()` diagnostic accessor reports the underlying
     /// `SensitiveBytesN<32>` variant.  Test only verifies the boolean
-    /// reflects реальную variant chosen — both branches ара valid
-    /// outcomes (CI с CAP_IPC_LOCK dropped lands в the fallback path).
+    /// reflects the actual variant chosen — both branches are valid
+    /// outcomes (CI with CAP_IPC_LOCK dropped lands in the fallback path).
     #[test]
     fn etap6_slice6e_is_mlocked_reflects_variant() {
         let key = TicketKey::generate();
-        // Boolean must round-trip stable across calls; no assertion на
+        // Boolean must round-trip stable across calls; no assertion on
         // which variant was chosen.
         assert_eq!(key.is_mlocked(), key.is_mlocked());
     }

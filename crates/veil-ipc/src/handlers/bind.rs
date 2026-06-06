@@ -1,8 +1,8 @@
-//! `APP_BIND` handler — register а new (namespace, name) → endpoint mapping.
+//! `APP_BIND` handler — register a new (namespace, name) → endpoint mapping.
 //!
 //! Handles malformed-payload protection (cap-counted decode failures),
 //! per-connection endpoint quota, sovereign vs ephemeral `app_id` derivation,
-//! per-app socket marker creation, и success/error reply framing.
+//! per-app socket marker creation, and success/error reply framing.
 
 use std::path::{Path, PathBuf};
 
@@ -27,8 +27,8 @@ pub(crate) async fn handle_bind(
     let bind = match AppBindPayload::decode(body) {
         Ok(b) => b,
         Err(_) => {
-            // Cap bind decode-failures per IPC client — а buggy or hostile
-            // local app should not be able к spam unbounded malformed
+            // Cap bind decode-failures per IPC client — a buggy or hostile
+            // local app should not be able to spam unbounded malformed
             // APP_BIND frames.
             client_state.record_bind_decode_failure();
             let err = AppBindErrPayload {
@@ -66,7 +66,7 @@ pub(crate) async fn handle_bind(
         .await;
     }
 
-    // Cap endpoints per IPC client к prevent local resource exhaustion.
+    // Cap endpoints per IPC client to prevent local resource exhaustion.
     if client_state.endpoint_count() >= veil_proto::budget::MAX_IPC_ENDPOINTS_PER_CLIENT {
         let err = AppBindErrPayload {
             error_code: ipc_bind_err::RESOURCE_LIMIT,
@@ -111,14 +111,14 @@ pub(crate) async fn handle_bind(
         veil_app::address::app_id(node_id, namespace, name)
     };
 
-    // Phase E22 (2026-05-22): bumped от 64 к 4096 для match `[session]
-    // tx_queue_depth` default sized для 2 Gbps per peer baseline.  At
-    // 64 the receiver-side `app_msg_channel_full_total` climbed к 9 K
+    // Phase E22 (2026-05-22): bumped from 64 to 4096 for match `[session]
+    // tx_queue_depth` default sized for 2 Gbps per peer baseline.  At
+    // 64 the receiver-side `app_msg_channel_full_total` climbed to 9 K
     // drops/12 s under iperf load through ogate, capping throughput at
     // ~100 Mbps despite all other limits unblocked.
     match app_registry.try_register(app_id, bind.endpoint_id, 4096) {
         Ok((handle, rx)) => {
-            // Create per-app socket marker в PerApp mode.
+            // Create per-app socket marker in PerApp mode.
             let socket_path = if !ephemeral {
                 app_socket_dir.map(|dir| build_per_app_socket(dir, &app_id))
             } else {
@@ -154,7 +154,7 @@ pub(crate) async fn handle_bind(
 }
 
 /// Build the per-app socket node at `{dir}/{hex(app_id)}.sock` so other
-/// processes can probe ownership (Unix listener bind с 0o600 perms,
+/// processes can probe ownership (Unix listener bind with 0o600 perms,
 /// dropped immediately as the daemon never serves on it; the node stays
 /// as an ownership marker until unbind).  On non-Unix platforms an empty
 /// marker file is created instead — filesystem ACLs still apply.

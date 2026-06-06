@@ -31,8 +31,8 @@ use super::{
     lock_tasks,
 };
 
-/// Per-tick counts от `tick_evict_expired_primary_stores`.  Consumed by
-/// `tick_record_eviction_metrics` к charge the storage-eviction counter
+/// Per-tick counts from `tick_evict_expired_primary_stores`.  Consumed by
+/// `tick_record_eviction_metrics` to charge the storage-eviction counter
 /// against the appropriate sub-metric.
 #[derive(Default, Clone, Copy)]
 pub struct PrimaryEvictionCounts {
@@ -148,7 +148,7 @@ impl NodeRuntime {
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(cleanup_interval);
             // deferred : tick counter for throttle decision.
-            // Wraps at u64::MAX (~580 billion years at 1 Hz, не a concern).
+            // Wraps at u64::MAX (~580 billion years at 1 Hz, not a concern).
             let mut tick_index: u64 = 0;
             loop {
                 tokio::select! {
@@ -178,7 +178,7 @@ impl NodeRuntime {
                         // battery is at-or-below threshold AND multiplier > 1
                         // skip on `(multiplier-1)/multiplier` of ticks.
                         // Default config: skip is always false → same as pre-
-                        // slice behaviour для server / desktop / non-opted-in
+                        // slice behaviour for server / desktop / non-opted-in
                         // mobile deployments.
                         let battery = crate::runtime::local_battery_level();
                         let skip_throttleable =
@@ -623,11 +623,11 @@ impl NodeRuntime {
     ///    `@receiver` find them).
     /// 2. Decode + check freshness. If still has > half-window
     ///    remaining, skip (no DHT churn for entries already fresh).
-    /// 3. Otherwise sign a fresh ad с `valid_from = now`
-    ///    `valid_until = now + entry.validity_window_secs` и
+    /// 3. Otherwise sign a fresh ad with `valid_from = now`
+    ///    `valid_until = now + entry.validity_window_secs` and
     ///    `dht.store_local(...)`.
     ///
-    /// Returns the count of ads refreshed this tick (для metrics +
+    /// Returns the count of ads refreshed this tick (for metrics +
     /// tests). Empty `entries` → 0 with no DHT mutation.
     pub fn tick_publish_rendezvous_ads(
         entries: &Arc<Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
@@ -637,7 +637,7 @@ impl NodeRuntime {
         logger: &Arc<veil_observability::NodeLogger>,
     ) -> usize {
         //.4 follow-up: publish each `RendezvousPublisherEntry`
-        // под its own DHT slot (`rendezvous_ad_dht_key_at(receiver, idx)`)
+        // under its own DHT slot (`rendezvous_ad_dht_key_at(receiver, idx)`)
         // so senders can fan-out mailbox puts to K=3+ replicas. Slot 0
         // is bit-exact with the legacy single-key derivation, so pre-T1.4
         // resolvers see whatever entry is in slot 0 and ignore the rest.
@@ -680,21 +680,21 @@ impl NodeRuntime {
             }
             let valid_from = now_unix;
             let valid_until = now_unix.saturating_add(entry.validity_window_secs);
-            // mint а capability token и stash
+            // mint a capability token and stash
             // it in the ad alongside the existing push_envelope. Senders
-            // that read the ad via DHT include the token в their PUTs;
-            // relays running с `require_capability_token = true` use this
-            // к gate inbound mailbox deposits.
+            // that read the ad via DHT include the token in their PUTs;
+            // relays running with `require_capability_token = true` use this
+            // to gate inbound mailbox deposits.
             //
             // For Ed25519 / Falcon-512 only. Hybrid (Ed25519+Falcon-512)
-            // identities skip the token mint и publish а tokenless ad —
+            // identities skip the token mint and publish a tokenless ad —
             // verify primitive doesn't support hybrid signatures.
-            // Relays running require=true will reject puts от such senders;
-            // operators с hybrid identities should keep require=false until
+            // Relays running require=true will reject puts from such senders;
+            // operators with hybrid identities should keep require=false until
             // grows hybrid support.
-            // v2 (relay-bound): per-replica token signed по entry.rendezvous_node_id.
-            // Each ad carries а token that only its own replica accepts;
-            // а malicious relay observing one cannot replay к another.
+            // v2 (relay-bound): per-replica token signed by entry.rendezvous_node_id.
+            // Each ad carries a token that only its own replica accepts;
+            // a malicious relay observing one cannot replay to another.
             let cap_token = mint_capability_token_for_ad(
                 local_identity,
                 entry.rendezvous_node_id,
@@ -899,19 +899,19 @@ impl NodeRuntime {
     }
 }
 
-/// mint а mailbox capability token signed by
-/// the receiver's identity sk, for stashing в `RendezvousAd.capability_token`.
+/// mint a mailbox capability token signed by
+/// the receiver's identity sk, for stashing in `RendezvousAd.capability_token`.
 ///
 /// Returns `vec![]` (empty / "no token") when:
-/// * The local identity uses а hybrid (Ed25519+Falcon-512) signature —
+/// * The local identity uses a hybrid (Ed25519+Falcon-512) signature —
 ///   verify primitive doesn't accept hybrid sigs yet.
 /// * The base64 → raw conversion of the public key fails (config error).
 /// * The signing routine fails.
 ///
-/// Operators running mailbox с `require_capability_token = true` MUST
-/// use а pure Ed25519 или Falcon-512 identity until grows
-/// hybrid support. The empty fallback prevents pubishing а malformed
-/// ad — receivers using hybrid simply won't have а token until then.
+/// Operators running mailbox with `require_capability_token = true` MUST
+/// use a pure Ed25519 or Falcon-512 identity until grows
+/// hybrid support. The empty fallback prevents pubishing a malformed
+/// ad — receivers using hybrid simply won't have a token until then.
 pub fn mint_capability_token_for_ad(
     local_identity: &crate::local_identity::HandshakeIdentity,
     relay_node_id: [u8; 32],
@@ -928,7 +928,7 @@ pub fn mint_capability_token_for_ad(
         // tokenless ads.
         _ => return Vec::new(),
     };
-    // Public key on the wire is base64; decode к raw bytes.
+    // Public key on the wire is base64; decode to raw bytes.
     let pk_raw = match base64::engine::general_purpose::STANDARD.decode(&local_identity.public_key)
     {
         Ok(b) => b,
@@ -944,17 +944,17 @@ pub fn mint_capability_token_for_ad(
     let sk_b64 = local_identity.private_key.clone();
     let algo = local_identity.algo;
     let sign_fn = |msg: &[u8]| -> Vec<u8> {
-        // Sign-failure is а config / fatal error. Empty sig produces
+        // Sign-failure is a config / fatal error. Empty sig produces
         // an invalid token that fails verify on the relay side; we
-        // surface the empty bytes back к the caller which then stashes
-        // empty `cap_token` в the ad. Logged at warn — операторы
-        // знают что делать.
+        // surface the empty bytes back to the caller which then stashes
+        // empty `cap_token` in the ad. Logged at warn — operators
+        // know what to do.
         veil_crypto::sign_message(algo, &pk_b64, &sk_b64, msg).unwrap_or_default()
     };
-    // v2 bound token: relay_node_id is signed into the token, и the
+    // v2 bound token: relay_node_id is signed into the token, and the
     // relay's verify path checks expected_relay_id == its own node_id.
-    // Закрывает cross-replica replay attack (malicious relay R observing
-    // legitimate PUT cannot replay the token к а sibling replica R').
+    // Closes cross-replica replay attack (malicious relay R observing
+    // legitimate PUT cannot replay the token to a sibling replica R').
     match veil_mailbox::capability::sign_token_v2(
         algo_byte,
         &pk_raw,
@@ -1124,7 +1124,7 @@ mod tests {
             NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger);
         assert_eq!(count, 1);
 
-        // Fetch by deterministic DHT key derived от RECEIVER's node_id.
+        // Fetch by deterministic DHT key derived from RECEIVER's node_id.
         let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
         let bytes = dht.get_local(&key).expect("ad in DHT");
         let ad = decode_rendezvous_ad(&bytes).expect("decode");
@@ -1230,8 +1230,8 @@ mod tests {
         let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
         let bytes_after_first = dht.get_local(&key).expect("ad in DHT").to_vec();
 
-        // Second tick без passage of time — ad is still very fresh
-        // tick must skip и leave bytes byte-equal.
+        // Second tick without passage of time — ad is still very fresh
+        // tick must skip and leave bytes byte-equal.
         let n2 = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger);
         assert_eq!(n2, 0, "still-fresh ad must NOT trigger republish");
         let bytes_after_second = dht.get_local(&key).expect("ad still in DHT").to_vec();

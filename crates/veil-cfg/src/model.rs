@@ -10,9 +10,9 @@ use super::{ConfigError, Result};
 
 // Crate-split : ParseEnumError + SignatureAlgorithm extracted to
 // the `veil-types` workspace crate (Tier 0 leaf, breaks cfg ↔ proto
-// и cfg ↔ crypto cycles). Re-exports preserve existing
+// and cfg ↔ crypto cycles). Re-exports preserve existing
 // `crate::ParseEnumError` / `crate::SignatureAlgorithm`
-// callers without touching every import site в the codebase.
+// callers without touching every import site in the codebase.
 pub use veil_types::{ParseEnumError, SignatureAlgorithm};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -23,7 +23,7 @@ pub struct Config {
     pub global: GlobalConfig,
     /// `transport` — transport.  Always emitted (no
     /// `skip_serializing_if`) because the `[transport.rotation]`
-    /// anti-DPI knob is meant к be discoverable by reading the file.
+    /// anti-DPI knob is meant to be discoverable by reading the file.
     #[serde(default)]
     pub transport: TransportConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -35,7 +35,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// `metrics` — metrics.
     pub metrics: Option<MetricsConfig>,
-    /// Private-veil-network configuration. `None` (default) или
+    /// Private-veil-network configuration. `None` (default) or
     /// `mode = "public"` keeps the open-veil behaviour; `mode =
     /// "private"` enables cert-gated handshake + DHT-propagated bans.
     /// See [`NetworkConfig`].
@@ -89,7 +89,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "DhtConfig::is_default")]
     pub dht: DhtConfig,
     /// Anycast resolution policy (signed-only vs best-effort).  Defaults
-    /// to best-effort для backward compat; production deployments что
+    /// to best-effort for backward compat; production deployments that
     /// route trust-sensitive traffic through anycast should set
     /// `resolve_policy = "signed_only"`.
     #[serde(default, skip_serializing_if = "AnycastConfig::is_default")]
@@ -367,7 +367,7 @@ pub struct MeshConfig {
     /// **SECURITY (audit 2026-05-29, A5)** — when `true`, the beacon
     /// receiver DROPS unsigned beacons instead of accepting them as
     /// "legacy".  An unsigned beacon lets an on-link attacker register
-    /// or redirect neighbor links и inject `IS_GATEWAY` entries без any
+    /// or redirect neighbor links and inject `IS_GATEWAY` entries without any
     /// key.  Recommended `true` for any non-loopback / hostile-LAN realm.
     ///
     /// **Default `true` (C-03):** unsigned beacons are rejected, closing the
@@ -460,7 +460,7 @@ pub struct MobileConfig {
     /// (toggled via `AdminCommand::SetMobileBackgroundMode` from
     /// the GUI wrapper / mobile app's onPause/onResume hooks).
     ///
-    /// Composes multiplicatively с battery scaling — backgrounded
+    /// Composes multiplicatively with battery scaling — backgrounded
     /// + low-battery → both factors apply.
     ///
     /// Default `1` (feature off — keepalive cadence unchanged).
@@ -497,13 +497,13 @@ pub struct MobileConfig {
     /// wakes once per burst instead of once per BACKGROUND frame.
     ///
     /// Interactive frames bypass the delay (they always sit at queue head
-    /// thanks к the WRR weights, so they trigger an immediate drain).
+    /// thanks to the WRR weights, so they trigger an immediate drain).
     /// Coalescing only kicks in when EVERY queued frame is non-interactive
     /// AND the runtime opted in.
     ///
     /// Default `None` (off). Reasonable values when enabled: 200-500 ms.
-    /// Capped at [`MobileConfig::MAX_OUTBOUND_BATCH_WINDOW_MS`] так что
-    /// misconfig "10 s coalesce" не starve liveness probes.
+    /// Capped at [`MobileConfig::MAX_OUTBOUND_BATCH_WINDOW_MS`] so that
+    /// misconfig "10 s coalesce" doesn't starve liveness probes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_batch_window_ms: Option<u32>,
 }
@@ -520,9 +520,9 @@ impl MobileConfig {
     pub const MAX_BACKGROUND_KEEPALIVE_MULTIPLIER: u32 = 120;
 
     /// Hard cap on outbound batch window. ROUTE_PROBE adaptive scheduler
-    /// ticks at 1 s minimum, и keepalives at 30 s — coalescing past 1 s
+    /// ticks at 1 s minimum, and keepalives at 30 s — coalescing past 1 s
     /// would risk stalling those. 1000 ms ceiling keeps the slice
-    /// strictly а radio-wake-coalescer, not a liveness-killer.
+    /// strictly a radio-wake-coalescer, not a liveness-killer.
     pub const MAX_OUTBOUND_BATCH_WINDOW_MS: u32 = 1000;
 
     fn default_low_battery_multiplier() -> u32 {
@@ -667,7 +667,7 @@ impl AnonymityConfig {
 
 /// Anycast service-tag resolution policy.
 ///
-/// IPC anycast handler routes через `AnycastService::resolve`, which
+/// IPC anycast handler routes through `AnycastService::resolve`, which
 /// honours [`AnycastConfig::resolve_policy`].  Default is `signed_bound`
 /// (audit cycle-6 T2 — secure-by-default: only candidates with a valid
 /// owner-signature AND a provable `BLAKE3(owner_pubkey) == node_id`
@@ -688,23 +688,23 @@ impl AnycastConfig {
 }
 
 /// Anycast resolve-policy variants.  Mirrors `veil_anycast::AnycastResolvePolicy`;
-/// kept в cfg layer т.е. veil-cfg doesn't depend on veil-anycast.
-/// Node-runtime translates this к the runtime enum при construction
+/// kept in cfg layer i.e. veil-cfg doesn't depend on veil-anycast.
+/// Node-runtime translates this to the runtime enum at construction
 /// of `AnycastService`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AnycastResolvePolicyKind {
-    /// Accept any record (signed или unsigned).  audit cycle-6 (T2): NO LONGER
+    /// Accept any record (signed or unsigned).  audit cycle-6 (T2): NO LONGER
     /// the default — opt into this explicitly for discovery-only deployments.
     BestEffort,
-    /// Only return candidates с а valid Ed25519 owner-signature.
-    /// Note: signature integrity only — а sybil signing under their own
+    /// Only return candidates with a valid Ed25519 owner-signature.
+    /// Note: signature integrity only — a sybil signing under their own
     /// key while claiming another node's `node_id` will pass.  Use
     /// `signed_bound` to close that gap.
     SignedOnly,
-    /// Only return candidates с а valid signature AND а provable owner-
+    /// Only return candidates with a valid signature AND a provable owner-
     /// binding (`BLAKE3(owner_pubkey) == node_id`, `sig_key_idx == 0`).
-    /// Strongest trust posture available в the synchronous resolve path.
+    /// Strongest trust posture available in the synchronous resolve path.
     /// Use for production trust-sensitive routing (mailbox routing of
     /// PII, sovereign-identity service discovery, payment endpoints).
     ///
@@ -756,17 +756,17 @@ pub struct MailboxConfig {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub rate_limit_per_minute: u32,
     /// require capability tokens on PUT.
-    /// Default `false` для backward compat с pre-slice senders. When
-    /// `true`, tokenless puts ара rejected с `CapabilityRequired`.
-    /// Operators flip к `true` after the receiver-side mint API ships
-    /// и senders ара propagating tokens via RendezvousAd v3.
+    /// Default `false` for backward compat with pre-slice senders. When
+    /// `true`, tokenless puts are rejected with `CapabilityRequired`.
+    /// Operators flip to `true` after the receiver-side mint API ships
+    /// and senders are propagating tokens via RendezvousAd v3.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_capability_token: bool,
     /// per-sender byte quota.  `0` (the serde default) ⇒ the runtime
     /// uses the crate-default safe quota
     /// (`veil_mailbox::DEFAULT_QUOTA_PER_SENDER_BYTES`, 10 MiB).
     /// An explicit non-zero value overrides; to fully disable per-sender
-    /// accounting в an operator config (NOT recommended), set а very
+    /// accounting in an operator config (NOT recommended), set a very
     /// large value (e.g. 18446744073709551615 / `u64::MAX`).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub quota_per_sender_bytes: u64,
@@ -774,7 +774,7 @@ pub struct MailboxConfig {
     /// section is empty / absent, the daemon falls back to the
     /// default `LogOnlyDispatcher` (puts get logged but no FCM/APNs
     /// API call is made). Configure either FCM, APNs, or both —
-    /// missing-provider tokens fail с `ProviderNotConfigured`.
+    /// missing-provider tokens fail with `ProviderNotConfigured`.
     #[serde(default, skip_serializing_if = "MailboxPushConfig::is_default")]
     pub push: MailboxPushConfig,
 }
@@ -799,7 +799,7 @@ impl MailboxConfig {
 /// rotation (no hot-reload yet).
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct MailboxPushConfig {
-    /// Path to a Google service-account JSON file для FCM v1 OAuth.
+    /// Path to a Google service-account JSON file for FCM v1 OAuth.
     /// Empty / missing → FCM disabled.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub fcm_credentials_path: String,
@@ -946,7 +946,7 @@ mod mobile_tests {
         assert_eq!(
             c.background_keepalive_factor(false),
             1,
-            "background_mode=false → factor 1 even с large multiplier"
+            "background_mode=false → factor 1 even with large multiplier"
         );
     }
 
@@ -1056,7 +1056,7 @@ mod mobile_tests {
     #[test]
     fn epic483_5d_throttle_maint_flag_off_overrides_low_battery() {
         // Threshold + low battery + multiplier=4, but flag explicitly off
-        // ⇒ never skip. Defends против the "battery scaling kicked in
+        // ⇒ never skip. Defends against the "battery scaling kicked in
         // automatically" worry — the maintenance throttle is independent.
         let c = MobileConfig {
             low_battery_threshold_pct: Some(30),
@@ -1155,7 +1155,7 @@ mod mobile_tests {
 
     #[test]
     fn epic483_5o_outbound_batch_threshold_unset_returns_none() {
-        // Window configured but threshold not — feature gated на having
+        // Window configured but threshold not — feature gated on having
         // BOTH so operator who only set window (typo) doesn't see
         // unexpected coalescing.
         let c = MobileConfig {
@@ -1170,7 +1170,7 @@ mod mobile_tests {
         );
     }
 
-    // ── is_default coverage с new fields ─────────────────────────────
+    // ── is_default coverage with new fields ─────────────────────────────
 
     #[test]
     fn epic483_5_is_default_recognises_serde_defaults() {
@@ -1212,23 +1212,23 @@ mod mobile_tests {
     }
 }
 
-/// Per-peer frame rate cap (frames/s).  Default sized для **2 Gbps per peer**
-/// throughput baseline на full-MTU 1500-byte frames:
+/// Per-peer frame rate cap (frames/s).  Default sized for **2 Gbps per peer**
+/// throughput baseline on full-MTU 1500-byte frames:
 ///
 /// ```text
 /// 2 Gbps / (1500 B × 8 b/B) ≈ 167 000 frames/s
 /// ```
 ///
-/// Bumped от prior 500 fps (which capped throughput at ~6 Mbps with MTU 1500)
+/// Bumped from prior 500 fps (which capped throughput at ~6 Mbps with MTU 1500)
 /// after audit batch 2026-05-22 testnet iperf revealed silent rate-limit drops
 /// were the dominant ogate-tunnel bottleneck (not session-flapping, not CPU).
-/// Operators on bandwidth-constrained links can lower это через
-/// `[abuse] rate_limit_fps = N` в node.toml.
+/// Operators on bandwidth-constrained links can lower this through
+/// `[abuse] rate_limit_fps = N` in node.toml.
 fn default_rate_limit_fps() -> f64 {
     200_000.0
 }
-/// Per-peer burst headroom (frames).  2× the rate cap so а brief 200 ms
-/// stall doesn't immediately drop а sustained flow.
+/// Per-peer burst headroom (frames).  2× the rate cap so a brief 200 ms
+/// stall doesn't immediately drop a sustained flow.
 fn default_rate_limit_burst() -> f64 {
     400_000.0
 }
@@ -1269,30 +1269,30 @@ pub struct RoutingConfig {
 
     /// iterative-DHT fallback baseline timeout (ms). After
     /// the legacy `RouteRequest` flood (TTL=7) exhausts its retries, the
-    /// miss-handler fires а `RecursiveQuery(FIND_NODE)` and awaits the
-    /// signed `RecursiveResponse` up к this budget. Tunable for slow
-    /// links (cellular, satellite, congested 4G — bump к 20000-30000) or
-    /// tight LAN clusters (drop к 3000-5000 для fast-fail).
-    /// adaptive logic adjusts на top of this baseline by ±50% based on
-    /// recent miss-rate, clamped к [1000, 60000] ms. Default 10000.
+    /// miss-handler fires a `RecursiveQuery(FIND_NODE)` and awaits the
+    /// signed `RecursiveResponse` up to this budget. Tunable for slow
+    /// links (cellular, satellite, congested 4G — bump to 20000-30000) or
+    /// tight LAN clusters (drop to 3000-5000 for fast-fail).
+    /// adaptive logic adjusts on top of this baseline by ±50% based on
+    /// recent miss-rate, clamped to [1000, 60000] ms. Default 10000.
     #[serde(default = "RoutingConfig::default_dht_fallback_timeout_ms")]
     pub dht_fallback_timeout_ms: u64,
 
     /// fraction (0-100) of `MAX_PENDING_RECURSIVE`
     /// at which the DHT fallback starts skipping new attempts to avoid
-    /// piling onto а starved dispatcher. Default 75 — once 75% of the
+    /// piling onto a starved dispatcher. Default 75 — once 75% of the
     /// pending-recursive map is occupied, route-miss events that would
-    /// trigger а fresh fallback are silently dropped (incremented as
-    /// `dht_fallback_skipped_backpressure_total`). Set к 100 к disable
-    /// the safety valve и always attempt.
+    /// trigger a fresh fallback are silently dropped (incremented as
+    /// `dht_fallback_skipped_backpressure_total`). Set to 100 to disable
+    /// the safety valve and always attempt.
     #[serde(default = "RoutingConfig::default_dht_fallback_backpressure_threshold_pct")]
     pub dht_fallback_backpressure_threshold_pct: u8,
 
     /// enable adaptive timeout scaling. When `true`
-    /// the fallback tracks the last 20 outcomes (resolved/miss) per node и
-    /// scales the effective timeout up to 1.5× если miss-rate exceeds 50%
-    /// down к 0.67× если miss-rate < 10%. Clamped к [1000, 60000] ms.
-    /// Default `false` — opt-in to avoid surprises на well-tuned clusters
+    /// the fallback tracks the last 20 outcomes (resolved/miss) per node and
+    /// scales the effective timeout up to 1.5× if miss-rate exceeds 50%
+    /// down to 0.67× if miss-rate < 10%. Clamped to [1000, 60000] ms.
+    /// Default `false` — opt-in to avoid surprises on well-tuned clusters
     /// where the baseline is correct.
     #[serde(default)]
     pub dht_fallback_adaptive: bool,
@@ -1301,10 +1301,10 @@ pub struct RoutingConfig {
     /// for INTERACTIVE-priority traffic time out at
     /// `dht_fallback_timeout_ms × interactive_mult / 100`, BACKGROUND at
     /// `× background_mult / 100`. Defaults [50, 200] — INTERACTIVE
-    /// (chat / RPC) gets half budget (fast-fail к surface stuck user
+    /// (chat / RPC) gets half budget (fast-fail to surface stuck user
     /// flows), BACKGROUND (cover-traffic / DHT housekeeping) gets double
-    /// (no user is waiting). Set both к 100 к disable priority-aware
-    /// behaviour and use the baseline для everything.
+    /// (no user is waiting). Set both to 100 to disable priority-aware
+    /// behaviour and use the baseline for everything.
     #[serde(default = "RoutingConfig::default_dht_fallback_priority_mult")]
     pub dht_fallback_priority_mult: [u16; 2],
 
@@ -1577,7 +1577,7 @@ pub struct RoutingConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_labels: Vec<String>,
 
-    /// (Уровень 2): controls who can learn this node's listen
+    /// (Level 2): controls who can learn this node's listen
     /// transports via `RouteRequest`/`RouteResponse`. Default: `Public`
     /// (any peer may probe — gated by PoW if `abuse.pow_min_difficulty > 0`).
     ///
@@ -1947,20 +1947,20 @@ pub struct DhtConfig {
     ///
     /// Worst-case memory: `max_store_entries × MAX_DHT_VALUE_BYTES` (16 KiB),
     /// so the default budget is ≈ 400 MB.  Operators running dedicated
-    /// DHT-infra с large RAM (≥8 GB) и production fill levels can opt
-    /// up к 250_000 (≈ 4 GB worst-case) via explicit config.  See
+    /// DHT-infra with large RAM (≥8 GB) and production fill levels can opt
+    /// up to 250_000 (≈ 4 GB worst-case) via explicit config.  See
     /// `docs/OPERATIONS.md` "Default Tuning Guidance" for role-specific
     /// profiles (Leaf = 0, Core = 25k, dedicated DHT = 250k).
     #[serde(default = "DhtConfig::default_max_store_entries")]
     pub max_store_entries: usize,
 
-    /// Optional **global byte budget** для the DHT value store.  When
-    /// set, а STORE що would push the cumulative byte total past this
+    /// Optional **global byte budget** for the DHT value store.  When
+    /// set, a STORE that would push the cumulative byte total past this
     /// value triggers eviction of the oldest entries (cold tier first,
-    /// then hot demoted-and-evicted) until the new value fits.  Если
+    /// then hot demoted-and-evicted) until the new value fits.  If
     /// the new value alone exceeds the cap, it is refused outright.
     /// `None` (default) disables the byte cap — only [`max_store_entries`]
-    /// limits memory, и worst-case is `entries × MAX_DHT_VALUE_BYTES`
+    /// limits memory, and worst-case is `entries × MAX_DHT_VALUE_BYTES`
     /// (= 16 KiB).  Audit batch 2026-05-23: closes the "count-cap doesn't
     /// bound memory if values approach `MAX_DHT_VALUE_BYTES`" gap.
     ///
@@ -1970,7 +1970,7 @@ pub struct DhtConfig {
     /// * **Core nodes**: `Some(400_000_000)` (≈ 400 MB — matches the
     ///   current entry-cap-based 25k × 16 KiB worst case directly).
     /// * **Dedicated DHT seeds**: `Some(4_000_000_000)` (≈ 4 GB — leaves
-    ///   plenty of room для 250k entries close к `MAX_DHT_VALUE_BYTES`).
+    ///   plenty of room for 250k entries close to `MAX_DHT_VALUE_BYTES`).
     ///
     /// RocksDB backend: the byte total is tracked best-effort because
     /// RocksDB evicts via background compaction; operators relying on
@@ -1978,16 +1978,16 @@ pub struct DhtConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_store_bytes: Option<u64>,
 
-    /// Per-origin byte budget (Этап 11e).  When set, а STORE whose signer
+    /// Per-origin byte budget (Phase 11e).  When set, a STORE whose signer
     /// pubkey is already holding `>= N` bytes in the local TieredStore is
     /// refused outright (caller sees the same `Ok(())` result the wire
     /// protocol returns for any silent drop).  Honest signers normally hold
-    /// а handful of records (NameClaim + IdentityDocument + а small fan-out
-    /// of AppEndpointEntry), so 64 KiB is а conservative ceiling that still
+    /// a handful of records (NameClaim + IdentityDocument + a small fan-out
+    /// of AppEndpointEntry), so 64 KiB is a conservative ceiling that still
     /// leaves headroom for legitimate growth.  Misbehaving / Sybil signers
     /// can no longer fill the store unilaterally — they can only fill their
     /// own per-origin slice.  Unsigned legacy STOREs (when
-    /// `allow_unsigned_store = true`) share а single synthetic origin
+    /// `allow_unsigned_store = true`) share a single synthetic origin
     /// bucket, so they collectively cap out at the same per-origin
     /// budget — the legacy inner-sig deployment pattern just needs
     /// operators to size this generously (≥ 4 MiB) until they migrate.
@@ -2058,17 +2058,17 @@ impl DhtConfig {
     fn is_default_vivaldi_weight(v: &f64) -> bool {
         (*v - 0.3).abs() < f64::EPSILON
     }
-    /// **RAM-sensitive default.** 25 K entries × up к
+    /// **RAM-sensitive default.** 25 K entries × up to
     /// `MAX_DHT_VALUE_BYTES` (16 KiB) ≈ **400 MB worst-case** — fits
-    /// в 2 GB constrained seeds.  Operators running dedicated DHT-infra
-    /// с large RAM (≥8 GB) и production fill levels should opt up к
+    /// in 2 GB constrained seeds.  Operators running dedicated DHT-infra
+    /// with large RAM (≥8 GB) and production fill levels should opt up to
     /// 250_000 (≈ 4 GiB worst-case) via explicit config.  See
     /// `docs/OPERATIONS.md` → "Default Tuning Guidance" for profile-
     /// specific overrides (0 for leaf clients, 25k for general Core,
-    /// 250k for dedicated DHT seeds).  Lowered от 100k к 25k when
-    /// `MAX_DHT_VALUE_BYTES` rose 4 KiB→16 KiB (Этап 10 hybrid-1024
+    /// 250k for dedicated DHT seeds).  Lowered from 100k to 25k when
+    /// `MAX_DHT_VALUE_BYTES` rose 4 KiB→16 KiB (Phase 10 hybrid-1024
     /// identity docs) so the worst-case memory product (entries × value
-    /// cap) held constant at ≈400 MB.  Originally lowered 1M→100k в audit
+    /// cap) held constant at ≈400 MB.  Originally lowered 1M→100k in audit
     /// batch 2026-05-21 (Phase C10) — previous default would OOM the
     /// default-tier seed.
     fn default_max_store_entries() -> usize {
@@ -2215,21 +2215,21 @@ pub struct SessionConfig {
     pub idle_timeout_secs: u64,
 
     /// **DEPRECATED** — superseded by [`transport.rotation`] which
-    /// supports а min/max range (the new default 1800-3600 s).  This
-    /// single-value knob is preserved для back-compat и used **only**
-    /// when `transport.rotation` is set к `-1`/`-1` (explicit disable
+    /// supports a min/max range (the new default 1800-3600 s).  This
+    /// single-value knob is preserved for back-compat and used **only**
+    /// when `transport.rotation` is set to `-1`/`-1` (explicit disable
     /// of the new section).  Operators upgrading from older configs
-    /// don't need к touch this field — leave `None` и use the
+    /// don't need to touch this field — leave `None` and use the
     /// `[transport.rotation]` section instead.
     ///
-    /// Legacy semantics: maximum session age в seconds before forced
+    /// Legacy semantics: maximum session age in seconds before forced
     /// graceful close (connection-rotation interval). `None` (default)
     /// disables rotation — sessions live indefinitely subject only
-    /// к idle_timeout.
+    /// to idle_timeout.
     ///
-    /// **Why this exists:** см. [`crate::TransportRotationConfig`] —
+    /// **Why this exists:** see [`crate::TransportRotationConfig`] —
     /// the rationale (censor-evasion via periodic TCP rotation) is
-    /// now centralised там.
+    /// now centralised there.
     ///
     /// **Validation:** must be ≥ 60 (rotating faster than once-a-
     /// minute is itself anomalous + would dominate connection cost).
@@ -2367,11 +2367,11 @@ impl SessionConfig {
     /// handling DHT-routed forwarding, transit sessions use smaller buffers
     /// (tx_queue_depth lowered to 256), making 64K sessions practical (~1 GB).
     fn default_max_concurrent() -> usize {
-        // lowered from 65_536 → 512 для budget-friendly
+        // lowered from 65_536 → 512 for budget-friendly
         // defaults. Each active session carries TLS state + queues
         // + timers ≈ 50-100 KB, so 512 ≈ 25-50 MB worst case — fits
-        // comfortably на любом desktop. Mobile / budget phones
-        // должны OVERRIDE через `--profile mobile` (sets 64 → ~5 MB
+        // comfortably on any desktop. Mobile / budget phones
+        // must OVERRIDE through `--profile mobile` (sets 64 → ~5 MB
         // ceiling). Operators running dedicated relay/gateway
         // hardware can raise to thousands explicitly via config.
         // Breaking change vs prior default: nodes that legitimately
@@ -2393,23 +2393,23 @@ impl SessionConfig {
     fn default_pending_response_ttl_ms() -> u64 {
         30000
     }
-    /// Per-session outbox depth (frames).  Sized для **2 Gbps per peer**
+    /// Per-session outbox depth (frames).  Sized for **2 Gbps per peer**
     /// baseline (matches the rate-limit + bandwidth-gate defaults):
     ///
     /// ```text
     /// 2 Gbps × 250 ms slack / (1500 B × 8) ≈ 41 000 frames buffered worst-case
     /// ```
     ///
-    /// Bumped от prior 64 (which capped sustained throughput at ~100 Mbps
+    /// Bumped from prior 64 (which capped sustained throughput at ~100 Mbps
     /// because the session-runner's `PQ_DRAIN_FRAMES_PER_PASS = 16` couldn't
     /// keep up under iperf-burst pressure → `priority_queue_drops_total`
-    /// climbed к 64K drops/12s and `session_tx_drops_total` к 500).
-    /// 4096 frames × 1500 B avg = ~6 MiB per peer worst-case; на 8 active
-    /// peers = ~48 MiB total — well-bounded but lets а brief drain hiccup
+    /// climbed to 64K drops/12s and `session_tx_drops_total` to 500).
+    /// 4096 frames × 1500 B avg = ~6 MiB per peer worst-case; on 8 active
+    /// peers = ~48 MiB total — well-bounded but lets a brief drain hiccup
     /// absorb instead of dropping.
     ///
-    /// Operators on mobile / low-RAM devices can lower через
-    /// `[session] tx_queue_depth = 256` в node.toml.
+    /// Operators on mobile / low-RAM devices can lower through
+    /// `[session] tx_queue_depth = 256` in node.toml.
     fn default_tx_queue_depth() -> usize {
         4096
     }
@@ -2542,8 +2542,8 @@ pub struct HotStandbyConfig {
     // removed. Both were stage-(b) B1+B2 plumbing superseded by
     // stage-(c.3) `auto_set_alt_uri_from_transports` (peer-cap discovery)
     // and stage-(c.2.2) keepalive-probe-timeout machinery respectively.
-    // Stale comments referencing them в runtime/mod.rs and warm_probe.rs
-    // updated в the same commit.
+    // Stale comments referencing them in runtime/mod.rs and warm_probe.rs
+    // updated in the same commit.
     /// How long the initiator side waits for `HandoffAck` after sending
     /// `HandoffInit` before aborting the handoff attempt, in seconds.
     /// Default: 5. Must be > the primary transport's round-trip time.
@@ -2881,12 +2881,12 @@ pub struct NodeCapacityConfig {
 }
 
 impl NodeCapacityConfig {
-    /// Per-node aggregate bandwidth cap (kbps).  Default sized для
+    /// Per-node aggregate bandwidth cap (kbps).  Default sized for
     /// **2 Gbps per peer** baseline × ~8 active peers worst-case = 16 Gbps
-    /// aggregate, rounded down к 10 Gbps headroom.  Bumped от prior
-    /// 100 Mbps (which capped а single-peer iperf flow long before any
-    /// other limit kicked in).  Set к `-1` для truly unlimited (datacentre
-    /// deployments); set lower (e.g. 1 Gbps) когда ISP rate-limited.
+    /// aggregate, rounded down to 10 Gbps headroom.  Bumped from prior
+    /// 100 Mbps (which capped a single-peer iperf flow long before any
+    /// other limit kicked in).  Set to `-1` for truly unlimited (datacentre
+    /// deployments); set lower (e.g. 1 Gbps) when ISP rate-limited.
     fn default_bandwidth_kbps() -> i64 {
         10_000_000
     } // 10 Gbit/s
@@ -2975,21 +2975,21 @@ pub struct AbuseConfig {
     pub ban_max_secs: u64,
 
     /// b: per-peer **byte-rate** throttle (bytes/sec
-    /// allowed from a single peer). Composes orthogonally с
+    /// allowed from a single peer). Composes orthogonally with
     /// node-aggregate `capacity.max_inbound_bandwidth_kbps`
     /// — node-aggregate prevents total runaway
     /// per-peer prevents single-peer-flood from saturating
     /// the user's cellular quota. `None` (default) disables
     /// per-peer enforcement; mobile profile sets to 65536
-    /// (64 KB/s = 512 kbps per peer — enough для real chat /
+    /// (64 KB/s = 512 kbps per peer — enough for real chat /
     /// signaling, blocks runaway DHT walks / misbehaving relay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_peer_bytes_per_sec: Option<u64>,
 
     /// Per-peer byte burst capacity (bytes — Token bucket
-    /// initial fill). None defaults к 4× `per_peer_bytes_per_sec`
+    /// initial fill). None defaults to 4× `per_peer_bytes_per_sec`
     /// (4-second burst window) so legitimate-but-bursty peers
-    /// don't get throttled on the first frame. Ignored когда
+    /// don't get throttled on the first frame. Ignored when
     /// `per_peer_bytes_per_sec` is None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_peer_byte_burst: Option<u64>,
@@ -3029,8 +3029,8 @@ impl AbuseConfig {
             && self.per_peer_byte_burst.is_none()
     }
 
-    /// Resolved per-peer byte burst capacity для PerPeerLimiter
-    /// construction. Returns `None` когда `per_peer_bytes_per_sec`
+    /// Resolved per-peer byte burst capacity for PerPeerLimiter
+    /// construction. Returns `None` when `per_peer_bytes_per_sec`
     /// is None (per-peer enforcement disabled). Otherwise returns
     /// the explicit `per_peer_byte_burst` if set, OR a 4-second
     /// burst (4× rate) as the sensible default.
@@ -3045,37 +3045,37 @@ impl AbuseConfig {
 /// Forces the underlying TCP/TLS connection of every session to be rotated
 /// periodically so that DPI fingerprinting based on flow lifetime (e.g.
 /// "this HTTPS session has lived 6 hours straight, classify as VPN") loses
-/// its signal.  Each session draws а random lifetime uniformly из the
-/// `[min_lifetime_secs, max_lifetime_secs]` range at handshake time; когда
-/// that deadline expires the runner attempts а **make-before-break** swap
-/// onto а freshly-handshaked transport (см. [`crate::HotStandbyConfig`]
-/// для the underlying mechanism).  If make-before-break can't proceed (no
-/// alt_uri available и same-URI rotation unsupported by the peer), the
-/// runner falls back к а graceful close, letting the outbound connector
+/// its signal.  Each session draws a random lifetime uniformly from the
+/// `[min_lifetime_secs, max_lifetime_secs]` range at handshake time; when
+/// that deadline expires the runner attempts a **make-before-break** swap
+/// onto a freshly-handshaked transport (see [`crate::HotStandbyConfig`]
+/// for the underlying mechanism).  If make-before-break can't proceed (no
+/// alt_uri available and same-URI rotation unsupported by the peer), the
+/// runner falls back to a graceful close, letting the outbound connector
 /// re-dial.
 ///
-/// **Why а range, not а point value:** а fixed 1-hour cadence is itself
-/// а DPI signature (every flow rotates at exactly 3600 ± 10 % seconds —
+/// **Why a range, not a point value:** a fixed 1-hour cadence is itself
+/// a DPI signature (every flow rotates at exactly 3600 ± 10 % seconds —
 /// statistical correlation across the fleet identifies veil sessions).
-/// Wider uniform spread (1800-3600 s by default = 30 min к 1 hour) hides
-/// the rotation event в the noise of normal browser-tab churn.
+/// Wider uniform spread (1800-3600 s by default = 30 min to 1 hour) hides
+/// the rotation event in the noise of normal browser-tab churn.
 ///
 /// **Disabling:** set either `min_lifetime_secs` or `max_lifetime_secs`
-/// к `-1` (the sentinel for "disabled"); the runner then runs sessions
-/// indefinitely subject only к idle-timeout / failure-detection.  Default
-/// is enabled с the 30-60 min range.
+/// to `-1` (the sentinel for "disabled"); the runner then runs sessions
+/// indefinitely subject only to idle-timeout / failure-detection.  Default
+/// is enabled with the 30-60 min range.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TransportRotationConfig {
-    /// Minimum session lifetime в seconds.  Default: 1800 (30 min).
+    /// Minimum session lifetime in seconds.  Default: 1800 (30 min).
     /// Sentinel: `-1` disables the entire rotation mechanism (paired-
-    /// or-not с `max_lifetime_secs` — either being `-1` means disabled).
+    /// or-not with `max_lifetime_secs` — either being `-1` means disabled).
     /// Positive values < 60 are rejected by validation (rotating faster
     /// than once-per-minute is itself anomalous + dominates handshake
     /// cost).
     #[serde(default = "TransportRotationConfig::default_min_lifetime_secs")]
     pub min_lifetime_secs: i64,
 
-    /// Maximum session lifetime в seconds.  Default: 3600 (1 hour).
+    /// Maximum session lifetime in seconds.  Default: 3600 (1 hour).
     /// Sentinel: `-1` disables the entire rotation mechanism.  Must be
     /// `>= min_lifetime_secs` when both are positive (validation rule).
     #[serde(default = "TransportRotationConfig::default_max_lifetime_secs")]
@@ -3083,7 +3083,7 @@ pub struct TransportRotationConfig {
 }
 
 impl TransportRotationConfig {
-    /// Default minimum lifetime: 30 min.  Picked к match the lower end
+    /// Default minimum lifetime: 30 min.  Picked to match the lower end
     /// of typical foreground browsing-tab lifetimes (Chrome's "long-lived"
     /// HTTPS sessions to e.g. Gmail or Slack often last 30-60 min).
     pub fn default_min_lifetime_secs() -> i64 {
@@ -3091,25 +3091,25 @@ impl TransportRotationConfig {
     }
 
     /// Default maximum lifetime: 1 hour.  Upper end of normal browser-tab
-    /// HTTPS lifetimes; sessions longer than this start к look anomalous
+    /// HTTPS lifetimes; sessions longer than this start to look anomalous
     /// to DPI classifiers that profile flow durations.
     pub fn default_max_lifetime_secs() -> i64 {
         3_600
     }
 
-    /// True если rotation is disabled (either bound is `-1`).
+    /// True if rotation is disabled (either bound is `-1`).
     ///
-    /// Consumers that need к know whether к arm the rotation timer
+    /// Consumers that need to know whether to arm the rotation timer
     /// should ask this rather than re-implementing the sentinel check;
-    /// keeps the policy в one place.
+    /// keeps the policy in one place.
     pub fn is_disabled(&self) -> bool {
         self.min_lifetime_secs < 0 || self.max_lifetime_secs < 0
     }
 
-    /// Resolve к а pair of positive `(min, max)` seconds, или `None`
-    /// when rotation is disabled.  Single helper для downstream callers
+    /// Resolve to a pair of positive `(min, max)` seconds, or `None`
+    /// when rotation is disabled.  Single helper for downstream callers
     /// (session runner global setter, hot-standby trigger) — they don't
-    /// need к know about the `-1` sentinel.
+    /// need to know about the `-1` sentinel.
     pub fn resolved_range(&self) -> Option<(u64, u64)> {
         if self.is_disabled() {
             return None;
@@ -3117,8 +3117,8 @@ impl TransportRotationConfig {
         let min = self.min_lifetime_secs as u64;
         let max = self.max_lifetime_secs as u64;
         // Validation guarantees min ≤ max when both positive — but we
-        // defensively clamp here so а validation-bypassed config can't
-        // crash the runner с а max < min uniform sample.
+        // defensively clamp here so a validation-bypassed config can't
+        // crash the runner with a max < min uniform sample.
         Some((min, min.max(max)))
     }
 }
@@ -3140,11 +3140,11 @@ pub struct TransportConfig {
     /// matches typical browser-tab HTTPS lifetimes for DPI-evasion.
     /// TOML section: `[transport.rotation]`.
     ///
-    /// **Always serialised** (no `skip_serializing_if`) — this is а
-    /// censor-evasion feature и operators expect к discover it by
+    /// **Always serialised** (no `skip_serializing_if`) — this is a
+    /// censor-evasion feature and operators expect to discover it by
     /// reading their config file.  Hiding the section when at default
     /// would hide both its existence AND its current effective values
-    /// (the new lifetime range), which is poor security UX даже когда
+    /// (the new lifetime range), which is poor security UX even when
     /// the rest of the config follows the "skip-default" convention.
     #[serde(default)]
     pub rotation: TransportRotationConfig,
@@ -3159,32 +3159,32 @@ pub struct TransportConfig {
     /// the legacy behaviour (use the target host as SNI).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_sni: Option<String>,
-    /// Path к а file containing the obfs4 pre-shared key (32 bytes,
-    /// base64-encoded на one line).  When set, enables the `obfs4-tcp://`
+    /// Path to a file containing the obfs4 pre-shared key (32 bytes,
+    /// base64-encoded on one line).  When set, enables the `obfs4-tcp://`
     /// transport: server-side verifies incoming MACs, client-side
-    /// includes the MAC в outgoing handshakes.  Single network-wide PSK;
-    /// per-peer PSK lookup via signed transport_hints is а follow-up.
+    /// includes the MAC in outgoing handshakes.  Single network-wide PSK;
+    /// per-peer PSK lookup via signed transport_hints is a follow-up.
     /// `None` disables the obfs4-tcp transport (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obfs4_psk_file: Option<std::path::PathBuf>,
     /// Webtunnel secret path (e.g. `/_t/random-32-chars`).  Activates
-    /// tunnel mode на the `webtunnel-wss://` transport's server side.
+    /// tunnel mode on the `webtunnel-wss://` transport's server side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webtunnel_secret_path: Option<String>,
-    /// Webtunnel auth token file (раздел из 32-byte random + base64).
-    /// Sent в `X-Veil-Auth` header alongside the secret path.
+    /// Webtunnel auth token file (made of 32-byte random + base64).
+    /// Sent in `X-Veil-Auth` header alongside the secret path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webtunnel_auth_token_file: Option<std::path::PathBuf>,
-    /// Webtunnel decoy content directory.  Static files served к probes
-    /// що don't match the secret path/auth.  Recommended: snapshot of а
+    /// Webtunnel decoy content directory.  Static files served to probes
+    /// that don't match the secret path/auth.  Recommended: snapshot of a
     /// neutral website (status dashboard, dev blog).  None falls back
-    /// к а minimal hardcoded HTML.
+    /// to a minimal hardcoded HTML.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webtunnel_decoy_dir: Option<std::path::PathBuf>,
 
-    /// Anti-censorship strategy: SOCKS proxy URL used as а **fallback**
+    /// Anti-censorship strategy: SOCKS proxy URL used as a **fallback**
     /// when direct outbound dialing fails repeatedly (e.g., AS-level
-    /// block, ISP route hijack, или а transient TSPU rule).  Format:
+    /// block, ISP route hijack, or a transient TSPU rule).  Format:
     /// `socks5://127.0.0.1:9050` (local Tor) or `socks5://proxy.example:1080`
     /// (operator-controlled bridge).
     ///
@@ -3192,67 +3192,67 @@ pub struct TransportConfig {
     /// connector retries the peer URI wrapped through this proxy after
     /// the direct + NAT-fallback paths fail.  Closes #22, #23, #27
     /// (AS-level wholesale blocks) partially — Tor's exit nodes are
-    /// в diverse ASes by design, so а blocked AS on the operator's host
+    /// in diverse ASes by design, so a blocked AS on the operator's host
     /// is bypassed via the proxy hop.
     ///
-    /// **Not а replacement for multi-AS hosting**: see
+    /// **Not a replacement for multi-AS hosting**: see
     /// [`docs/internal/DEPLOYMENT_HARDENING.md`](../../docs/internal/DEPLOYMENT_HARDENING.md)
-    /// для the recommended infrastructure setup.
+    /// for the recommended infrastructure setup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_socks_fallback_proxy: Option<String>,
 
     /// Anti-censorship strategy P2 #7 — opt-in bandwidth-profile
-    /// mimicry.  When enabled, shapes outbound traffic к match а
+    /// mimicry.  When enabled, shapes outbound traffic to match a
     /// reference flow pattern (Chrome browsing / CDN download / etc.)
-    /// к defeat throughput-shaping DPI classifiers (#29-31).
+    /// to defeat throughput-shaping DPI classifiers (#29-31).
     ///
-    /// **Default `false`** — feature opt-in.  Currently а **design
-    /// landing-pad**: the config field is recognised но the wire-up
-    /// (output gating layer) is deferred к the activation epic.  See
+    /// **Default `false`** — feature opt-in.  Currently a **design
+    /// landing-pad**: the config field is recognised but the wire-up
+    /// (output gating layer) is deferred to the activation epic.  See
     /// [`docs/internal/PLAN_BANDWIDTH_MIMICRY.md`](../../docs/internal/PLAN_BANDWIDTH_MIMICRY.md)
-    /// для the activation triggers + scope.
+    /// for the activation triggers + scope.
     ///
     /// Operators wanting throughput-shape resistance NOW should use
-    /// the operator-side tc/qdisc option в
+    /// the operator-side tc/qdisc option in
     /// [`docs/internal/DEPLOYMENT_HARDENING.md`](../../docs/internal/DEPLOYMENT_HARDENING.md)
     /// (Option B in the #29-31 section).
     ///
-    /// **Fail-closed (audit batch 2026-05-23):** setting this к `true`
-    /// без also setting [`experimental_allow_noop_mimicry`] now causes
-    /// `cargo run` к exit с а validation error.  Pre-fix, the daemon
-    /// only WARN-logged и continued running — operators could believe
-    /// mimicry was active when in fact traffic was unchanged (а
-    /// dangerous false sense of anti-DPI protection).  Operators що
+    /// **Fail-closed (audit batch 2026-05-23):** setting this to `true`
+    /// without also setting [`experimental_allow_noop_mimicry`] now causes
+    /// `cargo run` to exit with a validation error.  Pre-fix, the daemon
+    /// only WARN-logged and continued running — operators could believe
+    /// mimicry was active when in fact traffic was unchanged (a
+    /// dangerous false sense of anti-DPI protection).  Operators that
     /// genuinely want the no-op landing-pad must also flip the
-    /// `experimental_allow_noop_mimicry` flag к confirm understanding.
+    /// `experimental_allow_noop_mimicry` flag to confirm understanding.
     #[serde(default)]
     pub bandwidth_mimicry_enabled: bool,
 
     /// Profile name for [`bandwidth_mimicry_enabled`].  Recognised
     /// values (per `PLAN_BANDWIDTH_MIMICRY.md`): `"chrome-browsing"`,
-    /// `"cdn-download"`, `"interactive-chat"`.  Currently а pure
+    /// `"cdn-download"`, `"interactive-chat"`.  Currently a pure
     /// landing-pad field — see the parent doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bandwidth_mimicry_profile: Option<String>,
 
-    /// Acknowledge that [`bandwidth_mimicry_enabled`] is currently а
-    /// no-op design landing-pad и accept the daemon starting без
-    /// actual mimicry.  Required gate paired с
+    /// Acknowledge that [`bandwidth_mimicry_enabled`] is currently a
+    /// no-op design landing-pad and accept the daemon starting without
+    /// actual mimicry.  Required gate paired with
     /// `bandwidth_mimicry_enabled = true` until the activation epic
     /// wires the output gating layer.  Audit batch 2026-05-23.
     #[serde(default, skip_serializing_if = "is_false")]
     pub experimental_allow_noop_mimicry: bool,
 
     /// **Phase 2 kill-switch — server-side**: list of obfs4 wire-format
-    /// variants the listener accepts, в priority order.  Default empty
-    /// (resolved к `["v1"]` in transport_glue) preserves pre-Phase-2
+    /// variants the listener accepts, in priority order.  Default empty
+    /// (resolved to `["v1"]` in transport_glue) preserves pre-Phase-2
     /// behavior bit-for-bit.
     ///
-    /// Operator activation sequence for а V1→V2 migration:
-    /// 1. Deploy binary с Phase 2 support, set `obfs4_accept_variants
+    /// Operator activation sequence for a V1→V2 migration:
+    /// 1. Deploy binary with Phase 2 support, set `obfs4_accept_variants
     ///    = ["v2", "v1"]` on **all servers** first — accepts both during
     ///    the grace period.
-    /// 2. Wait until all client hosts have been deployed с the same
+    /// 2. Wait until all client hosts have been deployed with the same
     ///    binary (clients still use V1 outbound — controlled by
     ///    `obfs4_client_variant`).
     /// 3. Flip `obfs4_client_variant = "v2"` on client hosts so
@@ -3267,10 +3267,10 @@ pub struct TransportConfig {
     pub obfs4_accept_variants: Vec<String>,
 
     /// **Phase 2 kill-switch — client-side**: obfs4 wire-format variant
-    /// used для outbound obfs4-tcp connects.  Default `None` (resolves
-    /// к V1 в transport_glue).  Accepted values: `"v1"`, `"v2"`.
+    /// used for outbound obfs4-tcp connects.  Default `None` (resolves
+    /// to V1 in transport_glue).  Accepted values: `"v1"`, `"v2"`.
     ///
-    /// Set к `"v2"` only after **all** target servers' `accept_variants`
+    /// Set to `"v2"` only after **all** target servers' `accept_variants`
     /// includes V2 — otherwise outbound connects silent-drop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obfs4_client_variant: Option<String>,
@@ -3344,7 +3344,7 @@ pub struct TlsClientConfig {
     /// seeds (Let's Encrypt, etc.). : this used
     /// to require the `tls-webpki-roots` build feature; that gate is
     /// gone (webpki-roots is now an unconditional dep), so this knob
-    /// works в every build.
+    /// works in every build.
     #[serde(default, skip_serializing_if = "is_false")]
     pub use_system_roots: bool,
 
@@ -3394,17 +3394,17 @@ pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// `admin_socket` — admin socket.
     pub admin_socket: Option<String>,
-    /// `admin_max_connections` — soft cap на concurrent admin
+    /// `admin_max_connections` — soft cap on concurrent admin
     /// connections.
-    /// Defaults к 32; operators can raise для high-frequency tooling
-    /// workloads OR lower к narrow the resource-budget envelope.
+    /// Defaults to 32; operators can raise for high-frequency tooling
+    /// workloads OR lower to narrow the resource-budget envelope.
     ///
-    /// Implementation: а semaphore с this many permits gates per-
-    /// connection task spawns. Excess connections ара refused
+    /// Implementation: a semaphore with this many permits gates per-
+    /// connection task spawns. Excess connections are refused
     /// (logged at info level + `admin.accept_refused_total` metric).
     /// Token auth already gates "who can connect"; this knob caps
-    /// "how many connections а single authorised UID can hold at
-    /// once" — protects against а bug или mis-tooling that spawns
+    /// "how many connections a single authorised UID can hold at
+    /// once" — protects against a bug or mis-tooling that spawns
     /// hundreds of admin clients simultaneously.
     #[serde(default = "GlobalConfig::default_admin_max_connections")]
     pub admin_max_connections: usize,
@@ -3491,63 +3491,63 @@ pub struct GlobalConfig {
     /// accepts raw JSON bundles (no signature envelope) instead of
     /// rejecting them.  Default `false`.
     ///
-    /// TLS gives channel auth ("bytes came от the CDN endpoint без
-    /// on-path tampering") но NOT endpoint auth.  Если CDN, CA,
-    /// hosting account или mirror endpoint is compromised, attacker
-    /// swaps the JSON для own peer list и raw-JSON mode merges those
+    /// TLS gives channel auth ("bytes came from the CDN endpoint without
+    /// on-path tampering") but NOT endpoint auth.  If CDN, CA,
+    /// hosting account or mirror endpoint is compromised, attacker
+    /// swaps the JSON for own peer list and raw-JSON mode merges those
     /// directly into the seed set.  Signed bundles (operator-signed,
     /// pinned issuer pubkey) close this class of compromise.
     ///
-    /// Production deployments should leave это `false` и provision а
-    /// signed bundle (см. `sign_bundle` CLI).  Set `true` ТОЛЬКО для
-    /// dev/testnet builds що haven't yet generated and published а
-    /// signed bundle.  Flag will be removed after а migration window
+    /// Production deployments should leave this `false` and provision a
+    /// signed bundle (see `sign_bundle` CLI).  Set `true` ONLY for
+    /// dev/testnet builds that haven't yet generated and published a
+    /// signed bundle.  Flag will be removed after a migration window
     /// once production operators have migrated.
     #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
     pub legacy_allow_unsigned_bootstrap: bool,
-    /// **Phase-2 Этап 11 slice 11d** enforcement flag.  When `true`,
-    /// `load_config` REFUSES к load configs that:
+    /// **Phase-2 Phase 11 slice 11d** enforcement flag.  When `true`,
+    /// `load_config` REFUSES to load configs that:
     ///   * Carry no `# VEIL_CONFIG_SIGNATURE_V1: …` header, OR
-    ///   * Carry а header but verification fails (tamper, wrong issuer
-    ///     under а pinned `VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY`).
+    ///   * Carry a header but verification fails (tamper, wrong issuer
+    ///     under a pinned `VEIL_CONFIG_TRUSTED_ISSUER_PUBKEY`).
     ///
     /// Default `false` (phase-1 warn-only — matches the pre-11d
-    /// behaviour where signed-but-tampered configs still load с а
-    /// WARN log).  Operators flip к `true` after every machine в the
+    /// behaviour where signed-but-tampered configs still load with a
+    /// WARN log).  Operators flip to `true` after every machine in the
     /// fleet has been signed AND verified.
     ///
     /// Chicken-and-egg disclaimer: setting `require_signed_config =
-    /// false` doesn't help an attacker — they would still need к
-    /// tamper other fields, и the signed envelope ALREADY catches
+    /// false` doesn't help an attacker — they would still need to
+    /// tamper other fields, and the signed envelope ALREADY catches
     /// that tamper.  The flag's main purpose is **operator-side
-    /// enforcement posture**, не attacker-side defence.
+    /// enforcement posture**, not attacker-side defence.
     #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
     pub require_signed_config: bool,
 
-    /// **Этап 10 slice 2c** — TLS ECH GREASE on outbound public-PKI
+    /// **Phase 10 slice 2c** — TLS ECH GREASE on outbound public-PKI
     /// HTTPS connections (currently the bootstrap fetch path).  When
     /// `true`, the client adds an Encrypted Client Hello GREASE
-    /// extension к ClientHello messages, defeating middlebox
-    /// fingerprinting що distinguishes ECH-capable от non-ECH
-    /// connections.  Censors що block ECH-capable traffic must then
-    /// choose between (а) blocking everything (visible failure mode)
-    /// и (b) allowing all TLS through.
+    /// extension to ClientHello messages, defeating middlebox
+    /// fingerprinting that distinguishes ECH-capable from non-ECH
+    /// connections.  Censors that block ECH-capable traffic must then
+    /// choose between (a) blocking everything (visible failure mode)
+    /// and (b) allowing all TLS through.
     ///
     /// **Slice history**:
     /// * Slice 2a (`f44bb512`) — foundation flag (no-op).
-    /// * Slice 2b — workspace migration от `rustls-ring` к
+    /// * Slice 2b — workspace migration from `rustls-ring` to
     ///   `rustls-aws-lc-rs` crypto provider + actual `EchMode::Grease(...)`
     ///   wiring at `connect_pki_verified_https_stream`.
-    /// * Slice 2c (this commit) — default flipped к `true`.  Bundled
-    ///   с the 2b implementation because the workspace gates passed
+    /// * Slice 2c (this commit) — default flipped to `true`.  Bundled
+    ///   with the 2b implementation because the workspace gates passed
     ///   under aws_lc_rs with no observed regressions.
-    /// * Slice 3 (future) — real ECH с `EchMode::Enable(EchConfig::new(...))`
-    ///   driven от DNS HTTPS records.  Requires operator-side DNS
+    /// * Slice 3 (future) — real ECH with `EchMode::Enable(EchConfig::new(...))`
+    ///   driven from DNS HTTPS records.  Requires operator-side DNS
     ///   publishing infra.
     ///
     /// Pins TLS 1.3 for the public-HTTPS path when `true` (ECH requires
     /// 1.3; modern CDNs all support it).  Operators stuck on TLS 1.2-
-    /// only CDNs can flip this к `false` к restore the pre-Этап-10
+    /// only CDNs can flip this to `false` to restore the pre-Phase-10
     /// posture.
     #[serde(default = "GlobalConfig::default_tls_ech_grease")]
     pub tls_ech_grease: bool,
@@ -3563,13 +3563,13 @@ impl GlobalConfig {
         32
     }
 
-    /// Etap 10 slice 2c — default flipped к `true`.  Operators on
-    /// TLS 1.2-only public CDNs can override к `false`.
+    /// Etap 10 slice 2c — default flipped to `true`.  Operators on
+    /// TLS 1.2-only public CDNs can override to `false`.
     pub(crate) fn default_tls_ech_grease() -> bool {
         true
     }
 
-    /// Project the tokio-runtime knobs из `[global]` в а standalone
+    /// Project the tokio-runtime knobs from `[global]` in a standalone
     /// `RuntimeConfig` that other binaries (ogate, oproxy) can reuse
     /// through `veil_cfg::build_tokio_runtime`.
     pub fn runtime_config(&self) -> crate::RuntimeConfig {
@@ -3674,7 +3674,7 @@ pub struct IdentityConfig {
     /// Inline passphrase for the ML-KEM decapsulation-key seed file.
     /// **Least-secure source**: stored alongside the encrypted file →
     /// offers protection only against config-leak-without-key-file
-    /// scenarios. Suitable для dev / smoke tests. Production deployments
+    /// scenarios. Suitable for dev / smoke tests. Production deployments
     /// should prefer [`Self::key_passphrase_file`] or
     /// [`Self::key_passphrase_prompt`]. A WARN is logged on startup if
     /// this is the resolved source. `None` = no inline passphrase.
@@ -3686,18 +3686,18 @@ pub struct IdentityConfig {
     ///   4. `key_passphrase` (this field)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_passphrase: Option<String>,
-    /// Path к а file containing the ML-KEM key passphrase. File MUST be
+    /// Path to a file containing the ML-KEM key passphrase. File MUST be
     /// `0o600` owner-readable; daemon reads first line, trims whitespace.
-    /// Compatible с systemd `LoadCredential=` (`/run/credentials/...`),
-    /// k8s Secret mounts, и vault-fetched files. Wins over inline
+    /// Compatible with systemd `LoadCredential=` (`/run/credentials/...`),
+    /// k8s Secret mounts, and vault-fetched files. Wins over inline
     /// [`Self::key_passphrase`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_passphrase_file: Option<std::path::PathBuf>,
     /// When `true`, daemon prompts on stdin for the passphrase at startup.
     /// Highest-security source — passphrase never touches disk / config.
-    /// Incompatible с systemd auto-start (no controlling tty); intended
-    /// для operator-supervised launches. If `true` AND prompt fails →
-    /// daemon refuses to start (does NOT fall back к other sources).
+    /// Incompatible with systemd auto-start (no controlling tty); intended
+    /// for operator-supervised launches. If `true` AND prompt fails →
+    /// daemon refuses to start (does NOT fall back to other sources).
     #[serde(default, skip_serializing_if = "is_false")]
     pub key_passphrase_prompt: bool,
     /// Background mining of a better identity nonce during idle periods.
@@ -3756,7 +3756,7 @@ fn default_lazy_mining() -> bool {
     // Opt-in: lazy_miner runs Ed25519 sign on every PoW nonce attempt to
     // upgrade identity difficulty toward `max_lazy_difficulty`. On small
     // VPS (1-2 vCPU) this burned ~40% CPU continuously, throttling the
-    // session loop's throughput. Flipped к opt-in so operators chasing
+    // session loop's throughput. Flipped to opt-in so operators chasing
     // higher identity difficulty turn it on explicitly via
     // `[identity] lazy_mining = true` in node.toml.
     false
@@ -4107,46 +4107,46 @@ pub struct ListenConfig {
     /// through PEX + DHT routing announcements.
     /// `Public` (default) — full gossip.
     /// `Trusted` — never advertised; clients learn via invite-bundle.
-    /// `Hidden` — never advertised + allowlist enforced на accept.
-    /// Backwards compat: legacy configs без `visibility` field treated
-    /// як `Public`.
+    /// `Hidden` — never advertised + allowlist enforced on accept.
+    /// Backwards compat: legacy configs without `visibility` field treated
+    /// as `Public`.
     #[serde(default, skip_serializing_if = "Visibility::is_default")]
     pub visibility: Visibility,
 
     /// Optional human-readable group tag, mostly diagnostic ("family",
     /// "snowflake-rotation", "internal-mesh").  Not used by daemon
-    /// logic; surfaced в logs + metrics labels.
+    /// logic; surfaced in logs + metrics labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_label: Option<String>,
 
-    /// Optional path к а listener-specific PSK file (32-byte base64
+    /// Optional path to a listener-specific PSK file (32-byte base64
     /// encoded).  Used by obfs4-tcp listeners to decouple cluster-wide
-    /// shared PSK от per-group secret.  None → fall back к
+    /// shared PSK from per-group secret.  None → fall back to
     /// `transport.obfs4_psk_file` (the deployment-wide PSK).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub psk_file: Option<std::path::PathBuf>,
 
     /// Per-listener allowlist of node_ids (hex, 32 bytes).  Only peers
-    /// whose handshake identity_pubkey hashes к а listed node_id can
-    /// establish а session through this listener.  Required for
-    /// `visibility = "hidden"`; optional reinforcement для `trusted`
+    /// whose handshake identity_pubkey hashes to a listed node_id can
+    /// establish a session through this listener.  Required for
+    /// `visibility = "hidden"`; optional reinforcement for `trusted`
     /// (where PSK protects too).  Empty/missing = no allowlist (allow
-    /// any peer що passes the PSK check).
+    /// any peer that passes the PSK check).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowlist_node_ids: Vec<String>,
 
-    /// Ephemeral binding mode — when set, daemon picks а random port
-    /// from `range`, retries `bind_retries` times на EADDRINUSE, и
+    /// Ephemeral binding mode — when set, daemon picks a random port
+    /// from `range`, retries `bind_retries` times on EADDRINUSE, and
     /// rotates after `rotation` interval.  `transport` field's port
     /// is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral: Option<EphemeralConfig>,
 
     /// PoW-Gated Rendezvous binding mode — when set, daemon does
-    /// NOT bind а port at startup.  А port is bound on-demand after
-    /// а requester completes а PoW-gated rendezvous handshake against
-    /// the existing OVL1 session плоскость.  Requires
-    /// `visibility = "stealth"`.  See [`OnDemandListenConfig`] и the
+    /// NOT bind a port at startup.  A port is bound on-demand after
+    /// a requester completes a PoW-gated rendezvous handshake against
+    /// the existing OVL1 session plane.  Requires
+    /// `visibility = "stealth"`.  See [`OnDemandListenConfig`] and the
     /// epic design doc `docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_demand: Option<OnDemandListenConfig>,
@@ -4180,90 +4180,90 @@ impl std::fmt::Debug for ListenConfig {
     }
 }
 
-/// Visibility level для а listen entry.  Controls gossip behaviour;
+/// Visibility level for a listen entry.  Controls gossip behaviour;
 /// see [`ListenConfig`].
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
-    /// Default — listener advertised via PEX + DHT.  Any peer на the
-    /// network can resolve this listener's URI и connect (subject к
+    /// Default — listener advertised via PEX + DHT.  Any peer on the
+    /// network can resolve this listener's URI and connect (subject to
     /// PSK / transport-level auth).
     #[default]
     Public,
-    /// Listener bound locally но NOT advertised anywhere.  Discovery is
-    /// out-of-band — operator hands clients an invite-bundle с the
+    /// Listener bound locally but NOT advertised anywhere.  Discovery is
+    /// out-of-band — operator hands clients an invite-bundle with the
     /// URI + PSK.  Inbound connections still verified by transport-
     /// level credential (PSK, TLS).
     Trusted,
-    /// As `Trusted`, AND inbound connection identity must match а
-    /// node_id в `allowlist_node_ids`.  Strictest mode: even if PSK
+    /// As `Trusted`, AND inbound connection identity must match a
+    /// node_id in `allowlist_node_ids`.  Strictest mode: even if PSK
     /// leaks, connection rejected unless peer's signed identity matches.
     Hidden,
-    /// PoW-Gated Rendezvous (designed в `docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`).
+    /// PoW-Gated Rendezvous (designed in `docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`).
     /// Listener is **not bound** at startup.  Daemon binds an ephemeral
-    /// port on-demand только after а requester completes а PoW-gated
+    /// port on-demand only after a requester completes a PoW-gated
     /// rendezvous handshake (see `[listen.on_demand]` config block).
-    /// The bound listener accepts а bounded number of sessions within
-    /// а short TTL и then auto-closes.  IP becomes invisible к Shodan/
+    /// The bound listener accepts a bounded number of sessions within
+    /// a short TTL and then auto-closes.  IP becomes invisible to Shodan/
     /// nmap-style scanners since no port is open by default.
     Stealth,
 }
 
 impl Visibility {
-    /// `is_default` — used by serde к omit the field когда value =
+    /// `is_default` — used by serde to omit the field when value =
     /// `Public` (backwards compat).
     pub fn is_default(&self) -> bool {
         matches!(self, Visibility::Public)
     }
 
-    /// Whether this listener's transport URI должен be published в DHT
-    /// (`SignedTransportAnnouncement`) и returned through PEX walks.
+    /// Whether this listener's transport URI must be published in DHT
+    /// (`SignedTransportAnnouncement`) and returned through PEX walks.
     pub fn is_advertisable(&self) -> bool {
         matches!(self, Visibility::Public)
     }
 
     /// Whether incoming connections require their handshake-attested
-    /// identity к match the listener's `allowlist_node_ids`.
+    /// identity to match the listener's `allowlist_node_ids`.
     pub fn requires_allowlist_match(&self) -> bool {
         matches!(self, Visibility::Hidden)
     }
 
     /// Whether this listener uses the PoW-Gated Rendezvous flow
-    /// (listener bound on-demand only after а valid request lands).
+    /// (listener bound on-demand only after a valid request lands).
     /// Stealth listeners skip the startup-time physical bind in
-    /// `spawn_listeners`; the actual port comes alive только когда
+    /// `spawn_listeners`; the actual port comes alive only when
     /// the rendezvous controller invokes its BindClosure.
     pub fn is_stealth(&self) -> bool {
         matches!(self, Visibility::Stealth)
     }
 }
 
-/// Ephemeral random-port configuration для а listener.  See
+/// Ephemeral random-port configuration for a listener.  See
 /// [`ListenConfig::ephemeral`].
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EphemeralConfig {
-    /// Inclusive port range from which а random bind port is chosen.
-    /// `[10000, 60000]` covers а wide non-privileged range без typical
-    /// well-known service ports.  Use narrower range if blending с
-    /// specific protocol ports (e.g. `[3306, 3306]` для MySQL-SSL
+    /// Inclusive port range from which a random bind port is chosen.
+    /// `[10000, 60000]` covers a wide non-privileged range without typical
+    /// well-known service ports.  Use narrower range if blending with
+    /// specific protocol ports (e.g. `[3306, 3306]` for MySQL-SSL
     /// mimicry).
     pub range: (u16, u16),
 
-    /// Rotation interval (ISO-8601 duration или seconds-numeric).
-    /// Listener rebinds на а fresh random port after this elapses.
-    /// Existing sessions on the old port get а grace period before
+    /// Rotation interval (ISO-8601 duration or seconds-numeric).
+    /// Listener rebinds on a fresh random port after this elapses.
+    /// Existing sessions on the old port get a grace period before
     /// it's closed.
     pub rotation: String, // "3d", "12h", "300s" — parsed at runtime
 
-    /// Number of bind retries when the random port is already в use.
-    /// `0` disables retry (fail если first pick collides).  Default 64
-    /// gives ~99.999% success rate в а 50k-port range under typical
+    /// Number of bind retries when the random port is already in use.
+    /// `0` disables retry (fail if first pick collides).  Default 64
+    /// gives ~99.999% success rate in a 50k-port range under typical
     /// load.
     #[serde(default = "default_bind_retries")]
     pub bind_retries: u32,
 
-    /// Grace period после rotation during which old listener is kept
-    /// alive для in-flight sessions.  Default "30m".
+    /// Grace period after rotation during which old listener is kept
+    /// alive for in-flight sessions.  Default "30m".
     #[serde(default = "default_grace_period")]
     pub grace_period: String,
 }
@@ -4276,35 +4276,35 @@ fn default_grace_period() -> String {
     "30m".to_owned()
 }
 
-/// PoW-Gated Rendezvous configuration для а listener entry.  See
-/// [`ListenConfig::on_demand`].  Listener bound on-demand only после
-/// а valid PoW-gated request lands; no port is open by default.
+/// PoW-Gated Rendezvous configuration for a listener entry.  See
+/// [`ListenConfig::on_demand`].  Listener bound on-demand only after
+/// a valid PoW-gated request lands; no port is open by default.
 ///
-/// Threat model + full design documented в
+/// Threat model + full design documented in
 /// `docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct OnDemandListenConfig {
-    /// Inclusive random-port range от which the on-demand bind picks.
+    /// Inclusive random-port range from which the on-demand bind picks.
     /// Matches the [`EphemeralConfig::range`] semantics; wide ranges
-    /// (50000-60000) reduce collision probability при concurrent
+    /// (50000-60000) reduce collision probability under concurrent
     /// requests.
     pub range: (u16, u16),
 
-    /// Required PoW difficulty в leading-zero-bits.  Production
-    /// recommendation: 24 bits (~16M attempts ≈ 0.5 s on а 2-vCPU
+    /// Required PoW difficulty in leading-zero-bits.  Production
+    /// recommendation: 24 bits (~16M attempts ≈ 0.5 s on a 2-vCPU
     /// VPS).  Higher value = stronger anti-spam, slower legit
     /// requesters.  Verifier accepts requests claiming ≥ this value;
     /// requests below are rejected.
     pub pow_difficulty: u32,
 
     /// Listener TTL specification (e.g. `"5m"`, `"300s"`).  After
-    /// this elapses от bind moment the slot's accept-loop exits и
+    /// this elapses from bind moment the slot's accept-loop exits and
     /// the listener drops, regardless of whether any session was
     /// accepted.
     pub ttl: String,
 
     /// Maximum concurrent in-flight on-demand listener slots.  Caps
-    /// FD-table consumption against а PoW-funded burst.  Production
+    /// FD-table consumption against a PoW-funded burst.  Production
     /// recommendation: 16-32.
     #[serde(default = "default_max_concurrent_slots")]
     pub max_concurrent: usize,
@@ -4312,17 +4312,17 @@ pub struct OnDemandListenConfig {
     /// Per-requester rate-limit spec, format `"N/period"` where
     /// period is `s` / `m` / `h` / `d`.  Examples: `"3/h"` (3 grants
     /// per hour per requester pubkey), `"1/m"` (one grant per minute).
-    /// Independent от the global concurrent cap.
+    /// Independent from the global concurrent cap.
     #[serde(default = "default_rate_limit")]
     pub rate_limit: String,
 
     /// Maximum accepted sessions per slot before retiring it.  Default
     /// 1 (one-shot rendezvous).  Higher values support multi-device
-    /// pairing flows где several connections arrive в quick succession.
+    /// pairing flows where several connections arrive in quick succession.
     #[serde(default = "default_max_accepts")]
     pub max_accepts: usize,
 
-    /// Number of bind retries when the random port is already в use.
+    /// Number of bind retries when the random port is already in use.
     /// Mirrors [`EphemeralConfig::bind_retries`].
     #[serde(default = "default_bind_retries")]
     pub bind_retries: u32,
@@ -4434,7 +4434,7 @@ mod listen_visibility_tests {
         assert_eq!(on_demand.pow_difficulty, 24);
     }
 
-    /// Backwards-compat: configs без the new fields parse correctly.
+    /// Backwards-compat: configs without the new fields parse correctly.
     #[test]
     fn legacy_config_parses() {
         let toml_src = r#"
@@ -4449,7 +4449,7 @@ mod listen_visibility_tests {
         assert!(lc.group_label.is_none());
     }
 
-    /// Full-featured: new config с все fields parses + serializes round-trip.
+    /// Full-featured: new config with all fields parses + serializes round-trip.
     #[test]
     fn full_listen_config_round_trip() {
         let toml_src = r#"
@@ -4496,7 +4496,7 @@ mod listen_visibility_tests {
     }
 
     /// Public visibility omits serialization (backwards compat — old
-    /// tools що don't recognize the field still parse the file).
+    /// tools that don't recognize the field still parse the file).
     #[test]
     fn public_visibility_omitted_in_serialized_output() {
         let lc = ListenConfig {
@@ -4529,7 +4529,7 @@ mod listen_visibility_tests {
 // can consume it without depending on cfg.
 pub use veil_types::MetricsConfig;
 
-// P-Net Phase 1: NetworkConfig + membership-cert types live в
+// P-Net Phase 1: NetworkConfig + membership-cert types live in
 // veil-types so other crates (handshake, DHT ban-list) can reference
 // them without depending on `cfg`.
 pub use veil_types::{MEMBERSHIP_CERT_VERSION, MembershipCert, NetworkConfig, NetworkMode};
@@ -4726,7 +4726,7 @@ mod abuse_per_peer_byte_burst_tests {
     fn epic483_6b_resolved_burst_is_none_when_rate_not_set() {
         // Per-peer enforcement disabled (rate=None) — burst is
         // moot; resolved helper returns None so callers don't
-        // accidentally enable enforcement через only-burst-set
+        // accidentally enable enforcement through only-burst-set
         // misconfig.
         let cfg = AbuseConfig {
             per_peer_bytes_per_sec: None,
@@ -5113,24 +5113,24 @@ mod epic_117_defaults {
         );
     }
 
-    // ── Этап 10 slice 2c: tls_ech_grease default = true ──
+    // ── Phase 10 slice 2c: tls_ech_grease default = true ──
 
     /// Default is `true` after slice 2c.  Operators on TLS-1.2-only
-    /// CDNs override к `false`.  Guards against accidental
-    /// default-reversion в future refactors.
+    /// CDNs override to `false`.  Guards against accidental
+    /// default-reversion in future refactors.
     #[test]
     fn etap10_slice2c_tls_ech_grease_defaults_to_true() {
         let g = GlobalConfig::default();
         assert!(
             g.tls_ech_grease,
-            "slice 2c flipped the default к true; operators на TLS-1.2-only \
-             CDNs override к false explicitly"
+            "slice 2c flipped the default to true; operators on TLS-1.2-only \
+             CDNs override to false explicitly"
         );
     }
 
-    /// Round-trip preserves а `false` override across serialize / deserialize.
-    /// Guards against а future serde-attr regression що would silently
-    /// drop the override и default back к `true`.
+    /// Round-trip preserves a `false` override across serialize / deserialize.
+    /// Guards against a future serde-attr regression that would silently
+    /// drop the override and default back to `true`.
     #[test]
     fn etap10_slice2c_tls_ech_grease_roundtrips_when_overridden_false() {
         let g = GlobalConfig {

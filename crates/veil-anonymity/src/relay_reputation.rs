@@ -1,41 +1,41 @@
 //! Per-sender-local anonymity-relay reputation slice (Epic 482.3 / 482.4).
 //!
-//! Anonymity relays advertise `advertised_bps` в [`crate::directory::
-//! RelayDirectoryEntry`] which is operator-self-reported и unverifiable
+//! Anonymity relays advertise `advertised_bps` in [`crate::directory::
+//! RelayDirectoryEntry`] which is operator-self-reported and unverifiable
 //! at directory-publish time. Relays can:
 //!
 //! - Lie about bandwidth (claim 1 Gbps, deliver 1 Mbps under load).
 //! - Drop circuit cells silently after admitting the build.
-//! - Stall mid-stream / time out на relayed cells.
+//! - Stall mid-stream / time out on relayed cells.
 //!
 //! [`crate::circuit_builder::pick_circuit_hops_latency_aware`] selects
-//! relays purely by RTT — а relay что admits builds quickly but then
+//! relays purely by RTT — a relay that admits builds quickly but then
 //! drops or stalls cells keeps winning circuit slots until the operator
-//! intervenes. This module gives the sender а short-term memory of
-//! "which relays did NOT work as advertised" и downweights them in the
+//! intervenes. This module gives the sender a short-term memory of
+//! "which relays did NOT work as advertised" and downweights them in the
 //! latency-aware sort.
 //!
 //! ## Threat model addressed
 //!
-//! Sybil-relay flooding и lying-about-advertised-bps are documented в
+//! Sybil-relay flooding and lying-about-advertised-bps are documented in
 //! [`crate::directory`] as "out of scope here". Phase A of the mitigation
-//! is exactly this module: per-sender-local failure counter that adds а
-//! latency penalty к the relay's RTT score. After а handful of observed
+//! is exactly this module: per-sender-local failure counter that adds a
+//! latency penalty to the relay's RTT score. After a handful of observed
 //! drops, the relay sorts behind alternatives regardless of how low its
 //! true RTT is.
 //!
-//! ## Symmetry с anycast reputation
+//! ## Symmetry with anycast reputation
 //!
 //! This is the same shape as [`veil_anycast::AnycastReputation`]:
-//! - LRU-bounded HashMap по node_id (no service_tag dimension — а relay
+//! - LRU-bounded HashMap by node_id (no service_tag dimension — a relay
 //!   misbehaviour applies to all circuit usage of that relay).
-//! - Failures only; successes are peer-game-able и not tracked.
+//! - Failures only; successes are peer-game-able and not tracked.
 //! - No wall-clock decay; LRU eviction bounds memory.
 //! - No cross-sender sharing; per-sender-local Phase A only.
 //!
 //! Phase B (cross-sender gossip / signed reputation attestations) is
 //! deferred for the same reasons as anycast Phase B: wire-protocol
-//! work multiplier и new attack vectors (sybil-poisoning reputation
+//! work multiplier and new attack vectors (sybil-poisoning reputation
 //! gossip itself).
 
 use std::collections::HashMap;
@@ -50,14 +50,14 @@ use veil_util::lock;
 pub const RELAY_REPUTATION_LRU_CAP: usize = 4096;
 
 /// Latency penalty (milliseconds) added per recorded failure. Applied
-/// linearly к the relay's RTT score during sort in the latency-aware
+/// linearly to the relay's RTT score during sort in the latency-aware
 /// circuit selector.
 ///
 /// Tuning rationale: typical relay RTTs are 30–300 ms; common bad-relay
-/// alternatives differ by 50–200 ms. 500 ms per failure pushes а
-/// misbehaving relay behind viable alternatives after а single observed
-/// drop, и past most candidates after 2–3 drops. Linear (not quadratic)
-/// to keep the math obvious and avoid runaway penalties from а single
+/// alternatives differ by 50–200 ms. 500 ms per failure pushes a
+/// misbehaving relay behind viable alternatives after a single observed
+/// drop, and past most candidates after 2–3 drops. Linear (not quadratic)
+/// to keep the math obvious and avoid runaway penalties from a single
 /// blip.
 pub const FAILURE_PENALTY_MS: u32 = 500;
 
@@ -75,7 +75,7 @@ struct Inner {
 
 /// Bounded, in-memory relay-failure ledger.
 ///
-/// Construct once per sender (or share across senders within а node).
+/// Construct once per sender (or share across senders within a node).
 /// Clone-cheap if wrapped in [`std::sync::Arc`].
 pub struct RelayReputation {
     inner: Mutex<Inner>,
@@ -90,12 +90,12 @@ impl Default for RelayReputation {
 }
 
 impl RelayReputation {
-    /// Reputation slice с default LRU capacity.
+    /// Reputation slice with default LRU capacity.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Reputation slice с custom LRU capacity. Use в tests or memory-
+    /// Reputation slice with custom LRU capacity. Use in tests or memory-
     /// constrained environments. Capacity of 0 disables tracking
     /// entirely (every insert no-ops; penalty always returns 0).
     pub fn with_capacity(cap: usize) -> Self {
@@ -110,9 +110,9 @@ impl RelayReputation {
         self.tick.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Record one observed failure для the relay.
+    /// Record one observed failure for the relay.
     ///
-    /// Caller responsibility: only invoke after а concrete failure signal
+    /// Caller responsibility: only invoke after a concrete failure signal
     /// — circuit-build timeout, mid-stream stall, malformed forward, or
     /// gross bandwidth-claim violation. False positives directly hurt
     /// honest relays.
@@ -137,8 +137,8 @@ impl RelayReputation {
         }
     }
 
-    /// RTT penalty (in ms) для the relay's latency-aware score. Returns
-    /// 0 если no failures recorded. Querying also touches the entry для
+    /// RTT penalty (in ms) for the relay's latency-aware score. Returns
+    /// 0 if no failures recorded. Querying also touches the entry for
     /// LRU purposes.
     pub fn rtt_penalty_ms(&self, node_id: [u8; 32]) -> u32 {
         if self.cap == 0 {

@@ -434,32 +434,32 @@ impl NodeRuntime {
         rt.lock().await.apply_reload_after_stop(config).await
     }
 
-    /// **Push а config к the running daemon без going через the
+    /// **Push a config to the running daemon without going through the
     /// filesystem.**  Parses + validates `toml_content` first; on
-    /// success, optionally persists к `self.config_path`, then
+    /// success, optionally persists to `self.config_path`, then
     /// performs the full stop → swap → restart cycle used by
     /// [`Self::reload_via_arc`].
     ///
-    /// `persist = false` keeps the change in-memory only — useful для
+    /// `persist = false` keeps the change in-memory only — useful for
     /// the messenger / embedded use case where the app owns config
-    /// storage в а secure backend (Keychain, EncryptedSharedPreferences,
-    /// future TPM-sealed store) и passing the bytes через POSIX file
-    /// I/O would leak the plaintext к а readable inode.
+    /// storage in a secure backend (Keychain, EncryptedSharedPreferences,
+    /// future TPM-sealed store) and passing the bytes through POSIX file
+    /// I/O would leak the plaintext to a readable inode.
     ///
-    /// `persist = true` атомарно writes к `self.config_path` (через
-    /// `veil_util::atomic_write` so а mid-write crash never produces
+    /// `persist = true` atomically writes to `self.config_path` (through
+    /// `veil_util::atomic_write` so a mid-write crash never produces
     /// truncated garbage) before applying.  Used by server-admin
     /// orchestration (Terraform / ansible / scripts) that wants new
-    /// configs к survive daemon restarts.
+    /// configs to survive daemon restarts.
     ///
     /// **Failure mode:** validation rejects the config (TOML parse
     /// error, missing required field, etc.) BEFORE any state change.
     /// The running daemon is left untouched; the returned `Err` carries
-    /// the structured `ConfigError` for the caller к surface к the user.
+    /// the structured `ConfigError` for the caller to surface to the user.
     ///
     /// **Note on identity rotation:** an apply that changes the
     /// `[identity]` block rotates the daemon's keypair — peers will
-    /// observe а node_id change и rebuild sessions от scratch.  Use
+    /// observe a node_id change and rebuild sessions from scratch.  Use
     /// sparingly; usually `[identity]` is fixed for the daemon's
     /// lifetime.
     pub async fn apply_config_bytes_via_arc(
@@ -468,11 +468,11 @@ impl NodeRuntime {
         persist: bool,
     ) -> Result<()> {
         // Phase 1 — validation (no daemon-state mutation).  Parse the
-        // TOML и run the same validate-rules the on-disk reload path
-        // runs.  Format currently hard-coded к TOML — JSON / future
-        // formats can be added later если the messenger build needs
+        // TOML and run the same validate-rules the on-disk reload path
+        // runs.  Format currently hard-coded to TOML — JSON / future
+        // formats can be added later if the messenger build needs
         // them.  `parse_toml_str` is exposed publicly through cfg::*
-        // expressly для this use case (the `format` module is
+        // expressly for this use case (the `format` module is
         // pub, so we go through the helper).
         // audit U11: enforce signed-config on this runtime-injection path too.
         // The on-disk loader (`load_config`) refuses a non-Verified config when
@@ -491,16 +491,16 @@ impl NodeRuntime {
         }
 
         // Phase 2 — optional persistence.  Done BEFORE the
-        // stop-swap-restart cycle so а crash mid-cycle leaves either
+        // stop-swap-restart cycle so a crash mid-cycle leaves either
         // the OLD running config OR the persisted-but-not-yet-applied
         // new config on disk (next daemon start picks up the new one).
         if persist {
             persist_applied_config(&config_path, toml_content, &config)?;
         }
 
-        // Phase 3 — stop the running services и apply the new config
+        // Phase 3 — stop the running services and apply the new config
         // via the existing reload pipeline.  Reuses `apply_reload_after_stop`
-        // verbatim so behavior matches `Reload` exactly от this point on.
+        // verbatim so behavior matches `Reload` exactly from this point on.
         let stop_ctx = {
             let mut s = rt.lock().await;
             s.take_stop_tasks_context()
@@ -556,20 +556,20 @@ impl NodeRuntime {
 
         let listens = self.listens();
         // Follow-up #2: collect ALL stealth listeners first, then wire
-        // а single controller с the combined destination pool.  This
+        // a single controller with the combined destination pool.  This
         // replaces the prior «refuse second stealth listener» error
-        // path с even round-robin distribution across N destinations
+        // path with even round-robin distribution across N destinations
         // (shared PoW/rate/max_concurrent policy fields enforced via
-        // first-listener-canonical с per-extra match check).
+        // first-listener-canonical with per-extra match check).
         let mut stealth_listeners: Vec<ListenConfigEntry> = Vec::new();
         for listen in listens {
             // PoW-Gated Rendezvous Slice 5b: visibility=stealth listeners
             // skip the startup-time physical bind.  Their port comes alive
-            // on-demand only после а valid PoW-gated request lands; the
+            // on-demand only after a valid PoW-gated request lands; the
             // controller (built here, stored on `NodeRuntime`) drives the
             // bind asynchronously through its BindClosure.  Operators que
             // configure `visibility = "stealth"` without an `[on_demand]`
-            // block get а refusal (config-time validation should catch
+            // block get a refusal (config-time validation should catch
             // this too once Slice 5c lands operator-docs).
             if listen.visibility.is_stealth() {
                 stealth_listeners.push(listen);
@@ -631,7 +631,7 @@ impl NodeRuntime {
             // handshake tasks (pre-`live_sessions`-cap window). Without this
             // an inbound TCP flood spawns unbounded tokio tasks before the
             // post-handshake `max_concurrent` check kicks in, pinning ~5 KB
-            // per pending handshake. Capacity derived от `max_concurrent`
+            // per pending handshake. Capacity derived from `max_concurrent`
             // at NodeRuntime construction (see `inbound_handshake_sem` field).
             let inbound_sem = Arc::clone(&self.inbound_handshake_sem);
             let mut shutdown_rx = shutdown_tx.subscribe();
@@ -639,9 +639,9 @@ impl NodeRuntime {
 
             // ── Phase 5f Step 3 — ephemeral-port rotation ────────────────
             // Per-listener swap channel allows the rotator's consumer task
-            // к replace the listener mid-flight without restarting the
-            // accept loop.  Capacity 2 gives slack для а rotation event
-            // arriving while the loop is still busy с the previous one.
+            // to replace the listener mid-flight without restarting the
+            // accept loop.  Capacity 2 gives slack for a rotation event
+            // arriving while the loop is still busy with the previous one.
             let (listener_swap_tx, mut listener_swap_rx) =
                 tokio::sync::mpsc::channel::<Box<dyn veil_transport::TransportListener>>(2);
             if let Some(eph) = listen.ephemeral.as_ref() {
@@ -654,11 +654,11 @@ impl NodeRuntime {
                     listener_swap_tx.clone(),
                 )?;
             }
-            // Keep `listener_swap_tx` alive в the captured task — dropping
-            // it would close the channel и prevent late rotations from
+            // Keep `listener_swap_tx` alive in the captured task — dropping
+            // it would close the channel and prevent late rotations from
             // landing (even though rotator is task-spawned, the tx half
             // here is the canonical owner since the rotator-consumer
-            // gets а cloned tx).
+            // gets a cloned tx).
             let _swap_tx_keepalive = listener_swap_tx;
 
             let handle = tokio::spawn(async move {
@@ -667,11 +667,11 @@ impl NodeRuntime {
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
                         // ── Listener swap (Phase 5f Step 3) ────────────
-                        // Rotator-consumer pushes а freshly bound listener
-                        // here.  Replace the current one и loop back; the
+                        // Rotator-consumer pushes a freshly bound listener
+                        // here.  Replace the current one and loop back; the
                         // old listener drops here, closing its socket.
                         // Existing accepted connections (already handed
-                        // off к session-spawn tasks) are unaffected.
+                        // off to session-spawn tasks) are unaffected.
                         Some(new_listener) = listener_swap_rx.recv() => {
                             let new_addr = new_listener.local_addr();
                             logger.info(
@@ -682,7 +682,7 @@ impl NodeRuntime {
                                 ),
                             );
                             current_listener = new_listener;
-                            // Update the published local_addr на the state
+                            // Update the published local_addr on the state
                             // entry so admin surfaces reflect the new port.
                             {
                                 let mut state_lock = lock!(state);
@@ -715,8 +715,8 @@ impl NodeRuntime {
                                     drop(connection);
                                     continue;
                                 }
-                                // j: demoted к DEBUG. Under sustained
-                                // peer-retry-after-ban patterns this fires ~30/sec на bootstrap;
+                                // j: demoted to DEBUG. Under sustained
+                                // peer-retry-after-ban patterns this fires ~30/sec on bootstrap;
                                 // operational visibility preserved via
                                 // `veil_inbound_sessions_total` counter.
                                 logger.debug(
@@ -785,7 +785,7 @@ impl NodeRuntime {
                                     },
                                     connection,
                                 );
-                                // wrap handle к keep `permit` alive
+                                // wrap handle to keep `permit` alive
                                 // for the duration of the spawned task. Permit auto-drops on
                                 // task exit (success or handshake-timeout), freeing one slot
                                 // back to `inbound_handshake_sem`.
@@ -818,9 +818,9 @@ impl NodeRuntime {
             lock_tasks(&self.tasks).listeners.push(handle);
         }
 
-        // Follow-up #2: wire all stealth listeners as а SINGLE
-        // controller with а multi-destination policy.  No-op когда
-        // zero stealth listeners были configured.
+        // Follow-up #2: wire all stealth listeners as a SINGLE
+        // controller with a multi-destination policy.  No-op when
+        // zero stealth listeners were configured.
         if !stealth_listeners.is_empty() {
             self.wire_rendezvous_controller_for_stealth(&stealth_listeners)?;
         } else {
@@ -839,18 +839,18 @@ impl NodeRuntime {
         Ok(())
     }
 
-    /// Phase 5f Step 3 — bridge between а listen entry's
-    /// `EphemeralConfig` и the rotator + consumer pipeline в
+    /// Phase 5f Step 3 — bridge between a listen entry's
+    /// `EphemeralConfig` and the rotator + consumer pipeline in
     /// [`super::ephemeral_rotator::wire_ephemeral_rotator`].  Resolves
-    /// the identity signing key + node_id from runtime state и stores
-    /// the rotator+consumer JoinHandles в `self.tasks` for clean
+    /// the identity signing key + node_id from runtime state and stores
+    /// the rotator+consumer JoinHandles in `self.tasks` for clean
     /// shutdown.
     ///
-    /// Refuses when the local identity is не Ed25519 — veil-proto's
-    /// `sign_transport_migration_notify` signs с ed25519-dalek и does
+    /// Refuses when the local identity is not Ed25519 — veil-proto's
+    /// `sign_transport_migration_notify` signs with ed25519-dalek and does
     /// not support hybrid keys yet.  Operator must either drop the
-    /// `ephemeral` config block on the listen или migrate the node к
-    /// а pure-Ed25519 identity.
+    /// `ephemeral` config block on the listen or migrate the node to
+    /// a pure-Ed25519 identity.
     #[allow(clippy::too_many_arguments)]
     fn wire_ephemeral_rotator_for_listen(
         &mut self,
@@ -871,7 +871,7 @@ impl NodeRuntime {
                  — drop the [listen.ephemeral] block or migrate identity",
             )));
         }
-        // Decode the base64 private key to а raw 32-byte seed.
+        // Decode the base64 private key to a raw 32-byte seed.
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         let raw = STANDARD
             .decode(self.identity.local_identity.private_key.trim())
@@ -915,8 +915,8 @@ impl NodeRuntime {
         })?;
 
         // Store JoinHandles so shutdown cleanly aborts both tasks.
-        // The `shutdown` watch sender is dropped с the tasks block —
-        // its drop signals the rotator's internal channels к close.
+        // The `shutdown` watch sender is dropped with the tasks block —
+        // its drop signals the rotator's internal channels to close.
         let mut tasks = lock_tasks(&self.tasks);
         tasks.listeners.push(handles.rotator);
         tasks.listeners.push(handles.consumer);
@@ -924,9 +924,9 @@ impl NodeRuntime {
         // Stash the shutdown sender so the rotator loop's
         // `shutdown_rx.changed()` arm does NOT fire immediately on
         // sender-drop (which would exit the loop before any rotation
-        // ever happens).  Runtime shutdown sends `true` on each сидер
-        // в this list during graceful exit; until then the senders
-        // sit idle и the rotator just sleeps on its rotation interval.
+        // ever happens).  Runtime shutdown sends `true` on each seeder
+        // in this list during graceful exit; until then the senders
+        // sit idle and the rotator just sleeps on its rotation interval.
         veil_util::lock!(self.ephemeral_rotator_shutdowns).push(handles.shutdown);
 
         self.logger.info(
@@ -940,29 +940,29 @@ impl NodeRuntime {
     }
 
     /// PoW-Gated Rendezvous Slice 5c: build the rendezvous controller
-    /// для **all** `visibility = "stealth"` listeners и attach the
-    /// resulting controller к the dispatcher via а weak ref.  Follow-up #2
-    /// (multi-stealth) — replaces the prior one-listener-only path с а
+    /// for **all** `visibility = "stealth"` listeners and attach the
+    /// resulting controller to the dispatcher via a weak ref.  Follow-up #2
+    /// (multi-stealth) — replaces the prior one-listener-only path with a
     /// single controller pooling N destination triples (port range +
     /// advertise host + scheme) with unified policy fields shared from
     /// the first listener's `[on_demand]` block.
     ///
     /// Constraints enforced:
-    /// * Every listener must include а `[listen.on_demand]` section.
+    /// * Every listener must include a `[listen.on_demand]` section.
     /// * Identity must be Ed25519 (wire sig path).
     /// * Every listener's `pow_difficulty`, `rate_limit`, and
     ///   `max_concurrent` MUST match the first listener's — these are
     ///   *node-wide* policy fields, not per-destination.
     ///
     /// **Scope (Slice 5c + follow-up #2):** ships the **production**
-    /// `RendezvousBinder` що (а) clones the base `TransportContext` +
+    /// `RendezvousBinder` that (a) clones the base `TransportContext` +
     /// sets per-request `obfs4_psk`, (b) calls `TransportRegistry::bind(uri, ctx).await`,
-    /// (c) spawns а bounded accept task (TTL + accept-budget).  Multi-
+    /// (c) spawns a bounded accept task (TTL + accept-budget).  Multi-
     /// destination grants round-robin across all configured stealth
-    /// listeners (см. [`RendezvousController::pick_destination`]).
+    /// listeners (see. [`RendezvousController::pick_destination`]).
     /// The binder is wired against the FIRST stealth listener's
-    /// `AcceptBundle` для observability — `session.accept` events
-    /// carry that listener_handle even когда the grant came от an
+    /// `AcceptBundle` for observability — `session.accept` events
+    /// carry that listener_handle even when the grant came from an
     /// extra destination's port range.
     fn wire_rendezvous_controller_for_stealth(&self, listens: &[ListenConfigEntry]) -> Result<()> {
         use super::rendezvous_binder::{AcceptBundle, RendezvousBinder};
@@ -978,7 +978,7 @@ impl NodeRuntime {
 
         // Identity must be Ed25519 — wire frame's sig path uses
         // ed25519-dalek.  Same constraint as Phase 5e migration notify
-        // и Phase 5f ephemeral rotator.
+        // and Phase 5f ephemeral rotator.
         let algo = self.identity.local_identity.algo;
         if !matches!(algo, veil_cfg::SignatureAlgorithm::Ed25519) {
             return Err(NodeError::Unsupported(format!(
@@ -1007,37 +1007,37 @@ impl NodeRuntime {
         let first_listen_id = first.listen_id;
         let Some(first_on_demand) = first.on_demand.as_ref() else {
             return Err(NodeError::Unsupported(format!(
-                "listen_id={first_listen_id} visibility=stealth requires а [listen.on_demand] block",
+                "listen_id={first_listen_id} visibility=stealth requires a [listen.on_demand] block",
             )));
         };
         for extra in listens.iter().skip(1) {
             let id = extra.listen_id;
             let Some(od) = extra.on_demand.as_ref() else {
                 return Err(NodeError::Unsupported(format!(
-                    "listen_id={id} visibility=stealth requires а [listen.on_demand] block",
+                    "listen_id={id} visibility=stealth requires a [listen.on_demand] block",
                 )));
             };
             if od.pow_difficulty != first_on_demand.pow_difficulty {
                 return Err(NodeError::InvalidArgument(format!(
-                    "listen_id={id} pow_difficulty={} differs от first stealth listener's {} (must match — node-wide policy)",
+                    "listen_id={id} pow_difficulty={} differs from first stealth listener's {} (must match — node-wide policy)",
                     od.pow_difficulty, first_on_demand.pow_difficulty,
                 )));
             }
             if od.rate_limit != first_on_demand.rate_limit {
                 return Err(NodeError::InvalidArgument(format!(
-                    "listen_id={id} rate_limit={} differs от first stealth listener's {} (must match — node-wide policy)",
+                    "listen_id={id} rate_limit={} differs from first stealth listener's {} (must match — node-wide policy)",
                     od.rate_limit, first_on_demand.rate_limit,
                 )));
             }
             if od.max_concurrent != first_on_demand.max_concurrent {
                 return Err(NodeError::InvalidArgument(format!(
-                    "listen_id={id} max_concurrent={} differs от first stealth listener's {} (must match — node-wide policy)",
+                    "listen_id={id} max_concurrent={} differs from first stealth listener's {} (must match — node-wide policy)",
                     od.max_concurrent, first_on_demand.max_concurrent,
                 )));
             }
         }
 
-        // Parse the FIRST listener's advertise/transport URI into а
+        // Parse the FIRST listener's advertise/transport URI into a
         // (host, scheme) pair — those drive the primary destination.
         let primary_uri_str = first
             .advertise
@@ -1049,13 +1049,13 @@ impl NodeRuntime {
         // Use TransportUri::host() (not plaintext_host) — plaintext_host
         // returns None for AEAD/TLS schemes by design (DPI-visibility
         // classification).  Stealth listeners primarily use obfs4-tcp
-        // where plaintext_host=None, но we still need the host string
-        // для composing the response URI.
+        // where plaintext_host=None, but we still need the host string
+        // for composing the response URI.
         let primary_advertise_host = primary_parsed
             .host()
             .ok_or_else(|| {
                 NodeError::InvalidArgument(format!(
-                    "listen_id={first_listen_id} advertise URI has no host (unix scheme не supported для stealth)",
+                    "listen_id={first_listen_id} advertise URI has no host (unix scheme not supported for stealth)",
                 ))
             })?
             .to_owned();
@@ -1073,7 +1073,7 @@ impl NodeRuntime {
             )
         })?;
 
-        // Build AdvertiseDestination для each extra listener.
+        // Build AdvertiseDestination for each extra listener.
         for extra in listens.iter().skip(1) {
             let id = extra.listen_id;
             let od = extra.on_demand.as_ref().expect("on_demand checked above");
@@ -1088,7 +1088,7 @@ impl NodeRuntime {
                 .host()
                 .ok_or_else(|| {
                     NodeError::InvalidArgument(format!(
-                        "listen_id={id} advertise URI has no host (unix scheme не supported)",
+                        "listen_id={id} advertise URI has no host (unix scheme not supported)",
                     ))
                 })?
                 .to_owned();
@@ -1116,15 +1116,15 @@ impl NodeRuntime {
         }
 
         // Slice 5c production binder: clones base TransportContext +
-        // per-request PSK, calls registry.bind, spawns а bounded
-        // accept task що calls spawn_inbound_session per accepted
-        // connection.  Listener allocated а fresh ListenerHandle so
-        // observability (`session.accept` events) carries а unique
+        // per-request PSK, calls registry.bind, spawns a bounded
+        // accept task that calls spawn_inbound_session per accepted
+        // connection.  Listener allocated a fresh ListenerHandle so
+        // observability (`session.accept` events) carries a unique
         // identifier per stealth slot.  Multi-stealth: uses FIRST
         // listener's listen_id for accept-event accounting.
         let listener_handle =
             ListenerHandle::new(self.next_listener_handle.fetch_add(1, Ordering::Relaxed));
-        // Build the SessionRuntimeContext template once; cheap к
+        // Build the SessionRuntimeContext template once; cheap to
         // clone per-accept (all Arc fields inside).
         let session_ctx_template = SessionRuntimeContext {
             identity: Arc::clone(&self.identity),

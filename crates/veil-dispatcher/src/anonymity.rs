@@ -47,8 +47,8 @@ use veil_cfg::NodeId;
 #[cfg(test)]
 use veil_types::NodeIdBytes;
 use veil_util::wlock;
-// `Arc` referenced only from #[cfg(test)] paths в this file;
-// cfg-gating the import avoids unused-import warning в non-test builds.
+// `Arc` referenced only from #[cfg(test)] paths in this file;
+// cfg-gating the import avoids unused-import warning in non-test builds.
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -196,7 +196,7 @@ impl FrameDispatcher {
         }
     }
 
-    /// Final-hop kind=APP_DELIVER: decode AppDeliverPayload и route
+    /// Final-hop kind=APP_DELIVER: decode AppDeliverPayload and route
     /// to the addressed local endpoint via app_registry.
     /// behaviour, now triggered by explicit kind tag.
     fn handle_final_app_deliver(&self, body: &[u8]) -> DispatchResult {
@@ -237,7 +237,7 @@ impl FrameDispatcher {
     }
 
     /// Final-hop kind=INTRODUCE: this node is a rendezvous; look up
-    /// the cookie's subscriber и forward the ciphertext over their
+    /// the cookie's subscriber and forward the ciphertext over their
     /// established OVL1 session.
     fn handle_final_introduce(&self, body: &[u8]) -> DispatchResult {
         let intro = match IntroducePayload::decode(body) {
@@ -261,9 +261,9 @@ impl FrameDispatcher {
             Some(s) => s,
             None => {
                 // Cookie unknown. Silent drop: surfacing this would
-                // leak "this rendezvous serves cookie X / Y" к sender
-                // probes — exactly what the auth_cookie шифр-shape
-                // is designed к hide.
+                // leak "this rendezvous serves cookie X / Y" to sender
+                // probes — exactly what the auth_cookie cipher-shape
+                // is designed to hide.
                 self.logger.info(
                     "anonymity.relay_chain.introduce.cookie_unknown",
                     "no subscriber registered for this auth_cookie; dropped",
@@ -273,7 +273,7 @@ impl FrameDispatcher {
         };
         // Verify intro's claimed receiver_node_id matches the
         // subscriber's session peer_id. Mismatch could indicate a
-        // sender that built ad с stale receiver_node_id; silent drop.
+        // sender that built ad with stale receiver_node_id; silent drop.
         if intro.receiver_node_id != subscriber.peer_node_id {
             self.logger.info(
                 "anonymity.relay_chain.introduce.receiver_mismatch",
@@ -289,7 +289,7 @@ impl FrameDispatcher {
             Ok(b) => b,
             Err(_) => return DispatchResult::NoResponse, // oversize (cap'd anyway)
         };
-        // subscriber.peer_node_id is the raw [u8; 32] от the
+        // subscriber.peer_node_id is the raw [u8; 32] from the
         // veil-anonymity crate — convert to NodeId at the boundary.
         let target = NodeId::from(subscriber.peer_node_id);
         self.send_relay_chain_msg(&target, RelayChainMsg::ForwardIntroduce, &body_bytes);
@@ -297,8 +297,8 @@ impl FrameDispatcher {
     }
 
     /// Receiver → rendezvous: register a cookie. Idempotent on
-    /// same-subscriber repeat. Rejects на cookie collision (different
-    /// peer holds it) and на registry-full.
+    /// same-subscriber repeat. Rejects on cookie collision (different
+    /// peer holds it) and on registry-full.
     fn handle_register_rendezvous(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
         let req = match RegisterRendezvousPayload::decode(body) {
             Ok(p) => p,
@@ -307,9 +307,9 @@ impl FrameDispatcher {
             }
         };
         let Some(reg) = &self.rendezvous_registry else {
-            // Node не configured as rendezvous — anti-leak silent drop
+            // Node not configured as rendezvous — anti-leak silent drop
             // (returning Violation would identify "this node will not
-            // serve as rendezvous" к anyone probing).
+            // serve as rendezvous" to anyone probing).
             return DispatchResult::NoResponse;
         };
         let now = std::time::SystemTime::now()
@@ -329,7 +329,7 @@ impl FrameDispatcher {
                 self.logger.info(
                     "anonymity.relay_chain.register.ok",
                     format!(
-                        "registered cookie от peer={}; total registrations={}",
+                        "registered cookie from peer={}; total registrations={}",
                         veil_util::hex_short(node_id.as_bytes()),
                         reg.len(),
                     ),
@@ -371,7 +371,7 @@ impl FrameDispatcher {
     }
 
     /// Rendezvous → receiver: forwarded Introduce ciphertext arrived;
-    /// decrypt with our anonymity_x25519_sk и route the inner
+    /// decrypt with our anonymity_x25519_sk and route the inner
     /// AppDeliverPayload via app_registry.
     fn handle_forward_introduce(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
         let p = match ForwardIntroducePayload::decode(body) {
@@ -381,7 +381,7 @@ impl FrameDispatcher {
             }
         };
         let Some(ref sk) = self.anonymity_x25519_sk else {
-            // Не configured for anonymity — silent drop (anti-leak).
+            // Not configured for anonymity — silent drop (anti-leak).
             self.logger.info(
                 "anonymity.relay_chain.forward.no_sk",
                 "received forwarded introduce but no anonymity_x25519_sk wired",
@@ -405,21 +405,21 @@ impl FrameDispatcher {
             Ok(pt) => pt,
             Err(veil_anonymity::rendezvous::RendezvousError::Replay) => {
                 // Captured-and-replayed Introduce. Silent drop —
-                // logging would be а timing oracle confirming "this
+                // logging would be a timing oracle confirming "this
                 // node decrypted that ciphertext successfully once".
-                // Replay-detection counter would land here если а
+                // Replay-detection counter would land here if a
                 // future SOC dashboard requires it; current rate-
                 // limit + abuse tracker covers operator visibility.
                 return DispatchResult::NoResponse;
             }
             Err(_) => {
-                // AEAD failed — most likely sender encrypted к a
+                // AEAD failed — most likely sender encrypted to a
                 // different x25519 key (stale ad) or random poison.
                 // Silent drop.
                 self.logger.info(
                     "anonymity.relay_chain.forward.decrypt_failed",
                     format!(
-                        "decrypt failed для forward от peer={}",
+                        "decrypt failed for forward from peer={}",
                         veil_util::hex_short(node_id.as_bytes()),
                     ),
                 );
@@ -427,7 +427,7 @@ impl FrameDispatcher {
             }
         };
         // Decrypted plaintext IS an AppDeliverPayload (no tag byte —
-        // it's already inside the rendezvous-shielded layer и доставка
+        // it's already inside the rendezvous-shielded layer and delivery
         // path is unambiguous).
         let app_deliver = match AppDeliverPayload::decode(&plaintext) {
             Ok(p) => p,
@@ -462,10 +462,10 @@ impl FrameDispatcher {
         DispatchResult::NoResponse
     }
 
-    /// Send a `RelayChain::<msg>` frame с the given body bytes к
+    /// Send a `RelayChain::<msg>` frame with the given body bytes to
     /// the named peer's session. Used by the rendezvous-relay
-    /// state machine для receiver↔rendezvous control frames AND
-    /// для forwarding cells / introduces.
+    /// state machine for receiver↔rendezvous control frames AND
+    /// for forwarding cells / introduces.
     fn send_relay_chain_msg(&self, node_id: &NodeId, msg: RelayChainMsg, body: &[u8]) {
         use veil_proto::codec::encode_header;
         let Some(ref reg) = self.session_tx_registry else {
@@ -640,8 +640,8 @@ mod tests {
 
     /// When this node IS the final hop for a 1-hop circuit AND the
     /// payload decodes as an AppDeliverPayload addressed to a bound
-    /// endpoint, the handler delivers через `AppEndpointRegistry` —
-    /// closes (now с tag-byte routing).
+    /// endpoint, the handler delivers through `AppEndpointRegistry` —
+    /// closes (now with tag-byte routing).
     #[tokio::test]
     async fn epic482_7_dispatch_delivers_final_hop_payload_to_app() {
         use veil_anonymity::rendezvous::final_hop_kind;
@@ -709,7 +709,7 @@ mod tests {
         }
     }
 
-    /// Final-hop payload that IS tagged APP_DELIVER но carries
+    /// Final-hop payload that IS tagged APP_DELIVER but carries
     /// malformed AppDeliverPayload bytes must silently drop — same
     /// anti-leak logic as on AEAD failure.
     #[test]
@@ -743,7 +743,7 @@ mod tests {
 
     // ── Slices 2-4: rendezvous-relay dispatcher coverage ─────────────────────
 
-    /// Register frame с valid payload + active registry inserts an
+    /// Register frame with valid payload + active registry inserts an
     /// entry; subsequent lookup returns the subscriber.
     #[test]
     fn epic482_5_dispatch_register_inserts_into_registry() {
@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(sub.receiver_x25519_pk, req.receiver_x25519_pk);
     }
 
-    /// Register к node без registry (not configured as rendezvous)
+    /// Register to node without registry (not configured as rendezvous)
     /// silently drops — anti-leak.
     #[test]
     fn epic482_5_dispatch_register_no_registry_silent_drop() {
@@ -794,7 +794,7 @@ mod tests {
         assert!(matches!(result, DispatchResult::NoResponse));
     }
 
-    /// Forward frame с no anonymity SK silent-drops (anti-leak).
+    /// Forward frame with no anonymity SK silent-drops (anti-leak).
     #[test]
     fn epic482_5_dispatch_forward_no_sk_silent_drop() {
         use veil_anonymity::rendezvous::ForwardIntroducePayload;
@@ -817,8 +817,8 @@ mod tests {
     /// End-to-end through-the-rendezvous: sender encrypts a payload
     /// to receiver_x25519_pk wrapped as IntroducePayload, dispatcher
     /// (rendezvous role) receives it, decodes IntroducePayload, looks
-    /// up cookie → forwarder, и attempts to forward. Forward will
-    /// silent-drop здесь because no live session к the subscriber, но
+    /// up cookie → forwarder, and attempts to forward. Forward will
+    /// silent-drop here because no live session to the subscriber, but
     /// the lookup path itself runs.
     #[test]
     fn epic482_5_dispatch_introduce_routes_via_cookie() {
@@ -838,7 +838,7 @@ mod tests {
         let registry = Arc::new(RendezvousRegistry::default());
         let auth_cookie = [0xCC; 16];
         let receiver_node_id = [0x11; 32];
-        let receiver_x25519_pk = [0x22; 32]; // dummy (sender encrypts к THIS)
+        let receiver_x25519_pk = [0x22; 32]; // dummy (sender encrypts to THIS)
         registry
             .register(
                 auth_cookie,
@@ -851,8 +851,8 @@ mod tests {
             .unwrap();
         dispatcher.rendezvous_registry = Some(Arc::clone(&registry));
 
-        // Sender encrypts the inner payload к receiver_x25519_pk и
-        // wraps в IntroducePayload + final-hop tag.
+        // Sender encrypts the inner payload to receiver_x25519_pk and
+        // wraps in IntroducePayload + final-hop tag.
         let inner = b"e2e-payload";
         let ciphertext = encrypt_introduce(inner, &receiver_x25519_pk).unwrap();
         let intro = IntroducePayload {
@@ -863,7 +863,7 @@ mod tests {
         let mut payload_with_tag = vec![final_hop_kind::INTRODUCE];
         payload_with_tag.extend_from_slice(&intro.encode().unwrap());
 
-        // Build a 1-hop circuit где local node IS the rendezvous.
+        // Build a 1-hop circuit where local node IS the rendezvous.
         let mut node_id = [0u8; 32];
         node_id[0] = 0xCC;
         let me_as_hop = Hop {

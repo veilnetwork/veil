@@ -73,18 +73,18 @@ pub trait FrameBroadcaster: Send + Sync {
 // ── MlKemEkResolver — reactive cold-start ML-KEM-768 EK fetch ─────────────────
 //
 // Epic 486.1 slice 3 (audit batch 2026-05-23): closes the "no ML-KEM key →
-// silent drop" gap when an IPC client sends а datagram к а peer that the
-// daemon has not yet handshaked с.  Pre-fix the daemon-side
-// `peer_mlkem_keys` cache populated **only** at handshake completion (см.
+// silent drop" gap when an IPC client sends a datagram to a peer that the
+// daemon has not yet handshaked with.  Pre-fix the daemon-side
+// `peer_mlkem_keys` cache populated **only** at handshake completion (see
 // `peer_handshake.rs`); cold-start relay-routed sends would hit the
-// "no recipient_ek" branch in `handle_ipc_send` и return `NO_E2E_KEY`.
+// "no recipient_ek" branch in `handle_ipc_send` and return `NO_E2E_KEY`.
 //
-// This trait lets the IPC layer trigger а reactive **DHT lookup** of the
+// This trait lets the IPC layer trigger a reactive **DHT lookup** of the
 // peer's `MlKemKeyCert` (already published at startup by every sovereign
-// identity per Epic 462.12) without taking а direct dependency on
-// veil-node-runtime от veil-ipc.  The IPC layer holds an `Option<
+// identity per Epic 462.12) without taking a direct dependency on
+// veil-node-runtime from veil-ipc.  The IPC layer holds an `Option<
 // Arc<dyn MlKemEkResolver>>`; production wireup hands it the runtime-side
-// `DhtMlKemEkResolver` от service_tasks.rs.
+// `DhtMlKemEkResolver` from service_tasks.rs.
 //
 // ## API contract
 //
@@ -92,30 +92,30 @@ pub trait FrameBroadcaster: Send + Sync {
 // ML-KEM-768 EK.  Steps the implementor performs:
 //
 // 1. Recursive-get the peer's `IdentityDocument` (verified chain).
-// 2. Recursive-get the peer's `InstanceRegistry`; pick а recent-active
+// 2. Recursive-get the peer's `InstanceRegistry`; pick a recent-active
 //    instance by `last_seen_unix_ms`.
 // 3. Recursive-get the matching `MlKemKeyCert` at
 //    `MlKemKeyCert::dht_key(node_id, instance_id)`.
 // 4. Verify the cert chain via `verify_mlkem_cert(cert, doc, now)`.
-// 5. Return `cert.mlkem_pubkey` (1184 bytes) или `None`.
+// 5. Return `cert.mlkem_pubkey` (1184 bytes) or `None`.
 //
 // `None` masks every failure mode (missing record, sig invalid, decode
-// error, network timeout) — callers fall back к "no E2E key" semantics
+// error, network timeout) — callers fall back to "no E2E key" semantics
 // identically.  Diagnostic detail belongs in the implementor's logging
-// path, not в the trait surface.
+// path, not in the trait surface.
 //
 // ## Why `Pin<Box<dyn Future>>` rather than `async fn`
 //
-// veil-types is а Tier-0 leaf crate с zero async deps.  Adding the
+// veil-types is a Tier-0 leaf crate with zero async deps.  Adding the
 // `async-trait` macro crate would invert the layering.  This shape
 // matches the existing `BroadcastFn` trait in `veil-transport::rotation`
-// (also for the same reason) и keeps the trait object-safe.
+// (also for the same reason) and keeps the trait object-safe.
 pub trait MlKemEkResolver: Send + Sync {
     /// Reactively fetch + verify the recipient's ML-KEM-768 encapsulation
-    /// key от the DHT.  Returns `None` on any failure (no document, no
+    /// key from the DHT.  Returns `None` on any failure (no document, no
     /// instance, no cert, signature invalid, timeout).  Callers should
     /// treat `None` the same as "key not cached" — i.e. drop the
-    /// outbound frame с the usual `NO_E2E_KEY` error.
+    /// outbound frame with the usual `NO_E2E_KEY` error.
     fn resolve_ek(
         &self,
         target_node_id: [u8; 32],
@@ -134,9 +134,9 @@ pub trait MlKemEkResolver: Send + Sync {
 /// throughout the veil (DHT keying, routing, ban records, etc.).
 ///
 /// Transparent alias for `[u8; 32]`. Strong-typed wrappers (`NodeId`
-/// newtype в `veilcore::cfg::model`) build on top для compile-time
-/// distinction между peer-id vs link-id vs raw hash. Use this alias
-/// when the slot specifically means а node-identity wire byte sequence
+/// newtype in `veilcore::cfg::model`) build on top for compile-time
+/// distinction between peer-id vs link-id vs raw hash. Use this alias
+/// when the slot specifically means a node-identity wire byte sequence
 /// — not for content_id / session_id / nonce / other 32-byte tokens
 /// that share the wire shape but carry different semantics.
 pub type NodeIdBytes = [u8; 32];
@@ -145,7 +145,7 @@ pub type NodeIdBytes = [u8; 32];
 /// `MlkemCert::mlkem_algo`). Currently the only KEM the runtime supports.
 pub const ALGO_ML_KEM_768: u8 = 1;
 
-/// Encapsulation-key length in bytes для [`ALGO_ML_KEM_768`]. Used by
+/// Encapsulation-key length in bytes for [`ALGO_ML_KEM_768`]. Used by
 /// proto length checks and by `crypto::x3dh` input validation.
 pub const ML_KEM_768_EK_LEN: usize = 1184;
 
@@ -153,7 +153,7 @@ pub const ML_KEM_768_EK_LEN: usize = 1184;
 /// signatures (the `certify_subkey` flow). Both the wire-format
 /// encoder (`proto::identity_document`) and the signing helper
 /// (`crypto::identity::sign_certify`) prepend this byte string before
-/// the structured payload. Must NEVER change без wire-break bump.
+/// the structured payload. Must NEVER change without wire-break bump.
 pub const CERTIFY_CONTEXT: &[u8] = b"veil.certify.v1";
 
 /// Role bits for `CapabilitiesPayload::roles_supported` (c moved here
@@ -211,7 +211,7 @@ impl std::str::FromStr for NodeRole {
     }
 }
 
-/// (Уровень 2): who is allowed to learn this node's listen
+/// (Layer 2): who is allowed to learn this node's listen
 /// transports via `RouteRequest`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -390,11 +390,11 @@ impl std::str::FromStr for LogLevel {
 /// so an accidental `{:?}` on a config can't leak the metrics bearer token.
 pub struct MetricsConfig {
     /// TCP bind URI (e.g. `tcp://127.0.0.1:9000`). **
-    /// audit:** prefer а loopback bind for production. When binding к
-    /// а non-loopback address (e.g. `0.0.0.0:9000`), `auth_token`
+    /// audit:** prefer a loopback bind for production. When binding to
+    /// a non-loopback address (e.g. `0.0.0.0:9000`), `auth_token`
     /// SHOULD be set or the operator-provided firewall must restrict
     /// scrape sources — otherwise `/admin/state/dump` exposes role
-    /// session counts, mailbox/dht state, ban counters к anyone who
+    /// session counts, mailbox/dht state, ban counters to anyone who
     /// can reach the port.
     pub listen: String,
     /// Custom Prometheus path (default: `/metrics`).
@@ -402,23 +402,23 @@ pub struct MetricsConfig {
     pub path: Option<String>,
     /// Optional bearer-auth token. When set, every request MUST carry
     /// `Authorization: Bearer <token>` (constant-time compared); other
-    /// requests get а `401 Unauthorized`. When unset (default), all
+    /// requests get a `401 Unauthorized`. When unset (default), all
     /// endpoints are unauthenticated — appropriate only for loopback
-    /// binds или firewalled networks. audit closure.
+    /// binds or firewalled networks. audit closure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
-    /// Explicit opt-in to publish unauthenticated metrics on а non-
-    /// loopback bind. Without this flag, а non-loopback `listen` with
-    /// `auth_token = None` would be а security misconfiguration —
+    /// Explicit opt-in to publish unauthenticated metrics on a non-
+    /// loopback bind. Without this flag, a non-loopback `listen` with
+    /// `auth_token = None` would be a security misconfiguration —
     /// `/admin/state/dump` exposes role / session / DHT / mailbox state
     /// to anyone who can reach the port. Default `false`: such a config
-    /// causes node startup to fail with а `ValidationFailed` error so
+    /// causes node startup to fail with a `ValidationFailed` error so
     /// the operator notices.
     ///
-    /// Set к `true` when the metrics port is firewalled / Tailscale-
-    /// scoped / VPN-gated и the operator deliberately wants unauthenticated
+    /// Set to `true` when the metrics port is firewalled / Tailscale-
+    /// scoped / VPN-gated and the operator deliberately wants unauthenticated
     /// scrape (typical testnet / homelab pattern). Setting the flag
-    /// without а meaningful network boundary is а documented self-foot-
+    /// without a meaningful network boundary is a documented self-foot-
     /// shoot path; the warn-log on startup tells the operator what just
     /// happened.
     #[serde(default, skip_serializing_if = "is_default_false")]
@@ -449,23 +449,23 @@ fn is_default_false(b: &bool) -> bool {
 /// Two modes:
 ///
 /// * **Public (default)** — current veil behaviour. Any node that can
-///   reach а listening peer can attempt а handshake; per-peer
-///   authentication (Ed25519 / Falcon-512) verifies identity но
+///   reach a listening peer can attempt a handshake; per-peer
+///   authentication (Ed25519 / Falcon-512) verifies identity but
 ///   does not gate membership. Ban decisions stay local (node operator
-///   owns the policy для their own node).
+///   owns the policy for their own node).
 ///
 /// * **Private** — handshake-time membership gate. Every member carries
-///   а signed certificate от the network owner; peers reject handshake
-///   from а node that doesn't present а valid cert для the same
+///   a signed certificate from the network owner; peers reject handshake
+///   from a node that doesn't present a valid cert for the same
 ///   `network_id`. Admin-signed ban records propagate via the DHT so
-///   bans applied на any admin node take effect across the whole
+///   bans applied on any admin node take effect across the whole
 ///   network (mirrors VPN / private-veil semantics).
 ///
-/// The asymmetry is deliberate: в public networks anyone can connect, so
-/// remote-initiated bans would be а DoS vector (anyone signs а ban
-/// against the local node → cascading exclusion). В private networks
+/// The asymmetry is deliberate: in public networks anyone can connect, so
+/// remote-initiated bans would be a DoS vector (anyone signs a ban
+/// against the local node → cascading exclusion). In private networks
 /// the membership set is constrained by the owner's cert issuance, so
-/// bans cannot originate от outside the network.
+/// bans cannot originate from outside the network.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NetworkConfig {
     /// Membership mode. `"public"` (default) preserves the current
@@ -474,32 +474,32 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub mode: NetworkMode,
 
-    /// Stable 32-byte network identifier. BLAKE3 of а human-readable
-    /// network name OR а fresh random ID. Mandatory когда `mode = private`.
-    /// Carried в the membership cert и checked at handshake.
+    /// Stable 32-byte network identifier. BLAKE3 of a human-readable
+    /// network name OR a fresh random ID. Mandatory when `mode = private`.
+    /// Carried in the membership cert and checked at handshake.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_id: Option<String>,
 
-    /// Base64-encoded public key of the network owner. Used к verify
-    /// membership-cert signatures. Mandatory когда `mode = private`.
+    /// Base64-encoded public key of the network owner. Used to verify
+    /// membership-cert signatures. Mandatory when `mode = private`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_pubkey: Option<String>,
 
-    /// Signature algorithm used by the owner key. Mandatory когда
+    /// Signature algorithm used by the owner key. Mandatory when
     /// `mode = private`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_algo: Option<SignatureAlgorithm>,
 
-    /// Path on disk к this node's own membership certificate (signed
-    /// by `owner_pubkey`). Loaded at startup и exchanged through the
-    /// handshake TLV. Mandatory когда `mode = private`.
+    /// Path on disk to this node's own membership certificate (signed
+    /// by `owner_pubkey`). Loaded at startup and exchanged through the
+    /// handshake TLV. Mandatory when `mode = private`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub membership_cert: Option<String>,
 
     /// Allow-list of admin-cert subject `node_id` values (hex strings).
-    /// Only certs with а matching `node_id` AND `admin = true` may
-    /// publish ban records к the DHT-propagated ban list. Defense-in-
-    /// depth: даже если admin private key leaks, лишь listed node_ids
+    /// Only certs with a matching `node_id` AND `admin = true` may
+    /// publish ban records to the DHT-propagated ban list. Defense-in-
+    /// depth: even if admin private key leaks, only listed node_ids
     /// can act as admins. Empty list (default) accepts any cert with
     /// `admin = true` flag set by the owner.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -514,7 +514,7 @@ pub enum NetworkMode {
     /// stay local.
     #[default]
     Public,
-    /// Private network. Handshake requires а valid membership cert;
+    /// Private network. Handshake requires a valid membership cert;
     /// admin bans propagate via DHT.
     Private,
 }
@@ -522,14 +522,14 @@ pub enum NetworkMode {
 /// Membership certificate issued by the network owner.
 ///
 /// Format wire-versioned via [`MEMBERSHIP_CERT_VERSION`]. Body fields
-/// are serialised in а fixed order для signature-stable canonical
+/// are serialised in a fixed order for signature-stable canonical
 /// encoding (matches the existing identity-cert pattern).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MembershipCert {
-    /// Wire-format version. Must match [`MEMBERSHIP_CERT_VERSION`] на
+    /// Wire-format version. Must match [`MEMBERSHIP_CERT_VERSION`] on
     /// load — older or newer versions are rejected.
     pub version: u8,
-    /// Network identifier this cert belongs к. Must match the local
+    /// Network identifier this cert belongs to. Must match the local
     /// `[network].network_id` at handshake time.
     pub network_id: [u8; 32],
     /// Node identity (BLAKE3(pubkey)) that this cert authorises.
@@ -542,10 +542,10 @@ pub struct MembershipCert {
     /// `valid_until_unix <= now` are rejected during handshake.
     ///
     /// **Sentinel value `0` ⇒ no expiry** (cert is valid forever as long
-    /// as the owner-signature still verifies). Operators wanting а
-    /// long-lived service-key for а fleet member set this through
+    /// as the owner-signature still verifies). Operators wanting a
+    /// long-lived service-key for a fleet member set this through
     /// `veil-cli network sign-member --no-expiry`. With `0`, the
-    /// only revocation paths are (a) DHT-replicated ban-records и
+    /// only revocation paths are (a) DHT-replicated ban-records and
     /// (b) rotating the network's `owner_pubkey` (re-issues all certs).
     pub valid_until_unix: u64,
     /// Admin flag — when true, this member may publish DHT-replicated
@@ -561,46 +561,46 @@ pub struct MembershipCert {
 }
 
 /// Wire-format version for [`MembershipCert`]. Bump on every breaking
-/// schema change. Older versions in а live deployment must continue
-/// к verify until everyone has rotated; do not reuse version numbers.
+/// schema change. Older versions in a live deployment must continue
+/// to verify until everyone has rotated; do not reuse version numbers.
 pub const MEMBERSHIP_CERT_VERSION: u8 = 1;
 
-/// Admin-issued ban record для а private veil network. Replicated
+/// Admin-issued ban record for a private veil network. Replicated
 /// via DHT under key `BLAKE3(network_id || ":bans:" || banned_node_id)`
 /// so any private-network member can apply bans issued by an admin.
 ///
 /// Verification chain:
 /// 1. `admin_cert` is signed by the network owner (verified using the
-///    local `[network].owner_pubkey`) и has `admin: true`.
+///    local `[network].owner_pubkey`) and has `admin: true`.
 /// 2. `BLAKE3(admin_pubkey) == admin_cert.member_node_id` — pubkey
 ///    matches the cert's identity binding.
 /// 3. `admin_signature` (over the canonical body) verifies against
 ///    `admin_pubkey` using `admin_cert.algo`.
-/// 4. Optional defense-in-depth: `admin_cert.member_node_id` is в the
+/// 4. Optional defense-in-depth: `admin_cert.member_node_id` is in the
 ///    operator-configured `[network].admin_node_ids` allowlist.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct BanEntry {
     /// Wire-format version. Must match [`BAN_ENTRY_VERSION`].
     pub version: u8,
-    /// Network this ban applies к. Must match local `[network].network_id`.
+    /// Network this ban applies to. Must match local `[network].network_id`.
     pub network_id: [u8; 32],
     /// Node-id being banned (BLAKE3 of its pubkey).
     pub banned_node_id: [u8; 32],
-    /// Free-form operator-supplied reason (truncated к 256 bytes
+    /// Free-form operator-supplied reason (truncated to 256 bytes
     /// before encoding). Carried inside the signed body so it can be
-    /// audited but не altered.
+    /// audited but not altered.
     pub reason: String,
     /// Unix seconds when the admin issued the ban.
     pub issued_at_unix: u64,
-    /// Admin node-id (derived от admin_pubkey). Convenience field —
-    /// re-derived и checked at verification time.
+    /// Admin node-id (derived from admin_pubkey). Convenience field —
+    /// re-derived and checked at verification time.
     pub admin_node_id: [u8; 32],
     /// Bincode-blob of the admin's own membership cert (issued by
     /// network owner, `admin: true`). Embedded so anyone can verify
     /// the ban without prior knowledge of the admin set.
     #[serde(with = "base64_bytes")]
     pub admin_cert_blob: Vec<u8>,
-    /// Admin's public key (raw bytes). Must hash к `admin_cert`'s
+    /// Admin's public key (raw bytes). Must hash to `admin_cert`'s
     /// `member_node_id`.
     #[serde(with = "base64_bytes")]
     pub admin_pubkey: Vec<u8>,
@@ -611,7 +611,7 @@ pub struct BanEntry {
 }
 
 /// Wire-format version for [`BanEntry`]. Bump on every breaking
-/// schema change. Older versions must continue к verify until rotated.
+/// schema change. Older versions must continue to verify until rotated.
 pub const BAN_ENTRY_VERSION: u8 = 1;
 
 /// Cap on `BanEntry.reason` length before encoding. Truncated values
@@ -619,7 +619,7 @@ pub const BAN_ENTRY_VERSION: u8 = 1;
 /// before signing.
 pub const MAX_BAN_REASON_LEN: usize = 256;
 
-/// Helper для serde base64 round-trip on `Vec<u8>` fields.
+/// Helper for serde base64 round-trip on `Vec<u8>` fields.
 mod base64_bytes {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
@@ -842,8 +842,8 @@ pub struct BootstrapPeer {
 /// the operator typed) so the diagnostic can guide them to a
 /// valid choice.
 ///
-/// Used by [`SignatureAlgorithm::from_str`] и will be reused by
-/// future veil-enums that need string parsing с consistent
+/// Used by [`SignatureAlgorithm::from_str`] and will be reused by
+/// future veil-enums that need string parsing with consistent
 /// error format.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseEnumError {
@@ -893,13 +893,13 @@ impl std::error::Error for ParseEnumError {}
 /// both ed25519 and falcon detached sigs with explicit framing.
 /// Provides classical security via Ed25519 (fast verify) AND
 /// post-quantum security via Falcon-512 (quantum-resistant).
-/// `Ed25519Falcon1024Hybrid` (Этап 10) — higher-security PQ
-/// hybrid; same construction но swaps Falcon-512 for Falcon-1024
+/// `Ed25519Falcon1024Hybrid` (Stage 10) — higher-security PQ
+/// hybrid; same construction but swaps Falcon-512 for Falcon-1024
 /// (NIST PQC Level 5 vs Level 1).  Use for long-lived sovereign
 /// identities that must outlive the cryptographic-relevant-quantum-
-/// computer (CRQC) horizon AND need а margin beyond Falcon-512's
+/// computer (CRQC) horizon AND need a margin beyond Falcon-512's
 /// 103-bit classical security level (matches Falcon-1024's
-/// ~270-bit классическо-equivalent margin).
+/// ~270-bit classical-equivalent margin).
 ///
 /// Wire-byte encoding (used in `IdentityPayload.algo` and similar
 /// frame fields) is centralized [`Self::wire_byte`] and
@@ -917,17 +917,17 @@ pub enum SignatureAlgorithm {
     /// hybrid Ed25519 + Falcon-512 — both signatures
     /// required for verify. Long-term identities should use this.
     Ed25519Falcon512Hybrid,
-    /// hybrid Ed25519 + Falcon-1024 (Этап 10) — both signatures
+    /// hybrid Ed25519 + Falcon-1024 (Stage 10) — both signatures
     /// required for verify.  Higher-security PQ alternative to
     /// `Ed25519Falcon512Hybrid` for identities expected to outlive
-    /// the CRQC horizon by а wider margin (~270-bit classical-
-    /// equivalent vs ~103-bit для Falcon-512).
+    /// the CRQC horizon by a wider margin (~270-bit classical-
+    /// equivalent vs ~103-bit for Falcon-512).
     Ed25519Falcon1024Hybrid,
 }
 
 impl SignatureAlgorithm {
     /// All variants the runtime supports. Used by config
-    /// validation, CLI `key list-algos`, и tests that iterate
+    /// validation, CLI `key list-algos`, and tests that iterate
     /// over all algos.
     pub fn supported() -> &'static [Self] {
         &[
@@ -1034,8 +1034,8 @@ mod tests {
 
     #[test]
     fn unknown_byte_rejected() {
-        // Этап 10 added Ed25519Falcon1024Hybrid at wire byte 4 — bump
-        // the unknown-range start к 5.  Sequence пинна centrally в
+        // Stage 10 added Ed25519Falcon1024Hybrid at wire byte 4 — bump
+        // the unknown-range start to 5.  Sequence pinned centrally in
         // `wire_byte` / `from_wire_byte`; rejection range is the
         // complement of the supported byte set.
         for b in 5u8..=255 {
@@ -1087,14 +1087,14 @@ mod tests {
 // ── PeerLruCache ──────────────────────────────────────────────────────────────
 //
 // LRU-evicting bounded HashMap keyed on `NodeIdBytes`.
-// Used для `peer_pubkeys` и `peer_roles` caches в `NodeRuntime`,
-// `NodeServices`, `SessionRuntimeContext`, и `CryptoContext`.  Keeps
-// insertion-order в а `VecDeque` so the oldest entry is evicted first
+// Used for `peer_pubkeys` and `peer_roles` caches in `NodeRuntime`,
+// `NodeServices`, `SessionRuntimeContext`, and `CryptoContext`.  Keeps
+// insertion-order in a `VecDeque` so the oldest entry is evicted first
 // (FIFO-LRU), preventing unbounded memory growth while preserving recently
 // active peers.
 //
-// Phase 3 prep (veilcore extraction): moved here от veilcore::node::mod.rs
-// so dispatcher и other consumers can move к sibling crates.
+// Phase 3 prep (veilcore extraction): moved here from veilcore::node::mod.rs
+// so dispatcher and other consumers can move to sibling crates.
 
 /// LRU-evicting bounded HashMap keyed on [`NodeIdBytes`].
 ///
@@ -1107,13 +1107,13 @@ pub struct PeerLruCache<V> {
 }
 
 impl<V> PeerLruCache<V> {
-    /// Pre-allocate the inner HashMap + VecDeque так
-    /// що subsequent inserts up к `cap` entries не вызывают
+    /// Pre-allocate the inner HashMap + VecDeque so
+    /// that subsequent inserts up to `cap` entries do not trigger
     /// `hashbrown::RawTable::reserve_rehash` transients.  Under chaos-ban
-    /// peer churn the rehash spikes были pinned ~49 MiB of dirty pages
-    /// в jemalloc small-bin arena.
+    /// peer churn the rehash spikes were pinning ~49 MiB of dirty pages
+    /// in jemalloc small-bin arena.
     /// Trade-off: ~64 bytes/slot upfront × cap (e.g. 64 KiB for 1024 cap)
-    /// в exchange for а flat allocator footprint over time.
+    /// in exchange for a flat allocator footprint over time.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             map: std::collections::HashMap::with_capacity(cap),
@@ -1127,8 +1127,8 @@ impl<V> PeerLruCache<V> {
 
     /// Insert `(key, value)`, evicting the LRU entry if `map.len >= capacity`.
     ///
-    /// If `key` is already present the value is updated и the key is
-    /// promoted к most-recently-used (back of the order).
+    /// If `key` is already present the value is updated and the key is
+    /// promoted to most-recently-used (back of the order).
     pub fn insert_lru(&mut self, key: NodeIdBytes, value: V, capacity: usize) {
         if self.map.contains_key(&key) {
             if let Some(pos) = self.order.iter().position(|k| *k == key) {
@@ -1154,7 +1154,7 @@ impl<V> PeerLruCache<V> {
         }
     }
 
-    /// Read-only lookup (does NOT promote — use [`Self::insert_lru`] для LRU
+    /// Read-only lookup (does NOT promote — use [`Self::insert_lru`] for LRU
     /// promotion).
     pub fn get(&self, key: &NodeIdBytes) -> Option<&V> {
         self.map.get(key)

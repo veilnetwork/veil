@@ -308,14 +308,14 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
     ValidationRule {
         code: "transport_rotation_min_above_max",
         key: "transport.rotation.min_lifetime_secs",
-        message: "min_lifetime_secs must be ≤ max_lifetime_secs when both are positive — а min > max range cannot sample а deadline",
+        message: "min_lifetime_secs must be ≤ max_lifetime_secs when both are positive — a min > max range cannot sample a deadline",
         check: transport_rotation_min_above_max,
         fix: None,
     },
     ValidationRule {
         code: "transport_rotation_partial_disable",
         key: "transport.rotation.min_lifetime_secs",
-        message: "to disable rotation set BOTH min_lifetime_secs и max_lifetime_secs к -1, или leave both positive — а mismatched pair (one -1, the other positive) is а likely config typo",
+        message: "to disable rotation set BOTH min_lifetime_secs and max_lifetime_secs to -1, or leave both positive — a mismatched pair (one -1, the other positive) is a likely config typo",
         check: transport_rotation_partial_disable,
         fix: None,
     },
@@ -331,7 +331,7 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
     ValidationRule {
         code: "network_private_requires_network_id",
         key: "network.network_id",
-        message: "must be set when network.mode = \"private\" — а private veil must have а stable identifier the membership cert binds to",
+        message: "must be set when network.mode = \"private\" — a private veil must have a stable identifier the membership cert binds to",
         check: network_private_missing_network_id,
         fix: None,
     },
@@ -345,14 +345,14 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
     ValidationRule {
         code: "network_private_requires_owner_algo",
         key: "network.owner_algo",
-        message: "must be set when network.mode = \"private\" — signature dispatch needs к know the owner's algorithm",
+        message: "must be set when network.mode = \"private\" — signature dispatch needs to know the owner's algorithm",
         check: network_private_missing_owner_algo,
         fix: None,
     },
     ValidationRule {
         code: "network_private_requires_membership_cert",
         key: "network.membership_cert",
-        message: "must be set when network.mode = \"private\" — node needs its own membership cert к present at handshake time",
+        message: "must be set when network.mode = \"private\" — node needs its own membership cert to present at handshake time",
         check: network_private_missing_membership_cert,
         fix: None,
     },
@@ -728,7 +728,7 @@ fn session_max_age_too_short(config: &Config) -> bool {
 
 fn transport_rotation_min_too_short(config: &Config) -> bool {
     let v = config.transport.rotation.min_lifetime_secs;
-    // `-1` (disabled) is OK; any other negative value is а typo (only
+    // `-1` (disabled) is OK; any other negative value is a typo (only
     // `-1` is the official sentinel).  Positive values must be ≥ 60.
     v != -1 && v < 60
 }

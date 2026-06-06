@@ -153,45 +153,45 @@ pub fn spawn_outbound_peers(
             let mut first_failure_at: Option<std::time::Instant> = None;
             let peer_node_id = *peer.node_id.as_bytes();
             // Audit batch 2026-05-25 phase I: Phase E20 directional dedup
-            // policy — для pair (A, B) с `hex(A) < hex(B)`, the A→B
+            // policy — for pair (A, B) with `hex(A) < hex(B)`, the A→B
             // outbound is the canonical session.  Larger-hex side (B)
-            // keeps INBOUND и rejects its own outbound attempts с
+            // keeps INBOUND and rejects its own outbound attempts with
             // `session.dedup direction=outbound`.  Pre-fix the outbound_
             // connector dialed regardless of policy: B would hammer A
             // every 30 s, A would dedup-reject, B would sleep 30 s
-            // (duplicate-session backoff), repeat — visible как steady
-            // 500+/min handshake failures across the cluster even с
-            // chaos-ban stopped.  Worse, if A's own outbound к B got
-            // race-rejected by а stale tx_registry entry, the pair
-            // ended up в а wedge state since B never recovered the
+            // (duplicate-session backoff), repeat — visible as steady
+            // 500+/min handshake failures across the cluster even with
+            // chaos-ban stopped.  Worse, if A's own outbound to B got
+            // race-rejected by a stale tx_registry entry, the pair
+            // ended up in a wedge state since B never recovered the
             // session even on its own (every dial doomed by policy).
             //
             // Fix: pre-flight the policy check.  When we are the keep-
-            // inbound side для this peer (`hex(local) > hex(peer)`),
+            // inbound side for this peer (`hex(local) > hex(peer)`),
             // skip dialing entirely — sit on `force_reconnect_notify`
-            // и `has_session` polling, waiting for the canonical-
+            // and `has_session` polling, waiting for the canonical-
             // direction inbound to arrive.  Saves CPU/PoW-challenge
-            // load on the peer, eliminates the dedup-reject loop, и
-            // gives the lower-hex side а clean path к register.
+            // load on the peer, eliminates the dedup-reject loop, and
+            // gives the lower-hex side a clean path to register.
             let we_keep_outbound = access.local_node_id.as_slice() < peer_node_id.as_slice();
 
             loop {
                 // Check if this peer was banned.  Audit batch 2026-05-25
                 // phase J: previously `break` exited the entire
-                // outbound_connector task, dropping the slot_guard и
-                // unregistering the peer от
-                // `outbound_connector_node_ids`.  Когда the ban expired
+                // outbound_connector task, dropping the slot_guard and
+                // unregistering the peer from
+                // `outbound_connector_node_ids`.  When the ban expired
                 // (or was lifted), nothing re-spawned the task — peer
-                // remained un-dialed indefinitely.  Visible под
+                // remained un-dialed indefinitely.  Visible under
                 // chaos-ban stress: target-host's outbound_connector
-                // died mid-cycle, and когда the peer's ban_list entry
+                // died mid-cycle, and when the peer's ban_list entry
                 // expired (~15 min later) the canonical-direction dial
-                // никогда не возобновлялся even though policy said we
+                // never resumed even though policy said we
                 // should dial.  Fix: sleep + recheck instead of
                 // exiting; ban expiration naturally pulls us back into
                 // the dial path.  `force_reconnect_notify` wakes us
                 // immediately on operator-initiated unban (admin tear-
-                // down keeps stale entries из out of the registry).
+                // down keeps stale entries from out of the registry).
                 if lock!(access.dispatcher.abuse.ban_list).is_banned(&peer_node_id) {
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
@@ -227,10 +227,10 @@ pub fn spawn_outbound_peers(
                     continue;
                 }
                 if !we_keep_outbound {
-                    // Phase E20 policy violation guard: skip dial и
+                    // Phase E20 policy violation guard: skip dial and
                     // wait for peer-initiated inbound.  Same wake set
                     // as the `has_session` branch — `force_reconnect_
-                    // notify` fires on network-change, и а periodic
+                    // notify` fires on network-change, and a periodic
                     // wakeup re-evaluates ban state + has_session.
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
@@ -396,7 +396,7 @@ pub fn spawn_outbound_peers(
                                     },
                                     // Outbound side: pass the URI we just dialed so
                                     // the rotation-deadline trigger can do same-URI
-                                    // make-before-break без requiring а separate
+                                    // make-before-break without requiring a separate
                                     // alt_uri (Q.7 audit batch).
                                     primary_uri: Some(peer.transport.clone()),
                                 };
@@ -561,18 +561,18 @@ pub fn spawn_outbound_peers(
                                 // Phase E20-fix (2026-05-22): previously
                                 // `bootstrap_only` connectors broke after the
                                 // first session ended, relying on the
-                                // bootstrap-watchdog к re-spawn on full session
-                                // loss.  Combined с the new lexicographic dedup
+                                // bootstrap-watchdog to re-spawn on full session
+                                // loss.  Combined with the new lexicographic dedup
                                 // policy, the smaller-node-id side's `outbound_
-                                // connector` exits после а deploy-race-caused
-                                // session-loss, и the watchdog never fires
+                                // connector` exits after a deploy-race-caused
+                                // session-loss, and the watchdog never fires
                                 // (sessions to other peers remain).  Result:
                                 // permanent split.
                                 //
                                 // Fix: let bootstrap-only connectors loop just
                                 // like regular peers.  The single-shot FIND_NODE
                                 // burst above already ran on the first success;
-                                // subsequent reconnects ара cheap (TCP+handshake
+                                // subsequent reconnects are cheap (TCP+handshake
                                 // only, no DHT seed work).
                             }
                             Err(err) => {

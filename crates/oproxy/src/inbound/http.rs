@@ -1,19 +1,19 @@
 //! HTTP/1.1 forward proxy.  Supports the **CONNECT** method (used by
-//! browsers / curl for HTTPS through-tunnels) и absolute-URI requests
+//! browsers / curl for HTTPS through-tunnels) and absolute-URI requests
 //! for plain HTTP forwarding.
 //!
 //! # CONNECT
 //!
 //! Client sends: `CONNECT host:port HTTP/1.1\r\n<hdrs>\r\n\r\n`.
-//! Server replies: `HTTP/1.1 200 Connection Established\r\n\r\n` и
+//! Server replies: `HTTP/1.1 200 Connection Established\r\n\r\n` and
 //! then bridges bytes verbatim.
 //!
 //! # Plain HTTP (absolute-URI)
 //!
 //! Client sends: `GET http://host/path HTTP/1.1\r\n<hdrs>\r\n\r\n`.
-//! We extract host:port от the URI, rewrite the request line к
+//! We extract host:port from the URI, rewrite the request line to
 //! `GET /path HTTP/1.1`, then forward the (rewritten + remainder)
-//! bytes through the veil.  HTTPS upstream URIs ара treated as
+//! bytes through the veil.  HTTPS upstream URIs are treated as
 //! CONNECT equivalent (not supported in this minimal mode).
 
 use std::sync::Arc;
@@ -44,13 +44,13 @@ pub async fn run(
         .with_context(|| format!("bind HTTP listener {listen_addr}"))?;
     log::info!("oproxy.http: listening on {listen_addr}");
     loop {
-        // Audit batch 2026-05-24 (M8): semaphore gating, см. socks5.rs.
+        // Audit batch 2026-05-24 (M8): semaphore gating, see socks5.rs.
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(p) => p,
             Err(_closed) => return Ok(()),
         };
         let (stream, peer) = listener.accept().await.context("accept HTTP")?;
-        log::debug!("oproxy.http: accept от {peer}");
+        log::debug!("oproxy.http: accept from {peer}");
         let h = Arc::clone(&app_handle);
         let r = Arc::clone(&routing);
         tokio::spawn(async move {
@@ -70,20 +70,20 @@ async fn handle_connection(
     routing: Arc<RoutingConfig>,
 ) -> Result<()> {
     let mut stream = stream;
-    // Audit batch 2026-05-24: read headers с per-chunk bounds check (NOT
-    // `read_until` — that lets the read grow unbounded на а single line
+    // Audit batch 2026-05-24: read headers with per-chunk bounds check (NOT
+    // `read_until` — that lets the read grow unbounded on a single line
     // until newline arrives, defeating MAX_HEADERS_BYTES).  Chunked
-    // reads enforce the cap BEFORE each system call, и the entire phase
-    // wraps в `HANDSHAKE_TIMEOUT` к defeat slow-loris clients.
+    // reads enforce the cap BEFORE each system call, and the entire phase
+    // wraps in `HANDSHAKE_TIMEOUT` to defeat slow-loris clients.
     let (headers, pending_after_headers) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let mut headers: Vec<u8> = Vec::with_capacity(1024);
         let mut chunk = [0u8; READ_CHUNK_SIZE];
-        // Track where к resume scanning для end-of-headers — overlap of
-        // 3 bytes к catch а split "\r\n\r\n" pattern across chunks.
+        // Track where to resume scanning for end-of-headers — overlap of
+        // 3 bytes to catch a split "\r\n\r\n" pattern across chunks.
         let mut scan_from = 0usize;
         loop {
-            // Bound check BEFORE reading, не after.  An attacker shipping
-            // gigabytes на а single line cannot push us past MAX_HEADERS_BYTES.
+            // Bound check BEFORE reading, not after.  An attacker shipping
+            // gigabytes on a single line cannot push us past MAX_HEADERS_BYTES.
             let remaining = MAX_HEADERS_BYTES.saturating_sub(headers.len());
             if remaining == 0 {
                 anyhow::bail!("headers > {MAX_HEADERS_BYTES} bytes; refusing to continue");
@@ -97,14 +97,14 @@ async fn handle_connection(
                 anyhow::bail!("EOF before end-of-headers");
             }
             headers.extend_from_slice(&chunk[..n]);
-            // Look для end-of-headers ("\r\n\r\n" або "\n\n") в the
-            // newly-added region (с а 3-byte back-scan к catch split-
+            // Look for end-of-headers ("\r\n\r\n" or "\n\n") in the
+            // newly-added region (with a 3-byte back-scan to catch split-
             // across-chunks patterns).
             let scan_start = scan_from.saturating_sub(3);
             let eoh = find_end_of_headers(&headers[scan_start..]).map(|i| scan_start + i);
             if let Some(eoh_pos) = eoh {
-                // Capture pending bytes (если client pipelined body
-                // after the empty-line).  Truncate `headers` к the
+                // Capture pending bytes (if client pipelined body
+                // after the empty-line).  Truncate `headers` to the
                 // header-only portion.
                 let pending = headers.split_off(eoh_pos);
                 return Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>((headers, pending));
@@ -140,8 +140,8 @@ async fn handle_connection(
             .context("write CONNECT reply")?;
 
         // Audit batch 2026-05-24: previously pipelined post-CONNECT
-        // bytes were silently dropped с а warning ("dead-code TODO").
-        // Browsers don't pipeline после CONNECT, но non-standard
+        // bytes were silently dropped with a warning ("dead-code TODO").
+        // Browsers don't pipeline after CONNECT, but non-standard
         // clients might.  Reject explicitly — silent drop corrupts the
         // tunnel without informing the client.
         if !pending_after_headers.is_empty() {
@@ -168,9 +168,9 @@ async fn handle_connection(
         .ok_or_else(|| anyhow!("non-CONNECT target `{target}` not absolute-URI HTTP"))?;
     let http_version = parts.next().unwrap_or("HTTP/1.1");
 
-    // Rewrite the request line к origin-form (`GET /path HTTP/1.1`)
-    // и forward as raw bytes.  Drop the Proxy-Connection header (per
-    // RFC 7230) и add Host если missing.
+    // Rewrite the request line to origin-form (`GET /path HTTP/1.1`)
+    // and forward as raw bytes.  Drop the Proxy-Connection header (per
+    // RFC 7230) and add Host if missing.
     let mut rewritten: Vec<u8> = Vec::new();
     rewritten.extend_from_slice(method.as_bytes());
     rewritten.push(b' ');
@@ -178,7 +178,7 @@ async fn handle_connection(
     rewritten.push(b' ');
     rewritten.extend_from_slice(http_version.as_bytes());
     rewritten.extend_from_slice(b"\r\n");
-    // Append remaining headers (lines после the request line) verbatim.
+    // Append remaining headers (lines after the request line) verbatim.
     // Skip Proxy-Connection.
     let mut has_host = false;
     let rest = &headers[first_line_end..];
@@ -217,7 +217,7 @@ async fn handle_connection(
     rewritten.extend_from_slice(b"\r\n");
 
     // Captured during chunked read: any bytes that arrived past the
-    // end-of-headers marker (request body — unlikely for GET, но
+    // end-of-headers marker (request body — unlikely for GET, but
     // supported).
     let pending = pending_after_headers;
 
@@ -256,13 +256,13 @@ fn find_end_of_headers(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Parse а CONNECT authority `host:port` или `[ipv6]:port`.
+/// Parse a CONNECT authority `host:port` or `[ipv6]:port`.
 ///
 /// Audit batch 2026-05-24: explicitly reject empty hosts ("[]:443" or
-/// ":443") и control chars (defence в depth against header smuggling).
+/// ":443") and control chars (defence in depth against header smuggling).
 pub fn parse_authority(s: &str) -> Option<(String, u16)> {
-    // Reject control chars early — they have no place в an authority и
-    // могут confuse downstream consumers (smuggling).
+    // Reject control chars early — they have no place in an authority and
+    // can confuse downstream consumers (smuggling).
     if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return None;
     }

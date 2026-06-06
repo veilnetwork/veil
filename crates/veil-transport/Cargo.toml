@@ -10,22 +10,22 @@ license = "AGPL-3.0-or-later"
 # Mirrors veilcore's `tls-boring` feature so downstream binaries can
 # enable it via `veil-transport = { …, features = ["tls-boring"] }`.
 tls-boring = ["dep:btls", "dep:tokio-btls", "dep:quinn-btls"]
-# Phase 6.50.b audit-C2: `tls-webpki-roots` is now а semver-stable
-# no-op kept for existing build configs.  Originally gated а cfg-block
-# в `context.rs` that decided whether `use_system_roots = true` actually
-# applied Mozilla roots; that gate was а silent footgun (operator says
-# "yes, use Mozilla roots", build flag не задан → silent fall-through к
-# pinned-CAs-only с only а warn log).  `webpki-roots` is now а direct
-# dep either way (the HTTPS-bootstrap и signed-update fetch paths
+# Phase 6.50.b audit-C2: `tls-webpki-roots` is now a semver-stable
+# no-op kept for existing build configs.  Originally gated a cfg-block
+# in `context.rs` that decided whether `use_system_roots = true` actually
+# applied Mozilla roots; that gate was a silent footgun (operator says
+# "yes, use Mozilla roots", build flag not set → silent fall-through to
+# pinned-CAs-only with only a warn log).  `webpki-roots` is now a direct
+# dep either way (the HTTPS-bootstrap and signed-update fetch paths
 # require it unconditionally), so the build-flag/runtime-flag split
-# served no purpose.  Scheduled for removal в the next semver-major.
+# served no purpose.  Scheduled for removal in the next semver-major.
 tls-webpki-roots = []
 
 [dependencies]
 veil-error = { path = "../veil-error" }
 
 futures = "0.3"
-# Этап 10 slice 3: HTTPS RR (RFC 9460) lookups for real ECH config
+# Stage 10 slice 3: HTTPS RR (RFC 9460) lookups for real ECH config
 # resolution.  Basic features only — DoH/DoT not needed for this path.
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 log = "0.4"

@@ -299,11 +299,11 @@ pub fn decode_master_seed_encrypted(
         parsed.p_cost as u32,
     )?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_array()));
-    // wrap the decrypt result в `Zeroizing` IMMEDIATELY so
+    // wrap the decrypt result in `Zeroizing` IMMEDIATELY so
     // the master-seed bytes are wiped on every exit path (early
-    // return, panic, etc.) — not relying on а manual loop after а
+    // return, panic, etc.) — not relying on a manual loop after a
     // copy. Closes the timing window where the seed sits in plain
-    // heap storage between the AEAD decrypt и the explicit zeroing.
+    // heap storage between the AEAD decrypt and the explicit zeroing.
     let pt: Zeroizing<Vec<u8>> = Zeroizing::new(
         cipher
             .decrypt(
@@ -507,11 +507,11 @@ fn derive_key(
     t_cost: u32,
     p_cost: u32,
 ) -> Result<veil_util::sensitive_bytes::SensitiveBytesN<32>, MasterFileError> {
-    // Этап 6 slice 6d: pilot migration от `Zeroizing<[u8; 32]>` к the
+    // Phase 6 slice 6d: pilot migration from `Zeroizing<[u8; 32]>` to the
     // mlock-when-possible `SensitiveBytesN<32>` companion type.  The
-    // Argon2-derived key пинна in RAM (closes the swap-к-disk vector)
-    // when `RLIMIT_MEMLOCK` permits; falls back к zeroize-only otherwise
-    // (same protection as the pre-Этап-6 code path).  Caller-side API
+    // Argon2-derived key is pinned in RAM (closes the swap-to-disk vector)
+    // when `RLIMIT_MEMLOCK` permits; falls back to zeroize-only otherwise
+    // (same protection as the pre-Phase-6 code path).  Caller-side API
     // changes: `.as_ref()` → `.as_array()`.
     let params = Params::new(m_cost_kib, t_cost, p_cost, Some(32))
         .map_err(|e| MasterFileError::Argon2(e.to_string()))?;
@@ -525,18 +525,18 @@ fn derive_key(
 }
 
 fn write_file_atomically_secure(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    // Delegate к the shared helper, which already provides:
+    // Delegate to the shared helper, which already provides:
     //   - parent `mkdir -p` with EACCES retry
     //   - tmp-file open `0o600` on Unix (owner-only)
     //   - `f.sync_all()` on the tmp file
     //   - atomic `rename(tmp, path)`
     //   - **fsync of the parent dir after rename** — the bit this
-    //     local copy was missing. Without parent-dir fsync а power
-    //     loss in the narrow window between `rename(2)` returning и
+    //     local copy was missing. Without parent-dir fsync a power
+    //     loss in the narrow window between `rename(2)` returning and
     //     the dirent hitting disk could leave the directory referencing
-    //     either the old name (file gone), the new name (good), or а
+    //     either the old name (file gone), the new name (good), or a
     //     half-allocated inode. Most FS configs journal dirent updates
-    //     по умолчанию, но explicit parent fsync is the portable guarantee.
+    //     by default, but explicit parent fsync is the portable guarantee.
     veil_util::atomic_write(path, bytes)
 }
 

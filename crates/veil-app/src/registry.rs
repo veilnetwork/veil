@@ -49,8 +49,8 @@ pub enum AppMessage {
     Data(AppDataPayload),
     Send(AppSendPayload),
     /// IPC-layer delivery: veil datagram from `src_node_id` destined for
-    /// this endpoint. Carries the fully-decoded data без re-encoding.
-    /// d: pool-backed для chat_node-style high-throughput IPC.
+    /// this endpoint. Carries the fully-decoded data without re-encoding.
+    /// d: pool-backed for chat_node-style high-throughput IPC.
     Deliver {
         src_node_id: [u8; 32],
         src_app_id: [u8; 32],

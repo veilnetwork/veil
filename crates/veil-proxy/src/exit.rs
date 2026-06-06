@@ -426,9 +426,9 @@ mod tests {
     }
 
     /// SECURITY (audit 2026-05-29, CRITICAL SSRF regression): IPv4-mapped
-    /// IPv6 destinations MUST be canonicalized и blocked exactly like
+    /// IPv6 destinations MUST be canonicalized and blocked exactly like
     /// their plain-IPv4 form.  Pre-fix, `::ffff:169.254.169.254` had
-    /// first segment 0x0000 → bypassed both the fc00::/7 и fe80::/10
+    /// first segment 0x0000 → bypassed both the fc00::/7 and fe80::/10
     /// prefix checks AND `is_loopback()`, admitting cloud-metadata /
     /// RFC1918 / loopback over IPv4 on dual-stack hosts.
     #[test]

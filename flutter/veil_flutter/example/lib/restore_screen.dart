@@ -2,14 +2,14 @@
 //
 // Pure Material 3 widgets — no extra dependencies.  Drop into any
 // app that uses veil_flutter; it produces the identity files and
-// reports the path к the caller via the onRestored callback.
+// reports the path to the caller via the onRestored callback.
 //
 // Threat-model UX choices:
 //   * Phrase entered as a single multiline TextField — copy-pasting
 //     the 24 words from a password manager is easier than 24 small
 //     fields, and Android/iOS clipboard sniffers see the same data
 //     either way.
-//   * Live word-count feedback ("18 / 24") so user knows when к stop.
+//   * Live word-count feedback ("18 / 24") so user knows when to stop.
 //   * BIP-39 checksum check before showing "Restore" — surfaces
 //     a typo immediately, not after a daemon round-trip.
 //   * After restore, navigation is the caller's responsibility —
@@ -31,7 +31,7 @@ class RestoreIdentityScreen extends StatefulWidget {
   /// `getApplicationSupportDirectory()` (path_provider).
   final String veilDir;
 
-  /// Called on successful restore с the same [veilDir].  Caller
+  /// Called on successful restore with the same [veilDir].  Caller
   /// typically navigates to "Connect" / "Home" screen and starts
   /// the daemon.
   final void Function(String veilDir) onRestored;
@@ -100,9 +100,9 @@ class _RestoreIdentityScreenState extends State<RestoreIdentityScreen> {
       _restoreError = null;
     });
     try {
-      // Off-isolate в case Argon2id (master-encryption file path —
-      // currently unused here, но defensive) ever creeps in.
-      // restoreIdentity itself is pure-compute under а second.
+      // Off-isolate in case Argon2id (master-encryption file path —
+      // currently unused here, but defensive) ever creeps in.
+      // restoreIdentity itself is pure-compute under a second.
       await Future(() {
         restoreIdentity(
           phrase: _phraseCtrl.text,

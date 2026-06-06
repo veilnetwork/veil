@@ -141,19 +141,19 @@ impl AttachmentTable {
         self.leases.contains_key(node_id)
     }
 
-    /// cleanup test helper: read а lease's `expires_at`
-    /// без exposing the internal HashMap. Used by sleep-free flake-fix
+    /// cleanup test helper: read a lease's `expires_at`
+    /// without exposing the internal HashMap. Used by sleep-free flake-fix
     /// rewrites of `keepalive_prevents_eviction`-style tests.
     #[cfg(test)]
     pub fn expires_at(&self, node_id: &[u8; 32]) -> Option<Instant> {
         self.leases.get(node_id).map(|l| l.expires_at)
     }
 
-    /// cleanup test helper: forcibly set а lease's
-    /// `expires_at` к а synthetic instant. Lets tests verify
-    /// cleanup_expired / keepalive interactions через explicit Instant
+    /// cleanup test helper: forcibly set a lease's
+    /// `expires_at` to a synthetic instant. Lets tests verify
+    /// cleanup_expired / keepalive interactions through explicit Instant
     /// arithmetic instead of `std::thread::sleep` (which was scheduler-bound
-    /// и produced timing-flakes). Returns `true` if the lease existed.
+    /// and produced timing-flakes). Returns `true` if the lease existed.
     #[cfg(test)]
     pub fn force_expires_at(&mut self, node_id: &[u8; 32], instant: Instant) -> bool {
         if let Some(lease) = self.leases.get_mut(node_id) {

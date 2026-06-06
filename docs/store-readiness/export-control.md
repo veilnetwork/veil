@@ -36,13 +36,13 @@ Encryption Authorization Type:     Mass-market (Section 740.17(b)(1))
 Encryption Item Type:              §740.17(b)(1) item — software application
 Description of the encryption item: 
   Decentralized peer-to-peer messaging mobile / desktop application.
-  End-to-end encrypted между users using ML-KEM-768 hybrid post-
+  End-to-end encrypted between users using ML-KEM-768 hybrid post-
   quantum key encapsulation, Ed25519 + Falcon-512 identity
   signatures, ChaCha20-Poly1305 AEAD bulk cipher.  Distributed
-  through Apple App Store, Google Play Store, и direct download
+  through Apple App Store, Google Play Store, and direct download
   from project site.
 
-Symmetric algorithms used и max key sizes:
+Symmetric algorithms used and max key sizes:
   - ChaCha20  (256-bit key)
 
 Asymmetric algorithms:

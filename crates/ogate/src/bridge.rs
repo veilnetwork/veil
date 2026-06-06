@@ -32,32 +32,32 @@ use crate::config::OgateConfig;
 use crate::routing::{Decision, NodeId, RoutingTable, parse_ip_endpoints};
 use crate::tun::Device;
 
-/// Egress flush threshold (bytes).  When а per-peer batch crosses this size,
+/// Egress flush threshold (bytes).  When a per-peer batch crosses this size,
 /// or the NEXT push would push it over, we ship the batch immediately.
 ///
-/// Phase E27 root cause (2026-05-22):  obfs4 transport hard-caps а single
+/// Phase E27 root cause (2026-05-22):  obfs4 transport hard-caps a single
 /// frame ciphertext at `MAX_FRAME_CIPHERTEXT_BYTES = 16384`
 /// ([crates/veil-obfs4/src/lib.rs](crates/veil-obfs4/src/lib.rs)).  Above
-/// that, `wrap_frame` returns `OversizedFrame`, the writer task exits, и the
+/// that, `wrap_frame` returns `OversizedFrame`, the writer task exits, and the
 /// session closes.  Obfs4 also appends random 0-1024 bytes of padding per
 /// frame, so the SAFE plaintext-payload ceiling is:
 ///   16384 − 1024 (worst-case pad) − 17 (obfs4 hdr + tag) − 16 (session AEAD
 ///   tag) − 24 (FrameHeader) − 72 (AppSendPayload header) ≈ 15 231 bytes.
 ///
-/// Set к 14 000 для conservative headroom against jitter в padding/tag math.
-/// Pre-flush logic ниже ensures the NEXT push checks BEFORE appending — so
-/// а single TUN packet larger than this threshold ships solo (= effectively
-/// pre-E27 behaviour for big packets), и multi-packet batching only happens
-/// when individual packets are small enough к coalesce.
+/// Set to 14 000 for conservative headroom against jitter in padding/tag math.
+/// Pre-flush logic below ensures the NEXT push checks BEFORE appending — so
+/// a single TUN packet larger than this threshold ships solo (= effectively
+/// pre-E27 behaviour for big packets), and multi-packet batching only happens
+/// when individual packets are small enough to coalesce.
 ///
 /// At MTU 1500 each batch fits ~9 packets; at MTU 4500 ~3 packets; at MTU
 /// ≥ 14 000 each packet ships solo (no batching win — drop the testnet MTU
-/// если you want batching benefit).
+/// if you want batching benefit).
 ///
-/// Overrideable via `OGATE_BATCH_BYTES` env var:  bench-only knob для local
-/// stands где the daemon-to-daemon TCP is plain (no obfs4 cap), so larger
+/// Overrideable via `OGATE_BATCH_BYTES` env var:  bench-only knob for local
+/// stands where the daemon-to-daemon TCP is plain (no obfs4 cap), so larger
 /// batches can be safely shipped.  Production / testnet (obfs4) must keep
-/// the default к stay under `MAX_FRAME_CIPHERTEXT_BYTES` (16 KiB).
+/// the default to stay under `MAX_FRAME_CIPHERTEXT_BYTES` (16 KiB).
 const EGRESS_FLUSH_BYTES_DEFAULT: usize = 14_000;
 
 fn egress_flush_bytes() -> usize {
@@ -68,15 +68,15 @@ fn egress_flush_bytes() -> usize {
         .unwrap_or(EGRESS_FLUSH_BYTES_DEFAULT)
 }
 
-// Phase E27 kill-switch:  was а compile-time const, now config-driven
-// via `[batch] enabled = bool` (default true; см. `OgateConfig::batch`).
+// Phase E27 kill-switch:  was a compile-time const, now config-driven
+// via `[batch] enabled = bool` (default true; see `OgateConfig::batch`).
 // Audit batch 2026-05-24 (M13): rolling upgrade safety — operators can
-// flip off batching during mixed-version rollouts без re-compile.
+// flip off batching during mixed-version rollouts without re-compile.
 
 /// Egress max-batch-age before forced flush.  Tradeoff: smaller = lower latency,
 /// larger = better coalescing.  200 µs picks the same order-of-magnitude as the
-/// tokio scheduling jitter we see в production traces, so coalescing aggregates
-/// "what naturally arrives between schedules" без adding visible latency.
+/// tokio scheduling jitter we see in production traces, so coalescing aggregates
+/// "what naturally arrives between schedules" without adding visible latency.
 const EGRESS_FLUSH_AFTER: Duration = Duration::from_micros(200);
 
 /// Hot-swappable state: peer routing decisions + peer app_id lookup.
@@ -88,8 +88,8 @@ pub struct SharedState {
     /// Same peer set as the table, materialized as `(node_id, app_id)`
     /// to avoid recomputing BLAKE3 on every egress packet.
     pub peer_app_ids: Vec<(NodeId, [u8; 32])>,
-    /// Configured virtual-iface MTU. Used by the ingress task к drop
-    /// oversize packets BEFORE writing к TUN — а compromised peer cannot
+    /// Configured virtual-iface MTU. Used by the ingress task to drop
+    /// oversize packets BEFORE writing to TUN — a compromised peer cannot
     /// inject larger-than-expected frames that would either fragment
     /// unexpectedly or trip kernel-side anomaly handling.
     pub mtu: u16,
@@ -117,16 +117,16 @@ impl SharedState {
     }
 }
 
-/// Filter а config's `[[peers]]` list, keeping only those whose
+/// Filter a config's `[[peers]]` list, keeping only those whose
 /// `node_id` is currently cert-verified by the daemon's P-Net gate.
 ///
 /// Failure modes:
 /// * Daemon RPC error ⇒ peer dropped from list + warning.
-/// * `admitted=false` ⇒ no active session к peer; peer dropped + warn.
-/// * `has_cert=false` ⇒ peer admitted in public mode но без cert; drop.
+/// * `admitted=false` ⇒ no active session to peer; peer dropped + warn.
+/// * `has_cert=false` ⇒ peer admitted in public mode but without cert; drop.
 ///
 /// On startup: filters once.  On SIGHUP reload: filter re-runs (existing
-/// reload-task already re-calls `SharedState::build` через the supervisor;
+/// reload-task already re-calls `SharedState::build` through the supervisor;
 /// see the reload-handler block).
 async fn filter_peers_by_pnet(cfg: &OgateConfig, client: &VeilClient) -> OgateConfig {
     let mut filtered = cfg.clone();
@@ -138,7 +138,7 @@ async fn filter_peers_by_pnet(cfg: &OgateConfig, client: &VeilClient) -> OgateCo
             Ok(bytes) if bytes.len() == 32 => node_id.copy_from_slice(&bytes),
             _ => {
                 // Validate() will reject this later — keep here so the
-                // user-facing error message comes от the right place.
+                // user-facing error message comes from the right place.
                 filtered.peers.push(peer.clone());
                 continue;
             }
@@ -226,9 +226,9 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         .map_err(BridgeError::client)?;
 
     // ── initial state ───────────────────────────────────────────────────
-    // S2.A: filter peers by daemon-side P-Net cert verification если
-    // `pnet_required = true`.  Each filtered-out peer logs а warning;
-    // operators can either rotate the cert или drop the peer от config.
+    // S2.A: filter peers by daemon-side P-Net cert verification if
+    // `pnet_required = true`.  Each filtered-out peer logs a warning;
+    // operators can either rotate the cert or drop the peer from config.
     let cfg = if cfg.pnet_required {
         filter_peers_by_pnet(&cfg, &client).await
     } else {
@@ -266,8 +266,8 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
 
     let endpoint_id = cfg.endpoint_id;
     let (app_sender, mut app_receiver) = handle.into_split();
-    // Arc-wrap the sender so the cert-broadcast task can share it с
-    // the egress task без uncoordinated moves.  `send_*` methods take
+    // Arc-wrap the sender so the cert-broadcast task can share it with
+    // the egress task without uncoordinated moves.  `send_*` methods take
     // `&self`, so Arc-deref works transparently.
     let app_sender = Arc::new(app_sender);
 
@@ -311,16 +311,16 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
     let verified_peers: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], u64>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    // Notify shared с all background tasks для clean shutdown.  Moved
+    // Notify shared with all background tasks for clean shutdown.  Moved
     // earlier than its original position so the cert-broadcast task can
     // reference it during initialisation.
     let shutdown = Arc::new(Notify::new());
 
     // ── S2.B sender-side: periodic cert broadcast ──────────────────────
-    // When `app_cert_path` is set, ogate emits its cert к every
+    // When `app_cert_path` is set, ogate emits its cert to every
     // configured peer at startup (so receivers can populate their cache
-    // before regular packets arrive) и then every 5 min thereafter (so
-    // peers что came online late or restarted still get the cert).
+    // before regular packets arrive) and then every 5 min thereafter (so
+    // peers that came online late or restarted still get the cert).
     let cert_broadcast_task: Option<tokio::task::JoinHandle<()>> = if let Some(blob) =
         own_cert_blob.as_ref()
     {
@@ -332,10 +332,10 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                 let state_for_cert = Arc::clone(&state);
                 let shutdown_for_cert = Arc::clone(&shutdown);
                 Some(tokio::spawn(async move {
-                    // Wait а brief moment so peers' ingress tasks ара listening.
+                    // Wait a brief moment so peers' ingress tasks are listening.
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     loop {
-                        // Snapshot the current peer list (changes на SIGHUP reload).
+                        // Snapshot the current peer list (changes on SIGHUP reload).
                         let snap = state_for_cert.load();
                         for peer_node_id in snap.table.peer_node_ids() {
                             let app_id = snap.app_id_for(peer_node_id);
@@ -346,7 +346,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                     .await;
                             }
                         }
-                        // Wait 5 min или until shutdown.
+                        // Wait 5 min or until shutdown.
                         tokio::select! {
                             _ = shutdown_for_cert.notified() => break,
                             _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {},
@@ -371,7 +371,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
     // ── Egress: TUN → veil (batched) ─────────────────────────────────
     //
     // Phase E27: instead of shipping one IPC frame per IP packet, coalesce
-    // packets per peer destination into а batch envelope (BATCH_MAGIC + count
+    // packets per peer destination into a batch envelope (BATCH_MAGIC + count
     // + N × (u16 len, ip-packet)).  Flush triggers:
     //   * a batch hits `EGRESS_FLUSH_BYTES` (size cap)
     //   * a batch hits 255 packets (count cap, enforced by `should_flush`)
@@ -393,7 +393,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
     let batching_enabled = cfg.batch.enabled;
     tracing::info!(
         batching_enabled,
-        "egress batching state — set [batch] enabled = false для rolling-upgrade safety"
+        "egress batching state — set [batch] enabled = false for rolling-upgrade safety"
     );
 
     let egress = {
@@ -403,9 +403,9 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         tokio::spawn(async move {
             let mut batches = EgressBatches::new();
             loop {
-                // Pick wake-up source: either the TUN reader OR а deadline timer
+                // Pick wake-up source: either the TUN reader OR a deadline timer
                 // for the oldest pending batch.  `tokio::time::sleep_until` requires
-                // а concrete Instant; if no batch is open, just sleep "forever"
+                // a concrete Instant; if no batch is open, just sleep "forever"
                 // (the TUN read will wake us first).
                 let deadline = batches
                     .earliest_deadline()
@@ -475,17 +475,17 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                 continue;
                             };
                             // Drop the snap before await — `ArcSwap::load` returns
-                            // а guard that should be short-lived.
+                            // a guard that should be short-lived.
                             drop(snap);
 
                             if batching_enabled {
                                 // Per-record size = u16 len + pkt bytes.
                                 let pkt_len = pkt.len();
                                 let record_size = 2 + pkt_len;
-                                // Solo-ship: а single packet bigger than the
-                                // batch cap can't EVER fit в а multi-pkt envelope
+                                // Solo-ship: a single packet bigger than the
+                                // batch cap can't EVER fit in a multi-pkt envelope
                                 // — send raw to keep wire frame under the obfs4
-                                // 16K ciphertext cap.  E26 behaviour для big pkts.
+                                // 16K ciphertext cap.  E26 behaviour for big pkts.
                                 if record_size + 2 /* batch header */ > egress_flush_bytes {
                                     // Flush any pending batch first to preserve
                                     // ordering relative to this big packet.
@@ -498,7 +498,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                             .await;
                                     }
                                     // Zero-data-copy: SDK fills the PREFIX bytes
-                                    // в `buf` in place и forwards the whole Vec.
+                                    // in `buf` in place and forwards the whole Vec.
                                     if let Err(e) = app_sender
                                         .send_prepared(peer_nid, peer_app_id, endpoint_id, buf)
                                         .await
@@ -508,7 +508,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                 } else {
                                     // Pre-flush: if appending would cross the
                                     // threshold, flush the current batch FIRST,
-                                    // then start а fresh batch with this packet.
+                                    // then start a fresh batch with this packet.
                                     let pb = batches.get_or_create(peer_nid, peer_app_id);
                                     if !pb.is_empty()
                                         && pb.len() + record_size > egress_flush_bytes
@@ -577,7 +577,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                             let snap = state.load();
                             // S2.B: cert message intercept BEFORE any IP-packet
                             // dispatch.  Marker 0xC0 is outside IPv4/IPv6 version
-                            // nibbles + distinct от batch envelope (0xB1).
+                            // nibbles + distinct from batch envelope (0xB1).
                             if crate::cert_message::is_cert_message(&im.data) {
                                 match crate::cert_message::decode_cert_message(&im.data) {
                                     Ok(blob) => {
@@ -591,7 +591,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                                     tracing::info!(
                                                         src = %hex::encode(im.src_node_id),
                                                         valid_until,
-                                                        "app-cert verified для peer"
+                                                        "app-cert verified for peer"
                                                     );
                                                 }
                                                 Err(e) => {
@@ -604,7 +604,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                             }
                                         } else {
                                             // Gate not configured — silently swallow the
-                                            // cert message (wire-compat для mixed deployment).
+                                            // cert message (wire-compat for mixed deployment).
                                             tracing::debug!(
                                                 src = %hex::encode(im.src_node_id),
                                                 "ignoring unsolicited cert (gate not configured)"
@@ -622,7 +622,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                 continue; // Don't touch TUN-write path.
                             }
                             // S2.B admission gate: if app-cert authority configured,
-                            // packets от unverified peers ара dropped.
+                            // packets from unverified peers are dropped.
                             if app_cert_gate_for_ingress.is_some() {
                                 let admitted = {
                                     let g = verified_peers_for_ingress
@@ -641,7 +641,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                 if !admitted {
                                     tracing::debug!(
                                         src = %hex::encode(im.src_node_id),
-                                        "app-cert gate: dropping packet от unverified peer"
+                                        "app-cert gate: dropping packet from unverified peer"
                                     );
                                     continue;
                                 }
@@ -660,8 +660,8 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                 }
                             } else {
                                 // Legacy single-packet envelope.  Keep the
-                                // pre-E27 MTU guard at envelope level (а compromised
-                                // peer cannot inject а larger-than-MTU frame).
+                                // pre-E27 MTU guard at envelope level (a compromised
+                                // peer cannot inject a larger-than-MTU frame).
                                 if im.data.len() > snap.mtu as usize {
                                     tracing::debug!(
                                         src = %hex::encode(im.src_node_id),

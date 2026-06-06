@@ -240,9 +240,9 @@ async fn second_bind_same_endpoint_rejected() {
 
 // ── 26.5: E2E: client B sends → client A (same node) gets APP_DELIVER ─
 
-// Audit batch 2026-05-24: this test is а pre-existing flake on
-// sandboxed Unix-socket timing (hangs в CI / WSL / nested containers,
-// passes locally on bare metal).  Documented в audit batch 2026-05-23
+// Audit batch 2026-05-24: this test is a pre-existing flake on
+// sandboxed Unix-socket timing (hangs in CI / WSL / nested containers,
+// passes locally on bare metal).  Documented in audit batch 2026-05-23
 // (commit 884e32c) as "pre-existing flakes that hang on master too".
 // Run explicitly with `cargo test -p veil-ipc -- --ignored` when
 // validating IPC changes on Linux bare metal.
@@ -322,8 +322,8 @@ async fn e2e_local_send_delivers_to_receiver() {
 // ── 26.6: slow reader — node drops, doesn't block ────────────────────
 
 // Audit batch 2026-05-24: pre-existing flake (see
-// [`e2e_local_send_delivers_to_receiver`]).  Documented в commit
-// 884e32c.  Run с --ignored on Linux bare metal к validate IPC changes.
+// [`e2e_local_send_delivers_to_receiver`]).  Documented in commit
+// 884e32c.  Run with --ignored on Linux bare metal to validate IPC changes.
 #[ignore = "flaky on sandboxed Unix sockets — run with --ignored"]
 #[tokio::test]
 async fn slow_reader_does_not_block_server() {
@@ -399,8 +399,8 @@ async fn slow_reader_does_not_block_server() {
 // ── 27.6: stream open → data exchange → close ────────────────────────
 
 // Audit batch 2026-05-24: pre-existing flake (see
-// [`e2e_local_send_delivers_to_receiver`]).  Documented в commit
-// 884e32c.  Run с --ignored on Linux bare metal к validate IPC changes.
+// [`e2e_local_send_delivers_to_receiver`]).  Documented in commit
+// 884e32c.  Run with --ignored on Linux bare metal to validate IPC changes.
 #[ignore = "flaky on sandboxed Unix sockets — run with --ignored"]
 #[tokio::test]
 async fn ipc_stream_open_data_close() {
@@ -448,8 +448,8 @@ async fn ipc_stream_open_data_close() {
     let stream_id = open_ok.stream_id;
     assert!(stream_id > 0);
 
-    // B receives STREAM_OPEN_INBOUND (Phase 6.51: distinct от
-    // StreamOpenOk which is the reply к B's own outbound opens).
+    // B receives STREAM_OPEN_INBOUND (Phase 6.51: distinct from
+    // StreamOpenOk which is the reply to B's own outbound opens).
     let (hdr, _) = tokio::time::timeout(Duration::from_millis(500), recv_ipc_frame(&mut client_b))
         .await
         .expect("timeout waiting for B STREAM_OPEN_INBOUND");
@@ -506,16 +506,16 @@ async fn ipc_stream_open_data_close() {
 // ── Audit batch 2026-05-23: bidirectional ping/pong over IPC stream ─────
 //
 // Regression bar for HIGH-1: the SDK contract says an `VeilStream` is
-// а **bidirectional** byte channel, но pre-fix the server only registered
-// stream ownership on the opener (А) side.  When the acceptor (B) SDK
-// tried to write а reply via `STREAM_DATA`, server.rs's
-// `owns_stream(p.stream_id)` returned false (B never claimed the id) и
+// a **bidirectional** byte channel, but pre-fix the server only registered
+// stream ownership on the opener (A) side.  When the acceptor (B) SDK
+// tried to write a reply via `STREAM_DATA`, server.rs's
+// `owns_stream(p.stream_id)` returned false (B never claimed the id) and
 // the frame was silently dropped — turning every "RPC reply" pattern
-// (oproxy CONNECT handshake, request/response IPC services) into а
+// (oproxy CONNECT handshake, request/response IPC services) into a
 // permanent hang.
 //
 // Post-fix: the per-endpoint forwarder, when it translates
-// `AppMessage::StreamOpen` into а STREAM_OPEN_INBOUND frame, claims B-side
+// `AppMessage::StreamOpen` into a STREAM_OPEN_INBOUND frame, claims B-side
 // ownership in the shared `owned_streams_acceptor` set on that IPC
 // connection.  The server's STREAM_DATA handler now consults BOTH the
 // opener and acceptor sets and dispatches to either `route_data_from_a`
@@ -541,7 +541,7 @@ async fn ipc_stream_bidirectional_ping_pong() {
     let bind_ok = AppBindOkPayload::decode(&body).unwrap();
     let target_app_id = bind_ok.app_id;
 
-    // Client A opens а stream к B.
+    // Client A opens a stream to B.
     let mut client_a = connect_and_hello(&sock).await;
     let open = StreamOpenPayload {
         dst_node_id: node_id(),
@@ -681,7 +681,7 @@ async fn ipc_stream_third_party_cannot_hijack() {
         .await
         .expect("STREAM_OPEN_INBOUND");
 
-    // Attacker connects and tries к push bytes into stream_id.
+    // Attacker connects and tries to push bytes into stream_id.
     let mut attacker = connect_and_hello(&sock).await;
     let inj = StreamDataPayload {
         stream_id,
@@ -694,12 +694,12 @@ async fn ipc_stream_third_party_cannot_hijack() {
     let r_b = tokio::time::timeout(Duration::from_millis(150), recv_ipc_frame(&mut client_b)).await;
     assert!(
         r_b.is_err(),
-        "third-party STREAM_DATA leaked к acceptor — hijack vector reopened"
+        "third-party STREAM_DATA leaked to acceptor — hijack vector reopened"
     );
     let r_a = tokio::time::timeout(Duration::from_millis(150), recv_ipc_frame(&mut client_a)).await;
     assert!(
         r_a.is_err(),
-        "third-party STREAM_DATA leaked к opener — hijack vector reopened"
+        "third-party STREAM_DATA leaked to opener — hijack vector reopened"
     );
 
     drop(client_a);
@@ -723,8 +723,8 @@ fn generate_token_is_nonzero() {
 // fixture builds a server WITHOUT the bridge / session-tx registry, which is the
 // fallback case: a remote `dst_node_id` must surface the distinct
 // `REMOTE_NOT_IMPLEMENTED` code so SDK callers can tell "this daemon has no
-// remote bridge" apart from "endpoint not bound anywhere." Без this branch the
-// handler silently returned NOT_FOUND, что caused the oproxy smoke test к hang.
+// remote bridge" apart from "endpoint not bound anywhere." Without this branch the
+// handler silently returned NOT_FOUND, that caused the oproxy smoke test to hang.
 // (The bridge-wired success + cleanup paths are covered by
 // `server::remote_stream_open_tests`.)
 #[tokio::test]
@@ -736,7 +736,7 @@ async fn ipc_stream_open_remote_without_bridge_returns_not_implemented() {
 
     let mut client = connect_and_hello(&sock).await;
 
-    // dst_node_id is а fabricated remote node — not the local
+    // dst_node_id is a fabricated remote node — not the local
     // server's node_id().  Any non-matching value triggers the branch.
     let remote_node_id = [0xEEu8; 32];
     assert_ne!(remote_node_id, node_id(), "fixture must differ from local");
@@ -1153,7 +1153,7 @@ async fn per_app_socket_created_and_cleaned_up() {
     // so the directory prefix must stay short.  `std::env::temp_dir()` is
     // unusable here: macOS `$TMPDIR` is `/var/folders/.../T/` (~50 chars) and
     // blows the budget (full path ≈ 111 B > 104).  Anchor at the short,
-    // universally-writable `/tmp` instead — this is а unix-only test file, so
+    // universally-writable `/tmp` instead — this is a unix-only test file, so
     // `/tmp` is always present.  pid + 32 bits of OsRng keep the dir unique
     // across processes AND concurrent same-process tests.  Resulting path
     // `/tmp/ov-<pid>-<8hex>/<64hex>.sock` ≈ 94 B, comfortably under 104.
@@ -1306,10 +1306,10 @@ async fn full_delivery_channel_drops_frame_and_increments_counter() {
 
     let fwd = tokio::spawn(async move {
         // Phase 6.51: forward_endpoint signature gained `endpoint_app_id` +
-        // `endpoint_id` (used к label StreamOpenInbound payloads).
-        // Audit batch 2026-05-23: also `acceptor_streams` (used к track
+        // `endpoint_id` (used to label StreamOpenInbound payloads).
+        // Audit batch 2026-05-23: also `acceptor_streams` (used to track
         // bidirectional stream ownership).  Test fixture passes zero-bytes
-        // + а fresh empty set — irrelevant к the backpressure path under
+        // + a fresh empty set — irrelevant to the backpressure path under
         // test, which never touches StreamOpen/StreamClose.
         let acceptor_streams =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));

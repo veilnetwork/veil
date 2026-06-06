@@ -1,38 +1,38 @@
-//! Cold-start ML-KEM-768 EK resolver — fetches а recipient's current
-//! ML-KEM encapsulation key от the DHT и populates `peer_mlkem_keys`
-//! so subsequent E2E-encrypted sends work без а prior session
+//! Cold-start ML-KEM-768 EK resolver — fetches a recipient's current
+//! ML-KEM encapsulation key from the DHT and populates `peer_mlkem_keys`
+//! so subsequent E2E-encrypted sends work without a prior session
 //! handshake.  **Epic 486.1 slice 3** (audit batch 2026-05-23).
 //!
 //! ## Why it exists
 //!
 //! Pre-fix the `peer_mlkem_keys` cache was populated **only** at
-//! handshake completion (см. `peer_handshake.rs::cache.insert`).  IPC
-//! client sends к peers без а direct session would hit the
-//! "no recipient_ek" branch в `veil-ipc::handlers::send::handle_ipc_send`
-//! и return `NO_E2E_KEY` silently.
+//! handshake completion (see. `peer_handshake.rs::cache.insert`).  IPC
+//! client sends to peers without a direct session would hit the
+//! "no recipient_ek" branch in `veil-ipc::handlers::send::handle_ipc_send`
+//! and return `NO_E2E_KEY` silently.
 //!
-//! Every sovereign identity already publishes а signed `MlKemKeyCert`
-//! to its canonical DHT slot at startup и re-publishes every 6 hours
+//! Every sovereign identity already publishes a signed `MlKemKeyCert`
+//! to its canonical DHT slot at startup and re-publishes every 6 hours
 //! (Epic 462.12 / `runtime/sovereign_republish.rs`).  This resolver
-//! closes the loop: when IPC encounters а cache miss, it queries the
-//! DHT, verifies the cert chain, и populates the cache.
+//! closes the loop: when IPC encounters a cache miss, it queries the
+//! DHT, verifies the cert chain, and populates the cache.
 //!
 //! ## Resolution pipeline
 //!
 //! 1. Recursive-walk `IdentityDocument::dht_key(target_node_id)`
 //!    → decode + verify Ed25519 / Falcon-512 master signature + freshness.
 //! 2. Recursive-walk `InstanceRegistry::dht_key(target_node_id)`
-//!    → decode + verify Ed25519 sig против one of the document's subkeys.
+//!    → decode + verify Ed25519 sig against one of the document's subkeys.
 //! 3. Pick the most-recent-active instance by `last_seen_unix_ms`.
 //! 4. Recursive-walk `MlKemKeyCert::dht_key(target_node_id, instance_id)`
 //!    → decode + verify via `mlkem_fanout::verify_mlkem_cert(cert, doc, now)`.
 //! 5. Insert `(node_id, (ek, Instant::now()))` into `peer_mlkem_keys`.
-//! 6. Return the EK bytes так that the IPC handler can retry encryption.
+//! 6. Return the EK bytes so that the IPC handler can retry encryption.
 //!
 //! ## Failure semantics
 //!
-//! Every error path returns `None` к the caller (см. trait contract в
-//! `veil_types::MlKemEkResolver`).  Diagnostic detail lands в the
+//! Every error path returns `None` to the caller (see. trait contract in
+//! `veil_types::MlKemEkResolver`).  Diagnostic detail lands in the
 //! `NodeLogger` (debug level) — operators turn it on via
 //! `[global] log_level = "debug"`.
 
@@ -58,12 +58,12 @@ use veil_util::{lock, rlock, wlock};
 
 /// Default per-step timeout when none is configured (3 sec).  Three
 /// sequential DHT walks (doc + registry + cert) so total budget caps
-/// at ~9 sec в the worst case.
+/// at ~9 sec in the worst case.
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// DHT-driven impl of [`MlKemEkResolver`].  Wraps the same set of
 /// `Arc`-shared runtime components that `NodeRuntime::dht_recursive_get`
-/// uses, plus а write-through к `peer_mlkem_keys` cache.
+/// uses, plus a write-through to `peer_mlkem_keys` cache.
 pub struct DhtMlKemEkResolver {
     dht: Arc<KademliaService>,
     session_tx_registry: Arc<RwLock<SessionTxRegistry>>,
@@ -75,8 +75,8 @@ pub struct DhtMlKemEkResolver {
 }
 
 impl DhtMlKemEkResolver {
-    /// New resolver bound to а node's runtime components.  `step_timeout`
-    /// applies к each of the three DHT walks individually — total budget
+    /// New resolver bound to a node's runtime components.  `step_timeout`
+    /// applies to each of the three DHT walks individually — total budget
     /// is at most `3 × step_timeout`.
     #[must_use]
     pub fn new(
@@ -99,7 +99,7 @@ impl DhtMlKemEkResolver {
     }
 
     /// Override the per-step DHT timeout.  Useful for tests +
-    /// configurations што want а tighter / looser budget.
+    /// configurations that want a tighter / looser budget.
     #[must_use]
     pub fn with_step_timeout(mut self, t: Duration) -> Self {
         self.step_timeout = t;
@@ -108,7 +108,7 @@ impl DhtMlKemEkResolver {
 
     /// Core resolution body.  Each branch returns `None` on any failure
     /// — see module docstring.  Loggable failure points emit DEBUG events
-    /// via `NodeLogger` so operators can diagnose с `log_level = "debug"`.
+    /// via `NodeLogger` so operators can diagnose with `log_level = "debug"`.
     async fn fetch_inner(&self, target_node_id: [u8; 32]) -> Option<Vec<u8>> {
         self.log_dbg("mlkem_resolver.start", &target_node_id, "");
         let now_unix = std::time::SystemTime::now()
@@ -147,7 +147,7 @@ impl DhtMlKemEkResolver {
             self.log_dbg(
                 "mlkem_resolver.doc.node_id_mismatch",
                 &target_node_id,
-                "DHT returned IdentityDocument for а different node_id",
+                "DHT returned IdentityDocument for a different node_id",
             );
             return None;
         }
@@ -174,7 +174,7 @@ impl DhtMlKemEkResolver {
             self.log_dbg(
                 "mlkem_resolver.registry.node_id_mismatch",
                 &target_node_id,
-                "DHT returned InstanceRegistry for а different node_id",
+                "DHT returned InstanceRegistry for a different node_id",
             );
             return None;
         }
@@ -218,7 +218,7 @@ impl DhtMlKemEkResolver {
 
         // ── Step 4: cache writeback ────────────────────────────────
         // PeerMlKemCache uses [`MAX_PEER_MLKEM_CACHE`]-bounded LRU
-        // eviction — same policy as the handshake-time insert site в
+        // eviction — same policy as the handshake-time insert site in
         // `peer_handshake.rs:191-204`.  Mirror it here so cache growth
         // under cold-start traffic stays bounded.
         {
@@ -256,8 +256,8 @@ impl DhtMlKemEkResolver {
             return Some(value);
         }
 
-        // Pick К closest active session peers; bail если there are no
-        // peers к forward (solo recursive walk impossible).
+        // Pick the closest active session peers; bail if there are no
+        // peers to forward (solo recursive walk impossible).
         let mut peers: Vec<[u8; 32]> = rlock!(self.session_tx_registry).peer_ids();
         if peers.is_empty() {
             return None;
@@ -313,7 +313,7 @@ impl DhtMlKemEkResolver {
             );
         }
 
-        // Forward к top-2 closest peers.
+        // Forward to top-2 closest peers.
         {
             let guard = rlock!(self.session_tx_registry);
             for pid in peers.iter().take(2) {
@@ -330,7 +330,7 @@ impl DhtMlKemEkResolver {
             Ok(Ok(bytes)) => Some(bytes),
             _ => {
                 // Cleanup pending entry on timeout — the dispatcher's
-                // own cleanup is best-effort но explicit removal here
+                // own cleanup is best-effort but explicit removal here
                 // bounds memory deterministically.
                 let mut m = lock!(self.pending_recursive);
                 m.remove(&query_id);
@@ -362,9 +362,9 @@ fn verify_instance_registry_sig(reg: &InstanceRegistry, doc: &IdentityDocument) 
     let Some(subkey) = doc.identity_keys.get(key_idx) else {
         return false;
     };
-    // Only Ed25519 subkeys can sign а registry under v1 wire format.
+    // Only Ed25519 subkeys can sign a registry under v1 wire format.
     // (Falcon-512 subkeys exist but the registry was never specified to
-    // carry а Falcon sig.  If а future epic lifts that, expand here.)
+    // carry a Falcon sig.  If a future epic lifts that, expand here.)
     let Ok(pk_arr) = subkey.pubkey.as_slice().try_into() as Result<&[u8; 32], _> else {
         return false;
     };
@@ -380,7 +380,7 @@ fn verify_instance_registry_sig(reg: &InstanceRegistry, doc: &IdentityDocument) 
     pk.verify(&msg, &sig).is_ok()
 }
 
-/// Format the first 4 bytes of а node_id as 8 hex chars (matches the
+/// Format the first 4 bytes of a node_id as 8 hex chars (matches the
 /// rest of the codebase's log conventions).
 fn hex8(node_id: &[u8; 32]) -> String {
     veil_util::bytes_to_hex(&node_id[..4])
@@ -389,7 +389,7 @@ fn hex8(node_id: &[u8; 32]) -> String {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 //
 // Unit-test coverage focuses on the **pure** parts of the pipeline.
-// Full end-to-end (real DHT) coverage lives в integration tests under
+// Full end-to-end (real DHT) coverage lives in integration tests under
 // `veilcore/tests/` (Epic 486.1 slice 3.4).
 
 #[cfg(test)]
@@ -404,9 +404,9 @@ mod tests {
 
     #[test]
     fn verify_instance_registry_sig_rejects_oob_key_idx() {
-        // Build а registry pointing at а subkey index that doesn't
-        // exist в the supplied document.  Verifier must say nope.
-        // (Synthesising а real-signed registry needs the full identity
+        // Build a registry pointing at a subkey index that doesn't
+        // exist in the supplied document.  Verifier must say nope.
+        // (Synthesising a real-signed registry needs the full identity
         // crate fixtures — covered by the integration test.)
         let reg = InstanceRegistry {
             node_id: [0x11; 32],

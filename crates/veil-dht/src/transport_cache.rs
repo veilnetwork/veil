@@ -239,8 +239,8 @@ mod tests {
 
     #[test]
     fn re_insert_refreshes_inserted_at() {
-        // Audit batch 2026-05-24: bumped TTL к 2 s + sleeps к 500 ms
-        // (was 40 ms / 25 ms, then 200 ms / 100 ms — still flaky на
+        // Audit batch 2026-05-24: bumped TTL to 2 s + sleeps to 500 ms
+        // (was 40 ms / 25 ms, then 200 ms / 100 ms — still flaky on
         // overloaded shared CI runners where `sleep(100ms)` can
         // actually take 250+ ms).  Generous TTL ensures
         // `re_insert_at + 500ms_sleep_drift_500ms` stays comfortably

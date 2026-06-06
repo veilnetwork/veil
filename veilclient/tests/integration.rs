@@ -101,19 +101,19 @@ async fn echo_roundtrip_via_veilclient() {
 //
 // Audit batch 2026-05-23, HIGH-finding follow-up: per-stream `StreamEvent`
 // queue in the SDK was `mpsc::unbounded_channel`, so an opener that opened
-// а stream and then stopped reading let the daemon's STREAM_DATA frames
-// accumulate unboundedly в SDK RAM.  On budget Android в hostile networks
-// (the project's target platform) а malicious peer could flood STREAM_DATA
+// a stream and then stopped reading let the daemon's STREAM_DATA frames
+// accumulate unboundedly in SDK RAM.  On budget Android in hostile networks
+// (the project's target platform) a malicious peer could flood STREAM_DATA
 // frames faster than the consumer drained, exhausting RAM.
 //
-// Post-fix: per-stream queue is bounded к `STREAM_EVENT_QUEUE_CAP = 256`.
-// А consumer що falls behind has its stream silently closed by the reader
-// task (sender dropped from `dispatch.streams`), visible to the SDK как
+// Post-fix: per-stream queue is bounded to `STREAM_EVENT_QUEUE_CAP = 256`.
+// A consumer that falls behind has its stream silently closed by the reader
+// task (sender dropped from `dispatch.streams`), visible to the SDK as
 // `VeilStream::read` returning EOF (0 bytes) after the drained backlog.
 //
-// This test asserts the budget IS bounded: it opens а stream, sends
-// 4 × STREAM_EVENT_QUEUE_CAP = 1024 frames через the daemon back to the
-// opener without that opener reading а single byte, then verifies the
+// This test asserts the budget IS bounded: it opens a stream, sends
+// 4 × STREAM_EVENT_QUEUE_CAP = 1024 frames through the daemon back to the
+// opener without that opener reading a single byte, then verifies the
 // opener eventually sees EOF rather than memory growth.
 #[tokio::test]
 async fn stream_event_queue_is_bounded_on_slow_consumer() {
@@ -139,13 +139,13 @@ async fn stream_event_queue_is_bounded_on_slow_consumer() {
             .expect("connection closed before stream arrived");
         let mut s = inbound.stream;
         // Flood A with way more than STREAM_EVENT_QUEUE_CAP (256) frames.
-        // The daemon enforces flow control on А→B (windowed), но B→A в
+        // The daemon enforces flow control on A→B (windowed), but B→A in
         // route_data_from_b is unwindowed — that's exactly the path the
         // SDK bound-queue defends against.  Send 1024 small frames; SDK
-        // is supposed к close А's stream после ~256 unread frames.
+        // is supposed to close A's stream after ~256 unread frames.
         for _ in 0..1024 {
             // Ignore write errors: the daemon may close mid-flood
-            // когда A's stream is reaped, which is the success case.
+            // when A's stream is reaped, which is the success case.
             if s.write_all(b"x").await.is_err() {
                 break;
             }
@@ -154,7 +154,7 @@ async fn stream_event_queue_is_bounded_on_slow_consumer() {
         acceptor_done_rx.notify_one();
     });
 
-    // Opener (A) opens а stream к B и THEN STOPS READING.
+    // Opener (A) opens a stream to B and THEN STOPS READING.
     let client_a = veilclient::VeilClient::connect(&sock).await.unwrap();
     let a_handle = client_a
         .bind_named("test.stream.bounded", "opener", 51)
@@ -169,7 +169,7 @@ async fn stream_event_queue_is_bounded_on_slow_consumer() {
     .expect("timeout opening stream")
     .expect("open_stream failed");
 
-    // Wait для the acceptor to finish flooding.
+    // Wait for the acceptor to finish flooding.
     tokio::time::timeout(Duration::from_secs(5), acceptor_done_tx.notified())
         .await
         .expect("flood timeout");
@@ -178,7 +178,7 @@ async fn stream_event_queue_is_bounded_on_slow_consumer() {
     // closes the stream once the per-stream queue overflows, surfaced
     // here as `read` eventually returning Ok(0) (EOF) rather than
     // serving up the full 1024 frames OR blocking forever waiting for
-    // memory to fill.  Read in а bounded loop с а deadline so а
+    // memory to fill.  Read in a bounded loop with a deadline so a
     // regression (unbounded growth + no EOF) doesn't hang the test.
     let mut buf = [0u8; 64];
     let mut total = 0usize;
@@ -200,10 +200,10 @@ async fn stream_event_queue_is_bounded_on_slow_consumer() {
             .and_then(|r| r.ok());
         match n {
             Some(0) => break,      // EOF — bounded behaviour confirmed
-            Some(k) => total += k, // drained а frame от the queue
+            Some(k) => total += k, // drained a frame from the queue
             None => break,         // timeout while reading — also bounded
         }
-        // sanity cap so а runaway test doesn't spin forever
+        // sanity cap so a runaway test doesn't spin forever
         if total > 4 * 1024 * 1024 {
             panic!("stream emitted {total} bytes before EOF — bound looks ignored");
         }
@@ -591,7 +591,7 @@ async fn get_mobile_status_without_provider_returns_default() {
 async fn concurrent_node_identity_queries_match_in_order() {
     // Validates the FIFO oneshot dispatch in the SDK reader task —
     // two parallel queries must each get their reply matched in
-    // order, не one cross-matched to the other.
+    // order, not one cross-matched to the other.
     let sock = temp_socket();
     let (shutdown_tx, server_handle) =
         start_server_full(sock.clone(), vec![0u8; 32], 0, None, None, None, None).await;
@@ -698,7 +698,7 @@ async fn event_bus_publishes_to_connected_client() {
 
 #[tokio::test]
 async fn event_bus_without_subscriber_publish_is_noop() {
-    // Publishing на a bus with zero subscribers must not panic — это
+    // Publishing on a bus with zero subscribers must not panic — this is
     // the steady state when the daemon comes up before any app
     // connects.
     let bus = EventBus::new();
@@ -712,10 +712,10 @@ async fn event_bus_without_subscriber_publish_is_noop() {
 
 #[tokio::test]
 async fn event_bus_oversized_payload_dropped_at_source() {
-    // Defence-in-depth: оversized payloads must not propagate, even
+    // Defence-in-depth: oversized payloads must not propagate, even
     // if a buggy publisher forgets to clamp.  The IPC frame budget
-    // would also reject them на encode, but dropping at the source
-    // means слow consumers don't lag on a frame that would just be
+    // would also reject them on encode, but dropping at the source
+    // means slow consumers don't lag on a frame that would just be
     // refused anyway.
     let bus = EventBus::new();
     let _rx = bus.subscribe();
@@ -761,7 +761,7 @@ async fn event_bus_resubscribe_replaces_previous_sink() {
 
     // First receiver must have observed nothing (sink was replaced
     // before the publish).  Either it times out (sender still alive
-    // somewhere) или recv returns None (sender dropped on replace) —
+    // somewhere) or recv returns None (sender dropped on replace) —
     // both mean "no event delivered to this receiver", which is the
     // contract.  We reject only the path where it actually yielded
     // a payload.
@@ -791,12 +791,12 @@ type MockBlobEntry = ([u8; 32], Vec<u8>, bool);
 /// Mailbox key: receiver_id + content_id.
 type MockBlobKey = ([u8; 32], [u8; 32]);
 
-/// Mock mailbox backend that records every call в Mutex'd vectors.
-/// Simple HashMap по `(receiver, content_id)` to support fetch/ack.
+/// Mock mailbox backend that records every call in Mutex'd vectors.
+/// Simple HashMap by `(receiver, content_id)` to support fetch/ack.
 struct MockMailbox {
     /// `(receiver, content_id) -> (sender, blob, envelope_present)`
     blobs: StdMutex<std::collections::HashMap<MockBlobKey, MockBlobEntry>>,
-    /// Cookie that fetch/ack must match.  Stub: единственный cookie на receiver.
+    /// Cookie that fetch/ack must match.  Stub: a single cookie per receiver.
     expected_cookie: [u8; 16],
 }
 
@@ -1190,8 +1190,8 @@ async fn t1_4_p7a_lookup_rendezvous_replicas_no_resolver_returns_empty() {
 // ── chat_node wedge mitigation: SDK bind timeout ────────────────────────────
 
 /// Stub IPC server that completes the HELLO handshake but never sends
-/// `AppBindOk` / `AppBindErr`.  Models the failure mode где the
-/// daemon's routing layer is still initializing right after а
+/// `AppBindOk` / `AppBindErr`.  Models the failure mode where the
+/// daemon's routing layer is still initializing right after a
 /// `systemctl restart veil` cascade — pre-fix this wedged the
 /// client forever.
 async fn start_unresponsive_bind_server(

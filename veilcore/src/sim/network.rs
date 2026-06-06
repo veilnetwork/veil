@@ -639,8 +639,8 @@ pub struct SimNetworkBuilder {
     anonymity_relay_indices: Vec<bool>,
     /// per-node prefix-grinding spec (Epic 485.1 adversary validation).
     /// `Some((target, bits))` at index `i` makes node `i`'s identity
-    /// keypair grinded so its `node_id` shares `bits` leading bits с
-    /// `target`.  Empty defaults к "no grinding" (legacy).  Cost is
+    /// keypair grinded so its `node_id` shares `bits` leading bits with
+    /// `target`.  Empty defaults to "no grinding" (legacy).  Cost is
     /// ≈ 2^bits keypair draws — use bits ≤ 12 in normal tests.
     grind_prefix: Vec<Option<([u8; 32], u32)>>,
 }
@@ -747,7 +747,7 @@ impl SimNetworkBuilder {
     /// Per-node prefix-grinding spec.  Length must match `roles.len`
     /// (or be empty for "no grinding").  `Some((target, bits))` at
     /// index `i` makes that node's `node_id` share `bits` leading bits
-    /// с `target` — adversary-validation primitive for ID-grinding
+    /// with `target` — adversary-validation primitive for ID-grinding
     /// sybil scenarios.
     pub fn grind_prefix(mut self, spec: Vec<Option<([u8; 32], u32)>>) -> Self {
         self.grind_prefix = spec;
@@ -861,19 +861,19 @@ impl SimNetworkBuilder {
 
 /// Adversary-validation helper: keep generating Ed25519 keypairs until
 /// the resulting `node_id = BLAKE3(pubkey)` shares at least `bits`
-/// leading bits с the target.  Mirrors what а real sybil attacker
-/// would do — except the attacker pays для each draw в wall-clock
-/// time, while а sim wants this к finish fast.
+/// leading bits with the target.  Mirrors what a real sybil attacker
+/// would do — except the attacker pays for each draw in wall-clock
+/// time, while a sim wants this to finish fast.
 ///
 /// Cost analysis: expected iterations ≈ 2^bits.  Keypair generation
-/// is microsecond-class so bits ≤ 12 (~4096 draws) finishes в
-/// milliseconds; bits = 16 (~65k draws) finishes в seconds; bits >
+/// is microsecond-class so bits ≤ 12 (~4096 draws) finishes in
+/// milliseconds; bits = 16 (~65k draws) finishes in seconds; bits >
 /// 20 starts approaching real-attacker territory and should not be
-/// used в normal CI tests (the abstraction is "the attacker WOULD
+/// used in normal CI tests (the abstraction is "the attacker WOULD
 /// pay that, what does eclipse look like at that point").
 ///
 /// Returns the matching `(keypair, derived_node_id)`.  Does NOT solve
-/// PoW — caller chains а separate `search_nonce` call (cheaper to
+/// PoW — caller chains a separate `search_nonce` call (cheaper to
 /// re-mine once at the end than to PoW for every grinding draw).
 pub(crate) fn grind_keypair_with_prefix(
     target: &[u8; 32],
@@ -888,9 +888,9 @@ pub(crate) fn grind_keypair_with_prefix(
         let candidate = crypto::generate_keypair(SignatureAlgorithm::Ed25519);
         // `candidate.public_key` is base64; `NodeId::from_public_key`
         // decodes + applies the canonical BLAKE3 hash that the rest
-        // of the runtime uses к compute node_ids.  Match against that
-        // canonical id so the grind result actually corresponds к
-        // what а live node would advertise.
+        // of the runtime uses to compute node_ids.  Match against that
+        // canonical id so the grind result actually corresponds to
+        // what a live node would advertise.
         let id = NodeId::from_public_key(SignatureAlgorithm::Ed25519, &candidate.public_key)
             .expect("derive node_id from candidate pubkey");
         let candidate_id = *id.as_bytes();
@@ -900,7 +900,7 @@ pub(crate) fn grind_keypair_with_prefix(
     }
 }
 
-/// Helper для [grind_keypair_with_prefix]: do `a` and `b` agree on
+/// Helper for [grind_keypair_with_prefix]: do `a` and `b` agree on
 /// the leading `bits` bits?
 fn leading_bits_match(a: &[u8; 32], b: &[u8; 32], bits: u32) -> bool {
     if bits == 0 {
@@ -923,11 +923,11 @@ fn make_core_config(role: NodeRole) -> Config {
     make_core_config_with_optional_grind(role, None)
 }
 
-/// Same as [make_core_config] но с an optional prefix-grind spec.
+/// Same as [make_core_config] but with an optional prefix-grind spec.
 /// `grind = Some((target, bits))` makes the resulting node_id share
-/// `bits` leading bits с `target` (via [grind_keypair_with_prefix]).
-/// Use это for adversary-validation scenarios that need synthetic
-/// sybils close к а chosen victim's keyspace.
+/// `bits` leading bits with `target` (via [grind_keypair_with_prefix]).
+/// Use this for adversary-validation scenarios that need synthetic
+/// sybils close to a chosen victim's keyspace.
 pub(crate) fn make_core_config_grinded(role: NodeRole, target: &[u8; 32], bits: u32) -> Config {
     make_core_config_with_optional_grind(role, Some((*target, bits)))
 }
@@ -1031,9 +1031,9 @@ mod tests {
         assert!(!leading_bits_match(&a, &b, 5));
     }
 
-    /// Grind primitive: should always return а keypair whose
-    /// canonical node_id matches the requested prefix.  Use а small
-    /// prefix (4 bits) so the test finishes в milliseconds.
+    /// Grind primitive: should always return a keypair whose
+    /// canonical node_id matches the requested prefix.  Use a small
+    /// prefix (4 bits) so the test finishes in milliseconds.
     #[test]
     fn grind_keypair_with_prefix_matches_target() {
         let mut target = [0u8; 32];

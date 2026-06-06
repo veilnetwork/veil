@@ -4,25 +4,25 @@
 #
 # An xcframework holds per-platform "slices" so the same dependency
 # entry resolves to the right binary depending on whether the consumer
-# is building for а physical device, an Apple Silicon simulator, or an
+# is building for a physical device, an Apple Silicon simulator, or an
 # Intel-Mac simulator.  Without the bundling, an iOS app build picks
-# whichever slice happens to be available и trips on the runtime
+# whichever slice happens to be available and trips on the runtime
 # arch mismatch ("undefined symbol _objc_msgSend@i386" etc).
 #
 # Strategy:
 #   * Device slice  = aarch64-apple-ios staticlib
 #   * Simulator slice = lipo(aarch64-apple-ios-sim, x86_64-apple-ios) so
-#     it works on BOTH Apple-Silicon и Intel-Mac Xcode hosts.
+#     it works on BOTH Apple-Silicon and Intel-Mac Xcode hosts.
 #
 # Run AFTER `scripts/build-mobile.sh --target aarch64-apple-ios`,
-# `--target aarch64-apple-ios-sim`, и `--target x86_64-apple-ios`
+# `--target aarch64-apple-ios-sim`, and `--target x86_64-apple-ios`
 # have populated `target/<triple>/release/libveilclient_ffi.a`.
 #
-# Output: `target/xcframework/VeilClientFFI.xcframework/` ready к
+# Output: `target/xcframework/VeilClientFFI.xcframework/` ready to
 # vendor in the Flutter plugin's iOS Podspec (`ios/Frameworks/`).
 #
 # Requires: macOS host with Xcode 11+ (xcodebuild -create-xcframework).
-# The script no-ops с а clear error on non-macOS hosts (Linux CI can
+# The script no-ops with a clear error on non-macOS hosts (Linux CI can
 # still upload the per-arch artifacts; xcframework packaging happens
 # on the macOS leg of the matrix).
 
@@ -37,7 +37,7 @@ readonly HEADER_DIR="$REPO_ROOT/crates/veilclient-ffi/include"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "ERROR: xcframework packaging requires macOS (xcodebuild)." >&2
-  echo "Run scripts/build-mobile.sh on Linux к produce per-arch staticlibs," >&2
+  echo "Run scripts/build-mobile.sh on Linux to produce per-arch staticlibs," >&2
   echo "then run this script on the macOS CI runner." >&2
   exit 2
 fi
@@ -68,8 +68,8 @@ mkdir -p "$OUTPUT_DIR"
 rm -rf "$OUTPUT_FRAMEWORK"
 
 # Combine the two simulator slices (Apple Silicon ARM + Intel x86_64)
-# into а single fat staticlib.  An xcframework slice MUST be platform-
-# native — and "iOS Simulator on Apple Silicon" is а separate platform
+# into a single fat staticlib.  An xcframework slice MUST be platform-
+# native — and "iOS Simulator on Apple Silicon" is a separate platform
 # from "iOS Simulator on Intel" only at the triple level; both slices
 # are valid for the simulator destination, so lipo merges them.
 sim_fat_dir="$(mktemp -d)"
@@ -88,5 +88,5 @@ echo
 echo "==> built $OUTPUT_FRAMEWORK"
 ls -la "$OUTPUT_FRAMEWORK"
 echo
-echo "Vendor с the Flutter plugin's iOS Podspec:"
+echo "Vendor with the Flutter plugin's iOS Podspec:"
 echo "  cp -R $OUTPUT_FRAMEWORK flutter/veil_flutter/ios/Frameworks/"

@@ -1,28 +1,28 @@
 //! decomposition : bounded ring buffer of previous
 //! `rx_cipher` instances stashed at rekey-switch time so in-flight
-//! initiator frames sealed с the OLD tx_cipher (sent BEFORE the
+//! initiator frames sealed with the OLD tx_cipher (sent BEFORE the
 //! initiator received our RekeyAck) can still be decrypted instead of
-//! triggering а session.violation.
+//! triggering a session.violation.
 //!
 //! Background:
 //! * **** introduced the time-based grace window (was
 //!   frame-count-based, exhausted faster than RTT under chat-node
 //!   load).
-//! * **-** widened the buffer от а single
-//!   `Option<SessionCipher>` к а 3-deep `VecDeque` so two back-to-back
-//!   rekeys (gen-N-1 still в grace when gen-N rekey starts) don't
+//! * **-** widened the buffer from a single
+//!   `Option<SessionCipher>` to a 3-deep `VecDeque` so two back-to-back
+//!   rekeys (gen-N-1 still in grace when gen-N rekey starts) don't
 //!   orphan gen-N-2 frames.
 //!
-//! Was inline VecDeque + ~30 LoC inline в `SessionRunner::run` —
-//! extracted к а dedicated struct with three primitives и an `Outcome`
-//! that surfaces cap-evict events back к the caller для logging /
+//! Was inline VecDeque + ~30 LoC inline in `SessionRunner::run` —
+//! extracted to a dedicated struct with three primitives and an `Outcome`
+//! that surfaces cap-evict events back to the caller for logging /
 //! metrics (`session.rekey.grace.cap_evict` warn + `inc_rekey_grace_cap
 //! _eviction` counter).
 //!
 //! FIFO ordering: newest entries at the back, oldest at the front.
 //! `prune_expired` walks the front because expired entries cluster
 //! there; `try_open` walks the back-to-front (newest-first) because
-//! the most-recent prev cipher is the most likely match для an
+//! the most-recent prev cipher is the most likely match for an
 //! immediately-post-rekey arrival.
 
 use std::collections::VecDeque;
@@ -42,10 +42,10 @@ pub struct FallbackHit {
     pub plaintext: Vec<u8>,
 }
 
-/// Result of `push` indicating whether а cap-eviction was needed к
+/// Result of `push` indicating whether a cap-eviction was needed to
 /// make room. Cap-evictions are rare (only under back-to-back rekey
 /// scenarios that outpaced the 30 s grace window) but visibility-
-/// worthy because they correlate с traffic-burst patterns.
+/// worthy because they correlate with traffic-burst patterns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PushOutcome {
     pub evicted_due_to_capacity: bool,
@@ -71,7 +71,7 @@ impl RekeyRxGraceBuffer {
         self.entries.len()
     }
 
-    /// `true` если grace buffer is empty.  Companion к [`Self::len`].
+    /// `true` if grace buffer is empty.  Companion to [`Self::len`].
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -82,9 +82,9 @@ impl RekeyRxGraceBuffer {
         self.capacity
     }
 
-    /// Pop expired entries от the front. Cheap: single Instant
+    /// Pop expired entries from the front. Cheap: single Instant
     /// comparison per popped entry. Should be called BEFORE each
-    /// decrypt attempt к keep buffer length proportional к
+    /// decrypt attempt to keep buffer length proportional to
     /// in-flight rekey overlap rather than session-uptime.
     pub fn prune_expired(&mut self, now: Instant) {
         while let Some(&(_, deadline)) = self.entries.front()
@@ -94,10 +94,10 @@ impl RekeyRxGraceBuffer {
         }
     }
 
-    /// Try к decrypt `body` using each cached prev cipher в
+    /// Try to decrypt `body` using each cached prev cipher in
     /// newest-first order. On first success: returns `Some(FallbackHit)`
-    /// и that prev cipher's frame counter has advanced (mutating
-    /// `iter_mut` is intentional — а subsequent success at the same
+    /// and that prev cipher's frame counter has advanced (mutating
+    /// `iter_mut` is intentional — a subsequent success at the same
     /// slot would use the next nonce). On no-match: returns `None`
     /// no counter advanced.
     pub fn try_open(&mut self, body: &[u8], aad: &[u8], now: Instant) -> Option<FallbackHit> {
@@ -123,8 +123,8 @@ impl RekeyRxGraceBuffer {
         )
     }
 
-    /// Push а freshly-displaced rx cipher с deadline = `now + grace_duration`.
-    /// Если at capacity, the oldest entry is dropped to make room и
+    /// Push a freshly-displaced rx cipher with deadline = `now + grace_duration`.
+    /// If at capacity, the oldest entry is dropped to make room and
     /// `evicted_due_to_capacity = true` is returned (caller logs +
     /// inc-metric).
     pub fn push(&mut self, cipher: SessionCipher, now: Instant) -> PushOutcome {
@@ -157,7 +157,7 @@ mod tests {
         buf.push(fresh_cipher(0xBB), t0 + Duration::from_millis(50));
         buf.push(fresh_cipher(0xCC), t0 + Duration::from_millis(90));
         // At t = t0 + 110 ms: first entry's deadline (t0+100) expired
-        // second (t0+150) и third (t0+190) still alive.
+        // second (t0+150) and third (t0+190) still alive.
         buf.prune_expired(t0 + Duration::from_millis(110));
         assert_eq!(buf.len(), 2);
     }
@@ -188,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_open_finds_newest_match_first() {
-        // Build а matching pair: encrypt c sealing cipher, decrypt с
+        // Build a matching pair: encrypt c sealing cipher, decrypt with
         // matching opening cipher. Place opening cipher in slot 0
         // (newest); add unrelated ciphers behind it.
         use veil_crypto::session_cipher::frame_aad;

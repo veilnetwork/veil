@@ -1,11 +1,11 @@
 //! Adapter that exposes [`SessionTxRegistry`] as the cross-crate
 //! [`veil_types::FrameBroadcaster`] trait.
 //!
-//! Phase 3 prep (veilcore extraction): moved here от
+//! Phase 3 prep (veilcore extraction): moved here from
 //! `veilcore/src/node/session_glue.rs` so dispatcher can dep on
-//! veil-session directly без а glue-layer detour через veilcore.
+//! veil-session directly without a glue-layer detour through veilcore.
 //! Consumed by `veil_routing::miss_handler` + future Tier-3 crates
-//! (veil-pex, veil-proxy, veil-ipc) что accept any
+//! (veil-pex, veil-proxy, veil-ipc) that accept any
 //! `Arc<dyn FrameBroadcaster>` instead of importing `SessionTxRegistry`.
 
 use std::sync::{Arc, RwLock};
@@ -33,11 +33,11 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
     }
 
     fn send_to_all_with_priority(&self, priority: u8, bytes: Arc<[u8]>) {
-        // SessionTxRegistry consumes PooledShared, но the
+        // SessionTxRegistry consumes PooledShared, but the
         // veil-types trait passes Arc<[u8]> (changing it cascades to
         // every consumer — pex, gossip, identity, etc.). Convert via Vec copy
-        // here. Hot-path callers що хотят zero-copy use the impl directly
-        // через SessionTxRegistry без проходить через this trait.
+        // here. Hot-path callers that want zero-copy use the impl directly
+        // through SessionTxRegistry without going through this trait.
         let v = bytes.to_vec();
         rlock!(self.inner)
             .send_to_all_with_priority(priority, veil_bufpool::pooled_shared_from_vec(v));

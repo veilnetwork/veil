@@ -53,7 +53,7 @@ impl ConfigOps for StdConfigOps {
     }
 
     fn write_raw_config(&self, path: &Path, content: &str) -> veil_cfg::Result<()> {
-        // Atomic write via `veil_util::atomic_write` — writes к а
+        // Atomic write via `veil_util::atomic_write` — writes to a
         // temp file alongside the target, fsyncs, then renames.  Same
         // primitive `veil_cfg::save_config` uses internally, so the
         // crash-safety story is identical.

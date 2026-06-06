@@ -17,18 +17,18 @@
 //!
 //! # Replay scope (audit batch 2026-05-24, L2)
 //!
-//! **By design**, а single `(public_key, nonce)` pair что meets the
-//! difficulty threshold is accepted в multiple sessions.  PoW here
-//! enforces а **per-peer admission cost** — the work is paid once per
-//! identity к join the network, not per-session.  Re-using the nonce
+//! **By design**, a single `(public_key, nonce)` pair that meets the
+//! difficulty threshold is accepted in multiple sessions.  PoW here
+//! enforces a **per-peer admission cost** — the work is paid once per
+//! identity to join the network, not per-session.  Re-using the nonce
 //! across handshakes does NOT bypass any security gate:
 //!   * Each session still negotiates fresh keys (X25519 ephemeral DH).
 //!   * Replay attacks on session bytes are prevented by AEAD nonce
-//!     counters, не by PoW freshness.
+//!     counters, not by PoW freshness.
 //!   * The `nonce` field is part of the IdentityDocument signature,
 //!     so an attacker cannot use someone else's nonce.
 //!
-//! If а future design wants per-session work, add а replay cache keyed
+//! If a future design wants per-session work, add a replay cache keyed
 //! on `(public_key, nonce, session_id)` here.  Current default is
 //! intentional.
 

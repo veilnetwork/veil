@@ -130,57 +130,57 @@ pub enum SessionMsg {
     /// under the responder's static ML-KEM EK (from its mlkem_cert).
     /// The responder decapsulates with its stored DK seed; both sides
     /// then mix the resulting ML-KEM shared secret with the existing
-    /// X25519 shared secret via `derive_hybrid_session_keys` к replace
+    /// X25519 shared secret via `derive_hybrid_session_keys` to replace
     /// the classical `SessionKeys` before `SessionConfirm`.
     HybridKexCt = 19,
 
     /// Sent by the winning side of a mutual-rekey-init collision (the
     /// peer with `local_node_id < peer_id`, which kept its own init and
-    /// dropped the other's) к signal к the loser: "I will not ACK your
-    /// init; drop yours и await ACK for mine." Empty body — receipt
+    /// dropped the other's) to signal to the loser: "I will not ACK your
+    /// init; drop yours and await ACK for mine." Empty body — receipt
     /// alone carries the back-off semantics. Suppresses the loser's
     /// time/byte-threshold rekey re-trigger for one grace window so
     /// both sides don't immediately re-collide. AEAD-encrypted with
     /// current tx_cipher (pre-rekey keys) like RekeyAck.
     RekeyKeptInit = 20,
 
-    /// Sender informs its peer of а **new transport URI** для future
+    /// Sender informs its peer of a **new transport URI** for future
     /// connections (e.g. when the sender's listener is rotating its
-    /// ephemeral port на а snowflake schedule).  Body carries а
-    /// signed [`TransportMigrationNotifyPayload`] так что the
+    /// ephemeral port on a snowflake schedule).  Body carries a
+    /// signed [`TransportMigrationNotifyPayload`] so that the
     /// receiver can verify the announcement is genuine.
     ///
     /// Receiver updates its local route cache (peers_discovered.json)
-    /// для the sender's node_id: marks the prior URI as expiring soon
-    /// и adds the new URI.  Subsequent reconnects use the new URI.
+    /// for the sender's node_id: marks the prior URI as expiring soon
+    /// and adds the new URI.  Subsequent reconnects use the new URI.
     ///
-    /// Sent over the existing session BEFORE the old port closes так
+    /// Sent over the existing session BEFORE the old port closes so
     /// active peers don't lose connectivity.  Disconnected peers fall
-    /// back к DHT `ResolveTransport` (если sender published the new
-    /// URI как `SignedTransportAnnouncement`) или к invite-bundle.
+    /// back to DHT `ResolveTransport` (if sender published the new
+    /// URI as `SignedTransportAnnouncement`) or to invite-bundle.
     TransportMigrationNotify = 21,
 
-    /// PoW-gated rendezvous request — initiator asks а target node
-    /// (relayed через а mediator's existing session) к provision an
-    /// ephemeral listener для one-shot dial.  Body carries а signed
-    /// [`crate::rendezvous::RequestEphemeralEndpointPayload`] с а PoW
-    /// proof что the requester burned CPU equivalent к а tunable
+    /// PoW-gated rendezvous request — initiator asks a target node
+    /// (relayed through a mediator's existing session) to provision an
+    /// ephemeral listener for one-shot dial.  Body carries a signed
+    /// [`crate::rendezvous::RequestEphemeralEndpointPayload`] with a PoW
+    /// proof that the requester burned CPU equivalent to a tunable
     /// difficulty.  Anti-DoS gate: scanning attacker cannot flood
-    /// rendezvous requests без paying the PoW cost per attempt.
+    /// rendezvous requests without paying the PoW cost per attempt.
     ///
     /// Target verifies (a) PoW, (b) requester sig, (c) replay-window,
-    /// (d) per-requester rate limit; then binds а random-port listener
-    /// for а short TTL (or 1 accepted session) и signs an
+    /// (d) per-requester rate limit; then binds a random-port listener
+    /// for a short TTL (or 1 accepted session) and signs an
     /// [`EphemeralEndpointResponse`] (see below).
     RequestEphemeralEndpoint = 22,
 
-    /// PoW-gated rendezvous response — target node sends back а signed
-    /// short-lived URI (с per-request PSK) к the requester after
-    /// successful PoW verification.  Body carries а signed
+    /// PoW-gated rendezvous response — target node sends back a signed
+    /// short-lived URI (with per-request PSK) to the requester after
+    /// successful PoW verification.  Body carries a signed
     /// [`crate::rendezvous::EphemeralEndpointResponsePayload`].  The
-    /// initiator validates the sig против the target's identity_pk,
+    /// initiator validates the sig against the target's identity_pk,
     /// confirms its own `requester_pubkey` matches the response's echo
-    /// field (anti-replay-for-someone-else), и dials the listener.
+    /// field (anti-replay-for-someone-else), and dials the listener.
     EphemeralEndpointResponse = 23,
 
     // ── handoff anti-replay (audit cycle-6 T1) ─────────────────────
@@ -394,9 +394,9 @@ pub enum DeliveryMsg {
     /// Body is `RecursiveRelayPayload`.
     RecursiveRelay = 0x11,
     /// **Source-routed relay** — sender names the entire relay chain
-    /// up-front, each hop just forwards к the next entry в `path`.
+    /// up-front, each hop just forwards to the next entry in `path`.
     /// Bypasses both `route_cache` gossip (which has hop-depth limits)
-    /// и Audit-H22 `iterative.lookup.all_filtered` (which rejects
+    /// and Audit-H22 `iterative.lookup.all_filtered` (which rejects
     /// non-progressive contacts).  Body is `RelayPathPayload`.
     /// Audit batch 2026-05-23.
     RelayPath = 0x12,
@@ -578,7 +578,7 @@ pub enum LocalAppMsg {
     /// tier diagnostics). Empty body. Node responds c `MobileStatus`
     /// carrying current tier + battery + effective keepalive/probe
     /// factors so apps can display "Power-saving mode active" badges
-    /// or diagnose unexpected keepalive cadence без admin-token.
+    /// or diagnose unexpected keepalive cadence without admin-token.
     GetMobileStatus = 34,
     /// Mobile-status reply: node → app.
     /// Payload: `MobileStatusPayload`.
@@ -596,12 +596,12 @@ pub enum LocalAppMsg {
     /// Set push envelope: app → node.
     /// Payload: `SetPushEnvelopePayload` carrying matching rendezvous
     /// `(rendezvous_node_id, auth_cookie)` tuple + already-sealed envelope
-    /// bytes. Daemon routes к
+    /// bytes. Daemon routes to
     /// `NodeRuntime::set_rendezvous_push_envelope` so the next maintenance
-    /// tick re-signs every active rendezvous-ad с the new envelope.
-    /// Empty envelope (`bytes.len == 0`) clears push registration без
+    /// tick re-signs every active rendezvous-ad with the new envelope.
+    /// Empty envelope (`bytes.len == 0`) clears push registration without
     /// disrupting the rendezvous publication itself (use case: user
-    /// disabled push в settings). Sealing happens client-side ([crate::push_envelope_seal_helper] OR Dart wrapper) so the daemon
+    /// disabled push in settings). Sealing happens client-side ([crate::push_envelope_seal_helper] OR Dart wrapper) so the daemon
     /// never sees the raw FCM/APNs token — only opaque ciphertext.
     SetPushEnvelope = 37,
     /// Set push envelope reply: node → app.
@@ -681,10 +681,10 @@ pub enum LocalAppMsg {
     LookupRendezvousReplicasResp = 52,
     /// Create bootstrap invite request: app → node (Epic 489.7
     /// generator side).  Payload: `CreateBootstrapInvitePayload`
-    /// carrying optional password (encrypts the invite) и validity
+    /// carrying optional password (encrypts the invite) and validity
     /// seconds (for signed variants — currently ignored on plain).
-    /// Daemon assembles а `BootstrapPeer` from its own [identity] +
-    /// [[listen]] config и encodes the canonical URI (plus encrypt
+    /// Daemon assembles a `BootstrapPeer` from its own [identity] +
+    /// [[listen]] config and encodes the canonical URI (plus encrypt
     /// envelope if password supplied).  Reply: `CreateBootstrapInviteResult`.
     CreateBootstrapInvite = 53,
     /// Create bootstrap invite reply: node → app.
@@ -696,16 +696,16 @@ pub enum LocalAppMsg {
     //
     // Six-message ceremony between two devices of the SAME sovereign
     // identity.  Source = existing device holding the master_sk.
-    // Target = fresh device к be added к the identity-keys list.
-    // State lives ephemerally в the daemon (one-at-a-time semantics,
+    // Target = fresh device to be added to the identity-keys list.
+    // State lives ephemerally in the daemon (one-at-a-time semantics,
     // restart-tolerant — daemon crash midway means user restarts
-    // ceremony).  See pair_runtime crate для the state machines.
+    // ceremony).  See pair_runtime crate for the state machines.
     //
     // Source side (3 messages → 3 replies):
     //   55/56 — PairSourceCreateInvite: generate pair_secret + URI,
-    //           stash state, return URI for user к share.
+    //           stash state, return URI for user to share.
     //   57/58 — PairSourceHandleHello: receive Hello bytes from target,
-    //           return Cert bytes + 6-digit OOB code к display.
+    //           return Cert bytes + 6-digit OOB code to display.
     //   59/60 — PairSourceHandleConfirm: receive Confirm bytes, finalize
     //           (master-certified subkey persists across daemon restart).
     //
@@ -726,24 +726,24 @@ pub enum LocalAppMsg {
     PairTargetHandleCertResult = 64,
     PairTargetBuildConfirm = 65,
     PairTargetBuildConfirmResult = 66,
-    /// **Inbound stream notification: daemon → app.**  Sent when а
-    /// remote node opens а stream к а bound endpoint owned by this
-    /// IPC client.  Distinct от [`Self::StreamOpenOk`] which is the
-    /// reply к the app's OWN outbound `StreamOpen` request — the
-    /// two were previously aliased causing inbound streams к be
+    /// **Inbound stream notification: daemon → app.**  Sent when a
+    /// remote node opens a stream to a bound endpoint owned by this
+    /// IPC client.  Distinct from [`Self::StreamOpenOk`] which is the
+    /// reply to the app's OWN outbound `StreamOpen` request — the
+    /// two were previously aliased causing inbound streams to be
     /// silently dropped by the SDK.  Payload:
     /// [`crate::ipc::StreamOpenInboundPayload`].
     StreamOpenInbound = 67,
     /// **P-Net status query: app → daemon.**  Asks whether the
-    /// session к the given `peer_node_id` was admitted under а valid
-    /// `MembershipCert`.  Used by ogate / oproxy / other apps що
-    /// want к gate their app-layer admission на the daemon's
+    /// session to the given `peer_node_id` was admitted under a valid
+    /// `MembershipCert`.  Used by ogate / oproxy / other apps that
+    /// want to gate their app-layer admission on the daemon's
     /// already-performed handshake-time cert verification (instead
     /// of maintaining their own static `allowed_node_ids` list).
-    /// Payload: 32-byte peer_node_id.  Daemon replies с
+    /// Payload: 32-byte peer_node_id.  Daemon replies with
     /// [`Self::PnetStatusResult`].
     PnetStatusQuery = 68,
-    /// **P-Net status result: daemon → app.**  Reply к
+    /// **P-Net status result: daemon → app.**  Reply to
     /// [`Self::PnetStatusQuery`].  Payload:
     /// [`crate::ipc::PnetStatusResultPayload`] —
     /// `admitted` flag + (when admitted) the cert's network_id /
@@ -1069,7 +1069,7 @@ mod tests {
     fn session_msg_rejects_unknown_discriminant() {
         // One past the last defined variant (HandoffResponse=25, audit cycle-6
         // T1) — must be an error, not silent aliasing. Wire-format extensions
-        // that add а new variant must bump this test to the next unused
+        // that add a new variant must bump this test to the next unused
         // discriminant.
         let err = SessionMsg::try_from(26).unwrap_err();
         assert!(matches!(

@@ -2,7 +2,7 @@
 name = "veil-invite"
 version = "0.1.0"
 edition = "2024"
-description = "Invite-bundle format для out-of-band sharing of trusted-listener URIs.  CBOR + base32 + Ed25519 sig.  Used by `veil-cli invite create/accept`."
+description = "Invite-bundle format for out-of-band sharing of trusted-listener URIs.  CBOR + base32 + Ed25519 sig.  Used by `veil-cli invite create/accept`."
 license = "AGPL-3.0-or-later"
 
 [dependencies]

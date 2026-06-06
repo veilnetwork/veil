@@ -54,7 +54,7 @@ fn update_sign_manifest<I: CommandIo, O: ConfigOps>(
     use std::io::Read;
     use veil_update::manifest::sign_manifest;
 
-    // SHA-256 of the binary, streaming to keep memory bounded для
+    // SHA-256 of the binary, streaming to keep memory bounded for
     // 10-30 MiB binaries (the.so / veil-cli outputs are ~10 MiB).
     let mut file = std::fs::File::open(&args.binary).map_err(|e| {
         veil_cfg::ConfigError::CommandFailed(format!("open binary {}: {e}", args.binary.display()))
@@ -75,8 +75,8 @@ fn update_sign_manifest<I: CommandIo, O: ConfigOps>(
     binary_sha256.copy_from_slice(&digest);
 
     // Load issuer identity from the TOML file. Reuses the existing
-    // [identity] section schema так что operators may sign manifests
-    // с a key that ALSO acts как a node's signing key, OR с a
+    // [identity] section schema so that operators may sign manifests
+    // with a key that ALSO acts as a node's signing key, OR with a
     // dedicated cold-storage release-signing key — same wire format.
     let identity_toml = std::fs::read_to_string(&args.identity).map_err(|e| {
         veil_cfg::ConfigError::CommandFailed(format!(
@@ -133,7 +133,7 @@ fn update_sign_manifest<I: CommandIo, O: ConfigOps>(
     if let Some(path) = args.output {
         std::fs::write(&path, &bytes).map_err(|e| {
             veil_cfg::ConfigError::CommandFailed(format!(
-                "write manifest к {}: {e}",
+                "write manifest to {}: {e}",
                 path.display()
             ))
         })?;
@@ -147,9 +147,9 @@ fn update_sign_manifest<I: CommandIo, O: ConfigOps>(
             args.platform_target,
         )));
     } else {
-        // Write raw manifest bytes к stdout via the IO emitter so
+        // Write raw manifest bytes to stdout via the IO emitter so
         // callers can pipe `> manifest.bin`. Emit informational
-        // message к stderr first so it doesn't pollute the bytes.
+        // message to stderr first so it doesn't pollute the bytes.
         context.io.emit(OutputEvent::message(format!(
             "binary_sha256={sha_hex} version={} bytes={}",
             args.version,
@@ -649,7 +649,7 @@ mod tests {
 
     fn write_test_identity(dir: &std::path::Path) -> std::path::PathBuf {
         // Generate a fresh Ed25519 keypair for the release-signing key
-        // и persist as TOML (same shape as IdentityConfig). Reused
+        // and persist as TOML (same shape as IdentityConfig). Reused
         // across the tests below.
         use base64::Engine;
         use ed25519_dalek::SigningKey;
@@ -721,8 +721,8 @@ mod tests {
     #[test]
     fn epic484_1_sign_manifest_deterministic_with_fixed_inputs() {
         // Reproducibility check: same binary contents + same identity
-        // + same release_unix должен produce byte-identical manifest.
-        // (Signature includes a per-call nonce у Falcon, NOT у Ed25519
+        // + same release_unix must produce byte-identical manifest.
+        // (Signature includes a per-call nonce with Falcon, NOT with Ed25519
         // so this test deliberately uses Ed25519.)
         use crate::cmd::cli::SignManifestArgs;
 

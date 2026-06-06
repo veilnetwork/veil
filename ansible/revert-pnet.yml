@@ -1,7 +1,7 @@
 ---
-# Revert P-Net (private mode) rollout — drop `[network]` block из node.toml,
+# Revert P-Net (private mode) rollout — drop `[network]` block from node.toml,
 # remove membership cert, restart veil + chat-node.
-# Inverse of deploy-pnet.yml. Cluster returns к public-mode behaviour;
+# Inverse of deploy-pnet.yml. Cluster returns to public-mode behaviour;
 # membership-gate becomes no-op (gate=None at startup).
 
 - name: Revert P-Net (private → public)
@@ -45,7 +45,7 @@
         name: veil.service
         state: started
 
-    - name: Wait for node к come back online
+    - name: Wait for node to come back online
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 30); do
@@ -58,7 +58,7 @@
           exit 1
       changed_when: false
 
-    - name: Restart chat-node после veil restart
+    - name: Restart chat-node after veil restart
       ansible.builtin.systemd:
         name: chat-node.service
         state: restarted

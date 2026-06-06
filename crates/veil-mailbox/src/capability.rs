@@ -1,29 +1,29 @@
-//! Receiver-signed capability tokens that gate access к the mailbox
+//! Receiver-signed capability tokens that gate access to the mailbox
 //! PUT endpoint.
 //!
 //! ## Threat model
 //!
-//! Pre-fix the mailbox PUT endpoint was open: anyone holding а receiver's
+//! Pre-fix the mailbox PUT endpoint was open: anyone holding a receiver's
 //! `node_id` could deposit blobs at any of its replica relays, gated only
-//! by per-receiver byte quota и rate limit. An attacker grinding random
-//! `(receiver_id, content_id)` tuples could drive а relay's per-receiver
+//! by per-receiver byte quota and rate limit. An attacker grinding random
+//! `(receiver_id, content_id)` tuples could drive a relay's per-receiver
 //! byte counter against the quota cap, displacing legitimate blobs via
-//! the global eviction path (the eviction-age guard в
+//! the global eviction path (the eviction-age guard in
 //! [`crate::lib::MIN_EVICTION_AGE_SECS`] caps that, but the attacker
 //! still wastes the receiver's quota slot).
 //!
-//! Capability tokens turn the PUT endpoint от open к "receiver-authorised":
-//! the receiver mints а signed token, distributes it out-of-band (e.g.
+//! Capability tokens turn the PUT endpoint from open to "receiver-authorised":
+//! the receiver mints a signed token, distributes it out-of-band (e.g.
 //! alongside the `RendezvousAd.auth_cookie` already published in DHT)
-//! senders attach the token к each PUT, и the relay verifies the
-//! signature и time-window before storing.
+//! senders attach the token to each PUT, and the relay verifies the
+//! signature and time-window before storing.
 //!
 //! ## Why receiver-signed (not relay-issued)
 //!
-//! The relay does not know **which** senders the receiver wants к accept
+//! The relay does not know **which** senders the receiver wants to accept
 //! deposits from. Only the receiver knows that. Pushing the policy
-//! decision к the receiver — sender holds а token = receiver said "yes" —
-//! keeps the relay стейтлесс с regard к sender identity. Same shape as
+//! decision to the receiver — sender holds a token = receiver said "yes" —
+//! keeps the relay stateless with regard to sender identity. Same shape as
 //! the existing `RendezvousAd.auth_cookie` in `veil-anonymity`.
 //!
 //! ## What this slice ships
@@ -76,7 +76,7 @@
 //! [22+pk_len..] sig
 //! ```
 //!
-//! Signed bytes (the message that `sig` is а signature):
+//! Signed bytes (the message that `sig` is a signature):
 //!
 //! ```text
 //! b"veil:v1:mailbox-cap"
@@ -88,7 +88,7 @@
 //! ```
 //!
 //! Note: `receiver_id` is NOT signed. Relay computes
-//! `BLAKE3(issuer_pk)` и checks equality с the `MailboxPutPayload.receiver_id`
+//! `BLAKE3(issuer_pk)` and checks equality with the `MailboxPutPayload.receiver_id`
 //! field. Token is reusable across all replicas of the same receiver
 //! while it remains within its time window.
 
@@ -96,17 +96,17 @@ use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use pqcrypto_falcon::falcon512;
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, VerificationError};
 
-/// Wire-format version byte для **v1 (unbound)** capability tokens.
-/// V1 tokens may be presented к ANY of the receiver's mailbox replicas;
-/// а malicious relay observing а v1 PUT can replay the token к other
-/// replicas. Kept readable для backward compat (existing senders).
+/// Wire-format version byte for **v1 (unbound)** capability tokens.
+/// V1 tokens may be presented to ANY of the receiver's mailbox replicas;
+/// a malicious relay observing a v1 PUT can replay the token to other
+/// replicas. Kept readable for backward compat (existing senders).
 pub const TOKEN_VERSION: u8 = 1;
 
-/// Wire-format version byte для **v2 (relay-bound)** capability tokens.
-/// V2 adds а `relay_node_id` field signed by the issuer; relay verifies
+/// Wire-format version byte for **v2 (relay-bound)** capability tokens.
+/// V2 adds a `relay_node_id` field signed by the issuer; relay verifies
 /// `expected_relay_id == token.relay_node_id` before accepting. Closes
 /// the cross-replica replay vector. Receivers mint one token per replica
-/// they want senders к use.
+/// they want senders to use.
 pub const TOKEN_VERSION_V2: u8 = 2;
 
 /// Algorithm byte `0` = Ed25519 (32-byte pubkey, 64-byte sig).
@@ -114,19 +114,19 @@ pub const ALGO_ED25519: u8 = 0;
 /// Algorithm byte `1` = Falcon-512 (897-byte pubkey, ≤666-byte sig).
 pub const ALGO_FALCON512: u8 = 1;
 
-/// Domain-separation tag for the **v1** signed message. Distinct от any
-/// other signing context в the project so а signature minted under another
+/// Domain-separation tag for the **v1** signed message. Distinct from any
+/// other signing context in the project so a signature minted under another
 /// purpose (identity proof, rendezvous ad, etc.) cannot be replayed here.
 pub const SIGN_CONTEXT: &[u8] = b"veil:v1:mailbox-cap";
 
-/// Domain-separation tag for the **v2** signed message. Distinct от
-/// [`SIGN_CONTEXT`] so а v1 token bytes cannot be reinterpreted as v2 OR
-/// vice-versa even при byte-level overlap.
+/// Domain-separation tag for the **v2** signed message. Distinct from
+/// [`SIGN_CONTEXT`] so a v1 token bytes cannot be reinterpreted as v2 OR
+/// vice-versa even at byte-level overlap.
 pub const SIGN_CONTEXT_V2: &[u8] = b"veil:v2:mailbox-cap-bound";
 
 /// Maximum total token size on the wire. Falcon-512 worst case:
 /// 22 fixed-header B + 897 pk B + 666 sig B + slack ≈ 1600 B. 2 KiB
-/// keeps headroom for а future algo с ~1 KiB pubkey. Bounded к prevent
+/// keeps headroom for a future algo with ~1 KiB pubkey. Bounded to prevent
 /// pathological-size deserialisation attacks.
 pub const MAX_TOKEN_BYTES: usize = 2048;
 
@@ -138,34 +138,34 @@ const FIXED_HEADER_SIZE: usize = 1 + 1 + 8 + 8 + 2;
 /// + relay_node_id(32) = 52 B.
 const FIXED_HEADER_SIZE_V2: usize = FIXED_HEADER_SIZE + 32;
 
-/// Allowed clock skew between sender and relay для the time-window
+/// Allowed clock skew between sender and relay for the time-window
 /// check.
 ///
 /// **Interactive tier** (60 s) — central policy in
 /// `veil-proto::time_validity::INTERACTIVE_SKEW_SECS`.  Cannot import
 /// directly (veil-mailbox is leaf, no veil-proto dep) so the
 /// constant is duplicated.  **Pinned by the `interactive_tier_is_60_seconds`
-/// test в `veil-proto::time_validity`** — that test fails если а
+/// test in `veil-proto::time_validity`** — that test fails if a
 /// future refactor flips the central tier without updating this site.
 ///
 /// Why this tier: stops the most common cause of legitimate-token
-/// rejection (NTP drift в low-end mobile clients).
+/// rejection (NTP drift in low-end mobile clients).
 pub const SKEW_SECS: u64 = 60;
 
 /// Decoded capability token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxCapabilityToken {
-    /// Either [`TOKEN_VERSION`] (v1, unbound) или [`TOKEN_VERSION_V2`]
+    /// Either [`TOKEN_VERSION`] (v1, unbound) or [`TOKEN_VERSION_V2`]
     /// (v2, relay-bound).
     pub version: u8,
     /// One [`ALGO_ED25519`] / [`ALGO_FALCON512`].
     pub issuer_algo: u8,
-    /// Unix-seconds; relay rejects tokens с `now + SKEW_SECS < valid_from`.
+    /// Unix-seconds; relay rejects tokens with `now + SKEW_SECS < valid_from`.
     pub valid_from_unix: u64,
-    /// Unix-seconds; relay rejects tokens с `now > valid_until + SKEW_SECS`.
+    /// Unix-seconds; relay rejects tokens with `now > valid_until + SKEW_SECS`.
     pub valid_until_unix: u64,
     /// **v2 only**: the receiver-chosen relay node_id this token is valid
-    /// at. `None` для v1 (unbound) tokens; `Some(...)` для v2 (relay-bound).
+    /// at. `None` for v1 (unbound) tokens; `Some(...)` for v2 (relay-bound).
     /// Verifier rejects v2 tokens whose `relay_node_id` doesn't match the
     /// local relay's own node_id — closes the cross-replica replay vector.
     pub relay_node_id: Option<[u8; 32]>,
@@ -182,13 +182,13 @@ pub enum CapTokenError {
     /// could be read.
     #[error("token bytes too short: need {need}, got {got}")]
     TooShort {
-        /// Bytes required к continue parsing.
+        /// Bytes required to continue parsing.
         need: usize,
         /// Bytes actually present.
         got: usize,
     },
     /// Buffer length exceeds [`MAX_TOKEN_BYTES`] — almost certainly
-    /// an attacker probing the parser с oversized inputs.
+    /// an attacker probing the parser with oversized inputs.
     #[error("token bytes too long: max {max}, got {got}")]
     TooLong {
         /// Cap that was violated.
@@ -196,15 +196,15 @@ pub enum CapTokenError {
         /// Actual buffer length.
         got: usize,
     },
-    /// First byte is not [`TOKEN_VERSION`] (1) или [`TOKEN_VERSION_V2`] (2).
+    /// First byte is not [`TOKEN_VERSION`] (1) or [`TOKEN_VERSION_V2`] (2).
     #[error("unsupported wire version: {version}")]
     BadVersion {
         /// Version byte read off the wire.
         version: u8,
     },
     /// v2 token's `relay_node_id` does not match the expected relay id
-    /// the verifier was told к check. Either the token was minted for а
-    /// different replica (malicious relay replay scenario) или the
+    /// the verifier was told to check. Either the token was minted for a
+    /// different replica (malicious relay replay scenario) or the
     /// verifier was misconfigured.
     #[error("v2 relay-binding mismatch: token={token_hex}.. expected={expected_hex}..")]
     RelayMismatch {
@@ -215,7 +215,7 @@ pub enum CapTokenError {
     },
     /// v2 token presented but verifier wasn't given an `expected_relay_id`.
     /// Inconsistent caller state — either upgrade the caller to pass its
-    /// node_id or downgrade к v1 tokens.
+    /// node_id or downgrade to v1 tokens.
     #[error("v2 token requires expected_relay_id at verify but caller passed None")]
     RelayBindingRequired,
     /// `issuer_algo` byte not one of the known values
@@ -260,13 +260,13 @@ pub enum CapTokenError {
         valid_until: u64,
     },
     /// `BLAKE3(issuer_pk)!= expected_receiver_id`. Token was minted
-    /// for а different receiver — sender либо misrouted либо replayed
-    /// а stolen token к а wrong target.
-    #[error("issuer_pk does not hash к expected receiver_id")]
+    /// for a different receiver — sender either misrouted either replayed
+    /// a stolen token to a wrong target.
+    #[error("issuer_pk does not hash to expected receiver_id")]
     ReceiverIdMismatch,
-    /// Cryptographic signature verification failed. Folds в both
-    /// "unparseable signature bytes" и "valid bytes но mismatched key"
-    /// to avoid leaking distinguishability к а probing attacker.
+    /// Cryptographic signature verification failed. Folds in both
+    /// "unparseable signature bytes" and "valid bytes but mismatched key"
+    /// to avoid leaking distinguishability to a probing attacker.
     #[error("signature verification failed")]
     BadSignature,
 }
@@ -274,7 +274,7 @@ pub enum CapTokenError {
 impl MailboxCapabilityToken {
     /// Build the canonical signed-message bytes. The signer signs these
     /// the verifier reconstructs the same bytes from the decoded token
-    /// fields и checks the signature against `issuer_pk`.
+    /// fields and checks the signature against `issuer_pk`.
     pub fn signed_message(&self) -> Vec<u8> {
         signed_message_for_versioned(
             self.version,
@@ -286,7 +286,7 @@ impl MailboxCapabilityToken {
         )
     }
 
-    /// Encode к wire bytes. Caller must ensure `issuer_pk` и `sig`
+    /// Encode to wire bytes. Caller must ensure `issuer_pk` and `sig`
     /// match the algo's expected sizes; encode does not validate (decode
     /// does).
     pub fn encode(&self) -> Vec<u8> {
@@ -316,8 +316,8 @@ impl MailboxCapabilityToken {
         buf
     }
 
-    /// Decode wire bytes к а structured token. Validates wire shape
-    /// и known algo; does NOT verify signature или time-window — call
+    /// Decode wire bytes to a structured token. Validates wire shape
+    /// and known algo; does NOT verify signature or time-window — call
     /// [`Self::verify`] for the full check.
     pub fn decode(buf: &[u8]) -> Result<Self, CapTokenError> {
         if buf.len() > MAX_TOKEN_BYTES {
@@ -415,16 +415,16 @@ impl MailboxCapabilityToken {
         })
     }
 
-    /// Verify а decoded token against an expected receiver и а point in
+    /// Verify a decoded token against an expected receiver and a point in
     /// time. Combines: time-window check, receiver-id binding,
-    /// **relay binding** (v2 only) и signature verification.
+    /// **relay binding** (v2 only) and signature verification.
     ///
     /// `expected_relay_id` semantics:
     /// * `Some(local)` + v1 token → relay-binding ignored (backward compat).
     /// * `Some(local)` + v2 token → must match `token.relay_node_id`.
     /// * `None` + v1 token → OK.
     /// * `None` + v2 token → reject ([`CapTokenError::RelayBindingRequired`]):
-    ///   token requests relay-binding но caller didn't supply local id.
+    ///   token requests relay-binding but caller didn't supply local id.
     pub fn verify(
         &self,
         expected_receiver_id: &[u8; 32],
@@ -444,16 +444,16 @@ impl MailboxCapabilityToken {
                 valid_until: self.valid_until_unix,
             });
         }
-        // Receiver binding: issuer_pk MUST hash к the receiver_id the
-        // sender's PUT claims к target.
+        // Receiver binding: issuer_pk MUST hash to the receiver_id the
+        // sender's PUT claims to target.
         let computed_receiver_id = *blake3::hash(&self.issuer_pk).as_bytes();
         if &computed_receiver_id != expected_receiver_id {
             return Err(CapTokenError::ReceiverIdMismatch);
         }
-        // Relay binding (v2): if token claims а bound relay, verifier MUST
-        // be told its own node_id и that id MUST match. Closes the
-        // malicious-relay-replay vector where R captures а valid token
-        // observed during legitimate deposit и replays it к other replicas.
+        // Relay binding (v2): if token claims a bound relay, verifier MUST
+        // be told its own node_id and that id MUST match. Closes the
+        // malicious-relay-replay vector where R captures a valid token
+        // observed during legitimate deposit and replays it to other replicas.
         match (self.relay_node_id.as_ref(), expected_relay_id) {
             (Some(token_relay), Some(local_relay)) if token_relay != local_relay => {
                 return Err(CapTokenError::RelayMismatch {
@@ -477,7 +477,7 @@ impl MailboxCapabilityToken {
 
     /// **Mint helper (v1, unbound)**: high-level convenience wrapper over
     /// [`sign_token`] for Ed25519 receivers. Returns the encoded token
-    /// bytes ready к publish in `RendezvousAd.capability_token`.
+    /// bytes ready to publish in `RendezvousAd.capability_token`.
     pub fn mint_unbound_ed25519(
         signing_key: &ed25519_dalek::SigningKey,
         valid_from_unix: u64,
@@ -496,8 +496,8 @@ impl MailboxCapabilityToken {
 
     /// **Mint helper (v2, relay-bound)**: high-level convenience wrapper
     /// over [`sign_token_v2`] for Ed25519 receivers. `relay_node_id` is
-    /// the specific replica node_id this token authorises deposit к —
-    /// receivers mint one token per replica и publish the full list в
+    /// the specific replica node_id this token authorises deposit to —
+    /// receivers mint one token per replica and publish the full list in
     /// `RendezvousAd`.
     pub fn mint_bound_ed25519(
         signing_key: &ed25519_dalek::SigningKey,
@@ -528,20 +528,20 @@ fn hex_short(b: &[u8; 32]) -> String {
     s
 }
 
-/// mint а capability token by composing
-/// the canonical signed-message и delegating signing к а caller-supplied
-/// closure. Returns the encoded token wire bytes ready к stash в
+/// mint a capability token by composing
+/// the canonical signed-message and delegating signing to a caller-supplied
+/// closure. Returns the encoded token wire bytes ready to stash in
 /// `RendezvousAd.capability_token`.
 ///
-/// The closure pattern keeps `veil-mailbox` от needing а dep on
-/// `veil-crypto` (which would pull в the full PQ stack для what is
-/// functionally а 1-line `vk.sign(msg)` call). Callers that already
-/// have an `veil_crypto::sign_message` или `IdentitySigningKey::sign`
-/// в scope just wrap it.
+/// The closure pattern keeps `veil-mailbox` from needing a dep on
+/// `veil-crypto` (which would pull in the full PQ stack for what is
+/// functionally a 1-line `vk.sign(msg)` call). Callers that already
+/// have an `veil_crypto::sign_message` or `IdentitySigningKey::sign`
+/// in scope just wrap it.
 ///
 /// `issuer_algo` must be one [`ALGO_ED25519`] / [`ALGO_FALCON512`].
-/// Hybrid sigs are not supported в; pass а tokenless ad if the
-/// receiver uses а hybrid identity.
+/// Hybrid sigs are not supported in; pass a tokenless ad if the
+/// receiver uses a hybrid identity.
 pub fn sign_token(
     issuer_algo: u8,
     issuer_pk: &[u8],
@@ -595,7 +595,7 @@ pub fn sign_token(
 
 /// **v2 (relay-bound)** variant of [`sign_token`]. Token includes the
 /// receiver-chosen `relay_node_id`; only that replica accepts the token.
-/// Same closure-signing pattern as v1 so callers stay decoupled от
+/// Same closure-signing pattern as v1 so callers stay decoupled from
 /// crypto-stack details.
 pub fn sign_token_v2(
     issuer_algo: u8,
@@ -681,7 +681,7 @@ pub fn signed_message_for_versioned(
     msg
 }
 
-/// Build the canonical signed-message bytes без а decoded token —
+/// Build the canonical signed-message bytes without a decoded token —
 /// used by signers who construct the token field-by-field.
 pub fn signed_message_for(
     version: u8,
@@ -728,9 +728,9 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use pqcrypto_traits::sign::SecretKey as _;
 
-    /// Mint а valid Ed25519 token signed by а freshly-generated key.
+    /// Mint a valid Ed25519 token signed by a freshly-generated key.
     /// Returns the issuer's public key bytes (so test code can derive
-    /// the expected receiver_id) и the encoded token bytes.
+    /// the expected receiver_id) and the encoded token bytes.
     fn mint_ed25519_token(
         valid_from_unix: u64,
         valid_until_unix: u64,
@@ -879,7 +879,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_signature_over_different_validity_window() {
-        // Take а valid token, change valid_until, и keep the old sig:
+        // Take a valid token, change valid_until, and keep the old sig:
         // verify must fail because the signed bytes no longer match.
         let (pk, mut token) = mint_ed25519_token(1000, 2000);
         token.valid_until_unix = 5000;
@@ -932,12 +932,12 @@ mod tests {
     #[test]
     fn decode_rejects_pk_len_mismatch_for_ed25519() {
         let (_, token) = mint_ed25519_token(1000, 2000);
-        // Corrupt pk_len bytes к something other than 32.
+        // Corrupt pk_len bytes to something other than 32.
         let mut bytes = token.encode();
         bytes[18] = 0;
         bytes[19] = 99; // pk_len = 99, not 32 → must reject for Ed25519.
-        // Need к also extend pk и sig regions to keep buffer at the
-        // declared length so we hit the algo-vs-len validator не the
+        // Need to also extend pk and sig regions to keep buffer at the
+        // declared length so we hit the algo-vs-len validator not the
         // length-buffer check.
         let extra = 99usize.saturating_sub(32);
         for _ in 0..extra {

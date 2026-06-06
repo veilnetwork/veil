@@ -1,27 +1,27 @@
-//! Ephemeral port binder с collision retry.
+//! Ephemeral port binder with collision retry.
 //!
-//! Picks а random port from the configured range; if `EADDRINUSE` (some
-//! other process на the host bound it first), retries с а fresh random
-//! pick up к `bind_retries` times.  Use case: snowflake-style anti-port-
-//! clustering — каждая нода в the fleet listens on а different port
+//! Picks a random port from the configured range; if `EADDRINUSE` (some
+//! other process on the host bound it first), retries with a fresh random
+//! pick up to `bind_retries` times.  Use case: snowflake-style anti-port-
+//! clustering — each node in the fleet listens on a different port
 //! within the same range, so DPI / scanner can't recognize "all veil
-//! nodes listen на 5556" cluster signal.
+//! nodes listen on 5556" cluster signal.
 //!
-//! ## What's IN scope (Phase 5а)
+//! ## What's IN scope (Phase 5a)
 //!
 //! - Pure binding helper: input = (host, port range, retry count);
-//!   output = а bound `TcpListener` или error.
-//! - Pure functions, no runtime state.  Caller decides когда to call
+//!   output = a bound `TcpListener` or error.
+//! - Pure functions, no runtime state.  Caller decides when to call
 //!   (initial boot, rotation event, etc.).
 //!
 //! ## What's deferred (Phase 5b/5c)
 //!
-//! - **Rotation scheduler**: periodic re-bind с grace period для in-
-//!   flight sessions — needs integration с the runtime task-spawner.
+//! - **Rotation scheduler**: periodic re-bind with grace period for in-
+//!   flight sessions — needs integration with the runtime task-spawner.
 //! - **Peer-notify wire frame** (`TransportMigrationNotify`): broadcasting
-//!   the new URI к active peers before the old port closes — needs
-//!   а new proto family member + dispatcher arm.
-//! - **Invite-bundle CLI**: out-of-band distribution для trusted listener
+//!   the new URI to active peers before the old port closes — needs
+//!   a new proto family member + dispatcher arm.
+//! - **Invite-bundle CLI**: out-of-band distribution for trusted listener
 //!   URIs — needs CLI scaffolding + CBOR + base32.
 
 use std::ops::RangeInclusive;
@@ -31,15 +31,15 @@ use tokio::net::TcpListener;
 
 use super::error::{Result, TransportError};
 
-/// Maximum sensible retry count.  Tuned за typical 50k-port ranges
-/// под typical load — `(1 - p_collision)^64 > 0.999999` для 1000
+/// Maximum sensible retry count.  Tuned for typical 50k-port ranges
+/// under typical load — `(1 - p_collision)^64 > 0.999999` for 1000
 /// occupied ports.
 pub const DEFAULT_BIND_RETRIES: u32 = 64;
 
-/// Pick а random port в `port_range` и attempt `TcpListener::bind`
-/// on `(host, port)`.  Retry up к `bind_retries` times on `EADDRINUSE`
-/// (per RFC; на Linux это `errno=98`).  Other errors fail immediately
-/// (no point retrying если, e.g., the host isn't bindable).
+/// Pick a random port in `port_range` and attempt `TcpListener::bind`
+/// on `(host, port)`.  Retry up to `bind_retries` times on `EADDRINUSE`
+/// (per RFC; on Linux this `errno=98`).  Other errors fail immediately
+/// (no point retrying if, e.g., the host isn't bindable).
 ///
 /// Returns the bound `TcpListener` AND the random port chosen so the
 /// caller can advertise/publish that port.
@@ -82,7 +82,7 @@ pub async fn bind_random_port(
 mod tests {
     use super::*;
 
-    /// Single-shot bind succeeds for а wide range на localhost.
+    /// Single-shot bind succeeds for a wide range on localhost.
     #[tokio::test]
     async fn bind_random_succeeds_wide_range() {
         let (listener, port) = bind_random_port("127.0.0.1", 30000..=60000, 64)
@@ -107,13 +107,13 @@ mod tests {
     /// Single-port range (low == high) works iff that port is free.
     #[tokio::test]
     async fn bind_random_single_port_range() {
-        // Bind two listeners ON а single-port range — first succeeds,
-        // second must fail (с retry exhausted).
+        // Bind two listeners ON a single-port range — first succeeds,
+        // second must fail (with retry exhausted).
         let (_first, port) = bind_random_port("127.0.0.1", 40000..=50000, 64)
             .await
             .expect("first bind ok");
         let single = port..=port;
-        // Now retry-bind на the same port; first attempt collides,
+        // Now retry-bind on the same port; first attempt collides,
         // 64 retries also collide (single-port range), so eventually fails.
         let err = bind_random_port("127.0.0.1", single, 5)
             .await
@@ -131,7 +131,7 @@ mod tests {
         );
     }
 
-    /// Two simultaneous binds на а wide range produce different ports.
+    /// Two simultaneous binds on a wide range produce different ports.
     #[tokio::test]
     async fn bind_random_diversity() {
         let (_l1, p1) = bind_random_port("127.0.0.1", 30000..=60000, 64)
@@ -141,21 +141,21 @@ mod tests {
             .await
             .unwrap();
         // 30000-port range; collision probability is 1/30000 ≈ 0.003%.
-        // If they're equal, либо bad luck либо bug.  Re-run если spurious.
+        // If they're equal, either bad luck either bug.  Re-run if spurious.
         assert_ne!(
             p1, p2,
-            "two ephemeral binds picked the same port (re-run если spurious)"
+            "two ephemeral binds picked the same port (re-run if spurious)"
         );
     }
 
     /// Zero retries = single-shot.
     #[tokio::test]
     async fn bind_random_zero_retries_single_shot() {
-        // Pre-bind а port к force collision.
+        // Pre-bind a port to force collision.
         let (_l1, port) = bind_random_port("127.0.0.1", 40000..=50000, 64)
             .await
             .unwrap();
-        // Now try к bind same port с zero retries.
+        // Now try to bind same port with zero retries.
         let result = bind_random_port("127.0.0.1", port..=port, 0).await;
         assert!(result.is_err(), "zero retries should fail on collision");
     }

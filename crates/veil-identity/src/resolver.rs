@@ -144,7 +144,7 @@ pub trait IdentityLookup: Send + Sync {
     /// Default impl returns `Ok(None)` so existing in-memory test
     /// backends and historical implementations keep compiling without
     /// claiming migration support. Production DHT backends override
-    /// this к route the query to the same Kademlia GET path used for
+    /// this to route the query to the same Kademlia GET path used for
     /// identity documents.
     async fn fetch_migration_cert(
         &self,
@@ -156,7 +156,7 @@ pub trait IdentityLookup: Send + Sync {
 
     /// fetch up to `n_replicas` independent `MigrationCert`
     /// blobs for `dht_key`. Used by the resolver to defend against an
-    /// attacker who publishes a downgrade or unrelated cert на one
+    /// attacker who publishes a downgrade or unrelated cert on one
     /// replica path: when divergent values come back, the resolver
     /// picks the highest-security_tier candidate AND requires the
     /// signature to verify against the OLD master pubkey.
@@ -236,7 +236,7 @@ pub enum ResolveError {
     MigrationCertMalformed(String),
     #[error("migration cert verify failed: {0}")]
     MigrationCertInvalid(String),
-    #[error("migration cert chain depth exceeded {max_depth} hops — refusing к follow further")]
+    #[error("migration cert chain depth exceeded {max_depth} hops — refusing to follow further")]
     MigrationChainTooDeep { max_depth: u32 },
     #[error("migration cert chain cycle detected at hop {hop}, node_id={node_id:?}")]
     MigrationChainCycle { hop: u32, node_id: [u8; 32] },
@@ -374,25 +374,25 @@ impl<B: ResolverBackend> NameResolver<B> {
 
         // Verify the name claim against the document that signed it
         // BEFORE following any migration chain — the chain hops change
-        // who you talk to, не "what name does this identity claim".
+        // who you talk to, not "what name does this identity claim".
         if let Some(ref claim) = claim {
             self.verify_name_claim(claim, &original_doc, now_unix_secs)?;
         }
 
         // walk any migration-cert chain rooted at this
-        // node_id и return the most-recent migrated identity. Name
+        // node_id and return the most-recent migrated identity. Name
         // continuity: the claim still cryptographically binds the
-        // name к the old identity, и the migration cert
-        // cryptographically binds the old identity к the new one —
-        // chain of trust intact end к end.
+        // name to the old identity, and the migration cert
+        // cryptographically binds the old identity to the new one —
+        // chain of trust intact end to end.
         let validated = self
             .resolve_with_migration_chain(node_id, now_unix_secs)
             .await?;
 
         if let Some(claim) = claim {
             // Cache against the original requested name → caller's
-            // node_id (not the migrated one) so на the next call мы
-            // re-walk the chain (cheap, one DHT GET) и pick up
+            // node_id (not the migrated one) so on the next call we
+            // re-walk the chain (cheap, one DHT GET) and pick up
             // freshly-published rotations.
             self.insert_cache(normalized.clone(), claim.node_id);
         } else {
@@ -408,14 +408,14 @@ impl<B: ResolverBackend> NameResolver<B> {
     /// • no migration cert exists for the current node_id (steady
     /// state — return the document we just fetched)
     /// • the chain hits depth `MAX_MIGRATION_CHAIN_DEPTH` (refuse
-    /// к follow further; surface `MigrationChainTooDeep`)
+    /// to follow further; surface `MigrationChainTooDeep`)
     /// • the chain visits a node_id we already saw (loop attack;
     /// surface `MigrationChainCycle`).
     ///
     /// Each hop's `MigrationCert.signature` is verified against the
     /// CURRENT document's `master_pubkey`, so an attacker who only
     /// controls the DHT cannot forge a migration: they'd need the
-    /// old master's secret to mint a cert that binds к their new
+    /// old master's secret to mint a cert that binds to their new
     /// pubkey. Replica divergence is handled by
     /// `fetch_best_migration_cert`: the highest-security_tier valid
     /// candidate wins; ties broken by `issued_at_unix` (newer wins).
@@ -480,18 +480,18 @@ impl<B: ResolverBackend> NameResolver<B> {
             current_node_id = next;
         }
         // Loop body always returns; the unreachable! satisfies the
-        // compiler но also doubles as a runtime invariant tripwire
-        // if `MAX_MIGRATION_CHAIN_DEPTH` is set к 0.
+        // compiler but also doubles as a runtime invariant tripwire
+        // if `MAX_MIGRATION_CHAIN_DEPTH` is set to 0.
         unreachable!("migration-chain loop must return inside the body");
     }
 
     /// fetch up to `resolver_max_replicas` migration-cert
     /// candidates, decode each, verify against `current_doc.master_pubkey`
-    /// and return the one с the highest security_tier (ties broken by
+    /// and return the one with the highest security_tier (ties broken by
     /// `issued_at_unix` descending). Returns `Ok(None)` only when
     /// every replica returns no value (`fetch_migration_cert` ⇒ None).
     /// Malformed/invalid candidates are silently dropped — the resolver
-    /// only surfaces an error when it has к (no value at all OR every
+    /// only surfaces an error when it has to (no value at all OR every
     /// replica returned a malformed blob, in which case we report the
     /// first decode failure).
     async fn fetch_best_migration_cert(
@@ -522,7 +522,7 @@ impl<B: ResolverBackend> NameResolver<B> {
                     continue;
                 }
             };
-            // Algo + structural binding + signature verify против
+            // Algo + structural binding + signature verify against
             // current master. Stale-but-signed certs (window expired)
             // are dropped — the resolver wants live migrations only.
             if verify_migration_cert(&cert, &old_master_b64, now_unix_secs).is_err() {
@@ -552,10 +552,10 @@ impl<B: ResolverBackend> NameResolver<B> {
             return Err(ResolveError::MigrationCertMalformed(msg));
         }
         // All replicas decoded but none verified — treat the same
-        // as "no migration cert published" (resolver continues с
+        // as "no migration cert published" (resolver continues with
         // the current doc). This matches the model: an attacker
         // who can publish junk under the cert key shouldn't be
-        // able к stall name resolution by spamming invalid blobs.
+        // able to stall name resolution by spamming invalid blobs.
         Ok(best)
     }
 
@@ -1498,7 +1498,7 @@ mod tests {
     }
 
     /// Builds a `MigrationCert` signed by `old_master_sk_seed`'s
-    /// Ed25519 master, pointing the OLD `node_id` к the NEW one.
+    /// Ed25519 master, pointing the OLD `node_id` to the NEW one.
     fn build_ed25519_migration_cert(
         old_master_sk_seed: [u8; 32],
         old_node_id: [u8; 32],
@@ -1531,7 +1531,7 @@ mod tests {
     async fn resolve_follows_one_hop_migration_chain() {
         // Old identity = build_fixture (master_sk seed [0x11u8; 32]).
         // New identity = master_sk seed [0x33u8; 32], sub_sk seed [0x44u8; 32].
-        // Both docs published; cert signed by OLD master pointing к NEW node_id.
+        // Both docs published; cert signed by OLD master pointing to NEW node_id.
         let f_old = build_fixture("alice");
         let now = f_old.now_unix_secs;
         let (new_doc, _new_claim) =
@@ -1627,7 +1627,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_detects_migration_chain_cycle() {
-        // Two-node cycle: A migrates к B, B migrates back к A.
+        // Two-node cycle: A migrates to B, B migrates back to A.
         // Resolver must surface MigrationChainCycle, not loop forever.
         let f_a = build_fixture("alice");
         let now = f_a.now_unix_secs;
@@ -1743,7 +1743,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_ignores_migration_when_new_doc_missing() {
         // Cert is valid but new_doc isn't published (operator
-        // forgot к publish before publishing the cert). Resolver
+        // forgot to publish before publishing the cert). Resolver
         // surfaces IdentityNotFound for the NEW node_id — caller can
         // distinguish from "no migration" (which silently keeps the
         // old identity).

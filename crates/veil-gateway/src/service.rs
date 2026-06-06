@@ -218,13 +218,13 @@ mod tests {
 
     /// Keepalive renews the lease so it survives past the original TTL.
     ///
-    /// cleanup: original test used а 15ms TTL +
+    /// cleanup: original test used a 15ms TTL +
     /// `std::thread::sleep(7.5ms)` twice. Under load `std::thread::sleep`
     /// returned 30+ms late and the lease's renewed deadline lapsed before
     /// the post-keepalive `cleanup_expired(Instant::now)` call — flake.
-    /// Rewrite uses а 60-second TTL + а `cfg(test)` helper к force the
-    /// lease's `expires_at` к а synthetic short deadline, so the
-    /// cleanup-vs-deadline race is replaced с deterministic Instant
+    /// Rewrite uses a 60-second TTL + a `cfg(test)` helper to force the
+    /// lease's `expires_at` to a synthetic short deadline, so the
+    /// cleanup-vs-deadline race is replaced with deterministic Instant
     /// arithmetic.
     #[test]
     fn keepalive_prevents_eviction() {
@@ -242,8 +242,8 @@ mod tests {
 
         svc.handle_attach(node_id, &payload).unwrap();
 
-        // Force the lease к а synthetic short deadline 100ms in the past.
-        // Без keepalive а subsequent cleanup_expired(now) would evict.
+        // Force the lease to a synthetic short deadline 100ms in the past.
+        // Without keepalive a subsequent cleanup_expired(now) would evict.
         let synthetic_short_deadline =
             std::time::Instant::now() - std::time::Duration::from_millis(100);
         assert!(
@@ -254,7 +254,7 @@ mod tests {
         // Renew via the real handle_keepalive path. After this the lease's
         // expires_at = Instant::now + 60s, strictly later than the
         // synthetic short deadline above (since Instant::now is monotonic
-        // и moves forward of synthetic_short_deadline = now-100ms).
+        // and moves forward of synthetic_short_deadline = now-100ms).
         svc.handle_keepalive(
             &node_id,
             &KeepalivePayload {
@@ -273,7 +273,7 @@ mod tests {
 
         // Cleanup at synthetic_short_deadline + 1ms — past the synthetic
         // short deadline but well before the renewed (now+60s) deadline.
-        // Без keepalive the lease would be evicted; с keepalive it must
+        // Without keepalive the lease would be evicted; with keepalive it must
         // survive.
         svc.cleanup_expired(synthetic_short_deadline + std::time::Duration::from_millis(1));
 

@@ -30,10 +30,10 @@ impl NodeRuntime {
             return false;
         }
         let magic = &value[..2];
-        // P-Net ban records use а 4-byte `PBAN` magic; the receiver's
-        // `KademliaService::handle_store` routes those через
+        // P-Net ban records use a 4-byte `PBAN` magic; the receiver's
+        // `KademliaService::handle_store` routes those through
         // `NetworkAuthGate` regardless of signed-STORE flags, so
-        // republishing them propagates legitimate bans к peers that
+        // republishing them propagates legitimate bans to peers that
         // joined after the original publish.
         if value.len() >= 4 && &value[..4] == veil_identity::network_ban::BAN_BLOB_MAGIC {
             return true;

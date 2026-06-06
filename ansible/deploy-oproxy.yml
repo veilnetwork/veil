@@ -1,22 +1,22 @@
 ---
-# Deploy `oproxy-server` и/или `oproxy-client` on testnet hosts.
+# Deploy `oproxy-server` and/or `oproxy-client` on testnet hosts.
 #
 # Selects role per-host via the `oproxy_role` variable:
 #   * `server` — installs oproxy-server binary + config + systemd unit
 #   * `client` — installs oproxy-client binary + config + systemd unit
-#   * `both`   — both binaries (useful для local-loop smoke tests)
+#   * `both`   — both binaries (useful for local-loop smoke tests)
 #   * (unset)  — host skipped
 #
-# Per-host vars (set в inventory or `--extra-vars`):
+# Per-host vars (set in inventory or `--extra-vars`):
 #
 #   oproxy_role: "server" | "client" | "both"
 #
-#   # Server-side (когда role == "server" OR "both"):
+#   # Server-side (when role == "server" OR "both"):
 #   oproxy_app_name: "testnet-proxy"      # default
 #   oproxy_allowed_node_ids: []            # default — allow all
 #   oproxy_allow_private: false            # default — block RFC1918
 #
-#   # Client-side (когда role == "client" OR "both"):
+#   # Client-side (when role == "client" OR "both"):
 #   oproxy_server_node_id: "<64 hex chars of server's node_id>"
 #   oproxy_server_app_name: "testnet-proxy"
 #   oproxy_socks5_listen:  "127.0.0.1:1080"
@@ -42,7 +42,7 @@
     oproxy_bin_src_dir: "{{ playbook_dir }}/../target/release"
     oproxy_etc_dir: /etc/oproxy
   tasks:
-    - name: Skip hosts с no oproxy_role set
+    - name: Skip hosts with no oproxy_role set
       ansible.builtin.meta: end_host
       when: oproxy_role is not defined
 
@@ -73,7 +73,7 @@
     - name: Fail if oproxy-server binary missing locally
       ansible.builtin.fail:
         msg: >-
-          Missing {{ oproxy_bin_src_dir }}/oproxy-server.  Build first с
+          Missing {{ oproxy_bin_src_dir }}/oproxy-server.  Build first with
           `cargo build -p oproxy --release`.
       when: oproxy_role in ['server', 'both'] and not server_bin_stat.stat.exists
 
@@ -137,11 +137,11 @@
     - name: Fail if oproxy-client binary missing locally
       ansible.builtin.fail:
         msg: >-
-          Missing {{ oproxy_bin_src_dir }}/oproxy-client.  Build first с
+          Missing {{ oproxy_bin_src_dir }}/oproxy-client.  Build first with
           `cargo build -p oproxy --release`.
       when: oproxy_role in ['client', 'both'] and not client_bin_stat.stat.exists
 
-    - name: Fail if oproxy_server_node_id not set для client role
+    - name: Fail if oproxy_server_node_id not set for client role
       ansible.builtin.fail:
         msg: >-
           oproxy_server_node_id must be set (64 hex chars) when oproxy_role
@@ -197,7 +197,7 @@
           or client_unit.changed | default(false)
 
     # ── Post-deploy verification ───────────────────────────────────
-    - name: Wait 3s для services к stabilise
+    - name: Wait 3s for services to stabilise
       ansible.builtin.pause:
         seconds: 3
       when: oproxy_role is defined

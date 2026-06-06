@@ -19,8 +19,8 @@ This directory ships:
   `veil-cli`, generates a long-lived identity, registers a `systemd`
   unit.  Documented below.
 * **`iperf-veil-bench.sh`** — veil throughput integration test.
-  Measures iperf3 over kernel loopback (baseline), then iperf3 over а
-  fresh 2-daemon + 2-ogate netns setup, и asserts veil throughput is
+  Measures iperf3 over kernel loopback (baseline), then iperf3 over a
+  fresh 2-daemon + 2-ogate netns setup, and asserts veil throughput is
   ≥ `MIN_VEIL_PCT` (default 1) % of loopback.  Catches catastrophic
   regressions (session-flap, batch-encoding bugs) that drop veil below
   1 % of raw kernel throughput.  Requires sudo (NOPASSWD) for TUN +

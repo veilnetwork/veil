@@ -69,9 +69,9 @@
  * hard cap on `data` byte length accepted by
  * FFI calls that allocate from caller-supplied len. Mirrors the
  * daemon's `MAX_FRAME_BODY` (16 MiB) so an attacker — or buggy
- * caller — passing а huge `len` к [`veil_send`] gets а clean
+ * caller — passing a huge `len` to [`veil_send`] gets a clean
  * `VEIL_ERR_INVALID_ARG` instead of triggering an allocation
- * large enough к hard-OOM the host process.
+ * large enough to hard-OOM the host process.
  */
 #define VEIL_MAX_DATA_LEN ((16 * 1024) * 1024)
 
@@ -112,7 +112,7 @@
  * Wake-HMAC verdict codes returned by [`veil_verify_wake_hmac`].
  * Mirrors `veil_crypto::wake_hmac::WakePayloadVerdict` so receiver
  * plugins can branch on each failure mode separately (operators care
- * about clock-skew rate as а distinct signal от active forging).
+ * about clock-skew rate as a distinct signal from active forging).
  *
  * Slice 4.3.3 of Epic 489.10.
  */
@@ -125,14 +125,14 @@
 #define VEIL_WAKE_VERDICT_MALFORMED 3
 
 /**
- * Wake-HMAC key length (32 bytes).  Pinned за
+ * Wake-HMAC key length (32 bytes).  Pinned to
  * `veil_crypto::wake_hmac::WAKE_HMAC_KEY_LEN`.
  */
 #define VEIL_WAKE_HMAC_KEY_LEN 32
 
 /**
  * Wake payload total wire size (72 bytes — `ts u64 BE || content_id 32
- * || hmac_tag 32`).  Pinned за `veil_crypto::wake_hmac::WAKE_PAYLOAD_LEN`.
+ * || hmac_tag 32`).  Pinned to `veil_crypto::wake_hmac::WAKE_PAYLOAD_LEN`.
  */
 #define VEIL_WAKE_PAYLOAD_LEN 72
 
@@ -163,15 +163,15 @@
 #define VEIL_MAILBOX_PUT_NOT_RELAY 5
 
 /**
- * relay configured с
- * `require_capability_token = true` rejected а PUT that arrived
- * without а capability token.
+ * relay configured with
+ * `require_capability_token = true` rejected a PUT that arrived
+ * without a capability token.
  */
 #define VEIL_MAILBOX_PUT_CAPABILITY_REQUIRED 6
 
 /**
- * capability token decode или verify
- * failed (expired, wrong receiver, или bad signature).
+ * capability token decode or verify
+ * failed (expired, wrong receiver, or bad signature).
  */
 #define VEIL_MAILBOX_PUT_CAPABILITY_INVALID 7
 
@@ -211,7 +211,7 @@
 #define VEIL_CREATE_INVITE_INTERNAL_ERROR 3
 
 /**
- * Wire-byte session-state values для `VeilPeerCb::state`.
+ * Wire-byte session-state values for `VeilPeerCb::state`.
  */
 #define VEIL_PEER_STATE_CONNECTING 0
 
@@ -222,7 +222,7 @@
 #define VEIL_PEER_STATE_UNKNOWN 255
 
 /**
- * Wire-byte direction values для `VeilPeerCb::direction`.
+ * Wire-byte direction values for `VeilPeerCb::direction`.
  */
 #define VEIL_PEER_DIR_INBOUND 0
 
@@ -230,7 +230,7 @@
 
 /**
  * Per-envelope wire overhead (`eph_pk + nonce + tag`).  Pre-allocate
- * `token_len + VEIL_PUSH_ENVELOPE_OVERHEAD` bytes на the caller
+ * `token_len + VEIL_PUSH_ENVELOPE_OVERHEAD` bytes on the caller
  * side to receive the sealed bytes.  Mirrors
  * `veil_anonymity::push_envelope::PUSH_ENVELOPE_OVERHEAD`.
  */
@@ -249,7 +249,7 @@
 /**
  * Event-kind wire bytes mirroring `veil_proto::event_kind::*`.
  * Hosts dispatch on `kind` to know how to interpret `payload`. Keep
- * в lockstep with the server-side constants — adding new kinds is
+ * in lockstep with the server-side constants — adding new kinds is
  * forward-compatible (older C consumers see an unknown kind and
  * fall back to a noop handler).
  */
@@ -268,15 +268,15 @@
 #define VEIL_EVENT_MAILBOX_DRAINED 3
 
 /**
- * Maximum freshness window для a restored IdentityDocument — 30 days.
+ * Maximum freshness window for a restored IdentityDocument — 30 days.
  * Mirrors `veil_identity::MAX_FRESHNESS_WINDOW_SECS`. Restored
- * devices typically request the full window so the doc lives через
+ * devices typically request the full window so the doc lives through
  * the next routine document republish (default ~half-life).
  */
 #define VEIL_DEFAULT_RESTORE_VALIDITY_SECS ((30 * 24) * 3600)
 
 /**
- * Wire-byte status codes для Source-side pairing ops.  Mirror
+ * Wire-byte status codes for Source-side pairing ops.  Mirror
  * `veil_proto::pair_source_status`.
  */
 #define VEIL_PAIR_SOURCE_OK 0
@@ -296,7 +296,7 @@
 #define VEIL_PAIR_SOURCE_BAD_CONFIRM 7
 
 /**
- * Wire-byte status codes для Target-side pairing ops.  Mirror
+ * Wire-byte status codes for Target-side pairing ops.  Mirror
  * `veil_proto::pair_target_status`.
  */
 #define VEIL_PAIR_TARGET_OK 0
@@ -316,7 +316,7 @@
 /**
  * Hard cap on ceremony frame size (mirrors
  * `veil_proto::MAX_PAIR_CEREMONY_BYTES`).  Callers can pre-
- * allocate а buffer of this size to safely receive Hello / Cert /
+ * allocate a buffer of this size to safely receive Hello / Cert /
  * Confirm bytes without two-call sizing.
  */
 #define VEIL_MAX_PAIR_CEREMONY_BYTES (64 * 1024)
@@ -359,11 +359,11 @@ typedef struct VeilStreamFfi VeilStreamFfi;
 /**
  * Recv callback signature — invoked from a tokio worker thread.
  *
- * wrapped в `Option<...>` so а NULL
- * function pointer passed from C/Swift/Kotlin is а valid `None`
- * representation that Rust matches и rejects gracefully — instead
- * of being silently treated as а valid `unsafe extern "C" fn(...)`
- * (which Rust assumes non-nullable, leading к UB on dereference
+ * wrapped in `Option<...>` so a NULL
+ * function pointer passed from C/Swift/Kotlin is a valid `None`
+ * representation that Rust matches and rejects gracefully — instead
+ * of being silently treated as a valid `unsafe extern "C" fn(...)`
+ * (which Rust assumes non-nullable, leading to UB on dereference
  * before `catch_unwind` could intervene).
  */
 typedef void (*VeilRecvCb)(void *user,
@@ -414,7 +414,7 @@ typedef struct {
    */
   uint8_t battery_level_pct;
   /**
-   * Configured threshold для route-probe throttling (255 = disabled).
+   * Configured threshold for route-probe throttling (255 = disabled).
    */
   uint8_t low_battery_threshold_pct;
   uint8_t _pad2[2];
@@ -441,7 +441,7 @@ typedef struct {
  * direction — wire-byte direction (see VEIL_PEER_DIR_*).
  * transport — UTF-8 transport URI (NOT null-terminated; use len).
  * transport_len — byte length of `transport`.
- * wrapped в `Option<...>` for safe
+ * wrapped in `Option<...>` for safe
  * NULL-pointer rejection at the FFI boundary. See [`VeilRecvCb`]
  * docs.
  */
@@ -456,10 +456,10 @@ typedef void (*VeilPeerCb)(void *user,
  * Push-event callback. Invoked from a tokio worker thread for every
  * `LocalAppMsg::Event` frame the daemon emits while this handler is
  * installed. `payload`+`payload_len` describe the per-kind opaque
- * bytes (см. `veil_proto::event_kind` для wire format per kind);
+ * bytes (see. `veil_proto::event_kind` for wire format per kind);
  * they are valid for the duration of the call only — the consumer
  * must copy if it needs to retain.
- * wrapped в `Option<...>` for safe
+ * wrapped in `Option<...>` for safe
  * NULL-pointer rejection at the FFI boundary. See [`VeilRecvCb`]
  * docs.
  */
@@ -490,8 +490,8 @@ extern "C" {
  * alive via their own `Arc`; the runtime is dropped only when the last
  * reference goes away. Safe to call on NULL.
  *
- * defends against double-free. If the caller passes а pointer that's either
- * NULL, already-freed, or random garbage this function returns без
+ * defends against double-free. If the caller passes a pointer that's either
+ * NULL, already-freed, or random garbage this function returns without
  * `Box::from_raw` (which would be UB on freed memory). Liveness is resolved
  * via the external [`handle_registry`] keyed by address, so the guard never
  * dereferences the pointer (see the registry's module comment).
@@ -629,7 +629,7 @@ VeilStreamFfi *veil_stream_open(VeilApp *app,
  *. No `auth_cookie` required.
  *
  * `push_envelope` / `push_envelope_len` are optional (pass NULL / 0
- * to skip). When supplied и storage succeeds, the relay fires a
+ * to skip). When supplied and storage succeeds, the relay fires a
  * wake-push to the receiver after this call returns.
  *
  * Returns one of `VEIL_MAILBOX_PUT_*` (≥0) on a structured outcome
@@ -659,17 +659,17 @@ int veil_mailbox_put(VeilHandle *handle,
 
 /**
  * `veil_mailbox_put` variant that forwards
- * а receiver-signed capability token. Required when targeting а
- * relay running с `MailboxConfig::require_capability_token = true`.
+ * a receiver-signed capability token. Required when targeting a
+ * relay running with `MailboxConfig::require_capability_token = true`.
  *
- * `capability_token` / `capability_token_len` ара the bytes obtained
- * от the receiver's `RendezvousAd` (surfaced on the SDK side as
+ * `capability_token` / `capability_token_len` are the bytes obtained
+ * from the receiver's `RendezvousAd` (surfaced on the SDK side as
  * `RendezvousReplicaInfo::capability_token`). Pass `NULL` / `0` to
- * fall back к the no-token path (equivalent к calling the original
+ * fall back to the no-token path (equivalent to calling the original
  * `veil_mailbox_put`). Maximum length is
  * [`veilclient::MAX_MAILBOX_CAPABILITY_TOKEN_BYTES`].
  *
- * All other parameters и safety contracts ара identical к
+ * All other parameters and safety contracts are identical to
  * [`veil_mailbox_put`].
  */
 
@@ -688,27 +688,27 @@ int veil_mailbox_put_with_capability(VeilHandle *handle,
 ;
 
 /**
- * `veil_mailbox_put` variant that forwards BOTH а receiver-signed
+ * `veil_mailbox_put` variant that forwards BOTH a receiver-signed
  * capability token AND the receiver's sealed wake-HMAC envelope (Epic
- * 489.10 slice 4.3.4).  This is the export а mobile sender uses to
- * forward the wake-HMAC envelope so the relay can mint а receiver-
+ * 489.10 slice 4.3.4).  This is the export a mobile sender uses to
+ * forward the wake-HMAC envelope so the relay can mint a receiver-
  * verifiable wake-HMAC tag on the push.
  *
- * `capability_token` / `capability_token_len` ара as in
+ * `capability_token` / `capability_token_len` are as in
  * [`veil_mailbox_put_with_capability`] (pass `NULL` / `0` to skip).
  *
- * `wake_hmac_envelope` / `wake_hmac_envelope_len` ара the bytes the
- * receiver published в its `RendezvousAd` (surfaced SDK-side as
- * `RendezvousReplicaInfo::wake_hmac_envelope` и returned over the C
+ * `wake_hmac_envelope` / `wake_hmac_envelope_len` are the bytes the
+ * receiver published in its `RendezvousAd` (surfaced SDK-side as
+ * `RendezvousReplicaInfo::wake_hmac_envelope` and returned over the C
  * ABI by [`veil_lookup_rendezvous_replicas`]).  Pass `NULL` / `0`
- * к fall back к an unauthenticated wake (equivalent к
+ * to fall back to an unauthenticated wake (equivalent to
  * [`veil_mailbox_put_with_capability`]).  Maximum length is
  * [`veilclient::MAX_WAKE_HMAC_ENVELOPE_BYTES`]; overflow returns
  * `VEIL_ERR_INVALID_ARG`.
  *
- * All other parameters и safety contracts ара identical к
- * [`veil_mailbox_put`].  `wake_hmac_envelope` MUST point к
- * ≥`wake_hmac_envelope_len` readable bytes (или NULL if 0).
+ * All other parameters and safety contracts are identical to
+ * [`veil_mailbox_put`].  `wake_hmac_envelope` MUST point to
+ * ≥`wake_hmac_envelope_len` readable bytes (or NULL if 0).
  */
 
 int veil_mailbox_put_with_wake_hmac(VeilHandle *handle,
@@ -728,24 +728,24 @@ int veil_mailbox_put_with_wake_hmac(VeilHandle *handle,
 ;
 
 /**
- * Look up candidate mailbox-relays for `receiver_id` и return each
- * verified replica's relay id, ad-expiry, и the three sealed blobs a
- * sender forwards on the put: `push_envelope`, `capability_token`, и
+ * Look up candidate mailbox-relays for `receiver_id` and return each
+ * verified replica's relay id, ad-expiry, and the three sealed blobs a
+ * sender forwards on the put: `push_envelope`, `capability_token`, and
  * (Epic 489.10 slice 4.3.4 — the whole point of this export) the
  * `wake_hmac_envelope`.  Round-trips to the daemon via IPC; resolves
- * the receiver's `RendezvousAd` от the local DHT cache.
+ * the receiver's `RendezvousAd` from the local DHT cache.
  *
- * `max_replicas == 0` means "all up к the daemon's cap"
+ * `max_replicas == 0` means "all up to the daemon's cap"
  * (`MAX_RENDEZVOUS_REPLICAS = 8`; single-key publication returns ≤ 1).
  *
- * On success returns [`VEIL_OK`] (0) и writes а heap-allocated,
- * length-prefixed buffer к `*out_buf` (its length к `*out_len`).  The
- * caller OWNS that buffer и MUST free it with
+ * On success returns [`VEIL_OK`] (0) and writes a heap-allocated,
+ * length-prefixed buffer to `*out_buf` (its length to `*out_len`).  The
+ * caller OWNS that buffer and MUST free it with
  * [`veil_free_replica_buf`] (NOT `free` / `veil_free_string`).
  * An empty result (no cached ad / no replicas) still returns
- * [`VEIL_OK`] with `*out_len == 4` (just the `count = 0` header) и
- * а non-NULL `*out_buf` the caller must still free.  On error returns a
- * negative `VEIL_ERR_*`, sets `*err_out`, и leaves `*out_buf =
+ * [`VEIL_OK`] with `*out_len == 4` (just the `count = 0` header) and
+ * a non-NULL `*out_buf` the caller must still free.  On error returns a
+ * negative `VEIL_ERR_*`, sets `*err_out`, and leaves `*out_buf =
  * NULL` / `*out_len = 0`.
  *
  * Wire layout (all integers little-endian) — hand this to the Dart side:
@@ -757,11 +757,11 @@ int veil_mailbox_put_with_wake_hmac(VeilHandle *handle,
  *     capability_token_len:   u16, capability_token:   [u8; len]
  *     wake_hmac_envelope_len: u16, wake_hmac_envelope: [u8; len]
  * (Per-blob length is u16; every blob is backend-capped well under
- * 64 KiB — push ≤ 512 B, cap-token и wake-HMAC envelopes likewise.)
+ * 64 KiB — push ≤ 512 B, cap-token and wake-HMAC envelopes likewise.)
  *
  * # Safety
- * `handle` MUST be а live `VeilHandle*` от `veil_connect`.
- * `receiver_id` MUST point к ≥32 readable bytes.  `out_buf` и
+ * `handle` MUST be a live `VeilHandle*` from `veil_connect`.
+ * `receiver_id` MUST point to ≥32 readable bytes.  `out_buf` and
  * `out_len` MUST be valid, writable pointers.
  */
 
@@ -774,16 +774,16 @@ int veil_lookup_rendezvous_replicas(VeilHandle *handle,
 ;
 
 /**
- * Free а replica buffer returned by
+ * Free a replica buffer returned by
  * [`veil_lookup_rendezvous_replicas`].  `ptr` / `len` MUST be the
  * exact `*out_buf` / `*out_len` pair that call produced — passing any
  * other pointer, or a mismatched length, is undefined behaviour.  Safe
  * to call on `ptr == NULL` (no-op).
  *
  * # Safety
- * `ptr` MUST be either NULL or а pointer previously returned by
+ * `ptr` MUST be either NULL or a pointer previously returned by
  * `veil_lookup_rendezvous_replicas` that has NOT already been freed,
- * и `len` MUST equal the length that call wrote.
+ * and `len` MUST equal the length that call wrote.
  */
  void veil_free_replica_buf(uint8_t *ptr, size_t len) ;
 
@@ -882,20 +882,20 @@ int veil_mailbox_ack(VeilHandle *handle,
  int veil_get_mobile_status(VeilHandle *handle, VeilMobileStatus *out, char **err_out) ;
 
 /**
- * Decode a bootstrap-invite URI и register the peer for outbound dial
+ * Decode a bootstrap-invite URI and register the peer for outbound dial
  *. Forwards the URI bytes to the daemon, which decodes
- * them через the standard plain / encrypted / signed-invite paths.
+ * them through the standard plain / encrypted / signed-invite paths.
  *
  * `uri` must be NUL-terminated UTF-8. `password` and `expected_issuer_pk`
  * may be NULL (for plain URIs / unsigned), or NUL-terminated UTF-8
  * strings.
  *
  * On success / `VEIL_JOIN_ALREADY_REGISTERED`, `out_node_id_32` is
- * populated с the decoded peer's node_id. On any error status it is
+ * populated with the decoded peer's node_id. On any error status it is
  * zero-filled. `out_status` always carries the wire-byte status code
  * (one of `VEIL_JOIN_*`). Returns [`VEIL_OK`] iff the IPC
  * round-trip itself succeeded; the actual decode/verify outcome lives
- * в `out_status`.
+ * in `out_status`.
  */
 
 int veil_join_bootstrap_uri(VeilHandle *handle,
@@ -908,29 +908,29 @@ int veil_join_bootstrap_uri(VeilHandle *handle,
 ;
 
 /**
- * Build а bootstrap-invite URI from the daemon's own identity и
+ * Build a bootstrap-invite URI from the daemon's own identity and
  * listen-address config (Epic 489.7 generator side, "share my invite"
- * flow).  Output goes к а caller-owned heap-allocated UTF-8 string
+ * flow).  Output goes to a caller-owned heap-allocated UTF-8 string
  * the FFI returns through `out_uri` — caller MUST free it via
  * [`veil_free_string`] after consuming.
  *
- * `password` may be `NULL` (plain `veil:bootstrap?…` URI) или а
+ * `password` may be `NULL` (plain `veil:bootstrap?…` URI) or a
  * NUL-terminated UTF-8 string (encrypted `veil:pair?…` envelope).
- * Empty / whitespace-only passwords are rejected с status
+ * Empty / whitespace-only passwords are rejected with status
  * `VEIL_CREATE_INVITE_BAD_PASSWORD` so callers can re-prompt rather
- * than emitting an envelope encrypted under а trivial key.
+ * than emitting an envelope encrypted under a trivial key.
  *
- * On non-OK status, `out_uri` is set к NULL и `err_out` (если non-NULL)
- * carries а human-readable detail message.
+ * On non-OK status, `out_uri` is set to NULL and `err_out` (if non-NULL)
+ * carries a human-readable detail message.
  *
  * Returns [`VEIL_OK`] iff the IPC round-trip itself succeeded; the
  * actual outcome lives in `out_status` (one of `VEIL_CREATE_INVITE_*`).
  *
  * # Safety
- * `handle` must be а live `VeilHandle*` from `veil_connect`.
+ * `handle` must be a live `VeilHandle*` from `veil_connect`.
  * `out_status` must be writable.  `out_uri` must be writable; on
- * success it receives а pointer к а malloc'd NUL-terminated UTF-8
- * string — caller frees с [`veil_free_string`].
+ * success it receives a pointer to a malloc'd NUL-terminated UTF-8
+ * string — caller frees with [`veil_free_string`].
  */
 
 int veil_create_bootstrap_invite(VeilHandle *handle,
@@ -973,10 +973,10 @@ int veil_create_bootstrap_invite(VeilHandle *handle,
  int veil_notify_network_changed(VeilHandle *handle, int kind, uint16_t mtu_hint, char **err_out) ;
 
 /**
- * Register а sealed FCM/APNs push-token envelope on а rendezvous-publisher
+ * Register a sealed FCM/APNs push-token envelope on a rendezvous-publisher
  * entry.
  *
- * `rendezvous_node_id` (32 bytes) и `auth_cookie` (16 bytes) must match an
+ * `rendezvous_node_id` (32 bytes) and `auth_cookie` (16 bytes) must match an
  * entry the daemon has already registered via
  * `register_rendezvous_publisher_with_push`. `envelope` carries opaque
  * sealed bytes (use `veil_anonymity::push_envelope::seal_push_envelope`
@@ -994,11 +994,11 @@ int veil_create_bootstrap_invite(VeilHandle *handle,
  *
  * # Safety
  *
- * `rendezvous_node_id` MUST point к an exactly 32-byte buffer. `auth_cookie`
- * к exactly 16. `envelope` к а buffer of length `envelope_len`. All
+ * `rendezvous_node_id` MUST point to an exactly 32-byte buffer. `auth_cookie`
+ * to exactly 16. `envelope` to a buffer of length `envelope_len`. All
  * pointers may be NULL only when their corresponding length is 0. Caller
  * retains ownership of all input buffers; the function copies the envelope
- * internally (returning before write completes к the daemon's state).
+ * internally (returning before write completes to the daemon's state).
  */
 
 int veil_set_push_envelope(VeilHandle *handle,
@@ -1010,15 +1010,15 @@ int veil_set_push_envelope(VeilHandle *handle,
 ;
 
 /**
- * Seal а raw FCM/APNs token к the push-relay identified by а 32-byte
+ * Seal a raw FCM/APNs token to the push-relay identified by a 32-byte
  * X25519 public key.  Stateless — does not need an `VeilHandle`.
- * The relay pubkey is typically obtained от `veil_get_node_id` of
+ * The relay pubkey is typically obtained from `veil_get_node_id` of
  * the relay daemon (which surfaces it as
- * [`veil_get_relay_x25519_pubkey`]), then transferred OOB к the
- * sender (typically baked into the app via а build-time constant
+ * [`veil_get_relay_x25519_pubkey`]), then transferred OOB to the
+ * sender (typically baked into the app via a build-time constant
  * per push-relay deployment).
  *
- * Output goes к caller-owned buffer `out_buf` of length `out_buf_cap`.
+ * Output goes to caller-owned buffer `out_buf` of length `out_buf_cap`.
  * On success `*out_len` receives the actual sealed length (always
  * `token_len + VEIL_PUSH_ENVELOPE_OVERHEAD`).  Returns
  * [`VEIL_OK`] / [`VEIL_PUSH_TOO_LARGE`] / [`VEIL_ERR_INVALID_ARG`]
@@ -1026,10 +1026,10 @@ int veil_set_push_envelope(VeilHandle *handle,
  *
  * # Safety
  *
- * `token` must point к `token_len` readable bytes (или NULL if 0).
- * `relay_pk_32` MUST point к exactly 32 readable bytes.  `out_buf`
+ * `token` must point to `token_len` readable bytes (or NULL if 0).
+ * `relay_pk_32` MUST point to exactly 32 readable bytes.  `out_buf`
  * MUST be writable for at least `out_buf_cap` bytes.  `out_len` MUST
- * be а writable pointer.
+ * be a writable pointer.
  */
 
 int veil_seal_push_envelope(const uint8_t *token,
@@ -1042,12 +1042,12 @@ int veil_seal_push_envelope(const uint8_t *token,
 ;
 
 /**
- * Upload а sealed wake-HMAC envelope к the daemon's rendezvous-publisher
+ * Upload a sealed wake-HMAC envelope to the daemon's rendezvous-publisher
  * entry matched by `(rendezvous_node_id, auth_cookie)` (Epic 489.10
- * slice 4.3.4 — analog к [`veil_set_push_envelope`]).
+ * slice 4.3.4 — analog to [`veil_set_push_envelope`]).
  *
  * Empty `envelope` (`envelope_len == 0`) clears the registration —
- * the receiver falls back к the legacy rate-limited wake path.  Use
+ * the receiver falls back to the legacy rate-limited wake path.  Use
  * when toggling HMAC authentication on/off.
  *
  * Returns:
@@ -1060,10 +1060,10 @@ int veil_seal_push_envelope(const uint8_t *token,
  *
  * # Safety
  *
- * `handle` MUST be а live `VeilHandle*`.  `rendezvous_node_id`
- * MUST point к 32 readable bytes.  `auth_cookie` MUST point к 16
- * readable bytes.  `envelope` MUST point к `envelope_len` readable
- * bytes (или NULL if 0).
+ * `handle` MUST be a live `VeilHandle*`.  `rendezvous_node_id`
+ * MUST point to 32 readable bytes.  `auth_cookie` MUST point to 16
+ * readable bytes.  `envelope` MUST point to `envelope_len` readable
+ * bytes (or NULL if 0).
  */
 
 int veil_set_wake_hmac_envelope(VeilHandle *handle,
@@ -1075,28 +1075,28 @@ int veil_set_wake_hmac_envelope(VeilHandle *handle,
 ;
 
 /**
- * Fill `out_key_32` с а fresh 32-byte wake-HMAC key from the OS CSPRNG.
+ * Fill `out_key_32` with a fresh 32-byte wake-HMAC key from the OS CSPRNG.
  *
- * Receivers generate one key per identity rotation epoch и persist it
+ * Receivers generate one key per identity rotation epoch and persist it
  * platform-side (iOS Keychain / Android Keystore — sibling slice).
- * The key is sealed к the chosen push-relay via [`veil_seal_push_envelope`]
- * — same envelope shape as а push token — и embedded в the receiver's
- * rendezvous ad как `wake_hmac_envelope` (slice 4.3.2 wire bump).
+ * The key is sealed to the chosen push-relay via [`veil_seal_push_envelope`]
+ * — same envelope shape as a push token — and embedded in the receiver's
+ * rendezvous ad as `wake_hmac_envelope` (slice 4.3.2 wire bump).
  *
  * # Safety
  *
- * `out_key_32` MUST point к exactly 32 writable bytes.
+ * `out_key_32` MUST point to exactly 32 writable bytes.
  */
  int veil_generate_wake_hmac_key(uint8_t *out_key_32, char **err_out) ;
 
 /**
- * Verify а wake-up payload delivered via OS push (FCM / APNs body).
+ * Verify a wake-up payload delivered via OS push (FCM / APNs body).
  * Receiver's plugin calls this inside `handleWakeup` BEFORE doing any
  * expensive veil work (daemon reconnect, mailbox drain).
  *
  * Returns one of [`VEIL_WAKE_VERDICT_*`] codes via `out_verdict`:
  *
- * * `VALID` — payload matches; proceed к drain.
+ * * `VALID` — payload matches; proceed to drain.
  * * `TAMPERED` — HMAC mismatch.  Silent no-op; no observable network
  *   reaction (defeats presence oracle).
  * * `EXPIRED` — `ts` outside ±5-min freshness window.  Silent no-op;
@@ -1109,9 +1109,9 @@ int veil_set_wake_hmac_envelope(VeilHandle *handle,
  *
  * # Safety
  *
- * `key_32` and `receiver_id_32` MUST each point к exactly 32 readable
- * bytes.  `payload` MUST point к `payload_len` readable bytes (или
- * NULL if 0).  `out_verdict` MUST be а writable pointer.
+ * `key_32` and `receiver_id_32` MUST each point to exactly 32 readable
+ * bytes.  `payload` MUST point to `payload_len` readable bytes (or
+ * NULL if 0).  `out_verdict` MUST be a writable pointer.
  */
 
 int veil_verify_wake_hmac(const uint8_t *key_32,
@@ -1137,7 +1137,7 @@ int veil_verify_wake_hmac(const uint8_t *key_32,
  * the handle is closed.
  *
  * Threading note: the callback fires on a tokio worker thread.
- * Hosts that marshal к a single-threaded UI loop (Flutter
+ * Hosts that marshal to a single-threaded UI loop (Flutter
  * dart:ffi, Swift, Kotlin) should wrap their callback in a
  * listener-style trampoline that wakes the UI isolate/queue.
  */
@@ -1146,7 +1146,7 @@ int veil_verify_wake_hmac(const uint8_t *key_32,
 /**
  * Validate a BIP-39 master phrase. Returns `VEIL_OK` iff the
  * phrase is exactly 24 words from the English BIP-39 wordlist AND
- * the checksum verifies. Sets `*err_out` к a human-readable
+ * the checksum verifies. Sets `*err_out` to a human-readable
  * description on failure (unknown word / wrong word count / bad
  * checksum).
  *
@@ -1160,24 +1160,24 @@ int veil_verify_wake_hmac(const uint8_t *key_32,
  * Restore an identity from a BIP-39 master phrase.
  *
  * Decodes phrase → master_seed → derives identity_sk → builds a
- * fresh signed `IdentityDocument` → writes к `veil_dir`:
+ * fresh signed `IdentityDocument` → writes to `veil_dir`:
  *
  * * `identity_document.bin` (signed master+device cert chain)
  * * `instance.toml` (per-device label + sig key index)
  * * `identity_sk.bin` (this device's per-instance signing key)
  *
- * `instance_label` is the human-readable name shown в `identity show`
- * output на other devices belonging к the same identity_id (e.g.
+ * `instance_label` is the human-readable name shown in `identity show`
+ * output on other devices belonging to the same identity_id (e.g.
  * "phone-2024-05"). Caps at 64 ASCII chars; longer names truncate.
  *
- * Idempotent: re-running с the same phrase + same veil_dir
- * regenerates the per-device identity_sk и rewrites the document.
+ * Idempotent: re-running with the same phrase + same veil_dir
+ * regenerates the per-device identity_sk and rewrites the document.
  * The `node_id` (= BLAKE3(master_pk)) is **stable** across calls.
  *
- * Pow_difficulty is fixed at 0 для testnet builds; release builds
+ * Pow_difficulty is fixed at 0 for testnet builds; release builds
  * using `production-seeds` would set it from a release-policy file.
  *
- * Returns `VEIL_OK` on success. On failure sets `*err_out` к
+ * Returns `VEIL_OK` on success. On failure sets `*err_out` to
  * a description and returns `VEIL_ERR`.
  */
 
@@ -1222,26 +1222,26 @@ int veil_restore_identity_from_phrase_zeroize(char *phrase,
  *
  * Both `phrase` AND `password` buffers are zeroed in place before this
  * function returns (on every code path — success, validation error,
- * I/O error, или panic).  Caller still owns the allocations и frees
+ * I/O error, or panic).  Caller still owns the allocations and frees
  * them after this call.
  *
- * `password` may be NULL — equivalent к calling
+ * `password` may be NULL — equivalent to calling
  * [`veil_restore_identity_from_phrase_zeroize`] without the encrypted-
- * master file.  This is provided as а convenience so consumer Flutter
+ * master file.  This is provided as a convenience so consumer Flutter
  * apps can branch on "user-supplied passphrase or not" without
  * switching FFI symbols.
  *
  * The Argon2id parameters are the spec-production default (64 MiB,
  * t=3, p=4).  Test code wanting cheaper KDF must use the lower-level
- * `veil_identity::sovereign_flow::restore_identity` directly с
+ * `veil_identity::sovereign_flow::restore_identity` directly with
  * `argon2_params_override`.
  *
  * # Safety
- * `phrase` и (if non-NULL) `password` must each point к а writable,
- * NUL-terminated UTF-8 buffer.  `veil_dir` и `instance_label` must
+ * `phrase` and (if non-NULL) `password` must each point to a writable,
+ * NUL-terminated UTF-8 buffer.  `veil_dir` and `instance_label` must
  * be NUL-terminated UTF-8 (read-only).  `err_out` must be writable;
- * on non-OK returns it receives а pointer к а malloc'd UTF-8 string —
- * caller frees с [`veil_free_string`].
+ * on non-OK returns it receives a pointer to a malloc'd UTF-8 string —
+ * caller frees with [`veil_free_string`].
  */
 
 int veil_restore_identity_from_phrase_zeroize_with_password(char *phrase,
@@ -1252,9 +1252,9 @@ int veil_restore_identity_from_phrase_zeroize_with_password(char *phrase,
 ;
 
 /**
- * Source-side: generate а pair-invite URI + initialize ceremony.
- * On success, `*out_uri` receives а malloc'd NUL-terminated UTF-8
- * string — caller frees с [`veil_free_string`].  `password` MUST
+ * Source-side: generate a pair-invite URI + initialize ceremony.
+ * On success, `*out_uri` receives a malloc'd NUL-terminated UTF-8
+ * string — caller frees with [`veil_free_string`].  `password` MUST
  * be NUL-terminated UTF-8 (the master_sk decryption passphrase).
  */
 
@@ -1269,8 +1269,8 @@ int veil_pair_source_create_invite(VeilHandle *handle,
  * Source-side: process Hello bytes from Target.  Returns Cert bytes
  * (via caller buffer) + 6-digit OOB code.  `out_cert_buf` must be
  * writable for ≥ `out_cert_buf_cap` bytes (recommend
- * `VEIL_MAX_PAIR_CEREMONY_BYTES` = 64 KiB so а fixed-size buffer
- * always fits the Cert).  `out_oob_6` MUST point к а 6-byte buffer.
+ * `VEIL_MAX_PAIR_CEREMONY_BYTES` = 64 KiB so a fixed-size buffer
+ * always fits the Cert).  `out_oob_6` MUST point to a 6-byte buffer.
  */
 
 int veil_pair_source_handle_hello(VeilHandle *handle,
@@ -1288,8 +1288,8 @@ int veil_pair_source_handle_hello(VeilHandle *handle,
  * Source-side: process Confirm bytes — finalizes the ceremony.
  *
  * Phase 6.49 exemplar: uses [`guard::ffi_prelude`] + [`null_check!`]
- * for the boundary checks так that the consistent error messages
- * land на every FFI fn after incremental migration.
+ * for the boundary checks so that the consistent error messages
+ * land on every FFI fn after incremental migration.
  */
 
 int veil_pair_source_handle_confirm(VeilHandle *handle,
@@ -1327,7 +1327,7 @@ int veil_pair_target_handle_cert(VeilHandle *handle,
 ;
 
 /**
- * Target-side: emit Confirm bytes based на user's OOB-compare
+ * Target-side: emit Confirm bytes based on user's OOB-compare
  * decision.  `confirmed = 1` triggers identity persistence.
  */
 

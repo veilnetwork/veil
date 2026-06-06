@@ -20,29 +20,29 @@ pub trait DnsResolver: Send + Sync {
     /// Resolve `host:port` into a list of socket addresses.
     fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, Result<Vec<SocketAddr>>>;
 
-    /// **Этап 10 slice 3** — query the HTTPS RR (RFC 9460) for `host`
-    /// и extract the `ech` SvcParamValue если present.  Returned bytes
+    /// **Stage 10 slice 3** — query the HTTPS RR (RFC 9460) for `host`
+    /// and extract the `ech` SvcParamValue if present.  Returned bytes
     /// are the raw `EchConfigList` payload suitable for
     /// `rustls::client::EchConfig::new(EchConfigListBytes::from(...),
     /// ALL_SUPPORTED_SUITES)`.
     ///
-    /// Returns `None` если no HTTPS record exists, no `ech` SvcParamKey
-    /// is present, или the lookup fails for any reason.  The caller
+    /// Returns `None` if no HTTPS record exists, no `ech` SvcParamKey
+    /// is present, or the lookup fails for any reason.  The caller
     /// (typically [`crate::tls::connect_pki_verified_https_stream`])
-    /// treats а `None` return as "fall back к ECH GREASE" — failures
-    /// here ара NOT propagated as errors so transient DNS hiccups do
+    /// treats a `None` return as "fall back to ECH GREASE" — failures
+    /// here are NOT propagated as errors so transient DNS hiccups do
     /// not break bootstrap fetches.
     ///
     /// Default implementation returns `None` (the trait stays backwards-
-    /// compatible с custom resolvers що don't implement HTTPS RR queries).
+    /// compatible with custom resolvers that don't implement HTTPS RR queries).
     fn resolve_https_ech<'a>(&'a self, _host: &'a str) -> BoxFuture<'a, Option<Vec<u8>>> {
         Box::pin(async { None })
     }
 }
 
 /// Default resolver that defers to the OS resolver via `tokio::net::lookup_host`
-/// for А/AAAA queries и а static hickory resolver for HTTPS RR queries
-/// (HTTPS records ара not exposed by `tokio::net::lookup_host`).
+/// for A/AAAA queries and a static hickory resolver for HTTPS RR queries
+/// (HTTPS records are not exposed by `tokio::net::lookup_host`).
 #[derive(Debug, Default)]
 pub struct SystemDnsResolver;
 
@@ -200,60 +200,60 @@ pub struct TransportContext {
     /// masquerade against an on-path DPI. Veil's cert verifier is custom
     /// (node_id binding), so SNI value does not affect cert validation.
     pub default_sni: Option<String>,
-    /// Pre-shared key для obfs4-tcp transport.  When bound на а listener,
-    /// server uses this к verify incoming client MACs. When dialing
-    /// out, client uses it к build the handshake MAC.  None disables
-    /// obfs4 transport.  Phase 3-interim: single PSK для all peers;
-    /// per-peer PSK lookup via `transport_hints` is а follow-up.
+    /// Pre-shared key for obfs4-tcp transport.  When bound on a listener,
+    /// server uses this to verify incoming client MACs. When dialing
+    /// out, client uses it to build the handshake MAC.  None disables
+    /// obfs4 transport.  Phase 3-interim: single PSK for all peers;
+    /// per-peer PSK lookup via `transport_hints` is a follow-up.
     pub obfs4_psk: Option<Arc<[u8; 32]>>,
     /// Webtunnel secret path (e.g. `/_t/random-32-chars`).  When set,
     /// `webtunnel+wss://` transport's server-side matcher will activate
-    /// tunnel mode only для requests с this exact path.  None disables
+    /// tunnel mode only for requests with this exact path.  None disables
     /// the webtunnel transport.
     pub webtunnel_secret_path: Option<String>,
-    /// Webtunnel auth-header token (sent в `X-Veil-Auth` header).
+    /// Webtunnel auth-header token (sent in `X-Veil-Auth` header).
     /// Additional credential checked alongside the secret path.
     /// None = path-only mode.
     pub webtunnel_auth_token: Option<Arc<Vec<u8>>>,
-    /// Webtunnel decoy directory (path on disk к static content served
-    /// для non-tunnel-mode requests).  None defaults к а minimal
-    /// `StaticStringDecoy` що returns "<h1>Welcome</h1>".  Operators
-    /// should set к а realistic static-site snapshot.
+    /// Webtunnel decoy directory (path on disk to static content served
+    /// for non-tunnel-mode requests).  None defaults to a minimal
+    /// `StaticStringDecoy` that returns "<h1>Welcome</h1>".  Operators
+    /// should set to a realistic static-site snapshot.
     pub webtunnel_decoy_dir: Option<std::path::PathBuf>,
 
     /// SOCKS proxy URL used as outbound-dial **fallback** when direct
     /// transport fails.  Set via `[transport] outbound_socks_fallback_proxy`
-    /// в config.  Default `None` keeps outbound direct-only.  Format
+    /// in config.  Default `None` keeps outbound direct-only.  Format
     /// example: `socks5://127.0.0.1:9050` (local Tor SOCKS).  Consumed
     /// by the runtime's `socks_fallback_dial` helper.
     pub outbound_socks_fallback_proxy: Option<String>,
 
     /// **Phase 2 kill-switch — server-side**: list of obfs4 wire-format
-    /// variants the listener accepts, в priority order.  Default `&[V1]`
+    /// variants the listener accepts, in priority order.  Default `&[V1]`
     /// preserves pre-Phase-2 behavior bit-for-bit.  Operators set via
-    /// `[transport] obfs4_accept_variants = ["v2", "v1"]` during а
-    /// V1→V2 migration; once все clients upgraded, drop к `["v2"]` к
+    /// `[transport] obfs4_accept_variants = ["v2", "v1"]` during a
+    /// V1→V2 migration; once all clients upgraded, drop to `["v2"]` to
     /// cut off V1.
     pub obfs4_accept_variants: Vec<veil_obfs4::WireFormatVariant>,
 
     /// **Phase 2 kill-switch — client-side**: obfs4 wire-format
-    /// variant used для outbound obfs4-tcp connects.  Default `V1`.
+    /// variant used for outbound obfs4-tcp connects.  Default `V1`.
     /// Operators set via `[transport] obfs4_client_variant = "v2"`
-    /// only after **all** target servers в the cluster have accept_variants
-    /// що includes V2 (otherwise outbound connects silent-drop).
+    /// only after **all** target servers in the cluster have accept_variants
+    /// that includes V2 (otherwise outbound connects silent-drop).
     pub obfs4_client_variant: veil_obfs4::WireFormatVariant,
 
-    /// **Этап 10 slice 2b** — wire TLS ECH GREASE into outbound public-
+    /// **Stage 10 slice 2b** — wire TLS ECH GREASE into outbound public-
     /// PKI HTTPS connections (currently the bootstrap fetch path).
-    /// Plumbed от `GlobalConfig.tls_ech_grease` via
+    /// Plumbed from `GlobalConfig.tls_ech_grease` via
     /// `transport_glue::context_from_config`.  When `true`,
     /// [`connect_pki_verified_https_stream`] builds the `ClientConfig`
-    /// с `.with_ech(EchMode::Grease(...))` — adds an ECH GREASE
-    /// extension к the ClientHello, defeating middlebox fingerprinting
-    /// що distinguishes ECH-capable от non-ECH connections.
+    /// with `.with_ech(EchMode::Grease(...))` — adds an ECH GREASE
+    /// extension to the ClientHello, defeating middlebox fingerprinting
+    /// that distinguishes ECH-capable from non-ECH connections.
     ///
     /// Default `false` (slice 2b — opt-in).  Slice 2c will flip the
-    /// `GlobalConfig` default к `true`.
+    /// `GlobalConfig` default to `true`.
     pub tls_ech_grease: bool,
 
     /// Runtime TLS ClientHello fingerprint policy for outbound `tls://` /
@@ -357,10 +357,10 @@ impl TransportContext {
         self
     }
 
-    /// **Этап 10 slice 2b** — enable TLS ECH GREASE на outbound
-    /// public-PKI HTTPS connections.  See the field doc на
-    /// `tls_ech_grease` для the threat model и [`connect_pki_verified_https_stream`]
-    /// для the call-site wiring.
+    /// **Stage 10 slice 2b** — enable TLS ECH GREASE on outbound
+    /// public-PKI HTTPS connections.  See the field doc on
+    /// `tls_ech_grease` for the threat model and [`connect_pki_verified_https_stream`]
+    /// for the call-site wiring.
     #[must_use]
     pub fn with_tls_ech_grease(mut self, enabled: bool) -> Self {
         self.tls_ech_grease = enabled;
@@ -621,14 +621,14 @@ fn build_client_config(
     // bundle Mozilla's CA roots
     // when the operator opts in via config. Was originally gated on
     // the `tls-webpki-roots` feature, but `webpki-roots` is now always
-    // а direct dependency of `veil-transport` (the HTTPS-bootstrap
+    // a direct dependency of `veil-transport` (the HTTPS-bootstrap
     // and signed-update fetch paths require Web PKI verification
-    // regardless of feature flags). Keeping the cfg-gate was а silent
+    // regardless of feature flags). Keeping the cfg-gate was a silent
     // config footgun — operators setting `use_system_roots = true`
-    // got nothing without the build flag and only а warn log. Now
+    // got nothing without the build flag and only a warn log. Now
     // the config knob unconditionally controls behaviour; the
-    // `tls-webpki-roots` feature is а semver-stable no-op kept for
-    // existing build configs (scheduled for removal in а semver-major).
+    // `tls-webpki-roots` feature is a semver-stable no-op kept for
+    // existing build configs (scheduled for removal in a semver-major).
     if include_system_roots {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }

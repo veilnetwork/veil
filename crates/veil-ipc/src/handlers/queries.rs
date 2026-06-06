@@ -1,15 +1,15 @@
 //! Read-only IPC query handlers.
 //!
-//! All five handlers gate на the per-connection `allow_query` rate
-//! limiter so а sandboxed-but-IPC-capable adversary can't spam fast
-//! enough к reconstruct peer-graph snapshots or amplify outbound DNS-TXT
+//! All five handlers gate on the per-connection `allow_query` rate
+//! limiter so a sandboxed-but-IPC-capable adversary can't spam fast
+//! enough to reconstruct peer-graph snapshots or amplify outbound DNS-TXT
 //! lookups (the JoinBootstrapUri path).  When the bucket is empty the
 //! request is silently dropped — silent drop avoids making the limit
-//! itself а probing oracle.
+//! itself a probing oracle.
 //!
-//! Without а wired provider / sink, each handler replies с а sensible
+//! Without a wired provider / sink, each handler replies with a sensible
 //! default (empty list / zero-state payload / `INTERNAL_ERROR`) so apps
-//! see "feature off" cleanly rather than а protocol error.
+//! see "feature off" cleanly rather than a protocol error.
 
 use std::sync::Arc;
 
@@ -43,9 +43,9 @@ pub(crate) async fn handle_lookup_rendezvous_replicas(
     client_state: &mut IpcClientState,
     rendezvous_resolver: Option<&Arc<dyn RendezvousReplicaResolver>>,
 ) -> std::io::Result<()> {
-    // App asks daemon к resolve K candidate mailbox-relays for а
+    // App asks daemon to resolve K candidate mailbox-relays for a
     // receiver.  Daemon does the DHT lookup + verification; reply carries
-    // up к `min(MAX_RENDEZVOUS_REPLICAS, request.max_replicas)` verified
+    // up to `min(MAX_RENDEZVOUS_REPLICAS, request.max_replicas)` verified
     // entries.  Empty list = DHT miss / no fresh ad / verification failed.
     if !client_state.allow_query() {
         return Ok(());
@@ -118,14 +118,14 @@ pub(crate) async fn handle_get_peers(
     if !client_state.allow_query() {
         return Ok(());
     }
-    // Without а provider, replies an empty list — apps see "0 peers"
-    // cleanly rather than а protocol error.
+    // Without a provider, replies an empty list — apps see "0 peers"
+    // cleanly rather than a protocol error.
     let mut payload = peer_list_provider
         .map(|p| p.list_peers())
         .unwrap_or_default();
-    // Defensive trim — provider should respect the cap но а bug or race
+    // Defensive trim — provider should respect the cap but a bug or race
     // could push past it.  Truncating ("first N peers") beats failing
-    // the encode и surfacing а confusing IPC error.
+    // the encode and surfacing a confusing IPC error.
     if payload.peers.len() > veil_proto::MAX_PEERS_LIST_ENTRIES {
         payload.peers.truncate(veil_proto::MAX_PEERS_LIST_ENTRIES);
     }
@@ -148,11 +148,11 @@ pub(crate) async fn handle_pnet_status_query(
         return Ok(());
     }
     // Query body is just the 32-byte peer_node_id.  Malformed bodies →
-    // not-admitted reply (apps still get а correlated correlation_id'd
+    // not-admitted reply (apps still get a correlated correlation_id'd
     // result; no protocol error).
     let peer_node_id: [u8; 32] = body.try_into().unwrap_or_default();
-    // Without а provider, all queries reply admitted=false / has_cert=false.
-    // Apps в strict p_net mode treat this as "no daemon support" → reject.
+    // Without a provider, all queries reply admitted=false / has_cert=false.
+    // Apps in strict p_net mode treat this as "no daemon support" → reject.
     let payload = pnet_status_provider
         .map(|p| p.peer_status(&peer_node_id))
         .unwrap_or_else(|| veil_proto::PnetStatusResultPayload {
@@ -180,8 +180,8 @@ pub(crate) async fn handle_get_mobile_status(
     if !client_state.allow_query() {
         return Ok(());
     }
-    // Without а provider, replies а default zero-state payload — apps
-    // see "feature off" rather than а protocol error.
+    // Without a provider, replies a default zero-state payload — apps
+    // see "feature off" rather than a protocol error.
     let payload =
         mobile_status_provider
             .map(|p| p.mobile_status())
@@ -210,12 +210,12 @@ pub(crate) async fn handle_join_bootstrap_uri(
     bootstrap_join_sink: Option<&Arc<dyn BootstrapJoinSink>>,
 ) -> std::io::Result<()> {
     // JoinBootstrap is heavier (DNS-TXT lookups, signed-invite verification)
-    // so the cap also bounds outbound network amplification from а
+    // so the cap also bounds outbound network amplification from a
     // misbehaving local app.
     if !client_state.allow_query() {
         return Ok(());
     }
-    // Wire-format errors map к `INVALID_URI` с the proto error as detail.
+    // Wire-format errors map to `INVALID_URI` with the proto error as detail.
     let req = match JoinBootstrapPayload::decode(body) {
         Ok(r) => r,
         Err(e) => {
@@ -289,7 +289,7 @@ pub(crate) async fn handle_join_bootstrap_uri(
             detail: b"bootstrap-join sink not wired".to_vec(),
         }
     };
-    // Truncate detail in case sink emitted а very long error message
+    // Truncate detail in case sink emitted a very long error message
     // (avoids accidentally exceeding wire cap).
     if payload.detail.len() > MAX_JOIN_DETAIL_LEN {
         payload.detail.truncate(MAX_JOIN_DETAIL_LEN);
@@ -305,8 +305,8 @@ pub(crate) async fn handle_join_bootstrap_uri(
 
 /// Handler [`LocalAppMsg::CreateBootstrapInvite`] (Epic 489.7
 /// generator side).  Reads optional password from the payload,
-/// invokes the sink к assemble + encode the invite, и returns the
-/// resulting URI на success или а status-coded error.
+/// invokes the sink to assemble + encode the invite, and returns the
+/// resulting URI on success or a status-coded error.
 pub(crate) async fn handle_create_bootstrap_invite(
     wh: &mut IpcWriteHalf,
     body: &[u8],
@@ -314,7 +314,7 @@ pub(crate) async fn handle_create_bootstrap_invite(
     invite_create_sink: Option<&Arc<dyn BootstrapInviteCreateSink>>,
 ) -> std::io::Result<()> {
     // Same rate-limit class as JoinBootstrap — invite encoding is
-    // cheap но encryption variant adds Argon2id which would let а
+    // cheap but encryption variant adds Argon2id which would let a
     // misbehaving app pin CPU. Gate it consistently.
     if !client_state.allow_query() {
         return Ok(());
@@ -370,7 +370,7 @@ pub(crate) async fn handle_create_bootstrap_invite(
         }
     };
     if payload.uri.len() > MAX_CREATE_INVITE_URI_LEN {
-        // Should never happen (sink contract); clip и report.
+        // Should never happen (sink contract); clip and report.
         payload.status = create_invite_status::INTERNAL_ERROR;
         payload.detail = format!(
             "encoded URI {}B exceeds MAX_CREATE_INVITE_URI_LEN ({MAX_CREATE_INVITE_URI_LEN})",
@@ -393,7 +393,7 @@ pub(crate) async fn handle_create_bootstrap_invite(
 
 // ── Multi-device pairing handlers (Epic 489.8) ─────────────────
 
-/// Truncate detail к the wire cap to prevent oversized payloads.
+/// Truncate detail to the wire cap to prevent oversized payloads.
 fn clip_pair_detail(v: &mut Vec<u8>) {
     if v.len() > MAX_PAIR_DETAIL_LEN {
         v.truncate(MAX_PAIR_DETAIL_LEN);

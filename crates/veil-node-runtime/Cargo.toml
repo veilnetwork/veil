@@ -2,14 +2,14 @@
 name = "veil-node-runtime"
 version = "0.1.0"
 edition = "2024"
-description = "OVL1 node runtime — orchestration layer wiring dispatcher + session + DHT + identity + admin into а running daemon. Phase 4 of veilcore extraction."
+description = "OVL1 node runtime — orchestration layer wiring dispatcher + session + DHT + identity + admin into a running daemon. Phase 4 of veilcore extraction."
 license = "AGPL-3.0-or-later"
 
 [features]
 # Forward upstream feature flags so cargo's `unexpected_cfgs` lint sees them
-# as declared в this crate (Phase 4 extraction moved the `cfg!(feature)` /
+# as declared in this crate (Phase 4 extraction moved the `cfg!(feature)` /
 # `#[cfg(feature)]` call sites here but the features stayed at the source
-# crates).  Each entry cascades through к the source declaration so enabling
+# crates).  Each entry cascades through to the source declaration so enabling
 # `--features production-seeds` on veil-node-runtime activates the same
 # behaviour as enabling it on veil-bootstrap directly.
 production-seeds = ["veil-bootstrap/production-seeds"]

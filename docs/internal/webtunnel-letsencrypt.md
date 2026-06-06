@@ -18,7 +18,7 @@ The new `deploy-webtunnel-autotls.yml` puts Caddy in front:
                 │  Caddy on :443 (public)                  │
                 │    – Let's Encrypt cert (auto-renewing)  │
                 │    – Multi-page decoy site               │
-   public  ───→ │    – reverse_proxy /_t/<secret>* к 127.0.0.1:18443
+   public  ───→ │    – reverse_proxy /_t/<secret>* to 127.0.0.1:18443
                 └──────────────────────────────────────────┘
                                   │
                                   ▼
@@ -84,7 +84,7 @@ Where to stage replacements:
 cp my-real-site/* ansible/templates/
 mv ansible/templates/index.html ansible/templates/decoy-index.html.j2
 mv ansible/templates/about.html ansible/templates/decoy-about.html.j2
-# Add Jinja2 variable interpolation для `{{ veil_host }}` etc.
+# Add Jinja2 variable interpolation for `{{ veil_host }}` etc.
 ansible-playbook -i inventory.yml deploy-webtunnel-autotls.yml --limit b1
 ```
 
@@ -124,7 +124,7 @@ ssh root@<host> 'journalctl -u veil.service --since "5 minutes ago" | tail -50'
 # Check the resolved DNS:
 ssh root@<host> 'getent hosts <veil_host>'
 
-# Manual cert-issuance test (от the host itself):
+# Manual cert-issuance test (from the host itself):
 ssh root@<host> 'curl -fsS https://<veil_host>/.well-known/acme-challenge/foo'
 ```
 

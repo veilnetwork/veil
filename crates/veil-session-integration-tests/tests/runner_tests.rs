@@ -1,9 +1,9 @@
-// Phase D14 extraction (2026-05-22): this file was previously а
-// `mod runner_tests;` под veilcore/src/node/session/.  It now lives
-// в the standalone `veil-session-integration-tests` crate и imports
-// surface от sibling crates directly — `runner::*` and `crate::node::*`
-// wildcards replaced с explicit named imports так что the test file
-// pins к the published API и no longer regresses if veil-session
+// Phase D14 extraction (2026-05-22): this file was previously a
+// `mod runner_tests;` under veilcore/src/node/session/.  It now lives
+// in the standalone `veil-session-integration-tests` crate and imports
+// surface from sibling crates directly — `runner::*` and `crate::node::*`
+// wildcards replaced with explicit named imports so that the test file
+// pins to the published API and no longer regresses if veil-session
 // internals shuffle.
 
 use std::sync::{Arc, Mutex, RwLock};
@@ -20,16 +20,16 @@ use veil_proto::{
 };
 use veil_transport::BoxIoStream;
 
-// Surface-wide pull от veil-session так что все runner-private items
-// (jitter_keepalive_interval, apply_tx_cipher, MAX_MOBILE_*, и т.д.)
-// resolve без prefixing each call-site.  Same effective scope as the
+// Surface-wide pull from veil-session so that all runner-private items
+// (jitter_keepalive_interval, apply_tx_cipher, MAX_MOBILE_*, etc.)
+// resolve without prefixing each call-site.  Same effective scope as the
 // previous `use runner::*;` (veilcore's session/mod.rs re-exported
 // `veil_session::*` + `veil_session::runner::*`).
 use veil_session::runner::*;
 use veil_session::*;
 
 use veil_node_runtime::types::NodeId;
-// `NodeIdBytes` lives в veil-types post-Phase-2-session-2; explicit
+// `NodeIdBytes` lives in veil-types post-Phase-2-session-2; explicit
 // import keeps the test surface portable.
 use veil_types::NodeIdBytes;
 
@@ -117,7 +117,7 @@ fn epic488_4_keepalive_jitter_uses_most_of_range() {
     // tightly around mean (e.g., a buggy implementation accidentally
     // reduced the spread to ±5%), DPI sees less effective masking
     // than intended. After 1000 draws of a uniform [0.7, 1.3]
-    // distribution, P[no draw в outermost 5% on either side] is
+    // distribution, P[no draw in outermost 5% on either side] is
     // (0.95)^1000 ≈ 5e-23 — essentially zero false fail.
     let base = std::time::Duration::from_millis(10_000);
     let mut min_ms = u64::MAX;
@@ -162,7 +162,7 @@ fn epic488_4_keepalive_jitter_no_autocorrelation_at_lag_1() {
     let r = cov / var;
     assert!(
         r.abs() < 0.05,
-        "autocorrelation at lag 1 = {r:.4}; should be |r| < 0.05 для \
+        "autocorrelation at lag 1 = {r:.4}; should be |r| < 0.05 for \
          independent samples — non-zero correlation suggests RNG seeded \
          constant or jitter formula reusing entropy",
     );
@@ -176,7 +176,7 @@ fn epic488_4_keepalive_jitter_distribution_approximately_uniform() {
     // truly uniform, expected = 1000 per bucket; std error ~32.
     // ±15% tolerance (= ±150) gives essentially zero false-fail
     // while catching skewed distributions (e.g., gaussian-shape
-    // would cluster в middle buckets, missing extreme buckets).
+    // would cluster in middle buckets, missing extreme buckets).
     let base_ms = 10_000.0;
     let n = 6_000;
     let mut buckets = [0u32; 6];
@@ -186,7 +186,7 @@ fn epic488_4_keepalive_jitter_distribution_approximately_uniform() {
         let scale = m / base_ms; // expected [0.7, 1.3]
         // Bucket by 0.1-wide windows starting at 0.7.
         let bucket_f = ((scale - 0.7) / 0.1).floor() as i64;
-        // Clamp [0, 5] so the rare upper-edge value 1.3 lands в bucket 5.
+        // Clamp [0, 5] so the rare upper-edge value 1.3 lands in bucket 5.
         let bucket = bucket_f.clamp(0, 5) as usize;
         buckets[bucket] += 1;
     }
@@ -491,7 +491,7 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
 /// the responder-side rx_cipher_prev fallback for in-flight OLD-encrypted
 /// frames (frames the initiator queued BEFORE receiving RekeyAck).
 ///
-/// Pre-fix: stale-OLD frame would fail с new rx_cipher → trigger
+/// Pre-fix: stale-OLD frame would fail with new rx_cipher → trigger
 /// `session.violation` → close session. Post-fix: stale-OLD decrypts via
 /// rx_cipher_prev, session continues, no violation recorded.
 ///
@@ -513,8 +513,8 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
     let initial_rx = [0x22u8; 32]; // responder → initiator
     let initial_session_id = [0x33u8; 32];
 
-    // Both runners build с is_tx=true on direction-specific keys.
-    // Client (initiator) tx maps к server rx и vice versa.
+    // Both runners build with is_tx=true on direction-specific keys.
+    // Client (initiator) tx maps to server rx and vice versa.
     let mut client_tx = SessionCipher::new(&initial_tx, true);
     let mut client_rx = SessionCipher::new(&initial_rx, true);
 
@@ -584,7 +584,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
 
     let server_task = tokio::spawn(async move { runner.run().await });
 
-    // ── Step 1: client → RekeyInit (encrypted с OLD client_tx) ──────────
+    // ── Step 1: client → RekeyInit (encrypted with OLD client_tx) ──────────
     // Both sides need each other's pubkey to derive shared secret.
     let client_kp = kex::generate_ephemeral();
     let client_pubkey = client_kp.public_key;
@@ -603,9 +603,9 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
         client.write_all(&enc_init).await.unwrap();
     }
 
-    // ── Step 2: client reads RekeyAck (encrypted с OLD server_tx) ──────
-    // Server's RekeyInit handler: derives keys, sends Ack с OLD tx
-    // THEN switches both tx и rx к NEW (with rx_cipher_prev=OLD stashed).
+    // ── Step 2: client reads RekeyAck (encrypted with OLD server_tx) ──────
+    // Server's RekeyInit handler: derives keys, sends Ack with OLD tx
+    // THEN switches both tx and rx to NEW (with rx_cipher_prev=OLD stashed).
     let mut hdr_buf = [0u8; HEADER_SIZE];
     client
         .read_exact(&mut hdr_buf)
@@ -628,23 +628,23 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
 
     // ── Step 3: derive new keys ─────────────────────────────────────────
     // Client side derivation (peer_id arguments swapped because
-    // derive_rekey_keys keys по who-sees-whom; here client's
-    // local_node_id is server's peer_id и vice versa).
+    // derive_rekey_keys keys by who-sees-whom; here client's
+    // local_node_id is server's peer_id and vice versa).
     let shared = kex::compute_shared_secret(client_kp, &server_pubkey)
         .expect("contributory X25519 shared secret");
     let client_new_keys =
         session_kdf::derive_rekey_keys(&shared, &initial_session_id, &peer_id, &local_id);
     // CRITICALLY: do NOT switch client_tx to NEW yet. We're simulating
     // the in-flight scenario where initiator queued a frame BEFORE
-    // receiving Ack. In this fake test we already received Ack но
-    // queued frames that were sealed earlier с OLD tx.
+    // receiving Ack. In this fake test we already received Ack but
+    // queued frames that were sealed earlier with OLD tx.
     let mut client_rx_new = SessionCipher::new(&client_new_keys.rx_key, true);
 
-    // ── Step 4: send a Ping encrypted с OLD client_tx (in-flight sim) ───
+    // ── Step 4: send a Ping encrypted with OLD client_tx (in-flight sim) ───
     // Pre-fix: server side would AEAD-fail (NEW rx, OLD ciphertext)
     // → record_violation → close session.
-    // Post-fix: server tries NEW rx → fail → falls back к rx_cipher_prev (OLD)
-    // → succeeds → enqueues Pong → drains Pong с NEW tx.
+    // Post-fix: server tries NEW rx → fail → falls back to rx_cipher_prev (OLD)
+    // → succeeds → enqueues Pong → drains Pong with NEW tx.
     let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     let enc_stale_ping = client_tx.seal(&[], &ping_aad).expect("seal stale Ping");
     {
@@ -654,7 +654,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
         client.write_all(&enc_stale_ping).await.unwrap();
     }
 
-    // ── Step 5: read Pong (encrypted с NEW server_tx) ───────────────────
+    // ── Step 5: read Pong (encrypted with NEW server_tx) ───────────────────
     let mut pong_hdr_buf = [0u8; HEADER_SIZE];
     let read_result = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -687,7 +687,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
     }
 
     // ── Step 6: post-grace, NEW path keeps working ──────────────────────
-    // Client switches к NEW tx and sends another Ping. Server's NEW rx
+    // Client switches to NEW tx and sends another Ping. Server's NEW rx
     // counter has remained at 1 (only stale-fallback decrypts advance OLD).
     let mut client_tx_new = SessionCipher::new(&client_new_keys.tx_key, true);
     let enc_new_ping = client_tx_new.seal(&[], &ping_aad).expect("seal NEW Ping");
@@ -733,11 +733,11 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
 }
 
 /// 6.33 visibility-slice regression guard: walks one rekey
-/// round-trip + а stale-OLD-frame recovery, and asserts that the new
+/// round-trip + a stale-OLD-frame recovery, and asserts that the new
 /// per-stage counters incremented exactly the expected amounts. Pairs
-/// с `runner_rekey_grace_recovers_inflight_old_encrypted_frames`
+/// with `runner_rekey_grace_recovers_inflight_old_encrypted_frames`
 /// (which proves the fix works) — this test proves the **observability
-/// signal** also fires. Without it а silent regression in the inc_*
+/// signal** also fires. Without it a silent regression in the inc_*
 /// hooks would leave operators blind during the next incident.
 #[tokio::test]
 async fn runner_rekey_emits_observability_counters() {
@@ -839,7 +839,7 @@ async fn runner_rekey_emits_observability_counters() {
         client.write_all(&enc_init).await.unwrap();
     }
 
-    // Step 2: client reads server's RekeyAck (encrypted с OLD server tx)
+    // Step 2: client reads server's RekeyAck (encrypted with OLD server tx)
     let mut hdr_buf = [0u8; HEADER_SIZE];
     client
         .read_exact(&mut hdr_buf)
@@ -859,14 +859,14 @@ async fn runner_rekey_emits_observability_counters() {
     let server_pubkey = ack_payload.ephemeral_pubkey;
 
     // Step 3: derive new keys (client side) — same XOR keying as the
-    // peer test above (client's local_node_id == server's peer_id и
-    // vice versa, so swap arguments к match server-side derivation).
+    // peer test above (client's local_node_id == server's peer_id and
+    // vice versa, so swap arguments to match server-side derivation).
     let shared = kex::compute_shared_secret(client_kp, &server_pubkey)
         .expect("contributory X25519 shared secret");
     let _client_new_keys =
         session_kdf::derive_rekey_keys(&shared, &initial_session_id, &peer_id, &local_id);
 
-    // Step 4: client sends а stale Ping encrypted с OLD tx — exercises
+    // Step 4: client sends a stale Ping encrypted with OLD tx — exercises
     // the rx_cipher_prev fallback path on the server (decrypt_fallback
     // counter must inc; decrypt_failures counter must NOT).
     use veil_proto::family::ControlMsg;
@@ -898,7 +898,7 @@ async fn runner_rekey_emits_observability_counters() {
 
     // ── Counter assertions ──────────────────────────────────────────────
     let snap = metrics.snapshot();
-    // Server processed exactly one RekeyInit и emitted exactly one
+    // Server processed exactly one RekeyInit and emitted exactly one
     // RekeyAck. init_sent / ack_received are zero because this runner
     // is the responder side — server never initiates rekey here
     // (`rekey_bytes_threshold: u64::MAX`).
@@ -920,7 +920,7 @@ async fn runner_rekey_emits_observability_counters() {
     );
     // Stale Ping recovered via prev cipher → fallback +1, terminal
     // failure 0. This is THE -6.33 visibility win — without
-    // this counter оператор could not see the fallback path firing.
+    // this counter operator could not see the fallback path firing.
     assert_eq!(
         snap.rekey_decrypt_fallback_total, 1,
         "stale Ping must be recovered via prev cipher (fallback +1)"
@@ -929,7 +929,7 @@ async fn runner_rekey_emits_observability_counters() {
         snap.decrypt_failures_total, 0,
         "fallback path must NOT increment terminal decrypt_failures"
     );
-    // One rekey ⇒ one prev cipher stashed, fully fits в the cap=16
+    // One rekey ⇒ one prev cipher stashed, fully fits in the cap=16
     // ring buffer ⇒ no premature evictions.
     assert_eq!(
         snap.rekey_grace_cap_evictions_total, 0,
@@ -938,16 +938,16 @@ async fn runner_rekey_emits_observability_counters() {
 }
 
 /// 6.33 visibility-slice storm scenario: drive 17 back-to-back
-/// rekeys against the runner и assert the ring-buffer cap=16 eviction
+/// rekeys against the runner and assert the ring-buffer cap=16 eviction
 /// signal fires exactly once. This is the "smoking gun" early-warning
 /// pattern the dashboard alert keys on (`veil_rekey_grace_cap_evictions_total > 0`):
-/// without test coverage а silent regression в the eviction-detection code
-/// path would leave operators blind к the very condition the new metric
+/// without test coverage a silent regression in the eviction-detection code
+/// path would leave operators blind to the very condition the new metric
 /// was added to surface.
 ///
 /// Storm choreography (per rekey round-trip):
-/// client → RekeyInit → server (server stashes prev OLD rx, switches к NEW)
-/// server → RekeyAck → client (client switches к NEW)
+/// client → RekeyInit → server (server stashes prev OLD rx, switches to NEW)
+/// server → RekeyAck → client (client switches to NEW)
 /// After 16 rounds: ring buffer holds 16 prev ciphers (full).
 /// After 17th round: oldest prev evicted from front ⇒ cap_evict +=1.
 #[tokio::test]
@@ -1034,13 +1034,13 @@ async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
 
     // ── Drive 17 rekey round-trips ─────────────────────────────────────
     // After 16 of them, the server's `rx_cipher_prev` ring buffer is at
-    // capacity (16). The 17th rekey forces а front-pop ⇒ exactly one
+    // capacity (16). The 17th rekey forces a front-pop ⇒ exactly one
     // `rekey_grace_cap_evictions_total` increment.
     for round in 0..17u8 {
         let client_kp = kex::generate_ephemeral();
         let client_pubkey = client_kp.public_key;
 
-        // Client → RekeyInit (encrypted с current client_tx).
+        // Client → RekeyInit (encrypted with current client_tx).
         let init_body = RekeyPayload {
             ephemeral_pubkey: client_pubkey,
         }
@@ -1057,9 +1057,9 @@ async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
             client.write_all(&enc_init).await.unwrap();
         }
 
-        // Client ← RekeyAck (encrypted с current server tx — which is
+        // Client ← RekeyAck (encrypted with current server tx — which is
         // current client rx since the cipher state is symmetric on
-        // duplex). Read с timeout so а deadlocked storm is loud rather
+        // duplex). Read with timeout so a deadlocked storm is loud rather
         // than CI-hanging.
         let mut hdr_buf = [0u8; HEADER_SIZE];
         tokio::time::timeout(
@@ -1084,7 +1084,7 @@ async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
             RekeyPayload::decode(&plain_ack).unwrap_or_else(|_| panic!("decode Ack round={round}"));
 
         // Derive new keys. Argument order mirrors the existing
-        // `runner_rekey_grace_recovers_*` helper — peer_id и local_id
+        // `runner_rekey_grace_recovers_*` helper — peer_id and local_id
         // are swapped because keys are derived from each side's view.
         let shared = kex::compute_shared_secret(client_kp, &ack_payload.ephemeral_pubkey)
             .expect("contributory X25519 shared secret");
@@ -1117,7 +1117,7 @@ async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
          higher would mean ring ran beyond expected geometry, lower \
          would mean cap-evict detection silently regressed"
     );
-    // No fallback decrypts — we never sent а stale frame across а
+    // No fallback decrypts — we never sent a stale frame across a
     // rekey boundary. This isolates the cap-evict signal from the
     // unrelated fallback signal.
     assert_eq!(
@@ -1130,25 +1130,25 @@ async fn runner_rekey_storm_triggers_cap_eviction_once_after_four_rekeys() {
     );
 }
 
-/// gate-tests helper: read the next frame header от
+/// gate-tests helper: read the next frame header from
 /// the wire, skipping any `SessionMsg::Padding` frames emitted by
 /// the runner's TLS-bucket coalescing (`coalesce_with_padding`
-/// `runner.rs:1013`). Padding frames are discarded silently by а
+/// `runner.rs:1013`). Padding frames are discarded silently by a
 /// real receiver (`runner.rs:2402`); test clients must mirror that
 /// behaviour else they'll see Padding instead of the next real
 /// frame. Critically, the test must ALSO advance its rx_cipher
-/// counter when consuming а Padding body — а Padding frame was
+/// counter when consuming a Padding body — a Padding frame was
 /// sealed by the server's tx_cipher (advancing the AEAD counter)
-/// so the test's client_rx counter must follow в lockstep else
-/// subsequent real-frame decrypts will fail с counter mismatch.
+/// so the test's client_rx counter must follow in lockstep else
+/// subsequent real-frame decrypts will fail with counter mismatch.
 ///
 /// **Important:** this helper drains LEADING Padding before the next
 /// real frame. TRAILING Padding (emitted in the same wire batch as
 /// the real frame) remains in the channel until the NEXT helper
 /// invocation drains it as leading. If the cipher changes between
 /// real-frame N's trailing Padding and real-frame N+1 (e.g. across
-/// а rekey boundary), the caller must explicitly call
-/// [`drain_trailing_padding`] с the OLD cipher after decrypting
+/// a rekey boundary), the caller must explicitly call
+/// [`drain_trailing_padding`] with the OLD cipher after decrypting
 /// frame N's body to avoid feeding OLD-cipher Padding bytes to the
 /// NEW-cipher rx during frame N+1's leading-drain.
 async fn read_non_padding_header<R: tokio::io::AsyncRead + Unpin>(
@@ -1168,7 +1168,7 @@ async fn read_non_padding_header<R: tokio::io::AsyncRead + Unpin>(
             .unwrap_or_else(|_| panic!("{what}: header timeout"))
             .unwrap_or_else(|e| panic!("{what}: header read err {e}"));
         let hdr = decode_header(&hdr_buf).unwrap_or_else(|e| panic!("{what}: decode {e:?}"));
-        // Drain Padding-frame bodies but keep going until а real frame.
+        // Drain Padding-frame bodies but keep going until a real frame.
         if hdr.family == FrameFamily::Session as u8 && hdr.msg_type == SessionMsg::Padding as u16 {
             let mut pad = vec![0u8; hdr.body_len as usize];
             client.read_exact(&mut pad).await.unwrap();
@@ -1183,18 +1183,18 @@ async fn read_non_padding_header<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// gate-tests helper: drain а single trailing
+/// gate-tests helper: drain a single trailing
 /// `SessionMsg::Padding` frame using the **current** cipher. Used
-/// when а cipher transition is about to happen и the caller needs
+/// when a cipher transition is about to happen and the caller needs
 /// to consume the previous-cipher trailing Padding before the NEW
 /// cipher takes over rx-decrypt duties.
 ///
-/// Asserts the next header is а Padding frame (deterministic in our
+/// Asserts the next header is a Padding frame (deterministic in our
 /// test setup: every small frame fits below the 1300 B TLS bucket
 /// so coalesce-with-padding always emits exactly one trailing Pad).
-/// If your test setup ever emits а frame at exactly the TLS bucket
+/// If your test setup ever emits a frame at exactly the TLS bucket
 /// size, no padding is appended — see `coalesce_with_padding` line
-/// 1023 — but no rekey-collision frame в these tests reaches that
+/// 1023 — but no rekey-collision frame in these tests reaches that
 /// size.
 async fn drain_trailing_padding<R: tokio::io::AsyncRead + Unpin>(
     client: &mut R,
@@ -1236,32 +1236,32 @@ async fn drain_trailing_padding<R: tokio::io::AsyncRead + Unpin>(
 /// rekey-init collision tie-breaker (commit `d916e3b`).
 ///
 /// When BOTH peers cross the rekey byte-threshold within RTT (~10-20 ms
-/// observed live on testnet b2), each side independently sends а
+/// observed live on testnet b2), each side independently sends a
 /// `RekeyInit` AND receives the peer's `RekeyInit` while own-init is
 /// still in `AwaitingAck`. Without the tie-breaker (commit
-/// `d916e3b`), each side would act as both responder и initiator
-/// deriving DIFFERENT keys (because the responder ephemeral на each
-/// side is generated independently), yielding а terminal AEAD failure
+/// `d916e3b`), each side would act as both responder and initiator
+/// deriving DIFFERENT keys (because the responder ephemeral on each
+/// side is generated independently), yielding a terminal AEAD failure
 /// on the next frame.
 ///
-/// The tie-breaker (`runner.rs:2087-2145`) picks а winner by
+/// The tie-breaker (`runner.rs:2087-2145`) picks a winner by
 /// lexicographic `node_id` comparison: lower node_id keeps own init
-/// higher aborts own и accepts peer's via responder path. Symmetric
+/// higher aborts own and accepts peer's via responder path. Symmetric
 /// — both peers compute the same comparison, so exactly one ends up
 /// as initiator.
 ///
 /// This test exercises the **kept_init** branch: server's
 /// `local_node_id` (0x10) < `peer_id` (0xF0), so server keeps its own
-/// init и drops the peer's RekeyInit. Sequence:
+/// init and drops the peer's RekeyInit. Sequence:
 /// 1. Client sends Ping; server's rx_bytes crosses threshold-1, server
 /// initiates own rekey, sends RekeyInit.
 /// 2. Client reads server's RekeyInit (proves server is in AwaitingAck).
 /// 3. Client sends OWN RekeyInit → server's collision-handler fires;
 /// `kept_init` branch logs and `continue`s.
-/// 4. Client sends а RekeyAck containing the responder ephemeral.
-/// 5. Server processes Ack normally → derives new keys → switches к
+/// 4. Client sends a RekeyAck containing the responder ephemeral.
+/// 5. Server processes Ack normally → derives new keys → switches to
 /// new cipher.
-/// 6. Client + server exchange Ping/Pong с NEW keys → no AEAD violation.
+/// 6. Client + server exchange Ping/Pong with NEW keys → no AEAD violation.
 /// 7. Verify violation count unchanged (pre-d916e3b would be +1).
 #[tokio::test]
 async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
@@ -1271,8 +1271,8 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     use veil_observability::NodeMetrics;
     use veil_proto::session::RekeyPayload;
 
-    // Audit batch 2026-05-24: test asserts а trailing Padding frame
-    // after each rekey wire write, но `coalesce_with_padding` is а
+    // Audit batch 2026-05-24: test asserts a trailing Padding frame
+    // after each rekey wire write, but `coalesce_with_padding` is a
     // no-op when `PADDING_ENABLED` is `false` (default after iperf-
     // throughput regression).  Enable explicitly.  Global state —
     // intentionally NOT restored so concurrent rekey tests share the
@@ -1383,7 +1383,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     }
 
     // ── Step 3: Read server's RekeyInit. Server's tx_bytes is now ≥ 1
-    // от sending the Pong frame → next loop iteration triggers rekey.
+    // from sending the Pong frame → next loop iteration triggers rekey.
     let init_hdr = read_non_padding_header(
         &mut client,
         &mut client_rx,
@@ -1405,13 +1405,13 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     let server_init_payload = RekeyPayload::decode(&plain_init).expect("decode server RekeyInit");
     let server_pubkey = server_init_payload.ephemeral_pubkey;
 
-    // Drain server's RekeyInit trailing Padding с OLD client_rx
-    // BEFORE sending RekeyAck — после server processes our RekeyAck
-    // it switches к NEW tx_cipher, и ANY subsequent helper call с
+    // Drain server's RekeyInit trailing Padding with OLD client_rx
+    // BEFORE sending RekeyAck — after server processes our RekeyAck
+    // it switches to NEW tx_cipher, and ANY subsequent helper call with
     // NEW client_rx_new would see this leftover OLD-cipher Padding
-    // first и DecryptFailed. This is the last OLD-cipher frame
-    // emitted by server в the kept_init flow (server's RekeyAck path
-    // direct-writes без padding в the aborted_init flow, so Test 2
+    // first and DecryptFailed. This is the last OLD-cipher frame
+    // emitted by server in the kept_init flow (server's RekeyAck path
+    // direct-writes without padding in the aborted_init flow, so Test 2
     // doesn't need this drain).
     drain_trailing_padding(
         &mut client,
@@ -1422,9 +1422,9 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     .await;
 
     // ── Step 4: Send OUR own RekeyInit (collision trigger).
-    // Server is currently в AwaitingAck с its OWN init. Receiving ours
-    // while в that state activates the collision-handler. Since
-    // local_node_id (0x10) < peer_id (0xF0), server keeps own init и
+    // Server is currently in AwaitingAck with its OWN init. Receiving ours
+    // while in that state activates the collision-handler. Since
+    // local_node_id (0x10) < peer_id (0xF0), server keeps own init and
     // drops ours (logs "session.rekey.collision.kept_init").
     let our_kp = kex::generate_ephemeral();
     let our_pubkey = our_kp.public_key;
@@ -1445,14 +1445,14 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     client.write_all(&enc_our_init).await.unwrap();
 
     // ── Step 4.5: Consume the server's `RekeyKeptInit` notification.
-    // Added в `993c2fd`: server emits this 0-body session frame
-    // (msg_type=20) AEAD-encrypted с the OLD tx_cipher after the
+    // Added in `993c2fd`: server emits this 0-body session frame
+    // (msg_type=20) AEAD-encrypted with the OLD tx_cipher after the
     // kept_init branch fires, so the peer knows its dropped init won't
-    // ever be ACKed.  Without this, the peer's FSM stays в AwaitingAck
-    // и both sides re-collide near-simul под throughput → rekey storm.
+    // ever be ACKed.  Without this, the peer's FSM stays in AwaitingAck
+    // and both sides re-collide near-simul under throughput → rekey storm.
     //
     // Test must consume this signal frame before sending RekeyAck;
-    // otherwise it surfaces later as the "Pong" Step 7 reads и breaks
+    // otherwise it surfaces later as the "Pong" Step 7 reads and breaks
     // the msg_type assertion (test originally written pre-`993c2fd`).
     let kept_hdr = read_non_padding_header(
         &mut client,
@@ -1478,8 +1478,8 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     // with-padding pad, so no trailing-pad drain needed.)
 
     // ── Step 5: Send RekeyAck containing our_pubkey as responder
-    // ephemeral. Server's `kept_init` branch leaves it в AwaitingAck
-    // waiting для peer's RekeyAck. Our same ephemeral can be reused
+    // ephemeral. Server's `kept_init` branch leaves it in AwaitingAck
+    // waiting for peer's RekeyAck. Our same ephemeral can be reused
     // as the responder ephemeral. Server then derives:
     // shared = ECDH(server_init_kp.private × our_pubkey)
     // We mirror:
@@ -1504,9 +1504,9 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     let mut client_tx_new = SessionCipher::new(&new_keys.tx_key, true);
     let mut client_rx_new = SessionCipher::new(&new_keys.rx_key, true);
 
-    // ── Step 7: Send а Ping с NEW keys; server must respond с Pong
-    // via NEW keys. Если collision wasn't resolved correctly, server
-    // would have switched к а DIFFERENT key set и this Ping would
+    // ── Step 7: Send a Ping with NEW keys; server must respond with Pong
+    // via NEW keys. If collision wasn't resolved correctly, server
+    // would have switched to a DIFFERENT key set and this Ping would
     // AEAD-fail → `record_violation` → no Pong arrives.
     let enc_new_ping = client_tx_new.seal(&[], &ping_aad).expect("seal NEW Ping");
     let mut new_ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
@@ -1549,10 +1549,10 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     );
 
     // Metrics: server received exactly 1 RekeyInit (ours, then dropped
-    // by tie-breaker) и sent ≥1 RekeyInit (own). The post-collision
-    // NEW Ping/Pong round-trip can racily re-tip threshold=1 и trigger
-    // а second rekey before client drops; the tie-breaker correctness
-    // here is "did the FIRST collision resolve без AEAD violation"
+    // by tie-breaker) and sent ≥1 RekeyInit (own). The post-collision
+    // NEW Ping/Pong round-trip can racily re-tip threshold=1 and trigger
+    // a second rekey before client drops; the tie-breaker correctness
+    // here is "did the FIRST collision resolve without AEAD violation"
     // (asserted above), not exact init-sent count under degenerate
     // threshold settings.
     let snap = metrics.snapshot();
@@ -1571,19 +1571,19 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
 /// mutual rekey-init collision — **aborted_init** branch.
 ///
 /// Mirror of the kept_init test above: here `local_node_id` (0xF0) >
-/// `peer_id` (0x10), so server aborts its own init и accepts peer's
-/// via responder path. In this branch the server WILL respond с а
+/// `peer_id` (0x10), so server aborts its own init and accepts peer's
+/// via responder path. In this branch the server WILL respond with a
 /// RekeyAck containing its own freshly-generated responder ephemeral
 /// (since the original AwaitingAck keypair is discarded). Sequence:
 /// 1. Same setup as kept_init test, but local_node_id > peer_id.
 /// 2. Steps 1-3 identical: client sends Ping, reads Pong + server's
 /// RekeyInit.
 /// 3. Client sends OWN RekeyInit → server's `aborted_init` branch
-/// fires; server discards own init keypair, falls through к
-/// responder path с peer's init pubkey.
-/// 4. Server generates fresh responder eph, sends RekeyAck с it.
+/// fires; server discards own init keypair, falls through to
+/// responder path with peer's init pubkey.
+/// 4. Server generates fresh responder eph, sends RekeyAck with it.
 /// 5. Client reads RekeyAck, derives new keys via ECDH(client_init × server_responder).
-/// 6. Client + server exchange Ping/Pong с NEW keys.
+/// 6. Client + server exchange Ping/Pong with NEW keys.
 #[tokio::test]
 async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher() {
     use tokio::io::AsyncReadExt;
@@ -1665,7 +1665,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     };
     let server_task = tokio::spawn(async move { runner.run().await });
 
-    // Steps 1-3: drive server к send its own RekeyInit.
+    // Steps 1-3: drive server to send its own RekeyInit.
     let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     let enc_ping = client_tx.seal(&[], &ping_aad).expect("seal Ping");
     let mut ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
@@ -1704,8 +1704,8 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     let _ = client_rx
         .open(&enc_init_body, &init_aad)
         .expect("decrypt server RekeyInit");
-    // (server's pubkey discarded — server will discard ITS own init и
-    // generate а fresh responder eph in the aborted_init branch.)
+    // (server's pubkey discarded — server will discard ITS own init and
+    // generate a fresh responder eph in the aborted_init branch.)
 
     // ── Step 4: Send OUR own RekeyInit.
     let our_kp = kex::generate_ephemeral();
@@ -1727,8 +1727,8 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     client.write_all(&enc_our_init).await.unwrap();
 
     // ── Step 5: Read server's RekeyAck. Aborted_init branch falls
-    // through к responder path → server generates fresh responder
-    // ephemeral, computes shared с our_pubkey, sends RekeyAck с
+    // through to responder path → server generates fresh responder
+    // ephemeral, computes shared with our_pubkey, sends RekeyAck with
     // server_responder_pubkey.
     let ack_hdr = read_non_padding_header(
         &mut client,
@@ -1740,7 +1740,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     assert_eq!(
         ack_hdr.msg_type,
         SessionMsg::RekeyAck as u16,
-        "server should send RekeyAck via responder path после aborting own init"
+        "server should send RekeyAck via responder path after aborting own init"
     );
     let mut enc_ack_body = vec![0u8; ack_hdr.body_len as usize];
     client.read_exact(&mut enc_ack_body).await.unwrap();
@@ -1759,7 +1759,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     let mut client_tx_new = SessionCipher::new(&new_keys.tx_key, true);
     let mut client_rx_new = SessionCipher::new(&new_keys.rx_key, true);
 
-    // ── Step 7: Ping/Pong с NEW keys.
+    // ── Step 7: Ping/Pong with NEW keys.
     let enc_new_ping = client_tx_new.seal(&[], &ping_aad).expect("seal NEW Ping");
     let mut new_ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     new_ping_hdr.body_len = enc_new_ping.len() as u32;
@@ -1802,8 +1802,8 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
         "server should have initiated rekey at least once (got {})",
         snap.rekey_init_sent_total
     );
-    // Aborted_init path emits а RekeyAck via the responder fall-through;
-    // post-rekey NEW Ping cannot re-trigger а RekeyAck (NEW Pings → Pong).
+    // Aborted_init path emits a RekeyAck via the responder fall-through;
+    // post-rekey NEW Ping cannot re-trigger a RekeyAck (NEW Pings → Pong).
     assert_eq!(
         snap.rekey_ack_sent_total, 1,
         "aborted_init path emits exactly one RekeyAck"
@@ -1813,40 +1813,40 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
 /// decomposition gate test 2 of 5:
 /// rekey-during-swap convergence.
 ///
-/// Locks in the invariant that а transport swap during
+/// Locks in the invariant that a transport swap during
 /// the rekey `AwaitingAck` window does NOT corrupt the rekey FSM:
 /// the OLD transport's writer task is torn down, the NEW transport
 /// takes over, AEAD state (incl. `rekey_state = AwaitingAck { K_S }`)
-/// is preserved, и the peer's `RekeyAck` arriving on the NEW wire
+/// is preserved, and the peer's `RekeyAck` arriving on the NEW wire
 /// completes the rekey normally.
 ///
 /// Without this invariant, decomposition of `run` could
 /// accidentally reset `rekey_state` at the swap boundary (e.g. by
 /// re-initialising state-bearing locals after the SwapStream branch)
-/// which would leave the session с mismatched ciphers и trigger
+/// which would leave the session with mismatched ciphers and trigger
 /// `session.violation` at the next AEAD frame.
 ///
 /// Sequence:
-/// 1. Spawn runner с encryption + swap_inbox + threshold=1.
-/// 2. Client writes Ping on PRIMARY → server replies с Pong, then
-/// crosses byte-threshold и initiates own rekey (writes
+/// 1. Spawn runner with encryption + swap_inbox + threshold=1.
+/// 2. Client writes Ping on PRIMARY → server replies with Pong, then
+/// crosses byte-threshold and initiates own rekey (writes
 /// `RekeyInit`; server enters `AwaitingAck { K_S }`).
 /// 3. Client reads Pong + RekeyInit on PRIMARY (saves `K_S` pubkey).
-/// 4. Test pushes а fresh `BoxIoStream` into `swap_inbox` → server's
+/// 4. Test pushes a fresh `BoxIoStream` into `swap_inbox` → server's
 /// `await_next_input` picks the SwapStream branch, drops OLD
 /// writer/read_half, spawns new writer on NEW transport. Brief
-/// sleep gives the loop time к pick up the swap (cheaper than
+/// sleep gives the loop time to pick up the swap (cheaper than
 /// log-tap; 50 ms is many-orders-of-magnitude over actual swap
 /// latency on `tokio::io::duplex`).
-/// 5. Client writes `RekeyAck` (sealed с CONTINUOUS client_tx
+/// 5. Client writes `RekeyAck` (sealed with CONTINUOUS client_tx
 /// counter — swap does not reset AEAD state) on the NEW wire.
-/// 6. Server reads RekeyAck on NEW wire — still в
+/// 6. Server reads RekeyAck on NEW wire — still in
 /// `AwaitingAck { K_S }` — derives keys via ECDH(K_S ×
 /// peer_resp_eph), switches ciphers, logs
 /// `session.rekey.complete role=initiator`.
-/// 7. Client writes NEW-cipher Ping on NEW wire → server replies с
-/// NEW-cipher Pong, proving новые keys are actually wired up
-/// post-swap (без this round-trip, а decomposition that breaks
+/// 7. Client writes NEW-cipher Ping on NEW wire → server replies with
+/// NEW-cipher Pong, proving new keys are actually wired up
+/// post-swap (without this round-trip, a decomposition that breaks
 /// cipher swap would silently pass the metrics-only checks).
 /// 8. Verify: rekey_init_sent_total ≥ 1, rekey_ack_received_total ≥ 1
 /// no `session.violation` recorded.
@@ -1933,7 +1933,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
     let swap_tx = runner.with_swap_inbox();
     let server_task = tokio::spawn(async move { runner.run().await });
 
-    // ── Step 1: Ping → drives server к both Pong + own RekeyInit.
+    // ── Step 1: Ping → drives server to both Pong + own RekeyInit.
     let ping_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     let enc_ping = client_tx.seal(&[], &ping_aad).expect("seal Ping");
     let mut ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
@@ -1944,7 +1944,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
         .unwrap();
     primary_client.write_all(&enc_ping).await.unwrap();
 
-    // ── Step 2: Pong на PRIMARY.
+    // ── Step 2: Pong on PRIMARY.
     let pong_hdr = read_non_padding_header(
         &mut primary_client,
         &mut client_rx,
@@ -1962,7 +1962,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
             .expect("decrypt Pong on PRIMARY");
     }
 
-    // ── Step 3: server-RekeyInit на PRIMARY (server now in AwaitingAck).
+    // ── Step 3: server-RekeyInit on PRIMARY (server now in AwaitingAck).
     let init_hdr = read_non_padding_header(
         &mut primary_client,
         &mut client_rx,
@@ -1982,18 +1982,18 @@ async fn phase650b_rekey_state_survives_transport_swap() {
         .ephemeral_pubkey;
 
     // ── Step 4: push warm_server into swap_inbox. Don't bother
-    // draining server's RekeyInit-trailing-padding на PRIMARY — the
-    // OLD wire is about to be dropped и unread bytes на it disappear
-    // с the read_half. Brief sleep: the runner's `await_next_input`
+    // draining server's RekeyInit-trailing-padding on PRIMARY — the
+    // OLD wire is about to be dropped and unread bytes on it disappear
+    // with the read_half. Brief sleep: the runner's `await_next_input`
     // picks SwapStream on its next loop iteration; 50 ms is many OOM
-    // over the actual swap latency на `tokio::io::duplex`.
+    // over the actual swap latency on `tokio::io::duplex`.
     swap_tx
         .send(Box::new(warm_server))
         .await
         .expect("swap_tx must accept new stream — runner has swap_rx");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // ── Step 5: RekeyAck на the WARM wire.
+    // ── Step 5: RekeyAck on the WARM wire.
     // Client's tx counter continues across swap (counters are AEAD-
     // state, not per-transport).
     let our_kp = kex::generate_ephemeral();
@@ -2021,7 +2021,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
     let mut client_rx_new = SessionCipher::new(&new_keys.rx_key, true);
 
     // ── Step 7: NEW-cipher Ping/Pong on the WARM wire. This is the
-    // strong-form check — без it, а decomposition that broke cipher
+    // strong-form check — without it, a decomposition that broke cipher
     // swap would still satisfy the rekey_ack_received metric.
     let enc_new_ping = client_tx_new.seal(&[], &ping_aad).expect("seal NEW Ping");
     let mut new_ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
@@ -2085,33 +2085,33 @@ async fn phase650b_rekey_state_survives_transport_swap() {
 /// Locks in the invariant that the outbound-batch coalescing
 /// (`coalesce_active` check at runner.rs:1640) never delays
 /// INTERACTIVE-priority frames — including the runner's own
-/// `RekeyInit`. Без this guarantee, а phone on low battery
+/// `RekeyInit`. Without this guarantee, a phone on low battery
 /// could see rekey latency balloon by up to MAX_MOBILE_OUTBOUND
-/// _BATCH_WINDOW_MS (1 s), masking nonce-watermark warnings и
+/// _BATCH_WINDOW_MS (1 s), masking nonce-watermark warnings and
 /// eventually pushing the session past `idle_timeout` if the
-/// peer's threshold-cross also coincides с deferral.
+/// peer's threshold-cross also coincides with deferral.
 ///
 /// Decomposition risk: when `run` is split into helpers, the
 /// `coalesce_eligible = head.priority >= BULK` predicate could
-/// be moved to а helper that gets the WRONG queue head (e.g. by
+/// be moved to a helper that gets the WRONG queue head (e.g. by
 /// snapshotting before INTERACTIVE pushes that loop iteration's
-/// rekey). This test fails fast если RekeyInit is queued behind
+/// rekey). This test fails fast if RekeyInit is queued behind
 /// the deferral barrier.
 ///
 /// Mechanism: configure `set_mobile_low_battery_threshold_pct(255)`
 /// + `set_mobile_outbound_batch_window_ms(1000)` so the runner's
 /// `current_outbound_batch_window` returns `Some(1 s)` (`local
-/// _battery_level` returns 100 без а physical battery, и
+/// _battery_level` returns 100 without a physical battery, and
 /// 100 ≤ 255 keeps deferral engaged). Time the Ping→RekeyInit
-/// round-trip; если RekeyInit is correctly bypassed by the
+/// round-trip; if RekeyInit is correctly bypassed by the
 /// `head priority >= BULK` predicate, round-trip < 500 ms (well
-/// under the 1 s window). Если deferral incorrectly captures
+/// under the 1 s window). If deferral incorrectly captures
 /// INTERACTIVE, round-trip ≥ 1 s.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // intentional: serialise tests
 // against the `epic483_5_*` global mutators; sync Mutex held
 // across awaits is safe here because nothing inside the await
-// tree блочит на the same global lock.
+// tree blocks on the same global lock.
 async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
     use tokio::io::AsyncReadExt;
     use veil_crypto::session_cipher::{SessionCipher, frame_aad};
@@ -2120,12 +2120,12 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
     use veil_proto::session::RekeyPayload;
 
     // Acquire global-config lock — set_mobile_* writes process-wide
-    // statics shared с all `current_outbound_batch_window` callers.
+    // statics shared with all `current_outbound_batch_window` callers.
     let _g = epic483_5_lock();
     let _r = Epic483_5Restore;
-    // Audit batch 2026-05-24: trailing-padding drain в test fixtures
-    // requires `PADDING_ENABLED=true`; default flipped к `false` for
-    // throughput.  See note в phase650b_mutual_rekey_collision_*.
+    // Audit batch 2026-05-24: trailing-padding drain in test fixtures
+    // requires `PADDING_ENABLED=true`; default flipped to `false` for
+    // throughput.  See note in phase650b_mutual_rekey_collision_*.
     veil_session::runner::set_padding_enabled(true);
 
     // Engage deferral: threshold 255 ⇒ 100 ≤ 255 ⇒ low-battery
@@ -2244,7 +2244,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
         elapsed < std::time::Duration::from_millis(500),
         "RekeyInit must NOT be held back by low-battery deferral; \
          with window=1000 ms engaged, INTERACTIVE-priority RekeyInit \
-         should arrive в well under 500 ms.  Observed: {elapsed:?}"
+         should arrive in well under 500 ms.  Observed: {elapsed:?}"
     );
 
     let mut enc_init_body = vec![0u8; init_hdr.body_len as usize];
@@ -2257,8 +2257,8 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
         .expect("decode RekeyInit")
         .ephemeral_pubkey;
 
-    // Smoke-test full rekey path: complete и verify NEW Ping/Pong work.
-    // Drain RekeyInit-trailing-padding с OLD client_rx since we're about
+    // Smoke-test full rekey path: complete and verify NEW Ping/Pong work.
+    // Drain RekeyInit-trailing-padding with OLD client_rx since we're about
     // to switch ciphers (mirror Test 1's pattern).
     drain_trailing_padding(
         &mut client,
@@ -2307,7 +2307,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
     assert_eq!(
         new_pong_hdr.msg_type,
         ControlMsg::Pong as u16,
-        "post-rekey NEW Ping/Pong must round-trip even с deferral engaged"
+        "post-rekey NEW Ping/Pong must round-trip even with deferral engaged"
     );
     if new_pong_hdr.body_len > 0 {
         let mut buf = vec![0u8; new_pong_hdr.body_len as usize];
@@ -2327,15 +2327,15 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
 }
 
 /// decomposition gate test 4 of 5:
-/// hot-standby trigger fires DURING `AwaitingAck` без corrupting
+/// hot-standby trigger fires DURING `AwaitingAck` without corrupting
 /// the rekey FSM.
 ///
-/// `fire_hot_standby_trigger` is а `&self` call today (raises а
-/// signal к the controller, doesn't touch `rekey_state` или
+/// `fire_hot_standby_trigger` is a `&self` call today (raises a
+/// signal to the controller, doesn't touch `rekey_state` or
 /// ciphers). Decomposition risk: an extraction of the trigger-
-/// firing logic into а helper that takes `&mut self` could
+/// firing logic into a helper that takes `&mut self` could
 /// inadvertently reset rekey-related state when firing. This
-/// test proves the rekey FSM survives а firing event mid-window:
+/// test proves the rekey FSM survives a firing event mid-window:
 ///
 /// 1. Drive runner into `AwaitingAck { K_S }` via Ping → server
 /// Pong + own RekeyInit (threshold=1).
@@ -2343,7 +2343,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
 /// detector at runner.rs:1430 fires `on_primary_rx_stall →
 /// fire_hot_standby_trigger("rx_stall")`. Logs
 /// `session.hot_standby.trigger_raised reason=rx_stall`.
-/// 3. Push а warm transport into `swap_inbox` so the controller
+/// 3. Push a warm transport into `swap_inbox` so the controller
 /// completes its half of the swap protocol; runner takes
 /// SwapStream branch.
 /// 4. Send RekeyAck on the warm wire. Server still in
@@ -2386,9 +2386,9 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
     let metrics = Arc::new(NodeMetrics::new());
 
     // Real HotStandbyController so fire_hot_standby_trigger can
-    // dispatch без panicking; alt URI points at а dead port — the
-    // controller's auto-trigger dial will fail и be silently
-    // suppressed, but the trigger-firing PATH в the runner still
+    // dispatch without panicking; alt URI points at a dead port — the
+    // controller's auto-trigger dial will fail and be silently
+    // suppressed, but the trigger-firing PATH in the runner still
     // executes (which is what we're verifying preserves rekey state).
     let controller = Arc::new(HotStandbyController::new(
         Arc::new(TransportRegistry::with_defaults()),
@@ -2408,7 +2408,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
     controller.set_alt_uri(peer_id.into(), "tcp://127.0.0.1:1".to_owned());
 
     // raw_session_keys is required for fire_hot_standby_trigger
-    // (line 588: it bails early если absent). These bytes only
+    // (line 588: it bails early if absent). These bytes only
     // get used for HandoffAttach HMAC by the dialler, which fails
     // anyway in this test.
     let raw_tx_key = [0xAAu8; 32];
@@ -2480,12 +2480,12 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
         .unwrap();
     primary_client.write_all(&enc_ping).await.unwrap();
 
-    // Step 2a: Pong на PRIMARY.
+    // Step 2a: Pong on PRIMARY.
     let pong_hdr = read_non_padding_header(
         &mut primary_client,
         &mut client_rx,
         std::time::Duration::from_secs(2),
-        "Pong на PRIMARY",
+        "Pong on PRIMARY",
     )
     .await;
     assert_eq!(pong_hdr.msg_type, ControlMsg::Pong as u16);
@@ -2517,16 +2517,16 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
 
     // ── Step 3: STOP sending; wait > 2/3·idle_timeout (=1000 ms) so
     // the rx-stall trigger fires. Sleep 1100 ms to clear the
-    // threshold с margin.
+    // threshold with margin.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
     // ── Step 4: push warm transport. At this point the runner has
     // already fired its rx-stall trigger (logs
     // "session.hot_standby.trigger_raised reason=rx_stall"; if NOT
     // the test would still pass through the swap path but would
-    // cover а weaker invariant — see post-test snapshot assertion).
+    // cover a weaker invariant — see post-test snapshot assertion).
     // The runner takes the SwapStream branch on its next select! pass
-    // и the OLD wire is dropped.
+    // and the OLD wire is dropped.
     swap_tx
         .send(Box::new(warm_server))
         .await
@@ -2559,7 +2559,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
     let mut client_tx_new = SessionCipher::new(&new_keys.tx_key, true);
     let mut client_rx_new = SessionCipher::new(&new_keys.rx_key, true);
 
-    // ── Step 7: NEW-cipher Ping/Pong на warm.
+    // ── Step 7: NEW-cipher Ping/Pong on warm.
     let enc_new_ping = client_tx_new.seal(&[], &ping_aad).expect("seal NEW Ping");
     let mut new_ping_hdr = FrameHeader::new(FrameFamily::Control as u8, ControlMsg::Ping as u16);
     new_ping_hdr.body_len = enc_new_ping.len() as u32;
@@ -2573,7 +2573,7 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
         &mut warm_client,
         &mut client_rx_new,
         std::time::Duration::from_secs(2),
-        "NEW Pong на WARM",
+        "NEW Pong on WARM",
     )
     .await;
     assert_eq!(
@@ -2598,14 +2598,14 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
     let final_violations = lock!(violation_tracker_arc).count(&peer_id);
     assert_eq!(
         final_violations, 0,
-        "trigger-during-rekey must NOT cause а session.violation"
+        "trigger-during-rekey must NOT cause a session.violation"
     );
 
     let snap = metrics.snapshot();
     assert!(snap.rekey_init_sent_total >= 1);
     assert!(
         snap.rekey_ack_received_total >= 1,
-        "rekey must have completed на the warm wire even though а \
+        "rekey must have completed on the warm wire even though a \
          hot-standby trigger fired mid-AwaitingAck"
     );
 }
@@ -2614,22 +2614,22 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
 /// the idle-timeout ticker is NOT reset by the runner's own rekey
 /// emission while in `AwaitingAck`.
 ///
-/// Invariant locked in: `last_rx` (the input к the
+/// Invariant locked in: `last_rx` (the input to the
 /// `now - last_rx >= idle_timeout` check at runner.rs:1416)
 /// updates ONLY on incoming peer frames (line 1928 — after
-/// successfully reading the first byte of а frame), NEVER on
-/// outbound rekey-init transmission или any other server-driven
-/// timer event. Когда the peer goes silent mid-rekey, the
-/// session must still close at `last_rx + idle_timeout` — без
-/// this guarantee, а silently-disconnecting peer would leave the
-/// initiator hung forever waiting for а RekeyAck that never
+/// successfully reading the first byte of a frame), NEVER on
+/// outbound rekey-init transmission or any other server-driven
+/// timer event. When the peer goes silent mid-rekey, the
+/// session must still close at `last_rx + idle_timeout` — without
+/// this guarantee, a silently-disconnecting peer would leave the
+/// initiator hung forever waiting for a RekeyAck that never
 /// arrives, and the rekey-state machine would block session
 /// teardown indefinitely.
 ///
 /// Decomposition risk: if the rekey-trigger emission code is
-/// extracted to а helper that mistakenly does `last_rx =
-/// Instant::now` (e.g. by copy-pasting из the swap branch
-/// которая does legitimately reset it на line 1799), this test
+/// extracted to a helper that mistakenly does `last_rx =
+/// Instant::now` (e.g. by copy-pasting from the swap branch
+/// which does legitimately reset it on line 1799), this test
 /// catches it: the test would hang and the timeout-bounded
 /// `server_task.await` would fail.
 ///
@@ -2640,10 +2640,10 @@ async fn phase650b_rekey_state_survives_hot_standby_trigger_firing() {
 /// 2. Read Pong + RekeyInit on PRIMARY (proves rekey was emitted).
 /// 3. STOP sending; wait > idle_timeout.
 /// 4. Server's idle-timeout check fires at `last_rx + 500 ms`
-/// logging `session.idle_timeout` и returning from `run`.
+/// logging `session.idle_timeout` and returning from `run`.
 /// 5. `server_task.await` completes (bounded by 1 s outer timeout)
 /// AND no `session.rekey.complete` was emitted (rekey was
-/// cut short by idle, not satisfied by а RekeyAck).
+/// cut short by idle, not satisfied by a RekeyAck).
 #[tokio::test]
 async fn phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent() {
     use tokio::io::AsyncReadExt;
@@ -2731,7 +2731,7 @@ async fn phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent() {
     client.write_all(&enc_ping).await.unwrap();
 
     // Step 2: read Pong + RekeyInit (proves server emitted both
-    // before going to sleep на the read branch).
+    // before going to sleep on the read branch).
     let pong_hdr = read_non_padding_header(
         &mut client,
         &mut client_rx,
@@ -2762,11 +2762,11 @@ async fn phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent() {
         .open(&enc_init_body, &init_aad)
         .expect("decrypt server RekeyInit (advances client_rx counter)");
 
-    // ── Step 3: do NOT send а RekeyAck. Just wait long enough
-    // that the server's idle-timeout MUST fire even с rekey
+    // ── Step 3: do NOT send a RekeyAck. Just wait long enough
+    // that the server's idle-timeout MUST fire even with rekey
     // activity in flight: 750 ms > idle_timeout (500 ms) +
     // generous slack. If the rekey-emission path mistakenly
-    // resets last_rx, the runner would never hit idle и the
+    // resets last_rx, the runner would never hit idle and the
     // bounded `server_task.await` below would time out.
     let outer = tokio::time::timeout(std::time::Duration::from_millis(1500), server_task).await;
     assert!(
@@ -2793,7 +2793,7 @@ async fn phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent() {
 
     // ── Step 5: keep client alive until after server exited; then
     // drop. Without holding `client` past server exit, the duplex
-    // would close earlier и cause а primary_closed exit instead of
+    // would close earlier and cause a primary_closed exit instead of
     // idle_timeout. We let the outer-timeout-bounded await above
     // handle teardown ordering.
     drop(client);
@@ -3582,8 +3582,8 @@ async fn mlkem_rekey_initiator_commits_dk_seed_after_ack() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     // Verify per_session_mlkem_dk is populated and distinct from zero.
-    // Этап 6 slice 6h: values ара SensitiveBytesN<64> (!Copy, !Eq) so
-    // dereference `.as_array()` к compare against а plain byte literal.
+    // Stage 6 slice 6h: values are SensitiveBytesN<64> (!Copy, !Eq) so
+    // dereference `.as_array()` to compare against a plain byte literal.
     let committed: Option<[u8; veil_e2e::DK_SEED_BYTES]> = lock!(per_session_mlkem_dk_clone)
         .get(&peer_id)
         .map(|s| *s.as_array());
@@ -4507,16 +4507,16 @@ async fn end_to_end_handoff_pipeline_via_peek_and_dispatch() {
     //
     // cleanup: pre-fix this step was step 6 (after
     // dropping primary_client). Race: peek_and_dispatch returns
-    // immediately после `swap_tx.send`; the runner's `tokio::select!`
-    // loop may not have polled the SwapStream branch yet. Если
+    // immediately after `swap_tx.send`; the runner's `tokio::select!`
+    // loop may not have polled the SwapStream branch yet. If
     // primary_client was dropped first, the primary's `read` branch
-    // returned EOF before SwapStream got polled, и the runner exited
-    // via the primary-closed path WITHOUT swapping. Reordering к
-    // "Ping → Pong → drop primary" forces the runner к process the
-    // swap (yielding а Pong on warm) BEFORE we close primary, removing
+    // returned EOF before SwapStream got polled, and the runner exited
+    // via the primary-closed path WITHOUT swapping. Reordering to
+    // "Ping → Pong → drop primary" forces the runner to process the
+    // swap (yielding a Pong on warm) BEFORE we close primary, removing
     // the race.
     //
-    // The runner reads от `new_stream` after swap. Когда we call
+    // The runner reads from `new_stream` after swap. When we call
     // peek_and_dispatch, the warm_server's first-16-bytes + 64-byte
     // body are consumed. The runner inherits the stream positioned
     // AFTER the HandoffAttach frame — so our next Ping is the very
@@ -4545,7 +4545,7 @@ async fn end_to_end_handoff_pipeline_via_peek_and_dispatch() {
     );
 
     // ── Step 6: now that swap is confirmed, close primary. Runner is
-    // already on warm → primary close is а no-op, не the EOF-driven
+    // already on warm → primary close is a no-op, not the EOF-driven
     // exit path that pre-fix occasionally raced ahead of the swap.
     drop(primary_client);
 
@@ -4791,10 +4791,10 @@ impl tokio::io::AsyncRead for ReadsBlockForeverStream {
 // `epic483_5_lock`'s sync `MutexGuard` across `.await` to serialise
 // process-global mobile-config writes against phase650b tests.  This is
 // safe — guard never points to data that interior-mutates during the
-// await — но `await_holding_lock = deny` (workspace lint) blocks the
-// pattern by default.  Same `#[allow]` applied к phase650b tests above
+// await — but `await_holding_lock = deny` (workspace lint) blocks the
+// pattern by default.  Same `#[allow]` applied to phase650b tests above
 // (line 2103); we mirror it here so `cargo clippy --workspace --all-
-// targets -- -D warnings` stays green в CI.
+// targets -- -D warnings` stays green in CI.
 //
 // Audit batch 2026-05-25 phase M: ignored.  Test asserts that the rx-
 // stall trigger fires at ~2/3 · idle_timeout = 100 ms; under
@@ -4815,13 +4815,13 @@ async fn rx_stall_fires_proactive_trigger_before_idle_timeout() {
     use veil_session::hot_standby::HotStandbyController;
     use veil_transport::{TransportContext, TransportRegistry};
 
-    // Audit batch 2026-05-24: serialise с the phase650b battery tests
+    // Audit batch 2026-05-24: serialise with the phase650b battery tests
     // (which write process-global `set_mobile_low_battery_threshold_pct`
     // and `set_mobile_outbound_batch_window_ms`).  Without the lock the
-    // tests race when run с `--test-threads=2`: phase650b's "low
+    // tests race when run with `--test-threads=2`: phase650b's "low
     // battery" window pushes `compute_sleep_deadline.bat` ahead of the
     // 100 ms rx-stall deadline, the runner skips past stall-trigger
-    // firing, и this test's swap_attempts assertion blows.
+    // firing, and this test's swap_attempts assertion blows.
     let _g = epic483_5_lock();
     let _r = Epic483_5Restore;
     runner::set_mobile_low_battery_threshold_pct(None);
@@ -5100,7 +5100,7 @@ fn epic489_4_factor_is_1_when_tier_foreground() {
     assert_eq!(
         runner::current_mobile_background_keepalive_factor(),
         1,
-        "Foreground tier → factor 1 даже с large multiplier"
+        "Foreground tier → factor 1 even with large multiplier"
     );
 }
 
@@ -5114,8 +5114,8 @@ fn epic489_4_factor_is_2_for_active_tier() {
         runner::current_mobile_background_keepalive_factor(),
         runner::MOBILE_ACTIVE_TIER_MULTIPLIER,
         "Active tier hardcodes 2× regardless of configured multiplier — \
-         user может switch back to foreground at any second so we don't \
-         commit к the aggressive LowPower factor"
+         user can switch back to foreground at any second so we don't \
+         commit to the aggressive LowPower factor"
     );
 }
 
@@ -5171,7 +5171,7 @@ fn epic489_4_tier_clamped_to_lowpower_for_unknown_byte() {
         runner::current_mobile_background_tier(),
         2,
         "unknown tier byte must clamp DOWN to LowPower (most-conservative tier) — \
-         fail safely toward stretching keepalive не toward tight cadence"
+         fail safely toward stretching keepalive not toward tight cadence"
     );
 }
 
@@ -5260,7 +5260,7 @@ fn epic488_1_normal_value_passes_through() {
 #[test]
 fn epic488_1_below_floor_clamps_up_to_minimum() {
     // Misconfig OR validation bypass passes 30s. Runtime
-    // clamp pushes к 60s floor — defends against rapid
+    // clamp pushes to 60s floor — defends against rapid
     // reconnect storm.
     let _g = epic488_1_lock();
     let _r = Epic488Restore;
@@ -5277,14 +5277,14 @@ fn epic488_1_zero_is_distinct_from_clamped_minimum() {
     // Boundary: 0 means "disabled" and stays 0 — must NOT
     // clamp UP to 60. Otherwise default-config nodes would
     // start rotating every minute, doubling network handshake
-    // load по умолчанию.
+    // load by default.
     let _g = epic488_1_lock();
     let _r = Epic488Restore;
     runner::set_session_max_age_secs(0);
     assert_eq!(
         runner::current_session_max_age_secs(),
         0,
-        "0 (disabled) must stay 0 — must NOT silently get clamped к 60s"
+        "0 (disabled) must stay 0 — must NOT silently get clamped to 60s"
     );
 }
 
@@ -5321,7 +5321,7 @@ fn q7_range_mode_normal_values_pass_through() {
 
 #[test]
 fn q7_range_mode_below_floor_clamps_both_up() {
-    // Validation prevents sub-60s ranges, но runtime defends
+    // Validation prevents sub-60s ranges, but runtime defends
     // against bypass.  Each bound clamps independently to the floor.
     let _g = epic488_1_lock();
     let _r = Epic488Restore;
@@ -5339,8 +5339,8 @@ fn q7_range_mode_below_floor_clamps_both_up() {
 
 #[test]
 fn q7_range_mode_min_above_max_clamps_min_down() {
-    // Validation prevents this, но runtime should still produce
-    // а sane range (not deadline-can't-be-sampled).
+    // Validation prevents this, but runtime should still produce
+    // a sane range (not deadline-can't-be-sampled).
     let _g = epic488_1_lock();
     let _r = Epic488Restore;
     runner::set_session_rotation_range(7_200, 3_600);
@@ -5366,19 +5366,19 @@ fn q7_legacy_setter_clears_min_so_falls_to_point_mode() {
 // ── Q.7 audit batch: end-to-end rotation deadline behaviour ──────
 //
 // Verifies that:
-//   1. The deadline timer actually fires в а live `SessionRunner::run`
+//   1. The deadline timer actually fires in a live `SessionRunner::run`
 //      future (i.e. the `is_due` check is reached on `NextInput::Timer`).
 //   2. With no `HotStandbyController` registered, the runner takes the
 //      legacy graceful-close path: `run()` returns within the expected
-//      deadline window и а subsequent app-frame send doesn't crash.
-//   3. With а controller present + an `alt_uri` (pointing at а dead
-//      port — the warm-probe dial will fail but the trigger PATH в
+//      deadline window and a subsequent app-frame send doesn't crash.
+//   3. With a controller present + an `alt_uri` (pointing at a dead
+//      port — the warm-probe dial will fail but the trigger PATH in
 //      the runner still executes), `run()` either continues looping
-//      (deadline re-armed) или returns gracefully if probe fails fast.
+//      (deadline re-armed) or returns gracefully if probe fails fast.
 //
 // The 1-2 s range here requires the `_unchecked_for_tests` setter
-// because the production setter clamps к the 60 s floor.  See its
-// doc comment в `veil_session::runner`.
+// because the production setter clamps to the 60 s floor.  See its
+// doc comment in `veil_session::runner`.
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // intentional: serialise tests touching SESSION_MAX_AGE_SECS
@@ -5392,7 +5392,7 @@ async fn q7_rotation_deadline_fires_and_runner_returns_when_no_controller() {
     let _g = epic488_1_lock();
     let _r = Epic488Restore;
 
-    // Stage а 1-2 s rotation window — well under the 60 s production
+    // Stage a 1-2 s rotation window — well under the 60 s production
     // floor, hence the test-only unchecked setter.
     runner::set_session_rotation_range_unchecked_for_tests(1, 2);
 
@@ -5424,11 +5424,11 @@ async fn q7_rotation_deadline_fires_and_runner_returns_when_no_controller() {
         // Keepalive **off** so we don't trip
         // `keepalive_probe_timeout` — which would fire its OWN
         // hot-standby trigger (`reason=keepalive_probe_timeout`) ahead
-        // of the rotation deadline и close the session prematurely.
+        // of the rotation deadline and close the session prematurely.
         //
         // The rotation deadline gets folded into `compute_sleep_deadline`
         // directly (Q.7 audit batch) so the runner DOES wake at the
-        // rotation instant даже без а keepalive tick.
+        // rotation instant even without a keepalive tick.
         keepalive_interval: Duration::ZERO,
         // Long idle so the session doesn't idle-close before the
         // rotation deadline can fire.
@@ -5460,7 +5460,7 @@ async fn q7_rotation_deadline_fires_and_runner_returns_when_no_controller() {
         hot_standby: veil_session::runner::HotStandbyState {
             swap_rx: None,
             // No controller → fire_hot_standby_trigger returns false →
-            // fallback к graceful close.
+            // fallback to graceful close.
             handoff_registry: None,
             handoff_ack_waiters: None,
             controller: None,
@@ -5474,17 +5474,17 @@ async fn q7_rotation_deadline_fires_and_runner_returns_when_no_controller() {
         let mut runner = runner;
         runner.run().await;
     });
-    // Generous timeout: deadline is sampled uniformly из [1, 2] s, plus
+    // Generous timeout: deadline is sampled uniformly from [1, 2] s, plus
     // the runner's own timer tick granularity — 5 s headroom catches
-    // real bugs (deadline never fires) без being flaky on slow CI.
+    // real bugs (deadline never fires) without being flaky on slow CI.
     let outcome = tokio::time::timeout(Duration::from_secs(5), handle).await;
     let elapsed = start.elapsed();
     outcome
         .expect("run() must return within 5 s when rotation deadline ∈ [1, 2] s")
         .expect("run() task must not panic");
-    // Lower bound: the deadline can't fire BEFORE its min (1 s) или
-    // before the runner has had а chance к tick at all (~50 ms on cold
-    // start).  This catches "deadline computed но never reaches the
+    // Lower bound: the deadline can't fire BEFORE its min (1 s) or
+    // before the runner has had a chance to tick at all (~50 ms on cold
+    // start).  This catches "deadline computed but never reaches the
     // Timer arm" — which would close immediately.
     assert!(
         elapsed >= Duration::from_millis(800),
@@ -5579,8 +5579,8 @@ fn epic483_5o_returns_none_when_battery_zero_ac_sentinel() {
 #[test]
 fn epic483_5o_returns_none_when_threshold_unset_window_set() {
     // Operator misconfig — window set but no threshold. Feature
-    // gates на having BOTH, so this returns None (no surprise
-    // coalescing на cellular dev who forgot to set threshold).
+    // gates on having BOTH, so this returns None (no surprise
+    // coalescing on cellular dev who forgot to set threshold).
     let _g = epic483_5_lock();
     let _r = Epic483_5Restore;
     runner::set_mobile_low_battery_threshold_pct(None);
@@ -5615,7 +5615,7 @@ fn epic483_5o_setter_zero_disables() {
     assert_eq!(
         runner::current_outbound_batch_window(10),
         None,
-        "window=0 disables the feature even с threshold + low battery"
+        "window=0 disables the feature even with threshold + low battery"
     );
 }
 
@@ -5630,15 +5630,15 @@ fn epic483_5o_threshold_setter_none_disables() {
     assert_eq!(
         runner::current_outbound_batch_window(10),
         None,
-        "threshold=None disables the feature even с window set"
+        "threshold=None disables the feature even with window set"
     );
 }
 
 // ── Phase 5e: TransportMigrationNotify dispatcher arm ────────────────
 
-/// Helper — build а minimal `SessionRunner` configured for direct
-/// arm-method invocation.  Wire is а disconnected duplex stream because
-/// the arm under test does not perform I/O; only the registries и
+/// Helper — build a minimal `SessionRunner` configured for direct
+/// arm-method invocation.  Wire is a disconnected duplex stream because
+/// the arm under test does not perform I/O; only the registries and
 /// cache shared with the dispatcher matter.
 fn make_migration_test_runner(
     peer_id: NodeIdBytes,
@@ -5737,8 +5737,8 @@ fn phase5e_transport_migration_notify_valid_updates_cache() {
 }
 
 /// Notify whose embedded `node_id` does NOT match the session's
-/// `peer_id` must be rejected — а valid sig for SOMEONE else's node_id
-/// is not authorization к update this session's cache.
+/// `peer_id` must be rejected — a valid sig for SOMEONE else's node_id
+/// is not authorization to update this session's cache.
 #[test]
 fn phase5e_transport_migration_notify_mismatched_node_id_rejected() {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -5750,7 +5750,7 @@ fn phase5e_transport_migration_notify_mismatched_node_id_rejected() {
     let signer_node_id = *blake3::hash(&pubkey).as_bytes();
     let pubkey_b64 = STANDARD.encode(pubkey);
 
-    // Session's peer_id is DIFFERENT от the signed payload's node_id.
+    // Session's peer_id is DIFFERENT from the signed payload's node_id.
     let session_peer_id = [0xAAu8; 32];
     assert_ne!(session_peer_id, signer_node_id);
 
@@ -5826,7 +5826,7 @@ fn phase5e_transport_migration_notify_replay_outside_window_dropped() {
     );
 }
 
-/// Notify carrying а forged sig (signed with а different key than the
+/// Notify carrying a forged sig (signed with a different key than the
 /// session's `peer_public_key`) must be rejected.
 #[test]
 fn phase5e_transport_migration_notify_bad_signature_rejected() {
@@ -5839,7 +5839,7 @@ fn phase5e_transport_migration_notify_bad_signature_rejected() {
     let peer_id = *blake3::hash(&real_pubkey).as_bytes();
     let real_pubkey_b64 = STANDARD.encode(real_pubkey);
 
-    // Attacker has а different key but claims the victim's node_id.
+    // Attacker has a different key but claims the victim's node_id.
     let attacker_sk = SigningKey::from_bytes(&[0x99u8; 32]);
 
     let mut runner = make_migration_test_runner(peer_id, Some(real_pubkey_b64));
@@ -5867,7 +5867,7 @@ fn phase5e_transport_migration_notify_bad_signature_rejected() {
     assert_eq!(c.lookup(&peer_id), None, "forged sig must NOT update cache",);
 }
 
-/// Malformed body (too short to even decode) → recorded as а violation
+/// Malformed body (too short to even decode) → recorded as a violation
 /// no panic, no cache update.
 #[test]
 fn phase5e_transport_migration_notify_malformed_body_recorded_as_violation() {
@@ -5879,13 +5879,13 @@ fn phase5e_transport_migration_notify_malformed_body_recorded_as_violation() {
     let cache = runner.dispatcher.dht().transport_cache();
     let mut c = cache.lock().unwrap();
     assert_eq!(c.lookup(&peer_id), None);
-    // Violation tracker is shared с the dispatcher; checking the
+    // Violation tracker is shared with the dispatcher; checking the
     // count would require introspection beyond the public surface.
     // Behavioural assertion (no panic + no cache update) is sufficient.
 }
 
-/// Session с no `peer_public_key` (server-role without full handshake
-/// capture) silently drops the notify — there's nothing к verify
+/// Session with no `peer_public_key` (server-role without full handshake
+/// capture) silently drops the notify — there's nothing to verify
 /// against.
 #[test]
 fn phase5e_transport_migration_notify_no_pubkey_silent_drop() {

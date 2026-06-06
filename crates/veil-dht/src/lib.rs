@@ -95,7 +95,7 @@ mod tests {
         assert_eq!(err, KademliaError::DhtParticipationDisabled);
     }
 
-    /// Этап 11e: handle_store routes unsigned legacy STOREs through the
+    /// Stage 11e: handle_store routes unsigned legacy STOREs through the
     /// shared `ORIGIN_UNSIGNED` bucket and enforces the per-origin cap
     /// across all unsigned STOREs collectively.
     #[test]
@@ -116,7 +116,7 @@ mod tests {
             .unwrap();
         svc.handle_store(StorePayload::unsigned([3u8; 32], vec![0u8; 50]))
             .unwrap();
-        // 4th unsigned STORE: pushes bucket к 200 > 150 → refused.
+        // 4th unsigned STORE: pushes bucket to 200 > 150 → refused.
         let err = svc
             .handle_store(StorePayload::unsigned([4u8; 32], vec![0u8; 50]))
             .unwrap_err();
@@ -124,9 +124,9 @@ mod tests {
         assert_eq!(svc.stored_keys(), 3);
     }
 
-    /// Этап 11e: per-origin cap on signed STOREs isolates noisy signers
-    /// from polite ones — а signer that exhausts its bucket cannot
-    /// crowd out а separate signer's records.
+    /// Stage 11e: per-origin cap on signed STOREs isolates noisy signers
+    /// from polite ones — a signer that exhausts its bucket cannot
+    /// crowd out a separate signer's records.
     #[test]
     fn handle_store_signed_isolates_origins_under_per_origin_cap() {
         use ed25519_dalek::{Signer as _, SigningKey};
@@ -162,16 +162,16 @@ mod tests {
                 }
             };
 
-        // Alice fills her bucket к the cap.
+        // Alice fills her bucket to the cap.
         svc.handle_store(sign_store(&alice_sk, alice_pk, alice_key, vec![0u8; 120]))
             .unwrap();
-        // Alice tries to overwrite with а larger value — refused by cap.
+        // Alice tries to overwrite with a larger value — refused by cap.
         // (The overwrite path refunds the old bytes; 121 > 120 still fails.)
         let err = svc
             .handle_store(sign_store(&alice_sk, alice_pk, alice_key, vec![0u8; 121]))
             .unwrap_err();
         assert_eq!(err, KademliaError::PerOriginByteCapExceeded);
-        // Bob's bucket is untouched: he can fill к his own cap.
+        // Bob's bucket is untouched: he can fill to his own cap.
         svc.handle_store(sign_store(&bob_sk, bob_pk, bob_key, vec![0u8; 120]))
             .unwrap();
         assert_eq!(svc.stored_keys(), 2);

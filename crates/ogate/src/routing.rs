@@ -110,17 +110,17 @@ impl RoutingTable {
     /// Decide what to do with an inbound packet given the veil sender's
     /// `node_id` and the packet's claimed source IP.
     ///
-    /// * `open` mode: accept any peer in the network namespace, **но**
-    ///   packet must still parse as а valid IP header (post-audit: was
-    ///   accepting malformed packets unconditionally, which let а
+    /// * `open` mode: accept any peer in the network namespace, **but**
+    ///   packet must still parse as a valid IP header (post-audit: was
+    ///   accepting malformed packets unconditionally, which let a
     ///   namespace-peer inject garbage into the TUN interface).
-    /// * `authorized` mode: accept only if `src_node_id` is в the peer
+    /// * `authorized` mode: accept only if `src_node_id` is in the peer
     ///   table AND `src_ip` matches the peer's recorded virtual IP.
     pub fn lookup_ingress(&self, src_node_id: &NodeId, src_ip: Option<IpAddr>) -> Decision {
-        // Malformed packet (no parsable IP header) — drop в both modes.
+        // Malformed packet (no parsable IP header) — drop in both modes.
         // post-fix: open mode previously forwarded
-        // anything, allowing TUN-injection of arbitrary bytes by а peer
-        // в the network namespace.
+        // anything, allowing TUN-injection of arbitrary bytes by a peer
+        // in the network namespace.
         if src_ip.is_none() {
             return Decision::SpoofedSourceIp;
         }
@@ -162,15 +162,15 @@ pub fn encode_node_id(nid: &NodeId) -> String {
     hex::encode(nid)
 }
 
-/// Extract the IP version + source + destination from а raw IP packet.
+/// Extract the IP version + source + destination from a raw IP packet.
 ///
-/// Returns `None` for packets too short to parse а header или с
+/// Returns `None` for packets too short to parse a header or with
 /// invalid header-length / total-length fields.  Supports IPv4
 /// (version=4) and IPv6 (version=6); other versions return `None`.
 ///
 /// Audit batch 2026-05-24 (L9): also validates `IHL` (v4 internet
-/// header length) и `total_length` / `payload_length` consistency
-/// so а malformed packet doesn't reach TUN write с garbage headers.
+/// header length) and `total_length` / `payload_length` consistency
+/// so a malformed packet doesn't reach TUN write with garbage headers.
 pub fn parse_ip_endpoints(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
     if packet.is_empty() {
         return None;
@@ -183,12 +183,12 @@ pub fn parse_ip_endpoints(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
             }
             // IHL field = packet[0] & 0x0F = #32-bit words in header.
             // Minimum 5 (= 20 bytes); maximum 15 (= 60 bytes).  Header
-            // must fit в the buffer.
+            // must fit in the buffer.
             let ihl = (packet[0] & 0x0F) as usize;
             if ihl < 5 || packet.len() < ihl * 4 {
                 return None;
             }
-            // Total length (offset 2-3, BE) — must match packet len и
+            // Total length (offset 2-3, BE) — must match packet len and
             // be at least IHL*4.
             let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
             if total_len < ihl * 4 || total_len > packet.len() {
@@ -202,7 +202,7 @@ pub fn parse_ip_endpoints(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
             if packet.len() < 40 {
                 return None;
             }
-            // Payload length (offset 4-5, BE) — must fit в buffer
+            // Payload length (offset 4-5, BE) — must fit in buffer
             // beyond the 40-byte fixed header.
             let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
             if 40usize
@@ -338,8 +338,8 @@ mod tests {
     #[test]
     fn parse_ipv4_endpoints() {
         // Audit batch 2026-05-24 (L9): parse_ip_endpoints now validates
-        // IHL и total_length consistency.  Test fixture must set both
-        // — а raw zero-header packet (legitimate use case: synthetic
+        // IHL and total_length consistency.  Test fixture must set both
+        // — a raw zero-header packet (legitimate use case: synthetic
         // test data) would otherwise be rejected.
         let mut pkt = [0u8; 40];
         pkt[0] = 0x45; // version=4, IHL=5 (20-byte header)

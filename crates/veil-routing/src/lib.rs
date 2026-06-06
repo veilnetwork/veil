@@ -45,9 +45,9 @@ pub trait RoutingLogger: Send + Sync {
     /// Emit a warn-level event with category `event` and a free-form `message`.
     fn warn(&self, event: &str, message: &str);
 
-    /// Emit an info-level event. Default impl forwards к `warn` для existing
+    /// Emit an info-level event. Default impl forwards to `warn` for existing
     /// callers that haven't migrated; overriding lets concretes use their
-    /// native log level. : added для iterative-DHT fallback
+    /// native log level. : added for iterative-DHT fallback
     /// observability.
     fn info(&self, event: &str, message: &str) {
         self.warn(event, message);
@@ -61,13 +61,13 @@ pub trait RoutingMetrics: Send + Sync {
     fn inc_route_recovery(&self);
 
     /// iterative-DHT fallback was triggered (legacy
-    /// `RouteRequest` flood exhausted; fall through к `RecursiveQuery`).
+    /// `RouteRequest` flood exhausted; fall through to `RecursiveQuery`).
     /// Default no-op for backward-compatible impls.
     fn inc_dht_fallback_triggered(&self) {}
     /// iterative-DHT fallback resolved — response arrived
-    /// и `route_cache` got populated. Default no-op.
+    /// and `route_cache` got populated. Default no-op.
     fn inc_dht_fallback_resolved(&self) {}
-    /// iterative-DHT fallback timed out without а response.
+    /// iterative-DHT fallback timed out without a response.
     /// Default no-op.
     fn inc_dht_fallback_miss(&self) {}
     /// Push a reachability event into the sliding window and return the

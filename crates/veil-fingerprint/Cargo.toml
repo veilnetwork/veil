@@ -2,13 +2,13 @@
 name = "veil-fingerprint"
 version = "0.1.0"
 edition = "2024"
-description = "DPI-fingerprint regression test infrastructure (Epic 488.2 carry-over, anti-censorship P2 #5). Build byte-level n-gram models of OVL1 traffic + compare them к reference fingerprint distributions (uniform random для obfs4, Chrome HTTPS для tls-boring, etc.) so wire-format changes can't silently leak а distinguishability signal."
+description = "DPI-fingerprint regression test infrastructure (Epic 488.2 carry-over, anti-censorship P2 #5). Build byte-level n-gram models of OVL1 traffic + compare them to reference fingerprint distributions (uniform random for obfs4, Chrome HTTPS for tls-boring, etc.) so wire-format changes can't silently leak a distinguishability signal."
 license = "AGPL-3.0-or-later"
 
 [features]
-# Opt-in pcap-format parsing.  Pulls в the pcap-parser crate which is
-# а pure-Rust parser (no C libpcap dep).  Build keeps default-feature
-# light для most callers — only opt in if you need `observe_pcap()`.
+# Opt-in pcap-format parsing.  Pulls in the pcap-parser crate which is
+# a pure-Rust parser (no C libpcap dep).  Build keeps default-feature
+# light for most callers — only opt in if you need `observe_pcap()`.
 pcap = ["dep:pcap-parser", "dep:thiserror"]
 
 [dependencies]

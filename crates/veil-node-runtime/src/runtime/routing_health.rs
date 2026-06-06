@@ -58,8 +58,8 @@ impl NodeRuntime {
 
     /// Spawn a background task that prunes expired entries from the
     /// `HandoffRegistry`. The registry auto-prunes opportunistically on
-    /// `insert`/`consume` operations, но а quiet session can accumulate
-    /// stale entries для bounded time before the cap-eviction kicks in.
+    /// `insert`/`consume` operations, but a quiet session can accumulate
+    /// stale entries for bounded time before the cap-eviction kicks in.
     /// This periodic tick guarantees prompt expiry.
     pub fn spawn_handoff_prune_task(&mut self, interval_dur: std::time::Duration) {
         let Some(shutdown_tx) = &self.shutdown_tx else {
@@ -81,12 +81,12 @@ impl NodeRuntime {
         lock_tasks(&self.tasks).background.push(handle);
     }
 
-    /// Spawn а periodic prune task для closed channels в the
+    /// Spawn a periodic prune task for closed channels in the
     /// `SessionTxRegistry`.
     ///
     /// Audit batch 2026-05-24 (M4): the registry's internal `prune_closed`
     /// fires only on `register` / `unregister` paths.  Hosts running
-    /// pure-broadcast traffic (mesh hubs) с no new session churn could
+    /// pure-broadcast traffic (mesh hubs) with no new session churn could
     /// otherwise accumulate closed-channel entries indefinitely → RAM
     /// drift.  This tick guarantees bounded growth.
     pub fn spawn_tx_registry_prune_task(&mut self, interval_dur: std::time::Duration) {
@@ -106,7 +106,7 @@ impl NodeRuntime {
                     tokio::select! {
                         Ok(_) = shutdown_rx.changed() => break,
                         _ = interval.tick() => {
-                            // Audit-lint: `wlock!` resolves к а std::sync write guard.
+                            // Audit-lint: `wlock!` resolves to a std::sync write guard.
                             // No `.await` inside the critical section (workspace
                             // `clippy::await_holding_lock = "deny"` enforces this).
                             let pruned = veil_util::wlock!(registry).prune_closed_external();

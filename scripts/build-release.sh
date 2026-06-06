@@ -6,7 +6,7 @@
 #      EVERY machine that supports the target.  Lets independent
 #      verifiers rebuild from source and confirm "the binary I
 #      downloaded is what the source says it is".
-#   2. Single signed `UpdateManifest` blob ready для distribution.
+#   2. Single signed `UpdateManifest` blob ready for distribution.
 #
 # Determinism is enforced by:
 #   * `--remap-path-prefix=$PWD=.` — strips host path prefixes from
@@ -27,14 +27,14 @@
 #
 # Binaries built per invocation: `veil-cli`, `ogate`, `oproxy`.
 # veil-cli is the user-facing CLI + auto-update entry point;
-# ogate / oproxy are operator-side service binaries що ship alongside
+# ogate / oproxy are operator-side service binaries that ship alongside
 # so a release tag carries the full daemon set.
 #
 # Output paths (per-target):
 #   target/<triple>/release/{veil-cli,ogate,oproxy}[.exe]
 #   target/release-artifacts/<triple>/{<bin>,<bin>.sha256,manifest.bin}
 #   manifest.bin is generated only for veil-cli (auto-update target);
-#   ogate / oproxy are deployed via systemd / package managers и do not
+#   ogate / oproxy are deployed via systemd / package managers and do not
 #   currently consume signed manifests.
 #
 # Pass `--sign --identity <path> --version X.Y.Z --binary-url URL[ URL...]`
@@ -91,11 +91,11 @@ EOF
 
 target=""
 # Phase 6.50.b audit fix: default to `production-seeds`.  Pre-fix the
-# default was `allow-empty-seeds`, which produced а binary that won't
-# bootstrap без operator-supplied peers — а production-deploy footgun
-# for а CI artifact that LOOKS production-ready.  Override с
-# `--features veil-bootstrap/allow-empty-seeds` для testnet builds.
-# When `--sign` is also set, allow-empty-seeds is rejected (см. policy
+# default was `allow-empty-seeds`, which produced a binary that won't
+# bootstrap without operator-supplied peers — a production-deploy footgun
+# for a CI artifact that LOOKS production-ready.  Override with
+# `--features veil-bootstrap/allow-empty-seeds` for testnet builds.
+# When `--sign` is also set, allow-empty-seeds is rejected (see policy
 # block below).
 features="veil-bootstrap/production-seeds"
 source_date_epoch="$DEFAULT_SOURCE_DATE_EPOCH"
@@ -138,16 +138,16 @@ if "$sign"; then
     exit 2
   fi
   # Phase 6.50.b audit fix: signed releases MUST NOT bundle
-  # `allow-empty-seeds` — that flag produces а binary that won't
-  # bootstrap без operator-supplied peers и is а production-deploy
-  # footgun.  Pre-fix nothing prevented а CI/operator от signing
-  # such an artifact.  Now the build script refuses к sign.
+  # `allow-empty-seeds` — that flag produces a binary that won't
+  # bootstrap without operator-supplied peers and is a production-deploy
+  # footgun.  Pre-fix nothing prevented a CI/operator from signing
+  # such an artifact.  Now the build script refuses to sign.
   if [[ "$features" == *"allow-empty-seeds"* ]]; then
-    echo "ERROR: --sign incompatible с features='$features'" >&2
+    echo "ERROR: --sign incompatible with features='$features'" >&2
     echo "       allow-empty-seeds builds will not bootstrap on their own;" >&2
-    echo "       signing such а binary creates а production-deploy footgun." >&2
+    echo "       signing such a binary creates a production-deploy footgun." >&2
     echo "       Use --features veil-bootstrap/production-seeds for signed releases," >&2
-    echo "       OR drop --sign for а testnet build." >&2
+    echo "       OR drop --sign for a testnet build." >&2
     exit 2
   fi
 fi
@@ -158,7 +158,7 @@ fi
 
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 # --remap-path-prefix strips host paths from binary debug info so
-# the binary built на /home/alice/veil matches /Users/bob/proj/veil.
+# the binary built on /home/alice/veil matches /Users/bob/proj/veil.
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$REPO_ROOT=. --remap-path-prefix=$HOME=/HOME"
 # Disable incremental compilation — incremental injects per-machine
 # fingerprints into intermediate artifacts.
@@ -166,7 +166,7 @@ export CARGO_INCREMENTAL=0
 # Lock the resolver to the committed Cargo.lock.
 # Binary set: veil-cli (user CLI / auto-update) + ogate / oproxy-client /
 # oproxy-server (operator-side service daemons). Listed explicitly so the
-# script fails loud если а bin target is renamed upstream.
+# script fails loud if a bin target is renamed upstream.
 bins=(veil-cli ogate oproxy-client oproxy-server)
 cargo_args=(--release --target "$target" --locked)
 for b in "${bins[@]}"; do
@@ -236,7 +236,7 @@ if "$sign"; then
     binary_url_args+=("--binary-url" "$url")
   done
 
-  # Signed manifest covers only veil-cli — the only binary с the
+  # Signed manifest covers only veil-cli — the only binary with the
   # auto-update entry point (`veil-cli update apply`). ogate /
   # oproxy-* ship as system services (systemd, package managers) and
   # do not currently consume signed manifests.

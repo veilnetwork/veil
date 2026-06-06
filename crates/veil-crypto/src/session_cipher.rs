@@ -60,16 +60,16 @@ pub const AEAD_OVERHEAD: usize = 16;
 ///
 /// # Memory hygiene
 ///
-/// `SessionCipher` is `ZeroizeOnDrop` так that the session key material is
-/// wiped from heap memory as soon as the cipher is dropped. The wipe is а
+/// `SessionCipher` is `ZeroizeOnDrop` so that the session key material is
+/// wiped from heap memory as soon as the cipher is dropped. The wipe is a
 /// composition of two layers:
 ///
-/// * Our `#[derive(Zeroize, ZeroizeOnDrop)]` generates а `Drop` impl that
+/// * Our `#[derive(Zeroize, ZeroizeOnDrop)]` generates a `Drop` impl that
 ///   calls `self.zeroize()` — but the upstream `chacha20poly1305` crate
-///   only implements [`ZeroizeOnDrop`] (а marker trait) on
+///   only implements [`ZeroizeOnDrop`] (a marker trait) on
 ///   `ChaCha20Poly1305`, **not** the [`Zeroize`] trait itself.  Therefore
 ///   the `cipher` field must be `#[zeroize(skip)]` — otherwise the derive
-///   would fail к compile.
+///   would fail to compile.
 ///
 /// * Rust drops struct fields in declaration order **after** the explicit
 ///   `Drop::drop` body runs.  So the actual wipe sequence on drop is:
@@ -79,8 +79,8 @@ pub const AEAD_OVERHEAD: usize = 16;
 ///      → wipes the embedded `Key` (32 bytes of secret material).
 ///
 /// Net effect: 100 % of secret bytes wiped on drop.  The skip annotation
-/// is required для compile, NOT а hole в the zeroize coverage.  See
-/// `cipher_drop_zeroizes_via_upstream` test для type-system verification.
+/// is required for compile, NOT a hole in the zeroize coverage.  See
+/// `cipher_drop_zeroizes_via_upstream` test for type-system verification.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SessionCipher {
     /// `#[zeroize(skip)]` — see struct doc.  Upstream `ChaCha20Poly1305`'s
@@ -183,34 +183,34 @@ impl SessionCipher {
 
     /// b bufpool: decrypt in-place using the AEAD's `AeadInPlace`
     /// trait. `buf` enters containing `ciphertext ‖ tag`; on success
-    /// the buffer is truncated к the plaintext (tag stripped, length
+    /// the buffer is truncated to the plaintext (tag stripped, length
     /// shrinks by `AEAD_OVERHEAD` bytes). On failure the buffer's
-    /// contents are unspecified (документация chacha20poly1305:
+    /// contents are unspecified (docs chacha20poly1305:
     /// "If decryption fails, the buffer is left in an undefined
-    /// state.") — callers MUST NOT read from `buf` after а failed
+    /// state.") — callers MUST NOT read from `buf` after a failed
     /// `open_in_place`.
     ///
     /// Counter-advance discipline matches [`Self::open`]: advances
     /// ONLY on successful AEAD verify (hardening
-    /// rekey-grace correctness). Nonce overflow is а hard error
+    /// rekey-grace correctness). Nonce overflow is a hard error
     /// before any cipher work (same semantics as [`Self::open`]).
     ///
     /// # Rekey-grace caveat
     ///
     /// The rekey-grace fallback relies on
     /// retrying decryption against prior ciphers when the current
-    /// cipher fails. Because `open_in_place` corrupts the buffer на
-    /// failure, **callers that arm rekey-grace must keep а copy of
+    /// cipher fails. Because `open_in_place` corrupts the buffer on
+    /// failure, **callers that arm rekey-grace must keep a copy of
     /// the original ciphertext** before invoking this method — see
     /// runner.rs `decrypt_frame_body_in_place` for the conditional-
     /// i: in-place encrypt variant [`Self::seal`].
     ///
-    /// Encrypts `buf` (treated as plaintext) in-place и returns the 16-byte
+    /// Encrypts `buf` (treated as plaintext) in-place and returns the 16-byte
     /// AEAD tag separately. Caller is responsible for appending the tag at
     /// the desired wire position (typically right after the ciphertext).
     ///
     /// Sidesteps the per-frame `Vec<u8>` allocation [`Self::seal`]
-    /// produces — at 15 k frames/sec on а bootstrap that translates к
+    /// produces — at 15 k frames/sec on a bootstrap that translates to
     /// ~900 MiB/sec of allocator churn outside the bufpool. Combined with
     /// pool-backed output buffers, the wire-encrypt path becomes
     /// zero-allocation per frame.
@@ -290,10 +290,10 @@ mod tests {
     /// 1. `SessionCipher: ZeroizeOnDrop` — our derive generates the
     ///    marker + auto-Drop wrapper.
     /// 2. `ChaCha20Poly1305: ZeroizeOnDrop` — upstream `chacha20poly1305`
-    ///    crate guarantees the wrapped `Key` is wiped в its own `Drop`.
+    ///    crate guarantees the wrapped `Key` is wiped in its own `Drop`.
     ///
     /// If either guarantee regresses (e.g. upstream drops `zeroize`
-    /// feature, or our derive macro changes), this test fails к compile,
+    /// feature, or our derive macro changes), this test fails to compile,
     /// surfacing the regression before silent secret-leak risk hits prod.
     #[test]
     fn cipher_drop_zeroizes_via_upstream() {
@@ -440,7 +440,7 @@ mod tests {
     /// hardening: failed AEAD must NOT advance the
     /// receiver counter. Without this guarantee a transient AEAD failure
     /// (e.g. an OLD-encrypted frame in-flight during rekey) would burn
-    /// the NEW cipher's nonce slot и permanently desynchronise it from
+    /// the NEW cipher's nonce slot and permanently desynchronise it from
     /// the sender, manifesting as the cluster-wide decrypt-failure
     /// storm.
     #[test]
@@ -470,9 +470,9 @@ mod tests {
     fn legitimate_frame_after_failed_attempt_still_decrypts() {
         // Same convention as `tx_and_rx_ciphers_are_compatible`:
         // matched-direction-flag pair shares one key. The crypto
-        // model uses separate keys (tx_key vs rx_key) для direction
-        // separation, не the dir_salt — runner.rs:
-        // both ciphers built с is_tx=true, with distinct keys.
+        // model uses separate keys (tx_key vs rx_key) for direction
+        // separation, not the dir_salt — runner.rs:
+        // both ciphers built with is_tx=true, with distinct keys.
         let key = [9u8; 32];
         let mut enc = SessionCipher::new(&key, true);
         let mut dec = SessionCipher::new(&key, true);
@@ -485,7 +485,7 @@ mod tests {
         assert!(dec.open(&[0u8; 32], TEST_AAD).is_err());
         assert_eq!(dec.frames_processed(), 0);
 
-        // Now the legitimate frame should decrypt at counter=1, не be
+        // Now the legitimate frame should decrypt at counter=1, not be
         // rejected because the receiver already burned counter=1.
         let pt = dec.open(&ct1, TEST_AAD).unwrap();
         assert_eq!(pt, b"hello");
@@ -506,7 +506,7 @@ mod tests {
         let mut buf = ct.clone();
         dec.open_in_place(&mut buf, TEST_AAD)
             .expect("open_in_place");
-        // On success the buffer is truncated к plaintext (tag stripped).
+        // On success the buffer is truncated to plaintext (tag stripped).
         assert_eq!(buf, plaintext, "buffer must hold plaintext after success");
     }
 
@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn open_in_place_legitimate_frame_after_failed_attempt() {
         // Same property as legitimate_frame_after_failed_attempt_still_decrypts
-        // but для the in-place variant — guards against counter desync
+        // but for the in-place variant — guards against counter desync
         // through the new code path.
         let key = test_key(0x99);
         let mut enc = SessionCipher::new(&key, true);
@@ -580,7 +580,7 @@ mod tests {
             "wrong-AAD failure must NOT advance counter"
         );
 
-        // Original ct still decrypts with correct AAD on а fresh buffer.
+        // Original ct still decrypts with correct AAD on a fresh buffer.
         let mut buf2 = ct.clone();
         dec.open_in_place(&mut buf2, TEST_AAD).unwrap();
         assert_eq!(buf2, b"data");
@@ -588,8 +588,8 @@ mod tests {
 
     #[test]
     fn open_in_place_and_open_produce_same_plaintext() {
-        // Cross-check: in-place и heap-alloc variants must yield byte-
-        // identical plaintexts на the same ciphertext. If они drift
+        // Cross-check: in-place and heap-alloc variants must yield byte-
+        // identical plaintexts on the same ciphertext. If they drift
         // production traffic would silently desync.
         let key = test_key(0x44);
         let mut enc = SessionCipher::new(&key, true);

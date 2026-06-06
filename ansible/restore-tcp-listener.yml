@@ -1,10 +1,10 @@
 ---
 # Emergency rollback: re-add the tcp:// listen entry alongside the
 # obfs4-tcp:// one.  Use when drop-tcp-listener.yml partitioned the
-# network due к stale PEX / DHT caches с tcp:// URIs.
+# network due to stale PEX / DHT caches with tcp:// URIs.
 #
 # After this restores connectivity, peers will gradually re-propagate
-# obfs4-tcp:// addresses через PEX gossip.  Once observed во всех
+# obfs4-tcp:// addresses through PEX gossip.  Once observed across all
 # peer-state, drop-tcp-listener.yml can be re-run cleanly.
 
 - name: Restore tcp:// listen entry
@@ -42,7 +42,7 @@
             { id = "0x00000002", transport = "obfs4-tcp://0.0.0.0:5556", advertise = "obfs4-tcp://{{ adv_ip.stdout }}:5556" }
           ]
 
-    - name: Write new listen block через ansible copy then awk-replace
+    - name: Write new listen block through ansible copy then awk-replace
       ansible.builtin.copy:
         dest: /tmp/_veil_new_listen.txt
         content: "{{ listen_block }}"
@@ -74,7 +74,7 @@
         name: veil.service
         state: restarted
 
-    - name: Wait для live veil session
+    - name: Wait for live veil session
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 60); do

@@ -208,10 +208,10 @@ impl IdentitySigningKey {
     /// Audit batch 2026-05-25 phase O: borrow the underlying Ed25519
     /// `SigningKey` if this identity uses Ed25519.  Returns `None` for
     /// Falcon-only identities (post-quantum signing key cannot be cast
-    /// к Ed25519).  Used by the anycast layer к auto-sign IPC-
-    /// initiated advertise records — falls back к unsigned (legacy v1)
+    /// to Ed25519).  Used by the anycast layer to auto-sign IPC-
+    /// initiated advertise records — falls back to unsigned (legacy v1)
     /// when the identity isn't Ed25519, preserving the pre-fix
-    /// behaviour для PQ-only deployments.
+    /// behaviour for PQ-only deployments.
     ///
     /// The reference borrows the embedded `SigningKey`; cloning into
     /// `Arc<SigningKey>` is the typical caller pattern so the key can

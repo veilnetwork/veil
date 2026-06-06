@@ -6,14 +6,14 @@
 //!
 //! **Phase 1b (this commit):** AEAD frame wrap/unwrap core.  Pure
 //! functions; no I/O, no handshake, no key exchange.  This is the
-//! framing layer що sits AFTER an obfs4 handshake derives session
-//! keys — wraps every OVL1 frame в random-looking AEAD ciphertext с
+//! framing layer that sits AFTER an obfs4 handshake derives session
+//! keys — wraps every OVL1 frame in random-looking AEAD ciphertext with
 //! encrypted length so DPI cannot see frame boundaries either.
 //!
 //! **Phase 1c (next session):** NTOR handshake + elligator2 encoding
-//! що produces the session keys consumed by this crate's framing layer.
-//! Wire bytes от Phase 1c handshake are uniformly random; Phase 1b
-//! framing keeps them random для the rest of the connection.
+//! that produces the session keys consumed by this crate's framing layer.
+//! Wire bytes from Phase 1c handshake are uniformly random; Phase 1b
+//! framing keeps them random for the rest of the connection.
 //!
 //! # Wire format (post-handshake stream)
 //!
@@ -24,32 +24,32 @@
 //! [ 16 byte AEAD tag ]
 //! ```
 //!
-//! Length-field encryption: the 2-byte big-endian length is XOR'd с
-//! the first 2 bytes of а ChaCha20 keystream block keyed by the same
+//! Length-field encryption: the 2-byte big-endian length is XOR'd with
+//! the first 2 bytes of a ChaCha20 keystream block keyed by the same
 //! session key, nonce = `b"obfs4-len:v1\0\0\0\0" || counter[..4]`.
 //! Without the key, frame boundaries are invisible — an observer sees
 //! one continuous random byte stream.
 //!
-//! The AEAD body is encrypted с а **separate** nonce derivation
-//! (`b"obfs4-body:v1" || counter[..8]`) so length-keystream и body-key
+//! The AEAD body is encrypted with a **separate** nonce derivation
+//! (`b"obfs4-body:v1" || counter[..8]`) so length-keystream and body-key
 //! domain-separate properly.
 //!
 //! # Counter management
 //!
-//! Each direction maintains а monotonic u64 counter.  Sender increments
+//! Each direction maintains a monotonic u64 counter.  Sender increments
 //! on every wrap; receiver expects strict monotonicity (no
-//! out-of-order, since TCP delivers в order).  Counter overflow → close
-//! the stream (signals что rekey is overdue; handshake should have
+//! out-of-order, since TCP delivers in order).  Counter overflow → close
+//! the stream (signals that rekey is overdue; handshake should have
 //! re-negotiated long before 2^64 frames).
 //!
 //! # Threat model
 //!
 //! In-scope:
-//! - Passive DPI looking для OVL1 magic, frame-length patterns, or
+//! - Passive DPI looking for OVL1 magic, frame-length patterns, or
 //!   distinctive header bytes.  Wire entropy is uniform per AEAD.
 //! - Tampered ciphertext / length field → AEAD rejects, peer disconnect.
 //!
-//! Out-of-scope для Phase 1b:
+//! Out-of-scope for Phase 1b:
 //! - Active probing (handled by Phase 1c silent-drop on bad MAC).
 //! - First-handshake-byte uniformity (handled by Phase 1c elligator2).
 //! - Statistical timing analysis.
@@ -85,7 +85,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum HandshakeError {
-    #[error("failed к generate elligator-encodable keypair (broken RNG?)")]
+    #[error("failed to generate elligator-encodable keypair (broken RNG?)")]
     NoRepresentative,
 
     #[error("handshake message too short: got {0}")]
@@ -97,10 +97,10 @@ pub enum HandshakeError {
     #[error("handshake trailing bytes: {0}")]
     TrailingBytes(usize),
 
-    #[error("client MAC does not match (wrong PSK или tampering)")]
+    #[error("client MAC does not match (wrong PSK or tampering)")]
     ClientMacMismatch,
 
-    #[error("server AUTH does not match (tampered response или wrong server)")]
+    #[error("server AUTH does not match (tampered response or wrong server)")]
     AuthMismatch,
 }
 
@@ -113,17 +113,17 @@ pub const AEAD_TAG_LEN: usize = 16;
 pub const LEN_PREFIX_BYTES: usize = 2;
 
 /// Max length-prefix value (= max ciphertext length).  16 KiB is large
-/// enough для any OVL1 session frame (capped by `MAX_FRAME_BODY = 16 MiB`
-/// в veil-proto, но fragmented к 16 KiB chunks в practice для NIC
+/// enough for any OVL1 session frame (capped by `MAX_FRAME_BODY = 16 MiB`
+/// in veil-proto, but fragmented to 16 KiB chunks in practice for NIC
 /// MTU efficiency).
 pub const MAX_FRAME_CIPHERTEXT_BYTES: usize = 16 * 1024;
 
-/// Max padding appended к each frame body before AEAD.  Larger values
-/// disrupt frame-size fingerprinting но cost bandwidth.  1024 bytes is
-/// the same magnitude як TLS record padding upper bound.
+/// Max padding appended to each frame body before AEAD.  Larger values
+/// disrupt frame-size fingerprinting but cost bandwidth.  1024 bytes is
+/// the same magnitude as TLS record padding upper bound.
 pub const MAX_PADDING_BYTES: usize = 1024;
 
-/// Max plaintext bytes that fit into а single obfs4 frame с the
+/// Max plaintext bytes that fit into a single obfs4 frame with the
 /// worst-case padding budget.  `MAX_FRAME_CIPHERTEXT_BYTES - AEAD_TAG_LEN
 /// - MAX_PADDING_BYTES` — callers fragmenting large writes (e.g.
 /// `Obfs4Stream::poll_write`) bound each chunk at this value so
@@ -131,22 +131,22 @@ pub const MAX_PADDING_BYTES: usize = 1024;
 pub const MAX_PLAINTEXT_PER_FRAME: usize =
     MAX_FRAME_CIPHERTEXT_BYTES - AEAD_TAG_LEN - MAX_PADDING_BYTES;
 
-// Audit batch 2026-05-25 phase M: lock в the chunking-math invariants.
+// Audit batch 2026-05-25 phase M: lock in the chunking-math invariants.
 // `MAX_PLAINTEXT_PER_FRAME` derives MAX_FRAME_CIPHERTEXT_BYTES minus
-// the AEAD overhead и а conservative `MAX_PADDING_BYTES` budget
+// the AEAD overhead and a conservative `MAX_PADDING_BYTES` budget
 // (`wrap_frame` actually caps the wire pad-len byte at u8::MAX=255 via
 // `.min(255)` regardless of MAX_PADDING_BYTES, so the formula is
-// over-conservative — а strict improvement).  Compile-time invariants
+// over-conservative — a strict improvement).  Compile-time invariants
 // guard the underlying arithmetic against silently going negative or
 // past the wire-frame cap.
 const _: () = {
     assert!(
         AEAD_TAG_LEN < MAX_FRAME_CIPHERTEXT_BYTES,
-        "MAX_FRAME_CIPHERTEXT_BYTES must leave room для the AEAD tag",
+        "MAX_FRAME_CIPHERTEXT_BYTES must leave room for the AEAD tag",
     );
     assert!(
         AEAD_TAG_LEN + MAX_PADDING_BYTES < MAX_FRAME_CIPHERTEXT_BYTES,
-        "AEAD_TAG_LEN + MAX_PADDING_BYTES must fit под MAX_FRAME_CIPHERTEXT_BYTES \
+        "AEAD_TAG_LEN + MAX_PADDING_BYTES must fit under MAX_FRAME_CIPHERTEXT_BYTES \
          otherwise MAX_PLAINTEXT_PER_FRAME underflows",
     );
     assert!(
@@ -155,7 +155,7 @@ const _: () = {
     );
 };
 
-/// HKDF context — domain separates key-deriv от any other obfs use of
+/// HKDF context — domain separates key-deriv from any other obfs use of
 /// the same shared secret.
 pub const HKDF_CONTEXT: &[u8] = b"veil-obfs4-stream:v1";
 
@@ -185,18 +185,18 @@ pub enum FrameError {
 // ── Direction keys ───────────────────────────────────────────────────────────
 
 /// Per-direction session keys.  An obfs4 stream has TWO of these:
-/// one для client-к-server и one для server-к-client.  Each direction
+/// one for client-to-server and one for server-to-client.  Each direction
 /// has its own AEAD key + length-encryption key + monotonic counter.
 ///
-/// Derived от the handshake's shared secret via HKDF с per-direction
+/// Derived from the handshake's shared secret via HKDF with per-direction
 /// context label.
 #[derive(ZeroizeOnDrop)]
 pub struct DirectionKey {
-    /// AEAD cipher для frame body.
+    /// AEAD cipher for frame body.
     #[zeroize(skip)]
     body_cipher: ChaCha20Poly1305,
-    /// AEAD cipher для length-prefix encryption.  Different key
-    /// derived от same shared secret через separate HKDF info.
+    /// AEAD cipher for length-prefix encryption.  Different key
+    /// derived from same shared secret through separate HKDF info.
     #[zeroize(skip)]
     len_cipher: ChaCha20Poly1305,
 }
@@ -208,11 +208,11 @@ impl std::fmt::Debug for DirectionKey {
 }
 
 impl DirectionKey {
-    /// Derive а direction key от the post-handshake shared secret.
+    /// Derive a direction key from the post-handshake shared secret.
     ///
     /// `shared_secret` — 32-byte X25519 output (typically).
-    /// `direction_label` — e.g. b"c2s" или b"s2c", domain-separating
-    ///   the two directions так что keys are independent.
+    /// `direction_label` — e.g. b"c2s" or b"s2c", domain-separating
+    ///   the two directions so that keys are independent.
     pub fn derive(shared_secret: &[u8], direction_label: &[u8]) -> Self {
         let hk = Hkdf::<Sha256>::new(None, shared_secret);
         let mut body_key = [0u8; 32];
@@ -247,7 +247,7 @@ impl DirectionKey {
     #[doc(hidden)]
     pub fn from_raw_for_test(secret: &[u8; 32]) -> Self {
         let body_cipher = ChaCha20Poly1305::new(Key::from_slice(secret));
-        // For test, derive а distinct len_key by XOR — still
+        // For test, derive a distinct len_key by XOR — still
         // domain-separated for testing purposes.
         let mut len_key = *secret;
         for (i, b) in len_key.iter_mut().enumerate() {
@@ -264,7 +264,7 @@ impl DirectionKey {
 
 // ── Nonce derivation ─────────────────────────────────────────────────────────
 
-/// Build the 12-byte body-AEAD nonce от counter.  Domain-separated от
+/// Build the 12-byte body-AEAD nonce from counter.  Domain-separated from
 /// the length-encryption nonce so the two ciphers never share nonce-key
 /// state.
 fn body_nonce(counter: u64) -> [u8; NONCE_LEN] {
@@ -274,7 +274,7 @@ fn body_nonce(counter: u64) -> [u8; NONCE_LEN] {
     n
 }
 
-/// Build the 12-byte length-AEAD nonce от counter.  Used to encrypt
+/// Build the 12-byte length-AEAD nonce from counter.  Used to encrypt
 /// (well, AEAD-encrypt without using the tag) the 2-byte length prefix.
 fn len_nonce(counter: u64) -> [u8; NONCE_LEN] {
     let mut n = [0u8; NONCE_LEN];
@@ -285,25 +285,25 @@ fn len_nonce(counter: u64) -> [u8; NONCE_LEN] {
 
 // ── Frame wrap / unwrap ──────────────────────────────────────────────────────
 
-/// Wrap an outbound payload into а wire frame.
+/// Wrap an outbound payload into a wire frame.
 ///
 /// Steps:
-/// 1. Pick а random pad-length в `[0, MAX_PADDING_BYTES]`.
+/// 1. Pick a random pad-length in `[0, MAX_PADDING_BYTES]`.
 /// 2. Build body = `[1 byte pad-len || payload || pad-len bytes random]`.
-/// 3. AEAD-encrypt body с `body_cipher` keyed на counter-derived nonce.
-/// 4. Encrypt the 2-byte length prefix с `len_cipher` AEAD (taking only
+/// 3. AEAD-encrypt body with `body_cipher` keyed on counter-derived nonce.
+/// 4. Encrypt the 2-byte length prefix with `len_cipher` AEAD (taking only
 ///    the first 2 bytes of the resulting ciphertext — we discard the
-///    AEAD tag для the length prefix since the body's AEAD tag already
+///    AEAD tag for the length prefix since the body's AEAD tag already
 ///    authenticates the entire frame including its length).
 ///
-/// Step (4) deserves а note: we treat the length-cipher as а keystream-
-/// only operation by XOR'ing the plaintext length с 2 bytes derived
-/// от encrypting `[0u8; 2]` под the length-cipher's keyed AEAD.  This
-/// gives us а PRF на the (key, counter) pair without committing к ChaCha20
+/// Step (4) deserves a note: we treat the length-cipher as a keystream-
+/// only operation by XOR'ing the plaintext length with 2 bytes derived
+/// from encrypting `[0u8; 2]` under the length-cipher's keyed AEAD.  This
+/// gives us a PRF on the (key, counter) pair without committing to ChaCha20
 /// streamcipher API directly (chacha20poly1305 crate doesn't expose the
 /// streamcipher).  The trade-off: 2-byte AEAD wraps internally produce
 /// 18 bytes but we extract only the first 2 ciphertext bytes — that's
-/// equivalent к ChaCha20 keystream prefix encryption.
+/// equivalent to ChaCha20 keystream prefix encryption.
 pub fn wrap_frame(key: &DirectionKey, counter: u64, payload: &[u8]) -> Result<Vec<u8>, FrameError> {
     // Pad-length: random 0..=MAX_PADDING_BYTES.
     let mut pad_byte = [0u8; 2];
@@ -313,7 +313,7 @@ pub fn wrap_frame(key: &DirectionKey, counter: u64, payload: &[u8]) -> Result<Ve
     // Body = pad-len-byte || payload || random padding.
     //
     // Audit batch 2026-05-25 phase M: clarified comment.  Wire format
-    // packs pad_len в а single u8, so we cap к 255 first then build
+    // packs pad_len in a single u8, so we cap to 255 first then build
     // the body — receiver reads exactly `pad_len` bytes off the tail.
     // NOTE (audit cycle-6): the runtime `.min(u8::MAX)` below is the ONLY
     // guard — `MAX_PADDING_BYTES` is intentionally larger than `u8::MAX`
@@ -358,11 +358,11 @@ pub fn wrap_frame(key: &DirectionKey, counter: u64, payload: &[u8]) -> Result<Ve
     Ok(out)
 }
 
-/// Decrypt + verify а frame from wire bytes.  Caller is responsible
-/// для buffering enough bytes на the underlying transport so що the
-/// length-prefix can be decrypted, then the body fetched in а second
+/// Decrypt + verify a frame from wire bytes.  Caller is responsible
+/// for buffering enough bytes on the underlying transport so that the
+/// length-prefix can be decrypted, then the body fetched in a second
 /// read.  This crate exposes the framing as pure functions; the
-/// caller's tokio read-loop applies them в the correct order.
+/// caller's tokio read-loop applies them in the correct order.
 ///
 /// Returns `(consumed, payload)` so the caller can advance its buffer.
 /// `consumed` includes the length prefix.
@@ -412,9 +412,9 @@ pub fn unwrap_frame(
     Ok((LEN_PREFIX_BYTES + body_len, payload))
 }
 
-/// Encrypt the 2-byte length prefix.  Uses а keystream-only construction
-/// over the length-cipher: encrypt 2 zero bytes под (len_key, len_nonce)
-/// и XOR с the plaintext length.  AEAD tag is discarded — body AEAD
+/// Encrypt the 2-byte length prefix.  Uses a keystream-only construction
+/// over the length-cipher: encrypt 2 zero bytes under (len_key, len_nonce)
+/// and XOR with the plaintext length.  AEAD tag is discarded — body AEAD
 /// authenticates the entire frame anyway.
 fn encrypt_len_prefix(
     key: &DirectionKey,
@@ -426,7 +426,7 @@ fn encrypt_len_prefix(
         .len_cipher
         .encrypt(Nonce::from_slice(&len_nonce(counter)), zero.as_slice())
         .map_err(|_| FrameError::AeadFailure)?;
-    // Take первые 2 bytes of the AEAD ciphertext as keystream.  The
+    // Take first 2 bytes of the AEAD ciphertext as keystream.  The
     // AEAD tag (16 trailing bytes) is discarded.
     let mut out = [0u8; LEN_PREFIX_BYTES];
     for i in 0..LEN_PREFIX_BYTES {
@@ -436,7 +436,7 @@ fn encrypt_len_prefix(
 }
 
 /// Decrypt the 2-byte length prefix (inverse of `encrypt_len_prefix`).
-/// XOR is symmetric so the function is identical к encrypt.
+/// XOR is symmetric so the function is identical to encrypt.
 fn decrypt_len_prefix(
     key: &DirectionKey,
     counter: u64,
@@ -447,7 +447,7 @@ fn decrypt_len_prefix(
 
 // ── Stream state machine (monotonic counter) ─────────────────────────────────
 
-/// Outbound stream state: holds the direction key и monotonic counter.
+/// Outbound stream state: holds the direction key and monotonic counter.
 /// One per direction (sender uses its own, peer's sender uses its own
 /// in the opposite direction).
 pub struct OutboundStream {
@@ -460,8 +460,8 @@ impl OutboundStream {
         Self { key, counter: 0 }
     }
 
-    /// Wrap а frame, advancing the counter.  Returns wire bytes ready
-    /// для `AsyncWrite::write_all`.
+    /// Wrap a frame, advancing the counter.  Returns wire bytes ready
+    /// for `AsyncWrite::write_all`.
     pub fn wrap_next(&mut self, payload: &[u8]) -> Result<Vec<u8>, FrameError> {
         self.counter = self
             .counter
@@ -472,8 +472,8 @@ impl OutboundStream {
 }
 
 /// Inbound stream state: direction key + expected next counter.  Counter
-/// must be strictly monotonic (TCP delivers в order; out-of-order or
-/// gaps signal tampering или session loss).
+/// must be strictly monotonic (TCP delivers in order; out-of-order or
+/// gaps signal tampering or session loss).
 pub struct InboundStream {
     key: DirectionKey,
     expected_counter: u64,
@@ -487,9 +487,9 @@ impl InboundStream {
         }
     }
 
-    /// Peek the next frame's length от wire bytes (decrypts the
+    /// Peek the next frame's length from wire bytes (decrypts the
     /// 2-byte length prefix).  Caller uses this to know how many more
-    /// bytes к buffer before calling `unwrap_next`.
+    /// bytes to buffer before calling `unwrap_next`.
     ///
     /// Does NOT advance the counter — call `unwrap_next` once enough
     /// bytes are buffered.
@@ -507,7 +507,7 @@ impl InboundStream {
         Ok(u16::from_be_bytes(len_pt) as usize)
     }
 
-    /// Unwrap а complete frame.  Advances the counter on success.
+    /// Unwrap a complete frame.  Advances the counter on success.
     pub fn unwrap_next(&mut self, wire: &[u8]) -> Result<(usize, Vec<u8>), FrameError> {
         let next_counter = self
             .expected_counter
@@ -519,7 +519,7 @@ impl InboundStream {
     }
 }
 
-// ── Constant-time helpers (re-exported для callers) ──────────────────────────
+// ── Constant-time helpers (re-exported for callers) ──────────────────────────
 
 use subtle::ConstantTimeEq;
 
@@ -591,7 +591,7 @@ mod tests {
         let mut out = OutboundStream::new(sk);
         let mut inb = InboundStream::new(rk);
 
-        // ~14 KiB payload + padding должно fit под MAX_FRAME_CIPHERTEXT_BYTES.
+        // ~14 KiB payload + padding must fit under MAX_FRAME_CIPHERTEXT_BYTES.
         let payload = vec![0xABu8; 14_000];
         let wire = out.wrap_next(&payload).unwrap();
         let (_, got) = inb.unwrap_next(&wire).unwrap();
@@ -605,7 +605,7 @@ mod tests {
         let mut inb = InboundStream::new(rk);
 
         let mut wire = out.wrap_next(b"hello").unwrap();
-        // Flip byte в the body region.
+        // Flip byte in the body region.
         wire[LEN_PREFIX_BYTES + 2] ^= 0x01;
         assert_eq!(inb.unwrap_next(&wire).unwrap_err(), FrameError::AeadFailure);
     }
@@ -617,11 +617,11 @@ mod tests {
         let mut inb = InboundStream::new(rk);
 
         let mut wire = out.wrap_next(b"hello").unwrap();
-        wire[0] ^= 0x01; // flip а length-prefix bit
+        wire[0] ^= 0x01; // flip a length-prefix bit
         let err = inb.unwrap_next(&wire).unwrap_err();
         // Could surface as `TooShort` (decrypted len > available) or
         // `OversizedFrame` (decrypted len > cap) or `AeadFailure` (length
-        // happens к be valid but body decrypt fails).
+        // happens to be valid but body decrypt fails).
         assert!(matches!(
             err,
             FrameError::TooShort(_) | FrameError::OversizedFrame(_) | FrameError::AeadFailure
@@ -638,8 +638,8 @@ mod tests {
         let w2 = out.wrap_next(b"second").unwrap();
 
         // Consume w2 first — counter mismatch.  Decrypts under wrong
-        // counter → length prefix decrypts к garbage → either too-short
-        // or oversized-frame or (rarely) AEAD fails after а valid-looking
+        // counter → length prefix decrypts to garbage → either too-short
+        // or oversized-frame or (rarely) AEAD fails after a valid-looking
         // length.  Any of the three means rejection.
         let err = inb.unwrap_next(&w2).unwrap_err();
         assert!(matches!(
@@ -658,7 +658,7 @@ mod tests {
         let mut out = OutboundStream::new(sk);
         let mut lengths = std::collections::HashSet::new();
         // 200 frames with the same payload should produce variable
-        // wire lengths thanks к random padding.
+        // wire lengths thanks to random padding.
         for _ in 0..200 {
             let wire = out.wrap_next(b"same payload").unwrap();
             lengths.insert(wire.len());
@@ -696,7 +696,7 @@ mod tests {
         let mut inb_wrong = InboundStream::new(dk_s2c);
 
         let wire = out.wrap_next(b"hello").unwrap();
-        // Wrong-direction key → length prefix decrypts к garbage, then
+        // Wrong-direction key → length prefix decrypts to garbage, then
         // either the apparent body length exceeds available bytes
         // (TooShort), exceeds the cap (OversizedFrame), or matches but
         // body AEAD fails.  Any rejection mode is acceptable.
@@ -744,7 +744,7 @@ mod tests {
         out.counter = u64::MAX - 1;
         inb.expected_counter = u64::MAX - 1;
 
-        // One more wrap → counter advances к u64::MAX → OK.
+        // One more wrap → counter advances to u64::MAX → OK.
         let wire = out.wrap_next(b"last").unwrap();
         let (_, got) = inb.unwrap_next(&wire).unwrap();
         assert_eq!(got, b"last");

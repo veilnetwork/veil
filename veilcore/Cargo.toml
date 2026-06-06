@@ -48,16 +48,16 @@ test-low-difficulty = [
 # provider backed by BoringSSL, and it drives the `btls` choice.  See Epic
 # 409 notes in TASKS.md.
 tls-boring = ["dep:btls", "dep:tokio-btls", "dep:quinn-btls", "veil-transport/tls-boring", "veil-bootstrap/tls-boring", "veil-update/tls-boring"]
-# Phase 6.50.b audit-C2: `tls-webpki-roots` is now а semver-stable
+# Phase 6.50.b audit-C2: `tls-webpki-roots` is now a semver-stable
 # no-op kept for existing build configs (see veil-transport's feature
-# definition for the full history).  `use_system_roots = true` в
+# definition for the full history).  `use_system_roots = true` in
 # `transport.tls_client` config is now respected unconditionally —
-# webpki-roots is always present в the binary because
+# webpki-roots is always present in the binary because
 # `veil-transport` needs it for the HTTPS bootstrap path.
-# Scheduled for removal в the next semver-major.
+# Scheduled for removal in the next semver-major.
 tls-webpki-roots = ["veil-transport/tls-webpki-roots"]
 
-# Phase 5 (veilcore extraction): `veil-cli` binary moved к veil-cli crate.
+# Phase 5 (veilcore extraction): `veil-cli` binary moved to veil-cli crate.
 
 [dependencies]
 veil-abuse = { path = "../crates/veil-abuse" }
@@ -131,15 +131,15 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 rcgen = "0.13"
 rustls = "0.23"
 # Phase 6.50.b followup: dropped `rustls-pemfile` (RUSTSEC-2025-0134
-# unmaintained) — was а zombie dep here anyway (no `use rustls_pemfile`
-# в veilcore source; only `veil-transport` actually parsed PEM,
-# now migrated к `rustls-pki-types::pem::PemObject`).
+# unmaintained) — was a zombie dep here anyway (no `use rustls_pemfile`
+# in veilcore source; only `veil-transport` actually parsed PEM,
+# now migrated to `rustls-pki-types::pem::PemObject`).
 rustls-pki-types = "1.14"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 socket2 = "0.5"
 thiserror = "2.0"
-# Terminal-echo-disabled password prompt для interactive key_passphrase_prompt.
+# Terminal-echo-disabled password prompt for interactive key_passphrase_prompt.
 # Pure-Rust, no C deps, stdlib + termios on Unix / Win32 console on Windows.
 rpassword = "7"
 tokio = { version = "1.42", features = ["full"] }
@@ -162,7 +162,7 @@ tokio-btls = { version = "0.5", optional = true }
 quinn-btls = { version = "0.1", optional = true }
 
 # Phase 6.50.b audit-C2: dropped — `veil-transport` already pulls
-# `webpki-roots` as а direct (non-optional) dep, so listing it as
+# `webpki-roots` as a direct (non-optional) dep, so listing it as
 # optional here was redundant.  The dep is still in the binary; only
 # this duplicated declaration is gone.
 
@@ -175,28 +175,28 @@ windows-service = "0.8"
 # jemalloc as global allocator on Linux (2026-05-13 OOM follow-up).
 # glibc malloc fragments aggressively under bursty mixed-size workloads:
 # the veil daemon's chat_node-style 60 KB frame churn + session
-# tear-down/reconnect cycles от chaos-ban created ~5-10 MB/min ambient
-# RSS growth на bootstrap hubs — но не на non-bootstrap nodes which see
+# tear-down/reconnect cycles from chaos-ban created ~5-10 MB/min ambient
+# RSS growth on bootstrap hubs — but not on non-bootstrap nodes which see
 # fewer/smaller relay paths.  RSS plateaued instantly when traffic was
 # stopped (no true leak), so the growth is purely allocator overhead
-# that does not get returned к OS.  jemalloc handles this pattern
+# that does not get returned to OS.  jemalloc handles this pattern
 # orders-of-magnitude better.  Linux-only — Windows uses its own
 # fragmentation-resistant allocator.
 [target.'cfg(target_os = "linux")'.dependencies]
 # Phase 6.50.d.5n: `profiling` feature enables jemalloc's heap-profiling
 # support so we can dump heap callstacks via `MALLOC_CONF=prof:true,...`
-# and analyse с `jeprof`.  Build-time only — runtime overhead is gated
+# and analyse with `jeprof`.  Build-time only — runtime overhead is gated
 # by `MALLOC_CONF=prof_active:true`, so production binaries can ship
-# с this feature без paying для profiling unless explicitly enabled
+# with this feature without paying for profiling unless explicitly enabled
 # via the env at startup.
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
-# Phase 6.50.b chaos-sim V2-D: enable tokio time-pause + advance для
+# Phase 6.50.b chaos-sim V2-D: enable tokio time-pause + advance for
 # compressed-time tests.  Dev-only — `test-util` MUST NOT leak into
-# production builds, иначе real-time code paths get а fake clock и
-# timers stop firing на а live node.
+# production builds, otherwise real-time code paths get a fake clock and
+# timers stop firing on a live node.
 tokio = { version = "1.42", features = ["full", "test-util"] }
 # Re-list veil-crypto with the test-low-difficulty feature enabled so
 # veilcore's own #[cfg(test)] runs inherit the 16-bit PoW that

@@ -1,6 +1,6 @@
-// Pure-Dart unit tests для the mailbox wrapper's wire-byte mapping +
-// public-API exports.  Live-daemon I/O tests belong к the integration
-// suite (separate, requires а running `veil-cli daemon`).
+// Pure-Dart unit tests for the mailbox wrapper's wire-byte mapping +
+// public-API exports.  Live-daemon I/O tests belong to the integration
+// suite (separate, requires a running `veil-cli daemon`).
 
 import 'dart:typed_data';
 
@@ -15,7 +15,7 @@ void main() {
         expect(
           MailboxPutStatus.fromWire(s.wireByte),
           s,
-          reason: 'wire byte ${s.wireByte} must decode к $s',
+          reason: 'wire byte ${s.wireByte} must decode to $s',
         );
       }
     });
@@ -58,7 +58,7 @@ void main() {
   group('Mailbox public exports', () {
     test('VeilMailbox + MailboxBlob types resolve through public API',
         () {
-      // Smoke check: types are exported и compile-resolvable.
+      // Smoke check: types are exported and compile-resolvable.
       const t1 = VeilMailbox;
       const t2 = MailboxBlob;
       const t3 = MailboxPutResult;
@@ -71,7 +71,7 @@ void main() {
   });
 
   group('Push wake-HMAC end-to-end surface', () {
-    test('RendezvousReplica is exported и holds the per-replica blobs', () {
+    test('RendezvousReplica is exported and holds the per-replica blobs', () {
       final r = RendezvousReplica(
         relayNodeId: Uint8List(32),
         validUntilUnix: 1717000000,

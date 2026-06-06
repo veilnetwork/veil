@@ -1,12 +1,12 @@
-//! Stateless AEAD-per-datagram obfuscation для UDP plaintext transports.
+//! Stateless AEAD-per-datagram obfuscation for UDP plaintext transports.
 //!
 //! Phase 1a of [`docs/internal/PLAN_TRANSPORT_OBFUSCATION.md`](../../docs/internal/PLAN_TRANSPORT_OBFUSCATION.md).
 //!
 //! # What this crate does
 //!
-//! Wraps each outbound UDP datagram в an AEAD envelope so что the wire
-//! bytes are statistically indistinguishable от random.  Passive DPI
-//! that looks для the OVL1 magic (`4f 56 4c 31`) sees only ciphertext.
+//! Wraps each outbound UDP datagram in an AEAD envelope so that the wire
+//! bytes are statistically indistinguishable from random.  Passive DPI
+//! that looks for the OVL1 magic (`4f 56 4c 31`) sees only ciphertext.
 //!
 //! ## Design
 //!
@@ -26,26 +26,26 @@
 //! - **AEAD nonce** = first 12 bytes of `nonce-prefix || counter` (24 bytes
 //!   total; the AEAD primitive consumes 12).  Random prefix gives 2^96
 //!   nonce-uniqueness even if counter is reused across distinct senders.
-//! - **Replay window** (opt-in) = sliding bitmap по counter, default 1024
+//! - **Replay window** (opt-in) = sliding bitmap by counter, default 1024
 //!   slots (= 128 bytes of state per peer). Applied ONLY by the *stateful*
 //!   [`ReceiverState::open_and_check`] (after AEAD verify); the stateless
 //!   [`open_datagram`] helper does NOT consult it — see Threat model below.
 //!
 //! ## Properties
 //!
-//! - **Wire entropy:** uniformly random для an observer без the key.
-//!   Counter в plaintext но cannot be advanced or replayed без the key.
+//! - **Wire entropy:** uniformly random for an observer without the key.
+//!   Counter in plaintext but cannot be advanced or replayed without the key.
 //! - **Loss-tolerant:** datagram drop doesn't break anything; next
 //!   datagram decrypts independently.
 //! - **Reorder-tolerant:** sliding replay window accepts out-of-order
-//!   counter values up к window-width back от the highest-seen counter.
+//!   counter values up to window-width back from the highest-seen counter.
 //! - **Duplicate-resistant:** replay window's bitmap reject already-seen
 //!   counters.
 //!
 //! ## Threat model
 //!
 //! In-scope (always — stateless `seal_datagram` / `open_datagram`):
-//! - Passive DPI looking для plaintext OVL1 magic.
+//! - Passive DPI looking for plaintext OVL1 magic.
 //! - Statistical fingerprinting of packet bodies (header bytes leak protocol).
 //!
 //! In-scope ONLY via the *stateful* [`ReceiverState`] / [`SenderState`] API:
@@ -59,15 +59,15 @@
 //!   should use [`ReceiverState::open_and_check`] to get replay rejection.
 //!
 //! Out-of-scope:
-//! - Active probers que know the PSK (== anyone в the bootstrap pool).
+//! - Active probers que know the PSK (== anyone in the bootstrap pool).
 //! - Traffic analysis (packet timing, size patterns).
-//! - PSK leakage: compromise of PSK reveals all past и future traffic
+//! - PSK leakage: compromise of PSK reveals all past and future traffic
 //!   encrypted under it.  This is the central trade-off vs handshake-
 //!   based (WireGuard-style) UDP obfuscation — accepted because UDP
-//!   в veil carries discovery / NAT-probe / diagnostic traffic
-//!   а не long-lived data streams.
+//!   in veil carries discovery / NAT-probe / diagnostic traffic
+//!   a not long-lived data streams.
 //!
-//! See plan doc для re-open triggers.
+//! See plan doc for re-open triggers.
 
 #![forbid(unsafe_code)]
 
@@ -94,7 +94,7 @@ pub const COUNTER_LEN: usize = 8;
 /// ChaCha20-Poly1305 AEAD tag length.
 pub const AEAD_TAG_LEN: usize = 16;
 
-/// Total wire overhead added к every payload.
+/// Total wire overhead added to every payload.
 pub const WIRE_OVERHEAD: usize = NONCE_PREFIX_LEN + COUNTER_LEN + AEAD_TAG_LEN;
 
 /// Default sliding-replay-window width (bits) per peer.  1024 = 128 bytes
@@ -102,12 +102,12 @@ pub const WIRE_OVERHEAD: usize = NONCE_PREFIX_LEN + COUNTER_LEN + AEAD_TAG_LEN;
 /// positions behind the highest-seen counter.
 pub const DEFAULT_REPLAY_WINDOW_BITS: u64 = 1024;
 
-/// Maximum padding bytes appended к payload before AEAD encrypt.  Random
+/// Maximum padding bytes appended to payload before AEAD encrypt.  Random
 /// padding length defeats fixed-size fingerprinting where DPI matches
 /// distinctive payload-size buckets.
 pub const MAX_PADDING_BYTES: usize = 256;
 
-/// HKDF context label.  Domain-separated so the same PSK reused для another
+/// HKDF context label.  Domain-separated so the same PSK reused for another
 /// purpose doesn't produce key collisions.
 pub const HKDF_INFO_PREFIX: &[u8] = b"veil-udp-obfs:v1:";
 
@@ -133,9 +133,9 @@ pub enum ObfsError {
 
 // ── Key derivation ───────────────────────────────────────────────────────────
 
-/// Per-peer obfuscation key.  Derived once at construction; stored как
-/// raw 32 bytes wrapped в `ChaCha20Poly1305` cipher для reuse across
-/// many datagrams без re-running HKDF.
+/// Per-peer obfuscation key.  Derived once at construction; stored as
+/// raw 32 bytes wrapped in `ChaCha20Poly1305` cipher for reuse across
+/// many datagrams without re-running HKDF.
 ///
 /// `ZeroizeOnDrop` clears the key material at drop.  `Zeroize` skip on
 /// the cipher field is necessary because upstream's `ChaCha20Poly1305`
@@ -148,9 +148,9 @@ pub struct ObfsKey {
 }
 
 impl ObfsKey {
-    /// Derive an obfuscation key для traffic к/от `peer_node_id` from
+    /// Derive an obfuscation key for traffic to/from `peer_node_id` from
     /// the deployment's pre-shared key `psk`.  Both sides must derive
-    /// the SAME key for а given (psk, peer_node_id) pair.
+    /// the SAME key for a given (psk, peer_node_id) pair.
     ///
     /// HKDF context: `"veil-udp-obfs:v1:" || peer_node_id` (32 bytes).
     pub fn derive(psk: &[u8], peer_node_id: &[u8; 32]) -> Self {
@@ -180,14 +180,14 @@ impl ObfsKey {
 
 // ── Wire format helpers ──────────────────────────────────────────────────────
 
-/// Build the 12-byte AEAD nonce от prefix + counter.  ChaCha20-Poly1305
+/// Build the 12-byte AEAD nonce from prefix + counter.  ChaCha20-Poly1305
 /// consumes 12 bytes; we have 16 + 8 = 24 bytes of nonce material
 /// available, fold them deterministically:
 ///
 /// `nonce = prefix[0..4] XOR counter_bytes[0..4] || prefix[4..12]`.
 ///
 /// This gives uniform distribution on the nonce space even when senders
-/// happen к pick the same random prefix; counter ensures uniqueness
+/// happen to pick the same random prefix; counter ensures uniqueness
 /// per-sender, prefix ensures cross-sender separation.
 fn build_nonce(prefix: &[u8; NONCE_PREFIX_LEN], counter: u64) -> [u8; 12] {
     let counter_bytes = counter.to_be_bytes();
@@ -199,9 +199,9 @@ fn build_nonce(prefix: &[u8; NONCE_PREFIX_LEN], counter: u64) -> [u8; 12] {
     nonce[3] = prefix[3] ^ counter_bytes[3];
     // Bytes 4..12: prefix[4..12] verbatim.
     nonce[4..12].copy_from_slice(&prefix[4..12]);
-    // Mix low half of counter into bytes 8..12 для full per-counter
-    // uniqueness when prefix is reused across many datagrams от
-    // one sender (unlikely с 16-byte random но belt-and-braces).
+    // Mix low half of counter into bytes 8..12 for full per-counter
+    // uniqueness when prefix is reused across many datagrams from
+    // one sender (unlikely with 16-byte random but belt-and-braces).
     nonce[8] ^= counter_bytes[4];
     nonce[9] ^= counter_bytes[5];
     nonce[10] ^= counter_bytes[6];
@@ -209,14 +209,14 @@ fn build_nonce(prefix: &[u8; NONCE_PREFIX_LEN], counter: u64) -> [u8; 12] {
     nonce
 }
 
-/// Generate а fresh 16-byte random nonce-prefix.
+/// Generate a fresh 16-byte random nonce-prefix.
 fn fresh_prefix() -> [u8; NONCE_PREFIX_LEN] {
     let mut buf = [0u8; NONCE_PREFIX_LEN];
     rand::rng().fill_bytes(&mut buf);
     buf
 }
 
-/// Generate а random padding length в `0..=255` bytes.
+/// Generate a random padding length in `0..=255` bytes.
 fn fresh_padding_len() -> u8 {
     let mut b = [0u8; 1];
     rand::rng().fill_bytes(&mut b);
@@ -229,17 +229,17 @@ fn fresh_padding_len() -> u8 {
 
 // ── Encrypt / decrypt ────────────────────────────────────────────────────────
 
-/// Encrypt а datagram с the given counter.  Caller picks the counter
-/// (typically а monotonically-increasing per-peer u64); each (key
-/// counter) pair must be unique по AEAD security.
+/// Encrypt a datagram with the given counter.  Caller picks the counter
+/// (typically a monotonically-increasing per-peer u64); each (key
+/// counter) pair must be unique by AEAD security.
 ///
-/// Returns the wire-bytes ready к hand к `UdpSocket::send_to`.
+/// Returns the wire-bytes ready to hand to `UdpSocket::send_to`.
 pub fn seal_datagram(key: &ObfsKey, counter: u64, payload: &[u8]) -> Result<Vec<u8>, ObfsError> {
     let prefix = fresh_prefix();
     let nonce_bytes = build_nonce(&prefix, counter);
     let pad_len = fresh_padding_len();
 
-    // Prefix body с 1-byte pad-length, then payload, then random padding.
+    // Prefix body with 1-byte pad-length, then payload, then random padding.
     let mut body = Vec::with_capacity(1 + payload.len() + pad_len as usize);
     body.push(pad_len);
     body.extend_from_slice(payload);
@@ -267,17 +267,17 @@ pub fn seal_datagram(key: &ObfsKey, counter: u64, payload: &[u8]) -> Result<Vec<
     Ok(out)
 }
 
-/// Decrypt а datagram, returning the original payload (с padding stripped).
+/// Decrypt a datagram, returning the original payload (with padding stripped).
 ///
 /// Performs:
 /// 1. Length check (≥ `WIRE_OVERHEAD`).
 /// 2. Counter extraction (plaintext from wire).
-/// 3. AEAD verify + decrypt с the derived nonce.
-/// 4. Pad-length validation и trimming.
+/// 3. AEAD verify + decrypt with the derived nonce.
+/// 4. Pad-length validation and trimming.
 ///
-/// Does NOT consult а replay window — callers що need replay protection
+/// Does NOT consult a replay window — callers that need replay protection
 /// must invoke [`ReplayWindow::check_and_record`] separately.  Splitting
-/// the AEAD-verify step от replay-check lets callers что don't care
+/// the AEAD-verify step from replay-check lets callers that don't care
 /// about replay (e.g., one-shot probes) opt out cheaply.
 pub fn open_datagram(key: &ObfsKey, wire: &[u8]) -> Result<(u64, Vec<u8>), ObfsError> {
     if wire.len() < WIRE_OVERHEAD {
@@ -319,8 +319,8 @@ pub fn open_datagram(key: &ObfsKey, wire: &[u8]) -> Result<(u64, Vec<u8>), ObfsE
 
 /// Sliding-bitmap replay window.
 ///
-/// Tracks the highest counter seen so far и а bitmap of recent counters.
-/// Counters more than `bits` behind the highest are rejected как "too old."
+/// Tracks the highest counter seen so far and a bitmap of recent counters.
+/// Counters more than `bits` behind the highest are rejected as "too old."
 /// Counters within the window are checked against the bitmap; already-seen
 /// → reject; not-seen → record + accept.  Counters AHEAD of `highest` slide
 /// the window forward.
@@ -330,7 +330,7 @@ pub struct ReplayWindow {
     /// Highest counter accepted so far.
     highest: u64,
     /// Bitmap of last `bits` counter slots, bit-0 = highest, bit-1 =
-    /// highest-1, ... .  Stored как `Vec<u64>` для cheap word-shift slide.
+    /// highest-1, ... .  Stored as `Vec<u64>` for cheap word-shift slide.
     bitmap: Vec<u64>,
     /// Total bits in the window.
     bits: u64,
@@ -346,12 +346,12 @@ impl ReplayWindow {
         }
     }
 
-    /// Check whether `counter` is acceptable и, if so, record it.
+    /// Check whether `counter` is acceptable and, if so, record it.
     /// Returns `Ok(())` on accept, `Err(ReplayRejected)` if already seen
     /// or too old.
     ///
     /// Side-effects: on accept, advances `highest` and/or sets the
-    /// corresponding bit в the bitmap.
+    /// corresponding bit in the bitmap.
     pub fn check_and_record(&mut self, counter: u64) -> Result<(), ObfsError> {
         if counter > self.highest {
             // Slide window forward by (counter - highest) bits.
@@ -382,7 +382,7 @@ impl ReplayWindow {
             return;
         }
         // Word-by-word shift right (bit-0 is highest, so newer counters
-        // push older bits "down" в word indices).
+        // push older bits "down" in word indices).
         let word_shift = (shift / 64) as usize;
         let bit_shift = (shift % 64) as u32;
         let words = self.bitmap.len();
@@ -396,7 +396,7 @@ impl ReplayWindow {
             }
         }
         if bit_shift > 0 {
-            // Shift each word left by bit_shift, carrying in bits от
+            // Shift each word left by bit_shift, carrying in bits from
             // the previous word.
             let mut carry: u64 = 0;
             for w in &mut self.bitmap {
@@ -433,7 +433,7 @@ impl ReplayWindow {
 
 // ── Per-peer state (key + counter + replay window) ───────────────────────────
 
-/// Sender-side per-peer state: tracks the outbound counter что monotonically
+/// Sender-side per-peer state: tracks the outbound counter that monotonically
 /// increases across each `seal_next` call.  Holds the derived [`ObfsKey`].
 pub struct SenderState {
     key: ObfsKey,
@@ -445,7 +445,7 @@ impl SenderState {
         Self { key, counter: 0 }
     }
 
-    /// Seal а datagram, advancing the counter.  Returns wire-bytes.
+    /// Seal a datagram, advancing the counter.  Returns wire-bytes.
     ///
     /// Uses `checked_add` (matching `OutboundStream::wrap_next` /
     /// `session_cipher`): on the astronomically-unreachable 2^64th datagram the
@@ -482,9 +482,9 @@ impl ReceiverState {
         }
     }
 
-    /// Open and replay-check а datagram.  AEAD-verify runs BEFORE the
-    /// replay check (cheaper к reject malformed traffic от random
-    /// noise что happens к hit а stale counter slot).
+    /// Open and replay-check a datagram.  AEAD-verify runs BEFORE the
+    /// replay check (cheaper to reject malformed traffic from random
+    /// noise that happens to hit a stale counter slot).
     pub fn open_and_check(&mut self, wire: &[u8]) -> Result<Vec<u8>, ObfsError> {
         let (counter, payload) = open_datagram(&self.key, wire)?;
         self.replay.check_and_record(counter)?;
@@ -495,10 +495,10 @@ impl ReceiverState {
 // ── Multi-peer state map ─────────────────────────────────────────────────────
 
 /// Convenience wrapper holding per-peer [`SenderState`] + [`ReceiverState`].
-/// Use when а single transport handles datagrams к/от many peers.
+/// Use when a single transport handles datagrams to/from many peers.
 ///
 /// Memory: ~200 bytes per peer (key + counter + replay bitmap).  No
-/// LRU eviction — caller is responsible для removing entries on peer
+/// LRU eviction — caller is responsible for removing entries on peer
 /// teardown.
 #[derive(Default)]
 pub struct PeerStateMap {
@@ -533,11 +533,11 @@ impl PeerStateMap {
     }
 }
 
-// ── Constant-time tag-equality helper (для future use в TCP framing) ──────
+// ── Constant-time tag-equality helper (for future use in TCP framing) ──────
 
-/// Constant-time equality для two byte slices.  Re-export of [`subtle`]
-/// для convenience.  AEAD primitives already use constant-time compare
-/// internally; this is exposed для downstream callers що need it directly.
+/// Constant-time equality for two byte slices.  Re-export of [`subtle`]
+/// for convenience.  AEAD primitives already use constant-time compare
+/// internally; this is exposed for downstream callers that need it directly.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
@@ -586,7 +586,7 @@ mod tests {
         let key_b = ObfsKey::derive(TEST_PSK, &peer_b());
         let payload = b"secret";
         let wire = seal_datagram(&key_a, 1, payload).unwrap();
-        // Wrong peer key must fail к decrypt.
+        // Wrong peer key must fail to decrypt.
         assert_eq!(
             open_datagram(&key_b, &wire).unwrap_err(),
             ObfsError::AeadFailure
@@ -597,7 +597,7 @@ mod tests {
     fn tampered_ciphertext_rejected() {
         let key = ObfsKey::derive(TEST_PSK, &peer_a());
         let mut wire = seal_datagram(&key, 1, b"hello").unwrap();
-        // Flip а byte в the ciphertext region (past prefix + counter).
+        // Flip a byte in the ciphertext region (past prefix + counter).
         let flip_at = NONCE_PREFIX_LEN + COUNTER_LEN + 1;
         wire[flip_at] ^= 0x01;
         assert_eq!(
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn replay_window_rejects_too_old() {
-        let mut w = ReplayWindow::new(64); // small window for тест
+        let mut w = ReplayWindow::new(64); // small window for test
         w.check_and_record(1000).unwrap();
         // 935 is 65 behind — beyond 64-bit window.
         assert_eq!(
@@ -720,10 +720,10 @@ mod tests {
         let mut w = ReplayWindow::new(64);
         w.check_and_record(10).unwrap();
         w.check_and_record(20).unwrap();
-        // Jump к 100 — slides window by 80; entries at 10 и 20 fall
+        // Jump to 100 — slides window by 80; entries at 10 and 20 fall
         // out of the new window (highest=100, oldest=37).
         w.check_and_record(100).unwrap();
-        // 10 и 20 are now "too old"
+        // 10 and 20 are now "too old"
         assert!(matches!(
             w.check_and_record(10).unwrap_err(),
             ObfsError::ReplayRejected(_)
@@ -791,7 +791,7 @@ mod tests {
         let w2 = sender.seal_next(b"second").unwrap();
         let w3 = sender.seal_next(b"third").unwrap();
 
-        // Receive в reversed order — all should decrypt.
+        // Receive in reversed order — all should decrypt.
         assert_eq!(receiver.open_and_check(&w3).unwrap(), b"third");
         assert_eq!(receiver.open_and_check(&w1).unwrap(), b"first");
         assert_eq!(receiver.open_and_check(&w2).unwrap(), b"second");
@@ -808,7 +808,7 @@ mod tests {
         let wire_a = map.sender_mut(&pa, TEST_PSK).seal_next(b"to-a").unwrap();
         let wire_b = map.sender_mut(&pb, TEST_PSK).seal_next(b"to-b").unwrap();
 
-        // Receive from peer A через peer A's receiver.
+        // Receive from peer A through peer A's receiver.
         let got_a = map
             .receiver_mut(&pa, TEST_PSK)
             .open_and_check(&wire_a)
@@ -853,14 +853,14 @@ mod tests {
         for c in 1..=200u64 {
             let wire = seal_datagram(&key, c, payload).unwrap();
             // The plaintext `OVL1` magic must NOT appear consecutively
-            // anywhere в the wire bytes (probabilistic — would happen ≤
-            // 1 в 4 billion за random chance, vanishingly unlikely для
+            // anywhere in the wire bytes (probabilistic — would happen ≤
+            // 1 in 4 billion per random chance, vanishingly unlikely for
             // 200 trials of ~330-byte buffers).
             let magic = b"OVL1";
             for window in wire.windows(4) {
                 assert_ne!(
                     window, magic,
-                    "OVL1 magic appeared в wire bytes at counter={c}"
+                    "OVL1 magic appeared in wire bytes at counter={c}"
                 );
             }
         }

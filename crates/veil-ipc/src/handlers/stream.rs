@@ -1,11 +1,11 @@
-//! `STREAM_OPEN` handler — open а new reliable bidirectional byte stream
-//! к а local app endpoint.
+//! `STREAM_OPEN` handler — open a new reliable bidirectional byte stream
+//! to a local app endpoint.
 //!
 //! Stages: per-client open-quota gate → decode `StreamOpenPayload` →
-//! resolve target `(app_id, endpoint_id)` к the receiving endpoint's
-//! sender → reserve а `stream_id` в the global `IpcStreamTable` → claim
-//! ownership on this connection (so cross-client hijack via а guessed
-//! `stream_id` is impossible) → reply `STREAM_OPEN_OK` с initial window.
+//! resolve target `(app_id, endpoint_id)` to the receiving endpoint's
+//! sender → reserve a `stream_id` in the global `IpcStreamTable` → claim
+//! ownership on this connection (so cross-client hijack via a guessed
+//! `stream_id` is impossible) → reply `STREAM_OPEN_OK` with initial window.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,9 +47,9 @@ pub(crate) async fn handle_stream_open(
 ) -> std::io::Result<()> {
     // Per-client stream-open quota: refuse new opens once the cumulative
     // count for this IPC session reaches the cap, even if the global
-    // `MAX_TOTAL_STREAMS` still has room.  Without this check а single
-    // misbehaving local app can exhaust the global pool и starve every
-    // other client на the same node.
+    // `MAX_TOTAL_STREAMS` still has room.  Without this check a single
+    // misbehaving local app can exhaust the global pool and starve every
+    // other client on the same node.
     if client_state.stream_quota_exhausted() {
         let err = StreamOpenErrPayload {
             error_code: stream_open_err::CAPACITY_REACHED,
@@ -136,10 +136,10 @@ pub(crate) async fn handle_stream_open(
         .await;
     };
     client_state.record_stream_opened();
-    // Claim opener-side ownership so cross-client hijack via а known /
+    // Claim opener-side ownership so cross-client hijack via a known /
     // guessed `stream_id` is prevented downstream.  The acceptor side
     // claims its own ownership separately inside the per-endpoint
-    // forwarder when it translates `AppMessage::StreamOpen` into а
+    // forwarder when it translates `AppMessage::StreamOpen` into a
     // `STREAM_OPEN_INBOUND` IPC frame.
     client_state.claim_stream_opener(stream_id);
 

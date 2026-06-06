@@ -984,11 +984,11 @@ pub mod recursive_query_type {
     /// PoW-Gated Rendezvous epic; see
     /// `docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`).
     ///
-    /// **Routing contract:** initiator builds а `RecursiveQueryPayload`
+    /// **Routing contract:** initiator builds a `RecursiveQueryPayload`
     /// where:
     ///
     /// * `target_key` = the destination's `node_id` (so existing
-    ///   greedy-relay forwarding делivers the query toward the
+    ///   greedy-relay forwarding delivers the query toward the
     ///   stealth-listener target)
     /// * `reply_to` = initiator's own `node_id` (response routes back
     ///   through the same reverse-path machinery used by FIND_NODE)
@@ -1000,12 +1000,12 @@ pub mod recursive_query_type {
     ///   reachable IP is the secret protected by the rendezvous flow;
     ///   reply must travel through veil)
     ///
-    /// **Target dispatcher behavior** (см.
+    /// **Target dispatcher behavior** (see.
     /// `veilcore::node::dispatcher::routing::handle_recursive_query`,
     /// Slice 6b): parses inner
     /// `RequestEphemeralEndpointPayload`, invokes the rendezvous
     /// controller (`dispatcher.rendezvous_weak.upgrade()`), packs the
-    /// signed `EphemeralEndpointResponsePayload` bytes into а
+    /// signed `EphemeralEndpointResponsePayload` bytes into a
     /// `RecursiveResponsePayload` outer envelope, ships it back via
     /// the existing reverse-path resolver.
     ///
@@ -1013,10 +1013,10 @@ pub mod recursive_query_type {
     /// `responder_pubkey` MUST satisfy
     /// `BLAKE3(responder_pubkey) == target_node_id`; inner
     /// `EphemeralEndpointResponsePayload` then runs through the
-    /// existing `verify_ephemeral_endpoint_response()` под the same
-    /// pubkey.  Defense-in-depth: inner и outer sigs are domain-
-    /// separated, so а passive relay capturing the outer envelope
-    /// cannot replay it к а different initiator (inner sig binds
+    /// existing `verify_ephemeral_endpoint_response()` under the same
+    /// pubkey.  Defense-in-depth: inner and outer sigs are domain-
+    /// separated, so a passive relay capturing the outer envelope
+    /// cannot replay it to a different initiator (inner sig binds
     /// `requester_pubkey`).
     pub const RENDEZVOUS_REQUEST: u8 = 4;
 }
@@ -1083,7 +1083,7 @@ impl RecursiveQueryPayload {
         let query_id: [u8; 16] = super::read_array::<16>(buf, 0)?;
         let target_key: [u8; 32] = super::read_array::<32>(buf, 16)?;
         let reply_to: [u8; 32] = super::read_array::<32>(buf, 48)?;
-        // Clamp `ttl` к `MAX_RECURSIVE_RELAY_HOPS` (canonical spec cap):
+        // Clamp `ttl` to `MAX_RECURSIVE_RELAY_HOPS` (canonical spec cap):
         // attacker-controlled `ttl=255` × 2-way fanout would otherwise
         // amplify per-hop bandwidth before the network-wide query_id
         // dedup catches up.  Clamping at decode means every dispatcher
@@ -1885,8 +1885,8 @@ mod discovery_tests {
 
     #[test]
     fn recursive_query_roundtrip() {
-        // Drive-by: ttl set к MAX_RECURSIVE_RELAY_HOPS (was 40 — pre-
-        // existing flake after the constant got clamped к 20; decode
+        // Drive-by: ttl set to MAX_RECURSIVE_RELAY_HOPS (was 40 — pre-
+        // existing flake after the constant got clamped to 20; decode
         // clamps so the round-trip differs in the ttl field).  Using
         // the canonical maximum makes the test stable.
         let q = RecursiveQueryPayload {
@@ -1932,11 +1932,11 @@ mod discovery_tests {
 
     // ── PoW-Gated Rendezvous over RecursiveQuery (Slice 6a) ─────
 
-    /// Slice 6a contract: а signed `RequestEphemeralEndpointPayload`
-    /// embedded в а `RecursiveQueryPayload::payload` field с
+    /// Slice 6a contract: a signed `RequestEphemeralEndpointPayload`
+    /// embedded in a `RecursiveQueryPayload::payload` field with
     /// `query_type = RENDEZVOUS_REQUEST` round-trips cleanly through
     /// both layers AND the inner sig + PoW still verify after
-    /// decode-from-outer.  This is the on-wire contract что Slice 6b
+    /// decode-from-outer.  This is the on-wire contract that Slice 6b
     /// (target dispatcher arm) + Slice 6c (initiator client) rely
     /// on.
     #[test]
@@ -1947,7 +1947,7 @@ mod discovery_tests {
         };
         use ed25519_dalek::SigningKey;
 
-        // Build а signed PoW-gated request at minimum difficulty so
+        // Build a signed PoW-gated request at minimum difficulty so
         // mining is fast in the test.
         let requester_sk = SigningKey::from_bytes(&[0x42u8; 32]);
         let requester_pk = requester_sk.verifying_key().to_bytes();
@@ -1972,8 +1972,8 @@ mod discovery_tests {
         );
         let inner_bytes = inner.encode().to_vec();
 
-        // Wrap в the recursive envelope.  Use canonical max-hops так
-        // round-trip is stable (decode clamps к MAX_RECURSIVE_RELAY_HOPS).
+        // Wrap in the recursive envelope.  Use canonical max-hops so
+        // round-trip is stable (decode clamps to MAX_RECURSIVE_RELAY_HOPS).
         let query = RecursiveQueryPayload {
             query_id: [0xC0u8; 16],
             target_key: target_node_id,
@@ -2007,11 +2007,11 @@ mod discovery_tests {
         .expect("inner sig + PoW must still verify after outer round-trip");
     }
 
-    /// Slice 6a contract: а signed `EphemeralEndpointResponsePayload`
-    /// embedded в а `RecursiveResponsePayload::payload` field
-    /// round-trips и still verifies under the inner's target pubkey.
-    /// The OUTER sig (recursive response level) binds к the responder's
-    /// long-term key; the INNER sig binds к the per-request canonical.
+    /// Slice 6a contract: a signed `EphemeralEndpointResponsePayload`
+    /// embedded in a `RecursiveResponsePayload::payload` field
+    /// round-trips and still verifies under the inner's target pubkey.
+    /// The OUTER sig (recursive response level) binds to the responder's
+    /// long-term key; the INNER sig binds to the per-request canonical.
     /// Both must verify independently — domain-separation guarantees
     /// disjointness.
     #[test]

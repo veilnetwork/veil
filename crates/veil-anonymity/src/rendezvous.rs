@@ -2,7 +2,7 @@
 //!
 //! `RendezvousAd` is the **signed advertisement** a receiver publishes
 //! to the DHT to announce "I can be reached via rendezvous node R
-//! using auth cookie C, between unix-time T0 и T1, encrypt your
+//! using auth cookie C, between unix-time T0 and T1, encrypt your
 //! introduction frame to my X25519 key K".
 //!
 //! # Why rendezvous matters for censorship resistance
@@ -21,7 +21,7 @@
 //!
 //! Architectural inspiration: Tor onion services. Tor uses similar
 //! receiver-publishes-meeting-point pattern; we adopt the same
-//! architecture с our veil primitives (Ed25519/Falcon-512 sigs
+//! architecture with our veil primitives (Ed25519/Falcon-512 sigs
 //! BLAKE3 DHT keys, X25519 ECDH for the introduction encryption).
 //!
 //! # What this slice ships
@@ -29,11 +29,11 @@
 //! Just the **signed wire-format primitive** — the building block
 //! every later rendezvous slice composes against. Mirrors the
 //! pattern (signed manifest primitive shipped
-//! before fetch / failover / orchestrator / CLI слайсы).
+//! before fetch / failover / orchestrator / CLI slices).
 //!
 //! Deferred to follow-up slices:
 //! * Rendezvous-relay state machine (third party that brokers).
-//! * Sender-side: parse ad → build onion circuit к rendezvous →
+//! * Sender-side: parse ad → build onion circuit to rendezvous →
 //!   send Introduce frame.
 //! * Receiver-side: publish ad to DHT + accept Introduce on the
 //!   rendezvous side.
@@ -44,7 +44,7 @@
 //!
 //! ```text
 //! magic : 2 B ("RA" — Rendezvous Ad)
-//! version : 1 B (1 = legacy без push_envelope; 2 = current с push_envelope)
+//! version : 1 B (1 = legacy without push_envelope; 2 = current with push_envelope)
 //! sig_algo: 1 B (0=Ed25519, 1=Falcon-512, 2=Hybrid)
 //! receiver_node_id : 32 B (BLAKE3 of receiver's identity pubkey)
 //! rendezvous_node_id : 32 B (third-party meeting point, operator's choice)
@@ -54,16 +54,16 @@
 //! valid_until_unix : 8 B (BE)
 //! push_envelope_len : 2 B (BE; cap = 512; 0 = no push registered) — v2 only
 //! push_envelope : var (opaque sealed FCM/APNs token, decryptable
-//! only by а push-relay operator the receiver trusts;
-//! relays на the path forward this verbatim к the
+//! only by a push-relay operator the receiver trusts;
+//! relays on the path forward this verbatim to the
 //! configured push-relay when delivering an Introduce.
-//! Sealing format defined separately в push_envelope.rs;
+//! Sealing format defined separately in push_envelope.rs;
 //! this layer treats the bytes as opaque.) — v2 only
 //! issuer_pk_len : 2 B (BE; cap = 2048)
 //! issuer_pk : var (base64 of receiver's identity pubkey, utf-8)
 //! signature_len : 2 B (BE; cap = 2048)
 //! signature : var (issuer's signature over canonical message — covers
-//! push_envelope so а censor cannot strip / swap it)
+//! push_envelope so a censor cannot strip / swap it)
 //! ```
 //!
 //! Typical Ed25519 ad: ~190 B. Typical Falcon-512: ~1.6 KiB. Hard
@@ -71,8 +71,8 @@
 //! ceiling for anonymity wire formats).
 //!
 //! Version compatibility: decoder accepts BOTH v1 (no push envelope —
-//! returns `push_envelope = vec![]`) и v2 (current). Encoder always
-//! emits v2 since the wire is не-live; legacy v1 ads stored в the
+//! returns `push_envelope = vec![]`) and v2 (current). Encoder always
+//! emits v2 since the wire is not-live; legacy v1 ads stored in the
 //! DHT during the transition decode cleanly and re-sign as v2 on the
 //! receiver's next maintenance-tick refresh.
 //!
@@ -99,18 +99,18 @@ const VERSION_LEGACY: u8 = 1;
 const VERSION_V2: u8 = 2;
 const VERSION_V3: u8 = 3;
 /// Current wire-format version.  v4 adds the `wake_hmac_envelope`
-/// field (Epic 489.10 slice 4.3.2 — sealed wake-up HMAC key к the
+/// field (Epic 489.10 slice 4.3.2 — sealed wake-up HMAC key to the
 /// receiver's chosen push-relay).  Encoder always emits v4, decoder
 /// accepts v1 / v2 / v3 / v4 (older versions yield empty
 /// `wake_hmac_envelope`).
 const VERSION: u8 = 4;
-// Domain separator bumped с v3 → v4 alongside the wire-format version
-// so that signatures over old (no-wake-HMAC) и new (wake-HMAC-aware)
-// ads cannot replay across versions — а censor that captured an old
-// v3 ad cannot construct а v4 forgery by appending an arbitrary
+// Domain separator bumped with v3 → v4 alongside the wire-format version
+// so that signatures over old (no-wake-HMAC) and new (wake-HMAC-aware)
+// ads cannot replay across versions — a censor that captured an old
+// v3 ad cannot construct a v4 forgery by appending an arbitrary
 // wake_hmac_envelope, since canonical message construction includes
 // wake_hmac_envelope length + bytes, and v3's signing domain locks
-// `:v3\0`.  Same disjoint-domain invariant как pre-existing v1→v2 и
+// `:v3\0`.  Same disjoint-domain invariant as pre-existing v1→v2 and
 // v2→v3 bumps.
 const SIG_DOMAIN_V1: &[u8] = b"veil-rendezvous-ad:v1\0";
 const SIG_DOMAIN_V2: &[u8] = b"veil-rendezvous-ad:v2\0";
@@ -124,43 +124,43 @@ const AUTH_COOKIE_LEN: usize = 16;
 // without expanding past the 4 KiB total-blob cap.
 const MAX_ISSUER_PK_LEN: usize = 2048;
 const MAX_SIGNATURE_LEN: usize = 2048;
-/// Cap on `push_envelope`. Sized к accommodate а sealed FCM/APNs token:
+/// Cap on `push_envelope`. Sized to accommodate a sealed FCM/APNs token:
 /// X25519 ephemeral pubkey (32) + nonce (24) + ciphertext+tag (token ≤
 /// ~250 chars + 16-byte AEAD tag) ≈ 322 bytes; cap at 512 leaves slack
-/// для future opaque metadata (e.g. push-relay routing hint). Senders
-/// that exceed это cap MUST split the metadata across а separate channel
-/// или shorten the token (FCM token rotation supports replacement).
+/// for future opaque metadata (e.g. push-relay routing hint). Senders
+/// that exceed this cap MUST split the metadata across a separate channel
+/// or shorten the token (FCM token rotation supports replacement).
 pub const MAX_PUSH_ENVELOPE_LEN: usize = 512;
 
 /// cap on the optional mailbox capability
-/// token bytes carried в the rendezvous ad. Mirrors
+/// token bytes carried in the rendezvous ad. Mirrors
 /// `veil_mailbox::MAX_CAPABILITY_TOKEN_BYTES` — 2 KiB fits Falcon-512
-/// worst case с slack. Hardcoded here к keep `veil-anonymity` а
+/// worst case with slack. Hardcoded here to keep `veil-anonymity` a
 /// leaf crate (no dep on veil-mailbox).
 pub const MAX_CAPABILITY_TOKEN_LEN: usize = 2048;
 
 /// Cap on `wake_hmac_envelope` (Epic 489.10 slice 4.3.2).
 ///
-/// Sized к accommodate а sealed `WakeHmacKey` к the chosen push relay
+/// Sized to accommodate a sealed `WakeHmacKey` to the chosen push relay
 /// using the same envelope shape as [`MAX_PUSH_ENVELOPE_LEN`]: X25519
 /// ephemeral pubkey (32) + nonce (12) + ciphertext+tag (32 B key +
 /// 16 B AEAD tag) = 92 bytes worst case.  Cap at 128 leaves slack
-/// для future expansion (e.g. а rotation epoch tag prepended к the
+/// for future expansion (e.g. a rotation epoch tag prepended to the
 /// key).  Receivers que opt out of HMAC authentication publish empty
-/// (`vec![]`); pre-v4 ads decoded под new code also yield empty.
+/// (`vec![]`); pre-v4 ads decoded under new code also yield empty.
 pub const MAX_WAKE_HMAC_ENVELOPE_LEN: usize = 128;
 
 /// Hard cap on wire size. Sized to accommodate Falcon-512
 /// (~1.2 KiB pubkey + ~700 B sig) plus the field overhead PLUS
 /// future PQ algos whose pubkeys may approach 2 KiB. At 8 KiB
-/// the ad still fits в a single DHT-store frame (16 KiB frame
-/// budget) с plenty of slack.
+/// the ad still fits in a single DHT-store frame (16 KiB frame
+/// budget) with plenty of slack.
 pub const MAX_RENDEZVOUS_AD_BYTES: usize = 8 * 1024;
 
 /// Maximum allowed validity window (`valid_until - valid_from`).
 /// Operators publishing for longer than this should rotate their
 /// X25519 + auth cookie more often (compromise window grows linearly
-/// со validity); 30 days matches the "rotate keys monthly" hygiene
+/// with validity); 30 days matches the "rotate keys monthly" hygiene
 /// recommendation. Anti-DoS: censor capturing one ad shouldn't be
 /// able to keep using it indefinitely.
 pub const MAX_VALIDITY_WINDOW_SECS: u64 = 30 * 24 * 3600;
@@ -214,82 +214,82 @@ pub struct RendezvousAd {
     /// looking up this ad is derived from this field.
     pub receiver_node_id: [u8; NODE_ID_LEN],
     /// Third-party meeting point. Sender builds an onion circuit
-    /// к this node, sends an Introduce frame addressed by the auth
-    /// cookie; rendezvous relays к receiver who is also connected к
+    /// to this node, sends an Introduce frame addressed by the auth
+    /// cookie; rendezvous relays to receiver who is also connected to
     /// this node out-of-band.
     pub rendezvous_node_id: [u8; NODE_ID_LEN],
-    /// Shared secret that authorises a sender к use this ad.
-    /// Receiver distributes к specific senders out-of-band (DM /
+    /// Shared secret that authorises a sender to use this ad.
+    /// Receiver distributes to specific senders out-of-band (DM /
     /// QR / sneakernet); rendezvous accepts only Introduce frames
     /// presenting a known cookie. 16 bytes = 128-bit collision
     /// resistance, plenty for an authorisation token.
     pub auth_cookie: [u8; AUTH_COOKIE_LEN],
-    /// Sender encrypts the Introduce frame к this key. Provides
+    /// Sender encrypts the Introduce frame to this key. Provides
     /// receiver-only readability — even the rendezvous node CAN'T
-    /// see what sender sent (only что they sent it). Forward
+    /// see what sender sent (only that they sent it). Forward
     /// secrecy via per-ad rotation: receiver generates fresh
     /// X25519 keypair per ad republish.
     pub receiver_x25519_pk: [u8; X25519_PK_LEN],
     /// Unix-time when this ad becomes effective. Senders MUST
-    /// reject ads с `now < valid_from` (catches clock-skew attacks
+    /// reject ads with `now < valid_from` (catches clock-skew attacks
     /// + post-dated ads).
     pub valid_from_unix: u64,
-    /// Unix-time when this ad expires. Senders MUST reject ads с
+    /// Unix-time when this ad expires. Senders MUST reject ads with
     /// `now >= valid_until`. Receiver republishes before expiry
     /// to maintain availability.
     pub valid_until_unix: u64,
     /// Receiver's identity pubkey (base64 of raw bytes; same shape
-    /// as `IdentityConfig.public_key`). Verifier uses this к check
+    /// as `IdentityConfig.public_key`). Verifier uses this to check
     /// the signature.
     pub issuer_pk: String,
     pub issuer_algo: SignatureAlgorithm,
     pub signature: Vec<u8>,
     /// opaque sealed envelope carrying receiver's push
-    /// token (FCM / APNs). Decryptable only by а push-relay operator
-    /// the receiver trusts; relays на the message-delivery path forward
-    /// this verbatim к the configured push-relay so it can fire а
-    /// silent wake-up к the receiver's device.
+    /// token (FCM / APNs). Decryptable only by a push-relay operator
+    /// the receiver trusts; relays on the message-delivery path forward
+    /// this verbatim to the configured push-relay so it can fire a
+    /// silent wake-up to the receiver's device.
     ///
-    /// Empty (`vec![]`) when the receiver did not register для push
+    /// Empty (`vec![]`) when the receiver did not register for push
     /// (default — desktop nodes, mobile nodes opted out of push).
     /// Cap [`MAX_PUSH_ENVELOPE_LEN`].
     pub push_envelope: Vec<u8>,
     /// opaque mailbox capability-token bytes
     /// (decoded by `veil-mailbox::MailboxCapabilityToken::decode`).
-    /// Senders include this в their `MailboxPutPayload.capability_token`
-    /// trailer когда the relay enforces `require_capability_token = true`.
-    /// Empty (`vec![]`) when the receiver did not mint а token (legacy
+    /// Senders include this in their `MailboxPutPayload.capability_token`
+    /// trailer when the relay enforces `require_capability_token = true`.
+    /// Empty (`vec![]`) when the receiver did not mint a token (legacy
     /// senders / pre-slice-2 publishers). Cap [`MAX_CAPABILITY_TOKEN_LEN`].
     pub capability_token: Vec<u8>,
     /// opaque sealed envelope carrying receiver's wake-up
-    /// HMAC key к the chosen push-relay (Epic 489.10 slice 4.3.2).
+    /// HMAC key to the chosen push-relay (Epic 489.10 slice 4.3.2).
     /// Only the relay holding the matching X25519 sk can decrypt; the
-    /// relay then uses the key к sign wake-up payloads делаемые
+    /// relay then uses the key to sign wake-up payloads made
     /// receivers' plugin can verify locally (closes leaked-FCM/APNs-
     /// token battery DoS / presence-oracle).
     ///
-    /// Empty (`vec![]`) when the receiver did not register для wake-
+    /// Empty (`vec![]`) when the receiver did not register for wake-
     /// HMAC authentication (legacy desktop nodes, mobile nodes pre-v4,
-    /// receivers running с trust-the-rate-limit only).  Cap
+    /// receivers running with trust-the-rate-limit only).  Cap
     /// [`MAX_WAKE_HMAC_ENVELOPE_LEN`].
     pub wake_hmac_envelope: Vec<u8>,
-    /// Wire-format version this ad was decoded из (or freshly signed
+    /// Wire-format version this ad was decoded from (or freshly signed
     /// at). Preserved across decode → verify so verify can pick the
     /// matching canonical-message domain (v1 ads signed pre-push don't
     /// include push_envelope; v2 don't include capability_token; v3
     /// don't include wake_hmac_envelope).  Encoder always emits v4;
-    /// decoder tolerates v1 / v2 / v3 для backward-compat reads of
-    /// DHT entries из а transition-period network.
+    /// decoder tolerates v1 / v2 / v3 for backward-compat reads of
+    /// DHT entries from a transition-period network.
     pub wire_version: u8,
 }
 
 /// Derive the DHT key under which `receiver_node_id`'s rendezvous
 /// ad is published. Domain-separated from `relay_directory_dht_key`
-/// и every other DHT-key derivation в the codebase — a rendezvous
+/// and every other DHT-key derivation in the codebase — a rendezvous
 /// query CANNOT accidentally hit a relay-directory slot.
 ///
 /// Equivalent [`rendezvous_ad_dht_key_at(receiver_node_id, 0)`].
-/// Kept as a separate function для backward compatibility — pre-T1.4
+/// Kept as a separate function for backward compatibility — pre-T1.4
 /// publishers and resolvers used this exact form.
 pub fn rendezvous_ad_dht_key(receiver_node_id: &[u8; NODE_ID_LEN]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
@@ -309,12 +309,12 @@ pub const MAX_RENDEZVOUS_AD_SLOTS: u8 = 8;
 ///
 /// **Backward-compat invariant:** `rendezvous_ad_dht_key_at(_, 0)`
 /// produces the SAME 32 bytes as legacy [`rendezvous_ad_dht_key`].
-/// Pre-T1.4 publishers и resolvers therefore interoperate seamlessly
-/// с new multi-replica nodes — they simply only see slot 0.
+/// Pre-T1.4 publishers and resolvers therefore interoperate seamlessly
+/// with new multi-replica nodes — they simply only see slot 0.
 ///
 /// Slot indices ≥1 use a distinct domain separator so a malicious
-/// adversary cannot conflate slot N's content с slot 0's по
-/// crafting an input. `idx >= MAX_RENDEZVOUS_AD_SLOTS` saturates к
+/// adversary cannot conflate slot N's content with slot 0's by
+/// crafting an input. `idx >= MAX_RENDEZVOUS_AD_SLOTS` saturates to
 /// `MAX_RENDEZVOUS_AD_SLOTS - 1` (caller bug; we don't panic since
 /// this is on the hot publishing path).
 pub fn rendezvous_ad_dht_key_at(receiver_node_id: &[u8; NODE_ID_LEN], idx: u8) -> [u8; 32] {
@@ -332,14 +332,14 @@ pub fn rendezvous_ad_dht_key_at(receiver_node_id: &[u8; NODE_ID_LEN], idx: u8) -
 
 /// Build, sign, and encode a rendezvous-point ad.
 ///
-/// Many positional arguments — corresponds к the signed wire format's
-/// fields. Bundling them в а params struct would add indirection
+/// Many positional arguments — corresponds to the signed wire format's
+/// fields. Bundling them in a params struct would add indirection
 /// without improving readability; signed-primitive functions naturally
-/// have many positional fields (see `sign_entry` в `directory.rs`
-/// `sign_manifest` в `update::manifest`, etc).
+/// have many positional fields (see `sign_entry` in `directory.rs`
+/// `sign_manifest` in `update::manifest`, etc).
 ///
 /// `push_envelope` is the optional sealed FCM/APNs token blob (
-/// Pass `&[]` when the receiver did not register для push
+/// Pass `&[]` when the receiver did not register for push
 /// (desktop nodes; mobile-but-no-push); cap [`MAX_PUSH_ENVELOPE_LEN`].
 ///
 /// `capability_token` is the optional
@@ -349,7 +349,7 @@ pub fn rendezvous_ad_dht_key_at(receiver_node_id: &[u8; NODE_ID_LEN], idx: u8) -
 /// permissive path. Cap [`MAX_CAPABILITY_TOKEN_LEN`].
 ///
 /// `wake_hmac_envelope` is the optional sealed wake-HMAC key for
-/// push-relay-authenticated wakeups (Epic 489.10).  Pass `&[]` для
+/// push-relay-authenticated wakeups (Epic 489.10).  Pass `&[]` for
 /// receivers that opt out of wake-HMAC authentication (legacy
 /// desktop / pre-v4 mobile).  Cap [`MAX_WAKE_HMAC_ENVELOPE_LEN`].
 #[allow(clippy::too_many_arguments)]
@@ -441,13 +441,13 @@ pub fn sign_rendezvous_ad(
 ///
 /// Accepts ALL wire-format versions:
 /// * v1 (legacy, pre-push): no envelope/token fields present;
-///   decoder sets all three optionals к empty `vec![]`.
+///   decoder sets all three optionals to empty `vec![]`.
 /// * v2: includes `push_envelope_len` + `push_envelope` only.
 /// * v3: also includes `capability_token_len` + `capability_token`.
 /// * v4 (current): also includes `wake_hmac_envelope_len` +
 ///   `wake_hmac_envelope`.  Receivers still running pre-v4 will be
 ///   re-signed as v4 by their next maintenance-tick (with empty
-///   wake_hmac_envelope if they did not register для wake-HMAC).
+///   wake_hmac_envelope if they did not register for wake-HMAC).
 pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError> {
     if blob.len() > MAX_RENDEZVOUS_AD_BYTES {
         return Err(RendezvousError::TooLarge { got: blob.len() });
@@ -486,7 +486,7 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
     let valid_from_unix = u64::from_be_bytes(read(blob, &mut p, 8)?.try_into().unwrap());
     let valid_until_unix = u64::from_be_bytes(read(blob, &mut p, 8)?.try_into().unwrap());
     // v2 / v3 / v4: push_envelope_len (BE u16) + push_envelope bytes.
-    // v1 skips this entirely; `push_envelope` field defaults к empty.
+    // v1 skips this entirely; `push_envelope` field defaults to empty.
     let push_envelope = if version == VERSION || version == VERSION_V3 || version == VERSION_V2 {
         let env_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
         if env_len > MAX_PUSH_ENVELOPE_LEN {
@@ -497,7 +497,7 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
         Vec::new()
     };
     // v3 / v4: `capability_token` field after push_envelope.  Pre-v3
-    // ads decoded под new code yield empty.
+    // ads decoded under new code yield empty.
     let capability_token = if version == VERSION || version == VERSION_V3 {
         let cap_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
         if cap_len > MAX_CAPABILITY_TOKEN_LEN {
@@ -508,8 +508,8 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
         Vec::new()
     };
     // v4-only `wake_hmac_envelope` field (Epic 489.10 slice 4.3.2).
-    // Lives between capability_token и issuer_pk.  Pre-v4 ads yield
-    // empty; receivers still emit ads с empty wake_hmac_envelope если
+    // Lives between capability_token and issuer_pk.  Pre-v4 ads yield
+    // empty; receivers still emit ads with empty wake_hmac_envelope if
     // they opted out of HMAC authentication.
     let wake_hmac_envelope = if version == VERSION {
         let env_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
@@ -560,13 +560,13 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
 /// signature is valid; Err(Verify) when it's not. Caller is
 /// responsible for additionally checking validity window via
 /// [`is_currently_valid`] (kept separate so a debug tool can
-/// validate signature on an expired ad без validity rejection).
+/// validate signature on an expired ad without validity rejection).
 ///
 /// Verification picks the canonical-message form via `ad.wire_version`
 /// (preserved by decode). v1 ads signed pre-refactor use the v1
-/// domain (no `push_envelope` в the signed payload); v2 ads use the
+/// domain (no `push_envelope` in the signed payload); v2 ads use the
 /// v2 domain which includes `push_envelope` length + bytes — ensures
-/// а censor cannot strip the envelope post-sign и pass а v2 ad as
+/// a censor cannot strip the envelope post-sign and pass a v2 ad as
 /// v1, since the v2 signature won't verify under v1 canonical.
 pub fn verify_rendezvous_ad(ad: &RendezvousAd) -> Result<(), RendezvousError> {
     let canonical = match ad.wire_version {
@@ -642,9 +642,9 @@ pub fn is_currently_valid(ad: &RendezvousAd, now_unix: u64) -> Result<(), Rendez
 // ── Internal helpers ──────────────────────────────────────────────────
 
 /// Legacy v1 canonical-message form (no `push_envelope`). Used by
-/// [`verify_rendezvous_ad`] when reading а legacy v1 ad из the DHT
+/// [`verify_rendezvous_ad`] when reading a legacy v1 ad from the DHT
 /// during the transition period. Encoder NEVER produces
-/// v1 form anymore — once а receiver runs maintenance-tick, the next
+/// v1 form anymore — once a receiver runs maintenance-tick, the next
 /// re-sign emits v2.
 #[allow(clippy::too_many_arguments)]
 fn canonical_message_v1(
@@ -671,8 +671,8 @@ fn canonical_message_v1(
 /// Current v2 canonical-message form (— includes
 /// `push_envelope`). Length-prefix on the envelope ensures the
 /// signature binds BOTH the envelope contents AND the operator's
-/// intent to publish а push hint at all (length=0 still signs). А
-/// censor cannot strip / replace / append the envelope без breaking
+/// intent to publish a push hint at all (length=0 still signs). A
+/// censor cannot strip / replace / append the envelope without breaking
 /// the signature.
 #[allow(clippy::too_many_arguments)]
 fn canonical_message_v2(
@@ -706,8 +706,8 @@ fn canonical_message_v2(
 }
 
 // superseded by encode_body_v3 (signer always
-// emits v3). Retained for symmetry с canonical_message_v2 (still needed
-// by verify dispatch over existing-on-DHT v2 ads) и для cfg(test) callers
+// emits v3). Retained for symmetry with canonical_message_v2 (still needed
+// by verify dispatch over existing-on-DHT v2 ads) and for cfg(test) callers
 // that construct synthetic v2 wire to exercise backward-compat decode.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -763,7 +763,7 @@ fn encode_body_v2(
 /// v3 canonical-message form. Adds
 /// `capability_token` length + bytes after the v2 push_envelope tail.
 /// Same length-prefix-inclusion invariant as v2: censor cannot strip
-/// или replace the cap token без invalidating the v3 signature.
+/// or replace the cap token without invalidating the v3 signature.
 #[allow(clippy::too_many_arguments)]
 fn canonical_message_v3(
     receiver_node_id: &[u8; NODE_ID_LEN],
@@ -801,8 +801,8 @@ fn canonical_message_v3(
 }
 
 // superseded by encode_body_v4 (signer always emits v4).  Retained
-// для symmetry с canonical_message_v3 (still needed by verify
-// dispatch over existing-on-DHT v3 ads) и для cfg(test) callers
+// for symmetry with canonical_message_v3 (still needed by verify
+// dispatch over existing-on-DHT v3 ads) and for cfg(test) callers
 // that construct synthetic v3 wire to exercise backward-compat decode.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -863,7 +863,7 @@ fn encode_body_v3(
 /// v4 canonical-message form (Epic 489.10 slice 4.3.2).  Adds
 /// `wake_hmac_envelope` length + bytes after the v3 capability_token
 /// tail.  Same length-prefix-inclusion invariant: censor cannot strip
-/// или replace the wake HMAC envelope без invalidating the v4 signature.
+/// or replace the wake HMAC envelope without invalidating the v4 signature.
 #[allow(clippy::too_many_arguments)]
 fn canonical_message_v4(
     receiver_node_id: &[u8; NODE_ID_LEN],
@@ -984,49 +984,49 @@ fn read<'a>(blob: &'a [u8], cursor: &mut usize, n: usize) -> Result<&'a [u8], Re
 ///
 /// The receiver registers `(rendezvous_node_id, auth_cookie, validity_window)`
 /// once via `register_rendezvous_publisher`; the runtime's maintenance
-/// tick re-signs + re-stores the resulting `RendezvousAd` к the DHT
+/// tick re-signs + re-stores the resulting `RendezvousAd` to the DHT
 /// before its `valid_until_unix` lapses, so senders fetching the ad
 /// always see a freshly-signed entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RendezvousPublisherEntry {
     /// Third-party meeting point. Must already have an OVL1 session
     /// open (via `connect_peer` or configured-peer dial); the receiver
-    /// is also responsible для `register_with_rendezvous` to wire the
-    /// cookie там.
+    /// is also responsible for `register_with_rendezvous` to wire the
+    /// cookie there.
     pub rendezvous_node_id: [u8; NODE_ID_LEN],
-    /// Shared auth cookie. Same value the receiver passes к
+    /// Shared auth cookie. Same value the receiver passes to
     /// `register_with_rendezvous`.
     pub auth_cookie: [u8; AUTH_COOKIE_LEN],
     /// Lifetime of each signed ad. Maintenance re-signs at half-life.
-    /// Hard-capped к [`MAX_VALIDITY_WINDOW_SECS`] (30 days) by sign.
+    /// Hard-capped to [`MAX_VALIDITY_WINDOW_SECS`] (30 days) by sign.
     pub validity_window_secs: u64,
     /// opaque sealed push envelope (FCM/APNs token sealed
-    /// для а trusted push-relay operator). Empty (`vec![]`) when the
-    /// receiver has not registered для push. Persisted across re-signs;
-    /// receiver updates it via а separate IPC call (TBD slice) когда
+    /// for a trusted push-relay operator). Empty (`vec![]`) when the
+    /// receiver has not registered for push. Persisted across re-signs;
+    /// receiver updates it via a separate IPC call (TBD slice) when
     /// the underlying token rotates.
     pub push_envelope: Vec<u8>,
     /// opaque sealed wake-HMAC envelope (Epic 489.10 slice 4.3.2).
-    /// Wraps the receiver's `WakeHmacKey` к the same push-relay's
-    /// X25519 pubkey так relay can sign wake-up payloads receivers
+    /// Wraps the receiver's `WakeHmacKey` to the same push-relay's
+    /// X25519 pubkey so relay can sign wake-up payloads receivers
     /// verify locally.  Empty (`vec![]`) when the receiver did not
-    /// register для wake-HMAC authentication (defaults to opt-out
-    /// для backward compat с pre-v4 ads).  Persisted across re-signs;
-    /// receiver updates via а separate IPC call (slice 4.3.3) when
+    /// register for wake-HMAC authentication (defaults to opt-out
+    /// for backward compat with pre-v4 ads).  Persisted across re-signs;
+    /// receiver updates via a separate IPC call (slice 4.3.3) when
     /// the underlying key rotates.
     pub wake_hmac_envelope: Vec<u8>,
 }
 
-/// Default window для signed RendezvousAds — 1 day. Short enough к
+/// Default window for signed RendezvousAds — 1 day. Short enough to
 /// limit damage from a captured ad (censor can replay max 24h before
-/// it expires); long enough that maintenance only needs к re-sign
-/// every ~12 hours, keeping DHT churn proportionate к real receiver
+/// it expires); long enough that maintenance only needs to re-sign
+/// every ~12 hours, keeping DHT churn proportionate to real receiver
 /// presence rather than to refresh cadence.
 pub const DEFAULT_RENDEZVOUS_VALIDITY_SECS: u64 = 24 * 3600;
 
 /// Refresh threshold — when `valid_until - now <= half-window`
 /// the maintenance tick re-signs the ad. Half-life is the standard
-/// "republish at 50%" pattern used elsewhere в the codebase
+/// "republish at 50%" pattern used elsewhere in the codebase
 /// (sovereign-identity, local announcement, relay-directory).
 ///
 /// refactored from
@@ -1055,22 +1055,22 @@ pub fn rendezvous_ad_needs_refresh(
 /// Final-hop payload tag — distinguishes the kind of inner payload
 /// the Final-hop expects. Direct-delivery pre-refactor payloads
 /// were untagged; we add a 1-byte tag so the dispatcher can branch
-/// between AppDeliver and Introduce без heuristic decode-then-fallback.
+/// between AppDeliver and Introduce without heuristic decode-then-fallback.
 ///
 /// Wire-breaking change vs — the network is not yet live.
 pub mod final_hop_kind {
     /// Body is a `crate::proto::AppDeliverPayload` — Final-hop is
-    /// the destination и delivers locally via app_registry.
+    /// the destination and delivers locally via app_registry.
     pub const APP_DELIVER: u8 = 0x01;
     /// Body is a [`super::IntroducePayload`] — Final-hop is a
-    /// rendezvous и forwards к the registered subscriber.
+    /// rendezvous and forwards to the registered subscriber.
     pub const INTRODUCE: u8 = 0x02;
 }
 
-/// Cap on `IntroducePayload.ciphertext` length. Sized к match the
+/// Cap on `IntroducePayload.ciphertext` length. Sized to match the
 /// Final-hop budget: with 1-byte tag + IntroducePayload framing, the
-/// inner ciphertext can plausibly be up к ~150 B и still fit a 2-hop
-/// circuit. Capping at 256 B catches publisher mistakes early и keeps
+/// inner ciphertext can plausibly be up to ~150 B and still fit a 2-hop
+/// circuit. Capping at 256 B catches publisher mistakes early and keeps
 /// the wire format predictable.
 pub const MAX_INTRODUCE_CIPHERTEXT: usize = 256;
 
@@ -1080,8 +1080,8 @@ const INTRODUCE_TAG_LEN: usize = 16;
 const INTRODUCE_OVERHEAD: usize = X25519_PK_LEN + INTRODUCE_NONCE_LEN + INTRODUCE_TAG_LEN;
 
 /// Sender-built Introduce payload that the rendezvous receives as
-/// the Final-hop of an onion circuit и forwards к the receiver
-/// registered под `auth_cookie`.
+/// the Final-hop of an onion circuit and forwards to the receiver
+/// registered under `auth_cookie`.
 ///
 /// Wire layout:
 /// ```text
@@ -1089,7 +1089,7 @@ const INTRODUCE_OVERHEAD: usize = X25519_PK_LEN + INTRODUCE_NONCE_LEN + INTRODUC
 /// [32..48] auth_cookie [u8; 16]
 /// [48..50] ciphertext_len u16 BE (≤ MAX_INTRODUCE_CIPHERTEXT)
 /// [50..] ciphertext bytes — X25519+ChaCha20Poly1305 sealed
-/// к receiver_x25519_pk; decrypts к an
+/// to receiver_x25519_pk; decrypts to an
 /// inner `AppDeliverPayload`.
 /// ```
 ///
@@ -1156,7 +1156,7 @@ impl IntroducePayload {
 
 /// Receiver → rendezvous: register interest in a specific
 /// `auth_cookie`. The rendezvous holds (cookie → subscriber session)
-/// in memory; на cookie collision (different receiver tries to claim
+/// in memory; on cookie collision (different receiver tries to claim
 /// an existing cookie), the rendezvous rejects silently — receivers
 /// generate cookies cryptographically (16 B random) so collision is
 /// negligible.
@@ -1165,8 +1165,8 @@ impl IntroducePayload {
 ///
 /// `receiver_x25519_pk_check` is included so the rendezvous can
 /// log / audit which key the cookie was bound (it does NOT use
-/// it to decrypt anything — payloads are sealed к receiver_x25519_pk
-/// в the IntroducePayload itself, sealed-box style).
+/// it to decrypt anything — payloads are sealed to receiver_x25519_pk
+/// in the IntroducePayload itself, sealed-box style).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterRendezvousPayload {
     pub receiver_x25519_pk: [u8; X25519_PK_LEN],
@@ -1232,7 +1232,7 @@ impl UnregisterRendezvousPayload {
 
 /// Rendezvous → receiver: forward an Introduce ciphertext over the
 /// established OVL1 session. The receiver decrypts and routes the
-/// inner `AppDeliverPayload` локально.
+/// inner `AppDeliverPayload` locally.
 ///
 /// Wire layout: `[u16 BE ciphertext_len][ciphertext bytes]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1282,7 +1282,7 @@ impl ForwardIntroducePayload {
 
 // ── Sealed-box style sender → receiver encryption ────────────────────────────
 
-/// Encrypt `plaintext` к the recipient's X25519 pubkey. Generates a
+/// Encrypt `plaintext` to the recipient's X25519 pubkey. Generates a
 /// fresh ephemeral keypair for this call (forward secrecy: leaking
 /// the ciphertext + later compromise of the recipient's long-term
 /// X25519 sk does NOT reveal the plaintext if the ephemeral SK was
@@ -1290,9 +1290,9 @@ impl ForwardIntroducePayload {
 /// [AEAD ciphertext + 16B tag]`.
 ///
 /// AEAD: ChaCha20-Poly1305 with key = BLAKE3 of the X25519 shared
-/// secret и AAD = `INTRODUCE_DOMAIN` + ephemeral_pk + nonce. AAD
+/// secret and AAD = `INTRODUCE_DOMAIN` + ephemeral_pk + nonce. AAD
 /// binding catches tampering of any header field — in particular
-/// substituting a different ephemeral_pk fails AEAD verification и
+/// substituting a different ephemeral_pk fails AEAD verification and
 /// closes the cross-protocol replay attack from `wrap_for_hop`.
 pub fn encrypt_introduce(
     plaintext: &[u8],
@@ -1325,8 +1325,8 @@ pub fn encrypt_introduce(
     }
 
     // Derive AEAD key = BLAKE3(domain || shared). Domain prefix
-    // prevents the same shared-secret derivation от reuse в a
-    // future protocol that also DH-es к the same recipient pubkey.
+    // prevents the same shared-secret derivation from reuse in a
+    // future protocol that also DH-es to the same recipient pubkey.
     let mut h = blake3::Hasher::new();
     h.update(INTRODUCE_DOMAIN);
     h.update(shared.as_bytes());
@@ -1363,7 +1363,7 @@ pub fn encrypt_introduce(
 /// Decrypt a sealed-box ciphertext built by [`encrypt_introduce`] using
 /// the recipient's X25519 secret. Returns the plaintext, or
 /// [`RendezvousError::Verify`] on AEAD failure (wrong key, tampered
-/// fields, или замена eph_pk).
+/// fields, or replacement eph_pk).
 pub fn decrypt_introduce(
     ciphertext: &[u8],
     recipient_x25519_sk: &x25519_dalek::StaticSecret,
@@ -1459,8 +1459,8 @@ pub const INTRODUCE_REPLAY_TTL_SECS: u64 = 24 * 3600;
 /// prior `HashMap<fp, expiry>` (whose `g.keys.next` eviction was non-
 /// deterministic — let an attacker pumping unique fingerprints force-evict
 /// arbitrary legitimate entries to make their previously-captured Introduce
-/// replayable) с а VecDeque<(fp, expiry)> + HashSet<fp> pair providing
-/// O(1) FIFO eviction. Attacker-forced evictions now come из the oldest
+/// replayable) with a VecDeque<(fp, expiry)> + HashSet<fp> pair providing
+/// O(1) FIFO eviction. Attacker-forced evictions now come from the oldest
 /// end ONLY — newly-arrived legitimate fingerprints survive until N more
 /// entries have been recorded after them.
 struct ReplayState {
@@ -1540,8 +1540,8 @@ impl IntroduceReplayCache {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        // lazy GC of expired entries из the front. Queue
-        // is insertion-ordered, и all entries have the same TTL, so the
+        // lazy GC of expired entries from the front. Queue
+        // is insertion-ordered, and all entries have the same TTL, so the
         // front always carries the oldest expiry. Pop while expired.
         while let Some(&(fp_old, exp)) = g.queue.front() {
             if now_unix < exp {
@@ -1555,7 +1555,7 @@ impl IntroduceReplayCache {
         }
         // cap-eviction — drop FIFO oldest, NOT
         // HashMap-iteration-order-arbitrary. Attacker pumping unique
-        // fingerprints can only force-evict the OLDEST end, никогда не
+        // fingerprints can only force-evict the OLDEST end, never not
         // newly-recorded legitimate entries.
         if g.set.len() >= MAX_INTRODUCE_REPLAY_ENTRIES
             && let Some((fp_old, _)) = g.queue.pop_front()
@@ -1617,7 +1617,7 @@ pub fn decrypt_introduce_checked(
 // ── Rendezvous-side cookie registry ──────────────────────────────────────────
 
 /// Per-cookie subscriber entry held by the rendezvous node. Maps an
-/// `auth_cookie` к the subscriber's session peer_id, used to look up
+/// `auth_cookie` to the subscriber's session peer_id, used to look up
 /// their OVL1 session-tx for forwarding.
 ///
 /// derives `Zeroize` + `ZeroizeOnDrop` so the
@@ -1629,16 +1629,16 @@ pub fn decrypt_introduce_checked(
 pub struct RendezvousSubscriber {
     pub peer_node_id: [u8; NODE_ID_LEN],
     /// Receiver's X25519 pubkey for audit / log purposes. The
-    /// rendezvous does NOT decrypt anything — payloads are sealed к
+    /// rendezvous does NOT decrypt anything — payloads are sealed to
     /// this key by the sender.
     pub receiver_x25519_pk: [u8; X25519_PK_LEN],
     pub registered_at_unix: u64,
 }
 
-/// In-memory cookie → subscriber map. Bounded и thread-safe.
+/// In-memory cookie → subscriber map. Bounded and thread-safe.
 ///
 /// Bounded by `MAX_REGISTRATIONS` to prevent a single rogue receiver
-/// от exhausting rendezvous memory by registering millions of cookies.
+/// from exhausting rendezvous memory by registering millions of cookies.
 /// On overflow, new registrations are rejected (operator-friendly:
 /// they get an explicit error, not silent drop, since this is a
 /// receiver-controlled flow not a sender-probe).
@@ -1739,10 +1739,10 @@ impl RendezvousRegistry {
         Ok(())
     }
 
-    /// Remove a cookie если зарегистрирован subscriber'ом whose
+    /// Remove a cookie if registered by a subscriber whose
     /// `peer_node_id` matches `requesting_peer`. Mismatched requester
     /// is silently ignored (anti-DoS: an attacker who guesses someone
-    /// else's cookie shouldn't be able to deregister их).
+    /// else's cookie shouldn't be able to deregister their).
     pub fn unregister(
         &self,
         cookie: &[u8; AUTH_COOKIE_LEN],
@@ -1799,7 +1799,7 @@ impl RendezvousRegistry {
     }
 
     /// Remove every registration belonging to `peer_node_id` —
-    /// called by the dispatcher when the OVL1 session к a subscriber
+    /// called by the dispatcher when the OVL1 session to a subscriber
     /// closes. Returns the number of cookies dropped.
     pub fn drop_subscriber(&self, peer_node_id: &[u8; NODE_ID_LEN]) -> usize {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1901,7 +1901,7 @@ mod tests {
         );
         assert!(
             bytes.len() < MAX_RENDEZVOUS_AD_BYTES,
-            "must fit под the 4 KiB cap"
+            "must fit under the 4 KiB cap"
         );
     }
 
@@ -1920,7 +1920,7 @@ mod tests {
     #[test]
     fn epic482_5_tampered_rendezvous_node_id_fails_verify() {
         // Critical: censor that captures an ad and tries to redirect
-        // senders к their own rendezvous node MUST fail verify.
+        // senders to their own rendezvous node MUST fail verify.
         let (_bytes, mut ad, _pk) = fixture_ed25519();
         ad.rendezvous_node_id[0] ^= 0x01;
         assert_eq!(
@@ -1946,8 +1946,8 @@ mod tests {
     #[test]
     fn epic482_5_tampered_receiver_x25519_pk_fails_verify() {
         // CRITICAL: censor swapping X25519 key → sender encrypts
-        // Introduce к attacker's key → attacker reads sender's
-        // identity и intent. Signature MUST catch this.
+        // Introduce to attacker's key → attacker reads sender's
+        // identity and intent. Signature MUST catch this.
         let (_bytes, mut ad, _pk) = fixture_ed25519();
         ad.receiver_x25519_pk[0] ^= 0x01;
         assert_eq!(
@@ -2143,8 +2143,8 @@ mod tests {
         let (_bytes, ad, _pk) = fixture_ed25519();
         // Boundary: at exactly valid_until, ad is NO LONGER valid
         // (>= rather than >). Forces unambiguous rejection at the
-        // expiry instant — eliminates timing-window ambiguity для
-        // censor that races к use ad at the last microsecond.
+        // expiry instant — eliminates timing-window ambiguity for
+        // censor that races to use ad at the last microsecond.
         let err = is_currently_valid(&ad, 1_700_000_000 + 86_400).unwrap_err();
         assert!(matches!(err, RendezvousError::Expired { .. }));
         // After expiry too.
@@ -2169,12 +2169,12 @@ mod tests {
             canonical_message_v2(&[0u8; 32], &[0u8; 32], &[0u8; 16], &[0u8; 32], 0, 0, &[]);
         assert!(
             canonical.starts_with(SIG_DOMAIN_V2),
-            "canonical message must start с domain separator для cross-protocol replay protection"
+            "canonical message must start with domain separator for cross-protocol replay protection"
         );
         assert!(canonical.starts_with(b"veil-rendezvous-ad:v2\0"));
 
         // v1 (legacy) form retains its own domain so signatures don't
-        // replay between v1 и v2 ads even if all other fields match.
+        // replay between v1 and v2 ads even if all other fields match.
         let v1 = canonical_message_v1(&[0u8; 32], &[0u8; 32], &[0u8; 16], &[0u8; 32], 0, 0);
         assert!(v1.starts_with(b"veil-rendezvous-ad:v1\0"));
         assert_ne!(v1, canonical, "v1 and v2 canonical messages must differ");
@@ -2191,15 +2191,15 @@ mod tests {
     #[test]
     fn epic482_5_dht_key_distinct_from_relay_directory_key() {
         // CRITICAL domain-separation invariant: a rendezvous-ad
-        // lookup MUST NOT hit a relay-directory slot (или vice
+        // lookup MUST NOT hit a relay-directory slot (or vice
         // versa), even on the same node_id. Different domain
-        // prefixes в the BLAKE3 input guarantee distinct keys.
+        // prefixes in the BLAKE3 input guarantee distinct keys.
         let node_id = [0xAAu8; 32];
         let rendezvous_key = rendezvous_ad_dht_key(&node_id);
         let relay_key = super::super::directory::relay_directory_dht_key(&node_id);
         assert_ne!(
             rendezvous_key, relay_key,
-            "DHT keys for rendezvous-ad и relay-directory MUST differ to prevent cross-slot collision"
+            "DHT keys for rendezvous-ad and relay-directory MUST differ to prevent cross-slot collision"
         );
     }
 
@@ -2249,7 +2249,7 @@ mod tests {
     #[test]
     fn t1_4_followup_dht_key_at_oversized_idx_saturates() {
         // Caller passing idx >= MAX_RENDEZVOUS_AD_SLOTS shouldn't
-        // panic; key collapses к the last valid slot.
+        // panic; key collapses to the last valid slot.
         let nid = [0x42u8; 32];
         let last = rendezvous_ad_dht_key_at(&nid, MAX_RENDEZVOUS_AD_SLOTS - 1);
         let beyond = rendezvous_ad_dht_key_at(&nid, MAX_RENDEZVOUS_AD_SLOTS);
@@ -2696,7 +2696,7 @@ mod tests {
 
     #[test]
     fn epic489_10_default_no_push_envelope_yields_empty_field() {
-        // Existing fixture passes &[] для push_envelope; round-trip
+        // Existing fixture passes &[] for push_envelope; round-trip
         // through encode → decode preserves "no push" intent.
         let (_bytes, ad, _pk) = fixture_ed25519();
         assert!(
@@ -2740,9 +2740,9 @@ mod tests {
     #[test]
     fn epic489_10_signature_binds_push_envelope() {
         // Censor strips the envelope post-sign — verify must reject.
-        // Without this binding, а push-relay could be redirected к
-        // an attacker's FCM/APNs token, leaking wake-up timing к the
-        // attacker (метаданные).
+        // Without this binding, a push-relay could be redirected to
+        // an attacker's FCM/APNs token, leaking wake-up timing to the
+        // attacker (metadata).
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let envelope = b"original-sealed-token".to_vec();
         let bytes = sign_rendezvous_ad(
@@ -2761,7 +2761,7 @@ mod tests {
         )
         .unwrap();
         let mut ad = decode_rendezvous_ad(&bytes).unwrap();
-        // Tamper: replace envelope с different bytes (same length).
+        // Tamper: replace envelope with different bytes (same length).
         let mut tampered = envelope.clone();
         tampered[0] ^= 0x01;
         ad.push_envelope = tampered;
@@ -2775,7 +2775,7 @@ mod tests {
     #[test]
     fn epic489_10_signature_binds_envelope_presence() {
         // Different scenario: censor STRIPS the envelope entirely (sets
-        // length к 0). Verify must reject because v2 canonical includes
+        // length to 0). Verify must reject because v2 canonical includes
         // length=0 vs length=N.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let envelope = b"original-sealed-token".to_vec();
@@ -2856,8 +2856,8 @@ mod tests {
 
     #[test]
     fn epic489_10_v1_legacy_decode_yields_empty_envelope() {
-        // Construct а v1 wire-format blob by hand (no push_envelope
-        // field). Decoder must accept it и set push_envelope = vec![].
+        // Construct a v1 wire-format blob by hand (no push_envelope
+        // field). Decoder must accept it and set push_envelope = vec![].
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
 
         // Build v1 canonical and sign.
@@ -2898,17 +2898,17 @@ mod tests {
         assert_eq!(ad.wire_version, VERSION_LEGACY);
         assert!(
             ad.push_envelope.is_empty(),
-            "v1 ad has no push_envelope field; decoder must default к empty"
+            "v1 ad has no push_envelope field; decoder must default to empty"
         );
         verify_rendezvous_ad(&ad).expect("v1 signature must verify under v1 canonical");
     }
 
     #[test]
     fn epic489_10_v1_v2_canonical_messages_disjoint() {
-        // Cross-version replay protection: an Ed25519 signature на а v1
-        // canonical message MUST NOT verify against the same fields в
-        // v2 form (с empty envelope), even though the data fields match.
-        // Otherwise а censor could swap version bytes mid-flight и
+        // Cross-version replay protection: an Ed25519 signature on a v1
+        // canonical message MUST NOT verify against the same fields in
+        // v2 form (with empty envelope), even though the data fields match.
+        // Otherwise a censor could swap version bytes mid-flight and
         // confuse the receiver about whether push is registered.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
 
@@ -3271,8 +3271,8 @@ mod tests {
 
     #[test]
     fn epic489_10_v4_round_trip_with_wake_hmac_envelope() {
-        // Sign а fresh ad с а non-empty wake_hmac_envelope, decode + verify.
-        // Confirms encoder emits v4, decoder reads the new field, и
+        // Sign a fresh ad with a non-empty wake_hmac_envelope, decode + verify.
+        // Confirms encoder emits v4, decoder reads the new field, and
         // signature covers the envelope content.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let wake_env = vec![0xEE; 92]; // typical sealed K_wake size
@@ -3300,7 +3300,7 @@ mod tests {
     #[test]
     fn epic489_10_v4_wake_hmac_envelope_signed_in_canonical() {
         // Strip the wake_hmac_envelope post-sign — verify must reject
-        // (envelope length included в length-prefix binds signature).
+        // (envelope length included in length-prefix binds signature).
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let wake_env = vec![0xEE; 64];
         let bytes = sign_rendezvous_ad(
@@ -3329,7 +3329,7 @@ mod tests {
 
     #[test]
     fn epic489_10_v4_wake_hmac_envelope_replace_breaks_sig() {
-        // Replace envelope с same-length different-bytes — verify rejects.
+        // Replace envelope with same-length different-bytes — verify rejects.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let wake_env = vec![0xEE; 64];
         let bytes = sign_rendezvous_ad(
@@ -3358,7 +3358,7 @@ mod tests {
     #[test]
     fn epic489_10_oversized_wake_hmac_envelope_rejected_at_sign() {
         // Caller passing > MAX_WAKE_HMAC_ENVELOPE_LEN bytes must get
-        // а structured error rather than а corrupted ad.
+        // a structured error rather than a corrupted ad.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let too_big = vec![0u8; MAX_WAKE_HMAC_ENVELOPE_LEN + 1];
         let err = sign_rendezvous_ad(
@@ -3441,10 +3441,10 @@ mod tests {
 
     #[test]
     fn epic489_10_v3_legacy_decode_under_v4_yields_empty_wake_hmac_envelope() {
-        // Construct а v3 wire blob via encode_body_v3 + canonical_message_v3
+        // Construct a v3 wire blob via encode_body_v3 + canonical_message_v3
         // then decode under the new v4 decoder.  Verify must succeed
-        // using the v3 canonical, и wake_hmac_envelope must be empty —
-        // matches the symmetric v1-under-v2 и v2-under-v3 cases.
+        // using the v3 canonical, and wake_hmac_envelope must be empty —
+        // matches the symmetric v1-under-v2 and v2-under-v3 cases.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let push_env = vec![0xEE; 64];
         let cap_tok = vec![0xCC; 50];
@@ -3491,17 +3491,17 @@ mod tests {
         assert_eq!(ad.capability_token, cap_tok);
         assert!(
             ad.wake_hmac_envelope.is_empty(),
-            "v3 ads must decode к empty wake_hmac_envelope under v4 decoder"
+            "v3 ads must decode to empty wake_hmac_envelope under v4 decoder"
         );
         verify_rendezvous_ad(&ad).expect("v3 sig must verify under v4 verifier dispatch");
     }
 
     #[test]
     fn epic489_10_v3_v4_canonical_messages_disjoint() {
-        // Cross-version replay protection: an Ed25519 signature на а v3
-        // canonical message MUST NOT verify против the same fields в v4
-        // form (с empty wake_hmac_envelope).  Otherwise а censor could
-        // bump the version byte mid-flight и trick а v4 receiver into
+        // Cross-version replay protection: an Ed25519 signature on a v3
+        // canonical message MUST NOT verify against the same fields in v4
+        // form (with empty wake_hmac_envelope).  Otherwise a censor could
+        // bump the version byte mid-flight and trick a v4 receiver into
         // accepting an old-style v3 ad as if it were authenticated for
         // HMAC wakeup.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
@@ -3549,9 +3549,9 @@ mod tests {
 
     #[test]
     fn phase650b_316_v2_legacy_decode_under_v3_yields_empty_cap_token() {
-        // Construct а v2 wire blob via encode_body_v2 + canonical_message_v2
+        // Construct a v2 wire blob via encode_body_v2 + canonical_message_v2
         // then decode under the new decoder. Verify must
-        // succeed using the v2 canonical, и cap_token must be empty.
+        // succeed using the v2 canonical, and cap_token must be empty.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let envelope = vec![0xEE; 64];
         let receiver_node_id = [0xAAu8; 32];

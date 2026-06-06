@@ -1,4 +1,4 @@
-//! TOML config schema для both client и server binaries.
+//! TOML config schema for both client and server binaries.
 //!
 //! # Server example
 //!
@@ -10,7 +10,7 @@
 //!   "0011223344...64chars",
 //!   "ffeedd...64chars",
 //! ]
-//! # Allow proxying к RFC1918 destinations.  Default: false (block).
+//! # Allow proxying to RFC1918 destinations.  Default: false (block).
 //! allow_private = false
 //! ```
 //!
@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use veil_cfg::RuntimeConfig;
 
-/// Emit а warning если the config file is readable / writable by group
+/// Emit a warning if the config file is readable / writable by group
 /// or other.  Non-fatal.  Audit batch 2026-05-24 (M6).
 #[cfg(unix)]
 pub fn warn_loose_config_perms(path: &Path) {
@@ -63,7 +63,7 @@ pub fn warn_loose_config_perms(_path: &Path) {}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
-    /// Path к the local veil daemon's app socket (Unix) или named-
+    /// Path to the local veil daemon's app socket (Unix) or named-
     /// pipe (Windows).  Default matches daemon's default.
     pub socket_path: PathBuf,
     /// App name used to derive app_id via
@@ -74,55 +74,55 @@ pub struct ServerConfig {
     /// allowlist by source node_id (hex).
     #[serde(default)]
     pub allowed_node_ids: Vec<String>,
-    /// Permit outbound TCP к RFC1918 / loopback / metadata addresses.
+    /// Permit outbound TCP to RFC1918 / loopback / metadata addresses.
     /// Default `false` — recommended.
     #[serde(default)]
     pub allow_private: bool,
 
-    /// Explicit acknowledgement что this server runs as an **open proxy**
+    /// Explicit acknowledgement that this server runs as an **open proxy**
     /// (no `allowed_node_ids`).  Audit batch 2026-05-24 (M11): without
     /// this flag, `allowed_node_ids = []` is rejected at startup —
-    /// silent open-proxy was а footgun where operators thought "empty =
+    /// silent open-proxy was a footgun where operators thought "empty =
     /// nothing" but actually meant "all veil peers".
     #[serde(default)]
     pub allow_all: bool,
 
     /// **P-Net admission mode**.  When `true`, every incoming veil
     /// stream's source `node_id` is checked against the daemon's
-    /// verified-cert cache (см. `crates/veil-identity/src/network_cert.rs`)
-    /// via the `LocalAppMsg::PnetStatusQuery` IPC opcode.  Streams от
-    /// peers без а valid MembershipCert are dropped с `Denied`.
+    /// verified-cert cache (see `crates/veil-identity/src/network_cert.rs`)
+    /// via the `LocalAppMsg::PnetStatusQuery` IPC opcode.  Streams from
+    /// peers without a valid MembershipCert are dropped with `Denied`.
     ///
-    /// `allowed_node_ids` remains а secondary гейт когда `pnet_required`
-    /// is also set: peer must BOTH have а verified cert AND appear in
+    /// `allowed_node_ids` remains a secondary gate when `pnet_required`
+    /// is also set: peer must BOTH have a verified cert AND appear in
     /// the static list.  An empty `allowed_node_ids` + `pnet_required =
     /// true` means "trust whoever the daemon's P-Net gate admitted".
     ///
-    /// Default `false` — backward-compatible с pre-P-Net deployments
+    /// Default `false` — backward-compatible with pre-P-Net deployments
     /// where admission is configured statically.
     #[serde(default)]
     pub pnet_required: bool,
 
     /// S2.B **app-layer cert authority**.  When all three fields are
-    /// set, oproxy-server requires every incoming stream к present а
+    /// set, oproxy-server requires every incoming stream to present a
     /// signed `MembershipCert` preamble.  The cert is verified locally
     /// against `app_cert_trusted_owner_pubkey` + `app_cert_network_id`
-    /// (this is the app-layer's OWN trusted authority — может differ
-    /// от daemon's P-Net authority).  When unset, this gate is skipped
-    /// (oproxy falls back на the existing static / pnet_required path).
+    /// (this is the app-layer's OWN trusted authority — may differ
+    /// from daemon's P-Net authority).  When unset, this gate is skipped
+    /// (oproxy falls back on the existing static / pnet_required path).
     ///
-    /// Use case: daemon в public mode, но oproxy specifically wants к
-    /// admit only peers signed by а particular owner key.  Avoids
-    /// privatising the entire daemon когда per-app trust granularity
+    /// Use case: daemon in public mode, but oproxy specifically wants to
+    /// admit only peers signed by a particular owner key.  Avoids
+    /// privatising the entire daemon when per-app trust granularity
     /// is sufficient.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_cert_trusted_owner_pubkey: Option<String>,
-    /// Owner signature algorithm.  Required когда
+    /// Owner signature algorithm.  Required when
     /// `app_cert_trusted_owner_pubkey` set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_cert_owner_algo: Option<veil_types::SignatureAlgorithm>,
     /// Network id (64-char hex) that incoming certs must match.
-    /// Required когда `app_cert_trusted_owner_pubkey` set.
+    /// Required when `app_cert_trusted_owner_pubkey` set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_cert_network_id: Option<String>,
 
@@ -131,7 +131,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub limits: ServerLimits,
 
-    /// Tokio-runtime knobs (shared schema с veil-cli).  Env vars
+    /// Tokio-runtime knobs (shared schema with veil-cli).  Env vars
     /// `OPROXY_RUNTIME`, `OPROXY_WORKERS`, `OPROXY_MAX_BLOCKING_THREADS`
     /// override these post-load.
     #[serde(default)]
@@ -142,20 +142,20 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
 }
 
-/// Connection-count limits для `oproxy-client` (audit batch 2026-05-24,
+/// Connection-count limits for `oproxy-client` (audit batch 2026-05-24,
 /// finding M8).
 ///
 /// `oproxy-client` spawns one tokio task per inbound connection.  Without
-/// а cap, an `accept()` flood (DoS pivot from а compromised loopback
-/// client) exhausts tasks и memory.  The semaphore-backed limit means
+/// a cap, an `accept()` flood (DoS pivot from a compromised loopback
+/// client) exhausts tasks and memory.  The semaphore-backed limit means
 /// the `accept()` loop blocks (TCP backpressure to the client) when
 /// already at capacity.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientLimits {
     /// Max concurrent SOCKS5 / HTTP / TProxy sessions PER LISTENER.
-    /// Default 1024 — generous для legitimate workloads, fatal только
-    /// для adversaries що want к exhaust the daemon.
+    /// Default 1024 — generous for legitimate workloads, fatal only
+    /// for adversaries that want to exhaust the daemon.
     #[serde(default = "default_max_concurrent_per_listener")]
     pub max_concurrent_per_listener: usize,
 }
@@ -172,7 +172,7 @@ fn default_max_concurrent_per_listener() -> usize {
     1024
 }
 
-/// Connection-count limits для `oproxy-server`.
+/// Connection-count limits for `oproxy-server`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerLimits {
@@ -201,8 +201,8 @@ fn default_max_concurrent_streams() -> usize {
 pub enum InboundConfig {
     /// SOCKS5 ingress (RFC 1928).
     Socks5 {
-        /// `host:port` для the local listener.  Use `127.0.0.1:<port>`
-        /// для loopback-only access.
+        /// `host:port` for the local listener.  Use `127.0.0.1:<port>`
+        /// for loopback-only access.
         listen: String,
     },
     /// HTTP/1.1 forward proxy (CONNECT + absolute-URI rewriting).
@@ -212,9 +212,9 @@ pub enum InboundConfig {
     /// matching iptables / nftables rules.
     ///
     /// Linux / Keenetic only (Keenetic uses standard Linux kernel).
-    /// FreeBSD support was stubbed в audit batch 2026-05-23 — fail-fast
-    /// at startup until pf+divert или ipfw fwd integration lands.
-    /// macOS / Windows: use SOCKS5 или HTTP inbound instead.
+    /// FreeBSD support was stubbed in audit batch 2026-05-23 — fail-fast
+    /// at startup until pf+divert or ipfw fwd integration lands.
+    /// macOS / Windows: use SOCKS5 or HTTP inbound instead.
     Tproxy { listen: String },
 }
 
@@ -226,32 +226,32 @@ pub struct ClientConfig {
     /// Same name the server published.  Both sides derive the same
     /// app_id via the canonical helper.
     pub server_app_name: String,
-    /// One или more inbound listeners.  All run concurrently.
+    /// One or more inbound listeners.  All run concurrently.
     #[serde(default)]
     pub inbound: Vec<InboundConfig>,
 
     /// Connection-count limits (audit batch 2026-05-24, finding M8).
-    /// Cap'ит max concurrent SOCKS5/HTTP/TProxy sessions так que `accept()`
+    /// Caps max concurrent SOCKS5/HTTP/TProxy sessions so that `accept()`
     /// floods cannot exhaust tasks / memory.
     #[serde(default)]
     pub limits: ClientLimits,
 
     /// Per-target routing policy: which connects go through veil,
-    /// which bypass directly, и what к do if veil is down.
-    /// Omit для backward-compat (= veil-only, fail-closed).
+    /// which bypass directly, and what to do if veil is down.
+    /// Omit for backward-compat (= veil-only, fail-closed).
     #[serde(default)]
     pub routing: RoutingConfig,
 
-    /// S2.B: path к а signed `MembershipCert` blob (output of
+    /// S2.B: path to a signed `MembershipCert` blob (output of
     /// `veil-cli network sign-member`).  When set, the client
-    /// prepends an app-cert preamble (см. wire.rs) к every outbound
+    /// prepends an app-cert preamble (see wire.rs) to every outbound
     /// stream open; the server verifies it against its own configured
     /// trusted owner pubkey before accepting the connection.  Omit
     /// when the server's `app_cert_trusted_owner_pubkey` is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_cert_path: Option<PathBuf>,
 
-    /// Tokio-runtime knobs (shared schema с veil-cli).  Env vars
+    /// Tokio-runtime knobs (shared schema with veil-cli).  Env vars
     /// `OPROXY_RUNTIME`, `OPROXY_WORKERS`, `OPROXY_MAX_BLOCKING_THREADS`
     /// override these post-load.
     #[serde(default)]
@@ -263,21 +263,21 @@ pub struct ClientConfig {
 }
 
 /// Logging configuration shared between client/server binaries.
-/// Mapped к `env_logger::Builder` at startup.
+/// Mapped to `env_logger::Builder` at startup.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Minimum level: `off` | `error` | `warn` | `info` | `debug` |
-    /// `trace`.  Default `info`.  Set `off` к suppress all log
+    /// `trace`.  Default `info`.  Set `off` to suppress all log
     /// output.  Overridden by `RUST_LOG` env var when set.
     #[serde(default)]
     pub level: LogLevel,
 
-    /// Optional path к а log file.  `None` (default) ⇒ logs go к
-    /// stderr.  When set, logs are appended к the file (created if
-    /// absent).  Parent directory must exist.  Не affected by the
-    /// `level = "off"` shortcut — if you set а file и want к stop
-    /// writing к it, also set `level = "off"` (или remove the
+    /// Optional path to a log file.  `None` (default) ⇒ logs go to
+    /// stderr.  When set, logs are appended to the file (created if
+    /// absent).  Parent directory must exist.  Not affected by the
+    /// `level = "off"` shortcut — if you set a file and want to stop
+    /// writing to it, also set `level = "off"` (or remove the
     /// `file` field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<std::path::PathBuf>,
@@ -310,25 +310,25 @@ impl LogLevel {
 
 // ── Routing config ─────────────────────────────────────────────────────────
 
-/// Routing policy для outbound traffic from the client's inbound
+/// Routing policy for outbound traffic from the client's inbound
 /// listeners.
 ///
-/// Defaults к the historical "all через veil, fail если down"
-/// behaviour для backward compat.
+/// Defaults to the historical "all through veil, fail if down"
+/// behaviour for backward compat.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
-    /// Default action when no rule matches (или when `rules` is empty).
+    /// Default action when no rule matches (or when `rules` is empty).
     #[serde(default)]
     pub default: ProxyMode,
 
-    /// What к do если `default = "veil"` или а rule yielded `veil`
+    /// What to do if `default = "veil"` or a rule yielded `veil`
     /// but the veil path fails (server unreachable, timeout, etc.).
     #[serde(default)]
     pub fallback: FallbackMode,
 
-    /// Optional per-target rule table evaluated в order.  First match
-    /// wins.  Если none match, `default` applies.
+    /// Optional per-target rule table evaluated in order.  First match
+    /// wins.  If none match, `default` applies.
     #[serde(default)]
     pub rules: Vec<RoutingRule>,
 
@@ -345,24 +345,24 @@ pub struct RoutingConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyMode {
-    /// Tunnel the connection через veil → server (current default
+    /// Tunnel the connection through veil → server (current default
     /// behaviour for backward compat).
     #[default]
     Veil,
-    /// Open а direct TCP socket from the client host (acts as а plain
-    /// local SOCKS5/HTTP proxy с no veil involvement).
+    /// Open a direct TCP socket from the client host (acts as a plain
+    /// local SOCKS5/HTTP proxy with no veil involvement).
     Direct,
-    /// Refuse the connection с а SOCKS5/HTTP error.
+    /// Refuse the connection with a SOCKS5/HTTP error.
     Block,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FallbackMode {
-    /// Return CONNECT failure к the inbound client (current behaviour).
+    /// Return CONNECT failure to the inbound client (current behaviour).
     #[default]
     Fail,
-    /// Silently switch к а direct TCP connect when veil fails.
+    /// Silently switch to a direct TCP connect when veil fails.
     Direct,
 }
 
@@ -377,27 +377,27 @@ pub struct RoutingRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_exact: Option<String>,
     /// Match: destination IPv4/IPv6 CIDR.  Only applies if dst is an
-    /// IP literal (или resolves к one before action — current impl
+    /// IP literal (or resolves to one before action — current impl
     /// matches against the *literal* host string when it's already an
-    /// IP, не resolves DNS).
+    /// IP, not resolves DNS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cidr: Option<String>,
-    /// Match: destination port range, e.g. `"1024-65535"`, или
+    /// Match: destination port range, e.g. `"1024-65535"`, or
     /// single port `"443"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_range: Option<String>,
     /// Action when match succeeds.
     pub action: ProxyMode,
-    /// Per-rule fallback override.  Applies только when `action =
-    /// "veil"` и the veil path fails (phases 1-3 of the connect
+    /// Per-rule fallback override.  Applies only when `action =
+    /// "veil"` and the veil path fails (phases 1-3 of the connect
     /// handshake).  `None` (default) ⇒ inherit the parent
-    /// `[routing] fallback`.  Use `"fail"` к force-no-fallback for а
-    /// specific rule even если global fallback is `"direct"`.
+    /// `[routing] fallback`.  Use `"fail"` to force-no-fallback for a
+    /// specific rule even if global fallback is `"direct"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<FallbackMode>,
 }
 
-/// Parse а 64-char hex node_id с optional `0x` prefix.
+/// Parse a 64-char hex node_id with optional `0x` prefix.
 pub fn parse_node_id_hex(s: &str) -> Result<[u8; 32], String> {
     let trimmed = s.trim().trim_start_matches("0x");
     if trimmed.len() != 64 {
@@ -506,9 +506,9 @@ mod tests {
         assert!(matches!(cfg.inbound[2], InboundConfig::Tproxy { .. }));
     }
 
-    /// Per-rule fallback override is parsed correctly от TOML.  Covers
-    /// the user-asked RFC1918 split scenario (10/8 с fallback к direct;
-    /// 172.16/12 с fallback к fail; 192.168/16 always direct).
+    /// Per-rule fallback override is parsed correctly from TOML.  Covers
+    /// the user-asked RFC1918 split scenario (10/8 with fallback to direct;
+    /// 172.16/12 with fallback to fail; 192.168/16 always direct).
     #[test]
     fn parse_client_config_with_per_rule_fallback() {
         let toml = r#"

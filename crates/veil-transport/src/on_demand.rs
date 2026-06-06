@@ -1,13 +1,13 @@
 //! On-demand listener controller — Slice 2 of the PoW-Gated
 //! Rendezvous epic ([`docs/internal/PLAN_POW_GATED_RENDEZVOUS.md`]).
 //!
-//! Provides the primitive that converts а valid PoW-gated rendezvous
-//! request into а short-lived listener slot.  Lifecycle:
+//! Provides the primitive that converts a valid PoW-gated rendezvous
+//! request into a short-lived listener slot.  Lifecycle:
 //!
 //! 1. **Port reservation** — caller invokes [`bind_on_demand`], which
-//!    calls [`super::ephemeral::bind_random_port`] к probe-bind а free
-//!    port в the configured range, then drops the listener (caller
-//!    rebinds через `TransportRegistry` so the actual obfs4/wss/quic
+//!    calls [`super::ephemeral::bind_random_port`] to probe-bind a free
+//!    port in the configured range, then drops the listener (caller
+//!    rebinds through `TransportRegistry` so the actual obfs4/wss/quic
 //!    wrapping happens uniformly).
 //! 2. **Lifecycle tracking** — [`OnDemandLifecycle`] tracks two
 //!    independent exit conditions: TTL expiry (wall-clock deadline)
@@ -15,16 +15,16 @@
 //!    slot retires).  Either condition triggers exit.
 //! 3. **Caller-driven accept loop** — Slice 3's rendezvous-server
 //!    controller spawns its own accept task using the lifecycle handle
-//!    в а `tokio::select!` arm; the accept task awaits the lifecycle
-//!    OR а `listener.accept()` future и breaks out cleanly когда
+//!    in a `tokio::select!` arm; the accept task awaits the lifecycle
+//!    OR a `listener.accept()` future and breaks out cleanly when
 //!    lifecycle fires.
 //!
 //! ## Why split bind from accept-loop
 //!
-//! Phase 5f's `spawn_listeners` accept loop assumes а persistent
+//! Phase 5f's `spawn_listeners` accept loop assumes a persistent
 //! listener (replaceable mid-flight via swap-channel, but always
 //! present).  On-demand semantics are different: the listener is
-//! ephemeral, single-purpose, и cleans up after itself — owning а
+//! ephemeral, single-purpose, and cleans up after itself — owning a
 //! complete short-lived task lifecycle is cleaner than retro-fitting
 //! "remove listener" semantics onto the Phase 5f swap channel.
 //!
@@ -42,72 +42,72 @@ use super::error::{Result, TransportError};
 
 // ── Configuration ───────────────────────────────────────────────────
 
-/// Operator-visible knobs для one PoW-gated rendezvous request.
+/// Operator-visible knobs for one PoW-gated rendezvous request.
 ///
 /// Typical production values:
 /// * `ttl = Duration::from_secs(300)` — 5-minute window for the
-///   initiator к dial back; balances "too short ⇒ legitimate clients
-///   miss the window" с "too long ⇒ DPI scanner с captured token
+///   initiator to dial back; balances "too short ⇒ legitimate clients
+///   miss the window" with "too long ⇒ DPI scanner with captured token
 ///   has more time".
 /// * `max_accepts = 1` — one-shot.  Higher values are valid for
-///   multi-device pairing flows что land several connections в quick
+///   multi-device pairing flows that land several connections in quick
 ///   succession.
-/// * `bind_retries = 64` — matches the Phase 5а rotator default.
+/// * `bind_retries = 64` — matches the Phase 5a rotator default.
 #[derive(Debug, Clone)]
 pub struct OnDemandConfig {
-    /// Bind host, e.g. `"0.0.0.0"` или а specific local IP.
+    /// Bind host, e.g. `"0.0.0.0"` or a specific local IP.
     pub host: String,
     /// Inclusive random-port range.
     pub port_range: RangeInclusive<u16>,
     /// Retries on `EADDRINUSE` during port probing.
     pub bind_retries: u32,
-    /// Lifetime of the slot от bind moment.  Must be > 0.
+    /// Lifetime of the slot from bind moment.  Must be > 0.
     pub ttl: Duration,
     /// Maximum accepted sessions before slot retires.  Must be > 0.
-    /// 1 = one-shot rendezvous; higher = "open для N dials of the
+    /// 1 = one-shot rendezvous; higher = "open for N dials of the
     /// same requester within the TTL" (rare).
     pub max_accepts: usize,
 }
 
 // ── Lifecycle handle ────────────────────────────────────────────────
 
-/// Tracks the two exit conditions для an on-demand slot: TTL deadline
+/// Tracks the two exit conditions for an on-demand slot: TTL deadline
 /// + remaining accept budget.  Shared between the rendezvous-server
 ///   controller (which decrements `accepts_remaining` after each
-///   successful handshake) и the slot's dedicated accept task (which
-///   awaits the lifecycle в а `select!` arm).
+///   successful handshake) and the slot's dedicated accept task (which
+///   awaits the lifecycle in a `select!` arm).
 ///
-/// All fields are `Arc`-shareable; instances are cheap к clone.  Both
+/// All fields are `Arc`-shareable; instances are cheap to clone.  Both
 /// fields use atomic / channel-based concurrency primitives so the
 /// shared handle does not require external locking.
 #[derive(Debug)]
 pub struct OnDemandLifecycle {
     /// Wall-clock instant after which the slot is invalid.  Captured
-    /// от `Instant::now() + ttl` at bind time.
+    /// from `Instant::now() + ttl` at bind time.
     expires_at: Instant,
     /// Decremented on each successful accept.  Reaching 0 retires the
     /// slot regardless of TTL.
     accepts_remaining: AtomicUsize,
-    /// Used к forcibly retire the slot (e.g. когда the controller
-    /// fails к ship the EphemeralEndpointResponse и wants к release
-    /// the port immediately rather than waiting для TTL).
+    /// Used to forcibly retire the slot (e.g. when the controller
+    /// fails to ship the EphemeralEndpointResponse and wants to release
+    /// the port immediately rather than waiting for TTL).
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
 impl OnDemandLifecycle {
     /// Record one accepted handshake.  Returns the **previous** count
-    /// of `accepts_remaining`.  Caller decides what к do based на the
+    /// of `accepts_remaining`.  Caller decides what to do based on the
     /// return value:
     /// * `prev == 1` ⇒ this was the last allowed accept — caller
-    ///   should stop listening на the next iteration.
+    ///   should stop listening on the next iteration.
     /// * `prev == 0` (already retired) ⇒ caller should reject this
-    ///   connection (race between `should_exit()` check и acceptance).
-    /// * `prev > 1` ⇒ slot remains open для more accepts within TTL.
+    ///   connection (race between `should_exit()` check and acceptance).
+    /// * `prev > 1` ⇒ slot remains open for more accepts within TTL.
     pub fn note_accept(&self) -> usize {
         // Saturating-sub semantics: we don't want to underflow,
-        // even в the rare race где multiple accept-loops call this
-        // против а fully-spent slot.
+        // even in the rare race where multiple accept-loops call this
+        // against a fully-spent slot.
         loop {
             let prev = self.accepts_remaining.load(Ordering::SeqCst);
             if prev == 0 {
@@ -123,8 +123,8 @@ impl OnDemandLifecycle {
         }
     }
 
-    /// Returns true iff the slot has retired — either TTL elapsed или
-    /// accept budget exhausted.  Cheap к call (no syscall, no lock).
+    /// Returns true iff the slot has retired — either TTL elapsed or
+    /// accept budget exhausted.  Cheap to call (no syscall, no lock).
     pub fn should_exit(&self) -> bool {
         if Instant::now() >= self.expires_at {
             return true;
@@ -140,11 +140,11 @@ impl OnDemandLifecycle {
 
     /// Async wait until either (a) TTL deadline reached, (b) explicit
     /// shutdown signalled.  Note this does NOT track the accept-budget
-    /// path — accept-task implementations check `note_accept()` после
-    /// each handshake и break out of their loop manually когда the
+    /// path — accept-task implementations check `note_accept()` after
+    /// each handshake and break out of their loop manually when the
     /// returned `prev` indicates the slot is now retired.
     ///
-    /// Designed для use в а `tokio::select!` arm alongside
+    /// Designed for use in a `tokio::select!` arm alongside
     /// `listener.accept()` so the accept-task wakes promptly when
     /// the slot retires.
     pub async fn await_ttl_or_shutdown(&self) {
@@ -163,12 +163,12 @@ impl OnDemandLifecycle {
         let _ = self.shutdown_tx.send(true);
     }
 
-    /// Remaining accept budget.  Useful для diagnostics / metrics.
+    /// Remaining accept budget.  Useful for diagnostics / metrics.
     pub fn accepts_remaining(&self) -> usize {
         self.accepts_remaining.load(Ordering::SeqCst)
     }
 
-    /// Wall-clock expiry instant.  Useful для diagnostics / metrics.
+    /// Wall-clock expiry instant.  Useful for diagnostics / metrics.
     pub fn expires_at(&self) -> Instant {
         self.expires_at
     }
@@ -176,20 +176,20 @@ impl OnDemandLifecycle {
 
 // ── Bind result ─────────────────────────────────────────────────────
 
-/// Output of а successful [`bind_on_demand`] call.  Caller uses
+/// Output of a successful [`bind_on_demand`] call.  Caller uses
 /// `port` to compose the transport URI (typically `obfs4-tcp://host:port`)
-/// и then calls `TransportRegistry::bind(uri, ctx)` к get а real
+/// and then calls `TransportRegistry::bind(uri, ctx)` to get a real
 /// `Box<dyn TransportListener>`.  The `lifecycle` handle is shared
-/// между the controller и the spawned accept task.
+/// between the controller and the spawned accept task.
 #[derive(Debug)]
 pub struct OnDemandSlot {
-    /// Bind host that the probe used (echoes config — useful когда the
-    /// caller has multiple slots в flight и needs к keep track).
+    /// Bind host that the probe used (echoes config — useful when the
+    /// caller has multiple slots in flight and needs to keep track).
     pub host: String,
     /// Random port chosen by [`super::ephemeral::bind_random_port`].
     /// Verified-free at bind time; small race vs caller's actual rebind
     /// is acceptable (handled by `TransportRegistry::bind` returning
-    /// an error → controller retries или fails the request).
+    /// an error → controller retries or fails the request).
     pub port: u16,
     /// Shared lifecycle handle.  Cloneable cheaply.
     pub lifecycle: Arc<OnDemandLifecycle>,
@@ -197,16 +197,16 @@ pub struct OnDemandSlot {
 
 // ── Public API ──────────────────────────────────────────────────────
 
-/// Probe-bind а free port from the configured range и build а
-/// lifecycle handle для the slot.  Returns immediately после the
+/// Probe-bind a free port from the configured range and build a
+/// lifecycle handle for the slot.  Returns immediately after the
 /// probe drops; caller is responsible for invoking
-/// `TransportRegistry::bind(uri, ctx)` к actually open the listener.
+/// `TransportRegistry::bind(uri, ctx)` to actually open the listener.
 ///
 /// Failures:
 /// * `OnDemandConfig::ttl == 0` ⇒ refused
 /// * `OnDemandConfig::max_accepts == 0` ⇒ refused
-/// * Port range inverted ⇒ delegated к `bind_random_port`'s validation
-/// * All `bind_retries` attempts collide ⇒ delegated к `bind_random_port`
+/// * Port range inverted ⇒ delegated to `bind_random_port`'s validation
+/// * All `bind_retries` attempts collide ⇒ delegated to `bind_random_port`
 pub async fn bind_on_demand(config: OnDemandConfig) -> Result<OnDemandSlot> {
     if config.ttl.is_zero() {
         return Err(TransportError::Unsupported(
@@ -219,8 +219,8 @@ pub async fn bind_on_demand(config: OnDemandConfig) -> Result<OnDemandSlot> {
         ));
     }
 
-    // Probe-bind к verify а free port.  We drop the listener immediately
-    // — caller rebinds через TransportRegistry (which composes obfs4 /
+    // Probe-bind to verify a free port.  We drop the listener immediately
+    // — caller rebinds through TransportRegistry (which composes obfs4 /
     // TLS / etc. wrapping that this primitive doesn't know about).
     let (probe, port) =
         super::ephemeral::bind_random_port(&config.host, config.port_range, config.bind_retries)
@@ -295,16 +295,16 @@ mod tests {
     #[tokio::test]
     async fn bind_dropped_listener_releases_port() {
         // After bind_on_demand returns, the probe listener is dropped
-        // and the port is free to be rebound by the caller (or by а
-        // second call к bind_on_demand).  Verify by binding the same
-        // port-range again и asserting no error.
+        // and the port is free to be rebound by the caller (or by a
+        // second call to bind_on_demand).  Verify by binding the same
+        // port-range again and asserting no error.
         let _slot1 = bind_on_demand(cfg(Duration::from_secs(60), 1))
             .await
             .unwrap();
         let _slot2 = bind_on_demand(cfg(Duration::from_secs(60), 1))
             .await
             .unwrap();
-        // Both succeed — ports are diverse due к random pick over а
+        // Both succeed — ports are diverse due to random pick over a
         // 30k-port range.
     }
 
@@ -326,7 +326,7 @@ mod tests {
     fn note_accept_after_exhaustion_returns_zero() {
         let l = make_lifecycle(Duration::from_secs(60), 1);
         assert_eq!(l.note_accept(), 1);
-        // Already retired — subsequent calls return 0 без underflow.
+        // Already retired — subsequent calls return 0 without underflow.
         assert_eq!(l.note_accept(), 0);
         assert_eq!(l.note_accept(), 0);
         assert_eq!(l.accepts_remaining(), 0);
@@ -334,8 +334,8 @@ mod tests {
 
     #[test]
     fn note_accept_concurrent_does_not_underflow() {
-        // Hammer note_accept от 16 threads against а budget of 8.
-        // Final accepts_remaining must be 0 (not negative), и exactly
+        // Hammer note_accept from 16 threads against a budget of 8.
+        // Final accepts_remaining must be 0 (not negative), and exactly
         // 8 of the 16 calls should have returned non-zero prev.
         let l = make_lifecycle(Duration::from_secs(60), 8);
         let l_arc = Arc::clone(&l);
@@ -389,7 +389,7 @@ mod tests {
         let start = Instant::now();
         l.await_ttl_or_shutdown().await;
         let elapsed = start.elapsed();
-        // Should resolve after ~50ms, well before а generous timeout.
+        // Should resolve after ~50ms, well before a generous timeout.
         assert!(
             elapsed >= Duration::from_millis(40) && elapsed < Duration::from_millis(500),
             "elapsed was {elapsed:?}",
@@ -421,15 +421,15 @@ mod tests {
 
     /// Demonstrates the canonical accept-loop pattern that Slice 3's
     /// rendezvous server will use.  This integration test simulates
-    /// 2 accept-loop iterations on а budget of 2, then verifies the
+    /// 2 accept-loop iterations on a budget of 2, then verifies the
     /// loop exits cleanly after the budget is spent.
     #[tokio::test]
     async fn canonical_accept_loop_exits_when_budget_spent() {
         let lifecycle = make_lifecycle(Duration::from_secs(60), 2);
 
         // Pretend the actual listener.accept() returns immediately
-        // by yielding к tokio.  Real accept loop has а listener.accept()
-        // future в the select! arm alongside lifecycle.await_ttl_or_shutdown().
+        // by yielding to tokio.  Real accept loop has a listener.accept()
+        // future in the select! arm alongside lifecycle.await_ttl_or_shutdown().
         let mut accepts = 0;
         loop {
             if lifecycle.should_exit() {
@@ -439,8 +439,8 @@ mod tests {
             let prev = lifecycle.note_accept();
             if prev == 0 {
                 // Race: should_exit said budget but note_accept also
-                // sees 0 — bail.  Should be unreachable here но кодом
-                // должен handle it gracefully.
+                // sees 0 — bail.  Should be unreachable here but the code
+                // must handle it gracefully.
                 break;
             }
             accepts += 1;

@@ -218,7 +218,7 @@ fn create<I: CommandIo>(
 
     // parse `--algo` (default "ed25519"). Accept
     // operator-friendly aliases: "hybrid" / "ed25519+falcon512" map
-    // to Ed25519Falcon512Hybrid; "falcon512" / "falcon-512" map к
+    // to Ed25519Falcon512Hybrid; "falcon512" / "falcon-512" map to
     // standalone Falcon-512 (gated by `--accept-no-recovery`).
     let algo = match args.algo.as_str().trim().to_ascii_lowercase().as_str() {
         "ed25519" | "" => veil_types::SignatureAlgorithm::Ed25519,
@@ -236,24 +236,24 @@ fn create<I: CommandIo>(
 
     // standalone Falcon-512 has NO BIP-39 recovery —
     // operator MUST explicitly opt in with `--accept-no-recovery`.
-    // Without that flag we hard-refuse и steer them at hybrid (which
+    // Without that flag we hard-refuse and steer them at hybrid (which
     // retains a classical recovery path).
     if matches!(algo, veil_types::SignatureAlgorithm::Falcon512) && !args.accept_no_recovery {
         return Err(IdentityCliError::Internal(
             "create: --algo=falcon512 has NO recovery path — the \
-             master Falcon SK is generated from OsRng и lives ONLY \
+             master Falcon SK is generated from OsRng and lives ONLY \
              in <veil_dir>/master_falcon.bin.  Loss of that file \
-             = TOTAL identity loss с no paper backup.  Pass \
-             --accept-no-recovery to acknowledge, или use \
+             = TOTAL identity loss with no paper backup.  Pass \
+             --accept-no-recovery to acknowledge, or use \
              --algo=hybrid which retains BIP-39-recoverable Ed25519 \
              half.  See docs/identity-hybrid-backup.md."
                 .into(),
         ));
     }
     if matches!(algo, veil_types::SignatureAlgorithm::Falcon512) {
-        // Loud warning к stderr-style output channel. The block of
+        // Loud warning to stderr-style output channel. The block of
         // `!` lines is meant to be visually unmistakable in operator
-        // logs; keep the format stable across versions так чтобы log
+        // logs; keep the format stable across versions so that log
         // scrapers can recognise it.
         for line in [
             "!!! WARNING: standalone Falcon-512 master selected !!!",
@@ -262,7 +262,7 @@ fn create<I: CommandIo>(
             "!!! - LOSS of master_falcon.bin = LOSS of identity",
             "!!! - NO @name, NO contacts, NO reputation can be restored",
             "!!! Back up master_falcon.bin to multiple independent media",
-            "!!! BEFORE relying на this identity for anything important.",
+            "!!! BEFORE relying on this identity for anything important.",
         ] {
             io.emit(OutputEvent::message(line.to_owned()));
         }
@@ -270,8 +270,8 @@ fn create<I: CommandIo>(
 
     if args.pow_difficulty.is_some() {
         io.emit(OutputEvent::message(
-            "warning: --pow-difficulty is deprecated и has no effect; \
-             identity documents no longer carry а PoW field"
+            "warning: --pow-difficulty is deprecated and has no effect; \
+             identity documents no longer carry a PoW field"
                 .to_owned(),
         ));
     }
@@ -353,13 +353,13 @@ fn emit_creation_summary<I: CommandIo>(
     }
     io.emit(OutputEvent::message(String::new()));
 
-    // ext: для standalone Falcon-512 (master_algo = 2) the
+    // ext: for standalone Falcon-512 (master_algo = 2) the
     // BIP-39 phrase is informational only — it doesn't recover the
-    // master. Skip the "WRITE THIS DOWN" banner и replace с a
+    // master. Skip the "WRITE THIS DOWN" banner and replace with a
     // reminder that the bundle file IS the recovery medium.
     if out.document.master_algo == veil_proto::identity_document::ALGO_FALCON512 {
         io.emit(OutputEvent::message(
-            "Standalone Falcon-512: BIP-39 phrase is NOT a recovery medium и is suppressed."
+            "Standalone Falcon-512: BIP-39 phrase is NOT a recovery medium and is suppressed."
                 .to_owned(),
         ));
         io.emit(OutputEvent::message(
@@ -451,11 +451,11 @@ fn restore<I: CommandIo>(
         }
     };
 
-    // phrase-file handling. Required for Ed25519 и hybrid
-    // (BIP-39 recovers the classical half); ignored для falcon512
+    // phrase-file handling. Required for Ed25519 and hybrid
+    // (BIP-39 recovers the classical half); ignored for falcon512
     // (standalone Falcon has no BIP-39 path). When omitted on
     // falcon512 we feed the library a zero-seed (it's never used in
-    // that branch); when supplied на falcon512 we noisy-warn but
+    // that branch); when supplied on falcon512 we noisy-warn but
     // accept the file (operator may be reusing a phrase across
     // mixed-algo identities).
     let master_seed = match (&algo, &args.phrase_file) {
@@ -469,10 +469,10 @@ fn restore<I: CommandIo>(
         (veil_types::SignatureAlgorithm::Falcon512, Some(p)) => {
             io.emit(OutputEvent::message(format!(
                 "WARNING: standalone Falcon-512 restore ignores --phrase-file {} \
-                 (no BIP-39 path для Falcon master).",
+                 (no BIP-39 path for Falcon master).",
                 p.display()
             )));
-            // Decode anyway к catch obvious operator errors (typo'd
+            // Decode anyway to catch obvious operator errors (typo'd
             // phrase) — but the result is dropped to a zero-seed
             // because the library doesn't consume it on this branch.
             let raw = fs::read_to_string(p)?;
@@ -488,7 +488,7 @@ fn restore<I: CommandIo>(
         }
         (_, None) => {
             return Err(IdentityCliError::Internal(
-                "restore: --phrase-file is required для --algo={ed25519|hybrid} \
+                "restore: --phrase-file is required for --algo={ed25519|hybrid} \
                  (BIP-39 phrase recovers the classical master half).  \
                  Omit --phrase-file only for --algo=falcon512."
                     .into(),
@@ -496,8 +496,8 @@ fn restore<I: CommandIo>(
         }
     };
 
-    // bundle-file handling. Required for hybrid и
-    // falcon512; accepted-but-ignored для ed25519.
+    // bundle-file handling. Required for hybrid and
+    // falcon512; accepted-but-ignored for ed25519.
     let master_falcon_keypair_bytes = match (&algo, &args.master_falcon_file) {
         (veil_types::SignatureAlgorithm::Ed25519Falcon512Hybrid, Some(p))
         | (veil_types::SignatureAlgorithm::Falcon512, Some(p)) => {
@@ -521,7 +521,7 @@ fn restore<I: CommandIo>(
             return Err(IdentityCliError::Internal(
                 "restore: --algo=falcon512 requires --master-falcon-file \
                      pointing at the preserved master_falcon.bin (this is \
-                     the SOLE recovery medium для standalone Falcon-512 — \
+                     the SOLE recovery medium for standalone Falcon-512 — \
                      no BIP-39 path exists)"
                     .into(),
             ));
@@ -539,8 +539,8 @@ fn restore<I: CommandIo>(
 
     if args.pow_difficulty.is_some() {
         io.emit(OutputEvent::message(
-            "warning: --pow-difficulty is deprecated и has no effect; \
-             identity documents no longer carry а PoW field"
+            "warning: --pow-difficulty is deprecated and has no effect; \
+             identity documents no longer carry a PoW field"
                 .to_owned(),
         ));
     }
@@ -682,8 +682,8 @@ fn migrate<I: CommandIo>(
 
     if old_doc.node_id == new_doc.node_id {
         return Err(IdentityCliError::Internal(format!(
-            "migrate: --from и --to point at the same node_id {} — \
-             nothing к migrate",
+            "migrate: --from and --to point at the same node_id {} — \
+             nothing to migrate",
             hex_encode(&old_doc.node_id),
         )));
     }
@@ -715,7 +715,7 @@ fn migrate<I: CommandIo>(
             (Some(_), Some(_)) => {
                 return Err(IdentityCliError::Internal(
                     "migrate: pass exactly one of --from-phrase-file or \
-                     --from-password-file для the OLD master, not both"
+                     --from-password-file for the OLD master, not both"
                         .into(),
                 ));
             }
@@ -817,13 +817,13 @@ fn migrate<I: CommandIo>(
         other => {
             return Err(IdentityCliError::Internal(format!(
                 "migrate: OLD master_algo byte {other} is not a recognised \
-                 SignatureAlgorithm — refusing к sign cert against unknown \
+                 SignatureAlgorithm — refusing to sign cert against unknown \
                  algo"
             )));
         }
     };
 
-    // Sanity-check that the OLD master_pubkey we're about к use for
+    // Sanity-check that the OLD master_pubkey we're about to use for
     // signing matches what's published in the OLD IdentityDocument.
     // If the operator pointed --from at a directory containing a doc
     // for a different identity than their phrase / falcon bundle
@@ -836,7 +836,7 @@ fn migrate<I: CommandIo>(
             "migrate: composed OLD master_pubkey ({} bytes) doesn't match \
              {}/identity_document.bin's master_pubkey ({} bytes) — \
              operator likely pointed --from at a directory whose phrase/bundle \
-             belongs к a DIFFERENT identity",
+             belongs to a DIFFERENT identity",
             recomputed_old_pk.len(),
             from_dir.display(),
             old_doc.master_pubkey.len(),
@@ -862,8 +862,8 @@ fn migrate<I: CommandIo>(
     .map_err(|e| IdentityCliError::Internal(format!("migrate: sign_migration_cert: {e}")))?;
 
     // Step 6: write the cert blob. Default location alongside the
-    // NEW identity material — а running daemon serving --to will pick
-    // it up from there и publish. Mode 0o644 because the cert is
+    // NEW identity material — a running daemon serving --to will pick
+    // it up from there and publish. Mode 0o644 because the cert is
     // self-signed-public, not secret.
     let cert_out: PathBuf = args
         .cert_out
@@ -907,7 +907,7 @@ fn migrate<I: CommandIo>(
         args.valid_for_secs
     )));
     io.emit(OutputEvent::message(format!(
-        "  cert written к: {}",
+        "  cert written to: {}",
         cert_out.display()
     )));
     io.emit(OutputEvent::message(format!(
@@ -929,8 +929,8 @@ fn migrate<I: CommandIo>(
         io.emit(OutputEvent::message(String::new()));
         io.emit(OutputEvent::message(
             "Next step: a running daemon serving --to will publish this \
-             cert на its next maintenance tick.  Or pass \
-             `--publish-immediately` к push the cert через \
+             cert on its next maintenance tick.  Or pass \
+             `--publish-immediately` to push the cert through \
              admin socket right now.  Manual fallback: \
              `veil-cli node dht put <dht_key> <cert_path>`."
                 .to_owned(),
@@ -960,7 +960,7 @@ fn publish_cert_via_admin_socket<I: CommandIo>(
 ) -> Result<(), IdentityCliError> {
     use veil_node_runtime::admin as node;
 
-    // Default к <--from>/admin.sock. Operator can override с
+    // Default to <--from>/admin.sock. Operator can override with
     //admin-socket if their daemon's socket lives elsewhere (e.g.
     // running daemon has --config pointing at a different veil_dir).
     let socket = admin_socket_override
@@ -972,8 +972,8 @@ fn publish_cert_via_admin_socket<I: CommandIo>(
             "publish-immediately: admin socket `{}` not reachable.  \
              Either start a daemon serving the OLD identity first \
              (`veil-cli node run --config ...`), pass \
-             `--admin-socket <path>` к point at a different daemon, \
-             или drop --publish-immediately и use \
+             `--admin-socket <path>` to point at a different daemon, \
+             or drop --publish-immediately and use \
              `veil-cli node dht put {} {}` manually once a daemon \
              is up.",
             socket.display(),
@@ -1001,7 +1001,7 @@ fn publish_cert_via_admin_socket<I: CommandIo>(
         .map_err(|e| {
             IdentityCliError::Internal(format!(
                 "publish-immediately: admin send_request failed: {e}.  \
-                 Cert is at {} — retry с `node dht put {} {}` against a \
+                 Cert is at {} — retry with `node dht put {} {}` against a \
                  running daemon.",
                 cert_out.display(),
                 key_hex,
@@ -1021,7 +1021,7 @@ fn publish_cert_via_admin_socket<I: CommandIo>(
     };
     io.emit(OutputEvent::message(String::new()));
     io.emit(OutputEvent::message(format!(
-        "✓ cert published к DHT key {}\n  {ack}",
+        "✓ cert published to DHT key {}\n  {ack}",
         key_hex
     )));
     Ok(())
@@ -1704,9 +1704,9 @@ fn pair_accept<I: CommandIo>(
         })
         .map_err(|e| IdentityCliError::PairAccept(e.to_string()))?;
 
-    // 4. Persist target state.  Этап 6 slice 6i — wrap в
-    // `SensitiveBytesN<32>` so the seed sits в mlocked storage between
-    // pair-handoff и disk persist.
+    // 4. Persist target state.  Stage 6 slice 6i — wrap in
+    // `SensitiveBytesN<32>` so the seed sits in mlocked storage between
+    // pair-handoff and disk persist.
     let seed: veil_util::sensitive_bytes::SensitiveBytesN<32> =
         veil_util::sensitive_bytes::SensitiveBytesN::from_bytes(outcome.target_identity_sk_seed);
     save_paired_target_state(
@@ -1873,7 +1873,7 @@ fn standalone<I: CommandIo>(
 
     // Generate a fresh device SK seed — standalone identities use
     // OsRng directly because there's no master_seed to derive from.
-    // Этап 6 slice 6i — mlocked storage от OsRng output forward.
+    // Stage 6 slice 6i — mlocked storage from OsRng output forward.
     let mut seed: veil_util::sensitive_bytes::SensitiveBytesN<32> =
         veil_util::sensitive_bytes::SensitiveBytesN::new();
     OsRng.fill_bytes(seed.as_mut_array());
@@ -2254,14 +2254,14 @@ mod tests {
         let mut io = RecordingIo::default();
         create(&mut io, args).unwrap();
 
-        // master_falcon.bin лежит в veil_dir с framed `OFAM` magic.
+        // master_falcon.bin lives in veil_dir with framed `OFAM` magic.
         let falcon_path = dir.join(veil_cfg::sovereign_flow::MASTER_FALCON_FILE);
         assert!(falcon_path.exists(), "master_falcon.bin must be created");
         let bytes = fs::read(&falcon_path).unwrap();
         assert_eq!(
             &bytes[..4],
             veil_cfg::sovereign_flow::MASTER_FALCON_MAGIC,
-            "master_falcon.bin must start с OFAM magic"
+            "master_falcon.bin must start with OFAM magic"
         );
 
         // identity_document.bin's master_algo byte = 3 (hybrid).
@@ -2314,7 +2314,7 @@ mod tests {
     /// re-saves master_falcon.bin.
     #[test]
     fn restore_with_algo_hybrid_reproduces_node_id() {
-        // Step 1: hybrid create в original_dir.
+        // Step 1: hybrid create in original_dir.
         let original_dir = tempdir();
         let mut create_args_h = create_args(original_dir.clone());
         create_args_h.algo = "hybrid".into();
@@ -2334,7 +2334,7 @@ mod tests {
         // "BIP-39 recovery phrase" header. Concatenate them in order.
         let phrase = extract_bip39_phrase(&create_msgs);
 
-        // Step 2: persist phrase к a file и copy master_falcon.bin к
+        // Step 2: persist phrase to a file and copy master_falcon.bin to
         // a fresh location (operator preserves both backups).
         let scratch = tempdir();
         let phrase_path = scratch.join("phrase.txt");
@@ -2346,7 +2346,7 @@ mod tests {
         )
         .unwrap();
 
-        // Step 3: restore в a fresh veil_dir.
+        // Step 3: restore in a fresh veil_dir.
         let fresh_dir = tempdir();
         let restore_args_h = super::super::cli::IdentityRestoreArgs {
             veil_dir: Some(fresh_dir.clone()),
@@ -2439,7 +2439,7 @@ mod tests {
         assert_eq!(cert.new_node_id, new_doc.node_id);
         assert_eq!(cert.new_master_algo, new_doc.master_algo);
 
-        // Cert verifies против OLD master pubkey (the canonical sig
+        // Cert verifies against OLD master pubkey (the canonical sig
         // check the resolver does on every chain hop).
         let old_master_b64 = pubkey_bytes_to_b64(&old_doc.master_pubkey);
         let now = SystemTime::now()
@@ -2556,7 +2556,7 @@ mod tests {
         new_args.algo = "hybrid".into();
         create(&mut RecordingIo::default(), new_args).unwrap();
 
-        // Point at a path that's guaranteed not к exist as a socket.
+        // Point at a path that's guaranteed not to exist as a socket.
         let bogus_socket = old_dir.join("nonexistent-admin.sock");
         let mig_args = super::super::cli::IdentityMigrateArgs {
             from: Some(old_dir),
@@ -2583,12 +2583,12 @@ mod tests {
             }
             other => panic!("expected Internal, got {other:?}"),
         }
-        // CRITICAL: the cert MUST still be persisted к disk despite
+        // CRITICAL: the cert MUST still be persisted to disk despite
         // the publish failure — otherwise operator loses minted-but-
-        // unpublished cert и has к re-mint after fixing daemon.
+        // unpublished cert and has to re-mint after fixing daemon.
         assert!(
             new_dir.join("migration_cert.bin").exists(),
-            "cert must persist к disk even when --publish-immediately fails"
+            "cert must persist to disk even when --publish-immediately fails"
         );
     }
 
@@ -2639,7 +2639,7 @@ mod tests {
             IdentityCliError::Internal(msg) => {
                 assert!(
                     msg.contains("--accept-no-recovery"),
-                    "expected --accept-no-recovery в msg, got: {msg}"
+                    "expected --accept-no-recovery in msg, got: {msg}"
                 );
                 assert!(msg.contains("TOTAL identity loss"), "msg={msg}");
             }
@@ -2792,7 +2792,7 @@ mod tests {
         // who's signing; we just need parse-able phrase bytes.)
         let _ = original_dir;
         // Build a valid phrase via the master_seed library so the
-        // decode step passes и we exercise the post-decode rejection.
+        // decode step passes and we exercise the post-decode rejection.
         use veil_cfg::identity_master::generate_master_seed;
         let seed = generate_master_seed();
         let phrase = veil_cfg::identity_master::encode_master_seed_to_phrase(&seed)

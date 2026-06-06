@@ -247,15 +247,15 @@ Client → Server (TLS handshake, standard JA3/JA4 fingerprint):
 Server check (constant-time):
     if path == SECRET_PATH AND X-Veil-Auth == SECRET_TOKEN:
         → HTTP 101 Switching Protocols
-        → WebSocket binary frames carry OVL1 от there
+        → WebSocket binary frames carry OVL1 from there
 
     else:
-        → serve decoy content as а regular HTTPS site:
+        → serve decoy content as a regular HTTPS site:
             GET /              → cached homepage HTML
             GET /about         → cached /about page
             GET /<anything>    → 404 with distinctive-of-some-real-server page
         Constant-time-equivalent latency profile so timing analysis
-        can't tell "valid path" от "404 path" apart.
+        can't tell "valid path" from "404 path" apart.
 ```
 
 #### Decoy content options (operator chooses)

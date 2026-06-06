@@ -60,11 +60,11 @@ impl NodeRuntime {
     }
 
     // cleanup: `broadcast_epidemic` runtime method removed.
-    // module docstring listed это как operator-mutator admin
-    // action, но no `AdminCommand` variant, CLI subcommand, или IPC handler
+    // module docstring listed this as operator-mutator admin
+    // action, but no `AdminCommand` variant, CLI subcommand, or IPC handler
     // ever surfaced it. Inbound `EpidemicBroadcast` frames go directly via
     // `dispatcher/control.rs:520 → app_registry.broadcast_epidemic` bypassing
-    // this method entirely. Re-introduce из git history if
+    // this method entirely. Re-introduce from git history if
     // `AdminCommand::BroadcastEpidemic` actually ships.
 
     /// Permanently ban `node_id` from connecting (runtime only, not persisted).
@@ -140,7 +140,7 @@ impl NodeRuntime {
     pub fn mobile_status(&self) -> crate::admin::AdminMobileStatus {
         // Reload config off disk (mirrors UpdateStatus / BootstrapStatus
         // semantics — operator who edited [mobile] section gets fresh
-        // snapshot без admin reload).
+        // snapshot without admin reload).
         let config_snapshot = veil_cfg::load_config(&self.config_path)
             .unwrap_or_else(|_| veil_cfg::Config::default());
         let mobile_cfg = &config_snapshot.mobile;
@@ -202,8 +202,8 @@ impl NodeRuntime {
     /// Returns 9-tuple: `(inbound_kbps, outbound_kbps,
     /// in_total_bytes, in_dropped_bytes, out_total_bytes,
     /// out_dropped_bytes, per_peer_byte_cap, per_peer_allowed,
-    /// per_peer_dropped)`. Per-peer fields surface как `-1` /
-    /// `0` / `0` когда per-peer byte-rate enforcement не enabled
+    /// per_peer_dropped)`. Per-peer fields surface as `-1` /
+    /// `0` / `0` when per-peer byte-rate enforcement not enabled
     /// (default for non-mobile deployments).
     pub fn bandwidth_stats(&self) -> (i64, i64, u64, u64, u64, u64, i64, u64, u64) {
         let in_g = lock!(self.dispatcher.abuse.inbound_bandwidth);
@@ -212,7 +212,7 @@ impl NodeRuntime {
         // Reload config off disk so the cap surfaces operator's
         // current intent (matches BootstrapStatus / UpdateStatus
         // / MobileStatus semantics — operator who edited
-        // [abuse].per_peer_bytes_per_sec gets fresh view без
+        // [abuse].per_peer_bytes_per_sec gets fresh view without
         // admin reload).
         let cap = veil_cfg::load_config(&self.config_path)
             .ok()

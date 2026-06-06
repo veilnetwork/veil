@@ -27,21 +27,21 @@
 
 use crate::ProtoError;
 
-/// Magic bytes identifying а **v1 (unsigned)** AnycastRecord value in DHT.
+/// Magic bytes identifying a **v1 (unsigned)** AnycastRecord value in DHT.
 /// V1 records carry no owner signature — `score` is peer-controlled.
-/// Kept readable для backward compatibility с existing deployments.
+/// Kept readable for backward compatibility with existing deployments.
 pub const ANYCAST_MAGIC: [u8; 2] = [0x41, 0x43]; // "AC"
 
-/// Magic bytes identifying а **v2 (owner-signed)** AnycastRecord.
+/// Magic bytes identifying a **v2 (owner-signed)** AnycastRecord.
 /// V2 appends an Ed25519 signature over the canonical bytes, allowing the
-/// resolver к reject records published under а different `node_id` than
+/// resolver to reject records published under a different `node_id` than
 /// the signing key proves ownership of. See module security doc.
 pub const ANYCAST_MAGIC_V2: [u8; 2] = [0x41, 0x44]; // "AD"
 
-/// Wire size of а **v1 (unsigned)** record.
+/// Wire size of a **v1 (unsigned)** record.
 pub const ANYCAST_RECORD_SIZE: usize = 44;
 
-/// Wire size of а **v2 (signed)** record.
+/// Wire size of a **v2 (signed)** record.
 /// Layout: 44 (v1 fields) + 32 (owner_pubkey) + 1 (sig_key_idx) + 64 (sig) = 141.
 pub const ANYCAST_RECORD_V2_SIZE: usize = 141;
 
@@ -50,31 +50,31 @@ pub const MAX_ANYCAST_CANDIDATES: usize = 32;
 
 // ── AnycastRecord ─────────────────────────────────────────────────────────────
 
-/// Owner-binding signature payload for а v2 `AnycastRecord`.
+/// Owner-binding signature payload for a v2 `AnycastRecord`.
 ///
 /// `owner_pubkey` is the Ed25519 verifying key that signed the canonical
 /// bytes (everything in the record except the signature itself). Caller
-/// is responsible для making sure this key is bound к `node_id` —
+/// is responsible for making sure this key is bound to `node_id` —
 /// typically `node_id == BLAKE3(owner_pubkey)`, but advanced sovereign-
-/// identity flows may use а subkey indicated by `sig_key_idx`.
+/// identity flows may use a subkey indicated by `sig_key_idx`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnycastRecordSig {
     /// Ed25519 verifying key that produced `signature`.
     pub owner_pubkey: [u8; 32],
-    /// Which subkey index в the owner's identity document signed this
-    /// record. `0` for nodes без sovereign-identity multi-key setup.
+    /// Which subkey index in the owner's identity document signed this
+    /// record. `0` for nodes without sovereign-identity multi-key setup.
     pub sig_key_idx: u8,
     /// Ed25519 signature over canonical bytes (the first 77 bytes of the
-    /// v2 wire format — i.e. fields up к и including `sig_key_idx`).
+    /// v2 wire format — i.e. fields up to and including `sig_key_idx`).
     pub signature: [u8; 64],
 }
 
 /// A single anycast service advertisement stored in the DHT.
 ///
-/// When `signature` is `Some(...)`, this is а v2 record (wire size
+/// When `signature` is `Some(...)`, this is a v2 record (wire size
 /// [`ANYCAST_RECORD_V2_SIZE`] = 141 B) and verifiers MUST check the
 /// embedded Ed25519 signature before trusting any field. When `None`,
-/// this is а legacy v1 record ([`ANYCAST_RECORD_SIZE`] = 44 B) with no
+/// this is a legacy v1 record ([`ANYCAST_RECORD_SIZE`] = 44 B) with no
 /// owner binding — see the [crate-level security docs] for handling.
 ///
 /// [crate-level security docs]: crate
@@ -104,8 +104,8 @@ impl AnycastRecord {
         *h.finalize().as_bytes()
     }
 
-    /// Encode the record. Selects v2 wire format (141 B) если `signature`
-    /// is `Some`, otherwise v1 (44 B). Returns а `Vec<u8>` because the
+    /// Encode the record. Selects v2 wire format (141 B) if `signature`
+    /// is `Some`, otherwise v1 (44 B). Returns a `Vec<u8>` because the
     /// length depends on version.
     pub fn encode(&self) -> Vec<u8> {
         match &self.signature {
@@ -127,7 +127,7 @@ impl AnycastRecord {
         }
     }
 
-    /// Write the canonical-bytes prefix of а v2 record (77 bytes — everything
+    /// Write the canonical-bytes prefix of a v2 record (77 bytes — everything
     /// except the signature itself). This is exactly the byte sequence
     /// that the Ed25519 signature covers.
     fn encode_canonical_v2(&self, buf: &mut Vec<u8>, sig: &AnycastRecordSig) {
@@ -140,14 +140,14 @@ impl AnycastRecord {
         buf.push(sig.sig_key_idx);
     }
 
-    /// Decode а record. Auto-detects v1 vs v2 by magic bytes. v2 records
+    /// Decode a record. Auto-detects v1 vs v2 by magic bytes. v2 records
     /// have their embedded signature integrity-checked (the signature is
     /// stored intact for caller-side `verify_signature`).
     ///
     /// **This function does NOT verify the signature** — call
     /// [`Self::verify_signature`] separately if you want trust enforcement.
-    /// Decode-only allows downstream code к receive both signed и unsigned
-    /// records и make policy decisions about which к trust.
+    /// Decode-only allows downstream code to receive both signed and unsigned
+    /// records and make policy decisions about which to trust.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
         if buf.len() < 2 {
             return Err(ProtoError::BufferTooShort {
@@ -210,14 +210,14 @@ impl AnycastRecord {
     }
 
     /// Verify the embedded v2 owner-signature. Returns `Ok(())` if signed
-    /// и signature is valid под `signature.owner_pubkey`; `Err` otherwise.
+    /// and signature is valid under `signature.owner_pubkey`; `Err` otherwise.
     /// Unsigned (v1) records return `Err(ProtoError::Malformed(...))`.
     ///
-    /// Caller is responsible separately для checking that
-    /// `signature.owner_pubkey` actually corresponds к the claimed
-    /// `node_id` (typically via а sovereign-identity-document lookup).
-    /// Without that binding check, an attacker can publish а valid
-    /// signature под an unrelated key claiming а target node_id — the
+    /// Caller is responsible separately for checking that
+    /// `signature.owner_pubkey` actually corresponds to the claimed
+    /// `node_id` (typically via a sovereign-identity-document lookup).
+    /// Without that binding check, an attacker can publish a valid
+    /// signature under an unrelated key claiming a target node_id — the
     /// signature itself is valid but the binding is forged.
     pub fn verify_signature(&self) -> Result<(), ProtoError> {
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -239,41 +239,41 @@ impl AnycastRecord {
         })
     }
 
-    /// Verify the **owner-binding** in addition к the embedded signature —
+    /// Verify the **owner-binding** in addition to the embedded signature —
     /// confirms that the signer (whose pubkey is embedded in `signature.owner_pubkey`)
     /// is actually the same identity as the claimed `node_id`.
     ///
     /// Without this check, [`Self::verify_signature`] alone only proves
-    /// integrity: an attacker can mint а valid signature под their OWN
-    /// key while putting а victim's `node_id` in the record body.  The
-    /// signature passes, the binding is а forgery.  See the crate-level
-    /// security docs in `veil-anycast` для the full attack model.
+    /// integrity: an attacker can mint a valid signature under their OWN
+    /// key while putting a victim's `node_id` in the record body.  The
+    /// signature passes, the binding is a forgery.  See the crate-level
+    /// security docs in `veil-anycast` for the full attack model.
     ///
     /// ## Binding contract
     ///
     /// This method accepts ONLY the "self-signed" binding case:
-    /// 1. The record carries а v2 signature (calls [`Self::verify_signature`] first).
+    /// 1. The record carries a v2 signature (calls [`Self::verify_signature`] first).
     /// 2. `signature.sig_key_idx == 0` — i.e. the signer is using its
-    ///    PRIMARY (root) Ed25519 key, NOT а sovereign-identity subkey.
+    ///    PRIMARY (root) Ed25519 key, NOT a sovereign-identity subkey.
     /// 3. `node_id == BLAKE3(signature.owner_pubkey)` — i.e. the claimed
     ///    `node_id` is provably derived from the embedded pubkey via the
-    ///    standard 32-byte BLAKE3 hash used everywhere в veil's
+    ///    standard 32-byte BLAKE3 hash used everywhere in veil's
     ///    identity layer.
     ///
-    /// `sig_key_idx > 0` (multi-device sovereign identity flow с subkeys)
+    /// `sig_key_idx > 0` (multi-device sovereign identity flow with subkeys)
     /// is rejected here because verifying it requires an async DHT lookup
-    /// of the identity document к check `identity_keys[sig_key_idx] ==
-    /// owner_pubkey`, which doesn't fit а synchronous record-validator API.
-    /// Callers что need to support subkey-signed records должны either:
+    /// of the identity document to check `identity_keys[sig_key_idx] ==
+    /// owner_pubkey`, which doesn't fit a synchronous record-validator API.
+    /// Callers that need to support subkey-signed records must either:
     /// * Use [`Self::verify_signature`] alone + perform the identity-doc
     ///   lookup themselves, OR
     /// * Use the daemon's verified-identity-resolve path (which already
     ///   does this composition asynchronously).
     ///
-    /// Audit batch 2026-05-23: added к close the "anycast SignedOnly
-    /// proves signature but не binding" finding — the cross-audit pointed
-    /// out що the cfg-level SignedOnly knob would NOT prevent а sybil
-    /// from minting а valid signature under their own key while claiming
+    /// Audit batch 2026-05-23: added to close the "anycast SignedOnly
+    /// proves signature but not binding" finding — the cross-audit pointed
+    /// out that the cfg-level SignedOnly knob would NOT prevent a sybil
+    /// from minting a valid signature under their own key while claiming
     /// another node's `node_id`.
     pub fn verify_owner_binding(&self) -> Result<(), ProtoError> {
         self.verify_signature()?;
@@ -281,7 +281,7 @@ impl AnycastRecord {
         // the borrow-checker doesn't know that — so unwrap is safe here.
         let sig = self.signature.as_ref().ok_or_else(|| {
             ProtoError::Malformed(
-                "anycast record: owner-binding requires а v2 signature".to_string(),
+                "anycast record: owner-binding requires a v2 signature".to_string(),
             )
         })?;
         if sig.sig_key_idx != 0 {
@@ -303,8 +303,8 @@ impl AnycastRecord {
         Ok(())
     }
 
-    /// Construct а v2 (signed) record. Caller supplies the Ed25519
-    /// signing key; pubkey is derived и embedded automatically.
+    /// Construct a v2 (signed) record. Caller supplies the Ed25519
+    /// signing key; pubkey is derived and embedded automatically.
     pub fn sign(
         service_tag: [u8; 4],
         node_id: [u8; 32],
@@ -315,7 +315,7 @@ impl AnycastRecord {
     ) -> Self {
         use ed25519_dalek::Signer;
         let owner_pubkey = signing_key.verifying_key().to_bytes();
-        // Build placeholder sig к get canonical bytes via encode_canonical_v2.
+        // Build placeholder sig to get canonical bytes via encode_canonical_v2.
         let mut placeholder = Self {
             service_tag,
             node_id,
@@ -328,10 +328,10 @@ impl AnycastRecord {
             }),
         };
         let mut canonical = Vec::with_capacity(77);
-        // unwrap: we just set signature к Some above.
+        // unwrap: we just set signature to Some above.
         placeholder.encode_canonical_v2(&mut canonical, placeholder.signature.as_ref().unwrap());
         let sig_bytes = signing_key.sign(&canonical).to_bytes();
-        // Replace placeholder signature с actual signature.
+        // Replace placeholder signature with actual signature.
         if let Some(s) = placeholder.signature.as_mut() {
             s.signature = sig_bytes;
         }
@@ -349,10 +349,10 @@ impl AnycastRecord {
 pub struct AnycastList(pub Vec<AnycastRecord>);
 
 impl AnycastList {
-    /// Decode all records от а DHT value blob.
+    /// Decode all records from a DHT value blob.
     ///
-    /// Auto-detects v1 (44 B) и v2 (141 B) records by magic prefix.
-    /// Silently skips records that fail к decode (wrong magic, stale format,
+    /// Auto-detects v1 (44 B) and v2 (141 B) records by magic prefix.
+    /// Silently skips records that fail to decode (wrong magic, stale format,
     /// truncated tail). DOES NOT verify v2 signatures here — caller decides
     /// trust policy via [`AnycastRecord::verify_signature`].
     pub fn decode(blob: &[u8]) -> Self {
@@ -380,7 +380,7 @@ impl AnycastList {
         AnycastList(records)
     }
 
-    /// Encode all records into а DHT value blob. Length per record varies
+    /// Encode all records into a DHT value blob. Length per record varies
     /// by version (v1 = 44 B, v2 = 141 B); total is the sum.
     pub fn encode(&self) -> Vec<u8> {
         // Conservative upper bound: assume all v2.
@@ -780,10 +780,10 @@ mod tests {
     // ── verify_owner_binding (audit batch 2026-05-23) ────────────────
 
     fn signed_record_for(node_id: [u8; 32], sig_key_idx: u8) -> AnycastRecord {
-        // Synthesize а signing key whose BLAKE3 pubkey-hash gives the
+        // Synthesize a signing key whose BLAKE3 pubkey-hash gives the
         // desired `node_id` is hard (would require grinding); instead
-        // build а record where we KNOW the relationship between key и
-        // node_id, then test both "bound" и "forged-binding" cases
+        // build a record where we KNOW the relationship between key and
+        // node_id, then test both "bound" and "forged-binding" cases
         // separately.
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
         AnycastRecord::sign(*b"mbox", node_id, 5, 3600, sig_key_idx, &signing_key)
@@ -791,13 +791,13 @@ mod tests {
 
     #[test]
     fn verify_owner_binding_accepts_blake3_match() {
-        // Build а record where node_id is the BLAKE3 hash of the
+        // Build a record where node_id is the BLAKE3 hash of the
         // signer's pubkey — the standard sovereign-identity binding.
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
         let pubkey = signing_key.verifying_key().to_bytes();
         let derived_node_id: [u8; 32] = *blake3::hash(&pubkey).as_bytes();
         let r = AnycastRecord::sign(*b"mbox", derived_node_id, 5, 3600, 0, &signing_key);
-        // Sig integrity holds (always true для freshly-signed record).
+        // Sig integrity holds (always true for freshly-signed record).
         assert!(r.verify_signature().is_ok());
         // Binding holds because node_id == BLAKE3(pubkey) by construction.
         assert!(
@@ -808,11 +808,11 @@ mod tests {
 
     #[test]
     fn verify_owner_binding_rejects_forged_node_id() {
-        // Sign а record where node_id is NOT derived от the signer's
+        // Sign a record where node_id is NOT derived from the signer's
         // pubkey — this is the sybil attack `SignedOnly` cannot catch.
         let forged_node_id = [0xAB; 32];
         let r = signed_record_for(forged_node_id, 0);
-        // Sig integrity passes — attacker IS holding а valid key.
+        // Sig integrity passes — attacker IS holding a valid key.
         assert!(
             r.verify_signature().is_ok(),
             "signature integrity holds (signer has the key)"
@@ -832,10 +832,10 @@ mod tests {
 
     #[test]
     fn verify_owner_binding_rejects_sig_key_idx_nonzero() {
-        // Compute the correct node_id для the primary key so the
-        // BLAKE3 check would pass — но set sig_key_idx = 7 (subkey
+        // Compute the correct node_id for the primary key so the
+        // BLAKE3 check would pass — but set sig_key_idx = 7 (subkey
         // flow).  Binding must reject because async identity-doc
-        // lookup is required и out-of-scope для this sync API.
+        // lookup is required and out-of-scope for this sync API.
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
         let pubkey = signing_key.verifying_key().to_bytes();
         let derived_node_id: [u8; 32] = *blake3::hash(&pubkey).as_bytes();

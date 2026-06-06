@@ -1,17 +1,17 @@
 //! In-band introducer wire-frame — Epic 481.3.
 //!
 //! Out-of-band bootstrap (Epic 481) shipped 5 channels: builtin seeds, DHT
-//! bootstrap-bundle, transport hints, gossip, и operator-injected URIs.
+//! bootstrap-bundle, transport hints, gossip, and operator-injected URIs.
 //! Those cover the common "fresh node finds *some* peer to talk to" case
-//! but don't transmit а **transitive-trust signal** between peers. An
-//! introducer record lets node A vouch для node B: "I, А, attest что B's
-//! node_id is sensible to talk to in the context я personally know."
+//! but don't transmit a **transitive-trust signal** between peers. An
+//! introducer record lets node A vouch for node B: "I, A, attest that B's
+//! node_id is sensible to talk to in the context I personally know."
 //!
 //! The vouch is paper-thin — `IntroduceRequest` carries no claim of
-//! "I verified B is honest" — but it does carry а cryptographic anchor
-//! что the introducer pubkey actually said this, и а bounded expiry.
+//! "I verified B is honest" — but it does carry a cryptographic anchor
+//! that the introducer pubkey actually said this, and a bounded expiry.
 //! Higher layers (pairing invites, sponsored mailbox access, mass-onboard
-//! flashmob bootstraps) can attach app-level meaning к а valid signature.
+//! flashmob bootstraps) can attach app-level meaning to a valid signature.
 //!
 //! ## Wire format
 //!
@@ -28,29 +28,29 @@
 //! ```
 //!
 //! Canonical signing bytes = wire encoding minus the trailing `sig_len + sig`
-//! pair. The signature thus covers every field that contributes к meaning
-//! including the version и both node_ids и the expiry.
+//! pair. The signature thus covers every field that contributes to meaning
+//! including the version and both node_ids and the expiry.
 //!
 //! ## Validity policy
 //!
-//! `expiry_unix` is interpreted as а hard cutoff: receivers reject если
+//! `expiry_unix` is interpreted as a hard cutoff: receivers reject if
 //! `now_unix > expiry_unix + WIRE_SKEW_SECS` (5-minute skew tolerance from
-//! [`crate::time_validity::WIRE_SKEW_SECS`]). Introducer SHOULD pick а
+//! [`crate::time_validity::WIRE_SKEW_SECS`]). Introducer SHOULD pick a
 //! reasonable expiry — recommended max is `SHORT_STATE_TTL_SECS` for one-
-//! shot pairing flows, up к 1 hour for mass-onboarding events. Long expiries
+//! shot pairing flows, up to 1 hour for mass-onboarding events. Long expiries
 //! (> 1 day) are accepted by the wire layer but should be flagged at policy.
 //!
 //! ## What this module does NOT do
 //!
-//! - **No identity binding check.** Verifying что `introducer_pubkey` actually
-//!   belongs к `introducer_node_id` requires а separate IdentityDocument
-//!   lookup; this module only validates что the signature is integrity-
+//! - **No identity binding check.** Verifying that `introducer_pubkey` actually
+//!   belongs to `introducer_node_id` requires a separate IdentityDocument
+//!   lookup; this module only validates that the signature is integrity-
 //!   correct for the embedded pubkey. Callers must do the identity binding
 //!   step before trusting the introducer field.
 //! - **No replay prevention.** Same record can be replayed any number of
 //!   times before expiry. Callers needing replay protection must layer
 //!   their own nonce/seen-set on top.
-//! - **No bandwidth control.** Wire-level allows up к 64 KiB of pubkey
+//! - **No bandwidth control.** Wire-level allows up to 64 KiB of pubkey
 //!   + sig (both u16-length-prefixed); soft cap on Ed25519-only deployments
 //!   is implicit in [`MAX_INTRODUCE_REQUEST_BYTES`].
 
@@ -64,17 +64,17 @@ pub const INTRODUCE_MAGIC: [u8; 2] = [b'I', b'N'];
 /// Current wire format version.
 pub const INTRODUCE_V1: u8 = 1;
 
-/// Domain-separated signing context. Concatenated с canonical bytes
-/// before Ed25519 signing/verification так что а sig produced for one
-/// protocol artefact cannot be re-used as а valid sig for another.
+/// Domain-separated signing context. Concatenated with canonical bytes
+/// before Ed25519 signing/verification so that a sig produced for one
+/// protocol artefact cannot be re-used as a valid sig for another.
 pub const INTRODUCE_SIG_CONTEXT: &[u8] = b"veil.introduce.v1";
 
 /// Absolute upper bound on wire size. Generous: 1 KiB covers Ed25519
-/// pubkey/sig (32 + 64) plus headers с room для future curve upgrades.
+/// pubkey/sig (32 + 64) plus headers with room for future curve upgrades.
 pub const MAX_INTRODUCE_REQUEST_BYTES: usize = 1024;
 
-/// Hard cap on pubkey-length field на the wire. Ed25519 = 32; ML-DSA
-/// (post-quantum) ≤ 5 KiB — staying в u16-prefix is fine.
+/// Hard cap on pubkey-length field on the wire. Ed25519 = 32; ML-DSA
+/// (post-quantum) ≤ 5 KiB — staying in u16-prefix is fine.
 pub const MAX_INTRODUCER_PUBKEY_LEN: usize = 256;
 
 /// Hard cap on sig-length field. Ed25519 = 64. Same forward-room reasoning.
@@ -83,19 +83,19 @@ pub const MAX_INTRODUCER_SIG_LEN: usize = 512;
 // ── IntroduceRequest ─────────────────────────────────────────────────────────
 
 /// In-band introducer record — vouching that `introducer_node_id` (signing
-/// owner of `introducer_pubkey`) attests к the validity of `sponsoree_node_id`.
+/// owner of `introducer_pubkey`) attests to the validity of `sponsoree_node_id`.
 ///
-/// See module-level docs для wire format and validity policy.
+/// See module-level docs for wire format and validity policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntroduceRequest {
-    /// Node attesting к the sponsoree's identity.
+    /// Node attesting to the sponsoree's identity.
     pub introducer_node_id: [u8; 32],
     /// Node being introduced.
     pub sponsoree_node_id: [u8; 32],
-    /// Hard expiry in Unix seconds — receiver rejects если
+    /// Hard expiry in Unix seconds — receiver rejects if
     /// `now > expiry + WIRE_SKEW_SECS`.
     pub expiry_unix: u64,
-    /// Introducer's Ed25519 verifying key (32 bytes для current curve).
+    /// Introducer's Ed25519 verifying key (32 bytes for current curve).
     pub introducer_pubkey: Vec<u8>,
     /// Ed25519 signature over `INTRODUCE_SIG_CONTEXT || canonical_signing_bytes`.
     pub sig: Vec<u8>,
@@ -104,10 +104,10 @@ pub struct IntroduceRequest {
 /// Error variants surfaced during introducer-request validity checks.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IntroduceError {
-    #[error("introducer-pubkey length {0} is not а valid Ed25519 verifying key")]
+    #[error("introducer-pubkey length {0} is not a valid Ed25519 verifying key")]
     BadPubkeyLen(usize),
 
-    #[error("signature length {0} is not а valid Ed25519 signature")]
+    #[error("signature length {0} is not a valid Ed25519 signature")]
     BadSigLen(usize),
 
     #[error("Ed25519 pubkey parse failed: {0}")]
@@ -124,15 +124,15 @@ pub enum IntroduceError {
 }
 
 impl IntroduceRequest {
-    /// Build + sign а new record.
+    /// Build + sign a new record.
     ///
-    /// The provided `signing_key` must correspond к the
+    /// The provided `signing_key` must correspond to the
     /// `introducer_node_id`'s active identity — callers should source it
-    /// от the local sovereign-identity master, not invent а fresh key.
+    /// from the local sovereign-identity master, not invent a fresh key.
     /// This function does not check that binding; it just signs.
     ///
-    /// Returns `Err(SelfVouching)` если `introducer_node_id == sponsoree_node_id`
-    /// — а node cannot meaningfully vouch для itself через this channel.
+    /// Returns `Err(SelfVouching)` if `introducer_node_id == sponsoree_node_id`
+    /// — a node cannot meaningfully vouch for itself through this channel.
     pub fn sign(
         introducer_node_id: [u8; 32],
         sponsoree_node_id: [u8; 32],
@@ -143,7 +143,7 @@ impl IntroduceRequest {
             return Err(IntroduceError::SelfVouching);
         }
         let introducer_pubkey = signing_key.verifying_key().to_bytes().to_vec();
-        // Build а draft с empty sig so canonical_signing_bytes produces
+        // Build a draft with empty sig so canonical_signing_bytes produces
         // the right preimage; then attach the actual signature.
         let mut draft = Self {
             introducer_node_id,
@@ -158,7 +158,7 @@ impl IntroduceRequest {
         Ok(draft)
     }
 
-    /// Encode к wire bytes.
+    /// Encode to wire bytes.
     pub fn encode(&self) -> Vec<u8> {
         let pk_len = self.introducer_pubkey.len();
         let sig_len = self.sig.len();
@@ -254,16 +254,16 @@ impl IntroduceRequest {
     /// Full validity check: signature integrity, expiry, self-vouching gate.
     ///
     /// `now_unix` is provided by the caller — typically `SystemTime::now()`
-    /// converted к Unix seconds. The check applies а fixed
+    /// converted to Unix seconds. The check applies a fixed
     /// [`WIRE_SKEW_SECS`] skew tolerance on the expiry comparison.
     ///
     /// Does NOT verify identity binding (that `introducer_pubkey` belongs
-    /// к `introducer_node_id`) — call IdentityDocument lookup separately
-    /// и compare the resolved pubkey против `self.introducer_pubkey`.
+    /// to `introducer_node_id`) — call IdentityDocument lookup separately
+    /// and compare the resolved pubkey against `self.introducer_pubkey`.
     pub fn verify(&self, now_unix: u64) -> Result<(), IntroduceError> {
         // Self-vouching guard — same as on sign(), kept on decode-path too
-        // так что а malicious encoder can't fabricate а self-introducing
-        // record что bypasses the higher-layer "no self" gate.
+        // so that a malicious encoder can't fabricate a self-introducing
+        // record that bypasses the higher-layer "no self" gate.
         if self.introducer_node_id == self.sponsoree_node_id {
             return Err(IntroduceError::SelfVouching);
         }
@@ -277,7 +277,7 @@ impl IntroduceRequest {
             });
         }
 
-        // Sig + pubkey size sanity (Ed25519-specific; widen if курса change).
+        // Sig + pubkey size sanity (Ed25519-specific; widen if the curve changes).
         if self.introducer_pubkey.len() != 32 {
             return Err(IntroduceError::BadPubkeyLen(self.introducer_pubkey.len()));
         }
@@ -319,9 +319,9 @@ mod tests {
     }
 
     fn introducer_id(sk: &SigningKey) -> [u8; 32] {
-        // For tests we tie introducer_node_id directly к sk's pubkey hash —
+        // For tests we tie introducer_node_id directly to sk's pubkey hash —
         // matches the "node_id = BLAKE3(pubkey)" production rule closely
-        // enough к exercise the wire format.
+        // enough to exercise the wire format.
         let pk = sk.verifying_key().to_bytes();
         *blake3::hash(&pk).as_bytes()
     }
@@ -345,7 +345,7 @@ mod tests {
         let s_id = [0xBB; 32];
         let req = IntroduceRequest::sign(i_id, s_id, 1_700_000_000, &sk).unwrap();
 
-        // Verify within window — expiry is far future относительно now=0.
+        // Verify within window — expiry is far future relative to now=0.
         assert_eq!(req.verify(1_699_999_000), Ok(()));
     }
 
@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn self_vouching_rejected_on_verify() {
         let sk = key(0x42);
-        // Manually fabricate а self-introducing record bypassing sign()'s gate.
+        // Manually fabricate a self-introducing record bypassing sign()'s gate.
         let id = [0xAA; 32];
         let mut req = IntroduceRequest {
             introducer_node_id: id,
@@ -429,7 +429,7 @@ mod tests {
         use ed25519_dalek::Signer;
         req.sig = sk.sign(&preimage).to_bytes().to_vec();
 
-        // Sig now verifies cryptographically, но verify() still rejects.
+        // Sig now verifies cryptographically, but verify() still rejects.
         assert_eq!(req.verify(1_699_999_000), Err(IntroduceError::SelfVouching));
     }
 
@@ -439,7 +439,7 @@ mod tests {
         let sk_b = key(0xBB);
         let i_id = introducer_id(&sk_a);
 
-        // Sign с key_a but overwrite pubkey to key_b's after the fact.
+        // Sign with key_a but overwrite pubkey to key_b's after the fact.
         let mut req = IntroduceRequest::sign(i_id, [0xCC; 32], 1_700_000_000, &sk_a).unwrap();
         req.introducer_pubkey = sk_b.verifying_key().to_bytes().to_vec();
         // Sig was produced by key_a but record claims key_b's pubkey → mismatch.
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn zero_pubkey_len_rejected() {
-        // Manually craft а record with declared pubkey_len = 0.
+        // Manually craft a record with declared pubkey_len = 0.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&INTRODUCE_MAGIC);
         bytes.push(INTRODUCE_V1);

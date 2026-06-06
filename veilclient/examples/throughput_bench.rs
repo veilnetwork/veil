@@ -1,5 +1,5 @@
-//! Minimal SDK-level throughput bench для measuring veil-stack
-//! throughput без TUN/ogate overhead.
+//! Minimal SDK-level throughput bench for measuring veil-stack
+//! throughput without TUN/ogate overhead.
 //!
 //! Usage:
 //!   throughput_bench server <socket> <name>
@@ -179,7 +179,7 @@ async fn main() -> Result<(), ClientError> {
         }
         let target = &peers[0];
         eprintln!(
-            "[client] connecting к {} (payload={} B, secs={})",
+            "[client] connecting to {} (payload={} B, secs={})",
             target.name, payload_bytes, seconds
         );
 
@@ -197,7 +197,7 @@ async fn main() -> Result<(), ClientError> {
         let mut last_total: u64 = 0;
         let mut started = false;
 
-        // Wait а moment for session к stabilize.
+        // Wait a moment for session to stabilize.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         while Instant::now() < deadline {

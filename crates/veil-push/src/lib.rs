@@ -27,12 +27,12 @@
 //!
 //! ## What this crate ships
 //!
-//! **`FcmDispatcher`** — FCM HTTP v1 client с JWT-signed service-
-//! account auth (re-exported из `mod fcm`).
-//! **`ApnsDispatcher`** — APNs HTTP/2 client с `.p8` ES256 JWT
-//! (re-exported из `mod apns`).
+//! **`FcmDispatcher`** — FCM HTTP v1 client with JWT-signed service-
+//! account auth (re-exported from `mod fcm`).
+//! **`ApnsDispatcher`** — APNs HTTP/2 client with `.p8` ES256 JWT
+//! (re-exported from `mod apns`).
 //! **`LogOnlyDispatcher`** — default dev/test fallback that just
-//! logs the wake-up без contacting third parties.
+//! logs the wake-up without contacting third parties.
 //!
 //! ## What this crate does **not** do
 //!

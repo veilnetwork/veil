@@ -20,7 +20,7 @@ Here's what a real adversary brings to the table:
 
 | Capability | Examples |
 |---|---|
-| L7 DPI ("does this look like veil?") | GFW JA3 fingerprinting, Iran's pluggable-transport detector, Russia's Ростелеком DPI |
+| L7 DPI ("does this look like veil?") | GFW JA3 fingerprinting, Iran's pluggable-transport detector, Russia's Rostelecom DPI |
 | L4 port blacklist | "everything except 80/443/53 is dropped" |
 | L3 IP blacklist | published intel on veil infrastructure → BGP-level blackhole |
 | Active probing | "this IP looks suspicious; let's connect and see if it answers in veil's protocol" |

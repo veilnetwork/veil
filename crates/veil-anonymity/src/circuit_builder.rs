@@ -68,7 +68,7 @@ pub type CircuitPickResult = Option<Vec<Hop>>;
 ///
 /// cleanup: pre-replaced by `pick_circuit_hops_latency_aware`
 /// — current production sender uses the latency-aware variant exclusively.
-/// Kept under `#[cfg(test)]` as а baseline для diversity-test scenarios
+/// Kept under `#[cfg(test)]` as a baseline for diversity-test scenarios
 /// where uniform selection is the null-hypothesis.
 #[cfg(test)]
 pub fn pick_circuit_hops_random<R>(
@@ -220,26 +220,26 @@ where
 /// Latency-aware + AS-diversity + **reputation-downweighting** selection
 /// (Epic 482.3/482.4 Phase A).
 ///
-/// Identical к [`pick_circuit_hops_latency_aware_with_diversity`] except
-/// the latency score is bumped by а reputation-derived penalty: every
+/// Identical to [`pick_circuit_hops_latency_aware_with_diversity`] except
+/// the latency score is bumped by a reputation-derived penalty: every
 /// observed failure for the relay (from
 /// [`crate::relay_reputation::RelayReputation::record_failure`]) adds
-/// [`crate::relay_reputation::FAILURE_PENALTY_MS`] ms к its effective RTT.
-/// Relays что admit circuit builds but then drop / stall cells suffer
+/// [`crate::relay_reputation::FAILURE_PENALTY_MS`] ms to its effective RTT.
+/// Relays that admit circuit builds but then drop / stall cells suffer
 /// progressively worse ranking with each observed failure.
 ///
-/// `reputation_penalty_ms` is а closure (rather than а direct
+/// `reputation_penalty_ms` is a closure (rather than a direct
 /// `&RelayReputation` ref) so callers can:
-/// - Plug in а no-op (always-0) penalty в tests.
+/// - Plug in a no-op (always-0) penalty in tests.
 /// - Combine multiple penalty sources (e.g. reputation + per-deployment
 ///   operator-supplied deny-list weight).
 ///
 /// Selection algorithm:
 /// 1. Score each candidate: `score = rtt_or_inf + reputation_penalty_ms`.
-///    Missing RTT still maps к `u64::MAX` — reputation cannot promote
+///    Missing RTT still maps to `u64::MAX` — reputation cannot promote
 ///    unknown-RTT relays past known ones.
 /// 2. Sort ascending by score.
-/// 3. Walk в sorted order; keep а candidate iff its diversity-key has
+/// 3. Walk in sorted order; keep a candidate iff its diversity-key has
 ///    not been seen yet (or is `None`).
 /// 4. Stop after `n` distinct-key picks.
 ///
@@ -261,7 +261,7 @@ where
         return None;
     }
     // Score = rtt + reputation_penalty. Missing-RTT stays at u64::MAX
-    // — penalty cannot promote that тип candidate over а known one.
+    // — penalty cannot promote that kind of candidate over a known one.
     let mut scored: Vec<(u64, &DiscoveredRelay)> = distinct
         .iter()
         .map(|c| {
@@ -676,8 +676,8 @@ mod tests {
 
     #[test]
     fn epic482_reputation_penalty_demotes_fast_misbehaver() {
-        // Sender has 3 candidates: fast misbehaver (RTT=10ms) и two
-        // slower-but-honest (RTT=200, 300ms). Без penalty the fast one
+        // Sender has 3 candidates: fast misbehaver (RTT=10ms) and two
+        // slower-but-honest (RTT=200, 300ms). Without penalty the fast one
         // wins. After 1 recorded failure (+500ms penalty → effective 510ms)
         // the misbehaver sorts behind both honest relays.
         let candidates = vec![
@@ -695,7 +695,7 @@ mod tests {
         };
         let no_diversity = |_id: &[u8; 32]| None;
 
-        // Без penalty: fast misbehaver wins.
+        // Without penalty: fast misbehaver wins.
         let no_penalty = |_id: &[u8; 32]| 0u32;
         let picked = pick_circuit_hops_latency_aware_with_diversity_and_reputation(
             &candidates,
@@ -705,7 +705,10 @@ mod tests {
             no_penalty,
         )
         .unwrap();
-        assert_eq!(picked[0].node_id[0], 1, "fast misbehaver wins without penalty");
+        assert_eq!(
+            picked[0].node_id[0], 1,
+            "fast misbehaver wins without penalty"
+        );
 
         // After 1 failure (+500ms): effective scores
         // misbehaver = 10 + 500 = 510, honest_mid = 200, honest_slow = 300
@@ -729,8 +732,8 @@ mod tests {
     #[test]
     fn epic482_reputation_penalty_does_not_promote_unknown_rtt() {
         // Sender has: known-RTT misbehaver (10ms + heavy penalty)
-        // и unknown-RTT relay (no penalty). The unknown-RTT relay should
-        // sort к the end of the list regardless — а penalty can't promote
+        // and unknown-RTT relay (no penalty). The unknown-RTT relay should
+        // sort to the end of the list regardless — a penalty can't promote
         // candidates whose RTT is unknown.
         let candidates = vec![
             fixture_hop(1, 0xAA), // known misbehaver
@@ -767,8 +770,8 @@ mod tests {
     #[test]
     fn epic482_reputation_composes_with_diversity() {
         // Diversity + reputation: misbehaver is in AS-A; non-misbehaver is also
-        // in AS-A. After penalty, non-misbehaver from AS-A wins что slot
-        // и another AS gets the second slot.
+        // in AS-A. After penalty, non-misbehaver from AS-A wins that slot
+        // and another AS gets the second slot.
         let candidates = vec![
             fixture_hop(1, 0xAA), // AS-A, misbehaver (RTT=10)
             fixture_hop(2, 0xBB), // AS-A, honest (RTT=100)
@@ -800,7 +803,7 @@ mod tests {
         )
         .unwrap();
         // Sort: node1=510, node2=100, node3=200. node2 wins; node1 same-AS skipped;
-        // node3 второй slot (AS-B).
+        // node3 second slot (AS-B).
         assert_eq!(picked[0].node_id[0], 2, "honest AS-A peer wins AS-A slot");
         assert_eq!(picked[1].node_id[0], 3, "AS-B fills second slot");
     }
@@ -823,7 +826,7 @@ mod tests {
 
     #[test]
     fn epic482_reputation_wired_through_relay_reputation_struct() {
-        // End-to-end: build а real RelayReputation, record failures,
+        // End-to-end: build a real RelayReputation, record failures,
         // confirm the selector picks up the penalty via the
         // `rtt_penalty_ms` adapter closure.
         use crate::relay_reputation::RelayReputation;

@@ -1,17 +1,17 @@
-//! S2.B: per-app cert verifier (independent от daemon's P-Net authority).
+//! S2.B: per-app cert verifier (independent from daemon's P-Net authority).
 //!
-//! ogate operators wanting their OWN trust domain (different от daemon's
-//! `[network]`) configure а triple in `ogate.toml`:
+//! ogate operators wanting their OWN trust domain (different from daemon's
+//! `[network]`) configure a triple in `ogate.toml`:
 //! ```toml
 //! app_cert_trusted_owner_pubkey = "<base64 ed25519 owner pubkey>"
 //! app_cert_owner_algo = "ed25519"
 //! app_cert_network_id = "948b97b51b...ea87"
 //! ```
 //!
-//! Each peer presents а `MembershipCert` (output of
-//! `veil-cli network sign-member`) once via а cert message
-//! (см. [`crate::cert_message`]).  Verified peers go into а cache;
-//! subsequent IP packets от cached peers pass through.  Unverified
+//! Each peer presents a `MembershipCert` (output of
+//! `veil-cli network sign-member`) once via a cert message
+//! (see. [`crate::cert_message`]).  Verified peers go into a cache;
+//! subsequent IP packets from cached peers pass through.  Unverified
 //! sources have their packets dropped.
 
 use anyhow::{Result, anyhow};
@@ -50,7 +50,7 @@ impl AppCertGate {
         })
     }
 
-    /// Verify cert blob against the configured authority и that
+    /// Verify cert blob against the configured authority and that
     /// cert.member_node_id matches the source's authenticated node_id.
     /// Returns the cert's `valid_until_unix` on success (0 sentinel
     /// kept verbatim) so the caller can stamp the cache entry.

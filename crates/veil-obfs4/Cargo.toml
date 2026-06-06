@@ -2,7 +2,7 @@
 name = "veil-obfs4"
 version = "0.1.0"
 edition = "2024"
-description = "obfs4-style TCP stream obfuscation для plaintext transports. Phase 1b of PLAN_TRANSPORT_OBFUSCATION.md ships the AEAD framing core; NTOR handshake + elligator2 land в Phase 1c."
+description = "obfs4-style TCP stream obfuscation for plaintext transports. Phase 1b of PLAN_TRANSPORT_OBFUSCATION.md ships the AEAD framing core; NTOR handshake + elligator2 land in Phase 1c."
 license = "AGPL-3.0-or-later"
 
 [dependencies]

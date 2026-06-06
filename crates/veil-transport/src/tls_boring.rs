@@ -340,15 +340,15 @@ pub async fn connect_tls_client_stream(
 /// [`super::tls::connect_pki_verified_https_stream`] — see that
 /// function's doc-comment for the full rationale. Distinct from
 /// [`connect_tls_client_stream`] which uses `SslVerifyMode::NONE` for
-/// veil peer transport (where trust binds к node_id, not the
+/// veil peer transport (where trust binds to node_id, not the
 /// cert chain).
 ///
-/// Builds а fresh PEER-verifying SSL connector с the system trust
+/// Builds a fresh PEER-verifying SSL connector with the system trust
 /// store loaded via `set_default_verify_paths`. Hostname
-/// verification is **enabled** (mandatory for а CDN target).
+/// verification is **enabled** (mandatory for a CDN target).
 ///
 /// Note: this path intentionally does NOT apply the Chrome-fingerprint
-/// cipher list / curve list — а CDN is а legitimate HTTPS target and
+/// cipher list / curve list — a CDN is a legitimate HTTPS target and
 /// modern boringssl defaults are appropriate. The fingerprint-mimicking
 /// path is still available [`connect_tls_client_stream`] for
 /// veil peer traffic that needs DPI evasion.
@@ -361,7 +361,7 @@ pub async fn connect_pki_verified_https_stream(
 ) -> Result<BoxIoStream> {
     let stream = connect_tcp_stream(host, port, ctx).await?;
 
-    // PKI-verifying connector — distinct от
+    // PKI-verifying connector — distinct from
     // `build_chrome_client_connector` which sets verify=NONE.
     let mut builder = SslConnector::builder(SslMethod::tls())
         .map_err(|e| tls_error(format!("btls SslConnector::builder (pki): {e}")))?;
@@ -381,10 +381,10 @@ pub async fn connect_pki_verified_https_stream(
     let ssl = connector
         .configure()
         .map_err(|e| tls_error(format!("btls configure (pki): {e}")))?
-        // Bootstrap path REQUIRES hostname matching — а CDN serving
-        // bootstrap content must present а cert whose SAN/CN matches
-        // the URL host. Without this, MITM с а valid-but-unrelated
-        // cert (e.g. one issued for а domain the attacker controls)
+        // Bootstrap path REQUIRES hostname matching — a CDN serving
+        // bootstrap content must present a cert whose SAN/CN matches
+        // the URL host. Without this, MITM with a valid-but-unrelated
+        // cert (e.g. one issued for a domain the attacker controls)
         // would still pass the trust-store check.
         .verify_hostname(true)
         .into_ssl(&server_name)

@@ -37,10 +37,10 @@ To: Bureau of Industry and Security
 
 Subject: Annual self-classification report — ERN <YOUR-ERN>
 
-This letter confirms that the cryptographic functionality в veil
+This letter confirms that the cryptographic functionality in veil
 ([app name], v[version]) remains classified as ECCN 5D002.c.1 mass-
 market (License Exception ENC §740.17(b)(1)).  Cryptographic
-primitives используемые в this release:
+primitives used in this release:
 
   - ChaCha20-Poly1305 (256-bit symmetric AEAD)
   - Ed25519 + X25519 (Curve25519 family signatures + ECDH)
@@ -48,7 +48,7 @@ primitives используемые в this release:
   - ML-KEM-768 (post-quantum KEM, ≤ 256-bit effective security)
   - BLAKE3, SHA-256, SHA-3 (hash families)
 
-No changes к the above primitive set since the prior reporting period.
+No changes to the above primitive set since the prior reporting period.
 
 Sincerely,
 [Operator Name + Title]

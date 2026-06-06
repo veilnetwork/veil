@@ -4,7 +4,7 @@
 # port range) for quick observability — after the canary soak completes
 # successfully, re-run for the rest of the fleet with relaxed timings.
 #
-# Idempotent: skips если [listen.ephemeral] block already present in
+# Idempotent: skips if [listen.ephemeral] block already present in
 # /var/lib/veil/node.toml.
 #
 # Run:
@@ -19,16 +19,16 @@
   become: true
   serial: 1
   vars:
-    # Default canary settings — short rotation для quick feedback в
+    # Default canary settings — short rotation for quick feedback in
     # the test window.  Tune to "1h" / "30m" grace for production.
     eph_range_lo: 51000
     eph_range_hi: 51999
     eph_rotation: "10m"
     eph_grace_period: "5m"
     eph_bind_retries: 64
-    # Listener ID to attach the [listen.ephemeral] block к. Must
+    # Listener ID to attach the [listen.ephemeral] block to. Must
     # match an existing [[listen]] entry's id.  Default = 0x00000002
-    # (the obfs4-tcp entry в the standard testnet layout).
+    # (the obfs4-tcp entry in the standard testnet layout).
     eph_listen_id: "0x00000002"
 
   tasks:
@@ -39,10 +39,10 @@
       register: target_exists
       changed_when: false
 
-    - name: Fail если target listener missing
+    - name: Fail if target listener missing
       ansible.builtin.fail:
         msg: >-
-          Listener id={{ eph_listen_id }} not found в node.toml.
+          Listener id={{ eph_listen_id }} not found in node.toml.
           Check the listen-table OR override --extra-vars 'eph_listen_id=...'.
       when: target_exists.stdout | int < 1
 
@@ -64,16 +64,16 @@
       register: baseline_journal
       changed_when: false
 
-    # Append the [listen.ephemeral] block к the end of node.toml.
-    # А separate table block — no need to splice into the [[listen]]
-    # array (TOML's `listen.ephemeral` syntax associates с the most
+    # Append the [listen.ephemeral] block to the end of node.toml.
+    # A separate table block — no need to splice into the [[listen]]
+    # array (TOML's `listen.ephemeral` syntax associates with the most
     # recently declared [[listen]] entry whose id matches the
     # `attached_to` comment, but we keep things simple by
     # appending and letting the toml parser flatten the keys).
     #
-    # NB: the actual binding между [listen.ephemeral] и а specific
-    # [[listen]] entry is done VIA TOML INLINE TABLE.  Здесь мы
-    # rewrite the matched [[listen]] entry, инлайня the ephemeral
+    # NB: the actual binding between [listen.ephemeral] and a specific
+    # [[listen]] entry is done VIA TOML INLINE TABLE.  Here we
+    # rewrite the matched [[listen]] entry, inlining the ephemeral
     # table.
     - name: Inject ephemeral block into the matched [[listen]] entry
       ansible.builtin.shell:
@@ -89,21 +89,21 @@
               src = f.read()
 
           # Find the [[listen]] entry that contains id = "{target_id}".
-          # Strategy: regex для inline-table form
+          # Strategy: regex for inline-table form
           # `{ id = "..." , transport = "..." [, ...] }` AND multi-line
           # `[[listen]] ...` form.  Testnet uses INLINE form (one-line per
           # listener inside the top-level `listen = [...]` array), so we
-          # match that первое.
+          # match that first.
 
           # Match the inline table containing the target id; replace its
-          # closing `}` с `, ephemeral = {...} }`.
+          # closing `}` with `, ephemeral = {...} }`.
           inline_re = re.compile(
               r'(\{\s*id\s*=\s*"' + re.escape(target_id) + r'"[^}]*?)\}',
               re.MULTILINE | re.DOTALL,
           )
           m = inline_re.search(src)
           if not m:
-              sys.stderr.write(f"ERROR: could not locate inline [[listen]] entry с id={target_id}\n")
+              sys.stderr.write(f"ERROR: could not locate inline [[listen]] entry with id={target_id}\n")
               sys.exit(1)
           inline_eph = ', ephemeral = { range = [{{ eph_range_lo }}, {{ eph_range_hi }}], rotation = "{{ eph_rotation }}", grace_period = "{{ eph_grace_period }}", bind_retries = {{ eph_bind_retries }} }'
           new_src = src[:m.end(1)] + inline_eph + " }" + src[m.end():]
@@ -123,7 +123,7 @@
         name: veil.service
         state: restarted
 
-    - name: Wait для metrics endpoint
+    - name: Wait for metrics endpoint
       ansible.builtin.shell:
         cmd: |
           for i in $(seq 1 60); do
@@ -142,9 +142,9 @@
       ansible.builtin.debug:
         var: wait_result.stdout
 
-    - name: Check veil.log для rotation.spawned log
+    - name: Check veil.log for rotation.spawned log
       ansible.builtin.shell:
-        # Veil daemon writes к /var/log/veil/veil.log, не journald.
+        # Veil daemon writes to /var/log/veil/veil.log, not journald.
         # journalctl only carries systemd-side restart events.  Tail the
         # rotated current log file directly.
         cmd: |
@@ -157,7 +157,7 @@
       ansible.builtin.debug:
         msg: "{{ journal.stdout_lines }}"
 
-    - name: Fail если journal shows panic
+    - name: Fail if journal shows panic
       ansible.builtin.fail:
         msg: "PANIC in journal — rotator wiring failed.  Revert immediately."
       when: "'panic' in (journal.stdout | lower)"
@@ -174,30 +174,30 @@
       ansible.builtin.debug:
         msg: "listen.rotation.spawned event count: {{ rotation_log.stdout }}"
 
-    - name: Fail если rotator did NOT start
+    - name: Fail if rotator did NOT start
       ansible.builtin.fail:
         msg: >-
           listen.rotation.spawned event missing from journal.
-          Likely cause: identity is не Ed25519, или ephemeral block
+          Likely cause: identity is not Ed25519, or ephemeral block
           parsing failed.  Inspect `/var/lib/veil/node.toml` + journal.
       when: rotation_log.stdout | int < 1
 
     - name: Print follow-up instructions
       ansible.builtin.debug:
         msg: |
-          ✅ Canary enabled на {{ inventory_hostname }}.
+          ✅ Canary enabled on {{ inventory_hostname }}.
 
           Wait one rotation cycle ({{ eph_rotation }}) + grace ({{ eph_grace_period }})
           then check:
 
           1. `ss -tlnp 'sport >= :{{ eph_range_lo }} sport <= :{{ eph_range_hi }}'`
-             should show а LISTEN socket in the configured range.
+             should show a LISTEN socket in the configured range.
           2. journalctl: `listen.rotation.swap_sent`, `listen.swap` events
              at each rotation tick.
-          3. Other nodes должны log `session.migration.notify.applied`
-             pointing к this host's new ephemeral port.
-          4. `active_sessions` metric стays stable — no session drops.
+          3. Other nodes should log `session.migration.notify.applied`
+             pointing to this host's new ephemeral port.
+          4. `active_sessions` metric stays stable — no session drops.
 
-          Revert command если something goes wrong:
+          Revert command if something goes wrong:
               ansible-playbook -i inventory.yml revert-ephemeral-canary.yml \
                 --limit {{ inventory_hostname }}

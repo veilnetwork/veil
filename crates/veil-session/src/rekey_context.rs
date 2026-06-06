@@ -1,18 +1,18 @@
 //! decomposition : encapsulates the X25519
 //! rekey FSM + threshold ledger + per-session generation counter.
 //!
-//! Was scattered ~12 inline references в `SessionRunner::run` —
-//! the most invasive slice yet because rekey-state mutations live в:
+//! Was scattered ~12 inline references in `SessionRunner::run` —
+//! the most invasive slice yet because rekey-state mutations live in:
 //! * init triplet (state, bytes_since_rekey, last_rekey_at) + generation
 //! * threshold check (-6.33 visibility tags rekey_generation
 //!   on every init.tx / init.rx / ack.tx / ack.rx / complete event)
-//! * bytes accumulation на 4 tx/rx call sites
-//! * RekeyInit arrival с d916e3b mutual-collision tie-breaker
+//! * bytes accumulation on 4 tx/rx call sites
+//! * RekeyInit arrival with d916e3b mutual-collision tie-breaker
 //! * Responder rekey-complete (after RekeyAck out → switch ciphers)
 //! * Initiator rekey-complete (after peer's RekeyAck arrives)
 //!
-//! Pure refactor; keypair generation, frame encoding, и cipher swap
-//! stay at call sites because они coupled с `&mut self` access к
+//! Pure refactor; keypair generation, frame encoding, and cipher swap
+//! stay at call sites because they are coupled with `&mut self` access to
 //! `tx_cipher`/`rx_cipher`/`session_id`. This struct manages just
 //! the FSM + threshold/generation arithmetic.
 
@@ -25,13 +25,13 @@ use veil_crypto::kex;
 pub enum RekeyState {
     /// No rekey in progress.
     Idle,
-    /// We sent `RekeyInit` и are waiting for `RekeyAck` от the peer.
+    /// We sent `RekeyInit` and are waiting for `RekeyAck` from the peer.
     AwaitingAck { keypair: kex::EphemeralKeypair },
 }
 
-/// Reason а rekey was triggered — used in the visibility log
-/// `session.rekey.init.tx trigger=…` so оператор может судить mix
-/// между byte / time / nonce-pressure events across the fleet.
+/// Reason a rekey was triggered — used in the visibility log
+/// `session.rekey.init.tx trigger=…` so operator can judge mix
+/// between byte / time / nonce-pressure events across the fleet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RekeyTrigger {
     BytesThreshold,
@@ -94,10 +94,10 @@ impl RekeyContext {
         self.generation
     }
 
-    /// Decide whether а rekey should fire NOW, returning the trigger
-    /// reason (or `None` если no threshold crossed). Caller must
+    /// Decide whether a rekey should fire NOW, returning the trigger
+    /// reason (or `None` if no threshold crossed). Caller must
     /// also have verified `is_idle` to avoid double-initiating.
-    /// `nonce_pressure` is computed by the caller от the AEAD
+    /// `nonce_pressure` is computed by the caller from the AEAD
     /// counter watermark.
     pub fn should_initiate_rekey(
         &self,
@@ -116,14 +116,14 @@ impl RekeyContext {
         None
     }
 
-    /// Transition к `AwaitingAck { keypair }`. Caller has just pushed
+    /// Transition to `AwaitingAck { keypair }`. Caller has just pushed
     /// the matching `RekeyInit` frame onto the priority queue.
     pub fn enter_awaiting_ack(&mut self, keypair: kex::EphemeralKeypair) {
         self.state = RekeyState::AwaitingAck { keypair };
     }
 
-    /// Atomically take the keypair от `AwaitingAck` и transition к
-    /// `Idle`. Returns `None` если state was already Idle (FSM
+    /// Atomically take the keypair from `AwaitingAck` and transition to
+    /// `Idle`. Returns `None` if state was already Idle (FSM
     /// invariant violation; caller treats as no-op).
     pub fn take_initiator_keypair(&mut self) -> Option<kex::EphemeralKeypair> {
         match std::mem::replace(&mut self.state, RekeyState::Idle) {
@@ -132,16 +132,16 @@ impl RekeyContext {
         }
     }
 
-    /// Reset к `Idle` без extracting а keypair. Used in the d916e3b
+    /// Reset to `Idle` without extracting a keypair. Used in the d916e3b
     /// collision-aborted_init path: own init is dropped, then we
-    /// fall through к the responder path с peer's RekeyInit.
+    /// fall through to the responder path with peer's RekeyInit.
     pub fn reset_to_idle(&mut self) {
         self.state = RekeyState::Idle;
     }
 
-    /// Push `last_rekey_at` to a new instant без incrementing generation
+    /// Push `last_rekey_at` to a new instant without incrementing generation
     /// or touching byte counter. Used by the kept_init back-off path: when
-    /// peer signals it kept its init и dropped ours, we want к suppress
+    /// peer signals it kept its init and dropped ours, we want to suppress
     /// our own time-threshold rekey trigger for the next grace window so
     /// both sides don't immediately re-collide. Byte counter stays so
     /// byte-threshold can still fire if traffic keeps coming.
@@ -149,9 +149,9 @@ impl RekeyContext {
         self.last_rekey_at = now;
     }
 
-    /// Mark а rekey-complete event: increment generation, reset
-    /// bytes counter, update last_rekey_at. Called от both
-    /// responder-side (after RekeyAck-tx) и initiator-side (after
+    /// Mark a rekey-complete event: increment generation, reset
+    /// bytes counter, update last_rekey_at. Called from both
+    /// responder-side (after RekeyAck-tx) and initiator-side (after
     /// peer's RekeyAck-rx) completion paths.
     pub fn record_rekey_complete(&mut self, now: Instant) {
         self.bytes_since_rekey = 0;

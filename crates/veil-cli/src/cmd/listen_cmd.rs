@@ -252,7 +252,7 @@ mod tests {
 
         fn write_raw_config(&self, _path: &Path, _content: &str) -> veil_cfg::Result<()> {
             // Slice 11b: test stub — fixture acks the
-            // raw-write path without persisting к disk.
+            // raw-write path without persisting to disk.
             Ok(())
         }
     }

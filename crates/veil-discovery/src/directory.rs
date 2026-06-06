@@ -229,8 +229,8 @@ pub fn decode_and_verify_signed_attachment_status(
     // `handle_announce_attachment` path rejects `expires_at <= now`, but
     // the DHT replication path (dispatcher STORE-accept + GetAttachment
     // read/warm) used to call this decoder WITHOUT any freshness gate —
-    // letting an attacker who once captured а valid signed wrapper
-    // re-inject it forever (each lookup re-warmed the local cache with а
+    // letting an attacker who once captured a valid signed wrapper
+    // re-inject it forever (each lookup re-warmed the local cache with a
     // fresh 5-min TTL, ignoring `expires_at`).  Enforce expiry here so
     // every caller (store + read + routing) drops stale records uniformly.
     // `expires_at` is covered by `signable_body()` so it cannot be
@@ -333,7 +333,7 @@ impl AppEndpointEntry {
         .ok_or(SignedDhtReject::Invalid)?;
         // SECURITY (audit 2026-05-29, HIGH replay fix): same class as the
         // signed-attachment decoder — the DHT replication path had no
-        // freshness gate, so а captured-but-stale signed AppEndpointEntry
+        // freshness gate, so a captured-but-stale signed AppEndpointEntry
         // could be replayed indefinitely.  `expires_at` is inside the
         // signed region (decode_*_ checks the signature over it), so
         // rejecting expired records here is tamper-safe.

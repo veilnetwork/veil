@@ -5,7 +5,7 @@
 //! continue to compile unchanged.
 
 // iterative-DHT route-discovery fallback.
-// Phase 4: dht_fallback moved к veil-node-runtime
+// Phase 4: dht_fallback moved to veil-node-runtime
 
 // Re-exports so existing call sites compile unchanged.
 pub use veil_routing::cache::{self, RouteCache, RouteCacheEntry};

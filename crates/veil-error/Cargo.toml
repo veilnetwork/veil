@@ -8,7 +8,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 # Versions MUST match veilcore's deps so #[from] impls produce the
 # same `toml::de::Error` / etc types that callers in veilcore see —
-# otherwise `?` operator fails с "From not implemented".
+# otherwise `?` operator fails with "From not implemented".
 thiserror = "2.0"
 base64 = "0.22"
 toml = "0.9"

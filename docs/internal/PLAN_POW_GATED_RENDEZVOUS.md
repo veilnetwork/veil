@@ -61,7 +61,7 @@
 
 ```
                         ┌─────────────────────────────────┐
-                        │  Initiator (wants к dial Bob)   │
+                        │  Initiator (wants to dial Bob)  │
                         └───────────┬─────────────────────┘
                                     │ 1. RequestEphemeralEndpoint
                                     │    {target=bob, requester=alice_pk,
@@ -73,10 +73,10 @@
                                     ▼
                         ┌─────────────────────────────────┐
                         │  Mediator (any veil node        │
-                        │  with а session к Bob)          │
-                        │  - relays the request к Bob     │
+                        │  with a session to Bob)         │
+                        │  - relays the request to Bob    │
                         │    via the existing OVL1 session│
-                        │  - takes а small fee in PoW     │
+                        │  - takes a small fee in PoW     │
                         │    work-units (anti-flood)      │
                         └───────────┬─────────────────────┘
                                     │ 2. relayed inside OVL1
@@ -101,7 +101,7 @@
                                        ▼
                         ┌─────────────────────────────────┐
                         │  Initiator dials transport_uri  │
-                        │  с psk; obfs4 handshake         │
+                        │  with psk; obfs4 handshake      │
                         │  proceeds normally              │
                         └─────────────────────────────────┘
                                        │
@@ -144,11 +144,11 @@ fresh msg_types). Two frames:
 // SessionMsg = 22 (next after Phase 5b TransportMigrationNotify = 21)
 
 RequestEphemeralEndpointPayload {
-    target_node_id:    [u8; 32],  // who the initiator wants к dial
+    target_node_id:    [u8; 32],  // who the initiator wants to dial
     requester_pubkey:  [u8; 32],  // initiator's Ed25519 identity
     timestamp_unix:    u64,       // anti-replay window anchor
     pow_difficulty:    u32,       // claimed (verifier re-checks)
-    pow_nonce:         u64,       // such что BLAKE3(canonical) has
+    pow_nonce:         u64,       // such that BLAKE3(canonical) has
                                   //   >= pow_difficulty leading zero bits
     requester_sig:     [u8; 64],  // Ed25519 sig over (target||requester||
                                   //   timestamp||difficulty||nonce)
@@ -158,7 +158,7 @@ RequestEphemeralEndpointPayload {
 // signable_bytes() = target_node_id || requester_pubkey || timestamp_be ||
 //                    difficulty_be || nonce_be
 // pow input = SIG_DOMAIN_REQUEST || signable_bytes()
-//                    (separate domain от migration-notify к prevent
+//                    (separate domain from migration-notify to prevent
 //                     cross-purpose replay)
 // Wire size: 32 + 32 + 8 + 4 + 8 + 64 = 148 bytes
 
@@ -166,7 +166,7 @@ RequestEphemeralEndpointPayload {
 
 EphemeralEndpointResponsePayload {
     target_node_id:    [u8; 32],  // who answered (== Bob's node_id)
-    requester_pubkey:  [u8; 32],  // echo (anti-replay для another peer)
+    requester_pubkey:  [u8; 32],  // echo (anti-replay for another peer)
     transport_uri:     String,    // utf8 ≤ 240 bytes (matches Phase 5b cap)
     psk:               [u8; 32],  // one-shot PSK for this endpoint
     valid_until_unix:  u64,       // exp_unix
@@ -205,8 +205,8 @@ This extends Phase 5f's `EphemeralPortBinder` plus the accept-loop swap channel:
 // crates/veil-transport/src/on_demand.rs (new module)
 
 pub enum OnDemandTrigger {
-    /// Request к bind а listener для exactly one accepted session.
-    /// Listener drops после the first OVL1 handshake completes OR after
+    /// Request to bind a listener for exactly one accepted session.
+    /// Listener drops after the first OVL1 handshake completes OR after
     /// `ttl` elapses, whichever first.
     BindOnce {
         ttl: Duration,
@@ -299,7 +299,7 @@ that abandoning mid-stack still leaves a working tree.
   [listen.on_demand]
   range          = [50000, 60000]
   pow_difficulty = 24             # leading-zero bits required
-  ttl            = "5m"           # listener TTL после bind
+  ttl            = "5m"           # listener TTL after bind
   max_concurrent = 16
   rate_limit     = "3/h"          # per-requester
   ```

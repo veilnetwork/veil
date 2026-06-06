@@ -73,12 +73,12 @@ struct TestIdentity {
     doc: IdentityDocument,
     /// Test-fixture field: kept on the struct so future tests can re-sign
     /// during cross-doc verification scenarios. Retained verbatim from
-    /// the original fixture к avoid churn если those tests land later.
+    /// the original fixture to avoid churn if those tests land later.
     #[allow(dead_code)]
     master_sk: SigningKey,
     /// Test-fixture field: same rationale as `master_sk` — preserves the
-    /// determinism source для future regression tests that re-derive
-    /// from а known seed.
+    /// determinism source for future regression tests that re-derive
+    /// from a known seed.
     #[allow(dead_code)]
     master_seed: [u8; 32],
     instances: Vec<TestInstance>,
@@ -87,8 +87,8 @@ struct TestIdentity {
 struct TestInstance {
     sub_sk: crate::signing_key::IdentitySigningKey,
     instance_id: [u8; 16],
-    /// Test-fixture field: kept alongside `mlkem_dk_seed` для symmetry
-    /// (encapsulation-key + matching dk-seed pair) and к anchor the
+    /// Test-fixture field: kept alongside `mlkem_dk_seed` for symmetry
+    /// (encapsulation-key + matching dk-seed pair) and to anchor the
     /// future ML-KEM-rekey test that hasn't shipped yet.
     #[allow(dead_code)]
     mlkem_ek: Vec<u8>,
@@ -960,8 +960,8 @@ fn scenario_chat_backup_restore_roundtrip() {
     // ── DEVICE WIPE ──────────────────────────────────────────────
     // We "destroy" all in-memory state by dropping `alice` and only
     // keeping the public ciphertext + the user-known phrase + nonce.
-    // `alice` carries а real `Drop` impl (zeroizes keys); `mnemonic`
-    // is а String и gets dropped automatically at scope end, no
+    // `alice` carries a real `Drop` impl (zeroizes keys); `mnemonic`
+    // is a String and gets dropped automatically at scope end, no
     // explicit `drop` needed (clippy::drop_non_drop).
     drop(alice);
 

@@ -40,7 +40,7 @@
 //! entirely on Drop (counted as `fallback_alloc`). The pool **never
 //! blocks** and **never panics** even under acquire spikes;
 //! correctness is preserved by always servicing the request, at worst
-//! by degrading to direct-heap behaviour identical к pre-pool code.
+//! by degrading to direct-heap behaviour identical to pre-pool code.
 //!
 //! When the cache is full AND a buffer comes home, the excess buffer
 //! is dropped to the heap instead of cached (counted as
@@ -56,9 +56,9 @@
 //!    if needed via `clear_and_resize_zeroed`).
 //! 2. On `Pooled::drop` (and on `PooledShared`'s last drop), the
 //!    buffer's `len` is reset to 0, `capacity` is preserved, and
-//!    the buffer is offered к the pool. The pool may keep или
+//!    the buffer is offered to the pool. The pool may keep or
 //!    reject (overflow_drop).
-//! 3. The pool is `Send + Sync`. Internal state is protected by а
+//! 3. The pool is `Send + Sync`. Internal state is protected by a
 //!    short-critical-section `Mutex` (held only across the free-list
 //!    Vec push/pop).
 //! 4. A `PooledShared` cannot be cloned BEFORE the underlying buffer
@@ -67,10 +67,10 @@
 //!
 //! # Metrics
 //!
-//! [`BufferPool::stats`] returns а snapshot suitable for prometheus
+//! [`BufferPool::stats`] returns a snapshot suitable for prometheus
 //! export. Callers must wire this into their metrics layer
 //! (the pool itself has no observability dependency, by design —
-//! it must remain а leaf crate с zero side effects).
+//! it must remain a leaf crate with zero side effects).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -92,8 +92,8 @@ const BUCKET_SIZES: &[usize] = &[256, 4096, 65536];
 
 /// Hard cap on cached buffers per bucket. At 64 buffers × 64 KiB =
 /// 4 MiB max cache per largest bucket, ~12 MiB total worst case.
-/// Tuned so cache cap is small relative к typical RSS, large enough
-/// to absorb sub-second bursts on а 200 msg/sec workload.
+/// Tuned so cache cap is small relative to typical RSS, large enough
+/// to absorb sub-second bursts on a 200 msg/sec workload.
 const DEFAULT_BUCKET_CAPACITY: usize = 64;
 
 /// Public statistics snapshot for metrics export.
@@ -101,7 +101,7 @@ const DEFAULT_BUCKET_CAPACITY: usize = 64;
 pub struct PoolStats {
     /// Total successful pool-cache hits (no allocation needed).
     pub cache_hit_total: u64,
-    /// Total times the cache was empty and we fell back к heap.
+    /// Total times the cache was empty and we fell back to heap.
     pub fallback_alloc_total: u64,
     /// Total returns rejected because the cache was full (buffer dropped).
     pub overflow_drop_total: u64,
@@ -134,17 +134,17 @@ impl Bucket {
         }
     }
 
-    /// Pop а buffer from the free list, or return None if empty.
+    /// Pop a buffer from the free list, or return None if empty.
     ///
     /// Poison-tolerant: an inner `Vec::pop` cannot panic, so poisoning
-    /// requires а thread cancellation between `lock()` и the pop.
+    /// requires a thread cancellation between `lock()` and the pop.
     /// Recovering matches the workspace-wide poison policy.
     fn pop(&self) -> Option<Vec<u8>> {
         let mut guard = self.free.lock().unwrap_or_else(|p| p.into_inner());
         guard.pop()
     }
 
-    /// Try to return а buffer к the free list. Returns `true` if
+    /// Try to return a buffer to the free list. Returns `true` if
     /// cached; `false` if the cache was full (buffer is dropped by
     /// caller).
     ///
@@ -186,7 +186,7 @@ impl Default for BufferPool {
 }
 
 impl BufferPool {
-    /// Create а pool с the given per-bucket cap (same cap for all
+    /// Create a pool with the given per-bucket cap (same cap for all
     /// buckets — keeps the API minimal; if workload demands per-
     /// bucket caps, add an explicit constructor later).
     pub fn with_capacity(per_bucket_cap: usize) -> Self {
@@ -206,7 +206,7 @@ impl BufferPool {
         }
     }
 
-    /// Acquire а buffer с at-least `min_capacity` bytes. Returns а
+    /// Acquire a buffer with at-least `min_capacity` bytes. Returns a
     /// unique handle. The buffer's `len` is 0 on return; contents
     /// of the underlying allocation are unspecified (NOT zeroed).
     ///
@@ -265,7 +265,7 @@ impl BufferPool {
             .iter()
             .map(|b| b.cached_count() as u64)
             .sum();
-        // Update cached_peak atomically с monotonic max.
+        // Update cached_peak atomically with monotonic max.
         loop {
             let prev = self.inner.cached_peak.load(Ordering::Relaxed);
             if cached_inflight <= prev {
@@ -323,13 +323,13 @@ impl Pooled {
     // from git history if a `Vec<u8>`-detach is ever genuinely needed (and read
     // ALL non-Copy fields then).
 
-    /// Convert this unique handle into а refcounted shared handle.
-    /// After this point, multiple readers can hold а `PooledShared`
-    /// pointing к the same buffer, but no writer can mutate it.
+    /// Convert this unique handle into a refcounted shared handle.
+    /// After this point, multiple readers can hold a `PooledShared`
+    /// pointing to the same buffer, but no writer can mutate it.
     /// Buffer returns to pool when ALL `PooledShared` clones drop.
     pub fn into_shared(self) -> PooledShared {
-        // Move fields out of Self без triggering its Drop (which
-        // would otherwise return buf к the pool — we want to give
+        // Move fields out of Self without triggering its Drop (which
+        // would otherwise return buf to the pool — we want to give
         // it to the PooledSharedInner instead, so PooledShared's
         // own Drop is what eventually returns).
         //
@@ -340,7 +340,7 @@ impl Pooled {
         let buf = unsafe { std::ptr::read(&this.buf) };
         let bucket_idx = this.bucket_idx;
         let pool = unsafe { std::ptr::read(&this.pool) };
-        // m: acquire а slab cell rather than Arc::new(...).
+        // m: acquire a slab cell rather than Arc::new(...).
         let cell = shared_slab::acquire(PooledSharedInner {
             buf,
             bucket_idx,
@@ -372,10 +372,10 @@ impl Drop for Pooled {
 /// Refcounted shared buffer handle. Read-only access. Returns to
 /// pool when the last clone drops.
 ///
-/// m: backed by а pre-allocated slab cell (see
-/// [`shared_slab`]). Each `PooledShared` is а 1-word raw pointer
-/// into the slab; clone bumps а custom refcount, last drop returns
-/// the cell к the freelist. Replaces previous `Arc<PooledSharedInner>`
+/// m: backed by a pre-allocated slab cell (see
+/// [`shared_slab`]). Each `PooledShared` is a 1-word raw pointer
+/// into the slab; clone bumps a custom refcount, last drop returns
+/// the cell to the freelist. Replaces previous `Arc<PooledSharedInner>`
 /// which allocated ~64 bytes from jemalloc per shared handle —
 /// at sustained 14k frames/sec that was the dominant remaining
 /// allocator-pressure source.
@@ -384,22 +384,22 @@ pub struct PooledShared {
 }
 
 // SAFETY: SharedCell is Send+Sync (atomic refcount); the inner
-// PooledSharedInner is read-only через PooledShared's Deref — no
+// PooledSharedInner is read-only through PooledShared's Deref — no
 // interior mutation, no aliased mutable refs. Mirrors `Arc<T>` for
 // T: Send + Sync.
 unsafe impl Send for PooledShared {}
 unsafe impl Sync for PooledShared {}
 
 impl PooledShared {
-    /// Borrow the underlying inner cell payload. Safe только когда
-    /// `self.cell` points к a live SharedCell с rc >= 1, which is
+    /// Borrow the underlying inner cell payload. Safe only when
+    /// `self.cell` points to a live SharedCell with rc >= 1, which is
     /// our invariant — guaranteed by construction (refcount starts at
-    /// 1 on acquire) и preserved by clone/drop (no decrement к 0
+    /// 1 on acquire) and preserved by clone/drop (no decrement to 0
     /// while shared).
     #[inline]
     fn inner(&self) -> &PooledSharedInner {
         // SAFETY: cell is live (rc >= 1 invariant); payload was written
-        // на acquire и has not been dropped (would require rc=0).
+        // on acquire and has not been dropped (would require rc=0).
         unsafe { (*self.cell.as_ref().inner.get()).assume_init_ref() }
     }
 }
@@ -479,25 +479,25 @@ impl Drop for PooledSharedInner {
     }
 }
 
-/// Wrap an existing `Vec<u8>` as а `PooledShared` без копирования.
+/// Wrap an existing `Vec<u8>` as a `PooledShared` without copying.
 ///
-/// The Vec's heap allocation is moved into а fresh `Pooled` handle, then
+/// The Vec's heap allocation is moved into a fresh `Pooled` handle, then
 /// shared. `bucket_idx=None` flags it as "oversize / unmanaged" so it
-/// will be freed normally на drop (not cached к а bucket — capacity
-/// likely doesn't match а bucket size). Use this when migration к the
-/// pool is incremental: producers that already hold а `Vec<u8>` (from
+/// will be freed normally on drop (not cached to a bucket — capacity
+/// likely doesn't match a bucket size). Use this when migration to the
+/// pool is incremental: producers that already hold a `Vec<u8>` (from
 /// non-refactored code paths) can still feed into pool-typed channels
-/// without а cascade refactor. Cache-hit benefit is forfeit on this
-/// path; cache-warm benefit still applies к downstream consumers because
-/// the buffer drops normally rather than holding а pool slot.
+/// without a cascade refactor. Cache-hit benefit is forfeit on this
+/// path; cache-warm benefit still applies to downstream consumers because
+/// the buffer drops normally rather than holding a pool slot.
 pub fn pooled_shared_from_vec(buf: Vec<u8>) -> PooledShared {
     // m: slab-allocated cell rather than Arc::new(...).
     let cell = shared_slab::acquire(PooledSharedInner {
         buf,
         bucket_idx: None,
-        // Dangling Arc<PoolInner> would require carrying а live pool
-        // reference; instead we lift а sentinel pool — its counters
-        // would only be touched if Drop tried к return. Since
+        // Dangling Arc<PoolInner> would require carrying a live pool
+        // reference; instead we lift a sentinel pool — its counters
+        // would only be touched if Drop tried to return. Since
         // bucket_idx=None short-circuits the Drop's return path
         // before touching pool fields, this sentinel is safe.
         pool: orphan_pool(),
@@ -505,10 +505,10 @@ pub fn pooled_shared_from_vec(buf: Vec<u8>) -> PooledShared {
     PooledShared { cell }
 }
 
-/// Lazy sentinel `Arc<PoolInner>` для `pooled_shared_from_vec` use only.
+/// Lazy sentinel `Arc<PoolInner>` for `pooled_shared_from_vec` use only.
 /// Its counters are never read/written by anyone except its own Drop —
-/// which is а no-op because no `Pooled`/`PooledShared` ever sets its
-/// `bucket_idx` к `Some` while pointing к it.
+/// which is a no-op because no `Pooled`/`PooledShared` ever sets its
+/// `bucket_idx` to `Some` while pointing to it.
 fn orphan_pool() -> Arc<PoolInner> {
     static ORPHAN: OnceLock<Arc<PoolInner>> = OnceLock::new();
     ORPHAN
@@ -525,14 +525,14 @@ fn orphan_pool() -> Arc<PoolInner> {
         .clone()
 }
 
-/// Lazy-init accessor для the process-wide singleton `BufferPool`.
+/// Lazy-init accessor for the process-wide singleton `BufferPool`.
 ///
 /// Capacity controlled by the optional env override `VEIL_BUFPOOL_CAP`
 /// (default 64 per bucket). Multiple crates (veilcore, veil-ipc
 /// future consumers) share the same pool so buffers recycle across all
 /// frame-handling paths — inbound OVL1, outbound OVL1, IPC delivery.
 ///
-/// First call wins. Race-safe via `OnceLock`. Returns а cheap-clone
+/// First call wins. Race-safe via `OnceLock`. Returns a cheap-clone
 /// handle (Arc-backed internally).
 pub fn global() -> &'static BufferPool {
     static GLOBAL: OnceLock<BufferPool> = OnceLock::new();
@@ -545,7 +545,7 @@ pub fn global() -> &'static BufferPool {
     })
 }
 
-/// Common return path: validate, reset len, push к bucket cache.
+/// Common return path: validate, reset len, push to bucket cache.
 fn return_to_pool(buf: &mut Vec<u8>, bucket_idx: Option<usize>, pool: &PoolInner) {
     let Some(idx) = bucket_idx else {
         // Oversize buffer — never was cacheable. Just let Drop free.
@@ -560,15 +560,15 @@ fn return_to_pool(buf: &mut Vec<u8>, bucket_idx: Option<usize>, pool: &PoolInner
         return;
     }
     buf.clear();
-    // Take the Vec by replacing с а dummy empty one (whose Drop is
-    // а no-op since capacity=0). This lets us move the original
+    // Take the Vec by replacing with a dummy empty one (whose Drop is
+    // a no-op since capacity=0). This lets us move the original
     // into the bucket's free list without disturbing the &mut.
     let to_return = std::mem::take(buf);
     if !bucket.push(to_return) {
         // Cache full — buffer is dropped by Vec's own Drop because
-        // we just `mem::take`d it и the local `to_return` goes out
+        // we just `mem::take`d it and the local `to_return` goes out
         // of scope. Wait — actually we passed `to_return` BY VALUE
-        // к `push`, so если push returns false it gave it back, и
+        // to `push`, so if push returns false it gave it back, and
         // we lose it on this scope's end. Same effect either way.
         pool.overflow_drop.fetch_add(1, Ordering::Relaxed);
     }

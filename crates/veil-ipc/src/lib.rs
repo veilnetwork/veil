@@ -98,16 +98,16 @@ impl<T: MobileEventSink + ?Sized> MobileEventSink for std::sync::Arc<T> {
 /// Hook the IPC server calls when an app sends `LocalAppMsg::SetPushEnvelope`.
 /// Implemented by the veil runtime, routes to
 /// `NodeRuntime::set_rendezvous_push_envelope` so the next maintenance tick
-/// re-signs every active rendezvous-ad с the new envelope (or clears it
+/// re-signs every active rendezvous-ad with the new envelope (or clears it
 /// when `envelope.is_empty`).
 ///
-/// Returns the matching-rendezvous outcome — the IPC handler maps it к the
+/// Returns the matching-rendezvous outcome — the IPC handler maps it to the
 /// `SetPushEnvelopeStatus` wire byte.
 pub trait PushEnvelopeSink: Send + Sync {
-    /// Update the sealed push envelope (FCM/APNs token sealed к
-    /// the chosen push-relay) on а rendezvous-publisher entry matched
-    /// by `(rendezvous_node_id, auth_cookie)`. Returns `true` if а
-    /// matching entry was found и updated; `false` if no such entry.
+    /// Update the sealed push envelope (FCM/APNs token sealed to
+    /// the chosen push-relay) on a rendezvous-publisher entry matched
+    /// by `(rendezvous_node_id, auth_cookie)`. Returns `true` if a
+    /// matching entry was found and updated; `false` if no such entry.
     fn set_rendezvous_push_envelope(
         &self,
         rendezvous_node_id: [u8; 32],
@@ -117,10 +117,10 @@ pub trait PushEnvelopeSink: Send + Sync {
 
     /// Epic 489.10 slice 4.3.4 — update the sealed wake-HMAC envelope
     /// on the same rendezvous-publisher entry (matched the same way).
-    /// Returns `true` if а matching entry was found и updated.
+    /// Returns `true` if a matching entry was found and updated.
     ///
     /// Default-impl returns `false` so existing implementors compile
-    /// без changes; the trait's name dates от when push was the only
+    /// without changes; the trait's name dates from when push was the only
     /// rendezvous-bound envelope.  Real impls (production
     /// `NodeRuntime`) override.
     fn set_rendezvous_wake_hmac_envelope(
@@ -186,14 +186,14 @@ pub enum MailboxPutOutcome {
     QuotaGlobalExceeded,
     /// Sender exceeded the per-receiver rate limit.
     RateLimited,
-    /// relay configured с
-    /// `require_capability_token = true` rejected а PUT that arrived
-    /// без а capability token. IPC clients that surface this к the
-    /// app layer should prompt the user к re-fetch the receiver's
+    /// relay configured with
+    /// `require_capability_token = true` rejected a PUT that arrived
+    /// without a capability token. IPC clients that surface this to the
+    /// app layer should prompt the user to re-fetch the receiver's
     /// `RendezvousAd`.
     CapabilityRequired,
-    /// capability token decode или verify
-    /// failed (expired, wrong receiver, или bad signature).
+    /// capability token decode or verify
+    /// failed (expired, wrong receiver, or bad signature).
     CapabilityInvalid,
     /// per-sender byte cap would be exceeded.
     /// Sender_id is the BLAKE3 of the sender's identity pubkey, so this
@@ -311,7 +311,7 @@ impl<T: MailboxBackend + ?Sized> MailboxBackend for std::sync::Arc<T> {
 // ── Outbox backend ──────────────────────
 
 /// One outbox entry the IPC layer ferries between app and runtime.
-/// Mirrors `veil_mailbox::OutboxEntry` минus the receiver_id (the
+/// Mirrors `veil_mailbox::OutboxEntry` minus the receiver_id (the
 /// IPC message already carries it explicitly).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxEntryOut {
@@ -372,7 +372,7 @@ impl<T: OutboxBackend + ?Sized> OutboxBackend for std::sync::Arc<T> {
 // ── Rendezvous replica resolver ────────
 
 /// One verified replica candidate returned by [`RendezvousReplicaResolver`].
-/// Mirrors `veil_proto::ReplicaWire` минус the wire encoding.
+/// Mirrors `veil_proto::ReplicaWire` minus the wire encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedReplica {
     /// Relay's `node_id` — sender targets this for `MailboxPut`.
@@ -382,10 +382,10 @@ pub struct ResolvedReplica {
     /// Sealed FCM/APNs envelope to attach to the put (may be empty).
     pub push_envelope: Vec<u8>,
     /// receiver-signed mailbox capability
-    /// token bytes pulled из the resolved RendezvousAd. Senders include
-    /// these в `MailboxPutPayload.capability_token` если the relay
+    /// token bytes pulled from the resolved RendezvousAd. Senders include
+    /// these in `MailboxPutPayload.capability_token` if the relay
     /// enforces `require_capability_token = true`. Empty when the
-    /// receiver did not mint а token (legacy receivers / hybrid identities).
+    /// receiver did not mint a token (legacy receivers / hybrid identities).
     pub capability_token: Vec<u8>,
     /// Sealed `WakeHmacKey` envelope (Epic 489.10 slice 4.4) copied verbatim
     /// from the resolved `RendezvousAd.wake_hmac_envelope`. Senders forward it
@@ -410,7 +410,7 @@ pub struct ResolvedReplica {
 /// trait uses a boxed future to keep the abstraction object-safe.
 pub trait RendezvousReplicaResolver: Send + Sync {
     /// Resolve up to `max_replicas` verified replicas for `receiver_id`.
-    /// Returns an empty Vec на DHT miss / no fresh ad / verification
+    /// Returns an empty Vec on DHT miss / no fresh ad / verification
     /// failure — caller cannot distinguish (these are all "no usable
     /// replica" from the sender's perspective).
     fn resolve_replicas<'a>(
@@ -460,26 +460,26 @@ impl<T: PeerListProvider + ?Sized> PeerListProvider for std::sync::Arc<T> {
 /// Hook the IPC server calls when an app issues
 /// [`veil_proto::family::LocalAppMsg::PnetStatusQuery`].
 ///
-/// Implemented by the veil runtime which has access к the
+/// Implemented by the veil runtime which has access to the
 /// `NetworkAccessGate` cache populated at OVL1 handshake-time.  Apps
-/// (ogate / oproxy / SDK consumers) use this к gate their app-layer
-/// admission на the daemon's already-performed cert verification
+/// (ogate / oproxy / SDK consumers) use this to gate their app-layer
+/// admission on the daemon's already-performed cert verification
 /// instead of maintaining their own static `allowed_node_ids` list.
 ///
 /// Runs synchronously on the IPC dispatch task — implementations must
-/// avoid blocking; the typical pattern is а brief lock against the
+/// avoid blocking; the typical pattern is a brief lock against the
 /// per-session cert map.
 pub trait PnetStatusProvider: Send + Sync {
-    /// Look up the P-Net admission status for а given peer.
+    /// Look up the P-Net admission status for a given peer.
     /// Implementation contract:
     /// * Echo `peer_node_id` back in the result for IPC pipeline-safety.
     /// * Set `admitted=true` only if there's an active veil session.
-    /// * Set `has_cert=true` only if а MembershipCert was verified for
-    ///   this peer (i.e. daemon's P-Net is enabled и handshake passed).
+    /// * Set `has_cert=true` only if a MembershipCert was verified for
+    ///   this peer (i.e. daemon's P-Net is enabled and handshake passed).
     /// * When `has_cert=true`, populate `admin`, `valid_until_unix`,
     ///   `network_id` from the cached cert.
-    /// * `valid_until_unix == 0` is the "no expiry" sentinel и MUST be
-    ///   propagated verbatim (not rewritten к far-future).
+    /// * `valid_until_unix == 0` is the "no expiry" sentinel and MUST be
+    ///   propagated verbatim (not rewritten to far-future).
     fn peer_status(&self, peer_node_id: &[u8; 32]) -> veil_proto::PnetStatusResultPayload;
 }
 
@@ -495,7 +495,7 @@ impl<T: PnetStatusProvider + ?Sized> PnetStatusProvider for std::sync::Arc<T> {
 /// Outcome of a bootstrap-URI join request, returned by
 /// [`BootstrapJoinSink::join_uri`]. Wire-byte status codes mirror
 /// `veil_proto::join_status` constants so the IPC handler can
-/// pass the result через без mapping table.
+/// pass the result through without mapping table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapJoinOutcome {
     /// URI decoded, verified, peer registered for outbound dial.
@@ -527,10 +527,10 @@ pub enum BootstrapJoinOutcome {
 /// veil-bootstrap so the decode + crypto verification stays in
 /// veilcore where the runtime can also drive the registration.
 pub trait BootstrapJoinSink: Send + Sync {
-    /// Decode the URI, verify it (если signed / encrypted), and register
+    /// Decode the URI, verify it (if signed / encrypted), and register
     /// the resulting peer for outbound dial. Synchronous from the IPC
     /// handler's POV — implementations should keep CPU work bounded
-    /// (Argon2id decrypt + signature verify в worst case ≈ 200 ms на
+    /// (Argon2id decrypt + signature verify in worst case ≈ 200 ms on
     /// budget Android).
     fn join_uri(
         &self,
@@ -556,12 +556,12 @@ impl<T: BootstrapJoinSink + ?Sized> BootstrapJoinSink for std::sync::Arc<T> {
 
 /// Outcome of [`BootstrapInviteCreateSink::create_invite`].  Mirrors
 /// `veil_proto::create_invite_status` byte codes so the IPC handler
-/// can pass the result through без а mapping table.
+/// can pass the result through without a mapping table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapInviteCreateOutcome {
-    /// Invite assembled и encoded.  Carries the canonical URI.
+    /// Invite assembled and encoded.  Carries the canonical URI.
     Ok { uri: String },
-    /// Daemon's config has no `[identity]` или no `[[listen]]` entry —
+    /// Daemon's config has no `[identity]` or no `[[listen]]` entry —
     /// runtime cannot assemble an invite that points anywhere.
     NotConfigured(String),
     /// Caller-supplied password failed validation (empty / oversized).
@@ -576,13 +576,13 @@ pub enum BootstrapInviteCreateOutcome {
 /// the daemon's own [`veil_types::BootstrapPeer`] from `[identity]` +
 /// the first `[[listen]]` entry, then encode the canonical URI (plain
 /// or encrypted depending on `password`).  Same Arc<dyn> pattern as
-/// other IPC sinks — kept в veil-ipc so the crate doesn't pull
-/// в veil-bootstrap.
+/// other IPC sinks — kept in veil-ipc so the crate doesn't pull
+/// in veil-bootstrap.
 pub trait BootstrapInviteCreateSink: Send + Sync {
     /// Build a bootstrap invite URI.  Synchronous from the IPC handler's
     /// POV — implementations should keep CPU work bounded (encoding is
     /// allocation + base64; encryption variant adds Argon2id derive
-    /// + ChaCha20-Poly1305 encrypt, ~100-200 ms на budget Android).
+    /// + ChaCha20-Poly1305 encrypt, ~100-200 ms on budget Android).
     fn create_invite(&self, password: Option<&str>) -> BootstrapInviteCreateOutcome;
 }
 
@@ -598,7 +598,7 @@ impl<T: BootstrapInviteCreateSink + ?Sized> BootstrapInviteCreateSink for std::s
 /// `veil_proto::pair_source_status` byte codes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairSourceCreateOutcome {
-    /// Invite assembled.  URI is ready к QR-render.
+    /// Invite assembled.  URI is ready to QR-render.
     Ok {
         uri: String,
     },
@@ -634,7 +634,7 @@ pub enum PairSourceHandleConfirmOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairTargetConsumeOutcome {
     /// URI parsed, ceremony state initialised.  Hello bytes ready
-    /// для transport к Source.
+    /// for transport to Source.
     Ok {
         hello_bytes: Vec<u8>,
     },
@@ -647,7 +647,7 @@ pub enum PairTargetConsumeOutcome {
 /// Outcome of [`PairTargetSink::handle_cert`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairTargetHandleCertOutcome {
-    /// Cert decoded и verified.  OOB code ready для visual compare с
+    /// Cert decoded and verified.  OOB code ready for visual compare with
     /// Source's screen.
     Ok {
         oob_code: [u8; 6],
@@ -660,7 +660,7 @@ pub enum PairTargetHandleCertOutcome {
 /// Outcome of [`PairTargetSink::build_confirm`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairTargetBuildConfirmOutcome {
-    /// Confirm bytes ready для transport к Source.  Daemon also
+    /// Confirm bytes ready for transport to Source.  Daemon also
     /// persisted the new IdentityDocument + identity_sk on disk if
     /// `confirmed = true`.
     Ok {
@@ -670,11 +670,11 @@ pub enum PairTargetBuildConfirmOutcome {
     InternalError(String),
 }
 
-/// Hook the IPC server calls для Source-side ceremony ops.
-/// Implementations hold ephemeral ceremony state в memory (one-at-a-
-/// time semantics — а fresh CreateInvite drops any in-flight ceremony).
+/// Hook the IPC server calls for Source-side ceremony ops.
+/// Implementations hold ephemeral ceremony state in memory (one-at-a-
+/// time semantics — a fresh CreateInvite drops any in-flight ceremony).
 pub trait PairSourceSink: Send + Sync {
-    /// Generate а fresh pair_secret + URI, stash ceremony state.
+    /// Generate a fresh pair_secret + URI, stash ceremony state.
     /// `master_password` is needed if the sovereign identity's
     /// master_sk is encrypted at rest (Argon2id master.enc).
     fn create_invite(&self, master_password: Option<&str>) -> PairSourceCreateOutcome;
@@ -682,7 +682,7 @@ pub trait PairSourceSink: Send + Sync {
     /// certifies Target's subkey, returns Cert bytes + OOB code.
     fn handle_hello(&self, hello_bytes: &[u8]) -> PairSourceHandleHelloOutcome;
     /// Process Confirm bytes from Target — verifies proof, finalizes
-    /// (writes new IdentityDocument к disk + publishes via runtime
+    /// (writes new IdentityDocument to disk + publishes via runtime
     /// republish task), drops ceremony state.  On user-aborted Confirm
     /// the appended IdentityKey is rolled back.
     fn handle_confirm(&self, confirm_bytes: &[u8]) -> PairSourceHandleConfirmOutcome;
@@ -700,12 +700,12 @@ impl<T: PairSourceSink + ?Sized> PairSourceSink for std::sync::Arc<T> {
     }
 }
 
-/// Hook the IPC server calls для Target-side ceremony ops.
+/// Hook the IPC server calls for Target-side ceremony ops.
 pub trait PairTargetSink: Send + Sync {
     /// Parse scanned URI, generate own keypair + ephemeral, build Hello.
     fn consume_uri(&self, uri: &str, instance_label: Option<&str>) -> PairTargetConsumeOutcome;
     /// Process Cert from Source — verify sig chain, derive session key,
-    /// compute OOB code для visual compare.
+    /// compute OOB code for visual compare.
     fn handle_cert(&self, cert_bytes: &[u8]) -> PairTargetHandleCertOutcome;
     /// Emit Confirm bytes based on user's OOB-compare decision.
     /// `confirmed = true` triggers identity persistence to disk.
@@ -732,7 +732,7 @@ impl<T: PairTargetSink + ?Sized> PairTargetSink for std::sync::Arc<T> {
 /// pattern as [`PeerListProvider`] / [`MobileEventSink`].
 ///
 /// Returns a typed wire payload directly so the IPC handler can encode
-/// без a translation table.
+/// without a translation table.
 pub trait MobileStatusProvider: Send + Sync {
     /// Snapshot the daemon's current mobile / battery / keepalive state.
     /// Synchronous from the IPC dispatch task — implementations should
@@ -754,7 +754,7 @@ impl<T: MobileStatusProvider + ?Sized> MobileStatusProvider for std::sync::Arc<T
 /// a frame paint) before the broadcast channel starts dropping the oldest
 /// items per-receiver. Lagged receivers see `RecvError::Lagged(n)` and we
 /// surface that as a single dropped event in the IPC client task — the SDK
-/// just misses an intermediate state, не a fatal error.
+/// just misses an intermediate state, not a fatal error.
 pub const EVENT_BUS_DEFAULT_CAPACITY: usize = 256;
 
 /// Push-event fan-out for the IPC server.

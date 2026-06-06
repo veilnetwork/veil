@@ -60,12 +60,12 @@ pub enum DiagEvent {
 // ── CaptureEvent ───────────────────────────────────────────────────
 
 /// max body bytes preserved per `CaptureEvent`.
-/// Larger payloads are truncated к this prefix и `body_truncated` set.
+/// Larger payloads are truncated to this prefix and `body_truncated` set.
 /// 256 B is enough to identify the wire structure of any well-known
 /// frame type (header + initial bytes of payload — debug-capture is
-/// fundamentally а structural-inspection tool, not а replay-fidelity
+/// fundamentally a structural-inspection tool, not a replay-fidelity
 /// recorder), while bounding memory amplification at 10K pkt/s ×
-/// realistic 60 KB chat-node frames from ~600 MB/s к ~2.5 MB/s on
+/// realistic 60 KB chat-node frames from ~600 MB/s to ~2.5 MB/s on
 /// the active broadcast channel.
 pub const CAPTURE_BODY_PREVIEW_LEN: usize = 256;
 
@@ -87,16 +87,16 @@ pub struct CaptureEvent {
     /// bytes of the original frame body. When `body_truncated == true`
     /// `body.len < body_len` — the full payload is NOT recoverable
     /// from the capture stream. This is intentional: debug-capture
-    /// runs at hot-path frame dispatch и full-body cloning was
+    /// runs at hot-path frame dispatch and full-body cloning was
     /// 10 MB/s @ 10K pkt/s → ~600 MB/s broadcast amplification under
     /// chat-node load. The 256 B prefix retains enough structure for
-    /// `debug trace` to identify the frame type и initial payload
-    /// shape; full-fidelity captures should be done с tcpdump at the
+    /// `debug trace` to identify the frame type and initial payload
+    /// shape; full-fidelity captures should be done with tcpdump at the
     /// transport layer.
     pub body: Vec<u8>,
-    /// `true` if `body` was clipped к
+    /// `true` if `body` was clipped to
     /// [`CAPTURE_BODY_PREVIEW_LEN`]. Tools surfacing the capture
-    /// must indicate truncation — silently displaying а partial body
+    /// must indicate truncation — silently displaying a partial body
     /// would misrepresent reality.
     pub body_truncated: bool,
     /// When `true`, `body` contains the **plaintext** application payload
@@ -115,22 +115,22 @@ pub const CAPTURE_PER_PEER_EVENTS_PER_SEC: u32 = 100;
 
 /// simple per-peer rate limiter for
 /// capture-event emission. One-second tumbling window. Returns
-/// `false` (drop the event) when а peer has hit
+/// `false` (drop the event) when a peer has hit
 /// [`CAPTURE_PER_PEER_EVENTS_PER_SEC`] in the current window;
-/// otherwise increments the counter и returns `true`.
+/// otherwise increments the counter and returns `true`.
 ///
-/// **Why tumbling, not sliding window:** the limiter is а DoS
-/// defence, not а fairness primitive. Tumbling is O(1) per call
-/// и costs one `Instant::now` + one `HashMap` write; sliding
-/// would need а ring buffer per peer. The worst-case under
-/// tumbling is а 2× overshoot at the window boundary (peer
+/// **Why tumbling, not sliding window:** the limiter is a DoS
+/// defence, not a fairness primitive. Tumbling is O(1) per call
+/// and costs one `Instant::now` + one `HashMap` write; sliding
+/// would need a ring buffer per peer. The worst-case under
+/// tumbling is a 2× overshoot at the window boundary (peer
 /// produces 100 events at t=0.999 + another 100 at t=1.001), which
-/// for а debug-capture stream is fine.
+/// for a debug-capture stream is fine.
 ///
 /// Uses `std::sync::Mutex` rather than tokio's because capture-emit
-/// runs on the dispatcher's async hot path BUT only когда capture
+/// runs on the dispatcher's async hot path BUT only when capture
 /// is active (gated by `capture_active` atomic upstream); blocking
-/// for а HashMap update is sub-microsecond.
+/// for a HashMap update is sub-microsecond.
 #[derive(Default)]
 pub struct CaptureRateLimiter {
     inner: std::sync::Mutex<std::collections::HashMap<[u8; 32], CaptureRateState>>,
@@ -147,9 +147,9 @@ impl CaptureRateLimiter {
         Self::default()
     }
 
-    /// Check + increment. Returns `true` если caller may proceed
-    /// to emit а capture event for `peer_id`; `false` if the peer
-    /// has hit the per-second cap и this event must be dropped.
+    /// Check + increment. Returns `true` if caller may proceed
+    /// to emit a capture event for `peer_id`; `false` if the peer
+    /// has hit the per-second cap and this event must be dropped.
     pub fn allow(&self, peer_id: [u8; 32]) -> bool {
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let now = std::time::Instant::now();
@@ -171,7 +171,7 @@ impl CaptureRateLimiter {
 
     /// Test-only sanity check: how many distinct peers currently
     /// have an active rate-limit window? Useful when verifying
-    /// that bookkeeping doesn't grow unbounded под workload.
+    /// that bookkeeping doesn't grow unbounded under workload.
     #[doc(hidden)]
     pub fn tracked_peer_count(&self) -> usize {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
@@ -179,14 +179,14 @@ impl CaptureRateLimiter {
 }
 
 impl CaptureEvent {
-    /// helper to build а CaptureEvent с body
-    /// auto-truncated к [`CAPTURE_BODY_PREVIEW_LEN`]. All call sites
-    /// should use this constructor; storing а raw `Vec<u8>` без the
+    /// helper to build a CaptureEvent with body
+    /// auto-truncated to [`CAPTURE_BODY_PREVIEW_LEN`]. All call sites
+    /// should use this constructor; storing a raw `Vec<u8>` without the
     /// truncation defeats the fix.
     #[allow(clippy::too_many_arguments)] // 9 args matches the wire
     // representation 1:1 (timestamp + direction + 4 IDs + family + msg_type
-    // + body len + body). Refactoring к а builder struct would inflate
-    // call sites significantly без real type-safety benefit.
+    // + body len + body). Refactoring to a builder struct would inflate
+    // call sites significantly without real type-safety benefit.
     pub fn new_truncated(
         ts_us: u64,
         inbound: bool,
@@ -223,7 +223,7 @@ impl CaptureEvent {
 mod tests {
     use super::*;
 
-    /// small body fits в the preview без
+    /// small body fits in the preview without
     /// truncation; `body_truncated` reflects this honestly.
     #[test]
     fn capture_event_small_body_not_truncated() {
@@ -233,7 +233,7 @@ mod tests {
         assert!(!ev.body_truncated);
     }
 
-    /// Body bigger than the preview is clipped к 256 B и flagged.
+    /// Body bigger than the preview is clipped to 256 B and flagged.
     #[test]
     fn capture_event_oversize_body_truncated_and_flagged() {
         let big = vec![0xBBu8; 10 * 1024]; // 10 KiB
@@ -266,7 +266,7 @@ mod tests {
     }
 
     /// per-peer rate limiter admits the
-    /// first 100 events for а peer in а 1 s window, drops the
+    /// first 100 events for a peer in a 1 s window, drops the
     /// 101st.
     #[test]
     fn capture_rate_limiter_caps_at_100_per_peer_per_sec() {
@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(quiet_admitted, 100, "quiet peer not penalised by noisy one");
     }
 
-    /// Bookkeeping is per-peer so the tracked-peer count rises с
+    /// Bookkeeping is per-peer so the tracked-peer count rises with
     /// distinct senders. Doesn't test eviction (the limiter is
     /// only memory-bounded by total active peers, which is itself
     /// bounded by other / 6.48 caps in the dispatcher).

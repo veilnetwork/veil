@@ -84,12 +84,12 @@ pub const NEXT_HOP_ID_LEN: usize = 32;
 pub const FINAL_HOP_SENTINEL: [u8; NEXT_HOP_ID_LEN] = [0u8; NEXT_HOP_ID_LEN];
 
 /// anti-loop TTL: hard cap on the per-layer
-/// TTL field encoded в circuit envelopes. Honest senders set TTL =
+/// TTL field encoded in circuit envelopes. Honest senders set TTL =
 /// `hops.len + 1` (small headroom). Receiver-side cap prevents an
-/// adversarial sender от encoding а huge TTL и chaining self-loops
+/// adversarial sender from encoding a huge TTL and chaining self-loops
 /// indefinitely — independent of the natural payload-shrinkage
 /// limit that today caps loops at ~5-6 (cell-size budget). Sets the
-/// maximum-amplification factor а single circuit can produce.
+/// maximum-amplification factor a single circuit can produce.
 pub const MAX_CIRCUIT_TTL: u8 = 16;
 
 /// Wire-layer overhead per layer for the TTL byte. : each
@@ -106,16 +106,16 @@ pub enum CircuitError {
     #[error("circuit must have at least one hop")]
     NoHops,
     /// anti-loop TTL: incoming circuit envelope's TTL field is 0
-    /// (would have been forwarded по-prevous-hop and decremented к 0; OR
+    /// (would have been forwarded by-prevous-hop and decremented to 0; OR
     /// adversarial sender encoded TTL=0 directly). Drop the frame.
     #[error("circuit ttl exhausted")]
     TtlExhausted,
     /// anti-loop TTL: incoming TTL exceeds [`MAX_CIRCUIT_TTL`].
     /// Honest senders cap at `hops.len + 1`; values > 16 indicate
-    /// malicious sender attempting к inflate amplification budget.
+    /// malicious sender attempting to inflate amplification budget.
     #[error("circuit ttl {got} exceeds max {max}")]
     TtlExceedsCap { got: u8, max: u8 },
-    /// anti-loop TTL: caller asked для а circuit longer than
+    /// anti-loop TTL: caller asked for a circuit longer than
     /// the TTL cap allows (`hops.len + 1 > MAX_CIRCUIT_TTL`). Reject
     /// at build time rather than letting the receiver silently drop.
     #[error("circuit too long for ttl cap ({hops} hops requires ttl {required} > max {max})")]
@@ -167,18 +167,18 @@ pub struct Hop {
 /// Returns the bytes the sender hands to `hops[0]`.
 ///
 /// **anti-loop TTL:** each layer's plaintext
-/// now leads with а 1-byte TTL = `hops.len - layer_idx + 1` (so
+/// now leads with a 1-byte TTL = `hops.len - layer_idx + 1` (so
 /// outermost = `hops.len+1`, innermost = 2). Capped at
 /// [`MAX_CIRCUIT_TTL`] = 16; longer circuits are rejected at build
-/// time с [`CircuitError::CircuitTooLongForTtl`]. Each peel
-/// validates `1 <= ttl <= MAX_CIRCUIT_TTL` и drops on violation.
+/// time with [`CircuitError::CircuitTooLongForTtl`]. Each peel
+/// validates `1 <= ttl <= MAX_CIRCUIT_TTL` and drops on violation.
 pub fn build_circuit(payload: &[u8], hops: &[Hop]) -> Result<Vec<u8>, CircuitError> {
     if hops.is_empty() {
         return Err(CircuitError::NoHops);
     }
     // outermost hop receives ttl=hops.len+1. Headroom
-    // of +1 means even after а forwarding hop accidentally double-
-    // counts (shouldn't happen; this is а sanity margin), the next
+    // of +1 means even after a forwarding hop accidentally double-
+    // counts (shouldn't happen; this is a sanity margin), the next
     // legitimate hop still sees ttl >= 2.
     let outermost_ttl: u8 = (hops.len() as u8).saturating_add(1);
     if outermost_ttl > MAX_CIRCUIT_TTL {
@@ -201,7 +201,7 @@ pub fn build_circuit(payload: &[u8], hops: &[Hop]) -> Result<Vec<u8>, CircuitErr
     // Wrap through preceding hops in reverse order. Each layer's
     // plaintext = `[ttl(1)][next_hop_id(32)][previous_wrap]`, where
     // next_hop_id identifies the hop AFTER this one in forward direction
-    // и ttl = (hops.len - layer_idx + 1).
+    // and ttl = (hops.len - layer_idx + 1).
     for i in (0..hops.len() - 1).rev() {
         let this_hop = hops[i];
         let next_hop_in_chain = hops[i + 1];
@@ -263,7 +263,7 @@ pub fn peel_circuit(
 ///
 /// added [`TTL_PREFIX_LEN`] = 1 to every layer; previous
 /// callers that hard-coded the old value (32 + onion-overhead) need
-/// to recompute their max-payload budgets — но единственный caller
+/// to recompute their max-payload budgets — but the only caller
 /// `packet.rs` reads this constant at runtime so the change propagates.
 pub const PER_HOP_OVERHEAD: usize = TTL_PREFIX_LEN + NEXT_HOP_ID_LEN + onion::ONION_LAYER_OVERHEAD;
 
@@ -370,7 +370,7 @@ mod tests {
         // Walk hop1 → hop2 so we can inspect hop2's plaintext (its
         // forwarding-decision view). hop2's plaintext is what hop2
         // sees AFTER hop1 peels and forwards: anonymity requires the
-        // payload + final-hop id NOT appear там.
+        // payload + final-hop id NOT appear there.
         let (sk1_real, hop1_real) = fresh_hop_with_id(0x10);
         let envelope = build_circuit(payload, &[hop1_real, hop2, hop3, hop4_final])
             .expect("build with retained sk1");
@@ -469,7 +469,7 @@ mod tests {
 
     // ── anti-loop TTL ─────────────────────────────
 
-    /// Honest 3-hop circuit produces ttl=4 outermost, decrementing к ttl=2
+    /// Honest 3-hop circuit produces ttl=4 outermost, decrementing to ttl=2
     /// at the final hop. All peels succeed.
     #[test]
     fn phase650_ttl_normal_3hop_circuit_succeeds() {
@@ -497,7 +497,7 @@ mod tests {
         }
     }
 
-    /// Reject а circuit longer than [`MAX_CIRCUIT_TTL`] - 1 hops at build
+    /// Reject a circuit longer than [`MAX_CIRCUIT_TTL`] - 1 hops at build
     /// time so an honest sender doesn't ship envelopes the receiver
     /// will silently drop.
     #[test]
@@ -512,13 +512,13 @@ mod tests {
         );
     }
 
-    /// Adversarial sender encodes ttl=0 в outermost layer. Receiver must
-    /// drop the frame с TtlExhausted before processing the next-hop-id.
+    /// Adversarial sender encodes ttl=0 in outermost layer. Receiver must
+    /// drop the frame with TtlExhausted before processing the next-hop-id.
     #[test]
     fn phase650_ttl_zero_at_peel_drops_frame() {
         use crate::onion;
         let (sk1, hop1) = fresh_hop_with_id(0x01);
-        // Hand-craft а layer plaintext с ttl=0. Bypass build_circuit
+        // Hand-craft a layer plaintext with ttl=0. Bypass build_circuit
         // (which always sets ttl > 0) by manually wrapping.
         let mut malicious_inner = Vec::new();
         malicious_inner.push(0u8); // ttl=0 — adversarial
@@ -530,7 +530,7 @@ mod tests {
     }
 
     /// Adversarial sender encodes ttl > MAX_CIRCUIT_TTL. Receiver must
-    /// drop с TtlExceedsCap (а malicious sender attempting к inflate
+    /// drop with TtlExceedsCap (a malicious sender attempting to inflate
     /// the per-circuit amplification budget beyond the configured cap).
     #[test]
     fn phase650_ttl_exceeds_cap_drops_frame() {

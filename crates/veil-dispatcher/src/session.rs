@@ -128,7 +128,7 @@ impl FrameDispatcher {
                     .unwrap_or(0);
                 // **Sleep tier** — mobile/sleeping device may have been
                 // offline (airplane mode) just before issuing this ad,
-                // so we tolerate а 10-min stale clock.  Pinned к central
+                // so we tolerate a 10-min stale clock.  Pinned to central
                 // policy
                 // [`veil_proto::time_validity::SLEEP_SKEW_SECS`].
                 const MAX_ISSUED_SKEW_SECS: u64 = veil_proto::time_validity::SLEEP_SKEW_SECS;

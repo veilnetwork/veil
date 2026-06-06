@@ -12,7 +12,7 @@
 //   * Always call [close] when done (or rely on the attached
 //     [NativeFinalizer] at line ~37, which invokes
 //     `veil_stream_close_finalizer` when the Dart object is GC'd —
-//     belt-and-suspenders against а forgotten `.close()`).
+//     belt-and-suspenders against a forgotten `.close()`).
 //
 // Threading note: the underlying FFI calls block the calling Dart thread
 // for the duration of one daemon round-trip (`block_on` in Rust on a
@@ -33,8 +33,8 @@ import 'types.dart';
 /// GC-time safety-net for [VeilStream].  Fires
 /// `veil_stream_close` if the Dart object is GC'd without an
 /// explicit [VeilStream.close] — every live stream keeps an
-/// Arc'd `VeilStreamFfi` (which itself holds an Arc к the
-/// runtime bundle), so а forgotten close stalls runtime tear-down.
+/// Arc'd `VeilStreamFfi` (which itself holds an Arc to the
+/// runtime bundle), so a forgotten close stalls runtime tear-down.
 final _veilStreamFinalizer = NativeFinalizer(
   ffi.veilStreamCloseFinalizerPtr.cast<NativeFinalizerFunction>(),
 );

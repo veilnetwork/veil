@@ -1,11 +1,11 @@
 //! Private-veil-network membership cert verification.
 //!
-//! Each member of а private network carries а cert signed by the
-//! network owner. Cert binds the member's `node_id` к а specific
+//! Each member of a private network carries a cert signed by the
+//! network owner. Cert binds the member's `node_id` to a specific
 //! `network_id` + expiry. Verifying the cert at handshake gates
-//! peers without owner authorisation от joining the network.
+//! peers without owner authorisation from joining the network.
 //!
-//! Wire format и struct definition live в `veil-types` as
+//! Wire format and struct definition live in `veil-types` as
 //! [`veil_types::MembershipCert`]; this module owns the canonical
 //! byte encoding + signature verification.
 
@@ -39,9 +39,9 @@ pub enum CertVerifyError {
     BadOwnerPubkey { message: String },
 }
 
-/// Verify а membership cert against the local network configuration.
+/// Verify a membership cert against the local network configuration.
 ///
-/// Checks (в order):
+/// Checks (in order):
 /// 1. `version` matches [`MEMBERSHIP_CERT_VERSION`].
 /// 2. `issued_at_unix <= now_unix` (not back-dated past now's tolerance).
 /// 3. `valid_until_unix > now_unix` (not expired).
@@ -73,9 +73,9 @@ pub fn verify_membership_cert(
         });
     }
     // Sentinel `valid_until_unix == 0` ⇒ no expiry (owner explicitly
-    // minted а never-expiring cert via `sign-member --no-expiry`).
+    // minted a never-expiring cert via `sign-member --no-expiry`).
     // Real-world certs sign with valid_until_unix > issued_at_unix > 0,
-    // so the sentinel can't collide с а legitimate "almost-expired-just-
+    // so the sentinel can't collide with a legitimate "almost-expired-just-
     // after-the-epoch" cert.
     if cert.valid_until_unix != 0 && cert.valid_until_unix <= now_unix {
         return Err(CertVerifyError::Expired {
@@ -135,7 +135,7 @@ pub fn canonical_cert_body(cert: &MembershipCert) -> Vec<u8> {
     out
 }
 
-/// Encode а full cert (body + signature) к а compact wire blob suitable
+/// Encode a full cert (body + signature) to a compact wire blob suitable
 /// for HELLO TLV transport. Layout:
 /// ```text
 /// [0..83]   canonical_cert_body
@@ -206,7 +206,7 @@ pub fn decode_cert_blob(blob: &[u8]) -> Result<MembershipCert, CertDecodeError> 
 pub enum CertDecodeError {
     #[error("cert blob truncated: need {need} bytes, got {got}")]
     TooShort { need: usize, got: usize },
-    #[error("cert algo byte {actual} is не recognised")]
+    #[error("cert algo byte {actual} is not recognised")]
     UnknownAlgo { actual: u8 },
     #[error("cert signature truncated: need {need} bytes, got {got}")]
     TruncatedSignature { need: usize, got: usize },
@@ -296,8 +296,8 @@ mod tests {
         let (sk, pk) = ed25519_signer();
         let net = [0x11u8; 32];
         let mut cert = make_cert(&sk, net, [0x22u8; 32], 1000, 2000, false);
-        // Flip а byte в the signed body — the cached signature now
-        // verifies а different message.
+        // Flip a byte in the signed body — the cached signature now
+        // verifies a different message.
         cert.admin = true;
         let err = verify_membership_cert(&cert, &net, SignatureAlgorithm::Ed25519, &pk, 1500)
             .expect_err("tampered");

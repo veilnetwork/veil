@@ -18,8 +18,8 @@ CXXFLAGS = "-include cstdint -include cstring"
 #   * cargo registry paths become `cargo-registry/...`
 #   * rustc-source paths get short alias
 #
-# Saves ~100-300 KB on а 15 MB release binary (depends on how many
-# panic sites the dep tree triggers) и + reproducible builds across
+# Saves ~100-300 KB on a 15 MB release binary (depends on how many
+# panic sites the dep tree triggers) and + reproducible builds across
 # developers / CI workers.
 #
 # Note: `-Z trim-paths=all` (nightly) would supersede these once stabilised.

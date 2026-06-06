@@ -80,7 +80,7 @@ impl From<CellError> for PacketError {
 /// Boxing `Forward` would add an allocation per relay-hop on the
 /// anonymity hot path (cell relay is the most-frequent operation
 /// for relay nodes). The 520-byte size penalty matters only when
-/// CellPeelResult sits в a long-lived collection — it doesn't;
+/// CellPeelResult sits in a long-lived collection — it doesn't;
 /// callers consume it immediately.
 #[derive(Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -448,7 +448,7 @@ mod tests {
     // EVERY transmission on the circuit is exactly CELL_SIZE bytes
     // so size-based correlation is reduced to chance.
     //
-    // Acceptance row: "< 10 % при padding". Below we
+    // Acceptance row: "< 10 % during padding". Below we
     // construct N=50 cells with strongly-varied payload sizes (1..= max)
     // and exercise three correlation modes:
     //
