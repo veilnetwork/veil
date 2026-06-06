@@ -24,7 +24,7 @@
 //! [..] platform_target ASCII (≤ 64 B): "linux-x86_64"
 //! "linux-aarch64", "macos-aarch64"
 //! "windows-x86_64", "android-aarch64"
-//! [..] binary_sha256 32 B (BLAKE3-or-SHA256 of the
+//! [..] binary_sha256 32 B (SHA-256 of the
 //! decompressed binary blob)
 //! [..] binary_url_count u8 (1..=8)
 //! [..] [u16 BE len + URL bytes] × N
