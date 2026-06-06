@@ -85,7 +85,7 @@ pub enum RouteOutcome {
 
 struct StreamEntry {
     /// Delivery channel to notify client A (the opener).
-    a_delivery_tx: mpsc::Sender<veil_bufpool::PooledShared>,
+    a_delivery_tx: crate::server::DeliveryQueueTx,
     /// Registry sender for client B's endpoint.
     b_endpoint_tx: mpsc::Sender<AppMessage>,
     /// Receive window: bytes A may still send to B.
@@ -154,13 +154,14 @@ impl IpcStreamTable {
     ///
     /// Returns `Some(stream_id)` on success, or `None` when the global stream
     /// limit (`MAX_TOTAL_STREAMS`) has been reached.
-    pub fn open_local(
+    pub(crate) fn open_local(
         &self,
-        a_delivery_tx: mpsc::Sender<veil_bufpool::PooledShared>,
+        a_delivery_tx: impl Into<crate::server::DeliveryQueueTx>,
         b_endpoint_tx: mpsc::Sender<AppMessage>,
         src_node_id: [u8; 32],
         initial_window: u32,
     ) -> Option<u32> {
+        let a_delivery_tx = a_delivery_tx.into();
         // Clamp the peer-advertised window to a sane ceiling (defense-in-depth;
         // memory is already bounded by the per-endpoint channel). Clamping
         // never rejects a legitimate client, which advertises the 256 KiB
