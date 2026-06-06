@@ -10,11 +10,13 @@
 #      garbled to operators on failure AND is a recognised review-obfuscation
 #      vector (e.g. Cyrillic `с` is visually indistinguishable from Latin `c`).
 #
-#   2. CI TOOLING — every line of `scripts/` and `.github/`. These files are
-#      build/release/policy infrastructure; they must be plain ASCII English so
-#      a homoglyph (`а`/`с`/`к`) can't hide in a comment that no Rust-only lint
-#      would ever scan. This detector script itself is exempt (it must contain
-#      Cyrillic to define the pattern + example above).
+#   2. CI TOOLING — every line of `scripts/`, `.github/`, `docker/`, and the
+#      root build/infra files (`.dockerignore`, `.gitignore`, `.gitattributes`).
+#      These are build/release/policy infrastructure; they must be plain ASCII
+#      English so a homoglyph (`а`/`с`/`к`) can't hide in a comment that no
+#      Rust-only lint would ever scan (this is exactly how the `.dockerignore`
+#      release-key-glob leak slipped through). This detector script itself is
+#      exempt (it must contain Cyrillic to define the pattern + example above).
 #
 # Scope notes:
 #   * Scan 1 does NOT flag Cyrillic inside ordinary `//` / `///` Rust comments —
@@ -60,20 +62,27 @@ for root, _, files in os.walk('crates'):
                 runtime_violations.append((p, i, line.strip()))
 
 tooling_violations = []
-for base in ('scripts', '.github'):
+tooling_paths = []
+for base in ('scripts', '.github', 'docker'):
     for root, _, files in os.walk(base):
         if '/target' in root:
             continue
         for f in files:
             if f == SELF:
                 continue
-            p = os.path.join(root, f)
-            try:
-                for i, line in enumerate(open(p, encoding='utf-8', errors='ignore'), 1):
-                    if CYR.search(line):
-                        tooling_violations.append((p, i, line.strip()))
-            except (IsADirectoryError, UnicodeError):
-                continue
+            tooling_paths.append(os.path.join(root, f))
+# Root-level build/infra files that no per-language lint would otherwise scan
+# (this is exactly how the .dockerignore homoglyph leak slipped through).
+for f in ('.dockerignore', '.gitignore', '.gitattributes'):
+    if os.path.isfile(f):
+        tooling_paths.append(f)
+for p in tooling_paths:
+    try:
+        for i, line in enumerate(open(p, encoding='utf-8', errors='ignore'), 1):
+            if CYR.search(line):
+                tooling_violations.append((p, i, line.strip()))
+    except (IsADirectoryError, UnicodeError):
+        continue
 
 rc = 0
 if runtime_violations:
