@@ -1,10 +1,10 @@
-//! CLI handler for `veil-cli network …` — private-veil-network
-//! admin tooling. Operators use these commands к set up а private
-//! network (generate owner key, sign member certs) и inspect/verify
-//! existing certs.
+//! CLI handler for `veil-cli network …` — admin tooling for running your
+//! own private network. These commands set up a private network (generate
+//! the owner key, sign member certificates) and inspect or verify existing
+//! certificates.
 //!
-//! Public-mode nodes don't need any of these commands — leaving
-//! `[network]` config blank keeps the open-veil behaviour.
+//! Public-mode nodes don't need any of these commands — leaving the
+//! `[network]` config blank keeps the open, public behaviour.
 
 use std::fs;
 #[cfg(unix)]

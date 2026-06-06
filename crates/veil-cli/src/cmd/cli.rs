@@ -25,59 +25,80 @@ pub struct Cli {
 pub enum Command {
     /// Manage the node configuration file.
     Config(ConfigArgs),
-    /// Generate and manage cryptographic key pairs and PoW nonces.
+    /// Generate and manage key pairs and their proof-of-work nonces.
+    ///
+    /// A nonce is a small number mined so the key's hash meets a
+    /// difficulty target — cheap to check, costly to forge, which makes
+    /// spamming fake identities expensive.
     Key(KeyArgs),
     /// Start, stop, and inspect the veil node.
     Node(NodeArgs),
-    /// Manage listeners (inbound transport endpoints).
+    /// Manage listeners — the addresses your node accepts connections on.
     Listen(ListenArgs),
-    /// Manage known peers in the config.
+    /// Manage the known peers saved in your config.
     Peers(PeersArgs),
-    /// Inspect active sessions.
+    /// Inspect the connections your node currently has open.
     Sessions(SessionsArgs),
     /// Low-level debugging tools (transport, peer connections, packet capture).
     Debug(DebugArgs),
-    /// Peer Exchange (PEX) introspection.
+    /// Inspect peer exchange (PEX) — how your node discovers other peers.
+    ///
+    /// PEX is the gossip layer that lets nodes swap lists of peers they
+    /// know about, so you find new peers without a central directory.
     Pex(PexArgs),
-    /// Sovereign-identity management.
+    /// Manage your sovereign identity (your long-lived cryptographic name).
     Identity(IdentityArgs),
-    /// Out-of-band bootstrap invites. Generate / consume
-    /// QR-/URL-style invites so a brand-new node can join the network
-    /// without depending on a hardcoded seed list (which a state-level
-    /// censor can simply IP-block).
+    /// Create and redeem bootstrap invites that get a brand-new node onto
+    /// the network.
+    ///
+    /// A bootstrap invite is a short QR code or URL you share so a friend's
+    /// fresh node can find its first peer. This avoids relying on a built-in
+    /// list of seed servers, which a country-level censor could simply block
+    /// by IP address.
     Bootstrap(BootstrapArgs),
-    /// Trusted-listener invite bundles (Phase 5c+).  Out-of-band sharing
-    /// of `Trusted` / `Hidden` listener URIs that are NOT advertised on
-    /// PEX or DHT — the operator emits а signed CBOR bundle that carries
-    /// (node_id, vk, transport URI, PSK, expiry) and hands it к the
-    /// recipient through any side channel (QR scan, encrypted chat,
-    /// physical paper).  Distinct от `bootstrap invite`: bootstrap
-    /// invites are public-listener handoff, `invite` bundles carry per-
-    /// listener PSK material so the recipient can complete the obfs4-PSK
-    /// handshake against а listener no one else can find.
+    /// Share access to a private listener that is not publicly advertised.
+    ///
+    /// Some listeners are marked "trusted" or "hidden" and are never gossiped
+    /// over PEX or the DHT, so nobody can find them on their own. To let
+    /// someone in, you generate a signed invite bundle and hand it to them
+    /// over any side channel you trust (a scanned QR code, an encrypted chat,
+    /// even paper).
+    ///
+    /// The bundle packs everything the recipient needs to connect: your node
+    /// ID, public key, transport address, the shared secret (PSK) for that
+    /// listener, and an expiry time.
+    ///
+    /// How this differs from `bootstrap invite`: a bootstrap invite just
+    /// points at a public listener. An `invite` bundle also carries the
+    /// per-listener shared secret, which is what lets the recipient connect
+    /// to a listener no one else can even see.
     Invite(InviteArgs),
-    /// Private-veil-network admin tooling: generate owner key,
-    /// issue membership certs, inspect existing certs. Required by
-    /// operators standing up а private network (`[network].mode =
-    /// "private"`); public-mode nodes don't need any of these.
+    /// Run your own private network: create the owner key and issue or
+    /// inspect membership certificates.
+    ///
+    /// Use these commands when you set `[network].mode = "private"` to stand
+    /// up a closed, invite-only network. Nodes on the default public network
+    /// never need them.
     Network(NetworkArgs),
-    /// Self-update: check for / apply signed updates from the
-    /// operator's manifest endpoints. Requires the
-    /// `[update]` config section. Works without a running node —
-    /// fetch + verify + state-file all happen out-of-band.
+    /// Check for and install signed software updates.
+    ///
+    /// Fetches an update manifest from the endpoints in your `[update]`
+    /// config section, verifies its signature and the binary's checksum,
+    /// then (for `apply`) swaps in the new binary. No running node is
+    /// required — everything happens on its own.
     Update(UpdateArgs),
-    /// Mobile-mode controls. Toggles runtime flags
-    /// that GUI wrappers / mobile-app onPause-onResume hooks
-    /// normally drive via the IPC API. Useful for: mobile app
-    /// integrators testing their integration without writing IPC
-    /// code; cron-based cellular saving (flip background mode at
-    /// night); headless deployments where the daemon acts as a
-    /// mobile gateway. Requires a running node.
+    /// Switch the node between foreground and battery-saving background mode.
+    ///
+    /// On a phone, a GUI wrapper normally flips this automatically when the
+    /// app is paused or resumed. These commands let you do it by hand —
+    /// handy when testing a mobile integration, scripting a "go quiet at
+    /// night" cron job to save cellular data, or running a headless mobile
+    /// gateway. Requires a running node.
     Mobile(MobileArgs),
-    /// Windows Service integration: register / unregister the node
-    /// with the Service Control Manager so it auto-starts on boot.
-    /// Non-Windows platforms reject all subcommands with a clear
-    /// message.
+    /// Install or remove the node as a Windows service so it starts on boot.
+    ///
+    /// Registers with the Windows Service Control Manager. On non-Windows
+    /// platforms every subcommand fails with a clear message.
     Service(ServiceArgs),
 }
 
@@ -116,113 +137,120 @@ pub struct IdentityArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum IdentityCommand {
-    /// Create a fresh sovereign identity. Displays the 24-word
-    /// BIP-39 paper-backup phrase, mines the document PoW, and
-    /// persists the per-device `instance_id` to the veil
-    /// config dir.
-    Create(IdentityCreateArgs),
-    /// Pretty-print an identity from its on-disk state
-    /// (instance_id + the most-recent signed IdentityDocument).
-    Show(IdentityShowArgs),
-    /// Rotate this device's active `identity_sk`. Loads the
-    /// master seed from the BIP-39 phrase or encrypted master
-    /// file, generates a fresh identity subkey, master-certifies
-    /// it, bumps document_version, and persists the updated
-    /// signed document.
-    Rotate(IdentityRotateArgs),
-    /// Restore a sovereign identity on a fresh device from the
-    /// 24-word BIP-39 paper-backup phrase. The master-level
-    /// `node_id` (stable across device loss) is reconstructed;
-    /// a fresh device-local `identity_sk` is generated and
-    /// master-certified under the recovered seed.
-    Restore(IdentityRestoreArgs),
-    /// Claim a human-readable name for this sovereign identity.
-    /// Mines rarity-proportional PoW, signs with the active
-    /// `identity_sk`, and persists the signed `NameClaim` under
-    /// `<veil_dir>/name_claims/<name>.bin`. The running
-    /// daemon picks it up on its next 6-hour republish tick (or
-    /// on restart) and publishes to the DHT so peers resolving
-    /// `@<name>` can find this identity.
-    ClaimName(IdentityClaimNameArgs),
-    /// Render this identity's public contact as an `veil:identity?...`
-    /// URI + a scannable QR code printed to the terminal. Used
-    /// for in-person contact exchange: Alice runs `identity qr`
-    /// Bob points his phone camera at the screen, Bob's scanner
-    /// gets the URI + (optionally via the URI's `?name=...`
-    /// parameter) the preferred display name.
-    Qr(IdentityQrArgs),
-    /// Generate a time-limited pairing invite that lets a new
-    /// device join this sovereign identity (source
-    /// side). Signs a `PairingInvite` with the active identity_sk
-    /// prints the canonical `veil:pair?...` URI + QR code, and
-    /// displays the target-device transport endpoint. The target
-    /// device scans the QR; the master-certification + OOB compare
-    /// are performed once the target dials back (follow-up slice).
-    PairInvite(IdentityPairInviteArgs),
-    /// Parse and pretty-print an `veil:identity?…` (contact) or
-    /// `veil:pair?…` (invite) URI without performing any
-    /// side-effects. Target-side diagnostic: lets the operator
-    /// confirm a scanned QR decoded cleanly and review the fields
-    /// (endpoint, expiry, node_id, …) before running the full
-    /// pair / contact-import flow.
-    InspectUri(IdentityInspectUriArgs),
-    /// Bind a TCP listener, display the canonical `veil:pair?…`
-    /// URI + QR, accept one pairing dial-back, run the source
-    /// side of the ceremony, and persist the updated
-    /// `IdentityDocument` to disk on success. Requires the
-    /// master-file password so the freshly-minted target subkey
-    /// can be master-certified.
-    PairListen(IdentityPairListenArgs),
-    /// Dial the endpoint encoded in a scanned `veil:pair?…`
-    /// URI, run the target side of the ceremony, and on success
-    /// persist the paired identity state (document + fresh
-    /// identity_sk seed + sig_key_idx override + instance_id)
-    /// into the target's `--veil-dir`.
-    PairAccept(IdentityPairAcceptArgs),
-    /// Encrypt this device's master_seed and emit it as a
-    /// scannable `veil:master-backup?…` QR.
-    /// The QR is the **photo-grade** disaster-recovery backup
-    /// for the case where both the BIP-39 paper phrase AND the
-    /// `master.enc` file are gone. Decrypting requires the QR
-    /// password — convey it out-of-band (verbal, sealed
-    /// envelope, separate password manager). Filming the QR
-    /// alone is insufficient to compromise the identity.
-    ExportQrBackup(IdentityExportQrBackupArgs),
-    /// Decrypt a `veil:master-backup?…` URI back to a
-    /// master_seed and `restore_identity` into `--veil-dir`.
-    /// Used to recover from a photographed QR backup when
-    /// neither the BIP-39 phrase nor the `master.enc` file is
-    /// available. Same end-state as `identity restore` from
-    /// BIP-39: node_id is recovered, a fresh per-device
-    /// identity_sk is generated.
-    ImportQrBackup(IdentityImportQrBackupArgs),
-    /// provision a single-device "standalone" sovereign
-    /// identity where the device key IS the master key (no separate
-    /// master keypair, no BIP-39 ceremony, no `master.enc` file).
-    /// `node_id == device_id == BLAKE3(device_pubkey)`. This is
-    /// the default UX for phone-only / laptop-only users and
-    /// matches what the runtime auto-builds on first start when no
-    /// `identity_document.bin` exists.
-    Standalone(IdentityStandaloneArgs),
-    /// master-side delegation issuance. Sign a fresh
-    /// `IdentityKey` for a new device's pubkey and append it to
-    /// the existing `IdentityDocument`. Run this on the device
-    /// holding the master seed; the resulting updated document is
-    /// transported (USB / QR / scp) to the target device.
-    DelegateDevice(IdentityDelegateDeviceArgs),
-    /// mint a `MigrationCert` linking the OLD identity
-    /// (in `--from`) к the NEW identity (in `--to`), signed by the
-    /// OLD master keypair. The cert is written к
-    /// `<--to>/migration_cert.bin` (override с `--cert-out`).
-    /// Operators who want the cert published to the DHT need a
-    /// running daemon — point the daemon at the new veil_dir и
-    /// it picks up the cert на the next maintenance tick (or use
-    /// `node dht put` directly с the printed dht-key).
+    /// Create a brand-new identity.
     ///
-    /// Security non-downgrade is enforced: the NEW identity's
-    /// master_algo MUST have security_tier ≥ the OLD's
-    /// (`hybrid > falcon512 > ed25519`). Hybrid → ed25519 will
-    /// be rejected at sign time.
+    /// Shows your 24-word recovery phrase (BIP-39 — write it down; it is the
+    /// only way to recover the identity), mines its proof-of-work, and saves
+    /// a per-device instance ID into your veil config directory.
+    Create(IdentityCreateArgs),
+    /// Show the identity stored on this device.
+    ///
+    /// Pretty-prints the saved instance ID and the most recent signed
+    /// identity document.
+    Show(IdentityShowArgs),
+    /// Roll over this device's signing subkey to a fresh one.
+    ///
+    /// Loads the master seed (from your recovery phrase or encrypted master
+    /// file), generates a new per-device subkey, signs it with the master
+    /// key, bumps the document version, and saves the updated document.
+    /// Routine key hygiene that does not change your identity's name.
+    Rotate(IdentityRotateArgs),
+    /// Restore an identity onto a new device from its recovery phrase.
+    ///
+    /// From the 24-word phrase, rebuilds your permanent identity name
+    /// (which survives losing the old device) and generates a fresh
+    /// per-device signing subkey under the recovered master seed.
+    Restore(IdentityRestoreArgs),
+    /// Claim a human-readable name (like `@alice`) for this identity.
+    ///
+    /// Mines proof-of-work (more for shorter, rarer names), signs the claim
+    /// with your active subkey, and saves it under
+    /// `<veil_dir>/name_claims/<name>.bin`. A running node publishes it to
+    /// the DHT on its next 6-hour cycle (or at restart) so that peers
+    /// looking up `@<name>` can find you.
+    ClaimName(IdentityClaimNameArgs),
+    /// Show your contact details as a QR code so others can add you.
+    ///
+    /// Prints a `veil:identity?...` link plus a scannable QR code in the
+    /// terminal — useful for exchanging contacts in person. The other
+    /// person scans it and gets your link, optionally including a preferred
+    /// display name.
+    Qr(IdentityQrArgs),
+    /// Create an invite that adds a new device to this identity (run on the
+    /// device you already have).
+    ///
+    /// Prints a one-time `veil:pair?...` link and QR code, plus the address
+    /// the new device should connect back to. The new device scans it; the
+    /// two finish pairing — including a code you compare on both screens —
+    /// when it connects back.
+    PairInvite(IdentityPairInviteArgs),
+    /// Decode a scanned `veil:identity?…` (contact) or `veil:pair?…` (invite)
+    /// link and print its contents — without changing anything.
+    ///
+    /// A safe preview: confirm a scanned QR decoded cleanly and review its
+    /// fields (address, expiry, node ID, …) before you run the real pairing
+    /// or contact-import command.
+    InspectUri(IdentityInspectUriArgs),
+    /// Wait for a new device to pair (run on the device you already have).
+    ///
+    /// Opens a listening port, prints the `veil:pair?…` link and QR code,
+    /// then accepts one incoming pairing connection and completes it. On
+    /// success the updated identity document is saved to disk. Needs your
+    /// master-file password so it can sign the new device's subkey.
+    PairListen(IdentityPairListenArgs),
+    /// Join an existing identity by pairing from the new device.
+    ///
+    /// Connects to the address in a scanned `veil:pair?…` link, completes
+    /// the pairing, and on success saves this device's identity state
+    /// (document, fresh signing key, and instance ID) into its
+    /// `--veil-dir`.
+    PairAccept(IdentityPairAcceptArgs),
+    /// Make an encrypted "last resort" backup of your identity as a QR code.
+    ///
+    /// Encrypts this device's master seed into a `veil:master-backup?…` QR
+    /// you can photograph and store safely. Use it when both your paper
+    /// recovery phrase AND your `master.enc` file are gone. Decrypting needs
+    /// the separate QR password — share that out-of-band (spoken aloud, in a
+    /// sealed envelope, or in a password manager), never with the photo.
+    /// A photo of the QR alone cannot unlock the identity.
+    ExportQrBackup(IdentityExportQrBackupArgs),
+    /// Restore your identity from a `veil:master-backup?…` QR backup.
+    ///
+    /// Decrypts the backup (made by `export-qr-backup`) and restores the
+    /// identity into `--veil-dir`. Use this when you have neither the paper
+    /// recovery phrase nor the `master.enc` file. The end result is the same
+    /// as a normal restore: your permanent name comes back and a fresh
+    /// per-device signing key is generated.
+    ImportQrBackup(IdentityImportQrBackupArgs),
+    /// Create a simple single-device identity (no separate master key).
+    ///
+    /// Here the device key IS the master key — there is no separate master
+    /// keypair, no recovery-phrase ceremony, and no `master.enc` file. This
+    /// is the easy default for phone-only or laptop-only users, and matches
+    /// what the node builds automatically on first start when no identity
+    /// exists yet. The trade-off: there is no multi-device pairing and no
+    /// paper recovery.
+    Standalone(IdentityStandaloneArgs),
+    /// Authorize an additional device to act for this identity.
+    ///
+    /// Run this on the device holding the master seed: it signs the new
+    /// device's public key and adds it to your identity document. Move the
+    /// updated document to the new device however you like (USB, QR, scp).
+    DelegateDevice(IdentityDelegateDeviceArgs),
+    /// Move to a new identity while proving it is still you (migration
+    /// certificate).
+    ///
+    /// Signs a certificate linking your OLD identity (in `--from`) to your
+    /// NEW one (in `--to`) using the old master key, so peers trust the
+    /// hand-off. The certificate is written to `<--to>/migration_cert.bin`
+    /// (override with `--cert-out`). To publish it to the DHT you need a
+    /// running node pointed at the new directory — it picks the certificate
+    /// up on its next maintenance cycle (or run `node dht put` yourself with
+    /// the printed DHT key).
+    ///
+    /// You cannot downgrade security: the new identity's algorithm must be at
+    /// least as strong as the old one (`hybrid > falcon512 > ed25519`), so a
+    /// hybrid-to-ed25519 move is refused at sign time.
     Migrate(IdentityMigrateArgs),
     /// Compute the DHT key under which an `IdentityDocument` is
     /// published, given its `node_id`. No I/O — pure
@@ -450,11 +478,10 @@ pub struct IdentityCreateArgs {
     #[arg(long, default_value = "primary")]
     pub label: String,
 
-    /// **Inert / deprecated.** Retained for CLI back-compat with
-    /// pre-refactor scripts. Identity documents no longer carry а
-    /// document-level PoW (`IdentityDocument.pow_nonce` was removed
-    /// в Phase 6.50.b). The value is accepted but does not influence
-    /// the created identity. Will be removed в а future major version.
+    /// **Deprecated and ignored.** Kept only so older scripts keep
+    /// working. Identity documents no longer carry a document-level
+    /// proof-of-work, so this value has no effect. It will be removed in a
+    /// future major version.
     #[arg(long, hide = true)]
     pub pow_difficulty: Option<u32>,
 
@@ -481,30 +508,28 @@ pub struct IdentityCreateArgs {
     #[arg(long)]
     pub yes_i_wrote_it_down: bool,
 
-    /// master-key algorithm. Three options:
-    /// * `ed25519` (default) — classical, fastest verify, BIP-39
-    ///   fully recoverable.
-    /// * `hybrid` (= `ed25519+falcon512`) — composite signatures
-    ///   from BOTH classical и Falcon-512 components. BIP-39
-    ///   phrase recovers ONLY the Ed25519 half; the file
-    ///   `<veil_dir>/master_falcon.bin` (created automatically
-    ///   mode 0o600) is the SOLE copy of the post-quantum half.
-    ///   Operators MUST back up that file alongside the paper
-    ///   phrase or the identity degrades to classical-only on
-    ///   restore (changing the node_id).
-    /// * `falcon512` — pure post-quantum master, NO classical
-    ///   half. Has **NO BIP-39 recovery path at all** — the SK is
-    ///   OsRng-derived и lives ONLY in `master_falcon.bin`. Loss
-    ///   of that file = total identity loss with no paper backup.
-    ///   Requires the explicit `--accept-no-recovery` flag.
+    /// Which signature algorithm the master key uses. Three choices:
+    ///
+    /// * `ed25519` (default) — classical, fastest to verify, fully
+    ///   recoverable from the 24-word phrase.
+    /// * `hybrid` (= `ed25519+falcon512`) — signs with BOTH a classical and
+    ///   a post-quantum (Falcon-512) key. The recovery phrase restores ONLY
+    ///   the classical half; the file `<veil_dir>/master_falcon.bin` (created
+    ///   automatically, mode 0o600) is the ONLY copy of the post-quantum
+    ///   half. You MUST back up that file alongside the paper phrase, or a
+    ///   restore falls back to classical-only and your identity name changes.
+    /// * `falcon512` — pure post-quantum master, no classical half. It has
+    ///   **no recovery phrase at all** — the secret key lives ONLY in
+    ///   `master_falcon.bin`, so losing that file means total, unrecoverable
+    ///   loss of the identity. Requires the explicit `--accept-no-recovery`
+    ///   flag.
     #[arg(long, default_value = "ed25519")]
     pub algo: String,
 
-    /// explicit acknowledgement that operator
-    /// understands `--algo=falcon512` standalone has NO recovery
-    /// path beyond the on-disk `master_falcon.bin` file. The CLI
-    /// refuses to mint a standalone Falcon-512 identity без this
-    /// flag. Hybrid и Ed25519 paths ignore it.
+    /// Confirm you understand that a standalone `--algo=falcon512` identity
+    /// has NO recovery path other than the `master_falcon.bin` file on disk.
+    /// The CLI refuses to create one without this flag. The `hybrid` and
+    /// `ed25519` paths ignore it.
     #[arg(long)]
     pub accept_no_recovery: bool,
 }
@@ -524,11 +549,11 @@ pub struct IdentityRestoreArgs {
     #[arg(long)]
     pub veil_dir: Option<PathBuf>,
 
-    /// Path to a plaintext file containing the 24-word BIP-39
-    /// recovery phrase (whitespace-delimited, case-insensitive).
-    /// Required for `--algo=ed25519` и `--algo=hybrid`. IGNORED
-    /// for `--algo=falcon512` (standalone Falcon has no BIP-39
-    /// path; pass `--master-falcon-file` instead).
+    /// Path to a plaintext file holding the 24-word recovery phrase
+    /// (whitespace-separated, case-insensitive). Required for
+    /// `--algo=ed25519` and `--algo=hybrid`. Ignored for `--algo=falcon512`
+    /// (standalone Falcon has no recovery phrase; use
+    /// `--master-falcon-file` instead).
     #[arg(long)]
     pub phrase_file: Option<PathBuf>,
 
@@ -551,28 +576,26 @@ pub struct IdentityRestoreArgs {
     #[arg(long, default_value_t = 7 * 24 * 3600)]
     pub valid_for_secs: u64,
 
-    /// master-key algorithm (mirror of `identity create
-    ///algo`). Default `ed25519`; use `hybrid` (=
-    /// `ed25519+falcon512`) к restore a post-quantum hybrid identity.
-    /// Hybrid restore REQUIRES `--master-falcon-file` к point at the
-    /// preserved `master_falcon.bin` bundle — without it the function
-    /// returns `MissingFalconMaster` rather than silently degrading к
-    /// Ed25519-only (which would change the node_id и lose name-claim
-    /// continuity). Standalone `falcon512` is rejected.
+    /// Which master-key algorithm to restore (must match what `identity
+    /// create --algo` used). Default `ed25519`; use `hybrid`
+    /// (= `ed25519+falcon512`) to restore a post-quantum hybrid identity.
+    /// A hybrid restore REQUIRES `--master-falcon-file` pointing at your
+    /// saved `master_falcon.bin` — without it the restore fails outright
+    /// rather than quietly dropping to Ed25519-only (which would change your
+    /// identity name and break your claimed `@name`). Standalone `falcon512`
+    /// cannot be restored this way and is rejected.
     #[arg(long, default_value = "ed25519")]
     pub algo: String,
 
-    /// path к the preserved `master_falcon.bin` framed
-    /// keypair bundle (`OFAM` magic, see [`MASTER_FALCON_FILE`]).
-    /// Required when `--algo=hybrid`; ignored otherwise. The bundle
-    /// is read into memory once и passed through к `restore_identity`
-    /// — после успешного restore a fresh copy is written к the new
+    /// Path to your saved `master_falcon.bin` file (the post-quantum half of
+    /// a hybrid master). Required when `--algo=hybrid`; ignored otherwise.
+    /// After a successful restore a fresh copy is written to the new
     /// `<veil_dir>/master_falcon.bin`.
     #[arg(long)]
     pub master_falcon_file: Option<PathBuf>,
 }
 
-/// arguments for `identity standalone`.
+/// Arguments for `identity standalone`.
 #[derive(Args, Debug)]
 pub struct IdentityStandaloneArgs {
     /// Overrides `~/.config/veil` (or `$VEIL_IDENTITY_DIR`)
@@ -596,7 +619,7 @@ pub struct IdentityStandaloneArgs {
     pub force: bool,
 }
 
-/// arguments for `identity delegate-device`.
+/// Arguments for `identity delegate-device`.
 #[derive(Args, Debug)]
 pub struct IdentityDelegateDeviceArgs {
     /// Source veil dir (master holder). Must contain an existing
@@ -666,24 +689,23 @@ pub struct IdentityRotateArgs {
     pub valid_for_secs: u64,
 }
 
-/// master-key migration — mint a `MigrationCert`
-/// linking the OLD identity к the NEW identity (already minted в
-/// `--to`) и signed by the OLD master keypair.
+/// Arguments for `identity migrate` — sign a `MigrationCert` linking the
+/// OLD identity to the NEW one (already created in `--to`), using the OLD
+/// master key.
 ///
-/// Pre-flight assumptions:
-/// * Operator has run `identity create` (or restored) on the NEW
-///   `--to` directory FIRST — i.e. `<--to>/identity_document.bin`
-///   already exists and binds к the NEW master.
-/// * Operator can authenticate the OLD master either via
-///   `--from-phrase-file` (BIP-39 phrase) или
-///   `--from-password-file` (master.enc password). Hybrid /
-///   standalone Falcon identities additionally read
+/// Before running, make sure:
+/// * You already ran `identity create` (or restore) in the NEW `--to`
+///   directory, so `<--to>/identity_document.bin` exists and belongs to the
+///   new master.
+/// * You can unlock the OLD master, either with `--from-phrase-file` (the
+///   recovery phrase) or `--from-password-file` (the `master.enc` password).
+///   Hybrid and standalone-Falcon identities also read
 ///   `<--from>/master_falcon.bin`.
 #[derive(Args, Debug)]
 pub struct IdentityMigrateArgs {
     /// Veil config directory of the OLD (source) identity.
-    /// Defaults to the same logic as other identity commands
-    /// (`~/.config/veil` или `$VEIL_IDENTITY_DIR`).
+    /// Defaults the same way as other identity commands
+    /// (`~/.config/veil` or `$VEIL_IDENTITY_DIR`).
     #[arg(long)]
     pub from: Option<PathBuf>,
 
@@ -693,59 +715,54 @@ pub struct IdentityMigrateArgs {
     #[arg(long)]
     pub to: PathBuf,
 
-    /// 24-word BIP-39 recovery phrase for the OLD master. Required
-    /// для Ed25519 / hybrid OLD masters; NOT applicable к
-    /// standalone-Falcon OLD masters (they have no BIP-39 path).
-    /// Mutually exclusive с `--from-password-file`.
+    /// 24-word recovery phrase for the OLD master. Required for Ed25519 and
+    /// hybrid old masters; not used for standalone-Falcon masters (they have
+    /// no recovery phrase). Cannot be combined with `--from-password-file`.
     #[arg(long)]
     pub from_phrase_file: Option<PathBuf>,
 
-    /// `master.enc` password for the OLD master. Alternative к
+    /// `master.enc` password for the OLD master. An alternative to
     /// `--from-phrase-file`.
     #[arg(long)]
     pub from_password_file: Option<PathBuf>,
 
-    /// Path к the OLD `master_falcon.bin` (framed OFAM bundle).
-    /// Required if the OLD master_algo is `hybrid` or `falcon512`.
-    /// Defaults to `<--from>/master_falcon.bin` if omitted.
+    /// Path to the OLD `master_falcon.bin` file. Required when the old
+    /// master uses `hybrid` or `falcon512`. Defaults to
+    /// `<--from>/master_falcon.bin` if omitted.
     #[arg(long)]
     pub from_master_falcon_file: Option<PathBuf>,
 
-    /// Where к write the signed `MigrationCert` blob. Default:
-    /// `<--to>/migration_cert.bin`. This file is what the running
-    /// daemon serving the NEW identity should publish to the DHT
-    /// под `migration_cert_dht_key(old_node_id)`. CLI prints the
-    /// DHT key on success so operators can manually `node dht put`
-    /// if they prefer.
+    /// Where to write the signed migration certificate. Default:
+    /// `<--to>/migration_cert.bin`. This is the file the running node for
+    /// the NEW identity should publish to the DHT. On success the command
+    /// prints the DHT key so you can publish it yourself with `node dht put`
+    /// if you prefer.
     #[arg(long)]
     pub cert_out: Option<PathBuf>,
 
-    /// Validity window in seconds for the migration cert. Capped
-    /// at MAX_MIGRATION_VALIDITY_SECS (30 days) — chains migrate
-    /// fast и certs should expire quickly so operators can't
-    /// accidentally republish stale rotations.
+    /// How long the certificate stays valid, in seconds. Capped at 30 days —
+    /// migrations happen quickly and the certificate should expire soon so
+    /// stale ones cannot be replayed later.
     #[arg(long, default_value_t = 7 * 24 * 3600)]
     pub valid_for_secs: u64,
 
-    /// после mint'a cert'а опубликовать его в DHT
-    /// немедленно через `AdminCommand::DhtPublishReplicated` (
-    /// signed-bundle publish path — local store + fan-out to К closest
-    /// live peers). Требует, чтобы запущенный daemon обслуживал
-    /// `--admin-socket` (default: `<--from>/admin.sock`). Без флага
-    /// CLI пишет cert только на диск, и оператор должен либо
-    /// дождаться daemon's republish tick, либо запустить
-    /// `node dht put` вручную.
+    /// Publish the certificate to the DHT right away instead of waiting.
     ///
-    /// Failure modes (admin-socket недоступен, peer-публикация
-    /// timed out) сурфачатся как ошибки CLI с указанием на cert
-    /// файл, который УЖЕ записан — так что повторная попытка через
-    /// `node dht put <dht_key> <cert_path>` остаётся возможна.
+    /// Pushes it through a running node — saved locally and copied out to the
+    /// closest live peers. This needs a node already serving `--admin-socket`
+    /// (default `<--from>/admin.sock`). Without this flag the command only
+    /// writes the certificate to disk, and you wait for the node's next
+    /// republish cycle or run `node dht put` by hand.
+    ///
+    /// If publishing fails (no admin socket, or the peer push times out) the
+    /// command reports an error but still points you at the certificate file,
+    /// which is already written — so you can retry with
+    /// `node dht put <dht_key> <cert_path>`.
     #[arg(long)]
     pub publish_immediately: bool,
 
-    /// путь к admin-socket для `--publish-immediately`.
-    /// Defaults к `<--from>/admin.sock`. Игнорируется без
-    /// `--publish-immediately`.
+    /// Path to the admin socket for `--publish-immediately`. Defaults to
+    /// `<--from>/admin.sock`. Ignored unless `--publish-immediately` is set.
     #[arg(long)]
     pub admin_socket: Option<PathBuf>,
 }
@@ -767,38 +784,32 @@ pub struct DifficultyArgs {
     pub difficulty: u32,
 }
 
-/// deployment-profile preset for `config init`. Affects
-/// the generated `config.toml` defaults — does NOT change the runtime
-/// behaviour of an already-running node (operator can edit the file
-/// freely after init). Mirror of the user-facing
-/// `docs/internal/censorship-target.md` doc.
+/// Starter preset for `config init`. It only seeds the defaults written
+/// into the new `config.toml` — it does NOT change an already-running
+/// node, and you are free to edit the file afterwards.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum ConfigProfile {
-    /// Dev-friendly defaults: plain TCP on `:9000`, rustls TLS, no SNI
-    /// override. Suitable for local testing and CI.
+    /// Developer-friendly defaults: plain TCP on `:9000`, rustls TLS, no SNI
+    /// override. Good for local testing and CI.
     #[default]
     Dev,
-    /// Censorship-resistant deployment target: `wss://0.0.0.0:443`
-    /// `default_sni = "www.cloudflare.com"`, mesh enabled, with
-    /// inline comments reminding the operator to build with
-    /// `--features tls-boring`. See
-    /// `docs/internal/censorship-target.md`.
+    /// Tuned to resist censorship: `wss://0.0.0.0:443`,
+    /// `default_sni = "www.cloudflare.com"`, mesh enabled, plus inline
+    /// comments reminding you to build with `--features tls-boring`.
     CensorshipTarget,
-    /// Mobile / battery-powered leaf node. Stamps:
-    /// `[mobile]` with `low_battery_threshold_pct = 30` so probe
-    /// intervals throttle 4× when the device drops below 30 %
-    /// battery.
-    /// `[mesh]` with `autodiscover_gateway = true` so a leaf
-    /// behind CGN-NAT finds upstream gateways via beacon
+    /// For a mobile or battery-powered leaf node. Seeds:
     ///
-    /// `global.discovered_peers_cache_path` set under the platform
-    /// config dir so handshake-confirmed peers survive restarts
-    /// — critical on a phone where the OS may kill
-    /// the binary at any time.
+    /// * `[mobile]` with `low_battery_threshold_pct = 30`, so probing slows
+    ///   to a quarter speed once the battery drops below 30%.
+    /// * `[mesh]` with `autodiscover_gateway = true`, so a leaf stuck behind
+    ///   a carrier-grade NAT can find upstream gateways automatically.
+    /// * `global.discovered_peers_cache_path` under the platform config
+    ///   directory, so confirmed peers survive restarts — important on a
+    ///   phone, where the OS may kill the app at any time.
     ///
-    /// Identity + listen are left to the operator: a leaf typically
-    /// uses no `[[listen]]` entry (outbound-only) and connects to
-    /// gateways via the cached + auto-discovered list.
+    /// Identity and listeners are left to you: a leaf usually has no
+    /// `[[listen]]` entry (outbound only) and reaches gateways through the
+    /// cached and auto-discovered list.
     Mobile,
 }
 
@@ -816,16 +827,16 @@ pub enum ConfigCommand {
         /// Overwrite an existing config file.
         #[arg(short, long)]
         force: bool,
-        /// deployment-profile preset. When set, the
-        /// generated config is pre-tuned for the given environment
-        /// instead of the dev-friendly default. See
-        /// `docs/internal/censorship-target.md` for the full rationale.
+        /// Starter preset to tune the generated config for a particular
+        /// environment instead of the developer default.
         ///
         /// Profiles:
         /// * `dev` (default) — plain TCP on 9000, rustls TLS, no SNI override.
-        /// * `censorship-target` — `wss://0.0.0.0:443`, `default_sni
-        /// = "www.cloudflare.com"`, mesh enabled, comments
-        ///   reminding operator to build with `--features tls-boring`.
+        /// * `censorship-target` — `wss://0.0.0.0:443`,
+        ///   `default_sni = "www.cloudflare.com"`, mesh enabled, with comments
+        ///   reminding you to build with `--features tls-boring`.
+        /// * `mobile` — battery-aware leaf node (see the `--profile mobile`
+        ///   value help for details).
         #[arg(long, value_name = "NAME", default_value = "dev")]
         profile: ConfigProfile,
     },
@@ -862,26 +873,24 @@ pub enum ConfigCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Sign the active config file in place using the operator's
-    /// `[identity]` keypair (Этап 11 slice 11b).  After signing, the
-    /// file gains а `# VEIL_CONFIG_SIGNATURE_V1: <base64>` comment
-    /// header at the top.  Subsequent loads verify the signature и
-    /// surface а WARN log if it fails — see slice 11a docstring on
-    /// `veil_cfg::signed_config` для the threat model.
+    /// Sign the config file with your `[identity]` key so tampering can be
+    /// detected.
     ///
-    /// Re-signing an already-signed file replaces the previous
-    /// signature header.  The operator's `[identity].private_key`
-    /// must be present и match the file's `[identity].public_key`;
-    /// otherwise the call fails fast (no partial write).
+    /// Signing adds a `# VEIL_CONFIG_SIGNATURE_V1: <base64>` comment line at
+    /// the top of the file. From then on, loading the config checks that
+    /// signature and logs a warning if it no longer matches.
+    ///
+    /// Signing a file that is already signed replaces the old signature line.
+    /// Your `[identity].private_key` must be present and match the file's
+    /// `[identity].public_key`, or the command stops without writing
+    /// anything.
     Sign {
-        /// Unix timestamp embedded in the signed envelope.  Defaults
-        /// к `SystemTime::now()` so re-signing always advances the
-        /// `issued_at_unix` field.
+        /// Unix timestamp to record inside the signature. Defaults to the
+        /// current time, so re-signing always moves this forward.
         #[arg(long, value_name = "UNIX_SECS")]
         issued_at: Option<u64>,
-        /// Print the signed config к stdout instead of writing back
-        /// to the file.  Useful для dry-run or piping into а secure
-        /// storage system.
+        /// Print the signed config to stdout instead of writing it back to
+        /// the file. Useful for a dry run or piping into secure storage.
         #[arg(long)]
         stdout: bool,
     },
@@ -935,7 +944,7 @@ pub enum PexCommand {
     Status,
 }
 
-/// — out-of-band bootstrap invites.
+/// Out-of-band bootstrap invites.
 #[derive(Args, Debug)]
 pub struct BootstrapArgs {
     #[command(subcommand)]
@@ -960,12 +969,13 @@ pub enum BootstrapCommand {
         /// Also render an ASCII / half-block QR alongside the URI.
         #[arg(long, default_value_t = false)]
         qr: bool,
-        /// Wrap the invite in a password-protected envelope (
-        /// Distribute the URL on a large public channel
-        /// and the password on a small private channel.
+        /// Lock the invite in a password-protected envelope. Hand out the URL
+        /// on a wide public channel and the password on a small private one,
+        /// so neither alone is enough to use the invite.
         ///
-        /// DEPRECATED: argv secrets leak via `ps` / `/proc/<pid>/cmdline`
-        /// and shell history — prefer `--password-file`.
+        /// DEPRECATED: a password on the command line can leak via `ps`,
+        /// `/proc/<pid>/cmdline`, and shell history — prefer
+        /// `--password-file`.
         #[arg(long, value_name = "PASSWORD")]
         password: Option<String>,
         /// Read the envelope password from a file (`-` reads stdin) instead
@@ -973,13 +983,12 @@ pub enum BootstrapCommand {
         /// trimmed. Takes precedence over `--password`.
         #[arg(long, value_name = "PATH")]
         password_file: Option<PathBuf>,
-        /// Sign the invite with the local `[identity]` keypair (
-        /// Recipient verifies the signature against your
-        /// pubkey, distributed out-of-band. Output URL uses the
-        /// `veil:signed-invite?…` scheme. Mutually exclusive with
-        /// `--password`; combine the two by signing the encrypted URL
-        /// in two passes if both attestation AND channel secrecy are
-        /// needed.
+        /// Sign the invite with your local `[identity]` key so the recipient
+        /// can confirm it really came from you (verified against your public
+        /// key, which you share separately). The output URL uses the
+        /// `veil:signed-invite?…` scheme. Cannot be combined with
+        /// `--password`; if you need both proof-of-origin AND a private
+        /// channel, sign first and then encrypt the resulting URL.
         #[arg(long, default_value_t = false)]
         sign: bool,
         /// Validity window for `--sign` in seconds (default 1 hour;
@@ -1048,7 +1057,7 @@ pub enum BootstrapCommand {
     },
 }
 
-/// — trusted-listener invite bundles (Phase 5c+).
+/// Invite bundles for trusted / hidden (non-advertised) listeners.
 #[derive(Args, Debug)]
 pub struct InviteArgs {
     #[command(subcommand)]
@@ -1057,69 +1066,73 @@ pub struct InviteArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum InviteCommand {
-    /// Generate a signed `InviteBundleV1` for а configured listener и
-    /// emit it as base32 text + optional QR.  The recipient takes the
-    /// bundle и runs `invite accept` to install the listener's PSK и
-    /// add the inviter as а bootstrap peer.
+    /// Create a signed invite bundle for one of your listeners.
+    ///
+    /// Outputs the bundle as base32 text (and optionally a QR code). The
+    /// recipient runs `invite accept` on it to install the listener's shared
+    /// secret (PSK) and add you as a bootstrap peer.
     ///
     /// Requires:
-    /// * `[identity]` is configured (Ed25519 only — bundle signing
-    ///   currently expects ed25519-dalek `SigningKey`).
-    /// * The selected listener has `visibility = "trusted"` or
-    ///   `"hidden"` (we refuse к emit invites for `Public` listeners
-    ///   so operators don't accidentally distribute а PSK that's
-    ///   redundant — anyone can find Public via PEX).
-    /// * The listener carries а `psk_file` so the bundle can embed
-    ///   the actual PSK bytes the recipient needs.
+    /// * `[identity]` is configured (Ed25519 only — bundle signing currently
+    ///   supports Ed25519 keys).
+    /// * The chosen listener is `visibility = "trusted"` or `"hidden"`. The
+    ///   CLI refuses to make invites for `Public` listeners, since their
+    ///   shared secret would be pointless — anyone can already find a public
+    ///   listener via PEX.
+    /// * The listener has a `psk_file`, so the bundle can include the shared
+    ///   secret the recipient needs.
     Create {
-        /// Numeric listener ID (decimal or `0x…` hex) as shown в `listen
-        /// list`.  Must reference а Trusted / Hidden listener.
+        /// Listener ID (decimal or `0x…` hex) as shown in `listen list`.
+        /// Must be a trusted or hidden listener.
         #[arg(long, value_name = "LISTEN_ID")]
         listener_id: veil_cfg::ListenId,
-        /// Validity window в seconds.  Capped at 1 year by sanity check
-        /// here; bundle itself carries а raw `exp` unix timestamp so
-        /// downstream verifiers can apply their own policies.
+        /// How long the invite stays valid, in seconds. Capped at 1 year
+        /// here; the bundle stores a raw expiry timestamp, so anyone
+        /// verifying it later can also apply their own policy.
         #[arg(long, value_name = "SECS", default_value_t = 7 * 24 * 3600)]
         validity_secs: u64,
-        /// Optional human-readable label encoded into the bundle (e.g.
-        /// "family group"). ≤ 64 bytes after UTF-8 encoding.
+        /// Optional human-readable label baked into the bundle (e.g.
+        /// "family group"). At most 64 bytes once UTF-8 encoded.
         #[arg(long, value_name = "TEXT")]
         label: Option<String>,
-        /// Write the base32 bundle к а file instead of stdout. Useful
-        /// for piping into email / messenger attachments without shell
-        /// escaping the long base32 string.
+        /// Write the base32 bundle to a file instead of stdout. Handy for
+        /// attaching to an email or message without the shell mangling the
+        /// long base32 string.
         #[arg(long, value_name = "FILE")]
         output: Option<PathBuf>,
-        /// Also render а Unicode-art QR code beneath the base32 bundle
-        /// so the recipient can scan it of the terminal с а phone camera.
+        /// Also draw a QR code beneath the base32 bundle so the recipient can
+        /// scan it off the screen with a phone camera.
         #[arg(long, default_value_t = false)]
         qr: bool,
     },
-    /// Decode + verify an `InviteBundleV1` и install its material into
-    /// the local config: append the inviter to `[[bootstrap_peers]]`
-    /// (idempotent on node_id) и write the embedded PSK к а file under
-    /// `<veil_dir>/invite_psks/` для future re-use.  Stops with а
-    /// clear error if the bundle's signature, expiry, or version checks
-    /// fail.
+    /// Accept an invite bundle and install what it contains.
+    ///
+    /// Verifies the bundle, then adds the inviter to `[[bootstrap_peers]]`
+    /// (no duplicate if already present) and saves the embedded shared secret
+    /// (PSK) to a file under `<veil_dir>/invite_psks/` for later use. Stops
+    /// with a clear error if the bundle's signature, expiry, or version is
+    /// bad.
     Accept {
-        /// Input path containing the base32 bundle text. Use `-` к read
-        /// от stdin (paste the bundle text).
+        /// Path to the file holding the base32 bundle text. Use `-` to read
+        /// it from stdin (paste the bundle).
         #[arg(long, value_name = "FILE")]
         input: PathBuf,
-        /// Optional override для where the PSK is saved. Default:
-        /// `<config_dir>/invite_psks/<node_id_hex>.psk`. File is
-        /// created с 0o600 perms.
+        /// Optional override for where the shared secret is saved. Default:
+        /// `<config_dir>/invite_psks/<node_id_hex>.psk`. The file is created
+        /// with 0o600 permissions.
         #[arg(long, value_name = "FILE")]
         psk_out: Option<PathBuf>,
-        /// Skip mutating the on-disk config — just verify the bundle и
-        /// drop the PSK file. Useful когда the operator wants к review
-        /// the inviter manually before adding к bootstrap_peers.
+        /// Do not touch the config file — just verify the bundle and write
+        /// out the shared-secret file. Useful when you want to review the
+        /// inviter by hand before adding them to your bootstrap peers.
         #[arg(long, default_value_t = false)]
         no_update_config: bool,
     },
-    /// Decode + verify а bundle и pretty-print its fields, WITHOUT any
-    /// side effects.  Recipient-side preflight: "before I `accept`,
-    /// what's inside this thing?"
+    /// Verify an invite bundle and print its contents, without changing
+    /// anything.
+    ///
+    /// A recipient-side preview: "before I `accept` this, what's actually
+    /// inside it?"
     Decode {
         /// Input file (base32 text). `-` reads from stdin.
         #[arg(long, value_name = "FILE")]
@@ -1127,7 +1140,7 @@ pub enum InviteCommand {
     },
 }
 
-/// — operator-facing CLI for mobile-mode controls.
+/// Mobile-mode controls (foreground vs. background / battery-saving).
 #[derive(Args, Debug)]
 pub struct MobileArgs {
     #[command(subcommand)]
@@ -1168,7 +1181,7 @@ impl OnOff {
     }
 }
 
-/// — operator-facing CLI for the signed-update mechanism.
+/// Controls for the signed software-update mechanism.
 #[derive(Args, Debug)]
 pub struct UpdateArgs {
     #[command(subcommand)]
@@ -1183,40 +1196,41 @@ pub struct UpdateArgs {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum UpdateCommand {
-    /// Check whether a newer signed manifest is published at the
-    /// operator's endpoints. Reads `[update]` from config + the
-    /// installed-version state file (when configured); fetches
-    /// each manifest URL with failover; verifies issuer signature
-    /// and SHA-256 of the binary in the manifest; prints either
+    /// See whether a newer signed release is available.
+    ///
+    /// Reads `[update]` from your config (and the installed-version file, if
+    /// set), fetches each manifest URL with failover, and verifies the
+    /// publisher's signature and the binary's checksum. Prints either
     /// "up to date" or "v1.2.3 available — released YYYY-MM-DD".
-    /// Exits with status 0 = up-to-date, 1 = update available, 2 = error.
+    ///
+    /// Exit codes: 0 = up to date, 1 = update available, 2 = error.
     Check,
-    /// Apply a published update: fetch + SHA-256-verify the binary
-    /// atomically replace `update.install_path`, persist the new
-    /// release_unix to `update.installed_version_path`. Identity
-    /// files are NOT touched. Requires both `update.install_path`
-    /// and `update.installed_version_path` to be set in config.
-    /// Operator restarts the process out-of-band (systemd /
-    /// `veil-cli node restart` / SIGTERM-and-respawn) AFTER
-    /// this command exits 0; the new binary takes effect on next
-    /// `exec`. No-op when no update is available.
+    /// Download and install a published update.
+    ///
+    /// Fetches the new binary, checks its SHA-256, atomically swaps it into
+    /// `update.install_path`, and records the new release time in
+    /// `update.installed_version_path`. Your identity files are left
+    /// untouched. Both of those config paths must be set.
+    ///
+    /// After this exits 0, restart the process yourself (systemd,
+    /// `veil-cli node restart`, or stop-and-respawn) — the new binary takes
+    /// effect on the next start. Does nothing if no update is available.
     Apply,
-    /// build + sign an `UpdateManifest` for a freshly-built
-    /// binary. Used by the release CI workflow to produce the signed
-    /// blob that operators distribute alongside the binary. The
-    /// manifest is written to stdout (or `--output` file) as raw
-    /// bytes; consumers of the binary fetch this manifest, verify
-    /// the signature against a known issuer pubkey, and SHA-256-check
-    /// the binary they downloaded against `binary_sha256` в the
-    /// manifest before installing.
+    /// Build and sign an update manifest for a freshly built binary.
+    ///
+    /// Used by the release pipeline to produce the signed blob that operators
+    /// hand out alongside a binary. The manifest is written to stdout (or the
+    /// `--output` file) as raw bytes. Whoever downloads the binary fetches
+    /// this manifest, checks its signature against a known publisher key, and
+    /// verifies the binary's SHA-256 against the manifest before installing.
     SignManifest(SignManifestArgs),
 }
 
-/// Args для `veil-cli update sign-manifest`.
+/// Arguments for `veil-cli update sign-manifest`.
 #[derive(Args, Debug)]
 pub struct SignManifestArgs {
-    /// Path к the built binary file. SHA-256 будет computed of this
-    /// file and embedded в the manifest.
+    /// Path to the built binary file. Its SHA-256 is computed and recorded in
+    /// the manifest.
     #[arg(long)]
     pub binary: std::path::PathBuf,
 
@@ -1232,10 +1246,10 @@ pub struct SignManifestArgs {
     #[arg(long)]
     pub min_compatible_version: String,
 
-    /// Target triple (e.g. "x86_64-unknown-linux-gnu"). Update-check
-    /// matches this against the running platform; mismatched
-    /// platforms are silently skipped так that ONE manifest URL set
-    /// can serve manifests for multiple targets.
+    /// Target triple (e.g. "x86_64-unknown-linux-gnu"). `update check`
+    /// matches this against the running platform and silently skips
+    /// manifests for other platforms, so one set of manifest URLs can serve
+    /// several targets.
     #[arg(long)]
     pub platform_target: String,
 
@@ -1246,22 +1260,21 @@ pub struct SignManifestArgs {
     #[arg(long = "binary-url", required = true, num_args = 1..)]
     pub binary_urls: Vec<String>,
 
-    /// Path к the issuer's identity TOML file (same shape as
-    /// `[identity]` в node config — `algo`, `public_key`, `private_key`).
-    /// The release-signing key is typically distinct от a daemon
-    /// identity; cold-storage in operator's HSM / paper backup.
+    /// Path to the publisher's identity TOML file (same shape as `[identity]`
+    /// in a node config — `algo`, `public_key`, `private_key`). The
+    /// release-signing key is usually separate from any node identity and
+    /// kept in cold storage (an HSM or paper backup).
     #[arg(long)]
     pub identity: std::path::PathBuf,
 
-    /// Output path for the signed manifest bytes. When omitted
-    /// writes к stdout.
+    /// Where to write the signed manifest bytes. Writes to stdout when
+    /// omitted.
     #[arg(long, short)]
     pub output: Option<std::path::PathBuf>,
 
-    /// Override the manifest's `release_unix` timestamp. Defaults
-    /// to current time; operators may pin к `SOURCE_DATE_EPOCH` for
-    /// reproducible-build verification (manifest bytes deterministic
-    /// от inputs).
+    /// Override the manifest's `release_unix` timestamp. Defaults to the
+    /// current time; you can pin it to `SOURCE_DATE_EPOCH` for reproducible
+    /// builds (so the manifest bytes depend only on the inputs).
     #[arg(long)]
     pub release_unix: Option<u64>,
 }
@@ -1288,23 +1301,24 @@ pub enum NodeCommand {
         foreground: bool,
         #[arg(long, hide = true)]
         daemon_child: bool,
-        /// Start daemon без а config file using an ephemeral stub
-        /// identity, и await а runtime `admin apply-config` к provide
-        /// the actual config.
+        /// Start the daemon with no config file, using a throwaway temporary
+        /// identity, and wait for a later `admin apply-config` to supply the
+        /// real config.
         ///
         /// Use cases:
-        /// * **Messenger / embedded** — app keeps the real config in а
-        ///   secure storage backend (Keychain / EncryptedSharedPreferences /
-        ///   future TPM-sealed store) и avoids ever writing it to а
-        ///   regular file.  Pair с `admin apply-config --no-persist`.
-        /// * **Orchestrated provisioning** — start daemons за headed-up
-        ///   identity, then push generated configs at deploy-time без
-        ///   shipping the config file alongside the binary.
+        /// * **Messenger / embedded** — the app keeps the real config in a
+        ///   secure store (Keychain, EncryptedSharedPreferences, a future
+        ///   TPM-sealed store) and never writes it to an ordinary file. Pair
+        ///   this with `admin apply-config --no-persist`.
+        /// * **Orchestrated provisioning** — start daemons first, then push
+        ///   their generated configs at deploy time, without shipping the
+        ///   config file next to the binary.
         ///
-        /// The stub identity is а **fresh per-daemon-run Ed25519 keypair**;
-        /// it lives только в RAM, ephemeral working files (mlkem.key etc.)
-        /// land в а per-run temp directory that's cleaned up on shutdown.
-        /// Network listens и peers are empty until `apply-config` arrives.
+        /// The temporary identity is a **fresh Ed25519 keypair for this run
+        /// only**; it lives purely in RAM, and short-lived working files
+        /// (mlkem.key and so on) go in a per-run temp directory that is
+        /// cleaned up at shutdown. No listeners or peers are active until
+        /// `apply-config` arrives.
         #[arg(long)]
         defer_init: bool,
     },
@@ -1314,29 +1328,31 @@ pub enum NodeCommand {
     Restart,
     /// Reload the config file without restarting (SIGHUP equivalent).
     Reload,
-    /// Apply а new config to the running daemon без going через the filesystem.
+    /// Push a new config to the running daemon without writing it to disk.
     ///
-    /// Distinct от `reload`: reads the config TOML bytes inline (от а
-    /// file path или stdin) и pushes them к the daemon over IPC.  Used by:
+    /// Unlike `reload`, this reads the config TOML directly (from a file path
+    /// or stdin) and hands the bytes to the daemon over its admin channel.
+    /// Used for:
     ///
-    /// * **Messenger build** — app keeps config в а secure storage backend
-    ///   (Keychain / EncryptedSharedPreferences / future TPM-sealed store)
-    ///   и passes the bytes к the embedded daemon at startup.  Defaults to
-    ///   `--no-persist` so the bytes never touch the regular filesystem.
-    /// * **Server admin** — orchestration tools (Terraform / ansible / scripts)
-    ///   piping the rendered config к `apply-config -` directly без an
-    ///   intermediate file (more atomic than `cp + reload`).  Use `--persist`
-    ///   so the new config survives daemon restarts.
-    /// * **Deferred-init** — combined с `node run --defer-init`, this is
-    ///   the path the daemon promotes от "stub" к "fully operational".
+    /// * **Messenger build** — the app keeps the config in a secure store
+    ///   (Keychain, EncryptedSharedPreferences, a future TPM-sealed store)
+    ///   and passes the bytes to the embedded daemon at startup. Defaults to
+    ///   `--no-persist` so the bytes never hit the ordinary filesystem.
+    /// * **Server admin** — orchestration tools (Terraform, Ansible, scripts)
+    ///   pipe the rendered config straight to `apply-config -` with no
+    ///   intermediate file (more atomic than `cp` then `reload`). Use
+    ///   `--persist` so the new config survives daemon restarts.
+    /// * **Deferred init** — together with `node run --defer-init`, this is
+    ///   how the daemon goes from its temporary identity to fully
+    ///   operational.
     ApplyConfig {
-        /// Path к the config TOML file, or `-` к read from stdin.
+        /// Path to the config TOML file, or `-` to read it from stdin.
         #[arg(value_name = "PATH_OR_DASH")]
         path: std::path::PathBuf,
-        /// Persist the new config к the daemon's `config_path` on disk
-        /// after а successful apply.  Default is **no-persist** —
-        /// matches the messenger / embedded use case where the host
-        /// owns config storage в an external secure backend.
+        /// After a successful apply, also write the new config to the
+        /// daemon's `config_path` on disk. The default is no-persist, which
+        /// matches the messenger / embedded case where the host keeps config
+        /// in its own secure store.
         #[arg(long)]
         persist: bool,
     },
@@ -1353,15 +1369,16 @@ pub enum NodeCommand {
     Metrics,
     /// DHT introspection: K/V store, routing table, manual get/put.
     Dht(DhtArgs),
-    /// resolve a sovereign `IdentityDocument` from the DHT
-    /// and run full cryptographic verification (signature chain
-    /// expiry windows, sig_key_idx bounds, node_id ↔ master_pubkey
-    /// binding, and substitution check `doc.node_id == requested`).
+    /// Look up another node's identity on the DHT and fully verify it.
     ///
-    /// Distinct from `node dht recursive-get` — that returns raw bytes
-    /// the operator must interpret manually (and probably skips the
-    /// signature step). This verb is the only safe surface for any
-    /// caller that wants to act on the resolved identity.
+    /// Fetches the signed identity document for a node ID and checks
+    /// everything: the signature chain, expiry windows, key bounds, that the
+    /// node ID matches the master key, and that the document is the one you
+    /// asked for (not a swapped-in substitute).
+    ///
+    /// Prefer this over `node dht recursive-get`, which just returns raw
+    /// bytes you'd have to verify yourself. This is the safe way to look up
+    /// an identity you intend to act on.
     ResolveIdentity {
         /// 32-byte node_id as 64 lowercase hex chars.
         #[arg(value_name = "NODE_ID")]
@@ -1370,11 +1387,11 @@ pub enum NodeCommand {
         #[arg(long, default_value = "5000")]
         timeout_ms: u64,
     },
-    /// resolve `@name` → ValidatedIdentity, walking the
-    /// `NameClaim` → `IdentityDocument` chain with full verification
-    /// (PoW difficulty, freshness-hour skew, name-binding check
-    /// signature against the document's active subkey). Accepts
-    /// either `alice` or `@alice`.
+    /// Look up who owns a `@name` and fully verify the result.
+    ///
+    /// Follows the name claim through to its identity document, checking the
+    /// proof-of-work, freshness, and that the name is really signed by that
+    /// identity's active key. Accepts either `alice` or `@alice`.
     ResolveName {
         /// The name to resolve, with or without leading `@`.
         #[arg(value_name = "NAME")]
@@ -1383,14 +1400,16 @@ pub enum NodeCommand {
         #[arg(long, default_value = "5000")]
         timeout_ms: u64,
     },
-    /// probe NAT traversal candidates for a peer
-    /// by routing through any currently-connected peer as the
-    /// signaling coordinator. Surfaces the target's `NatProbeReply`
-    /// candidates that a phone behind CGN-NAT could feed into UDP
-    /// hole-punching to establish a direct path to another NAT'd peer.
+    /// Discover the network addresses another peer could be reached at
+    /// (NAT traversal).
     ///
-    /// Tries up to 4 coordinators (closer-to-target peers first by
-    /// XOR distance), per-coordinator timeout configurable.
+    /// Asks a peer you're already connected to relay the request, and reports
+    /// the target's candidate addresses. A device stuck behind a carrier-grade
+    /// NAT can feed these into UDP hole-punching to open a direct path to
+    /// another NAT'd peer.
+    ///
+    /// Tries up to 4 relays (closest to the target first); the per-relay
+    /// timeout is configurable.
     NatProbe {
         /// 32-byte node_id of the peer whose candidates we want.
         #[arg(value_name = "TARGET_NODE_ID")]
@@ -1404,27 +1423,32 @@ pub enum NodeCommand {
     DiscoveryList,
     /// List node IDs currently attached to this gateway.
     GatewayList,
-    /// leaf-side mesh status — list auto-discovered gateways
-    /// (best-first by latency+battery score) with active/standby state
-    /// RTT, battery, freshness. Answers "why am I (not) connected via X".
+    /// Show which mesh gateways this leaf node is using and why.
+    ///
+    /// Lists the gateways found automatically, best first (scored on latency
+    /// and battery), with each one's active/standby state, round-trip time,
+    /// battery, and freshness. Answers "why am I (or am I not) connected
+    /// through gateway X?".
     MeshStatus,
-    /// bootstrap-chain diag — show the operator the state of
-    /// every bootstrap defense layer (operator-curated peers, builtin
-    /// seeds, DNS bootstrap domain, discovered-peer cache from prior
-    /// runs). Pure snapshot, no probes. Answers "if a censor takes
-    /// down my known seed IPs tomorrow, what fallback do I have?".
+    /// Show the state of every way your node can find its first peer.
+    ///
+    /// A read-only snapshot (no probing) of each bootstrap fallback layer:
+    /// your own curated peers, the built-in seed list, the DNS bootstrap
+    /// domain, and peers cached from previous runs. Answers "if a censor
+    /// blocks my known seed IPs tomorrow, what do I fall back to?".
     BootstrapStatus,
-    /// update-mechanism status snapshot. Renders
-    /// "configured? installed_release_unix? auto-poll cadence?
-    /// background mode active?" — operator verifies setup AND
-    /// GUI tray icons render badges WITHOUT grepping logs OR
-    /// re-running the network-touching `update check`. No
-    /// network I/O.
+    /// Show the software-update status without touching the network.
+    ///
+    /// Reports whether updates are configured, the installed release, the
+    /// auto-check interval, and whether background mode is active. Lets you
+    /// (or a GUI tray icon) confirm the setup without reading logs or running
+    /// the network-touching `update check`.
     UpdateStatus,
-    /// mobile-mode runtime status snapshot.
-    /// Renders battery level + scaling factors + config — answers
-    /// "why is my keepalive 30 min when I expected 30s?".
-    /// Complements `update-status`; both pure read-over-state.
+    /// Show the current mobile / battery-saving status.
+    ///
+    /// Reports battery level, the scaling factors in effect, and the relevant
+    /// config — answers "why is my keepalive 30 minutes when I expected 30
+    /// seconds?". Like `update-status`, it only reads existing state.
     MobileStatus,
     /// List all non-expired route cache entries. Optional `<dst_node_id>`
     /// filter narrows output to a single destination — useful when the cache
@@ -1438,32 +1462,30 @@ pub enum NodeCommand {
     },
     /// Manually trigger a route discovery search.
     DiscoverySearch,
-    /// Hot-standby transport handover).
+    /// Move an open session to a different transport without reconnecting.
     ///
-    /// Spawns a one-shot warm-probe that dials `--alt-uri` and runs the
-    /// three-frame handoff protocol on the primary session to `--peer`.
-    /// On success the session keeps its `session_id` and AEAD state but
-    /// its underlying byte pipe moves to the new transport — no OVL1
-    /// re-handshake.
+    /// Dials `--alt-uri` and hands off the existing session to `--peer` onto
+    /// it. The session keeps its identity and encryption state — only the
+    /// underlying connection changes, so there is no fresh handshake and no
+    /// interruption.
     ///
-    /// Typical operator use: switch a peer's TLS session to WSS when a
-    /// middlebox starts dropping TLS traffic. Example:
+    /// Typical use: move a peer's TLS session to WSS when a middlebox starts
+    /// dropping TLS traffic. Example:
     ///
-    /// veil-cli node swap-transport \
-    ///peer <64-hex node_id> \
-    ///alt-uri wss://peer.example:8443/veil
+    ///   veil-cli node swap-transport \
+    ///     --peer <64-hex node_id> \
+    ///     --alt-uri wss://peer.example:8443/veil
     ///
-    /// Both ends must run a build that includes stage (b)/(d) of
-    /// (this command ships only the initiator-side drive; the accept-side
-    /// peek-and-dispatch is always on).
+    /// Both ends must run a build that supports transport handover. This
+    /// command only drives the initiating side; the receiving side handles
+    /// handovers automatically.
     SwapTransport {
-        /// 64-hex `node_id` of the peer whose primary session to migrate.
+        /// 64-hex `node_id` of the peer whose session to move.
         #[arg(long = "peer", value_name = "NODE_ID")]
         peer_node_id: String,
-        /// Transport URI to dial (e.g. `tls://peer:9906`
-        /// `wss://peer:8443/veil`). Scheme does not have to differ
-        /// from the primary — the command is happy to migrate within
-        /// the same scheme if the operator asks for that.
+        /// Transport URI to dial (e.g. `tls://peer:9906` or
+        /// `wss://peer:8443/veil`). The scheme need not differ from the
+        /// current one — moving within the same scheme is fine.
         #[arg(long = "alt-uri", value_name = "URI")]
         alt_uri: String,
     },
@@ -1504,24 +1526,24 @@ pub enum DhtCommand {
         #[arg(value_name = "VALUE", help = "Value bytes as hex")]
         value: String,
     },
-    /// 486.4: store a key-value pair locally AND fan out
-    /// к the K closest live peers in keyspace via the Kademlia
-    /// replication path. Used by `bootstrap publish` and by
-    /// `identity migrate --publish-immediately`; exposed as a
-    /// generic CLI verb so operators can republish arbitrary
-    /// content (e.g. a freshly-restored IdentityDocument that
-    /// dropped off the DHT after every replica's TTL expired).
-    /// `--value-file` is a convenience: the file's contents are
-    /// hex-encoded и sent as the value. Mutually exclusive с
-    /// `--value` (raw hex).
+    /// Store a key-value pair locally AND replicate it to the network.
+    ///
+    /// Saves the pair on this node and copies it out to the closest live
+    /// peers in the keyspace. Used internally by `bootstrap publish` and
+    /// `identity migrate --publish-immediately`, and exposed here so you can
+    /// re-publish arbitrary data yourself — for example an identity document
+    /// that fell off the DHT after every copy's lifetime expired.
+    ///
+    /// `--value-file` is a shortcut: the file's contents are hex-encoded for
+    /// you. It cannot be combined with `--value` (raw hex).
     PublishReplicated {
         #[arg(value_name = "KEY", help = "32-byte key as 64 hex chars")]
         key: String,
-        /// Value bytes as hex string (mutually exclusive с
+        /// Value bytes as a hex string (cannot be combined with
         /// `--value-file`).
         #[arg(long, conflicts_with = "value_file")]
         value: Option<String>,
-        /// Read value bytes from this file и hex-encode automatically.
+        /// Read value bytes from this file and hex-encode them automatically.
         #[arg(long)]
         value_file: Option<PathBuf>,
     },
@@ -1671,13 +1693,13 @@ pub enum DebugCommand {
         #[arg(long, default_value_t = 5000, help = "Per-hop timeout (ms)")]
         timeout: u64,
     },
-    /// Send an app message via source-routed relay path (audit batch 2026-05-23).
+    /// Send an app message along an explicit relay path you specify.
     ///
-    /// Bypasses DHT lookups + route-cache gossip — каждый relay просто
-    /// forwards к the next node listed в `--path`.  Works в any
-    /// topology где the path's session-chain is intact (linear, mesh,
-    /// или anything в between).  Used for connectivity testing в
-    /// pathological topologies где DHT walks structurally fail.
+    /// Skips DHT lookups and route gossip entirely — each relay simply
+    /// forwards to the next node listed in `--path`. This works in any
+    /// topology where the sessions along that path are already connected
+    /// (linear, mesh, or anything in between), so it is handy for testing
+    /// connectivity in awkward layouts where automatic DHT routing fails.
     RelaySend {
         #[arg(
             long,
@@ -1704,7 +1726,7 @@ pub enum DebugCommand {
         #[arg(
             long,
             value_name = "DATA_HEX",
-            help = "Payload bytes as а hex string (use \"\" для empty)",
+            help = "Payload bytes as a hex string (use \"\" for empty)",
             default_value = ""
         )]
         data: String,
@@ -1889,7 +1911,7 @@ impl From<SignatureAlgorithmArg> for SignatureAlgorithm {
     }
 }
 
-/// — private-veil-network admin tooling.
+/// Admin tooling for running your own private network.
 #[derive(Args, Debug)]
 pub struct NetworkArgs {
     #[command(subcommand)]
@@ -1898,38 +1920,41 @@ pub struct NetworkArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum NetworkCommand {
-    /// Generate а fresh network-owner keypair и write the keys к
-    /// disk. The owner pubkey ends up в every member's
-    /// `[network].owner_pubkey` config slot; the owner private key
-    /// stays on the operator's admin workstation. ANYONE с the
-    /// owner private key can issue admin certs, so guard it carefully
-    /// (offline storage, hardware token, GPG-encrypted backup).
+    /// Create the network owner keypair and write both keys to disk.
+    ///
+    /// The owner public key goes into every member's
+    /// `[network].owner_pubkey` config slot; the owner private key stays on
+    /// your admin machine. ANYONE with the owner private key can issue admin
+    /// certificates, so guard it carefully (offline storage, a hardware
+    /// token, an encrypted backup).
     GenOwner {
         /// Path where the public key is written (base64 + newline).
         #[arg(long, value_name = "PATH")]
         pub_out: PathBuf,
         /// Path where the private key is written (base64 + newline).
-        /// Mode 0600 на Unix.
+        /// Created with mode 0600 on Unix.
         #[arg(long, value_name = "PATH")]
         priv_out: PathBuf,
         /// Owner signing algorithm. Default `ed25519`.
         #[arg(long, value_enum, default_value_t = SignatureAlgorithmArg::Ed25519)]
         algo: SignatureAlgorithmArg,
     },
-    /// Generate а random 32-byte `network_id` и print it as hex
-    /// (suitable for `[network].network_id`). One-shot — no state
-    /// persisted; rerun if you lose it.
+    /// Generate a random 32-byte `network_id` and print it as hex.
+    ///
+    /// Goes into `[network].network_id`. One-shot — nothing is saved, so
+    /// rerun if you lose it.
     GenNetworkId,
-    /// Sign а membership cert for а member node. The owner private
-    /// key reads от `--owner-priv`. The member's `node_id` (BLAKE3
-    /// of their pubkey) is the cert's binding identity — the member
-    /// proves ownership at handshake via the existing OVL1 signature
-    /// exchange.
+    /// Issue a membership certificate for one member node.
+    ///
+    /// Signs with the owner private key from `--owner-priv`. The certificate
+    /// is bound to the member's `node_id` (the BLAKE3 hash of their public
+    /// key); the member proves it owns that key during the normal connection
+    /// handshake.
     SignMember {
-        /// Path к the owner public-key file (от `gen-owner`).
+        /// Path to the owner public-key file (from `gen-owner`).
         #[arg(long, value_name = "PATH")]
         owner_pub: PathBuf,
-        /// Path к the owner private-key file (от `gen-owner`).
+        /// Path to the owner private-key file (from `gen-owner`).
         #[arg(long, value_name = "PATH")]
         owner_priv: PathBuf,
         /// Owner signing algorithm (must match `gen-owner`'s).
@@ -1946,8 +1971,8 @@ pub enum NetworkCommand {
         /// only.
         #[arg(long, default_value_t = false)]
         admin: bool,
-        /// Cert validity window в days от now. Default 365. Ignored
-        /// when `--no-expiry` is passed.
+        /// How many days the certificate stays valid, counting from now.
+        /// Default 365. Ignored when `--no-expiry` is passed.
         #[arg(
             long,
             value_name = "DAYS",
@@ -1955,34 +1980,33 @@ pub enum NetworkCommand {
             conflicts_with = "no_expiry"
         )]
         valid_days: u32,
-        /// Mint а cert що never expires. Useful for fleet members where
-        /// the operator wants к manage revocation only via DHT-ban
-        /// records или by rotating the network's `owner_pubkey`.
-        /// Sets `valid_until_unix = 0` (sentinel) на the wire.
+        /// Issue a certificate that never expires. Useful for fleet members
+        /// where you would rather handle revocation only through DHT bans or
+        /// by rotating the network's `owner_pubkey`.
         ///
-        /// Trade-off: revoking а single device без rotating the owner
-        /// key requires DHT-ban propagation; if the device is offline /
-        /// air-gapped the ban won't reach it until it re-joins.
+        /// Trade-off: revoking a single device without rotating the owner key
+        /// relies on the DHT ban reaching it. If that device is offline or
+        /// air-gapped, the ban won't take effect until it reconnects.
         #[arg(long, default_value_t = false)]
         no_expiry: bool,
         /// Path where the encoded cert blob is written (binary).
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
-    /// Decode a cert blob и dump its fields. Read-only — verifies
-    /// nothing about the owner signature (use `verify-cert` for that).
+    /// Decode a certificate and print its fields. Read-only — it does NOT
+    /// check the owner signature (use `verify-cert` for that).
     InspectCert {
-        /// Path к the encoded cert blob.
+        /// Path to the encoded certificate file.
         #[arg(value_name = "PATH")]
         path: PathBuf,
     },
-    /// Verify а cert blob against а network owner's public key. Prints
-    /// the cert fields on success или the error reason on failure.
+    /// Verify a certificate against a network owner's public key. Prints the
+    /// certificate's fields on success, or the reason it failed.
     VerifyCert {
-        /// Path к the encoded cert blob.
+        /// Path to the encoded certificate file.
         #[arg(value_name = "PATH")]
         cert: PathBuf,
-        /// Path к the owner public key (base64).
+        /// Path to the owner public key (base64).
         #[arg(long, value_name = "PATH")]
         owner_pub: PathBuf,
         /// Owner signing algorithm.
@@ -1992,18 +2016,21 @@ pub enum NetworkCommand {
         #[arg(long, value_name = "HEX64")]
         network_id: String,
     },
-    /// Issue а DHT-replicated ban via the running daemon's admin
-    /// socket. Requires this node к be configured `[network].mode =
-    /// "private"` AND its local cert flagged `admin: true`. The ban
-    /// fan-outs to K closest peers и propagates network-wide; every
-    /// member applies on its next ban-sync tick (~60 s).
+    /// Ban a node across the whole private network.
+    ///
+    /// Issues a DHT-replicated ban through the running daemon's admin socket.
+    /// This node must be configured `[network].mode = "private"` AND hold a
+    /// local certificate marked `admin: true`. The ban is copied out to the
+    /// closest peers and spreads network-wide; every member applies it on its
+    /// next ban-sync cycle (about every 60 s).
     Ban {
-        /// Target node-id (BLAKE3 of pubkey), 64-char hex. Or an
-        /// alias resolved by the running daemon (peer alias, link_id).
+        /// Target node ID (the BLAKE3 hash of the public key), 64 hex chars.
+        /// You can also pass an alias the running daemon can resolve (a peer
+        /// alias or link ID).
         #[arg(value_name = "NODE_ID")]
         node_id: String,
-        /// Optional ban reason — surfaces в admin-audit log on the
-        /// admin node and в `list-bans` on every receiver. Defaults к
+        /// Optional reason for the ban — shown in the admin audit log here and
+        /// in `list-bans` on every node that receives it. Defaults to
         /// `"admin ban"` when omitted.
         #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
