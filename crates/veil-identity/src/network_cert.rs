@@ -66,7 +66,12 @@ pub fn verify_membership_cert(
             expected: MEMBERSHIP_CERT_VERSION,
         });
     }
-    if cert.issued_at_unix > now_unix {
+    // Clock-skew tolerance on the lower bound: a member whose clock lags the
+    // owner that minted the cert by a few seconds must not reject a freshly-
+    // issued, otherwise-valid membership cert at handshake. Mirrors the skew
+    // applied to every other issued_at/valid_from check in this crate
+    // (`verify::TIME_VALIDITY_SKEW_SECS`).
+    if cert.issued_at_unix > now_unix.saturating_add(crate::verify::TIME_VALIDITY_SKEW_SECS) {
         return Err(CertVerifyError::NotYetValid {
             issued_at_unix: cert.issued_at_unix,
             now_unix,
