@@ -1555,7 +1555,9 @@ impl NodeRuntime {
             app_registry: Arc::clone(&app_registry),
             stream_table: Arc::new(veil_app::AppStreamTable::new()),
             mesh_forwarder: Arc::clone(&mesh_forwarder),
-            chunk_reassembler: Arc::new(Mutex::new(veil_transfer::ChunkReassembler::new())),
+            chunk_reassembler: Arc::new(Mutex::new(
+                veil_dispatcher::envelope_chunks::EnvelopeChunkReassembler::new(),
+            )),
             discovery_forwarder: Arc::new(Mutex::new(
                 veil_routing::discovery_forwarder::DiscoveryForwarder::with_default_difficulty(
                     local_node_id,

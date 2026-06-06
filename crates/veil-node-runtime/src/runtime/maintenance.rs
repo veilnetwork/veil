@@ -408,7 +408,7 @@ impl NodeRuntime {
         gateway: &Arc<veil_gateway::GatewayService>,
         discovery: &Arc<veil_discovery::DiscoveryService>,
         dht: &Arc<veil_dht::KademliaService>,
-        chunk_reassembler: &Arc<Mutex<veil_transfer::ChunkReassembler>>,
+        chunk_reassembler: &Arc<Mutex<veil_dispatcher::envelope_chunks::EnvelopeChunkReassembler>>,
         logger: &Arc<NodeLogger>,
         now: std::time::Instant,
     ) -> PrimaryEvictionCounts {
@@ -424,10 +424,10 @@ impl NodeRuntime {
 
         // evict stale chunked transfers.
         let chunk_evicted = lock!(chunk_reassembler).evict_stale();
-        if !chunk_evicted.is_empty() {
+        if chunk_evicted > 0 {
             logger.info(
                 "chunk.evict_stale",
-                format!("evicted {} stale transfer(s)", chunk_evicted.len()),
+                format!("evicted {chunk_evicted} stale transfer(s)"),
             );
         }
 

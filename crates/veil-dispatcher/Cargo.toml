@@ -31,7 +31,6 @@ veil-proxy = { path = "../veil-proxy" }
 veil-reputation = { path = "../veil-reputation" }
 veil-routing = { path = "../veil-routing" }
 veil-session = { path = "../veil-session" }
-veil-transfer = { path = "../veil-transfer" }
 veil-transport = { path = "../veil-transport" }
 veil-types = { path = "../veil-types" }
 veil-util = { path = "../veil-util" }
