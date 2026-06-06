@@ -324,15 +324,21 @@ unsafe fn clear_err(err_out: *mut *mut c_char) {
     }
 }
 
-/// Maximum length для caller-supplied C strings on the FFI boundary.
-/// Bounded scan via [`cstr_to_str_with_len`] / [`cstr_to_str`] prevents
-/// OOB read если caller passes а non-NUL-terminated buffer.  4 KiB
-/// covers every legitimate input shape: filesystem paths (Linux
-/// PATH_MAX = 4096), BIP-39 phrases (~330 B for 24 words), passwords
-/// (typically <256 B), error strings (<1 KiB).  Inputs longer than this
-/// are rejected as invalid even если they happen to be NUL-terminated
-/// — better к refuse а malformed contract upfront than scan kilobytes
-/// of arbitrary memory.
+/// Maximum length for caller-supplied C strings on the FFI boundary.
+///
+/// The `strnlen`-bounded scan via [`cstr_to_str_with_len`] / [`cstr_to_str`]
+/// CAPS the scan at this many bytes — it does NOT make an invalid pointer safe.
+/// SAFETY CONTRACT (the caller's responsibility, as on any C ABI): a non-null
+/// `*const c_char` MUST be readable either up to a NUL terminator OR for at
+/// least `MAX_FFI_CSTR_LEN` bytes. A pointer to a shorter, unterminated buffer
+/// is undefined behaviour: the bound limits how far a *terminated* contract is
+/// scanned and prevents an unbounded walk of arbitrary memory, but it cannot
+/// detect a lying caller. Hosts that cannot guarantee this should pass an
+/// explicit length through the `*_with_len` entry points. 4 KiB covers every
+/// legitimate input shape: filesystem paths (Linux PATH_MAX = 4096), BIP-39
+/// phrases (~330 B for 24 words), passwords (typically <256 B), error strings
+/// (<1 KiB). Inputs longer than this are rejected as invalid even if they are
+/// NUL-terminated.
 const MAX_FFI_CSTR_LEN: usize = 4096;
 
 /// Bounded variant of `CStr::from_ptr().to_str()`.
@@ -1091,7 +1097,7 @@ pub unsafe extern "C" fn veil_stream_read(
     // allocation that hard-OOMs the host process. Mirrors the
     // existing `veil_send` cap pattern. Caller с а legitimate
     // need for а bigger buffer can call `veil_stream_read` in а
-    // loop — стreaming guarantees nothing about chunk boundaries
+    // loop — streaming guarantees nothing about chunk boundaries
     // anyway.
     if cap > VEIL_MAX_DATA_LEN {
         unsafe {
@@ -3957,7 +3963,7 @@ pub unsafe extern "C" fn veil_pair_source_handle_confirm(
         "handle" => handle,
         "out_status" => out_status,
     );
-    // Conditional null check doesn't fit the уni-form macro shape —
+    // Conditional null check doesn't fit the uniform macro shape —
     // keep inline.  Pattern stays consistent across all FFI fns.
     if confirm_bytes.is_null() && confirm_len > 0 {
         unsafe {

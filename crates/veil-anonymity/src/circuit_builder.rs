@@ -705,7 +705,7 @@ mod tests {
             no_penalty,
         )
         .unwrap();
-        assert_eq!(picked[0].node_id[0], 1, "fast misbehaver wins без penalty");
+        assert_eq!(picked[0].node_id[0], 1, "fast misbehaver wins without penalty");
 
         // After 1 failure (+500ms): effective scores
         // misbehaver = 10 + 500 = 510, honest_mid = 200, honest_slow = 300

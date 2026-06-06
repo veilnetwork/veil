@@ -105,7 +105,7 @@ mod imp {
         // ergonomics.  When `[logging] file` is set, route output к the
         // file instead of stderr.
         if let Err(e) = oproxy::init_oproxy_logger("oproxy-client", &cfg.logging) {
-            eprintln!("oproxy-client: failed к init logger: {e}");
+            eprintln!("oproxy-client: failed to init logger: {e}");
             return std::process::ExitCode::FAILURE;
         }
 
@@ -140,7 +140,7 @@ mod imp {
         let rt = match build_tokio_runtime(&rt_cfg) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("oproxy-client: failed к build tokio runtime: {e}");
+                eprintln!("oproxy-client: failed to build tokio runtime: {e}");
                 return std::process::ExitCode::FAILURE;
             }
         };
@@ -171,7 +171,7 @@ mod imp {
         );
         let client = VeilClient::connect(&cfg.socket_path)
             .await
-            .with_context(|| format!("connect к veil daemon at {}", cfg.socket_path.display()))?;
+            .with_context(|| format!("connect to veil daemon at {}", cfg.socket_path.display()))?;
         log::info!(
             "oproxy-client: binding local app endpoint (namespace={}, name={})",
             oproxy::CLIENT_NAMESPACE,
@@ -192,7 +192,7 @@ mod imp {
         let app_sender = Arc::new(sender);
 
         if cfg.inbound.is_empty() {
-            anyhow::bail!("no [[inbound]] sections configured — nothing к do");
+            anyhow::bail!("no [[inbound]] sections configured — nothing to do");
         }
 
         let routing = Arc::new(cfg.routing.clone());

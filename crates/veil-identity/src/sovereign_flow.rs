@@ -516,7 +516,7 @@ pub fn create_identity(
                 SignatureAlgorithm::Ed25519Falcon1024Hybrid => &master_pubkey_bytes[32..],
                 SignatureAlgorithm::Falcon512 => &master_pubkey_bytes,
                 SignatureAlgorithm::Ed25519 => {
-                    unreachable!("falcon_master_sk_bytes is None для Ed25519 path")
+                    unreachable!("falcon_master_sk_bytes is None for Ed25519 path")
                 }
             };
             save_master_falcon_keypair(&opts.veil_dir, &falcon_sk, falcon_pk)?;
@@ -948,7 +948,7 @@ pub fn restore_identity(
                 SignatureAlgorithm::Ed25519Falcon1024Hybrid => &master_pubkey_bytes[32..],
                 SignatureAlgorithm::Falcon512 => &master_pubkey_bytes,
                 SignatureAlgorithm::Ed25519 => {
-                    unreachable!("falcon_master_sk_to_persist is None для Ed25519 path")
+                    unreachable!("falcon_master_sk_to_persist is None for Ed25519 path")
                 }
             };
             save_master_falcon_keypair(&opts.veil_dir, &falcon_sk, falcon_pk)?;
@@ -3026,7 +3026,7 @@ mod tests {
             algo: SignatureAlgorithm::Ed25519Falcon512Hybrid,
             master_falcon_keypair_bytes: None, // ← the operator forgot к back up.
         })
-        .expect_err("must reject hybrid restore без master_falcon bundle");
+        .expect_err("must reject hybrid restore without master_falcon bundle");
         assert!(
             matches!(err, RestoreIdentityError::MissingFalconMaster),
             "expected MissingFalconMaster, got {err:?}"

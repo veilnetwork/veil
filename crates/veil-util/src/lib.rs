@@ -245,6 +245,81 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     }
 }
 
+/// Stage an EXECUTABLE file next to `install_path`, returning the staged path
+/// for the caller to `rename(2)` into place.
+///
+/// Hardened exactly like [`atomic_write`], for the privileged-updater case
+/// where the install directory may be writable by a less-trusted user:
+/// * the staging path is `<install_path>.update-tmp.<getrandom-hex>` —
+///   UNPREDICTABLE, so an attacker cannot pre-create a file/symlink at it;
+/// * opened with `create_new` (`O_EXCL`) + `O_NOFOLLOW` (Unix), so a
+///   pre-existing symlink or regular file at the path FAILS the open instead of
+///   being followed (clobbering the victim's target) or captured;
+/// * written, `fsync`'d, and chmod'd `0o755` (Unix) BEFORE return, so the
+///   caller's `rename` publishes an already-executable binary with no
+///   post-rename `+x` TOCTOU window.
+///
+/// The caller owns the returned path: `rename` it into place on success, and
+/// `remove_file` it on any later failure. Crashed-mid-apply leftovers are swept
+/// by the updater's startup `cleanup_stale_update_artifacts`.
+pub fn write_executable_staged(
+    install_path: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    if let Some(parent) = install_path.parent() {
+        create_dir_all_with_eacces_retry(parent)?;
+    }
+    const MAX_TMP_ATTEMPTS: usize = 8;
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..MAX_TMP_ATTEMPTS {
+        let mut rand_bytes = [0u8; 8];
+        getrandom::getrandom(&mut rand_bytes).map_err(|e| {
+            std::io::Error::other(format!("write_executable_staged: getrandom failed: {e}"))
+        })?;
+        let mut name = install_path.as_os_str().to_owned();
+        name.push(format!(".update-tmp.{}", bytes_to_hex(&rand_bytes)));
+        let tmp = std::path::PathBuf::from(name);
+        match open_owner_only_create_new(&tmp) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mut perms = std::fs::metadata(&tmp)?.permissions();
+                    // 0o755: owner rwx, group/other rx — typical install perms.
+                    perms.set_mode(0o755);
+                    if let Err(e) = std::fs::set_permissions(&tmp, perms) {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(e);
+                    }
+                }
+                return Ok(tmp);
+            }
+            // AlreadyExists (collision / attacker pre-creation / refused
+            // symlink) or transient PermissionDenied (Windows AV) — retry with
+            // a fresh suffix.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    || e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "write_executable_staged: could not create a unique tmp file after retries",
+        )
+    }))
+}
+
 /// best-effort fsync of a directory
 /// so a recently-completed `rename(2)` is durably persisted across
 /// power loss. No-op on Windows where directory fsync semantics are

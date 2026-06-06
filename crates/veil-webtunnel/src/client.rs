@@ -47,6 +47,9 @@ pub enum ClientError {
 
     #[error("Sec-WebSocket-Accept mismatch (possible MITM or bad server)")]
     BadAccept,
+
+    #[error("invalid webtunnel request component (control byte / CRLF) in {0}")]
+    InvalidRequestComponent(&'static str),
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -66,6 +69,14 @@ pub struct WebtunnelClient {
     /// Additional headers к send (e.g. realistic User-Agent).  Phase
     /// 5c default: а common browser UA so we don't stick out.
     extra_headers: Vec<(String, String)>,
+}
+
+/// Reject HTTP request components that contain control bytes (CR, LF, NUL, any
+/// other C0 control, or DEL). Prevents CRLF header injection / request
+/// smuggling via operator-supplied `secret_path` / `host`. High bytes (≥ 0x80,
+/// e.g. UTF-8) are allowed — they cannot terminate a header line.
+fn is_request_component_safe(s: &str) -> bool {
+    s.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
 
 impl WebtunnelClient {
@@ -112,6 +123,17 @@ impl WebtunnelClient {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        // Reject control bytes (esp. CR / LF) in operator-supplied request
+        // components: a newline in `secret_path` or `host` would let CRLF
+        // injection forge headers or smuggle a second request. (Auth-token
+        // values are separately guarded by the base64 path below.)
+        if !is_request_component_safe(&self.secret_path) {
+            return Err(ClientError::InvalidRequestComponent("secret_path"));
+        }
+        if !is_request_component_safe(&self.host) {
+            return Err(ClientError::InvalidRequestComponent("host"));
+        }
+
         // Generate а random 16-byte Sec-WebSocket-Key per RFC 6455.
         let mut key_bytes = [0u8; 16];
         rand::rng().fill_bytes(&mut key_bytes);
@@ -322,7 +344,7 @@ mod tests {
         let err = client.connect(client_io).await.unwrap_err();
         match err {
             ClientError::DecoyReceived { status } => {
-                assert_eq!(status, 200, "decoy is а 200 OK с HTML body");
+                assert_eq!(status, 200, "decoy is a 200 OK with HTML body");
             }
             other => panic!("expected DecoyReceived, got {other:?}"),
         }

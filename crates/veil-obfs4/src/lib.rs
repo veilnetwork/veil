@@ -681,7 +681,7 @@ mod tests {
             let wire = out.wrap_next(payload).unwrap();
             let magic = b"OVL1";
             for window in wire.windows(4) {
-                assert_ne!(window, magic, "OVL1 magic leaked в obfs4 frame wire bytes");
+                assert_ne!(window, magic, "OVL1 magic leaked in obfs4 frame wire bytes");
             }
         }
     }

@@ -668,10 +668,12 @@ pub struct BeaconReceiver {
     /// SECURITY (audit 2026-05-29, A5): when `true`, drop beacons that
     /// carry no signature instead of accepting them as "legacy".  An
     /// unsigned beacon lets an on-link attacker register/redirect
-    /// neighbor links and inject IS_GATEWAY entries.  Default `false`
-    /// preserves the legacy unsigned-beacon interop for existing
-    /// deployments; operators on hostile LANs flip
-    /// `[mesh] require_signed_beacons = true` to harden.
+    /// neighbor links and inject IS_GATEWAY entries.  Default `true`
+    /// (rejects unsigned beacons) — pass `with_require_signed(false)` (or
+    /// `[mesh] require_signed_beacons = false`) ONLY for legacy interop with
+    /// deployments still emitting unsigned beacons (roll signed beacons out
+    /// fleet-wide first; flipping on across a live unsigned network partitions
+    /// those nodes).
     require_signed: bool,
     /// Per-source deduplication window.
     ///
@@ -706,15 +708,20 @@ impl BeaconReceiver {
             dedup_seen: std::collections::HashMap::new(),
             dedup_window: std::time::Duration::from_secs(3), // default 3 s
             beacon_count: 0,
-            require_signed: false,
+            // Safe-by-default (audit hardening): reject unsigned beacons unless
+            // a caller explicitly opts into legacy interop via
+            // `with_require_signed(false)`. The production wiring
+            // (`mesh_gateway`) already passes `[mesh] require_signed_beacons`,
+            // which itself defaults `true`.
+            require_signed: true,
         }
     }
 
     /// SECURITY (audit 2026-05-29, A5): require every accepted beacon к
     /// carry а valid signature.  When enabled, unsigned beacons are
     /// dropped (logged at `warn`) rather than accepted as "legacy".
-    /// Recommended on for non-loopback realms; off by default for
-    /// back-compat с existing unsigned-beacon deployments.
+    /// Recommended on for non-loopback realms; ON by default — pass
+    /// `false` only for back-compat with existing unsigned-beacon deployments.
     #[must_use]
     pub fn with_require_signed(mut self, require: bool) -> Self {
         self.require_signed = require;
@@ -896,8 +903,11 @@ mod tests {
         use crate::neighbor::NeighborTable;
         let table = NeighborTable::new();
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // legacy opt-out: exercises neighbor registration with an unsigned
+        // beacon, not the signing gate (default now requires signed).
         let mut receiver =
-            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None);
+            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None)
+                .with_require_signed(false);
         let frame = MeshFrame::new(
             RealmId([1u8; 16]),
             [9u8; 32],
@@ -941,15 +951,39 @@ mod tests {
         );
     }
 
-    /// Default (legacy) mode still accepts unsigned beacons — guards
-    /// against accidentally flipping the default-off back-compat.
+    /// SECURITY (audit hardening): the DEFAULT now REJECTS unsigned beacons —
+    /// guards against accidentally regressing the safe-by-default posture.
     #[test]
-    fn beacon_receiver_default_accepts_unsigned_legacy() {
+    fn beacon_receiver_default_drops_unsigned() {
         use crate::neighbor::NeighborTable;
         let table = NeighborTable::new();
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut receiver =
             BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None);
+        let frame = MeshFrame::new(
+            RealmId([1u8; 16]),
+            [9u8; 32],
+            BROADCAST_NODE_ID,
+            1,
+            MeshBeaconPayload::new_basic([9u8; 32], RealmId([1u8; 16])).encode(),
+        );
+        assert!(
+            !receiver.handle_beacon(&frame, "127.0.0.1:5555".parse().unwrap()),
+            "default mode must drop an unsigned beacon"
+        );
+        assert_eq!(table.len(), 0);
+    }
+
+    /// With the explicit legacy opt-out (`with_require_signed(false)`) an
+    /// unsigned beacon is still accepted for back-compat.
+    #[test]
+    fn beacon_receiver_legacy_optout_accepts_unsigned() {
+        use crate::neighbor::NeighborTable;
+        let table = NeighborTable::new();
+        let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut receiver =
+            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None)
+                .with_require_signed(false);
         let frame = MeshFrame::new(
             RealmId([1u8; 16]),
             [9u8; 32],
@@ -967,7 +1001,8 @@ mod tests {
         let table = NeighborTable::new();
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut receiver =
-            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None);
+            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None)
+                .with_require_signed(false);
         let frame = MeshFrame::new(
             RealmId([1u8; 16]),
             [7u8; 32],
@@ -1008,7 +1043,8 @@ mod tests {
         let table = NeighborTable::new();
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut receiver =
-            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None);
+            BeaconReceiver::new(RealmId([1u8; 16]), table.clone(), Arc::new(std_sock), None)
+                .with_require_signed(false);
         // Rate limit is MAX_BEACONS_PER_IP_PER_WINDOW = 10 per minute.
         // Send 10+1 beacons from different node_ids (same sender IP).
         let sender: SocketAddr = "127.0.0.1:7777".parse().unwrap();
@@ -1045,6 +1081,7 @@ mod tests {
         let std_sock = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
 
         let mut receiver = BeaconReceiver::new(realm, table.clone(), std_sock, None)
+            .with_require_signed(false)
             .with_dedup_window(std::time::Duration::from_secs(60)); // long window
 
         let frame = MeshFrame::new(
@@ -1152,6 +1189,7 @@ mod tests {
         let std_sock = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
 
         let mut receiver = BeaconReceiver::new(realm, table.clone(), std_sock, None)
+            .with_require_signed(false)
             .with_dedup_window(std::time::Duration::ZERO); // disabled
 
         let frame = MeshFrame::new(

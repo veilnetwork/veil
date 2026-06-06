@@ -9,4 +9,4 @@
 //! и veil-node-runtime — same coupling profile as any downstream
 //! integration test would have.
 //!
-//! Тhe library itself is empty; the suite lives entirely под `tests/`.
+//! The library itself is empty; the suite lives entirely под `tests/`.

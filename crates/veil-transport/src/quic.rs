@@ -237,7 +237,7 @@ pub fn chrome_mimic_transport_config() -> quinn::TransportConfig {
     cfg.receive_window(quinn::VarInt::from_u64(CHROME_INITIAL_MAX_DATA).expect("≤ VarInt::MAX"));
     cfg.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(std::time::Duration::from_millis(CHROME_MAX_IDLE_TIMEOUT_MS))
-            .expect("30s is а valid IdleTimeout"),
+            .expect("30s is a valid IdleTimeout"),
     ));
     cfg
 }

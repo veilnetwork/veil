@@ -147,7 +147,7 @@ where
 /// degradation — better к pick а no-key candidate than fail к build the
 /// circuit entirely).
 ///
-/// **Сall-site responsibility:** the closure typically consults the
+/// **Call-site responsibility:** the closure typically consults the
 /// caller's `DiscoveredPeerCache` или session-tx-registry к look up
 /// known IPs of relays we've already dialed.  Unknown relays receive
 /// the "no constraint" treatment.  Future slice: extend the
@@ -591,7 +591,7 @@ mod tests {
             target_pk,
             3,
         )
-        .expect("None-extractor должен degrade gracefully");
+        .expect("None-extractor must degrade gracefully");
         // First hop is а relay (not the target).
         assert_ne!(first_hop, target_id);
     }
@@ -660,7 +660,7 @@ mod tests {
             target_pk,
             3,
         )
-        .expect("distinct AS должен build");
+        .expect("distinct AS must build");
 
         // Lower-RTT relay (0x01) wins first hop.
         assert_eq!(first_hop[0], 0x01);

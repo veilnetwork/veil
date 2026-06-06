@@ -166,7 +166,7 @@ pub struct ListenConfigEntry {
     pub group_label: Option<String>,
     /// Ephemeral random-port rotation config (Phase 5f Step 3).  None =
     /// listener binds at config-specified port и stays there.  Some =
-    /// daemon рebinds on а fresh random port from `range` каждые
+    /// daemon rebinds on a fresh random port from `range` every
     /// `rotation` interval; peers learn the new URI через а signed
     /// `TransportMigrationNotify` broadcast.
     pub ephemeral: Option<veil_cfg::EphemeralConfig>,

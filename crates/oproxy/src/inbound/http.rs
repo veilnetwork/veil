@@ -86,7 +86,7 @@ async fn handle_connection(
             // gigabytes на а single line cannot push us past MAX_HEADERS_BYTES.
             let remaining = MAX_HEADERS_BYTES.saturating_sub(headers.len());
             if remaining == 0 {
-                anyhow::bail!("headers > {MAX_HEADERS_BYTES} bytes; refusing к continue");
+                anyhow::bail!("headers > {MAX_HEADERS_BYTES} bytes; refusing to continue");
             }
             let to_read = remaining.min(chunk.len());
             let n = stream

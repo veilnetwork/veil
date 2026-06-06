@@ -85,8 +85,8 @@ pub fn verify_membership_cert(
     }
     if &cert.network_id != expected_network_id {
         return Err(CertVerifyError::WrongNetwork {
-            expected_hex: hex_encode(expected_network_id),
-            got_hex: hex_encode(&cert.network_id),
+            expected_hex: veil_util::bytes_to_hex(expected_network_id),
+            got_hex: veil_util::bytes_to_hex(&cert.network_id),
         });
     }
     if cert.algo != owner_algo {
@@ -149,7 +149,7 @@ pub fn encode_cert_blob(cert: &MembershipCert) -> Vec<u8> {
         .owner_signature
         .len()
         .try_into()
-        .expect("signature should fit в u16 (Ed25519: 64, Falcon-512: 666)");
+        .expect("signature should fit in u16 (Ed25519: 64, Falcon-512: 666)");
     let mut out = Vec::with_capacity(body.len() + 2 + cert.owner_signature.len());
     out.extend_from_slice(&body);
     out.extend_from_slice(&sig_len.to_be_bytes());
@@ -221,13 +221,8 @@ fn algo_discriminant(algo: SignatureAlgorithm) -> u8 {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+// hex_encode removed — use the shared `veil_util::bytes_to_hex` (the two
+// hand-rolled copies here and in `network_ban` duplicated `veil_util`'s impl).
 
 #[cfg(test)]
 mod tests {

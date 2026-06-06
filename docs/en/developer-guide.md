@@ -564,7 +564,6 @@ are production-ready:
 |-----------|------|--------|
 | Mesh WiFi Direct / BLE | absent | Real integration is not implemented; mesh works over UDP links ([`node/mesh/udp.rs`](../../crates/veil-mesh/src/udp.rs)) |
 | QUIC sessions | [`transport/quic.rs`](../../crates/veil-transport/src/quic.rs) | The `quic://` transport is always compiled (unconditional `quinn` dependency); there is no longer a separate feature flag |
-| PoW signature verify | [`node/dispatcher/routing.rs`](../../crates/veil-dispatcher/src/routing.rs) | The PowChallenge signature is not verified in some paths |
 | TUN/TAP | [`crates/ogate/src/tun/`](../../crates/ogate/src/tun/) | Basic implementation in the `ogate` crate (moved out of `veilcore`); production readiness has not been verified |
 
 ---

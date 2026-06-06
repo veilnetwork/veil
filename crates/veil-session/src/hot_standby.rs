@@ -644,7 +644,7 @@ mod tests {
         c.set_alt_uri(peer, "tcp://10.1.1.1:9000".to_owned());
         // alt_uri takes precedence over the primary_uri fallback.
         let ok = c.try_rotation_trigger(peer, "tcp://10.2.2.2:9000", [0u8; 32], [0u8; 32]);
-        assert!(ok, "must spawn а probe когда alt_uri OR primary_uri parses");
+        assert!(ok, "must spawn a probe when alt_uri OR primary_uri parses");
     }
 
     #[tokio::test]
@@ -656,7 +656,7 @@ mod tests {
         let peer = NodeId::from([0x88u8; 32]);
         assert!(c.alt_uri_for(&peer).is_none());
         let ok = c.try_rotation_trigger(peer, "tcp://10.3.3.3:9000", [0u8; 32], [0u8; 32]);
-        assert!(ok, "must spawn а probe via primary_uri fallback");
+        assert!(ok, "must spawn a probe via primary_uri fallback");
     }
 
     #[tokio::test]

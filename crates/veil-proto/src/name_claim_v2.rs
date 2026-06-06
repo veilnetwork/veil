@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn normalize_rejects_unicode() {
         // Cyrillic, looks like ASCII — classic homoglyph attack.
-        let err = normalize_name("аlice").unwrap_err();
+        let err = normalize_name("alice").unwrap_err();
         assert!(matches!(err, NameError::InvalidChar(_)), "{err:?}");
 
         // Accented Latin.

@@ -113,21 +113,58 @@ pub enum ApplyError {
         current: String,
         min_compatible: String,
     },
+    /// C-08 hardening: the keyed installed-version store holds a record with NO
+    /// mac (legacy, pre-authentication). Auto-adopting it is a downgrade vector
+    /// — a local writer who can reach the state file but not the HMAC key can
+    /// strip the mac to re-open the anti-downgrade window — so the apply path
+    /// refuses it by default. A genuine one-time migration from a pre-C-08
+    /// install must be authorized explicitly
+    /// (`ApplyOptions::allow_legacy_state_migration`, surfaced as the CLI
+    /// `--allow-legacy-state-migration` flag).
+    #[error(
+        "installed-version state is unauthenticated (legacy, no MAC) — refusing to \
+         adopt it automatically because a stripped MAC can re-open the anti-downgrade \
+         window; re-run with --allow-legacy-state-migration to perform the one-time \
+         authenticated migration"
+    )]
+    LegacyStateMigrationRequired,
+    /// cycle-7 hardening: the manifest's `min_compatible_version` is present but
+    /// is not valid semver. Fail closed rather than silently treating a
+    /// malformed constraint as "no constraint".
+    #[error(
+        "update manifest declares an unparseable min_compatible_version \
+         {min_compatible:?} — refusing to apply (cannot verify version compatibility)"
+    )]
+    MalformedVersionConstraint { min_compatible: String },
 }
 
 /// cycle-7 (M5): is `current` (the running binary's version) recent enough to
-/// directly apply an update whose manifest requires `min_compatible`? A
-/// non-semver / empty `min_compatible` is treated as "no constraint" (Ok) — the
+/// directly apply an update whose manifest requires `min_compatible`? The
 /// signed manifest is the real authenticator; `min_compatible_version` is an
 /// additional author-set bound that gates against skipping a mandatory
-/// migration. Fail-open on unparseable input avoids bricking updates on a
-/// manifest that simply omits the field.
+/// migration.
+///
+/// Parsing policy (fail-closed): an EMPTY / whitespace-only `min_compatible`
+/// means "no constraint" (`Ok`). A NON-empty but unparseable `min_compatible`
+/// is REJECTED rather than silently ignored — treating a typo'd or tampered
+/// bound as "no constraint" would let a manifest skip the very migration the
+/// field exists to enforce. `current` is our own `CARGO_PKG_VERSION` (always
+/// valid semver in a real build), so a parse failure there is a build bug and
+/// is likewise failed closed.
 fn min_compatible_satisfied(current: &str, min_compatible: &str) -> Result<(), ApplyError> {
-    let (Ok(cur), Ok(min)) = (
-        semver::Version::parse(current.trim()),
-        semver::Version::parse(min_compatible.trim()),
-    ) else {
+    let min_trimmed = min_compatible.trim();
+    if min_trimmed.is_empty() {
         return Ok(());
+    }
+    let Ok(min) = semver::Version::parse(min_trimmed) else {
+        return Err(ApplyError::MalformedVersionConstraint {
+            min_compatible: min_compatible.to_string(),
+        });
+    };
+    let Ok(cur) = semver::Version::parse(current.trim()) else {
+        return Err(ApplyError::MalformedVersionConstraint {
+            min_compatible: min_compatible.to_string(),
+        });
     };
     if cur < min {
         return Err(ApplyError::IncompatibleVersion {
@@ -205,6 +242,20 @@ pub struct ApplyOutcome {
     pub migrated_legacy_state: bool,
 }
 
+/// Optional knobs for [`apply_update_with_options`]. `Default` is the safe
+/// posture — every field off — so plain [`apply_update`] never relaxes a
+/// security gate.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyOptions {
+    /// Authorize a one-time migration from a LEGACY (pre-C-08, no-MAC)
+    /// installed-version file to the MAC-authenticated form. Default `false`:
+    /// a keyed store that finds an unauthenticated record is REFUSED
+    /// ([`ApplyError::LegacyStateMigrationRequired`]) rather than adopted,
+    /// because a stripped MAC would otherwise re-open the anti-downgrade
+    /// window. Set `true` only for the deliberate operator-driven migration.
+    pub allow_legacy_state_migration: bool,
+}
+
 /// Apply a fetched + verified update. Steps in order:
 ///
 /// 1. Recompute SHA-256 of `binary_bytes` and verify against
@@ -231,6 +282,28 @@ pub fn apply_update(
     store: &InstalledVersionStore,
     current_version: &str,
 ) -> Result<ApplyOutcome, ApplyError> {
+    apply_update_with_options(
+        manifest,
+        binary_bytes,
+        install_path,
+        store,
+        current_version,
+        &ApplyOptions::default(),
+    )
+}
+
+/// Like [`apply_update`] but takes explicit [`ApplyOptions`]. Plain
+/// `apply_update` is the safe-default wrapper (`ApplyOptions::default()`, so
+/// legacy no-MAC state migration is DISABLED). Use this variant only on the
+/// deliberate operator-authorized migration path.
+pub fn apply_update_with_options(
+    manifest: &UpdateManifest,
+    binary_bytes: &[u8],
+    install_path: &Path,
+    store: &InstalledVersionStore,
+    current_version: &str,
+    opts: &ApplyOptions,
+) -> Result<ApplyOutcome, ApplyError> {
     // Step 1: recompute SHA-256 (defence in depth).
     let mut hasher = Sha256::new();
     hasher.update(binary_bytes);
@@ -246,6 +319,16 @@ pub fn apply_update(
     // missing state file → 0 (fresh install — any positive
     // release_unix is "newer").
     let (installed_opt, migrated_legacy_state) = store.read_release_unix_for_apply()?;
+    // C-08 hardening: a keyed store that finds an UNAUTHENTICATED (no-MAC,
+    // legacy) record must not silently adopt it. A local writer who can reach
+    // the state file but not the HMAC key could strip the MAC, lower the
+    // recorded floor, and re-open the anti-downgrade window (then replay an
+    // older, still-validly-signed manifest). Refuse by default; a genuine
+    // one-time migration from a pre-C-08 install is an explicit opt-in
+    // (`ApplyOptions::allow_legacy_state_migration`).
+    if migrated_legacy_state && !opts.allow_legacy_state_migration {
+        return Err(ApplyError::LegacyStateMigrationRequired);
+    }
     let installed = installed_opt.unwrap_or(0);
     if manifest.release_unix <= installed {
         return Err(ApplyError::AntiDowngrade {
@@ -288,9 +371,12 @@ pub fn apply_update(
     // checked by nothing.)
     min_compatible_satisfied(current_version, &manifest.min_compatible_version)?;
 
-    // Step 3: atomic stage + +x + rename.
-    let tmp_path = with_tmp_suffix(install_path);
-    write_then_chmod_exec(&tmp_path, binary_bytes)?;
+    // Step 3: atomic stage + +x + rename. The staging file is created next to
+    // `install_path` with an UNPREDICTABLE name, `O_EXCL`+`O_NOFOLLOW`, written,
+    // fsync'd, and chmod'd executable BEFORE the rename — so a less-trusted user
+    // with write access to the install directory cannot pre-place a symlink at a
+    // predictable tmp path to capture or clobber the privileged write.
+    let tmp_path = veil_util::write_executable_staged(install_path, binary_bytes)?;
     let binary_marked_executable = cfg!(unix);
 
     // Step 3a (Windows-only):.old-shuffle to make room for the
@@ -389,12 +475,27 @@ pub fn apply_update(
 /// (for caller to log / report — empty list = nothing to clean).
 pub fn cleanup_stale_update_artifacts(install_path: &Path) -> Vec<PathBuf> {
     let mut cleaned = Vec::new();
+    // Deterministic artifacts: `.update-old` (Windows shuffle-out) and the
+    // legacy fixed `.update-tmp` staging name.
     for path in [with_old_suffix(install_path), with_tmp_suffix(install_path)] {
-        if path.exists() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => cleaned.push(path),
-                Err(_) => {
-                    // Skip silently — see doc-comment for rationale.
+        if path.exists() && std::fs::remove_file(&path).is_ok() {
+            cleaned.push(path);
+        }
+    }
+    // Hardened staging now uses an unpredictable `<install>.update-tmp.<rand>`
+    // suffix (`veil_util::write_executable_staged`); sweep those siblings too so
+    // a crash mid-apply doesn't leak disk. Best-effort, like the rest.
+    if let (Some(parent), Some(stem)) = (install_path.parent(), install_path.file_name()) {
+        let mut marker = stem.to_owned();
+        marker.push(".update-tmp.");
+        let marker = marker.as_encoded_bytes().to_vec();
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if entry.file_name().as_encoded_bytes().starts_with(&marker) {
+                    let p = entry.path();
+                    if std::fs::remove_file(&p).is_ok() {
+                        cleaned.push(p);
+                    }
                 }
             }
         }
@@ -447,34 +548,9 @@ fn with_tmp_suffix(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn write_then_chmod_exec(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        veil_util::create_dir_all_with_eacces_retry(parent)?;
-    }
-    // Open + write + sync + close. We DON'T call atomic_write
-    // here because we need the chmod step BEFORE the rename so
-    // that the renamed file is already executable (rename
-    // preserves perms; setting +x post-rename has a TOCTOU window
-    // where a concurrent reader could see non-executable perms).
-    {
-        let mut f = std::fs::File::create(path)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        // 0o755: owner rwx, group/other rx. Matches typical
-        // /usr/local/bin install perms.
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms)?;
-    }
-    Ok(())
-}
+// Executable staging (write + fsync + chmod-before-rename) moved to the
+// hardened `veil_util::write_executable_staged` (unpredictable name +
+// `O_EXCL`/`O_NOFOLLOW`) — see Step 3 of `apply_update_with_options`.
 
 // local `bytes_hex` removed — use `veil_util::bytes_to_hex`.
 
@@ -535,9 +611,15 @@ mod tests {
             min_compatible_satisfied("0.9.0", "1.0.0"),
             Err(ApplyError::IncompatibleVersion { .. })
         ));
-        // empty / non-semver min → no constraint (fail-open; signature is the gate)
+        // empty / whitespace min → no constraint (signature is the real gate)
         assert!(min_compatible_satisfied("1.0.0", "").is_ok());
-        assert!(min_compatible_satisfied("1.0.0", "not-a-version").is_ok());
+        assert!(min_compatible_satisfied("1.0.0", "   ").is_ok());
+        // present-but-unparseable min → fail-closed reject (a malformed bound
+        // must not be silently treated as "no constraint")
+        assert!(matches!(
+            min_compatible_satisfied("1.0.0", "not-a-version"),
+            Err(ApplyError::MalformedVersionConstraint { .. })
+        ));
         // the actual running binary clears a permissive floor
         assert!(min_compatible_satisfied(env!("CARGO_PKG_VERSION"), "0.0.1").is_ok());
     }
@@ -1062,8 +1144,11 @@ mod tests {
     #[test]
     fn c08_apply_migrates_legacy_unauthenticated_state() {
         // A node that applied an update before C-08 has a legacy (no-mac)
-        // installed.json. The first KEYED apply must adopt it once (migration),
-        // flag `migrated_legacy_state`, and re-write it authenticated.
+        // installed.json. The first KEYED apply, WHEN EXPLICITLY AUTHORIZED via
+        // `allow_legacy_state_migration`, must adopt it once (migration), flag
+        // `migrated_legacy_state`, and re-write it authenticated. (Without the
+        // opt-in the apply refuses — see
+        // `c08_apply_refuses_legacy_state_without_optin`.)
         let dir = unique_dir("c08-migrate");
         let install = dir.join("veil");
         let state = dir.join("installed.json");
@@ -1080,18 +1165,21 @@ mod tests {
         let keyed = InstalledVersionStore::with_hmac_key(state.clone(), [0x5Au8; 32]);
         let payload = b"new authenticated binary";
         let manifest = fixture_manifest(2_000_000_000, sha256_of(payload));
-        let outcome = apply_update(
+        let outcome = apply_update_with_options(
             &manifest,
             payload,
             &install,
             &keyed,
             env!("CARGO_PKG_VERSION"),
+            &ApplyOptions {
+                allow_legacy_state_migration: true,
+            },
         )
         .unwrap();
 
         assert!(
             outcome.migrated_legacy_state,
-            "first keyed apply over a legacy file must flag the migration"
+            "first authorized keyed apply over a legacy file must flag the migration"
         );
         assert_eq!(outcome.previous_release_unix, 1_900_000_000);
         assert_eq!(outcome.new_release_unix, 2_000_000_000);
@@ -1153,6 +1241,74 @@ mod tests {
         assert!(
             !install.exists(),
             "no binary may be written when the anti-downgrade read fails"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn c08_apply_refuses_legacy_state_without_optin() {
+        // A keyed store that finds a legacy (no-mac) file must REFUSE by default
+        // — silently adopting it is the strip-MAC downgrade vector. Migration is
+        // an explicit opt-in (`allow_legacy_state_migration`), not automatic.
+        let dir = unique_dir("c08-refuse-legacy");
+        let install = dir.join("veil");
+        let state = dir.join("installed.json");
+        InstalledVersionStore::new(state.clone())
+            .write(1_900_000_000)
+            .unwrap();
+        let keyed = InstalledVersionStore::with_hmac_key(state.clone(), [0x5Au8; 32]);
+        let payload = b"binary";
+        let manifest = fixture_manifest(2_000_000_000, sha256_of(payload));
+        let err = apply_update(&manifest, payload, &install, &keyed, env!("CARGO_PKG_VERSION"))
+            .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::LegacyStateMigrationRequired),
+            "default apply over a legacy no-mac keyed file must fail closed, got {err:?}"
+        );
+        assert!(
+            !install.exists(),
+            "no binary may be written on the legacy-refusal path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn c08_apply_rejects_stripped_mac_downgrade() {
+        // Regression (audit): write an AUTHENTICATED record at a high floor,
+        // then an attacker STRIPS the mac and lowers release_unix to re-open the
+        // migration window. The default apply must reject this rather than
+        // adopting the lowered floor and accepting a replayed older manifest.
+        let dir = unique_dir("c08-strip-mac");
+        let install = dir.join("veil");
+        let state = dir.join("installed.json");
+        let keyed = InstalledVersionStore::with_hmac_key(state.clone(), [0x33u8; 32]);
+        keyed.write(2_000_000_000).unwrap();
+        assert!(
+            std::fs::read_to_string(&state).unwrap().contains("\"mac\""),
+            "precondition: authenticated record carries a mac"
+        );
+
+        // Strip the mac AND lower the floor — byte-identical to what a
+        // strip-mac attacker writes (an unkeyed record at the lowered value).
+        InstalledVersionStore::new(state.clone())
+            .write(1_000_000_000)
+            .unwrap();
+        assert!(
+            !std::fs::read_to_string(&state).unwrap().contains("\"mac\""),
+            "attacker stripped the mac"
+        );
+
+        let payload = b"replayed older binary";
+        let manifest = fixture_manifest(1_500_000_000, sha256_of(payload));
+        let err = apply_update(&manifest, payload, &install, &keyed, env!("CARGO_PKG_VERSION"))
+            .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::LegacyStateMigrationRequired),
+            "stripped-mac lowered floor must be rejected, got {err:?}"
+        );
+        assert!(
+            !install.exists(),
+            "no binary may be written on the strip-mac downgrade path"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -622,7 +622,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
     let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
     let plain_ack = client_rx
         .open(&enc_ack_body, &ack_aad)
-        .expect("decrypt Ack с OLD rx");
+        .expect("decrypt Ack with OLD rx");
     let ack_payload = RekeyPayload::decode(&plain_ack).expect("decode RekeyAck");
     let server_pubkey = ack_payload.ephemeral_pubkey;
 
@@ -683,7 +683,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
         let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
         client_rx_new
             .open(&enc_pong_body, &pong_aad)
-            .expect("decrypt Pong с NEW rx — server's tx must have switched");
+            .expect("decrypt Pong with NEW rx — server's tx must have switched");
     }
 
     // ── Step 6: post-grace, NEW path keeps working ──────────────────────
@@ -716,7 +716,7 @@ async fn runner_rekey_grace_recovers_inflight_old_encrypted_frames() {
         let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
         client_rx_new
             .open(&enc_pong2_body, &pong_aad)
-            .expect("post-rekey Pong must decrypt с NEW rx");
+            .expect("post-rekey Pong must decrypt with NEW rx");
     }
 
     // ── Step 7: assert no violation was recorded ─────────────────────────
@@ -1379,7 +1379,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
         let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
         client_rx
             .open(&enc_pong_body, &pong_aad)
-            .expect("decrypt Pong с current rx");
+            .expect("decrypt Pong with current rx");
     }
 
     // ── Step 3: Read server's RekeyInit. Server's tx_bytes is now ≥ 1
@@ -1401,7 +1401,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
     let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
     let plain_init = client_rx
         .open(&enc_init_body, &init_aad)
-        .expect("decrypt server RekeyInit с current rx");
+        .expect("decrypt server RekeyInit with current rx");
     let server_init_payload = RekeyPayload::decode(&plain_init).expect("decode server RekeyInit");
     let server_pubkey = server_init_payload.ephemeral_pubkey;
 
@@ -1472,7 +1472,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
         let kept_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyKeptInit as u16);
         client_rx
             .open(&enc_kept_body, &kept_aad)
-            .expect("decrypt RekeyKeptInit с OLD client_rx");
+            .expect("decrypt RekeyKeptInit with OLD client_rx");
     }
     // (RekeyKeptInit is emitted via direct `push_wire` — no coalesce-
     // with-padding pad, so no trailing-pad drain needed.)
@@ -1535,7 +1535,7 @@ async fn phase650b_mutual_rekey_collision_kept_init_when_local_node_id_lower() {
         let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
         client_rx_new
             .open(&enc_new_pong_body, &pong_aad)
-            .expect("post-collision Pong must decrypt с new client_rx");
+            .expect("post-collision Pong must decrypt with new client_rx");
     }
 
     // ── Step 8: Verify no violations were recorded.
@@ -1687,7 +1687,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
         let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
         client_rx
             .open(&buf, &pong_aad)
-            .expect("decrypt Pong с current rx");
+            .expect("decrypt Pong with current rx");
     }
 
     let init_hdr = read_non_padding_header(
@@ -1747,7 +1747,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
     let ack_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyAck as u16);
     let plain_ack = client_rx
         .open(&enc_ack_body, &ack_aad)
-        .expect("decrypt RekeyAck с current rx");
+        .expect("decrypt RekeyAck with current rx");
     let ack_payload = RekeyPayload::decode(&plain_ack).expect("decode RekeyAck");
     let server_responder_pubkey = ack_payload.ephemeral_pubkey;
 
@@ -1783,7 +1783,7 @@ async fn phase650b_mutual_rekey_collision_aborted_init_when_local_node_id_higher
         let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
         client_rx_new
             .open(&buf, &pong_aad)
-            .expect("post-collision Pong must decrypt с new client_rx");
+            .expect("post-collision Pong must decrypt with new client_rx");
     }
 
     // ── Step 8: No violations recorded.
@@ -1959,7 +1959,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
         let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
         client_rx
             .open(&buf, &pong_aad)
-            .expect("decrypt Pong на PRIMARY");
+            .expect("decrypt Pong on PRIMARY");
     }
 
     // ── Step 3: server-RekeyInit на PRIMARY (server now in AwaitingAck).
@@ -1976,7 +1976,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
     let init_aad = frame_aad(FrameFamily::Session as u8, SessionMsg::RekeyInit as u16);
     let plain_init = client_rx
         .open(&enc_init_body, &init_aad)
-        .expect("decrypt server RekeyInit на PRIMARY");
+        .expect("decrypt server RekeyInit on PRIMARY");
     let server_pubkey = RekeyPayload::decode(&plain_init)
         .expect("decode RekeyInit")
         .ephemeral_pubkey;
@@ -2051,7 +2051,7 @@ async fn phase650b_rekey_state_survives_transport_swap() {
         let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
         client_rx_new
             .open(&buf, &pong_aad)
-            .expect("post-swap NEW Pong must decrypt с NEW client_rx");
+            .expect("post-swap NEW Pong must decrypt with NEW client_rx");
     }
 
     // ── Step 8: tear down + verify.
@@ -2315,7 +2315,7 @@ async fn phase650b_rekey_bypasses_low_battery_deferral_window() {
         let pong_aad = frame_aad(FrameFamily::Control as u8, ControlMsg::Pong as u16);
         client_rx_new
             .open(&buf, &pong_aad)
-            .expect("post-rekey Pong must decrypt с NEW client_rx");
+            .expect("post-rekey Pong must decrypt with NEW client_rx");
     }
 
     drop(client);

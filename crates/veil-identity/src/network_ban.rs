@@ -97,8 +97,8 @@ pub fn verify_ban_entry(
     }
     if &entry.network_id != expected_network_id {
         return Err(BanVerifyError::WrongNetwork {
-            expected_hex: hex_encode(expected_network_id),
-            got_hex: hex_encode(&entry.network_id),
+            expected_hex: veil_util::bytes_to_hex(expected_network_id),
+            got_hex: veil_util::bytes_to_hex(&entry.network_id),
         });
     }
     if entry.reason.len() > veil_types::MAX_BAN_REASON_LEN {
@@ -116,8 +116,8 @@ pub fn verify_ban_entry(
     }
     if admin_cert.member_node_id != entry.admin_node_id {
         return Err(BanVerifyError::AdminMismatch {
-            cert_hex: hex_encode(&admin_cert.member_node_id),
-            entry_hex: hex_encode(&entry.admin_node_id),
+            cert_hex: veil_util::bytes_to_hex(&admin_cert.member_node_id),
+            entry_hex: veil_util::bytes_to_hex(&entry.admin_node_id),
         });
     }
     verify_membership_cert(
@@ -132,8 +132,8 @@ pub fn verify_ban_entry(
     let derived_node_id = *blake3::hash(&entry.admin_pubkey).as_bytes();
     if derived_node_id != admin_cert.member_node_id {
         return Err(BanVerifyError::AdminPubkeyMismatch {
-            pubkey_hex: hex_encode(&derived_node_id),
-            cert_hex: hex_encode(&admin_cert.member_node_id),
+            pubkey_hex: veil_util::bytes_to_hex(&derived_node_id),
+            cert_hex: veil_util::bytes_to_hex(&admin_cert.member_node_id),
         });
     }
 
@@ -334,13 +334,7 @@ pub fn is_ban_blob(blob: &[u8]) -> bool {
     blob.len() >= 4 && &blob[0..4] == BAN_BLOB_MAGIC
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+// hex_encode removed — use the shared `veil_util::bytes_to_hex`.
 
 #[cfg(test)]
 mod tests {

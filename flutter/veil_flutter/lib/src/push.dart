@@ -140,9 +140,10 @@ class VeilPush {
   /// WakePayloadVerdict.valid] verdict makes the call return early
   /// (reject) BEFORE the rate-limit accept path — so а forged / replayed
   /// / expired wake never promotes the foreground service или fires
-  /// [onWake].  The default `requireAuth: false` preserves the legacy
-  /// back-compat path (verify only when the full tuple is supplied,
-  /// otherwise wake-on-any-push gated solely by [_minWakeupGap]).
+  /// [onWake].  The default is now `requireAuth: true` (fail-closed). Pass
+  /// `requireAuth: false` only for the legacy back-compat path (verify only
+  /// when the full tuple is supplied, otherwise wake-on-any-push gated solely
+  /// by [_minWakeupGap]).
   ///
   /// Wiring the inputs: the 72-byte wake payload arrives base64-encoded
   /// under the push data key `"w"` — `message.data["w"]` on FCM, the
@@ -150,13 +151,16 @@ class VeilPush {
   /// supply [wakeHmacKey] from [loadWakeHmacKey] и [receiverId] from the
   /// local node id (`VeilClient.nodeId()`).
   ///
-  /// **Open follow-ups** (deferred, daemon-side work):
-  ///   * HMAC-authenticated wake payloads — current behaviour fires
-  ///     on any push the OS delivers, so а leaked push token allows
-  ///     battery-DoS / presence-oracle attacks.  Mitigation today is
-  ///     the [_minWakeupGap] rate-limit; the proper fix is а
-  ///     per-relay HMAC key distributed via the existing rendezvous
-  ///     channel.
+  /// **Open follow-ups** (daemon-side):
+  ///   * HMAC-authenticated wake payloads are now MINTED by the daemon
+  ///     when a sealed `WakeHmacKey` envelope is configured (see
+  ///     `mint_wake_payload`) and VERIFIED here when the full tuple is
+  ///     supplied (`requireAuth: true` by default — fail-closed). The
+  ///     remaining gap is automatic per-relay HMAC-key DISTRIBUTION over
+  ///     the rendezvous channel; until a relay has provisioned that key,
+  ///     wakes degrade to the rate-limited ([_minWakeupGap]) wake-only
+  ///     path, where a leaked push token can still drive battery-DoS /
+  ///     presence-oracle attacks.
   ///   * A NO-ARG `VeilPush.drainMailbox()` convenience. The
   ///     explicit-args `drainMailbox({socketPath, receiverId,
   ///     authCookie})` already EXISTS (see below) and is fully wired;
@@ -169,7 +173,7 @@ class VeilPush {
     Uint8List? wakePayload,
     Uint8List? wakeHmacKey,
     Uint8List? receiverId,
-    bool requireAuth = false,
+    bool requireAuth = true,
   }) async {
     // Epic 489.10 slice 4.3.4 follow-up — HMAC verification before any
     // observable side-effect (battery promotion, daemon reconnect).
@@ -181,12 +185,12 @@ class VeilPush {
     // attacks от leaked-push-token holders.
     //
     // `requireAuth` selects the policy:
-    //   * false (default, back-compat) — verify ONLY when the full tuple
-    //     is supplied; otherwise fall back к the unauthenticated
-    //     wake-on-any-push path gated solely by `_minWakeupGap`.
-    //   * true (production) — fail CLOSED: an incomplete tuple OR а
-    //     non-Valid verdict rejects (returns early) BEFORE the rate-limit
+    //   * true (default, production) — fail CLOSED: an incomplete tuple OR
+    //     a non-Valid verdict rejects (returns early) BEFORE the rate-limit
     //     accept path, so an unauthenticated/forged wake never proceeds.
+    //   * false (legacy back-compat) — verify ONLY when the full tuple is
+    //     supplied; otherwise fall back to the unauthenticated
+    //     wake-on-any-push path gated solely by `_minWakeupGap`.
     final hasFullVerifyTuple =
         wakePayload != null && wakeHmacKey != null && receiverId != null;
     if (requireAuth && !hasFullVerifyTuple) {

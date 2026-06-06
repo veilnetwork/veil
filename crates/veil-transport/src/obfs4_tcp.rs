@@ -372,7 +372,7 @@ mod tests {
         };
         // Client connect should fail (server silent-drops bad-MAC peer).
         let result = transport.connect(&connect_uri, Arc::clone(&ctx_c)).await;
-        assert!(result.is_err(), "client should fail с wrong PSK");
+        assert!(result.is_err(), "client should fail with wrong PSK");
 
         let server_result = server_task.await.unwrap();
         assert!(server_result.is_err(), "server should reject bad MAC");

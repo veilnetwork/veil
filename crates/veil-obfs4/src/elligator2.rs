@@ -126,7 +126,7 @@ impl ElligatorKeypair {
     /// instead.
     pub fn public(&self) -> MontgomeryPoint {
         MontgomeryPoint::from_representative::<Randomized>(&self.representative)
-            .expect("we just verified self has а valid representative")
+            .expect("we just verified self has a valid representative")
     }
 }
 
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn generate_succeeds() {
-        let kp = ElligatorKeypair::generate().expect("generate с retry should succeed");
+        let kp = ElligatorKeypair::generate().expect("generate with retry should succeed");
         assert_eq!(kp.representative().len(), REPRESENTATIVE_LEN);
     }
 

@@ -13,7 +13,7 @@
 //! * **Censor** observing DHT traffic sees published envelopes but can't
 //!   decrypt — so cannot pressure Google/Apple to disclose "give me the
 //!   device IDs that received these FCM tokens" to deanonymize users.
-//! * **Push-relay operator** holds the X25519 sk и can decrypt. Сee
+//! * **Push-relay operator** holds the X25519 sk and can decrypt. Sees
 //!   only "user X (by node_id) wants а wake-up at time T". Cannot read
 //!   message content (veil E2E protects). Trust placed:
 //!   "this operator forwards wake-ups but does not log token-к-user
@@ -129,6 +129,10 @@ pub fn seal_push_envelope(
     let ephemeral_pk = X25519PublicKey::from(&ephemeral_sk).to_bytes();
     let relay = X25519PublicKey::from(*relay_pk);
     let shared = ephemeral_sk.diffie_hellman(&relay);
+    // Defense-in-depth: refuse to seal against a non-contributory relay key.
+    if !shared.was_contributory() {
+        return Err(PushEnvelopeError::Aead);
+    }
 
     let aead_key = derive_aead_key(shared.as_bytes());
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -186,6 +190,12 @@ pub fn unseal_push_envelope(
     let ciphertext = &envelope[EPH_PK_LEN + NONCE_LEN..];
 
     let shared = relay_sk.diffie_hellman(&X25519PublicKey::from(ephemeral_pk));
+    // Reject a non-contributory (low-order) ephemeral_pk (attacker-controlled,
+    // read off the wire above): a small-order point forces a known shared
+    // secret. Fail closed rather than derive an AEAD key off it.
+    if !shared.was_contributory() {
+        return Err(PushEnvelopeError::Aead);
+    }
     let aead_key = derive_aead_key(shared.as_bytes());
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&aead_key));

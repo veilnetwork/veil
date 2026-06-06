@@ -72,6 +72,12 @@ impl NodeRuntime {
         // Audit M8: mailbox handle for the runtime-summary refresh, so
         // `mailbox_entries` reports the real blob count instead of a hardcoded 0.
         let mailbox_for_summary = self.mailbox_state.mailbox.clone();
+        // Audit (this pass): outbox handle for the TTL-prune stage below. The
+        // mailbox/outbox `prune_expired` were implemented + tested but had NO
+        // periodic caller after the old `MailboxCleanup` loop was renamed, so
+        // the 7-day mailbox / 30-day outbox TTLs were never actually enforced —
+        // a never-ack'd blob lived forever and held its quota slot.
+        let outbox_for_prune = self.mailbox_state.outbox.clone();
         let health_tick = Arc::clone(&self.health_tick);
         let metrics = self.metrics.clone();
         let peer_mlkem_keys = Arc::clone(&self.identity.peer_mlkem_keys);
@@ -183,6 +189,14 @@ impl NodeRuntime {
                                 &chunk_reassembler, &cleanup_logger, now,
                             );
                             Self::tick_record_eviction_metrics(evicted, metrics.as_ref());
+                            // Enforce mailbox/outbox TTLs (pruned BEFORE the
+                            // summary refresh so `mailbox_entries` reflects the
+                            // post-prune count).
+                            Self::tick_prune_expired_mailbox(
+                                mailbox_for_summary.as_ref(),
+                                outbox_for_prune.as_ref(),
+                                &cleanup_logger,
+                            );
                             let (route_cache_size, banned_peers) = Self::tick_evict_secondary_caches(
                                 &route_cache, &rtt_table, &rate_limiter,
                                 reputation.as_ref(), &ban_list, &violation_tracker,
@@ -349,8 +363,46 @@ impl NodeRuntime {
         }
     }
 
-    /// Evict expired entries from the primary stores (gateway, discovery, DHT
-    /// chunk reassembler). removed the mailbox stage.
+    /// Enforce the mailbox/outbox TTLs. Both stores bound total bytes on the
+    /// `put` path, but a blob that is never ack'd (recipient never fetches) is
+    /// otherwise reclaimed only under global-quota LRU pressure — never by time
+    /// — so the documented 7-day mailbox / 30-day outbox TTLs need an explicit
+    /// periodic prune. This stage was silently dropped when the old
+    /// `MailboxCleanup` loop was renamed to the generic runtime-maintenance
+    /// loop; without it the TTLs were inert and a never-ack'd blob held its
+    /// quota slot forever. Best-effort: a prune error is logged, not fatal.
+    fn tick_prune_expired_mailbox(
+        mailbox: Option<&Arc<veil_mailbox::Mailbox>>,
+        outbox: Option<&Arc<veil_mailbox::Outbox>>,
+        logger: &Arc<NodeLogger>,
+    ) {
+        if let Some(mb) = mailbox {
+            match mb.prune_expired() {
+                Ok(n) if n > 0 => {
+                    logger.info("mailbox.ttl_evicted", format!("blobs_removed={n}"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    logger.warn("mailbox.ttl_prune_failed", format!("error={e}"));
+                }
+            }
+        }
+        if let Some(ob) = outbox {
+            match ob.prune_expired() {
+                Ok(n) if n > 0 => {
+                    logger.info("outbox.ttl_evicted", format!("entries_removed={n}"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    logger.warn("outbox.ttl_prune_failed", format!("error={e}"));
+                }
+            }
+        }
+    }
+
+    /// Evict expired entries from the primary stores (gateway, discovery, DHT,
+    /// chunk reassembler). Mailbox/outbox TTLs are handled separately by
+    /// [`Self::tick_prune_expired_mailbox`].
     #[allow(clippy::too_many_arguments)]
     pub fn tick_evict_expired_primary_stores(
         gateway: &Arc<veil_gateway::GatewayService>,

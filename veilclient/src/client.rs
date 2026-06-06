@@ -2401,6 +2401,15 @@ async fn reader_task(
 
 // ── Frame I/O helpers ─────────────────────────────────────────────────────────
 
+/// Hard upper-bound on how long a frame BODY may take to arrive after its
+/// header was read. Mirrors the daemon-side `BODY_READ_DEADLINE` in
+/// `veil-ipc::frame_io`: without it a fake/compromised daemon could announce a
+/// body of up to `MAX_FRAME_BODY` (16 MiB) and then never send it, pinning the
+/// SDK's reader task and the allocated buffer indefinitely. Only the body is
+/// bounded — the header read is left unbounded because an idle connection
+/// legitimately waits (possibly minutes) for the next frame.
+const IPC_BODY_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(crate) async fn read_frame_raw(
     stream: &mut IpcStream,
 ) -> Result<(FrameHeader, Vec<u8>), ClientError> {
@@ -2416,7 +2425,22 @@ pub(crate) async fn read_frame_raw(
     }
     let mut body = vec![0u8; hdr.body_len as usize];
     if !body.is_empty() {
-        stream.read_exact(&mut body).await?;
+        match tokio::time::timeout(IPC_BODY_READ_DEADLINE, stream.read_exact(&mut body)).await {
+            Ok(io_result) => {
+                io_result?;
+            }
+            Err(_elapsed) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "IPC frame body read timeout after {}s (header announced {} body bytes)",
+                        IPC_BODY_READ_DEADLINE.as_secs(),
+                        hdr.body_len,
+                    ),
+                )
+                .into());
+            }
+        }
     }
     Ok((hdr, body))
 }
@@ -2436,7 +2460,22 @@ pub(crate) async fn read_frame_rh(
     }
     let mut body = vec![0u8; hdr.body_len as usize];
     if !body.is_empty() {
-        rh.read_exact(&mut body).await?;
+        match tokio::time::timeout(IPC_BODY_READ_DEADLINE, rh.read_exact(&mut body)).await {
+            Ok(io_result) => {
+                io_result?;
+            }
+            Err(_elapsed) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "IPC frame body read timeout after {}s (header announced {} body bytes)",
+                        IPC_BODY_READ_DEADLINE.as_secs(),
+                        hdr.body_len,
+                    ),
+                )
+                .into());
+            }
+        }
     }
     Ok((hdr, body))
 }

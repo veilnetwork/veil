@@ -1094,7 +1094,7 @@ mod tests {
         let (silent_pending, _) =
             tokio::time::timeout(Duration::from_millis(500), listener.accept_raw())
                 .await
-                .expect("accept_raw блокирует на silent client")
+                .expect("accept_raw blocks on silent client")
                 .unwrap();
         assert!(
             start.elapsed() < Duration::from_millis(500),
