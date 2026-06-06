@@ -71,8 +71,13 @@ pub(crate) fn handle_anycast_report_failure(
     anycast_service: Option<&Arc<AnycastService>>,
 ) {
     if let (Ok(req), Some(svc)) = (AnycastReportFailurePayload::decode(body), anycast_service) {
-        svc.reputation()
-            .record_failure(req.node_id, req.service_tag);
+        // Bind the report to a real resolve + rate-limit it: a local IPC app
+        // must not be able to penalize an arbitrary honest node it was never
+        // offered. Rejected reports (unknown/expired candidate or rate-limited)
+        // are silently dropped — fire-and-forget opcode, no reply.
+        let _ = svc
+            .reputation()
+            .record_failure_if_issued(req.node_id, req.service_tag);
     }
 }
 

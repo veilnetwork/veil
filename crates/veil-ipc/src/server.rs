@@ -1675,7 +1675,7 @@ async fn handle_ipc_client(
                         handle_stream_open(
                             &mut wh, &body, &mut client_state, &app_registry,
                             &stream_table, &node_id,
-                            session_tx_registry.as_deref(), stream_bridge.as_ref(),
+                            session_tx_registry.clone(), stream_bridge.as_ref(),
                         ).await?;
                     }
                     Ok(LocalAppMsg::StreamData) => {
@@ -2197,7 +2197,7 @@ mod remote_stream_open_tests {
                 &registry,
                 &st_task,
                 &src,
-                Some(&*bc_task as &dyn veil_types::FrameBroadcaster),
+                Some(bc_task as Arc<dyn veil_types::FrameBroadcaster>),
                 Some(&br_task),
             )
             .await

@@ -1226,6 +1226,14 @@ pub enum UpdateCommand {
         /// to upgrade a genuine pre-existing legacy file.
         #[arg(long)]
         allow_legacy_state_migration: bool,
+        /// Operator-asserted anti-downgrade floor (unix seconds) for the legacy
+        /// migration above. The unauthenticated state file's OWN value is NOT
+        /// trusted; pass the lowest release_unix you know this host legitimately
+        /// reached, so a tampered/lowered file cannot wave through an older
+        /// signed manifest. Omit to accept the verified manifest as the new
+        /// baseline.
+        #[arg(long)]
+        migrate_min_release_unix: Option<u64>,
     },
     /// Build and sign an update manifest for a freshly built binary.
     ///

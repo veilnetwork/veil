@@ -470,11 +470,19 @@ impl AnycastService {
         candidates.dedup_by_key(|(id, _)| *id);
 
         let limit = (max_results as usize).min(MAX_ANYCAST_CANDIDATES);
-        let node_ids = candidates
+        let node_ids: Vec<[u8; 32]> = candidates
             .into_iter()
             .map(|(id, _)| id)
             .take(limit)
             .collect();
+
+        // Bind future app-reported failures to this real resolve: only the
+        // candidates we actually hand out may later be reported as failed
+        // (see `AnycastReputation::record_failure_if_issued`), so a local IPC
+        // app cannot penalize an honest node it was never offered.
+        for id in &node_ids {
+            self.reputation.note_issued(*id, service_tag);
+        }
 
         AnycastResultPayload {
             service_tag,
