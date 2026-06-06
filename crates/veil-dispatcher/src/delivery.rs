@@ -1185,9 +1185,13 @@ impl FrameDispatcher {
             Err(e) => return DispatchResult::Violation(format!("bad Forward: {e}")),
         };
 
-        // Reject envelopes with unset node ids (meta-E2E is the one exception).
+        // Reject envelopes with unset node ids (meta-E2E and chunk-envelope
+        // wrappers are the exceptions — an anonymous chunked send carries a
+        // zero sender on each chunk and a meta-E2E payload only after reassembly).
         if payload.envelope.sender_node_id == [0u8; 32]
             && payload.envelope.payload.first() != Some(&veil_proto::META_E2E_MARKER)
+            && payload.envelope.payload.first()
+                != Some(&veil_proto::delivery::CHUNKED_ENVELOPE_MARKER)
         {
             return DispatchResult::Violation("Forward: zero sender_node_id".into());
         }
@@ -1234,6 +1238,25 @@ impl FrameDispatcher {
     /// reverse route, dispatch to the local app registry, and emit an ACK
     /// back to the original sender when `require_ack` is set.
     fn deliver_forward_locally(&self, payload: ForwardPayload, peer_id: NodeId) {
+        self.terminal_deliver(payload.envelope, peer_id);
+    }
+
+    /// Terminal delivery of a `DeliveryEnvelope` addressed to this node. Handles
+    /// (a) relay-chunked envelopes — accumulated in the reassembler until the
+    /// whole message arrives, then re-entered here as the reconstructed original
+    /// envelope — and (b) ordinary envelopes — deduped, E2E-decrypted, delivered
+    /// to the addressed app, and ACKed. Called both from `deliver_forward_locally`
+    /// (a Forward addressed to us) and from chunk reassembly on completion.
+    fn terminal_deliver(&self, envelope: DeliveryEnvelope, peer_id: NodeId) {
+        // Relay-chunked piece? Divert to reassembly. Only the reassembled
+        // ORIGINAL envelope (payload no longer chunk-marked) proceeds below, so
+        // app_id/endpoint_id/E2E/ACK semantics are preserved instead of being
+        // flattened into an epidemic broadcast.
+        if envelope.payload.first() == Some(&veil_proto::delivery::CHUNKED_ENVELOPE_MARKER) {
+            self.handle_chunk_envelope(envelope, peer_id);
+            return;
+        }
+
         // Terminal replay guard: the same envelope can arrive here twice (a
         // captured-frame replay, or a multi-path delivery race). The relay
         // path already dedups on `content_id` (see `check_relay_preconditions`);
@@ -1241,11 +1264,10 @@ impl FrameDispatcher {
         // most once within the TTL window. A zero `content_id` is an unset
         // sentinel — never dedup it (that would collapse every zero-id frame
         // into one); just deliver.
-        let content_id = payload.envelope.content_id;
+        let content_id = envelope.content_id;
         if content_id != [0u8; 32] && lock!(self.forward_seen_set).check_and_insert(content_id) {
             return;
         }
-        let envelope = payload.envelope;
         let first_byte = envelope.payload.first().copied();
 
         // Resolve the decapsulation-key seed once (used by both E2E branches).
@@ -1301,6 +1323,48 @@ impl FrameDispatcher {
         // per-message ACK key (C-09) so a relay cannot forge it.
         if envelope.require_ack {
             self.send_delivery_ack(deliver_sender_node_id, envelope.content_id, ack_key);
+        }
+    }
+
+    /// Accumulate one relay-chunked envelope. Each chunk is an ordinary Forward
+    /// envelope whose payload is a [`ChunkedEnvelopePayload`]; the bounded
+    /// reassembler joins them by `transfer_id`, and on completion we re-enter
+    /// [`Self::terminal_deliver`] with the reconstructed ORIGINAL envelope so the
+    /// standard E2E-decrypt + addressed-delivery + ACK path runs unchanged.
+    fn handle_chunk_envelope(&self, envelope: DeliveryEnvelope, peer_id: NodeId) {
+        use crate::envelope_chunks::AddChunkResult;
+        use veil_proto::delivery::ChunkedEnvelopePayload;
+        let chunk = match ChunkedEnvelopePayload::decode(&envelope.payload) {
+            Ok(c) => c,
+            Err(e) => {
+                self.logger
+                    .warn("chunk.bad_envelope", format!("decode failed: {e}"));
+                return;
+            }
+        };
+        let now = veil_util::unix_secs_now_u64();
+        let result = lock!(self.chunk_reassembler).add(&envelope, chunk, now);
+        match result {
+            AddChunkResult::Complete(reassembled) => {
+                if let Some(m) = &self.metrics {
+                    m.inc_chunks_reassembled();
+                }
+                self.logger.info(
+                    "chunk.reassembly_complete",
+                    format!(
+                        "content_id={} size={}",
+                        veil_util::hex_short(&reassembled.content_id),
+                        reassembled.payload.len(),
+                    ),
+                );
+                // Re-enter terminal delivery; the reassembled payload is no
+                // longer chunk-marked, so it takes the normal decrypt+deliver path.
+                self.terminal_deliver(*reassembled, peer_id);
+            }
+            AddChunkResult::Pending => {}
+            AddChunkResult::Rejected(reason) => {
+                self.logger.warn("chunk.rejected", reason);
+            }
         }
     }
 
@@ -1451,74 +1515,26 @@ impl FrameDispatcher {
     }
 
     /// 289: register the reassembly manifest for an upcoming chunk set.
-    fn handle_chunk_manifest(&self, body: &[u8]) -> DispatchResult {
-        use veil_proto::delivery::ChunkManifestPayload;
-        let manifest = match ChunkManifestPayload::decode(body) {
-            Ok(m) => m,
-            Err(e) => return DispatchResult::Violation(format!("bad ChunkManifest: {e}")),
-        };
-        if !lock!(self.chunk_reassembler).register_manifest(&manifest) {
-            self.logger.warn(
-                "chunk.manifest_rejected",
-                format!(
-                    "transfer_id={} chunk_count={} total_size={}",
-                    veil_util::hex_str(&manifest.transfer_id),
-                    manifest.chunk_count,
-                    manifest.total_size,
-                ),
-            );
-        }
+    // Legacy direct-chunk frames (`DeliveryMsg::ChunkManifest` / `Chunk`) are
+    // obsolete. Large payloads now ride the relay-preserving chunk-envelope path
+    // (`handle_chunk_envelope`), where each chunk is an ordinary relayable
+    // Forward envelope reassembled into the original addressed envelope. These
+    // frame types are no longer emitted by this codebase. Drop them (no peer
+    // penalty, for version-skew tolerance) rather than the old
+    // reassemble-then-`broadcast_epidemic` behaviour, which flattened an
+    // addressed message into an unauthenticated epidemic broadcast to every
+    // local app endpoint (that vector is closed here).
+    fn handle_chunk_manifest(&self, _body: &[u8]) -> DispatchResult {
+        self.logger.warn(
+            "chunk.obsolete_frame",
+            "dropped obsolete ChunkManifest frame",
+        );
         DispatchResult::NoResponse
     }
 
-    /// add a chunk to the reassembler; when the transfer completes
-    /// broadcast the reassembled payload to local app endpoints.
-    fn handle_chunk(&self, body: &[u8], peer_id: NodeId) -> DispatchResult {
-        use veil_proto::delivery::ChunkPayload;
-        use veil_transfer::AddChunkResult;
-        let chunk = match ChunkPayload::decode(body) {
-            Ok(c) => c,
-            Err(e) => return DispatchResult::Violation(format!("bad Chunk: {e}")),
-        };
-        let transfer_id = chunk.transfer_id;
-        let result = lock!(self.chunk_reassembler).add_chunk(
-            &chunk.transfer_id,
-            chunk.chunk_index,
-            chunk.data,
-        );
-        match result {
-            AddChunkResult::Complete {
-                payload,
-                content_id,
-            } => {
-                self.logger.info(
-                    "chunk.reassembly_complete",
-                    format!(
-                        "content_id={} size={}",
-                        veil_util::hex_short(&content_id),
-                        payload.len(),
-                    ),
-                );
-                if let Some(m) = &self.metrics {
-                    m.inc_chunks_reassembled();
-                }
-                // Mirror the non-chunked delivery path: broadcast to app endpoints.
-                self.app_registry
-                    .broadcast_epidemic(*peer_id.as_bytes(), payload);
-            }
-            AddChunkResult::HashMismatch => {
-                self.logger.warn(
-                    "chunk.hash_mismatch",
-                    format!("transfer_id={}", veil_util::hex_str(&transfer_id),),
-                );
-            }
-            AddChunkResult::MemoryCapExceeded => {
-                self.logger
-                    .warn("chunk.memory_cap", "reassembly buffer full");
-            }
-            // Pending / UnknownTransfer / ChunkIndexOutOfRange / DuplicateChunk — silent.
-            _ => {}
-        }
+    fn handle_chunk(&self, _body: &[u8], _peer_id: NodeId) -> DispatchResult {
+        self.logger
+            .warn("chunk.obsolete_frame", "dropped obsolete Chunk frame");
         DispatchResult::NoResponse
     }
 
@@ -2013,6 +2029,113 @@ mod tests {
         assert!(
             endpoint_rx.try_recv().is_err(),
             "replayed terminal Forward must NOT produce a second delivery",
+        );
+    }
+
+    /// H-B end-to-end: a payload larger than `MAX_ENVELOPE_PAYLOAD`, split into
+    /// relay-chunked envelopes (as the IPC sender does), is reassembled at the
+    /// destination and delivered ONCE to the addressed app endpoint with the
+    /// full original bytes — i.e. `app_id`/`endpoint_id` and message integrity
+    /// are preserved (the old path flattened this into a lossy epidemic broadcast).
+    #[test]
+    fn relay_chunked_envelope_reassembles_and_delivers_once() {
+        use crate::make_test_dispatcher;
+        use veil_app::registry::AppMessage;
+        use veil_proto::budget::MAX_CHUNK_PAYLOAD;
+        use veil_proto::delivery::{
+            ChunkedEnvelopePayload, DeliveryEnvelope, ForwardPayload, MAX_ENVELOPE_PAYLOAD,
+        };
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::FrameHeader;
+
+        let sender_id = [0xAAu8; 32];
+        let recipient_id = [0xBBu8; 32];
+        let dst_app_id = [0xCCu8; 32];
+        let dst_endpoint_id = 0xC0DEu32;
+
+        let mut disp = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        disp.local_node_id = recipient_id;
+        let (_handle, mut endpoint_rx) =
+            disp.app_registry.register(dst_app_id, dst_endpoint_id, 16);
+
+        // Original plaintext message just over the single-envelope limit so it
+        // genuinely requires chunking. First byte must not be an E2E/chunk marker.
+        let total = MAX_ENVELOPE_PAYLOAD + 50_000;
+        let original: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        assert!(original[0] < 0xE2);
+
+        let pieces: Vec<&[u8]> = original.chunks(MAX_CHUNK_PAYLOAD).collect();
+        let chunk_count = pieces.len() as u32;
+        assert!(chunk_count > 1, "test must span multiple chunks");
+        let transfer_id = [0x5Au8; 16];
+        let orig_content_id = [0x77u8; 32];
+
+        // Deliver every chunk-envelope as an ordinary terminal Forward (out of
+        // order, to exercise index-based reassembly).
+        let mut order: Vec<usize> = (0..pieces.len()).collect();
+        order.rotate_left(1); // 1,2,...,0 — last chunk arrives last but not first
+
+        for &i in &order {
+            let wrapper = ChunkedEnvelopePayload {
+                transfer_id,
+                chunk_index: i as u32,
+                chunk_count,
+                total_size: total as u32,
+                orig_content_id,
+                require_ack: false,
+                data: pieces[i].to_vec(),
+            }
+            .encode();
+            let mut cid = [0u8; 32];
+            cid[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            cid[8] = 1; // ensure non-zero, distinct per chunk
+            let envelope = DeliveryEnvelope {
+                recipient: veil_proto::recipient::Recipient::any(recipient_id),
+                sender_node_id: sender_id,
+                src_app_id: [0xA1u8; 32],
+                app_id: dst_app_id,
+                endpoint_id: dst_endpoint_id,
+                content_id: cid,
+                created_at: veil_util::unix_secs_now_u64(),
+                ttl_secs: 3600,
+                payload: wrapper,
+                trace_id: 0,
+                require_ack: false,
+            };
+            let body = ForwardPayload {
+                next_hop_node_id: recipient_id,
+                envelope,
+                relay_hops: 0,
+            }
+            .encode();
+            let mut hdr =
+                FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            hdr.body_len = body.len() as u32;
+            disp.dispatch(&hdr, &body, sender_id);
+        }
+
+        // Exactly one Deliver, carrying the full reassembled payload.
+        match endpoint_rx.try_recv() {
+            Ok(AppMessage::Deliver {
+                app_id,
+                endpoint_id,
+                data,
+                ..
+            }) => {
+                assert_eq!(app_id, dst_app_id);
+                assert_eq!(endpoint_id, dst_endpoint_id);
+                assert_eq!(data.as_ref().len(), total, "reassembled length mismatch");
+                assert_eq!(
+                    data.as_ref(),
+                    original.as_slice(),
+                    "reassembled bytes mismatch"
+                );
+            }
+            other => panic!("expected one reassembled Deliver, got {other:?}"),
+        }
+        assert!(
+            endpoint_rx.try_recv().is_err(),
+            "chunked transfer must deliver exactly once",
         );
     }
 

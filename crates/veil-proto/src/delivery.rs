@@ -537,6 +537,134 @@ impl ChunkPayload {
     }
 }
 
+// ── ChunkedEnvelopePayload (relay-preserving large-payload chunking) ──
+//
+// Unlike `ChunkManifestPayload`/`ChunkPayload` (which ride direct
+// `DeliveryMsg::ChunkManifest`/`Chunk` frames to a peer we have a session
+// with), a `ChunkedEnvelopePayload` is the *body of an ordinary
+// `DeliveryEnvelope`*: the sender splits an oversized envelope payload into N
+// pieces, wraps each piece in this header, and ships each as a normal
+// `DeliveryMsg::Forward` envelope. Every chunk therefore relays hop-by-hop over
+// the proven Forward path (TTL, dedup, route-cache failover all reused), and
+// the destination reassembles the pieces back into the original envelope
+// payload before running the standard E2E-decrypt + addressed-delivery + ACK
+// terminal path — preserving `app_id`/`endpoint_id`/E2E/ACK semantics that the
+// old `broadcast_epidemic` reassembly discarded.
+
+/// Leading marker byte of a chunk-carrying `DeliveryEnvelope` payload. Distinct
+/// from `E2E_MARKER` (0xE2) and `META_E2E_MARKER` (0xE3) so the terminal
+/// delivery path can tell a chunk wrapper apart from a (meta-)E2E payload.
+pub const CHUNKED_ENVELOPE_MARKER: u8 = 0xE4;
+
+/// `flags` bit: the *original* (reassembled) message requested a delivery ACK.
+/// Carried per-chunk so the destination can ACK once after reassembly. The
+/// per-chunk envelopes themselves never set `DeliveryEnvelope::require_ack`
+/// (they are not individually acked).
+pub const CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK: u8 = 0x01;
+
+/// One chunk of an oversized `DeliveryEnvelope`, carried inside the payload of a
+/// normal relayable envelope.
+///
+/// Wire layout (header = 62 bytes, then chunk data):
+/// ```text
+/// [0]      marker = CHUNKED_ENVELOPE_MARKER (0xE4)
+/// [1..17]  transfer_id [u8; 16]
+/// [17..21] chunk_index u32 BE (0-based)
+/// [21..25] chunk_count u32 BE (1..=MAX_TRANSFER_CHUNKS)
+/// [25..29] total_size u32 BE (reassembled payload bytes, ≤ MAX_REASSEMBLY_BYTES)
+/// [29..61] orig_content_id [u8; 32] (content_id of the WHOLE message, for ACK + terminal dedup)
+/// [61]     flags u8 (bit0 = original require_ack)
+/// [62..]   data (this chunk's slice of the original payload, ≤ MAX_CHUNK_PAYLOAD)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkedEnvelopePayload {
+    /// Transfer id shared by every chunk of one logical message.
+    pub transfer_id: TransferId,
+    /// Zero-based index of this chunk.
+    pub chunk_index: u32,
+    /// Total number of chunks in the transfer.
+    pub chunk_count: u32,
+    /// Total reassembled payload size in bytes.
+    pub total_size: u32,
+    /// content_id of the whole (reassembled) message — used for the ACK and the
+    /// terminal replay-dedup, distinct from each chunk envelope's own content_id.
+    pub orig_content_id: [u8; 32],
+    /// `true` iff the original message set `require_ack`.
+    pub require_ack: bool,
+    /// This chunk's payload slice.
+    pub data: Vec<u8>,
+}
+
+impl ChunkedEnvelopePayload {
+    /// Size of the fixed-width header (before `data`).
+    pub const HEADER_SIZE: usize = 1 + 16 + 4 + 4 + 4 + 32 + 1; // 62
+
+    /// Encode to wire bytes (marker-prefixed).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.data.len());
+        buf.push(CHUNKED_ENVELOPE_MARKER);
+        buf.extend_from_slice(&self.transfer_id);
+        buf.extend_from_slice(&self.chunk_index.to_be_bytes());
+        buf.extend_from_slice(&self.chunk_count.to_be_bytes());
+        buf.extend_from_slice(&self.total_size.to_be_bytes());
+        buf.extend_from_slice(&self.orig_content_id);
+        buf.push(if self.require_ack {
+            CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK
+        } else {
+            0
+        });
+        buf.extend_from_slice(&self.data);
+        buf
+    }
+
+    /// Parse from wire bytes. Validates the marker and the structural bounds
+    /// (`chunk_count` in `1..=MAX_TRANSFER_CHUNKS`, `chunk_index < chunk_count`,
+    /// `total_size ≤ MAX_REASSEMBLY_BYTES`, `data ≤ MAX_CHUNK_PAYLOAD`) so a
+    /// malformed or non-chunk payload is rejected before reassembly.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::HEADER_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::HEADER_SIZE,
+                got: buf.len(),
+            });
+        }
+        if buf[0] != CHUNKED_ENVELOPE_MARKER {
+            return Err(ProtoError::Malformed(
+                "not a chunked-envelope payload".into(),
+            ));
+        }
+        let chunk_index = u32::from_be_bytes([buf[17], buf[18], buf[19], buf[20]]);
+        let chunk_count = u32::from_be_bytes([buf[21], buf[22], buf[23], buf[24]]);
+        let total_size = u32::from_be_bytes([buf[25], buf[26], buf[27], buf[28]]);
+        if chunk_count == 0 || chunk_count > super::budget::MAX_TRANSFER_CHUNKS {
+            return Err(ProtoError::Malformed("chunk_count out of range".into()));
+        }
+        if chunk_index >= chunk_count {
+            return Err(ProtoError::Malformed("chunk_index >= chunk_count".into()));
+        }
+        if total_size as usize > super::budget::MAX_REASSEMBLY_BYTES {
+            return Err(ProtoError::Malformed(
+                "total_size exceeds reassembly cap".into(),
+            ));
+        }
+        let data = buf[Self::HEADER_SIZE..].to_vec();
+        if data.len() > super::budget::MAX_CHUNK_PAYLOAD {
+            return Err(ProtoError::Malformed(
+                "chunk data exceeds MAX_CHUNK_PAYLOAD".into(),
+            ));
+        }
+        Ok(Self {
+            transfer_id: super::read_array::<16>(buf, 1)?,
+            chunk_index,
+            chunk_count,
+            total_size,
+            orig_content_id: super::read_array::<32>(buf, 29)?,
+            require_ack: buf[61] & CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK != 0,
+            data,
+        })
+    }
+}
+
 // ── TransitFramePayload ───────────────────────────────────────────
 
 /// Stateless transit relay frame — lightweight header for relay forwarding
@@ -846,6 +974,78 @@ impl RelayPathPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_envelope_round_trip() {
+        let p = ChunkedEnvelopePayload {
+            transfer_id: [7u8; 16],
+            chunk_index: 3,
+            chunk_count: 10,
+            total_size: 600_000,
+            orig_content_id: [0xCDu8; 32],
+            require_ack: true,
+            data: vec![0xABu8; 1234],
+        };
+        let wire = p.encode();
+        assert_eq!(wire[0], CHUNKED_ENVELOPE_MARKER);
+        assert_eq!(wire.len(), ChunkedEnvelopePayload::HEADER_SIZE + 1234);
+        let back = ChunkedEnvelopePayload::decode(&wire).expect("decode");
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn chunked_envelope_rejects_bad_marker() {
+        let mut wire = ChunkedEnvelopePayload {
+            transfer_id: [0u8; 16],
+            chunk_index: 0,
+            chunk_count: 1,
+            total_size: 4,
+            orig_content_id: [0u8; 32],
+            require_ack: false,
+            data: vec![1, 2, 3, 4],
+        }
+        .encode();
+        wire[0] = 0xE3; // META_E2E_MARKER — must NOT be mistaken for a chunk
+        assert!(ChunkedEnvelopePayload::decode(&wire).is_err());
+    }
+
+    #[test]
+    fn chunked_envelope_rejects_index_ge_count_and_oversize() {
+        // index >= count
+        let mut bad = ChunkedEnvelopePayload {
+            transfer_id: [0u8; 16],
+            chunk_index: 0,
+            chunk_count: 2,
+            total_size: 4,
+            orig_content_id: [0u8; 32],
+            require_ack: false,
+            data: vec![1, 2, 3, 4],
+        }
+        .encode();
+        // overwrite chunk_index (offset 17..21) to 5 (>= count 2)
+        bad[17..21].copy_from_slice(&5u32.to_be_bytes());
+        assert!(ChunkedEnvelopePayload::decode(&bad).is_err());
+
+        // chunk_count over MAX_TRANSFER_CHUNKS
+        let mut over = ChunkedEnvelopePayload {
+            transfer_id: [0u8; 16],
+            chunk_index: 0,
+            chunk_count: 1,
+            total_size: 4,
+            orig_content_id: [0u8; 32],
+            require_ack: false,
+            data: vec![1, 2, 3, 4],
+        }
+        .encode();
+        over[21..25]
+            .copy_from_slice(&(super::super::budget::MAX_TRANSFER_CHUNKS + 1).to_be_bytes());
+        assert!(ChunkedEnvelopePayload::decode(&over).is_err());
+    }
+
+    #[test]
+    fn chunked_envelope_truncated_rejected() {
+        assert!(ChunkedEnvelopePayload::decode(&[CHUNKED_ENVELOPE_MARKER; 10]).is_err());
+    }
 
     fn sample_envelope() -> DeliveryEnvelope {
         DeliveryEnvelope {
