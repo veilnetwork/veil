@@ -918,6 +918,19 @@ pub const MAX_TRANSFERS_CONCURRENT: usize = 256;
 /// for full rationale.
 pub const DELIVERY_CHANNEL_CAP: usize = 1024;
 
+/// Byte budget for the per-IPC-client delivery queue, enforced ALONGSIDE the
+/// frame-count cap above.
+///
+/// The count cap alone bounds frame *count*, not bytes — and a single delivered
+/// message can now be large (a relay-chunked transfer reassembles to up to
+/// `MAX_REASSEMBLY_BYTES` before the app reads it), so `DELIVERY_CHANNEL_CAP`
+/// frames could pin gigabytes against a slow / non-reading client. This caps
+/// total in-flight delivery bytes per client: once exceeded, further frames are
+/// dropped (counted as `ipc_delivery_drops`) exactly like a count-full queue.
+/// 96 MiB leaves headroom above the ~60 MiB steady-state backlog the count cap
+/// was tuned for (Phase E27) while bounding the pathological large-frame case.
+pub const MAX_DELIVERY_INFLIGHT_BYTES: usize = 96 * 1024 * 1024;
+
 /// Bounded capacity of the per-proxy-stream data channel (APP_DATA chunks
 /// queued for an outbound TCP connection that is applying backpressure).
 /// At 65536 bytes per chunk this caps memory per proxy stream at ~16 MiB.
