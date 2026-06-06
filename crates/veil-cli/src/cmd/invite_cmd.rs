@@ -2,11 +2,11 @@
 //!
 //! Generates / consumes [`veil_invite::InviteBundleV1`] for trusted /
 //! hidden listeners that are not advertised on PEX or DHT.  The bundle
-//! is bearer-credential — anyone holding а valid bundle can complete
-//! the obfs4-PSK handshake against the embedded transport URI.  Distinct
-//! from `bootstrap invite` (public-listener handoff) in that an invite
-//! bundle carries the actual PSK bytes; bootstrap invites carry only а
-//! transport URI + identity public key.
+//! is a bearer credential — anyone holding a valid bundle can complete
+//! the obfs4-PSK handshake against the embedded transport URI.  It differs
+//! from `bootstrap invite` (which just hands off a public listener) in that
+//! an invite bundle carries the actual PSK bytes; bootstrap invites carry
+//! only a transport URI and identity public key.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -502,11 +502,11 @@ mod tests {
         }
     }
 
-    /// End-to-end: an inviter с configured Trusted listener emits а
-    /// bundle к а file; the recipient consumes the bundle и ends up
-    /// с (а) the PSK saved at the expected default path, (b) the
-    /// inviter appended к bootstrap_peers с the right transport URI и
-    /// public_key derived от the bundle's `vk`.
+    /// End-to-end: an inviter with a configured Trusted listener emits a
+    /// bundle to a file; the recipient consumes the bundle and ends up
+    /// with (a) the PSK saved at the expected default path, (b) the
+    /// inviter appended to bootstrap_peers with the right transport URI and
+    /// public_key derived from the bundle's `vk`.
     #[test]
     fn create_accept_round_trip_e2e() {
         use ed25519_dalek::SigningKey;
@@ -663,7 +663,7 @@ mod tests {
         );
     }
 
-    /// `--no-update-config` writes the PSK файл but leaves
+    /// `--no-update-config` writes the PSK file but leaves
     /// `bootstrap_peers` untouched.
     #[test]
     fn accept_with_no_update_config_leaves_peers_empty() {
@@ -716,8 +716,8 @@ mod tests {
     }
 
     /// Public-visibility listener rejected at create time — operator
-    /// would otherwise leak а PSK redundantly (Public listeners are
-    /// already discoverable через PEX/DHT).
+    /// would otherwise leak a PSK redundantly (Public listeners are
+    /// already discoverable through PEX/DHT).
     #[test]
     fn create_rejects_public_visibility_listener() {
         use ed25519_dalek::SigningKey;
