@@ -107,8 +107,15 @@ pub fn resolve_ipc_endpoint(
                         "ipc.socket_uri: TCP host must be loopback, got `{host}`"
                     )));
                 }
+                // `SocketAddr::parse` does not resolve hostnames; map the
+                // accepted `localhost` alias to a loopback literal.
+                let host_ip = if host == "localhost" {
+                    "127.0.0.1"
+                } else {
+                    host.as_str()
+                };
                 let bind_addr: std::net::SocketAddr =
-                    format!("{host}:{port}").parse().map_err(|e| {
+                    format!("{host_ip}:{port}").parse().map_err(|e| {
                         IpcEndpointError::Validation(format!(
                             "ipc.socket_uri: invalid tcp address {host}:{port} — {e}"
                         ))

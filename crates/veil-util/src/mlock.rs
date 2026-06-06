@@ -207,7 +207,7 @@ static MADVISE_DONTDUMP_WARNED: std::sync::atomic::AtomicBool =
 /// — failures are non-fatal (the region remains mlocked).
 #[cfg(target_os = "linux")]
 unsafe fn try_exclude_from_coredump(ptr: *const u8, len: usize) {
-    // SAFETY: ptr+len describe a valid heap allocation que the caller
+    // SAFETY: ptr+len describe a valid heap allocation that the caller
     // just successfully mlock'd; the kernel accepts arbitrary
     // page-spanning ranges and returns -1 on failure without mutating memory.
     let rc = unsafe { libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTDUMP) };
