@@ -34,8 +34,7 @@
 use sha2::{Digest, Sha256};
 
 use super::manifest::{
-    BINARY_SHA256_LEN, MAX_MANIFEST_BYTES, ManifestError, UpdateManifest, decode_manifest,
-    verify_manifest,
+    BINARY_SHA256_LEN, MAX_MANIFEST_BYTES, ManifestError, VerifiedManifest, decode_manifest,
 };
 
 /// Hard cap on a single update-binary download. 100 MiB is well
@@ -91,7 +90,7 @@ pub async fn fetch_manifest_with_failover<F, Fut>(
     expected_issuer_pk: &str,
     installed_release_unix: Option<u64>,
     now_unix_secs: Option<u64>,
-) -> Result<UpdateManifest, FetchError>
+) -> Result<VerifiedManifest, FetchError>
 where
     F: Fn(&str) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
@@ -119,18 +118,22 @@ where
                 continue;
             }
         };
-        if let Err(e) = verify_manifest(
-            &m,
+        // Verify-and-wrap: the returned `VerifiedManifest` is the type-level
+        // proof that downstream `apply_update` requires.
+        match VerifiedManifest::verify(
+            m,
             Some(expected_issuer_pk),
             installed_release_unix,
             now_unix_secs,
         ) {
-            if first_error.is_none() {
-                first_error = Some(format!("{url}: verify: {e}"));
+            Ok(verified) => return Ok(verified),
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("{url}: verify: {e}"));
+                }
+                continue;
             }
-            continue;
         }
-        return Ok(m);
     }
     Err(FetchError::AllUrlsFailed {
         tried: urls.len(),
@@ -146,9 +149,11 @@ pub enum UpdateAvailability {
     /// signed (so a UI can show "you're on the latest version
     /// pushed YYYY-MM-DD").
     UpToDate { latest_release_unix: u64 },
-    /// A newer signed manifest exists. Caller can pass the manifest
-    /// to a binary-fetch + restart pipeline.
-    Available { manifest: UpdateManifest },
+    /// A newer signed manifest exists. Caller can pass the (already-verified)
+    /// manifest straight to the binary-fetch + `apply_update` pipeline — the
+    /// `VerifiedManifest` type carries the proof that fetch-time verification
+    /// succeeded.
+    Available { manifest: VerifiedManifest },
 }
 
 /// Check whether a newer signed manifest exists.
@@ -293,7 +298,7 @@ pub async fn fetch_manifest_via_https(
     expected_issuer_pk: &str,
     installed_release_unix: Option<u64>,
     now_unix_secs: Option<u64>,
-) -> Result<UpdateManifest, FetchError> {
+) -> Result<VerifiedManifest, FetchError> {
     let fetcher = move |url: &str| {
         let ctx = ctx.clone();
         let url = url.to_owned();
