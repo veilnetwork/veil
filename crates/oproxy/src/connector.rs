@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use tokio::io::{AsyncReadExt, copy};
+use tokio::io::copy;
 use tokio::net::TcpStream;
 
 use veilclient::AppSender;
@@ -427,15 +427,4 @@ pub async fn bridge_via_routing(
             },
         },
     }
-}
-
-/// Helper: read N bytes from an inbound TCP stream into a buffer
-/// (used by SOCKS5 / HTTP handshake parsers).
-pub async fn read_exact_n<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-    n: usize,
-) -> std::io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; n];
-    reader.read_exact(&mut buf).await?;
-    Ok(buf)
 }
