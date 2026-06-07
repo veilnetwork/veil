@@ -15,10 +15,10 @@ use veil_types::{FrameBroadcaster, PexConfig};
 use crate::{PexEvent, PexLogger, encode_pex_frame};
 
 const MAX_PEERS_PER_SUBNET: usize = 2;
-const MIN_PEERS_FOR_BACKOFF: usize = 3;
-const BASE_INTERVAL_SECS: u64 = 120;
-const BACKOFF_STEP_SECS: u64 = 7200;
-const MAX_INTERVAL_SECS: u64 = 48 * 3600;
+// Walk-cadence tiers + thresholds are operator-tunable via `[pex]` in node.toml
+// (see `veil_types::PexConfig`): low_peer_threshold / high_peer_threshold and
+// search_interval_active/mid/idle_secs. Defaults: <3 sessions → 15 min,
+// 3..20 → 1 h, >=20 → 1 day.
 const INITIAL_DELAY_SECS: u64 = 30;
 
 /// Discovered peers from PEX, shared with the runtime for connection attempts.
@@ -233,14 +233,19 @@ pub async fn spawn_pex_initiator(
                 if *shutdown_rx.borrow() { break; }
             }
             _ = tokio::time::sleep_until(next_walk) => {
-                let public_count = {
+                // Gate walk-backoff on ACTIVE SESSIONS, not on the count of
+                // DISCOVERED peers: a node that discovered peers but failed to
+                // connect to them must keep walking, not sleep for hours
+                // believing it is healthy (see `compute_interval`).
+                let connected_count = broadcaster.active_node_ids().len();
+                let discovered_count = {
                     let state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
                     state.public_peer_count()
                 };
-                let interval = compute_interval(public_count);
-                if public_count >= MIN_PEERS_FOR_BACKOFF {
+                let interval = compute_interval(connected_count, &config);
+                if connected_count >= config.low_peer_threshold {
                     logger.info("pex.initiator.sleep",
-                        &format!("public_peers={public_count} next_walk_in={interval}s"));
+                        &format!("active_sessions={connected_count} discovered={discovered_count} next_walk_in={interval}s"));
                 }
                 send_walks(
                     &local_node_id, &local_pubkey, local_nonce,
@@ -514,12 +519,35 @@ fn xor_leading_bits(a: &[u8; 32], b: &[u8; 32]) -> u32 {
     256
 }
 
-fn compute_interval(public_peer_count: usize) -> u64 {
-    if public_peer_count < MIN_PEERS_FOR_BACKOFF {
-        BASE_INTERVAL_SECS
+/// Walk cadence as a function of ACTIVE-SESSION count (`connected`), tiered by
+/// operator-tunable thresholds in [`PexConfig`].
+///
+/// Cadence must reflect how many sessions we have actually ESTABLISHED, not how
+/// many peers we have merely DISCOVERED. A node can discover peers it then fails
+/// to connect to — dial failures, or a keyspace-isolated `node_id` that few
+/// peers dial back — so keying the walk interval on `discovered_peers.len()`
+/// made such a node sleep for hours while under-connected (observed on the
+/// testnet: discovered=5, active sessions=3 → 6 h backoff, stuck at 3/7 even
+/// though the random-walk machinery was "running").
+///
+/// Keying on `connected` is also **scale-safe**: the active-session count is
+/// bounded by the node's connection target regardless of network size, so a
+/// node searches aggressively only while genuinely under-connected and then
+/// steps down — it does NOT keep walking forever just because billions of peers
+/// exist to be discovered. (Filling sessions UP TO the target from
+/// already-discovered peers is the dial loop's job, not the discovery-walk's.)
+///
+/// Tiers (defaults; all configurable via `[pex]`):
+/// * `< low_peer_threshold` (3) sessions → `search_interval_active_secs` (15 min)
+/// * `low..high_peer_threshold` (3..20)  → `search_interval_mid_secs` (1 h)
+/// * `>= high_peer_threshold` (20)       → `search_interval_idle_secs` (1 day)
+fn compute_interval(connected: usize, config: &PexConfig) -> u64 {
+    if connected < config.low_peer_threshold {
+        config.search_interval_active_secs
+    } else if connected < config.high_peer_threshold {
+        config.search_interval_mid_secs
     } else {
-        let extra = (public_peer_count - MIN_PEERS_FOR_BACKOFF) as u64;
-        (BACKOFF_STEP_SECS + extra * BACKOFF_STEP_SECS).min(MAX_INTERVAL_SECS)
+        config.search_interval_idle_secs
     }
 }
 
@@ -570,22 +598,35 @@ mod tests {
     }
 
     #[test]
-    fn compute_interval_below_threshold() {
-        assert_eq!(compute_interval(0), BASE_INTERVAL_SECS);
-        assert_eq!(compute_interval(2), BASE_INTERVAL_SECS);
+    fn compute_interval_tiers_by_active_sessions() {
+        let c = PexConfig::default();
+        // < low_peer_threshold (3) active sessions → aggressive 15-min search.
+        assert_eq!(compute_interval(0, &c), 15 * 60);
+        assert_eq!(compute_interval(2, &c), 15 * 60);
+        // low..high (3..20) → hourly.
+        assert_eq!(compute_interval(3, &c), 60 * 60);
+        assert_eq!(compute_interval(19, &c), 60 * 60);
+        // >= high_peer_threshold (20) → once-daily maintenance search.
+        assert_eq!(compute_interval(20, &c), 24 * 60 * 60);
+        assert_eq!(compute_interval(1_000, &c), 24 * 60 * 60);
     }
 
     #[test]
-    fn compute_interval_with_backoff() {
-        // 3 peers → BACKOFF_STEP_SECS
-        assert_eq!(compute_interval(3), BACKOFF_STEP_SECS);
-        // 4 peers → 2 * BACKOFF_STEP_SECS
-        assert_eq!(compute_interval(4), BACKOFF_STEP_SECS * 2);
-    }
-
-    #[test]
-    fn compute_interval_capped() {
-        assert!(compute_interval(1000) <= MAX_INTERVAL_SECS);
+    fn compute_interval_thresholds_are_config_tunable() {
+        // Boundaries + intervals come entirely from config, so an operator can
+        // move them via `[pex]` in node.toml.
+        let c = PexConfig {
+            low_peer_threshold: 5,
+            high_peer_threshold: 10,
+            search_interval_active_secs: 60,
+            search_interval_mid_secs: 600,
+            search_interval_idle_secs: 6_000,
+            ..PexConfig::default()
+        };
+        assert_eq!(compute_interval(4, &c), 60); // < low → active
+        assert_eq!(compute_interval(5, &c), 600); // low boundary → mid
+        assert_eq!(compute_interval(9, &c), 600); // mid
+        assert_eq!(compute_interval(10, &c), 6_000); // high boundary → idle
     }
 
     /// Audit M-F: a fabricated peer triple (node_id != BLAKE3(public_key)) must
