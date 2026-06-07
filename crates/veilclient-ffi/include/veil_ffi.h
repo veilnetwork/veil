@@ -490,11 +490,9 @@ extern "C" {
  * alive via their own `Arc`; the runtime is dropped only when the last
  * reference goes away. Safe to call on NULL.
  *
- * defends against double-free. If the caller passes a pointer that's either
- * NULL, already-freed, or random garbage this function returns without
- * `Box::from_raw` (which would be UB on freed memory). Liveness is resolved
- * via the external [`handle_registry`] keyed by address, so the guard never
- * dereferences the pointer (see the registry's module comment).
+ * Defends against double-free. A NULL / already-freed / garbage / wrong-type
+ * token is absent from the generational handle table → safe no-op; the
+ * (opaque, non-pointer) token is never dereferenced (see [`HandleTable`]).
  */
  void veil_close(VeilHandle *handle) ;
 
