@@ -149,7 +149,12 @@ pub use session::{RekeyPayload, SessionAlias, SleepAdvertisementPayload};
 use thiserror::Error;
 
 /// Errors raised by every OVL1 decoder.
+///
+/// `#[non_exhaustive]`: this wire-protocol error set gains variants as the
+/// protocol evolves; downstream `match`es must include a wildcard arm so
+/// adding a variant is not a breaking change.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProtoError {
     /// First four bytes were not the ASCII `"OVL1"` preamble.
     #[error("invalid magic: expected OVL1, got {0:?}")]

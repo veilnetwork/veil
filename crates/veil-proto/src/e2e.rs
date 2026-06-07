@@ -99,6 +99,15 @@ impl E2eEnvelope {
         }
         // [0] version — ignored for forward-compat
         let kem_ct_len = super::read_u16_be(buf, 1)? as usize;
+        // Per-field cap (defense-in-depth): self-bounding even if called on a
+        // buffer not gated by the 16 MiB frame body cap.
+        if kem_ct_len > crate::budget::MAX_KEM_CIPHERTEXT {
+            return Err(ProtoError::ValueTooLarge {
+                field: "kem_ct_len",
+                value: kem_ct_len as u64,
+                max: crate::budget::MAX_KEM_CIPHERTEXT as u64,
+            });
+        }
         let offset = 3;
         if offset + kem_ct_len > buf.len() {
             return Err(ProtoError::BufferTooShort {
@@ -133,6 +142,15 @@ impl E2eEnvelope {
             });
         }
         let ct_len = super::read_u32_be(buf, offset)? as usize;
+        // Per-field cap: the ciphertext can't exceed the hard frame body
+        // ceiling (the only implicit bound today); make it explicit.
+        if ct_len > crate::MAX_FRAME_BODY as usize {
+            return Err(ProtoError::ValueTooLarge {
+                field: "ct_len",
+                value: ct_len as u64,
+                max: crate::MAX_FRAME_BODY as u64,
+            });
+        }
         let offset = need_len_field;
 
         let ct_end = offset
