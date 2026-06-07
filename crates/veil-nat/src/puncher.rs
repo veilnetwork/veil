@@ -12,7 +12,7 @@
 //! 4. The first successful `quinn::Connection` is returned as [`PunchResult::Direct`].
 //! 5. If the deadline expires, the caller should invoke relay fallback.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,6 +102,11 @@ pub struct NatPuncher {
     endpoint: quinn::Endpoint,
     /// Local candidates advertised to the peer.
     local_candidates: Vec<NatCandidate>,
+    /// When false (default), peer-supplied candidates pointing at loopback /
+    /// private / link-local / CGNAT / metadata addresses are dropped before
+    /// dialing (SSRF defense). Operators on a trusted LAN — and the crate's
+    /// own loopback tests — can opt in.
+    allow_internal_candidates: bool,
 }
 
 impl NatPuncher {
@@ -123,7 +128,16 @@ impl NatPuncher {
                 .into_iter()
                 .map(socket_addr_to_candidate)
                 .collect(),
+            allow_internal_candidates: false,
         }
+    }
+
+    /// Opt in to dialing internal/non-routable peer candidates (loopback,
+    /// RFC1918, etc.). Off by default; intended for trusted-LAN deployments
+    /// and tests. Leaving it off is the SSRF-safe default.
+    pub fn allow_internal_candidates(mut self, allow: bool) -> Self {
+        self.allow_internal_candidates = allow;
+        self
     }
 
     /// Build a relay-mode `NAT_PROBE_REQUEST` addressed at `target_node_id`.
@@ -199,6 +213,15 @@ impl NatPuncher {
             let Some(addr) = candidate_to_socket_addr(candidate) else {
                 continue;
             };
+            // SSRF defense-in-depth: candidates come from a peer's NatProbeReply
+            // (attacker-controllable). Drop loopback / private / link-local /
+            // CGNAT / metadata addresses so a malicious peer can't make us fire
+            // QUIC connects at internal services. (The dispatcher STUN-echo path
+            // filters too, but `punch` must not rely on every caller doing so.)
+            // `allow_internal_candidates` opts out for trusted-LAN / tests.
+            if !self.allow_internal_candidates && is_forbidden_candidate_ip(addr.ip()) {
+                continue;
+            }
             let ep = Arc::clone(&endpoint);
             let cfg = client_config.clone();
             let sn = server_name.to_string();
@@ -231,6 +254,54 @@ impl NatPuncher {
                     }
                 }
             }
+        }
+    }
+}
+
+/// SSRF guard for peer-supplied hole-punch candidates: reject non-routable /
+/// internal destinations (loopback, RFC1918, link-local incl. 169.254.169.254
+/// metadata, CGNAT, 0.0.0.0/8, ULA/link-local v6, multicast, unspecified).
+/// Canonicalizes IPv4-mapped / IPv4-compatible / NAT64 v6 forms first so an
+/// embedded internal V4 can't slip through. Mirrors
+/// `veil_proxy::exit::is_forbidden_destination` (kept local to avoid a
+/// nat→proxy layering inversion).
+fn is_forbidden_candidate_ip(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => {
+            let c = v6.to_canonical(); // handles ::ffff:x.x.x.x
+            if c.is_ipv4() {
+                c
+            } else {
+                let s = v6.segments();
+                let is_nat64 = s[0] == 0x0064 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0);
+                if is_nat64 || (s[0..6].iter().all(|&x| x == 0) && (s[6] != 0 || s[7] > 1)) {
+                    IpAddr::V4(Ipv4Addr::new(
+                        (s[6] >> 8) as u8,
+                        (s[6] & 0xff) as u8,
+                        (s[7] >> 8) as u8,
+                        (s[7] & 0xff) as u8,
+                    ))
+                } else {
+                    IpAddr::V6(v6)
+                }
+            }
+        }
+        other => other,
+    };
+    if ip.is_loopback() || ip.is_multicast() || ip.is_unspecified() {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let is_cgnat = o[0] == 100 && (o[1] & 0xC0) == 64;
+            o[0] == 0 || v4.is_private() || v4.is_link_local() || v4.is_broadcast() || is_cgnat
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments()[0];
+            let is_unique_local = (seg & 0xFE00) == 0xFC00;
+            let is_link_local = (seg & 0xFFC0) == 0xFE80;
+            is_unique_local || is_link_local
         }
     }
 }
@@ -323,9 +394,11 @@ mod tests {
         let server_task =
             tokio::spawn(async move { server_ep.accept().await.unwrap().await.unwrap() });
 
-        // Client endpoint for the "puncher".
+        // Client endpoint for the "puncher". Opt into internal candidates so
+        // the loopback test server is dialable (production filters loopback).
         let client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        let puncher = NatPuncher::new([0u8; 32], 42, client_ep, vec![client_ep_addr()]);
+        let puncher = NatPuncher::new([0u8; 32], 42, client_ep, vec![client_ep_addr()])
+            .allow_internal_candidates(true);
 
         let candidate = NatCandidate {
             atyp: 4,
@@ -368,7 +441,11 @@ mod tests {
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
         ));
 
-        let puncher = NatPuncher::new([0u8; 32], 1, client_ep, vec![]);
+        // Opt into internal candidates so this genuinely exercises the
+        // dial-and-timeout path (port 1 closed) rather than passing trivially
+        // because the SSRF filter dropped the loopback candidate.
+        let puncher =
+            NatPuncher::new([0u8; 32], 1, client_ep, vec![]).allow_internal_candidates(true);
 
         // Port 1 is never open — timeout expected quickly.
         let candidate = NatCandidate {
@@ -393,5 +470,26 @@ mod tests {
 
     fn client_ep_addr() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
+    }
+
+    #[test]
+    fn forbidden_candidate_ip_blocks_internal_targets() {
+        let forbid = |s: &str| is_forbidden_candidate_ip(s.parse().unwrap());
+        // loopback / RFC1918 / link-local (metadata) / CGNAT / 0.0.0.0/8 / v6.
+        assert!(forbid("127.0.0.1"));
+        assert!(forbid("10.0.0.5"));
+        assert!(forbid("192.168.1.1"));
+        assert!(forbid("172.16.0.1"));
+        assert!(forbid("169.254.169.254")); // cloud metadata
+        assert!(forbid("100.64.0.1")); // CGNAT
+        assert!(forbid("0.0.0.0"));
+        assert!(forbid("::1"));
+        assert!(forbid("fd00::1")); // ULA
+        assert!(forbid("::ffff:10.0.0.1")); // IPv4-mapped internal
+        assert!(forbid("64:ff9b::a00:1")); // NAT64-embedded 10.0.0.1
+        // Public addresses must be allowed.
+        assert!(!forbid("1.1.1.1"));
+        assert!(!forbid("8.8.8.8"));
+        assert!(!forbid("2606:4700:4700::1111"));
     }
 }
