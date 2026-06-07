@@ -93,17 +93,20 @@ impl BandwidthGate {
     }
 
     pub fn allow_bytes(&mut self, byte_count: usize) -> bool {
+        // saturating_add (not `+=`) so a long-running node can't wrap these
+        // observability counters at u64::MAX — matching the discipline in
+        // per_peer_limiter (a debug build would otherwise panic on overflow).
         match &mut self.bucket {
             None => {
-                self.total_bytes += byte_count as u64;
+                self.total_bytes = self.total_bytes.saturating_add(byte_count as u64);
                 true
             }
             Some(bucket) => {
                 if bucket.allow_n_at(byte_count as f64, Instant::now()) {
-                    self.total_bytes += byte_count as u64;
+                    self.total_bytes = self.total_bytes.saturating_add(byte_count as u64);
                     true
                 } else {
-                    self.dropped_bytes += byte_count as u64;
+                    self.dropped_bytes = self.dropped_bytes.saturating_add(byte_count as u64);
                     false
                 }
             }
