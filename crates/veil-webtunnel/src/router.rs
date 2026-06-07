@@ -210,6 +210,12 @@ where
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let mut header_end: Option<usize> = None;
+    // Bytes already scanned for the CRLF terminator. Re-scanning the whole
+    // buffer from 0 after every read is O(n^2) when a slow client dribbles the
+    // 16 KiB header one byte per packet; instead scan only the newly-appended
+    // region, with a 3-byte overlap so a `\r\n\r\n` straddling the previous
+    // read boundary is still found. Total scanning is then O(n).
+    let mut scanned = 0usize;
 
     while buf.len() < MAX_HEADER_BYTES {
         let n = stream.read(&mut chunk).await?;
@@ -220,10 +226,12 @@ where
             )));
         }
         buf.extend_from_slice(&chunk[..n]);
-        if let Some(end) = find_double_crlf(&buf) {
-            header_end = Some(end);
+        let scan_from = scanned.saturating_sub(3);
+        if let Some(rel) = find_double_crlf(&buf[scan_from..]) {
+            header_end = Some(scan_from + rel);
             break;
         }
+        scanned = buf.len();
     }
     let end = header_end.ok_or_else(|| {
         RouterError::Io(std::io::Error::new(
