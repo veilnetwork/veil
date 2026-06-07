@@ -110,6 +110,24 @@ impl PexDispatcher {
             rate.retain(|_, t| now.duration_since(*t).as_secs() < WALK_RATE_LIMIT_SECS * 2);
         }
 
+        // Learn the walk's ORIGIN as a dialable contact (if it advertised an
+        // address and it isn't us). Every node a walk traverses thus records
+        // the origin → an under-connected / keyspace-isolated origin (which
+        // peers would otherwise never learn an address for, leaving it stuck on
+        // outbound-only sessions) becomes discoverable cluster-wide and the mesh
+        // fills. Rate-limited above (1 walk/peer/min). The initiator validates
+        // the node_id↔pubkey binding and drops wildcard addresses before dialing
+        // (same path as `Result` peers), so a spoofed `origin_transport` at most
+        // wastes one dial.
+        if !walk.origin_transport.is_empty() && walk.origin_node_id != self.local_node_id {
+            let _ = self.event_tx.try_send(PexEvent::LearnedPeer(PexPeer {
+                node_id: walk.origin_node_id,
+                transport: walk.origin_transport.clone(),
+                public_key: walk.origin_pubkey.clone(),
+                nonce: walk.origin_nonce,
+            }));
+        }
+
         // Should we terminate the walk here?
         let should_terminate = walk.ttl <= 1
             || xor_distance(&self.local_node_id, &walk.target_node_id)

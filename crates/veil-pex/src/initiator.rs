@@ -203,6 +203,10 @@ pub async fn spawn_pex_initiator(
     pex_state: Arc<Mutex<PexState>>,
     mut event_rx: tokio::sync::mpsc::Receiver<PexEvent>,
     connect_tx: PexConnectTx,
+    // Our own advertised dialable transport URI, stamped into outgoing walks as
+    // `origin_transport` so peers can learn+dial us. Empty string disables it
+    // (e.g. a node with no public listener).
+    local_advertise: String,
     mut shutdown_rx: watch::Receiver<bool>,
     logger: Arc<dyn PexLogger>,
 ) {
@@ -249,7 +253,8 @@ pub async fn spawn_pex_initiator(
                 }
                 send_walks(
                     &local_node_id, &local_pubkey, local_nonce,
-                    signing_key.as_ref(), &config, broadcaster.as_ref(), &pex_state, logger.as_ref(),
+                    signing_key.as_ref(), &config, broadcaster.as_ref(), &pex_state,
+                    &local_advertise, logger.as_ref(),
                 );
                 next_walk = tokio::time::Instant::now() + Duration::from_secs(interval);
             }
@@ -265,6 +270,11 @@ pub async fn spawn_pex_initiator(
                         handle_result(
                             &result, from_peer, &config, &pex_state, &connect_tx, logger.as_ref(),
                         ).await;
+                    }
+                    Some(PexEvent::LearnedPeer(peer)) => {
+                        handle_learned_peer(
+                            peer, &config, &pex_state, &connect_tx, logger.as_ref(),
+                        );
                     }
                     None => break,
                 }
@@ -282,6 +292,7 @@ fn send_walks(
     config: &PexConfig,
     broadcaster: &dyn FrameBroadcaster,
     pex_state: &Arc<Mutex<PexState>>,
+    local_advertise: &str,
     logger: &dyn PexLogger,
 ) {
     let parallelism = config.walk_parallelism as usize;
@@ -307,6 +318,10 @@ fn send_walks(
             origin_nonce: local_nonce,
             origin_sig,
             ttl,
+            // Carry our own dialable address so every node this walk traverses
+            // can learn + dial us back — the path that lets an under-connected
+            // origin become reachable cluster-wide.
+            origin_transport: local_advertise.to_string(),
         };
 
         let frame = encode_pex_frame(PexMsg::Walk, &walk.encode());
@@ -475,6 +490,47 @@ async fn handle_result(
     // Notify runtime to attempt connections to newly discovered peers.
     if !peers.is_empty() {
         let _ = connect_tx.try_send(peers);
+    }
+}
+
+/// Record a peer learned from a relayed PEX walk's ORIGIN (see
+/// [`PexEvent::LearnedPeer`]). Same validation + fan-out as [`handle_result`]
+/// for a single peer: enforce the node_id↔public_key binding (M-F), drop
+/// wildcard/undialable addresses, add to the walk table, and nudge the runtime
+/// to dial it. This is the mechanism that makes an under-connected /
+/// keyspace-isolated origin discoverable+dialable by every node its walks reach.
+fn handle_learned_peer(
+    peer: PexPeer,
+    config: &PexConfig,
+    pex_state: &Arc<Mutex<PexState>>,
+    connect_tx: &PexConnectTx,
+    logger: &dyn PexLogger,
+) {
+    if !pex_binding_ok(&peer) || is_wildcard_transport(&peer.transport) {
+        return;
+    }
+    // Only nudge a dial when this is a genuinely NEW contact, so a steady
+    // stream of relayed walks for already-known peers doesn't spam the connect
+    // path (the directional dedup would reject those anyway). `add_peers`
+    // itself dedups storage; we check membership first only to gate the dial.
+    let is_new = {
+        let mut state = pex_state.lock().unwrap_or_else(|p| p.into_inner());
+        let already = state
+            .discovered_peers
+            .iter()
+            .any(|(p, _)| p.node_id == peer.node_id);
+        state.add_peers(vec![peer.clone()], config.max_peers);
+        !already
+    };
+    if is_new {
+        logger.info(
+            "pex.learned_peer",
+            &format!(
+                "walk-origin recorded as dialable contact node_id={}",
+                veil_util::hex_short(&peer.node_id),
+            ),
+        );
+        let _ = connect_tx.try_send(vec![peer]);
     }
 }
 
