@@ -1,3 +1,18 @@
+# Replace the 203.0.113.x placeholders (RFC 5737) with your real node IPs.
+#
+# LABELSET-UNIQUENESS WARNING — each scrape target MUST end up with a UNIQUE
+# label set, or Prometheus rejects the ENTIRE scrape ("duplicate sample for
+# timestamp" / num_dropped == number of samples in /metrics — i.e. the whole
+# scrape is dropped, not individual series). The veil /metrics endpoint emits
+# bare series (no instance/host of its own), so uniqueness comes from the
+# scrape config below: every target gets a distinct `host` label AND the
+# default `instance` = its `address:port`. Do NOT:
+#   * set a shared `instance` (e.g. `labels: { instance: veil }`),
+#   * `relabel`/`replacement` all targets to the same `instance`,
+#   * `labeldrop` `instance` (or `host`) — that collapses every node onto one
+#     time series and every scrape after the first looks like a duplicate.
+# Keep the per-target `host` label (it alone keeps series distinct even if
+# `instance` is ever overridden).
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
