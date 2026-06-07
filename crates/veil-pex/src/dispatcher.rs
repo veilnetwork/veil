@@ -436,20 +436,27 @@ fn verify_pex_pow(
 
 fn verify_origin_sig(walk: &PexWalk, response: &PexResponse) -> bool {
     use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let pubkey_b64 = b64.encode(&walk.origin_pubkey);
-    let algo = if walk.origin_pubkey.len() == 32 {
-        SignatureAlgorithm::Ed25519
-    } else {
-        SignatureAlgorithm::Falcon512
-    };
+    // PEX is Ed25519-only: `origin_sig` is a fixed `[u8; 64]` (Falcon-512 sigs
+    // are ~660 B and can't be carried), and the initiator disables walks for
+    // non-Ed25519 nodes. Hard-require a 32-byte pubkey rather than silently
+    // dispatching to an unreachable Falcon-512 branch that could never verify.
+    if walk.origin_pubkey.len() != 32 {
+        return false;
+    }
+    let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(&walk.origin_pubkey);
     let msg = [
         response.walk_id.to_be_bytes().as_slice(),
         response.challenge_nonce.as_slice(),
         response.pow_solution.as_slice(),
     ]
     .concat();
-    veil_crypto::signature::verify_message(algo, &pubkey_b64, &msg, &response.origin_sig).is_ok()
+    veil_crypto::signature::verify_message(
+        SignatureAlgorithm::Ed25519,
+        &pubkey_b64,
+        &msg,
+        &response.origin_sig,
+    )
+    .is_ok()
 }
 
 #[cfg(test)]
