@@ -994,10 +994,15 @@ mod tests {
             "https://stale.example".to_owned(),
             "https://fresh.example".to_owned(),
         ];
-        let result =
-            check_for_update(&urls, stub_fetcher(store), &kp.public_key, 1_500_000_000, None)
-                .await
-                .expect("check ok");
+        let result = check_for_update(
+            &urls,
+            stub_fetcher(store),
+            &kp.public_key,
+            1_500_000_000,
+            None,
+        )
+        .await
+        .expect("check ok");
         match result {
             UpdateAvailability::Available { manifest } => {
                 assert_eq!(
@@ -1037,10 +1042,15 @@ mod tests {
             "https://evil.example".to_owned(),
             "https://fresh.example".to_owned(),
         ];
-        let result =
-            check_for_update(&urls, stub_fetcher(store), &kp.public_key, 1_000_000_000, None)
-                .await
-                .expect("check ok");
+        let result = check_for_update(
+            &urls,
+            stub_fetcher(store),
+            &kp.public_key,
+            1_000_000_000,
+            None,
+        )
+        .await
+        .expect("check ok");
         match result {
             UpdateAvailability::Available { manifest } => {
                 assert_eq!(manifest.release_unix, 2_000_000_000);
