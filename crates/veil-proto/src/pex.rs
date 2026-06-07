@@ -37,12 +37,28 @@ pub struct PexWalk {
     pub origin_nonce: u64,
     pub origin_sig: [u8; 64],
     pub ttl: u8,
+    /// Origin's advertised dialable transport URI (e.g.
+    /// `obfs4-tcp://1.2.3.4:5556`). Lets every node a walk traverses learn the
+    /// origin as a *dialable* contact, so an under-connected / keyspace-isolated
+    /// node — which others would otherwise never learn an address for — becomes
+    /// reachable and the mesh can fill. Empty == not advertised (or a pre-field
+    /// peer): treated as "no dialable address", not recorded.
+    ///
+    /// Appended at the END of the wire format and NOT covered by `origin_sig`
+    /// (see `signable_bytes`): a pre-field decoder simply ignores the trailing
+    /// bytes, and a new decoder of an old frame defaults this to "" — so the
+    /// field is forward/backward compatible across a rolling upgrade. A relaying
+    /// node could rewrite it, but a dial to a rewritten address still runs the
+    /// OVL1 handshake (which verifies `origin_node_id`), so the worst case is a
+    /// single wasted dial — it cannot impersonate the origin.
+    pub origin_transport: String,
 }
 
 impl PexWalk {
     pub fn encode(&self) -> Vec<u8> {
         let pk_len = self.origin_pubkey.len();
-        let total = 8 + 32 + 32 + 2 + pk_len + 8 + 64 + 1;
+        let tr_len = self.origin_transport.len();
+        let total = 8 + 32 + 32 + 2 + pk_len + 8 + 64 + 1 + 2 + tr_len;
         let mut buf = Vec::with_capacity(total);
         buf.extend_from_slice(&self.walk_id.to_be_bytes());
         buf.extend_from_slice(&self.target_node_id);
@@ -52,6 +68,10 @@ impl PexWalk {
         buf.extend_from_slice(&self.origin_nonce.to_le_bytes());
         buf.extend_from_slice(&self.origin_sig);
         buf.push(self.ttl);
+        // Trailing, optional: [u16 len][origin_transport bytes]. Appended after
+        // the original layout so pre-field decoders ignore it (backward-compat).
+        buf.extend_from_slice(&(tr_len as u16).to_be_bytes());
+        buf.extend_from_slice(self.origin_transport.as_bytes());
         buf
     }
 
@@ -92,6 +112,18 @@ impl PexWalk {
         let mut origin_sig = [0u8; 64];
         origin_sig.copy_from_slice(&buf[off + 8..off + 72]);
         let ttl = buf[off + 72];
+        // Trailing, optional origin_transport ([u16 len][bytes]). Absent on
+        // pre-field frames → default "". A truncated/oversized length is
+        // tolerated as "" rather than rejecting the whole walk.
+        let tr_off = off + 73;
+        let origin_transport = if buf.len() >= tr_off + 2 {
+            let tr_len = u16::from_be_bytes([buf[tr_off], buf[tr_off + 1]]) as usize;
+            buf.get(tr_off + 2..tr_off + 2 + tr_len)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         Ok(Self {
             walk_id,
             target_node_id,
@@ -100,6 +132,7 @@ impl PexWalk {
             origin_nonce,
             origin_sig,
             ttl,
+            origin_transport,
         })
     }
 
@@ -400,10 +433,49 @@ mod tests {
             origin_nonce: 42,
             origin_sig: [0xCC; 64],
             ttl: 7,
+            origin_transport: "obfs4-tcp://1.2.3.4:5556".to_string(),
         };
         let encoded = walk.encode();
         let decoded = PexWalk::decode(&encoded).unwrap();
         assert_eq!(decoded, walk);
+    }
+
+    #[test]
+    fn pex_walk_empty_transport_roundtrip() {
+        let walk = PexWalk {
+            walk_id: 1,
+            target_node_id: [0; 32],
+            origin_node_id: [1; 32],
+            origin_pubkey: vec![9; 32],
+            origin_nonce: 0,
+            origin_sig: [0; 64],
+            ttl: 4,
+            origin_transport: String::new(),
+        };
+        assert_eq!(PexWalk::decode(&walk.encode()).unwrap(), walk);
+    }
+
+    #[test]
+    fn pex_walk_decodes_pre_field_frame_as_empty_transport() {
+        // A frame encoded WITHOUT the trailing origin_transport (old wire
+        // format) must still decode, with origin_transport defaulting to "".
+        let walk = PexWalk {
+            walk_id: 7,
+            target_node_id: [2; 32],
+            origin_node_id: [3; 32],
+            origin_pubkey: vec![4, 5, 6],
+            origin_nonce: 11,
+            origin_sig: [7; 64],
+            ttl: 9,
+            origin_transport: "obfs4-tcp://5.6.7.8:5556".to_string(),
+        };
+        let mut legacy = walk.encode();
+        // Strip the trailing [u16 len][transport] to simulate a pre-field frame.
+        legacy.truncate(legacy.len() - 2 - walk.origin_transport.len());
+        let decoded = PexWalk::decode(&legacy).unwrap();
+        assert_eq!(decoded.origin_transport, "");
+        assert_eq!(decoded.walk_id, 7);
+        assert_eq!(decoded.ttl, 9);
     }
 
     #[test]

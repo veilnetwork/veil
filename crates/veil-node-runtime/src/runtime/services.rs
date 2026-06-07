@@ -182,6 +182,15 @@ impl NodeRuntime {
                                 &self.session_tx_registry,
                             )));
                         let pex_logger: Arc<dyn veil_pex::PexLogger> = self.logger.clone();
+                        // Our own advertised dialable address, stamped into PEX
+                        // walks (origin_transport) so peers learn+dial us back.
+                        // First Public listener's advertise URI; empty if none
+                        // (leaf / no public listener) — then walks carry no
+                        // address and peers can't auto-dial us, which is correct.
+                        let local_advertise = super::build_advertised_transports(config)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default();
                         let handle = tokio::spawn(veil_pex::spawn_pex_initiator(
                             *self.identity.local_identity.node_id.as_bytes(),
                             pk_bytes,
@@ -192,6 +201,7 @@ impl NodeRuntime {
                             Arc::clone(&self.pex.state),
                             pex_event_rx,
                             pex_connect_tx,
+                            local_advertise,
                             shutdown_tx.subscribe(),
                             pex_logger,
                         ));

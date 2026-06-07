@@ -21,7 +21,7 @@
 pub mod dispatcher;
 pub mod initiator;
 
-use veil_proto::pex::{PexChallenge, PexResult};
+use veil_proto::pex::{PexChallenge, PexPeer, PexResult};
 
 pub use dispatcher::PexDispatcher;
 pub use initiator::{PexConnectTx, PexState, spawn_pex_initiator};
@@ -56,6 +56,11 @@ pub enum PexEvent {
         result: PexResult,
         from_peer: [u8; 32],
     },
+    /// A PEX walk passed through us carrying its origin's dialable address.
+    /// The dispatcher forwards the origin as a learned contact so the initiator
+    /// records + dials it (same path as `Result` peers) — this is how an
+    /// under-connected origin becomes reachable cluster-wide.
+    LearnedPeer(PexPeer),
 }
 
 /// Logger surface for the PEX dispatcher and initiator. Implemented by
