@@ -113,6 +113,15 @@ pub struct CaptureEvent {
 /// down ×60 from the 10 MB/s @ 10K pkt/s pre-fix ceiling.
 pub const CAPTURE_PER_PEER_EVENTS_PER_SEC: u32 = 100;
 
+/// Hard cap on the number of per-peer rate-limit windows held in the
+/// `CaptureRateLimiter` map. Each entry is ~40 B; 8 192 entries ≈ 320 KiB.
+/// The map previously only ever inserted (one entry per distinct peer_id),
+/// never reclaiming — bounded in practice by upstream peer caps, but a peer-id
+/// flood while capture is active could grow it without limit. At the cap we
+/// first drop fully-elapsed windows (lossless — they reset on next touch) and,
+/// if still full, evict one arbitrary entry to guarantee room.
+pub const CAPTURE_RATE_MAP_CAP: usize = 8_192;
+
 /// simple per-peer rate limiter for
 /// capture-event emission. One-second tumbling window. Returns
 /// `false` (drop the event) when a peer has hit
@@ -153,6 +162,20 @@ impl CaptureRateLimiter {
     pub fn allow(&self, peer_id: [u8; 32]) -> bool {
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let now = std::time::Instant::now();
+        // Bound the map before inserting a NEW peer's window. First drop
+        // fully-elapsed windows (lossless — a rolled-over entry resets to
+        // count=0 on next touch anyway); if still at the cap under a flood of
+        // fresh distinct peer_ids, evict one arbitrary entry to guarantee room.
+        if guard.len() >= CAPTURE_RATE_MAP_CAP && !guard.contains_key(&peer_id) {
+            guard.retain(|_, st| {
+                now.duration_since(st.window_start) < std::time::Duration::from_secs(1)
+            });
+            if guard.len() >= CAPTURE_RATE_MAP_CAP
+                && let Some(&victim) = guard.keys().next()
+            {
+                guard.remove(&victim);
+            }
+        }
         let entry = guard.entry(peer_id).or_insert(CaptureRateState {
             window_start: now,
             count: 0,
