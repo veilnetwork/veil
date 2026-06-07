@@ -133,7 +133,20 @@ pub fn sign_instance_registry(
 
 // ── NameClaim V2 ─────────────────────────────────────────────────────────────
 
-const NAME_CLAIM_POW_BUDGET: u64 = 20_000_000;
+/// Safety multiplier over the EXPECTED work (`2^required`) for NameClaim PoW
+/// mining. A flat budget below the expected work makes legitimate claims fail
+/// probabilistically: pre-fix a flat 20M budget meant a 24-bit name
+/// (`alice`, ~16.7M expected) failed ~30% of the time and a 28-bit name
+/// (`bob`, ~268M expected) ~93% — the rarity-proportional difficulty was real
+/// but the budget was never scaled to it. At 16× expected the miss
+/// probability is e^-16 ≈ 1e-7. Mining for premium (short) names is
+/// intentionally expensive; callers run it off the request thread.
+const NAME_CLAIM_POW_SAFETY: u64 = 16;
+
+/// Hard ceiling on the computed NameClaim PoW budget, so a future high
+/// difficulty tier can't size an unbounded loop. Covers the current max tier
+/// (28 bits → 2^28 × 16 = 2^32) with headroom.
+const NAME_CLAIM_POW_BUDGET_CAP: u64 = 1 << 33;
 
 /// Build an unsigned [`NameClaim`] draft. Caller supplies the
 /// normalised name + the identity the claim binds to; this helper
@@ -180,7 +193,8 @@ pub fn sign_name_claim(
 
 fn mine_name_pow(claim: &mut NameClaim) -> Result<(), PublishError> {
     let required = required_difficulty(&claim.name);
-    for i in 0..NAME_CLAIM_POW_BUDGET {
+    let budget = name_claim_pow_budget(required);
+    for i in 0..budget {
         let mut nonce = [0u8; 16];
         nonce[0..8].copy_from_slice(&i.to_be_bytes());
         claim.pow_nonce = nonce;
@@ -189,9 +203,17 @@ fn mine_name_pow(claim: &mut NameClaim) -> Result<(), PublishError> {
             return Ok(());
         }
     }
-    Err(PublishError::PowExhausted {
-        attempts: NAME_CLAIM_POW_BUDGET,
-    })
+    Err(PublishError::PowExhausted { attempts: budget })
+}
+
+/// Budget = `2^required × NAME_CLAIM_POW_SAFETY`, capped. Scaling to the
+/// difficulty is what makes mining reliable across the rarity tiers (a flat
+/// budget below the expected work fails legitimate claims probabilistically).
+fn name_claim_pow_budget(required: u32) -> u64 {
+    let expected = 1u64.checked_shl(required.min(63)).unwrap_or(u64::MAX);
+    expected
+        .saturating_mul(NAME_CLAIM_POW_SAFETY)
+        .min(NAME_CLAIM_POW_BUDGET_CAP)
 }
 
 // ── MlKemKeyCert ─────────────────────────────────────────────────────────────
@@ -556,6 +578,30 @@ pub async fn publish_full_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_claim_pow_budget_scales_with_difficulty_and_caps() {
+        // Budget must comfortably exceed the expected work (2^required) so a
+        // legitimate claim doesn't fail probabilistically.
+        for required in [4u32, 8, 12, 22, 24, 28] {
+            let expected = 1u64 << required;
+            let budget = name_claim_pow_budget(required);
+            assert!(
+                budget
+                    >= expected
+                        .saturating_mul(NAME_CLAIM_POW_SAFETY)
+                        .min(NAME_CLAIM_POW_BUDGET_CAP),
+                "budget {budget} too small for difficulty {required} (expected {expected})"
+            );
+            assert!(budget <= NAME_CLAIM_POW_BUDGET_CAP);
+        }
+        // Pre-fix the flat 20M budget was below the 24-bit expected work (~16.7M)
+        // with no safety margin; the scaled budget gives 16x headroom.
+        assert!(name_claim_pow_budget(24) > 20_000_000);
+        // Cap holds even for an absurd difficulty.
+        assert_eq!(name_claim_pow_budget(40), NAME_CLAIM_POW_BUDGET_CAP);
+        assert_eq!(name_claim_pow_budget(255), NAME_CLAIM_POW_BUDGET_CAP);
+    }
 
     use ed25519_dalek::Verifier as _;
 
