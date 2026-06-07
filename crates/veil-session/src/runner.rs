@@ -3133,12 +3133,12 @@ impl SessionRunner {
                     }
                     NextInput::RpcRequest(req) => {
                         let now = tokio::time::Instant::now();
-                        // NOTE: capacity-evict deliberately omitted here —
-                        // the drain-loop path in Step 1b does the
-                        // capacity check for batched arrivals. See
-                        // `PendingResponseTable` doc-comment for the
-                        // asymmetry rationale.
+                        // Symmetric with the drain-loop path: TTL-evict AND
+                        // capacity-evict before insert, so single-at-a-time
+                        // arrivals via this select-arm can't transiently push
+                        // the table past `capacity`.
                         pending_responses.evict_expired(now);
+                        pending_responses.evict_oldest_if_at_capacity();
                         pending_responses.insert(req.request_id, req.response_tx, now);
                         pq.push(
                             veil_proto::priority::INTERACTIVE,
