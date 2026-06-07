@@ -30,6 +30,7 @@ param(
     [string]   $Repo       = $(if ($env:VEIL_REPO) { $env:VEIL_REPO } else { 'veilnetwork/veil' }),
     [switch]   $NoModifyPath,
     [switch]   $NoVerify,
+    [switch]   $RequireSignature,
     [switch]   $Quickstart,
     [switch]   $Help
 )
@@ -46,6 +47,72 @@ function Info ($m) { Write-Host "  $m" }
 function Warn ($m) { Write-Warning $m }
 function Die  ($m) { Write-Host "error: $m" -ForegroundColor Red; exit 1 }
 
+# ── Release-manifest signature (F2: supply-chain authenticity) ───────────────
+# Mirrors the Unix installer (scripts/install.sh). The sha256 manifest binds
+# binary -> hash but only proves manifest and binary AGREE; an attacker who can
+# replace the release assets (or a mirror) can serve a malicious .exe WITH a
+# matching manifest. A detached Ed25519 signature over the manifest, checked
+# against a key PINNED here, raises the bar to "forge the operator's release
+# key". Verified with openssl (independent of the downloaded binary, so a
+# malicious binary cannot self-attest).
+#
+# Windows has no native Ed25519 verifier, so this uses `openssl` (>= 3.0) if it
+# is on PATH. When openssl is absent / too old / no signature is published, the
+# installer WARNS and falls back to sha256-only (no regression vs the prior
+# channel-trust behaviour) — unless -RequireSignature forces a hard failure.
+
+# Pinned Ed25519 release public key (openssl PEM). Keep in sync with
+# scripts/install.sh `pinned_release_pubkey`. Runtime override:
+# $env:VEIL_RELEASE_PUBKEY_PEM (e.g. a testnet key).
+function Get-PinnedReleasePubkey {
+    if ($env:VEIL_RELEASE_PUBKEY_PEM) { return $env:VEIL_RELEASE_PUBKEY_PEM }
+    return @"
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAdvlFTSCogeqOOtL3TnkZZ14Eq9waNDBU+yTfubasRXs=
+-----END PUBLIC KEY-----
+"@
+}
+
+# OpenSSL >= 3.0 supports one-shot Ed25519 via `pkeyutl -rawin`. Returns the
+# openssl command name if capable, else $null.
+function Get-Ed25519Openssl {
+    $ossl = Get-Command openssl -ErrorAction SilentlyContinue
+    if (-not $ossl) { return $null }
+    try { $ver = (& openssl version) 2>$null } catch { return $null }
+    if ($ver -match '^OpenSSL\s+[345]\.') { return $ossl.Source }
+    return $null
+}
+
+# Verify the detached Ed25519 signature over the sha256 manifest. Fail-closed
+# when a key is pinned and the signature is missing/invalid AND
+# -RequireSignature is set (or always on a verify FAILURE); warn-and-continue
+# when no key is pinned or no capable openssl is present.
+function Verify-ManifestSignature ($shaPath, $base, $triple, $tmp) {
+    $pem = Get-PinnedReleasePubkey
+    if (-not ($pem -replace '\s', '')) {
+        if ($RequireSignature) { Die "-RequireSignature given, but this installer has no pinned release key. See docs/en/release-signing.md." }
+        Warn "release manifest is NOT signature-verified (no pinned key) — authenticity rests on TLS to the download host. See docs/en/release-signing.md."
+        return
+    }
+    $ossl = Get-Ed25519Openssl
+    if (-not $ossl) {
+        if ($RequireSignature) { Die "-RequireSignature needs OpenSSL >= 3.0 on PATH to verify the Ed25519 release signature (none found)." }
+        Warn "cannot verify release signature: OpenSSL >= 3.0 not found on PATH. Falling back to sha256-only. Install OpenSSL 3.x or pass -RequireSignature to enforce."
+        return
+    }
+    $sigPath = Join-Path $tmp 'sha256.txt.sig'
+    try { Invoke-WebRequest -Uri "$base/sha256-$triple.txt.sig" -OutFile $sigPath -UseBasicParsing }
+    catch { Die "a release key is pinned but no sha256-$triple.txt.sig was published — refusing to install an unverified manifest." }
+    $pemPath = Join-Path $tmp 'relkey.pem'
+    Set-Content -Path $pemPath -Value $pem -NoNewline
+    & $ossl pkeyutl -verify -pubin -inkey $pemPath -rawin -in $shaPath -sigfile $sigPath 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Ok 'release manifest signature verified (Ed25519)'
+    } else {
+        Die "release manifest signature INVALID — ABORTING. The sha256 manifest does not verify against the pinned release key; the download channel or the release artifacts may be compromised. Do NOT run anything."
+    }
+}
+
 if ($Help) {
 @"
 veil installer (Windows)
@@ -57,6 +124,8 @@ veil installer (Windows)
   -Repo <owner/repo>   Source repo (default: veilnetwork/veil)
   -NoModifyPath        Don't touch the user PATH
   -NoVerify            Skip sha256 verification (not recommended)
+  -RequireSignature    Hard-fail unless the release manifest carries a valid
+                       Ed25519 signature (needs openssl 3.x on PATH)
   -Quickstart          Init + start a node after install
   -Help                This help
 
@@ -131,6 +200,9 @@ try {
         $shaFile = Join-Path $tmp 'sha256.txt'
         try { Invoke-WebRequest -Uri "$base/sha256-$triple.txt" -OutFile $shaFile -UseBasicParsing }
         catch { Die "no sha256-$triple.txt published — refusing to install an unverified binary. Re-run with -NoVerify to override." }
+        # Authenticate the manifest (Ed25519 over sha256-$triple.txt) before
+        # trusting any hash in it. Warn-fallback unless -RequireSignature.
+        Verify-ManifestSignature $shaFile $base $triple $tmp
     }
 
     foreach ($bin in $wanted) {
