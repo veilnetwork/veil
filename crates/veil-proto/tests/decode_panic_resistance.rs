@@ -33,10 +33,14 @@
 //!
 //! Strategic context: the dispatcher's `dispatch` function calls
 //! `*Payload::decode(body)` for every routed family/msg_type combination
-//! (see `veilcore/src/node/dispatcher/`). So as long as every
-//! `decode` in here is panic-free, the dispatcher cannot be panic'd by
-//! any remote-peer body — modulo signature-verify paths, which are
-//! covered by their own crate's tests.
+//! (see `veilcore/src/node/dispatcher/`). This registry aims to cover EVERY
+//! remote-peer-reachable wire decoder so the dispatcher cannot be panic'd by a
+//! hostile body. It is a maintained allow-list, NOT an automatic guarantee:
+//! a decoder that exists but is missing from `decoders()` is NOT swept, so the
+//! coverage holds only as far as the list is kept in sync. When you add a new
+//! `decode(&[u8])` on a remote-peer payload, append it below. Out of scope:
+//! `ipc::*` decoders (local, uid-gated loopback — not remote-peer bytes) and
+//! signature-verify paths (covered by their own crates' tests).
 
 use veil_proto as p;
 
@@ -202,6 +206,62 @@ fn decoders() -> Vec<(&'static str, DecoderFn)> {
         ("MlKemKeyCert", decoder!(p::mlkem_cert::MlKemKeyCert)),
         // ── e2e / mailbox / pex / mesh / epidemic ──────────────────────
         ("EpidemicPayload", decoder!(p::epidemic::EpidemicPayload)),
+        ("E2eEnvelope", decoder!(p::e2e::E2eEnvelope)),
+        ("RelayChainHop", decoder!(p::relay_chain::RelayChainHop)),
+        // ── pex (random-walk peer exchange) ────────────────────────────
+        ("PexWalk", decoder!(p::pex::PexWalk)),
+        ("PexChallenge", decoder!(p::pex::PexChallenge)),
+        ("PexResponse", decoder!(p::pex::PexResponse)),
+        ("PexPeer", decoder!(p::pex::PexPeer)),
+        ("PexResult", decoder!(p::pex::PexResult)),
+        // ── delivery (nested relay/transit/chunk payloads) ─────────────
+        ("DeliveryEnvelope", decoder!(p::delivery::DeliveryEnvelope)),
+        (
+            "ChunkedEnvelopePayload",
+            decoder!(p::delivery::ChunkedEnvelopePayload),
+        ),
+        (
+            "TransitFramePayload",
+            decoder!(p::delivery::TransitFramePayload),
+        ),
+        (
+            "RecursiveRelayPayload",
+            decoder!(p::delivery::RecursiveRelayPayload),
+        ),
+        ("RelayPathPayload", decoder!(p::delivery::RelayPathPayload)),
+        // ── mesh (realm beacon/ack/frame) ──────────────────────────────
+        ("MeshFrame", decoder!(p::mesh::MeshFrame)),
+        ("MeshBeaconPayload", decoder!(p::mesh::MeshBeaconPayload)),
+        ("MeshAckPayload", decoder!(p::mesh::MeshAckPayload)),
+        // ── rendezvous (ephemeral endpoint) ────────────────────────────
+        (
+            "RequestEphemeralEndpointPayload",
+            decoder!(p::rendezvous::RequestEphemeralEndpointPayload),
+        ),
+        (
+            "EphemeralEndpointResponsePayload",
+            decoder!(p::rendezvous::EphemeralEndpointResponsePayload),
+        ),
+        // ── diag (ping/trace) ──────────────────────────────────────────
+        ("DiagPingPayload", decoder!(p::diag::DiagPingPayload)),
+        ("DiagPongPayload", decoder!(p::diag::DiagPongPayload)),
+        (
+            "DiagTraceProbePayload",
+            decoder!(p::diag::DiagTraceProbePayload),
+        ),
+        (
+            "DiagTraceHopPayload",
+            decoder!(p::diag::DiagTraceHopPayload),
+        ),
+        // ── recipient (offset-based decode_from) ───────────────────────
+        ("Recipient::decode_from", |buf: &[u8]| {
+            let mut pos = 0usize;
+            let _ = p::recipient::Recipient::decode_from(buf, &mut pos);
+        }),
+        ("Recipient::decode_fixed_from", |buf: &[u8]| {
+            let mut pos = 0usize;
+            let _ = p::recipient::Recipient::decode_fixed_from(buf, &mut pos);
+        }),
     ]
 }
 
