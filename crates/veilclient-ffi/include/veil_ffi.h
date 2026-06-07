@@ -1151,6 +1151,12 @@ int veil_verify_wake_hmac(const uint8_t *key_32,
  * Lightweight — no key derivation, no disk I/O. UI uses this to
  * give immediate feedback as the user types ("checksum invalid"
  * before they hit "Restore").
+ *
+ * **DEPRECATED (Epic 489.8): prefer [`veil_validate_bip39_phrase_zeroize`].**
+ * This `*const c_char` form leaves the mnemonic in the caller's heap; the
+ * `_zeroize` variant takes `*mut c_char` and wipes it in place. The Flutter
+ * wrapper already uses the `_zeroize` variant. Kept only for ABI back-compat
+ * with existing raw/C consumers; slated for removal at the next ABI break.
  */
  int veil_validate_bip39_phrase(const char *phrase, char **err_out) ;
 
@@ -1177,6 +1183,13 @@ int veil_verify_wake_hmac(const uint8_t *key_32,
  *
  * Returns `VEIL_OK` on success. On failure sets `*err_out` to
  * a description and returns `VEIL_ERR`.
+ *
+ * **DEPRECATED (Epic 489.8): prefer
+ * [`veil_restore_identity_from_phrase_zeroize`].** This `*const c_char` form
+ * leaves the mnemonic in the caller's heap; the `_zeroize` variant takes
+ * `*mut c_char` and wipes it in place. The Flutter wrapper already uses the
+ * `_zeroize` variant. Kept only for ABI back-compat with existing raw/C
+ * consumers; slated for removal at the next ABI break.
  */
 
 int veil_restore_identity_from_phrase(const char *phrase,
