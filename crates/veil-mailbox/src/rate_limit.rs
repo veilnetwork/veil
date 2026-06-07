@@ -10,7 +10,7 @@
 //! get bypassed by minting more identities. See lib.rs `MailboxConfig`
 //! for the broader rationale.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Token bucket per receiver. At construction, the bucket is full
 /// (`capacity` tokens). Each `check_and_consume` decrements by 1 if
@@ -26,6 +26,12 @@ use std::collections::HashMap;
 /// evicted to make room for the newcomer — a fresh receiver always
 /// starts with a full bucket, so eviction does not unfairly reset a
 /// throttled receiver's allowance.
+///
+/// Eviction picks the victim via the `lru` `BTreeSet` minimum in
+/// O(log n), not an O(n) `min_by_key` scan under the lock — otherwise an
+/// attacker keeping the map saturated and rotating `receiver_id` per PUT
+/// would force a full-map scan on every request (cheap PUT → O(n) work),
+/// turning the cap defense into an amplifier. Mirrors `IdentityWriteQuota`.
 #[derive(Debug)]
 pub(crate) struct ReceiverRateLimiter {
     /// Maximum tokens a receiver may have at once (also the steady-
@@ -33,6 +39,11 @@ pub(crate) struct ReceiverRateLimiter {
     capacity: u32,
     /// Per-receiver state.
     buckets: HashMap<[u8; 32], BucketState>,
+    /// Secondary LRU index ordered by `(last_refill, receiver)` so the
+    /// at-capacity victim is the minimum (O(log n)). Kept in sync with
+    /// `buckets` on every insert / refill-update / eviction; invariant:
+    /// `lru.len() == buckets.len()`.
+    lru: BTreeSet<(u64, [u8; 32])>,
 }
 
 /// Maximum number of receiver buckets held in memory. At ~56 bytes
@@ -60,6 +71,7 @@ impl ReceiverRateLimiter {
         Self {
             capacity: capacity_per_minute,
             buckets: HashMap::new(),
+            lru: BTreeSet::new(),
         }
     }
 
@@ -73,36 +85,53 @@ impl ReceiverRateLimiter {
         }
         let cap_scaled = self.capacity as u64 * SCALE;
         let refill_per_sec = cap_scaled / 60;
-        // audit follow-up: enforce MAX_BUCKETS before
-        // potentially inserting a new entry. If the cap is hit and
-        // the receiver is NOT already tracked, evict the LRU bucket
-        // (oldest `last_refill`) to make room.
-        if !self.buckets.contains_key(&receiver)
-            && self.buckets.len() >= MAX_BUCKETS
-            && let Some(oldest_key) = self
-                .buckets
-                .iter()
-                .min_by_key(|(_, b)| b.last_refill)
-                .map(|(k, _)| *k)
+        // Disjoint field borrows so the eviction/insert paths can touch both
+        // `buckets` and the `lru` index without going through `&mut self`.
+        let Self { buckets, lru, .. } = self;
+
+        // Enforce MAX_BUCKETS before inserting a NEW entry: evict the
+        // least-recently-refilled bucket via the LRU index minimum (O(log n)).
+        if !buckets.contains_key(&receiver)
+            && buckets.len() >= MAX_BUCKETS
+            && let Some(&victim) = lru.iter().next()
         {
-            self.buckets.remove(&oldest_key);
+            lru.remove(&victim);
+            buckets.remove(&victim.1);
         }
-        let bucket = self.buckets.entry(receiver).or_insert(BucketState {
-            tokens_scaled: cap_scaled,
-            last_refill: now_secs,
-        });
-        // Refill since last update.
-        let elapsed = now_secs.saturating_sub(bucket.last_refill);
-        if elapsed > 0 {
-            let added = elapsed.saturating_mul(refill_per_sec);
-            bucket.tokens_scaled = bucket.tokens_scaled.saturating_add(added).min(cap_scaled);
-            bucket.last_refill = now_secs;
-        }
-        if bucket.tokens_scaled >= SCALE {
-            bucket.tokens_scaled -= SCALE;
-            true
-        } else {
-            false
+
+        match buckets.get_mut(&receiver) {
+            Some(bucket) => {
+                // Refill since last update; reposition in the LRU index when
+                // `last_refill` advances (remove old key, insert new).
+                let elapsed = now_secs.saturating_sub(bucket.last_refill);
+                if elapsed > 0 {
+                    let added = elapsed.saturating_mul(refill_per_sec);
+                    bucket.tokens_scaled =
+                        bucket.tokens_scaled.saturating_add(added).min(cap_scaled);
+                    lru.remove(&(bucket.last_refill, receiver));
+                    bucket.last_refill = now_secs;
+                    lru.insert((now_secs, receiver));
+                }
+                if bucket.tokens_scaled >= SCALE {
+                    bucket.tokens_scaled -= SCALE;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                // Fresh receiver: full bucket, consume one. (capacity >= 1 here,
+                // so cap_scaled >= SCALE — no underflow.)
+                buckets.insert(
+                    receiver,
+                    BucketState {
+                        tokens_scaled: cap_scaled - SCALE,
+                        last_refill: now_secs,
+                    },
+                );
+                lru.insert((now_secs, receiver));
+                true
+            }
         }
     }
 }
@@ -141,6 +170,23 @@ mod tests {
         assert!(r.check_and_consume([7u8; 32], 1));
         // Next call same second fails.
         assert!(!r.check_and_consume([7u8; 32], 1));
+    }
+
+    #[test]
+    fn lru_index_stays_in_sync_with_buckets() {
+        // Invariant: exactly one lru entry per bucket, across inserts and
+        // refill-driven last_refill repositions.
+        let mut r = ReceiverRateLimiter::new(60);
+        for i in 0..10u8 {
+            r.check_and_consume([i; 32], 0);
+        }
+        assert_eq!(r.lru.len(), r.buckets.len());
+        // Advance time so existing buckets reposition on next touch.
+        for i in 0..10u8 {
+            r.check_and_consume([i; 32], 5);
+        }
+        assert_eq!(r.lru.len(), r.buckets.len());
+        assert_eq!(r.lru.len(), 10);
     }
 
     #[test]
