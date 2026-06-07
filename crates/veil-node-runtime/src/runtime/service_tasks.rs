@@ -1688,6 +1688,32 @@ impl veil_ipc::OutboxBackend for OutboxIpcBridge {
 pub fn build_push_dispatcher(
     cfg: &veil_cfg::MailboxPushConfig,
 ) -> Arc<dyn veil_push::PushDispatcher> {
+    // Loud startup signal for a partial APNs credential set. `apns_enabled()`
+    // is all-or-nothing, so a half-filled APNs block (e.g. only `apns_p8_path`)
+    // silently disables real push and falls back to LogOnly — wake delivery is
+    // lost with no error. `veil-cli config validate` rejects this
+    // (mailbox_push_apns_partial_config), but the daemon doesn't run full
+    // validation at startup, so warn here too.
+    {
+        let apns_fields_set = [
+            !cfg.apns_p8_path.is_empty(),
+            !cfg.apns_key_id.is_empty(),
+            !cfg.apns_team_id.is_empty(),
+            !cfg.apns_bundle_id.is_empty(),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count();
+        if apns_fields_set != 0 && apns_fields_set != 4 {
+            log::warn!(
+                "veil-push: APNs config is PARTIAL ({apns_fields_set}/4 of \
+                 apns_p8_path/apns_key_id/apns_team_id/apns_bundle_id set) — \
+                 APNs push is DISABLED and the daemon is falling back to \
+                 log-only for APNs tokens. Set all four fields, or clear them \
+                 all to silence this. Run `veil-cli config validate`.",
+            );
+        }
+    }
     let fcm_dispatcher = build_fcm_dispatcher(cfg);
     let apns_dispatcher = build_apns_dispatcher(cfg);
 

@@ -374,6 +374,58 @@ mod tests {
         }
 
         #[test]
+        fn mailbox_push_partial_apns_config_flagged() {
+            // Operator set only the .p8 path but forgot key_id/team_id/
+            // bundle_id — apns_enabled() returns false and the daemon
+            // silently falls back to log-only, losing wake delivery with
+            // no error. Validation must surface this loudly.
+            let mut config = Config::default();
+            config.mailbox.push.apns_p8_path = "/etc/veil/apns.p8".to_owned();
+            let report = validate(&config);
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|i| i.code == "mailbox_push_apns_partial_config"),
+                "partial APNs config must be flagged: {:?}",
+                report.issues,
+            );
+        }
+
+        #[test]
+        fn mailbox_push_complete_apns_config_passes() {
+            let mut config = Config::default();
+            config.mailbox.push.apns_p8_path = "/etc/veil/apns.p8".to_owned();
+            config.mailbox.push.apns_key_id = "ABC1234567".to_owned();
+            config.mailbox.push.apns_team_id = "DEF1234567".to_owned();
+            config.mailbox.push.apns_bundle_id = "com.example.Veil".to_owned();
+            let report = validate(&config);
+            assert!(
+                !report
+                    .issues
+                    .iter()
+                    .any(|i| i.code == "mailbox_push_apns_partial_config"),
+                "fully-configured APNs must NOT be flagged: {:?}",
+                report.issues,
+            );
+        }
+
+        #[test]
+        fn mailbox_push_no_apns_config_passes() {
+            // Default (no push provider) is the intentional log-only
+            // posture, not a misconfig.
+            let report = validate(&Config::default());
+            assert!(
+                !report
+                    .issues
+                    .iter()
+                    .any(|i| i.code == "mailbox_push_apns_partial_config"),
+                "default (no push) must NOT be flagged: {:?}",
+                report.issues,
+            );
+        }
+
+        #[test]
         fn epic483_6b_per_peer_bytes_below_1024_flagged() {
             // Misconfig (or operator typo) — anything below 1 KB/s
             // would prevent even small protocol traffic (handshake
