@@ -242,10 +242,12 @@ impl DirectionKey {
         }
     }
 
-    /// Test/internal: from raw 32-byte secret bytes (skips HKDF).
-    /// Production callers must use [`derive`](Self::derive).
-    #[doc(hidden)]
-    pub fn from_raw_for_test(secret: &[u8; 32]) -> Self {
+    /// Test-only: from raw 32-byte secret bytes (skips HKDF). Production
+    /// callers must use [`derive`](Self::derive). Gated `#[cfg(test)]` +
+    /// `pub(crate)` so this non-HKDF constructor (with its weak XOR len-key
+    /// derivation) is unreachable from any production build or other crate.
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(secret: &[u8; 32]) -> Self {
         let body_cipher = ChaCha20Poly1305::new(Key::from_slice(secret));
         // For test, derive a distinct len_key by XOR — still
         // domain-separated for testing purposes.

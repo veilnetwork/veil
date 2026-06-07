@@ -166,16 +166,6 @@ impl ObfsKey {
         key_bytes.zeroize();
         Self { cipher }
     }
-
-    /// Test/internal: construct from already-derived raw 32-byte key.
-    /// Production callers must use [`derive`](Self::derive) so HKDF
-    /// domain separation is preserved.
-    #[doc(hidden)]
-    pub fn from_raw_for_test(raw: &[u8; 32]) -> Self {
-        Self {
-            cipher: ChaCha20Poly1305::new(Key::from_slice(raw)),
-        }
-    }
 }
 
 // ── Wire format helpers ──────────────────────────────────────────────────────
