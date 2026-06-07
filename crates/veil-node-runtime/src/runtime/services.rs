@@ -813,6 +813,19 @@ impl NodeRuntime {
                                         listen_id, listener_handle, err
                                     ),
                                 );
+                                // Back off before retrying. `accept()` returns
+                                // PERSISTENT errors under fd exhaustion
+                                // (EMFILE/ENFILE) — it fails instantly and keeps
+                                // failing until fds free up. Without this pause
+                                // the loop would busy-spin at 100% CPU and flood
+                                // the log one line per iteration (exactly the
+                                // failure mode an inbound flood can induce).
+                                // The sibling on-demand accept loop bails on
+                                // error; the main data-plane listener must
+                                // instead recover, so we back off rather than
+                                // break. 100 ms is short enough not to delay
+                                // shutdown materially.
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                         }
                     }

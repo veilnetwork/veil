@@ -37,16 +37,22 @@ impl EpidemicPayload {
     /// Serialise to the wire layout:
     /// `msg_id(16) ‖ ttl(1) ‖ origin(32) ‖ payload_len(2 BE) ‖ payload`.
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::FIXED_SIZE + self.payload.len());
+        debug_assert!(
+            self.payload.len() <= crate::budget::MAX_EPIDEMIC_PAYLOAD,
+            "EpidemicBroadcast: payload exceeds MAX_EPIDEMIC_PAYLOAD"
+        );
+        // Clamp the length field and the appended bytes to the SAME value so
+        // the frame is always self-consistent — a > u16::MAX payload can
+        // never produce a length prefix that disagrees with the body (which
+        // a bare `as u16` cast would, by wrapping to 0). Producers are bounded
+        // well under this; the clamp is purely a corruption backstop.
+        let len = self.payload.len().min(u16::MAX as usize);
+        let mut buf = Vec::with_capacity(Self::FIXED_SIZE + len);
         buf.extend_from_slice(&self.msg_id);
         buf.push(self.ttl);
         buf.extend_from_slice(&self.origin);
-        debug_assert!(
-            self.payload.len() <= u16::MAX as usize,
-            "EpidemicBroadcast: payload exceeds u16::MAX bytes"
-        );
-        buf.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.payload);
+        buf.extend_from_slice(&(len as u16).to_be_bytes());
+        buf.extend_from_slice(&self.payload[..len]);
         buf
     }
 
