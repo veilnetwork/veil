@@ -756,24 +756,53 @@ pub async fn register_connection_session(
                 )));
             }
         };
-        let new_count = {
+        // Authoritative cap check INSIDE the same critical section as the
+        // insert. The early `at_limit` read above is only a fast-path: it and
+        // the insert took the `live_sessions` lock separately, so N concurrent
+        // handshakes could each observe room before any of them inserted and
+        // collectively overshoot `max_concurrent`. Re-checking under the insert
+        // lock closes that TOCTOU. The `!Send` guard must not span the reject
+        // path's `.await`, so decide-and-insert under the lock, then handle the
+        // over-limit branch (rollback + shutdown) after the lock scope closes.
+        let inserted_count = {
             let mut sessions = lock!(runtime.live_sessions);
-            sessions.insert(
-                link_id,
-                SessionInfo {
+            if sessions.len() >= runtime.defaults.max_concurrent {
+                None
+            } else {
+                sessions.insert(
                     link_id,
-                    node_id: Some(remote_identity.node_id),
-                    nonce: Some(remote_identity.nonce.clone()),
-                    matched_peer_id,
-                    source,
-                    listener_handle,
-                    state: session_state,
-                    transport,
-                    remote_addr,
-                    description,
-                },
-            );
-            sessions.len()
+                    SessionInfo {
+                        link_id,
+                        node_id: Some(remote_identity.node_id),
+                        nonce: Some(remote_identity.nonce.clone()),
+                        matched_peer_id,
+                        source,
+                        listener_handle,
+                        state: session_state,
+                        transport,
+                        remote_addr,
+                        description,
+                    },
+                );
+                Some(sessions.len())
+            }
+        };
+        let new_count = match inserted_count {
+            Some(n) => n,
+            None => {
+                // Over cap: roll back the directional reservation we took above
+                // (we own it — `try_register_directional` returned `Some`).
+                runtime
+                    .session_tx_registry
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .unregister(&remote_nid);
+                let _ = stream.shutdown().await;
+                return Err(NodeError::Handshake(format!(
+                    "session limit reached ({} concurrent sessions); rejecting link_id={}",
+                    runtime.defaults.max_concurrent, link_id,
+                )));
+            }
         };
         let count_u16 = new_count.min(u16::MAX as usize) as u16;
         runtime.event_bus.publish(veil_proto::EventPayload {
