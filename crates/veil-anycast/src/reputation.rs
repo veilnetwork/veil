@@ -162,7 +162,7 @@ impl AnycastReputation {
 
     /// Note that `node_id` was just RETURNED to a client as a candidate for
     /// `service_tag`. Only candidates the daemon actually handed out (within
-    /// [`ISSUED_TTL`]) may later be the subject of a failure report — this binds
+    /// `ISSUED_TTL`) may later be the subject of a failure report — this binds
     /// app-reported failures to a real resolve (see
     /// [`Self::record_failure_if_issued`]). Bounded ledger with TTL pruning.
     pub fn note_issued(&self, node_id: [u8; 32], service_tag: [u8; 4]) {
