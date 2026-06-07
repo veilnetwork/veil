@@ -22,10 +22,8 @@ impl IdentityPolicy {
     // existing call sites (`IdentityPolicy::DEFAULT_POW_*`) working.
     pub const DEFAULT_POW_DIFFICULTY: u32 = veil_crypto::DEFAULT_POW_DIFFICULTY;
     pub const DEFAULT_POW_TIMEOUT_SECS: u64 = veil_crypto::DEFAULT_POW_TIMEOUT_SECS;
-    /// upper cap on adaptive PoW difficulty. Keeps solve times
-    /// bounded even when the network estimate is unreliable — at 32 bits the
-    /// expected CPU cost is ~4 billion hash attempts, which a single core
-    /// handles in ≤ 30 s on modern hardware.
+    /// The canonical identity policy: the default signature algorithm paired
+    /// with the canonical [`PowPolicy`].
     pub fn canonical() -> Self {
         Self {
             algo: Self::DEFAULT_ALGO,

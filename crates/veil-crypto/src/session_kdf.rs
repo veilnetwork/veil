@@ -240,15 +240,13 @@ pub fn derive_rekey_keys(
 /// Both sides derive the same 96-byte block; lexicographic ordering
 /// of node_ids picks who uses which half as `tx_key` / `rx_key`.
 ///
-/// **Wire-protocol note:** this is the PRIMITIVE only. Wiring it
-/// into the OVL1 handshake (initiator must transmit ML-KEM EK to
-/// responder, responder encapsulates and returns the ciphertext +
-/// initiator's EK back along the existing 4-phase handshake) is a
-/// follow-up slice that requires a wire-format version bump. Until
-/// that ships, callers can use `derive_hybrid_session_keys` directly
-/// when both X25519 and ML-KEM secrets are pre-established by some
-/// out-of-band mechanism (e.g. operator-driven key-rotation tests
-/// or a future -style multi-device sync flow).
+/// **Wire-protocol note:** the hybrid handshake is LIVE — the OVL1
+/// handshake (`veil-session`) transmits the ML-KEM EK, encapsulates,
+/// and returns the ciphertext, then calls this function to derive the
+/// post-quantum-augmented session keys. This primitive can also be used
+/// directly when both X25519 and ML-KEM secrets are pre-established by
+/// some out-of-band mechanism (e.g. operator-driven key-rotation tests
+/// or a multi-device sync flow).
 pub fn derive_hybrid_session_keys(
     x25519_shared_secret: &[u8; 32],
     mlkem_shared_secret: &[u8],

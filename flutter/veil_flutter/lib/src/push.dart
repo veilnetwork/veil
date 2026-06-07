@@ -87,13 +87,15 @@ class VeilPush {
   /// `handleWakeup()` runs on **any** push the OS delivers. Wake-payload
   /// authentication IS available — `handleWakeup` verifies a wake-HMAC when the
   /// caller supplies `wakePayload + wakeHmacKey + receiverId`, silently
-  /// rejecting forged/replayed/expired wakes. It is OPT-IN: the relay/provider
-  /// that MINTS the HMAC payload is the deferred push-relay (TASKS.md 489.10
-  /// slice 4.4), so until that ships — or when no key is supplied — this
-  /// rate-limit is the active defence. Without the HMAC, an attacker with a
-  /// leaked FCM/APNs token can spam pushes to either drain battery (DoS) or
-  /// time-correlate the resulting wakeups to infer when the user is online —
-  /// bounded to 1/min by [_minWakeupGap].
+  /// rejecting forged/replayed/expired wakes. Daemon-side MINTING has shipped
+  /// (Epic 489.10 slice 4.4: `mint_wake_payload` in the node runtime emits the
+  /// authenticated payload, surfaced to senders via the rendezvous
+  /// `wake_hmac_envelope`); what remains is automatic key distribution /
+  /// onboarding to clients, so this path is still OPT-IN. When no key is
+  /// supplied, this rate-limit is the active defence: without the HMAC, an
+  /// attacker with a leaked FCM/APNs token can spam pushes to either drain
+  /// battery (DoS) or time-correlate the resulting wakeups to infer when the
+  /// user is online — bounded to 1/min by [_minWakeupGap].
   ///
   /// As a stop-gap until the HMAC rolls out, gate every wake-up by a
   /// monotonic-clock timestamp cached in-process: if the
