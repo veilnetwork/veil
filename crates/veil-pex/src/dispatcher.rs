@@ -110,16 +110,23 @@ impl PexDispatcher {
             rate.retain(|_, t| now.duration_since(*t).as_secs() < WALK_RATE_LIMIT_SECS * 2);
         }
 
+        // Authenticate the stamped origin ONCE; gates both the LearnedPeer
+        // fan-out below and the PoW-difficulty reduction in `emit_challenge`.
+        let origin_authenticated = verify_walk_origin(&walk);
+
         // Learn the walk's ORIGIN as a dialable contact (if it advertised an
         // address and it isn't us). Every node a walk traverses thus records
         // the origin → an under-connected / keyspace-isolated origin (which
         // peers would otherwise never learn an address for, leaving it stuck on
         // outbound-only sessions) becomes discoverable cluster-wide and the mesh
-        // fills. Rate-limited above (1 walk/peer/min). The initiator validates
-        // the node_id↔pubkey binding and drops wildcard addresses before dialing
-        // (same path as `Result` peers), so a spoofed `origin_transport` at most
-        // wastes one dial.
-        if !walk.origin_transport.is_empty() && walk.origin_node_id != self.local_node_id {
+        // fills. Rate-limited above (1 walk/peer/min). Gated on
+        // `origin_authenticated` so a forged/unsigned origin can't inject a
+        // spoofed (node_id, transport) contact; the initiator additionally
+        // re-checks the binding and drops wildcard addresses before dialing.
+        if origin_authenticated
+            && !walk.origin_transport.is_empty()
+            && walk.origin_node_id != self.local_node_id
+        {
             let _ = self.event_tx.try_send(PexEvent::LearnedPeer(PexPeer {
                 node_id: walk.origin_node_id,
                 transport: walk.origin_transport.clone(),
@@ -134,7 +141,7 @@ impl PexDispatcher {
                 < xor_distance(&peer_id, &walk.target_node_id);
 
         if should_terminate {
-            return self.emit_challenge(&walk, peer_id, broadcaster);
+            return self.emit_challenge(&walk, peer_id, broadcaster, origin_authenticated);
         }
 
         // Forward the walk to the peer closest to target.
@@ -156,8 +163,16 @@ impl PexDispatcher {
         walk: &PexWalk,
         _peer_id: [u8; 32],
         broadcaster: Option<&dyn FrameBroadcaster>,
+        origin_authenticated: bool,
     ) -> PexDispatchOutcome {
-        let origin_difficulty = compute_origin_difficulty(walk);
+        // Only an AUTHENTICATED origin earns a PoW discount. An unsigned /
+        // forged origin gets src_difficulty=0 → the full anti-amplification
+        // challenge (no reduction), closing the grind-a-low-difficulty path.
+        let origin_difficulty = if origin_authenticated {
+            compute_origin_difficulty(walk)
+        } else {
+            0
+        };
         let difficulty = compute_pex_challenge_difficulty(origin_difficulty, self.local_difficulty);
 
         let mut challenge_nonce = [0u8; 32];
@@ -366,6 +381,42 @@ fn compute_origin_difficulty(walk: &PexWalk) -> u8 {
     veil_util::leading_zero_bits(hash.as_bytes()).min(255) as u8
 }
 
+/// Authenticate a walk's stamped origin before we trust ANY origin-derived
+/// field (the PoW-difficulty reduction in `compute_origin_difficulty`, and the
+/// `LearnedPeer` fan-out).
+///
+/// Check one — node_id ↔ pubkey binding: `BLAKE3(origin_pubkey) ==
+/// origin_node_id` (same rule as `pex_binding_ok`), so a forged pubkey can't
+/// impersonate another node's identity to grind a low difficulty.
+///
+/// Check two — `origin_sig` is a valid Ed25519 signature over
+/// `signable_bytes()` (`walk_id ‖ target_node_id`), proving the origin
+/// actually issued this walk rather than a third party replaying/forging it.
+///
+/// PEX is Ed25519-only (the initiator disables walks for non-Ed25519 nodes),
+/// so a 32-byte pubkey is required; unsigned / forged / mis-bound origins are
+/// rejected. Without this, an attacker could forge `origin_pubkey` /
+/// `origin_nonce` with many leading-zero bits to lower the anti-amplification
+/// PoW the terminating node charges, and inject spoofed `LearnedPeer` contacts.
+fn verify_walk_origin(walk: &PexWalk) -> bool {
+    use base64::Engine as _;
+    // Ed25519 only — origin_sig is a fixed [u8; 64].
+    if walk.origin_pubkey.len() != 32 {
+        return false;
+    }
+    if *blake3::hash(&walk.origin_pubkey).as_bytes() != walk.origin_node_id {
+        return false;
+    }
+    let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(&walk.origin_pubkey);
+    veil_crypto::signature::verify_message(
+        SignatureAlgorithm::Ed25519,
+        &pubkey_b64,
+        &walk.signable_bytes(),
+        &walk.origin_sig,
+    )
+    .is_ok()
+}
+
 fn verify_pex_pow(
     response: &PexResponse,
     server_challenge_nonce: &[u8; 32],
@@ -399,4 +450,75 @@ fn verify_origin_sig(walk: &PexWalk, response: &PexResponse) -> bool {
     ]
     .concat();
     veil_crypto::signature::verify_message(algo, &pubkey_b64, &msg, &response.origin_sig).is_ok()
+}
+
+#[cfg(test)]
+mod walk_origin_auth_tests {
+    use super::*;
+    use base64::Engine as _;
+    use veil_crypto::generate_keypair;
+
+    fn signed_walk(walk_id: u64, target: [u8; 32]) -> PexWalk {
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let pubkey_raw = base64::engine::general_purpose::STANDARD
+            .decode(&kp.public_key)
+            .unwrap();
+        let origin_node_id = *blake3::hash(&pubkey_raw).as_bytes();
+        let mut w = PexWalk {
+            walk_id,
+            target_node_id: target,
+            origin_node_id,
+            origin_pubkey: pubkey_raw,
+            origin_nonce: 7,
+            origin_sig: [0u8; 64],
+            ttl: 5,
+            origin_transport: "obfs4-tcp://1.2.3.4:5556".to_string(),
+        };
+        let sig = veil_crypto::signature::sign_message(
+            SignatureAlgorithm::Ed25519,
+            &kp.public_key,
+            &kp.private_key,
+            &w.signable_bytes(),
+        )
+        .unwrap();
+        w.origin_sig.copy_from_slice(&sig);
+        w
+    }
+
+    #[test]
+    fn accepts_valid_signed_walk() {
+        assert!(verify_walk_origin(&signed_walk(0xABCD, [0x11; 32])));
+    }
+
+    #[test]
+    fn rejects_unsigned_origin() {
+        let mut w = signed_walk(0xABCD, [0x11; 32]);
+        w.origin_sig = [0u8; 64];
+        assert!(!verify_walk_origin(&w));
+    }
+
+    #[test]
+    fn rejects_forged_node_id_binding() {
+        // pubkey no longer hashes to origin_node_id → grind-a-low-difficulty
+        // / impersonation attempt is rejected before any signature work.
+        let mut w = signed_walk(0xABCD, [0x11; 32]);
+        w.origin_node_id = [0xFF; 32];
+        assert!(!verify_walk_origin(&w));
+    }
+
+    #[test]
+    fn rejects_tampered_target() {
+        // signature was over the original (walk_id ‖ target); mutating target
+        // after signing must break verification.
+        let mut w = signed_walk(0xABCD, [0x11; 32]);
+        w.target_node_id = [0x22; 32];
+        assert!(!verify_walk_origin(&w));
+    }
+
+    #[test]
+    fn rejects_wrong_length_pubkey() {
+        let mut w = signed_walk(0xABCD, [0x11; 32]);
+        w.origin_pubkey.truncate(16);
+        assert!(!verify_walk_origin(&w));
+    }
 }
