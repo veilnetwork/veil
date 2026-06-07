@@ -1,6 +1,6 @@
 [package]
 name = "veil-bloom"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Tiny Bloom filter for veil peer-sync (Phase 6.49 T1.4 P4, Epic 489.10). Pure Rust, no allocations during contains-checks, BLAKE3-based double hashing."
 license = "AGPL-3.0-or-later"

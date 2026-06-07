@@ -1,6 +1,6 @@
 [package]
 name = "veil-gateway"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Multi-gateway scoring and failover (Epic 141): aggregates static-config + mesh-discovered gateways, picks the preferred peer, hysteresis to avoid oscillation, integrates with NAT relay. Phase 6 extraction from veilcore."
 license = "AGPL-3.0-or-later"
