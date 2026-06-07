@@ -158,6 +158,25 @@ fn external_require_signed_config() -> bool {
         .unwrap_or(false)
 }
 
+/// External, trusted anti-rollback floor for signed configs (F4).
+///
+/// `issued_at_unix` is cryptographically covered by the signature, but nothing
+/// remembers the newest config accepted so far — so an attacker with config
+/// write access could replace the current config with an OLDER, still-validly-
+/// signed one (a downgrade to a config with weaker settings). This env-var
+/// (unix seconds), living OUTSIDE the mutable config like the issuer pin, sets a
+/// minimum acceptable `issued_at_unix`: a verified config older than it is
+/// rejected as a rollback. Operators bump it when they roll a new signed config.
+pub const MIN_ISSUED_AT_CONFIG_ENV: &str = "VEIL_CONFIG_MIN_ISSUED_AT";
+
+/// Operator-asserted anti-rollback floor from [`MIN_ISSUED_AT_CONFIG_ENV`]
+/// (`None` if unset or unparseable).
+fn external_min_issued_at() -> Option<u64> {
+    std::env::var(MIN_ISSUED_AT_CONFIG_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 /// Internal: surface the signed-config envelope on load and normalise
 /// the body for the TOML parser.  Three branches:
 ///
@@ -177,18 +196,19 @@ fn external_require_signed_config() -> bool {
 /// only).
 fn preprocess_signed_config(content: &str, path: &Path) -> (String, SignedConfigStatus) {
     let pinned = std::env::var(TRUSTED_CONFIG_ISSUER_PUBKEY_ENV).ok();
-    preprocess_signed_config_with_pin(content, path, pinned.as_deref())
+    preprocess_signed_config_with_pin(content, path, pinned.as_deref(), external_min_issued_at())
 }
 
 /// Testable inner: same as [`preprocess_signed_config`] but accepts
-/// the trusted-issuer pubkey explicitly instead of reading the env-var.
-/// Production callers go through the env-var wrapper; tests pass a
-/// concrete `Some(pk)` or `None` directly so they don't race on
-/// process-global env state.
+/// the trusted-issuer pubkey and anti-rollback floor explicitly instead of
+/// reading the env-vars. Production callers go through the env-var wrapper;
+/// tests pass concrete values directly so they don't race on process-global
+/// env state.
 fn preprocess_signed_config_with_pin(
     content: &str,
     path: &Path,
     pinned: Option<&str>,
+    min_issued_at: Option<u64>,
 ) -> (String, SignedConfigStatus) {
     if !crate::signed_config::has_signature_header(content) {
         log::warn!(
@@ -213,6 +233,28 @@ fn preprocess_signed_config_with_pin(
     }
     match crate::signed_config::verify_signed_config(content, pinned) {
         Ok(verified) => {
+            // F4 (anti-rollback): a validly-signed but OLDER-than-floor config is
+            // a downgrade attack. Reject it as a verification failure (so the
+            // require-signed gate refuses it) rather than accepting the rollback.
+            if let Some(floor) = min_issued_at
+                && verified.issued_at_unix < floor
+            {
+                log::warn!(
+                    "veil_cfg.signed_config_rollback \
+                     config '{}' issued_at={} is older than {}={} — rejecting as \
+                     a rollback (downgrade attack or stale floor).",
+                    path.display(),
+                    verified.issued_at_unix,
+                    MIN_ISSUED_AT_CONFIG_ENV,
+                    floor,
+                );
+                let stripped = content
+                    .lines()
+                    .filter(|l| !l.starts_with(crate::signed_config::SIGNED_CONFIG_HEADER_PREFIX))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return (stripped, SignedConfigStatus::VerifyFailed);
+            }
             let fp_len = 16.min(verified.issuer_pk.len());
             log::info!(
                 "veil_cfg.signed_config \
@@ -456,6 +498,7 @@ mod tests {
             &signed,
             Path::new("/tmp/test-config.toml"),
             Some(&kp.public_key),
+            None,
         );
         assert!(preprocessed.contains("runtime_flavor = \"multi_thread\""));
         assert!(!preprocessed.contains("VEIL_CONFIG_SIGNATURE_V1"));
@@ -481,6 +524,7 @@ mod tests {
             &signed,
             Path::new("/tmp/test-config.toml"),
             Some(&kp_b.public_key), // wrong pin
+            None,
         );
         // Body still loads (phase-1 graceful degradation), but the
         // signature-header lines are stripped so the TOML parses.
@@ -523,6 +567,43 @@ mod tests {
         );
     }
 
+    /// F4: a validly-signed config OLDER than the anti-rollback floor is rejected
+    /// (VerifyFailed), while one at/above the floor — or with no floor — verifies.
+    #[test]
+    fn f4_anti_rollback_floor_rejects_older_signed_config() {
+        let kp = veil_crypto::generate_keypair(crate::SignatureAlgorithm::Ed25519);
+        let raw = "[global]\nruntime_flavor = \"multi_thread\"\n";
+        let signed = crate::signed_config::sign_config(
+            raw,
+            &kp.public_key,
+            &kp.private_key,
+            kp.algo,
+            1_000, // issued_at_unix
+        )
+        .expect("sign");
+        let path = Path::new("/tmp/f4-config.toml");
+        // floor below issued_at → accepted.
+        let (_b, st) =
+            preprocess_signed_config_with_pin(&signed, path, Some(&kp.public_key), Some(500));
+        assert_eq!(
+            st,
+            SignedConfigStatus::Verified,
+            "newer-than-floor must verify"
+        );
+        // floor above issued_at → rollback rejected.
+        let (_b2, st2) =
+            preprocess_signed_config_with_pin(&signed, path, Some(&kp.public_key), Some(2_000));
+        assert_eq!(
+            st2,
+            SignedConfigStatus::VerifyFailed,
+            "older-than-floor must be rejected as a rollback"
+        );
+        // no floor → accepted (back-compat).
+        let (_b3, st3) =
+            preprocess_signed_config_with_pin(&signed, path, Some(&kp.public_key), None);
+        assert_eq!(st3, SignedConfigStatus::Verified, "no floor must verify");
+    }
+
     /// Unpinned mode (`None`) accepts any internally-consistent envelope,
     /// matching the slice-11a unpinned path.
     #[test]
@@ -537,8 +618,12 @@ mod tests {
             1_700_000_000,
         )
         .expect("sign");
-        let (preprocessed, _status) =
-            preprocess_signed_config_with_pin(&signed, Path::new("/tmp/test-config.toml"), None);
+        let (preprocessed, _status) = preprocess_signed_config_with_pin(
+            &signed,
+            Path::new("/tmp/test-config.toml"),
+            None,
+            None,
+        );
         assert!(preprocessed.contains("runtime_flavor = \"multi_thread\""));
     }
 
@@ -551,7 +636,7 @@ mod tests {
     fn epic11d_signed_status_unsigned_for_plain_toml() {
         let raw = "[global]\nruntime_flavor = \"multi_thread\"\n";
         let (_body, status) =
-            preprocess_signed_config_with_pin(raw, Path::new("/tmp/test-config.toml"), None);
+            preprocess_signed_config_with_pin(raw, Path::new("/tmp/test-config.toml"), None, None);
         assert_eq!(status, SignedConfigStatus::Unsigned);
     }
 
@@ -571,6 +656,7 @@ mod tests {
             &signed,
             Path::new("/tmp/test-config.toml"),
             Some(&kp.public_key),
+            None,
         );
         assert_eq!(status, SignedConfigStatus::Verified);
     }
@@ -592,6 +678,7 @@ mod tests {
             &signed,
             Path::new("/tmp/test-config.toml"),
             Some(&kp_b.public_key),
+            None,
         );
         assert_eq!(status, SignedConfigStatus::VerifyFailed);
     }
