@@ -95,6 +95,14 @@ windows-service = "0.8"
 [dev-dependencies]
 rcgen = "0.13"
 tempfile = "3"
+# Re-list veil-proto with `test-low-difficulty` so `cargo test -p veil-cli`
+# mines NameClaim PoW (`required_difficulty`, defined in veil-proto) at the
+# lowered test difficulty. Without this, veil-proto is built as a plain
+# dependency (production difficulty: 24-28 bits for short alpha names), making
+# the `claim_name` tests slow and — paired with the mining budget — flaky.
+# Feature unification applies this only to the test/dev build, not the lib.
+# Mirrors the veilcore dev-dependency pattern.
+veil-proto = { path = "../veil-proto", features = ["test-low-difficulty"] }
 
 [lints]
 workspace = true

@@ -188,6 +188,14 @@ pub fn decode_cert_blob(blob: &[u8]) -> Result<MembershipCert, CertDecodeError> 
         other => return Err(CertDecodeError::UnknownAlgo { actual: other }),
     };
     let sig_len = u16::from_be_bytes([blob[83], blob[84]]) as usize;
+    // Cap before the bounds check so an attacker-supplied length can't drive a
+    // large pre-verify allocation.
+    if sig_len > MAX_CERT_SIG_BYTES {
+        return Err(CertDecodeError::SignatureTooLarge {
+            got: sig_len,
+            max: MAX_CERT_SIG_BYTES,
+        });
+    }
     if blob.len() < 85 + sig_len {
         return Err(CertDecodeError::TruncatedSignature {
             need: 85 + sig_len,
@@ -207,6 +215,14 @@ pub fn decode_cert_blob(blob: &[u8]) -> Result<MembershipCert, CertDecodeError> 
     })
 }
 
+/// Upper bound on the membership-cert signature field at decode time. The
+/// largest valid signature is an Ed25519+Falcon-1024 hybrid (~64 + ~1462
+/// bytes); 2048 leaves headroom. Bounds the pre-verify `Vec` allocation so a
+/// peer can't make us allocate up to ~64 KiB (the bare u16 max) per HELLO TLV
+/// cert before `verify_message` rejects it — matches the sig-length caps used
+/// in `veil-crypto`, `network_ban`, and `rendezvous`.
+pub const MAX_CERT_SIG_BYTES: usize = 2048;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CertDecodeError {
     #[error("cert blob truncated: need {need} bytes, got {got}")]
@@ -215,6 +231,8 @@ pub enum CertDecodeError {
     UnknownAlgo { actual: u8 },
     #[error("cert signature truncated: need {need} bytes, got {got}")]
     TruncatedSignature { need: usize, got: usize },
+    #[error("cert signature too large: {got} bytes exceeds {max}")]
+    SignatureTooLarge { got: usize, max: usize },
 }
 
 fn algo_discriminant(algo: SignatureAlgorithm) -> u8 {
