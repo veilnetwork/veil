@@ -171,7 +171,11 @@ pub fn cache_peer_handshake_state(
             .peer_cap_flags
             .write()
             .unwrap_or_else(|p| p.into_inner());
+        // Only evict when inserting a NEW peer (matches the sibling caches), so
+        // an existing peer re-handshaking can't churn out a different live
+        // peer's flags.
         if flags_cache.len() >= veil_proto::budget::MAX_PEER_PUBKEYS_CACHE
+            && !flags_cache.contains_key(&r.remote_identity_payload.node_id)
             && let Some(evict_key) = flags_cache.keys().next().copied()
         {
             flags_cache.remove(&evict_key);
