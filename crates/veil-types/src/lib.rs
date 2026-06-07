@@ -706,6 +706,36 @@ pub struct PexConfig {
     /// Maximum peers returned per PEX response. Default: 16.
     #[serde(default = "PexConfig::default_max_response_peers")]
     pub max_response_peers: u8,
+
+    // ── Search-walk cadence (tiered by ACTIVE-SESSION count) ─────────────────
+    // The discovery walk interval steps down as the node accumulates SESSIONS
+    // (not merely discovered peers — see `veil_pex` `compute_interval`):
+    //   active sessions < low_peer_threshold            → search_interval_active
+    //   low_peer_threshold..high_peer_threshold         → search_interval_mid
+    //   >= high_peer_threshold                          → search_interval_idle
+    // Keying on sessions keeps it scale-safe: a node stops aggressive searching
+    // once it is connected, regardless of how many peers exist to discover.
+    /// Below this many ACTIVE SESSIONS, search aggressively
+    /// (`search_interval_active_secs`). Default: 3.
+    #[serde(default = "PexConfig::default_low_peer_threshold")]
+    pub low_peer_threshold: usize,
+    /// At/above this many ACTIVE SESSIONS, drop to once-per-day maintenance
+    /// search (`search_interval_idle_secs`). Default: 20.
+    #[serde(default = "PexConfig::default_high_peer_threshold")]
+    pub high_peer_threshold: usize,
+    /// Search interval while under-connected (< `low_peer_threshold` sessions).
+    /// Default: 900 (15 min).
+    #[serde(default = "PexConfig::default_search_interval_active_secs")]
+    pub search_interval_active_secs: u64,
+    /// Search interval while minimally connected
+    /// (`low_peer_threshold`..`high_peer_threshold` sessions).
+    /// Default: 3600 (1 h).
+    #[serde(default = "PexConfig::default_search_interval_mid_secs")]
+    pub search_interval_mid_secs: u64,
+    /// Search interval while well-connected (>= `high_peer_threshold` sessions).
+    /// Default: 86400 (1 day).
+    #[serde(default = "PexConfig::default_search_interval_idle_secs")]
+    pub search_interval_idle_secs: u64,
 }
 
 impl PexConfig {
@@ -721,12 +751,32 @@ impl PexConfig {
     fn default_max_response_peers() -> u8 {
         16
     }
+    fn default_low_peer_threshold() -> usize {
+        3
+    }
+    fn default_high_peer_threshold() -> usize {
+        20
+    }
+    fn default_search_interval_active_secs() -> u64 {
+        15 * 60
+    }
+    fn default_search_interval_mid_secs() -> u64 {
+        60 * 60
+    }
+    fn default_search_interval_idle_secs() -> u64 {
+        24 * 60 * 60
+    }
 
     pub fn is_default(&self) -> bool {
         self.enabled == Self::default_enabled()
             && self.max_peers == Self::default_max_peers()
             && self.walk_parallelism == Self::default_walk_parallelism()
             && self.max_response_peers == Self::default_max_response_peers()
+            && self.low_peer_threshold == Self::default_low_peer_threshold()
+            && self.high_peer_threshold == Self::default_high_peer_threshold()
+            && self.search_interval_active_secs == Self::default_search_interval_active_secs()
+            && self.search_interval_mid_secs == Self::default_search_interval_mid_secs()
+            && self.search_interval_idle_secs == Self::default_search_interval_idle_secs()
     }
 }
 
@@ -737,6 +787,11 @@ impl Default for PexConfig {
             max_peers: Self::default_max_peers(),
             walk_parallelism: Self::default_walk_parallelism(),
             max_response_peers: Self::default_max_response_peers(),
+            low_peer_threshold: Self::default_low_peer_threshold(),
+            high_peer_threshold: Self::default_high_peer_threshold(),
+            search_interval_active_secs: Self::default_search_interval_active_secs(),
+            search_interval_mid_secs: Self::default_search_interval_mid_secs(),
+            search_interval_idle_secs: Self::default_search_interval_idle_secs(),
         }
     }
 }
