@@ -1,10 +1,17 @@
 # Release-manifest signing (installer supply-chain authenticity)
 
-> **Status:** wired, **not yet armed.** The code (CI signing step +
-> `scripts/install.sh` verification) is in place; it activates the moment you
-> complete the key ceremony below. Until then the installer falls back to
-> sha256-only verification with a warning — no regression versus the prior
-> channel-trust behaviour.
+> **Status:** key **pinned**; verification **live on both installers**;
+> CI signing **optional (warn-fallback)**. The pinned Ed25519 public key is
+> embedded in BOTH `scripts/install.sh` (`pinned_release_pubkey`) and
+> `scripts/install.ps1` (`Get-PinnedReleasePubkey`). When the release workflow
+> publishes a `sha256-<triple>.txt.sig` and a verifier is available
+> (OpenSSL ≥ 3.0), the installer verifies it and **fail-closes on a bad/missing
+> signature**. When no signature is published, or no capable OpenSSL is present,
+> the installer **warns and falls back to sha256-only** — no regression versus
+> the prior channel-trust behaviour. Pass `--require-signature` (Unix) /
+> `-RequireSignature` (Windows) to make verification mandatory. The remaining
+> "arm" action is making the CI `RELEASE_INSTALLER_ED25519_SK` secret required
+> so every release publishes a signature (see the release workflow).
 
 ## What this protects (and what it does not)
 
