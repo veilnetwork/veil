@@ -217,16 +217,24 @@ pub struct SlabStats {
     pub fallback_alloc_total: u64,
 }
 
+/// Hard upper bound on `VEIL_SHARED_SLAB_CELLS`. The slab preallocates a
+/// `Vec<SharedCell>` of the configured size at first use, so an absurd env
+/// value (typo / hostile env) would otherwise drive a multi-GB allocation /
+/// OOM at startup. 1 Mi cells is far above any real workload and caps the
+/// preallocation. Values are clamped into `[1, MAX_SLAB_CELLS]`.
+pub const MAX_SLAB_CELLS: usize = 1 << 20;
+
 /// Lazy global slab — allocated on first use, persists for process
 /// lifetime. Sized via `VEIL_SHARED_SLAB_CELLS` env (default
-/// [`DEFAULT_SLAB_CELLS`]).
+/// [`DEFAULT_SLAB_CELLS`]), clamped to `[1, MAX_SLAB_CELLS]`.
 pub(crate) fn global() -> &'static SharedSlab {
     static GLOBAL: OnceLock<SharedSlab> = OnceLock::new();
     GLOBAL.get_or_init(|| {
         let cap = std::env::var("VEIL_SHARED_SLAB_CELLS")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_SLAB_CELLS);
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SLAB_CELLS)
+            .clamp(1, MAX_SLAB_CELLS);
         SharedSlab::new(cap)
     })
 }
