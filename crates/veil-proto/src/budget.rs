@@ -317,6 +317,14 @@ pub const MAX_TRANSPORT_ADDRS: usize = 32;
 /// 1600 gives one round-number of headroom for future ML-KEM parameter sets.
 pub const MAX_MLKEM_PK_LEN: usize = 1600;
 
+/// Maximum byte length of an ML-KEM ciphertext field (E2E envelope).
+///
+/// ML-KEM-768 ciphertext is exactly 1088 bytes; ML-KEM-1024 is 1568 bytes.
+/// 1600 matches `MAX_MLKEM_PK_LEN` for one round-number of headroom. Used as
+/// the per-field decode cap so `E2eEnvelope::decode` is self-bounding even if
+/// ever invoked on a buffer not already gated by the 16 MiB frame body cap.
+pub const MAX_KEM_CIPHERTEXT: usize = 1600;
+
 /// Maximum number of NAT candidates in a single `NatProbeRequest`/`NatProbeReply`.
 ///
 /// A node realistically has at most a handful of addresses; 64 is generous.
