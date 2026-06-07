@@ -186,6 +186,9 @@ sha256_of() { # <file>
 # override: VEIL_RELEASE_PUBKEY_PEM (e.g. a testnet key).
 pinned_release_pubkey() {
     cat <<'PUBKEY'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAdvlFTSCogeqOOtL3TnkZZ14Eq9waNDBU+yTfubasRXs=
+-----END PUBLIC KEY-----
 PUBKEY
 }
 
