@@ -266,6 +266,19 @@ jobs:
           keyfile="$(mktemp)"; pubfile="$(mktemp)"
           printf '%s' "$RELEASE_INSTALLER_ED25519_SK" > "$keyfile"
           openssl pkey -in "$keyfile" -pubout -out "$pubfile"
+          # Fail-fast: the secret's public half MUST equal the key pinned in
+          # scripts/install.sh. Otherwise the installer would reject every
+          # release we sign here (wrong-key verification failure). Catches a
+          # mismatched/rotated secret at release time, not in users' installs.
+          pinned="$(sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' scripts/install.sh | tr -d '[:space:]')"
+          derived="$(tr -d '[:space:]' < "$pubfile")"
+          if [ -z "$pinned" ]; then
+            echo "::error::no pinned public key in scripts/install.sh (pinned_release_pubkey is empty) — arm it before signing releases"; exit 1
+          fi
+          if [ "$pinned" != "$derived" ]; then
+            echo "::error::RELEASE_INSTALLER_ED25519_SK public half does NOT match pinned_release_pubkey() in install.sh"; exit 1
+          fi
+          echo "secret public half matches the pinned installer key"
           shopt -s nullglob
           signed=0
           for f in out/sha256-*.txt; do
