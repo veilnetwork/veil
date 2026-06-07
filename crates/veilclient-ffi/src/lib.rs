@@ -1850,16 +1850,17 @@ pub unsafe extern "C" fn veil_lookup_rendezvous_replicas(
     });
     match res {
         Ok(replicas) => {
-            let mut buf = serialize_replica_buf(&replicas);
-            // Hand the heap buffer to the caller. `into_raw_parts` is
-            // unstable, so shrink-to-fit then leak the Vec's pointer +
-            // length; `veil_free_replica_buf` reconstitutes the exact
-            // (ptr, len, len) triple via `Vec::from_raw_parts`.
-            buf.shrink_to_fit();
-            debug_assert_eq!(buf.len(), buf.capacity());
-            let len = buf.len();
-            let ptr = buf.as_mut_ptr();
-            std::mem::forget(buf);
+            // Hand the heap buffer to the caller as a boxed slice. Unlike
+            // `Vec::shrink_to_fit` (best-effort — a size-class allocator
+            // such as jemalloc may keep capacity > len), `into_boxed_slice`
+            // reallocates to an allocation of EXACTLY `len` bytes, so the
+            // `Box::from_raw(slice_ptr_of_len(len))` reconstruction in
+            // `veil_free_replica_buf` deallocates with the matching layout.
+            // This removes a latent capacity-mismatch UB that could fire
+            // even when the caller passes back the correct length.
+            let boxed: Box<[u8]> = serialize_replica_buf(&replicas).into_boxed_slice();
+            let len = boxed.len();
+            let ptr = Box::into_raw(boxed) as *mut u8;
             unsafe {
                 *out_buf = ptr;
                 *out_len = len;
@@ -1890,11 +1891,13 @@ pub unsafe extern "C" fn veil_free_replica_buf(ptr: *mut u8, len: size_t) {
     if ptr.is_null() {
         return;
     }
-    // The buffer was leaked from a Vec whose len == capacity (we
-    // `shrink_to_fit` before forgetting it), so reconstruct with
-    // capacity == len and drop.
+    // The buffer was leaked from a `Box<[u8]>` of exactly `len` bytes
+    // (see `veil_lookup_rendezvous_replicas`), so rebuild the fat slice
+    // pointer and drop the box — this deallocates with the same layout
+    // the allocation was made with.
     unsafe {
-        drop(Vec::from_raw_parts(ptr, len, len));
+        let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        drop(Box::from_raw(slice));
     }
 }
 
@@ -3323,6 +3326,12 @@ pub const VEIL_DEFAULT_RESTORE_VALIDITY_SECS: u64 = 30 * 24 * 3600;
 /// Lightweight — no key derivation, no disk I/O. UI uses this to
 /// give immediate feedback as the user types ("checksum invalid"
 /// before they hit "Restore").
+///
+/// **DEPRECATED (Epic 489.8): prefer [`veil_validate_bip39_phrase_zeroize`].**
+/// This `*const c_char` form leaves the mnemonic in the caller's heap; the
+/// `_zeroize` variant takes `*mut c_char` and wipes it in place. The Flutter
+/// wrapper already uses the `_zeroize` variant. Kept only for ABI back-compat
+/// with existing raw/C consumers; slated for removal at the next ABI break.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_validate_bip39_phrase(
     phrase: *const c_char,
@@ -3370,6 +3379,13 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase(
 ///
 /// Returns `VEIL_OK` on success. On failure sets `*err_out` to
 /// a description and returns `VEIL_ERR`.
+///
+/// **DEPRECATED (Epic 489.8): prefer
+/// [`veil_restore_identity_from_phrase_zeroize`].** This `*const c_char` form
+/// leaves the mnemonic in the caller's heap; the `_zeroize` variant takes
+/// `*mut c_char` and wipes it in place. The Flutter wrapper already uses the
+/// `_zeroize` variant. Kept only for ABI back-compat with existing raw/C
+/// consumers; slated for removal at the next ABI break.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_restore_identity_from_phrase(
     phrase: *const c_char,
