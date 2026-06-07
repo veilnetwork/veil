@@ -291,6 +291,17 @@ pub const MAX_PEER_MLKEM_CACHE: usize = 512;
 /// without measurable user-visible degradation.
 pub const MAX_PEER_VIVALDI_CACHE: usize = 1_024;
 
+/// Cap for the `verified_peer_certs` map (private-network membership certs
+/// stashed at handshake for `PnetStatusProvider` IPC lookups).
+///
+/// Each `MembershipCert` carries an owner signature (Falcon ≈ 1.3 KiB), so
+/// 4_096 entries ≈ 5 MiB worst-case. Without a cap the map grew once per
+/// distinct authorized peer ever seen and was never reclaimed (not even on
+/// session close), a slow leak on long-lived private-network relays. The
+/// map is best-effort IPC status only — an evicted-but-still-live peer's
+/// status lookup simply misses until its next handshake re-populates it.
+pub const MAX_VERIFIED_PEER_CERTS: usize = 4_096;
+
 /// Maximum total entries (across all tables) in the `StaticDirectory`.
 /// Chosen to comfortably fit a network of ~1 000 nodes each announcing
 /// one attachment + several app endpoints.
@@ -315,7 +326,11 @@ pub const MAX_NAT_CANDIDATES: usize = 64;
 ///
 /// Epidemic frames carry small control blobs (announcements, short signed records).
 /// Capped well below `MAX_FRAME_BODY` to limit per-frame allocation.
-pub const MAX_EPIDEMIC_PAYLOAD: usize = 65_536;
+// NOTE: must fit the u16 length prefix on the wire — 65_535, NOT 65_536.
+// A 65_536-byte payload truncates to 0 when cast to u16 on encode (release
+// builds), emitting a corrupt frame whose declared length is 0; the decode
+// cap must therefore not admit a size the encode side cannot represent.
+pub const MAX_EPIDEMIC_PAYLOAD: usize = 65_535;
 
 /// Maximum signature length accepted in DHT control payloads (e.g. DELETE).
 ///

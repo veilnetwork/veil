@@ -260,9 +260,20 @@ pub fn cache_peer_handshake_state(
     }
     // S2.A part 3: stash the verified MembershipCert (if any) so
     // PnetStatusProvider can surface it to IPC consumers (ogate / oproxy).
+    // Hard-cap with arbitrary eviction (matching the sibling peer caches
+    // above) so the map can't grow unbounded across the process lifetime —
+    // it was previously never reclaimed, a slow leak on long-lived P-Net
+    // relays. Best-effort status: evicting a still-live peer only drops it
+    // from IPC status until its next handshake re-populates the entry.
     if let Some(cert) = &r.verified_membership_cert
         && let Ok(mut g) = runtime.verified_peer_certs.write()
     {
+        if g.len() >= veil_proto::budget::MAX_VERIFIED_PEER_CERTS
+            && !g.contains_key(&peer_id)
+            && let Some(evict) = g.keys().next().copied()
+        {
+            g.remove(&evict);
+        }
         g.insert(peer_id, cert.clone());
     }
     // S3: surface the remote-side's observation of our public address
