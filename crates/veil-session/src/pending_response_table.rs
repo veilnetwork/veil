@@ -4,20 +4,15 @@
 //!
 //! Was three duplicated inline blocks in `SessionRunner::run`:
 //! * the `rpc_outbox` try_recv drain loop (TTL evict + capacity evict + dedupe + insert)
-//! * the `NextInput::RpcRequest` select-arm (TTL evict + dedupe + insert; no capacity evict — see note below)
+//! * the `NextInput::RpcRequest` select-arm (TTL evict + capacity evict + dedupe + insert)
 //! * the `NextInput::Timer` arm (TTL evict only, for quiet-period housekeeping)
 //!
 //! Plus the take-on-receipt block in the response-matching path (line ~2577 pre-extraction).
 //!
-//! **Asymmetry preserved verbatim:** the `RpcRequest` select-arm path
-//! does NOT call `evict_oldest_if_at_capacity` — only the drain-loop
-//! path does. This may be a latent bug (capacity check missed when
-//! requests arrive one-at-a-time via select! rather than batched
-//! through try_recv) but extracting the structure is a pure refactor;
-//! we don't change semantics here. If future analysis shows the
-//! asymmetry was unintentional, both paths can call
-//! `evict_oldest_if_at_capacity` in a separate one-line slice (gate
-//! tests will catch any regression).
+//! **Capacity-evict on both insert paths:** both the drain-loop and the
+//! `RpcRequest` select-arm call `evict_oldest_if_at_capacity` before insert,
+//! so single-at-a-time arrivals via select! can't transiently push the table
+//! past `capacity` (the earlier asymmetry where only the drain loop checked).
 //!
 //! Invariant: `table.len == deadline_index.len` at all times.
 //! Every code path that mutates one of the two backing collections
