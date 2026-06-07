@@ -147,9 +147,12 @@ impl DecoyProvider for StaticStringDecoy {
 /// realistic responses with proper Content-Type, varying file sizes, and
 /// 404 for absent paths — indistinguishable from a real static-hosted site.
 ///
-/// Security: path-traversal attempts (e.g. `..`, encoded `%2e%2e`) are
-/// rejected with `DecoyError::PathTraversal`.  Caller (Phase 5b) maps this
-/// to a 400 response.
+/// Security: literal `..` segments are rejected with
+/// `DecoyError::PathTraversal`. URL-encoded forms like `%2e%2e` are NOT
+/// percent-decoded by this layer, so they arrive as ordinary (harmless) file-
+/// name segments rather than traversal — and a symlink that escapes the root
+/// is caught at serve time by canonicalizing the resolved path and confirming
+/// it stays under `root_dir` (see `respond`). Caller maps the error to a 404.
 pub struct StaticDirectoryDecoy {
     root_dir: PathBuf,
     index_file: String,
@@ -237,6 +240,23 @@ impl DecoyProvider for StaticDirectoryDecoy {
             }
             Err(e) => return Err(e),
         };
+
+        // Symlink-escape defense: lexical `..` filtering in `resolve_path`
+        // cannot catch a symlink INSIDE the decoy root that points outside it.
+        // Canonicalize the resolved path (and the root) and confirm the real
+        // target stays under the root before reading. A missing file (or a
+        // symlink that escapes) canonicalizes away from the root → 404.
+        let real = match tokio::fs::canonicalize(&resolved).await {
+            Ok(p) => p,
+            Err(_) => return Ok(DecoyResponse::not_found_html()),
+        };
+        let real_root = tokio::fs::canonicalize(&self.root_dir)
+            .await
+            .unwrap_or_else(|_| self.root_dir.clone());
+        if !real.starts_with(&real_root) {
+            return Ok(DecoyResponse::not_found_html());
+        }
+        let resolved = real;
 
         match tokio::fs::read(&resolved).await {
             Ok(body) => {

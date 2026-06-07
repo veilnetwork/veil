@@ -186,11 +186,23 @@ impl ReputationTracker {
 
     fn get_or_create(&mut self, node_id: [u8; 32]) -> &mut PeerReputation {
         if !self.by_identity.contains_key(&node_id) {
-            // Evict oldest entry if at capacity.
+            // Evict the least-recently-updated entry if at capacity. Skip
+            // entries with an OPEN session (`session_start.is_some()`) — evicting
+            // those mid-session would lose their accumulated uptime/score, the
+            // same invariant `evict_stale` upholds.
+            //
+            // NOTE (perf, accepted): this is an O(n) scan that fires only when a
+            // NEW identity arrives at capacity. Reachability is gated by OVL1
+            // session establishment (PoW-bound), not free packet spam, so the
+            // amplification is bounded — unlike the rate-limiter maps that were
+            // migrated to O(log n) BTreeSet indices. A correct index here would
+            // have to sync `last_updated` across every caller mutation site, so
+            // it's deferred rather than risked.
             if self.by_identity.len() >= self.max_entries {
                 let oldest = self
                     .by_identity
                     .iter()
+                    .filter(|(_, e)| e.session_start.is_none())
                     .min_by_key(|(_, e)| e.last_updated)
                     .map(|(k, _)| *k);
                 if let Some(k) = oldest {
