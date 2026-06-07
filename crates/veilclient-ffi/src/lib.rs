@@ -47,7 +47,6 @@
 // downstream consumer.
 #![cfg(unix)]
 
-use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -136,122 +135,185 @@ impl Drop for RuntimeBundle {
     }
 }
 
-// ── Live-handle registry (double-free / double-close guard) ───────────────────
+// ── Generational handle table (double-free / use-after-free / ABA guard) ──────
 //
 // Dart's GC is nondeterministic; combined with `NativeFinalizer` it is easy to
-// get a situation where `veil_close` / `veil_app_close` /
-// `veil_stream_close` is called twice on the same pointer. A naïve second
-// `Box::from_raw` reinterprets freed memory as a live struct → UB → potential
-// RCE.
+// double-close the same handle, and a host may also USE a handle on one thread
+// while another closes it. A naïve `Box::from_raw` on either path reinterprets
+// freed (or about-to-be-freed) memory as a live struct → UB → potential RCE.
 //
-// The PREVIOUS guard embedded an `AtomicU32` sentinel INSIDE each struct and
-// read it back through the pointer (`(*handle).magic`) before `Box::from_raw`.
-// That read is itself UB on already-freed memory (audit cycle-7 M1) — it only
-// happened to work while the allocator had not yet reused the slot.
+// Each handle lives in a per-type generational table. The opaque `*mut T`
+// handed to C is NOT a real pointer — it is an encoded `(slot_index,
+// generation)` token. Callers treat it as opaque (they only pass it back or
+// compare against NULL; the C type is incomplete so it cannot be dereferenced
+// in well-formed C), so reinterpreting it costs no ABI / cbindgen / glue change.
 //
-// Instead we track the set of LIVE handle addresses in an external, per-type
-// registry. The close path checks membership by integer address WITHOUT ever
-// dereferencing the (possibly dangling) pointer — `ptr as usize` is a
-// well-defined cast even for a freed pointer, unlike a deref. A double-close /
-// already-freed / garbage pointer is therefore a safe no-op: `unregister`
-// returns `false` and we never reconstruct the `Box`.
+// * Every lookup validates the generation, so a token whose slot was freed and
+//   reused for a DIFFERENT handle (classic ABA) no longer matches — the prior
+//   address-keyed registry could not distinguish that case.
+// * The table owns an `Arc<T>`; the USE path clones the `Arc` BEFORE any async
+//   work, so a concurrent `*_close` that removes the entry does not free the
+//   value out from under an in-flight call — it lives until the last in-flight
+//   `Arc` drops. The previous design freed the `Box` immediately on close,
+//   dangling any `&*ptr` a worker thread still held.
+// * A double-close / unknown / wrong-type / stale token finds no matching live
+//   slot → safe no-op (close) or clean error (use); the token is never
+//   dereferenced as a pointer.
 //
-// Residual: if the allocator reuses a freed address for a NEW handle of the
-// SAME type before a stale close of the OLD handle lands (classic ABA), the
-// registry cannot distinguish them — full immunity needs monotonic handle IDs
-// (an ABI change). This matches the prior sentinel's residual exactly; hosts
-// must still guarantee single-close (Dart `NativeFinalizer`, Swift `deinit`).
-// Per-type registries additionally turn a cross-type pointer mix-up (e.g. an
-// `VeilHandle*` passed to `veil_app_close`) into a safe no-op rather than
-// a type-confused free.
+// Residual: the generation is `u32` on 64-bit hosts (16-bit on 32-bit hosts,
+// where the token itself is only 32 bits wide). After 2^32 (resp. 2^16) reuses
+// of the SAME slot the generation wraps and ABA could in principle recur for
+// that one slot. On 64-bit this is unreachable in practice; on legacy 32-bit
+// hosts it is a far smaller window than the unconditional address-reuse ABA it
+// replaces. Modern iOS/Android are 64-bit.
 
-fn handle_registry() -> &'static StdMutex<HashSet<usize>> {
-    static REG: OnceLock<StdMutex<HashSet<usize>>> = OnceLock::new();
-    REG.get_or_init(|| StdMutex::new(HashSet::new()))
+/// Bit split of the opaque token: slot index in the low bits, generation in the
+/// high bits. 64-bit hosts get a full 32-bit generation; 32-bit hosts fall back
+/// to 16/16 (see the residual note above).
+#[cfg(target_pointer_width = "64")]
+const HANDLE_INDEX_BITS: u32 = 32;
+#[cfg(not(target_pointer_width = "64"))]
+const HANDLE_INDEX_BITS: u32 = 16;
+const HANDLE_INDEX_MASK: usize = (1usize << HANDLE_INDEX_BITS) - 1;
+
+struct HandleSlot<T> {
+    /// Generation of the value CURRENTLY occupying this slot. Bumped on every
+    /// remove so a stale token for a prior occupant fails validation. Starts at
+    /// 1 so a live token is never all-zero (which would collide with NULL).
+    generation: u32,
+    value: Option<Arc<T>>,
 }
 
-fn app_registry() -> &'static StdMutex<HashSet<usize>> {
-    static REG: OnceLock<StdMutex<HashSet<usize>>> = OnceLock::new();
-    REG.get_or_init(|| StdMutex::new(HashSet::new()))
+/// Per-type generational table mapping opaque tokens → live `Arc<T>`.
+pub(crate) struct HandleTable<T> {
+    slots: Vec<HandleSlot<T>>,
+    free: Vec<u32>,
 }
 
-fn stream_registry() -> &'static StdMutex<HashSet<usize>> {
-    static REG: OnceLock<StdMutex<HashSet<usize>>> = OnceLock::new();
-    REG.get_or_init(|| StdMutex::new(HashSet::new()))
-}
-
-/// Record `addr` as a live handle. Called on every successful create, with the
-/// raw pointer returned to the caller.
-fn register_handle(reg: &StdMutex<HashSet<usize>>, addr: usize) {
-    if let Ok(mut set) = reg.lock() {
-        set.insert(addr);
-    }
-}
-
-/// Atomically remove `addr` from the live set. Returns `true` iff it WAS live
-/// (so the caller may now reconstruct + drop the `Box`); `false` for a
-/// double-close / already-freed / garbage / wrong-type pointer — in which case
-/// the caller MUST NOT dereference it. A poisoned lock fails safe (`false`):
-/// leaking is preferable to a double-free.
-#[must_use]
-fn unregister_handle(reg: &StdMutex<HashSet<usize>>, addr: usize) -> bool {
-    match reg.lock() {
-        Ok(mut set) => set.remove(&addr),
-        Err(_) => false,
-    }
-}
-
-/// Non-destructive membership probe used by the USE-path guard (audit M-2).
-/// Returns `true` iff `addr` is currently a LIVE handle of this registry's
-/// type. Unlike [`unregister_handle`] this does NOT remove the address, so it
-/// is safe to call on every dereference. A poisoned lock fails CLOSED
-/// (`false` → "treat as not-live"): an FFI panic would be UB on the C side, and
-/// reporting a live handle as dead degrades to a clean `VEIL_ERR_INVALID_ARG`
-/// rather than risking a use-after-free, which is the safe direction.
-#[must_use]
-fn is_registered(reg: &StdMutex<HashSet<usize>>, addr: usize) -> bool {
-    reg.lock().map(|s| s.contains(&addr)).unwrap_or(false)
-}
-
-/// USE-path liveness guard (audit M-2): assert a raw handle/app/stream pointer
-/// is still LIVE in its matching registry BEFORE dereferencing it, turning a
-/// use-after-close (host calls a method with an already-closed pointer) from
-/// undefined behaviour into a clean error return.
-///
-/// `$reg`     — the matching registry (`handle_registry()` / `app_registry()` /
-///              `stream_registry()`); `$ptr` MUST have been created and closed
-///              against THIS registry for the guard to be meaningful.
-/// `$ptr`     — the raw pointer about to be dereferenced (already null-checked
-///              by the surrounding fn's `null_check!`).
-/// `$err_out` — the fn's `err_out` slot, or `ptr::null_mut()` for fns without
-///              one (`write_err` no-ops on a NULL slot).
-/// `$ret`     — the value to return on failure; MUST match the value the
-///              surrounding fn's null-check returns (`VEIL_ERR_INVALID_ARG`,
-///              `VEIL_ERR_INVALID_ARG as ssize_t`, `ptr::null_mut()`, `0`…).
-/// `$what`    — the opaque type name for the diagnostic string.
-///
-/// Membership is checked by integer address WITHOUT dereferencing `$ptr`, so an
-/// unregistered (never-registered or registered-then-unregistered) address is
-/// rejected before any load — the guard is the security property even when the
-/// underlying allocation was already freed.
-macro_rules! live_or_return {
-    ($reg:expr, $ptr:expr, $err_out:expr, $ret:expr, $what:literal) => {{
-        // Expand metavariables into a safe scope before the unsafe `write_err`
-        // (mirrors the `null_check!` pattern; satisfies
-        // clippy::macro_metavars_in_unsafe).
-        let reg_ref = $reg;
-        let addr = $ptr as usize;
-        if !$crate::is_registered(reg_ref, addr) {
-            let err_out_ref = $err_out;
-            unsafe {
-                $crate::write_err(
-                    err_out_ref,
-                    concat!($what, ": use-after-close or unknown handle"),
-                );
-            }
-            return $ret;
+impl<T> HandleTable<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
         }
-    }};
+    }
+
+    fn encode(index: u32, generation: u32) -> usize {
+        ((generation as usize) << HANDLE_INDEX_BITS) | (index as usize)
+    }
+
+    fn decode(token: usize) -> (u32, u32) {
+        let index = (token & HANDLE_INDEX_MASK) as u32;
+        let generation = (token >> HANDLE_INDEX_BITS) as u32;
+        (index, generation)
+    }
+
+    /// Insert `value`, returning its opaque token. Reuses a free slot when
+    /// available (carrying that slot's already-bumped generation), else grows.
+    pub(crate) fn insert(table: &StdMutex<Self>, value: T) -> usize {
+        let arc = Arc::new(value);
+        let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = t.free.pop() {
+            let slot = &mut t.slots[index as usize];
+            slot.value = Some(arc);
+            Self::encode(index, slot.generation)
+        } else {
+            let index = t.slots.len() as u32;
+            // Refuse to alias slot 0 if the index space is ever exhausted.
+            assert!(
+                (index as usize) <= HANDLE_INDEX_MASK,
+                "veilclient-ffi: handle table exhausted",
+            );
+            t.slots.push(HandleSlot {
+                generation: 1,
+                value: Some(arc),
+            });
+            Self::encode(index, 1)
+        }
+    }
+
+    /// Clone the live `Arc` for `token`, or `None` if the token is stale /
+    /// unknown / freed. Never dereferences the token as a pointer.
+    pub(crate) fn get(table: &StdMutex<Self>, token: usize) -> Option<Arc<T>> {
+        let (index, generation) = Self::decode(token);
+        let t = table.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = t.slots.get(index as usize)?;
+        if slot.generation != generation {
+            return None;
+        }
+        slot.value.clone()
+    }
+
+    /// Remove and return the live `Arc` for `token`, bumping the slot's
+    /// generation so the token can never validate again. `None` for a
+    /// double-close / unknown / stale token — a safe no-op.
+    pub(crate) fn remove(table: &StdMutex<Self>, token: usize) -> Option<Arc<T>> {
+        let (index, generation) = Self::decode(token);
+        let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = t.slots.get_mut(index as usize)?;
+        if slot.generation != generation || slot.value.is_none() {
+            return None;
+        }
+        let taken = slot.value.take();
+        // Bump generation, keeping it nonzero so encoded tokens never collide
+        // with NULL. wrapping_add handles the (practically unreachable on
+        // 64-bit) overflow; skip 0 on wrap.
+        slot.generation = slot.generation.wrapping_add(1);
+        if slot.generation == 0 {
+            slot.generation = 1;
+        }
+        t.free.push(index);
+        taken
+    }
+}
+
+fn handle_table() -> &'static StdMutex<HandleTable<VeilHandle>> {
+    static T: OnceLock<StdMutex<HandleTable<VeilHandle>>> = OnceLock::new();
+    T.get_or_init(|| StdMutex::new(HandleTable::new()))
+}
+
+fn app_table() -> &'static StdMutex<HandleTable<VeilApp>> {
+    static T: OnceLock<StdMutex<HandleTable<VeilApp>>> = OnceLock::new();
+    T.get_or_init(|| StdMutex::new(HandleTable::new()))
+}
+
+fn stream_table() -> &'static StdMutex<HandleTable<VeilStreamFfi>> {
+    static T: OnceLock<StdMutex<HandleTable<VeilStreamFfi>>> = OnceLock::new();
+    T.get_or_init(|| StdMutex::new(HandleTable::new()))
+}
+
+/// USE-path liveness guard: resolve a raw handle token to its live `Arc<T>`
+/// BEFORE any dereference or async work, turning a use-after-close / ABA /
+/// unknown / wrong-type token into a clean error return instead of UB. Binds
+/// the cloned `Arc` to `$name` (usable via `Deref` exactly like the old
+/// `&*ptr`). The token is validated by (index, generation) WITHOUT ever being
+/// dereferenced as a pointer.
+///
+/// `$name`    — identifier the cloned `Arc<T>` is bound to for the rest of the fn.
+/// `$table`   — the matching table (`handle_table()` / `app_table()` /
+///              `stream_table()`); `$ptr` MUST have been minted by THIS table.
+/// `$ptr`     — the raw token (already null-checked by the surrounding fn).
+/// `$err_out` — the fn's `err_out` slot, or `ptr::null_mut()` (write_err no-ops).
+/// `$ret`     — value to return on failure; MUST match the surrounding fn's
+///              null-check return (`VEIL_ERR_INVALID_ARG`, `... as ssize_t`,
+///              `ptr::null_mut()`, `0` …).
+/// `$what`    — opaque type name for the diagnostic string.
+macro_rules! get_or_return {
+    ($name:ident, $table:expr, $ptr:expr, $err_out:expr, $ret:expr, $what:literal) => {
+        let $name = match $crate::HandleTable::get($table, $ptr as usize) {
+            Some(arc) => arc,
+            None => {
+                let err_out_ref = $err_out;
+                unsafe {
+                    $crate::write_err(
+                        err_out_ref,
+                        concat!($what, ": use-after-close or unknown handle"),
+                    );
+                }
+                return $ret;
+            }
+        };
+    };
 }
 
 /// Opaque connection handle returned by [`veil_connect`].
@@ -487,37 +549,33 @@ pub unsafe extern "C" fn veil_connect(
         client: TokioMutex::new(client),
         pending_mailbox_fetch: StdMutex::new(None),
     });
-    let ptr = Box::into_raw(Box::new(VeilHandle {
-        bundle,
-        event_task: StdMutex::new(None),
-    }));
-    register_handle(handle_registry(), ptr as usize);
-    ptr
+    HandleTable::insert(
+        handle_table(),
+        VeilHandle {
+            bundle,
+            event_task: StdMutex::new(None),
+        },
+    ) as *mut VeilHandle
 }
 
 /// Release the handle. Outstanding apps / streams keep the runtime
 /// alive via their own `Arc`; the runtime is dropped only when the last
 /// reference goes away. Safe to call on NULL.
 ///
-/// defends against double-free. If the caller passes a pointer that's either
-/// NULL, already-freed, or random garbage this function returns without
-/// `Box::from_raw` (which would be UB on freed memory). Liveness is resolved
-/// via the external [`handle_registry`] keyed by address, so the guard never
-/// dereferences the pointer (see the registry's module comment).
+/// Defends against double-free. A NULL / already-freed / garbage / wrong-type
+/// token is absent from the generational handle table → safe no-op; the
+/// (opaque, non-pointer) token is never dereferenced (see [`HandleTable`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_close(handle: *mut VeilHandle) {
     if handle.is_null() {
         return;
     }
-    // Atomically claim the address from the live set. A double-close /
-    // already-freed / garbage pointer is not present → safe no-op, and we
-    // never read through the (possibly dangling) pointer.
-    if !unregister_handle(handle_registry(), handle as usize) {
+    // Claim the live entry from the generational table. A double-close /
+    // already-freed / garbage / wrong-type token is absent → safe no-op, and
+    // the (opaque) token is never dereferenced as a pointer.
+    let Some(h) = HandleTable::remove(handle_table(), handle as usize) else {
         return;
-    }
-    // SAFETY: the address was in the live set and we just removed it, so this
-    // is the unique close that owns the allocation.
-    let h: Box<VeilHandle> = unsafe { Box::from_raw(handle) };
+    };
     if let Ok(mut guard) = h.event_task.lock()
         && let Some(task) = guard.take()
     {
@@ -556,14 +614,15 @@ unsafe fn bind_internal(
         }
         return ptr::null_mut();
     };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         ptr::null_mut(),
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let bind_res: Result<AppHandle, ClientError> = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         if named {
@@ -595,9 +654,7 @@ unsafe fn bind_internal(
         endpoint_id: ep_id,
         recv_task: StdMutex::new(None),
     };
-    let ptr = Box::into_raw(Box::new(app));
-    register_handle(app_registry(), ptr as usize);
-    ptr
+    HandleTable::insert(app_table(), app) as *mut VeilApp
 }
 
 /// Bind an ephemeral application endpoint. Returns NULL on failure
@@ -632,14 +689,14 @@ pub unsafe extern "C" fn veil_app_get_app_id(app: *const VeilApp, out: *mut u8) 
     if app.is_null() || out.is_null() {
         return VEIL_ERR_INVALID_ARG;
     }
-    live_or_return!(
-        app_registry(),
+    get_or_return!(
+        app_ref,
+        app_table(),
         app,
         ptr::null_mut(),
         VEIL_ERR_INVALID_ARG,
         "VeilApp"
     );
-    let app_ref: &VeilApp = unsafe { &*app };
     unsafe {
         ptr::copy_nonoverlapping(app_ref.app_id.as_ptr(), out, 32);
     }
@@ -652,8 +709,7 @@ pub unsafe extern "C" fn veil_app_get_endpoint_id(app: *const VeilApp) -> u32 {
     if app.is_null() {
         return 0;
     }
-    live_or_return!(app_registry(), app, ptr::null_mut(), 0, "VeilApp");
-    let app_ref: &VeilApp = unsafe { &*app };
+    get_or_return!(app_ref, app_table(), app, ptr::null_mut(), 0, "VeilApp");
     app_ref.endpoint_id
 }
 
@@ -664,11 +720,11 @@ pub unsafe extern "C" fn veil_app_close(app: *mut VeilApp) {
     if app.is_null() {
         return;
     }
-    // double-free guard via the external registry (see. [`veil_close`]).
-    if !unregister_handle(app_registry(), app as usize) {
+    // double-free / ABA / concurrent-use guard via the generational table
+    // (see [`veil_close`]).
+    let Some(app_box) = HandleTable::remove(app_table(), app as usize) else {
         return;
-    }
-    let app_box: Box<VeilApp> = unsafe { Box::from_raw(app) };
+    };
     if let Ok(mut guard) = app_box.recv_task.lock()
         && let Some(task) = guard.take()
     {
@@ -716,14 +772,14 @@ pub unsafe extern "C" fn veil_send(
         }
         return VEIL_ERR_INVALID_ARG;
     }
-    live_or_return!(
-        app_registry(),
+    get_or_return!(
+        app_ref,
+        app_table(),
         app,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilApp"
     );
-    let app_ref: &VeilApp = unsafe { &*app };
     let mut dst_node = [0u8; 32];
     let mut dst_app = [0u8; 32];
     // SAFETY: caller MUST guarantee that
@@ -848,14 +904,14 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
             return VEIL_ERR_INVALID_ARG;
         }
     };
-    live_or_return!(
-        app_registry(),
+    get_or_return!(
+        app_ref,
+        app_table(),
         app,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilApp"
     );
-    let app_ref: &VeilApp = unsafe { &*app };
 
     // audit cycle-6 (P6): install/replace the callback by swapping the shared
     // slot. A SINGLE persistent recv task (spawned below on the first call)
@@ -962,8 +1018,14 @@ pub unsafe extern "C" fn veil_stream_open(
         "dst_node_id" => dst_node_id,
         "dst_app_id" => dst_app_id,
     );
-    live_or_return!(app_registry(), app, err_out, ptr::null_mut(), "VeilApp");
-    let app_ref: &VeilApp = unsafe { &*app };
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        ptr::null_mut(),
+        "VeilApp"
+    );
     let mut dst_node = [0u8; 32];
     let mut dst_app = [0u8; 32];
     unsafe {
@@ -993,9 +1055,7 @@ pub unsafe extern "C" fn veil_stream_open(
         bundle: Arc::clone(&app_ref.bundle),
         inner: TokioMutex::new(Some(sdk_stream)),
     };
-    let ptr = Box::into_raw(Box::new(stream));
-    register_handle(stream_registry(), ptr as usize);
-    ptr
+    HandleTable::insert(stream_table(), stream) as *mut VeilStreamFfi
 }
 
 /// Write `len` bytes to the stream.
@@ -1032,14 +1092,14 @@ pub unsafe extern "C" fn veil_stream_write(
         }
         return VEIL_ERR_INVALID_ARG;
     }
-    live_or_return!(
-        stream_registry(),
+    get_or_return!(
+        stream_ref,
+        stream_table(),
         stream,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilStreamFfi"
     );
-    let stream_ref: &VeilStreamFfi = unsafe { &*stream };
     let payload: Vec<u8> = if len == 0 {
         Vec::new()
     } else {
@@ -1111,14 +1171,14 @@ pub unsafe extern "C" fn veil_stream_read(
         }
         return VEIL_ERR_INVALID_ARG as ssize_t;
     }
-    live_or_return!(
-        stream_registry(),
+    get_or_return!(
+        stream_ref,
+        stream_table(),
         stream,
         err_out,
         VEIL_ERR_INVALID_ARG as ssize_t,
         "VeilStreamFfi"
     );
-    let stream_ref: &VeilStreamFfi = unsafe { &*stream };
     let mut local_buf = vec![0u8; cap];
     let read_res: std::io::Result<usize> = stream_ref.bundle.runtime.block_on(async {
         let mut inner_guard = stream_ref.inner.lock().await;
@@ -1160,13 +1220,10 @@ pub unsafe extern "C" fn veil_stream_close(stream: *mut VeilStreamFfi) {
     if stream.is_null() {
         return;
     }
-    // double-free guard via the external registry (see. [`veil_close`]).
-    if !unregister_handle(stream_registry(), stream as usize) {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(stream));
-    }
+    // Remove from the generational table (see [`veil_close`]); the returned
+    // Arc (if any) drops here. In-flight calls that already cloned it keep the
+    // stream alive until they finish.
+    drop(HandleTable::remove(stream_table(), stream as usize));
 }
 
 // ── Mobile lifecycle events ─────────────────────────────
@@ -1248,14 +1305,15 @@ pub unsafe extern "C" fn veil_get_relay_x25519_pubkey(
         "handle" => handle,
         "out_pubkey_32" => out_pubkey_32,
     );
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.node_identity().await
@@ -1614,14 +1672,15 @@ unsafe fn mailbox_put_inner(
             unsafe { std::slice::from_raw_parts(wake_hmac_envelope, wake_hmac_envelope_len) };
         Some(slice.to_vec())
     };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client
@@ -1774,14 +1833,15 @@ pub unsafe extern "C" fn veil_lookup_rendezvous_replicas(
     unsafe {
         ptr::copy_nonoverlapping(receiver_id, recv_arr.as_mut_ptr(), 32);
     }
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client
@@ -1876,14 +1936,15 @@ pub unsafe extern "C" fn veil_mailbox_fetch_count(
         ptr::copy_nonoverlapping(receiver_id, recv_arr.as_mut_ptr(), 32);
         ptr::copy_nonoverlapping(auth_cookie, cookie_arr.as_mut_ptr(), 16);
     }
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.mailbox_fetch(recv_arr, cookie_arr).await
@@ -1969,14 +2030,15 @@ pub unsafe extern "C" fn veil_mailbox_fetch_into(
         }
         return VEIL_ERR_INVALID_ARG;
     }
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     // Mutex poison recovery: see fetch_count for rationale — FFI panic
     // = UB on C-side. Adopt poisoned inner state and continue.
     let mut pending = match bundle.pending_mailbox_fetch.lock() {
@@ -2082,14 +2144,15 @@ pub unsafe extern "C" fn veil_mailbox_ack(
         ptr::copy_nonoverlapping(content_id, content_arr.as_mut_ptr(), 32);
         ptr::copy_nonoverlapping(auth_cookie, cookie_arr.as_mut_ptr(), 16);
     }
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.mailbox_ack(recv_arr, content_arr, cookie_arr).await
@@ -2133,14 +2196,15 @@ pub unsafe extern "C" fn veil_get_node_id(
         "handle" => handle,
         "out_node_id_32" => out_node_id_32,
     );
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.node_identity().await
@@ -2202,14 +2266,15 @@ pub unsafe extern "C" fn veil_get_mobile_status(
         "handle" => handle,
         "out" => out,
     );
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.mobile_status().await
@@ -2294,14 +2359,15 @@ pub unsafe extern "C" fn veil_join_bootstrap_uri(
     let pw = unsafe { cstr_to_str(password) };
     let pk = unsafe { cstr_to_str(expected_issuer_pk) };
 
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.join_bootstrap_uri(uri_str, pw, pk).await
@@ -2376,14 +2442,15 @@ pub unsafe extern "C" fn veil_create_bootstrap_invite(
         *out_uri = ptr::null_mut();
     }
     let pw = unsafe { cstr_to_str(password) };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.create_bootstrap_invite(pw).await
@@ -2490,14 +2557,15 @@ pub unsafe extern "C" fn veil_peers_list(
             return VEIL_ERR_INVALID_ARG;
         }
     };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.peers().await
@@ -2578,14 +2646,15 @@ pub unsafe extern "C" fn veil_set_background_mode(
             return VEIL_ERR_INVALID_ARG;
         }
     };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.set_mobile_background_mode(wire_mode).await
@@ -2633,14 +2702,15 @@ pub unsafe extern "C" fn veil_notify_network_changed(
             return VEIL_ERR_INVALID_ARG;
         }
     };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.notify_network_changed(net_kind, mtu_hint).await
@@ -2738,14 +2808,15 @@ pub unsafe extern "C" fn veil_set_push_envelope(
         unsafe { std::slice::from_raw_parts(envelope, envelope_len) }.to_vec()
     };
 
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client
@@ -2948,14 +3019,15 @@ pub unsafe extern "C" fn veil_set_wake_hmac_envelope(
         unsafe { std::slice::from_raw_parts(envelope, envelope_len) }.to_vec()
     };
 
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client
@@ -3173,14 +3245,14 @@ pub unsafe extern "C" fn veil_set_event_handler(
             return VEIL_ERR_INVALID_ARG;
         }
     };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        h_ref,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let h_ref: &VeilHandle = unsafe { &*handle };
     // Cancel any previous handler before subscribing again. A second
     // subscriber would replace the SDK-side mpsc sink anyway, but we
     // also want to drop the old task so it stops holding the runtime
@@ -3794,14 +3866,15 @@ pub unsafe extern "C" fn veil_pair_source_create_invite(
         *out_uri = ptr::null_mut();
     }
     let pw = unsafe { cstr_to_str(password) };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.pair_source_create_invite(pw).await
@@ -3888,14 +3961,15 @@ pub unsafe extern "C" fn veil_pair_source_handle_hello(
     } else {
         unsafe { std::slice::from_raw_parts(hello_bytes, hello_len) }.to_vec()
     };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.pair_source_handle_hello(hello).await
@@ -3986,14 +4060,15 @@ pub unsafe extern "C" fn veil_pair_source_handle_confirm(
     } else {
         unsafe { std::slice::from_raw_parts(confirm_bytes, confirm_len) }.to_vec()
     };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.pair_source_handle_confirm(confirm).await
@@ -4044,14 +4119,15 @@ pub unsafe extern "C" fn veil_pair_target_consume_uri(
     unsafe {
         *out_hello_len = 0;
     }
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.pair_target_consume_uri(uri_str).await
@@ -4142,14 +4218,15 @@ pub unsafe extern "C" fn veil_pair_target_handle_cert(
     } else {
         unsafe { std::slice::from_raw_parts(cert_bytes, cert_len) }.to_vec()
     };
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.pair_target_handle_cert(cert).await
@@ -4198,14 +4275,15 @@ pub unsafe extern "C" fn veil_pair_target_build_confirm(
     unsafe {
         *out_confirm_len = 0;
     }
-    live_or_return!(
-        handle_registry(),
+    get_or_return!(
+        handle_live,
+        handle_table(),
         handle,
         err_out,
         VEIL_ERR_INVALID_ARG,
         "VeilHandle"
     );
-    let bundle = Arc::clone(&unsafe { &*handle }.bundle);
+    let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
         client.pair_target_build_confirm(confirmed != 0).await
@@ -4267,137 +4345,98 @@ mod tests {
         }
     }
 
-    /// Audit cycle-7 M1: the live-handle registry makes a double-close a safe
-    /// no-op WITHOUT dereferencing the (possibly freed) pointer. We exercise
-    /// the registry directly with synthetic addresses — they are never
-    /// dereferenced, so no real allocation is required.
+    /// The generational table makes a double-close a safe no-op and a stale
+    /// token (slot reused by a DIFFERENT handle) fail validation, WITHOUT
+    /// dereferencing the opaque token. Exercised on a local table with a cheap
+    /// value type — no real handle / allocation / deref required.
     #[test]
-    fn live_handle_registry_double_close_is_safe_noop() {
-        let reg = handle_registry();
-        // A fake address that is never dereferenced (proves the guard is
-        // deref-free: a real freed pointer would be UB to read).
-        let addr = 0xDEAD_BEEF_usize;
-
-        register_handle(reg, addr);
-        // First close: address is live → claim it.
-        assert!(
-            unregister_handle(reg, addr),
-            "first close must claim the live handle"
+    fn handle_table_insert_get_remove_roundtrip() {
+        let table = StdMutex::new(HandleTable::<u64>::new());
+        let tok = HandleTable::insert(&table, 0xABCD);
+        assert_ne!(tok, 0, "a live token must never be NULL");
+        assert_eq!(
+            HandleTable::get(&table, tok).as_deref().copied(),
+            Some(0xABCD),
+            "get must return the live value"
         );
-        // Second close (the double-close the guard exists for): no-op.
+        assert_eq!(
+            HandleTable::remove(&table, tok).as_deref().copied(),
+            Some(0xABCD),
+            "first close must claim the live entry"
+        );
         assert!(
-            !unregister_handle(reg, addr),
+            HandleTable::get(&table, tok).is_none(),
+            "use-after-close must report not-live"
+        );
+        assert!(
+            HandleTable::remove(&table, tok).is_none(),
             "double-close must be a safe no-op"
         );
-        // Never-registered / garbage address: no-op.
-        assert!(
-            !unregister_handle(reg, 0x1234_usize),
-            "garbage pointer must be a no-op"
-        );
     }
 
-    /// Per-type registries prevent cross-type pointer confusion: an address
-    /// registered as a handle is invisible to the app/stream close paths, so
-    /// passing the wrong pointer to `veil_app_close` is a no-op, not a
-    /// type-confused free.
+    /// ABA: closing a handle and creating a new one that REUSES the freed slot
+    /// must NOT let the old (stale) token address the new handle. The bumped
+    /// per-slot generation makes the two tokens distinct and the stale one
+    /// invalid — the property the prior address-keyed registry could not give.
     #[test]
-    fn registries_are_per_type_isolated() {
-        let addr = 0xABCD_0001_usize;
-        register_handle(handle_registry(), addr);
-        assert!(
-            !unregister_handle(app_registry(), addr),
-            "app close must not claim a handle addr"
+    fn handle_table_generation_defeats_aba() {
+        let table = StdMutex::new(HandleTable::<u64>::new());
+        let t1 = HandleTable::insert(&table, 1);
+        assert!(HandleTable::remove(&table, t1).is_some());
+        // New handle reuses slot 0 with a bumped generation.
+        let t2 = HandleTable::insert(&table, 2);
+        assert_ne!(
+            t1, t2,
+            "slot reuse must yield a distinct token (new generation)"
         );
         assert!(
-            !unregister_handle(stream_registry(), addr),
-            "stream close must not claim a handle addr"
+            HandleTable::get(&table, t1).is_none(),
+            "stale token must NOT address the reused slot (ABA closed)"
         );
-        assert!(
-            unregister_handle(handle_registry(), addr),
-            "correct-type close still works"
-        );
-    }
-
-    /// `is_registered` is the non-destructive probe behind the USE-path guard
-    /// (audit M-2). It must report membership WITHOUT removing the address (so
-    /// it is safe to call on every deref), report `false` for never-registered
-    /// / garbage addresses, and — critically — never dereference the address.
-    #[test]
-    fn is_registered_probe_is_non_destructive() {
-        let reg = handle_registry();
-        let addr = 0x1515_0001_usize;
-
-        // Not registered yet → false.
-        assert!(!is_registered(reg, addr), "unknown addr must be not-live");
-
-        register_handle(reg, addr);
-        // Registered → true, repeatedly (non-destructive: does NOT consume it).
-        assert!(is_registered(reg, addr), "registered addr must be live");
-        assert!(
-            is_registered(reg, addr),
-            "probe must not consume the entry — still live on second call"
-        );
-        // Garbage address never registered → false.
-        assert!(
-            !is_registered(reg, 0x9999_9999_usize),
-            "garbage addr must be not-live"
-        );
-
-        // After close → false (this is the use-after-close signal).
-        assert!(unregister_handle(reg, addr), "close claims the live handle");
-        assert!(
-            !is_registered(reg, addr),
-            "closed addr must be reported not-live"
-        );
-    }
-
-    /// Audit M-2 (use-after-close): calling a real USE method on a handle that
-    /// was registered and then CLOSED (unregistered) must return the
-    /// invalid-arg error via the liveness guard, NOT dereference the now-stale
-    /// pointer. We use a synthetic non-NULL address that is never dereferenced —
-    /// the guard rejects it on the integer-address membership check *before* the
-    /// `unsafe { &*handle }` deref, so this exercises the security property
-    /// without committing real UB (reading a freed allocation).
-    #[test]
-    fn use_after_close_handle_returns_error_not_uaf() {
-        // Distinct sentinel (parallel tests share the global registries).
-        let stale = 0x0AF5_0001_usize as *mut VeilHandle;
-
-        // Simulate the create→close lifecycle WITHOUT a real allocation:
-        // register the address, then unregister it (== `veil_close`).
-        register_handle(handle_registry(), stale as usize);
-        assert!(
-            unregister_handle(handle_registry(), stale as usize),
-            "precondition: close claims the live handle"
-        );
-
-        // USE after close: the guard must fire and return INVALID_ARG.
-        let mut out_node = [0u8; 32];
-        let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe { veil_get_node_id(stale, out_node.as_mut_ptr(), &mut err) };
         assert_eq!(
-            rc, VEIL_ERR_INVALID_ARG,
-            "use-after-close must return INVALID_ARG, not crash"
+            HandleTable::get(&table, t2).as_deref().copied(),
+            Some(2),
+            "the live token still resolves"
         );
-        assert!(!err.is_null(), "guard must write a diagnostic");
-        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
-        assert_eq!(msg, "VeilHandle: use-after-close or unknown handle");
-        unsafe {
-            veil_free_string(err);
-        }
+        assert!(
+            HandleTable::remove(&table, t1).is_none(),
+            "stale double-close must not free the reused slot"
+        );
+        assert!(
+            HandleTable::get(&table, t2).is_some(),
+            "live handle survives a stale close of its predecessor"
+        );
     }
 
-    /// A handle pointer that was NEVER registered (e.g. a wild/forged value, or
-    /// a different object's address) is likewise rejected by the guard before
-    /// any deref. Same security property as the closed case, different entry.
+    /// Per-type isolation: a token minted by one table must not resolve in
+    /// another, so the use path rejects a cross-type token before any deref.
     #[test]
-    fn unknown_handle_returns_error_not_uaf() {
-        let bogus = 0x0AF5_0002_usize as *mut VeilHandle;
-        // Deliberately NOT registered.
+    fn handle_table_tokens_are_per_table() {
+        let a = StdMutex::new(HandleTable::<u64>::new());
+        let b = StdMutex::new(HandleTable::<u64>::new());
+        let tok = HandleTable::insert(&a, 7);
+        assert!(
+            HandleTable::get(&b, tok).is_none(),
+            "a token from table A must not resolve in table B"
+        );
+    }
+
+    /// Audit M-2 (use path): a real USE entry point handed a token that is not
+    /// live in its table — never-created, already-closed, ABA-stale, or the
+    /// wrong type — must return INVALID_ARG via the liveness guard and NEVER
+    /// dereference the opaque (non-pointer) token. In a unit test the global
+    /// handle/app/stream tables are empty (no daemon connection), so any
+    /// synthetic non-NULL token is "not live" and exercises exactly that guard.
+    #[test]
+    fn use_with_unknown_handle_token_returns_error_not_uaf() {
+        let bogus = 0x0AF5_0001_usize as *mut VeilHandle;
         let mut out_node = [0u8; 32];
         let mut err: *mut c_char = ptr::null_mut();
         let rc = unsafe { veil_get_node_id(bogus, out_node.as_mut_ptr(), &mut err) };
-        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert_eq!(
+            rc, VEIL_ERR_INVALID_ARG,
+            "unknown handle must return INVALID_ARG, not crash"
+        );
         let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
         assert_eq!(msg, "VeilHandle: use-after-close or unknown handle");
         unsafe {
@@ -4405,26 +4444,17 @@ mod tests {
         }
     }
 
-    /// Audit M-2 (use-after-close) for `VeilApp*`: a closed app pointer
-    /// passed to a real send must hit the app-registry guard and return
-    /// INVALID_ARG before the `unsafe { &*app }` deref. `len == 0` with valid
-    /// stack dst buffers carries control past the cheap arg checks straight to
-    /// the liveness guard.
     #[test]
-    fn use_after_close_app_returns_error_not_uaf() {
-        let stale = 0x0AF5_0003_usize as *mut VeilApp;
-        register_handle(app_registry(), stale as usize);
-        assert!(
-            unregister_handle(app_registry(), stale as usize),
-            "precondition: app close claims the live handle"
-        );
-
+    fn use_with_unknown_app_token_returns_error_not_uaf() {
+        let bogus = 0x0AF5_0003_usize as *mut VeilApp;
         let dst_node = [0u8; 32];
         let dst_app = [0u8; 32];
         let mut err: *mut c_char = ptr::null_mut();
+        // len == 0 with valid stack dst buffers carries control past the cheap
+        // arg checks straight to the liveness guard.
         let rc = unsafe {
             veil_send(
-                stale,
+                bogus,
                 dst_node.as_ptr(),
                 dst_app.as_ptr(),
                 0,
@@ -4435,7 +4465,7 @@ mod tests {
         };
         assert_eq!(
             rc, VEIL_ERR_INVALID_ARG,
-            "use-after-close app must return INVALID_ARG, not crash"
+            "unknown app must return INVALID_ARG, not crash"
         );
         let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
         assert_eq!(msg, "VeilApp: use-after-close or unknown handle");
@@ -4444,66 +4474,21 @@ mod tests {
         }
     }
 
-    /// Audit M-2 (use-after-close) for `VeilStreamFfi*`: a closed stream
-    /// pointer passed to a real write must hit the stream-registry guard and
-    /// return INVALID_ARG before the `unsafe { &*stream }` deref.
     #[test]
-    fn use_after_close_stream_returns_error_not_uaf() {
-        let stale = 0x0AF5_0004_usize as *mut VeilStreamFfi;
-        register_handle(stream_registry(), stale as usize);
-        assert!(
-            unregister_handle(stream_registry(), stale as usize),
-            "precondition: stream close claims the live handle"
-        );
-
+    fn use_with_unknown_stream_token_returns_error_not_uaf() {
+        let bogus = 0x0AF5_0004_usize as *mut VeilStreamFfi;
         let mut err: *mut c_char = ptr::null_mut();
         // len == 0 → no payload deref; control reaches the liveness guard.
-        let rc = unsafe { veil_stream_write(stale, ptr::null(), 0, &mut err) };
+        let rc = unsafe { veil_stream_write(bogus, ptr::null(), 0, &mut err) };
         assert_eq!(
             rc, VEIL_ERR_INVALID_ARG,
-            "use-after-close stream must return INVALID_ARG, not crash"
+            "unknown stream must return INVALID_ARG, not crash"
         );
         let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
         assert_eq!(msg, "VeilStreamFfi: use-after-close or unknown handle");
         unsafe {
             veil_free_string(err);
         }
-    }
-
-    /// Cross-type confusion on the USE path: an address registered as a HANDLE
-    /// but passed to an APP method must be rejected (it is not in the app
-    /// registry), mirroring the per-type isolation already enforced on close.
-    #[test]
-    fn use_path_rejects_cross_type_pointer() {
-        let addr = 0x0AF5_0005_usize;
-        register_handle(handle_registry(), addr);
-
-        // Same address handed to an app USE method → not in app_registry → error.
-        let dst_node = [0u8; 32];
-        let dst_app = [0u8; 32];
-        let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe {
-            veil_send(
-                addr as *mut VeilApp,
-                dst_node.as_ptr(),
-                dst_app.as_ptr(),
-                0,
-                ptr::null(),
-                0,
-                &mut err,
-            )
-        };
-        assert_eq!(
-            rc, VEIL_ERR_INVALID_ARG,
-            "a handle addr must not be usable as an app"
-        );
-        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
-        assert_eq!(msg, "VeilApp: use-after-close or unknown handle");
-        unsafe {
-            veil_free_string(err);
-        }
-        // Cleanup the global registry so we don't leak the sentinel.
-        assert!(unregister_handle(handle_registry(), addr));
     }
 
     /// Bounded FFI string scan must accept a normal NUL-terminated buffer
