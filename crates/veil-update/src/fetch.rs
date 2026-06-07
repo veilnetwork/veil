@@ -162,15 +162,29 @@ pub enum UpdateAvailability {
 /// and swap the binary) — this just answers the question "is there a
 /// newer version published".
 ///
-/// Internally calls [`fetch_manifest_with_failover`] with
-/// `installed_release_unix = None` so we deliberately DO NOT enforce
-/// anti-downgrade at fetch time. Anti-downgrade is a property of
-/// the apply path; for a check, an operator who rolls back their
-/// own published manifest (e.g. emergency revert) should still see
-/// "up-to-date" rather than a fetch error. The distinction between
-/// "older manifest published" and "newer manifest published" is
-/// then made explicitly by comparing the manifest's release_unix
-/// against `installed_release_unix`.
+/// # Newest-valid-across-all-mirrors (NOT first-good-wins)
+///
+/// Unlike [`fetch_manifest_with_failover`] (which stops at the first
+/// valid manifest), the *check* queries EVERY mirror and selects the
+/// valid manifest with the greatest `release_unix`. This closes a
+/// freeze/rollback hole: a compromised — or merely stale/desynced —
+/// mirror listed first could otherwise serve an older-but-legitimately-
+/// signed manifest, the check would report `UpToDate`, and a security
+/// release available on a later mirror would be silently masked. By
+/// taking the max over all valid manifests we cannot be frozen by any
+/// single lagging mirror. Poison-resistance is preserved: a tampered /
+/// wrong-issuer / undecodable response from any mirror fails
+/// verification and is simply discarded — it can neither win nor block
+/// the freshest valid manifest from another mirror.
+///
+/// `installed_release_unix = None` is passed to per-manifest verify so
+/// we deliberately DO NOT enforce anti-downgrade at check time. Anti-
+/// downgrade is a property of the apply path; for a check, an operator
+/// who rolls back their own published manifest (e.g. emergency revert)
+/// should still see "up-to-date" rather than a fetch error. The
+/// distinction between "older manifest published" and "newer manifest
+/// published" is then made explicitly by comparing the chosen
+/// manifest's release_unix against `installed_release_unix`.
 pub async fn check_for_update<F, Fut>(
     manifest_urls: &[String],
     fetcher: F,
@@ -182,20 +196,62 @@ where
     F: Fn(&str) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
 {
-    let m = fetch_manifest_with_failover(
-        manifest_urls,
-        fetcher,
-        expected_issuer_pk,
-        None, // see doc-comment: anti-downgrade is for apply, not check.
-        now_unix_secs,
-    )
-    .await?;
-    if m.release_unix > installed_release_unix {
-        Ok(UpdateAvailability::Available { manifest: m })
-    } else {
-        Ok(UpdateAvailability::UpToDate {
-            latest_release_unix: m.release_unix,
-        })
+    if manifest_urls.is_empty() {
+        return Err(FetchError::NoUrls);
+    }
+    let mut newest: Option<VerifiedManifest> = None;
+    let mut first_error: Option<String> = None;
+    for url in manifest_urls {
+        let bytes = match fetcher(url).await {
+            Ok(b) => b,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("{url}: {e}"));
+                }
+                continue;
+            }
+        };
+        let m = match decode_manifest(&bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("{url}: decode: {e}"));
+                }
+                continue;
+            }
+        };
+        // anti-downgrade deliberately NOT enforced here (None) — see doc.
+        match VerifiedManifest::verify(m, Some(expected_issuer_pk), None, now_unix_secs) {
+            Ok(verified) => {
+                let strictly_newer = newest
+                    .as_ref()
+                    .is_none_or(|cur| verified.release_unix > cur.release_unix);
+                if strictly_newer {
+                    newest = Some(verified);
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("{url}: verify: {e}"));
+                }
+                continue;
+            }
+        }
+    }
+    match newest {
+        Some(m) => {
+            if m.release_unix > installed_release_unix {
+                Ok(UpdateAvailability::Available { manifest: m })
+            } else {
+                Ok(UpdateAvailability::UpToDate {
+                    latest_release_unix: m.release_unix,
+                })
+            }
+        }
+        None => Err(FetchError::AllUrlsFailed {
+            tried: manifest_urls.len(),
+            first_error: first_error.unwrap_or_else(|| "no URLs reached fetcher".to_owned()),
+        }),
     }
 }
 
@@ -902,6 +958,95 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::AllUrlsFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn check_for_update_picks_newest_valid_when_stale_mirror_is_first() {
+        // Freeze/rollback resistance: mirror #1 serves an OLDER but
+        // legitimately-signed manifest; mirror #2 has the security release.
+        // The check must select the NEWEST valid manifest across all
+        // mirrors, not the first one that verifies — otherwise a stale /
+        // compromised first mirror could mask a security update.
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let sign = |release_unix: u64, version: &str| {
+            sign_manifest(
+                release_unix,
+                version,
+                "1.0.0",
+                "linux-x86_64",
+                [0xAA; 32],
+                vec!["https://bin.example/x".to_owned()],
+                &kp.public_key,
+                &kp.private_key,
+                SignatureAlgorithm::Ed25519,
+            )
+            .unwrap()
+        };
+        let stale = sign(1_000_000_000, "1.2.0");
+        let security = sign(2_000_000_000, "1.3.0");
+
+        let mut store: HashMap<String, Result<Vec<u8>, String>> = HashMap::new();
+        store.insert("https://stale.example".to_owned(), Ok(stale));
+        store.insert("https://fresh.example".to_owned(), Ok(security));
+
+        // stale mirror listed FIRST.
+        let urls = vec![
+            "https://stale.example".to_owned(),
+            "https://fresh.example".to_owned(),
+        ];
+        let result =
+            check_for_update(&urls, stub_fetcher(store), &kp.public_key, 1_500_000_000, None)
+                .await
+                .expect("check ok");
+        match result {
+            UpdateAvailability::Available { manifest } => {
+                assert_eq!(
+                    manifest.release_unix, 2_000_000_000,
+                    "must select the newest valid manifest across all mirrors"
+                );
+                assert_eq!(manifest.version, "1.3.0");
+            }
+            other => panic!("expected Available (newest), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_for_update_tampered_first_mirror_does_not_block_newest_valid() {
+        // Poison-resistance preserved: a garbage manifest at the first
+        // mirror is discarded and must not prevent selecting the valid
+        // newer manifest from a later mirror.
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let security = sign_manifest(
+            2_000_000_000,
+            "1.3.0",
+            "1.0.0",
+            "linux-x86_64",
+            [0xAA; 32],
+            vec!["https://bin.example/x".to_owned()],
+            &kp.public_key,
+            &kp.private_key,
+            SignatureAlgorithm::Ed25519,
+        )
+        .unwrap();
+
+        let mut store: HashMap<String, Result<Vec<u8>, String>> = HashMap::new();
+        store.insert("https://evil.example".to_owned(), Ok(b"garbage".to_vec()));
+        store.insert("https://fresh.example".to_owned(), Ok(security));
+
+        let urls = vec![
+            "https://evil.example".to_owned(),
+            "https://fresh.example".to_owned(),
+        ];
+        let result =
+            check_for_update(&urls, stub_fetcher(store), &kp.public_key, 1_000_000_000, None)
+                .await
+                .expect("check ok");
+        match result {
+            UpdateAvailability::Available { manifest } => {
+                assert_eq!(manifest.release_unix, 2_000_000_000);
+            }
+            other => panic!("expected Available despite tampered first mirror, got {other:?}"),
+        }
     }
 
     #[tokio::test]

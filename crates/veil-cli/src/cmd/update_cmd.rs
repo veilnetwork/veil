@@ -329,12 +329,33 @@ fn update_apply<I: CommandIo, O: ConfigOps>(
     let store = match installed_version_mac_key() {
         Some(key) => InstalledVersionStore::with_hmac_key(state_path, key),
         None => {
+            // Fail-closed: without an Ed25519 identity the anti-downgrade
+            // state file cannot be MAC-authenticated, so a local attacker
+            // who can rewrite it could lower the floor and replay an older
+            // (legitimately-signed) release. Refuse to run an
+            // unauthenticated store unless the operator explicitly opts in
+            // via --allow-legacy-state-migration (the same flag that already
+            // gates accepting a pre-C-08 no-MAC file).
+            if !allow_legacy_state_migration {
+                return Err(veil_cfg::ConfigError::CommandFailed(
+                    "refusing to apply an update with an UNAUTHENTICATED \
+                     anti-downgrade state file: no Ed25519 identity was found \
+                     at the default identity dir, so the state file cannot be \
+                     MAC-authenticated and a local attacker able to rewrite it \
+                     could lower the anti-downgrade floor to replay an older \
+                     signed release. Run `veil-cli identity create` (or restore \
+                     one) to enable authentication, OR pass \
+                     --allow-legacy-state-migration to explicitly accept an \
+                     unauthenticated state file."
+                        .to_owned(),
+                ));
+            }
             context.io.emit(OutputEvent::message(
-                "warning: the anti-downgrade state file will NOT be \
-                 MAC-authenticated — no Ed25519 identity was found at the \
-                 default identity dir, so a local attacker able to rewrite it \
-                 could lower the anti-downgrade floor. Run `veil-cli identity \
-                 create` (or restore one) to enable authentication."
+                "warning: --allow-legacy-state-migration set: the anti-downgrade \
+                 state file will NOT be MAC-authenticated (no Ed25519 identity \
+                 found), so a local attacker able to rewrite it could lower the \
+                 anti-downgrade floor. Run `veil-cli identity create` to enable \
+                 authentication."
                     .to_owned(),
             ));
             InstalledVersionStore::new(state_path)
