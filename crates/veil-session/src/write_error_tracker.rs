@@ -82,18 +82,17 @@ impl WriteErrorTracker {
         }
     }
 
-    /// Current count.  Used for observability / metrics on session
-    /// teardown.  Not reset on check.
-    #[allow(dead_code)]
+    /// Current count. Test-only accessor (no production caller); gated
+    /// `#[cfg(test)]` rather than `#[allow(dead_code)]` so its test-only
+    /// status is explicit.
+    #[cfg(test)]
     pub fn count(&self) -> u32 {
         self.count
     }
 
-    /// Threshold value passed to [`Self::new`].  Used by callsites
-    /// that need to log the threshold alongside an event (legacy
-    /// SessionRunner emits "threshold=N" in the hot-standby trigger
-    /// log line).
-    #[allow(dead_code)]
+    /// Threshold value passed to [`Self::new`]. Test-only accessor (see
+    /// `count`).
+    #[cfg(test)]
     pub fn threshold(&self) -> u32 {
         self.threshold
     }
