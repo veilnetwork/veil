@@ -1,6 +1,6 @@
 [package]
 name = "veil-routing"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Veil routing primitives: route cache, Vivaldi coordinates, RTT probe table, neighbor scorer, route-discovery PoW, loss tracker. Phase 6 extraction from veilcore — leaf bits without session/dispatcher coupling."
 license = "AGPL-3.0-or-later"

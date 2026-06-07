@@ -1,6 +1,6 @@
 [package]
 name = "veil-types"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Shared primitive types for the Veil network — SignatureAlgorithm enum, parse-error helper.  Tier 0 leaf crate hosting types that ALL upper layers (cfg, proto, crypto, node) need access to without inducing cyclic dependencies."
 license = "AGPL-3.0-or-later"

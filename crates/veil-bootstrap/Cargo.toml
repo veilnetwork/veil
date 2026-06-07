@@ -1,6 +1,6 @@
 [package]
 name = "veil-bootstrap"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Veil network bootstrap layer: DNS-TXT seed records, signed/encrypted invites, HTTPS bootstrap-bundle fetch, builtin seeds. Phase 6 extraction from veilcore."
 license = "AGPL-3.0-or-later"
