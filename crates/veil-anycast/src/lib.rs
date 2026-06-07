@@ -14,11 +14,13 @@
 //! Nodes that are no longer reachable age out naturally when their TTL
 //! causes the DHT entry to expire.
 //!
-//! # Security considerations — discovery layer with optional owner-signing
+//! # Security considerations — secure-by-default, with an opt-down discovery mode
 //!
-//! `AnycastRecord.score` is **peer-controlled**: a node can claim `score = 0`
-//! to win anycast traffic for a service tag. Two shipped layers bound the abuse,
-//! and one honesty gap remains deferred.
+//! `AnycastRecord.score` is **peer-controlled**: a node can sign its own record
+//! claiming `score = 0` to try to win anycast traffic for a service tag. The
+//! default resolve policy rejects unsigned / unbound records outright; two
+//! further shipped layers harden the opt-down `BestEffort` path; one honesty
+//! gap remains deferred.
 //!
 //! ## Owner-signing (shipped)
 //!
@@ -29,23 +31,34 @@
 //! records; [`AnycastResolvePolicy::SignedBound`] additionally requires the
 //! owner binding (`BLAKE3(owner_pubkey) == node_id`, key idx 0) — closing the
 //! "claim to be the canonical provider of someone else's node_id" vector.
-//! Operators routing trust-sensitive traffic should set
-//! `[anycast] resolve_policy = "signed_bound"`.
+//! **`SignedBound` is the DEFAULT** (audit cycle-6 T2): unsigned and unbound
+//! records are dropped unless an operator explicitly opts DOWN to `BestEffort`
+//! (`[anycast] resolve_policy = "best_effort"`) for discovery-only deployments.
+//! The two layers below harden that opt-down path.
 //!
 //! ## Resolver-XOR tie-break (shipped)
 //!
 //! [`AnycastService::resolve`] mixes XOR distance from the **resolver's**
-//! node_id into the sort, so a `score = 0` sybil's payoff is resolver-specific
-//! (no single sybil farm uniformly eclipses all resolvers).
+//! node_id into the sort, so under `BestEffort` a `score = 0` sybil's payoff is
+//! resolver-specific (no single sybil farm uniformly eclipses all resolvers).
 //!
-//! ## What remains deferred
+//! ## Reputation downweight (shipped)
 //!
 //! Owner-signing proves WHO published a record, not that its advertised
 //! `score` is HONEST — a node can still sign its OWN record with `score = 0`.
-//! **Reputation downweight** (penalize advertisers that fail to serve) and
-//! **quorum vote** (don't trust a single first-time `score = 0` claim) remain
-//! the deferred half of the "Anycast signed records" row in TASKS.md. Re-open
-//! trigger: a production trust-sensitive anycast consumer materializes.
+//! [`AnycastService::resolve`] therefore stacks a resolver-local reputation
+//! penalty on top of the peer-claimed score: [`AnycastReputation::record_failure`]
+//! (invoked when a handed-out candidate later times out or misbehaves) makes
+//! that node sort below honest tiers on subsequent resolves, via
+//! [`reputation::AnycastReputation::score_offset`].
+//!
+//! ## What remains deferred
+//!
+//! **Quorum vote** — declining to trust a single first-time `score = 0` claim
+//! before it has actually served, by cross-checking multiple DHT replicas —
+//! is the remaining deferred half of the "Anycast signed records" row in
+//! TASKS.md. Re-open trigger: a production trust-sensitive anycast consumer
+//! materializes.
 //!
 //! ## Acceptable use
 //!
@@ -66,9 +79,12 @@
 //! **Bootstrap discovery** of seed peers in untrusted environments —
 //! use [`veil_proto::transport_hints`] (signed-by-issuer) or the
 //! bootstrap-bundle path with pinned `BUILTIN_SEEDS`.
-//! **First-time service-owner authentication** — a sybil might be the
-//! first record returned; the caller has no way to tell who the canonical
-//! owner is until owner-signing lands.
+//! **First-time service-owner authentication under `BestEffort`** — when an
+//! operator has opted DOWN to `BestEffort`, a sybil might be the first record
+//! returned. The default `SignedBound` rejects unsigned / unbound records; the
+//! residual under any policy is that even a correctly-signed first-time record's
+//! `score` is unproven until reputation accrues. Keep the default `SignedBound`,
+//! or resolve via sovereign records ([`veil_proto::identity_document`]).
 
 use std::sync::Arc;
 
@@ -95,7 +111,7 @@ pub enum AnycastResolvePolicy {
     /// legacy / discovery-only deployments.
     ///
     /// audit cycle-6 (T2): no longer the default — secure-by-default is now the
-    /// strictest [`SignedBound`] (the network has no legacy unsigned-anycast
+    /// strictest [`AnycastResolvePolicy::SignedBound`] (the network has no legacy unsigned-anycast
     /// deployments to preserve). Opt down to `BestEffort` explicitly for
     /// discovery-only use.
     BestEffort,
@@ -318,16 +334,20 @@ impl AnycastService {
     /// Candidates are ranked by `AnycastRecord.score` ascending (lower =
     /// better). Returns an `AnycastResultPayload` ready to send over IPC.
     ///
-    /// A7: `score` is peer-controlled — any node that publishes
-    /// an AnycastRecord can claim `score = 0` to win all traffic for the
-    /// service tag. We can't yet validate signed records (full mitigation
-    /// requires Ed25519 sig per AnycastRecord, deferred), but we can break
-    /// the deterministic "score=0 always wins" pattern by mixing in
-    /// **XOR distance from this resolver**. An attacker now needs to be
-    /// both `score = 0` *and* XOR-close to the resolver — the latter is a
-    /// proof-of-work-equivalent constraint they can't satisfy for arbitrary
-    /// resolvers. Randomized resolvers receive different rankings for the
-    /// same Sybil farm, breaking the universal eclipse.
+    /// A7: under the opt-down `BestEffort` policy `score` is peer-controlled —
+    /// any node publishing an AnycastRecord can claim `score = 0` to win all
+    /// traffic for the service tag. (The DEFAULT `SignedBound` policy already
+    /// rejects unsigned / unbound records outright.) Under `BestEffort`, two
+    /// shipped layers bound this WITHOUT requiring signatures: (1) a
+    /// resolver-local **reputation penalty** is
+    /// added to the claimed score (see `resolve_internal`), demoting nodes that
+    /// failed to serve on prior resolves; and (2) ties — including a fabricated
+    /// `0` — fall back to **XOR distance from this resolver**, so a sybil must be
+    /// both `score = 0` *and* XOR-close to each target resolver, a constraint it
+    /// cannot satisfy uniformly (different resolvers rank the same Sybil farm
+    /// differently, breaking the universal eclipse). Callers that want to reject
+    /// unsigned or unowned records outright use [`Self::resolve_signed_only`] /
+    /// [`Self::resolve_signed_bound`] (policies `SignedOnly` / `SignedBound`).
     pub fn resolve(&self, service_tag: [u8; 4], max_results: u8) -> AnycastResultPayload {
         let (require_signed, require_binding) = match self.policy {
             AnycastResolvePolicy::BestEffort => (false, false),
