@@ -841,7 +841,13 @@ pub enum ConfigCommand {
         profile: ConfigProfile,
     },
     /// Print the current config in its native format.
-    Show,
+    Show {
+        /// Print secret values (e.g. `identity.private_key`) verbatim instead
+        /// of redacting them. Off by default so `config show` is safe to paste
+        /// into logs / issues.
+        #[arg(long)]
+        reveal_secrets: bool,
+    },
     /// Validate the config file; use --fix to auto-correct fixable issues.
     Validate {
         /// Automatically fix fixable validation errors and rewrite the config.
@@ -852,6 +858,10 @@ pub enum ConfigCommand {
     Get {
         #[arg(value_name = "KEY")]
         key: String,
+        /// Required to read a secret value (e.g. `identity.private_key`);
+        /// without it, reading a secret key is refused.
+        #[arg(long)]
+        reveal_secrets: bool,
     },
     /// Write a single config value by dot-separated key.
     Set {
