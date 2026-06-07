@@ -80,6 +80,16 @@ impl RelayChainHop {
         }
         let next_hop_node_id: [u8; 32] = super::read_array::<32>(buf, 0)?;
         let inner_len = super::read_u32_be(buf, 32)? as usize;
+        // Per-field cap: the inner payload can't exceed the hard frame body
+        // ceiling (the only implicit bound today); make it explicit so the
+        // decoder is self-bounding regardless of caller.
+        if inner_len > crate::MAX_FRAME_BODY as usize {
+            return Err(ProtoError::ValueTooLarge {
+                field: "inner_len",
+                value: inner_len as u64,
+                max: crate::MAX_FRAME_BODY as u64,
+            });
+        }
         let end = Self::FIXED_HEADER
             .checked_add(inner_len)
             .ok_or(ProtoError::BufferTooShort {
