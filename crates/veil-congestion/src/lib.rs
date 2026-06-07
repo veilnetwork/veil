@@ -157,8 +157,14 @@ impl CongestionMonitor {
             return;
         }
         state.last_score = score;
-        drop(state);
-
+        // Hold the hysteresis lock across the admitting transition so the
+        // score snapshot, the admitting read/store, and the watch send are one
+        // serialized step. If the lock were released first (the old `drop`),
+        // two concurrent updaters could interleave the read-modify-write of
+        // `admitting` and deliver out-of-order true/false notifications to the
+        // routing dispatcher (e.g. a stale `false` arriving after a newer
+        // `true`). The watch send is non-blocking, so holding the std Mutex
+        // across it cannot stall. `state` is dropped at end of scope.
         let currently_admitting = self.admitting.load(Ordering::Relaxed);
         if currently_admitting && score >= self.cfg.congestion_high {
             self.admitting.store(false, Ordering::Relaxed);
