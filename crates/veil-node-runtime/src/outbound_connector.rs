@@ -281,12 +281,18 @@ pub fn spawn_outbound_peers(
                                     )
                                 };
                                 let peer_id = session.peer_id;
-                                // Register in the outbox registries so the runtime
-                                // can send outgoing frames to this outbound session.
-                                let outbox_rx = access.session_tx_registry
-                                    .write()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .register(peer_id);
+                                // Consume the tx-registry receiver pre-reserved by
+                                // `try_register_directional` inside
+                                // `register_connection_session` (the directional
+                                // glare policy already ran there). The old code
+                                // called `.register(peer_id)` a SECOND time here,
+                                // which overwrote that reservation with a fresh
+                                // channel — orphaning the reserved one (wasted
+                                // mpsc allocation) and opening a frame-loss window
+                                // where a send between the two registrations landed
+                                // in the discarded channel. Mirror the inbound path
+                                // (mod.rs), which consumes `reserved_outbox_rx`.
+                                let outbox_rx = session.reserved_outbox_rx;
                                 let rpc_rx = access.session_outbox.register(peer_id);
 
                                 // if we're a Leaf connecting to a Gateway
