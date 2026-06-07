@@ -1873,8 +1873,14 @@ pub struct DebugTransportOverrideArgs {
 pub enum KeyCommand {
     /// Generate a new key pair and write it to the config.
     Gen(KeyGenArgs),
-    /// Print the public key and node ID from the current config.
-    Show,
+    /// Print the identity (algo, public key, node ID). The private key is
+    /// redacted unless `--reveal-secrets` is given.
+    Show {
+        /// Print the private key too. Off by default so `key show` is safe to
+        /// paste into logs / bug reports.
+        #[arg(long)]
+        reveal_secrets: bool,
+    },
     /// Print detailed key information (algorithm, node ID, nonce difficulty).
     Info,
     /// Mine a PoW nonce for the current identity key.
