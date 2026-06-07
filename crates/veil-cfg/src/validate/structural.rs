@@ -283,6 +283,14 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
         check: update_check_interval_too_frequent,
         fix: None,
     },
+    // ── mailbox push: APNs credential completeness ───────────────
+    ValidationRule {
+        code: "mailbox_push_apns_partial_config",
+        key: "mailbox.push.apns_p8_path",
+        message: "APNs requires all four of apns_p8_path, apns_key_id, apns_team_id, apns_bundle_id to be set together — a partial set silently disables real push (the daemon falls back to log-only) instead of erroring, so wake delivery is lost without warning. Set all four, or clear them all to use log-only intentionally",
+        check: mailbox_push_apns_partial_config,
+        fix: None,
+    },
     // ── connection-rotation interval ────────────────────────────
     ValidationRule {
         code: "session_max_age_too_short",
@@ -722,6 +730,22 @@ fn update_manifest_url_must_be_https(config: &Config) -> bool {
 
 fn update_check_interval_too_frequent(config: &Config) -> bool {
     matches!(config.update.check_interval_secs, Some(n) if n < 60)
+}
+
+fn mailbox_push_apns_partial_config(config: &Config) -> bool {
+    // APNs needs all four fields together. `apns_environment` is optional
+    // (defaults to production) and does not count toward completeness.
+    let p = &config.mailbox.push;
+    let set = [
+        !p.apns_p8_path.is_empty(),
+        !p.apns_key_id.is_empty(),
+        !p.apns_team_id.is_empty(),
+        !p.apns_bundle_id.is_empty(),
+    ];
+    let count = set.iter().filter(|x| **x).count();
+    // 0 = APNs intentionally absent (fine); 4 = fully configured (fine);
+    // anything in between is a partial config that silently no-ops.
+    count != 0 && count != 4
 }
 
 fn session_max_age_too_short(config: &Config) -> bool {
