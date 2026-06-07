@@ -850,23 +850,32 @@ fn validate_loaded(io: &mut impl CommandIo, config: &veil_cfg::Config) -> veil_c
 
 /// Dot-separated config keys whose value is secret and must not be printed by
 /// `config get` without an explicit `--reveal-secrets`.
+/// Inline-secret config field names (TOML keys whose VALUE is a secret, not a
+/// file path). Used by both the raw-text redactor and the dotted-key gate so a
+/// new inline secret only has to be added in one place. `*_file`/`*_path`
+/// variants are deliberately excluded (leaking a path is not leaking the key).
+const SECRET_FIELD_NAMES: &[&str] = &["private_key", "key_passphrase", "realm_psk"];
+
 fn is_secret_config_key(key: &str) -> bool {
-    matches!(
-        key.trim().to_ascii_lowercase().as_str(),
-        "identity.private_key" | "identity.key_passphrase"
-    )
+    // Compare the final dotted segment against the inline-secret field set, so
+    // both `identity.private_key` and `mesh.realm_psk` are covered.
+    let leaf = key.trim().to_ascii_lowercase();
+    let leaf = leaf.rsplit('.').next().unwrap_or(leaf.as_str());
+    SECRET_FIELD_NAMES.contains(&leaf)
 }
 
 /// Redact the value of secret TOML keys in raw config text for `config show`.
-/// Matches `private_key`/`key_passphrase` assignments (any indentation) and
-/// replaces the value, leaving structure/comments intact. `key_passphrase_file`
-/// (a path, not a secret) is deliberately not redacted.
+/// Matches the [`SECRET_FIELD_NAMES`] assignments (any indentation) and
+/// replaces the value, leaving structure/comments intact. `*_file`/`*_path`
+/// variants (e.g. `key_passphrase_file`) are NOT redacted — the prefix check
+/// requires the next non-space byte to be `=`, so `key_passphrase_file = …`
+/// (next byte `_`) is left alone.
 fn redact_secret_lines(content: &str) -> String {
     const REDACTED: &str = "\"<redacted — rerun with --reveal-secrets>\"";
     let mut out = String::with_capacity(content.len());
     for line in content.lines() {
         let trimmed = line.trim_start();
-        let is_secret = ["private_key", "key_passphrase"].iter().any(|k| {
+        let is_secret = SECRET_FIELD_NAMES.iter().any(|k| {
             trimmed
                 .strip_prefix(k)
                 .map(|rest| matches!(rest.trim_start().as_bytes().first(), Some(b'=')))
@@ -957,8 +966,21 @@ mod tests {
     fn get_secret_key_refused_without_flag() {
         assert!(is_secret_config_key("identity.private_key"));
         assert!(is_secret_config_key("identity.key_passphrase"));
+        assert!(is_secret_config_key("mesh.realm_psk"));
         assert!(!is_secret_config_key("identity.algo"));
         assert!(!is_secret_config_key("identity.key_passphrase_file"));
+    }
+
+    #[test]
+    fn show_redacts_realm_psk_inline_secret() {
+        let raw = "[mesh]\nenabled = true\nrealm_psk = \"BASE64SECRETPSK\"\n";
+        let redacted = redact_secret_lines(raw);
+        assert!(
+            !redacted.contains("BASE64SECRETPSK"),
+            "realm_psk must be redacted: {redacted}"
+        );
+        assert!(redacted.contains("realm_psk = \"<redacted"));
+        assert!(redacted.contains("enabled = true"));
     }
 
     #[test]

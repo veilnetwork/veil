@@ -42,7 +42,7 @@ impl IdentityService {
     ) -> veil_cfg::Result<()> {
         match command {
             KeyCommand::Gen(args) => Self::key_gen(&mut context, args),
-            KeyCommand::Show => Self::key_show(&mut context),
+            KeyCommand::Show { reveal_secrets } => Self::key_show(&mut context, reveal_secrets),
             KeyCommand::Info => Self::key_info(&mut context),
             KeyCommand::Nonce(args) => Self::key_nonce(&mut context, args),
         }
@@ -139,9 +139,26 @@ impl IdentityService {
 
     fn key_show<I: CommandIo, O: ConfigOps>(
         context: &mut CommandContext<'_, I, O>,
+        reveal_secrets: bool,
     ) -> veil_cfg::Result<()> {
-        Self::with_identity_config(context, |io, _path, identity| {
-            IdentityOutput::emit_identity(io, &identity.into_config());
+        Self::with_identity_config(context, move |io, _path, identity| {
+            let mut config = identity.into_config();
+            // Redact secret material by default so `key show` (whose contract
+            // is "print the identity") can't spill the long-lived signing key
+            // into logs / bug reports. Mirrors `config show`/`config get`.
+            // Applies to BOTH text and JSON output (the view serializes the
+            // config verbatim). `key gen` deliberately still prints the freshly
+            // generated keypair.
+            if !reveal_secrets {
+                if !config.private_key.is_empty() {
+                    config.private_key = "<redacted — rerun with --reveal-secrets>".to_owned();
+                }
+                if config.key_passphrase.is_some() {
+                    config.key_passphrase =
+                        Some("<redacted — rerun with --reveal-secrets>".to_owned());
+                }
+            }
+            IdentityOutput::emit_identity(io, &config);
             Ok(())
         })
     }
@@ -301,14 +318,37 @@ mod tests {
                 },
             };
 
-            IdentityService::key_show(&mut context).unwrap();
+            let priv_b64 = context
+                .ops
+                .loaded_config
+                .identity
+                .as_ref()
+                .unwrap()
+                .private_key
+                .clone();
 
+            // Default: private key redacted, public material shown.
+            IdentityService::key_show(&mut context, false).unwrap();
             assert!(context.io.output.contains("algo: ed25519"));
             assert!(
                 context
                     .io
                     .output
                     .contains(&format!("public_key: {}", keypair.public_key))
+            );
+            assert!(
+                !context.io.output.contains(&priv_b64),
+                "private key must be redacted by default: {}",
+                context.io.output
+            );
+            assert!(context.io.output.contains("private_key: <redacted"));
+
+            // --reveal-secrets prints it.
+            context.io = BufferIo::default();
+            IdentityService::key_show(&mut context, true).unwrap();
+            assert!(
+                context.io.output.contains(&priv_b64),
+                "--reveal-secrets must print the private key"
             );
         }
 
