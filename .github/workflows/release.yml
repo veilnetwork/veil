@@ -215,6 +215,12 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    env:
+      # F2: Ed25519 private key (openssl PEM) that signs the per-triple sha256
+      # manifests for the shell installer (scripts/install.sh). OPTIONAL — when
+      # the secret is unset, no `.sig` is produced and install.sh falls back to
+      # sha256-only with a warning (no regression). See docs/en/release-signing.md.
+      RELEASE_INSTALLER_ED25519_SK: ${{ secrets.RELEASE_INSTALLER_ED25519_SK }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -246,6 +252,34 @@ jobs:
             done
           done
           ls -la out/
+
+      - name: Sign sha256 manifests for the installer (Ed25519) — F2
+        # Detached Ed25519 signature over each per-triple sha256 manifest, so
+        # scripts/install.sh can authenticate the manifest against a pinned key
+        # BEFORE trusting any hash it lists (closes the "compromised release
+        # artifact serves its own matching sha256" supply-chain gap). The `.sig`
+        # files land in out/ and are picked up by the `out/*` glob below.
+        # Skipped automatically when no signing secret is configured.
+        if: ${{ env.RELEASE_INSTALLER_ED25519_SK != '' }}
+        shell: bash
+        run: |
+          keyfile="$(mktemp)"; pubfile="$(mktemp)"
+          printf '%s' "$RELEASE_INSTALLER_ED25519_SK" > "$keyfile"
+          openssl pkey -in "$keyfile" -pubout -out "$pubfile"
+          shopt -s nullglob
+          signed=0
+          for f in out/sha256-*.txt; do
+            openssl pkeyutl -sign -inkey "$keyfile" -rawin -in "$f" -out "$f.sig"
+            # Ship-time self-check: the published .sig MUST verify under the
+            # key's public half (catches a wrong / corrupt secret before release).
+            openssl pkeyutl -verify -pubin -inkey "$pubfile" -rawin \
+              -in "$f" -sigfile "$f.sig" \
+              || { echo "::error::installer signature self-check failed for $f"; exit 1; }
+            echo "signed + verified: $f.sig"
+            signed=$((signed + 1))
+          done
+          rm -f "$keyfile" "$pubfile"
+          [ "$signed" -gt 0 ] || { echo "::error::no sha256-*.txt manifests to sign"; exit 1; }
 
       - name: Attach to Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2

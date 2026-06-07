@@ -6,8 +6,9 @@
 #   curl --proto '=https' --tlsv1.2 -sSf \
 #     https://raw.githubusercontent.com/veilnetwork/veil/main/scripts/install.sh | sh
 #
-# Downloads PREBUILT, sha256-verified binaries from GitHub Releases and walks
-# you from `curl` all the way to a running node. No Rust toolchain required.
+# Downloads PREBUILT binaries from GitHub Releases — sha256-verified, and
+# (when a release key is pinned) Ed25519-signature-verified — then walks you
+# from `curl` all the way to a running node. No Rust toolchain required.
 #
 # What it installs (pick any subset; default: veil-cli):
 #   veil-cli     the node + self-updater (client leaf OR public server)
@@ -38,6 +39,8 @@ MODIFY_PATH=1
 ASSUME_YES=0
 QUICKSTART="auto"          # auto|yes|no — offer to init+run a node at the end
 NO_VERIFY=0                # escape hatch; verification is ON by default
+REQUIRE_SIGNATURE=0        # --require-signature: hard-fail if manifest sig absent
+SIG_VERIFIED=0             # set to 1 once the release-manifest signature verifies
 ALL_COMPONENTS="veil-cli ogate oproxy-client oproxy-server"
 
 # ── Pretty output ───────────────────────────────────────────────────────────
@@ -76,7 +79,13 @@ OPTIONS:
     --quickstart          After install, interactively init + start a node.
     --no-quickstart       Never prompt; just print the next-steps guide.
     -y, --yes             Assume "yes" to prompts (non-interactive).
-    --no-verify           Skip sha256 verification (NOT recommended).
+    --no-verify           Skip ALL verification — sha256 AND signature
+                          (NOT recommended).
+    --require-signature   Hard-fail unless the release manifest carries a valid
+                          Ed25519 signature under the pinned release key.
+                          Default: verify the signature when a key is pinned and
+                          OpenSSL >= 3.0 is present, otherwise warn and continue
+                          with sha256-only.
     -h, --help            Show this help.
 
 ENVIRONMENT:
@@ -110,6 +119,7 @@ while [ $# -gt 0 ]; do
         --no-quickstart) QUICKSTART="no"; shift ;;
         -y|--yes) ASSUME_YES=1; shift ;;
         --no-verify) NO_VERIFY=1; shift ;;
+        --require-signature) REQUIRE_SIGNATURE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) err "unknown option '$1' (try --help)" ;;
     esac
@@ -160,6 +170,76 @@ sha256_of() { # <file>
     elif have shasum; then shasum -a 256 "$1" | awk '{print $1}'
     elif have openssl; then openssl dgst -sha256 "$1" | awk '{print $NF}'
     else err "no sha256 tool (need sha256sum, shasum, or openssl)"; fi
+}
+
+# ── Release-manifest signature (F2: supply-chain authenticity) ───────────────
+# The sha256 manifest binds binary -> hash, but on its own only proves the
+# manifest and binary AGREE — an attacker who controls the release artifacts
+# (or a mirror) can serve a malicious binary WITH a matching manifest. A
+# detached Ed25519 signature over the manifest, checked against a key PINNED in
+# THIS script, raises the bar to "forge the operator's release key". It is
+# verified with openssl — a verifier INDEPENDENT of the downloaded binary, so a
+# malicious binary cannot self-attest.
+
+# Pinned Ed25519 release public key (openssl PEM). EMPTY until the key ceremony
+# runs (docs/en/release-signing.md) — leave the heredoc body blank. Runtime
+# override: VEIL_RELEASE_PUBKEY_PEM (e.g. a testnet key).
+pinned_release_pubkey() {
+    cat <<'PUBKEY'
+PUBKEY
+}
+
+# True only for OpenSSL >= 3.0, where `pkeyutl -rawin` supports one-shot
+# Ed25519. LibreSSL (the default `openssl` on macOS) and OpenSSL <= 1.1 lack it.
+openssl_can_ed25519() {
+    have openssl || return 1
+    case "$(openssl version 2>/dev/null)" in
+        "OpenSSL 3."* | "OpenSSL 4."* | "OpenSSL 5."*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Verify the detached Ed25519 signature over the sha256 manifest ($1). Sets
+# SIG_VERIFIED=1 on success. Fail-closed when a key is pinned and the signature
+# is missing or invalid; warn-and-continue (no regression vs channel trust)
+# when no key is pinned or no capable openssl is present, unless
+# --require-signature forces a hard failure.
+verify_manifest_signature() { # <sha256-manifest-file>
+    _sha="$1"
+    _pem="${VEIL_RELEASE_PUBKEY_PEM:-$(pinned_release_pubkey)}"
+    if [ -z "$(printf '%s' "$_pem" | tr -d '[:space:]')" ]; then
+        if [ "$REQUIRE_SIGNATURE" -eq 1 ]; then
+            err "--require-signature given, but this installer has no pinned
+       release key. See docs/en/release-signing.md."
+        fi
+        warn "release manifest is NOT signature-verified (no pinned key) —
+       authenticity rests on TLS to the download host. See
+       docs/en/release-signing.md."
+        return 0
+    fi
+    if ! openssl_can_ed25519; then
+        if [ "$REQUIRE_SIGNATURE" -eq 1 ]; then
+            err "--require-signature needs OpenSSL >= 3.0 to verify the Ed25519
+       release signature (found: $(openssl version 2>/dev/null || echo none))."
+        fi
+        warn "cannot verify release signature: need OpenSSL >= 3.0 (found
+       $(openssl version 2>/dev/null || echo 'no openssl')). Falling back to
+       sha256-only. Install OpenSSL 3.x or pass --require-signature to enforce."
+        return 0
+    fi
+    fetch "${_base}/sha256-${TRIPLE}.txt.sig" "${TMP}/sha256.txt.sig" \
+        || err "a release key is pinned but no sha256-${TRIPLE}.txt.sig was
+       published — refusing to install an unverified manifest."
+    printf '%s\n' "$_pem" > "${TMP}/relkey.pem"
+    if openssl pkeyutl -verify -pubin -inkey "${TMP}/relkey.pem" -rawin \
+            -in "$_sha" -sigfile "${TMP}/sha256.txt.sig" >/dev/null 2>&1; then
+        ok "release manifest signature verified (Ed25519)"
+        SIG_VERIFIED=1
+    else
+        err "release manifest signature INVALID — ABORTING. The sha256 manifest
+       does not verify against the pinned release key; the download channel or
+       the release artifacts may be compromised. Do NOT run anything."
+    fi
 }
 
 # ── Detect platform -> Rust target triple ───────────────────────────────────
@@ -240,6 +320,8 @@ install_component() { # <bin-name>
             fetch "${_base}/sha256-${TRIPLE}.txt" "${TMP}/sha256.txt" \
                 || err "no sha256-${TRIPLE}.txt published — refusing to install
        an unverified ${_bin}. Re-run with --no-verify to override."
+            # Authenticate the manifest BEFORE trusting any hash it lists.
+            verify_manifest_signature "${TMP}/sha256.txt"
         fi
         _want="$(awk -v n="$_bin" '$2==n{print $1}' "${TMP}/sha256.txt" | head -n1)"
         if [ -z "$_want" ]; then
