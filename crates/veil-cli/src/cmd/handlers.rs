@@ -308,6 +308,13 @@ pub(crate) fn apply_profile_defaults(
             // ~6× cellular data vs the 4 h cadence reasonable for
             // server nodes.
             loaded.update.check_interval_secs = Some(86_400);
+            // Cap DHT-store memory tighter than the Core ~400 MB default:
+            // budget phones can't afford it. 128 MB byte cap + a matching
+            // ~8k-entry cap (8k × 16 KiB = 128 MB worst case) keep the store
+            // bounded both ways. Overridable in `[dht]` (a WiFi-only mobile
+            // node with RAM to spare can raise these).
+            loaded.dht.max_store_bytes = Some(128_000_000);
+            loaded.dht.max_store_entries = 8_000;
         }
     }
 }
@@ -1258,6 +1265,18 @@ mod tests {
             config.session.max_concurrent, 64,
             "mobile profile MUST cap max_concurrent at 64 for budget-phone RAM"
         );
+
+        // DHT store memory capped tighter than the Core ~400 MB default:
+        // 128 MB byte cap + ~8k-entry cap (8k × 16 KiB = 128 MB worst case).
+        assert_eq!(
+            config.dht.max_store_bytes,
+            Some(128_000_000),
+            "mobile profile MUST cap DHT store at ~128 MB"
+        );
+        assert_eq!(
+            config.dht.max_store_entries, 8_000,
+            "mobile profile MUST lower the DHT entry cap to match the 128 MB byte cap"
+        );
     }
 
     /// default `max_concurrent` is 512 (desktop-friendly
@@ -1303,7 +1322,19 @@ mod tests {
             config.routing, baseline.routing,
             "mobile must not touch [routing]"
         );
-        assert_eq!(config.dht, baseline.dht, "mobile must not touch [dht]");
+        // [dht]: mobile lowers ONLY the two memory caps (128 MB / 8k entries)
+        // vs the Core default; other dht knobs must match baseline.
+        assert_eq!(config.dht.max_store_bytes, Some(128_000_000));
+        assert_eq!(config.dht.max_store_entries, 8_000);
+        assert_eq!(
+            config.dht.republish_interval_secs, baseline.dht.republish_interval_secs,
+            "mobile must not touch unrelated [dht] knobs"
+        );
+        assert_eq!(config.dht.participate, baseline.dht.participate);
+        assert_eq!(
+            config.dht.per_origin_max_bytes,
+            baseline.dht.per_origin_max_bytes
+        );
         assert_eq!(
             config.bootstrap_peers, baseline.bootstrap_peers,
             "mobile must not touch [[bootstrap_peers]]"

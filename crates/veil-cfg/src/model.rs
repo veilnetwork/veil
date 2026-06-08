@@ -1959,23 +1959,30 @@ pub struct DhtConfig {
     /// value triggers eviction of the oldest entries (cold tier first,
     /// then hot demoted-and-evicted) until the new value fits.  If
     /// the new value alone exceeds the cap, it is refused outright.
-    /// `None` (default) disables the byte cap — only [`max_store_entries`]
-    /// limits memory, and worst-case is `entries × MAX_DHT_VALUE_BYTES`
-    /// (= 16 KiB).  Audit batch 2026-05-23: closes the "count-cap doesn't
-    /// bound memory if values approach `MAX_DHT_VALUE_BYTES`" gap.
+    /// **Default `Some(400 MB)`** — a Core-node baseline that hard-bounds DHT
+    /// store memory (matches the 25k × 16 KiB entry-cap worst case, keeping
+    /// total node memory comfortably under ~512 MB). To RAISE the ceiling, set
+    /// a larger value in `[dht]` (e.g. `4_000_000_000` for a dedicated seed).
+    /// Because the field defaults to `Some(..)` and TOML has no null, omitting
+    /// the key yields this default rather than "no cap" — the byte ceiling is
+    /// always present via config (raise it, don't remove it).
+    /// Audit batch 2026-05-23: closes the "count-cap doesn't bound memory if
+    /// values approach `MAX_DHT_VALUE_BYTES`" gap.
     ///
-    /// Recommended profiles:
-    /// * **Leaf clients**: `None` (`max_store_entries = 0` already
-    ///   suppresses storage).
-    /// * **Core nodes**: `Some(400_000_000)` (≈ 400 MB — matches the
-    ///   current entry-cap-based 25k × 16 KiB worst case directly).
+    /// Recommended profiles (all overridable in `[dht]`):
+    /// * **Leaf clients**: `Some(128_000_000)` (≈ 128 MB — set by the `mobile`
+    ///   config profile; budget phones).
+    /// * **Core nodes**: `Some(400_000_000)` (≈ 400 MB — this default).
     /// * **Dedicated DHT seeds**: `Some(4_000_000_000)` (≈ 4 GB — leaves
     ///   plenty of room for 250k entries close to `MAX_DHT_VALUE_BYTES`).
     ///
     /// RocksDB backend: the byte total is tracked best-effort because
     /// RocksDB evicts via background compaction; operators relying on
     /// hard byte limits should size `max_store_entries` conservatively.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "DhtConfig::default_max_store_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_store_bytes: Option<u64>,
 
     /// Per-origin byte budget (Phase 11e).  When set, a STORE whose signer
@@ -2075,6 +2082,14 @@ impl DhtConfig {
         25_000
     }
 
+    /// Core-node baseline: ~400 MB hard byte cap on the DHT store, so total
+    /// node memory stays comfortably under ~512 MB. Matches the 25k-entry ×
+    /// 16 KiB worst case. The `mobile` profile lowers this to ~128 MB; all
+    /// values are overridable via `[dht] max_store_bytes`.
+    fn default_max_store_bytes() -> Option<u64> {
+        Some(400_000_000)
+    }
+
     fn default_transport_announcements_persist_interval_secs() -> u64 {
         120
     }
@@ -2140,7 +2155,7 @@ impl Default for DhtConfig {
             transport_announcements_persist_interval_secs:
                 Self::default_transport_announcements_persist_interval_secs(),
             max_store_entries: Self::default_max_store_entries(),
-            max_store_bytes: None,
+            max_store_bytes: Self::default_max_store_bytes(),
             per_origin_max_bytes: None,
             shard_filtering: false,
             allow_unsigned_store: Self::default_allow_unsigned_store(),
@@ -4998,8 +5013,13 @@ mod config_knobs_tests {
             transport_announcements_persist_interval_secs: DhtConfig::default()
                 .transport_announcements_persist_interval_secs,
             max_store_entries: DhtConfig::default().max_store_entries,
-            max_store_bytes: None,
-            per_origin_max_bytes: None,
+            // Explicit non-default values: `max_store_bytes` now defaults to
+            // Some(400 MB) and is `skip_serializing_if = is_none`, so an
+            // explicit `None` would serialize to absent and deserialize back to
+            // the default — not round-trippable. Use concrete values so the
+            // roundtrip genuinely exercises both byte caps.
+            max_store_bytes: Some(256_000_000),
+            per_origin_max_bytes: Some(65_536),
             shard_filtering: false,
             allow_unsigned_store: false,
         };
@@ -5009,6 +5029,26 @@ mod config_knobs_tests {
         let json = serde_json::to_string(&custom).unwrap();
         let back: DhtConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, custom);
+    }
+
+    #[test]
+    fn dht_default_byte_cap_is_core_baseline() {
+        // Core baseline: ~400 MB byte cap by default, keeping node memory
+        // under ~512 MB. The named serde default must also apply when the key
+        // is absent from a present `[dht]` table (not fall back to None).
+        assert_eq!(DhtConfig::default().max_store_bytes, Some(400_000_000));
+        let partial: DhtConfig = toml::from_str("participate = true\n").unwrap();
+        assert_eq!(
+            partial.max_store_bytes,
+            Some(400_000_000),
+            "omitting max_store_bytes must yield the Core default, not None"
+        );
+        // And a whole config with no [dht] section at all gets the default.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.dht.max_store_bytes, Some(400_000_000));
+        // Operator override still wins.
+        let over: DhtConfig = toml::from_str("max_store_bytes = 4000000000\n").unwrap();
+        assert_eq!(over.max_store_bytes, Some(4_000_000_000));
     }
 
     /// Config with all-custom routing/session/dht sections serialises and
