@@ -184,22 +184,36 @@ async fn run(ctx: MissHandlerCtx) {
                     if let Some(m) = &metrics {
                         m.inc_dht_fallback_triggered();
                     }
-                    let resolved = fallback.try_resolve_and_dial(dst, priority).await;
-                    if resolved {
-                        // Iterative walk + dial succeeded; route_cache may
-                        // already have a hop OR the dial-handshake will
-                        // populate it shortly. Wait one more backoff round.
-                        found = wait_for_route(
+                    let oneshot_ok = fallback.try_resolve_and_dial(dst, priority).await;
+                    // Re-check the route cache REGARDLESS of the oneshot result.
+                    // `oneshot_ok` only reflects whether our RecursiveResponse
+                    // oneshot fired; but the dispatcher ALSO seeds candidate
+                    // next-hops into route_cache from PARTIAL recursive responses
+                    // that arrive along the path (see DhtRouteFallback docs). So
+                    // a route can recover even when the oneshot timed out.
+                    // Counting `resolved`/`miss` off the oneshot (as before)
+                    // under-counted real recoveries and mislabeled them as
+                    // partitions. Tie the outcome to whether a route actually
+                    // appeared instead. On oneshot success, give the dial-
+                    // handshake a brief window to land; on oneshot miss, any seed
+                    // already arrived during the timeout, so an immediate check
+                    // adds no latency to the (already-slow) miss path.
+                    found = if oneshot_ok {
+                        wait_for_route(
                             &dst, &route_cache, &route_updated, route_request_backoff_ms,
-                        ).await;
+                        ).await
+                    } else {
+                        rlock!(route_cache).lookup(&dst).is_some()
+                    };
+                    if found {
                         if let Some(m) = &metrics {
                             m.inc_dht_fallback_resolved();
                         }
                         logger.info(
                             "route.dht_fallback.resolved",
                             &format!(
-                                "target={} cache_hit={}",
-                                hex_short_8(&dst), found
+                                "target={} oneshot={} cache_seeded={}",
+                                hex_short_8(&dst), oneshot_ok, !oneshot_ok
                             ),
                         );
                     } else {
@@ -208,7 +222,7 @@ async fn run(ctx: MissHandlerCtx) {
                         }
                         logger.info(
                             "route.dht_fallback.miss",
-                            &format!("target={}", hex_short_8(&dst)),
+                            &format!("target={} oneshot={}", hex_short_8(&dst), oneshot_ok),
                         );
                     }
                 }
@@ -284,4 +298,165 @@ async fn wait_for_route(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct MockMetrics {
+        triggered: AtomicU64,
+        resolved: AtomicU64,
+        miss: AtomicU64,
+        reach_success: AtomicU64,
+        reach_fail: AtomicU64,
+    }
+    impl RoutingMetrics for MockMetrics {
+        fn inc_discovery_triggered(&self) {}
+        fn inc_route_recovery(&self) {}
+        fn inc_dht_fallback_triggered(&self) {
+            self.triggered.fetch_add(1, Ordering::Relaxed);
+        }
+        fn inc_dht_fallback_resolved(&self) {
+            self.resolved.fetch_add(1, Ordering::Relaxed);
+        }
+        fn inc_dht_fallback_miss(&self) {
+            self.miss.fetch_add(1, Ordering::Relaxed);
+        }
+        fn record_reachability_event(&self, success: bool) -> f64 {
+            if success {
+                self.reach_success.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.reach_fail.fetch_add(1, Ordering::Relaxed);
+            }
+            1.0
+        }
+    }
+
+    struct NoopLogger;
+    impl RoutingLogger for NoopLogger {
+        fn warn(&self, _: &str, _: &str) {}
+    }
+
+    struct NoopBroadcaster;
+    impl FrameBroadcaster for NoopBroadcaster {
+        fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+            true
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            Vec::new()
+        }
+    }
+
+    /// Fallback whose oneshot ALWAYS "misses" (returns false, simulating a
+    /// RecursiveResponse timeout) but, when `seed` is set, populates the
+    /// route_cache during the call — simulating the dispatcher seeding a
+    /// candidate next-hop from PARTIAL recursive responses along the path.
+    struct SeedingFallback {
+        route_cache: Arc<RwLock<RouteCache>>,
+        seed: bool,
+    }
+    impl IterativeDhtFallback for SeedingFallback {
+        fn try_resolve_and_dial<'a>(
+            &'a self,
+            target: [u8; 32],
+            _priority: u8,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            let cache = Arc::clone(&self.route_cache);
+            let seed = self.seed;
+            Box::pin(async move {
+                if seed {
+                    cache.write().unwrap().insert(target, [0xAA; 32], 50_000, 2);
+                }
+                false // oneshot timed out regardless
+            })
+        }
+    }
+
+    async fn run_one_miss(seed: bool) -> Arc<MockMetrics> {
+        let route_cache = Arc::new(RwLock::new(RouteCache::new(Duration::from_secs(60))));
+        let metrics = Arc::new(MockMetrics::default());
+        let (tx, rx) = mpsc::channel(8);
+        let (sh_tx, sh_rx) = watch::channel(false);
+        let ctx = MissHandlerCtx {
+            shutdown_rx: sh_rx,
+            rx,
+            broadcaster: Arc::new(NoopBroadcaster),
+            route_cache: Arc::clone(&route_cache),
+            route_updated: Arc::new(Notify::new()),
+            local_node_id: [0u8; 32],
+            signing_key: None,
+            metrics: Some(metrics.clone() as Arc<dyn RoutingMetrics>),
+            logger: Arc::new(NoopLogger),
+            // tiny backoffs so the initial RouteRequest wait exhausts fast
+            route_request_backoff_ms: [1, 1, 1],
+            partition_threshold: 0.5,
+            iterative_dht_fallback: Some(Arc::new(SeedingFallback {
+                route_cache: Arc::clone(&route_cache),
+                seed,
+            })),
+        };
+        let handle = spawn(ctx);
+        tx.send(([0x11u8; 32], 1)).await.unwrap();
+        // Poll until the fallback outcome lands.
+        for _ in 0..500 {
+            if metrics.triggered.load(Ordering::Relaxed) > 0
+                && metrics.resolved.load(Ordering::Relaxed) + metrics.miss.load(Ordering::Relaxed)
+                    > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let _ = sh_tx.send(true);
+        let _ = handle.await;
+        metrics
+    }
+
+    #[tokio::test]
+    async fn cache_seeded_recovery_counts_as_resolved_not_miss() {
+        // Oneshot misses, but the cache gets seeded → the route IS recovered.
+        // The fix: count this as `resolved` (not `miss`), and DON'T record a
+        // partition event.
+        let m = run_one_miss(true).await;
+        assert_eq!(
+            m.triggered.load(Ordering::Relaxed),
+            1,
+            "fallback must trigger"
+        );
+        assert_eq!(
+            m.resolved.load(Ordering::Relaxed),
+            1,
+            "cache-seeded recovery must count as resolved"
+        );
+        assert_eq!(m.miss.load(Ordering::Relaxed), 0, "must NOT count as miss");
+        assert_eq!(
+            m.reach_fail.load(Ordering::Relaxed),
+            0,
+            "a recovered route must NOT record a partition event"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_miss_counts_as_miss_and_partition() {
+        // Oneshot misses AND no cache seed → route still absent → genuine miss
+        // + partition event.
+        let m = run_one_miss(false).await;
+        assert_eq!(m.triggered.load(Ordering::Relaxed), 1);
+        assert_eq!(m.resolved.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            m.miss.load(Ordering::Relaxed),
+            1,
+            "hard miss must count as miss"
+        );
+        assert!(
+            m.reach_fail.load(Ordering::Relaxed) >= 1,
+            "hard miss must record a partition/reachability-failure event"
+        );
+    }
 }
