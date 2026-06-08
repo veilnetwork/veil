@@ -112,6 +112,7 @@ impl NodeRuntime {
                 config.routing.dht_fallback_backpressure_threshold_pct,
                 config.routing.dht_fallback_adaptive,
                 config.routing.dht_fallback_priority_mult,
+                config.routing.dht_fallback_enabled,
             ),
             S::Bootstrap => self.spawn_bootstrap_task(config),
             S::BootstrapWatchdog => self.spawn_bootstrap_watchdog_task(config),

@@ -711,6 +711,7 @@ impl NodeRuntime {
     /// on route discovery success the handler used to drain a
     /// mailbox for that destination; with mailbox removed it now simply
     /// signals route_updated and the application layer retries delivery.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_route_miss_handler(
         &mut self,
         route_request_backoff_ms: [u64; 3],
@@ -719,6 +720,7 @@ impl NodeRuntime {
         dht_fallback_backpressure_threshold_pct: u8,
         dht_fallback_adaptive: bool,
         dht_fallback_priority_mult: [u16; 2],
+        dht_fallback_enabled: bool,
     ) {
         // a: extracted to `node/routing/miss_handler.rs`.
         let Some(shutdown_tx) = &self.shutdown_tx else {
@@ -753,18 +755,24 @@ impl NodeRuntime {
             logger,
             route_request_backoff_ms,
             partition_threshold,
-            // wire the iterative-DHT fallback so
-            // that after RouteRequest flood retries are exhausted we run a
-            // Kademlia walk + direct dial. Closes the > 16-hop reach gap
-            // exposed by the 20-node linear chain test (long-chain
-            // reach extension).
-            iterative_dht_fallback: Some(Arc::new(crate::dht_fallback::DhtRouteFallback::new(
-                self.access(),
-                dht_fallback_timeout_ms,
-                dht_fallback_backpressure_threshold_pct,
-                dht_fallback_adaptive,
-                dht_fallback_priority_mult,
-            ))),
+            // wire the iterative-DHT fallback so that after RouteRequest flood
+            // retries are exhausted we fire a RecursiveQuery(FIND_NODE) to seed
+            // route_cache (does NOT dial — see dht_fallback.rs module docs).
+            // `dht_fallback_enabled = false` unwires it entirely: the
+            // miss-handler then records the partition and drops, exactly the
+            // pre-fallback behaviour. The always-on recursive-relay, which
+            // carries the actual cross-topology delivery, is unaffected.
+            iterative_dht_fallback: if dht_fallback_enabled {
+                Some(Arc::new(crate::dht_fallback::DhtRouteFallback::new(
+                    self.access(),
+                    dht_fallback_timeout_ms,
+                    dht_fallback_backpressure_threshold_pct,
+                    dht_fallback_adaptive,
+                    dht_fallback_priority_mult,
+                )))
+            } else {
+                None
+            },
         };
         let handle = veil_routing::miss_handler::spawn(ctx);
         lock_tasks(&self.tasks).sessions.push(handle);
