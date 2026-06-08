@@ -2274,6 +2274,16 @@ pub struct SessionConfig {
     #[serde(default = "SessionConfig::default_max_concurrent")]
     pub max_concurrent: usize,
 
+    /// Transient referral-session headroom above `max_concurrent`. A node at
+    /// its data ceiling still accepts a connection into this many EXTRA slots
+    /// as a short-lived referral session: it hands the would-be client a
+    /// peer-gossip sample of freer nodes, then closes (~20 s) so the slot
+    /// frees. Keeps the per-node data cap effectively hard while never
+    /// stranding a joiner. Default 32; size to expected concurrent referral
+    /// churn. Override as `[session] referral_headroom = N`.
+    #[serde(default = "SessionConfig::default_referral_headroom")]
+    pub referral_headroom: usize,
+
     /// Maximum number of inbound sessions accepted from a single IP (default 32).
     /// Set to `0` to disable the check — useful in sim/devnet where many nodes
     /// share `127.0.0.1`.
@@ -2419,6 +2429,9 @@ impl SessionConfig {
         // tune for their hardware class.
         1000
     }
+    fn default_referral_headroom() -> usize {
+        32
+    }
     fn default_max_per_ip() -> usize {
         32
     }
@@ -2493,6 +2506,7 @@ impl SessionConfig {
         self.keepalive_interval_secs == Self::default_keepalive_interval_secs()
             && self.idle_timeout_secs == Self::default_idle_timeout_secs()
             && self.max_concurrent == Self::default_max_concurrent()
+            && self.referral_headroom == Self::default_referral_headroom()
             && self.max_per_ip == Self::default_max_per_ip()
             && self.max_pending_responses == Self::default_max_pending_responses()
             && self.pending_response_ttl_ms == Self::default_pending_response_ttl_ms()
@@ -2530,6 +2544,7 @@ impl Default for SessionConfig {
             idle_timeout_secs: Self::default_idle_timeout_secs(),
             max_age_secs: None,
             max_concurrent: Self::default_max_concurrent(),
+            referral_headroom: Self::default_referral_headroom(),
             max_per_ip: Self::default_max_per_ip(),
             max_per_subnet: Self::default_max_per_subnet(),
             max_pending_responses: Self::default_max_pending_responses(),
@@ -4866,6 +4881,7 @@ mod config_knobs_tests {
             idle_timeout_secs: 45,
             max_age_secs: None,
             max_concurrent: SessionConfig::default().max_concurrent,
+            referral_headroom: SessionConfig::default().referral_headroom,
             max_per_ip: SessionConfig::default().max_per_ip,
             max_per_subnet: SessionConfig::default().max_per_subnet,
             max_pending_responses: SessionConfig::default().max_pending_responses,
