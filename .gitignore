@@ -44,3 +44,6 @@ flutter/veil_flutter/example/build/
 /stdin
 /librust_out.rlib
 /doc/
+
+# A/B snapshot CSVs (scripts/ab-dht-fallback-snapshot.sh) — transient testnet data
+ab-data/
