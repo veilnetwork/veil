@@ -33,11 +33,18 @@
 
 set -euo pipefail
 
-TRIPLE="x86_64-unknown-linux-musl"
+TRIPLE="${TRIPLE:-x86_64-unknown-linux-musl}"
 FEATURES="${FEATURES:-rocksdb-cold,tls-boring,production-seeds}"
 
+# Derive cargo/cc/cmake env-var name fragments from the triple so the script
+# works for any linux-musl target (x86_64 via FiloSottile/musl-cross, aarch64
+# via messense/macos-cross-toolchains, ...).
+ARCH="${TRIPLE%%-*}"                       # x86_64 | aarch64
+TRIPLE_US="${TRIPLE//-/_}"                  # lower underscore (CC_/CXX_/AR_/CMAKE_)
+TRIPLE_UC="$(printf '%s' "$TRIPLE_US" | tr '[:lower:]' '[:upper:]')"  # CARGO_TARGET_
+
 command -v "${TRIPLE}-gcc" >/dev/null || {
-  echo "error: ${TRIPLE}-gcc not found — brew install FiloSottile/musl-cross/musl-cross" >&2
+  echo "error: ${TRIPLE}-gcc not found — install the cross toolchain (x86_64: brew install FiloSottile/musl-cross/musl-cross; aarch64: brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl)" >&2
   exit 1
 }
 SYSROOT="$(${TRIPLE}-gcc -print-sysroot)"
@@ -47,7 +54,7 @@ echo "musl sysroot: $SYSROOT"
 TOOLCHAIN_FILE="$(mktemp -t musl-toolchain.XXXXXX.cmake)"
 cat > "$TOOLCHAIN_FILE" <<EOF
 set(CMAKE_SYSTEM_NAME Linux)
-set(CMAKE_SYSTEM_PROCESSOR x86_64)
+set(CMAKE_SYSTEM_PROCESSOR ${ARCH})
 set(CMAKE_C_COMPILER ${TRIPLE}-gcc)
 set(CMAKE_CXX_COMPILER ${TRIPLE}-g++)
 set(CMAKE_AR ${TRIPLE}-ar)
@@ -62,12 +69,12 @@ trap 'rm -f "$TOOLCHAIN_FILE"' EXIT
 # Wipe any stale btls-sys CMake configure that may pin host -arch flags.
 rm -rf "target/${TRIPLE}"/*/build/btls-sys-* 2>/dev/null || true
 
-export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${TRIPLE}-gcc"
-export CC_x86_64_unknown_linux_musl="${TRIPLE}-gcc"
-export CXX_x86_64_unknown_linux_musl="${TRIPLE}-g++"
-export AR_x86_64_unknown_linux_musl="${TRIPLE}-ar"
-export BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_musl="--sysroot=${SYSROOT} --target=${TRIPLE}"
-export CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl="$TOOLCHAIN_FILE"
+export "CARGO_TARGET_${TRIPLE_UC}_LINKER=${TRIPLE}-gcc"
+export "CC_${TRIPLE_US}=${TRIPLE}-gcc"
+export "CXX_${TRIPLE_US}=${TRIPLE}-g++"
+export "AR_${TRIPLE_US}=${TRIPLE}-ar"
+export "BINDGEN_EXTRA_CLANG_ARGS_${TRIPLE_US}=--sysroot=${SYSROOT} --target=${TRIPLE}"
+export "CMAKE_TOOLCHAIN_FILE_${TRIPLE_US}=$TOOLCHAIN_FILE"
 
 echo "building veil-cli [$FEATURES] for $TRIPLE ..."
 cargo build --release -p veil-cli \

@@ -1,0 +1,64 @@
+listen = [{ id = "0x00000002", transport = "obfs4-tcp://0.0.0.0:5556", advertise = "obfs4-tcp://{{ ansible_host }}:5556" }]
+
+[global]
+runtime_flavor = "multi_thread"
+worker_threads = 1
+admin_socket = "unix:///var/lib/veil/admin.sock"
+logs = "stderr"
+log_level = "info"
+log_format = "text"
+
+{% for bp in veil_bootstrap_peers %}
+[[bootstrap_peers]]
+transport = "{{ bp.transport }}"
+public_key = "{{ bp.public_key }}"
+nonce = "{{ bp.nonce }}"
+algo = "{{ bp.algo }}"
+
+{% endfor %}
+[mobile]
+low_battery_multiplier = 0
+background_keepalive_multiplier = 0
+
+[metrics]
+allow_unauthenticated_remote_metrics = true
+listen = "tcp://0.0.0.0:19999"
+path = "/metrics"
+
+[routing]
+dht_fallback_enabled = true
+dht_fallback_adaptive = true
+cache_persist_path = "/var/lib/veil/route_cache.json"
+rtt_persist_path = "/var/lib/veil/rtt.json"
+vivaldi_persist_path = "/var/lib/veil/vivaldi.json"
+gateway_persist_path = "/var/lib/veil/gateway_list.json"
+peer_pubkeys_persist_path = "/var/lib/veil/peer_pubkeys.json"
+
+[dht]
+routing_persist_path = "/var/lib/veil/dht_routing.json"
+values_persist_path = "/var/lib/veil/dht_values.json"
+
+[ipc]
+enabled = true
+socket_uri = "unix:///var/lib/veil/app.sock"
+
+[transport]
+obfs4_psk_file = "/var/lib/veil/obfs4_psk.b64"
+
+[transport.rotation]
+min_lifetime_secs = 1800
+max_lifetime_secs = 3600
+
+[capacity]
+max_inbound_bandwidth_kbps  = -1
+max_outbound_bandwidth_kbps = -1
+
+[abuse]
+rate_limit_fps   = 200000
+rate_limit_burst = 400000
+
+[hot_standby]
+enabled = true
+
+[pex]
+low_peer_threshold = 7
