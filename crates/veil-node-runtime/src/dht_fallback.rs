@@ -4,10 +4,26 @@
 //! retry budget without finding a route to `target`, this module fires a
 //! `RecursiveQuery(FIND_NODE, target_key=target)` for target and waits for
 //! the signed `RecursiveResponse` to come back. Dispatcher's
-//! `handle_recursive_response` automatically populates `route_cache` from
-//! the returned contacts (routing.rs:2173-2186) and fires `route_updated`;
-//! `miss_handler`'s second `wait_for_route` round picks it up; app-layer
-//! retry uses DELIVERY_FORWARD over the new relay-chain hop.
+//! `handle_recursive_response` populates `route_cache` from the returned
+//! contacts (routing.rs:2409-2424, score 50_000 / hops 2) and fires
+//! `route_updated`; `miss_handler`'s second `wait_for_route` round picks any
+//! seeded hop up.
+//!
+//! ## What this is NOT
+//!
+//! Despite the historical naming, this does **not** resolve a transport URI
+//! or dial the target directly. `FIND_NODE` responses carry node_ids only
+//! (no transports), and the seeded node_ids are *target-proximate* (the
+//! responder's k-closest-to-target) — usable by us only when we already hold
+//! a session to one (`send_to` requires a live session; otherwise the hop is
+//! invalidated on first send, see `delivery.rs`). So in the sparse/relay
+//! topologies this fallback exists for, the seeding rarely yields a directly-
+//! usable route. The actual cross-topology delivery is carried by the
+//! dispatcher's always-on `try_recursive_relay_via_dht` (greedy Kademlia
+//! relay via `find_closest_nodes`), which fires on every route-miss
+//! independent of this module. Treat this fallback as a best-effort
+//! opportunistic seed, not the primary recovery path — and consult the
+//! testnet `dht_fallback_*` metrics before assuming it earns its keep.
 //!
 //! ## — load/timeout tuning (all four sub-slices in one delivery)
 //!
@@ -176,7 +192,7 @@ impl DhtRouteFallback {
 }
 
 impl IterativeDhtFallback for DhtRouteFallback {
-    fn try_resolve_and_dial<'a>(
+    fn try_seed_route_via_find_node<'a>(
         &'a self,
         target: [u8; 32],
         priority: u8,
@@ -226,7 +242,7 @@ impl IterativeDhtFallback for DhtRouteFallback {
 
             // Register the oneshot so dispatcher's response handler can
             // wake us when the signed RecursiveResponse arrives. See
-            // dispatcher/routing.rs:2173-2186 — for FIND_NODE the
+            // dispatcher/routing.rs:2409-2424 — for FIND_NODE the
             // dispatcher inserts each returned 32-byte node_id as a
             // candidate next-hop for `target_key` at score=50_000
             // hops=2. So even if our oneshot times out, the cache
