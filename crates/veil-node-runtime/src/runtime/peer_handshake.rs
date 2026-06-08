@@ -296,15 +296,6 @@ pub fn cache_peer_handshake_state(
     }
 }
 
-/// Small headroom above `max_concurrent` reserved for transient REFERRAL
-/// sessions. A node at its data ceiling still accepts a connection into this
-/// headroom so the on-session-opened peer-gossip can hand the would-be client
-/// a sample of freer nodes to dial — the data cap thus never strands a joiner.
-/// Bounded + small so the per-node session ceiling stays effectively hard;
-/// referral sessions are short-lived (the client migrates once it learns a
-/// freer node and drops the referral).
-const REFERRAL_HEADROOM: usize = 32;
-
 pub async fn register_connection_session(
     runtime: SessionRuntimeContext,
     source: SessionSource,
@@ -701,7 +692,7 @@ pub async fn register_connection_session(
         // client to freer nodes rather than stranding it).
         let at_limit = {
             lock!(runtime.live_sessions).len()
-                >= runtime.defaults.max_concurrent.saturating_add(REFERRAL_HEADROOM)
+                >= runtime.defaults.max_concurrent.saturating_add(runtime.defaults.referral_headroom)
         };
         let remote_nid = *remote_identity.node_id.as_bytes();
         if lock!(runtime.dispatcher.abuse.ban_list).is_banned(&remote_nid) {
@@ -811,7 +802,7 @@ pub async fn register_connection_session(
         // over-limit branch (rollback + shutdown) after the lock scope closes.
         let inserted_count = {
             let mut sessions = lock!(runtime.live_sessions);
-            if sessions.len() >= runtime.defaults.max_concurrent.saturating_add(REFERRAL_HEADROOM) {
+            if sessions.len() >= runtime.defaults.max_concurrent.saturating_add(runtime.defaults.referral_headroom) {
                 None
             } else {
                 sessions.insert(

@@ -891,6 +891,7 @@ impl NodeRuntime {
             config.session.rekey_time_threshold_secs,
             config.session.qos_weights.map(|w| w as u32),
             config.session.max_concurrent,
+            config.session.referral_headroom,
             config.session.max_per_ip,
             // previously frozen — operator could edit the limit
             // in config but `reload` would silently ignore it (admission
