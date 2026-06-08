@@ -226,7 +226,13 @@ pub fn spawn_outbound_peers(
                     }
                     continue;
                 }
-                if !we_keep_outbound {
+                // Bootstrap peers are exempt from the directional-dedup skip:
+                // a bootstrap has no prior knowledge of us and never dials IN,
+                // so the larger-node_id side MUST still initiate or it can
+                // never join. tx_registry mirrors this bypass on both sides.
+                // No glare: once our outbound lands the bootstrap sees it as
+                // inbound and dedups any later dial via the has_session check.
+                if !we_keep_outbound && !peer.bootstrap_only {
                     // Phase E20 policy violation guard: skip dial and
                     // wait for peer-initiated inbound.  Same wake set
                     // as the `has_session` branch — `force_reconnect_

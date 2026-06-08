@@ -728,12 +728,37 @@ pub async fn register_connection_session(
         let remote_nid = *remote_identity.node_id.as_bytes();
         let local_nid = *runtime.identity.local_identity.node_id.as_bytes();
         let new_is_outbound = matches!(source, SessionSource::Outbound(_));
+        // E20 directional-dedup is only sound when BOTH peers may dial each
+        // other (real glare). Bypass it for one-sided connections, otherwise
+        // the larger-node_id side is stranded at zero sessions:
+        //   * outbound to a bootstrap — it has no prior knowledge of us and
+        //     never dials back (observed: any node whose node_id sorted after
+        //     every bootstrap node_id could never join the mesh);
+        //   * inbound from a peer we have no configured entry for — we will
+        //     never dial them, so no glare is possible.
+        let bypass_directional = if new_is_outbound {
+            matched_peer_id
+                .map(|pid| {
+                    lock_state(&runtime.state)
+                        .peers
+                        .get(&pid)
+                        .is_some_and(|e| e.bootstrap_only)
+                })
+                .unwrap_or(false)
+        } else {
+            matched_peer_id.is_none()
+        };
         let reserved_outbox_rx = {
             let mut reg = runtime
                 .session_tx_registry
                 .write()
                 .unwrap_or_else(|p| p.into_inner());
-            reg.try_register_directional(remote_nid, &local_nid, new_is_outbound)
+            reg.try_register_directional(
+                remote_nid,
+                &local_nid,
+                new_is_outbound,
+                bypass_directional,
+            )
         };
         let reserved_outbox_rx = match reserved_outbox_rx {
             Some(rx) => rx,

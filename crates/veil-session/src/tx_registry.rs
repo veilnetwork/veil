@@ -228,6 +228,7 @@ impl SessionTxRegistry {
         peer_id: impl Into<NodeId>,
         local_node_id: &NodeIdBytes,
         new_is_outbound: bool,
+        bypass_directional: bool,
     ) -> Option<mpsc::Receiver<PriorityFrame>> {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
@@ -239,11 +240,18 @@ impl SessionTxRegistry {
         let we_keep_outbound = local_is_smaller;
         let new_matches_policy = we_keep_outbound == new_is_outbound;
 
-        // Policy violation: regardless of existing state, reject.
-        // The peer on the other side will accept the symmetric-direction
-        // session (which IS policy-compliant from their POV), and both
-        // sides converge on the same surviving TCP connection.
-        if !new_matches_policy {
+        // Policy violation: regardless of existing state, reject — UNLESS the
+        // caller flagged this connection as glare-free (`bypass_directional`).
+        // The directional convention assumes BOTH peers independently attempt
+        // the canonical direction; that holds only for mutually-dialing peers.
+        // For one-sided connections — a node dialing a bootstrap that has no
+        // prior knowledge of it, or an inbound from a peer we never dial — the
+        // canonical-direction session never materialises, so enforcing the
+        // policy strands the larger-node_id side at zero sessions (it observed:
+        // any node whose node_id sorted after every bootstrap's node_id could
+        // never join). The caller sets the bypass only in those no-glare cases,
+        // so this cannot reintroduce the dedup storm E20 fixed.
+        if !new_matches_policy && !bypass_directional {
             return None;
         }
 
@@ -550,5 +558,59 @@ mod tests {
         assert_eq!(evicted, 1);
         assert!(!reg.has_session(&peer_a), "older peer A evicted");
         assert!(reg.has_session(&peer_b), "recently-active peer B retained");
+    }
+
+    #[tokio::test]
+    async fn directional_bootstrap_bypass_lets_larger_node_keep_outbound() {
+        // Regression: the directional policy rejects a node's OWN outbound
+        // when its node_id sorts after the peer's (`we_keep_outbound = local <
+        // peer = false`). For a bootstrap — which never dials back — that
+        // stranded every node whose node_id sorted after all bootstrap
+        // node_ids at zero sessions. The `bypass_directional` flag must accept
+        // it.
+        let mut reg = SessionTxRegistry::new();
+        let local = [0xd9u8; 32]; // larger (e.g. node7)
+        let peer = [0xc1u8; 32]; // smaller (e.g. a bootstrap)
+        // Without bypass: policy rejects the larger side's outbound (the bug).
+        assert!(
+            reg.try_register_directional(peer, &local, true, false)
+                .is_none(),
+            "directional policy rejects larger-node_id outbound"
+        );
+        // With bypass (bootstrap dial): accepted. Hold the returned rx so the
+        // channel stays open for the has_session assertion — dropping it would
+        // close the sender and read as no-session.
+        let _rx = reg
+            .try_register_directional(peer, &local, true, true)
+            .expect("bypass lets the larger side keep its outbound to a bootstrap");
+        assert!(reg.has_session(&peer), "accepted session is registered");
+    }
+
+    #[tokio::test]
+    async fn directional_glare_dedup_preserved_without_bypass() {
+        // The E20 glare guard must stay intact when bypass is false: only the
+        // canonical direction (smaller→larger outbound, larger keeps inbound)
+        // is accepted; the symmetric direction is rejected.
+        let smaller = [0x10u8; 32];
+        let larger = [0x90u8; 32];
+
+        let mut reg = SessionTxRegistry::new();
+        assert!(
+            reg.try_register_directional(larger, &smaller, true, false)
+                .is_some(),
+            "canonical smaller→larger outbound accepted"
+        );
+
+        let mut reg2 = SessionTxRegistry::new();
+        assert!(
+            reg2.try_register_directional(smaller, &larger, true, false)
+                .is_none(),
+            "non-canonical larger→smaller outbound rejected (glare dedup)"
+        );
+        assert!(
+            reg2.try_register_directional(smaller, &larger, false, false)
+                .is_some(),
+            "canonical inbound (larger keeps inbound) accepted"
+        );
     }
 }
