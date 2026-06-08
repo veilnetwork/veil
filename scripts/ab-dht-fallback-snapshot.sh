@@ -105,15 +105,16 @@ cmd_diff() {
     {
       h=$2
       ds=$5-a[h,5]; dr=$6-a[h,6]; dm=$7-a[h,7]; di=$8-a[h,8]; dd=$9-a[h,9]
-      dft=$11-a[h,11]; dfr=$12-a[h,12]
-      printf "  %-7s flag %s->%s  sent+%-6d recv+%-6d  route_miss+%-6d rr_init+%-6d rr_deliv+%-5d  fb_trig+%d fb_resolv+%d\n", \
-             h, flagA[h], $4, ds, dr, dm, di, dd, dft, dfr
-      SS+=ds; SR+=dr; SM+=dm; SI+=di; SD+=dd; SFT+=dft; SFR+=dfr
+      dsf=$10-a[h,10]; dwd=$11-a[h,11]; dft=$12-a[h,12]; dfr=$13-a[h,13]
+      printf "  %-7s flag %s->%s  sent+%-5d recv+%-4d  route_miss+%-5d rr_init+%-5d rr_deliv+%-4d  send_fail+%d wire_drop+%d  fb_trig+%d fb_resolv+%d\n", \
+             h, flagA[h], $4, ds, dr, dm, di, dd, dsf, dwd, dft, dfr
+      SS+=ds; SR+=dr; SM+=dm; SI+=di; SD+=dd; SSF+=dsf; SWD+=dwd; SFT+=dft; SFR+=dfr
     }
     END {
-      printf "\n  NETWORK  sent+%d recv+%d  (delivery ratio %.4f)\n", SS, SR, (SS>0?SR/SS:0)
+      printf "\n  NETWORK  chat sent+%d recv+%d  (lines; send sampled 1:100, recv 1:1000)\n", SS, SR
       printf "           route_miss+%d  rr_init+%d  rr_deliv+%d\n", SM, SI, SD
-      printf "           fb_triggered+%d  fb_resolved+%d  <- fallback resolutions over the window\n", SFT, SFR
+      printf "           send_to_failed+%d  session_wire_dropped+%d\n", SSF, SWD
+      printf "           fb_triggered+%d  fb_resolved+%d\n", SFT, SFR
     }
   ' "$fa" "$fb"
 }
