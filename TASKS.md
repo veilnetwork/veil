@@ -508,9 +508,25 @@ setWakeHmacEnvelope → embeds in RendezvousAd
                                                                                                         ) verifies
 ```
 
+**Already shipped daemon-side (status correction 2026-06-08):** the wake-payload
+**minting** is done — `mint_wake_payload` in
+[`service_tasks.rs`](crates/veil-node-runtime/src/runtime/service_tasks.rs)
+decrypts the sealed `WakeHmacKey` envelope, computes the HMAC, and the push
+dispatch path (`build_push_dispatcher` → `FcmDispatcher` / `ApnsDispatcher`,
+or `LogOnlyDispatcher`) fires the sealed FCM/APNs delivery. So minting is NOT
+open work — don't re-implement it.
+
 **Still open (slice 4.4 — separate epic):**
 
-* **Push-relay reference implementation** (~800 LoC new binary, deferred to operator-side epic).  Operator-run service: subscribes to a receiver's mailbox events, decrypts `wake_hmac_envelope` once-per-receiver, computes HMAC tag using `veil_crypto::wake_hmac::compute_wake_hmac` (already shipped), packages payload via `encode_wake_payload` (already shipped), fires sealed FCM/APNs delivery.  Open architectural question: centralized per-app relay vs multi-relay for anti-takedown?  Does not block 1.0 — receiver-side and sender-side fully wired; turning the chain on requires deploying the relay binary, which is an operator-side concern.
+* **Automatic per-relay wake-HMAC key distribution / onboarding** — the REAL
+  remaining gap. The receiver→relay handoff of the sealed `wake_hmac_envelope`
+  exists end-to-end (RendezvousAd v4 → IPC `set_wake_hmac_envelope` → mailbox
+  PUT trailer 3), but a receiver must currently opt in by setting the envelope;
+  there is no automatic provisioning flow. Open architectural question:
+  centralized per-app relay vs multi-relay for anti-takedown. Does not block
+  1.0 — receiver-side, sender-side, and daemon-side minting are fully wired;
+  turning the chain on for end-users is an onboarding/operator-deployment
+  concern, not missing crypto/runtime code.
 * **Platform-secure persistence for wake-HMAC key** (orthogonal to the FFI surface).  Receivers should persist the 32-byte raw key through iOS Keychain (alongside the APNs token shipped in audit batch 2026-05-23) / Android Keystore vs SharedPreferences.  Pure plugin-level slice when adopted.
 * **FFI surface for `mailbox_put` wake_hmac_envelope** — current FFI passes `None`; extending `veil_mailbox_put` signature + Dart wrapper bump is a small follow-up.
 * **Custom notification UI** (action buttons "Reply" / "Mark read") via iOS notification-extensions / Android NotificationStyle.
