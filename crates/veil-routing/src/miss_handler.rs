@@ -39,27 +39,38 @@ use crate::{RoutingLogger, RoutingMetrics};
 /// iterative-DHT fallback.
 ///
 /// When the legacy `RouteRequest` flood (TTL=7) exhausts its retries without
-/// finding a route, the miss-handler can optionally invoke this trait to
-/// run a Kademlia-style iterative `find_node_iterative` against the DHT
-/// resolve the target's transport URI, and trigger a direct outbound dial.
-/// This bypasses both `RouteRequest TTL=7` and `MAX_RELAY_HOPS=16` limits —
-/// useful when the topology requires reaching peers > 16 hops away in a
-/// relay chain (adversarial partition / sparse mesh / pathological cases).
+/// finding a route, the miss-handler can optionally invoke this trait to fire
+/// a Kademlia-style `RecursiveQuery(FIND_NODE)` for the target. The dispatcher
+/// seeds the returned contacts into `route_cache` as candidate next-hops; the
+/// miss-handler's second `wait_for_route` round picks any of them up.
 ///
-/// `veil-routing` defines only the trait k keep crate-graph clean
+/// NOTE — this does **not** resolve a transport or dial the target directly
+/// (despite this fallback's history). `FIND_NODE` responses carry node_ids
+/// only, no transports, and the seeded node_ids are *target-proximate* (the
+/// responder's k-closest-to-target), usable by us only when we already hold a
+/// session to one. In the sparse/relay topologies this fallback exists for,
+/// the actual cross-topology delivery is done by the dispatcher's always-on
+/// `try_recursive_relay_via_dht` (greedy Kademlia relay), which fires on every
+/// route-miss independent of this trait. Treat the seeding here as a best-
+/// effort opportunistic boost, not the primary recovery path.
+///
+/// `veil-routing` defines only the trait to keep the crate-graph clean
 /// (the concrete impl lives in veilcore where veil-dht is reachable).
 /// `None` disables the fallback and preserves pre-refactor behaviour exactly.
 pub trait IterativeDhtFallback: Send + Sync {
-    /// Attempt to resolve `target` via iterative DHT walk + dial. Returns
-    /// `true` once the route_cache shows a hop (either direct session
-    /// established or relay-able next-hop learned), `false` on hard miss
-    /// (target absent from DHT, all dials failed, walker timeout, etc.).
+    /// Fire a `RecursiveQuery(FIND_NODE)` for `target` to seed `route_cache`
+    /// with candidate next-hops. Returns `true` if the signed
+    /// `RecursiveResponse` oneshot fired within the timeout, `false` otherwise
+    /// (timeout, backpressure skip, or no session peers to query). The bool is
+    /// only a hint: the dispatcher also seeds the cache from PARTIAL responses
+    /// along the path, so the caller re-checks `route_cache` regardless (see
+    /// the impl's module docs and the call site in `spawn`).
     ///
-    /// `priority` is the original message's traffic-class byte (
-    /// — INTERACTIVE / BACKGROUND / etc.). Impl scales the timeout by
+    /// `priority` is the original message's traffic-class byte
+    /// (INTERACTIVE / BACKGROUND / etc.). The impl scales the timeout by
     /// `dht_fallback_priority_mult` so interactive flows fast-fail and
     /// background flows tolerate longer DHT walks.
-    fn try_resolve_and_dial<'a>(
+    fn try_seed_route_via_find_node<'a>(
         &'a self,
         target: [u8; 32],
         priority: u8,
@@ -184,7 +195,7 @@ async fn run(ctx: MissHandlerCtx) {
                     if let Some(m) = &metrics {
                         m.inc_dht_fallback_triggered();
                     }
-                    let oneshot_ok = fallback.try_resolve_and_dial(dst, priority).await;
+                    let oneshot_ok = fallback.try_seed_route_via_find_node(dst, priority).await;
                     // Re-check the route cache REGARDLESS of the oneshot result.
                     // `oneshot_ok` only reflects whether our RecursiveResponse
                     // oneshot fired; but the dispatcher ALSO seeds candidate
@@ -194,8 +205,8 @@ async fn run(ctx: MissHandlerCtx) {
                     // Counting `resolved`/`miss` off the oneshot (as before)
                     // under-counted real recoveries and mislabeled them as
                     // partitions. Tie the outcome to whether a route actually
-                    // appeared instead. On oneshot success, give the dial-
-                    // handshake a brief window to land; on oneshot miss, any seed
+                    // appeared instead. On oneshot success, give the seeded
+                    // route a brief window to settle; on oneshot miss, any seed
                     // already arrived during the timeout, so an immediate check
                     // adds no latency to the (already-slow) miss path.
                     found = if oneshot_ok {
@@ -362,7 +373,7 @@ mod tests {
         seed: bool,
     }
     impl IterativeDhtFallback for SeedingFallback {
-        fn try_resolve_and_dial<'a>(
+        fn try_seed_route_via_find_node<'a>(
             &'a self,
             target: [u8; 32],
             _priority: u8,

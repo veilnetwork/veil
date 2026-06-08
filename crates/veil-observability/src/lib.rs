@@ -117,17 +117,19 @@ pub struct NodeMetrics {
     route_miss_total: Arc<AtomicU64>,
     discovery_triggered_total: Arc<AtomicU64>,
     // ── Iterative-DHT route-discovery fallback ───────────────
-    /// Count of `try_resolve_and_dial` invocations — fires whenever the
+    /// Count of `try_seed_route_via_find_node` invocations — fires whenever the
     /// legacy `RouteRequest` flood (TTL=7) exhausts retries without finding a
     /// route and we fall through to the relay-aware `RecursiveQuery(FIND_NODE)`
     /// path. High value indicates the network's diameter exceeds 7 hops
     /// regularly (sparse mesh / partition / pathological topology).
     dht_fallback_triggered_total: Arc<AtomicU64>,
-    /// Count of fallbacks that succeeded — `RecursiveResponse` arrived
-    /// within the `RECURSIVE_TIMEOUT` budget and dispatcher populated
-    /// `route_cache`. Ratio `resolved / triggered` is the **partition
-    /// health signal**: > 0.5 = healthy mesh, < 0.2 = fragmentation OR
-    /// CPU starvation on the response path.
+    /// Count of fallbacks where a usable route appeared in `route_cache`
+    /// after the `RecursiveQuery(FIND_NODE)` — whether via the oneshot
+    /// response or a partial cache-seed along the path (see `miss_handler`).
+    /// This is opportunistic: most cross-topology delivery is carried by the
+    /// dispatcher's always-on recursive-relay, which is NOT counted here, so a
+    /// low `resolved / triggered` ratio is EXPECTED in sparse/relay meshes and
+    /// is not by itself a partition signal.
     dht_fallback_resolved_total: Arc<AtomicU64>,
     /// Count of fallbacks that hit the `RECURSIVE_TIMEOUT` (10 s) without
     /// a response. High value points to either (a) network partition
