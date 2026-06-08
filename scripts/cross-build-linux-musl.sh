@@ -27,13 +27,14 @@
 #    step finds stddef.h etc. for the musl target.
 #
 # Defaults match the production binary: rocksdb-cold + tls-boring +
-# production-seeds. Override features by editing FEATURES below or passing
-# `--no-default-features --features ...` as extra args.
+# production-seeds. Override features via the FEATURES env var, e.g. a testnet
+# build that takes bootstraps from node.toml instead of baked-in seeds:
+#   FEATURES=rocksdb-cold,tls-boring,allow-empty-seeds scripts/cross-build-linux-musl.sh
 
 set -euo pipefail
 
 TRIPLE="x86_64-unknown-linux-musl"
-FEATURES="rocksdb-cold,tls-boring,production-seeds"
+FEATURES="${FEATURES:-rocksdb-cold,tls-boring,production-seeds}"
 
 command -v "${TRIPLE}-gcc" >/dev/null || {
   echo "error: ${TRIPLE}-gcc not found — brew install FiloSottile/musl-cross/musl-cross" >&2
