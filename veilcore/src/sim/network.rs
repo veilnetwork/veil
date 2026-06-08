@@ -590,6 +590,11 @@ pub struct SimNetworkBuilder {
     seed: u64,
     /// Whether to record topology events in an event log.
     recording: bool,
+    /// when `true`, each node enables in-memory metrics counters (with an
+    /// ephemeral `tcp://127.0.0.1:0` exporter bind so there's no port conflict
+    /// across nodes), so tests can read `runtime.metrics_snapshot()`. Default
+    /// `false` — most scenarios assert on sessions/routes, not counters.
+    with_metrics: bool,
     /// when `true`, each node additionally gets its
     /// own on-disk sovereign identity (via `create_identity`) in
     /// a per-node veil directory, so `NodeRuntime::start`
@@ -670,6 +675,14 @@ impl SimNetworkBuilder {
     /// node. Useful for tests that need short idle timeouts.
     pub fn session(mut self, cfg: SessionConfig) -> Self {
         self.session_config = Some(cfg);
+        self
+    }
+
+    /// Enable in-memory metrics counters on every node (ephemeral exporter
+    /// bind, no port conflict), so tests can assert on
+    /// `runtime.metrics_snapshot()`. Off by default.
+    pub fn with_metrics(mut self) -> Self {
+        self.with_metrics = true;
         self
     }
 
@@ -770,6 +783,17 @@ impl SimNetworkBuilder {
             }
             if let Some(ref dc) = self.dht_config {
                 config.dht = dc.clone();
+            }
+            if self.with_metrics {
+                // Ephemeral bind (port 0) → each node gets a distinct port, no
+                // conflict; `metrics_from_config` builds the in-memory counters
+                // either way, which is what `metrics_snapshot()` reads.
+                config.metrics = Some(crate::cfg::MetricsConfig {
+                    listen: "tcp://127.0.0.1:0".to_owned(),
+                    path: Some("/metrics".to_owned()),
+                    auth_token: None,
+                    allow_unauthenticated_remote_metrics: false,
+                });
             }
             // per-node anonymity-relay opt-in.
             if self

@@ -611,6 +611,106 @@ mod tests {
         net.stop().await;
     }
 
+    // ── iterative-DHT fallback: real end-to-end trigger + settle ────────────
+    //
+    // Deterministic exercise of the route-miss → RouteRequest-exhaust →
+    // iterative-DHT fallback chain that chaos-ban drives (unsuccessfully) on the
+    // live testnet, in a REAL multi-node runtime (the veil-routing unit tests
+    // mock the fallback; this runs the actual `DhtRouteFallback` —
+    // `RecursiveQuery` send, `pending_recursive` registration, priority-scaled
+    // timeout, metric increments — and proves it triggers + settles without
+    // hanging or panicking).
+    //
+    // We inject a miss for a node_id that does NOT exist in the mesh into node
+    // 0's real `route_miss_sender()` (the harness has no app-send-to-node
+    // primitive). No route can ever exist → RouteRequest exhausts → the fallback
+    // fires → its RecursiveQuery finds no terminal node → it settles to `miss`.
+    //
+    // SCOPE NOTE — why this asserts `miss`, not `resolved`: exercising the
+    // RESOLVE path needs a target reachable via the recursive walk but BEYOND
+    // the RouteRequest TTL=7 horizon, i.e. a >7-hop SPARSE (line) topology. The
+    // sim harness can't build that reliably — random identities cause the
+    // documented ~50% pairwise-session-establishment failure (E20 directional
+    // dedup), and a line has no redundancy, so it doesn't converge. The
+    // recursive round-trip the resolve path depends on is separately covered by
+    // the `dht_recursive_get` scenarios; the trigger→outcome accounting is
+    // covered by veil-routing's `miss_handler` unit tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg_attr(
+        not(feature = "slow-sim-tests"),
+        ignore = "mesh convergence + fallback timeout ~15-30s; run via `--features slow-sim-tests`"
+    )]
+    async fn dht_fallback_triggers_and_settles_end_to_end() {
+        let n = 4;
+        let mut net = SimNetwork::builder()
+            .nodes(n)
+            .role(NodeRole::Core)
+            .seed(7)
+            .with_metrics() // needed to read fallback counters via metrics_snapshot()
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        // The fallback only needs node 0 to have ≥1 session peer to send its
+        // RecursiveQuery to. We deliberately DON'T require full-mesh
+        // convergence — the harness's directional-dedup pairwise failures make
+        // that flaky — only that node 0 has a peer.
+        assert!(
+            net.node(0).wait_sessions(1, Duration::from_secs(20)).await,
+            "node 0 must have at least one session peer to drive the recursive query"
+        );
+
+        // A target that exists in NO node's keyspace/sessions → unresolvable.
+        let target = [0x5au8; 32];
+        let before = net
+            .node(0)
+            .runtime
+            .metrics_snapshot()
+            .map(|s| s.dht_fallback_triggered_total)
+            .unwrap_or(0);
+
+        // INTERACTIVE priority (×50 mult → ~5s budget) keeps the timeout short.
+        const INTERACTIVE: u8 = 1;
+        let tx = net
+            .node(0)
+            .runtime
+            .route_miss_sender()
+            .expect("route_miss_sender must be wired once services are up");
+        tx.send((target, INTERACTIVE))
+            .await
+            .expect("inject route miss");
+
+        // Poll: triggered appears after the ~3.5s RouteRequest backoff; the miss
+        // after the ~5s fallback timeout settles.
+        let (mut triggered, mut resolved, mut miss) = (0u64, 0u64, 0u64);
+        for _ in 0..120 {
+            if let Some(s) = net.node(0).runtime.metrics_snapshot() {
+                triggered = s.dht_fallback_triggered_total;
+                resolved = s.dht_fallback_resolved_total;
+                miss = s.dht_fallback_miss_total;
+                if triggered > before && (resolved + miss) >= 1 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        eprintln!(
+            "[fallback-sim] triggered={triggered} (was {before}) resolved={resolved} miss={miss}"
+        );
+
+        // The real fallback chain fired end-to-end for an unreachable target...
+        assert!(
+            triggered > before,
+            "iterative-DHT fallback must trigger (triggered={triggered}, was {before})"
+        );
+        // ...and settled cleanly to a miss (no hang/panic; correct accounting).
+        assert!(
+            miss >= 1,
+            "unresolvable target must settle to a miss (miss={miss} resolved={resolved})"
+        );
+
+        net.stop().await;
+    }
+
     // ── 274.2: Churn convergence with event-driven sync ──────────────────────
 
     /// 12-node ring: disconnect 3 nodes, reconnect, verify reconvergence.
