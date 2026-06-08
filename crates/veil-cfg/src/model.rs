@@ -1308,6 +1308,17 @@ pub struct RoutingConfig {
     #[serde(default = "RoutingConfig::default_dht_fallback_priority_mult")]
     pub dht_fallback_priority_mult: [u16; 2],
 
+    /// Master switch for the iterative-DHT route-discovery fallback
+    /// (`try_seed_route_via_find_node`). Default `true`. When `false` the
+    /// miss-handler records the partition event and drops the frame after the
+    /// `RouteRequest` flood exhausts — exactly the pre-fallback behaviour. The
+    /// always-on `try_recursive_relay_via_dht` greedy relay is unaffected (it
+    /// carries the actual cross-topology delivery). Exposed for operators and
+    /// for fallback-on/off A/B measurement: in practice the FIND_NODE fallback
+    /// resolves ~0% of route-misses while recursive-relay handles ~100%.
+    #[serde(default = "RoutingConfig::default_dht_fallback_enabled")]
+    pub dht_fallback_enabled: bool,
+
     /// Minimum `network_reachability_score` (0.0–1.0) before logging a
     /// partition warning. Default: 0.2 (warn when ≥ 80 % of recent route
     /// attempts fail without recovery). Set to 0.0 to disable.
@@ -1622,6 +1633,9 @@ impl RoutingConfig {
     fn default_dht_fallback_priority_mult() -> [u16; 2] {
         [50, 200]
     }
+    fn default_dht_fallback_enabled() -> bool {
+        true
+    }
     fn default_partition_score_threshold() -> f64 {
         0.2
     }
@@ -1744,6 +1758,7 @@ impl RoutingConfig {
                 == Self::default_dht_fallback_backpressure_threshold_pct()
             && !self.dht_fallback_adaptive
             && self.dht_fallback_priority_mult == Self::default_dht_fallback_priority_mult()
+            && self.dht_fallback_enabled
             && (self.partition_score_threshold - Self::default_partition_score_threshold()).abs()
                 < f64::EPSILON
             && self.route_seen_capacity == Self::default_route_seen_capacity()
@@ -1798,6 +1813,7 @@ impl Default for RoutingConfig {
                 Self::default_dht_fallback_backpressure_threshold_pct(),
             dht_fallback_adaptive: false,
             dht_fallback_priority_mult: Self::default_dht_fallback_priority_mult(),
+            dht_fallback_enabled: Self::default_dht_fallback_enabled(),
             partition_score_threshold: Self::default_partition_score_threshold(),
             route_seen_capacity: Self::default_route_seen_capacity(),
             route_seen_window_secs: Self::default_route_seen_window_secs(),
@@ -4784,6 +4800,7 @@ mod config_knobs_tests {
             dht_fallback_backpressure_threshold_pct: 50,
             dht_fallback_adaptive: true,
             dht_fallback_priority_mult: [40, 250],
+            dht_fallback_enabled: false,
             route_seen_capacity: RoutingConfig::default().route_seen_capacity,
             route_seen_window_secs: RoutingConfig::default().route_seen_window_secs,
             max_gossip_hops: RoutingConfig::default().max_gossip_hops,
