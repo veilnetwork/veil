@@ -129,6 +129,8 @@ impl NodeRuntime {
         // amplification on networks that grow past the bootstrap
         // threshold.
         let dispatcher_adaptive_params_for_tick = Arc::clone(&self.dispatcher.adaptive_params);
+        // Whole-dispatcher handle for the 300 s peer-gossip exchange heartbeat.
+        let dispatcher_for_gossip = Arc::clone(&self.dispatcher);
         let dht_for_tick = Arc::clone(&self.dht);
         let session_tx_registry_for_tick = Arc::clone(&self.session_tx_registry);
         // re-issue local sovereign delegation at half-validity.
@@ -154,6 +156,13 @@ impl NodeRuntime {
                 tokio::select! {
                     _ = interval.tick() => {
                         let now = std::time::Instant::now();
+                        // 300 s peer-gossip exchange heartbeat: refresh peer
+                        // knowledge across all live sessions even on a stable
+                        // mesh (the establish/drop triggers only fire on churn).
+                        // 8 = PEER_GOSSIP_SAMPLE in veil-dispatcher.
+                        if tick_index.is_multiple_of(300) {
+                            dispatcher_for_gossip.gossip_peer_sample_to_all(8);
+                        }
                         // ── Always-run phase: memory + congestion + heartbeat ──
                         // slice-1 explicitly excludes these from
                         // throttling: memory eviction protects the budget
