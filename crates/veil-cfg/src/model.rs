@@ -2267,7 +2267,10 @@ pub struct SessionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_secs: Option<u64>,
 
-    /// Maximum number of concurrent OVL1 sessions (default 1024).
+    /// Maximum number of concurrent OVL1 sessions (per-node hard ceiling).
+    /// Default 1000; override in node.toml as `[session] max_concurrent = N`
+    /// (or `config set session.max_concurrent N`). A node at the ceiling
+    /// refers new clients elsewhere rather than stranding them.
     #[serde(default = "SessionConfig::default_max_concurrent")]
     pub max_concurrent: usize,
 
@@ -2398,10 +2401,14 @@ impl SessionConfig {
     /// handling DHT-routed forwarding, transit sessions use smaller buffers
     /// (tx_queue_depth lowered to 256), making 64K sessions practical (~1 GB).
     fn default_max_concurrent() -> usize {
-        // lowered from 65_536 → 512 for budget-friendly
-        // defaults. Each active session carries TLS state + queues
-        // + timers ≈ 50-100 KB, so 512 ≈ 25-50 MB worst case — fits
-        // comfortably on any desktop. Mobile / budget phones
+        // 1000 active sessions per node — the per-node hard ceiling. At ~300
+        // B/s idle gossip per session this caps idle egress at ~300 KB/s
+        // (≈30% of a 1 MB/s budget), independent of network size — bounded
+        // degree is what keeps idle traffic flat as N grows (full-mesh is only
+        // an artifact of N < cap on small clusters). A node AT the cap refers
+        // new clients to other peers (NeighborOffer on capacity-reject) so the
+        // ceiling never strands a joiner. Each session ≈ 50-100 KB state, so
+        // 1000 ≈ 50-100 MB worst case. Mobile / budget phones
         // must OVERRIDE through `--profile mobile` (sets 64 → ~5 MB
         // ceiling). Operators running dedicated relay/gateway
         // hardware can raise to thousands explicitly via config.
@@ -2410,7 +2417,7 @@ impl SessionConfig {
         // until operator raises the cap. Acceptable per "no working
         // network yet" framing — operators reading deployment docs
         // tune for their hardware class.
-        512
+        1000
     }
     fn default_max_per_ip() -> usize {
         32
