@@ -51,6 +51,11 @@ pub const MIN_REACHABILITY: f32 = 0.01;
 /// for the same destination.
 pub const MIN_DIRECT_RELAY_SCORE: u32 = 20_000;
 
+/// Number of `NeighborOffer` hints emitted per peer-gossip exchange (on
+/// session establish/drop and the periodic heartbeat). Small + bounded so the
+/// exchange stays O(degree) regardless of routing-table size.
+pub const PEER_GOSSIP_SAMPLE: usize = 8;
+
 impl FrameDispatcher {
     pub fn dispatch_routing(
         &self,
@@ -943,6 +948,65 @@ impl FrameDispatcher {
     /// currently connected peers, and announce all current peers to `new_peer`.
     ///
     /// Called immediately after a new session is registered in `SessionTxRegistry`.
+    /// Active peer-gossip: queue up to `limit` `NeighborOffer` hints (sampled
+    /// from our DHT routing table, which carry transports) into `target`'s
+    /// session. The offer path was otherwise dormant — nothing emitted it — so
+    /// this is what makes neighbours cross-pollinate peer knowledge on session
+    /// churn and the periodic heartbeat, and what lets a capacity-referred
+    /// client learn freer nodes to dial. Best-effort; no-ops without a tx
+    /// registry or contacts. The recipient routes the offers into its
+    /// source-quota'd pending pool (see `handle_neighbor_offer`), so this
+    /// cannot be used to eclipse its verified routing table.
+    pub fn gossip_peer_sample_to(&self, target: &[u8; 32], limit: usize) {
+        let Some(reg) = &self.session_tx_registry else {
+            return;
+        };
+        let contacts = self.dht.routing_table_contacts();
+        if contacts.is_empty() {
+            return;
+        }
+        let guard = rlock!(reg);
+        let mut sent = 0usize;
+        for c in &contacts {
+            if sent >= limit {
+                break;
+            }
+            if &c.node_id == target || c.node_id == self.local_node_id || c.transport.is_empty() {
+                continue;
+            }
+            let body = veil_proto::control::NeighborOfferPayload {
+                node_id: c.node_id,
+                addr: c.transport.clone().into_bytes(),
+                flags: 0,
+            }
+            .encode();
+            let mut hdr = veil_proto::header::FrameHeader::new(
+                veil_proto::family::FrameFamily::Control as u8,
+                veil_proto::family::ControlMsg::NeighborOffer as u16,
+            );
+            hdr.body_len = body.len() as u32;
+            if guard.send_to(
+                target,
+                veil_proto::header::priority::INTERACTIVE,
+                veil_proto::codec::encode_frame(&hdr, &body),
+            ) {
+                sent += 1;
+            }
+        }
+    }
+
+    /// Gossip a fresh peer sample to every active session — the 300 s exchange
+    /// heartbeat and the on-session-drop re-spread.
+    pub fn gossip_peer_sample_to_all(&self, limit: usize) {
+        let Some(reg) = &self.session_tx_registry else {
+            return;
+        };
+        let targets: Vec<[u8; 32]> = rlock!(reg).active_node_ids().into_iter().collect();
+        for target in targets {
+            self.gossip_peer_sample_to(&target, limit);
+        }
+    }
+
     pub fn on_session_opened(
         &self,
         new_peer: [u8; 32],
@@ -1082,6 +1146,14 @@ impl FrameDispatcher {
         // not the owner) are skipped — the real owner will push them to
         // the new peer when *they* open a session.
         self.push_owned_dht_records(new_peer, reg_arc);
+
+        // Peer-exchange on session ESTABLISH: hand the new neighbour a sample
+        // of our known peers so it can widen its own dial set. Fires on both
+        // sides of every new session (inbound + outbound), so the exchange is
+        // mutual. Also the delivery path for capacity-referral: a node at the
+        // session ceiling accepts a transient session, and this gives the
+        // would-be client freer nodes to dial before that session closes.
+        self.gossip_peer_sample_to(&new_peer, PEER_GOSSIP_SAMPLE);
     }
 
     /// scan local DHT store for owned signed records (magic "AP"
@@ -1273,6 +1345,11 @@ impl FrameDispatcher {
         // replica quorum / fetch entries removed with the mailbox
         // subsystem; nothing per-peer to evict here.
         let _ = closed_peer;
+
+        // Peer-exchange on session DROP: a neighbour just left, so re-spread a
+        // fresh peer sample to the remaining sessions to help the mesh re-knit
+        // around the loss. Bounded by our (capped) session degree.
+        self.gossip_peer_sample_to_all(PEER_GOSSIP_SAMPLE);
     }
 
     /// Re-announce every currently-connected peer to all other peers.
