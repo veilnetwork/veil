@@ -323,6 +323,13 @@ pub struct InboundSessionContext {
     listener_handle: ListenerHandle,
 }
 
+/// Lifetime cap for a transient referral session (one accepted into the
+/// headroom above `max_concurrent`). Long enough for the client to receive the
+/// on-open peer-gossip sample and dial a freer node, short enough that the
+/// headroom frees quickly so the per-node session ceiling stays effectively
+/// hard under sustained load.
+const REFERRAL_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub struct AttachedDebugSession {
     pub link_id: LinkId,
     pub source: SessionSource,
@@ -345,6 +352,13 @@ pub struct AttachedDebugSession {
     /// `handle_find_node_v2` can filter the peer out of FIND_NODE responses
     /// if they prefer to stay hidden.
     pub remote_discovery_mode: veil_cfg::DiscoveryMode,
+    /// True when this session was accepted INTO the referral headroom above
+    /// `max_concurrent` (the node was already at its data ceiling). Such a
+    /// session is transient: it exists only to deliver a peer-gossip sample so
+    /// the would-be client can dial a freer node, then its lifetime is capped
+    /// (see `REFERRAL_SESSION_TTL`) so the headroom frees and the per-node
+    /// ceiling stays effectively hard.
+    pub referral: bool,
     /// receiver pre-reserved by
     /// `try_register_unique` in the cap+dup atomic critical section.
     /// The downstream `cache_peer_handshake_state` consumes this
@@ -5182,6 +5196,7 @@ pub fn spawn_inbound_session(
             // by `try_register_unique` in the cap+dup atomic critical
             // section. Replaces the old second-register pattern that
             // had a TOCTOU window between dup-check and registration.
+            let is_referral = session.referral;
             let outbox_rx = session.reserved_outbox_rx;
             let rpc_rx = inbound.runtime.session_outbox.register(peer_id);
             let mut runner = veil_session::runner::SessionRunner {
@@ -5320,7 +5335,18 @@ pub fn spawn_inbound_session(
             // when the session exits (any path, including panic), so
             // accept-side lookups on a dead session fail fast.
             let _swap_guard = runner.register_swap_channel(&inbound.runtime.handoff.swap_registry);
-            runner.run().await;
+            if is_referral {
+                // Transient referral session (accepted into the headroom above
+                // max_concurrent): cap its lifetime so the headroom frees and
+                // the per-node data ceiling stays effectively hard. The timeout
+                // cancels the run() future, but the cleanup below STILL executes
+                // (graceful — unlike a task abort, so no stale tx_registry /
+                // dispatcher per-peer state). The client received a peer-gossip
+                // sample on session-open and migrates to a freer node.
+                let _ = tokio::time::timeout(REFERRAL_SESSION_TTL, runner.run()).await;
+            } else {
+                runner.run().await;
+            }
             drop(_swap_guard);
             // oncurrency-unregister tx-channel
             // BEFORE notifying the dispatcher. The previous order
