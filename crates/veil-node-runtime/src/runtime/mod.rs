@@ -2322,6 +2322,16 @@ impl NodeRuntime {
         Arc::clone(&self.dispatcher.trace_buffer)
     }
 
+    /// A clone of the route-miss channel sender — the same channel the delivery
+    /// path signals when it forwards to a destination with no cached route.
+    /// `None` before the route-miss-handler service has installed its receiver.
+    /// Introspection seam: lets sim scenarios drive the real route-miss →
+    /// RouteRequest → iterative-DHT-fallback chain without an app-send-to-node
+    /// primitive (the harness has none).
+    pub fn route_miss_sender(&self) -> Option<veil_dispatcher::RouteMissTx> {
+        lock!(self.dispatcher.route_miss_tx).as_ref().cloned()
+    }
+
     // ── Introspection ─────────────────────────────────────────────
 
     /// Return a snapshot of all runtime metrics counters, or `None` if metrics
