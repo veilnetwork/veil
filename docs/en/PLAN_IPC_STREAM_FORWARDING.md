@@ -194,22 +194,30 @@ enough. It makes the limitation visible, and it costs us nothing — no
 
 ---
 
-## Status snapshot (audit batch 2026-05-23)
+## Status snapshot (audit batch 2026-05-23) — SUPERSEDED 2026-06-03
+
+> **SUPERSEDED:** the planning call below ("Phases 2-4 are a deferred epic")
+> was overtaken by events — Phases 2-4 SHIPPED on branch
+> `feat/ipc-remote-stream-forwarding`; see the **"Implementation (2026-06-03)"**
+> section at the bottom for what landed. The snapshot is kept for historical
+> context (the effort estimate + the rejected partial-Phase-3 reasoning). The
+> only remaining work is the end-to-end two-daemon integration test (item 6 in
+> "Closing this plan"); the in-process handshake, bridge, and dispatch are live.
 
 The cross-audit asked us to "close" this row. After a planning pass, the
-honest engineering call is:
+honest engineering call at the time was:
 
 * **Phase 1 (clean error)** — shipped, in production. It already clears
   the bar that mattered: the limitation is visible, and callers no longer
   hang.
-* **Phases 2-4 (full implementation)** — still a deferred epic. Budget
-  3 dedicated sessions, per the breakdown above. The hard part is the
-  cross-cutting state management — coordinating the wire stream-id
-  allocator, managing each bridge task's lifecycle, aligning dispatcher
-  inbound routing — not any algorithm. A partial Phase 3 (say, open-only
-  with no bridge task) would be strictly *worse* than where Phase 1 leaves
-  us: it trades a clean error for a silent hang on the first STREAM_DATA
-  frame.
+* **Phases 2-4 (full implementation)** — *(historical estimate; since shipped
+  — see Implementation 2026-06-03)* was budgeted at 3 dedicated sessions. The
+  hard part was the cross-cutting state management — coordinating the wire
+  stream-id allocator, managing each bridge task's lifecycle, aligning
+  dispatcher inbound routing — not any algorithm. A partial Phase 3 (say,
+  open-only with no bridge task) would have been strictly *worse* than where
+  Phase 1 left us: it trades a clean error for a silent hang on the first
+  STREAM_DATA frame.
 
 ### What operators can do today
 
