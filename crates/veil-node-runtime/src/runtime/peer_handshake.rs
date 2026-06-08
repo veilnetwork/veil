@@ -694,7 +694,7 @@ pub async fn register_connection_session(
         }
     }
 
-    let reserved_outbox_rx = {
+    let (reserved_outbox_rx, referral_session) = {
         // Hard-reject only when even the referral headroom above the data cap
         // is full; otherwise accept (a session at/above max_concurrent is a
         // transient referral — the establish-time peer-gossip steers the
@@ -854,7 +854,8 @@ pub async fn register_connection_session(
             kind: veil_proto::event_kind::SESSIONS_CHANGED,
             payload: count_u16.to_be_bytes().to_vec(),
         });
-        reserved_outbox_rx
+        // referral = accepted past the data cap (into the headroom only).
+        (reserved_outbox_rx, new_count > runtime.defaults.max_concurrent)
     };
     runtime.logger.info(
         "session.open",
@@ -894,6 +895,8 @@ pub async fn register_connection_session(
         public_key: remote_identity.public_key,
         nonce: remote_identity.nonce,
         remote_discovery_mode: remote_identity.remote_discovery_mode,
+        // Transient when accepted past the data cap (into the headroom only).
+        referral: referral_session,
         reserved_outbox_rx,
         _guard: SessionGuard::new(
             runtime.live_sessions,
