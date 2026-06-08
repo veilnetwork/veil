@@ -69,6 +69,8 @@ pub struct SessionDefaults {
     pub qos_weights: [u32; 4],
     /// max concurrent OVL1 sessions.
     pub max_concurrent: usize,
+    /// Transient referral-session headroom above `max_concurrent`.
+    pub referral_headroom: usize,
     /// max inbound sessions per source IP.
     pub max_per_ip: usize,
     /// max inbound sessions per /24 subnet.
@@ -105,6 +107,7 @@ impl SessionDefaults {
         rekey_time_threshold_secs: u64,
         qos_weights: [u32; 4],
         max_concurrent: usize,
+        referral_headroom: usize,
         max_per_ip: usize,
         max_per_subnet: usize,
         gateway_keepalive_interval: Duration,
@@ -122,6 +125,7 @@ impl SessionDefaults {
             rekey_time_threshold_secs,
             qos_weights,
             max_concurrent,
+            referral_headroom,
             max_per_ip,
             max_per_subnet,
             gateway_keepalive_interval,

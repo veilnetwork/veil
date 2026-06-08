@@ -1987,6 +1987,7 @@ impl NodeRuntime {
                 config.session.rekey_time_threshold_secs,
                 config.session.qos_weights.map(|w| w as u32),
                 config.session.max_concurrent,
+                config.session.referral_headroom,
                 config.session.max_per_ip,
                 config.session.max_per_subnet,
                 std::time::Duration::from_secs(config.gateway.keepalive_interval_secs),
