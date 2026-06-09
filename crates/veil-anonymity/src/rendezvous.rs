@@ -1429,19 +1429,30 @@ pub fn decrypt_introduce(
 /// Maximum entries in [`IntroduceReplayCache`]. At ~24 B per
 /// entry (16 B fingerprint + u64 expiry + map overhead), 65536 ≈
 /// 1.5 MiB worst-case memory. When the cap is reached the cache
-/// drops one arbitrary entry — the worst outcome is that the
-/// dropped fingerprint becomes replay-able again until the original
-/// `INTRODUCE_REPLAY_TTL_SECS` expires, which is bounded by the
-/// receiver's own anti-replay window in the rendezvous protocol.
+/// drops the FIFO-OLDEST entry (`queue.pop_front`), never an
+/// iteration-order-arbitrary one — so an attacker pumping unique
+/// fingerprints can only force-evict the oldest end, never the
+/// freshly-recorded legitimate entry it is racing. The worst outcome
+/// is that a force-evicted fingerprint becomes replay-able again
+/// before its TTL would have expired.
 pub const MAX_INTRODUCE_REPLAY_ENTRIES: usize = 65_536;
 
-/// Default replay-window for an Introduce-frame fingerprint. The
-/// rendezvous ad's `valid_until_unix` is the upper bound; once an ad
-/// expires its associated Introduces can no longer be redirected to
-/// the receiver, so a 1-day default amply covers the expected ad
-/// validity window (typically 7-30 days but the receiver only
-/// maintains a single-cookie session at a time).
-pub const INTRODUCE_REPLAY_TTL_SECS: u64 = 24 * 3600;
+/// Replay-window for an Introduce-frame fingerprint. An ad's
+/// `valid_until_unix` is the real upper bound on when a captured
+/// Introduce can still be redirected to the receiver, and that bound
+/// can be as high as [`MAX_VALIDITY_WINDOW_SECS`] (30 days). The TTL is
+/// therefore pinned to that maximum so a single captured Introduce
+/// cannot be replayed within ANY legal ad lifetime — the previous
+/// 1-day value left a replay window for any ad published with a
+/// validity > 1 day (e.g. the common 7-30 day ads).
+///
+/// This does NOT change the cache's memory bound: that is governed by
+/// [`MAX_INTRODUCE_REPLAY_ENTRIES`] (FIFO cap), not the TTL. Under
+/// sustained volume exceeding the cap, the FIFO cap-evict drops only
+/// the OLDEST fingerprints (never freshly-recorded legitimate ones),
+/// so the longer TTL trades a slightly higher steady-state occupancy
+/// for full-lifetime replay protection.
+pub const INTRODUCE_REPLAY_TTL_SECS: u64 = MAX_VALIDITY_WINDOW_SECS;
 
 /// replay-protection cache for Introduce
 /// frames. Each fingerprint is `BLAKE3(eph_pk || nonce)[..16]`
@@ -3050,6 +3061,33 @@ mod tests {
         let err = decrypt_introduce_checked(&ct, &receiver_sk, &cache, now).unwrap_err();
         assert!(matches!(err, RendezvousError::Replay));
         assert_eq!(cache.len(), 1, "fingerprint recorded once");
+    }
+
+    /// Cycle-5 #4: the default replay window must cover the MAXIMUM ad
+    /// validity, not just 1 day. An ad may be published with a validity up
+    /// to `MAX_VALIDITY_WINDOW_SECS` (30 days); a captured Introduce must
+    /// stay un-replayable for that whole window. With the old 1-day TTL a
+    /// replay 24h+ later (still within a 7-30 day ad's life) slipped through.
+    #[test]
+    fn cycle5_4_introduce_replay_blocked_across_long_ad_validity() {
+        // The const itself is pinned to the max validity window.
+        assert_eq!(INTRODUCE_REPLAY_TTL_SECS, MAX_VALIDITY_WINDOW_SECS);
+
+        use x25519_dalek::StaticSecret;
+        let receiver_sk = StaticSecret::random_from_rng(rand_core::OsRng);
+        let receiver_pk = x25519_dalek::PublicKey::from(&receiver_sk);
+        let ct = encrypt_introduce(b"intro", receiver_pk.as_bytes()).unwrap();
+
+        let cache = IntroduceReplayCache::new();
+        let t0 = 1_700_000_000u64;
+        decrypt_introduce_checked(&ct, &receiver_sk, &cache, t0).expect("first decrypt OK");
+
+        // 7 days later — previously past the 1-day TTL, now still inside the
+        // 30-day window → must be rejected as replay.
+        let seven_days_later = t0 + 7 * 24 * 3600;
+        let err = decrypt_introduce_checked(&ct, &receiver_sk, &cache, seven_days_later)
+            .expect_err("replay within max ad validity must be rejected");
+        assert!(matches!(err, RendezvousError::Replay));
     }
 
     /// Distinct introduces (each fresh ephemeral keypair) decrypt
