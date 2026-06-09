@@ -559,13 +559,26 @@ class VeilPush {
     required Uint8List authCookie,
   }) async {
     final key = generateWakeHmacKey();
-    await storeWakeHmacKey(key);
-    final envelope = sealWakeHmacKey(key: key, relayPk: relayPk);
-    return client.setWakeHmacEnvelope(
-      rendezvousNodeId: rendezvousNodeId,
-      authCookie: authCookie,
-      envelope: envelope,
-    );
+    try {
+      await storeWakeHmacKey(key);
+      final envelope = sealWakeHmacKey(key: key, relayPk: relayPk);
+      return await client.setWakeHmacEnvelope(
+        rendezvousNodeId: rendezvousNodeId,
+        authCookie: authCookie,
+        envelope: envelope,
+      );
+    } finally {
+      // The raw 32-byte key was minted into this Dart-managed buffer.
+      // By here it has been copied out twice — into the platform store
+      // (storeWakeHmacKey) and the relay-sealed envelope
+      // (sealWakeHmacKey) — so our working copy is no longer needed.
+      // Best-effort wipe + drop the reference so the plaintext key does
+      // not linger in the GC heap until the next collection. This is
+      // not a *reliable* erase (GC compaction may have relocated the
+      // backing store; see secure_wipe.dart), but it closes the
+      // common-case window cheaply.
+      key.fillRange(0, key.length, 0);
+    }
   }
 
   /// Drain a receiver's mailbox in one call, returning the fetched blobs.
