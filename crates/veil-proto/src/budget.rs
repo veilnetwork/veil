@@ -152,8 +152,8 @@ pub const NODE_CONTACT_ID_SIZE: usize = 32;
 
 /// `MeshFrame` fixed header (without variable `payload`).
 ///
-/// realm_id(16) + src(32) + dst(32) + ttl(1) + payload_len(2) = 83 bytes.
-pub const MESH_FRAME_HEADER: usize = 83;
+/// realm_id(16) + src(32) + dst(32) + ttl(1) + nonce(8) + payload_len(2) = 91 bytes.
+pub const MESH_FRAME_HEADER: usize = 91;
 
 /// `MeshBeaconPayload` v1 minimum: node_id(32) + realm_id(16) = 48.
 /// v2 adds role_flags(1) + addr_len(1) + veil_addr(0..=255).

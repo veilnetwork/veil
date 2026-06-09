@@ -13,6 +13,7 @@
 //! in. removed the post-lift mailbox sink; the bridge
 //! now produces `LiftedEnvelope`s without writing them to a service.
 
+use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -225,13 +226,19 @@ impl GatewayBridge {
         if payload.len() > u16::MAX as usize {
             return Err(BridgeError::PayloadTooLarge);
         }
+        // Stamp a fresh end-to-end replay nonce: this is an originated unicast
+        // frame, so receivers (relays and the destination) can drop replays
+        // keyed on (src_node_id, nonce). 0 is reserved for "unset" and is
+        // ~never produced by the CSPRNG; if it ever is, that one frame simply
+        // goes unprotected (benign). See `MeshFrame::nonce`.
         let frame = MeshFrame::new(
             realm_id,
             self.gateway_id,
             envelope.recipient_node_id(),
             ttl,
             payload,
-        );
+        )
+        .with_nonce(rand::rng().next_u64());
         Ok(frame)
     }
 
