@@ -1567,14 +1567,18 @@ pub async fn bind_admin_endpoint(
     match endpoint {
         #[cfg(unix)]
         AdminEndpoint::Unix(socket) => {
-            // Set restrictive umask before bind so the socket is created
-            // with 0o600 from the start.
-            let old_umask = unsafe { libc::umask(0o177) };
+            // SECURITY — audit cycle-2 HIGH: do NOT set a process-wide
+            // `libc::umask` around the bind. umask is process-global, so in the
+            // multi-threaded async runtime a temporary `umask(0o177)` made
+            // concurrent threads create files/dirs without the execute/other
+            // bits (directories → `PermissionDenied`, which broke parallel test
+            // runs), and an error from `bind_unix` returned via `?` BEFORE the
+            // restore leaked the restrictive mask for the whole process. The
+            // socket is secured without any global state: `bind_unix` rejects a
+            // world/group-writable or symlinked parent (the admin dir is 0o700),
+            // and `set_socket_permissions` chmods the socket to 0o600 right
+            // after bind.
             let listener = admin_transport::bind_unix(socket)?;
-            unsafe {
-                libc::umask(old_umask);
-            }
-            // Belt-and-suspenders explicit permission set.
             set_socket_permissions(socket).await;
             Ok((listener, socket.clone()))
         }
