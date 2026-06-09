@@ -26,12 +26,14 @@
 //!
 //! ## Scope (Slice 3)
 //!
-//! This module is a **standalone, testable controller**.  The
-//! dispatcher arm in `node::session::runner` that hands incoming
-//! `SessionMsg::RequestEphemeralEndpoint` bodies to [`RendezvousController::handle_request`]
-//! lives in Slice 5 — bundled with config integration so the wiring lands
-//! atomically.  Until then this module is `pub` + unused in
-//! production paths.
+//! This module is a **standalone, testable controller** that is now
+//! wired in production: the controller is constructed in `node-runtime`
+//! (`runtime/services.rs`) and incoming
+//! `SessionMsg::RequestEphemeralEndpoint` bodies are dispatched to
+//! [`RendezvousController::handle_request`] via the dispatcher's
+//! `rendezvous_weak` upgrade on the routing dispatch path
+//! (`veil-dispatcher`). (Slice 5 landed; the earlier "pub + unused in
+//! production" note was stale.)
 //!
 //! Tests inject a recording [`BindClosure`] that captures `(uri, psk
 //! lifecycle)` tuples; the controller is verified in-process with no
