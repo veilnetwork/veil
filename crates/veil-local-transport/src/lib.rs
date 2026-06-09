@@ -888,7 +888,7 @@ fn unix_peer_uid_matches(stream: &tokio::net::UnixStream) -> bool {
             if ret != 0 {
                 return false;
             }
-            cred.uid == libc::getuid()
+            cred.uid == libc::geteuid()
         }
     }
     #[cfg(any(
@@ -908,7 +908,7 @@ fn unix_peer_uid_matches(stream: &tokio::net::UnixStream) -> bool {
             if ret != 0 {
                 return false;
             }
-            uid == libc::getuid()
+            uid == libc::geteuid()
         }
     }
     #[cfg(not(any(
