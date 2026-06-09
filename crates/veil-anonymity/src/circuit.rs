@@ -105,9 +105,11 @@ pub enum CircuitError {
     PlaintextTooShort { got: usize, min: usize },
     #[error("circuit must have at least one hop")]
     NoHops,
-    /// anti-loop TTL: incoming circuit envelope's TTL field is 0
-    /// (would have been forwarded by-prevous-hop and decremented to 0; OR
-    /// adversarial sender encoded TTL=0 directly). Drop the frame.
+    /// anti-loop TTL: incoming circuit envelope's TTL field is 0. Since
+    /// M1 the per-layer TTL is a constant `MAX_CIRCUIT_TTL` and is NOT
+    /// decremented at a hop (decrementing leaked circuit position/length),
+    /// so a TTL of 0 here can only be an adversarial sender encoding it
+    /// directly. Drop the frame.
     #[error("circuit ttl exhausted")]
     TtlExhausted,
     /// anti-loop TTL: incoming TTL exceeds [`MAX_CIRCUIT_TTL`].
@@ -479,8 +481,9 @@ mod tests {
 
     // ── anti-loop TTL ─────────────────────────────
 
-    /// Honest 3-hop circuit produces ttl=4 outermost, decrementing to ttl=2
-    /// at the final hop. All peels succeed.
+    /// Honest 3-hop circuit: every layer carries the constant
+    /// `MAX_CIRCUIT_TTL` (no per-hop decrement, since M1) and all three
+    /// peels succeed (Forward → Forward → Final).
     #[test]
     fn phase650_ttl_normal_3hop_circuit_succeeds() {
         let (sk1, hop1) = fresh_hop_with_id(0x01);
