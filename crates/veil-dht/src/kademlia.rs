@@ -901,6 +901,15 @@ impl KademliaService {
             if !gate.verify_ban_record(&payload.key, &payload.value) {
                 return Err(KademliaError::InvalidNetworkRecord);
             }
+            // Ban records use `store_insert` (ORIGIN_INTERNAL), which
+            // deliberately bypasses the per-origin byte cap: the auth gate
+            // above already gates these to admins with a valid chain of
+            // trust, so a per-origin bucket here would only risk *refusing*
+            // legitimate bans (PerOriginByteCapExceeded). They DO still count
+            // against the global byte cap and can be reached by oldest-entry
+            // eviction under store pressure — that residual is bounded by
+            // periodic DHT republish of live ban records (and replication
+            // across the key's shard), not a reserved sticky partition.
             let mut inner = lock!(self.inner);
             inner.store_insert(payload.key, payload.value);
             if let Some(m) = &self.metrics {

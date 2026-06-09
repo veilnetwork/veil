@@ -34,8 +34,23 @@
 //! # Error model
 //!
 //! Fallible functions take a `char** err_out`:
-//! * On success, `*err_out = NULL`.
-//! * On error, `*err_out` is set to a heap-allocated UTF-8 message.
+//! * On error (return `!= VEIL_OK`), `*err_out` is set to a
+//!   heap-allocated UTF-8 message.
+//! * On success (return `VEIL_OK`), `*err_out` is normally `NULL`.
+//!
+//! Exception: a few calls report a fine-grained *outcome* through a
+//! separate `out_status` byte while the function-level return stays
+//! `VEIL_OK` (the call itself completed). For those — currently
+//! `veil_join_bootstrap_uri` and `veil_create_bootstrap_invite` —
+//! `*err_out` MAY be non-NULL on `VEIL_OK`, carrying the human-readable
+//! detail for that `out_status` (e.g. "wrong password", or an
+//! informational note on a successful join). Each such function
+//! documents this on its own declaration.
+//!
+//! Therefore the caller's free rule is: **free `*err_out` with
+//! `veil_free_string` whenever it is non-NULL, regardless of the return
+//! code** — do not gate the free on `return != VEIL_OK`, or these
+//! calls will leak the detail string.
 
 #![allow(clippy::missing_safety_doc)]
 // `veilclient-ffi` exposes types (`AppHandle`, `VeilClient`,
@@ -2350,6 +2365,14 @@ pub const VEIL_JOIN_ALREADY_REGISTERED: u8 = 6;
 /// (one of `VEIL_JOIN_*`). Returns [`VEIL_OK`] iff the IPC
 /// round-trip itself succeeded; the actual decode/verify outcome lives
 /// in `out_status`.
+///
+/// Because the outcome is in `out_status`, this call returns `VEIL_OK`
+/// for *every* completed round-trip — including failure statuses
+/// (`VEIL_JOIN_PASSWORD_WRONG`, …) and successes that carry an
+/// informational note. In all of those cases `*err_out` is set to the
+/// detail string for `out_status`, so `*err_out` may be non-NULL even
+/// on `VEIL_OK`. Callers MUST free `*err_out` with `veil_free_string`
+/// whenever it is non-NULL — see the crate-level "Error model".
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_join_bootstrap_uri(
     handle: *mut VeilHandle,
