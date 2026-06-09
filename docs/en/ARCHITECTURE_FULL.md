@@ -122,7 +122,7 @@ algo = 3  — Ed25519+Falcon-512 hybrid
 algo = 4  — Ed25519+Falcon-1024 hybrid
 ```
 
-(The DHT `DeletePayload` currently accepts only `0` and `2`, so hybrid-signed records cannot yet be self-deleted.)
+(The DHT `DeletePayload` accepts all canonical signature algorithms — `0`/`1` Ed25519, `2` Falcon-512, `3`/`4` hybrid — so hybrid-signed records can be self-deleted by their owner.)
 
 In the session handshake, `algo = 1 → Ed25519` — a historical quirk (see `handshake::algo_to_u8`).
 
