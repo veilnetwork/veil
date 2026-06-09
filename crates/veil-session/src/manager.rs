@@ -180,11 +180,14 @@ impl SessionRegistry {
     /// [`Self::peer_ids_for_identity`].
     pub fn get_by_node_id(&self, node_id: &NodeId) -> Option<&SessionEntry> {
         let node_id_bytes = node_id.as_bytes();
-        self.by_identity.get(node_id_bytes)?.iter().find_map(|inst| {
-            self.by_identity_instance
-                .get(&(*node_id_bytes, *inst))
-                .and_then(|sid| self.sessions.get(sid))
-        })
+        self.by_identity
+            .get(node_id_bytes)?
+            .iter()
+            .find_map(|inst| {
+                self.by_identity_instance
+                    .get(&(*node_id_bytes, *inst))
+                    .and_then(|sid| self.sessions.get(sid))
+            })
     }
 
     /// look up a session by the peer's `(node_id
@@ -316,12 +319,15 @@ impl SessionRegistry {
 
     pub fn peer_id_for_identity(&self, node_id: &NodeId) -> Option<[u8; 32]> {
         let node_id_bytes = node_id.as_bytes();
-        self.by_identity.get(node_id_bytes)?.iter().find_map(|inst| {
-            self.by_identity_instance
-                .get(&(*node_id_bytes, *inst))
-                .and_then(|sid| self.sessions.get(sid))
-                .map(|e| e.remote_node_id)
-        })
+        self.by_identity
+            .get(node_id_bytes)?
+            .iter()
+            .find_map(|inst| {
+                self.by_identity_instance
+                    .get(&(*node_id_bytes, *inst))
+                    .and_then(|sid| self.sessions.get(sid))
+                    .map(|e| e.remote_node_id)
+            })
     }
 
     /// unified routing: resolve a sovereign [`Recipient`]

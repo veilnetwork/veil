@@ -4413,7 +4413,9 @@ mod tests {
         // writable buffer must be scrubbed — the RAII guard runs on every path.
         let mut buf: Vec<u8> = vec![0xFF, 0xFE, 0xAA, 0x00]; // invalid UTF-8 + NUL
         let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf.as_mut_ptr() as *mut c_char, &mut err) };
+        let rc = unsafe {
+            veil_validate_bip39_phrase_zeroize(buf.as_mut_ptr() as *mut c_char, &mut err)
+        };
         assert_eq!(rc, VEIL_ERR_INVALID_ARG);
         assert_eq!(&buf[..3], &[0, 0, 0], "content bytes must be zeroed");
         if !err.is_null() {
@@ -4427,9 +4429,14 @@ mod tests {
         // case; guards against regression).
         let mut buf: Vec<u8> = b"not a real mnemonic\0".to_vec();
         let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf.as_mut_ptr() as *mut c_char, &mut err) };
+        let rc = unsafe {
+            veil_validate_bip39_phrase_zeroize(buf.as_mut_ptr() as *mut c_char, &mut err)
+        };
         assert_ne!(rc, VEIL_OK);
-        assert!(buf.iter().all(|&b| b == 0), "phrase buffer must be fully zeroed");
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "phrase buffer must be fully zeroed"
+        );
         if !err.is_null() {
             unsafe { veil_free_string(err) };
         }

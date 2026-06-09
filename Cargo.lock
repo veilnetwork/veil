@@ -4431,7 +4431,6 @@ dependencies = [
  "veil-dispatcher-state",
  "veil-e2e",
  "veil-error",
- "veil-fingerprint",
  "veil-gateway",
  "veil-identity",
  "veil-invite",

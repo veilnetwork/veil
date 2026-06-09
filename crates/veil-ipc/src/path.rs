@@ -193,7 +193,10 @@ mod tests {
     #[test]
     fn split_ipc_uri_query_extracts_and_rejects() {
         // No query → body unchanged.
-        assert_eq!(split_ipc_uri_query("tcp://[::1]:9").unwrap(), ("tcp://[::1]:9", None));
+        assert_eq!(
+            split_ipc_uri_query("tcp://[::1]:9").unwrap(),
+            ("tcp://[::1]:9", None)
+        );
         // runtime_dir extracted.
         let (body, rd) = split_ipc_uri_query("tcp://[::1]:9?runtime_dir=/x").unwrap();
         assert_eq!(body, "tcp://[::1]:9");
