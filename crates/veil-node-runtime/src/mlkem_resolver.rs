@@ -118,7 +118,14 @@ impl DhtMlKemEkResolver {
 
         // ── Step 1: IdentityDocument ────────────────────────────────
         let doc_key = IdentityDocument::dht_key(&target_node_id);
-        let doc_bytes = match self.dht_recursive_get(doc_key, self.step_timeout).await {
+        let doc_bytes = match self
+            .dht_recursive_get(doc_key, self.step_timeout, |b| {
+                IdentityDocument::decode(b).ok().is_some_and(|d| {
+                    d.node_id == target_node_id && verify_identity_document(&d, now_unix).is_ok()
+                })
+            })
+            .await
+        {
             Some(b) => b,
             None => {
                 self.log_dbg("mlkem_resolver.doc.dht_miss", &target_node_id, "");
@@ -154,7 +161,14 @@ impl DhtMlKemEkResolver {
 
         // ── Step 2: InstanceRegistry ────────────────────────────────
         let reg_key = InstanceRegistry::dht_key(&target_node_id);
-        let reg_bytes = match self.dht_recursive_get(reg_key, self.step_timeout).await {
+        let reg_bytes = match self
+            .dht_recursive_get(reg_key, self.step_timeout, |b| {
+                InstanceRegistry::decode(b).ok().is_some_and(|r| {
+                    r.node_id == target_node_id && verify_instance_registry_sig(&r, &doc)
+                })
+            })
+            .await
+        {
             Some(b) => b,
             None => {
                 self.log_dbg("mlkem_resolver.registry.dht_miss", &target_node_id, "");
@@ -190,7 +204,14 @@ impl DhtMlKemEkResolver {
 
         // ── Step 3: MlKemKeyCert ────────────────────────────────────
         let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance.instance_id);
-        let cert_bytes = match self.dht_recursive_get(cert_key, self.step_timeout).await {
+        let cert_bytes = match self
+            .dht_recursive_get(cert_key, self.step_timeout, |b| {
+                MlKemKeyCert::decode(b).ok().is_some_and(|c| {
+                    verify_mlkem_cert(&c, &doc, now_unix).is_ok()
+                })
+            })
+            .await
+        {
             Some(b) => b,
             None => {
                 self.log_dbg("mlkem_resolver.cert.dht_miss", &target_node_id, "");
@@ -250,11 +271,30 @@ impl DhtMlKemEkResolver {
     /// Mirror of `NodeRuntime::dht_recursive_get` adapted for the shared
     /// references that this resolver holds.  Does NOT depend on the
     /// surrounding NodeRuntime so this module stays self-contained.
-    async fn dht_recursive_get(&self, key: [u8; 32], timeout: Duration) -> Option<Vec<u8>> {
-        // Local fast path.
+    async fn dht_recursive_get(
+        &self,
+        key: [u8; 32],
+        timeout: Duration,
+        is_valid: impl Fn(&[u8]) -> bool,
+    ) -> Option<Vec<u8>> {
+        // Validated local fast path. Only trust a locally mirror-cached value
+        // if it passes the caller's verification. A malicious FIND_VALUE
+        // responder can mirror-poison the local cache with a structurally-valid
+        // but forged identity-family record (NM/ID/IR/MC) under the victim's
+        // key — the dispatcher's `mirror_cache_key_ok` intentionally caches
+        // those without a signature check (verification is the resolver's job).
+        // Without this gate the poisoned entry short-circuits the remote walk
+        // and the caller's verify then yields `None` => persistent targeted DoS
+        // of cold-start E2E key resolution. On an invalid local value we fall
+        // through to the remote walk. (audit: DHT mirror-cache poisoning.)
         if let Some(value) = self.dht.get_local(&key) {
-            return Some(value);
+            if is_valid(&value) {
+                return Some(value);
+            }
         }
+        // Drop the validator before the awaits below so it is never held across
+        // an await point (keeps this future `Send` regardless of its captures).
+        drop(is_valid);
 
         // Pick the closest active session peers; bail if there are no
         // peers to forward (solo recursive walk impossible).
