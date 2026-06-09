@@ -243,7 +243,10 @@ impl HotStandbyController {
         // peer being revisited).
         if history.len() > Self::MAX_TRACKED_SWAP_PEERS {
             history.retain(|_, dq| {
-                while dq.front().is_some_and(|&t| now.duration_since(t) > Self::FLAP_WINDOW) {
+                while dq
+                    .front()
+                    .is_some_and(|&t| now.duration_since(t) > Self::FLAP_WINDOW)
+                {
                     dq.pop_front();
                 }
                 !dq.is_empty()

@@ -282,7 +282,9 @@ pub fn derive_resume_keys(
         .expect("64 <= HKDF-SHA256 max okm");
 
     let okm_slice = okm.as_slice();
-    let key_a: [u8; 32] = okm_slice[0..32].try_into().expect("compile-time-sized slice");
+    let key_a: [u8; 32] = okm_slice[0..32]
+        .try_into()
+        .expect("compile-time-sized slice");
     let key_b: [u8; 32] = okm_slice[32..64]
         .try_into()
         .expect("compile-time-sized slice");
@@ -505,8 +507,24 @@ mod tests {
         let server_nonce = [0x50u8; RESUME_NONCE_LEN];
 
         // client.tx == K1, client.rx == K2 ; server.tx == K2, server.rx == K1.
-        let cli = derive_resume_keys(&k1, &k2, &sid, &client_nonce, &server_nonce, &client, &server);
-        let srv = derive_resume_keys(&k2, &k1, &sid, &client_nonce, &server_nonce, &server, &client);
+        let cli = derive_resume_keys(
+            &k1,
+            &k2,
+            &sid,
+            &client_nonce,
+            &server_nonce,
+            &client,
+            &server,
+        );
+        let srv = derive_resume_keys(
+            &k2,
+            &k1,
+            &sid,
+            &client_nonce,
+            &server_nonce,
+            &server,
+            &client,
+        );
 
         // Cross-side agreement: the resumed session works in both directions.
         assert_eq!(cli.tx_key, srv.rx_key, "client tx must equal server rx");
