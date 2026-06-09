@@ -3,30 +3,30 @@
 //
 // Android aggressively kills backgrounded processes after ~5-15 min
 // of being idle (varies by vendor — Xiaomi/Huawei more aggressive).
-// A foreground service displays а persistent notification и signals
+// A foreground service displays a persistent notification and signals
 // the OS "this process is doing user-visible work — don't kill" —
 // without it, the veil daemon embedded in the Flutter process
-// disconnects whenever the screen turns off, и messages stop
+// disconnects whenever the screen turns off, and messages stop
 // flowing.  With it, the daemon stays connected for hours / until
 // the user explicitly stops it.
 //
 // The service itself does NO work in its run loop — it exists ONLY
 // to keep the process alive.  The actual daemon lives in the Rust
 // FFI library loaded into the Flutter process; pinning the process
-// transitively pins all its threads и Rust-side state.
+// transitively pins all its threads and Rust-side state.
 //
 // Lifecycle (start path):
 //   1. Dart calls `VeilClient.startBackgroundService()` via
 //      MethodChannel.
 //   2. Plugin Java/Kotlin invokes `startForegroundService(intent)`.
-//   3. ОС creates the service; within 5 seconds it MUST call
-//      `startForeground(notificationId, notification)` or ОС kills
-//      it.  We do that immediately в `onCreate`.
+//   3. The OS creates the service; within 5 seconds it MUST call
+//      `startForeground(notificationId, notification)` or the OS kills
+//      it.  We do that immediately in `onCreate`.
 //   4. Notification stays visible until `stopForeground + stopSelf`.
 //
 // Lifecycle (stop path):
 //   1. Dart calls `VeilClient.stopBackgroundService()` (typically
-//      from а logout / "go offline" UI action).
+//      from a logout / "go offline" UI action).
 //   2. Plugin Kotlin sends ACTION_STOP intent → service unwinds.
 
 package com.veil.veil_flutter
@@ -60,7 +60,7 @@ class VeilDaemonService : Service() {
         ensureChannel()
         // Start foreground IMMEDIATELY (within 5 s of onCreate) — Android
         // 12+ is strict about this and kills the service otherwise.
-        // The notification text is updated later когда onStartCommand
+        // The notification text is updated later when onStartCommand
         // receives the actual title / body via Intent extras.
         startForegroundCompat(buildNotification(getString(R.string.veil_default_title), null))
     }
@@ -81,7 +81,7 @@ class VeilDaemonService : Service() {
         }
         // START_STICKY: if the OS kills us under memory pressure,
         // re-create the service on next available opportunity.  Persistent-
-        // by-design for а P2P connection-maintaining service.
+        // by-design for a P2P connection-maintaining service.
         return START_STICKY
     }
 
@@ -116,12 +116,12 @@ class VeilDaemonService : Service() {
 
     private fun startForegroundCompat(notification: Notification) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // Android 14+ requires а foregroundServiceType matching
+            // Android 14+ requires a foregroundServiceType matching
             // the service's actual purpose.  REMOTE_MESSAGING fits
             // veil's use case (continuously receive messages over
             // the internet for messaging apps) — gives us latitude
             // to maintain network connections in the background
-            // без the user-visible CONNECTED_DEVICE / DATA_SYNC
+            // without the user-visible CONNECTED_DEVICE / DATA_SYNC
             // restrictions.
             startForeground(
                 NOTIFICATION_ID,
