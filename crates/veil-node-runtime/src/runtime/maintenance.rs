@@ -147,6 +147,15 @@ impl NodeRuntime {
             .to_path_buf();
         let reissue_logger = Arc::clone(&self.logger);
         let tasks = Arc::clone(&self.tasks);
+        // No per-tick catch_unwind/supervisor here ON PURPOSE: the workspace
+        // builds release with `panic = "abort"` (see Cargo.toml), so a panic in
+        // any tick phase aborts the whole process — a loud crash that the node's
+        // process supervisor restarts, after which maintenance resumes. A
+        // catch_unwind would be a no-op under abort and would falsely imply this
+        // loop self-heals in-process; the tick phases only touch local,
+        // poison-recovering caches, so there is no Result-level failure to
+        // recover here either. (Silent in-process task death would only be
+        // possible under `panic = "unwind"`, which release does not use.)
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(cleanup_interval);
             // deferred : tick counter for throttle decision.
