@@ -264,6 +264,7 @@ mod tests {
             node_id: [0xAA; 32],
             resume_ticket: None,
             membership_cert_blob: None,
+            resume_nonce: None,
         }
     }
 
