@@ -125,12 +125,25 @@ impl WebtunnelRouter {
         match matcher.check(path, auth_value) {
             MatchResult::TunnelMode => {
                 // Generate the 101 Switching Protocols response.
-                let sec_key = request.header("Sec-WebSocket-Key").ok_or_else(|| {
-                    RouterError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "tunnel-mode request missing Sec-WebSocket-Key",
-                    ))
-                })?;
+                // A request that matched the secret path/auth but carries NO
+                // Sec-WebSocket-Key is not a real WebSocket upgrade — almost
+                // certainly an active probe. Serve the decoy (byte-identical to a
+                // wrong-path response) rather than returning an error, so a
+                // prober cannot distinguish "right path, malformed upgrade" from
+                // "wrong path". This branch runs BEFORE the 101 is written, so
+                // falling back to the decoy is still possible. (audit cycle-2:
+                // anti-probe behavioral distinguisher. The decoy-vs-tunnel
+                // *timing* distinguisher is tracked separately.)
+                let sec_key = match request.header("Sec-WebSocket-Key") {
+                    Some(k) => k,
+                    None => {
+                        let resp = decoy.respond(&request.method, path).await?;
+                        write_http_response(&mut stream, &resp).await?;
+                        stream.flush().await?;
+                        let _ = stream.shutdown().await;
+                        return Err(RouterError::ServedDecoy);
+                    }
+                };
                 let accept = compute_sec_websocket_accept(sec_key);
                 let response = format!(
                     "HTTP/1.1 101 Switching Protocols\r\n\
