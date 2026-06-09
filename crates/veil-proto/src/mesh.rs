@@ -46,7 +46,7 @@ impl From<[u8; 16]> for RealmId {
 // ── MeshFrame ─────────────────────────────────────────────────────────────────
 
 /// The fixed-size header prefix of a `MeshFrame` (without payload).
-pub const MESH_HEADER_SIZE: usize = 16 + 32 + 32 + 1 + 2; // 83
+pub const MESH_HEADER_SIZE: usize = 16 + 32 + 32 + 1 + 8 + 2; // 91 (+8 = end-to-end replay nonce)
 
 /// Broadcast destination: deliver to all neighbours in realm.
 pub const BROADCAST_NODE_ID: [u8; 32] = [0xFF; 32];
@@ -66,6 +66,14 @@ pub struct MeshFrame {
     pub dst_node_id: [u8; 32],
     /// Hops remaining. Decremented by each forwarder. Frame dropped when 0.
     pub ttl: u8,
+    /// End-to-end replay nonce, set ONCE by the originator and preserved across
+    /// every forward hop (unlike the hop-by-hop udp-obfs counter). Receivers
+    /// keep a per-`src_node_id` replay window keyed on this value to drop
+    /// replayed/duplicated frames. `0` = unset (no replay protection — legacy /
+    /// plaintext-origin), so it is NOT replay-checked. Originators set a fresh
+    /// random value via [`MeshFrame::with_nonce`]. (audit cycle-2 HIGH: mesh
+    /// unicast replay.)
+    pub nonce: u64,
     /// Opaque application payload. Immutable post-construction; shared across
     /// clones via `Arc` so fan-out forwarding doesn't reallocate per neighbour.
     pub payload: Arc<[u8]>,
@@ -88,8 +96,21 @@ impl MeshFrame {
             src_node_id,
             dst_node_id,
             ttl,
+            nonce: 0,
             payload: payload.into(),
         }
+    }
+
+    /// Stamp a fresh end-to-end replay nonce on a newly-originated frame.
+    ///
+    /// Called ONLY by the node that originates a frame (not by forwarders,
+    /// which preserve the originator's nonce across hops). Pass a value drawn
+    /// from a CSPRNG (`OsRng`); `0` is reserved to mean "unset" and is never
+    /// replay-checked, so avoid stamping it deliberately. See [`MeshFrame::nonce`].
+    #[must_use]
+    pub fn with_nonce(mut self, nonce: u64) -> Self {
+        self.nonce = nonce;
+        self
     }
 
     /// True iff this frame targets `BROADCAST_NODE_ID`.
@@ -118,6 +139,7 @@ impl MeshFrame {
         buf.extend_from_slice(&self.src_node_id);
         buf.extend_from_slice(&self.dst_node_id);
         buf.push(self.ttl);
+        buf.extend_from_slice(&self.nonce.to_le_bytes());
         buf.extend_from_slice(&payload_len.to_le_bytes());
         buf.extend_from_slice(&self.payload);
         buf
@@ -135,7 +157,8 @@ impl MeshFrame {
         let src_node_id: [u8; 32] = super::read_array::<32>(buf, 16)?;
         let dst_node_id: [u8; 32] = super::read_array::<32>(buf, 48)?;
         let ttl = buf[80];
-        let payload_len = u16::from_le_bytes([buf[81], buf[82]]) as usize;
+        let nonce = u64::from_le_bytes(super::read_array::<8>(buf, 81)?);
+        let payload_len = u16::from_le_bytes([buf[89], buf[90]]) as usize;
         let total = MESH_HEADER_SIZE + payload_len;
         if buf.len() < total {
             return Err(ProtoError::BufferTooShort {
@@ -149,6 +172,7 @@ impl MeshFrame {
             src_node_id,
             dst_node_id,
             ttl,
+            nonce,
             payload,
         })
     }
@@ -429,7 +453,17 @@ mod tests {
     #[test]
     fn mesh_frame_too_short_header() {
         let err = MeshFrame::decode(&[0u8; 10]).unwrap_err();
-        assert!(matches!(err, ProtoError::BufferTooShort { need: 83, .. }));
+        assert!(matches!(err, ProtoError::BufferTooShort { need: 91, .. }));
+    }
+
+    #[test]
+    fn mesh_frame_nonce_roundtrips() {
+        let f = sample_frame().with_nonce(0xDEAD_BEEF_0BAD_F00D);
+        let dec = MeshFrame::decode(&f.encode()).unwrap();
+        assert_eq!(dec.nonce, 0xDEAD_BEEF_0BAD_F00D);
+        assert_eq!(dec, f);
+        // Default (unset) nonce is 0 and also roundtrips.
+        assert_eq!(sample_frame().nonce, 0);
     }
 
     #[test]
