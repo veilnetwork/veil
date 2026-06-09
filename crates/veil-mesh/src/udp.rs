@@ -191,6 +191,62 @@ impl LocalLink for UdpLink {
     }
 }
 
+// ── Mesh replay guard ─────────────────────────────────────────────────────────
+
+/// Max distinct originators tracked at once (FIFO-evicted past this).
+const MESH_REPLAY_MAX_SRCS: usize = 4096;
+/// Recent-nonce window retained per originator.
+const MESH_REPLAY_WINDOW_PER_SRC: usize = 256;
+
+/// End-to-end replay window over `MeshFrame` nonces, keyed by originator
+/// `src_node_id`. Distinct from the hop-by-hop udp-obfs counter (which is
+/// re-stamped at every relay and so cannot identify the end-to-end originator):
+/// this tracks the nonce the *originator* stamped and preserved across forwards,
+/// so any node that has already seen a given `(src, nonce)` drops the replay —
+/// whether it would otherwise re-forward it or deliver it. Bounded in both
+/// dimensions (srcs × nonces-per-src) so adversarial src churn cannot grow it
+/// without limit. (audit cycle-2 HIGH: mesh unicast replay.)
+#[derive(Default)]
+struct MeshReplayState {
+    per_src: std::collections::HashMap<[u8; 32], MeshReplayRing>,
+    /// Insertion order of tracked srcs, for FIFO eviction at capacity.
+    src_order: std::collections::VecDeque<[u8; 32]>,
+}
+
+/// Per-originator recent-nonce ring: `seen` for O(1) membership, `order` to
+/// evict the oldest nonce once the window is full.
+#[derive(Default)]
+struct MeshReplayRing {
+    seen: std::collections::HashSet<u64>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl MeshReplayState {
+    /// Record `(src, nonce)`; return `true` if it was already present (a replay).
+    fn check_and_record(&mut self, src: [u8; 32], nonce: u64) -> bool {
+        let is_new_src = !self.per_src.contains_key(&src);
+        if is_new_src {
+            if self.per_src.len() >= MESH_REPLAY_MAX_SRCS
+                && let Some(old) = self.src_order.pop_front()
+            {
+                self.per_src.remove(&old);
+            }
+            self.src_order.push_back(src);
+        }
+        let ring = self.per_src.entry(src).or_default();
+        if !ring.seen.insert(nonce) {
+            return true; // already seen → replay
+        }
+        ring.order.push_back(nonce);
+        if ring.order.len() > MESH_REPLAY_WINDOW_PER_SRC
+            && let Some(old) = ring.order.pop_front()
+        {
+            ring.seen.remove(&old);
+        }
+        false
+    }
+}
+
 // ── UdpRealm ─────────────────────────────────────────────────────────────────
 
 /// Receives `MeshFrame`s on a bound UDP socket.
@@ -207,6 +263,8 @@ pub struct UdpRealm {
     /// used in [`Self::recv_frame`] to open sealed DATA datagrams. `None` =>
     /// plaintext mesh (unchanged behaviour).
     obfs: Option<Arc<veil_udp_obfs::ObfsKey>>,
+    /// End-to-end replay guard over inbound frame nonces (see [`MeshReplayState`]).
+    replay: std::sync::Mutex<MeshReplayState>,
 }
 
 impl UdpRealm {
@@ -240,6 +298,7 @@ impl UdpRealm {
             socket: Arc::new(async_socket),
             std_socket: Arc::new(std_socket),
             obfs,
+            replay: std::sync::Mutex::new(MeshReplayState::default()),
         })
     }
 
@@ -402,6 +461,22 @@ impl UdpRealm {
                 None => MeshFrame::decode(wire).ok(),
             };
             if let Some(frame) = frame {
+                // End-to-end replay guard: a captured sealed datagram re-opens
+                // and re-decodes cleanly, so AEAD alone does not stop replays.
+                // The originator stamps a per-frame nonce that survives every
+                // forward hop; drop any `(src, nonce)` we have recently seen.
+                // `nonce == 0` means unset (legacy / plaintext-origin frames,
+                // e.g. beacons) and is not checked. (audit cycle-2 HIGH.)
+                if frame.nonce != 0
+                    && self
+                        .replay
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .check_and_record(frame.src_node_id, frame.nonce)
+                {
+                    // Replayed / duplicate frame — drop and keep receiving.
+                    continue;
+                }
                 return Ok((frame, src));
             }
             // Malformed datagram — silently drop and retry
@@ -414,6 +489,35 @@ mod tests {
     use super::*;
     use crate::neighbor::{MeshNeighborProvider, NeighborTable};
     use veil_proto::mesh::{MeshFrame, RealmId};
+
+    #[test]
+    fn replay_state_detects_duplicates_per_src() {
+        let mut st = MeshReplayState::default();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        // First sight of each nonce is fresh; immediate repeat is a replay.
+        assert!(!st.check_and_record(a, 100));
+        assert!(st.check_and_record(a, 100), "exact repeat must be a replay");
+        assert!(!st.check_and_record(a, 101), "distinct nonce is fresh");
+        // Same nonce under a different originator is independent (not a replay).
+        assert!(!st.check_and_record(b, 100));
+        assert!(st.check_and_record(b, 100));
+    }
+
+    #[test]
+    fn replay_state_window_evicts_oldest_nonce() {
+        let mut st = MeshReplayState::default();
+        let s = [9u8; 32];
+        // Fill the per-src window, then push one more to evict the oldest (0).
+        for n in 0..(MESH_REPLAY_WINDOW_PER_SRC as u64) {
+            assert!(!st.check_and_record(s, n));
+        }
+        assert!(!st.check_and_record(s, MESH_REPLAY_WINDOW_PER_SRC as u64));
+        // Nonce 0 was evicted, so it now reads as fresh again (bounded window).
+        assert!(!st.check_and_record(s, 0));
+        // A nonce still inside the window is still a replay.
+        assert!(st.check_and_record(s, MESH_REPLAY_WINDOW_PER_SRC as u64));
+    }
 
     fn sample_frame() -> MeshFrame {
         MeshFrame::new(
