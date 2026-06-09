@@ -41,12 +41,44 @@ pub enum TunError {
     Setup(String),
 }
 
+/// Resolve a network-config helper (`ip` / `ifconfig` / `route` / `netsh`) to
+/// an absolute path from a FIXED set of trusted, root-owned system directories
+/// rather than consulting `$PATH`. ogate may run as root / with
+/// `CAP_NET_ADMIN`; a hostile `$PATH` (set by a local unprivileged user before
+/// launch) must not be able to substitute the binary we exec. The trusted dirs
+/// are root-owned, so an attacker who could plant a binary there already has
+/// the privileges this guards. (audit M-3: local PATH hijack.)
+fn resolve_trusted_prog(prog: &str) -> Result<std::path::PathBuf, TunError> {
+    #[cfg(windows)]
+    let dirs: &[&str] = &[r"C:\Windows\System32", r"C:\Windows\Sysnative"];
+    #[cfg(not(windows))]
+    let dirs: &[&str] = &["/sbin", "/usr/sbin", "/bin", "/usr/bin"];
+    for dir in dirs {
+        let candidate = std::path::Path::new(dir).join(prog);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(TunError::Setup(format!(
+        "network helper {prog:?} not found in trusted system directories \
+         {dirs:?} — refusing to resolve via $PATH"
+    )))
+}
+
 /// Common interface for adding routes / addresses post-creation.
 /// Re-exported by each platform module so the bridge does not import
 /// `std::process::Command` directly.
 pub(crate) fn run_cmd(prog: &str, args: &[&str]) -> Result<(), TunError> {
-    let out = std::process::Command::new(prog)
+    let abs = resolve_trusted_prog(prog)?;
+    // Override PATH with the same trusted dirs (don't env_clear — `netsh` needs
+    // SystemRoot etc.) so any internal lookups by the helper are hijack-safe too.
+    #[cfg(windows)]
+    let safe_path = r"C:\Windows\System32";
+    #[cfg(not(windows))]
+    let safe_path = "/sbin:/usr/sbin:/bin:/usr/bin";
+    let out = std::process::Command::new(&abs)
         .args(args)
+        .env("PATH", safe_path)
         .output()
         .map_err(|e| TunError::Setup(format!("spawn {prog}: {e}")))?;
     if !out.status.success() {
