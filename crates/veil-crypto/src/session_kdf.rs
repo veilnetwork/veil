@@ -60,6 +60,14 @@ impl std::fmt::Debug for SessionKeys {
 
 const HKDF_INFO: &[u8] = b"ovl1-session-v1";
 const HKDF_REKEY_INFO: &[u8] = b"ovl1-session-rekey-v1";
+/// HKDF info-tag for session-RESUMPTION key derivation. Distinct from the
+/// initial / rekey tags so a resumed session's keys can never collide with the
+/// original session's (which would re-introduce the counter-0 nonce reuse the
+/// whole derivation exists to prevent).
+const HKDF_RESUME_INFO: &[u8] = b"ovl1-session-resume-v1";
+
+/// Length of a per-resumption nonce (one from each peer).
+pub const RESUME_NONCE_LEN: usize = 32;
 /// HKDF info-tag for hybrid X25519 + ML-KEM session-key
 /// derivation. Distinct from `HKDF_INFO` (classical-only) so the two
 /// derivation paths cannot collide; a peer that thinks it's running
@@ -211,6 +219,83 @@ pub fn derive_rekey_keys(
         tx_key,
         rx_key,
         session_id: new_session_id,
+    }
+}
+
+/// Derive FRESH `SessionKeys` for a resumed (ticket fast-path) session.
+///
+/// Session resumption must **not** restore the original session's tx/rx keys
+/// verbatim. A `SessionCipher` always starts its counter at 0, so reusing the
+/// originals would repeat the exact `(key, nonce)` of the original session's
+/// frame #i on the resumed session's frame #i — catastrophic ChaCha20-Poly1305
+/// nonce reuse (keystream + Poly1305 one-time-key recovery). Instead, both
+/// peers fold a fresh per-resumption nonce **from each side** into an HKDF over
+/// the original keys, so every resumption yields unique keys even if one peer
+/// reuses its nonce. (audit cycle-2 CRITICAL: session-resumption nonce reuse.)
+///
+/// * `orig_tx_key` / `orig_rx_key` — this side's tx/rx keys from the original
+///   session (server: the ticket's keys; client: the `ClientTicketEntry`
+///   keys). They are role-swapped between peers (one side's tx is the other's
+///   rx), so the IKM canonical-sorts the pair to a value both sides agree on.
+/// * `session_id` — carried through unchanged; it identifies the session but
+///   does not feed the AEAD nonce (which keys on tx/rx + counter), so only the
+///   keys need to be fresh.
+/// * `client_resume_nonce` / `server_resume_nonce` — fresh 32-byte nonces, one
+///   minted by each peer and exchanged in the resume HELLO / ATTACH. Ordered
+///   client-then-server (both peers know which role they played) so the salt is
+///   identical on both sides.
+/// * `local_node_id` / `remote_node_id` — select the tx/rx role per side via the
+///   same lexicographic rule as [`derive_session_keys`], so `local.tx_key ==
+///   remote.rx_key` and vice-versa.
+pub fn derive_resume_keys(
+    orig_tx_key: &[u8; 32],
+    orig_rx_key: &[u8; 32],
+    session_id: &[u8; 32],
+    client_resume_nonce: &[u8; RESUME_NONCE_LEN],
+    server_resume_nonce: &[u8; RESUME_NONCE_LEN],
+    local_node_id: &[u8; 32],
+    remote_node_id: &[u8; 32],
+) -> SessionKeys {
+    // Symmetric IKM: both peers hold the SAME {tx, rx} key pair, just labelled
+    // oppositely (initiator.tx == responder.rx). Canonical-sort the pair so both
+    // derive identical IKM. Zeroizing wipes the 64-byte concatenation on drop.
+    let (lo, hi) = if orig_tx_key <= orig_rx_key {
+        (orig_tx_key, orig_rx_key)
+    } else {
+        (orig_rx_key, orig_tx_key)
+    };
+    let mut ikm: zeroize::Zeroizing<[u8; 64]> = zeroize::Zeroizing::new([0u8; 64]);
+    ikm[..32].copy_from_slice(lo);
+    ikm[32..].copy_from_slice(hi);
+
+    // Salt = client_nonce || server_nonce (role-ordered → identical on both
+    // sides). Public values, so no zeroization needed.
+    let mut salt = [0u8; 2 * RESUME_NONCE_LEN];
+    salt[..RESUME_NONCE_LEN].copy_from_slice(client_resume_nonce);
+    salt[RESUME_NONCE_LEN..].copy_from_slice(server_resume_nonce);
+
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt), ikm.as_slice());
+    // 64 bytes = tx_key (32) || rx_key (32); session_id is carried through, not
+    // re-derived. 64 << HKDF-SHA256 max okm (8160 B), so expand is infallible.
+    let mut okm = veil_util::sensitive_bytes::SensitiveBytes::new(64);
+    hkdf.expand(HKDF_RESUME_INFO, okm.as_mut_slice())
+        .expect("64 <= HKDF-SHA256 max okm");
+
+    let okm_slice = okm.as_slice();
+    let key_a: [u8; 32] = okm_slice[0..32].try_into().expect("compile-time-sized slice");
+    let key_b: [u8; 32] = okm_slice[32..64]
+        .try_into()
+        .expect("compile-time-sized slice");
+    let (tx_key, rx_key) = if local_node_id <= remote_node_id {
+        (key_a, key_b)
+    } else {
+        (key_b, key_a)
+    };
+
+    SessionKeys {
+        tx_key,
+        rx_key,
+        session_id: *session_id,
     }
 }
 
@@ -403,6 +488,90 @@ mod tests {
 
         assert_ne!(original.tx_key, rekeyed.tx_key);
         assert_ne!(original.session_id, rekeyed.session_id);
+    }
+
+    // ── derive_resume_keys (session-resumption nonce reuse fix) ──────────────
+
+    #[test]
+    fn resume_both_sides_agree_and_keys_are_fresh() {
+        // Original session: K1 = initiator→responder key, K2 = responder→initiator.
+        // The two peers hold the pair role-swapped.
+        let k1 = [0x11u8; 32];
+        let k2 = [0x22u8; 32];
+        let sid = [0x99u8; 32];
+        let client = node_id(0x01);
+        let server = node_id(0xFF);
+        let client_nonce = [0xC0u8; RESUME_NONCE_LEN];
+        let server_nonce = [0x50u8; RESUME_NONCE_LEN];
+
+        // client.tx == K1, client.rx == K2 ; server.tx == K2, server.rx == K1.
+        let cli = derive_resume_keys(&k1, &k2, &sid, &client_nonce, &server_nonce, &client, &server);
+        let srv = derive_resume_keys(&k2, &k1, &sid, &client_nonce, &server_nonce, &server, &client);
+
+        // Cross-side agreement: the resumed session works in both directions.
+        assert_eq!(cli.tx_key, srv.rx_key, "client tx must equal server rx");
+        assert_eq!(cli.rx_key, srv.tx_key, "client rx must equal server tx");
+        // session_id carried through unchanged.
+        assert_eq!(cli.session_id, sid);
+        assert_eq!(srv.session_id, sid);
+        // Keys are FRESH — never the original keys (this is the whole point).
+        assert_ne!(cli.tx_key, k1);
+        assert_ne!(cli.rx_key, k2);
+        assert_ne!(srv.tx_key, k2);
+        assert_ne!(srv.rx_key, k1);
+    }
+
+    #[test]
+    fn resume_different_nonces_yield_different_keys() {
+        let k1 = [0x11u8; 32];
+        let k2 = [0x22u8; 32];
+        let sid = [0x99u8; 32];
+        let client = node_id(0x01);
+        let server = node_id(0xFF);
+
+        let a = derive_resume_keys(
+            &k1,
+            &k2,
+            &sid,
+            &[0x01u8; RESUME_NONCE_LEN],
+            &[0x02u8; RESUME_NONCE_LEN],
+            &client,
+            &server,
+        );
+        // Flip ONLY the server nonce — a fresh-from-one-side change must move keys.
+        let b = derive_resume_keys(
+            &k1,
+            &k2,
+            &sid,
+            &[0x01u8; RESUME_NONCE_LEN],
+            &[0x03u8; RESUME_NONCE_LEN],
+            &client,
+            &server,
+        );
+        assert_ne!(a.tx_key, b.tx_key, "server-nonce change must change keys");
+        // Flip ONLY the client nonce.
+        let c = derive_resume_keys(
+            &k1,
+            &k2,
+            &sid,
+            &[0x04u8; RESUME_NONCE_LEN],
+            &[0x02u8; RESUME_NONCE_LEN],
+            &client,
+            &server,
+        );
+        assert_ne!(a.tx_key, c.tx_key, "client-nonce change must change keys");
+        // Deterministic on identical inputs.
+        let a2 = derive_resume_keys(
+            &k1,
+            &k2,
+            &sid,
+            &[0x01u8; RESUME_NONCE_LEN],
+            &[0x02u8; RESUME_NONCE_LEN],
+            &client,
+            &server,
+        );
+        assert_eq!(a.tx_key, a2.tx_key);
+        assert_eq!(a.rx_key, a2.rx_key);
     }
 
     #[test]

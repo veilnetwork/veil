@@ -410,30 +410,31 @@ pub async fn register_connection_session(
             };
         let known_remote_id: Option<[u8; 32]> =
             expected_peer.as_ref().map(|ep| *ep.node_id.as_bytes());
-        // SECURITY — audit cycle-2 CRITICAL: the session-resumption fast-path is
-        // DISABLED on BOTH sides. On resume both peers restored the ORIGINAL
-        // session's tx/rx keys into a fresh `SessionCipher` whose counter resets
-        // to 0 (handshake.rs:547 server / :641 client); the AEAD nonce is
-        // `dir_salt ‖ counter` with no session-unique salt/epoch
-        // (session_cipher.rs:100), so every resumed frame #i reused the EXACT
-        // (key, nonce) of the original session's frame #i — catastrophic
-        // ChaCha20-Poly1305 nonce reuse (keystream + Poly1305 one-time-key
-        // recovery → plaintext disclosure + frame forgery for anyone who records
-        // both sessions' ciphertext).
+        // Session-resumption fast-path. RE-ENABLED (audit cycle-2): the prior
+        // CRITICAL — resumption restored the ORIGINAL session's tx/rx keys into a
+        // counter-0 `SessionCipher`, repeating the original session's exact
+        // (key, nonce) per frame — is now closed at the handshake layer.
+        // Resumption derives FRESH keys via `veil_crypto::session_kdf::
+        // derive_resume_keys` from the original keys + a per-resumption nonce
+        // minted by EACH side (carried in the HELLO and the ATTACH trailer), so
+        // every resumed session has unique keys even if one peer reuses its
+        // nonce. A peer that sends a ticket WITHOUT a resume nonce is NOT resumed
+        // (the handshake falls back to the full path), so the fix is atomic.
         //
-        // `resume_ticket = None` (outbound) → this node never ORIGINATES a
-        // resumption; `ticket_verifier = None` (inbound) → this node never
-        // ACCEPTS one (so a legacy/hostile peer that still sends a ticket cannot
-        // make *us* resume). Every connection therefore takes the full handshake
-        // — always supported, so no compat break, only a reconnect-latency cost.
-        // Tickets are still issued/stored (harmless), so re-enabling is a local
-        // revert here ONCE resumption derives FRESH keys (HKDF over the ticket
-        // secret + a per-resumption nonce in HELLO/ATTACH) instead of restoring
-        // the originals into a counter-0 cipher.
-        let resume_ticket: Option<veil_proto::session::ClientTicketEntry> = None;
-        let ticket_verifier: Option<
-            std::sync::Arc<std::sync::Mutex<veil_session::ticket::TicketIssuer>>,
-        > = None;
+        // Outbound: replay any stored ticket for this peer (the initiator mints
+        // its own nonce internally). Inbound: offer the issuer so a presented
+        // ticket can be verified (the responder mints + returns its nonce).
+        let (resume_ticket, ticket_verifier) = match source {
+            SessionSource::Outbound(_) => {
+                let ticket = known_remote_id
+                    .and_then(|id| lock!(runtime.resumption.peer_tickets).get(&id).cloned());
+                (ticket, None)
+            }
+            SessionSource::Inbound(_) => {
+                let verifier = Some(Arc::clone(&runtime.resumption.ticket_issuer));
+                (None, verifier)
+            }
+        };
         let hs_timeout = std::time::Duration::from_secs(veil_proto::budget::HANDSHAKE_TIMEOUT_SECS);
         let sovereign_ctx =
             runtime

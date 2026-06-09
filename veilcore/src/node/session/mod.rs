@@ -108,6 +108,7 @@ mod integration_tests {
             node_id: [node_seed; 32],
             resume_ticket: None,
             membership_cert_blob: None,
+            resume_nonce: None,
         };
         write_frame(
             &mut stream,
