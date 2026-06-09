@@ -281,6 +281,17 @@ pub fn meta_encrypt(
 /// callers forgot the prepend.
 ///
 /// Returns `(sender_node_id, src_app_id, app_id, endpoint_id, application_payload)`.
+///
+/// SECURITY — the returned `sender_node_id` (and `src_app_id`) is
+/// **UNAUTHENTICATED**. meta-E2E is the anonymous-sender path: the envelope is
+/// sealed to the recipient with ML-KEM (confidentiality only — a KEM proves
+/// nothing about the origin), so anyone who knows the recipient's published EK
+/// can craft a valid envelope claiming ANY `sender_node_id`. Callers MUST NOT
+/// use it for trust / authorization / routing decisions without an app-layer
+/// signature carried inside `application_payload`. The dispatcher accordingly
+/// does NOT learn a reverse route from a meta-E2E sender (audit cycle-4 M2).
+/// The authenticated path is the `E2E_MARKER` flow, which binds the sender to
+/// the OVL1 session peer.
 pub fn meta_decrypt(
     dk_seed: &[u8],
     dst_id: &[u8; 32],
