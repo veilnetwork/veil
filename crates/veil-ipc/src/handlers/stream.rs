@@ -187,7 +187,7 @@ async fn handle_stream_open_remote(
         .pending_receipts
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(wire_stream_id, receipt_tx);
+        .insert((dst, wire_stream_id), receipt_tx);
     let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(veil_proto::budget::PROXY_STREAM_CHANNEL_CAP);
     bridge
         .veil_stream_rx
@@ -350,7 +350,7 @@ fn deregister_wire_stream(bridge: &IpcStreamBridge, dst: &[u8; 32], wire_stream_
         .pending_receipts
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(&wire_stream_id);
+        .remove(&(*dst, wire_stream_id));
     bridge
         .veil_stream_rx
         .lock()

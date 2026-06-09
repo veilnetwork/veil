@@ -28,11 +28,14 @@ use tokio::sync::{mpsc, oneshot};
 /// owning surface (the IPC client's delivery channel, or the proxy socket).
 pub type VeilStreamRxMap = Arc<Mutex<HashMap<([u8; 32], u32), mpsc::Sender<Vec<u8>>>>>;
 
-/// `wire_stream_id` → one-shot receipt waiter.
+/// `(peer_id, wire_stream_id)` → one-shot receipt waiter.
 ///
 /// Completed by the dispatcher with the `AppReceipt` status byte when the
-/// remote peer accepts (or rejects) a freshly-sent `AppOpen`.
-pub type PendingReceiptMap = Arc<Mutex<HashMap<u32, oneshot::Sender<u8>>>>;
+/// remote peer accepts (or rejects) a freshly-sent `AppOpen`. Keyed by the
+/// same `(node_id, wire_stream_id)` pair as `veil_stream_rx` so a receipt is
+/// matched to the exact opener even if the shared `u32` `wire_stream_counter`
+/// ever wraps.
+pub type PendingReceiptMap = Arc<Mutex<HashMap<([u8; 32], u32), oneshot::Sender<u8>>>>;
 
 /// Daemon-supplied shared state that enables the IPC server's cross-node
 /// stream-forwarding path. Cloned into the [`crate::server::IpcServer`] at

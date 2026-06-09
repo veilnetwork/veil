@@ -50,8 +50,13 @@ use crate::socks5::{BiStream, ProxyConnector, ProxyDestination, Socks5Error};
 
 // ── Type aliases ─────────────────────────────────────────────────────────────
 
-/// Map: `stream_id → receipt waiter` for locally-initiated veil streams.
-pub type PendingReceiptMap = Arc<Mutex<HashMap<u32, oneshot::Sender<u8>>>>;
+/// Map: `(peer_id, stream_id) → receipt waiter` for locally-initiated veil
+/// streams. Keyed by the SAME `(node_id, wire_stream_id)` pair as
+/// [`VeilStreamRxMap`] so a receipt is always matched to the exact opener:
+/// the shared `wire_stream_counter` is a `u32`, so without the peer in the
+/// key a 2^32 wraparound (over a very long-lived process) could let a late
+/// receipt resolve a different peer's still-pending waiter.
+pub type PendingReceiptMap = Arc<Mutex<HashMap<([u8; 32], u32), oneshot::Sender<u8>>>>;
 
 /// Map: `(peer_id, stream_id) → byte channel` for inbound stream data routing.
 pub type VeilStreamRxMap = Arc<Mutex<HashMap<([u8; 32], u32), mpsc::Sender<Vec<u8>>>>>;
@@ -189,7 +194,7 @@ impl ProxyConnector for VeilConnector {
         self.pending_receipts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(stream_id, receipt_tx);
+            .insert((exit_node_id, stream_id), receipt_tx);
 
         // Register the inbound data channel.
         let (data_tx, data_rx) =
@@ -221,7 +226,7 @@ impl ProxyConnector for VeilConnector {
             self.pending_receipts
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .remove(&stream_id);
+                .remove(&(exit_node_id, stream_id));
             self.veil_stream_rx
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
