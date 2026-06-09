@@ -292,6 +292,13 @@ impl ClientHandshake {
         // ECDH with server's elligator-decoded pubkey.
         let server_pk = decode_representative(&server_repr);
         let mut shared = ecdh(self.ephemeral.private(), &server_pk);
+        // Reject non-contributory / low-order points: `decode_representative`
+        // is total and can map to a low-order point, yielding an all-zero
+        // shared secret. Such a secret must never feed AUTH-key derivation —
+        // fail closed before it is used. (audit: obfs4 ecdh low-order reject.)
+        if shared == [0u8; 32] {
+            return Err(HandshakeError::AuthMismatch);
+        }
 
         // Derive AUTH key + verify server's AUTH MAC.  Variant-aware
         // HKDF label + MAC context — a V2 client cannot validate a
@@ -448,6 +455,11 @@ impl ServerHandshake {
 
         let client_pk = decode_representative(&client_repr);
         let mut shared = ecdh(ephemeral.private(), &client_pk);
+        // Reject non-contributory / low-order points (all-zero shared secret)
+        // before deriving the AUTH key — fail closed. (audit: obfs4 ecdh.)
+        if shared == [0u8; 32] {
+            return Err(HandshakeError::AuthMismatch);
+        }
         let auth_key = derive_auth_key_for(&shared, matched_variant);
         // AUTH binds the matched client epoch (echoed) and our server epoch.
         // Neither is on the wire; the client reconstructs our epoch from its
