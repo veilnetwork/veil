@@ -257,30 +257,28 @@ impl FrameDispatcher {
             );
             return DispatchResult::NoResponse;
         };
-        let subscriber = match reg.lookup(&intro.auth_cookie) {
+        // Look up by (receiver_node_id, cookie). The registry is
+        // namespaced by the registrant's authenticated peer_node_id, so
+        // this resolves only the genuine receiver's entry — a squatter
+        // who registered the same (public) cookie under a different
+        // identity is keyed elsewhere and never matched here. This also
+        // makes the old explicit `receiver_node_id == peer_node_id`
+        // check structurally guaranteed: the resolved subscriber's
+        // peer_node_id IS `intro.receiver_node_id`.
+        let subscriber = match reg.lookup(&intro.receiver_node_id, &intro.auth_cookie) {
             Some(s) => s,
             None => {
-                // Cookie unknown. Silent drop: surfacing this would
-                // leak "this rendezvous serves cookie X / Y" to sender
-                // probes — exactly what the auth_cookie cipher-shape
-                // is designed to hide.
+                // No entry for this (receiver, cookie). Silent drop:
+                // surfacing this would leak "this rendezvous serves
+                // cookie X / Y" to sender probes — exactly what the
+                // auth_cookie cipher-shape is designed to hide.
                 self.logger.info(
                     "anonymity.relay_chain.introduce.cookie_unknown",
-                    "no subscriber registered for this auth_cookie; dropped",
+                    "no subscriber registered for this (receiver, auth_cookie); dropped",
                 );
                 return DispatchResult::NoResponse;
             }
         };
-        // Verify intro's claimed receiver_node_id matches the
-        // subscriber's session peer_id. Mismatch could indicate a
-        // sender that built ad with stale receiver_node_id; silent drop.
-        if intro.receiver_node_id != subscriber.peer_node_id {
-            self.logger.info(
-                "anonymity.relay_chain.introduce.receiver_mismatch",
-                "intro.receiver_node_id != subscriber peer_id; dropped",
-            );
-            return DispatchResult::NoResponse;
-        }
         // Forward the ciphertext over the subscriber's OVL1 session.
         let forward = ForwardIntroducePayload {
             ciphertext: intro.ciphertext,
@@ -767,7 +765,11 @@ mod tests {
         let node_id: NodeId = node_id_bytes.into();
         let result = dispatcher.dispatch_relay_chain(&hdr, &body, node_id);
         assert!(matches!(result, DispatchResult::NoResponse));
-        let sub = registry.lookup(&req.auth_cookie).expect("registered");
+        // Registry is namespaced by the authenticated session
+        // peer_node_id — look up under it.
+        let sub = registry
+            .lookup(&node_id_bytes, &req.auth_cookie)
+            .expect("registered");
         assert_eq!(sub.peer_node_id, node_id_bytes);
         assert_eq!(sub.receiver_x25519_pk, req.receiver_x25519_pk);
     }

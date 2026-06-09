@@ -1635,7 +1635,24 @@ pub struct RendezvousSubscriber {
     pub registered_at_unix: u64,
 }
 
-/// In-memory cookie → subscriber map. Bounded and thread-safe.
+/// In-memory `(peer_node_id, cookie)` → subscriber map. Bounded and
+/// thread-safe.
+///
+/// The map is keyed by the **pair** of the registrant's authenticated
+/// OVL1 `peer_node_id` *and* the cookie — not the cookie alone. The
+/// `auth_cookie` is published in the receiver's DHT rendezvous-ad and
+/// is therefore readable by anyone. Keying by cookie alone let an
+/// attacker who scraped a victim's ad `register()` that cookie first
+/// under their own session and lock the genuine receiver out with a
+/// cookie-collision rejection — a pure availability DoS (the squatter could
+/// never *read* the sender's Introduce, since those are sealed to the
+/// receiver's X25519 key and the relay also matches
+/// `intro.receiver_node_id` against the registrant, but the receiver
+/// could no longer register). Namespacing by `peer_node_id` lets the
+/// attacker's `(attacker, cookie)` and the victim's `(victim, cookie)`
+/// coexist: the attacker's dead entry is never looked up (the
+/// Introduce relay keys lookups by the ad's `receiver_node_id`), and
+/// the victim is never blocked.
 ///
 /// Bounded by `MAX_REGISTRATIONS` to prevent a single rogue receiver
 /// from exhausting rendezvous memory by registering millions of cookies.
@@ -1647,8 +1664,13 @@ pub struct RendezvousRegistry {
     max_registrations: usize,
 }
 
+/// Registry key: the registrant's authenticated `peer_node_id` paired
+/// with the cookie. See [`RendezvousRegistry`] for why the cookie alone
+/// is insufficient.
+type RegistrationKey = ([u8; NODE_ID_LEN], [u8; AUTH_COOKIE_LEN]);
+
 struct RendezvousRegistryInner {
-    cookies: std::collections::HashMap<[u8; AUTH_COOKIE_LEN], RendezvousSubscriber>,
+    cookies: std::collections::HashMap<RegistrationKey, RendezvousSubscriber>,
 }
 
 /// Default cap on rendezvous registrations. 10k cookies × ~80 B per
@@ -1671,8 +1693,6 @@ pub const DEFAULT_RENDEZVOUS_REGISTRY_TTL_SECS: u64 = 6 * 3600;
 pub enum RegistryError {
     #[error("registry full ({cap} entries) — refusing new registration")]
     Full { cap: usize },
-    #[error("cookie already registered to a different subscriber")]
-    CookieCollision,
     /// a same-peer re-registration tried to swap
     /// `receiver_x25519_pk` without going through unregister-first.
     /// Silently allowing the swap is a receiver-pivot vector — an
@@ -1702,32 +1722,43 @@ impl RendezvousRegistry {
         }
     }
 
-    /// Register a cookie for the given subscriber. Idempotent on
-    /// same-subscriber repeat (refreshes `registered_at_unix`); rejects
-    /// `CookieCollision` if a different peer already holds the cookie.
+    /// Register a cookie for the given subscriber. The entry is keyed
+    /// by `(subscriber.peer_node_id, cookie)` — the `peer_node_id` is
+    /// the registrant's *authenticated* OVL1 session identity, set by
+    /// the dispatcher at the crate boundary, not anything the caller
+    /// can spoof.
     ///
-    /// silent swap of `receiver_x25519_pk`
-    /// within an existing `(cookie, peer_node_id)` binding is a
-    /// receiver-pivot vector and is now rejected with
+    /// Idempotent on same-subscriber repeat (refreshes
+    /// `registered_at_unix`). Because the key includes `peer_node_id`,
+    /// two different peers registering the same (public) cookie no
+    /// longer collide — each gets its own entry. This is what defeats
+    /// cookie-squatting: an attacker who scraped a victim's ad cannot
+    /// take over or block the victim's `(victim, cookie)` slot. See
+    /// [`RendezvousRegistry`] for the full rationale.
+    ///
+    /// A silent swap of `receiver_x25519_pk` within an existing
+    /// `(peer_node_id, cookie)` binding is a receiver-pivot vector and
+    /// is rejected with
     /// [`RegistryError::PubkeyRotationNeedsFreshCookie`]. Peers
     /// rotating their X25519 key must unregister the old cookie first
-    /// and register a fresh one. Other fields (e.g. `transports`
+    /// and register a fresh one. Other fields (e.g.
     /// `registered_at_unix`) may still refresh in-place.
     pub fn register(
         &self,
         cookie: [u8; AUTH_COOKIE_LEN],
         subscriber: RendezvousSubscriber,
     ) -> Result<(), RegistryError> {
+        let key: RegistrationKey = (subscriber.peer_node_id, cookie);
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(existing) = g.cookies.get(&cookie) {
-            if existing.peer_node_id != subscriber.peer_node_id {
-                return Err(RegistryError::CookieCollision);
-            }
+        if let Some(existing) = g.cookies.get(&key) {
+            // Same (peer_node_id, cookie) — peer matches by key
+            // construction, so the only thing to guard is an x25519
+            // rotation (receiver-pivot vector).
             if existing.receiver_x25519_pk != subscriber.receiver_x25519_pk {
                 return Err(RegistryError::PubkeyRotationNeedsFreshCookie);
             }
             // Same subscriber AND same x25519_pk — refresh the rest.
-            g.cookies.insert(cookie, subscriber);
+            g.cookies.insert(key, subscriber);
             return Ok(());
         }
         if g.cookies.len() >= self.max_registrations {
@@ -1735,53 +1766,45 @@ impl RendezvousRegistry {
                 cap: self.max_registrations,
             });
         }
-        g.cookies.insert(cookie, subscriber);
+        g.cookies.insert(key, subscriber);
         Ok(())
     }
 
-    /// Remove a cookie if registered by a subscriber whose
-    /// `peer_node_id` matches `requesting_peer`. Mismatched requester
-    /// is silently ignored (anti-DoS: an attacker who guesses someone
-    /// else's cookie shouldn't be able to deregister their).
+    /// Remove the `(requesting_peer, cookie)` registration if present.
+    /// Because the registry is keyed by `(peer_node_id, cookie)`, a
+    /// requester can only ever address their own entry — an attacker
+    /// who guesses someone else's cookie cannot deregister it (their
+    /// key is `(attacker, cookie)`, a different slot). Returns whether
+    /// an entry was removed.
     pub fn unregister(
         &self,
         cookie: &[u8; AUTH_COOKIE_LEN],
         requesting_peer: &[u8; NODE_ID_LEN],
     ) -> bool {
+        let key: RegistrationKey = (*requesting_peer, *cookie);
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        match g.cookies.get(cookie) {
-            Some(sub) if &sub.peer_node_id == requesting_peer => {
-                g.cookies.remove(cookie);
-                true
-            }
-            _ => false,
-        }
+        g.cookies.remove(&key).is_some()
     }
 
-    /// Look up the subscriber that registered `cookie`. Returns
-    /// `None` if no subscriber holds that cookie.
-    pub fn lookup(&self, cookie: &[u8; AUTH_COOKIE_LEN]) -> Option<RendezvousSubscriber> {
+    /// Look up the subscriber that registered `cookie` under
+    /// `receiver_node_id`. The Introduce relay supplies the
+    /// `receiver_node_id` from the sender's (signed) rendezvous-ad, so
+    /// only the genuine receiver's entry is ever resolved — a squatter
+    /// who registered the same cookie under a different identity is
+    /// keyed elsewhere and never matched. Returns `None` if no such
+    /// entry exists.
+    pub fn lookup(
+        &self,
+        receiver_node_id: &[u8; NODE_ID_LEN],
+        cookie: &[u8; AUTH_COOKIE_LEN],
+    ) -> Option<RendezvousSubscriber> {
+        let key: RegistrationKey = (*receiver_node_id, *cookie);
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .cookies
-            .get(cookie)
+            .get(&key)
             .cloned()
-    }
-
-    /// cheap projection-only
-    /// lookup that returns just the fields the dispatcher actually
-    /// needs (peer_node_id) instead of cloning the full
-    /// `RendezvousSubscriber` (which under also pulls in the
-    /// `receiver_x25519_pk` + Zeroize machinery). Hot paths in the
-    /// dispatcher's ForwardIntroduce handler should prefer this.
-    pub fn lookup_peer_node_id(&self, cookie: &[u8; AUTH_COOKIE_LEN]) -> Option<[u8; NODE_ID_LEN]> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .cookies
-            .get(cookie)
-            .map(|s| s.peer_node_id)
     }
 
     /// drop every registration older than
@@ -2479,23 +2502,47 @@ mod tests {
         let sub = make_subscriber(0x11);
         assert!(reg.register(cookie, sub.clone()).is_ok());
         assert_eq!(reg.len(), 1);
-        let found = reg.lookup(&cookie).unwrap();
+        let found = reg.lookup(&sub.peer_node_id, &cookie).unwrap();
         assert_eq!(found.peer_node_id, sub.peer_node_id);
     }
 
     #[test]
     fn epic482_5_registry_lookup_unknown_returns_none() {
         let reg = RendezvousRegistry::default();
-        assert!(reg.lookup(&[0u8; AUTH_COOKIE_LEN]).is_none());
+        assert!(
+            reg.lookup(&[0u8; NODE_ID_LEN], &[0u8; AUTH_COOKIE_LEN])
+                .is_none()
+        );
     }
 
+    /// Two *different* peers registering the same (public) cookie must
+    /// NOT collide — the registry is keyed by `(peer_node_id, cookie)`,
+    /// so each gets an independent entry. This is the cookie-squatting
+    /// defence: an attacker who scraped a victim's DHT ad and
+    /// registered the victim's cookie under their own authenticated
+    /// session cannot block or hijack the victim's slot.
     #[test]
-    fn epic482_5_registry_collision_rejected() {
+    fn rendezvous_cross_peer_same_cookie_coexist_no_squat() {
         let reg = RendezvousRegistry::default();
         let cookie = [0xBB; AUTH_COOKIE_LEN];
-        reg.register(cookie, make_subscriber(0x11)).unwrap();
-        let result = reg.register(cookie, make_subscriber(0x22));
-        assert!(matches!(result, Err(RegistryError::CookieCollision)));
+        let victim = make_subscriber(0x11);
+        let attacker = make_subscriber(0x22);
+        // Attacker squats the cookie first.
+        reg.register(cookie, attacker.clone()).unwrap();
+        // Victim registers the SAME cookie — must still succeed.
+        reg.register(cookie, victim.clone()).unwrap();
+        assert_eq!(reg.len(), 2, "both entries coexist under distinct peers");
+        // Each peer resolves to its OWN entry; the squatter cannot
+        // shadow the victim's registration.
+        let v = reg
+            .lookup(&victim.peer_node_id, &cookie)
+            .expect("victim entry present");
+        assert_eq!(v.peer_node_id, victim.peer_node_id);
+        assert_eq!(v.receiver_x25519_pk, victim.receiver_x25519_pk);
+        let a = reg
+            .lookup(&attacker.peer_node_id, &cookie)
+            .expect("attacker entry present");
+        assert_eq!(a.peer_node_id, attacker.peer_node_id);
     }
 
     #[test]
@@ -2531,7 +2578,7 @@ mod tests {
         assert!(matches!(err, RegistryError::PubkeyRotationNeedsFreshCookie));
         // The original subscriber is still active — registry didn't
         // overwrite anything despite the rejection.
-        let still = reg.lookup(&cookie).unwrap();
+        let still = reg.lookup(&sub_v1.peer_node_id, &cookie).unwrap();
         assert_eq!(
             still.receiver_x25519_pk, sub_v1.receiver_x25519_pk,
             "rejected re-register must leave the original entry intact"
@@ -2549,7 +2596,7 @@ mod tests {
         let mut sub_v2 = sub_v1.clone();
         sub_v2.registered_at_unix = sub_v1.registered_at_unix + 60;
         reg.register(cookie, sub_v2.clone()).unwrap();
-        let r = reg.lookup(&cookie).unwrap();
+        let r = reg.lookup(&sub_v1.peer_node_id, &cookie).unwrap();
         assert_eq!(r.registered_at_unix, sub_v2.registered_at_unix);
     }
 
@@ -2566,7 +2613,7 @@ mod tests {
         sub_v2.receiver_x25519_pk = [0xCD; X25519_PK_LEN];
         // Fresh registration after unregister succeeds.
         reg.register(cookie, sub_v2.clone()).unwrap();
-        let r = reg.lookup(&cookie).unwrap();
+        let r = reg.lookup(&sub_v1.peer_node_id, &cookie).unwrap();
         assert_eq!(r.receiver_x25519_pk, sub_v2.receiver_x25519_pk);
     }
 
@@ -2588,7 +2635,8 @@ mod tests {
         assert_eq!(evicted, 1, "stale entry must be evicted");
         assert_eq!(reg.len(), 1);
         assert!(
-            reg.lookup(&[0xA1; AUTH_COOKIE_LEN]).is_some(),
+            reg.lookup(&[0x20; NODE_ID_LEN], &[0xA1; AUTH_COOKIE_LEN])
+                .is_some(),
             "fresh entry must survive"
         );
     }
@@ -2602,10 +2650,10 @@ mod tests {
         // Stranger tries to unregister — silently ignored.
         let imposter = [0x99; NODE_ID_LEN];
         assert!(!reg.unregister(&cookie, &imposter));
-        assert!(reg.lookup(&cookie).is_some());
+        assert!(reg.lookup(&owner.peer_node_id, &cookie).is_some());
         // Real owner unregisters — succeeds.
         assert!(reg.unregister(&cookie, &owner.peer_node_id));
-        assert!(reg.lookup(&cookie).is_none());
+        assert!(reg.lookup(&owner.peer_node_id, &cookie).is_none());
     }
 
     #[test]
