@@ -153,6 +153,12 @@ pub fn context_from_config(config: &Config) -> Result<TransportContext> {
     if let Some(ref dir) = config.transport.webtunnel_decoy_dir {
         ctx.webtunnel_decoy_dir = Some(dir.clone());
     }
+    // Optional response-timing floor (anti-probe). 0 == disabled (same as unset).
+    if let Some(ms) = config.transport.webtunnel_response_floor_ms
+        && ms > 0
+    {
+        ctx.webtunnel_response_floor = Some(std::time::Duration::from_millis(ms));
+    }
     // Anti-censorship: optional SOCKS fallback for outbound dials.
     // Default `None` — direct outbound only.  Operator opts in by
     // setting `[transport] outbound_socks_fallback_proxy = "socks5://..."`.

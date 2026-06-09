@@ -230,7 +230,10 @@ impl Transport for WebtunnelWssTransport {
             let listener = TcpListener::bind((host, port)).await?;
             let matcher = build_matcher(&ctx)?;
             let decoy = build_decoy(&ctx);
-            let router = WebtunnelRouter::new(matcher, decoy);
+            let mut router = WebtunnelRouter::new(matcher, decoy);
+            if let Some(floor) = ctx.webtunnel_response_floor {
+                router = router.with_response_floor(floor);
+            }
             let acceptor = TlsAcceptor::from(Arc::clone(&ctx.tls.server_config));
             Ok(Box::new(WebtunnelListener {
                 listener,

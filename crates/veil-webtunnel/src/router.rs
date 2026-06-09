@@ -24,7 +24,9 @@
 #![allow(clippy::result_large_err)] // WebSocketStream Ok-arm is also large; no boxing benefit
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_tungstenite::WebSocketStream;
 
@@ -62,6 +64,9 @@ pub enum RouterError {
 pub struct WebtunnelRouter {
     matcher: Arc<SecretMatcher>,
     decoy: Arc<dyn DecoyProvider>,
+    /// Optional response-timing floor (see [`Self::with_response_floor`]).
+    /// `None` => respond as soon as ready (default).
+    response_floor: Option<Duration>,
 }
 
 impl WebtunnelRouter {
@@ -69,7 +74,31 @@ impl WebtunnelRouter {
         Self {
             matcher: Arc::new(matcher),
             decoy,
+            response_floor: None,
         }
+    }
+
+    /// Enable response-timing uniformity: hold every response — the tunnel
+    /// `101 Switching Protocols` AND the decoy — until at least `floor` (plus a
+    /// small random jitter) has elapsed since the request was fully read.
+    ///
+    /// This collapses the decoy-vs-tunnel *timing* distinguisher. Without it a
+    /// tunnel match emits a near-instant 101 (just a SHA-1 + write) while a
+    /// decoy response waits on a slower, variable decoy fetch (`tokio::fs::read`
+    /// or an HTTP-proxy round-trip), so an active prober can tell a real tunnel
+    /// endpoint from a plain site by latency alone — even though Part 1 already
+    /// made the two byte-identical.
+    ///
+    /// Off by default: it adds up to `floor` of latency to every real tunnel
+    /// handshake, so operators opt in where probe resistance outweighs handshake
+    /// RTT. Choose a `floor` above the worst-case decoy-fetch time (for an
+    /// HTTP-proxy decoy, above the backend's typical latency); a decoy fetch
+    /// that overruns the floor still responds late and is not masked. A zero
+    /// `floor` disables the feature (same as `None`).
+    #[must_use]
+    pub fn with_response_floor(mut self, floor: Duration) -> Self {
+        self.response_floor = (!floor.is_zero()).then_some(floor);
+        self
     }
 
     /// Handle one inbound connection.  Returns:
@@ -117,6 +146,11 @@ impl WebtunnelRouter {
         // that; Phase 5c can refactor if a cleaner tungstenite API
         // surfaces.
         let (request, residual, mut stream) = read_http_request(stream).await?;
+        // Anchor for the optional response-timing floor: padding is measured
+        // from the moment the full request is in hand, i.e. it normalises the
+        // *processing* time (where tunnel and decoy diverge), not the
+        // client-paced request read. No-op unless `response_floor` is set.
+        let received_at = Instant::now();
 
         let path = request.uri.as_str();
         let header_name = matcher.auth_header_name();
@@ -133,11 +167,14 @@ impl WebtunnelRouter {
                 // "wrong path". This branch runs BEFORE the 101 is written, so
                 // falling back to the decoy is still possible. (audit cycle-2:
                 // anti-probe behavioral distinguisher. The decoy-vs-tunnel
-                // *timing* distinguisher is tracked separately.)
+                // *timing* distinguisher is addressed separately + opt-in by
+                // `with_response_floor`, which pads this decoy and the 101 to a
+                // common floor.)
                 let sec_key = match request.header("Sec-WebSocket-Key") {
                     Some(k) => k,
                     None => {
                         let resp = decoy.respond(&request.method, path).await?;
+                        pad_to_floor(self.response_floor, received_at).await;
                         write_http_response(&mut stream, &resp).await?;
                         stream.flush().await?;
                         let _ = stream.shutdown().await;
@@ -152,6 +189,7 @@ impl WebtunnelRouter {
                      Sec-WebSocket-Accept: {accept}\r\n\
                      \r\n"
                 );
+                pad_to_floor(self.response_floor, received_at).await;
                 stream.write_all(response.as_bytes()).await?;
                 stream.flush().await?;
 
@@ -180,12 +218,33 @@ impl WebtunnelRouter {
             }
             MatchResult::Decoy => {
                 let resp = decoy.respond(&request.method, path).await?;
+                pad_to_floor(self.response_floor, received_at).await;
                 write_http_response(&mut stream, &resp).await?;
                 stream.flush().await?;
                 let _ = stream.shutdown().await;
                 Err(RouterError::ServedDecoy)
             }
         }
+    }
+}
+
+/// Sleep until `floor` (plus up to ~25% random jitter) has elapsed since
+/// `received_at`. No-op when `floor` is `None` or has already passed.
+///
+/// The jitter keeps the padded response time from collapsing to a tell-tale
+/// constant; it is bounded above by the floor so timing stays in a tight band.
+async fn pad_to_floor(floor: Option<Duration>, received_at: Instant) {
+    let Some(floor) = floor else {
+        return;
+    };
+    let jitter_max_ns = (floor / 4).as_nanos() as u64;
+    let jitter = if jitter_max_ns > 0 {
+        Duration::from_nanos(rand::rng().next_u64() % (jitter_max_ns + 1))
+    } else {
+        Duration::ZERO
+    };
+    if let Some(remaining) = (floor + jitter).checked_sub(received_at.elapsed()) {
+        tokio::time::sleep(remaining).await;
     }
 }
 
@@ -495,6 +554,47 @@ mod tests {
 
         let result = router_task.await.unwrap();
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn response_floor_holds_decoy_until_floor() {
+        let (mut client, server) = duplex(64 * 1024);
+        let matcher = SecretMatcher::with_auth("/_t/abc", "X-Veil-Auth", b"correct-token".to_vec());
+        let decoy = Arc::new(StaticStringDecoy::new("<h1>Welcome</h1>"));
+        let floor = Duration::from_millis(80);
+        let router = WebtunnelRouter::new(matcher, decoy).with_response_floor(floor);
+        let router_task = tokio::spawn(async move { router.handle(server).await });
+
+        let start = Instant::now();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let mut buf = Vec::new();
+        let _ = client.read_to_end(&mut buf).await;
+        let elapsed = start.elapsed();
+
+        // The (fast) static decoy would otherwise return in microseconds; the
+        // floor must hold it back at least `floor`. Only the lower bound is
+        // asserted — the upper bound (floor + jitter) is timing-flaky.
+        assert!(
+            elapsed >= floor,
+            "decoy held {elapsed:?}, expected >= {floor:?}"
+        );
+        assert!(String::from_utf8_lossy(&buf).contains("<h1>Welcome</h1>"));
+        assert!(matches!(
+            router_task.await.unwrap(),
+            Err(RouterError::ServedDecoy)
+        ));
+    }
+
+    #[test]
+    fn response_floor_zero_disables() {
+        let matcher = SecretMatcher::with_auth("/_t/abc", "X-Veil-Auth", b"tok".to_vec());
+        let decoy = Arc::new(StaticStringDecoy::new("x"));
+        let r = WebtunnelRouter::new(matcher, decoy).with_response_floor(Duration::ZERO);
+        assert!(r.response_floor.is_none(), "zero floor disables timing");
     }
 
     #[test]
