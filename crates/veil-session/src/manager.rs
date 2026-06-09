@@ -5,7 +5,7 @@
 //! transport metadata keyed by `LinkId` (assigned at connection accept
 //! well before `SESSION_CONFIRM`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use veil_cfg::NodeId;
 use veil_identity::verify::ValidatedIdentity;
@@ -75,6 +75,14 @@ pub struct SessionRegistry {
     /// `InstanceTag::All`. Populated only for sessions whose
     /// handshake produced a [`ValidatedIdentity`].
     by_identity_instance: HashMap<([u8; 32], [u8; 16]), SessionId>,
+    /// Tertiary index: `node_id → {instance_id}` — the set of instances present
+    /// in `by_identity_instance` for each identity. Lets `InstanceTag::Any`/
+    /// `All` resolution (which only knows the node_id) enumerate an identity's
+    /// instances in O(instances) instead of an O(total-sessions) scan of
+    /// `by_identity_instance`. Maintained in lockstep: an instance is added on
+    /// insert and removed only when its `by_identity_instance` entry is actually
+    /// removed (same reconnect-race guard). (audit cycle-3 perf.)
+    by_identity: HashMap<[u8; 32], HashSet<[u8; 16]>>,
 }
 
 impl SessionRegistry {
@@ -88,6 +96,10 @@ impl SessionRegistry {
         if let Some(ref v) = entry.validated_sovereign_identity {
             self.by_identity_instance
                 .insert((v.node_id, v.active_instance_id), entry.session_id);
+            self.by_identity
+                .entry(v.node_id)
+                .or_default()
+                .insert(v.active_instance_id);
         }
         self.sessions.insert(entry.session_id, entry);
     }
@@ -119,6 +131,15 @@ impl SessionRegistry {
                 // key could have overwritten it.
                 if self.by_identity_instance.get(&key) == Some(&entry.session_id) {
                     self.by_identity_instance.remove(&key);
+                    // Keep the node_id→instances index in lockstep: only drop
+                    // the instance here (under the same guard), and prune the
+                    // node_id key once its last instance is gone.
+                    if let Some(set) = self.by_identity.get_mut(&v.node_id) {
+                        set.remove(&v.active_instance_id);
+                        if set.is_empty() {
+                            self.by_identity.remove(&v.node_id);
+                        }
+                    }
                 }
             }
             Some(entry)
@@ -159,15 +180,11 @@ impl SessionRegistry {
     /// [`Self::peer_ids_for_identity`].
     pub fn get_by_node_id(&self, node_id: &NodeId) -> Option<&SessionEntry> {
         let node_id_bytes = node_id.as_bytes();
-        self.by_identity_instance
-            .iter()
-            .find_map(|((id, _inst), sid)| {
-                if id == node_id_bytes {
-                    self.sessions.get(sid)
-                } else {
-                    None
-                }
-            })
+        self.by_identity.get(node_id_bytes)?.iter().find_map(|inst| {
+            self.by_identity_instance
+                .get(&(*node_id_bytes, *inst))
+                .and_then(|sid| self.sessions.get(sid))
+        })
     }
 
     /// look up a session by the peer's `(node_id
@@ -203,14 +220,15 @@ impl SessionRegistry {
     /// delivery target.
     pub fn peer_ids_for_identity(&self, node_id: &NodeId) -> Vec<([u8; 16], [u8; 32])> {
         let node_id_bytes = node_id.as_bytes();
-        self.by_identity_instance
-            .iter()
-            .filter_map(|((id, inst), sid)| {
-                if id == node_id_bytes {
-                    self.sessions.get(sid).map(|e| (*inst, e.remote_node_id))
-                } else {
-                    None
-                }
+        self.by_identity
+            .get(node_id_bytes)
+            .into_iter()
+            .flatten()
+            .filter_map(|inst| {
+                self.by_identity_instance
+                    .get(&(*node_id_bytes, *inst))
+                    .and_then(|sid| self.sessions.get(sid))
+                    .map(|e| (*inst, e.remote_node_id))
             })
             .collect()
     }
@@ -261,18 +279,19 @@ impl SessionRegistry {
     {
         let node_id_bytes = node_id.as_bytes();
         let candidates: Vec<([u8; 16], [u8; 32], f64)> = self
-            .by_identity_instance
-            .iter()
-            .filter_map(|((id, inst), sid)| {
-                if id == node_id_bytes {
-                    self.sessions.get(sid).map(|e| {
+            .by_identity
+            .get(node_id_bytes)
+            .into_iter()
+            .flatten()
+            .filter_map(|inst| {
+                self.by_identity_instance
+                    .get(&(*node_id_bytes, *inst))
+                    .and_then(|sid| self.sessions.get(sid))
+                    .map(|e| {
                         let peer = e.remote_node_id;
                         let score = scorer(peer, *inst);
                         (*inst, peer, score)
                     })
-                } else {
-                    None
-                }
             })
             .collect();
         // Highest score wins; deterministic tie-break by (instance, peer).
@@ -297,15 +316,12 @@ impl SessionRegistry {
 
     pub fn peer_id_for_identity(&self, node_id: &NodeId) -> Option<[u8; 32]> {
         let node_id_bytes = node_id.as_bytes();
-        self.by_identity_instance
-            .iter()
-            .find_map(|((id, _inst), sid)| {
-                if id == node_id_bytes {
-                    self.sessions.get(sid).map(|e| e.remote_node_id)
-                } else {
-                    None
-                }
-            })
+        self.by_identity.get(node_id_bytes)?.iter().find_map(|inst| {
+            self.by_identity_instance
+                .get(&(*node_id_bytes, *inst))
+                .and_then(|sid| self.sessions.get(sid))
+                .map(|e| e.remote_node_id)
+        })
     }
 
     /// unified routing: resolve a sovereign [`Recipient`]
@@ -509,6 +525,51 @@ mod tests {
     }
 
     // ── 462.20: (node_id, instance_id) composite index ──
+
+    #[test]
+    fn by_identity_index_survives_reconnect_race_and_removal() {
+        // audit cycle-3: the node_id->instances index must stay in lockstep with
+        // by_identity_instance through a reconnect race (a new session takes the
+        // same (node_id, instance) slot before the old session is removed).
+        let mut reg = SessionRegistry::new();
+        let node_id = [0xCD; 32];
+        let inst = [0x07; 16];
+
+        let mut a = make_sovereign_entry(0x30, node_id);
+        a.session_id = [0x30; 32];
+        a.remote_node_id = [0x31; 32];
+        a.validated_sovereign_identity
+            .as_mut()
+            .unwrap()
+            .active_instance_id = inst;
+        reg.insert(a);
+
+        // Reconnect: B takes the same (node_id, instance) slot.
+        let mut b = make_sovereign_entry(0x40, node_id);
+        b.session_id = [0x40; 32];
+        b.remote_node_id = [0x41; 32];
+        b.validated_sovereign_identity
+            .as_mut()
+            .unwrap()
+            .active_instance_id = inst;
+        reg.insert(b);
+
+        // Removing the OLD session must NOT evict the live (B) index entry.
+        reg.remove(&[0x30; 32]);
+        assert_eq!(
+            reg.peer_id_for_identity(&NodeId::from(node_id)),
+            Some([0x41; 32])
+        );
+        assert_eq!(
+            reg.peer_ids_for_identity(&NodeId::from(node_id)),
+            vec![(inst, [0x41; 32])]
+        );
+
+        // Removing the live session clears the index entirely.
+        reg.remove(&[0x40; 32]);
+        assert_eq!(reg.peer_id_for_identity(&NodeId::from(node_id)), None);
+        assert!(reg.peer_ids_for_identity(&NodeId::from(node_id)).is_empty());
+    }
 
     #[test]
     fn two_instances_of_same_identity_coexist() {
