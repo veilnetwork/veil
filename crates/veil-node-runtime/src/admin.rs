@@ -1690,7 +1690,7 @@ pub fn resolve_admin_endpoint(config: &Config, config_dir: Option<&Path>) -> Res
     // variant, so we pre-extract `?runtime_dir=` and strip it
     // before parsing. Once TransportUri learns query params natively this
     // block collapses.
-    let (uri_body, query_runtime_dir) = split_admin_uri_query(admin_socket);
+    let (uri_body, query_runtime_dir) = split_admin_uri_query(admin_socket)?;
 
     // handle `pipe://` ourselves because TransportUri doesn't
     // know about Windows NamedPipes. Form: `pipe://LEAF[?runtime_dir=...]`
@@ -1719,12 +1719,22 @@ pub fn resolve_admin_endpoint(config: &Config, config_dir: Option<&Path>) -> Res
     match uri {
         veil_transport::TransportUri::Unix { path } => Ok(AdminEndpoint::Unix(path)),
         veil_transport::TransportUri::Tcp { host, port } => {
-            let bind_addr: std::net::SocketAddr =
-                format!("{host}:{port}").parse().map_err(|e| {
-                    NodeError::AdminProtocol(format!(
-                        "global.admin_socket: invalid tcp address {host}:{port} — {e}"
-                    ))
-                })?;
+            // `SocketAddr::parse` needs IPv6 literals in bracket form and does
+            // not resolve hostnames, so normalize the loopback aliases (the
+            // is_loopback check below still gates the result): `::1` →
+            // `[::1]:port` — the bare `::1:port` the old code built failed to
+            // parse — and `localhost`/`127.0.0.1` → `127.0.0.1:port`. Mirrors
+            // the IPC resolver. (audit cycle-3.)
+            let hostport = match host.as_str() {
+                "::1" => format!("[::1]:{port}"),
+                "localhost" | "127.0.0.1" => format!("127.0.0.1:{port}"),
+                other => format!("{other}:{port}"),
+            };
+            let bind_addr: std::net::SocketAddr = hostport.parse().map_err(|e| {
+                NodeError::AdminProtocol(format!(
+                    "global.admin_socket: invalid tcp address {host}:{port} — {e}"
+                ))
+            })?;
             // F6 (defense-in-depth): enforce loopback in the resolver itself, not
             // only in config validation. A direct caller (test, tool, future call
             // site) that bypasses validation must not be able to bind the admin
@@ -1756,25 +1766,36 @@ pub fn resolve_admin_endpoint(config: &Config, config_dir: Option<&Path>) -> Res
 }
 
 /// Strip `?runtime_dir=...` from the URI and return the remaining URI body
-/// plus the extracted value. Accepts only this single query parameter;
-/// anything else is preserved in the body [`veil_transport::TransportUri`]
-/// to reject with its usual error.
-pub fn split_admin_uri_query(uri: &str) -> (&str, Option<String>) {
+/// plus the extracted value. `runtime_dir` is the ONLY accepted query
+/// parameter; any other key is an error so a typo like `runtime_dri=` fails
+/// loudly instead of silently falling back to the default runtime dir (the
+/// query is split off before [`veil_transport::TransportUri`] ever sees it, so
+/// it would otherwise never be rejected). (audit cycle-3.)
+pub fn split_admin_uri_query(uri: &str) -> Result<(&str, Option<String>)> {
     let Some(q_idx) = uri.find('?') else {
-        return (uri, None);
+        return Ok((uri, None));
     };
     let (body, query) = uri.split_at(q_idx);
     let query = &query[1..]; // skip the '?'
+    let mut runtime_dir = None;
     for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
         if let Some(rest) = pair.strip_prefix("runtime_dir=") {
             // Trivial percent-decode for `%2F` etc. is unnecessary here:
             // operators supply filesystem paths verbatim and the URI-level
             // escaping is their responsibility. A future patch can upgrade
             // to `percent_encoding` if real-world paths demand it.
-            return (body, Some(rest.to_owned()));
+            runtime_dir = Some(rest.to_owned());
+        } else {
+            let key = pair.split('=').next().unwrap_or(pair);
+            return Err(NodeError::AdminProtocol(format!(
+                "global.admin_socket: unknown query parameter `{key}` (only `runtime_dir` is supported)"
+            )));
         }
     }
-    (body, None)
+    Ok((body, runtime_dir))
 }
 
 /// Return the canonical anchor path that clients use to locate the admin
@@ -4433,6 +4454,39 @@ mod tests {
             }
             other => panic!("expected Tcp endpoint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_admin_endpoint_ipv6_loopback_normalized() {
+        // audit cycle-3: `tcp://[::1]:port` must resolve (the old
+        // `format!("{host}:{port}")` built `::1:port` which failed to parse).
+        let cfg = Config {
+            global: GlobalConfig {
+                admin_socket: Some("tcp://[::1]:0".to_owned()),
+                ..GlobalConfig::default()
+            },
+            ..Config::default()
+        };
+        match resolve_admin_endpoint(&cfg, None).unwrap() {
+            AdminEndpoint::Tcp { bind_addr, .. } => {
+                assert!(bind_addr.ip().is_loopback());
+                assert!(bind_addr.is_ipv6(), "[::1] must resolve to an IPv6 addr");
+            }
+            other => panic!("expected Tcp endpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_admin_endpoint_rejects_unknown_query() {
+        // A typo like `runtime_dri=` must fail loudly, not silently fall back.
+        let cfg = Config {
+            global: GlobalConfig {
+                admin_socket: Some("tcp://127.0.0.1:0?runtime_dri=/tmp/x".to_owned()),
+                ..GlobalConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(resolve_admin_endpoint(&cfg, None).is_err());
     }
 
     #[test]

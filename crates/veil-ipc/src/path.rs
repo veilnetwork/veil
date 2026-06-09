@@ -75,7 +75,7 @@ pub fn resolve_ipc_endpoint(
     default_runtime_dir: &Path,
 ) -> Result<IpcEndpoint, IpcEndpointError> {
     if let Some(uri) = cfg.socket_uri.as_deref() {
-        let (uri_body, query_runtime_dir) = split_ipc_uri_query(uri);
+        let (uri_body, query_runtime_dir) = split_ipc_uri_query(uri)?;
 
         // pipe:// handled here — `TransportUri` doesn't model Windows
         // NamedPipes.  Form: `pipe://LEAF[?runtime_dir=...]`.
@@ -161,16 +161,44 @@ pub fn ipc_anchor_path(
 /// Split an IPC URI into `(body, runtime_dir?)`.  Extracts the
 /// `?runtime_dir=` query parameter since `TransportUri::parse` doesn't
 /// model query strings yet.
-fn split_ipc_uri_query(uri: &str) -> (&str, Option<String>) {
+fn split_ipc_uri_query(uri: &str) -> Result<(&str, Option<String>), IpcEndpointError> {
     let Some(q) = uri.find('?') else {
-        return (uri, None);
+        return Ok((uri, None));
     };
     let (body, query) = uri.split_at(q);
     let query = &query[1..];
+    let mut runtime_dir = None;
     for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
         if let Some(rest) = pair.strip_prefix("runtime_dir=") {
-            return (body, Some(rest.to_owned()));
+            runtime_dir = Some(rest.to_owned());
+        } else {
+            // Reject unknown query keys so a typo (e.g. `runtime_dri=`) fails
+            // loudly instead of silently using the default runtime dir.
+            let key = pair.split('=').next().unwrap_or(pair);
+            return Err(IpcEndpointError::Validation(format!(
+                "ipc.socket_uri: unknown query parameter `{key}` (only `runtime_dir` is supported)"
+            )));
         }
     }
-    (body, None)
+    Ok((body, runtime_dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_ipc_uri_query_extracts_and_rejects() {
+        // No query → body unchanged.
+        assert_eq!(split_ipc_uri_query("tcp://[::1]:9").unwrap(), ("tcp://[::1]:9", None));
+        // runtime_dir extracted.
+        let (body, rd) = split_ipc_uri_query("tcp://[::1]:9?runtime_dir=/x").unwrap();
+        assert_eq!(body, "tcp://[::1]:9");
+        assert_eq!(rd.as_deref(), Some("/x"));
+        // Unknown key (typo) is rejected, not silently dropped.
+        assert!(split_ipc_uri_query("tcp://[::1]:9?runtime_dri=/x").is_err());
+    }
 }
