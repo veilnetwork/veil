@@ -34,6 +34,11 @@
 //! kind = "tproxy"
 //! listen = "0.0.0.0:12345"   # Linux / Keenetic only (FreeBSD stubbed)
 //! ```
+//!
+//! SOCKS5 / HTTP inbounds are UNAUTHENTICATED; binding them to a non-loopback
+//! address (e.g. `0.0.0.0`) is refused at startup unless `allow_lan_inbound =
+//! true` is set (see [`ClientConfig::allow_lan_inbound`]).  Tproxy is
+//! kernel/iptables-gated and exempt.
 
 use std::path::{Path, PathBuf};
 
@@ -218,6 +223,33 @@ pub enum InboundConfig {
     Tproxy { listen: String },
 }
 
+/// Fail-fast guard for an UNAUTHENTICATED inbound listener's bind address.
+///
+/// SOCKS5 / HTTP ingress accept any local client with no authentication, so a
+/// non-loopback bind is an open proxy for the whole interface.  Refuses any
+/// `listen` that resolves to a non-loopback address (including `0.0.0.0` / `::`,
+/// which are not loopback) unless `allow_lan_inbound` is set.  Called at startup
+/// before binding.  Audit cycle-3 (M2).
+pub fn ensure_inbound_bind_allowed(listen: &str, allow_lan_inbound: bool) -> anyhow::Result<()> {
+    use std::net::ToSocketAddrs;
+    if allow_lan_inbound {
+        return Ok(());
+    }
+    let addrs: Vec<std::net::SocketAddr> = listen
+        .to_socket_addrs()
+        .map_err(|e| anyhow::anyhow!("inbound listen address {listen:?} is not resolvable: {e}"))?
+        .collect();
+    if let Some(non_lo) = addrs.iter().find(|a| !a.ip().is_loopback()) {
+        anyhow::bail!(
+            "inbound listener {listen:?} binds non-loopback {non_lo}: oproxy SOCKS5/HTTP inbound is \
+             UNAUTHENTICATED (SOCKS NO_AUTH / open HTTP CONNECT), so this would be an open proxy on \
+             that interface. Use a 127.0.0.1 / [::1] address, or set `allow_lan_inbound = true` to \
+             explicitly accept LAN exposure."
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClientConfig {
     pub socket_path: PathBuf,
@@ -229,6 +261,17 @@ pub struct ClientConfig {
     /// One or more inbound listeners.  All run concurrently.
     #[serde(default)]
     pub inbound: Vec<InboundConfig>,
+
+    /// Allow the UNAUTHENTICATED SOCKS5 / HTTP inbound listeners to bind a
+    /// **non-loopback** address.  These ingresses accept any local client with
+    /// no authentication (SOCKS `NO_AUTH` / open HTTP `CONNECT`), so binding
+    /// them to `0.0.0.0` or a LAN IP turns the node into an open proxy for the
+    /// whole network segment.  Default `false`: a non-loopback SOCKS5/HTTP bind
+    /// is refused at startup unless the operator sets this to explicitly accept
+    /// LAN exposure.  (Tproxy is kernel/iptables-gated and not covered.)
+    /// Audit cycle-3 (M2).
+    #[serde(default)]
+    pub allow_lan_inbound: bool,
 
     /// Connection-count limits (audit batch 2026-05-24, finding M8).
     /// Caps max concurrent SOCKS5/HTTP/TProxy sessions so that `accept()`
@@ -417,6 +460,19 @@ pub fn parse_node_id_hex(s: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbound_bind_guard_allows_loopback_refuses_lan() {
+        // Loopback is always fine.
+        assert!(ensure_inbound_bind_allowed("127.0.0.1:1080", false).is_ok());
+        assert!(ensure_inbound_bind_allowed("[::1]:1080", false).is_ok());
+        // 0.0.0.0 / a LAN IP are non-loopback → refused without opt-in.
+        assert!(ensure_inbound_bind_allowed("0.0.0.0:1080", false).is_err());
+        assert!(ensure_inbound_bind_allowed("[::]:1080", false).is_err());
+        assert!(ensure_inbound_bind_allowed("192.0.2.10:1080", false).is_err());
+        // With explicit opt-in, LAN bind is permitted.
+        assert!(ensure_inbound_bind_allowed("0.0.0.0:1080", true).is_ok());
+    }
 
     #[test]
     fn parse_server_config_minimal() {
