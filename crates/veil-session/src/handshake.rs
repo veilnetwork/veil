@@ -651,12 +651,14 @@ where
                 // The responder must echo a resume nonce in its ATTACH trailer;
                 // without it we cannot derive matching fresh keys, so refuse the
                 // resume rather than build an unusable (or unsafe) session.
-                let server_resume_nonce =
-                    veil_proto::session::decode_resume_nonce_from_attach(&body).ok_or_else(|| {
-                        HandshakeError(
-                            "session resumption: responder ATTACH missing resume nonce".into(),
-                        )
-                    })?;
+                let server_resume_nonce = veil_proto::session::decode_resume_nonce_from_attach(
+                    &body,
+                )
+                .ok_or_else(|| {
+                    HandshakeError(
+                        "session resumption: responder ATTACH missing resume nonce".into(),
+                    )
+                })?;
                 let remote_vivaldi = decode_vivaldi_from_attach(&body);
                 let remote_battery = decode_battery_from_attach(&body);
                 let remote_advertised_transports =

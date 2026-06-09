@@ -2226,9 +2226,8 @@ mod tests {
         // Build an ATTACH that already carries other trailer TLVs (battery +
         // transports + observed_addr), then append the resume nonce — it must be
         // found regardless of the TLVs before it.
-        let mut bytes = encode_attach_with_tlvs(&base, Some((1.0, 2.0, 3.0)), Some(55), &[
-            "tcp".to_owned(),
-        ]);
+        let mut bytes =
+            encode_attach_with_tlvs(&base, Some((1.0, 2.0, 3.0)), Some(55), &["tcp".to_owned()]);
         let addr: std::net::SocketAddr = "203.0.113.7:9000".parse().unwrap();
         bytes.extend_from_slice(&OBSERVED_ADDR_TLV_TAG.to_be_bytes());
         bytes.extend_from_slice(&(OBSERVED_ADDR_TLV_LEN as u16).to_be_bytes());
