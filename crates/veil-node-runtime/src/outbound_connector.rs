@@ -548,7 +548,9 @@ pub fn spawn_outbound_peers(
                                 let _swap_guard = runner.register_swap_channel(&access.handoff.swap_registry);
                                 runner.run().await;
                                 drop(_swap_guard);
-                                access.dispatcher.on_session_closed(peer_id);
+                                // Outbound sessions are never capacity-referral
+                                // (referral admission is inbound-only).
+                                access.dispatcher.on_session_closed(peer_id, false);
                                 // Evict ML-KEM key for this peer.
                                 wlock!(access.identity.peer_mlkem_keys).remove(peer_id.as_bytes());
                                 // Evict per-session ephemeral DK.

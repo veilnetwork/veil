@@ -5364,7 +5364,10 @@ pub fn spawn_inbound_session(
             lock!(inbound.runtime.identity.per_session_mlkem_dk).remove(peer_id.as_bytes());
             // Now safe to notify dispatcher: any `session_tx_registry`
             // lookups in the close-handler path will return None.
-            inbound.runtime.dispatcher.on_session_closed(peer_id);
+            inbound
+                .runtime
+                .dispatcher
+                .on_session_closed(peer_id, is_referral);
             let _ = runner.stream.shutdown().await;
         }
     })
