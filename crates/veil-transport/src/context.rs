@@ -220,6 +220,13 @@ pub struct TransportContext {
     /// `StaticStringDecoy` that returns "<h1>Welcome</h1>".  Operators
     /// should set to a realistic static-site snapshot.
     pub webtunnel_decoy_dir: Option<std::path::PathBuf>,
+    /// Optional webtunnel response-timing floor.  When `Some`, the router
+    /// holds every response (tunnel `101` and decoy alike) until at least this
+    /// long has elapsed since the request was read, collapsing the
+    /// decoy-vs-tunnel *timing* distinguisher at the cost of added handshake
+    /// latency.  `None` (default) responds as soon as ready.  Operators on a
+    /// proxy decoy should set this above the backend's typical latency.
+    pub webtunnel_response_floor: Option<std::time::Duration>,
 
     /// SOCKS proxy URL used as outbound-dial **fallback** when direct
     /// transport fails.  Set via `[transport] outbound_socks_fallback_proxy`
@@ -296,6 +303,7 @@ impl TransportContext {
             webtunnel_secret_path: None,
             webtunnel_auth_token: None,
             webtunnel_decoy_dir: None,
+            webtunnel_response_floor: None,
             outbound_socks_fallback_proxy: None,
             obfs4_accept_variants: vec![veil_obfs4::WireFormatVariant::V1],
             obfs4_client_variant: veil_obfs4::WireFormatVariant::V1,
