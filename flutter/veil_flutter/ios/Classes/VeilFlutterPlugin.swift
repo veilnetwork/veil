@@ -1,35 +1,35 @@
-// iOS plugin glue для veil_flutter (Epic 489.6 + 489.10).
+// iOS plugin glue for veil_flutter (Epic 489.6 + 489.10).
 //
 // Two surfaces:
 //
 //   1. **Lifecycle channel** (`veil_flutter/lifecycle`):
 //      `startBackgroundService` / `stopBackgroundService` —
 //      Android-only operations.  iOS doesn't have foreground services;
-//      we accept the calls и silently no-op so cross-platform code
-//      doesn't need а Platform check.
+//      we accept the calls and silently no-op so cross-platform code
+//      doesn't need a Platform check.
 //
 //   2. **Push channel** (`veil_flutter/push`):
 //      * `notifyWakeup` — called by Dart when an APNs silent push
-//        arrives.  Schedules а `BGProcessingTask` that gives the
-//        daemon ~30 s к drain pending operations BEFORE iOS suspends
+//        arrives.  Schedules a `BGProcessingTask` that gives the
+//        daemon ~30 s to drain pending operations BEFORE iOS suspends
 //        the process.  Without this, the silent push wakes the
-//        daemon for ~5 s и then iOS suspends mid-fetch.
+//        daemon for ~5 s and then iOS suspends mid-fetch.
 //      * `registerDeviceToken` / `getRegisteredToken` — APNs token
-//        storage в the **iOS Keychain** so the daemon can include
-//        it в rendezvous-ad announcements.  Audit batch 2026-05-23:
-//        promoted от `UserDefaults` к Keychain so the token lives at
+//        storage in the **iOS Keychain** so the daemon can include
+//        it in rendezvous-ad announcements.  Audit batch 2026-05-23:
+//        promoted from `UserDefaults` to Keychain so the token lives at
 //        the same trust level as Android's `EncryptedSharedPreferences`
-//        (file-level encryption, never в iCloud backup, never in
-//        plaintext в the app sandbox).  Legacy UserDefaults entries
+//        (file-level encryption, never in iCloud backup, never in
+//        plaintext in the app sandbox).  Legacy UserDefaults entries
 //        are migrated transparently on the first `getRegisteredToken`
-//        и then removed.
+//        and then removed.
 //
 // Background-task registration:
 //   The plugin registers `com.veil.veil_flutter.refresh` as
-//   а `BGProcessingTask` identifier при app launch (consumer must
-//   ALSO add the same identifier к `Info.plist` под key
+//   a `BGProcessingTask` identifier at app launch (consumer must
+//   ALSO add the same identifier to `Info.plist` under key
 //   `BGTaskSchedulerPermittedIdentifiers`).  When iOS schedules the
-//   task, we call back into Dart via the push channel так that
+//   task, we call back into Dart via the push channel so that
 //   higher-level code can complete fetches.
 
 import Flutter
@@ -45,16 +45,16 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
     private static let PUSH_CHANNEL      = "veil_flutter/push"
     private static let BG_TASK_IDENTIFIER = "com.veil.veil_flutter.refresh"
 
-    // Keychain coordinates для the APNs device token.  Service identifier
+    // Keychain coordinates for the APNs device token.  Service identifier
     // matches the plugin's bundle namespace; account is the human-readable
     // tag so multiple credentials could coexist if ever needed.
     private static let KEYCHAIN_SERVICE = "com.veil.veil_flutter"
     private static let KEYCHAIN_ACCOUNT = "deviceToken"
     // Receiver's wake-HMAC secret (Epic 489.10).  Distinct Keychain
-    // account под the SAME service so it sits at the exact same trust
+    // account under the SAME service so it sits at the exact same trust
     // level as the APNs token (same accessibility class, iCloud-excluded).
     // Anyone holding it can forge silent-push wake authenticators for this
-    // device, so it must never live в plaintext.
+    // device, so it must never live in plaintext.
     private static let KEYCHAIN_ACCOUNT_WAKE_HMAC = "wake_hmac_key"
     // Wake-HMAC keys are fixed 32-byte secrets (veil_crypto's
     // `WakeHmacKey`); mirrors the Dart `veilWakeHmacKeyLen`.
@@ -62,16 +62,16 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
 
     // Legacy UserDefaults key — kept ONLY for one-shot migration.  After
     // the first `getRegisteredToken` call following the audit batch
-    // 2026-05-23 upgrade, the value is read, copied into Keychain, и
+    // 2026-05-23 upgrade, the value is read, copied into Keychain, and
     // the UserDefaults entry is removed.  Future versions can delete
-    // this constant once а reasonable upgrade-grace-period has passed.
+    // this constant once a reasonable upgrade-grace-period has passed.
     private static let LEGACY_DEFAULTS_KEY_TOKEN = "VeilFlutter.deviceToken"
 
     /// Signal armed at the start of each BGProcessingTask invocation;
     /// consumed by the matching `notifyDrained` MethodChannel call.
     /// Per-task instance (recreated on every `handleBackgroundProcessing`
     /// entry) avoids stale signals carrying over between independent
-    /// wake cycles.  When `nil`, `notifyDrained` becomes а silent no-op
+    /// wake cycles.  When `nil`, `notifyDrained` becomes a silent no-op
     /// (signal arrived while no BG task is awaiting it — common race
     /// when drain completes inside the silent-push handler BEFORE iOS
     /// schedules the BG task).  The hardcoded-timeout fallback in
@@ -90,7 +90,7 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
         registrar.addMethodCallDelegate(instance, channel: pushChannel)
 
         // Register the BGProcessingTask handler at plugin init.  iOS
-        // refuses к schedule а task whose identifier isn't registered
+        // refuses to schedule a task whose identifier isn't registered
         // ON THIS RUN (BGTaskScheduler is per-launch state).  Skip
         // gracefully on iOS < 13 (BackgroundTasks framework absent).
         #if canImport(BackgroundTasks)
@@ -115,7 +115,7 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
         switch call.method {
         case "startBackgroundService", "stopBackgroundService":
             // Android-only; iOS has no equivalent.  Silent no-op so
-            // cross-platform code doesn't need а Platform.isAndroid check.
+            // cross-platform code doesn't need a Platform.isAndroid check.
             result(nil)
         case "notifyWakeup":
             scheduleBackgroundProcessing()
@@ -123,22 +123,22 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
         case "registerDeviceToken":
             let token = (call.arguments as? [String: Any])?["token"] as? String ?? ""
             Self.keychainSaveToken(token)
-            // Also clear any legacy UserDefaults entry в case caller did
+            // Also clear any legacy UserDefaults entry in case caller did
             // not previously call `getRegisteredToken` (which performs the
             // one-shot migration).  Keeps the device clean.
             UserDefaults.standard.removeObject(forKey: Self.LEGACY_DEFAULTS_KEY_TOKEN)
             result(nil)
         case "notifyDrained":
-            // Mailbox drain (fetch) completed на the Dart side.  If а
-            // BGProcessingTask currently armed а signal, release it so
+            // Mailbox drain (fetch) completed on the Dart side.  If a
+            // BGProcessingTask currently armed a signal, release it so
             // `setTaskCompleted` fires precisely at drain completion
-            // rather than padding к the 28-second fallback.  Outside
-            // а BG-task window the call is а silent no-op.
+            // rather than padding to the 28-second fallback.  Outside
+            // a BG-task window the call is a silent no-op.
             drainSignal?.signal()
             result(nil)
         case "getRegisteredToken":
-            // One-shot migration: if Keychain is empty но UserDefaults has
-            // а legacy token, lift it into Keychain и delete the original.
+            // One-shot migration: if Keychain is empty but UserDefaults has
+            // a legacy token, lift it into Keychain and delete the original.
             // After the next launch the UserDefaults branch never fires.
             if Self.keychainReadToken().isEmpty,
                let legacy = UserDefaults.standard.string(forKey: Self.LEGACY_DEFAULTS_KEY_TOKEN),
@@ -149,10 +149,10 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
             }
             result(Self.keychainReadToken())
         case "storeWakeHmacKey":
-            // Receiver's wake-HMAC secret — persisted в the Keychain at the
-            // same trust level as the APNs token (см. KEYCHAIN_ACCOUNT_WAKE_HMAC).
+            // Receiver's wake-HMAC secret — persisted in the Keychain at the
+            // same trust level as the APNs token (see KEYCHAIN_ACCOUNT_WAKE_HMAC).
             // Raw 32-byte secret, so it goes in as `Data` (NOT UTF-8 String
-            // like the token) под its own account.
+            // like the token) under its own account.
             guard let typed = (call.arguments as? [String: Any])?["key"] as? FlutterStandardTypedData,
                   typed.data.count == Self.WAKE_HMAC_KEY_LEN
             else {
@@ -179,8 +179,8 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
         }
     }
 
-    /// Schedule а BGProcessingTask that gives the daemon ~30 s к
-    /// drain pending veil operations after а silent push wake.
+    /// Schedule a BGProcessingTask that gives the daemon ~30 s to
+    /// drain pending veil operations after a silent push wake.
     /// iOS may delay execution — silent pushes don't guarantee
     /// immediate task scheduling, but background-task is the
     /// supported "give me longer" mechanism.
@@ -203,13 +203,13 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
 
     @available(iOS 13.0, *)
     private func handleBackgroundProcessing(_ task: BGProcessingTask) {
-        // Arm а fresh signal so any pending `notifyDrained` call from
+        // Arm a fresh signal so any pending `notifyDrained` call from
         // the Dart side (typically inside `VeilPush.drainMailbox`)
         // wakes us precisely at drain completion.  Previous behaviour
-        // was а blind 25-second sleep; now we complete as soon as
-        // drain finishes, falling back к а 28-second timeout if the
-        // signal never arrives (slow cellular, daemon stall, или the
-        // common race где drain completed BEFORE iOS scheduled this
+        // was a blind 25-second sleep; now we complete as soon as
+        // drain finishes, falling back to a 28-second timeout if the
+        // signal never arrives (slow cellular, daemon stall, or the
+        // common race where drain completed BEFORE iOS scheduled this
         // task — see the `drainSignal` field docstring).
         //
         // 28-second budget leaves ~2 seconds of safety margin under
@@ -218,8 +218,8 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
         let signal = DispatchSemaphore(value: 0)
         drainSignal = signal
         task.expirationHandler = { [weak self] in
-            // iOS is about к suspend — drop the reference so а later
-            // `notifyDrained` doesn't fire into а dead semaphore.
+            // iOS is about to suspend — drop the reference so a later
+            // `notifyDrained` doesn't fire into a dead semaphore.
             self?.drainSignal = nil
             NSLog("VeilFlutter: BGProcessingTask expired")
         }
@@ -229,32 +229,32 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
                 self?.drainSignal = nil
                 // success=true means we observed the drained signal;
                 // false = timed out (best-effort, iOS will count it as
-                // а normal completion either way — distinguishing helps
+                // a normal completion either way — distinguishing helps
                 // future operator-side analytics if added).
                 task.setTaskCompleted(success: waitResult == .success)
             }
         }
     }
 
-    // MARK: - Keychain storage для APNs device token (audit batch 2026-05-23)
+    // MARK: - Keychain storage for APNs device token (audit batch 2026-05-23)
     //
     // The APNs token is sensitive — it lets ANY holder issue silent-push
-    // wakeups к this device, draining battery и (depending on push HMAC
-    // status; см. Epic 489.10) potentially probing presence.  Keychain
-    // protects it via the same file-level encryption iOS uses для
-    // Touch/Face ID secrets, AND excludes it от iCloud backups.
+    // wakeups to this device, draining battery and (depending on push HMAC
+    // status; see Epic 489.10) potentially probing presence.  Keychain
+    // protects it via the same file-level encryption iOS uses for
+    // Touch/Face ID secrets, AND excludes it from iCloud backups.
     //
     // `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`:
     //   * `AfterFirstUnlock` — readable as soon as the user has unlocked
     //     the device once since boot.  APNs delivery happens long before
     //     the user explicitly unlocks again, so `WhenUnlocked*` would
     //     break wakeup-on-locked-screen.
-    //   * `ThisDeviceOnly` — never migrated к а new device via iCloud
-    //     backup или device-к-device transfer.  Forces fresh APNs
-    //     enrollment after а device swap (intentional — the new device
-    //     should not pretend к be the old one).
+    //   * `ThisDeviceOnly` — never migrated to a new device via iCloud
+    //     backup or device-to-device transfer.  Forces fresh APNs
+    //     enrollment after a device swap (intentional — the new device
+    //     should not pretend to be the old one).
 
-    /// Persist `token` к the Keychain, overwriting any existing entry
+    /// Persist `token` to the Keychain, overwriting any existing entry
     /// under `(service, account)`.  Empty `token` deletes the entry
     /// (matches the historical UserDefaults `set(""..)` semantics).
     private static func keychainSaveToken(_ token: String) {
@@ -267,7 +267,7 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
 
     /// Read the stored APNs token, returning `""` when absent or
     /// unreadable (matches the historical UserDefaults `string(forKey:)
-    /// ?? ""` contract so the Dart side does not need а separate
+    /// ?? ""` contract so the Dart side does not need a separate
     /// not-bound vs empty-string branch).
     private static func keychainReadToken() -> String {
         guard let data = keychainReadData(account: KEYCHAIN_ACCOUNT),
@@ -279,8 +279,8 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     /// Remove the stored APNs token from the Keychain.  No-op when
-    /// nothing is stored.  Used both от `registerDeviceToken` с empty
-    /// string и от tests.
+    /// nothing is stored.  Used both from `registerDeviceToken` with empty
+    /// string and from tests.
     private static func keychainDeleteToken() {
         keychainDeleteData(account: KEYCHAIN_ACCOUNT)
     }
@@ -288,18 +288,18 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
     // MARK: - Keychain storage primitives (account-parameterised)
     //
     // Byte-exact extraction of the token store's mechanism so the APNs
-    // token и the wake-HMAC secret (Epic 489.10) share ONE query shape и
+    // token and the wake-HMAC secret (Epic 489.10) share ONE query shape and
     // ONE accessibility class — `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`
-    // (см. the section header above for why).  They differ ONLY by
+    // (see the section header above for why).  They differ ONLY by
     // `kSecAttrAccount`.  These operate on raw `Data` because the wake-HMAC
-    // key is а 32-byte secret, not а UTF-8 string; the token wrappers above
+    // key is a 32-byte secret, not a UTF-8 string; the token wrappers above
     // adapt String ⇄ Data exactly as before.
 
-    /// Persist `data` к the Keychain под `(service, account)`, overwriting
+    /// Persist `data` to the Keychain under `(service, account)`, overwriting
     /// any existing entry.  Mirrors the historical token save (update-then-add).
     private static func keychainSaveData(_ data: Data, account: String) {
         // SecItemAdd refuses when an entry already exists, so try update
-        // first; if nothing к update, fall through к add.
+        // first; if nothing to update, fall through to add.
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: KEYCHAIN_SERVICE,
@@ -325,7 +325,7 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
         }
     }
 
-    /// Read the raw bytes stored под `(service, account)`, or `nil` when
+    /// Read the raw bytes stored under `(service, account)`, or `nil` when
     /// absent / unreadable.  (The token wrapper maps `nil` → `""`.)
     private static func keychainReadData(account: String) -> Data? {
         let query: [String: Any] = [
@@ -343,7 +343,7 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
         return data
     }
 
-    /// Remove the entry под `(service, account)`.  No-op when nothing is
+    /// Remove the entry under `(service, account)`.  No-op when nothing is
     /// stored.
     private static func keychainDeleteData(account: String) {
         let query: [String: Any] = [
