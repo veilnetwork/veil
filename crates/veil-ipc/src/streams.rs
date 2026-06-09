@@ -169,7 +169,13 @@ impl IpcStreamTable {
         // is what we both store AND advertise to B, so the two sides agree.
         let initial_window = initial_window.min(veil_proto::ipc::MAX_STREAM_INITIAL_WINDOW);
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if inner.streams.len() >= veil_proto::budget::MAX_TOTAL_STREAMS {
+        // Count BOTH tables against the global cap (matching `open_remote` and
+        // `len()`). Checking only `streams` here let local opens push the
+        // combined total past `MAX_TOTAL_STREAMS` whenever remote streams were
+        // already holding slots — up to ~2× the intended ceiling.
+        if inner.streams.len() + inner.remote_streams.len()
+            >= veil_proto::budget::MAX_TOTAL_STREAMS
+        {
             return None;
         }
         // Advance ID, skip any that collide with existing open streams.
@@ -523,6 +529,39 @@ mod tests {
             .expect("capacity not exceeded");
         assert!(id > 0);
         assert_eq!(table.len(), 1);
+    }
+
+    /// Regression (cycle-5 #1): `open_local` must count BOTH the local and
+    /// remote stream tables against `MAX_TOTAL_STREAMS` (matching `open_remote`
+    /// and `len()`). Before the fix it checked only the local table, so once
+    /// remote streams had filled the global cap a local client could keep
+    /// opening streams — pushing the combined total to ~2× the intended
+    /// ceiling (memory / FD pressure).
+    #[test]
+    fn open_local_respects_combined_cap_with_remote_streams() {
+        let table = IpcStreamTable::new();
+        let dst = [7u8; 32];
+        let app_id = [9u8; 32];
+        // Saturate the entire global cap with remote-bound streams.
+        for i in 0..veil_proto::budget::MAX_TOTAL_STREAMS as u32 {
+            table
+                .open_remote(dst, i, app_id, 1)
+                .expect("remote opens succeed until the cap");
+        }
+        assert_eq!(table.len(), veil_proto::budget::MAX_TOTAL_STREAMS);
+
+        // A local open must now be refused: the combined table is full even
+        // though the local sub-table is still empty.
+        let registry = AppEndpointRegistry::new();
+        let local_app = [0xAAu8; 32];
+        let (_handle, _rx) = registry.register(local_app, 1, 8);
+        let b_tx = registry.get_sender(local_app, 1).unwrap();
+        let (a_tx, _a_rx) = mpsc::channel(1024);
+        assert!(
+            table.open_local(a_tx, b_tx, node_id(), 65536).is_none(),
+            "open_local must reject when remote streams already fill the cap"
+        );
+        assert_eq!(table.len(), veil_proto::budget::MAX_TOTAL_STREAMS);
     }
 
     #[test]
