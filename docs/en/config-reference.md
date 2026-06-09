@@ -1104,11 +1104,30 @@ Peer Exchange — random-walk peer discovery. Optional, with sensible defaults.
 
 ## `[anycast]`
 
-How anycast service records are resolved.
+How anycast service records are resolved. An anycast record maps a service tag
+(e.g. a gateway/mailbox shard) to a candidate `node_id`; the record's `score`
+is **peer-controlled**, so without admission control a Sybil could publish a
+`score = 0` record to win traffic for a tag, or claim to be the canonical
+provider of someone else's `node_id`.
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
 | `resolve_policy` | enum | `"signed_bound"` | Which anycast records to accept. Values: `"signed_bound"` (default — signed and owner-bound), `"signed_only"` (reject unsigned), `"best_effort"` (accept anything — legacy, not recommended) |
+
+**Default lockdown.** `signed_bound` is secure-by-default: a record is accepted
+only if it carries a valid owner signature **and** is bound to the advertising
+node (`BLAKE3(owner_pubkey) == node_id`), so a node can advertise only for its
+*own* id. This closes record forgery and node-id impersonation. (A signer can
+still claim a dishonest `score` for its *own* record; the resolver additionally
+mixes in resolver-specific XOR distance and a resolver-local reputation penalty
+for candidates that later fail — both automatic, no config.)
+
+Only drop to `best_effort` for discovery-only / non-trust-sensitive deployments
+where unsigned legacy records must resolve; it disables the signature/binding
+check and re-opens the Sybil-score and impersonation vectors above. Advertising
+is local-app-driven over the (0600) IPC socket, so *who* may advertise a tag is
+already gated by host access to that socket — `resolve_policy` governs which
+*network-published* records a resolver will trust.
 
 ---
 
