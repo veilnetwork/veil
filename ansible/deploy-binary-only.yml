@@ -31,7 +31,7 @@
 
     - name: Fail if binary missing
       ansible.builtin.fail:
-        msg: "Missing binary: {{ veil_bin_src }} — build first with `cargo build --release -p veilcore --bin veil-cli`"
+        msg: "Missing binary: {{ veil_bin_src }} — build first with `cargo build --release -p veil-cli --bin veil-cli`"
       when: not bin_stat.stat.exists
 
     - name: Capture current node.toml stress-overrides (for log/verification)

@@ -66,7 +66,7 @@
       ansible.builtin.fail:
         msg: |
           Missing {{ veil_bin_src }}.  Build first with:
-          `cargo build --release -p veilcore --bin veil-cli --features allow-empty-seeds`
+          `cargo build --release -p veil-cli --bin veil-cli --features allow-empty-seeds`
       when: not bin_stat.stat.exists
 
     - name: Stop veil service

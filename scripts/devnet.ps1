@@ -68,7 +68,7 @@ function Resolve-Binary {
     Write-Info 'veil-cli not found — building (release)...'
     Push-Location $RepoRoot
     try {
-        & cargo build --release --features allow-empty-seeds -p veilcore --bin veil-cli
+        & cargo build --release --features allow-empty-seeds -p veil-cli --bin veil-cli
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
     } finally {
         Pop-Location

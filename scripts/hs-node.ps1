@@ -40,7 +40,7 @@ if (-not $Binary) {
     $debugBin   = Join-Path $RepoRoot 'target\debug\veil-cli.exe'
     if      (Test-Path $releaseBin) { $Binary = $releaseBin }
     elseif  (Test-Path $debugBin)   { $Binary = $debugBin }
-    else    { throw "veil-cli.exe not found. Build with: cargo build --release -p veilcore --bin veil-cli" }
+    else    { throw "veil-cli.exe not found. Build with: cargo build --release -p veil-cli --bin veil-cli" }
 }
 
 if (-not (Test-Path $ConfigPath)) {
