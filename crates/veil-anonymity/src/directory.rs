@@ -266,11 +266,9 @@ pub fn verify_entry(entry: &RelayDirectoryEntry) -> Result<(), DirectoryError> {
     // caller, which matches node_id against the fetch key) keeps the invariant
     // intact for every caller, including any future network-wide directory
     // discovery. (audit: relay-pool poisoning / deanonymization.)
-    let issuer_pk_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &entry.issuer_pk,
-    )
-    .map_err(|_| DirectoryError::Verify)?;
+    let issuer_pk_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &entry.issuer_pk)
+            .map_err(|_| DirectoryError::Verify)?;
     if blake3::hash(&issuer_pk_bytes).as_bytes() != &entry.node_id {
         return Err(DirectoryError::Verify);
     }
