@@ -89,7 +89,7 @@ build_and_install_binary() {
         cd "${SRC_DIR}"
         # shellcheck disable=SC1091
         [[ -f "${HOME}/.cargo/env" ]] && source "${HOME}/.cargo/env"
-        cargo build --release --features "${CARGO_FEATURES}" -p veilcore
+        cargo build --release --features "${CARGO_FEATURES}" -p veil-cli --bin veil-cli
     )
     install -m 0755 "${SRC_DIR}/target/release/veil-cli" "${BINARY_PATH}"
     say "installed ${BINARY_PATH} ($(${BINARY_PATH} --version 2>/dev/null || echo unknown version))"
