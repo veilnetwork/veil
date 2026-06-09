@@ -206,9 +206,9 @@ impl DhtMlKemEkResolver {
         let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance.instance_id);
         let cert_bytes = match self
             .dht_recursive_get(cert_key, self.step_timeout, |b| {
-                MlKemKeyCert::decode(b).ok().is_some_and(|c| {
-                    verify_mlkem_cert(&c, &doc, now_unix).is_ok()
-                })
+                MlKemKeyCert::decode(b)
+                    .ok()
+                    .is_some_and(|c| verify_mlkem_cert(&c, &doc, now_unix).is_ok())
             })
             .await
         {
@@ -287,10 +287,10 @@ impl DhtMlKemEkResolver {
         // and the caller's verify then yields `None` => persistent targeted DoS
         // of cold-start E2E key resolution. On an invalid local value we fall
         // through to the remote walk. (audit: DHT mirror-cache poisoning.)
-        if let Some(value) = self.dht.get_local(&key) {
-            if is_valid(&value) {
-                return Some(value);
-            }
+        if let Some(value) = self.dht.get_local(&key)
+            && is_valid(&value)
+        {
+            return Some(value);
         }
         // Drop the validator before the awaits below so it is never held across
         // an await point (keeps this future `Send` regardless of its captures).
