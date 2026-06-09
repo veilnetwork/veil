@@ -1078,7 +1078,25 @@ impl NodeRuntime {
             // for sealing semantics — but we check defensively.
             if let Some(sk) = self.dispatcher.anonymity_x25519_sk.as_ref() {
                 let sk_clone = Arc::clone(sk);
-                let push_handle = tokio::spawn(push_dispatch_task(push_rx, sk_clone, dispatcher));
+                let require_wake_hmac = config.mailbox.push.require_wake_hmac;
+                if !require_wake_hmac {
+                    // Startup advisory (audit cycle-2): with the gate off, the
+                    // relay falls back to an UNauthenticated wake-only push for
+                    // any receiver that hasn't uploaded a wake-HMAC envelope —
+                    // forgeable by anyone who learns the push token. Operators
+                    // who control their client fleet should enable the gate.
+                    log::warn!(
+                        "veil-push: [mailbox.push] require_wake_hmac is OFF — unauthenticated \
+                         wake-only pushes are permitted (forgeable battery-drain/nuisance \
+                         vector); set require_wake_hmac = true once clients opt into wake-HMAC"
+                    );
+                }
+                let push_handle = tokio::spawn(push_dispatch_task(
+                    push_rx,
+                    sk_clone,
+                    dispatcher,
+                    require_wake_hmac,
+                ));
                 lock_tasks(&self.tasks).sessions.push(push_handle);
             }
             //.4 P5b: spawn the mailbox built-in app
@@ -2087,6 +2105,7 @@ async fn push_dispatch_task(
     mut rx: tokio::sync::mpsc::Receiver<PushTrigger>,
     relay_sk: Arc<x25519_dalek::StaticSecret>,
     dispatcher: Arc<dyn veil_push::PushDispatcher>,
+    require_wake_hmac: bool,
 ) {
     while let Some(trigger) = rx.recv().await {
         let plaintext =
@@ -2125,6 +2144,20 @@ async fn push_dispatch_task(
             &trigger.receiver_id,
             ts,
         );
+        // Production gate (audit cycle-2): when the operator requires
+        // authenticated wakes, refuse to emit the legacy wake-only push
+        // (empty payload) — an unauthenticated wake is forgeable by anyone who
+        // learns the push token and is a battery-drain/nuisance vector. The
+        // receiver must opt into wake-HMAC (upload a sealed envelope) to be
+        // woken under this policy.
+        if require_wake_hmac && wake_payload.is_empty() {
+            log::warn!(
+                "veil-push: dropping unauthenticated wake-only push for receiver {} \
+                 (require_wake_hmac=true; receiver has not uploaded a wake-HMAC envelope)",
+                hex_short(&trigger.receiver_id),
+            );
+            continue;
+        }
         if let Err(e) = dispatcher.dispatch(&token, &wake_payload).await {
             log::warn!(
                 "veil-push: dispatch failed for receiver {} provider {:?}: {e}",
@@ -2580,6 +2613,57 @@ mod tests {
         assert!(
             payload.is_empty(),
             "unseal failure (wrong relay key) must fall back to wake-only"
+        );
+    }
+
+    /// Drive `push_dispatch_task` with a trigger that has NO wake-HMAC envelope
+    /// (→ empty/wake-only payload) and assert the dispatch count under each
+    /// `require_wake_hmac` setting.
+    async fn run_wake_only_trigger(require_wake_hmac: bool) -> usize {
+        let (relay_sk, relay_pk) = fixture_relay_x25519();
+        // Seal a valid push token so unseal + decode succeed and we reach the gate.
+        let envelope =
+            veil_anonymity::push_envelope::seal_push_envelope(&fake_token().encode(), &relay_pk)
+                .unwrap();
+        let counting = Arc::new(CountingDispatcher {
+            tag: "gate",
+            count: AtomicUsize::new(0),
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(push_dispatch_task(
+            rx,
+            Arc::new(relay_sk),
+            Arc::clone(&counting) as Arc<dyn PushDispatcher>,
+            require_wake_hmac,
+        ));
+        tx.send(PushTrigger {
+            receiver_id: [1u8; 32],
+            envelope,
+            content_id: [2u8; 32],
+            wake_hmac_envelope: None, // legacy wake-only
+        })
+        .await
+        .unwrap();
+        drop(tx); // close the channel so the task loop terminates
+        task.await.unwrap();
+        counting.count.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn require_wake_hmac_drops_unauthenticated_wake_only_push() {
+        assert_eq!(
+            run_wake_only_trigger(true).await,
+            0,
+            "gate ON: an unauthenticated wake-only push must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_only_push_dispatched_when_gate_off() {
+        assert_eq!(
+            run_wake_only_trigger(false).await,
+            1,
+            "gate OFF: legacy wake-only push is still dispatched (back-compat)"
         );
     }
 }
