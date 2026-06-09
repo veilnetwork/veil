@@ -1478,9 +1478,13 @@ impl MailboxIpcBridge {
         let Some(reg) = &self.rendezvous_registry else {
             return false;
         };
-        reg.lookup(&auth_cookie)
-            .map(|sub| sub.peer_node_id == receiver_id)
-            .unwrap_or(false)
+        // Namespaced lookup: an entry exists under (receiver_id, cookie) iff
+        // THIS receiver registered THIS cookie. The registry being keyed by
+        // peer_node_id means a cookie-squatter registered under a different
+        // identity cannot shadow the lookup and deny the genuine receiver's
+        // fetch/ack (which the old cookie-only lookup + equality check was
+        // vulnerable to).
+        reg.lookup(&receiver_id, &auth_cookie).is_some()
     }
 }
 
