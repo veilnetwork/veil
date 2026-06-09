@@ -26,6 +26,17 @@ use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope, TransferId}
 /// existing one completes or ages out.
 pub const MAX_CONCURRENT_TRANSFERS: usize = 64;
 
+/// Per-sender cap on simultaneous transfers. Without it, one peer can open all
+/// `MAX_CONCURRENT_TRANSFERS` slots (or consume the whole `MAX_REASSEMBLY_BYTES`
+/// budget) and starve reassembly for every other peer until the partials age
+/// out (`CHUNK_REASSEMBLY_TTL_SECS`). Memory stays bounded either way, so this
+/// is a fairness / partial-DoS guard, not an OOM guard. (audit: per-sender quota.)
+pub const MAX_TRANSFERS_PER_SENDER: usize = MAX_CONCURRENT_TRANSFERS / 4;
+
+/// Per-sender cap on buffered reassembly bytes — same fairness rationale as
+/// [`MAX_TRANSFERS_PER_SENDER`].
+pub const MAX_REASSEMBLY_BYTES_PER_SENDER: usize = MAX_REASSEMBLY_BYTES / 4;
+
 /// Outcome of feeding one chunk into the reassembler.
 #[derive(Debug)]
 pub enum AddChunkResult {
@@ -109,6 +120,24 @@ impl EnvelopeChunkReassembler {
             // data.len() <= MAX_CHUNK_PAYLOAD.
             if self.total_buffered.saturating_add(chunk.data.len()) > MAX_REASSEMBLY_BYTES {
                 return AddChunkResult::Rejected("global reassembly budget exceeded");
+            }
+            // Per-sender sub-quota (fairness / partial-DoS): one peer must not be
+            // able to occupy all global slots/bytes and starve reassembly for
+            // others. Computed on the fly from the (≤64) in-flight transfers so
+            // there is no per-sender counter to keep in sync.
+            let sender = envelope.sender_node_id;
+            let (sender_transfers, sender_bytes) = self
+                .transfers
+                .values()
+                .filter(|s| s.sender_node_id == sender)
+                .fold((0usize, 0usize), |(c, b), s| {
+                    (c + 1, b.saturating_add(s.received_bytes))
+                });
+            if sender_transfers >= MAX_TRANSFERS_PER_SENDER {
+                return AddChunkResult::Rejected("per-sender transfer quota exceeded");
+            }
+            if sender_bytes.saturating_add(chunk.data.len()) > MAX_REASSEMBLY_BYTES_PER_SENDER {
+                return AddChunkResult::Rejected("per-sender reassembly byte quota exceeded");
             }
             let mut received = vec![None; chunk.chunk_count as usize];
             let data_len = chunk.data.len();
@@ -242,6 +271,14 @@ mod tests {
             payload: vec![],
             trace_id: 0,
             require_ack: false,
+        }
+    }
+
+    /// Carrier envelope from a specific sender_node_id (per-sender-quota tests).
+    fn carrier_from(sender_node_id: [u8; 32]) -> DeliveryEnvelope {
+        DeliveryEnvelope {
+            sender_node_id,
+            ..carrier([0u8; 32])
         }
     }
 
@@ -379,17 +416,58 @@ mod tests {
             let mut tid = [0u8; 16];
             tid[0] = (i & 0xff) as u8;
             tid[1] = (i >> 8) as u8;
+            // Distinct sender per transfer so the GLOBAL cap is what trips
+            // (not the per-sender quota — exercised separately below).
+            let sender = [i as u8; 32];
             // multi-chunk so each stays pending and occupies a slot
             assert!(matches!(
-                r.add(&carrier([0; 32]), chunk(tid, 0, 2, 4, vec![1, 2]), 0),
+                r.add(&carrier_from(sender), chunk(tid, 0, 2, 4, vec![1, 2]), 0),
                 AddChunkResult::Pending
             ));
         }
-        // One more distinct transfer must be rejected.
+        // One more distinct transfer (distinct sender) must be rejected by the
+        // global cap.
         let tid = [0xFFu8; 16];
         assert!(matches!(
-            r.add(&carrier([0; 32]), chunk(tid, 0, 2, 4, vec![1, 2]), 0),
+            r.add(
+                &carrier_from([0xFE; 32]),
+                chunk(tid, 0, 2, 4, vec![1, 2]),
+                0
+            ),
             AddChunkResult::Rejected("too many concurrent transfers")
+        ));
+    }
+
+    #[test]
+    fn per_sender_quota_enforced() {
+        let mut r = EnvelopeChunkReassembler::new();
+        let sender = [7u8; 32];
+        // Fill the per-sender quota from one sender (well below the global cap).
+        for i in 0..MAX_TRANSFERS_PER_SENDER {
+            let mut tid = [0u8; 16];
+            tid[0] = i as u8;
+            assert!(matches!(
+                r.add(&carrier_from(sender), chunk(tid, 0, 2, 4, vec![1, 2]), 0),
+                AddChunkResult::Pending
+            ));
+        }
+        // One more from the SAME sender → per-sender rejection.
+        assert!(matches!(
+            r.add(
+                &carrier_from(sender),
+                chunk([0xAAu8; 16], 0, 2, 4, vec![1, 2]),
+                0
+            ),
+            AddChunkResult::Rejected("per-sender transfer quota exceeded")
+        ));
+        // A DIFFERENT sender is unaffected (no global starvation).
+        assert!(matches!(
+            r.add(
+                &carrier_from([8u8; 32]),
+                chunk([0xBBu8; 16], 0, 2, 4, vec![1, 2]),
+                0
+            ),
+            AddChunkResult::Pending
         ));
     }
 }
