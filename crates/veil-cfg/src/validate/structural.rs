@@ -373,8 +373,45 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
     },
 ];
 
+/// Non-fatal advisories surfaced in [`ValidationReport::warnings`] but
+/// which NEVER fail the config (see [`ValidationReport::is_valid`]). Use
+/// this — not [`VALIDATION_RULES`] — for risky-but-permitted defaults that
+/// must not break backward compatibility.
+///
+/// [`ValidationReport`]: super::report::ValidationReport
+/// [`ValidationReport::warnings`]: super::report::ValidationReport::warnings
+/// [`ValidationReport::is_valid`]: super::report::ValidationReport::is_valid
+pub const WARNING_RULES: &[ValidationRule] = &[ValidationRule {
+    code: "mailbox_push_unauth_wake_permitted",
+    key: "mailbox.push.require_wake_hmac",
+    message: "push relay is enabled (FCM/APNs credentials set) with require_wake_hmac = false — the relay falls back to UNauthenticated wake-only pushes for receivers that have not uploaded a wake-HMAC envelope, which anyone who learns a push token (or can trigger a mailbox PUT) can forge to drain a device's battery or probe presence. This is the backward-compatible default; set it true in production once your client fleet onboards wake-HMAC keys",
+    check: mailbox_push_unauth_wake_permitted,
+    fix: None,
+}];
+
+/// A push relay (FCM or APNs credentials configured) that still permits the
+/// legacy unauthenticated wake-only fallback.
+fn mailbox_push_unauth_wake_permitted(config: &Config) -> bool {
+    let p = &config.mailbox.push;
+    (p.fcm_enabled() || p.apns_enabled()) && !p.require_wake_hmac
+}
+
 pub fn collect_issues(config: &Config) -> Vec<ValidationIssue> {
     VALIDATION_RULES
+        .iter()
+        .filter(|rule| (rule.check)(config))
+        .map(|rule| ValidationIssue {
+            code: rule.code,
+            key: rule.key,
+            message: rule.message.to_owned(),
+            can_fix: rule.fix.is_some(),
+        })
+        .collect()
+}
+
+/// Collect non-fatal advisories (see [`WARNING_RULES`]).
+pub fn collect_warnings(config: &Config) -> Vec<ValidationIssue> {
+    WARNING_RULES
         .iter()
         .filter(|rule| (rule.check)(config))
         .map(|rule| ValidationIssue {
