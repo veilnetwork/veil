@@ -821,6 +821,19 @@ pub struct MailboxPushConfig {
     /// Empty → production.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub apns_environment: String,
+    /// Forbid the legacy UNauthenticated wake-up path.
+    ///
+    /// A wake-up push carries an authenticated payload (`ts ‖ content_id ‖
+    /// HMAC`) only when the receiver has opted in by uploading a sealed
+    /// `WakeHmacKey` envelope; otherwise the relay falls back to a "wake-only"
+    /// push with an EMPTY payload, which anyone able to learn the push token
+    /// (or trigger a mailbox PUT) can forge to wake the device — a battery-drain
+    /// / nuisance vector. When `true`, the relay DROPS such pushes instead of
+    /// sending an unauthenticated wake. Default `false` for backward compat
+    /// (receivers that haven't opted into wake-HMAC still get woken); operators
+    /// who control their client fleet should set it `true` in production.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_wake_hmac: bool,
 }
 
 impl MailboxPushConfig {
