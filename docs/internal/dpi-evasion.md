@@ -139,7 +139,10 @@ obfs4 PSK distribution: Phase 3-interim ships a single network-wide
 
 ## webtunnel anti-probe for `wss://` / `tls://`
 
-**Status**: library complete, transport integration deferred.
+**Status**: library + transport integration complete — registered as the
+`wss://` webtunnel transport (`registry.rs`), with operator config via
+`webtunnel_secret_path` / `webtunnel_auth_token` / `webtunnel_decoy_dir` in
+`TransportContext`.
 
 webtunnel addresses the **active-probe** gap left by plain TLS.  An
 operator that deploys veil on a public server can wrap it with
