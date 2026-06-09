@@ -1015,9 +1015,21 @@ impl FrameDispatcher {
         if let Some(addr) = observed_addr {
             use veil_proto::budget::MAX_PEER_OBSERVED_ADDRS;
             let mut map = wlock!(self.peer_observed_addrs);
-            if map.len() < MAX_PEER_OBSERVED_ADDRS {
-                map.insert(new_peer, addr);
+            // Entries are removed on session close, so this map tracks active
+            // sessions; overflow is rare but reachable — active sessions CAN
+            // exceed MAX_PEER_OBSERVED_ADDRS (1024) under capacity-referral
+            // headroom (max_concurrent 1000 + referral_headroom). When full,
+            // evict one entry so the newest peer's observed addr is always
+            // recorded instead of being silently dropped (the old `< MAX`
+            // gate). Best-effort NAT-hint cache, so arbitrary eviction is fine.
+            // (audit: silent no-op at cap.)
+            if map.len() >= MAX_PEER_OBSERVED_ADDRS && !map.contains_key(&new_peer) {
+                let victim = map.keys().next().copied();
+                if let Some(victim) = victim {
+                    map.remove(&victim);
+                }
             }
+            map.insert(new_peer, addr);
         }
         let Some(ref reg_arc) = self.session_tx_registry else {
             return;
