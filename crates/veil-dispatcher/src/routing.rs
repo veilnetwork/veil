@@ -1233,7 +1233,14 @@ impl FrameDispatcher {
     /// Broadcast `ROUTE_WITHDRAW(origin=closed_peer, via=self)` to all remaining peers.
     ///
     /// Called immediately before a session is unregistered from `SessionTxRegistry`.
-    pub fn on_session_closed(&self, closed_peer: NodeId) {
+    ///
+    /// `was_referral` suppresses the post-close peer-sample re-gossip for
+    /// transient capacity-referral sessions: those cycle every ~20 s under
+    /// saturation and the referred client already received an on-open sample, so
+    /// re-gossiping to all peers on every referral close is pure churn
+    /// amplification with no re-knit value. Real (data) session closes pass
+    /// `false` and still trigger the re-knit gossip.
+    pub fn on_session_closed(&self, closed_peer: NodeId, was_referral: bool) {
         let closed_peer = *closed_peer.as_bytes();
         wlock!(self.peer_observed_addrs).remove(&closed_peer);
         // Release any relay tunnels where the closing peer was an endpoint.
@@ -1348,8 +1355,12 @@ impl FrameDispatcher {
 
         // Peer-exchange on session DROP: a neighbour just left, so re-spread a
         // fresh peer sample to the remaining sessions to help the mesh re-knit
-        // around the loss. Bounded by our (capped) session degree.
-        self.gossip_peer_sample_to_all(PEER_GOSSIP_SAMPLE);
+        // around the loss. Bounded by our (capped) session degree. Skipped for
+        // transient referral closes (see `was_referral` above) to avoid churn
+        // amplification when a saturated node cycles referral sessions.
+        if !was_referral {
+            self.gossip_peer_sample_to_all(PEER_GOSSIP_SAMPLE);
+        }
     }
 
     /// Re-announce every currently-connected peer to all other peers.
