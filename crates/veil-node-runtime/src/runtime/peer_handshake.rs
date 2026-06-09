@@ -410,17 +410,30 @@ pub async fn register_connection_session(
             };
         let known_remote_id: Option<[u8; 32]> =
             expected_peer.as_ref().map(|ep| *ep.node_id.as_bytes());
-        let (resume_ticket, ticket_verifier) = match source {
-            SessionSource::Outbound(_) => {
-                let ticket = known_remote_id
-                    .and_then(|id| lock!(runtime.resumption.peer_tickets).get(&id).cloned());
-                (ticket, None)
-            }
-            SessionSource::Inbound(_) => {
-                let verifier = Some(Arc::clone(&runtime.resumption.ticket_issuer));
-                (None, verifier)
-            }
-        };
+        // SECURITY — audit cycle-2 CRITICAL: the session-resumption fast-path is
+        // DISABLED on BOTH sides. On resume both peers restored the ORIGINAL
+        // session's tx/rx keys into a fresh `SessionCipher` whose counter resets
+        // to 0 (handshake.rs:547 server / :641 client); the AEAD nonce is
+        // `dir_salt ‖ counter` with no session-unique salt/epoch
+        // (session_cipher.rs:100), so every resumed frame #i reused the EXACT
+        // (key, nonce) of the original session's frame #i — catastrophic
+        // ChaCha20-Poly1305 nonce reuse (keystream + Poly1305 one-time-key
+        // recovery → plaintext disclosure + frame forgery for anyone who records
+        // both sessions' ciphertext).
+        //
+        // `resume_ticket = None` (outbound) → this node never ORIGINATES a
+        // resumption; `ticket_verifier = None` (inbound) → this node never
+        // ACCEPTS one (so a legacy/hostile peer that still sends a ticket cannot
+        // make *us* resume). Every connection therefore takes the full handshake
+        // — always supported, so no compat break, only a reconnect-latency cost.
+        // Tickets are still issued/stored (harmless), so re-enabling is a local
+        // revert here ONCE resumption derives FRESH keys (HKDF over the ticket
+        // secret + a per-resumption nonce in HELLO/ATTACH) instead of restoring
+        // the originals into a counter-0 cipher.
+        let resume_ticket: Option<veil_proto::session::ClientTicketEntry> = None;
+        let ticket_verifier: Option<
+            std::sync::Arc<std::sync::Mutex<veil_session::ticket::TicketIssuer>>,
+        > = None;
         let hs_timeout = std::time::Duration::from_secs(veil_proto::budget::HANDSHAKE_TIMEOUT_SECS);
         let sovereign_ctx =
             runtime
