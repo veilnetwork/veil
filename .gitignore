@@ -9,10 +9,19 @@ temp.md
 /.claude/
 /temp
 
-# Release sign
+# Release-signing secrets — backstop only. PREFER keeping these OUTSIDE the
+# repo working tree entirely (e.g. ~/.config/veil/); the CLI takes a path
+# (`--identity <path>`) and CI reads them from secrets, so they need never
+# live here. See docs/en/release-signing.md. These globs catch the ceremony
+# filenames so an in-tree copy can't be committed by accident.
 release-identity.toml
 release.key
 release.pub
+*-release-*.key
+*-release-*.pub
+veil-release-*.key
+veil-release-*.pub
+release-identity*.toml
 
 # Testnet ssl
 ssl/key.pem

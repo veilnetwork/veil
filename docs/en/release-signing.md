@@ -54,14 +54,21 @@ fails). For a guaranteed check, install OpenSSL 3.x or run with
 Do this on a trusted, offline-capable machine. The **private key never leaves**
 it except as a CI secret.
 
+Generate the keypair **outside the repository working tree** so the private
+key can never be `git add`-ed by accident — e.g. under `~/.config/veil/`. The
+repo `.gitignore` also globs `*-release-*.key` as a backstop, but the primary
+control is keeping the file out of the tree in the first place.
+
 ```sh
-# 1. Generate an Ed25519 release-signing keypair.
+# 1. Generate an Ed25519 release-signing keypair, OUTSIDE the repo.
 umask 077
-openssl genpkey -algorithm ed25519 -out veil-release-ed25519.key
-openssl pkey -in veil-release-ed25519.key -pubout -out veil-release-ed25519.pub
+mkdir -p ~/.config/veil
+openssl genpkey -algorithm ed25519 -out ~/.config/veil/veil-release-ed25519.key
+openssl pkey -in ~/.config/veil/veil-release-ed25519.key \
+  -pubout -out ~/.config/veil/veil-release-ed25519.pub
 
 # 2. Inspect the public key you will pin.
-cat veil-release-ed25519.pub
+cat ~/.config/veil/veil-release-ed25519.pub
 # -----BEGIN PUBLIC KEY-----
 # MCowBQYDK2VwAyEA....
 # -----END PUBLIC KEY-----
@@ -100,9 +107,20 @@ signature **fail-closed** (missing or invalid signature aborts the install).
 
 ### 4. Store the private key safely
 
-Keep `veil-release-ed25519.key` offline (hardware token / encrypted backup).
-Compromise of this key lets an attacker mint installer-trusted manifests, so
-treat it like the `VEIL_RELEASE_IDENTITY_TOML` update-signing key.
+Keep `veil-release-ed25519.key` offline (hardware token / encrypted backup)
+and **never inside the repo working tree** — store it under a per-user config
+dir (`~/.config/veil/`) or a secrets manager, not the checkout. Compromise of
+this key lets an attacker mint installer-trusted manifests, so treat it like
+the `VEIL_RELEASE_IDENTITY_TOML` update-signing key.
+
+The same rule applies to the **update-signing** identity (`release-identity.toml`,
+read locally via `veil-cli ... update --identity <path>`): it takes an arbitrary
+path, so point it at an out-of-tree file (`--identity ~/.config/veil/release-identity.toml`)
+rather than dropping it in the repo root. In CI both keys come from repository
+secrets (`RELEASE_INSTALLER_ED25519_SK`, `VEIL_RELEASE_IDENTITY_TOML`), never a
+committed file. The repo `.gitignore` globs the conventional secret filenames
+(`*-release-*.key`, `release-identity*.toml`, …) as a last-resort backstop —
+defence in depth, not the primary control.
 
 ## Verification behaviour matrix
 
@@ -127,7 +145,7 @@ secret in the testnet repo, and run the installer with the public PEM in the
 `VEIL_RELEASE_PUBKEY_PEM` environment variable (it overrides the pinned key):
 
 ```sh
-VEIL_RELEASE_PUBKEY_PEM="$(cat veil-release-ed25519.pub)" \
+VEIL_RELEASE_PUBKEY_PEM="$(cat ~/.config/veil/veil-release-ed25519.pub)" \
   sh install.sh --require-signature
 ```
 

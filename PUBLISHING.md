@@ -136,6 +136,13 @@ git remote -v   # should point at the anonymous GitHub repo before any push
 > **CI release secret.** `.github/workflows/release.yml` reads the repository
 > secret **`VEIL_RELEASE_IDENTITY_TOML`**. Create it under that exact name in
 > the public repo, or the signed-release job will fail.
+>
+> Release/update-signing **private keys never belong in the working tree.** In
+> CI they come from repository secrets; for local signing keep them out of the
+> checkout (e.g. `~/.config/veil/`) and pass the path explicitly
+> (`veil-cli ... update --identity ~/.config/veil/release-identity.toml`). The
+> `.gitignore` globs the conventional secret filenames as a backstop only — see
+> [`docs/en/release-signing.md`](docs/en/release-signing.md).
 
 This file (`PUBLISHING.md`) can be deleted before or kept after publication —
 it contains no sensitive data.
