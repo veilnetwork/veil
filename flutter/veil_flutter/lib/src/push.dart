@@ -656,7 +656,10 @@ class VeilPush {
       }
       return blobs;
     } finally {
-      client.close();
+      // Await the close so the native teardown + controller cleanup fully
+      // complete before this background isolate exits — an un-awaited close
+      // can be cut short when the FCM/APNs handler returns.
+      await client.close();
     }
   }
 }

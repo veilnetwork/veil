@@ -98,7 +98,14 @@ public class VeilFlutterPlugin: NSObject, FlutterPlugin {
             BGTaskScheduler.shared.register(
                 forTaskWithIdentifier: BG_TASK_IDENTIFIER, using: nil,
             ) { task in
-                instance.handleBackgroundProcessing(task as! BGProcessingTask)
+                // Guarded cast: a forced `as!` would crash the host app if iOS
+                // ever hands a task of an unexpected type. Mark the task done
+                // (unsuccessfully) and bail instead.
+                guard let task = task as? BGProcessingTask else {
+                    task.setTaskCompleted(success: false)
+                    return
+                }
+                instance.handleBackgroundProcessing(task)
             }
         }
         #endif
