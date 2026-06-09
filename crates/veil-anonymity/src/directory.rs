@@ -258,6 +258,22 @@ pub fn decode_entry(blob: &[u8]) -> Result<RelayDirectoryEntry, DirectoryError> 
 /// (kept separate so a debug tool can validate signature on a
 /// stale entry without freshness rejection).
 pub fn verify_entry(entry: &RelayDirectoryEntry) -> Result<(), DirectoryError> {
+    // Bind node_id to the issuer key: node_id MUST equal BLAKE3(issuer_pk).
+    // Without this, an attacker holding ANY valid identity key could sign an
+    // entry naming a *victim's* node_id (with an attacker-chosen x25519_pk) and
+    // the signature alone would pass — letting them occupy a victim's relay
+    // slot. Enforcing the binding HERE (not only at the `discover_relay_hops`
+    // caller, which matches node_id against the fetch key) keeps the invariant
+    // intact for every caller, including any future network-wide directory
+    // discovery. (audit: relay-pool poisoning / deanonymization.)
+    let issuer_pk_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &entry.issuer_pk,
+    )
+    .map_err(|_| DirectoryError::Verify)?;
+    if blake3::hash(&issuer_pk_bytes).as_bytes() != &entry.node_id {
+        return Err(DirectoryError::Verify);
+    }
     let canonical = canonical_message(
         &entry.node_id,
         &entry.x25519_pk,
