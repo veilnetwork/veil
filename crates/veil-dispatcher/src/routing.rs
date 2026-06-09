@@ -1101,9 +1101,15 @@ impl FrameDispatcher {
             wlock!(reg_arc).send_to(&new_peer, veil_proto::header::priority::INTERACTIVE, frame);
         }
 
-        // Update DHT routing table: new peer is now reachable via a direct session.
+        // Update DHT routing table: new peer is now reachable via a direct
+        // session. Use the TRUSTED insert — this peer just completed an OVL1
+        // handshake, so it must bypass the per-bucket Eclipse rate limit (that
+        // limit defends against unsolicited/gossip adds, not known-good
+        // post-handshake peers). With the generic `add_contact`, several
+        // handshakes completing in the same rate-limit window could silently
+        // drop an authenticated peer from the table (see `insert_trusted`).
         self.dht
-            .add_contact(veil_dht::routing::Contact::new(new_peer, ""));
+            .add_contact_trusted(veil_dht::routing::Contact::new(new_peer, ""));
 
         // update total and relay session counts in the congestion monitor.
         if let Some(cm) = &self.congestion_monitor {
