@@ -218,12 +218,15 @@ impl<T> HandleTable<T> {
             slot.value = Some(arc);
             Self::encode(index, slot.generation)
         } else {
-            let index = t.slots.len() as u32;
-            // Refuse to alias slot 0 if the index space is ever exhausted.
+            // Check the bound in `usize` BEFORE narrowing to u32, so a
+            // (physically infeasible) >u32::MAX slot count can't truncate past
+            // the guard. (audit cycle-3.)
+            let index = t.slots.len();
             assert!(
-                (index as usize) <= HANDLE_INDEX_MASK,
+                index <= HANDLE_INDEX_MASK,
                 "veilclient-ffi: handle table exhausted",
             );
+            let index = index as u32;
             t.slots.push(HandleSlot {
                 generation: 1,
                 value: Some(arc),
@@ -971,11 +974,15 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
                     continue; // no handler currently installed — drop the frame
                 };
                 let user_ptr = user_addr as *mut std::ffi::c_void;
-                // wrap the callback in catch_unwind. A panic across the FFI
-                // boundary is undefined behaviour (Rust's unwinder doesn't
-                // cross C-ABI frames cleanly); catching here turns it into a
-                // logged warning + drop the message. The recv loop continues so
-                // a single bad callback panic doesn't permanently break it.
+                // Best-effort catch_unwind around the host callback. NOTE: this
+                // only intercepts a panic raised on the RUST side of this
+                // closure — a panic/exception propagating OUT of the host `cb`
+                // across the C-ABI frame is undefined behaviour that catch_unwind
+                // cannot catch; the host callback MUST NOT unwind (contract).
+                // Under the release `panic=abort` profile a Rust panic aborts
+                // regardless, so the guard is meaningful only in unwinding
+                // (dev/test) builds, where it logs + drops the message and keeps
+                // the recv loop alive instead of poisoning it.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                     cb(
                         user_ptr,
@@ -3491,19 +3498,57 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
     unsafe {
         clear_err(err_out);
     }
-    let (phrase_str, phrase_len) = match unsafe { cstr_to_str_with_len(phrase) } {
-        Some(pair) => pair,
+    if phrase.is_null() {
+        unsafe {
+            write_err(err_out, "phrase is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // Bounded length FIRST, WITHOUT UTF-8 validation, so we can scrub even a
+    // non-UTF-8 buffer. `None` ⇒ NULL or non-NUL-terminated within the cap,
+    // which we cannot safely scrub without knowing the allocation size.
+    // (audit cycle-3: the old path returned on invalid-UTF-8 BEFORE wiping.)
+    let phrase_len = match unsafe { ffi_cstr_len_bounded(phrase) } {
+        Some(n) => n,
         None => {
             unsafe {
-                write_err(
-                    err_out,
-                    "phrase is NULL, too long (>4 KiB), or not valid UTF-8",
-                );
+                write_err(err_out, "phrase is NULL or too long (>4 KiB)");
             }
             return VEIL_ERR_INVALID_ARG;
         }
     };
-    let rc = match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
+    // RAII guard: zero the buffer (incl. trailing NUL) on EVERY return path —
+    // success, decode failure, or non-UTF-8 — so possibly-sensitive input never
+    // lingers. Armed after the bounded length check. Mirrors
+    // `veil_restore_identity_from_phrase_zeroize`.
+    struct ZeroOnDrop {
+        ptr: *mut u8,
+        len: usize,
+    }
+    impl Drop for ZeroOnDrop {
+        fn drop(&mut self) {
+            unsafe {
+                std::ptr::write_bytes(self.ptr, 0, self.len);
+            }
+        }
+    }
+    let _guard = ZeroOnDrop {
+        ptr: phrase as *mut u8,
+        len: phrase_len.saturating_add(1),
+    };
+
+    // UTF-8 decode AFTER the guard is armed.
+    let phrase_bytes = unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) };
+    let phrase_str = match std::str::from_utf8(phrase_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe {
+                write_err(err_out, "phrase is not valid UTF-8");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
         Ok(_seed) => VEIL_OK,
         Err(e) => {
             unsafe {
@@ -3511,14 +3556,7 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
             }
             VEIL_ERR
         }
-    };
-    // Zero the caller's buffer including the trailing NUL. This runs
-    // unconditionally — even on the error path — so a bad phrase that
-    // exposes which words are wrong does not stay in plaintext.
-    unsafe {
-        std::ptr::write_bytes(phrase as *mut u8, 0, phrase_len.saturating_add(1));
     }
-    rc
 }
 
 /// Zero-on-consume variant [`veil_restore_identity_from_phrase`].
@@ -4366,6 +4404,34 @@ mod tests {
     fn null_handle_close_is_noop() {
         unsafe {
             veil_close(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn validate_bip39_zeroize_wipes_invalid_utf8_input() {
+        // audit cycle-3: even a non-UTF-8 (so rejected) but NUL-terminated
+        // writable buffer must be scrubbed — the RAII guard runs on every path.
+        let mut buf: Vec<u8> = vec![0xFF, 0xFE, 0xAA, 0x00]; // invalid UTF-8 + NUL
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf.as_mut_ptr() as *mut c_char, &mut err) };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert_eq!(&buf[..3], &[0, 0, 0], "content bytes must be zeroed");
+        if !err.is_null() {
+            unsafe { veil_free_string(err) };
+        }
+    }
+
+    #[test]
+    fn validate_bip39_zeroize_wipes_rejected_phrase() {
+        // A valid-UTF-8 but not-a-mnemonic phrase is also wiped (was already the
+        // case; guards against regression).
+        let mut buf: Vec<u8> = b"not a real mnemonic\0".to_vec();
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf.as_mut_ptr() as *mut c_char, &mut err) };
+        assert_ne!(rc, VEIL_OK);
+        assert!(buf.iter().all(|&b| b == 0), "phrase buffer must be fully zeroed");
+        if !err.is_null() {
+            unsafe { veil_free_string(err) };
         }
     }
 
