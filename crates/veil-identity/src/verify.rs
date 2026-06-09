@@ -481,13 +481,19 @@ pub fn verify_identity_proof(
             skew: TIME_VALIDITY_SKEW_SECS,
         });
     }
-    // 4''. `freshness_hour` enforcement.
-    // The wire field has been carried through encode/decode and
-    // producers always set it to `floor(now / 3600)` at sign time
-    // (`publish::sign_identity_proof`). Pre-fix the verifier
-    // accepted any value, so a stale proof captured 5 days ago
-    // could be replayed unmodified. Skew window is FRESHNESS_HOUR_SKEW
-    // hours (±1) to accept producers with briefly-wrong clocks.
+    // 4''. `freshness_hour` sanity check — NOT replay protection.
+    // The wire field is carried through encode/decode and producers set it to
+    // `floor(now / 3600)` at sign time (`publish::sign_identity_proof`).
+    // IMPORTANT: `freshness_hour` is NOT covered by any signature —
+    // `ephemeral_signing_message` signs context||node_id||proof_valid_until||
+    // ephemeral_x25519_pk, not this field — so an attacker replaying a captured
+    // proof can rewrite `freshness_hour` to the current hour and pass this check.
+    // It therefore does NOT stop a deliberate replay. The load-bearing
+    // anti-replay is the ephemeral-pk binding in `verify_identity_proof_frame`
+    // (the proof must match the live key-agreement ephemeral of THIS session, so
+    // a captured proof cannot bind to a fresh handshake). What this check DOES
+    // catch is an honest producer with a badly-wrong clock or a grossly stale
+    // cached proof. Skew window is FRESHNESS_HOUR_SKEW hours (±1).
     // Producers carrying `freshness_hour == 0` predate this field
     // (legacy / uninitialized) and are accepted silently — same
     // "0-as-sentinel" rule as the other lower-bound fields.
