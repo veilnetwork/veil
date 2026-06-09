@@ -894,6 +894,14 @@ int veil_mailbox_ack(VeilHandle *handle,
  * (one of `VEIL_JOIN_*`). Returns [`VEIL_OK`] iff the IPC
  * round-trip itself succeeded; the actual decode/verify outcome lives
  * in `out_status`.
+ *
+ * Because the outcome is in `out_status`, this call returns `VEIL_OK`
+ * for *every* completed round-trip — including failure statuses
+ * (`VEIL_JOIN_PASSWORD_WRONG`, …) and successes that carry an
+ * informational note. In all of those cases `*err_out` is set to the
+ * detail string for `out_status`, so `*err_out` may be non-NULL even
+ * on `VEIL_OK`. Callers MUST free `*err_out` with `veil_free_string`
+ * whenever it is non-NULL — see the crate-level "Error model".
  */
 
 int veil_join_bootstrap_uri(VeilHandle *handle,
