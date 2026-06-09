@@ -1682,23 +1682,28 @@ impl HybridKexCtPayload {
 
 // ── hot-standby transport handover ─────────────────────────────────
 //
-// Three frames carry the handoff:
+// The handoff migrates a live session onto a new transport via a
+// challenge-response on the fresh socket (NOT the old nonce-echo scheme):
 //
 // 1. `HandoffInit` (over primary, AEAD) — sender announces intent to
 // migrate the session onto a new underlying transport.
-// 2. `HandoffAck` (over primary, AEAD) — receiver agrees and echoes
-// the nonce to commit the pending handoff on its side.
-// 3. `HandoffAttach` (first OVL1 frame on the **new** socket — plaintext
-// on the wire, but the HMAC binds it to the secret session key so
-// forgery requires knowledge of `tx_key`/`rx_key`).
+// 2. `HandoffAck` (over primary, AEAD) — receiver agrees and records a
+// pending handoff keyed by `session_id`.
+// 3. `HandoffAttach` (first frame on the **new** socket) — initiator
+// identifies which session this socket belongs to.
+// 4. `HandoffChallenge` (new socket) — the accepting side replies with a
+// FRESH 32-byte `OsRng` challenge generated for THIS socket.
+// 5. `HandoffResponse` (new socket) — initiator proves ownership with
+// `hmac = BLAKE3::keyed(tx_key)(session_id || challenge)`; the accepting
+// side recomputes it with its `rx_key` (which equals the sender's
+// `tx_key` under the OVL1 DH) and constant-time compares. Mismatch →
+// close the socket as a protocol violation.
 //
-// The nonce in `HandoffInit`/`HandoffAck` is 32 bytes of `OsRng`. The HMAC
-// in `HandoffAttach` is `BLAKE3::keyed(tx_key)(session_id || nonce)` — the
-// receiver recomputes it with its `rx_key` (which equals the sender's
-// `tx_key` under the OVL1 DH). Mismatch → close the socket as a violation.
-//
-// Each of the three payloads is fixed-size, so the decoder rejects any
-// trailing bytes: `TrailingBytes { trailing: buf.len - WIRE_SIZE }`.
+// Anti-replay comes from the per-socket FRESH challenge: a captured
+// `HandoffResponse` cannot answer a different socket's challenge (see
+// `veil-session/src/handoff.rs` + its replay regression test). Each
+// payload is fixed-size, so the decoder rejects any trailing bytes:
+// `TrailingBytes { trailing: buf.len - WIRE_SIZE }`.
 
 /// Payload of `SessionMsg::HandoffInit` (32 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
