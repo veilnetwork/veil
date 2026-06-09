@@ -69,6 +69,12 @@ impl HotStandbyController {
     /// `max_swaps_per_minute` semantics [`HotStandbyConfig`].
     pub const FLAP_WINDOW: Duration = Duration::from_secs(60);
 
+    /// Cap on distinct peers tracked in `swap_history`. Past this, a single GC
+    /// sweep drops peers whose flap window has fully aged out, so a churn of
+    /// one-shot swappers can't grow the map unboundedly (the per-peer prune only
+    /// runs when that peer is revisited). (audit cycle-3.)
+    const MAX_TRACKED_SWAP_PEERS: usize = 4096;
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         transport_registry: Arc<TransportRegistry>,
@@ -231,6 +237,18 @@ impl HotStandbyController {
     fn register_swap_attempt(&self, peer_id: &NodeId) -> Option<usize> {
         let now = Instant::now();
         let mut history = self.swap_history.lock().unwrap_or_else(|p| p.into_inner());
+        // Opportunistic GC: when the map grows past the cap, prune every peer's
+        // window and drop those that have fully aged out, bounding memory under
+        // one-shot-swapper churn (the per-peer prune below only runs for the
+        // peer being revisited).
+        if history.len() > Self::MAX_TRACKED_SWAP_PEERS {
+            history.retain(|_, dq| {
+                while dq.front().is_some_and(|&t| now.duration_since(t) > Self::FLAP_WINDOW) {
+                    dq.pop_front();
+                }
+                !dq.is_empty()
+            });
+        }
         let entry = history.entry(*peer_id.as_bytes()).or_default();
         // Prune entries older than the flap window.
         while let Some(&t) = entry.front() {

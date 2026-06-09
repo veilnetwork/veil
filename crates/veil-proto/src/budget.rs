@@ -208,6 +208,12 @@ pub const MAX_ROUTES_PER_DST: usize = 4;
 /// redundant paths.
 pub const MAX_ROUTES_PER_VIA: usize = 256;
 
+/// Maximum entries accepted in a `VersionVectorSyncPayload` (per-frame). At
+/// ~40 B/entry this caps a single sync frame near 400 KiB. Named so the cap and
+/// its memory implication live next to the other routing budgets instead of as
+/// a bare literal in the decoder. (audit cycle-3.)
+pub const MAX_VERSION_VECTOR_ENTRIES: usize = 10_000;
+
 /// Maximum number of bytes in a single TLV entry value.
 ///
 /// Must not exceed `u16::MAX` (65 535): the wire format stores the TLV length

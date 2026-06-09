@@ -172,6 +172,11 @@ impl AdminListener {
     }
 
     /// Return the locally-bound TCP address, if this is a TCP listener.
+    ///
+    /// ANCHOR (audit cycle-3, dead-code policy): currently uncalled — kept as
+    /// the symmetric accessor to `AdminListener`'s inner transport for when a
+    /// TCP admin endpoint writes its bound port to a discovery file (the Unix
+    /// path already exposes its socket path). Remove if that never lands.
     #[allow(dead_code)]
     pub fn local_tcp_addr(&self) -> Option<std::net::SocketAddr> {
         self.0.local_tcp_addr()

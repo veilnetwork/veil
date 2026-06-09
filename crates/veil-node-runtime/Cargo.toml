@@ -43,7 +43,6 @@ veil-dispatcher = { path = "../veil-dispatcher" }
 veil-dispatcher-state = { path = "../veil-dispatcher-state" }
 veil-e2e = { path = "../veil-e2e" }
 veil-error = { path = "../veil-error" }
-veil-fingerprint = { path = "../veil-fingerprint" }
 veil-gateway = { path = "../veil-gateway" }
 veil-identity = { path = "../veil-identity" }
 veil-invite = { path = "../veil-invite" }
