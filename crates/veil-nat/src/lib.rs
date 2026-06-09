@@ -1,29 +1,21 @@
-//! NAT traversal — UDP hole punching + relay fallback.
+//! NAT helpers — external-address (STUN-like) discovery and `NatCandidate`
+//! ⇄ `SocketAddr` conversion.
 //!
-//! ## Architecture
+//! A node asks a core/gateway peer "what address do you see my connection
+//! coming from?" ([`ExternalAddrDiscovery`]); the peer echoes the observed
+//! external `(IP, port)` back in a `NAT_PROBE_REPLY`. [`candidate_to_socket_addr`]
+//! decodes the `NatCandidate`s carried in those replies into usable addresses.
 //!
-//! 1. **External address discovery** ([`ExternalAddrDiscovery`]): A node
-//!    contacts a core node and learns its external `(IP, port)` from the core's
-//!    perspective (STUN-like).
+//! ## History
 //!
-//! 2. **Candidate exchange** ([`NatPuncher`]): Alice sends
-//!    `NAT_PROBE_REQUEST` with her candidates through the veil (via core).
-//!    Bob receives it, replies with `NAT_PROBE_REPLY` carrying his own candidates.
-//!
-//! 3. **Hole punching** ([`NatPuncher::punch`]): Both sides simultaneously send
-//!    UDP QUIC handshake packets to all candidates. The first successful QUIC
-//!    connection becomes the direct path.
-//!
-//! 4. **Relay fallback** ([`RelayFallback`]): If punching fails within a
-//!    deadline, `NAT_RELAY_REQUEST` is sent to a core node which opens a
-//!    `FORWARD` tunnel between the two leaf nodes.
+//! This crate originally also carried UDP hole-punching (`NatPuncher`),
+//! candidate coordination (`NatCoordinator`), and relay-fallback
+//! (`RelayFallback`) plumbing. None of it was ever wired into the dial path —
+//! no production caller ever constructed any of those types (the one would-be
+//! call site was cargo-cult and had already been removed) — so that ~1k LOC of
+//! dead code was deleted. Only the discovery + candidate-conversion layer below
+//! remains in use (by `veil-dispatcher` and `veil-node-runtime`).
 
-pub mod coordinator;
 pub mod discovery;
-pub mod puncher;
-pub mod relay;
 
-pub use coordinator::{NatCoordinator, NatResult, NatState};
 pub use discovery::{ExternalAddrDiscovery, candidate_to_socket_addr};
-pub use puncher::{CandidateList, NatPuncher, PunchResult};
-pub use relay::RelayFallback;
