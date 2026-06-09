@@ -29,6 +29,15 @@ use veil_types::UpdateConfig;
 use super::fetch::{FetchError, UpdateAvailability, check_for_update_via_https};
 use super::installed_version::{InstalledVersionError, InstalledVersionStore};
 
+/// Absolute lower bound for a believable wall clock, used only in the
+/// "no installed version recorded" (check-only) mode where there is no
+/// on-device release timestamp to floor against. 2024-01-01 UTC. When
+/// an install IS recorded, the running binary's own `release_unix` is a
+/// tighter, self-updating floor (a binary cannot run before it shipped),
+/// so this constant is deliberately conservative rather than tracking
+/// "now" — its only job is to catch an epoch-zero / CMOS-reset clock.
+const MIN_PLAUSIBLE_WALL_CLOCK_UNIX: u64 = 1_704_067_200;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CheckerError {
     /// `UpdateConfig` is missing required fields — see
@@ -93,16 +102,36 @@ impl UpdateChecker {
             .as_deref()
             .ok_or(CheckerError::NotConfigured)?;
         let installed_release_unix = self.read_installed_release_unix()?;
-        // pass current wall-clock time to the
-        // verifier so it can enforce the manifest's clock-skew + age
-        // gates. Falls back to `None` (gates disabled) if the system
-        // clock is implausibly early — better than blocking updates on
-        // a CMOS-reset device.
-        let now_unix_secs = std::time::SystemTime::now()
+        // Pass current wall-clock time to the verifier so it can enforce
+        // the manifest's future-skew + staleness gates. If the system
+        // clock is implausibly early it is unusable as a freshness
+        // reference: fall back to `None` (both gates disabled) rather
+        // than blocking updates on a CMOS-reset device.
+        //
+        // Plausibility floor = the running binary's own `release_unix`
+        // (you cannot be executing a binary before it was published — a
+        // self-updating, non-stale bound) OR an absolute constant for
+        // the check-only mode where no install timestamp is recorded.
+        // This replaces a frozen 2023 magic number that grew staler
+        // every year. Note we do NOT substitute the floor *for* `now`:
+        // doing so would reject legitimately newer manifests via the
+        // very future-skew gate we are trying to preserve. Disabling is
+        // the least-bad option for a bogus clock — but we WARN so the
+        // weakened-verification state is observable instead of silent.
+        let now_raw = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
-            .map(|d| d.as_secs())
-            .filter(|t| *t > 1_700_000_000); // sanity floor:
+            .map(|d| d.as_secs());
+        let plausibility_floor = installed_release_unix.max(MIN_PLAUSIBLE_WALL_CLOCK_UNIX);
+        let now_unix_secs = now_raw.filter(|t| *t >= plausibility_floor);
+        if now_unix_secs.is_none() {
+            log::warn!(
+                "update check: system clock ({now_raw:?}) is below the plausibility \
+                 floor ({plausibility_floor}); manifest freshness gates (future-skew \
+                 + staleness) are DISABLED for this check. Anti-downgrade still \
+                 applies. Correct the device clock to restore full verification."
+            );
+        }
         let availability = check_for_update_via_https(
             &self.config.manifest_urls,
             self.transport_ctx.clone(),
