@@ -474,4 +474,47 @@ mod tests {
         };
         assert!(!verify_instance_registry_sig(&reg, &doc));
     }
+
+    fn make_test_resolver(dht: Arc<KademliaService>) -> DhtMlKemEkResolver {
+        DhtMlKemEkResolver::new(
+            dht,
+            Arc::new(RwLock::new(SessionTxRegistry::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            [1u8; 32],
+            Arc::new(RwLock::new(PeerMlKemCache::new())),
+            Arc::new(NodeLogger::new_noop()),
+        )
+    }
+
+    // Regression for the DHT mirror-cache poison DoS fix: the validated local
+    // fast-path must return a locally-cached value ONLY if it passes the
+    // caller's validator. A poisoned/invalid local value must NOT short-circuit
+    // the remote walk — with no peers configured the walk yields None, proving
+    // the poison was neither returned nor allowed to block fallback.
+    #[tokio::test]
+    async fn dht_recursive_get_rejects_invalid_local_value() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let key = [42u8; 32];
+        dht.store_local(key, b"poisoned".to_vec());
+        let resolver = make_test_resolver(Arc::clone(&dht));
+        let got = resolver
+            .dht_recursive_get(key, Duration::from_millis(50), |_| false)
+            .await;
+        assert_eq!(
+            got, None,
+            "invalid local value must not be returned; must fall through to remote"
+        );
+    }
+
+    #[tokio::test]
+    async fn dht_recursive_get_returns_valid_local_value() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let key = [42u8; 32];
+        dht.store_local(key, b"good".to_vec());
+        let resolver = make_test_resolver(Arc::clone(&dht));
+        let got = resolver
+            .dht_recursive_get(key, Duration::from_millis(50), |_| true)
+            .await;
+        assert_eq!(got, Some(b"good".to_vec()));
+    }
 }
