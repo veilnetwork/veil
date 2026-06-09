@@ -40,6 +40,7 @@ pub fn validate_and_fix_with_policy(
 fn build_report(config: &Config, pow: &PowPolicy, fixed: usize) -> ValidationReport {
     ValidationReport {
         issues: collect_issues(config, pow),
+        warnings: structural::collect_warnings(config),
         fixed,
     }
 }
@@ -88,6 +89,58 @@ mod tests {
             let report = validate(&config);
             assert_eq!(report.issues.len(), 1);
             assert_eq!(report.issues[0].key, "global.worker_threads");
+        }
+
+        /// Cycle-5 #2: a push relay left with the fail-open default
+        /// `require_wake_hmac = false` must surface a NON-FATAL advisory —
+        /// flagged in `warnings`, never in `issues` (so it does not break
+        /// backward-compatible deployments).
+        #[test]
+        fn push_relay_without_wake_hmac_warns_but_stays_valid() {
+            let mut config = Config::default();
+            // Configure an FCM push relay; leave the default gate off.
+            config.mailbox.push.fcm_credentials_path = "/etc/veil/fcm.json".to_owned();
+            assert!(
+                !config.mailbox.push.require_wake_hmac,
+                "default must be the fail-open value this advisory targets"
+            );
+
+            let report = validate(&config);
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "mailbox_push_unauth_wake_permitted"),
+                "expected the unauthenticated-wake advisory in warnings"
+            );
+            assert!(
+                !report
+                    .issues
+                    .iter()
+                    .any(|i| i.code == "mailbox_push_unauth_wake_permitted"),
+                "the advisory must be a warning, never a fatal issue"
+            );
+        }
+
+        /// The advisory disappears once the gate is enabled — and is never
+        /// raised for a node that is not a push relay at all.
+        #[test]
+        fn no_wake_advisory_when_gate_on_or_not_a_relay() {
+            let has_wake_warning = |c: &Config| {
+                validate(c)
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "mailbox_push_unauth_wake_permitted")
+            };
+
+            // Not a push relay (default: no credentials) → no advisory.
+            assert!(!has_wake_warning(&Config::default()));
+
+            // Push relay WITH the gate on → no advisory.
+            let mut gated = Config::default();
+            gated.mailbox.push.fcm_credentials_path = "/etc/veil/fcm.json".to_owned();
+            gated.mailbox.push.require_wake_hmac = true;
+            assert!(!has_wake_warning(&gated));
         }
 
         #[test]
