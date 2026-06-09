@@ -173,8 +173,7 @@ impl IpcStreamTable {
         // `len()`). Checking only `streams` here let local opens push the
         // combined total past `MAX_TOTAL_STREAMS` whenever remote streams were
         // already holding slots — up to ~2× the intended ceiling.
-        if inner.streams.len() + inner.remote_streams.len()
-            >= veil_proto::budget::MAX_TOTAL_STREAMS
+        if inner.streams.len() + inner.remote_streams.len() >= veil_proto::budget::MAX_TOTAL_STREAMS
         {
             return None;
         }
