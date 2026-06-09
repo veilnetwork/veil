@@ -237,6 +237,16 @@ impl IdentityPayload {
 
         let algo = read_u8(buf, &mut pos, "identity.algo")?;
         let pk_len = read_u16(buf, &mut pos, "identity.pk_len")? as usize;
+        // Per-field cap before allocation — mirrors IdentityProof::decode. The
+        // frame body is already ≤ MAX_FRAME_BODY, so this only adds a tight,
+        // algorithm-aware ceiling so a pre-auth peer can't make us copy + hash +
+        // verify a wildly-oversized "pubkey". (audit cycle-3.)
+        if pk_len > super::budget::MAX_SIGNATURE_PUBKEY_BYTES {
+            return Err(ProtoError::Malformed(format!(
+                "identity.public_key {pk_len} > {}",
+                super::budget::MAX_SIGNATURE_PUBKEY_BYTES
+            )));
+        }
         let public_key = read_bytes(buf, &mut pos, pk_len, "identity.public_key")?;
         let nonce_len = read_u8(buf, &mut pos, "identity.nonce_len")? as usize;
         let nonce = read_bytes(buf, &mut pos, nonce_len, "identity.nonce")?;
@@ -244,6 +254,12 @@ impl IdentityPayload {
         pos += 32;
 
         let ek_len = read_u16(buf, &mut pos, "identity.ek_len")? as usize;
+        if ek_len > super::budget::MAX_MLKEM_PK_LEN {
+            return Err(ProtoError::Malformed(format!(
+                "identity.mlkem_pubkey {ek_len} > {}",
+                super::budget::MAX_MLKEM_PK_LEN
+            )));
+        }
         let mlkem_pubkey = if ek_len > 0 {
             Some(read_bytes(buf, &mut pos, ek_len, "identity.mlkem_pubkey")?)
         } else {
@@ -505,9 +521,23 @@ impl KeyAgreementPayload {
         let mut pos = 0;
         let algo = read_u8(buf, &mut pos, "key_agreement.algo")?;
         let key_len = read_u16(buf, &mut pos, "key_agreement.key_len")? as usize;
+        // Per-field caps before allocation (audit cycle-3) — same rationale as
+        // IdentityPayload/IdentityProof: bound the pre-auth copy + verify work.
+        if key_len > super::budget::MAX_SIGNATURE_PUBKEY_BYTES {
+            return Err(ProtoError::Malformed(format!(
+                "key_agreement.ephemeral_pubkey {key_len} > {}",
+                super::budget::MAX_SIGNATURE_PUBKEY_BYTES
+            )));
+        }
         let ephemeral_pubkey =
             read_bytes(buf, &mut pos, key_len, "key_agreement.ephemeral_pubkey")?;
         let sig_len = read_u16(buf, &mut pos, "key_agreement.sig_len")? as usize;
+        if sig_len > super::budget::MAX_SIGNATURE_PUBKEY_BYTES {
+            return Err(ProtoError::Malformed(format!(
+                "key_agreement.ephemeral_sig {sig_len} > {}",
+                super::budget::MAX_SIGNATURE_PUBKEY_BYTES
+            )));
+        }
         let ephemeral_sig = read_bytes(buf, &mut pos, sig_len, "key_agreement.ephemeral_sig")?;
         Ok(Self {
             algo,
@@ -2223,6 +2253,53 @@ mod tests {
     #[test]
     fn hello_too_short() {
         assert!(HelloPayload::decode(&[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn identity_decode_rejects_oversized_fields() {
+        // Oversized public_key is rejected before allocation/verify.
+        let big_pk = IdentityPayload {
+            algo: 0,
+            public_key: vec![7u8; crate::budget::MAX_SIGNATURE_PUBKEY_BYTES + 1],
+            nonce: vec![],
+            node_id: [0u8; 32],
+            mlkem_pubkey: None,
+        };
+        assert!(IdentityPayload::decode(&big_pk.encode()).is_err());
+        // Oversized ML-KEM key likewise.
+        let big_ek = IdentityPayload {
+            algo: 0,
+            public_key: vec![1u8; 32],
+            nonce: vec![],
+            node_id: [0u8; 32],
+            mlkem_pubkey: Some(vec![9u8; crate::budget::MAX_MLKEM_PK_LEN + 1]),
+        };
+        assert!(IdentityPayload::decode(&big_ek.encode()).is_err());
+        // A normal-sized identity still decodes.
+        let ok = IdentityPayload {
+            algo: 0,
+            public_key: vec![1u8; 32],
+            nonce: vec![2u8; 16],
+            node_id: [3u8; 32],
+            mlkem_pubkey: None,
+        };
+        assert!(IdentityPayload::decode(&ok.encode()).is_ok());
+    }
+
+    #[test]
+    fn key_agreement_decode_rejects_oversized_sig() {
+        let big_sig = KeyAgreementPayload {
+            algo: 0,
+            ephemeral_pubkey: vec![1u8; 32],
+            ephemeral_sig: vec![2u8; crate::budget::MAX_SIGNATURE_PUBKEY_BYTES + 1],
+        };
+        assert!(KeyAgreementPayload::decode(&big_sig.encode()).is_err());
+        let ok = KeyAgreementPayload {
+            algo: 0,
+            ephemeral_pubkey: vec![1u8; 32],
+            ephemeral_sig: vec![2u8; 64],
+        };
+        assert!(KeyAgreementPayload::decode(&ok.encode()).is_ok());
     }
 
     #[test]
