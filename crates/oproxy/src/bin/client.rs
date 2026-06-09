@@ -37,7 +37,9 @@ mod imp {
 
     use veilclient::VeilClient;
 
-    use oproxy::config::{ClientConfig, InboundConfig, parse_node_id_hex};
+    use oproxy::config::{
+        ClientConfig, InboundConfig, ensure_inbound_bind_allowed, parse_node_id_hex,
+    };
     use oproxy::inbound;
     use veil_cfg::build_tokio_runtime;
 
@@ -193,6 +195,16 @@ mod imp {
 
         if cfg.inbound.is_empty() {
             anyhow::bail!("no [[inbound]] sections configured — nothing to do");
+        }
+
+        // Audit cycle-3 (M2): fail fast BEFORE binding if an unauthenticated
+        // SOCKS5/HTTP ingress would listen on a non-loopback address without
+        // the operator explicitly accepting LAN exposure. Tproxy is gated by
+        // the kernel/iptables and intentionally excluded.
+        for ib in &cfg.inbound {
+            if let InboundConfig::Socks5 { listen } | InboundConfig::Http { listen } = ib {
+                ensure_inbound_bind_allowed(listen, cfg.allow_lan_inbound)?;
+            }
         }
 
         let routing = Arc::new(cfg.routing.clone());
