@@ -647,6 +647,7 @@ Push-notification provider credentials (FCM / APNs). Leave it empty and the daem
 | `apns_team_id` | `string` | `""` | Apple developer team ID |
 | `apns_bundle_id` | `string` | `""` | App bundle ID (the APNs topic) |
 | `apns_environment` | `string` | `"production"` | APNs environment: `"production"` or `"sandbox"` (empty ⇒ production) |
+| `require_wake_hmac` | `bool` | `false` | Forbid the legacy **unauthenticated** wake-up push. A wake-up is authenticated (carries `ts ‖ content_id ‖ HMAC`) only when the receiver has uploaded a sealed `WakeHmacKey` envelope; otherwise the relay falls back to a "wake-only" push with an empty payload, which anyone who learns the push token (or can trigger a mailbox PUT) can forge to wake the device (battery-drain / nuisance). When `true`, the relay **drops** such pushes instead of sending an unauthenticated wake — so a receiver must opt into wake-HMAC to be woken. Default `false` for back-compat; operators who control their client fleet should enable it. With it off, the daemon logs a startup advisory |
 
 ---
 
