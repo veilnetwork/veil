@@ -1,5 +1,6 @@
 target
 **/__pycache__
+**/.DS_Store
 stend/*/mlkem.key
 temp.md
 **/bans.json
