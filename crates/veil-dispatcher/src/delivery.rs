@@ -1337,8 +1337,16 @@ impl FrameDispatcher {
             return; // decrypt failed — metric already incremented.
         };
 
-        // Cache reverse route: sender → peer_id (direct hop).
-        if deliver_sender_node_id != self.local_node_id
+        // Cache reverse route: sender → peer_id (direct hop). ONLY for an
+        // AUTHENTICATED sender. The meta-E2E (anonymous) path carries an inner
+        // sender_node_id that is encrypted but NOT authenticated (ML-KEM gives
+        // confidentiality, not origin proof — anyone who knows our published EK
+        // can claim any sender). Caching it would let such a peer poison the
+        // route cache with a bogus node_id→peer mapping, redirecting our later
+        // traffic for that node_id. (audit cycle-4 M2.)
+        let is_meta_e2e = first_byte == Some(veil_proto::META_E2E_MARKER);
+        if !is_meta_e2e
+            && deliver_sender_node_id != self.local_node_id
             && &deliver_sender_node_id != peer_id.as_bytes()
             && deliver_sender_node_id != [0u8; 32]
         {
