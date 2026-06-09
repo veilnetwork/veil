@@ -449,6 +449,22 @@ pub struct SessionRunner {
     pub primary_uri: Option<String>,
 }
 
+impl Drop for SessionRunner {
+    /// Zeroize the plaintext copy of the session keys on drop. `SessionKeys`
+    /// and `SessionCipher` are already `ZeroizeOnDrop`, but `raw_session_keys`
+    /// is a separate plaintext copy of tx/rx (kept for handoff + ticket
+    /// issuance) that was left to drop as raw bytes — recoverable from freed
+    /// memory / swap / a core dump. Wipe tx/rx here (session_id is not secret).
+    /// (audit cycle-2 MEDIUM: inconsistent key zeroization.)
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some((tx, rx, _session_id)) = self.raw_session_keys.as_mut() {
+            tx.zeroize();
+            rx.zeroize();
+        }
+    }
+}
+
 /// per-`write_all` deadline applied to the session's outbound
 /// socket writes inside the dedicated writer task (see `spawn_writer_task`).
 /// On a healthy edge a write completes in < 4 s at typical inter-VPS rates
