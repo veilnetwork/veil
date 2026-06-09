@@ -52,6 +52,13 @@ pub struct HelloPayload {
     /// mode reject HELLO without it; public-mode receivers ignore the
     /// TLV for forward compat.
     pub membership_cert_blob: Option<Vec<u8>>,
+    /// Per-resumption nonce (32 bytes), set by the initiator ONLY when it also
+    /// sets `resume_ticket`. The responder mixes this with its own fresh nonce
+    /// (returned in the ATTACH trailer) to derive fresh resumed-session keys, so
+    /// resumption never reuses the original session's `(key, nonce)`. A
+    /// `resume_ticket` present without this nonce is not resumed — the responder
+    /// falls back to the full handshake. `None` for non-resuming HELLOs.
+    pub resume_nonce: Option<[u8; 32]>,
 }
 
 impl HelloPayload {
@@ -68,7 +75,9 @@ impl HelloPayload {
             .membership_cert_blob
             .as_ref()
             .map_or(0, |c| 1 + 2 + c.len());
-        let mut buf = Vec::with_capacity(Self::WIRE_SIZE + resume_tlv_len + cert_tlv_len);
+        let nonce_tlv_len = self.resume_nonce.as_ref().map_or(0, |n| 1 + 2 + n.len());
+        let mut buf =
+            Vec::with_capacity(Self::WIRE_SIZE + resume_tlv_len + cert_tlv_len + nonce_tlv_len);
         buf.extend_from_slice(&self.ovl1_major.to_be_bytes());
         buf.extend_from_slice(&self.node_id);
         if let Some(ticket) = &self.resume_ticket {
@@ -80,6 +89,11 @@ impl HelloPayload {
             buf.push(super::budget::HELLO_TLV_MEMBERSHIP_CERT);
             buf.extend_from_slice(&(cert.len() as u16).to_be_bytes());
             buf.extend_from_slice(cert);
+        }
+        if let Some(nonce) = &self.resume_nonce {
+            buf.push(super::budget::HELLO_TLV_RESUME_NONCE);
+            buf.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
+            buf.extend_from_slice(nonce);
         }
         buf
     }
@@ -110,6 +124,7 @@ impl HelloPayload {
         // Parse optional TLV extensions after the fixed region.
         let mut resume_ticket: Option<EncryptedTicket> = None;
         let mut membership_cert_blob: Option<Vec<u8>> = None;
+        let mut resume_nonce: Option<[u8; 32]> = None;
         let mut pos = Self::WIRE_SIZE;
         while pos + 3 <= buf.len() {
             let tlv_type = buf[pos];
@@ -132,6 +147,14 @@ impl HelloPayload {
                     }
                     membership_cert_blob = Some(value.to_vec());
                 }
+                super::budget::HELLO_TLV_RESUME_NONCE => {
+                    // Exactly 32 bytes or ignore (a malformed length must not
+                    // half-enable resumption — the responder then sees no nonce
+                    // and falls back to the full handshake).
+                    if let Ok(arr) = <[u8; 32]>::try_from(value) {
+                        resume_nonce = Some(arr);
+                    }
+                }
                 // Unknown TLV types are silently ignored (forward-compat).
                 _ => {}
             }
@@ -142,6 +165,7 @@ impl HelloPayload {
             node_id,
             resume_ticket,
             membership_cert_blob,
+            resume_nonce,
         })
     }
 }
@@ -980,6 +1004,48 @@ pub fn decode_observed_addr(buf: &[u8]) -> Option<std::net::SocketAddr> {
         }
         _ => None,
     }
+}
+
+// ── Resume-nonce ATTACH TLV (session-resumption fresh-key derivation) ──────────
+
+/// ATTACH-trailer TLV tag carrying the responder's per-resumption nonce.
+pub const RESUME_NONCE_TLV_TAG: u16 = 0x0015;
+/// Length of the resume-nonce TLV value (32-byte nonce).
+pub const RESUME_NONCE_TLV_LEN: usize = 32;
+
+/// Append the responder's per-resumption nonce to an ATTACH byte buffer as a
+/// TLV (resume fast-path only). The initiator reads it via
+/// [`decode_resume_nonce_from_attach`] and folds it — with its own HELLO nonce
+/// — into [`veil_crypto::session_kdf::derive_resume_keys`], so the resumed
+/// session gets fresh keys instead of reusing the original session's.
+pub fn append_resume_nonce_to_attach(out: &mut Vec<u8>, nonce: &[u8; RESUME_NONCE_TLV_LEN]) {
+    out.extend_from_slice(&RESUME_NONCE_TLV_TAG.to_be_bytes());
+    out.extend_from_slice(&(RESUME_NONCE_TLV_LEN as u16).to_be_bytes());
+    out.extend_from_slice(nonce);
+}
+
+/// Scan an ATTACH frame body for the responder's per-resumption nonce TLV.
+/// Returns the 32-byte nonce if a well-formed `RESUME_NONCE_TLV_TAG` entry is
+/// present, else `None` (initiator then refuses the unsafe resume).
+pub fn decode_resume_nonce_from_attach(buf: &[u8]) -> Option<[u8; RESUME_NONCE_TLV_LEN]> {
+    if buf.len() <= AttachPayload::WIRE_SIZE {
+        return None;
+    }
+    let tlv_region = &buf[AttachPayload::WIRE_SIZE..];
+    let mut pos = 0;
+    while pos + 4 <= tlv_region.len() {
+        let tag = u16::from_be_bytes([tlv_region[pos], tlv_region[pos + 1]]);
+        let len = u16::from_be_bytes([tlv_region[pos + 2], tlv_region[pos + 3]]) as usize;
+        pos += 4;
+        if pos + len > tlv_region.len() {
+            break;
+        }
+        if tag == RESUME_NONCE_TLV_TAG && len == RESUME_NONCE_TLV_LEN {
+            return <[u8; RESUME_NONCE_TLV_LEN]>::try_from(&tlv_region[pos..pos + len]).ok();
+        }
+        pos += len;
+    }
+    None
 }
 
 /// Encode an `AttachPayload` with optional Vivaldi, battery, visibility scope
@@ -1944,6 +2010,7 @@ mod tests {
             node_id: node_id(0xAB),
             resume_ticket: None,
             membership_cert_blob: None,
+            resume_nonce: None,
         };
         assert_eq!(HelloPayload::decode(&p.encode()).unwrap(), p);
     }
@@ -1956,6 +2023,7 @@ mod tests {
             node_id: node_id(0xCD),
             resume_ticket: None,
             membership_cert_blob: Some(cert_blob.clone()),
+            resume_nonce: None,
         };
         let decoded = HelloPayload::decode(&p.encode()).unwrap();
         assert_eq!(
@@ -1969,11 +2037,13 @@ mod tests {
     fn hello_roundtrip_with_both_tlvs() {
         let resume: Vec<u8> = (0..188).collect();
         let cert_blob: Vec<u8> = (0..100).collect();
+        let resume_nonce = [0x5Au8; 32];
         let p = HelloPayload {
             ovl1_major: 1,
             node_id: node_id(0xEF),
             resume_ticket: Some(resume.clone()),
             membership_cert_blob: Some(cert_blob.clone()),
+            resume_nonce: Some(resume_nonce),
         };
         let decoded = HelloPayload::decode(&p.encode()).unwrap();
         assert_eq!(decoded.resume_ticket.as_deref(), Some(&resume[..]));
@@ -1981,6 +2051,8 @@ mod tests {
             decoded.membership_cert_blob.as_deref(),
             Some(&cert_blob[..])
         );
+        assert_eq!(decoded.resume_nonce, Some(resume_nonce));
+        assert_eq!(decoded, p);
     }
 
     #[test]
@@ -2109,6 +2181,43 @@ mod tests {
             flags: 0xFF_FF,
         };
         assert_eq!(AttachPayload::decode(&p.encode()).unwrap(), p);
+    }
+
+    #[test]
+    fn resume_nonce_attach_tlv_roundtrips_and_coexists() {
+        let base = AttachPayload {
+            role: 1,
+            realm_id: 0,
+            attach_epoch: 0,
+            mailbox_preference_count: 0,
+            gateway_preference_count: 0,
+            flags: 0,
+        };
+        // Build an ATTACH that already carries other trailer TLVs (battery +
+        // transports + observed_addr), then append the resume nonce — it must be
+        // found regardless of the TLVs before it.
+        let mut bytes = encode_attach_with_tlvs(&base, Some((1.0, 2.0, 3.0)), Some(55), &[
+            "tcp".to_owned(),
+        ]);
+        let addr: std::net::SocketAddr = "203.0.113.7:9000".parse().unwrap();
+        bytes.extend_from_slice(&OBSERVED_ADDR_TLV_TAG.to_be_bytes());
+        bytes.extend_from_slice(&(OBSERVED_ADDR_TLV_LEN as u16).to_be_bytes());
+        bytes.extend_from_slice(&encode_observed_addr(addr));
+        let nonce = [0x7Bu8; RESUME_NONCE_TLV_LEN];
+        append_resume_nonce_to_attach(&mut bytes, &nonce);
+
+        assert_eq!(decode_resume_nonce_from_attach(&bytes), Some(nonce));
+        // The pre-existing TLVs still decode (resume nonce didn't shadow them).
+        assert_eq!(decode_battery_from_attach(&bytes), Some(55));
+        assert_eq!(decode_observed_addr_from_attach(&bytes), Some(addr));
+        // No false positive when the TLV is absent.
+        let mut without = encode_attach_with_tlvs(&base, None, None, &[]);
+        assert_eq!(decode_resume_nonce_from_attach(&without), None);
+        // A wrong-length entry under the tag is rejected (not half-accepted).
+        without.extend_from_slice(&RESUME_NONCE_TLV_TAG.to_be_bytes());
+        without.extend_from_slice(&(16u16).to_be_bytes());
+        without.extend_from_slice(&[0u8; 16]);
+        assert_eq!(decode_resume_nonce_from_attach(&without), None);
     }
 
     #[test]

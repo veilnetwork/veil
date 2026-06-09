@@ -358,6 +358,17 @@ where
     // For the HELLO frame we only need the opaque blob; the client's own keys are
     // kept in `resume_ticket` for use in the fast-path restoration below.
     let hello_ticket_blob = resume_ticket.as_ref().map(|e| e.blob.clone());
+    // When attempting resumption, mint a fresh per-resumption nonce and carry it
+    // in the HELLO. The responder folds it (with its own nonce, returned in the
+    // ATTACH trailer) into a FRESH resumed-session key derivation, so the
+    // resumed session never reuses the original session's (key, nonce). Kept in
+    // scope for the client-side derivation in the fast-path branch below.
+    let client_resume_nonce: Option<[u8; 32]> = hello_ticket_blob.as_ref().map(|_| {
+        use rand_core::{OsRng, RngCore};
+        let mut n = [0u8; 32];
+        OsRng.fill_bytes(&mut n);
+        n
+    });
     let hello = HelloPayload {
         ovl1_major: VERSION as u16,
         node_id: local_node_id_bytes,
@@ -366,6 +377,7 @@ where
         // private network. Public-mode (`network_gate = None`) leaves
         // the field unset → existing TLV-less HELLO on the wire.
         membership_cert_blob: network_gate.map(|g| g.local_cert_blob.clone()),
+        resume_nonce: client_resume_nonce,
     };
     let hello_bytes = hello.encode();
 
@@ -510,13 +522,29 @@ where
             };
             if let Some(ticket) = maybe_ticket {
                 // Verify the ticket's peer_id matches the connecting node.
-                if ticket.peer_id == remote_id {
-                    // Fast-path accepted: send ATTACH directly, then read client's ATTACH.
-                    let fp_attach_bytes = build_local_attach_bytes(
+                if ticket.peer_id == remote_id
+                    && let Some(peer_resume_nonce) = remote_hello.resume_nonce
+                {
+                    // Fast-path accepted ONLY with a valid ticket AND a resume
+                    // nonce — a ticket without a nonce is never resumed (falls
+                    // through to the full handshake), so secure resumption is
+                    // atomic. Mint our own nonce, return it in the ATTACH
+                    // trailer, and derive FRESH keys from both nonces below.
+                    let mut fp_attach_bytes = build_local_attach_bytes(
                         role,
                         vivaldi,
                         local_advertised_transports,
                         peer_observed_addr,
+                    );
+                    let server_resume_nonce = {
+                        use rand_core::{OsRng, RngCore};
+                        let mut n = [0u8; 32];
+                        OsRng.fill_bytes(&mut n);
+                        n
+                    };
+                    veil_proto::session::append_resume_nonce_to_attach(
+                        &mut fp_attach_bytes,
+                        &server_resume_nonce,
                     );
                     write_frame(stream, family, SessionMsg::Attach as u16, &fp_attach_bytes)
                         .await?;
@@ -544,12 +572,20 @@ where
 
                     let node_id = node_id_from_bytes(remote_id)?;
                     let remote_role = RemoteRole::from(remote_attach.role);
-                    // Restore session keys from the ticket (server's own tx/rx keys).
-                    let session_keys = veil_crypto::session_kdf::SessionKeys {
-                        tx_key: ticket.tx_key,
-                        rx_key: ticket.rx_key,
-                        session_id: ticket.session_id,
-                    };
+                    // Derive FRESH session keys from the ticket's original keys +
+                    // both resumption nonces (client's from HELLO, ours from the
+                    // ATTACH trailer). NEVER restore the originals into a
+                    // counter-0 cipher — that was the audit cycle-2 CRITICAL
+                    // (identical (key, nonce) per frame across the two sessions).
+                    let session_keys = veil_crypto::session_kdf::derive_resume_keys(
+                        &ticket.tx_key,
+                        &ticket.rx_key,
+                        &ticket.session_id,
+                        &peer_resume_nonce,
+                        &server_resume_nonce,
+                        &local_node_id_bytes,
+                        &remote_id,
+                    );
                     // Synthesize a minimal IdentityPayload — IDENTITY was not exchanged.
                     let remote_identity_payload = IdentityPayload {
                         algo: 0,
@@ -612,6 +648,15 @@ where
                 let remote_attach = AttachPayload::decode(&body).map_err(|e| {
                     HandshakeError(format!("OVL1 ATTACH (fast-path client) decode: {e}"))
                 })?;
+                // The responder must echo a resume nonce in its ATTACH trailer;
+                // without it we cannot derive matching fresh keys, so refuse the
+                // resume rather than build an unusable (or unsafe) session.
+                let server_resume_nonce =
+                    veil_proto::session::decode_resume_nonce_from_attach(&body).ok_or_else(|| {
+                        HandshakeError(
+                            "session resumption: responder ATTACH missing resume nonce".into(),
+                        )
+                    })?;
                 let remote_vivaldi = decode_vivaldi_from_attach(&body);
                 let remote_battery = decode_battery_from_attach(&body);
                 let remote_advertised_transports =
@@ -637,12 +682,21 @@ where
                 }
 
                 let node_id = node_id_from_bytes(remote_id)?;
-                // Restore session keys from the stored ClientTicketEntry.
-                let session_keys = veil_crypto::session_kdf::SessionKeys {
-                    tx_key: entry.tx_key,
-                    rx_key: entry.rx_key,
-                    session_id: entry.session_id,
-                };
+                // Derive FRESH keys from our stored original keys + both
+                // resumption nonces (ours from the HELLO, the responder's from
+                // its ATTACH). NEVER restore the originals into a counter-0
+                // cipher — that was the audit cycle-2 CRITICAL.
+                let client_nonce = client_resume_nonce
+                    .expect("client_resume_nonce is Some whenever resume_ticket is Some");
+                let session_keys = veil_crypto::session_kdf::derive_resume_keys(
+                    &entry.tx_key,
+                    &entry.rx_key,
+                    &entry.session_id,
+                    &client_nonce,
+                    &server_resume_nonce,
+                    &local_node_id_bytes,
+                    &remote_id,
+                );
                 // Synthesize IdentityPayload from stored peer identity.
                 let nonce_bytes = entry.peer_nonce.as_bytes().to_vec();
                 let remote_identity_payload = IdentityPayload {
@@ -2486,35 +2540,45 @@ mod tests {
         let cli2 = cli2.unwrap();
 
         // ── Step 4: verify the resumed session ────────────────────────────────
-        // Server restored its original tx/rx keys from the ticket.
-        assert_eq!(srv2.session_keys.tx_key, srv_tx, "server tx_key restored");
-        assert_eq!(srv2.session_keys.rx_key, srv_rx, "server rx_key restored");
-        assert_eq!(
-            srv2.session_keys.session_id, srv_session_id,
-            "server session_id restored"
+        // CRITICAL (audit cycle-2): the resumed session must NOT reuse the
+        // original session's keys — both peers derive FRESH keys from the
+        // original keys + the per-resumption nonces. Otherwise the counter-0
+        // cipher would repeat the original (key, nonce) per frame.
+        assert_ne!(
+            srv2.session_keys.tx_key, srv_tx,
+            "server tx_key must be FRESH, not the original"
         );
-
-        // Client restored its own keys from ClientTicketEntry.
-        assert_eq!(
+        assert_ne!(
+            srv2.session_keys.rx_key, srv_rx,
+            "server rx_key must be FRESH, not the original"
+        );
+        assert_ne!(
             cli2.session_keys.tx_key, entry.tx_key,
-            "client tx_key restored"
+            "client tx_key must be FRESH, not the original"
         );
-        assert_eq!(
+        assert_ne!(
             cli2.session_keys.rx_key, entry.rx_key,
-            "client rx_key restored"
-        );
-        assert_eq!(
-            cli2.session_keys.session_id, entry.session_id,
-            "client session_id restored"
+            "client rx_key must be FRESH, not the original"
         );
 
-        // The session IDs match.
+        // The resumed session must still WORK in both directions: each side's tx
+        // equals the other's rx (the dual-nonce derivation agrees cross-peer).
+        assert_eq!(
+            srv2.session_keys.tx_key, cli2.session_keys.rx_key,
+            "server tx must equal client rx on the resumed session"
+        );
+        assert_eq!(
+            srv2.session_keys.rx_key, cli2.session_keys.tx_key,
+            "server rx must equal client tx on the resumed session"
+        );
+
+        // session_id is carried through unchanged (identifier, not cipher input).
+        assert_eq!(srv2.session_keys.session_id, srv_session_id);
+        assert_eq!(cli2.session_keys.session_id, entry.session_id);
         assert_eq!(
             srv2.session_keys.session_id, cli2.session_keys.session_id,
             "resumed session_id must match on both sides"
         );
-        // NegotiatedCapabilities removed — all features are on
-        // unconditionally, no longer asserted per-handshake.
         let _ = (&srv2, &cli2);
     }
 

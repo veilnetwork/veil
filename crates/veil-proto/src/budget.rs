@@ -96,6 +96,14 @@ pub const HELLO_TLV_RESUME_TICKET: u8 = 0x01;
 /// compatibility with private-mode peers connecting to public bootstrap.
 pub const HELLO_TLV_MEMBERSHIP_CERT: u8 = 0x02;
 
+/// TLV type byte for a per-resumption nonce in `HelloPayload`. Set by the
+/// initiator alongside `resume_ticket`; the responder folds it (with its own
+/// nonce returned in the ATTACH trailer) into a fresh resumption key
+/// derivation, so a resumed session never reuses the original session's
+/// `(key, nonce)`. A `resume_ticket` without this nonce is NOT resumed
+/// (responder falls back to the full handshake). 32 bytes.
+pub const HELLO_TLV_RESUME_NONCE: u8 = 0x03;
+
 /// Upper bound on encoded `MembershipCert` blob size (defense-in-depth
 /// against a malicious HELLO inflating the TLV). Real certs serialise
 /// to ~150-200 bytes (Ed25519 sig = 64 bytes; Falcon = 666 bytes; plus
@@ -1009,6 +1017,7 @@ mod tests {
             node_id: [0u8; 32],
             resume_ticket: None,
             membership_cert_blob: None,
+            resume_nonce: None,
         };
         assert_eq!(p.encode().len(), SESSION_HELLO_SIZE);
         assert_eq!(SESSION_HELLO_SIZE, HelloPayload::WIRE_SIZE);
