@@ -29,6 +29,16 @@ pub fn verify_mesh_beacon_auth(beacon: &MeshBeaconPayload) -> bool {
         return false;
     }
     // Verify signature.
+    //
+    // `beacon.algo` is read from the UNSIGNED wire (signable_body does not
+    // cover it). This is integrity-neutral, not a tamper vector: node_id ==
+    // BLAKE3(public_key) (checked above) pins the key, and the signature must
+    // still validate over signable_body below. A flipped `algo` only makes
+    // the verifier pick the wrong scheme, which then fails — there is no
+    // scheme under which a forged or stripped signature passes. Folding algo
+    // into signable_body would add defense-in-depth but would break
+    // signed-beacon verification across a rolling upgrade, which is not worth
+    // it for a non-exploitable concern.
     let algo = if beacon.algo == 2 {
         SignatureAlgorithm::Falcon512
     } else {
