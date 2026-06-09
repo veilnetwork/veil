@@ -42,7 +42,7 @@ info() { echo "[devnet] $*"; }
 require_binary() {
     if [[ ! -x "$BINARY" ]]; then
         info "Building veil-cli binary..."
-        (cd "$REPO_ROOT" && cargo build -q -p veilcore --bin veil-cli) || die "Build failed"
+        (cd "$REPO_ROOT" && cargo build -q -p veil-cli --bin veil-cli) || die "Build failed"
     fi
 }
 

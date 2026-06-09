@@ -80,7 +80,7 @@ is_running() {
 require_binary() {
     if [[ ! -x "$BINARY" ]]; then
         info "building veil-cli"
-        (cd "$REPO_ROOT" && cargo build -q -p veilcore --bin veil-cli) \
+        (cd "$REPO_ROOT" && cargo build -q -p veil-cli --bin veil-cli) \
             || die "build failed"
     fi
 }

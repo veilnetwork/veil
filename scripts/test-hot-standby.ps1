@@ -108,7 +108,7 @@ function Resolve-Binary {
     Write-Info 'building veil-cli (debug)'
     Push-Location $RepoRoot
     try {
-        & cargo build -q -p veilcore --bin veil-cli
+        & cargo build -q -p veil-cli --bin veil-cli
         if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
     } finally { Pop-Location }
     if (-not (Test-Path $BinaryDebug)) {
