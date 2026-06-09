@@ -208,7 +208,8 @@ pub mod beacon_role_flags {
 /// ```
 ///
 /// Byte offset of the role/addr/battery extension — decoders require at least
-/// `MESH_BEACON_SIZE + 3` bytes (role_flags + addr_len + battery_level).
+/// `MESH_BEACON_SIZE + 11` bytes (role_flags + addr_len + battery_level +
+/// timestamp[8]).
 pub const MESH_BEACON_SIZE: usize = 32 + 16; // 48 — offset of the v2 extension
 
 /// Periodic neighbour-discovery beacon broadcast within a realm.
@@ -225,6 +226,14 @@ pub struct MeshBeaconPayload {
     pub veil_addr: Option<String>,
     /// Battery charge level: 0 = unknown or on AC power (no penalty), 1–100 = percent.
     pub battery_level: u8,
+    /// Unix-seconds timestamp, set by the originator and covered by the
+    /// signature (part of `signable_body`). Lets receivers reject stale/replayed
+    /// SIGNED beacons via a clock-skew window, instead of accepting a captured
+    /// beacon forever (which let an on-segment attacker rebind the originator's
+    /// `node_id` to a spoofed address). `0` on unsigned/legacy beacons (not
+    /// freshness-checked — an unsigned beacon's timestamp is forgeable anyway).
+    /// (audit cycle-4 M3.)
+    pub timestamp: u64,
     /// signature algorithm (0 = Ed25519, 2 = Falcon512).
     pub algo: u8,
     /// sender's long-term public key (raw bytes).
@@ -244,6 +253,7 @@ impl MeshBeaconPayload {
             role_flags: 0,
             veil_addr: None,
             battery_level: 0,
+            timestamp: 0,
             algo: 0,
             public_key: vec![],
             signature: vec![],
@@ -260,7 +270,7 @@ impl MeshBeaconPayload {
         } else {
             1 + 2 + self.public_key.len() + 2 + self.signature.len()
         };
-        let total = MESH_BEACON_SIZE + 2 + addr_len + 1 + auth_size;
+        let total = MESH_BEACON_SIZE + 2 + addr_len + 1 + 8 + auth_size;
         let mut buf = Vec::with_capacity(total);
         // Unsigned body.
         buf.extend_from_slice(&self.node_id);
@@ -269,6 +279,7 @@ impl MeshBeaconPayload {
         buf.push(addr_len as u8);
         buf.extend_from_slice(&addr_bytes[..addr_len]);
         buf.push(self.battery_level);
+        buf.extend_from_slice(&self.timestamp.to_be_bytes());
         // authentication extension.
         if !self.public_key.is_empty() {
             buf.push(self.algo);
@@ -285,20 +296,21 @@ impl MeshBeaconPayload {
     pub fn signable_body(&self) -> Vec<u8> {
         let addr_bytes = self.veil_addr.as_deref().unwrap_or("").as_bytes();
         let addr_len = addr_bytes.len().min(255);
-        let mut buf = Vec::with_capacity(MESH_BEACON_SIZE + 2 + addr_len + 1);
+        let mut buf = Vec::with_capacity(MESH_BEACON_SIZE + 2 + addr_len + 1 + 8);
         buf.extend_from_slice(&self.node_id);
         buf.extend_from_slice(&self.realm_id.0);
         buf.push(self.role_flags);
         buf.push(addr_len as u8);
         buf.extend_from_slice(&addr_bytes[..addr_len]);
         buf.push(self.battery_level);
+        buf.extend_from_slice(&self.timestamp.to_be_bytes());
         buf
     }
 
     /// Parse a beacon payload. Requires the v2 layout
     /// (role_flags + addr_len + addr_bytes + battery_level).
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
-        let min = MESH_BEACON_SIZE + 3;
+        let min = MESH_BEACON_SIZE + 3 + 8; // +8 = signed timestamp (M3)
         if buf.len() < min {
             return Err(ProtoError::BufferTooShort {
                 need: min,
@@ -324,7 +336,17 @@ impl MeshBeaconPayload {
             None
         };
         let battery_level = buf[addr_end];
-        let body_end = addr_end + 1;
+        // Per-beacon timestamp (audit cycle-4 M3): 8 bytes BE in the signed
+        // body, immediately after battery_level.
+        let ts_start = addr_end + 1;
+        if buf.len() < ts_start + 8 {
+            return Err(ProtoError::BufferTooShort {
+                need: ts_start + 8,
+                got: buf.len(),
+            });
+        }
+        let timestamp = u64::from_be_bytes(super::read_array::<8>(buf, ts_start)?);
+        let body_end = ts_start + 8;
         // authentication extension (optional).
         let auth_start = body_end;
         let (algo, public_key, signature) = if auth_start + 3 <= buf.len() {
@@ -353,6 +375,7 @@ impl MeshBeaconPayload {
             role_flags,
             veil_addr,
             battery_level,
+            timestamp,
             algo,
             public_key,
             signature,
@@ -501,12 +524,14 @@ mod tests {
             role_flags: beacon_role_flags::IS_GATEWAY | beacon_role_flags::HAS_INTERNET,
             veil_addr: Some("tcp://10.0.0.1:9000".to_owned()),
             battery_level: 0,
+            timestamp: 1_700_000_123,
             algo: 0,
             public_key: vec![],
             signature: vec![],
         };
         let dec = MeshBeaconPayload::decode(&b.encode()).unwrap();
         assert_eq!(dec, b);
+        assert_eq!(dec.timestamp, 1_700_000_123);
     }
 
     #[test]
@@ -521,7 +546,7 @@ mod tests {
     #[test]
     fn beacon_too_short() {
         let err = MeshBeaconPayload::decode(&[0u8; 10]).unwrap_err();
-        assert!(matches!(err, ProtoError::BufferTooShort { need: 51, .. }));
+        assert!(matches!(err, ProtoError::BufferTooShort { need: 59, .. }));
     }
 
     #[test]
