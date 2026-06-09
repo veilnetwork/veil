@@ -887,6 +887,16 @@ fn apply_validation_fixes<O: ConfigOps>(config: &ConfigHandle<'_, O>) -> veil_cf
 
 fn validate_loaded(io: &mut impl CommandIo, config: &veil_cfg::Config) -> veil_cfg::Result<()> {
     let report = veil_cfg::validate(config);
+    // Non-fatal advisories are surfaced regardless of validity so a
+    // pre-deploy `config validate` catches risky-but-permitted defaults
+    // (e.g. a push relay left with require_wake_hmac = false) before the
+    // daemon ever runs — without failing the config.
+    if report.has_warnings() {
+        io.emit(OutputEvent::message(format!(
+            "configuration warnings (non-fatal):\n{}",
+            report.format_warnings()
+        )));
+    }
     if report.is_valid() {
         io.emit(OutputEvent::ValidationPassed);
         Ok(())
