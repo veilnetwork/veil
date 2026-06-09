@@ -166,20 +166,22 @@ pub struct Hop {
 ///
 /// Returns the bytes the sender hands to `hops[0]`.
 ///
-/// **anti-loop TTL:** each layer's plaintext
-/// now leads with a 1-byte TTL = `hops.len - layer_idx + 1` (so
-/// outermost = `hops.len+1`, innermost = 2). Capped at
-/// [`MAX_CIRCUIT_TTL`] = 16; longer circuits are rejected at build
-/// time with [`CircuitError::CircuitTooLongForTtl`]. Each peel
-/// validates `1 <= ttl <= MAX_CIRCUIT_TTL` and drops on violation.
+/// **anti-loop TTL:** each layer's plaintext leads with a 1-byte TTL set to a
+/// CONSTANT [`MAX_CIRCUIT_TTL`] on every layer (audit cycle-4 M1 — a per-layer
+/// value that varied with position previously leaked each hop's distance from
+/// the destination and gave the entry guard the full circuit length). Circuits
+/// longer than [`MAX_CIRCUIT_TTL`] hops are rejected at build time with
+/// [`CircuitError::CircuitTooLongForTtl`]. Each peel validates
+/// `1 <= ttl <= MAX_CIRCUIT_TTL` and drops on violation; real loop /
+/// amplification is bounded by the cell-size shrinkage budget, not this field.
 pub fn build_circuit(payload: &[u8], hops: &[Hop]) -> Result<Vec<u8>, CircuitError> {
     if hops.is_empty() {
         return Err(CircuitError::NoHops);
     }
-    // outermost hop receives ttl=hops.len+1. Headroom
-    // of +1 means even after a forwarding hop accidentally double-
-    // counts (shouldn't happen; this is a sanity margin), the next
-    // legitimate hop still sees ttl >= 2.
+    // Circuit-length cap: reject circuits longer than MAX_CIRCUIT_TTL hops. The
+    // layer ttl itself is now a constant (M1 below), so this is a direct length
+    // bound rather than a ttl-encoding limit; it keeps the existing ~15-hop
+    // ceiling and the CircuitTooLongForTtl error.
     let outermost_ttl: u8 = (hops.len() as u8).saturating_add(1);
     if outermost_ttl > MAX_CIRCUIT_TTL {
         return Err(CircuitError::CircuitTooLongForTtl {
@@ -189,10 +191,18 @@ pub fn build_circuit(payload: &[u8], hops: &[Hop]) -> Result<Vec<u8>, CircuitErr
         });
     }
 
-    // Innermost layer: final hop sees `[ttl=2][FINAL_HOP_SENTINEL][payload]`.
+    // CONSTANT per-layer TTL (audit cycle-4 M1): every layer carries the SAME
+    // ttl. The old scheme set `ttl = hops.len - i + 1`, which leaked topology —
+    // each relay, peeling its own layer, read `ttl - 2 = hops remaining
+    // downstream`, and the entry guard read `ttl = N+1 = full circuit length`.
+    // That is exactly the position/length onion routing must hide from
+    // intermediate relays. A constant reveals nothing. Anti-loop is unaffected:
+    // `peel_circuit` only validates `0 < ttl <= MAX_CIRCUIT_TTL` (it never
+    // decrements), and real loop/amplification is bounded by the cell-size
+    // shrinkage budget — the per-layer value never limited loop length anyway.
     let final_hop = hops.last().expect("hops non-empty");
     let mut inner = Vec::with_capacity(TTL_PREFIX_LEN + NEXT_HOP_ID_LEN + payload.len());
-    let inner_ttl: u8 = 2; // hops.len - (hops.len - 1) + 1 = 2
+    let inner_ttl: u8 = MAX_CIRCUIT_TTL;
     inner.push(inner_ttl);
     inner.extend_from_slice(&FINAL_HOP_SENTINEL);
     inner.extend_from_slice(payload);
@@ -201,11 +211,11 @@ pub fn build_circuit(payload: &[u8], hops: &[Hop]) -> Result<Vec<u8>, CircuitErr
     // Wrap through preceding hops in reverse order. Each layer's
     // plaintext = `[ttl(1)][next_hop_id(32)][previous_wrap]`, where
     // next_hop_id identifies the hop AFTER this one in forward direction
-    // and ttl = (hops.len - layer_idx + 1).
+    // and ttl is the SAME constant on every layer (see M1 note above).
     for i in (0..hops.len() - 1).rev() {
         let this_hop = hops[i];
         let next_hop_in_chain = hops[i + 1];
-        let layer_ttl: u8 = (hops.len() - i + 1) as u8; // i=0 outermost ⇒ hops.len+1
+        let layer_ttl: u8 = MAX_CIRCUIT_TTL;
         let mut layer = Vec::with_capacity(TTL_PREFIX_LEN + NEXT_HOP_ID_LEN + wrapped.len());
         layer.push(layer_ttl);
         layer.extend_from_slice(&next_hop_in_chain.node_id);
@@ -545,6 +555,34 @@ mod tests {
         assert!(
             matches!(err, CircuitError::TtlExceedsCap { got, .. } if got == MAX_CIRCUIT_TTL + 1),
             "{err:?}"
+        );
+    }
+
+    /// audit cycle-4 M1: the per-layer TTL must be a CONSTANT, so no relay can
+    /// infer its position in the circuit (or the circuit length) from the TTL it
+    /// peels. Read the raw leading TTL byte at every hop of a 4-hop circuit —
+    /// entry, two middles, and final — and assert they are all identical.
+    #[test]
+    fn m1_ttl_is_constant_across_layers_no_position_leak() {
+        use crate::onion;
+        let (sk1, hop1) = fresh_hop_with_id(0x01);
+        let (sk2, hop2) = fresh_hop_with_id(0x02);
+        let (sk3, hop3) = fresh_hop_with_id(0x03);
+        let (sk4, hop4) = fresh_hop_with_id(0x04);
+        let envelope = build_circuit(b"payload", &[hop1, hop2, hop3, hop4]).unwrap();
+        let body = TTL_PREFIX_LEN + NEXT_HOP_ID_LEN;
+
+        let p1 = onion::unwrap_at_hop(&envelope, &sk1).unwrap();
+        let p2 = onion::unwrap_at_hop(&p1[body..], &sk2).unwrap();
+        let p3 = onion::unwrap_at_hop(&p2[body..], &sk3).unwrap();
+        let p4 = onion::unwrap_at_hop(&p3[body..], &sk4).unwrap();
+
+        assert_eq!(p1[0], MAX_CIRCUIT_TTL, "entry hop");
+        assert_eq!(p2[0], MAX_CIRCUIT_TTL, "middle hop 1");
+        assert_eq!(p3[0], MAX_CIRCUIT_TTL, "middle hop 2");
+        assert_eq!(
+            p4[0], MAX_CIRCUIT_TTL,
+            "final hop TTL must equal the rest — no length leak"
         );
     }
 }
