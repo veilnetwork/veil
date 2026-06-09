@@ -551,15 +551,24 @@ impl FrameDispatcher {
 
     /// Apply ECMP flow-pinning: identify the equal-cost group inside
     /// `candidates` (using raw cache scores from `hops_with_scores` and the
-    /// dispatcher's `ecmp_score_band`), then rotate the group prefix so that
-    /// the path chosen by the per-flow hash appears first.
+    /// dispatcher's `ecmp_score_band`), order it so the per-flow pinned hop is
+    /// first, the rest of the group follows, and worse-cost candidates trail.
+    /// Returns the group size; `0` means no pinning (no scores or singleton).
     ///
-    /// Assumes `candidates` is already sorted by weighted score so the ECMP
-    /// group occupies indices `0..group_len`.  Returns the group size; `0`
-    /// means no pinning was applied (either no scores or a singleton group).
+    /// Does **not** assume any incoming order: the ECMP members are gathered by
+    /// identity and ordered DETERMINISTICALLY (by node_id) before the per-flow
+    /// hash picks one, so the same `(sender, dst)` flow pins the same hop every
+    /// time regardless of the upstream weighted-random shuffle — that is the
+    /// point of flow-pinning (no per-frame path flapping / reordering). Worse-
+    /// cost candidates keep their incoming (shuffled) order as fallback.
+    ///
+    /// `candidates` and `hop_attrs` are permuted **together** so callers that
+    /// index them in parallel (e.g. RTT metrics on the chosen hop) stay
+    /// consistent.
     pub fn apply_ecmp_pinning(
         &self,
         candidates: &mut [[u8; 32]],
+        hop_attrs: &mut [HopAttrs],
         hops_with_scores: &[([u8; 32], u32)],
         sender_node_id: NodeIdBytes,
         dst: NodeIdBytes,
@@ -578,14 +587,21 @@ impl FrameDispatcher {
             .filter(|(_, s)| *s as f64 <= threshold)
             .map(|(h, _)| *h)
             .collect();
-        let group_len = candidates.iter().filter(|h| ecmp_set.contains(*h)).count();
+
+        // ECMP-member candidate indices, ordered DETERMINISTICALLY by node_id
+        // (independent of the per-frame weighted shuffle) so flow-pinning is
+        // stable across frames.
+        let mut member_idx: Vec<usize> = (0..candidates.len())
+            .filter(|&i| ecmp_set.contains(&candidates[i]))
+            .collect();
+        let group_len = member_idx.len();
         if group_len < 2 {
             return 0;
         }
-        // Flow-pinning hash: XOR sender and destination node-ids, then mix bytes
-        // with FNV-1a to produce a stable per-flow index. Packets from the same
-        // (src, dst) pair always take the same next-hop as long as the ECMP
-        // group membership is stable.
+        member_idx.sort_unstable_by(|&a, &b| candidates[a].cmp(&candidates[b]));
+
+        // Flow-pinning hash: XOR sender and destination node-ids, mix with
+        // FNV-1a → a stable per-flow index into the deterministic group order.
         let mut xored = [0u8; 32];
         for i in 0..32 {
             xored[i] = sender_node_id[i] ^ dst[i];
@@ -596,7 +612,20 @@ impl FrameDispatcher {
             acc.wrapping_mul(FNV_PRIME) ^ (b as u64)
         });
         let pin_idx = (hash as usize) % group_len;
-        candidates[..group_len].rotate_left(pin_idx);
+        member_idx.rotate_left(pin_idx);
+
+        // Final order: pinned ECMP group first (deterministic), then the
+        // remaining worse-cost candidates in their incoming order. Permute both
+        // parallel arrays the same way.
+        let order: Vec<usize> = member_idx
+            .iter()
+            .copied()
+            .chain((0..candidates.len()).filter(|&i| !ecmp_set.contains(&candidates[i])))
+            .collect();
+        let new_candidates: Vec<[u8; 32]> = order.iter().map(|&i| candidates[i]).collect();
+        let new_attrs: Vec<HopAttrs> = order.iter().map(|&i| hop_attrs[i]).collect();
+        candidates.copy_from_slice(&new_candidates);
+        hop_attrs.copy_from_slice(&new_attrs);
         group_len
     }
 
@@ -882,8 +911,13 @@ impl FrameDispatcher {
             // candidate prefix so the flow-pinned path comes first. Provides
             // deterministic per-flow path selection while leaving the order
             // outside the group unchanged.
-            let ecmp_group_len =
-                self.apply_ecmp_pinning(&mut candidates, &hops_with_scores, sender_node_id, dst);
+            let ecmp_group_len = self.apply_ecmp_pinning(
+                &mut candidates,
+                &mut hop_attrs,
+                &hops_with_scores,
+                sender_node_id,
+                dst,
+            );
 
             // Pre-encode the envelope once; each hop attempt only differs in the
             // 32-byte `next_hop_node_id` prefix, so we avoid re-serialising the
@@ -1797,8 +1831,68 @@ impl FrameDispatcher {
 
 #[cfg(test)]
 mod tests {
+    use super::HopAttrs;
     use veil_cfg::NodeId;
     use veil_util::rlock;
+
+    /// audit cycle-3 (M1): ECMP flow-pinning must be deterministic per flow
+    /// regardless of the upstream weighted shuffle, keep the equal-cost group at
+    /// the front, and permute `hop_attrs` in lockstep with `candidates`.
+    #[test]
+    fn ecmp_pinning_deterministic_group_front_attrs_parallel() {
+        let disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let mk = |rtt: u32| HopAttrs {
+            hop_count: 1,
+            rtt_ms: rtt,
+            congestion: 0,
+            confidence: 1.0,
+            battery: 0,
+            jitter_ms: 0.0,
+            bandwidth_class: 0,
+            relay_success_ema: 1.0,
+            relay_attempts: 0,
+        };
+        let (h1, h2, h3, h4) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+        // h1/h2/h3 equal-cost (ECMP group); h4 far worse-cost (excluded).
+        let scores = vec![(h1, 100u32), (h2, 100), (h3, 100), (h4, 1_000_000)];
+        let (sender, dst) = ([9u8; 32], [8u8; 32]);
+        // rtt encodes hop identity so we can check the parallel permutation.
+        let rtt_of = |h: [u8; 32]| -> u32 {
+            if h == h1 {
+                11
+            } else if h == h2 {
+                22
+            } else if h == h3 {
+                33
+            } else {
+                44
+            }
+        };
+
+        // Run A — one input order.
+        let mut ca = vec![h1, h2, h3, h4];
+        let mut aa = vec![mk(11), mk(22), mk(33), mk(44)];
+        let g = disp.apply_ecmp_pinning(&mut ca, &mut aa, &scores, sender, dst);
+        assert_eq!(g, 3, "three equal-cost members form the group");
+        assert_eq!(ca[3], h4, "worse-cost hop trails the group");
+        assert!(ca[..3].contains(&h1) && ca[..3].contains(&h2) && ca[..3].contains(&h3));
+        assert_ne!(ca[0], h4, "primary hop is an ECMP member");
+        for i in 0..ca.len() {
+            assert_eq!(aa[i].rtt_ms, rtt_of(ca[i]), "attrs parallel at {i}");
+        }
+
+        // Run B — DIFFERENT input order (simulating the weighted shuffle), same flow.
+        let mut cb = vec![h4, h3, h1, h2];
+        let mut ab = vec![mk(44), mk(33), mk(11), mk(22)];
+        disp.apply_ecmp_pinning(&mut cb, &mut ab, &scores, sender, dst);
+        assert_eq!(
+            ca[0], cb[0],
+            "flow-pinned primary hop is identical across input orders (determinism)"
+        );
+        for i in 0..cb.len() {
+            assert_eq!(ab[i].rtt_ms, rtt_of(cb[i]), "attrs parallel (B) at {i}");
+        }
+    }
 
     /// Standalone implementation of the effective_score formula so that tests
     /// can exercise jitter/bandwidth/reputation scoring without going through relay_forward.
