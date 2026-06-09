@@ -1763,8 +1763,16 @@ fn serialize_replica_buf(replicas: &[veilclient::RendezvousReplicaInfo]) -> Vec<
                 "replica blob len {} exceeds the u16 length prefix",
                 blob.len(),
             );
-            buf.extend_from_slice(&(blob.len() as u16).to_le_bytes());
-            buf.extend_from_slice(blob);
+            // Clamp the prefix AND the appended bytes to the SAME length so a
+            // future cap bump past u16::MAX can never desync the Dart-side
+            // parser: a bare `as u16` cast would wrap the prefix while still
+            // writing the full blob, corrupting every subsequent entry. Self-
+            // consistent truncation degrades one entry instead. Producers are
+            // capped far below 64 KiB today. (audit cycle-3; matches the
+            // EpidemicPayload::encode clamp pattern.)
+            let len = blob.len().min(u16::MAX as usize);
+            buf.extend_from_slice(&(len as u16).to_le_bytes());
+            buf.extend_from_slice(&blob[..len]);
         }
     }
     buf
