@@ -1,10 +1,10 @@
-// MethodChannel bridge for foreground-service control от Dart side
+// MethodChannel bridge for foreground-service control from Dart side
 // (Epic 489.6).
 //
 // The veil-flutter plugin is primarily an `ffiPlugin` (Dart-FFI
-// directly into the Rust .so), но Android-specific lifecycle hooks
-// — namely starting / stopping а foreground service — require а
-// JNI thunk because Android's `startForegroundService` is а Java API
+// directly into the Rust .so), but Android-specific lifecycle hooks
+// — namely starting / stopping a foreground service — require a
+// JNI thunk because Android's `startForegroundService` is a Java API
 // not exposed via NDK.
 //
 // MethodChannel surface:
@@ -34,8 +34,8 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         private const val LIFECYCLE_CHANNEL = "veil_flutter/lifecycle"
         private const val PUSH_CHANNEL = "veil_flutter/push"
         // Legacy plain-text prefs file — read-once-then-delete migration
-        // target.  Existing installs may have а cleartext token here;
-        // we move it к the encrypted store on first read so older app
+        // target.  Existing installs may have a cleartext token here;
+        // we move it to the encrypted store on first read so older app
         // versions don't strand the token.
         private const val LEGACY_PREFS_FILE = "veil_flutter_push"
         private const val PREFS_FILE = "veil_flutter_push_enc"
@@ -145,10 +145,10 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                 // Receiver's wake-HMAC secret (Epic 489.10).  Same trust
                 // level as the push token — anyone holding it can forge
                 // silent-push wake authenticators for this device — so it
-                // rides the SAME EncryptedSharedPreferences store, under а
-                // distinct prefs key, never в plaintext.  Stored base64 so
+                // rides the SAME EncryptedSharedPreferences store, under a
+                // distinct prefs key, never in plaintext.  Stored base64 so
                 // the raw 32 bytes survive the String-valued prefs (the
-                // token store is String-typed; см. PREFS_KEY_TOKEN).
+                // token store is String-typed; see PREFS_KEY_TOKEN).
                 val key = call.argument<ByteArray>("key")
                 if (key == null || key.size != WAKE_HMAC_KEY_LEN) {
                     result.error(
@@ -179,7 +179,7 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                 // does not gate background work on this — pacing is
                 // handled via the foreground service notification —
                 // but ack the channel call so future BG-task wiring
-                // can hook here без а Dart-side API change.
+                // can hook here without a Dart-side API change.
                 val count = call.argument<Int>("count") ?: 0
                 android.util.Log.i("VeilFlutterPlugin",
                     "mailbox drained (count=$count)")
@@ -192,9 +192,9 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     /// Open the EncryptedSharedPreferences store, migrating any
     /// pre-existing cleartext token from the legacy file on first
     /// access.  Throws IllegalStateException on Keystore unavailability —
-    /// rare (very old / damaged devices), surfaces к the MethodChannel
-    /// caller as а PlatformException the consumer can handle (we
-    /// deliberately don't silently fall back к cleartext).
+    /// rare (very old / damaged devices), surfaces to the MethodChannel
+    /// caller as a PlatformException the consumer can handle (we
+    /// deliberately don't silently fall back to cleartext).
     private fun tokenPrefs(ctx: Context): SharedPreferences {
         val masterKey = MasterKey.Builder(ctx)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
@@ -212,13 +212,13 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         return prefs
     }
 
-    /// One-shot: read any stored token из the legacy cleartext file,
-    /// re-store it через the encrypted prefs, then delete the legacy
+    /// One-shot: read any stored token from the legacy cleartext file,
+    /// re-store it through the encrypted prefs, then delete the legacy
     /// file so the cleartext copy doesn't linger.  Marks the
     /// migrated-flag inside the encrypted store, so this only runs
-    /// once.  Failure modes (legacy file unreadable, delete fails) ара
-    /// non-fatal — а fresh install just enters the encrypted flow с
-    /// no token, и subsequent registerDeviceToken calls populate it.
+    /// once.  Failure modes (legacy file unreadable, delete fails) are
+    /// non-fatal — a fresh install just enters the encrypted flow with
+    /// no token, and subsequent registerDeviceToken calls populate it.
     private fun migrateLegacyToken(ctx: Context, prefs: SharedPreferences) {
         try {
             val legacy = ctx.getSharedPreferences(LEGACY_PREFS_FILE, Context.MODE_PRIVATE)
@@ -230,13 +230,13 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             editor.putBoolean(PREFS_KEY_MIGRATED, true)
             editor.apply()
             // Best-effort: delete legacy file + its XML on disk.
-            // Failures here are logged but не block — worst case the
-            // cleartext file lingers, но subsequent reads come из the
-            // encrypted store thanks к the migrated-flag.
+            // Failures here are logged but do not block — worst case the
+            // cleartext file lingers, but subsequent reads come from the
+            // encrypted store thanks to the migrated-flag.
             legacy.edit().clear().apply()
             // `Context.deleteSharedPreferences` is API 24+; on API 21-23
             // the cleared-content xml stays on disk.  Cleared values
-            // ара safe (just the legacy file name), но removing entirely
+            // are safe (just the legacy file name), but removing entirely
             // is preferable when the SDK level allows.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 ctx.deleteSharedPreferences(LEGACY_PREFS_FILE)
@@ -247,7 +247,7 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                 "legacy push-token migration failed: ${e.message}",
             )
             // Mark migrated anyway so we don't retry on every read —
-            // если legacy is truly broken, re-trying won't help.
+            // if legacy is truly broken, re-trying won't help.
             prefs.edit().putBoolean(PREFS_KEY_MIGRATED, true).apply()
         }
     }

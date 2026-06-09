@@ -2,7 +2,7 @@
 #
 # check-cyrillic-runtime-strings.sh
 #
-# Two scans, both failing on Cyrillic-block characters (U+0400–U+04FF):
+# Three scans, all failing on Cyrillic-block characters (U+0400–U+04FF):
 #
 #   1. RUNTIME-VISIBLE Rust strings — `expect(` / `panic!` / `assert*!` /
 #      `format!` / `println!` / `eprintln!` / `write!` / `bail!` / `anyhow!` /
@@ -17,6 +17,13 @@
 #      Rust-only lint would ever scan (this is exactly how the `.dockerignore`
 #      release-key-glob leak slipped through). This detector script itself is
 #      exempt (it must contain Cyrillic to define the pattern + example above).
+#
+#   3. MOBILE plugin source — every `.swift` / `.kt` / `.dart` file under
+#      `flutter/` (comment AND code). The mobile plugin was fully normalized to
+#      ASCII English, so unlike the Rust tree (scope note below) ANY Cyrillic
+#      here is a regression — mobile reviewers may not read Russian and
+#      homoglyphs are a review-obfuscation vector. Generated dirs
+#      (build/.dart_tool/Pods/ephemeral) are skipped.
 #
 # Scope notes:
 #   * Scan 1 does NOT flag Cyrillic inside ordinary `//` / `///` Rust comments —
@@ -84,6 +91,23 @@ for p in tooling_paths:
     except (IsADirectoryError, UnicodeError):
         continue
 
+# Scan 3: MOBILE plugin source (Flutter Swift/Kotlin/Dart). Unlike the Rust
+# tree — whose ordinary comments still carry deferred bilingual RU/EN text —
+# the mobile plugin was fully normalized to ASCII English, so ANY Cyrillic
+# here (comment OR code) is a regression. Mobile reviewers don't necessarily
+# read Russian, and homoglyphs (а/с/к) are a review-obfuscation vector.
+mobile_violations = []
+for root, _, files in os.walk('flutter'):
+    if any(seg in root for seg in ('/build', '/.dart_tool', '/Pods', '/ephemeral')):
+        continue
+    for f in files:
+        if not f.endswith(('.swift', '.kt', '.dart')):
+            continue
+        p = os.path.join(root, f)
+        for i, line in enumerate(open(p, encoding='utf-8', errors='ignore'), 1):
+            if CYR.search(line):
+                mobile_violations.append((p, i, line.strip()))
+
 rc = 0
 if runtime_violations:
     print("Cyrillic found in operator-visible runtime strings:\n")
@@ -101,7 +125,15 @@ if tooling_violations:
           "English; watch for homoglyphs (а/с/к/в/о/е/р/у/х).\n")
     rc = 1
 
+if mobile_violations:
+    print("Cyrillic found in mobile plugin source (flutter/ *.swift/*.kt/*.dart must be ASCII English):\n")
+    for p, i, line in mobile_violations:
+        print(f"  {p}:{i}: {line[:140]}")
+    print(f"\n{len(mobile_violations)} violation(s). The mobile plugin was normalized to "
+          "ASCII English; keep it that way (translate meaning, watch homoglyphs а/с/к/в/о/е/р/у/х).\n")
+    rc = 1
+
 if rc == 0:
-    print("OK: no Cyrillic in runtime strings or CI tooling.")
+    print("OK: no Cyrillic in runtime strings, CI tooling, or mobile plugin source.")
 sys.exit(rc)
 PY
