@@ -1,32 +1,55 @@
-//! Fuzz target for protocol conformance.
+//! Fuzz target for protocol-decoder robustness against untrusted bytes.
 //!
-//! Covers proto types introduced in Epics 243-246:
-//! * `RelayChainHop`
-//! * `AnnounceAttachmentPayload` with optional `EphemeralEndpoint` TLV
-//! * `EphemeralEndpoint::decode_from_tlv`
-//! * `MeshFrame`
+//! Every decoder below parses bytes that originate from a REMOTE peer, so an
+//! arbitrary byte slice must never panic, abort, over-allocate, or produce
+//! undefined behaviour — decoders may only return `Err` / `None`.
 //!
-//! No arbitrary byte slice must cause a panic — decoders may return `Err` / `None`
-//! but must never panic, abort, or produce undefined behaviour.
+//! Coverage (expanded in audit cycle-1 from the original 4 decoders):
+//! * Epics 243-246: `RelayChainHop`, `AnnounceAttachmentPayload` (+ optional
+//!   `EphemeralEndpoint` TLV), `EphemeralEndpoint::decode_from_tlv`, `MeshFrame`.
+//! * Gossip / E2E: `EpidemicPayload`, `E2eEnvelope`.
+//! * Routing / recursive-DHT plane: `RouteAnnouncePayload`,
+//!   `RouteResponsePayload`, `RecursiveQueryPayload`, `RecursiveResponsePayload`.
+//! * DHT store/find plane (the cache-poison surface — see the ML-KEM resolver
+//!   validated-fast-path fix): `StorePayload`, `DhtValue`, `FindValuePayload`,
+//!   `FindNodeResponse`.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
 use veilcore::proto::{
-    discovery::{AnnounceAttachmentPayload, EphemeralEndpoint},
+    discovery::{
+        AnnounceAttachmentPayload, DhtValue, EphemeralEndpoint, FindNodeResponse, FindValuePayload,
+        StorePayload,
+    },
+    e2e::E2eEnvelope,
+    epidemic::EpidemicPayload,
     mesh::MeshFrame,
     relay_chain::RelayChainHop,
+    routing::{
+        RecursiveQueryPayload, RecursiveResponsePayload, RouteAnnouncePayload, RouteResponsePayload,
+    },
 };
 
 fuzz_target!(|data: &[u8]| {
-    // RelayChainHop — must never panic on arbitrary input.
+    // ── Epics 243-246 (original coverage) ──────────────────────────────
     let _ = RelayChainHop::decode(data);
-
-    // AnnounceAttachmentPayload — includes optional TLV.
     let _ = AnnounceAttachmentPayload::decode(data);
-
-    // EphemeralEndpoint TLV scanner — parses arbitrary TLV blocks.
     let _ = EphemeralEndpoint::decode_from_tlv(data);
-
-    // MeshFrame — realm-scoped mesh packet.
     let _ = MeshFrame::decode(data);
+
+    // ── Gossip + end-to-end envelopes ──────────────────────────────────
+    let _ = EpidemicPayload::decode(data);
+    let _ = E2eEnvelope::decode(data);
+
+    // ── Routing / recursive-DHT plane (attacker-reachable frames) ───────
+    let _ = RouteAnnouncePayload::decode(data);
+    let _ = RouteResponsePayload::decode(data);
+    let _ = RecursiveQueryPayload::decode(data);
+    let _ = RecursiveResponsePayload::decode(data);
+
+    // ── DHT store/find plane — the cache-poison surface ────────────────
+    let _ = StorePayload::decode(data);
+    let _ = DhtValue::decode(data);
+    let _ = FindValuePayload::decode(data);
+    let _ = FindNodeResponse::decode(data);
 });
