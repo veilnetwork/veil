@@ -384,7 +384,7 @@ its own.
 
 - `visibility = "stealth"` is required (otherwise config validation errors out at startup)
 - An Ed25519 node identity (hybrid Falcon-512 isn't supported at this layer)
-- **One stealth listener** per node (multi-stealth = TODO in Slice 6+)
+- **Multiple stealth listeners** per node are supported (advertised round-robin; node-wide `pow_difficulty` / `rate_limit` / `max_concurrent` must be identical across them)
 
 | Key | Type | Default | Description |
 |------|-----|-------------|----------|
@@ -439,12 +439,11 @@ max_accepts    = 1
 
 Grant rate is `granted / received`. A high `rejected_verify_total` with a low `granted` means one of two things: clients are mining too weak a PoW (raise `pow_difficulty`), or someone's forging requests (and the rate-limit and anti-abuse layers are doing their job). A high `rejected_concurrency_total` means `max_concurrent` is too tight for normal load.
 
-**What isn't built yet (Slice 6+):**
+**Mediator routing (shipped — Slice 6).** A requester with no open OVL1 session to the stealth target reaches it through a PEX/DHT mediator-relay (`RecursiveQuery`), so a stealth listener with no open port is reachable end-to-end — not merely hooked into the dispatch path.
 
-- **Mediator routing.** This layer only handles the request frame on the target side, which assumes the requester already has an OVL1 session with the target — nonsense for a stealth listener that has no open port. Full integration through a PEX/DHT mediator-relay lands in Slice 6.
+**Still pending:**
+
 - **End-to-end integration tests.** Slice 8.
-
-Until Slice 6, the stealth listener runs in a "hooked into the dispatch path, but unreachable through a mediator" mode — useful for unit-testing the controller and watching it through metrics while you inject frames by hand.
 
 ---
 
