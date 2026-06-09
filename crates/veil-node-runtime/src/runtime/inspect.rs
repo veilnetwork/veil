@@ -98,7 +98,8 @@ impl NodeRuntime {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .unregister(&id_bytes);
-        self.dispatcher.on_session_closed(node_id);
+        // Admin/inspection teardown path — not a referral session.
+        self.dispatcher.on_session_closed(node_id, false);
         lock!(self.live_sessions).retain(|_, s| s.node_id.as_ref() != Some(&node_id));
     }
 
