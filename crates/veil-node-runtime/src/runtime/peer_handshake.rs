@@ -692,7 +692,10 @@ pub async fn register_connection_session(
         // client to freer nodes rather than stranding it).
         let at_limit = {
             lock!(runtime.live_sessions).len()
-                >= runtime.defaults.max_concurrent.saturating_add(runtime.defaults.referral_headroom)
+                >= runtime
+                    .defaults
+                    .max_concurrent
+                    .saturating_add(runtime.defaults.referral_headroom)
         };
         let remote_nid = *remote_identity.node_id.as_bytes();
         if lock!(runtime.dispatcher.abuse.ban_list).is_banned(&remote_nid) {
@@ -802,7 +805,12 @@ pub async fn register_connection_session(
         // over-limit branch (rollback + shutdown) after the lock scope closes.
         let inserted_count = {
             let mut sessions = lock!(runtime.live_sessions);
-            if sessions.len() >= runtime.defaults.max_concurrent.saturating_add(runtime.defaults.referral_headroom) {
+            if sessions.len()
+                >= runtime
+                    .defaults
+                    .max_concurrent
+                    .saturating_add(runtime.defaults.referral_headroom)
+            {
                 None
             } else {
                 sessions.insert(
@@ -846,7 +854,10 @@ pub async fn register_connection_session(
             payload: count_u16.to_be_bytes().to_vec(),
         });
         // referral = accepted past the data cap (into the headroom only).
-        (reserved_outbox_rx, new_count > runtime.defaults.max_concurrent)
+        (
+            reserved_outbox_rx,
+            new_count > runtime.defaults.max_concurrent,
+        )
     };
     runtime.logger.info(
         "session.open",
