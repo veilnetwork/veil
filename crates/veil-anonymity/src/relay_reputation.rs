@@ -1,5 +1,15 @@
 //! Per-sender-local anonymity-relay reputation slice (Epic 482.3 / 482.4).
 //!
+//! **Wiring status (audit cycle-3):** implemented and unit-tested, but NOT yet
+//! wired into the production circuit builder — `sender.rs` still selects hops
+//! via [`crate::circuit_builder::pick_circuit_hops_latency_aware_with_diversity`]
+//! (no reputation term). Activating it (route `sender.rs` through
+//! [`crate::circuit_builder::pick_circuit_hops_latency_aware_with_diversity_and_reputation`]
+//! fed by this module's own [`RelayReputation::record_failure`] signals) is the
+//! remaining work of Epic 482.3/482.4. Until then it is exercised only by tests — a
+//! deliberate deferral (changing anonymity hop-selection scoring is feature
+//! work, not an audit fix), not dead code.
+//!
 //! Anonymity relays advertise `advertised_bps` in [`crate::directory::
 //! RelayDirectoryEntry`] which is operator-self-reported and unverifiable
 //! at directory-publish time. Relays can:
