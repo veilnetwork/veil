@@ -840,6 +840,14 @@ pub const MAX_RELAY_TUNNELS: usize = 512;
 /// possible re-acceptance is harmless — at most one extra beacon per source).
 pub const MAX_BEACON_DEDUP_ENTRIES: usize = 4_096;
 
+/// Max accepted clock-skew (seconds, past or future) on a SIGNED mesh beacon's
+/// timestamp. Beyond this a signed beacon is rejected as stale/replayed — so a
+/// captured beacon can only redirect the originator's `node_id` for this window
+/// instead of forever. Generous enough to tolerate clock skew + several missed
+/// beacon intervals; tight enough to bound the replay-redirect window to
+/// minutes. (audit cycle-4 M3.)
+pub const MAX_BEACON_SKEW_SECS: u64 = 120;
+
 /// Maximum number of peer-observed addresses the dispatcher retains.
 /// One entry per active peer (cleaned up on session close), so this is
 /// normally well below the active-session limit. The explicit cap is a
@@ -1105,13 +1113,14 @@ mod tests {
 
     #[test]
     fn mesh_beacon_wire_size() {
-        // v2 encodes role_flags(1) + addr_len(1) + battery_level(1), so min size is 51.
+        // v2 encodes role_flags(1) + addr_len(1) + battery_level(1) + timestamp(8),
+        // so min size is MESH_BEACON_SIZE + 11 = 59.
         let b = MeshBeaconPayload::new_basic([0u8; 32], RealmId([0u8; 16]));
         assert!(
             b.encode().len() >= MESH_BEACON_SIZE,
             "must include at least the v1 fields"
         );
-        assert_eq!(b.encode().len(), MESH_BEACON_SIZE + 3); // +role_flags +addr_len +battery_level
+        assert_eq!(b.encode().len(), MESH_BEACON_SIZE + 3 + 8); // +role_flags +addr_len +battery_level +timestamp
     }
 
     #[test]

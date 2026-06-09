@@ -555,6 +555,8 @@ impl BeaconSender {
             role_flags: self.role_flags,
             veil_addr: self.veil_addr.clone(),
             battery_level: read_battery_level(),
+            // Freshness for replay rejection (M3); covered by the signature below.
+            timestamp: crate::udp::now_secs(),
             algo: self.algo,
             public_key: self.public_key.clone(),
             signature: vec![],
@@ -801,6 +803,24 @@ impl BeaconReceiver {
             return false;
         } else {
             log::debug!("mesh.beacon: unsigned beacon from {sender_addr} — accepted (legacy)");
+        }
+
+        // Freshness (audit cycle-4 M3): a SIGNED beacon carries a
+        // signature-covered timestamp, so a captured beacon can't be replayed
+        // forever to rebind this node_id to a spoofed `sender_addr`. Reject
+        // signed beacons outside the skew window. (Unsigned beacons have no
+        // trustworthy timestamp — forgeable wholesale — so freshness isn't
+        // checked there; the require_signed gate above is the real defence.)
+        if beacon.is_signed() {
+            let skew = crate::udp::now_secs().abs_diff(beacon.timestamp);
+            if skew > veil_proto::budget::MAX_BEACON_SKEW_SECS {
+                log::warn!(
+                    "mesh.beacon: stale/future signed beacon from {sender_addr} \
+                     (skew {skew}s > {}s) — dropped (possible replay)",
+                    veil_proto::budget::MAX_BEACON_SKEW_SECS
+                );
+                return false;
+            }
         }
 
         // per-source deduplication window.
