@@ -326,8 +326,10 @@ impl RateLimiter {
         true
     }
 
-    /// Test/diagnostics helper.
-    #[allow(dead_code)]
+    /// Test/diagnostics helper. (audit cycle-3: `#[cfg(test)]` instead of
+    /// `#[allow(dead_code)]` — its only caller, `rate_limiter_entries_for`, is
+    /// itself test-only.)
+    #[cfg(test)]
     fn current_entries(&self, requester: &[u8; 32]) -> usize {
         self.state.get(requester).map(|v| v.len()).unwrap_or(0)
     }
@@ -595,7 +597,9 @@ impl RendezvousController {
     }
 
     /// Diagnostics: number of currently-rate-limited requesters in
-    /// the live window.  Mostly for tests / metrics export.
+    /// the live window.  Test-only — no production consumer (audit cycle-3);
+    /// re-export by dropping the `#[cfg(test)]` if a metrics exporter wires in.
+    #[cfg(test)]
     pub fn rate_limiter_entries_for(&self, requester: &[u8; 32]) -> usize {
         // SECURITY (audit 2026-05-29, poison-DoS fix): poison-recovering
         // access — see the `allow` call site above for rationale.

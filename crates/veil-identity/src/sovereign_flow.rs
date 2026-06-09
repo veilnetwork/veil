@@ -593,7 +593,10 @@ pub struct RestoreIdentityOptions {
     /// the fresh machine.
     pub instance_label: String,
 
-    /// PoW difficulty the new document must satisfy.
+    /// Retained for API stability — `restore_identity` dropped the
+    /// document-level PoW, so this value is currently unused (mirrors
+    /// `CreateIdentityOptions::pow_difficulty`). (audit cycle-3: the doc was
+    /// misleadingly "the new document must satisfy".)
     pub pow_difficulty: u32,
 
     /// Now, in Unix seconds — used as `issued_at`.

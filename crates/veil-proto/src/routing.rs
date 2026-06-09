@@ -1343,11 +1343,11 @@ impl VersionVectorSyncPayload {
             });
         }
         let count = super::read_u32_be(buf, 0)? as usize;
-        if count > 10_000 {
+        if count > super::budget::MAX_VERSION_VECTOR_ENTRIES {
             return Err(ProtoError::ValueTooLarge {
                 field: "VersionVectorSync.count",
                 value: count as u64,
-                max: 10_000,
+                max: super::budget::MAX_VERSION_VECTOR_ENTRIES as u64,
             });
         }
         let needed = 4 + count * 40;
