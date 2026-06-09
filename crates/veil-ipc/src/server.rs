@@ -2335,7 +2335,7 @@ mod remote_stream_open_tests {
         // Complete the receipt for wire_stream_id == 1 once the handler has
         // registered it (no fixed sleep — yield until it appears).
         for _ in 0..10_000 {
-            if let Some(tx) = bridge.pending_receipts.lock().unwrap().remove(&1) {
+            if let Some(tx) = bridge.pending_receipts.lock().unwrap().remove(&(dst, 1)) {
                 let _ = tx.send(status);
                 break;
             }

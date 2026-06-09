@@ -219,11 +219,17 @@ impl FrameDispatcher {
                 // waiter if one is registered for this stream_id; otherwise drop.
                 match AppReceiptPayload::decode(body) {
                     Ok(receipt) => {
+                        // Key by (source peer, stream_id): the receipt's sender
+                        // is the peer we opened the stream to, matching the
+                        // (node_id, wire_stream_id) key the opener registered.
+                        // Prevents a receipt from resolving a different peer's
+                        // waiter that shares a wire_stream_id (possible only if
+                        // the shared u32 counter wrapped — now excluded).
                         if let Some(tx) = self
                             .pending_stream_receipts
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
-                            .remove(&header.stream_id)
+                            .remove(&(*node_id.as_bytes(), header.stream_id))
                         {
                             let _ = tx.send(receipt.status);
                         }
