@@ -2818,10 +2818,10 @@ impl NodeRuntime {
     /// `NatProbeReply` carrying the target's NAT candidates.
     ///
     /// This implements the SIGNALING half of NAT traversal — it does
-    /// NOT do the actual UDP hole-punching. Returns the candidates
-    /// the target advertised so the caller can hand them to a
-    /// `NatPuncher` (will wire that step into the
-    /// outbound dial). Returns `None` on timeout.
+    /// NOT do the actual UDP hole-punching. Returns the candidates the
+    /// target advertised so the caller can drive the punch/dial directly
+    /// (see `attempt_nat_traversal_via` / `nat_fallback_dial`). Returns
+    /// `None` on timeout.
     ///
     /// Semantics:
     /// 1. Build a fresh `session_token` (16-bit random).
