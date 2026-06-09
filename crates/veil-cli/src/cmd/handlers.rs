@@ -726,10 +726,21 @@ impl ConfigCommandService {
         let signed = bootstrap::decode_signed_bundle(&envelope_bytes).map_err(|e| {
             veil_cfg::ConfigError::ValidationFailed(format!("decode signed bundle: {e}",))
         })?;
+        // Fail closed on a broken clock: `unwrap_or(0)` would set `now = 0`, and
+        // the bundle-expiry check (`now > issued_at + MAX_BUNDLE_AGE`) would then
+        // always be false — silently disabling freshness and accepting an
+        // arbitrarily-old (replayed) signed bundle. The runtime HTTPS path already
+        // fails closed here; mirror it. (audit M-1.)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_err(|_| {
+                veil_cfg::ConfigError::ValidationFailed(
+                    "system clock is before UNIX_EPOCH — refusing to verify \
+                     bootstrap-bundle freshness"
+                        .to_owned(),
+                )
+            })?;
         let pinned_issuer = loaded.global.trusted_bundle_issuer_pubkey.as_deref();
         let expected: Option<&str> = if let Some(pinned) = pinned_issuer {
             // Strict pin: reject mismatch BEFORE running the crypto
@@ -759,6 +770,12 @@ impl ConfigCommandService {
                 .filter(|i| i.public_key == signed.issuer_pk)
                 .map(|i| i.public_key.as_str())
         };
+        // H-2: when `expected` is None (no pin AND the envelope issuer is not
+        // this node's own identity), `verify_signed_bundle` only checks internal
+        // consistency — ANY attacker keypair passes. Capture that here; we refuse
+        // to MERGE such an unauthenticated bundle below unless the operator has
+        // explicitly opted into unsigned bootstrap.
+        let is_no_anchor = expected.is_none();
         let peers = bootstrap::verify_signed_bundle(&signed, expected, now).map_err(|e| {
             veil_cfg::ConfigError::ValidationFailed(format!("verify signed bundle: {e}",))
         })?;
@@ -782,8 +799,33 @@ impl ConfigCommandService {
             return Ok(());
         }
 
+        // H-2: refuse to persist unauthenticated peers (no pin, issuer != our
+        // identity) unless the operator explicitly opted into unsigned bootstrap
+        // — mirrors the runtime BootstrapHttpsPolicy gate (service_tasks.rs).
+        // Dry-run already returned above, so inspection still works without the
+        // opt-in (an operator can dry-run to read the issuer, then pin it).
+        if is_no_anchor && !loaded.global.legacy_allow_unsigned_bootstrap {
+            return Err(veil_cfg::ConfigError::CommandFailed(format!(
+                "bootstrap fetch: bundle issuer {issuer_short}… is not pinned and \
+                 does not match this node's identity — refusing to merge \
+                 unauthenticated bootstrap peers. Set `trusted_bundle_issuer_pubkey` \
+                 to pin the operator's pubkey, or set \
+                 `legacy_allow_unsigned_bootstrap = true` to opt into unsigned \
+                 bootstrap (dev/testnet only).",
+            )));
+        }
+
         let count = peers.len();
         loaded.bootstrap_peers = peers;
+        // Never persist a config that would fail to load: validate the merged
+        // result (e.g. malformed peer transports from a crafted bundle) before
+        // writing it to disk.
+        let report = veil_cfg::validate(&loaded);
+        if !report.is_valid() {
+            return Err(veil_cfg::ConfigError::ValidationFailed(
+                report.format_issues(),
+            ));
+        }
         context.config().save(&config_path, &loaded)?;
         context.io.emit(OutputEvent::message(format!(
             "merged {count} signed bootstrap peer(s) (issuer={issuer_short}…) into {}",
@@ -1279,18 +1321,18 @@ mod tests {
         );
     }
 
-    /// default `max_concurrent` is 512 (desktop-friendly
-    /// memory-safe). Was 65,536 in pre-builds — lowered as a
-    /// breaking change for "no working network yet" deployment.
-    /// Operators with dedicated relay/gateway hardware can raise via
-    /// config; mobile profile lowers further to 64.
+    /// default `max_concurrent` is 1000 (raised from 512 alongside the
+    /// capacity-referral work, which added a hard ceiling of
+    /// `max_concurrent + referral_headroom`). Was 65,536 in pre-builds —
+    /// lowered as a breaking change for "no working network yet"
+    /// deployment. Mobile profile lowers further to 64.
     #[test]
     fn epic487_3_default_max_concurrent_is_budget_friendly() {
         let config = veil_cfg::Config::default();
         assert_eq!(
-            config.session.max_concurrent, 512,
-            "default max_concurrent must be 512 (down from 65_536) — \
-             budget desktops fit, dedicated relays raise via config"
+            config.session.max_concurrent, 1000,
+            "default max_concurrent must be 1000 — budget desktops fit, \
+             dedicated relays raise via config"
         );
     }
 
