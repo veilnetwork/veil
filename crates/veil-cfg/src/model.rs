@@ -3234,6 +3234,16 @@ pub struct TransportConfig {
     /// to a minimal hardcoded HTML.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webtunnel_decoy_dir: Option<std::path::PathBuf>,
+    /// Webtunnel response-timing floor, in milliseconds.  When set, the server
+    /// holds every response — the tunnel `101` upgrade and the decoy alike —
+    /// until at least this long has elapsed since the request was read, so an
+    /// active prober cannot tell a real tunnel endpoint from a plain decoy by
+    /// response latency.  Costs up to this much added handshake latency, so it
+    /// is opt-in; `None`/`0` (default) responds as soon as ready.  Set it above
+    /// the decoy's worst-case fetch time (for a proxy decoy, above the
+    /// backend's latency) or the decoy can still overrun the floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webtunnel_response_floor_ms: Option<u64>,
 
     /// Anti-censorship strategy: SOCKS proxy URL used as a **fallback**
     /// when direct outbound dialing fails repeatedly (e.g., AS-level
