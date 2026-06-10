@@ -211,7 +211,7 @@ impl WebtunnelRouter {
                 let ws = WebSocketStream::from_raw_socket(
                     stream,
                     tokio_tungstenite::tungstenite::protocol::Role::Server,
-                    None,
+                    Some(crate::bounded_ws_config()),
                 )
                 .await;
                 Ok(ws)
