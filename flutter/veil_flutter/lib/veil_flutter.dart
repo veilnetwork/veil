@@ -37,7 +37,7 @@ export 'src/mailbox.dart' show VeilMailbox;
 export 'src/multi_device_pairing.dart'
     show VeilMultiDevicePairingDialog, PairingRole;
 export 'src/pairing.dart' show VeilPairingDialog;
-export 'src/push.dart' show VeilPush;
+export 'src/push.dart' show VeilPush, PushProvider;
 export 'src/share_invite.dart' show VeilShareInviteDialog;
 export 'src/stream.dart' show VeilStream;
 export 'src/types.dart'

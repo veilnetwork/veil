@@ -15,14 +15,22 @@
 //!
 //! ```text
 //! [ 16 byte random nonce-prefix (plaintext)         ]
-//! [ 8 byte counter u64 BE       (plaintext)         ]
+//! [ 8 byte counter u64 BE       (MASKED, see H9)    ]
 //! [ ChaCha20-Poly1305(payload || padding, key, nonce) ]
 //! [ 16 byte AEAD tag                                ]
 //! ```
 //!
 //! Total overhead per datagram: **40 bytes**.
 //!
-//! - **Key** = `HKDF-SHA256(PSK, "veil-udp-obfs:v1:" || peer_node_id, 32)`.
+//! - **Key** = `HKDF-SHA256(PSK, "veil-udp-obfs:v2:" || peer_node_id, 64)` —
+//!   `[0..32]` AEAD key, `[32..64]` counter-mask key.
+//! - **Counter masking (v2 / audit cycle-8 H9)**: the on-wire counter field is
+//!   XORed with `HKDF(counter-mask-key, prefix)[..8]`. The prefix is random per
+//!   datagram, so the masked counter is uniformly random to an observer without
+//!   the key — closing the passive-DPI fingerprint of a monotonic plaintext
+//!   counter. The receiver re-derives the mask from the prefix and recovers the
+//!   true counter for the AEAD nonce and replay window. **Wire-incompatible with
+//!   v1** (different HKDF label → different keys; old nodes cannot decrypt v2).
 //! - **AEAD nonce** = first 12 bytes of `nonce-prefix || counter` (24 bytes
 //!   total; the AEAD primitive consumes 12).  Random prefix gives 2^96
 //!   nonce-uniqueness even if counter is reused across distinct senders.
@@ -33,8 +41,9 @@
 //!
 //! ## Properties
 //!
-//! - **Wire entropy:** uniformly random for an observer without the key.
-//!   Counter in plaintext but cannot be advanced or replayed without the key.
+//! - **Wire entropy:** uniformly random for an observer without the key —
+//!   including the counter field, which is masked (v2 / H9) rather than sent
+//!   as a monotonic plaintext value.
 //! - **Loss-tolerant:** datagram drop doesn't break anything; next
 //!   datagram decrypts independently.
 //! - **Reorder-tolerant:** sliding replay window accepts out-of-order
@@ -109,7 +118,7 @@ pub const MAX_PADDING_BYTES: usize = 256;
 
 /// HKDF context label.  Domain-separated so the same PSK reused for another
 /// purpose doesn't produce key collisions.
-pub const HKDF_INFO_PREFIX: &[u8] = b"veil-udp-obfs:v1:";
+pub const HKDF_INFO_PREFIX: &[u8] = b"veil-udp-obfs:v2:";
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
@@ -145,6 +154,12 @@ pub enum ObfsError {
 pub struct ObfsKey {
     #[zeroize(skip)]
     cipher: ChaCha20Poly1305,
+    /// Independent 32-byte key for the wire-counter mask (audit cycle-8 H9).
+    /// Used by [`counter_mask`] to derive a per-datagram keystream from the
+    /// random prefix so the on-wire counter field is uniformly random instead
+    /// of a monotonic plaintext value an on-path DPI could fingerprint. Kept
+    /// separate from the AEAD key so masking never touches AEAD key material.
+    counter_mask_key: [u8; 32],
 }
 
 impl ObfsKey {
@@ -152,20 +167,41 @@ impl ObfsKey {
     /// the deployment's pre-shared key `psk`.  Both sides must derive
     /// the SAME key for a given (psk, peer_node_id) pair.
     ///
-    /// HKDF context: `"veil-udp-obfs:v1:" || peer_node_id` (32 bytes).
+    /// HKDF context: `"veil-udp-obfs:v2:" || peer_node_id`. Expands 64 bytes:
+    /// `[0..32]` = ChaCha20-Poly1305 AEAD key, `[32..64]` = counter-mask key.
     pub fn derive(psk: &[u8], peer_node_id: &[u8; 32]) -> Self {
         let hk = Hkdf::<Sha256>::new(None, psk);
         let mut info = Vec::with_capacity(HKDF_INFO_PREFIX.len() + peer_node_id.len());
         info.extend_from_slice(HKDF_INFO_PREFIX);
         info.extend_from_slice(peer_node_id);
 
-        let mut key_bytes = [0u8; 32];
-        hk.expand(&info, &mut key_bytes)
-            .expect("HKDF-SHA256 32-byte expand cannot fail (length < 8160)");
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-        key_bytes.zeroize();
-        Self { cipher }
+        let mut okm = [0u8; 64];
+        hk.expand(&info, &mut okm)
+            .expect("HKDF-SHA256 64-byte expand cannot fail (length < 8160)");
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&okm[..32]));
+        let mut counter_mask_key = [0u8; 32];
+        counter_mask_key.copy_from_slice(&okm[32..]);
+        okm.zeroize();
+        Self {
+            cipher,
+            counter_mask_key,
+        }
     }
+}
+
+/// Derive the 8-byte per-datagram counter mask from the counter-mask key and
+/// the (plaintext) random nonce-prefix. Deterministic on both sides — the
+/// receiver re-derives it from the same key + the prefix it reads off the wire
+/// — but uniformly random to an observer without the key, so the masked wire
+/// counter leaks no monotonic structure. (audit cycle-8 H9.)
+fn counter_mask(mask_key: &[u8; 32], prefix: &[u8; NONCE_PREFIX_LEN]) -> [u8; COUNTER_LEN] {
+    // HKDF-Expand keyed by `mask_key`, salted by the prefix — one HMAC-SHA256
+    // pass; negligible for the low-rate discovery/NAT-probe traffic this carries.
+    let hk = Hkdf::<Sha256>::new(Some(prefix), mask_key);
+    let mut mask = [0u8; COUNTER_LEN];
+    hk.expand(b"veil-udp-obfs:ctr-mask", &mut mask)
+        .expect("HKDF-SHA256 8-byte expand cannot fail");
+    mask
 }
 
 // ── Wire format helpers ──────────────────────────────────────────────────────
@@ -250,9 +286,18 @@ pub fn seal_datagram(key: &ObfsKey, counter: u64, payload: &[u8]) -> Result<Vec<
         )
         .map_err(|_| ObfsError::AeadFailure)?;
 
+    // Mask the wire counter field so it is uniformly random on the wire. The
+    // AEAD nonce above uses the TRUE counter; only the on-wire bytes are masked.
+    // (audit cycle-8 H9.)
+    let mask = counter_mask(&key.counter_mask_key, &prefix);
+    let mut masked_counter = counter.to_be_bytes();
+    for (b, m) in masked_counter.iter_mut().zip(mask.iter()) {
+        *b ^= *m;
+    }
+
     let mut out = Vec::with_capacity(WIRE_OVERHEAD + ciphertext.len());
     out.extend_from_slice(&prefix);
-    out.extend_from_slice(&counter.to_be_bytes());
+    out.extend_from_slice(&masked_counter);
     out.extend_from_slice(&ciphertext);
     Ok(out)
 }
@@ -261,7 +306,7 @@ pub fn seal_datagram(key: &ObfsKey, counter: u64, payload: &[u8]) -> Result<Vec<
 ///
 /// Performs:
 /// 1. Length check (≥ `WIRE_OVERHEAD`).
-/// 2. Counter extraction (plaintext from wire).
+/// 2. Counter unmask (XOR the wire field with the re-derived per-datagram mask).
 /// 3. AEAD verify + decrypt with the derived nonce.
 /// 4. Pad-length validation and trimming.
 ///
@@ -275,11 +320,18 @@ pub fn open_datagram(key: &ObfsKey, wire: &[u8]) -> Result<(u64, Vec<u8>), ObfsE
     }
     let mut prefix = [0u8; NONCE_PREFIX_LEN];
     prefix.copy_from_slice(&wire[..NONCE_PREFIX_LEN]);
-    let counter = u64::from_be_bytes(
-        wire[NONCE_PREFIX_LEN..NONCE_PREFIX_LEN + COUNTER_LEN]
-            .try_into()
-            .expect("checked length above"),
-    );
+    // Unmask the wire counter (audit cycle-8 H9): the sender XORed it with
+    // `counter_mask(key, prefix)`; re-derive the same mask and recover the true
+    // counter that feeds `build_nonce` and the replay window.
+    let mut counter_bytes: [u8; COUNTER_LEN] = wire
+        [NONCE_PREFIX_LEN..NONCE_PREFIX_LEN + COUNTER_LEN]
+        .try_into()
+        .expect("checked length above");
+    let mask = counter_mask(&key.counter_mask_key, &prefix);
+    for (b, m) in counter_bytes.iter_mut().zip(mask.iter()) {
+        *b ^= *m;
+    }
+    let counter = u64::from_be_bytes(counter_bytes);
     let nonce_bytes = build_nonce(&prefix, counter);
     let ciphertext = &wire[NONCE_PREFIX_LEN + COUNTER_LEN..];
 
@@ -556,6 +608,41 @@ mod tests {
         let (counter, opened) = open_datagram(&key, &wire).unwrap();
         assert_eq!(counter, 1);
         assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn cycle8_h9_wire_counter_field_is_masked_not_plaintext() {
+        let key = ObfsKey::derive(TEST_PSK, &peer_a());
+        // A small counter would be `00 00 00 00 00 00 00 2A` in plaintext BE —
+        // an obvious monotonic structure. After masking the wire field must not
+        // equal that, yet open() must still recover the true counter.
+        let counter = 42u64;
+        let wire = seal_datagram(&key, counter, b"x").unwrap();
+        let wire_ctr = &wire[NONCE_PREFIX_LEN..NONCE_PREFIX_LEN + COUNTER_LEN];
+        assert_ne!(
+            wire_ctr,
+            &counter.to_be_bytes()[..],
+            "wire counter field must be masked, not plaintext BE"
+        );
+        let (got, _) = open_datagram(&key, &wire).unwrap();
+        assert_eq!(got, counter, "open must recover the true counter");
+    }
+
+    #[test]
+    fn cycle8_h9_same_counter_different_prefix_yields_different_wire_bytes() {
+        // The mask is keyed by the per-datagram random prefix, so sealing the
+        // SAME counter twice produces different wire counter fields — no
+        // monotonic/static structure leaks across datagrams.
+        let key = ObfsKey::derive(TEST_PSK, &peer_a());
+        let w1 = seal_datagram(&key, 7, b"a").unwrap();
+        let w2 = seal_datagram(&key, 7, b"a").unwrap();
+        let c1 = &w1[NONCE_PREFIX_LEN..NONCE_PREFIX_LEN + COUNTER_LEN];
+        let c2 = &w2[NONCE_PREFIX_LEN..NONCE_PREFIX_LEN + COUNTER_LEN];
+        // Prefixes differ (random) → masks differ → masked counters differ.
+        assert_ne!(c1, c2, "same counter must not produce identical wire bytes");
+        // Both still decrypt to counter 7.
+        assert_eq!(open_datagram(&key, &w1).unwrap().0, 7);
+        assert_eq!(open_datagram(&key, &w2).unwrap().0, 7);
     }
 
     #[test]
