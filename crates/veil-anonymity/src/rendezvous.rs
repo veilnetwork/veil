@@ -1698,6 +1698,47 @@ type RegistrationKey = ([u8; NODE_ID_LEN], [u8; AUTH_COOKIE_LEN]);
 
 struct RendezvousRegistryInner {
     cookies: std::collections::HashMap<RegistrationKey, RendezvousSubscriber>,
+    /// O(1) per-peer registration count, kept in lockstep with `cookies`
+    /// (audit cycle-10). The cycle-9 per-peer fairness cap counted a peer's
+    /// entries by scanning the WHOLE table (`cookies.keys().filter(..).count()`)
+    /// on EVERY register — an always-on O(n) under the registry mutex, n up to
+    /// `max_registrations` (10k default). This map makes that count O(1).
+    /// Invariant: `per_peer[p]` == number of keys `(p, _)` in `cookies`, and a
+    /// peer is absent from the map iff its count is 0. All mutations go through
+    /// `insert_cookie` / `remove_cookie` (or the two retain sweeps, which fix
+    /// the map up explicitly) so the two maps can never drift.
+    per_peer: std::collections::HashMap<[u8; NODE_ID_LEN], usize>,
+}
+
+impl RendezvousRegistryInner {
+    /// Insert or refresh a cookie, keeping `per_peer` in sync. A refresh
+    /// (key already present) leaves the count unchanged.
+    fn insert_cookie(&mut self, key: RegistrationKey, sub: RendezvousSubscriber) {
+        let peer = key.0;
+        if self.cookies.insert(key, sub).is_none() {
+            *self.per_peer.entry(peer).or_insert(0) += 1;
+        }
+    }
+
+    /// Remove a cookie, keeping `per_peer` in sync. Returns the removed
+    /// subscriber, if any.
+    fn remove_cookie(&mut self, key: &RegistrationKey) -> Option<RendezvousSubscriber> {
+        let removed = self.cookies.remove(key);
+        if removed.is_some()
+            && let Some(c) = self.per_peer.get_mut(&key.0)
+        {
+            *c -= 1;
+            if *c == 0 {
+                self.per_peer.remove(&key.0);
+            }
+        }
+        removed
+    }
+
+    /// O(1) count of live registrations for `peer`.
+    fn peer_count(&self, peer: &[u8; NODE_ID_LEN]) -> usize {
+        self.per_peer.get(peer).copied().unwrap_or(0)
+    }
 }
 
 /// Default cap on rendezvous registrations. 10k cookies × ~80 B per
@@ -1751,6 +1792,7 @@ impl RendezvousRegistry {
         Self {
             inner: std::sync::Mutex::new(RendezvousRegistryInner {
                 cookies: std::collections::HashMap::new(),
+                per_peer: std::collections::HashMap::new(),
             }),
             max_registrations,
         }
@@ -1792,7 +1834,7 @@ impl RendezvousRegistry {
                 return Err(RegistryError::PubkeyRotationNeedsFreshCookie);
             }
             // Same subscriber AND same x25519_pk — refresh the rest.
-            g.cookies.insert(key, subscriber);
+            g.insert_cookie(key, subscriber);
             return Ok(());
         }
         // Per-peer fairness cap (audit cycle-9): the cookie is caller-supplied,
@@ -1803,7 +1845,10 @@ impl RendezvousRegistry {
         // peer's footprint: at its own cap, evict THIS peer's oldest entry rather
         // than the global oldest, so a flood churns only the attacker's own slots.
         let peer = subscriber.peer_node_id;
-        let this_peer_count = g.cookies.keys().filter(|(p, _)| *p == peer).count();
+        // O(1) per-peer count (audit cycle-10). The oldest-own eviction below
+        // still scans the table, but only fires when this peer is AT its cap —
+        // a flood path, not every register.
+        let this_peer_count = g.peer_count(&peer);
         if this_peer_count >= MAX_COOKIES_PER_PEER
             && let Some(oldest_own) = g
                 .cookies
@@ -1812,7 +1857,7 @@ impl RendezvousRegistry {
                 .min_by_key(|(_, s)| s.registered_at_unix)
                 .map(|(k, _)| *k)
         {
-            g.cookies.remove(&oldest_own);
+            g.remove_cookie(&oldest_own);
         }
         if g.cookies.len() >= self.max_registrations {
             // At capacity: evict the oldest registration (smallest
@@ -1829,10 +1874,10 @@ impl RendezvousRegistry {
                 .min_by_key(|(_, s)| s.registered_at_unix)
                 .map(|(k, _)| *k)
             {
-                g.cookies.remove(&oldest_key);
+                g.remove_cookie(&oldest_key);
             }
         }
-        g.cookies.insert(key, subscriber);
+        g.insert_cookie(key, subscriber);
         Ok(())
     }
 
@@ -1849,7 +1894,7 @@ impl RendezvousRegistry {
     ) -> bool {
         let key: RegistrationKey = (*requesting_peer, *cookie);
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.cookies.remove(&key).is_some()
+        g.remove_cookie(&key).is_some()
     }
 
     /// Look up the subscriber that registered `cookie` under
@@ -1882,9 +1927,19 @@ impl RendezvousRegistry {
     pub fn evict_expired(&self, now_unix: u64, ttl_secs: u64) -> usize {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let cutoff = now_unix.saturating_sub(ttl_secs);
-        let before = g.cookies.len();
-        g.cookies.retain(|_, sub| sub.registered_at_unix >= cutoff);
-        before - g.cookies.len()
+        // Field-borrow both maps so the retain closure can decrement `per_peer`
+        // in lockstep with each removed cookie (audit cycle-10).
+        let RendezvousRegistryInner { cookies, per_peer } = &mut *g;
+        let before = cookies.len();
+        cookies.retain(|(p, _), sub| {
+            let keep = sub.registered_at_unix >= cutoff;
+            if !keep && let Some(c) = per_peer.get_mut(p) {
+                *c -= 1;
+            }
+            keep
+        });
+        per_peer.retain(|_, c| *c > 0);
+        before - cookies.len()
     }
 
     /// Remove every registration belonging to `peer_node_id` —
@@ -1894,6 +1949,8 @@ impl RendezvousRegistry {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let before = g.cookies.len();
         g.cookies.retain(|_, sub| &sub.peer_node_id != peer_node_id);
+        // All of this peer's entries are gone → its per-peer count is 0.
+        g.per_peer.remove(peer_node_id);
         before - g.cookies.len()
     }
 
@@ -3198,6 +3255,70 @@ mod tests {
             "attacker footprint must be capped, registry len = {}",
             reg.len()
         );
+    }
+
+    #[test]
+    fn cycle10_per_peer_count_stays_consistent_across_all_mutations() {
+        // audit cycle-10: the O(1) per_peer count map must stay in perfect
+        // lockstep with `cookies` across register / unregister / evict_expired /
+        // drop_subscriber, or the per-peer cap would mis-fire (false lockout or
+        // a bypass). Exercise every mutation path, then assert the invariant
+        // `per_peer[p] == #keys (p,_) in cookies` and that the map has no zero or
+        // stale peers.
+        let reg = RendezvousRegistry::with_capacity(10_000);
+        let cookie_of = |p: u8, i: u32| {
+            let mut c = [0u8; AUTH_COOKIE_LEN];
+            c[0] = p;
+            c[1..5].copy_from_slice(&i.to_le_bytes());
+            c
+        };
+        let sub = |p: u8, t: u64| RendezvousSubscriber {
+            peer_node_id: [p; NODE_ID_LEN],
+            receiver_x25519_pk: [0x01; X25519_PK_LEN],
+            registered_at_unix: t,
+        };
+        let assert_consistent = |reg: &RendezvousRegistry| {
+            let g = reg.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let mut recount: std::collections::HashMap<[u8; NODE_ID_LEN], usize> =
+                std::collections::HashMap::new();
+            for (p, _) in g.cookies.keys() {
+                *recount.entry(*p).or_insert(0) += 1;
+            }
+            assert_eq!(g.per_peer, recount, "per_peer must mirror cookies exactly");
+            assert!(
+                g.per_peer.values().all(|c| *c > 0),
+                "per_peer must never hold a zero-count peer",
+            );
+        };
+
+        // Peer A: flood past its cap (triggers own-oldest eviction). Peer B: a few.
+        for i in 0..(MAX_COOKIES_PER_PEER as u32 + 50) {
+            reg.register(cookie_of(0xAA, i), sub(0xAA, 1_700_000_000 + i as u64))
+                .unwrap();
+        }
+        for i in 0..5 {
+            reg.register(cookie_of(0xBB, i), sub(0xBB, 1_700_000_500 + i as u64))
+                .unwrap();
+        }
+        assert_consistent(&reg);
+
+        // Refresh an existing key (count must NOT change).
+        reg.register(cookie_of(0xBB, 0), sub(0xBB, 1_700_000_999))
+            .unwrap();
+        assert_consistent(&reg);
+
+        // Unregister one of B's.
+        reg.unregister(&cookie_of(0xBB, 1), &[0xBBu8; NODE_ID_LEN]);
+        assert_consistent(&reg);
+
+        // Expire everything older than a cutoff that catches all of A but not B.
+        reg.evict_expired(1_700_000_600, 0);
+        assert_consistent(&reg);
+
+        // Drop all of B.
+        reg.drop_subscriber(&[0xBBu8; NODE_ID_LEN]);
+        assert_consistent(&reg);
+        assert_eq!(reg.len(), 0, "all entries removed");
     }
 
     #[test]
