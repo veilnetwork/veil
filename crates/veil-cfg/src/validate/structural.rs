@@ -381,19 +381,48 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
 /// [`ValidationReport`]: super::report::ValidationReport
 /// [`ValidationReport::warnings`]: super::report::ValidationReport::warnings
 /// [`ValidationReport::is_valid`]: super::report::ValidationReport::is_valid
-pub const WARNING_RULES: &[ValidationRule] = &[ValidationRule {
-    code: "mailbox_push_unauth_wake_permitted",
-    key: "mailbox.push.require_wake_hmac",
-    message: "push relay is enabled (FCM/APNs credentials set) with require_wake_hmac = false — the relay falls back to UNauthenticated wake-only pushes for receivers that have not uploaded a wake-HMAC envelope, which anyone who learns a push token (or can trigger a mailbox PUT) can forge to drain a device's battery or probe presence. This is the backward-compatible default; set it true in production once your client fleet onboards wake-HMAC keys",
-    check: mailbox_push_unauth_wake_permitted,
-    fix: None,
-}];
+pub const WARNING_RULES: &[ValidationRule] = &[
+    ValidationRule {
+        code: "mailbox_push_unauth_wake_permitted",
+        key: "mailbox.push.require_wake_hmac",
+        message: "push relay is enabled (FCM/APNs credentials set) with require_wake_hmac = false — the relay falls back to UNauthenticated wake-only pushes for receivers that have not uploaded a wake-HMAC envelope, which anyone who learns a push token (or can trigger a mailbox PUT) can forge to drain a device's battery or probe presence. This is the backward-compatible default; set it true in production once your client fleet onboards wake-HMAC keys",
+        check: mailbox_push_unauth_wake_permitted,
+        fix: None,
+    },
+    ValidationRule {
+        code: "mailbox_capability_token_not_required",
+        key: "mailbox.require_capability_token",
+        message: "mailbox is enabled with require_capability_token = false — any authenticated peer can deposit blobs for any receiver up to the per-sender/global quota, an occupancy/spam/wake-noise vector. This is the backward-compatible default; set it true in production once your client fleet issues capability tokens",
+        check: mailbox_capability_token_not_required,
+        fix: None,
+    },
+    ValidationRule {
+        code: "dht_unsigned_store_permitted",
+        key: "dht.allow_unsigned_store",
+        message: "dht.allow_unsigned_store = true — the node accepts UNSIGNED DHT STOREs, so any reachable peer can write/overwrite values under arbitrary keys (cache poisoning of identity/name/rendezvous records). This is OFF by default; only enable it for a closed test network, never on a node exposed to untrusted peers",
+        check: dht_unsigned_store_permitted,
+        fix: None,
+    },
+];
 
 /// A push relay (FCM or APNs credentials configured) that still permits the
 /// legacy unauthenticated wake-only fallback.
 fn mailbox_push_unauth_wake_permitted(config: &Config) -> bool {
     let p = &config.mailbox.push;
     (p.fcm_enabled() || p.apns_enabled()) && !p.require_wake_hmac
+}
+
+/// Mailbox enabled but accepting deposits without a capability token (audit
+/// cycle-10, report-2 C). Bounded by quota/rate-limit but still an occupancy
+/// and presence-noise surface.
+fn mailbox_capability_token_not_required(config: &Config) -> bool {
+    config.mailbox.enabled && !config.mailbox.require_capability_token
+}
+
+/// DHT accepting unsigned STOREs (audit cycle-10, report-2 E) — a record-
+/// poisoning surface that must never be on for an internet-facing node.
+fn dht_unsigned_store_permitted(config: &Config) -> bool {
+    config.dht.allow_unsigned_store
 }
 
 pub fn collect_issues(config: &Config) -> Vec<ValidationIssue> {
