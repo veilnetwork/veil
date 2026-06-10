@@ -1,14 +1,27 @@
 //! Per-sender-local anonymity-relay reputation slice (Epic 482.3 / 482.4).
 //!
-//! **Wiring status (audit cycle-3):** implemented and unit-tested, but NOT yet
-//! wired into the production circuit builder — `sender.rs` still selects hops
-//! via [`crate::circuit_builder::pick_circuit_hops_latency_aware_with_diversity`]
-//! (no reputation term). Activating it (route `sender.rs` through
-//! [`crate::circuit_builder::pick_circuit_hops_latency_aware_with_diversity_and_reputation`]
-//! fed by this module's own [`RelayReputation::record_failure`] signals) is the
-//! remaining work of Epic 482.3/482.4. Until then it is exercised only by tests — a
-//! deliberate deferral (changing anonymity hop-selection scoring is feature
-//! work, not an audit fix), not dead code.
+//! **Wiring status (Epic 482.3/482.4 Phase A — wired):** the production sender
+//! now selects hops via
+//! [`crate::sender::build_outbound_anonymous_cell_with_diversity_reported_and_reputation`]
+//! → [`crate::circuit_builder::pick_circuit_hops_latency_aware_with_diversity_and_reputation`],
+//! feeding this ledger's [`RelayReputation::rtt_penalty_ms`] into the latency
+//! score so failed relays sort behind alternatives. The runtime owns one
+//! `Arc<RelayReputation>` (in `AnonymityState`) and records failures from TWO
+//! signals:
+//!
+//! - **first-hop send failure** — an anonymity send whose chosen first hop has
+//!   no live session (`session_tx_registry.send_to` returns `false`); recorded
+//!   in `NodeServices::send_anonymous` / `send_via_rendezvous`.
+//! - **relayed delivery timeout** — an acked delivery that exhausts all
+//!   retransmits, attributed to its `next_hop` ONLY when `next_hop !=
+//!   dst_node_id` (so a direct send to an offline destination is not blamed on
+//!   a relay); recorded in the pending-ack tick (`spawn_pending_ack_tick`).
+//!
+//! Not covered (deferred): a relay that ADMITS a circuit build then silently
+//! drops/stalls cells MID-STREAM. The anonymity send is intentionally
+//! fire-and-forget with no return-ack (a return path would deanonymise the
+//! sender), so there is no leak-free inline signal for it — catching it needs a
+//! dedicated anonymity ack-protocol with its own deanonymisation trade-offs.
 //!
 //! Anonymity relays advertise `advertised_bps` in [`crate::directory::
 //! RelayDirectoryEntry`] which is operator-self-reported and unverifiable

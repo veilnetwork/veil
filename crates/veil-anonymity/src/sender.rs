@@ -63,7 +63,7 @@
 use super::cell::CELL_SIZE;
 use super::circuit::Hop;
 use super::circuit_builder::{
-    pick_circuit_hops_latency_aware, pick_circuit_hops_latency_aware_with_diversity,
+    pick_circuit_hops_latency_aware, pick_circuit_hops_latency_aware_with_diversity_and_reputation,
 };
 use super::directory::DiscoveredRelay;
 use super::packet::{MAX_HOPS_PER_CELL, PacketError, build_anonymous_cell, max_payload_for_hops};
@@ -207,6 +207,10 @@ where
 /// actually satisfied or silently degraded to latency-only selection — so the
 /// caller (which has logging/metrics) can make a loss of AS-correlation
 /// protection observable instead of silent. (audit cycle-8 F4.)
+///
+/// Relay reputation is NOT consulted (the penalty is always 0); production
+/// senders that want misbehaving-relay downweighting use
+/// [`build_outbound_anonymous_cell_with_diversity_reported_and_reputation`].
 pub fn build_outbound_anonymous_cell_with_diversity_reported<F, K>(
     payload: &[u8],
     discovered_candidates: &[DiscoveredRelay],
@@ -219,6 +223,42 @@ pub fn build_outbound_anonymous_cell_with_diversity_reported<F, K>(
 where
     F: Fn(&[u8; 32]) -> Option<u32>,
     K: Fn(&[u8; 32]) -> Option<String>,
+{
+    build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
+        payload,
+        discovered_candidates,
+        rtt_estimator,
+        diversity_key_of,
+        |_| 0, // no reputation penalty
+        target_node_id,
+        target_x25519_pk,
+        hop_count,
+    )
+}
+
+/// Like [`build_outbound_anonymous_cell_with_diversity_reported`] but feeds a
+/// per-relay reputation penalty (ms added to each candidate's effective RTT)
+/// into hop selection, so relays with recorded failures sort behind viable
+/// alternatives (Epic 482.3/482.4 Phase A wire-up — closes the gap noted in
+/// `crate::relay_reputation`'s module doc). The penalty applies on the primary
+/// AS-diverse selection path; the rare degraded latency-only fallback (no
+/// AS-diverse set exists) stays reputation-unaware so a partial-protection
+/// circuit still builds.
+#[allow(clippy::too_many_arguments)]
+pub fn build_outbound_anonymous_cell_with_diversity_reported_and_reputation<F, K, P>(
+    payload: &[u8],
+    discovered_candidates: &[DiscoveredRelay],
+    rtt_estimator: F,
+    diversity_key_of: K,
+    reputation_penalty_ms: P,
+    target_node_id: [u8; 32],
+    target_x25519_pk: [u8; 32],
+    hop_count: usize,
+) -> Result<(OutboundAnonymousCell, DiversityOutcome), SenderError>
+where
+    F: Fn(&[u8; 32]) -> Option<u32>,
+    K: Fn(&[u8; 32]) -> Option<String>,
+    P: Fn(&[u8; 32]) -> u32,
 {
     // A 1-hop circuit has no relay hops to diversify, so it is trivially "full".
     let mut diversity_outcome = DiversityOutcome::Full;
@@ -278,11 +318,12 @@ where
         // the same /16, or the extractor returns None for everyone).
         // This keeps a partial-AS-protection circuit working when a
         // strict-diversity circuit would fail outright.
-        let (picked, outcome) = match pick_circuit_hops_latency_aware_with_diversity(
+        let (picked, outcome) = match pick_circuit_hops_latency_aware_with_diversity_and_reputation(
             &pool,
             n_relays,
             &rtt_estimator,
             &diversity_key_of,
+            &reputation_penalty_ms,
         ) {
             Some(p) => (p, DiversityOutcome::Full),
             None => (
@@ -377,6 +418,60 @@ mod tests {
             CellPeelResult::Final { payload } => assert_eq!(payload.as_slice(), b"direct send"),
             other => panic!("expected Final, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn epic482_3_reputation_penalty_downweights_misbehaving_relay() {
+        // Two relays with IDENTICAL RTT. A reputation penalty on one must push
+        // it behind the other so the clean relay is chosen as the (single)
+        // circuit hop — the wire-up that activates RelayReputation in selection.
+        let (_sk_a, relay_a) = fresh_relay(0xAA);
+        let (_sk_b, relay_b) = fresh_relay(0xBB);
+        let (_t_sk, target_pk) = fresh_keypair();
+        let target_id = [0xCC; 32];
+        let a_id = relay_a.hop.node_id;
+        let b_id = relay_b.hop.node_id;
+        let pool = vec![relay_a, relay_b];
+
+        let equal_rtt = |_: &[u8; 32]| Some(50u32);
+        let no_diversity = |_: &[u8; 32]| None;
+
+        // Baseline: no penalty → stable sort keeps pool order → A (first) wins.
+        let ((first_hop_baseline, _), _) =
+            build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
+                b"p",
+                &pool,
+                equal_rtt,
+                no_diversity,
+                |_| 0,
+                target_id,
+                target_pk,
+                2,
+            )
+            .expect("baseline circuit builds");
+        assert_eq!(
+            first_hop_baseline, a_id,
+            "baseline: A is picked (equal RTT, pool order)"
+        );
+
+        // Penalize A heavily → B must now be chosen instead.
+        let penalize_a = move |nid: &[u8; 32]| if *nid == a_id { 100_000 } else { 0 };
+        let ((first_hop_penalized, _), _) =
+            build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
+                b"p",
+                &pool,
+                equal_rtt,
+                no_diversity,
+                penalize_a,
+                target_id,
+                target_pk,
+                2,
+            )
+            .expect("penalized circuit still builds");
+        assert_eq!(
+            first_hop_penalized, b_id,
+            "a relay with a reputation penalty must be avoided in favour of a clean one",
+        );
     }
 
     #[test]
