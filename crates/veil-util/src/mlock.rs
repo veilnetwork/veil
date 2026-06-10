@@ -157,8 +157,17 @@ impl Drop for MlockedBytes {
         // cleanup); we don't have anywhere to surface them after a
         // Drop call, and leaving a page locked after the process exits
         // is benign (OS reclaims on process exit).
-        unsafe {
-            let _ = unlock_region(ptr.cast(), len);
+        //
+        // SKIP when `mlockall(MCL_CURRENT | MCL_FUTURE)` is active: `munlock`
+        // is page-granular and not refcounted, so unlocking this buffer's
+        // 4 KiB page would also unlock any co-resident secret sharing that
+        // page AND punch a swappable hole in the process-wide lock. Under
+        // mlockall the pages stay pinned for the process lifetime by design
+        // (audit cycle-8 H11).
+        if should_munlock_on_drop() {
+            unsafe {
+                let _ = unlock_region(ptr.cast(), len);
+            }
         }
         // Step 3 — take + drop the Box, releasing the heap allocation.
         unsafe {
@@ -202,6 +211,24 @@ unsafe fn lock_region(ptr: *const u8, len: usize) -> Result<(), MlockError> {
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 static MADVISE_DONTDUMP_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Set once `try_mlockall_current_future()` has locked the whole address space
+/// (`MCL_CURRENT | MCL_FUTURE`). When true, every page — current and future — is
+/// already pinned process-wide, so `MlockedBytes::drop` SKIPS its per-buffer
+/// `munlock`: `munlock` is page-granular and not refcounted, so unlocking one
+/// 32-byte buffer's page would (a) unlock any co-resident secret sharing that
+/// 4 KiB page and (b) punch a swappable hole in the `mlockall` lock. Skipping it
+/// keeps every secret pinned for the process lifetime (the intended model —
+/// `mlockall` is deliberately never undone). (audit cycle-8 H11.)
+static MLOCKALL_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `MlockedBytes::drop` should issue a per-buffer `munlock`. Returns
+/// `false` once `mlockall(MCL_FUTURE)` has pinned the whole address space — see
+/// [`MLOCKALL_ACTIVE`] for why per-buffer munlock is then a hole-punching
+/// liability. Factored out so the H11 invariant is unit-testable.
+fn should_munlock_on_drop() -> bool {
+    !MLOCKALL_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Linux `MADV_DONTDUMP` / BSD-family `MADV_NOCORE` advisory.  Best-effort
 /// — failures are non-fatal (the region remains mlocked).
@@ -395,6 +422,9 @@ pub fn try_mlockall_current_future() -> MlockallOutcome {
         // call; no Rust-side invariants to uphold.
         let rc = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
         if rc == 0 {
+            // Whole address space is now pinned; per-buffer munlock becomes a
+            // hole-punching liability — record so `MlockedBytes::drop` skips it.
+            MLOCKALL_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
             return MlockallOutcome::Locked;
         }
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -521,5 +551,37 @@ mod tests {
         assert_eq!(buf.as_slice()[0], 0);
         assert_eq!(buf.len(), 4096);
         drop(buf);
+    }
+
+    /// Audit cycle-8 H11 — once `mlockall(MCL_FUTURE)` has pinned the whole
+    /// address space, `MlockedBytes::drop` must NOT issue a per-buffer
+    /// `munlock`: page-granular, unrefcounted munlock would unlock any
+    /// co-resident secret on the same 4 KiB page and punch a swappable hole
+    /// in the process-wide lock. We drive the decision helper directly so the
+    /// invariant is deterministic regardless of platform / RLIMIT_MEMLOCK, and
+    /// save/restore the process-global flag so sibling tests are unaffected.
+    #[test]
+    fn drop_skips_munlock_under_mlockall() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let saved = MLOCKALL_ACTIVE.load(Relaxed);
+
+        MLOCKALL_ACTIVE.store(false, Relaxed);
+        assert!(
+            should_munlock_on_drop(),
+            "without mlockall, per-buffer munlock is the only unlock path"
+        );
+
+        MLOCKALL_ACTIVE.store(true, Relaxed);
+        assert!(
+            !should_munlock_on_drop(),
+            "under mlockall, per-buffer munlock must be skipped (H11)"
+        );
+        // A buffer dropped while the flag is set must still zero + free without
+        // panicking — only the munlock syscall is elided.
+        let buf = MlockedBytes::new(64).expect("64 B alloc fits under stock RLIMIT_MEMLOCK");
+        assert_eq!(buf.len(), 64);
+        drop(buf);
+
+        MLOCKALL_ACTIVE.store(saved, Relaxed);
     }
 }
