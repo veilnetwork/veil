@@ -2293,10 +2293,12 @@ impl NodeRuntime {
             .filter_map(|(i, relay)| {
                 let node_id =
                     veil_cfg::NodeId::from_public_key(relay.algo, &relay.public_key).ok()?;
-                // Synthetic peer_id in 0xD000_0000 range — avoids conflicts with:
-                // configured peers (small integers)
-                // bootstrap peers (0x8000_0000+).
-                let peer_id = veil_cfg::PeerId::new(0xD000_0000u32.wrapping_add(i as u32));
+                // Synthetic peer_id in the pinned-relay window (cycle-7 M3:
+                // disjoint from PEX / gateway-failover, which used to share
+                // 0xD000_0000). See `types::synthetic_peer_id`.
+                let peer_id = veil_cfg::PeerId::new(
+                    crate::types::synthetic_peer_id::PINNED_RELAY_BASE.wrapping_add(i as u32),
+                );
                 Some(PeerConfigEntry {
                     peer_id,
                     node_id,
@@ -2312,6 +2314,18 @@ impl NodeRuntime {
                 })
             })
             .collect();
+        // cycle-7 M2: register pinned relays in `state.peers` BEFORE spawning
+        // their connectors — every other `spawn_outbound_peers` caller does
+        // this. The connector itself dials from the captured `PeerConfigEntry`,
+        // so the connection worked without it, but the missing insert left
+        // pinned relays invisible to peer enumeration / admin status / any path
+        // that re-resolves a peer's config from `state.peers`.
+        {
+            let mut st = self.lock_state();
+            for entry in &entries {
+                st.peers.insert(entry.peer_id, entry.clone());
+            }
+        }
         let handles =
             crate::outbound_connector::spawn_outbound_peers(entries, &self.access(), shutdown_tx);
         lock_tasks(&self.tasks).peers.extend(handles);

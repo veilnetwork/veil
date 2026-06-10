@@ -280,9 +280,11 @@ impl NodeRuntime {
                             ),
                         );
                     }
-                    // 0x8800_0000 namespace — sits between DNS (0x8000_0000)
-                    // and the synthetic/gateway range (>= 0xC000_0000) so the
-                    // discovered-peer cache skips these too.
+                    // HTTPS_SEEDS_BASE namespace — sits between DNS and the
+                    // synthetic/gateway range (>= GATEWAY_SYNTHETIC) so the
+                    // discovered-peer cache skips these too. Distinct from
+                    // APP_ADDED_BASE (cycle-7 M3: the two used to collide on
+                    // 0x8800_0000); see `types::synthetic_peer_id`.
                     for (i, bp) in seeds
                         .iter()
                         .take(MAX_BOOTSTRAP_SEEDS_PER_SOURCE)
@@ -302,7 +304,10 @@ impl NodeRuntime {
                             &bp.transport,
                         ));
 
-                        let peer_id = PeerId::new(0x8800_0000u32.wrapping_add(i as u32));
+                        let peer_id = PeerId::new(
+                            crate::types::synthetic_peer_id::HTTPS_SEEDS_BASE
+                                .wrapping_add(i as u32),
+                        );
                         let entry = PeerConfigEntry {
                             peer_id,
                             node_id,
@@ -2003,6 +2008,18 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                 if let Err(e) = verify_rendezvous_ad(&ad) {
                     log::debug!(
                         "rendezvous-resolver: signature verify failed for receiver {} slot {idx}: {e}",
+                        hex_short(&receiver_id),
+                    );
+                    continue;
+                }
+                // Companion binding check: the ad served from receiver_id's
+                // DHT slot MUST name receiver_id. verify_rendezvous_ad already
+                // binds receiver_node_id↔issuer_pk, but this also rejects a
+                // valid-for-someone-else ad replicated into the wrong slot.
+                // Mirrors discover_relay_hops matching node_id to the fetch key.
+                if ad.receiver_node_id != receiver_id {
+                    log::debug!(
+                        "rendezvous-resolver: ad receiver_node_id mismatch for receiver {} slot {idx}",
                         hex_short(&receiver_id),
                     );
                     continue;

@@ -2,6 +2,42 @@ use std::{fmt, path::PathBuf, time::Instant};
 
 pub use veil_cfg::{ListenId, NodeId, NodeRole, PeerId};
 
+/// Central registry of synthetic `PeerId` (`u32`) namespace bases.
+///
+/// Every subsystem that mints peers NOT backed by a config-file entry
+/// allocates `BASE + i` from its own disjoint window. Before cycle-7 these
+/// bases were ad-hoc literals scattered across modules and several **collided**
+/// (`0xD000_0000` was claimed by pinned-relays, PEX, AND gateway-failover;
+/// `0x8800_0000` by app-added AND HTTPS seeds). When two allocators hit the
+/// same concrete id, the second `state.peers.insert` overwrites the first —
+/// orphaning one subsystem's connector and leaving two reconnect loops fighting
+/// over one map slot. Keeping the bases here, disjoint and named, is the single
+/// source of truth that prevents that drift.
+///
+/// `>= GATEWAY_SYNTHETIC` (`0xC000_0000`) classifies a peer-id as
+/// synthetic-gateway range (force-reconnect / mesh behaviour); gateway-class
+/// bases stay at or above it, non-gateway bases stay below.
+pub mod synthetic_peer_id {
+    /// DNS-seeded bootstrap peers.
+    pub const DNS_BASE: u32 = 0x8000_0000;
+    /// App-added bootstrap peers (`JoinBootstrapUri` IPC).
+    pub const APP_ADDED_BASE: u32 = 0x8800_0000;
+    /// HTTPS-fetched bootstrap seeds.
+    pub const HTTPS_SEEDS_BASE: u32 = 0x8900_0000;
+    /// Threshold at/above which a peer-id is treated as synthetic-gateway range.
+    pub const GATEWAY_SYNTHETIC: u32 = 0xC000_0000;
+    /// Mesh-beacon autodiscovered gateways.
+    pub const MESH_AUTODISCOVER_BASE: u32 = 0xC000_0000;
+    /// Configured pinned relays.
+    pub const PINNED_RELAY_BASE: u32 = 0xD000_0000;
+    /// PEX-introduced peers.
+    pub const PEX_BASE: u32 = 0xD100_0000;
+    /// Gateway-failover-initiated reconnects.
+    pub const GATEWAY_FAILOVER_BASE: u32 = 0xD200_0000;
+    /// Persistence-restored discovered peers.
+    pub const PERSISTENCE_BASE: u32 = 0xE000_0000;
+}
+
 /// 32-byte cryptographic node identifier (`BLAKE3(pubkey)` for Ed25519
 /// nodes, `BLAKE3(falcon_pubkey)` for PQ nodes).
 ///
@@ -206,4 +242,48 @@ pub struct NodeSummary {
     pub listens_configured: usize,
     pub listens_active: usize,
     pub sessions_active: usize,
+}
+
+#[cfg(test)]
+mod synthetic_peer_id_tests {
+    use super::synthetic_peer_id::*;
+
+    /// cycle-7 M3 regression: no two allocator bases may share a value, else
+    /// their `state.peers` inserts collide and orphan a connector.
+    #[test]
+    fn allocator_bases_are_pairwise_disjoint() {
+        let bases = [
+            ("DNS", DNS_BASE),
+            ("APP_ADDED", APP_ADDED_BASE),
+            ("HTTPS_SEEDS", HTTPS_SEEDS_BASE),
+            ("MESH_AUTODISCOVER", MESH_AUTODISCOVER_BASE),
+            ("PINNED_RELAY", PINNED_RELAY_BASE),
+            ("PEX", PEX_BASE),
+            ("GATEWAY_FAILOVER", GATEWAY_FAILOVER_BASE),
+            ("PERSISTENCE", PERSISTENCE_BASE),
+        ];
+        for (i, (na, a)) in bases.iter().enumerate() {
+            for (nb, b) in bases.iter().skip(i + 1) {
+                assert_ne!(a, b, "synthetic peer_id bases collide: {na} == {nb}");
+            }
+        }
+    }
+
+    /// The `>= GATEWAY_SYNTHETIC` threshold classifies a peer as
+    /// synthetic-gateway range; preserve which side of it each base sits on.
+    #[test]
+    fn gateway_class_threshold_preserved() {
+        for b in [DNS_BASE, APP_ADDED_BASE, HTTPS_SEEDS_BASE] {
+            assert!(b < GATEWAY_SYNTHETIC, "{b:#x} must be below the gateway threshold");
+        }
+        for b in [
+            MESH_AUTODISCOVER_BASE,
+            PINNED_RELAY_BASE,
+            PEX_BASE,
+            GATEWAY_FAILOVER_BASE,
+            PERSISTENCE_BASE,
+        ] {
+            assert!(b >= GATEWAY_SYNTHETIC, "{b:#x} must be at/above the gateway threshold");
+        }
+    }
 }

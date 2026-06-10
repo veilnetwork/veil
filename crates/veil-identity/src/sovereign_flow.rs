@@ -1460,10 +1460,6 @@ pub fn save_master_falcon_keypair(
     falcon_sk_bytes: &[u8],
     falcon_pk_bytes: &[u8],
 ) -> std::io::Result<()> {
-    use std::fs;
-    use std::io::Write as _;
-    veil_util::create_dir_all_with_eacces_retry(veil_dir)?;
-
     let mut framed = Vec::with_capacity(
         MASTER_FALCON_MAGIC.len() + 1 + 4 + falcon_sk_bytes.len() + 4 + falcon_pk_bytes.len(),
     );
@@ -1484,22 +1480,10 @@ pub fn save_master_falcon_keypair(
         ));
     }
 
+    // cycle-7 MH3: hardened atomic write (O_EXCL + O_NOFOLLOW + 0o600 +
+    // fsync + parent-dir fsync) instead of the predictable-tmp + rename dance.
     let path = veil_dir.join(MASTER_FALCON_FILE);
-    let tmp = path.with_extension("tmp");
-    veil_util::with_eacces_retry(|| {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
-        f.write_all(&framed)?;
-        f.sync_all()?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
-    })
+    veil_util::atomic_write(&path, &framed)
 }
 
 /// parse the framed `master_falcon.bin` bundle into
@@ -1596,31 +1580,14 @@ pub fn save_identity_sk(
     veil_dir: &std::path::Path,
     seed: &SensitiveBytesN<32>,
 ) -> std::io::Result<()> {
-    use std::fs;
-    use std::io::Write as _;
-    veil_util::create_dir_all_with_eacces_retry(veil_dir)?;
+    // cycle-7 MH3: route private-key persistence through the hardened
+    // `atomic_write` (unpredictable getrandom tmp suffix + O_EXCL + O_NOFOLLOW
+    // + 0o600 + fsync + parent-dir fsync) instead of a hand-rolled predictable
+    // `path.with_extension("tmp")` + rename, which a local actor with write
+    // access to `veil_dir` could pre-empt with a symlink to redirect the SK
+    // write, and which skipped the parent-dir fsync (crash-window key loss).
     let path = veil_dir.join(DEVICE_IDENTITY_SK_FILE);
-    let tmp = path.with_extension("tmp");
-    veil_util::with_eacces_retry(|| {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
-        f.write_all(seed.as_slice())?;
-        f.sync_all()?;
-        Ok(())
-    })?;
-    match fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    veil_util::atomic_write(&path, seed.as_slice())
 }
 
 /// Load the device's identity_sk seed from
@@ -1669,11 +1636,7 @@ pub fn save_identity_falcon_keypair(
     sk_bytes: &Zeroizing<Vec<u8>>,
     pk_bytes: &[u8],
 ) -> std::io::Result<()> {
-    use std::fs;
-    use std::io::Write as _;
-    veil_util::create_dir_all_with_eacces_retry(veil_dir)?;
     let path = veil_dir.join(DEVICE_IDENTITY_FALCON_FILE);
-    let tmp = path.with_extension("tmp");
 
     // Build the file body in memory so we never write a partial header
     // to disk. The SK portion is held inside `Zeroizing<Vec<u8>>` so
@@ -1695,30 +1658,10 @@ pub fn save_identity_falcon_keypair(
     body.extend_from_slice(&pk_len.to_be_bytes());
     body.extend_from_slice(pk_bytes);
 
-    veil_util::with_eacces_retry(|| {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
-        f.write_all(&body[..])?;
-        f.sync_all()?;
-        Ok(())
-    })?;
-
-    // Atomic rename — this is the commit point. If it fails the tmp
-    // file is left behind; clean it up so the directory isn't littered
-    // with stale `.tmp` from previous failed saves.
-    match fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    // cycle-7 MH3: hardened atomic write (O_EXCL + O_NOFOLLOW + 0o600 +
+    // fsync + parent-dir fsync) — replaces the predictable-tmp + rename dance.
+    // The combined SK+PK body keeps the write atomic (no SK-without-PK window).
+    veil_util::atomic_write(&path, &body)
 }
 
 /// load a Falcon-512 keypair from the
@@ -1873,24 +1816,10 @@ pub fn save_device_sig_key_idx(
     veil_dir: &std::path::Path,
     sig_key_idx: u16,
 ) -> std::io::Result<()> {
-    use std::fs;
-    use std::io::Write as _;
-    veil_util::create_dir_all_with_eacces_retry(veil_dir)?;
+    // cycle-7 MH3: hardened atomic write (the previous path used a bare
+    // `File::create` with no 0o600 mode and a predictable tmp name).
     let path = veil_dir.join(DEVICE_SIG_KEY_IDX_FILE);
-    let tmp = path.with_extension("tmp");
-    veil_util::with_eacces_retry(|| {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&sig_key_idx.to_be_bytes())?;
-        f.sync_all()?;
-        Ok(())
-    })?;
-    match fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    veil_util::atomic_write(&path, &sig_key_idx.to_be_bytes())
 }
 
 /// Load the per-device `sig_key_idx` override. Returns `Ok(None)`

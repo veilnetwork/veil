@@ -835,7 +835,11 @@ pub unsafe extern "C" fn veil_send(
             unsafe {
                 write_err(err_out, format!("send failed: {s}"));
             }
-            if s == "app already closed" {
+            // `ClientError::Protocol` renders as "protocol error: {msg}", so an
+            // exact `==` never matched the closed sentinel and the signal
+            // silently degraded to VEIL_ERR. Use substring match, consistent
+            // with the stream-close paths (`.contains("stream already closed")`).
+            if s.contains("app already closed") {
                 VEIL_ERR_CLOSED
             } else {
                 VEIL_ERR

@@ -138,6 +138,21 @@ impl GatewayList {
         self.sort();
     }
 
+    /// Evict gateways not seen within `max_age` that have no active session.
+    ///
+    /// cycle-7 MH4d: `upsert` only ever grew `entries`, so a node (or attacker)
+    /// rotating beacon `node_id`s drove slow unbounded heap growth plus rising
+    /// per-`upsert` sort cost. Entries with a live session
+    /// (`stable_since.is_some()`) are kept regardless of age so we never evict a
+    /// gateway we are actively using. Returns the number of entries removed.
+    pub fn prune_stale(&mut self, max_age: Duration) -> usize {
+        let now = Instant::now();
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| e.stable_since.is_some() || now.duration_since(e.last_seen) <= max_age);
+        before - self.entries.len()
+    }
+
     /// Mark `node_id`'s session as active (sets `stable_since` if not already
     /// set). Called when a session to this gateway is successfully established.
     pub fn mark_connected(&mut self, node_id: &[u8; 32]) {
@@ -412,6 +427,24 @@ mod tests {
             score,
             has_internet,
         )
+    }
+
+    /// cycle-7 MH4d: prune evicts idle gateways past the TTL but keeps any with
+    /// an active session, so GatewayList cannot grow without bound.
+    #[test]
+    fn prune_stale_evicts_unseen_keeps_connected_cycle7() {
+        let mut gl = GatewayList::new(false);
+        let (a, aa, asc, ai) = make_gw(0x0a, 10.0, true);
+        let (b, ba, bsc, bi) = make_gw(0x0b, 20.0, true);
+        gl.upsert(a, aa, asc, ai);
+        gl.upsert(b, ba, bsc, bi);
+        gl.mark_connected(&a); // A has an active session → must survive prune
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let removed = gl.prune_stale(std::time::Duration::from_nanos(1));
+        assert_eq!(removed, 1, "the idle gateway B must be evicted");
+        let ids: HashSet<_> = gl.entries().iter().map(|e| e.node_id).collect();
+        assert!(ids.contains(&a), "connected gateway A must be kept");
+        assert!(!ids.contains(&b), "idle stale gateway B must be removed");
     }
 
     #[test]

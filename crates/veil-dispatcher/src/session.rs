@@ -1,7 +1,7 @@
-use super::{DispatchResult, FrameDispatcher, encode_response};
+use super::{DispatchResult, FrameDispatcher};
 use veil_cfg::NodeId;
 use veil_proto::{
-    family::{FrameFamily, SessionMsg},
+    family::SessionMsg,
     header::FrameHeader,
     session::{AttachPayload, DetachPayload, KeepalivePayload, SleepAdvertisementPayload},
 };
@@ -55,13 +55,16 @@ impl FrameDispatcher {
                         ),
                     );
                 }
-                // Echo keepalive back
-                DispatchResult::Response(encode_response(
-                    header,
-                    FrameFamily::Session as u8,
-                    SessionMsg::Keepalive as u16,
-                    &payload.encode(),
-                ))
+                // Do NOT echo a Keepalive back (cycle-7 H8). The gateway-lease
+                // keepalive (epic 76.3) is a one-way lease renewal from the leaf
+                // to its host. Both ends run THIS handler, so echoing a Keepalive
+                // means the echo is itself handled-and-echoed — a permanent
+                // ping-pong that accrues one new loop per keepalive interval until
+                // the per-peer rate limiter starts dropping, which then
+                // collaterally throttles the peer's legitimate frames. Transport
+                // liveness is the separate Control/Keepalive → KeepaliveAck pair;
+                // this frame's only job is to renew the lease via handle_keepalive.
+                DispatchResult::NoResponse
             }
 
             SessionMsg::SleepAdvertisement => {

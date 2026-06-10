@@ -140,7 +140,12 @@ impl Default for DhtRuntimeConfig {
             // ≈400 MB worst-case (25_000 × MAX_DHT_VALUE_BYTES 16 KiB); kept
             // in sync with veil_cfg::DhtConfig::default_max_store_entries.
             max_store_entries: 25_000,
-            max_store_bytes: None,
+            // Mirror veil_cfg::DhtConfig::default_max_store_bytes (Some(400 MB)).
+            // Production wires this via `runtime_config_from`; keeping the cap
+            // here too means the public `KademliaService::new()` is byte-bounded
+            // by default rather than silently unbounded against its own docs.
+            // The cap is large enough that no unit test / bench trips it.
+            max_store_bytes: Some(400_000_000),
             per_origin_max_bytes: None,
             cold_store_path: None,
             shard_filtering: false,
