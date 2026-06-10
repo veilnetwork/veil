@@ -60,6 +60,23 @@ use crate::tun::Device;
 /// the default to stay under `MAX_FRAME_CIPHERTEXT_BYTES` (16 KiB).
 const EGRESS_FLUSH_BYTES_DEFAULT: usize = 14_000;
 
+/// Hard ceiling for a single solo-shipped packet's payload over obfs4.
+///
+/// Derived from `MAX_FRAME_CIPHERTEXT_BYTES = 16384` minus the worst-case
+/// obfs4 padding (1024), obfs4 hdr+tag (17), session AEAD tag (16),
+/// `FrameHeader` (24) and `AppSendPayload` header (72) — the same arithmetic
+/// as [`EGRESS_FLUSH_BYTES_DEFAULT`]'s rationale. A solo packet ABOVE this
+/// would make `wrap_frame` return `OversizedFrame`, exit the writer task and
+/// tear down the whole session; we drop just that packet instead. Operators
+/// should keep the tunnel MTU at or below this. (audit cycle-8 H10.)
+const MAX_OBFS4_SOLO_PAYLOAD_BYTES: usize = 15_231;
+
+// Compile-time invariant: the solo ceiling must stay strictly below the obfs4
+// frame ciphertext cap (`veil_obfs4::MAX_FRAME_CIPHERTEXT_BYTES = 16 * 1024`),
+// otherwise a solo packet at the ceiling could still trip OversizedFrame and
+// tear down the session the H10 guard exists to protect.
+const _: () = assert!(MAX_OBFS4_SOLO_PAYLOAD_BYTES < 16 * 1024);
+
 fn egress_flush_bytes() -> usize {
     std::env::var("OGATE_BATCH_BYTES")
         .ok()
@@ -492,6 +509,23 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                 // — send raw to keep wire frame under the obfs4
                                 // 16K ciphertext cap.  E26 behaviour for big pkts.
                                 if record_size + 2 /* batch header */ > egress_flush_bytes {
+                                    // Oversize guard (audit cycle-8 H10): a solo
+                                    // packet above the obfs4-safe payload ceiling
+                                    // would make `wrap_frame` return OversizedFrame,
+                                    // exit the writer task and tear down the WHOLE
+                                    // session. Drop just this packet — the peer's
+                                    // stack retransmits at a smaller PMTU. Operators
+                                    // should keep tunnel MTU ≤ this ceiling.
+                                    if pkt_len > MAX_OBFS4_SOLO_PAYLOAD_BYTES {
+                                        tracing::warn!(
+                                            peer = %hex::encode(peer_nid),
+                                            len = pkt_len,
+                                            ceiling = MAX_OBFS4_SOLO_PAYLOAD_BYTES,
+                                            "egress: dropping oversize solo packet (would exceed \
+                                             obfs4 frame ceiling and tear down the session)",
+                                        );
+                                        continue;
+                                    }
                                     // Flush any pending batch first to preserve
                                     // ordering relative to this big packet.
                                     if let Some(pb) = batches.peek_mut(&peer_nid)

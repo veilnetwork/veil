@@ -37,6 +37,35 @@ mod tests {
             .unwrap();
             assert!(score.zero_bits <= 256);
         }
+
+        #[test]
+        fn pow_score_matches_worker_path_for_hybrid() {
+            // audit cycle-8 H13 — pow_score (initial-score seed + verification)
+            // must agree byte-for-byte with the search-loop scorer
+            // (pow_score_raw via CachedSigningKey) for a hybrid algo, which signs
+            // Ed25519-ONLY. Before the fix pow_score signed the full
+            // [ed_sig][falcon_sig] and produced a different zero_bits, so a nonce
+            // the workers found was not verifiable via pow_score.
+            use crate::pow::score;
+            let algo = SignatureAlgorithm::Ed25519Falcon512Hybrid;
+            let kp = generate_keypair(algo);
+            let pk = Base64PublicKey::new(algo, kp.public_key.clone()).unwrap();
+            let sk = Base64PrivateKey::new(algo, kp.private_key.clone()).unwrap();
+            let nonce = Base64Nonce::zero();
+
+            let via_pow_score = pow_score(algo, &pk, &sk, &nonce).unwrap();
+
+            let pk_bytes = score::decode_pk_bytes(algo, &pk).unwrap();
+            let sk_bytes = score::decode_sk_bytes(algo, &sk).unwrap();
+            let signing_key = score::CachedSigningKey::from_private_key(algo, &sk_bytes).unwrap();
+            let nonce_bytes = score::decode_nonce(nonce.as_str()).unwrap();
+            let via_worker = score::pow_score_raw(&pk_bytes, &signing_key, &nonce_bytes).unwrap();
+
+            assert_eq!(
+                via_pow_score.zero_bits, via_worker.zero_bits,
+                "pow_score must equal the worker scorer for hybrid (H13)"
+            );
+        }
     }
 
     mod integration_pow {
