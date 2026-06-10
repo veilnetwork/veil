@@ -856,7 +856,8 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
         .map(|(j, chunk)| {
             let pair = std::str::from_utf8(chunk)
                 .map_err(|_| format!("non-ASCII hex at offset {}", j * 2))?;
-            u8::from_str_radix(pair, 16).map_err(|e| format!("invalid hex at offset {}: {e}", j * 2))
+            u8::from_str_radix(pair, 16)
+                .map_err(|e| format!("invalid hex at offset {}: {e}", j * 2))
         })
         .collect()
 }

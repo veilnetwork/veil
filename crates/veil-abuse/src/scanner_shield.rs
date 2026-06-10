@@ -213,8 +213,12 @@ mod tests {
         // audit cycle-8 F6 — these come from an already-connected legitimate
         // peer (post-handshake app frames), NOT a port scanner; they must not
         // trip the IP soft-ban despite containing "unsupported version".
-        assert!(!is_pre_protocol_garbage("name_claim: unsupported version 5"));
-        assert!(!is_pre_protocol_garbage("pair frame: unsupported version 3"));
+        assert!(!is_pre_protocol_garbage(
+            "name_claim: unsupported version 5"
+        ));
+        assert!(!is_pre_protocol_garbage(
+            "pair frame: unsupported version 3"
+        ));
         assert!(!is_pre_protocol_garbage(
             "instance_registry: unsupported version 2"
         ));
