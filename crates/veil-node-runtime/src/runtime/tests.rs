@@ -1386,7 +1386,9 @@ async fn rejected_handshake_does_not_leak_session_registry_crit6() {
     // path. After the fix the second session's entry is never inserted, so
     // session_registry stays at 1, not 2.
     let path = save_test_config("node-runtime-crit6", runtime_config_with_metrics()).unwrap();
-    let mut runtime = NodeRuntime::start(&path, true).await.expect("runtime starts");
+    let mut runtime = NodeRuntime::start(&path, true)
+        .await
+        .expect("runtime starts");
     let listen = runtime.listens().into_iter().next().expect("listen entry");
     let addr = listen.local_addr.as_ref().unwrap().clone();
 

@@ -400,7 +400,10 @@ pub async fn register_connection_session(
 
     // `pending_session_entry` is built during the handshake but inserted into
     // `session_registry` only after the accept gates pass (audit cycle-9 CRIT-6).
-    let (remote_identity, pending_session_entry): (RemoteHandshakeInfo, veil_session::SessionEntry) = {
+    let (remote_identity, pending_session_entry): (
+        RemoteHandshakeInfo,
+        veil_session::SessionEntry,
+    ) = {
         let role = runtime.dispatcher.role;
         let mlkem_ek_bytes: Vec<u8> = runtime.identity.mlkem_ek.as_ref().to_vec();
         let capture_tx = Arc::clone(&runtime.dispatcher.capture_tx);

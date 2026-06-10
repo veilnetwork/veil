@@ -715,7 +715,10 @@ mod tests {
         );
         assert_eq!(l.allowlist_node_ids, vec!["aa".to_owned(), "bb".to_owned()]);
         assert_eq!(l.group_label.as_deref(), Some("friends"));
-        assert_eq!(l.psk_file.as_deref(), Some(std::path::Path::new("/etc/veil/psk")));
+        assert_eq!(
+            l.psk_file.as_deref(),
+            Some(std::path::Path::new("/etc/veil/psk"))
+        );
         assert_eq!(
             reloaded.peers[0].algo,
             crate::SignatureAlgorithm::Falcon512,
