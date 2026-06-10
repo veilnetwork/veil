@@ -251,13 +251,21 @@ where
 
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
 
-    // Bridge in both directions concurrently.
-    // Using futures directly (not spawn) ensures the losing direction is cancelled
-    // when the winning direction closes, with no orphaned background tasks.
-    tokio::select! {
-        _ = tokio::io::copy(&mut veil_r, &mut tcp_w) => {}
-        _ = tokio::io::copy(&mut tcp_r, &mut veil_w) => {}
-    }
+    // Bridge bidirectionally, draining BOTH directions (audit cycle-8). The old
+    // `select!` cancelled the opposite `copy` the instant either direction
+    // finished, so a client that half-closes its request direction (HTTP/1.0,
+    // SMTP, line protocols) truncated the server's response mid-flight. Mirror
+    // oproxy's bridge: `join!` each direction's copy + a `shutdown` of its write
+    // half so a one-way EOF propagates without cancelling the other half.
+    let up = async {
+        let _ = tokio::io::copy(&mut veil_r, &mut tcp_w).await;
+        let _ = tcp_w.shutdown().await;
+    };
+    let down = async {
+        let _ = tokio::io::copy(&mut tcp_r, &mut veil_w).await;
+        let _ = veil_w.shutdown().await;
+    };
+    tokio::join!(up, down);
 
     Ok(())
 }
