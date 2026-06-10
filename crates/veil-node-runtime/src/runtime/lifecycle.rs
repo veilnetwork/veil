@@ -293,11 +293,28 @@ impl NodeRuntime {
         Ok(())
     }
 
+    /// Dry-run the fallible reconstruction that `apply_reload_after_stop`
+    /// performs, so a bad config is rejected BEFORE any running task is torn
+    /// down (audit cycle-9 reload-zombie). apply_reload_after_stop runs
+    /// `context_from_config` (e.g. unreadable TLS cert) and
+    /// `HandshakeIdentity::from_config` (e.g. corrupt identity keypair) AFTER
+    /// `do_stop_tasks` has aborted every task and taken `shutdown_tx`. A failure
+    /// there leaves the node online-but-dead — zero tasks, `shutdown_tx == None`,
+    /// so every `spawn_*` early-returns and a retried reload can't recover
+    /// either — until a full process restart. Validating here keeps the running
+    /// node intact on a bad reload.
+    pub fn validate_reloadable_config(config: &veil_cfg::Config) -> Result<()> {
+        veil_cfg::require_identity(config)?; // identity section present
+        let _ = veil_cfg::transport_glue::context_from_config(config)?;
+        let _ = HandshakeIdentity::from_config(config)?;
+        Ok(())
+    }
+
     pub async fn reload(&mut self) -> Result<()> {
-        // validate config BEFORE stopping tasks. If the config
-        // file is invalid, return Err without disrupting the running node.
+        // validate config BEFORE stopping tasks. If the config is invalid or
+        // can't be fully reconstructed, return Err without disrupting the node.
         let config = veil_cfg::load_config(&self.config_path)?;
-        veil_cfg::require_identity(&config)?; // ensure identity section is present
+        Self::validate_reloadable_config(&config)?;
         let stop_ctx = self.take_stop_tasks_context();
         Self::do_stop_tasks(stop_ctx).await;
         self.apply_reload_after_stop(config).await
