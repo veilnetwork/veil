@@ -3940,6 +3940,84 @@ mod tests {
         net.stop().await;
     }
 
+    /// (cycle-10 regression): an ISOLATED / offline node must be able to
+    /// resolve its OWN `@name` with zero peers.
+    ///
+    /// The cycle-9 anti-sybil quorum gate over-corrected: it required ≥2
+    /// matching replicas for EVERY NameClaim resolve, including a node's own
+    /// self-published claim served from its local store. With no peers the
+    /// `dht_get_replicated` local fast-path returns the single self-replica,
+    /// which the quorum gate then rejected as a "single remote response" →
+    /// `QuorumDivergence{queried:1, required:2}`. The fix distinguishes replica
+    /// ORIGIN — a local self-published claim (node_id == ours) is authoritative
+    /// and skips quorum; remote names still require it.
+    ///
+    /// Single node, no `wire_full_mesh` → genuinely offline, so this scenario
+    /// is NOT subject to the E20 directional-dedup multi-node `#[ignore]`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cycle10_offline_self_name_resolves_without_quorum() {
+        use crate::proto::name_claim_v2::NameClaim;
+        use std::time::SystemTime;
+
+        let net = SimNetwork::builder()
+            .nodes(1)
+            .role(NodeRole::Core)
+            .sovereign_identities(true)
+            .name_claims(vec![Some("alice".into())])
+            .build()
+            .await;
+
+        // No mesh wiring: the node has zero peers (isolated/offline). Publish
+        // the sovereign identity document + NameClaim into the LOCAL store,
+        // matching the post-startup-publish state of a real node.
+        net.node(0)
+            .runtime
+            .debug_republish_sovereign_identity()
+            .await
+            .expect("re-publish into local DHT");
+
+        let alice_node_id = *net
+            .node(0)
+            .runtime
+            .sovereign_identity()
+            .expect("alice sov")
+            .node_id();
+
+        // Sanity: the node really has no sessions (offline).
+        assert_eq!(
+            net.node(0).runtime.sessions().len(),
+            0,
+            "scenario premise: node must be isolated (no peers)",
+        );
+        // Sanity: the self claim + doc are in the local store.
+        assert!(
+            net.node(0)
+                .runtime
+                .dht_get_local(&NameClaim::dht_key("alice"))
+                .is_some(),
+            "publisher must hold its own NameClaim locally",
+        );
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // The regression: this previously failed with QuorumDivergence.
+        let validated = net
+            .node(0)
+            .runtime
+            .resolve_name_verified("@alice", now, Duration::from_secs(2))
+            .await
+            .expect("offline self-name must resolve without remote quorum");
+        assert_eq!(
+            validated.node_id, alice_node_id,
+            "offline self-name must resolve to our own node_id",
+        );
+
+        net.stop().await;
+    }
+
     // ── quorum-aware resolve survives a sybil-served forgery ───────
 
     /// prove that a single sybil close to a victim's keyspace

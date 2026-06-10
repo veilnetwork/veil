@@ -4448,45 +4448,77 @@ impl NodeServices {
         let normalized =
             normalize_name(stripped).map_err(|e| ResolveError::InvalidName(e.to_string()))?;
         let claim_key = NameClaim::dht_key(&normalized);
-        // same quorum policy as `resolve_identity_verified`
-        // — N independent replicas, ≥2 matches required. A sybil
-        // close to the name's keyspace slot can't single-handedly
-        // serve a forged NameClaim binding `@alice → attacker_id`.
-        let claim_replicas = self
-            .dht_get_replicated(claim_key, RESOLVE_MAX_REPLICAS, timeout, |bytes| {
-                // Name authority is QUORUM, not self-signature: a self-consistent
-                // forged claim (@name -> attacker, signed by attacker) would pass
-                // any cryptographic self-check. So the local fast path is trusted
-                // ONLY for names WE published (claim.node_id == our id) — every
-                // other name must clear remote quorum below. Closes the
-                // cache-poison name-hijack while keeping offline self-resolution.
+        // A NameClaim binds a name to the SOVEREIGN node_id of the signer
+        // (`sign_name_claim` lives on `SovereignIdentity`), NOT the handshake /
+        // PoW `local_identity`. A legacy (node_id-keyed) node has no sovereign
+        // identity and never publishes a name, so it always falls through to
+        // remote quorum.
+        let our_sovereign_id = self
+            .identity
+            .sovereign_identity
+            .as_ref()
+            .map(|s| *s.node_id());
+        // A name WE published is locally authoritative and needs NO remote
+        // corroboration: quorum exists to stop a sybil forging a claim for
+        // SOMEONE ELSE's name, but a NameClaim can only bind a name to the
+        // sovereign node_id whose key signed it (re-verified by
+        // `verify_name_claim` below), so a self-published claim (node_id ==
+        // our sovereign id) is self-evidently ours. Resolve it straight from
+        // the local store so an isolated / offline / sparse-network node can
+        // always resolve its own @name.
+        //
+        // (cycle-10: the cycle-9 anti-sybil quorum gate over-corrected — the
+        // `dht_get_replicated` local fast path returned the self-published value
+        // as a single-element set, which then flowed into the ≥2 quorum check
+        // below and was rejected as a "single remote response". The cycle-9
+        // local-fast-path validator ALSO compared against `local_identity`, the
+        // wrong identity for a sovereign-signed claim, so the fast path never
+        // even fired for sovereign nodes. The fix distinguishes replica ORIGIN —
+        // local-self vs remote — and compares against the SOVEREIGN id. A
+        // poisoned local entry forging `@bob → our_sovereign_id` would resolve
+        // to OUR identity, not the attacker's, and `verify_name_claim` below
+        // rejects it unless the claim is signed by our key — which only we hold.)
+        let self_published = our_sovereign_id.and_then(|our_id| {
+            self.dht.get_local(&claim_key).filter(|bytes| {
                 matches!(NameClaim::decode(bytes), Ok(c)
-                    if c.name == normalized
-                        && c.node_id == *self.identity.local_identity.node_id.as_bytes())
+                    if c.name == normalized && c.node_id == our_id)
             })
-            .await;
-        // NameClaim is NON-self-certifying: a self-consistent forged claim
-        // (@name -> attacker, signed by attacker) passes any crypto self-check,
-        // so the remote quorum is the only defense. A name WE published already
-        // short-circuited via the local fast path above; reaching here means
-        // these are REMOTE replicas for someone else's name, so a single
-        // response must NOT be accepted → allow_single_replica = false.
-        // (audit cycle-9 — closes the single-remote-responder name hijack.)
-        let claim_bytes = pick_quorum_match(&claim_replicas, RESOLVE_QUORUM_THRESHOLD, false)
-            .ok_or_else(|| {
-                if claim_replicas.is_empty() {
-                    ResolveError::NameNotFound
-                } else {
-                    ResolveError::QuorumDivergence {
-                        queried: claim_replicas.len(),
-                        best: claim_replicas
-                            .iter()
-                            .filter(|r| **r == claim_replicas[0])
-                            .count(),
-                        required: RESOLVE_QUORUM_THRESHOLD,
+        });
+        let claim_bytes = if let Some(bytes) = self_published {
+            bytes
+        } else {
+            // Remote name: NameClaim is NON-self-certifying (a self-consistent
+            // forged claim @name -> attacker, signed by attacker, passes any
+            // crypto self-check), so remote quorum is the only defense and a
+            // single remote response must NOT be accepted → allow_single_replica
+            // = false. (audit cycle-9 — closes the single-remote-responder name
+            // hijack.) The local fast path inside `dht_get_replicated` is gated to
+            // our sovereign id, which is false (or absent) for a remote name, so
+            // it correctly falls through to the remote fan-out.
+            let claim_replicas = self
+                .dht_get_replicated(claim_key, RESOLVE_MAX_REPLICAS, timeout, |bytes| {
+                    matches!((our_sovereign_id, NameClaim::decode(bytes)),
+                        (Some(our_id), Ok(c))
+                            if c.name == normalized && c.node_id == our_id)
+                })
+                .await;
+            pick_quorum_match(&claim_replicas, RESOLVE_QUORUM_THRESHOLD, false).ok_or_else(
+                || {
+                    if claim_replicas.is_empty() {
+                        ResolveError::NameNotFound
+                    } else {
+                        ResolveError::QuorumDivergence {
+                            queried: claim_replicas.len(),
+                            best: claim_replicas
+                                .iter()
+                                .filter(|r| **r == claim_replicas[0])
+                                .count(),
+                            required: RESOLVE_QUORUM_THRESHOLD,
+                        }
                     }
-                }
-            })?;
+                },
+            )?
+        };
         // same cache-poisoning fix as identity resolve —
         // overwrite local with the quorum-winning bytes so a sybil's
         // first-arriving forgery doesn't linger in the local store.
