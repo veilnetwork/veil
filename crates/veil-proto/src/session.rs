@@ -1087,6 +1087,19 @@ pub fn decode_resume_nonce_from_attach(buf: &[u8]) -> Option<[u8; RESUME_NONCE_T
 
 /// Encode an `AttachPayload` with optional Vivaldi, battery, visibility scope
 /// and custom TTL TLV extensions.
+///
+/// **Deferred wire-half — DO NOT delete as "dead code".** This and the
+/// matching [`decode_visibility_scope_from_attach`] /
+/// [`decode_custom_ttl_from_attach`] are the OVL1 wire encode/decode side of
+/// the gateway attachment-visibility / custom-lease-TTL feature whose
+/// server-side policy is already built and shipped in `veil-gateway`
+/// (`attachment.rs::attach_with_scope`, `lease.rs` — which documents
+/// `custom_ttl_secs` as riding [`CUSTOM_TTL_TLV_TAG`]). The handshake does not
+/// yet emit these TLVs (only `encode_attach_with_tlvs`, the transports-only
+/// encoder, is wired), so they read as unused — but removing them would orphan
+/// the gateway's documented wire contract. Earlier audit flagged the tag
+/// collision (`VISIBILITY_SCOPE_TLV_TAG` was `0x0012`, now `0x0016`); that is
+/// resolved. (audit cycle-8 Этап-5.)
 pub fn encode_attach_full(
     payload: &AttachPayload,
     vivaldi: Option<(f64, f64, f64)>,
