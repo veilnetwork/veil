@@ -75,6 +75,13 @@ impl HotStandbyController {
     /// runs when that peer is revisited). (audit cycle-3.)
     const MAX_TRACKED_SWAP_PEERS: usize = 4096;
 
+    /// Cap on distinct peers tracked in `auto_alt_uris`. These entries carry no
+    /// TTL (a learned alt URI survives until a fresh handshake replaces it), so
+    /// a peer-enumeration churn would otherwise grow the map one entry per
+    /// distinct peer forever. At the cap a single arbitrary entry is evicted to
+    /// admit the freshly-learned one. (audit cycle-8.)
+    const MAX_AUTO_ALT_URIS: usize = 4096;
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         transport_registry: Arc<TransportRegistry>,
@@ -184,10 +191,17 @@ impl HotStandbyController {
             if !self.local_can_dial(&uri) {
                 continue;
             }
-            self.auto_alt_uris
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(*peer_id.as_bytes(), candidate.clone());
+            let key = *peer_id.as_bytes();
+            let mut map = self.auto_alt_uris.lock().unwrap_or_else(|p| p.into_inner());
+            // Bound memory under peer-enumeration churn: at the cap, evict an
+            // arbitrary existing entry so the freshly-learned URI still lands.
+            if map.len() >= Self::MAX_AUTO_ALT_URIS
+                && !map.contains_key(&key)
+                && let Some(victim) = map.keys().next().copied()
+            {
+                map.remove(&victim);
+            }
+            map.insert(key, candidate.clone());
             return Some(candidate.clone());
         }
         None

@@ -143,7 +143,7 @@ impl FrameDispatcher {
         let body_len = 32 + envelope_bytes.len() + suffix.len();
         let total_wire_len = veil_proto::header::HEADER_SIZE + body_len;
 
-        let reg_guard = wlock!(reg);
+        let reg_guard = rlock!(reg);
         for target in targets {
             // Split-horizon + self-loop filtering (mirrors the same
             // predicate relay_forward applies to route_cache hops).
@@ -767,7 +767,7 @@ impl FrameDispatcher {
         };
         let gw_node_id: Option<[u8; 32]> = {
             let active: std::collections::HashSet<[u8; 32]> = {
-                let r = wlock!(reg);
+                let r = rlock!(reg);
                 r.active_node_ids()
             };
             let gl_guard = lock!(gl);
@@ -808,7 +808,7 @@ impl FrameDispatcher {
         frame.extend_from_slice(&gw);
         frame.extend_from_slice(&envelope_bytes);
         frame.extend_from_slice(&gw_suffix);
-        wlock!(reg).send_to(&gw, TrafficClass::Interactive as u8, frame)
+        rlock!(reg).send_to(&gw, TrafficClass::Interactive as u8, frame)
     }
 
     /// DHT recursive-relay fallback: when neither route_cache nor a gateway
@@ -828,7 +828,7 @@ impl FrameDispatcher {
         let Some(reg) = &self.session_tx_registry else {
             return false;
         };
-        let reg_guard = wlock!(reg);
+        let reg_guard = rlock!(reg);
         for next in &closest {
             if next == peer_id.as_bytes() || *next == self.local_node_id {
                 continue;
@@ -856,7 +856,7 @@ impl FrameDispatcher {
                 let frame = veil_proto::codec::encode_frame(&rr_hdr, &rr_bytes);
                 drop(reg_guard);
                 let sent =
-                    wlock!(reg).send_to(next, veil_proto::header::priority::INTERACTIVE, frame);
+                    rlock!(reg).send_to(next, veil_proto::header::priority::INTERACTIVE, frame);
                 if let Some(m) = &self.metrics {
                     if !sent {
                         m.inc_send_to_failed();
@@ -955,7 +955,7 @@ impl FrameDispatcher {
             };
 
             // ── Acquire reg_guard only for the send window ────────────────────
-            let reg_guard = wlock!(reg);
+            let reg_guard = rlock!(reg);
 
             // Try direct session to recipient.
             let fwd_frame = make_fwd_frame(dst);
@@ -1193,7 +1193,7 @@ impl FrameDispatcher {
         let frame = veil_proto::codec::encode_frame(&hdr, &body);
 
         if let Some(reg) = &self.session_tx_registry {
-            let guard = wlock!(reg);
+            let guard = rlock!(reg);
             guard.send_to(&sender, veil_proto::header::priority::INTERACTIVE, frame);
         }
     }
@@ -1692,7 +1692,7 @@ impl FrameDispatcher {
         let frame = veil_proto::codec::encode_frame(&fwd_hdr, &fwd_bytes);
         // count transit-frame forward failures — previously
         // silently dropped, hiding link degradation.
-        let sent = wlock!(reg).send_to(&hop, veil_proto::header::priority::INTERACTIVE, frame);
+        let sent = rlock!(reg).send_to(&hop, veil_proto::header::priority::INTERACTIVE, frame);
         if !sent && let Some(m) = &self.metrics {
             m.inc_send_to_failed();
         }
@@ -1756,7 +1756,7 @@ impl FrameDispatcher {
 
         // (b) Direct-session forward: we already have a session to the dst.
         if let Some(reg) = &self.session_tx_registry
-            && wlock!(reg).get_sender(&rr.dst_node_id).is_some()
+            && rlock!(reg).get_sender(&rr.dst_node_id).is_some()
         {
             let mut fwd_hdr = veil_proto::header::FrameHeader::new(
                 veil_proto::family::FrameFamily::Delivery as u8,
@@ -1765,7 +1765,7 @@ impl FrameDispatcher {
             fwd_hdr.body_len = rr.payload.len() as u32;
             // single-allocation frame assembly.
             let frame = veil_proto::codec::encode_frame(&fwd_hdr, &rr.payload);
-            wlock!(reg).send_to(
+            rlock!(reg).send_to(
                 &rr.dst_node_id,
                 veil_proto::header::priority::INTERACTIVE,
                 frame,
@@ -1812,7 +1812,7 @@ impl FrameDispatcher {
             None => return false,
         };
         let closest = self.dht.find_closest_nodes(&rr.dst_node_id, 3);
-        let reg_guard = wlock!(reg);
+        let reg_guard = rlock!(reg);
         for next in &closest {
             // Split-horizon + self-loop guard.
             if next == peer_id.as_bytes() || *next == self.local_node_id {
@@ -1841,7 +1841,7 @@ impl FrameDispatcher {
             // single-allocation frame assembly.
             let frame = veil_proto::codec::encode_frame(&fwd_hdr, &fwd_bytes);
             drop(reg_guard);
-            wlock!(reg).send_to(next, veil_proto::header::priority::INTERACTIVE, frame);
+            rlock!(reg).send_to(next, veil_proto::header::priority::INTERACTIVE, frame);
             if let Some(m) = &self.metrics {
                 m.inc_recursive_relay_forwarded();
             }
