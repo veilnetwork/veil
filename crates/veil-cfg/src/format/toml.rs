@@ -356,71 +356,51 @@ fn set_ipc(document: &mut DocumentMut, ipc: &crate::IpcConfig) -> Result<()> {
 }
 
 fn set_peers(document: &mut DocumentMut, peers: &[crate::PeerConfig]) {
+    // Render via serde so EVERY `PeerConfig` field is preserved on save. The
+    // previous hand-maintained inline-table writer silently dropped `algo`
+    // (audit cycle-9 CRIT-2) — a Falcon/hybrid peer reloaded as ed25519, failing
+    // key-length/identity validation and becoming unreachable. The same
+    // field-drift class previously dropped advertise/relay. Mirroring
+    // `set_bootstrap_peers`'s serde render makes field coverage structural: a
+    // new model field can no longer be forgotten here.
+    document.remove("peers");
     if peers.is_empty() {
-        document.remove("peers");
         return;
     }
-
-    let mut array = toml_edit::Array::default();
-    for peer in peers {
-        let mut table = toml_edit::InlineTable::new();
-        table.insert("peer_id", Value::from(peer.peer_id.to_string()));
-        table.insert("public_key", Value::from(peer.public_key.as_str()));
-        table.insert("nonce", Value::from(peer.nonce.as_str()));
-        table.insert("transport", Value::from(peer.transport.as_str()));
-        if let Some(value) = peer.tls_cert.as_deref() {
-            table.insert("tls_cert", Value::from(value));
-        }
-        if let Some(value) = peer.tls_key.as_deref() {
-            table.insert("tls_key", Value::from(value));
-        }
-        if let Some(value) = peer.tls_ca_cert.as_deref() {
-            table.insert("tls_ca_cert", Value::from(value));
-        }
-        // stage (c): alt_uri for hot-standby auto-swap.
-        if let Some(value) = peer.alt_uri.as_deref() {
-            table.insert("alt_uri", Value::from(value));
-        }
-        array.push(Value::InlineTable(table));
+    #[derive(serde::Serialize)]
+    struct Wrapper<'a> {
+        peers: &'a [crate::PeerConfig],
     }
-    document["peers"] = Item::Value(Value::Array(array));
+    let rendered = toml::to_string_pretty(&Wrapper { peers }).unwrap_or_default();
+    let sub: DocumentMut = rendered.parse().unwrap_or_default();
+    if let Some(item) = sub.get("peers") {
+        document["peers"] = item.clone();
+    }
 }
 
 fn set_listens(document: &mut DocumentMut, listens: &[crate::ListenConfig]) {
+    // Render via serde so EVERY `ListenConfig` field is preserved on save. The
+    // previous hand-maintained inline-table writer dropped `visibility`,
+    // `psk_file`, `allowlist_node_ids`, `group_label`, `ephemeral` and
+    // `on_demand` (audit cycle-9 CRIT-1) — any save over an existing config
+    // (incl. daemon-initiated peer-nonce persistence) silently turned a
+    // stealth/hidden/trusted listener PUBLIC on the next load, binding the port
+    // and announcing it in PEX/DHT (defeating PoW-gated rendezvous) and dropping
+    // the allowlist accept-gate. The same drift earlier dropped advertise/relay.
+    // Serde render makes field coverage structural — see `set_peers`.
+    document.remove("listen");
     if listens.is_empty() {
-        document.remove("listen");
         return;
     }
-
-    let mut array = toml_edit::Array::default();
-    for listen in listens {
-        let mut table = toml_edit::InlineTable::new();
-        table.insert("id", Value::from(listen.id.to_string()));
-        table.insert("transport", Value::from(listen.transport.as_str()));
-        // `advertise` and `relay` are core PEX/RouteResponse fields —
-        // without them, peers behind a wildcard bind have no public URI to
-        // gossip and PEX walks return `peers=0` cluster-wide. Earlier
-        // versions of `set_listens` wrote only TLS material and silently
-        // dropped these on save (the CLI's `listen add --advertise` would
-        // succeed but the next config reload would not see the value).
-        if let Some(value) = listen.advertise.as_deref() {
-            table.insert("advertise", Value::from(value));
-        }
-        if let Some(value) = listen.relay.as_deref() {
-            table.insert("relay", Value::from(value));
-        }
-        if let Some(value) = listen.tls_cert.as_deref() {
-            table.insert("tls_cert", Value::from(value));
-        }
-        if let Some(value) = listen.tls_key.as_deref() {
-            table.insert("tls_key", Value::from(value));
-        }
-        if let Some(value) = listen.tls_ca_cert.as_deref() {
-            table.insert("tls_ca_cert", Value::from(value));
-        }
-        array.push(Value::InlineTable(table));
+    #[derive(serde::Serialize)]
+    struct Wrapper<'a> {
+        listen: &'a [crate::ListenConfig],
     }
-    document["listen"] = Item::Value(Value::Array(array));
+    let rendered = toml::to_string_pretty(&Wrapper { listen: listens }).unwrap_or_default();
+    let sub: DocumentMut = rendered.parse().unwrap_or_default();
+    if let Some(item) = sub.get("listen") {
+        document["listen"] = item.clone();
+    }
 }
 
 fn set_bootstrap_peers(document: &mut DocumentMut, peers: &[crate::BootstrapPeer]) {
@@ -677,8 +657,70 @@ mod tests {
         assert!(rendered.contains("admin_socket = \"unix:///tmp/veil.sock\""));
         assert!(rendered.contains("logs = \"file\""));
         assert!(rendered.contains("[metrics]"));
-        assert!(rendered.contains("peers = ["));
-        assert!(rendered.contains("listen = ["));
+        // peers/listen now render as array-of-tables via serde (cycle-9 CRIT-1/2
+        // field-preservation fix) rather than inline `peers = [{...}]`.
+        assert!(rendered.contains("[[peers]]"), "rendered: {rendered}");
+        assert!(rendered.contains("[[listen]]"), "rendered: {rendered}");
+        // Round-trips with all fields intact.
+        let reloaded = load_config(&rendered).expect("re-parses");
+        assert_eq!(reloaded.peers.len(), 1);
+        assert_eq!(reloaded.listen.len(), 1);
+    }
+
+    #[test]
+    fn cycle9_listen_and_peer_save_preserves_all_fields() {
+        // audit cycle-9 CRIT-1/CRIT-2: a save over an EXISTING config (incl. a
+        // daemon-initiated peer-nonce persist) must not drop listener
+        // visibility/allowlist/psk/group/ephemeral/on_demand (silent
+        // stealth→public downgrade) or peer `algo` (Falcon→ed25519 downgrade).
+        // This also re-parses the patched output, catching any array-of-tables
+        // placement corruption from the serde-render path.
+        let existing = "[global]\nruntime_flavor = \"multi_thread\"\n\
+             listen = [{ id = \"2\", transport = \"tcp://127.0.0.1:9001\" }]\n\
+             [identity]\nnonce = \"AAAAAA==\"\n";
+        let mut document = existing.parse::<DocumentMut>().unwrap();
+
+        let mut config = Config::default();
+        config.listen.push(crate::ListenConfig {
+            id: crate::ListenId::new(2),
+            transport: "tcp://127.0.0.1:9001".to_owned(),
+            visibility: crate::Visibility::Stealth,
+            group_label: Some("friends".to_owned()),
+            psk_file: Some(std::path::PathBuf::from("/etc/veil/psk")),
+            allowlist_node_ids: vec!["aa".to_owned(), "bb".to_owned()],
+            ..Default::default()
+        });
+        config.peers.push(crate::PeerConfig {
+            peer_id: crate::PeerId::new(1),
+            public_key: "pub".to_owned(),
+            nonce: "AAAAAA==".to_owned(),
+            transport: "tcp://127.0.0.1:9000".to_owned(),
+            algo: crate::SignatureAlgorithm::Falcon512,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            alt_uri: None,
+        });
+
+        update_document(&mut document, &config).unwrap();
+        let rendered = document.to_string();
+
+        // Re-parse the patched TOML (fails if array-of-tables placement broke it).
+        let reloaded = load_config(&rendered).expect("patched config must re-parse");
+        let l = &reloaded.listen[0];
+        assert_eq!(
+            l.visibility,
+            crate::Visibility::Stealth,
+            "visibility must survive save (CRIT-1)"
+        );
+        assert_eq!(l.allowlist_node_ids, vec!["aa".to_owned(), "bb".to_owned()]);
+        assert_eq!(l.group_label.as_deref(), Some("friends"));
+        assert_eq!(l.psk_file.as_deref(), Some(std::path::Path::new("/etc/veil/psk")));
+        assert_eq!(
+            reloaded.peers[0].algo,
+            crate::SignatureAlgorithm::Falcon512,
+            "peer algo must survive save (CRIT-2)"
+        );
     }
 
     #[test]
