@@ -1894,3 +1894,35 @@ async fn reload_with_unapplyable_config_does_not_zombie() {
     runtime.stop().await.expect("stop");
     let _ = fs::remove_file(&path);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn reload_with_malformed_peer_pubkey_does_not_zombie() {
+    // audit cycle-10: completes the cycle-9 reload-zombie guard. The LOCAL
+    // identity is valid (HandshakeIdentity::from_config passes), but a PEER's
+    // public_key is unparseable — caught only by build_state's per-peer
+    // NodeId::from_public_key, which the cycle-9 validate_reloadable_config did
+    // NOT dry-run. Without the build_state dry-run the reload would pass
+    // validation, tear down the tasks, then fail in apply_reload_after_stop →
+    // zombie. The node must stay intact instead.
+    let path = save_test_config("reload-zombie-peer", runtime_config_with_listen()).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.expect("start");
+    assert!(runtime.shutdown_tx.is_some(), "tasks running after start");
+
+    // Valid identity, malformed PEER public_key.
+    let mut bad = runtime_config_with_listen();
+    bad.peers[0].public_key = "!!!not-base64!!!".to_owned();
+    veil_cfg::save_config(&path, &bad).expect("write bad config");
+
+    let result = runtime.reload().await;
+    assert!(
+        result.is_err(),
+        "reload must reject a config with a malformed peer pubkey"
+    );
+    assert!(
+        runtime.shutdown_tx.is_some(),
+        "running node must stay intact (no zombie) on a bad peer pubkey reload"
+    );
+
+    runtime.stop().await.expect("stop");
+    let _ = fs::remove_file(&path);
+}

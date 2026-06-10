@@ -9,7 +9,7 @@ use tokio::{
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream as ServerTlsStream};
 use tokio_tungstenite::{
-    WebSocketStream, accept_hdr_async, client_async,
+    WebSocketStream, accept_hdr_async_with_config, client_async_with_config,
     tungstenite::{Message, client::IntoClientRequest, http},
 };
 
@@ -401,7 +401,15 @@ async fn accept_ws_connection(
     // SECURITY (audit 2026-05-29): bound the WS upgrade handshake.
     let ws_stream = tokio::time::timeout(
         WS_HANDSHAKE_TIMEOUT,
-        accept_hdr_async(stream, make_path_callback(path)),
+        // Cap incoming message/frame at 256 KiB (audit cycle-10): tungstenite's
+        // 64 MiB default let a post-upgrade peer amplify memory on this plain
+        // ws:// path the same way it could on webtunnel before the cycle-9 cap.
+        // OVL1 frames carried here are ≤ 16 KiB, so 256 KiB is generous headroom.
+        accept_hdr_async_with_config(
+            stream,
+            make_path_callback(path),
+            Some(veil_webtunnel::bounded_ws_config()),
+        ),
     )
     .await
     .map_err(|_| handshake_timeout(WS_HANDSHAKE_TIMEOUT))?
@@ -429,7 +437,13 @@ async fn accept_wss_connection(
     let path = listen_path(&bind_uri);
     let ws_stream = tokio::time::timeout(
         WS_HANDSHAKE_TIMEOUT,
-        accept_hdr_async(tls_stream, make_path_callback(path)),
+        // Cap incoming message/frame at 256 KiB (audit cycle-10) — see the
+        // plain ws:// accept above; the wss:// path shares the same risk.
+        accept_hdr_async_with_config(
+            tls_stream,
+            make_path_callback(path),
+            Some(veil_webtunnel::bounded_ws_config()),
+        ),
     )
     .await
     .map_err(|_| handshake_timeout(WS_HANDSHAKE_TIMEOUT))?
@@ -679,7 +693,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let request = ws_request(scheme, host, port, path, query)?;
-    let (ws_stream, _) = client_async(request, stream).await?;
+    // Cap incoming message/frame at 256 KiB (audit cycle-10): bound the client
+    // side too, so a malicious ws:// endpoint cannot amplify memory against an
+    // outbound dial via tungstenite's 64 MiB default.
+    let (ws_stream, _) =
+        client_async_with_config(request, stream, Some(veil_webtunnel::bounded_ws_config()))
+            .await?;
     Ok(ws_stream)
 }
 
