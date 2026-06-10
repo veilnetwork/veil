@@ -2010,7 +2010,8 @@ async fn handle_ipc_client(
                         .await?;
                     }
                     Ok(LocalAppMsg::OutboxAck) => {
-                        handle_outbox_ack(&mut wh, &body, outbox_backend.as_ref()).await?;
+                        handle_outbox_ack(&mut wh, &body, &mut client_state, outbox_backend.as_ref())
+                            .await?;
                     }
                     Ok(LocalAppMsg::LookupRendezvousReplicas) => {
                         handle_lookup_rendezvous_replicas(

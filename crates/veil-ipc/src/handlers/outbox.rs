@@ -99,10 +99,26 @@ pub(crate) async fn handle_outbox_find_missing(
 pub(crate) async fn handle_outbox_ack(
     wh: &mut IpcWriteHalf,
     body: &[u8],
+    client_state: &mut IpcClientState,
     outbox_backend: Option<&Arc<dyn OutboxBackend>>,
 ) -> std::io::Result<()> {
     // Idempotent — receiver confirms direct end-to-end ack, sender drops
     // the entry.
+    // audit cycle-8: per-client rate-limit, symmetric with the sibling
+    // `handle_mailbox_ack` / `handle_outbox_put` / `handle_outbox_find_missing`
+    // gates. `OutboxBackend::ack` is a lookup-and-remove store mutation under
+    // the outbox lock, so an ungated local process could spam OUTBOX_ACK frames
+    // to pin the lock / amplify CPU. On limit, reply the same no-op
+    // `removed=false` a miss yields (not a distinguishable oracle).
+    if !client_state.allow_query() {
+        return write_frame_wh(
+            wh,
+            FrameFamily::LocalApp as u8,
+            LocalAppMsg::OutboxAckOk as u16,
+            &[0u8],
+        )
+        .await;
+    }
     let Ok(req) = OutboxAckPayload::decode(body) else {
         return Ok(());
     };
