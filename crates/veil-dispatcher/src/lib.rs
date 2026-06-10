@@ -476,13 +476,20 @@ impl<K: Hash + Eq + Copy + Ord, V> ExpiryMap<K, V> {
         }
     }
 
-    /// Insert (caller guarantees one insert per key). Evicts the oldest entry in
-    /// O(log n) when at capacity.
+    /// Insert or update. Evicts the oldest entry in O(log n) when at capacity.
+    ///
+    /// Idempotent on the heap (audit cycle-9): re-inserting an existing key
+    /// refreshes the VALUE in place but does NOT push a second heap entry. A
+    /// duplicate heap entry would later be popped by `prune_expired` and evict
+    /// the still-live key early (the existing key's original expiry stands).
     pub fn insert(&mut self, key: K, value: V) {
         let now = Instant::now();
         self.prune_expired(now);
-        if !self.entries.contains_key(&key)
-            && self.entries.len() >= self.max_size
+        if let Some(slot) = self.entries.get_mut(&key) {
+            *slot = value; // in-place value update, no new heap entry
+            return;
+        }
+        if self.entries.len() >= self.max_size
             && let Some(Reverse(oldest)) = self.heap.pop()
         {
             self.entries.remove(&oldest.key);
@@ -4452,6 +4459,26 @@ mod tests {
         let mut expm: ExpiryMap<u32, u8> = ExpiryMap::new(Duration::ZERO, 16);
         expm.insert(7, 7);
         assert_eq!(expm.get(&7), None, "expired value must be dropped");
+    }
+
+    #[test]
+    fn expiry_map_reinsert_is_heap_idempotent_keeps_capacity() {
+        // audit cycle-9 F-A1: re-inserting an existing key must NOT push a second
+        // heap entry. A duplicate would later be popped as "oldest" and remove an
+        // already-gone key (a no-op), so the at-cap eviction fails to free a slot
+        // and the map grows past max_size.
+        let mut m: ExpiryMap<u32, u8> = ExpiryMap::new(Duration::from_secs(60), 2);
+        m.insert(1, 1);
+        m.insert(1, 9); // re-insert same key (value updated, no new heap entry)
+        assert_eq!(m.get(&1).copied(), Some(9), "re-insert updates the value");
+        m.insert(2, 2);
+        m.insert(3, 3); // at cap → evict oldest
+        m.insert(4, 4); // at cap → evict oldest
+        let live = [1u32, 2, 3, 4].iter().filter(|k| m.get(k).is_some()).count();
+        assert_eq!(
+            live, 2,
+            "map must stay within max_size=2 after a re-insert (was 3 with the duplicate-heap bug)"
+        );
     }
 
     // ── 104.4: capture_active fast-path — no event when flag is false ─────────
