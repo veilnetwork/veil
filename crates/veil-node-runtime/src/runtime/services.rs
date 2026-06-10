@@ -437,6 +437,10 @@ impl NodeRuntime {
         let (config, stop_ctx) = {
             let mut s = rt.lock().await;
             let config = veil_cfg::load_config(&s.config_path)?;
+            // Dry-run the fallible reconstruction BEFORE tearing down tasks
+            // (audit cycle-9 reload-zombie) — `?` returns here with the running
+            // node fully intact if the new config can't be applied.
+            Self::validate_reloadable_config(&config)?;
             let stop_ctx = s.take_stop_tasks_context();
             (config, stop_ctx)
         };
@@ -504,6 +508,11 @@ impl NodeRuntime {
                 veil_cfg::ConfigError::ValidationFailed(validation.format_issues()),
             ));
         }
+        // Structural `validate` does NOT exercise the fallible reconstruction
+        // (context_from_config / HandshakeIdentity::from_config); dry-run it here
+        // so a config that can't actually be applied is rejected BEFORE it is
+        // persisted or any task is torn down (audit cycle-9 reload-zombie).
+        Self::validate_reloadable_config(&config)?;
 
         // Phase 2 — optional persistence.  Done BEFORE the
         // stop-swap-restart cycle so a crash mid-cycle leaves either
