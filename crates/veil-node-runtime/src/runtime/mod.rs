@@ -3042,6 +3042,14 @@ impl NodeRuntime {
         payload_bytes.extend_from_slice(&deliver_bytes);
         let payload: &[u8] = &payload_bytes;
 
+        // W0 measurement (anonymity-preserving plan): time the SELECTION phase
+        // (candidate snapshot + relay discovery/verify + diversity map) vs the
+        // BUILD phase (pick + onion wrap) to decide whether selection dominates
+        // the per-send overhead (gates W2 selection-input caching). Local timing
+        // of our OWN send — nothing is transmitted, no peer correlation; emitted
+        // at debug level (off by default).
+        let t_select = std::time::Instant::now();
+
         // Step 1: snapshot candidates from local DHT routing table.
         // We could also pull from PEX-discovered peers or the live-
         // sessions registry, but routing table is the canonical
@@ -3108,6 +3116,8 @@ impl NodeRuntime {
         let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
         let reputation_penalty_ms =
             move |node_id: &[u8; 32]| -> u32 { relay_reputation.rtt_penalty_ms(*node_id) };
+        let select_us = t_select.elapsed().as_micros();
+        let t_build = std::time::Instant::now();
         let ((first_hop_node_id, cell), diversity) =
             build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
                 payload,
@@ -3119,6 +3129,17 @@ impl NodeRuntime {
                 target_x25519_pk,
                 hop_count,
             )?;
+        // W0 measurement: selection (candidate prep + discovery + diversity map)
+        // vs build (pick + onion wrap). The anonymity-preserving plan expects
+        // selection to dominate → justifies W2 selection-input caching.
+        log::debug!(
+            "anonymity.send.timing select_us={select_us} build_us={} \
+             payload={} hops={hop_count} candidates={} usable={}",
+            t_build.elapsed().as_micros(),
+            payload.len(),
+            candidate_node_ids.len(),
+            usable_relays.len(),
+        );
         if diversity == DiversityOutcome::DegradedToLatency {
             // AS-correlation protection was silently lost — surface it so an
             // operator can see when circuits aren't netblock-diverse. (cycle-8 F4.)
@@ -3321,6 +3342,8 @@ impl NodeRuntime {
 
         // Snapshot relay candidates (excluding rendezvous itself —
         // rendezvous is the Final-hop, not a middle-hop).
+        // W0 measurement: time selection vs build (see send_anonymous).
+        let t_select = std::time::Instant::now();
         let candidate_node_ids: Vec<[u8; 32]> = self
             .dht
             .routing_table_contacts()
@@ -3361,6 +3384,8 @@ impl NodeRuntime {
         let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
         let reputation_penalty_ms =
             move |node_id: &[u8; 32]| -> u32 { relay_reputation.rtt_penalty_ms(*node_id) };
+        let select_us = t_select.elapsed().as_micros();
+        let t_build = std::time::Instant::now();
         let ((first_hop_node_id, cell), diversity) =
             build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
                 &payload_bytes,
@@ -3372,6 +3397,15 @@ impl NodeRuntime {
                 rendezvous_relay.hop.pubkey,
                 hop_count,
             )?;
+        // W0 measurement (see send_anonymous).
+        log::debug!(
+            "anonymity.rendezvous.timing select_us={select_us} build_us={} \
+             payload={} hops={hop_count} candidates={} usable={}",
+            t_build.elapsed().as_micros(),
+            payload_bytes.len(),
+            candidate_node_ids.len(),
+            usable_relays.len(),
+        );
         if diversity == DiversityOutcome::DegradedToLatency {
             log::warn!(
                 "anonymity.rendezvous.diversity_degraded hop_count={hop_count} \
