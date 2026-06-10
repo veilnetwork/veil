@@ -20,9 +20,50 @@ use veil_proto::{
 };
 
 use crate::OutboxBackend;
+use crate::OutboxEntryOut;
 use crate::frame_io::write_frame_wh;
 use crate::server::IpcClientState;
 use crate::transport::IpcWriteHalf;
+
+/// Cumulative-byte budget for a single `OutboxFindMissing` response (audit
+/// cycle-10). Mirror of mailbox's `MAX_MAILBOX_FETCH_BYTES`: kept well under the
+/// IPC frame body cap `MAX_FRAME_BODY` (16 MiB) with room for per-entry framing.
+const MAX_OUTBOX_FIND_MISSING_BYTES: usize = 12 * 1024 * 1024;
+
+/// Select a prefix of `raw` bounded by BOTH `max_entries` and `max_bytes`
+/// (audit cycle-10). The structural twin of mailbox's `select_bounded_fetch_blobs`:
+/// the entry-count cap alone (`MAX_OUTBOX_FIND_MISSING_ENTRIES` × `MAX_MAILBOX_BLOB_BYTES`
+/// = 256 MiB) overran the 16 MiB frame body cap, so a receiver with >16 MiB of
+/// accumulated outbox entries got an unparseable frame on every peer-sync and
+/// could never synchronize. The first entry is ALWAYS emitted (a real blob is
+/// ≤ `MAX_MAILBOX_BLOB_BYTES` = 1 MiB, far under the budget) so the receiver
+/// always makes progress, acks the batch, then re-syncs the rest.
+fn select_bounded_outbox_entries(
+    raw: Vec<OutboxEntryOut>,
+    max_entries: usize,
+    max_bytes: usize,
+) -> Vec<OutboxEntryWire> {
+    let mut total_bytes = 0usize;
+    raw.into_iter()
+        .take(max_entries)
+        .take_while(|e| {
+            if total_bytes == 0 {
+                total_bytes = e.blob.len();
+                return true; // always emit at least one (guarantees progress)
+            }
+            if total_bytes + e.blob.len() > max_bytes {
+                return false; // stop before the frame body would exceed the cap
+            }
+            total_bytes += e.blob.len();
+            true
+        })
+        .map(|e| OutboxEntryWire {
+            content_id: e.content_id,
+            deposited_at: e.deposited_at,
+            blob: e.blob,
+        })
+        .collect()
+}
 
 pub(crate) async fn handle_outbox_put(
     wh: &mut IpcWriteHalf,
@@ -77,15 +118,14 @@ pub(crate) async fn handle_outbox_find_missing(
     let entries_raw = outbox_backend
         .and_then(|b| b.find_missing(req.receiver_id, req.since, req.bloom))
         .unwrap_or_default();
-    let entries: Vec<OutboxEntryWire> = entries_raw
-        .into_iter()
-        .take(MAX_OUTBOX_FIND_MISSING_ENTRIES)
-        .map(|e| OutboxEntryWire {
-            content_id: e.content_id,
-            deposited_at: e.deposited_at,
-            blob: e.blob,
-        })
-        .collect();
+    // Bound by BOTH entry count AND cumulative bytes: the count cap alone could
+    // produce a >16 MiB frame the receiver cannot parse, wedging peer-sync
+    // forever (audit cycle-10, mirror of the mailbox fetch fix).
+    let entries = select_bounded_outbox_entries(
+        entries_raw,
+        MAX_OUTBOX_FIND_MISSING_ENTRIES,
+        MAX_OUTBOX_FIND_MISSING_BYTES,
+    );
     let reply = OutboxFindMissingRespPayload { entries };
     write_frame_wh(
         wh,
@@ -132,4 +172,49 @@ pub(crate) async fn handle_outbox_ack(
         &[removed as u8],
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(n: usize) -> OutboxEntryOut {
+        OutboxEntryOut {
+            content_id: [0u8; 32],
+            deposited_at: 0,
+            blob: vec![0u8; n],
+        }
+    }
+
+    #[test]
+    fn find_missing_bounded_by_bytes_stays_under_budget_and_makes_progress() {
+        // 20×1 MiB entries, 12 MiB budget → take a prefix that fits, never empty,
+        // never the whole set (CRIT: previously a ~256 MiB frame, unparseable by
+        // the peer's MAX_FRAME_BODY=16 MiB decoder, wedging peer-sync forever).
+        let raw: Vec<_> = (0..20).map(|_| entry(1024 * 1024)).collect();
+        let out = select_bounded_outbox_entries(raw, 256, 12 * 1024 * 1024);
+        let total: usize = out.iter().map(|e| e.blob.len()).sum();
+        assert!(!out.is_empty(), "must make progress");
+        assert!(out.len() < 20, "bounded prefix, not the whole backlog");
+        assert!(
+            total <= 12 * 1024 * 1024,
+            "cumulative bytes stay within the budget, got {total}"
+        );
+    }
+
+    #[test]
+    fn find_missing_first_entry_always_returned_even_if_over_budget() {
+        // Progress guarantee: the first entry is emitted even if it alone exceeds
+        // the budget (real blobs are ≤ MAX_MAILBOX_BLOB_BYTES so this never bites,
+        // but it prevents a permanently-wedged peer-sync).
+        let out = select_bounded_outbox_entries(vec![entry(2_000_000)], 256, 1_000_000);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn find_missing_entry_count_cap_still_enforced() {
+        let raw: Vec<_> = (0..500).map(|_| entry(1)).collect();
+        let out = select_bounded_outbox_entries(raw, 256, 12 * 1024 * 1024);
+        assert_eq!(out.len(), 256, "entry-count cap holds when blobs are tiny");
+    }
 }
