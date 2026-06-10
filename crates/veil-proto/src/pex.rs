@@ -136,6 +136,20 @@ impl PexWalk {
         })
     }
 
+    /// The origin-signed portion of a walk frame: `walk_id ‖ target_node_id`.
+    ///
+    /// NOTE (audit cycle-9, deliberate): `origin_transport` / `origin_nonce` are
+    /// intentionally NOT covered. The walk is forwarded hop-by-hop, so an
+    /// intermediate relay CAN rewrite the advertised `origin_transport` and the
+    /// signature still verifies. This is bounded to a WASTED DIAL, not
+    /// route/identity poisoning: the learned address is bound to the origin's
+    /// PROVEN `origin_node_id` (authenticated via the signature over
+    /// `walk_id ‖ target` plus the `BLAKE3(pubkey)==node_id` binding), and when
+    /// that contact is dialed the OVL1 handshake re-verifies `origin_node_id` —
+    /// so a relay can at most redirect a single dial to an attacker endpoint
+    /// that cannot complete a handshake AS the origin. Signing the transport
+    /// would be a wire-format change for that marginal gain, so it is left as a
+    /// relayable hint.
     pub fn signable_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(8 + 32);
         buf.extend_from_slice(&self.walk_id.to_be_bytes());
