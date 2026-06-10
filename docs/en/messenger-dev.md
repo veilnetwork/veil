@@ -45,13 +45,16 @@ docs.
 
 **Does NOT give you**:
 
-- **Async / offline delivery.** Veil has no built-in mailbox. If your
-  messenger needs durable async delivery (messages that wait for an
-  offline recipient and survive a restart), you build it yourself:
-  either as a separate crate (`veil-mailbox`, not yet implemented), or
-  on top of existing primitives — `DHT.store` with a TTL (a record
-  that the network drops after a time-to-live), self-sync across your
-  own nodes, or an external relay.
+- **Async / offline delivery is opt-in, not on by default.** Veil ships a
+  mailbox (`veil-mailbox`) for durable async delivery — encrypted blobs that
+  wait for an offline recipient and survive a restart — but the daemon's
+  `[mailbox] enabled` defaults to off. When you enable it, deposits are bounded
+  by per-sender / global quotas and a rate limit; set
+  `mailbox.require_capability_token = true` in production so only token-holding
+  senders can deposit (the default is permissive for backward compatibility).
+  If you'd rather not run the mailbox, the older primitives still work —
+  `DHT.store` with a TTL (a record the network drops after a time-to-live),
+  self-sync across your own nodes, or an external relay.
 - **Revocation and compromise recovery.** Veil has no in-band way to
   gossip "this key is revoked" — no `RevocationCache`, no
   `master_freshness_sig`. Today's recovery flow is simpler: each

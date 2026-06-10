@@ -328,6 +328,7 @@ impl TicketIssuer {
     /// observability wires this into a Prometheus counter in the
     /// future, drop the cfg AND add the wire-up in the same commit so
     /// the production-compile signal goes live, not silently dead.
+    #[cfg(test)]
     pub fn consumed_tickets_len(&self) -> usize {
         self.consumed_tickets.lock().map(|g| g.len()).unwrap_or(0)
     }

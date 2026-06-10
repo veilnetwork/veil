@@ -70,6 +70,7 @@ impl SessionTimers {
     /// the `idle_deadline` / `stall_trigger_deadline` helpers.
     /// Gating with `#[cfg(test)]` blocks accidental external mutation
     /// of the ticker invariant (gate Test 5).
+    #[cfg(test)]
     pub fn last_rx(&self) -> Instant {
         self.last_rx
     }

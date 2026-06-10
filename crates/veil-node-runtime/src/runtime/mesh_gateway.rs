@@ -156,7 +156,13 @@ impl NodeRuntime {
                             veil_util::redact_addr_for_log(&veil_addr),
                         ),
                     );
-                    let _ = failover_delay; // used by caller to decide when to trigger
+                    // NOTE (audit cycle-10): the `gateway_failover_delay_secs`
+                    // config knob is NOT applied here — the dial stagger uses the
+                    // rank-derived `delay_ms` computed above plus the fixed 10 s
+                    // failover poll. The knob is plumbed through config but
+                    // currently has no effect; wiring a debounce off it (Epic
+                    // 141.5) or removing the field is tracked as follow-up.
+                    let _ = failover_delay;
                     let handles = crate::outbound_connector::spawn_outbound_peers(
                         vec![entry],
                         &access,

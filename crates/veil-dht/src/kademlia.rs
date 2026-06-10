@@ -6,11 +6,12 @@
 //!
 //! # Network I/O
 //!
-//! Cross-node iterative lookups (the multi-hop "closest-node walk") are out of
-//! scope for. They belong in the transport layer and will be wired up
-//! when the wire protocol is fully integrated. For now, `KademliaService`
-//! answers local queries only — which is sufficient for a single-node testnet
-//! and for unit testing the core algorithms.
+//! `KademliaService` answers local FIND_NODE / FIND_VALUE / STORE / DELETE
+//! requests against its own store, AND drives cross-node iterative lookups (the
+//! multi-hop "closest-node walk") through the `network_querier` / `iterative`
+//! glue — see `find_node_iterative_network`, `find_value_iterative_network`,
+//! `find_all_values_network`, and `publish_to_network`. The transport layer
+//! supplies the per-hop query transport; the walk logic lives here.
 //!
 //! # Role enforcement
 //!
