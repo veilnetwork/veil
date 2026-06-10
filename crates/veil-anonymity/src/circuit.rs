@@ -421,8 +421,9 @@ mod tests {
             PER_HOP_OVERHEAD,
             TTL_PREFIX_LEN + NEXT_HOP_ID_LEN + onion::ONION_LAYER_OVERHEAD,
         );
-        // 1 (ttl) + 32 (next-hop-id) + 60 (onion: 32 ephemeral + 12 nonce + 16 tag) = 93.
-        assert_eq!(PER_HOP_OVERHEAD, 93);
+        // 1 (ttl) + 32 (next-hop-id) + 48 (onion v2: 32 ephemeral + 16 tag,
+        // nonce derived not transmitted) = 81.
+        assert_eq!(PER_HOP_OVERHEAD, 81);
     }
 
     #[test]
