@@ -1866,6 +1866,12 @@ impl Default for RoutingConfig {
     }
 }
 
+/// Default per-origin DHT store budget (audit cycle-9): 1 MiB. See
+/// [`DhtConfig::per_origin_max_bytes`] for the rationale.
+fn default_per_origin_max_bytes() -> Option<u64> {
+    Some(1024 * 1024)
+}
+
 /// DHT background task configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DhtConfig {
@@ -2026,9 +2032,16 @@ pub struct DhtConfig {
     /// bucket, so they collectively cap out at the same per-origin
     /// budget — the legacy inner-sig deployment pattern just needs
     /// operators to size this generously (≥ 4 MiB) until they migrate.
-    /// `None` (default) disables the per-origin cap entirely — only the
-    /// global [`max_store_bytes`] limit (if set) applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Default `Some(1 MiB)` (audit cycle-9): bounds single-signer eviction
+    /// pressure on the shared store (global cap ≈ 400 MiB) without breaking real
+    /// publishers. An honest origin holds ≈20-30 KiB — an IdentityDocument
+    /// (≤16 KiB), a few NameClaims/AppEndpointEntries, an MLKEM cert — so 1 MiB
+    /// is ~40× headroom; a large naming authority can raise it. A Sybil cluster
+    /// with N distinct identities still gets N×budget, so per-origin only stops
+    /// the cheap single-key flood; Sybil cost is the orthogonal identity/PoW
+    /// defense. `None` disables the per-origin cap entirely — only the global
+    /// [`max_store_bytes`] limit (if set) applies.
+    #[serde(default = "default_per_origin_max_bytes")]
     pub per_origin_max_bytes: Option<u64>,
 
     /// enable shard-aware filtering — reject STORE requests for keys
@@ -2162,7 +2175,7 @@ impl DhtConfig {
             // wrongly reported `DhtConfig::default()` as non-default, so a
             // default `[dht]` section round-tripped through serialization.
             && self.max_store_bytes == Self::default_max_store_bytes()
-            && self.per_origin_max_bytes.is_none()
+            && self.per_origin_max_bytes == default_per_origin_max_bytes()
             && !self.shard_filtering
             && Self::is_default_allow_unsigned_store(&self.allow_unsigned_store)
     }
@@ -2187,7 +2200,7 @@ impl Default for DhtConfig {
                 Self::default_transport_announcements_persist_interval_secs(),
             max_store_entries: Self::default_max_store_entries(),
             max_store_bytes: Self::default_max_store_bytes(),
-            per_origin_max_bytes: None,
+            per_origin_max_bytes: default_per_origin_max_bytes(),
             shard_filtering: false,
             allow_unsigned_store: Self::default_allow_unsigned_store(),
         }
@@ -5307,6 +5320,19 @@ mod epic_117_defaults {
         };
         let back: GlobalConfig = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
         assert!(back.allow_unpinned_signed_bootstrap, "opt-in roundtrips");
+    }
+
+    #[test]
+    fn cycle9_per_origin_max_bytes_defaults_to_1mib() {
+        // audit cycle-9: enable a per-origin DHT store budget by default to bound
+        // single-signer eviction pressure (was None — unbounded).
+        assert_eq!(
+            DhtConfig::default().per_origin_max_bytes,
+            Some(1024 * 1024),
+            "per-origin budget must default to 1 MiB"
+        );
+        // a default DhtConfig must still round-trip as "default".
+        assert!(DhtConfig::default().is_default());
     }
 
     #[test]
