@@ -790,6 +790,7 @@ impl NodeRuntime {
             // reuse the existing dedup set across reloads so in-flight
             // replays that straddle a config reload are still caught.
             forward_seen_set: Arc::clone(&self.dispatcher.forward_seen_set),
+            forward_seen_content: Arc::clone(&self.dispatcher.forward_seen_content),
             terminal_ack_replay: Arc::clone(&self.dispatcher.terminal_ack_replay),
             recursive_query_seen: Arc::clone(&self.dispatcher.recursive_query_seen),
             vvsync_seen: Arc::clone(&self.dispatcher.vvsync_seen),
