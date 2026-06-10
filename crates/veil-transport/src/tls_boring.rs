@@ -60,8 +60,8 @@ use super::{
     fingerprint::{FingerprintProfile, TlsFingerprint},
     tcp::{StreamConnection, connect_tcp_stream, peer_meta},
     traits::{
-        BoxIoStream, Transport, TransportCapabilities, TransportConnection, TransportHandshakeMode,
-        TransportListener, native_runtime_info,
+        BoxIoStream, RawInbound, Transport, TransportCapabilities, TransportConnection,
+        TransportHandshakeMode, TransportListener, native_runtime_info,
     },
     uri::TransportUri,
 };
@@ -424,6 +424,11 @@ fn boxed_tls_connection(
     Box::new(StreamConnection::new(peer, stream)) as Box<dyn TransportConnection>
 }
 
+/// Bound the inline tls-boring server handshake (audit cycle-8 H1). Before this
+/// the handshake had NO timeout at all — the worst slowloris/HOL surface of all
+/// the listeners. 10 s matches the rustls/ws/wss/obfs4/webtunnel sibling caps.
+const TLS_BORING_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Server-side handshake — wraps `SslStream::new + Pin::new.accept`.
 async fn accept_tls_stream<S>(acceptor: &SslAcceptor, stream: S) -> Result<SslStream<S>>
 where
@@ -445,11 +450,46 @@ impl TransportListener for TlsBoringListener {
         Box::pin(async move {
             let (stream, remote_addr) = self.listener.accept().await?;
             let local_addr = stream.local_addr().ok();
-            let tls_stream = accept_tls_stream(&self.acceptor, stream).await?;
+            let tls_stream = tokio::time::timeout(
+                TLS_BORING_HANDSHAKE_TIMEOUT,
+                accept_tls_stream(&self.acceptor, stream),
+            )
+            .await
+            .map_err(|_| handshake_timeout(TLS_BORING_HANDSHAKE_TIMEOUT))??;
             Ok(boxed_tls_connection(
                 native_tls_peer(self.bind_uri.clone(), local_addr, Some(remote_addr)),
                 tls_stream,
             ))
+        })
+    }
+
+    /// cycle-8 H1: split the kernel accept (fast) from the TLS handshake (slow,
+    /// attacker-driven, previously UNbounded). The runtime spawns `finish`
+    /// behind the inbound-handshake semaphore so a stalled client occupies one
+    /// bounded slot instead of wedging the serial accept loop indefinitely.
+    fn accept_split<'a>(&'a self) -> BoxFuture<'a, Result<RawInbound>> {
+        Box::pin(async move {
+            let (stream, remote_addr) = self.listener.accept().await?;
+            let local_addr = stream.local_addr().ok();
+            let acceptor = Arc::clone(&self.acceptor);
+            let bind_uri = self.bind_uri.clone();
+            let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
+                Box::pin(async move {
+                    let tls_stream = tokio::time::timeout(
+                        TLS_BORING_HANDSHAKE_TIMEOUT,
+                        accept_tls_stream(&acceptor, stream),
+                    )
+                    .await
+                    .map_err(|_| handshake_timeout(TLS_BORING_HANDSHAKE_TIMEOUT))??;
+                    Ok(boxed_tls_connection(
+                        native_tls_peer(bind_uri, local_addr, Some(remote_addr)),
+                        tls_stream,
+                    ))
+                });
+            Ok(RawInbound {
+                remote_addr: Some(remote_addr),
+                finish,
+            })
         })
     }
 
