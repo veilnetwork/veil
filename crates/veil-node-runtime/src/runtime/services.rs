@@ -707,16 +707,22 @@ impl NodeRuntime {
                             }
                             continue;
                         }
-                        accepted = current_listener.accept() => match accepted {
-                            Ok(connection) => {
-                                // drop connections from IPs the scanner-shield
-                                // has soft-banned (port scanners, HTTP probes that previously
-                                // sent invalid-magic frames). Skips spawning the inbound
-                                // task entirely so we don't pay parse/log/metric cost per
-                                // garbage handshake.
-                                let banned_ip = connection
-                                    .peer_meta()
-                                    .remote_addr
+                        raw = current_listener.accept_split() => match raw {
+                            Ok(veil_transport::RawInbound { remote_addr, finish }) => {
+                                // cycle-7 H2: `accept_split` returns after only the
+                                // kernel accept; the (attacker-driven) handshake is
+                                // the `finish` future, spawned below behind the
+                                // inbound-handshake semaphore. A stalled/slow client
+                                // therefore occupies ONE bounded handshake slot
+                                // instead of wedging this serial accept loop for the
+                                // whole handshake-timeout window (slowloris HOL DoS).
+                                //
+                                // drop connections from IPs the scanner-shield has
+                                // soft-banned (port scanners, HTTP probes that
+                                // previously sent invalid-magic frames). The peer
+                                // addr is known pre-handshake, so we skip the
+                                // handshake entirely for banned IPs.
+                                let banned_ip = remote_addr
                                     .map(|sa| sa.ip())
                                     .filter(|ip| scanner_shield.is_banned(*ip));
                                 if let Some(ip) = banned_ip {
@@ -727,7 +733,7 @@ impl NodeRuntime {
                                             listen_id, listener_handle, ip
                                         ),
                                     );
-                                    drop(connection);
+                                    drop(finish);
                                     continue;
                                 }
                                 // j: demoted to DEBUG. Under sustained
@@ -741,18 +747,12 @@ impl NodeRuntime {
                                         listen_id, listener_handle
                                     ),
                                 );
-                                let connection = if let Some(waiter) = pop_accept_waiter(&pending_accepts, listen_id) {
-                                    match waiter.send((listener_handle, connection)) {
-                                        Ok(()) => continue,
-                                        Err((_, connection)) => connection,
-                                    }
-                                } else {
-                                    connection
-                                };
                                 // pre-spawn inbound-handshake cap.
                                 // Sem permit MUST be acquired before tokio::spawn so an
                                 // inbound flood cannot exhaust task-allocator/memory
                                 // before the post-handshake `max_concurrent` gate triggers.
+                                // The permit is held across the spawned handshake, so the
+                                // cap now bounds concurrent IN-FLIGHT handshakes directly.
                                 let permit = match Arc::clone(&inbound_sem).try_acquire_owned() {
                                     Ok(p) => p,
                                     Err(_) => {
@@ -764,48 +764,77 @@ impl NodeRuntime {
                                                 listen_id, listener_handle
                                             ),
                                         );
-                                        drop(connection);
+                                        drop(finish);
                                         continue;
                                     }
                                 };
-                                let handle = spawn_inbound_session(
-                                    InboundSessionContext {
-                                        runtime: SessionRuntimeContext {
-                                            identity:            Arc::clone(&identity),
-                                            state:               Arc::clone(&state),
-                                            live_sessions:       Arc::clone(&live_sessions),
-                                            event_bus:           Arc::clone(&event_bus),
-                                            next_link_id:        Arc::clone(&next_link_id),
-                                            logger:              Arc::clone(&logger),
-                                            metrics:             metrics.clone(),
-                                            dispatcher:          Arc::clone(&dispatcher),
-                                            session_registry:    Arc::clone(&session_registry),
-                                            session_tx_registry: Arc::clone(&session_tx_registry),
-                                            session_outbox:      Arc::clone(&session_outbox),
-                                            anonymity: Arc::clone(&anonymity),
-                                            sessions_per_ip:     Arc::clone(&sessions_per_ip),
-                                            scanner_shield:      Arc::clone(&scanner_shield),
-                                            defaults:       Arc::clone(&defaults_for_listener),
-                                            rtt_table: Arc::clone(&rtt_table_for_probe),
-                                            config_path: config_path_for_listener.clone(),
-                                            mobile: Arc::clone(&mobile),
-                                            resumption:    Arc::clone(&resumption_for_listener),
-                                            handoff:            Arc::clone(&handoff_for_listener),
-                                            allowed_peer_algos:             allowed_peer_algos_for_listener.clone(),
-                                            network_gate:           network_gate_for_listener.as_ref().map(Arc::clone),
-                                            verified_peer_certs:    Arc::clone(&verified_peer_certs_for_listener),
-                                        },
-                                        listen_id,
-                                        listener_handle,
+                                let ctx = InboundSessionContext {
+                                    runtime: SessionRuntimeContext {
+                                        identity:            Arc::clone(&identity),
+                                        state:               Arc::clone(&state),
+                                        live_sessions:       Arc::clone(&live_sessions),
+                                        event_bus:           Arc::clone(&event_bus),
+                                        next_link_id:        Arc::clone(&next_link_id),
+                                        logger:              Arc::clone(&logger),
+                                        metrics:             metrics.clone(),
+                                        dispatcher:          Arc::clone(&dispatcher),
+                                        session_registry:    Arc::clone(&session_registry),
+                                        session_tx_registry: Arc::clone(&session_tx_registry),
+                                        session_outbox:      Arc::clone(&session_outbox),
+                                        anonymity: Arc::clone(&anonymity),
+                                        sessions_per_ip:     Arc::clone(&sessions_per_ip),
+                                        scanner_shield:      Arc::clone(&scanner_shield),
+                                        defaults:       Arc::clone(&defaults_for_listener),
+                                        rtt_table: Arc::clone(&rtt_table_for_probe),
+                                        config_path: config_path_for_listener.clone(),
+                                        mobile: Arc::clone(&mobile),
+                                        resumption:    Arc::clone(&resumption_for_listener),
+                                        handoff:            Arc::clone(&handoff_for_listener),
+                                        allowed_peer_algos:             allowed_peer_algos_for_listener.clone(),
+                                        network_gate:           network_gate_for_listener.as_ref().map(Arc::clone),
+                                        verified_peer_certs:    Arc::clone(&verified_peer_certs_for_listener),
                                     },
-                                    connection,
-                                );
-                                // wrap handle to keep `permit` alive
-                                // for the duration of the spawned task. Permit auto-drops on
-                                // task exit (success or handshake-timeout), freeing one slot
-                                // back to `inbound_handshake_sem`.
+                                    listen_id,
+                                    listener_handle,
+                                };
+                                let pending_accepts_t = Arc::clone(&pending_accepts);
+                                let logger_t = Arc::clone(&logger);
+                                // Spawn the handshake + session off the accept loop.
+                                // `permit` is moved in and held for the whole task, so
+                                // it covers the handshake and auto-drops on exit
+                                // (success / timeout / error), freeing one slot back to
+                                // `inbound_handshake_sem`.
                                 let wrapped = tokio::spawn(async move {
                                     let _permit = permit;
+                                    let connection = match finish.await {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            // Handshake failure is per-connection — log
+                                            // and drop, never back off the accept loop
+                                            // (a slow/bad client must not slow good ones).
+                                            logger_t.debug(
+                                                "session.handshake_error",
+                                                format!(
+                                                    "listen_id={listen_id} \
+                                                     listener_handle={listener_handle} error={e}"
+                                                ),
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    // Hand the freshly-handshaked connection to a
+                                    // waiting reverse-connect acceptor if one is queued.
+                                    let connection = if let Some(waiter) =
+                                        pop_accept_waiter(&pending_accepts_t, listen_id)
+                                    {
+                                        match waiter.send((listener_handle, connection)) {
+                                            Ok(()) => return,
+                                            Err((_, connection)) => connection,
+                                        }
+                                    } else {
+                                        connection
+                                    };
+                                    let handle = spawn_inbound_session(ctx, connection);
                                     let _ = handle.await;
                                 });
                                 push_session_handle(&tasks, wrapped);
