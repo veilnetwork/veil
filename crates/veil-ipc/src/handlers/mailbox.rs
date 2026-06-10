@@ -18,8 +18,50 @@ use veil_proto::{
     MailboxPutStatus,
 };
 
+use crate::MailboxBlobOut;
 use crate::frame_io::write_frame_wh;
 use crate::server::IpcClientState;
+
+/// Cumulative-byte budget for a single `MailboxFetch` response (audit cycle-9).
+/// Kept well under the IPC frame body cap `MAX_FRAME_BODY` (16 MiB) with room
+/// for per-blob framing overhead.
+const MAX_MAILBOX_FETCH_BYTES: usize = 12 * 1024 * 1024;
+
+/// Select a prefix of `raw` (already oldest-first from the backend) bounded by
+/// BOTH `max_entries` and `max_bytes` (audit cycle-9). Entry-count alone
+/// (`MAX_MAILBOX_FETCH_ENTRIES` × `MAX_BLOB_BYTES` = 256 MiB) overran the
+/// 16 MiB frame body cap, so a receiver with >16 MiB of accumulated blobs got
+/// an unparseable frame on every fetch and could never ack out (ack needs a
+/// content_id only a successful fetch reveals). The first blob is ALWAYS
+/// emitted (a real blob is ≤ `MAX_BLOB_BYTES` = 1 MiB, far under the budget) so
+/// the receiver always makes progress, acks the batch, then re-fetches the rest.
+fn select_bounded_fetch_blobs(
+    raw: Vec<MailboxBlobOut>,
+    max_entries: usize,
+    max_bytes: usize,
+) -> Vec<MailboxBlobWire> {
+    let mut total_bytes = 0usize;
+    raw.into_iter()
+        .take(max_entries)
+        .take_while(|b| {
+            if total_bytes == 0 {
+                total_bytes = b.blob.len();
+                return true; // always emit at least one (guarantees progress)
+            }
+            if total_bytes + b.blob.len() > max_bytes {
+                return false; // stop before the frame body would exceed the cap
+            }
+            total_bytes += b.blob.len();
+            true
+        })
+        .map(|b| MailboxBlobWire {
+            sender_id: b.sender_id,
+            content_id: b.content_id,
+            deposited_at: b.deposited_at,
+            blob: b.blob,
+        })
+        .collect()
+}
 use crate::transport::IpcWriteHalf;
 use crate::{MailboxBackend, MailboxPutOutcome};
 
@@ -113,16 +155,7 @@ pub(crate) async fn handle_mailbox_fetch(
     let blobs_raw = mailbox_backend
         .and_then(|b| b.fetch(req.receiver_id, req.auth_cookie))
         .unwrap_or_default();
-    let blobs: Vec<MailboxBlobWire> = blobs_raw
-        .into_iter()
-        .take(MAX_MAILBOX_FETCH_ENTRIES)
-        .map(|b| MailboxBlobWire {
-            sender_id: b.sender_id,
-            content_id: b.content_id,
-            deposited_at: b.deposited_at,
-            blob: b.blob,
-        })
-        .collect();
+    let blobs = select_bounded_fetch_blobs(blobs_raw, MAX_MAILBOX_FETCH_ENTRIES, MAX_MAILBOX_FETCH_BYTES);
     let reply = MailboxFetchRespPayload { blobs };
     write_frame_wh(
         wh,
@@ -169,4 +202,49 @@ pub(crate) async fn handle_mailbox_ack(
         &[removed as u8],
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blob(n: usize) -> MailboxBlobOut {
+        MailboxBlobOut {
+            sender_id: [0u8; 32],
+            content_id: [0u8; 32],
+            deposited_at: 0,
+            blob: vec![0u8; n],
+        }
+    }
+
+    #[test]
+    fn fetch_bounded_by_bytes_stays_under_budget_and_makes_progress() {
+        // 20×1 MiB blobs, 12 MiB budget → take a prefix that fits, never empty,
+        // never the whole set (CRIT: previously 256 MiB frame, unparseable).
+        let raw: Vec<_> = (0..20).map(|_| blob(1024 * 1024)).collect();
+        let out = select_bounded_fetch_blobs(raw, 256, 12 * 1024 * 1024);
+        let total: usize = out.iter().map(|b| b.blob.len()).sum();
+        assert!(!out.is_empty(), "must make progress");
+        assert!(out.len() < 20, "bounded prefix, not the whole backlog");
+        assert!(
+            total <= 12 * 1024 * 1024,
+            "cumulative bytes stay within the budget, got {total}"
+        );
+    }
+
+    #[test]
+    fn fetch_first_blob_always_returned_even_if_over_budget() {
+        // Progress guarantee: the first blob is emitted even if it alone exceeds
+        // the budget (real blobs are ≤ MAX_BLOB_BYTES so this never bites, but it
+        // prevents a permanently-wedged mailbox).
+        let out = select_bounded_fetch_blobs(vec![blob(2_000_000)], 256, 1_000_000);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn fetch_entry_count_cap_still_enforced() {
+        let raw: Vec<_> = (0..500).map(|_| blob(1)).collect();
+        let out = select_bounded_fetch_blobs(raw, 256, 12 * 1024 * 1024);
+        assert_eq!(out.len(), 256, "entry-count cap holds when blobs are tiny");
+    }
 }
