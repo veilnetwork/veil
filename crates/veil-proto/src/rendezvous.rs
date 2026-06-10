@@ -486,17 +486,16 @@ pub fn verify_request_ephemeral_endpoint(
     min_difficulty: u32,
     now_unix: u64,
 ) -> Result<(), ProtoError> {
-    // 1+2: Ed25519 sig verify under requester_pubkey.
-    let vk = VerifyingKey::from_bytes(&payload.requester_pubkey)
-        .map_err(|e| ProtoError::Malformed(format!("bad requester_pubkey: {e}")))?;
-    let mut to_verify = Vec::with_capacity(REQUEST_SIG_DOMAIN.len() + 84);
-    to_verify.extend_from_slice(REQUEST_SIG_DOMAIN);
-    to_verify.extend_from_slice(&payload.signable_bytes());
-    let sig = Signature::from_bytes(&payload.requester_sig);
-    vk.verify(&to_verify, &sig)
-        .map_err(|_| ProtoError::Malformed("rendezvous request: sig verify failed".to_owned()))?;
+    // Order matters for DoS resistance (audit cycle-9): run the CHEAP gates
+    // (integer bounds, one BLAKE3 PoW check, integer skew) BEFORE the expensive
+    // Ed25519 verification (~50-100µs). The PoW is the anti-spam gate that is
+    // meant to fund the signature verify; previously the sig was checked first,
+    // so an attacker rotating `requester_pubkey` (fresh key per request →
+    // per-pubkey rate-limit never trips) forced one Ed25519 verify per packet
+    // at near-zero attacker cost. The PoW solution and replay checks do not
+    // depend on the signature, so reordering is sound.
 
-    // 3: difficulty bounds.
+    // 1: difficulty bounds (cheapest — integer compare).
     if payload.pow_difficulty < min_difficulty {
         return Err(ProtoError::Malformed(format!(
             "rendezvous request: pow_difficulty={} below operator min={}",
@@ -511,14 +510,14 @@ pub fn verify_request_ephemeral_endpoint(
         });
     }
 
-    // 4: PoW solution.
+    // 2: PoW solution (one BLAKE3 — the anti-spam gate).
     if !pow_solution_satisfies(payload) {
         return Err(ProtoError::Malformed(
             "rendezvous request: PoW solution does not meet declared difficulty".to_owned(),
         ));
     }
 
-    // 5: replay window.
+    // 3: replay window (integer skew).
     let skew = now_unix.abs_diff(payload.timestamp_unix);
     if skew > REPLAY_WINDOW_SECS {
         return Err(ProtoError::Malformed(format!(
@@ -526,6 +525,16 @@ pub fn verify_request_ephemeral_endpoint(
             skew, REPLAY_WINDOW_SECS,
         )));
     }
+
+    // 4: Ed25519 sig verify under requester_pubkey (expensive — last).
+    let vk = VerifyingKey::from_bytes(&payload.requester_pubkey)
+        .map_err(|e| ProtoError::Malformed(format!("bad requester_pubkey: {e}")))?;
+    let mut to_verify = Vec::with_capacity(REQUEST_SIG_DOMAIN.len() + 84);
+    to_verify.extend_from_slice(REQUEST_SIG_DOMAIN);
+    to_verify.extend_from_slice(&payload.signable_bytes());
+    let sig = Signature::from_bytes(&payload.requester_sig);
+    vk.verify(&to_verify, &sig)
+        .map_err(|_| ProtoError::Malformed("rendezvous request: sig verify failed".to_owned()))?;
 
     Ok(())
 }
@@ -828,8 +837,13 @@ mod tests {
         // Bump pow_nonce — invalidates PoW solution AND sig.
         req.pow_nonce = req.pow_nonce.wrapping_add(1);
         let err = verify_request_ephemeral_endpoint(&req, 8, 1_700_000_010).unwrap_err();
-        // Sig fails first (signable bytes include pow_nonce).
-        assert!(format!("{err}").contains("sig verify failed"));
+        // PoW is now checked BEFORE the expensive Ed25519 verify (audit cycle-9
+        // DoS reorder), so a tampered nonce is caught by the cheap PoW gate
+        // first — the request is still rejected, just before paying for the sig.
+        assert!(
+            format!("{err}").contains("PoW solution does not meet declared difficulty"),
+            "expected PoW rejection, got: {err}"
+        );
     }
 
     #[test]
