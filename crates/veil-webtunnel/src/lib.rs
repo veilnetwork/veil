@@ -64,3 +64,23 @@ pub fn bounded_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocke
         ..Default::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// audit cycle-9/10: the shared WS cap must stay BOUNDED and well under
+    /// tungstenite's 64 MiB default — both the webtunnel and the plain ws/wss
+    /// transports rely on it to close the memory-amplification vector. Lock the
+    /// 256 KiB ceiling so an accidental bump (or a `..Default` that drops the
+    /// caps) is caught here rather than in production memory.
+    #[test]
+    fn bounded_ws_config_caps_message_and_frame_at_256_kib() {
+        let cfg = bounded_ws_config();
+        assert_eq!(cfg.max_message_size, Some(256 * 1024));
+        assert_eq!(cfg.max_frame_size, Some(256 * 1024));
+        // Guard against a regression to the unbounded default.
+        assert!(cfg.max_message_size.unwrap() < 64 * 1024 * 1024);
+        assert!(cfg.max_frame_size.unwrap() < 16 * 1024 * 1024);
+    }
+}

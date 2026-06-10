@@ -516,6 +516,41 @@ uBenoB2G2KjmKvlujrd5ZBGcMZH9gXWt0fI34gGdZJzluLr/ZXaA8e8+Xy3u7Jm/\n\
     }
 
     #[tokio::test]
+    async fn cycle9_oauth_error_body_is_truncated_char_safe() {
+        // audit cycle-9: a hostile/buggy provider can return a huge error body;
+        // the logged PushError uses `{body:.256}` so it stays bounded and never
+        // splits a UTF-8 boundary. Refuse oauth with a 4000-byte multibyte body
+        // and assert the surfaced error is short + valid UTF-8.
+        let mock = MockServer::start().await;
+        let huge_body = "🔥".repeat(1000); // 1000 chars / 4000 bytes
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(huge_body))
+            .mount(&mock)
+            .await;
+
+        let json = fake_service_account_json();
+        let d = Arc::try_unwrap(FcmDispatcher::from_service_account_json(&json).unwrap())
+            .unwrap_or_else(|arc| (*arc).clone_for_test())
+            .with_test_endpoints(Some(format!("{}/oauth2/token", mock.uri())), None);
+        let token = PushToken {
+            provider: PushProvider::Fcm,
+            token: b"x".to_vec(),
+        };
+        let err = d.dispatch(&token, &[]).await.unwrap_err();
+        let msg = err.to_string();
+        // Fixed prefix "oauth refused: HTTP 400 ... body=" + at most 256 body
+        // chars — far under the untruncated ~4000-char blob.
+        assert!(
+            msg.chars().count() < 320,
+            "error body must be truncated, got {} chars",
+            msg.chars().count()
+        );
+        // Char-safe: the body fragment is whole 🔥 glyphs, never a split byte.
+        assert!(msg.contains('🔥'), "truncated body must remain valid UTF-8");
+    }
+
+    #[tokio::test]
     async fn t1_4_p3b_fcm_429_maps_to_rate_limited() {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
