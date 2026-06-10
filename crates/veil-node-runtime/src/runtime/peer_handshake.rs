@@ -623,14 +623,21 @@ pub async fn register_connection_session(
                 let nonce_for_persist = new_nonce;
                 let state_for_persist = Arc::clone(&runtime.state);
                 tokio::task::spawn_blocking(move || {
-                    if let Ok(mut cfg) = veil_cfg::load_config(&config_path)
-                        && let Some(p) = cfg
-                            .peers
-                            .iter_mut()
-                            .find(|p| p.peer_id == peer_id_for_persist)
+                    // audit cycle-8 H5: hold the config-write guard across the
+                    // whole load-modify-save so a concurrent lazy-miner
+                    // identity-nonce upgrade cannot clobber this peer-nonce
+                    // persist (last-writer-wins on the other's field).
                     {
-                        p.nonce = nonce_for_persist;
-                        let _ = veil_cfg::save_config(&config_path, &cfg);
+                        let _guard = veil_cfg::config_write_guard();
+                        if let Ok(mut cfg) = veil_cfg::load_config(&config_path)
+                            && let Some(p) = cfg
+                                .peers
+                                .iter_mut()
+                                .find(|p| p.peer_id == peer_id_for_persist)
+                        {
+                            p.nonce = nonce_for_persist;
+                            let _ = veil_cfg::save_config(&config_path, &cfg);
+                        }
                     }
                     persistence::persist_discovered_peers(&state_for_persist, &config_path);
                 });

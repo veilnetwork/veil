@@ -119,7 +119,7 @@ pub const MAX_BLOB_BYTES: u64 = 1024 * 1024;
 /// if no eligible victim exists, the put is rejected with
 /// `QuotaGlobalExceeded` instead of evicting fresh authenticated
 /// content. Stale attacker traffic ages out via TTL prune (default
-/// 24 h).
+/// 7 days — see `DEFAULT_TTL_SECS`).
 pub const MIN_EVICTION_AGE_SECS: u64 = 3600;
 
 /// hard cap on the number of records
@@ -799,7 +799,7 @@ impl Mailbox {
                             // evictable identified blobs sit below the cap. Only
                             // reject when NEITHER pool has an old-enough head.
                             // Stale attacker traffic ages past this window via
-                            // the TTL prune tick (default 24 h).
+                            // the TTL prune tick (default 7 days, DEFAULT_TTL_SECS).
                             let evictable = |key: &[u8]| -> bool {
                                 if key.len() >= 8 {
                                     let mut ts_bytes = [0u8; 8];
