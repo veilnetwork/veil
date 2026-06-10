@@ -1861,3 +1861,34 @@ fn pick_quorum_match_single_replica_gated_by_allow_single() {
     let distinct = vec![vec![1u8], vec![2u8], vec![3u8]];
     assert_eq!(super::pick_quorum_match(&distinct, 2, false), None);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn reload_with_unapplyable_config_does_not_zombie() {
+    // audit cycle-9 reload-zombie: a config that passes require_identity but
+    // fails reconstruction (here a malformed public_key makes
+    // HandshakeIdentity::from_config error) must be rejected BEFORE the running
+    // tasks are torn down, leaving the node alive (shutdown_tx intact) — not a
+    // zombie that needs a full process restart.
+    let path = save_test_config("reload-zombie", runtime_config_with_metrics()).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.expect("start");
+    assert!(runtime.shutdown_tx.is_some(), "tasks running after start");
+
+    // Overwrite the config with a valid identity SECTION but an unparseable
+    // public_key + absent node_id (forces the from_public_key failure path).
+    let mut bad = runtime_config_with_metrics();
+    if let Some(id) = bad.identity.as_mut() {
+        id.public_key = "!!!not-base64!!!".to_owned();
+        id.node_id = None;
+    }
+    veil_cfg::save_config(&path, &bad).expect("write bad config");
+
+    let result = runtime.reload().await;
+    assert!(result.is_err(), "reload must reject an unapplyable config");
+    assert!(
+        runtime.shutdown_tx.is_some(),
+        "running node must stay intact on a rejected reload (reload-zombie guard)"
+    );
+
+    runtime.stop().await.expect("stop");
+    let _ = fs::remove_file(&path);
+}
