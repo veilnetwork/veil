@@ -469,14 +469,23 @@ pub const RESOLVE_QUORUM_THRESHOLD: usize = 2;
 /// candidate reached the threshold (= `QuorumDivergence`) OR if the
 /// list is empty (= `NotFound` — the caller distinguishes the two).
 ///
-/// Single-replica fast path: if exactly one response came back
-/// (typically the local-fast-path case in `dht_get_replicated`)
-/// return it as-is — the local store is trusted (we only got it
-/// because we ARE close to the target and saw the publisher's
-/// signed STORE). Without this bypass an isolated node resolving
-/// its own published values would always trip QuorumDivergence.
-pub fn pick_quorum_match(replicas: &[Vec<u8>], threshold: usize) -> Option<Vec<u8>> {
-    if replicas.len() == 1 {
+/// Single-replica fast path (audit cycle-9): `allow_single_replica` must be set
+/// ONLY when a single response is independently trustworthy — i.e. the value is
+/// SELF-CERTIFYING and the caller re-verifies it (e.g. an identity document
+/// whose `node_id == BLAKE3(master_pk)` is re-checked after this returns). For
+/// NON-self-certifying values (NameClaim @name → node_id) the quorum is the
+/// ONLY anti-Sybil defense, so `allow_single_replica = false` requires
+/// `threshold` agreeing replicas. Previously the `len()==1` bypass was
+/// unconditional, justified by a stale comment about the local-store fast path —
+/// but `dht_get_replicated` short-circuits a validated LOCAL value before
+/// reaching here, so a `len()==1` set here is a single REMOTE response, which a
+/// lone (or only-reachable) Sybil could supply to hijack a name.
+pub fn pick_quorum_match(
+    replicas: &[Vec<u8>],
+    threshold: usize,
+    allow_single_replica: bool,
+) -> Option<Vec<u8>> {
+    if allow_single_replica && replicas.len() == 1 {
         return Some(replicas[0].clone());
     }
     let mut tally: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
@@ -4282,7 +4291,11 @@ impl NodeServices {
                         && verify_identity_document(&d, now_unix_secs).is_ok())
             })
             .await;
-        let bytes = pick_quorum_match(&replicas, RESOLVE_QUORUM_THRESHOLD).ok_or_else(|| {
+        // Identity documents are self-certifying: each replica was already
+        // filtered through `verify_identity_document` + `node_id == BLAKE3`
+        // above, so a single verified replica is independently trustworthy →
+        // allow_single_replica = true. (audit cycle-9.)
+        let bytes = pick_quorum_match(&replicas, RESOLVE_QUORUM_THRESHOLD, true).ok_or_else(|| {
             if replicas.is_empty() {
                 ResolveError::IdentityNotFound(node_id)
             } else {
@@ -4451,8 +4464,15 @@ impl NodeServices {
                         && c.node_id == *self.identity.local_identity.node_id.as_bytes())
             })
             .await;
-        let claim_bytes =
-            pick_quorum_match(&claim_replicas, RESOLVE_QUORUM_THRESHOLD).ok_or_else(|| {
+        // NameClaim is NON-self-certifying: a self-consistent forged claim
+        // (@name -> attacker, signed by attacker) passes any crypto self-check,
+        // so the remote quorum is the only defense. A name WE published already
+        // short-circuited via the local fast path above; reaching here means
+        // these are REMOTE replicas for someone else's name, so a single
+        // response must NOT be accepted → allow_single_replica = false.
+        // (audit cycle-9 — closes the single-remote-responder name hijack.)
+        let claim_bytes = pick_quorum_match(&claim_replicas, RESOLVE_QUORUM_THRESHOLD, false)
+            .ok_or_else(|| {
                 if claim_replicas.is_empty() {
                     ResolveError::NameNotFound
                 } else {
