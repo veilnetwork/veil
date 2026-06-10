@@ -484,6 +484,85 @@ mod tests {
     const T0: u64 = 1_700_000_000;
     const BPS: u32 = 1_000_000;
 
+    /// W0 measurement (anonymity-preserving plan): quantify the per-send
+    /// SELECTION cost (`discover_relay_hops` — decode + signature verify per
+    /// candidate) vs the BUILD cost (pick + onion wrap) for realistic candidate
+    /// counts. The onion send path is sim/bench-only in production (not
+    /// IPC-wired), so this is the realistic way to measure the decomposition.
+    /// Ed25519 issuers (the common case); hybrid/Falcon issuers would make
+    /// selection EVEN more dominant (slower verify). Run with:
+    ///   cargo test -p veil-anonymity --release w0_measure -- --ignored --nocapture
+    #[test]
+    #[ignore = "W0 measurement — run explicitly with --ignored --nocapture"]
+    fn w0_measure_selection_vs_build() {
+        use crate::sender::build_outbound_anonymous_cell;
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let now = T0 + 10; // well within the 24 h freshness window
+        let reps = 50u128;
+        println!("\nW0 selection-vs-build (Ed25519 issuers, 3-hop build, {reps} reps):");
+        for &n in &[50usize, 100, 200, 500] {
+            // N signed relay-directory entries → fetchable store.
+            let mut store: HashMap<[u8; NODE_ID_LEN], Vec<u8>> = HashMap::new();
+            let mut node_ids = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (ipk, isk, node_id, x25519_pk) = fresh_relay();
+                let bytes = sign_entry(
+                    node_id,
+                    x25519_pk,
+                    BPS,
+                    now,
+                    &ipk,
+                    &isk,
+                    SignatureAlgorithm::Ed25519,
+                )
+                .expect("sign");
+                store.insert(node_id, bytes);
+                node_ids.push(node_id);
+            }
+
+            // SELECTION: decode + verify_entry (Ed25519) per candidate.
+            let t = Instant::now();
+            let mut discovered = Vec::new();
+            for _ in 0..reps {
+                discovered = discover_relay_hops(
+                    &node_ids,
+                    |nid| store.get(nid).cloned(),
+                    now,
+                    DEFAULT_FRESHNESS_WINDOW_SECS,
+                );
+            }
+            let select_us = t.elapsed().as_micros() / reps;
+            assert_eq!(discovered.len(), n, "all entries should verify");
+
+            // BUILD: pick (latency sort) + onion wrap for a 3-hop circuit.
+            let target_sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+            let target_pk = x25519_dalek::PublicKey::from(&target_sk).to_bytes();
+            let target_id = [0xEEu8; NODE_ID_LEN];
+            let t = Instant::now();
+            for _ in 0..reps {
+                build_outbound_anonymous_cell(
+                    b"a typical chat message of moderate length ~64 bytes or so!!",
+                    &discovered,
+                    |_| Some(50u32),
+                    target_id,
+                    target_pk,
+                    3,
+                )
+                .expect("build");
+            }
+            let build_us = t.elapsed().as_micros() / reps;
+
+            println!(
+                "  N={n:4}  select_us={select_us:6}  build_us={build_us:5}  \
+                 selection/build = {:.1}x",
+                select_us as f64 / build_us.max(1) as f64,
+            );
+        }
+        println!();
+    }
+
     #[test]
     fn epic482_4_sign_decode_verify_round_trip() {
         let (issuer_pk, issuer_sk, node_id, x25519_pk) = fresh_relay();
