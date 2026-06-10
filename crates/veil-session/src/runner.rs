@@ -1303,6 +1303,24 @@ impl SessionRunner {
         rekey: &mut crate::rekey_context::RekeyContext,
         pq: &mut crate::priority_queue::PriorityQueue,
     ) {
+        let now = tokio::time::Instant::now();
+        // audit cycle-8 H7: if a prior RekeyInit was never answered (peer crash
+        // / lost RekeyAck — there is no rekey retransmit), the FSM would sit in
+        // AwaitingAck forever, blocking ALL future rekeys including the
+        // nonce-exhaustion failsafe (gated on is_idle below). Time it out back to
+        // Idle so a fresh init can fire.
+        const REKEY_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        if rekey.awaiting_ack_timed_out(now, REKEY_ACK_TIMEOUT) {
+            self.logger.info(
+                "session.rekey.ack_timeout",
+                format!(
+                    "peer_id={} — RekeyAck not received within {}s; resetting to allow re-init",
+                    hex_short(&self.peer_id),
+                    REKEY_ACK_TIMEOUT.as_secs()
+                ),
+            );
+            rekey.reset_to_idle();
+        }
         if !(self.crypto.tx_cipher.is_some() && self.session_id != [0u8; 32] && rekey.is_idle()) {
             return;
         }
@@ -1319,9 +1337,7 @@ impl SessionRunner {
                 .rx_cipher
                 .as_ref()
                 .is_some_and(|c| c.frames_processed() >= NONCE_REKEY_WATERMARK);
-        let Some(trigger) =
-            rekey.should_initiate_rekey(tokio::time::Instant::now(), nonce_pressure)
-        else {
+        let Some(trigger) = rekey.should_initiate_rekey(now, nonce_pressure) else {
             return;
         };
         if matches!(trigger, crate::rekey_context::RekeyTrigger::NonceWatermark) {
@@ -1345,7 +1361,7 @@ impl SessionRunner {
         let mut rekey_frame = encode_header(&rekey_hdr).to_vec();
         rekey_frame.extend_from_slice(&rekey_body);
         let bytes_log = rekey.bytes_since_rekey();
-        rekey.enter_awaiting_ack(kp);
+        rekey.enter_awaiting_ack(kp, now);
         pq.push(
             veil_proto::priority::INTERACTIVE,
             veil_bufpool::pooled_shared_from_vec(rekey_frame),

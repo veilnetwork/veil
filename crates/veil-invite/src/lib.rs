@@ -101,7 +101,11 @@ pub enum InviteError {
 
 /// Invite bundle (CBOR-serializable).  All field names are short
 /// (1-2 chars) to minimize wire size in the encoded form.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Debug` is hand-written to REDACT `psk` (audit cycle-8): the bundle is a
+/// bearer credential and `psk` is the listener's pre-shared key — a derived
+/// `Debug` would print it in full to any `tracing`/`{:?}` site.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InviteBundleV1 {
     /// Wire format version.
     pub v: u8,
@@ -124,6 +128,22 @@ pub struct InviteBundleV1 {
     /// Ed25519 signature over canonical body (see `signable_bytes`).
     #[serde(with = "serde_bytes")]
     pub sig: Vec<u8>,
+}
+
+impl std::fmt::Debug for InviteBundleV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteBundleV1")
+            .field("v", &self.v)
+            .field("nid", &self.nid)
+            .field("vk", &self.vk)
+            .field("tr", &self.tr)
+            // psk is the bearer pre-shared key — never print it.
+            .field("psk", &"<redacted>")
+            .field("exp", &self.exp)
+            .field("lbl", &self.lbl)
+            .field("sig", &self.sig)
+            .finish()
+    }
 }
 
 mod serde_bytes {
@@ -344,6 +364,23 @@ mod tests {
         assert_eq!(b.tr, "obfs4-tcp://1.2.3.4:7821");
         assert_eq!(b.psk, vec![0xCC; 32]);
         b.verify(1_700_000_000).expect("verify ok");
+    }
+
+    /// audit cycle-8: the bundle's `Debug` must REDACT the bearer `psk` so it
+    /// never reaches logs via `{:?}` / `tracing`.
+    #[test]
+    fn debug_redacts_psk_cycle8() {
+        let b = sample_bundle(); // psk = [0xCC; 32]
+        let dbg = format!("{b:?}");
+        assert!(
+            dbg.contains("psk: \"<redacted>\""),
+            "psk must be redacted in Debug: {dbg}"
+        );
+        // The raw 32-byte 0xCC psk run must not appear as a debug byte array.
+        assert!(
+            !dbg.contains("204, 204, 204, 204"),
+            "psk bytes leaked into Debug: {dbg}"
+        );
     }
 
     #[test]
