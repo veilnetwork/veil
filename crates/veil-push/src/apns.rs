@@ -219,14 +219,18 @@ impl PushDispatcher for ApnsDispatcher {
             return Ok(());
         }
         let body = resp.text().await.unwrap_or_default();
+        // Truncate the provider body in error strings (audit cycle-9): these
+        // PushError messages are logged, and an APNs/FCM error body can echo the
+        // push token or be arbitrarily large. The reason field
+        // (e.g. {"reason":"BadDeviceToken"}) fits well within the cap.
         match status.as_u16() {
             // 400/410 with reason BadDeviceToken / Unregistered → permanent.
             400 | 403 | 410 => Err(PushError::InvalidToken(format!(
-                "APNs rejected token (HTTP {status}): {body}"
+                "APNs rejected token (HTTP {status}): {body:.256}"
             ))),
             429 => Err(PushError::RateLimited),
             _ => Err(PushError::Transport(format!(
-                "APNs POST HTTP {status}: {body}"
+                "APNs POST HTTP {status}: {body:.256}"
             ))),
         }
     }

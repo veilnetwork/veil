@@ -208,7 +208,7 @@ impl FcmDispatcher {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(PushError::Transport(format!(
-                "oauth refused: HTTP {status} body={body}"
+                "oauth refused: HTTP {status} body={body:.256}"
             )));
         }
         let parsed: OAuthResponse = resp
@@ -260,13 +260,15 @@ impl PushDispatcher for FcmDispatcher {
         // 429 → quota exceeded. Transient.
         // 5xx → backend trouble. Transient.
         let body = resp.text().await.unwrap_or_default();
+        // Truncate the provider body in logged error strings (audit cycle-9):
+        // an FCM error body can echo the registration token or be large.
         match status.as_u16() {
             401 | 403 | 404 => Err(PushError::InvalidToken(format!(
-                "FCM rejected token (HTTP {status}): {body}"
+                "FCM rejected token (HTTP {status}): {body:.256}"
             ))),
             429 => Err(PushError::RateLimited),
             _ => Err(PushError::Transport(format!(
-                "FCM send HTTP {status}: {body}"
+                "FCM send HTTP {status}: {body:.256}"
             ))),
         }
     }
