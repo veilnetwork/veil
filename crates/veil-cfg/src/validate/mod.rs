@@ -81,6 +81,39 @@ mod tests {
         use crate::identity_policy::PowPolicy;
 
         #[test]
+        fn corrupt_identity_keypair_is_flagged_not_silently_valid() {
+            // audit cycle-9: a present-but-undecodable identity must surface a
+            // validation issue — the daemon would otherwise crash at startup
+            // loading it — instead of passing silently because the downstream
+            // rules do `from_config(..).ok()` (None on a corrupt key).
+            let config = Config {
+                identity: Some(IdentityConfig {
+                    algo: SignatureAlgorithm::Ed25519,
+                    role: Default::default(),
+                    public_key: "!!!not-base64!!!".to_owned(),
+                    private_key: "!!!not-base64!!!".to_owned(),
+                    nonce: "AAAAAA==".to_owned(),
+                    node_id: None,
+                    key_passphrase: None,
+                    key_passphrase_file: None,
+                    key_passphrase_prompt: false,
+                    lazy_mining: false,
+                    max_lazy_difficulty: 64,
+                }),
+                ..Config::default()
+            };
+            let report = validate(&config);
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|i| i.code == "identity_keypair_decodable"),
+                "corrupt identity key material must be flagged, got: {:?}",
+                report.issues.iter().map(|i| i.code).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
         fn reports_invalid_current_thread_worker_setting() {
             let mut config = Config::default();
             config.global.runtime_flavor = RuntimeFlavor::CurrentThread;
