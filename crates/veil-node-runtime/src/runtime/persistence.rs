@@ -81,7 +81,7 @@ pub fn load_discovered_peers(
         Ok(v) => v,
         Err(_) => return,
     };
-    let mut peer_id_counter: u32 = 0xE000_0000;
+    let mut peer_id_counter: u32 = crate::types::synthetic_peer_id::PERSISTENCE_BASE;
     let active = {
         let reg = access
             .session_tx_registry

@@ -219,7 +219,11 @@ impl NodeRuntime {
                         let config_path = self.config_path.clone();
                         let handle = tokio::spawn(async move {
                             let mut shutdown_rx = shutdown_tx_clone.subscribe();
-                            let mut peer_id_counter: u32 = 0xD000_0000;
+                            // cycle-7 M3: PEX has its own window, disjoint from
+                            // pinned-relays / gateway-failover (all used to share
+                            // 0xD000_0000). See `types::synthetic_peer_id`.
+                            let mut peer_id_counter: u32 =
+                                crate::types::synthetic_peer_id::PEX_BASE;
                             loop {
                                 tokio::select! {
                                     peers = pex_connect_rx.recv() => {

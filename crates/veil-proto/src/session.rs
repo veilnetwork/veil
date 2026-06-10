@@ -956,7 +956,14 @@ impl VisibilityScope {
 /// ```text
 /// [0] scope u8 (0=Public, 1=FriendsOnly, 2=InviteOnly, 3=Private)
 /// ```
-pub const VISIBILITY_SCOPE_TLV_TAG: u16 = 0x0012;
+///
+/// NB: was `0x0012` historically — collided with
+/// [`ADVERTISED_TRANSPORTS_TLV_TAG`] in the same ATTACH-trailer namespace.
+/// The collision was latent (the two encoders are mutually exclusive and the
+/// visibility decoder guards on `len == 1`), but a future encoder emitting both
+/// on one frame would have the transports decoder mis-parse a visibility TLV.
+/// Moved to the next free tag (`0x0016`; `0x0010`-`0x0015` are taken).
+pub const VISIBILITY_SCOPE_TLV_TAG: u16 = 0x0016;
 
 /// TLV tag for custom attachment lease TTL appended after `AttachPayload`.
 ///

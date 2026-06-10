@@ -20,6 +20,7 @@
 
 use std::time::Duration;
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 use veil_e2e::DK_SEED_BYTES;
 
@@ -35,7 +36,13 @@ pub enum MlKemRekeyState {
     /// `per_session_mlkem_dk[peer_id]` so the dispatcher can decrypt
     /// future E2E messages from the peer that were encrypted with the new
     /// key.
-    AwaitingAck { dk_seed: [u8; DK_SEED_BYTES] },
+    /// `dk_seed` is wrapped in `Zeroizing` so that if the session tears
+    /// down mid-rekey (context dropped while still `AwaitingAck`) the
+    /// 64-byte decapsulation seed is wiped rather than left in freed heap.
+    /// Mirrors the X25519 rekey sibling's zeroize-on-drop discipline.
+    AwaitingAck {
+        dk_seed: Zeroizing<[u8; DK_SEED_BYTES]>,
+    },
 }
 
 pub struct MlKemRekeyContext {
@@ -86,7 +93,9 @@ impl MlKemRekeyContext {
     /// Caller must have just pushed the matching `MlKemRekeyEk` frame
     /// onto the priority queue.
     pub fn enter_awaiting_ack(&mut self, dk_seed: [u8; DK_SEED_BYTES]) {
-        self.state = MlKemRekeyState::AwaitingAck { dk_seed };
+        self.state = MlKemRekeyState::AwaitingAck {
+            dk_seed: Zeroizing::new(dk_seed),
+        };
     }
 
     /// Atomically transitions from `AwaitingAck` back to `Idle`
@@ -102,7 +111,10 @@ impl MlKemRekeyContext {
             MlKemRekeyState::AwaitingAck { dk_seed } => {
                 self.bytes_since_rekey = 0;
                 self.last_rekey_at = now;
-                Some(dk_seed)
+                // Deref-copy the seed out; the `Zeroizing` wrapper wipes its
+                // own storage as it drops at the end of this arm. The caller
+                // immediately re-wraps the returned copy in mlocked storage.
+                Some(*dk_seed)
             }
             MlKemRekeyState::Idle => None,
         }
