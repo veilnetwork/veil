@@ -15,8 +15,8 @@ use super::{
     error::{Result, TransportError, handshake_timeout, tls_error},
     tcp::{StreamConnection, connect_tcp_stream, peer_meta},
     traits::{
-        BoxIoStream, Transport, TransportCapabilities, TransportConnection, TransportHandshakeMode,
-        TransportListener, native_runtime_info,
+        BoxIoStream, RawInbound, Transport, TransportCapabilities, TransportConnection,
+        TransportHandshakeMode, TransportListener, native_runtime_info,
     },
     uri::TransportUri,
 };
@@ -331,6 +331,37 @@ impl TransportListener for TlsTransportListener {
                 native_tls_peer(self.bind_uri.clone(), local_addr, Some(remote_addr)),
                 tls_stream,
             ))
+        })
+    }
+
+    /// cycle-8 H2: split the kernel accept from the TLS handshake so a stalled
+    /// client occupies one spawned, semaphore-bounded handshake slot rather than
+    /// serializing the accept loop (the 10 s timeout bounded a single hang, but
+    /// the loop still processed handshakes one at a time).
+    fn accept_split<'a>(&'a self) -> BoxFuture<'a, Result<RawInbound>> {
+        Box::pin(async move {
+            let (stream, remote_addr) = self.listener.accept().await?;
+            let local_addr = stream.local_addr().ok();
+            let acceptor = self.acceptor.clone();
+            let bind_uri = self.bind_uri.clone();
+            let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
+                Box::pin(async move {
+                    let tls_stream: ServerTlsStream<TcpStream> =
+                        tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+                            .await
+                            .map_err(|_| {
+                                tls_error("tls server handshake timed out".to_string())
+                            })?
+                            .map_err(|err| tls_error(err.to_string()))?;
+                    Ok(boxed_tls_connection(
+                        native_tls_peer(bind_uri, local_addr, Some(remote_addr)),
+                        tls_stream,
+                    ))
+                });
+            Ok(RawInbound {
+                remote_addr: Some(remote_addr),
+                finish,
+            })
         })
     }
 

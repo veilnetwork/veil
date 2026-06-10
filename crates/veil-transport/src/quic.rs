@@ -8,7 +8,7 @@ use super::{
     error::{Result, TransportError, connect_timeout, handshake_timeout, quic_error},
     tcp::peer_meta,
     traits::{
-        BoxIoStream, PeerMeta, Transport, TransportCapabilities, TransportConnection,
+        BoxIoStream, PeerMeta, RawInbound, Transport, TransportCapabilities, TransportConnection,
         TransportHandshakeMode, TransportListener, native_runtime_info,
     },
     uri::TransportUri,
@@ -491,6 +491,11 @@ struct QuicTransportListener {
     bind_uri: TransportUri,
 }
 
+/// Bound the QUIC handshake + first-stream accept (audit cycle-8 H2). The QUIC
+/// `accept()` and `accept_bi()` were previously UNbounded; a peer that starts a
+/// connection then stalls could hold the accept path indefinitely.
+const QUIC_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl TransportListener for QuicTransportListener {
     fn accept<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn TransportConnection>>> {
         Box::pin(async move {
@@ -502,16 +507,58 @@ impl TransportListener for QuicTransportListener {
             let local_addr = incoming
                 .local_ip()
                 .map(|ip| std::net::SocketAddr::new(ip, 0));
-            let connection = incoming.await?;
+            let connection = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming)
+                .await
+                .map_err(|_| quic_error("quic handshake timed out"))??;
             let remote_addr = connection.remote_address();
             let peer_meta = native_quic_peer(self.bind_uri.clone(), local_addr, Some(remote_addr));
 
             let stream: BoxIoStream = {
-                let (send, recv) = connection.accept_bi().await?;
+                let (send, recv) =
+                    tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connection.accept_bi())
+                        .await
+                        .map_err(|_| quic_error("quic accept_bi timed out"))??;
                 Box::new(QuicBidiStream { recv, send })
             };
 
             Ok(boxed_quic_connection(peer_meta, connection, stream))
+        })
+    }
+
+    /// cycle-8 H2: split the QUIC connection accept (fast) from the handshake +
+    /// first bidi-stream accept (slow, attacker-driven, previously UNbounded).
+    /// The peer address is known pre-handshake via `Incoming::remote_address`.
+    fn accept_split<'a>(&'a self) -> BoxFuture<'a, Result<RawInbound>> {
+        Box::pin(async move {
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
+                .ok_or_else(|| quic_error("endpoint closed"))?;
+            let local_addr = incoming
+                .local_ip()
+                .map(|ip| std::net::SocketAddr::new(ip, 0));
+            let remote_addr = incoming.remote_address();
+            let bind_uri = self.bind_uri.clone();
+            let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
+                Box::pin(async move {
+                    let connection = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming)
+                        .await
+                        .map_err(|_| quic_error("quic handshake timed out"))??;
+                    let peer_meta = native_quic_peer(bind_uri, local_addr, Some(remote_addr));
+                    let stream: BoxIoStream = {
+                        let (send, recv) =
+                            tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connection.accept_bi())
+                                .await
+                                .map_err(|_| quic_error("quic accept_bi timed out"))??;
+                        Box::new(QuicBidiStream { recv, send })
+                    };
+                    Ok(boxed_quic_connection(peer_meta, connection, stream))
+                });
+            Ok(RawInbound {
+                remote_addr: Some(remote_addr),
+                finish,
+            })
         })
     }
 
