@@ -206,7 +206,9 @@ impl WebtunnelClient {
             _ => return Err(ClientError::BadAccept),
         }
 
-        let ws = WebSocketStream::from_raw_socket(stream, Role::Client, None).await;
+        let ws =
+            WebSocketStream::from_raw_socket(stream, Role::Client, Some(crate::bounded_ws_config()))
+                .await;
         Ok(ws)
     }
 }
