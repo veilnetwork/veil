@@ -1789,9 +1789,22 @@ impl RendezvousRegistry {
             return Ok(());
         }
         if g.cookies.len() >= self.max_registrations {
-            return Err(RegistryError::Full {
-                cap: self.max_registrations,
-            });
+            // At capacity: evict the oldest registration (smallest
+            // `registered_at_unix`) to admit the new one rather than failing
+            // closed. Plain fail-closed turned a flood of `(attacker, cookie_i)`
+            // registrations into a full lockout of every legitimate receiver;
+            // LRU eviction degrades that to churn — genuine receivers republish
+            // their ads before expiry, refreshing `registered_at_unix` and
+            // keeping themselves out of the oldest-eviction set. O(n) scan fires
+            // only on the rare full-path. (audit cycle-8 F5.)
+            if let Some(oldest_key) = g
+                .cookies
+                .iter()
+                .min_by_key(|(_, s)| s.registered_at_unix)
+                .map(|(k, _)| *k)
+            {
+                g.cookies.remove(&oldest_key);
+            }
         }
         g.cookies.insert(key, subscriber);
         Ok(())
@@ -3116,15 +3129,37 @@ mod tests {
     }
 
     #[test]
-    fn epic482_5_registry_capacity_enforced() {
+    fn cycle8_f5_registry_full_evicts_oldest_instead_of_failing() {
+        // audit cycle-8 F5 — at capacity, register() must evict the oldest
+        // entry (smallest registered_at_unix) and admit the new one rather than
+        // fail-closed, so a registration flood can't lock out fresh receivers.
         let reg = RendezvousRegistry::with_capacity(3);
+        let cookie_of = |i: u8| {
+            let mut c = [0u8; AUTH_COOKIE_LEN];
+            c[0] = i;
+            c
+        };
         for i in 0..3u8 {
-            let mut cookie = [0u8; AUTH_COOKIE_LEN];
-            cookie[0] = i;
-            reg.register(cookie, make_subscriber(i)).unwrap();
+            let sub = RendezvousSubscriber {
+                peer_node_id: [i; NODE_ID_LEN],
+                receiver_x25519_pk: [i ^ 0xFF; X25519_PK_LEN],
+                registered_at_unix: 1_700_000_000 + i as u64, // i=0 is oldest
+            };
+            reg.register(cookie_of(i), sub).unwrap();
         }
-        let result = reg.register([0xAA; AUTH_COOKIE_LEN], make_subscriber(0xAA));
-        assert!(matches!(result, Err(RegistryError::Full { cap: 3 })));
+        // A 4th registration at capacity must succeed (no Full error).
+        let newest = RendezvousSubscriber {
+            peer_node_id: [0xAA; NODE_ID_LEN],
+            receiver_x25519_pk: [0x55; X25519_PK_LEN],
+            registered_at_unix: 1_700_000_100,
+        };
+        reg.register(cookie_of(0xAA), newest).unwrap();
+
+        assert_eq!(reg.len(), 3, "cap held");
+        // Oldest (i=0) evicted; the new one and the two newer survivors remain.
+        assert!(reg.lookup(&[0u8; NODE_ID_LEN], &cookie_of(0)).is_none());
+        assert!(reg.lookup(&[0xAA; NODE_ID_LEN], &cookie_of(0xAA)).is_some());
+        assert!(reg.lookup(&[2u8; NODE_ID_LEN], &cookie_of(2)).is_some());
     }
 
     // ── Introduce replay protection ─────────────
