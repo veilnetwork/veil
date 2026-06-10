@@ -150,13 +150,6 @@ impl CongestionMonitor {
 
     fn update_hysteresis(&self) {
         let score = self.score();
-        // Fast path: skip mutex if score hasn't changed significantly.
-        let mut state = self.hysteresis.lock().unwrap_or_else(|p| p.into_inner());
-        let prev = state.last_score;
-        if (score - prev).abs() < 0.005 {
-            return;
-        }
-        state.last_score = score;
         // Hold the hysteresis lock across the admitting transition so the
         // score snapshot, the admitting read/store, and the watch send are one
         // serialized step. If the lock were released first (the old `drop`),
@@ -165,11 +158,24 @@ impl CongestionMonitor {
         // routing dispatcher (e.g. a stale `false` arriving after a newer
         // `true`). The watch send is non-blocking, so holding the std Mutex
         // across it cannot stall. `state` is dropped at end of scope.
+        let mut state = self.hysteresis.lock().unwrap_or_else(|p| p.into_inner());
         let currently_admitting = self.admitting.load(Ordering::Relaxed);
-        if currently_admitting && score >= self.cfg.congestion_high {
+        let needs_deny = currently_admitting && score >= self.cfg.congestion_high;
+        let needs_admit = !currently_admitting && score <= self.cfg.congestion_low;
+        // Fast path: skip only when NO threshold transition is pending and the
+        // score barely moved. The pending-transition guard is essential — a
+        // score that creeps across `congestion_high` in sub-epsilon steps must
+        // still flip `admitting`; the old code returned on `|Δ| < 0.005` before
+        // evaluating the thresholds and left `last_score` frozen just below the
+        // line, so the admit→deny transition was missed forever. (audit cycle-8 F8.)
+        if !needs_deny && !needs_admit && (score - state.last_score).abs() < 0.005 {
+            return;
+        }
+        state.last_score = score;
+        if needs_deny {
             self.admitting.store(false, Ordering::Relaxed);
             let _ = self.admitting_tx.send(false);
-        } else if !currently_admitting && score <= self.cfg.congestion_low {
+        } else if needs_admit {
             self.admitting.store(true, Ordering::Relaxed);
             let _ = self.admitting_tx.send(true);
         }
@@ -243,6 +249,24 @@ mod tests {
         assert!(
             m.is_admitting(),
             "should resume admitting below congestion_low"
+        );
+    }
+
+    #[test]
+    fn cycle8_f8_sub_epsilon_creep_still_crosses_threshold() {
+        // max_relay=1000 → each session bumps score by 0.001, below the 0.005
+        // hysteresis epsilon. A slow creep from 0.70 across congestion_high=0.80
+        // must still flip admitting to false — the old fast path returned on
+        // |Δ|<0.005 before checking thresholds and missed the transition forever.
+        let m = monitor_with_limits(1000, 0, 0);
+        m.set_relay_sessions(700); // 0.70, admitting
+        assert!(m.is_admitting());
+        for n in 701..=801 {
+            m.set_relay_sessions(n); // each step Δscore = 0.001 < epsilon
+        }
+        assert!(
+            !m.is_admitting(),
+            "sub-epsilon creep across congestion_high must stop admitting"
         );
     }
 

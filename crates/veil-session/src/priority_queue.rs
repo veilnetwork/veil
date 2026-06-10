@@ -116,16 +116,28 @@ impl PriorityQueue {
     pub fn push(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
         let p = priority.min(3) as usize;
         if self.len() >= self.max_depth {
-            // Shed one frame from the lowest priority that has any
-            // queued — prefer victimising lower-priority traffic over
-            // dropping the incoming frame outright, so REALTIME/INTERACTIVE
-            // stays responsive even when BULK is flooding the queue.
-            for shed_p in (0..4).rev() {
+            // Shed one frame from the lowest priority that has any queued —
+            // prefer victimising lower-priority traffic over dropping the
+            // incoming frame, so REALTIME/INTERACTIVE stays responsive when
+            // BULK floods the queue. Larger index = lower priority, so scan
+            // 3→p and only victimise frames AT OR BELOW the incoming frame's
+            // priority. If everything queued outranks the incoming frame (e.g.
+            // a BACKGROUND cover frame arriving into a queue full of REALTIME
+            // data), drop the INCOMING frame instead of inverting priority.
+            // (audit cycle-8 F4.)
+            let mut shed = false;
+            for shed_p in (p..4).rev() {
                 if !self.queues[shed_p].is_empty() {
                     self.queues[shed_p].pop_front();
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
+                    shed = true;
                     break;
                 }
+            }
+            if !shed {
+                // Nothing at-or-below incoming priority to evict — drop it.
+                self.drops_total.fetch_add(1, Ordering::Relaxed);
+                return;
             }
         }
         self.queues[p].push_back(frame);
@@ -319,6 +331,37 @@ mod tests {
         assert_eq!(pq.pop().unwrap().as_ref(), b"rt0");
         assert_eq!(pq.pop().unwrap().as_ref(), b"rt1");
         assert_eq!(pq.peek_priority(), None);
+    }
+
+    #[test]
+    fn cycle8_f4_full_realtime_queue_drops_incoming_background_not_realtime() {
+        let drops = Arc::new(AtomicU64::new(0));
+        let mut pq =
+            PriorityQueue::with_capacity_and_drop_counter(DEFAULT_WEIGHTS, 2, Arc::clone(&drops));
+        pq.push(REALTIME, arc(b"rt0"));
+        pq.push(REALTIME, arc(b"rt1"));
+        // At depth — an incoming BACKGROUND must NOT evict a REALTIME frame.
+        pq.push(BACKGROUND, arc(b"bg"));
+        assert_eq!(drops.load(Ordering::Relaxed), 1, "incoming bg dropped");
+        // Both REALTIME frames survive, in FIFO order; no bg leaked in.
+        assert_eq!(pq.pop().unwrap().as_ref(), b"rt0");
+        assert_eq!(pq.pop().unwrap().as_ref(), b"rt1");
+        assert_eq!(pq.pop(), None);
+    }
+
+    #[test]
+    fn cycle8_f4_incoming_realtime_sheds_lower_priority_background() {
+        let drops = Arc::new(AtomicU64::new(0));
+        let mut pq =
+            PriorityQueue::with_capacity_and_drop_counter(DEFAULT_WEIGHTS, 2, Arc::clone(&drops));
+        pq.push(BACKGROUND, arc(b"bg0"));
+        pq.push(BACKGROUND, arc(b"bg1"));
+        // Incoming REALTIME outranks queued BACKGROUND → shed oldest bg, admit rt.
+        pq.push(REALTIME, arc(b"rt"));
+        assert_eq!(drops.load(Ordering::Relaxed), 1, "one bg shed");
+        assert_eq!(pq.pop().unwrap().as_ref(), b"rt", "REALTIME served first");
+        assert_eq!(pq.pop().unwrap().as_ref(), b"bg1", "oldest bg0 was shed");
+        assert_eq!(pq.pop(), None);
     }
 
     #[test]
