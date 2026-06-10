@@ -847,13 +847,18 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
         return Err(format!("hex string has odd length: {}", s.len()));
     }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for i in (0..s.len()).step_by(2) {
-        let byte = u8::from_str_radix(&s[i..i + 2], 16)
-            .map_err(|e| format!("invalid hex at offset {i}: {e}"))?;
-        out.push(byte);
-    }
-    Ok(out)
+    // Operate on bytes, not `&str` slices: `&s[i..i + 2]` panics when the
+    // index lands inside a multi-byte UTF-8 char (e.g. "€a" is 4 bytes, so the
+    // even-length check passes but s[0..2] cuts the 3-byte '€' mid-char).
+    s.as_bytes()
+        .chunks(2)
+        .enumerate()
+        .map(|(j, chunk)| {
+            let pair = std::str::from_utf8(chunk)
+                .map_err(|_| format!("non-ASCII hex at offset {}", j * 2))?;
+            u8::from_str_radix(pair, 16).map_err(|e| format!("invalid hex at offset {}: {e}", j * 2))
+        })
+        .collect()
 }
 
 fn normalize_identity_config(
@@ -1053,6 +1058,17 @@ mod tests {
         test_support::{BufferIo, MockConfigOps},
     };
     use veil_cfg::SignatureAlgorithm;
+
+    #[test]
+    fn parse_hex_bytes_rejects_non_ascii_without_panic() {
+        // "€a" is 4 bytes ('€' = 3 + 'a' = 1), so the even-length gate passes;
+        // the old `&s[0..2]` cut the 3-byte char mid-boundary and panicked.
+        assert!(parse_hex_bytes("€a").is_err());
+        // Odd byte length still rejected cleanly.
+        assert!(parse_hex_bytes("abc").is_err());
+        // Happy path unaffected.
+        assert_eq!(parse_hex_bytes("0a0b0c").unwrap(), vec![0x0a, 0x0b, 0x0c]);
+    }
 
     #[test]
     fn command_io_collects_validate_output() {
