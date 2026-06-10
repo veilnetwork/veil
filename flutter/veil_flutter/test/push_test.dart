@@ -112,4 +112,52 @@ void main() {
       expect(regFn, isNotNull);
     });
   });
+
+  group('encodePushToken provider-tagged wire format (H12)', () {
+    test('FCM token encodes [0][len BE][token]', () {
+      final token = Uint8List.fromList([0xAA, 0xBB, 0xCC]);
+      final wire = VeilPush.encodePushToken(
+        provider: PushProvider.fcm,
+        token: token,
+      );
+      expect(wire[0], 0, reason: 'FCM provider byte is 0');
+      expect(wire[1], 0, reason: 'len high byte');
+      expect(wire[2], 3, reason: 'len low byte (3)');
+      expect(wire.sublist(3), token);
+      expect(wire.length, 6);
+    });
+
+    test('APNs provider byte is 1', () {
+      final wire = VeilPush.encodePushToken(
+        provider: PushProvider.apns,
+        token: Uint8List.fromList([0x01]),
+      );
+      expect(wire[0], 1);
+    });
+
+    test('provider wire bytes match the relay PushProvider enum', () {
+      expect(PushProvider.fcm.wireByte, 0);
+      expect(PushProvider.apns.wireByte, 1);
+    });
+
+    test('rejects a token whose tagged length exceeds the cap', () {
+      // 3-byte header + token must stay within veilMaxPushTokenLen (384).
+      final tooBig = Uint8List(384); // 3 + 384 = 387 > 384
+      expect(
+        () => VeilPush.encodePushToken(
+          provider: PushProvider.fcm,
+          token: tooBig,
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('empty token encodes a 3-byte header with zero length', () {
+      final wire = VeilPush.encodePushToken(
+        provider: PushProvider.fcm,
+        token: Uint8List(0),
+      );
+      expect(wire, Uint8List.fromList([0, 0, 0]));
+    });
+  });
 }

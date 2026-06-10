@@ -75,6 +75,20 @@ import 'types.dart';
 
 const MethodChannel _channel = MethodChannel('veil_flutter/push');
 
+/// Push provider tag for the sealed-token wire format. The wire byte values
+/// (FCM = 0, APNs = 1) MUST match `veil_push::token::PushProvider` on the relay
+/// side — the relay's `PushToken::decode` reads byte 0 as this tag. (audit
+/// cycle-8 H12.)
+enum PushProvider {
+  fcm(0),
+  apns(1);
+
+  const PushProvider(this.wireByte);
+
+  /// On-wire tag byte consumed by the relay's `PushToken::decode`.
+  final int wireByte;
+}
+
 /// Push-notification wake-up controls.
 ///
 /// All methods are silent no-ops on platforms without a push system
@@ -340,6 +354,64 @@ class VeilPush {
       calloc.free(outLen);
       calloc.free(errOut);
     }
+  }
+
+  /// Encode a provider-tagged push token into the relay's wire format
+  /// (audit cycle-8 H12):
+  ///
+  /// ```text
+  /// [0]        provider u8  (FCM = 0, APNs = 1)
+  /// [1..3]     token_len u16 BE
+  /// [3..]      token bytes
+  /// ```
+  ///
+  /// This is the plaintext the relay's `PushToken::decode` expects. The shipped
+  /// client previously sealed a BARE token, so the relay read the token's first
+  /// byte as the provider tag and the next two as a length — routing to the
+  /// wrong provider or failing to decode. Always seal the OUTPUT of this helper
+  /// (or use [sealPushToken]), never a raw token, for push registrations.
+  ///
+  /// [token] is the raw provider token (FCM registration token / APNs device
+  /// token). The 3-byte header brings the sealed plaintext to `token.length + 3`,
+  /// which must stay within [ffi.veilMaxPushTokenLen]; throws [ArgumentError]
+  /// otherwise.
+  static Uint8List encodePushToken({
+    required PushProvider provider,
+    required Uint8List token,
+  }) {
+    final total = 3 + token.length;
+    if (total > ffi.veilMaxPushTokenLen) {
+      throw ArgumentError(
+        'provider-tagged token length $total (3-byte header + ${token.length}) '
+        'exceeds veilMaxPushTokenLen (${ffi.veilMaxPushTokenLen})',
+      );
+    }
+    if (token.length > 0xffff) {
+      throw ArgumentError('token length ${token.length} exceeds u16 range');
+    }
+    final out = Uint8List(total);
+    out[0] = provider.wireByte;
+    out[1] = (token.length >> 8) & 0xff;
+    out[2] = token.length & 0xff;
+    out.setRange(3, total, token);
+    return out;
+  }
+
+  /// Seal a provider-tagged push token to a push-relay's X25519 public key —
+  /// the correct entry point for push registrations (audit cycle-8 H12).
+  ///
+  /// Equivalent to `sealPushEnvelope(token: encodePushToken(...), relayPk: ...)`:
+  /// it prepends the provider tag + length header [encodePushToken] documents
+  /// before sealing, so the relay's `PushToken::decode` recovers the right
+  /// provider and token. Use this instead of [sealPushEnvelope] for push tokens;
+  /// [sealPushEnvelope] remains the raw-bytes sealer for wake-HMAC keys.
+  static Uint8List sealPushToken({
+    required PushProvider provider,
+    required Uint8List token,
+    required Uint8List relayPk,
+  }) {
+    final wire = encodePushToken(provider: provider, token: token);
+    return sealPushEnvelope(token: wire, relayPk: relayPk);
   }
 
   /// Generate a fresh 32-byte wake-HMAC key via `OsRng` (Epic 489.10
