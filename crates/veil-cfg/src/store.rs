@@ -391,6 +391,26 @@ pub fn build_stub_config_with_ephemeral_identity() -> Result<Config> {
 /// uses [`veil_util::atomic_write`] so a crash mid-write
 /// leaves either the old config or the new one, never truncated garbage
 /// that would prevent the node from starting.
+/// Write `config` to `path` as a FRESH, fully-rendered document — never the
+/// comment-preserving `patch_existing` path, even when the file already exists.
+///
+/// `save_config` patches an existing file in place, but `patch_existing` only
+/// rewrites the sections it hand-maintains (global / transport sub-tables /
+/// identity / ipc / peers / listen / metrics / bootstrap) — it does NOT emit
+/// `[mesh]` / `[mobile]` / `[session]` / `[abuse]` or transport scalars like
+/// `default_sni`. So patching over an existing file SILENTLY DROPS any
+/// profile-specific section an authoritative full-config writer set in memory
+/// (audit cycle-10). `init --force` is exactly such a writer: it builds a
+/// complete `Config` from defaults + identity + `apply_profile_defaults`, so it
+/// must render the whole struct, not patch the file it is overwriting.
+pub fn render_config(path: &Path, config: &Config) -> Result<()> {
+    let format = FileFormat::from_path(path)?;
+    let backend = format::backend(format);
+    let content = backend.render(config)?;
+    veil_util::atomic_write(path, content.as_bytes())?;
+    Ok(())
+}
+
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     let format = FileFormat::from_path(path)?;
     let backend = format::backend(format);
@@ -486,6 +506,48 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// cycle-10 regression: `render_config` over an EXISTING file emits a
+    /// fully-rendered document, preserving profile-set fields that the
+    /// `save_config` patch path silently drops (here `transport.default_sni`,
+    /// a transport scalar `patch_existing`/`set_transport` does not write).
+    /// This is the mechanism behind `init --force` losing a profile's
+    /// anti-censorship defaults; `init` now renders instead of patching.
+    #[test]
+    fn render_config_over_existing_file_preserves_profile_scalars() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("veil-render-init-test-{unique}"));
+        let path = root.join("config.toml");
+        fs::create_dir_all(&root).expect("create temp dir");
+        // Pre-existing file WITHOUT default_sni (as a prior `init` would leave).
+        fs::write(&path, "[global]\nruntime_flavor = \"multi_thread\"\n").expect("seed config");
+
+        let mut config = Config::default();
+        config.transport.default_sni = Some("www.example.com".into());
+
+        // Patch path drops the transport scalar...
+        save_config(&path, &config).expect("patch save");
+        let patched = load_config(&path).expect("reload patched");
+        assert_eq!(
+            patched.transport.default_sni, None,
+            "patch_existing drops transport.default_sni (the bug)",
+        );
+
+        // ...render path keeps it.
+        render_config(&path, &config).expect("render save");
+        let rendered = load_config(&path).expect("reload rendered");
+        assert_eq!(
+            rendered.transport.default_sni,
+            Some("www.example.com".into()),
+            "render_config must preserve the profile-set default_sni",
+        );
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&root);
