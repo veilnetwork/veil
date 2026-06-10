@@ -1836,3 +1836,28 @@ pub fn phase650_uri_scheme_extracts_prefix() {
     assert_eq!(uri_scheme("just-a-host:0"), None);
     assert_eq!(uri_scheme(""), None);
 }
+
+#[test]
+fn pick_quorum_match_single_replica_gated_by_allow_single() {
+    // audit cycle-9: a single replica is accepted ONLY when the caller marks it
+    // independently trustworthy (self-certifying, re-verified). For
+    // non-self-certifying values (NameClaim) a lone remote response must be
+    // rejected so a single Sybil responder can't hijack a name.
+    let one = vec![vec![1u8, 2, 3]];
+    assert_eq!(
+        super::pick_quorum_match(&one, 2, true),
+        Some(vec![1u8, 2, 3]),
+        "self-certifying single replica accepted"
+    );
+    assert_eq!(
+        super::pick_quorum_match(&one, 2, false),
+        None,
+        "non-self-certifying single replica must be rejected (name-hijack guard)"
+    );
+    // Quorum still works regardless of the flag: 2 agreeing of 3 meets threshold.
+    let three = vec![vec![9u8], vec![9u8], vec![7u8]];
+    assert_eq!(super::pick_quorum_match(&three, 2, false), Some(vec![9u8]));
+    // Below threshold (all distinct) → None.
+    let distinct = vec![vec![1u8], vec![2u8], vec![3u8]];
+    assert_eq!(super::pick_quorum_match(&distinct, 2, false), None);
+}
