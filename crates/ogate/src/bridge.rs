@@ -500,6 +500,26 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                             // a guard that should be short-lived.
                             drop(snap);
 
+                            // Oversize guard (audit cycle-9 — completes cycle-8 H10):
+                            // hoisted ABOVE the batching/raw split so it covers BOTH
+                            // paths. A packet above the obfs4-safe payload ceiling makes
+                            // wrap_frame return OversizedFrame, exits the writer task and
+                            // tears down the WHOLE session. Previously the guard lived
+                            // only in the batching branch's solo-ship sub-path, so with
+                            // `[batch] enabled = false` (raw mode) a full-MTU packet still
+                            // tore the session down. Drop just this packet; the peer
+                            // retransmits at a smaller PMTU. Keep tunnel MTU ≤ the ceiling.
+                            if pkt.len() > MAX_OBFS4_SOLO_PAYLOAD_BYTES {
+                                tracing::warn!(
+                                    peer = %hex::encode(peer_nid),
+                                    len = pkt.len(),
+                                    ceiling = MAX_OBFS4_SOLO_PAYLOAD_BYTES,
+                                    "egress: dropping oversize packet (would exceed obfs4 \
+                                     frame ceiling and tear down the session)",
+                                );
+                                continue;
+                            }
+
                             if batching_enabled {
                                 // Per-record size = u16 len + pkt bytes.
                                 let pkt_len = pkt.len();
@@ -509,23 +529,9 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                                 // — send raw to keep wire frame under the obfs4
                                 // 16K ciphertext cap.  E26 behaviour for big pkts.
                                 if record_size + 2 /* batch header */ > egress_flush_bytes {
-                                    // Oversize guard (audit cycle-8 H10): a solo
-                                    // packet above the obfs4-safe payload ceiling
-                                    // would make `wrap_frame` return OversizedFrame,
-                                    // exit the writer task and tear down the WHOLE
-                                    // session. Drop just this packet — the peer's
-                                    // stack retransmits at a smaller PMTU. Operators
-                                    // should keep tunnel MTU ≤ this ceiling.
-                                    if pkt_len > MAX_OBFS4_SOLO_PAYLOAD_BYTES {
-                                        tracing::warn!(
-                                            peer = %hex::encode(peer_nid),
-                                            len = pkt_len,
-                                            ceiling = MAX_OBFS4_SOLO_PAYLOAD_BYTES,
-                                            "egress: dropping oversize solo packet (would exceed \
-                                             obfs4 frame ceiling and tear down the session)",
-                                        );
-                                        continue;
-                                    }
+                                    // (Oversize is already guarded above the
+                                    // batching/raw split — this solo-ship path only
+                                    // handles packets within the obfs4 ceiling.)
                                     // Flush any pending batch first to preserve
                                     // ordering relative to this big packet.
                                     if let Some(pb) = batches.peek_mut(&peer_nid)
