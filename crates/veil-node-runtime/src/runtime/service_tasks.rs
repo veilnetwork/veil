@@ -1256,6 +1256,11 @@ impl NodeRuntime {
         // writes successes into. Tick path counts losses and periodically
         // demote_via on threshold breach.
         let loss_tracker = Arc::clone(&self.dispatcher.loss_tracker);
+        // Signal 2 (Epic 482.3/482.4 Phase A): feed exhausted-retransmit
+        // delivery failures into the anonymity relay-reputation ledger so a
+        // relay that repeatedly drops relayed frames is downweighted in future
+        // circuit hop selection. Guarded below to relayed timeouts only.
+        let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
@@ -1405,10 +1410,23 @@ impl NodeRuntime {
                             content_id,
                             src_app_id,
                             next_hop,
+                            dst_node_id,
                         } => {
                             // final attempt also failed — record the
                             // loss before notifying the app.
                             loss_tracker.record_loss(next_hop);
+                            // Signal 2 (Phase A): blame the RELAY only for a
+                            // relayed timeout. When next_hop == dst_node_id the
+                            // frame went direct to the recipient, so the timeout
+                            // means the DESTINATION is offline — not a relay
+                            // misbehaving — and attributing it would unfairly
+                            // bury a node (the ledger has no decay). The record
+                            // is per-sender-local and only ever consulted by the
+                            // anonymity circuit picker, so a non-relay next_hop
+                            // that slips through is harmless (never a candidate).
+                            if next_hop != dst_node_id {
+                                relay_reputation.record_failure(next_hop);
+                            }
                             // Notify the originating IPC application that all
                             // retransmit attempts for this message have been
                             // exhausted. The app receives AppSendFailed on its
