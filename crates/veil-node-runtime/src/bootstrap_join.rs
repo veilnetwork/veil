@@ -41,10 +41,16 @@ pub struct BootstrapJoinForwarder {
     /// app-added peers get the same treatment so iterative lookups
     /// can route through them.
     dht: Arc<veil_dht::KademliaService>,
-    /// Notify shared with the gateway-failover loop — kicked after a
-    /// successful join so the failover task picks up the new peer
-    /// immediately rather than waiting for its periodic poll.
-    gateway_failover_notify: Arc<tokio::sync::Notify>,
+    /// Runtime-owned dial queue. The forwarder cannot spawn an
+    /// outbound-connector itself (that needs `&NodeServices` + the shutdown
+    /// `watch::Sender`, neither of which an IPC sink holds), so a registered
+    /// app-added peer is handed to a drain task in `spawn_ipc_server` that owns
+    /// those handles and calls `spawn_outbound_peers`. (audit cycle-10: replaces
+    /// the previous `gateway_failover_notify` kick, which woke a loop that only
+    /// ever dials `live_gateways()` and filters `state.peers` to
+    /// `peer_id >= 0xC000_0000` — so an app-added peer at `0x8800_0000` was
+    /// never actually dialed despite the "dial in flight" success reply.)
+    dial_tx: tokio::sync::mpsc::UnboundedSender<PeerConfigEntry>,
 }
 
 impl BootstrapJoinForwarder {
@@ -52,14 +58,14 @@ impl BootstrapJoinForwarder {
         logger: Arc<NodeLogger>,
         state: Arc<Mutex<NodeState>>,
         dht: Arc<veil_dht::KademliaService>,
-        gateway_failover_notify: Arc<tokio::sync::Notify>,
+        dial_tx: tokio::sync::mpsc::UnboundedSender<PeerConfigEntry>,
     ) -> Self {
         Self {
             logger,
             state,
             next_peer_id_offset: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             dht,
-            gateway_failover_notify,
+            dial_tx,
         }
     }
 
@@ -234,30 +240,110 @@ impl BootstrapJoinSink for BootstrapJoinForwarder {
             &peer.transport,
         ));
 
-        // Note: the actual outbound-connector task is NOT spawned here.
-        // Spawning requires `&NodeServices` + `&watch::Sender`, neither
-        // of which the sink holds (would create circular deps).
-        // Instead we kick `gateway_failover_notify` — the failover loop
-        // already polls state.peers periodically and spawns connector
-        // tasks for entries it hasn't seen, so the new peer gets dialed
-        // within ~5 s rather than ~60 s without the kick. Tradeoff:
-        // saves a complex sink → runtime upcall; cost is up to 5 s
-        // latency before first dial attempt.
-        self.gateway_failover_notify.notify_waiters();
+        // Hand the peer to the runtime-owned dial drain (spawn_ipc_server),
+        // which holds the `&NodeServices` + shutdown `watch::Sender` an IPC sink
+        // cannot, and spawns the actual reconnect loop via `spawn_outbound_peers`.
+        // A closed channel means the daemon is shutting down — registration in
+        // state still succeeded, so report success but say the dial was deferred
+        // rather than claiming one is in flight.
+        let dial_started = self.dial_tx.send(entry).is_ok();
 
         self.logger.info(
             "ipc.bootstrap_join.registered",
             format!(
-                "node_id={} transport={} peer_id={}",
+                "node_id={} transport={} peer_id={} dial_started={}",
                 veil_util::hex_short(&node_id_bytes),
                 veil_util::redact_addr_for_log(&peer.transport),
                 peer_id,
+                dial_started,
             ),
         );
 
         BootstrapJoinOutcome::Ok {
             peer_node_id: node_id_bytes,
-            detail: format!("registered; outbound dial in flight (peer_id={})", peer_id),
+            detail: if dial_started {
+                format!("registered; outbound dial in flight (peer_id={peer_id})")
+            } else {
+                format!("registered; dial deferred — daemon stopping (peer_id={peer_id})")
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::NodeState;
+
+    fn empty_state() -> Arc<Mutex<NodeState>> {
+        let kp = veil_crypto::generate_keypair(veil_cfg::SignatureAlgorithm::Ed25519);
+        let node_id =
+            NodeId::from_public_key(veil_cfg::SignatureAlgorithm::Ed25519, &kp.public_key).unwrap();
+        Arc::new(Mutex::new(NodeState::new(
+            node_id,
+            crate::types::NodeRole::default(),
+            std::path::PathBuf::from("/tmp/test-config.toml"),
+            true,
+            std::time::Instant::now(),
+            false,
+            None,
+            std::iter::empty(),
+            std::iter::empty(),
+        )))
+    }
+
+    /// cycle-10 regression: a registered app-added bootstrap peer must be
+    /// ENQUEUED for an actual outbound dial (the runtime drain in
+    /// spawn_ipc_server spawns the connector), not silently dropped. Pre-fix
+    /// the forwarder only kicked gateway_failover_notify, a loop that never
+    /// dials state.peers entries, so the peer was registered but never dialed
+    /// despite the "dial in flight" reply.
+    #[test]
+    fn join_uri_registers_peer_and_enqueues_dial() {
+        let kp = veil_crypto::generate_keypair(veil_cfg::SignatureAlgorithm::Ed25519);
+        let peer = BootstrapPeer {
+            transport: "tcp://10.9.8.7:9000".to_owned(),
+            public_key: kp.public_key.clone(),
+            nonce: "AAAAAAAA".to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        };
+        let uri = veil_bootstrap::encode_bootstrap_uri(&peer).expect("encode bootstrap uri");
+
+        let state = empty_state();
+        let dht = Arc::new(veil_dht::KademliaService::new([7u8; 32]));
+        let (dial_tx, mut dial_rx) = tokio::sync::mpsc::unbounded_channel();
+        let forwarder = BootstrapJoinForwarder::new(
+            Arc::new(NodeLogger::new_noop()),
+            Arc::clone(&state),
+            dht,
+            dial_tx,
+        );
+
+        let outcome = forwarder.join_uri(&uri, None, None);
+        assert!(
+            matches!(outcome, BootstrapJoinOutcome::Ok { .. }),
+            "join must succeed, got {outcome:?}",
+        );
+
+        // The peer is enqueued for a REAL dial (the core regression).
+        let dialed = dial_rx
+            .try_recv()
+            .expect("app-added peer must be enqueued for dial");
+        assert_eq!(dialed.transport, "tcp://10.9.8.7:9000");
+        assert!(
+            dialed.peer_id.get() >= APP_ADDED_PEER_ID_BASE,
+            "dialed entry must use the app-added synthetic peer_id range",
+        );
+
+        // ...and registered in state.
+        let st = state.lock().unwrap();
+        assert!(
+            st.peers
+                .values()
+                .any(|e| e.transport == "tcp://10.9.8.7:9000"),
+            "peer must be registered in state.peers",
+        );
     }
 }

@@ -988,13 +988,44 @@ impl NodeRuntime {
         // without it, an app receiving an `veil:` deep-link would
         // have to either re-implement the decode (Argon2id + Ed25519)
         // in Dart or shell out to veil-cli (impossible on Android).
-        let bootstrap_join: Arc<dyn veil_ipc::BootstrapJoinSink> =
+        // Runtime-owned dial drain for app-added bootstrap peers. The IPC sink
+        // can't spawn an outbound connector (needs &NodeServices + the shutdown
+        // watch::Sender); it hands each registered peer over this channel and
+        // this task — which holds both — spawns the reconnect loop. (audit
+        // cycle-10: app-added peers were previously never dialed; the old
+        // gateway_failover_notify kick woke a loop that only dials gateways.)
+        let bootstrap_join: Arc<dyn veil_ipc::BootstrapJoinSink> = {
+            let (dial_tx, mut dial_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::types::PeerConfigEntry>();
+            if let Some(shutdown_tx) = &self.shutdown_tx {
+                let dial_access = self.access();
+                let dial_shutdown_tx = shutdown_tx.clone();
+                let mut dial_shutdown_rx = shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = dial_shutdown_rx.changed() => break,
+                            recv = dial_rx.recv() => match recv {
+                                Some(entry) => {
+                                    let _ = crate::outbound_connector::spawn_outbound_peers(
+                                        vec![entry],
+                                        &dial_access,
+                                        &dial_shutdown_tx,
+                                    );
+                                }
+                                None => break, // forwarder dropped → no more joins
+                            },
+                        }
+                    }
+                });
+            }
             Arc::new(crate::bootstrap_join::BootstrapJoinForwarder::new(
                 Arc::clone(&self.logger),
                 Arc::clone(&self.state),
                 Arc::clone(&self.dht),
-                Arc::clone(&self.gateway_failover_notify),
-            ));
+                dial_tx,
+            ))
+        };
         server = server.with_bootstrap_join_sink(bootstrap_join);
         // bootstrap-invite-create sink (Epic 489.7 generator side).
         // Snapshot the daemon's `[identity]` keypair + first advertise URI
