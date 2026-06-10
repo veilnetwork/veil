@@ -153,11 +153,16 @@ pub fn context_from_config(config: &Config) -> Result<TransportContext> {
     if let Some(ref dir) = config.transport.webtunnel_decoy_dir {
         ctx.webtunnel_decoy_dir = Some(dir.clone());
     }
-    // Optional response-timing floor (anti-probe). 0 == disabled (same as unset).
-    if let Some(ms) = config.transport.webtunnel_response_floor_ms
-        && ms > 0
-    {
-        ctx.webtunnel_response_floor = Some(std::time::Duration::from_millis(ms));
+    // Response-timing floor (anti-probe). audit cycle-9: ON by default — when
+    // unset, apply a 40 ms floor so the instant tunnel `101` doesn't stand out
+    // against a decoy's file-read / backend latency; an explicit `0` disables it.
+    const DEFAULT_WEBTUNNEL_FLOOR_MS: u64 = 40;
+    let floor_ms = config
+        .transport
+        .webtunnel_response_floor_ms
+        .unwrap_or(DEFAULT_WEBTUNNEL_FLOOR_MS);
+    if floor_ms > 0 {
+        ctx.webtunnel_response_floor = Some(std::time::Duration::from_millis(floor_ms));
     }
     // Anti-censorship: optional SOCKS fallback for outbound dials.
     // Default `None` — direct outbound only.  Operator opts in by
@@ -263,6 +268,24 @@ mod bandwidth_mimicry_failclosed_tests {
         assert!(!cfg.transport.bandwidth_mimicry_enabled);
         assert!(!cfg.transport.experimental_allow_noop_mimicry);
         let _ = context_from_config(&cfg).expect("default config must build");
+    }
+
+    #[test]
+    fn webtunnel_response_floor_defaults_to_40ms() {
+        // audit cycle-9: the anti-probe timing floor is ON by default (40 ms)
+        // when unset; an explicit 0 disables it.
+        let mut cfg = Config::default();
+        assert!(cfg.transport.webtunnel_response_floor_ms.is_none());
+        let ctx = context_from_config(&cfg).expect("default builds");
+        assert_eq!(
+            ctx.webtunnel_response_floor,
+            Some(std::time::Duration::from_millis(40)),
+            "unset must apply the 40 ms default floor"
+        );
+
+        cfg.transport.webtunnel_response_floor_ms = Some(0);
+        let ctx0 = context_from_config(&cfg).expect("builds with floor disabled");
+        assert_eq!(ctx0.webtunnel_response_floor, None, "0 disables the floor");
     }
 }
 
