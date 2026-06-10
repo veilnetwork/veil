@@ -3002,7 +3002,7 @@ impl NodeRuntime {
             directory::{
                 DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
             },
-            sender::build_outbound_anonymous_cell_with_diversity,
+            sender::{DiversityOutcome, build_outbound_anonymous_cell_with_diversity_reported},
         };
 
         // Wrap data in `AppDeliverPayload` so the receiver's
@@ -3086,15 +3086,25 @@ impl NodeRuntime {
         let diversity_key_of =
             move |node_id: &[u8; 32]| -> Option<String> { diversity_map.get(node_id).cloned() };
 
-        let (first_hop_node_id, cell) = build_outbound_anonymous_cell_with_diversity(
-            payload,
-            &usable_relays,
-            rtt_estimator,
-            diversity_key_of,
-            target_node_id,
-            target_x25519_pk,
-            hop_count,
-        )?;
+        let ((first_hop_node_id, cell), diversity) =
+            build_outbound_anonymous_cell_with_diversity_reported(
+                payload,
+                &usable_relays,
+                rtt_estimator,
+                diversity_key_of,
+                target_node_id,
+                target_x25519_pk,
+                hop_count,
+            )?;
+        if diversity == DiversityOutcome::DegradedToLatency {
+            // AS-correlation protection was silently lost — surface it so an
+            // operator can see when circuits aren't netblock-diverse. (cycle-8 F4.)
+            log::warn!(
+                "anonymity.circuit.diversity_degraded hop_count={hop_count} \
+                 candidates={} — no AS-diverse relay set; fell back to latency-only",
+                usable_relays.len()
+            );
+        }
 
         // Step 5: hit the wire. RelayChain::Hop frame to first hop's
         // session. If first_hop has no live session, the send is a
@@ -3247,7 +3257,7 @@ impl NodeRuntime {
             directory::{
                 DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
             },
-            sender::build_outbound_anonymous_cell_with_diversity,
+            sender::{DiversityOutcome, build_outbound_anonymous_cell_with_diversity_reported},
         };
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3308,15 +3318,23 @@ impl NodeRuntime {
         let diversity_key_of =
             move |node_id: &[u8; 32]| -> Option<String> { diversity_map.get(node_id).cloned() };
 
-        let (first_hop_node_id, cell) = build_outbound_anonymous_cell_with_diversity(
-            &payload_bytes,
-            &usable_relays,
-            rtt_estimator,
-            diversity_key_of,
-            ad.rendezvous_node_id,
-            rendezvous_relay.hop.pubkey,
-            hop_count,
-        )?;
+        let ((first_hop_node_id, cell), diversity) =
+            build_outbound_anonymous_cell_with_diversity_reported(
+                &payload_bytes,
+                &usable_relays,
+                rtt_estimator,
+                diversity_key_of,
+                ad.rendezvous_node_id,
+                rendezvous_relay.hop.pubkey,
+                hop_count,
+            )?;
+        if diversity == DiversityOutcome::DegradedToLatency {
+            log::warn!(
+                "anonymity.rendezvous.diversity_degraded hop_count={hop_count} \
+                 candidates={} — no AS-diverse relay set; fell back to latency-only",
+                usable_relays.len()
+            );
+        }
 
         use veil_proto::{
             codec::encode_header,
