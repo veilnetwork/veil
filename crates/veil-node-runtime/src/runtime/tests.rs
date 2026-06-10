@@ -1375,6 +1375,54 @@ async fn bans_survive_reload_crit4() {
     let _ = fs::remove_file(&path);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn rejected_handshake_does_not_leak_session_registry_crit6() {
+    // audit cycle-9 CRIT-6: the SessionEntry was inserted into session_registry
+    // BEFORE the accept gates, and no SessionGuard is created on a reject path,
+    // so every handshake-then-reject leaked a ~1 KB entry into the unbounded
+    // `sessions` map (and clobbered by_peer for a peer with a live session).
+    // A second concurrent session from the SAME peer is rejected at the dedup
+    // gate AFTER the handshake crypto completes — exactly the post-cache reject
+    // path. After the fix the second session's entry is never inserted, so
+    // session_registry stays at 1, not 2.
+    let path = save_test_config("node-runtime-crit6", runtime_config_with_metrics()).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.expect("runtime starts");
+    let listen = runtime.listens().into_iter().next().expect("listen entry");
+    let addr = listen.local_addr.as_ref().unwrap().clone();
+
+    // Session 1 — accepted and registered.
+    let mut stream1 = TcpStream::connect(&addr).await.expect("connects 1");
+    complete_test_handshake(&mut stream1).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if veil_util::lock!(runtime.session_registry).len() == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("session 1 registered");
+
+    // Session 2 — same client identity, so the dedup gate rejects it AFTER its
+    // handshake completes. Keep stream1 alive so the dedup actually fires.
+    let mut stream2 = TcpStream::connect(&addr).await.expect("connects 2");
+    complete_test_handshake(&mut stream2).await;
+    sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        veil_util::lock!(runtime.session_registry).len(),
+        1,
+        "dedup-rejected second session must NOT leak into session_registry (CRIT-6) — \
+         len would be 2 before the fix"
+    );
+
+    let _ = stream2.shutdown().await;
+    let _ = stream1.shutdown().await;
+    runtime.stop().await.expect("runtime stops");
+    let _ = fs::remove_file(path);
+}
+
 /// Audit M7: the ephemeral-rotator shutdown senders must be drained out of the
 /// runtime on stop/reload (so the list does not grow unbounded across reloads)
 /// and actually signalled (the old code only ever pushed — the documented

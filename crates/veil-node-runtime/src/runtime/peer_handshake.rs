@@ -80,11 +80,17 @@ pub enum PeerVerificationError {
 /// reputation-aware role downgrade, cap-flags, ML-KEM EK, battery,
 /// Vivaldi, hot-standby alt URI) from a single handshake result.  All work
 /// is synchronous — the caller remains responsible for any `await` points.
+/// Populate the bounded per-peer caches (pubkeys, roles, cap-flags, ML-KEM,
+/// battery, vivaldi, sovereign bindings) from a completed handshake and BUILD
+/// the [`veil_session::SessionEntry`] for the session — but do NOT insert it
+/// into `session_registry`. The caller registers the returned entry only after
+/// the accept gates pass (audit cycle-9 CRIT-6).
+#[must_use]
 pub fn cache_peer_handshake_state(
     runtime: &SessionRuntimeContext,
     r: &OvlHandshakeResult,
     primary_uri: &str,
-) {
+) -> veil_session::SessionEntry {
     let peer_id = r.remote_identity_payload.node_id;
     // LOCK ORDER: canonical workspace-wide order (see session_guard.rs) is
     // `session_registry` (#3) → `peer_sovereign_identities` (#5).  However
@@ -131,15 +137,15 @@ pub fn cache_peer_handshake_state(
         }
         // sovereign_g released here.
     };
-    lock!(runtime.session_registry).insert(veil_session::SessionEntry {
-        session_id: r.session_keys.session_id,
-        remote_node_id: peer_id,
-        remote_identity: r.remote_identity_payload.clone(),
-        remote_capabilities: r.remote_capabilities.clone(),
-        remote_attach: r.remote_attach.clone(),
-        remote_role: r.remote_role,
-        validated_sovereign_identity: validated,
-    });
+    // NOTE (audit cycle-9 CRIT-6): the SessionEntry is BUILT here (and returned
+    // at the end) but NOT inserted into `session_registry` yet. The caller
+    // inserts it only AFTER the accept gates (identity-mismatch / allowlist /
+    // banned / at-limit / dedup / over-cap) pass. Previously the insert happened
+    // here, before those gates — so every handshake-then-reject leaked a
+    // ~1 KB SessionEntry into the unbounded `sessions` map (no SessionGuard is
+    // created on a reject path), and the pre-dedup insert clobbered `by_peer`
+    // for a peer that still had a live session. Deferring the insert past the
+    // gates fixes both.
     // Cache the peer's raw public key for signature verification.  Skip
     // if public_key is empty — this happens during session resumption
     // (fast-path reconnect via ticket) where the synthetic IdentityPayload
@@ -294,6 +300,17 @@ pub fn cache_peer_handshake_state(
             ),
         );
     }
+
+    // Built here, inserted by the caller only after the accept gates pass.
+    veil_session::SessionEntry {
+        session_id: r.session_keys.session_id,
+        remote_node_id: peer_id,
+        remote_identity: r.remote_identity_payload.clone(),
+        remote_capabilities: r.remote_capabilities.clone(),
+        remote_attach: r.remote_attach.clone(),
+        remote_role: r.remote_role,
+        validated_sovereign_identity: validated,
+    }
 }
 
 pub async fn register_connection_session(
@@ -381,7 +398,9 @@ pub async fn register_connection_session(
         }
     }
 
-    let remote_identity: RemoteHandshakeInfo = {
+    // `pending_session_entry` is built during the handshake but inserted into
+    // `session_registry` only after the accept gates pass (audit cycle-9 CRIT-6).
+    let (remote_identity, pending_session_entry): (RemoteHandshakeInfo, veil_session::SessionEntry) = {
         let role = runtime.dispatcher.role;
         let mlkem_ek_bytes: Vec<u8> = runtime.identity.mlkem_ek.as_ref().to_vec();
         let capture_tx = Arc::clone(&runtime.dispatcher.capture_tx);
@@ -544,15 +563,18 @@ pub async fn register_connection_session(
                         )));
                     }
                 }
-                cache_peer_handshake_state(&runtime, &r, &transport);
+                let pending_session_entry = cache_peer_handshake_state(&runtime, &r, &transport);
                 let remote_discovery_mode = r.remote_capabilities.parse_discovery_mode();
-                RemoteHandshakeInfo {
-                    node_id: r.node_id,
-                    public_key: r.public_key,
-                    nonce: r.nonce,
-                    session_keys: r.session_keys,
-                    remote_discovery_mode,
-                }
+                (
+                    RemoteHandshakeInfo {
+                        node_id: r.node_id,
+                        public_key: r.public_key,
+                        nonce: r.nonce,
+                        session_keys: r.session_keys,
+                        remote_discovery_mode,
+                    },
+                    pending_session_entry,
+                )
             }
             Err(err) => {
                 runtime.logger.warn(
@@ -880,6 +902,12 @@ pub async fn register_connection_session(
             new_count > runtime.defaults.max_concurrent,
         )
     };
+    // All accept gates (identity-mismatch / allowlist / banned / at-limit /
+    // dedup / over-cap) have passed — NOW register the session in
+    // `session_registry` (audit cycle-9 CRIT-6). The matching SessionGuard
+    // below removes it on session end; a reject path above this point simply
+    // drops `pending_session_entry` without ever inserting it.
+    lock!(runtime.session_registry).insert(pending_session_entry);
     runtime.logger.info(
         "session.open",
         format!(
@@ -887,9 +915,8 @@ pub async fn register_connection_session(
             link_id, source, session_state, remote_identity.node_id
         ),
     );
-    // Notify reputation tracker of session open, keyed on sovereign
-    // node_id.  At this point the session has just been registered via
-    // `cache_peer_handshake_state`, so `node_id_for_peer` returns
+    // Notify reputation tracker of session open, keyed on sovereign node_id.
+    // The session was just registered above, so `node_id_for_peer` returns
     // `Some(...)` for sovereign peers; legacy peers fall back to peer_id.
     if let Some(ref rep) = runtime.dispatcher.reputation {
         let peer_id = *remote_identity.node_id.as_bytes();
