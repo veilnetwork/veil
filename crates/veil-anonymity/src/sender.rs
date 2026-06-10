@@ -100,6 +100,25 @@ impl From<PacketError> for SenderError {
 /// `RelayChain::Hop` frame.
 pub type OutboundAnonymousCell = ([u8; 32], [u8; CELL_SIZE]);
 
+/// Whether the relay hops of a built circuit actually satisfied the
+/// AS/netblock diversity gate, or silently degraded to latency-only
+/// selection because no diverse set existed (all candidates shared a
+/// `/16`, or the extractor returned `None` for everyone).
+///
+/// `build_outbound_anonymous_cell_with_diversity` discards this and is
+/// kept for back-compat; callers that care about AS-correlation
+/// resistance should use the `_reported` variant and surface
+/// [`DiversityOutcome::DegradedToLatency`] (log/meter) so a silent loss
+/// of diversity protection is observable. (audit cycle-8 F4.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiversityOutcome {
+    /// The diversity-aware picker found `n_relays` distinct-key hops.
+    Full,
+    /// The diversity picker could not satisfy the constraint; the circuit
+    /// fell back to latency-only selection (no AS-diversity guarantee).
+    DegradedToLatency,
+}
+
 /// Build an outbound anonymous cell. Pure helper; caller is
 /// responsible for fetching `discovered_candidates` from DHT and
 /// supplying a usable `rtt_estimator` (typically Vivaldi-derived).
@@ -153,6 +172,11 @@ where
 /// the "no constraint" treatment.  Future slice: extend the
 /// `RelayDirectoryEntry` wire format with advertised_ip/asn so the
 /// closure can derive keys for ALL candidates even without a prior dial.
+///
+/// Back-compat shim that discards the [`DiversityOutcome`]. New callers
+/// that care about AS-correlation resistance should prefer
+/// [`build_outbound_anonymous_cell_with_diversity_reported`] and surface a
+/// [`DiversityOutcome::DegradedToLatency`] result.
 pub fn build_outbound_anonymous_cell_with_diversity<F, K>(
     payload: &[u8],
     discovered_candidates: &[DiscoveredRelay],
@@ -166,6 +190,38 @@ where
     F: Fn(&[u8; 32]) -> Option<u32>,
     K: Fn(&[u8; 32]) -> Option<String>,
 {
+    build_outbound_anonymous_cell_with_diversity_reported(
+        payload,
+        discovered_candidates,
+        rtt_estimator,
+        diversity_key_of,
+        target_node_id,
+        target_x25519_pk,
+        hop_count,
+    )
+    .map(|(cell, _outcome)| cell)
+}
+
+/// Like [`build_outbound_anonymous_cell_with_diversity`] but also returns a
+/// [`DiversityOutcome`] reporting whether the AS/netblock diversity gate was
+/// actually satisfied or silently degraded to latency-only selection — so the
+/// caller (which has logging/metrics) can make a loss of AS-correlation
+/// protection observable instead of silent. (audit cycle-8 F4.)
+pub fn build_outbound_anonymous_cell_with_diversity_reported<F, K>(
+    payload: &[u8],
+    discovered_candidates: &[DiscoveredRelay],
+    rtt_estimator: F,
+    diversity_key_of: K,
+    target_node_id: [u8; 32],
+    target_x25519_pk: [u8; 32],
+    hop_count: usize,
+) -> Result<(OutboundAnonymousCell, DiversityOutcome), SenderError>
+where
+    F: Fn(&[u8; 32]) -> Option<u32>,
+    K: Fn(&[u8; 32]) -> Option<String>,
+{
+    // A 1-hop circuit has no relay hops to diversify, so it is trivially "full".
+    let mut diversity_outcome = DiversityOutcome::Full;
     if hop_count == 0 {
         return Err(SenderError::ZeroHops);
     }
@@ -222,17 +278,27 @@ where
         // the same /16, or the extractor returns None for everyone).
         // This keeps a partial-AS-protection circuit working when a
         // strict-diversity circuit would fail outright.
-        let picked = pick_circuit_hops_latency_aware_with_diversity(
+        let (picked, outcome) = match pick_circuit_hops_latency_aware_with_diversity(
             &pool,
             n_relays,
             &rtt_estimator,
             &diversity_key_of,
-        )
-        .or_else(|| pick_circuit_hops_latency_aware(&pool, n_relays, &rtt_estimator))
-        .ok_or(SenderError::InsufficientRelayCandidates {
-            need: n_relays,
-            have: pool.len(),
-        })?;
+        ) {
+            Some(p) => (p, DiversityOutcome::Full),
+            None => (
+                // No diverse set exists — fall back to latency-only so a
+                // partial-protection circuit still works rather than failing
+                // outright, but report the degradation so the caller can meter it.
+                pick_circuit_hops_latency_aware(&pool, n_relays, &rtt_estimator).ok_or(
+                    SenderError::InsufficientRelayCandidates {
+                        need: n_relays,
+                        have: pool.len(),
+                    },
+                )?,
+                DiversityOutcome::DegradedToLatency,
+            ),
+        };
+        diversity_outcome = outcome;
         hops.extend(picked);
     }
 
@@ -244,7 +310,7 @@ where
 
     let cell = build_anonymous_cell(payload, &hops)?;
     let first_hop_node_id = hops[0].node_id;
-    Ok((first_hop_node_id, cell))
+    Ok(((first_hop_node_id, cell), diversity_outcome))
 }
 
 #[cfg(test)]
@@ -628,6 +694,45 @@ mod tests {
             "fallback to latency-aware must succeed: {:?}",
             result.err()
         );
+    }
+
+    /// audit cycle-8 F4 — the `_reported` variant must surface the silent
+    /// loss of AS-diversity protection so the caller can meter it: a
+    /// two-relays-one-/16 pool degrades to latency-only, two distinct /16s
+    /// stays Full.
+    #[test]
+    fn diversity_reported_flags_degradation() {
+        let (_, relay1) = fresh_relay(0x01);
+        let (_, relay2) = fresh_relay(0x02);
+        let (_, target_pk) = fresh_keypair();
+        let mut target_id = [0u8; 32];
+        target_id[0] = 0xCC;
+
+        // Both relays share one /16 → strict diversity unsatisfiable → degraded.
+        let (_, outcome) = build_outbound_anonymous_cell_with_diversity_reported(
+            b"payload",
+            &[relay1.clone(), relay2.clone()],
+            |_| Some(10),
+            |_| Some("v4:10.0".to_owned()),
+            target_id,
+            target_pk,
+            3,
+        )
+        .expect("fallback builds");
+        assert_eq!(outcome, DiversityOutcome::DegradedToLatency);
+
+        // Distinct /16s → strict diversity satisfied → Full.
+        let (_, outcome) = build_outbound_anonymous_cell_with_diversity_reported(
+            b"payload",
+            &[relay1, relay2],
+            |_| Some(10),
+            |id: &[u8; 32]| Some(format!("v4:10.{}", id[0])),
+            target_id,
+            target_pk,
+            3,
+        )
+        .expect("diverse builds");
+        assert_eq!(outcome, DiversityOutcome::Full);
     }
 
     /// When two relays have distinct AS keys, picker should select

@@ -61,7 +61,15 @@ pub struct PeerReputation {
     /// Number of successfully relayed frames attributed to this peer.
     pub successful_relays: u64,
     /// When the current session started (for uptime accumulation).
+    /// `Some` exactly while `session_count > 0` — set on the 0→1
+    /// transition, cleared on the 1→0 transition.
     session_start: Option<Instant>,
+    /// Number of currently-open sessions for this identity. Multi-device
+    /// peers (same sovereign `node_id`, several concurrent sessions) are
+    /// reference-counted so a second device's `session_opened` does NOT
+    /// clobber the first's `session_start` and uptime accrues for the
+    /// union of overlapping sessions. (audit cycle-8 F1.)
+    session_count: u32,
     /// Last time this entry was updated.
     pub last_updated: Instant,
 }
@@ -72,6 +80,7 @@ impl PeerReputation {
             uptime_secs: 0,
             successful_relays: 0,
             session_start: None,
+            session_count: 0,
             last_updated: Instant::now(),
         }
     }
@@ -120,15 +129,28 @@ impl ReputationTracker {
     /// pass through their `peer_id` as the degenerate identity.
     pub fn session_opened(&mut self, node_id: NodeId) {
         let entry = self.get_or_create(*node_id.as_bytes());
-        entry.session_start = Some(Instant::now());
+        // Reference-count concurrent sessions: only the first open starts the
+        // uptime clock, so a second device for the same identity doesn't reset
+        // the first device's `session_start` (which would drop accrued uptime).
+        if entry.session_count == 0 {
+            entry.session_start = Some(Instant::now());
+        }
+        entry.session_count = entry.session_count.saturating_add(1);
         entry.last_updated = Instant::now();
     }
 
     /// Notify that a session with `node_id` has been closed.
-    /// Accumulates the uptime from session start to now.
+    /// Accumulates the uptime from session start to now once the LAST
+    /// concurrent session for this identity closes.
     pub fn session_closed(&mut self, node_id: NodeId) {
         if let Some(entry) = self.by_identity.get_mut(node_id.as_bytes()) {
-            if let Some(start) = entry.session_start.take() {
+            entry.session_count = entry.session_count.saturating_sub(1);
+            // Accrue uptime only on the 1→0 transition — i.e. when no device
+            // for this identity is connected anymore. Overlapping sessions thus
+            // count the wall-clock union, not each session's span double-billed.
+            if entry.session_count == 0
+                && let Some(start) = entry.session_start.take()
+            {
                 entry.uptime_secs += start.elapsed().as_secs();
             }
             entry.last_updated = Instant::now();
@@ -199,13 +221,24 @@ impl ReputationTracker {
             // have to sync `last_updated` across every caller mutation site, so
             // it's deferred rather than risked.
             if self.by_identity.len() >= self.max_entries {
-                let oldest = self
+                let oldest_closed = self
                     .by_identity
                     .iter()
                     .filter(|(_, e)| e.session_start.is_none())
                     .min_by_key(|(_, e)| e.last_updated)
                     .map(|(k, _)| *k);
-                if let Some(k) = oldest {
+                // Prefer evicting a closed-session entry (no in-progress uptime
+                // to lose). But if EVERY slot holds an open session — a flood of
+                // concurrent PoW-bound sessions — fall back to evicting the
+                // globally least-recently-updated entry so `max_entries` stays a
+                // hard bound rather than being silently exceeded. (audit cycle-8 F3.)
+                let victim = oldest_closed.or_else(|| {
+                    self.by_identity
+                        .iter()
+                        .min_by_key(|(_, e)| e.last_updated)
+                        .map(|(k, _)| *k)
+                });
+                if let Some(k) = victim {
                     self.by_identity.remove(&k);
                 }
             }
@@ -232,6 +265,52 @@ mod tests {
         let nid: NodeId = [1u8; 32].into();
         assert_eq!(rt.score(&nid), 0.0);
         assert!(!rt.can_transit(&nid));
+    }
+
+    #[test]
+    fn multi_device_sessions_are_refcounted() {
+        // audit cycle-8 F1 — a second concurrent session for the same identity
+        // must not clobber the first's session_start, and uptime accrues only
+        // once the last session closes.
+        let mut rt = ReputationTracker::new();
+        let nid: NodeId = [7u8; 32].into();
+        rt.session_opened(nid); // device 1
+        rt.session_opened(nid); // device 2
+        let e = rt.by_identity.get(nid.as_bytes()).unwrap();
+        assert_eq!(e.session_count, 2);
+        assert!(e.session_start.is_some());
+
+        rt.session_closed(nid); // device 1 leaves; device 2 still up
+        let e = rt.by_identity.get(nid.as_bytes()).unwrap();
+        assert_eq!(e.session_count, 1);
+        assert!(
+            e.session_start.is_some(),
+            "clock must keep running while a device remains"
+        );
+
+        rt.session_closed(nid); // last device leaves
+        let e = rt.by_identity.get(nid.as_bytes()).unwrap();
+        assert_eq!(e.session_count, 0);
+        assert!(e.session_start.is_none(), "clock stops on 1→0 transition");
+    }
+
+    #[test]
+    fn max_entries_is_a_hard_bound_even_when_all_open() {
+        // audit cycle-8 F3 — when every slot holds an open session, a brand-new
+        // identity must still evict (fall back to LRU) rather than grow past cap.
+        let mut rt = ReputationTracker {
+            by_identity: HashMap::new(),
+            max_entries: 2,
+        };
+        for i in 0..5u8 {
+            let nid: NodeId = [i; 32].into();
+            rt.session_opened(nid); // all sessions stay open
+        }
+        assert!(
+            rt.by_identity.len() <= 2,
+            "max_entries must bound the map under all-open flood, got {}",
+            rt.by_identity.len()
+        );
     }
 
     #[test]
