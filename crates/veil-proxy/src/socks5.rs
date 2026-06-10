@@ -315,10 +315,19 @@ pub async fn handle_connection(
     let (mut exit_r, mut exit_w) = stream.split();
     let (mut client_r, mut client_w) = client.into_split();
 
-    tokio::select! {
-        _ = tokio::io::copy(&mut client_r, &mut exit_w) => {}
-        _ = tokio::io::copy(&mut exit_r, &mut client_w) => {}
-    }
+    // Bridge bidirectionally, draining BOTH directions (audit cycle-8): the old
+    // `select!` cancelled the opposite copy on first EOF, truncating the
+    // response when a client half-closes its request. `join!` + per-direction
+    // `shutdown` mirrors the oproxy bridge.
+    let up = async {
+        let _ = tokio::io::copy(&mut client_r, &mut exit_w).await;
+        let _ = exit_w.shutdown().await;
+    };
+    let down = async {
+        let _ = tokio::io::copy(&mut exit_r, &mut client_w).await;
+        let _ = client_w.shutdown().await;
+    };
+    tokio::join!(up, down);
     Ok(())
 }
 

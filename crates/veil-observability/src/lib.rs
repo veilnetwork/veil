@@ -607,7 +607,14 @@ impl NodeMetrics {
     }
 
     pub fn dec_active_sessions(&self) {
-        self.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        // audit cycle-8: saturate at 0. A plain `fetch_sub` on a double-decrement
+        // (or a dec reordered ahead of its inc) would wrap the gauge to ~1.8e19,
+        // corrupting `veil_active_sessions` and any alerting built on it.
+        let _ = self.active_sessions.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(1)),
+        );
     }
 
     pub fn inc_inbound_sessions(&self) {
