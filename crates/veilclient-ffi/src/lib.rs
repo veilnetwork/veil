@@ -432,11 +432,15 @@ const MAX_FFI_CSTR_LEN: usize = 4096;
 ///
 /// # Safety
 ///
-/// `p` either NULL or points to a **readable** buffer.  Caller does NOT
-/// need to guarantee NUL-termination — the `strnlen` scan bounds itself
-/// at `MAX_FFI_CSTR_LEN` so that a runaway pointer cannot cause OOB
-/// read (worst case: scan reads up to 4 KiB past the buffer, but never
-/// further).
+/// Same contract as [`MAX_FFI_CSTR_LEN`]: `p` is NULL, or a non-null pointer
+/// that is readable either up to a NUL terminator OR for at least
+/// `MAX_FFI_CSTR_LEN` bytes. The `strnlen` scan only CAPS how far a
+/// *terminated* buffer is walked (so a NUL-terminated string longer than the
+/// cap is rejected, not over-read indefinitely) — it does NOT make a short,
+/// unterminated buffer safe: scanning such a buffer reads past its end (up to
+/// `MAX_FFI_CSTR_LEN` bytes), which is undefined behaviour and can fault near a
+/// page boundary. The caller must uphold the termination/length contract, as on
+/// any C ABI.
 unsafe fn cstr_to_str_with_len<'a>(p: *const c_char) -> Option<(&'a str, usize)> {
     if p.is_null() {
         return None;

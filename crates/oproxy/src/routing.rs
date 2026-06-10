@@ -289,57 +289,6 @@ pub async fn open_direct_and_bridge(
     Ok(())
 }
 
-/// Resolve mode and dispatch — used by inbound handlers.  Returns
-/// `Ok(true)` if the connection was handled (either successfully or with
-/// a graceful close); `Ok(false)` if the policy was `Block`; `Err`
-/// for unexpected I/O failure.
-///
-/// `try_veil` — closure that attempts the veil path; returns
-/// `Err` if veil leg failed (server unreachable / timeout / etc.).
-/// Caller passes a small async fn that closes over the AppHandle and
-/// `(host, port)`.
-pub async fn dispatch<F, Fut>(
-    cfg: &RoutingConfig,
-    inbound: TcpStream,
-    host: String,
-    port: u16,
-    try_veil: F,
-) -> Result<bool>
-where
-    F: FnOnce(TcpStream, String, u16) -> Fut,
-    Fut: std::future::Future<Output = Result<(), (TcpStream, anyhow::Error)>>,
-{
-    let decision = resolve(cfg, &host, port);
-    log::debug!("oproxy.routing: {host}:{port} → {decision:?}");
-    match decision.mode {
-        ProxyMode::Block => {
-            log::info!("oproxy.routing: BLOCK {host}:{port}");
-            // Close inbound by dropping; caller's handler can write
-            // protocol-specific reject reply before calling dispatch.
-            Ok(false)
-        }
-        ProxyMode::Direct => {
-            open_direct_and_bridge(inbound, host, port, cfg.allow_private).await?;
-            Ok(true)
-        }
-        ProxyMode::Veil => match try_veil(inbound, host.clone(), port).await {
-            Ok(()) => Ok(true),
-            Err((inbound, err)) => match decision.fallback {
-                crate::config::FallbackMode::Fail => {
-                    Err(anyhow!("veil failed (no fallback): {err}"))
-                }
-                crate::config::FallbackMode::Direct => {
-                    log::warn!(
-                        "oproxy.routing: veil failed for {host}:{port}, falling back direct: {err}"
-                    );
-                    open_direct_and_bridge(inbound, host, port, cfg.allow_private).await?;
-                    Ok(true)
-                }
-            },
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -169,29 +169,6 @@ pub async fn try_veil_setup_and_bridge(
     Ok(())
 }
 
-/// Backward-compat shim — the original API used before routing modes
-/// were added.  Pure veil path with no fallback.  Direct / fallback
-/// callers should use [`bridge_via_routing`] instead.
-pub async fn open_stream_and_bridge(
-    app_handle: Arc<AppSender>,
-    server_node_id: [u8; 32],
-    server_app_id: [u8; 32],
-    inbound: TcpStream,
-    host: String,
-    port: u16,
-) -> Result<()> {
-    try_veil_setup_and_bridge(
-        app_handle,
-        server_node_id,
-        server_app_id,
-        inbound,
-        host,
-        port,
-    )
-    .await
-    .map_err(|(_inbound, e)| e)
-}
-
 /// Variant of [`try_veil_setup_and_bridge`] that injects a pre-built
 /// prelude (rewritten HTTP request line + headers, etc.) after the
 /// connect-header handshake but BEFORE bridging.  Returns the inbound
@@ -377,9 +354,8 @@ pub async fn bridge_via_routing_with_prelude(
 }
 
 /// Dispatch each inbound connection through the configured routing
-/// policy.  Replaces direct calls to `open_stream_and_bridge` from
-/// inbound handlers — every inbound (SOCKS5 / HTTP / TProxy) routes its
-/// `(host, port)` through this gate.
+/// policy.  Every inbound (SOCKS5 / HTTP / TProxy) routes its
+/// `(host, port)` through this gate (Direct / Veil / Block per config).
 pub async fn bridge_via_routing(
     app_handle: Arc<AppSender>,
     server_node_id: [u8; 32],
