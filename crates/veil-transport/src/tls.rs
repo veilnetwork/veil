@@ -349,9 +349,7 @@ impl TransportListener for TlsTransportListener {
                     let tls_stream: ServerTlsStream<TcpStream> =
                         tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
                             .await
-                            .map_err(|_| {
-                                tls_error("tls server handshake timed out".to_string())
-                            })?
+                            .map_err(|_| tls_error("tls server handshake timed out".to_string()))?
                             .map_err(|err| tls_error(err.to_string()))?;
                     Ok(boxed_tls_connection(
                         native_tls_peer(bind_uri, local_addr, Some(remote_addr)),

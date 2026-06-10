@@ -381,8 +381,7 @@ impl NodeRuntime {
             // when one fires — `Notify::notify_waiters` doesn't queue).
             // 1 s × 8 entries × 1 sort ≈ negligible CPU.
             const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-            let mut peer_id_counter: u32 =
-                crate::types::synthetic_peer_id::MESH_AUTODISCOVER_BASE;
+            let mut peer_id_counter: u32 = crate::types::synthetic_peer_id::MESH_AUTODISCOVER_BASE;
 
             loop {
                 tokio::select! {

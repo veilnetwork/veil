@@ -3472,7 +3472,9 @@ mod tests {
         // 70 KiB of non-newline bytes, never terminated.
         let payload = vec![b'a'; cap + 6 * 1024];
         let mut reader = tokio::io::BufReader::new(&payload[..]);
-        let got = super::read_bounded_admin_line(&mut reader, cap).await.unwrap();
+        let got = super::read_bounded_admin_line(&mut reader, cap)
+            .await
+            .unwrap();
         assert!(
             got.is_none(),
             "over-cap newline-less request must be rejected, not buffered"
@@ -3486,7 +3488,9 @@ mod tests {
         let cap = 64 * 1024;
         let payload = b"{\"version\":1,\"cmd\":\"status\"}\n".to_vec();
         let mut reader = tokio::io::BufReader::new(&payload[..]);
-        let got = super::read_bounded_admin_line(&mut reader, cap).await.unwrap();
+        let got = super::read_bounded_admin_line(&mut reader, cap)
+            .await
+            .unwrap();
         assert_eq!(got.as_deref(), Some("{\"version\":1,\"cmd\":\"status\"}"));
     }
 

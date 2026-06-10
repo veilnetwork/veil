@@ -274,7 +274,10 @@ mod synthetic_peer_id_tests {
     #[test]
     fn gateway_class_threshold_preserved() {
         for b in [DNS_BASE, APP_ADDED_BASE, HTTPS_SEEDS_BASE] {
-            assert!(b < GATEWAY_SYNTHETIC, "{b:#x} must be below the gateway threshold");
+            assert!(
+                b < GATEWAY_SYNTHETIC,
+                "{b:#x} must be below the gateway threshold"
+            );
         }
         for b in [
             MESH_AUTODISCOVER_BASE,
@@ -283,7 +286,10 @@ mod synthetic_peer_id_tests {
             GATEWAY_FAILOVER_BASE,
             PERSISTENCE_BASE,
         ] {
-            assert!(b >= GATEWAY_SYNTHETIC, "{b:#x} must be at/above the gateway threshold");
+            assert!(
+                b >= GATEWAY_SYNTHETIC,
+                "{b:#x} must be at/above the gateway threshold"
+            );
         }
     }
 }

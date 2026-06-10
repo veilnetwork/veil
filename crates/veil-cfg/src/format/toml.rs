@@ -283,10 +283,7 @@ fn set_rotation_table(table: &mut Table, rotation: &crate::TransportRotationConf
 /// when it matches the baked-in default.  Rationale mirrors
 /// `set_rotation_table`: discoverability of the censor-evasion knob beats
 /// keeping the file minimal, and the struct doc marks it "Always serialised".
-fn set_tls_fingerprint_table(
-    table: &mut Table,
-    fp: &crate::TlsFingerprintConfig,
-) -> Result<()> {
+fn set_tls_fingerprint_table(table: &mut Table, fp: &crate::TlsFingerprintConfig) -> Result<()> {
     if !table.get("tls_fingerprint").is_some_and(Item::is_table) {
         table["tls_fingerprint"] = Item::Table(Table::new());
     }
@@ -780,9 +777,10 @@ mod tests {
         // Regression: the [transport.*] pruner used to delete the live,
         // runtime-consumed `tls_fingerprint` section on every save, silently
         // reverting a pinned anti-DPI profile to the default `rotate` policy.
-        let mut document = "[transport]\n[transport.tls_fingerprint]\nmode = \"pinned\"\nprofile = \"firefox\"\n"
-            .parse::<DocumentMut>()
-            .unwrap();
+        let mut document =
+            "[transport]\n[transport.tls_fingerprint]\nmode = \"pinned\"\nprofile = \"firefox\"\n"
+                .parse::<DocumentMut>()
+                .unwrap();
         let mut config = Config::default();
         config.transport.tls_fingerprint.mode = "pinned".to_owned();
         config.transport.tls_fingerprint.profile = "firefox".to_owned();

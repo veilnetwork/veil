@@ -1299,7 +1299,8 @@ impl FrameDispatcher {
         // sentinel — never dedup it (that would collapse every zero-id frame
         // into one); just deliver.
         let content_id = envelope.content_id;
-        if content_id != [0u8; 32] && lock!(self.forward_seen_content).check_and_insert(content_id) {
+        if content_id != [0u8; 32] && lock!(self.forward_seen_content).check_and_insert(content_id)
+        {
             // Duplicate terminal arrival (audit cycle-8 H8): a retransmit because
             // our original DELIVERED ACK was lost (the retransmit window 15 s is
             // inside the 60 s dedup window), or a replay. The app already saw
