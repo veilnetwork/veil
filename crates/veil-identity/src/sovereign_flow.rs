@@ -301,13 +301,16 @@ pub fn create_identity(
             pk.extend_from_slice(master_ed_pk.as_bytes());
             pk.extend_from_slice(fal_pk_bytes);
 
-            let mut sk = Vec::with_capacity(32 + 2 + fal_sk_bytes.len());
+            // audit cycle-9: the assembled master SK (Ed25519 half + Falcon SK)
+            // must be zeroized on drop — it does not escape this scope (only the
+            // base64 `sk_b64` derived from it does).
+            let mut sk = zeroize::Zeroizing::new(Vec::with_capacity(32 + 2 + fal_sk_bytes.len()));
             sk.extend_from_slice(&master_sk_bytes[..]);
             sk.extend_from_slice(&(fal_sk_bytes.len() as u16).to_le_bytes());
             sk.extend_from_slice(fal_sk_bytes);
 
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk);
+            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk[..]);
 
             (
                 ALGO_ED25519_FALCON512_HYBRID,
@@ -350,13 +353,16 @@ pub fn create_identity(
             pk.extend_from_slice(master_ed_pk.as_bytes());
             pk.extend_from_slice(fal_pk_bytes);
 
-            let mut sk = Vec::with_capacity(32 + 2 + fal_sk_bytes.len());
+            // audit cycle-9: the assembled master SK (Ed25519 half + Falcon SK)
+            // must be zeroized on drop — it does not escape this scope (only the
+            // base64 `sk_b64` derived from it does).
+            let mut sk = zeroize::Zeroizing::new(Vec::with_capacity(32 + 2 + fal_sk_bytes.len()));
             sk.extend_from_slice(&master_sk_bytes[..]);
             sk.extend_from_slice(&(fal_sk_bytes.len() as u16).to_le_bytes());
             sk.extend_from_slice(fal_sk_bytes);
 
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk);
+            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk[..]);
 
             (
                 ALGO_ED25519_FALCON1024_HYBRID,
@@ -764,13 +770,15 @@ pub fn restore_identity(
             pk.extend_from_slice(master_ed_pk.as_bytes());
             pk.extend_from_slice(&falcon_pk);
 
-            let mut sk = Vec::with_capacity(32 + 2 + falcon_sk.len());
+            // audit cycle-9: zeroize the assembled master SK on drop (does not
+            // escape this scope; only the derived base64 `sk_b64` does).
+            let mut sk = zeroize::Zeroizing::new(Vec::with_capacity(32 + 2 + falcon_sk.len()));
             sk.extend_from_slice(&master_sk_bytes[..]);
             sk.extend_from_slice(&(falcon_sk.len() as u16).to_le_bytes());
             sk.extend_from_slice(&falcon_sk);
 
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk);
+            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk[..]);
 
             (
                 ALGO_ED25519_FALCON512_HYBRID,
@@ -811,13 +819,15 @@ pub fn restore_identity(
             pk.extend_from_slice(master_ed_pk.as_bytes());
             pk.extend_from_slice(&falcon_pk);
 
-            let mut sk = Vec::with_capacity(32 + 2 + falcon_sk.len());
+            // audit cycle-9: zeroize the assembled master SK on drop (does not
+            // escape this scope; only the derived base64 `sk_b64` does).
+            let mut sk = zeroize::Zeroizing::new(Vec::with_capacity(32 + 2 + falcon_sk.len()));
             sk.extend_from_slice(&master_sk_bytes[..]);
             sk.extend_from_slice(&(falcon_sk.len() as u16).to_le_bytes());
             sk.extend_from_slice(&falcon_sk);
 
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk);
+            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk[..]);
 
             (
                 ALGO_ED25519_FALCON1024_HYBRID,
@@ -1145,12 +1155,14 @@ pub fn rotate_identity(
             let mut pk = Vec::with_capacity(32 + falcon_pk.len());
             pk.extend_from_slice(master_ed_pk.as_bytes());
             pk.extend_from_slice(&falcon_pk);
-            let mut sk = Vec::with_capacity(32 + 2 + falcon_sk.len());
+            // audit cycle-9: zeroize the assembled master SK on drop (does not
+            // escape this scope; only the derived base64 `sk_b64` does).
+            let mut sk = zeroize::Zeroizing::new(Vec::with_capacity(32 + 2 + falcon_sk.len()));
             sk.extend_from_slice(&master_ed_sk_bytes[..]);
             sk.extend_from_slice(&(falcon_sk.len() as u16).to_le_bytes());
             sk.extend_from_slice(&falcon_sk);
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk);
+            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk[..]);
             (algo, pk, pk_b64, sk_b64)
         }
         other => return Err(RotateIdentityError::UnsupportedMasterAlgo(other)),
