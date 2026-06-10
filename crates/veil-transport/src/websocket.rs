@@ -482,10 +482,9 @@ impl TransportListener for WsListener {
         Box::pin(async move {
             let (stream, remote_addr) = self.listener.accept().await?;
             let bind_uri = self.bind_uri.clone();
-            let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
-                Box::pin(
-                    async move { accept_ws_connection("ws", bind_uri, stream, remote_addr).await },
-                );
+            let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> = Box::pin(
+                async move { accept_ws_connection("ws", bind_uri, stream, remote_addr).await },
+            );
             Ok(RawInbound {
                 remote_addr: Some(remote_addr),
                 finish,

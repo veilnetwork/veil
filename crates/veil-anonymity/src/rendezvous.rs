@@ -1896,9 +1896,8 @@ mod tests {
     fn coherent_node_id(issuer_pk_b64: &str) -> [u8; NODE_ID_LEN] {
         // Mirror verify_rendezvous_ad: hash the DECODED pubkey bytes, since
         // `issuer_pk` is stored base64-encoded.
-        let raw =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, issuer_pk_b64)
-                .expect("test issuer_pk must be valid base64");
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, issuer_pk_b64)
+            .expect("test issuer_pk must be valid base64");
         *blake3::hash(&raw).as_bytes()
     }
 
