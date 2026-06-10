@@ -137,12 +137,21 @@ fn evict_stale(map: &mut HashMap<IpAddr, FailureRecord>, now: Instant) {
 /// handshake-protocol problem.
 ///
 /// We pattern-match the message text because `NodeError::Handshake` flattens
-/// the underlying `ProtoError` into a string before reaching the metrics
-/// site. The substrings below correspond to `ProtoError::InvalidMagic`
-/// and the related "decode … frame header" prefix used by every OVL1
-/// header decoder.
+/// the underlying `ProtoError` into a string before reaching the metrics site.
+///
+/// The match is anchored to the canonical FRAME-HEADER `ProtoError` Display
+/// strings, NOT a loose substring. App-level protocol errors from an already-
+/// connected, legitimate peer — e.g. `"name_claim: unsupported version 5"`,
+/// `"pair frame: unsupported version 3"`, `"instance_registry: unsupported
+/// version 2"` — also contain `"unsupported version"`; a loose `contains`
+/// would mis-classify them as scanner garbage and soft-ban a real peer's IP.
+/// The frame-header errors are `ProtoError::InvalidMagic`
+/// (`"invalid magic: expected OVL1, …"`) and `ProtoError::UnsupportedVersion`
+/// (`"unsupported version: <n>"` — the trailing colon after `version`
+/// distinguishes it from the app-level `"…: unsupported version <n>"`
+/// messages, which have the colon before the label). (audit cycle-8 F6.)
 pub fn is_pre_protocol_garbage(msg: &str) -> bool {
-    msg.contains("invalid magic") || msg.contains("unsupported version")
+    msg.contains("invalid magic: expected OVL1") || msg.contains("unsupported version:")
 }
 
 #[cfg(test)]
@@ -197,5 +206,24 @@ mod tests {
             "peer signature verification failed"
         ));
         assert!(!is_pre_protocol_garbage("ML-KEM decapsulation failed"));
+    }
+
+    #[test]
+    fn cycle8_f6_app_level_unsupported_version_is_not_scanner_garbage() {
+        // audit cycle-8 F6 — these come from an already-connected legitimate
+        // peer (post-handshake app frames), NOT a port scanner; they must not
+        // trip the IP soft-ban despite containing "unsupported version".
+        assert!(!is_pre_protocol_garbage("name_claim: unsupported version 5"));
+        assert!(!is_pre_protocol_garbage("pair frame: unsupported version 3"));
+        assert!(!is_pre_protocol_garbage(
+            "instance_registry: unsupported version 2"
+        ));
+        assert!(!is_pre_protocol_garbage(
+            "pairing_invite: unsupported version 1"
+        ));
+        // The genuine frame-header version error still classifies as garbage.
+        assert!(is_pre_protocol_garbage(
+            "decode OVL1 frame header: unsupported version: 7"
+        ));
     }
 }

@@ -3713,14 +3713,25 @@ impl SessionRunner {
                 };
 
                 let resp_len = wire_bytes.len() as u64;
-                if let Some(m) = &self.metrics {
-                    m.add_transport_bytes_tx(resp_len);
-                }
-                rekey.record_bytes(resp_len);
-                mlkem_rekey.record_bytes(resp_len);
-                if Self::push_wire(wire_tx, wire_bytes, &self.metrics).is_err() {
-                    self.on_primary_write_error(write_error_count);
-                    return true;
+                // Outbound bandwidth enforcement — the same gate the pq-drain
+                // path applies (runner.rs ~3098). Dispatcher-generated responses
+                // previously bypassed the limiter entirely, so a request flood
+                // (e.g. RouteRequest → RouteResponse) could pull unlimited
+                // response bandwidth past the operator's configured cap. Over the
+                // cap we drop the response (don't count it as tx, don't advance
+                // rekey byte accounting) but keep the session open — dropping a
+                // reply is the limiter's intended behaviour, matching the drain
+                // path. (audit cycle-8 F12.)
+                if self.dispatcher.allow_outbound_bandwidth(wire_bytes.len()) {
+                    if let Some(m) = &self.metrics {
+                        m.add_transport_bytes_tx(resp_len);
+                    }
+                    rekey.record_bytes(resp_len);
+                    mlkem_rekey.record_bytes(resp_len);
+                    if Self::push_wire(wire_tx, wire_bytes, &self.metrics).is_err() {
+                        self.on_primary_write_error(write_error_count);
+                        return true;
+                    }
                 }
             }
             DispatchResult::NoResponse => {}

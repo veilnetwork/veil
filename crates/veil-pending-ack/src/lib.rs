@@ -115,13 +115,23 @@ impl PendingAckTracker {
         ack_key: [u8; 32],
         frame_bytes: impl Into<Arc<[u8]>>,
     ) -> bool {
-        if self.pending.len() >= MAX_PENDING_ACK_ENTRIES {
+        // Only gate on the growth caps when this registration actually grows
+        // the relevant table — re-registering an EXISTING content_id replaces
+        // in place and must not be rejected just because the table is full.
+        // (audit cycle-8 F13.)
+        let existing_dst = self.pending.get(&content_id).map(|e| e.dst_node_id);
+        if existing_dst.is_none() && self.pending.len() >= MAX_PENDING_ACK_ENTRIES {
             return false;
         }
-        // enforce per-peer cap before inserting.
-        let peer_count = self.per_peer.get(&dst_node_id).copied().unwrap_or(0);
-        if (peer_count as usize) >= MAX_PENDING_ACK_PER_PEER {
-            return false;
+        // Per-peer cap: enforce only when this registration adds to
+        // `dst_node_id`'s count — a brand-new entry, or a redirect-update that
+        // moves the entry from a different peer. A same-peer re-register leaves
+        // the per-peer count unchanged, so it must not be denied at the cap.
+        if existing_dst != Some(dst_node_id) {
+            let peer_count = self.per_peer.get(&dst_node_id).copied().unwrap_or(0);
+            if (peer_count as usize) >= MAX_PENDING_ACK_PER_PEER {
+                return false;
+            }
         }
         let deadline = Instant::now() + Duration::from_millis(DELIVERY_ACK_TIMEOUT_MS);
         // When re-registering a
@@ -301,6 +311,24 @@ mod tests {
         t.register(cid(2), hop(), dst(), src(), [0u8; 32], vec![]);
         assert!(t.tick().is_empty());
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn cycle8_f13_reregister_existing_at_cap_is_allowed() {
+        // audit cycle-8 F13 — at the per-peer cap, a NEW content_id is rejected,
+        // but re-registering an EXISTING content_id (a retransmit refresh)
+        // replaces in place and must still succeed rather than being denied.
+        let mut t = PendingAckTracker::new();
+        let dst_a = [0xAA; 32];
+        for i in 0..MAX_PENDING_ACK_PER_PEER {
+            assert!(t.register([i as u8; 32], hop(), dst_a, src(), [0u8; 32], vec![]));
+        }
+        // A brand-new content_id at the cap is rejected.
+        assert!(!t.register([0xFE; 32], hop(), dst_a, src(), [0u8; 32], vec![]));
+        // Re-registering content_id [0;32] (already present) for the same peer
+        // succeeds — it's a replacement, not growth.
+        assert!(t.register([0u8; 32], hop(), dst_a, src(), [0u8; 32], vec![0x99]));
+        assert_eq!(t.len(), MAX_PENDING_ACK_PER_PEER);
     }
 
     #[test]
