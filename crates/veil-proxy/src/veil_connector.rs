@@ -204,6 +204,24 @@ impl ProxyConnector for VeilConnector {
             .unwrap_or_else(|p| p.into_inner())
             .insert((exit_node_id, stream_id), data_tx);
 
+        // Remove BOTH registrations (audit cycle-9). Every error path below must
+        // clean up `pending_receipts` AND `veil_stream_rx`: previously the
+        // timeout / sender-dropped / rejected paths removed only
+        // `veil_stream_rx` and leaked the `pending_receipts` entry. `stream_id`
+        // is a monotonic counter (never reused), so each leak was permanent and
+        // the map grew unbounded under repeated APP_OPEN timeouts. On success the
+        // `pending_receipts` entry is consumed by the receipt handler instead.
+        let cleanup_regs = || {
+            self.pending_receipts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&(exit_node_id, stream_id));
+            self.veil_stream_rx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&(exit_node_id, stream_id));
+        };
+
         // Send APP_OPEN to the exit node.
         let open_payload = AppOpenPayload {
             app_id: EXIT_PROXY_APP_ID,
@@ -222,15 +240,7 @@ impl ProxyConnector for VeilConnector {
             .broadcaster
             .send_to(&exit_node_id, priority::INTERACTIVE, frame);
         if !sent {
-            // Clean up registrations.
-            self.pending_receipts
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&(exit_node_id, stream_id));
-            self.veil_stream_rx
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&(exit_node_id, stream_id));
+            cleanup_regs();
             return Err(Socks5Error::ConnectFailed(
                 "no session to exit node".to_owned(),
             ));
@@ -240,26 +250,17 @@ impl ProxyConnector for VeilConnector {
         let status = timeout(OPEN_RECEIPT_TIMEOUT, receipt_rx)
             .await
             .map_err(|_| {
-                self.veil_stream_rx
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&(exit_node_id, stream_id));
+                cleanup_regs();
                 Socks5Error::ConnectFailed("APP_OPEN receipt timeout".to_owned())
             })?
             .map_err(|_| {
-                self.veil_stream_rx
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&(exit_node_id, stream_id));
+                cleanup_regs();
                 Socks5Error::ConnectFailed("APP_OPEN receipt sender dropped".to_owned())
             })?;
 
         use veil_proto::app::receipt_status;
         if status != receipt_status::ACCEPTED {
-            self.veil_stream_rx
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&(exit_node_id, stream_id));
+            cleanup_regs();
             return Err(Socks5Error::ConnectFailed(format!(
                 "APP_OPEN rejected (status=0x{status:04x})"
             )));
@@ -648,6 +649,48 @@ mod tests {
         assert!(
             found_close,
             "expected APP_CLOSE frame in broadcaster outbox"
+        );
+    }
+    #[tokio::test]
+    async fn connect_cleanup_removes_both_maps_on_send_failure() {
+        // audit cycle-9: every connect error path must remove BOTH
+        // pending_receipts and veil_stream_rx. Previously the timeout /
+        // sender-dropped / rejected paths removed only veil_stream_rx and leaked
+        // the pending_receipts entry; with stream_id monotonic that grew the map
+        // unbounded. The !sent path exercises the shared cleanup_regs closure.
+        struct FailingBroadcaster;
+        impl FrameBroadcaster for FailingBroadcaster {
+            fn send_to(&self, _peer: &[u8; 32], _priority: u8, _bytes: Vec<u8>) -> bool {
+                false
+            }
+            fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                Vec::new()
+            }
+        }
+        let pending: PendingReceiptMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let rx: VeilStreamRxMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let conn = VeilConnector::new(
+            Arc::new(FailingBroadcaster),
+            [0u8; 32],
+            [1u8; 32],
+            Arc::clone(&pending),
+            Arc::clone(&rx),
+            Arc::new(AtomicU32::new(0)),
+        );
+        let dest = crate::socks5::ProxyDestination {
+            host: "example.com".to_owned(),
+            port: 443,
+        };
+        let res = conn.connect([2u8; 32], &dest).await;
+        assert!(res.is_err(), "send failure must error");
+        assert!(
+            pending.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+            "pending_receipts must be cleaned up (no leak)"
+        );
+        assert!(
+            rx.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+            "veil_stream_rx must be cleaned up"
         );
     }
 }
