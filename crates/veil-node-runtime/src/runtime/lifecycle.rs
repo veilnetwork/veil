@@ -507,7 +507,18 @@ impl NodeRuntime {
             }
             limiter
         };
+        // Reset then RE-LOAD the persisted bans from disk (audit cycle-9
+        // CRIT-4). A bare `BanList::new()` wiped every ban (manual + auto) on
+        // any reload (SIGHUP / admin reload / apply-config) while bans.json
+        // stayed on disk but inactive until a full process restart — banned
+        // peers reconnected immediately after a reload. This mirrors the
+        // deliberate cross-reload preservation of `recursive_query_limiter`
+        // (so a flood-throttled peer can't reset its budget via reload); the
+        // ban list must likewise survive a reload. `persist_bans` only writes
+        // manual bans, so this restores those; auto-bans re-accumulate via the
+        // freshly-rebuilt violation tracker below.
         *lock!(self.ban_list) = BanList::new();
+        super::persistence::load_bans(&self.ban_list, &self.config_path);
         // `.max(1)` clamp makes the `.expect` unreachable here (same
         // invariant as in `runtime/mod.rs` — see commentary there).
         *lock!(self.violation_tracker) = ViolationTracker::new(
