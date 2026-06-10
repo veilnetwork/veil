@@ -1705,6 +1705,13 @@ struct RendezvousRegistryInner {
 /// other load. Operators can override at construction time.
 pub const DEFAULT_MAX_RENDEZVOUS_REGISTRATIONS: usize = 10_000;
 
+/// Per-peer fairness cap on rendezvous registrations (audit cycle-9). A
+/// legitimate receiver needs only a handful of live cookies; this generous
+/// ceiling stops a single authenticated peer from filling the registry and
+/// LRU-evicting every other principal, while leaving ample room for cookie
+/// rotation. With the 10 000 global cap that is ~156 distinct peers minimum.
+pub const MAX_COOKIES_PER_PEER: usize = 64;
+
 /// maximum age of a rendezvous registration
 /// before it's lazily evicted. Without a TTL, stale `(peer_node_id
 /// receiver_x25519_pk)` pairs accumulate over the lifetime of the
@@ -1787,6 +1794,25 @@ impl RendezvousRegistry {
             // Same subscriber AND same x25519_pk — refresh the rest.
             g.cookies.insert(key, subscriber);
             return Ok(());
+        }
+        // Per-peer fairness cap (audit cycle-9): the cookie is caller-supplied,
+        // so one authenticated peer could register `max_registrations` distinct
+        // cookies and, via the global LRU below, evict every OTHER principal's
+        // entry (the cycle-8 F5 fix moved the DoS from fail-closed to LRU churn,
+        // but didn't stop a single peer monopolizing the table). Bound each
+        // peer's footprint: at its own cap, evict THIS peer's oldest entry rather
+        // than the global oldest, so a flood churns only the attacker's own slots.
+        let peer = subscriber.peer_node_id;
+        let this_peer_count = g.cookies.keys().filter(|(p, _)| *p == peer).count();
+        if this_peer_count >= MAX_COOKIES_PER_PEER
+            && let Some(oldest_own) = g
+                .cookies
+                .iter()
+                .filter(|((p, _), _)| *p == peer)
+                .min_by_key(|(_, s)| s.registered_at_unix)
+                .map(|(k, _)| *k)
+        {
+            g.cookies.remove(&oldest_own);
         }
         if g.cookies.len() >= self.max_registrations {
             // At capacity: evict the oldest registration (smallest
@@ -3125,6 +3151,53 @@ mod tests {
         };
         let e2 = e1.clone();
         assert_eq!(e1, e2);
+    }
+
+    #[test]
+    fn cycle9_per_peer_cap_one_peer_cannot_evict_other_principals() {
+        // audit cycle-9: a single authenticated peer flooding cookies must not
+        // displace another principal's registration. Its own footprint is capped
+        // at MAX_COOKIES_PER_PEER; the global LRU never reaches the victim.
+        let reg = RendezvousRegistry::with_capacity(10_000);
+        let cookie_of = |i: u32| {
+            let mut c = [0u8; AUTH_COOKIE_LEN];
+            c[..4].copy_from_slice(&i.to_le_bytes());
+            c
+        };
+        // Legitimate receiver B registers one cookie at t0.
+        let victim_peer = [0xBBu8; NODE_ID_LEN];
+        reg.register(
+            cookie_of(0xAAAA),
+            RendezvousSubscriber {
+                peer_node_id: victim_peer,
+                receiver_x25519_pk: [0x01; X25519_PK_LEN],
+                registered_at_unix: 1_700_000_000,
+            },
+        )
+        .unwrap();
+        // Attacker A floods far more than its per-peer cap, all newer than B.
+        for i in 0..(MAX_COOKIES_PER_PEER as u32 + 200) {
+            reg.register(
+                cookie_of(i),
+                RendezvousSubscriber {
+                    peer_node_id: [0xAAu8; NODE_ID_LEN],
+                    receiver_x25519_pk: [0x02; X25519_PK_LEN],
+                    registered_at_unix: 1_700_000_100 + i as u64,
+                },
+            )
+            .unwrap();
+        }
+        // Victim B's registration survives the flood.
+        assert!(
+            reg.lookup(&victim_peer, &cookie_of(0xAAAA)).is_some(),
+            "a single peer's flood must not evict another principal (CRIT)"
+        );
+        // Attacker's footprint is bounded by the per-peer cap (+ victim's 1).
+        assert!(
+            reg.len() <= MAX_COOKIES_PER_PEER + 1,
+            "attacker footprint must be capped, registry len = {}",
+            reg.len()
+        );
     }
 
     #[test]
