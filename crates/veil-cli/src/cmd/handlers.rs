@@ -428,7 +428,7 @@ impl ConfigCommandService {
         let content = if reveal_secrets {
             content
         } else {
-            redact_secret_lines(&content)
+            redact_secrets_structured(&content)
         };
         context.io.emit(OutputEvent::config_contents(content));
         Ok(())
@@ -929,6 +929,83 @@ fn is_secret_config_key(key: &str) -> bool {
 /// variants (e.g. `key_passphrase_file`) are NOT redacted — the prefix check
 /// requires the next non-space byte to be `=`, so `key_passphrase_file = …`
 /// (next byte `_`) is left alone.
+/// Redact secret config fields by parsing the config into its typed model and
+/// blanking every key whose name is in [`SECRET_FIELD_NAMES`], recursively
+/// (audit cycle-8 H3). This replaces a fragile line-prefix heuristic that
+/// `config show` used, which leaked secrets written as quoted keys
+/// (`"private_key" = …`), dotted keys (`identity.private_key = …`), inline
+/// tables (`identity = { private_key = … }`), and — entirely — in JSON configs
+/// (`"private_key": …`, which the TOML `key =` heuristic never matched).
+///
+/// The redacted output is re-serialized from the parsed model, so comments and
+/// original formatting are not preserved (use `--reveal-secrets` to see the raw
+/// file). Falls back to the line heuristic only if the content fails to parse.
+fn redact_secrets_structured(content: &str) -> String {
+    const REDACTED: &str = "<redacted — rerun with --reveal-secrets>";
+    // A JSON config is the only one that starts with '{'; TOML starts with a
+    // key or `[section]`.
+    if content.trim_start().starts_with('{') {
+        return match serde_json::from_str::<serde_json::Value>(content) {
+            Ok(mut v) => {
+                redact_json_value(&mut v, REDACTED);
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| redact_secret_lines(content))
+            }
+            Err(_) => redact_secret_lines(content),
+        };
+    }
+    match toml::from_str::<toml::Table>(content) {
+        Ok(mut table) => {
+            redact_toml_table(&mut table, REDACTED);
+            toml::to_string_pretty(&table).unwrap_or_else(|_| redact_secret_lines(content))
+        }
+        Err(_) => redact_secret_lines(content),
+    }
+}
+
+/// Recursively blank secret keys in a parsed TOML table. The `toml` crate models
+/// both `[section]` tables and inline `{ … }` tables as `Value::Table`, so a
+/// single recursion covers both (and dotted keys, which parse to nested tables).
+fn redact_toml_table(table: &mut toml::Table, redacted: &str) {
+    for (key, val) in table.iter_mut() {
+        if SECRET_FIELD_NAMES.contains(&key.as_str()) {
+            *val = toml::Value::String(redacted.to_string());
+            continue;
+        }
+        match val {
+            toml::Value::Table(t) => redact_toml_table(t, redacted),
+            toml::Value::Array(arr) => {
+                for item in arr.iter_mut() {
+                    if let toml::Value::Table(t) = item {
+                        redact_toml_table(t, redacted);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recursively blank secret keys in a parsed JSON value.
+fn redact_json_value(v: &mut serde_json::Value, redacted: &str) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                if SECRET_FIELD_NAMES.contains(&k.as_str()) {
+                    *val = serde_json::Value::String(redacted.to_string());
+                } else {
+                    redact_json_value(val, redacted);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                redact_json_value(item, redacted);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn redact_secret_lines(content: &str) -> String {
     const REDACTED: &str = "\"<redacted — rerun with --reveal-secrets>\"";
     let mut out = String::with_capacity(content.len());
@@ -1019,6 +1096,38 @@ mod tests {
         // non-secret keys (and the *_file path, which is not the secret) survive.
         assert!(redacted.contains("algo = \"ed25519\""));
         assert!(redacted.contains("key_passphrase_file = \"/etc/veil/pass\""));
+    }
+
+    /// audit cycle-8 H3: the structured redactor must catch the spellings the
+    /// old line heuristic leaked — dotted keys, quoted keys, inline tables, and
+    /// JSON configs entirely.
+    #[test]
+    fn redact_structured_covers_dotted_quoted_inline_json_h3() {
+        // dotted key
+        let r = redact_secrets_structured("identity.private_key = \"SECRETD\"\n");
+        assert!(!r.contains("SECRETD"), "dotted-key secret leaked: {r}");
+
+        // quoted key
+        let r = redact_secrets_structured("[identity]\n\"private_key\" = \"SECRETQ\"\n");
+        assert!(!r.contains("SECRETQ"), "quoted-key secret leaked: {r}");
+
+        // inline table
+        let r = redact_secrets_structured(
+            "identity = { algo = \"ed25519\", private_key = \"SECRETI\" }\n",
+        );
+        assert!(!r.contains("SECRETI"), "inline-table secret leaked: {r}");
+
+        // JSON config (the old TOML `key =` heuristic never matched these)
+        let r = redact_secrets_structured(
+            "{\"identity\":{\"private_key\":\"SECRETJ\",\"algo\":\"ed25519\"},\
+             \"mesh\":{\"realm_psk\":\"SECRETP\"}}",
+        );
+        assert!(!r.contains("SECRETJ"), "JSON private_key leaked: {r}");
+        assert!(!r.contains("SECRETP"), "JSON realm_psk leaked: {r}");
+
+        // Non-secret values survive and the redaction marker is present.
+        assert!(r.contains("ed25519"));
+        assert!(r.contains("redacted"));
     }
 
     #[test]
