@@ -859,9 +859,18 @@ pub struct FrameDispatcher {
     pub peer_vivaldi: PeerVivaldiCache,
 
     // ── DELIVERY_FORWARD dedup ─────────────────────────────────────
-    /// Relay dedup set keyed by content_id. Prevents replay: if the same
-    /// content_id arrives twice within 30 s, the second copy is dropped.
+    /// Loop/duplicate-suppression set for the floodable relay domains —
+    /// source-routed RelayPath (`0xFD`), transit-frame content-hash (`0xFF`),
+    /// and recursive-relay (`0xFE`) keys. Best-effort; an attacker can drive
+    /// these to high volume with unique frames, so they are deliberately kept
+    /// OUT of [`Self::forward_seen_content`] to avoid evicting replay-critical
+    /// content_id entries before their TTL. (audit cycle-8 F9.)
     pub forward_seen_set: Arc<Mutex<ForwardSeenSet>>,
+    /// Replay guard for terminal/forward delivery keyed by `content_id`.
+    /// Isolated in its own ExpiryCache so a flood in the floodable relay
+    /// domains (see [`Self::forward_seen_set`]) cannot evict a content_id and
+    /// re-open the payload-replay window within the TTL. (audit cycle-8 F9.)
+    pub forward_seen_content: Arc<Mutex<ForwardSeenSet>>,
     /// Terminal-delivery ACK-replay cache (audit cycle-8 H8): `content_id →
     /// (ack_target_sender, ack_key)`. On a duplicate terminal arrival — a
     /// retransmit sent because our original DELIVERED ACK was lost — re-emit the
@@ -1645,6 +1654,10 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
             Duration::from_secs(veil_proto::budget::FORWARD_SEEN_SET_TTL_SECS),
             veil_proto::budget::MAX_FORWARD_SEEN_SET_SIZE,
         ))),
+        forward_seen_content: Arc::new(Mutex::new(ForwardSeenSet::new(
+            Duration::from_secs(veil_proto::budget::FORWARD_SEEN_SET_TTL_SECS),
+            veil_proto::budget::MAX_FORWARD_SEEN_SET_SIZE,
+        ))),
         terminal_ack_replay: Arc::new(Mutex::new(ExpiryMap::new(
             Duration::from_secs(veil_proto::budget::FORWARD_SEEN_SET_TTL_SECS),
             veil_proto::budget::MAX_FORWARD_SEEN_SET_SIZE,
@@ -2326,6 +2339,10 @@ mod tests {
             local_vivaldi: None,
             peer_vivaldi: Arc::new(std::sync::RwLock::new(HashMap::new())),
             forward_seen_set: Arc::new(Mutex::new(ForwardSeenSet::new(
+                Duration::from_secs(30),
+                10_000,
+            ))),
+            forward_seen_content: Arc::new(Mutex::new(ForwardSeenSet::new(
                 Duration::from_secs(30),
                 10_000,
             ))),

@@ -441,7 +441,7 @@ impl FrameDispatcher {
                     "DELIVERY_FORWARD: zero content_id not allowed on relay path".to_owned(),
                 ));
             }
-            if lock!(self.forward_seen_set).check_and_insert(content_id) {
+            if lock!(self.forward_seen_content).check_and_insert(content_id) {
                 return Err(DispatchResult::NoResponse);
             }
         }
@@ -1299,7 +1299,7 @@ impl FrameDispatcher {
         // sentinel — never dedup it (that would collapse every zero-id frame
         // into one); just deliver.
         let content_id = envelope.content_id;
-        if content_id != [0u8; 32] && lock!(self.forward_seen_set).check_and_insert(content_id) {
+        if content_id != [0u8; 32] && lock!(self.forward_seen_content).check_and_insert(content_id) {
             // Duplicate terminal arrival (audit cycle-8 H8): a retransmit because
             // our original DELIVERED ACK was lost (the retransmit window 15 s is
             // inside the 60 s dedup window), or a replay. The app already saw
@@ -2152,6 +2152,36 @@ mod tests {
         assert!(
             endpoint_rx.try_recv().is_err(),
             "replayed terminal Forward must NOT produce a second delivery",
+        );
+    }
+
+    /// audit cycle-8 F9 — the replay-critical content_id dedup
+    /// (`forward_seen_content`) must be isolated from the floodable relay
+    /// domains (`forward_seen_set`): a flood that overflows the relay cache by
+    /// far more than its capacity must NOT evict a recorded content_id and
+    /// re-open the payload-replay window within the TTL.
+    #[test]
+    fn content_dedup_survives_relay_seen_set_flood() {
+        use crate::make_test_dispatcher;
+        use veil_util::lock;
+
+        let disp = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let content_id = [0x77u8; 32];
+        // Record a content_id in the isolated terminal cache (new → false).
+        assert!(!lock!(disp.forward_seen_content).check_and_insert(content_id));
+
+        // Flood the relay/loop-suppression cache well past its 10_000 test cap.
+        for i in 0..20_000u32 {
+            let mut k = [0u8; 32];
+            k[..4].copy_from_slice(&i.to_le_bytes());
+            k[31] = 0xFD; // floodable relay-path domain tag
+            lock!(disp.forward_seen_set).check_and_insert(k);
+        }
+
+        // The content_id is still present → replayed payload would be dropped.
+        assert!(
+            lock!(disp.forward_seen_content).check_and_insert(content_id),
+            "content_id must survive a relay-domain flood (F9 isolation)"
         );
     }
 
