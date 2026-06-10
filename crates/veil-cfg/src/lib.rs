@@ -48,7 +48,8 @@ pub use model::{
 pub use runtime::{RuntimeConfig, build_tokio_runtime};
 pub use store::{
     build_stub_config_with_ephemeral_identity, config_write_guard, init_config, load_config,
-    load_config_str, parse_toml_str, prepare_init_path, read_raw_config, save_config,
+    load_config_str, parse_toml_str, prepare_init_path, read_raw_config, render_config,
+    save_config,
 };
 pub use validate::{
     ValidationIssue, ValidationReport, validate, validate_and_fix, validate_and_fix_with_policy,

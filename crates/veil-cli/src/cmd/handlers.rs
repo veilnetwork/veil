@@ -19,6 +19,15 @@ pub trait ConfigOps {
     fn read_raw_config(&self, path: &Path) -> veil_cfg::Result<String>;
     fn load_config(&self, path: &Path) -> veil_cfg::Result<veil_cfg::Config>;
     fn save_config(&self, path: &Path, config: &veil_cfg::Config) -> veil_cfg::Result<()>;
+    /// Write a FRESH, fully-rendered config — never the comment-preserving
+    /// patch path that drops profile sections an authoritative writer set
+    /// (`[mesh]`/`[mobile]`/`[session]`/`[abuse]`/transport scalars). `init`
+    /// uses this so `--force` over an existing file does not silently lose the
+    /// chosen profile's defaults (audit cycle-10). Defaults to `save_config`
+    /// for in-memory stub ops where patch-vs-render is moot.
+    fn save_config_render(&self, path: &Path, config: &veil_cfg::Config) -> veil_cfg::Result<()> {
+        self.save_config(path, config)
+    }
     /// Atomically write a raw string back to the config file.  Used
     /// by `config sign` (slice 11b) — the signed output includes
     /// comment-line signature headers that `save_config` would lose
@@ -92,6 +101,11 @@ where
 
     pub(crate) fn save(&self, path: &Path, config: &veil_cfg::Config) -> veil_cfg::Result<()> {
         self.ops.save_config(path, config)
+    }
+
+    /// Fresh full-render save (see [`ConfigOps::save_config_render`]).
+    pub(crate) fn render(&self, path: &Path, config: &veil_cfg::Config) -> veil_cfg::Result<()> {
+        self.ops.save_config_render(path, config)
     }
 
     pub(crate) fn try_locate(&self) -> veil_cfg::Result<Option<PathBuf>> {
@@ -416,7 +430,12 @@ impl ConfigCommandService {
         // profile choice. See `apply_profile_defaults` for what each
         // profile changes.
         apply_profile_defaults(&mut loaded, profile);
-        context.config().save(&path, &loaded)?;
+        // Render the WHOLE struct — never patch. `init` is authoritative and
+        // `--force` may be overwriting an existing file; the patch path would
+        // silently drop the profile's `[mesh]`/`[mobile]`/`[session]`/`[abuse]`
+        // sections + transport scalars (default_sni) that `apply_profile_defaults`
+        // just set (audit cycle-10).
+        context.config().render(&path, &loaded)?;
         Ok(path)
     }
 

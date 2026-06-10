@@ -52,6 +52,10 @@ impl ConfigOps for StdConfigOps {
         veil_cfg::save_config(path, config)
     }
 
+    fn save_config_render(&self, path: &Path, config: &veil_cfg::Config) -> veil_cfg::Result<()> {
+        veil_cfg::render_config(path, config)
+    }
+
     fn write_raw_config(&self, path: &Path, content: &str) -> veil_cfg::Result<()> {
         // Atomic write via `veil_util::atomic_write` — writes to a
         // temp file alongside the target, fsyncs, then renames.  Same
