@@ -8,6 +8,25 @@
 > **keep only work with zero anonymity cost; drop anything that weakens the
 > per-message-unlinkability property.**
 
+## ⚠️ Production-wiring status (gates the whole line's priority)
+
+**The onion-routing anonymity path is NOT wired to production.**
+`NodeServices::send_anonymous` / `send_via_rendezvous` (→ circuit builder → onion
+→ relay forwarding) have **no production callers** — only `veilcore/src/sim/
+scenarios.rs` (sim) and benches invoke them. The IPC `send.anonymous` flag uses
+**meta-E2E** (`veil_e2e::meta_encrypt` — hides sender identity inside the E2E
+ciphertext on the REGULAR delivery path), NOT onion circuits
+(`crates/veil-ipc/src/handlers/send.rs`). Evidence: `grep '.send_anonymous('` →
+only `scenarios.rs`; `build_outbound_anonymous_cell_*` callers → those two
+methods + benches.
+
+**Consequence:** every workstream here optimises a path production doesn't use.
+W1 (shipped) still benefits sim/benches and a future wiring; the measurement (W0)
+must be done in-process (below), not on a live testnet (which produces zero onion
+traffic). **Before investing in W2/W3, decide:** (2) wire onion-send to a
+production IPC entry point if onion-grade anonymity is wanted beyond meta-E2E, or
+(3) deprioritise this line. W2/W3 are premature until the path is prod-wired.
+
 ## Scope decision
 
 **Goal:** recover the "interactive chat overhead" without spending anonymity.
@@ -83,6 +102,25 @@
   ECDH in the wrap) → justifies W2.
 - Follow-up (optional): promote to Prometheus sum/count metrics via
   `NodeMetrics` for ongoing dashboards (`self.metrics` is reachable here).
+
+**RESULT (in-process measurement, `directory::tests::w0_measure_selection_vs_build`,
+Ed25519 issuers, 3-hop build, release):**
+
+| candidates | select_us | build_us | selection/build |
+|---|---|---|---|
+| 50  | 1205 | 91 | 13.2× |
+| 100 | 1892 | 79 | 23.9× |
+| 200 | 3712 | 82 | 45.3× |
+| 500 | 9324 | 95 | 98.1× |
+
+Selection scales linearly (~18.6 µs/candidate — the Ed25519 `verify_entry` per
+candidate); build is ~constant (~80–95 µs, independent of N — the 3-hop pick +
+onion wrap). At a realistic 100–500-candidate routing table, **selection
+dominates 24–98×.** Hybrid/Falcon issuers would make selection even more
+dominant (slower verify). Conclusion: **W2 (cache the verified relay set, fresh
+path per send) is 1–2 orders of magnitude more impactful than W1/W3**, which
+touch the small build/bandwidth half. (But see the production-wiring caveat —
+W2 is premature until the onion path is prod-wired.)
 
 ### W2 — selection-input caching (fresh path)
 - Sender-side cache (sibling to `AnonymityState`): `{rtt snapshot, diversity
