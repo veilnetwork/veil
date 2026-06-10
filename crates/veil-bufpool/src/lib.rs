@@ -315,6 +315,22 @@ impl Pooled {
         &mut self.buf
     }
 
+    /// Zero the current contents and resize to `n` zeroed bytes (audit
+    /// cycle-9). Invariant #1 documents that pooled buffers are NOT auto-zeroed
+    /// for performance, so a tenant handling SENSITIVE plaintext (key material,
+    /// decrypted frames) should call this instead of `acquire` + `resize` to
+    /// scrub any prior tenant's residue from the exposed range before reuse.
+    /// (This method was referenced in the module docs but never implemented.)
+    pub fn clear_and_resize_zeroed(&mut self, n: usize) {
+        // Zero the currently-exposed bytes first (scrub prior residue), then
+        // re-establish a zeroed length-`n` buffer.
+        for b in self.buf.iter_mut() {
+            *b = 0;
+        }
+        self.buf.clear();
+        self.buf.resize(n, 0);
+    }
+
     // Audit cycle-5: `into_vec_detached` removed. It had ZERO callers anywhere
     // (production / tests / FFI) and was buggy — it `ptr::read`-d only `buf` out
     // of a `ManuallyDrop<Pooled>`, leaking the `pool: Arc<PoolInner>` field (one
@@ -587,6 +603,18 @@ mod tests {
         let buf = pool.acquire(1000);
         assert_eq!(buf.len(), 0);
         assert!(buf.capacity() >= 1000);
+    }
+
+    #[test]
+    fn clear_and_resize_zeroed_scrubs_and_resizes() {
+        // audit cycle-9: the documented sensitive-buffer scrub path must exist
+        // and leave a zeroed length-n buffer with no prior residue.
+        let pool = BufferPool::default();
+        let mut buf = pool.acquire(64);
+        buf.as_vec_mut().extend_from_slice(&[0xAAu8; 32]); // tenant writes secret-ish bytes
+        buf.clear_and_resize_zeroed(16);
+        assert_eq!(buf.len(), 16, "resized to n");
+        assert!(buf.iter().all(|&b| b == 0), "exposed range is zeroed");
     }
 
     #[test]
