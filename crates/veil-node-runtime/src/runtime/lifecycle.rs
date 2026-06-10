@@ -307,6 +307,25 @@ impl NodeRuntime {
         veil_cfg::require_identity(config)?; // identity section present
         let _ = veil_cfg::transport_glue::context_from_config(config)?;
         let _ = HandshakeIdentity::from_config(config)?;
+        // Dry-run the FULL state build so EVERY fallible step in `build_state`
+        // is exercised here, BEFORE do_stop_tasks tears the node down — most
+        // importantly the per-peer `NodeId::from_public_key` on each
+        // `[[peers]].public_key`. HandshakeIdentity::from_config validates only
+        // the LOCAL identity, so a malformed PEER pubkey otherwise sailed
+        // through validation and then failed inside `build_state` in
+        // apply_reload_after_stop, AFTER the tasks were aborted and shutdown_tx
+        // taken → an online-but-dead zombie until process restart. The built
+        // NodeState is discarded; build_state is a pure constructor (no spawns),
+        // so this is cheap and future-proofs the gate against new fallible build
+        // steps. (audit cycle-10 — completes the cycle-9 reload-zombie fix.)
+        let _ = build_state(
+            config,
+            std::path::PathBuf::new(),
+            false,
+            std::time::Instant::now(),
+            false,
+            None,
+        )?;
         Ok(())
     }
 
