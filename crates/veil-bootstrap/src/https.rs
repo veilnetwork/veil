@@ -192,10 +192,16 @@ pub enum HttpsBootstrapError {
 /// Policy governing how [`fetch_seeds_https_with_policy`] handles the
 /// response body.
 ///
-/// The default ([`BootstrapHttpsPolicy::signed_required`] when an issuer
-/// pubkey pinned, [`BootstrapHttpsPolicy::signed_preferred`] without
-/// pinning) protects against compromised TLS endpoints (CDN, CA,
-/// hosting account, mirror endpoint).  Raw-JSON fallback is opt-in via
+/// [`BootstrapHttpsPolicy::signed_required`] (issuer pin) authenticates the
+/// bundle AUTHOR, so it genuinely protects against a compromised HTTPS origin
+/// (CDN, CA, hosting account, mirror) substituting the body. NOTE (audit
+/// cycle-9): [`BootstrapHttpsPolicy::signed_preferred`] (no pin) does NOT — it
+/// verifies only the envelope's self-embedded key, so an origin-compromise
+/// attacker can serve their own validly-signed bundle and it is accepted. It
+/// adds nothing over plain TLS against an origin compromise; the node therefore
+/// fails closed on unpinned bootstrap unless explicitly opted in
+/// (`allow_unpinned_signed_bootstrap` / `legacy_allow_unsigned_bootstrap`).
+/// Raw-JSON fallback is opt-in via
 /// [`BootstrapHttpsPolicy::legacy_allow_unsigned`] for dev/testnet
 /// builds that haven't yet provisioned a signed bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
