@@ -3583,6 +3583,19 @@ pub struct GlobalConfig {
     /// once production operators have migrated.
     #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
     pub legacy_allow_unsigned_bootstrap: bool,
+    /// Opt into UNPINNED signed-bundle bootstrap (audit cycle-9). When HTTPS /
+    /// `.onion` bootstrap URLs are configured WITHOUT
+    /// [`trusted_bundle_issuer_pubkey`](Self::trusted_bundle_issuer_pubkey),
+    /// the node fails closed by default — it refuses to fetch, because an
+    /// attacker who controls the HTTPS origin (CDN / CA / hosting account /
+    /// mirror compromise) can serve their OWN validly-signed bundle (own
+    /// keypair, real signature) which the unpinned verifier would accept. A pin
+    /// is the only thing that authenticates the bundle's author. Set this `true`
+    /// ONLY for dev/testnet, where pinning is inconvenient and the threat model
+    /// is relaxed; production must provision `trusted_bundle_issuer_pubkey`
+    /// instead. Default `false`.
+    #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
+    pub allow_unpinned_signed_bootstrap: bool,
     /// **Phase-2 Phase 11 slice 11d** enforcement flag.  When `true`,
     /// `load_config` REFUSES to load configs that:
     ///   * Carry no `# VEIL_CONFIG_SIGNATURE_V1: …` header, OR
@@ -3682,6 +3695,7 @@ impl Default for GlobalConfig {
             bootstrap_https_urls: Vec::new(),
             bootstrap_tor_socks_proxy: None,
             trusted_bundle_issuer_pubkey: None,
+            allow_unpinned_signed_bootstrap: false,
             require_signed_config: false,
             legacy_allow_unsigned_bootstrap: false,
             tls_ech_grease: Self::default_tls_ech_grease(),
@@ -5279,6 +5293,22 @@ mod epic_117_defaults {
     /// 481.4: a set `bootstrap_tor_socks_proxy` survives a round-trip
     /// (serde `skip_serializing_if = Option::is_none` must serialize a `Some`
     /// value, not silently drop it), and the default is `None`.
+    #[test]
+    fn cycle9_allow_unpinned_signed_bootstrap_defaults_false_and_roundtrips() {
+        // audit cycle-9 BOOT-UNPIN: the unpinned-bootstrap opt-in must default
+        // to false (the runtime fails closed on HTTPS bootstrap without a pin).
+        assert!(
+            !GlobalConfig::default().allow_unpinned_signed_bootstrap,
+            "must default to false (fail-closed)"
+        );
+        let g = GlobalConfig {
+            allow_unpinned_signed_bootstrap: true,
+            ..GlobalConfig::default()
+        };
+        let back: GlobalConfig = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert!(back.allow_unpinned_signed_bootstrap, "opt-in roundtrips");
+    }
+
     #[test]
     fn epic481_4_bootstrap_tor_socks_proxy_roundtrips() {
         assert!(

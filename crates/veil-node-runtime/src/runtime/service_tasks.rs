@@ -131,19 +131,46 @@ impl NodeRuntime {
         // discovered peers are registered + dialed via the same
         // outbound-connector path the DNS layer uses.
         if !config.global.bootstrap_https_urls.is_empty() {
+            // Fail-closed gate (audit cycle-9 BOOT-UNPIN): without an issuer pin,
+            // signed_preferred accepts ANY internally-valid bundle — an attacker
+            // who controls the HTTPS origin (CDN/CA/hosting/mirror compromise)
+            // can serve their own validly-signed seed list and the fetcher merges
+            // it. A pin is the only author authentication. Refuse to fetch
+            // unpinned bootstrap unless an operator explicitly opts in
+            // (production → trusted_bundle_issuer_pubkey; dev/testnet →
+            // allow_unpinned_signed_bootstrap / legacy_allow_unsigned_bootstrap).
+            let pinned = config.global.trusted_bundle_issuer_pubkey.is_some();
+            let unpinned_opt_in = config.global.allow_unpinned_signed_bootstrap
+                || config.global.legacy_allow_unsigned_bootstrap;
+            if !pinned && !unpinned_opt_in {
+                self.logger.error(
+                    "bootstrap.https.fail_closed",
+                    format!(
+                        "{} HTTPS bootstrap URL(s) configured without \
+                         trusted_bundle_issuer_pubkey — refusing to fetch unpinned bootstrap \
+                         (an HTTPS-origin compromise could serve a validly-signed attacker \
+                         bundle). Set trusted_bundle_issuer_pubkey for production, or \
+                         allow_unpinned_signed_bootstrap = true for dev/testnet.",
+                        config.global.bootstrap_https_urls.len(),
+                    ),
+                );
+                return;
+            }
             let logger = self.logger.clone();
             let urls = config.global.bootstrap_https_urls.clone();
             let transport_ctx = self.transport_ctx.clone();
-            // Construct policy from config: pinned-issuer takes precedence
-            // (signed-required + pin); else signed-required without pinning
-            // when `legacy_allow_unsigned_bootstrap = false` (default);
-            // else legacy unsigned acceptance (dev/testnet opt-in).
+            // Policy (the unpinned-without-opt-in case already failed closed
+            // above): pinned issuer → signed-required + pin (authenticates the
+            // bundle author); else `legacy_allow_unsigned_bootstrap` → accept raw
+            // JSON; else (`allow_unpinned_signed_bootstrap`) → signed_preferred,
+            // which verifies the envelope's self-embedded key only (NO author
+            // authentication — dev/testnet opt-in, gated above).
             let bootstrap_policy = match config.global.trusted_bundle_issuer_pubkey.as_deref() {
                 Some(pk) => veil_bootstrap::https::BootstrapHttpsPolicy::signed_required(pk),
-                None if !config.global.legacy_allow_unsigned_bootstrap => {
-                    veil_bootstrap::https::BootstrapHttpsPolicy::signed_preferred()
+                None if config.global.legacy_allow_unsigned_bootstrap => {
+                    veil_bootstrap::https::BootstrapHttpsPolicy::legacy_unsigned()
                 }
-                None => veil_bootstrap::https::BootstrapHttpsPolicy::legacy_unsigned(),
+                None => veil_bootstrap::https::BootstrapHttpsPolicy::signed_preferred(),
             };
             // 481.4: `.onion` URLs in the list are routed through this Tor
             // SOCKS proxy (plaintext HTTP over the Tor circuit); clearnet URLs
