@@ -4474,7 +4474,10 @@ mod tests {
         m.insert(2, 2);
         m.insert(3, 3); // at cap → evict oldest
         m.insert(4, 4); // at cap → evict oldest
-        let live = [1u32, 2, 3, 4].iter().filter(|k| m.get(k).is_some()).count();
+        let live = [1u32, 2, 3, 4]
+            .iter()
+            .filter(|k| m.get(k).is_some())
+            .count();
         assert_eq!(
             live, 2,
             "map must stay within max_size=2 after a re-insert (was 3 with the duplicate-heap bug)"
