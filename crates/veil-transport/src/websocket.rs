@@ -18,7 +18,7 @@ use super::{
     error::{Result, TransportError, handshake_timeout, tls_error, websocket_error},
     tcp::{connect_tcp_stream, peer_meta},
     traits::{
-        BoxIoStream, PeerMeta, Transport, TransportCapabilities, TransportConnection,
+        BoxIoStream, PeerMeta, RawInbound, Transport, TransportCapabilities, TransportConnection,
         TransportListener, TransportMessage, apply_standard_websocket_metadata,
     },
     uri::TransportUri,
@@ -475,6 +475,24 @@ impl TransportListener for WsListener {
         })
     }
 
+    /// cycle-8 H2: defer the WS upgrade handshake (timeout-bounded inside
+    /// `accept_ws_connection`) to a spawned `finish` so it doesn't serialize the
+    /// accept loop.
+    fn accept_split<'a>(&'a self) -> BoxFuture<'a, Result<RawInbound>> {
+        Box::pin(async move {
+            let (stream, remote_addr) = self.listener.accept().await?;
+            let bind_uri = self.bind_uri.clone();
+            let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
+                Box::pin(
+                    async move { accept_ws_connection("ws", bind_uri, stream, remote_addr).await },
+                );
+            Ok(RawInbound {
+                remote_addr: Some(remote_addr),
+                finish,
+            })
+        })
+    }
+
     fn local_addr(&self) -> String {
         listener_local_addr(&self.listener, &self.bind_uri)
     }
@@ -497,6 +515,25 @@ impl TransportListener for WssListener {
                 remote_addr,
             )
             .await
+        })
+    }
+
+    /// cycle-8 H2: defer the TLS + WS upgrade handshake (timeout-bounded inside
+    /// `accept_wss_connection`) to a spawned `finish` so it doesn't serialize the
+    /// accept loop.
+    fn accept_split<'a>(&'a self) -> BoxFuture<'a, Result<RawInbound>> {
+        Box::pin(async move {
+            let (stream, remote_addr) = self.listener.accept().await?;
+            let bind_uri = self.bind_uri.clone();
+            let acceptor = self.acceptor.clone();
+            let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
+                Box::pin(async move {
+                    accept_wss_connection(bind_uri, acceptor, stream, remote_addr).await
+                });
+            Ok(RawInbound {
+                remote_addr: Some(remote_addr),
+                finish,
+            })
         })
     }
 
