@@ -3867,7 +3867,10 @@ impl SessionRunner {
                         // could deadlock against a thread taking them in
                         // canonical order.
                         let next_hop = rlock!(dispatcher.route_cache()).lookup(&acceptor);
-                        let guard = wlock!(reg);
+                        // Read lock: send_to/get_sender take &self (tx_registry's
+                        // send-path contract), so concurrent PoW responses to
+                        // different acceptors run in parallel. (audit cycle-8 F5.)
+                        let guard = rlock!(reg);
                         // Try direct session to acceptor first; fall back
                         // via route cache then via the peer who sent
                         // us the challenge.
