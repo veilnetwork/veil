@@ -97,6 +97,12 @@ pub struct GatewaySnapshot {
 
 // ── GatewayList ───────────────────────────────────────────────────────────────
 
+/// Hard cap on distinct gateways tracked in [`GatewayList`] (audit cycle-9).
+/// Bounds heap + per-upsert sort cost under a beacon `node_id`-rotation flood,
+/// beyond the time-based `prune_stale`. Mirrors `veil-reputation`'s
+/// `DEFAULT_MAX_ENTRIES`.
+const MAX_GATEWAY_ENTRIES: usize = 4096;
+
 /// Sorted list of known gateways with scoring and failover logic.
 #[derive(Debug, Default)]
 pub struct GatewayList {
@@ -126,6 +132,24 @@ impl GatewayList {
             e.has_internet = has_internet;
             e.last_seen = now;
         } else {
+            // Hard cap (audit cycle-9): `prune_stale` is time-based only, so a
+            // node_id-rotation flood grows `entries` (and the per-upsert
+            // O(n log n) sort) until the next prune tick. At capacity, evict the
+            // oldest entry WITHOUT an active session — never drop a gateway we
+            // are actively using — mirroring the reputation map's bound. If every
+            // slot holds a live session, growth is bounded by the live-session
+            // cap and we let the insert proceed.
+            if self.entries.len() >= MAX_GATEWAY_ENTRIES
+                && let Some(idx) = self
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.stable_since.is_none())
+                    .min_by_key(|(_, e)| e.last_seen)
+                    .map(|(i, _)| i)
+            {
+                self.entries.swap_remove(idx);
+            }
             self.entries.push(GatewayEntry {
                 node_id,
                 veil_addr,
@@ -391,6 +415,36 @@ impl GatewayList {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn cycle9_upsert_caps_entries_but_never_evicts_active() {
+        // audit cycle-9: GatewayList::upsert had no hard cap (only time-based
+        // prune_stale), so a beacon node_id-rotation flood grew entries
+        // unbounded. A node with a live session (stable_since set) must never be
+        // evicted by the cap.
+        let mut gl = GatewayList::new(false);
+        let pinned = [0xFFu8; 32];
+        gl.upsert(pinned, "veil://pinned".to_owned(), 1.0, true);
+        gl.mark_connected(&pinned); // active session → stable_since set
+
+        for i in 0..(MAX_GATEWAY_ENTRIES as u32 + 50) {
+            let mut nid = [0u8; 32];
+            nid[..4].copy_from_slice(&i.to_le_bytes());
+            // avoid colliding with `pinned`
+            nid[31] = 0x01;
+            gl.upsert(nid, format!("veil://{i}"), 0.5, false);
+        }
+
+        assert!(
+            gl.entries().len() <= MAX_GATEWAY_ENTRIES,
+            "entries must stay bounded under flood, got {}",
+            gl.entries().len()
+        );
+        assert!(
+            gl.entries().iter().any(|e| e.node_id == pinned),
+            "an actively-connected gateway must never be evicted by the cap"
+        );
+    }
 
     /// Audit cycle-5 (#2): a NaN-scored gateway must sort to the END (worst),
     /// not the front. Guards the descending-sort NaN fallback comparator.
