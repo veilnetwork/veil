@@ -1835,6 +1835,45 @@ pub const ADMIN_TOKEN_FILENAME: &str = "admin.token";
 #[cfg(windows)]
 pub const ADMIN_PIPE_FILENAME: &str = "admin.pipe";
 
+/// Read one newline-terminated admin request line, bounded to `max_bytes`
+/// (audit cycle-8). Reads incrementally through the buffered reader and stops
+/// at the first newline OR the cap, whichever comes first, so the accumulator
+/// never exceeds `max_bytes` — a client streaming bytes with no newline cannot
+/// exhaust daemon memory. Returns `Ok(None)` for EOF-before-newline, an
+/// over-cap request, or non-UTF-8 input (all of which the caller treats as
+/// "close the connection"); `Ok(Some(line))` with the newline stripped
+/// otherwise.
+async fn read_bounded_admin_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break; // EOF before a newline
+        }
+        if let Some(nl) = available.iter().position(|&b| b == b'\n') {
+            raw.extend_from_slice(&available[..nl]);
+            reader.consume(nl + 1);
+            break;
+        }
+        let n = available.len();
+        raw.extend_from_slice(available);
+        reader.consume(n);
+        if raw.len() > max_bytes {
+            return Ok(None);
+        }
+    }
+    if raw.is_empty() || raw.len() > max_bytes {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(raw).ok())
+}
+
 async fn handle_admin_connection(
     stream: AdminStream,
     runtime: Arc<Mutex<NodeRuntime>>,
@@ -1842,7 +1881,6 @@ async fn handle_admin_connection(
     admin_socket: PathBuf,
     config_path: PathBuf,
 ) -> Result<()> {
-    let mut line = String::new();
     let mut reader = BufReader::new(stream);
 
     // Peek at the first byte to detect binary IPC clients that accidentally
@@ -1862,26 +1900,16 @@ async fn handle_admin_connection(
         }
     }
 
-    // Audit batch 2026-05-25 phase L: bound the admin request body
-    // Cap to MAX_ADMIN_REQUEST_BYTES to prevent a connected client from
-    // exhausting daemon memory by streaming arbitrary bytes without
-    // newline.  `tokio::io::AsyncBufReadExt::read_line` reads up to
-    // either a newline OR EOF; without a cap, a misbehaving (or
-    // attacker-controlled) Unix-socket / TCP-loopback client could
-    // grow `line: String` to gigabytes before failing.  The 64 KiB
-    // cap is generous — the largest legitimate admin command
-    // (RelaySend with a 16-hop path in hex) clocks ~2 KiB.
+    // Audit batch 2026-05-25 phase L + audit cycle-8: bound the admin request
+    // body AT READ TIME (see `read_bounded_admin_line`). The largest legitimate
+    // admin command (RelaySend with a 16-hop path in hex) clocks ~2 KiB; 64 KiB
+    // is generous. An over-cap / EOF-without-newline / non-UTF-8 request returns
+    // `None` → we silently close (logging would amplify adversary noise).
     const MAX_ADMIN_REQUEST_BYTES: usize = 64 * 1024;
-    let read = reader.read_line(&mut line).await?;
-    if read == 0 {
-        return Ok(());
-    }
-    if line.len() > MAX_ADMIN_REQUEST_BYTES {
-        // Oversized line — silently close.  Logging would amplify
-        // adversary noise; ban-list integration belongs at a higher
-        // layer if we want to escalate.
-        return Ok(());
-    }
+    let line = match read_bounded_admin_line(&mut reader, MAX_ADMIN_REQUEST_BYTES).await? {
+        Some(l) => l,
+        None => return Ok(()),
+    };
 
     let request: AdminRequest = serde_json::from_str(line.trim_end())?;
     let outcome = if request.version != ADMIN_PROTOCOL_VERSION {
@@ -3434,6 +3462,33 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
+
+    /// audit cycle-8: an admin client streaming bytes with no newline must NOT
+    /// be able to grow the read accumulator past the cap; `read_bounded_admin_line`
+    /// returns `None` (→ caller closes) instead of buffering it all.
+    #[tokio::test]
+    async fn admin_request_over_cap_without_newline_is_rejected() {
+        let cap = 64 * 1024;
+        // 70 KiB of non-newline bytes, never terminated.
+        let payload = vec![b'a'; cap + 6 * 1024];
+        let mut reader = tokio::io::BufReader::new(&payload[..]);
+        let got = super::read_bounded_admin_line(&mut reader, cap).await.unwrap();
+        assert!(
+            got.is_none(),
+            "over-cap newline-less request must be rejected, not buffered"
+        );
+    }
+
+    /// A normal newline-terminated request under the cap round-trips with the
+    /// newline stripped.
+    #[tokio::test]
+    async fn admin_request_normal_line_under_cap_ok() {
+        let cap = 64 * 1024;
+        let payload = b"{\"version\":1,\"cmd\":\"status\"}\n".to_vec();
+        let mut reader = tokio::io::BufReader::new(&payload[..]);
+        let got = super::read_bounded_admin_line(&mut reader, cap).await.unwrap();
+        assert_eq!(got.as_deref(), Some("{\"version\":1,\"cmd\":\"status\"}"));
+    }
 
     use tokio::time::{sleep, timeout};
     #[cfg(unix)]

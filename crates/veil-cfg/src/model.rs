@@ -88,10 +88,9 @@ pub struct Config {
     /// DHT background task tuning.
     #[serde(default, skip_serializing_if = "DhtConfig::is_default")]
     pub dht: DhtConfig,
-    /// Anycast resolution policy (signed-only vs best-effort).  Defaults
-    /// to best-effort for backward compat; production deployments that
-    /// route trust-sensitive traffic through anycast should set
-    /// `resolve_policy = "signed_only"`.
+    /// Anycast resolution policy.  Defaults to `signed_bound` (audit cycle-6
+    /// T2 — secure-by-default: only owner-signature-bound records resolve);
+    /// opt into `best_effort` explicitly for discovery-only deployments.
     #[serde(default, skip_serializing_if = "AnycastConfig::is_default")]
     pub anycast: AnycastConfig,
     /// Session-layer keepalive and idle-timeout tuning.

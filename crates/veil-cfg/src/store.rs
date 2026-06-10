@@ -396,12 +396,49 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     let backend = format::backend(format);
     let content = if path.is_file() && backend.save_strategy() == SaveStrategy::PatchExisting {
         let existing = fs::read_to_string(path)?;
-        backend.patch_existing(&existing, config)?
+        let patched = backend.patch_existing(&existing, config)?;
+        // audit cycle-8 H4: `patch_existing` preserves the file's leading
+        // comments — including a `# VEIL_CONFIG_SIGNATURE_V1:` header — verbatim
+        // over the now-MUTATED body. The retained signature no longer matches
+        // the new bytes, so the next `load_config` gets `VerifyFailed` (a WARN
+        // in phase-1, but a HARD boot refusal under `require_signed_config` /
+        // `VEIL_CONFIG_REQUIRE_SIGNED`). Rather than silently leave a config
+        // that won't verify, strip the now-stale header and warn the operator
+        // to re-sign.
+        if crate::signed_config::has_signature_header(&patched) {
+            log::warn!(
+                "config at {} was signed; saving changes INVALIDATED the signature — \
+                 stripped the now-stale signature header. Re-run `config sign` to re-sign \
+                 before relying on require_signed_config enforcement.",
+                path.display()
+            );
+            crate::signed_config::strip_signature_headers(&patched)
+        } else {
+            patched
+        }
     } else {
         backend.render(config)?
     };
     veil_util::atomic_write(path, content.as_bytes())?;
     Ok(())
+}
+
+/// Process-wide guard serializing config read-modify-write sequences
+/// (audit cycle-8 H5).
+///
+/// `save_config` re-reads + patches the file from the passed `Config`, so a
+/// caller doing `load_config → mutate one field → save_config` must hold this
+/// guard across the WHOLE sequence. Otherwise two concurrent RMW callers — e.g.
+/// the lazy-miner identity-nonce upgrade and a per-peer nonce persist — each
+/// load the same baseline and the last `save_config` clobbers the other's field
+/// (last-writer-wins), silently losing a persisted nonce. There is exactly one
+/// config file per process, so a single global lock is sufficient. Poison is
+/// recovered (a panic mid-write must not wedge all future writers).
+pub fn config_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CONFIG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Read the raw on-disk bytes of a config file without parsing them —
@@ -502,6 +539,74 @@ mod tests {
         );
         assert!(preprocessed.contains("runtime_flavor = \"multi_thread\""));
         assert!(!preprocessed.contains("VEIL_CONFIG_SIGNATURE_V1"));
+    }
+
+    /// audit cycle-8 H4: saving (patching) a signed config must STRIP the now-
+    /// stale signature header instead of leaving it over the mutated body
+    /// (which would fail verification / refuse boot under enforcement).
+    #[test]
+    fn save_config_strips_stale_signature_header_h4() {
+        let kp = veil_crypto::generate_keypair(crate::SignatureAlgorithm::Ed25519);
+        let raw = "[global]\nruntime_flavor = \"multi_thread\"\n";
+        let signed = crate::signed_config::sign_config(
+            raw,
+            &kp.public_key,
+            &kp.private_key,
+            kp.algo,
+            1_700_000_000,
+        )
+        .expect("sign");
+        assert!(signed.contains("VEIL_CONFIG_SIGNATURE_V1"));
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("veil-h4-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(&path, &signed).unwrap();
+
+        // Mutate + save → must strip the now-stale signature header.
+        save_config(&path, &Config::default()).expect("save");
+
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains("VEIL_CONFIG_SIGNATURE_V1"),
+            "save_config must strip the stale signature header, got:\n{after}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// audit cycle-8 H5: the config-write guard must serialize a read-modify-
+    /// write so two concurrent callers don't lose updates. Models the
+    /// `load → mutate → save` the lazy-miner and peer-handshake persists do with
+    /// a deliberately racy load-then-store on a shared counter — correct (no
+    /// lost updates) ONLY if the guard provides mutual exclusion across the RMW.
+    #[test]
+    fn config_write_guard_serializes_read_modify_write_h5() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SHARED: AtomicU64 = AtomicU64::new(0);
+        SHARED.store(0, Ordering::SeqCst);
+        let iters = 5_000u64;
+        let spawn_worker = || {
+            std::thread::spawn(move || {
+                for _ in 0..iters {
+                    let _g = config_write_guard();
+                    let v = SHARED.load(Ordering::SeqCst);
+                    SHARED.store(v + 1, Ordering::SeqCst); // racy without the guard
+                }
+            })
+        };
+        let t1 = spawn_worker();
+        let t2 = spawn_worker();
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert_eq!(
+            SHARED.load(Ordering::SeqCst),
+            2 * iters,
+            "config_write_guard must serialize read-modify-write (no lost updates)"
+        );
     }
 
     /// Pin to a DIFFERENT pubkey: verification surfaces `IssuerMismatch`

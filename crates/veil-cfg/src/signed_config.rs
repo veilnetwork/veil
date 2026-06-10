@@ -279,7 +279,7 @@ pub fn has_signature_header(content: &str) -> bool {
 /// Trimming edge whitespace is safe because TOML's parsing tolerates
 /// leading and trailing whitespace; the operator's actual config bytes
 /// between `[section]` markers are preserved verbatim.
-fn strip_signature_headers(content: &str) -> String {
+pub(crate) fn strip_signature_headers(content: &str) -> String {
     let joined = content
         .lines()
         .filter(|line| !line.starts_with(SIGNED_CONFIG_HEADER_PREFIX))

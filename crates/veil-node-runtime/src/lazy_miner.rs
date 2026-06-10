@@ -188,6 +188,10 @@ fn upgrade_nonce_in_config(
     logger: &NodeLogger,
 ) {
     let result = (|| -> Result<(), String> {
+        // audit cycle-8 H5: hold the process-wide config-write guard across the
+        // whole load-modify-save so a concurrent peer-nonce persist cannot load
+        // the same baseline and clobber this identity-nonce upgrade.
+        let _guard = cfg::config_write_guard();
         let mut config = cfg::load_config(config_path).map_err(|e| e.to_string())?;
         let identity = config.identity.as_mut().ok_or("no identity section")?;
         identity.nonce = new_nonce_b64.to_owned();
