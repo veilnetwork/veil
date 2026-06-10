@@ -71,10 +71,18 @@
 - Test: round-trip; envelope is exactly 12 B smaller; tamper test offset updated;
   budget assertion `max_payload(N) == 510 - 81·N`.
 
-### W0 — measurement
-- Instrument `send_anonymous`/`send_via_rendezvous` with per-phase timers
-  (selection-input build vs pick vs onion-wrap) + a payload-size histogram.
-- No behaviour/wire change. Decide W2/W3 sizing from data.
+### W0 — measurement (shipped: debug-log instrumentation)
+- `send_anonymous`/`send_via_rendezvous` now emit a `log::debug!`
+  `anonymity.{send,rendezvous}.timing` line per send with `select_us`
+  (candidate snapshot + relay discovery/verify + diversity map) vs `build_us`
+  (pick + onion wrap) + `payload`, `hops`, `candidates`, `usable`.
+- No behaviour/wire change; debug-level (off by default); anonymity-neutral
+  (local timing of our own send, nothing transmitted, no peer correlation).
+- Decide W2/W3 sizing from the captured ratio. Expectation: `select_us` ≫
+  `build_us` (per-candidate signature verify in `discover_relay_hops` vs a few
+  ECDH in the wrap) → justifies W2.
+- Follow-up (optional): promote to Prometheus sum/count metrics via
+  `NodeMetrics` for ongoing dashboards (`self.metrics` is reachable here).
 
 ### W2 — selection-input caching (fresh path)
 - Sender-side cache (sibling to `AnonymityState`): `{rtt snapshot, diversity
