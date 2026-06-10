@@ -77,6 +77,12 @@ pub enum AckTickOutcome {
         /// Direct next-hop the final attempt was sent through. :
         /// counted as a loss against this peer in the in-line loss tracker.
         next_hop: [u8; 32],
+        /// Final recipient. Lets the consumer distinguish a relayed timeout
+        /// (`next_hop != dst_node_id` → the relay may be at fault) from a direct
+        /// send to an offline destination (`next_hop == dst_node_id` → the
+        /// destination is down, not a relay), so relay-reputation attribution
+        /// doesn't blame a node for a peer being offline (audit cycle-10).
+        dst_node_id: [u8; 32],
     },
 }
 
@@ -229,6 +235,7 @@ impl PendingAckTracker {
                     content_id,
                     src_app_id: entry.src_app_id,
                     next_hop: entry.next_hop,
+                    dst_node_id: entry.dst_node_id,
                 });
                 // decrement per-peer counter on failure.
                 decrement_peer(per_peer, &entry.dst_node_id);
@@ -393,7 +400,14 @@ mod tests {
         }
         let out = t.tick();
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], AckTickOutcome::Failed { .. }));
+        // The Failed outcome must carry BOTH next_hop and dst_node_id so the
+        // consumer can tell a relayed timeout from a direct-to-offline-dst one
+        // (audit cycle-10 — relay-reputation attribution guard).
+        assert!(matches!(
+            out[0],
+            AckTickOutcome::Failed { next_hop, dst_node_id, .. }
+                if next_hop == hop() && dst_node_id == dst()
+        ));
         assert!(t.is_empty());
     }
 }

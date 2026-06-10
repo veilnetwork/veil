@@ -25,6 +25,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use veil_anonymity::relay_reputation::RelayReputation;
 use veil_anonymity::rendezvous::RendezvousPublisherEntry;
 
 /// Anonymity-domain state owned by [`NodeRuntime`] and shared as
@@ -65,6 +66,16 @@ pub struct AnonymityState {
     /// default — only receivers that explicitly opt in to
     /// rendezvous-routed inbound delivery touch this.
     pub rendezvous_publisher_entries: Arc<Mutex<Vec<RendezvousPublisherEntry>>>,
+
+    /// Per-node anonymity-relay failure ledger (Epic 482.3/482.4 Phase A).
+    /// Records relays observed to misbehave — a chosen first hop with no live
+    /// session (send-time), or a relayed delivery that exhausted retransmits
+    /// (timeout). The circuit picker consults its `rtt_penalty_ms` so a
+    /// misbehaving relay sorts behind viable alternatives. Built once at
+    /// startup and shared by `Arc`, so the short-term memory persists for the
+    /// process lifetime. Bounded + LRU-evicted; failures only, no decay (see
+    /// `veil_anonymity::relay_reputation`).
+    pub relay_reputation: Arc<RelayReputation>,
 }
 
 impl AnonymityState {
@@ -81,6 +92,7 @@ impl AnonymityState {
             advertised_bps,
             x25519_sk,
             rendezvous_publisher_entries: Arc::new(Mutex::new(Vec::new())),
+            relay_reputation: Arc::new(RelayReputation::new()),
         }
     }
 }

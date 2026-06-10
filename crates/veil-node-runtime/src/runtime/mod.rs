@@ -3015,7 +3015,10 @@ impl NodeRuntime {
             directory::{
                 DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
             },
-            sender::{DiversityOutcome, build_outbound_anonymous_cell_with_diversity_reported},
+            sender::{
+                DiversityOutcome,
+                build_outbound_anonymous_cell_with_diversity_reported_and_reputation,
+            },
         };
 
         // Wrap data in `AppDeliverPayload` so the receiver's
@@ -3099,12 +3102,19 @@ impl NodeRuntime {
         let diversity_key_of =
             move |node_id: &[u8; 32]| -> Option<String> { diversity_map.get(node_id).cloned() };
 
+        // Downweight relays with recorded failures (Epic 482.3/482.4 Phase A):
+        // a misbehaving relay's effective RTT is bumped by its penalty so it
+        // sorts behind viable alternatives.
+        let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
+        let reputation_penalty_ms =
+            move |node_id: &[u8; 32]| -> u32 { relay_reputation.rtt_penalty_ms(*node_id) };
         let ((first_hop_node_id, cell), diversity) =
-            build_outbound_anonymous_cell_with_diversity_reported(
+            build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
                 payload,
                 &usable_relays,
                 rtt_estimator,
                 diversity_key_of,
+                reputation_penalty_ms,
                 target_node_id,
                 target_x25519_pk,
                 hop_count,
@@ -3136,7 +3146,19 @@ impl NodeRuntime {
         frame.extend_from_slice(&cell);
         if let Some(ref reg) = self.dispatcher.session_tx_registry {
             let guard = wlock!(reg);
-            let _ = guard.send_to(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
+            let sent = guard.send_to(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
+            drop(guard);
+            if !sent {
+                // Signal 1 (Epic 482.3/482.4 Phase A): the chosen anonymity
+                // first hop has no live session — record it so the picker
+                // downweights it next time. This is per-sender-LOCAL memory and
+                // changes NO external behaviour (we still return Ok, no
+                // synchronous error), so it does not leak first-hop reachability
+                // to a sender-side observer (the reason this stays fire-and-forget).
+                self.anonymity
+                    .relay_reputation
+                    .record_failure(first_hop_node_id);
+            }
         }
         Ok(())
     }
@@ -3270,7 +3292,10 @@ impl NodeRuntime {
             directory::{
                 DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
             },
-            sender::{DiversityOutcome, build_outbound_anonymous_cell_with_diversity_reported},
+            sender::{
+                DiversityOutcome,
+                build_outbound_anonymous_cell_with_diversity_reported_and_reputation,
+            },
         };
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3331,12 +3356,18 @@ impl NodeRuntime {
         let diversity_key_of =
             move |node_id: &[u8; 32]| -> Option<String> { diversity_map.get(node_id).cloned() };
 
+        // Downweight relays with recorded failures (Epic 482.3/482.4 Phase A) —
+        // see send_anonymous for rationale.
+        let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
+        let reputation_penalty_ms =
+            move |node_id: &[u8; 32]| -> u32 { relay_reputation.rtt_penalty_ms(*node_id) };
         let ((first_hop_node_id, cell), diversity) =
-            build_outbound_anonymous_cell_with_diversity_reported(
+            build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
                 &payload_bytes,
                 &usable_relays,
                 rtt_estimator,
                 diversity_key_of,
+                reputation_penalty_ms,
                 ad.rendezvous_node_id,
                 rendezvous_relay.hop.pubkey,
                 hop_count,
@@ -3361,7 +3392,16 @@ impl NodeRuntime {
         frame.extend_from_slice(&cell);
         if let Some(ref reg) = self.dispatcher.session_tx_registry {
             let guard = wlock!(reg);
-            let _ = guard.send_to(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
+            let sent = guard.send_to(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
+            drop(guard);
+            if !sent {
+                // Signal 1 (Phase A): chosen anonymity first hop has no live
+                // session — record it (per-sender-local, no external behaviour
+                // change). See send_anonymous.
+                self.anonymity
+                    .relay_reputation
+                    .record_failure(first_hop_node_id);
+            }
         }
         Ok(())
     }
