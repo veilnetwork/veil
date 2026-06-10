@@ -117,6 +117,13 @@ class VeilClient implements Finalizable {
         final bytes = len > 0
             ? Uint8List.fromList(payload.asTypedList(len))
             : Uint8List(0);
+        // cycle-7 H6: the native payload buffer is now callee-owned — free it
+        // immediately after copying. This callback runs on the isolate AFTER
+        // the Rust frame returned (NativeCallable.listener defers), so reading
+        // `payload` here was a use-after-free before the buffer became owned.
+        if (len > 0) {
+          ffi.veilFreeBuf(payload, len);
+        }
         controller.add(VeilEvent(
           kind: VeilEventKind.fromWire(kind),
           rawKind: kind,
@@ -1097,6 +1104,12 @@ class AppHandle implements Finalizable {
         final data = len > 0
             ? Uint8List.fromList(dataPtr.asTypedList(len))
             : Uint8List(0);
+        // cycle-7 H6: srcNode/srcApp/dataPtr are offsets into ONE callee-owned
+        // buffer ([nodeId(32) | appId(32) | data]); free it via the base
+        // pointer (srcNode) with the total length, after copying all three.
+        // This callback runs on the isolate AFTER the Rust frame returned, so
+        // reading these pointers was a use-after-free before they became owned.
+        ffi.veilFreeBuf(srcNode, 64 + len);
         controller
             .add(IncomingMessage(srcNodeId: src, srcAppId: app, data: data));
       },

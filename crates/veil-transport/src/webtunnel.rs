@@ -35,8 +35,8 @@ use super::{
     TransportContext,
     error::{Result, TransportError, handshake_timeout},
     traits::{
-        BoxIoStream, Transport, TransportCapabilities, TransportConnection, TransportHandshakeMode,
-        TransportListener, standard_peer_meta,
+        BoxIoStream, RawInbound, Transport, TransportCapabilities, TransportConnection,
+        TransportHandshakeMode, TransportListener, standard_peer_meta,
     },
     uri::TransportUri,
 };
@@ -292,6 +292,52 @@ impl TransportListener for WebtunnelListener {
                 TransportHandshakeMode::TlsRustls,
             );
             Ok(super::tcp::boxed_stream_connection(peer, byte_stream))
+        })
+    }
+
+    /// cycle-7 H2: split the kernel accept (fast) from the webtunnel handshake
+    /// (TLS + HTTP/WS routing — both read attacker bytes). The runtime spawns
+    /// `finish` behind the inbound-handshake semaphore so a stalled client
+    /// cannot monopolise the serial accept loop for the timeout window.
+    /// `WebtunnelRouter` and `TlsAcceptor` are both clone-cheap (Arc-backed),
+    /// so `finish` owns its config and is `'static`.
+    fn accept_split<'a>(&'a self) -> BoxFuture<'a, Result<RawInbound>> {
+        Box::pin(async move {
+            let (tcp, remote_addr) = self.listener.accept().await?;
+            let local_addr = tcp.local_addr().ok();
+            let acceptor = self.acceptor.clone();
+            let router = self.router.clone();
+            let bind_uri = self.bind_uri.clone();
+            let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
+                Box::pin(async move {
+                    let tls_stream =
+                        tokio::time::timeout(WEBTUNNEL_HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
+                            .await
+                            .map_err(|_| handshake_timeout(WEBTUNNEL_HANDSHAKE_TIMEOUT))?
+                            .map_err(|e| {
+                                TransportError::Tls(format!("webtunnel TLS accept: {e}"))
+                            })?;
+                    let ws = tokio::time::timeout(
+                        WEBTUNNEL_HANDSHAKE_TIMEOUT,
+                        router.handle(Box::new(tls_stream) as BoxIoStream),
+                    )
+                    .await
+                    .map_err(|_| handshake_timeout(WEBTUNNEL_HANDSHAKE_TIMEOUT))?
+                    .map_err(|e| TransportError::Tls(format!("webtunnel router: {e}")))?;
+                    let byte_stream = ws_to_byte_stream(ws);
+                    let peer = standard_peer_meta(
+                        "webtunnel-wss",
+                        bind_uri,
+                        local_addr,
+                        Some(remote_addr),
+                        TransportHandshakeMode::TlsRustls,
+                    );
+                    Ok(super::tcp::boxed_stream_connection(peer, byte_stream))
+                });
+            Ok(RawInbound {
+                remote_addr: Some(remote_addr),
+                finish,
+            })
         })
     }
 

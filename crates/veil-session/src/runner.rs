@@ -1084,8 +1084,19 @@ impl SessionRunner {
         let Some(cipher) = self.crypto.rx_cipher.as_mut() else {
             return ControlFlow::Continue(DecryptInPlaceOutcome::Passthrough);
         };
+        // cycle-7 M1: with a cipher present, even a zero-plaintext control frame
+        // MUST carry its AEAD tag (sealed by `apply_tx_cipher`). A genuinely
+        // empty body here is therefore UNAUTHENTICATED — a pre-M1 peer, or an
+        // on-path forgery of Keepalive / RekeyKeptInit / MlKemRekeyAck /
+        // Backpressure. Reject it (tear the session down) instead of passing it
+        // through unverified. A sealed empty frame is NOT empty here: its body
+        // is the 16-byte AEAD tag, so it flows to the open path below.
         if raw_body.is_empty() {
-            return ControlFlow::Continue(DecryptInPlaceOutcome::Passthrough);
+            log::warn!(
+                "session.rx: empty-body frame received with cipher active — \
+                 rejecting unauthenticated control frame (peer pre-M1 or forged)"
+            );
+            return ControlFlow::Break(());
         }
         let aad = frame_aad(header_family, header_msg_type);
         let now = tokio::time::Instant::now();
@@ -1847,8 +1858,10 @@ impl SessionRunner {
                         SessionMsg::RekeyKeptInit as u16,
                     );
                     let kept_init_frame = encode_header(&kept_init_hdr).to_vec();
-                    // empty body — but RekeyKeptInit must still be AEAD-encrypted
-                    // (current keys) to prove session-membership to the peer.
+                    // empty body, but `apply_tx_cipher` AEAD-seals it (cycle-7
+                    // M1) so the empty frame still proves session-membership to
+                    // the peer — the receiver tears down on an unauthenticated
+                    // empty frame.
                     let wire_kept_init = {
                         let Some(cipher) = self.crypto.tx_cipher.as_mut() else {
                             return ControlFlow::Continue(());
@@ -2463,13 +2476,23 @@ pub fn apply_tx_cipher(
 ) -> Option<veil_bufpool::PooledShared> {
     use veil_crypto::session_cipher::CipherError;
     use veil_proto::header::HEADER_SIZE;
-    if frame.len() <= HEADER_SIZE {
-        // Header-only frame (no body to encrypt). Wrap the input slice
-        // through a pool copy — these are infrequent (handshake/keepalive
-        // territory) so the extra copy is negligible vs maintaining
-        // separate non-pooled call paths.
+    if frame.len() < HEADER_SIZE {
+        // Malformed sub-header frame (cannot decode a header to derive AAD).
+        // Unreachable in practice — every frame carries a full header — but
+        // guard the slice below. Wrap verbatim through a pool copy.
         return Some(veil_bufpool::pooled_shared_from_vec(frame.to_vec()));
     }
+    // cycle-7 M1: a header-only frame (body_len == 0) is STILL sealed when a
+    // cipher is present — the empty plaintext is AEAD'd to a 16-byte detached
+    // tag (body_len becomes AEAD_OVERHEAD). Previously such frames
+    // (Keepalive / KeepaliveAck / Backpressure / RekeyKeptInit / MlKemRekeyAck)
+    // went out unauthenticated, so on a plaintext-TCP link an on-path attacker
+    // could forge them to manipulate the rekey FSM / mask a dying transport.
+    // The seal path below handles a zero-length plaintext slice correctly.
+    //
+    // WIRE COMPAT (flag-day): empty control frames grow by 16 bytes and a
+    // pre-M1 peer's receiver rejects them (it expects no body). Roll out to all
+    // nodes together — see `decrypt_frame_body_in_place`.
     let plaintext_body = &frame[HEADER_SIZE..];
     let h = decode_header(frame).ok()?;
     let aad = frame_aad(h.family, h.msg_type);
@@ -3856,3 +3879,49 @@ use veil_util::hex_short;
 // for file-size sanity. `#[path]` attribute keeps it scoped as a child
 // module of `runner` so all `super::*` imports still resolve and
 // `pub` visibility from runner's items is preserved.
+
+#[cfg(test)]
+mod m1_empty_frame_aead_tests {
+    use super::*;
+    use veil_proto::header::HEADER_SIZE;
+
+    /// cycle-7 M1: a header-only control frame (body_len == 0) MUST be
+    /// AEAD-sealed when a cipher is present — it grows by exactly the AEAD tag
+    /// and decodes/opens back to empty plaintext — rather than being returned
+    /// verbatim and unauthenticated (the previous behaviour that let an on-path
+    /// attacker forge Keepalive / RekeyKeptInit / MlKemRekeyAck on a
+    /// plaintext-TCP link).
+    #[test]
+    fn empty_control_frame_is_sealed_not_passed_through() {
+        const AEAD_OVERHEAD: usize = veil_crypto::session_cipher::AEAD_OVERHEAD;
+        let key = [0x11u8; 32];
+        let mut tx = SessionCipher::new(&key, true);
+
+        // A header-only frame: full header, zero body.
+        let hdr = FrameHeader::new(0u8, 0u16);
+        let frame = encode_header(&hdr).to_vec();
+        assert_eq!(frame.len(), HEADER_SIZE);
+
+        let sealed = apply_tx_cipher(&frame, &mut tx).expect("empty frame must seal");
+        let bytes = sealed.as_slice();
+        assert_eq!(
+            bytes.len(),
+            HEADER_SIZE + AEAD_OVERHEAD,
+            "empty control frame must carry a 16-byte AEAD tag, not pass through verbatim"
+        );
+
+        let out_hdr = decode_header(bytes).expect("decode sealed header");
+        assert_eq!(
+            out_hdr.body_len as usize, AEAD_OVERHEAD,
+            "body_len must reflect the AEAD tag length"
+        );
+
+        // Round-trip: a peer cipher with the same key opens it to empty plaintext.
+        let mut rx = SessionCipher::new(&key, true);
+        let aad = frame_aad(out_hdr.family, out_hdr.msg_type);
+        let pt = rx
+            .open(&bytes[HEADER_SIZE..], &aad)
+            .expect("sealed empty frame must open");
+        assert!(pt.is_empty(), "sealed empty frame opens to empty plaintext");
+    }
+}
