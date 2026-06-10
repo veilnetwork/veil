@@ -1,7 +1,7 @@
 //! Inbound listeners — the client-side surfaces that accept local
 //! TCP connections in a given protocol (SOCKS5 / HTTP CONNECT / TProxy),
 //! extract the destination `(host, port)`, and hand the connection off
-//! to [`crate::connector::open_stream_and_bridge`].
+//! to [`crate::connector::bridge_via_routing`].
 
 pub mod http;
 pub mod socks5;
