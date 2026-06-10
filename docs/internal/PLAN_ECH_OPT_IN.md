@@ -2,12 +2,14 @@
 
 > **Status (2026-06):** the activation prerequisites have largely **shipped** —
 > the TLS crypto provider is now `aws-lc-rs` (`crates/veil-transport/src/tls.rs`)
-> and client-side ECH is wired (GREASE always-on + real ECH via DNS HTTPS-RR
-> lookup, `crates/veil-transport/src/ech_dns.rs::query_https_ech`). **Not yet
-> done:** an operator `[transport]` config schema (`ech_enabled` /
-> `ech_config_list_file`) and the startup WARN log — ECH is currently hard-wired
-> (GREASE + auto-detect), not config-gated. Server-side ECH stays out of scope
-> (rustls API). Treat the design below as rationale, not pending work.
+> and client-side ECH is wired (GREASE + real ECH via DNS HTTPS-RR lookup,
+> `crates/veil-transport/src/ech_dns.rs::query_https_ech`). It is gated by ONE
+> coarse toggle, `[global] tls_ech_grease` (**default `true`** — GREASE on out
+> of the box; set `false` to disable). **Not yet done:** a finer operator
+> `[transport]` ECH schema (`ech_enabled` / `ech_config_list_file` for an
+> explicit ECHConfigList + per-endpoint control) and the startup WARN log.
+> Server-side ECH stays out of scope (rustls API). Treat the design below as
+> rationale, not pending work.
 
 Anti-censorship strategy P0-followup. This closes DPI method #14 (the FakeSNI heuristic) **without** requiring CDN domain fronting. ECH means Encrypted Client Hello: it hides the SNI — the website name your client normally sends in the clear during a TLS handshake — so a censor can't read which site you're reaching.
 
