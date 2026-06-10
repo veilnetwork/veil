@@ -23,12 +23,11 @@ use veil_bootstrap::{
 use veil_cfg::{BootstrapPeer, NodeId};
 use veil_observability::NodeLogger;
 
-/// Synthetic peer-id range for apps-added bootstrap peers. High bit
-/// plus the `0x800_0000` marker keeps these distinct from configured
-/// peers (small u32) and bootstrap-from-config (`0x8000_0000` range
-/// from `service_tasks::spawn_bootstrap_task`). Each new app-added
-/// peer claims the next slot via an atomic counter.
-pub const APP_ADDED_PEER_ID_BASE: u32 = 0x8800_0000;
+/// Synthetic peer-id range for apps-added bootstrap peers. Distinct from
+/// configured peers (small u32), DNS bootstrap, and HTTPS seeds. Each new
+/// app-added peer claims the next slot via an atomic counter. Single source of
+/// truth lives in [`crate::types::synthetic_peer_id`] (cycle-7 M3).
+pub const APP_ADDED_PEER_ID_BASE: u32 = crate::types::synthetic_peer_id::APP_ADDED_BASE;
 
 /// Bridges `JoinBootstrapUri` IPC requests to runtime peer-state +
 /// outbound-connector machinery.

@@ -125,9 +125,10 @@ impl SharedState {
 /// * `admitted=false` ⇒ no active session to peer; peer dropped + warn.
 /// * `has_cert=false` ⇒ peer admitted in public mode but without cert; drop.
 ///
-/// On startup: filters once.  On SIGHUP reload: filter re-runs (existing
-/// reload-task already re-calls `SharedState::build` through the supervisor;
-/// see the reload-handler block).
+/// Called on startup AND on every SIGHUP reload (cycle-7 H4) — the reload
+/// handler re-runs this before `SharedState::build` so a peer whose
+/// MembershipCert was revoked/expired since the last load is dropped rather
+/// than re-admitted to the routing table.
 async fn filter_peers_by_pnet(cfg: &OgateConfig, client: &VeilClient) -> OgateConfig {
     let mut filtered = cfg.clone();
     let original_count = cfg.peers.len();
@@ -221,9 +222,13 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
     // ── IPC handshake (moved earlier than initial-state build so we
     //    can query peer_pnet_status while filtering peers) ──────────────
     tracing::info!(socket = %cfg.socket_path.display(), "connecting to veil daemon");
-    let client = VeilClient::connect(&cfg.socket_path)
-        .await
-        .map_err(BridgeError::client)?;
+    // `Arc` so the SIGHUP reload task can also query peer_pnet_status to
+    // re-apply the P-Net filter on reload (see the reload handler below).
+    let client = Arc::new(
+        VeilClient::connect(&cfg.socket_path)
+            .await
+            .map_err(BridgeError::client)?,
+    );
 
     // ── initial state ───────────────────────────────────────────────────
     // S2.A: filter peers by daemon-side P-Net cert verification if
@@ -692,6 +697,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         let current_cfg = Arc::clone(&current_cfg);
         let shutdown = Arc::clone(&shutdown);
         let path = config_path.clone();
+        let client = Arc::clone(&client);
         tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
             let mut hup = match signal(SignalKind::hangup()) {
@@ -722,6 +728,16 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                             );
                             continue;
                         }
+                        // SECURITY (cycle-7 H4): re-apply the P-Net peer filter on
+                        // reload, exactly as startup does. Without this a revoked /
+                        // expired MembershipCert peer was re-admitted to the routing
+                        // table on any SIGHUP (even an unchanged file) and could
+                        // inject TUN traffic until the next full restart.
+                        let new_cfg = if new_cfg.pnet_required {
+                            filter_peers_by_pnet(&new_cfg, &client).await
+                        } else {
+                            new_cfg
+                        };
                         let new_state = match SharedState::build(&new_cfg) {
                             Ok(s) => s,
                             Err(e) => {

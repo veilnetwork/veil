@@ -44,7 +44,9 @@ impl NodeRuntime {
         let session_tx_registry = Arc::clone(&self.session_tx_registry);
         let logger = Arc::clone(&self.logger);
         let shutdown_tx_clone = shutdown_tx.clone();
-        let mut peer_id_ctr: u32 = 0xD000_0000; // synthetic range for failover-initiated
+        // cycle-7 M3: gateway-failover window, disjoint from pinned-relays / PEX
+        // (all used to share 0xD000_0000). See `types::synthetic_peer_id`.
+        let mut peer_id_ctr: u32 = crate::types::synthetic_peer_id::GATEWAY_FAILOVER_BASE;
 
         let handle = tokio::spawn(async move {
             use veil_gateway::BASE_SCORE_AUTODISCOVERED;
@@ -70,6 +72,18 @@ impl NodeRuntime {
                             gw.veil_addr.clone(),
                             BASE_SCORE_AUTODISCOVERED,
                             has_internet,
+                        );
+                    }
+                    // cycle-7 MH4d: evict gateways we have not seen in a while and
+                    // are not actively connected to, so a node rotating beacon
+                    // node_ids cannot grow GatewayList without bound.
+                    const GATEWAY_STALE_TTL: std::time::Duration =
+                        std::time::Duration::from_secs(600);
+                    let pruned = gl.prune_stale(GATEWAY_STALE_TTL);
+                    if pruned > 0 {
+                        logger.info(
+                            "gateway.prune",
+                            format!("evicted {pruned} stale GatewayList entries"),
                         );
                     }
                 }
@@ -367,7 +381,8 @@ impl NodeRuntime {
             // when one fires — `Notify::notify_waiters` doesn't queue).
             // 1 s × 8 entries × 1 sort ≈ negligible CPU.
             const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-            let mut peer_id_counter: u32 = 0xC000_0000;
+            let mut peer_id_counter: u32 =
+                crate::types::synthetic_peer_id::MESH_AUTODISCOVER_BASE;
 
             loop {
                 tokio::select! {

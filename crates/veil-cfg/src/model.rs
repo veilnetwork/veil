@@ -2159,7 +2159,10 @@ impl DhtConfig {
                 &self.transport_announcements_persist_interval_secs,
             )
             && self.max_store_entries == Self::default_max_store_entries()
-            && self.max_store_bytes.is_none()
+            // NB: default is `Some(400_000_000)`, NOT None — `.is_none()` here
+            // wrongly reported `DhtConfig::default()` as non-default, so a
+            // default `[dht]` section round-tripped through serialization.
+            && self.max_store_bytes == Self::default_max_store_bytes()
             && self.per_origin_max_bytes.is_none()
             && !self.shard_filtering
             && Self::is_default_allow_unsigned_store(&self.allow_unsigned_store)
@@ -4414,6 +4417,35 @@ fn default_rate_limit() -> String {
 
 fn default_max_accepts() -> usize {
     1
+}
+
+#[cfg(test)]
+mod dht_config_default_tests {
+    use super::*;
+
+    #[test]
+    fn dht_config_default_is_reported_default() {
+        // Regression: is_default() compared max_store_bytes against None, but
+        // the default is Some(400_000_000) — so DhtConfig::default() was wrongly
+        // reported non-default and a default [dht] section serialized out.
+        assert!(
+            DhtConfig::default().is_default(),
+            "DhtConfig::default() must satisfy is_default()"
+        );
+        assert_eq!(
+            DhtConfig::default().max_store_bytes,
+            DhtConfig::default_max_store_bytes()
+        );
+    }
+
+    #[test]
+    fn dht_config_non_default_max_store_bytes_detected() {
+        let c = DhtConfig {
+            max_store_bytes: Some(123),
+            ..DhtConfig::default()
+        };
+        assert!(!c.is_default());
+    }
 }
 
 #[cfg(test)]

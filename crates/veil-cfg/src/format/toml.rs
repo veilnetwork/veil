@@ -225,13 +225,19 @@ fn set_transport(document: &mut DocumentMut, transport: &crate::TransportConfig)
 
     set_tls_client_table(transport_table, &transport.tls_client)?;
     set_rotation_table(transport_table, &transport.rotation)?;
+    set_tls_fingerprint_table(transport_table, &transport.tls_fingerprint)?;
     // Prune sub-tables that are not part of the current schema (e.g.
     // legacy `quic_client` / `websocket` left over from older configs
     // someone copied and updated incrementally).  Pre-Q.7 the entire
     // `[transport]` section was removed-and-rebuilt in the default
     // case, which incidentally cleaned these up; now that we always
     // emit `[transport.rotation]`, we have to do the pruning explicitly.
-    const KNOWN_SUB_TABLES: &[&str] = &["rotation", "tls_client"];
+    //
+    // `tls_fingerprint` MUST be in this list: it is an always-serialised,
+    // runtime-consumed anti-censorship control. Before it was added here the
+    // pruner deleted a `pinned` profile on every save, silently reverting the
+    // node to the default `rotate` policy (operator DPI-evasion downgrade).
+    const KNOWN_SUB_TABLES: &[&str] = &["rotation", "tls_client", "tls_fingerprint"];
     let stale: Vec<String> = transport_table
         .iter()
         .filter_map(|(k, v)| {
@@ -270,6 +276,30 @@ fn set_rotation_table(table: &mut Table, rotation: &crate::TransportRotationConf
         "max_lifetime_secs",
         Item::Value(Value::from(rotation.max_lifetime_secs)),
     );
+    Ok(())
+}
+
+/// Always emit `[transport.tls_fingerprint]` with the current policy, EVEN
+/// when it matches the baked-in default.  Rationale mirrors
+/// `set_rotation_table`: discoverability of the censor-evasion knob beats
+/// keeping the file minimal, and the struct doc marks it "Always serialised".
+fn set_tls_fingerprint_table(
+    table: &mut Table,
+    fp: &crate::TlsFingerprintConfig,
+) -> Result<()> {
+    if !table.get("tls_fingerprint").is_some_and(Item::is_table) {
+        table["tls_fingerprint"] = Item::Table(Table::new());
+    }
+    let fp_table =
+        table["tls_fingerprint"]
+            .as_table_mut()
+            .ok_or(ConfigError::TomlSectionNotTable {
+                section: "transport.tls_fingerprint",
+            })?;
+    fp_table.insert("mode", Item::Value(Value::from(fp.mode.as_str())));
+    fp_table.insert("profile", Item::Value(Value::from(fp.profile.as_str())));
+    set_string_array(fp_table, "rotation", &fp.rotation);
+    fp_table.insert("sticky", Item::Value(Value::from(fp.sticky)));
     Ok(())
 }
 
@@ -743,5 +773,40 @@ mod tests {
         let rendered = document.to_string();
         assert!(rendered.contains("min_lifetime_secs = -1"));
         assert!(rendered.contains("max_lifetime_secs = -1"));
+    }
+
+    #[test]
+    fn tls_fingerprint_pinned_survives_save() {
+        // Regression: the [transport.*] pruner used to delete the live,
+        // runtime-consumed `tls_fingerprint` section on every save, silently
+        // reverting a pinned anti-DPI profile to the default `rotate` policy.
+        let mut document = "[transport]\n[transport.tls_fingerprint]\nmode = \"pinned\"\nprofile = \"firefox\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let mut config = Config::default();
+        config.transport.tls_fingerprint.mode = "pinned".to_owned();
+        config.transport.tls_fingerprint.profile = "firefox".to_owned();
+
+        update_document(&mut document, &config).unwrap();
+
+        let rendered = document.to_string();
+        assert!(
+            rendered.contains("[transport.tls_fingerprint]"),
+            "tls_fingerprint section must survive a save, got: {rendered}"
+        );
+        assert!(rendered.contains("mode = \"pinned\""));
+        assert!(rendered.contains("profile = \"firefox\""));
+    }
+
+    #[test]
+    fn tls_fingerprint_section_always_emitted_with_defaults() {
+        let mut document = DocumentMut::new();
+        update_document(&mut document, &Config::default()).unwrap();
+        let rendered = document.to_string();
+        assert!(
+            rendered.contains("[transport.tls_fingerprint]"),
+            "tls_fingerprint section must always appear, got: {rendered}"
+        );
+        assert!(rendered.contains("mode = \"rotate\""));
     }
 }

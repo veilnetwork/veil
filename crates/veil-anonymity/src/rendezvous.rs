@@ -569,6 +569,22 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
 /// a censor cannot strip the envelope post-sign and pass a v2 ad as
 /// v1, since the v2 signature won't verify under v1 canonical.
 pub fn verify_rendezvous_ad(ad: &RendezvousAd) -> Result<(), RendezvousError> {
+    // Bind receiver_node_id to the issuer key: receiver_node_id MUST equal
+    // BLAKE3(issuer_pk). Without this, an attacker holding ANY valid identity
+    // key could sign an ad naming a *victim's* receiver_node_id (with an
+    // attacker-chosen rendezvous_node_id + receiver_x25519_pk) and the
+    // signature alone would pass — letting them hijack the victim's rendezvous
+    // slot so a sender seals the Introduce frame to the attacker's X25519 key
+    // and routes the onion to the attacker's relay (content + metadata capture
+    // / MITM / deanonymization). Enforced HERE (not only at the resolver) so the
+    // invariant holds for every caller. Mirrors `directory::verify_entry`'s
+    // node_id↔issuer binding. (audit cycle-6 H1.)
+    let issuer_pk_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &ad.issuer_pk)
+            .map_err(|_| RendezvousError::Verify)?;
+    if blake3::hash(&issuer_pk_bytes).as_bytes() != &ad.receiver_node_id {
+        return Err(RendezvousError::Verify);
+    }
     let canonical = match ad.wire_version {
         VERSION_LEGACY => canonical_message_v1(
             &ad.receiver_node_id,
@@ -1860,9 +1876,22 @@ mod tests {
     use super::*;
     use veil_crypto::generate_keypair;
 
+    /// node_id that satisfies the in-band binding `BLAKE3(issuer_pk) ==
+    /// receiver_node_id` enforced by `verify_rendezvous_ad`. Production ads
+    /// always have this shape (receiver_node_id IS BLAKE3 of the identity
+    /// pubkey); tests must construct coherent ads to exercise verify.
+    fn coherent_node_id(issuer_pk_b64: &str) -> [u8; NODE_ID_LEN] {
+        // Mirror verify_rendezvous_ad: hash the DECODED pubkey bytes, since
+        // `issuer_pk` is stored base64-encoded.
+        let raw =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, issuer_pk_b64)
+                .expect("test issuer_pk must be valid base64");
+        *blake3::hash(&raw).as_bytes()
+    }
+
     fn fixture_ed25519() -> (Vec<u8>, RendezvousAd, String) {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
-        let receiver_node_id = [0xAAu8; 32];
+        let receiver_node_id = coherent_node_id(&kp.public_key);
         let rendezvous_node_id = [0xBBu8; 32];
         let auth_cookie = [0xCCu8; 16];
         let receiver_x25519_pk = [0xDDu8; 32];
@@ -1891,9 +1920,9 @@ mod tests {
 
     #[test]
     fn epic482_5_sign_decode_verify_round_trip_ed25519() {
-        let (_bytes, ad, _pk) = fixture_ed25519();
+        let (_bytes, ad, pk) = fixture_ed25519();
         verify_rendezvous_ad(&ad).expect("signature must verify");
-        assert_eq!(ad.receiver_node_id, [0xAAu8; 32]);
+        assert_eq!(ad.receiver_node_id, coherent_node_id(&pk));
         assert_eq!(ad.rendezvous_node_id, [0xBBu8; 32]);
         assert_eq!(ad.auth_cookie, [0xCCu8; 16]);
         assert_eq!(ad.receiver_x25519_pk, [0xDDu8; 32]);
@@ -1906,7 +1935,7 @@ mod tests {
     fn epic482_5_sign_decode_verify_round_trip_falcon512() {
         let kp = generate_keypair(SignatureAlgorithm::Falcon512);
         let bytes = sign_rendezvous_ad(
-            [0xAAu8; 32],
+            coherent_node_id(&kp.public_key),
             [0xBBu8; 32],
             [0xCCu8; 16],
             [0xDDu8; 32],
@@ -1923,6 +1952,66 @@ mod tests {
         let ad = decode_rendezvous_ad(&bytes).unwrap();
         verify_rendezvous_ad(&ad).expect("Falcon signature must verify");
         assert_eq!(ad.issuer_algo, SignatureAlgorithm::Falcon512);
+    }
+
+    /// Regression (audit cycle-6 H1): an attacker holding their OWN valid
+    /// identity key signs a well-formed ad that NAMES the victim's
+    /// receiver_node_id while pointing receiver_x25519_pk + rendezvous_node_id
+    /// at attacker-controlled values. The signature is internally valid, but
+    /// `verify_rendezvous_ad` must reject it because
+    /// `BLAKE3(issuer_pk) != receiver_node_id` (the in-band identity binding,
+    /// mirroring directory::verify_entry). Without the binding this was a
+    /// rendezvous-slot hijack → sender content/metadata capture + MITM.
+    #[test]
+    fn cycle6_h1_foreign_key_ad_naming_victim_node_id_fails_verify() {
+        let attacker = generate_keypair(SignatureAlgorithm::Ed25519);
+        // A victim id that is NOT BLAKE3(attacker pubkey).
+        let victim_node_id = [0x77u8; 32];
+        assert_ne!(
+            victim_node_id,
+            coherent_node_id(&attacker.public_key),
+            "test precondition: victim id must differ from attacker's own node_id"
+        );
+        let forged = sign_rendezvous_ad(
+            victim_node_id,
+            [0xBBu8; 32], // attacker's rendezvous relay
+            [0xCCu8; 16],
+            [0xDDu8; 32], // attacker's x25519 key
+            1_700_000_000,
+            1_700_000_000 + 86_400,
+            &[],
+            &[],
+            &[],
+            &attacker.public_key,
+            &attacker.private_key,
+            SignatureAlgorithm::Ed25519,
+        )
+        .unwrap();
+        let forged_ad = decode_rendezvous_ad(&forged).unwrap();
+        assert!(
+            verify_rendezvous_ad(&forged_ad).is_err(),
+            "ad signed by a non-receiver key naming the victim's node_id must be rejected"
+        );
+
+        // Sanity: the SAME attacker key signing its OWN coherent node_id still
+        // verifies — proves the binding rejects impersonation, not all ads.
+        let own = sign_rendezvous_ad(
+            coherent_node_id(&attacker.public_key),
+            [0xBBu8; 32],
+            [0xCCu8; 16],
+            [0xDDu8; 32],
+            1_700_000_000,
+            1_700_000_000 + 86_400,
+            &[],
+            &[],
+            &[],
+            &attacker.public_key,
+            &attacker.private_key,
+            SignatureAlgorithm::Ed25519,
+        )
+        .unwrap();
+        let own_ad = decode_rendezvous_ad(&own).unwrap();
+        verify_rendezvous_ad(&own_ad).expect("ad bound to its own signer must verify");
     }
 
     #[test]
@@ -2774,7 +2863,7 @@ mod tests {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let envelope = b"sealed-fcm-token-blob-aaaa-bbbb-cccc-dddd-eeee-ffff".to_vec();
         let bytes = sign_rendezvous_ad(
-            [0xAA; 32],
+            coherent_node_id(&kp.public_key),
             [0xBB; 32],
             [0xCC; 16],
             [0xDD; 32],
@@ -2889,7 +2978,7 @@ mod tests {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let max_envelope = vec![0xAB; MAX_PUSH_ENVELOPE_LEN];
         let bytes = sign_rendezvous_ad(
-            [0xAA; 32],
+            coherent_node_id(&kp.public_key),
             [0xBB; 32],
             [0xCC; 16],
             [0xDD; 32],
@@ -2921,7 +3010,7 @@ mod tests {
 
         // Build v1 canonical and sign.
         let canonical = canonical_message_v1(
-            &[0xAA; 32],
+            &coherent_node_id(&kp.public_key),
             &[0xBB; 32],
             &[0xCC; 16],
             &[0xDD; 32],
@@ -2941,7 +3030,7 @@ mod tests {
         out.extend_from_slice(MAGIC);
         out.push(VERSION_LEGACY);
         out.push(0u8); // sig_algo Ed25519
-        out.extend_from_slice(&[0xAA; 32]);
+        out.extend_from_slice(&coherent_node_id(&kp.public_key));
         out.extend_from_slice(&[0xBB; 32]);
         out.extend_from_slice(&[0xCC; 16]);
         out.extend_from_slice(&[0xDD; 32]);
@@ -3225,7 +3314,7 @@ mod tests {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let token = vec![0xCC; 128]; // opaque cap-token bytes
         let bytes = sign_rendezvous_ad(
-            [0xAAu8; 32],
+            coherent_node_id(&kp.public_key),
             [0xBBu8; 32],
             [0xCCu8; 16],
             [0xDDu8; 32],
@@ -3332,7 +3421,7 @@ mod tests {
         let envelope = vec![0xEE; 80];
         let token = vec![0xCC; 100];
         let bytes = sign_rendezvous_ad(
-            [0xAA; 32],
+            coherent_node_id(&kp.public_key),
             [0xBB; 32],
             [0xCC; 16],
             [0xDD; 32],
@@ -3363,7 +3452,7 @@ mod tests {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let wake_env = vec![0xEE; 92]; // typical sealed K_wake size
         let bytes = sign_rendezvous_ad(
-            [0xAAu8; 32],
+            coherent_node_id(&kp.public_key),
             [0xBBu8; 32],
             [0xCCu8; 16],
             [0xDDu8; 32],
@@ -3474,7 +3563,7 @@ mod tests {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let max_env = vec![0xAA; MAX_WAKE_HMAC_ENVELOPE_LEN];
         let bytes = sign_rendezvous_ad(
-            [0xAA; 32],
+            coherent_node_id(&kp.public_key),
             [0xBB; 32],
             [0xCC; 16],
             [0xDD; 32],
@@ -3503,7 +3592,7 @@ mod tests {
         let cap_tok = vec![0xCC; 100];
         let wake_env = vec![0xBB; 92];
         let bytes = sign_rendezvous_ad(
-            [0xAA; 32],
+            coherent_node_id(&kp.public_key),
             [0xBB; 32],
             [0xCC; 16],
             [0xDD; 32],
@@ -3534,7 +3623,7 @@ mod tests {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let push_env = vec![0xEE; 64];
         let cap_tok = vec![0xCC; 50];
-        let receiver_node_id = [0xAAu8; 32];
+        let receiver_node_id = coherent_node_id(&kp.public_key);
         let rendezvous_node_id = [0xBBu8; 32];
         let auth_cookie = [0xCCu8; 16];
         let receiver_x25519_pk = [0xDDu8; 32];
@@ -3640,7 +3729,7 @@ mod tests {
         // succeed using the v2 canonical, and cap_token must be empty.
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let envelope = vec![0xEE; 64];
-        let receiver_node_id = [0xAAu8; 32];
+        let receiver_node_id = coherent_node_id(&kp.public_key);
         let rendezvous_node_id = [0xBBu8; 32];
         let auth_cookie = [0xCCu8; 16];
         let receiver_x25519_pk = [0xDDu8; 32];

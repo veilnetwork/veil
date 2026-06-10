@@ -1838,14 +1838,26 @@ async fn handle_ipc_client(
                                     }
                                 } else {
                                     let outcome = stream_table.route_data_from_a(p.stream_id, p.data);
-                                    if matches!(outcome, crate::streams::RouteOutcome::PeerBackpressure) {
-                                        // B's endpoint mpsc returned `Full` —
-                                        // close the stream with an error frame
-                                        // rather than silently lose bytes  while
-                                        // having already debited the window
-                                        // accounting (the route helper restores
-                                        // the window before returning, so we
-                                        // are NOT double-counting here).
+                                    if matches!(
+                                        outcome,
+                                        crate::streams::RouteOutcome::PeerBackpressure
+                                            | crate::streams::RouteOutcome::WindowExhausted
+                                    ) {
+                                        // `PeerBackpressure`: B's endpoint mpsc
+                                        // returned `Full` (the route helper restores
+                                        // the window before returning, so we are NOT
+                                        // double-counting).
+                                        //
+                                        // `WindowExhausted` (cycle-7 H3): A overran
+                                        // the send window the acceptor advertised.
+                                        // The SDK never emits `STREAM_WINDOW` credit
+                                        // refreshes, so the A→B budget only ever
+                                        // shrinks; previously this arm ignored the
+                                        // outcome and every further frame was
+                                        // SILENTLY dropped while the stream stayed
+                                        // open — breaking the reliable-stream
+                                        // contract. Close so the loss surfaces as
+                                        // EOF to A instead of vanishing.
                                         stream_table.close(p.stream_id);
                                         client_state.release_stream(p.stream_id);
                                     }
