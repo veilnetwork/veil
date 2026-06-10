@@ -782,6 +782,7 @@ where
                 let remote_identity = IdentityPayload::decode(&remote_identity_body)
                     .map_err(|e| HandshakeError(format!("OVL1 IDENTITY decode (C6): {e}")))?;
                 verify_identity_binding(&remote_identity, "OVL1 IDENTITY (C6)")?;
+                verify_hello_matches_identity(remote_id, &remote_identity, "OVL1 IDENTITY (C6)")?;
 
                 return complete_handshake_from_capabilities(
                     stream,
@@ -846,6 +847,7 @@ where
     }
 
     verify_identity_binding(&remote_identity, "OVL1 IDENTITY")?;
+    verify_hello_matches_identity(remote_id, &remote_identity, "OVL1 IDENTITY")?;
 
     complete_handshake_from_capabilities(
         stream,
@@ -927,6 +929,35 @@ pub fn verify_identity_binding(id: &IdentityPayload, error_label: &str) -> Resul
     if expected != id.node_id {
         return Err(HandshakeError(format!(
             "{error_label}: node_id does not match BLAKE3(public_key) — peer identity rejected",
+        )));
+    }
+    Ok(())
+}
+
+/// Bind the HELLO-advertised `node_id` to the PROVEN IDENTITY node_id (audit
+/// cycle-9 CRIT-3).
+///
+/// The HELLO `node_id` is what the early P-Net membership-cert check
+/// (`verify_peer`) was run against, and what seeds routing / cert caches —
+/// but at HELLO time it is UNPROVEN. The IDENTITY frame later proves ownership
+/// of the key whose BLAKE3 is `identity.node_id`. Without reconciling the two,
+/// an inbound attacker could replay a member's cert in HELLO
+/// (`hello.node_id = victim`) while proving ownership of their OWN key in
+/// IDENTITY (`identity.node_id = attacker`): `verify_peer` passed (cert valid
+/// for the victim's id) and the session completed under the attacker's
+/// identity — admission to the private overlay without holding a cert.
+/// Requiring `hello.node_id == identity.node_id` closes that split. Honest
+/// peers always satisfy it (both equal `BLAKE3(pubkey)`).
+pub fn verify_hello_matches_identity(
+    hello_node_id: [u8; 32],
+    identity: &IdentityPayload,
+    error_label: &str,
+) -> Result<()> {
+    if hello_node_id != identity.node_id {
+        return Err(HandshakeError(format!(
+            "{error_label}: HELLO node_id {} does not match proven identity {} — peer rejected",
+            veil_util::hex_short(&hello_node_id),
+            veil_util::hex_short(&identity.node_id),
         )));
     }
     Ok(())
@@ -1678,6 +1709,25 @@ mod tests {
 
     use super::*;
     use veil_cfg::{NodeRole, SignatureAlgorithm};
+
+    #[test]
+    fn verify_hello_matches_identity_rejects_mismatch_crit3() {
+        // audit cycle-9 CRIT-3: the HELLO node_id (against which the P-Net
+        // membership cert was checked) must equal the proven IDENTITY node_id,
+        // else an attacker replays a victim's cert in HELLO while proving their
+        // own key in IDENTITY and is admitted under their own identity.
+        let id = IdentityPayload {
+            algo: 0,
+            public_key: vec![1, 2, 3],
+            nonce: vec![0u8; 6],
+            node_id: [0xAA; 32],
+            mlkem_pubkey: None,
+        };
+        // Honest peer: HELLO node_id == proven identity → accepted.
+        assert!(verify_hello_matches_identity([0xAA; 32], &id, "test").is_ok());
+        // Attacker: HELLO node_id (victim) != proven identity (attacker) → rejected.
+        assert!(verify_hello_matches_identity([0xBB; 32], &id, "test").is_err());
+    }
 
     // ── handshake padding ─────────────────────────────────────
 
