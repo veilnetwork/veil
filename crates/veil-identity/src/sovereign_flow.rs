@@ -277,7 +277,7 @@ pub fn create_identity(
             ALGO_ED25519,
             master_ed_pk.as_bytes().to_vec(),
             String::new(),
-            String::new(),
+            Zeroizing::new(String::new()),
             None,
         ),
         SignatureAlgorithm::Ed25519Falcon512Hybrid => {
@@ -310,14 +310,17 @@ pub fn create_identity(
             sk.extend_from_slice(fal_sk_bytes);
 
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk[..]);
+            // audit cycle-10: the base64 master SK is just as sensitive as the
+            // raw `sk` Vec wrapped above — wrap it too so a freed-heap / swap
+            // read can't recover the Ed25519+Falcon master secret.
+            let sk_b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&sk[..]));
 
             (
                 ALGO_ED25519_FALCON512_HYBRID,
                 pk,
                 pk_b64,
                 sk_b64,
-                Some(fal_sk_bytes.to_vec()),
+                Some(Zeroizing::new(fal_sk_bytes.to_vec())),
             )
         }
         SignatureAlgorithm::Ed25519Falcon1024Hybrid => {
@@ -362,14 +365,17 @@ pub fn create_identity(
             sk.extend_from_slice(fal_sk_bytes);
 
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk[..]);
+            // audit cycle-10: the base64 master SK is just as sensitive as the
+            // raw `sk` Vec wrapped above — wrap it too so a freed-heap / swap
+            // read can't recover the Ed25519+Falcon master secret.
+            let sk_b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&sk[..]));
 
             (
                 ALGO_ED25519_FALCON1024_HYBRID,
                 pk,
                 pk_b64,
                 sk_b64,
-                Some(fal_sk_bytes.to_vec()),
+                Some(Zeroizing::new(fal_sk_bytes.to_vec())),
             )
         }
         SignatureAlgorithm::Falcon512 => {
@@ -400,9 +406,17 @@ pub fn create_identity(
             let pk_bytes = fal_pk_bytes.to_vec();
             let sk_bytes = fal_sk_bytes.to_vec();
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk_bytes);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk_bytes);
+            // audit cycle-10: wrap the base64 master SK (see hybrid arms above).
+            let sk_b64 =
+                Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&sk_bytes));
 
-            (ALGO_FALCON512, pk_bytes, pk_b64, sk_b64, Some(sk_bytes))
+            (
+                ALGO_FALCON512,
+                pk_bytes,
+                pk_b64,
+                sk_b64,
+                Some(Zeroizing::new(sk_bytes)),
+            )
         }
     };
 
@@ -742,7 +756,7 @@ pub fn restore_identity(
             ALGO_ED25519,
             master_ed_pk.as_bytes().to_vec(),
             String::new(),
-            String::new(),
+            Zeroizing::new(String::new()),
             None,
         ),
         SignatureAlgorithm::Ed25519Falcon512Hybrid => {
@@ -778,14 +792,17 @@ pub fn restore_identity(
             sk.extend_from_slice(&falcon_sk);
 
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk[..]);
+            // audit cycle-10: the base64 master SK is just as sensitive as the
+            // raw `sk` Vec wrapped above — wrap it too so a freed-heap / swap
+            // read can't recover the Ed25519+Falcon master secret.
+            let sk_b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&sk[..]));
 
             (
                 ALGO_ED25519_FALCON512_HYBRID,
                 pk,
                 pk_b64,
                 sk_b64,
-                Some(falcon_sk),
+                Some(Zeroizing::new(falcon_sk)),
             )
         }
         SignatureAlgorithm::Ed25519Falcon1024Hybrid => {
@@ -827,14 +844,17 @@ pub fn restore_identity(
             sk.extend_from_slice(&falcon_sk);
 
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk[..]);
+            // audit cycle-10: the base64 master SK is just as sensitive as the
+            // raw `sk` Vec wrapped above — wrap it too so a freed-heap / swap
+            // read can't recover the Ed25519+Falcon master secret.
+            let sk_b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&sk[..]));
 
             (
                 ALGO_ED25519_FALCON1024_HYBRID,
                 pk,
                 pk_b64,
                 sk_b64,
-                Some(falcon_sk),
+                Some(Zeroizing::new(falcon_sk)),
             )
         }
         SignatureAlgorithm::Falcon512 => {
@@ -864,9 +884,17 @@ pub fn restore_identity(
             }
 
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&falcon_pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&falcon_sk);
+            // audit cycle-10: wrap the base64 master SK (see hybrid arms above).
+            let sk_b64 =
+                Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&falcon_sk));
 
-            (ALGO_FALCON512, falcon_pk, pk_b64, sk_b64, Some(falcon_sk))
+            (
+                ALGO_FALCON512,
+                falcon_pk,
+                pk_b64,
+                sk_b64,
+                Some(Zeroizing::new(falcon_sk)),
+            )
         }
     };
 
@@ -1130,7 +1158,7 @@ pub fn rotate_identity(
             SignatureAlgorithm::Ed25519,
             master_ed_pk.as_bytes().to_vec(),
             String::new(),
-            String::new(),
+            Zeroizing::new(String::new()),
         ),
         ALGO_ED25519_FALCON512_HYBRID | ALGO_ED25519_FALCON1024_HYBRID => {
             use base64::Engine as _;
@@ -1162,7 +1190,10 @@ pub fn rotate_identity(
             sk.extend_from_slice(&(falcon_sk.len() as u16).to_le_bytes());
             sk.extend_from_slice(&falcon_sk);
             let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk);
-            let sk_b64 = base64::engine::general_purpose::STANDARD.encode(&sk[..]);
+            // audit cycle-10: the base64 master SK is just as sensitive as the
+            // raw `sk` Vec wrapped above — wrap it too so a freed-heap / swap
+            // read can't recover the Ed25519+Falcon master secret.
+            let sk_b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&sk[..]));
             (algo, pk, pk_b64, sk_b64)
         }
         other => return Err(RotateIdentityError::UnsupportedMasterAlgo(other)),
