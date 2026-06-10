@@ -439,6 +439,73 @@ impl<K: Hash + Eq + Copy + Ord> ExpiryCache<K> {
     }
 }
 
+/// TTL- and capacity-bounded key→value cache (the value-carrying sibling of
+/// [`ExpiryCache`]). Same O(log n) heap-driven expiry + oldest-entry eviction.
+///
+/// Used for the terminal-delivery ACK-replay cache (audit cycle-8 H8): maps a
+/// `content_id` to the `(sender, ack_key)` needed to RE-emit a DELIVERED ACK
+/// when a retransmit arrives (because the original ACK was lost), without
+/// re-decrypting the payload. Each key is inserted at most once per delivery, so
+/// the simple "one heap entry per insert" model needs no generation tracking.
+pub struct ExpiryMap<K, V> {
+    entries: HashMap<K, V>,
+    heap: BinaryHeap<Reverse<ExpiryCacheEntry<K>>>,
+    ttl: Duration,
+    max_size: usize,
+}
+
+impl<K: Hash + Eq + Copy + Ord, V> ExpiryMap<K, V> {
+    pub fn new(ttl: Duration, max_size: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            heap: BinaryHeap::new(),
+            ttl,
+            max_size,
+        }
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        while let Some(Reverse(e)) = self.heap.peek() {
+            if now >= e.expires_at {
+                if let Some(Reverse(entry)) = self.heap.pop() {
+                    self.entries.remove(&entry.key);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Insert (caller guarantees one insert per key). Evicts the oldest entry in
+    /// O(log n) when at capacity.
+    pub fn insert(&mut self, key: K, value: V) {
+        let now = Instant::now();
+        self.prune_expired(now);
+        if !self.entries.contains_key(&key)
+            && self.entries.len() >= self.max_size
+            && let Some(Reverse(oldest)) = self.heap.pop()
+        {
+            self.entries.remove(&oldest.key);
+        }
+        self.entries.insert(key, value);
+        self.heap.push(Reverse(ExpiryCacheEntry {
+            expires_at: now + self.ttl,
+            key,
+        }));
+    }
+
+    /// Look up a live (non-expired) value.
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        let now = Instant::now();
+        self.prune_expired(now);
+        self.entries.get(key)
+    }
+}
+
+/// Shared terminal-delivery ACK-replay cache: `content_id → (sender, ack_key)`
+/// (audit cycle-8 H8). Type alias to keep the dispatcher field readable.
+pub type TerminalAckReplay = Arc<Mutex<ExpiryMap<[u8; 32], ([u8; 32], [u8; 32])>>>;
+
 // ── RouteSeenSet ──────────────────────────────────────────────────────────────
 
 /// Gossip deduplication set.
@@ -795,6 +862,13 @@ pub struct FrameDispatcher {
     /// Relay dedup set keyed by content_id. Prevents replay: if the same
     /// content_id arrives twice within 30 s, the second copy is dropped.
     pub forward_seen_set: Arc<Mutex<ForwardSeenSet>>,
+    /// Terminal-delivery ACK-replay cache (audit cycle-8 H8): `content_id →
+    /// (ack_target_sender, ack_key)`. On a duplicate terminal arrival — a
+    /// retransmit sent because our original DELIVERED ACK was lost — re-emit the
+    /// ACK from here instead of silently dropping the frame, so a lost ACK is
+    /// recoverable WITHOUT re-decrypting the payload (cheap + replay-safe).
+    /// Same TTL/cap window as `forward_seen_set`.
+    pub terminal_ack_replay: TerminalAckReplay,
 
     /// Recursive query dedup: prevents loops in recursive DHT routing.
     pub recursive_query_seen: Arc<Mutex<ExpiryCache<[u8; 16]>>>,
@@ -1571,6 +1645,10 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
             Duration::from_secs(veil_proto::budget::FORWARD_SEEN_SET_TTL_SECS),
             veil_proto::budget::MAX_FORWARD_SEEN_SET_SIZE,
         ))),
+        terminal_ack_replay: Arc::new(Mutex::new(ExpiryMap::new(
+            Duration::from_secs(veil_proto::budget::FORWARD_SEEN_SET_TTL_SECS),
+            veil_proto::budget::MAX_FORWARD_SEEN_SET_SIZE,
+        ))),
         recursive_query_seen: Arc::new(Mutex::new(ExpiryCache::new(
             Duration::from_secs(30),
             65536,
@@ -2248,6 +2326,10 @@ mod tests {
             local_vivaldi: None,
             peer_vivaldi: Arc::new(std::sync::RwLock::new(HashMap::new())),
             forward_seen_set: Arc::new(Mutex::new(ForwardSeenSet::new(
+                Duration::from_secs(30),
+                10_000,
+            ))),
+            terminal_ack_replay: Arc::new(Mutex::new(ExpiryMap::new(
                 Duration::from_secs(30),
                 10_000,
             ))),
@@ -4330,6 +4412,29 @@ mod tests {
             !cache.check_and_insert(42),
             "expired entry must be accepted as new"
         );
+    }
+
+    /// audit cycle-8 H8: the value-carrying ExpiryMap (terminal ACK-replay cache)
+    /// returns the stored value within TTL, drops it after expiry, and bounds at
+    /// capacity.
+    #[test]
+    fn expiry_map_get_insert_expiry_and_cap() {
+        // live value round-trips
+        let mut m: ExpiryMap<u32, (u8, u8)> = ExpiryMap::new(Duration::from_secs(60), 2);
+        m.insert(1, (10, 20));
+        assert_eq!(m.get(&1).copied(), Some((10, 20)));
+        assert_eq!(m.get(&99), None);
+
+        // capacity bound: inserting a 3rd key evicts the oldest
+        m.insert(2, (0, 0));
+        m.insert(3, (0, 0));
+        assert!(m.get(&1).is_none(), "oldest entry must be evicted at cap");
+        assert!(m.get(&3).is_some());
+
+        // TTL=0 → entry is immediately expired on next access
+        let mut expm: ExpiryMap<u32, u8> = ExpiryMap::new(Duration::ZERO, 16);
+        expm.insert(7, 7);
+        assert_eq!(expm.get(&7), None, "expired value must be dropped");
     }
 
     // ── 104.4: capture_active fast-path — no event when flag is false ─────────
