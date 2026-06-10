@@ -6,7 +6,6 @@ use pqcrypto_traits::sign::{DetachedSignature as _, SecretKey as _};
 use veil_error::{ConfigError, Result};
 use veil_types::SignatureAlgorithm;
 
-use super::super::sign_message;
 use super::super::signature::decode_public_key;
 use super::super::{Base64Nonce, Base64PrivateKey, Base64PublicKey};
 
@@ -187,24 +186,22 @@ pub fn pow_score(
     private_key_base64: &Base64PrivateKey,
     nonce_base64: &Base64Nonce,
 ) -> Result<PowScore> {
-    let public_key = decode_public_key(algo, public_key_base64.as_str())?;
+    // Route through the SAME CachedSigningKey path the search loop uses
+    // (`pow_score_raw` → `pow_score_raw_into`) so the score is byte-identical
+    // across the initial-score seed, the worker hot loop, and verification.
+    //
+    // The old code signed via `sign_message`, which for a hybrid algo emits the
+    // FULL `[ed_sig][falcon_sig]` signature — but the worker signs Ed25519-only
+    // for hybrid (see `CachedSigningKey::from_private_key`). The two hashes
+    // diverged, so for `Ed25519Falcon512Hybrid`/`Ed25519Falcon1024Hybrid` a
+    // nonce the workers "found" scored differently here and any later re-check
+    // failed the target — a reported PoW success that was not reproducible.
+    // (audit cycle-8 H13.)
+    let pk_bytes = decode_public_key(algo, public_key_base64.as_str())?;
     let nonce = decode_nonce(nonce_base64.as_str())?;
-    let message = pow_message(&public_key, &nonce);
-    let signature = sign_message(
-        algo,
-        public_key_base64.as_str(),
-        private_key_base64.as_str(),
-        &message,
-    )?;
-    let mut hash_input = Vec::with_capacity(public_key.len() + nonce.len() + signature.len());
-    hash_input.extend_from_slice(&public_key);
-    hash_input.extend_from_slice(&nonce);
-    hash_input.extend_from_slice(&signature);
-    let hash = blake3::hash(&hash_input);
-
-    Ok(PowScore {
-        zero_bits: veil_util::leading_zero_bits(hash.as_bytes()),
-    })
+    let sk_bytes = decode_sk_bytes(algo, private_key_base64)?;
+    let signing_key = CachedSigningKey::from_private_key(algo, &sk_bytes)?;
+    pow_score_raw(&pk_bytes, &signing_key, &nonce)
 }
 
 pub fn available_thread_count() -> usize {
@@ -225,13 +222,6 @@ pub(super) fn decode_nonce(value: &str) -> Result<[u8; NONCE_LEN]> {
             expected: NONCE_LEN,
             actual: bytes.len(),
         })
-}
-
-fn pow_message(public_key: &[u8], nonce: &[u8; NONCE_LEN]) -> Vec<u8> {
-    let mut message = Vec::with_capacity(public_key.len() + nonce.len());
-    message.extend_from_slice(public_key);
-    message.extend_from_slice(nonce);
-    message
 }
 
 pub(super) fn nonce_to_u32(nonce: &[u8; NONCE_LEN]) -> u32 {

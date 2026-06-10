@@ -154,6 +154,31 @@ impl std::fmt::Display for KademliaError {
 /// unsigned STOREs are silent to avoid log spam.  Migration plan: once
 /// inner-sig deployments transition to explicit STORE-level signatures
 /// the default for `allow_unsigned_store` will flip to `false`.
+/// Round-robin interleave several pre-ordered source sets into a single
+/// deduped list capped at `cap`, drawing one element from each source per
+/// round. Used by `find_all_values_network` so the eclipse-resistance fanout
+/// cap samples ALL source regions (key-closest, connected, XOR-diverse) rather
+/// than collapsing to whichever a `HashSet::iter().take()` happened to surface
+/// first. Earlier sources win ties (same id seen later is skipped). (cycle-8 H6.)
+fn interleave_capped_diverse(sources: &[&[[u8; 32]]], cap: usize) -> Vec<[u8; 32]> {
+    let max_len = sources.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut seen = std::collections::HashSet::new();
+    let mut picked: Vec<[u8; 32]> = Vec::with_capacity(cap.min(max_len * sources.len().max(1)));
+    'fill: for i in 0..max_len {
+        for src in sources {
+            if let Some(&id) = src.get(i)
+                && seen.insert(id)
+            {
+                picked.push(id);
+                if picked.len() >= cap {
+                    break 'fill;
+                }
+            }
+        }
+    }
+    picked
+}
+
 fn warn_unsigned_store_once() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
@@ -1551,29 +1576,23 @@ impl KademliaService {
         let closest = self
             .find_node_iterative_network(key, Arc::clone(&outbox))
             .await;
-        let mut targets: std::collections::HashSet<[u8; 32]> =
-            closest.iter().map(|c| c.node_id).collect();
-        for peer_id in outbox.peer_ids() {
-            targets.insert(peer_id);
-        }
-        // Add up to ALPHA*3 routing-table contacts sorted by XOR-distance from
-        // the lookup key's complement (~key). This picks peers that are in
-        // different k-buckets from the key's neighbourhood, making it harder for
-        // an eclipse attacker to suppress the result by occupying only one region.
-        {
-            // use `node_ids` instead of `all_contacts`
-            // — saves ~6× memory (32 B vs ~200 B per entry) and reduces lock
-            // hold during the clone.
+        // Three eclipse-resistance source sets, kept SEPARATE so the fanout cap
+        // below can sample all three regions instead of collapsing to one.
+        let closest_ids: Vec<[u8; 32]> = closest.iter().map(|c| c.node_id).collect();
+        let connected_ids: Vec<[u8; 32]> = outbox.peer_ids();
+        // Up to ALPHA*3 routing-table contacts sorted by XOR-distance from the
+        // lookup key's complement (~key) — peers in different k-buckets from the
+        // key's neighbourhood, so an eclipse attacker must occupy the whole table
+        // rather than only the key's region.
+        let diverse_ids: Vec<[u8; 32]> = {
+            // use `node_ids` instead of `all_contacts` — saves ~6× memory
+            // (32 B vs ~200 B per entry) and reduces lock hold during the clone.
             let mut by_dist = lock!(self.inner).routing.node_ids();
             let n = (self.dht_config.alpha as usize * 3).min(by_dist.len());
-            // Invert key bits so the sort picks contacts furthest from the key's
-            // Kademlia neighbourhood (i.e. most diverse from the K-closest set).
             let inv_key: [u8; 32] = std::array::from_fn(|i| !key[i]);
             by_dist.sort_unstable_by_key(|id| super::routing::xor_distance(id, &inv_key));
-            for id in by_dist.into_iter().take(n) {
-                targets.insert(id);
-            }
-        }
+            by_dist.into_iter().take(n).collect()
+        };
         // Include local value first.
         let mut values: Vec<Vec<u8>> = Vec::new();
         if let Some(v) = self.get_local(&key) {
@@ -1589,6 +1608,17 @@ impl KademliaService {
         // outbound RPCs. Cap at `MAX_FIND_ALL_VALUES_FANOUT` (32);
         // attackers can still flood requests, but each one is bounded.
         const MAX_FIND_ALL_VALUES_FANOUT: usize = 32;
+        // Diversity-preserving truncation: round-robin across the three source
+        // sets (key-closest, connected peers, XOR-diverse routing contacts),
+        // deduping, so the fanout cap always samples ALL THREE regions. The
+        // previous `HashSet::iter().take(32)` truncated in arbitrary hash order
+        // and could collapse the whole sample into the key's neighbourhood — the
+        // exact region an eclipse attacker occupies — defeating the diversity
+        // the source sets are built to provide. (audit cycle-8 H6.)
+        let targets = interleave_capped_diverse(
+            &[&closest_ids, &connected_ids, &diverse_ids],
+            MAX_FIND_ALL_VALUES_FANOUT,
+        );
         let timeout_dur = Duration::from_millis(self.dht_config.find_node_timeout_ms);
         let querier: Box<dyn super::iterative::PeerQuerier> =
             Box::new(super::network_querier::NetworkPeerQuerier::with_cache(
@@ -1600,7 +1630,6 @@ impl KademliaService {
             ));
         let futures: Vec<_> = targets
             .iter()
-            .take(MAX_FIND_ALL_VALUES_FANOUT)
             .map(|&id| querier.find_value(id, key))
             .collect();
         let results = futures::future::join_all(futures).await;
@@ -1722,6 +1751,34 @@ mod tests {
     use crate::iterative::{FindValueResult, PeerQuerier};
     use crate::routing::Contact;
     use veil_proto::discovery::{DeletePayload, FindValuePayload, StorePayload, attachment_key};
+
+    #[test]
+    fn interleave_capped_diverse_samples_all_regions() {
+        // audit cycle-8 H6 — the eclipse-resistance fanout cap must not be
+        // starved by a large key-closest set. With cap=4 and a 10-element
+        // closest set plus one connected + one diverse contact, the diverse
+        // regions must still be represented (the old HashSet::take could drop
+        // them entirely).
+        let closest: Vec<[u8; 32]> = (0..10u8).map(|i| [i; 32]).collect();
+        let connected = vec![[0xCC; 32]];
+        let diverse = vec![[0xDD; 32]];
+        let picked = interleave_capped_diverse(&[&closest, &connected, &diverse], 4);
+        assert_eq!(picked.len(), 4);
+        assert!(picked.contains(&[0xCC; 32]), "connected region sampled");
+        assert!(picked.contains(&[0xDD; 32]), "diverse region sampled");
+        // Round-robin draws one from each source first: closest[0], connected[0],
+        // diverse[0], then closest[1].
+        assert_eq!(picked, vec![[0u8; 32], [0xCC; 32], [0xDD; 32], [1u8; 32]]);
+    }
+
+    #[test]
+    fn interleave_capped_diverse_dedups_across_sources() {
+        // A node appearing in two sources is queried once; earlier source wins.
+        let a = vec![[1u8; 32], [2u8; 32]];
+        let b = vec![[1u8; 32], [3u8; 32]];
+        let picked = interleave_capped_diverse(&[&a, &b], 8);
+        assert_eq!(picked, vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
+    }
 
     /// integration test: 3-node topology using in-process querier.
     ///
