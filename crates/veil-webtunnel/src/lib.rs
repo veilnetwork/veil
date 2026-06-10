@@ -49,3 +49,18 @@ pub use decoy::{
 };
 pub use matcher::{MatchResult, SecretMatcher};
 pub use router::{RouterError, WebtunnelRouter};
+
+/// Bounded WebSocket config for both webtunnel server and client (audit
+/// cycle-9). tokio-tungstenite's default caps an incoming message at 64 MiB and
+/// a frame at 16 MiB — a post-upgrade peer could send one ~64 MiB binary
+/// message and `ws_to_byte_stream` would buffer it whole before the 64 KiB
+/// bridge applies backpressure. OVL1 frames carried here are ≤ 16 KiB, so a
+/// 256 KiB ceiling is generous headroom while removing the amplification.
+pub fn bounded_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    const MAX_WS_MESSAGE_BYTES: usize = 256 * 1024;
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_WS_MESSAGE_BYTES),
+        max_frame_size: Some(MAX_WS_MESSAGE_BYTES),
+        ..Default::default()
+    }
+}
