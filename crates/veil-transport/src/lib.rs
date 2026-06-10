@@ -59,8 +59,9 @@ pub use error::{Result, TransportError};
 pub use hint_registry::{SchemeCounters, TransportHintRegistry};
 pub use registry::{TransportHintSink, TransportRegistry};
 pub use traits::{
-    BoxIoStream, IoStream, PeerMeta, Transport, TransportCapabilities, TransportConnection,
-    TransportHandshakeMode, TransportListener, TransportMessage, TransportRuntimeInfo,
+    BoxIoStream, IoStream, PeerMeta, RawInbound, Transport, TransportCapabilities,
+    TransportConnection, TransportHandshakeMode, TransportListener, TransportMessage,
+    TransportRuntimeInfo,
 };
 pub use uri::{TransportStack, TransportUri, Wrapper, rewrite_wildcard_host};
 

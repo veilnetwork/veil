@@ -31,7 +31,8 @@ use super::{
     error::{Result, TransportError},
     tcp::{boxed_stream_connection, connect_tcp_stream, peer_meta},
     traits::{
-        BoxIoStream, Transport, TransportCapabilities, TransportConnection, TransportListener,
+        BoxIoStream, RawInbound, Transport, TransportCapabilities, TransportConnection,
+        TransportListener,
     },
     uri::TransportUri,
 };
@@ -192,6 +193,44 @@ impl TransportListener for Obfs4TcpListener {
         })
     }
 
+    /// cycle-7 H2: split the kernel accept (fast) from the obfs4 handshake
+    /// (slow, attacker-driven). The runtime spawns `finish` behind the
+    /// inbound-handshake semaphore so a stalled client cannot monopolise the
+    /// serial accept loop for the whole `OBFS4_HANDSHAKE_TIMEOUT` window.
+    fn accept_split<'a>(&'a self) -> BoxFuture<'a, Result<RawInbound>> {
+        Box::pin(async move {
+            let (tcp, remote_addr) = self.listener.accept().await?;
+            if let Some(idle) = self.keepalive_idle {
+                let ka = socket2::TcpKeepalive::new().with_time(idle);
+                socket2::SockRef::from(&tcp).set_tcp_keepalive(&ka)?;
+            }
+            let local_addr = tcp.local_addr().ok();
+            // Clone the config the handshake needs so `finish` is `'static`.
+            let psk = self.psk.clone();
+            let variants = self.accept_variants.clone();
+            let bind_uri = self.bind_uri.clone();
+            let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
+                Box::pin(async move {
+                    let (wrapped, _matched_variant) = tokio::time::timeout(
+                        OBFS4_HANDSHAKE_TIMEOUT,
+                        obfs4_server_accept_multi(tcp, &psk, &variants),
+                    )
+                    .await
+                    .map_err(|_| {
+                        TransportError::Tls("obfs4 server handshake timed out".to_string())
+                    })?
+                    .map_err(|e| TransportError::Tls(format!("obfs4 server handshake: {e}")))?;
+                    let peer = peer_meta("obfs4-tcp", bind_uri, local_addr, Some(remote_addr));
+                    let boxed_stream: BoxIoStream = Box::new(Obfs4IoStream(wrapped));
+                    Ok(boxed_stream_connection_obfs4(peer, boxed_stream))
+                });
+            Ok(RawInbound {
+                remote_addr: Some(remote_addr),
+                finish,
+            })
+        })
+    }
+
     fn local_addr(&self) -> String {
         self.listener
             .local_addr()
@@ -316,6 +355,63 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let conn = listener.accept().await.unwrap();
+            let mut stream = conn.into_stream().unwrap();
+            let mut buf = vec![0u8; 5];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello");
+            stream.write_all(b"world").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let connect_uri = TransportUri::Obfs4Tcp {
+            host: "127.0.0.1".to_owned(),
+            port,
+        };
+        let conn = transport
+            .connect(&connect_uri, Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let mut stream = conn.into_stream().unwrap();
+        stream.write_all(b"hello").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = vec![0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"world");
+
+        let _ = server_task.await;
+    }
+
+    /// cycle-7 H2: the split accept path (`accept_split` -> `finish.await`)
+    /// completes the same obfs4 handshake as `accept()` and exposes the peer
+    /// address BEFORE the handshake runs (so the accept loop can ban-check the
+    /// IP without paying for a handshake first).
+    #[tokio::test]
+    async fn obfs4_tcp_accept_split_round_trip() {
+        let psk = [0x42u8; 32];
+        let ctx = ctx_with_psk(psk);
+        let transport = Obfs4TcpTransport;
+
+        let bind_uri = TransportUri::Obfs4Tcp {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+        };
+        let listener = transport.bind(&bind_uri, Arc::clone(&ctx)).await.unwrap();
+        let port: u16 = listener
+            .local_addr()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let raw = listener.accept_split().await.unwrap();
+            // Peer addr is known before the handshake completes.
+            assert!(
+                raw.remote_addr.is_some(),
+                "remote_addr must be populated before the handshake runs"
+            );
+            let conn = raw.finish.await.unwrap();
             let mut stream = conn.into_stream().unwrap();
             let mut buf = vec![0u8; 5];
             stream.read_exact(&mut buf).await.unwrap();

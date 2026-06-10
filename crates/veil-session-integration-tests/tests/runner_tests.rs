@@ -439,11 +439,21 @@ async fn runner_aead_encrypt_decrypt_round_trip() {
         client.write_all(&encode_header(&hdr)).await.unwrap();
         client.write_all(&enc_ping_body).await.unwrap();
     }
-    // Read and discard the Pong reply (no body → no encryption payload to verify).
+    // Read the Pong reply. cycle-7 M1: an empty control-frame body is now
+    // AEAD-sealed (16-byte tag) rather than zero-length, and sealing advances
+    // the server's tx counter — so the client must read AND open the Pong body
+    // to keep client_rx's counter in lock-step (exactly as a real peer does).
     {
         let mut hdr_buf = [0u8; HEADER_SIZE];
         client.read_exact(&mut hdr_buf).await.unwrap();
-        // Advance client_rx counter even though Pong body is empty.
+        let pong_hdr = decode_header(&hdr_buf).unwrap();
+        let mut pong_body = vec![0u8; pong_hdr.body_len as usize];
+        client.read_exact(&mut pong_body).await.unwrap();
+        let pong_aad = frame_aad(pong_hdr.family, pong_hdr.msg_type);
+        let pong_plain = client_rx
+            .open(&pong_body, &pong_aad)
+            .expect("sealed empty Pong must open");
+        assert!(pong_plain.is_empty(), "Pong plaintext is empty");
     }
 
     // ── Step 2: send an encrypted RouteRequest (tests response body encryption) ──
@@ -3186,11 +3196,19 @@ async fn rekey_completes_and_subsequent_frames_decrypt() {
         client.write_all(&encode_header(&hdr)).await.unwrap();
         client.write_all(&enc_ping).await.unwrap();
     }
-    // Read and discard the Pong.
+    // Read the Pong. cycle-7 M1: the empty Pong body is AEAD-sealed now and
+    // sealing advanced the responder's tx counter, so read + open it to keep
+    // client_rx's counter in lock-step (as a real peer does).
     {
         let mut hdr_buf = [0u8; HEADER_SIZE];
         client.read_exact(&mut hdr_buf).await.unwrap();
-        // Pong has empty body so no counter advancement needed.
+        let pong_hdr = decode_header(&hdr_buf).unwrap();
+        let mut pong_body = vec![0u8; pong_hdr.body_len as usize];
+        client.read_exact(&mut pong_body).await.unwrap();
+        let pong_aad = frame_aad(pong_hdr.family, pong_hdr.msg_type);
+        client_rx
+            .open(&pong_body, &pong_aad)
+            .expect("sealed empty Pong must open");
     }
 
     // Step 2: send a RekeyInit (initiator → responder).

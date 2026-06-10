@@ -727,6 +727,20 @@ final void Function(Pointer<Uint8>, int) veilFreeReplicaBuf = nativeLib
             )>>('veil_free_replica_buf')
     .asFunction();
 
+/// Release a callback buffer handed to a recv-/event-handler callback
+/// (cycle-7 H6). For recv, `ptr` is the `srcNodeId` base pointer and `len` is
+/// `64 + dataLen` (layout `[nodeId(32) | appId(32) | data]`); for events, `ptr`
+/// is the `payload` pointer and `len` is `payloadLen`. Must be called exactly
+/// once per callback that received a non-null pointer, after copying the bytes.
+final void Function(Pointer<Uint8>, int) veilFreeBuf = nativeLib
+    .lookup<
+            NativeFunction<
+                Void Function(
+              Pointer<Uint8>,
+              IntPtr,
+            )>>('veil_free_buf')
+    .asFunction();
+
 final int Function(
   Pointer<VeilHandle>,
   Pointer<Uint8>, // receiver_id

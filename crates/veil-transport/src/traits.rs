@@ -262,9 +262,46 @@ pub trait Transport: Send + Sync {
 }
 
 /// Accepts inbound connections of a single transport kind.
+/// An inbound connection split into the fast kernel-accept (which yields the
+/// peer address immediately) and the handshake `finish` future.
+///
+/// The runtime accept loop awaits only the fast part serially and spawns
+/// `finish` behind the inbound-handshake semaphore, so a stalled/slow client
+/// handshake (slowloris) occupies one bounded handshake slot instead of
+/// wedging the entire accept loop for the handshake-timeout window. (cycle-7 H2)
+pub struct RawInbound {
+    /// Peer socket address, known before the handshake runs — lets the accept
+    /// loop apply the early scanner-shield ban check without paying for a
+    /// handshake first.
+    pub remote_addr: Option<SocketAddr>,
+    /// Completes the transport handshake and yields the connection. `'static`
+    /// so it can be moved into a spawned task (owns the accepted stream plus
+    /// any cloned listener config it needs).
+    pub finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>>,
+}
+
 pub trait TransportListener: Send + Sync {
     /// Await and return the next inbound connection.
     fn accept<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn TransportConnection>>>;
     /// Resolved local bind address, rendered as a string.
     fn local_addr(&self) -> String;
+
+    /// Accept with the handshake split out (see [`RawInbound`]).
+    ///
+    /// The default runs the full [`accept`](Self::accept) inline and presents
+    /// an already-finished handshake — correct, but it does not relieve the
+    /// accept loop of the handshake cost. Transports with an expensive,
+    /// attacker-driven inline handshake (obfs4, webtunnel) override this to
+    /// return after only the kernel accept, deferring the handshake to a
+    /// spawned task.
+    fn accept_split<'a>(&'a self) -> BoxFuture<'a, Result<RawInbound>> {
+        Box::pin(async move {
+            let conn = self.accept().await?;
+            let remote_addr = conn.peer_meta().remote_addr;
+            Ok(RawInbound {
+                remote_addr,
+                finish: Box::pin(ready(Ok(conn))),
+            })
+        })
+    }
 }

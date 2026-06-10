@@ -850,6 +850,16 @@ pub unsafe extern "C" fn veil_send(
 
 /// Recv callback signature — invoked from a tokio worker thread.
 ///
+/// BUFFER OWNERSHIP (cycle-7 H6): the three pointers (`src_node_id`,
+/// `src_app_id`, `data`) are offsets into ONE heap buffer the callee now OWNS:
+/// `src_node_id` is the base, laid out `[node_id(32) | app_id(32) | data]`. The
+/// host MAY retain the pointers past this synchronous call (e.g. marshal them to
+/// another thread/isolate and copy later) and MUST, exactly once per non-NULL
+/// invocation, call `veil_free_buf(src_node_id, 64 + data_len)` after copying.
+/// This replaces the old "valid for the call only; copy synchronously" contract
+/// that a deferred host (Dart `NativeCallable.listener`) could not honour
+/// without a use-after-free.
+///
 /// wrapped in `Option<...>` so a NULL
 /// function pointer passed from C/Swift/Kotlin is a valid `None`
 /// representation that Rust matches and rejects gracefully — instead
@@ -1002,16 +1012,39 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
                 // regardless, so the guard is meaningful only in unwinding
                 // (dev/test) builds, where it logs + drops the message and keeps
                 // the recv loop alive instead of poisoning it.
+                // cycle-7 H6: the host callback may read these pointers AFTER
+                // this Rust frame returns (e.g. Dart `NativeCallable.listener`
+                // marshals the args to the isolate and copies them later). The
+                // `data` Vec and the stack `src_*` arrays would be gone by then —
+                // a use-after-free. Hand the callee ONE owned heap buffer laid
+                // out `[node_id(32) | app_id(32) | data]`; the three pointers are
+                // offsets into it and it stays valid until the callee calls
+                // `veil_free_buf(node_id_ptr, 64 + data_len)`.
+                let data_len = data.len();
+                let total_len = 64 + data_len;
+                let mut combined: Vec<u8> = Vec::with_capacity(total_len);
+                combined.extend_from_slice(&src_node_id);
+                combined.extend_from_slice(&src_app_id);
+                combined.extend_from_slice(&data);
+                let base: *mut u8 = Box::into_raw(combined.into_boxed_slice()).cast();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                     cb(
                         user_ptr,
-                        src_node_id.as_ptr(),
-                        src_app_id.as_ptr(),
-                        data.as_ptr(),
-                        data.len(),
+                        base.cast_const(),         // src_node_id (32 bytes)
+                        base.add(32).cast_const(), // src_app_id  (32 bytes)
+                        base.add(64).cast_const(), // data        (data_len bytes)
+                        data_len,
                     );
                 }));
                 if result.is_err() {
+                    // The callee panicked before it could take ownership / free —
+                    // reclaim the buffer so it doesn't leak on the dev/test
+                    // unwinding path (release `panic=abort` never reaches here).
+                    unsafe {
+                        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                            base, total_len,
+                        )));
+                    }
                     eprintln!(
                         "[veilclient-ffi] recv-handler callback panicked; \
                          frame dropped, channel kept open",
@@ -1929,6 +1962,36 @@ pub unsafe extern "C" fn veil_free_replica_buf(ptr: *mut u8, len: size_t) {
     // (see `veil_lookup_rendezvous_replicas`), so rebuild the fat slice
     // pointer and drop the box — this deallocates with the same layout
     // the allocation was made with.
+    unsafe {
+        let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        drop(Box::from_raw(slice));
+    }
+}
+
+/// Free a callback buffer handed to a recv- or event-handler callback
+/// (cycle-7 H6).  `ptr` MUST be the base pointer the callback received — for
+/// recv that is the `src_node_id` pointer (the buffer is laid out
+/// `[node_id(32) | app_id(32) | data]`); for events it is the `payload`
+/// pointer — and `len` MUST be the buffer's total length (recv: `64 + data_len`;
+/// events: `payload_len`).  Safe to call on `ptr == NULL` (no-op).
+///
+/// The callback contract is callee-owns-the-buffer: the host MUST call this
+/// exactly once per callback invocation that received a non-NULL pointer, after
+/// it has finished copying the bytes it needs. This lets the host retain the
+/// pointer past the synchronous call (e.g. Dart `NativeCallable.listener`,
+/// which marshals to the isolate and reads the bytes later) without a
+/// use-after-free.
+///
+/// # Safety
+/// `ptr` MUST be NULL or the exact base pointer a recv/event callback received
+/// and has NOT already freed, and `len` MUST equal that buffer's total length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_free_buf(ptr: *mut u8, len: size_t) {
+    if ptr.is_null() {
+        return;
+    }
+    // The buffer was leaked from a `Box<[u8]>` of exactly `len` bytes in the
+    // recv/event loops; rebuild the fat slice pointer and drop the box.
     unsafe {
         let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
         drop(Box::from_raw(slice));
@@ -3233,9 +3296,14 @@ pub const VEIL_EVENT_MAILBOX_DRAINED: u8 = 3;
 /// Push-event callback. Invoked from a tokio worker thread for every
 /// `LocalAppMsg::Event` frame the daemon emits while this handler is
 /// installed. `payload`+`payload_len` describe the per-kind opaque
-/// bytes (see. `veil_proto::event_kind` for wire format per kind);
-/// they are valid for the duration of the call only — the consumer
-/// must copy if it needs to retain.
+/// bytes (see. `veil_proto::event_kind` for wire format per kind).
+///
+/// BUFFER OWNERSHIP (cycle-7 H6): for a non-empty payload the pointer is an
+/// OWNED heap buffer the callee must free via `veil_free_buf(payload,
+/// payload_len)` after copying — it MAY be retained past this synchronous call
+/// (Dart `NativeCallable.listener`). An empty payload passes a NULL pointer with
+/// `payload_len == 0` (nothing to free).
+///
 /// wrapped in `Option<...>` for safe
 /// NULL-pointer rejection at the FFI boundary. See [`VeilRecvCb`]
 /// docs.
@@ -3325,18 +3393,34 @@ pub unsafe extern "C" fn veil_set_event_handler(
         };
         while let Some(ev) = events.recv().await {
             let user_ptr = user_addr as *mut std::ffi::c_void;
-            let payload_ptr = if ev.payload.is_empty() {
-                std::ptr::null()
+            let kind = ev.kind;
+            let payload_len = ev.payload.len();
+            // cycle-7 H6: same use-after-free hazard as the recv loop — the host
+            // callback may read `payload_ptr` after this frame returns (Dart
+            // `NativeCallable.listener`). For a non-empty payload, hand the callee
+            // an OWNED heap copy it frees via `veil_free_buf(payload_ptr,
+            // payload_len)`; an empty payload passes NULL (nothing to free).
+            let base: *mut u8 = if payload_len == 0 {
+                std::ptr::null_mut()
             } else {
-                ev.payload.as_ptr()
+                Box::into_raw(ev.payload.into_boxed_slice()).cast()
             };
             // catch_unwind around the callback so
             // a panic doesn't unwind across the C-ABI frame
             // (UB). Logged and the event-stream stays alive.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                cb_fn(user_ptr, ev.kind, payload_ptr, ev.payload.len());
+                cb_fn(user_ptr, kind, base.cast_const(), payload_len);
             }));
             if result.is_err() {
+                // Reclaim on the unwinding (dev/test) path so we don't leak.
+                if !base.is_null() {
+                    unsafe {
+                        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                            base,
+                            payload_len,
+                        )));
+                    }
+                }
                 eprintln!(
                     "[veilclient-ffi] event-handler callback panicked; \
                      event dropped, stream kept open",

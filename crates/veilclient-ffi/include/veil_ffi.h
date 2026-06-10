@@ -359,6 +359,16 @@ typedef struct VeilStreamFfi VeilStreamFfi;
 /**
  * Recv callback signature — invoked from a tokio worker thread.
  *
+ * BUFFER OWNERSHIP (cycle-7 H6): the three pointers (`src_node_id`,
+ * `src_app_id`, `data`) are offsets into ONE heap buffer the callee now OWNS:
+ * `src_node_id` is the base, laid out `[node_id(32) | app_id(32) | data]`. The
+ * host MAY retain the pointers past this synchronous call (e.g. marshal them to
+ * another thread/isolate and copy later) and MUST, exactly once per non-NULL
+ * invocation, call `veil_free_buf(src_node_id, 64 + data_len)` after copying.
+ * This replaces the old "valid for the call only; copy synchronously" contract
+ * that a deferred host (Dart `NativeCallable.listener`) could not honour
+ * without a use-after-free.
+ *
  * wrapped in `Option<...>` so a NULL
  * function pointer passed from C/Swift/Kotlin is a valid `None`
  * representation that Rust matches and rejects gracefully — instead
@@ -456,9 +466,14 @@ typedef void (*VeilPeerCb)(void *user,
  * Push-event callback. Invoked from a tokio worker thread for every
  * `LocalAppMsg::Event` frame the daemon emits while this handler is
  * installed. `payload`+`payload_len` describe the per-kind opaque
- * bytes (see. `veil_proto::event_kind` for wire format per kind);
- * they are valid for the duration of the call only — the consumer
- * must copy if it needs to retain.
+ * bytes (see. `veil_proto::event_kind` for wire format per kind).
+ *
+ * BUFFER OWNERSHIP (cycle-7 H6): for a non-empty payload the pointer is an
+ * OWNED heap buffer the callee must free via `veil_free_buf(payload,
+ * payload_len)` after copying — it MAY be retained past this synchronous call
+ * (Dart `NativeCallable.listener`). An empty payload passes a NULL pointer with
+ * `payload_len == 0` (nothing to free).
+ *
  * wrapped in `Option<...>` for safe
  * NULL-pointer rejection at the FFI boundary. See [`VeilRecvCb`]
  * docs.
@@ -784,6 +799,27 @@ int veil_lookup_rendezvous_replicas(VeilHandle *handle,
  * and `len` MUST equal the length that call wrote.
  */
  void veil_free_replica_buf(uint8_t *ptr, size_t len) ;
+
+/**
+ * Free a callback buffer handed to a recv- or event-handler callback
+ * (cycle-7 H6).  `ptr` MUST be the base pointer the callback received — for
+ * recv that is the `src_node_id` pointer (the buffer is laid out
+ * `[node_id(32) | app_id(32) | data]`); for events it is the `payload`
+ * pointer — and `len` MUST be the buffer's total length (recv: `64 + data_len`;
+ * events: `payload_len`).  Safe to call on `ptr == NULL` (no-op).
+ *
+ * The callback contract is callee-owns-the-buffer: the host MUST call this
+ * exactly once per callback invocation that received a non-NULL pointer, after
+ * it has finished copying the bytes it needs. This lets the host retain the
+ * pointer past the synchronous call (e.g. Dart `NativeCallable.listener`,
+ * which marshals to the isolate and reads the bytes later) without a
+ * use-after-free.
+ *
+ * # Safety
+ * `ptr` MUST be NULL or the exact base pointer a recv/event callback received
+ * and has NOT already freed, and `len` MUST equal that buffer's total length.
+ */
+ void veil_free_buf(uint8_t *ptr, size_t len) ;
 
 /**
  * Fetch all blobs currently stored for `receiver_id`. `auth_cookie`
