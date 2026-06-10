@@ -155,7 +155,11 @@ pub(crate) async fn handle_mailbox_fetch(
     let blobs_raw = mailbox_backend
         .and_then(|b| b.fetch(req.receiver_id, req.auth_cookie))
         .unwrap_or_default();
-    let blobs = select_bounded_fetch_blobs(blobs_raw, MAX_MAILBOX_FETCH_ENTRIES, MAX_MAILBOX_FETCH_BYTES);
+    let blobs = select_bounded_fetch_blobs(
+        blobs_raw,
+        MAX_MAILBOX_FETCH_ENTRIES,
+        MAX_MAILBOX_FETCH_BYTES,
+    );
     let reply = MailboxFetchRespPayload { blobs };
     write_frame_wh(
         wh,

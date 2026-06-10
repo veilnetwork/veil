@@ -4295,17 +4295,18 @@ impl NodeServices {
         // filtered through `verify_identity_document` + `node_id == BLAKE3`
         // above, so a single verified replica is independently trustworthy →
         // allow_single_replica = true. (audit cycle-9.)
-        let bytes = pick_quorum_match(&replicas, RESOLVE_QUORUM_THRESHOLD, true).ok_or_else(|| {
-            if replicas.is_empty() {
-                ResolveError::IdentityNotFound(node_id)
-            } else {
-                ResolveError::QuorumDivergence {
-                    queried: replicas.len(),
-                    best: replicas.iter().filter(|r| **r == replicas[0]).count(),
-                    required: RESOLVE_QUORUM_THRESHOLD,
+        let bytes =
+            pick_quorum_match(&replicas, RESOLVE_QUORUM_THRESHOLD, true).ok_or_else(|| {
+                if replicas.is_empty() {
+                    ResolveError::IdentityNotFound(node_id)
+                } else {
+                    ResolveError::QuorumDivergence {
+                        queried: replicas.len(),
+                        best: replicas.iter().filter(|r| **r == replicas[0]).count(),
+                        required: RESOLVE_QUORUM_THRESHOLD,
+                    }
                 }
-            }
-        })?;
+            })?;
         // Cache-poison fix: overwrite the local DHT shard
         // with the quorum-winning bytes.
         self.dht.store_local(key, bytes.clone());
