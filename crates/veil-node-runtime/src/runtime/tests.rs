@@ -189,7 +189,34 @@ async fn metrics_counters_move_on_session_lifecycle() {
         .await
         .expect("connects");
     complete_test_handshake(&mut stream).await;
-    // Send a valid OVL1 Ping frame (Control family, Ping msg_type, no body).
+
+    // Phase 1 — observe the session-OPEN counters while the session is idle,
+    // BEFORE sending any post-handshake frame. (audit cycle-9 CRIT-0): the M1
+    // empty-frame AEAD fix (commit 11e5065) now correctly tears down a session
+    // that receives an unsealed/empty body under an active cipher. So the
+    // open-state (active_sessions 1) must be sampled before the Ping below,
+    // which both counts its wire bytes AND triggers the close — previously this
+    // test required all three counters true at ONE scrape, which is impossible
+    // now that the Ping closes the session microseconds after the byte count.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let rendered = fetch_metrics(&endpoint, "/metrics").await;
+            if rendered.contains("veil_inbound_sessions_total 1")
+                && rendered.contains("veil_active_sessions 1")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("session-open counters observed");
+
+    // Send a raw OVL1 Ping header (Control family, Ping msg_type, empty body).
+    // The runner counts its 24 wire bytes (HEADER_SIZE) into
+    // transport_bytes_rx_total BEFORE the empty-body decrypt rejects it and
+    // closes the session — so this single frame drives both the rx-byte counter
+    // and the session-close half of the lifecycle.
     {
         use veil_proto::{
             codec::encode_header,
@@ -204,12 +231,13 @@ async fn metrics_counters_move_on_session_lifecycle() {
             .expect("write ping frame");
     }
 
+    // Phase 2 — the Ping's 24 wire bytes are counted (cumulative counter) and
+    // the session is torn down by the empty-frame rejection.
     timeout(Duration::from_secs(2), async {
         loop {
             let rendered = fetch_metrics(&endpoint, "/metrics").await;
-            if rendered.contains("veil_inbound_sessions_total 1")
-                && rendered.contains("veil_active_sessions 1")
-                && rendered.contains("veil_transport_bytes_rx_total 24")
+            if rendered.contains("veil_transport_bytes_rx_total 24")
+                && rendered.contains("veil_active_sessions 0")
             {
                 break;
             }
@@ -217,21 +245,9 @@ async fn metrics_counters_move_on_session_lifecycle() {
         }
     })
     .await
-    .expect("metrics updated");
+    .expect("rx bytes counted and session closed");
 
-    stream.shutdown().await.expect("shutdown");
-
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let rendered = fetch_metrics(&endpoint, "/metrics").await;
-            if rendered.contains("veil_active_sessions 0") {
-                break;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("active sessions decremented");
+    let _ = stream.shutdown().await;
 
     runtime.stop().await.expect("runtime stops");
     let _ = fs::remove_file(path);
