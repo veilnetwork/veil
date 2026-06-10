@@ -207,7 +207,7 @@ clean, `scripts/check-allow-dead-code-anchors.sh` 15 sites all anchored.
 
 - **Anycast reputation-based downweight + quorum vote** — `SignedBound` (this batch) only proves owner binding, not score honesty.  Requires a new IPC reverse-direction frame for "resolution result failed in use" feedback + per-service reputation slice.  Re-open trigger: production trust-sensitive anycast consumer materializes.
 - **DHT per-origin byte accounting** — would track bytes per signer pubkey + allow per-origin quotas.  Requires per-signer state in `TieredStore` (HashMap<pubkey, bytes>); larger change than the global cap shipped here.  Re-open trigger: observed per-signer abuse in production.
-- **`allow_unsigned_store = false` default flip (P1)** — TASKS.md Phase C10 explicitly defers this ("flipping disrupts every legacy network using inner-sig pattern; Migration story belongs to follow-up epic").
+- **`allow_unsigned_store = false` default flip (P1)** — ✅ **SUPERSEDED / DONE (audit cycle-8 2026-06-10):** the default is now `false` in code (`veil-cfg` `default_allow_unsigned_store()` returns `false`, "cycle-6 P1 secure-by-default"), and the PBAN linchpin below was resolved — `veil-dispatcher/src/discovery.rs` routes `PBAN`-prefixed values straight to `handle_store` so the NetworkAuthGate runs. The deferred discussion below is retained for history only; do not re-open. (Original deferral note: Phase C10 deferred this as "flipping disrupts every legacy network using inner-sig pattern.")
   - *Audit cycle-6 investigation (Variant A scoped; ONE linchpin must be resolved
     first — paused for a dedicated session, high blast-radius = core DHT accept
     path):* The plan is to route dispatcher-VALIDATED unsigned records through

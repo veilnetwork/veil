@@ -3875,10 +3875,11 @@ use veil_util::hex_short;
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 //
-// Test module body (~5257 LoC) extracted to sibling file `runner_tests.rs`
-// for file-size sanity. `#[path]` attribute keeps it scoped as a child
-// module of `runner` so all `super::*` imports still resolve and
-// `pub` visibility from runner's items is preserved.
+// NB: there is no separate `runner_tests.rs` file — an earlier comment here
+// claimed the test module was extracted to a sibling file via `#[path]`, but no
+// such file or attribute exists. Runner unit tests live inline in `#[cfg(test)]`
+// modules in this file (e.g. `m1_empty_frame_aead_tests`) and in the
+// `veil-session-integration-tests` crate.
 
 #[cfg(test)]
 mod m1_empty_frame_aead_tests {

@@ -20,8 +20,11 @@
 //!
 //! * [`manifest`] — signed update-manifest primitive: wire format
 //!   sign/decode/verify, anti-downgrade timestamp, anti-tamper
-//!   signature binding. No HTTPS fetch / no in-place restart yet
-//!   — those are separate slices.
+//!   signature binding.
+//! * [`fetch`] — HTTPS manifest/binary fetch (reuses the `veil-bootstrap`
+//!   real-HTTPS infrastructure).
+//! * [`apply`] — verified in-place binary replacement via atomic rename
+//!   (sha256 re-check + anti-downgrade + platform/min-version gates).
 
 pub mod apply;
 pub mod check_task;

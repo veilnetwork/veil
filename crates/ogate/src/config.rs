@@ -8,7 +8,7 @@
 //! mode           = "authorized"
 //! socket_path    = "/run/veil/app.sock"
 //! iface_name     = "ogate0"
-//! mtu            = 1280
+//! mtu            = 16000
 //! local_addr_v4  = "10.99.0.1"
 //! prefix_v4      = 24
 //! local_addr_v6  = "fd00:ogate:1::1"
@@ -83,7 +83,9 @@ pub struct OgateConfig {
     #[serde(default = "default_iface_name")]
     pub iface_name: String,
 
-    /// MTU for the TUN device. Default 1280 keeps room for veil headers.
+    /// MTU for the TUN device. Default 16000 (matches the TUN read buffer);
+    /// note a full-MTU packet plus framing must stay under the obfs4 ciphertext
+    /// cap on obfs4 links (see the egress oversize handling in `bridge`).
     #[serde(default = "default_mtu")]
     pub mtu: u16,
 
