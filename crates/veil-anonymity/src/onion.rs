@@ -2,10 +2,10 @@
 //!
 //! Wraps a payload for one hop: the sender generates a fresh X25519
 //! ephemeral keypair, ECDHs with the hop's static public key, derives
-//! a ChaCha20-Poly1305 key via BLAKE3, encrypts, and produces an
-//! envelope of `[ephemeral_pk || nonce || ciphertext+tag]`. The
-//! receiver at that hop reverses the process using its static secret
-//! key.
+//! a ChaCha20-Poly1305 key AND nonce via BLAKE3, encrypts, and produces an
+//! envelope of `[ephemeral_pk || ciphertext+tag]` (onion v2 — the nonce is
+//! derived, not transmitted). The receiver at that hop reverses the process
+//! using its static secret key.
 //!
 //! # Multi-hop composition
 //!
@@ -30,25 +30,27 @@
 //! random ciphertext. The whole anonymity property collapses without
 //! either piece, so they ship together in this directory.
 //!
-//! # Wire format (single layer)
+//! # Wire format (single layer, onion v2)
 //!
 //! ```text
 //! [0..32] ephemeral_pk X25519 PublicKey (32 bytes)
-//! [32..44] nonce ChaCha20-Poly1305 (12 bytes, random)
-//! [44..] ciphertext+tag AEAD output (N + 16 bytes)
+//! [32..]  ciphertext+tag AEAD output (N + 16 bytes)
 //! ```
 //!
-//! Total overhead per layer: 60 bytes (32 + 12 + 16). An N-hop onion
-//! that fits in a 510-byte cell can carry up to `510 - 60 * N` bytes
-//! of innermost payload — for N=3, that's 330 bytes. Higher hop
-//! counts trade payload budget for stronger unlinkability.
+//! The nonce is NOT on the wire (onion v2) — it is derived from the per-layer
+//! shared secret (see "Why a derived nonce"). Total overhead per layer: 48
+//! bytes (32 + 16). An N-hop onion that fits in a 510-byte cell can carry up to
+//! `510 - 48 * N` bytes of innermost payload at the onion layer; the circuit
+//! layer adds a 1-byte TTL + 32-byte next-hop id per hop (see
+//! `circuit::PER_HOP_OVERHEAD`). Higher hop counts trade payload for stronger
+//! unlinkability.
 //!
 //! # AEAD AAD
 //!
-//! The ephemeral public key + nonce are bound into the AEAD via AAD:
+//! The ephemeral public key + (derived) nonce are bound into the AEAD via AAD:
 //!
 //! ```text
-//! aad = "veil-onion-v1\0" || ephemeral_pk || nonce
+//! aad = "veil-onion-v2\0" || layer_kind || ephemeral_pk || nonce
 //! ```
 //!
 //! Domain prefix prevents cross-protocol reuse (an AEAD ciphertext
@@ -58,15 +60,23 @@
 //! valid AEAD verify (which would otherwise fail because the derived
 //! key would change, but binding it explicitly is defense in depth).
 //!
-//! # Why deterministic-looking but actually random nonce
+//! # Why a derived nonce (onion v2)
 //!
-//! Each layer uses a fresh ephemeral key → fresh shared secret →
-//! fresh derived AEAD key. We could derive the nonce from the shared
-//! secret (saving 12 wire bytes), but choosing a random nonce keeps
-//! the wire format aligned with conventional AEAD usage and makes
-//! future "reuse a long-term key for a hop" easier to retrofit
-//! without nonce-collision risk. The 12-byte cost per layer is
-//! tolerable.
+//! Each layer uses a fresh ephemeral key → fresh shared secret → fresh derived
+//! AEAD key. Because the key is therefore unique per layer, the nonce can be
+//! DERIVED from the shared secret (under a domain string separate from the key)
+//! and NOT transmitted — the `(key, nonce)` pair never repeats, and nonce reuse
+//! only breaks AEAD when the KEY repeats. This saves 12 wire bytes per hop
+//! (payload budget +12·N), the cheap half of the anonymity-preserving
+//! circuit-optimisation plan (`docs/internal/PLAN_ANON_PRESERVING_IMPL.md` W1).
+//!
+//! v1 transmitted a random nonce to keep "reuse a long-term key for a hop"
+//! easy to retrofit. That retrofit is **stateful circuits (Epic 482.7)**, which
+//! the anonymity-preserving path deliberately does NOT pursue (it would let a
+//! relay link a sender's messages). So the v1 hedge no longer applies: on this
+//! path every layer always has a fresh ephemeral → a derived nonce is always
+//! safe. (Any future long-term-key mode MUST mix a per-message counter into the
+//! nonce — see `derive_nonce`.)
 //!
 //! # What this module does NOT do
 //!
@@ -89,7 +99,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use rand_core::{OsRng, RngCore};
+use rand_core::OsRng;
 use x25519_dalek::{
     EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret,
 };
@@ -105,13 +115,21 @@ pub const NONCE_LEN: usize = 12;
 /// AEAD tag length — fixed by ChaCha20-Poly1305.
 pub const TAG_LEN: usize = 16;
 
-/// Total per-layer envelope overhead: ephemeral_pk + nonce + AEAD tag.
-pub const ONION_LAYER_OVERHEAD: usize = EPHEMERAL_PK_LEN + NONCE_LEN + TAG_LEN;
+/// Total per-layer envelope overhead: ephemeral_pk + AEAD tag.
+///
+/// onion v2 (anonymity-preserving optimisation): the 12-byte nonce is NO
+/// longer transmitted — it is DERIVED from the per-layer shared secret (see
+/// `derive_nonce` + the module "Why a derived nonce" note), saving 12 B per
+/// hop. `PER_HOP_OVERHEAD` and the cell payload budget update through this
+/// constant automatically.
+pub const ONION_LAYER_OVERHEAD: usize = EPHEMERAL_PK_LEN + TAG_LEN;
 
-/// Domain-separation prefix bound into the AEAD AAD. Bumping `:v1`
-/// would invalidate every existing onion envelope — only do this for
-/// a security-relevant format change.
-const AEAD_DOMAIN: &[u8] = b"veil-onion-v1\0";
+/// Domain-separation prefix bound into the AEAD AAD. Bumped `:v1` → `:v2` for
+/// the onion-v2 format change (derived, not transmitted, nonce). A v2 node
+/// computes a different AAD than a v1 node, so a v1 envelope fails AEAD verify
+/// at a v2 hop and vice versa — clean version separation (flag-day on the
+/// anonymity path; the 512-byte cell framing is unchanged).
+const AEAD_DOMAIN: &[u8] = b"veil-onion-v2\0";
 
 /// layer-kind discriminator bound into the
 /// AEAD AAD so that a single onion envelope cannot be re-interpreted
@@ -124,14 +142,15 @@ pub const LAYER_KIND_CIRCUIT: u8 = 0;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum OnionError {
-    #[error("envelope is {got} B; minimum layer size is {min} B (ephemeral_pk + nonce + tag)")]
+    #[error("envelope is {got} B; minimum layer size is {min} B (ephemeral_pk + tag)")]
     EnvelopeTooSmall { got: usize, min: usize },
     #[error("AEAD verification failed (wrong hop key, tampered envelope, or wrong layer)")]
     Aead,
 }
 
 /// Encrypt `payload` for a hop identified by its X25519 public key.
-/// Output layout: `ephemeral_pk (32B) || nonce (12B) || ciphertext+tag`.
+/// Output layout (onion v2): `ephemeral_pk (32B) || ciphertext+tag` — the
+/// nonce is derived from the shared secret, not transmitted.
 ///
 /// The ephemeral keypair is generated fresh per call and consumed
 /// after one ECDH — the secret half is never stored, never returned
@@ -169,8 +188,13 @@ pub fn wrap_for_hop_kind(
     );
 
     let aead_key = derive_aead_key(shared.as_bytes());
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    // onion v2: the nonce is DERIVED from the shared secret instead of being
+    // randomly generated and transmitted (saves 12 wire bytes/hop). This is
+    // safe because the key is unique per layer (fresh ephemeral → unique shared
+    // → unique key), so the (key, nonce) pair never repeats — nonce reuse only
+    // breaks AEAD when the KEY repeats, which the fresh-ephemeral-per-layer
+    // invariant prevents. See the module "Why a derived nonce" note.
+    let nonce_bytes = derive_nonce(shared.as_bytes());
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&aead_key));
     let aad = build_aad(&ephemeral_pk, &nonce_bytes, layer_kind);
@@ -187,9 +211,9 @@ pub fn wrap_for_hop_kind(
         )
         .expect("chacha20poly1305 encrypt must not fail on valid inputs");
 
-    let mut out = Vec::with_capacity(EPHEMERAL_PK_LEN + NONCE_LEN + ciphertext.len());
+    // Wire: ephemeral_pk || ciphertext+tag (no transmitted nonce — derived).
+    let mut out = Vec::with_capacity(EPHEMERAL_PK_LEN + ciphertext.len());
     out.extend_from_slice(&ephemeral_pk);
-    out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
     out
 }
@@ -220,9 +244,9 @@ pub fn unwrap_at_hop_kind(
     }
     let mut ephemeral_pk = [0u8; EPHEMERAL_PK_LEN];
     ephemeral_pk.copy_from_slice(&envelope[..EPHEMERAL_PK_LEN]);
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    nonce_bytes.copy_from_slice(&envelope[EPHEMERAL_PK_LEN..EPHEMERAL_PK_LEN + NONCE_LEN]);
-    let ciphertext = &envelope[EPHEMERAL_PK_LEN + NONCE_LEN..];
+    // onion v2: no transmitted nonce — ciphertext begins right after the
+    // ephemeral_pk; the nonce is re-derived from the shared secret below.
+    let ciphertext = &envelope[EPHEMERAL_PK_LEN..];
 
     let shared = hop_sk.diffie_hellman(&X25519PublicKey::from(ephemeral_pk));
     // Reject a non-contributory (low-order) ephemeral_pk. It is attacker-
@@ -233,6 +257,7 @@ pub fn unwrap_at_hop_kind(
         return Err(OnionError::Aead);
     }
     let aead_key = derive_aead_key(shared.as_bytes());
+    let nonce_bytes = derive_nonce(shared.as_bytes());
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&aead_key));
     let aad = build_aad(&ephemeral_pk, &nonce_bytes, layer_kind);
@@ -257,6 +282,25 @@ fn derive_aead_key(shared_secret: &[u8; 32]) -> [u8; 32] {
     hasher.update(b"veil-onion-v1-aead-key\0");
     hasher.update(shared_secret);
     *hasher.finalize().as_bytes()
+}
+
+/// Derive the ChaCha20-Poly1305 nonce from the same X25519 shared secret,
+/// under a SEPARATE domain string from the key (onion v2). Because the shared
+/// secret is unique per layer (fresh ephemeral per layer), the derived
+/// (key, nonce) pair is unique per encryption — so the nonce can be derived
+/// instead of transmitted, saving 12 wire bytes/hop with no loss of AEAD
+/// security. SAFETY: this relies on the fresh-ephemeral-per-layer invariant;
+/// any future mode that reuses a long-term key for a hop (e.g. a stateful
+/// circuit) MUST mix a per-message counter into the nonce instead — but that
+/// mode is explicitly out of scope on the anonymity-preserving path (see
+/// `docs/internal/PLAN_ANON_PRESERVING_IMPL.md`).
+fn derive_nonce(shared_secret: &[u8; 32]) -> [u8; NONCE_LEN] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"veil-onion-v2-nonce\0");
+    hasher.update(shared_secret);
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&hasher.finalize().as_bytes()[..NONCE_LEN]);
+    nonce
 }
 
 /// Construct the AEAD AAD: domain prefix || layer_kind || ephemeral_pk || nonce.
@@ -337,8 +381,9 @@ mod tests {
     fn epic482_1_tampered_ciphertext_fails_aead() {
         let (hop_sk, hop_pk) = fresh_hop();
         let mut envelope = wrap_for_hop(b"data", &hop_pk);
-        // Flip a bit deep inside the ciphertext region.
-        let ciphertext_start = EPHEMERAL_PK_LEN + NONCE_LEN;
+        // Flip a bit in the ciphertext region (onion v2: ciphertext begins
+        // right after the 32-byte ephemeral_pk — no transmitted nonce).
+        let ciphertext_start = EPHEMERAL_PK_LEN;
         envelope[ciphertext_start] ^= 0x01;
         let err = unwrap_at_hop(&envelope, &hop_sk).unwrap_err();
         assert_eq!(err, OnionError::Aead, "tampered ciphertext must fail AEAD");
@@ -461,8 +506,39 @@ mod tests {
     fn epic482_1_overhead_constant_matches_components() {
         // Sanity that the public constant operators rely on for
         // payload-budget calculation matches the actual structure.
-        assert_eq!(ONION_LAYER_OVERHEAD, EPHEMERAL_PK_LEN + NONCE_LEN + TAG_LEN);
-        assert_eq!(ONION_LAYER_OVERHEAD, 60);
+        // onion v2: nonce derived, not transmitted → overhead is eph_pk + tag.
+        assert_eq!(ONION_LAYER_OVERHEAD, EPHEMERAL_PK_LEN + TAG_LEN);
+        assert_eq!(ONION_LAYER_OVERHEAD, 48);
+    }
+
+    #[test]
+    fn onion_v2_omits_nonce_saving_12_bytes_per_layer() {
+        // The v2 envelope is exactly NONCE_LEN (12 B) smaller than the v1 layout
+        // (eph_pk + nonce + ct+tag) would have been, and still round-trips.
+        let (hop_sk, hop_pk) = fresh_hop();
+        let payload = b"abc";
+        let env = wrap_for_hop(payload, &hop_pk);
+        // v2: eph_pk(32) + ct(payload + tag 16). No 12-byte nonce on the wire.
+        assert_eq!(env.len(), EPHEMERAL_PK_LEN + payload.len() + TAG_LEN);
+        assert_eq!(env.len(), 32 + 3 + 16);
+        // Exactly NONCE_LEN smaller than the old (v1) layout would have been.
+        let v1_len = EPHEMERAL_PK_LEN + NONCE_LEN + payload.len() + TAG_LEN;
+        assert_eq!(v1_len - env.len(), NONCE_LEN);
+        assert_eq!(unwrap_at_hop(&env, &hop_sk).unwrap(), payload);
+    }
+
+    #[test]
+    fn onion_v2_nonce_is_deterministic_per_shared_secret() {
+        // The derived nonce must be a stable function of the shared secret
+        // (so wrap and unwrap agree) and domain-separated from the key.
+        let s = [7u8; 32];
+        assert_eq!(derive_nonce(&s), derive_nonce(&s), "derivation is stable");
+        assert_ne!(
+            &derive_nonce(&s)[..],
+            &derive_aead_key(&s)[..NONCE_LEN],
+            "nonce and key use distinct domains",
+        );
+        assert_ne!(derive_nonce(&[1u8; 32]), derive_nonce(&[2u8; 32]));
     }
 
     /// an envelope produced for one layer kind

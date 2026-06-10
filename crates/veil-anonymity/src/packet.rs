@@ -12,32 +12,32 @@
 //! outbound from every relay. Without this:
 //!
 //! * Sender emits 512 B cell.
-//! * Hop 1 peels one onion layer, produces a `[u8]` of size
-//!   `(previous - 92)`. If hop 1 forwards those bytes RAW, the
-//!   observer at the hop1→hop2 link sees a 420-byte payload.
-//!   Hop 2 peels another layer, forwards 328 bytes. Hop 3 peels
-//!   forwards 236 bytes. Cell sizes shrink monotonically along
-//!   the circuit — that's a per-hop signal that immediately
+//! * Hop 1 peels one onion layer, producing a `[u8]` of size
+//!   `(previous - PER_HOP_OVERHEAD)`. If hop 1 forwards those bytes RAW, the
+//!   observer at the hop1→hop2 link sees a shrunken payload. Cell sizes shrink
+//!   monotonically along the circuit — a per-hop signal that immediately
 //!   deanonymizes (observer infers hop position from cell size).
 //!
 //! [`peel_anonymous_cell`] guarantees the relay's outbound is also
 //! a 512-byte cell by re-packing the peeled `inner` bytes through
-//! [`super::cell::pack`]. The 92 bytes of overhead per layer
+//! [`super::cell::pack`]. The `PER_HOP_OVERHEAD` bytes per layer
 //! become zero-padding bytes inside the next cell, invisible to
 //! observers and ignored by the next hop's `cell::unpack`.
 //!
-//! # Maximum user payload per hop count
+//! # Maximum user payload per hop count (onion v2)
 //!
-//! For an N-hop circuit packed into a 512-byte cell:
+//! For an N-hop circuit packed into a 512-byte cell, with
+//! `PER_HOP_OVERHEAD = 81` (1 ttl + 32 next-hop + 48 onion v2; the 12-byte
+//! nonce is derived, not transmitted):
 //!
-//! max_payload(N) = MAX_PAYLOAD_PER_CELL - 92 * N
-//! = 510 - 92 * N
+//! max_payload(N) = MAX_PAYLOAD_PER_CELL - 81 * N
+//! = 510 - 81 * N
 //!
-//! N=1 → 418 B
-//! N=2 → 326 B
-//! N=3 → 234 B
-//! N=5 → 50 B
-//! N=6 → reject — 510 - 552 < 0
+//! N=1 → 429 B
+//! N=2 → 348 B
+//! N=3 → 267 B
+//! N=6 → 24 B
+//! N=7 → reject — 510 - 567 < 0
 //!
 //! Higher hop counts trade payload budget for stronger
 //! unlinkability. Real Tor uses 3 hops as the standard tradeoff;
@@ -128,7 +128,7 @@ pub fn max_payload_for_hops(n: usize) -> Option<usize> {
 pub fn build_anonymous_cell(payload: &[u8], hops: &[Hop]) -> Result<[u8; CELL_SIZE], PacketError> {
     let max = max_payload_for_hops(hops.len()).ok_or(PacketError::TooManyHops {
         got: hops.len(),
-        // (510 - 32) / 92 = 5 hops max; show 5 as a friendly hint.
+        // 510 / 81 = 6 hops max (onion v2); show it as a friendly hint.
         max: MAX_PAYLOAD_PER_CELL / PER_HOP_OVERHEAD,
     })?;
     if payload.len() > max {
@@ -196,21 +196,20 @@ mod tests {
 
     #[test]
     fn epic482_1_max_payload_formula_matches_overhead() {
-        // anti-loop TTL: PER_HOP_OVERHEAD bumped 92 → 93
-        // (1 byte ttl per layer). Per-hop budgets shift by 1B × N:
-        // 1 hop → 510 - 93 = 417
-        // 2 hops → 510 - 186 = 324
-        // 3 hops → 510 - 279 = 231
+        // onion v2: PER_HOP_OVERHEAD = 81 (1 ttl + 32 next-hop + 48 onion;
+        // nonce derived, not transmitted). max_payload(N) = 510 - 81·N:
+        // 1 hop → 429, 2 → 348, 3 → 267, 6 → 24 (still fits), 7 → negative.
         assert_eq!(max_payload_for_hops(0), None, "0 hops is invalid");
-        assert_eq!(max_payload_for_hops(1), Some(417));
-        assert_eq!(max_payload_for_hops(2), Some(324));
-        assert_eq!(max_payload_for_hops(3), Some(231));
-        // Higher hop counts: at some N the formula goes negative.
-        // (510 - 93*N < 0) when N >= 6.
+        assert_eq!(max_payload_for_hops(1), Some(429));
+        assert_eq!(max_payload_for_hops(2), Some(348));
+        assert_eq!(max_payload_for_hops(3), Some(267));
+        // v2's bigger budget lets a 6-hop onion fit (24 B payload) where v1
+        // capped at 5; the formula only goes negative at N ≥ 7.
+        assert_eq!(max_payload_for_hops(6), Some(24));
         assert_eq!(
-            max_payload_for_hops(6),
+            max_payload_for_hops(7),
             None,
-            "6 hops cannot fit in a 512 B cell"
+            "7 hops cannot fit in a 512 B cell"
         );
     }
 
@@ -380,11 +379,12 @@ mod tests {
 
     #[test]
     fn epic482_1_too_many_hops_rejected_at_build() {
-        let hops: Vec<_> = (0..6).map(|i| fresh_hop(i as u8 + 1).1).collect();
+        // onion v2: 6 hops now fit (24 B payload); 7 is the first that can't.
+        let hops: Vec<_> = (0..7).map(|i| fresh_hop(i as u8 + 1).1).collect();
         let err = build_anonymous_cell(b"x", &hops).unwrap_err();
         assert!(
             matches!(err, PacketError::TooManyHops { .. }),
-            "6+ hops cannot fit in a 512 B cell — must be rejected: {err:?}"
+            "7+ hops cannot fit in a 512 B cell — must be rejected: {err:?}"
         );
     }
 
