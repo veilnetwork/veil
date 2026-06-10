@@ -26,7 +26,13 @@ pub enum RekeyState {
     /// No rekey in progress.
     Idle,
     /// We sent `RekeyInit` and are waiting for `RekeyAck` from the peer.
-    AwaitingAck { keypair: kex::EphemeralKeypair },
+    /// `since` records when we entered this state so a never-answered init
+    /// (peer crash / lost frame — there is no rekey retransmit) can be timed
+    /// out back to `Idle` instead of pinning the FSM forever (audit cycle-8 H7).
+    AwaitingAck {
+        keypair: kex::EphemeralKeypair,
+        since: Instant,
+    },
 }
 
 /// Reason a rekey was triggered — used in the visibility log
@@ -116,10 +122,26 @@ impl RekeyContext {
         None
     }
 
-    /// Transition to `AwaitingAck { keypair }`. Caller has just pushed
-    /// the matching `RekeyInit` frame onto the priority queue.
-    pub fn enter_awaiting_ack(&mut self, keypair: kex::EphemeralKeypair) {
-        self.state = RekeyState::AwaitingAck { keypair };
+    /// Transition to `AwaitingAck { keypair, since: now }`. Caller has just
+    /// pushed the matching `RekeyInit` frame onto the priority queue.
+    pub fn enter_awaiting_ack(&mut self, keypair: kex::EphemeralKeypair, now: Instant) {
+        self.state = RekeyState::AwaitingAck {
+            keypair,
+            since: now,
+        };
+    }
+
+    /// audit cycle-8 H7: returns true if we have been in `AwaitingAck` longer
+    /// than `timeout` — the peer never answered the `RekeyInit` (it crashed, or
+    /// the `RekeyAck` was lost and there is no rekey retransmit). The caller
+    /// resets to `Idle` so a fresh rekey (and the nonce-exhaustion failsafe,
+    /// which is gated on `is_idle`) can fire again instead of the session being
+    /// stuck unable to ever rekey.
+    pub fn awaiting_ack_timed_out(&self, now: Instant, timeout: Duration) -> bool {
+        match &self.state {
+            RekeyState::AwaitingAck { since, .. } => now.duration_since(*since) >= timeout,
+            RekeyState::Idle => false,
+        }
     }
 
     /// Atomically take the keypair from `AwaitingAck` and transition to
@@ -127,7 +149,7 @@ impl RekeyContext {
     /// invariant violation; caller treats as no-op).
     pub fn take_initiator_keypair(&mut self) -> Option<kex::EphemeralKeypair> {
         match std::mem::replace(&mut self.state, RekeyState::Idle) {
-            RekeyState::AwaitingAck { keypair } => Some(keypair),
+            RekeyState::AwaitingAck { keypair, .. } => Some(keypair),
             RekeyState::Idle => None,
         }
     }
@@ -217,7 +239,7 @@ mod tests {
         let mut ctx = RekeyContext::new(1000, 60);
         let kp = fresh_keypair();
         let pubkey = kp.public_key;
-        ctx.enter_awaiting_ack(kp);
+        ctx.enter_awaiting_ack(kp, Instant::now());
         assert!(ctx.is_awaiting_ack());
         let taken = ctx.take_initiator_keypair().expect("must return keypair");
         assert_eq!(taken.public_key, pubkey);
@@ -233,11 +255,32 @@ mod tests {
     #[tokio::test]
     async fn reset_to_idle_drops_keypair() {
         let mut ctx = RekeyContext::new(1000, 60);
-        ctx.enter_awaiting_ack(fresh_keypair());
+        ctx.enter_awaiting_ack(fresh_keypair(), Instant::now());
         ctx.reset_to_idle();
         assert!(ctx.is_idle());
         // Subsequent take returns None — keypair was dropped.
         assert!(ctx.take_initiator_keypair().is_none());
+    }
+
+    /// audit cycle-8 H7: a never-answered RekeyInit must time out so the FSM
+    /// doesn't pin in AwaitingAck forever (which would also block the
+    /// nonce-exhaustion failsafe).
+    #[tokio::test]
+    async fn awaiting_ack_times_out_and_idle_never_does_h7() {
+        let mut ctx = RekeyContext::new(1000, 60);
+        let t0 = Instant::now();
+        ctx.enter_awaiting_ack(fresh_keypair(), t0);
+        assert!(ctx.is_awaiting_ack());
+        // Within the window: not timed out.
+        assert!(!ctx.awaiting_ack_timed_out(t0 + Duration::from_secs(30), Duration::from_secs(60)));
+        // Past the window: timed out.
+        assert!(ctx.awaiting_ack_timed_out(t0 + Duration::from_secs(61), Duration::from_secs(60)));
+        // After reset, Idle never reports a timeout.
+        ctx.reset_to_idle();
+        assert!(ctx.is_idle());
+        assert!(
+            !ctx.awaiting_ack_timed_out(t0 + Duration::from_secs(600), Duration::from_secs(60))
+        );
     }
 
     #[tokio::test]
