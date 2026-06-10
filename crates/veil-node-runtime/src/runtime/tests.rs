@@ -1348,6 +1348,33 @@ async fn pex_survives_reload_m2() {
     let _ = fs::remove_file(&path);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn bans_survive_reload_crit4() {
+    // audit cycle-9 CRIT-4: a reload reset the ban list to empty and never
+    // re-read bans.json, so banned peers reconnected immediately after any
+    // SIGHUP / admin reload. The fix re-loads persisted bans after the reset.
+    let path = save_test_config("ban-reload-crit4", runtime_config_with_listen()).unwrap();
+    let mut runtime = NodeRuntime::start(&path, false).await.expect("start");
+
+    let victim = [0x42u8; 32];
+    veil_util::lock!(runtime.ban_list).ban_manual(victim, "audit-test");
+    super::persistence::persist_bans(&runtime.ban_list, &path);
+    assert!(
+        veil_util::lock!(runtime.ban_list).is_banned(&victim),
+        "peer banned before reload"
+    );
+
+    runtime.reload().await.expect("reload succeeds");
+
+    assert!(
+        veil_util::lock!(runtime.ban_list).is_banned(&victim),
+        "manual ban must survive reload (CRIT-4) — was reset to empty before the fix"
+    );
+
+    runtime.stop().await.expect("stop");
+    let _ = fs::remove_file(&path);
+}
+
 /// Audit M7: the ephemeral-rotator shutdown senders must be drained out of the
 /// runtime on stop/reload (so the list does not grow unbounded across reloads)
 /// and actually signalled (the old code only ever pushed — the documented
