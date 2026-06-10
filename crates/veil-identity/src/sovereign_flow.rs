@@ -1460,9 +1460,12 @@ pub fn save_master_falcon_keypair(
     falcon_sk_bytes: &[u8],
     falcon_pk_bytes: &[u8],
 ) -> std::io::Result<()> {
-    let mut framed = Vec::with_capacity(
+    // audit cycle-8: the framed bundle carries the Falcon master SK — the single
+    // highest-value, non-BIP-39-recoverable secret. Hold it in `Zeroizing` so it
+    // is wiped from the heap on drop rather than lingering in freed memory.
+    let mut framed = zeroize::Zeroizing::new(Vec::with_capacity(
         MASTER_FALCON_MAGIC.len() + 1 + 4 + falcon_sk_bytes.len() + 4 + falcon_pk_bytes.len(),
-    );
+    ));
     framed.extend_from_slice(MASTER_FALCON_MAGIC);
     framed.push(MASTER_FALCON_VERSION);
     framed.extend_from_slice(&(falcon_sk_bytes.len() as u32).to_be_bytes());
