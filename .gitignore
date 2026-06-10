@@ -2,6 +2,7 @@ target
 **/__pycache__
 **/.DS_Store
 stend/*/mlkem.key
+stend/veil-cli
 temp.md
 **/bans.json
 **/dht_values.json
