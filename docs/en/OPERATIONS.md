@@ -428,8 +428,10 @@ slice.  Operators who have **explicitly re-enabled** the legacy
 below) should note that all unsigned legacy STOREs share a single
 synthetic origin bucket, so they collectively cap out at the same
 per-origin budget; size it generously (≥ 4 MiB) on such networks.
-`None` (default) disables the cap entirely — only the global
-`max_store_bytes` limit (if set) applies.
+The default is `Some(1 MiB)` (audit cycle-9) — a generous ceiling that
+protects a fresh node out of the box; set it explicitly to `None` to
+disable the per-origin cap entirely, leaving only the global
+`max_store_bytes` limit (if set).
 
 Recommended profiles:
 
