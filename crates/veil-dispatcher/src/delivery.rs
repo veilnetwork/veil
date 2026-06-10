@@ -1300,6 +1300,20 @@ impl FrameDispatcher {
         // into one); just deliver.
         let content_id = envelope.content_id;
         if content_id != [0u8; 32] && lock!(self.forward_seen_set).check_and_insert(content_id) {
+            // Duplicate terminal arrival (audit cycle-8 H8): a retransmit because
+            // our original DELIVERED ACK was lost (the retransmit window 15 s is
+            // inside the 60 s dedup window), or a replay. The app already saw
+            // this content_id, so do NOT re-deliver — but if the original
+            // required an ACK, re-emit it from the replay cache so the
+            // originator can recover a lost ACK (no re-decrypt; cheap +
+            // replay-safe). Without this the originator burns all retransmits and
+            // reports AppSendFailed for a message that WAS delivered, and the
+            // loss_tracker is poisoned against a healthy hop.
+            if let Some((sender, ack_key)) =
+                lock!(self.terminal_ack_replay).get(&content_id).copied()
+            {
+                self.send_delivery_ack(sender, content_id, ack_key);
+            }
             return;
         }
         let first_byte = envelope.payload.first().copied();
@@ -1365,6 +1379,13 @@ impl FrameDispatcher {
         // per-message ACK key (C-09) so a relay cannot forge it.
         if envelope.require_ack {
             self.send_delivery_ack(deliver_sender_node_id, envelope.content_id, ack_key);
+            // audit cycle-8 H8: cache (sender, ack_key) keyed by content_id so a
+            // retransmit (sent when this ACK is lost) can be re-ACK'd from the
+            // duplicate path above without re-decrypting the payload.
+            if envelope.content_id != [0u8; 32] {
+                lock!(self.terminal_ack_replay)
+                    .insert(envelope.content_id, (deliver_sender_node_id, ack_key));
+            }
         }
     }
 

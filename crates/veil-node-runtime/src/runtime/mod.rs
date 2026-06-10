@@ -1675,6 +1675,10 @@ impl NodeRuntime {
                 std::time::Duration::from_secs(veil_proto::budget::FORWARD_SEEN_SET_TTL_SECS),
                 veil_proto::budget::MAX_FORWARD_SEEN_SET_SIZE,
             ))),
+            terminal_ack_replay: Arc::new(Mutex::new(veil_dispatcher::ExpiryMap::new(
+                std::time::Duration::from_secs(veil_proto::budget::FORWARD_SEEN_SET_TTL_SECS),
+                veil_proto::budget::MAX_FORWARD_SEEN_SET_SIZE,
+            ))),
             recursive_query_seen: Arc::new(Mutex::new(veil_dispatcher::ExpiryCache::new(
                 std::time::Duration::from_secs(30),
                 65536,
