@@ -13,6 +13,19 @@ pub struct IdentityValidationRule {
 }
 
 pub const IDENTITY_RULES: &[IdentityValidationRule] = &[
+    // Audit cycle-9: surface UNDECODABLE key material. The signature / nonce
+    // rules below `DomainIdentity::from_config(..).ok()` then `is_some_and`, so
+    // a corrupt keypair (unparseable base64 / wrong length for the algo) maps to
+    // None and those rules silently DON'T fire — `validate` reported "OK" on a
+    // config the daemon then crashes loading at startup. This rule fires exactly
+    // when the identity section is present but cannot be decoded.
+    IdentityValidationRule {
+        code: "identity_keypair_decodable",
+        key: "Identity",
+        message: identity_undecodable_message,
+        check: identity_undecodable,
+        repair: None, // corrupt key material can't be auto-repaired
+    },
     IdentityValidationRule {
         code: "identity_signature_valid",
         key: "Identity",
@@ -48,6 +61,19 @@ pub fn collect_repairs(config: &Config, pow: &PowPolicy) -> Vec<IdentityRepairPl
         .filter(|rule| (rule.check)(config, pow))
         .filter_map(|rule| rule.repair)
         .collect()
+}
+
+fn identity_undecodable_message(_pow: &PowPolicy) -> String {
+    "identity key material must decode: base64 public_key / private_key / nonce \
+     must parse and match the configured algo"
+        .to_owned()
+}
+
+fn identity_undecodable(config: &Config, _pow: &PowPolicy) -> bool {
+    config
+        .identity
+        .as_ref()
+        .is_some_and(|identity| DomainIdentity::from_config(identity).is_err())
 }
 
 fn identity_signature_message(_pow: &PowPolicy) -> String {
