@@ -176,6 +176,64 @@ mod tests {
             assert!(!has_wake_warning(&gated));
         }
 
+        /// cycle-10 (report-2 C): mailbox enabled with the default
+        /// require_capability_token = false surfaces a non-fatal advisory.
+        #[test]
+        fn mailbox_without_capability_token_warns_but_stays_valid() {
+            let mut config = Config::default();
+            config.mailbox.enabled = true;
+            assert!(
+                !config.mailbox.require_capability_token,
+                "default must be the permissive value this advisory targets"
+            );
+            let report = validate(&config);
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "mailbox_capability_token_not_required"),
+                "expected the capability-token advisory in warnings"
+            );
+            assert!(report.is_valid(), "advisory must not break validity");
+
+            // Gate on, or mailbox disabled → no advisory.
+            config.mailbox.require_capability_token = true;
+            assert!(
+                !validate(&config)
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "mailbox_capability_token_not_required")
+            );
+            assert!(
+                !validate(&Config::default())
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "mailbox_capability_token_not_required"),
+                "mailbox off by default → no advisory"
+            );
+        }
+
+        /// cycle-10 (report-2 E): dht.allow_unsigned_store = true surfaces a
+        /// non-fatal advisory; it is off by default so a default config is clean.
+        #[test]
+        fn dht_unsigned_store_warns_but_stays_valid() {
+            let has_warning = |c: &Config| {
+                validate(c)
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "dht_unsigned_store_permitted")
+            };
+            assert!(!has_warning(&Config::default()), "off by default → clean");
+
+            let mut config = Config::default();
+            config.dht.allow_unsigned_store = true;
+            assert!(has_warning(&config), "enabling unsigned STORE must warn");
+            assert!(
+                validate(&config).is_valid(),
+                "advisory must not break validity"
+            );
+        }
+
         #[test]
         fn fixes_supported_issues() {
             let mut config = Config::default();
