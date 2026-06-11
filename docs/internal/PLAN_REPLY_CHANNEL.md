@@ -1,7 +1,12 @@
 # Reply channel for authenticated anonymous messaging (v2 / #1)
 
-Status: **DESIGN (reply-block model; reviewed — see §10)**
+Status: **SHIPPED (r1–r7 in `main`; reply-block model, reviewed — see §10)**
 Depends on: bricks 1–5 (authenticated anonymous delivery via rendezvous, shipped).
+
+> **Implemented r1–r7.** Slices `ac59d6b` (design) · `f5c09ef` (r1) · `bbe783c`
+> (r2) · `cacc7c4` (r3) · `e236164` (r4a) · `ba89144` (r4b) · `2bdfa4e` (r5) ·
+> `611a4a0` (r6) · `0c6c41c` (r7). See §12 for the one non-obvious correctness
+> fix (transport- vs sovereign-node_id) and §13 for shipped limitations.
 
 Goal: let a recipient B **reply** to an authenticated anonymous message from A
 without learning A's network location — bidirectional authenticated anonymous
@@ -22,12 +27,14 @@ sealed reply path that B uses to route a reply back, with **no public ad**:
   (existing `register_with_rendezvous` — A↔R session, R-local mapping
   `(A_node_id, cookie) → A's session`). A publishes **nothing to the DHT**.
 - A embeds a signed `ReplyBlock { rendezvous_node_id: R, auth_cookie,
-  x25519_pk: A's anonymity key, reply_app_id, reply_endpoint_id }` in the
-  `AuthAppDeliver`.
+  x25519_pk: A's anonymity key, reply_app_id, reply_endpoint_id,
+  receiver_node_id: A's TRANSPORT node_id }` in the `AuthAppDeliver`. (The last
+  field was added in r7 — see §12 for why it is NOT A's sovereign id.)
 - B replies by sealing to `ReplyBlock.x25519_pk`, wrapping as an
-  `IntroducePayload { receiver_node_id: A_node_id, auth_cookie, ciphertext }`,
-  and onion-routing it to `ReplyBlock.rendezvous_node_id`. R forwards by cookie
-  to A's session. A decrypts + verifies B. **Reuses `send_sealed_introduce`.**
+  `IntroducePayload { receiver_node_id: ReplyBlock.receiver_node_id, auth_cookie,
+  ciphertext }`, and onion-routing it to `ReplyBlock.rendezvous_node_id`. R
+  forwards by cookie to A's session. A decrypts + verifies B. **Reuses
+  `send_sealed_introduce`.**
 
 Only R (transiently, R-local) and B (who holds the inline block) know A's reply
 path; the DHT shows nothing. The block is signed inside the `AuthAppDeliver`, so
@@ -143,21 +150,27 @@ send adds the `send_reply` path + `ReplyBlockStore`.
 
 ## 8. Commit slicing
 
-- **r1** proto: `ReplyBlock` + embed in `AuthAppDeliver` (signed, optional);
+- **r1** ✅ proto: `ReplyBlock` + embed in `AuthAppDeliver` (signed, optional);
   `AppDeliverPayload` += `reply_id`. Round-trip tests + decode-offset care.
-- **r2** identity: `sign_auth_deliver` / `verify_auth_deliver` carry the block.
-- **r3** A-side: ephemeral reply-registration (relay pick + register, no ad) +
+- **r2** ✅ identity: `sign_auth_deliver` / `verify_auth_deliver` carry the block.
+- **r3** ✅ A-side: ephemeral reply-registration (relay pick + register, no ad) +
   embed block; "expect reply" config/flag.
-- **r4** B-side: `ReplyBlockStore` + auth task stores block + surfaces
+- **r4** ✅ B-side: `ReplyBlockStore` + auth task stores block + surfaces
   `reply_id`; `route_ipc_deliver` / `AppMessage::Deliver` += `reply_id`
-  (~25 sites) + plain-onion `AppDeliverPayload` sites set 0.
-- **r5** reply send: `send_reply(reply_id)` + factor
-  `send_via_rendezvous_authenticated` for explicit reply paths; IPC
-  reply request.
-- **r6** client + FFI: `IncomingMessage` += `reply_id` + `reply()`;
-  `veil_send_reply` + recv-callback ABI change + `veil_ffi.h` regen + version
-  bump.
-- **r7** sim reply test + docs.
+  (~25 sites) + plain-onion `AppDeliverPayload` sites set 0. (r4a surfacing +
+  r4b store/producer.)
+- **r5** ✅ reply send: `send_reply(reply_id)` on `NodeServices` +
+  `AnonOnionSender::{send_reply, send_authenticated_with_reply}`; IPC
+  `is_reply`/`expect_reply` flags + trailing `reply_id`/`reply_endpoint_id`;
+  `ipc_send_err::REPLY_UNKNOWN`.
+- **r6** ✅ client + FFI: `IncomingMessage` += `reply_id` + `reply()`;
+  `veil_send_reply` + `veil_send_anonymous_authenticated_with_reply` + recv-
+  callback ABI change (`reply_id` scalar) + `veil_ffi.h` regen + version bump
+  (ffi 0.2.0, flutter 0.2.0). Dart recv side updated; **Dart SEND side not bound
+  yet** (see §13).
+- **r7** ✅ sim reply round-trip (`epic482_reply_channel_end_to_end_round_trip`,
+  drop-tolerant retry loop, 12/12) + the transport-id correctness fix (§12) +
+  these docs.
 
 ## 9. Out of scope
 
@@ -190,3 +203,50 @@ the same freshness window, surfaced as a delivery failure rather than the old
 3. **Relay choice for R** — reuse the recipient-lifecycle relay selection
    (dialable published `relay_capable` peer); A may pick the same R it uses for
    its own receiving (if `receive_anonymous`) or a fresh one per request.
+
+## 12. r7 correctness fix — TRANSPORT vs SOVEREIGN node_id (non-obvious)
+
+The first end-to-end sim run failed only on the REPLY leg: the relay's
+`(receiver_node_id, cookie)` lookup MISSED and the reply was silently dropped.
+
+Root cause — veil nodes carry **two** identities:
+
+- **transport/link node_id** (`identity.local_identity.node_id`) — the OVL1
+  session peer id. The rendezvous relay keys a `RegisterRendezvous` by the
+  **session peer**, i.e. by this transport id.
+- **sovereign node_id** (`sovereign_identity().node_id`) — the Ed25519/Falcon
+  identity used in `AuthAppDeliver` signing and as `auth.sender_node_id`.
+
+The reply was originally addressed with A's **sovereign** id (taken from the
+verified `auth.sender_node_id`), but A had registered at R under its
+**transport** id — so the lookup keys did not match.
+
+Fix: `ReplyBlock` carries `receiver_node_id` = A's **transport** node_id
+(signed + sealed to B, so B can trust it); `send_reply` addresses the reply
+introduce with it. `ReplyBlock::WIRE_SIZE` 116 → 148. The daemon-side
+`ReplyBlockStore` therefore needs no side-channel id — the signed block
+fully self-describes its return path (relay, cookie, x25519_pk, transport id).
+
+Lesson for any future rendezvous/return-path work (incl. 482.7 onion
+registration): **the rendezvous registry is keyed by transport id**, not
+sovereign id — address the relay accordingly.
+
+## 13. Shipped limitations / follow-ups
+
+1. **Reply leg is single-shot best-effort (no retransmit).** The FORWARD leg
+   retransmits on timeout and lands reliably. A one-time reply block is consumed
+   on first `send_reply`, so there is **no retransmit-with-fresh-block recourse**
+   — a dropped reply cell loses the reply (the app must re-request). The sim test
+   masks this with a retry loop over fresh sends; production replies are
+   best-effort. *Decision pending:* accept, or wire a bounded retransmit for the
+   reply introduce (the block could stay un-consumed until ack/expiry).
+2. **Dart SEND side not bound.** `bindings.dart` binds only `veil_send`; the
+   authenticated/`veil_send_reply` entry points are exported from the FFI but not
+   yet surfaced in Dart. A Flutter host can RECEIVE `reply_id` but cannot send a
+   reply (or any authenticated-anonymous message) through the FFI until those are
+   bound.
+3. **Reply still reveals A's location to R** (same as all rendezvous receiving):
+   A registers with R over a DIRECT session, so R learns A's transport address.
+   Hiding the service/replier location from its own rendezvous relay is the
+   onion-registration capability — see
+   `PLAN_ANON_SERVICE_ONION_REGISTRATION.md` (depends on 482.7).
