@@ -57,6 +57,8 @@ pub enum AppMessage {
         app_id: [u8; 32],
         endpoint_id: u32,
         data: veil_bufpool::PooledShared,
+        /// Reply handle (reply-channel): non-zero ⇒ the app may reply via it.
+        reply_id: u64,
     },
     /// Real-time media frame (loss-tolerant, no window check).
     RtData(AppRtDataPayload),
@@ -357,6 +359,23 @@ impl AppEndpointRegistry {
         endpoint_id: u32,
         data: veil_bufpool::PooledShared,
     ) -> bool {
+        // No reply path on the generic delivery path.
+        self.route_ipc_deliver_with_reply(src_node_id, src_app_id, app_id, endpoint_id, data, 0)
+    }
+
+    /// Like [`Self::route_ipc_deliver`] but carries a reply handle
+    /// (reply-channel): non-zero `reply_id` ⇒ the recipient app may reply via
+    /// it. Used by the authenticated-delivery task when the message embedded a
+    /// one-time reply path.
+    pub fn route_ipc_deliver_with_reply(
+        &self,
+        src_node_id: [u8; 32],
+        src_app_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: veil_bufpool::PooledShared,
+        reply_id: u64,
+    ) -> bool {
         let key = EndpointKey {
             app_id,
             endpoint_id,
@@ -369,6 +388,7 @@ impl AppEndpointRegistry {
                 app_id,
                 endpoint_id,
                 data,
+                reply_id,
             },
         )
     }

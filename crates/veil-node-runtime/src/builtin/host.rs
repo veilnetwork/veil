@@ -294,6 +294,7 @@ mod tests {
                 app_id,
                 endpoint_id: 42,
                 data: veil_bufpool::pooled_shared_from_vec(b"hello-builtin".to_vec()),
+                reply_id: 0,
             })
             .expect("send to registered endpoint");
 

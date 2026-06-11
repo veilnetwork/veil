@@ -494,6 +494,7 @@ async fn forward_endpoint(
                     app_id: p.app_id,
                     endpoint_id: p.endpoint_id,
                     data: p.data,
+                    reply_id: 0,
                 };
                 encode_ipc_frame(LocalAppMsg::AppDeliver as u16, &deliver.encode())
             }
@@ -503,6 +504,7 @@ async fn forward_endpoint(
                 app_id,
                 endpoint_id,
                 data,
+                reply_id,
             } => {
                 let deliver = AppDeliverPayload {
                     src_node_id,
@@ -510,6 +512,7 @@ async fn forward_endpoint(
                     app_id,
                     endpoint_id,
                     data,
+                    reply_id,
                 };
                 encode_ipc_frame(LocalAppMsg::AppDeliver as u16, &deliver.encode())
             }
@@ -521,6 +524,7 @@ async fn forward_endpoint(
                     app_id: p.app_id,
                     endpoint_id: p.endpoint_id,
                     data: veil_bufpool::pooled_shared_from_vec(p.data),
+                    reply_id: 0,
                 };
                 encode_ipc_frame(LocalAppMsg::AppDeliver as u16, &deliver.encode())
             }
