@@ -457,6 +457,15 @@ impl FrameDispatcher {
                 return DispatchResult::Violation(format!("ForwardIntroduce decode: {e}"));
             }
         };
+        self.process_introduce_ciphertext(&p.ciphertext, node_id.as_bytes())
+    }
+
+    /// Decrypt a sealed introduce ciphertext (replay-protected) with our
+    /// anonymity key and dispatch the inner final-hop payload (APP_DELIVER /
+    /// APP_DELIVER_AUTH). Shared by the SESSION forward path
+    /// ([`Self::handle_forward_introduce`]) and the CIRCUIT origin-receive path
+    /// (a return cell the originator opened — b5b).
+    fn process_introduce_ciphertext(&self, ciphertext: &[u8], peer: &[u8; 32]) -> DispatchResult {
         let Some(ref sk) = self.anonymity_x25519_sk else {
             // Not configured for anonymity — silent drop (anti-leak).
             self.logger.info(
@@ -474,7 +483,7 @@ impl FrameDispatcher {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let plaintext = match veil_anonymity::rendezvous::decrypt_introduce_checked(
-            &p.ciphertext,
+            ciphertext,
             sk,
             &self.introduce_replay_cache,
             now_unix,
@@ -497,7 +506,7 @@ impl FrameDispatcher {
                     "anonymity.relay_chain.forward.decrypt_failed",
                     format!(
                         "decrypt failed for forward from peer={}",
-                        veil_util::hex_short(node_id.as_bytes()),
+                        veil_util::hex_short(peer),
                     ),
                 );
                 return DispatchResult::NoResponse;
@@ -647,9 +656,6 @@ impl FrameDispatcher {
     fn handle_circuit_data(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
         use veil_anonymity::circuit_data::{Direction, open_layer, seal_layer};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
-        let Some(table) = &self.circuit_table else {
-            return DispatchResult::NoResponse;
-        };
         let cell = match CircuitDataPayload::decode(body) {
             Ok(c) => c,
             Err(_) => return DispatchResult::NoResponse,
@@ -657,88 +663,108 @@ impl FrameDispatcher {
         let link = *node_id.as_bytes();
         let now = circuit_now_unix();
 
-        // FORWARD cell: arrived from prev_link tagged circuit_id_in.
-        if let Some(state) = table.lookup_forward(&link, cell.circuit_id) {
-            // AEAD-verify (authenticate) BEFORE advancing the replay window, so a
-            // spoofed seq can't desync the window.
-            let inner = match open_layer(
-                &state.circuit_key,
-                Direction::Forward,
-                cell.seq,
-                &cell.ciphertext,
-            ) {
-                Ok(i) => i,
-                Err(_) => return DispatchResult::NoResponse,
-            };
-            if !state
-                .replay_fwd
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .accept(cell.seq)
-            {
-                return DispatchResult::NoResponse; // replay / too-old
-            }
-            state.touch(now);
-            match state.next_link {
-                Some(nl) => {
-                    let out = CircuitDataPayload {
-                        circuit_id: state.circuit_id_out,
-                        seq: cell.seq,
-                        ciphertext: inner,
-                    };
-                    if let Ok(b) = out.encode() {
-                        self.send_relay_chain_msg(
-                            &NodeId::from(nl),
-                            RelayChainMsg::CircuitData,
-                            &b,
+        // Relay paths — only if this node carries others' circuits (a receive-
+        // only service has no relay table but still ORIGINATES below).
+        if let Some(table) = &self.circuit_table {
+            // FORWARD cell: arrived from prev_link tagged circuit_id_in.
+            if let Some(state) = table.lookup_forward(&link, cell.circuit_id) {
+                // AEAD-verify (authenticate) BEFORE advancing the replay window, so a
+                // spoofed seq can't desync the window.
+                let inner = match open_layer(
+                    &state.circuit_key,
+                    Direction::Forward,
+                    cell.seq,
+                    &cell.ciphertext,
+                ) {
+                    Ok(i) => i,
+                    Err(_) => return DispatchResult::NoResponse,
+                };
+                if !state
+                    .replay_fwd
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .accept(cell.seq)
+                {
+                    return DispatchResult::NoResponse; // replay / too-old
+                }
+                state.touch(now);
+                match state.next_link {
+                    Some(nl) => {
+                        let out = CircuitDataPayload {
+                            circuit_id: state.circuit_id_out,
+                            seq: cell.seq,
+                            ciphertext: inner,
+                        };
+                        if let Ok(b) = out.encode() {
+                            self.send_relay_chain_msg(
+                                &NodeId::from(nl),
+                                RelayChainMsg::CircuitData,
+                                &b,
+                            );
+                        }
+                    }
+                    None => {
+                        // Terminus: `inner` is the delivered message (b4 consumes —
+                        // e.g. an introduce to forward to a registered cookie).
+                        self.logger.info(
+                            "anonymity.circuit.terminus_data",
+                            format!("circuit terminus rx {} B (b4 consumes)", inner.len()),
                         );
                     }
                 }
-                None => {
-                    // Terminus: `inner` is the delivered message (b4 consumes —
-                    // e.g. an introduce to forward to a registered cookie).
-                    self.logger.info(
-                        "anonymity.circuit.terminus_data",
-                        format!("circuit terminus rx {} B (b4 consumes)", inner.len()),
-                    );
-                }
-            }
-            return DispatchResult::NoResponse;
-        }
-
-        // RETURN cell: arrived from next_link tagged circuit_id_out. This relay
-        // adds its layer and passes toward the originator (prev_link). It cannot
-        // AEAD-verify (it is not the recipient), so the replay window is seq-only
-        // here; the originator does the final verify.
-        if let Some(state) = table.lookup_backward(&link, cell.circuit_id) {
-            if !state
-                .replay_ret
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .accept(cell.seq)
-            {
                 return DispatchResult::NoResponse;
             }
-            state.touch(now);
-            let outer = seal_layer(
-                &state.circuit_key,
-                Direction::Return,
-                cell.seq,
-                &cell.ciphertext,
-            );
-            let out = CircuitDataPayload {
-                circuit_id: state.circuit_id_in,
-                seq: cell.seq,
-                ciphertext: outer,
-            };
-            if let Ok(b) = out.encode() {
-                self.send_relay_chain_msg(
-                    &NodeId::from(state.prev_link),
-                    RelayChainMsg::CircuitData,
-                    &b,
+
+            // RETURN cell: arrived from next_link tagged circuit_id_out. This relay
+            // adds its layer and passes toward the originator (prev_link). It cannot
+            // AEAD-verify (it is not the recipient), so the replay window is seq-only
+            // here; the originator does the final verify.
+            if let Some(state) = table.lookup_backward(&link, cell.circuit_id) {
+                if !state
+                    .replay_ret
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .accept(cell.seq)
+                {
+                    return DispatchResult::NoResponse;
+                }
+                state.touch(now);
+                let outer = seal_layer(
+                    &state.circuit_key,
+                    Direction::Return,
+                    cell.seq,
+                    &cell.ciphertext,
                 );
+                let out = CircuitDataPayload {
+                    circuit_id: state.circuit_id_in,
+                    seq: cell.seq,
+                    ciphertext: outer,
+                };
+                if let Ok(b) = out.encode() {
+                    self.send_relay_chain_msg(
+                        &NodeId::from(state.prev_link),
+                        RelayChainMsg::CircuitData,
+                        &b,
+                    );
+                }
+                return DispatchResult::NoResponse;
             }
-            return DispatchResult::NoResponse;
+        } // end relay-table paths
+
+        // ORIGIN cell: this node BUILT the circuit (it is the receiver). The
+        // return cell arrives from the first hop tagged our origin circuit_id;
+        // open ALL accreted layers to recover the introduce R forwarded down the
+        // circuit, then decrypt + deliver it (the same path as a session-
+        // forwarded introduce). R never learned our location.
+        if let Some(origin) = self
+            .circuit_origin
+            .as_ref()
+            .and_then(|t| t.lookup(&link, cell.circuit_id))
+        {
+            return match origin.open_return(cell.seq, &cell.ciphertext) {
+                Ok(introduce_ct) => self.process_introduce_ciphertext(&introduce_ct, &link),
+                Err(_) => DispatchResult::NoResponse, // a layer failed AEAD — drop
+            };
         }
 
         // Unknown circuit — anti-leak silent drop.
@@ -1411,6 +1437,88 @@ mod tests {
                 .is_some(),
             "terminus registration bound the cookie to its return circuit"
         );
+    }
+
+    /// Origin-receive: a return CircuitData that matches a circuit THIS node
+    /// built is opened across all layers, decrypted, and delivered to the bound
+    /// app — the full receiver side of an onion-registered service.
+    #[tokio::test]
+    async fn circuit_origin_return_opens_decrypts_and_delivers() {
+        use veil_anonymity::circuit_data::{Direction, seal_layer};
+        use veil_anonymity::circuit_origin::{OriginCircuit, OriginCircuitTable};
+        use veil_anonymity::circuit_wire::CircuitDataPayload;
+        use veil_anonymity::rendezvous::{encrypt_introduce, final_hop_kind};
+        use veil_proto::AppDeliverPayload;
+
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let local_sk = StaticSecret::random_from_rng(OsRng);
+        let local_pk = PublicKey::from(&local_sk).to_bytes();
+        d.anonymity_x25519_sk = Some(std::sync::Arc::new(local_sk));
+        d.circuit_origin = Some(std::sync::Arc::new(OriginCircuitTable::new()));
+
+        // Bind the receiving endpoint.
+        let app_id = [0xAB; 32];
+        let endpoint_id = 7u32;
+        let (_h, mut rx) = d.app_registry.register(app_id, endpoint_id, 16);
+
+        // 1-hop origin circuit: terminus R is the first (and only) hop. We craft
+        // the return cell R would produce, so a placeholder R id + key suffice.
+        let r_id = [0x9C; 32];
+        let r_key = [0x33u8; 32];
+        let origin_cid = 555u32;
+        d.circuit_origin
+            .as_ref()
+            .unwrap()
+            .insert(std::sync::Arc::new(OriginCircuit {
+                circuit_keys: vec![r_key],
+                first_hop: r_id,
+                origin_circuit_id: origin_cid,
+                created_unix: 0,
+            }));
+
+        // The sealed introduce the sender produced (sealed to OUR anonymity key).
+        let payload = b"anon-service-hello".to_vec();
+        let deliver = AppDeliverPayload {
+            src_node_id: [0u8; 32],
+            src_app_id: [0xCD; 32],
+            app_id,
+            endpoint_id,
+            data: veil_bufpool::pooled_shared_from_vec(payload.clone()),
+            reply_id: 0,
+        };
+        let mut introduce_plain = vec![final_hop_kind::APP_DELIVER];
+        introduce_plain.extend_from_slice(&deliver.encode());
+        let introduce_ct = encrypt_introduce(&introduce_plain, &local_pk).unwrap();
+
+        // R seals it as the first return layer and sends a CircuitData to us.
+        let seq = 1u32;
+        let cell = CircuitDataPayload {
+            circuit_id: origin_cid,
+            seq,
+            ciphertext: seal_layer(&r_key, Direction::Return, seq, &introduce_ct),
+        };
+        let body = cell.encode().unwrap();
+        let mut hdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitData as u16,
+        );
+        hdr.body_len = body.len() as u32;
+        d.dispatch_relay_chain(&hdr, &body, NodeId::from(r_id));
+
+        // The introduce was opened across the circuit, decrypted, and delivered.
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("origin-receive did not deliver in 500ms")
+            .expect("channel closed");
+        match msg {
+            veil_app::registry::AppMessage::Deliver {
+                src_node_id, data, ..
+            } => {
+                assert_eq!(src_node_id, [0u8; 32], "anonymity: src_node_id zeros");
+                assert_eq!(data.as_ref(), payload.as_slice());
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
     }
 
     /// A non-circuit-capable node (no SK / table) silently drops CircuitBuild.

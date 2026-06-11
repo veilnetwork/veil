@@ -1828,6 +1828,11 @@ impl NodeRuntime {
             circuit_rendezvous: config.anonymity.relay_capable.then(|| {
                 Arc::new(veil_anonymity::circuit_register::CircuitRendezvousRegistry::new())
             }),
+            // Origin-side: any receive-capable node (owns the anonymity key) may
+            // ORIGINATE circuits to host a location-anonymous service.
+            circuit_origin: anonymity_x25519_sk_for_dispatcher
+                .is_some()
+                .then(|| Arc::new(veil_anonymity::circuit_origin::OriginCircuitTable::new())),
         });
         // cleanup: pre-build the hot-standby controller and
         // its prerequisite Arcs (handoff_ack_waiters, swap_registry)
