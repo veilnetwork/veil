@@ -87,6 +87,8 @@ pub enum SenderError {
     InsufficientRelayCandidates { need: usize, have: usize },
     #[error("packet: {0}")]
     Packet(PacketError),
+    #[error("authenticated anonymous send requires a loaded sovereign identity")]
+    MissingSenderIdentity,
 }
 
 impl From<PacketError> for SenderError {
