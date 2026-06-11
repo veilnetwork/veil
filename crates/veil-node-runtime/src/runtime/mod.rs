@@ -3333,7 +3333,7 @@ impl NodeRuntime {
         data: &[u8],
         hop_count: usize,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
-        use veil_anonymity::rendezvous::{IntroducePayload, encrypt_introduce, final_hop_kind};
+        use veil_anonymity::rendezvous::final_hop_kind;
 
         // Step 1: build inner AppDeliverPayload (the bytes the
         // receiver's app eventually consumes). src_node_id zero —
@@ -3354,6 +3354,125 @@ impl NodeRuntime {
         sealed_plaintext.push(final_hop_kind::APP_DELIVER);
         sealed_plaintext.extend_from_slice(&app_deliver_bytes);
 
+        self.send_sealed_introduce(ad, &sealed_plaintext, hop_count)
+    }
+
+    /// Authenticated rendezvous send (Epic 482 v1, "any recipient"): like
+    /// [`send_via_rendezvous`] but the sealed payload is a per-message Ed25519/
+    /// Falcon-signed [`veil_proto::AuthAppDeliver`], so the recipient
+    /// cryptographically verifies WHO sent it. A signed message rarely fits one
+    /// onion cell, so it is sign-whole-then-fragmented across multiple
+    /// introduces (`AuthDeliverFragment`); the recipient reassembles + verifies
+    /// once. Requires a loaded sovereign identity. One-way (sender → recipient).
+    pub fn send_via_rendezvous_authenticated(
+        &self,
+        ad: &veil_anonymity::rendezvous::RendezvousAd,
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        data: &[u8],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        use rand_core::RngCore;
+        use veil_anonymity::rendezvous::final_hop_kind;
+
+        let sovereign = self
+            .identity
+            .sovereign_identity
+            .as_ref()
+            .ok_or(veil_anonymity::sender::SenderError::MissingSenderIdentity)?;
+
+        // Build + sign the whole message. dst = the ad's receiver_node_id (bound
+        // by the signature; the verifier reconstructs it as its own node_id).
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let nonce = rand_core::OsRng.next_u64();
+        let auth = sovereign.sign_auth_deliver(
+            ad.receiver_node_id,
+            target_app_id,
+            target_endpoint_id,
+            now_unix,
+            nonce,
+            data.to_vec(),
+        );
+        let auth_bytes = auth.encode();
+        if auth_bytes.len() > veil_proto::MAX_AUTH_DELIVER_MSG_BYTES {
+            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
+                hop_count,
+                got: data.len(),
+                max: veil_proto::MAX_AUTH_DELIVER_MSG_BYTES,
+            });
+        }
+
+        // Largest signed-blob chunk that fits one fragment at this hop_count:
+        //   Final-hop budget − [1 onion tag] − IntroducePayload fixed − introduce
+        //   overhead − [1 inner tag] − fragment header.
+        let final_budget = veil_anonymity::packet::max_payload_for_hops(hop_count).ok_or(
+            veil_anonymity::sender::SenderError::HopCountExceedsCellBudget {
+                hop_count,
+                max: veil_anonymity::packet::MAX_HOPS_PER_CELL,
+            },
+        )?;
+        let ciphertext_budget = final_budget
+            .min(
+                veil_anonymity::rendezvous::MAX_INTRODUCE_CIPHERTEXT
+                    + 1
+                    + veil_anonymity::rendezvous::IntroducePayload::FIXED_SIZE,
+            )
+            .saturating_sub(1 + veil_anonymity::rendezvous::IntroducePayload::FIXED_SIZE);
+        let chunk_size = ciphertext_budget
+            .saturating_sub(veil_anonymity::rendezvous::INTRODUCE_OVERHEAD)
+            .saturating_sub(1 + veil_proto::AuthDeliverFragment::HEADER_SIZE);
+        if chunk_size == 0 {
+            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
+                hop_count,
+                got: data.len(),
+                max: 0,
+            });
+        }
+        let frag_count = auth_bytes.len().div_ceil(chunk_size).max(1);
+        if frag_count > veil_proto::MAX_AUTH_DELIVER_FRAGMENTS as usize {
+            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
+                hop_count,
+                got: data.len(),
+                max: chunk_size * veil_proto::MAX_AUTH_DELIVER_FRAGMENTS as usize,
+            });
+        }
+        let mut msg_id = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut msg_id);
+
+        // Each fragment: [APP_DELIVER_AUTH tag][AuthDeliverFragment] → sealed +
+        // onion-routed to the rendezvous independently.
+        for (idx, chunk) in auth_bytes.chunks(chunk_size).enumerate() {
+            let frag = veil_proto::AuthDeliverFragment {
+                msg_id,
+                frag_count: frag_count as u16,
+                frag_idx: idx as u16,
+                chunk: chunk.to_vec(),
+            };
+            let frag_bytes = frag.encode();
+            let mut sealed_plaintext = Vec::with_capacity(1 + frag_bytes.len());
+            sealed_plaintext.push(final_hop_kind::APP_DELIVER_AUTH);
+            sealed_plaintext.extend_from_slice(&frag_bytes);
+            self.send_sealed_introduce(ad, &sealed_plaintext, hop_count)?;
+        }
+        Ok(())
+    }
+
+    /// Seal `sealed_plaintext` (which already carries its `final_hop_kind` tag)
+    /// to the ad's recipient, wrap it as an `IntroducePayload`, and onion-route
+    /// it to the rendezvous relay as the Final hop. Shared by the plain
+    /// ([`send_via_rendezvous`]) and authenticated
+    /// ([`send_via_rendezvous_authenticated`]) rendezvous paths.
+    fn send_sealed_introduce(
+        &self,
+        ad: &veil_anonymity::rendezvous::RendezvousAd,
+        sealed_plaintext: &[u8],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        use veil_anonymity::rendezvous::{IntroducePayload, encrypt_introduce, final_hop_kind};
+
         // Step 2: seal to receiver_x25519_pk. Rendezvous cannot read
         // this — only the receiver after their `decrypt_introduce`.
         // encrypt_introduce only fails on AEAD library error (vanishingly
@@ -3361,10 +3480,10 @@ impl NodeRuntime {
         // reporting (caller's recourse is the same: shrink payload or
         // retry).
         let ciphertext =
-            encrypt_introduce(&sealed_plaintext, &ad.receiver_x25519_pk).map_err(|_| {
+            encrypt_introduce(sealed_plaintext, &ad.receiver_x25519_pk).map_err(|_| {
                 veil_anonymity::sender::SenderError::PayloadTooLarge {
                     hop_count,
-                    got: data.len(),
+                    got: sealed_plaintext.len(),
                     max: 0,
                 }
             })?;
@@ -3380,7 +3499,7 @@ impl NodeRuntime {
                 .encode()
                 .map_err(|_| veil_anonymity::sender::SenderError::PayloadTooLarge {
                     hop_count,
-                    got: data.len(),
+                    got: sealed_plaintext.len(),
                     max: 0,
                 })?;
 
