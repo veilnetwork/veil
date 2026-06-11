@@ -85,6 +85,14 @@ pub enum RuntimeService {
     /// receive `APP_DELIVER_AUTH` cells (the channel simply stays idle).
     AuthDeliverHandler,
 
+    /// Rendezvous-recipient lifecycle (Epic 482 v1, `receive_anonymous`).
+    /// Picks a reachable published rendezvous relay, registers with it, and
+    /// registers a publisher entry (the maintenance tick then publishes the
+    /// signed RendezvousAd). Re-registers on relay-session loss / failover and
+    /// periodically (the relay's registration is in-memory). No-op unless
+    /// `[anonymity].receive_anonymous`.
+    RendezvousRecipient,
+
     // ── P-Net (private veil network) ──────────────────────────────────
     /// Periodic poll of the local DHT store for PBAN-prefixed records,
     /// verifying and applying them to the local `BanList`. Spawned only
@@ -156,6 +164,7 @@ impl RuntimeService {
         Self::BootstrapWatchdog,
         Self::SovereignIdentityRepublish,
         Self::AuthDeliverHandler,
+        Self::RendezvousRecipient,
         Self::PNetBanSync,
         Self::UpdateCheck,
         // Proxy / IPC / discovery.
