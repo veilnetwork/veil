@@ -89,6 +89,10 @@ pub enum SenderError {
     Packet(PacketError),
     #[error("authenticated anonymous send requires a loaded sovereign identity")]
     MissingSenderIdentity,
+    #[error(
+        "reply requested but this node has no anonymity key — set [anonymity].receive_anonymous to be reply-capable"
+    )]
+    MissingReplyCapability,
 }
 
 impl From<PacketError> for SenderError {
