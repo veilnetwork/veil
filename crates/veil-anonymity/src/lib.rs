@@ -39,6 +39,7 @@ pub mod circuit;
 pub mod circuit_builder;
 pub mod circuit_data;
 pub mod circuit_setup;
+pub mod circuit_table;
 pub mod circuit_wire;
 pub mod directory;
 pub mod onion;
