@@ -1076,11 +1076,17 @@ pub fn rendezvous_ad_needs_refresh(
 /// Wire-breaking change vs — the network is not yet live.
 pub mod final_hop_kind {
     /// Body is a `crate::proto::AppDeliverPayload` — Final-hop is
-    /// the destination and delivers locally via app_registry.
+    /// the destination and delivers locally via app_registry. The
+    /// `src_node_id` is anonymous-to-recipient (zeroed / unauthenticated).
     pub const APP_DELIVER: u8 = 0x01;
     /// Body is a [`super::IntroducePayload`] — Final-hop is a
     /// rendezvous and forwards to the registered subscriber.
     pub const INTRODUCE: u8 = 0x02;
+    /// Body is a `veil_proto::AuthAppDeliver` — Final-hop is the destination and
+    /// delivers locally AFTER cryptographically verifying the sender's identity
+    /// (authenticated onion delivery v1). Unlike [`APP_DELIVER`], the recipient
+    /// learns + verifies WHO sent the message.
+    pub const APP_DELIVER_AUTH: u8 = 0x03;
 }
 
 /// Cap on `IntroducePayload.ciphertext` length. Sized to match the
