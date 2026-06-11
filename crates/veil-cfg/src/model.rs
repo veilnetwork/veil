@@ -656,11 +656,35 @@ pub struct AnonymityConfig {
     /// Only meaningful when `relay_capable = true`.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub advertised_bps: u32,
+    /// When `true`, the node opts in to RECEIVING authenticated anonymous
+    /// messages via rendezvous: it generates/persists its anonymity X25519 key
+    /// (to unseal forwarded introduces) and runs the rendezvous-recipient
+    /// lifecycle (register with a relay + publish a signed RendezvousAd). This
+    /// is INDEPENDENT of `relay_capable` — a `receive_anonymous` node does NOT
+    /// carry other peers' circuits (the dispatcher's Forward arm stays gated on
+    /// `relay_capable`). Default `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub receive_anonymous: bool,
+    /// Onion circuit length for authenticated anonymous sends (total hops incl.
+    /// the rendezvous Final hop). `None` (default) uses the built-in default
+    /// (2). Larger = more anonymity, smaller per-fragment payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_hop_count: Option<u8>,
+    /// Optional operator-pinned rendezvous relays (node-id hex). When non-empty,
+    /// the rendezvous-recipient lifecycle picks from this list instead of
+    /// auto-selecting a published `relay_capable` peer. Empty (default) =
+    /// auto-pick + failover.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendezvous_relays: Vec<String>,
 }
 
 impl AnonymityConfig {
     pub fn is_default(c: &Self) -> bool {
-        !c.relay_capable && c.advertised_bps == 0
+        !c.relay_capable
+            && c.advertised_bps == 0
+            && !c.receive_anonymous
+            && c.default_hop_count.is_none()
+            && c.rendezvous_relays.is_empty()
     }
 }
 

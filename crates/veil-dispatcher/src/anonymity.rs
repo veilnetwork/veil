@@ -146,8 +146,16 @@ impl FrameDispatcher {
                 next_hop,
                 outbound_cell,
             }) => {
-                // Forward to next_hop's session, if we have one.
-                self.forward_anonymous_cell(&next_hop, &outbound_cell);
+                // Forward to next_hop's session, if we have one — but ONLY if
+                // this node opted in to carrying others' circuits. A
+                // `receive_anonymous`-only node owns the SK (to unseal its own
+                // forwarded introduces + accept Final cells) yet must never
+                // relay for strangers; it silently drops Forward cells (same
+                // anti-leak policy — surfacing "I won't relay" would reveal the
+                // node's capability to a probe).
+                if self.anonymity_relay_capable {
+                    self.forward_anonymous_cell(&next_hop, &outbound_cell);
+                }
                 DispatchResult::NoResponse
             }
             Ok(CellPeelResult::Final { payload }) => {
@@ -1059,6 +1067,43 @@ mod tests {
         assert!(matches!(result, DispatchResult::NoResponse));
         // Registry still has the entry (forwarding doesn't unregister).
         assert_eq!(registry.len(), 1);
+    }
+
+    /// MUST-FIX-1: a `receive_anonymous`-only node owns an anonymity SK (to
+    /// unseal its own forwarded introduces) but `anonymity_relay_capable =
+    /// false`, so it must NOT forward OTHERS' onion cells. The Forward arm is
+    /// gated on the relay flag, not SK presence. With the flag set it forwards.
+    #[test]
+    fn forward_arm_gated_on_relay_capable() {
+        use veil_session::tx_registry::SessionTxRegistry;
+        let (me_sk, me_hop) = fresh_hop(0xAA);
+        let (_next_sk, next_hop) = fresh_hop(0xBB);
+        let next_node_id = next_hop.node_id;
+        // 2-hop cell: this node (hop0) forwards to next_hop (hop1).
+        let cell = build_anonymous_cell(b"inner onion payload", &[me_hop, next_hop]).unwrap();
+        let me_sk_bytes = me_sk.to_bytes();
+
+        let run = |relay_capable: bool| -> bool {
+            let mut dispatcher = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+            dispatcher.anonymity_x25519_sk = Some(Arc::new(StaticSecret::from(me_sk_bytes)));
+            dispatcher.anonymity_relay_capable = relay_capable;
+            let mut reg = SessionTxRegistry::new();
+            let mut rx = reg.register(NodeId::from(next_node_id));
+            dispatcher.session_tx_registry = Some(Arc::new(std::sync::RwLock::new(reg)));
+
+            let mut hdr =
+                FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
+            hdr.body_len = CELL_SIZE as u32;
+            let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0xEE; 32]));
+            assert!(matches!(result, DispatchResult::NoResponse));
+            rx.try_recv().is_ok()
+        };
+
+        assert!(run(true), "relay_capable node must forward the cell");
+        assert!(
+            !run(false),
+            "receive-only node must NOT forward others' circuits",
+        );
     }
 
     /// Final-hop with valid AppDeliverPayload but no bound app endpoint

@@ -1163,6 +1163,13 @@ pub struct FrameDispatcher {
     /// rather than peeling. See `node/dispatcher/anonymity.rs`.
     pub anonymity_x25519_sk: Option<Arc<x25519_dalek::StaticSecret>>,
 
+    /// Whether this node carries OTHER peers' onion circuits
+    /// (`[anonymity].relay_capable`). A `receive_anonymous`-only node owns an
+    /// `anonymity_x25519_sk` (to unseal its own forwarded introduces + accept
+    /// `Final` cells addressed to it) but must NOT forward `Forward` cells — so
+    /// the onion Forward arm is gated on THIS flag, not on SK presence.
+    pub anonymity_relay_capable: bool,
+
     /// per-node replay-protection cache for
     /// Introduce frames. Each fingerprint is `BLAKE3(eph_pk \|\| nonce)`;
     /// repeated ciphertexts (whether from a captured-and-replayed
@@ -1765,6 +1772,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         pex_dispatcher: None,
         pex_state: None,
         anonymity_x25519_sk: None,
+        anonymity_relay_capable: false,
         introduce_replay_cache: Arc::new(veil_anonymity::rendezvous::IntroduceReplayCache::new()),
         rendezvous_registry: None,
     }
@@ -2456,6 +2464,7 @@ mod tests {
             pex_dispatcher: None,
             pex_state: None,
             anonymity_x25519_sk: None,
+            anonymity_relay_capable: false,
             introduce_replay_cache: Arc::new(
                 veil_anonymity::rendezvous::IntroduceReplayCache::new(),
             ),

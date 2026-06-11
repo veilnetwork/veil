@@ -909,6 +909,7 @@ impl NodeRuntime {
             // pubkey) keep working through the reload. An operator who
             // wants a fresh SK should do a full restart, not a reload.
             anonymity_x25519_sk: self.dispatcher.anonymity_x25519_sk.clone(),
+            anonymity_relay_capable: self.dispatcher.anonymity_relay_capable,
             // reload preserves the Introduce
             // replay cache so reload doesn't open a window in which
             // captured ciphertexts could be re-submitted between the
