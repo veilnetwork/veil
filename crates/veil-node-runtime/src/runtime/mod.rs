@@ -3011,16 +3011,6 @@ impl NodeRuntime {
         data: &[u8],
         hop_count: usize,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
-        use veil_anonymity::{
-            directory::{
-                DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
-            },
-            sender::{
-                DiversityOutcome,
-                build_outbound_anonymous_cell_with_diversity_reported_and_reputation,
-            },
-        };
-
         // Wrap data in `AppDeliverPayload` so the receiver's
         // Final-hop dispatcher can route to the addressed endpoint.
         // src_node_id stays zero — anonymity guarantees the receiver
@@ -3040,7 +3030,92 @@ impl NodeRuntime {
         let mut payload_bytes = Vec::with_capacity(1 + deliver_bytes.len());
         payload_bytes.push(veil_anonymity::rendezvous::final_hop_kind::APP_DELIVER);
         payload_bytes.extend_from_slice(&deliver_bytes);
-        let payload: &[u8] = &payload_bytes;
+
+        self.send_anonymous_onion(&payload_bytes, target_node_id, target_x25519_pk, hop_count)
+    }
+
+    /// Authenticated anonymous send (Epic 482 authenticated-onion v1).
+    ///
+    /// Like [`send_anonymous`], the source-routed onion hides the sender's
+    /// network LOCATION from every relay on the path. UNLIKE it, the
+    /// final-hop payload is an [`veil_proto::AuthAppDeliver`] carrying the
+    /// sender's sovereign `node_id` plus a per-message identity-subkey
+    /// signature (Ed25519 / Falcon-512), so the recipient can
+    /// cryptographically verify WHO sent the message. The domain-separated
+    /// signature binds `dst_node_id` (no re-targeting), `timestamp`
+    /// (freshness) and a random `nonce` (replay) — see
+    /// `veil_identity::auth_deliver::verify_auth_deliver`.
+    ///
+    /// One-way (sender → recipient); replies require the separate
+    /// rendezvous flow. Requires a loaded sovereign identity, otherwise
+    /// returns [`veil_anonymity::sender::SenderError::MissingSenderIdentity`].
+    pub fn send_anonymous_authenticated(
+        &self,
+        target_node_id: [u8; 32],
+        target_x25519_pk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        data: &[u8],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        use rand_core::RngCore;
+
+        let sovereign = self
+            .identity
+            .sovereign_identity
+            .as_ref()
+            .ok_or(veil_anonymity::sender::SenderError::MissingSenderIdentity)?;
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Random per-message nonce — the recipient's replay cache keys on
+        // (sender_node_id, nonce), so a fresh nonce each send is what makes
+        // an intercepted-and-replayed cell detectable.
+        let nonce = rand_core::OsRng.next_u64();
+
+        let auth = sovereign.sign_auth_deliver(
+            target_node_id,
+            target_app_id,
+            target_endpoint_id,
+            now_unix,
+            nonce,
+            data.to_vec(),
+        );
+        let auth_bytes = auth.encode();
+        // Final-hop tag byte: kind = APP_DELIVER_AUTH tells the receiver
+        // dispatcher to decode an `AuthAppDeliver` (not a plain
+        // `AppDeliverPayload`) and run sender verification before delivery.
+        let mut payload_bytes = Vec::with_capacity(1 + auth_bytes.len());
+        payload_bytes.push(veil_anonymity::rendezvous::final_hop_kind::APP_DELIVER_AUTH);
+        payload_bytes.extend_from_slice(&auth_bytes);
+
+        self.send_anonymous_onion(&payload_bytes, target_node_id, target_x25519_pk, hop_count)
+    }
+
+    /// Common onion-send path shared by [`send_anonymous`] (un-authenticated)
+    /// and [`send_anonymous_authenticated`]. `payload` is the already-assembled
+    /// final-hop blob: a `final_hop_kind` tag byte followed by the
+    /// kind-specific body. This helper owns candidate selection, relay
+    /// discovery/verify, AS-diversity + reputation-weighted circuit picking,
+    /// the onion wrap, and the fire-and-forget first-hop send.
+    fn send_anonymous_onion(
+        &self,
+        payload: &[u8],
+        target_node_id: [u8; 32],
+        target_x25519_pk: [u8; 32],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        use veil_anonymity::{
+            directory::{
+                DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
+            },
+            sender::{
+                DiversityOutcome,
+                build_outbound_anonymous_cell_with_diversity_reported_and_reputation,
+            },
+        };
 
         // W0 measurement (anonymity-preserving plan): time the SELECTION phase
         // (candidate snapshot + relay discovery/verify + diversity map) vs the
