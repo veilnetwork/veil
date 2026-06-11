@@ -940,6 +940,7 @@ mod tests {
             x25519_pk: [0x3C; 32],
             reply_app_id: [0x4D; 32],
             reply_endpoint_id: 5,
+            receiver_node_id: [0x5E; 32],
         };
 
         let p = sov.sign_auth_deliver(
