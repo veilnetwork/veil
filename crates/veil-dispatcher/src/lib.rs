@@ -1206,6 +1206,14 @@ pub struct FrameDispatcher {
     /// the service's location. See `circuit_register`.
     pub circuit_rendezvous:
         Option<Arc<veil_anonymity::circuit_register::CircuitRendezvousRegistry>>,
+
+    /// Circuits THIS node ORIGINATED (as a location-anonymous receiver), keyed
+    /// by `(first_hop, origin_circuit_id)`. `None` when the node is not
+    /// receive-capable (no `anonymity_x25519_sk`). A return `CircuitData` that
+    /// matches here (not the relay `circuit_table`) is opened across all its
+    /// layers — recovering the introduce R forwarded down the circuit — then
+    /// decrypted + delivered. See `circuit_origin`.
+    pub circuit_origin: Option<Arc<veil_anonymity::circuit_origin::OriginCircuitTable>>,
 }
 
 /// Constant-time pad applied to banned-peer drops in `dispatch()`.
@@ -1794,6 +1802,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         rendezvous_registry: None,
         circuit_table: None,
         circuit_rendezvous: None,
+        circuit_origin: None,
     }
 }
 
@@ -2490,6 +2499,7 @@ mod tests {
             rendezvous_registry: None,
             circuit_table: None,
             circuit_rendezvous: None,
+            circuit_origin: None,
         }
     }
 
