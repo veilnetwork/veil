@@ -3038,6 +3038,7 @@ impl NodeRuntime {
             app_id: target_app_id,
             endpoint_id: target_endpoint_id,
             data: veil_bufpool::pooled_shared_from_vec(data.to_vec()),
+            reply_id: 0,
         };
         let deliver_bytes = deliver_payload.encode();
         // Final-hop tag byte: kind = APP_DELIVER
@@ -3359,6 +3360,7 @@ impl NodeRuntime {
             app_id: target_app_id,
             endpoint_id: target_endpoint_id,
             data: veil_bufpool::pooled_shared_from_vec(data.to_vec()),
+            reply_id: 0,
         };
         // Tag the sealed plaintext so the receiver can distinguish a plain
         // delivery from an authenticated one (`send_via_rendezvous_authenticated`

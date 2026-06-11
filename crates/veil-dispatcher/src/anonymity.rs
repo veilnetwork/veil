@@ -750,6 +750,7 @@ mod tests {
             app_id,
             endpoint_id,
             data: veil_bufpool::pooled_shared_from_vec(inner_data.clone()),
+            reply_id: 0,
         };
         // Final-hop payload now starts with a kind tag.
         let mut onion_payload = vec![final_hop_kind::APP_DELIVER];
@@ -1126,6 +1127,7 @@ mod tests {
             app_id: [0xAB; 32],
             endpoint_id: 7,
             data: veil_bufpool::pooled_shared_from_vec(b"never-arrives".to_vec()),
+            reply_id: 0,
         };
         let mut onion_payload = vec![final_hop_kind::APP_DELIVER];
         onion_payload.extend_from_slice(&deliver.encode());
