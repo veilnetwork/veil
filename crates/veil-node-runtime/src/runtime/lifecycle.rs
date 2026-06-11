@@ -923,6 +923,7 @@ impl NodeRuntime {
             // a config reload without a rebuild round-trip.
             circuit_table: self.dispatcher.circuit_table.clone(),
             circuit_rendezvous: self.dispatcher.circuit_rendezvous.clone(),
+            circuit_origin: self.dispatcher.circuit_origin.clone(),
         }
     }
 
