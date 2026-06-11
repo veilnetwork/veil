@@ -922,6 +922,7 @@ impl NodeRuntime {
             // reload preserves live circuit state so in-flight circuits survive
             // a config reload without a rebuild round-trip.
             circuit_table: self.dispatcher.circuit_table.clone(),
+            circuit_rendezvous: self.dispatcher.circuit_rendezvous.clone(),
         }
     }
 
