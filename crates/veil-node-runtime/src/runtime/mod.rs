@@ -1531,8 +1531,15 @@ impl NodeRuntime {
         // the key was `random_from_rng` on every startup, silently
         // invalidating every sealed envelope already registered with
         // this relay's rendezvous publisher.
+        // Generated when the node either RELAYS others' circuits
+        // (`relay_capable`) or RECEIVES authenticated anonymous messages
+        // (`receive_anonymous`) — both need the key (relaying peels cells;
+        // receiving unseals forwarded introduces). The two roles are gated
+        // separately downstream: the dispatcher's onion Forward arm + the
+        // rendezvous registry stay on `relay_capable`, so a receive-only node
+        // never carries others' circuits.
         let anonymity_x25519_sk_for_dispatcher: Option<Arc<x25519_dalek::StaticSecret>> =
-            if config.anonymity.relay_capable {
+            if config.anonymity.relay_capable || config.anonymity.receive_anonymous {
                 let sk = crate::identity_local::anonymity_x25519::load_or_create(&veil_dir_path)?;
                 Some(Arc::new(sk))
             } else {
@@ -1791,6 +1798,7 @@ impl NodeRuntime {
             ),
             pex_state: Some(Arc::clone(&shared_pex_state)),
             anonymity_x25519_sk: anonymity_x25519_sk_for_dispatcher.clone(),
+            anonymity_relay_capable: config.anonymity.relay_capable,
             // per-node Introduce-frame replay
             // cache. Cheap struct (Mutex<HashMap>); always allocated
             // even on non-anonymity nodes since the cost is one
@@ -1803,9 +1811,15 @@ impl NodeRuntime {
             // are opt-in [anonymity].relay_capable; operators
             // wanting separation will get a dedicated knob if the
             // memory cost justifies it (default cap is 800 KiB).
-            rendezvous_registry: anonymity_x25519_sk_for_dispatcher
-                .as_ref()
-                .map(|_| Arc::new(veil_anonymity::rendezvous::RendezvousRegistry::default())),
+            // The rendezvous-relay SERVER role (accept RegisterRendezvous +
+            // forward introduces for others) is gated on `relay_capable`, NOT on
+            // SK presence — a `receive_anonymous`-only node owns the SK (to
+            // unseal its OWN forwarded introduces) but must NOT serve as a
+            // rendezvous relay for strangers.
+            rendezvous_registry: config
+                .anonymity
+                .relay_capable
+                .then(|| Arc::new(veil_anonymity::rendezvous::RendezvousRegistry::default())),
         });
         // cleanup: pre-build the hot-standby controller and
         // its prerequisite Arcs (handoff_ack_waiters, swap_registry)
