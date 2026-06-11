@@ -1189,6 +1189,14 @@ pub struct FrameDispatcher {
     /// established OVL1 session, and the rendezvous forwards inbound
     /// `IntroducePayload` frames to the matching subscriber.
     pub rendezvous_registry: Option<Arc<veil_anonymity::rendezvous::RendezvousRegistry>>,
+
+    // ── Stateful return circuits (onion-registration epic) ─────────────
+    /// Per-hop circuit state for nodes that relay stateful circuits. `None`
+    /// when not `relay_capable` (same gate as `rendezvous_registry`). Installed
+    /// by `RelayChainMsg::CircuitBuild`; consulted to re-tag + forward
+    /// `CircuitData` / `CircuitTeardown` cells in both directions. See
+    /// `docs/internal/PLAN_ANON_SERVICE_ONION_REGISTRATION.md`.
+    pub circuit_table: Option<Arc<veil_anonymity::circuit_table::CircuitTable>>,
 }
 
 /// Constant-time pad applied to banned-peer drops in `dispatch()`.
@@ -1775,6 +1783,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         anonymity_relay_capable: false,
         introduce_replay_cache: Arc::new(veil_anonymity::rendezvous::IntroduceReplayCache::new()),
         rendezvous_registry: None,
+        circuit_table: None,
     }
 }
 
@@ -2469,6 +2478,7 @@ mod tests {
                 veil_anonymity::rendezvous::IntroduceReplayCache::new(),
             ),
             rendezvous_registry: None,
+            circuit_table: None,
         }
     }
 

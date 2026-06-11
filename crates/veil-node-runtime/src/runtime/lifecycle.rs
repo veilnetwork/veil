@@ -919,6 +919,9 @@ impl NodeRuntime {
             // registry so currently-registered cookies survive without
             // forcing a re-registration round-trip from every receiver.
             rendezvous_registry: self.dispatcher.rendezvous_registry.clone(),
+            // reload preserves live circuit state so in-flight circuits survive
+            // a config reload without a rebuild round-trip.
+            circuit_table: self.dispatcher.circuit_table.clone(),
         }
     }
 

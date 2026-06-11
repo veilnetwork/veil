@@ -67,6 +67,14 @@ use veil_proto::{
     header::FrameHeader,
 };
 
+/// Unix seconds for circuit install/touch/GC timestamps (best-effort clock).
+fn circuit_now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 impl FrameDispatcher {
     /// Handle one inbound `FrameFamily::RelayChain` frame. See
     /// module docs for the per-frame flow.
@@ -102,19 +110,12 @@ impl FrameDispatcher {
                 return self.handle_unregister_rendezvous(body, node_id);
             }
             RelayChainMsg::ForwardIntroduce => return self.handle_forward_introduce(body, node_id),
-            // Stateful return circuits (onion-registration epic, 482.7 return
-            // path). b1 reserves the wire tags but installs no circuit state —
-            // drop gracefully (anti-leak: no Violation, which would confirm
-            // relay-capability to a prober). b2/b3 wire the real handlers.
-            RelayChainMsg::CircuitBuild
-            | RelayChainMsg::CircuitData
-            | RelayChainMsg::CircuitTeardown => {
-                self.logger.info(
-                    "anonymity.relay_chain.circuit.not_implemented",
-                    "circuit msg received but stateful circuits are not wired yet (b1); dropped",
-                );
-                return DispatchResult::NoResponse;
-            }
+            // Stateful return circuits (onion-registration epic). Control frames
+            // over an established session (NOT fixed CELL_SIZE), so return before
+            // the Hop cell-size check below.
+            RelayChainMsg::CircuitBuild => return self.handle_circuit_build(body, node_id),
+            RelayChainMsg::CircuitData => return self.handle_circuit_data(body, node_id),
+            RelayChainMsg::CircuitTeardown => return self.handle_circuit_teardown(body, node_id),
         }
 
         if body.len() != CELL_SIZE {
@@ -558,6 +559,218 @@ impl FrameDispatcher {
                 format!("rendezvous plaintext kind=0x{other:02x} not recognised; dropped"),
             ),
         }
+        DispatchResult::NoResponse
+    }
+
+    // ── Stateful return circuits (onion-registration epic) ─────────────
+    //
+    // NOTE: circuit data cells are currently variable-size (each hop's AEAD tag
+    // grows/shrinks the layered ciphertext), which leaks hop position to a
+    // passive observer. Fixed-size cell padding (482.7 §4 — the cell layer
+    // provides the fixed envelope) is a follow-up; tracked as a b6 refinement.
+
+    /// `RelayChainMsg::CircuitBuild`: peel one setup layer, install the per-hop
+    /// state, then forward the inner setup to the next hop (or, at the terminus,
+    /// surface the piggy-backed payload). `node_id` is the authenticated sender
+    /// = this hop's `prev_link`.
+    fn handle_circuit_build(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
+        let (Some(sk), Some(table)) = (&self.anonymity_x25519_sk, &self.circuit_table) else {
+            // Not circuit-capable — anti-leak silent drop (a Violation would
+            // confirm relay-capability to a prober).
+            return DispatchResult::NoResponse;
+        };
+        let peeled = match veil_anonymity::circuit_setup::peel_circuit_setup(body, sk) {
+            Ok(p) => p,
+            Err(_) => return DispatchResult::NoResponse, // bad/foreign setup — drop
+        };
+        let now = circuit_now_unix();
+        let prev_link = *node_id.as_bytes();
+        match peeled {
+            veil_anonymity::circuit_setup::SetupPeelResult::Forward {
+                install,
+                next_hop,
+                inner,
+            } => {
+                if table
+                    .install(&install, prev_link, Some(next_hop), now)
+                    .is_err()
+                {
+                    return DispatchResult::NoResponse; // cap/duplicate — drop
+                }
+                self.send_relay_chain_msg(
+                    &NodeId::from(next_hop),
+                    RelayChainMsg::CircuitBuild,
+                    &inner,
+                );
+            }
+            veil_anonymity::circuit_setup::SetupPeelResult::Terminus { install, payload } => {
+                if table.install(&install, prev_link, None, now).is_err() {
+                    return DispatchResult::NoResponse;
+                }
+                // The terminus payload is the piggy-backed registration (b4
+                // consumes it). Until then, record + drop.
+                self.logger.info(
+                    "anonymity.circuit.terminus_build",
+                    format!(
+                        "circuit terminus installed; {} B setup payload (b4 consumes)",
+                        payload.len()
+                    ),
+                );
+            }
+        }
+        DispatchResult::NoResponse
+    }
+
+    /// `RelayChainMsg::CircuitData`: re-tag + relay a data cell. A cell matching
+    /// the FORWARD index (arrived from `prev_link`) is unwrapped one layer and
+    /// passed toward the terminus; a cell matching the BACKWARD index (arrived
+    /// from `next_link`) gets ANOTHER layer and is passed toward the originator.
+    fn handle_circuit_data(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
+        use veil_anonymity::circuit_data::{Direction, open_layer, seal_layer};
+        use veil_anonymity::circuit_wire::CircuitDataPayload;
+        let Some(table) = &self.circuit_table else {
+            return DispatchResult::NoResponse;
+        };
+        let cell = match CircuitDataPayload::decode(body) {
+            Ok(c) => c,
+            Err(_) => return DispatchResult::NoResponse,
+        };
+        let link = *node_id.as_bytes();
+        let now = circuit_now_unix();
+
+        // FORWARD cell: arrived from prev_link tagged circuit_id_in.
+        if let Some(state) = table.lookup_forward(&link, cell.circuit_id) {
+            // AEAD-verify (authenticate) BEFORE advancing the replay window, so a
+            // spoofed seq can't desync the window.
+            let inner = match open_layer(
+                &state.circuit_key,
+                Direction::Forward,
+                cell.seq,
+                &cell.ciphertext,
+            ) {
+                Ok(i) => i,
+                Err(_) => return DispatchResult::NoResponse,
+            };
+            if !state
+                .replay_fwd
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .accept(cell.seq)
+            {
+                return DispatchResult::NoResponse; // replay / too-old
+            }
+            state.touch(now);
+            match state.next_link {
+                Some(nl) => {
+                    let out = CircuitDataPayload {
+                        circuit_id: state.circuit_id_out,
+                        seq: cell.seq,
+                        ciphertext: inner,
+                    };
+                    if let Ok(b) = out.encode() {
+                        self.send_relay_chain_msg(
+                            &NodeId::from(nl),
+                            RelayChainMsg::CircuitData,
+                            &b,
+                        );
+                    }
+                }
+                None => {
+                    // Terminus: `inner` is the delivered message (b4 consumes —
+                    // e.g. an introduce to forward to a registered cookie).
+                    self.logger.info(
+                        "anonymity.circuit.terminus_data",
+                        format!("circuit terminus rx {} B (b4 consumes)", inner.len()),
+                    );
+                }
+            }
+            return DispatchResult::NoResponse;
+        }
+
+        // RETURN cell: arrived from next_link tagged circuit_id_out. This relay
+        // adds its layer and passes toward the originator (prev_link). It cannot
+        // AEAD-verify (it is not the recipient), so the replay window is seq-only
+        // here; the originator does the final verify.
+        if let Some(state) = table.lookup_backward(&link, cell.circuit_id) {
+            if !state
+                .replay_ret
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .accept(cell.seq)
+            {
+                return DispatchResult::NoResponse;
+            }
+            state.touch(now);
+            let outer = seal_layer(
+                &state.circuit_key,
+                Direction::Return,
+                cell.seq,
+                &cell.ciphertext,
+            );
+            let out = CircuitDataPayload {
+                circuit_id: state.circuit_id_in,
+                seq: cell.seq,
+                ciphertext: outer,
+            };
+            if let Ok(b) = out.encode() {
+                self.send_relay_chain_msg(
+                    &NodeId::from(state.prev_link),
+                    RelayChainMsg::CircuitData,
+                    &b,
+                );
+            }
+            return DispatchResult::NoResponse;
+        }
+
+        // Unknown circuit — anti-leak silent drop.
+        DispatchResult::NoResponse
+    }
+
+    /// `RelayChainMsg::CircuitTeardown`: drop the matched circuit state and
+    /// propagate the teardown to the OTHER neighbour so the whole path is freed.
+    fn handle_circuit_teardown(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
+        use veil_anonymity::circuit_wire::CircuitTeardownPayload;
+        let Some(table) = &self.circuit_table else {
+            return DispatchResult::NoResponse;
+        };
+        let p = match CircuitTeardownPayload::decode(body) {
+            Ok(p) => p,
+            Err(_) => return DispatchResult::NoResponse,
+        };
+        let link = *node_id.as_bytes();
+
+        // Teardown from prev_link → propagate forward to next_link.
+        if let Some(state) = table.lookup_forward(&link, p.circuit_id) {
+            let next = state.next_link;
+            let cid_out = state.circuit_id_out;
+            table.remove(&link, p.circuit_id);
+            if let Some(nl) = next {
+                let tp = CircuitTeardownPayload {
+                    circuit_id: cid_out,
+                };
+                self.send_relay_chain_msg(
+                    &NodeId::from(nl),
+                    RelayChainMsg::CircuitTeardown,
+                    &tp.encode(),
+                );
+            }
+            return DispatchResult::NoResponse;
+        }
+
+        // Teardown from next_link → propagate back to prev_link.
+        if let Some(state) = table.lookup_backward(&link, p.circuit_id) {
+            let prev = state.prev_link;
+            let cid_in = state.circuit_id_in;
+            table.remove(&state.prev_link, state.circuit_id_in);
+            let tp = CircuitTeardownPayload { circuit_id: cid_in };
+            self.send_relay_chain_msg(
+                &NodeId::from(prev),
+                RelayChainMsg::CircuitTeardown,
+                &tp.encode(),
+            );
+            return DispatchResult::NoResponse;
+        }
+
         DispatchResult::NoResponse
     }
 
@@ -1017,6 +1230,75 @@ mod tests {
         hdr.body_len = body.len() as u32;
         let result = dispatcher.dispatch_relay_chain(&hdr, &body, NodeId::from([0xEE; 32]));
         assert!(matches!(result, DispatchResult::NoResponse));
+    }
+
+    /// CircuitBuild at the terminus installs circuit state keyed by
+    /// (prev_link, circuit_id_in); a CircuitTeardown frees it.
+    #[test]
+    fn circuit_build_installs_terminus_then_teardown_frees() {
+        use veil_anonymity::circuit_setup::{CircuitSetupHop, build_circuit_setup};
+        use veil_anonymity::circuit_table::CircuitTable;
+        use veil_anonymity::circuit_wire::CircuitTeardownPayload;
+
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let sk = StaticSecret::random_from_rng(OsRng);
+        let pk = PublicKey::from(&sk).to_bytes();
+        d.anonymity_x25519_sk = Some(std::sync::Arc::new(sk));
+        d.circuit_table = Some(std::sync::Arc::new(CircuitTable::new()));
+
+        // 1-hop circuit → this node is the terminus (next_hop sentinel).
+        let hop = CircuitSetupHop {
+            node_id: [0u8; 32],
+            pubkey: pk,
+            circuit_id_in: 42,
+            circuit_id_out: 0,
+            circuit_key: [7u8; 32],
+        };
+        let env = build_circuit_setup(&[hop], b"reg-payload").unwrap();
+        let mut hdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitBuild as u16,
+        );
+        hdr.body_len = env.len() as u32;
+        let prev = NodeId::from([0xEE; 32]);
+        assert!(matches!(
+            d.dispatch_relay_chain(&hdr, &env, prev),
+            DispatchResult::NoResponse
+        ));
+
+        let table = d.circuit_table.as_ref().unwrap();
+        assert_eq!(table.len(), 1, "terminus circuit installed");
+        assert!(table.lookup_forward(&[0xEE; 32], 42).is_some());
+
+        // Teardown from the same prev_link frees it.
+        let tp = CircuitTeardownPayload { circuit_id: 42 };
+        let tbody = tp.encode();
+        let mut thdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitTeardown as u16,
+        );
+        thdr.body_len = tbody.len() as u32;
+        d.dispatch_relay_chain(&thdr, &tbody, prev);
+        assert!(
+            d.circuit_table.as_ref().unwrap().is_empty(),
+            "teardown freed the circuit"
+        );
+    }
+
+    /// A non-circuit-capable node (no SK / table) silently drops CircuitBuild.
+    #[test]
+    fn circuit_build_no_capability_silent_drop() {
+        let d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        assert!(d.circuit_table.is_none());
+        let mut hdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitBuild as u16,
+        );
+        hdr.body_len = 8;
+        assert!(matches!(
+            d.dispatch_relay_chain(&hdr, &[0u8; 8], NodeId::from([0xEE; 32])),
+            DispatchResult::NoResponse
+        ));
     }
 
     /// End-to-end through-the-rendezvous: sender encrypts a payload
