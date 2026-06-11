@@ -558,10 +558,16 @@ pub const AUTH_APP_DELIVER_DOMAIN: &[u8] = b"veil-auth-onion-deliver:v1\0";
 /// (unlike the anonymous-to-recipient [`AppDeliverPayload`] whose `src_node_id`
 /// is unauthenticated / zeroed).
 ///
-/// The recipient verifies: freshness (`timestamp`), that `dst_node_id` is itself
-/// (no relay re-targeting), the `signature` against
+/// The recipient verifies: freshness (`timestamp`), the `signature` against
 /// `sender_node_id`'s identity subkey `sig_key_idx` (resolved/cached), and
 /// per-sender replay on `nonce`. Only then is `sender_node_id` trusted.
+///
+/// `dst_node_id` (the intended recipient) is **signed but NOT transmitted** —
+/// it is part of [`Self::signing_bytes`] so re-targeting is prevented, but the
+/// verifier reconstructs it as its OWN node_id ([`Self::signing_bytes_with_dst`]).
+/// A relay that re-targets the envelope to a different recipient makes that
+/// recipient compute different signing bytes → `BadSignature`. This keeps 32 B
+/// off the wire (it matters most for the fragmented rendezvous path).
 ///
 /// Wire layout (big-endian):
 /// ```text
@@ -570,14 +576,14 @@ pub const AUTH_APP_DELIVER_DOMAIN: &[u8] = b"veil-auth-onion-deliver:v1\0";
 /// [33..35]   sig_key_idx u16 BE   index into the sender's IdentityDocument subkeys
 /// [35..43]   timestamp u64 BE     unix secs (freshness)
 /// [43..51]   nonce u64 BE         fresh-random per message (replay)
-/// [51..83]   dst_node_id [32]     the intended recipient (binds the envelope)
-/// [83..115]  app_id [32]          destination app
-/// [115..119] endpoint_id u32 BE
-/// [119..123] data_len u32 BE
-/// [123..123+data_len] data
+/// [51..83]   app_id [32]          destination app
+/// [83..87]   endpoint_id u32 BE
+/// [87..91]   data_len u32 BE
+/// [91..91+data_len] data
 /// [..+2]     sig_len u16 BE
 /// [..]       signature            (Ed25519 = 64 B in v1)
 /// ```
+/// (`dst_node_id` is NOT on the wire — see above.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthAppDeliver {
     /// Format version (1).
@@ -592,7 +598,9 @@ pub struct AuthAppDeliver {
     /// Fresh random per-message nonce; recipient keeps a per-sender replay window.
     pub nonce: u64,
     /// Intended recipient `node_id` — bound into the signed bytes so a relay
-    /// cannot re-target the envelope to a different recipient.
+    /// cannot re-target the envelope to a different recipient. NOT transmitted
+    /// on the wire; the verifier reconstructs it as its own node_id (see
+    /// [`Self::signing_bytes_with_dst`]). `decode` leaves this zeroed.
     pub dst_node_id: [u8; 32],
     /// Destination app id.
     pub app_id: [u8; 32],
@@ -608,28 +616,39 @@ impl AuthAppDeliver {
     /// Current wire version.
     pub const VERSION: u8 = 1;
     /// Fixed header size before `data` (version..data_len inclusive).
-    const HEADER_SIZE: usize = 1 + 32 + 2 + 8 + 8 + 32 + 32 + 4 + 4;
+    /// `dst_node_id` is signed but not on the wire, so it is NOT counted here.
+    const HEADER_SIZE: usize = 1 + 32 + 2 + 8 + 8 + 32 + 4 + 4;
     /// Cap on the signature length accepted on decode (Falcon-512 ≈ 690 B; v1
     /// uses Ed25519 = 64 B, but the cap leaves room for the hybrid v2 subkey).
     pub const MAX_SIG_LEN: usize = 1024;
 
-    /// Canonical bytes the sender signs and the recipient verifies. Covers every
-    /// field EXCEPT the signature itself, domain-separated. The same byte order
-    /// the wire uses, so a verifier can reconstruct it from the decoded struct.
-    pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut b =
-            Vec::with_capacity(AUTH_APP_DELIVER_DOMAIN.len() + Self::HEADER_SIZE + self.data.len());
+    /// Canonical bytes the sender signs, computed with an EXPLICIT `dst` so the
+    /// recipient (who reconstructs `dst` as its own node_id) and the sender
+    /// (who knows the intended target) derive the same bytes iff the message
+    /// was actually for that recipient. Covers every field EXCEPT the signature,
+    /// domain-separated. `dst` is bound here but is NOT on the wire.
+    pub fn signing_bytes_with_dst(&self, dst: &[u8; 32]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(
+            AUTH_APP_DELIVER_DOMAIN.len() + Self::HEADER_SIZE + 32 + self.data.len(),
+        );
         b.extend_from_slice(AUTH_APP_DELIVER_DOMAIN);
         b.push(self.version);
         b.extend_from_slice(&self.sender_node_id);
         b.extend_from_slice(&self.sig_key_idx.to_be_bytes());
         b.extend_from_slice(&self.timestamp.to_be_bytes());
         b.extend_from_slice(&self.nonce.to_be_bytes());
-        b.extend_from_slice(&self.dst_node_id);
+        b.extend_from_slice(dst);
         b.extend_from_slice(&self.app_id);
         b.extend_from_slice(&self.endpoint_id.to_be_bytes());
         b.extend_from_slice(&self.data);
         b
+    }
+
+    /// Sender-side signing bytes — binds the intended recipient from
+    /// `self.dst_node_id`. The recipient instead calls
+    /// [`Self::signing_bytes_with_dst`] with its own node_id.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        self.signing_bytes_with_dst(&self.dst_node_id)
     }
 
     /// Encode to wire bytes (header || data || sig_len || signature).
@@ -641,7 +660,7 @@ impl AuthAppDeliver {
         buf.extend_from_slice(&self.sig_key_idx.to_be_bytes());
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
         buf.extend_from_slice(&self.nonce.to_be_bytes());
-        buf.extend_from_slice(&self.dst_node_id);
+        // dst_node_id is signed but NOT transmitted (reconstructed as self).
         buf.extend_from_slice(&self.app_id);
         buf.extend_from_slice(&self.endpoint_id.to_be_bytes());
         buf.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
@@ -670,10 +689,11 @@ impl AuthAppDeliver {
         let sig_key_idx = u16::from_be_bytes([buf[33], buf[34]]);
         let timestamp = super::read_u64_be(buf, 35)?;
         let nonce = super::read_u64_be(buf, 43)?;
-        let dst_node_id = super::read_array::<32>(buf, 51)?;
-        let app_id = super::read_array::<32>(buf, 83)?;
-        let endpoint_id = super::read_u32_be(buf, 115)?;
-        let data_len = super::read_u32_be(buf, 119)? as usize;
+        // dst_node_id is NOT on the wire — left zeroed; the verifier supplies
+        // its own node_id via `signing_bytes_with_dst`.
+        let app_id = super::read_array::<32>(buf, 51)?;
+        let endpoint_id = super::read_u32_be(buf, 83)?;
+        let data_len = super::read_u32_be(buf, 87)? as usize;
         let data_end =
             Self::HEADER_SIZE
                 .checked_add(data_len)
@@ -717,7 +737,8 @@ impl AuthAppDeliver {
             sig_key_idx,
             timestamp,
             nonce,
-            dst_node_id,
+            // Reconstructed by the verifier via `signing_bytes_with_dst`.
+            dst_node_id: [0u8; 32],
             app_id,
             endpoint_id,
             data: buf[Self::HEADER_SIZE..data_end].to_vec(),
@@ -4601,7 +4622,30 @@ mod tests {
     fn auth_app_deliver_roundtrip() {
         let p = sample_auth_deliver();
         let decoded = AuthAppDeliver::decode(&p.encode()).expect("decode");
-        assert_eq!(decoded, p);
+        // `dst_node_id` is signed but NOT on the wire — decode zeroes it, the
+        // verifier reconstructs it as its own node_id. Every other field round
+        // trips.
+        assert_eq!(decoded.dst_node_id, [0u8; 32]);
+        let mut expected = p.clone();
+        expected.dst_node_id = [0u8; 32];
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn auth_app_deliver_dst_bound_in_signature_not_on_wire() {
+        let p = sample_auth_deliver();
+        // The 32-byte dst run does NOT appear on the wire.
+        assert!(
+            !p.encode().windows(32).any(|w| w == p.dst_node_id),
+            "dst_node_id must not be transmitted",
+        );
+        // But two different dsts produce different signing bytes (binding).
+        assert_ne!(
+            p.signing_bytes_with_dst(&[0x01; 32]),
+            p.signing_bytes_with_dst(&[0x02; 32]),
+        );
+        // And the sender-side `signing_bytes` binds `self.dst_node_id`.
+        assert_eq!(p.signing_bytes(), p.signing_bytes_with_dst(&p.dst_node_id));
     }
 
     #[test]
