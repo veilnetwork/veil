@@ -852,6 +852,95 @@ pub unsafe extern "C" fn veil_send(
     }
 }
 
+/// Send an AUTHENTICATED anonymous datagram from `app` to
+/// `(dst_node_id, dst_app_id, dst_endpoint_id)`.
+///
+/// Like [`veil_send`], but routed over the onion/rendezvous transport: no
+/// relay learns the sender's network location, while the recipient
+/// cryptographically verifies WHO sent it. v1: one-way; fire-and-forget
+/// (`VEIL_OK` means accepted + handed to the first hop, NOT delivery-
+/// confirmed); the recipient must have opted in to receiving
+/// (`[anonymity].receive_anonymous`). The sender node needs a sovereign
+/// identity. Large messages are fragmented up to a fixed ceiling.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_send_anonymous_authenticated(
+    app: *mut VeilApp,
+    dst_node_id: *const u8,
+    dst_app_id: *const u8,
+    dst_endpoint_id: u32,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_send_anonymous_authenticated") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "app" => app,
+        "dst_node_id" => dst_node_id,
+        "dst_app_id" => dst_app_id,
+    );
+    if data.is_null() && len > 0 {
+        unsafe {
+            write_err(err_out, "data is NULL but len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("data len {len} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let mut dst_node = [0u8; 32];
+    let mut dst_app = [0u8; 32];
+    // SAFETY: as in `veil_send` — caller guarantees both pointers are
+    // readable for 32 bytes (NULL-checked above; size per the C header).
+    unsafe {
+        ptr::copy_nonoverlapping(dst_node_id, dst_node.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(dst_app_id, dst_app.as_mut_ptr(), 32);
+    }
+    let payload: Vec<u8> = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    let send_res: Result<(), ClientError> = app_ref.bundle.runtime.block_on(async {
+        let inner_guard = app_ref.sender.lock().await;
+        let Some(sender) = inner_guard.as_ref() else {
+            return Err(ClientError::Protocol("app already closed".to_string()));
+        };
+        sender
+            .send_anonymous_authenticated(dst_node, dst_app, dst_endpoint_id, &payload)
+            .await
+    });
+    match send_res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            let s = e.to_string();
+            unsafe {
+                write_err(err_out, format!("authenticated anonymous send failed: {s}"));
+            }
+            if s.contains("app already closed") {
+                VEIL_ERR_CLOSED
+            } else {
+                VEIL_ERR
+            }
+        }
+    }
+}
+
 /// Recv callback signature — invoked from a tokio worker thread.
 ///
 /// BUFFER OWNERSHIP (cycle-7 H6): the three pointers (`src_node_id`,

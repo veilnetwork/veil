@@ -171,6 +171,35 @@ impl AppHandle {
             .await
     }
 
+    /// Send `data` as an AUTHENTICATED anonymous message over the
+    /// onion/rendezvous transport. Unlike a plain send, the onion hides the
+    /// sender's network location from every relay while the recipient
+    /// cryptographically verifies WHO sent it.
+    ///
+    /// v1 limitations: one-way (no reply channel); the recipient must have
+    /// opted in to receiving (a resolvable RendezvousAd); fire-and-forget —
+    /// `Ok` means the request was accepted and handed to the first hop, NOT
+    /// delivery-confirmed (there is no end-to-end ACK). Large messages are
+    /// fragmented automatically up to a fixed ceiling.
+    pub async fn send_anonymous_authenticated(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_owned(
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED,
+                data,
+            )
+            .await
+    }
+
     /// Receive the next incoming datagram, or `None` if the connection closed.
     pub async fn recv(&mut self) -> Result<Option<IncomingMessage>, ClientError> {
         Ok(self.rx.recv().await)
@@ -419,6 +448,30 @@ impl AppSender {
                 dst_endpoint_id,
                 0,
                 &data,
+            )
+            .await
+    }
+
+    /// Send an AUTHENTICATED anonymous message (mirror
+    /// [`AppHandle::send_anonymous_authenticated`]). The onion hides the
+    /// sender's location from relays; the recipient verifies the sender.
+    /// Fire-and-forget (no end-to-end ACK); the recipient must have opted in
+    /// to receiving.
+    pub async fn send_anonymous_authenticated(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_owned(
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED,
+                data,
             )
             .await
     }
