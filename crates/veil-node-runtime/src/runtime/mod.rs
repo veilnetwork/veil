@@ -3368,383 +3368,8 @@ impl NodeRuntime {
         sealed_plaintext.push(final_hop_kind::APP_DELIVER);
         sealed_plaintext.extend_from_slice(&app_deliver_bytes);
 
-        self.send_sealed_introduce(ad, &sealed_plaintext, hop_count)
-    }
-
-    /// Authenticated rendezvous send (Epic 482 v1, "any recipient"): like
-    /// [`send_via_rendezvous`] but the sealed payload is a per-message Ed25519/
-    /// Falcon-signed [`veil_proto::AuthAppDeliver`], so the recipient
-    /// cryptographically verifies WHO sent it. A signed message rarely fits one
-    /// onion cell, so it is sign-whole-then-fragmented across multiple
-    /// introduces (`AuthDeliverFragment`); the recipient reassembles + verifies
-    /// once. Requires a loaded sovereign identity. One-way (sender → recipient).
-    pub fn send_via_rendezvous_authenticated(
-        &self,
-        ad: &veil_anonymity::rendezvous::RendezvousAd,
-        target_app_id: [u8; 32],
-        target_endpoint_id: u32,
-        data: &[u8],
-        hop_count: usize,
-    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
-        use rand_core::RngCore;
-        use veil_anonymity::rendezvous::final_hop_kind;
-
-        let sovereign = self
-            .identity
-            .sovereign_identity
-            .as_ref()
-            .ok_or(veil_anonymity::sender::SenderError::MissingSenderIdentity)?;
-
-        // Build + sign the whole message. dst = the ad's receiver_node_id (bound
-        // by the signature; the verifier reconstructs it as its own node_id).
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let nonce = rand_core::OsRng.next_u64();
-        let auth = sovereign.sign_auth_deliver(
-            ad.receiver_node_id,
-            target_app_id,
-            target_endpoint_id,
-            now_unix,
-            nonce,
-            data.to_vec(),
-        );
-        let auth_bytes = auth.encode();
-        if auth_bytes.len() > veil_proto::MAX_AUTH_DELIVER_MSG_BYTES {
-            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
-                hop_count,
-                got: data.len(),
-                max: veil_proto::MAX_AUTH_DELIVER_MSG_BYTES,
-            });
-        }
-
-        // Largest signed-blob chunk that fits one fragment at this hop_count:
-        //   Final-hop budget − [1 onion tag] − IntroducePayload fixed − introduce
-        //   overhead − [1 inner tag] − fragment header.
-        let final_budget = veil_anonymity::packet::max_payload_for_hops(hop_count).ok_or(
-            veil_anonymity::sender::SenderError::HopCountExceedsCellBudget {
-                hop_count,
-                max: veil_anonymity::packet::MAX_HOPS_PER_CELL,
-            },
-        )?;
-        let ciphertext_budget = final_budget
-            .min(
-                veil_anonymity::rendezvous::MAX_INTRODUCE_CIPHERTEXT
-                    + 1
-                    + veil_anonymity::rendezvous::IntroducePayload::FIXED_SIZE,
-            )
-            .saturating_sub(1 + veil_anonymity::rendezvous::IntroducePayload::FIXED_SIZE);
-        let chunk_size = ciphertext_budget
-            .saturating_sub(veil_anonymity::rendezvous::INTRODUCE_OVERHEAD)
-            .saturating_sub(1 + veil_proto::AuthDeliverFragment::HEADER_SIZE);
-        if chunk_size == 0 {
-            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
-                hop_count,
-                got: data.len(),
-                max: 0,
-            });
-        }
-        let frag_count = auth_bytes.len().div_ceil(chunk_size).max(1);
-        if frag_count > veil_proto::MAX_AUTH_DELIVER_FRAGMENTS as usize {
-            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
-                hop_count,
-                got: data.len(),
-                max: chunk_size * veil_proto::MAX_AUTH_DELIVER_FRAGMENTS as usize,
-            });
-        }
-        let mut msg_id = [0u8; 16];
-        rand_core::OsRng.fill_bytes(&mut msg_id);
-
-        // Each fragment: [APP_DELIVER_AUTH tag][AuthDeliverFragment] → sealed +
-        // onion-routed to the rendezvous independently.
-        for (idx, chunk) in auth_bytes.chunks(chunk_size).enumerate() {
-            let frag = veil_proto::AuthDeliverFragment {
-                msg_id,
-                frag_count: frag_count as u16,
-                frag_idx: idx as u16,
-                chunk: chunk.to_vec(),
-            };
-            let frag_bytes = frag.encode();
-            let mut sealed_plaintext = Vec::with_capacity(1 + frag_bytes.len());
-            sealed_plaintext.push(final_hop_kind::APP_DELIVER_AUTH);
-            sealed_plaintext.extend_from_slice(&frag_bytes);
-            self.send_sealed_introduce(ad, &sealed_plaintext, hop_count)?;
-        }
-        Ok(())
-    }
-
-    /// Resolve the recipient's `RendezvousAd` and send an authenticated
-    /// anonymous message to it (Epic 482 v1, "any recipient"). This is the
-    /// production entry point behind the IPC `anonymous_authenticated` flag.
-    /// Fetches + verifies the ad from the DHT (recursive, across replica slots),
-    /// pre-resolves the rendezvous relay's directory entry into the local shard
-    /// (so the onion build can reach it instead of silent-dropping), then
-    /// signs/fragments/sends via [`Self::send_via_rendezvous_authenticated`].
-    /// Errors are local/pre-transmit; once the cell is on the wire it is
-    /// fire-and-forget (no end-to-end ACK).
-    pub async fn send_anonymous_authenticated_to(
-        &self,
-        receiver_node_id: [u8; 32],
-        target_app_id: [u8; 32],
-        target_endpoint_id: u32,
-        data: &[u8],
-        hop_count: usize,
-    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
-        use veil_anonymity::rendezvous::{
-            MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
-            rendezvous_ad_dht_key_at, verify_rendezvous_ad,
-        };
-        use veil_types::AnonOnionSendError;
-
-        const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-        if self.identity.sovereign_identity.is_none() {
-            return Err(AnonOnionSendError::NoIdentity);
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        // Resolve the best currently-valid ad across the recipient's replica
-        // slots. verify_rendezvous_ad binds receiver_node_id↔issuer_pk; we also
-        // reject an ad replicated into the wrong slot.
-        let mut chosen: Option<veil_anonymity::rendezvous::RendezvousAd> = None;
-        for idx in 0..MAX_RENDEZVOUS_AD_SLOTS {
-            let key = rendezvous_ad_dht_key_at(&receiver_node_id, idx);
-            let Some(bytes) = self.dht_recursive_get(key, RESOLVE_TIMEOUT).await else {
-                continue;
-            };
-            let Ok(ad) = decode_rendezvous_ad(&bytes) else {
-                continue;
-            };
-            if verify_rendezvous_ad(&ad).is_err()
-                || ad.receiver_node_id != receiver_node_id
-                || is_currently_valid(&ad, now).is_err()
-            {
-                continue;
-            }
-            chosen = Some(ad);
-            break;
-        }
-        let Some(ad) = chosen else {
-            return Err(AnonOnionSendError::NoRendezvous);
-        };
-
-        // Pre-resolve the rendezvous relay's directory entry into our local DHT
-        // shard so `send_via_rendezvous_authenticated`'s `get_local` lookup finds
-        // it (otherwise that path silent-drops when the entry isn't organically
-        // cached — review fix).
-        let relay_key = veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id);
-        if self.dht.get_local(&relay_key).is_none()
-            && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
-        {
-            self.dht.store_local(relay_key, bytes);
-        }
-
-        self.send_via_rendezvous_authenticated(
-            &ad,
-            target_app_id,
-            target_endpoint_id,
-            data,
-            hop_count,
-        )
-        .map_err(|e| match e {
-            veil_anonymity::sender::SenderError::MissingSenderIdentity => {
-                AnonOnionSendError::NoIdentity
-            }
-            veil_anonymity::sender::SenderError::InsufficientRelayCandidates { .. } => {
-                AnonOnionSendError::NoRelays
-            }
-            veil_anonymity::sender::SenderError::PayloadTooLarge { .. } => {
-                AnonOnionSendError::PayloadTooLarge
-            }
-            _ => AnonOnionSendError::NoRelays,
-        })
-    }
-
-    /// Seal `sealed_plaintext` (which already carries its `final_hop_kind` tag)
-    /// to the ad's recipient, wrap it as an `IntroducePayload`, and onion-route
-    /// it to the rendezvous relay as the Final hop. Shared by the plain
-    /// ([`send_via_rendezvous`]) and authenticated
-    /// ([`send_via_rendezvous_authenticated`]) rendezvous paths.
-    fn send_sealed_introduce(
-        &self,
-        ad: &veil_anonymity::rendezvous::RendezvousAd,
-        sealed_plaintext: &[u8],
-        hop_count: usize,
-    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
-        use veil_anonymity::rendezvous::{IntroducePayload, encrypt_introduce, final_hop_kind};
-
-        // Step 2: seal to receiver_x25519_pk. Rendezvous cannot read
-        // this — only the receiver after their `decrypt_introduce`.
-        // encrypt_introduce only fails on AEAD library error (vanishingly
-        // rare); treat as PayloadTooLarge for surface-level error
-        // reporting (caller's recourse is the same: shrink payload or
-        // retry).
-        let ciphertext =
-            encrypt_introduce(sealed_plaintext, &ad.receiver_x25519_pk).map_err(|_| {
-                veil_anonymity::sender::SenderError::PayloadTooLarge {
-                    hop_count,
-                    got: sealed_plaintext.len(),
-                    max: 0,
-                }
-            })?;
-
-        // Step 3: wrap as IntroducePayload.
-        let intro = IntroducePayload {
-            receiver_node_id: ad.receiver_node_id,
-            auth_cookie: ad.auth_cookie,
-            ciphertext,
-        };
-        let intro_bytes =
-            intro
-                .encode()
-                .map_err(|_| veil_anonymity::sender::SenderError::PayloadTooLarge {
-                    hop_count,
-                    got: sealed_plaintext.len(),
-                    max: 0,
-                })?;
-
-        // Step 4: prepend final-hop kind tag.
-        let mut payload_bytes = Vec::with_capacity(1 + intro_bytes.len());
-        payload_bytes.push(final_hop_kind::INTRODUCE);
-        payload_bytes.extend_from_slice(&intro_bytes);
-
-        // Step 5: build + dispatch the onion cell with rendezvous_node_id
-        // as the Final-hop target. Rendezvous's anonymity_x25519_pk
-        // is needed for the outermost onion layer; we look it up from
-        // its directory entry (shipped in).
-        use veil_anonymity::{
-            directory::{
-                DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
-            },
-            sender::{
-                DiversityOutcome,
-                build_outbound_anonymous_cell_with_diversity_reported_and_reputation,
-            },
-        };
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Resolve rendezvous's directory entry to fetch its x25519_pk.
-        let dht = Arc::clone(&self.dht);
-        let candidates = vec![ad.rendezvous_node_id];
-        let resolved = discover_relay_hops(
-            &candidates,
-            |node_id| dht.get_local(&relay_directory_dht_key(node_id)),
-            now_unix,
-            DEFAULT_FRESHNESS_WINDOW_SECS,
-        );
-        let rendezvous_relay = match resolved.into_iter().next() {
-            Some(r) => r,
-            None => {
-                // Rendezvous not in our DHT cache — same silent-drop
-                // semantics as `send_anonymous` first-hop unreachable.
-                return Ok(());
-            }
-        };
-
-        // Snapshot relay candidates (excluding rendezvous itself —
-        // rendezvous is the Final-hop, not a middle-hop).
-        // W0 measurement: time selection vs build (see send_anonymous).
-        let t_select = std::time::Instant::now();
-        let candidate_node_ids: Vec<[u8; 32]> = self
-            .dht
-            .routing_table_contacts()
-            .into_iter()
-            .map(|c| c.node_id)
-            .filter(|nid| *nid != ad.rendezvous_node_id)
-            .collect();
-        let usable_relays = discover_relay_hops(
-            &candidate_node_ids,
-            |node_id| dht.get_local(&relay_directory_dht_key(node_id)),
-            now_unix,
-            DEFAULT_FRESHNESS_WINDOW_SECS,
-        );
-
-        // Vivaldi-based RTT estimator (same shape as send_anonymous).
-        let local_vivaldi = self.dispatcher.local_vivaldi.clone();
-        let peer_vivaldi = Arc::clone(&self.dispatcher.peer_vivaldi);
-        let rtt_estimator = move |node_id: &[u8; 32]| -> Option<u32> {
-            let local = local_vivaldi.as_ref()?;
-            let peer_map = rlock!(peer_vivaldi);
-            let (peer_coord, _) = peer_map.get(node_id)?;
-            let local_guard = lock!(local);
-            let estimated_ms = local_guard.distance_estimate(peer_coord) * 1000.0;
-            if !estimated_ms.is_finite() || estimated_ms < 0.0 {
-                return None;
-            }
-            Some(estimated_ms.min(u32::MAX as f64) as u32)
-        };
-
-        // Anti-censorship AS-diversity extractor (same shape as
-        // send_anonymous) — see the helper comments in that function.
-        let diversity_map = build_as_diversity_map(&self.discovered_peers_cache);
-        let diversity_key_of =
-            move |node_id: &[u8; 32]| -> Option<String> { diversity_map.get(node_id).cloned() };
-
-        // Downweight relays with recorded failures (Epic 482.3/482.4 Phase A) —
-        // see send_anonymous for rationale.
-        let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
-        let reputation_penalty_ms =
-            move |node_id: &[u8; 32]| -> u32 { relay_reputation.rtt_penalty_ms(*node_id) };
-        let select_us = t_select.elapsed().as_micros();
-        let t_build = std::time::Instant::now();
-        let ((first_hop_node_id, cell), diversity) =
-            build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
-                &payload_bytes,
-                &usable_relays,
-                rtt_estimator,
-                diversity_key_of,
-                reputation_penalty_ms,
-                ad.rendezvous_node_id,
-                rendezvous_relay.hop.pubkey,
-                hop_count,
-            )?;
-        // W0 measurement (see send_anonymous).
-        log::debug!(
-            "anonymity.rendezvous.timing select_us={select_us} build_us={} \
-             payload={} hops={hop_count} candidates={} usable={}",
-            t_build.elapsed().as_micros(),
-            payload_bytes.len(),
-            candidate_node_ids.len(),
-            usable_relays.len(),
-        );
-        if diversity == DiversityOutcome::DegradedToLatency {
-            log::warn!(
-                "anonymity.rendezvous.diversity_degraded hop_count={hop_count} \
-                 candidates={} — no AS-diverse relay set; fell back to latency-only",
-                usable_relays.len()
-            );
-        }
-
-        use veil_proto::{
-            codec::encode_header,
-            family::{FrameFamily, RelayChainMsg},
-            header::FrameHeader,
-        };
-        let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
-        hdr.body_len = cell.len() as u32;
-        hdr.set_priority(veil_proto::priority::INTERACTIVE);
-        let mut frame = encode_header(&hdr).to_vec();
-        frame.extend_from_slice(&cell);
-        if let Some(ref reg) = self.dispatcher.session_tx_registry {
-            let guard = wlock!(reg);
-            let sent = guard.send_to(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
-            drop(guard);
-            if !sent {
-                // Signal 1 (Phase A): chosen anonymity first hop has no live
-                // session — record it (per-sender-local, no external behaviour
-                // change). See send_anonymous.
-                self.anonymity
-                    .relay_reputation
-                    .record_failure(first_hop_node_id);
-            }
-        }
-        Ok(())
+        self.access()
+            .send_sealed_introduce(ad, &sealed_plaintext, hop_count)
     }
 
     /// register a rendezvous publication. The
@@ -6360,3 +5985,381 @@ mod mailbox_cfg_translation_tests {
 
 #[cfg(test)]
 mod tests;
+
+impl NodeServices {
+    /// Authenticated rendezvous send (Epic 482 v1, "any recipient"): like
+    /// [`send_via_rendezvous`] but the sealed payload is a per-message Ed25519/
+    /// Falcon-signed [`veil_proto::AuthAppDeliver`], so the recipient
+    /// cryptographically verifies WHO sent it. A signed message rarely fits one
+    /// onion cell, so it is sign-whole-then-fragmented across multiple
+    /// introduces (`AuthDeliverFragment`); the recipient reassembles + verifies
+    /// once. Requires a loaded sovereign identity. One-way (sender → recipient).
+    pub fn send_via_rendezvous_authenticated(
+        &self,
+        ad: &veil_anonymity::rendezvous::RendezvousAd,
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        data: &[u8],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        use rand_core::RngCore;
+        use veil_anonymity::rendezvous::final_hop_kind;
+
+        let sovereign = self
+            .identity
+            .sovereign_identity
+            .as_ref()
+            .ok_or(veil_anonymity::sender::SenderError::MissingSenderIdentity)?;
+
+        // Build + sign the whole message. dst = the ad's receiver_node_id (bound
+        // by the signature; the verifier reconstructs it as its own node_id).
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let nonce = rand_core::OsRng.next_u64();
+        let auth = sovereign.sign_auth_deliver(
+            ad.receiver_node_id,
+            target_app_id,
+            target_endpoint_id,
+            now_unix,
+            nonce,
+            data.to_vec(),
+        );
+        let auth_bytes = auth.encode();
+        if auth_bytes.len() > veil_proto::MAX_AUTH_DELIVER_MSG_BYTES {
+            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
+                hop_count,
+                got: data.len(),
+                max: veil_proto::MAX_AUTH_DELIVER_MSG_BYTES,
+            });
+        }
+
+        // Largest signed-blob chunk that fits one fragment at this hop_count:
+        //   Final-hop budget − [1 onion tag] − IntroducePayload fixed − introduce
+        //   overhead − [1 inner tag] − fragment header.
+        let final_budget = veil_anonymity::packet::max_payload_for_hops(hop_count).ok_or(
+            veil_anonymity::sender::SenderError::HopCountExceedsCellBudget {
+                hop_count,
+                max: veil_anonymity::packet::MAX_HOPS_PER_CELL,
+            },
+        )?;
+        let ciphertext_budget = final_budget
+            .min(
+                veil_anonymity::rendezvous::MAX_INTRODUCE_CIPHERTEXT
+                    + 1
+                    + veil_anonymity::rendezvous::IntroducePayload::FIXED_SIZE,
+            )
+            .saturating_sub(1 + veil_anonymity::rendezvous::IntroducePayload::FIXED_SIZE);
+        let chunk_size = ciphertext_budget
+            .saturating_sub(veil_anonymity::rendezvous::INTRODUCE_OVERHEAD)
+            .saturating_sub(1 + veil_proto::AuthDeliverFragment::HEADER_SIZE);
+        if chunk_size == 0 {
+            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
+                hop_count,
+                got: data.len(),
+                max: 0,
+            });
+        }
+        let frag_count = auth_bytes.len().div_ceil(chunk_size).max(1);
+        if frag_count > veil_proto::MAX_AUTH_DELIVER_FRAGMENTS as usize {
+            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
+                hop_count,
+                got: data.len(),
+                max: chunk_size * veil_proto::MAX_AUTH_DELIVER_FRAGMENTS as usize,
+            });
+        }
+        let mut msg_id = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut msg_id);
+
+        // Each fragment: [APP_DELIVER_AUTH tag][AuthDeliverFragment] → sealed +
+        // onion-routed to the rendezvous independently.
+        for (idx, chunk) in auth_bytes.chunks(chunk_size).enumerate() {
+            let frag = veil_proto::AuthDeliverFragment {
+                msg_id,
+                frag_count: frag_count as u16,
+                frag_idx: idx as u16,
+                chunk: chunk.to_vec(),
+            };
+            let frag_bytes = frag.encode();
+            let mut sealed_plaintext = Vec::with_capacity(1 + frag_bytes.len());
+            sealed_plaintext.push(final_hop_kind::APP_DELIVER_AUTH);
+            sealed_plaintext.extend_from_slice(&frag_bytes);
+            self.send_sealed_introduce(ad, &sealed_plaintext, hop_count)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve the recipient's `RendezvousAd` and send an authenticated
+    /// anonymous message to it (Epic 482 v1, "any recipient"). This is the
+    /// production entry point behind the IPC `anonymous_authenticated` flag.
+    /// Fetches + verifies the ad from the DHT (recursive, across replica slots),
+    /// pre-resolves the rendezvous relay's directory entry into the local shard
+    /// (so the onion build can reach it instead of silent-dropping), then
+    /// signs/fragments/sends via [`Self::send_via_rendezvous_authenticated`].
+    /// Errors are local/pre-transmit; once the cell is on the wire it is
+    /// fire-and-forget (no end-to-end ACK).
+    pub async fn send_anonymous_authenticated_to(
+        &self,
+        receiver_node_id: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        data: &[u8],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        use veil_anonymity::rendezvous::{
+            MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
+            rendezvous_ad_dht_key_at, verify_rendezvous_ad,
+        };
+        use veil_types::AnonOnionSendError;
+
+        const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        if self.identity.sovereign_identity.is_none() {
+            return Err(AnonOnionSendError::NoIdentity);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Resolve the best currently-valid ad across the recipient's replica
+        // slots. verify_rendezvous_ad binds receiver_node_id↔issuer_pk; we also
+        // reject an ad replicated into the wrong slot.
+        let mut chosen: Option<veil_anonymity::rendezvous::RendezvousAd> = None;
+        for idx in 0..MAX_RENDEZVOUS_AD_SLOTS {
+            let key = rendezvous_ad_dht_key_at(&receiver_node_id, idx);
+            let Some(bytes) = self.dht_recursive_get(key, RESOLVE_TIMEOUT).await else {
+                continue;
+            };
+            let Ok(ad) = decode_rendezvous_ad(&bytes) else {
+                continue;
+            };
+            if verify_rendezvous_ad(&ad).is_err()
+                || ad.receiver_node_id != receiver_node_id
+                || is_currently_valid(&ad, now).is_err()
+            {
+                continue;
+            }
+            chosen = Some(ad);
+            break;
+        }
+        let Some(ad) = chosen else {
+            return Err(AnonOnionSendError::NoRendezvous);
+        };
+
+        // Pre-resolve the rendezvous relay's directory entry into our local DHT
+        // shard so `send_via_rendezvous_authenticated`'s `get_local` lookup finds
+        // it (otherwise that path silent-drops when the entry isn't organically
+        // cached — review fix).
+        let relay_key = veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id);
+        if self.dht.get_local(&relay_key).is_none()
+            && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
+        {
+            self.dht.store_local(relay_key, bytes);
+        }
+
+        self.send_via_rendezvous_authenticated(
+            &ad,
+            target_app_id,
+            target_endpoint_id,
+            data,
+            hop_count,
+        )
+        .map_err(|e| match e {
+            veil_anonymity::sender::SenderError::MissingSenderIdentity => {
+                AnonOnionSendError::NoIdentity
+            }
+            veil_anonymity::sender::SenderError::InsufficientRelayCandidates { .. } => {
+                AnonOnionSendError::NoRelays
+            }
+            veil_anonymity::sender::SenderError::PayloadTooLarge { .. } => {
+                AnonOnionSendError::PayloadTooLarge
+            }
+            _ => AnonOnionSendError::NoRelays,
+        })
+    }
+
+    /// Seal `sealed_plaintext` (which already carries its `final_hop_kind` tag)
+    /// to the ad's recipient, wrap it as an `IntroducePayload`, and onion-route
+    /// it to the rendezvous relay as the Final hop. Shared by the plain
+    /// ([`send_via_rendezvous`]) and authenticated
+    /// ([`send_via_rendezvous_authenticated`]) rendezvous paths.
+    fn send_sealed_introduce(
+        &self,
+        ad: &veil_anonymity::rendezvous::RendezvousAd,
+        sealed_plaintext: &[u8],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        use veil_anonymity::rendezvous::{IntroducePayload, encrypt_introduce, final_hop_kind};
+
+        // Step 2: seal to receiver_x25519_pk. Rendezvous cannot read
+        // this — only the receiver after their `decrypt_introduce`.
+        // encrypt_introduce only fails on AEAD library error (vanishingly
+        // rare); treat as PayloadTooLarge for surface-level error
+        // reporting (caller's recourse is the same: shrink payload or
+        // retry).
+        let ciphertext =
+            encrypt_introduce(sealed_plaintext, &ad.receiver_x25519_pk).map_err(|_| {
+                veil_anonymity::sender::SenderError::PayloadTooLarge {
+                    hop_count,
+                    got: sealed_plaintext.len(),
+                    max: 0,
+                }
+            })?;
+
+        // Step 3: wrap as IntroducePayload.
+        let intro = IntroducePayload {
+            receiver_node_id: ad.receiver_node_id,
+            auth_cookie: ad.auth_cookie,
+            ciphertext,
+        };
+        let intro_bytes =
+            intro
+                .encode()
+                .map_err(|_| veil_anonymity::sender::SenderError::PayloadTooLarge {
+                    hop_count,
+                    got: sealed_plaintext.len(),
+                    max: 0,
+                })?;
+
+        // Step 4: prepend final-hop kind tag.
+        let mut payload_bytes = Vec::with_capacity(1 + intro_bytes.len());
+        payload_bytes.push(final_hop_kind::INTRODUCE);
+        payload_bytes.extend_from_slice(&intro_bytes);
+
+        // Step 5: build + dispatch the onion cell with rendezvous_node_id
+        // as the Final-hop target. Rendezvous's anonymity_x25519_pk
+        // is needed for the outermost onion layer; we look it up from
+        // its directory entry (shipped in).
+        use veil_anonymity::{
+            directory::{
+                DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
+            },
+            sender::{
+                DiversityOutcome,
+                build_outbound_anonymous_cell_with_diversity_reported_and_reputation,
+            },
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Resolve rendezvous's directory entry to fetch its x25519_pk.
+        let dht = Arc::clone(&self.dht);
+        let candidates = vec![ad.rendezvous_node_id];
+        let resolved = discover_relay_hops(
+            &candidates,
+            |node_id| dht.get_local(&relay_directory_dht_key(node_id)),
+            now_unix,
+            DEFAULT_FRESHNESS_WINDOW_SECS,
+        );
+        let rendezvous_relay = match resolved.into_iter().next() {
+            Some(r) => r,
+            None => {
+                // Rendezvous not in our DHT cache — same silent-drop
+                // semantics as `send_anonymous` first-hop unreachable.
+                return Ok(());
+            }
+        };
+
+        // Snapshot relay candidates (excluding rendezvous itself —
+        // rendezvous is the Final-hop, not a middle-hop).
+        // W0 measurement: time selection vs build (see send_anonymous).
+        let t_select = std::time::Instant::now();
+        let candidate_node_ids: Vec<[u8; 32]> = self
+            .dht
+            .routing_table_contacts()
+            .into_iter()
+            .map(|c| c.node_id)
+            .filter(|nid| *nid != ad.rendezvous_node_id)
+            .collect();
+        let usable_relays = discover_relay_hops(
+            &candidate_node_ids,
+            |node_id| dht.get_local(&relay_directory_dht_key(node_id)),
+            now_unix,
+            DEFAULT_FRESHNESS_WINDOW_SECS,
+        );
+
+        // Vivaldi-based RTT estimator (same shape as send_anonymous).
+        let local_vivaldi = self.dispatcher.local_vivaldi.clone();
+        let peer_vivaldi = Arc::clone(&self.dispatcher.peer_vivaldi);
+        let rtt_estimator = move |node_id: &[u8; 32]| -> Option<u32> {
+            let local = local_vivaldi.as_ref()?;
+            let peer_map = rlock!(peer_vivaldi);
+            let (peer_coord, _) = peer_map.get(node_id)?;
+            let local_guard = lock!(local);
+            let estimated_ms = local_guard.distance_estimate(peer_coord) * 1000.0;
+            if !estimated_ms.is_finite() || estimated_ms < 0.0 {
+                return None;
+            }
+            Some(estimated_ms.min(u32::MAX as f64) as u32)
+        };
+
+        // Anti-censorship AS-diversity extractor (same shape as
+        // send_anonymous) — see the helper comments in that function.
+        let diversity_map = build_as_diversity_map(&self.discovered_peers_cache);
+        let diversity_key_of =
+            move |node_id: &[u8; 32]| -> Option<String> { diversity_map.get(node_id).cloned() };
+
+        // Downweight relays with recorded failures (Epic 482.3/482.4 Phase A) —
+        // see send_anonymous for rationale.
+        let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
+        let reputation_penalty_ms =
+            move |node_id: &[u8; 32]| -> u32 { relay_reputation.rtt_penalty_ms(*node_id) };
+        let select_us = t_select.elapsed().as_micros();
+        let t_build = std::time::Instant::now();
+        let ((first_hop_node_id, cell), diversity) =
+            build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
+                &payload_bytes,
+                &usable_relays,
+                rtt_estimator,
+                diversity_key_of,
+                reputation_penalty_ms,
+                ad.rendezvous_node_id,
+                rendezvous_relay.hop.pubkey,
+                hop_count,
+            )?;
+        // W0 measurement (see send_anonymous).
+        log::debug!(
+            "anonymity.rendezvous.timing select_us={select_us} build_us={} \
+             payload={} hops={hop_count} candidates={} usable={}",
+            t_build.elapsed().as_micros(),
+            payload_bytes.len(),
+            candidate_node_ids.len(),
+            usable_relays.len(),
+        );
+        if diversity == DiversityOutcome::DegradedToLatency {
+            log::warn!(
+                "anonymity.rendezvous.diversity_degraded hop_count={hop_count} \
+                 candidates={} — no AS-diverse relay set; fell back to latency-only",
+                usable_relays.len()
+            );
+        }
+
+        use veil_proto::{
+            codec::encode_header,
+            family::{FrameFamily, RelayChainMsg},
+            header::FrameHeader,
+        };
+        let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
+        hdr.body_len = cell.len() as u32;
+        hdr.set_priority(veil_proto::priority::INTERACTIVE);
+        let mut frame = encode_header(&hdr).to_vec();
+        frame.extend_from_slice(&cell);
+        if let Some(ref reg) = self.dispatcher.session_tx_registry {
+            let guard = wlock!(reg);
+            let sent = guard.send_to(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
+            drop(guard);
+            if !sent {
+                // Signal 1 (Phase A): chosen anonymity first hop has no live
+                // session — record it (per-sender-local, no external behaviour
+                // change). See send_anonymous.
+                self.anonymity
+                    .relay_reputation
+                    .record_failure(first_hop_node_id);
+            }
+        }
+        Ok(())
+    }
+}

@@ -1307,6 +1307,14 @@ impl NodeRuntime {
                 Arc::clone(&self.identity.peer_mlkem_keys),
                 Arc::clone(&self.logger),
             ));
+        // Authenticated anonymous (onion/rendezvous) sender for the IPC
+        // `anonymous_authenticated` flag. Holds the access bundle + the
+        // configured circuit length.
+        let anon_onion_sender: Arc<dyn veil_types::AnonOnionSender> =
+            Arc::new(RuntimeAnonOnionSender::new(
+                self.access(),
+                config.anonymity.default_hop_count.unwrap_or(2).max(1) as usize,
+            ));
         let mut server = IpcServer::new(endpoint, shutdown_rx, app_registry, node_id)
             .with_session_tx_registry(session_tx_broadcaster)
             // Cross-node IPC STREAM_OPEN forwarding: share the dispatcher's
@@ -1321,6 +1329,7 @@ impl NodeRuntime {
             .with_route_updated(route_updated)
             .with_e2e_keys(Arc::clone(&self.identity.peer_mlkem_keys))
             .with_mlkem_ek_resolver(mlkem_ek_resolver)
+            .with_anon_onion_sender(anon_onion_sender)
             .with_trace_sample_rate(config.routing.trace_sample_rate)
             .with_pending_ack(Arc::clone(&self.dispatcher.pending_ack))
             .with_pending_recursive(Arc::clone(&self.dispatcher.pending_recursive));
@@ -2469,6 +2478,49 @@ pub struct RendezvousResolverImpl {
 impl RendezvousResolverImpl {
     fn new(dht: Arc<veil_dht::KademliaService>) -> Self {
         Self { dht }
+    }
+}
+
+/// Adapts the runtime's `NodeServices` to the IPC-layer [`veil_types::
+/// AnonOnionSender`] trait, so the `anonymous_authenticated` send flag can
+/// originate an authenticated anonymous onion send without veil-ipc depending
+/// on veil-node-runtime. Holds the access bundle + the configured hop count.
+struct RuntimeAnonOnionSender {
+    access: super::NodeServices,
+    hop_count: usize,
+}
+
+impl RuntimeAnonOnionSender {
+    fn new(access: super::NodeServices, hop_count: usize) -> Self {
+        Self { access, hop_count }
+    }
+}
+
+impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
+    fn send_authenticated<'a>(
+        &'a self,
+        receiver_node_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: &'a [u8],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), veil_types::AnonOnionSendError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.access
+                .send_anonymous_authenticated_to(
+                    receiver_node_id,
+                    app_id,
+                    endpoint_id,
+                    data,
+                    self.hop_count,
+                )
+                .await
+        })
     }
 }
 

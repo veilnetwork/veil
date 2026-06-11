@@ -852,6 +852,15 @@ pub const IPC_SEND_FLAG_REQUIRE_ACK: u32 = 0x0000_0001;
 /// is not available the server returns `ipc_send_err::NO_E2E_KEY`.
 pub const IPC_SEND_FLAG_ANONYMOUS: u32 = 0x0000_0002;
 
+/// Flag bit for `AppIpcSendPayload.flags`: send as an AUTHENTICATED anonymous
+/// message over the onion/rendezvous transport. Unlike `ANONYMOUS` (meta-E2E),
+/// the recipient cryptographically verifies WHO sent it while no relay learns
+/// the sender's location. Mutually exclusive with `ANONYMOUS` (both set →
+/// `ipc_send_err::INVALID_FLAGS`). `REQUIRE_ACK` is ignored (fire-and-forget,
+/// no end-to-end ACK). Requires the recipient to have opted in to receiving
+/// (a resolvable RendezvousAd) and the sender to have a sovereign identity.
+pub const IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED: u32 = 0x0000_0004;
+
 /// Sent by the IPC client to dispatch a datagram into the veil network.
 ///
 /// Wire layout:
@@ -860,7 +869,8 @@ pub const IPC_SEND_FLAG_ANONYMOUS: u32 = 0x0000_0002;
 /// [32..64] src_app_id [u8; 32] (sender's own app_id)
 /// [64..96] app_id [u8; 32] (destination app_id)
 /// [96..100] endpoint_id u32 BE (destination endpoint)
-/// [100..104] flags u32 BE (bit 0 = REQUIRE_ACK, bit 1 = ANONYMOUS)
+/// [100..104] flags u32 BE (bit 0 = REQUIRE_ACK, bit 1 = ANONYMOUS,
+///                           bit 2 = ANONYMOUS_AUTHENTICATED)
 /// [104..108] data_len u32 BE
 /// [108..108+data_len] data bytes
 /// ```
@@ -880,6 +890,10 @@ pub struct AppIpcSendPayload {
     /// Send anonymously using meta-E2E (onion) encryption.
     /// Set `IPC_SEND_FLAG_ANONYMOUS` to enable.
     pub anonymous: bool,
+    /// Send as an AUTHENTICATED anonymous message (onion/rendezvous; recipient
+    /// verifies the sender). Set `IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED`.
+    /// Mutually exclusive with `anonymous`.
+    pub anonymous_authenticated: bool,
     /// Datagram payload. d: backed by the global bufpool so chat_node-
     /// style 200 msg/sec × 60 KB IPC inbound load doesn't malloc-churn this
     /// allocator-side. Clone is cheap (Arc-style refcount).
@@ -904,6 +918,9 @@ impl AppIpcSendPayload {
         if self.anonymous {
             flags |= IPC_SEND_FLAG_ANONYMOUS;
         }
+        if self.anonymous_authenticated {
+            flags |= IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED;
+        }
         buf.extend_from_slice(&flags.to_be_bytes());
         buf.extend_from_slice(&(data_slice.len() as u32).to_be_bytes());
         buf.extend_from_slice(data_slice);
@@ -925,6 +942,7 @@ impl AppIpcSendPayload {
         let flags = super::read_u32_be(buf, 100)?;
         let require_ack = flags & IPC_SEND_FLAG_REQUIRE_ACK != 0;
         let anonymous = flags & IPC_SEND_FLAG_ANONYMOUS != 0;
+        let anonymous_authenticated = flags & IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED != 0;
         let data_len = super::read_u32_be(buf, 104)? as usize;
         // checked_add — 32-bit overflow defence.
         let total = Self::FIXED_SIZE
@@ -953,6 +971,7 @@ impl AppIpcSendPayload {
             endpoint_id,
             require_ack,
             anonymous,
+            anonymous_authenticated,
             data: pooled.into_shared(),
         })
     }
@@ -1358,6 +1377,15 @@ pub mod ipc_send_err {
     /// sending; the server rejects the entire frame to bound the worst-case
     /// E2E encryption / fragmentation cost on the IPC server.
     pub const PAYLOAD_TOO_LARGE: u16 = 6;
+    /// Authenticated anonymous send requested but no sovereign identity is
+    /// loaded — the message cannot be signed. (`anonymous_authenticated`.)
+    pub const NO_IDENTITY: u16 = 7;
+    /// Authenticated anonymous send: the recipient has no resolvable, valid
+    /// RendezvousAd — it has not opted in to receiving (or its ad is stale).
+    pub const NO_RENDEZVOUS: u16 = 8;
+    /// Conflicting flags: `anonymous` (meta-E2E) and `anonymous_authenticated`
+    /// (onion) are mutually exclusive transports.
+    pub const INVALID_FLAGS: u16 = 9;
 }
 
 // ── AppIpcRtSendPayload ─────────────────────────────────────────────────────
@@ -5011,11 +5039,38 @@ mod tests {
             endpoint_id: 7,
             require_ack: false,
             anonymous: false,
+            anonymous_authenticated: false,
             data: veil_bufpool::pooled_shared_from_vec(b"greetings".to_vec()),
         };
         let buf = p.encode();
         let d = AppIpcSendPayload::decode(&buf).unwrap();
         assert_eq!(d, p);
+    }
+
+    #[test]
+    fn ipc_send_anonymous_authenticated_flag_roundtrips() {
+        let p = AppIpcSendPayload {
+            src_app_id: [1u8; 32],
+            dst_node_id: [0x10; 32],
+            app_id: [0x20; 32],
+            endpoint_id: 9,
+            require_ack: true,
+            anonymous: false,
+            anonymous_authenticated: true,
+            data: veil_bufpool::pooled_shared_from_vec(b"authed".to_vec()),
+        };
+        let d = AppIpcSendPayload::decode(&p.encode()).unwrap();
+        assert_eq!(d, p);
+        assert!(d.anonymous_authenticated);
+        assert!(!d.anonymous);
+        // Bit 2 is set in the wire flags word ([100..104] BE).
+        let buf = p.encode();
+        let flags = u32::from_be_bytes([buf[100], buf[101], buf[102], buf[103]]);
+        assert_eq!(
+            flags & IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED,
+            IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED
+        );
+        assert_eq!(flags & IPC_SEND_FLAG_REQUIRE_ACK, IPC_SEND_FLAG_REQUIRE_ACK);
     }
 
     #[test]
