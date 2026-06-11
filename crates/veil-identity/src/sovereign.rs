@@ -351,6 +351,7 @@ impl SovereignIdentity {
         timestamp: u64,
         nonce: u64,
         data: Vec<u8>,
+        reply_block: Option<veil_proto::ReplyBlock>,
     ) -> veil_proto::AuthAppDeliver {
         let mut p = veil_proto::AuthAppDeliver {
             version: veil_proto::AuthAppDeliver::VERSION,
@@ -362,8 +363,9 @@ impl SovereignIdentity {
             app_id,
             endpoint_id,
             data,
-            // r1: senders do not yet attach a reply block (wired in r3).
-            reply_block: None,
+            // Optional one-time reply path — signed so a relay can't forge it.
+            // `None` for one-way sends.
+            reply_block,
             signature: Vec::new(),
         };
         p.signature = self.identity_sk.sign(&p.signing_bytes());
@@ -885,7 +887,15 @@ mod tests {
         let now = 1_700_000_100u64;
         let bob = [0xBB; 32]; // recipient
 
-        let p = sov.sign_auth_deliver(bob, [0xCC; 32], 9, now, 0x1234, b"hi from alice".to_vec());
+        let p = sov.sign_auth_deliver(
+            bob,
+            [0xCC; 32],
+            9,
+            now,
+            0x1234,
+            b"hi from alice".to_vec(),
+            None,
+        );
         assert_eq!(p.sender_node_id, *sov.node_id());
         assert_eq!(p.sig_key_idx, sov.sig_key_idx);
 
@@ -914,6 +924,60 @@ mod tests {
             )
             .is_err(),
             "tampered delivery must fail verify",
+        );
+    }
+
+    #[test]
+    fn sign_auth_deliver_with_reply_block_verifies_and_binds() {
+        use crate::auth_deliver::{DEFAULT_AUTH_DELIVER_FRESHNESS_SECS, verify_auth_deliver};
+        let (dir, _out) = fresh_dir_with_identity();
+        let sov = SovereignIdentity::load_from_dir(&dir).unwrap();
+        let now = 1_700_000_100u64;
+        let bob = [0xBB; 32];
+        let rb = veil_proto::ReplyBlock {
+            rendezvous_node_id: [0x1A; 32],
+            auth_cookie: [0x2B; 16],
+            x25519_pk: [0x3C; 32],
+            reply_app_id: [0x4D; 32],
+            reply_endpoint_id: 5,
+        };
+
+        let p = sov.sign_auth_deliver(
+            bob,
+            [0xCC; 32],
+            9,
+            now,
+            0x1234,
+            b"hi + reply path".to_vec(),
+            Some(rb.clone()),
+        );
+        // The signed reply block survives a wire round-trip.
+        let decoded = veil_proto::AuthAppDeliver::decode(&p.encode()).unwrap();
+        assert_eq!(decoded.reply_block, Some(rb));
+        // It verifies as-is.
+        assert_eq!(
+            verify_auth_deliver(
+                &decoded,
+                &sov.document,
+                &bob,
+                now,
+                DEFAULT_AUTH_DELIVER_FRESHNESS_SECS
+            ),
+            Ok(()),
+        );
+        // Tampering the reply block breaks the signature.
+        let mut bad = decoded.clone();
+        bad.reply_block.as_mut().unwrap().rendezvous_node_id = [0xEE; 32];
+        assert!(
+            verify_auth_deliver(
+                &bad,
+                &sov.document,
+                &bob,
+                now,
+                DEFAULT_AUTH_DELIVER_FRESHNESS_SECS
+            )
+            .is_err(),
+            "a relay altering the reply path must fail verify",
         );
     }
 

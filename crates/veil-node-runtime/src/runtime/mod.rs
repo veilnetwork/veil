@@ -3098,6 +3098,7 @@ impl NodeRuntime {
             now_unix,
             nonce,
             data.to_vec(),
+            None, // direct onion path: no reply block (r3 wires rendezvous replies)
         );
         let auth_bytes = auth.encode();
         // Final-hop tag byte: kind = APP_DELIVER_AUTH tells the receiver
@@ -6025,6 +6026,7 @@ impl NodeServices {
             now_unix,
             nonce,
             data.to_vec(),
+            None, // r3 attaches a reply block here when the sender wants a reply
         );
         let auth_bytes = auth.encode();
         if auth_bytes.len() > veil_proto::MAX_AUTH_DELIVER_MSG_BYTES {
