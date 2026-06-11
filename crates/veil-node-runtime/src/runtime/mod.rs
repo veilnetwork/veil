@@ -3345,7 +3345,14 @@ impl NodeRuntime {
             endpoint_id: target_endpoint_id,
             data: veil_bufpool::pooled_shared_from_vec(data.to_vec()),
         };
+        // Tag the sealed plaintext so the receiver can distinguish a plain
+        // delivery from an authenticated one (`send_via_rendezvous_authenticated`
+        // tags APP_DELIVER_AUTH). The tag is INSIDE the seal, so the rendezvous
+        // relay never sees it.
         let app_deliver_bytes = app_deliver.encode();
+        let mut sealed_plaintext = Vec::with_capacity(1 + app_deliver_bytes.len());
+        sealed_plaintext.push(final_hop_kind::APP_DELIVER);
+        sealed_plaintext.extend_from_slice(&app_deliver_bytes);
 
         // Step 2: seal to receiver_x25519_pk. Rendezvous cannot read
         // this — only the receiver after their `decrypt_introduce`.
@@ -3354,7 +3361,7 @@ impl NodeRuntime {
         // reporting (caller's recourse is the same: shrink payload or
         // retry).
         let ciphertext =
-            encrypt_introduce(&app_deliver_bytes, &ad.receiver_x25519_pk).map_err(|_| {
+            encrypt_introduce(&sealed_plaintext, &ad.receiver_x25519_pk).map_err(|_| {
                 veil_anonymity::sender::SenderError::PayloadTooLarge {
                     hop_count,
                     got: data.len(),

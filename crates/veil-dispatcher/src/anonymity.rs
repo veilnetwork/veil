@@ -52,7 +52,7 @@ use veil_util::{lock, wlock};
 #[cfg(test)]
 use std::sync::Arc;
 
-use super::{DispatchResult, FrameDispatcher};
+use super::{AuthDeliverInbound, DispatchResult, FrameDispatcher};
 use veil_anonymity::{
     cell::CELL_SIZE,
     packet::{CellPeelResult, peel_anonymous_cell},
@@ -251,35 +251,39 @@ impl FrameDispatcher {
     /// learns from an app-layer timeout, never a synchronous error — which
     /// would leak first-hop reachability).
     fn handle_final_auth_deliver(&self, body: &[u8]) -> DispatchResult {
-        let auth = match veil_proto::AuthAppDeliver::decode(body) {
-            Ok(a) => a,
-            Err(e) => {
-                self.logger.info(
-                    "anonymity.relay_chain.auth.decode_failed",
-                    format!("AuthAppDeliver decode failed ({} B): {e}", body.len()),
-                );
-                return DispatchResult::NoResponse;
-            }
+        match veil_proto::AuthAppDeliver::decode(body) {
+            Ok(auth) => self.enqueue_auth_deliver(AuthDeliverInbound::Full(Box::new(auth))),
+            Err(e) => self.logger.info(
+                "anonymity.relay_chain.auth.decode_failed",
+                format!("AuthAppDeliver decode failed ({} B): {e}", body.len()),
+            ),
+        }
+        DispatchResult::NoResponse
+    }
+
+    /// Hand one inbound authenticated delivery (whole message or fragment) to
+    /// the runtime-owned async verify+deliver task via `auth_deliver_tx`. The
+    /// dispatcher is SYNC and has no identity resolver, while verification needs
+    /// an async DHT resolve — so resolve + verify + replay + (reassembly +)
+    /// delivery all happen off-thread. `auth_deliver_tx` is `None` on
+    /// dispatchers the runtime never wired (test harnesses) → silent drop, same
+    /// policy as an unbound endpoint. A full channel also drops (best-effort;
+    /// the sender learns from an app-layer timeout, never a synchronous error —
+    /// which would leak reachability).
+    fn enqueue_auth_deliver(&self, inbound: AuthDeliverInbound) {
+        let Some(tx) = lock!(self.auth_deliver_tx).as_ref().cloned() else {
+            self.logger.info(
+                "anonymity.relay_chain.auth.unwired",
+                "authenticated delivery received but no verify task wired; dropped",
+            );
+            return;
         };
-        let tx = match lock!(self.auth_deliver_tx).as_ref().cloned() {
-            Some(tx) => tx,
-            None => {
-                self.logger.info(
-                    "anonymity.relay_chain.auth.unwired",
-                    "authenticated delivery received but no verify task wired; dropped",
-                );
-                return DispatchResult::NoResponse;
-            }
-        };
-        if let Err(e) = tx.try_send(auth) {
-            // Channel full or closed — best-effort drop. Don't block the
-            // session read loop on a slow verifier.
+        if let Err(e) = tx.try_send(inbound) {
             self.logger.info(
                 "anonymity.relay_chain.auth.enqueue_dropped",
                 format!("auth-deliver verify queue unavailable; dropped: {e}"),
             );
         }
-        DispatchResult::NoResponse
     }
 
     /// Final-hop kind=INTRODUCE: this node is a rendezvous; look up
@@ -470,38 +474,68 @@ impl FrameDispatcher {
                 return DispatchResult::NoResponse;
             }
         };
-        // Decrypted plaintext IS an AppDeliverPayload (no tag byte —
-        // it's already inside the rendezvous-shielded layer and delivery
-        // path is unambiguous).
-        let app_deliver = match AppDeliverPayload::decode(&plaintext) {
-            Ok(p) => p,
-            Err(e) => {
-                self.logger.info(
-                    "anonymity.relay_chain.forward.payload_decode_failed",
-                    format!("AppDeliverPayload decode: {e}"),
-                );
-                return DispatchResult::NoResponse;
-            }
+        // The decrypted plaintext is tagged with a `final_hop_kind` so the
+        // receiver can tell a plain delivery from an authenticated one. Plain
+        // rendezvous sends `APP_DELIVER`; the authenticated path sends
+        // `APP_DELIVER_AUTH` fragments (reassembled + verified by the runtime
+        // task — the recipient learns the VERIFIED sender).
+        let Some((&kind, inner)) = plaintext.split_first() else {
+            self.logger.info(
+                "anonymity.relay_chain.forward.empty",
+                "decrypted rendezvous plaintext is empty; dropped",
+            );
+            return DispatchResult::NoResponse;
         };
-        let data_len = app_deliver.data.len();
-        let endpoint_id = app_deliver.endpoint_id;
-        let delivered = self.app_registry.route_ipc_deliver(
-            app_deliver.src_node_id,
-            app_deliver.src_app_id,
-            app_deliver.app_id,
-            endpoint_id,
-            app_deliver.data,
-        );
-        if delivered {
-            self.logger.info(
-                "anonymity.relay_chain.forward.delivered",
-                format!("delivered {data_len} B via rendezvous to endpoint_id={endpoint_id}",),
-            );
-        } else {
-            self.logger.info(
-                "anonymity.relay_chain.forward.unbound",
-                format!("no app bound to endpoint_id={endpoint_id}; {data_len} B dropped",),
-            );
+        match kind {
+            final_hop_kind::APP_DELIVER => {
+                let app_deliver = match AppDeliverPayload::decode(inner) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.logger.info(
+                            "anonymity.relay_chain.forward.payload_decode_failed",
+                            format!("AppDeliverPayload decode: {e}"),
+                        );
+                        return DispatchResult::NoResponse;
+                    }
+                };
+                let data_len = app_deliver.data.len();
+                let endpoint_id = app_deliver.endpoint_id;
+                let delivered = self.app_registry.route_ipc_deliver(
+                    app_deliver.src_node_id,
+                    app_deliver.src_app_id,
+                    app_deliver.app_id,
+                    endpoint_id,
+                    app_deliver.data,
+                );
+                if delivered {
+                    self.logger.info(
+                        "anonymity.relay_chain.forward.delivered",
+                        format!(
+                            "delivered {data_len} B via rendezvous to endpoint_id={endpoint_id}"
+                        ),
+                    );
+                } else {
+                    self.logger.info(
+                        "anonymity.relay_chain.forward.unbound",
+                        format!("no app bound to endpoint_id={endpoint_id}; {data_len} B dropped"),
+                    );
+                }
+            }
+            final_hop_kind::APP_DELIVER_AUTH => {
+                // A fragment of a signed AuthAppDeliver — hand to the runtime
+                // task to reassemble + verify + deliver with the VERIFIED sender.
+                match veil_proto::AuthDeliverFragment::decode(inner) {
+                    Ok(frag) => self.enqueue_auth_deliver(AuthDeliverInbound::Fragment(frag)),
+                    Err(e) => self.logger.info(
+                        "anonymity.relay_chain.forward.auth_decode_failed",
+                        format!("AuthDeliverFragment decode: {e}"),
+                    ),
+                }
+            }
+            other => self.logger.info(
+                "anonymity.relay_chain.forward.unknown_kind",
+                format!("rendezvous plaintext kind=0x{other:02x} not recognised; dropped"),
+            ),
         }
         DispatchResult::NoResponse
     }
@@ -833,10 +867,15 @@ mod tests {
             .await
             .expect("auth deliver was not enqueued to the verify task")
             .expect("verify-task channel closed");
-        assert_eq!(got.sender_node_id, [0x5A; 32]);
-        assert_eq!(got.nonce, 42);
-        assert_eq!(got.endpoint_id, 7);
-        assert_eq!(got.data, b"authed-hello");
+        // The direct onion final-hop enqueues a whole message.
+        let auth = match got {
+            crate::AuthDeliverInbound::Full(a) => a,
+            crate::AuthDeliverInbound::Fragment(_) => panic!("expected Full, got Fragment"),
+        };
+        assert_eq!(auth.sender_node_id, [0x5A; 32]);
+        assert_eq!(auth.nonce, 42);
+        assert_eq!(auth.endpoint_id, 7);
+        assert_eq!(auth.data, b"authed-hello");
     }
 
     /// With no verify task wired (`auth_deliver_tx = None`, the default on test
