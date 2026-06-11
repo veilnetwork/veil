@@ -747,6 +747,93 @@ impl AuthAppDeliver {
     }
 }
 
+// ── AuthDeliverFragment ──────────────────────────────────────────────────────
+
+/// Max fragments a single authenticated rendezvous message may be split into.
+/// Bounds the receiver's per-message reassembly buffer count.
+pub const MAX_AUTH_DELIVER_FRAGMENTS: u16 = 64;
+
+/// Max reassembled `AuthAppDeliver` wire size (across all fragments). Bounds
+/// receiver memory per message; the sender enforces the matching application
+/// payload ceiling before signing. ~6 KiB ≈ 64 fragments of useful chunk.
+pub const MAX_AUTH_DELIVER_MSG_BYTES: usize = 6144;
+
+/// One fragment of a signed [`AuthAppDeliver`], for the rendezvous path where a
+/// single onion cell cannot carry the whole signed message (sign-whole-then-
+/// fragment). The sender splits `AuthAppDeliver::encode()` into chunks; each
+/// fragment is independently sealed + onion-routed to the rendezvous. The
+/// receiver reassembles by `msg_id` and verifies the whole message ONCE — the
+/// single signature integrity-protects the reassembly (tamper / truncation /
+/// reorder → BadSignature).
+///
+/// Carried as the SEALED introduce plaintext under `final_hop_kind::
+/// APP_DELIVER_AUTH` (the 1-byte tag precedes this struct). A small message is
+/// simply `frag_count == 1`.
+///
+/// Wire layout (big-endian):
+/// ```text
+/// [0..16]   msg_id [16]       random; ties a message's fragments together
+/// [16..18]  frag_count u16    total fragments (1..=MAX_AUTH_DELIVER_FRAGMENTS)
+/// [18..20]  frag_idx u16      0-based, < frag_count
+/// [20..]    chunk             slice of AuthAppDeliver::encode()
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthDeliverFragment {
+    /// Random per-message id grouping a message's fragments.
+    pub msg_id: [u8; 16],
+    /// Total number of fragments in this message.
+    pub frag_count: u16,
+    /// 0-based index of this fragment.
+    pub frag_idx: u16,
+    /// This fragment's slice of the signed `AuthAppDeliver` bytes.
+    pub chunk: Vec<u8>,
+}
+
+impl AuthDeliverFragment {
+    /// Fixed header before `chunk`.
+    pub const HEADER_SIZE: usize = 16 + 2 + 2;
+
+    /// Encode to wire bytes (header || chunk).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.chunk.len());
+        buf.extend_from_slice(&self.msg_id);
+        buf.extend_from_slice(&self.frag_count.to_be_bytes());
+        buf.extend_from_slice(&self.frag_idx.to_be_bytes());
+        buf.extend_from_slice(&self.chunk);
+        buf
+    }
+
+    /// Parse from wire bytes. Validates `frag_count` is in range and
+    /// `frag_idx < frag_count`, and that a non-empty chunk is present.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() <= Self::HEADER_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::HEADER_SIZE + 1,
+                got: buf.len(),
+            });
+        }
+        let msg_id = super::read_array::<16>(buf, 0)?;
+        let frag_count = u16::from_be_bytes([buf[16], buf[17]]);
+        let frag_idx = u16::from_be_bytes([buf[18], buf[19]]);
+        if frag_count == 0 || frag_count > MAX_AUTH_DELIVER_FRAGMENTS {
+            return Err(ProtoError::Malformed(format!(
+                "AuthDeliverFragment: frag_count {frag_count} out of range (1..={MAX_AUTH_DELIVER_FRAGMENTS})"
+            )));
+        }
+        if frag_idx >= frag_count {
+            return Err(ProtoError::Malformed(format!(
+                "AuthDeliverFragment: frag_idx {frag_idx} >= frag_count {frag_count}"
+            )));
+        }
+        Ok(Self {
+            msg_id,
+            frag_count,
+            frag_idx,
+            chunk: buf[Self::HEADER_SIZE..].to_vec(),
+        })
+    }
+}
+
 // ── AppIpcSendPayload ─────────────────────────────────────────────────────── // STABLE v1
 
 /// Flag bit for `AppIpcSendPayload.flags`: request end-to-end delivery ACK.
@@ -4686,6 +4773,52 @@ mod tests {
             AuthAppDeliver::decode(&p.encode()),
             Err(ProtoError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn auth_deliver_fragment_roundtrip() {
+        let f = AuthDeliverFragment {
+            msg_id: [0x7A; 16],
+            frag_count: 5,
+            frag_idx: 2,
+            chunk: b"a slice of the signed AuthAppDeliver".to_vec(),
+        };
+        let decoded = AuthDeliverFragment::decode(&f.encode()).expect("decode");
+        assert_eq!(decoded, f);
+    }
+
+    #[test]
+    fn auth_deliver_fragment_rejects_bad_indices_and_empty() {
+        let base = AuthDeliverFragment {
+            msg_id: [0; 16],
+            frag_count: 3,
+            frag_idx: 0,
+            chunk: vec![1, 2, 3],
+        };
+        // frag_idx >= frag_count.
+        let mut bad = base.clone();
+        bad.frag_idx = 3;
+        assert!(matches!(
+            AuthDeliverFragment::decode(&bad.encode()),
+            Err(ProtoError::Malformed(_))
+        ));
+        // frag_count = 0.
+        let mut zero = base.clone();
+        zero.frag_count = 0;
+        zero.frag_idx = 0;
+        assert!(matches!(
+            AuthDeliverFragment::decode(&zero.encode()),
+            Err(ProtoError::Malformed(_))
+        ));
+        // frag_count over cap.
+        let mut over = base.clone();
+        over.frag_count = MAX_AUTH_DELIVER_FRAGMENTS + 1;
+        assert!(matches!(
+            AuthDeliverFragment::decode(&over.encode()),
+            Err(ProtoError::Malformed(_))
+        ));
+        // Header-only (no chunk) → too short.
+        assert!(AuthDeliverFragment::decode(&[0u8; AuthDeliverFragment::HEADER_SIZE]).is_err());
     }
 
     #[test]
