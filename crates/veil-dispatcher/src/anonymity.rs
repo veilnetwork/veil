@@ -853,6 +853,7 @@ mod tests {
             app_id: [0xAB; 32],
             endpoint_id: 7,
             data: b"authed-hello".to_vec(),
+            reply_block: None,
             signature: vec![0u8; 64],
         };
         let mut onion_payload = vec![final_hop_kind::APP_DELIVER_AUTH];
@@ -908,6 +909,7 @@ mod tests {
             app_id: [0xAB; 32],
             endpoint_id: 7,
             data: b"x".to_vec(),
+            reply_block: None,
             signature: vec![0u8; 64],
         };
         let mut onion_payload = vec![final_hop_kind::APP_DELIVER_AUTH];

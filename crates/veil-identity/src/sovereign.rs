@@ -362,6 +362,8 @@ impl SovereignIdentity {
             app_id,
             endpoint_id,
             data,
+            // r1: senders do not yet attach a reply block (wired in r3).
+            reply_block: None,
             signature: Vec::new(),
         };
         p.signature = self.identity_sk.sign(&p.signing_bytes());

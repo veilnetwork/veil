@@ -580,10 +580,13 @@ pub const AUTH_APP_DELIVER_DOMAIN: &[u8] = b"veil-auth-onion-deliver:v1\0";
 /// [83..87]   endpoint_id u32 BE
 /// [87..91]   data_len u32 BE
 /// [91..91+data_len] data
+/// [..]       has_reply u8         (1 = a ReplyBlock follows, 0 = none)
+/// [..]       reply_block          (ReplyBlock::WIRE_SIZE B, only if has_reply)
 /// [..+2]     sig_len u16 BE
 /// [..]       signature            (Ed25519 = 64 B in v1)
 /// ```
-/// (`dst_node_id` is NOT on the wire — see above.)
+/// (`dst_node_id` is NOT on the wire — see above. The reply block, when
+/// present, is BEFORE the signature so the signature covers it.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthAppDeliver {
     /// Format version (1).
@@ -608,8 +611,81 @@ pub struct AuthAppDeliver {
     pub endpoint_id: u32,
     /// Application payload.
     pub data: Vec<u8>,
+    /// Optional one-time reply path (Mixminion-style reply block). When present
+    /// the recipient can reply WITHOUT the sender publishing a public
+    /// `RendezvousAd` — the sender embeds a sealed reply path here and registers
+    /// R-locally with the named rendezvous relay. Signed (part of
+    /// [`Self::signing_bytes`]) so a relay cannot forge/alter it. `None` =
+    /// one-way (no reply).
+    pub reply_block: Option<ReplyBlock>,
     /// Signature over [`Self::signing_bytes`] by the sender's subkey.
     pub signature: Vec<u8>,
+}
+
+/// One-time reply path embedded in an [`AuthAppDeliver`]. Lets the recipient
+/// route an authenticated reply back to the sender via the sender's chosen
+/// rendezvous relay, with NO public DHT footprint for the sender (presence-leak
+/// mitigation). The recipient seals the reply to `x25519_pk`, wraps it as an
+/// `IntroducePayload` with `auth_cookie`, and onion-routes it to
+/// `rendezvous_node_id`; the relay forwards by cookie to the sender's session.
+///
+/// Wire layout (fixed `WIRE_SIZE`, big-endian):
+/// ```text
+/// [0..32]   rendezvous_node_id [32]
+/// [32..48]  auth_cookie [16]
+/// [48..80]  x25519_pk [32]        sender's anonymity key (seal target)
+/// [80..112] reply_app_id [32]     sender's app that receives the reply
+/// [112..116] reply_endpoint_id u32 BE
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyBlock {
+    /// Rendezvous relay that forwards the reply to the original sender.
+    pub rendezvous_node_id: [u8; 32],
+    /// One-time cookie the sender registered with the relay.
+    pub auth_cookie: [u8; 16],
+    /// Sender's anonymity X25519 pubkey — the recipient seals the reply to it.
+    pub x25519_pk: [u8; 32],
+    /// Sender's app that receives the reply.
+    pub reply_app_id: [u8; 32],
+    /// Endpoint on `reply_app_id` that receives the reply.
+    pub reply_endpoint_id: u32,
+}
+
+impl ReplyBlock {
+    /// Fixed wire size.
+    pub const WIRE_SIZE: usize = 32 + 16 + 32 + 32 + 4;
+
+    fn write_into(&self, b: &mut Vec<u8>) {
+        b.extend_from_slice(&self.rendezvous_node_id);
+        b.extend_from_slice(&self.auth_cookie);
+        b.extend_from_slice(&self.x25519_pk);
+        b.extend_from_slice(&self.reply_app_id);
+        b.extend_from_slice(&self.reply_endpoint_id.to_be_bytes());
+    }
+
+    /// Encode to its fixed-size wire bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(Self::WIRE_SIZE);
+        self.write_into(&mut b);
+        b
+    }
+
+    /// Decode from exactly `WIRE_SIZE` bytes.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::WIRE_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::WIRE_SIZE,
+                got: buf.len(),
+            });
+        }
+        Ok(Self {
+            rendezvous_node_id: super::read_array::<32>(buf, 0)?,
+            auth_cookie: super::read_array::<16>(buf, 32)?,
+            x25519_pk: super::read_array::<32>(buf, 48)?,
+            reply_app_id: super::read_array::<32>(buf, 80)?,
+            reply_endpoint_id: super::read_u32_be(buf, 112)?,
+        })
+    }
 }
 
 impl AuthAppDeliver {
@@ -641,6 +717,15 @@ impl AuthAppDeliver {
         b.extend_from_slice(&self.app_id);
         b.extend_from_slice(&self.endpoint_id.to_be_bytes());
         b.extend_from_slice(&self.data);
+        // Optional reply block — a presence byte then its bytes (so the
+        // signature binds both whether a reply path exists AND its contents).
+        match &self.reply_block {
+            Some(rb) => {
+                b.push(1);
+                rb.write_into(&mut b);
+            }
+            None => b.push(0),
+        }
         b
     }
 
@@ -665,6 +750,15 @@ impl AuthAppDeliver {
         buf.extend_from_slice(&self.endpoint_id.to_be_bytes());
         buf.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
         buf.extend_from_slice(&self.data);
+        // Optional reply block (presence byte + bytes) — between data and the
+        // signature, matching `signing_bytes` so the sig covers it.
+        match &self.reply_block {
+            Some(rb) => {
+                buf.push(1);
+                rb.write_into(&mut buf);
+            }
+            None => buf.push(0),
+        }
         buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.signature);
         buf
@@ -701,8 +795,40 @@ impl AuthAppDeliver {
                     need: usize::MAX,
                     got: buf.len(),
                 })?;
-        // sig_len (u16) follows data.
-        let sig_len_end = data_end.checked_add(2).ok_or(ProtoError::BufferTooShort {
+        // Optional reply block: a presence byte at `data_end`, then (if 1) a
+        // fixed `ReplyBlock::WIRE_SIZE` section, before the signature.
+        if buf.len() <= data_end {
+            return Err(ProtoError::BufferTooShort {
+                need: data_end + 1,
+                got: buf.len(),
+            });
+        }
+        let (reply_block, reply_end) = match buf[data_end] {
+            0 => (None, data_end + 1),
+            1 => {
+                let rb_start = data_end + 1;
+                let rb_end = rb_start.checked_add(ReplyBlock::WIRE_SIZE).ok_or(
+                    ProtoError::BufferTooShort {
+                        need: usize::MAX,
+                        got: buf.len(),
+                    },
+                )?;
+                if buf.len() < rb_end {
+                    return Err(ProtoError::BufferTooShort {
+                        need: rb_end,
+                        got: buf.len(),
+                    });
+                }
+                (Some(ReplyBlock::decode(&buf[rb_start..rb_end])?), rb_end)
+            }
+            other => {
+                return Err(ProtoError::Malformed(format!(
+                    "AuthAppDeliver: invalid reply-presence byte {other}"
+                )));
+            }
+        };
+        // sig_len (u16) follows the (optional) reply block.
+        let sig_len_end = reply_end.checked_add(2).ok_or(ProtoError::BufferTooShort {
             need: usize::MAX,
             got: buf.len(),
         })?;
@@ -712,7 +838,7 @@ impl AuthAppDeliver {
                 got: buf.len(),
             });
         }
-        let sig_len = u16::from_be_bytes([buf[data_end], buf[data_end + 1]]) as usize;
+        let sig_len = u16::from_be_bytes([buf[reply_end], buf[reply_end + 1]]) as usize;
         if sig_len > Self::MAX_SIG_LEN {
             return Err(ProtoError::Malformed(format!(
                 "AuthAppDeliver: signature {sig_len} B exceeds cap {}",
@@ -742,6 +868,7 @@ impl AuthAppDeliver {
             app_id,
             endpoint_id,
             data: buf[Self::HEADER_SIZE..data_end].to_vec(),
+            reply_block,
             signature: buf[sig_len_end..total].to_vec(),
         })
     }
@@ -4729,6 +4856,7 @@ mod tests {
             app_id: [0xCC; 32],
             endpoint_id: 42,
             data: b"hi bob, it's authentically alice".to_vec(),
+            reply_block: None,
             signature: vec![0x5A; 64], // Ed25519-sized
         }
     }
@@ -4801,6 +4929,49 @@ mod tests {
             AuthAppDeliver::decode(&p.encode()),
             Err(ProtoError::Malformed(_))
         ));
+    }
+
+    fn sample_reply_block() -> ReplyBlock {
+        ReplyBlock {
+            rendezvous_node_id: [0x11; 32],
+            auth_cookie: [0x22; 16],
+            x25519_pk: [0x33; 32],
+            reply_app_id: [0x44; 32],
+            reply_endpoint_id: 99,
+        }
+    }
+
+    #[test]
+    fn reply_block_roundtrip() {
+        let rb = sample_reply_block();
+        assert_eq!(rb.encode().len(), ReplyBlock::WIRE_SIZE);
+        assert_eq!(ReplyBlock::decode(&rb.encode()).unwrap(), rb);
+        assert!(ReplyBlock::decode(&[0u8; ReplyBlock::WIRE_SIZE - 1]).is_err());
+    }
+
+    #[test]
+    fn auth_app_deliver_with_reply_block_roundtrips() {
+        let mut p = sample_auth_deliver();
+        p.reply_block = Some(sample_reply_block());
+        let decoded = AuthAppDeliver::decode(&p.encode()).expect("decode");
+        // Only dst_node_id is dropped on the wire; the reply block survives.
+        let mut expected = p.clone();
+        expected.dst_node_id = [0u8; 32];
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.reply_block, Some(sample_reply_block()));
+    }
+
+    #[test]
+    fn auth_app_deliver_signing_binds_reply_block() {
+        let none = sample_auth_deliver(); // reply_block: None
+        let mut some = none.clone();
+        some.reply_block = Some(sample_reply_block());
+        // Presence of a reply block changes the signed bytes.
+        assert_ne!(none.signing_bytes(), some.signing_bytes());
+        // Altering the block's contents changes the signed bytes (unforgeable).
+        let mut other = some.clone();
+        other.reply_block.as_mut().unwrap().auth_cookie = [0xFF; 16];
+        assert_ne!(some.signing_bytes(), other.signing_bytes());
     }
 
     #[test]
