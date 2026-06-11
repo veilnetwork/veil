@@ -37,6 +37,7 @@
 pub mod cell;
 pub mod circuit;
 pub mod circuit_builder;
+pub mod circuit_data;
 pub mod circuit_setup;
 pub mod circuit_wire;
 pub mod directory;
