@@ -1674,6 +1674,8 @@ impl NodeRuntime {
             capture_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capture_rate_limit: Arc::new(veil_dispatcher_state::CaptureRateLimiter::new()),
             route_miss_tx: Arc::new(Mutex::new(None)),
+            // Wired post-construction by `spawn_auth_deliver_handler`.
+            auth_deliver_tx: Arc::new(Mutex::new(None)),
             neighbor_scorer: Arc::clone(&shared_neighbor_scorer),
             local_vivaldi: Some(Arc::clone(&shared_vivaldi)),
             peer_vivaldi: Arc::clone(&shared_peer_vivaldi),
@@ -4380,7 +4382,7 @@ impl NodeServices {
         let mut visited: Vec<[u8; 32]> = vec![current_node_id];
 
         for hop in 0..=MAX_MIGRATION_CHAIN_DEPTH {
-            let validated = self
+            let (validated, _doc) = self
                 .resolve_one_identity_doc(current_node_id, now_unix_secs, timeout)
                 .await?;
 
@@ -4419,7 +4421,10 @@ impl NodeServices {
         now_unix_secs: u64,
         timeout: std::time::Duration,
     ) -> std::result::Result<
-        veil_identity::verify::ValidatedIdentity,
+        (
+            veil_identity::verify::ValidatedIdentity,
+            veil_proto::identity_document::IdentityDocument,
+        ),
         veil_identity::resolver::ResolveError,
     > {
         use veil_identity::resolver::ResolveError;
@@ -4469,7 +4474,9 @@ impl NodeServices {
                 veil_util::hex_short(&node_id),
             )));
         }
-        verify_identity_document(&doc, now_unix_secs).map_err(ResolveError::IdentityDocInvalid)
+        let validated = verify_identity_document(&doc, now_unix_secs)
+            .map_err(ResolveError::IdentityDocInvalid)?;
+        Ok((validated, doc))
     }
 
     async fn fetch_best_migration_cert_for(

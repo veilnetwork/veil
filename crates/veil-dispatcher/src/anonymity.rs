@@ -46,7 +46,7 @@
 use veil_cfg::NodeId;
 #[cfg(test)]
 use veil_types::NodeIdBytes;
-use veil_util::wlock;
+use veil_util::{lock, wlock};
 // `Arc` referenced only from #[cfg(test)] paths in this file;
 // cfg-gating the import avoids unused-import warning in non-test builds.
 #[cfg(test)]
@@ -166,6 +166,7 @@ impl FrameDispatcher {
                 let body = &payload[1..];
                 match kind {
                     final_hop_kind::APP_DELIVER => self.handle_final_app_deliver(body),
+                    final_hop_kind::APP_DELIVER_AUTH => self.handle_final_auth_deliver(body),
                     final_hop_kind::INTRODUCE => self.handle_final_introduce(body),
                     other => {
                         self.logger.info(
@@ -231,6 +232,51 @@ impl FrameDispatcher {
             self.logger.info(
                 "anonymity.relay_chain.final.unbound",
                 format!("no app bound to endpoint_id={endpoint_id}; {data_len} B dropped",),
+            );
+        }
+        DispatchResult::NoResponse
+    }
+
+    /// Final-hop kind=APP_DELIVER_AUTH: an authenticated anonymous delivery
+    /// (Epic 482 v1). Decode the `AuthAppDeliver` and hand it to the
+    /// runtime-owned async verify+deliver task via `auth_deliver_tx`. This
+    /// dispatcher is SYNC and has no identity resolver, while verification
+    /// needs an async DHT resolve of the sender's identity document — so the
+    /// crypto + replay check + final delivery all happen off-thread in the
+    /// runtime task. Here we only decode (cheap, leak-free) and enqueue.
+    ///
+    /// `auth_deliver_tx` is `None` on dispatchers the runtime never wired
+    /// (test harnesses) → the cell is dropped, same silent-drop policy as an
+    /// unbound endpoint. A full channel also drops (best-effort; the sender
+    /// learns from an app-layer timeout, never a synchronous error — which
+    /// would leak first-hop reachability).
+    fn handle_final_auth_deliver(&self, body: &[u8]) -> DispatchResult {
+        let auth = match veil_proto::AuthAppDeliver::decode(body) {
+            Ok(a) => a,
+            Err(e) => {
+                self.logger.info(
+                    "anonymity.relay_chain.auth.decode_failed",
+                    format!("AuthAppDeliver decode failed ({} B): {e}", body.len()),
+                );
+                return DispatchResult::NoResponse;
+            }
+        };
+        let tx = match lock!(self.auth_deliver_tx).as_ref().cloned() {
+            Some(tx) => tx,
+            None => {
+                self.logger.info(
+                    "anonymity.relay_chain.auth.unwired",
+                    "authenticated delivery received but no verify task wired; dropped",
+                );
+                return DispatchResult::NoResponse;
+            }
+        };
+        if let Err(e) = tx.try_send(auth) {
+            // Channel full or closed — best-effort drop. Don't block the
+            // session read loop on a slow verifier.
+            self.logger.info(
+                "anonymity.relay_chain.auth.enqueue_dropped",
+                format!("auth-deliver verify queue unavailable; dropped: {e}"),
             );
         }
         DispatchResult::NoResponse
@@ -736,6 +782,100 @@ mod tests {
         assert!(
             matches!(result, DispatchResult::NoResponse),
             "malformed AppDeliverPayload must silent-drop: got {result:?}"
+        );
+    }
+
+    /// An `APP_DELIVER_AUTH` final-hop cell decodes the `AuthAppDeliver` and
+    /// hands it to the runtime verify task over `auth_deliver_tx`. The crypto
+    /// verification + replay check are async (need a DHT identity resolve) and
+    /// live in the runtime task; here we assert the sync dispatcher's hand-off.
+    #[tokio::test]
+    async fn auth_deliver_final_hop_enqueues_to_verify_task() {
+        use veil_anonymity::rendezvous::final_hop_kind;
+        let mut dispatcher = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let local_sk = StaticSecret::random_from_rng(OsRng);
+        let local_pk = PublicKey::from(&local_sk).to_bytes();
+        dispatcher.anonymity_x25519_sk = Some(Arc::new(local_sk));
+
+        // Wire a verify-task channel in place of the real runtime task.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        *veil_util::lock!(dispatcher.auth_deliver_tx) = Some(tx);
+
+        let auth = veil_proto::AuthAppDeliver {
+            version: veil_proto::AuthAppDeliver::VERSION,
+            sender_node_id: [0x5A; 32],
+            sig_key_idx: 0,
+            timestamp: 1_700_000_000,
+            nonce: 42,
+            dst_node_id: [0xCC; 32],
+            app_id: [0xAB; 32],
+            endpoint_id: 7,
+            data: b"authed-hello".to_vec(),
+            signature: vec![0u8; 64],
+        };
+        let mut onion_payload = vec![final_hop_kind::APP_DELIVER_AUTH];
+        onion_payload.extend_from_slice(&auth.encode());
+
+        let me_as_hop = Hop {
+            node_id: [0xCC; 32],
+            pubkey: local_pk,
+        };
+        let cell = build_anonymous_cell(&onion_payload, &[me_as_hop]).unwrap();
+        let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
+        hdr.body_len = CELL_SIZE as u32;
+        let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0x11u8; 32]));
+        assert!(
+            matches!(result, DispatchResult::NoResponse),
+            "auth final-hop accept must yield NoResponse: got {result:?}"
+        );
+
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("auth deliver was not enqueued to the verify task")
+            .expect("verify-task channel closed");
+        assert_eq!(got.sender_node_id, [0x5A; 32]);
+        assert_eq!(got.nonce, 42);
+        assert_eq!(got.endpoint_id, 7);
+        assert_eq!(got.data, b"authed-hello");
+    }
+
+    /// With no verify task wired (`auth_deliver_tx = None`, the default on test
+    /// dispatchers), an `APP_DELIVER_AUTH` cell is silently dropped — same
+    /// anti-leak policy as an unbound endpoint, and crucially it must not panic
+    /// on the unset channel.
+    #[tokio::test]
+    async fn auth_deliver_final_hop_drops_when_verify_task_unwired() {
+        use veil_anonymity::rendezvous::final_hop_kind;
+        let mut dispatcher = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let local_sk = StaticSecret::random_from_rng(OsRng);
+        let local_pk = PublicKey::from(&local_sk).to_bytes();
+        dispatcher.anonymity_x25519_sk = Some(Arc::new(local_sk));
+
+        let auth = veil_proto::AuthAppDeliver {
+            version: veil_proto::AuthAppDeliver::VERSION,
+            sender_node_id: [0x5A; 32],
+            sig_key_idx: 0,
+            timestamp: 1_700_000_000,
+            nonce: 1,
+            dst_node_id: [0xCC; 32],
+            app_id: [0xAB; 32],
+            endpoint_id: 7,
+            data: b"x".to_vec(),
+            signature: vec![0u8; 64],
+        };
+        let mut onion_payload = vec![final_hop_kind::APP_DELIVER_AUTH];
+        onion_payload.extend_from_slice(&auth.encode());
+        let me_as_hop = Hop {
+            node_id: [0xCC; 32],
+            pubkey: local_pk,
+        };
+        let cell = build_anonymous_cell(&onion_payload, &[me_as_hop]).unwrap();
+        let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
+        hdr.body_len = CELL_SIZE as u32;
+        let result = dispatcher.dispatch_relay_chain(&hdr, &cell, NodeId::from([0x11u8; 32]));
+        assert!(
+            matches!(result, DispatchResult::NoResponse),
+            "unwired auth final-hop must silent-drop: got {result:?}"
         );
     }
 
