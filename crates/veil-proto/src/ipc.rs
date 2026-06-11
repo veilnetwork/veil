@@ -567,14 +567,14 @@ pub const AUTH_APP_DELIVER_DOMAIN: &[u8] = b"veil-auth-onion-deliver:v1\0";
 /// ```text
 /// [0]        version u8 (= 1)
 /// [1..33]    sender_node_id [32]
-/// [33]       sig_key_idx u8       index into the sender's IdentityDocument subkeys
-/// [34..42]   timestamp u64 BE     unix secs (freshness)
-/// [42..50]   nonce u64 BE         fresh-random per message (replay)
-/// [50..82]   dst_node_id [32]     the intended recipient (binds the envelope)
-/// [82..114]  app_id [32]          destination app
-/// [114..118] endpoint_id u32 BE
-/// [118..122] data_len u32 BE
-/// [122..122+data_len] data
+/// [33..35]   sig_key_idx u16 BE   index into the sender's IdentityDocument subkeys
+/// [35..43]   timestamp u64 BE     unix secs (freshness)
+/// [43..51]   nonce u64 BE         fresh-random per message (replay)
+/// [51..83]   dst_node_id [32]     the intended recipient (binds the envelope)
+/// [83..115]  app_id [32]          destination app
+/// [115..119] endpoint_id u32 BE
+/// [119..123] data_len u32 BE
+/// [123..123+data_len] data
 /// [..+2]     sig_len u16 BE
 /// [..]       signature            (Ed25519 = 64 B in v1)
 /// ```
@@ -586,7 +586,7 @@ pub struct AuthAppDeliver {
     /// `signature`, NOT trusted until then.
     pub sender_node_id: [u8; 32],
     /// Index of the signing subkey in the sender's IdentityDocument.
-    pub sig_key_idx: u8,
+    pub sig_key_idx: u16,
     /// Unix-seconds timestamp; recipient enforces a freshness window.
     pub timestamp: u64,
     /// Fresh random per-message nonce; recipient keeps a per-sender replay window.
@@ -608,7 +608,7 @@ impl AuthAppDeliver {
     /// Current wire version.
     pub const VERSION: u8 = 1;
     /// Fixed header size before `data` (version..data_len inclusive).
-    const HEADER_SIZE: usize = 1 + 32 + 1 + 8 + 8 + 32 + 32 + 4 + 4;
+    const HEADER_SIZE: usize = 1 + 32 + 2 + 8 + 8 + 32 + 32 + 4 + 4;
     /// Cap on the signature length accepted on decode (Falcon-512 ≈ 690 B; v1
     /// uses Ed25519 = 64 B, but the cap leaves room for the hybrid v2 subkey).
     pub const MAX_SIG_LEN: usize = 1024;
@@ -622,7 +622,7 @@ impl AuthAppDeliver {
         b.extend_from_slice(AUTH_APP_DELIVER_DOMAIN);
         b.push(self.version);
         b.extend_from_slice(&self.sender_node_id);
-        b.push(self.sig_key_idx);
+        b.extend_from_slice(&self.sig_key_idx.to_be_bytes());
         b.extend_from_slice(&self.timestamp.to_be_bytes());
         b.extend_from_slice(&self.nonce.to_be_bytes());
         b.extend_from_slice(&self.dst_node_id);
@@ -638,7 +638,7 @@ impl AuthAppDeliver {
             Vec::with_capacity(Self::HEADER_SIZE + self.data.len() + 2 + self.signature.len());
         buf.push(self.version);
         buf.extend_from_slice(&self.sender_node_id);
-        buf.push(self.sig_key_idx);
+        buf.extend_from_slice(&self.sig_key_idx.to_be_bytes());
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
         buf.extend_from_slice(&self.nonce.to_be_bytes());
         buf.extend_from_slice(&self.dst_node_id);
@@ -667,13 +667,13 @@ impl AuthAppDeliver {
             )));
         }
         let sender_node_id = super::read_array::<32>(buf, 1)?;
-        let sig_key_idx = buf[33];
-        let timestamp = super::read_u64_be(buf, 34)?;
-        let nonce = super::read_u64_be(buf, 42)?;
-        let dst_node_id = super::read_array::<32>(buf, 50)?;
-        let app_id = super::read_array::<32>(buf, 82)?;
-        let endpoint_id = super::read_u32_be(buf, 114)?;
-        let data_len = super::read_u32_be(buf, 118)? as usize;
+        let sig_key_idx = u16::from_be_bytes([buf[33], buf[34]]);
+        let timestamp = super::read_u64_be(buf, 35)?;
+        let nonce = super::read_u64_be(buf, 43)?;
+        let dst_node_id = super::read_array::<32>(buf, 51)?;
+        let app_id = super::read_array::<32>(buf, 83)?;
+        let endpoint_id = super::read_u32_be(buf, 115)?;
+        let data_len = super::read_u32_be(buf, 119)? as usize;
         let data_end =
             Self::HEADER_SIZE
                 .checked_add(data_len)
