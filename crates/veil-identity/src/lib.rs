@@ -31,6 +31,7 @@
 //! [`pair_runtime`] — pair-with-other-device orchestration.
 //! [`pair_transport`] — pair-session transport adapter.
 
+pub mod auth_deliver;
 pub mod error;
 pub mod freshness;
 pub mod identity_policy;
