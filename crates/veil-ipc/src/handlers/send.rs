@@ -236,6 +236,10 @@ pub(crate) struct IpcSendContext<'a> {
     /// `None` preserves legacy behaviour exactly (test fixtures + setups
     /// without full NodeRuntime).
     pub(crate) mlkem_ek_resolver: Option<&'a (dyn veil_types::MlKemEkResolver + 'a)>,
+    /// Authenticated anonymous (onion/rendezvous) sender. `Some` only when the
+    /// full NodeRuntime is wired; the `anonymous_authenticated` flag fails with
+    /// `NO_RENDEZVOUS` when this is `None` (test fixtures / minimal setups).
+    pub(crate) anon_onion_sender: Option<&'a (dyn veil_types::AnonOnionSender + 'a)>,
     pub(crate) capture_tx: Option<
         &'a Mutex<Option<tokio::sync::broadcast::Sender<veil_dispatcher_state::CaptureEvent>>>,
     >,
@@ -285,6 +289,56 @@ pub(crate) async fn handle_ipc_send(
         let mut frame = codec::encode_header(&hdr).to_vec();
         frame.extend_from_slice(&ipc_send_err::PAYLOAD_TOO_LARGE.to_be_bytes());
         wh.write_all(&frame).await?;
+        return Ok(());
+    }
+
+    // Authenticated anonymous send (onion/rendezvous) — a distinct transport
+    // from the meta-E2E `anonymous` flag, and mutually exclusive with it. The
+    // onion hides the sender's location from every relay; the recipient
+    // cryptographically verifies WHO sent it. Fire-and-forget: a returned
+    // AppSendOk (only when require_ack) means "handed to the first hop", not
+    // "delivered". All surfaced errors are local / pre-transmit.
+    if send.anonymous_authenticated {
+        let err_code = if send.anonymous {
+            Some(ipc_send_err::INVALID_FLAGS)
+        } else if let Some(sender) = ctx.anon_onion_sender {
+            match sender
+                .send_authenticated(send.dst_node_id, send.app_id, send.endpoint_id, &send.data)
+                .await
+            {
+                Ok(()) => None,
+                Err(veil_types::AnonOnionSendError::NoIdentity) => Some(ipc_send_err::NO_IDENTITY),
+                Err(veil_types::AnonOnionSendError::NoRendezvous) => {
+                    Some(ipc_send_err::NO_RENDEZVOUS)
+                }
+                Err(veil_types::AnonOnionSendError::NoRelays) => Some(ipc_send_err::NO_ROUTE),
+                Err(veil_types::AnonOnionSendError::PayloadTooLarge) => {
+                    Some(ipc_send_err::PAYLOAD_TOO_LARGE)
+                }
+            }
+        } else {
+            // No sender wired (test / minimal setup) — fail rather than
+            // silently succeed on an undelivered message.
+            Some(ipc_send_err::NO_RENDEZVOUS)
+        };
+        match err_code {
+            Some(code) => {
+                let mut hdr = FrameHeader::new(
+                    FrameFamily::LocalApp as u8,
+                    LocalAppMsg::AppSendFailed as u16,
+                );
+                hdr.body_len = 2;
+                let mut frame = codec::encode_header(&hdr).to_vec();
+                frame.extend_from_slice(&code.to_be_bytes());
+                wh.write_all(&frame).await?;
+            }
+            None if send.require_ack => {
+                let ok_hdr =
+                    FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppSendOk as u16);
+                wh.write_all(&codec::encode_header(&ok_hdr)).await?;
+            }
+            None => {}
+        }
         return Ok(());
     }
 

@@ -290,6 +290,7 @@ async fn e2e_local_send_delivers_to_receiver() {
         data: veil_bufpool::pooled_shared_from_vec(b"hello from B".to_vec()),
         require_ack: false,
         anonymous: false,
+        anonymous_authenticated: false,
     };
     send_ipc_frame(
         &mut client_b,
@@ -368,6 +369,7 @@ async fn slow_reader_does_not_block_server() {
         data: veil_bufpool::pooled_shared_from_vec(b"flood".to_vec()),
         require_ack: false,
         anonymous: false,
+        anonymous_authenticated: false,
     };
 
     // Send 20 messages quickly; server should not block
@@ -841,6 +843,7 @@ async fn ipc_send_relay_via_route_cache() {
         data: veil_bufpool::pooled_shared_from_vec(b"hello relay".to_vec()),
         require_ack: false,
         anonymous: false,
+        anonymous_authenticated: false,
     };
     send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &send.encode()).await;
 
@@ -1107,6 +1110,7 @@ async fn spoofed_src_app_id_is_rejected() {
         data: veil_bufpool::pooled_shared_from_vec(b"should not arrive".to_vec()),
         require_ack: false,
         anonymous: false,
+        anonymous_authenticated: false,
     };
     send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &send.encode()).await;
 
@@ -1430,6 +1434,7 @@ async fn anonymous_send_payload_starts_with_meta_e2e_marker() {
         data: veil_bufpool::pooled_shared_from_vec(b"secret".to_vec()),
         require_ack: false,
         anonymous: true,
+        anonymous_authenticated: false,
     };
     send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &send.encode()).await;
 
