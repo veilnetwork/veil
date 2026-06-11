@@ -141,6 +141,125 @@ async fn process_auth_deliver(
     }
 }
 
+// ── rendezvous-recipient lifecycle (Epic 482 v1) ─────────────────────────────
+
+/// How often the rendezvous-recipient task re-checks its registration.
+const RENDEZVOUS_RECIPIENT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Ad validity window the recipient requests (the maintenance tick refreshes the
+/// published ad before half-life). Comfortably longer than the check interval.
+const RENDEZVOUS_AD_VALIDITY_SECS: u64 = 3600;
+/// Re-register with the (still-live) current relay every N ticks — the relay's
+/// cookie map is in-memory, so this survives a relay restart.
+const RENDEZVOUS_REREGISTER_EVERY_TICKS: u64 = 5;
+
+type LiveSessions = Arc<
+    std::sync::Mutex<std::collections::BTreeMap<crate::types::LinkId, crate::types::SessionInfo>>,
+>;
+
+/// True iff there is an Active session to `node_id`.
+fn rendezvous_session_live(live: &LiveSessions, node_id: &[u8; 32]) -> bool {
+    let g = lock!(live);
+    g.values().any(|info| {
+        info.state == crate::types::SessionState::Active
+            && info
+                .node_id
+                .as_ref()
+                .is_some_and(|n| n.as_bytes() == node_id)
+    })
+}
+
+/// True iff `node_id` has a relay-directory entry in our local DHT shard — i.e.
+/// it is `relay_capable` AND published, so a sender can resolve + reach it.
+fn rendezvous_relay_published(dht: &Arc<veil_dht::KademliaService>, node_id: &[u8; 32]) -> bool {
+    dht.get_local(&veil_anonymity::directory::relay_directory_dht_key(node_id))
+        .is_some()
+}
+
+/// Pick a rendezvous relay: a session-live, published peer. If `pinned` is
+/// non-empty, restrict to that operator list; otherwise auto-pick.
+fn pick_rendezvous_relay(
+    live: &LiveSessions,
+    dht: &Arc<veil_dht::KademliaService>,
+    pinned: &[[u8; 32]],
+) -> Option<[u8; 32]> {
+    let connected: Vec<[u8; 32]> = {
+        let g = lock!(live);
+        g.values()
+            .filter(|i| i.state == crate::types::SessionState::Active)
+            .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
+            .collect()
+    };
+    if !pinned.is_empty() {
+        return pinned
+            .iter()
+            .copied()
+            .find(|p| connected.contains(p) && rendezvous_relay_published(dht, p));
+    }
+    connected
+        .into_iter()
+        .find(|c| rendezvous_relay_published(dht, c))
+}
+
+/// Send a `RegisterRendezvous` frame to `relay` over its live session (inlines
+/// `NodeRuntime::register_with_rendezvous`, which is unavailable from the task's
+/// `NodeServices` handle). Fire-and-forget — a no-op without a session.
+fn rendezvous_register_with(
+    session_tx_registry: &Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
+    anonymity: &Arc<super::anonymity_state::AnonymityState>,
+    relay: &[u8; 32],
+    cookie: [u8; 16],
+) {
+    use veil_anonymity::rendezvous::RegisterRendezvousPayload;
+    use veil_proto::{
+        codec::encode_header,
+        family::{FrameFamily, RelayChainMsg},
+        header::FrameHeader,
+    };
+    let receiver_x25519_pk = x25519_dalek::PublicKey::from(anonymity.x25519_sk.as_ref()).to_bytes();
+    let req = RegisterRendezvousPayload {
+        receiver_x25519_pk,
+        auth_cookie: cookie,
+    };
+    let body = req.encode();
+    let mut hdr = FrameHeader::new(
+        FrameFamily::RelayChain as u8,
+        RelayChainMsg::RegisterRendezvous as u16,
+    );
+    hdr.body_len = body.len() as u32;
+    hdr.set_priority(veil_proto::priority::INTERACTIVE);
+    let mut frame = encode_header(&hdr).to_vec();
+    frame.extend_from_slice(&body);
+    let guard = wlock!(session_tx_registry);
+    let _ = guard.send_to(relay, veil_proto::priority::INTERACTIVE, frame);
+}
+
+/// Register/refresh a rendezvous publisher entry (the maintenance tick publishes
+/// the signed ad from it). Dedups by (relay, cookie). Inlines
+/// `NodeRuntime::register_rendezvous_publisher`.
+fn rendezvous_register_publisher(
+    anonymity: &Arc<super::anonymity_state::AnonymityState>,
+    relay: &[u8; 32],
+    cookie: [u8; 16],
+    validity_window_secs: u64,
+) {
+    let entry = veil_anonymity::rendezvous::RendezvousPublisherEntry {
+        rendezvous_node_id: *relay,
+        auth_cookie: cookie,
+        validity_window_secs,
+        push_envelope: Vec::new(),
+        wake_hmac_envelope: Vec::new(),
+    };
+    let mut entries = lock!(anonymity.rendezvous_publisher_entries);
+    if let Some(pos) = entries
+        .iter()
+        .position(|e| e.rendezvous_node_id == *relay && e.auth_cookie == cookie)
+    {
+        entries[pos] = entry;
+    } else {
+        entries.push(entry);
+    }
+}
+
 impl NodeRuntime {
     // ── proxy runtime wiring ───────────────────────────────────────
 
@@ -1010,6 +1129,111 @@ impl NodeRuntime {
                             }
                         }
                         Ok(_) = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        lock_tasks(&self.tasks).sessions.push(handle);
+    }
+
+    /// Spawn the rendezvous-recipient lifecycle (Epic 482 v1). No-op unless
+    /// `[anonymity].receive_anonymous`. Picks a reachable published rendezvous
+    /// relay, registers with it (so it forwards introduces addressed to our
+    /// cookie) and registers a publisher entry (the maintenance tick publishes
+    /// the signed `RendezvousAd`). Re-registers on relay-session loss / failover
+    /// and periodically (the relay's cookie map is in-memory).
+    pub fn spawn_rendezvous_recipient_task(&mut self, config: &veil_cfg::Config) {
+        if !config.anonymity.receive_anonymous {
+            return;
+        }
+        let Some(shutdown_tx) = &self.shutdown_tx else {
+            return;
+        };
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let logger = Arc::clone(&self.logger);
+        let dht = Arc::clone(&self.dht);
+        let live_sessions = Arc::clone(&self.live_sessions);
+        let session_tx_registry = Arc::clone(&self.session_tx_registry);
+        let anonymity = Arc::clone(&self.anonymity);
+        // Operator-pinned rendezvous relays (node-id hex), if any.
+        let pinned: Vec<[u8; 32]> = config
+            .anonymity
+            .rendezvous_relays
+            .iter()
+            .filter_map(|s| {
+                <veil_cfg::NodeId as std::str::FromStr>::from_str(s)
+                    .ok()
+                    .map(|n| *n.as_bytes())
+            })
+            .collect();
+        // Per-process cookie tying our published ad to our relay registration.
+        let mut cookie = [0u8; 16];
+        {
+            use rand_core::RngCore;
+            rand_core::OsRng.fill_bytes(&mut cookie);
+        }
+
+        let handle = supervised_spawn(
+            Arc::clone(&self.logger),
+            "rendezvous_recipient",
+            async move {
+                let mut interval = tokio::time::interval(RENDEZVOUS_RECIPIENT_CHECK_INTERVAL);
+                let mut current: Option<[u8; 32]> = None;
+                let mut ticks: u64 = 0;
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            ticks = ticks.wrapping_add(1);
+                            let current_ok = current.is_some_and(|r| {
+                                rendezvous_session_live(&live_sessions, &r)
+                                    && rendezvous_relay_published(&dht, &r)
+                            });
+                            if !current_ok {
+                                match pick_rendezvous_relay(&live_sessions, &dht, &pinned) {
+                                    Some(relay) => {
+                                        rendezvous_register_with(
+                                            &session_tx_registry,
+                                            &anonymity,
+                                            &relay,
+                                            cookie,
+                                        );
+                                        rendezvous_register_publisher(
+                                            &anonymity,
+                                            &relay,
+                                            cookie,
+                                            RENDEZVOUS_AD_VALIDITY_SECS,
+                                        );
+                                        current = Some(relay);
+                                        logger.info(
+                                            "anonymity.rendezvous_recipient.registered",
+                                            format!(
+                                                "registered with rendezvous relay {}",
+                                                veil_util::hex_short(&relay),
+                                            ),
+                                        );
+                                    }
+                                    None => logger.info(
+                                        "anonymity.rendezvous_recipient.no_relay",
+                                        "no reachable published rendezvous relay yet; retrying",
+                                    ),
+                                }
+                            } else if ticks.is_multiple_of(RENDEZVOUS_REREGISTER_EVERY_TICKS) {
+                                // Refresh — the relay's registration is in-memory.
+                                if let Some(relay) = current {
+                                    rendezvous_register_with(
+                                        &session_tx_registry,
+                                        &anonymity,
+                                        &relay,
+                                        cookie,
+                                    );
+                                }
+                            }
+                        }
+                        _ = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() {
                                 break;
                             }
