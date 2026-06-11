@@ -66,6 +66,7 @@ typedef VeilRecvCbNative = Void Function(
   Pointer<Void> user,
   Pointer<Uint8> srcNodeId,
   Pointer<Uint8> srcAppId,
+  Uint64 replyId,
   Pointer<Uint8> data,
   IntPtr len,
 );
@@ -73,6 +74,7 @@ typedef VeilRecvCb = void Function(
   Pointer<Void> user,
   Pointer<Uint8> srcNodeId,
   Pointer<Uint8> srcAppId,
+  int replyId,
   Pointer<Uint8> data,
   int len,
 );

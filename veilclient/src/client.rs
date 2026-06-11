@@ -210,6 +210,55 @@ impl SharedWriter {
             .map_err(|_| ClientError::ConnectionClosed)
     }
 
+    /// Reply-channel-aware `APP_IPC_SEND` encoder: like
+    /// [`Self::write_app_ipc_send_owned`] but also appends the two trailing
+    /// reply fields (`reply_id`, `reply_endpoint_id`) the daemon reads after the
+    /// data. Used by the expect-reply and is-reply send paths, which are not the
+    /// ogate hot path, so the extra 12 trailing bytes are immaterial.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_app_ipc_send_reply_aware(
+        &self,
+        dst_node_id: &[u8; 32],
+        src_app_id: &[u8; 32],
+        dst_app_id: &[u8; 32],
+        endpoint_id: u32,
+        flags: u32,
+        reply_id: u64,
+        reply_endpoint_id: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        use veil_proto::header::HEADER_SIZE;
+        const FIXED_SIZE: usize = 32 + 32 + 32 + 4 + 4 + 4; // matches AppIpcSendPayload::FIXED_SIZE
+        const TRAILER: usize = 8 + 4; // reply_id + reply_endpoint_id
+        let body_len = FIXED_SIZE + data.len() + TRAILER;
+        let total = HEADER_SIZE + body_len;
+        let mut frame = Vec::with_capacity(total);
+
+        let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppIpcSend as u16);
+        hdr.body_len = body_len as u32;
+        frame.extend_from_slice(&codec::encode_header(&hdr));
+
+        // AppIpcSendPayload fixed fields.
+        frame.extend_from_slice(dst_node_id);
+        frame.extend_from_slice(src_app_id);
+        frame.extend_from_slice(dst_app_id);
+        frame.extend_from_slice(&endpoint_id.to_be_bytes());
+        frame.extend_from_slice(&flags.to_be_bytes());
+        frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
+
+        // Data, then the trailing reply fields.
+        frame.extend_from_slice(data);
+        frame.extend_from_slice(&reply_id.to_be_bytes());
+        frame.extend_from_slice(&reply_endpoint_id.to_be_bytes());
+
+        debug_assert_eq!(frame.len(), total, "reply-aware encode size mismatch");
+
+        self.tx
+            .send(frame)
+            .await
+            .map_err(|_| ClientError::ConnectionClosed)
+    }
+
     /// A [`PollSender`](tokio_util::sync::PollSender) over a clone of the
     /// writer channel, for the `AsyncWrite::poll_*` paths.
     ///
@@ -1908,6 +1957,7 @@ async fn reader_task(
                             // so user-side ownership is unambiguous. The pool slot
                             // returns when `p` drops at end of this arm.
                             data: p.data.to_vec(),
+                            reply_id: p.reply_id,
                         });
                     }
                 }

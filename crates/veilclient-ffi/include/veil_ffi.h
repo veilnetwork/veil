@@ -369,6 +369,12 @@ typedef struct VeilStreamFfi VeilStreamFfi;
  * that a deferred host (Dart `NativeCallable.listener`) could not honour
  * without a use-after-free.
  *
+ * `reply_id` is a by-value scalar (NOT part of the owned buffer — it has no
+ * lifetime to manage): non-zero when this message arrived over the
+ * authenticated anonymous transport WITH a one-time reply block. Pass it to
+ * [`veil_send_reply`] to answer without either side publishing a public
+ * rendezvous ad. `0` means "not repliable".
+ *
  * wrapped in `Option<...>` so a NULL
  * function pointer passed from C/Swift/Kotlin is a valid `None`
  * representation that Rust matches and rejects gracefully — instead
@@ -379,6 +385,7 @@ typedef struct VeilStreamFfi VeilStreamFfi;
 typedef void (*VeilRecvCb)(void *user,
                            const uint8_t *src_node_id,
                            const uint8_t *src_app_id,
+                           uint64_t reply_id,
                            const uint8_t *data,
                            size_t len);
 
@@ -584,6 +591,42 @@ int veil_send_anonymous_authenticated(VeilApp *app,
                                       const uint8_t *data,
                                       size_t len,
                                       char **err_out)
+;
+
+/**
+ * Like [`veil_send_anonymous_authenticated`], but additionally attach a
+ * one-time reply block so the recipient can answer WITHOUT either side
+ * publishing a public rendezvous ad (no presence leak). The reply is delivered
+ * back to `(this app, reply_endpoint_id)` and surfaces to the recipient as a
+ * non-zero `reply_id` in the recv callback. Pass the endpoint you receive on
+ * for `reply_endpoint_id`. Same fire-and-forget semantics as the plain
+ * authenticated send.
+ */
+
+int veil_send_anonymous_authenticated_with_reply(VeilApp *app,
+                                                 const uint8_t *dst_node_id,
+                                                 const uint8_t *dst_app_id,
+                                                 uint32_t dst_endpoint_id,
+                                                 uint32_t reply_endpoint_id,
+                                                 const uint8_t *data,
+                                                 size_t len,
+                                                 char **err_out)
+;
+
+/**
+ * Reply to a message received over the authenticated anonymous transport,
+ * addressing it by the opaque `reply_id` from the recv callback. The daemon
+ * routes the reply back over the original sender's rendezvous path — no public
+ * ad on either side. `reply_id` is single-use and TTL-bounded daemon-side; a
+ * stale/unknown id returns `VEIL_ERR` with a "reply unknown" detail. Same
+ * fire-and-forget semantics as the other authenticated sends.
+ */
+
+int veil_send_reply(VeilApp *app,
+                    uint64_t reply_id,
+                    const uint8_t *data,
+                    size_t len,
+                    char **err_out)
 ;
 
 /**
