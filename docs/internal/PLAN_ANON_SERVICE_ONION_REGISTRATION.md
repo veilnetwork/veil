@@ -157,7 +157,44 @@ A's location. The reply channel is forward-compatible — `ReplyBlock` already
 carries the relay + cookie + the transport id R keys on (§12 there); the only
 change is HOW A reaches R (circuit vs direct) and how R forwards back.
 
-## 7. Open questions
+## 7. Implementation slicing (minimal return-path first)
+
+This needs the **return-path subset** of 482.7 — not the QoS "send-N / amortise"
+half. Build only what onion registration requires, in anonymity-safe order
+(scaffold → crypto under the §5 + 482.7 §6 gate → integration → e2e):
+
+- **b1 — wire + types (no crypto, no behaviour).** `CircuitId` type;
+  `RelayChainMsg` += `CircuitBuild`, `CircuitData`, `CircuitTeardown`; payload
+  structs + encode/decode + round-trip tests. Pure additive framing. *(safe to
+  land first.)*
+- **b2 — circuit build / per-hop key install (482.7 Option B1).** Sender packs
+  per-hop `{circuit_id_in, circuit_id_out, circuit_key, next_link}` in onion
+  layers; each relay installs `CircuitState` keyed by `(prev_link,
+  circuit_id_in)`. Relay install handler. **Gated by §5 + 482.7 §6 threat-model
+  review.**
+- **b3 — return-path data plane.** A `CircuitData` cell travelling BACK toward
+  the originator: each relay re-tags `circuit_id` + adds a layer; the originator
+  peels N layers with cached circuit keys. This is the load-bearing new
+  direction (482.7 ships send-only). Anti-replay window per circuit.
+- **b4 — onion registration at R.** Circuit-backed subscription store
+  (cookie-keyed, not session-keyed); `RegisterRendezvous` over a circuit (new
+  variant or circuit payload); `RendezvousAd += reg_pk` + registration
+  signature (anti-squat, §3.B); `handle_final_introduce` forwards the introduce
+  as a return `CircuitData` cell when the sub is circuit-backed.
+- **b5 — receiver side.** Build + maintain the R-ward circuit (rebuild on
+  teardown/TTL); register over it; receive forwarded introduces over it; opt-in
+  config flag (`anonymity.onion_register` or similar).
+- **b6 — lifecycle / DoS.** Per-relay circuit caps (≈ rendezvous 10k / 64-peer),
+  TTL, teardown-GCs-cookie; rotation policy per 482.7 §4.5.
+- **b7 — sim e2e.** Service receives an introduce with R holding NO session/entry
+  for the service's transport id; assert R's session table + rendezvous registry
+  contain no receiver-identifying entry (the location-anonymity property).
+
+Direct registration stays the default; onion registration is opt-in (§4). b1 is
+self-contained and can land independently; b2/b3 are the anonymity-critical core
+and must clear the threat-model gate before merge.
+
+## 8. Open questions
 
 1. **One R or Tor-style IP+RP split?** Single-R is simpler and matches today; the
    split buys defence-in-depth (the introduction point never meets the rendezvous

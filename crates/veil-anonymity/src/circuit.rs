@@ -122,6 +122,10 @@ pub enum CircuitError {
     /// at build time rather than letting the receiver silently drop.
     #[error("circuit too long for ttl cap ({hops} hops requires ttl {required} > max {max})")]
     CircuitTooLongForTtl { hops: usize, required: u8, max: u8 },
+    /// A stateful-circuit wire payload (`circuit_wire`) failed to decode —
+    /// truncated, or a declared length exceeds its cap.
+    #[error("malformed circuit wire payload: {0}")]
+    Malformed(String),
 }
 
 impl From<OnionError> for CircuitError {
