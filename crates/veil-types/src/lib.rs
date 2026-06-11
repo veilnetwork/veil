@@ -122,6 +122,50 @@ pub trait MlKemEkResolver: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>;
 }
 
+// ── AnonOnionSender — authenticated anonymous send over rendezvous ────────────
+//
+// Lets the IPC layer originate an authenticated anonymous onion send
+// (`anonymous_authenticated` flag) without depending on veil-node-runtime: the
+// runtime implements this trait and is injected as `Option<&dyn AnonOnionSender>`
+// on the send context, exactly like `MlKemEkResolver`. The implementation
+// resolves the recipient's RendezvousAd, signs + fragments an `AuthAppDeliver`,
+// and onion-routes it to the rendezvous relay.
+
+/// Local (pre-transmit) failure reasons for an authenticated anonymous send.
+/// All map to an IPC `AppSendFailed` error code; once the cell is on the wire
+/// the result is always `Ok` (fire-and-forget, no end-to-end ACK).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonOnionSendError {
+    /// No sovereign identity loaded — cannot sign.
+    NoIdentity,
+    /// No valid RendezvousAd for the recipient (it hasn't opted in to receiving,
+    /// or its ad is unresolvable / stale).
+    NoRendezvous,
+    /// Could not build a circuit (insufficient relay candidates).
+    NoRelays,
+    /// Message exceeds the authenticated-send size ceiling.
+    PayloadTooLarge,
+}
+
+/// Originates an authenticated anonymous onion send to a recipient over the
+/// rendezvous transport. Implemented by the node runtime; consumed by the IPC
+/// send handler.
+pub trait AnonOnionSender: Send + Sync {
+    /// Send `data` to `(receiver_node_id, app_id, endpoint_id)` as an
+    /// authenticated anonymous message. The recipient cryptographically verifies
+    /// the sender; no relay learns the sender's location. The circuit length is
+    /// the implementation's configured default. Errors are local/pre-transmit.
+    fn send_authenticated<'a>(
+        &'a self,
+        receiver_node_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: &'a [u8],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
+    >;
+}
+
 // ── Wire-format constants shared by proto + crypto ────────────────────────────
 //
 // These three constants are consumed by *both* `proto::*` (encode/decode) and
