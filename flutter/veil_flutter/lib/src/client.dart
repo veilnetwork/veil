@@ -1098,7 +1098,7 @@ class AppHandle implements Finalizable {
     final controller = StreamController<IncomingMessage>.broadcast();
     final callable = NativeCallable<ffi.VeilRecvCbNative>.listener(
       (Pointer<Void> _, Pointer<Uint8> srcNode, Pointer<Uint8> srcApp,
-          Pointer<Uint8> dataPtr, int len) {
+          int replyId, Pointer<Uint8> dataPtr, int len) {
         final src = Uint8List.fromList(srcNode.asTypedList(32));
         final app = Uint8List.fromList(srcApp.asTypedList(32));
         final data = len > 0
@@ -1107,11 +1107,12 @@ class AppHandle implements Finalizable {
         // cycle-7 H6: srcNode/srcApp/dataPtr are offsets into ONE callee-owned
         // buffer ([nodeId(32) | appId(32) | data]); free it via the base
         // pointer (srcNode) with the total length, after copying all three.
+        // `replyId` is a by-value scalar (not in the buffer) — nothing to free.
         // This callback runs on the isolate AFTER the Rust frame returned, so
         // reading these pointers was a use-after-free before they became owned.
         ffi.veilFreeBuf(srcNode, 64 + len);
-        controller
-            .add(IncomingMessage(srcNodeId: src, srcAppId: app, data: data));
+        controller.add(IncomingMessage(
+            srcNodeId: src, srcAppId: app, data: data, replyId: replyId));
       },
     );
     final errOut = calloc<Pointer<Utf8>>();
