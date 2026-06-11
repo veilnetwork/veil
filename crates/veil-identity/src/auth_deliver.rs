@@ -28,8 +28,6 @@ pub const DEFAULT_AUTH_DELIVER_FRESHNESS_SECS: u64 = 300;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum AuthDeliverError {
-    #[error("authenticated delivery not addressed to this node")]
-    WrongRecipient,
     #[error("sender_node_id does not match the resolved identity document")]
     SenderMismatch,
     #[error("timestamp {timestamp} outside freshness window (now={now}, window={window}s)")]
@@ -156,10 +154,6 @@ pub fn verify_auth_deliver(
     now_unix: u64,
     freshness_window_secs: u64,
 ) -> Result<(), AuthDeliverError> {
-    // Bound to THIS recipient — a relay cannot re-target the envelope.
-    if &p.dst_node_id != self_node_id {
-        return Err(AuthDeliverError::WrongRecipient);
-    }
     // The claimed sender must match the document we resolved for it.
     if p.sender_node_id != sender_doc.node_id {
         return Err(AuthDeliverError::SenderMismatch);
@@ -186,8 +180,17 @@ pub fn verify_auth_deliver(
     };
     // `verify_message` takes a base64 pubkey (same encoding as IdentityConfig).
     let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&subkey.pubkey);
-    verify_message(algo, &pk_b64, &p.signing_bytes(), &p.signature)
-        .map_err(|_| AuthDeliverError::BadSignature)
+    // Recipient binding: `dst_node_id` is not on the wire — reconstruct it as
+    // OUR node_id. A message actually signed for a DIFFERENT recipient yields
+    // different signing bytes here → BadSignature (this replaces the old
+    // explicit WrongRecipient check, now enforced cryptographically).
+    verify_message(
+        algo,
+        &pk_b64,
+        &p.signing_bytes_with_dst(self_node_id),
+        &p.signature,
+    )
+    .map_err(|_| AuthDeliverError::BadSignature)
 }
 
 #[cfg(test)]
@@ -320,7 +323,9 @@ mod tests {
     #[test]
     fn verify_rejects_retargeted_or_wrong_sender() {
         let (doc, p, self_id, _) = signed_fixture();
-        // A relay tries to deliver to a different recipient.
+        // A relay tries to deliver to a different recipient. `dst_node_id` is
+        // not on the wire — the wrong recipient reconstructs its own node_id as
+        // dst, computes different signing bytes, and the signature fails.
         assert_eq!(
             verify_auth_deliver(
                 &p,
@@ -329,7 +334,7 @@ mod tests {
                 NOW,
                 DEFAULT_AUTH_DELIVER_FRESHNESS_SECS
             ),
-            Err(AuthDeliverError::WrongRecipient),
+            Err(AuthDeliverError::BadSignature),
         );
         // Sender claims an id that doesn't match the resolved doc.
         let mut wrong = doc.clone();
