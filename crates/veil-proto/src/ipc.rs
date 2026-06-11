@@ -488,6 +488,12 @@ pub struct AppDeliverPayload {
     /// Delivered datagram bytes. d: pool-backed for symmetry
     /// with AppSendPayload / AppIpcSendPayload — daemon → chat-node hot path.
     pub data: veil_bufpool::PooledShared,
+    /// Reply handle (reply-channel): non-zero when this was an authenticated
+    /// anonymous message carrying a one-time reply path. The daemon stores the
+    /// reply block and surfaces this id; the app replies via it. `0` = no reply
+    /// path (plain / meta-E2E / one-way auth deliveries). Appended LAST on the
+    /// wire so existing field offsets are unchanged.
+    pub reply_id: u64,
 }
 
 impl AppDeliverPayload {
@@ -503,6 +509,9 @@ impl AppDeliverPayload {
         buf.extend_from_slice(&self.endpoint_id.to_be_bytes());
         buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
         buf.extend_from_slice(data);
+        // reply_id appended LAST (trailing u64) so header/data offsets are
+        // unchanged for the plain path.
+        buf.extend_from_slice(&self.reply_id.to_be_bytes());
         buf
     }
 
@@ -520,26 +529,33 @@ impl AppDeliverPayload {
         let endpoint_id = super::read_u32_be(buf, 96)?;
         let data_len = super::read_u32_be(buf, 100)? as usize;
         // checked_add — 32-bit overflow defence.
+        // total = header + data; the trailing reply_id (u64) follows.
         let total = Self::FIXED_SIZE
             .checked_add(data_len)
             .ok_or(ProtoError::BufferTooShort {
                 need: usize::MAX,
                 got: buf.len(),
             })?;
-        if buf.len() < total {
+        let end = total.checked_add(8).ok_or(ProtoError::BufferTooShort {
+            need: usize::MAX,
+            got: buf.len(),
+        })?;
+        if buf.len() < end {
             return Err(ProtoError::BufferTooShort {
-                need: total,
+                need: end,
                 got: buf.len(),
             });
         }
         let mut pooled = veil_bufpool::global().acquire(data_len);
         pooled.as_vec_mut().extend_from_slice(&buf[104..total]);
+        let reply_id = super::read_u64_be(buf, total)?;
         Ok(Self {
             src_node_id,
             src_app_id,
             app_id,
             endpoint_id,
             data: pooled.into_shared(),
+            reply_id,
         })
     }
 }
@@ -5182,10 +5198,28 @@ mod tests {
             app_id: [0x02; 32],
             endpoint_id: 5,
             data: veil_bufpool::pooled_shared_from_vec(b"hello veil".to_vec()),
+            reply_id: 0,
         };
         let buf = p.encode();
         let d = AppDeliverPayload::decode(&buf).unwrap();
         assert_eq!(d, p);
+    }
+
+    #[test]
+    fn deliver_reply_id_roundtrips() {
+        // The trailing reply_id survives + doesn't disturb the data slice.
+        let p = AppDeliverPayload {
+            src_node_id: [0x01; 32],
+            src_app_id: [0xAA; 32],
+            app_id: [0x02; 32],
+            endpoint_id: 5,
+            data: veil_bufpool::pooled_shared_from_vec(b"reply please".to_vec()),
+            reply_id: 0xDEAD_BEEF_0000_0001,
+        };
+        let d = AppDeliverPayload::decode(&p.encode()).unwrap();
+        assert_eq!(d, p);
+        assert_eq!(d.reply_id, 0xDEAD_BEEF_0000_0001);
+        assert_eq!(d.data.as_ref(), b"reply please");
     }
 
     #[test]
@@ -5196,6 +5230,7 @@ mod tests {
             app_id: [0; 32],
             endpoint_id: 0,
             data: veil_bufpool::pooled_shared_from_vec(vec![]),
+            reply_id: 0,
         };
         let d = AppDeliverPayload::decode(&p.encode()).unwrap();
         assert_eq!(d, p);

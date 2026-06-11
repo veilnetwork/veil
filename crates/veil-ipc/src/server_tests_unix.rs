@@ -1338,6 +1338,7 @@ async fn full_delivery_channel_drops_frame_and_increments_counter() {
                 app_id: [0u8; 32],
                 endpoint_id: 1,
                 data: veil_bufpool::pooled_shared_from_vec(vec![i]),
+                reply_id: 0,
             })
             .await
             .unwrap();

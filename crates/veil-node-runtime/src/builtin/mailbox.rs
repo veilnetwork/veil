@@ -365,6 +365,7 @@ mod tests {
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(payload),
+                reply_id: 0,
             })
             .expect("send to PUT");
 
@@ -408,6 +409,7 @@ mod tests {
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(payload),
+                reply_id: 0,
             })
             .unwrap();
 
@@ -448,6 +450,7 @@ mod tests {
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(payload),
+                reply_id: 0,
             })
             .unwrap();
         // Wait for the put to complete.
@@ -479,6 +482,7 @@ mod tests {
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(vec![0u8; 10]), // way too short for header
+                reply_id: 0,
             })
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -491,6 +495,7 @@ mod tests {
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(valid),
+                reply_id: 0,
             })
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -528,6 +533,7 @@ mod tests {
                 app_id: MAILBOX_APP_ID,
                 endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
                 data: veil_bufpool::pooled_shared_from_vec(valid),
+                reply_id: 0,
             })
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
