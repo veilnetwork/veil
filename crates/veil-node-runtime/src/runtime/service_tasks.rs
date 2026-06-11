@@ -111,16 +111,24 @@ async fn process_auth_deliver(
         return;
     }
 
-    // 4. Deliver with the VERIFIED sender node_id.
+    // 4. Deliver with the VERIFIED sender node_id. If the message carried a
+    //    one-time reply path, store it daemon-side and surface a non-zero
+    //    reply_id so the app can reply (the block never crosses to the app).
     let data_len = auth.data.len();
     let endpoint_id = auth.endpoint_id;
     let sender_node_id = auth.sender_node_id;
-    let delivered = access.dispatcher.app_registry.route_ipc_deliver(
+    let app_id = auth.app_id;
+    let reply_id = match auth.reply_block {
+        Some(rb) => access.anonymity.reply_block_store.store(rb, now_unix),
+        None => 0,
+    };
+    let delivered = access.dispatcher.app_registry.route_ipc_deliver_with_reply(
         sender_node_id,
         [0u8; 32], // AuthAppDeliver carries no src_app_id in v1
-        auth.app_id,
+        app_id,
         endpoint_id,
         veil_bufpool::pooled_shared_from_vec(auth.data),
+        reply_id,
     );
     if delivered {
         logger.info(
