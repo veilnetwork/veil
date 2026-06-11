@@ -119,10 +119,7 @@ async fn process_auth_deliver(
     let sender_node_id = auth.sender_node_id;
     let app_id = auth.app_id;
     let reply_id = match auth.reply_block {
-        Some(rb) => access
-            .anonymity
-            .reply_block_store
-            .store(rb, sender_node_id, now_unix),
+        Some(rb) => access.anonymity.reply_block_store.store(rb, now_unix),
         None => 0,
     };
     let delivered = access.dispatcher.app_registry.route_ipc_deliver_with_reply(

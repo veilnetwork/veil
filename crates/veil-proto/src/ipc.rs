@@ -665,11 +665,18 @@ pub struct ReplyBlock {
     pub reply_app_id: [u8; 32],
     /// Endpoint on `reply_app_id` that receives the reply.
     pub reply_endpoint_id: u32,
+    /// Sender's LOCAL (transport) node_id — the id it registered with at the
+    /// rendezvous relay, and thus the `receiver_node_id` the replier must put in
+    /// the reply introduce for the relay's `(receiver_node_id, cookie)` lookup
+    /// to hit. NOTE: this is the transport identity, distinct from the SOVEREIGN
+    /// `sender_node_id` the recipient verifies — the relay keys registrations by
+    /// transport id, so the reply must address that one.
+    pub receiver_node_id: [u8; 32],
 }
 
 impl ReplyBlock {
     /// Fixed wire size.
-    pub const WIRE_SIZE: usize = 32 + 16 + 32 + 32 + 4;
+    pub const WIRE_SIZE: usize = 32 + 16 + 32 + 32 + 4 + 32;
 
     fn write_into(&self, b: &mut Vec<u8>) {
         b.extend_from_slice(&self.rendezvous_node_id);
@@ -677,6 +684,7 @@ impl ReplyBlock {
         b.extend_from_slice(&self.x25519_pk);
         b.extend_from_slice(&self.reply_app_id);
         b.extend_from_slice(&self.reply_endpoint_id.to_be_bytes());
+        b.extend_from_slice(&self.receiver_node_id);
     }
 
     /// Encode to its fixed-size wire bytes.
@@ -700,6 +708,7 @@ impl ReplyBlock {
             x25519_pk: super::read_array::<32>(buf, 48)?,
             reply_app_id: super::read_array::<32>(buf, 80)?,
             reply_endpoint_id: super::read_u32_be(buf, 112)?,
+            receiver_node_id: super::read_array::<32>(buf, 116)?,
         })
     }
 }
@@ -5017,6 +5026,7 @@ mod tests {
             x25519_pk: [0x33; 32],
             reply_app_id: [0x44; 32],
             reply_endpoint_id: 99,
+            receiver_node_id: [0x55; 32],
         }
     }
 
