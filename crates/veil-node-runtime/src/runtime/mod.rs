@@ -1820,6 +1820,11 @@ impl NodeRuntime {
                 .anonymity
                 .relay_capable
                 .then(|| Arc::new(veil_anonymity::rendezvous::RendezvousRegistry::default())),
+            // Same relay-capable gate: only relays hold per-hop circuit state.
+            circuit_table: config
+                .anonymity
+                .relay_capable
+                .then(|| Arc::new(veil_anonymity::circuit_table::CircuitTable::new())),
         });
         // cleanup: pre-build the hot-standby controller and
         // its prerequisite Arcs (handoff_ack_waiters, swap_registry)
