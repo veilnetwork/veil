@@ -45,6 +45,102 @@ const AUTH_DELIVER_CHANNEL_CAP: usize = 256;
 /// serial verify queue when a sender's document is unreachable.
 const AUTH_DELIVER_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Resolve the sender, verify (signature + freshness + subkey), replay-check,
+/// and deliver one COMPLETE authenticated message with the VERIFIED sender
+/// node_id. Shared by the direct-onion (`Full`) and rendezvous (reassembled
+/// `Fragment`) paths. Every failure is logged and dropped — never surfaced to
+/// the anonymous sender (that would leak recipient liveness).
+async fn process_auth_deliver(
+    auth: veil_proto::AuthAppDeliver,
+    access: &super::NodeServices,
+    logger: &Arc<veil_observability::NodeLogger>,
+    replay_cache: &veil_identity::auth_deliver::AuthDeliverReplayCache,
+    local_node_id: &[u8; 32],
+    freshness_window: u64,
+    now_unix: u64,
+) {
+    // 1. Resolve the sender's identity document (DHT), bound to EXACTLY the
+    //    claimed sender_node_id — no migration follow: a migrated-away signer
+    //    must fail closed.
+    let sender_doc = match access
+        .resolve_one_identity_doc(auth.sender_node_id, now_unix, AUTH_DELIVER_RESOLVE_TIMEOUT)
+        .await
+    {
+        Ok((_, doc)) => doc,
+        Err(e) => {
+            logger.info(
+                "anonymity.auth_deliver.resolve_failed",
+                format!(
+                    "cannot resolve sender {} identity: {e}",
+                    veil_util::hex_short(&auth.sender_node_id),
+                ),
+            );
+            return;
+        }
+    };
+
+    // 2. Verify recipient binding, sender↔doc match, freshness, subkey, sig.
+    if let Err(e) = veil_identity::auth_deliver::verify_auth_deliver(
+        &auth,
+        &sender_doc,
+        local_node_id,
+        now_unix,
+        freshness_window,
+    ) {
+        logger.info(
+            "anonymity.auth_deliver.verify_failed",
+            format!(
+                "auth delivery from {} rejected: {e}",
+                veil_util::hex_short(&auth.sender_node_id),
+            ),
+        );
+        return;
+    }
+
+    // 3. Replay check AFTER signature verify, so a forger cannot poison the
+    //    cache with bogus (sender, nonce) entries to suppress a real sender.
+    if let Err(e) = replay_cache.check_and_record(&auth.sender_node_id, auth.nonce, now_unix) {
+        logger.info(
+            "anonymity.auth_deliver.replay",
+            format!(
+                "replayed auth delivery from {} (nonce={}): {e}",
+                veil_util::hex_short(&auth.sender_node_id),
+                auth.nonce,
+            ),
+        );
+        return;
+    }
+
+    // 4. Deliver with the VERIFIED sender node_id.
+    let data_len = auth.data.len();
+    let endpoint_id = auth.endpoint_id;
+    let sender_node_id = auth.sender_node_id;
+    let delivered = access.dispatcher.app_registry.route_ipc_deliver(
+        sender_node_id,
+        [0u8; 32], // AuthAppDeliver carries no src_app_id in v1
+        auth.app_id,
+        endpoint_id,
+        veil_bufpool::pooled_shared_from_vec(auth.data),
+    );
+    if delivered {
+        logger.info(
+            "anonymity.auth_deliver.delivered",
+            format!(
+                "delivered {data_len} B from verified sender {} to endpoint_id={endpoint_id}",
+                veil_util::hex_short(&sender_node_id),
+            ),
+        );
+    } else {
+        logger.info(
+            "anonymity.auth_deliver.unbound",
+            format!(
+                "no app bound to endpoint_id={endpoint_id}; {data_len} B from {} dropped",
+                veil_util::hex_short(&sender_node_id),
+            ),
+        );
+    }
+}
+
 impl NodeRuntime {
     // ── proxy runtime wiring ───────────────────────────────────────
 
@@ -842,8 +938,9 @@ impl NodeRuntime {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
-        let (tx, mut rx) =
-            tokio::sync::mpsc::channel::<veil_proto::AuthAppDeliver>(AUTH_DELIVER_CHANNEL_CAP);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<veil_dispatcher::AuthDeliverInbound>(
+            AUTH_DELIVER_CHANNEL_CAP,
+        );
         *lock!(self.dispatcher.auth_deliver_tx) = Some(tx);
 
         let mut shutdown_rx = shutdown_tx.subscribe();
@@ -852,6 +949,10 @@ impl NodeRuntime {
         let local_node_id = *self.identity.local_identity.node_id.as_bytes();
         let replay_cache = veil_identity::auth_deliver::AuthDeliverReplayCache::new();
         let freshness_window = veil_identity::auth_deliver::DEFAULT_AUTH_DELIVER_FRESHNESS_SECS;
+        // Reassembles fragmented authenticated messages from the rendezvous path
+        // (the direct onion path delivers whole `Full` messages). Single-owner —
+        // the task processes serially, so no lock.
+        let mut reassembler = veil_identity::auth_deliver::AuthDeliverReassembler::new();
 
         let handle = supervised_spawn(
             Arc::clone(&self.logger),
@@ -860,103 +961,52 @@ impl NodeRuntime {
                 loop {
                     tokio::select! {
                         maybe = rx.recv() => {
-                            let Some(auth) = maybe else { break };
+                            let Some(inbound) = maybe else { break };
                             let now_unix = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
-
-                            // 1. Resolve the sender's identity document (DHT), bound
-                            //    to EXACTLY the claimed sender_node_id — no migration
-                            //    follow: a migrated-away signer must fail closed.
-                            let sender_doc = match access
-                                .resolve_one_identity_doc(
-                                    auth.sender_node_id,
-                                    now_unix,
-                                    AUTH_DELIVER_RESOLVE_TIMEOUT,
-                                )
-                                .await
-                            {
-                                Ok((_, doc)) => doc,
-                                Err(e) => {
-                                    logger.info(
-                                        "anonymity.auth_deliver.resolve_failed",
-                                        format!(
-                                            "cannot resolve sender {} identity: {e}",
-                                            veil_util::hex_short(&auth.sender_node_id),
-                                        ),
-                                    );
-                                    continue;
+                            // Resolve a complete AuthAppDeliver from the inbound:
+                            // a Full message arrives whole; Fragments reassemble.
+                            let auth = match inbound {
+                                veil_dispatcher::AuthDeliverInbound::Full(a) => Some(*a),
+                                veil_dispatcher::AuthDeliverInbound::Fragment(frag) => {
+                                    use veil_identity::auth_deliver::ReassembleOutcome;
+                                    match reassembler.push(frag, now_unix) {
+                                        ReassembleOutcome::Complete(bytes) => {
+                                            match veil_proto::AuthAppDeliver::decode(&bytes) {
+                                                Ok(a) => Some(a),
+                                                Err(e) => {
+                                                    logger.info(
+                                                        "anonymity.auth_deliver.reassembled_decode_failed",
+                                                        format!("reassembled AuthAppDeliver decode: {e}"),
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        }
+                                        ReassembleOutcome::Pending => None,
+                                        ReassembleOutcome::Rejected => {
+                                            logger.info(
+                                                "anonymity.auth_deliver.fragment_rejected",
+                                                "auth-deliver fragment rejected (bounds/inconsistent)",
+                                            );
+                                            None
+                                        }
+                                    }
                                 }
                             };
-
-                            // 2. Verify recipient binding, sender↔doc match,
-                            //    freshness, subkey validity, and the signature.
-                            if let Err(e) = veil_identity::auth_deliver::verify_auth_deliver(
-                                &auth,
-                                &sender_doc,
-                                &local_node_id,
-                                now_unix,
-                                freshness_window,
-                            ) {
-                                logger.info(
-                                    "anonymity.auth_deliver.verify_failed",
-                                    format!(
-                                        "auth delivery from {} rejected: {e}",
-                                        veil_util::hex_short(&auth.sender_node_id),
-                                    ),
-                                );
-                                continue;
-                            }
-
-                            // 3. Replay check AFTER signature verify, so a forger
-                            //    cannot poison the cache with bogus (sender, nonce)
-                            //    entries to suppress a real sender's later messages.
-                            if let Err(e) = replay_cache.check_and_record(
-                                &auth.sender_node_id,
-                                auth.nonce,
-                                now_unix,
-                            ) {
-                                logger.info(
-                                    "anonymity.auth_deliver.replay",
-                                    format!(
-                                        "replayed auth delivery from {} (nonce={}): {e}",
-                                        veil_util::hex_short(&auth.sender_node_id),
-                                        auth.nonce,
-                                    ),
-                                );
-                                continue;
-                            }
-
-                            // 4. Deliver with the VERIFIED sender node_id.
-                            let data_len = auth.data.len();
-                            let endpoint_id = auth.endpoint_id;
-                            let sender_node_id = auth.sender_node_id;
-                            let delivered = access.dispatcher.app_registry.route_ipc_deliver(
-                                sender_node_id,
-                                [0u8; 32], // AuthAppDeliver carries no src_app_id in v1
-                                auth.app_id,
-                                endpoint_id,
-                                veil_bufpool::pooled_shared_from_vec(auth.data),
-                            );
-                            if delivered {
-                                logger.info(
-                                    "anonymity.auth_deliver.delivered",
-                                    format!(
-                                        "delivered {data_len} B from verified sender {} \
-                                         to endpoint_id={endpoint_id}",
-                                        veil_util::hex_short(&sender_node_id),
-                                    ),
-                                );
-                            } else {
-                                logger.info(
-                                    "anonymity.auth_deliver.unbound",
-                                    format!(
-                                        "no app bound to endpoint_id={endpoint_id}; {data_len} B \
-                                         from {} dropped",
-                                        veil_util::hex_short(&sender_node_id),
-                                    ),
-                                );
+                            if let Some(auth) = auth {
+                                process_auth_deliver(
+                                    auth,
+                                    &access,
+                                    &logger,
+                                    &replay_cache,
+                                    &local_node_id,
+                                    freshness_window,
+                                    now_unix,
+                                )
+                                .await;
                             }
                         }
                         Ok(_) = shutdown_rx.changed() => {

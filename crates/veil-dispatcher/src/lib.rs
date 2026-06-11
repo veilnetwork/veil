@@ -348,10 +348,24 @@ pub use veil_dispatcher_state::{CaptureEvent, DiagEvent, PendingRecursive};
 /// fallback can apply priority-aware timeout multipliers.
 pub type RouteMissTx = mpsc::Sender<([u8; 32], u8)>;
 
-/// type alias for the authenticated-onion final-hop channel sender.
-/// Carries the decoded [`veil_proto::AuthAppDeliver`] from the sync
+/// One inbound authenticated delivery the sync dispatcher hands to the
+/// runtime-owned async verify+deliver task.
+///
+/// The direct onion final-hop carries a whole [`veil_proto::AuthAppDeliver`]
+/// ([`Self::Full`]); the rendezvous path can't fit a whole signed message in
+/// one cell, so it carries [`veil_proto::AuthDeliverFragment`]s
+/// ([`Self::Fragment`]) that the task reassembles before verifying.
+#[derive(Debug)]
+pub enum AuthDeliverInbound {
+    /// A complete signed message (direct onion final-hop).
+    Full(Box<veil_proto::AuthAppDeliver>),
+    /// One fragment of a signed message (rendezvous path).
+    Fragment(veil_proto::AuthDeliverFragment),
+}
+
+/// type alias for the authenticated-delivery channel sender from the sync
 /// dispatcher to the runtime-owned async verify+deliver task.
-pub type AuthDeliverTx = mpsc::Sender<veil_proto::AuthAppDeliver>;
+pub type AuthDeliverTx = mpsc::Sender<AuthDeliverInbound>;
 
 // ── ExpiryCache ───────────────────────────────────────────────────────────────
 
