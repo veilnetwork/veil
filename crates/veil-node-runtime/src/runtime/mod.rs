@@ -1825,6 +1825,9 @@ impl NodeRuntime {
                 .anonymity
                 .relay_capable
                 .then(|| Arc::new(veil_anonymity::circuit_table::CircuitTable::new())),
+            circuit_rendezvous: config.anonymity.relay_capable.then(|| {
+                Arc::new(veil_anonymity::circuit_register::CircuitRendezvousRegistry::new())
+            }),
         });
         // cleanup: pre-build the hot-standby controller and
         // its prerequisite Arcs (handoff_ack_waiters, swap_registry)

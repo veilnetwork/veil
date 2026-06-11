@@ -340,6 +340,13 @@ impl FrameDispatcher {
         let subscriber = match reg.lookup(&intro.receiver_node_id, &intro.auth_cookie) {
             Some(s) => s,
             None => {
+                // No session-backed subscriber. Try a circuit-backed
+                // (onion-registered) subscription, keyed by cookie ALONE — for a
+                // LOCATION-anonymous service R forwards the introduce DOWN the
+                // receiver's return circuit instead of over a direct session.
+                if self.try_forward_introduce_via_circuit(&intro) {
+                    return DispatchResult::NoResponse;
+                }
                 // No entry for this (receiver, cookie). Silent drop:
                 // surfacing this would leak "this rendezvous serves
                 // cookie X / Y" to sender probes — exactly what the
@@ -604,18 +611,30 @@ impl FrameDispatcher {
                 );
             }
             veil_anonymity::circuit_setup::SetupPeelResult::Terminus { install, payload } => {
-                if table.install(&install, prev_link, None, now).is_err() {
-                    return DispatchResult::NoResponse;
+                let circuit = match table.install(&install, prev_link, None, now) {
+                    Ok(c) => c,
+                    Err(_) => return DispatchResult::NoResponse,
+                };
+                // The terminus payload is a signed circuit-rendezvous
+                // registration: bind its cookie → this circuit (cookie-keyed,
+                // first-wins; R never learns the receiver's node_id). A bad
+                // signature / cookie-squat / unparseable payload just leaves the
+                // bare circuit installed (idle-GC'd) — anti-leak silent.
+                if let Some(reg) = &self.circuit_rendezvous
+                    && let Some(p) =
+                        veil_anonymity::circuit_register::CircuitRegisterPayload::decode(&payload)
+                {
+                    match reg.register(&p, circuit, now) {
+                        Ok(()) => self.logger.info(
+                            "anonymity.circuit.registered",
+                            "circuit-rendezvous registration bound a cookie to a return circuit",
+                        ),
+                        Err(e) => self.logger.info(
+                            "anonymity.circuit.register_rejected",
+                            format!("circuit registration rejected: {e:?}"),
+                        ),
+                    }
                 }
-                // The terminus payload is the piggy-backed registration (b4
-                // consumes it). Until then, record + drop.
-                self.logger.info(
-                    "anonymity.circuit.terminus_build",
-                    format!(
-                        "circuit terminus installed; {} B setup payload (b4 consumes)",
-                        payload.len()
-                    ),
-                );
             }
         }
         DispatchResult::NoResponse
@@ -772,6 +791,50 @@ impl FrameDispatcher {
         }
 
         DispatchResult::NoResponse
+    }
+
+    /// If `intro.auth_cookie` is bound to a circuit-backed (onion-registered)
+    /// subscription, seal the introduce ciphertext as the FIRST return layer and
+    /// send it down that circuit toward the receiver. Returns `true` if handled.
+    /// R is the circuit terminus, so it originates the return seq + seals one
+    /// layer; intermediate hops add their layers, the receiver opens all N.
+    fn try_forward_introduce_via_circuit(
+        &self,
+        intro: &veil_anonymity::rendezvous::IntroducePayload,
+    ) -> bool {
+        use veil_anonymity::circuit_data::{Direction, seal_layer};
+        use veil_anonymity::circuit_wire::CircuitDataPayload;
+        let Some(reg) = &self.circuit_rendezvous else {
+            return false;
+        };
+        let Some(circuit) = reg.lookup(&intro.auth_cookie) else {
+            return false;
+        };
+        let seq = circuit.alloc_return_seq();
+        let outer = seal_layer(
+            &circuit.circuit_key,
+            Direction::Return,
+            seq,
+            &intro.ciphertext,
+        );
+        let cell = CircuitDataPayload {
+            circuit_id: circuit.circuit_id_in,
+            seq,
+            ciphertext: outer,
+        };
+        match cell.encode() {
+            Ok(body) => {
+                self.send_relay_chain_msg(
+                    &NodeId::from(circuit.prev_link),
+                    RelayChainMsg::CircuitData,
+                    &body,
+                );
+                true
+            }
+            // Oversize (too many return hops for the cell cap) — drop; the cell
+            // budget is a known b6 refinement.
+            Err(_) => false,
+        }
     }
 
     /// Send a `RelayChain::<msg>` frame with the given body bytes to
@@ -1282,6 +1345,71 @@ mod tests {
         assert!(
             d.circuit_table.as_ref().unwrap().is_empty(),
             "teardown freed the circuit"
+        );
+    }
+
+    /// A terminus CircuitBuild whose setup payload is a signed circuit
+    /// registration binds the cookie → circuit in the circuit-rendezvous
+    /// registry (R never sees the receiver's node_id).
+    #[test]
+    fn circuit_build_terminus_registers_cookie() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use veil_anonymity::circuit_register::{CircuitRegisterPayload, CircuitRendezvousRegistry};
+        use veil_anonymity::circuit_setup::{CircuitSetupHop, build_circuit_setup};
+        use veil_anonymity::circuit_table::CircuitTable;
+        use veil_crypto::{generate_keypair, sign_message};
+        use veil_types::SignatureAlgorithm;
+
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let sk = StaticSecret::random_from_rng(OsRng);
+        let pk = PublicKey::from(&sk).to_bytes();
+        d.anonymity_x25519_sk = Some(std::sync::Arc::new(sk));
+        d.circuit_table = Some(std::sync::Arc::new(CircuitTable::new()));
+        d.circuit_rendezvous = Some(std::sync::Arc::new(CircuitRendezvousRegistry::new()));
+
+        // Signed registration for a cookie.
+        let cookie = [0x5A; 16];
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let reg_pk: [u8; 32] = STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
+        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk);
+        let sig = sign_message(
+            SignatureAlgorithm::Ed25519,
+            &kp.public_key,
+            &kp.private_key,
+            &msg,
+        )
+        .unwrap();
+        let reg = CircuitRegisterPayload {
+            cookie,
+            reg_pk,
+            signature: sig,
+        };
+
+        // 1-hop circuit (this node is terminus); registration as terminus payload.
+        let hop = CircuitSetupHop {
+            node_id: [0u8; 32],
+            pubkey: pk,
+            circuit_id_in: 77,
+            circuit_id_out: 0,
+            circuit_key: [3u8; 32],
+        };
+        let env = build_circuit_setup(&[hop], &reg.encode()).unwrap();
+        let mut hdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitBuild as u16,
+        );
+        hdr.body_len = env.len() as u32;
+        d.dispatch_relay_chain(&hdr, &env, NodeId::from([0xEE; 32]));
+
+        // Cookie is now bound to the installed circuit.
+        assert!(
+            d.circuit_rendezvous
+                .as_ref()
+                .unwrap()
+                .lookup(&cookie)
+                .is_some(),
+            "terminus registration bound the cookie to its return circuit"
         );
     }
 
