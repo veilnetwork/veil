@@ -996,6 +996,19 @@ pub enum RelayChainMsg {
     /// Rendezvous → receiver: forward an Introduce ciphertext that
     /// arrived through the onion path. Body is `ForwardIntroducePayload`.
     ForwardIntroduce = 3,
+    /// Originator → relays: build a stateful return circuit, installing per-hop
+    /// `CircuitState` once. Body is `CircuitBuildPayload`. Stateful-circuit /
+    /// onion-registration epic (Epic 482.7 return path) — see
+    /// `PLAN_ANON_SERVICE_ONION_REGISTRATION.md`. b1 reserves the wire tag; the
+    /// per-hop key-install semantics land in b2.
+    CircuitBuild = 4,
+    /// A data cell travelling along an established circuit (either direction).
+    /// Body is `CircuitDataPayload` (`[circuit_id][seq][layered ciphertext]`).
+    /// Re-tagged per hop. Semantics land in b3.
+    CircuitData = 5,
+    /// Tear down a circuit + free its per-hop state. Body is
+    /// `CircuitTeardownPayload`.
+    CircuitTeardown = 6,
 }
 
 impl TryFrom<u16> for RelayChainMsg {
@@ -1006,6 +1019,9 @@ impl TryFrom<u16> for RelayChainMsg {
             1 => Ok(RelayChainMsg::RegisterRendezvous),
             2 => Ok(RelayChainMsg::UnregisterRendezvous),
             3 => Ok(RelayChainMsg::ForwardIntroduce),
+            4 => Ok(RelayChainMsg::CircuitBuild),
+            5 => Ok(RelayChainMsg::CircuitData),
+            6 => Ok(RelayChainMsg::CircuitTeardown),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::RelayChain as u8,
                 msg_type: v,
@@ -1019,6 +1035,26 @@ impl TryFrom<u16> for RelayChainMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_chain_msg_discriminants_and_roundtrip() {
+        // Wire-format gate: existing discriminants are frozen; the circuit
+        // variants (4–6) are the onion-registration / 482.7 return-path epic.
+        let all = [
+            (RelayChainMsg::Hop, 0u16),
+            (RelayChainMsg::RegisterRendezvous, 1),
+            (RelayChainMsg::UnregisterRendezvous, 2),
+            (RelayChainMsg::ForwardIntroduce, 3),
+            (RelayChainMsg::CircuitBuild, 4),
+            (RelayChainMsg::CircuitData, 5),
+            (RelayChainMsg::CircuitTeardown, 6),
+        ];
+        for (variant, disc) in all {
+            assert_eq!(variant as u16, disc);
+            assert_eq!(RelayChainMsg::try_from(disc).unwrap(), variant);
+        }
+        assert!(RelayChainMsg::try_from(7).is_err());
+    }
 
     #[test]
     fn session_msg_discriminants_are_stable() {
