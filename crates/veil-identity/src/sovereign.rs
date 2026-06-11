@@ -336,6 +336,38 @@ impl SovereignIdentity {
         )
     }
 
+    /// Sign an authenticated anonymous delivery (v1). Fills `sender_node_id`
+    /// from this identity, `sig_key_idx` from the active subkey, and signs
+    /// [`veil_proto::AuthAppDeliver::signing_bytes`] with `identity_sk`. The
+    /// caller onion-wraps the result; the recipient verifies via
+    /// [`crate::auth_deliver::verify_auth_deliver`]. See
+    /// `docs/internal/PLAN_AUTHENTICATED_ONION_DELIVERY.md`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_auth_deliver(
+        &self,
+        dst_node_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        timestamp: u64,
+        nonce: u64,
+        data: Vec<u8>,
+    ) -> veil_proto::AuthAppDeliver {
+        let mut p = veil_proto::AuthAppDeliver {
+            version: veil_proto::AuthAppDeliver::VERSION,
+            sender_node_id: self.document.node_id,
+            sig_key_idx: self.sig_key_idx,
+            timestamp,
+            nonce,
+            dst_node_id,
+            app_id,
+            endpoint_id,
+            data,
+            signature: Vec::new(),
+        };
+        p.signature = self.identity_sk.sign(&p.signing_bytes());
+        p
+    }
+
     /// helper: returns `true` iff this handle's active
     /// subkey IS the master key — i.e. the document was built in
     /// standalone mode (or is functionally equivalent: single subkey
@@ -839,6 +871,48 @@ mod tests {
         let bytes = claim.encode();
         let decoded = NameClaim::decode(&bytes).unwrap();
         assert_eq!(decoded, claim);
+    }
+
+    #[test]
+    fn sign_auth_deliver_round_trips_through_verify() {
+        use crate::auth_deliver::{DEFAULT_AUTH_DELIVER_FRESHNESS_SECS, verify_auth_deliver};
+        let (dir, _out) = fresh_dir_with_identity();
+        let sov = SovereignIdentity::load_from_dir(&dir).unwrap();
+        // `now` within the fixture's subkey validity window (issued_at
+        // 1_700_000_000, valid 7 days) — verify checks the subkey window.
+        let now = 1_700_000_100u64;
+        let bob = [0xBB; 32]; // recipient
+
+        let p = sov.sign_auth_deliver(bob, [0xCC; 32], 9, now, 0x1234, b"hi from alice".to_vec());
+        assert_eq!(p.sender_node_id, *sov.node_id());
+        assert_eq!(p.sig_key_idx, sov.sig_key_idx);
+
+        // Recipient (bob) verifies against the SENDER's (alice's) document.
+        assert_eq!(
+            verify_auth_deliver(
+                &p,
+                &sov.document,
+                &bob,
+                now,
+                DEFAULT_AUTH_DELIVER_FRESHNESS_SECS
+            ),
+            Ok(()),
+            "a genuine signed delivery must verify",
+        );
+        // Tampered data must be rejected.
+        let mut bad = p.clone();
+        bad.data.push(1);
+        assert!(
+            verify_auth_deliver(
+                &bad,
+                &sov.document,
+                &bob,
+                now,
+                DEFAULT_AUTH_DELIVER_FRESHNESS_SECS
+            )
+            .is_err(),
+            "tampered delivery must fail verify",
+        );
     }
 
     #[test]
