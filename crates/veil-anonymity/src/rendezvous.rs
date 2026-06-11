@@ -1089,17 +1089,20 @@ pub mod final_hop_kind {
     pub const APP_DELIVER_AUTH: u8 = 0x03;
 }
 
-/// Cap on `IntroducePayload.ciphertext` length. Sized to match the
-/// Final-hop budget: with 1-byte tag + IntroducePayload framing, the
-/// inner ciphertext can plausibly be up to ~150 B and still fit a 2-hop
-/// circuit. Capping at 256 B catches publisher mistakes early and keeps
-/// the wire format predictable.
-pub const MAX_INTRODUCE_CIPHERTEXT: usize = 256;
+/// Cap on `IntroducePayload.ciphertext` length. Sized to the Final-hop budget
+/// of a 2-hop circuit: `[1 B onion tag] + IntroducePayload` (50 B fixed) +
+/// ciphertext must fit `max_payload_for_hops(2)` (~348 B), so the ciphertext
+/// can be ~297 B. 320 leaves a small margin and keeps the wire format
+/// predictable; the authenticated fragmentation path clamps each fragment to
+/// the actual per-hop budget regardless.
+pub const MAX_INTRODUCE_CIPHERTEXT: usize = 320;
 
 const INTRODUCE_DOMAIN: &[u8] = b"veil-introduce-v1\0";
 const INTRODUCE_NONCE_LEN: usize = 12;
 const INTRODUCE_TAG_LEN: usize = 16;
-const INTRODUCE_OVERHEAD: usize = X25519_PK_LEN + INTRODUCE_NONCE_LEN + INTRODUCE_TAG_LEN;
+/// Per-`encrypt_introduce` ciphertext overhead: ephemeral X25519 pubkey +
+/// nonce + AEAD tag. `ciphertext.len() == plaintext.len() + INTRODUCE_OVERHEAD`.
+pub const INTRODUCE_OVERHEAD: usize = X25519_PK_LEN + INTRODUCE_NONCE_LEN + INTRODUCE_TAG_LEN;
 
 /// Sender-built Introduce payload that the rendezvous receives as
 /// the Final-hop of an onion circuit and forwards to the receiver
