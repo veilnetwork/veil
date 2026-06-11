@@ -102,6 +102,19 @@ impl FrameDispatcher {
                 return self.handle_unregister_rendezvous(body, node_id);
             }
             RelayChainMsg::ForwardIntroduce => return self.handle_forward_introduce(body, node_id),
+            // Stateful return circuits (onion-registration epic, 482.7 return
+            // path). b1 reserves the wire tags but installs no circuit state —
+            // drop gracefully (anti-leak: no Violation, which would confirm
+            // relay-capability to a prober). b2/b3 wire the real handlers.
+            RelayChainMsg::CircuitBuild
+            | RelayChainMsg::CircuitData
+            | RelayChainMsg::CircuitTeardown => {
+                self.logger.info(
+                    "anonymity.relay_chain.circuit.not_implemented",
+                    "circuit msg received but stateful circuits are not wired yet (b1); dropped",
+                );
+                return DispatchResult::NoResponse;
+            }
         }
 
         if body.len() != CELL_SIZE {
