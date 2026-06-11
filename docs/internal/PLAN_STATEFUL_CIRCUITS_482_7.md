@@ -32,18 +32,19 @@ overhead vs message latency."
 
 ### What it buys (QoS, for high-message-count flows only)
 The current per-message cost (see §1) is, **per message**: `N` fresh X25519
-ephemeral keypairs + `N` ECDH + `N` AEAD ops, and **92 bytes of onion overhead
-per hop** — of which **32 bytes is the next-hop id carried in every layer**.
-Building once and reusing the circuit amortises all of that:
+ephemeral keypairs + `N` ECDH + `N` AEAD ops, and **81 bytes of onion overhead
+per hop** (onion v2, post-W1: 48 onion + 32 next-hop id + 1 TTL) — of which
+**32 bytes is the next-hop id carried in every layer**. Building once and reusing
+the circuit amortises all of that:
 
 - **No per-message ECDH** — derive a symmetric circuit key with each hop once,
   reuse for the circuit's lifetime.
 - **The relay caches the next hop** under the `CircuitId`, so data cells no
   longer carry the 32-byte next-hop id per layer.
-- A data cell's per-hop overhead drops from **~92 B → ~16 B** (just an AEAD tag;
+- A data cell's per-hop overhead drops from **~81 B → ~16 B** (just an AEAD tag;
   nonce derived from the per-circuit sequence number). For a 3-hop circuit,
-  usable payload rises from **234 B → ~450 B** (per `packet.rs`: `510 - 92·N` →
-  `~510 - 16·N - 8`), nearly double, plus the CPU saving.
+  usable payload rises from **267 B → ~450 B** (per `packet.rs`: `510 − 81·N` →
+  `~510 − 16·N − 8`), plus the CPU saving.
 
 **Break-even:** a circuit must carry **≥ 2** messages to amortise its build. So
 482.7 helps **interactive chat / repeated sends to the same peer**, and does
@@ -86,8 +87,8 @@ useful (the A.2 doc relies on it for §4.3), but it is **not** a free perf win.
 | Aspect | Today (stateless) | Anchor |
 |---|---|---|
 | Cell | 512 B fixed: `[payload_len u16][payload][zero pad]` | `cell.rs:16-22,67-72` |
-| Payload budget | `510 - 92·N` (N=3 → 234 B; N≥6 rejected) | `packet.rs:29-47` |
-| Per-hop overhead | 92 B = 60 onion (`32 eph_pk + 12 nonce + 16 tag`) + 32 next-hop id | `onion.rs:109` |
+| Payload budget | `510 − 81·N` (N=3 → 267 B; N≤6 fits, N≥7 rejected) | `packet.rs` |
+| Per-hop overhead | 81 B = 48 onion v2 (`32 eph_pk + 16 tag`, nonce derived) + 32 next-hop id + 1 TTL | `onion.rs` `ONION_LAYER_OVERHEAD=48` / `circuit.rs` `PER_HOP_OVERHEAD=81` |
 | Key schedule | **per-message** fresh ephemeral DH with each hop's STABLE directory x25519 key; AEAD key = BLAKE3(shared) | `onion.rs:133-260` |
 | Relay forwarding | **stateless**: `peel_anonymous_cell` → `Forward{next_hop, outbound_cell}` or `Final`; no per-cell state; silent drop if next hop down | `dispatcher/anonymity.rs:70-196` |
 | Replay protection | **none** on generic cells (only Introduce frames at rendezvous have a replay cache) | `onion.rs:84-86`; `rendezvous.rs` IntroduceReplayCache |
