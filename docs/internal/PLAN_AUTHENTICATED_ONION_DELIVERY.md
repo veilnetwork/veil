@@ -1,16 +1,18 @@
-# Authenticated-sender onion delivery — design spec (SUPERSEDED)
+# Authenticated-sender onion delivery — v1 design spec (ACTIVE)
 
-> **⚠️ SUPERSEDED (2026-06)** by
-> [`PLAN_ANON_MESSAGING_ARCHITECTURE.md`](PLAN_ANON_MESSAGING_ARCHITECTURE.md).
-> This single-cell, source-routed design hit a payload-budget wall (~184 B
-> per-message-signature auth overhead in a 267 B cell; worse with a hybrid
-> Falcon subkey) and had no return path for replies. The budget / hybrid-sig /
-> reply / incoming requirements all pointed to **stateful bidirectional
-> circuits**, and per-message-signature authentication was replaced by an X3DH
-> handshake. Kept as a record of the design evolution; the §3 envelope format
-> and §5 verification steps remain a useful reference for the auth fields, but
-> the chosen architecture carries them over an X3DH/Double-Ratchet session, not a
-> per-message signature in a single cell.
+> **✅ REINSTATED as the v1 plan (2026-06).** Two independent reviews found the
+> X3DH-handshake replacement was wrong (`x3dh.rs` is a KEM seal, not an AKE —
+> zero sender auth), and recommended exactly this approach for v1: a **per-message
+> identity-subkey signature** inside the onion final payload. v1 scope (confirmed
+> with the maintainer): **Ed25519 signature + single-cell onion + one-way
+> (sender→recipient) + production-wire the onion origination.** The earlier
+> "budget wall" was the FULL 184 B auth envelope; a minimal Ed25519 signature is
+> +64 B, which fits the 267 B (onion v2) cell. **Deferred to v2:** hybrid-Falcon
+> signature (needs multi-cell circuit data), replies / bidirectional, stateful
+> circuits (482.7), Double Ratchet — see
+> [`PLAN_ANON_MESSAGING_ARCHITECTURE.md`](PLAN_ANON_MESSAGING_ARCHITECTURE.md)
+> (descoped). The §3 envelope / §5 verification below are the v1 blueprint;
+> implementation tracks §9.
 
 > **Status (2026-06):** DESIGN DRAFT for review, no code. Chosen direction:
 > production onion-routed delivery (relay anonymity) **with the recipient
