@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::circuit_data::ReplayWindow;
 use crate::circuit_setup::{CIRCUIT_KEY_LEN, CircuitInstall};
@@ -56,6 +57,10 @@ pub struct CircuitState {
     pub replay_fwd: Mutex<ReplayWindow>,
     /// Anti-replay window for return-direction cells.
     pub replay_ret: Mutex<ReplayWindow>,
+    /// Monotonic seq for return cells THIS node ORIGINATES (only meaningful at
+    /// the terminus, which seals the first return layer — see b4b). Starts at 1
+    /// (0 is reserved by [`ReplayWindow`]).
+    next_return_seq: AtomicU32,
 }
 
 impl CircuitState {
@@ -74,6 +79,7 @@ impl CircuitState {
             last_seen_unix: Mutex::new(now),
             replay_fwd: Mutex::new(ReplayWindow::new()),
             replay_ret: Mutex::new(ReplayWindow::new()),
+            next_return_seq: AtomicU32::new(1),
         }
     }
 
@@ -83,6 +89,13 @@ impl CircuitState {
             .last_seen_unix
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = now;
+    }
+
+    /// Allocate the next return-direction seq for a cell this node originates.
+    /// Wraps past `u32::MAX` back to 1 (never returns 0).
+    pub fn alloc_return_seq(&self) -> u32 {
+        let s = self.next_return_seq.fetch_add(1, Ordering::Relaxed);
+        if s == 0 { 1 } else { s }
     }
 }
 

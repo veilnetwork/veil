@@ -1197,6 +1197,15 @@ pub struct FrameDispatcher {
     /// `CircuitData` / `CircuitTeardown` cells in both directions. See
     /// `docs/internal/PLAN_ANON_SERVICE_ONION_REGISTRATION.md`.
     pub circuit_table: Option<Arc<veil_anonymity::circuit_table::CircuitTable>>,
+
+    /// Cookie → circuit-backed rendezvous subscriptions, for nodes acting as a
+    /// rendezvous relay for LOCATION-anonymous services. `None` when not
+    /// `relay_capable`. A receiver registers a cookie as the terminus payload of
+    /// a circuit build; `handle_final_introduce` forwards a matching introduce
+    /// DOWN that circuit instead of over a direct session — so R never learns
+    /// the service's location. See `circuit_register`.
+    pub circuit_rendezvous:
+        Option<Arc<veil_anonymity::circuit_register::CircuitRendezvousRegistry>>,
 }
 
 /// Constant-time pad applied to banned-peer drops in `dispatch()`.
@@ -1784,6 +1793,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         introduce_replay_cache: Arc::new(veil_anonymity::rendezvous::IntroduceReplayCache::new()),
         rendezvous_registry: None,
         circuit_table: None,
+        circuit_rendezvous: None,
     }
 }
 
@@ -2479,6 +2489,7 @@ mod tests {
             ),
             rendezvous_registry: None,
             circuit_table: None,
+            circuit_rendezvous: None,
         }
     }
 
