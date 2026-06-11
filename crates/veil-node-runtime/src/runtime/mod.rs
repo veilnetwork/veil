@@ -6233,6 +6233,95 @@ impl NodeServices {
         })
     }
 
+    /// Reply to a previously-received authenticated message via its one-time
+    /// reply block. `reply_id` is the opaque handle the recipient app got
+    /// alongside the inbound message; we take (consume) the daemon-side block,
+    /// reconstruct the original sender's rendezvous path from it, and send an
+    /// authenticated anonymous message back — WITHOUT either side publishing a
+    /// public ad (the whole point of the reply channel: no presence leak).
+    ///
+    /// The reply itself carries no further reply block (`reply = None`): a v1
+    /// reply is terminal. The block is single-use — a second `send_reply` with
+    /// the same id fails with `NoRendezvous` (already consumed or TTL-expired).
+    pub async fn send_reply(
+        &self,
+        reply_id: u64,
+        data: &[u8],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        use veil_types::AnonOnionSendError;
+
+        const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        if self.identity.sovereign_identity.is_none() {
+            return Err(AnonOnionSendError::NoIdentity);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Consume the one-time block; gone/expired → no reply path.
+        let Some((block, original_sender_node_id)) =
+            self.anonymity.reply_block_store.take(reply_id, now)
+        else {
+            return Err(AnonOnionSendError::NoRendezvous);
+        };
+
+        // Reconstruct the original sender's rendezvous path as a synthetic ad.
+        // Only the four routing fields are read downstream
+        // (`send_via_rendezvous_authenticated` → `send_sealed_introduce`); the
+        // signed-ad fields are irrelevant here because the path came from a
+        // signature-bound reply block, not a DHT lookup, so it needs no
+        // re-verification. Validity bounds are set wide-open for the same reason.
+        let ad = veil_anonymity::rendezvous::RendezvousAd {
+            receiver_node_id: original_sender_node_id,
+            rendezvous_node_id: block.rendezvous_node_id,
+            auth_cookie: block.auth_cookie,
+            receiver_x25519_pk: block.x25519_pk,
+            valid_from_unix: 0,
+            valid_until_unix: u64::MAX,
+            issuer_pk: String::new(),
+            issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
+            signature: Vec::new(),
+            push_envelope: Vec::new(),
+            capability_token: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            // Inert: the synthetic ad is never re-encoded or verified.
+            wire_version: 0,
+        };
+
+        // Pre-resolve the reply relay's directory entry into our local shard so
+        // the onion build can reach it (same fix as `send_anonymous_*_to`).
+        let relay_key = veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id);
+        if self.dht.get_local(&relay_key).is_none()
+            && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
+        {
+            self.dht.store_local(relay_key, bytes);
+        }
+
+        self.send_via_rendezvous_authenticated(
+            &ad,
+            block.reply_app_id,
+            block.reply_endpoint_id,
+            data,
+            hop_count,
+            None,
+        )
+        .map_err(|e| match e {
+            veil_anonymity::sender::SenderError::MissingSenderIdentity => {
+                AnonOnionSendError::NoIdentity
+            }
+            veil_anonymity::sender::SenderError::InsufficientRelayCandidates { .. } => {
+                AnonOnionSendError::NoRelays
+            }
+            veil_anonymity::sender::SenderError::PayloadTooLarge { .. } => {
+                AnonOnionSendError::PayloadTooLarge
+            }
+            _ => AnonOnionSendError::NoRelays,
+        })
+    }
+
     /// Seal `sealed_plaintext` (which already carries its `final_hop_kind` tag)
     /// to the ad's recipient, wrap it as an `IntroducePayload`, and onion-route
     /// it to the rendezvous relay as the Final hop. Shared by the plain
