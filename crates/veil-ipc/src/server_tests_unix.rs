@@ -291,6 +291,10 @@ async fn e2e_local_send_delivers_to_receiver() {
         require_ack: false,
         anonymous: false,
         anonymous_authenticated: false,
+        expect_reply: false,
+        is_reply: false,
+        reply_id: 0,
+        reply_endpoint_id: 0,
     };
     send_ipc_frame(
         &mut client_b,
@@ -370,6 +374,10 @@ async fn slow_reader_does_not_block_server() {
         require_ack: false,
         anonymous: false,
         anonymous_authenticated: false,
+        expect_reply: false,
+        is_reply: false,
+        reply_id: 0,
+        reply_endpoint_id: 0,
     };
 
     // Send 20 messages quickly; server should not block
@@ -844,6 +852,10 @@ async fn ipc_send_relay_via_route_cache() {
         require_ack: false,
         anonymous: false,
         anonymous_authenticated: false,
+        expect_reply: false,
+        is_reply: false,
+        reply_id: 0,
+        reply_endpoint_id: 0,
     };
     send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &send.encode()).await;
 
@@ -1111,6 +1123,10 @@ async fn spoofed_src_app_id_is_rejected() {
         require_ack: false,
         anonymous: false,
         anonymous_authenticated: false,
+        expect_reply: false,
+        is_reply: false,
+        reply_id: 0,
+        reply_endpoint_id: 0,
     };
     send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &send.encode()).await;
 
@@ -1436,6 +1452,10 @@ async fn anonymous_send_payload_starts_with_meta_e2e_marker() {
         require_ack: false,
         anonymous: true,
         anonymous_authenticated: false,
+        expect_reply: false,
+        is_reply: false,
+        reply_id: 0,
+        reply_endpoint_id: 0,
     };
     send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &send.encode()).await;
 

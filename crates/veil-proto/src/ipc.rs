@@ -1004,6 +1004,21 @@ pub const IPC_SEND_FLAG_ANONYMOUS: u32 = 0x0000_0002;
 /// (a resolvable RendezvousAd) and the sender to have a sovereign identity.
 pub const IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED: u32 = 0x0000_0004;
 
+/// Flag bit for `AppIpcSendPayload.flags`: on an authenticated anonymous send,
+/// attach a one-time reply block so the recipient can reply WITHOUT either side
+/// publishing a public rendezvous ad (no presence leak). The reply will be
+/// delivered to `(src_app_id, reply_endpoint_id)` on this node. Only meaningful
+/// together with `ANONYMOUS_AUTHENTICATED`; ignored otherwise.
+pub const IPC_SEND_FLAG_EXPECT_REPLY: u32 = 0x0000_0008;
+
+/// Flag bit for `AppIpcSendPayload.flags`: this send IS a reply, routed via the
+/// opaque `reply_id` the app received alongside an earlier authenticated
+/// message (not via `dst_node_id`/`app_id`/`endpoint_id`, which are ignored).
+/// The daemon takes the one-time reply block by id and sends back over the
+/// original sender's rendezvous path. Mutually exclusive with the explicit
+/// destination flags.
+pub const IPC_SEND_FLAG_IS_REPLY: u32 = 0x0000_0010;
+
 /// Sent by the IPC client to dispatch a datagram into the veil network.
 ///
 /// Wire layout:
@@ -1013,10 +1028,16 @@ pub const IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED: u32 = 0x0000_0004;
 /// [64..96] app_id [u8; 32] (destination app_id)
 /// [96..100] endpoint_id u32 BE (destination endpoint)
 /// [100..104] flags u32 BE (bit 0 = REQUIRE_ACK, bit 1 = ANONYMOUS,
-///                           bit 2 = ANONYMOUS_AUTHENTICATED)
+///                           bit 2 = ANONYMOUS_AUTHENTICATED,
+///                           bit 3 = EXPECT_REPLY, bit 4 = IS_REPLY)
 /// [104..108] data_len u32 BE
 /// [108..108+data_len] data bytes
+/// [D..D+8]   reply_id u64 BE     (trailing; optional — 0 if absent)
+/// [D+8..D+12] reply_endpoint_id u32 BE (trailing; optional — 0 if absent)
 /// ```
+/// The two trailing fields are appended after `data` so the fixed header offsets
+/// stay stable; a pre-reply-channel client (which sends neither) round-trips as
+/// `reply_id = 0`, `reply_endpoint_id = 0`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppIpcSendPayload {
     /// Destination `node_id`.
@@ -1037,6 +1058,17 @@ pub struct AppIpcSendPayload {
     /// verifies the sender). Set `IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED`.
     /// Mutually exclusive with `anonymous`.
     pub anonymous_authenticated: bool,
+    /// On an authenticated send, attach a one-time reply block addressed to
+    /// `(src_app_id, reply_endpoint_id)`. Set `IPC_SEND_FLAG_EXPECT_REPLY`.
+    pub expect_reply: bool,
+    /// This send is a reply routed via `reply_id` (ignores the explicit
+    /// destination). Set `IPC_SEND_FLAG_IS_REPLY`.
+    pub is_reply: bool,
+    /// Opaque reply handle, used when `is_reply`. 0 means "no reply".
+    pub reply_id: u64,
+    /// Endpoint the eventual reply should be delivered to, used when
+    /// `expect_reply` (paired with `src_app_id`).
+    pub reply_endpoint_id: u32,
     /// Datagram payload. d: backed by the global bufpool so chat_node-
     /// style 200 msg/sec × 60 KB IPC inbound load doesn't malloc-churn this
     /// allocator-side. Clone is cheap (Arc-style refcount).
@@ -1064,9 +1096,18 @@ impl AppIpcSendPayload {
         if self.anonymous_authenticated {
             flags |= IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED;
         }
+        if self.expect_reply {
+            flags |= IPC_SEND_FLAG_EXPECT_REPLY;
+        }
+        if self.is_reply {
+            flags |= IPC_SEND_FLAG_IS_REPLY;
+        }
         buf.extend_from_slice(&flags.to_be_bytes());
         buf.extend_from_slice(&(data_slice.len() as u32).to_be_bytes());
         buf.extend_from_slice(data_slice);
+        // Trailing reply fields (after data — keeps fixed offsets stable).
+        buf.extend_from_slice(&self.reply_id.to_be_bytes());
+        buf.extend_from_slice(&self.reply_endpoint_id.to_be_bytes());
         buf
     }
 
@@ -1086,6 +1127,8 @@ impl AppIpcSendPayload {
         let require_ack = flags & IPC_SEND_FLAG_REQUIRE_ACK != 0;
         let anonymous = flags & IPC_SEND_FLAG_ANONYMOUS != 0;
         let anonymous_authenticated = flags & IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED != 0;
+        let expect_reply = flags & IPC_SEND_FLAG_EXPECT_REPLY != 0;
+        let is_reply = flags & IPC_SEND_FLAG_IS_REPLY != 0;
         let data_len = super::read_u32_be(buf, 104)? as usize;
         // checked_add — 32-bit overflow defence.
         let total = Self::FIXED_SIZE
@@ -1107,6 +1150,18 @@ impl AppIpcSendPayload {
         // dirty-page retention.
         let mut pooled = veil_bufpool::global().acquire(data_len);
         pooled.as_vec_mut().extend_from_slice(&buf[108..total]);
+        // Trailing reply fields: present only on reply-channel-aware clients.
+        // Absent (older client) → default to 0 (= "no reply").
+        let reply_id = if buf.len() >= total + 8 {
+            super::read_u64_be(buf, total)?
+        } else {
+            0
+        };
+        let reply_endpoint_id = if buf.len() >= total + 12 {
+            super::read_u32_be(buf, total + 8)?
+        } else {
+            0
+        };
         Ok(Self {
             dst_node_id,
             src_app_id,
@@ -1115,6 +1170,10 @@ impl AppIpcSendPayload {
             require_ack,
             anonymous,
             anonymous_authenticated,
+            expect_reply,
+            is_reply,
+            reply_id,
+            reply_endpoint_id,
             data: pooled.into_shared(),
         })
     }
@@ -1529,6 +1588,10 @@ pub mod ipc_send_err {
     /// Conflicting flags: `anonymous` (meta-E2E) and `anonymous_authenticated`
     /// (onion) are mutually exclusive transports.
     pub const INVALID_FLAGS: u16 = 9;
+    /// Reply send (`is_reply`): the `reply_id` is unknown, already consumed, or
+    /// its one-time reply block expired (default 300 s TTL). The app must obtain
+    /// a fresh `reply_id` from a newer inbound message.
+    pub const REPLY_UNKNOWN: u16 = 10;
 }
 
 // ── AppIpcRtSendPayload ─────────────────────────────────────────────────────
@@ -5246,6 +5309,10 @@ mod tests {
             require_ack: false,
             anonymous: false,
             anonymous_authenticated: false,
+            expect_reply: false,
+            is_reply: false,
+            reply_id: 0,
+            reply_endpoint_id: 0,
             data: veil_bufpool::pooled_shared_from_vec(b"greetings".to_vec()),
         };
         let buf = p.encode();
@@ -5263,6 +5330,10 @@ mod tests {
             require_ack: true,
             anonymous: false,
             anonymous_authenticated: true,
+            expect_reply: false,
+            is_reply: false,
+            reply_id: 0,
+            reply_endpoint_id: 0,
             data: veil_bufpool::pooled_shared_from_vec(b"authed".to_vec()),
         };
         let d = AppIpcSendPayload::decode(&p.encode()).unwrap();
@@ -5277,6 +5348,76 @@ mod tests {
             IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED
         );
         assert_eq!(flags & IPC_SEND_FLAG_REQUIRE_ACK, IPC_SEND_FLAG_REQUIRE_ACK);
+    }
+
+    #[test]
+    fn ipc_send_reply_fields_roundtrip() {
+        // expect_reply on an outbound authenticated send.
+        let p = AppIpcSendPayload {
+            src_app_id: [3u8; 32],
+            dst_node_id: [0x10; 32],
+            app_id: [0x20; 32],
+            endpoint_id: 5,
+            require_ack: false,
+            anonymous: false,
+            anonymous_authenticated: true,
+            expect_reply: true,
+            is_reply: false,
+            reply_id: 0,
+            reply_endpoint_id: 77,
+            data: veil_bufpool::pooled_shared_from_vec(b"hi".to_vec()),
+        };
+        let d = AppIpcSendPayload::decode(&p.encode()).unwrap();
+        assert_eq!(d, p);
+        assert!(d.expect_reply);
+        assert_eq!(d.reply_endpoint_id, 77);
+
+        // is_reply carrying an opaque reply_id.
+        let r = AppIpcSendPayload {
+            src_app_id: [4u8; 32],
+            dst_node_id: [0; 32],
+            app_id: [0; 32],
+            endpoint_id: 0,
+            require_ack: false,
+            anonymous: false,
+            anonymous_authenticated: false,
+            expect_reply: false,
+            is_reply: true,
+            reply_id: 0xDEAD_BEEF_0000_0042,
+            reply_endpoint_id: 0,
+            data: veil_bufpool::pooled_shared_from_vec(b"pong".to_vec()),
+        };
+        let d = AppIpcSendPayload::decode(&r.encode()).unwrap();
+        assert_eq!(d, r);
+        assert!(d.is_reply);
+        assert_eq!(d.reply_id, 0xDEAD_BEEF_0000_0042);
+    }
+
+    #[test]
+    fn ipc_send_decodes_pre_reply_buffer_as_zero() {
+        // A pre-reply-channel client encodes no trailing fields. Truncate the
+        // 12 trailing bytes off a fresh encode to emulate that wire shape; it
+        // must still decode (reply_id/reply_endpoint_id default to 0).
+        let p = AppIpcSendPayload {
+            src_app_id: [1u8; 32],
+            dst_node_id: [2u8; 32],
+            app_id: [3u8; 32],
+            endpoint_id: 9,
+            require_ack: true,
+            anonymous: false,
+            anonymous_authenticated: false,
+            expect_reply: false,
+            is_reply: false,
+            reply_id: 0,
+            reply_endpoint_id: 0,
+            data: veil_bufpool::pooled_shared_from_vec(b"legacy".to_vec()),
+        };
+        let mut buf = p.encode();
+        buf.truncate(buf.len() - 12); // drop trailing reply_id + reply_endpoint_id
+        let d = AppIpcSendPayload::decode(&buf).unwrap();
+        assert_eq!(d.reply_id, 0);
+        assert_eq!(d.reply_endpoint_id, 0);
+        assert_eq!(&*d.data, b"legacy");
     }
 
     #[test]
