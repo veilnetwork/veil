@@ -312,10 +312,27 @@ impl SimNetwork {
         }
 
         // Reload both nodes
-        if self.nodes[a].reload_with(config_a).await.is_err() {
+        // E20 fix — reload order matters. Directional dedup makes the
+        // SMALLER-node_id side own the canonical outbound dial (it keeps its
+        // outbound; the larger keeps the inbound + skips dialing). If the
+        // smaller node reloads FIRST, it dials + forms the session, and the
+        // larger node's SUBSEQUENT reload tears that session down — after which
+        // the smaller node's outbound connector sits in its 30s has_session /
+        // policy sleep and doesn't promptly re-dial (and force_reconnect_notify
+        // is edge-triggered, easily missed). Net: ~50% of pairs (keyed on which
+        // index has the smaller node_id) never re-establish in the wait window.
+        // Fix: reload the LARGER node_id first and the SMALLER last, so the
+        // canonical session forms AFTER both reloads and is never torn down.
+        let a_smaller = self.nodes[a].node_id() < self.nodes[b].node_id();
+        let (first, first_cfg, second, second_cfg) = if a_smaller {
+            (b, config_b, a, config_a) // a is smaller → reload it last
+        } else {
+            (a, config_a, b, config_b)
+        };
+        if self.nodes[first].reload_with(first_cfg).await.is_err() {
             return false;
         }
-        if self.nodes[b].reload_with(config_b).await.is_err() {
+        if self.nodes[second].reload_with(second_cfg).await.is_err() {
             return false;
         }
         self.links.insert(key);
@@ -466,9 +483,54 @@ impl SimNetwork {
     /// Wire a full mesh: every pair (i, j) with i < j.
     pub async fn wire_full_mesh(&mut self) {
         let n = self.nodes.len();
+        if n == 0 {
+            return;
+        }
+        // E20 fix: build each node's COMPLETE peer set up front and reload each
+        // node exactly ONCE (no O(N^2) pairwise reload churn), in DESCENDING
+        // node_id order (smallest last). Directional dedup makes the smaller
+        // node own the canonical outbound dial; reloading it last means every
+        // pair's canonical session forms after BOTH endpoints are up and is
+        // never torn down by a later reload. (The old pairwise `connect(i, j)`
+        // reloaded shared nodes O(N) times and, for ~half of pairs, formed the
+        // session before the partner's reload killed it — with the 30s
+        // connector sleep blocking a prompt re-dial: the ~50% flake.)
+        let mut configs: Vec<_> = (0..n).map(|i| self.nodes[i].config.clone()).collect();
+        for i in 0..n {
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let peer_id = PeerId::new(self.next_peer_id as u32);
+                self.next_peer_id += 1;
+                if let Some(p) = self.nodes[j].as_peer_config(peer_id) {
+                    configs[i].peers.push(p);
+                }
+            }
+        }
+        // Reload order: descending node_id (smallest node reloads LAST).
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&x, &y| self.nodes[y].node_id().cmp(&self.nodes[x].node_id()));
+        let mut configs: Vec<Option<_>> = configs.into_iter().map(Some).collect();
+        for &i in &order {
+            if let Some(cfg) = configs[i].take() {
+                let _ = self.nodes[i].reload_with(cfg).await;
+            }
+        }
         for i in 0..n {
             for j in (i + 1)..n {
-                self.connect(i, j).await;
+                self.links.insert((i, j));
+            }
+        }
+        // Convergence: every node should reach n-1 sessions.
+        for i in 0..n {
+            let ok = self.nodes[i]
+                .wait_sessions(n - 1, Duration::from_secs(30))
+                .await;
+            if ok {
+                for j in (i + 1)..n {
+                    self.record(SimEvent::NodeConnected { a: i, b: j });
+                }
             }
         }
     }
