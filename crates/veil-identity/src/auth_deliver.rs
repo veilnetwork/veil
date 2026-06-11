@@ -46,6 +46,103 @@ pub enum AuthDeliverError {
     UnsupportedAlgo(u8),
     #[error("signature verification failed")]
     BadSignature,
+    #[error("replayed authenticated delivery (sender+nonce already seen)")]
+    Replay,
+}
+
+/// FIFO cap on the per-sender replay window. ~65k × 24 B ≈ 1.5 MiB; an attacker
+/// pumping unique nonces can only force-evict the OLDEST entries, never a
+/// just-recorded one.
+pub const DEFAULT_AUTH_DELIVER_REPLAY_CAP: usize = 65_536;
+
+/// Bounded per-recipient replay cache for authenticated deliveries, keyed on
+/// `BLAKE3(sender_node_id || nonce)`. Entries expire after `ttl_secs` (set to
+/// the freshness window — a replay older than that is already rejected by the
+/// freshness check in [`verify_auth_deliver`], so we never need to remember it
+/// longer). Same insertion-ordered queue + set shape as the rendezvous
+/// `IntroduceReplayCache`. The caller verifies FIRST, then records — so a forged
+/// envelope never pollutes the cache.
+pub struct AuthDeliverReplayCache {
+    seen: std::sync::Mutex<ReplayState>,
+    ttl_secs: u64,
+    cap: usize,
+}
+
+#[derive(Default)]
+struct ReplayState {
+    /// Insertion-ordered `(fingerprint, expiry_unix)` — front is oldest.
+    queue: std::collections::VecDeque<([u8; 16], u64)>,
+    /// O(1) membership.
+    set: std::collections::HashSet<[u8; 16]>,
+}
+
+impl AuthDeliverReplayCache {
+    /// Cache with the default freshness-window TTL and capacity.
+    pub fn new() -> Self {
+        Self::with_params(
+            DEFAULT_AUTH_DELIVER_FRESHNESS_SECS,
+            DEFAULT_AUTH_DELIVER_REPLAY_CAP,
+        )
+    }
+
+    /// Cache with explicit TTL + capacity.
+    pub fn with_params(ttl_secs: u64, cap: usize) -> Self {
+        Self {
+            seen: std::sync::Mutex::new(ReplayState::default()),
+            ttl_secs,
+            cap,
+        }
+    }
+
+    fn fingerprint(sender_node_id: &[u8; 32], nonce: u64) -> [u8; 16] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"veil.auth-deliver.replay.v1");
+        h.update(sender_node_id);
+        h.update(&nonce.to_be_bytes());
+        let mut fp = [0u8; 16];
+        fp.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        fp
+    }
+
+    /// Record `(sender_node_id, nonce)` as seen, or return
+    /// [`AuthDeliverError::Replay`] if it already was within the TTL. Call ONLY
+    /// after [`verify_auth_deliver`] has accepted the message.
+    pub fn check_and_record(
+        &self,
+        sender_node_id: &[u8; 32],
+        nonce: u64,
+        now_unix: u64,
+    ) -> Result<(), AuthDeliverError> {
+        let fp = Self::fingerprint(sender_node_id, nonce);
+        let mut g = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        // Lazy GC from the front (uniform TTL → front is oldest expiry).
+        while let Some(&(fp_old, exp)) = g.queue.front() {
+            if now_unix < exp {
+                break;
+            }
+            g.queue.pop_front();
+            g.set.remove(&fp_old);
+        }
+        if g.set.contains(&fp) {
+            return Err(AuthDeliverError::Replay);
+        }
+        // FIFO cap-evict (drop the oldest, never the just-recorded entry).
+        if g.set.len() >= self.cap
+            && let Some((fp_old, _)) = g.queue.pop_front()
+        {
+            g.set.remove(&fp_old);
+        }
+        g.queue
+            .push_back((fp, now_unix.saturating_add(self.ttl_secs)));
+        g.set.insert(fp);
+        Ok(())
+    }
+}
+
+impl Default for AuthDeliverReplayCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Verify an [`AuthAppDeliver`] at the recipient. Pure (no replay state).
@@ -100,6 +197,55 @@ mod tests {
     use veil_proto::identity_document::IdentityKey;
 
     const NOW: u64 = 1_700_000_000;
+
+    #[test]
+    fn replay_cache_accepts_once_then_rejects_duplicate() {
+        let cache = AuthDeliverReplayCache::new();
+        let alice = [0xAA; 32];
+        assert_eq!(cache.check_and_record(&alice, 1, NOW), Ok(()));
+        // Same (sender, nonce) → replay.
+        assert_eq!(
+            cache.check_and_record(&alice, 1, NOW),
+            Err(AuthDeliverError::Replay)
+        );
+        // Different nonce, same sender → ok.
+        assert_eq!(cache.check_and_record(&alice, 2, NOW), Ok(()));
+        // Same nonce, different sender → ok (key includes sender).
+        assert_eq!(cache.check_and_record(&[0xBB; 32], 1, NOW), Ok(()));
+    }
+
+    #[test]
+    fn replay_cache_forgets_after_ttl() {
+        let cache = AuthDeliverReplayCache::with_params(300, 1024);
+        let alice = [0xAA; 32];
+        assert_eq!(cache.check_and_record(&alice, 7, NOW), Ok(()));
+        // Within TTL → still a replay.
+        assert_eq!(
+            cache.check_and_record(&alice, 7, NOW + 299),
+            Err(AuthDeliverError::Replay)
+        );
+        // Past TTL → the entry is GC'd, so it is accepted again. (Freshness in
+        // verify_auth_deliver independently rejects a stale timestamp; this only
+        // governs the cache's memory window.)
+        assert_eq!(cache.check_and_record(&alice, 7, NOW + 301), Ok(()));
+    }
+
+    #[test]
+    fn replay_cache_cap_evicts_fifo_oldest() {
+        let cache = AuthDeliverReplayCache::with_params(10_000, 2);
+        let alice = [0xAA; 32];
+        assert_eq!(cache.check_and_record(&alice, 1, NOW), Ok(()));
+        assert_eq!(cache.check_and_record(&alice, 2, NOW), Ok(()));
+        // Inserting a 3rd over cap=2 evicts the OLDEST (nonce 1).
+        assert_eq!(cache.check_and_record(&alice, 3, NOW), Ok(()));
+        // nonce 1 was evicted → accepted again (not a replay).
+        assert_eq!(cache.check_and_record(&alice, 1, NOW), Ok(()));
+        // nonce 3 is still present → replay.
+        assert_eq!(
+            cache.check_and_record(&alice, 3, NOW),
+            Err(AuthDeliverError::Replay)
+        );
+    }
 
     /// Build a synthetic single-Ed25519-subkey IdentityDocument + a matching
     /// signed AuthAppDeliver. Returns (doc, payload, self_node_id, sender_node_id).
