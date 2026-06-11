@@ -348,6 +348,11 @@ pub use veil_dispatcher_state::{CaptureEvent, DiagEvent, PendingRecursive};
 /// fallback can apply priority-aware timeout multipliers.
 pub type RouteMissTx = mpsc::Sender<([u8; 32], u8)>;
 
+/// type alias for the authenticated-onion final-hop channel sender.
+/// Carries the decoded [`veil_proto::AuthAppDeliver`] from the sync
+/// dispatcher to the runtime-owned async verify+deliver task.
+pub type AuthDeliverTx = mpsc::Sender<veil_proto::AuthAppDeliver>;
+
 // ── ExpiryCache ───────────────────────────────────────────────────────────────
 
 /// Generic deduplication set with TTL expiry and O(1) oldest-entry eviction.
@@ -851,6 +856,17 @@ pub struct FrameDispatcher {
     /// channel item gained the traffic_class byte so the iterative-DHT
     /// fallback can pick a priority-aware timeout budget.
     pub route_miss_tx: Arc<Mutex<Option<RouteMissTx>>>,
+
+    // ── Authenticated anonymous delivery (Epic 482 v1) ──────────────
+    /// Sender side of the authenticated-onion final-hop channel. When a
+    /// final-hop cell carries `final_hop_kind::APP_DELIVER_AUTH`, the (sync)
+    /// dispatcher decodes the [`veil_proto::AuthAppDeliver`] and hands it here.
+    /// A runtime-owned async task drains the channel, resolves the sender's
+    /// identity document (DHT), runs `verify_auth_deliver` + the per-sender
+    /// replay check, and delivers with the VERIFIED sender node_id. `None`
+    /// until the runtime wires the task (test dispatchers leave it unset, so
+    /// authenticated final-hop cells are dropped).
+    pub auth_deliver_tx: Arc<Mutex<Option<AuthDeliverTx>>>,
 
     // ── Neighbor scoring ─────────────────────────────────────────
     /// Neighbor reachability scorer. Used when inserting routes into the cache
@@ -1654,6 +1670,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         capture_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         capture_rate_limit: Arc::new(veil_dispatcher_state::CaptureRateLimiter::new()),
         route_miss_tx: Arc::new(Mutex::new(None)),
+        auth_deliver_tx: Arc::new(Mutex::new(None)),
         neighbor_scorer: Arc::new(Mutex::new(NeighborScorer::with_alphas(0.5, 0.1))),
         local_vivaldi: None,
         peer_vivaldi: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -2342,6 +2359,7 @@ mod tests {
             capture_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capture_rate_limit: Arc::new(veil_dispatcher_state::CaptureRateLimiter::new()),
             route_miss_tx: Arc::new(Mutex::new(None)),
+            auth_deliver_tx: Arc::new(Mutex::new(None)),
             neighbor_scorer: Arc::new(Mutex::new(NeighborScorer::with_alphas(0.5, 0.1))),
             local_vivaldi: None,
             peer_vivaldi: Arc::new(std::sync::RwLock::new(HashMap::new())),

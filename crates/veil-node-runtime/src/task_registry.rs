@@ -78,6 +78,13 @@ pub enum RuntimeService {
     /// No-op on nodes without a loaded sovereign identity.
     SovereignIdentityRepublish,
 
+    /// Authenticated-onion final-hop verify+deliver task (Epic 482 v1).
+    /// Drains `auth_deliver_tx`: resolves the sender's identity document,
+    /// runs `verify_auth_deliver` + the per-sender replay check, and delivers
+    /// with the VERIFIED sender node_id. No-op behaviour on nodes that never
+    /// receive `APP_DELIVER_AUTH` cells (the channel simply stays idle).
+    AuthDeliverHandler,
+
     // ── P-Net (private veil network) ──────────────────────────────────
     /// Periodic poll of the local DHT store for PBAN-prefixed records,
     /// verifying and applying them to the local `BanList`. Spawned only
@@ -148,6 +155,7 @@ impl RuntimeService {
         Self::Bootstrap,
         Self::BootstrapWatchdog,
         Self::SovereignIdentityRepublish,
+        Self::AuthDeliverHandler,
         Self::PNetBanSync,
         Self::UpdateCheck,
         // Proxy / IPC / discovery.
