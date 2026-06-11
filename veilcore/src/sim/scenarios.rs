@@ -267,7 +267,6 @@ mod tests {
     ///
     /// The test verifies that P50 < 2 s and P95 < 5 s — sanity bounds for a
     /// loopback TCP connection in a debug build.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn session_establishment_latency_percentiles() {
         let pairs = 5;
@@ -5300,7 +5299,6 @@ mod tests {
     /// `dht_get_local` for each candidate). Maintenance tick publishes
     /// own entry every 60s by default — too slow for tests. Use
     /// `debug_force_dht_publish_relay_directory_entry` to expedite.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic482_7_end_to_end_anonymous_send_through_3_hops() {
         let n = 4;
@@ -5439,7 +5437,6 @@ mod tests {
     /// `#[ignore]` for the same reason as its unauthenticated sibling: E20
     /// directional dedup makes SimNetwork pairwise-session establishment
     /// flaky; run with `--ignored` for the integration check.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic482_end_to_end_authenticated_send_through_3_hops() {
         use crate::proto::identity_document::IdentityDocument;
@@ -5596,7 +5593,6 @@ mod tests {
     /// * Receiver-IP NEVER flows to sender (sender only knows N3 + cookie).
     /// * Rendezvous can NOT read the payload (sealed to receiver's pk).
     /// * Payload bytes round-trip exactly.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic482_5_end_to_end_rendezvous_flow_through_3_hops_plus_rendezvous() {
         let n = 5;
@@ -5746,7 +5742,6 @@ mod tests {
     /// `#[ignore]` for the same reason as its plain sibling: E20 directional
     /// dedup makes SimNetwork pairwise-session establishment flaky. Run with
     /// `--ignored` for the integration check.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic482_5_end_to_end_authenticated_rendezvous_flow() {
         use crate::proto::identity_document::IdentityDocument;
