@@ -5730,6 +5730,166 @@ mod tests {
         net.stop().await;
     }
 
+    /// End-to-end AUTHENTICATED anonymous delivery via RENDEZVOUS (Epic 482 v1
+    /// brick 5, "any recipient"). Combines the rendezvous topology with the
+    /// authenticated payload: the sender signs + fragments an `AuthAppDeliver`,
+    /// onion-routes each fragment to the rendezvous relay, which forwards to the
+    /// registered receiver; the receiver reassembles, resolves + verifies the
+    /// sender's identity, and delivers with the VERIFIED sender node_id.
+    ///
+    /// 5-node topology: sender (N0) + relay1 (N1) + relay2 (N2) +
+    /// rendezvous (N3) + receiver (N4). Verifies the property the plain
+    /// rendezvous flow cannot give: `src_node_id` at the receiver equals the
+    /// sender's sovereign node_id (vs `[0; 32]` on the unauthenticated path),
+    /// while no relay (incl. the rendezvous) learns the sender's location.
+    ///
+    /// `#[ignore]` for the same reason as its plain sibling: E20 directional
+    /// dedup makes SimNetwork pairwise-session establishment flaky. Run with
+    /// `--ignored` for the integration check.
+    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn epic482_5_end_to_end_authenticated_rendezvous_flow() {
+        use crate::proto::identity_document::IdentityDocument;
+        let n = 5;
+        let mut net = SimNetwork::builder()
+            .nodes(n)
+            .role(NodeRole::Core)
+            // Relays (N1, N2) + rendezvous (N3) + receiver (N4) opt into
+            // anonymity (need x25519_sk). N0 (sender) needs only a sovereign
+            // identity to sign.
+            .anonymity_relay(vec![false, true, true, true, true])
+            .sovereign_identities(true)
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        for i in 0..n {
+            let ok = net
+                .node(i)
+                .wait_sessions(n - 1, Duration::from_secs(45))
+                .await;
+            assert!(ok, "node {i} should have {0} sessions", n - 1);
+        }
+
+        // Bind the receiver's (N4) app endpoint.
+        let app_id = [0xAB; 32];
+        let endpoint_id = 7u32;
+        let (_handle, mut rx) =
+            net.node(4)
+                .runtime
+                .app_registry()
+                .register(app_id, endpoint_id, 16);
+
+        // Receiver lifecycle (manually orchestrated, as the production task
+        // would): register a publisher entry + publish the ad, then register
+        // with the rendezvous relay (N3) so it forwards our cookie.
+        let rendezvous_node_id = net.node(3).node_id();
+        let auth_cookie = [0xC1u8; 16];
+        net.node(4)
+            .runtime
+            .register_rendezvous_publisher(rendezvous_node_id, auth_cookie, 3600);
+        let n_ads = net
+            .node(4)
+            .runtime
+            .debug_force_publish_rendezvous_ads()
+            .await;
+        assert_eq!(n_ads, 1, "receiver must publish exactly one rendezvous-ad");
+        net.node(4)
+            .runtime
+            .register_with_rendezvous(rendezvous_node_id.into(), auth_cookie);
+        // Let the register frame land in the rendezvous registry BEFORE the
+        // sender's introduce arrives (else cookie-not-found → silent drop).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Publish relay directory entries (relay1 + relay2 + rendezvous) and
+        // mirror them into the sender's local DHT so circuit selection + the
+        // rendezvous final-hop resolve find them.
+        for i in 1..=3 {
+            net.node(i)
+                .runtime
+                .debug_force_publish_relay_directory_entry()
+                .await
+                .expect("relay must publish directory entry");
+        }
+        for i in 1..=3 {
+            let relay_node_id = net.node(i).node_id();
+            let key = crate::node::anonymity::directory::relay_directory_dht_key(&relay_node_id);
+            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                net.node(0).runtime.dht_put_local(key, bytes);
+            }
+        }
+
+        // The receiver's verify task must resolve the SENDER's IdentityDocument.
+        // Publish it and mirror it into the receiver's local shard so the
+        // resolve doesn't depend on organic replication timing.
+        let alice_node_id = *net
+            .node(0)
+            .runtime
+            .sovereign_identity()
+            .expect("sender has a sovereign identity")
+            .node_id();
+        net.node(0)
+            .runtime
+            .debug_republish_sovereign_identity()
+            .await
+            .expect("publish sender identity");
+        net.node(0).runtime.debug_force_dht_republish().await;
+        let alice_doc_key = IdentityDocument::dht_key(&alice_node_id);
+        let alice_doc = net
+            .node(0)
+            .runtime
+            .dht_get_local(&alice_doc_key)
+            .expect("sender's own identity document in its local shard");
+        net.node(4).runtime.dht_put_local(alice_doc_key, alice_doc);
+
+        // Sender fetches the receiver's rendezvous ad (OOB, as in the plain
+        // sibling) and sends an authenticated message. hop_count=2 (1 relay +
+        // rendezvous Final hop) leaves room for the signed + fragmented payload.
+        let ad_dht_key =
+            crate::node::anonymity::rendezvous::rendezvous_ad_dht_key(&net.node(4).node_id());
+        let ad_bytes = net
+            .node(4)
+            .runtime
+            .dht_get_local(&ad_dht_key)
+            .expect("receiver has its own ad locally");
+        let ad = crate::node::anonymity::rendezvous::decode_rendezvous_ad(&ad_bytes)
+            .expect("ad must decode");
+
+        let payload = b"authenticated hi via rendezvous";
+        net.node(0)
+            .runtime
+            .access()
+            .send_via_rendezvous_authenticated(&ad, app_id, endpoint_id, payload, 2)
+            .expect("send_via_rendezvous_authenticated must succeed");
+
+        // The receiver's app should get the payload with the VERIFIED sender
+        // node_id. Allow extra time: delivery includes reassembly + an async
+        // DHT identity resolve in the verify task.
+        let msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("authenticated rendezvous message did not arrive in 8s")
+            .expect("receiver channel closed");
+
+        match msg {
+            veil_app::registry::AppMessage::Deliver {
+                src_node_id, data, ..
+            } => {
+                assert_eq!(
+                    src_node_id, alice_node_id,
+                    "authentication property: receiver must learn the VERIFIED \
+                     sender node_id (not zeros, not someone else)",
+                );
+                assert_eq!(
+                    data.as_ref(),
+                    payload.as_slice(),
+                    "payload round-trip exact via authenticated rendezvous"
+                );
+            }
+            other => panic!("expected AppMessage::Deliver, got {other:?}"),
+        }
+
+        net.stop().await;
+    }
+
     // ── network-change triggers fast reconnect ────────────────────
 
     /// Simulates a WiFi → Cellular flip on a mobile node. Verifies that
