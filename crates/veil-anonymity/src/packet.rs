@@ -521,7 +521,7 @@ mod tests {
         let (_sk2, hop2) = fresh_hop(0x02);
         let (_sk3, hop3) = fresh_hop(0x03);
 
-        let max = max_payload_for_hops(3).unwrap(); // 234
+        let max = max_payload_for_hops(3).unwrap(); // 267 (onion v2)
         let mut entry_sizes: Vec<usize> = Vec::with_capacity(50);
         for i in 0..50 {
             // Vary payload size 1..=max in 50 steps.

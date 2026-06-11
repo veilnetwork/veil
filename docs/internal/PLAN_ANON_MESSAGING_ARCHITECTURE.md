@@ -1,5 +1,42 @@
 # Anonymous authenticated messaging — consolidated architecture (for review)
 
+> **⚠️ REVIEW OUTCOME (2026-06): DESCOPE.** Two independent reviews found a
+> **verified-critical error** in this draft and recommend NOT building the full
+> "Signal-over-Tor" epic now. Corrections + the descoped direction are folded in
+> below; the original full-epic prose is kept (struck through in spirit) as the
+> reviewed artifact.
+>
+> **The critical finding (verified against code):** the central claim "Bob
+> authenticates Alice (via X3DH)" is **FALSE**. `crates/veil-crypto/src/x3dh.rs`
+> is **not** X3DH — `sender_encapsulate` (x3dh.rs:142) does ONE ML-KEM-768
+> encapsulation to the recipient's public prekey and mixes `sender_node_id` into
+> the HKDF info as a **public label** (x3dh.rs:200), with **no DH contribution
+> from Alice's private identity key**. So anyone holding Bob's published EK can
+> forge a message claiming any sender → **zero sender authentication.** The
+> codebase already documents this for the identical primitive
+> (`veil-e2e/src/lib.rs:285` "a KEM proves nothing about the origin"). Sender
+> authentication is the ONE genuinely-missing §0 property and it must be **built**
+> (per-message identity-subkey signature, OR a real identity-bound AKE: X25519
+> IK-DH + ML-KEM hybrid) — it is **independent of circuits and the ratchet.**
+>
+> **Descoped direction (both reviews):**
+> 1. **Auth line (do first, independent of circuits):** add real sender-binding
+>    to the EXISTING anonymous payload — identity-subkey signature inside the
+>    payload, or an identity-bound AKE. Closes "Bob authenticates Alice" with no
+>    telescoped circuits and no Double Ratchet.
+> 2. **Transport line (incremental, measured):** W1 (done) + W2 selection-input
+>    caching (hits the W0-measured bottleneck — selection, 24–98× build — at zero
+>    anonymity cost) + wire the existing onion origination to production. This IS
+>    the "exhaust the anonymity-preserving path first" the other plans mandate.
+> 3. **Stateful circuits (482.7) + Double Ratchet + return-plane:** DEFER until
+>    (i) a post-W2 measurement shows per-message DH is still the bottleneck (W0
+>    says it is NOT — selection dominates), and (ii) auth + return-path are
+>    designed. Net-anonymity-loss risk (intra-circuit linkability, unjustified
+>    K/T) is unresolved.
+>
+> The rest of this document is the reviewed full-epic architecture; read it with
+> the corrections in §3/§5/§8 (below) applied.
+
 > **Status (2026-06):** ARCHITECTURE DRAFT for independent review, no code.
 > Supersedes `PLAN_AUTHENTICATED_ONION_DELIVERY.md` (single-cell, source-routed)
 > — the budget / hybrid-signature / reply / incoming requirements all pointed
@@ -83,20 +120,27 @@ veil reuse: `RendezvousAd`, `IntroducePayload`, `register_with_rendezvous`,
 
 ## 3. Layer B — E2E security (over the circuit)
 
-### B1. X3DH authenticated key agreement (veil has a one-shot form)
-The initiator (Alice) runs X3DH against Bob's published prekey bundle, mixing in
-**both parties' long-term identity keys** → a shared secret that (a) authenticates
-Alice to Bob (only Alice's identity key produces it) and (b) gives first-message
-forward secrecy (prekey consumed). veil already ships an X3DH-style prekey scheme
-(`crates/veil-crypto/src/x3dh.rs`: `generate_prekey`, `PrekeyBundle`,
-`PrekeySecretStore`, ML-KEM-768, FS-by-consume) — **this is the authentication
-mechanism** (replaces the per-message signature from the superseded single-cell
-spec; cleaner, and authentication is mutual).
-
-Bob authenticates Alice by checking the handshake binds **Alice's resolved/known
-identity** (contact cache → else `resolve_identity_verified`; cache policy per
-the earlier §8.2). PQ-hybrid: X25519 + ML-KEM (already ML-KEM in x3dh.rs); add a
-classical+PQ identity-key mix.
+### B1. Authenticated key agreement — MUST BE BUILT (the critical gap)
+> **CORRECTION (review):** `crates/veil-crypto/src/x3dh.rs` is **NOT X3DH and
+> gives NO sender authentication.** `sender_encapsulate` is one ML-KEM-768
+> encapsulation to Bob's public prekey; `sender_node_id` is a HKDF **label**, not
+> a DH contribution from Alice's private identity key (x3dh.rs:142,200). Anyone
+> with Bob's EK forges any sender (identical to meta-E2E, which the code marks
+> unauthenticated, `veil-e2e/src/lib.rs:285`). It is a reusable **KEM/confidential-
+> ity primitive**, NOT an AKE.
+>
+> Real sender authentication requires Alice's **private identity key** in the key
+> agreement. Two options, both **independent of circuits/ratchet** (Auth line):
+> - **(a) Per-message identity-subkey signature** inside the payload (the
+>   approach the superseded single-cell spec had — removing it is what removed
+>   auth). Gives non-repudiation; +64 B (Ed25519) or +~660 B (Falcon hybrid).
+> - **(b) Identity-bound AKE** — a real X3DH = X25519 `DH(IK_Alice, …)` + ML-KEM
+>   hybrid, mixing Alice's long-term key. Gives deniability (Signal-style).
+>
+> Pick one (open question §10-Q3: deniable vs non-repudiation). Bob then verifies
+> against Alice's resolved/known identity (contact cache → `resolve_identity_
+> verified`). The current `x3dh.rs` provides the ML-KEM half + FS-by-consume, but
+> the identity-DH/signature half does not exist yet.
 
 ### B2. Double Ratchet (NEW — not in veil today)
 After X3DH seeds the root key, a **Double Ratchet** (symmetric-key chain per
@@ -126,28 +170,39 @@ adopt a vetted implementation — do NOT hand-roll the ratchet).
 
 ## 5. veil: have vs build
 
+Three statuses: ✅ usable as-is · ⚠ reusable only with protocol changes · ❌
+new/not reusable.
+
 | Piece | Status |
 |---|---|
-| Onion-layer crypto (build cells) | ✅ `onion.rs` (post-W1 v2) |
-| Relay directory + selection + AS-diversity + reputation | ✅ shipped |
-| Rendezvous primitive | ✅ `rendezvous.rs` (single-cell — extend to circuits) |
-| X3DH prekey handshake (one-shot FS, ML-KEM) | ✅ `x3dh.rs` (wire into the flow; add identity-auth mix) |
+| Onion-layer crypto (build cells) | ✅ `onion.rs` (post-W1 v2; per-hop overhead **81 B**, payload `510−81·N`, N=3 → **267 B**, N≤6 fits) |
+| Relay directory + signed publish loop + selection + AS-diversity + reputation | ✅ shipped (the *infrastructure* is wired; only message **origination** — `send_anonymous` — is sim-only) |
+| Rendezvous primitive | ⚠ `rendezvous.rs` (single-cell; `IntroducePayload` capped 256 B; ML-KEM CT 1088 B ≫ ~172 B single-cell → "Introduce carries the X3DH first message" needs the not-yet-built circuit data plane) |
+| ML-KEM seal + FS-by-consume (`x3dh.rs`) | ⚠ reusable as a **confidentiality** primitive only; it is **NOT** sender-auth (see §B1) |
+| **Sender authentication (identity-subkey signature OR identity-bound AKE)** | ❌ NEW — the critical missing §0 property |
 | **Telescoped stateful circuit state machine + caps + teardown** | ❌ NEW (the bulk — Epic 482.7) |
+| **Return data plane (for replies / bidirectional)** | ❌ NEW — does not exist; building it is itself a correlation surface (A.2 §2 C1) |
 | **Double Ratchet** | ❌ NEW (vetted impl, not hand-rolled) |
-| Production IPC wiring for the anonymous-authenticated mode | ❌ NEW |
+| **Persistent prekey store** | ❌ `PrekeySecretStore` is an in-memory MVP (tests only); restart loses seeds → undelivered first-contact messages become permanently undecryptable (**data loss**) |
+| Production IPC wiring for the anonymous-authenticated mode | ❌ NEW (origination sim-only, `scenarios.rs:5380`) |
+| W2 selection-input caching | ❌ NEW but **highest value/risk** (hits the W0-measured bottleneck) — missing from this plan; the descope adds it |
 
 ## 6. Security properties (claims — to be reviewed)
 
-| Property | Mechanism |
-|---|---|
-| No relay knows (Alice, Bob) | telescoped circuit (A1) |
-| No relay reads content | circuit symmetric layers (A1) + E2E ratchet (B2) |
-| Bob authenticates Alice | X3DH identity-key binding (B1) |
-| Bidirectional reply | bidirectional circuit (A1) |
-| Unsolicited incoming | rendezvous (A2) |
-| Forward secrecy (relay) | per-hop ephemeral DH at build (A1) |
-| Forward secrecy + PCS (endpoints) | Double Ratchet (B2) |
-| Bob can't learn Alice's location | circuit (A1) |
+| Property | Mechanism | Holds today? |
+|---|---|---|
+| No relay knows (Alice, Bob) | telescoped circuit (A1) | ❌ circuits not built |
+| No relay reads content | circuit layers (A1) + ratchet (B2) | partial (onion content sealed; no ratchet) |
+| **Bob authenticates Alice** | ~~X3DH binding~~ → **new auth (§B1)** | ❌ **the critical gap — x3dh.rs is a KEM seal, not auth** |
+| Bidirectional reply | return data plane (A1) | ❌ return plane not built; itself a C1 correlation surface |
+| Unsolicited incoming | rendezvous (A2) | ⚠ primitive exists; first-contact-in-one-Introduce blocked by budget (needs circuits) |
+| Forward secrecy (relay) | per-hop ephemeral DH at build | ⚠ holds only under telescoped B2; the 482.7-recommended single-pass B1 reuses a key under the hop's static key → claim breaks |
+| Forward secrecy + PCS (endpoints) | Double Ratchet (B2) | ❌ no ratchet (first-message FS via prekey-consume only) |
+| Bob can't learn Alice's location | circuit (A1) | ❌ circuits not built |
+
+**Net: of the §0 properties, only relay-content-confidentiality (onion) and
+first-message FS partially hold today; the headline "authenticates WHO" does
+NOT.**
 
 ## 7. Tradeoffs & costs (honest)
 
@@ -166,9 +221,27 @@ adopt a vetted implementation — do NOT hand-roll the ratchet).
 ## 8. Anonymity threat-model gate (before any wire change)
 Inherit the 482.7 §6 checklist (intra-circuit linkability vs K/T, long-flow
 correlation, build fingerprint, CircuitId as a tag, predecessor/intersection,
-reused-key blast radius, state-exhaustion DoS) PLUS the E2E layer (X3DH identity
-binding soundness, ratchet state-compromise semantics, replay). Each needs a
-bounded, sim-validated answer.
+reused-key blast radius, state-exhaustion DoS) PLUS the E2E layer, PLUS the
+review-added items below — each needs a bounded, sim-validated answer:
+
+- **KCI / identity-binding** (root of the verified auth gap) — the sender-auth
+  mechanism must bind Alice's private identity key; verify no key-compromise-
+  impersonation.
+- **Return-path correlation (C1, from A.2 §2)** — any reply/bidirectional channel
+  is a confirmable round-trip + a timing edge for the last relay; the §6 checklist
+  did NOT inherit this from A.2_MIDSTREAM.
+- **Prekey exhaustion + persistence + data loss** — one-time prekeys can be
+  drained (first-contact DoS) or forced into reduced-FS reuse; `PrekeySecretStore`
+  is in-memory only → restart = permanent loss of undelivered first-contact
+  messages (user data loss).
+- **Identity-resolution deanon** — "Bob resolves Alice via DHT" can leak, by the
+  query pattern, that Bob talks to Alice.
+- **Public rendezvous metadata** — `RendezvousAd` is keyed by `receiver_node_id`
+  and names the rendezvous node; `auth_cookie` is public in the DHT ad
+  (`rendezvous.rs:1668`). Specify exactly what receiver-reachability is hidden,
+  from whom, and what the cookie does/doesn't protect.
+- **Replay on generic relay cells** — the onion path has none (`onion.rs:94`); the
+  E2E layer needs its own replay analysis.
 
 ## 9. Phased implementation plan (after review)
 
