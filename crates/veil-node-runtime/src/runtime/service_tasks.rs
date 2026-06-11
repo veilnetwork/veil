@@ -152,7 +152,7 @@ const RENDEZVOUS_AD_VALIDITY_SECS: u64 = 3600;
 /// cookie map is in-memory, so this survives a relay restart.
 const RENDEZVOUS_REREGISTER_EVERY_TICKS: u64 = 5;
 
-type LiveSessions = Arc<
+pub(crate) type LiveSessions = Arc<
     std::sync::Mutex<std::collections::BTreeMap<crate::types::LinkId, crate::types::SessionInfo>>,
 >;
 
@@ -177,7 +177,7 @@ fn rendezvous_relay_published(dht: &Arc<veil_dht::KademliaService>, node_id: &[u
 
 /// Pick a rendezvous relay: a session-live, published peer. If `pinned` is
 /// non-empty, restrict to that operator list; otherwise auto-pick.
-fn pick_rendezvous_relay(
+pub(crate) fn pick_rendezvous_relay(
     live: &LiveSessions,
     dht: &Arc<veil_dht::KademliaService>,
     pinned: &[[u8; 32]],
@@ -203,7 +203,7 @@ fn pick_rendezvous_relay(
 /// Send a `RegisterRendezvous` frame to `relay` over its live session (inlines
 /// `NodeRuntime::register_with_rendezvous`, which is unavailable from the task's
 /// `NodeServices` handle). Fire-and-forget — a no-op without a session.
-fn rendezvous_register_with(
+pub(crate) fn rendezvous_register_with(
     session_tx_registry: &Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
     anonymity: &Arc<super::anonymity_state::AnonymityState>,
     relay: &[u8; 32],
@@ -2518,6 +2518,7 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                     endpoint_id,
                     data,
                     self.hop_count,
+                    None, // reply blocks are attached via the reply-aware path (r5/r6)
                 )
                 .await
         })
