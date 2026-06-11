@@ -143,6 +143,228 @@ impl Default for AuthDeliverReplayCache {
     }
 }
 
+/// Default reassembly timeout (seconds) for a partial authenticated message —
+/// matches the freshness window: a message that can't reassemble within it
+/// would fail freshness anyway.
+pub const DEFAULT_AUTH_DELIVER_REASSEMBLY_TIMEOUT_SECS: u64 = DEFAULT_AUTH_DELIVER_FRESHNESS_SECS;
+/// Default cap on concurrent in-flight (partial) reassemblies.
+pub const DEFAULT_MAX_AUTH_DELIVER_REASSEMBLIES: usize = 256;
+/// Default global cap on bytes buffered across all partial reassemblies.
+pub const DEFAULT_MAX_AUTH_DELIVER_REASSEMBLY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Outcome of feeding one fragment to [`AuthDeliverReassembler::push`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReassembleOutcome {
+    /// Message still incomplete — more fragments needed.
+    Pending,
+    /// All fragments present — the reassembled `AuthAppDeliver` wire bytes.
+    /// Verify them ONCE; the single signature integrity-protects the reassembly.
+    Complete(Vec<u8>),
+    /// Fragment dropped (bounds exceeded, inconsistent `frag_count`, or the
+    /// per-message byte cap). The caller should count this for observability.
+    Rejected,
+}
+
+struct Partial {
+    frag_count: u16,
+    received: Vec<Option<Vec<u8>>>,
+    received_count: u16,
+    bytes: usize,
+    started_at: u64,
+}
+
+/// Bounded reassembler for fragmented authenticated rendezvous messages
+/// ([`veil_proto::AuthDeliverFragment`]). Single-owner (the auth-deliver task),
+/// so it carries no lock — feed fragments via [`Self::push`]; on the completing
+/// fragment it returns the reassembled `AuthAppDeliver` bytes.
+///
+/// DoS bounds (the sender is onion-anonymous, so we cannot rate-limit per
+/// sender): a global byte cap, a concurrent-message cap, a per-message byte cap
+/// ([`veil_proto::MAX_AUTH_DELIVER_MSG_BYTES`]), and a timeout that GCs
+/// partials. On pressure the oldest partial is evicted.
+pub struct AuthDeliverReassembler {
+    messages: std::collections::HashMap<[u8; 16], Partial>,
+    /// Insertion order (oldest at front) for timeout-GC + FIFO eviction.
+    order: std::collections::VecDeque<[u8; 16]>,
+    total_bytes: usize,
+    max_messages: usize,
+    max_total_bytes: usize,
+    timeout_secs: u64,
+}
+
+impl AuthDeliverReassembler {
+    /// Reassembler with default bounds.
+    pub fn new() -> Self {
+        Self::with_params(
+            DEFAULT_MAX_AUTH_DELIVER_REASSEMBLIES,
+            DEFAULT_MAX_AUTH_DELIVER_REASSEMBLY_BYTES,
+            DEFAULT_AUTH_DELIVER_REASSEMBLY_TIMEOUT_SECS,
+        )
+    }
+
+    /// Reassembler with explicit bounds.
+    pub fn with_params(max_messages: usize, max_total_bytes: usize, timeout_secs: u64) -> Self {
+        Self {
+            messages: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            total_bytes: 0,
+            max_messages: max_messages.max(1),
+            max_total_bytes,
+            timeout_secs,
+        }
+    }
+
+    /// Drop a partial by id, keeping `order` + `total_bytes` consistent.
+    fn remove(&mut self, msg_id: &[u8; 16]) {
+        if let Some(p) = self.messages.remove(msg_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(p.bytes);
+            self.order.retain(|m| m != msg_id);
+        }
+    }
+
+    /// Evict the oldest partial (front of `order`).
+    fn evict_oldest(&mut self) {
+        while let Some(old) = self.order.pop_front() {
+            if let Some(p) = self.messages.remove(&old) {
+                self.total_bytes = self.total_bytes.saturating_sub(p.bytes);
+                return;
+            }
+            // stale order entry (already removed) — keep popping.
+        }
+    }
+
+    /// GC partials older than `timeout_secs` (FIFO → front is oldest).
+    fn gc(&mut self, now_unix: u64) {
+        while let Some(front) = self.order.front().copied() {
+            match self.messages.get(&front) {
+                Some(p) if now_unix.saturating_sub(p.started_at) >= self.timeout_secs => {
+                    self.remove(&front);
+                }
+                Some(_) => break,
+                None => {
+                    self.order.pop_front();
+                }
+            }
+        }
+    }
+
+    /// Feed one fragment. Returns [`ReassembleOutcome::Complete`] with the
+    /// reassembled `AuthAppDeliver` bytes once every fragment has arrived.
+    pub fn push(
+        &mut self,
+        frag: veil_proto::AuthDeliverFragment,
+        now_unix: u64,
+    ) -> ReassembleOutcome {
+        self.gc(now_unix);
+        let idx = frag.frag_idx as usize;
+        let count = frag.frag_count;
+
+        if self.messages.contains_key(&frag.msg_id) {
+            // Validate against the existing partial under a short borrow, then
+            // apply — avoids holding a `get_mut` borrow across `self.*` calls.
+            let chunk_len = frag.chunk.len();
+            let (consistent, duplicate, new_bytes, completes) = {
+                let p = self.messages.get(&frag.msg_id).expect("present");
+                if p.frag_count != count || idx >= p.received.len() {
+                    (false, false, 0usize, false)
+                } else if p.received[idx].is_some() {
+                    (true, true, 0usize, false)
+                } else {
+                    let nb = p.bytes.saturating_add(chunk_len);
+                    (true, false, nb, p.received_count + 1 == p.frag_count)
+                }
+            };
+            if !consistent || new_bytes > veil_proto::MAX_AUTH_DELIVER_MSG_BYTES {
+                let id = frag.msg_id;
+                self.remove(&id);
+                return ReassembleOutcome::Rejected;
+            }
+            if duplicate {
+                return ReassembleOutcome::Pending;
+            }
+            {
+                let p = self.messages.get_mut(&frag.msg_id).expect("present");
+                p.bytes = new_bytes;
+                p.received_count += 1;
+                p.received[idx] = Some(frag.chunk);
+            }
+            self.total_bytes = self.total_bytes.saturating_add(chunk_len);
+            if completes {
+                let p = self.messages.remove(&frag.msg_id).expect("present");
+                self.order.retain(|m| m != &frag.msg_id);
+                self.total_bytes = self.total_bytes.saturating_sub(p.bytes);
+                let mut out = Vec::with_capacity(p.bytes);
+                for chunk in p.received {
+                    out.extend_from_slice(&chunk.expect("all present at completion"));
+                }
+                return ReassembleOutcome::Complete(out);
+            }
+            self.enforce_total_bytes(&frag.msg_id);
+            return ReassembleOutcome::Pending;
+        }
+
+        // New message.
+        if count == 0
+            || count > veil_proto::MAX_AUTH_DELIVER_FRAGMENTS
+            || idx >= count as usize
+            || frag.chunk.len() > veil_proto::MAX_AUTH_DELIVER_MSG_BYTES
+        {
+            return ReassembleOutcome::Rejected;
+        }
+        // Single-fragment fast path — complete immediately, no state.
+        if count == 1 {
+            return ReassembleOutcome::Complete(frag.chunk);
+        }
+        // Concurrent-message cap — evict oldest to make room.
+        while self.messages.len() >= self.max_messages {
+            self.evict_oldest();
+        }
+        let chunk_len = frag.chunk.len();
+        let mut received = vec![None; count as usize];
+        received[idx] = Some(frag.chunk);
+        self.messages.insert(
+            frag.msg_id,
+            Partial {
+                frag_count: count,
+                received,
+                received_count: 1,
+                bytes: chunk_len,
+                started_at: now_unix,
+            },
+        );
+        self.order.push_back(frag.msg_id);
+        self.total_bytes = self.total_bytes.saturating_add(chunk_len);
+        self.enforce_total_bytes(&frag.msg_id);
+        ReassembleOutcome::Pending
+    }
+
+    /// Evict oldest partials until under the global byte cap, never evicting
+    /// `keep` (the message we just touched).
+    fn enforce_total_bytes(&mut self, keep: &[u8; 16]) {
+        while self.total_bytes > self.max_total_bytes {
+            let Some(&front) = self.order.front() else {
+                break;
+            };
+            if &front == keep && self.order.len() == 1 {
+                break; // only the just-touched message remains.
+            }
+            if &front == keep {
+                // rotate keep to the back so we evict something else first.
+                self.order.pop_front();
+                self.order.push_back(front);
+                continue;
+            }
+            self.evict_oldest();
+        }
+    }
+}
+
+impl Default for AuthDeliverReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Verify an [`AuthAppDeliver`] at the recipient. Pure (no replay state).
 ///
 /// `sender_doc` MUST be the verified IdentityDocument of `p.sender_node_id`
@@ -380,5 +602,95 @@ mod tests {
             verify_auth_deliver(&p2, &doc2, &self_id2, NOW, 300),
             Err(AuthDeliverError::SubkeyNotValid),
         );
+    }
+
+    // ── reassembler ──────────────────────────────────────────────────────
+
+    use veil_proto::AuthDeliverFragment;
+
+    /// Split `bytes` into `n` fragments under one msg_id (ceil chunking).
+    fn fragments_of(msg_id: [u8; 16], bytes: &[u8], n: u16) -> Vec<AuthDeliverFragment> {
+        let chunk = bytes.len().div_ceil(n as usize).max(1);
+        (0..n)
+            .map(|i| AuthDeliverFragment {
+                msg_id,
+                frag_count: n,
+                frag_idx: i,
+                chunk: bytes
+                    .chunks(chunk)
+                    .nth(i as usize)
+                    .map(|c| c.to_vec())
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reassembler_single_fragment_completes_immediately() {
+        let mut r = AuthDeliverReassembler::new();
+        let f = AuthDeliverFragment {
+            msg_id: [1; 16],
+            frag_count: 1,
+            frag_idx: 0,
+            chunk: b"whole signed AuthAppDeliver".to_vec(),
+        };
+        assert_eq!(
+            r.push(f, NOW),
+            ReassembleOutcome::Complete(b"whole signed AuthAppDeliver".to_vec()),
+        );
+    }
+
+    #[test]
+    fn reassembler_multi_fragment_reassembles_out_of_order() {
+        let mut r = AuthDeliverReassembler::new();
+        let original: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let mut frags = fragments_of([7; 16], &original, 4);
+        // Deliver in reverse order; only the last completes.
+        frags.reverse();
+        let last = frags.pop().unwrap();
+        for f in frags {
+            assert_eq!(r.push(f, NOW), ReassembleOutcome::Pending);
+        }
+        assert_eq!(r.push(last, NOW), ReassembleOutcome::Complete(original));
+    }
+
+    #[test]
+    fn reassembler_ignores_duplicates_and_rejects_inconsistent_count() {
+        let mut r = AuthDeliverReassembler::new();
+        let frags = fragments_of([9; 16], &[0u8; 100], 3);
+        assert_eq!(r.push(frags[0].clone(), NOW), ReassembleOutcome::Pending);
+        // Duplicate idx 0 → ignored (still pending, no double count).
+        assert_eq!(r.push(frags[0].clone(), NOW), ReassembleOutcome::Pending);
+        // A fragment claiming a different frag_count for the same msg_id → reject.
+        let mut bad = frags[1].clone();
+        bad.frag_count = 5;
+        assert_eq!(r.push(bad, NOW), ReassembleOutcome::Rejected);
+    }
+
+    #[test]
+    fn reassembler_times_out_partials() {
+        let mut r = AuthDeliverReassembler::with_params(64, 1 << 20, 300);
+        let frags = fragments_of([3; 16], &[0u8; 100], 2);
+        assert_eq!(r.push(frags[0].clone(), NOW), ReassembleOutcome::Pending);
+        // The other fragment arrives after the timeout → the partial was GC'd, so
+        // this is treated as a fresh (still-incomplete) message, not a completion.
+        assert_eq!(
+            r.push(frags[1].clone(), NOW + 301),
+            ReassembleOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn reassembler_concurrent_cap_evicts_oldest() {
+        let mut r = AuthDeliverReassembler::with_params(2, 1 << 20, 300);
+        // 3 distinct in-flight 2-fragment messages; cap is 2 → the first is evicted.
+        for id in 0u8..3 {
+            let f = fragments_of([id; 16], &[0u8; 50], 2);
+            assert_eq!(r.push(f[0].clone(), NOW), ReassembleOutcome::Pending);
+        }
+        // Completing message 0 should NOT succeed — it was evicted, so its second
+        // fragment starts a fresh partial (pending), not a completion.
+        let f0 = fragments_of([0; 16], &[0u8; 50], 2);
+        assert_eq!(r.push(f0[1].clone(), NOW), ReassembleOutcome::Pending);
     }
 }
