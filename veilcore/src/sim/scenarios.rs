@@ -5420,6 +5420,153 @@ mod tests {
         net.stop().await;
     }
 
+    /// End-to-end AUTHENTICATED anonymous send (Epic 482 v1). Same 4-node
+    /// onion topology as `epic482_7_end_to_end_anonymous_send_through_3_hops`,
+    /// but the sender uses `send_anonymous_authenticated`: the final-hop blob
+    /// is an `AuthAppDeliver` carrying a per-message Ed25519 identity-subkey
+    /// signature. The recipient's verify task resolves the sender's identity
+    /// document, verifies the signature, and delivers with the VERIFIED sender
+    /// node_id.
+    ///
+    /// Verifies the property the plain onion path CANNOT give:
+    /// * `src_node_id` at the receiver equals the sender's sovereign node_id
+    ///   (the recipient cryptographically learns WHO sent it) — whereas the
+    ///   unauthenticated path delivers `src_node_id = [0; 32]`.
+    /// * No relay on the path learns the sender's location (unchanged onion
+    ///   guarantee — the signature rides INSIDE the innermost layer).
+    /// * Payload bytes round-trip exactly.
+    ///
+    /// `#[ignore]` for the same reason as its unauthenticated sibling: E20
+    /// directional dedup makes SimNetwork pairwise-session establishment
+    /// flaky; run with `--ignored` for the integration check.
+    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn epic482_end_to_end_authenticated_send_through_3_hops() {
+        use crate::proto::identity_document::IdentityDocument;
+        let n = 4;
+        let mut net = SimNetwork::builder()
+            .nodes(n)
+            .role(NodeRole::Core)
+            // Relays (N1, N2) + receiver (N3) opt in. N0 (sender) does NOT
+            // relay, but DOES need a sovereign identity to sign.
+            .anonymity_relay(vec![false, true, true, true])
+            .sovereign_identities(true)
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        for i in 0..n {
+            let ok = net
+                .node(i)
+                .wait_sessions(n - 1, Duration::from_secs(30))
+                .await;
+            assert!(ok, "node {i} should have {0} sessions", n - 1);
+        }
+
+        // Bind a receiver-side app endpoint before the sender dispatches.
+        let app_id = [0xAB; 32];
+        let endpoint_id = 7u32;
+        let (_handle, mut rx) =
+            net.node(3)
+                .runtime
+                .app_registry()
+                .register(app_id, endpoint_id, 16);
+
+        let receiver_x25519_pk = net
+            .node(3)
+            .runtime
+            .anonymity_x25519_pk()
+            .expect("receiver opted into anonymity, must have x25519_pk");
+        let receiver_node_id = net.node(3).node_id();
+
+        // The sender's sovereign node_id is what the receiver will learn +
+        // verify (sign_auth_deliver stamps it as sender_node_id).
+        let alice_node_id = *net
+            .node(0)
+            .runtime
+            .sovereign_identity()
+            .expect("sender has a sovereign identity")
+            .node_id();
+
+        // Force every relay to publish its directory entry NOW, then mirror
+        // each into the sender's local DHT cache (deterministic discovery —
+        // same approach as the unauthenticated sibling test).
+        for i in 1..n {
+            net.node(i)
+                .runtime
+                .debug_force_publish_relay_directory_entry()
+                .await
+                .expect("relay-capable node must succeed publish");
+        }
+        for i in 1..n {
+            let relay_node_id = net.node(i).node_id();
+            let key = crate::node::anonymity::directory::relay_directory_dht_key(&relay_node_id);
+            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                net.node(0).runtime.dht_put_local(key, bytes);
+            }
+        }
+
+        // The receiver's verify task must resolve ALICE's IdentityDocument.
+        // Publish it, then mirror it directly into the receiver's local DHT
+        // shard so the resolve does not depend on organic replication timing.
+        net.node(0)
+            .runtime
+            .debug_republish_sovereign_identity()
+            .await
+            .expect("publish sender identity");
+        net.node(0).runtime.debug_force_dht_republish().await;
+        let alice_doc_key = IdentityDocument::dht_key(&alice_node_id);
+        let alice_doc = net
+            .node(0)
+            .runtime
+            .dht_get_local(&alice_doc_key)
+            .expect("sender's own identity document in its local shard");
+        net.node(3).runtime.dht_put_local(alice_doc_key, alice_doc);
+
+        // Send authenticated. hop_count = 3 → 2 relays + receiver. Note: no
+        // src_app_id parameter — the AuthAppDeliver carries the verified
+        // sender identity instead.
+        let payload = b"authenticated hi from anon sender";
+        net.node(0)
+            .runtime
+            .send_anonymous_authenticated(
+                receiver_node_id,
+                receiver_x25519_pk,
+                app_id,
+                endpoint_id,
+                payload,
+                3,
+            )
+            .expect("send_anonymous_authenticated must succeed (identity + relays present)");
+
+        // The receiver's app should get the payload with the VERIFIED sender
+        // node_id. Allow extra time: delivery now includes an async DHT
+        // identity resolve in the verify task.
+        let msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("authenticated message did not arrive at receiver in 8s")
+            .expect("receiver channel closed");
+
+        match msg {
+            veil_app::registry::AppMessage::Deliver {
+                src_node_id, data, ..
+            } => {
+                assert_eq!(
+                    src_node_id, alice_node_id,
+                    "authentication property: receiver must learn the VERIFIED \
+                     sender node_id (not zeros, not someone else)",
+                );
+                assert_eq!(
+                    data.as_ref(),
+                    payload.as_slice(),
+                    "payload round-trip exact"
+                );
+            }
+            other => panic!("expected AppMessage::Deliver, got {other:?}"),
+        }
+
+        net.stop().await;
+    }
+
     /// (deferred): rendezvous flow integration.
     /// 5-node topology: sender (N0) + relay1 (N1) + relay2 (N2) +
     /// rendezvous (N3) + receiver (N4). Receiver is BEHIND a "NAT" —
