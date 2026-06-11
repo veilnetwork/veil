@@ -565,6 +565,28 @@ int veil_send(VeilApp *app,
 ;
 
 /**
+ * Send an AUTHENTICATED anonymous datagram from `app` to
+ * `(dst_node_id, dst_app_id, dst_endpoint_id)`.
+ *
+ * Like [`veil_send`], but routed over the onion/rendezvous transport: no
+ * relay learns the sender's network location, while the recipient
+ * cryptographically verifies WHO sent it. v1: one-way; fire-and-forget
+ * (`VEIL_OK` means accepted + handed to the first hop, NOT delivery-
+ * confirmed); the recipient must have opted in to receiving
+ * (`[anonymity].receive_anonymous`). The sender node needs a sovereign
+ * identity. Large messages are fragmented up to a fixed ceiling.
+ */
+
+int veil_send_anonymous_authenticated(VeilApp *app,
+                                      const uint8_t *dst_node_id,
+                                      const uint8_t *dst_app_id,
+                                      uint32_t dst_endpoint_id,
+                                      const uint8_t *data,
+                                      size_t len,
+                                      char **err_out)
+;
+
+/**
  * Install a recv handler that calls `cb` for every incoming datagram on this
  * app. Returns [`VEIL_OK`] once the handler is installed.
  *
