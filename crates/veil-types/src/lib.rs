@@ -164,6 +164,35 @@ pub trait AnonOnionSender: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
     >;
+
+    /// Like [`Self::send_authenticated`], but additionally attach a one-time
+    /// reply block addressed to `(reply_app_id, reply_endpoint_id)` on this node
+    /// — letting the recipient reply WITHOUT either side publishing a public
+    /// rendezvous ad (no presence leak). The reply path is registered
+    /// R-locally under a fresh cookie inside the implementation.
+    fn send_authenticated_with_reply<'a>(
+        &'a self,
+        receiver_node_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: &'a [u8],
+        reply_app_id: [u8; 32],
+        reply_endpoint_id: u32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
+    >;
+
+    /// Reply to an earlier authenticated message via the opaque `reply_id` the
+    /// recipient app received with it. The implementation consumes the one-time
+    /// reply block and sends back over the original sender's rendezvous path.
+    /// `NoRendezvous` means the id is unknown, already used, or expired.
+    fn send_reply<'a>(
+        &'a self,
+        reply_id: u64,
+        data: &'a [u8],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
+    >;
 }
 
 // ── Wire-format constants shared by proto + crypto ────────────────────────────

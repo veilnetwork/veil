@@ -298,18 +298,48 @@ pub(crate) async fn handle_ipc_send(
     // cryptographically verifies WHO sent it. Fire-and-forget: a returned
     // AppSendOk (only when require_ack) means "handed to the first hop", not
     // "delivered". All surfaced errors are local / pre-transmit.
-    if send.anonymous_authenticated {
-        let err_code = if send.anonymous {
+    // `is_reply` rides the same onion/rendezvous transport but routes via the
+    // opaque reply_id (no explicit destination), so it shares this branch.
+    if send.anonymous_authenticated || send.is_reply {
+        let err_code = if send.anonymous || (send.is_reply && send.anonymous_authenticated) {
+            // meta-E2E `anonymous` conflicts with the onion transport, and
+            // `is_reply` already implies the authenticated reply path.
             Some(ipc_send_err::INVALID_FLAGS)
         } else if let Some(sender) = ctx.anon_onion_sender {
-            match sender
-                .send_authenticated(send.dst_node_id, send.app_id, send.endpoint_id, &send.data)
-                .await
-            {
+            let result = if send.is_reply {
+                // Reply: the daemon takes the one-time block by id; the explicit
+                // destination fields are ignored. A consumed/expired/unknown id
+                // surfaces as NoRendezvous → REPLY_UNKNOWN below.
+                sender.send_reply(send.reply_id, &send.data).await
+            } else if send.expect_reply {
+                // Attach a one-time reply block addressed to our own
+                // (src_app_id, reply_endpoint_id) — no public ad published.
+                sender
+                    .send_authenticated_with_reply(
+                        send.dst_node_id,
+                        send.app_id,
+                        send.endpoint_id,
+                        &send.data,
+                        send.src_app_id,
+                        send.reply_endpoint_id,
+                    )
+                    .await
+            } else {
+                sender
+                    .send_authenticated(send.dst_node_id, send.app_id, send.endpoint_id, &send.data)
+                    .await
+            };
+            match result {
                 Ok(()) => None,
                 Err(veil_types::AnonOnionSendError::NoIdentity) => Some(ipc_send_err::NO_IDENTITY),
                 Err(veil_types::AnonOnionSendError::NoRendezvous) => {
-                    Some(ipc_send_err::NO_RENDEZVOUS)
+                    // For a reply, "no rendezvous path" means the reply_id is
+                    // unknown/consumed/expired — a distinct, actionable error.
+                    if send.is_reply {
+                        Some(ipc_send_err::REPLY_UNKNOWN)
+                    } else {
+                        Some(ipc_send_err::NO_RENDEZVOUS)
+                    }
                 }
                 Err(veil_types::AnonOnionSendError::NoRelays) => Some(ipc_send_err::NO_ROUTE),
                 Err(veil_types::AnonOnionSendError::PayloadTooLarge) => {

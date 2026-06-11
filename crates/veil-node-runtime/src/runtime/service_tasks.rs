@@ -119,7 +119,10 @@ async fn process_auth_deliver(
     let sender_node_id = auth.sender_node_id;
     let app_id = auth.app_id;
     let reply_id = match auth.reply_block {
-        Some(rb) => access.anonymity.reply_block_store.store(rb, now_unix),
+        Some(rb) => access
+            .anonymity
+            .reply_block_store
+            .store(rb, sender_node_id, now_unix),
         None => 0,
     };
     let delivered = access.dispatcher.app_registry.route_ipc_deliver_with_reply(
@@ -2526,10 +2529,53 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                     endpoint_id,
                     data,
                     self.hop_count,
-                    None, // reply blocks are attached via the reply-aware path (r5/r6)
+                    None,
                 )
                 .await
         })
+    }
+
+    fn send_authenticated_with_reply<'a>(
+        &'a self,
+        receiver_node_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: &'a [u8],
+        reply_app_id: [u8; 32],
+        reply_endpoint_id: u32,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), veil_types::AnonOnionSendError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.access
+                .send_anonymous_authenticated_to(
+                    receiver_node_id,
+                    app_id,
+                    endpoint_id,
+                    data,
+                    self.hop_count,
+                    Some((reply_app_id, reply_endpoint_id)),
+                )
+                .await
+        })
+    }
+
+    fn send_reply<'a>(
+        &'a self,
+        reply_id: u64,
+        data: &'a [u8],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), veil_types::AnonOnionSendError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { self.access.send_reply(reply_id, data, self.hop_count).await })
     }
 }
 

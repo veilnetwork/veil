@@ -46,8 +46,10 @@ pub struct ReplyBlockStore {
 
 #[derive(Default)]
 struct ReplyStoreState {
-    /// reply_id → (block, expiry_unix).
-    map: std::collections::HashMap<u64, (veil_proto::ReplyBlock, u64)>,
+    /// reply_id → (block, sender_node_id, expiry_unix). `sender_node_id` is the
+    /// VERIFIED original sender — the reply's `receiver_node_id` (the rendezvous
+    /// relay routes the reply to its registration keyed on it + the cookie).
+    map: std::collections::HashMap<u64, (veil_proto::ReplyBlock, [u8; 32], u64)>,
     /// Insertion order (front = oldest) for TTL-GC + FIFO cap-evict.
     order: std::collections::VecDeque<u64>,
     /// Monotonic id allocator; never hands out 0 (0 = "no reply").
@@ -74,7 +76,7 @@ impl ReplyBlockStore {
     fn gc(state: &mut ReplyStoreState, now_unix: u64) {
         while let Some(&id) = state.order.front() {
             match state.map.get(&id) {
-                Some(&(_, exp)) if now_unix >= exp => {
+                Some(&(_, _, exp)) if now_unix >= exp => {
                     state.map.remove(&id);
                     state.order.pop_front();
                 }
@@ -86,8 +88,14 @@ impl ReplyBlockStore {
         }
     }
 
-    /// Store `block`, returning a fresh non-zero `reply_id`.
-    pub fn store(&self, block: veil_proto::ReplyBlock, now_unix: u64) -> u64 {
+    /// Store `block` for original sender `sender_node_id`, returning a fresh
+    /// non-zero `reply_id`.
+    pub fn store(
+        &self,
+        block: veil_proto::ReplyBlock,
+        sender_node_id: [u8; 32],
+        now_unix: u64,
+    ) -> u64 {
         let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         Self::gc(&mut s, now_unix);
         while s.map.len() >= self.cap {
@@ -101,22 +109,33 @@ impl ReplyBlockStore {
         let id = s.next_id;
         let next = s.next_id.wrapping_add(1);
         s.next_id = if next == 0 { 1 } else { next };
-        s.map
-            .insert(id, (block, now_unix.saturating_add(self.ttl_secs)));
+        s.map.insert(
+            id,
+            (
+                block,
+                sender_node_id,
+                now_unix.saturating_add(self.ttl_secs),
+            ),
+        );
         s.order.push_back(id);
         id
     }
 
-    /// Take (consume) a block by `reply_id`, if present + unexpired.
-    pub fn take(&self, reply_id: u64, now_unix: u64) -> Option<veil_proto::ReplyBlock> {
+    /// Take (consume) a block + its original sender by `reply_id`, if present +
+    /// unexpired.
+    pub fn take(&self, reply_id: u64, now_unix: u64) -> Option<(veil_proto::ReplyBlock, [u8; 32])> {
         if reply_id == 0 {
             return None;
         }
         let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         Self::gc(&mut s, now_unix);
-        let (block, exp) = s.map.remove(&reply_id)?;
+        let (block, sender, exp) = s.map.remove(&reply_id)?;
         s.order.retain(|&x| x != reply_id);
-        if now_unix >= exp { None } else { Some(block) }
+        if now_unix >= exp {
+            None
+        } else {
+            Some((block, sender))
+        }
     }
 }
 
@@ -218,9 +237,9 @@ mod tests {
     #[test]
     fn store_take_roundtrip_and_consumes() {
         let s = ReplyBlockStore::new();
-        let id = s.store(rb(1), 1000);
+        let id = s.store(rb(1), [0x9A; 32], 1000);
         assert_ne!(id, 0);
-        assert_eq!(s.take(id, 1000), Some(rb(1)));
+        assert_eq!(s.take(id, 1000), Some((rb(1), [0x9A; 32])));
         // Consumed — a second take is empty.
         assert_eq!(s.take(id, 1000), None);
         // reply_id 0 is never valid.
@@ -230,18 +249,18 @@ mod tests {
     #[test]
     fn store_expires_after_ttl() {
         let s = ReplyBlockStore::with_params(300, 16);
-        let id = s.store(rb(2), 1000);
-        assert_eq!(s.take(id, 1000 + 299), Some(rb(2)));
-        let id2 = s.store(rb(3), 2000);
+        let id = s.store(rb(2), [2; 32], 1000);
+        assert_eq!(s.take(id, 1000 + 299), Some((rb(2), [2; 32])));
+        let id2 = s.store(rb(3), [3; 32], 2000);
         assert_eq!(s.take(id2, 2000 + 300), None, "expired block is gone");
     }
 
     #[test]
     fn store_cap_evicts_oldest() {
         let s = ReplyBlockStore::with_params(10_000, 2);
-        let id1 = s.store(rb(1), 0);
-        let _id2 = s.store(rb(2), 0);
-        let _id3 = s.store(rb(3), 0); // over cap → evicts id1
+        let id1 = s.store(rb(1), [1; 32], 0);
+        let _id2 = s.store(rb(2), [2; 32], 0);
+        let _id3 = s.store(rb(3), [3; 32], 0); // over cap → evicts id1
         assert_eq!(s.take(id1, 0), None, "oldest evicted");
     }
 }
