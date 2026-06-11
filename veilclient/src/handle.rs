@@ -17,6 +17,13 @@ pub struct IncomingMessage {
     pub src_app_id: [u8; 32],
     /// Raw payload bytes.
     pub data: Vec<u8>,
+    /// Opaque reply handle: non-zero when this message arrived over the
+    /// authenticated anonymous transport WITH a one-time reply block attached.
+    /// Pass it to [`AppHandle::reply`] / [`AppSender::reply`] to answer without
+    /// either side publishing a public rendezvous ad. `0` means "not
+    /// repliable" (a plain send, or an authenticated send without a reply
+    /// block). Single-use and TTL-bounded daemon-side (default 300 s).
+    pub reply_id: u64,
 }
 
 /// A remote peer opened a byte-stream to this endpoint.  Returned by
@@ -195,6 +202,55 @@ impl AppHandle {
                 &dst_app_id,
                 dst_endpoint_id,
                 veil_proto::ipc::IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED,
+                data,
+            )
+            .await
+    }
+
+    /// Like [`Self::send_anonymous_authenticated`], but additionally attach a
+    /// one-time reply block so the recipient can answer WITHOUT either side
+    /// publishing a public rendezvous ad (no presence leak). The reply is
+    /// delivered back to THIS endpoint (`self.app_id`, `reply_endpoint_id`);
+    /// pass `self.endpoint_id()` for `reply_endpoint_id` to receive it here.
+    /// The recipient gets a non-zero [`IncomingMessage::reply_id`].
+    pub async fn send_anonymous_authenticated_with_reply(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        reply_endpoint_id: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        use veil_proto::ipc::{IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED, IPC_SEND_FLAG_EXPECT_REPLY};
+        self.writer
+            .write_app_ipc_send_reply_aware(
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED | IPC_SEND_FLAG_EXPECT_REPLY,
+                0,
+                reply_endpoint_id,
+                data,
+            )
+            .await
+    }
+
+    /// Reply to a message received over the authenticated anonymous transport,
+    /// addressing it by the opaque [`IncomingMessage::reply_id`] it carried. The
+    /// daemon routes the reply back over the original sender's rendezvous path —
+    /// no public ad on either side. `reply_id` is single-use: a stale/expired id
+    /// returns [`ClientError`] (the daemon answers `REPLY_UNKNOWN`).
+    pub async fn reply(&self, reply_id: u64, data: &[u8]) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_reply_aware(
+                &[0u8; 32],
+                &self.app_id,
+                &[0u8; 32],
+                0,
+                veil_proto::ipc::IPC_SEND_FLAG_IS_REPLY,
+                reply_id,
+                0,
                 data,
             )
             .await
@@ -471,6 +527,49 @@ impl AppSender {
                 &dst_app_id,
                 dst_endpoint_id,
                 veil_proto::ipc::IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED,
+                data,
+            )
+            .await
+    }
+
+    /// Authenticated anonymous send WITH an attached one-time reply block
+    /// (mirror [`AppHandle::send_anonymous_authenticated_with_reply`]). The
+    /// reply is delivered to `(self.app_id, reply_endpoint_id)`.
+    pub async fn send_anonymous_authenticated_with_reply(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        reply_endpoint_id: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        use veil_proto::ipc::{IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED, IPC_SEND_FLAG_EXPECT_REPLY};
+        self.writer
+            .write_app_ipc_send_reply_aware(
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED | IPC_SEND_FLAG_EXPECT_REPLY,
+                0,
+                reply_endpoint_id,
+                data,
+            )
+            .await
+    }
+
+    /// Reply by opaque `reply_id` (mirror [`AppHandle::reply`]). Routes back
+    /// over the original sender's rendezvous path; no public ad either side.
+    pub async fn reply(&self, reply_id: u64, data: &[u8]) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_reply_aware(
+                &[0u8; 32],
+                &self.app_id,
+                &[0u8; 32],
+                0,
+                veil_proto::ipc::IPC_SEND_FLAG_IS_REPLY,
+                reply_id,
+                0,
                 data,
             )
             .await

@@ -526,6 +526,7 @@ class IncomingMessage {
     required this.srcNodeId,
     required this.srcAppId,
     required this.data,
+    this.replyId = 0,
   });
 
   /// 32-byte BLAKE3 hash of the originating node's signing pubkey.
@@ -536,6 +537,14 @@ class IncomingMessage {
 
   /// Application payload bytes.
   final Uint8List data;
+
+  /// Opaque reply handle: non-zero when this message arrived over the
+  /// authenticated anonymous transport WITH a one-time reply block attached.
+  /// The daemon can route a reply back over the original sender's rendezvous
+  /// path with no public ad on either side. `0` means "not repliable" (a plain
+  /// send, or an authenticated send without a reply block). Single-use and
+  /// TTL-bounded daemon-side.
+  final int replyId;
 }
 
 /// Exception raised from the high-level Dart API on FFI failures.

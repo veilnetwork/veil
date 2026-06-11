@@ -1,6 +1,6 @@
 name: veil_flutter
 description: Dart-FFI bindings for the veil daemon — censorship-resistant P2P network for budget Android devices.
-version: 0.1.0
+version: 0.2.0
 publish_to: none
 
 environment:

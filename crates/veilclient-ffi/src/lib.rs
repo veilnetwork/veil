@@ -941,6 +941,177 @@ pub unsafe extern "C" fn veil_send_anonymous_authenticated(
     }
 }
 
+/// Like [`veil_send_anonymous_authenticated`], but additionally attach a
+/// one-time reply block so the recipient can answer WITHOUT either side
+/// publishing a public rendezvous ad (no presence leak). The reply is delivered
+/// back to `(this app, reply_endpoint_id)` and surfaces to the recipient as a
+/// non-zero `reply_id` in the recv callback. Pass the endpoint you receive on
+/// for `reply_endpoint_id`. Same fire-and-forget semantics as the plain
+/// authenticated send.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_send_anonymous_authenticated_with_reply(
+    app: *mut VeilApp,
+    dst_node_id: *const u8,
+    dst_app_id: *const u8,
+    dst_endpoint_id: u32,
+    reply_endpoint_id: u32,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) =
+        unsafe { guard::ffi_prelude(err_out, "veil_send_anonymous_authenticated_with_reply") }
+    {
+        return rc;
+    }
+    null_check!(err_out,
+        "app" => app,
+        "dst_node_id" => dst_node_id,
+        "dst_app_id" => dst_app_id,
+    );
+    if data.is_null() && len > 0 {
+        unsafe {
+            write_err(err_out, "data is NULL but len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("data len {len} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let mut dst_node = [0u8; 32];
+    let mut dst_app = [0u8; 32];
+    // SAFETY: as in `veil_send_anonymous_authenticated`.
+    unsafe {
+        ptr::copy_nonoverlapping(dst_node_id, dst_node.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(dst_app_id, dst_app.as_mut_ptr(), 32);
+    }
+    let payload: Vec<u8> = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    let send_res: Result<(), ClientError> = app_ref.bundle.runtime.block_on(async {
+        let inner_guard = app_ref.sender.lock().await;
+        let Some(sender) = inner_guard.as_ref() else {
+            return Err(ClientError::Protocol("app already closed".to_string()));
+        };
+        sender
+            .send_anonymous_authenticated_with_reply(
+                dst_node,
+                dst_app,
+                dst_endpoint_id,
+                reply_endpoint_id,
+                &payload,
+            )
+            .await
+    });
+    match send_res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            let s = e.to_string();
+            unsafe {
+                write_err(err_out, format!("authenticated anonymous send failed: {s}"));
+            }
+            if s.contains("app already closed") {
+                VEIL_ERR_CLOSED
+            } else {
+                VEIL_ERR
+            }
+        }
+    }
+}
+
+/// Reply to a message received over the authenticated anonymous transport,
+/// addressing it by the opaque `reply_id` from the recv callback. The daemon
+/// routes the reply back over the original sender's rendezvous path — no public
+/// ad on either side. `reply_id` is single-use and TTL-bounded daemon-side; a
+/// stale/unknown id returns `VEIL_ERR` with a "reply unknown" detail. Same
+/// fire-and-forget semantics as the other authenticated sends.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_send_reply(
+    app: *mut VeilApp,
+    reply_id: u64,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_send_reply") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "app" => app,
+    );
+    if data.is_null() && len > 0 {
+        unsafe {
+            write_err(err_out, "data is NULL but len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("data len {len} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if reply_id == 0 {
+        unsafe {
+            write_err(err_out, "reply_id is 0 (not a repliable message)");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let payload: Vec<u8> = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    let send_res: Result<(), ClientError> = app_ref.bundle.runtime.block_on(async {
+        let inner_guard = app_ref.sender.lock().await;
+        let Some(sender) = inner_guard.as_ref() else {
+            return Err(ClientError::Protocol("app already closed".to_string()));
+        };
+        sender.reply(reply_id, &payload).await
+    });
+    match send_res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            let s = e.to_string();
+            unsafe {
+                write_err(err_out, format!("reply send failed: {s}"));
+            }
+            if s.contains("app already closed") {
+                VEIL_ERR_CLOSED
+            } else {
+                VEIL_ERR
+            }
+        }
+    }
+}
+
 /// Recv callback signature — invoked from a tokio worker thread.
 ///
 /// BUFFER OWNERSHIP (cycle-7 H6): the three pointers (`src_node_id`,
@@ -953,6 +1124,12 @@ pub unsafe extern "C" fn veil_send_anonymous_authenticated(
 /// that a deferred host (Dart `NativeCallable.listener`) could not honour
 /// without a use-after-free.
 ///
+/// `reply_id` is a by-value scalar (NOT part of the owned buffer — it has no
+/// lifetime to manage): non-zero when this message arrived over the
+/// authenticated anonymous transport WITH a one-time reply block. Pass it to
+/// [`veil_send_reply`] to answer without either side publishing a public
+/// rendezvous ad. `0` means "not repliable".
+///
 /// wrapped in `Option<...>` so a NULL
 /// function pointer passed from C/Swift/Kotlin is a valid `None`
 /// representation that Rust matches and rejects gracefully — instead
@@ -964,6 +1141,7 @@ pub type VeilRecvCb = Option<
         user: *mut std::ffi::c_void,
         src_node_id: *const u8, // 32 bytes
         src_app_id: *const u8,  // 32 bytes
+        reply_id: u64,          // 0 = not repliable
         data: *const u8,
         len: size_t,
     ),
@@ -979,7 +1157,7 @@ pub type VeilRecvCb = Option<
 /// held across the C callback.
 #[derive(Clone, Copy)]
 struct RecvCbSlot {
-    cb: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, *const u8, *const u8, size_t),
+    cb: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, *const u8, u64, *const u8, size_t),
     user_addr: usize,
 }
 
@@ -1085,6 +1263,7 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
                 src_node_id,
                 src_app_id,
                 data,
+                reply_id,
                 ..
             })) = receiver.recv().await
             {
@@ -1125,6 +1304,7 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
                         user_ptr,
                         base.cast_const(),         // src_node_id (32 bytes)
                         base.add(32).cast_const(), // src_app_id  (32 bytes)
+                        reply_id,                  // 0 = not repliable
                         base.add(64).cast_const(), // data        (data_len bytes)
                         data_len,
                     );
