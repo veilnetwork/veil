@@ -544,6 +544,188 @@ impl AppDeliverPayload {
     }
 }
 
+// ── AuthAppDeliver ──────────────────────────────────────────────────────────
+
+/// Domain-separation prefix for the signed bytes of an [`AuthAppDeliver`].
+/// Binding it prevents a signature made for some other veil structure from
+/// being replayed as an authenticated delivery, and vice-versa.
+pub const AUTH_APP_DELIVER_DOMAIN: &[u8] = b"veil-auth-onion-deliver:v1\0";
+
+/// Authenticated anonymous delivery payload (Epic: authenticated onion delivery
+/// v1). Carried as the onion FINAL-hop payload under `final_hop_kind::
+/// APP_DELIVER_AUTH`. The onion hides the sender's network location from every
+/// relay; this payload lets the RECIPIENT cryptographically verify WHO sent it
+/// (unlike the anonymous-to-recipient [`AppDeliverPayload`] whose `src_node_id`
+/// is unauthenticated / zeroed).
+///
+/// The recipient verifies: freshness (`timestamp`), that `dst_node_id` is itself
+/// (no relay re-targeting), the `signature` against
+/// `sender_node_id`'s identity subkey `sig_key_idx` (resolved/cached), and
+/// per-sender replay on `nonce`. Only then is `sender_node_id` trusted.
+///
+/// Wire layout (big-endian):
+/// ```text
+/// [0]        version u8 (= 1)
+/// [1..33]    sender_node_id [32]
+/// [33]       sig_key_idx u8       index into the sender's IdentityDocument subkeys
+/// [34..42]   timestamp u64 BE     unix secs (freshness)
+/// [42..50]   nonce u64 BE         fresh-random per message (replay)
+/// [50..82]   dst_node_id [32]     the intended recipient (binds the envelope)
+/// [82..114]  app_id [32]          destination app
+/// [114..118] endpoint_id u32 BE
+/// [118..122] data_len u32 BE
+/// [122..122+data_len] data
+/// [..+2]     sig_len u16 BE
+/// [..]       signature            (Ed25519 = 64 B in v1)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthAppDeliver {
+    /// Format version (1).
+    pub version: u8,
+    /// Sovereign `node_id` of the sender — VERIFIED by the recipient via
+    /// `signature`, NOT trusted until then.
+    pub sender_node_id: [u8; 32],
+    /// Index of the signing subkey in the sender's IdentityDocument.
+    pub sig_key_idx: u8,
+    /// Unix-seconds timestamp; recipient enforces a freshness window.
+    pub timestamp: u64,
+    /// Fresh random per-message nonce; recipient keeps a per-sender replay window.
+    pub nonce: u64,
+    /// Intended recipient `node_id` — bound into the signed bytes so a relay
+    /// cannot re-target the envelope to a different recipient.
+    pub dst_node_id: [u8; 32],
+    /// Destination app id.
+    pub app_id: [u8; 32],
+    /// Destination endpoint id.
+    pub endpoint_id: u32,
+    /// Application payload.
+    pub data: Vec<u8>,
+    /// Signature over [`Self::signing_bytes`] by the sender's subkey.
+    pub signature: Vec<u8>,
+}
+
+impl AuthAppDeliver {
+    /// Current wire version.
+    pub const VERSION: u8 = 1;
+    /// Fixed header size before `data` (version..data_len inclusive).
+    const HEADER_SIZE: usize = 1 + 32 + 1 + 8 + 8 + 32 + 32 + 4 + 4;
+    /// Cap on the signature length accepted on decode (Falcon-512 ≈ 690 B; v1
+    /// uses Ed25519 = 64 B, but the cap leaves room for the hybrid v2 subkey).
+    pub const MAX_SIG_LEN: usize = 1024;
+
+    /// Canonical bytes the sender signs and the recipient verifies. Covers every
+    /// field EXCEPT the signature itself, domain-separated. The same byte order
+    /// the wire uses, so a verifier can reconstruct it from the decoded struct.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut b =
+            Vec::with_capacity(AUTH_APP_DELIVER_DOMAIN.len() + Self::HEADER_SIZE + self.data.len());
+        b.extend_from_slice(AUTH_APP_DELIVER_DOMAIN);
+        b.push(self.version);
+        b.extend_from_slice(&self.sender_node_id);
+        b.push(self.sig_key_idx);
+        b.extend_from_slice(&self.timestamp.to_be_bytes());
+        b.extend_from_slice(&self.nonce.to_be_bytes());
+        b.extend_from_slice(&self.dst_node_id);
+        b.extend_from_slice(&self.app_id);
+        b.extend_from_slice(&self.endpoint_id.to_be_bytes());
+        b.extend_from_slice(&self.data);
+        b
+    }
+
+    /// Encode to wire bytes (header || data || sig_len || signature).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf =
+            Vec::with_capacity(Self::HEADER_SIZE + self.data.len() + 2 + self.signature.len());
+        buf.push(self.version);
+        buf.extend_from_slice(&self.sender_node_id);
+        buf.push(self.sig_key_idx);
+        buf.extend_from_slice(&self.timestamp.to_be_bytes());
+        buf.extend_from_slice(&self.nonce.to_be_bytes());
+        buf.extend_from_slice(&self.dst_node_id);
+        buf.extend_from_slice(&self.app_id);
+        buf.extend_from_slice(&self.endpoint_id.to_be_bytes());
+        buf.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.data);
+        buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.signature);
+        buf
+    }
+
+    /// Parse from wire bytes. Does NOT verify the signature — the caller MUST
+    /// chain signature + freshness + replay checks (see the recipient flow).
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::HEADER_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::HEADER_SIZE,
+                got: buf.len(),
+            });
+        }
+        let version = buf[0];
+        if version != Self::VERSION {
+            return Err(ProtoError::Malformed(format!(
+                "AuthAppDeliver: unsupported version {version}"
+            )));
+        }
+        let sender_node_id = super::read_array::<32>(buf, 1)?;
+        let sig_key_idx = buf[33];
+        let timestamp = super::read_u64_be(buf, 34)?;
+        let nonce = super::read_u64_be(buf, 42)?;
+        let dst_node_id = super::read_array::<32>(buf, 50)?;
+        let app_id = super::read_array::<32>(buf, 82)?;
+        let endpoint_id = super::read_u32_be(buf, 114)?;
+        let data_len = super::read_u32_be(buf, 118)? as usize;
+        let data_end =
+            Self::HEADER_SIZE
+                .checked_add(data_len)
+                .ok_or(ProtoError::BufferTooShort {
+                    need: usize::MAX,
+                    got: buf.len(),
+                })?;
+        // sig_len (u16) follows data.
+        let sig_len_end = data_end.checked_add(2).ok_or(ProtoError::BufferTooShort {
+            need: usize::MAX,
+            got: buf.len(),
+        })?;
+        if buf.len() < sig_len_end {
+            return Err(ProtoError::BufferTooShort {
+                need: sig_len_end,
+                got: buf.len(),
+            });
+        }
+        let sig_len = u16::from_be_bytes([buf[data_end], buf[data_end + 1]]) as usize;
+        if sig_len > Self::MAX_SIG_LEN {
+            return Err(ProtoError::Malformed(format!(
+                "AuthAppDeliver: signature {sig_len} B exceeds cap {}",
+                Self::MAX_SIG_LEN
+            )));
+        }
+        let total = sig_len_end
+            .checked_add(sig_len)
+            .ok_or(ProtoError::BufferTooShort {
+                need: usize::MAX,
+                got: buf.len(),
+            })?;
+        if buf.len() < total {
+            return Err(ProtoError::BufferTooShort {
+                need: total,
+                got: buf.len(),
+            });
+        }
+        Ok(Self {
+            version,
+            sender_node_id,
+            sig_key_idx,
+            timestamp,
+            nonce,
+            dst_node_id,
+            app_id,
+            endpoint_id,
+            data: buf[Self::HEADER_SIZE..data_end].to_vec(),
+            signature: buf[sig_len_end..total].to_vec(),
+        })
+    }
+}
+
 // ── AppIpcSendPayload ─────────────────────────────────────────────────────── // STABLE v1
 
 /// Flag bit for `AppIpcSendPayload.flags`: request end-to-end delivery ACK.
@@ -4399,6 +4581,79 @@ impl PnetStatusResultPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_auth_deliver() -> AuthAppDeliver {
+        AuthAppDeliver {
+            version: AuthAppDeliver::VERSION,
+            sender_node_id: [0xAA; 32],
+            sig_key_idx: 3,
+            timestamp: 1_700_000_123,
+            nonce: 0x0123_4567_89AB_CDEF,
+            dst_node_id: [0xBB; 32],
+            app_id: [0xCC; 32],
+            endpoint_id: 42,
+            data: b"hi bob, it's authentically alice".to_vec(),
+            signature: vec![0x5A; 64], // Ed25519-sized
+        }
+    }
+
+    #[test]
+    fn auth_app_deliver_roundtrip() {
+        let p = sample_auth_deliver();
+        let decoded = AuthAppDeliver::decode(&p.encode()).expect("decode");
+        assert_eq!(decoded, p);
+    }
+
+    #[test]
+    fn auth_app_deliver_signing_bytes_exclude_signature_and_bind_fields() {
+        let p = sample_auth_deliver();
+        let sb = p.signing_bytes();
+        // Domain-prefixed, and the signature is NOT part of the signed bytes.
+        assert!(sb.starts_with(AUTH_APP_DELIVER_DOMAIN));
+        let mut windows = sb.windows(p.signature.len());
+        // a 64-byte run of 0x5A (the signature) must not appear in signing_bytes.
+        assert!(
+            !windows.any(|w| w == p.signature.as_slice()),
+            "signature bytes must not be covered by signing_bytes",
+        );
+        // Changing any bound field changes signing_bytes (sample: dst_node_id).
+        let mut q = p.clone();
+        q.dst_node_id = [0x00; 32];
+        assert_ne!(q.signing_bytes(), sb);
+        // Changing ONLY the signature does NOT change signing_bytes.
+        let mut r = p.clone();
+        r.signature = vec![0x11; 64];
+        assert_eq!(r.signing_bytes(), sb);
+    }
+
+    #[test]
+    fn auth_app_deliver_rejects_bad_version_and_oversize_sig() {
+        let mut bytes = sample_auth_deliver().encode();
+        bytes[0] = 2; // unsupported version
+        assert!(matches!(
+            AuthAppDeliver::decode(&bytes),
+            Err(ProtoError::Malformed(_))
+        ));
+
+        // Oversize signature length field → rejected by the cap.
+        let mut p = sample_auth_deliver();
+        p.signature = vec![0u8; AuthAppDeliver::MAX_SIG_LEN + 1];
+        assert!(matches!(
+            AuthAppDeliver::decode(&p.encode()),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn auth_app_deliver_truncated_inputs_error_not_panic() {
+        let full = sample_auth_deliver().encode();
+        for cut in [0usize, 1, 33, 50, 121, full.len() - 1] {
+            assert!(
+                AuthAppDeliver::decode(&full[..cut]).is_err(),
+                "truncation at {cut} must error, not panic",
+            );
+        }
+    }
 
     #[test]
     fn pnet_status_result_roundtrip() {
