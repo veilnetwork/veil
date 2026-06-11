@@ -5853,7 +5853,7 @@ mod tests {
         net.node(0)
             .runtime
             .access()
-            .send_via_rendezvous_authenticated(&ad, app_id, endpoint_id, payload, 2)
+            .send_via_rendezvous_authenticated(&ad, app_id, endpoint_id, payload, 2, None)
             .expect("send_via_rendezvous_authenticated must succeed");
 
         // The receiver's app should get the payload with the VERIFIED sender

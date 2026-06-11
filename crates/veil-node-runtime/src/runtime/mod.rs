@@ -6002,6 +6002,11 @@ impl NodeServices {
         target_endpoint_id: u32,
         data: &[u8],
         hop_count: usize,
+        // When `Some((reply_app_id, reply_endpoint_id))`, attach a one-time
+        // reply block so the recipient can reply WITHOUT us publishing a public
+        // ad (presence-leak mitigation): we register R-locally with a rendezvous
+        // relay under a fresh cookie and embed the sealed reply path.
+        reply: Option<([u8; 32], u32)>,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
         use rand_core::RngCore;
         use veil_anonymity::rendezvous::final_hop_kind;
@@ -6011,6 +6016,46 @@ impl NodeServices {
             .sovereign_identity
             .as_ref()
             .ok_or(veil_anonymity::sender::SenderError::MissingSenderIdentity)?;
+
+        // Optionally set up an ephemeral reply path (no public ad).
+        let reply_block = match reply {
+            Some((reply_app_id, reply_endpoint_id)) => {
+                // We must own the anonymity key to unseal the eventual reply —
+                // i.e. be receive-capable (`receive_anonymous`/`relay_capable`).
+                let x25519_pk = match self.dispatcher.anonymity_x25519_sk.as_ref() {
+                    Some(sk) => x25519_dalek::PublicKey::from(sk.as_ref()).to_bytes(),
+                    None => {
+                        return Err(veil_anonymity::sender::SenderError::MissingReplyCapability);
+                    }
+                };
+                // Pick a rendezvous relay we're connected to + that's published,
+                // and register R-locally under a fresh one-time cookie (no ad).
+                let relay =
+                    service_tasks::pick_rendezvous_relay(&self.live_sessions, &self.dht, &[])
+                        .ok_or(
+                            veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                                need: 1,
+                                have: 0,
+                            },
+                        )?;
+                let mut cookie = [0u8; 16];
+                rand_core::OsRng.fill_bytes(&mut cookie);
+                service_tasks::rendezvous_register_with(
+                    &self.session_tx_registry,
+                    &self.anonymity,
+                    &relay,
+                    cookie,
+                );
+                Some(veil_proto::ReplyBlock {
+                    rendezvous_node_id: relay,
+                    auth_cookie: cookie,
+                    x25519_pk,
+                    reply_app_id,
+                    reply_endpoint_id,
+                })
+            }
+            None => None,
+        };
 
         // Build + sign the whole message. dst = the ad's receiver_node_id (bound
         // by the signature; the verifier reconstructs it as its own node_id).
@@ -6026,7 +6071,7 @@ impl NodeServices {
             now_unix,
             nonce,
             data.to_vec(),
-            None, // r3 attaches a reply block here when the sender wants a reply
+            reply_block,
         );
         let auth_bytes = auth.encode();
         if auth_bytes.len() > veil_proto::MAX_AUTH_DELIVER_MSG_BYTES {
@@ -6108,6 +6153,9 @@ impl NodeServices {
         target_endpoint_id: u32,
         data: &[u8],
         hop_count: usize,
+        // `Some((reply_app_id, reply_endpoint_id))` attaches a one-time reply
+        // block (see `send_via_rendezvous_authenticated`).
+        reply: Option<([u8; 32], u32)>,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
         use veil_anonymity::rendezvous::{
             MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
@@ -6167,6 +6215,7 @@ impl NodeServices {
             target_endpoint_id,
             data,
             hop_count,
+            reply,
         )
         .map_err(|e| match e {
             veil_anonymity::sender::SenderError::MissingSenderIdentity => {
