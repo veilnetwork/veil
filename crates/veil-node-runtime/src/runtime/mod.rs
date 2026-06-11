@@ -6054,6 +6054,10 @@ impl NodeServices {
                     x25519_pk,
                     reply_app_id,
                     reply_endpoint_id,
+                    // The relay keys our registration by our TRANSPORT node_id
+                    // (the session peer id), so the replier must address that —
+                    // NOT our sovereign sender id.
+                    receiver_node_id: *self.identity.local_identity.node_id.as_bytes(),
                 })
             }
             None => None,
@@ -6262,9 +6266,7 @@ impl NodeServices {
             .unwrap_or(0);
 
         // Consume the one-time block; gone/expired → no reply path.
-        let Some((block, original_sender_node_id)) =
-            self.anonymity.reply_block_store.take(reply_id, now)
-        else {
+        let Some(block) = self.anonymity.reply_block_store.take(reply_id, now) else {
             return Err(AnonOnionSendError::NoRendezvous);
         };
 
@@ -6275,7 +6277,7 @@ impl NodeServices {
         // signature-bound reply block, not a DHT lookup, so it needs no
         // re-verification. Validity bounds are set wide-open for the same reason.
         let ad = veil_anonymity::rendezvous::RendezvousAd {
-            receiver_node_id: original_sender_node_id,
+            receiver_node_id: block.receiver_node_id,
             rendezvous_node_id: block.rendezvous_node_id,
             auth_cookie: block.auth_cookie,
             receiver_x25519_pk: block.x25519_pk,

@@ -5885,6 +5885,243 @@ mod tests {
         net.stop().await;
     }
 
+    /// Reply-channel end-to-end (v2 #1): A sends an authenticated anonymous
+    /// message to B WITH a one-time reply block attached, B answers via the
+    /// opaque `reply_id`, and A's app receives the reply with B's VERIFIED
+    /// node_id — all WITHOUT A ever publishing a public rendezvous ad (the
+    /// presence-leak mitigation that motivates the reply-block model).
+    ///
+    /// Topology (5 nodes, full mesh, all anonymity-capable): N0 = A
+    /// (sender + reply-receiver), N4 = B (receiver + replier), N1/N2/N3 =
+    /// relays / rendezvous. A's reply relay is auto-picked inside the send
+    /// from its connected+published relays and registered R-locally under a
+    /// fresh cookie; no ad is published for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn epic482_reply_channel_end_to_end_round_trip() {
+        use crate::proto::identity_document::IdentityDocument;
+        let n = 5;
+        let mut net = SimNetwork::builder()
+            .nodes(n)
+            // A (N0) must ALSO be anonymity-capable: it owns the x25519 key the
+            // reply is sealed to, so it needs `anonymity_relay` like the relays.
+            .role(NodeRole::Core)
+            .anonymity_relay(vec![true, true, true, true, true])
+            .sovereign_identities(true)
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        for i in 0..n {
+            assert!(
+                net.node(i)
+                    .wait_sessions(n - 1, Duration::from_secs(45))
+                    .await,
+                "node {i} should have {0} sessions",
+                n - 1
+            );
+        }
+
+        // Bind B's inbound endpoint (receives A's message) and A's reply
+        // endpoint (receives B's reply).
+        let app_b = [0xB1; 32];
+        let ep_b = 7u32;
+        let (_h_b, mut rx_b) = net.node(4).runtime.app_registry().register(app_b, ep_b, 16);
+        let app_a = [0xA1; 32];
+        let ep_a = 9u32;
+        let (_h_a, mut rx_a) = net.node(0).runtime.app_registry().register(app_a, ep_a, 16);
+
+        // B's inbound rendezvous lifecycle: register a publisher + publish the
+        // ad, then register with the rendezvous relay (N3).
+        let rendezvous_b = net.node(3).node_id();
+        let cookie_b = [0xC1u8; 16];
+        net.node(4)
+            .runtime
+            .register_rendezvous_publisher(rendezvous_b, cookie_b, 3600);
+        let n_ads = net
+            .node(4)
+            .runtime
+            .debug_force_publish_rendezvous_ads()
+            .await;
+        assert_eq!(n_ads, 1, "receiver must publish exactly one rendezvous-ad");
+        net.node(4)
+            .runtime
+            .register_with_rendezvous(rendezvous_b.into(), cookie_b);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Publish relay directory entries (N1/N2/N3) and mirror them into BOTH
+        // A's (sends + auto-picks its reply relay) and B's (onion-routes the
+        // reply to that relay) local shards.
+        for i in 1..=3 {
+            net.node(i)
+                .runtime
+                .debug_force_publish_relay_directory_entry()
+                .await
+                .expect("relay must publish directory entry");
+        }
+        for i in 1..=3 {
+            let relay_node_id = net.node(i).node_id();
+            let key = crate::node::anonymity::directory::relay_directory_dht_key(&relay_node_id);
+            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                net.node(0).runtime.dht_put_local(key, bytes.clone());
+                net.node(4).runtime.dht_put_local(key, bytes);
+            }
+        }
+
+        // A↔B identities must each be resolvable by the other's verify task:
+        // B verifies A on the original send; A verifies B on the reply. Publish
+        // both and mirror cross-wise.
+        let a_node_id = *net
+            .node(0)
+            .runtime
+            .sovereign_identity()
+            .expect("A has a sovereign identity")
+            .node_id();
+        let b_node_id = *net
+            .node(4)
+            .runtime
+            .sovereign_identity()
+            .expect("B has a sovereign identity")
+            .node_id();
+        for i in [0usize, 4] {
+            net.node(i)
+                .runtime
+                .debug_republish_sovereign_identity()
+                .await
+                .expect("publish identity");
+            net.node(i).runtime.debug_force_dht_republish().await;
+        }
+        let a_doc_key = IdentityDocument::dht_key(&a_node_id);
+        let a_doc = net
+            .node(0)
+            .runtime
+            .dht_get_local(&a_doc_key)
+            .expect("A's own identity document locally");
+        net.node(4).runtime.dht_put_local(a_doc_key, a_doc);
+        let b_doc_key = IdentityDocument::dht_key(&b_node_id);
+        let b_doc = net
+            .node(4)
+            .runtime
+            .dht_get_local(&b_doc_key)
+            .expect("B's own identity document locally");
+        net.node(0).runtime.dht_put_local(b_doc_key, b_doc);
+
+        // A resolves B's ad (OOB) and sends an authenticated message WITH a
+        // reply block addressed to A's own (app_a, ep_a).
+        let ad_key =
+            crate::node::anonymity::rendezvous::rendezvous_ad_dht_key(&net.node(4).node_id());
+        let ad_bytes = net
+            .node(4)
+            .runtime
+            .dht_get_local(&ad_key)
+            .expect("B has its own ad locally");
+        let ad = crate::node::anonymity::rendezvous::decode_rendezvous_ad(&ad_bytes)
+            .expect("ad must decode");
+
+        let reply_payload = b"who's there (reply ok)";
+
+        // The reply rides a SINGLE circuit hop (direct B→relay→A): a one-time
+        // reply block is single-use, so there is no retransmit-with-fresh-block
+        // recourse if the sim drops the reply cell. The FORWARD leg retransmits
+        // on timeout and lands reliably, so we drive the round-trip in a retry
+        // loop — each attempt is a fresh send (new reply block / cookie / id) —
+        // and pass as soon as one reply lands. This keeps the test a real gate
+        // (not ignored) despite sim onion-cell delivery loss. ~25% per-attempt
+        // drop → 4 attempts is ~3-in-10⁴ false-fail.
+        let mut reply_to_a: Option<veil_app::registry::AppMessage> = None;
+        let mut forward_landed = false;
+        for attempt in 0..6 {
+            // Drain any straggler reply from a previous attempt first.
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(1), rx_a.recv()).await {
+                reply_to_a = Some(m);
+                break;
+            }
+            let out = format!("knock #{attempt} (reply please)");
+            net.node(0)
+                .runtime
+                .access()
+                .send_via_rendezvous_authenticated(
+                    &ad,
+                    app_b,
+                    ep_b,
+                    out.as_bytes(),
+                    2,
+                    Some((app_a, ep_a)),
+                )
+                .expect("authenticated send with reply block must succeed");
+
+            // Forward leg: tolerate a sim drop on any single attempt (just resend
+            // next loop). A 0 reply_id or wrong sender, however, is a real bug.
+            let reply_id = match tokio::time::timeout(Duration::from_secs(8), rx_b.recv()).await {
+                Ok(Some(veil_app::registry::AppMessage::Deliver {
+                    src_node_id,
+                    reply_id,
+                    ..
+                })) => {
+                    assert_eq!(src_node_id, a_node_id, "B must learn A's VERIFIED node_id");
+                    assert_ne!(
+                        reply_id, 0,
+                        "message carried a reply block → non-zero reply_id"
+                    );
+                    forward_landed = true;
+                    reply_id
+                }
+                Ok(Some(other)) => panic!("expected Deliver, got {other:?}"),
+                Ok(None) => panic!("B channel closed"),
+                Err(_) => continue, // forward dropped this attempt → resend
+            };
+
+            net.node(4)
+                .runtime
+                .access()
+                .send_reply(reply_id, reply_payload, 1)
+                .await
+                .expect("send_reply must succeed");
+
+            // Did the reply land this attempt? If not, loop and resend fresh.
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(8), rx_a.recv()).await {
+                reply_to_a = Some(m);
+                break;
+            }
+        }
+        assert!(
+            forward_landed,
+            "forward leg never delivered to B across 6 attempts (not a reply-leg issue)"
+        );
+
+        // PRESENCE-LEAK CHECK: across every send-with-reply above, A attached a
+        // reply path WITHOUT ever publishing an ad — its publisher set is empty
+        // (force-publish finds nothing).
+        let a_published = net
+            .node(0)
+            .runtime
+            .debug_force_publish_rendezvous_ads()
+            .await;
+        assert_eq!(
+            a_published, 0,
+            "presence-leak mitigation: A must publish NO rendezvous ad for the reply path"
+        );
+
+        // A's reply endpoint received the reply with B's VERIFIED node_id.
+        let msg_a = reply_to_a.expect("B's reply did not reach A within 4 attempts");
+        match msg_a {
+            veil_app::registry::AppMessage::Deliver {
+                src_node_id, data, ..
+            } => {
+                assert_eq!(
+                    src_node_id, b_node_id,
+                    "reply authentication: A must learn B's VERIFIED node_id"
+                );
+                assert_eq!(
+                    data.as_ref(),
+                    reply_payload.as_slice(),
+                    "reply payload round-trip exact"
+                );
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+
+        net.stop().await;
+    }
+
     // ── network-change triggers fast reconnect ────────────────────
 
     /// Simulates a WiFi → Cellular flip on a mobile node. Verifies that
