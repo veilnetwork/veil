@@ -141,6 +141,44 @@ fn update_document(document: &mut DocumentMut, config: &Config) -> Result<()> {
     set_listens(document, &config.listen);
     set_metrics(document, config.metrics.as_ref());
     set_bootstrap_peers(document, &config.bootstrap_peers);
+
+    // Sync EVERY remaining section from the in-memory config (diff-audit M11).
+    // The manual patches above own a fixed set of sections (comment/format-
+    // preserving). All OTHER Config sections — [mesh] [mailbox] [anonymity]
+    // [dht] [routing] [session] [gateway] [nat] [pex] … — were never touched,
+    // so a programmatic mutation to any of them (e.g. an IPC/CLI command editing
+    // config.mailbox then save) was silently dropped on disk while the user-
+    // facing call reported success. Render the full config via serde and splice
+    // in the un-owned SECTIONS (tables / arrays-of-tables), overwriting any
+    // stale on-disk copy. Root scalars are skipped: in TOML they must precede
+    // all tables, and appending one here would reorder it into a preceding
+    // section (out of scope; the reported loss is sections).
+    const MANUALLY_OWNED: &[&str] = &[
+        GLOBAL_SECTION, // "global"
+        "transport",
+        "identity",       // lowercase alias the patcher may write
+        IDENTITY_SECTION, // "Identity" — the serde-rendered key (rename)
+        "ipc",
+        "peers",
+        "listen",
+        "metrics",
+        "bootstrap_peers",
+    ];
+    let rendered = toml::to_string_pretty(config)?;
+    let rendered_doc =
+        rendered
+            .parse::<DocumentMut>()
+            .map_err(|err| ConfigError::TomlDocumentParse {
+                details: err.to_string(),
+            })?;
+    for (key, item) in rendered_doc.as_table().iter() {
+        if MANUALLY_OWNED.contains(&key) {
+            continue;
+        }
+        if item.is_table() || item.is_array_of_tables() {
+            document.insert(key, item.clone());
+        }
+    }
     Ok(())
 }
 
@@ -493,6 +531,35 @@ mod tests {
         let rendered = document.to_string();
         assert!(rendered.contains("# for test"));
         assert!(rendered.contains("runtime_flavor = \"current_thread\""));
+    }
+
+    #[test]
+    fn save_preserves_non_owned_section_mutations() {
+        // diff-audit M11: sections the manual patcher does not own (mesh,
+        // mailbox, anonymity, dht, …) must still be written from the in-memory
+        // config, not silently dropped. Start from a file with NO [anonymity],
+        // mutate it, save, reload, and assert the change survived on disk.
+        let start = "[global]\n# keep me\nruntime_flavor = \"multi_thread\"\n";
+        let mut config: Config = load_config(start).unwrap();
+        config.anonymity.onion_service = true;
+        config.mailbox.require_capability_token = true;
+
+        let saved = save_existing(start, &config).unwrap();
+        assert!(
+            saved.contains("# keep me"),
+            "owned-section comments preserved"
+        );
+        assert!(saved.contains("[anonymity]"), "un-owned section written");
+
+        let reloaded = load_config(&saved).unwrap();
+        assert!(
+            reloaded.anonymity.onion_service,
+            "anonymity mutation must survive save (was the M11 data loss)"
+        );
+        assert!(
+            reloaded.mailbox.require_capability_token,
+            "mailbox mutation must survive save"
+        );
     }
 
     #[test]
