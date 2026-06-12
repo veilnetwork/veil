@@ -239,8 +239,11 @@ impl AppHandle {
     /// Reply to a message received over the authenticated anonymous transport,
     /// addressing it by the opaque [`IncomingMessage::reply_id`] it carried. The
     /// daemon routes the reply back over the original sender's rendezvous path —
-    /// no public ad on either side. `reply_id` is single-use: a stale/expired id
-    /// returns [`ClientError`] (the daemon answers `REPLY_UNKNOWN`).
+    /// no public ad on either side. `reply_id` is valid until its daemon-side TTL
+    /// expires and may be used more than once (the daemon peeks the reply block,
+    /// it does not consume it) — deduplicate at the app layer if needed; a
+    /// stale/expired id returns [`ClientError`] (the daemon answers
+    /// `REPLY_UNKNOWN`).
     pub async fn reply(&self, reply_id: u64, data: &[u8]) -> Result<(), ClientError> {
         self.writer
             .write_app_ipc_send_reply_aware(
