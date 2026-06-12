@@ -2665,6 +2665,26 @@ async fn reader_task(
                     }
                 }
             }
+            LocalAppMsg::AppSendFailed => {
+                // diff-audit L7: the daemon reports an async send failure (no
+                // route / terminal NACK) for a fire-and-forget send that already
+                // returned success. Surface it to the event sink as an
+                // ANON_SEND_FAILED event (payload = content_id) instead of
+                // silently dropping it, so an app that subscribes can react.
+                let event = VeilEvent {
+                    kind: veilcore::proto::event_kind::ANON_SEND_FAILED,
+                    payload: body.to_vec(),
+                };
+                let mut d = dispatch.lock().await;
+                let drop_sink = if let Some(tx) = d.event_sink.as_ref() {
+                    matches!(tx.try_send(event), Err(mpsc::error::TrySendError::Closed(_)))
+                } else {
+                    false
+                };
+                if drop_sink {
+                    d.event_sink = None;
+                }
+            }
             _ => {}
         }
     }

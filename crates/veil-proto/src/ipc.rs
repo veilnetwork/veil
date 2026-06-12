@@ -4918,6 +4918,14 @@ pub mod event_kind {
     /// hardcoded ceiling.  Payload: `[u32 BE drained_count]` (4 bytes;
     /// number of blobs returned in this fetch).
     pub const MAILBOX_DRAINED: u8 = 3;
+    /// An authenticated/anonymous send the daemon accepted for transmission
+    /// later failed asynchronously (diff-audit L7). The send API is
+    /// fire-and-forget — it returns success once the cell is handed to the first
+    /// hop — so a failure detected afterwards (no route, terminal NACK) surfaces
+    /// here rather than as a return value. Best-effort / informational: there is
+    /// no end-to-end ACK, so absence of this event is NOT proof of delivery.
+    /// Payload: `[u8; 32] content_id` of the failed message.
+    pub const ANON_SEND_FAILED: u8 = 4;
 }
 
 /// Payload [`crate::family::LocalAppMsg::Event`].
