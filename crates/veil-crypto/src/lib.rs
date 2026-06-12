@@ -7,6 +7,7 @@
 pub mod identity;
 pub mod identity_fingerprint;
 pub mod kex;
+pub mod key_blinding;
 pub mod pair_oob;
 pub mod pow;
 pub mod session_cipher;

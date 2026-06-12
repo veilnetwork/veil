@@ -21,7 +21,12 @@ base64 = "0.22"
 blake3 = "1.5"
 chacha20poly1305 = "0.10"
 ctrlc = "3.4"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+# `hazmat` exposes ExpandedSecretKey + raw_sign for Ed25519 key BLINDING
+# (Tor-v3-style blinded descriptors — onion-registration #3).
+ed25519-dalek = { version = "2.1", features = ["rand_core", "hazmat"] }
+# Scalar + Edwards point arithmetic for the blinding factor (h·A). Must match
+# ed25519-dalek's internal curve25519-dalek version (4.x).
+curve25519-dalek = "4"
 hkdf = "0.12"
 hmac = "0.12"
 thiserror = "2.0"
