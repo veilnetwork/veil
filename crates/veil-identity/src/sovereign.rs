@@ -237,7 +237,41 @@ impl SovereignIdentity {
         identity_sk_seed: &veil_util::sensitive_bytes::SensitiveBytesN<32>,
     ) -> Result<Self, SovereignIdentityError> {
         let idx = document.sig_key_idx;
-        Self::from_parts(document, identity_sk_seed, idx)
+        // Crash-recovery (diff-audit M8): a crash BETWEEN the rotate's document
+        // write and the SK-file write leaves the document's active sig_key_idx
+        // pointing at the NEW subkey while the on-disk seed is still the OLD one,
+        // so `from_parts` would fail SkSubkeyMismatch and the node refuses to
+        // boot (manual recovery). Instead, if the documented active subkey does
+        // not match the on-disk seed, fall back to the subkey index whose pubkey
+        // DOES match — the still-valid pre-rotation subkey, which is still in the
+        // document. We sign as that subkey until the next rotation re-attempts
+        // and re-signs a consistent document. Determine the index by reference
+        // (no clone) before `from_parts` consumes the document.
+        let probe = IdentitySigningKey::from_ed25519_seed(*identity_sk_seed.as_array());
+        let matches_seed = |k: &veil_proto::identity_document::IdentityKey| {
+            k.algo == veil_proto::identity_document::ALGO_ED25519
+                && probe.verify_skpk_match(&k.pubkey).is_ok()
+        };
+        let active_ok = document
+            .identity_keys
+            .get(idx as usize)
+            .is_some_and(&matches_seed);
+        let chosen = if active_ok {
+            idx
+        } else if let Some(found) = document.identity_keys.iter().position(matches_seed) {
+            log::warn!(
+                "sovereign_identity.rotate_recovery: document active sig_key_idx={idx} does \
+                 not match the on-disk seed (likely a crash mid-rotation); recovering with the \
+                 matching subkey idx={found}. Re-run rotate to converge the document."
+            );
+            found as u16
+        } else {
+            // No subkey matches the seed at all — not a half-rotation; let
+            // `from_parts` surface the precise SkSubkeyMismatch on the documented
+            // index.
+            idx
+        };
+        Self::from_parts(document, identity_sk_seed, chosen)
     }
 
     /// Load from the canonical on-disk layout written by
@@ -756,6 +790,43 @@ mod tests {
         // `from_parts_active` would have rejected with `SkSubkeyMismatch`
         // since doc.sig_key_idx still points at slot 0 and its
         // SK is the source's, not the target's.
+    }
+
+    #[test]
+    fn from_parts_active_recovers_half_completed_rotation() {
+        // diff-audit M8: a crash BETWEEN the rotate's document write and the
+        // SK-file write leaves doc.sig_key_idx pointing at the NEW subkey while
+        // the on-disk seed is still the OLD one. from_parts_active must recover
+        // by selecting the subkey whose pubkey matches the seed, not refuse boot.
+        use ed25519_dalek::SigningKey as EdSk;
+        use veil_proto::identity_document::IdentityKey;
+        use veil_util::sensitive_bytes::SensitiveBytesN;
+
+        let (_dir, out) = fresh_dir_with_identity();
+        let mut doc = out.document.clone();
+        let old_idx = doc.sig_key_idx; // matches out.identity_sk_seed
+
+        // Append a NEW subkey (different seed) and point sig_key_idx at it —
+        // the document write of a rotation whose SK write never landed.
+        let new_seed: SensitiveBytesN<32> = SensitiveBytesN::from_bytes([0x55u8; 32]);
+        let new_pk = EdSk::from_bytes(new_seed.as_array()).verifying_key();
+        doc.identity_keys.push(IdentityKey {
+            algo: veil_proto::identity_document::ALGO_ED25519,
+            pubkey: new_pk.as_bytes().to_vec(),
+            device_id: veil_crypto::identity::compute_node_id(new_pk.as_bytes()),
+            valid_from_unix: 1_700_000_000,
+            valid_until_unix: 1_700_000_000 + 7 * 86_400,
+            master_sig: vec![0u8; 64],
+        });
+        doc.sig_key_idx = (doc.identity_keys.len() - 1) as u16; // new subkey
+
+        // On-disk seed is still the OLD one (matches old_idx).
+        let sov = SovereignIdentity::from_parts_active(doc, &out.identity_sk_seed)
+            .expect("must recover, not SkSubkeyMismatch");
+        assert_eq!(
+            sov.sig_key_idx, old_idx,
+            "recovers to the subkey index whose pubkey matches the on-disk seed"
+        );
     }
 
     #[test]
