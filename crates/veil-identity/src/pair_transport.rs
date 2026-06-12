@@ -189,7 +189,10 @@ where
 
 /// Outcome returned by [`run_pair_target`] on a fully-confirmed
 /// ceremony.
-#[derive(Debug)]
+//
+// Manual `Debug` (NOT derived): `target_identity_sk_seed` is the device's raw
+// signing-key seed — a derived Debug would print it in any `{:?}` (diff-audit
+// defect M7). Redact it.
 pub struct TargetTransportOutcome {
     /// The fully-signed identity document the target just
     /// received. Caller persists as the target's local view of
@@ -205,6 +208,18 @@ pub struct TargetTransportOutcome {
     pub target_identity_sk_seed: [u8; 32],
     /// Target's freshly-minted 16-byte per-device instance tag.
     pub target_instance_id: [u8; 16],
+}
+
+impl std::fmt::Debug for TargetTransportOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TargetTransportOutcome")
+            .field("document", &self.document)
+            .field("oob_code", &self.oob_code)
+            .field("target_identity_key_idx", &self.target_identity_key_idx)
+            .field("target_identity_sk_seed", &"<redacted>")
+            .field("target_instance_id", &self.target_instance_id)
+            .finish()
+    }
 }
 
 /// Run the target side of the ceremony over a connected stream.
