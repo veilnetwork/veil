@@ -68,6 +68,15 @@ pub struct CircuitState {
     registered_cookie: Mutex<Option<[u8; 16]>>,
 }
 
+impl Drop for CircuitState {
+    fn drop(&mut self) {
+        // diff-audit Δ2-j: scrub the per-circuit symmetric key on drop so it does
+        // not linger in freed memory for the circuit's whole lifetime.
+        use zeroize::Zeroize;
+        self.circuit_key.zeroize();
+    }
+}
+
 impl CircuitState {
     fn from_install(
         install: &CircuitInstall,

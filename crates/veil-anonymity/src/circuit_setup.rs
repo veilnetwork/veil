@@ -65,6 +65,22 @@ pub struct CircuitInstall {
     pub circuit_key: [u8; CIRCUIT_KEY_LEN],
 }
 
+impl Drop for CircuitInstall {
+    fn drop(&mut self) {
+        // diff-audit Δ2-j: scrub key material on drop.
+        use zeroize::Zeroize;
+        self.circuit_key.zeroize();
+    }
+}
+
+impl Drop for CircuitSetupHop {
+    fn drop(&mut self) {
+        // diff-audit Δ2-j: scrub key material on drop.
+        use zeroize::Zeroize;
+        self.circuit_key.zeroize();
+    }
+}
+
 impl std::fmt::Debug for CircuitInstall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print the key material.
