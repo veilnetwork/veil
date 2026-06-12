@@ -6017,7 +6017,16 @@ impl NodeServices {
             .ok()
             .and_then(|v| v.try_into().ok())
             .ok_or(AnonOnionSendError::NoIdentity)?;
-        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // diff-audit M2: bind the registration to a monotonic freshness epoch
+        // (our unix clock; rebuilds are ~150 s apart, so it strictly increases).
+        // R rejects a re-registration whose epoch is not strictly greater than
+        // the recorded one, defeating replay-hijack of the cookie→circuit map.
+        let epoch = now;
+        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
         let sig = veil_crypto::sign_message(
             veil_types::SignatureAlgorithm::Ed25519,
             &reg_kp.public_key,
@@ -6028,14 +6037,11 @@ impl NodeServices {
         let reg = CircuitRegisterPayload {
             cookie,
             reg_pk,
+            epoch,
             signature: sig,
         };
 
         // Build the origin circuit with the registration as terminus payload.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         let (setup, origin) = build_origin_circuit(&hops, &reg.encode(), now)
             .map_err(|_| AnonOnionSendError::NoRelays)?;
         let first_hop = origin.first_hop;

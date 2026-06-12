@@ -48,44 +48,60 @@ pub const DEFAULT_SUBSCRIPTION_TTL_SECS: u64 = 600;
 
 /// Signed registration a receiver delivers as the circuit-setup terminus
 /// payload. `reg_pk` is an Ed25519 public key (raw bytes); `signature` covers
-/// `(domain ‖ cookie ‖ reg_pk)`.
+/// `(domain ‖ cookie ‖ reg_pk ‖ epoch)`.
+///
+/// `epoch` (diff-audit M2) is a monotonic freshness counter (the receiver uses
+/// its unix-seconds clock; rebuilds are minutes apart so it strictly increases).
+/// R only accepts a re-registration whose epoch is STRICTLY GREATER than the one
+/// it last recorded for the cookie. Without it the signature was static and
+/// replayable: a party that captured a registration off the circuit path could
+/// replay it on its OWN circuit to re-bind `cookie → attacker circuit` and
+/// black-hole introduces. A replayed payload carries an old (≤ stored) epoch and
+/// is now rejected; only the holder of `reg_sk` can mint a fresher one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CircuitRegisterPayload {
     pub cookie: [u8; COOKIE_LEN],
     pub reg_pk: [u8; REG_PK_LEN],
+    pub epoch: u64,
     pub signature: Vec<u8>,
 }
 
 impl CircuitRegisterPayload {
     /// Bytes the `reg_sk` signs over.
-    pub fn signing_bytes(cookie: &[u8; COOKIE_LEN], reg_pk: &[u8; REG_PK_LEN]) -> Vec<u8> {
-        let mut m = Vec::with_capacity(REGISTER_DOMAIN.len() + COOKIE_LEN + REG_PK_LEN);
+    pub fn signing_bytes(
+        cookie: &[u8; COOKIE_LEN],
+        reg_pk: &[u8; REG_PK_LEN],
+        epoch: u64,
+    ) -> Vec<u8> {
+        let mut m = Vec::with_capacity(REGISTER_DOMAIN.len() + COOKIE_LEN + REG_PK_LEN + 8);
         m.extend_from_slice(REGISTER_DOMAIN);
         m.extend_from_slice(cookie);
         m.extend_from_slice(reg_pk);
+        m.extend_from_slice(&epoch.to_be_bytes());
         m
     }
 
     /// Verify the registration self-signature (proves possession of `reg_sk`).
     pub fn verify(&self) -> bool {
-        let msg = Self::signing_bytes(&self.cookie, &self.reg_pk);
+        let msg = Self::signing_bytes(&self.cookie, &self.reg_pk, self.epoch);
         let pk_b64 = STANDARD.encode(self.reg_pk);
         veil_crypto::verify_message(SignatureAlgorithm::Ed25519, &pk_b64, &msg, &self.signature)
             .is_ok()
     }
 
-    /// Wire: `[cookie(16)][reg_pk(32)][sig_len u16 BE][sig]`.
+    /// Wire: `[cookie(16)][reg_pk(32)][epoch(8) BE][sig_len u16 BE][sig]`.
     pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(COOKIE_LEN + REG_PK_LEN + 2 + self.signature.len());
+        let mut b = Vec::with_capacity(COOKIE_LEN + REG_PK_LEN + 8 + 2 + self.signature.len());
         b.extend_from_slice(&self.cookie);
         b.extend_from_slice(&self.reg_pk);
+        b.extend_from_slice(&self.epoch.to_be_bytes());
         b.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
         b.extend_from_slice(&self.signature);
         b
     }
 
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        let fixed = COOKIE_LEN + REG_PK_LEN + 2;
+        let fixed = COOKIE_LEN + REG_PK_LEN + 8 + 2;
         if buf.len() < fixed {
             return None;
         }
@@ -93,16 +109,17 @@ impl CircuitRegisterPayload {
         cookie.copy_from_slice(&buf[..COOKIE_LEN]);
         let mut reg_pk = [0u8; REG_PK_LEN];
         reg_pk.copy_from_slice(&buf[COOKIE_LEN..COOKIE_LEN + REG_PK_LEN]);
-        let sig_len = u16::from_be_bytes([
-            buf[COOKIE_LEN + REG_PK_LEN],
-            buf[COOKIE_LEN + REG_PK_LEN + 1],
-        ]) as usize;
+        let epoch_off = COOKIE_LEN + REG_PK_LEN;
+        let epoch = u64::from_be_bytes(buf[epoch_off..epoch_off + 8].try_into().ok()?);
+        let sig_len_off = epoch_off + 8;
+        let sig_len = u16::from_be_bytes([buf[sig_len_off], buf[sig_len_off + 1]]) as usize;
         if sig_len > MAX_SIG_LEN || buf.len() < fixed + sig_len {
             return None;
         }
         Some(Self {
             cookie,
             reg_pk,
+            epoch,
             signature: buf[fixed..fixed + sig_len].to_vec(),
         })
     }
@@ -117,12 +134,18 @@ pub enum RegisterError {
     CookieClaimed,
     /// Global subscription cap reached.
     Full,
+    /// Re-registration epoch is not strictly greater than the recorded one
+    /// (diff-audit M2) — a replayed/stale registration. The legitimate holder
+    /// always mints a fresher epoch on each rebuild.
+    StaleEpoch,
 }
 
 struct Subscription {
     reg_pk: [u8; REG_PK_LEN],
     circuit: Arc<CircuitState>,
     registered_unix: u64,
+    /// Last accepted registration epoch (M2 replay guard).
+    epoch: u64,
 }
 
 /// Bounded, cookie-keyed registry of circuit-backed rendezvous subscriptions.
@@ -162,7 +185,13 @@ impl CircuitRendezvousRegistry {
             Some(existing) if existing.reg_pk != payload.reg_pk => {
                 return Err(RegisterError::CookieClaimed);
             }
-            Some(_) => {} // same reg_pk → refresh below
+            // Same reg_pk → refresh, but ONLY with a strictly-fresher epoch (M2).
+            // A replayed payload carries epoch ≤ the recorded one and is rejected
+            // before it can re-bind the cookie to a different circuit.
+            Some(existing) if payload.epoch <= existing.epoch => {
+                return Err(RegisterError::StaleEpoch);
+            }
+            Some(_) => {}
             None => {
                 if g.len() >= self.cap {
                     return Err(RegisterError::Full);
@@ -177,6 +206,7 @@ impl CircuitRendezvousRegistry {
                 reg_pk: payload.reg_pk,
                 circuit,
                 registered_unix: now_unix,
+                epoch: payload.epoch,
             },
         );
         Ok(())
@@ -227,13 +257,26 @@ mod tests {
     use crate::circuit_table::CircuitTable;
     use veil_crypto::{generate_keypair, sign_message};
 
-    /// Make a signed registration for `cookie` under a fresh Ed25519 key; return
-    /// (payload, reg_pk_bytes).
-    fn signed(cookie: [u8; COOKIE_LEN]) -> (CircuitRegisterPayload, [u8; REG_PK_LEN]) {
+    /// Make a signed registration for `cookie` under a fresh Ed25519 key at
+    /// `epoch`; return (payload, reg_pk_bytes).
+    fn signed_at(
+        cookie: [u8; COOKIE_LEN],
+        epoch: u64,
+    ) -> (CircuitRegisterPayload, [u8; REG_PK_LEN]) {
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        signed_with(cookie, epoch, &kp)
+    }
+
+    /// Sign for `cookie`/`epoch` under a SPECIFIC keypair (so a refresh can reuse
+    /// the same reg_pk with a fresher epoch, as the real service does).
+    fn signed_with(
+        cookie: [u8; COOKIE_LEN],
+        epoch: u64,
+        kp: &veil_crypto::GeneratedKeyPair,
+    ) -> (CircuitRegisterPayload, [u8; REG_PK_LEN]) {
         let reg_pk_bytes: [u8; REG_PK_LEN] =
             STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
-        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk_bytes);
+        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk_bytes, epoch);
         let sig = sign_message(
             SignatureAlgorithm::Ed25519,
             &kp.public_key,
@@ -245,10 +288,16 @@ mod tests {
             CircuitRegisterPayload {
                 cookie,
                 reg_pk: reg_pk_bytes,
+                epoch,
                 signature: sig,
             },
             reg_pk_bytes,
         )
+    }
+
+    /// Back-compat shim for tests that don't care about epoch: epoch = 1.
+    fn signed(cookie: [u8; COOKIE_LEN]) -> (CircuitRegisterPayload, [u8; REG_PK_LEN]) {
+        signed_at(cookie, 1)
     }
 
     fn a_circuit() -> Arc<CircuitState> {
@@ -307,19 +356,47 @@ mod tests {
     fn first_wins_blocks_squatter_but_allows_refresh() {
         let reg = CircuitRendezvousRegistry::new();
         let cookie = [0x07; COOKIE_LEN];
-        let (legit, _) = signed(cookie);
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let (legit, _) = signed_with(cookie, 10, &kp);
         reg.register(&legit, a_circuit(), 0).unwrap();
 
         // Squatter: same cookie, DIFFERENT reg_pk → rejected.
-        let (squat, _) = signed(cookie);
+        let (squat, _) = signed_at(cookie, 999);
         assert_eq!(
             reg.register(&squat, a_circuit(), 0),
             Err(RegisterError::CookieClaimed)
         );
 
-        // Legit owner refreshes (same reg_pk) → ok.
-        reg.register(&legit, a_circuit(), 100).unwrap();
+        // Legit owner refreshes (same reg_pk, FRESHER epoch) → ok.
+        let (refresh, _) = signed_with(cookie, 11, &kp);
+        reg.register(&refresh, a_circuit(), 100).unwrap();
         assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn replayed_registration_is_rejected_m2() {
+        // diff-audit M2: a captured registration cannot be replayed to re-bind
+        // the cookie to a different circuit — its epoch is not strictly fresher.
+        let reg = CircuitRendezvousRegistry::new();
+        let cookie = [0x55; COOKIE_LEN];
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let (first, _) = signed_with(cookie, 100, &kp);
+        reg.register(&first, a_circuit(), 0).unwrap();
+
+        // Replay of the SAME payload (same epoch) → rejected.
+        assert_eq!(
+            reg.register(&first, a_circuit(), 1),
+            Err(RegisterError::StaleEpoch)
+        );
+        // An OLDER epoch (same key) → rejected.
+        let (older, _) = signed_with(cookie, 50, &kp);
+        assert_eq!(
+            reg.register(&older, a_circuit(), 1),
+            Err(RegisterError::StaleEpoch)
+        );
+        // A strictly-fresher epoch from the legitimate holder → accepted.
+        let (fresher, _) = signed_with(cookie, 101, &kp);
+        reg.register(&fresher, a_circuit(), 2).unwrap();
     }
 
     #[test]
