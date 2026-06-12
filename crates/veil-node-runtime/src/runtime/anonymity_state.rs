@@ -94,7 +94,12 @@ impl ReplyBlockStore {
     /// Store `block` owned by `owner_app_id` (the app that received the message),
     /// returning a fresh non-zero `reply_id`. Only `owner_app_id` may later
     /// [`peek`](Self::peek) it (diff-audit D3).
-    pub fn store(&self, block: veil_proto::ReplyBlock, owner_app_id: [u8; 32], now_unix: u64) -> u64 {
+    pub fn store(
+        &self,
+        block: veil_proto::ReplyBlock,
+        owner_app_id: [u8; 32],
+        now_unix: u64,
+    ) -> u64 {
         let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         Self::gc(&mut s, now_unix);
         while s.map.len() >= self.cap {
@@ -325,7 +330,11 @@ mod tests {
         let id = s.store(rb(2), OWNER, 1000);
         assert_eq!(s.peek(id, OWNER, 1000 + 299), Some(rb(2)));
         let id2 = s.store(rb(3), OWNER, 2000);
-        assert_eq!(s.peek(id2, OWNER, 2000 + 300), None, "expired block is gone");
+        assert_eq!(
+            s.peek(id2, OWNER, 2000 + 300),
+            None,
+            "expired block is gone"
+        );
     }
 
     #[test]

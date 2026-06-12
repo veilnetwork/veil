@@ -351,7 +351,10 @@ impl NodeRuntime {
         // trap, so warn the operator that a restart is required to apply it.
         {
             let new_onion_hops = config.anonymity.onion_service.then(|| {
-                config.anonymity.onion_service_hops.map_or(3, |h| h as usize)
+                config
+                    .anonymity
+                    .onion_service_hops
+                    .map_or(3, |h| h as usize)
             });
             if config.anonymity.relay_capable != self.anonymity.relay_capable
                 || config.anonymity.advertised_bps != self.anonymity.advertised_bps

@@ -121,7 +121,10 @@ async fn process_auth_deliver(
     let reply_id = match auth.reply_block {
         // D3: the reply block is owned by the app that received this message
         // (`app_id`); only that app may later reply through it.
-        Some(rb) => access.anonymity.reply_block_store.store(rb, app_id, now_unix),
+        Some(rb) => access
+            .anonymity
+            .reply_block_store
+            .store(rb, app_id, now_unix),
         None => 0,
     };
     let delivered = access.dispatcher.app_registry.route_ipc_deliver_with_reply(

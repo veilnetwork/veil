@@ -2677,7 +2677,10 @@ async fn reader_task(
                 };
                 let mut d = dispatch.lock().await;
                 let drop_sink = if let Some(tx) = d.event_sink.as_ref() {
-                    matches!(tx.try_send(event), Err(mpsc::error::TrySendError::Closed(_)))
+                    matches!(
+                        tx.try_send(event),
+                        Err(mpsc::error::TrySendError::Closed(_))
+                    )
                 } else {
                     false
                 };

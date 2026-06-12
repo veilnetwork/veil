@@ -6212,11 +6212,9 @@ impl NodeServices {
             auth_cookie: cookie,
             receiver_x25519_pk: x25519_pk,
         };
-        if let Some((dht_key, bytes)) = veil_anonymity::blinded_descriptor::seal_descriptor(
-            &identity_sk,
-            period,
-            &body,
-        ) {
+        if let Some((dht_key, bytes)) =
+            veil_anonymity::blinded_descriptor::seal_descriptor(&identity_sk, period, &body)
+        {
             // diff-audit L5: replicate to the K-closest peers immediately (not
             // store_local-only). A by-identity sender resolves the descriptor at
             // H(domain ‖ blinded_pub), which is unlikely to be in OUR keyspace —
@@ -6533,12 +6531,12 @@ impl NodeServices {
         // failure above returns without ever creating a circuit to strand.
         if let Some((relay_path, cookie, reply_reg_kp)) = pending_reply_circuit {
             self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp)
-                .map_err(|_| {
-                    veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                .map_err(
+                    |_| veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
                         need: REPLY_CIRCUIT_HOPS,
                         have: 0,
-                    }
-                })?;
+                    },
+                )?;
         }
 
         let mut msg_id = [0u8; 16];
