@@ -67,13 +67,19 @@
 
 /**
  * hard cap on `data` byte length accepted by
- * FFI calls that allocate from caller-supplied len. Mirrors the
- * daemon's `MAX_FRAME_BODY` (16 MiB) so an attacker — or buggy
- * caller — passing a huge `len` to [`veil_send`] gets a clean
- * `VEIL_ERR_INVALID_ARG` instead of triggering an allocation
- * large enough to hard-OOM the host process.
+ * FFI calls that allocate from caller-supplied len. Sits BELOW the daemon's
+ * `MAX_FRAME_BODY` (16 MiB) by enough headroom for the largest IPC send-payload
+ * fixed prefix, so the framed `body_len = FIXED_SIZE + data_len` can never
+ * exceed `MAX_FRAME_BODY`. Without this margin a max-size send produced
+ * `body_len > MAX_FRAME_BODY`, which `decode_header` rejects → the daemon's
+ * read task `return`s and tears down the WHOLE IPC connection (all multiplexed
+ * apps/streams), not just the offending send (diff-audit 2026-06-12, defect
+ * M25). The largest send prefix is `SendAnonymousDirectPayload::FIXED_SIZE`
+ * (136 B); 256 B of headroom covers it plus any reply-aware trailer. Also
+ * keeps a huge `len` to [`veil_send`] a clean `VEIL_ERR_INVALID_ARG` rather
+ * than an OOM-sized allocation.
  */
-#define VEIL_MAX_DATA_LEN ((16 * 1024) * 1024)
+#define VEIL_MAX_DATA_LEN (((16 * 1024) * 1024) - 256)
 
 /**
  * Background-mode tier values [`veil_set_background_mode`].

@@ -99,12 +99,18 @@ pub const VEIL_ERR_CLOSED: c_int = -3;
 pub const VEIL_ERR_REENTRANT: c_int = -4;
 
 /// hard cap on `data` byte length accepted by
-/// FFI calls that allocate from caller-supplied len. Mirrors the
-/// daemon's `MAX_FRAME_BODY` (16 MiB) so an attacker — or buggy
-/// caller — passing a huge `len` to [`veil_send`] gets a clean
-/// `VEIL_ERR_INVALID_ARG` instead of triggering an allocation
-/// large enough to hard-OOM the host process.
-pub const VEIL_MAX_DATA_LEN: size_t = 16 * 1024 * 1024;
+/// FFI calls that allocate from caller-supplied len. Sits BELOW the daemon's
+/// `MAX_FRAME_BODY` (16 MiB) by enough headroom for the largest IPC send-payload
+/// fixed prefix, so the framed `body_len = FIXED_SIZE + data_len` can never
+/// exceed `MAX_FRAME_BODY`. Without this margin a max-size send produced
+/// `body_len > MAX_FRAME_BODY`, which `decode_header` rejects → the daemon's
+/// read task `return`s and tears down the WHOLE IPC connection (all multiplexed
+/// apps/streams), not just the offending send (diff-audit 2026-06-12, defect
+/// M25). The largest send prefix is `SendAnonymousDirectPayload::FIXED_SIZE`
+/// (136 B); 256 B of headroom covers it plus any reply-aware trailer. Also
+/// keeps a huge `len` to [`veil_send`] a clean `VEIL_ERR_INVALID_ARG` rather
+/// than an OOM-sized allocation.
+pub const VEIL_MAX_DATA_LEN: size_t = 16 * 1024 * 1024 - 256;
 
 // ── Internal types ───────────────────────────────────────────────────────────
 
@@ -5125,6 +5131,25 @@ mod tests {
         unsafe {
             veil_close(ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn max_data_len_leaves_frame_headroom() {
+        // The daemon frames an FFI send as body_len = <payload FIXED_SIZE> +
+        // data_len and rejects body_len > MAX_FRAME_BODY (16 MiB), tearing down
+        // the WHOLE IPC connection on overflow (diff-audit defect M25). So
+        // VEIL_MAX_DATA_LEN must leave headroom for the LARGEST send-payload
+        // fixed prefix. Literals mirror veil_proto::codec::MAX_FRAME_BODY and
+        // SendAnonymousDirectPayload::FIXED_SIZE (the largest cap-using sender);
+        // veilclient-ffi does not depend on veil-proto directly, hence the
+        // documented constants here.
+        const MAX_FRAME_BODY: usize = 16 * 1024 * 1024;
+        const LARGEST_SEND_PREFIX: usize = 136; // SendAnonymousDirectPayload::FIXED_SIZE
+        assert!(
+            VEIL_MAX_DATA_LEN + LARGEST_SEND_PREFIX <= MAX_FRAME_BODY,
+            "VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN}) + prefix ({LARGEST_SEND_PREFIX}) \
+             must stay <= MAX_FRAME_BODY ({MAX_FRAME_BODY})"
+        );
     }
 
     #[test]
