@@ -61,6 +61,11 @@ pub struct CircuitState {
     /// the terminus, which seals the first return layer — see b4b). Starts at 1
     /// (0 is reserved by [`ReplayWindow`]).
     next_return_seq: AtomicU32,
+    /// Cookie this circuit is registered under in the circuit-rendezvous registry
+    /// (terminus only), so teardown can immediately drop the orphaned
+    /// subscription instead of waiting for its TTL. `None` until a registration
+    /// binds it (b4a `register`).
+    registered_cookie: Mutex<Option<[u8; 16]>>,
 }
 
 impl CircuitState {
@@ -80,6 +85,7 @@ impl CircuitState {
             replay_fwd: Mutex::new(ReplayWindow::new()),
             replay_ret: Mutex::new(ReplayWindow::new()),
             next_return_seq: AtomicU32::new(1),
+            registered_cookie: Mutex::new(None),
         }
     }
 
@@ -89,6 +95,23 @@ impl CircuitState {
             .last_seen_unix
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = now;
+    }
+
+    /// Record the rendezvous cookie this (terminus) circuit is registered under,
+    /// so teardown can evict the subscription eagerly.
+    pub fn set_registered_cookie(&self, cookie: [u8; 16]) {
+        *self
+            .registered_cookie
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(cookie);
+    }
+
+    /// The registered cookie, if any.
+    pub fn registered_cookie(&self) -> Option<[u8; 16]> {
+        *self
+            .registered_cookie
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Allocate the next return-direction seq for a cell this node originates.

@@ -788,6 +788,14 @@ impl FrameDispatcher {
         if let Some(state) = table.lookup_forward(&link, p.circuit_id) {
             let next = state.next_link;
             let cid_out = state.circuit_id_out;
+            // Terminus circuit backing a circuit-rendezvous sub → evict it now
+            // (don't wait for the registry TTL).
+            if next.is_none()
+                && let (Some(reg), Some(cookie)) =
+                    (&self.circuit_rendezvous, state.registered_cookie())
+            {
+                reg.remove(&cookie);
+            }
             table.remove(&link, p.circuit_id);
             if let Some(nl) = next {
                 let tp = CircuitTeardownPayload {
@@ -1436,6 +1444,26 @@ mod tests {
                 .lookup(&cookie)
                 .is_some(),
             "terminus registration bound the cookie to its return circuit"
+        );
+
+        // Tearing the circuit down evicts the subscription eagerly (b2d) — no
+        // waiting for the registry TTL.
+        use veil_anonymity::circuit_wire::CircuitTeardownPayload;
+        let tp = CircuitTeardownPayload { circuit_id: 77 };
+        let tbody = tp.encode();
+        let mut thdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitTeardown as u16,
+        );
+        thdr.body_len = tbody.len() as u32;
+        d.dispatch_relay_chain(&thdr, &tbody, NodeId::from([0xEE; 32]));
+        assert!(
+            d.circuit_rendezvous
+                .as_ref()
+                .unwrap()
+                .lookup(&cookie)
+                .is_none(),
+            "teardown evicted the circuit-rendezvous subscription"
         );
     }
 
