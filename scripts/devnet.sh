@@ -145,25 +145,29 @@ cmd_start() {
     # the peer entry in both directions ensures whichever side has the lower
     # hex is the one that actually dials.
     if (( num_nodes > 1 )); then
-        local n0_pubkey n0_nonce n0_transport
-        n0_pubkey=$(  awk -F'"' '/^public_key /{print $2}' "$(config_file 0)")
-        n0_nonce=$(   awk -F'"' '/^nonce /{print $2}'      "$(config_file 0)")
-        n0_transport="tcp://127.0.0.1:${BASE_PEER_PORT}"
+        # Capture each node's IDENTITY pubkey + PoW nonce BEFORE any `peers add`
+        # mutates a config.  `peers add` appends a `[[peers]]` block carrying its
+        # OWN unindented `public_key`/`nonce` fields, which the `/^public_key /`
+        # awk would then match in addition to the identity line — yielding a
+        # two-line value that fails base64 decode ("Invalid symbol 61, offset
+        # 43").  Pre-capturing from pristine configs (and `exit` on first match)
+        # keeps each value the single identity key.
+        local -a node_pubkeys node_nonces
+        for n in $(seq 0 $(( num_nodes - 1 ))); do
+            node_pubkeys[n]=$( awk -F'"' '/^public_key /{print $2; exit}' "$(config_file "$n")" )
+            node_nonces[n]=$(  awk -F'"' '/^nonce /{print $2; exit}'       "$(config_file "$n")" )
+        done
         for n in $(seq 1 $(( num_nodes - 1 ))); do
             # node-N learns node-0 (the seed).
             "$BINARY" --config "$(config_file "$n")" peers add \
-                "$n0_pubkey" "$n0_nonce" "$n0_transport" \
+                "${node_pubkeys[0]}" "${node_nonces[0]}" "tcp://127.0.0.1:${BASE_PEER_PORT}" \
                 >/dev/null \
                 || die "peers add failed for node-${n}"
             # node-0 learns node-N (so node-0 can dial out if it's the
             # lower-hex side for this pair — required by the directional
             # dedup policy described above).
-            local nN_pubkey nN_nonce nN_transport
-            nN_pubkey=$(  awk -F'"' '/^public_key /{print $2}' "$(config_file "$n")")
-            nN_nonce=$(   awk -F'"' '/^nonce /{print $2}'      "$(config_file "$n")")
-            nN_transport="tcp://127.0.0.1:$(( BASE_PEER_PORT + n ))"
             "$BINARY" --config "$(config_file 0)" peers add \
-                "$nN_pubkey" "$nN_nonce" "$nN_transport" \
+                "${node_pubkeys[n]}" "${node_nonces[n]}" "tcp://127.0.0.1:$(( BASE_PEER_PORT + n ))" \
                 >/dev/null \
                 || die "peers add failed for node-0 ↔ node-${n}"
             info "node-${n} ↔ node-0: bidirectional peer config wired"
