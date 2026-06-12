@@ -318,7 +318,7 @@ mod tests {
         // diff-audit L5: the STORE gate verifies a descriptor WITHOUT the identity
         // (only its embedded blinded_pub + sig) and returns its canonical DHT key,
         // which the gate binds to the STORE key.
-        let (id_sk, id_vk) = identity();
+        let (id_sk, _id_vk) = identity();
         let period = 9u64;
         let (dht_key, desc) = seal_descriptor(&id_sk, period, &body(0x5A)).unwrap();
 
