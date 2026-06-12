@@ -242,6 +242,57 @@ class VeilClient implements Finalizable {
     });
   }
 
+  /// Like [sendToOnionService], but UNAUTHENTICATED: the service receives
+  /// `src_node_id = [0;32]` and never learns who sent the message. Combined with
+  /// the unlinkable descriptor, neither the relays, the rendezvous relay, nor the
+  /// service learn the sender's location or identity — the fully-anonymous
+  /// "anonymous user → anonymous service" path. [srcAppId] rides inside the
+  /// sealed payload for the service's app-level routing only (no node identity).
+  Future<void> sendToOnionServiceAnonymous({
+    required Uint8List serviceIdentityVk,
+    required Uint8List targetAppId,
+    required int targetEndpointId,
+    required Uint8List srcAppId,
+    required Uint8List data,
+    int hopCount = 3,
+  }) async {
+    _ensureOpen();
+    if (serviceIdentityVk.length != 32 ||
+        targetAppId.length != 32 ||
+        srcAppId.length != 32) {
+      throw ArgumentError(
+          'service_identity_vk, target_app_id and src_app_id must be 32 bytes');
+    }
+    return Future(() {
+      final idVk = calloc<Uint8>(32);
+      final appId = calloc<Uint8>(32);
+      final srcApp = calloc<Uint8>(32);
+      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        idVk.asTypedList(32).setAll(0, serviceIdentityVk);
+        appId.asTypedList(32).setAll(0, targetAppId);
+        srcApp.asTypedList(32).setAll(0, srcAppId);
+        if (data.isNotEmpty) {
+          dataPtr.asTypedList(data.length).setAll(0, data);
+        }
+        final rc = ffi.veilSendToOnionServiceAnonymous(_handle, idVk, appId,
+            targetEndpointId, srcApp, hopCount, dataPtr, data.length, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+              'send_to_onion_service_anonymous failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+      } finally {
+        calloc.free(idVk);
+        calloc.free(appId);
+        calloc.free(srcApp);
+        if (dataPtr != nullptr) calloc.free(dataPtr);
+        calloc.free(errOut);
+      }
+    });
+  }
+
   /// Consume a bootstrap-invite URI (Epic 489.7) — typically scanned
   /// from a QR code or pasted from a sharing channel.  The daemon
   /// decodes plain / encrypted / signed formats automatically and
