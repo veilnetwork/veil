@@ -772,6 +772,12 @@ pub enum LocalAppMsg {
     /// (audit cycle-7 M6). Successes are deliberately NOT reported (they are
     /// peer-fakeable; see the reputation module doc).
     AnycastReportFailure = 72,
+    /// App → daemon: register this node as a location-anonymous (onion) service.
+    /// Body is `RegisterOnionServicePayload`.
+    RegisterOnionService = 73,
+    /// daemon → app: result of `RegisterOnionService` (2-byte status code,
+    /// `0` = ok, else an `ipc_send_err`).
+    RegisterOnionServiceResult = 74,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -851,6 +857,8 @@ impl TryFrom<u16> for LocalAppMsg {
             70 => Ok(LocalAppMsg::SetWakeHmacEnvelope),
             71 => Ok(LocalAppMsg::SetWakeHmacEnvelopeOk),
             72 => Ok(LocalAppMsg::AnycastReportFailure),
+            73 => Ok(LocalAppMsg::RegisterOnionService),
+            74 => Ok(LocalAppMsg::RegisterOnionServiceResult),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,
