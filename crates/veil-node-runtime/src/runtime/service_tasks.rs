@@ -268,6 +268,19 @@ pub(crate) fn rendezvous_register_publisher(
     }
 }
 
+/// Remove a `(relay, cookie)` rendezvous publication (diff-audit L4). Used by the
+/// recipient task on relay failover to prune the prior (now-dead) relay's slot,
+/// which otherwise lingers forever — maintenance re-signs the stale ad each tick
+/// and senders take the first valid slot → black-hole.
+pub(crate) fn rendezvous_unregister_publisher(
+    anonymity: &Arc<super::anonymity_state::AnonymityState>,
+    relay: &[u8; 32],
+    cookie: [u8; 16],
+) {
+    lock!(anonymity.rendezvous_publisher_entries)
+        .retain(|e| !(e.rendezvous_node_id == *relay && e.auth_cookie == cookie));
+}
+
 impl NodeRuntime {
     // ── proxy runtime wiring ───────────────────────────────────────
 
@@ -1208,6 +1221,17 @@ impl NodeRuntime {
                             if !current_ok {
                                 match pick_rendezvous_relay(&live_sessions, &dht, &pinned) {
                                     Some(relay) => {
+                                        // Prune the prior (failed) relay's publisher
+                                        // slot before adding the new one (L4) — else
+                                        // failover strands a stale ad that senders
+                                        // black-hole into.
+                                        if let Some(old) = current
+                                            && old != relay
+                                        {
+                                            rendezvous_unregister_publisher(
+                                                &anonymity, &old, cookie,
+                                            );
+                                        }
                                         rendezvous_register_with(
                                             &session_tx_registry,
                                             &anonymity,
