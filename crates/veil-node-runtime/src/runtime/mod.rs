@@ -3371,6 +3371,8 @@ impl NodeRuntime {
             // .10 slice 4.3.2: defaults to empty (HMAC opt-out — receiver
             // upgrades via a separate IPC call wired in slice 4.3.3).
             wake_hmac_envelope: Vec::new(),
+            // Plain rendezvous receiver — signed under the sovereign identity.
+            ephemeral_ad_identity: None,
         };
         let mut entries = lock!(self.anonymity.rendezvous_publisher_entries);
         // Replace existing entry with same (rendezvous, cookie) pair.
@@ -6149,11 +6151,27 @@ impl NodeServices {
         // Build + register the circuit (no session register — that is the leak),
         // then publish the ad so clients can find us.
         self.register_onion_circuit(&relay_path, cookie)?;
+        // Δ2-c: sign + DHT-key the ad under a per-service EPHEMERAL pseudo
+        // identity (derived from this service's registration keypair, minted by
+        // register_onion_circuit above), NOT our sovereign node_id — otherwise
+        // the ad would publicly link our identity to our live rendezvous point,
+        // defeating the blinded descriptor's unlinkability.
+        let ephemeral_ad_identity = lock!(self.anonymity.onion_services)
+            .iter()
+            .find(|e| e.cookie == cookie)
+            .and_then(|e| {
+                veil_anonymity::rendezvous::EphemeralAdIdentity::from_b64_keypair(
+                    e.reg_keypair.public_key.clone(),
+                    e.reg_keypair.private_key.clone(),
+                    veil_types::SignatureAlgorithm::Ed25519,
+                )
+            });
         service_tasks::rendezvous_register_publisher(
             &self.anonymity,
             &r,
             cookie,
             DEFAULT_FRESHNESS_WINDOW_SECS,
+            ephemeral_ad_identity,
         );
 
         // Also publish a BLINDED descriptor (3c): identity-unlinkable in the DHT.

@@ -695,7 +695,27 @@ impl NodeRuntime {
         let n_slots = snapshot.len().min(MAX_RENDEZVOUS_AD_SLOTS as usize);
         let mut published = 0usize;
         for (idx, entry) in snapshot.iter().take(n_slots).enumerate() {
-            let dht_key = rendezvous_ad_dht_key_at(&receiver_node_id, idx as u8);
+            // Δ2-c: a LOCATION-ANONYMOUS service signs + DHT-keys its ad under a
+            // per-service PSEUDO identity, so the ad never reveals the sovereign
+            // node_id (which would link the identity to its live rendezvous
+            // point). A plain rendezvous receiver uses the sovereign identity (so
+            // senders discover the ad by its real node_id).
+            let (ad_node_id, issuer_pk, issuer_sk, issuer_algo) =
+                match &entry.ephemeral_ad_identity {
+                    Some(eph) => (
+                        eph.pseudo_node_id,
+                        eph.public_key.as_str(),
+                        eph.private_key.as_str(),
+                        eph.algo,
+                    ),
+                    None => (
+                        receiver_node_id,
+                        local_identity.public_key.as_str(),
+                        local_identity.private_key.as_str(),
+                        local_identity.algo,
+                    ),
+                };
+            let dht_key = rendezvous_ad_dht_key_at(&ad_node_id, idx as u8);
             // Slot-level freshness check.
             if let Some(existing_bytes) = dht.get_local(&dht_key)
                 && let Ok(ad) = decode_rendezvous_ad(&existing_bytes)
@@ -724,15 +744,22 @@ impl NodeRuntime {
             // v2 (relay-bound): per-replica token signed by entry.rendezvous_node_id.
             // Each ad carries a token that only its own replica accepts;
             // a malicious relay observing one cannot replay to another.
-            let cap_token = mint_capability_token_for_ad(
-                local_identity,
-                entry.rendezvous_node_id,
-                valid_from,
-                valid_until,
-                logger,
-            );
+            // Δ2-c: a pseudo-signed (onion-service) ad skips the capability token
+            // — it is discovered via the blinded descriptor, not by mailbox PUTs,
+            // and the token mint requires the sovereign HandshakeIdentity anyway.
+            let cap_token = if entry.ephemeral_ad_identity.is_some() {
+                Vec::new()
+            } else {
+                mint_capability_token_for_ad(
+                    local_identity,
+                    entry.rendezvous_node_id,
+                    valid_from,
+                    valid_until,
+                    logger,
+                )
+            };
             let bytes = match sign_rendezvous_ad(
-                receiver_node_id,
+                ad_node_id,
                 entry.rendezvous_node_id,
                 entry.auth_cookie,
                 receiver_x25519_pk,
@@ -741,9 +768,9 @@ impl NodeRuntime {
                 &entry.push_envelope, // .10: empty when no push registered
                 &cap_token,
                 &entry.wake_hmac_envelope, // .10 slice 4.3.2: empty until receiver opts in via IPC (slice 4.3.3)
-                &local_identity.public_key,
-                &local_identity.private_key,
-                local_identity.algo,
+                issuer_pk,
+                issuer_sk,
+                issuer_algo,
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -1147,6 +1174,7 @@ mod tests {
             validity_window_secs: 24 * 3600,
             push_envelope: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            ephemeral_ad_identity: None,
         }]));
 
         let count =
@@ -1190,6 +1218,7 @@ mod tests {
             validity_window_secs: 3600,
             push_envelope: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            ephemeral_ad_identity: None,
         }]));
 
         let n = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger);
@@ -1251,6 +1280,7 @@ mod tests {
             validity_window_secs: 24 * 3600,
             push_envelope: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            ephemeral_ad_identity: None,
         }]));
 
         // First tick — publishes.
@@ -1268,6 +1298,59 @@ mod tests {
             bytes_after_first, bytes_after_second,
             "DHT bytes must be unchanged when republish was skipped"
         );
+    }
+
+    /// diff-audit Δ2-c: an onion-service ad (ephemeral_ad_identity = Some) is
+    /// signed + DHT-keyed under the PSEUDO node_id, never the sovereign one — so
+    /// it cannot be found by enumerating the service's real node_id, and does not
+    /// link the identity to its live rendezvous point.
+    #[test]
+    fn delta2c_onion_service_ad_keyed_under_pseudo_not_sovereign() {
+        use veil_anonymity::rendezvous::{
+            EphemeralAdIdentity, RendezvousPublisherEntry, decode_rendezvous_ad,
+            rendezvous_ad_dht_key,
+        };
+
+        let identity = fresh_identity();
+        let sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let dht = Arc::new(KademliaService::new(*identity.node_id.as_bytes()));
+        let logger = Arc::new(NodeLogger::new_noop());
+
+        // Per-service registration key → ephemeral pseudo identity.
+        let reg = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+        let eph = EphemeralAdIdentity::from_b64_keypair(
+            reg.public_key.clone(),
+            reg.private_key.clone(),
+            veil_types::SignatureAlgorithm::Ed25519,
+        )
+        .expect("derive pseudo");
+        let pseudo = eph.pseudo_node_id;
+        assert_ne!(pseudo, *identity.node_id.as_bytes(), "pseudo != sovereign");
+
+        let entries = Arc::new(Mutex::new(vec![RendezvousPublisherEntry {
+            rendezvous_node_id: [0xAA; 32],
+            auth_cookie: [0xBB; 16],
+            validity_window_secs: 24 * 3600,
+            push_envelope: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            ephemeral_ad_identity: Some(eph),
+        }]));
+
+        let n = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger);
+        assert_eq!(n, 1);
+
+        // The ad is NOT at the sovereign node_id's key (no identity leak)...
+        assert!(
+            dht.get_local(&rendezvous_ad_dht_key(identity.node_id.as_bytes()))
+                .is_none(),
+            "ad must NOT be published under the sovereign node_id",
+        );
+        // ...but IS at the pseudo's key, and binds receiver_node_id = pseudo.
+        let bytes = dht
+            .get_local(&rendezvous_ad_dht_key(&pseudo))
+            .expect("ad under pseudo key");
+        let ad = decode_rendezvous_ad(&bytes).expect("decode");
+        assert_eq!(ad.receiver_node_id, pseudo);
     }
 
     /// every tick republishes — even when nothing changed
