@@ -3416,6 +3416,71 @@ impl NodeRuntime {
         )
     }
 
+    /// Register this node as a LOCATION-anonymous service (onion-registration,
+    /// the prod entry point). Picks a rendezvous relay R + `hop_count - 1`
+    /// intermediate relays from the local relay directory, builds an onion
+    /// circuit to R (registering a fresh cookie over it — `register_onion_circuit`,
+    /// so R never learns our location), and publishes a `RendezvousAd` at
+    /// (R, cookie, our x25519) so clients can reach us. The circuit is kept alive
+    /// by the maintenance tick. `hop_count` is the circuit length (≥ 2 to hide
+    /// our location from R itself; clamped to ≥ 2). Returns the published cookie.
+    pub fn register_onion_service(
+        &self,
+        hop_count: usize,
+    ) -> std::result::Result<[u8; 16], veil_types::AnonOnionSendError> {
+        use rand_core::{OsRng, RngCore};
+        use veil_anonymity::directory::{
+            DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
+        };
+        use veil_types::AnonOnionSendError;
+
+        let hop_count = hop_count.max(2);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // R: a connected, published rendezvous-capable relay (the terminus).
+        let r = service_tasks::pick_rendezvous_relay(&self.live_sessions, &self.dht, &[])
+            .ok_or(AnonOnionSendError::NoRelays)?;
+
+        // Intermediate hops: other published relays, distinct from R.
+        let candidates: Vec<[u8; 32]> = self
+            .dht
+            .routing_table_contacts()
+            .into_iter()
+            .map(|c| c.node_id)
+            .filter(|n| *n != r)
+            .collect();
+        let dht = std::sync::Arc::clone(&self.dht);
+        let mids: Vec<[u8; 32]> = discover_relay_hops(
+            &candidates,
+            |n| dht.get_local(&relay_directory_dht_key(n)),
+            now_unix,
+            DEFAULT_FRESHNESS_WINDOW_SECS,
+        )
+        .into_iter()
+        .map(|d| d.hop.node_id)
+        .take(hop_count - 1)
+        .collect();
+        if mids.len() < hop_count - 1 {
+            return Err(AnonOnionSendError::NoRelays); // not enough relays to hide from R
+        }
+
+        // relay_path = [intermediate…, R].
+        let mut relay_path = mids;
+        relay_path.push(r);
+
+        let mut cookie = [0u8; 16];
+        OsRng.fill_bytes(&mut cookie);
+
+        // Build + register the circuit (no session register — that is the leak).
+        self.access().register_onion_circuit(&relay_path, cookie)?;
+        // Publish the ad so clients can find us (R, cookie, our x25519).
+        self.register_rendezvous_publisher(r, cookie, DEFAULT_FRESHNESS_WINDOW_SECS);
+        Ok(cookie)
+    }
+
     /// same as [`Self::register_rendezvous_publisher`] but
     /// associates a sealed push envelope with the publication. The
     /// envelope (FCM/APNs token sealed for a trusted push-relay) is
