@@ -207,6 +207,14 @@ pub struct AnonymityState {
     /// reply-send path. Bounded + TTL'd; the block never leaves the daemon.
     pub reply_block_store: Arc<ReplyBlockStore>,
 
+    /// AuthDeliver (sender, nonce) replay cache. PERSISTENT across config reload
+    /// (diff-audit Δ2-b): the auth-deliver task is re-spawned on reload, and
+    /// before this lived task-locally — so a reload reset the replay window,
+    /// briefly re-opening it for captured ciphertexts (the Introduce cache was
+    /// already preserved this way; this brings parity). Interior-mutable
+    /// (`check_and_record(&self, ..)`), so it shares fine behind `Arc`.
+    pub auth_deliver_replay_cache: Arc<veil_identity::auth_deliver::AuthDeliverReplayCache>,
+
     /// Active location-anonymous services this node hosts (onion-registration):
     /// the `(relay_path, cookie)` + last-build time of each, so the maintenance
     /// tick can REBUILD the circuit before its TTL lapses (the circuit is
@@ -261,6 +269,9 @@ impl AnonymityState {
             rendezvous_publisher_entries: Arc::new(Mutex::new(Vec::new())),
             relay_reputation: Arc::new(RelayReputation::new()),
             reply_block_store: Arc::new(ReplyBlockStore::new()),
+            auth_deliver_replay_cache: Arc::new(
+                veil_identity::auth_deliver::AuthDeliverReplayCache::new(),
+            ),
             onion_services: Arc::new(Mutex::new(Vec::new())),
             onion_service_hops,
             pinned_rendezvous_relays,
