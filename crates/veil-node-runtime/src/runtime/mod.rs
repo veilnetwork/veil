@@ -6127,11 +6127,15 @@ impl NodeServices {
     /// `RendezvousAd` at (R, cookie, our x25519). The maintenance tick keeps the
     /// circuit alive. `hop_count` is clamped to ≥ 2 so R itself can't see us.
     /// Returns the published cookie.
-    pub fn register_onion_service(
+    /// Pick an onion relay path first→terminus: a connected+published rendezvous
+    /// relay R (the terminus = `relay_path.last()`) + `hop_count - 1` intermediate
+    /// published relays from the local directory, distinct from R. `hop_count` is
+    /// clamped to ≥ 2 so R itself can't see us. Errors `NoRelays` when there
+    /// aren't enough published relays.
+    pub(crate) fn select_onion_relay_path(
         &self,
         hop_count: usize,
-    ) -> std::result::Result<[u8; 16], veil_types::AnonOnionSendError> {
-        use rand_core::{OsRng, RngCore};
+    ) -> std::result::Result<Vec<[u8; 32]>, veil_types::AnonOnionSendError> {
         use veil_anonymity::directory::{
             DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
         };
@@ -6142,10 +6146,8 @@ impl NodeServices {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-
         let r = service_tasks::pick_rendezvous_relay(&self.live_sessions, &self.dht, &[])
             .ok_or(AnonOnionSendError::NoRelays)?;
-
         let candidates: Vec<[u8; 32]> = self
             .dht
             .routing_table_contacts()
@@ -6167,9 +6169,20 @@ impl NodeServices {
         if mids.len() < hop_count - 1 {
             return Err(AnonOnionSendError::NoRelays); // not enough relays to hide from R
         }
-
         let mut relay_path = mids;
         relay_path.push(r);
+        Ok(relay_path)
+    }
+
+    pub fn register_onion_service(
+        &self,
+        hop_count: usize,
+    ) -> std::result::Result<[u8; 16], veil_types::AnonOnionSendError> {
+        use rand_core::{OsRng, RngCore};
+        use veil_anonymity::directory::DEFAULT_FRESHNESS_WINDOW_SECS;
+
+        let relay_path = self.select_onion_relay_path(hop_count)?;
+        let r = *relay_path.last().expect("non-empty relay path");
         let mut cookie = [0u8; 16];
         OsRng.fill_bytes(&mut cookie);
 
@@ -6303,33 +6316,41 @@ impl NodeServices {
                         return Err(veil_anonymity::sender::SenderError::MissingReplyCapability);
                     }
                 };
-                // Pick a rendezvous relay we're connected to + that's published,
-                // and register R-locally under a fresh one-time cookie (no ad).
-                let relay =
-                    service_tasks::pick_rendezvous_relay(&self.live_sessions, &self.dht, &[])
-                        .ok_or(
+                // Register the reply cookie over an ONION CIRCUIT to R_a (not a
+                // direct session), so R_a never learns OUR location either (1c) —
+                // the same location-hiding the onion-service registration gives.
+                // No ad is published: the signed reply block IS the private
+                // descriptor sent to the replier. Ephemeral (build-once, no
+                // maintenance entry) — the reply happens within the block's TTL.
+                const REPLY_CIRCUIT_HOPS: usize = 2;
+                let relay_path =
+                    self.select_onion_relay_path(REPLY_CIRCUIT_HOPS)
+                        .map_err(|_| {
                             veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
-                                need: 1,
+                                need: REPLY_CIRCUIT_HOPS,
                                 have: 0,
-                            },
-                        )?;
+                            }
+                        })?;
+                let relay = *relay_path.last().expect("non-empty relay path");
                 let mut cookie = [0u8; 16];
                 rand_core::OsRng.fill_bytes(&mut cookie);
-                service_tasks::rendezvous_register_with(
-                    &self.session_tx_registry,
-                    &self.anonymity,
-                    &relay,
-                    cookie,
-                );
+                self.build_onion_circuit_once(&relay_path, cookie)
+                    .map_err(|_| {
+                        veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                            need: REPLY_CIRCUIT_HOPS,
+                            have: 0,
+                        }
+                    })?;
                 Some(veil_proto::ReplyBlock {
                     rendezvous_node_id: relay,
                     auth_cookie: cookie,
                     x25519_pk,
                     reply_app_id,
                     reply_endpoint_id,
-                    // The relay keys our registration by our TRANSPORT node_id
-                    // (the session peer id), so the replier must address that —
-                    // NOT our sovereign sender id.
+                    // Circuit-backed: R_a forwards the reply DOWN our circuit by
+                    // COOKIE alone, so this transport id is now unused on the
+                    // circuit path (kept for wire compatibility / the legacy
+                    // session path).
                     receiver_node_id: *self.identity.local_identity.node_id.as_bytes(),
                 })
             }
