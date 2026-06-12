@@ -10,6 +10,7 @@
 //! installs or peels circuit state; it is pure encode/decode framing.
 
 use crate::circuit::CircuitError;
+use crate::circuit_data::CIRCUIT_PAYLOAD_BYTES;
 
 /// Per-link circuit identifier. Scoped to a single (link, direction) — each hop
 /// re-tags `circuit_id_in → circuit_id_out`, so the same circuit shows a
@@ -43,9 +44,14 @@ impl CircuitDataPayload {
     pub const HEADER_LEN: usize = 4 + 4 + 2;
 
     pub fn encode(&self) -> Result<Vec<u8>, CircuitError> {
-        if self.ciphertext.len() > MAX_CIRCUIT_DATA_CIPHERTEXT {
+        // diff-audit Δ2-f: every circuit data cell carries EXACTLY the fixed
+        // payload size — `wrap_payload` pads to it and the XOR layers are
+        // length-preserving, so legitimate cells are always this size. Enforce it
+        // (rather than the old `<= MAX` cap) so a variable-length cell can never
+        // reach the wire as a size-correlation fingerprint for a passive observer.
+        if self.ciphertext.len() != CIRCUIT_PAYLOAD_BYTES {
             return Err(CircuitError::Malformed(format!(
-                "circuit data ciphertext {} > MAX {MAX_CIRCUIT_DATA_CIPHERTEXT}",
+                "circuit data ciphertext {} != fixed {CIRCUIT_PAYLOAD_BYTES}",
                 self.ciphertext.len()
             )));
         }
@@ -68,9 +74,10 @@ impl CircuitDataPayload {
         let circuit_id = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]);
         let seq = u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]);
         let len = u16::from_be_bytes([blob[8], blob[9]]) as usize;
-        if len > MAX_CIRCUIT_DATA_CIPHERTEXT {
+        // Δ2-f: reject any cell that is not the fixed payload size (see `encode`).
+        if len != CIRCUIT_PAYLOAD_BYTES {
             return Err(CircuitError::Malformed(format!(
-                "circuit data ciphertext_len {len} > MAX {MAX_CIRCUIT_DATA_CIPHERTEXT}"
+                "circuit data ciphertext_len {len} != fixed {CIRCUIT_PAYLOAD_BYTES}"
             )));
         }
         if blob.len() < Self::HEADER_LEN + len {
@@ -126,25 +133,38 @@ mod tests {
 
     #[test]
     fn circuit_data_roundtrip() {
+        let mut ciphertext = vec![0u8; CIRCUIT_PAYLOAD_BYTES];
+        ciphertext[..5].copy_from_slice(&[1, 2, 3, 4, 5]);
         let p = CircuitDataPayload {
             circuit_id: 0xDEAD_BEEF,
             seq: 42,
-            ciphertext: vec![1, 2, 3, 4, 5],
+            ciphertext,
         };
         let enc = p.encode().unwrap();
+        assert_eq!(
+            enc.len(),
+            CircuitDataPayload::HEADER_LEN + CIRCUIT_PAYLOAD_BYTES
+        );
         assert_eq!(CircuitDataPayload::decode(&enc).unwrap(), p);
     }
 
     #[test]
-    fn circuit_data_empty_ciphertext_roundtrip() {
-        let p = CircuitDataPayload {
+    fn circuit_data_rejects_non_fixed_size_delta2f() {
+        // Δ2-f: only the fixed cell size is valid on the wire — an empty or
+        // otherwise-sized ciphertext is rejected at encode AND decode.
+        let empty = CircuitDataPayload {
             circuit_id: 1,
             seq: 0,
             ciphertext: vec![],
         };
-        let enc = p.encode().unwrap();
-        assert_eq!(enc.len(), CircuitDataPayload::HEADER_LEN);
-        assert_eq!(CircuitDataPayload::decode(&enc).unwrap(), p);
+        assert!(empty.encode().is_err(), "empty ciphertext must be rejected");
+        // A hand-built blob declaring a non-fixed length is rejected at decode.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_be_bytes());
+        blob.extend_from_slice(&0u32.to_be_bytes());
+        blob.extend_from_slice(&(100u16).to_be_bytes());
+        blob.extend_from_slice(&[0u8; 100]);
+        assert!(CircuitDataPayload::decode(&blob).is_err());
     }
 
     #[test]
@@ -160,11 +180,12 @@ mod tests {
     #[test]
     fn circuit_data_rejects_truncated() {
         assert!(CircuitDataPayload::decode(&[0u8; 3]).is_err());
-        // Header claims 10 bytes of ciphertext but body is empty.
+        // Header declares the fixed size but the body is truncated.
         let mut blob = Vec::new();
         blob.extend_from_slice(&7u32.to_be_bytes());
         blob.extend_from_slice(&0u32.to_be_bytes());
-        blob.extend_from_slice(&10u16.to_be_bytes());
+        blob.extend_from_slice(&(CIRCUIT_PAYLOAD_BYTES as u16).to_be_bytes());
+        blob.extend_from_slice(&[0u8; 8]); // far short of CIRCUIT_PAYLOAD_BYTES
         assert!(CircuitDataPayload::decode(&blob).is_err());
     }
 
