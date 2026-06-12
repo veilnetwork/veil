@@ -832,6 +832,20 @@ impl FrameDispatcher {
         let Some(circuit) = reg.lookup(&intro.auth_cookie) else {
             return false;
         };
+        // Δ2-g1: drop a byte-identical replayed introduce before it consumes
+        // circuit bandwidth. Fingerprint the (public cookie ‖ sealed ciphertext);
+        // the ciphertext is AEAD so an on-path attacker can't mutate it to dodge
+        // the fingerprint. (Duplicate DELIVERY is already blocked downstream by
+        // the receiver's introduce replay cache; this closes the amplification.)
+        let fp: [u8; 32] = {
+            let mut h = blake3::Hasher::new();
+            h.update(&intro.auth_cookie);
+            h.update(&intro.ciphertext);
+            *h.finalize().as_bytes()
+        };
+        if lock!(self.circuit_introduce_seen).check_and_insert(fp) {
+            return false; // already forwarded this exact introduce recently
+        }
         // Frame the introduce into a FIXED-SIZE cell, then apply R's (terminus)
         // return layer; intermediate hops add theirs, the originator peels all.
         let mut buf = match wrap_payload(&intro.ciphertext) {
