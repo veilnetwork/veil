@@ -382,7 +382,11 @@ mod tests {
         // SATURATE to None — never wrap back to a reused (key, dir, seq).
         c.set_return_seq_for_test(u32::MAX - 1);
         assert_eq!(c.alloc_return_seq(), Some(u32::MAX - 1));
-        assert_eq!(c.alloc_return_seq(), None, "exhausted — must not wrap + reuse");
+        assert_eq!(
+            c.alloc_return_seq(),
+            None,
+            "exhausted — must not wrap + reuse"
+        );
         assert_eq!(c.alloc_return_seq(), None, "stays exhausted");
     }
 

@@ -564,8 +564,7 @@ impl FrameDispatcher {
         let is_ir = magic == Some(&veil_proto::instance_registry::INSTANCE_REGISTRY_MAGIC[..]);
         let is_mc = magic == Some(&veil_proto::mlkem_cert::MLKEM_CERT_MAGIC[..]);
         let is_sb = magic == Some(&veil_bootstrap::SIGNED_BUNDLE_MAGIC[..]);
-        let is_desc =
-            magic == Some(&veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC[..]);
+        let is_desc = magic == Some(&veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC[..]);
 
         if is_sb {
             // Signed operator bootstrap bundle (cf. `veil-bootstrap::

@@ -216,10 +216,7 @@ where
     let (host, port) = timeout(HEADER_TIMEOUT, read_proxy_header(&mut veil_r))
         .await
         .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "proxy header read timed out",
-            )
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy header read timed out")
         })??;
 
     // resolve host → IPs and pick the first non-forbidden one.
