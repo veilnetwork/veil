@@ -341,6 +341,30 @@ final int Function(Pointer<VeilHandle>, int, Pointer<Pointer<Utf8>>)
 
 final int Function(
   Pointer<VeilHandle>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilSendToOnionService = nativeLib
+    .lookup<
+            NativeFunction<
+                Int32 Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Uint32,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_send_to_onion_service')
+    .asFunction();
+
+final int Function(
+  Pointer<VeilHandle>,
   int,
   Pointer<Pointer<Utf8>>,
 ) veilSetBackgroundMode = nativeLib

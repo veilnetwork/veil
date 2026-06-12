@@ -197,6 +197,51 @@ class VeilClient implements Finalizable {
     });
   }
 
+  /// Send [data] to a LOCATION-anonymous (onion) service addressed by its
+  /// Ed25519 IDENTITY key ([serviceIdentityVk], 32 bytes — a `.onion`-like
+  /// handle), NOT its node_id. The daemon resolves the service's unlinkable
+  /// per-period blinded descriptor, decrypts it (we know the identity), and
+  /// routes over an onion circuit. [hopCount] is clamped to ≥ 2 by the daemon.
+  /// Fire-and-forget (no end-to-end ack); throws on rejection (e.g. no
+  /// resolvable descriptor — the service is offline or hasn't published).
+  Future<void> sendToOnionService({
+    required Uint8List serviceIdentityVk,
+    required Uint8List targetAppId,
+    required int targetEndpointId,
+    required Uint8List data,
+    int hopCount = 3,
+  }) async {
+    _ensureOpen();
+    if (serviceIdentityVk.length != 32 || targetAppId.length != 32) {
+      throw ArgumentError('service_identity_vk and target_app_id must be 32 bytes');
+    }
+    return Future(() {
+      final idVk = calloc<Uint8>(32);
+      final appId = calloc<Uint8>(32);
+      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        idVk.asTypedList(32).setAll(0, serviceIdentityVk);
+        appId.asTypedList(32).setAll(0, targetAppId);
+        if (data.isNotEmpty) {
+          dataPtr.asTypedList(data.length).setAll(0, data);
+        }
+        final rc = ffi.veilSendToOnionService(_handle, idVk, appId,
+            targetEndpointId, hopCount, dataPtr, data.length, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+              'send_to_onion_service failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+      } finally {
+        calloc.free(idVk);
+        calloc.free(appId);
+        if (dataPtr != nullptr) calloc.free(dataPtr);
+        calloc.free(errOut);
+      }
+    });
+  }
+
   /// Consume a bootstrap-invite URI (Epic 489.7) — typically scanned
   /// from a QR code or pasted from a sharing channel.  The daemon
   /// decodes plain / encrypted / signed formats automatically and

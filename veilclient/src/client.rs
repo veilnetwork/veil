@@ -419,6 +419,9 @@ pub(crate) struct DispatchTable {
     /// Pending oneshot replies for `RegisterOnionService` (2-byte status; 0=ok).
     pub pending_register_onion_service:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
+    /// Pending oneshot replies for `SendToOnionService` (2-byte status; 0=ok).
+    pub pending_send_to_onion_service:
+        std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
     ///.4 P2: pending oneshot replies for `MailboxPut`.
     pub pending_mailbox_put:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<MailboxPutReply>>,
@@ -544,6 +547,7 @@ impl DispatchTable {
             pending_set_push_envelope: std::collections::VecDeque::new(),
             pending_set_wake_hmac_envelope: std::collections::VecDeque::new(),
             pending_register_onion_service: std::collections::VecDeque::new(),
+            pending_send_to_onion_service: std::collections::VecDeque::new(),
             pending_mailbox_put: std::collections::VecDeque::new(),
             pending_mailbox_fetch: std::collections::VecDeque::new(),
             pending_mailbox_ack: std::collections::VecDeque::new(),
@@ -960,6 +964,55 @@ impl VeilClient {
             Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
             Err(_) => Err(ClientError::Protocol(
                 "timeout waiting for RegisterOnionServiceResult".into(),
+            )),
+        }
+    }
+
+    /// Send `data` to a LOCATION-anonymous (onion) service addressed by its
+    /// Ed25519 IDENTITY key (a `.onion`-like handle), NOT its node_id. The daemon
+    /// resolves the service's unlinkable per-period blinded descriptor, decrypts
+    /// it (we know the identity), and routes the message over an onion circuit.
+    /// `hop_count` is clamped to ≥ 2 by the daemon. `Ok(())` once the daemon hands
+    /// the cell to the first hop (fire-and-forget — NOT delivery-confirmed); a
+    /// non-zero status maps to an error (e.g. no resolvable descriptor — the
+    /// service is offline or hasn't published).
+    pub async fn send_to_onion_service(
+        &self,
+        service_identity_vk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        hop_count: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_send_to_onion_service);
+            if d.pending_send_to_onion_service.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(format!(
+                    "send_to_onion_service queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
+                )));
+            }
+            d.pending_send_to_onion_service.push_back(tx);
+        }
+        let payload = veilcore::proto::SendToOnionServicePayload {
+            service_identity_vk,
+            target_app_id,
+            target_endpoint_id,
+            hop_count,
+            data: data.to_vec(),
+        };
+        self.writer
+            .write_frame(LocalAppMsg::SendToOnionService as u16, &payload.encode())
+            .await?;
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(code)) => Err(ClientError::Protocol(format!(
+                "send_to_onion_service rejected by daemon (status {code})"
+            ))),
+            Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
+            Err(_) => Err(ClientError::Protocol(
+                "timeout waiting for SendToOnionServiceResult".into(),
             )),
         }
     }
@@ -2222,6 +2275,13 @@ async fn reader_task(
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
                 if let Some(tx) = pop_next_open(&mut d.pending_register_onion_service) {
+                    let _ = tx.send(status);
+                }
+            }
+            LocalAppMsg::SendToOnionServiceResult if body.len() >= 2 => {
+                let status = u16::from_be_bytes([body[0], body[1]]);
+                let mut d = dispatch.lock().await;
+                if let Some(tx) = pop_next_open(&mut d.pending_send_to_onion_service) {
                     let _ = tx.send(status);
                 }
             }

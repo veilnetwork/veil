@@ -718,6 +718,33 @@ VeilStreamFfi *veil_stream_open(VeilApp *app,
  int veil_register_onion_service(VeilHandle *handle, uint32_t hop_count, char **err_out) ;
 
 /**
+ * Send `data` to a LOCATION-anonymous (onion) service addressed by its Ed25519
+ * IDENTITY key (`service_identity_vk`, 32 bytes — a `.onion`-like handle), NOT
+ * its node_id. The daemon resolves the service's unlinkable per-period blinded
+ * descriptor, decrypts it (the caller knows the identity), and routes the
+ * message over an onion circuit. `hop_count` is clamped to ≥ 2 by the daemon.
+ *
+ * `VEIL_OK` once the daemon hands the cell to the first hop (fire-and-forget —
+ * NOT delivery-confirmed); `VEIL_ERR` with a detail otherwise (e.g. no
+ * resolvable descriptor — the service is offline or hasn't published).
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*`; `service_identity_vk` and
+ * `target_app_id` must each be readable for 32 bytes; `data` must be readable
+ * for `len` bytes (or NULL iff `len == 0`).
+ */
+
+int veil_send_to_onion_service(VeilHandle *handle,
+                               const uint8_t *service_identity_vk,
+                               const uint8_t *target_app_id,
+                               uint32_t target_endpoint_id,
+                               uint32_t hop_count,
+                               const uint8_t *data,
+                               size_t len,
+                               char **err_out)
+;
+
+/**
  * Deposit `blob` for an offline `receiver_id` at the daemon's mailbox
  *. No `auth_cookie` required.
  *
