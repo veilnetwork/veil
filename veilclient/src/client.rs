@@ -105,6 +105,15 @@ impl SharedWriter {
             .map_err(|_| ClientError::ConnectionClosed)
     }
 
+    /// Non-blocking frame send for sync contexts (e.g. `AsyncRead::poll_read`
+    /// emitting STREAM_WINDOW credit, which cannot await). Returns `true` if the
+    /// frame was queued; `false` if the channel is full or closed — the caller
+    /// keeps the pending amount and retries on a later poll, so no credit is
+    /// lost.
+    pub(crate) fn try_send_frame(&self, msg_type: u16, body: &[u8]) -> bool {
+        self.tx.try_send(encode_frame(msg_type, body)).is_ok()
+    }
+
     /// Zero-data-copy variant: caller supplies a `Vec<u8>` that already
     /// has [`APP_IPC_SEND_PREFIX_BYTES`] uninit bytes reserved at the
     /// FRONT, followed by the IP packet (or other datagram payload).
@@ -2201,8 +2210,13 @@ async fn reader_task(
                     if let Some(q) = d.inbound_streams.get(&p.endpoint_id).cloned() {
                         d.streams.insert(p.stream_id, data_tx);
                         drop(d); // release lock before sending.
-                        let veil_stream =
-                            crate::stream::VeilStream::new(p.stream_id, writer.clone(), data_rx);
+                        // Acceptor (B) side: credits STREAM_WINDOW so the daemon
+                        // refills the A→B flow-control window (diff-audit H5).
+                        let veil_stream = crate::stream::VeilStream::new_acceptor(
+                            p.stream_id,
+                            writer.clone(),
+                            data_rx,
+                        );
                         let incoming = crate::handle::IncomingStream {
                             stream: veil_stream,
                             src_node_id: p.src_node_id,
