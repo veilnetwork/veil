@@ -191,6 +191,19 @@ impl CircuitTable {
         if g.per_link.get(&prev_link).copied().unwrap_or(0) >= self.max_per_link {
             return Err(InstallError::PerLinkFull);
         }
+        // Backward-index dedup (diff-audit S1/M1): `bwd` is the ONLY index used to
+        // route RETURN cells. `circuit_id_out` is an originator-chosen u32, so two
+        // circuits through this relay toward the same `next_link` can collide. A
+        // silent overwrite (the old behaviour) would (a) misroute the first
+        // circuit's return traffic to the second's state, and (b) let EITHER
+        // circuit's teardown delete the shared `(nl, cid_out)` key, breaking the
+        // survivor's return path. Reject the collision instead — checked before
+        // any mutation so `install` stays atomic.
+        if let Some(nl) = next_link
+            && g.bwd.contains_key(&(nl, install.circuit_id_out))
+        {
+            return Err(InstallError::Duplicate);
+        }
         let state = std::sync::Arc::new(CircuitState::from_install(
             install, prev_link, next_link, now,
         ));
@@ -347,12 +360,45 @@ mod tests {
             Err(InstallError::PerLinkFull)
         ));
         // A different link still works until the GLOBAL cap (3) is hit.
-        t.install(&inst(1, 1, 1), [2u8; 32], Some([9u8; 32]), 0)
+        // Distinct cid_out (3) so it doesn't collide on the backward index with
+        // the (next=[9], cid_out=1) circuit installed above — the cap, not a
+        // bwd collision, is what this asserts.
+        t.install(&inst(1, 3, 1), [2u8; 32], Some([9u8; 32]), 0)
             .unwrap();
         assert!(matches!(
-            t.install(&inst(1, 1, 1), [3u8; 32], Some([9u8; 32]), 0),
+            t.install(&inst(1, 4, 1), [3u8; 32], Some([9u8; 32]), 0),
             Err(InstallError::TableFull)
         ));
+    }
+
+    #[test]
+    fn rejects_backward_index_collision() {
+        // Two circuits through this relay toward the SAME next_link with the SAME
+        // originator-chosen circuit_id_out, but distinct (prev_link, cid_in). The
+        // forward dedup does NOT catch this; the backward-index dedup must — else
+        // the first circuit's return route is silently overwritten and a later
+        // teardown of either breaks the survivor (diff-audit S1/M1).
+        let t = CircuitTable::new();
+        let next = [9u8; 32];
+        t.install(&inst(10, 50, 0xAA), [1u8; 32], Some(next), 0)
+            .unwrap();
+        // Same (next, cid_out=50), different (prev, cid_in) → rejected, not
+        // silently overwritten.
+        assert!(matches!(
+            t.install(&inst(20, 50, 0xBB), [2u8; 32], Some(next), 0),
+            Err(InstallError::Duplicate)
+        ));
+        // The first circuit's return route is intact and still its OWN state.
+        let b = t.lookup_backward(&next, 50).unwrap();
+        assert_eq!(b.circuit_id_in, 10);
+        assert_eq!(b.circuit_key, [0xAA; CIRCUIT_KEY_LEN]);
+        // A distinct (next, cid_out) still installs fine.
+        t.install(&inst(30, 51, 0xCC), [3u8; 32], Some(next), 0)
+            .unwrap();
+        assert_eq!(t.lookup_backward(&next, 51).unwrap().circuit_id_in, 30);
+        // And tearing it down leaves the first circuit's return route untouched.
+        t.remove(&[3u8; 32], 30);
+        assert!(t.lookup_backward(&next, 50).is_some());
     }
 
     #[test]
