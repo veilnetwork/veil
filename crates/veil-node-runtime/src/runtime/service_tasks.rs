@@ -1094,7 +1094,10 @@ impl NodeRuntime {
         let access = self.access();
         let logger = Arc::clone(&self.logger);
         let local_node_id = *self.identity.local_identity.node_id.as_bytes();
-        let replay_cache = veil_identity::auth_deliver::AuthDeliverReplayCache::new();
+        // Δ2-b: clone the PERSISTENT replay cache off AnonymityState (which
+        // survives reload) rather than building a fresh one per spawn — so a
+        // config reload no longer resets the (sender, nonce) replay window.
+        let replay_cache = Arc::clone(&self.anonymity.auth_deliver_replay_cache);
         let freshness_window = veil_identity::auth_deliver::DEFAULT_AUTH_DELIVER_FRESHNESS_SECS;
         // Reassembles fragmented authenticated messages from the rendezvous path
         // (the direct onion path delivers whole `Full` messages). Single-owner —
