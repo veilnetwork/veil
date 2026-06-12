@@ -654,7 +654,7 @@ impl FrameDispatcher {
     /// passed toward the terminus; a cell matching the BACKWARD index (arrived
     /// from `next_link`) gets ANOTHER layer and is passed toward the originator.
     fn handle_circuit_data(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
-        use veil_anonymity::circuit_data::{Direction, open_layer, seal_layer};
+        use veil_anonymity::circuit_data::{Direction, apply_layer, read_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
         let cell = match CircuitDataPayload::decode(body) {
             Ok(c) => c,
@@ -664,21 +664,13 @@ impl FrameDispatcher {
         let now = circuit_now_unix();
 
         // Relay paths — only if this node carries others' circuits (a receive-
-        // only service has no relay table but still ORIGINATES below).
+        // only service has no relay table but still ORIGINATES below). Layers are
+        // length-preserving XOR (2a) — cells are FIXED-SIZE on every link; the
+        // relay can't authenticate (no per-layer tag), so the replay window is
+        // seq-only and end-to-end integrity is the inner introduce's own AEAD.
         if let Some(table) = &self.circuit_table {
             // FORWARD cell: arrived from prev_link tagged circuit_id_in.
             if let Some(state) = table.lookup_forward(&link, cell.circuit_id) {
-                // AEAD-verify (authenticate) BEFORE advancing the replay window, so a
-                // spoofed seq can't desync the window.
-                let inner = match open_layer(
-                    &state.circuit_key,
-                    Direction::Forward,
-                    cell.seq,
-                    &cell.ciphertext,
-                ) {
-                    Ok(i) => i,
-                    Err(_) => return DispatchResult::NoResponse,
-                };
                 if !state
                     .replay_fwd
                     .lock()
@@ -688,12 +680,14 @@ impl FrameDispatcher {
                     return DispatchResult::NoResponse; // replay / too-old
                 }
                 state.touch(now);
+                let mut buf = cell.ciphertext.clone();
+                apply_layer(&state.circuit_key, Direction::Forward, cell.seq, &mut buf);
                 match state.next_link {
                     Some(nl) => {
                         let out = CircuitDataPayload {
                             circuit_id: state.circuit_id_out,
                             seq: cell.seq,
-                            ciphertext: inner,
+                            ciphertext: buf,
                         };
                         if let Ok(b) = out.encode() {
                             self.send_relay_chain_msg(
@@ -704,11 +698,11 @@ impl FrameDispatcher {
                         }
                     }
                     None => {
-                        // Terminus: `inner` is the delivered message (b4 consumes —
-                        // e.g. an introduce to forward to a registered cookie).
+                        // Terminus: the framed payload is the delivered message.
+                        let n = read_payload(&buf).map(|p| p.len()).unwrap_or(0);
                         self.logger.info(
                             "anonymity.circuit.terminus_data",
-                            format!("circuit terminus rx {} B (b4 consumes)", inner.len()),
+                            format!("circuit terminus rx {n} B"),
                         );
                     }
                 }
@@ -716,9 +710,7 @@ impl FrameDispatcher {
             }
 
             // RETURN cell: arrived from next_link tagged circuit_id_out. This relay
-            // adds its layer and passes toward the originator (prev_link). It cannot
-            // AEAD-verify (it is not the recipient), so the replay window is seq-only
-            // here; the originator does the final verify.
+            // applies its layer and passes toward the originator (prev_link).
             if let Some(state) = table.lookup_backward(&link, cell.circuit_id) {
                 if !state
                     .replay_ret
@@ -729,16 +721,12 @@ impl FrameDispatcher {
                     return DispatchResult::NoResponse;
                 }
                 state.touch(now);
-                let outer = seal_layer(
-                    &state.circuit_key,
-                    Direction::Return,
-                    cell.seq,
-                    &cell.ciphertext,
-                );
+                let mut buf = cell.ciphertext.clone();
+                apply_layer(&state.circuit_key, Direction::Return, cell.seq, &mut buf);
                 let out = CircuitDataPayload {
                     circuit_id: state.circuit_id_in,
                     seq: cell.seq,
-                    ciphertext: outer,
+                    ciphertext: buf,
                 };
                 if let Ok(b) = out.encode() {
                     self.send_relay_chain_msg(
@@ -836,7 +824,7 @@ impl FrameDispatcher {
         &self,
         intro: &veil_anonymity::rendezvous::IntroducePayload,
     ) -> bool {
-        use veil_anonymity::circuit_data::{Direction, seal_layer};
+        use veil_anonymity::circuit_data::{Direction, apply_layer, wrap_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
         let Some(reg) = &self.circuit_rendezvous else {
             return false;
@@ -844,17 +832,18 @@ impl FrameDispatcher {
         let Some(circuit) = reg.lookup(&intro.auth_cookie) else {
             return false;
         };
+        // Frame the introduce into a FIXED-SIZE cell, then apply R's (terminus)
+        // return layer; intermediate hops add theirs, the originator peels all.
+        let mut buf = match wrap_payload(&intro.ciphertext) {
+            Ok(b) => b,
+            Err(_) => return false, // introduce larger than one cell — drop
+        };
         let seq = circuit.alloc_return_seq();
-        let outer = seal_layer(
-            &circuit.circuit_key,
-            Direction::Return,
-            seq,
-            &intro.ciphertext,
-        );
+        apply_layer(&circuit.circuit_key, Direction::Return, seq, &mut buf);
         let cell = CircuitDataPayload {
             circuit_id: circuit.circuit_id_in,
             seq,
-            ciphertext: outer,
+            ciphertext: buf,
         };
         match cell.encode() {
             Ok(body) => {
@@ -1472,7 +1461,7 @@ mod tests {
     /// app — the full receiver side of an onion-registered service.
     #[tokio::test]
     async fn circuit_origin_return_opens_decrypts_and_delivers() {
-        use veil_anonymity::circuit_data::{Direction, seal_layer};
+        use veil_anonymity::circuit_data::{Direction, apply_layer, wrap_payload};
         use veil_anonymity::circuit_origin::{OriginCircuit, OriginCircuitTable};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
         use veil_anonymity::rendezvous::{encrypt_introduce, final_hop_kind};
@@ -1518,12 +1507,14 @@ mod tests {
         introduce_plain.extend_from_slice(&deliver.encode());
         let introduce_ct = encrypt_introduce(&introduce_plain, &local_pk).unwrap();
 
-        // R seals it as the first return layer and sends a CircuitData to us.
+        // R frames it into a fixed-size cell + applies its return layer.
         let seq = 1u32;
+        let mut buf = wrap_payload(&introduce_ct).unwrap();
+        apply_layer(&r_key, Direction::Return, seq, &mut buf);
         let cell = CircuitDataPayload {
             circuit_id: origin_cid,
             seq,
-            ciphertext: seal_layer(&r_key, Direction::Return, seq, &introduce_ct),
+            ciphertext: buf,
         };
         let body = cell.encode().unwrap();
         let mut hdr = FrameHeader::new(

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use rand_core::{OsRng, RngCore};
 
 use crate::circuit::CircuitError;
-use crate::circuit_data::{Direction, open_layers};
+use crate::circuit_data::{Direction, apply_layers, read_payload};
 use crate::circuit_setup::{CIRCUIT_KEY_LEN, CircuitSetupHop, build_circuit_setup};
 use crate::circuit_wire::CircuitId;
 
@@ -44,11 +44,15 @@ pub struct OriginCircuit {
 }
 
 impl OriginCircuit {
-    /// Open a return cell (introduce forwarded down the circuit): peel ALL N
-    /// accreted layers with the ordered circuit keys. The result is the inner
-    /// payload the terminus sent (e.g. a sealed introduce to decrypt next).
-    pub fn open_return(&self, seq: u32, ciphertext: &[u8]) -> Result<Vec<u8>, CircuitError> {
-        open_layers(&self.circuit_keys, Direction::Return, seq, ciphertext)
+    /// Open a return cell (introduce forwarded down the circuit): apply ALL N
+    /// circuit-key layers (XOR, fixed-size) then read the framed payload back
+    /// out. The result is the inner payload the terminus sent (e.g. a sealed
+    /// introduce to decrypt next).
+    pub fn open_return(&self, seq: u32, cell: &[u8]) -> Result<Vec<u8>, CircuitError> {
+        let mut buf = cell.to_vec();
+        apply_layers(&self.circuit_keys, Direction::Return, seq, &mut buf)?;
+        read_payload(&buf)
+            .ok_or_else(|| CircuitError::Malformed("circuit return payload framing".into()))
     }
 }
 
@@ -187,7 +191,7 @@ impl Default for OriginCircuitTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::circuit_data::seal_layer;
+    use crate::circuit_data::{apply_layer, wrap_payload};
     use crate::circuit_setup::{SetupPeelResult, peel_circuit_setup};
     use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -259,13 +263,14 @@ mod tests {
         let (_env, origin) = build_origin_circuit(&[h0, h1, h2], b"", 0).unwrap();
         let k = &origin.circuit_keys;
         let seq = 5u32;
-        // Terminus seals, intermediate hops accrete toward the origin.
-        let c2 = seal_layer(&k[2], Direction::Return, seq, b"introduce-bytes");
-        let c1 = seal_layer(&k[1], Direction::Return, seq, &c2);
-        let c0 = seal_layer(&k[0], Direction::Return, seq, &c1);
-        assert_eq!(origin.open_return(seq, &c0).unwrap(), b"introduce-bytes");
-        // Wrong seq fails.
-        assert!(origin.open_return(seq + 1, &c0).is_err());
+        // Terminus wraps + applies its layer; intermediate hops apply theirs.
+        let mut cell = wrap_payload(b"introduce-bytes").unwrap();
+        apply_layer(&k[2], Direction::Return, seq, &mut cell);
+        apply_layer(&k[1], Direction::Return, seq, &mut cell);
+        apply_layer(&k[0], Direction::Return, seq, &mut cell);
+        assert_eq!(origin.open_return(seq, &cell).unwrap(), b"introduce-bytes");
+        // Wrong seq → garbage framing → error.
+        assert!(origin.open_return(seq + 1, &cell).is_err());
     }
 
     #[test]
