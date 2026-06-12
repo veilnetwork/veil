@@ -251,6 +251,7 @@ pub(crate) fn rendezvous_register_publisher(
     relay: &[u8; 32],
     cookie: [u8; 16],
     validity_window_secs: u64,
+    ephemeral_ad_identity: Option<veil_anonymity::rendezvous::EphemeralAdIdentity>,
 ) {
     let entry = veil_anonymity::rendezvous::RendezvousPublisherEntry {
         rendezvous_node_id: *relay,
@@ -258,6 +259,7 @@ pub(crate) fn rendezvous_register_publisher(
         validity_window_secs,
         push_envelope: Vec::new(),
         wake_hmac_envelope: Vec::new(),
+        ephemeral_ad_identity,
     };
     let mut entries = lock!(anonymity.rendezvous_publisher_entries);
     if let Some(pos) = entries
@@ -1248,6 +1250,10 @@ impl NodeRuntime {
                                             &relay,
                                             cookie,
                                             RENDEZVOUS_AD_VALIDITY_SECS,
+                                            // Plain rendezvous receiver: ad is
+                                            // signed under the sovereign identity
+                                            // (senders discover it by node_id).
+                                            None,
                                         );
                                         current = Some(relay);
                                         logger.info(

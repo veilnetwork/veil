@@ -1031,6 +1031,51 @@ pub struct RendezvousPublisherEntry {
     /// receiver updates via a separate IPC call (slice 4.3.3) when
     /// the underlying key rotates.
     pub wake_hmac_envelope: Vec<u8>,
+    /// Per-service EPHEMERAL signing identity (diff-audit Δ2-c). `Some` for a
+    /// LOCATION-ANONYMOUS (onion) service: the ad is signed + DHT-keyed under
+    /// this pseudo identity instead of the real sovereign node_id, so it no
+    /// longer publicly links the service identity to its live rendezvous point.
+    /// `None` for a plain rendezvous receiver (signed under the sovereign
+    /// identity, as senders discover it by the receiver's real node_id).
+    pub ephemeral_ad_identity: Option<EphemeralAdIdentity>,
+}
+
+/// A per-service ephemeral identity used to sign + DHT-key a rendezvous ad
+/// WITHOUT revealing the service's sovereign node_id (diff-audit Δ2-c). Derived
+/// from a location-anonymous service's per-service registration keypair.
+/// `pseudo_node_id == BLAKE3(public_key bytes)`, matching the ad verifier's
+/// issuer↔node_id binding, so the pseudo-signed ad verifies normally.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EphemeralAdIdentity {
+    /// `BLAKE3(decoded public_key)` — the ad's `receiver_node_id` + DHT key base.
+    pub pseudo_node_id: [u8; NODE_ID_LEN],
+    /// Base64 Ed25519 public key (the ad's issuer pk).
+    pub public_key: String,
+    /// Base64 Ed25519 private key (signs the ad).
+    pub private_key: String,
+    /// Signature algorithm (Ed25519 for onion-service registration keys).
+    pub algo: SignatureAlgorithm,
+}
+
+impl EphemeralAdIdentity {
+    /// Build from a base64 keypair; `pseudo_node_id = BLAKE3(decoded pubkey)` so
+    /// the resulting ad satisfies the verifier's issuer↔node_id binding.
+    /// `None` if the public key is not valid base64.
+    pub fn from_b64_keypair(
+        public_key: String,
+        private_key: String,
+        algo: SignatureAlgorithm,
+    ) -> Option<Self> {
+        let pk_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &public_key).ok()?;
+        let pseudo_node_id = *blake3::hash(&pk_bytes).as_bytes();
+        Some(Self {
+            pseudo_node_id,
+            public_key,
+            private_key,
+            algo,
+        })
+    }
 }
 
 /// Default window for signed RendezvousAds — 1 day. Short enough to
@@ -3214,6 +3259,7 @@ mod tests {
             validity_window_secs: 3600,
             push_envelope: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            ephemeral_ad_identity: None,
         };
         let e2 = e1.clone();
         assert_eq!(e1, e2);
