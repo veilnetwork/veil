@@ -6975,6 +6975,7 @@ impl NodeServices {
         reply_id: u64,
         data: &[u8],
         hop_count: usize,
+        src_app_id: [u8; 32],
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
         use veil_types::AnonOnionSendError;
         // Per-fragment redundancy for the fire-and-forget reply (2).
@@ -6993,7 +6994,13 @@ impl NodeServices {
         // Look up the reply block (NON-consuming — stays valid until TTL so the
         // app can retry if this reply's cell is dropped; 1b). gone/expired → no
         // reply path.
-        let Some(block) = self.anonymity.reply_block_store.peek(reply_id, now) else {
+        // D3: only the app that received the original message (and was handed
+        // this reply_id) may reply through it — peek enforces the owner binding.
+        let Some(block) = self
+            .anonymity
+            .reply_block_store
+            .peek(reply_id, src_app_id, now)
+        else {
             return Err(AnonOnionSendError::NoRendezvous);
         };
 
