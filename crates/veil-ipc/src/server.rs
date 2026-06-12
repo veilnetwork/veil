@@ -2000,8 +2000,20 @@ async fn handle_ipc_client(
                         let status: u16 = match SendToOnionServicePayload::decode(&body) {
                             Ok(p) => match anon_onion_sender.as_deref() {
                                 Some(s) => {
-                                    match s
-                                        .send_to_onion_service(
+                                    // anonymous → service sees src=[0;32]; else the
+                                    // daemon signs with our sovereign identity.
+                                    let send = if p.anonymous {
+                                        s.send_to_onion_service_anonymous(
+                                            p.service_identity_vk,
+                                            p.target_app_id,
+                                            p.target_endpoint_id,
+                                            p.src_app_id,
+                                            &p.data,
+                                            p.hop_count as usize,
+                                        )
+                                        .await
+                                    } else {
+                                        s.send_to_onion_service(
                                             p.service_identity_vk,
                                             p.target_app_id,
                                             p.target_endpoint_id,
@@ -2009,7 +2021,8 @@ async fn handle_ipc_client(
                                             p.hop_count as usize,
                                         )
                                         .await
-                                    {
+                                    };
+                                    match send {
                                         Ok(()) => 0,
                                         Err(veil_types::AnonOnionSendError::NoRelays) => {
                                             ipc_send_err::NO_ROUTE

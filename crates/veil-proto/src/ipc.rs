@@ -1629,13 +1629,22 @@ impl RegisterOnionServicePayload {
 /// App → daemon request to send to a LOCATION-anonymous service addressed by its
 /// Ed25519 IDENTITY key (the daemon resolves the per-period blinded descriptor).
 ///
+/// `anonymous` selects the delivery mode: `false` = AUTHENTICATED (the daemon
+/// signs with our sovereign identity; the service learns + verifies our
+/// node_id), `true` = ANONYMOUS (the service receives `src_node_id = [0;32]` and
+/// never learns the sender). `src_app_id` is only meaningful for the anonymous
+/// mode (it rides inside the sealed payload for the service's app-level routing);
+/// the authenticated mode ignores it.
+///
 /// Wire layout:
 /// ```text
 /// [0..32]   service_identity_vk [u8; 32]   service Ed25519 identity ("address")
 /// [32..64]  target_app_id [u8; 32]
 /// [64..68]  target_endpoint_id u32 BE
 /// [68..72]  hop_count u32 BE               circuit length; daemon clamps to ≥ 2
-/// [72..]    data                            opaque payload (tail)
+/// [72]      flags u8                       bit0 = anonymous (unauthenticated)
+/// [73..105] src_app_id [u8; 32]            anonymous mode only
+/// [105..]   data                            opaque payload (tail)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendToOnionServicePayload {
@@ -1643,11 +1652,14 @@ pub struct SendToOnionServicePayload {
     pub target_app_id: [u8; 32],
     pub target_endpoint_id: u32,
     pub hop_count: u32,
+    pub anonymous: bool,
+    pub src_app_id: [u8; 32],
     pub data: Vec<u8>,
 }
 
 impl SendToOnionServicePayload {
-    pub const FIXED_SIZE: usize = 32 + 32 + 4 + 4; // 72
+    pub const FIXED_SIZE: usize = 32 + 32 + 4 + 4 + 1 + 32; // 105
+    const FLAG_ANONYMOUS: u8 = 0x01;
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::FIXED_SIZE + self.data.len());
@@ -1655,6 +1667,12 @@ impl SendToOnionServicePayload {
         out.extend_from_slice(&self.target_app_id);
         out.extend_from_slice(&self.target_endpoint_id.to_be_bytes());
         out.extend_from_slice(&self.hop_count.to_be_bytes());
+        out.push(if self.anonymous {
+            Self::FLAG_ANONYMOUS
+        } else {
+            0
+        });
+        out.extend_from_slice(&self.src_app_id);
         out.extend_from_slice(&self.data);
         out
     }
@@ -1671,6 +1689,8 @@ impl SendToOnionServicePayload {
             target_app_id: super::read_array::<32>(buf, 32)?,
             target_endpoint_id: super::read_u32_be(buf, 64)?,
             hop_count: super::read_u32_be(buf, 68)?,
+            anonymous: buf[72] & Self::FLAG_ANONYMOUS != 0,
+            src_app_id: super::read_array::<32>(buf, 73)?,
             data: buf[Self::FIXED_SIZE..].to_vec(),
         })
     }
@@ -5008,11 +5028,14 @@ mod tests {
 
     #[test]
     fn send_to_onion_service_payload_roundtrip() {
+        // Authenticated mode (anonymous = false; src_app_id preserved on wire).
         let p = SendToOnionServicePayload {
             service_identity_vk: [0x1A; 32],
             target_app_id: [0x2B; 32],
             target_endpoint_id: 0xDEAD_BEEF,
             hop_count: 3,
+            anonymous: false,
+            src_app_id: [0x3C; 32],
             data: b"hello onion service".to_vec(),
         };
         let bytes = p.encode();
@@ -5024,22 +5047,26 @@ mod tests {
     }
 
     #[test]
-    fn send_to_onion_service_payload_empty_data_ok() {
+    fn send_to_onion_service_payload_anonymous_flag_roundtrip() {
         let p = SendToOnionServicePayload {
-            service_identity_vk: [0; 32],
-            target_app_id: [0; 32],
-            target_endpoint_id: 0,
+            service_identity_vk: [0x44; 32],
+            target_app_id: [0x55; 32],
+            target_endpoint_id: 7,
             hop_count: 2,
+            anonymous: true,
+            src_app_id: [0x66; 32],
             data: Vec::new(),
         };
         let bytes = p.encode();
         assert_eq!(bytes.len(), SendToOnionServicePayload::FIXED_SIZE);
-        assert_eq!(SendToOnionServicePayload::decode(&bytes).unwrap(), p);
+        let decoded = SendToOnionServicePayload::decode(&bytes).unwrap();
+        assert!(decoded.anonymous);
+        assert_eq!(decoded, p);
     }
 
     #[test]
     fn send_to_onion_service_payload_short_buf_errs() {
-        assert!(SendToOnionServicePayload::decode(&[0u8; 71]).is_err());
+        assert!(SendToOnionServicePayload::decode(&[0u8; 104]).is_err());
     }
 
     fn sample_auth_deliver() -> AuthAppDeliver {

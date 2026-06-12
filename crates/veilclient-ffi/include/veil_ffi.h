@@ -745,6 +745,30 @@ int veil_send_to_onion_service(VeilHandle *handle,
 ;
 
 /**
+ * Like [`veil_send_to_onion_service`], but UNAUTHENTICATED: the service receives
+ * `src_node_id = [0;32]` and never learns who sent the message. Combined with the
+ * unlinkable descriptor, neither the relays, the rendezvous relay, nor the
+ * service learn the sender's location or identity. `src_app_id` (32 bytes) rides
+ * inside the sealed payload for the service's app-level routing only.
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*`; `service_identity_vk`, `target_app_id`,
+ * and `src_app_id` must each be readable for 32 bytes; `data` must be readable
+ * for `len` bytes (or NULL iff `len == 0`).
+ */
+
+int veil_send_to_onion_service_anonymous(VeilHandle *handle,
+                                         const uint8_t *service_identity_vk,
+                                         const uint8_t *target_app_id,
+                                         uint32_t target_endpoint_id,
+                                         const uint8_t *src_app_id,
+                                         uint32_t hop_count,
+                                         const uint8_t *data,
+                                         size_t len,
+                                         char **err_out)
+;
+
+/**
  * Deposit `blob` for an offline `receiver_id` at the daemon's mailbox
  *. No `auth_cookie` required.
  *
