@@ -834,8 +834,22 @@ impl ConfigCommandService {
             )));
         }
 
-        let count = peers.len();
-        loaded.bootstrap_peers = peers;
+        // MERGE (union) with the operator-curated peers, deduped by public_key —
+        // the prior `loaded.bootstrap_peers = peers` REPLACED them, silently
+        // discarding hand-pinned entries despite the "merged" wording (diff-audit
+        // M21). Existing entries win on a public_key clash (operator intent).
+        let mut existing_keys: std::collections::HashSet<String> = loaded
+            .bootstrap_peers
+            .iter()
+            .map(|p| p.public_key.clone())
+            .collect();
+        let mut count = 0usize;
+        for p in peers {
+            if existing_keys.insert(p.public_key.clone()) {
+                loaded.bootstrap_peers.push(p);
+                count += 1;
+            }
+        }
         // Never persist a config that would fail to load: validate the merged
         // result (e.g. malformed peer transports from a crafted bundle) before
         // writing it to disk.
