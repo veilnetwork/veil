@@ -46,9 +46,13 @@ pub struct ReplyBlockStore {
 
 #[derive(Default)]
 struct ReplyStoreState {
-    /// reply_id → (block, expiry_unix). The reply's routing (relay, cookie,
-    /// receiver transport node_id) lives inside the signed `ReplyBlock` itself.
-    map: std::collections::HashMap<u64, (veil_proto::ReplyBlock, u64)>,
+    /// reply_id → (block, expiry_unix, owner_app_id). The reply's routing (relay,
+    /// cookie, receiver transport node_id) lives inside the signed `ReplyBlock`
+    /// itself. `owner_app_id` is the local app that RECEIVED the message (and was
+    /// handed this `reply_id`); only that app may reply through it (diff-audit
+    /// D3) — without the binding, any local app that guessed/observed a reply_id
+    /// (a small monotonic u64) could reply through another app's channel.
+    map: std::collections::HashMap<u64, (veil_proto::ReplyBlock, u64, [u8; 32])>,
     /// Insertion order (front = oldest) for TTL-GC + FIFO cap-evict.
     order: std::collections::VecDeque<u64>,
     /// Monotonic id allocator; never hands out 0 (0 = "no reply").
@@ -75,7 +79,7 @@ impl ReplyBlockStore {
     fn gc(state: &mut ReplyStoreState, now_unix: u64) {
         while let Some(&id) = state.order.front() {
             match state.map.get(&id) {
-                Some(&(_, exp)) if now_unix >= exp => {
+                Some(&(_, exp, _)) if now_unix >= exp => {
                     state.map.remove(&id);
                     state.order.pop_front();
                 }
@@ -87,8 +91,10 @@ impl ReplyBlockStore {
         }
     }
 
-    /// Store `block`, returning a fresh non-zero `reply_id`.
-    pub fn store(&self, block: veil_proto::ReplyBlock, now_unix: u64) -> u64 {
+    /// Store `block` owned by `owner_app_id` (the app that received the message),
+    /// returning a fresh non-zero `reply_id`. Only `owner_app_id` may later
+    /// [`peek`](Self::peek) it (diff-audit D3).
+    pub fn store(&self, block: veil_proto::ReplyBlock, owner_app_id: [u8; 32], now_unix: u64) -> u64 {
         let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         Self::gc(&mut s, now_unix);
         while s.map.len() >= self.cap {
@@ -102,8 +108,10 @@ impl ReplyBlockStore {
         let id = s.next_id;
         let next = s.next_id.wrapping_add(1);
         s.next_id = if next == 0 { 1 } else { next };
-        s.map
-            .insert(id, (block, now_unix.saturating_add(self.ttl_secs)));
+        s.map.insert(
+            id,
+            (block, now_unix.saturating_add(self.ttl_secs), owner_app_id),
+        );
         s.order.push_back(id);
         id
     }
@@ -115,14 +123,23 @@ impl ReplyBlockStore {
     /// is therefore at-least-once — a recipient may see a duplicate reply if more
     /// than one copy lands, and should de-dup at the app layer. (Was single-use
     /// `take`; relaxed to TTL-bounded multi-use — onion-registration cleanup 1b.)
-    pub fn peek(&self, reply_id: u64, now_unix: u64) -> Option<veil_proto::ReplyBlock> {
+    /// `requester_app_id` MUST equal the `owner_app_id` the block was stored
+    /// under (diff-audit D3) — a mismatch returns `None` (treated as
+    /// unknown/expired by the caller), so one local app cannot reply through
+    /// another app's reply channel by guessing its (small, monotonic) reply_id.
+    pub fn peek(
+        &self,
+        reply_id: u64,
+        requester_app_id: [u8; 32],
+        now_unix: u64,
+    ) -> Option<veil_proto::ReplyBlock> {
         if reply_id == 0 {
             return None;
         }
         let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         Self::gc(&mut s, now_unix);
-        let (block, exp) = s.map.get(&reply_id)?;
-        if now_unix >= *exp {
+        let (block, exp, owner) = s.map.get(&reply_id)?;
+        if now_unix >= *exp || *owner != requester_app_id {
             None
         } else {
             Some(block.clone())
@@ -258,33 +275,46 @@ mod tests {
         }
     }
 
+    const OWNER: [u8; 32] = [7u8; 32];
+
     #[test]
     fn store_peek_is_non_consuming() {
         let s = ReplyBlockStore::new();
-        let id = s.store(rb(1), 1000);
+        let id = s.store(rb(1), OWNER, 1000);
         assert_ne!(id, 0);
         // NON-consuming (1b): repeated peeks keep returning the block (retry).
-        assert_eq!(s.peek(id, 1000), Some(rb(1)));
-        assert_eq!(s.peek(id, 1000), Some(rb(1)));
+        assert_eq!(s.peek(id, OWNER, 1000), Some(rb(1)));
+        assert_eq!(s.peek(id, OWNER, 1000), Some(rb(1)));
         // reply_id 0 is never valid.
-        assert_eq!(s.peek(0, 1000), None);
+        assert_eq!(s.peek(0, OWNER, 1000), None);
+    }
+
+    #[test]
+    fn peek_rejects_wrong_owner_d3() {
+        // diff-audit D3: a different local app cannot reply through this block.
+        let s = ReplyBlockStore::new();
+        let id = s.store(rb(1), OWNER, 1000);
+        let other_app = [0x99u8; 32];
+        assert_eq!(s.peek(id, other_app, 1000), None, "non-owner rejected");
+        // The legitimate owner still resolves it.
+        assert_eq!(s.peek(id, OWNER, 1000), Some(rb(1)));
     }
 
     #[test]
     fn store_expires_after_ttl() {
         let s = ReplyBlockStore::with_params(300, 16);
-        let id = s.store(rb(2), 1000);
-        assert_eq!(s.peek(id, 1000 + 299), Some(rb(2)));
-        let id2 = s.store(rb(3), 2000);
-        assert_eq!(s.peek(id2, 2000 + 300), None, "expired block is gone");
+        let id = s.store(rb(2), OWNER, 1000);
+        assert_eq!(s.peek(id, OWNER, 1000 + 299), Some(rb(2)));
+        let id2 = s.store(rb(3), OWNER, 2000);
+        assert_eq!(s.peek(id2, OWNER, 2000 + 300), None, "expired block is gone");
     }
 
     #[test]
     fn store_cap_evicts_oldest() {
         let s = ReplyBlockStore::with_params(10_000, 2);
-        let id1 = s.store(rb(1), 0);
-        let _id2 = s.store(rb(2), 0);
-        let _id3 = s.store(rb(3), 0); // over cap → evicts id1
-        assert_eq!(s.peek(id1, 0), None, "oldest evicted");
+        let id1 = s.store(rb(1), OWNER, 0);
+        let _id2 = s.store(rb(2), OWNER, 0);
+        let _id3 = s.store(rb(3), OWNER, 0); // over cap → evicts id1
+        assert_eq!(s.peek(id1, OWNER, 0), None, "oldest evicted");
     }
 }
