@@ -1490,6 +1490,18 @@ impl FindValueResponse {
                 });
             }
             let vlen = super::read_u32_be(buf, 1)? as usize;
+            // Cap the value length at the DHT value budget (diff-audit DHT-16MiB):
+            // the StorePayload decode path caps this, but a FIND_VALUE *response*
+            // is attacker-controlled too — without this bound a malicious peer
+            // could return a value up to the 16 MiB frame cap (1024× the 16 KiB
+            // intended limit) → allocation amplification on the requester.
+            if vlen > crate::budget::MAX_DHT_VALUE_BYTES {
+                return Err(ProtoError::ValueTooLarge {
+                    field: "find_value_response_vlen",
+                    value: vlen as u64,
+                    max: crate::budget::MAX_DHT_VALUE_BYTES as u64,
+                });
+            }
             // checked_add — 32-bit overflow defence.
             let end = 5usize.checked_add(vlen).ok_or(ProtoError::BufferTooShort {
                 need: usize::MAX,
@@ -1930,6 +1942,32 @@ impl DeletePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_value_response_rejects_oversize_value() {
+        // diff-audit DHT-16MiB: an attacker-controlled FIND_VALUE response must
+        // not declare a value larger than MAX_DHT_VALUE_BYTES. The cap fires
+        // before the buffer-length check, so a tiny crafted buffer suffices.
+        let vlen = (crate::budget::MAX_DHT_VALUE_BYTES + 1) as u32;
+        let mut buf = vec![1u8]; // found
+        buf.extend_from_slice(&vlen.to_be_bytes());
+        assert!(matches!(
+            FindValueResponse::decode(&buf),
+            Err(ProtoError::ValueTooLarge {
+                field: "find_value_response_vlen",
+                ..
+            })
+        ));
+        // Exactly at the cap is accepted (length-permitting).
+        let okv = crate::budget::MAX_DHT_VALUE_BYTES as u32;
+        let mut okbuf = vec![1u8];
+        okbuf.extend_from_slice(&okv.to_be_bytes());
+        okbuf.resize(5 + crate::budget::MAX_DHT_VALUE_BYTES, 0);
+        assert!(matches!(
+            FindValueResponse::decode(&okbuf),
+            Ok(FindValueResponse::Value(_))
+        ));
+    }
 
     fn sample_gw() -> GatewayRef {
         GatewayRef {
