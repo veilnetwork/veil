@@ -5853,7 +5853,7 @@ mod tests {
         net.node(0)
             .runtime
             .access()
-            .send_via_rendezvous_authenticated(&ad, app_id, endpoint_id, payload, 2, None)
+            .send_via_rendezvous_authenticated(&ad, app_id, endpoint_id, payload, 2, None, 1)
             .expect("send_via_rendezvous_authenticated must succeed");
 
         // The receiver's app should get the payload with the VERIFIED sender
@@ -6045,6 +6045,7 @@ mod tests {
                     out.as_bytes(),
                     2,
                     Some((app_a, ep_a)),
+                    1,
                 )
                 .expect("authenticated send with reply block must succeed");
 
