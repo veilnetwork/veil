@@ -1879,6 +1879,10 @@ impl NodeRuntime {
             introduce_replay_cache: Arc::new(
                 veil_anonymity::rendezvous::IntroduceReplayCache::new(),
             ),
+            // Δ2-g1: relay-side introduce-forward dedup (TTL 300s, cap 4096).
+            circuit_introduce_seen: Arc::new(std::sync::Mutex::new(
+                veil_dispatcher::ExpiryCache::new(std::time::Duration::from_secs(300), 4096),
+            )),
             // bundle rendezvous-relay capability
             // with general anonymity-relay capability for v1. Both
             // are opt-in [anonymity].relay_capable; operators

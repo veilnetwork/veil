@@ -915,6 +915,10 @@ impl NodeRuntime {
             // captured ciphertexts could be re-submitted between the
             // dispatcher swap and the next legitimate Introduce.
             introduce_replay_cache: Arc::clone(&self.dispatcher.introduce_replay_cache),
+            // Δ2-g1: preserve the relay-side introduce dedup across reload (parity
+            // with the introduce replay cache), so reload doesn't briefly reopen
+            // the replay window.
+            circuit_introduce_seen: Arc::clone(&self.dispatcher.circuit_introduce_seen),
             // reload preserves the rendezvous
             // registry so currently-registered cookies survive without
             // forcing a re-registration round-trip from every receiver.
