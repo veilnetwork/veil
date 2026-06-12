@@ -3049,28 +3049,15 @@ impl NodeRuntime {
         data: &[u8],
         hop_count: usize,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
-        // Wrap data in `AppDeliverPayload` so the receiver's
-        // Final-hop dispatcher can route to the addressed endpoint.
-        // src_node_id stays zero — anonymity guarantees the receiver
-        // does NOT learn the sender's node identity at this layer
-        // (replies require a separate rendezvous flow).
-        let deliver_payload = veil_proto::AppDeliverPayload {
-            src_node_id: [0u8; 32],
+        self.access().send_anonymous(
+            target_node_id,
+            target_x25519_pk,
+            target_app_id,
+            target_endpoint_id,
             src_app_id,
-            app_id: target_app_id,
-            endpoint_id: target_endpoint_id,
-            data: veil_bufpool::pooled_shared_from_vec(data.to_vec()),
-            reply_id: 0,
-        };
-        let deliver_bytes = deliver_payload.encode();
-        // Final-hop tag byte: kind = APP_DELIVER
-        // tells the receiver dispatcher to route locally vs forward
-        // through a rendezvous-relay flow.
-        let mut payload_bytes = Vec::with_capacity(1 + deliver_bytes.len());
-        payload_bytes.push(veil_anonymity::rendezvous::final_hop_kind::APP_DELIVER);
-        payload_bytes.extend_from_slice(&deliver_bytes);
-
-        self.send_anonymous_onion(&payload_bytes, target_node_id, target_x25519_pk, hop_count)
+            data,
+            hop_count,
+        )
     }
 
     /// Authenticated anonymous send (Epic 482 authenticated-onion v1).
@@ -3131,172 +3118,12 @@ impl NodeRuntime {
         payload_bytes.push(veil_anonymity::rendezvous::final_hop_kind::APP_DELIVER_AUTH);
         payload_bytes.extend_from_slice(&auth_bytes);
 
-        self.send_anonymous_onion(&payload_bytes, target_node_id, target_x25519_pk, hop_count)
-    }
-
-    /// Common onion-send path shared by [`send_anonymous`] (un-authenticated)
-    /// and [`send_anonymous_authenticated`]. `payload` is the already-assembled
-    /// final-hop blob: a `final_hop_kind` tag byte followed by the
-    /// kind-specific body. This helper owns candidate selection, relay
-    /// discovery/verify, AS-diversity + reputation-weighted circuit picking,
-    /// the onion wrap, and the fire-and-forget first-hop send.
-    fn send_anonymous_onion(
-        &self,
-        payload: &[u8],
-        target_node_id: [u8; 32],
-        target_x25519_pk: [u8; 32],
-        hop_count: usize,
-    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
-        use veil_anonymity::{
-            directory::{
-                DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
-            },
-            sender::{
-                DiversityOutcome,
-                build_outbound_anonymous_cell_with_diversity_reported_and_reputation,
-            },
-        };
-
-        // W0 measurement (anonymity-preserving plan): time the SELECTION phase
-        // (candidate snapshot + relay discovery/verify + diversity map) vs the
-        // BUILD phase (pick + onion wrap) to decide whether selection dominates
-        // the per-send overhead (gates W2 selection-input caching). Local timing
-        // of our OWN send — nothing is transmitted, no peer correlation; emitted
-        // at debug level (off by default).
-        let t_select = std::time::Instant::now();
-
-        // Step 1: snapshot candidates from local DHT routing table.
-        // We could also pull from PEX-discovered peers or the live-
-        // sessions registry, but routing table is the canonical
-        // "peers we already know about" set + matches the security
-        // story (anonymity layer must not consult sources that an
-        // attacker can poison faster than DHT).
-        let candidate_node_ids: Vec<[u8; 32]> = self
-            .dht
-            .routing_table_contacts()
-            .into_iter()
-            .map(|c| c.node_id)
-            .collect();
-
-        // Step 2 + 3: fetch + verify + filter via discovery helper.
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let dht = Arc::clone(&self.dht);
-        let usable_relays = discover_relay_hops(
-            &candidate_node_ids,
-            |node_id| dht.get_local(&relay_directory_dht_key(node_id)),
-            now_unix,
-            DEFAULT_FRESHNESS_WINDOW_SECS,
-        );
-
-        // Step 4: build the cell. RTT estimator pulls from Vivaldi
-        // when local coords have converged; falls back to None
-        // (which the picker handles by sorting unknown-RTT to last).
-        let local_vivaldi = self.dispatcher.local_vivaldi.clone();
-        let peer_vivaldi = Arc::clone(&self.dispatcher.peer_vivaldi);
-        let rtt_estimator = move |node_id: &[u8; 32]| -> Option<u32> {
-            // Vivaldi distance estimate: Euclidean distance between
-            // local + peer coords, scaled. When either coord is
-            // unknown, return None (picker treats as worst-priority).
-            let local = local_vivaldi.as_ref()?;
-            let peer_map = rlock!(peer_vivaldi);
-            let (peer_coord, _) = peer_map.get(node_id)?;
-            let local_guard = lock!(local);
-            let estimated_ms = local_guard.distance_estimate(peer_coord) * 1000.0;
-            // Sanity: clamp to u32 range. Vivaldi can return
-            // negative or NaN values during convergence — treat as
-            // unknown (None) so picker doesn't sort by garbage.
-            if !estimated_ms.is_finite() || estimated_ms < 0.0 {
-                return None;
-            }
-            Some(estimated_ms.min(u32::MAX as f64) as u32)
-        };
-
-        // Anti-censorship AS-diversity extractor — snapshots already-
-        // dialed peers' IPs from discovered_peers_cache + builds a
-        // node_id → /16 (IPv4) / /32 (IPv6) prefix map.  Used by the
-        // circuit picker to enforce "no two hops in the same /16" even
-        // when relay-directory wire format doesn't carry IP/ASN.
-        // Unknown relays get `None` (graceful degradation —
-        // picker accepts them without a diversity gate).
-        let diversity_map = build_as_diversity_map(&self.discovered_peers_cache);
-        let diversity_key_of =
-            move |node_id: &[u8; 32]| -> Option<String> { diversity_map.get(node_id).cloned() };
-
-        // Downweight relays with recorded failures (Epic 482.3/482.4 Phase A):
-        // a misbehaving relay's effective RTT is bumped by its penalty so it
-        // sorts behind viable alternatives.
-        let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
-        let reputation_penalty_ms =
-            move |node_id: &[u8; 32]| -> u32 { relay_reputation.rtt_penalty_ms(*node_id) };
-        let select_us = t_select.elapsed().as_micros();
-        let t_build = std::time::Instant::now();
-        let ((first_hop_node_id, cell), diversity) =
-            build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
-                payload,
-                &usable_relays,
-                rtt_estimator,
-                diversity_key_of,
-                reputation_penalty_ms,
-                target_node_id,
-                target_x25519_pk,
-                hop_count,
-            )?;
-        // W0 measurement: selection (candidate prep + discovery + diversity map)
-        // vs build (pick + onion wrap). The anonymity-preserving plan expects
-        // selection to dominate → justifies W2 selection-input caching.
-        log::debug!(
-            "anonymity.send.timing select_us={select_us} build_us={} \
-             payload={} hops={hop_count} candidates={} usable={}",
-            t_build.elapsed().as_micros(),
-            payload.len(),
-            candidate_node_ids.len(),
-            usable_relays.len(),
-        );
-        if diversity == DiversityOutcome::DegradedToLatency {
-            // AS-correlation protection was silently lost — surface it so an
-            // operator can see when circuits aren't netblock-diverse. (cycle-8 F4.)
-            log::warn!(
-                "anonymity.circuit.diversity_degraded hop_count={hop_count} \
-                 candidates={} — no AS-diverse relay set; fell back to latency-only",
-                usable_relays.len()
-            );
-        }
-
-        // Step 5: hit the wire. RelayChain::Hop frame to first hop's
-        // session. If first_hop has no live session, the send is a
-        // silent drop — caller learns from app-layer timeout, NOT
-        // from a synchronous error (which would leak whether the
-        // first hop is reachable to a sender-side observer).
-        use veil_proto::{
-            codec::encode_header,
-            family::{FrameFamily, RelayChainMsg},
-            header::FrameHeader,
-        };
-        let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
-        hdr.body_len = cell.len() as u32;
-        hdr.set_priority(veil_proto::priority::INTERACTIVE);
-        let mut frame = encode_header(&hdr).to_vec();
-        frame.extend_from_slice(&cell);
-        if let Some(ref reg) = self.dispatcher.session_tx_registry {
-            let guard = wlock!(reg);
-            let sent = guard.send_to(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
-            drop(guard);
-            if !sent {
-                // Signal 1 (Epic 482.3/482.4 Phase A): the chosen anonymity
-                // first hop has no live session — record it so the picker
-                // downweights it next time. This is per-sender-LOCAL memory and
-                // changes NO external behaviour (we still return Ok, no
-                // synchronous error), so it does not leak first-hop reachability
-                // to a sender-side observer (the reason this stays fire-and-forget).
-                self.anonymity
-                    .relay_reputation
-                    .record_failure(first_hop_node_id);
-            }
-        }
-        Ok(())
+        self.access().send_anonymous_onion(
+            &payload_bytes,
+            target_node_id,
+            target_x25519_pk,
+            hop_count,
+        )
     }
 
     /// register an `auth_cookie` with the named
@@ -6746,6 +6573,209 @@ impl NodeServices {
 
         self.send_sealed_introduce(&ad, &sealed_plaintext, hop_count)
             .map_err(map_sender_err)
+    }
+
+    /// Send `data` to a KNOWN peer `(target_node_id, target_x25519_pk)` as an
+    /// UNAUTHENTICATED anonymous onion message — the direct (non-rendezvous)
+    /// sender-anonymous path. The source-routed onion hides our network location
+    /// from every relay, and the receiver sees `src_node_id = [0; 32]` (it does
+    /// NOT learn who sent it; replies need the separate rendezvous flow).
+    /// Fire-and-forget: `Ok` means handed to the first hop, not delivered.
+    // 8-arg signature — destination+payload+anonymity shape is one tuple;
+    // a struct adds boilerplate without ergonomic gain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_anonymous(
+        &self,
+        target_node_id: [u8; 32],
+        target_x25519_pk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        src_app_id: [u8; 32],
+        data: &[u8],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        // Wrap data in `AppDeliverPayload` so the receiver's Final-hop dispatcher
+        // can route to the addressed endpoint. src_node_id stays zero — the
+        // anonymity guarantee: the receiver does NOT learn the sender's node id.
+        let deliver_payload = veil_proto::AppDeliverPayload {
+            src_node_id: [0u8; 32],
+            src_app_id,
+            app_id: target_app_id,
+            endpoint_id: target_endpoint_id,
+            data: veil_bufpool::pooled_shared_from_vec(data.to_vec()),
+            reply_id: 0,
+        };
+        let deliver_bytes = deliver_payload.encode();
+        let mut payload_bytes = Vec::with_capacity(1 + deliver_bytes.len());
+        payload_bytes.push(veil_anonymity::rendezvous::final_hop_kind::APP_DELIVER);
+        payload_bytes.extend_from_slice(&deliver_bytes);
+
+        self.send_anonymous_onion(&payload_bytes, target_node_id, target_x25519_pk, hop_count)
+    }
+
+    /// Common onion-send path shared by [`Self::send_anonymous`] (un-authenticated)
+    /// and the Runtime's `send_anonymous_authenticated`. `payload` is the
+    /// already-assembled final-hop blob: a `final_hop_kind` tag byte followed by
+    /// the kind-specific body. This helper owns candidate selection, relay
+    /// discovery/verify, AS-diversity + reputation-weighted circuit picking, the
+    /// onion wrap, and the fire-and-forget first-hop send.
+    pub(crate) fn send_anonymous_onion(
+        &self,
+        payload: &[u8],
+        target_node_id: [u8; 32],
+        target_x25519_pk: [u8; 32],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        use veil_anonymity::{
+            directory::{
+                DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
+            },
+            sender::{
+                DiversityOutcome,
+                build_outbound_anonymous_cell_with_diversity_reported_and_reputation,
+            },
+        };
+
+        // W0 measurement (anonymity-preserving plan): time the SELECTION phase
+        // (candidate snapshot + relay discovery/verify + diversity map) vs the
+        // BUILD phase (pick + onion wrap) to decide whether selection dominates
+        // the per-send overhead (gates W2 selection-input caching). Local timing
+        // of our OWN send — nothing is transmitted, no peer correlation; emitted
+        // at debug level (off by default).
+        let t_select = std::time::Instant::now();
+
+        // Step 1: snapshot candidates from local DHT routing table.
+        // We could also pull from PEX-discovered peers or the live-
+        // sessions registry, but routing table is the canonical
+        // "peers we already know about" set + matches the security
+        // story (anonymity layer must not consult sources that an
+        // attacker can poison faster than DHT).
+        let candidate_node_ids: Vec<[u8; 32]> = self
+            .dht
+            .routing_table_contacts()
+            .into_iter()
+            .map(|c| c.node_id)
+            .collect();
+
+        // Step 2 + 3: fetch + verify + filter via discovery helper.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let dht = Arc::clone(&self.dht);
+        let usable_relays = discover_relay_hops(
+            &candidate_node_ids,
+            |node_id| dht.get_local(&relay_directory_dht_key(node_id)),
+            now_unix,
+            DEFAULT_FRESHNESS_WINDOW_SECS,
+        );
+
+        // Step 4: build the cell. RTT estimator pulls from Vivaldi
+        // when local coords have converged; falls back to None
+        // (which the picker handles by sorting unknown-RTT to last).
+        let local_vivaldi = self.dispatcher.local_vivaldi.clone();
+        let peer_vivaldi = Arc::clone(&self.dispatcher.peer_vivaldi);
+        let rtt_estimator = move |node_id: &[u8; 32]| -> Option<u32> {
+            // Vivaldi distance estimate: Euclidean distance between
+            // local + peer coords, scaled. When either coord is
+            // unknown, return None (picker treats as worst-priority).
+            let local = local_vivaldi.as_ref()?;
+            let peer_map = rlock!(peer_vivaldi);
+            let (peer_coord, _) = peer_map.get(node_id)?;
+            let local_guard = lock!(local);
+            let estimated_ms = local_guard.distance_estimate(peer_coord) * 1000.0;
+            // Sanity: clamp to u32 range. Vivaldi can return
+            // negative or NaN values during convergence — treat as
+            // unknown (None) so picker doesn't sort by garbage.
+            if !estimated_ms.is_finite() || estimated_ms < 0.0 {
+                return None;
+            }
+            Some(estimated_ms.min(u32::MAX as f64) as u32)
+        };
+
+        // Anti-censorship AS-diversity extractor — snapshots already-
+        // dialed peers' IPs from discovered_peers_cache + builds a
+        // node_id → /16 (IPv4) / /32 (IPv6) prefix map.  Used by the
+        // circuit picker to enforce "no two hops in the same /16" even
+        // when relay-directory wire format doesn't carry IP/ASN.
+        // Unknown relays get `None` (graceful degradation —
+        // picker accepts them without a diversity gate).
+        let diversity_map = build_as_diversity_map(&self.discovered_peers_cache);
+        let diversity_key_of =
+            move |node_id: &[u8; 32]| -> Option<String> { diversity_map.get(node_id).cloned() };
+
+        // Downweight relays with recorded failures (Epic 482.3/482.4 Phase A):
+        // a misbehaving relay's effective RTT is bumped by its penalty so it
+        // sorts behind viable alternatives.
+        let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
+        let reputation_penalty_ms =
+            move |node_id: &[u8; 32]| -> u32 { relay_reputation.rtt_penalty_ms(*node_id) };
+        let select_us = t_select.elapsed().as_micros();
+        let t_build = std::time::Instant::now();
+        let ((first_hop_node_id, cell), diversity) =
+            build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
+                payload,
+                &usable_relays,
+                rtt_estimator,
+                diversity_key_of,
+                reputation_penalty_ms,
+                target_node_id,
+                target_x25519_pk,
+                hop_count,
+            )?;
+        // W0 measurement: selection (candidate prep + discovery + diversity map)
+        // vs build (pick + onion wrap). The anonymity-preserving plan expects
+        // selection to dominate → justifies W2 selection-input caching.
+        log::debug!(
+            "anonymity.send.timing select_us={select_us} build_us={} \
+             payload={} hops={hop_count} candidates={} usable={}",
+            t_build.elapsed().as_micros(),
+            payload.len(),
+            candidate_node_ids.len(),
+            usable_relays.len(),
+        );
+        if diversity == DiversityOutcome::DegradedToLatency {
+            // AS-correlation protection was silently lost — surface it so an
+            // operator can see when circuits aren't netblock-diverse. (cycle-8 F4.)
+            log::warn!(
+                "anonymity.circuit.diversity_degraded hop_count={hop_count} \
+                 candidates={} — no AS-diverse relay set; fell back to latency-only",
+                usable_relays.len()
+            );
+        }
+
+        // Step 5: hit the wire. RelayChain::Hop frame to first hop's
+        // session. If first_hop has no live session, the send is a
+        // silent drop — caller learns from app-layer timeout, NOT
+        // from a synchronous error (which would leak whether the
+        // first hop is reachable to a sender-side observer).
+        use veil_proto::{
+            codec::encode_header,
+            family::{FrameFamily, RelayChainMsg},
+            header::FrameHeader,
+        };
+        let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::Hop as u16);
+        hdr.body_len = cell.len() as u32;
+        hdr.set_priority(veil_proto::priority::INTERACTIVE);
+        let mut frame = encode_header(&hdr).to_vec();
+        frame.extend_from_slice(&cell);
+        if let Some(ref reg) = self.dispatcher.session_tx_registry {
+            let guard = wlock!(reg);
+            let sent = guard.send_to(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
+            drop(guard);
+            if !sent {
+                // Signal 1 (Epic 482.3/482.4 Phase A): the chosen anonymity
+                // first hop has no live session — record it so the picker
+                // downweights it next time. This is per-sender-LOCAL memory and
+                // changes NO external behaviour (we still return Ok, no
+                // synchronous error), so it does not leak first-hop reachability
+                // to a sender-side observer (the reason this stays fire-and-forget).
+                self.anonymity
+                    .relay_reputation
+                    .record_failure(first_hop_node_id);
+            }
+        }
+        Ok(())
     }
 
     /// Resolve a location-anonymous service's BLINDED descriptor (by its Ed25519
