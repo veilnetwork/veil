@@ -36,6 +36,12 @@ pub fn current_period(now_unix: u64) -> u64 {
 /// Routing the client needs to reach the service (the descriptor plaintext).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlindedDescriptorBody {
+    /// Service TRANSPORT node_id. The sender signs its `AuthDeliver` over this
+    /// (the service verifies by reconstructing it as its own id), so the sender
+    /// must learn it — but only AFTER decrypting the descriptor, i.e. only a
+    /// client that already knows the service identity. A DHT enumerator never
+    /// sees it (it's inside the ciphertext), so unlinkability is preserved.
+    pub receiver_node_id: [u8; 32],
     /// Rendezvous relay R that forwards introduces down the service's circuit.
     pub rendezvous_node_id: [u8; 32],
     /// One-time cookie bound to the service's return circuit at R.
@@ -45,13 +51,14 @@ pub struct BlindedDescriptorBody {
 }
 
 impl BlindedDescriptorBody {
-    const WIRE: usize = 32 + 16 + 32; // 80
+    const WIRE: usize = 32 + 32 + 16 + 32; // 112
 
     fn encode(&self) -> [u8; Self::WIRE] {
         let mut b = [0u8; Self::WIRE];
-        b[..32].copy_from_slice(&self.rendezvous_node_id);
-        b[32..48].copy_from_slice(&self.auth_cookie);
-        b[48..80].copy_from_slice(&self.receiver_x25519_pk);
+        b[..32].copy_from_slice(&self.receiver_node_id);
+        b[32..64].copy_from_slice(&self.rendezvous_node_id);
+        b[64..80].copy_from_slice(&self.auth_cookie);
+        b[80..112].copy_from_slice(&self.receiver_x25519_pk);
         b
     }
 
@@ -59,13 +66,16 @@ impl BlindedDescriptorBody {
         if b.len() != Self::WIRE {
             return None;
         }
+        let mut receiver_node_id = [0u8; 32];
+        receiver_node_id.copy_from_slice(&b[..32]);
         let mut rendezvous_node_id = [0u8; 32];
-        rendezvous_node_id.copy_from_slice(&b[..32]);
+        rendezvous_node_id.copy_from_slice(&b[32..64]);
         let mut auth_cookie = [0u8; 16];
-        auth_cookie.copy_from_slice(&b[32..48]);
+        auth_cookie.copy_from_slice(&b[64..80]);
         let mut receiver_x25519_pk = [0u8; 32];
-        receiver_x25519_pk.copy_from_slice(&b[48..80]);
+        receiver_x25519_pk.copy_from_slice(&b[80..112]);
         Some(Self {
+            receiver_node_id,
             rendezvous_node_id,
             auth_cookie,
             receiver_x25519_pk,
@@ -213,6 +223,7 @@ mod tests {
 
     fn body(tag: u8) -> BlindedDescriptorBody {
         BlindedDescriptorBody {
+            receiver_node_id: [tag ^ 0x33; 32],
             rendezvous_node_id: [tag; 32],
             auth_cookie: [tag ^ 0x11; 16],
             receiver_x25519_pk: [tag ^ 0x22; 32],

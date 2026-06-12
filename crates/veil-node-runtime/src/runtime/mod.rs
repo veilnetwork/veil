@@ -6230,6 +6230,7 @@ impl NodeServices {
             .unwrap_or(0);
         let period = veil_anonymity::blinded_descriptor::current_period(now);
         let body = veil_anonymity::blinded_descriptor::BlindedDescriptorBody {
+            receiver_node_id: *self.identity.local_identity.node_id.as_bytes(),
             rendezvous_node_id: rendezvous,
             auth_cookie: cookie,
             receiver_x25519_pk: x25519_pk,

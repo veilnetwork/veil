@@ -6482,9 +6482,11 @@ mod tests {
         );
 
         // Build a synthetic ad from the opened body + send (the routing fields
-        // are all send_via_rendezvous reads).
+        // are all send_via_rendezvous reads). receiver_node_id comes from the
+        // DECRYPTED body — the client only ever knew the service IDENTITY.
+        assert_eq!(body.receiver_node_id, net.node(4).node_id());
         let ad = crate::node::anonymity::rendezvous::RendezvousAd {
-            receiver_node_id: net.node(4).node_id(),
+            receiver_node_id: body.receiver_node_id,
             rendezvous_node_id: body.rendezvous_node_id,
             auth_cookie: body.auth_cookie,
             receiver_x25519_pk: body.receiver_x25519_pk,
