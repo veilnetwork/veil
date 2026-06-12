@@ -496,7 +496,7 @@ impl SimNetwork {
         // session before the partner's reload killed it — with the 30s
         // connector sleep blocking a prompt re-dial: the ~50% flake.)
         let mut configs: Vec<_> = (0..n).map(|i| self.nodes[i].config.clone()).collect();
-        for i in 0..n {
+        for (i, cfg) in configs.iter_mut().enumerate() {
             for j in 0..n {
                 if i == j {
                     continue;
@@ -504,7 +504,7 @@ impl SimNetwork {
                 let peer_id = PeerId::new(self.next_peer_id as u32);
                 self.next_peer_id += 1;
                 if let Some(p) = self.nodes[j].as_peer_config(peer_id) {
-                    configs[i].peers.push(p);
+                    cfg.peers.push(p);
                 }
             }
         }
