@@ -1478,8 +1478,14 @@ impl NodeRuntime {
         // cycle-10: app-added peers were previously never dialed; the old
         // gateway_failover_notify kick woke a loop that only dials gateways.)
         let bootstrap_join: Arc<dyn veil_ipc::BootstrapJoinSink> = {
-            let (dial_tx, mut dial_rx) =
-                tokio::sync::mpsc::unbounded_channel::<crate::types::PeerConfigEntry>();
+            // Rep-B-2: bound the app-added-peer dial queue so an IPC client
+            // looping BootstrapJoin can't grow it without limit. A full queue
+            // drops the dial (peer stays registered; dialed later) rather than
+            // accumulating unboundedly.
+            const BOOTSTRAP_JOIN_DIAL_QUEUE: usize = 128;
+            let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel::<crate::types::PeerConfigEntry>(
+                BOOTSTRAP_JOIN_DIAL_QUEUE,
+            );
             if let Some(shutdown_tx) = &self.shutdown_tx {
                 let dial_access = self.access();
                 let dial_shutdown_tx = shutdown_tx.clone();

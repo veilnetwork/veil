@@ -50,7 +50,10 @@ pub struct BootstrapJoinForwarder {
     /// ever dials `live_gateways()` and filters `state.peers` to
     /// `peer_id >= 0xC000_0000` — so an app-added peer at `0x8800_0000` was
     /// never actually dialed despite the "dial in flight" success reply.)
-    dial_tx: tokio::sync::mpsc::UnboundedSender<PeerConfigEntry>,
+    /// Bounded (diff-audit Rep-B-2): an app looping `BootstrapJoin` would
+    /// otherwise enqueue dials without limit. On a full queue `try_send` drops
+    /// the dial (registration still succeeds; reported as "dial deferred").
+    dial_tx: tokio::sync::mpsc::Sender<PeerConfigEntry>,
 }
 
 impl BootstrapJoinForwarder {
@@ -58,7 +61,7 @@ impl BootstrapJoinForwarder {
         logger: Arc<NodeLogger>,
         state: Arc<Mutex<NodeState>>,
         dht: Arc<veil_dht::KademliaService>,
-        dial_tx: tokio::sync::mpsc::UnboundedSender<PeerConfigEntry>,
+        dial_tx: tokio::sync::mpsc::Sender<PeerConfigEntry>,
     ) -> Self {
         Self {
             logger,
@@ -243,10 +246,10 @@ impl BootstrapJoinSink for BootstrapJoinForwarder {
         // Hand the peer to the runtime-owned dial drain (spawn_ipc_server),
         // which holds the `&NodeServices` + shutdown `watch::Sender` an IPC sink
         // cannot, and spawns the actual reconnect loop via `spawn_outbound_peers`.
-        // A closed channel means the daemon is shutting down — registration in
-        // state still succeeded, so report success but say the dial was deferred
-        // rather than claiming one is in flight.
-        let dial_started = self.dial_tx.send(entry).is_ok();
+        // A closed OR full channel (Rep-B-2: the queue is bounded) means the dial
+        // can't be enqueued now — registration in state still succeeded, so
+        // report success but say the dial was deferred rather than in flight.
+        let dial_started = self.dial_tx.try_send(entry).is_ok();
 
         self.logger.info(
             "ipc.bootstrap_join.registered",
@@ -313,7 +316,7 @@ mod tests {
 
         let state = empty_state();
         let dht = Arc::new(veil_dht::KademliaService::new([7u8; 32]));
-        let (dial_tx, mut dial_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel(8);
         let forwarder = BootstrapJoinForwarder::new(
             Arc::new(NodeLogger::new_noop()),
             Arc::clone(&state),
