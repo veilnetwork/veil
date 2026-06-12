@@ -785,6 +785,12 @@ pub enum LocalAppMsg {
     /// daemon → app: result of `SendToOnionService` (2-byte status code,
     /// `0` = ok, else an `ipc_send_err`).
     SendToOnionServiceResult = 76,
+    /// App → daemon: DIRECT (non-rendezvous) sender-anonymous send to a known
+    /// peer by `(node_id, x25519_pk)`. Body is `SendAnonymousDirectPayload`.
+    SendAnonymousDirect = 77,
+    /// daemon → app: result of `SendAnonymousDirect` (2-byte status code,
+    /// `0` = ok, else an `ipc_send_err`).
+    SendAnonymousDirectResult = 78,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -868,6 +874,8 @@ impl TryFrom<u16> for LocalAppMsg {
             74 => Ok(LocalAppMsg::RegisterOnionServiceResult),
             75 => Ok(LocalAppMsg::SendToOnionService),
             76 => Ok(LocalAppMsg::SendToOnionServiceResult),
+            77 => Ok(LocalAppMsg::SendAnonymousDirect),
+            78 => Ok(LocalAppMsg::SendAnonymousDirectResult),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,
