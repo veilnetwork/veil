@@ -169,6 +169,8 @@ impl CircuitRendezvousRegistry {
                 }
             }
         }
+        // Record the cookie ON the circuit so its teardown can evict this sub.
+        circuit.set_registered_cookie(payload.cookie);
         g.insert(
             payload.cookie,
             Subscription {
