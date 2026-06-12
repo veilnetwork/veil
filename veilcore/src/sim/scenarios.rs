@@ -6269,6 +6269,127 @@ mod tests {
         net.stop().await;
     }
 
+    /// Prod entry-point variant of the onion-service e2e (onion-registration 3):
+    /// the service calls the single high-level `register_onion_service(hop_count)`
+    /// — which auto-PICKS the rendezvous relay + intermediate hops, builds the
+    /// circuit, and publishes the ad — instead of the manual orchestration. Then
+    /// a client reaches it and the location-hiding property holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn epic_anon_service_register_onion_service_prod_path() {
+        let n = 5;
+        let mut net = SimNetwork::builder()
+            .nodes(n)
+            .role(NodeRole::Core)
+            .anonymity_relay(vec![true, true, true, true, true])
+            .sovereign_identities(true)
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        for i in 0..n {
+            assert!(
+                net.node(i)
+                    .wait_sessions(n - 1, Duration::from_secs(45))
+                    .await,
+                "node {i} sessions",
+            );
+        }
+
+        let app_s = [0x5F; 32];
+        let ep_s = 8u32;
+        let (_h_s, mut rx_s) = net.node(4).runtime.app_registry().register(app_s, ep_s, 16);
+
+        // Publish + mirror relay directory entries into the service (so it can
+        // pick + resolve hops) and the client (to onion-route to R).
+        for i in 1..=3 {
+            net.node(i)
+                .runtime
+                .debug_force_publish_relay_directory_entry()
+                .await
+                .expect("relay dir entry");
+        }
+        for i in 1..=3 {
+            let key =
+                crate::node::anonymity::directory::relay_directory_dht_key(&net.node(i).node_id());
+            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                net.node(0).runtime.dht_put_local(key, bytes.clone());
+                net.node(4).runtime.dht_put_local(key, bytes);
+            }
+        }
+
+        // THE PROD ENTRY POINT: one call picks R + a mid hop, builds the circuit,
+        // and publishes the ad. hop_count=2 → S→mid→R (R can't see S).
+        net.node(4)
+            .runtime
+            .register_onion_service(2)
+            .expect("register_onion_service must succeed");
+        let n_ads = net
+            .node(4)
+            .runtime
+            .debug_force_publish_rendezvous_ads()
+            .await;
+        assert_eq!(n_ads, 1, "service publishes one ad");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Resolve S's ad into C + verify.
+        let ad_key =
+            crate::node::anonymity::rendezvous::rendezvous_ad_dht_key(&net.node(4).node_id());
+        let ad_bytes = net
+            .node(4)
+            .runtime
+            .dht_get_local(&ad_key)
+            .expect("service ad locally");
+        net.node(0).runtime.dht_put_local(ad_key, ad_bytes.clone());
+        let ad = crate::node::anonymity::rendezvous::decode_rendezvous_ad(&ad_bytes).unwrap();
+
+        // R holds the cookie as a CIRCUIT sub with NO session registration.
+        let rendezvous = ad.rendezvous_node_id;
+        let r_idx = (0..n)
+            .find(|&i| net.node(i).node_id() == rendezvous)
+            .unwrap();
+        let r = net.node(r_idx).runtime.access();
+        assert!(
+            r.dispatcher
+                .circuit_rendezvous
+                .as_ref()
+                .unwrap()
+                .lookup(&ad.auth_cookie)
+                .is_some(),
+            "R holds a circuit-backed sub for the cookie"
+        );
+        assert_eq!(
+            r.dispatcher.rendezvous_registry.as_ref().unwrap().len(),
+            0,
+            "R has no session-backed registration"
+        );
+
+        // Client reaches the service; retry the (drop-prone) onion introduce leg.
+        let payload = b"prod onion service hi";
+        let src_app = [0x0D; 32];
+        let mut delivered: Option<veil_app::registry::AppMessage> = None;
+        for _ in 0..6 {
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(1), rx_s.recv()).await {
+                delivered = Some(m);
+                break;
+            }
+            let _ = net
+                .node(0)
+                .runtime
+                .send_via_rendezvous(&ad, app_s, ep_s, src_app, payload, 2);
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(8), rx_s.recv()).await {
+                delivered = Some(m);
+                break;
+            }
+        }
+        match delivered.expect("service did not receive within 6 attempts") {
+            veil_app::registry::AppMessage::Deliver { data, .. } => {
+                assert_eq!(data.as_ref(), payload.as_slice());
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+
+        net.stop().await;
+    }
+
     // ── network-change triggers fast reconnect ────────────────────
 
     /// Simulates a WiFi → Cellular flip on a mobile node. Verifies that
