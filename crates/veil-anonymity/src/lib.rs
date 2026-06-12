@@ -34,6 +34,7 @@
 //!   and returns `(first_hop_node_id, cell_bytes)` ready to
 //!   transmit.
 
+pub mod blinded_descriptor;
 pub mod cell;
 pub mod circuit;
 pub mod circuit_builder;
