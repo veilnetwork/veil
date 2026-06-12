@@ -6195,7 +6195,53 @@ impl NodeServices {
             cookie,
             DEFAULT_FRESHNESS_WINDOW_SECS,
         );
+
+        // Also publish a BLINDED descriptor (3c): identity-unlinkable in the DHT.
+        // A client that knows our Ed25519 identity key derives the descriptor's
+        // DHT key + decryption key; an enumerator sees only a rotating key + an
+        // opaque ciphertext. Best-effort (needs an Ed25519 sovereign identity).
+        self.publish_blinded_descriptor(r, cookie);
+
         Ok(cookie)
+    }
+
+    /// Seal + store a blinded service descriptor for the current period (3c).
+    /// Best-effort: a no-op unless we hold an Ed25519 sovereign identity.
+    fn publish_blinded_descriptor(&self, rendezvous: [u8; 32], cookie: [u8; 16]) {
+        let Some(sov) = self.identity.sovereign_identity.as_ref() else {
+            return;
+        };
+        let Some(ed) = sov.ed25519_signing_key() else {
+            return;
+        };
+        let Some(x25519_pk) = self
+            .dispatcher
+            .anonymity_x25519_sk
+            .as_ref()
+            .map(|sk| x25519_dalek::PublicKey::from(sk.as_ref()).to_bytes())
+        else {
+            return;
+        };
+        let identity_sk = ed.to_bytes();
+        let identity_vk = ed.verifying_key().to_bytes();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let period = veil_anonymity::blinded_descriptor::current_period(now);
+        let body = veil_anonymity::blinded_descriptor::BlindedDescriptorBody {
+            rendezvous_node_id: rendezvous,
+            auth_cookie: cookie,
+            receiver_x25519_pk: x25519_pk,
+        };
+        if let Some((dht_key, bytes)) = veil_anonymity::blinded_descriptor::seal_descriptor(
+            &identity_sk,
+            &identity_vk,
+            period,
+            &body,
+        ) {
+            self.dht.store_local(dht_key, bytes);
+        }
     }
 
     /// Register a location-anonymous service: build its onion circuit + record it
