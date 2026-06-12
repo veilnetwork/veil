@@ -33,7 +33,20 @@ pub const MAX_CIRCUIT_DATA_CIPHERTEXT: usize = 512;
 pub struct CircuitDataPayload {
     /// Circuit id on the link this cell arrived/leaves on (re-tagged per hop).
     pub circuit_id: CircuitId,
-    /// Per-circuit monotonic sequence (anti-replay window lands in b3).
+    /// Per-circuit sequence, anti-replay + keystream nonce.
+    ///
+    /// Δ2-f note: unlike `circuit_id`, `seq` is NOT re-tagged per hop — it is
+    /// the SAME value end-to-end (the relay re-emits it verbatim). This is
+    /// load-bearing, not an oversight: it is the nonce in the length-preserving
+    /// XOR keystream (`circuit_data::keystream`), where the originator
+    /// pre-applies every hop's layer under one `seq` and each hop peels under
+    /// that same `seq`; and it is the drop-tolerant anti-replay token
+    /// (`ReplayWindow`), so it can't be an implicit per-hop counter (onion legs
+    /// drop cells). Hiding it on the wire would need a per-link header cipher —
+    /// but relay-chain frames already ride the transport-encrypted session, so a
+    /// non-hop observer never sees `seq`, and a hop already correlates its own
+    /// two links via its `(link, circuit_id)` state. A per-link header cipher
+    /// would therefore be redundant with the transport layer.
     pub seq: u32,
     /// Layered ciphertext (peeled/added one layer per hop; opaque here).
     pub ciphertext: Vec<u8>,
