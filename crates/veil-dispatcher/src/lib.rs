@@ -1226,6 +1226,16 @@ pub struct FrameDispatcher {
     /// layers — recovering the introduce R forwarded down the circuit — then
     /// decrypted + delivered. See `circuit_origin`.
     pub circuit_origin: Option<Arc<veil_anonymity::circuit_origin::OriginCircuitTable>>,
+
+    /// Relay-side introduce-forward dedup (diff-audit Δ2-g1). At the rendezvous
+    /// relay R, `try_forward_introduce_via_circuit` forwards a sealed introduce
+    /// down the service's circuit keyed only by the (public, long-lived) cookie —
+    /// with no replay guard, a captured introduce could be replayed to amplify
+    /// traffic down that circuit. Keyed by `BLAKE3(cookie ‖ ciphertext)`; a
+    /// byte-identical replay within the TTL is dropped before it consumes circuit
+    /// bandwidth (duplicate DELIVERY is already blocked downstream by the
+    /// receiver's introduce replay cache — this closes the amplification).
+    pub circuit_introduce_seen: Arc<Mutex<ExpiryCache<[u8; 32]>>>,
 }
 
 /// Constant-time pad applied to banned-peer drops in `dispatch()`.
@@ -1815,6 +1825,10 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         circuit_table: None,
         circuit_rendezvous: None,
         circuit_origin: None,
+        circuit_introduce_seen: Arc::new(Mutex::new(ExpiryCache::new(
+            Duration::from_secs(300),
+            4096,
+        ))),
     }
 }
 
@@ -2512,6 +2526,10 @@ mod tests {
             circuit_table: None,
             circuit_rendezvous: None,
             circuit_origin: None,
+            circuit_introduce_seen: Arc::new(Mutex::new(ExpiryCache::new(
+                Duration::from_secs(300),
+                4096,
+            ))),
         }
     }
 
