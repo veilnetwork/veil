@@ -5168,11 +5168,16 @@ mod tests {
         // documented constants here.
         const MAX_FRAME_BODY: usize = 16 * 1024 * 1024;
         const LARGEST_SEND_PREFIX: usize = 136; // SendAnonymousDirectPayload::FIXED_SIZE
-        assert!(
-            VEIL_MAX_DATA_LEN + LARGEST_SEND_PREFIX <= MAX_FRAME_BODY,
-            "VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN}) + prefix ({LARGEST_SEND_PREFIX}) \
-             must stay <= MAX_FRAME_BODY ({MAX_FRAME_BODY})"
-        );
+        // Asserting a compile-time-constant invariant is the whole point here —
+        // this test pins that VEIL_MAX_DATA_LEN can never grow past the headroom.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(
+                VEIL_MAX_DATA_LEN + LARGEST_SEND_PREFIX <= MAX_FRAME_BODY,
+                "VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN}) + prefix ({LARGEST_SEND_PREFIX}) \
+                 must stay <= MAX_FRAME_BODY ({MAX_FRAME_BODY})"
+            );
+        }
     }
 
     #[test]
