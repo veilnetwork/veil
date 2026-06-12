@@ -6770,6 +6770,104 @@ mod tests {
         net.stop().await;
     }
 
+    /// The maintenance tick re-publishes the blinded descriptor (onion-
+    /// registration follow-up): register_onion_service seals it once, but its DHT
+    /// key rotates per period, so the tick must re-seal it under the current
+    /// period or the by-identity send path rots after ~1–2 periods. We corrupt the
+    /// stored descriptor, run a (due-forcing) tick, and assert it's restored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn epic_anon_service_maintenance_republishes_blinded_descriptor() {
+        use veil_anonymity::blinded_descriptor as bd;
+        let n = 5;
+        let mut net = SimNetwork::builder()
+            .nodes(n)
+            .role(NodeRole::Core)
+            .anonymity_relay(vec![true, true, true, true, true])
+            .sovereign_identities(true)
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        for i in 0..n {
+            assert!(
+                net.node(i)
+                    .wait_sessions(n - 1, Duration::from_secs(45))
+                    .await,
+                "node {i} sessions",
+            );
+        }
+
+        for i in 1..=3 {
+            net.node(i)
+                .runtime
+                .debug_force_publish_relay_directory_entry()
+                .await
+                .expect("relay dir entry");
+            let key =
+                crate::node::anonymity::directory::relay_directory_dht_key(&net.node(i).node_id());
+            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                net.node(4).runtime.dht_put_local(key, bytes);
+            }
+        }
+
+        net.node(4)
+            .runtime
+            .register_onion_service(2)
+            .expect("register_onion_service");
+
+        let identity_vk = *net
+            .node(4)
+            .runtime
+            .sovereign_identity()
+            .expect("service identity")
+            .ed25519_signing_key()
+            .expect("ed25519 identity")
+            .verifying_key()
+            .as_bytes();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let period = bd::current_period(now);
+        let dht_key = bd::descriptor_dht_key(&identity_vk, period).unwrap();
+
+        // Descriptor present + openable right after register.
+        let initial = net
+            .node(4)
+            .runtime
+            .dht_get_local(&dht_key)
+            .expect("descriptor stored at register");
+        assert!(bd::open_descriptor(&identity_vk, period, &initial).is_some());
+
+        // Corrupt the stored descriptor; it must no longer open.
+        net.node(4).runtime.dht_put_local(dht_key, vec![0u8; 8]);
+        assert!(
+            net.node(4)
+                .runtime
+                .dht_get_local(&dht_key)
+                .and_then(|b| bd::open_descriptor(&identity_vk, period, &b))
+                .is_none(),
+            "corrupted descriptor must not open"
+        );
+
+        // Force a due maintenance tick (REFRESH_SECS = 150 s) and assert the
+        // descriptor is re-published + openable again.
+        net.node(4)
+            .runtime
+            .access()
+            .maintain_onion_circuits(now + 200);
+        let restored = net
+            .node(4)
+            .runtime
+            .dht_get_local(&dht_key)
+            .expect("descriptor re-published by the tick");
+        assert!(
+            bd::open_descriptor(&identity_vk, period, &restored).is_some(),
+            "the maintenance tick must re-seal a valid descriptor under the live key"
+        );
+
+        net.stop().await;
+    }
+
     // ── network-change triggers fast reconnect ────────────────────
 
     /// Simulates a WiFi → Cellular flip on a mobile node. Verifies that
