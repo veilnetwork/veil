@@ -150,7 +150,11 @@ pub struct CreateIdentityOptions {
 // ── Outputs ──────────────────────────────────────────────────────────────────
 
 /// Result of a successful `create_identity` call.
-#[derive(Debug)]
+//
+// Manual `Debug` (NOT derived): `master_seed` and `master_seed_phrase` are
+// recovery secrets — a derived Debug would dump the master seed / BIP-39 phrase
+// into any `{:?}` (tracing span, error context, test panic). Redact them.
+// Keep this in sync if secret-bearing fields are added (diff-audit defect M7).
 pub struct CreateIdentityOutput {
     /// Stable 32-byte identity address (BLAKE3 over master_pk).
     pub node_id: [u8; 32],
@@ -194,6 +198,22 @@ pub struct CreateIdentityOutput {
     /// up alongside (or as well as) the BIP-39 paper backup. `None`
     /// for the classical Ed25519 path.
     pub master_falcon_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for CreateIdentityOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateIdentityOutput")
+            .field("node_id", &self.node_id)
+            .field("master_seed_phrase", &"<redacted>")
+            .field("master_seed", &"<redacted>")
+            .field("document", &self.document)
+            .field("instance", &self.instance)
+            .field("identity_sk_path", &self.identity_sk_path)
+            .field("encrypted_master_path", &self.encrypted_master_path)
+            .field("identity_sk_seed", &self.identity_sk_seed)
+            .field("master_falcon_path", &self.master_falcon_path)
+            .finish()
+    }
 }
 
 // ── Main flow ────────────────────────────────────────────────────────────────
@@ -1024,7 +1044,9 @@ pub fn restore_identity(
 // ── Rotate flow ─────────────────────────────────────────────────
 
 /// Options controlling a `rotate_identity` call.
-#[derive(Debug)]
+//
+// Manual `Debug` (NOT derived): `master_seed` is a recovery secret (diff-audit
+// defect M7). Redact it; a derived Debug would print the raw seed.
 pub struct RotateIdentityOptions {
     /// Directory containing the existing identity state.
     pub veil_dir: PathBuf,
@@ -1041,6 +1063,17 @@ pub struct RotateIdentityOptions {
     /// Unix seconds the new document's freshness window ends.
     /// Capped at `now_unix + MAX_FRESHNESS_WINDOW_SECS`.
     pub valid_until_unix: u64,
+}
+
+impl std::fmt::Debug for RotateIdentityOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotateIdentityOptions")
+            .field("veil_dir", &self.veil_dir)
+            .field("master_seed", &"<redacted>")
+            .field("now_unix", &self.now_unix)
+            .field("valid_until_unix", &self.valid_until_unix)
+            .finish()
+    }
 }
 
 /// Result of a successful `rotate_identity` call.
@@ -2038,6 +2071,26 @@ mod tests {
     use crate::master_file::load_master_seed_encrypted;
     use crate::master_seed::decode_master_seed_from_phrase;
     use crate::verify::verify_identity_document;
+
+    #[test]
+    fn rotate_options_debug_redacts_master_seed() {
+        // diff-audit M7: a derived Debug would dump the raw master seed. The
+        // manual impl must redact it. (CreateIdentityOutput / TargetTransport-
+        // Outcome use the identical manual-redact pattern; this is the cheaply
+        // constructible one — no IdentityDocument fixture needed.)
+        let opts = RotateIdentityOptions {
+            veil_dir: std::path::PathBuf::from("/tmp/veil-x"),
+            master_seed: Zeroizing::new([0xAB; MASTER_SEED_LEN]),
+            now_unix: 1,
+            valid_until_unix: 2,
+        };
+        let dbg = format!("{opts:?}");
+        assert!(dbg.contains("<redacted>"), "must mark master_seed redacted");
+        assert!(
+            !dbg.contains("171"),
+            "raw seed byte 0xAB (171) must not appear in Debug: {dbg}"
+        );
+    }
 
     /// PoW difficulty kept at 0 (dropped document-level
     /// PoW); retained as an inert field on `CreateIdentityOptions`.
