@@ -293,6 +293,63 @@ class VeilClient implements Finalizable {
     });
   }
 
+  /// DIRECT (non-rendezvous) sender-anonymous send to a KNOWN peer addressed by
+  /// its [targetNodeId] + [targetX25519Pk] (each 32 bytes). The source-routed
+  /// onion hides our location from every relay; the receiver sees
+  /// `src_node_id = [0;32]` and never learns who sent it. For reaching a peer
+  /// whose transport node_id + anonymity x25519 you already know — NOT a
+  /// location-anonymous service (use [sendToOnionService] for those).
+  /// Fire-and-forget (no end-to-end ack).
+  Future<void> sendAnonymousDirect({
+    required Uint8List targetNodeId,
+    required Uint8List targetX25519Pk,
+    required Uint8List targetAppId,
+    required int targetEndpointId,
+    required Uint8List srcAppId,
+    required Uint8List data,
+    int hopCount = 3,
+  }) async {
+    _ensureOpen();
+    if (targetNodeId.length != 32 ||
+        targetX25519Pk.length != 32 ||
+        targetAppId.length != 32 ||
+        srcAppId.length != 32) {
+      throw ArgumentError(
+          'target_node_id, target_x25519_pk, target_app_id and src_app_id must be 32 bytes');
+    }
+    return Future(() {
+      final nodeId = calloc<Uint8>(32);
+      final x25519 = calloc<Uint8>(32);
+      final appId = calloc<Uint8>(32);
+      final srcApp = calloc<Uint8>(32);
+      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        nodeId.asTypedList(32).setAll(0, targetNodeId);
+        x25519.asTypedList(32).setAll(0, targetX25519Pk);
+        appId.asTypedList(32).setAll(0, targetAppId);
+        srcApp.asTypedList(32).setAll(0, srcAppId);
+        if (data.isNotEmpty) {
+          dataPtr.asTypedList(data.length).setAll(0, data);
+        }
+        final rc = ffi.veilSendAnonymousDirect(_handle, nodeId, x25519, appId,
+            targetEndpointId, srcApp, hopCount, dataPtr, data.length, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+              'send_anonymous_direct failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+      } finally {
+        calloc.free(nodeId);
+        calloc.free(x25519);
+        calloc.free(appId);
+        calloc.free(srcApp);
+        if (dataPtr != nullptr) calloc.free(dataPtr);
+        calloc.free(errOut);
+      }
+    });
+  }
+
   /// Consume a bootstrap-invite URI (Epic 489.7) — typically scanned
   /// from a QR code or pasted from a sharing channel.  The daemon
   /// decodes plain / encrypted / signed formats automatically and

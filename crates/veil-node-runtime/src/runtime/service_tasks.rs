@@ -2648,6 +2648,38 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                 .await
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_anonymous_direct<'a>(
+        &'a self,
+        target_node_id: [u8; 32],
+        target_x25519_pk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        src_app_id: [u8; 32],
+        data: &'a [u8],
+        hop_count: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), veil_types::AnonOnionSendError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.access
+                .send_anonymous(
+                    target_node_id,
+                    target_x25519_pk,
+                    target_app_id,
+                    target_endpoint_id,
+                    src_app_id,
+                    data,
+                    hop_count,
+                )
+                .map_err(super::map_sender_err)
+        })
+    }
 }
 
 impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {

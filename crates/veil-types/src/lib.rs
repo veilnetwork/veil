@@ -237,6 +237,27 @@ pub trait AnonOnionSender: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
     >;
+
+    /// DIRECT (non-rendezvous) sender-anonymous send to a KNOWN peer addressed by
+    /// its `(target_node_id, target_x25519_pk)`. The source-routed onion hides the
+    /// sender's location from every relay; the receiver sees `src_node_id =
+    /// [0;32]` (never learns who sent it). For reaching a peer whose transport
+    /// address + anonymity x25519 the caller already knows — NOT a
+    /// location-anonymous service (use the onion-service paths for those). No
+    /// sovereign identity required. Errors are local/pre-transmit.
+    #[allow(clippy::too_many_arguments)]
+    fn send_anonymous_direct<'a>(
+        &'a self,
+        target_node_id: [u8; 32],
+        target_x25519_pk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        src_app_id: [u8; 32],
+        data: &'a [u8],
+        hop_count: usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
+    >;
 }
 
 // ── Wire-format constants shared by proto + crypto ────────────────────────────

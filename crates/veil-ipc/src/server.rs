@@ -2051,6 +2051,48 @@ async fn handle_ipc_client(
                         frame.extend_from_slice(&status.to_be_bytes());
                         wh.write_all(&frame).await?;
                     }
+                    Ok(LocalAppMsg::SendAnonymousDirect) => {
+                        use veil_proto::ipc::{SendAnonymousDirectPayload, ipc_send_err};
+                        // 0 = ok; else an ipc_send_err. Direct sender-anonymous
+                        // onion send to a known peer (no rendezvous).
+                        let status: u16 = match SendAnonymousDirectPayload::decode(&body) {
+                            Ok(p) => match anon_onion_sender.as_deref() {
+                                Some(s) => {
+                                    match s
+                                        .send_anonymous_direct(
+                                            p.target_node_id,
+                                            p.target_x25519_pk,
+                                            p.target_app_id,
+                                            p.target_endpoint_id,
+                                            p.src_app_id,
+                                            &p.data,
+                                            p.hop_count as usize,
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => 0,
+                                        Err(veil_types::AnonOnionSendError::NoRelays) => {
+                                            ipc_send_err::NO_ROUTE
+                                        }
+                                        Err(veil_types::AnonOnionSendError::PayloadTooLarge) => {
+                                            ipc_send_err::PAYLOAD_TOO_LARGE
+                                        }
+                                        Err(_) => ipc_send_err::NO_ROUTE,
+                                    }
+                                }
+                                None => ipc_send_err::NO_ROUTE,
+                            },
+                            Err(_) => ipc_send_err::INVALID_FLAGS,
+                        };
+                        let mut hdr = FrameHeader::new(
+                            FrameFamily::LocalApp as u8,
+                            LocalAppMsg::SendAnonymousDirectResult as u16,
+                        );
+                        hdr.body_len = 2;
+                        let mut frame = codec::encode_header(&hdr).to_vec();
+                        frame.extend_from_slice(&status.to_be_bytes());
+                        wh.write_all(&frame).await?;
+                    }
                     Ok(LocalAppMsg::TransportHintQuery) => {
                         handle_transport_hint_query(&mut wh, hint_registry.as_ref()).await?;
                     }

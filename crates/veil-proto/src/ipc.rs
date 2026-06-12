@@ -1696,6 +1696,68 @@ impl SendToOnionServicePayload {
     }
 }
 
+// ── SendAnonymousDirectPayload ───────────────────────────────────────────────
+
+/// App → daemon request for a DIRECT (non-rendezvous) sender-anonymous send to a
+/// KNOWN peer addressed by its `(target_node_id, target_x25519_pk)`. The receiver
+/// sees `src_node_id = [0;32]`; `src_app_id` rides inside the sealed payload for
+/// the receiver's app-level routing only.
+///
+/// Wire layout:
+/// ```text
+/// [0..32]    target_node_id [u8; 32]
+/// [32..64]   target_x25519_pk [u8; 32]      receiver anonymity x25519
+/// [64..96]   target_app_id [u8; 32]
+/// [96..128]  src_app_id [u8; 32]
+/// [128..132] target_endpoint_id u32 BE
+/// [132..136] hop_count u32 BE               circuit length; daemon clamps to ≥ 1
+/// [136..]    data                            opaque payload (tail)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendAnonymousDirectPayload {
+    pub target_node_id: [u8; 32],
+    pub target_x25519_pk: [u8; 32],
+    pub target_app_id: [u8; 32],
+    pub src_app_id: [u8; 32],
+    pub target_endpoint_id: u32,
+    pub hop_count: u32,
+    pub data: Vec<u8>,
+}
+
+impl SendAnonymousDirectPayload {
+    pub const FIXED_SIZE: usize = 32 + 32 + 32 + 32 + 4 + 4; // 136
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::FIXED_SIZE + self.data.len());
+        out.extend_from_slice(&self.target_node_id);
+        out.extend_from_slice(&self.target_x25519_pk);
+        out.extend_from_slice(&self.target_app_id);
+        out.extend_from_slice(&self.src_app_id);
+        out.extend_from_slice(&self.target_endpoint_id.to_be_bytes());
+        out.extend_from_slice(&self.hop_count.to_be_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::FIXED_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::FIXED_SIZE,
+                got: buf.len(),
+            });
+        }
+        Ok(Self {
+            target_node_id: super::read_array::<32>(buf, 0)?,
+            target_x25519_pk: super::read_array::<32>(buf, 32)?,
+            target_app_id: super::read_array::<32>(buf, 64)?,
+            src_app_id: super::read_array::<32>(buf, 96)?,
+            target_endpoint_id: super::read_u32_be(buf, 128)?,
+            hop_count: super::read_u32_be(buf, 132)?,
+            data: buf[Self::FIXED_SIZE..].to_vec(),
+        })
+    }
+}
+
 // ── AppIpcRtSendPayload ─────────────────────────────────────────────────────
 
 /// Sent by the IPC client to dispatch a real-time (RT) frame into the veil.
@@ -5067,6 +5129,30 @@ mod tests {
     #[test]
     fn send_to_onion_service_payload_short_buf_errs() {
         assert!(SendToOnionServicePayload::decode(&[0u8; 104]).is_err());
+    }
+
+    #[test]
+    fn send_anonymous_direct_payload_roundtrip() {
+        let p = SendAnonymousDirectPayload {
+            target_node_id: [0x11; 32],
+            target_x25519_pk: [0x22; 32],
+            target_app_id: [0x33; 32],
+            src_app_id: [0x44; 32],
+            target_endpoint_id: 0xCAFE,
+            hop_count: 3,
+            data: b"direct anon".to_vec(),
+        };
+        let bytes = p.encode();
+        assert_eq!(
+            bytes.len(),
+            SendAnonymousDirectPayload::FIXED_SIZE + p.data.len()
+        );
+        assert_eq!(SendAnonymousDirectPayload::decode(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn send_anonymous_direct_payload_short_buf_errs() {
+        assert!(SendAnonymousDirectPayload::decode(&[0u8; 135]).is_err());
     }
 
     fn sample_auth_deliver() -> AuthAppDeliver {
