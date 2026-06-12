@@ -6372,8 +6372,15 @@ impl NodeServices {
             .as_ref()
             .ok_or(veil_anonymity::sender::SenderError::MissingSenderIdentity)?;
 
-        // Optionally set up an ephemeral reply path (no public ad).
-        let reply_block = match reply {
+        const REPLY_CIRCUIT_HOPS: usize = 2;
+        // Optionally set up an ephemeral reply path (no public ad). diff-audit
+        // S4: we PREPARE the reply block (select the relay path + cookie) here so
+        // its bytes are included in the size validation below, but DEFER actually
+        // building the onion circuit (which registers a cookie at R_a) until
+        // AFTER all the PayloadTooLarge / fragment-budget checks pass — otherwise
+        // a late size failure would strand the ephemeral circuit + its R_a
+        // registration to expire on idle-GC.
+        let (reply_block, pending_reply_circuit) = match reply {
             Some((reply_app_id, reply_endpoint_id)) => {
                 // We must own the anonymity key to unseal the eventual reply —
                 // i.e. be receive-capable (`receive_anonymous`/`relay_capable`).
@@ -6383,13 +6390,11 @@ impl NodeServices {
                         return Err(veil_anonymity::sender::SenderError::MissingReplyCapability);
                     }
                 };
-                // Register the reply cookie over an ONION CIRCUIT to R_a (not a
-                // direct session), so R_a never learns OUR location either (1c) —
-                // the same location-hiding the onion-service registration gives.
-                // No ad is published: the signed reply block IS the private
-                // descriptor sent to the replier. Ephemeral (build-once, no
-                // maintenance entry) — the reply happens within the block's TTL.
-                const REPLY_CIRCUIT_HOPS: usize = 2;
+                // The reply cookie will be registered over an ONION CIRCUIT to
+                // R_a (not a direct session), so R_a never learns OUR location
+                // either (1c). No ad is published: the signed reply block IS the
+                // private descriptor sent to the replier. Ephemeral (build-once,
+                // no maintenance entry) — the reply happens within the block TTL.
                 let relay_path =
                     self.select_onion_relay_path(REPLY_CIRCUIT_HOPS)
                         .map_err(|_| {
@@ -6406,14 +6411,7 @@ impl NodeServices {
                 // concern (L1 only matters for the rebuilt hosted-service circuits).
                 let reply_reg_kp =
                     veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
-                self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp)
-                    .map_err(|_| {
-                        veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
-                            need: REPLY_CIRCUIT_HOPS,
-                            have: 0,
-                        }
-                    })?;
-                Some(veil_proto::ReplyBlock {
+                let block = veil_proto::ReplyBlock {
                     rendezvous_node_id: relay,
                     auth_cookie: cookie,
                     x25519_pk,
@@ -6424,9 +6422,10 @@ impl NodeServices {
                     // circuit path (kept for wire compatibility / the legacy
                     // session path).
                     receiver_node_id: *self.identity.local_identity.node_id.as_bytes(),
-                })
+                };
+                (Some(block), Some((relay_path, cookie, reply_reg_kp)))
             }
-            None => None,
+            None => (None, None),
         };
 
         // Build + sign the whole message. dst = the ad's receiver_node_id (bound
@@ -6488,6 +6487,20 @@ impl NodeServices {
                 max: chunk_size * veil_proto::MAX_AUTH_DELIVER_FRAGMENTS as usize,
             });
         }
+
+        // S4: all size/fragment validation passed — NOW build the ephemeral reply
+        // circuit (registers the cookie at R_a). Doing it here means a size
+        // failure above returns without ever creating a circuit to strand.
+        if let Some((relay_path, cookie, reply_reg_kp)) = pending_reply_circuit {
+            self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp)
+                .map_err(|_| {
+                    veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                        need: REPLY_CIRCUIT_HOPS,
+                        have: 0,
+                    }
+                })?;
+        }
+
         let mut msg_id = [0u8; 16];
         rand_core::OsRng.fill_bytes(&mut msg_id);
 
