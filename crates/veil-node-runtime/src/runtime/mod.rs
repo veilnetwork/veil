@@ -6155,7 +6155,6 @@ impl NodeServices {
             return;
         };
         let identity_sk = ed.to_bytes();
-        let identity_vk = ed.verifying_key().to_bytes();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -6169,7 +6168,6 @@ impl NodeServices {
         };
         if let Some((dht_key, bytes)) = veil_anonymity::blinded_descriptor::seal_descriptor(
             &identity_sk,
-            &identity_vk,
             period,
             &body,
         ) {

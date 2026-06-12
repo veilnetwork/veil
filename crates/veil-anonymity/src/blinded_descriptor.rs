@@ -119,16 +119,22 @@ const NONCE_LEN: usize = 12;
 /// Service side: seal `body` into a publishable blinded descriptor for `period`,
 /// returning `(dht_key, descriptor_bytes)`. `identity_sk` is the 32-byte Ed25519
 /// identity seed.
+///
+/// diff-audit D6: the verifying key is DERIVED from `identity_sk` here rather
+/// than accepted as a parameter. Previously a caller could pass an `(sk, vk)`
+/// pair that disagreed, producing a descriptor signed under one blinded key but
+/// published under another's DHT key / encryption key — a record that silently
+/// failed its own self-verification on every reader.
 pub fn seal_descriptor(
     identity_sk: &[u8; 32],
-    identity_vk: &[u8; 32],
     period: u64,
     body: &BlindedDescriptorBody,
 ) -> Option<([u8; 32], Vec<u8>)> {
-    let blinded_pub = veil_crypto::key_blinding::blinded_public(identity_vk, period)?;
+    let identity_vk = veil_crypto::key_blinding::ed25519_public_from_seed(identity_sk);
+    let blinded_pub = veil_crypto::key_blinding::blinded_public(&identity_vk, period)?;
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
-    let key = enc_key(identity_vk, period);
+    let key = enc_key(&identity_vk, period);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     let ciphertext = cipher
         .encrypt(
@@ -155,7 +161,7 @@ pub fn seal_descriptor(
     out.extend_from_slice(&ciphertext);
     out.extend_from_slice(&sig);
 
-    let dht_key = descriptor_dht_key(identity_vk, period)?;
+    let dht_key = descriptor_dht_key(&identity_vk, period)?;
     Some((dht_key, out))
 }
 
@@ -295,7 +301,7 @@ mod tests {
         let (id_sk, id_vk) = identity();
         let period = 7u64;
         let b = body(0xA5);
-        let (dht_key, desc) = seal_descriptor(&id_sk, &id_vk, period, &b).unwrap();
+        let (dht_key, desc) = seal_descriptor(&id_sk, period, &b).unwrap();
         // DHT key matches the client-derived one (both from the identity).
         assert_eq!(dht_key, descriptor_dht_key(&id_vk, period).unwrap());
         assert_eq!(open_descriptor(&id_vk, period, &desc).unwrap(), b);
@@ -308,7 +314,7 @@ mod tests {
         // which the gate binds to the STORE key.
         let (id_sk, id_vk) = identity();
         let period = 9u64;
-        let (dht_key, desc) = seal_descriptor(&id_sk, &id_vk, period, &body(0x5A)).unwrap();
+        let (dht_key, desc) = seal_descriptor(&id_sk, period, &body(0x5A)).unwrap();
 
         // Valid descriptor → its canonical key equals descriptor_dht_key.
         assert_eq!(verify_descriptor_self(&desc), Some(dht_key));
@@ -337,7 +343,7 @@ mod tests {
     #[test]
     fn wrong_period_or_identity_or_tamper_rejected() {
         let (id_sk, id_vk) = identity();
-        let (_k, desc) = seal_descriptor(&id_sk, &id_vk, 1, &body(1)).unwrap();
+        let (_k, desc) = seal_descriptor(&id_sk, 1, &body(1)).unwrap();
         assert!(open_descriptor(&id_vk, 2, &desc).is_none(), "wrong period");
         let (_, other) = identity();
         assert!(
