@@ -181,7 +181,9 @@ struct Partial {
 /// DoS bounds (the sender is onion-anonymous, so we cannot rate-limit per
 /// sender): a global byte cap, a concurrent-message cap, a per-message byte cap
 /// ([`veil_proto::MAX_AUTH_DELIVER_MSG_BYTES`]), and a timeout that GCs
-/// partials. On pressure the oldest partial is evicted.
+/// partials. On concurrent-message pressure the LEAST-COMPLETE partial is
+/// evicted (Δ2-g2), so a flood of fresh `msg_id`s cannot starve a nearly-done
+/// legitimate reassembly.
 pub struct AuthDeliverReassembler {
     messages: std::collections::HashMap<[u8; 16], Partial>,
     /// Insertion order (oldest at front) for timeout-GC + FIFO eviction.
@@ -222,14 +224,25 @@ impl AuthDeliverReassembler {
         }
     }
 
-    /// Evict the oldest partial (front of `order`).
-    fn evict_oldest(&mut self) {
-        while let Some(old) = self.order.pop_front() {
-            if let Some(p) = self.messages.remove(&old) {
-                self.total_bytes = self.total_bytes.saturating_sub(p.bytes);
-                return;
-            }
-            // stale order entry (already removed) — keep popping.
+    /// Evict ONE partial under cap pressure, choosing the LEAST-COMPLETE one
+    /// (fewest fragments received; ties broken by oldest, then id for
+    /// determinism) — diff-audit Δ2-g2.
+    ///
+    /// FIFO-by-age (the previous behaviour) is the worst choice against a flood:
+    /// an attacker spraying brand-new single-fragment `msg_id`s would evict the
+    /// OLDEST partial, i.e. exactly the legitimate message closest to completing.
+    /// Evicting the least-progressed partial instead means a near-complete real
+    /// message survives a burst of fresh attacker partials. The sender is
+    /// onion-anonymous so per-sender limiting is impossible; this is the
+    /// available fairness lever.
+    fn evict_one(&mut self) {
+        let victim = self
+            .messages
+            .iter()
+            .map(|(id, p)| (p.received_count, p.started_at, *id))
+            .min();
+        if let Some((_, _, id)) = victim {
+            self.remove(&id);
         }
     }
 
@@ -315,9 +328,10 @@ impl AuthDeliverReassembler {
         if count == 1 {
             return ReassembleOutcome::Complete(frag.chunk);
         }
-        // Concurrent-message cap — evict oldest to make room.
+        // Concurrent-message cap — evict the least-complete partial to make room
+        // (Δ2-g2: protects nearly-done legit messages from a fresh-msg_id flood).
         while self.messages.len() >= self.max_messages {
-            self.evict_oldest();
+            self.evict_one();
         }
         let chunk_len = frag.chunk.len();
         let mut received = vec![None; count as usize];
@@ -338,23 +352,22 @@ impl AuthDeliverReassembler {
         ReassembleOutcome::Pending
     }
 
-    /// Evict oldest partials until under the global byte cap, never evicting
-    /// `keep` (the message we just touched).
+    /// Evict partials until under the global byte cap, never evicting `keep`
+    /// (the message we just touched). Δ2-g2: targets the LEAST-complete partial
+    /// (excluding `keep`), consistent with the concurrent-message cap, so a
+    /// byte-flood of fresh msg_ids can't starve a nearly-done legit message.
     fn enforce_total_bytes(&mut self, keep: &[u8; 16]) {
         while self.total_bytes > self.max_total_bytes {
-            let Some(&front) = self.order.front() else {
-                break;
-            };
-            if &front == keep && self.order.len() == 1 {
-                break; // only the just-touched message remains.
+            let victim = self
+                .messages
+                .iter()
+                .filter(|(id, _)| *id != keep)
+                .map(|(id, p)| (p.received_count, p.started_at, *id))
+                .min();
+            match victim {
+                Some((_, _, id)) => self.remove(&id),
+                None => break, // only `keep` remains
             }
-            if &front == keep {
-                // rotate keep to the back so we evict something else first.
-                self.order.pop_front();
-                self.order.push_back(front);
-                continue;
-            }
-            self.evict_oldest();
         }
     }
 }
@@ -682,16 +695,41 @@ mod tests {
     }
 
     #[test]
-    fn reassembler_concurrent_cap_evicts_oldest() {
+    fn reassembler_concurrent_cap_evicts_under_pressure() {
         let mut r = AuthDeliverReassembler::with_params(2, 1 << 20, 300);
-        // 3 distinct in-flight 2-fragment messages; cap is 2 → the first is evicted.
+        // 3 distinct in-flight 2-fragment messages, all equally (1/2) complete;
+        // cap is 2 → one is evicted. With equal completeness the tie-break is
+        // (started_at, msg_id), so the smallest id ([0;16]) goes.
         for id in 0u8..3 {
             let f = fragments_of([id; 16], &[0u8; 50], 2);
             assert_eq!(r.push(f[0].clone(), NOW), ReassembleOutcome::Pending);
         }
-        // Completing message 0 should NOT succeed — it was evicted, so its second
-        // fragment starts a fresh partial (pending), not a completion.
         let f0 = fragments_of([0; 16], &[0u8; 50], 2);
         assert_eq!(r.push(f0[1].clone(), NOW), ReassembleOutcome::Pending);
+    }
+
+    #[test]
+    fn reassembler_evicts_least_complete_not_oldest_g2() {
+        // diff-audit Δ2-g2: under a flood of fresh msg_ids, a nearly-complete
+        // legit message must survive — eviction targets the LEAST-complete
+        // partial, not the oldest.
+        let mut r = AuthDeliverReassembler::with_params(2, 1 << 20, 600);
+        let a = fragments_of([0xAA; 16], &[1u8; 90], 3); // 3 fragments
+        let b = fragments_of([0xBB; 16], &[2u8; 90], 3);
+        let c = fragments_of([0xCC; 16], &[3u8; 90], 3);
+        // A (oldest) advances to 2/3; B is newer at 1/3. messages = {A, B}.
+        assert_eq!(r.push(a[0].clone(), NOW), ReassembleOutcome::Pending);
+        assert_eq!(r.push(a[1].clone(), NOW), ReassembleOutcome::Pending);
+        assert_eq!(r.push(b[0].clone(), NOW), ReassembleOutcome::Pending);
+        // A fresh msg_id forces an eviction: B (least complete) goes, A survives.
+        assert_eq!(r.push(c[0].clone(), NOW), ReassembleOutcome::Pending);
+        // A's final fragment COMPLETES it (proves A was not evicted). Under the
+        // old FIFO-by-age rule, A (oldest) would have been evicted → Pending.
+        assert!(matches!(
+            r.push(a[2].clone(), NOW),
+            ReassembleOutcome::Complete(_)
+        ));
+        // B (evicted) no longer completes from its remaining fragments alone.
+        assert_eq!(r.push(b[1].clone(), NOW), ReassembleOutcome::Pending);
     }
 }
