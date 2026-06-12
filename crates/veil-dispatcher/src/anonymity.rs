@@ -1395,7 +1395,8 @@ mod tests {
         let cookie = [0x5A; 16];
         let kp = generate_keypair(SignatureAlgorithm::Ed25519);
         let reg_pk: [u8; 32] = STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
-        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk);
+        let epoch = 1u64;
+        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
         let sig = sign_message(
             SignatureAlgorithm::Ed25519,
             &kp.public_key,
@@ -1406,6 +1407,7 @@ mod tests {
         let reg = CircuitRegisterPayload {
             cookie,
             reg_pk,
+            epoch,
             signature: sig,
         };
 
