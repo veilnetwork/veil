@@ -769,6 +769,36 @@ int veil_send_to_onion_service_anonymous(VeilHandle *handle,
 ;
 
 /**
+ * DIRECT (non-rendezvous) sender-anonymous send to a KNOWN peer addressed by its
+ * `(target_node_id, target_x25519_pk)` (each 32 bytes). The source-routed onion
+ * hides the sender's location from every relay; the receiver sees
+ * `src_node_id = [0;32]` and never learns who sent it. For reaching a peer whose
+ * transport node_id + anonymity x25519 the caller already knows — NOT a
+ * location-anonymous service (use `veil_send_to_onion_service` for those).
+ * `hop_count` is clamped to ≥ 1 by the daemon.
+ *
+ * `VEIL_OK` once handed to the first hop (fire-and-forget, NOT delivery-
+ * confirmed); `VEIL_ERR` with a detail otherwise.
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*`; `target_node_id`, `target_x25519_pk`,
+ * `target_app_id`, and `src_app_id` must each be readable for 32 bytes; `data`
+ * must be readable for `len` bytes (or NULL iff `len == 0`).
+ */
+
+int veil_send_anonymous_direct(VeilHandle *handle,
+                               const uint8_t *target_node_id,
+                               const uint8_t *target_x25519_pk,
+                               const uint8_t *target_app_id,
+                               uint32_t target_endpoint_id,
+                               const uint8_t *src_app_id,
+                               uint32_t hop_count,
+                               const uint8_t *data,
+                               size_t len,
+                               char **err_out)
+;
+
+/**
  * Deposit `blob` for an offline `receiver_id` at the daemon's mailbox
  *. No `auth_cookie` required.
  *

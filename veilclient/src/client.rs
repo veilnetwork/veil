@@ -422,6 +422,9 @@ pub(crate) struct DispatchTable {
     /// Pending oneshot replies for `SendToOnionService` (2-byte status; 0=ok).
     pub pending_send_to_onion_service:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
+    /// Pending oneshot replies for `SendAnonymousDirect` (2-byte status; 0=ok).
+    pub pending_send_anonymous_direct:
+        std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
     ///.4 P2: pending oneshot replies for `MailboxPut`.
     pub pending_mailbox_put:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<MailboxPutReply>>,
@@ -548,6 +551,7 @@ impl DispatchTable {
             pending_set_wake_hmac_envelope: std::collections::VecDeque::new(),
             pending_register_onion_service: std::collections::VecDeque::new(),
             pending_send_to_onion_service: std::collections::VecDeque::new(),
+            pending_send_anonymous_direct: std::collections::VecDeque::new(),
             pending_mailbox_put: std::collections::VecDeque::new(),
             pending_mailbox_fetch: std::collections::VecDeque::new(),
             pending_mailbox_ack: std::collections::VecDeque::new(),
@@ -1065,6 +1069,59 @@ impl VeilClient {
             Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
             Err(_) => Err(ClientError::Protocol(
                 "timeout waiting for SendToOnionServiceResult".into(),
+            )),
+        }
+    }
+
+    /// DIRECT (non-rendezvous) sender-anonymous send to a KNOWN peer addressed by
+    /// its `(target_node_id, target_x25519_pk)`. The source-routed onion hides our
+    /// location from every relay; the receiver sees `src_node_id = [0;32]` (never
+    /// learns who sent it). For reaching a peer whose transport node_id +
+    /// anonymity x25519 you already know — NOT a location-anonymous service (use
+    /// [`Self::send_to_onion_service`] for those). `hop_count` is clamped to ≥ 1 by
+    /// the daemon. Fire-and-forget (no end-to-end ack).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_anonymous_direct(
+        &self,
+        target_node_id: [u8; 32],
+        target_x25519_pk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        src_app_id: [u8; 32],
+        hop_count: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_send_anonymous_direct);
+            if d.pending_send_anonymous_direct.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(format!(
+                    "send_anonymous_direct queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
+                )));
+            }
+            d.pending_send_anonymous_direct.push_back(tx);
+        }
+        let payload = veilcore::proto::SendAnonymousDirectPayload {
+            target_node_id,
+            target_x25519_pk,
+            target_app_id,
+            src_app_id,
+            target_endpoint_id,
+            hop_count,
+            data: data.to_vec(),
+        };
+        self.writer
+            .write_frame(LocalAppMsg::SendAnonymousDirect as u16, &payload.encode())
+            .await?;
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(code)) => Err(ClientError::Protocol(format!(
+                "send_anonymous_direct rejected by daemon (status {code})"
+            ))),
+            Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
+            Err(_) => Err(ClientError::Protocol(
+                "timeout waiting for SendAnonymousDirectResult".into(),
             )),
         }
     }
@@ -2334,6 +2391,13 @@ async fn reader_task(
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
                 if let Some(tx) = pop_next_open(&mut d.pending_send_to_onion_service) {
+                    let _ = tx.send(status);
+                }
+            }
+            LocalAppMsg::SendAnonymousDirectResult if body.len() >= 2 => {
+                let status = u16::from_be_bytes([body[0], body[1]]);
+                let mut d = dispatch.lock().await;
+                if let Some(tx) = pop_next_open(&mut d.pending_send_anonymous_direct) {
                     let _ = tx.send(status);
                 }
             }
