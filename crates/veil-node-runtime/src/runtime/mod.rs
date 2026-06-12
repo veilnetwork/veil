@@ -5941,6 +5941,7 @@ impl NodeServices {
         &self,
         relay_path: &[[u8; 32]],
         cookie: [u8; 16],
+        reg_kp: &veil_crypto::GeneratedKeyPair,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
         use base64::Engine;
         use veil_anonymity::circuit_origin::{OriginHop, build_origin_circuit};
@@ -5970,18 +5971,20 @@ impl NodeServices {
             });
         }
 
-        // Fresh Ed25519 registration key; sign the cookie binding.
-        let kp = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+        // STABLE Ed25519 registration key (diff-audit L1): the caller persists it
+        // in the OnionServiceEntry and passes the SAME key on every rebuild, so R
+        // sees a same-reg_pk refresh instead of CookieClaimed (first-wins
+        // anti-squat against our own prior registration).
         let reg_pk: [u8; 32] = base64::engine::general_purpose::STANDARD
-            .decode(&kp.public_key)
+            .decode(&reg_kp.public_key)
             .ok()
             .and_then(|v| v.try_into().ok())
             .ok_or(AnonOnionSendError::NoIdentity)?;
         let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk);
         let sig = veil_crypto::sign_message(
             veil_types::SignatureAlgorithm::Ed25519,
-            &kp.public_key,
-            &kp.private_key,
+            &reg_kp.public_key,
+            &reg_kp.private_key,
             &msg,
         )
         .map_err(|_| AnonOnionSendError::NoIdentity)?;
@@ -6149,7 +6152,9 @@ impl NodeServices {
         relay_path: &[[u8; 32]],
         cookie: [u8; 16],
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
-        self.build_onion_circuit_once(relay_path, cookie)?;
+        // Mint the registration keypair ONCE here; every rebuild reuses it (L1).
+        let reg_keypair = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+        self.build_onion_circuit_once(relay_path, cookie, &reg_keypair)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -6161,6 +6166,7 @@ impl NodeServices {
             relay_path: relay_path.to_vec(),
             cookie,
             built_unix: now,
+            reg_keypair,
         });
         Ok(())
     }
@@ -6179,17 +6185,35 @@ impl NodeServices {
             let _ = self.register_onion_service(hops);
         }
 
+        // Evict expired circuit state (diff-audit L2): these GCs had ZERO prod
+        // callers, so the relay table, rendezvous registry and origin table grew
+        // unbounded — the origin table (cap 256) filled in ~10 h as each 150 s
+        // rebuild leaked an entry, after which builds failed and the service went
+        // dark. Run them here so idle/expired entries are reclaimed.
+        if let Some(t) = self.dispatcher.circuit_table.as_ref() {
+            t.gc(now_unix);
+        }
+        if let Some(r) = self.dispatcher.circuit_rendezvous.as_ref() {
+            r.gc(now_unix);
+        }
+        if let Some(o) = self.dispatcher.circuit_origin.as_ref() {
+            o.gc(now_unix);
+        }
+
         // Refresh at half the relay-side circuit idle TTL (300 s) → 150 s.
         const REFRESH_SECS: u64 = veil_anonymity::circuit_table::DEFAULT_CIRCUIT_TTL_SECS / 2;
-        let due: Vec<([u8; 16], Vec<[u8; 32]>)> = {
+        let due: Vec<([u8; 16], Vec<[u8; 32]>, veil_crypto::GeneratedKeyPair)> = {
             let svcs = lock!(self.anonymity.onion_services);
             svcs.iter()
                 .filter(|e| now_unix.saturating_sub(e.built_unix) >= REFRESH_SECS)
-                .map(|e| (e.cookie, e.relay_path.clone()))
+                .map(|e| (e.cookie, e.relay_path.clone(), e.reg_keypair.clone()))
                 .collect()
         };
-        for (cookie, relay_path) in due {
-            if self.build_onion_circuit_once(&relay_path, cookie).is_ok() {
+        for (cookie, relay_path, reg_keypair) in due {
+            if self
+                .build_onion_circuit_once(&relay_path, cookie, &reg_keypair)
+                .is_ok()
+            {
                 let mut svcs = lock!(self.anonymity.onion_services);
                 if let Some(e) = svcs.iter_mut().find(|e| e.cookie == cookie) {
                     e.built_unix = now_unix;
@@ -6292,7 +6316,12 @@ impl NodeServices {
                 let relay = *relay_path.last().expect("non-empty relay path");
                 let mut cookie = [0u8; 16];
                 rand_core::OsRng.fill_bytes(&mut cookie);
-                self.build_onion_circuit_once(&relay_path, cookie)
+                // Ephemeral one-shot reply circuit (build-once, no maintenance
+                // rebuild), so a fresh registration key is fine — no CookieClaimed
+                // concern (L1 only matters for the rebuilt hosted-service circuits).
+                let reply_reg_kp =
+                    veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+                self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp)
                     .map_err(|_| {
                         veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
                             need: REPLY_CIRCUIT_HOPS,

@@ -212,6 +212,12 @@ pub struct OnionServiceEntry {
     pub cookie: [u8; 16],
     /// Unix secs of the last (re)build, for the refresh cadence.
     pub built_unix: u64,
+    /// STABLE Ed25519 registration keypair for this service (diff-audit L1).
+    /// Generated ONCE at register time and reused on every rebuild: R's cookie
+    /// registry is first-wins anti-squat, so a fresh reg_pk per rebuild would
+    /// hit `CookieClaimed` against this service's own prior registration. Reusing
+    /// the same reg_pk reaches the registry's same-key refresh path instead.
+    pub reg_keypair: veil_crypto::GeneratedKeyPair,
 }
 
 impl AnonymityState {
