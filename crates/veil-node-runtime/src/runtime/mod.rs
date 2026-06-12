@@ -6212,6 +6212,23 @@ impl NodeServices {
         let mut svcs = lock!(self.anonymity.onion_services);
         // Replace any prior entry for the same cookie (re-register), else push.
         svcs.retain(|e| e.cookie != cookie);
+        // diff-audit S3: bound the live-service set. Each `register_onion_service`
+        // mints a FRESH cookie, so an IPC client looping the call would otherwise
+        // grow this Vec without limit — and every maintenance tick rebuilds AND
+        // re-publishes a descriptor for EACH entry, turning the leak into traffic
+        // amplification. Evict the oldest (FIFO) once at capacity so the work per
+        // tick stays bounded; the rate-limiter on the IPC arm bounds call rate.
+        const MAX_ONION_SERVICES: usize = 8;
+        while svcs.len() >= MAX_ONION_SERVICES {
+            let evicted = svcs.remove(0);
+            self.logger.warn(
+                "onion.service.evicted",
+                format!(
+                    "onion-service slot cap ({MAX_ONION_SERVICES}) reached — evicted oldest cookie={}",
+                    veil_util::bytes_to_hex(&evicted.cookie),
+                ),
+            );
+        }
         svcs.push(anonymity_state::OnionServiceEntry {
             relay_path: relay_path.to_vec(),
             cookie,
@@ -6229,10 +6246,17 @@ impl NodeServices {
         // Config-driven auto-start: if `[anonymity].onion_service` is on and we
         // haven't registered yet, do so now (once relays are available). Builds
         // once; the rebuild loop below keeps it alive.
-        if let Some(hops) = self.anonymity.onion_service_hops
-            && lock!(self.anonymity.onion_services).is_empty()
-        {
-            let _ = self.register_onion_service(hops);
+        //
+        // diff-audit S2: scope the `onion_services` lock so its guard is dropped
+        // BEFORE `register_onion_service` re-locks the same mutex. Folding the
+        // `is_empty()` check into the let-chain condition only avoids a
+        // self-deadlock thanks to the edition-2024 if-let temporary-drop rule —
+        // a latent footgun that an edition downgrade or refactor would re-arm.
+        if let Some(hops) = self.anonymity.onion_service_hops {
+            let none_registered = { lock!(self.anonymity.onion_services).is_empty() };
+            if none_registered {
+                let _ = self.register_onion_service(hops);
+            }
         }
 
         // Evict expired circuit state (diff-audit L2): these GCs had ZERO prod
