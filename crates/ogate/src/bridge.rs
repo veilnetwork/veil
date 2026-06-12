@@ -69,7 +69,10 @@ const EGRESS_FLUSH_BYTES_DEFAULT: usize = 14_000;
 /// would make `wrap_frame` return `OversizedFrame`, exit the writer task and
 /// tear down the whole session; we drop just that packet instead. Operators
 /// should keep the tunnel MTU at or below this. (audit cycle-8 H10.)
-const MAX_OBFS4_SOLO_PAYLOAD_BYTES: usize = 15_231;
+/// `pub(crate)` so `config::validate` can reject an MTU above the ceiling
+/// (diff-audit H6 — the old default 16000 sat ABOVE this, silently dropping
+/// every full-size packet).
+pub(crate) const MAX_OBFS4_SOLO_PAYLOAD_BYTES: usize = 15_231;
 
 // Compile-time invariant: the solo ceiling must stay strictly below the obfs4
 // frame ciphertext cap (`veil_obfs4::MAX_FRAME_CIPHERTEXT_BYTES = 16 * 1024`),
