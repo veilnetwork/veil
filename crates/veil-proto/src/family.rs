@@ -778,6 +778,13 @@ pub enum LocalAppMsg {
     /// daemon → app: result of `RegisterOnionService` (2-byte status code,
     /// `0` = ok, else an `ipc_send_err`).
     RegisterOnionServiceResult = 74,
+    /// App → daemon: send to a location-anonymous service addressed by its
+    /// Ed25519 IDENTITY key (resolves the blinded descriptor). Body is
+    /// `SendToOnionServicePayload`.
+    SendToOnionService = 75,
+    /// daemon → app: result of `SendToOnionService` (2-byte status code,
+    /// `0` = ok, else an `ipc_send_err`).
+    SendToOnionServiceResult = 76,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -859,6 +866,8 @@ impl TryFrom<u16> for LocalAppMsg {
             72 => Ok(LocalAppMsg::AnycastReportFailure),
             73 => Ok(LocalAppMsg::RegisterOnionService),
             74 => Ok(LocalAppMsg::RegisterOnionServiceResult),
+            75 => Ok(LocalAppMsg::SendToOnionService),
+            76 => Ok(LocalAppMsg::SendToOnionServiceResult),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,

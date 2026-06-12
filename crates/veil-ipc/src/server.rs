@@ -1993,6 +1993,51 @@ async fn handle_ipc_client(
                         frame.extend_from_slice(&status.to_be_bytes());
                         wh.write_all(&frame).await?;
                     }
+                    Ok(LocalAppMsg::SendToOnionService) => {
+                        use veil_proto::ipc::{SendToOnionServicePayload, ipc_send_err};
+                        // 0 = ok; else an ipc_send_err. Resolving + sending to an
+                        // onion service goes through the same anon_onion_sender.
+                        let status: u16 = match SendToOnionServicePayload::decode(&body) {
+                            Ok(p) => match anon_onion_sender.as_deref() {
+                                Some(s) => {
+                                    match s
+                                        .send_to_onion_service(
+                                            p.service_identity_vk,
+                                            p.target_app_id,
+                                            p.target_endpoint_id,
+                                            &p.data,
+                                            p.hop_count as usize,
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => 0,
+                                        Err(veil_types::AnonOnionSendError::NoRelays) => {
+                                            ipc_send_err::NO_ROUTE
+                                        }
+                                        Err(veil_types::AnonOnionSendError::NoIdentity) => {
+                                            ipc_send_err::NO_IDENTITY
+                                        }
+                                        Err(veil_types::AnonOnionSendError::PayloadTooLarge) => {
+                                            ipc_send_err::PAYLOAD_TOO_LARGE
+                                        }
+                                        // NoRendezvous → no resolvable/decryptable
+                                        // descriptor for that identity.
+                                        Err(_) => ipc_send_err::NO_RENDEZVOUS,
+                                    }
+                                }
+                                None => ipc_send_err::NO_RENDEZVOUS,
+                            },
+                            Err(_) => ipc_send_err::INVALID_FLAGS,
+                        };
+                        let mut hdr = FrameHeader::new(
+                            FrameFamily::LocalApp as u8,
+                            LocalAppMsg::SendToOnionServiceResult as u16,
+                        );
+                        hdr.body_len = 2;
+                        let mut frame = codec::encode_header(&hdr).to_vec();
+                        frame.extend_from_slice(&status.to_be_bytes());
+                        wh.write_all(&frame).await?;
+                    }
                     Ok(LocalAppMsg::TransportHintQuery) => {
                         handle_transport_hint_query(&mut wh, hint_registry.as_ref()).await?;
                     }
