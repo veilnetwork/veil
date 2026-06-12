@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
-use veilcore::proto::{LocalAppMsg, StreamClosePayload, StreamDataPayload};
+use veilcore::proto::{LocalAppMsg, StreamClosePayload, StreamDataPayload, StreamWindowPayload};
 
 use crate::client::{SharedWriter, StreamEvent, encode_frame};
 
@@ -45,13 +45,45 @@ pub struct VeilStream {
     /// Set once `poll_shutdown` has enqueued the STREAM_CLOSE frame, so a
     /// repeated `poll_shutdown` is a no-op instead of sending a second close.
     shutdown_sent: bool,
+    /// Bytes consumed by the app but not yet credited back to the daemon as
+    /// STREAM_WINDOW (diff-audit H5). The daemon debits the A→B flow-control
+    /// window per data frame and only refills it on an inbound STREAM_WINDOW
+    /// from this acceptor SDK; without crediting, a transfer past the initial
+    /// window gets force-closed mid-stream. Accumulated so a momentarily-full
+    /// IPC channel never drops a credit — `credit_window` retries next read.
+    pending_window: u32,
+    /// Only the ACCEPTOR (B) credits: the flow-control window is A→B
+    /// (opener→acceptor) only, and the daemon honours STREAM_WINDOW solely from
+    /// the acceptor. An opener crediting on its B→A reads would emit ignored
+    /// frames, so suppress it there.
+    is_acceptor: bool,
 }
 
 impl VeilStream {
+    /// Opener-side stream (A). Does NOT credit STREAM_WINDOW (see `is_acceptor`).
     pub(crate) fn new(
         stream_id: u32,
         writer: SharedWriter,
         rx: mpsc::Receiver<StreamEvent>,
+    ) -> Self {
+        Self::with_role(stream_id, writer, rx, false)
+    }
+
+    /// Acceptor-side stream (B). Credits STREAM_WINDOW as the app drains data so
+    /// the daemon refills the A→B window (diff-audit H5).
+    pub(crate) fn new_acceptor(
+        stream_id: u32,
+        writer: SharedWriter,
+        rx: mpsc::Receiver<StreamEvent>,
+    ) -> Self {
+        Self::with_role(stream_id, writer, rx, true)
+    }
+
+    fn with_role(
+        stream_id: u32,
+        writer: SharedWriter,
+        rx: mpsc::Receiver<StreamEvent>,
+        is_acceptor: bool,
     ) -> Self {
         let tx = writer.poll_sender();
         Self {
@@ -62,6 +94,30 @@ impl VeilStream {
             read_buf: Vec::new(),
             read_closed: false,
             shutdown_sent: false,
+            pending_window: 0,
+            is_acceptor,
+        }
+    }
+
+    /// Credit `n` consumed bytes back to the daemon's A→B flow-control window
+    /// (diff-audit H5). Acceptor-only (the daemon ignores opener credits).
+    /// Best-effort non-blocking send from the sync poll_read path: on a full
+    /// channel the amount stays pending and is retried on the next read, so
+    /// credits are never lost (only briefly delayed).
+    fn credit_window(&mut self, n: usize) {
+        if n == 0 || !self.is_acceptor {
+            return;
+        }
+        self.pending_window = self.pending_window.saturating_add(n as u32);
+        let payload = StreamWindowPayload {
+            stream_id: self.stream_id,
+            increment: self.pending_window,
+        };
+        if self
+            .writer
+            .try_send_frame(LocalAppMsg::StreamWindow as u16, &payload.encode())
+        {
+            self.pending_window = 0;
         }
     }
 
@@ -104,6 +160,7 @@ impl AsyncRead for VeilStream {
             let n = self.read_buf.len().min(buf.remaining());
             buf.put_slice(&self.read_buf[..n]);
             self.read_buf.drain(..n);
+            self.credit_window(n);
             return Poll::Ready(Ok(()));
         }
 
@@ -118,6 +175,9 @@ impl AsyncRead for VeilStream {
                 if n < data.len() {
                     self.read_buf.extend_from_slice(&data[n..]);
                 }
+                // Credit only the bytes actually delivered to the consumer; the
+                // buffered remainder is credited when a later read drains it.
+                self.credit_window(n);
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(StreamEvent::Close)) | Poll::Ready(None) => {
