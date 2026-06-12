@@ -6074,7 +6074,9 @@ mod tests {
             net.node(4)
                 .runtime
                 .access()
-                .send_reply(reply_id, reply_payload, 1)
+                // D3: the reply must come from the app that received the message
+                // (`app_b`), which owns the reply block.
+                .send_reply(reply_id, reply_payload, 1, app_b)
                 .await
                 .expect("send_reply must succeed");
 

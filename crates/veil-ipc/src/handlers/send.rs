@@ -310,7 +310,9 @@ pub(crate) async fn handle_ipc_send(
                 // Reply: the daemon takes the one-time block by id; the explicit
                 // destination fields are ignored. A consumed/expired/unknown id
                 // surfaces as NoRendezvous → REPLY_UNKNOWN below.
-                sender.send_reply(send.reply_id, &send.data).await
+                sender
+                    .send_reply(send.reply_id, &send.data, send.src_app_id)
+                    .await
             } else if send.expect_reply {
                 // Attach a one-time reply block addressed to our own
                 // (src_app_id, reply_endpoint_id) — no public ad published.

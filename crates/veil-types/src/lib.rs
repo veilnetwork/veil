@@ -183,13 +183,16 @@ pub trait AnonOnionSender: Send + Sync {
     >;
 
     /// Reply to an earlier authenticated message via the opaque `reply_id` the
-    /// recipient app received with it. The implementation consumes the one-time
-    /// reply block and sends back over the original sender's rendezvous path.
-    /// `NoRendezvous` means the id is unknown, already used, or expired.
+    /// recipient app received with it. The implementation sends back over the
+    /// original sender's rendezvous path. `src_app_id` is the replying app; it
+    /// must own the reply block (diff-audit D3) or the reply is rejected.
+    /// `NoRendezvous` means the id is unknown, not owned by `src_app_id`, or
+    /// expired.
     fn send_reply<'a>(
         &'a self,
         reply_id: u64,
         data: &'a [u8],
+        src_app_id: [u8; 32],
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
     >;
