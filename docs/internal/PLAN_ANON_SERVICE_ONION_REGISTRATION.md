@@ -98,6 +98,23 @@ Replace with:
 - The introduce's `receiver_node_id` namespacing (current squat defence) is
   retired for onion-registered cookies; the descriptor-signature replaces it.
 
+> **As-built (b4a) + the `reg_pk`-in-ad decision.** The shipped registry verifies
+> the registration's self-signature and is **first-registration-wins per cookie**
+> (`circuit_register`): a later party claiming a held cookie with a different
+> `reg_pk` is rejected. The legitimate service registers (fresh random cookie)
+> BEFORE publishing its ad, so it wins; a squatter who guesses a cookie can at
+> worst DROP sealed introduces (the introduce is sealed to the service x25519, so
+> never read) and can never re-bind a held cookie.
+>
+> **We deliberately do NOT add `reg_pk` to the `RendezvousAd` (the 2b task).** In
+> this architecture R never fetches the ad, so it cannot cross-check the
+> registration's `reg_pk` against an ad-committed one — the field would be inert.
+> The ad is already unforgeable (signed by the publisher's sovereign key), and
+> the client derives no extra guarantee from `reg_pk` either. `reg_pk`-in-ad would
+> only become meaningful if R fetched the descriptor (a Tor-v3-style design,
+> §7.4) — defer it to that. So 2b is **resolved as "decline (no-op now)"**, not
+> implemented.
+
 ### C. Introduce → forward DOWN the circuit (R-side)
 `handle_final_introduce` gains a branch: if the matched subscription is
 circuit-backed, wrap the introduce ciphertext as a **482.7 data cell** and emit
