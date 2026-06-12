@@ -6362,14 +6362,16 @@ impl NodeServices {
 
     /// Reply to a previously-received authenticated message via its one-time
     /// reply block. `reply_id` is the opaque handle the recipient app got
-    /// alongside the inbound message; we take (consume) the daemon-side block,
+    /// alongside the inbound message; we look the daemon-side block up,
     /// reconstruct the original sender's rendezvous path from it, and send an
     /// authenticated anonymous message back — WITHOUT either side publishing a
     /// public ad (the whole point of the reply channel: no presence leak).
     ///
     /// The reply itself carries no further reply block (`reply = None`): a v1
-    /// reply is terminal. The block is single-use — a second `send_reply` with
-    /// the same id fails with `NoRendezvous` (already consumed or TTL-expired).
+    /// reply is terminal. The block is NON-consuming and valid until its TTL (1b),
+    /// so a reply whose cell the network drops can be RETRIED with the same
+    /// `reply_id`; delivery is at-least-once (the recipient de-dups). An unknown
+    /// or TTL-expired id fails with `NoRendezvous`.
     pub async fn send_reply(
         &self,
         reply_id: u64,
@@ -6388,8 +6390,10 @@ impl NodeServices {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        // Consume the one-time block; gone/expired → no reply path.
-        let Some(block) = self.anonymity.reply_block_store.take(reply_id, now) else {
+        // Look up the reply block (NON-consuming — stays valid until TTL so the
+        // app can retry if this reply's cell is dropped; 1b). gone/expired → no
+        // reply path.
+        let Some(block) = self.anonymity.reply_block_store.peek(reply_id, now) else {
             return Err(AnonOnionSendError::NoRendezvous);
         };
 

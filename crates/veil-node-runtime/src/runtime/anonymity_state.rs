@@ -108,16 +108,25 @@ impl ReplyBlockStore {
         id
     }
 
-    /// Take (consume) a block by `reply_id`, if present + unexpired.
-    pub fn take(&self, reply_id: u64, now_unix: u64) -> Option<veil_proto::ReplyBlock> {
+    /// Peek a block by `reply_id`, if present + unexpired. NON-consuming: the
+    /// block stays valid until its TTL so the app can RETRY a reply whose cell
+    /// the network dropped (replies are fire-and-forget with no end-to-end ack;
+    /// the onion/rendezvous legs can drop ~25% in a lossy sim/network). Delivery
+    /// is therefore at-least-once — a recipient may see a duplicate reply if more
+    /// than one copy lands, and should de-dup at the app layer. (Was single-use
+    /// `take`; relaxed to TTL-bounded multi-use — onion-registration cleanup 1b.)
+    pub fn peek(&self, reply_id: u64, now_unix: u64) -> Option<veil_proto::ReplyBlock> {
         if reply_id == 0 {
             return None;
         }
         let mut s = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         Self::gc(&mut s, now_unix);
-        let (block, exp) = s.map.remove(&reply_id)?;
-        s.order.retain(|&x| x != reply_id);
-        if now_unix >= exp { None } else { Some(block) }
+        let (block, exp) = s.map.get(&reply_id)?;
+        if now_unix >= *exp {
+            None
+        } else {
+            Some(block.clone())
+        }
     }
 }
 
@@ -218,24 +227,24 @@ mod tests {
     }
 
     #[test]
-    fn store_take_roundtrip_and_consumes() {
+    fn store_peek_is_non_consuming() {
         let s = ReplyBlockStore::new();
         let id = s.store(rb(1), 1000);
         assert_ne!(id, 0);
-        assert_eq!(s.take(id, 1000), Some(rb(1)));
-        // Consumed — a second take is empty.
-        assert_eq!(s.take(id, 1000), None);
+        // NON-consuming (1b): repeated peeks keep returning the block (retry).
+        assert_eq!(s.peek(id, 1000), Some(rb(1)));
+        assert_eq!(s.peek(id, 1000), Some(rb(1)));
         // reply_id 0 is never valid.
-        assert_eq!(s.take(0, 1000), None);
+        assert_eq!(s.peek(0, 1000), None);
     }
 
     #[test]
     fn store_expires_after_ttl() {
         let s = ReplyBlockStore::with_params(300, 16);
         let id = s.store(rb(2), 1000);
-        assert_eq!(s.take(id, 1000 + 299), Some(rb(2)));
+        assert_eq!(s.peek(id, 1000 + 299), Some(rb(2)));
         let id2 = s.store(rb(3), 2000);
-        assert_eq!(s.take(id2, 2000 + 300), None, "expired block is gone");
+        assert_eq!(s.peek(id2, 2000 + 300), None, "expired block is gone");
     }
 
     #[test]
@@ -244,6 +253,6 @@ mod tests {
         let id1 = s.store(rb(1), 0);
         let _id2 = s.store(rb(2), 0);
         let _id3 = s.store(rb(3), 0); // over cap → evicts id1
-        assert_eq!(s.take(id1, 0), None, "oldest evicted");
+        assert_eq!(s.peek(id1, 0), None, "oldest evicted");
     }
 }
