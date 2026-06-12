@@ -96,6 +96,12 @@ pub fn descriptor_dht_key(identity_vk: &[u8; 32], period: u64) -> Option<[u8; 32
 
 /// Per-(identity, period) descriptor encryption key — a client derives it from
 /// the service identity it already knows.
+///
+/// diff-audit D8: this encryption is NOT an access-control boundary. Anyone who
+/// knows the service identity can derive this key and decrypt the body; its sole
+/// purpose is UNLINKABILITY from DHT enumerators who do NOT know the identity
+/// (they see only a per-period-rotating key + opaque ciphertext). Authorisation,
+/// if a service wants it, lives in the introduce/auth-cookie layer, not here.
 fn enc_key(identity_vk: &[u8; 32], period: u64) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(ENC_KEY_DOMAIN);

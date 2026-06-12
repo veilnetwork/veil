@@ -631,9 +631,11 @@ int veil_send_anonymous_authenticated_with_reply(VeilApp *app,
  * Reply to a message received over the authenticated anonymous transport,
  * addressing it by the opaque `reply_id` from the recv callback. The daemon
  * routes the reply back over the original sender's rendezvous path — no public
- * ad on either side. `reply_id` is single-use and TTL-bounded daemon-side; a
- * stale/unknown id returns `VEIL_ERR` with a "reply unknown" detail. Same
- * fire-and-forget semantics as the other authenticated sends.
+ * ad on either side. `reply_id` is TTL-bounded daemon-side and may be replied
+ * to MORE THAN ONCE until it expires (the daemon peeks the reply block, it does
+ * not consume it) — deduplicate at the app layer if needed; a stale/unknown id
+ * returns `VEIL_ERR` with a "reply unknown" detail. Same fire-and-forget
+ * semantics as the other authenticated sends.
  */
 
 int veil_send_reply(VeilApp *app,
