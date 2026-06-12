@@ -3221,7 +3221,9 @@ impl NodeRuntime {
         sealed_plaintext.extend_from_slice(&app_deliver_bytes);
 
         self.access()
-            .send_sealed_introduce(ad, &sealed_plaintext, hop_count)
+            // by-node_id unauthenticated send: recipient may be session-backed,
+            // keep the real cleartext receiver id (L3).
+            .send_sealed_introduce(ad, &sealed_plaintext, hop_count, false)
     }
 
     /// register a rendezvous publication. The
@@ -5901,6 +5903,24 @@ mod mailbox_cfg_translation_tests {
 #[cfg(test)]
 mod tests;
 
+/// Stable, non-resolvable cleartext receiver-id for a CIRCUIT-BACKED introduce
+/// (diff-audit L3). A location-anonymous service is routed by R using the cookie
+/// alone — R never forwards `receiver_node_id` down the circuit and the service
+/// never sees it — but R DOES read the cleartext `receiver_node_id` of the
+/// introduce it receives, and the real value is the service's transport node_id,
+/// which R can resolve to the service's location via DHT/PEX. Substitute a
+/// per-service-stable pseudo-id derived from the cookie: it looks like any
+/// node_id (so R cannot fingerprint circuit-backed introduces by it, nor tell
+/// them apart from session-backed ones for an unknown cookie) and resolves to
+/// nothing. The AuthDeliver signature still binds the REAL receiver_node_id
+/// inside the seal, which the service verifies against its own node_id.
+fn circuit_backed_cleartext_id(cookie: &[u8; 16]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"veil.rendezvous.cleartext-id.v1\0");
+    h.update(cookie);
+    *h.finalize().as_bytes()
+}
+
 /// Map a low-level onion `SenderError` to the IPC-facing `AnonOnionSendError`.
 fn map_sender_err(e: veil_anonymity::sender::SenderError) -> veil_types::AnonOnionSendError {
     use veil_types::AnonOnionSendError;
@@ -6277,6 +6297,11 @@ impl NodeServices {
         // higher odds. 1 = no redundancy (forward sends); >1 for fire-and-forget
         // replies that have no end-to-end ack.
         redundancy: usize,
+        // True for a circuit-backed / location-anonymous recipient: the introduce
+        // cleartext receiver_node_id is replaced by a cookie-derived pseudo-id so
+        // R cannot learn the recipient's transport node_id (L3). The AuthDeliver
+        // signature below still binds the REAL `ad.receiver_node_id`.
+        circuit_backed: bool,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
         use rand_core::RngCore;
         use veil_anonymity::rendezvous::final_hop_kind;
@@ -6422,7 +6447,7 @@ impl NodeServices {
             // Bounded retransmit: send the fragment `redundancy` times over
             // independent circuits; the recipient de-dups by (msg_id, frag_idx).
             for _ in 0..redundancy.max(1) {
-                self.send_sealed_introduce(ad, &sealed_plaintext, hop_count)?;
+                self.send_sealed_introduce(ad, &sealed_plaintext, hop_count, circuit_backed)?;
             }
         }
         Ok(())
@@ -6507,7 +6532,8 @@ impl NodeServices {
             data,
             hop_count,
             reply,
-            1, // forward sends: no redundancy (the recipient is reachable via its ad)
+            1,     // forward sends: no redundancy (the recipient is reachable via its ad)
+            false, // by-node_id: recipient may be session-backed → keep real id (L3)
         )
         .map_err(|e| match e {
             veil_anonymity::sender::SenderError::MissingSenderIdentity => {
@@ -6562,6 +6588,7 @@ impl NodeServices {
             hop_count,
             reply,
             1,
+            true, // by-identity → circuit-backed: pseudo cleartext receiver id (L3)
         )
         .map_err(map_sender_err)
     }
@@ -6600,7 +6627,8 @@ impl NodeServices {
         sealed_plaintext.push(final_hop_kind::APP_DELIVER);
         sealed_plaintext.extend_from_slice(&app_deliver_bytes);
 
-        self.send_sealed_introduce(&ad, &sealed_plaintext, hop_count)
+        // by-identity anonymous send → circuit-backed: pseudo cleartext id (L3).
+        self.send_sealed_introduce(&ad, &sealed_plaintext, hop_count, true)
             .map_err(map_sender_err)
     }
 
@@ -6958,6 +6986,7 @@ impl NodeServices {
             // onion+circuit return path — send each fragment a few times; the
             // recipient de-dups (1b/2). Bounded so the amplification is small.
             REPLY_SEND_REDUNDANCY,
+            true, // reply goes over the original sender's circuit-backed cookie (L3)
         )
         .map_err(|e| match e {
             veil_anonymity::sender::SenderError::MissingSenderIdentity => {
@@ -6983,6 +7012,11 @@ impl NodeServices {
         ad: &veil_anonymity::rendezvous::RendezvousAd,
         sealed_plaintext: &[u8],
         hop_count: usize,
+        // When true (circuit-backed / location-anonymous service), the cleartext
+        // `receiver_node_id` R reads is replaced by a cookie-derived pseudo-id so
+        // R never learns the service's transport node_id (L3). The AuthDeliver
+        // signature still binds the real id inside the seal.
+        circuit_backed: bool,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
         use veil_anonymity::rendezvous::{IntroducePayload, encrypt_introduce, final_hop_kind};
 
@@ -7001,9 +7035,15 @@ impl NodeServices {
                 }
             })?;
 
-        // Step 3: wrap as IntroducePayload.
+        // Step 3: wrap as IntroducePayload. For a circuit-backed service the
+        // cleartext receiver_node_id is a cookie-derived pseudo-id (L3) — R
+        // routes by cookie and never forwards this field to the service.
         let intro = IntroducePayload {
-            receiver_node_id: ad.receiver_node_id,
+            receiver_node_id: if circuit_backed {
+                circuit_backed_cleartext_id(&ad.auth_cookie)
+            } else {
+                ad.receiver_node_id
+            },
             auth_cookie: ad.auth_cookie,
             ciphertext,
         };
