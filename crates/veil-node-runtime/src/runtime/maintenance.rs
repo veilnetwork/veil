@@ -700,21 +700,21 @@ impl NodeRuntime {
             // node_id (which would link the identity to its live rendezvous
             // point). A plain rendezvous receiver uses the sovereign identity (so
             // senders discover the ad by its real node_id).
-            let (ad_node_id, issuer_pk, issuer_sk, issuer_algo) =
-                match &entry.ephemeral_ad_identity {
-                    Some(eph) => (
-                        eph.pseudo_node_id,
-                        eph.public_key.as_str(),
-                        eph.private_key.as_str(),
-                        eph.algo,
-                    ),
-                    None => (
-                        receiver_node_id,
-                        local_identity.public_key.as_str(),
-                        local_identity.private_key.as_str(),
-                        local_identity.algo,
-                    ),
-                };
+            let (ad_node_id, issuer_pk, issuer_sk, issuer_algo) = match &entry.ephemeral_ad_identity
+            {
+                Some(eph) => (
+                    eph.pseudo_node_id,
+                    eph.public_key.as_str(),
+                    eph.private_key.as_str(),
+                    eph.algo,
+                ),
+                None => (
+                    receiver_node_id,
+                    local_identity.public_key.as_str(),
+                    local_identity.private_key.as_str(),
+                    local_identity.algo,
+                ),
+            };
             let dht_key = rendezvous_ad_dht_key_at(&ad_node_id, idx as u8);
             // Slot-level freshness check.
             if let Some(existing_bytes) = dht.get_local(&dht_key)

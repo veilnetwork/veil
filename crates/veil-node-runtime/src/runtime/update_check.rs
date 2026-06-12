@@ -66,9 +66,7 @@ impl NodeRuntime {
             .sovereign_identity
             .as_ref()
             .and_then(|sov| sov.ed25519_signing_key())
-            .map(|sk| {
-                veil_update::installed_version::mac_key_from_ed25519_seed(&sk.to_bytes())
-            });
+            .map(|sk| veil_update::installed_version::mac_key_from_ed25519_seed(&sk.to_bytes()));
         let checker = UpdateChecker::new(config.update.clone(), (*self.transport_ctx).clone())
             .with_installed_version_hmac_key(iv_hmac_key);
         let interval = Duration::from_secs(interval_secs);
