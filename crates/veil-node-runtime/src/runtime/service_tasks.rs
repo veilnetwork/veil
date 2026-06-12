@@ -2591,6 +2591,34 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                 .map(|_cookie| ())
         })
     }
+
+    fn send_to_onion_service<'a>(
+        &'a self,
+        service_identity_vk: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: &'a [u8],
+        hop_count: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), veil_types::AnonOnionSendError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.access
+                .send_to_onion_service(
+                    service_identity_vk,
+                    app_id,
+                    endpoint_id,
+                    data,
+                    hop_count,
+                    None,
+                )
+                .await
+        })
+    }
 }
 
 impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {

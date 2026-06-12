@@ -204,6 +204,23 @@ pub trait AnonOnionSender: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
     >;
+
+    /// Send `data` to a LOCATION-anonymous service addressed by its Ed25519
+    /// IDENTITY key (the unlinkable analogue of [`Self::send_authenticated`],
+    /// which addresses by node_id). Resolves the service's per-period BLINDED
+    /// descriptor — a DHT enumerator who doesn't know the identity cannot find
+    /// or read it — decrypts it, and routes over the onion. `NoRendezvous` means
+    /// no resolvable/decryptable descriptor for that identity.
+    fn send_to_onion_service<'a>(
+        &'a self,
+        service_identity_vk: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: &'a [u8],
+        hop_count: usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
+    >;
 }
 
 // ── Wire-format constants shared by proto + crypto ────────────────────────────

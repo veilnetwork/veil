@@ -1624,6 +1624,58 @@ impl RegisterOnionServicePayload {
     }
 }
 
+// ── SendToOnionServicePayload ────────────────────────────────────────────────
+
+/// App → daemon request to send to a LOCATION-anonymous service addressed by its
+/// Ed25519 IDENTITY key (the daemon resolves the per-period blinded descriptor).
+///
+/// Wire layout:
+/// ```text
+/// [0..32]   service_identity_vk [u8; 32]   service Ed25519 identity ("address")
+/// [32..64]  target_app_id [u8; 32]
+/// [64..68]  target_endpoint_id u32 BE
+/// [68..72]  hop_count u32 BE               circuit length; daemon clamps to ≥ 2
+/// [72..]    data                            opaque payload (tail)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendToOnionServicePayload {
+    pub service_identity_vk: [u8; 32],
+    pub target_app_id: [u8; 32],
+    pub target_endpoint_id: u32,
+    pub hop_count: u32,
+    pub data: Vec<u8>,
+}
+
+impl SendToOnionServicePayload {
+    pub const FIXED_SIZE: usize = 32 + 32 + 4 + 4; // 72
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::FIXED_SIZE + self.data.len());
+        out.extend_from_slice(&self.service_identity_vk);
+        out.extend_from_slice(&self.target_app_id);
+        out.extend_from_slice(&self.target_endpoint_id.to_be_bytes());
+        out.extend_from_slice(&self.hop_count.to_be_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::FIXED_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::FIXED_SIZE,
+                got: buf.len(),
+            });
+        }
+        Ok(Self {
+            service_identity_vk: super::read_array::<32>(buf, 0)?,
+            target_app_id: super::read_array::<32>(buf, 32)?,
+            target_endpoint_id: super::read_u32_be(buf, 64)?,
+            hop_count: super::read_u32_be(buf, 68)?,
+            data: buf[Self::FIXED_SIZE..].to_vec(),
+        })
+    }
+}
+
 // ── AppIpcRtSendPayload ─────────────────────────────────────────────────────
 
 /// Sent by the IPC client to dispatch a real-time (RT) frame into the veil.
@@ -4953,6 +5005,42 @@ impl PnetStatusResultPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_to_onion_service_payload_roundtrip() {
+        let p = SendToOnionServicePayload {
+            service_identity_vk: [0x1A; 32],
+            target_app_id: [0x2B; 32],
+            target_endpoint_id: 0xDEAD_BEEF,
+            hop_count: 3,
+            data: b"hello onion service".to_vec(),
+        };
+        let bytes = p.encode();
+        assert_eq!(
+            bytes.len(),
+            SendToOnionServicePayload::FIXED_SIZE + p.data.len()
+        );
+        assert_eq!(SendToOnionServicePayload::decode(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn send_to_onion_service_payload_empty_data_ok() {
+        let p = SendToOnionServicePayload {
+            service_identity_vk: [0; 32],
+            target_app_id: [0; 32],
+            target_endpoint_id: 0,
+            hop_count: 2,
+            data: Vec::new(),
+        };
+        let bytes = p.encode();
+        assert_eq!(bytes.len(), SendToOnionServicePayload::FIXED_SIZE);
+        assert_eq!(SendToOnionServicePayload::decode(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn send_to_onion_service_payload_short_buf_errs() {
+        assert!(SendToOnionServicePayload::decode(&[0u8; 71]).is_err());
+    }
 
     fn sample_auth_deliver() -> AuthAppDeliver {
         AuthAppDeliver {
