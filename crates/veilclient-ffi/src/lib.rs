@@ -73,7 +73,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 pub(crate) mod guard;
 
 use libc::{size_t, ssize_t};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use veilclient::{
     AppHandle, AppReceiver, AppSender, ClientError, IncomingMessage, VeilClient,
@@ -384,9 +384,18 @@ pub struct VeilApp {
 }
 
 /// Opaque veil stream — reliable ordered byte channel.
+///
+/// The SDK stream is split into independent read/write halves under SEPARATE
+/// mutexes (diff-audit H4): the old single `Mutex<Option<SdkStream>>` meant a
+/// thread parked in `veil_stream_read` (which holds the lock across a blocking,
+/// timeout-less read) blocked any concurrent `veil_stream_write` forever — a
+/// half-duplex deadlock for request/response protocols. `tokio::io::split`
+/// lets read and write lock disjoint halves. Dropping the struct drops both
+/// halves → the underlying stream → its `Drop` sends STREAM_CLOSE.
 pub struct VeilStreamFfi {
     bundle: Arc<RuntimeBundle>,
-    inner: TokioMutex<Option<SdkStream>>,
+    reader: TokioMutex<Option<tokio::io::ReadHalf<SdkStream>>>,
+    writer: TokioMutex<Option<tokio::io::WriteHalf<SdkStream>>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1389,9 +1398,11 @@ pub unsafe extern "C" fn veil_stream_open(
             return ptr::null_mut();
         }
     };
+    let (rd, wr) = tokio::io::split(sdk_stream);
     let stream = VeilStreamFfi {
         bundle: Arc::clone(&app_ref.bundle),
-        inner: TokioMutex::new(Some(sdk_stream)),
+        reader: TokioMutex::new(Some(rd)),
+        writer: TokioMutex::new(Some(wr)),
     };
     HandleTable::insert(stream_table(), stream) as *mut VeilStreamFfi
 }
@@ -1444,14 +1455,17 @@ pub unsafe extern "C" fn veil_stream_write(
         unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
     };
     let res: std::io::Result<()> = stream_ref.bundle.runtime.block_on(async {
-        let inner_guard = stream_ref.inner.lock().await;
-        let Some(s) = inner_guard.as_ref() else {
+        // Locks only the WRITE half — independent of an in-flight read (H4).
+        let mut wguard = stream_ref.writer.lock().await;
+        let Some(w) = wguard.as_mut() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "stream already closed",
             ));
         };
-        s.send_data(&payload).await
+        // write_all via AsyncWrite chunks at MAX_STREAM_CHUNK + is backpressure-
+        // aware (vs send_data's single unchunked frame); poll_flush is a no-op.
+        w.write_all(&payload).await
     });
     match res {
         Ok(()) => VEIL_OK,
@@ -1519,14 +1533,15 @@ pub unsafe extern "C" fn veil_stream_read(
     );
     let mut local_buf = vec![0u8; cap];
     let read_res: std::io::Result<usize> = stream_ref.bundle.runtime.block_on(async {
-        let mut inner_guard = stream_ref.inner.lock().await;
-        let Some(s) = inner_guard.as_mut() else {
+        // Locks only the READ half — a parked read no longer blocks writes (H4).
+        let mut rguard = stream_ref.reader.lock().await;
+        let Some(r) = rguard.as_mut() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "stream already closed",
             ));
         };
-        s.read(&mut local_buf).await
+        r.read(&mut local_buf).await
     });
     match read_res {
         Ok(n) => {
