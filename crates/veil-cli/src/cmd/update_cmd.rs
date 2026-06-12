@@ -152,14 +152,16 @@ fn update_sign_manifest<I: CommandIo, O: ConfigOps>(
             args.platform_target,
         )));
     } else {
-        // Write raw manifest bytes to stdout via the IO emitter so
-        // callers can pipe `> manifest.bin`. Emit informational
-        // message to stderr first so it doesn't pollute the bytes.
-        context.io.emit(OutputEvent::message(format!(
+        // Write raw manifest bytes to stdout so callers can pipe `> manifest.bin`.
+        // The informational line MUST go to stderr — `context.io.emit` routes
+        // through `print!` (stdout), which prepended this text to the binary
+        // manifest and corrupted every `sign-manifest … > manifest.bin` (diff-
+        // audit 2026-06-12, defect H7). Write it to stderr directly.
+        eprintln!(
             "binary_sha256={sha_hex} version={} bytes={}",
             args.version,
             bytes.len(),
-        )));
+        );
         std::io::Write::write_all(&mut std::io::stdout(), &bytes)
             .map_err(|e| veil_cfg::ConfigError::CommandFailed(format!("write to stdout: {e}")))?;
     }
