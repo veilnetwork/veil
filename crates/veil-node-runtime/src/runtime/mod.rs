@@ -3440,6 +3440,30 @@ impl NodeRuntime {
         self.access().register_onion_service(hop_count)
     }
 
+    /// Send an authenticated anonymous message to a location-anonymous service
+    /// addressed by its Ed25519 IDENTITY key, resolving its unlinkable blinded
+    /// descriptor. See [`NodeServices::send_to_onion_service`].
+    pub async fn send_to_onion_service(
+        &self,
+        service_identity_vk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        data: &[u8],
+        hop_count: usize,
+        reply: Option<([u8; 32], u32)>,
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        self.access()
+            .send_to_onion_service(
+                service_identity_vk,
+                target_app_id,
+                target_endpoint_id,
+                data,
+                hop_count,
+                reply,
+            )
+            .await
+    }
+
     /// same as [`Self::register_rendezvous_publisher`] but
     /// associates a sealed push envelope with the publication. The
     /// envelope (FCM/APNs token sealed for a trusted push-relay) is
@@ -6575,6 +6599,113 @@ impl NodeServices {
             hop_count,
             reply,
             1, // forward sends: no redundancy (the recipient is reachable via its ad)
+        )
+        .map_err(|e| match e {
+            veil_anonymity::sender::SenderError::MissingSenderIdentity => {
+                AnonOnionSendError::NoIdentity
+            }
+            veil_anonymity::sender::SenderError::InsufficientRelayCandidates { .. } => {
+                AnonOnionSendError::NoRelays
+            }
+            veil_anonymity::sender::SenderError::PayloadTooLarge { .. } => {
+                AnonOnionSendError::PayloadTooLarge
+            }
+            _ => AnonOnionSendError::NoRelays,
+        })
+    }
+
+    /// Send an authenticated anonymous message to a LOCATION-anonymous (onion)
+    /// service addressed by its Ed25519 IDENTITY key — the unlinkable analogue of
+    /// [`Self::send_anonymous_authenticated_to`] (which addresses by node_id and
+    /// resolves a node_id-keyed `RendezvousAd`). Here we resolve the service's
+    /// per-period BLINDED descriptor: `descriptor_dht_key(identity, period)` is
+    /// derived from the blinded key, so a DHT enumerator who doesn't know the
+    /// identity cannot find or read it. We decrypt it (we know the identity),
+    /// reconstruct a synthetic ad from the body, and route over the onion exactly
+    /// as the node_id path does.
+    ///
+    /// We try the current period plus ±1 to tolerate clock skew across a period
+    /// boundary and a service that registered in the previous period and hasn't
+    /// rotated yet (the descriptor's blinded key + enc key + signature all bind
+    /// the period, so a wrong-period attempt simply fails to open).
+    pub async fn send_to_onion_service(
+        &self,
+        service_identity_vk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        data: &[u8],
+        hop_count: usize,
+        reply: Option<([u8; 32], u32)>,
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        use veil_anonymity::blinded_descriptor as bd;
+        use veil_types::AnonOnionSendError;
+
+        const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        if self.identity.sovereign_identity.is_none() {
+            return Err(AnonOnionSendError::NoIdentity);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cur = bd::current_period(now);
+
+        // Resolve + decrypt the descriptor across the current and adjacent periods.
+        let mut body: Option<bd::BlindedDescriptorBody> = None;
+        for period in [cur, cur.saturating_sub(1), cur.saturating_add(1)] {
+            let Some(dht_key) = bd::descriptor_dht_key(&service_identity_vk, period) else {
+                continue;
+            };
+            let Some(bytes) = self.dht_recursive_get(dht_key, RESOLVE_TIMEOUT).await else {
+                continue;
+            };
+            if let Some(b) = bd::open_descriptor(&service_identity_vk, period, &bytes) {
+                body = Some(b);
+                break;
+            }
+        }
+        let Some(body) = body else {
+            return Err(AnonOnionSendError::NoRendezvous);
+        };
+
+        // Synthesize the ad the send path reads. Only the routing + the
+        // receiver_node_id (which the AuthDeliver signature binds) are consulted
+        // by `send_via_rendezvous_authenticated`; the ad-signature fields are not
+        // (we decrypted + verified the descriptor ourselves), so they stay empty.
+        let ad = veil_anonymity::rendezvous::RendezvousAd {
+            receiver_node_id: body.receiver_node_id,
+            rendezvous_node_id: body.rendezvous_node_id,
+            auth_cookie: body.auth_cookie,
+            receiver_x25519_pk: body.receiver_x25519_pk,
+            valid_from_unix: 0,
+            valid_until_unix: u64::MAX,
+            issuer_pk: String::new(),
+            issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
+            signature: Vec::new(),
+            push_envelope: Vec::new(),
+            capability_token: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            wire_version: 0,
+        };
+
+        // Pre-resolve the rendezvous relay's directory entry into our local shard
+        // so the onion build finds it (mirrors send_anonymous_authenticated_to).
+        let relay_key = veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id);
+        if self.dht.get_local(&relay_key).is_none()
+            && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
+        {
+            self.dht.store_local(relay_key, bytes);
+        }
+
+        self.send_via_rendezvous_authenticated(
+            &ad,
+            target_app_id,
+            target_endpoint_id,
+            data,
+            hop_count,
+            reply,
+            1,
         )
         .map_err(|e| match e {
             veil_anonymity::sender::SenderError::MissingSenderIdentity => {
