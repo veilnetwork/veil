@@ -6368,6 +6368,18 @@ impl NodeServices {
                     e.built_unix = now_unix;
                 }
             }
+            // Re-publish the blinded descriptor under the CURRENT period so the
+            // by-identity send path keeps resolving across period boundaries.
+            // register_onion_service seals it only once; the descriptor's DHT key
+            // rotates every PERIOD_SECS (24 h), so without this refresh a sender
+            // computing the current-period key stops finding it after ~1–2 periods
+            // (it only tolerates ±1). REFRESH_SECS (150 s) ≪ the period, so a fresh
+            // descriptor is always present under the live key. Decoupled from the
+            // rebuild result — discoverability shouldn't hinge on one tick's
+            // rebuild succeeding.
+            if let Some(&rendezvous) = relay_path.last() {
+                self.publish_blinded_descriptor(rendezvous, cookie);
+            }
         }
     }
 
