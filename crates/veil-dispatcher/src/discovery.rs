@@ -564,6 +564,8 @@ impl FrameDispatcher {
         let is_ir = magic == Some(&veil_proto::instance_registry::INSTANCE_REGISTRY_MAGIC[..]);
         let is_mc = magic == Some(&veil_proto::mlkem_cert::MLKEM_CERT_MAGIC[..]);
         let is_sb = magic == Some(&veil_bootstrap::SIGNED_BUNDLE_MAGIC[..]);
+        let is_desc =
+            magic == Some(&veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC[..]);
 
         if is_sb {
             // Signed operator bootstrap bundle (cf. `veil-bootstrap::
@@ -703,6 +705,21 @@ impl FrameDispatcher {
                 return Err(DispatchResult::NoResponse);
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE // audit cycle-5 N1-residue
+        } else if is_desc {
+            // Blinded onion-service descriptor (diff-audit L5). CRYPTOGRAPHICALLY
+            // self-authenticating: verify the signature under the descriptor's
+            // embedded blinded_pub. The canonical-key binding (DHT key ==
+            // H(domain ‖ blinded_pub)) is enforced by `mirror_cache_key_ok` on the
+            // STORE path, so an attacker can't store a valid descriptor under a
+            // victim's key. Blinded keys are cheap to grind (per-period,
+            // unlinkable), so attribute bytes to the shared aggregate bucket
+            // rather than a per-key bucket an attacker could multiply.
+            if veil_anonymity::blinded_descriptor::verify_descriptor_self(payload_value).is_none() {
+                return Err(DispatchResult::Violation(
+                    "Store: blinded descriptor failed self-verification".to_owned(),
+                ));
+            }
+            veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
         } else {
             return Err(DispatchResult::Violation(
                 "Store: unrecognised payload magic — recursive plane requires a signed-record magic prefix"
@@ -749,6 +766,16 @@ impl FrameDispatcher {
             }
         } else if magic == &veil_bootstrap::SIGNED_BUNDLE_MAGIC[..] {
             veil_bootstrap::bootstrap_bundle_dht_key() == *target_key
+        } else if magic == &veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC[..] {
+            // Blinded descriptor (diff-audit L5): cryptographically verified at
+            // the STORE gate, so it is an owner-VERIFIED type — bind its canonical
+            // DHT key (H(domain ‖ blinded_pub), returned by verify_descriptor_self)
+            // to target_key, else a valid descriptor could be stored under a
+            // victim's / arbitrary key and poison resolver lookups.
+            match veil_anonymity::blinded_descriptor::verify_descriptor_self(payload) {
+                Some(canonical) => canonical == *target_key,
+                None => false,
+            }
         } else {
             // nc / id / ir / mc: caching left unchanged (returns true). The
             // canonical key IS structurally derivable from the record's

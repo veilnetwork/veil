@@ -78,7 +78,18 @@ pub fn verify_blinded(identity_vk: &[u8; 32], period: u64, msg: &[u8], sig: &[u8
     let Some(a_prime) = blinded_public(identity_vk, period) else {
         return false;
     };
-    let Ok(vk) = VerifyingKey::from_bytes(&a_prime) else {
+    verify_under_blinded_pub(&a_prime, msg, sig)
+}
+
+/// Verify a signature DIRECTLY under a given blinded public key, without
+/// deriving it from a service identity. Used by the self-authenticating
+/// descriptor STORE gate: a relay accepting a blinded descriptor into the DHT
+/// has the blinded_pub from the wire (and binds the DHT key to it) but does NOT
+/// know the service identity, so it can only check that the descriptor is
+/// self-consistent (signed by the key it claims). `verify_strict` rejects
+/// small-order keys / non-canonical `R`.
+pub fn verify_under_blinded_pub(blinded_pub: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
+    let Ok(vk) = VerifyingKey::from_bytes(blinded_pub) else {
         return false;
     };
     vk.verify_strict(msg, &Signature::from_bytes(sig)).is_ok()
