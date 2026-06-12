@@ -31,6 +31,12 @@ use veil_types::NodeRole;
 /// Connection timeout for the outgoing TCP leg.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Timeout for reading the inbound proxy header. Without it a peer can open an
+/// exit stream and never send a header, holding one of the bounded
+/// `MAX_EXIT_STREAMS` slots indefinitely → exit-slot exhaustion DoS (diff-audit
+/// Rep-B-1 / M19; oproxy already wraps its inbound handshake in a timeout).
+const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Check that `role` is eligible to act as an exit proxy.
 ///
 /// Only Core nodes with exit enabled may accept proxy-connect
@@ -205,8 +211,16 @@ where
 
     let (mut veil_r, mut veil_w) = tokio::io::split(veil_stream);
 
-    // Read the destination header from the veil stream.
-    let (host, port) = read_proxy_header(&mut veil_r).await?;
+    // Read the destination header from the veil stream, bounded by
+    // HEADER_TIMEOUT so a silent peer cannot hold an exit slot forever.
+    let (host, port) = timeout(HEADER_TIMEOUT, read_proxy_header(&mut veil_r))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "proxy header read timed out",
+            )
+        })??;
 
     // resolve host → IPs and pick the first non-forbidden one.
     // Resolving explicitly (rather than deferring to `TcpStream::connect`)
