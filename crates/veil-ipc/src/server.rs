@@ -33,7 +33,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::IpcMetrics;
 use crate::streams::IpcStreamTable;
-use veil_abuse::rate_limiter::TokenBucket;
+use veil_abuse::rate_limiter::{RateLimiter, TokenBucket};
 use veil_app::registry::{AppEndpointRegistry, AppMessage, EndpointHandle};
 use veil_proto::{
     AppDeliverPayload, AppIpcHelloErrPayload, AppIpcHelloOkPayload, AppIpcHelloPayload,
@@ -1965,9 +1965,14 @@ async fn handle_ipc_client(
                     Ok(LocalAppMsg::RegisterOnionService) => {
                         use veil_proto::ipc::{RegisterOnionServicePayload, ipc_send_err};
                         // 0 = ok; else an ipc_send_err. Onion-service hosting goes
-                        // through the same anon_onion_sender capability.
-                        let status: u16 = match RegisterOnionServicePayload::decode(&body) {
-                            Ok(p) => match anon_onion_sender.as_deref() {
+                        // through the same anon_onion_sender capability. Rate-limit
+                        // (diff-audit D2): like the regular send path, gate the
+                        // expensive circuit-build / DHT-publish work behind the
+                        // per-connection token bucket.
+                        let status: u16 = if rate_limiter.as_mut().is_some_and(|rl| !rl.allow()) {
+                            ipc_send_err::RATE_LIMITED
+                        } else if let Ok(p) = RegisterOnionServicePayload::decode(&body) {
+                            match anon_onion_sender.as_deref() {
                                 Some(s) => {
                                     match s.register_onion_service(p.hop_count as usize).await {
                                         Ok(()) => 0,
@@ -1981,8 +1986,9 @@ async fn handle_ipc_client(
                                     }
                                 }
                                 None => ipc_send_err::NO_RENDEZVOUS,
-                            },
-                            Err(_) => ipc_send_err::INVALID_FLAGS,
+                            }
+                        } else {
+                            ipc_send_err::INVALID_FLAGS
                         };
                         let mut hdr = FrameHeader::new(
                             FrameFamily::LocalApp as u8,
@@ -1997,50 +2003,64 @@ async fn handle_ipc_client(
                         use veil_proto::ipc::{SendToOnionServicePayload, ipc_send_err};
                         // 0 = ok; else an ipc_send_err. Resolving + sending to an
                         // onion service goes through the same anon_onion_sender.
-                        let status: u16 = match SendToOnionServicePayload::decode(&body) {
-                            Ok(p) => match anon_onion_sender.as_deref() {
-                                Some(s) => {
-                                    // anonymous → service sees src=[0;32]; else the
-                                    // daemon signs with our sovereign identity.
-                                    let send = if p.anonymous {
-                                        s.send_to_onion_service_anonymous(
-                                            p.service_identity_vk,
-                                            p.target_app_id,
-                                            p.target_endpoint_id,
-                                            p.src_app_id,
-                                            &p.data,
-                                            p.hop_count as usize,
-                                        )
-                                        .await
-                                    } else {
-                                        s.send_to_onion_service(
-                                            p.service_identity_vk,
-                                            p.target_app_id,
-                                            p.target_endpoint_id,
-                                            &p.data,
-                                            p.hop_count as usize,
-                                        )
-                                        .await
-                                    };
-                                    match send {
-                                        Ok(()) => 0,
-                                        Err(veil_types::AnonOnionSendError::NoRelays) => {
-                                            ipc_send_err::NO_ROUTE
+                        // Rate-limit (D2) + src_app_id ownership (D1): match the old
+                        // AppIpcSend path's protections, which the standalone arms
+                        // previously skipped (diff-audit).
+                        let status: u16 = if rate_limiter.as_mut().is_some_and(|rl| !rl.allow()) {
+                            ipc_send_err::RATE_LIMITED
+                        } else if let Ok(p) = SendToOnionServicePayload::decode(&body) {
+                            // Only the anonymous variant delivers src_app_id as the
+                            // sender's app identity, so only it needs the ownership
+                            // check; the authenticated variant signs with the
+                            // sovereign identity and carries no app-id claim.
+                            if p.anonymous && !client_state.has_app_id(&p.src_app_id) {
+                                ipc_send_err::SPOOFED_SRC
+                            } else {
+                                match anon_onion_sender.as_deref() {
+                                    Some(s) => {
+                                        // anonymous → service sees src=[0;32]; else
+                                        // the daemon signs with our sovereign id.
+                                        let send = if p.anonymous {
+                                            s.send_to_onion_service_anonymous(
+                                                p.service_identity_vk,
+                                                p.target_app_id,
+                                                p.target_endpoint_id,
+                                                p.src_app_id,
+                                                &p.data,
+                                                p.hop_count as usize,
+                                            )
+                                            .await
+                                        } else {
+                                            s.send_to_onion_service(
+                                                p.service_identity_vk,
+                                                p.target_app_id,
+                                                p.target_endpoint_id,
+                                                &p.data,
+                                                p.hop_count as usize,
+                                            )
+                                            .await
+                                        };
+                                        match send {
+                                            Ok(()) => 0,
+                                            Err(veil_types::AnonOnionSendError::NoRelays) => {
+                                                ipc_send_err::NO_ROUTE
+                                            }
+                                            Err(veil_types::AnonOnionSendError::NoIdentity) => {
+                                                ipc_send_err::NO_IDENTITY
+                                            }
+                                            Err(
+                                                veil_types::AnonOnionSendError::PayloadTooLarge,
+                                            ) => ipc_send_err::PAYLOAD_TOO_LARGE,
+                                            // NoRendezvous → no resolvable/decryptable
+                                            // descriptor for that identity.
+                                            Err(_) => ipc_send_err::NO_RENDEZVOUS,
                                         }
-                                        Err(veil_types::AnonOnionSendError::NoIdentity) => {
-                                            ipc_send_err::NO_IDENTITY
-                                        }
-                                        Err(veil_types::AnonOnionSendError::PayloadTooLarge) => {
-                                            ipc_send_err::PAYLOAD_TOO_LARGE
-                                        }
-                                        // NoRendezvous → no resolvable/decryptable
-                                        // descriptor for that identity.
-                                        Err(_) => ipc_send_err::NO_RENDEZVOUS,
                                     }
+                                    None => ipc_send_err::NO_RENDEZVOUS,
                                 }
-                                None => ipc_send_err::NO_RENDEZVOUS,
-                            },
-                            Err(_) => ipc_send_err::INVALID_FLAGS,
+                            }
+                        } else {
+                            ipc_send_err::INVALID_FLAGS
                         };
                         let mut hdr = FrameHeader::new(
                             FrameFamily::LocalApp as u8,
@@ -2055,34 +2075,44 @@ async fn handle_ipc_client(
                         use veil_proto::ipc::{SendAnonymousDirectPayload, ipc_send_err};
                         // 0 = ok; else an ipc_send_err. Direct sender-anonymous
                         // onion send to a known peer (no rendezvous).
-                        let status: u16 = match SendAnonymousDirectPayload::decode(&body) {
-                            Ok(p) => match anon_onion_sender.as_deref() {
-                                Some(s) => {
-                                    match s
-                                        .send_anonymous_direct(
-                                            p.target_node_id,
-                                            p.target_x25519_pk,
-                                            p.target_app_id,
-                                            p.target_endpoint_id,
-                                            p.src_app_id,
-                                            &p.data,
-                                            p.hop_count as usize,
-                                        )
-                                        .await
-                                    {
-                                        Ok(()) => 0,
-                                        Err(veil_types::AnonOnionSendError::NoRelays) => {
-                                            ipc_send_err::NO_ROUTE
+                        // Rate-limit (D2) + src_app_id ownership (D1).
+                        let status: u16 = if rate_limiter.as_mut().is_some_and(|rl| !rl.allow()) {
+                            ipc_send_err::RATE_LIMITED
+                        } else if let Ok(p) = SendAnonymousDirectPayload::decode(&body) {
+                            // src_app_id is delivered as the sender's app identity;
+                            // it must belong to this client.
+                            if !client_state.has_app_id(&p.src_app_id) {
+                                ipc_send_err::SPOOFED_SRC
+                            } else {
+                                match anon_onion_sender.as_deref() {
+                                    Some(s) => {
+                                        match s
+                                            .send_anonymous_direct(
+                                                p.target_node_id,
+                                                p.target_x25519_pk,
+                                                p.target_app_id,
+                                                p.target_endpoint_id,
+                                                p.src_app_id,
+                                                &p.data,
+                                                p.hop_count as usize,
+                                            )
+                                            .await
+                                        {
+                                            Ok(()) => 0,
+                                            Err(veil_types::AnonOnionSendError::NoRelays) => {
+                                                ipc_send_err::NO_ROUTE
+                                            }
+                                            Err(
+                                                veil_types::AnonOnionSendError::PayloadTooLarge,
+                                            ) => ipc_send_err::PAYLOAD_TOO_LARGE,
+                                            Err(_) => ipc_send_err::NO_ROUTE,
                                         }
-                                        Err(veil_types::AnonOnionSendError::PayloadTooLarge) => {
-                                            ipc_send_err::PAYLOAD_TOO_LARGE
-                                        }
-                                        Err(_) => ipc_send_err::NO_ROUTE,
                                     }
+                                    None => ipc_send_err::NO_ROUTE,
                                 }
-                                None => ipc_send_err::NO_ROUTE,
-                            },
-                            Err(_) => ipc_send_err::INVALID_FLAGS,
+                            }
+                        } else {
+                            ipc_send_err::INVALID_FLAGS
                         };
                         let mut hdr = FrameHeader::new(
                             FrameFamily::LocalApp as u8,
