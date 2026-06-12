@@ -196,6 +196,11 @@ pub struct AnonymityState {
     /// otherwise built once and idle-GC'd). Empty unless the node registered an
     /// onion service via `register_onion_circuit`.
     pub onion_services: Arc<Mutex<Vec<OnionServiceEntry>>>,
+
+    /// `Some(hops)` when `[anonymity].onion_service` is enabled — the maintenance
+    /// tick auto-registers a location-anonymous service of this circuit length
+    /// once relays are available, then keeps it alive. `None` = not hosting.
+    pub onion_service_hops: Option<usize>,
 }
 
 /// One hosted onion service to keep alive (see [`AnonymityState::onion_services`]).
@@ -217,6 +222,7 @@ impl AnonymityState {
         relay_capable: bool,
         advertised_bps: u32,
         x25519_sk: Arc<x25519_dalek::StaticSecret>,
+        onion_service_hops: Option<usize>,
     ) -> Self {
         Self {
             relay_capable,
@@ -226,6 +232,7 @@ impl AnonymityState {
             relay_reputation: Arc::new(RelayReputation::new()),
             reply_block_store: Arc::new(ReplyBlockStore::new()),
             onion_services: Arc::new(Mutex::new(Vec::new())),
+            onion_service_hops,
         }
     }
 }
