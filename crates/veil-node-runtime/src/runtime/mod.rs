@@ -3464,6 +3464,30 @@ impl NodeRuntime {
             .await
     }
 
+    /// Send to a location-anonymous service by identity WITHOUT revealing the
+    /// sender (`src_node_id = [0; 32]` at the service). See
+    /// [`NodeServices::send_to_onion_service_anonymous`].
+    pub async fn send_to_onion_service_anonymous(
+        &self,
+        service_identity_vk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        src_app_id: [u8; 32],
+        data: &[u8],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        self.access()
+            .send_to_onion_service_anonymous(
+                service_identity_vk,
+                target_app_id,
+                target_endpoint_id,
+                src_app_id,
+                data,
+                hop_count,
+            )
+            .await
+    }
+
     /// same as [`Self::register_rendezvous_publisher`] but
     /// associates a sealed push envelope with the publication. The
     /// envelope (FCM/APNs token sealed for a trusted push-relay) is
@@ -6050,6 +6074,23 @@ mod mailbox_cfg_translation_tests {
 #[cfg(test)]
 mod tests;
 
+/// Map a low-level onion `SenderError` to the IPC-facing `AnonOnionSendError`.
+fn map_sender_err(e: veil_anonymity::sender::SenderError) -> veil_types::AnonOnionSendError {
+    use veil_types::AnonOnionSendError;
+    match e {
+        veil_anonymity::sender::SenderError::MissingSenderIdentity => {
+            AnonOnionSendError::NoIdentity
+        }
+        veil_anonymity::sender::SenderError::InsufficientRelayCandidates { .. } => {
+            AnonOnionSendError::NoRelays
+        }
+        veil_anonymity::sender::SenderError::PayloadTooLarge { .. } => {
+            AnonOnionSendError::PayloadTooLarge
+        }
+        _ => AnonOnionSendError::NoRelays,
+    }
+}
+
 impl NodeServices {
     /// Register a LOCATION-anonymous service (onion-registration b5b-runtime):
     /// build an onion circuit whose terminus is the rendezvous relay R
@@ -6637,30 +6678,97 @@ impl NodeServices {
         hop_count: usize,
         reply: Option<([u8; 32], u32)>,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        use veil_types::AnonOnionSendError;
+
+        // The authenticated path signs with our sovereign identity.
+        if self.identity.sovereign_identity.is_none() {
+            return Err(AnonOnionSendError::NoIdentity);
+        }
+        let ad = self.resolve_onion_service_ad(&service_identity_vk).await?;
+
+        self.send_via_rendezvous_authenticated(
+            &ad,
+            target_app_id,
+            target_endpoint_id,
+            data,
+            hop_count,
+            reply,
+            1,
+        )
+        .map_err(map_sender_err)
+    }
+
+    /// Like [`Self::send_to_onion_service`] but UNAUTHENTICATED: the service
+    /// receives the message with `src_node_id = [0; 32]`, so it never learns who
+    /// sent it. Combined with the unlinkable descriptor resolution, this is the
+    /// fully-anonymous "anonymous user → anonymous service" quadrant — neither the
+    /// relays, R, nor the service itself learn the sender's location or identity.
+    /// `src_app_id` rides inside the sealed payload for the service's app-level
+    /// routing only (no node identity). No sovereign identity is required.
+    pub async fn send_to_onion_service_anonymous(
+        &self,
+        service_identity_vk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        src_app_id: [u8; 32],
+        data: &[u8],
+        hop_count: usize,
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        use veil_anonymity::rendezvous::final_hop_kind;
+
+        let ad = self.resolve_onion_service_ad(&service_identity_vk).await?;
+
+        // Unauthenticated final-hop payload: src_node_id zero (anonymity).
+        let app_deliver = veil_proto::AppDeliverPayload {
+            src_node_id: [0u8; 32],
+            src_app_id,
+            app_id: target_app_id,
+            endpoint_id: target_endpoint_id,
+            data: veil_bufpool::pooled_shared_from_vec(data.to_vec()),
+            reply_id: 0,
+        };
+        let app_deliver_bytes = app_deliver.encode();
+        let mut sealed_plaintext = Vec::with_capacity(1 + app_deliver_bytes.len());
+        sealed_plaintext.push(final_hop_kind::APP_DELIVER);
+        sealed_plaintext.extend_from_slice(&app_deliver_bytes);
+
+        self.send_sealed_introduce(&ad, &sealed_plaintext, hop_count)
+            .map_err(map_sender_err)
+    }
+
+    /// Resolve a location-anonymous service's BLINDED descriptor (by its Ed25519
+    /// identity) into a synthetic `RendezvousAd` ready for the send path. Tries
+    /// the current period plus ±1 to tolerate clock skew across a period boundary
+    /// and a service that registered in the previous period and hasn't rotated yet
+    /// (the descriptor's blinded key + enc key + signature all bind the period, so
+    /// a wrong-period attempt simply fails to open). Also pre-resolves the
+    /// rendezvous relay's directory entry into our local shard so the onion build
+    /// finds it. `NoRendezvous` if no descriptor resolves/decrypts.
+    async fn resolve_onion_service_ad(
+        &self,
+        service_identity_vk: &[u8; 32],
+    ) -> std::result::Result<veil_anonymity::rendezvous::RendezvousAd, veil_types::AnonOnionSendError>
+    {
         use veil_anonymity::blinded_descriptor as bd;
         use veil_types::AnonOnionSendError;
 
         const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-        if self.identity.sovereign_identity.is_none() {
-            return Err(AnonOnionSendError::NoIdentity);
-        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let cur = bd::current_period(now);
 
-        // Resolve + decrypt the descriptor across the current and adjacent periods.
         let mut body: Option<bd::BlindedDescriptorBody> = None;
         for period in [cur, cur.saturating_sub(1), cur.saturating_add(1)] {
-            let Some(dht_key) = bd::descriptor_dht_key(&service_identity_vk, period) else {
+            let Some(dht_key) = bd::descriptor_dht_key(service_identity_vk, period) else {
                 continue;
             };
             let Some(bytes) = self.dht_recursive_get(dht_key, RESOLVE_TIMEOUT).await else {
                 continue;
             };
-            if let Some(b) = bd::open_descriptor(&service_identity_vk, period, &bytes) {
+            if let Some(b) = bd::open_descriptor(service_identity_vk, period, &bytes) {
                 body = Some(b);
                 break;
             }
@@ -6669,10 +6777,9 @@ impl NodeServices {
             return Err(AnonOnionSendError::NoRendezvous);
         };
 
-        // Synthesize the ad the send path reads. Only the routing + the
-        // receiver_node_id (which the AuthDeliver signature binds) are consulted
-        // by `send_via_rendezvous_authenticated`; the ad-signature fields are not
-        // (we decrypted + verified the descriptor ourselves), so they stay empty.
+        // Synthesize the ad the send path reads. Only routing + receiver_node_id
+        // are consulted; the ad-signature fields are not (we decrypted + verified
+        // the descriptor ourselves), so they stay empty.
         let ad = veil_anonymity::rendezvous::RendezvousAd {
             receiver_node_id: body.receiver_node_id,
             rendezvous_node_id: body.rendezvous_node_id,
@@ -6689,36 +6796,13 @@ impl NodeServices {
             wire_version: 0,
         };
 
-        // Pre-resolve the rendezvous relay's directory entry into our local shard
-        // so the onion build finds it (mirrors send_anonymous_authenticated_to).
         let relay_key = veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id);
         if self.dht.get_local(&relay_key).is_none()
             && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
         {
             self.dht.store_local(relay_key, bytes);
         }
-
-        self.send_via_rendezvous_authenticated(
-            &ad,
-            target_app_id,
-            target_endpoint_id,
-            data,
-            hop_count,
-            reply,
-            1,
-        )
-        .map_err(|e| match e {
-            veil_anonymity::sender::SenderError::MissingSenderIdentity => {
-                AnonOnionSendError::NoIdentity
-            }
-            veil_anonymity::sender::SenderError::InsufficientRelayCandidates { .. } => {
-                AnonOnionSendError::NoRelays
-            }
-            veil_anonymity::sender::SenderError::PayloadTooLarge { .. } => {
-                AnonOnionSendError::PayloadTooLarge
-            }
-            _ => AnonOnionSendError::NoRelays,
-        })
+        Ok(ad)
     }
 
     /// Reply to a previously-received authenticated message via its one-time
