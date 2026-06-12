@@ -218,6 +218,12 @@ pub struct AnonymityState {
     /// tick auto-registers a location-anonymous service of this circuit length
     /// once relays are available, then keeps it alive. `None` = not hosting.
     pub onion_service_hops: Option<usize>,
+
+    /// Operator-pinned rendezvous relays (`[anonymity].rendezvous_relays`),
+    /// parsed to node-ids once at construction. The rendezvous-recipient task
+    /// honoured this, but `select_onion_relay_path` (onion-service / reply
+    /// circuits) used to ignore it (diff-audit Δ2-h) — empty = auto-pick.
+    pub pinned_rendezvous_relays: Vec<[u8; 32]>,
 }
 
 /// One hosted onion service to keep alive (see [`AnonymityState::onion_services`]).
@@ -246,6 +252,7 @@ impl AnonymityState {
         advertised_bps: u32,
         x25519_sk: Arc<x25519_dalek::StaticSecret>,
         onion_service_hops: Option<usize>,
+        pinned_rendezvous_relays: Vec<[u8; 32]>,
     ) -> Self {
         Self {
             relay_capable,
@@ -256,6 +263,7 @@ impl AnonymityState {
             reply_block_store: Arc::new(ReplyBlockStore::new()),
             onion_services: Arc::new(Mutex::new(Vec::new())),
             onion_service_hops,
+            pinned_rendezvous_relays,
         }
     }
 }

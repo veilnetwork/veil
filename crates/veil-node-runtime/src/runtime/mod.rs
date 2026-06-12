@@ -2043,6 +2043,18 @@ impl NodeRuntime {
                         .onion_service_hops
                         .map_or(3, |h| h as usize)
                 }),
+                // Δ2-h: operator-pinned rendezvous relays, parsed once so
+                // select_onion_relay_path can honour them.
+                config
+                    .anonymity
+                    .rendezvous_relays
+                    .iter()
+                    .filter_map(|s| {
+                        <veil_cfg::NodeId as std::str::FromStr>::from_str(s)
+                            .ok()
+                            .map(|n| *n.as_bytes())
+                    })
+                    .collect(),
             )),
             mailbox_state: Arc::new(mailbox_state::MailboxState::new(
                 mailbox_handle,
@@ -6084,8 +6096,14 @@ impl NodeServices {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let r = service_tasks::pick_rendezvous_relay(&self.live_sessions, &self.dht, &[])
-            .ok_or(AnonOnionSendError::NoRelays)?;
+        // Δ2-h: honour the operator's pinned rendezvous relays (was `&[]`, which
+        // silently ignored the `[anonymity].rendezvous_relays` pin on this path).
+        let r = service_tasks::pick_rendezvous_relay(
+            &self.live_sessions,
+            &self.dht,
+            &self.anonymity.pinned_rendezvous_relays,
+        )
+        .ok_or(AnonOnionSendError::NoRelays)?;
         let candidates: Vec<[u8; 32]> = self
             .dht
             .routing_table_contacts()
