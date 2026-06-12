@@ -230,8 +230,9 @@ impl FrameDispatcher {
                 return DispatchResult::NoResponse; // far-future timestamp
             }
         }
-        // Dedup check.
+        // Dedup check (M3: namespaced by route-message kind).
         let already_seen = lock!(self.route_seen_set).check_and_insert(
+            crate::RouteSeenSet::KIND_ANNOUNCE,
             p.origin_node_id,
             p.via_node_id,
             p.sequence,
@@ -383,10 +384,15 @@ impl FrameDispatcher {
             Ok(p) => p,
             Err(e) => return DispatchResult::Violation(format!("bad RouteWithdraw: {e}")),
         };
-        // Dedup check using same seen-set (seq=p.sequence, via=p.via_node_id).
-        let already_seen = lock!(self.route_seen_set)
-            // Use a "withdraw marker" via same key space as announce.
-            .check_and_insert(p.origin_node_id, p.via_node_id, p.sequence);
+        // Dedup check using same seen-set (seq=p.sequence, via=p.via_node_id),
+        // namespaced under the WITHDRAW kind so it can't collide with an
+        // announce of the same (origin, via, seq) (diff-audit M3).
+        let already_seen = lock!(self.route_seen_set).check_and_insert(
+            crate::RouteSeenSet::KIND_WITHDRAW,
+            p.origin_node_id,
+            p.via_node_id,
+            p.sequence,
+        );
         if already_seen {
             return DispatchResult::NoResponse;
         }
@@ -489,9 +495,11 @@ impl FrameDispatcher {
             Ok(p) => p,
             Err(e) => return DispatchResult::Violation(format!("bad RouteRequest: {e}")),
         };
-        // Dedup: treat (target, requester, request_id) as the seen-key.
+        // Dedup: treat (target, requester, request_id) as the seen-key,
+        // namespaced under the REQUEST kind (diff-audit M3).
         {
             let already_seen = lock!(self.route_seen_set).check_and_insert(
+                crate::RouteSeenSet::KIND_REQUEST,
                 p.target_node_id,
                 p.requester_node_id,
                 p.request_id,

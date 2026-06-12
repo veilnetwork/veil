@@ -534,21 +534,26 @@ pub type TerminalAckReplay = Arc<Mutex<ExpiryMap<[u8; 32], ([u8; 32], [u8; 32])>
 
 // ── RouteSeenSet ──────────────────────────────────────────────────────────────
 
+/// Layer-1 key. The leading `u8` is the route-message KIND (announce, withdraw,
+/// request); without it (diff-audit M3) all three kinds shared one keyspace, so
+/// a forged RouteWithdraw `(origin, via, seq)` would dedup-suppress a legitimate
+/// RouteAnnounce with the same triple (and vice-versa) — an on-path
+/// route-suppression vector.
+pub type SeenKey = (u8, [u8; 32], [u8; 32], u32);
+/// Replay-window key: `(kind, origin_node_id, sequence)` — independent of via.
+pub type AnnounceReplayKey = (u8, [u8; 32], u32);
+
 /// Gossip deduplication set.
 ///
 /// Uses two layers of deduplication:
 ///
-/// 1. **Per-`(origin, via, seq)` dedup** — prevents re-processing the same
+/// 1. **Per-`(kind, origin, via, seq)` dedup** — prevents re-processing the same
 ///    gossip triple from the same forwarding path.
-/// 2. **Per-`(origin, seq)` replay-window** — prevents replaying an old but
+/// 2. **Per-`(kind, origin, seq)` replay-window** — prevents replaying an old but
 ///    still-valid *signed* announcement through a *different* `via` path once
 ///    the original entry has expired from layer 1. A ROUTE_ANNOUNCE with
 ///    sequence N from origin O is accepted at most once regardless of which
 ///    relay forwards it.
-pub type SeenKey = ([u8; 32], [u8; 32], u32);
-/// Replay-window key: `(origin_node_id, sequence)` — independent of via.
-pub type AnnounceReplayKey = ([u8; 32], u32);
-
 pub struct RouteSeenSet {
     /// Layer 1: per-(origin, via, seq) dedup.
     full: ExpiryCache<SeenKey>,
@@ -572,15 +577,22 @@ impl RouteSeenSet {
     /// An announcement is considered "seen" if either:
     /// the exact `(origin, via, seq)` triple was processed before, OR
     /// any announcement with `(origin, seq)` was processed (replay).
-    fn check_and_insert(&mut self, origin: [u8; 32], via: [u8; 32], seq: u32) -> bool {
-        // Layer 2: per-(origin, seq) check first — this is the replay guard.
-        if self.replay.check_and_insert((origin, seq)) {
-            // Already seen this (origin, seq) from some via — drop regardless of
-            // current via to prevent replay through a different forwarding path.
+    /// Route-message kinds, used to namespace the seen-set keyspace so distinct
+    /// kinds cannot dedup-suppress one another (diff-audit M3).
+    pub const KIND_ANNOUNCE: u8 = 0;
+    pub const KIND_WITHDRAW: u8 = 1;
+    pub const KIND_REQUEST: u8 = 2;
+
+    fn check_and_insert(&mut self, kind: u8, origin: [u8; 32], via: [u8; 32], seq: u32) -> bool {
+        // Layer 2: per-(kind, origin, seq) check first — this is the replay guard.
+        if self.replay.check_and_insert((kind, origin, seq)) {
+            // Already seen this (kind, origin, seq) from some via — drop
+            // regardless of current via to prevent replay through a different
+            // forwarding path.
             return true;
         }
-        // Layer 1: per-(origin, via, seq) check.
-        self.full.check_and_insert((origin, via, seq))
+        // Layer 1: per-(kind, origin, via, seq) check.
+        self.full.check_and_insert((kind, origin, via, seq))
     }
 }
 
@@ -6063,6 +6075,24 @@ mod tests {
     /// arriving via a different relay. Origin-only keying poisoned
     /// `last[victim] = MAX`, rejecting every later announce; `(origin, via)`
     /// keying confines the poison to the attacker's own via.
+    #[test]
+    fn route_seen_set_namespaces_by_kind_m3() {
+        // diff-audit M3: announce / withdraw / request must NOT share a dedup
+        // keyspace, else a forged frame of one kind suppresses a legitimate
+        // frame of another with the same (origin, via, seq).
+        let mut s = RouteSeenSet::new(Duration::from_secs(60), 128);
+        let (o, v, seq) = ([1u8; 32], [2u8; 32], 7u32);
+        // First of each kind is fresh — none suppressed by a prior other kind.
+        assert!(!s.check_and_insert(RouteSeenSet::KIND_ANNOUNCE, o, v, seq));
+        assert!(!s.check_and_insert(RouteSeenSet::KIND_WITHDRAW, o, v, seq));
+        assert!(!s.check_and_insert(RouteSeenSet::KIND_REQUEST, o, v, seq));
+        // A duplicate of the SAME kind is still deduped (replay guard intact).
+        assert!(s.check_and_insert(RouteSeenSet::KIND_ANNOUNCE, o, v, seq));
+        assert!(s.check_and_insert(RouteSeenSet::KIND_WITHDRAW, o, v, seq));
+        // Replay layer still collapses a different via under the same kind.
+        assert!(s.check_and_insert(RouteSeenSet::KIND_ANNOUNCE, o, [9u8; 32], seq));
+    }
+
     #[test]
     fn route_announce_high_seq_poison_confined_to_attacker_via_m6() {
         use ed25519_dalek::SigningKey;
