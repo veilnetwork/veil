@@ -353,16 +353,31 @@ impl MeshBeaconPayload {
             let algo = buf[auth_start];
             let pk_len = u16::from_be_bytes([buf[auth_start + 1], buf[auth_start + 2]]) as usize;
             let pk_end = auth_start + 3 + pk_len;
+            // diff-audit M5: a DECLARED-but-truncated auth trailer must be
+            // REJECTED, not silently reinterpreted as an unsigned beacon. A
+            // signed beacon with its signature (or key) shaved off would
+            // otherwise decode as `signature: []` — a downgrade-on-decode. A
+            // genuinely unsigned beacon declares pk_len = 0 / sig_len = 0 (so the
+            // checks below don't fire), including the zero-padded sealed case.
+            if pk_len > 0 && pk_end + 2 > buf.len() {
+                return Err(ProtoError::BufferTooShort {
+                    need: pk_end + 2,
+                    got: buf.len(),
+                });
+            }
             if pk_end + 2 <= buf.len() {
                 let public_key = buf[auth_start + 3..pk_end].to_vec();
                 let sig_len = u16::from_be_bytes([buf[pk_end], buf[pk_end + 1]]) as usize;
                 let sig_end = pk_end + 2 + sig_len;
-                let signature = if sig_end <= buf.len() {
-                    buf[pk_end + 2..sig_end].to_vec()
-                } else {
-                    vec![]
-                };
-                (algo, public_key, signature)
+                if sig_len > 0 && sig_end > buf.len() {
+                    return Err(ProtoError::BufferTooShort {
+                        need: sig_end,
+                        got: buf.len(),
+                    });
+                }
+                // sig_len == 0 → empty slice; sig_len > 0 is guaranteed in-bounds
+                // by the check above.
+                (algo, public_key, buf[pk_end + 2..sig_end].to_vec())
             } else {
                 (0, vec![], vec![])
             }
@@ -547,6 +562,35 @@ mod tests {
     fn beacon_too_short() {
         let err = MeshBeaconPayload::decode(&[0u8; 10]).unwrap_err();
         assert!(matches!(err, ProtoError::BufferTooShort { need: 59, .. }));
+    }
+
+    #[test]
+    fn beacon_truncated_signature_rejected_m5() {
+        // A signed beacon (non-empty key + signature).
+        let b = MeshBeaconPayload {
+            node_id: [7u8; 32],
+            realm_id: RealmId([0xAA; 16]),
+            role_flags: 0,
+            veil_addr: None,
+            battery_level: 0,
+            timestamp: 1_700_000_123,
+            algo: 0,
+            public_key: vec![1u8; 32],
+            signature: vec![9u8; 64],
+        };
+        let enc = b.encode();
+        // Full payload roundtrips and is recognised as signed.
+        let dec = MeshBeaconPayload::decode(&enc).unwrap();
+        assert!(dec.is_signed());
+        assert_eq!(dec, b);
+        // diff-audit M5: shaving the signature must REJECT, not silently decode
+        // as an unsigned beacon (downgrade-on-decode).
+        assert!(matches!(
+            MeshBeaconPayload::decode(&enc[..enc.len() - 1]),
+            Err(ProtoError::BufferTooShort { .. })
+        ));
+        // Cutting into the key region is likewise rejected.
+        assert!(MeshBeaconPayload::decode(&enc[..enc.len() - 60]).is_err());
     }
 
     #[test]
