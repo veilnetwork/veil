@@ -1038,6 +1038,117 @@ class AppHandle implements Finalizable {
     });
   }
 
+  /// Send [data] as an AUTHENTICATED anonymous message over the
+  /// onion/rendezvous transport: the relays don't learn our location while the
+  /// recipient cryptographically verifies WHO sent it. Fire-and-forget (no
+  /// end-to-end ack); the recipient must have opted in to receiving.
+  Future<void> sendAnonymousAuthenticated({
+    required Uint8List dstNodeId,
+    required Uint8List dstAppId,
+    required int dstEndpointId,
+    required Uint8List data,
+  }) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32 || dstAppId.length != 32) {
+      throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
+    }
+    return Future(() {
+      final dstNode = calloc<Uint8>(32);
+      final dstApp = calloc<Uint8>(32);
+      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        dstNode.asTypedList(32).setAll(0, dstNodeId);
+        dstApp.asTypedList(32).setAll(0, dstAppId);
+        if (data.isNotEmpty) {
+          dataPtr.asTypedList(data.length).setAll(0, data);
+        }
+        final rc = ffi.veilSendAnonymousAuthenticated(
+            _app, dstNode, dstApp, dstEndpointId, dataPtr, data.length, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+              'anonymous authenticated send failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+      } finally {
+        calloc.free(dstNode);
+        calloc.free(dstApp);
+        if (dataPtr != nullptr) calloc.free(dataPtr);
+        calloc.free(errOut);
+      }
+    });
+  }
+
+  /// Like [sendAnonymousAuthenticated], but attach a one-time reply block so the
+  /// recipient can answer WITHOUT either side publishing a public ad. The reply
+  /// is delivered back to (this app, [replyEndpointId]) and surfaces as a
+  /// non-zero [IncomingMessage.replyId]; answer it with [sendReply].
+  Future<void> sendAnonymousAuthenticatedWithReply({
+    required Uint8List dstNodeId,
+    required Uint8List dstAppId,
+    required int dstEndpointId,
+    required int replyEndpointId,
+    required Uint8List data,
+  }) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32 || dstAppId.length != 32) {
+      throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
+    }
+    return Future(() {
+      final dstNode = calloc<Uint8>(32);
+      final dstApp = calloc<Uint8>(32);
+      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        dstNode.asTypedList(32).setAll(0, dstNodeId);
+        dstApp.asTypedList(32).setAll(0, dstAppId);
+        if (data.isNotEmpty) {
+          dataPtr.asTypedList(data.length).setAll(0, data);
+        }
+        final rc = ffi.veilSendAnonymousAuthenticatedWithReply(_app, dstNode,
+            dstApp, dstEndpointId, replyEndpointId, dataPtr, data.length, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+              'anonymous authenticated send failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+      } finally {
+        calloc.free(dstNode);
+        calloc.free(dstApp);
+        if (dataPtr != nullptr) calloc.free(dataPtr);
+        calloc.free(errOut);
+      }
+    });
+  }
+
+  /// Reply to a message received over the authenticated anonymous transport,
+  /// addressing it by the opaque [IncomingMessage.replyId] it carried. Routed
+  /// back over the original sender's rendezvous path — no public ad either side.
+  Future<void> sendReply({
+    required int replyId,
+    required Uint8List data,
+  }) async {
+    _ensureOpen();
+    return Future(() {
+      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        if (data.isNotEmpty) {
+          dataPtr.asTypedList(data.length).setAll(0, data);
+        }
+        final rc =
+            ffi.veilSendReply(_app, replyId, dataPtr, data.length, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException('reply send failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+      } finally {
+        if (dataPtr != nullptr) calloc.free(dataPtr);
+        calloc.free(errOut);
+      }
+    });
+  }
+
   /// Open a reliable bidirectional byte-stream to a remote endpoint.
   /// Returns once the daemon-side stream FSM is established (the open
   /// handshake doesn't await peer ACK — call [VeilStream.write] and
