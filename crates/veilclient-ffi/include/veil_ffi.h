@@ -596,6 +596,12 @@ int veil_send(VeilApp *app,
  * confirmed); the recipient must have opted in to receiving
  * (`[anonymity].receive_anonymous`). The sender node needs a sovereign
  * identity. Large messages are fragmented up to a fixed ceiling.
+ *
+ * Because the return value reports only local acceptance, an asynchronous
+ * send failure (no route, terminal NACK) surfaces LATER as an
+ * `ANON_SEND_FAILED` event (diff-audit L7), not as an error return here.
+ * There is no end-to-end ACK, so absence of that event is not proof of
+ * delivery.
  */
 
 int veil_send_anonymous_authenticated(VeilApp *app,
