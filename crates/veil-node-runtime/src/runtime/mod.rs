@@ -6283,6 +6283,7 @@ impl NodeServices {
     /// onion cell, so it is sign-whole-then-fragmented across multiple
     /// introduces (`AuthDeliverFragment`); the recipient reassembles + verifies
     /// once. Requires a loaded sovereign identity. One-way (sender → recipient).
+    #[allow(clippy::too_many_arguments)]
     pub fn send_via_rendezvous_authenticated(
         &self,
         ad: &veil_anonymity::rendezvous::RendezvousAd,
@@ -6295,6 +6296,12 @@ impl NodeServices {
         // ad (presence-leak mitigation): we register R-locally with a rendezvous
         // relay under a fresh cookie and embed the sealed reply path.
         reply: Option<([u8; 32], u32)>,
+        // Send each fragment this many times over independent circuits (bounded
+        // retransmit). The recipient's fragment reassembler de-dups by
+        // `(msg_id, frag_idx)`, so duplicates collapse → exactly-once delivery at
+        // higher odds. 1 = no redundancy (forward sends); >1 for fire-and-forget
+        // replies that have no end-to-end ack.
+        redundancy: usize,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
         use rand_core::RngCore;
         use veil_anonymity::rendezvous::final_hop_kind;
@@ -6432,7 +6439,11 @@ impl NodeServices {
             let mut sealed_plaintext = Vec::with_capacity(1 + frag_bytes.len());
             sealed_plaintext.push(final_hop_kind::APP_DELIVER_AUTH);
             sealed_plaintext.extend_from_slice(&frag_bytes);
-            self.send_sealed_introduce(ad, &sealed_plaintext, hop_count)?;
+            // Bounded retransmit: send the fragment `redundancy` times over
+            // independent circuits; the recipient de-dups by (msg_id, frag_idx).
+            for _ in 0..redundancy.max(1) {
+                self.send_sealed_introduce(ad, &sealed_plaintext, hop_count)?;
+            }
         }
         Ok(())
     }
@@ -6516,6 +6527,7 @@ impl NodeServices {
             data,
             hop_count,
             reply,
+            1, // forward sends: no redundancy (the recipient is reachable via its ad)
         )
         .map_err(|e| match e {
             veil_anonymity::sender::SenderError::MissingSenderIdentity => {
@@ -6550,6 +6562,8 @@ impl NodeServices {
         hop_count: usize,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
         use veil_types::AnonOnionSendError;
+        // Per-fragment redundancy for the fire-and-forget reply (2).
+        const REPLY_SEND_REDUNDANCY: usize = 3;
 
         const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -6607,6 +6621,10 @@ impl NodeServices {
             data,
             hop_count,
             None,
+            // Replies are fire-and-forget with no end-to-end ack and a lossy
+            // onion+circuit return path — send each fragment a few times; the
+            // recipient de-dups (1b/2). Bounded so the amplification is small.
+            REPLY_SEND_REDUNDANCY,
         )
         .map_err(|e| match e {
             veil_anonymity::sender::SenderError::MissingSenderIdentity => {
