@@ -244,7 +244,7 @@ pub(crate) fn rendezvous_register_with(
 /// Register/refresh a rendezvous publisher entry (the maintenance tick publishes
 /// the signed ad from it). Dedups by (relay, cookie). Inlines
 /// `NodeRuntime::register_rendezvous_publisher`.
-fn rendezvous_register_publisher(
+pub(crate) fn rendezvous_register_publisher(
     anonymity: &Arc<super::anonymity_state::AnonymityState>,
     relay: &[u8; 32],
     cookie: [u8; 16],

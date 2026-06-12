@@ -676,6 +676,19 @@ pub struct AnonymityConfig {
     /// auto-pick + failover.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rendezvous_relays: Vec<String>,
+    /// When `true`, host a LOCATION-anonymous service: the node registers at a
+    /// rendezvous relay over an ONION CIRCUIT (not a direct session), so the
+    /// relay never learns the node's location — a Tor-hidden-service-style
+    /// endpoint. Implies `receive_anonymous` (needs the anonymity key). The
+    /// maintenance tick auto-registers once relays are available + keeps the
+    /// circuit alive. Default `false`. See onion-registration epic.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub onion_service: bool,
+    /// Circuit length for `onion_service` (total hops to the rendezvous relay).
+    /// `None` (default) uses 3. Must be ≥ 2 to hide the node from the relay
+    /// itself; clamped at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onion_service_hops: Option<u8>,
 }
 
 impl AnonymityConfig {
@@ -685,6 +698,8 @@ impl AnonymityConfig {
             && !c.receive_anonymous
             && c.default_hop_count.is_none()
             && c.rendezvous_relays.is_empty()
+            && !c.onion_service
+            && c.onion_service_hops.is_none()
     }
 }
 
