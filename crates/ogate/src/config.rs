@@ -8,7 +8,7 @@
 //! mode           = "authorized"
 //! socket_path    = "/run/veil/app.sock"
 //! iface_name     = "ogate0"
-//! mtu            = 16000
+//! mtu            = 15000
 //! local_addr_v4  = "10.99.0.1"
 //! prefix_v4      = 24
 //! local_addr_v6  = "fd00:ogate:1::1"
@@ -83,7 +83,7 @@ pub struct OgateConfig {
     #[serde(default = "default_iface_name")]
     pub iface_name: String,
 
-    /// MTU for the TUN device. Default 16000 (matches the TUN read buffer);
+    /// MTU for the TUN device. Default 15000 (clamped at/below the 15231 obfs4
     /// note a full-MTU packet plus framing must stay under the obfs4 ciphertext
     /// cap on obfs4 links (see the egress oversize handling in `bridge`).
     #[serde(default = "default_mtu")]
@@ -301,6 +301,15 @@ impl OgateConfig {
         if self.prefix_v6 > 128 {
             return Err(ConfigError::Field("`prefix_v6` must be in 0..=128"));
         }
+        if self.mtu as usize > crate::bridge::MAX_OBFS4_SOLO_PAYLOAD_BYTES {
+            // Above the obfs4 single-packet egress ceiling, full-size packets are
+            // silently dropped (warn-only, no PMTU signal) → bulk transfers hang
+            // (diff-audit H6). Reject at load instead of blackholing at runtime.
+            return Err(ConfigError::Field(
+                "`mtu` exceeds the obfs4 single-packet egress ceiling (15231); \
+                 set mtu <= 15231 (default 15000)",
+            ));
+        }
         for (i, peer) in self.peers.iter().enumerate() {
             if peer.node_id.len() != 64 {
                 return Err(ConfigError::Peer {
@@ -334,7 +343,8 @@ fn default_socket_path() -> PathBuf {
 fn default_iface_name() -> String {
     "ogate0".to_owned()
 }
-/// TUN MTU.  Default 16000 (= bufpool's 16 KiB bucket size — the largest
+/// TUN MTU.  Default 15000, clamped at/below the 15231 obfs4 egress ceiling
+/// (bridge::MAX_OBFS4_SOLO_PAYLOAD_BYTES). Near bufpool's 16 KiB bucket — the largest
 /// safe value before delivery breaks on bigger frames).  Phase E24
 /// (2026-05-22) measured MTU-sweep through ogate-tunnel:
 ///
@@ -352,7 +362,12 @@ fn default_iface_name() -> String {
 /// Operators on links with MTU restrictions (PPPoE 1492, VPN nested) can
 /// override through `[ogate] mtu = 1500` in config.
 fn default_mtu() -> u16 {
-    16000
+    // Must stay at/below bridge::MAX_OBFS4_SOLO_PAYLOAD_BYTES (15231) — the old
+    // default of 16000 sat ABOVE the egress ceiling, so a TCP-in-tunnel MSS
+    // negotiated to ~15960 and every full-size segment was silently dropped
+    // (warn-only, no ICMP frag-needed) → PMTU blackhole for bulk transfers
+    // (diff-audit H6). 15000 leaves headroom below the ceiling.
+    15000
 }
 fn default_prefix_v4() -> u8 {
     24
@@ -423,7 +438,7 @@ mod tests {
         assert_eq!(cfg.app, "ogate");
         assert_eq!(cfg.mode, AccessMode::Authorized);
         assert_eq!(cfg.endpoint_id, 1);
-        assert_eq!(cfg.mtu, 16000);
+        assert_eq!(cfg.mtu, 15000);
         assert!(cfg.peers.is_empty());
         // Audit batch 2026-05-24 (M13): batching defaults to enabled.
         assert!(cfg.batch.enabled);
@@ -460,6 +475,28 @@ mod tests {
         assert_eq!(cfg.mode, AccessMode::Authorized);
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(cfg.peers[0].name.as_deref(), Some("peer-b"));
+    }
+
+    #[test]
+    fn mtu_above_egress_ceiling_rejected() {
+        // diff-audit H6: mtu must stay at/below the obfs4 egress ceiling (15231),
+        // else full-size packets are silently dropped at runtime (PMTU blackhole).
+        let toml = r#"
+            network       = "homenet"
+            local_addr_v4 = "10.99.0.1"
+            mtu           = 16000
+        "#;
+        let cfg: OgateConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.validate().is_err(), "mtu 16000 must be rejected");
+
+        // The lowered default validates and sits below the ceiling.
+        let dflt = r#"
+            network       = "homenet"
+            local_addr_v4 = "10.99.0.1"
+        "#;
+        let cfg: OgateConfig = toml::from_str(dflt).unwrap();
+        assert_eq!(cfg.mtu, 15000);
+        cfg.validate().unwrap();
     }
 
     #[test]
