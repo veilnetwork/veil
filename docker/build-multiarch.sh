@@ -23,8 +23,8 @@
 #   REPO              Docker Hub repo (default: veilnetwork/veil)
 #   TAG / $2          Image tag (default: latest)
 #   PLATFORMS         Comma-separated platforms (default: auto-detected native)
-#   CARGO_FEATURES    Rust feature flags (default: production-seeds,quic-session).
-#                     Override to "allow-empty-seeds,quic-session" ONLY for
+#   CARGO_FEATURES    Rust feature flags (default: production-seeds).
+#                     Override to "allow-empty-seeds" ONLY for
 #                     explicit testnet/devnet builds; the production default
 #                     refuses to compile without populated bootstrap seeds, which
 #                     prevents shipping a "production-looking" artefact that
@@ -36,7 +36,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONTEXT_DIR="$(dirname "$SCRIPT_DIR")"
 
 REPO="${REPO:-veilnetwork/veil}"
-CARGO_FEATURES="${CARGO_FEATURES:-production-seeds,quic-session}"
+CARGO_FEATURES="${CARGO_FEATURES:-production-seeds}"
 PUSH="${PUSH:-1}"
 
 CMD="${1:-build}"
