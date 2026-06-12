@@ -104,7 +104,15 @@ fn enc_key(identity_vk: &[u8; 32], period: u64) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// Wire: `[blinded_pub 32][nonce 12][ct_len u16 BE][ciphertext][sig 64]`.
+/// Wire: `[MAGIC 2][blinded_pub 32][nonce 12][ct_len u16 BE][ciphertext][sig 64]`.
+///
+/// The 2-byte magic lets the DHT STORE gate (`validate_store_value_by_magic`) and
+/// the periodic republish allowlist recognise a blinded descriptor (diff-audit
+/// L5) so it PROPAGATES like other self-authenticating records instead of being
+/// `store_local`-only. The descriptor is self-authenticating: it carries
+/// `blinded_pub` + a signature under it, and its DHT key is `H(domain ‖
+/// blinded_pub)` — see [`verify_descriptor_self`].
+pub const DESCRIPTOR_DHT_MAGIC: &[u8; 2] = b"od";
 const SIG_LEN: usize = 64;
 const NONCE_LEN: usize = 12;
 
@@ -139,7 +147,8 @@ pub fn seal_descriptor(
     signed.extend_from_slice(&ciphertext);
     let sig = veil_crypto::key_blinding::sign_blinded(identity_sk, period, &signed)?;
 
-    let mut out = Vec::with_capacity(32 + NONCE_LEN + 2 + ciphertext.len() + SIG_LEN);
+    let mut out = Vec::with_capacity(2 + 32 + NONCE_LEN + 2 + ciphertext.len() + SIG_LEN);
+    out.extend_from_slice(DESCRIPTOR_DHT_MAGIC);
     out.extend_from_slice(&blinded_pub);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&(ciphertext.len() as u16).to_be_bytes());
@@ -159,6 +168,11 @@ pub fn open_descriptor(
     period: u64,
     bytes: &[u8],
 ) -> Option<BlindedDescriptorBody> {
+    // Strip the 2-byte DHT magic prefix (L5).
+    if bytes.get(..2)? != DESCRIPTOR_DHT_MAGIC {
+        return None;
+    }
+    let bytes = &bytes[2..];
     let fixed = 32 + NONCE_LEN + 2;
     if bytes.len() < fixed + SIG_LEN {
         return None;
@@ -202,6 +216,52 @@ pub fn open_descriptor(
     BlindedDescriptorBody::decode(&plaintext)
 }
 
+/// STORE-gate / republish verifier (diff-audit L5). A relay accepting a blinded
+/// descriptor into the DHT does NOT know the service identity, so it verifies the
+/// descriptor's SELF-consistency: the signature must verify under the `blinded_pub`
+/// the descriptor itself carries, and the descriptor's canonical DHT key is then
+/// `H(DHT_KEY_DOMAIN ‖ blinded_pub)`. Returns that key on success (the caller
+/// MUST check it equals the STORE key, so a valid descriptor cannot be stored
+/// under an attacker-chosen key); `None` on bad magic / length / signature.
+///
+/// This proves only that whoever signed holds the blinded private key (so a third
+/// party cannot forge or grind a descriptor under a victim's key). It does NOT
+/// reveal which identity (that needs `open_descriptor` with the identity) — the
+/// unlinkability property is preserved.
+pub fn verify_descriptor_self(bytes: &[u8]) -> Option<[u8; 32]> {
+    if bytes.get(..2)? != DESCRIPTOR_DHT_MAGIC {
+        return None;
+    }
+    let body = &bytes[2..];
+    let fixed = 32 + NONCE_LEN + 2;
+    if body.len() < fixed + SIG_LEN {
+        return None;
+    }
+    let blinded_pub: [u8; 32] = body[..32].try_into().ok()?;
+    let nonce = &body[32..32 + NONCE_LEN];
+    let ct_len = u16::from_be_bytes([body[32 + NONCE_LEN], body[33 + NONCE_LEN]]) as usize;
+    let ct_start = fixed;
+    let ct_end = ct_start.checked_add(ct_len)?;
+    if body.len() != ct_end + SIG_LEN {
+        return None;
+    }
+    let ciphertext = &body[ct_start..ct_end];
+    let sig: [u8; SIG_LEN] = body[ct_end..ct_end + SIG_LEN].try_into().ok()?;
+
+    let mut signed = Vec::with_capacity(32 + NONCE_LEN + ciphertext.len());
+    signed.extend_from_slice(&blinded_pub);
+    signed.extend_from_slice(nonce);
+    signed.extend_from_slice(ciphertext);
+    if !veil_crypto::key_blinding::verify_under_blinded_pub(&blinded_pub, &signed, &sig) {
+        return None;
+    }
+
+    let mut h = blake3::Hasher::new();
+    h.update(DHT_KEY_DOMAIN);
+    h.update(&blinded_pub);
+    Some(*h.finalize().as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +299,39 @@ mod tests {
         // DHT key matches the client-derived one (both from the identity).
         assert_eq!(dht_key, descriptor_dht_key(&id_vk, period).unwrap());
         assert_eq!(open_descriptor(&id_vk, period, &desc).unwrap(), b);
+    }
+
+    #[test]
+    fn verify_descriptor_self_returns_canonical_key_and_rejects_tamper() {
+        // diff-audit L5: the STORE gate verifies a descriptor WITHOUT the identity
+        // (only its embedded blinded_pub + sig) and returns its canonical DHT key,
+        // which the gate binds to the STORE key.
+        let (id_sk, id_vk) = identity();
+        let period = 9u64;
+        let (dht_key, desc) = seal_descriptor(&id_sk, &id_vk, period, &body(0x5A)).unwrap();
+
+        // Valid descriptor → its canonical key equals descriptor_dht_key.
+        assert_eq!(verify_descriptor_self(&desc), Some(dht_key));
+
+        // Wrong magic → rejected.
+        let mut bad_magic = desc.clone();
+        bad_magic[0] ^= 0xFF;
+        assert_eq!(verify_descriptor_self(&bad_magic), None);
+
+        // Tampered signature → rejected (proves it really verifies the sig).
+        let mut tampered = desc.clone();
+        let n = tampered.len();
+        tampered[n - 1] ^= 0x01;
+        assert_eq!(verify_descriptor_self(&tampered), None);
+
+        // Tampered ciphertext (sig no longer covers it) → rejected.
+        let mut ct_tamper = desc.clone();
+        ct_tamper[2 + 32 + NONCE_LEN + 2] ^= 0x01; // first ciphertext byte
+        assert_eq!(verify_descriptor_self(&ct_tamper), None);
+
+        // Truncated → rejected, not a panic.
+        assert_eq!(verify_descriptor_self(&desc[..desc.len() - 1]), None);
+        assert_eq!(verify_descriptor_self(&[]), None);
     }
 
     #[test]

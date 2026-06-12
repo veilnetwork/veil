@@ -894,6 +894,76 @@ pub struct StopTasksContext {
     pub ephemeral_rotator_shutdowns: Vec<tokio::sync::watch::Sender<bool>>,
 }
 
+/// Replicate `value` at `key` to the K closest peers in keyspace via a
+/// fire-and-forget `RecursiveQuery(STORE)` fan-out (after a local store).
+///
+/// Shared by [`NodeRuntime::dht_publish_replicated`] and the onion-service
+/// descriptor publish on `NodeServices` (diff-audit L5): both need a SYNCHRONOUS
+/// replicated store but live on different `impl`s. `send_to` is fire-and-forget;
+/// peers without a direct session are skipped (the STORE recursive-forward path
+/// handles those hops via greedy walk on receivers we DO have sessions to).
+/// Returns the number of peers a frame was enqueued for.
+fn dht_publish_replicated_via(
+    dht: &KademliaService,
+    session_tx_registry: &RwLock<veil_session::SessionTxRegistry>,
+    local_node_id: [u8; 32],
+    key: [u8; 32],
+    value: Vec<u8>,
+) -> usize {
+    // Local first — always succeeds.
+    dht.store_local(key, value.clone());
+
+    // K-closest replicas: skip self. Use the routing table's keyspace ranking,
+    // not the live-session set, so we hit the truly closest peers — STORE
+    // forwards greedy if we don't have direct sessions to all of them.
+    let candidates: Vec<[u8; 32]> = dht
+        .find_closest_nodes(&key, veil_proto::budget::DHT_REPLICATION_K)
+        .into_iter()
+        .filter(|n| *n != local_node_id)
+        .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    // Build the RecursiveQuery(STORE) frame once, clone bytes per send.
+    let query_id: [u8; 16] = {
+        use rand_core::RngCore;
+        let mut id = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut id);
+        id
+    };
+    let q = veil_proto::routing::RecursiveQueryPayload {
+        query_id,
+        target_key: key,
+        reply_to: local_node_id,
+        ttl: 40,
+        query_type: veil_proto::routing::recursive_query_type::STORE,
+        reply_port: 0,
+        payload: value,
+    };
+    let q_bytes = q.encode();
+    let mut hdr = veil_proto::header::FrameHeader::new(
+        veil_proto::family::FrameFamily::Routing as u8,
+        veil_proto::family::RoutingMsg::RecursiveQuery as u16,
+    );
+    hdr.body_len = q_bytes.len() as u32;
+    let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
+    frame.extend_from_slice(&q_bytes);
+
+    let mut sent = 0usize;
+    let guard = rlock!(session_tx_registry);
+    for peer in candidates {
+        if guard.send_to(
+            &peer,
+            veil_proto::header::priority::INTERACTIVE,
+            frame.clone(),
+        ) {
+            sent += 1;
+        }
+    }
+    sent
+}
+
 impl NodeRuntime {
     pub async fn start(config_path: impl AsRef<Path>, foreground_mode: bool) -> Result<Self> {
         let config_path = config_path.as_ref().to_path_buf();
@@ -2491,66 +2561,13 @@ impl NodeRuntime {
     /// Returns the count of successful sends — useful for metrics +
     /// tests but rarely actionable on the publish path.
     pub fn dht_publish_replicated(&self, key: [u8; 32], value: Vec<u8>) -> usize {
-        // Local first — always succeeds.
-        self.dht.store_local(key, value.clone());
-
-        // K-closest replicas: skip self, skip dead sessions. Use the
-        // routing table's keyspace ranking, not the live-session set
-        // so we hit the truly closest peers in the network — STORE
-        // forwards greedy if we don't have direct sessions to all of
-        // them.
-        let local_node_id = *self.identity.local_identity.node_id.as_bytes();
-        let candidates: Vec<[u8; 32]> = self
-            .dht
-            .find_closest_nodes(&key, veil_proto::budget::DHT_REPLICATION_K)
-            .into_iter()
-            .filter(|n| *n != local_node_id)
-            .collect();
-        if candidates.is_empty() {
-            return 0;
-        }
-
-        // Build the RecursiveQuery(STORE) frame once, clone bytes per send.
-        let query_id: [u8; 16] = {
-            use rand_core::RngCore;
-            let mut id = [0u8; 16];
-            rand_core::OsRng.fill_bytes(&mut id);
-            id
-        };
-        let q = veil_proto::routing::RecursiveQueryPayload {
-            query_id,
-            target_key: key,
-            reply_to: local_node_id,
-            ttl: 40,
-            query_type: veil_proto::routing::recursive_query_type::STORE,
-            reply_port: 0,
-            payload: value,
-        };
-        let q_bytes = q.encode();
-        let mut hdr = veil_proto::header::FrameHeader::new(
-            veil_proto::family::FrameFamily::Routing as u8,
-            veil_proto::family::RoutingMsg::RecursiveQuery as u16,
-        );
-        hdr.body_len = q_bytes.len() as u32;
-        let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
-        frame.extend_from_slice(&q_bytes);
-
-        // Fan-out — send_to is fire-and-forget on the session_tx
-        // registry. Peers without a direct session are silently
-        // skipped (the STORE recursive-forward path handles those
-        // hops via greedy walk on receivers we DO have sessions).
-        let mut sent = 0usize;
-        let guard = rlock!(self.session_tx_registry);
-        for peer in candidates {
-            if guard.send_to(
-                &peer,
-                veil_proto::header::priority::INTERACTIVE,
-                frame.clone(),
-            ) {
-                sent += 1;
-            }
-        }
-        sent
+        dht_publish_replicated_via(
+            &self.dht,
+            &self.session_tx_registry,
+            *self.identity.local_identity.node_id.as_bytes(),
+            key,
+            value,
+        )
     }
 
     /// PoW-Gated Rendezvous initiator helper — Slice 9 follow-up of
@@ -6156,7 +6173,22 @@ impl NodeServices {
             period,
             &body,
         ) {
-            self.dht.store_local(dht_key, bytes);
+            // diff-audit L5: replicate to the K-closest peers immediately (not
+            // store_local-only). A by-identity sender resolves the descriptor at
+            // H(domain ‖ blinded_pub), which is unlikely to be in OUR keyspace —
+            // so a local-only store would never be found cross-node until the
+            // 30-min republish tick happened to fan it out. The recursive STORE
+            // is accepted by remote dispatchers now that the "od" magic is
+            // self-authenticating (validate_store_value_by_magic +
+            // mirror_cache_key_ok bind it to its canonical key); the periodic
+            // republish tick keeps it alive thereafter.
+            dht_publish_replicated_via(
+                &self.dht,
+                &self.session_tx_registry,
+                *self.identity.local_identity.node_id.as_bytes(),
+                dht_key,
+                bytes,
+            );
         }
     }
 

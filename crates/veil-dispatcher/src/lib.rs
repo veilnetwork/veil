@@ -5555,6 +5555,64 @@ mod tests {
         assert!(!dispatcher.mirror_cache_key_ok(&[0x00], &canonical_key));
     }
 
+    /// diff-audit L5: the blinded onion-service descriptor ("od") is an
+    /// owner-VERIFIED type — it is cryptographically self-authenticating
+    /// (signed under its embedded blinded_pub), so the STORE gate accepts it
+    /// AND `mirror_cache_key_ok` binds its canonical DHT key (H(domain ‖
+    /// blinded_pub)) to `target_key`. This is what makes by-identity send
+    /// resolve cross-node: before L5 the descriptor's magic was unrecognised,
+    /// so STORE rejected it ("unsigned STORE for non-self key") and it never
+    /// propagated past the publisher's local store.
+    #[test]
+    fn mirror_cache_key_binding_for_blinded_descriptor_l5() {
+        use veil_anonymity::blinded_descriptor::{
+            BlindedDescriptorBody, descriptor_dht_key, seal_descriptor,
+        };
+
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+
+        // A service identity + a sealed descriptor for some period.
+        let id_sk = [0x42u8; 32];
+        let id_vk = ed25519_dalek::SigningKey::from_bytes(&id_sk)
+            .verifying_key()
+            .to_bytes();
+        let period = 11u64;
+        let body = BlindedDescriptorBody {
+            receiver_node_id: [0x10u8; 32],
+            rendezvous_node_id: [0x20u8; 32],
+            auth_cookie: [0x30u8; 16],
+            receiver_x25519_pk: [0x40u8; 32],
+        };
+        let (canonical_key, signed) =
+            seal_descriptor(&id_sk, &id_vk, period, &body).expect("seal");
+        assert_eq!(canonical_key, descriptor_dht_key(&id_vk, period).unwrap());
+        let victim_key = [0xFFu8; 32];
+
+        // The STORE magic-gate accepts a self-consistent descriptor.
+        assert!(
+            dispatcher.validate_store_value_by_magic(&signed).is_ok(),
+            "valid blinded descriptor must pass the recursive STORE gate",
+        );
+        // Cacheable ONLY under its own canonical key.
+        assert!(
+            dispatcher.mirror_cache_key_ok(&signed, &canonical_key),
+            "descriptor under its canonical key must be cacheable",
+        );
+        assert!(
+            !dispatcher.mirror_cache_key_ok(&signed, &victim_key),
+            "descriptor must NOT be cacheable under a victim key (poison prevented)",
+        );
+        // A descriptor whose signature is tampered fails the STORE gate.
+        let mut tampered = signed.clone();
+        let n = tampered.len();
+        tampered[n - 1] ^= 0x01;
+        assert!(
+            dispatcher.validate_store_value_by_magic(&tampered).is_err(),
+            "tampered descriptor must be rejected by the STORE gate",
+        );
+        assert!(!dispatcher.mirror_cache_key_ok(&tampered, &canonical_key));
+    }
+
     /// Audit cycle-8 (latent-invariant lock): `mirror_cache_key_ok` deliberately
     /// returns `true` (pass-through, no canonical-key binding) for the
     /// structurally-decoded-but-not-yet-verified record types (nc/id/ir/mc),

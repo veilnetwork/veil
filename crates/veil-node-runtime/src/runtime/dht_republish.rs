@@ -55,6 +55,11 @@ impl NodeRuntime {
             // missing here — so a forwarding node that stored an SB record never
             // republished it, letting bootstrap bundles decay after one TTL.
             || magic == veil_bootstrap::SIGNED_BUNDLE_MAGIC
+            // Blinded onion-service descriptor (diff-audit L5): self-authenticating
+            // (signed under the embedded blinded_pub; DHT key = H(domain ‖
+            // blinded_pub) — `verify_descriptor_self`). Without this the descriptor
+            // was store_local-only and by-identity send never resolved cross-node.
+            || magic == veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC
     }
 
     pub fn spawn_dht_republish_task(&mut self, republish_interval: std::time::Duration) {
