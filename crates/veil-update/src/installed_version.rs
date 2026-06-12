@@ -237,6 +237,15 @@ impl InstalledVersionStore {
     }
 }
 
+/// Derive the anti-downgrade state-file MAC key from a node's 32-byte Ed25519
+/// identity seed. Both the apply path AND the update checker (diff-audit M16)
+/// MUST derive the key this way so the file one writes is verifiable by the
+/// other — otherwise the checker would either trust an unauthenticated file or
+/// reject a correctly-authenticated one.
+pub fn mac_key_from_ed25519_seed(seed: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("veil.update.installed-version.mac.v1", seed)
+}
+
 fn compute_record_mac(body_bytes: &[u8], key: &[u8; 32]) -> String {
     let mut hasher = blake3::Hasher::new_keyed(key);
     hasher.update(INSTALLED_VERSION_MAC_DOMAIN);
