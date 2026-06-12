@@ -6391,6 +6391,141 @@ mod tests {
         net.stop().await;
     }
 
+    /// Blinded-descriptor end-to-end (onion-registration 3d): a service is
+    /// reachable via a DHT descriptor that is keyed under a per-period BLINDED
+    /// key and encrypted — so a DHT enumerator can't link it to the service
+    /// identity — while a client that KNOWS the identity resolves + decrypts it
+    /// and reaches the service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn epic_anon_service_blinded_descriptor_end_to_end() {
+        use veil_anonymity::blinded_descriptor as bd;
+        let n = 5;
+        let mut net = SimNetwork::builder()
+            .nodes(n)
+            .role(NodeRole::Core)
+            .anonymity_relay(vec![true, true, true, true, true])
+            .sovereign_identities(true)
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        for i in 0..n {
+            assert!(
+                net.node(i)
+                    .wait_sessions(n - 1, Duration::from_secs(45))
+                    .await,
+                "node {i} sessions",
+            );
+        }
+
+        let app_s = [0x6A; 32];
+        let ep_s = 9u32;
+        let (_h_s, mut rx_s) = net.node(4).runtime.app_registry().register(app_s, ep_s, 16);
+
+        for i in 1..=3 {
+            net.node(i)
+                .runtime
+                .debug_force_publish_relay_directory_entry()
+                .await
+                .expect("relay dir entry");
+        }
+        for i in 1..=3 {
+            let key =
+                crate::node::anonymity::directory::relay_directory_dht_key(&net.node(i).node_id());
+            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                net.node(0).runtime.dht_put_local(key, bytes.clone());
+                net.node(4).runtime.dht_put_local(key, bytes);
+            }
+        }
+
+        // Service registers — this also seals + stores a blinded descriptor.
+        net.node(4)
+            .runtime
+            .register_onion_service(2)
+            .expect("register_onion_service");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // The client knows the service's Ed25519 IDENTITY (shared out-of-band,
+        // like a .onion address). It derives the descriptor's DHT key + decrypts.
+        let identity_vk = *net
+            .node(4)
+            .runtime
+            .sovereign_identity()
+            .expect("service identity")
+            .ed25519_signing_key()
+            .expect("ed25519 identity")
+            .verifying_key()
+            .as_bytes();
+        // Same wall-clock period the service sealed under (both within ms).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let period = bd::current_period(now);
+        let dht_key = bd::descriptor_dht_key(&identity_vk, period).unwrap();
+
+        // The descriptor's DHT key is NOT the service node_id (unlinkable).
+        assert_ne!(dht_key, net.node(4).node_id(), "descriptor key ≠ node_id");
+
+        // Fetch (mirror) the descriptor + open it.
+        let desc = net
+            .node(4)
+            .runtime
+            .dht_get_local(&dht_key)
+            .expect("service stored its blinded descriptor");
+        net.node(0).runtime.dht_put_local(dht_key, desc.clone());
+        let body = bd::open_descriptor(&identity_vk, period, &desc)
+            .expect("client decrypts the descriptor with the known identity");
+        // The cleartext routing is NOT in the descriptor bytes (encrypted).
+        assert!(
+            !desc.windows(32).any(|w| w == body.receiver_x25519_pk),
+            "descriptor body is encrypted, not in cleartext"
+        );
+
+        // Build a synthetic ad from the opened body + send (the routing fields
+        // are all send_via_rendezvous reads).
+        let ad = crate::node::anonymity::rendezvous::RendezvousAd {
+            receiver_node_id: net.node(4).node_id(),
+            rendezvous_node_id: body.rendezvous_node_id,
+            auth_cookie: body.auth_cookie,
+            receiver_x25519_pk: body.receiver_x25519_pk,
+            valid_from_unix: 0,
+            valid_until_unix: u64::MAX,
+            issuer_pk: String::new(),
+            issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
+            signature: Vec::new(),
+            push_envelope: Vec::new(),
+            capability_token: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            wire_version: 0,
+        };
+
+        let payload = b"hello via blinded descriptor";
+        let src_app = [0x0E; 32];
+        let mut delivered: Option<veil_app::registry::AppMessage> = None;
+        for _ in 0..6 {
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(1), rx_s.recv()).await {
+                delivered = Some(m);
+                break;
+            }
+            let _ = net
+                .node(0)
+                .runtime
+                .send_via_rendezvous(&ad, app_s, ep_s, src_app, payload, 2);
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(8), rx_s.recv()).await {
+                delivered = Some(m);
+                break;
+            }
+        }
+        match delivered.expect("service did not receive within 6 attempts") {
+            veil_app::registry::AppMessage::Deliver { data, .. } => {
+                assert_eq!(data.as_ref(), payload.as_slice());
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+
+        net.stop().await;
+    }
+
     // ── network-change triggers fast reconnect ────────────────────
 
     /// Simulates a WiFi → Cellular flip on a mobile node. Verifies that

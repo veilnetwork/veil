@@ -23,6 +23,16 @@ const ENC_KEY_DOMAIN: &[u8] = b"veil.descriptor.enc.v1\0";
 const DHT_KEY_DOMAIN: &[u8] = b"veil.descriptor.dhtkey.v1\0";
 const AAD_DOMAIN: &[u8] = b"veil.descriptor.aad.v1";
 
+/// Descriptor time-period length (24 h, Tor-v3-ish). The blinded key + DHT key +
+/// encryption key all rotate at this cadence; publisher and client compute the
+/// same period from their (loosely-synced) clocks.
+pub const PERIOD_SECS: u64 = 86_400;
+
+/// The current descriptor period for `now_unix`.
+pub fn current_period(now_unix: u64) -> u64 {
+    now_unix / PERIOD_SECS
+}
+
 /// Routing the client needs to reach the service (the descriptor plaintext).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlindedDescriptorBody {
