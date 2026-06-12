@@ -6334,9 +6334,34 @@ mod tests {
         assert_eq!(n_ads, 1, "service publishes one ad");
         tokio::time::sleep(Duration::from_millis(250)).await;
 
-        // Resolve S's ad into C + verify.
-        let ad_key =
-            crate::node::anonymity::rendezvous::rendezvous_ad_dht_key(&net.node(4).node_id());
+        // Δ2-c: the onion-service ad is keyed under a per-service PSEUDO node_id,
+        // NOT the sovereign one — so it can't be found by enumerating the real
+        // identity (a real client discovers the service via the blinded
+        // descriptor; see epic_anon_service_blinded_descriptor_end_to_end). Being
+        // white-box, derive the pseudo from the service's registration key (the
+        // same derivation the publisher uses) to fetch the ad here.
+        assert!(
+            net.node(4)
+                .runtime
+                .dht_get_local(&crate::node::anonymity::rendezvous::rendezvous_ad_dht_key(
+                    &net.node(4).node_id()
+                ))
+                .is_none(),
+            "ad must NOT be published under the sovereign node_id (Δ2-c)",
+        );
+        let pseudo = {
+            let svc = net.node(4).runtime.access();
+            let svcs = svc.anonymity.onion_services.lock().unwrap();
+            let kp = &svcs.first().expect("one registered service").reg_keypair;
+            veil_anonymity::rendezvous::EphemeralAdIdentity::from_b64_keypair(
+                kp.public_key.clone(),
+                kp.private_key.clone(),
+                veil_types::SignatureAlgorithm::Ed25519,
+            )
+            .expect("derive pseudo")
+            .pseudo_node_id
+        };
+        let ad_key = crate::node::anonymity::rendezvous::rendezvous_ad_dht_key(&pseudo);
         let ad_bytes = net
             .node(4)
             .runtime
