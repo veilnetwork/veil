@@ -343,6 +343,29 @@ impl NodeRuntime {
     /// the old ones. Called by both `reload` and `reload_via_arc`.
     pub async fn apply_reload_after_stop(&mut self, config: veil_cfg::Config) -> Result<()> {
         self.transport_ctx = Arc::new(veil_cfg::transport_glue::context_from_config(&config)?);
+        // Δ2-a: the `[anonymity]` section is NOT re-applied on reload — the live
+        // AnonymityState (relay_capable, advertised_bps, onion_service, x25519
+        // key) is frozen at boot so reload can't orphan already-published
+        // directory entries / rotate the anonymity key mid-flight. That freezing
+        // is deliberate, but silently ignoring a CHANGED `[anonymity]` is an ops
+        // trap, so warn the operator that a restart is required to apply it.
+        {
+            let new_onion_hops = config.anonymity.onion_service.then(|| {
+                config.anonymity.onion_service_hops.map_or(3, |h| h as usize)
+            });
+            if config.anonymity.relay_capable != self.anonymity.relay_capable
+                || config.anonymity.advertised_bps != self.anonymity.advertised_bps
+                || new_onion_hops != self.anonymity.onion_service_hops
+            {
+                self.logger.warn(
+                    "config.anonymity.reload_ignored",
+                    "[anonymity] changed but is applied at startup only — the live \
+                     relay_capable / advertised_bps / onion_service settings are unchanged \
+                     until a full restart (the anonymity key + published directory entries \
+                     are pinned across reload by design)",
+                );
+            }
+        }
         // identity bundle is `Arc<IdentityState>` — can't
         // mutate fields via deref. Build a fresh IdentityState reusing
         // existing Arc-clones for the peer caches (those are interior-mutable
