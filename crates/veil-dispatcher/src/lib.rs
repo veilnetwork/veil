@@ -5583,8 +5583,7 @@ mod tests {
             auth_cookie: [0x30u8; 16],
             receiver_x25519_pk: [0x40u8; 32],
         };
-        let (canonical_key, signed) =
-            seal_descriptor(&id_sk, &id_vk, period, &body).expect("seal");
+        let (canonical_key, signed) = seal_descriptor(&id_sk, period, &body).expect("seal");
         assert_eq!(canonical_key, descriptor_dht_key(&id_vk, period).unwrap());
         let victim_key = [0xFFu8; 32];
 
