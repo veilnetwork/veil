@@ -359,6 +359,14 @@ typedef struct VeilHandle VeilHandle;
 
 /**
  * Opaque veil stream — reliable ordered byte channel.
+ *
+ * The SDK stream is split into independent read/write halves under SEPARATE
+ * mutexes (diff-audit H4): the old single `Mutex<Option<SdkStream>>` meant a
+ * thread parked in `veil_stream_read` (which holds the lock across a blocking,
+ * timeout-less read) blocked any concurrent `veil_stream_write` forever — a
+ * half-duplex deadlock for request/response protocols. `tokio::io::split`
+ * lets read and write lock disjoint halves. Dropping the struct drops both
+ * halves → the underlying stream → its `Drop` sends STREAM_CLOSE.
  */
 typedef struct VeilStreamFfi VeilStreamFfi;
 
