@@ -175,6 +175,28 @@ class VeilClient implements Finalizable {
     });
   }
 
+  /// Register this node as a LOCATION-anonymous (onion) service: the daemon
+  /// builds an onion circuit to a rendezvous relay (which never learns this
+  /// node's location) and publishes the ad so clients can reach it by identity.
+  /// [hopCount] is clamped to ≥ 2 by the daemon. Throws on rejection (e.g. no
+  /// relays available yet — retry after a back-off). Connection-level.
+  Future<void> registerOnionService({int hopCount = 3}) async {
+    _ensureOpen();
+    return Future(() {
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        final rc = ffi.veilRegisterOnionService(_handle, hopCount, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+              'register_onion_service failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+      } finally {
+        calloc.free(errOut);
+      }
+    });
+  }
+
   /// Consume a bootstrap-invite URI (Epic 489.7) — typically scanned
   /// from a QR code or pasted from a sharing channel.  The daemon
   /// decodes plain / encrypted / signed formats automatically and

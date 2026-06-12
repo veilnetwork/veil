@@ -1603,6 +1603,27 @@ pub mod ipc_send_err {
     pub const REPLY_UNKNOWN: u16 = 10;
 }
 
+// ── RegisterOnionServicePayload ──────────────────────────────────────────────
+
+/// App → daemon request to host a LOCATION-anonymous (onion) service. Wire is
+/// just the circuit `hop_count` (u32 BE; clamped to ≥ 2 by the daemon).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterOnionServicePayload {
+    pub hop_count: u32,
+}
+
+impl RegisterOnionServicePayload {
+    pub fn encode(&self) -> [u8; 4] {
+        self.hop_count.to_be_bytes()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        Ok(Self {
+            hop_count: super::read_u32_be(buf, 0)?,
+        })
+    }
+}
+
 // ── AppIpcRtSendPayload ─────────────────────────────────────────────────────
 
 /// Sent by the IPC client to dispatch a real-time (RT) frame into the veil.

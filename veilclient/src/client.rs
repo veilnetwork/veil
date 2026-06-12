@@ -416,6 +416,9 @@ pub(crate) struct DispatchTable {
     pub pending_set_wake_hmac_envelope: std::collections::VecDeque<
         tokio::sync::oneshot::Sender<veilcore::proto::SetWakeHmacEnvelopeStatus>,
     >,
+    /// Pending oneshot replies for `RegisterOnionService` (2-byte status; 0=ok).
+    pub pending_register_onion_service:
+        std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
     ///.4 P2: pending oneshot replies for `MailboxPut`.
     pub pending_mailbox_put:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<MailboxPutReply>>,
@@ -540,6 +543,7 @@ impl DispatchTable {
             pending_mobile_status: std::collections::VecDeque::new(),
             pending_set_push_envelope: std::collections::VecDeque::new(),
             pending_set_wake_hmac_envelope: std::collections::VecDeque::new(),
+            pending_register_onion_service: std::collections::VecDeque::new(),
             pending_mailbox_put: std::collections::VecDeque::new(),
             pending_mailbox_fetch: std::collections::VecDeque::new(),
             pending_mailbox_ack: std::collections::VecDeque::new(),
@@ -922,6 +926,40 @@ impl VeilClient {
             Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
             Err(_) => Err(ClientError::Protocol(
                 "timeout waiting for SetWakeHmacEnvelopeOk".into(),
+            )),
+        }
+    }
+
+    /// Register this node as a LOCATION-anonymous (onion) service: the daemon
+    /// picks relays, builds an onion circuit to a rendezvous relay (so it never
+    /// learns this node's location), and publishes the ad so clients can reach
+    /// this node by its identity. `hop_count` is clamped to ≥ 2 by the daemon.
+    /// `Ok(())` once the daemon accepts; a non-zero daemon status maps to an
+    /// error (e.g. no relays available yet — retry later).
+    pub async fn register_onion_service(&self, hop_count: u32) -> Result<(), ClientError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_register_onion_service);
+            if d.pending_register_onion_service.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(format!(
+                    "register_onion_service queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
+                )));
+            }
+            d.pending_register_onion_service.push_back(tx);
+        }
+        let payload = veilcore::proto::RegisterOnionServicePayload { hop_count };
+        self.writer
+            .write_frame(LocalAppMsg::RegisterOnionService as u16, &payload.encode())
+            .await?;
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(code)) => Err(ClientError::Protocol(format!(
+                "register_onion_service rejected by daemon (status {code})"
+            ))),
+            Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
+            Err(_) => Err(ClientError::Protocol(
+                "timeout waiting for RegisterOnionServiceResult".into(),
             )),
         }
     }
@@ -2178,6 +2216,13 @@ async fn reader_task(
                     if let Some(tx) = pop_next_open(&mut d.pending_set_wake_hmac_envelope) {
                         let _ = tx.send(status);
                     }
+                }
+            }
+            LocalAppMsg::RegisterOnionServiceResult if body.len() >= 2 => {
+                let status = u16::from_be_bytes([body[0], body[1]]);
+                let mut d = dispatch.lock().await;
+                if let Some(tx) = pop_next_open(&mut d.pending_register_onion_service) {
+                    let _ = tx.send(status);
                 }
             }
             LocalAppMsg::MailboxPutOk => {

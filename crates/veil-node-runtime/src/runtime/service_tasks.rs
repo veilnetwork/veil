@@ -2574,6 +2574,23 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
     > {
         Box::pin(async move { self.access.send_reply(reply_id, data, self.hop_count).await })
     }
+
+    fn register_onion_service<'a>(
+        &'a self,
+        hop_count: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), veil_types::AnonOnionSendError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.access
+                .register_onion_service(hop_count)
+                .map(|_cookie| ())
+        })
+    }
 }
 
 impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {

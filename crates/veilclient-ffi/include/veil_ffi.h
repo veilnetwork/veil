@@ -703,6 +703,21 @@ VeilStreamFfi *veil_stream_open(VeilApp *app,
  int veil_get_relay_x25519_pubkey(VeilHandle *handle, uint8_t *out_pubkey_32, char **err_out) ;
 
 /**
+ * Register this node as a LOCATION-anonymous (onion) service: the daemon picks
+ * relays, builds an onion circuit to a rendezvous relay (which never learns
+ * this node's location), and publishes the ad so clients can reach this node by
+ * its identity. `hop_count` is clamped to ≥ 2 by the daemon (2 = node→mid→relay).
+ *
+ * `VEIL_OK` once the daemon accepts; `VEIL_ERR` with a detail otherwise (e.g.
+ * no relays available yet — retry after a short back-off). Connection-level:
+ * hosts the whole node as a service; any bound endpoint can then receive.
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*` from `veil_connect`.
+ */
+ int veil_register_onion_service(VeilHandle *handle, uint32_t hop_count, char **err_out) ;
+
+/**
  * Deposit `blob` for an offline `receiver_id` at the daemon's mailbox
  *. No `auth_cookie` required.
  *

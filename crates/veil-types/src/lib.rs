@@ -193,6 +193,17 @@ pub trait AnonOnionSender: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
     >;
+
+    /// Register this node as a LOCATION-anonymous service over an onion circuit
+    /// (the IPC/FFI entry point, complementing the `[anonymity].onion_service`
+    /// config flag): pick relays, build the circuit, publish the ad. `hop_count`
+    /// is clamped to ≥ 2. Errors are local/pre-transmit (e.g. `NoRelays`).
+    fn register_onion_service<'a>(
+        &'a self,
+        hop_count: usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
+    >;
 }
 
 // ── Wire-format constants shared by proto + crypto ────────────────────────────

@@ -1669,6 +1669,53 @@ pub unsafe extern "C" fn veil_get_relay_x25519_pubkey(
     }
 }
 
+/// Register this node as a LOCATION-anonymous (onion) service: the daemon picks
+/// relays, builds an onion circuit to a rendezvous relay (which never learns
+/// this node's location), and publishes the ad so clients can reach this node by
+/// its identity. `hop_count` is clamped to ≥ 2 by the daemon (2 = node→mid→relay).
+///
+/// `VEIL_OK` once the daemon accepts; `VEIL_ERR` with a detail otherwise (e.g.
+/// no relays available yet — retry after a short back-off). Connection-level:
+/// hosts the whole node as a service; any bound endpoint can then receive.
+///
+/// # Safety
+/// `handle` must be a live `VeilHandle*` from `veil_connect`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_register_onion_service(
+    handle: *mut VeilHandle,
+    hop_count: u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_register_onion_service") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&handle_live.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.register_onion_service(hop_count).await
+    });
+    match res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("register_onion_service failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
 // ── Mailbox put/fetch/ack ────────────────
 
 /// Status return codes [`veil_mailbox_put`]. Mirrors
