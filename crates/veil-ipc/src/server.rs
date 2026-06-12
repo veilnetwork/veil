@@ -1962,6 +1962,37 @@ async fn handle_ipc_client(
                     Ok(LocalAppMsg::AnycastReportFailure) => {
                         handle_anycast_report_failure(&body, anycast_service.as_ref());
                     }
+                    Ok(LocalAppMsg::RegisterOnionService) => {
+                        use veil_proto::ipc::{RegisterOnionServicePayload, ipc_send_err};
+                        // 0 = ok; else an ipc_send_err. Onion-service hosting goes
+                        // through the same anon_onion_sender capability.
+                        let status: u16 = match RegisterOnionServicePayload::decode(&body) {
+                            Ok(p) => match anon_onion_sender.as_deref() {
+                                Some(s) => {
+                                    match s.register_onion_service(p.hop_count as usize).await {
+                                        Ok(()) => 0,
+                                        Err(veil_types::AnonOnionSendError::NoRelays) => {
+                                            ipc_send_err::NO_ROUTE
+                                        }
+                                        Err(veil_types::AnonOnionSendError::NoIdentity) => {
+                                            ipc_send_err::NO_IDENTITY
+                                        }
+                                        Err(_) => ipc_send_err::NO_RENDEZVOUS,
+                                    }
+                                }
+                                None => ipc_send_err::NO_RENDEZVOUS,
+                            },
+                            Err(_) => ipc_send_err::INVALID_FLAGS,
+                        };
+                        let mut hdr = FrameHeader::new(
+                            FrameFamily::LocalApp as u8,
+                            LocalAppMsg::RegisterOnionServiceResult as u16,
+                        );
+                        hdr.body_len = 2;
+                        let mut frame = codec::encode_header(&hdr).to_vec();
+                        frame.extend_from_slice(&status.to_be_bytes());
+                        wh.write_all(&frame).await?;
+                    }
                     Ok(LocalAppMsg::TransportHintQuery) => {
                         handle_transport_hint_query(&mut wh, hint_registry.as_ref()).await?;
                     }
