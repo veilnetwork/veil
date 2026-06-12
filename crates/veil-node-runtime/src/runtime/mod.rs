@@ -6021,7 +6021,7 @@ impl NodeServices {
     /// anti-squat guarantee is first-wins only; binding `reg_pk` into the ad is a
     /// follow-up. Maintenance (rebuild on TTL) is also a follow-up — v1 builds
     /// once.
-    pub fn register_onion_circuit(
+    fn build_onion_circuit_once(
         &self,
         relay_path: &[[u8; 32]],
         cookie: [u8; 16],
@@ -6094,6 +6094,58 @@ impl NodeServices {
             &setup,
         );
         Ok(())
+    }
+
+    /// Register a location-anonymous service: build its onion circuit + record it
+    /// so the maintenance tick keeps it alive ([`Self::maintain_onion_circuits`]).
+    /// `relay_path` is first→terminus (terminus = rendezvous relay R); each hop's
+    /// X25519 key is resolved from the local relay-directory shard. The caller
+    /// separately publishes a `RendezvousAd` at (R, cookie, our x25519) — this
+    /// does NOT session-register (the location leak it avoids). See the
+    /// onion-registration design doc.
+    pub fn register_onion_circuit(
+        &self,
+        relay_path: &[[u8; 32]],
+        cookie: [u8; 16],
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        self.build_onion_circuit_once(relay_path, cookie)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut svcs = lock!(self.anonymity.onion_services);
+        // Replace any prior entry for the same cookie (re-register), else push.
+        svcs.retain(|e| e.cookie != cookie);
+        svcs.push(anonymity_state::OnionServiceEntry {
+            relay_path: relay_path.to_vec(),
+            cookie,
+            built_unix: now,
+        });
+        Ok(())
+    }
+
+    /// Maintenance: rebuild any hosted onion-service circuit that is older than
+    /// half the relay circuit TTL, so it never lapses. Called from the
+    /// maintenance tick. Best-effort — a rebuild that fails (e.g. a hop's
+    /// directory entry not currently cached) is retried next tick.
+    pub fn maintain_onion_circuits(&self, now_unix: u64) {
+        // Refresh at half the relay-side circuit idle TTL (300 s) → 150 s.
+        const REFRESH_SECS: u64 = veil_anonymity::circuit_table::DEFAULT_CIRCUIT_TTL_SECS / 2;
+        let due: Vec<([u8; 16], Vec<[u8; 32]>)> = {
+            let svcs = lock!(self.anonymity.onion_services);
+            svcs.iter()
+                .filter(|e| now_unix.saturating_sub(e.built_unix) >= REFRESH_SECS)
+                .map(|e| (e.cookie, e.relay_path.clone()))
+                .collect()
+        };
+        for (cookie, relay_path) in due {
+            if self.build_onion_circuit_once(&relay_path, cookie).is_ok() {
+                let mut svcs = lock!(self.anonymity.onion_services);
+                if let Some(e) = svcs.iter_mut().find(|e| e.cookie == cookie) {
+                    e.built_unix = now_unix;
+                }
+            }
+        }
     }
 
     /// Build + enqueue one `RelayChain::<msg>` control frame to `peer`'s session.
