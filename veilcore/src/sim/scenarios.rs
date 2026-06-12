@@ -6122,6 +6122,153 @@ mod tests {
         net.stop().await;
     }
 
+    /// Onion-registration end-to-end (anonymous-service epic b7): a service S
+    /// registers a cookie at rendezvous relay R **over a 2-hop onion circuit**
+    /// (S→mid→R), publishes an ad, and a client C reaches it via the normal
+    /// rendezvous send. R forwards the introduce DOWN the circuit and S
+    /// receives it — while R holds NO session registration for S and never
+    /// learned S's location (its only link toward S is the intermediate hop).
+    ///
+    /// Topology (5 nodes, full mesh, all anonymity-capable): N0 = C (client),
+    /// N4 = S (service), N1 = circuit mid-hop, N3 = R (terminus + rendezvous),
+    /// N2 = spare relay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn epic_anon_service_onion_registration_end_to_end() {
+        let n = 5;
+        let mut net = SimNetwork::builder()
+            .nodes(n)
+            .role(NodeRole::Core)
+            .anonymity_relay(vec![true, true, true, true, true])
+            .sovereign_identities(true)
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        for i in 0..n {
+            assert!(
+                net.node(i)
+                    .wait_sessions(n - 1, Duration::from_secs(45))
+                    .await,
+                "node {i} should have {0} sessions",
+                n - 1
+            );
+        }
+
+        // Bind the service's receiving endpoint.
+        let app_s = [0x5E; 32];
+        let ep_s = 7u32;
+        let (_h_s, mut rx_s) = net.node(4).runtime.app_registry().register(app_s, ep_s, 16);
+
+        // Publish relay directory entries (N1/N2/N3) and mirror them into BOTH
+        // S's shard (to resolve its circuit hops' x25519 keys) and C's shard (to
+        // onion-route the introduce to R).
+        for i in 1..=3 {
+            net.node(i)
+                .runtime
+                .debug_force_publish_relay_directory_entry()
+                .await
+                .expect("relay must publish directory entry");
+        }
+        for i in 1..=3 {
+            let key =
+                crate::node::anonymity::directory::relay_directory_dht_key(&net.node(i).node_id());
+            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                net.node(0).runtime.dht_put_local(key, bytes.clone());
+                net.node(4).runtime.dht_put_local(key, bytes);
+            }
+        }
+
+        // S registers a LOCATION-anonymous service: a 2-hop circuit S→N1→N3,
+        // registering `cookie` AT N3 over that circuit (NO session register), and
+        // publishes a rendezvous ad pointing at (N3, cookie, S's x25519).
+        let cookie = [0xC7u8; 16];
+        let r_id = net.node(3).node_id();
+        let mid_id = net.node(1).node_id();
+        net.node(4)
+            .runtime
+            .access()
+            .register_onion_circuit(&[mid_id, r_id], cookie)
+            .expect("register_onion_circuit must succeed");
+        net.node(4)
+            .runtime
+            .register_rendezvous_publisher(r_id, cookie, 3600);
+        let n_ads = net
+            .node(4)
+            .runtime
+            .debug_force_publish_rendezvous_ads()
+            .await;
+        assert_eq!(n_ads, 1, "service publishes exactly one ad");
+        // Let the CircuitBuild (over direct sessions) install at N1 + N3.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // R bound the cookie to a CIRCUIT (not a session): the presence-of-circuit
+        // + absence-of-session is the location-hiding property.
+        let r = net.node(3).runtime.access();
+        assert!(
+            r.dispatcher
+                .circuit_rendezvous
+                .as_ref()
+                .unwrap()
+                .lookup(&cookie)
+                .is_some(),
+            "R must hold a circuit-backed subscription for the cookie"
+        );
+        assert_eq!(
+            r.dispatcher.rendezvous_registry.as_ref().unwrap().len(),
+            0,
+            "R must have NO session-backed registration — S never revealed its location"
+        );
+
+        // Mirror S's ad into C, who resolves + verifies it, then sends.
+        let ad_key =
+            crate::node::anonymity::rendezvous::rendezvous_ad_dht_key(&net.node(4).node_id());
+        let ad_bytes = net
+            .node(4)
+            .runtime
+            .dht_get_local(&ad_key)
+            .expect("service has its own ad locally");
+        net.node(0).runtime.dht_put_local(ad_key, ad_bytes.clone());
+        let ad = crate::node::anonymity::rendezvous::decode_rendezvous_ad(&ad_bytes)
+            .expect("ad decodes");
+        assert!(
+            crate::node::anonymity::rendezvous::verify_rendezvous_ad(&ad).is_ok(),
+            "ad signature verifies"
+        );
+
+        // C sends to the service via the rendezvous. The introduce is onion-routed
+        // to R, which forwards it DOWN the circuit to S. The onion leg can drop in
+        // the sim (~25%), so retry the send (the circuit + registration persist).
+        let payload = b"hello anonymous service";
+        let src_app = [0x0C; 32];
+        let mut delivered: Option<veil_app::registry::AppMessage> = None;
+        for _ in 0..6 {
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(1), rx_s.recv()).await {
+                delivered = Some(m);
+                break;
+            }
+            let _ = net
+                .node(0)
+                .runtime
+                .send_via_rendezvous(&ad, app_s, ep_s, src_app, payload, 2);
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(8), rx_s.recv()).await {
+                delivered = Some(m);
+                break;
+            }
+        }
+
+        let msg = delivered.expect("service did not receive the message within 6 attempts");
+        match msg {
+            veil_app::registry::AppMessage::Deliver {
+                src_node_id, data, ..
+            } => {
+                assert_eq!(src_node_id, [0u8; 32], "anonymity: sender node_id zeroed");
+                assert_eq!(data.as_ref(), payload.as_slice(), "payload exact");
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+
+        net.stop().await;
+    }
+
     // ── network-change triggers fast reconnect ────────────────────
 
     /// Simulates a WiFi → Cellular flip on a mobile node. Verifies that
