@@ -133,6 +133,10 @@ impl NodeRuntime {
         let dispatcher_for_gossip = Arc::clone(&self.dispatcher);
         let dht_for_tick = Arc::clone(&self.dht);
         let session_tx_registry_for_tick = Arc::clone(&self.session_tx_registry);
+        // Whole-services handle so the tick can rebuild hosted onion-service
+        // circuits before their TTL lapses (no-op unless this node registered an
+        // onion service via `register_onion_circuit`).
+        let access_for_onion = self.access();
         // re-issue local sovereign delegation at half-validity.
         // Standalone-mode only — multi-device delegations need master-sk
         // intervention from a separate device, the tick will skip + log.
@@ -296,6 +300,13 @@ impl NodeRuntime {
                             &local_identity_for_publish,
                             &dht_for_publish,
                             &publish_logger,
+                        );
+                        // Rebuild hosted onion-service circuits nearing their TTL.
+                        access_for_onion.maintain_onion_circuits(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0),
                         );
                         Self::tick_prune_completed_task_handles(&tasks);
                         // Advance heartbeat so the watchdog knows we're alive.

@@ -189,6 +189,24 @@ pub struct AnonymityState {
     /// when a verified inbound message carries a reply path; consumed by the
     /// reply-send path. Bounded + TTL'd; the block never leaves the daemon.
     pub reply_block_store: Arc<ReplyBlockStore>,
+
+    /// Active location-anonymous services this node hosts (onion-registration):
+    /// the `(relay_path, cookie)` + last-build time of each, so the maintenance
+    /// tick can REBUILD the circuit before its TTL lapses (the circuit is
+    /// otherwise built once and idle-GC'd). Empty unless the node registered an
+    /// onion service via `register_onion_circuit`.
+    pub onion_services: Arc<Mutex<Vec<OnionServiceEntry>>>,
+}
+
+/// One hosted onion service to keep alive (see [`AnonymityState::onion_services`]).
+#[derive(Clone)]
+pub struct OnionServiceEntry {
+    /// Hop list first→terminus (terminus = the rendezvous relay R).
+    pub relay_path: Vec<[u8; 32]>,
+    /// Rendezvous cookie bound to this service's circuit.
+    pub cookie: [u8; 16],
+    /// Unix secs of the last (re)build, for the refresh cadence.
+    pub built_unix: u64,
 }
 
 impl AnonymityState {
@@ -207,6 +225,7 @@ impl AnonymityState {
             rendezvous_publisher_entries: Arc::new(Mutex::new(Vec::new())),
             relay_reputation: Arc::new(RelayReputation::new()),
             reply_block_store: Arc::new(ReplyBlockStore::new()),
+            onion_services: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
