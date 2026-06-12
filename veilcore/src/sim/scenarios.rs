@@ -6528,6 +6528,139 @@ mod tests {
         net.stop().await;
     }
 
+    /// Full prod send-via-blinded-descriptor (onion-registration A2): the client
+    /// calls `send_to_onion_service(identity_vk, …)` — it resolves the service's
+    /// UNLINKABLE per-period descriptor (not the node_id-keyed ad), decrypts it
+    /// with the known identity, and reaches the service over the onion. This is
+    /// the production entry that makes the blinded descriptor (#3) live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn epic_anon_service_send_to_onion_service_prod_path() {
+        let n = 5;
+        let mut net = SimNetwork::builder()
+            .nodes(n)
+            .role(NodeRole::Core)
+            .anonymity_relay(vec![true, true, true, true, true])
+            .sovereign_identities(true)
+            .build()
+            .await;
+        net.wire_full_mesh().await;
+        for i in 0..n {
+            assert!(
+                net.node(i)
+                    .wait_sessions(n - 1, Duration::from_secs(45))
+                    .await,
+                "node {i} sessions",
+            );
+        }
+
+        let app_s = [0x7B; 32];
+        let ep_s = 11u32;
+        let (_h_s, mut rx_s) = net.node(4).runtime.app_registry().register(app_s, ep_s, 16);
+
+        for i in 1..=3 {
+            net.node(i)
+                .runtime
+                .debug_force_publish_relay_directory_entry()
+                .await
+                .expect("relay dir entry");
+        }
+        for i in 1..=3 {
+            let key =
+                crate::node::anonymity::directory::relay_directory_dht_key(&net.node(i).node_id());
+            if let Some(bytes) = net.node(i).runtime.dht_get_local(&key) {
+                net.node(0).runtime.dht_put_local(key, bytes.clone());
+                net.node(4).runtime.dht_put_local(key, bytes);
+            }
+        }
+
+        // Authenticated delivery: the service's verify task resolves the SENDER's
+        // IdentityDocument. Mirror node 0's into the service's shard so the
+        // resolve doesn't depend on organic replication timing.
+        {
+            use crate::proto::identity_document::IdentityDocument;
+            let sender_node_id = *net
+                .node(0)
+                .runtime
+                .sovereign_identity()
+                .expect("sender identity")
+                .node_id();
+            net.node(0)
+                .runtime
+                .debug_republish_sovereign_identity()
+                .await
+                .expect("publish sender identity");
+            net.node(0).runtime.debug_force_dht_republish().await;
+            let doc_key = IdentityDocument::dht_key(&sender_node_id);
+            let doc = net
+                .node(0)
+                .runtime
+                .dht_get_local(&doc_key)
+                .expect("sender identity doc in its shard");
+            net.node(4).runtime.dht_put_local(doc_key, doc);
+        }
+
+        // Register — publishes the ad AND seals + stores the blinded descriptor.
+        net.node(4)
+            .runtime
+            .register_onion_service(2)
+            .expect("register_onion_service");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // The client addresses the service by its Ed25519 IDENTITY (the .onion-
+        // like handle), never by node_id. Mirror the descriptor into the client's
+        // shard so the recursive resolve is deterministic (the onion leg below is
+        // the only drop-prone part).
+        let identity_vk = *net
+            .node(4)
+            .runtime
+            .sovereign_identity()
+            .expect("service identity")
+            .ed25519_signing_key()
+            .expect("ed25519 identity")
+            .verifying_key()
+            .as_bytes();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let period = veil_anonymity::blinded_descriptor::current_period(now);
+        let dht_key =
+            veil_anonymity::blinded_descriptor::descriptor_dht_key(&identity_vk, period).unwrap();
+        let desc = net
+            .node(4)
+            .runtime
+            .dht_get_local(&dht_key)
+            .expect("service stored its blinded descriptor");
+        net.node(0).runtime.dht_put_local(dht_key, desc);
+
+        // THE PROD ENTRY POINT for sending: resolve descriptor → decrypt → onion.
+        let payload = b"hello onion service by identity";
+        let mut delivered: Option<veil_app::registry::AppMessage> = None;
+        for _ in 0..6 {
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(1), rx_s.recv()).await {
+                delivered = Some(m);
+                break;
+            }
+            let _ = net
+                .node(0)
+                .runtime
+                .send_to_onion_service(identity_vk, app_s, ep_s, payload, 2, None)
+                .await;
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(8), rx_s.recv()).await {
+                delivered = Some(m);
+                break;
+            }
+        }
+        match delivered.expect("service did not receive within 6 attempts") {
+            veil_app::registry::AppMessage::Deliver { data, .. } => {
+                assert_eq!(data.as_ref(), payload.as_slice());
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+
+        net.stop().await;
+    }
+
     // ── network-change triggers fast reconnect ────────────────────
 
     /// Simulates a WiFi → Cellular flip on a mobile node. Verifies that
