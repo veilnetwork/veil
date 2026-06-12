@@ -365,32 +365,37 @@ impl NodeRuntime {
         // returning rotated seeds. Each URL is fetched concurrently;
         // discovered peers are registered + dialed via the same
         // outbound-connector path the DNS layer uses.
-        if !config.global.bootstrap_https_urls.is_empty() {
-            // Fail-closed gate (audit cycle-9 BOOT-UNPIN): without an issuer pin,
-            // signed_preferred accepts ANY internally-valid bundle — an attacker
-            // who controls the HTTPS origin (CDN/CA/hosting/mirror compromise)
-            // can serve their own validly-signed seed list and the fetcher merges
-            // it. A pin is the only author authentication. Refuse to fetch
-            // unpinned bootstrap unless an operator explicitly opts in
-            // (production → trusted_bundle_issuer_pubkey; dev/testnet →
-            // allow_unpinned_signed_bootstrap / legacy_allow_unsigned_bootstrap).
-            let pinned = config.global.trusted_bundle_issuer_pubkey.is_some();
-            let unpinned_opt_in = config.global.allow_unpinned_signed_bootstrap
-                || config.global.legacy_allow_unsigned_bootstrap;
-            if !pinned && !unpinned_opt_in {
-                self.logger.error(
-                    "bootstrap.https.fail_closed",
-                    format!(
-                        "{} HTTPS bootstrap URL(s) configured without \
-                         trusted_bundle_issuer_pubkey — refusing to fetch unpinned bootstrap \
-                         (an HTTPS-origin compromise could serve a validly-signed attacker \
-                         bundle). Set trusted_bundle_issuer_pubkey for production, or \
-                         allow_unpinned_signed_bootstrap = true for dev/testnet.",
-                        config.global.bootstrap_https_urls.len(),
-                    ),
-                );
-                return;
-            }
+        // Fail-closed gate (audit cycle-9 BOOT-UNPIN): without an issuer pin,
+        // signed_preferred accepts ANY internally-valid bundle — an attacker
+        // who controls the HTTPS origin (CDN/CA/hosting/mirror compromise)
+        // can serve their own validly-signed seed list and the fetcher merges
+        // it. A pin is the only author authentication. Refuse to fetch
+        // unpinned bootstrap unless an operator explicitly opts in
+        // (production → trusted_bundle_issuer_pubkey; dev/testnet →
+        // allow_unpinned_signed_bootstrap / legacy_allow_unsigned_bootstrap).
+        let https_urls_present = !config.global.bootstrap_https_urls.is_empty();
+        let https_pinned_or_opted_in = config.global.trusted_bundle_issuer_pubkey.is_some()
+            || config.global.allow_unpinned_signed_bootstrap
+            || config.global.legacy_allow_unsigned_bootstrap;
+        if https_urls_present && !https_pinned_or_opted_in {
+            self.logger.error(
+                "bootstrap.https.fail_closed",
+                format!(
+                    "{} HTTPS bootstrap URL(s) configured without \
+                     trusted_bundle_issuer_pubkey — refusing to fetch unpinned bootstrap \
+                     (an HTTPS-origin compromise could serve a validly-signed attacker \
+                     bundle). Set trusted_bundle_issuer_pubkey for production, or \
+                     allow_unpinned_signed_bootstrap = true for dev/testnet.",
+                    config.global.bootstrap_https_urls.len(),
+                ),
+            );
+        }
+        // BOOT-UNPIN scope fix (diff-audit 2026-06-12): gate ONLY the HTTPS
+        // fetch. The prior `return` here exited the WHOLE task, so a node with
+        // valid bootstrap_peers + one unpinned HTTPS URL lost ALL startup
+        // bootstrap (configured peers / DNS / builtin seeds below). Those must
+        // still run when the HTTPS branch is refused.
+        if https_urls_present && https_pinned_or_opted_in {
             let logger = self.logger.clone();
             let urls = config.global.bootstrap_https_urls.clone();
             let transport_ctx = self.transport_ctx.clone();
