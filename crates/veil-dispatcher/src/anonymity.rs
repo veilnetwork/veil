@@ -838,7 +838,11 @@ impl FrameDispatcher {
             Ok(b) => b,
             Err(_) => return false, // introduce larger than one cell — drop
         };
-        let seq = circuit.alloc_return_seq();
+        // D5: refuse to send if the return-seq space is exhausted (would reuse
+        // keystream). Drop the cell; the circuit idle-GCs and is rebuilt fresh.
+        let Some(seq) = circuit.alloc_return_seq() else {
+            return false;
+        };
         apply_layer(&circuit.circuit_key, Direction::Return, seq, &mut buf);
         let cell = CircuitDataPayload {
             circuit_id: circuit.circuit_id_in,

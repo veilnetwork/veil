@@ -115,10 +115,37 @@ impl CircuitState {
     }
 
     /// Allocate the next return-direction seq for a cell this node originates.
-    /// Wraps past `u32::MAX` back to 1 (never returns 0).
-    pub fn alloc_return_seq(&self) -> u32 {
-        let s = self.next_return_seq.fetch_add(1, Ordering::Relaxed);
-        if s == 0 { 1 } else { s }
+    /// Returns `None` when the seq space is EXHAUSTED (diff-audit D5).
+    ///
+    /// The cell keystream is `keystream(circuit_key, Return, seq)`. Wrapping the
+    /// seq back to 1 would reuse a (key, dir, seq) triple and hence reuse
+    /// keystream — an XOR/two-time-pad leak. Instead we SATURATE: once the space
+    /// is used up we refuse to allocate (the caller drops the cell; the circuit
+    /// idle-GCs and is rebuilt with a fresh key). 2^32 return cells on ONE
+    /// circuit is far beyond any real lifetime (the idle TTL tears it down long
+    /// first), so this is a belt-and-braces guard, not a hot path. Never returns
+    /// 0 (reserved by [`ReplayWindow`]).
+    pub fn alloc_return_seq(&self) -> Option<u32> {
+        let mut cur = self.next_return_seq.load(Ordering::Relaxed);
+        loop {
+            if cur == u32::MAX {
+                return None; // exhausted — refuse rather than wrap + reuse
+            }
+            match self.next_return_seq.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(cur),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_return_seq_for_test(&self, v: u32) {
+        self.next_return_seq.store(v, Ordering::Relaxed);
     }
 }
 
@@ -331,6 +358,23 @@ mod tests {
         // Misses.
         assert!(t.lookup_forward(&prev, 99).is_none());
         assert!(t.lookup_backward(&next, 99).is_none());
+    }
+
+    #[test]
+    fn alloc_return_seq_saturates_no_wrap_d5() {
+        let t = CircuitTable::new();
+        let c = t.install(&inst(1, 2, 0x11), [3u8; 32], None, 0).unwrap();
+        // Normal allocation: nonzero, increasing.
+        let a = c.alloc_return_seq().unwrap();
+        let b = c.alloc_return_seq().unwrap();
+        assert_ne!(a, 0);
+        assert!(b > a);
+        // diff-audit D5: at the top of the space, hand out the last seq then
+        // SATURATE to None — never wrap back to a reused (key, dir, seq).
+        c.set_return_seq_for_test(u32::MAX - 1);
+        assert_eq!(c.alloc_return_seq(), Some(u32::MAX - 1));
+        assert_eq!(c.alloc_return_seq(), None, "exhausted — must not wrap + reuse");
+        assert_eq!(c.alloc_return_seq(), None, "stays exhausted");
     }
 
     #[test]
