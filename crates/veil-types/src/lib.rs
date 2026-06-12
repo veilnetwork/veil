@@ -221,6 +221,22 @@ pub trait AnonOnionSender: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
     >;
+
+    /// Like [`Self::send_to_onion_service`] but UNAUTHENTICATED: the service
+    /// receives the message with `src_node_id = [0; 32]` and never learns the
+    /// sender. `src_app_id` rides inside the sealed payload for the service's
+    /// app-level routing only. No sovereign identity is required.
+    fn send_to_onion_service_anonymous<'a>(
+        &'a self,
+        service_identity_vk: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        src_app_id: [u8; 32],
+        data: &'a [u8],
+        hop_count: usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
+    >;
 }
 
 // ── Wire-format constants shared by proto + crypto ────────────────────────────

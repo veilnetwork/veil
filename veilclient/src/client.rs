@@ -1000,6 +1000,8 @@ impl VeilClient {
             target_app_id,
             target_endpoint_id,
             hop_count,
+            anonymous: false,
+            src_app_id: [0u8; 32],
             data: data.to_vec(),
         };
         self.writer
@@ -1009,6 +1011,56 @@ impl VeilClient {
             Ok(Ok(0)) => Ok(()),
             Ok(Ok(code)) => Err(ClientError::Protocol(format!(
                 "send_to_onion_service rejected by daemon (status {code})"
+            ))),
+            Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
+            Err(_) => Err(ClientError::Protocol(
+                "timeout waiting for SendToOnionServiceResult".into(),
+            )),
+        }
+    }
+
+    /// Like [`Self::send_to_onion_service`] but UNAUTHENTICATED: the service
+    /// receives `src_node_id = [0; 32]` and never learns who sent the message —
+    /// combined with the unlinkable descriptor resolution, neither the relays, the
+    /// rendezvous relay, nor the service learn the sender's location or identity.
+    /// `src_app_id` rides inside the sealed payload for the service's app-level
+    /// routing only (no node identity). No sovereign identity is required.
+    pub async fn send_to_onion_service_anonymous(
+        &self,
+        service_identity_vk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        src_app_id: [u8; 32],
+        hop_count: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_send_to_onion_service);
+            if d.pending_send_to_onion_service.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(format!(
+                    "send_to_onion_service queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
+                )));
+            }
+            d.pending_send_to_onion_service.push_back(tx);
+        }
+        let payload = veilcore::proto::SendToOnionServicePayload {
+            service_identity_vk,
+            target_app_id,
+            target_endpoint_id,
+            hop_count,
+            anonymous: true,
+            src_app_id,
+            data: data.to_vec(),
+        };
+        self.writer
+            .write_frame(LocalAppMsg::SendToOnionService as u16, &payload.encode())
+            .await?;
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(code)) => Err(ClientError::Protocol(format!(
+                "send_to_onion_service_anonymous rejected by daemon (status {code})"
             ))),
             Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
             Err(_) => Err(ClientError::Protocol(

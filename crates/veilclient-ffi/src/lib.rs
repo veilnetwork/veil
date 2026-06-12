@@ -1803,6 +1803,104 @@ pub unsafe extern "C" fn veil_send_to_onion_service(
     }
 }
 
+/// Like [`veil_send_to_onion_service`], but UNAUTHENTICATED: the service receives
+/// `src_node_id = [0;32]` and never learns who sent the message. Combined with the
+/// unlinkable descriptor, neither the relays, the rendezvous relay, nor the
+/// service learn the sender's location or identity. `src_app_id` (32 bytes) rides
+/// inside the sealed payload for the service's app-level routing only.
+///
+/// # Safety
+/// `handle` must be a live `VeilHandle*`; `service_identity_vk`, `target_app_id`,
+/// and `src_app_id` must each be readable for 32 bytes; `data` must be readable
+/// for `len` bytes (or NULL iff `len == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_send_to_onion_service_anonymous(
+    handle: *mut VeilHandle,
+    service_identity_vk: *const u8,
+    target_app_id: *const u8,
+    target_endpoint_id: u32,
+    src_app_id: *const u8,
+    hop_count: u32,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_send_to_onion_service_anonymous") }
+    {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "service_identity_vk" => service_identity_vk,
+        "target_app_id" => target_app_id,
+        "src_app_id" => src_app_id,
+    );
+    if data.is_null() && len > 0 {
+        unsafe {
+            write_err(err_out, "data is NULL but len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("data len {len} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let mut id_vk = [0u8; 32];
+    let mut app_id = [0u8; 32];
+    let mut src_app = [0u8; 32];
+    // SAFETY: all three pointers NULL-checked above; caller guarantees 32
+    // readable bytes each (size per the C header).
+    unsafe {
+        ptr::copy_nonoverlapping(service_identity_vk, id_vk.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(target_app_id, app_id.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(src_app_id, src_app.as_mut_ptr(), 32);
+    }
+    let payload: Vec<u8> = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    let bundle = Arc::clone(&handle_live.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client
+            .send_to_onion_service_anonymous(
+                id_vk,
+                app_id,
+                target_endpoint_id,
+                src_app,
+                hop_count,
+                &payload,
+            )
+            .await
+    });
+    match res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            unsafe {
+                write_err(
+                    err_out,
+                    format!("send_to_onion_service_anonymous failed: {e}"),
+                );
+            }
+            VEIL_ERR
+        }
+    }
+}
+
 // ── Mailbox put/fetch/ack ────────────────
 
 /// Status return codes [`veil_mailbox_put`]. Mirrors
