@@ -16,6 +16,7 @@
 
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::IsIdentity;
 use ed25519_dalek::hazmat::{ExpandedSecretKey, raw_sign};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha512};
@@ -34,18 +35,47 @@ fn blinding_factor(identity_vk: &[u8; 32], period: u64) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&wide)
 }
 
+/// Ed25519 verifying key for a 32-byte seed. Use this to obtain the `identity_vk`
+/// that pairs with an `identity_sk` rather than trusting a separately-supplied
+/// value: the blinded-signing safety invariant (see [`sign_blinded`]) requires
+/// the public key to be DERIVED from the seed, not caller-asserted.
+pub fn ed25519_public_from_seed(identity_sk: &[u8; 32]) -> [u8; 32] {
+    SigningKey::from_bytes(identity_sk)
+        .verifying_key()
+        .to_bytes()
+}
+
 /// Blinded PUBLIC key `A' = h·A` for `(identity, period)`. `None` if `identity_vk`
-/// is not a valid Edwards point. A client derives this from a service's known
-/// identity key to locate + authenticate its descriptor.
+/// is not a valid Edwards point, is a SMALL-ORDER point, or the blinded result is
+/// the identity element. A client derives this from a service's known identity
+/// key to locate + authenticate its descriptor.
 pub fn blinded_public(identity_vk: &[u8; 32], period: u64) -> Option<[u8; 32]> {
     let a = CompressedEdwardsY(*identity_vk).decompress()?;
+    // Reject the 8 small-order points: `A' = h·A` would then be low-order /
+    // identity, collapsing the per-period unlinkability AND yielding a blinded
+    // key under which a forged signature could verify. A legitimate Ed25519
+    // identity key is never small-order, so this only rejects malformed input.
+    if a.is_small_order() {
+        return None;
+    }
     let h = blinding_factor(identity_vk, period);
-    Some((h * a).compress().to_bytes())
+    let a_prime = h * a;
+    if a_prime.is_identity() {
+        return None;
+    }
+    Some(a_prime.compress().to_bytes())
 }
 
 /// Sign `msg` with the blinded private key for `(identity, period)`. The result
 /// verifies under [`blinded_public`]`(identity_vk, period)`. `identity_sk` is the
 /// 32-byte Ed25519 seed; `None` if the derived blinded key is degenerate.
+///
+/// SAFETY INVARIANT (load-bearing): `vk_bytes` MUST be the verifying key DERIVED
+/// from `identity_sk` (as done below) — never a caller-supplied value. We sign
+/// via `ed25519-dalek`'s `hazmat::raw_sign`, which performs none of the
+/// strict-API checks; signing under a public key that does not match the secret
+/// scalar would leak the blinded private scalar across two signatures. Deriving
+/// `vk_bytes` here makes the invariant unbreakable from outside this function.
 pub fn sign_blinded(identity_sk: &[u8; 32], period: u64, msg: &[u8]) -> Option<[u8; 64]> {
     let sk = SigningKey::from_bytes(identity_sk);
     let vk_bytes = sk.verifying_key().to_bytes();
@@ -134,5 +164,37 @@ mod tests {
         );
         assert_ne!(b1, blinded_public(&vk, 2).unwrap(), "rotates per period");
         assert_ne!(b1, vk, "blinded key is not the identity key");
+    }
+
+    #[test]
+    fn blinded_public_rejects_small_order_points() {
+        // diff-audit S5: a small-order `identity_vk` would blind to a low-order /
+        // identity point under which a forged signature could verify and which
+        // carries no per-period unlinkability. Reject it.
+        let mut identity = [0u8; 32];
+        identity[0] = 1; // canonical encoding of the order-1 identity point
+        assert_eq!(
+            blinded_public(&identity, 1),
+            None,
+            "identity point must be rejected"
+        );
+        // y = 0 is an order-4 (small-order) point.
+        assert_eq!(
+            blinded_public(&[0u8; 32], 1),
+            None,
+            "y=0 small-order point must be rejected"
+        );
+        // A legitimate key still blinds fine.
+        let vk = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        assert!(blinded_public(&vk, 1).is_some());
+    }
+
+    #[test]
+    fn ed25519_public_from_seed_matches_dalek() {
+        let sk = SigningKey::generate(&mut OsRng);
+        assert_eq!(
+            ed25519_public_from_seed(&sk.to_bytes()),
+            sk.verifying_key().to_bytes(),
+        );
     }
 }
