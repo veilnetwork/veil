@@ -72,6 +72,12 @@ impl From<FetchError> for CheckerError {
 pub struct UpdateChecker {
     config: UpdateConfig,
     transport_ctx: TransportContext,
+    /// Anti-downgrade state-file MAC key (diff-audit M16). When set, the
+    /// installed-version read is authenticated exactly as the apply path does,
+    /// so a locally-tampered state file cannot forge a spurious "update
+    /// available" downgrade notification. `None` → unauthenticated read
+    /// (back-compat; no worse than before).
+    installed_version_hmac_key: Option<[u8; 32]>,
 }
 
 impl UpdateChecker {
@@ -79,7 +85,17 @@ impl UpdateChecker {
         Self {
             config,
             transport_ctx,
+            installed_version_hmac_key: None,
         }
+    }
+
+    /// Authenticate the installed-version state file with `key` (derive it via
+    /// [`crate::installed_version::mac_key_from_ed25519_seed`] from the node's
+    /// Ed25519 seed — the SAME key the apply path uses). Diff-audit M16.
+    #[must_use]
+    pub fn with_installed_version_hmac_key(mut self, key: Option<[u8; 32]>) -> Self {
+        self.installed_version_hmac_key = key;
+        self
     }
 
     /// Run a check. Steps:
@@ -155,8 +171,22 @@ impl UpdateChecker {
             // Available.
             return Ok(0);
         };
-        let store = InstalledVersionStore::new(path.clone());
-        Ok(store.read_release_unix()?.unwrap_or(0))
+        match self.installed_version_hmac_key {
+            // M16: authenticate the read like the apply path. A present-but-wrong
+            // mac surfaces as `MacFailure` (→ CheckerError) rather than a forged
+            // release_unix, so local tampering can't fabricate a downgrade
+            // notification. A legacy (no-mac) file is adopted trust-on-first-use,
+            // identical to the apply path's migration behaviour.
+            Some(key) => {
+                let store = InstalledVersionStore::with_hmac_key(path.clone(), key);
+                let (v, _migrated) = store.read_release_unix_for_apply()?;
+                Ok(v.unwrap_or(0))
+            }
+            None => {
+                let store = InstalledVersionStore::new(path.clone());
+                Ok(store.read_release_unix()?.unwrap_or(0))
+            }
+        }
     }
 }
 
@@ -207,6 +237,43 @@ mod tests {
             matches!(err, CheckerError::NotConfigured),
             "half-config (urls only) must NOT reach the network"
         );
+    }
+
+    #[test]
+    fn m16_keyed_checker_rejects_tampered_state_file() {
+        // Write a state file authenticated under key A.
+        let path = unique_path("m16");
+        let key_a = [0xA1u8; 32];
+        InstalledVersionStore::with_hmac_key(path.clone(), key_a)
+            .write(1_700_000_000)
+            .unwrap();
+
+        let config = UpdateConfig {
+            manifest_urls: vec!["https://m.example/m".to_owned()],
+            expected_issuer_pk: Some("0".repeat(64)),
+            installed_version_path: Some(path.clone()),
+            check_interval_secs: None,
+            install_path: None,
+        };
+
+        // A checker keyed with the SAME key reads the value back.
+        let ok = UpdateChecker::new(config.clone(), debug_ctx())
+            .with_installed_version_hmac_key(Some(key_a));
+        assert_eq!(ok.read_installed_release_unix().unwrap(), 1_700_000_000);
+
+        // A checker keyed with a DIFFERENT key (≈ a tampered / forged file)
+        // surfaces MacFailure instead of a forged 0 that would fabricate a
+        // spurious "update available" downgrade notification (diff-audit M16).
+        let bad = UpdateChecker::new(config, debug_ctx())
+            .with_installed_version_hmac_key(Some([0xB2u8; 32]));
+        assert!(matches!(
+            bad.read_installed_release_unix(),
+            Err(CheckerError::InstalledVersion(
+                InstalledVersionError::MacFailure
+            ))
+        ));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

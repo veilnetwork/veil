@@ -57,8 +57,20 @@ impl NodeRuntime {
         };
         let shutdown_rx = shutdown_tx.subscribe();
 
-        // Build the checker. Cheap — just clones config + ctx Arc.
-        let checker = UpdateChecker::new(config.update.clone(), (*self.transport_ctx).clone());
+        // Build the checker. Cheap — just clones config + ctx Arc. M16:
+        // authenticate the installed-version state file with a key derived from
+        // our Ed25519 identity seed (same derivation as the apply path), so a
+        // locally-tampered file can't forge a spurious downgrade notification.
+        let iv_hmac_key = self
+            .identity
+            .sovereign_identity
+            .as_ref()
+            .and_then(|sov| sov.ed25519_signing_key())
+            .map(|sk| {
+                veil_update::installed_version::mac_key_from_ed25519_seed(&sk.to_bytes())
+            });
+        let checker = UpdateChecker::new(config.update.clone(), (*self.transport_ctx).clone())
+            .with_installed_version_hmac_key(iv_hmac_key);
         let interval = Duration::from_secs(interval_secs);
         let logger: Arc<dyn veil_update::UpdateLogger> =
             Arc::clone(&self.logger) as Arc<dyn veil_update::UpdateLogger>;

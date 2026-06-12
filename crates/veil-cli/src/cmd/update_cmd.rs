@@ -186,7 +186,11 @@ fn update_check<I: CommandIo, O: ConfigOps>(
         veil_cfg::ConfigError::CommandFailed(format!("build transport context: {e}"))
     })?;
 
-    let checker = UpdateChecker::new(config.update.clone(), transport_ctx);
+    // M16: authenticate the installed-version state file with the same
+    // identity-derived key the apply path uses, so a tampered file can't forge a
+    // spurious "update available" notification.
+    let checker = UpdateChecker::new(config.update.clone(), transport_ctx)
+        .with_installed_version_hmac_key(installed_version_mac_key());
 
     let runtime = Builder::new_current_thread()
         .enable_all()
@@ -278,8 +282,9 @@ fn installed_version_mac_key() -> Option<[u8; 32]> {
     let dir = veil_identity::sovereign_flow::default_identity_dir().ok()?;
     let sov = veil_identity::sovereign::SovereignIdentity::load_from_dir(&dir).ok()?;
     let sk = sov.ed25519_signing_key()?;
-    Some(blake3::derive_key(
-        "veil.update.installed-version.mac.v1",
+    // Centralised so the checker (diff-audit M16) and the apply path derive a
+    // byte-identical key.
+    Some(veil_update::installed_version::mac_key_from_ed25519_seed(
         &sk.to_bytes(),
     ))
 }
@@ -374,8 +379,10 @@ fn update_apply<I: CommandIo, O: ConfigOps>(
         .map_err(veil_cfg::ConfigError::Io)?;
 
     // Step 1: ask the checker whether an update is even available.
-    // No point fetching the binary if we're already current.
-    let checker = UpdateChecker::new(config.update.clone(), transport_ctx.clone());
+    // No point fetching the binary if we're already current. M16: authenticate
+    // the installed-version read with the apply path's key.
+    let checker = UpdateChecker::new(config.update.clone(), transport_ctx.clone())
+        .with_installed_version_hmac_key(installed_version_mac_key());
     let availability = runtime.block_on(checker.check()).map_err(map_checker_err)?;
     let manifest = match availability {
         UpdateAvailability::UpToDate {
