@@ -6003,6 +6003,116 @@ mod mailbox_cfg_translation_tests {
 mod tests;
 
 impl NodeServices {
+    /// Register a LOCATION-anonymous service (onion-registration b5b-runtime):
+    /// build an onion circuit whose terminus is the rendezvous relay R
+    /// (`relay_path.last()`), and register `cookie` AT R over that circuit —
+    /// piggy-backed as the circuit-setup terminus payload — so R binds the cookie
+    /// to the return circuit WITHOUT learning this node's location. Introduces a
+    /// client sends to (R, cookie) are then forwarded back DOWN the circuit and
+    /// opened here.
+    ///
+    /// `relay_path` is the full hop list first→terminus; each hop's X25519 key is
+    /// resolved from the LOCAL relay-directory shard (publish/mirror it first).
+    /// The caller separately publishes a `RendezvousAd` pointing at (R, cookie,
+    /// our x25519) so clients can find the service — this method does NOT
+    /// session-register (that is the leak it avoids).
+    ///
+    /// NOTE (§3.B): the ad does not yet COMMIT to the registration key, so the
+    /// anti-squat guarantee is first-wins only; binding `reg_pk` into the ad is a
+    /// follow-up. Maintenance (rebuild on TTL) is also a follow-up — v1 builds
+    /// once.
+    pub fn register_onion_circuit(
+        &self,
+        relay_path: &[[u8; 32]],
+        cookie: [u8; 16],
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        use base64::Engine;
+        use veil_anonymity::circuit_origin::{OriginHop, build_origin_circuit};
+        use veil_anonymity::circuit_register::CircuitRegisterPayload;
+        use veil_anonymity::directory::{decode_entry, relay_directory_dht_key};
+        use veil_types::AnonOnionSendError;
+
+        if relay_path.is_empty() {
+            return Err(AnonOnionSendError::NoRelays);
+        }
+        // Receive-capable only: we must own the origin table (to open returns).
+        let Some(origin_table) = &self.dispatcher.circuit_origin else {
+            return Err(AnonOnionSendError::NoIdentity);
+        };
+
+        // Resolve each hop's anonymity X25519 key from the local directory.
+        let mut hops = Vec::with_capacity(relay_path.len());
+        for nid in relay_path {
+            let bytes = self
+                .dht
+                .get_local(&relay_directory_dht_key(nid))
+                .ok_or(AnonOnionSendError::NoRelays)?;
+            let entry = decode_entry(&bytes).map_err(|_| AnonOnionSendError::NoRelays)?;
+            hops.push(OriginHop {
+                node_id: *nid,
+                pubkey: entry.x25519_pk,
+            });
+        }
+
+        // Fresh Ed25519 registration key; sign the cookie binding.
+        let kp = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+        let reg_pk: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(&kp.public_key)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or(AnonOnionSendError::NoIdentity)?;
+        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk);
+        let sig = veil_crypto::sign_message(
+            veil_types::SignatureAlgorithm::Ed25519,
+            &kp.public_key,
+            &kp.private_key,
+            &msg,
+        )
+        .map_err(|_| AnonOnionSendError::NoIdentity)?;
+        let reg = CircuitRegisterPayload {
+            cookie,
+            reg_pk,
+            signature: sig,
+        };
+
+        // Build the origin circuit with the registration as terminus payload.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (setup, origin) = build_origin_circuit(&hops, &reg.encode(), now)
+            .map_err(|_| AnonOnionSendError::NoRelays)?;
+        let first_hop = origin.first_hop;
+        if !origin_table.insert(std::sync::Arc::new(origin)) {
+            return Err(AnonOnionSendError::NoRelays); // origin table full
+        }
+
+        // Send the CircuitBuild envelope to the first hop over its session.
+        self.send_relay_chain_frame(
+            &first_hop,
+            veil_proto::family::RelayChainMsg::CircuitBuild,
+            &setup,
+        );
+        Ok(())
+    }
+
+    /// Build + enqueue one `RelayChain::<msg>` control frame to `peer`'s session.
+    fn send_relay_chain_frame(
+        &self,
+        peer: &[u8; 32],
+        msg: veil_proto::family::RelayChainMsg,
+        body: &[u8],
+    ) {
+        use veil_proto::{codec::encode_header, family::FrameFamily, header::FrameHeader};
+        let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, msg as u16);
+        hdr.body_len = body.len() as u32;
+        hdr.set_priority(veil_proto::priority::INTERACTIVE);
+        let mut frame = encode_header(&hdr).to_vec();
+        frame.extend_from_slice(body);
+        let guard = wlock!(self.session_tx_registry);
+        let _ = guard.send_to(peer, veil_proto::priority::INTERACTIVE, frame);
+    }
+
     /// Authenticated rendezvous send (Epic 482 v1, "any recipient"): like
     /// [`send_via_rendezvous`] but the sealed payload is a per-message Ed25519/
     /// Falcon-signed [`veil_proto::AuthAppDeliver`], so the recipient
