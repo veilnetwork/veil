@@ -223,6 +223,70 @@ final int Function(
 
 final int Function(
   Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilSendAnonymousAuthenticated = nativeLib
+    .lookup<
+            NativeFunction<
+                Int32 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_send_anonymous_authenticated')
+    .asFunction();
+
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilSendAnonymousAuthenticatedWithReply = nativeLib
+    .lookup<
+            NativeFunction<
+                Int32 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Uint32,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_send_anonymous_authenticated_with_reply')
+    .asFunction();
+
+final int Function(
+  Pointer<VeilApp>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilSendReply = nativeLib
+    .lookup<
+            NativeFunction<
+                Int32 Function(
+              Pointer<VeilApp>,
+              Uint64,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_send_reply')
+    .asFunction();
+
+final int Function(
+  Pointer<VeilApp>,
   Pointer<NativeFunction<VeilRecvCbNative>>,
   Pointer<Void>,
   Pointer<Pointer<Utf8>>,
