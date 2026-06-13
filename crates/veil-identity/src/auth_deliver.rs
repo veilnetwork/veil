@@ -211,7 +211,17 @@ impl AuthDeliverReassembler {
             order: std::collections::VecDeque::new(),
             total_bytes: 0,
             max_messages: max_messages.max(1),
-            max_total_bytes,
+            // Floor the global byte cap at one message's worth. `enforce_total_
+            // bytes` deliberately never evicts the just-touched partial (`keep`),
+            // so a cap smaller than a single message would leave that one partial
+            // sitting permanently ABOVE the cap — the `total_bytes <=
+            // max_total_bytes` invariant would not hold for a pathological tiny
+            // custom cap (e.g. `0`). A single partial's bytes are already bounded
+            // by `MAX_AUTH_DELIVER_MSG_BYTES` (rejected above that), so this floor
+            // guarantees the keep-only case always fits. Production passes a 4 MiB
+            // default; this only rescues a too-small custom cap. (`max_messages`
+            // is floored at 1 for the same robustness reason.)
+            max_total_bytes: max_total_bytes.max(veil_proto::MAX_AUTH_DELIVER_MSG_BYTES),
             timeout_secs,
         }
     }
@@ -666,6 +676,35 @@ mod tests {
             assert_eq!(r.push(f, NOW), ReassembleOutcome::Pending);
         }
         assert_eq!(r.push(last, NOW), ReassembleOutcome::Complete(original));
+    }
+
+    #[test]
+    fn reassembler_floors_tiny_cap_to_preserve_invariant() {
+        use veil_proto::MAX_AUTH_DELIVER_MSG_BYTES;
+        // A pathological tiny custom byte cap (here `0`) is floored to one
+        // message's worth, so the `total_bytes <= max_total_bytes` invariant
+        // always holds — including for the just-touched partial that
+        // `enforce_total_bytes` deliberately never evicts.
+        let mut r = AuthDeliverReassembler::with_params(64, 0, 300);
+        assert!(
+            r.max_total_bytes >= MAX_AUTH_DELIVER_MSG_BYTES,
+            "tiny cap must be floored to >= one message",
+        );
+        // First fragment of a 2-fragment message: retained (Pending), and
+        // total_bytes stays within the floored cap rather than above it.
+        let frags = fragments_of([0xAB; 16], &[0u8; 200], 2);
+        assert_eq!(r.push(frags[0].clone(), NOW), ReassembleOutcome::Pending);
+        assert!(
+            r.total_bytes <= r.max_total_bytes,
+            "retained partial must not exceed the cap ({} > {})",
+            r.total_bytes,
+            r.max_total_bytes,
+        );
+        // The message still completes normally under the floored cap.
+        assert!(matches!(
+            r.push(frags[1].clone(), NOW),
+            ReassembleOutcome::Complete(_)
+        ));
     }
 
     #[test]
