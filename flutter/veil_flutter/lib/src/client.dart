@@ -6,11 +6,11 @@
 // defers them onto the SAME (UI) isolate's event loop — it yields once but
 // does NOT offload work to another thread (diff-audit H3 corrected the prior
 // comment that wrongly claimed `Isolate.run`).  Genuinely blocking / CPU-heavy
-// calls must use `Isolate.run` to avoid freezing the UI: e.g.
-// `restoreIdentityEncrypted` (Argon2id) now does (see identity.dart).  A
-// `VeilStream.read()` with no data still `block_on`s on the CALLING isolate, so
-// drive streams from a worker isolate, not the UI isolate (tracked: full
-// per-call isolate offload).
+// calls must use `Isolate.run` to avoid freezing the UI: `connect` (IPC
+// APP_HELLO handshake) and `restoreIdentity{,Encrypted}` (key derivation /
+// Argon2id) now do, as does `VeilStream.read()`.  The remaining `Future(()
+// {...})` calls are quick IPC round-trips; drive any that prove heavy from a
+// worker isolate too.
 //
 // Memory: every Pointer<Utf8> from C must be freed with veilFreeString
 // after consumption.  Every malloc'd buffer we hand to FFI is freed in
@@ -19,6 +19,7 @@
 
 import 'dart:async';
 import 'dart:ffi';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -81,7 +82,20 @@ class VeilClient implements Finalizable {
   /// `ipc.port` + `ipc.token` sidecars, TCP-loopback with token auth is
   /// used; otherwise plain Unix socket.
   static Future<VeilClient> connect(String socketPath) async {
-    return Future(() {
+    // diff-audit H3 follow-up: the native connect performs a BLOCKING IPC
+    // round-trip (APP_HELLO handshake via tokio `block_on`), so run it on a
+    // worker isolate instead of `Future(() {...})` (which only defers onto the
+    // SAME UI isolate and still freezes it for the handshake duration).
+    //
+    // SAFE across isolates: the tokio runtime + IPC connection live in
+    // PROCESS-GLOBAL native memory keyed by a generational handle TABLE, so the
+    // worker creates them and we carry back the opaque handle TOKEN as an int
+    // address (sendable). The main isolate's later FFI calls resolve that token
+    // against the same global table — no isolate-bound memory is shared, and
+    // the worker isolate exiting does NOT drop the native runtime (it lives
+    // until `veil_close`). `_eventController` / `_eventCallable` stay bound to
+    // the main isolate, set up lazily by `events()` after connect returns.
+    final handleAddr = await Isolate.run(() {
       final pathC = socketPath.toNativeUtf8();
       final errOut = calloc<Pointer<Utf8>>();
       try {
@@ -89,12 +103,14 @@ class VeilClient implements Finalizable {
         if (h == nullptr) {
           throw VeilException('connect failed: ${_readErrAndFree(errOut)}');
         }
-        return VeilClient._(h, socketPath);
+        return h.address;
       } finally {
         calloc.free(pathC);
         calloc.free(errOut);
       }
     });
+    return VeilClient._(
+        Pointer<ffi.VeilHandle>.fromAddress(handleAddr), socketPath);
   }
 
   /// Mailbox surface — deposit blobs to offline recipients and fetch
