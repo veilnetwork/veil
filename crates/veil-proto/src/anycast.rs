@@ -38,6 +38,15 @@ pub const ANYCAST_MAGIC: [u8; 2] = [0x41, 0x43]; // "AC"
 /// the signing key proves ownership of. See module security doc.
 pub const ANYCAST_MAGIC_V2: [u8; 2] = [0x41, 0x44]; // "AD"
 
+/// Magic bytes identifying a **v3 (algo-tagged, owner-signed)** AnycastRecord.
+/// V3 generalizes v2 to ANY signature algorithm (Ed25519 / Falcon-512 / hybrid)
+/// so a PQ-only sovereign identity can own-sign its anycast records. The owner
+/// pubkey and signature are length-prefixed (algo-dependent sizes), and a
+/// 1-byte `sig_algo` selects the algorithm. INVARIANT: v3 carries a NON-Ed25519
+/// algo — plain Ed25519 stays on the fixed-size v2 wire for backward-compat with
+/// resolvers that predate v3 (they skip the unknown v3 magic).
+pub const ANYCAST_MAGIC_V3: [u8; 2] = [0x41, 0x45]; // "AE"
+
 /// Wire size of a **v1 (unsigned)** record.
 pub const ANYCAST_RECORD_SIZE: usize = 44;
 
@@ -45,28 +54,49 @@ pub const ANYCAST_RECORD_SIZE: usize = 44;
 /// Layout: 44 (v1 fields) + 32 (owner_pubkey) + 1 (sig_key_idx) + 64 (sig) = 141.
 pub const ANYCAST_RECORD_V2_SIZE: usize = 141;
 
+/// Upper bound on a v3 owner-pubkey length (Falcon-512 = 897 B; hybrid encodings
+/// are larger). Bounds the pre-alloc / scan against a malformed length field.
+pub const MAX_ANYCAST_PUBKEY_LEN: usize = 4096;
+
+/// Upper bound on a v3 signature length (Falcon-512 detached ≈ 690 B; hybrid is
+/// Ed25519(64) + len-prefixed Falcon). Same anti-amplification rationale.
+pub const MAX_ANYCAST_SIG_LEN: usize = 4096;
+
+/// Fixed prefix length of a v3 record up to (not including) `owner_pubkey`:
+/// 2 magic + 4 service_tag + 32 node_id + 2 score + 4 ttl + 1 sig_algo + 2
+/// pubkey_len = 47.
+const ANYCAST_V3_PREFIX_LEN: usize = 47;
+
 /// Maximum number of candidate records stored per service tag in the DHT.
 pub const MAX_ANYCAST_CANDIDATES: usize = 32;
 
 // ── AnycastRecord ─────────────────────────────────────────────────────────────
 
-/// Owner-binding signature payload for a v2 `AnycastRecord`.
+/// Owner-binding signature payload for a v2/v3 `AnycastRecord`.
 ///
-/// `owner_pubkey` is the Ed25519 verifying key that signed the canonical
-/// bytes (everything in the record except the signature itself). Caller
-/// is responsible for making sure this key is bound to `node_id` —
-/// typically `node_id == BLAKE3(owner_pubkey)`, but advanced sovereign-
-/// identity flows may use a subkey indicated by `sig_key_idx`.
+/// `owner_pubkey` is the verifying key that signed the canonical bytes
+/// (everything in the record except the signature itself). Caller is
+/// responsible for making sure this key is bound to `node_id` — typically
+/// `node_id == BLAKE3(owner_pubkey)`, but advanced sovereign-identity flows may
+/// use a subkey indicated by `sig_key_idx`.
+///
+/// `sig_algo` is a [`veil_types::SignatureAlgorithm::wire_byte`]: Ed25519
+/// records ride the fixed-size v2 wire (32-byte pubkey, 64-byte sig); any other
+/// algorithm (Falcon-512, hybrid) rides the length-prefixed v3 wire. The struct
+/// holds `Vec`s so a single shape covers both — for v2 they are always exactly
+/// 32 / 64 bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnycastRecordSig {
-    /// Ed25519 verifying key that produced `signature`.
-    pub owner_pubkey: [u8; 32],
+    /// Signature algorithm wire-byte ([`veil_types::SignatureAlgorithm::wire_byte`]).
+    pub sig_algo: u8,
+    /// Verifying key bytes that produced `signature` (algo-dependent length).
+    pub owner_pubkey: Vec<u8>,
     /// Which subkey index in the owner's identity document signed this
     /// record. `0` for nodes without sovereign-identity multi-key setup.
     pub sig_key_idx: u8,
-    /// Ed25519 signature over canonical bytes (the first 77 bytes of the
-    /// v2 wire format — i.e. fields up to and including `sig_key_idx`).
-    pub signature: [u8; 64],
+    /// Signature over the canonical bytes (fields up to and including
+    /// `sig_key_idx`), algo-dependent length.
+    pub signature: Vec<u8>,
 }
 
 /// A single anycast service advertisement stored in the DHT.
@@ -92,6 +122,14 @@ pub struct AnycastRecord {
     pub signature: Option<AnycastRecordSig>,
 }
 
+/// Whether a `sig_algo` wire-byte denotes Ed25519 (the v2 algorithm). `1` is the
+/// canonical Ed25519 wire-byte; `0` is accepted as a legacy alias (see
+/// [`veil_types::SignatureAlgorithm::from_wire_byte`]). Ed25519 records use the
+/// fixed-size v2 wire; everything else uses v3.
+fn is_ed25519_wire_algo(sig_algo: u8) -> bool {
+    sig_algo == 0 || sig_algo == 1
+}
+
 impl AnycastRecord {
     /// Compute the DHT key for the given service tag.
     ///
@@ -104,14 +142,24 @@ impl AnycastRecord {
         *h.finalize().as_bytes()
     }
 
-    /// Encode the record. Selects v2 wire format (141 B) if `signature`
-    /// is `Some`, otherwise v1 (44 B). Returns a `Vec<u8>` because the
-    /// length depends on version.
+    /// Encode the record. Unsigned → v1 (44 B). Signed with Ed25519 → v2
+    /// (141 B, backward-compatible). Signed with any other algorithm
+    /// (Falcon-512, hybrid) → v3 (length-prefixed, variable). Returns a
+    /// `Vec<u8>` because the length depends on version.
     pub fn encode(&self) -> Vec<u8> {
         match &self.signature {
-            Some(sig) => {
+            Some(sig) if is_ed25519_wire_algo(sig.sig_algo) => {
                 let mut buf = Vec::with_capacity(ANYCAST_RECORD_V2_SIZE);
                 self.encode_canonical_v2(&mut buf, sig);
+                buf.extend_from_slice(&sig.signature);
+                buf
+            }
+            Some(sig) => {
+                let mut buf = Vec::with_capacity(
+                    ANYCAST_V3_PREFIX_LEN + sig.owner_pubkey.len() + 1 + 2 + sig.signature.len(),
+                );
+                self.encode_canonical_v3(&mut buf, sig);
+                buf.extend_from_slice(&(sig.signature.len() as u16).to_be_bytes());
                 buf.extend_from_slice(&sig.signature);
                 buf
             }
@@ -125,6 +173,37 @@ impl AnycastRecord {
                 buf
             }
         }
+    }
+
+    /// Canonical bytes the embedded signature covers (everything EXCEPT the
+    /// signature itself), in the v2 or v3 layout matching how [`Self::encode`]
+    /// serializes this record. Empty for an unsigned (v1) record. Exposed so the
+    /// algo-generic verifier (in `veil-anycast`, which has the PQ crypto deps)
+    /// can reconstruct exactly what was signed.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let Some(sig) = &self.signature else {
+            return Vec::new();
+        };
+        let mut buf = Vec::new();
+        if is_ed25519_wire_algo(sig.sig_algo) {
+            self.encode_canonical_v2(&mut buf, sig);
+        } else {
+            self.encode_canonical_v3(&mut buf, sig);
+        }
+        buf
+    }
+
+    /// Write the canonical-bytes prefix of a v3 record (magic … sig_key_idx).
+    fn encode_canonical_v3(&self, buf: &mut Vec<u8>, sig: &AnycastRecordSig) {
+        buf.extend_from_slice(&ANYCAST_MAGIC_V3);
+        buf.extend_from_slice(&self.service_tag);
+        buf.extend_from_slice(&self.node_id);
+        buf.extend_from_slice(&self.score.to_be_bytes());
+        buf.extend_from_slice(&self.ttl.to_be_bytes());
+        buf.push(sig.sig_algo);
+        buf.extend_from_slice(&(sig.owner_pubkey.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&sig.owner_pubkey);
+        buf.push(sig.sig_key_idx);
     }
 
     /// Write the canonical-bytes prefix of a v2 record (77 bytes — everything
@@ -158,7 +237,38 @@ impl AnycastRecord {
         match (buf[0], buf[1]) {
             (a, b) if [a, b] == ANYCAST_MAGIC => Self::decode_v1(buf),
             (a, b) if [a, b] == ANYCAST_MAGIC_V2 => Self::decode_v2(buf),
+            (a, b) if [a, b] == ANYCAST_MAGIC_V3 => Self::decode_v3(buf),
             _ => Err(ProtoError::InvalidMagic([buf[0], buf[1], 0, 0])),
+        }
+    }
+
+    /// Total wire length of the record that starts at `buf[0]`, without fully
+    /// decoding it. Used by the list decoder to step over variable-length v3
+    /// records. Returns `None` on unknown magic or a truncated header.
+    pub fn wire_len(buf: &[u8]) -> Option<usize> {
+        if buf.len() < 2 {
+            return None;
+        }
+        match (buf[0], buf[1]) {
+            (a, b) if [a, b] == ANYCAST_MAGIC => Some(ANYCAST_RECORD_SIZE),
+            (a, b) if [a, b] == ANYCAST_MAGIC_V2 => Some(ANYCAST_RECORD_V2_SIZE),
+            (a, b) if [a, b] == ANYCAST_MAGIC_V3 => {
+                // [..45 fixed..][pubkey_len u16 @45][pubkey][sig_key_idx u8]
+                // [sig_len u16][sig]
+                let pubkey_len = super::read_u16_be(buf, 45).ok()? as usize;
+                if pubkey_len > MAX_ANYCAST_PUBKEY_LEN {
+                    return None;
+                }
+                let sig_len_off = ANYCAST_V3_PREFIX_LEN
+                    .checked_add(pubkey_len)?
+                    .checked_add(1)?;
+                let sig_len = super::read_u16_be(buf, sig_len_off).ok()? as usize;
+                if sig_len > MAX_ANYCAST_SIG_LEN {
+                    return None;
+                }
+                sig_len_off.checked_add(2)?.checked_add(sig_len)
+            }
+            _ => None,
         }
     }
 
@@ -202,16 +312,88 @@ impl AnycastRecord {
             score,
             ttl,
             signature: Some(AnycastRecordSig {
-                owner_pubkey,
+                // v2 wire carries no algo byte — it is Ed25519 by definition.
+                sig_algo: 1,
+                owner_pubkey: owner_pubkey.to_vec(),
                 sig_key_idx,
-                signature,
+                signature: signature.to_vec(),
             }),
         })
     }
 
-    /// Verify the embedded v2 owner-signature. Returns `Ok(())` if signed
-    /// and signature is valid under `signature.owner_pubkey`; `Err` otherwise.
-    /// Unsigned (v1) records return `Err(ProtoError::Malformed(...))`.
+    fn decode_v3(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < ANYCAST_V3_PREFIX_LEN {
+            return Err(ProtoError::BufferTooShort {
+                need: ANYCAST_V3_PREFIX_LEN,
+                got: buf.len(),
+            });
+        }
+        let service_tag = super::read_array::<4>(buf, 2)?;
+        let node_id = super::read_array::<32>(buf, 6)?;
+        let score = super::read_u16_be(buf, 38)?;
+        let ttl = super::read_u32_be(buf, 40)?;
+        let sig_algo = buf[44];
+        // INVARIANT: v3 carries a NON-Ed25519 algo (Ed25519 belongs on the v2
+        // wire). This keeps the v2/v3 split unambiguous so the canonical bytes
+        // a verifier reconstructs always match what was signed.
+        if is_ed25519_wire_algo(sig_algo) {
+            return Err(ProtoError::Malformed(
+                "anycast v3 record must not carry an Ed25519 algo (use v2)".to_string(),
+            ));
+        }
+        let pubkey_len = super::read_u16_be(buf, 45)? as usize;
+        if pubkey_len > MAX_ANYCAST_PUBKEY_LEN {
+            return Err(ProtoError::Malformed(format!(
+                "anycast v3 owner_pubkey too long: {pubkey_len} > {MAX_ANYCAST_PUBKEY_LEN}"
+            )));
+        }
+        let pubkey_end = ANYCAST_V3_PREFIX_LEN + pubkey_len;
+        // need pubkey + sig_key_idx(1) + sig_len(2)
+        if buf.len() < pubkey_end + 3 {
+            return Err(ProtoError::BufferTooShort {
+                need: pubkey_end + 3,
+                got: buf.len(),
+            });
+        }
+        let owner_pubkey = buf[ANYCAST_V3_PREFIX_LEN..pubkey_end].to_vec();
+        let sig_key_idx = buf[pubkey_end];
+        let sig_len = super::read_u16_be(buf, pubkey_end + 1)? as usize;
+        if sig_len > MAX_ANYCAST_SIG_LEN {
+            return Err(ProtoError::Malformed(format!(
+                "anycast v3 signature too long: {sig_len} > {MAX_ANYCAST_SIG_LEN}"
+            )));
+        }
+        let sig_start = pubkey_end + 3;
+        let sig_end = sig_start + sig_len;
+        // Exact length: the caller (list decoder) slices to `wire_len`, so the
+        // record must be precisely its declared size — reject trailing bytes.
+        if buf.len() != sig_end {
+            return Err(ProtoError::Malformed(format!(
+                "anycast v3 wrong length: have {}, expected exactly {sig_end}",
+                buf.len()
+            )));
+        }
+        Ok(AnycastRecord {
+            service_tag,
+            node_id,
+            score,
+            ttl,
+            signature: Some(AnycastRecordSig {
+                sig_algo,
+                owner_pubkey,
+                sig_key_idx,
+                signature: buf[sig_start..sig_end].to_vec(),
+            }),
+        })
+    }
+
+    /// Verify the embedded **Ed25519** owner-signature (v2 records, or a v3
+    /// record whose `sig_algo` is Ed25519). Returns `Ok(())` if the signature
+    /// is valid under `signature.owner_pubkey`; `Err` otherwise. Unsigned (v1)
+    /// records, or records signed with a NON-Ed25519 algorithm, return `Err` —
+    /// the latter must be verified through the algo-generic path in
+    /// `veil-anycast` (which has the PQ crypto deps). `veil-proto` deliberately
+    /// stays crypto-light (Ed25519 only).
     ///
     /// Caller is responsible separately for checking that
     /// `signature.owner_pubkey` actually corresponds to the claimed
@@ -226,12 +408,25 @@ impl AnycastRecord {
                 "anycast record is unsigned (v1); cannot verify".to_string(),
             ));
         };
-        let vk = VerifyingKey::from_bytes(&sig.owner_pubkey).map_err(|_| {
+        if !is_ed25519_wire_algo(sig.sig_algo) {
+            return Err(ProtoError::Malformed(format!(
+                "anycast record: non-Ed25519 algo {} — verify via the algo-generic path",
+                sig.sig_algo,
+            )));
+        }
+        let pk: [u8; 32] = sig.owner_pubkey.as_slice().try_into().map_err(|_| {
+            ProtoError::Malformed(
+                "anycast record: Ed25519 owner_pubkey must be 32 bytes".to_string(),
+            )
+        })?;
+        let sig_bytes: [u8; 64] = sig.signature.as_slice().try_into().map_err(|_| {
+            ProtoError::Malformed("anycast record: Ed25519 signature must be 64 bytes".to_string())
+        })?;
+        let vk = VerifyingKey::from_bytes(&pk).map_err(|_| {
             ProtoError::Malformed("anycast record: invalid Ed25519 owner_pubkey".to_string())
         })?;
-        let mut canonical = Vec::with_capacity(77);
-        self.encode_canonical_v2(&mut canonical, sig);
-        let sig_obj = Signature::from_bytes(&sig.signature);
+        let canonical = self.canonical_bytes();
+        let sig_obj = Signature::from_bytes(&sig_bytes);
         vk.verify(&canonical, &sig_obj).map_err(|_| {
             ProtoError::Malformed(
                 "anycast record: Ed25519 signature verification failed".to_string(),
@@ -292,7 +487,7 @@ impl AnycastRecord {
                 sig.sig_key_idx,
             )));
         }
-        let derived_node_id = blake3::hash(&sig.owner_pubkey);
+        let derived_node_id = blake3::hash(sig.owner_pubkey.as_slice());
         if derived_node_id.as_bytes() != &self.node_id {
             return Err(ProtoError::Malformed(
                 "anycast record: BLAKE3(owner_pubkey) != node_id — \
@@ -314,7 +509,7 @@ impl AnycastRecord {
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Self {
         use ed25519_dalek::Signer;
-        let owner_pubkey = signing_key.verifying_key().to_bytes();
+        let owner_pubkey = signing_key.verifying_key().to_bytes().to_vec();
         // Build placeholder sig to get canonical bytes via encode_canonical_v2.
         let mut placeholder = Self {
             service_tag,
@@ -322,15 +517,15 @@ impl AnycastRecord {
             score,
             ttl,
             signature: Some(AnycastRecordSig {
+                sig_algo: 1, // Ed25519
                 owner_pubkey,
                 sig_key_idx,
-                signature: [0u8; 64],
+                signature: vec![0u8; 64],
             }),
         };
-        let mut canonical = Vec::with_capacity(77);
         // unwrap: we just set signature to Some above.
-        placeholder.encode_canonical_v2(&mut canonical, placeholder.signature.as_ref().unwrap());
-        let sig_bytes = signing_key.sign(&canonical).to_bytes();
+        let canonical = placeholder.canonical_bytes();
+        let sig_bytes = signing_key.sign(&canonical).to_bytes().to_vec();
         // Replace placeholder signature with actual signature.
         if let Some(s) = placeholder.signature.as_mut() {
             s.signature = sig_bytes;
@@ -351,21 +546,19 @@ pub struct AnycastList(pub Vec<AnycastRecord>);
 impl AnycastList {
     /// Decode all records from a DHT value blob.
     ///
-    /// Auto-detects v1 (44 B) and v2 (141 B) records by magic prefix.
-    /// Silently skips records that fail to decode (wrong magic, stale format,
-    /// truncated tail). DOES NOT verify v2 signatures here — caller decides
-    /// trust policy via [`AnycastRecord::verify_signature`].
+    /// Auto-detects v1 (44 B), v2 (141 B) and v3 (variable, length-prefixed)
+    /// records by magic prefix. Silently skips records that fail to decode
+    /// (wrong magic, stale format, truncated tail). DOES NOT verify signatures
+    /// here — caller decides trust policy.
     pub fn decode(blob: &[u8]) -> Self {
         let mut records = Vec::new();
         let mut pos = 0;
         while pos + 2 <= blob.len() {
-            let magic = &blob[pos..pos + 2];
-            let rec_size = if magic == ANYCAST_MAGIC {
-                ANYCAST_RECORD_SIZE
-            } else if magic == ANYCAST_MAGIC_V2 {
-                ANYCAST_RECORD_V2_SIZE
-            } else {
-                // Unknown magic — abort to avoid sliding into garbage.
+            // `wire_len` reads only the header/length fields to size the record
+            // (constant for v1/v2, length-prefixed for v3).
+            let Some(rec_size) = AnycastRecord::wire_len(&blob[pos..]) else {
+                // Unknown magic / truncated header — abort to avoid sliding
+                // into garbage.
                 break;
             };
             if pos + rec_size > blob.len() {
@@ -654,6 +847,101 @@ mod tests {
         let mut enc = sample_record(1).encode();
         enc[0] = 0xFF;
         assert!(AnycastRecord::decode(&enc).is_err());
+    }
+
+    // Build a v3 record carrying a non-Ed25519 (e.g. Falcon-512-shaped) sig.
+    fn sample_v3(tag: u8, pubkey_len: usize, sig_len: usize) -> AnycastRecord {
+        AnycastRecord {
+            service_tag: [tag; 4],
+            node_id: [tag; 32],
+            score: 7,
+            ttl: 1234,
+            signature: Some(AnycastRecordSig {
+                sig_algo: 2, // Falcon512 wire-byte
+                owner_pubkey: vec![0xAB; pubkey_len],
+                sig_key_idx: 0,
+                signature: vec![0xCD; sig_len],
+            }),
+        }
+    }
+
+    #[test]
+    fn v3_encode_decode_roundtrip_falcon_shaped() {
+        // Falcon-512: 897-byte pubkey, ~690-byte detached sig.
+        let r = sample_v3(0x5E, 897, 690);
+        let enc = r.encode();
+        assert_eq!(&enc[0..2], &ANYCAST_MAGIC_V3, "v3 magic");
+        assert_ne!(enc.len(), ANYCAST_RECORD_V2_SIZE, "v3 is variable, not 141");
+        assert_eq!(
+            AnycastRecord::wire_len(&enc),
+            Some(enc.len()),
+            "wire_len must match the encoded size",
+        );
+        let dec = AnycastRecord::decode(&enc).unwrap();
+        assert_eq!(dec, r, "v3 round-trips exactly");
+    }
+
+    #[test]
+    fn v3_rejects_trailing_bytes_and_ed25519_algo() {
+        // Trailing garbage after a valid v3 record is rejected (exact-length).
+        let mut enc = sample_v3(0x11, 64, 64).encode();
+        enc.push(0x00);
+        assert!(
+            AnycastRecord::decode(&enc).is_err(),
+            "trailing bytes must be rejected",
+        );
+        // A v3 record claiming the Ed25519 algo is rejected (Ed25519 ⇒ v2).
+        let mut ed = sample_v3(0x22, 32, 64);
+        if let Some(s) = ed.signature.as_mut() {
+            s.sig_algo = 1; // Ed25519
+        }
+        // Hand-roll the v3 wire (encode() would route Ed25519 to v2, so force v3).
+        let mut buf = Vec::new();
+        if let Some(sig) = ed.signature.as_ref() {
+            ed.encode_canonical_v3(&mut buf, sig);
+            buf.extend_from_slice(&(sig.signature.len() as u16).to_be_bytes());
+            buf.extend_from_slice(&sig.signature);
+        }
+        assert!(
+            AnycastRecord::decode(&buf).is_err(),
+            "v3 wire with Ed25519 algo must be rejected",
+        );
+    }
+
+    #[test]
+    fn ed25519_signed_record_stays_on_v2_wire() {
+        // Backward-compat invariant: an Ed25519-signed record serializes as the
+        // fixed 141-byte v2 format, NOT v3, so pre-v3 resolvers still parse it.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let r = AnycastRecord::sign(
+            [0x6D; 4],
+            blake3::hash(key.verifying_key().as_bytes()).into(),
+            5,
+            60,
+            0,
+            &key,
+        );
+        let enc = r.encode();
+        assert_eq!(enc.len(), ANYCAST_RECORD_V2_SIZE);
+        assert_eq!(&enc[0..2], &ANYCAST_MAGIC_V2);
+        assert!(r.verify_signature().is_ok());
+        assert!(r.verify_owner_binding().is_ok());
+    }
+
+    #[test]
+    fn list_decode_handles_mixed_v1_v2_v3() {
+        let v1 = sample_record(0x01);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x07; 32]);
+        let v2 = AnycastRecord::sign([0x02; 4], [0x02; 32], 1, 60, 0, &key);
+        let v3 = sample_v3(0x03, 897, 690);
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&v1.encode());
+        blob.extend_from_slice(&v2.encode());
+        blob.extend_from_slice(&v3.encode());
+        let list = AnycastList::decode(&blob);
+        assert_eq!(list.0.len(), 3, "all three versions decode");
+        assert_eq!(list.0[0].signature, None);
+        assert_eq!(list.0[2], v3);
     }
 
     #[test]
