@@ -3372,13 +3372,13 @@ mod tests {
     /// peers persisted the value. Larger-N variants where K-closest is a
     /// strict subset would require a separate scenario that pre-positions
     /// node_ids near `target_key` — out of scope for the convergence test.
-    #[ignore = "DHT replication does not land on the k-closest peers in-sim (separate from E20 wire convergence, which now passes); needs DHT-placement investigation"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic489_6_replication_lands_on_k_closest_peers() {
         let n = 6;
         let mut net = SimNetwork::builder()
             .nodes(n)
             .role(NodeRole::Core)
+            .sovereign_identities(true)
             .build()
             .await;
         net.wire_full_mesh().await;
@@ -3394,12 +3394,35 @@ mod tests {
             assert!(ok, "pre-publish: node {i} should have {0} sessions", n - 1);
         }
 
-        // Pick a key + value. Key bytes are arbitrary — `dht_publish_replicated`
-        // doesn't care about format; recipients only validate length. Value
-        // is unique-per-test so a stale leftover entry from another scenario
-        // can't masquerade as a passing assertion.
+        // The value MUST be a recognized self-authenticating DHT record: the
+        // recursive-STORE receiver runs `validate_store_value_by_magic` and
+        // drops any payload without a known 2-byte magic prefix (audit cycle-7
+        // / N1 signed-store gate), so an arbitrary blob never replicates. Use
+        // node 0's own IdentityDocument bytes — they carry IDENTITY_DOCUMENT_
+        // MAGIC, structurally decode at the gate, and id-type records pass
+        // `mirror_cache_key_ok` for ANY key, so we can place them under an
+        // arbitrary `key` to isolate the on-PUT fan-out path.
+        net.node(0)
+            .runtime
+            .debug_republish_sovereign_identity()
+            .await
+            .expect("re-publish sovereign identity into local DHT");
+        let alice_node_id = *net
+            .node(0)
+            .runtime
+            .sovereign_identity()
+            .expect("node 0 sovereign identity")
+            .node_id();
+        let doc_key = crate::proto::identity_document::IdentityDocument::dht_key(&alice_node_id);
+        let value: Vec<u8> = net
+            .node(0)
+            .runtime
+            .dht_get_local(&doc_key)
+            .expect("node 0's IdentityDocument is in its local DHT after republish");
+        // Arbitrary mirror-cache key (id records pass the key-binding gate for
+        // any key); distinct from `doc_key` so we measure the fan-out, not the
+        // canonical-key republish.
         let key: [u8; 32] = [0xAAu8; 32];
-        let value: Vec<u8> = b"epic489-6-replication-test-payload".to_vec();
 
         // Publish via the K-closest fan-out path (NOT the periodic republish
         // path — this test specifically exercises the synchronous on-PUT
@@ -3490,7 +3513,6 @@ mod tests {
     /// check explicitly closes — `verify_identity_document` alone would
     /// happily accept alice's fully-valid document; the resolver has to
     /// know the caller asked for bob and reject the answer.
-    #[ignore = "resolve_identity_verified does not resolve the happy-path replicated doc in-sim (same DHT-resolution gap as epic490_resolve_name_*; separate from E20 wire convergence, which now passes)"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn epic490_resolve_identity_verified_rejects_tampered_doc() {
         use crate::proto::identity_document::IdentityDocument;
@@ -3570,6 +3592,14 @@ mod tests {
         );
 
         // ── Case B: garbage bytes → IdentityDocMalformed ──────────────
+        // Poison BOTH the remote source (node 0) and node 1's local copy.
+        // Identity resolution self-certifies each replica and allows a single
+        // verified one, so poisoning only node 1's local store would be
+        // repaired by node 0's good remote copy (the cache-poisoning defense);
+        // the bad bytes must be what the resolver actually fetches.
+        net.node(0)
+            .runtime
+            .dht_put_local(alice_doc_key, vec![0xCAu8; 16]);
         net.node(1)
             .runtime
             .dht_put_local(alice_doc_key, vec![0xCAu8; 16]);
@@ -3593,6 +3623,9 @@ mod tests {
         let mut tampered = real_bytes.clone();
         let last_idx = tampered.len() - 1;
         tampered[last_idx] ^= 0x01;
+        net.node(0)
+            .runtime
+            .dht_put_local(alice_doc_key, tampered.clone());
         net.node(1).runtime.dht_put_local(alice_doc_key, tampered);
         let err = net
             .node(1)
@@ -3612,6 +3645,9 @@ mod tests {
         // happily accept it (it's a real document!) — but the resolver
         // asked for bob, not alice. The runtime-level binding check
         // (`doc.node_id!= requested`) is the layer that closes this.
+        net.node(0)
+            .runtime
+            .dht_put_local(bob_doc_key, real_bytes.clone());
         net.node(1)
             .runtime
             .dht_put_local(bob_doc_key, real_bytes.clone());
@@ -3835,24 +3871,28 @@ mod tests {
     /// This is the strict superset of "DHT recursive-get returns bytes":
     /// it proves the name layer's freshness/PoW/signature chain is
     /// actually walked end-to-end inside the runtime, not just decoded.
-    #[ignore = "resolve_name_verified does not resolve @alice in-sim despite replication landing (separate from E20 wire convergence, which now passes); needs name-resolution investigation"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn epic490_resolve_name_verified_round_trip() {
         use crate::proto::name_claim_v2::NameClaim;
         use std::time::SystemTime;
         use veil_identity::resolver::ResolveError;
 
+        // 3 nodes, not 2: resolving a name published by ANOTHER node goes
+        // through remote quorum (RESOLVE_QUORUM_THRESHOLD = 2, single-replica
+        // disallowed since the cycle-9 anti-sybil gate), so the resolver (node
+        // 1) needs at least TWO peers that each hold alice's replicated claim.
+        // A 2-node net gives node 1 only one peer → permanent QuorumDivergence.
         let mut net = SimNetwork::builder()
-            .nodes(2)
+            .nodes(3)
             .role(NodeRole::Core)
             .sovereign_identities(true)
-            .name_claims(vec![Some("alice".into()), None])
+            .name_claims(vec![Some("alice".into()), None, None])
             .build()
             .await;
         net.wire_full_mesh().await;
-        for i in 0..2 {
-            let ok = net.node(i).wait_sessions(1, Duration::from_secs(15)).await;
-            assert!(ok, "node {i} should have a session");
+        for i in 0..3 {
+            let ok = net.node(i).wait_sessions(2, Duration::from_secs(15)).await;
+            assert!(ok, "node {i} should have 2 sessions (full mesh of 3)");
         }
 
         net.node(0)
@@ -3869,25 +3909,23 @@ mod tests {
             .expect("alice sov")
             .node_id();
         let claim_key = NameClaim::dht_key("alice");
+        let doc_key = crate::proto::identity_document::IdentityDocument::dht_key(&alice_node_id);
 
-        // Wait for both records to land on node 1.
+        // Wait for both records to replicate onto BOTH peers (nodes 1 and 2),
+        // so node 1's resolve fan-out to {0, 2} reaches a 2-replica quorum.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let has_claim = net.node(1).runtime.dht_get_local(&claim_key).is_some();
-            let has_doc = net
-                .node(1)
-                .runtime
-                .dht_get_local(&crate::proto::identity_document::IdentityDocument::dht_key(
-                    &alice_node_id,
-                ))
-                .is_some();
-            if has_claim && has_doc {
+            let landed = |i: usize| {
+                net.node(i).runtime.dht_get_local(&claim_key).is_some()
+                    && net.node(i).runtime.dht_get_local(&doc_key).is_some()
+            };
+            if landed(1) && landed(2) {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "node 1 must have alice's NameClaim AND IdentityDocument \
-                 replicated before name-resolve test",
+                "alice's NameClaim AND IdentityDocument must replicate to both \
+                 peers before the name-resolve test",
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -3909,20 +3947,27 @@ mod tests {
             "happy: name binding must point to alice's node_id",
         );
 
-        // Garbage NameClaim bytes.
-        net.node(1)
+        // Malformed path: poison BOTH of node 1's peers with IDENTICAL garbage
+        // so the remote fan-out forms a 2-replica quorum on bytes that fail to
+        // decode. Poisoning only node 1's LOCAL store would be silently
+        // repaired by the good remote quorum (the cache-poisoning defense:
+        // dht_get_replicated skips an un-validating local value and the resolver
+        // overwrites it with the quorum winner), so the malformed signal must
+        // come from the quorum itself.
+        let garbage = vec![0xDEu8; 24];
+        net.node(0)
             .runtime
-            .dht_put_local(claim_key, vec![0xDEu8; 24]);
+            .dht_put_local(claim_key, garbage.clone());
+        net.node(2).runtime.dht_put_local(claim_key, garbage);
         let err = net
             .node(1)
             .runtime
             .resolve_name_verified("alice", now, Duration::from_secs(2))
             .await
-            .expect_err("garbage NameClaim must be rejected");
+            .expect_err("malformed quorum must be rejected");
         assert!(
             matches!(err, ResolveError::NameClaimMalformed(_)),
-            "garbage NameClaim must surface as \
-             NameClaimMalformed, got {err:?}",
+            "garbage quorum must surface as NameClaimMalformed, got {err:?}",
         );
 
         net.stop().await;
