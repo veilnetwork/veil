@@ -191,7 +191,6 @@ mod tests {
     /// Done criteria: all 6 nodes achieve 2 sessions (both ring neighbours)
     /// confirming that route discovery works through the ring even under the
     /// recorded impairment.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gossip_loss_route_discovery() {
         let n = 6;
@@ -1092,7 +1091,6 @@ mod tests {
     /// 3. peer's dispatcher accepts signed STORE via `decode_and_verify…`
     /// 4. third node's `handle_get_app_endpoint` falls back to DHT lookup
     /// and finds + verifies the record.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cross_node_app_endpoint_via_dht_republish() {
         use crate::cfg::DhtConfig;
@@ -1306,7 +1304,6 @@ mod tests {
     /// Cross-node DHT replication of the `NM`-magic record is
     /// covered by the `sovereign_identity_name_resolves_over_dht`
     /// scenario below.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sovereign_identity_name_claim_publishes_locally() {
         use crate::proto::name_claim_v2::NameClaim;
@@ -1463,7 +1460,6 @@ mod tests {
     /// where one magic is accidentally stripped from
     /// [`is_self_authenticating_dht_value`] or the dispatcher
     /// accept path.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sovereign_identity_all_records_cross_replicate() {
         use crate::cfg::DhtConfig;
@@ -1652,7 +1648,6 @@ mod tests {
     /// mesh with Alice) receives the updated doc with both
     /// subkeys present. Closes the "new device joined and is
     /// visible to peers via the existing mesh" e2e proof.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sovereign_identity_pairing_ceremony_propagates_to_peer() {
         use crate::cfg::sovereign_flow::{load_identity_sk, save_paired_target_state};
@@ -2001,7 +1996,6 @@ mod tests {
     /// the dispatcher-level scoring contract end-to-end over
     /// real TCP — production scorers compose reputation + RTT +
     /// battery + role.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sovereign_identity_recipient_any_picks_highest_scored_instance() {
         let mut net = SimNetwork::builder()
@@ -2162,7 +2156,6 @@ mod tests {
     /// master_seed. Both devices speak as the same `@alice` to the
     /// network, but each has its own `device_id` for fan-out + ack
     /// routing.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sovereign_multi_device_under_one_master() {
         let mut net = SimNetwork::builder()
@@ -3383,7 +3376,7 @@ mod tests {
     /// peers persisted the value. Larger-N variants where K-closest is a
     /// strict subset would require a separate scenario that pre-positions
     /// node_ids near `target_key` — out of scope for the convergence test.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
+    #[ignore = "DHT replication does not land on the k-closest peers in-sim (separate from E20 wire convergence, which now passes); needs DHT-placement investigation"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic489_6_replication_lands_on_k_closest_peers() {
         let n = 6;
@@ -3846,7 +3839,7 @@ mod tests {
     /// This is the strict superset of "DHT recursive-get returns bytes":
     /// it proves the name layer's freshness/PoW/signature chain is
     /// actually walked end-to-end inside the runtime, not just decoded.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
+    #[ignore = "resolve_name_verified does not resolve @alice in-sim despite replication landing (separate from E20 wire convergence, which now passes); needs name-resolution investigation"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn epic490_resolve_name_verified_round_trip() {
         use crate::proto::name_claim_v2::NameClaim;
@@ -4048,7 +4041,6 @@ mod tests {
     /// reported `IdentityDocMalformed` even though 60% of replicas
     /// held a valid document. Resolver was effectively DoS'd by
     /// one well-positioned sybil per victim.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic491_quorum_resolve_survives_close_sybil_forgery() {
         use crate::proto::identity_document::IdentityDocument;
@@ -4808,7 +4800,6 @@ mod tests {
     /// 8. Verify NO returned URI carries A's synthetic-input port
     /// (5001) — that would be the regression signature of the
     /// pre-bugfix echo behaviour.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic483_3_slice2_promote_uris_yields_responders_actual_listen_addrs() {
         use crate::proto::control::{NatCandidate, candidate_type};
@@ -5089,7 +5080,6 @@ mod tests {
     /// caller has to know its connected peers AND pick a sensible
     /// coordinator manually — turning a one-liner into a 30-line
     /// boilerplate dance and discouraging adoption.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic483_3_try_nat_traversal_auto_picks_coordinator() {
         let mut net = SimNetwork::builder()
@@ -6942,7 +6932,6 @@ mod tests {
     ///
     /// Without the wake-on-notify wiring, this test would fail on step 6
     /// (recovery would take 30+ s, exceeding the 5 s budget).
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn epic483_4_network_change_triggers_fast_reconnect() {
         let mut net = SimNetwork::builder()
