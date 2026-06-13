@@ -6068,8 +6068,10 @@ impl NodeServices {
     ///
     /// NOTE (§3.B): the ad does not yet COMMIT to the registration key, so the
     /// anti-squat guarantee is first-wins only; binding `reg_pk` into the ad is a
-    /// follow-up. Maintenance (rebuild on TTL) is also a follow-up — v1 builds
-    /// once.
+    /// follow-up. (Periodic rebuild-on-TTL maintenance IS now wired — see the
+    /// `REFRESH_SECS` tick in the onion-service maintenance path, which rebuilds
+    /// each due service on a fresh or proven-live path and re-publishes its
+    /// descriptor.)
     fn build_onion_circuit_once(
         &self,
         relay_path: &[[u8; 32]],
