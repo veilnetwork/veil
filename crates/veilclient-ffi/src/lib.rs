@@ -474,6 +474,22 @@ unsafe fn cstr_to_str<'a>(p: *const c_char) -> Option<&'a str> {
     unsafe { cstr_to_str_with_len(p).map(|(s, _)| s) }
 }
 
+/// Classify a PASSWORD C-string argument (diff-audit M26).
+///
+/// `cstr_to_str` collapses NULL and non-UTF-8 to the same `None`, which for a
+/// password means a non-NULL-but-undecodable value is silently treated as "no
+/// password" — downgrading an intended-ENCRYPTED output to plaintext while
+/// reporting success. This keeps them distinct:
+///  * NULL → `Ok(None)` (no password, intended plain output),
+///  * valid UTF-8 → `Ok(Some(s))`,
+///  * non-NULL but non-UTF-8 (or over-long) → `Err(())` (caller must reject).
+unsafe fn password_arg<'a>(p: *const c_char) -> Result<Option<&'a str>, ()> {
+    if p.is_null() {
+        return Ok(None);
+    }
+    unsafe { cstr_to_str(p) }.map(Some).ok_or(())
+}
+
 /// Bounded `strnlen` — returns `Some(len)` if a NUL byte exists within
 /// `MAX_FFI_CSTR_LEN` bytes of `p`, `None` otherwise (caller passed
 /// non-NUL-terminated buffer or a string longer than the cap).
@@ -3102,7 +3118,19 @@ pub unsafe extern "C" fn veil_join_bootstrap_uri(
         }
         return VEIL_ERR_INVALID_ARG;
     };
-    let pw = unsafe { cstr_to_str(password) };
+    // M26: reject a non-NULL but non-UTF-8 password rather than silently
+    // ignoring it (which would attempt a PLAIN join of an encrypted invite and
+    // fail with a misleading error, or join a plain invite while pretending the
+    // password mattered).
+    let pw = match unsafe { password_arg(password) } {
+        Ok(p) => p,
+        Err(()) => {
+            unsafe {
+                write_err(err_out, "password is not valid UTF-8");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
     let pk = unsafe { cstr_to_str(expected_issuer_pk) };
 
     get_or_return!(
@@ -3187,7 +3215,22 @@ pub unsafe extern "C" fn veil_create_bootstrap_invite(
     unsafe {
         *out_uri = ptr::null_mut();
     }
-    let pw = unsafe { cstr_to_str(password) };
+    // M26: a non-NULL but non-UTF-8 password must be REJECTED, not coerced to
+    // None (which emits a plaintext invite for a caller that asked to encrypt).
+    let pw = match unsafe { password_arg(password) } {
+        Ok(p) => p,
+        Err(()) => {
+            unsafe {
+                *out_status = VEIL_CREATE_INVITE_BAD_PASSWORD;
+                write_err(
+                    err_out,
+                    "password is not valid UTF-8 — refusing to emit a plaintext invite"
+                        .to_owned(),
+                );
+            }
+            return VEIL_OK;
+        }
+    };
     get_or_return!(
         handle_live,
         handle_table(),
@@ -4676,7 +4719,21 @@ pub unsafe extern "C" fn veil_pair_source_create_invite(
     unsafe {
         *out_uri = ptr::null_mut();
     }
-    let pw = unsafe { cstr_to_str(password) };
+    // M26: reject a non-NULL but non-UTF-8 master password rather than silently
+    // dropping it to None (pairing transfers master-identity material — a
+    // silently-unprotected invite is even worse than the bootstrap case).
+    let pw = match unsafe { password_arg(password) } {
+        Ok(p) => p,
+        Err(()) => {
+            unsafe {
+                write_err(
+                    err_out,
+                    "master password is not valid UTF-8 — refusing to proceed".to_owned(),
+                );
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
     get_or_return!(
         handle_live,
         handle_table(),
@@ -5148,6 +5205,27 @@ pub unsafe extern "C" fn veil_pair_target_build_confirm(
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    /// diff-audit M26: a non-NULL but non-UTF-8 password must NOT collapse to
+    /// `None` (which silently emits a plaintext invite) — it must be rejected.
+    #[test]
+    fn password_arg_distinguishes_null_utf8_and_invalid_m26() {
+        // NULL → no password (intended plain output).
+        assert!(matches!(unsafe { password_arg(ptr::null()) }, Ok(None)));
+        // Valid UTF-8 → Some.
+        let ok = CString::new("hunter2").unwrap();
+        assert!(matches!(
+            unsafe { password_arg(ok.as_ptr()) },
+            Ok(Some("hunter2"))
+        ));
+        // Non-NULL but non-UTF-8 (0xFF) → Err — caller rejects, never coerces to
+        // a plaintext-emitting None.
+        let bad = [0xFFu8, 0xFE, 0x00]; // invalid UTF-8 + NUL terminator
+        assert!(matches!(
+            unsafe { password_arg(bad.as_ptr() as *const c_char) },
+            Err(())
+        ));
+    }
 
     #[test]
     fn null_handle_close_is_noop() {
