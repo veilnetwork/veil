@@ -1152,10 +1152,16 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "veil-bind-unix-{label}-{}-{n:x}",
-            std::process::id()
-        ));
+        // Root the socket-test dir at a SHORT base (`/tmp`), not
+        // `std::env::temp_dir()`. On macOS `$TMPDIR` is a long
+        // `/var/folders/xx/.../T/` path, and `<that>/<dir>/admin.sock`
+        // overruns the AF_UNIX `sun_path` limit (`SUN_LEN`, 104 on macOS) —
+        // `bind_unix` then fails with a cryptic "path too long" instead of
+        // exercising the TOCTOU/permission logic these tests target. `/tmp`
+        // is always present on unix (this fn is `#[cfg(unix)]`); the short
+        // `vlt-` prefix leaves ample headroom under SUN_LEN.
+        let dir = std::path::PathBuf::from("/tmp")
+            .join(format!("vlt-{label}-{}-{n:x}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Lock down to 0700 — the bind_unix check refuses world/group writable.
         use std::os::unix::fs::PermissionsExt;
