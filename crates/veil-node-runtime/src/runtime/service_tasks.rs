@@ -1411,14 +1411,31 @@ impl NodeRuntime {
             *self.identity.local_identity.node_id.as_bytes(),
         )
         .with_policy(anycast_policy);
-        if let Some(sov) = self.identity.sovereign_identity.as_ref()
-            && let Some(ed_sk) = sov.ed25519_signing_key()
-        {
-            // sig_key_idx = 0 follows the IdentityDocument convention
-            // (master signing key).  Cloning a 32-byte SigningKey to
-            // Arc-share with the anycast service is cheap.
-            anycast_svc_builder =
-                anycast_svc_builder.with_signing_key(std::sync::Arc::new(ed_sk.clone()), 0);
+        if let Some(sov) = self.identity.sovereign_identity.as_ref() {
+            if let Some(ed_sk) = sov.ed25519_signing_key() {
+                // sig_key_idx = 0 follows the IdentityDocument convention
+                // (master signing key).  Cloning a 32-byte SigningKey to
+                // Arc-share with the anycast service is cheap.
+                anycast_svc_builder =
+                    anycast_svc_builder.with_signing_key(std::sync::Arc::new(ed_sk.clone()), 0);
+            } else {
+                // A1 (audit): a PQ-only (Falcon-512) sovereign identity has no
+                // Ed25519 signing key, and anycast owner-signing is Ed25519-only
+                // on the wire today — so our anycast records would go out
+                // UNSIGNED. Peers on the DEFAULT `SignedBound` resolve policy
+                // drop unsigned records, so the advertise silently fails to
+                // resolve. Surface it loudly rather than failing silently;
+                // Falcon/hybrid anycast signing is a separate wire-compat
+                // exercise.
+                self.logger.warn(
+                    "anycast.signing.unsupported_pq_only",
+                    "sovereign identity is PQ-only (no Ed25519 signing key): \
+                     anycast records will be published UNSIGNED and dropped by \
+                     peers running the default SignedBound resolve policy, so \
+                     anycast advertise is effectively disabled until \
+                     Falcon/hybrid anycast signing ships",
+                );
+            }
         }
         let anycast_svc = Arc::new(anycast_svc_builder);
         server = server.with_anycast_service(anycast_svc);
