@@ -902,6 +902,25 @@ pub struct StopTasksContext {
 /// Replicate `value` at `key` to the K closest peers in keyspace via a
 /// fire-and-forget `RecursiveQuery(STORE)` fan-out (after a local store).
 ///
+/// Advance a per-service onion registration-epoch counter to a value that is
+/// BOTH `>= now` (tracks wall-clock) AND strictly greater than any value this
+/// counter previously returned (monotonic). B2: R rejects a re-registration
+/// whose epoch is not strictly increasing for the same `(cookie, reg_pk)`
+/// (`StaleEpoch`), so two onion-service rebuilds in the same wall-clock second —
+/// or under a clock that doesn't advance — must still produce increasing
+/// epochs. Lock-free CAS; safe to call concurrently on the same counter.
+fn next_monotonic_epoch(last_epoch: &std::sync::atomic::AtomicU64, now: u64) -> u64 {
+    use std::sync::atomic::Ordering;
+    let mut cur = last_epoch.load(Ordering::Acquire);
+    loop {
+        let next = now.max(cur.saturating_add(1));
+        match last_epoch.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break next,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
 /// Shared by [`NodeRuntime::dht_publish_replicated`] and the onion-service
 /// descriptor publish on `NodeServices` (diff-audit L5): both need a SYNCHRONOUS
 /// replicated store but live on different `impl`s. `send_to` is fire-and-forget;
@@ -5953,6 +5972,48 @@ mod mailbox_cfg_translation_tests {
 }
 
 #[cfg(test)]
+mod onion_epoch_tests {
+    use super::next_monotonic_epoch;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn epoch_strictly_increases_within_same_second() {
+        // B2 regression: two onion-service rebuilds in the SAME wall-clock
+        // second must still produce strictly-increasing registration epochs, or
+        // R drops the rebuild as StaleEpoch and the service strands on a stale
+        // circuit. (Pre-fix, epoch == raw unix seconds, so both rebuilds emitted
+        // the same value.)
+        let c = AtomicU64::new(0);
+        let e1 = next_monotonic_epoch(&c, 1000);
+        let e2 = next_monotonic_epoch(&c, 1000); // same second
+        let e3 = next_monotonic_epoch(&c, 1000); // same second
+        assert_eq!(e1, 1000, "first epoch tracks wall-clock");
+        assert!(e2 > e1, "{e2} must be strictly > {e1}");
+        assert!(e3 > e2, "{e3} must be strictly > {e2}");
+    }
+
+    #[test]
+    fn epoch_tracks_wall_clock_when_it_advances() {
+        let c = AtomicU64::new(0);
+        let _ = next_monotonic_epoch(&c, 1000);
+        let later = next_monotonic_epoch(&c, 5000);
+        assert_eq!(later, 5000, "a real clock jump is reflected, not just +1");
+    }
+
+    #[test]
+    fn epoch_never_regresses_on_clock_rewind() {
+        // A backward clock (NTP step) must not produce a non-increasing epoch.
+        let c = AtomicU64::new(0);
+        let high = next_monotonic_epoch(&c, 9000);
+        let rewound = next_monotonic_epoch(&c, 3000); // clock went backwards
+        assert!(
+            rewound > high,
+            "{rewound} must still be > {high} after rewind"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests;
 
 /// Stable, non-resolvable cleartext receiver-id for a CIRCUIT-BACKED introduce
@@ -6014,6 +6075,11 @@ impl NodeServices {
         relay_path: &[[u8; 32]],
         cookie: [u8; 16],
         reg_kp: &veil_crypto::GeneratedKeyPair,
+        // B2: per-service strictly-monotonic registration epoch counter. See
+        // `OnionServiceEntry::registration_epoch`. For one-shot circuits (reply
+        // paths) pass a fresh counter — a unique (cookie, reg_pk) never collides
+        // at R, so the epoch is just `unix_now`.
+        last_epoch: &std::sync::atomic::AtomicU64,
     ) -> std::result::Result<
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         veil_types::AnonOnionSendError,
@@ -6059,11 +6125,15 @@ impl NodeServices {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // diff-audit M2: bind the registration to a monotonic freshness epoch
-        // (our unix clock; rebuilds are ~150 s apart, so it strictly increases).
-        // R rejects a re-registration whose epoch is not strictly greater than
-        // the recorded one, defeating replay-hijack of the cookie→circuit map.
-        let epoch = now;
+        // diff-audit M2 + B2: bind the registration to a STRICTLY-monotonic
+        // freshness epoch. R rejects a re-registration whose epoch is not
+        // strictly greater than the recorded one (replay-hijack defense of the
+        // cookie→circuit map). Wall-clock seconds alone collided when two
+        // rebuilds landed in the same second (or the clock didn't advance),
+        // dropping the rebuild as StaleEpoch and stranding the service on a
+        // stale circuit. `next_monotonic_epoch` advances the per-service counter
+        // to `max(now, prev + 1)` so the epoch is monotonic AND tracks wall-clock.
+        let epoch = next_monotonic_epoch(last_epoch, now);
         let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
         let sig = veil_crypto::sign_message(
             veil_types::SignatureAlgorithm::Ed25519,
@@ -6272,7 +6342,11 @@ impl NodeServices {
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
         // Mint the registration keypair ONCE here; every rebuild reuses it (L1).
         let reg_keypair = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
-        let confirmed = self.build_onion_circuit_once(relay_path, cookie, &reg_keypair)?;
+        // B2: per-service monotonic registration-epoch counter, reused on every
+        // rebuild so re-registrations strictly increase even within one second.
+        let registration_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let confirmed =
+            self.build_onion_circuit_once(relay_path, cookie, &reg_keypair, &registration_epoch)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -6303,6 +6377,7 @@ impl NodeServices {
             built_unix: now,
             reg_keypair,
             confirmed,
+            registration_epoch,
         });
         Ok(())
     }
@@ -6350,6 +6425,7 @@ impl NodeServices {
             Vec<[u8; 32]>,
             veil_crypto::GeneratedKeyPair,
             std::sync::Arc<std::sync::atomic::AtomicBool>,
+            std::sync::Arc<std::sync::atomic::AtomicU64>,
         );
         let due: Vec<DueEntry> = {
             let svcs = lock!(self.anonymity.onion_services);
@@ -6361,11 +6437,12 @@ impl NodeServices {
                         e.relay_path.clone(),
                         e.reg_keypair.clone(),
                         std::sync::Arc::clone(&e.confirmed),
+                        std::sync::Arc::clone(&e.registration_epoch),
                     )
                 })
                 .collect()
         };
-        for (cookie, relay_path, reg_keypair, prev_confirmed) in due {
+        for (cookie, relay_path, reg_keypair, prev_confirmed, registration_epoch) in due {
             // diff-audit Δ2-d: if the terminus never ACK'd the current circuit
             // (CircuitBuilt), its path is suspect — a hop is likely dead. Pick a
             // FRESH path rather than rebuilding the same frozen one. A confirmed
@@ -6387,7 +6464,9 @@ impl NodeServices {
             } else {
                 relay_path.clone()
             };
-            if let Ok(new_confirmed) = self.build_onion_circuit_once(&path, cookie, &reg_keypair) {
+            if let Ok(new_confirmed) =
+                self.build_onion_circuit_once(&path, cookie, &reg_keypair, &registration_epoch)
+            {
                 let mut svcs = lock!(self.anonymity.onion_services);
                 if let Some(e) = svcs.iter_mut().find(|e| e.cookie == cookie) {
                     e.built_unix = now_unix;
@@ -6589,7 +6668,11 @@ impl NodeServices {
         // circuit (registers the cookie at R_a). Doing it here means a size
         // failure above returns without ever creating a circuit to strand.
         if let Some((relay_path, cookie, reply_reg_kp)) = pending_reply_circuit {
-            self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp)
+            // Reply circuits are one-shot with a fresh (cookie, reg_pk), so a
+            // throwaway epoch counter is fine — the registration is unique at R
+            // and never collides; the epoch is just `unix_now`.
+            let reply_epoch = std::sync::atomic::AtomicU64::new(0);
+            self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch)
                 .map_err(
                     |_| veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
                         need: REPLY_CIRCUIT_HOPS,
