@@ -140,9 +140,51 @@ impl CircuitTeardownPayload {
     }
 }
 
+/// Terminus → originator circuit-establishment ACK (diff-audit Δ2-d). Routed
+/// back down the return path; each hop re-tags `circuit_id` (like a return data
+/// cell) so the originator matches it against its origin circuit and marks the
+/// circuit CONFIRMED. Carries no payload beyond the per-link circuit id.
+///
+/// Wire: `[circuit_id u32 BE]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircuitBuiltPayload {
+    /// Circuit id on the link this ACK arrived on.
+    pub circuit_id: CircuitId,
+}
+
+impl CircuitBuiltPayload {
+    pub const WIRE_LEN: usize = 4;
+
+    pub fn encode(&self) -> [u8; Self::WIRE_LEN] {
+        self.circuit_id.to_be_bytes()
+    }
+
+    pub fn decode(blob: &[u8]) -> Result<Self, CircuitError> {
+        if blob.len() < Self::WIRE_LEN {
+            return Err(CircuitError::Malformed(format!(
+                "circuit built too short: {} < {}",
+                blob.len(),
+                Self::WIRE_LEN
+            )));
+        }
+        Ok(Self {
+            circuit_id: u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn circuit_built_roundtrip() {
+        let p = CircuitBuiltPayload {
+            circuit_id: 0x1234_5678,
+        };
+        assert_eq!(CircuitBuiltPayload::decode(&p.encode()).unwrap(), p);
+        assert!(CircuitBuiltPayload::decode(&[0u8; 3]).is_err());
+    }
 
     #[test]
     fn circuit_data_roundtrip() {

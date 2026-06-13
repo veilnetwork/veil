@@ -41,9 +41,26 @@ pub struct OriginCircuit {
     pub origin_circuit_id: CircuitId,
     /// Build time (unix secs) for idle GC / rotation.
     pub created_unix: u64,
+    /// Establishment confirmation (diff-audit Δ2-d): set when the terminus's
+    /// `CircuitBuilt` ACK reaches the originator, proving the whole path is up.
+    /// `Arc<AtomicBool>` so it survives the table's `Arc<OriginCircuit>` sharing.
+    /// `false` until the ACK arrives — the maintenance tick re-selects an
+    /// unconfirmed path rather than rebuilding a possibly-dead frozen one.
+    pub confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OriginCircuit {
+    /// Mark the circuit confirmed (its `CircuitBuilt` ACK arrived).
+    pub fn mark_confirmed(&self) {
+        self.confirmed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the establishment ACK has been seen.
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Open a return cell (introduce forwarded down the circuit): apply ALL N
     /// circuit-key layers (XOR, fixed-size) then read the framed payload back
     /// out. The result is the inner payload the terminus sent (e.g. a sealed
@@ -107,6 +124,7 @@ pub fn build_origin_circuit(
         first_hop: hops[0].node_id,
         origin_circuit_id: cids[0],
         created_unix: now_unix,
+        confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     Ok((setup, origin))
 }
