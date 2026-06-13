@@ -569,7 +569,7 @@ mod tests {
         // Sign with key_a but overwrite owner_pubkey with key_b's.
         let mut r = AnycastRecord::sign(*b"mbox", [0xAA; 32], 5, 3600, 0, &key_a);
         if let Some(s) = r.signature.as_mut() {
-            s.owner_pubkey = key_b.verifying_key().to_bytes();
+            s.owner_pubkey = key_b.verifying_key().to_bytes().to_vec();
         }
         // Signature was produced by key_a but claims key_b → mismatch.
         assert!(r.verify_signature().is_err());
