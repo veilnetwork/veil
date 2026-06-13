@@ -93,9 +93,13 @@ impl CircuitDataPayload {
                 "circuit data ciphertext_len {len} != fixed {CIRCUIT_PAYLOAD_BYTES}"
             )));
         }
-        if blob.len() < Self::HEADER_LEN + len {
+        // Exact length: reject BOTH truncation and trailing garbage. The cell
+        // is delivered as an exact RelayChainMsg frame body (body_len), so a
+        // legitimate cell is precisely HEADER_LEN + the fixed payload; anything
+        // longer is wire malleability (bad for fuzz/versioning), not a real cell.
+        if blob.len() != Self::HEADER_LEN + len {
             return Err(CircuitError::Malformed(format!(
-                "circuit data truncated: have {}, need {}",
+                "circuit data wrong length: have {}, need exactly {}",
                 blob.len(),
                 Self::HEADER_LEN + len
             )));
@@ -127,9 +131,9 @@ impl CircuitTeardownPayload {
     }
 
     pub fn decode(blob: &[u8]) -> Result<Self, CircuitError> {
-        if blob.len() < Self::WIRE_LEN {
+        if blob.len() != Self::WIRE_LEN {
             return Err(CircuitError::Malformed(format!(
-                "circuit teardown too short: {} < {}",
+                "circuit teardown wrong length: {} != {}",
                 blob.len(),
                 Self::WIRE_LEN
             )));
@@ -160,9 +164,9 @@ impl CircuitBuiltPayload {
     }
 
     pub fn decode(blob: &[u8]) -> Result<Self, CircuitError> {
-        if blob.len() < Self::WIRE_LEN {
+        if blob.len() != Self::WIRE_LEN {
             return Err(CircuitError::Malformed(format!(
-                "circuit built too short: {} < {}",
+                "circuit built wrong length: {} != {}",
                 blob.len(),
                 Self::WIRE_LEN
             )));
@@ -251,5 +255,44 @@ mod tests {
         };
         assert_eq!(CircuitTeardownPayload::decode(&p.encode()).unwrap(), p);
         assert!(CircuitTeardownPayload::decode(&[0u8; 3]).is_err());
+    }
+
+    // Exact-length decode: every wire decoder rejects trailing garbage after a
+    // valid payload (protocol malleability / fuzz-seed hardening). The decoders
+    // are fed exact frame bodies (RelayChainMsg body_len), so a legitimate
+    // producer never appends trailing bytes.
+    #[test]
+    fn circuit_wire_decoders_reject_trailing_bytes() {
+        // CircuitDataPayload: valid fixed cell + one trailing byte.
+        let data = CircuitDataPayload {
+            circuit_id: 0xAABB_CCDD,
+            seq: 9,
+            ciphertext: vec![7u8; CIRCUIT_PAYLOAD_BYTES],
+        };
+        let mut enc = data.encode().unwrap();
+        assert!(CircuitDataPayload::decode(&enc).is_ok());
+        enc.push(0x00); // trailing garbage
+        assert!(
+            CircuitDataPayload::decode(&enc).is_err(),
+            "CircuitDataPayload must reject trailing bytes"
+        );
+
+        // CircuitBuiltPayload: 4-byte payload + trailing.
+        let built = CircuitBuiltPayload { circuit_id: 1 };
+        let mut b = built.encode().to_vec();
+        b.push(0xFF);
+        assert!(
+            CircuitBuiltPayload::decode(&b).is_err(),
+            "CircuitBuiltPayload must reject trailing bytes"
+        );
+
+        // CircuitTeardownPayload: 4-byte payload + trailing.
+        let td = CircuitTeardownPayload { circuit_id: 2 };
+        let mut t = td.encode().to_vec();
+        t.extend_from_slice(&[0xDE, 0xAD]);
+        assert!(
+            CircuitTeardownPayload::decode(&t).is_err(),
+            "CircuitTeardownPayload must reject trailing bytes"
+        );
     }
 }
