@@ -154,6 +154,20 @@ impl UdpLink {
                 self.last_success_secs.store(now_secs(), Ordering::Relaxed);
                 SendResult::Ok
             }
+            // diff-audit M15: a non-blocking socket whose send buffer is
+            // transiently full returns `WouldBlock` (and an interrupted syscall
+            // returns `Interrupted`). Treating those as link death made the mesh
+            // SELF-AMPUTATE under a send burst. UDP is lossy by nature — drop
+            // THIS datagram best-effort but keep the link alive; the next send
+            // (or the idle-liveness check) handles a genuinely stuck link.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                SendResult::Ok
+            }
             Err(_) => {
                 *lock!(self.alive) = false;
                 SendResult::Disconnected
