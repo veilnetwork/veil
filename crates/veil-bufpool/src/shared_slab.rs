@@ -259,10 +259,17 @@ pub(crate) unsafe fn clone_cell(cell: NonNull<SharedCell>) {
     // Relaxed is sufficient for clone: the new ref doesn't observe
     // anything beyond what the cloning thread already saw.
     let prev = c.refcount.fetch_add(1, Ordering::Relaxed);
-    // Guard against refcount overflow (impossible in practice but
-    // defensive — Rust's std::sync::Arc does the same check).
     debug_assert!(prev > 0, "clone of dropped SharedCell");
-    debug_assert!(prev < usize::MAX / 2, "refcount near overflow");
+    // diff-audit M10: abort on refcount overflow in RELEASE too, like
+    // `std::sync::Arc`. `refcount` is an `AtomicUsize` — only 32-bit wide on
+    // 32-bit targets (mobile FFI / armv7), where a runaway clone could wrap
+    // `usize::MAX → 0` and let a still-referenced cell be freed (use-after-free).
+    // A `debug_assert` alone compiles out in release. Unreachable in practice
+    // (needs ~2^31 live clones of one cell), so the branch is free on the hot
+    // path; the abort just forecloses the UAF.
+    if prev > usize::MAX / 2 {
+        std::process::abort();
+    }
 }
 
 /// Decrement refcount on `cell`; if it hits zero, return the cell to

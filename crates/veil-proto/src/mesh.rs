@@ -141,7 +141,10 @@ impl MeshFrame {
         buf.push(self.ttl);
         buf.extend_from_slice(&self.nonce.to_le_bytes());
         buf.extend_from_slice(&payload_len.to_le_bytes());
-        buf.extend_from_slice(&self.payload);
+        // diff-audit M6: write only the CLAMPED length, so the len field and the
+        // body stay consistent (writing the full body past a clamped u16 length
+        // desyncs the decoder). Mirrors the epidemic-frame encoder.
+        buf.extend_from_slice(&self.payload[..payload_len as usize]);
         buf
     }
 
