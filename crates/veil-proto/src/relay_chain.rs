@@ -184,8 +184,6 @@ pub struct RelayChainBuilder {
     hops: Vec<([u8; 32], Vec<u8>)>,
     /// Plaintext payload delivered to the final destination.
     payload: Vec<u8>,
-    /// `next_hop_node_id` of the final destination (the *logical* target).
-    dest_node_id: [u8; 32],
 }
 
 impl RelayChainBuilder {
@@ -194,7 +192,6 @@ impl RelayChainBuilder {
         Self {
             hops: Vec::new(),
             payload: Vec::new(),
-            dest_node_id: FINAL_HOP_SENTINEL,
         }
     }
 
@@ -214,7 +211,6 @@ impl RelayChainBuilder {
     /// * `key`: the key shared with the destination (encrypts the plaintext payload).
     /// * `payload`: the application-level plaintext.
     pub fn destination(mut self, dest_id: [u8; 32], key: &[u8], payload: Vec<u8>) -> Self {
-        self.dest_node_id = dest_id;
         self.hops.push((dest_id, key.to_vec()));
         self.payload = payload;
         self
