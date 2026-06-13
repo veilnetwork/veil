@@ -105,6 +105,8 @@ pub enum PairCeremonyError {
     },
     #[error("pair ceremony: cert's appended node_id does not match scanned URI's node_id")]
     CertIdentityIdMismatch,
+    #[error("pair ceremony: peer sent a non-contributory (low-order) X25519 ephemeral key")]
+    NonContributoryDh,
 }
 
 // ── Session-key helpers (shared) ─────────────────────────────────────────────
@@ -113,12 +115,21 @@ fn derive_session_key(
     my_ephemeral_sk: &XSec,
     peer_ephemeral_pk: &[u8; 32],
     pair_secret: &[u8; PAIR_SECRET_LEN],
-) -> [u8; 32] {
+) -> Result<[u8; 32], PairCeremonyError> {
     let shared = my_ephemeral_sk.diffie_hellman(&XPub::from(*peer_ephemeral_pk));
+    // Defense-in-depth: reject a low-order / degenerate peer ephemeral key that
+    // forces a non-contributory (all-zero) shared secret. The session key is
+    // ALREADY keyed by the OOB `pair_secret` (so a forced `shared` is not by
+    // itself enough to derive it, and the OOB-code confirm catches a MITM), but
+    // rejecting early forecloses the degenerate-DH foot-gun entirely at ~zero
+    // cost.
+    if !shared.was_contributory() {
+        return Err(PairCeremonyError::NonContributoryDh);
+    }
     let mut keyed = Hasher::new_keyed(pair_secret);
     keyed.update(PAIR_SESSION_CONTEXT);
     keyed.update(shared.as_bytes());
-    *keyed.finalize().as_bytes()
+    Ok(*keyed.finalize().as_bytes())
 }
 
 fn mac_hello(pair_secret: &[u8; PAIR_SECRET_LEN], mac_input: &[u8]) -> [u8; 32] {
@@ -263,7 +274,7 @@ impl PairingSource {
         let ek_sk = XSec::from(*ek_seed);
         let ek_pk = XPub::from(&ek_sk);
         let session_key =
-            derive_session_key(&ek_sk, &hello.target_ephemeral_x25519_pk, &self.pair_secret);
+            derive_session_key(&ek_sk, &hello.target_ephemeral_x25519_pk, &self.pair_secret)?;
 
         // 4. Master-certify the target subkey.
         if self.document.identity_keys.len() >= MAX_IDENTITY_KEYS {
@@ -538,7 +549,7 @@ impl PairingTarget {
             &self.ek_sk,
             &cert.source_ephemeral_x25519_pk,
             &self.uri.pair_secret,
-        );
+        )?;
 
         // Locate the IdentityKey entry for our target_identity_pk.
         // device_id is deterministic from the pubkey, so the
@@ -628,6 +639,23 @@ mod tests {
         sov: SovereignIdentity,
         master_seed: Zeroizing<[u8; 32]>,
         identity_sk: SigningKey,
+    }
+
+    /// `derive_session_key` rejects a low-order / non-contributory peer key
+    /// (e.g. all-zeros) rather than deriving a key from a forced shared secret.
+    #[test]
+    fn derive_session_key_rejects_low_order_peer_key() {
+        let my_sk = XSec::from([0x11u8; 32]);
+        let pair_secret = [0x22u8; PAIR_SECRET_LEN];
+        // All-zeros is a canonical low-order X25519 point → non-contributory.
+        let low_order = [0u8; 32];
+        assert!(matches!(
+            derive_session_key(&my_sk, &low_order, &pair_secret),
+            Err(PairCeremonyError::NonContributoryDh)
+        ));
+        // A genuine peer ephemeral public key is accepted.
+        let peer_pk = XPub::from(&XSec::from([0x33u8; 32]));
+        assert!(derive_session_key(&my_sk, peer_pk.as_bytes(), &pair_secret).is_ok());
     }
 
     /// Driver: runs `create_identity` with `#[cfg(test)]` PoW
