@@ -1048,7 +1048,11 @@ pub struct RecursiveQueryPayload {
     pub ttl: u8,
     /// One [`recursive_query_type`] codes.
     pub query_type: u8,
-    /// UDP port for direct reply (0 = route via veil).
+    /// RESERVED — wire-present but unused. Was intended as a UDP port for a
+    /// direct (off-session) reply; that path was never implemented, all
+    /// replies route back through the session reverse-path, and the
+    /// dispatcher never reads this field. Always encoded/decoded as `0`. Kept
+    /// for wire-format stability; do not assume a UDP reply path exists.
     pub reply_port: u16,
     /// Query-type-specific payload (e.g. value bytes for STORE).
     pub payload: Vec<u8>,

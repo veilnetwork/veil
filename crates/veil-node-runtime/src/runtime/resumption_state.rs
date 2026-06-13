@@ -36,8 +36,9 @@ use veil_session::ticket::TicketIssuer;
 /// Session-resumption-domain state owned by [`crate::node::NodeRuntime`].
 pub struct ResumptionState {
     /// host ticket key used to AEAD-encrypt/decrypt session-resumption
-    /// tickets. Rotated every `TICKET_KEY_ROTATION_SECS` seconds by a
-    /// background task.
+    /// tickets. Generated at startup and held for the process lifetime —
+    /// periodic rotation is the intended design but is not yet wired (there
+    /// is no rotation task or `TICKET_KEY_ROTATION_SECS` const today).
     pub ticket_issuer: Arc<Mutex<TicketIssuer>>,
 
     /// per-peer session-resumption tickets received from the server.
