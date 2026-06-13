@@ -37,8 +37,6 @@ pub enum IdentityCliError {
     DocumentDecode(String),
     #[error("instance state: {0}")]
     Instance(#[from] veil_cfg::instance::InstanceFileError),
-    #[error("confirmation aborted: user did not retype BIP-39 words")]
-    ConfirmationAborted,
     #[error("sovereign identity not provisioned: {0}")]
     SovereignLoad(String),
     #[error("name claim sign/persist failed: {0}")]
@@ -71,12 +69,6 @@ pub enum IdentityCliError {
     DhtKey(String),
     #[error("internal: {0}")]
     Internal(String),
-}
-
-impl From<IdentityCliError> for veil_cfg::Result<()> {
-    fn from(err: IdentityCliError) -> Self {
-        Err(veil_cfg::ConfigError::ValidationFailed(err.to_string()))
-    }
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────

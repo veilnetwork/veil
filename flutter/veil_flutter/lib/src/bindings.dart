@@ -92,15 +92,6 @@ typedef VeilEventCb = void Function(
   int payloadLen,
 );
 
-typedef VeilPeerCbNative = Void Function(
-  Pointer<Void> user,
-  Pointer<Uint8> nodeId,
-  Uint8 state,
-  Uint8 direction,
-  Pointer<Uint8> transport,
-  IntPtr transportLen,
-);
-
 // ── C-function lookups ───────────────────────────────────────────────────────
 
 final void Function(Pointer<Utf8>) veilFreeString = nativeLib
