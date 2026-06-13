@@ -129,9 +129,7 @@ impl NodeRuntime {
             S::ExitProxy => self.spawn_exit_proxy_task(config),
             S::IpcServer => self.spawn_ipc_server(config),
             S::PendingAckTick => self.spawn_pending_ack_tick(),
-            S::GatewayFailover => self.spawn_gateway_failover_task(std::time::Duration::from_secs(
-                config.connection.gateway_failover_delay_secs,
-            )),
+            S::GatewayFailover => self.spawn_gateway_failover_task(),
             S::PexInitiator => {
                 if config.pex.enabled
                     && let Some(identity) = config.identity.as_ref()

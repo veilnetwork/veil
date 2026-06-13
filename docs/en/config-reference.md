@@ -875,7 +875,6 @@ Outbound reconnects and gateway failover.
 | `reconnect_backoff_min_ms` | `u64` | `1000` | Shortest reconnect interval, in ms |
 | `reconnect_backoff_max_ms` | `u64` | `300000` | Longest reconnect interval, in ms (5 minutes) |
 | `prefer_internet_gateway` | `bool` | `true` | Favor a gateway with the `HAS_INTERNET` flag when routing to global nodes. `false` uses the nearest gateway, internet access or not |
-| `gateway_failover_delay_secs` | `u64` | `5` | How long a gateway must stay unavailable (sec) before switching away. Brief outages are ignored |
 | `exit_diversification` | `bool` | `false` | Pick the exit gateway weighted-random from the top-K candidates instead of always the single best — cuts down statistical fingerprinting, since one fat flow to one IP stands out |
 | `exit_diversification_top_k` | `u8` | `4` | Window for `exit_diversification`: choose from the top-K gateways by score |
 | `reconnect_quiet_after_failures` | `u32` | `5` | After this many reconnect failures in a row, per-attempt logs drop from WARN to DEBUG (it keeps retrying, and emits `INFO peer.recovered` once it's back). `0` keeps them at WARN forever |
@@ -887,7 +886,6 @@ Outbound reconnects and gateway failover.
 reconnect_backoff_min_ms     = 500
 reconnect_backoff_max_ms     = 60000
 prefer_internet_gateway      = true
-gateway_failover_delay_secs  = 10
 ```
 
 ---

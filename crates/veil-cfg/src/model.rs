@@ -2870,14 +2870,6 @@ pub struct ConnectionConfig {
     #[serde(default = "ConnectionConfig::default_prefer_internet_gateway")]
     pub prefer_internet_gateway: bool,
 
-    /// Minimum duration (in seconds) a Gateway must be unreachable before a
-    /// failover to the next Gateway is initiated (default 5).
-    ///
-    /// Brief disconnects shorter than this window are ignored to avoid
-    /// unnecessary failover churn.
-    #[serde(default = "ConnectionConfig::default_gateway_failover_delay_secs")]
-    pub gateway_failover_delay_secs: u64,
-
     /// when `true`, exit-gateway selection samples weighted-random
     /// from the top-K candidates instead of always using the single best.
     /// Reduces statistical fingerprinting (one fat connection to one IP looks
@@ -2918,9 +2910,6 @@ impl ConnectionConfig {
     fn default_prefer_internet_gateway() -> bool {
         true
     }
-    fn default_gateway_failover_delay_secs() -> u64 {
-        5
-    }
     fn default_exit_diversification_top_k() -> u8 {
         4
     }
@@ -2933,7 +2922,6 @@ impl ConnectionConfig {
         self.reconnect_backoff_min_ms == Self::default_reconnect_backoff_min_ms()
             && self.reconnect_backoff_max_ms == Self::default_reconnect_backoff_max_ms()
             && self.prefer_internet_gateway == Self::default_prefer_internet_gateway()
-            && self.gateway_failover_delay_secs == Self::default_gateway_failover_delay_secs()
             && !self.exit_diversification
             && self.exit_diversification_top_k == Self::default_exit_diversification_top_k()
             && self.reconnect_quiet_after_failures == Self::default_reconnect_quiet_after_failures()
@@ -2946,7 +2934,6 @@ impl Default for ConnectionConfig {
             reconnect_backoff_min_ms: Self::default_reconnect_backoff_min_ms(),
             reconnect_backoff_max_ms: Self::default_reconnect_backoff_max_ms(),
             prefer_internet_gateway: Self::default_prefer_internet_gateway(),
-            gateway_failover_delay_secs: Self::default_gateway_failover_delay_secs(),
             exit_diversification: false,
             exit_diversification_top_k: Self::default_exit_diversification_top_k(),
             reconnect_quiet_after_failures: Self::default_reconnect_quiet_after_failures(),

@@ -882,7 +882,6 @@ stun_servers     = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
 | `reconnect_backoff_min_ms` | `u64` | `1000` | Наименьший интервал переподключения, в мс |
 | `reconnect_backoff_max_ms` | `u64` | `300000` | Наибольший интервал переподключения, в мс (5 минут) |
 | `prefer_internet_gateway` | `bool` | `true` | Отдавать предпочтение gateway с флагом `HAS_INTERNET` при маршрутизации к глобальным узлам. `false` использует ближайший gateway, есть у него доступ в интернет или нет |
-| `gateway_failover_delay_secs` | `u64` | `5` | Сколько gateway должен оставаться недоступным (сек), прежде чем переключиться с него. Короткие разрывы игнорируются |
 | `exit_diversification` | `bool` | `false` | Выбирать exit-gateway взвешенно-случайно из топ-K кандидатов, а не всегда лучший — это снижает статистическое снятие отпечатков, ведь один жирный поток к одному IP бросается в глаза |
 | `exit_diversification_top_k` | `u8` | `4` | Окно для `exit_diversification`: выбор из топ-K gateway по score |
 | `reconnect_quiet_after_failures` | `u32` | `5` | После скольких неудач переподключения подряд логи каждой попытки понижаются с WARN до DEBUG (узел продолжает повторять и при восстановлении выдаёт `INFO peer.recovered`). `0` оставляет их на WARN навсегда |
@@ -894,7 +893,6 @@ stun_servers     = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
 reconnect_backoff_min_ms     = 500
 reconnect_backoff_max_ms     = 60000
 prefer_internet_gateway      = true
-gateway_failover_delay_secs  = 10
 ```
 
 ---
