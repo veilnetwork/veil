@@ -132,6 +132,24 @@ impl NodeRuntime {
                         continue;
                     }
 
+                    // M12 (failover path): skip if we already recorded an entry
+                    // for this node_id. The sibling autodiscover loop got this
+                    // dedup in 4f371ed but this loop was missed: a beaconing-
+                    // but-unreachable gateway stays in GatewayList (beacons keep
+                    // refreshing last_seen, dodging the 600 s prune) and no live
+                    // session ever forms, so without this it gets a BRAND-NEW
+                    // `state.peers` entry every 10 s poll (~8.6k/day), growing
+                    // the map without bound. Re-inserting buys nothing: the first
+                    // insert already spawned a persistent, slot-deduped,
+                    // auto-reconnecting connector that handles session drops.
+                    let already_recorded = lock_state(&state)
+                        .peers
+                        .values()
+                        .any(|p| *p.node_id.as_bytes() == node_id);
+                    if already_recorded {
+                        continue;
+                    }
+
                     let peer_id = PeerId::new(peer_id_ctr);
                     peer_id_ctr = peer_id_ctr.wrapping_add(1);
                     let entry = PeerConfigEntry {
