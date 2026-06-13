@@ -27,16 +27,20 @@
 //!    structure).
 //!
 //! 4. On [`CellPeelResult::Final`]: this node is the final
-//!    destination. v1 simply logs the receipt + records a metric;
-//!    a separate slice will wire delivery into a per-app inbox.
+//!    destination. The payload's 1-byte kind tag routes it:
+//!    `APP_DELIVER` is delivered to the local per-app inbox, and
+//!    `INTRODUCE` is forwarded through the rendezvous-relay flow.
+//!    (Earlier revisions only logged + metered the receipt; delivery
+//!    is now wired — see the `CellPeelResult::Final` arm below.)
 //!
 //! # Why "drop on next-hop-down" is the right choice
 //!
 //! Tor handles relay-down by tearing down the circuit and surfacing
-//! to the sender so it can rebuild. We don't have circuit state
-//! yet, so
-//! the alternative is "send an error back through the inbound
-//! path". But that error message would leak the position of the
+//! to the sender so it can rebuild. This cell-relay path has no
+//! per-circuit teardown signal of its own (the separate
+//! CircuitBuild/CircuitData state machine does; this older onion-cell
+//! path does not), so the alternative is "send an error back through
+//! the inbound path". But that error message would leak the position of the
 //! failing hop to the sender's previous-hop observer, which is the
 //! exact correlation attack the cell+onion+packet machinery is
 //! designed to prevent. Silent drop is the safer v1 default; the
