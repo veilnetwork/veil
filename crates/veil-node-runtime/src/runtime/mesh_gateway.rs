@@ -28,7 +28,7 @@ impl NodeRuntime {
     /// Monitors `AutoDiscoveredPeers` for new gateways, upserts them into the
     /// `GatewayList` with appropriate scores, and on session loss triggers
     /// staggered reconnect with hysteresis.
-    pub fn spawn_gateway_failover_task(&mut self, failover_delay: std::time::Duration) {
+    pub fn spawn_gateway_failover_task(&mut self) {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
@@ -174,13 +174,9 @@ impl NodeRuntime {
                             veil_util::redact_addr_for_log(&veil_addr),
                         ),
                     );
-                    // NOTE (audit cycle-10): the `gateway_failover_delay_secs`
-                    // config knob is NOT applied here — the dial stagger uses the
-                    // rank-derived `delay_ms` computed above plus the fixed 10 s
-                    // failover poll. The knob is plumbed through config but
-                    // currently has no effect; wiring a debounce off it (Epic
-                    // 141.5) or removing the field is tracked as follow-up.
-                    let _ = failover_delay;
+                    // Dial stagger is the rank-derived `delay_ms` above plus the
+                    // fixed 10 s failover poll. (The old `gateway_failover_delay_secs`
+                    // config knob was removed — it was plumbed but never applied.)
                     let handles = crate::outbound_connector::spawn_outbound_peers(
                         vec![entry],
                         &access,
