@@ -3280,11 +3280,15 @@ pub struct TransportConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_sni: Option<String>,
     /// Path to a file containing the obfs4 pre-shared key (32 bytes,
-    /// base64-encoded on one line).  When set, enables the `obfs4-tcp://`
-    /// transport: server-side verifies incoming MACs, client-side
-    /// includes the MAC in outgoing handshakes.  Single network-wide PSK;
-    /// per-peer PSK lookup via signed transport_hints is a follow-up.
-    /// `None` disables the obfs4-tcp transport (default).
+    /// base64-encoded on one line).  **Legacy override, optional.**
+    ///
+    /// By default (`None`) an obfs4 listener derives its anti-probe
+    /// `node_id_mac_key` from the node's PUBLIC identity (vk + node_id) — the
+    /// same value a client derives from the invite's vk/nid — so obfs4 works
+    /// with no PSK file to generate, store, distribute, or rotate (Option C).
+    /// Set this only to pin a fixed network-wide secret instead of the
+    /// identity-derived key (e.g. to keep an existing deployment's PSK); when
+    /// set, every invite for the listener embeds it verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obfs4_psk_file: Option<std::path::PathBuf>,
     /// Webtunnel secret path (e.g. `/_t/random-32-chars`).  Activates

@@ -184,12 +184,13 @@ pub struct ListenConfigEntry {
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub tls_ca_cert: Option<String>,
-    /// Per-listener PSK file (32 raw bytes base64-encoded).  When set
-    /// and the listener's transport is `obfs4-tcp://`, this PSK overrides
-    /// the global `transport.obfs4_psk_file`.  Allows different listen
-    /// entries on one node to use different PSKs (e.g. public listener
-    /// uses deployment-wide PSK; trusted/family listener uses a secret
-    /// shared only with invitees).  `None` falls back to global PSK.
+    /// Per-listener PSK file (32 raw bytes base64-encoded).  **Legacy
+    /// override.**  When set and the listener's transport is `obfs4-tcp://`,
+    /// this PSK overrides both the global `transport.obfs4_psk_file` and the
+    /// identity-derived default.  `None` falls back to the global PSK, or —
+    /// when that is also unset — to the key derived from the node's public
+    /// identity (vk + node_id), which matches what the invite embeds, so no
+    /// PSK file is needed at all (Option C).
     pub psk_file: Option<std::path::PathBuf>,
     /// Visibility level (public/trusted/hidden).  Controls whether
     /// this listener's URI gets gossiped through PEX/DHT.

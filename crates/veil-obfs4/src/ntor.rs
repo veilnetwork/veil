@@ -28,8 +28,11 @@
 //! uniform-random opener.
 //!
 //! Where:
-//! - `node_id_mac_key` = pre-shared 32-byte secret, derived from server's
-//!   identity by HKDF.  Both sides know it (server-id-bound PSK).
+//! - `node_id_mac_key` = 32-byte anti-probe key, by default derived from the
+//!   server's PUBLIC identity (vk + node_id) via HKDF — see
+//!   [`NodeIdMacKey::derive_from_identity`].  Both sides know it: the client
+//!   from the invite's vk/nid, the server from its own identity, with no secret
+//!   to distribute (an explicit psk_file can still pin a fixed key instead).
 //! - `auth_key` = HKDF(`shared_secret`, "obfs4-auth-key-v1") computed
 //!   AFTER ECDH.
 //! - `shared_secret` = ECDH(C, S) = ECDH(Cx, S) = ECDH(Sx, C).  Both
