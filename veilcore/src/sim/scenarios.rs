@@ -4986,9 +4986,6 @@ mod tests {
     /// path (no regression on the happy path) (b) signaling +
     /// candidate promotion + real dial all chain into one
     /// production-callable function.
-    #[ignore = "flaky (~30% green even isolated): the NAT-fallback connect_peer_active dial \
-                via coordinator C is timing-sensitive, independent of E20 wire convergence \
-                (the wire_star setup converges fine); needs a deterministic fallback-dial harness"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic483_3_slice3_outbound_dial_failure_auto_triggers_nat_fallback() {
         let mut net = SimNetwork::builder()

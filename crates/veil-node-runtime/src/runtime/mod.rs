@@ -4906,6 +4906,12 @@ impl NodeServices {
         }
         let uri = TransportUri::parse(&peer.transport)?;
         let peer_ctx = Arc::new(peer_transport_context(&self.transport_ctx, &peer)?);
+        // E20: a connection recovered via NAT-traversal / SOCKS fallback is a
+        // one-sided, no-glare recovery dial — the primary URI was unreachable
+        // and the peer is not reciprocally dialing — so it must bypass
+        // directional dedup or the larger-node_id side is stranded ~50% of the
+        // time. The primary (direct-dial) path keeps normal dedup.
+        let mut used_fallback = false;
         let connection = match self.registry.connect(&uri, Arc::clone(&peer_ctx)).await {
             Ok(connection) => connection,
             Err(primary_err) => {
@@ -4933,6 +4939,7 @@ impl NodeServices {
                         if let Some(metrics) = &session_ctx.metrics {
                             metrics.inc_outbound_connect_attempts();
                         }
+                        used_fallback = true;
                         connection
                     } else if let Some(connection) = self.socks_fallback_dial(&uri, peer_ctx).await
                     {
@@ -4946,6 +4953,7 @@ impl NodeServices {
                         if let Some(metrics) = &session_ctx.metrics {
                             metrics.inc_outbound_connect_attempts();
                         }
+                        used_fallback = true;
                         connection
                     } else {
                         if let Some(metrics) = &session_ctx.metrics {
@@ -4985,6 +4993,7 @@ impl NodeServices {
             None,
             session_state,
             connection,
+            used_fallback,
         )
         .await?
         .ok_or_else(|| {
@@ -5029,6 +5038,7 @@ impl NodeServices {
             Some(listener_handle),
             SessionState::DebugAttached,
             connection,
+            false,
         )
         .await?
         .ok_or_else(|| {
@@ -5214,6 +5224,7 @@ pub fn spawn_inbound_session(
             Some(inbound.listener_handle),
             SessionState::Active,
             connection,
+            false,
         )
         .await
         {
