@@ -3224,8 +3224,7 @@ pub unsafe extern "C" fn veil_create_bootstrap_invite(
                 *out_status = VEIL_CREATE_INVITE_BAD_PASSWORD;
                 write_err(
                     err_out,
-                    "password is not valid UTF-8 — refusing to emit a plaintext invite"
-                        .to_owned(),
+                    "password is not valid UTF-8 — refusing to emit a plaintext invite".to_owned(),
                 );
             }
             return VEIL_OK;
