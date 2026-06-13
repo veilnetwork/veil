@@ -6,7 +6,7 @@
 
 import 'dart:ffi';
 
-import 'package:ffi/ffi.dart' show Utf8;
+import 'package:ffi/ffi.dart' show Utf8, Utf8Pointer;
 
 import 'native.dart';
 
@@ -98,15 +98,26 @@ final void Function(Pointer<Utf8>) veilFreeString = nativeLib
     .lookup<NativeFunction<Void Function(Pointer<Utf8>)>>('veil_free_string')
     .asFunction();
 
-final Pointer<VeilHandle> Function(Pointer<Utf8>, Pointer<Pointer<Utf8>>)
-    veilConnect = nativeLib
+// Explicit-length text ABI: native takes (ptr, len); the Dart wrapper keeps a
+// `Pointer<Utf8>` arg (from `toNativeUtf8()`) and forwards its byte pointer +
+// `.length` so call sites are unchanged. (Utf8 `.length` is strlen — excludes
+// the NUL — which is exactly the content byte count the native side reads.)
+final Pointer<VeilHandle> Function(Pointer<Uint8>, int, Pointer<Pointer<Utf8>>)
+    _connectNative = nativeLib
         .lookup<
                 NativeFunction<
                     Pointer<VeilHandle> Function(
-                  Pointer<Utf8>,
+                  Pointer<Uint8>,
+                  IntPtr,
                   Pointer<Pointer<Utf8>>,
                 )>>('veil_connect')
         .asFunction();
+
+Pointer<VeilHandle> veilConnect(
+  Pointer<Utf8> socketPath,
+  Pointer<Pointer<Utf8>> errOut,
+) =>
+    _connectNative(socketPath.cast<Uint8>(), socketPath.length, errOut);
 
 final void Function(Pointer<VeilHandle>) veilClose = nativeLib
     .lookup<NativeFunction<Void Function(Pointer<VeilHandle>)>>(
@@ -116,8 +127,10 @@ final void Function(Pointer<VeilHandle>) veilClose = nativeLib
 
 final Pointer<VeilApp> Function(
   Pointer<VeilHandle>,
-  Pointer<Utf8>,
-  Pointer<Utf8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
   int,
   Pointer<Pointer<Utf8>>,
 ) _bindNative = nativeLib
@@ -125,8 +138,10 @@ final Pointer<VeilApp> Function(
             NativeFunction<
                 Pointer<VeilApp> Function(
               Pointer<VeilHandle>,
-              Pointer<Utf8>,
-              Pointer<Utf8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
               Uint32,
               Pointer<Pointer<Utf8>>,
             )>>('veil_bind')
@@ -139,12 +154,15 @@ Pointer<VeilApp> veilBind(
   int endpointId,
   Pointer<Pointer<Utf8>> errOut,
 ) =>
-    _bindNative(handle, namespace, name, endpointId, errOut);
+    _bindNative(handle, namespace.cast<Uint8>(), namespace.length,
+        name.cast<Uint8>(), name.length, endpointId, errOut);
 
 final Pointer<VeilApp> Function(
   Pointer<VeilHandle>,
-  Pointer<Utf8>,
-  Pointer<Utf8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
   int,
   Pointer<Pointer<Utf8>>,
 ) _bindNamedNative = nativeLib
@@ -152,8 +170,10 @@ final Pointer<VeilApp> Function(
             NativeFunction<
                 Pointer<VeilApp> Function(
               Pointer<VeilHandle>,
-              Pointer<Utf8>,
-              Pointer<Utf8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
               Uint32,
               Pointer<Pointer<Utf8>>,
             )>>('veil_bind_named')
@@ -166,7 +186,8 @@ Pointer<VeilApp> veilBindNamed(
   int endpointId,
   Pointer<Pointer<Utf8>> errOut,
 ) =>
-    _bindNamedNative(handle, namespace, name, endpointId, errOut);
+    _bindNamedNative(handle, namespace.cast<Uint8>(), namespace.length,
+        name.cast<Uint8>(), name.length, endpointId, errOut);
 
 final int Function(Pointer<VeilApp>, Pointer<Uint8>) veilAppGetAppId =
     nativeLib
@@ -440,85 +461,110 @@ final int Function(
 
 // ── Identity restore (Epic 489.8) ──────────────────────────────────────────
 
-final int Function(Pointer<Utf8>, Pointer<Pointer<Utf8>>)
-    veilValidateBip39Phrase = nativeLib
+// Explicit-length text ABI: native takes (ptr, len). The Dart wrappers keep
+// `Pointer<Utf8>` args (from `toNativeUtf8()`) and forward each buffer's byte
+// pointer + `.length`. The non-zeroize `veil_validate_bip39_phrase` /
+// `veil_restore_identity_from_phrase` were removed — these zeroize variants
+// (caller-writable buffer wiped in place before return, success and error
+// paths both) are the only entry points.
+final int Function(Pointer<Uint8>, int, Pointer<Pointer<Utf8>>)
+    _validateBip39PhraseZeroizeNative = nativeLib
         .lookup<
                 NativeFunction<
                     Int32 Function(
-                  Pointer<Utf8>,
-                  Pointer<Pointer<Utf8>>,
-                )>>('veil_validate_bip39_phrase')
-        .asFunction();
-
-final int Function(
-  Pointer<Utf8>,
-  Pointer<Utf8>,
-  Pointer<Utf8>,
-  Pointer<Pointer<Utf8>>,
-) veilRestoreIdentityFromPhrase = nativeLib
-    .lookup<
-            NativeFunction<
-                Int32 Function(
-              Pointer<Utf8>,
-              Pointer<Utf8>,
-              Pointer<Utf8>,
-              Pointer<Pointer<Utf8>>,
-            )>>('veil_restore_identity_from_phrase')
-    .asFunction();
-
-// Zero-on-consume variants: caller-writable buffer is wiped in place
-// before return (success and error paths both).  Use when the phrase
-// originates as freshly malloc'd memory (e.g. `String.toNativeUtf8`)
-// so the plaintext window in the heap collapses to ~zero.
-final int Function(Pointer<Utf8>, Pointer<Pointer<Utf8>>)
-    veilValidateBip39PhraseZeroize = nativeLib
-        .lookup<
-                NativeFunction<
-                    Int32 Function(
-                  Pointer<Utf8>,
+                  Pointer<Uint8>,
+                  IntPtr,
                   Pointer<Pointer<Utf8>>,
                 )>>('veil_validate_bip39_phrase_zeroize')
         .asFunction();
 
+int veilValidateBip39PhraseZeroize(
+  Pointer<Utf8> phrase,
+  Pointer<Pointer<Utf8>> errOut,
+) =>
+    _validateBip39PhraseZeroizeNative(
+        phrase.cast<Uint8>(), phrase.length, errOut);
+
 final int Function(
-  Pointer<Utf8>,
-  Pointer<Utf8>,
-  Pointer<Utf8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
   Pointer<Pointer<Utf8>>,
-) veilRestoreIdentityFromPhraseZeroize = nativeLib
+) _restoreIdentityFromPhraseZeroizeNative = nativeLib
     .lookup<
             NativeFunction<
                 Int32 Function(
-              Pointer<Utf8>,
-              Pointer<Utf8>,
-              Pointer<Utf8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
               Pointer<Pointer<Utf8>>,
             )>>('veil_restore_identity_from_phrase_zeroize')
     .asFunction();
+
+int veilRestoreIdentityFromPhraseZeroize(
+  Pointer<Utf8> phrase,
+  Pointer<Utf8> veilDir,
+  Pointer<Utf8> instanceLabel,
+  Pointer<Pointer<Utf8>> errOut,
+) =>
+    _restoreIdentityFromPhraseZeroizeNative(
+        phrase.cast<Uint8>(), phrase.length,
+        veilDir.cast<Uint8>(), veilDir.length,
+        instanceLabel.cast<Uint8>(), instanceLabel.length, errOut);
 
 /// `_zeroize_with_password` variant — same contract as
 /// [veilRestoreIdentityFromPhraseZeroize] plus an optional
 /// passphrase that, if non-NULL, makes the daemon write a
 /// passphrase-encrypted `master.enc` backup alongside the identity
 /// document.  Both phrase AND password buffers are zeroed in place
-/// before return (Argon2id 64 MiB defaults — production tier).
+/// before return (Argon2id 64 MiB defaults — production tier). Pass
+/// `nullptr` for `password` to skip the encrypted backup.
 final int Function(
-  Pointer<Utf8>, // phrase (writable)
-  Pointer<Utf8>, // veil_dir (read-only)
-  Pointer<Utf8>, // instance_label (read-only)
-  Pointer<Utf8>, // password (writable, nullable)
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
   Pointer<Pointer<Utf8>>,
-) veilRestoreIdentityFromPhraseZeroizeWithPassword = nativeLib
+) _restoreIdentityFromPhraseZeroizeWithPasswordNative = nativeLib
     .lookup<
             NativeFunction<
                 Int32 Function(
-              Pointer<Utf8>,
-              Pointer<Utf8>,
-              Pointer<Utf8>,
-              Pointer<Utf8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
               Pointer<Pointer<Utf8>>,
             )>>('veil_restore_identity_from_phrase_zeroize_with_password')
     .asFunction();
+
+int veilRestoreIdentityFromPhraseZeroizeWithPassword(
+  Pointer<Utf8> phrase,
+  Pointer<Utf8> veilDir,
+  Pointer<Utf8> instanceLabel,
+  Pointer<Utf8> password, // nullable
+  Pointer<Pointer<Utf8>> errOut,
+) =>
+    _restoreIdentityFromPhraseZeroizeWithPasswordNative(
+        phrase.cast<Uint8>(), phrase.length,
+        veilDir.cast<Uint8>(), veilDir.length,
+        instanceLabel.cast<Uint8>(), instanceLabel.length,
+        password == nullptr ? nullptr : password.cast<Uint8>(),
+        password == nullptr ? 0 : password.length,
+        errOut);
 
 // ── Push-envelope sealing (Epic 489.10) ─────────────────────────────────────
 
@@ -660,43 +706,87 @@ const int veilCreateInviteInternalError = 3;
 
 final int Function(
   Pointer<VeilHandle>,
-  Pointer<Utf8>, // password (nullable)
+  Pointer<Uint8>, // password ptr (nullable)
+  int, // password_len
   Pointer<Uint8>, // out_status
   Pointer<Pointer<Utf8>>, // out_uri (malloc'd UTF-8 — caller frees with veil_free_string)
   Pointer<Pointer<Utf8>>, // err_out
-) veilCreateBootstrapInvite = nativeLib
+) _createBootstrapInviteNative = nativeLib
     .lookup<
             NativeFunction<
                 Int32 Function(
               Pointer<VeilHandle>,
-              Pointer<Utf8>,
+              Pointer<Uint8>,
+              IntPtr,
               Pointer<Uint8>,
               Pointer<Pointer<Utf8>>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_create_bootstrap_invite')
     .asFunction();
 
+int veilCreateBootstrapInvite(
+  Pointer<VeilHandle> handle,
+  Pointer<Utf8> password, // nullable
+  Pointer<Uint8> outStatus,
+  Pointer<Pointer<Utf8>> outUri,
+  Pointer<Pointer<Utf8>> errOut,
+) =>
+    _createBootstrapInviteNative(
+        handle,
+        password == nullptr ? nullptr : password.cast<Uint8>(),
+        password == nullptr ? 0 : password.length,
+        outStatus,
+        outUri,
+        errOut);
+
 final int Function(
   Pointer<VeilHandle>,
-  Pointer<Utf8>, // uri
-  Pointer<Utf8>, // password (nullable)
-  Pointer<Utf8>, // expected_issuer_pk (nullable)
+  Pointer<Uint8>, // uri
+  int, // uri_len
+  Pointer<Uint8>, // password (nullable)
+  int, // password_len
+  Pointer<Uint8>, // expected_issuer_pk (nullable)
+  int, // expected_issuer_pk_len
   Pointer<Uint8>, // out_node_id_32
   Pointer<Uint8>, // out_status
   Pointer<Pointer<Utf8>>,
-) veilJoinBootstrapUri = nativeLib
+) _joinBootstrapUriNative = nativeLib
     .lookup<
             NativeFunction<
                 Int32 Function(
               Pointer<VeilHandle>,
-              Pointer<Utf8>,
-              Pointer<Utf8>,
-              Pointer<Utf8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
               Pointer<Uint8>,
               Pointer<Uint8>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_join_bootstrap_uri')
     .asFunction();
+
+int veilJoinBootstrapUri(
+  Pointer<VeilHandle> handle,
+  Pointer<Utf8> uri,
+  Pointer<Utf8> password, // nullable
+  Pointer<Utf8> expectedIssuerPk, // nullable
+  Pointer<Uint8> outNodeId32,
+  Pointer<Uint8> outStatus,
+  Pointer<Pointer<Utf8>> errOut,
+) =>
+    _joinBootstrapUriNative(
+        handle,
+        uri.cast<Uint8>(),
+        uri.length,
+        password == nullptr ? nullptr : password.cast<Uint8>(),
+        password == nullptr ? 0 : password.length,
+        expectedIssuerPk == nullptr ? nullptr : expectedIssuerPk.cast<Uint8>(),
+        expectedIssuerPk == nullptr ? 0 : expectedIssuerPk.length,
+        outNodeId32,
+        outStatus,
+        errOut);
 
 // ── Mailbox (Epic 489.3) ────────────────────────────────────────────────────
 
@@ -1067,21 +1157,38 @@ const int veilPairOobCodeLen = 6;
 
 final int Function(
   Pointer<VeilHandle>,
-  Pointer<Utf8>, // password
+  Pointer<Uint8>, // password ptr (nullable)
+  int, // password_len
   Pointer<Uint8>, // out_status
   Pointer<Pointer<Utf8>>, // out_uri (malloc'd; caller frees)
   Pointer<Pointer<Utf8>>, // err_out
-) veilPairSourceCreateInvite = nativeLib
+) _pairSourceCreateInviteNative = nativeLib
     .lookup<
             NativeFunction<
                 Int32 Function(
               Pointer<VeilHandle>,
-              Pointer<Utf8>,
+              Pointer<Uint8>,
+              IntPtr,
               Pointer<Uint8>,
               Pointer<Pointer<Utf8>>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_pair_source_create_invite')
     .asFunction();
+
+int veilPairSourceCreateInvite(
+  Pointer<VeilHandle> handle,
+  Pointer<Utf8> password, // nullable
+  Pointer<Uint8> outStatus,
+  Pointer<Pointer<Utf8>> outUri,
+  Pointer<Pointer<Utf8>> errOut,
+) =>
+    _pairSourceCreateInviteNative(
+        handle,
+        password == nullptr ? nullptr : password.cast<Uint8>(),
+        password == nullptr ? 0 : password.length,
+        outStatus,
+        outUri,
+        errOut);
 
 final int Function(
   Pointer<VeilHandle>,
@@ -1129,18 +1236,20 @@ final int Function(
 
 final int Function(
   Pointer<VeilHandle>,
-  Pointer<Utf8>, // uri
+  Pointer<Uint8>, // uri
+  int, // uri_len
   Pointer<Uint8>, // out_status
   Pointer<Uint8>, // out_hello_buf
   int, // out_hello_buf_cap
   Pointer<IntPtr>, // out_hello_len
   Pointer<Pointer<Utf8>>, // err_out
-) veilPairTargetConsumeUri = nativeLib
+) _pairTargetConsumeUriNative = nativeLib
     .lookup<
             NativeFunction<
                 Int32 Function(
               Pointer<VeilHandle>,
-              Pointer<Utf8>,
+              Pointer<Uint8>,
+              IntPtr,
               Pointer<Uint8>,
               Pointer<Uint8>,
               IntPtr,
@@ -1148,6 +1257,18 @@ final int Function(
               Pointer<Pointer<Utf8>>,
             )>>('veil_pair_target_consume_uri')
     .asFunction();
+
+int veilPairTargetConsumeUri(
+  Pointer<VeilHandle> handle,
+  Pointer<Utf8> uri,
+  Pointer<Uint8> outStatus,
+  Pointer<Uint8> outHelloBuf,
+  int outHelloBufCap,
+  Pointer<IntPtr> outHelloLen,
+  Pointer<Pointer<Utf8>> errOut,
+) =>
+    _pairTargetConsumeUriNative(handle, uri.cast<Uint8>(), uri.length,
+        outStatus, outHelloBuf, outHelloBufCap, outHelloLen, errOut);
 
 final int Function(
   Pointer<VeilHandle>,
