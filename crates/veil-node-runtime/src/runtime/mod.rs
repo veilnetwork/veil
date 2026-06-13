@@ -993,8 +993,16 @@ impl NodeRuntime {
         let config_path = config_path.as_ref().to_path_buf();
         let config = veil_cfg::load_config(&config_path)?;
 
-        // Fail fast if the config has structural or identity issues.
-        let validation = veil_cfg::validate(&config);
+        // Fail fast if the config has structural or identity issues. Under the
+        // production-hardening profile (`[global].strict_config_validation`),
+        // also treat the risky-but-permitted advisories (push wake-HMAC, mailbox
+        // capability tokens, unsigned DHT store, …) as fatal so the daemon
+        // refuses to start on an unsafe production posture.
+        let validation = if config.global.strict_config_validation {
+            veil_cfg::validate_strict(&config)
+        } else {
+            veil_cfg::validate(&config)
+        };
         if !validation.is_valid() {
             return Err(NodeError::Config(veil_cfg::ConfigError::ValidationFailed(
                 validation.format_issues(),

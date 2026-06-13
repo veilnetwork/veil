@@ -21,6 +21,16 @@ pub fn validate_with_policy(config: &Config, pow: &PowPolicy) -> ValidationRepor
     build_report(config, pow, 0)
 }
 
+/// Validate under the production-hardening profile: identical to [`validate`]
+/// except the non-fatal production-posture advisories are PROMOTED to fatal
+/// issues (see [`ValidationReport::into_strict`]). The daemon calls this at
+/// startup when `[global].strict_config_validation = true`, so a risky-but-
+/// permitted posture refuses to start instead of merely warning. Adds no new
+/// checks — only changes the severity of the existing advisories.
+pub fn validate_strict(config: &Config) -> ValidationReport {
+    validate(config).into_strict()
+}
+
 /// Validate and apply in-place fixes for fixable issues (e.g. missing defaults
 /// canonicalising enum strings). Returns the post-fix report; use this in
 /// init/migration paths where a dirty config should be repaired.
@@ -74,7 +84,10 @@ mod tests {
     };
     use veil_crypto as crypto;
 
-    use super::{validate, validate_and_fix, validate_and_fix_with_policy, validate_with_policy};
+    use super::{
+        validate, validate_and_fix, validate_and_fix_with_policy, validate_strict,
+        validate_with_policy,
+    };
 
     mod unit {
         use super::*;
@@ -152,6 +165,52 @@ mod tests {
                     .iter()
                     .any(|i| i.code == "mailbox_push_unauth_wake_permitted"),
                 "the advisory must be a warning, never a fatal issue"
+            );
+        }
+
+        /// Production-hardening profile (audit follow-up): `validate_strict`
+        /// promotes the non-fatal advisories to FATAL issues, so a daemon with
+        /// `[global].strict_config_validation = true` refuses to start on a
+        /// risky-but-permitted posture. `validate` (default) keeps them as
+        /// warnings.
+        #[test]
+        fn strict_validation_promotes_advisories_to_fatal_issues() {
+            let mut config = Config::default();
+            // A push relay left on the fail-open default raises an advisory.
+            config.mailbox.push.fcm_credentials_path = "/etc/veil/fcm.json".to_owned();
+
+            // Default validation: valid, advisory only.
+            let lax = validate(&config);
+            assert!(lax.is_valid(), "advisory must not fail default validation");
+            assert!(
+                lax.warnings
+                    .iter()
+                    .any(|w| w.code == "mailbox_push_unauth_wake_permitted"),
+                "advisory expected in warnings under default validation",
+            );
+
+            // Strict profile: the advisory is promoted to a fatal issue.
+            let strict = validate_strict(&config);
+            assert!(
+                !strict.is_valid(),
+                "strict profile must reject the risky posture",
+            );
+            assert!(
+                strict
+                    .issues
+                    .iter()
+                    .any(|i| i.code == "mailbox_push_unauth_wake_permitted"),
+                "advisory must appear as a fatal issue under strict validation",
+            );
+            assert!(
+                strict.warnings.is_empty(),
+                "strict validation moves all warnings into issues",
+            );
+
+            // A clean default config still passes strict validation.
+            assert!(
+                validate_strict(&Config::default()).is_valid(),
+                "a clean config must remain valid under the strict profile",
             );
         }
 

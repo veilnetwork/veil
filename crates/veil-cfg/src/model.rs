@@ -3670,6 +3670,19 @@ pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
     pub require_signed_config: bool,
 
+    /// Production-hardening profile (audit follow-up). When `true`, the daemon
+    /// treats the production-posture ADVISORIES — a push relay without
+    /// `mailbox.push.require_wake_hmac`, a mailbox without
+    /// `mailbox.require_capability_token`, `dht.allow_unsigned_store`, etc. — as
+    /// FATAL config errors instead of non-fatal warnings, and REFUSES to start
+    /// until they are addressed. Default `false` (backward-compatible: the
+    /// advisories stay warnings). Flip to `true` on a production fleet to
+    /// fail-closed on a risky-but-permitted posture; pairs naturally with
+    /// `require_signed_config = true`. It only PROMOTES the existing advisories —
+    /// it adds no new checks.
+    #[serde(default, skip_serializing_if = "is_default_legacy_allow")]
+    pub strict_config_validation: bool,
+
     /// **Phase 10 slice 2c** — TLS ECH GREASE on outbound public-PKI
     /// HTTPS connections (currently the bootstrap fetch path).  When
     /// `true`, the client adds an Encrypted Client Hello GREASE
@@ -3752,6 +3765,7 @@ impl Default for GlobalConfig {
             trusted_bundle_issuer_pubkey: None,
             allow_unpinned_signed_bootstrap: false,
             require_signed_config: false,
+            strict_config_validation: false,
             legacy_allow_unsigned_bootstrap: false,
             tls_ech_grease: Self::default_tls_ech_grease(),
         }
