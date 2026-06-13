@@ -38,7 +38,8 @@ impl NeighborOfferPayload {
         let mut buf = Vec::with_capacity(32 + 2 + self.addr.len() + 1);
         buf.extend_from_slice(&self.node_id);
         buf.extend_from_slice(&addr_len.to_be_bytes());
-        buf.extend_from_slice(&self.addr);
+        // diff-audit M6: write only the CLAMPED length so field + body agree.
+        buf.extend_from_slice(&self.addr[..addr_len as usize]);
         buf.push(self.flags);
         buf
     }
