@@ -262,6 +262,17 @@ pub struct OnionServiceEntry {
     /// pre-Δ2-d terminus) instead of rebuilding the same possibly-dead path.
     /// Replaced on every (re)build with the new circuit's flag.
     pub confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    /// Per-service strictly-monotonic registration freshness counter (B2).
+    /// R rejects a re-registration whose epoch is not STRICTLY greater than the
+    /// recorded one (M2 replay-hijack defense). The epoch used to be raw
+    /// wall-clock seconds, so two rebuilds in the same second — or a clock that
+    /// did not advance — produced equal epochs and the second rebuild was
+    /// dropped as `StaleEpoch`, silently leaving the service on a stale circuit.
+    /// On every (re)build the epoch is advanced to `max(unix_now, prev + 1)`, so
+    /// it is monotonic AND still tracks wall-clock. Shared (`Arc`) so the value
+    /// persists across rebuilds of this entry.
+    pub registration_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AnonymityState {
