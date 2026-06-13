@@ -20,6 +20,7 @@
 // address.
 
 import 'dart:ffi';
+import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
 
@@ -140,33 +141,42 @@ void restoreIdentity({
 ///   * invalid UTF-8 [passphrase],
 ///   * cannot create / write to [veilDir],
 ///   * crypto failure (rare — would indicate a bug).
-void restoreIdentityEncrypted({
+Future<void> restoreIdentityEncrypted({
   required String phrase,
   required String veilDir,
   required String instanceLabel,
   required String passphrase,
 }) {
-  final phraseC = phrase.toNativeUtf8();
-  final dirC = veilDir.toNativeUtf8();
-  final labelC = instanceLabel.toNativeUtf8();
-  final passC = passphrase.toNativeUtf8();
-  final errOut = calloc<Pointer<Utf8>>();
-  try {
-    final rc = ffi.veilRestoreIdentityFromPhraseZeroizeWithPassword(
-      phraseC, dirC, labelC, passC, errOut,
-    );
-    if (rc == ffi.veilOk) return;
-    final errPtr = errOut.value;
-    final msg = errPtr == nullptr ? '<no detail>' : errPtr.toDartString();
-    if (errPtr != nullptr) ffi.veilFreeString(errPtr);
-    throw VeilException(msg, code: rc);
-  } finally {
-    calloc.free(phraseC);
-    calloc.free(dirC);
-    calloc.free(labelC);
-    calloc.free(passC);
-    calloc.free(errOut);
-  }
+  // diff-audit H3: this call runs Argon2id (64 MiB, t=3, p=4) — multiple seconds
+  // on budget Android — so it MUST NOT run on the UI isolate (it previously was a
+  // plain synchronous function → hard UI freeze / ANR). Offload it to a worker
+  // isolate via `Isolate.run`. The native library + bindings are top-level
+  // lazies (`native.dart`'s `nativeLib`), so they re-initialise inside the
+  // spawned isolate; all four args are `String` (sendable) and `VeilException`
+  // (String + int) marshals back across the boundary on failure.
+  return Isolate.run(() {
+    final phraseC = phrase.toNativeUtf8();
+    final dirC = veilDir.toNativeUtf8();
+    final labelC = instanceLabel.toNativeUtf8();
+    final passC = passphrase.toNativeUtf8();
+    final errOut = calloc<Pointer<Utf8>>();
+    try {
+      final rc = ffi.veilRestoreIdentityFromPhraseZeroizeWithPassword(
+        phraseC, dirC, labelC, passC, errOut,
+      );
+      if (rc == ffi.veilOk) return;
+      final errPtr = errOut.value;
+      final msg = errPtr == nullptr ? '<no detail>' : errPtr.toDartString();
+      if (errPtr != nullptr) ffi.veilFreeString(errPtr);
+      throw VeilException(msg, code: rc);
+    } finally {
+      calloc.free(phraseC);
+      calloc.free(dirC);
+      calloc.free(labelC);
+      calloc.free(passC);
+      calloc.free(errOut);
+    }
+  });
 }
 
 /// Sanity-check helper for UI: returns `true` iff [phrase], when

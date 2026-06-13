@@ -2,8 +2,15 @@
 //
 // Threading: every FFI call is synchronous from Dart's POV (the Rust
 // runtime owns its own tokio worker pool, the FFI surface block_on's
-// internally).  We schedule those calls onto an Isolate.run() so they
-// don't stall the UI isolate during connect/bind handshakes.
+// internally).  Most calls here are wrapped in `Future(() {...})`, which
+// defers them onto the SAME (UI) isolate's event loop — it yields once but
+// does NOT offload work to another thread (diff-audit H3 corrected the prior
+// comment that wrongly claimed `Isolate.run`).  Genuinely blocking / CPU-heavy
+// calls must use `Isolate.run` to avoid freezing the UI: e.g.
+// `restoreIdentityEncrypted` (Argon2id) now does (see identity.dart).  A
+// `VeilStream.read()` with no data still `block_on`s on the CALLING isolate, so
+// drive streams from a worker isolate, not the UI isolate (tracked: full
+// per-call isolate offload).
 //
 // Memory: every Pointer<Utf8> from C must be freed with veilFreeString
 // after consumption.  Every malloc'd buffer we hand to FFI is freed in
