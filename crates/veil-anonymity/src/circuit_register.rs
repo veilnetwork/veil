@@ -113,7 +113,12 @@ impl CircuitRegisterPayload {
         let epoch = u64::from_be_bytes(buf[epoch_off..epoch_off + 8].try_into().ok()?);
         let sig_len_off = epoch_off + 8;
         let sig_len = u16::from_be_bytes([buf[sig_len_off], buf[sig_len_off + 1]]) as usize;
-        if sig_len > MAX_SIG_LEN || buf.len() < fixed + sig_len {
+        // Exact length: reject trailing garbage as well as truncation. The
+        // registration is delivered as the exact innermost circuit-setup
+        // payload (no padding through the onion layers), so a legitimate
+        // payload is precisely `fixed + sig_len`; accepting trailing bytes is
+        // wire malleability with no legitimate producer.
+        if sig_len > MAX_SIG_LEN || buf.len() != fixed + sig_len {
             return None;
         }
         Some(Self {
@@ -322,6 +327,21 @@ mod tests {
         let d = CircuitRegisterPayload::decode(&p.encode()).unwrap();
         assert_eq!(d, p);
         assert!(d.verify());
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        // Exact-length: the registration is the exact innermost circuit-setup
+        // payload (unpadded), so trailing bytes after the signature are wire
+        // malleability with no legitimate producer and must be rejected.
+        let (p, _) = signed([0xC2; COOKIE_LEN]);
+        let mut enc = p.encode();
+        assert!(CircuitRegisterPayload::decode(&enc).is_some());
+        enc.push(0x00); // trailing garbage
+        assert!(
+            CircuitRegisterPayload::decode(&enc).is_none(),
+            "trailing bytes after the signature must be rejected"
+        );
     }
 
     #[test]
