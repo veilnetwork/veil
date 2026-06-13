@@ -305,7 +305,6 @@ mod tests {
     /// A real production topology: 1 Gateway, 1 Core, 1 Leaf.
     /// Gateway ↔ Core (backbone), Gateway ↔ Leaf (attachment path).
     /// Verifies that different roles can all establish sessions together.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn three_role_core_core_leaf_topology() {
         use crate::cfg::NodeRole;
@@ -430,7 +429,6 @@ mod tests {
     /// Two nodes connect with a 1-second keepalive interval and a 4-second idle
     /// timeout. With keepalive running, the session should remain alive after
     /// 3 seconds (below idle timeout).
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn keepalive_prevents_idle_timeout() {
         use crate::cfg::SessionConfig;
@@ -2853,7 +2851,6 @@ mod tests {
     // * 100 % means "every contact is a sybil" — anything > 50 % is the
     // eclipse failure mode (target's lookups all hit attacker-controlled
     // nodes). Bound at 50 % so we have a clear pass/fail signal.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic485_1_sybil_flood_does_not_eclipse_routing_table() {
         let honest_count = 5;
@@ -3125,7 +3122,6 @@ mod tests {
     // measurement (every honest as target). We test ONE target here
     // because the failure mode at H == S is timing-bias, which is
     // target-symmetric.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic485_1c_equal_strength_sybil_attack_degrades_gracefully() {
         let honest_count = 5;

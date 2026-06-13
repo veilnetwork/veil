@@ -289,57 +289,21 @@ impl SimNetwork {
         if self.links.contains(&key) {
             return true; // already connected
         }
-        let peer_id_a = PeerId::new(self.next_peer_id as u32);
-        let peer_id_b = PeerId::new((self.next_peer_id + 1) as u32);
-        self.next_peer_id += 2;
-
-        let (config_b, peer_a) = {
-            let node_a = &self.nodes[a];
-            let node_b = &self.nodes[b];
-            let peer_b_for_a = node_b.as_peer_config(peer_id_a);
-            let peer_a_for_b = node_a.as_peer_config(peer_id_b);
-            let mut config_b = node_b.config.clone();
-            if let Some(p) = peer_a_for_b {
-                config_b.peers.push(p);
-            }
-            (config_b, peer_b_for_a)
-        };
-
-        // Update A: add B as peer
-        let mut config_a = self.nodes[a].config.clone();
-        if let Some(p) = peer_a {
-            config_a.peers.push(p);
-        }
-
-        // Reload both nodes
-        // E20 fix — reload order matters. Directional dedup makes the
-        // SMALLER-node_id side own the canonical outbound dial (it keeps its
-        // outbound; the larger keeps the inbound + skips dialing). If the
-        // smaller node reloads FIRST, it dials + forms the session, and the
-        // larger node's SUBSEQUENT reload tears that session down — after which
-        // the smaller node's outbound connector sits in its 30s has_session /
-        // policy sleep and doesn't promptly re-dial (and force_reconnect_notify
-        // is edge-triggered, easily missed). Net: ~50% of pairs (keyed on which
-        // index has the smaller node_id) never re-establish in the wait window.
-        // Fix: reload the LARGER node_id first and the SMALLER last, so the
-        // canonical session forms AFTER both reloads and is never torn down.
-        let a_smaller = self.nodes[a].node_id() < self.nodes[b].node_id();
-        let (first, first_cfg, second, second_cfg) = if a_smaller {
-            (b, config_b, a, config_a) // a is smaller → reload it last
-        } else {
-            (a, config_a, b, config_b)
-        };
-        if self.nodes[first].reload_with(first_cfg).await.is_err() {
-            return false;
-        }
-        if self.nodes[second].reload_with(second_cfg).await.is_err() {
-            return false;
-        }
+        // E20: a single pairwise reload of just `a` and `b` strands any
+        // third-party canonical dialer that already had a session to whichever
+        // endpoint we reload (its session is torn down by the reload, and it
+        // then sits in the 30s connector sleep). Rather than reload only the
+        // pair, add the edge and re-converge the WHOLE current link set via the
+        // descending-node_id reload pass (smallest node_id last), so every
+        // affected dialer re-dials after its partner is back up. For an
+        // isolated pair this reduces to exactly "reload both, smaller last".
         self.links.insert(key);
+        self.converge_links_descending().await;
 
-        // Wait for session to appear on both sides.
-        let b_id = self.nodes[b].node_id();
+        // Report whether THIS pair established (the caller's contract), and
+        // record the connect event only for this newly-added edge.
         let a_id = self.nodes[a].node_id();
+        let b_id = self.nodes[b].node_id();
         let ok_a = self.nodes[a]
             .wait_session_to(b_id, Duration::from_secs(5))
             .await;
@@ -494,10 +458,16 @@ impl SimNetwork {
     /// sets from it. Rebuilding from scratch (rather than appending) keeps the
     /// peer sets in exact sync with `self.links`, so it is correct after edge
     /// removals too.
-    async fn converge_links_descending(&mut self) {
+    ///
+    /// Returns a per-node `converged` vector (`converged[i]` is true iff node
+    /// `i` reached its expected session degree). Does NOT emit any `SimEvent` —
+    /// event recording is the caller's responsibility, so that callers invoked
+    /// repeatedly (e.g. incremental `connect`) don't re-record already-present
+    /// edges every pass.
+    async fn converge_links_descending(&mut self) -> Vec<bool> {
         let n = self.nodes.len();
         if n == 0 {
-            return;
+            return Vec::new();
         }
         // Expected session count (degree) per node from the edge set.
         let mut degree = vec![0usize; n];
@@ -537,10 +507,19 @@ impl SimNetwork {
                 .wait_sessions(degree[i], Duration::from_secs(30))
                 .await;
         }
-        // Record a NodeConnected event for each edge whose endpoints converged.
+        converged
+    }
+
+    /// Converge `self.links`, then record a `NodeConnected` event for every
+    /// edge whose endpoints both reached their expected session degree. Shared
+    /// by the bulk-wiring helpers, which establish a full edge set in one shot.
+    async fn converge_and_record_all(&mut self) {
+        let converged = self.converge_links_descending().await;
         let edges: Vec<(usize, usize)> = self.links.iter().copied().collect();
         for (a, b) in edges {
-            if converged[a] && converged[b] {
+            if converged.get(a).copied().unwrap_or(false)
+                && converged.get(b).copied().unwrap_or(false)
+            {
                 self.record(SimEvent::NodeConnected { a, b });
             }
         }
@@ -555,7 +534,7 @@ impl SimNetwork {
         for i in 0..n {
             self.links.insert((i.min((i + 1) % n), i.max((i + 1) % n)));
         }
-        self.converge_links_descending().await;
+        self.converge_and_record_all().await;
     }
 
     /// Wire a full mesh: every pair (i, j) with i < j.
@@ -569,7 +548,7 @@ impl SimNetwork {
                 self.links.insert((i, j));
             }
         }
-        self.converge_links_descending().await;
+        self.converge_and_record_all().await;
     }
 
     /// Wire a star: node 0 is the hub, connected to all others.
@@ -578,7 +557,7 @@ impl SimNetwork {
         for spoke in 1..n {
             self.links.insert((0, spoke));
         }
-        self.converge_links_descending().await;
+        self.converge_and_record_all().await;
     }
 
     /// Wire a random graph where each pair (i, j) is connected with probability `p`.
@@ -598,7 +577,7 @@ impl SimNetwork {
                 }
             }
         }
-        self.converge_links_descending().await;
+        self.converge_and_record_all().await;
     }
 
     /// Wire a random graph using the network's own seeded RNG.
@@ -614,7 +593,7 @@ impl SimNetwork {
                 }
             }
         }
-        self.converge_links_descending().await;
+        self.converge_and_record_all().await;
     }
 
     // ── Snapshot / replay ────────────────────────────────
@@ -1173,7 +1152,6 @@ mod tests {
     }
 
     /// Two-node network: start, connect, verify sessions.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_node_connect_establishes_session() {
         let mut net = SimNetwork::builder()
@@ -1217,7 +1195,6 @@ mod tests {
     }
 
     /// Three-node linear topology: 0-1-2.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn three_node_linear_topology() {
         let mut net = SimNetwork::builder()
