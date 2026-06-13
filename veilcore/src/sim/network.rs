@@ -472,33 +472,45 @@ impl SimNetwork {
 
     // ── Topology wiring ────────────────────────────────────────────────────────
 
-    /// Wire a ring: 0-1-2-…-(n-1)-0.
-    pub async fn wire_ring(&mut self) {
-        let n = self.nodes.len();
-        for i in 0..n {
-            self.connect(i, (i + 1) % n).await;
-        }
-    }
-
-    /// Wire a full mesh: every pair (i, j) with i < j.
-    pub async fn wire_full_mesh(&mut self) {
+    /// E20-safe bulk-topology convergence (the shared primitive behind
+    /// `wire_full_mesh` / `wire_ring` / `wire_star` / `wire_random*`).
+    ///
+    /// Given the edge set already recorded in `self.links`, rebuild every
+    /// node's COMPLETE peer set from scratch and reload each node that has at
+    /// least one link exactly ONCE, in DESCENDING node_id order (smallest
+    /// node_id reloads LAST). Directional dedup makes the smaller-node_id side
+    /// own the canonical outbound dial; reloading it last guarantees every
+    /// pair's session forms AFTER both endpoints are up and is never torn down
+    /// by a later reload — and any partner whose session was dropped by an
+    /// earlier reload re-dials when it itself reloads. Then converge-wait so
+    /// every node reaches its expected (degree) session count.
+    ///
+    /// This replaces the old O(N^2) incremental `connect(i, j)` wiring, which
+    /// reloaded shared nodes O(N) times and stranded ~half of the canonical
+    /// dialers behind the 30s connector sleep — the Phase E20 "~50% pairwise
+    /// session establishment failure" flake.
+    ///
+    /// Caller must populate `self.links` first; this method only rebuilds peer
+    /// sets from it. Rebuilding from scratch (rather than appending) keeps the
+    /// peer sets in exact sync with `self.links`, so it is correct after edge
+    /// removals too.
+    async fn converge_links_descending(&mut self) {
         let n = self.nodes.len();
         if n == 0 {
             return;
         }
-        // E20 fix: build each node's COMPLETE peer set up front and reload each
-        // node exactly ONCE (no O(N^2) pairwise reload churn), in DESCENDING
-        // node_id order (smallest last). Directional dedup makes the smaller
-        // node own the canonical outbound dial; reloading it last means every
-        // pair's canonical session forms after BOTH endpoints are up and is
-        // never torn down by a later reload. (The old pairwise `connect(i, j)`
-        // reloaded shared nodes O(N) times and, for ~half of pairs, formed the
-        // session before the partner's reload killed it — with the 30s
-        // connector sleep blocking a prompt re-dial: the ~50% flake.)
+        // Expected session count (degree) per node from the edge set.
+        let mut degree = vec![0usize; n];
+        for &(a, b) in &self.links {
+            degree[a] += 1;
+            degree[b] += 1;
+        }
+        // Rebuild each node's complete peer set from `self.links`.
         let mut configs: Vec<_> = (0..n).map(|i| self.nodes[i].config.clone()).collect();
         for (i, cfg) in configs.iter_mut().enumerate() {
+            cfg.peers.clear();
             for j in 0..n {
-                if i == j {
+                if i == j || !self.links.contains(&(i.min(j), i.max(j))) {
                     continue;
                 }
                 let peer_id = PeerId::new(self.next_peer_id as u32);
@@ -508,8 +520,9 @@ impl SimNetwork {
                 }
             }
         }
-        // Reload order: descending node_id (smallest node reloads LAST).
-        let mut order: Vec<usize> = (0..n).collect();
+        // Reload order: descending node_id (smallest node reloads LAST). Skip
+        // link-less nodes — no session to converge and no reason to churn them.
+        let mut order: Vec<usize> = (0..n).filter(|&i| degree[i] > 0).collect();
         order.sort_by(|&x, &y| self.nodes[y].node_id().cmp(&self.nodes[x].node_id()));
         let mut configs: Vec<Option<_>> = configs.into_iter().map(Some).collect();
         for &i in &order {
@@ -517,30 +530,55 @@ impl SimNetwork {
                 let _ = self.nodes[i].reload_with(cfg).await;
             }
         }
+        // Convergence: each node should reach `degree[i]` sessions.
+        let mut converged = vec![false; n];
+        for &i in &order {
+            converged[i] = self.nodes[i]
+                .wait_sessions(degree[i], Duration::from_secs(30))
+                .await;
+        }
+        // Record a NodeConnected event for each edge whose endpoints converged.
+        let edges: Vec<(usize, usize)> = self.links.iter().copied().collect();
+        for (a, b) in edges {
+            if converged[a] && converged[b] {
+                self.record(SimEvent::NodeConnected { a, b });
+            }
+        }
+    }
+
+    /// Wire a ring: 0-1-2-…-(n-1)-0.
+    pub async fn wire_ring(&mut self) {
+        let n = self.nodes.len();
+        if n < 2 {
+            return;
+        }
+        for i in 0..n {
+            self.links.insert((i.min((i + 1) % n), i.max((i + 1) % n)));
+        }
+        self.converge_links_descending().await;
+    }
+
+    /// Wire a full mesh: every pair (i, j) with i < j.
+    pub async fn wire_full_mesh(&mut self) {
+        let n = self.nodes.len();
+        if n == 0 {
+            return;
+        }
         for i in 0..n {
             for j in (i + 1)..n {
                 self.links.insert((i, j));
             }
         }
-        // Convergence: every node should reach n-1 sessions.
-        for i in 0..n {
-            let ok = self.nodes[i]
-                .wait_sessions(n - 1, Duration::from_secs(30))
-                .await;
-            if ok {
-                for j in (i + 1)..n {
-                    self.record(SimEvent::NodeConnected { a: i, b: j });
-                }
-            }
-        }
+        self.converge_links_descending().await;
     }
 
     /// Wire a star: node 0 is the hub, connected to all others.
     pub async fn wire_star(&mut self) {
         let n = self.nodes.len();
         for spoke in 1..n {
-            self.connect(0, spoke).await;
+            self.links.insert((0, spoke));
         }
+        self.converge_links_descending().await;
     }
 
     /// Wire a random graph where each pair (i, j) is connected with probability `p`.
@@ -556,10 +594,11 @@ impl SimNetwork {
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
                 if (rng as f64) / (u64::MAX as f64) < p {
-                    self.connect(i, j).await;
+                    self.links.insert((i, j));
                 }
             }
         }
+        self.converge_links_descending().await;
     }
 
     /// Wire a random graph using the network's own seeded RNG.
@@ -567,18 +606,15 @@ impl SimNetwork {
     /// Produces the same topology for the same seed passed to the builder.
     pub async fn wire_random_seeded(&mut self, p: f64) {
         let n = self.nodes.len();
-        let mut pairs = Vec::new();
         for i in 0..n {
             for j in (i + 1)..n {
                 let r = self.rng_u64();
                 if (r as f64) / (u64::MAX as f64) < p {
-                    pairs.push((i, j));
+                    self.links.insert((i, j));
                 }
             }
         }
-        for (i, j) in pairs {
-            self.connect(i, j).await;
-        }
+        self.converge_links_descending().await;
     }
 
     // ── Snapshot / replay ────────────────────────────────
@@ -1220,7 +1256,6 @@ mod tests {
     }
 
     /// Star topology: 4 nodes → hub (node 0) has 3 sessions, spokes have 1.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn star_topology() {
         let mut net = SimNetwork::builder()
