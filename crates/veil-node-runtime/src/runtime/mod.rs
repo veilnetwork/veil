@@ -672,6 +672,11 @@ pub struct NodeRuntime {
     /// cap an inbound TCP flood pinned ~5 KB per pending task before the
     /// post-handshake `live_sessions.len >= max_concurrent` gate kicked in.
     pub inbound_handshake_sem: Arc<tokio::sync::Semaphore>,
+    /// Permit count `inbound_handshake_sem` was built with (diff-audit M14).
+    /// The semaphore can't be resized mid-flight without risking in-flight
+    /// handshakes, so reload warns when `session.max_concurrent` changes the
+    /// target rather than silently ignoring it.
+    pub inbound_handshake_sem_target: usize,
     /// ML-KEM-768 decapsulation-key seed (private, 64 bytes).
     /// (Stays outside the IdentityState bundle: it's the local-only
     /// secret half of mlkem_ek and has different access patterns —
@@ -2113,6 +2118,11 @@ impl NodeRuntime {
             inbound_handshake_sem: Arc::new(tokio::sync::Semaphore::new(
                 config.session.max_concurrent.saturating_mul(4).max(1024),
             )),
+            inbound_handshake_sem_target: config
+                .session
+                .max_concurrent
+                .saturating_mul(4)
+                .max(1024),
             mlkem_dk_seed,
             pending_diag: Arc::clone(&shared_pending_diag),
             // H10 stage-B (4/N): 16 session-config knobs collapsed

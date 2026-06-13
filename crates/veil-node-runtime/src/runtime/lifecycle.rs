@@ -369,6 +369,28 @@ impl NodeRuntime {
                 );
             }
         }
+        // diff-audit M14: the inbound-handshake admission semaphore is sized at
+        // boot from session.max_concurrent and CANNOT be resized mid-flight
+        // without risking in-flight handshakes. Warn if reload changes the target
+        // so the operator knows a restart is required (it was previously silently
+        // ignored).
+        {
+            let new_target = config
+                .session
+                .max_concurrent
+                .saturating_mul(4)
+                .max(1024);
+            if new_target != self.inbound_handshake_sem_target {
+                self.logger.warn(
+                    "config.session.handshake_admission_reload_ignored",
+                    format!(
+                        "session.max_concurrent changed but the inbound-handshake admission \
+                         cap ({} permits) is sized at startup and stays until a full restart",
+                        self.inbound_handshake_sem_target
+                    ),
+                );
+            }
+        }
         // identity bundle is `Arc<IdentityState>` — can't
         // mutate fields via deref. Build a fresh IdentityState reusing
         // existing Arc-clones for the peer caches (those are interior-mutable
