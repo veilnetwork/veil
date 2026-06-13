@@ -120,20 +120,26 @@ fn spawn_websocket_inbound_task<S>(
         while let Some(message) = ws_source.next().await {
             match message {
                 Ok(Message::Binary(payload)) => {
-                    // Write bridge first (borrows payload), then move into channel.
+                    // Write bridge first (borrows payload), then offer to channel.
                     if bridge_writer.write_all(&payload).await.is_err() {
                         break;
                     }
-                    let _ = inbound_tx.send(TransportMessage::Binary(payload)).await;
+                    // diff-audit M20: NON-blocking offer to the message channel.
+                    // The byte-bridge (`into_stream`) is the production consumer;
+                    // the `recv_message` channel is test-only and undrained in
+                    // production. A blocking `send().await` on the (cap-128)
+                    // channel would fill and STALL this single inbound loop —
+                    // wedging the byte-bridge too. Drop-on-full keeps the bridge
+                    // flowing; the test consumer drains fast enough to never drop.
+                    let _ = inbound_tx.try_send(TransportMessage::Binary(payload));
                 }
                 Ok(Message::Text(payload)) => {
                     // Consistent ordering with Binary: bridge first, then channel.
                     if bridge_writer.write_all(payload.as_bytes()).await.is_err() {
                         break;
                     }
-                    let _ = inbound_tx
-                        .send(TransportMessage::Text(payload.to_string()))
-                        .await;
+                    // M20: non-blocking (see Binary arm above).
+                    let _ = inbound_tx.try_send(TransportMessage::Text(payload.to_string()));
                 }
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
                 Ok(Message::Close(_)) | Ok(Message::Frame(_)) | Err(_) => break,
