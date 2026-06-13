@@ -802,6 +802,12 @@ pub struct SimNetworkBuilder {
     /// `target`.  Empty defaults to "no grinding" (legacy).  Cost is
     /// ≈ 2^bits keypair draws — use bits ≤ 12 in normal tests.
     grind_prefix: Vec<Option<([u8; 32], u32)>>,
+    /// when `true`, every node spawns a plain-Unix IPC server at a unique
+    /// `/tmp/veil-sim-ipc-<pid>-<i>.sock`, so a test can connect a raw IPC
+    /// client per node and exercise the app/stream surface end-to-end. The
+    /// resolved socket path is on each node's `config.ipc.socket_uri`. Forces
+    /// the per-node-subdir veil_dir layout. Default `false`.
+    with_ipc: bool,
 }
 
 impl SimNetworkBuilder {
@@ -837,6 +843,15 @@ impl SimNetworkBuilder {
     /// `runtime.metrics_snapshot()`. Off by default.
     pub fn with_metrics(mut self) -> Self {
         self.with_metrics = true;
+        self
+    }
+
+    /// Spawn a plain-Unix IPC server on every node (see [`with_ipc`] field) so
+    /// a test can drive each node through a raw IPC client. Off by default.
+    ///
+    /// [`with_ipc`]: SimNetworkBuilder
+    pub fn with_ipc(mut self) -> Self {
+        self.with_ipc = true;
         self
     }
 
@@ -963,11 +978,25 @@ impl SimNetworkBuilder {
             // config.parent → `identity_document.bin`). Use a
             // per-node subdir; otherwise keep the legacy flat
             // `/tmp/sim-*.toml` layout the older scenarios expect.
-            let config_path = if self.with_sovereign_identities {
+            let config_path = if self.with_sovereign_identities || self.with_ipc {
                 next_sim_config_path_with_dir(&format!("node{i}"))
             } else {
                 next_sim_config_path(&format!("node{i}"))
             };
+            if self.with_ipc {
+                // Plain-Unix IPC server at a short /tmp path (well under the
+                // macOS 104-byte sun_path limit — the deep per-node veil_dir
+                // could blow it). Unique per (process, node index).
+                let sock = std::path::PathBuf::from("/tmp").join(format!(
+                    "veil-sim-ipc-{}-{i}.sock",
+                    std::process::id(),
+                ));
+                config.ipc = crate::cfg::IpcConfig {
+                    enabled: true,
+                    socket_uri: Some(format!("unix://{}", sock.display())),
+                    ..crate::cfg::IpcConfig::default()
+                };
+            }
             crate::cfg::save_config(&config_path, &config).expect("save sim config");
 
             if self.with_sovereign_identities {

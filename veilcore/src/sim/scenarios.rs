@@ -10,6 +10,176 @@ mod tests {
 
     use crate::{cfg::NodeRole, sim::SimNetwork};
 
+    // ── two-node IPC stream-forwarding e2e (raw IPC client over the sim) ────────
+    //
+    // Brings up two real `NodeRuntime`s on loopback TCP, each with a plain-Unix
+    // IPC server (`SimNetworkBuilder::with_ipc`), establishes a session, then
+    // drives a cross-node stream with a hand-rolled IPC client (no SDK): bind an
+    // endpoint on B, open A→B, exchange bytes BOTH ways, close. First end-to-end
+    // coverage of the full IPC stream-forwarding chain (the remote-stream
+    // mechanics are otherwise only unit-tested against a mocked broadcaster).
+    mod ipc_stream_e2e {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+        use veil_proto::{
+            AppBindOkPayload, AppBindPayload, AppIpcHelloPayload, FrameFamily, FrameHeader,
+            HEADER_SIZE, LocalAppMsg, STREAM_INITIAL_WINDOW, StreamClosePayload, StreamDataPayload,
+            StreamOpenInboundPayload, StreamOpenOkPayload, StreamOpenPayload, decode_header,
+            encode_header,
+        };
+
+        fn sock_path(node: &crate::sim::SimNode) -> std::path::PathBuf {
+            let uri = node
+                .config
+                .ipc
+                .socket_uri
+                .clone()
+                .expect("with_ipc sets socket_uri");
+            std::path::PathBuf::from(uri.strip_prefix("unix://").expect("unix scheme"))
+        }
+
+        async fn send_frame(s: &mut UnixStream, msg_type: u16, body: &[u8]) {
+            let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, msg_type);
+            hdr.body_len = body.len() as u32;
+            s.write_all(&encode_header(&hdr)).await.unwrap();
+            if !body.is_empty() {
+                s.write_all(body).await.unwrap();
+            }
+        }
+
+        async fn recv_frame(s: &mut UnixStream) -> (FrameHeader, Vec<u8>) {
+            let mut hbuf = [0u8; HEADER_SIZE];
+            s.read_exact(&mut hbuf).await.unwrap();
+            let hdr = decode_header(&hbuf).unwrap();
+            let mut body = vec![0u8; hdr.body_len as usize];
+            if !body.is_empty() {
+                s.read_exact(&mut body).await.unwrap();
+            }
+            (hdr, body)
+        }
+
+        /// Read frames until one of `want` type arrives (skipping unrelated
+        /// pushes such as flow-control window credits), bounded by a timeout.
+        async fn recv_until(s: &mut UnixStream, want: u16) -> Vec<u8> {
+            let fut = async {
+                loop {
+                    let (hdr, body) = recv_frame(s).await;
+                    if hdr.msg_type == want {
+                        return body;
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), fut)
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for IPC msg_type {want}"))
+        }
+
+        async fn hello(s: &mut UnixStream) {
+            let h = AppIpcHelloPayload { version: 1, flags: 0 };
+            send_frame(s, LocalAppMsg::AppHello as u16, &h.encode()).await;
+            let _ = recv_until(s, LocalAppMsg::AppHelloOk as u16).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn ipc_stream_forwards_across_two_nodes() {
+            let mut net = SimNetwork::builder()
+                .nodes(2)
+                .role(NodeRole::Core)
+                .with_ipc()
+                .build()
+                .await;
+            assert!(
+                net.connect(0, 1).await,
+                "nodes 0 and 1 must establish a session"
+            );
+
+            let a_node_id = net.node(0).node_id();
+            let b_node_id = net.node(1).node_id();
+            let a_sock = sock_path(net.node(0));
+            let b_sock = sock_path(net.node(1));
+
+            // ── B binds a named endpoint to accept inbound streams ──────────────
+            let mut b = UnixStream::connect(&b_sock).await.expect("connect B ipc");
+            hello(&mut b).await;
+            const ENDPOINT: u32 = 7;
+            let bind = AppBindPayload {
+                endpoint_id: ENDPOINT,
+                flags: 0, // named (stable app_id = BLAKE3(node_id||ns||name))
+                namespace: b"test.e2e".to_vec(),
+                name: b"acceptor".to_vec(),
+            };
+            send_frame(&mut b, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+            let bind_ok = AppBindOkPayload::decode(
+                &recv_until(&mut b, LocalAppMsg::AppBindOk as u16).await,
+            )
+            .unwrap();
+            let app_id = bind_ok.app_id;
+
+            // ── A opens a stream to B's endpoint ────────────────────────────────
+            let mut a = UnixStream::connect(&a_sock).await.expect("connect A ipc");
+            hello(&mut a).await;
+            let open = StreamOpenPayload {
+                dst_node_id: b_node_id,
+                app_id,
+                endpoint_id: ENDPOINT,
+                initial_window: STREAM_INITIAL_WINDOW,
+            };
+            send_frame(&mut a, LocalAppMsg::StreamOpen as u16, &open.encode()).await;
+
+            // A sees STREAM_OPEN_OK only AFTER B's node accepted over the wire.
+            let ok = StreamOpenOkPayload::decode(
+                &recv_until(&mut a, LocalAppMsg::StreamOpenOk as u16).await,
+            )
+            .unwrap();
+            let stream_id = ok.stream_id;
+
+            // B sees the inbound-stream notification for the same stream_id.
+            let inb = StreamOpenInboundPayload::decode(
+                &recv_until(&mut b, LocalAppMsg::StreamOpenInbound as u16).await,
+            )
+            .unwrap();
+            assert_eq!(
+                inb.stream_id, stream_id,
+                "acceptor stream_id must match opener"
+            );
+            assert_eq!(inb.src_node_id, a_node_id, "inbound src must be node A");
+
+            // ── A → B data ──────────────────────────────────────────────────────
+            let ping = StreamDataPayload {
+                stream_id,
+                data: b"ping".to_vec(),
+            };
+            send_frame(&mut a, LocalAppMsg::StreamData as u16, &ping.encode()).await;
+            let d1 = StreamDataPayload::decode(
+                &recv_until(&mut b, LocalAppMsg::StreamData as u16).await,
+            )
+            .unwrap();
+            assert_eq!(d1.data, b"ping", "B must receive A's bytes");
+
+            // ── B → A data (reply direction) ────────────────────────────────────
+            let pong = StreamDataPayload {
+                stream_id,
+                data: b"pong".to_vec(),
+            };
+            send_frame(&mut b, LocalAppMsg::StreamData as u16, &pong.encode()).await;
+            let d2 = StreamDataPayload::decode(
+                &recv_until(&mut a, LocalAppMsg::StreamData as u16).await,
+            )
+            .unwrap();
+            assert_eq!(d2.data, b"pong", "A must receive B's reply bytes");
+
+            // ── A closes; both sides observe STREAM_CLOSE ───────────────────────
+            let close = StreamClosePayload { stream_id };
+            send_frame(&mut a, LocalAppMsg::StreamClose as u16, &close.encode()).await;
+            let cb = StreamClosePayload::decode(
+                &recv_until(&mut b, LocalAppMsg::StreamClose as u16).await,
+            )
+            .unwrap();
+            assert_eq!(cb.stream_id, stream_id, "acceptor must observe close");
+        }
+    }
+
     // ── 72.3: Churn scenario ───────────────────────────────────────────────────
 
     /// 8-node ring network with 25% node churn: disconnect 2 random-ish nodes
