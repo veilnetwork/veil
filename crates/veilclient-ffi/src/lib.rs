@@ -474,6 +474,28 @@ unsafe fn cstr_to_str<'a>(p: *const c_char) -> Option<&'a str> {
     unsafe { cstr_to_str_with_len(p).map(|(s, _)| s) }
 }
 
+/// Non-elidable wipe of a caller-owned byte buffer at the FFI boundary.
+///
+/// The secret-scrub `ZeroOnDrop` guards below wipe caller buffers (BIP-39
+/// phrases, passwords) that Rust never reads again. A plain `write_bytes`
+/// (memset) on a never-again-read buffer is a dead store the optimizer is
+/// permitted to ELIDE — defeating the very scrub the guard exists for. Writing
+/// each byte through `write_volatile` forbids elision, and the `compiler_fence`
+/// keeps the stores from being reordered past the guard's drop. NULL `ptr` (or
+/// `len == 0`) is a no-op.
+///
+/// # Safety
+/// `ptr` must be valid for writes of `len` bytes, or be NULL.
+unsafe fn volatile_wipe(ptr: *mut u8, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    for i in 0..len {
+        unsafe { core::ptr::write_volatile(ptr.add(i), 0u8) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 /// Classify a PASSWORD C-string argument (diff-audit M26).
 ///
 /// `cstr_to_str` collapses NULL and non-UTF-8 to the same `None`, which for a
@@ -4318,9 +4340,7 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
     }
     impl Drop for ZeroOnDrop {
         fn drop(&mut self) {
-            unsafe {
-                std::ptr::write_bytes(self.ptr, 0, self.len);
-            }
+            unsafe { volatile_wipe(self.ptr, self.len) };
         }
     }
     let _guard = ZeroOnDrop {
@@ -4397,9 +4417,7 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
     }
     impl Drop for ZeroOnDrop {
         fn drop(&mut self) {
-            unsafe {
-                std::ptr::write_bytes(self.ptr, 0, self.len);
-            }
+            unsafe { volatile_wipe(self.ptr, self.len) };
         }
     }
     let _guard = ZeroOnDrop {
@@ -4524,11 +4542,8 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password
     }
     impl Drop for ZeroOnDrop {
         fn drop(&mut self) {
-            if !self.ptr.is_null() {
-                unsafe {
-                    std::ptr::write_bytes(self.ptr, 0, self.len);
-                }
-            }
+            // `volatile_wipe` is NULL-safe.
+            unsafe { volatile_wipe(self.ptr, self.len) };
         }
     }
 
