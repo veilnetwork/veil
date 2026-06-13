@@ -170,7 +170,6 @@ mod tests {
 
     // ── 251.2: event log records topology events ─────────────────────────────
 
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 
     async fn event_log_records_connect_and_disconnect() {
@@ -292,7 +291,6 @@ mod tests {
 
     // ── 251.4: scenario parameterization ──────────────────────────────────────
 
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 
     async fn scenario_ring_produces_n_links() {

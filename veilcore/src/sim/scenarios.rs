@@ -16,7 +16,6 @@ mod tests {
     /// reconnect them, and verify the ring converges back to full connectivity.
     ///
     /// Scaled down from the 20-node / 30%-churn spec so the test suite stays fast.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn churn_ring_reconverges() {
         let n = 8;
@@ -58,7 +57,6 @@ mod tests {
 
     /// Split a 6-node ring into two halves, verify partition, then heal and
     /// verify that both halves reconnect.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn partition_and_heal() {
         let mut net = SimNetwork::builder()
@@ -231,7 +229,6 @@ mod tests {
     /// Verify that peer count in config is respected: after adding many peers to
     /// a node's config, the peer list reflects the entries (quota enforcement is
     /// at the dispatcher/mailbox layer, not network layer).
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multi_peer_config_reflects_all_peers() {
         let n = 4;
@@ -343,7 +340,6 @@ mod tests {
     /// timeout and verifies that at least one side closes the session.
     ///
     /// Uses `SimNetworkBuilder::session` to inject a short timeout.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_timeout_closes_dead_session() {
         use crate::cfg::SessionConfig;
@@ -524,7 +520,6 @@ mod tests {
     /// A mixed network: 2 Core nodes form a backbone, 2 Leaf nodes connect to
     /// separate Core nodes. Verifies that different-role nodes can establish
     /// sessions (Core ↔ Core and Core ↔ Leaf links).
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mixed_core_and_leaf_segments() {
         use crate::cfg::NodeRole;
@@ -1227,7 +1222,6 @@ mod tests {
     /// like the library-layer `integration_tests.rs`. Gates
     /// follow-up slices that layer name-resolution, mailbox
     /// delivery, and multi-instance fan-out on top.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sovereign_identity_two_nodes_establish_session() {
         let n = 2;
@@ -1374,7 +1368,6 @@ mod tests {
     /// Closes the cross-node resolution gap flagged by the
     /// `sovereign_identity_name_claim_publishes_locally`
     /// scenario above.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sovereign_identity_name_resolves_over_dht() {
         use crate::cfg::DhtConfig;
@@ -1559,7 +1552,6 @@ mod tests {
     /// `identity_sk`). Sessions still establish over real TCP
     /// because session-layer node_id is built from the legacy
     /// per-device keypair, not the sovereign identity.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sovereign_identity_master_seed_restore_preserves_node_id() {
         let mut net = SimNetwork::builder()
@@ -1869,7 +1861,6 @@ mod tests {
     /// cached binding when the handshake skipped the proof
     /// exchange. Both sessions now populate `by_identity_instance`
     /// and `Recipient::All` fans out to both.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sovereign_identity_instance_tag_survives_runtime_layer() {
         use crate::proto::delivery::DeliveryEnvelope;
@@ -2083,7 +2074,6 @@ mod tests {
     /// usual `create_identity` pre-flight — proving the runtime's
     /// standalone-mode bootstrap path actually does the right thing
     /// in real-TCP wiring.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sovereign_standalone_mode_works_without_master() {
         let n = 2;
@@ -2872,12 +2862,15 @@ mod tests {
         // target's routing table with H-1 honest contacts BEFORE any
         // sybil joins. Real-world analogue: operator boots a fresh
         // network of trusted seeds before opening it to the public.
-        for a in 0..honest_count {
-            for b in (a + 1)..honest_count {
-                let ok = net.connect(a, b).await;
-                assert!(ok, "honest backbone {a}-{b} must connect");
-            }
-        }
+        let backbone: Vec<(usize, usize)> = (0..honest_count)
+            .flat_map(|a| ((a + 1)..honest_count).map(move |b| (a, b)))
+            .collect();
+        // One convergence pass for the whole honest mesh (vs. O(H^2)
+        // per-pair re-convergences, which are slow + flaky under suite load).
+        assert!(
+            net.connect_all(&backbone).await,
+            "honest backbone must fully connect",
+        );
         // Allow the honest backbone to settle.
         for i in 0..honest_count {
             let _ = net
@@ -2904,9 +2897,9 @@ mod tests {
         // pattern. Sybils don't dial each other (no benefit to the
         // attacker; they're all colluding) and don't dial other honest
         // peers (more aggressive variants belong in a follow-up).
-        for s in honest_count..total {
-            let _ = net.connect(target_idx, s).await;
-        }
+        let sybil_pairs: Vec<(usize, usize)> =
+            (honest_count..total).map(|s| (target_idx, s)).collect();
+        let _ = net.connect_all(&sybil_pairs).await;
         // Settle: target should now have honest backbone + sybil sessions.
         let _ = net
             .node(target_idx)
@@ -2980,7 +2973,6 @@ mod tests {
     // achievable bound; a 10 %-sybil variant would require ≥ 20 nodes
     // (1 sybil out of 10 wouldn't even have measurable per-target
     // fraction, so we'd need to scale up).
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic485_1b_eclipse_rate_under_low_sybil_fraction_meets_spec_bound() {
         let honest_count = 8;
@@ -2996,12 +2988,15 @@ mod tests {
 
         // Honest backbone: full mesh among honest nodes. Every honest
         // sees every other honest as a configured peer + live session.
-        for a in 0..honest_count {
-            for b in (a + 1)..honest_count {
-                let ok = net.connect(a, b).await;
-                assert!(ok, "honest backbone {a}-{b} must connect");
-            }
-        }
+        let backbone: Vec<(usize, usize)> = (0..honest_count)
+            .flat_map(|a| ((a + 1)..honest_count).map(move |b| (a, b)))
+            .collect();
+        // One convergence pass for the whole honest mesh (vs. O(H^2)
+        // per-pair re-convergences, which are slow + flaky under suite load).
+        assert!(
+            net.connect_all(&backbone).await,
+            "honest backbone must fully connect",
+        );
         for i in 0..honest_count {
             let _ = net
                 .node(i)
@@ -3015,12 +3010,12 @@ mod tests {
 
         // Sybil arrival: every sybil dials every honest. This is the
         // worst-case low-fraction attack pattern — every honest target
-        // ends up with both sybils as direct contacts.
-        for s in honest_count..total {
-            for h in 0..honest_count {
-                let _ = net.connect(s, h).await;
-            }
-        }
+        // ends up with both sybils as direct contacts. One convergence pass
+        // for the full S×H flood (vs. O(S·H) per-pair re-convergences).
+        let sybil_pairs: Vec<(usize, usize)> = (honest_count..total)
+            .flat_map(|s| (0..honest_count).map(move |h| (s, h)))
+            .collect();
+        let _ = net.connect_all(&sybil_pairs).await;
         // Settle: each honest now expects (honest_count - 1) honest
         // sessions + sybil_count sybil sessions.
         let expected_sessions = honest_count - 1 + sybil_count;
@@ -3142,12 +3137,15 @@ mod tests {
         // arrival timing (honest already in the target's RT, sybils
         // dial). If Kademlia is recent-arrival-biased, this is
         // exactly when sybils get an unfair advantage.
-        for a in 0..honest_count {
-            for b in (a + 1)..honest_count {
-                let ok = net.connect(a, b).await;
-                assert!(ok, "honest backbone {a}-{b} must connect");
-            }
-        }
+        let backbone: Vec<(usize, usize)> = (0..honest_count)
+            .flat_map(|a| ((a + 1)..honest_count).map(move |b| (a, b)))
+            .collect();
+        // One convergence pass for the whole honest mesh (vs. O(H^2)
+        // per-pair re-convergences, which are slow + flaky under suite load).
+        assert!(
+            net.connect_all(&backbone).await,
+            "honest backbone must fully connect",
+        );
         for i in 0..honest_count {
             let _ = net
                 .node(i)
@@ -3160,9 +3158,9 @@ mod tests {
         // Sybil flood: every sybil dials the target. At H == S this is
         // the most aggressive arrival pattern (5 fresh contacts hitting
         // the target's RT in a tight window).
-        for s in honest_count..total {
-            let _ = net.connect(target_idx, s).await;
-        }
+        let sybil_pairs: Vec<(usize, usize)> =
+            (honest_count..total).map(|s| (target_idx, s)).collect();
+        let _ = net.connect_all(&sybil_pairs).await;
         // Settle: target = (honest_count - 1) honest sessions + sybil_count sybil.
         let _ = net
             .node(target_idx)
@@ -3222,7 +3220,6 @@ mod tests {
     // regression observed in production OR new attack class published
     // showing prefix-grinding succeeds against current routing-table
     // shape" — this scenario regression-protects that gate.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic485_1d_prefix_grinded_sybils_still_bounded_by_eclipse_cap() {
         let honest_count = 8;
@@ -3293,12 +3290,15 @@ mod tests {
         }
 
         // Stage 1 — honest backbone (same as 485.1.b).
-        for a in 0..honest_count {
-            for b in (a + 1)..honest_count {
-                let ok = net.connect(a, b).await;
-                assert!(ok, "honest backbone {a}-{b} must connect");
-            }
-        }
+        let backbone: Vec<(usize, usize)> = (0..honest_count)
+            .flat_map(|a| ((a + 1)..honest_count).map(move |b| (a, b)))
+            .collect();
+        // One convergence pass for the whole honest mesh (vs. O(H^2)
+        // per-pair re-convergences, which are slow + flaky under suite load).
+        assert!(
+            net.connect_all(&backbone).await,
+            "honest backbone must fully connect",
+        );
         for i in 0..honest_count {
             let _ = net
                 .node(i)
@@ -3315,9 +3315,9 @@ mod tests {
         // construction — they are now "close" in Kademlia keyspace,
         // landing in the same bucket the target uses for its closest
         // lookups.
-        for s in honest_count..total {
-            let _ = net.connect(target_idx, s).await;
-        }
+        let sybil_pairs: Vec<(usize, usize)> =
+            (honest_count..total).map(|s| (target_idx, s)).collect();
+        let _ = net.connect_all(&sybil_pairs).await;
         let _ = net
             .node(target_idx)
             .wait_sessions(honest_count - 1 + sybil_count, Duration::from_secs(15))
@@ -3490,7 +3490,7 @@ mod tests {
     /// check explicitly closes — `verify_identity_document` alone would
     /// happily accept alice's fully-valid document; the resolver has to
     /// know the caller asked for bob and reject the answer.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
+    #[ignore = "resolve_identity_verified does not resolve the happy-path replicated doc in-sim (same DHT-resolution gap as epic490_resolve_name_*; separate from E20 wire convergence, which now passes)"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn epic490_resolve_identity_verified_rejects_tampered_doc() {
         use crate::proto::identity_document::IdentityDocument;
@@ -4176,7 +4176,6 @@ mod tests {
     /// `bundle_bytes` or signature region) makes `verify` fail
     /// with `Verify` — N2 cannot be tricked into merging
     /// attacker-injected peers.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn epic492_signed_bundle_distributes_and_verifies_cross_node() {
         use crate::cfg::BootstrapPeer;
@@ -4414,7 +4413,6 @@ mod tests {
     /// * Without NAT-traversal coordination, A and B would have NO way
     /// to learn each other's candidates — this test is the regression
     /// bar for that capability.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic483_3_nat_traversal_coordination_round_trip() {
         use crate::proto::control::{NatCandidate, candidate_type};
@@ -4537,7 +4535,7 @@ mod tests {
     /// This is the regression bar. Future code that "cleans up
     /// peer_tickets on session close" will trip the assertion at
     /// step 5 → caught at PR time.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
+    #[ignore = "SESSION_TICKET does not propagate to both sides in-sim (2-node mesh wires fine; this is a ticket-exchange gap separate from E20 wire convergence)"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic483_4_session_ticket_survives_transport_reconnect() {
         let mut net = SimNetwork::builder()
@@ -4954,7 +4952,9 @@ mod tests {
     /// path (no regression on the happy path) (b) signaling +
     /// candidate promotion + real dial all chain into one
     /// production-callable function.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
+    #[ignore = "flaky (~30% green even isolated): the NAT-fallback connect_peer_active dial \
+                via coordinator C is timing-sensitive, independent of E20 wire convergence \
+                (the wire_star setup converges fine); needs a deterministic fallback-dial harness"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic483_3_slice3_outbound_dial_failure_auto_triggers_nat_fallback() {
         let mut net = SimNetwork::builder()
