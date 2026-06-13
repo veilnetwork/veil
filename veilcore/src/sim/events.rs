@@ -253,7 +253,6 @@ mod tests {
 
     // ── 251.3: replay ─────────────────────────────────────────────────────────
 
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 
     async fn replay_produces_same_active_links() {
@@ -314,7 +313,6 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 
     async fn scenario_full_mesh_produces_correct_links() {
