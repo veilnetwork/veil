@@ -375,11 +375,7 @@ impl NodeRuntime {
         // so the operator knows a restart is required (it was previously silently
         // ignored).
         {
-            let new_target = config
-                .session
-                .max_concurrent
-                .saturating_mul(4)
-                .max(1024);
+            let new_target = config.session.max_concurrent.saturating_mul(4).max(1024);
             if new_target != self.inbound_handshake_sem_target {
                 self.logger.warn(
                     "config.session.handshake_admission_reload_ignored",
