@@ -1034,6 +1034,15 @@ pub enum RelayChainMsg {
     /// Tear down a circuit + free its per-hop state. Body is
     /// `CircuitTeardownPayload`.
     CircuitTeardown = 6,
+    /// Terminus → originator: an end-to-end ACK that the circuit was fully
+    /// established (diff-audit Δ2-d). Emitted by the terminus when it installs
+    /// its circuit state, routed back down the return path (each hop re-tags it
+    /// like a return cell); the originator marks the circuit CONFIRMED. Body is
+    /// `CircuitBuiltPayload`. Purely additive: an originator that never receives
+    /// it (dead hop, or a pre-Δ2-d terminus) re-selects the path on the next
+    /// rebuild rather than trusting a possibly-dead frozen one — the circuit
+    /// itself stays usable in the meantime (build is still optimistic).
+    CircuitBuilt = 7,
 }
 
 impl TryFrom<u16> for RelayChainMsg {
@@ -1047,6 +1056,7 @@ impl TryFrom<u16> for RelayChainMsg {
             4 => Ok(RelayChainMsg::CircuitBuild),
             5 => Ok(RelayChainMsg::CircuitData),
             6 => Ok(RelayChainMsg::CircuitTeardown),
+            7 => Ok(RelayChainMsg::CircuitBuilt),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::RelayChain as u8,
                 msg_type: v,
@@ -1064,7 +1074,8 @@ mod tests {
     #[test]
     fn relay_chain_msg_discriminants_and_roundtrip() {
         // Wire-format gate: existing discriminants are frozen; the circuit
-        // variants (4–6) are the onion-registration / 482.7 return-path epic.
+        // variants (4–7) are the onion-registration / 482.7 return-path epic
+        // (CircuitBuilt=7 is the diff-audit Δ2-d establishment ACK).
         let all = [
             (RelayChainMsg::Hop, 0u16),
             (RelayChainMsg::RegisterRendezvous, 1),
@@ -1073,12 +1084,13 @@ mod tests {
             (RelayChainMsg::CircuitBuild, 4),
             (RelayChainMsg::CircuitData, 5),
             (RelayChainMsg::CircuitTeardown, 6),
+            (RelayChainMsg::CircuitBuilt, 7),
         ];
         for (variant, disc) in all {
             assert_eq!(variant as u16, disc);
             assert_eq!(RelayChainMsg::try_from(disc).unwrap(), variant);
         }
-        assert!(RelayChainMsg::try_from(7).is_err());
+        assert!(RelayChainMsg::try_from(8).is_err());
     }
 
     #[test]

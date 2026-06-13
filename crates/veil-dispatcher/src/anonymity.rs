@@ -116,6 +116,7 @@ impl FrameDispatcher {
             RelayChainMsg::CircuitBuild => return self.handle_circuit_build(body, node_id),
             RelayChainMsg::CircuitData => return self.handle_circuit_data(body, node_id),
             RelayChainMsg::CircuitTeardown => return self.handle_circuit_teardown(body, node_id),
+            RelayChainMsg::CircuitBuilt => return self.handle_circuit_built(body, node_id),
         }
 
         if body.len() != CELL_SIZE {
@@ -624,6 +625,19 @@ impl FrameDispatcher {
                     Ok(c) => c,
                     Err(_) => return DispatchResult::NoResponse,
                 };
+                // Δ2-d: ACK the originator that the circuit is fully established.
+                // Routed back down the return path (toward prev_link, re-tagged
+                // per hop like a return data cell); the originator marks it
+                // CONFIRMED. Emitted on install — independent of whether the
+                // piggy-backed registration below parses.
+                let ack = veil_anonymity::circuit_wire::CircuitBuiltPayload {
+                    circuit_id: circuit.circuit_id_in,
+                };
+                self.send_relay_chain_msg(
+                    &NodeId::from(prev_link),
+                    RelayChainMsg::CircuitBuilt,
+                    &ack.encode(),
+                );
                 // The terminus payload is a signed circuit-rendezvous
                 // registration: bind its cookie → this circuit (cookie-keyed,
                 // first-wins; R never learns the receiver's node_id). A bad
@@ -756,6 +770,51 @@ impl FrameDispatcher {
         }
 
         // Unknown circuit — anti-leak silent drop.
+        DispatchResult::NoResponse
+    }
+
+    /// `RelayChainMsg::CircuitBuilt` (diff-audit Δ2-d): the terminus's
+    /// establishment ACK, travelling RETURN-ward toward the originator. An
+    /// intermediate hop re-tags + forwards it (mirroring the return data path);
+    /// the originator marks its origin circuit CONFIRMED.
+    fn handle_circuit_built(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
+        use veil_anonymity::circuit_wire::CircuitBuiltPayload;
+        let p = match CircuitBuiltPayload::decode(body) {
+            Ok(p) => p,
+            Err(_) => return DispatchResult::NoResponse,
+        };
+        let link = *node_id.as_bytes();
+
+        // Intermediate hop: the ACK arrived from next_link tagged circuit_id_out
+        // → forward toward the originator (prev_link), re-tagged circuit_id_in.
+        if let Some(table) = &self.circuit_table
+            && let Some(state) = table.lookup_backward(&link, p.circuit_id)
+        {
+            let out = CircuitBuiltPayload {
+                circuit_id: state.circuit_id_in,
+            };
+            self.send_relay_chain_msg(
+                &NodeId::from(state.prev_link),
+                RelayChainMsg::CircuitBuilt,
+                &out.encode(),
+            );
+            return DispatchResult::NoResponse;
+        }
+
+        // Originator: this node BUILT the circuit (return cells arrive from the
+        // first hop tagged our origin circuit_id) → mark it CONFIRMED so the
+        // maintenance tick keeps this (proven-live) path instead of re-selecting.
+        if let Some(origin) = self
+            .circuit_origin
+            .as_ref()
+            .and_then(|t| t.lookup(&link, p.circuit_id))
+        {
+            origin.mark_confirmed();
+            self.logger.info(
+                "anonymity.circuit.confirmed",
+                "origin circuit confirmed by terminus CircuitBuilt ACK",
+            );
+        }
         DispatchResult::NoResponse
     }
 
@@ -1511,6 +1570,7 @@ mod tests {
                 first_hop: r_id,
                 origin_circuit_id: origin_cid,
                 created_unix: 0,
+                confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }));
 
         // The sealed introduce the sender produced (sealed to OUR anonymity key).
@@ -1558,6 +1618,49 @@ mod tests {
             }
             other => panic!("expected Deliver, got {other:?}"),
         }
+    }
+
+    /// diff-audit Δ2-d: a `CircuitBuilt` ACK arriving from the first hop, tagged
+    /// with our origin circuit id, marks that origin circuit CONFIRMED.
+    #[test]
+    fn circuit_built_ack_confirms_origin_circuit_delta2d() {
+        use veil_anonymity::circuit_origin::{OriginCircuit, OriginCircuitTable};
+        use veil_anonymity::circuit_wire::CircuitBuiltPayload;
+
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        d.circuit_origin = Some(std::sync::Arc::new(OriginCircuitTable::new()));
+
+        let r_id = [0x9C; 32];
+        let origin_cid = 555u32;
+        let confirmed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        d.circuit_origin
+            .as_ref()
+            .unwrap()
+            .insert(std::sync::Arc::new(OriginCircuit {
+                circuit_keys: vec![[0x33u8; 32]],
+                first_hop: r_id,
+                origin_circuit_id: origin_cid,
+                created_unix: 0,
+                confirmed: std::sync::Arc::clone(&confirmed),
+            }));
+        assert!(!confirmed.load(std::sync::atomic::Ordering::Relaxed));
+
+        // The terminus ACK arrives from the first hop tagged our origin id.
+        let body = CircuitBuiltPayload {
+            circuit_id: origin_cid,
+        }
+        .encode();
+        let mut hdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitBuilt as u16,
+        );
+        hdr.body_len = body.len() as u32;
+        d.dispatch_relay_chain(&hdr, &body, NodeId::from(r_id));
+
+        assert!(
+            confirmed.load(std::sync::atomic::Ordering::Relaxed),
+            "CircuitBuilt ACK must confirm the origin circuit",
+        );
     }
 
     /// A non-circuit-capable node (no SK / table) silently drops CircuitBuild.

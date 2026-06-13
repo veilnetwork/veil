@@ -6416,6 +6416,30 @@ mod tests {
             other => panic!("expected Deliver, got {other:?}"),
         }
 
+        // diff-audit Δ2-d: the terminus's CircuitBuilt ACK travels back up the
+        // circuit (R → mid → S) and confirms the service's origin circuit. The
+        // circuit is proven up (delivery succeeded), so the ACK (emitted once
+        // when R installed) has had time to return — poll the flag.
+        let mut confirmed = false;
+        for _ in 0..50 {
+            let is_conf = {
+                let svc = net.node(4).runtime.access();
+                let svcs = svc.anonymity.onion_services.lock().unwrap();
+                svcs.first()
+                    .map(|e| e.confirmed.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(false)
+            };
+            if is_conf {
+                confirmed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            confirmed,
+            "service's origin circuit must be CONFIRMED by the terminus CircuitBuilt ACK",
+        );
+
         net.stop().await;
     }
 

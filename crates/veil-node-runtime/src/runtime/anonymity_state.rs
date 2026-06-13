@@ -254,6 +254,14 @@ pub struct OnionServiceEntry {
     /// hit `CookieClaimed` against this service's own prior registration. Reusing
     /// the same reg_pk reaches the registry's same-key refresh path instead.
     pub reg_keypair: veil_crypto::GeneratedKeyPair,
+
+    /// Establishment-confirmation flag of the CURRENT circuit (diff-audit Δ2-d):
+    /// shared with the dispatcher's `OriginCircuit`, set when the terminus's
+    /// `CircuitBuilt` ACK arrives. The maintenance tick re-selects a fresh relay
+    /// path on rebuild if the last circuit was never confirmed (a dead hop or a
+    /// pre-Δ2-d terminus) instead of rebuilding the same possibly-dead path.
+    /// Replaced on every (re)build with the new circuit's flag.
+    pub confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AnonymityState {
