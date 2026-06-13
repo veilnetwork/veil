@@ -2118,11 +2118,7 @@ impl NodeRuntime {
             inbound_handshake_sem: Arc::new(tokio::sync::Semaphore::new(
                 config.session.max_concurrent.saturating_mul(4).max(1024),
             )),
-            inbound_handshake_sem_target: config
-                .session
-                .max_concurrent
-                .saturating_mul(4)
-                .max(1024),
+            inbound_handshake_sem_target: config.session.max_concurrent.saturating_mul(4).max(1024),
             mlkem_dk_seed,
             pending_diag: Arc::clone(&shared_pending_diag),
             // H10 stage-B (4/N): 16 session-config knobs collapsed
