@@ -317,30 +317,70 @@ impl SimNetwork {
         established
     }
 
+    /// Connect MANY pairs in a SINGLE convergence pass.
+    ///
+    /// `connect()` re-converges the whole network on every call (so the
+    /// strand-free invariant holds for incremental adds), which makes building
+    /// a mesh via a nested `connect()` loop O(pairs × N) reloads — too slow
+    /// under concurrent suite load. `connect_all` inserts every edge first and
+    /// converges ONCE (O(N) reloads total), then reports whether every
+    /// newly-added pair established. Use it whenever a test brings up several
+    /// links at once (e.g. an honest backbone before a sybil flood).
+    pub async fn connect_all(&mut self, pairs: &[(usize, usize)]) -> bool {
+        let mut added: Vec<(usize, usize)> = Vec::new();
+        for &(a, b) in pairs {
+            let key = (a.min(b), a.max(b));
+            if self.links.insert(key) {
+                added.push((a, b));
+            }
+        }
+        self.converge_links_descending().await;
+
+        let mut all_ok = true;
+        for &(a, b) in &added {
+            let a_id = self.nodes[a].node_id();
+            let b_id = self.nodes[b].node_id();
+            let ok = self.nodes[a]
+                .wait_session_to(b_id, Duration::from_secs(5))
+                .await
+                && self.nodes[b]
+                    .wait_session_to(a_id, Duration::from_secs(5))
+                    .await;
+            if ok {
+                let key = (a.min(b), a.max(b));
+                self.record(SimEvent::NodeConnected { a: key.0, b: key.1 });
+            } else {
+                all_ok = false;
+            }
+        }
+        all_ok
+    }
+
     /// Disconnect nodes `a` and `b`.
     ///
-    /// Removes each from the other's peer list and reloads both.
+    /// Removes the edge and re-converges the remaining link set (forcing a
+    /// reload of `a` and `b` so the orphaned session is torn down even if
+    /// either drops to zero links). Re-converging the survivors via the
+    /// descending-node_id pass is what keeps the OTHER sessions of `a`/`b`
+    /// alive — the old "reload only a and b" stranded any survivor that was the
+    /// canonical dialer into a reloaded endpoint (Phase E20).
     pub async fn disconnect(&mut self, a: usize, b: usize) {
         let key = (a.min(b), a.max(b));
         let was_connected = self.links.remove(&key);
-        let b_key = self.nodes[b].node_id();
+
+        self.converge_with_forced(&[a, b]).await;
+
+        // Positive teardown wait: confirm the a↔b session is actually gone
+        // (replaces a fixed 200ms sleep). 5s is ample on loopback.
         let a_key = self.nodes[a].node_id();
+        let b_key = self.nodes[b].node_id();
+        let _ = self.nodes[a]
+            .wait_no_session_to(b_key, Duration::from_secs(5))
+            .await;
+        let _ = self.nodes[b]
+            .wait_no_session_to(a_key, Duration::from_secs(5))
+            .await;
 
-        let mut config_a = self.nodes[a].config.clone();
-        config_a.peers.retain(|p| {
-            // Remove peers whose transport points to b's listen addr
-            !p.transport.contains(&self.nodes[b].listen_addr)
-        });
-        let mut config_b = self.nodes[b].config.clone();
-        config_b
-            .peers
-            .retain(|p| !p.transport.contains(&self.nodes[a].listen_addr));
-
-        let _ = self.nodes[a].reload_with(config_a).await;
-        let _ = self.nodes[b].reload_with(config_b).await;
-        // Brief pause for sessions to close
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let _ = (a_key, b_key); // suppress unused warnings
         if was_connected {
             self.record(SimEvent::NodeDisconnected { a: key.0, b: key.1 });
         }
@@ -350,18 +390,39 @@ impl SimNetwork {
     /// the two sets.
     ///
     /// `group_a` and `group_b` are indices; all links between them are removed.
+    /// All crossing edges are removed from `self.links` up front and the
+    /// network is re-converged ONCE (forcing a reload of every involved
+    /// endpoint), rather than re-converging per pair.
     pub async fn partition(&mut self, group_a: &[usize], group_b: &[usize]) {
         let mut pairs = Vec::new();
         for &a in group_a {
             for &b in group_b {
                 let key = (a.min(b), a.max(b));
-                if self.links.contains(&key) {
+                if self.links.remove(&key) {
                     pairs.push((a, b));
                 }
             }
         }
-        for (a, b) in pairs {
-            self.disconnect(a, b).await;
+        // Force-reload every endpoint of a removed edge (so each orphaned
+        // session is torn down even if the node now has zero links), then
+        // re-converge survivors in one descending-node_id pass.
+        let mut forced: Vec<usize> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+        forced.sort_unstable();
+        forced.dedup();
+        self.converge_with_forced(&forced).await;
+
+        // Confirm each crossing session is gone, then record.
+        for &(a, b) in &pairs {
+            let a_key = self.nodes[a].node_id();
+            let b_key = self.nodes[b].node_id();
+            let _ = self.nodes[a]
+                .wait_no_session_to(b_key, Duration::from_secs(5))
+                .await;
+            let _ = self.nodes[b]
+                .wait_no_session_to(a_key, Duration::from_secs(5))
+                .await;
+            let key = (a.min(b), a.max(b));
+            self.record(SimEvent::NodeDisconnected { a: key.0, b: key.1 });
         }
         self.record(SimEvent::Partition {
             group_a: group_a.to_vec(),
@@ -465,6 +526,19 @@ impl SimNetwork {
     /// repeatedly (e.g. incremental `connect`) don't re-record already-present
     /// edges every pass.
     async fn converge_links_descending(&mut self) -> Vec<bool> {
+        self.converge_with_forced(&[]).await
+    }
+
+    /// As [`converge_links_descending`], but additionally force-reload the
+    /// nodes in `forced` even if they now have ZERO links. Edge REMOVAL
+    /// (`disconnect` / `partition`) needs this: a node that just lost its only
+    /// link still holds a stale session that must be torn down, but the normal
+    /// pass skips degree-0 nodes (nothing to converge). Forcing the reload of
+    /// the just-affected endpoints drops their now-orphaned sessions while the
+    /// descending-node_id order still lets every surviving canonical dialer
+    /// re-dial after its partner is back up (so disconnect doesn't strand the
+    /// survivors the way the old pairwise reload did).
+    async fn converge_with_forced(&mut self, forced: &[usize]) -> Vec<bool> {
         let n = self.nodes.len();
         if n == 0 {
             return Vec::new();
@@ -490,9 +564,11 @@ impl SimNetwork {
                 }
             }
         }
-        // Reload order: descending node_id (smallest node reloads LAST). Skip
-        // link-less nodes — no session to converge and no reason to churn them.
-        let mut order: Vec<usize> = (0..n).filter(|&i| degree[i] > 0).collect();
+        // Reload set: every linked node, plus any `forced` (degree-0) endpoint.
+        // Order: descending node_id (smallest node reloads LAST).
+        let mut order: Vec<usize> = (0..n)
+            .filter(|&i| degree[i] > 0 || forced.contains(&i))
+            .collect();
         order.sort_by(|&x, &y| self.nodes[y].node_id().cmp(&self.nodes[x].node_id()));
         let mut configs: Vec<Option<_>> = configs.into_iter().map(Some).collect();
         for &i in &order {
@@ -500,7 +576,8 @@ impl SimNetwork {
                 let _ = self.nodes[i].reload_with(cfg).await;
             }
         }
-        // Convergence: each node should reach `degree[i]` sessions.
+        // Convergence: each node should reach `degree[i]` sessions (a forced
+        // degree-0 node trivially satisfies `>= 0` once reloaded).
         let mut converged = vec![false; n];
         for &i in &order {
             converged[i] = self.nodes[i]
@@ -1173,7 +1250,6 @@ mod tests {
     }
 
     /// Disconnect should remove sessions.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disconnect_removes_session() {
         let mut net = SimNetwork::builder()
@@ -1215,7 +1291,6 @@ mod tests {
     // ── 72.2: Configurable topology ─────────────────────────────────────────────
 
     /// Ring topology: 4 nodes → 4 links, each node has exactly 2 sessions.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ring_topology() {
         let mut net = SimNetwork::builder()
@@ -1258,7 +1333,6 @@ mod tests {
     }
 
     /// Full mesh: 4 nodes → 6 links, each node eventually has 3 sessions.
-    #[ignore = "Phase E20 directional dedup: SimNetwork random identities cause ~50% pairwise-session establishment failure; see audit batch 2026-05-24"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_mesh_topology() {
         let mut net = SimNetwork::builder()
