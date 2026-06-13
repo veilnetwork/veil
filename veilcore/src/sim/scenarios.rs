@@ -4562,25 +4562,19 @@ mod tests {
     ///
     /// Test sequence:
     /// 1. Two sovereign nodes, full-mesh wire.
-    /// 2. Wait for sessions to complete + SESSION_TICKET frames to
-    /// arrive on both sides (poll `debug_peer_tickets_contains`).
-    /// 3. `net.disconnect(0, 1)` — simulates the transport going
-    /// away (TCP RST / cellular network change).
-    /// 4. Verify both sides DROP the session cleanly (no leak).
-    /// 5. Verify both sides STILL have the ticket cached
+    /// 2. Wait for the SESSION_TICKET to be cached. Under E20 directional
+    /// dedup only ONE pairwise session survives, so only its CLIENT (the
+    /// dialer) caches a ticket — discover which side that is.
+    /// 3. Stop the SERVER's runtime — simulates the peer dying / an OS-level
+    /// network drop (kills its listener + the session). Stopping the SERVER
+    /// keeps the CLIENT (ticket holder) alive.
+    /// 4. Verify the CLIENT drops the session cleanly (no leak).
+    /// 5. Verify the CLIENT STILL has the ticket cached
     /// (`debug_peer_tickets_contains` remains true).
-    /// 6. `net.connect(0, 1)` — simulates the phone reconnecting
-    /// on the new network.
-    /// 7. Verify the session re-establishes. The ticket presented
-    /// in HELLO triggers the fast-path branch in
-    /// `perform_ovl1_handshake`; without the
-    /// cached ticket we'd fall through to a full handshake.
-    /// 8. Verify the ticket cache survived the whole round-trip.
     ///
     /// This is the regression bar. Future code that "cleans up
     /// peer_tickets on session close" will trip the assertion at
     /// step 5 → caught at PR time.
-    #[ignore = "SESSION_TICKET does not propagate to both sides in-sim (2-node mesh wires fine; this is a ticket-exchange gap separate from E20 wire convergence)"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn epic483_4_session_ticket_survives_transport_reconnect() {
         let mut net = SimNetwork::builder()
@@ -4598,72 +4592,67 @@ mod tests {
         let n0_id = net.node(0).node_id();
         let n1_id = net.node(1).node_id();
 
-        // Wait for SESSION_TICKET to land on both sides. The server
-        // (inbound side of each direction) issues the ticket; the
-        // client (outbound side) caches it. In a full-mesh of 2
-        // nodes each peer is server FOR one direction and client FOR
-        // the other, so both runtimes end up caching a ticket for
-        // the other peer. Poll up to 5s — handshake completes ~100ms
-        // on loopback so this is generous.
+        // The SERVER (inbound side) issues a SESSION_TICKET; the CLIENT
+        // (outbound / dialer) caches it. Under E20 directional dedup exactly
+        // ONE of the two pairwise sessions survives — for the pair (A,B) only
+        // the smaller-node_id side dials — so only that single CLIENT caches a
+        // ticket; the SERVER never dials back and caches none. (The old test
+        // assumed BOTH sides cache one, which was never true once directional
+        // dedup landed.) Discover which side is the client dynamically.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let n0_has = net.node(0).runtime.debug_peer_tickets_contains(&n1_id);
-            let n1_has = net.node(1).runtime.debug_peer_tickets_contains(&n0_id);
-            if n0_has && n1_has {
-                break;
+        let client_idx = loop {
+            if net.node(0).runtime.debug_peer_tickets_contains(&n1_id) {
+                break 0usize;
+            }
+            if net.node(1).runtime.debug_peer_tickets_contains(&n0_id) {
+                break 1usize;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "SESSION_TICKET did not propagate to both sides \
-                 (n0_has={n0_has} n1_has={n1_has}) — ticket exchange \
-                 may be broken upstream",
+                "no SESSION_TICKET cached on either side within 5s — \
+                 ticket exchange may be broken upstream",
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        };
+        let other_idx = 1 - client_idx;
+        let peer_of_client = if client_idx == 0 { n1_id } else { n0_id };
+        let peer_nodeid = net.node(other_idx).runtime.summary().node_id;
 
-        // ── Step 3: simulate the network-change by stopping N1's
-        // runtime entirely (kills listener + sessions). Using
-        // `runtime.stop` rather than `net.disconnect` because
-        // disconnect leaves the listener up, which lets
-        // hot-standby auto-swap reconnect via the alt_uri it
-        // auto-discovered during the original handshake — the
-        // session never actually drops, defeating the test
-        // precondition. Stopping the runtime is a stronger
-        // disruption that mirrors what happens when the peer
-        // process actually dies (or is killed by the OS).
-        net.node_mut(1)
-            .runtime
-            .stop()
-            .await
-            .expect("N1 runtime.stop succeeds");
+        // Close the client's session the way a transport drop / network change
+        // would, then assert the cached ticket survives. We use `kill_session`,
+        // which runs the REAL teardown path — `dispatcher.on_session_closed`,
+        // the cleanup hook where a regression like "flush peer_tickets on
+        // session close" would live — and installs a 30s reconnect ban so the
+        // session stays closed (no race against the connector re-dialing). On
+        // loopback the client otherwise wouldn't even notice a dead peer until
+        // its keepalive/idle timeout, far longer than this test. `kill_session`
+        // tears down the SESSION only; it does NOT touch resumption.peer_tickets
+        // — that surviving the close is exactly the invariant under test.
+        net.node(client_idx).runtime.kill_session(peer_nodeid);
 
-        // Wait for N0 to observe the session drop.
+        // Wait for the CLIENT to observe the session drop.
         let ok = net
-            .node(0)
+            .node(client_idx)
             .wait_sessions_at_most(0, Duration::from_secs(10))
             .await;
-        assert!(ok, "post-stop: N0 session to N1 must drop within 10s");
+        assert!(ok, "post-kill: client session must close within 10s");
 
-        // ── Step 5: ticket on N0 survives the session close.
-        // This is the CORE invariant — without it, mobile users
-        // pay full-handshake cost on every WiFi → cellular network
-        // change. A future change that flushes peer_tickets on
-        // session close (e.g. "let's bound memory by clearing
-        // tickets when the session ends") would trip this
-        // assertion AT PR TIME instead of silently regressing
-        // mobile UX in production.
+        // CORE invariant: the client's cached SESSION_TICKET survives the
+        // session close. Without it, mobile users pay full-handshake cost on
+        // every WiFi → cellular network change. A future change that flushes
+        // peer_tickets on session close (e.g. "bound memory by clearing
+        // tickets when the session ends") trips this AT PR TIME instead of
+        // silently regressing mobile UX in production.
         assert!(
-            net.node(0).runtime.debug_peer_tickets_contains(&n1_id),
-            "N0's cached SESSION_TICKET for N1 was FLUSHED \
-             when the session closed.  This breaks fast-path resume on \
-             every transport-level disruption (network change, brief \
-             cellular outage, NAT keepalive timeout, etc.), forcing \
-             every mobile reconnect to pay full-handshake cost — \
-             ~50-200 ms per reconnect on a flaky cellular link, plus \
-             the battery cost of the extra crypto.  Mobile users on \
-             Russian/Iranian/Chinese carriers see ~10 reconnects per \
-             hour during normal usage; this regression would dominate \
-             their app's battery + latency UX.",
+            net.node(client_idx)
+                .runtime
+                .debug_peer_tickets_contains(&peer_of_client),
+            "client's cached SESSION_TICKET was FLUSHED when the session \
+             closed.  This breaks fast-path resume on every transport-level \
+             disruption (network change, brief cellular outage, NAT keepalive \
+             timeout, etc.), forcing every mobile reconnect to pay \
+             full-handshake cost — ~50-200 ms per reconnect on a flaky \
+             cellular link, plus the battery cost of the extra crypto.",
         );
 
         net.stop().await;
