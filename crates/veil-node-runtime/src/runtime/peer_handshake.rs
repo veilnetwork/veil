@@ -320,6 +320,12 @@ pub async fn register_connection_session(
     listener_handle: Option<ListenerHandle>,
     session_state: SessionState,
     connection: Box<dyn TransportConnection>,
+    // E20: force the directional-dedup bypass regardless of the bootstrap_only
+    // heuristic below. Set by no-glare recovery dials (NAT-traversal / SOCKS
+    // fallback) where the primary URI was unreachable and the peer is NOT
+    // reciprocally dialing — so the canonical-direction session would never
+    // materialise and the larger-node_id side would be wrongly stranded.
+    bypass_directional_override: bool,
 ) -> Result<Option<AttachedDebugSession>> {
     let link_id = LinkId::new(runtime.next_link_id.fetch_add(1, Ordering::Relaxed));
     let peer = connection.peer_meta().clone();
@@ -792,18 +798,19 @@ pub async fn register_connection_session(
         //     every bootstrap node_id could never join the mesh);
         //   * inbound from a peer we have no configured entry for — we will
         //     never dial them, so no glare is possible.
-        let bypass_directional = if new_is_outbound {
-            matched_peer_id
-                .map(|pid| {
-                    lock_state(&runtime.state)
-                        .peers
-                        .get(&pid)
-                        .is_some_and(|e| e.bootstrap_only)
-                })
-                .unwrap_or(false)
-        } else {
-            matched_peer_id.is_none()
-        };
+        let bypass_directional = bypass_directional_override
+            || if new_is_outbound {
+                matched_peer_id
+                    .map(|pid| {
+                        lock_state(&runtime.state)
+                            .peers
+                            .get(&pid)
+                            .is_some_and(|e| e.bootstrap_only)
+                    })
+                    .unwrap_or(false)
+            } else {
+                matched_peer_id.is_none()
+            };
         let reserved_outbox_rx = {
             let mut reg = runtime
                 .session_tx_registry
