@@ -419,59 +419,56 @@ unsafe fn clear_err(err_out: *mut *mut c_char) {
     }
 }
 
-/// Maximum length for caller-supplied C strings on the FFI boundary.
+/// Maximum length for a caller-supplied text input on the FFI boundary.
 ///
-/// The `strnlen`-bounded scan via [`cstr_to_str_with_len`] / [`cstr_to_str`]
-/// CAPS the scan at this many bytes — it does NOT make an invalid pointer safe.
-/// SAFETY CONTRACT (the caller's responsibility, as on any C ABI): a non-null
-/// `*const c_char` MUST be readable either up to a NUL terminator OR for at
-/// least `MAX_FFI_CSTR_LEN` bytes. A pointer to a shorter, unterminated buffer
-/// is undefined behaviour: the bound limits how far a *terminated* contract is
-/// scanned and prevents an unbounded walk of arbitrary memory, but it cannot
-/// detect a lying caller. (There are currently no length-based C entry points —
-/// `cstr_to_str_with_len` is an internal helper, not an exported ABI — so a host
-/// that cannot uphold the termination contract must not pass the pointer; an
-/// explicit-length `*_with_len` C ABI is tracked as future work.) 4 KiB covers
-/// every
+/// All text inputs use the explicit-length `(*const u8, len)` ABI
+/// ([`slice_to_str`] / [`opt_slice_to_str`]): the length is authoritative, so
+/// there is no `strnlen` scan and no "must be NUL-terminated or readable for
+/// 4 KiB" footgun. This cap is a sanity/DoS bound — 4 KiB covers every
 /// legitimate input shape: filesystem paths (Linux PATH_MAX = 4096), BIP-39
-/// phrases (~330 B for 24 words), passwords (typically <256 B), error strings
-/// (<1 KiB). Inputs longer than this are rejected as invalid even if they are
-/// NUL-terminated.
+/// phrases (~330 B for 24 words), passwords (typically <256 B), invite URIs
+/// (<1 KiB). Inputs longer than this are rejected as invalid.
 const MAX_FFI_CSTR_LEN: usize = 4096;
 
-/// Bounded variant of `CStr::from_ptr().to_str()`.
+/// Decode a REQUIRED text input from an explicit `(ptr, len)` byte pair — the
+/// length-based C ABI used for every caller-supplied string.
 ///
-/// Returns `Some((str, byte_len))` when the pointer is non-null, NUL-
-/// terminated within `MAX_FFI_CSTR_LEN` bytes, and contains valid UTF-8.
-/// Returns `None` otherwise.
+/// Unlike the `strnlen` path, the length is authoritative: there is no scan and
+/// no "must be NUL-terminated or readable for 4 KiB" footgun — a non-terminated
+/// buffer of exactly `len` bytes is well-defined. Returns `None` when `ptr` is
+/// NULL, `len` exceeds [`MAX_FFI_CSTR_LEN`], or the bytes are not valid UTF-8.
+/// An empty input (`len == 0`, non-NULL `ptr`) decodes to `Some("")`; callers
+/// that forbid empty validate that themselves.
 ///
 /// # Safety
-///
-/// Same contract as [`MAX_FFI_CSTR_LEN`]: `p` is NULL, or a non-null pointer
-/// that is readable either up to a NUL terminator OR for at least
-/// `MAX_FFI_CSTR_LEN` bytes. The `strnlen` scan only CAPS how far a
-/// *terminated* buffer is walked (so a NUL-terminated string longer than the
-/// cap is rejected, not over-read indefinitely) — it does NOT make a short,
-/// unterminated buffer safe: scanning such a buffer reads past its end (up to
-/// `MAX_FFI_CSTR_LEN` bytes), which is undefined behaviour and can fault near a
-/// page boundary. The caller must uphold the termination/length contract, as on
-/// any C ABI.
-unsafe fn cstr_to_str_with_len<'a>(p: *const c_char) -> Option<(&'a str, usize)> {
-    if p.is_null() {
+/// `ptr` is NULL, or points to a readable buffer of at least `len` bytes. No
+/// NUL terminator is required or consulted.
+unsafe fn slice_to_str<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    if ptr.is_null() || len > MAX_FFI_CSTR_LEN {
         return None;
     }
-    let len = unsafe { libc::strnlen(p, MAX_FFI_CSTR_LEN) };
-    if len >= MAX_FFI_CSTR_LEN {
-        // No NUL within bound — refuse rather than continue the scan
-        // through `CStr::from_ptr` (which would be unbounded).
-        return None;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
-    std::str::from_utf8(bytes).ok().map(|s| (s, len))
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    std::str::from_utf8(bytes).ok()
 }
 
-unsafe fn cstr_to_str<'a>(p: *const c_char) -> Option<&'a str> {
-    unsafe { cstr_to_str_with_len(p).map(|(s, _)| s) }
+/// Tri-state decode of an OPTIONAL text input from `(ptr, len)`, for any
+/// nullable string (`password`, `instance_label`, …):
+///  * NULL `ptr` → `Ok(None)` (argument omitted),
+///  * valid UTF-8 within [`MAX_FFI_CSTR_LEN`] → `Ok(Some(s))`,
+///  * non-NULL but invalid UTF-8 or over-cap → `Err(())` (caller MUST reject,
+///    never silently coerce to "omitted" — see diff-audit M26).
+///
+/// # Safety
+/// `ptr` is NULL, or points to a readable buffer of at least `len` bytes.
+unsafe fn opt_slice_to_str<'a>(ptr: *const u8, len: usize) -> Result<Option<&'a str>, ()> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    if len > MAX_FFI_CSTR_LEN {
+        return Err(());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    std::str::from_utf8(bytes).map(Some).map_err(|_| ())
 }
 
 /// Non-elidable wipe of a caller-owned byte buffer at the FFI boundary.
@@ -494,45 +491,6 @@ unsafe fn volatile_wipe(ptr: *mut u8, len: usize) {
         unsafe { core::ptr::write_volatile(ptr.add(i), 0u8) };
     }
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-}
-
-/// Classify a PASSWORD C-string argument (diff-audit M26).
-///
-/// `cstr_to_str` collapses NULL and non-UTF-8 to the same `None`, which for a
-/// password means a non-NULL-but-undecodable value is silently treated as "no
-/// password" — downgrading an intended-ENCRYPTED output to plaintext while
-/// reporting success. This keeps them distinct:
-///  * NULL → `Ok(None)` (no password, intended plain output),
-///  * valid UTF-8 → `Ok(Some(s))`,
-///  * non-NULL but non-UTF-8 (or over-long) → `Err(())` (caller must reject).
-unsafe fn password_arg<'a>(p: *const c_char) -> Result<Option<&'a str>, ()> {
-    if p.is_null() {
-        return Ok(None);
-    }
-    unsafe { cstr_to_str(p) }.map(Some).ok_or(())
-}
-
-/// Bounded `strnlen` — returns `Some(len)` if a NUL byte exists within
-/// `MAX_FFI_CSTR_LEN` bytes of `p`, `None` otherwise (caller passed
-/// non-NUL-terminated buffer or a string longer than the cap).
-///
-/// Use in zeroize-paths where we need the length **before** decoding
-/// UTF-8 so the RAII scrub guard can be armed.  Returning `None`
-/// signals "structurally invalid input — refuse but also do NOT touch
-/// the buffer", since at that point we don't know how long the
-/// allocation actually is.
-///
-/// # Safety
-/// `p` either NULL or points to a readable buffer.
-unsafe fn ffi_cstr_len_bounded(p: *const c_char) -> Option<usize> {
-    if p.is_null() {
-        return None;
-    }
-    let len = unsafe { libc::strnlen(p, MAX_FFI_CSTR_LEN) };
-    if len >= MAX_FFI_CSTR_LEN {
-        return None;
-    }
-    Some(len)
 }
 
 /// detect FFI re-entry from inside a Tokio worker
@@ -585,16 +543,16 @@ pub unsafe extern "C" fn veil_free_string(s: *mut c_char) {
 /// [`veilclient::VeilClient::connect`] for backend discovery rules.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_connect(
-    socket_path: *const c_char,
+    socket_path: *const u8,
+    socket_path_len: usize,
     err_out: *mut *mut c_char,
 ) -> *mut VeilHandle {
     if unsafe { guard::ffi_prelude(err_out, "veil_connect") }.is_err() {
         return ptr::null_mut();
     }
-    // socket_path validation is delegated to `cstr_to_str` (returns
-    // None on null OR invalid UTF-8) — finer-grained than a plain
-    // null check.
-    let Some(path) = (unsafe { cstr_to_str(socket_path) }) else {
+    // Explicit-length text ABI: `(ptr, len)` UTF-8, validated by `slice_to_str`
+    // (None on NULL, over-cap, or invalid UTF-8) — no NUL terminator required.
+    let Some(path) = (unsafe { slice_to_str(socket_path, socket_path_len) }) else {
         unsafe {
             write_err(err_out, "socket_path is NULL or not valid UTF-8");
         }
@@ -661,10 +619,13 @@ pub unsafe extern "C" fn veil_close(handle: *mut VeilHandle) {
 
 // ── App binding ──────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn bind_internal(
     handle: *mut VeilHandle,
-    namespace: *const c_char,
-    name: *const c_char,
+    namespace: *const u8,
+    namespace_len: usize,
+    name: *const u8,
+    name_len: usize,
     endpoint_id: u32,
     err_out: *mut *mut c_char,
     named: bool,
@@ -675,15 +636,14 @@ unsafe fn bind_internal(
     null_check_with_default!(err_out, ptr::null_mut(),
         "handle" => handle,
     );
-    // namespace / name validation delegated to `cstr_to_str`
-    // (None on null OR invalid UTF-8).
-    let Some(ns) = (unsafe { cstr_to_str(namespace) }) else {
+    // namespace / name: explicit-length UTF-8 (None on NULL/over-cap/invalid).
+    let Some(ns) = (unsafe { slice_to_str(namespace, namespace_len) }) else {
         unsafe {
             write_err(err_out, "namespace is NULL or invalid UTF-8");
         }
         return ptr::null_mut();
     };
-    let Some(nm) = (unsafe { cstr_to_str(name) }) else {
+    let Some(nm) = (unsafe { slice_to_str(name, name_len) }) else {
         unsafe {
             write_err(err_out, "name is NULL or invalid UTF-8");
         }
@@ -737,12 +697,25 @@ unsafe fn bind_internal(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_bind(
     handle: *mut VeilHandle,
-    namespace: *const c_char,
-    name: *const c_char,
+    namespace: *const u8,
+    namespace_len: usize,
+    name: *const u8,
+    name_len: usize,
     endpoint_id: u32,
     err_out: *mut *mut c_char,
 ) -> *mut VeilApp {
-    unsafe { bind_internal(handle, namespace, name, endpoint_id, err_out, false) }
+    unsafe {
+        bind_internal(
+            handle,
+            namespace,
+            namespace_len,
+            name,
+            name_len,
+            endpoint_id,
+            err_out,
+            false,
+        )
+    }
 }
 
 /// Bind a well-known persistent application endpoint. Returns NULL on
@@ -750,12 +723,25 @@ pub unsafe extern "C" fn veil_bind(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_bind_named(
     handle: *mut VeilHandle,
-    namespace: *const c_char,
-    name: *const c_char,
+    namespace: *const u8,
+    namespace_len: usize,
+    name: *const u8,
+    name_len: usize,
     endpoint_id: u32,
     err_out: *mut *mut c_char,
 ) -> *mut VeilApp {
-    unsafe { bind_internal(handle, namespace, name, endpoint_id, err_out, true) }
+    unsafe {
+        bind_internal(
+            handle,
+            namespace,
+            namespace_len,
+            name,
+            name_len,
+            endpoint_id,
+            err_out,
+            true,
+        )
+    }
 }
 
 /// Copy the bound `app_id` (32 bytes) into `out`.
@@ -3098,9 +3084,9 @@ pub const VEIL_JOIN_ALREADY_REGISTERED: u8 = 6;
 ///. Forwards the URI bytes to the daemon, which decodes
 /// them through the standard plain / encrypted / signed-invite paths.
 ///
-/// `uri` must be NUL-terminated UTF-8. `password` and `expected_issuer_pk`
-/// may be NULL (for plain URIs / unsigned), or NUL-terminated UTF-8
-/// strings.
+/// `uri` is `(ptr, len)` UTF-8 (no NUL terminator). `password` and
+/// `expected_issuer_pk` may be NULL (for plain URIs / unsigned) — pass a NULL
+/// pointer (length ignored) — or `(ptr, len)` UTF-8.
 ///
 /// On success / `VEIL_JOIN_ALREADY_REGISTERED`, `out_node_id_32` is
 /// populated with the decoded peer's node_id. On any error status it is
@@ -3119,9 +3105,12 @@ pub const VEIL_JOIN_ALREADY_REGISTERED: u8 = 6;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_join_bootstrap_uri(
     handle: *mut VeilHandle,
-    uri: *const c_char,
-    password: *const c_char,
-    expected_issuer_pk: *const c_char,
+    uri: *const u8,
+    uri_len: usize,
+    password: *const u8,
+    password_len: usize,
+    expected_issuer_pk: *const u8,
+    expected_issuer_pk_len: usize,
     out_node_id_32: *mut u8,
     out_status: *mut u8,
     err_out: *mut *mut c_char,
@@ -3134,7 +3123,7 @@ pub unsafe extern "C" fn veil_join_bootstrap_uri(
         "out_node_id_32" => out_node_id_32,
         "out_status" => out_status,
     );
-    let Some(uri_str) = (unsafe { cstr_to_str(uri) }) else {
+    let Some(uri_str) = (unsafe { slice_to_str(uri, uri_len) }) else {
         unsafe {
             write_err(err_out, "uri is NULL or invalid UTF-8");
         }
@@ -3144,7 +3133,7 @@ pub unsafe extern "C" fn veil_join_bootstrap_uri(
     // ignoring it (which would attempt a PLAIN join of an encrypted invite and
     // fail with a misleading error, or join a plain invite while pretending the
     // password mattered).
-    let pw = match unsafe { password_arg(password) } {
+    let pw = match unsafe { opt_slice_to_str(password, password_len) } {
         Ok(p) => p,
         Err(()) => {
             unsafe {
@@ -3153,7 +3142,17 @@ pub unsafe extern "C" fn veil_join_bootstrap_uri(
             return VEIL_ERR_INVALID_ARG;
         }
     };
-    let pk = unsafe { cstr_to_str(expected_issuer_pk) };
+    // expected_issuer_pk is optional; reject non-NULL-but-invalid rather than
+    // silently dropping the issuer pin (which would skip signature checking).
+    let pk = match unsafe { opt_slice_to_str(expected_issuer_pk, expected_issuer_pk_len) } {
+        Ok(p) => p,
+        Err(()) => {
+            unsafe {
+                write_err(err_out, "expected_issuer_pk is not valid UTF-8");
+            }
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
 
     get_or_return!(
         handle_live,
@@ -3201,9 +3200,9 @@ pub const VEIL_CREATE_INVITE_INTERNAL_ERROR: u8 = 3;
 /// the FFI returns through `out_uri` — caller MUST free it via
 /// [`veil_free_string`] after consuming.
 ///
-/// `password` may be `NULL` (plain `veil:bootstrap?…` URI) or a
-/// NUL-terminated UTF-8 string (encrypted `veil:pair?…` envelope).
-/// Empty / whitespace-only passwords are rejected with status
+/// `password` may be `NULL` (plain `veil:bootstrap?…` URI) — pass a NULL
+/// pointer (length ignored) — or `(ptr, len)` UTF-8 (encrypted `veil:pair?…`
+/// envelope). Empty / whitespace-only passwords are rejected with status
 /// `VEIL_CREATE_INVITE_BAD_PASSWORD` so callers can re-prompt rather
 /// than emitting an envelope encrypted under a trivial key.
 ///
@@ -3221,7 +3220,8 @@ pub const VEIL_CREATE_INVITE_INTERNAL_ERROR: u8 = 3;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_create_bootstrap_invite(
     handle: *mut VeilHandle,
-    password: *const c_char,
+    password: *const u8,
+    password_len: usize,
     out_status: *mut u8,
     out_uri: *mut *mut c_char,
     err_out: *mut *mut c_char,
@@ -3239,7 +3239,7 @@ pub unsafe extern "C" fn veil_create_bootstrap_invite(
     }
     // M26: a non-NULL but non-UTF-8 password must be REJECTED, not coerced to
     // None (which emits a plaintext invite for a caller that asked to encrypt).
-    let pw = match unsafe { password_arg(password) } {
+    let pw = match unsafe { opt_slice_to_str(password, password_len) } {
         Ok(p) => p,
         Err(()) => {
             unsafe {
@@ -4145,158 +4145,24 @@ pub unsafe extern "C" fn veil_set_event_handler(
 /// the next routine document republish (default ~half-life).
 pub const VEIL_DEFAULT_RESTORE_VALIDITY_SECS: u64 = 30 * 24 * 3600;
 
-/// Validate a BIP-39 master phrase. Returns `VEIL_OK` iff the
-/// phrase is exactly 24 words from the English BIP-39 wordlist AND
-/// the checksum verifies. Sets `*err_out` to a human-readable
-/// description on failure (unknown word / wrong word count / bad
-/// checksum).
-///
-/// Lightweight — no key derivation, no disk I/O. UI uses this to
-/// give immediate feedback as the user types ("checksum invalid"
-/// before they hit "Restore").
-///
-/// **DEPRECATED (Epic 489.8): prefer [`veil_validate_bip39_phrase_zeroize`].**
-/// This `*const c_char` form leaves the mnemonic in the caller's heap; the
-/// `_zeroize` variant takes `*mut c_char` and wipes it in place. The Flutter
-/// wrapper already uses the `_zeroize` variant. Kept only for ABI back-compat
-/// with existing raw/C consumers; slated for removal at the next ABI break.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_validate_bip39_phrase(
-    phrase: *const c_char,
-    err_out: *mut *mut c_char,
-) -> c_int {
-    unsafe {
-        clear_err(err_out);
-    }
-    let Some(phrase_str) = (unsafe { cstr_to_str(phrase) }) else {
-        unsafe {
-            write_err(err_out, "phrase is NULL or invalid UTF-8");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    };
-    match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
-        Ok(_seed) => VEIL_OK, // Zeroizing seed dropped immediately
-        Err(e) => {
-            unsafe {
-                write_err(err_out, format!("invalid phrase: {e}"));
-            }
-            VEIL_ERR
-        }
-    }
-}
-
-/// Restore an identity from a BIP-39 master phrase.
-///
-/// Decodes phrase → master_seed → derives identity_sk → builds a
-/// fresh signed `IdentityDocument` → writes to `veil_dir`:
-///
-/// * `identity_document.bin` (signed master+device cert chain)
-/// * `instance.toml` (per-device label + sig key index)
-/// * `identity_sk.bin` (this device's per-instance signing key)
-///
-/// `instance_label` is the human-readable name shown in `identity show`
-/// output on other devices belonging to the same identity_id (e.g.
-/// "phone-2024-05"). Caps at 64 ASCII chars; longer names truncate.
-///
-/// Idempotent: re-running with the same phrase + same veil_dir
-/// regenerates the per-device identity_sk and rewrites the document.
-/// The `node_id` (= BLAKE3(master_pk)) is **stable** across calls.
-///
-/// Pow_difficulty is fixed at 0 for testnet builds; release builds
-/// using `production-seeds` would set it from a release-policy file.
-///
-/// Returns `VEIL_OK` on success. On failure sets `*err_out` to
-/// a description and returns `VEIL_ERR`.
-///
-/// **DEPRECATED (Epic 489.8): prefer
-/// [`veil_restore_identity_from_phrase_zeroize`].** This `*const c_char` form
-/// leaves the mnemonic in the caller's heap; the `_zeroize` variant takes
-/// `*mut c_char` and wipes it in place. The Flutter wrapper already uses the
-/// `_zeroize` variant. Kept only for ABI back-compat with existing raw/C
-/// consumers; slated for removal at the next ABI break.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_restore_identity_from_phrase(
-    phrase: *const c_char,
-    veil_dir: *const c_char,
-    instance_label: *const c_char,
-    err_out: *mut *mut c_char,
-) -> c_int {
-    unsafe {
-        clear_err(err_out);
-    }
-    let Some(phrase_str) = (unsafe { cstr_to_str(phrase) }) else {
-        unsafe {
-            write_err(err_out, "phrase is NULL or invalid UTF-8");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    };
-    let Some(dir_str) = (unsafe { cstr_to_str(veil_dir) }) else {
-        unsafe {
-            write_err(err_out, "veil_dir is NULL or invalid UTF-8");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    };
-    let Some(label_str) = (unsafe { cstr_to_str(instance_label) }) else {
-        unsafe {
-            write_err(err_out, "instance_label is NULL or invalid UTF-8");
-        }
-        return VEIL_ERR_INVALID_ARG;
-    };
-
-    let master_seed = match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
-        Ok(s) => s,
-        Err(e) => {
-            unsafe {
-                write_err(err_out, format!("decode phrase: {e}"));
-            }
-            return VEIL_ERR;
-        }
-    };
-
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let opts = veil_identity::sovereign_flow::RestoreIdentityOptions {
-        veil_dir: std::path::PathBuf::from(dir_str),
-        master_seed,
-        save_encrypted_with_password: None,
-        argon2_params_override: None,
-        instance_label: label_str.chars().take(64).collect::<String>(),
-        pow_difficulty: 0,
-        now_unix,
-        valid_until_unix: now_unix + VEIL_DEFAULT_RESTORE_VALIDITY_SECS,
-        algo: veil_types::SignatureAlgorithm::Ed25519,
-        master_falcon_keypair_bytes: None,
-    };
-
-    match veil_identity::sovereign_flow::restore_identity(opts) {
-        Ok(_output) => VEIL_OK,
-        Err(e) => {
-            unsafe {
-                write_err(err_out, format!("restore_identity: {e}"));
-            }
-            VEIL_ERR
-        }
-    }
-}
-
 // ── zeroize-on-consume BIP-39 variants ────────────────
 //
-// The original `veil_validate_bip39_phrase` / `veil_restore_identity_from_phrase`
-// take the phrase as `*const c_char` and never zero the caller's buffer.
-// Hosts that load a 24-word seed phrase via malloc'd buffers (typical
-// Flutter `Pointer<Utf8>` from `String.toNativeUtf8`) leave that
-// memory in the heap until later allocations overwrite it, lengthening
-// the plaintext-lifetime window.
+// The phrase is a SECRET (24-word master seed). These entry points take it as
+// a writable `(*mut u8, len)` buffer and overwrite every byte with `0` after
+// decoding — on success and on every error path — so a host that loads the
+// seed via a malloc'd buffer (typical Flutter `Uint8List` / `calloc<Uint8>`)
+// does not leave the plaintext lingering in the heap. Caller still owns the
+// allocation and frees the (now-zeroed) buffer.
 //
-// The `_zeroize` variants below take a `*mut c_char` and overwrite
-// every byte (including the trailing NUL) with `0` after decoding, in
-// place. Caller still owns the allocation and is responsible for
-// freeing (now-zeroed) buffer.
+// (The earlier non-zeroizing `*const c_char` forms were removed in the
+// explicit-length ABI migration — they left the mnemonic in caller memory.)
 
-/// Zero-on-consume variant [`veil_validate_bip39_phrase`].
+/// Validate a BIP-39 master phrase, zeroizing the caller's buffer on consume.
+///
+/// Returns `VEIL_OK` iff the phrase is exactly 24 words from the English BIP-39
+/// wordlist AND the checksum verifies. The `(phrase, phrase_len)` buffer is
+/// overwritten with `0` before returning, on every path. UI uses this for live
+/// feedback as the user types.
 ///
 /// Reads the phrase, runs the same validation, and unconditionally
 /// overwrites the buffer bytes with `0` before returning — regardless
@@ -4305,7 +4171,8 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase(
 /// `String.toNativeUtf8` in Dart).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
-    phrase: *mut c_char,
+    phrase: *mut u8,
+    phrase_len: usize,
     err_out: *mut *mut c_char,
 ) -> c_int {
     unsafe {
@@ -4317,23 +4184,18 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
         }
         return VEIL_ERR_INVALID_ARG;
     }
-    // Bounded length FIRST, WITHOUT UTF-8 validation, so we can scrub even a
-    // non-UTF-8 buffer. `None` ⇒ NULL or non-NUL-terminated within the cap,
-    // which we cannot safely scrub without knowing the allocation size.
-    // (audit cycle-3: the old path returned on invalid-UTF-8 BEFORE wiping.)
-    let phrase_len = match unsafe { ffi_cstr_len_bounded(phrase) } {
-        Some(n) => n,
-        None => {
-            unsafe {
-                write_err(err_out, "phrase is NULL or too long (>4 KiB)");
-            }
-            return VEIL_ERR_INVALID_ARG;
+    // Explicit-length ABI: the caller hands us the exact buffer length, so we
+    // can scrub it precisely without a strnlen scan (and even if the bytes are
+    // not UTF-8). Reject an over-cap length before touching memory.
+    if phrase_len > MAX_FFI_CSTR_LEN {
+        unsafe {
+            write_err(err_out, "phrase too long (>4 KiB)");
         }
-    };
-    // RAII guard: zero the buffer (incl. trailing NUL) on EVERY return path —
-    // success, decode failure, or non-UTF-8 — so possibly-sensitive input never
-    // lingers. Armed after the bounded length check. Mirrors
-    // `veil_restore_identity_from_phrase_zeroize`.
+        return VEIL_ERR_INVALID_ARG;
+    }
+    // RAII guard: zero the WHOLE caller buffer on EVERY return path — success,
+    // decode failure, or non-UTF-8 — so possibly-sensitive input never lingers.
+    // Mirrors `veil_restore_identity_from_phrase_zeroize`.
     struct ZeroOnDrop {
         ptr: *mut u8,
         len: usize,
@@ -4344,8 +4206,8 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
         }
     }
     let _guard = ZeroOnDrop {
-        ptr: phrase as *mut u8,
-        len: phrase_len.saturating_add(1),
+        ptr: phrase,
+        len: phrase_len,
     };
 
     // UTF-8 decode AFTER the guard is armed.
@@ -4370,19 +4232,27 @@ pub unsafe extern "C" fn veil_validate_bip39_phrase_zeroize(
     }
 }
 
-/// Zero-on-consume variant [`veil_restore_identity_from_phrase`].
+/// Restore an identity from a BIP-39 master phrase, zeroizing the phrase on
+/// consume.
 ///
-/// Same contract as [`veil_restore_identity_from_phrase`] except
-/// `phrase` is `*mut c_char` (caller-owned writable buffer). After
-/// decoding the master seed, the phrase buffer is overwritten with `0`
-/// in place — including on every error path — before this function
-/// returns. `veil_dir` and `instance_label` are still `*const c_char`
-/// (non-secret).
+/// Decodes `phrase` → master_seed → derives identity_sk → builds a fresh signed
+/// `IdentityDocument` and writes `identity_document.bin`, `instance.toml`, and
+/// `identity_sk.bin` to `veil_dir`. `instance_label` is the human-readable
+/// device name (capped at 64 chars). Idempotent: same phrase + same `veil_dir`
+/// regenerates the per-device key; the `node_id` (= BLAKE3(master_pk)) is stable.
+///
+/// `phrase` is a SECRET, passed as a writable `(*mut u8, len)` buffer that is
+/// overwritten with `0` before return on EVERY path. `veil_dir` and
+/// `instance_label` are non-secret `(*const u8, len)` UTF-8. Returns `VEIL_OK`
+/// on success; on failure sets `*err_out` and returns `VEIL_ERR`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
-    phrase: *mut c_char,
-    veil_dir: *const c_char,
-    instance_label: *const c_char,
+    phrase: *mut u8,
+    phrase_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    instance_label: *const u8,
+    instance_label_len: usize,
     err_out: *mut *mut c_char,
 ) -> c_int {
     unsafe {
@@ -4394,23 +4264,17 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
         }
         return VEIL_ERR_INVALID_ARG;
     }
-    // Length check FIRST with bounded scan.  None ⇒ caller passed a NULL
-    // OR a non-NUL-terminated buffer longer than MAX_FFI_CSTR_LEN.  In
-    // last case we cannot safely scrub without knowing the actual allocation
-    // size, so refuse without touching the buffer.
-    let phrase_len = match unsafe { ffi_cstr_len_bounded(phrase) } {
-        Some(n) => n,
-        None => {
-            unsafe {
-                write_err(err_out, "phrase is NULL or too long (>4 KiB)");
-            }
-            return VEIL_ERR_INVALID_ARG;
+    // Explicit-length ABI: the length is authoritative, so we scrub exactly the
+    // caller's buffer with no strnlen scan. Reject over-cap before touching it.
+    if phrase_len > MAX_FFI_CSTR_LEN {
+        unsafe {
+            write_err(err_out, "phrase too long (>4 KiB)");
         }
-    };
+        return VEIL_ERR_INVALID_ARG;
+    }
 
-    // RAII guard: zero the buffer no matter how this function returns
-    // (early return on validation error, panic, success).  Armed AFTER
-    // bounded length check so we know `phrase_len` is safe to scrub.
+    // RAII guard: zero the WHOLE caller buffer no matter how this returns
+    // (early return on validation error, panic, success).
     struct ZeroOnDrop {
         ptr: *mut u8,
         len: usize,
@@ -4421,8 +4285,8 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
         }
     }
     let _guard = ZeroOnDrop {
-        ptr: phrase as *mut u8,
-        len: phrase_len.saturating_add(1),
+        ptr: phrase,
+        len: phrase_len,
     };
 
     // UTF-8 decode AFTER guard armed, so a non-UTF8 phrase still gets
@@ -4437,13 +4301,13 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
             return VEIL_ERR_INVALID_ARG;
         }
     };
-    let Some(dir_str) = (unsafe { cstr_to_str(veil_dir) }) else {
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
         unsafe {
             write_err(err_out, "veil_dir is NULL or invalid UTF-8");
         }
         return VEIL_ERR_INVALID_ARG;
     };
-    let Some(label_str) = (unsafe { cstr_to_str(instance_label) }) else {
+    let Some(label_str) = (unsafe { slice_to_str(instance_label, instance_label_len) }) else {
         unsafe {
             write_err(err_out, "instance_label is NULL or invalid UTF-8");
         }
@@ -4510,17 +4374,21 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize(
 /// `argon2_params_override`.
 ///
 /// # Safety
-/// `phrase` and (if non-NULL) `password` must each point to a writable,
-/// NUL-terminated UTF-8 buffer.  `veil_dir` and `instance_label` must
-/// be NUL-terminated UTF-8 (read-only).  `err_out` must be writable;
-/// on non-OK returns it receives a pointer to a malloc'd UTF-8 string —
-/// caller frees with [`veil_free_string`].
+/// `phrase` and (if non-NULL) `password` must each point to a writable buffer
+/// of at least the given length.  `veil_dir` and `instance_label` are read-only
+/// `(*const u8, len)` UTF-8.  `err_out` must be writable; on non-OK returns it
+/// receives a pointer to a malloc'd UTF-8 string — caller frees with
+/// [`veil_free_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password(
-    phrase: *mut c_char,
-    veil_dir: *const c_char,
-    instance_label: *const c_char,
-    password: *mut c_char,
+    phrase: *mut u8,
+    phrase_len: usize,
+    veil_dir: *const u8,
+    veil_dir_len: usize,
+    instance_label: *const u8,
+    instance_label_len: usize,
+    password: *mut u8,
+    password_len: usize,
     err_out: *mut *mut c_char,
 ) -> c_int {
     unsafe {
@@ -4529,6 +4397,12 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password
     if phrase.is_null() {
         unsafe {
             write_err(err_out, "phrase is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if phrase_len > MAX_FFI_CSTR_LEN {
+        unsafe {
+            write_err(err_out, "phrase too long (>4 KiB)");
         }
         return VEIL_ERR_INVALID_ARG;
     }
@@ -4547,18 +4421,9 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password
         }
     }
 
-    let phrase_len = match unsafe { ffi_cstr_len_bounded(phrase) } {
-        Some(n) => n,
-        None => {
-            unsafe {
-                write_err(err_out, "phrase is NULL or too long (>4 KiB)");
-            }
-            return VEIL_ERR_INVALID_ARG;
-        }
-    };
     let _phrase_guard = ZeroOnDrop {
-        ptr: phrase as *mut u8,
-        len: phrase_len.saturating_add(1),
+        ptr: phrase,
+        len: phrase_len,
     };
 
     // Read password BEFORE constructing its guard so we can copy it to an owned
@@ -4579,20 +4444,17 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password
             },
         )
     } else {
-        let pw_len = match unsafe { ffi_cstr_len_bounded(password) } {
-            Some(n) => n,
-            None => {
-                unsafe {
-                    write_err(err_out, "password too long (>4 KiB)");
-                }
-                return VEIL_ERR_INVALID_ARG;
+        if password_len > MAX_FFI_CSTR_LEN {
+            unsafe {
+                write_err(err_out, "password too long (>4 KiB)");
             }
-        };
+            return VEIL_ERR_INVALID_ARG;
+        }
         let guard = ZeroOnDrop {
-            ptr: password as *mut u8,
-            len: pw_len.saturating_add(1),
+            ptr: password,
+            len: password_len,
         };
-        let pw_slice = unsafe { std::slice::from_raw_parts(password as *const u8, pw_len) };
+        let pw_slice = unsafe { std::slice::from_raw_parts(password as *const u8, password_len) };
         let bytes = match std::str::from_utf8(pw_slice) {
             Ok(s) => Some(zeroize::Zeroizing::new(s.as_bytes().to_vec())),
             Err(_) => {
@@ -4615,13 +4477,13 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password
             return VEIL_ERR_INVALID_ARG;
         }
     };
-    let Some(dir_str) = (unsafe { cstr_to_str(veil_dir) }) else {
+    let Some(dir_str) = (unsafe { slice_to_str(veil_dir, veil_dir_len) }) else {
         unsafe {
             write_err(err_out, "veil_dir is NULL or invalid UTF-8");
         }
         return VEIL_ERR_INVALID_ARG;
     };
-    let Some(label_str) = (unsafe { cstr_to_str(instance_label) }) else {
+    let Some(label_str) = (unsafe { slice_to_str(instance_label, instance_label_len) }) else {
         unsafe {
             write_err(err_out, "instance_label is NULL or invalid UTF-8");
         }
@@ -4712,12 +4574,14 @@ unsafe fn write_pair_detail(err_out: *mut *mut c_char, detail: &str) {
 
 /// Source-side: generate a pair-invite URI + initialize ceremony.
 /// On success, `*out_uri` receives a malloc'd NUL-terminated UTF-8
-/// string — caller frees with [`veil_free_string`].  `password` MUST
-/// be NUL-terminated UTF-8 (the master_sk decryption passphrase).
+/// string — caller frees with [`veil_free_string`].  `password` is the
+/// master_sk decryption passphrase as `(ptr, len)` UTF-8; pass a NULL pointer
+/// (length ignored) for a standalone identity with no encrypted master.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_pair_source_create_invite(
     handle: *mut VeilHandle,
-    password: *const c_char,
+    password: *const u8,
+    password_len: usize,
     out_status: *mut u8,
     out_uri: *mut *mut c_char,
     err_out: *mut *mut c_char,
@@ -4736,7 +4600,7 @@ pub unsafe extern "C" fn veil_pair_source_create_invite(
     // M26: reject a non-NULL but non-UTF-8 master password rather than silently
     // dropping it to None (pairing transfers master-identity material — a
     // silently-unprotected invite is even worse than the bootstrap case).
-    let pw = match unsafe { password_arg(password) } {
+    let pw = match unsafe { opt_slice_to_str(password, password_len) } {
         Ok(p) => p,
         Err(()) => {
             unsafe {
@@ -4976,7 +4840,8 @@ pub unsafe extern "C" fn veil_pair_source_handle_confirm(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_pair_target_consume_uri(
     handle: *mut VeilHandle,
-    uri: *const c_char,
+    uri: *const u8,
+    uri_len: usize,
     out_status: *mut u8,
     out_hello_buf: *mut u8,
     out_hello_buf_cap: size_t,
@@ -4992,7 +4857,7 @@ pub unsafe extern "C" fn veil_pair_target_consume_uri(
         "out_hello_buf" => out_hello_buf,
         "out_hello_len" => out_hello_len,
     );
-    let Some(uri_str) = (unsafe { cstr_to_str(uri) }) else {
+    let Some(uri_str) = (unsafe { slice_to_str(uri, uri_len) }) else {
         unsafe {
             write_err(err_out, "uri is NULL or invalid UTF-8");
         }
@@ -5220,25 +5085,54 @@ mod tests {
     use super::*;
     use std::ffi::CStr;
 
-    /// diff-audit M26: a non-NULL but non-UTF-8 password must NOT collapse to
-    /// `None` (which silently emits a plaintext invite) — it must be rejected.
+    /// diff-audit M26 (explicit-length ABI): a non-NULL but non-UTF-8 password
+    /// must NOT collapse to `None` (which silently emits a plaintext invite) —
+    /// `opt_slice_to_str` must reject it.
     #[test]
-    fn password_arg_distinguishes_null_utf8_and_invalid_m26() {
-        // NULL → no password (intended plain output).
-        assert!(matches!(unsafe { password_arg(ptr::null()) }, Ok(None)));
-        // Valid UTF-8 → Some.
-        let ok = CString::new("hunter2").unwrap();
+    fn opt_slice_to_str_distinguishes_null_utf8_and_invalid_m26() {
+        // NULL ptr → no value (length ignored), intended plain output.
         assert!(matches!(
-            unsafe { password_arg(ok.as_ptr()) },
+            unsafe { opt_slice_to_str(ptr::null(), 7) },
+            Ok(None)
+        ));
+        // Valid UTF-8 → Some.
+        let ok = b"hunter2";
+        assert!(matches!(
+            unsafe { opt_slice_to_str(ok.as_ptr(), ok.len()) },
             Ok(Some("hunter2"))
         ));
         // Non-NULL but non-UTF-8 (0xFF) → Err — caller rejects, never coerces to
         // a plaintext-emitting None.
-        let bad = [0xFFu8, 0xFE, 0x00]; // invalid UTF-8 + NUL terminator
+        let bad = [0xFFu8, 0xFE];
         assert!(matches!(
-            unsafe { password_arg(bad.as_ptr() as *const c_char) },
+            unsafe { opt_slice_to_str(bad.as_ptr(), bad.len()) },
             Err(())
         ));
+        // Over-cap length → Err (not silently dropped).
+        let big = vec![b'x'; MAX_FFI_CSTR_LEN + 1];
+        assert!(matches!(
+            unsafe { opt_slice_to_str(big.as_ptr(), big.len()) },
+            Err(())
+        ));
+    }
+
+    /// `slice_to_str`: NULL, over-cap, and invalid-UTF-8 all reject; a valid
+    /// non-terminated buffer of exactly `len` bytes decodes (no NUL needed).
+    #[test]
+    fn slice_to_str_rejects_null_overcap_and_invalid() {
+        assert!(unsafe { slice_to_str(ptr::null(), 4) }.is_none());
+        let good = b"obfs4-tcp://host:1"; // no NUL terminator
+        assert_eq!(
+            unsafe { slice_to_str(good.as_ptr(), good.len()) },
+            Some("obfs4-tcp://host:1")
+        );
+        let bad = [0xFFu8, 0x00, 0x01];
+        assert!(unsafe { slice_to_str(bad.as_ptr(), bad.len()) }.is_none());
+        let big = vec![b'x'; MAX_FFI_CSTR_LEN + 1];
+        assert!(unsafe { slice_to_str(big.as_ptr(), big.len()) }.is_none());
+        // Exactly at cap is accepted.
+        let at_cap = vec![b'a'; MAX_FFI_CSTR_LEN];
+        assert!(unsafe { slice_to_str(at_cap.as_ptr(), at_cap.len()) }.is_some());
     }
 
     #[test]
@@ -5276,11 +5170,10 @@ mod tests {
     fn validate_bip39_zeroize_wipes_invalid_utf8_input() {
         // audit cycle-3: even a non-UTF-8 (so rejected) but NUL-terminated
         // writable buffer must be scrubbed — the RAII guard runs on every path.
-        let mut buf: Vec<u8> = vec![0xFF, 0xFE, 0xAA, 0x00]; // invalid UTF-8 + NUL
+        let mut buf: Vec<u8> = vec![0xFF, 0xFE, 0xAA]; // invalid UTF-8
+        let n = buf.len();
         let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe {
-            veil_validate_bip39_phrase_zeroize(buf.as_mut_ptr() as *mut c_char, &mut err)
-        };
+        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf.as_mut_ptr(), n, &mut err) };
         assert_eq!(rc, VEIL_ERR_INVALID_ARG);
         assert_eq!(&buf[..3], &[0, 0, 0], "content bytes must be zeroed");
         if !err.is_null() {
@@ -5292,11 +5185,10 @@ mod tests {
     fn validate_bip39_zeroize_wipes_rejected_phrase() {
         // A valid-UTF-8 but not-a-mnemonic phrase is also wiped (was already the
         // case; guards against regression).
-        let mut buf: Vec<u8> = b"not a real mnemonic\0".to_vec();
+        let mut buf: Vec<u8> = b"not a real mnemonic".to_vec();
+        let n = buf.len();
         let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe {
-            veil_validate_bip39_phrase_zeroize(buf.as_mut_ptr() as *mut c_char, &mut err)
-        };
+        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf.as_mut_ptr(), n, &mut err) };
         assert_ne!(rc, VEIL_OK);
         assert!(
             buf.iter().all(|&b| b == 0),
@@ -5453,39 +5345,6 @@ mod tests {
         }
     }
 
-    /// Bounded FFI string scan must accept a normal NUL-terminated buffer
-    /// and reject (1) NULL pointer, (2) buffer without NUL within MAX_FFI_CSTR_LEN.
-    /// Closes the OOB-read surface where caller passes mis-terminated input.
-    #[test]
-    fn ffi_cstr_bounded_scan_accepts_and_rejects() {
-        // Accept: normal NUL-terminated CString.
-        let valid = CString::new("hello").unwrap();
-        let (s, n) =
-            unsafe { cstr_to_str_with_len(valid.as_ptr()) }.expect("normal CString must decode");
-        assert_eq!(s, "hello");
-        assert_eq!(n, 5);
-
-        // Reject: NULL pointer.
-        let null_result = unsafe { cstr_to_str_with_len(std::ptr::null()) };
-        assert!(null_result.is_none(), "NULL pointer must yield None");
-
-        // Reject: buffer of MAX_FFI_CSTR_LEN bytes without NUL.  Use Vec<u8>
-        // filled with 'A' (no NUL anywhere); `strnlen` will scan up to the
-        // cap, see no NUL, and return MAX_FFI_CSTR_LEN — helper rejects.
-        let runaway = vec![b'A'; MAX_FFI_CSTR_LEN + 16];
-        let bounded = unsafe { cstr_to_str_with_len(runaway.as_ptr() as *const c_char) };
-        assert!(
-            bounded.is_none(),
-            "non-NUL-terminated buffer must be rejected on scan past cap"
-        );
-
-        // ffi_cstr_len_bounded follows same contract.
-        let len_only = unsafe { ffi_cstr_len_bounded(valid.as_ptr()) };
-        assert_eq!(len_only, Some(5));
-        let len_runaway = unsafe { ffi_cstr_len_bounded(runaway.as_ptr() as *const c_char) };
-        assert!(len_runaway.is_none());
-    }
-
     #[test]
     fn null_string_free_is_noop() {
         unsafe {
@@ -5497,7 +5356,7 @@ mod tests {
     fn connect_to_invalid_path_returns_null() {
         let path = CString::new("/nonexistent/path/that/does/not/exist.sock").unwrap();
         let mut err: *mut c_char = ptr::null_mut();
-        let h = unsafe { veil_connect(path.as_ptr(), &mut err) };
+        let h = unsafe { veil_connect(path.as_bytes().as_ptr(), path.as_bytes().len(), &mut err) };
         assert!(h.is_null());
         assert!(!err.is_null());
         unsafe {
@@ -5508,7 +5367,7 @@ mod tests {
     #[test]
     fn connect_with_null_path_returns_null() {
         let mut err: *mut c_char = ptr::null_mut();
-        let h = unsafe { veil_connect(ptr::null(), &mut err) };
+        let h = unsafe { veil_connect(ptr::null(), 0, &mut err) };
         assert!(h.is_null());
         assert!(!err.is_null());
         unsafe {
@@ -5580,7 +5439,7 @@ mod tests {
         let r = rt.block_on(async {
             let path = CString::new("/tmp/veil-h6.sock").unwrap();
             let mut err: *mut c_char = ptr::null_mut();
-            let h = unsafe { veil_connect(path.as_ptr(), &mut err) };
+            let h = unsafe { veil_connect(path.as_bytes().as_ptr(), path.as_bytes().len(), &mut err) };
             let err_string = if err.is_null() {
                 String::new()
             } else {
@@ -5613,7 +5472,7 @@ mod tests {
     fn phase647_h6_connect_from_plain_thread_does_not_trip_guard() {
         let path = CString::new("/nonexistent/h6.sock").unwrap();
         let mut err: *mut c_char = ptr::null_mut();
-        let h = unsafe { veil_connect(path.as_ptr(), &mut err) };
+        let h = unsafe { veil_connect(path.as_bytes().as_ptr(), path.as_bytes().len(), &mut err) };
         assert!(h.is_null());
         assert!(!err.is_null());
         let s = unsafe { CStr::from_ptr(err) }
@@ -5637,16 +5496,15 @@ mod tests {
     #[test]
     fn phase647_h8_validate_zeroize_clears_phrase_buffer_on_success() {
         let phrase = fresh_phrase();
-        let phrase_bytes = phrase.as_bytes_with_nul().to_vec();
-        // Move the bytes into a heap-owned buffer that mimics a C-side
-        // malloc — write_bytes(0) on it is well-defined.
-        let mut buf: Vec<u8> = phrase_bytes.clone();
-        let buf_ptr = buf.as_mut_ptr() as *mut c_char;
+        // Explicit-length ABI: pass the content bytes (no NUL terminator).
+        let mut buf: Vec<u8> = phrase.as_bytes().to_vec();
+        let n = buf.len();
+        let buf_ptr = buf.as_mut_ptr();
         let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf_ptr, &mut err) };
+        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf_ptr, n, &mut err) };
         assert_eq!(rc, VEIL_OK);
         assert!(err.is_null());
-        // Every byte (including trailing NUL) must now be 0.
+        // Every byte must now be 0.
         assert!(
             buf.iter().all(|&b| b == 0),
             "buffer must be fully zeroed; got: {:?}",
@@ -5663,10 +5521,11 @@ mod tests {
              abandon abandon abandon abandon abandon abandon abandon zoo",
         )
         .unwrap();
-        let mut buf: Vec<u8> = bad.as_bytes_with_nul().to_vec();
-        let buf_ptr = buf.as_mut_ptr() as *mut c_char;
+        let mut buf: Vec<u8> = bad.as_bytes().to_vec();
+        let n = buf.len();
+        let buf_ptr = buf.as_mut_ptr();
         let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf_ptr, &mut err) };
+        let rc = unsafe { veil_validate_bip39_phrase_zeroize(buf_ptr, n, &mut err) };
         assert_eq!(rc, VEIL_ERR); // bad checksum
         if !err.is_null() {
             unsafe {
@@ -5684,7 +5543,7 @@ mod tests {
     #[test]
     fn phase647_h8_validate_zeroize_rejects_null() {
         let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe { veil_validate_bip39_phrase_zeroize(ptr::null_mut(), &mut err) };
+        let rc = unsafe { veil_validate_bip39_phrase_zeroize(ptr::null_mut(), 0, &mut err) };
         assert_eq!(rc, VEIL_ERR_INVALID_ARG);
         assert!(!err.is_null());
         unsafe {
@@ -5931,52 +5790,30 @@ mod tests {
         std::ffi::CString::new(mnemonic.to_string()).unwrap()
     }
 
-    #[test]
-    fn epic489_8_validate_phrase_accepts_valid_24_words() {
-        let phrase = fresh_phrase();
-        let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe { veil_validate_bip39_phrase(phrase.as_ptr(), &mut err) };
-        assert_eq!(rc, VEIL_OK, "valid phrase must accept");
-        assert!(err.is_null(), "no error message on success");
-    }
-
-    #[test]
-    fn epic489_8_validate_phrase_rejects_garbage() {
-        let bad = std::ffi::CString::new("not actually a valid bip39 phrase at all").unwrap();
-        let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe { veil_validate_bip39_phrase(bad.as_ptr(), &mut err) };
-        assert_eq!(rc, VEIL_ERR);
-        assert!(!err.is_null());
-        unsafe {
-            veil_free_string(err);
-        }
-    }
-
-    #[test]
-    fn epic489_8_validate_phrase_rejects_null() {
-        let mut err: *mut c_char = ptr::null_mut();
-        let rc = unsafe { veil_validate_bip39_phrase(ptr::null(), &mut err) };
-        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
-        assert!(!err.is_null());
-        unsafe {
-            veil_free_string(err);
-        }
-    }
+    // (validate accept/garbage/null are covered by the `phase647_h8_*` zeroize
+    // tests above; the non-zeroize `veil_validate_bip39_phrase` was removed in
+    // the explicit-length ABI migration.)
 
     #[test]
     fn epic489_8_restore_writes_identity_files() {
         // End-to-end: valid phrase + tempdir → produces signed identity
-        // document + instance file + identity_sk on disk.
+        // document + instance file + identity_sk on disk. Uses the zeroize
+        // restore variant (explicit-length ABI; the phrase buffer is wiped).
         let dir = tempfile::tempdir().expect("tempdir");
         let phrase = fresh_phrase();
-        let dir_c = std::ffi::CString::new(dir.path().to_str().unwrap()).unwrap();
-        let label_c = std::ffi::CString::new("test-device").unwrap();
+        let mut pbuf = phrase.as_bytes().to_vec();
+        let pbuf_len = pbuf.len();
+        let dir_s = dir.path().to_str().unwrap();
+        let label = "test-device";
         let mut err: *mut c_char = ptr::null_mut();
         let rc = unsafe {
-            veil_restore_identity_from_phrase(
-                phrase.as_ptr(),
-                dir_c.as_ptr(),
-                label_c.as_ptr(),
+            veil_restore_identity_from_phrase_zeroize(
+                pbuf.as_mut_ptr(),
+                pbuf_len,
+                dir_s.as_ptr(),
+                dir_s.len(),
+                label.as_ptr(),
+                label.len(),
                 &mut err,
             )
         };
@@ -5998,30 +5835,41 @@ mod tests {
         // Critical: BIP-39 → master_seed → master_pk → node_id is
         // DETERMINISTIC. Restoring on Device A and Device B from the
         // same phrase MUST give the same node_id (that's the whole
-        // point of identity recovery).
+        // point of identity recovery). Each zeroize call wipes its buffer,
+        // so we materialize a fresh phrase buffer per device.
         let phrase = fresh_phrase();
-        let label_c = std::ffi::CString::new("dev").unwrap();
+        let label = "dev";
 
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
-        let dir_a_c = std::ffi::CString::new(dir_a.path().to_str().unwrap()).unwrap();
-        let dir_b_c = std::ffi::CString::new(dir_b.path().to_str().unwrap()).unwrap();
+        let dir_a_s = dir_a.path().to_str().unwrap();
+        let dir_b_s = dir_b.path().to_str().unwrap();
         let mut err: *mut c_char = ptr::null_mut();
 
+        let mut pbuf_a = phrase.as_bytes().to_vec();
+        let pbuf_a_len = pbuf_a.len();
         let rc_a = unsafe {
-            veil_restore_identity_from_phrase(
-                phrase.as_ptr(),
-                dir_a_c.as_ptr(),
-                label_c.as_ptr(),
+            veil_restore_identity_from_phrase_zeroize(
+                pbuf_a.as_mut_ptr(),
+                pbuf_a_len,
+                dir_a_s.as_ptr(),
+                dir_a_s.len(),
+                label.as_ptr(),
+                label.len(),
                 &mut err,
             )
         };
         assert_eq!(rc_a, VEIL_OK);
+        let mut pbuf_b = phrase.as_bytes().to_vec();
+        let pbuf_b_len = pbuf_b.len();
         let rc_b = unsafe {
-            veil_restore_identity_from_phrase(
-                phrase.as_ptr(),
-                dir_b_c.as_ptr(),
-                label_c.as_ptr(),
+            veil_restore_identity_from_phrase_zeroize(
+                pbuf_b.as_mut_ptr(),
+                pbuf_b_len,
+                dir_b_s.as_ptr(),
+                dir_b_s.len(),
+                label.as_ptr(),
+                label.len(),
                 &mut err,
             )
         };
