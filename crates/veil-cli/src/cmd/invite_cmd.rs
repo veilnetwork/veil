@@ -104,14 +104,19 @@ fn create_invite<I: CommandIo, O: ConfigOps>(
         )));
     }
 
-    let psk_path = listen.psk_file.clone().ok_or_else(|| {
-        veil_cfg::ConfigError::ValidationFailed(format!(
-            "listener {listener_id} has no `psk_file` — invite bundles must embed a PSK; \
-             configure `psk_file = \"…\"` or fall back to a deployment-wide \
-             `transport.obfs4_psk_file` AND set it explicitly on the listener.",
-        ))
-    })?;
-    let psk = read_psk_file(&resolve_relative(&config_path, &psk_path))?;
+    // Option C (obfs4 PSK): when the listener has no explicit `psk_file`, derive
+    // the anti-probe key from the owner's PUBLIC identity (vk + node_id). The
+    // server derives the SAME key at bind time, so nothing secret is generated,
+    // stored, or distributed — the invite carries only public material and there
+    // is no PSK to rotate or leak. An explicit `psk_file` stays a legacy override.
+    let psk = match listen.psk_file.clone() {
+        Some(psk_path) => read_psk_file(&resolve_relative(&config_path, &psk_path))?,
+        None => {
+            let vk = signing_key.verifying_key().to_bytes();
+            let node_id = blake3::hash(&vk);
+            veil_obfs4::NodeIdMacKey::derive_from_identity(&vk, node_id.as_bytes()).0
+        }
+    };
 
     let transport_uri = listen
         .advertise

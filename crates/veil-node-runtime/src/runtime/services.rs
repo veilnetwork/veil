@@ -46,7 +46,8 @@ use veil_mesh::UdpRealm;
 use super::persistence::persist_discovered_peers;
 use super::{
     InboundSessionContext, NodeRuntime, NodeServices, SessionRuntimeContext,
-    listen_transport_context, lock_state, lock_tasks, push_session_handle, spawn_inbound_session,
+    derive_listener_obfs4_psk, listen_transport_context, lock_state, lock_tasks,
+    push_session_handle, spawn_inbound_session,
 };
 
 impl NodeRuntime {
@@ -603,7 +604,28 @@ impl NodeRuntime {
             }
 
             let uri = TransportUri::parse(&listen.transport)?;
-            let listen_ctx = Arc::new(listen_transport_context(&self.transport_ctx, &listen)?);
+            let mut listen_ctx = listen_transport_context(&self.transport_ctx, &listen)?;
+            // Option C (obfs4 PSK): no explicit psk_file ⇒ derive the anti-probe
+            // key from this node's PUBLIC identity. Clients derive the same key
+            // from the invite's vk/node_id, so no PSK is generated or shared.
+            if let Some(key) = derive_listener_obfs4_psk(
+                &listen.transport,
+                listen_ctx.obfs4_psk.is_some(),
+                self.identity.local_identity.algo,
+                &self.identity.local_identity.public_key,
+                self.identity.local_identity.node_id.as_bytes(),
+            ) {
+                listen_ctx.obfs4_psk = Some(Arc::new(key));
+                self.logger.info(
+                    "obfs4.psk.derived",
+                    format!(
+                        "listen_id={} derived obfs4 anti-probe key from node \
+                         identity (no psk_file configured)",
+                        listen.listen_id
+                    ),
+                );
+            }
+            let listen_ctx = Arc::new(listen_ctx);
             let listener = self.registry.bind(&uri, Arc::clone(&listen_ctx)).await?;
             let listener_handle =
                 ListenerHandle::new(self.next_listener_handle.fetch_add(1, Ordering::Relaxed));

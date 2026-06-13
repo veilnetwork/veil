@@ -5535,6 +5535,41 @@ pub fn listen_transport_context(
     Ok(ctx)
 }
 
+/// Option C (obfs4 PSK): derive a listener's anti-probe `node_id_mac_key` from
+/// the node's **public** identity (`vk` + `node_id`) when no explicit PSK is
+/// configured. A client derives the SAME key from the invite's `vk`/`nid`, so
+/// the handshake succeeds with nothing secret generated, stored, or shared.
+///
+/// Returns `None` — leaving any configured PSK / disabling obfs4 — when:
+/// - the listener already has a PSK (explicit `psk_file` is the legacy override),
+/// - the transport isn't obfs4, or
+/// - the identity isn't Ed25519. The invite path is Ed25519-only
+///   ([`veil_invite::create_bundle`] signs with ed25519-dalek), so a PQ node has
+///   no matching invite to agree with; such an operator must set `psk_file`.
+///
+/// `node_id` MUST equal `BLAKE3(STANDARD-decode(public_key_b64))` — the same
+/// `vk`/`nid` an invite embeds — which holds for a node's own identity by
+/// construction ([`veil_cfg::NodeId::from_public_key`]).
+pub(crate) fn derive_listener_obfs4_psk(
+    transport: &str,
+    already_has_psk: bool,
+    algo: veil_cfg::SignatureAlgorithm,
+    public_key_b64: &str,
+    node_id: &[u8; 32],
+) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    if already_has_psk
+        || algo != veil_cfg::SignatureAlgorithm::Ed25519
+        || !transport.starts_with("obfs4")
+    {
+        return None;
+    }
+    let vk = base64::engine::general_purpose::STANDARD
+        .decode(public_key_b64)
+        .ok()?;
+    Some(veil_obfs4::NodeIdMacKey::derive_from_identity(&vk, node_id).0)
+}
+
 #[cfg(test)]
 mod listen_visibility_tests {
     use super::*;
@@ -5548,6 +5583,81 @@ mod listen_visibility_tests {
             visibility: vis,
             ..Default::default()
         }
+    }
+
+    // ── Option C: identity-derived obfs4 PSK ─────────────────────────────────
+
+    /// A sample Ed25519 vk (b64) + its node_id, matching the invite invariant.
+    fn sample_identity() -> (String, [u8; 32]) {
+        use base64::Engine as _;
+        let vk = [0x11u8; 32];
+        let vk_b64 = base64::engine::general_purpose::STANDARD.encode(vk);
+        let node_id = *veil_cfg::NodeId::from_public_key(
+            veil_cfg::SignatureAlgorithm::Ed25519,
+            &vk_b64,
+        )
+        .expect("valid ed25519 pubkey")
+        .as_bytes();
+        (vk_b64, node_id)
+    }
+
+    #[test]
+    fn derive_obfs4_psk_matches_invite_derivation() {
+        use base64::Engine as _;
+        let (vk_b64, node_id) = sample_identity();
+        let got = derive_listener_obfs4_psk(
+            "obfs4-tcp://0.0.0.0:5556",
+            false,
+            veil_cfg::SignatureAlgorithm::Ed25519,
+            &vk_b64,
+            &node_id,
+        )
+        .expect("ed25519 obfs4 listener with no psk must derive");
+        // Must equal the key a client derives from the invite's vk/node_id.
+        let vk = base64::engine::general_purpose::STANDARD.decode(&vk_b64).unwrap();
+        let expect = veil_obfs4::NodeIdMacKey::derive_from_identity(&vk, &node_id).0;
+        assert_eq!(got, expect, "server and invite must derive the same key");
+    }
+
+    #[test]
+    fn derive_obfs4_psk_none_cases() {
+        let (vk_b64, node_id) = sample_identity();
+        // Already has an explicit PSK → don't override.
+        assert!(
+            derive_listener_obfs4_psk(
+                "obfs4-tcp://0.0.0.0:5556",
+                true,
+                veil_cfg::SignatureAlgorithm::Ed25519,
+                &vk_b64,
+                &node_id,
+            )
+            .is_none(),
+            "explicit psk_file must not be overridden"
+        );
+        // Non-obfs4 transport → no anti-probe key needed.
+        assert!(
+            derive_listener_obfs4_psk(
+                "tcp://0.0.0.0:5556",
+                false,
+                veil_cfg::SignatureAlgorithm::Ed25519,
+                &vk_b64,
+                &node_id,
+            )
+            .is_none(),
+            "non-obfs4 transport must not derive"
+        );
+        // PQ identity → no Ed25519 invite to agree with.
+        assert!(
+            derive_listener_obfs4_psk(
+                "obfs4-tcp://0.0.0.0:5556",
+                false,
+                veil_cfg::SignatureAlgorithm::Falcon512,
+                &vk_b64,
+                &node_id,
+            )
+            .is_none(),
+            "PQ identity must not derive (invite path is Ed25519-only)"
+        );
     }
 
     #[test]
