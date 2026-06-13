@@ -81,32 +81,40 @@ bool validateBip39Phrase(String phrase) {
 ///   * malformed phrase (use [validateBip39Phrase] for UI feedback first),
 ///   * cannot create / write to [veilDir],
 ///   * any underlying crypto failure (rare — would indicate a bug).
-void restoreIdentity({
+Future<void> restoreIdentity({
   required String phrase,
   required String veilDir,
   required String instanceLabel,
 }) {
-  final phraseC = phrase.toNativeUtf8();
-  final dirC = veilDir.toNativeUtf8();
-  final labelC = instanceLabel.toNativeUtf8();
-  final errOut = calloc<Pointer<Utf8>>();
-  try {
-    // Zeroize variant: phrase buffer is wiped in place after the master
-    // seed is decoded, regardless of success/error path.
-    final rc = ffi.veilRestoreIdentityFromPhraseZeroize(
-      phraseC, dirC, labelC, errOut,
-    );
-    if (rc == ffi.veilOk) return;
-    final errPtr = errOut.value;
-    final msg = errPtr == nullptr ? '<no detail>' : errPtr.toDartString();
-    if (errPtr != nullptr) ffi.veilFreeString(errPtr);
-    throw VeilException(msg, code: rc);
-  } finally {
-    calloc.free(phraseC);
-    calloc.free(dirC);
-    calloc.free(labelC);
-    calloc.free(errOut);
-  }
+  // diff-audit H3 follow-up: this derives the master seed → identity_sk
+  // (Ed25519 keygen + signing) and writes the document/instance/sk files to
+  // disk — seconds of synchronous work on a budget device. Offload to a worker
+  // isolate (like `restoreIdentityEncrypted`) so it can't freeze the UI isolate.
+  // All four args are `String` (sendable); the native lib + bindings re-init in
+  // the spawned isolate; `VeilException` (String + int) marshals back on failure.
+  return Isolate.run(() {
+    final phraseC = phrase.toNativeUtf8();
+    final dirC = veilDir.toNativeUtf8();
+    final labelC = instanceLabel.toNativeUtf8();
+    final errOut = calloc<Pointer<Utf8>>();
+    try {
+      // Zeroize variant: phrase buffer is wiped in place after the master
+      // seed is decoded, regardless of success/error path.
+      final rc = ffi.veilRestoreIdentityFromPhraseZeroize(
+        phraseC, dirC, labelC, errOut,
+      );
+      if (rc == ffi.veilOk) return;
+      final errPtr = errOut.value;
+      final msg = errPtr == nullptr ? '<no detail>' : errPtr.toDartString();
+      if (errPtr != nullptr) ffi.veilFreeString(errPtr);
+      throw VeilException(msg, code: rc);
+    } finally {
+      calloc.free(phraseC);
+      calloc.free(dirC);
+      calloc.free(labelC);
+      calloc.free(errOut);
+    }
+  });
 }
 
 /// Restore identity AND save a passphrase-encrypted master-seed backup

@@ -100,16 +100,13 @@ class _RestoreIdentityScreenState extends State<RestoreIdentityScreen> {
       _restoreError = null;
     });
     try {
-      // Off-isolate in case Argon2id (master-encryption file path —
-      // currently unused here, but defensive) ever creeps in.
-      // restoreIdentity itself is pure-compute under a second.
-      await Future(() {
-        restoreIdentity(
-          phrase: _phraseCtrl.text,
-          veilDir: widget.veilDir,
-          instanceLabel: _labelCtrl.text.trim(),
-        );
-      });
+      // restoreIdentity offloads its key derivation + disk I/O to a worker
+      // isolate internally, so a plain await keeps the UI isolate responsive.
+      await restoreIdentity(
+        phrase: _phraseCtrl.text,
+        veilDir: widget.veilDir,
+        instanceLabel: _labelCtrl.text.trim(),
+      );
       if (!mounted) return;
       widget.onRestored(widget.veilDir);
     } on VeilException catch (e) {
