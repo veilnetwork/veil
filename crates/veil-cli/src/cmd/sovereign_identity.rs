@@ -1572,6 +1572,15 @@ fn pair_listen<I: CommandIo>(
         .to_string();
 
     // 3. Sign invite, render QR.
+    // diff-audit M22: bound the invite TTL exactly like `pair_invite` — without
+    // this, `--ttl-secs` was unbounded here, so a pair invite (which authorises
+    // adoption of this identity) could be made valid for a year+.
+    if args.ttl_secs == 0 || args.ttl_secs > PAIR_INVITE_MAX_TTL_SECS {
+        return Err(IdentityCliError::PairListen(format!(
+            "--ttl-secs must be in [1, {PAIR_INVITE_MAX_TTL_SECS}], got {}",
+            args.ttl_secs
+        )));
+    }
     let mut pair_secret = [0u8; PAIR_SECRET_LEN];
     OsRng.fill_bytes(&mut pair_secret);
     let pair_secret_hash = hash_pair_secret(&pair_secret);
@@ -1637,8 +1646,12 @@ fn pair_listen<I: CommandIo>(
         .map_err(|e| IdentityCliError::PairListen(e.to_string()))?;
 
     // 5. Persist the updated doc.
+    // diff-audit M22: atomic write (tmp + fsync + rename), like every other
+    // identity-doc write — a crash mid-`fs::write` here would corrupt the
+    // identity document (the rest of the codebase routes these through
+    // `atomic_write` for exactly this reason).
     let doc_path = veil_dir.join(IDENTITY_DOCUMENT_FILE);
-    fs::write(&doc_path, outcome.finalized_document.encode())
+    atomic_write(&doc_path, &outcome.finalized_document.encode())
         .map_err(|e| IdentityCliError::PairListen(format!("persist doc: {e}")))?;
 
     io.emit(OutputEvent::message(format!(
