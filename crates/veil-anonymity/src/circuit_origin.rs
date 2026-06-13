@@ -49,6 +49,20 @@ pub struct OriginCircuit {
     pub confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl Drop for OriginCircuit {
+    fn drop(&mut self) {
+        // diff-audit (zeroize sweep follow-up): scrub the per-hop symmetric
+        // keys on drop. This is the originator's copy of EVERY hop key for a
+        // circuit it built (used to open every return cell) — the highest-value
+        // data-plane key material — and it was the one spot the Δ2-j sweep
+        // missed (the relay-side `CircuitState` and `CircuitInstall` already
+        // zeroize on drop). `#[derive(Clone)]` is retained; each clone scrubs
+        // its own copy here.
+        use zeroize::Zeroize;
+        self.circuit_keys.zeroize();
+    }
+}
+
 impl OriginCircuit {
     /// Mark the circuit confirmed (its `CircuitBuilt` ACK arrived).
     pub fn mark_confirmed(&self) {
