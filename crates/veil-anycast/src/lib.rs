@@ -88,13 +88,148 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use veil_dht::KademliaService;
+use veil_proto::ProtoError;
 use veil_proto::anycast::{
-    AnycastList, AnycastRecord, AnycastResultPayload, MAX_ANYCAST_CANDIDATES,
+    AnycastList, AnycastRecord, AnycastRecordSig, AnycastResultPayload, MAX_ANYCAST_CANDIDATES,
 };
+use veil_types::SignatureAlgorithm;
 
 pub mod reputation;
 pub use reputation::AnycastReputation;
+
+// ── Algo-generic v3 (Falcon-512 / hybrid) verify ──────────────────────────────
+
+/// Whether a `sig_algo` wire-byte denotes Ed25519 (the v2 algorithm). Mirrors
+/// the v2/v3 split in `veil-proto`: Ed25519 records carry a 32-byte pubkey +
+/// 64-byte sig and are verified by `veil-proto` directly; every other algorithm
+/// is verified here through `veil-crypto`.
+fn sig_algo_is_ed25519(sig_algo: u8) -> bool {
+    sig_algo == 0 || sig_algo == 1
+}
+
+/// Algo-generic anycast owner-signature verification. Ed25519 records use
+/// `veil-proto`'s built-in Ed25519 path; Falcon-512 / hybrid records are
+/// verified here via `veil-crypto` over the record's canonical bytes. The
+/// resolver-side complement to v3 signing — it lets a resolver admit records
+/// published by PQ-only sovereign identities.
+pub fn verify_record_signature(record: &AnycastRecord) -> Result<(), ProtoError> {
+    let Some(sig) = &record.signature else {
+        return Err(ProtoError::Malformed(
+            "anycast record is unsigned; cannot verify".to_string(),
+        ));
+    };
+    if sig_algo_is_ed25519(sig.sig_algo) {
+        return record.verify_signature();
+    }
+    let algo = SignatureAlgorithm::from_wire_byte(sig.sig_algo).ok_or_else(|| {
+        ProtoError::Malformed(format!("anycast record: unknown sig_algo {}", sig.sig_algo))
+    })?;
+    let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(&sig.owner_pubkey);
+    veil_crypto::verify_message(algo, &pubkey_b64, &record.canonical_bytes(), &sig.signature)
+        .map_err(|e| {
+            ProtoError::Malformed(format!(
+                "anycast record: {algo:?} signature verify failed: {e}"
+            ))
+        })
+}
+
+/// Algo-generic owner-binding: the record's signature must verify (any algo) AND
+/// `BLAKE3(owner_pubkey) == node_id` with `sig_key_idx == 0` (the self-signed
+/// master-key case). Closes, for v3 records, the same "valid signature under an
+/// attacker key claiming a victim node_id" forgery that
+/// [`AnycastRecord::verify_owner_binding`] closes for v2.
+pub fn verify_record_owner_binding(record: &AnycastRecord) -> Result<(), ProtoError> {
+    verify_record_signature(record)?;
+    let sig = record.signature.as_ref().ok_or_else(|| {
+        ProtoError::Malformed("anycast record: owner-binding requires a signature".to_string())
+    })?;
+    if sig.sig_key_idx != 0 {
+        return Err(ProtoError::Malformed(format!(
+            "anycast record: owner-binding only supports sig_key_idx == 0 (got {})",
+            sig.sig_key_idx,
+        )));
+    }
+    if blake3::hash(sig.owner_pubkey.as_slice()).as_bytes() != &record.node_id {
+        return Err(ProtoError::Malformed(
+            "anycast record: BLAKE3(owner_pubkey) != node_id — owner-binding forged".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Detached signer: maps an anycast record's canonical bytes to a raw signature
+/// of the owner's algorithm. The secret key stays captured inside the closure.
+pub type AnycastSignFn = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
+/// Algo-generic owner-signer for anycast advertisements. Lets the daemon
+/// own-sign v2 (Ed25519) OR v3 (Falcon-512 / hybrid) records depending on the
+/// identity's algorithm.
+///
+/// The private key never lives here — it is held inside the `sign` closure (e.g.
+/// the sovereign `IdentitySigningKey`, which deliberately hides its SK), so this
+/// type stays clonable and SK-free.
+#[derive(Clone)]
+pub struct AnycastSigner {
+    /// Signature algorithm of the owner key.
+    algo: SignatureAlgorithm,
+    /// Owner verifying-key bytes — embedded as the record's `owner_pubkey`. MUST
+    /// be the master pubkey for owner-binding (`BLAKE3(owner_pubkey) == node_id`)
+    /// to hold under `SignedBound`.
+    owner_pubkey: Vec<u8>,
+    /// Subkey index (`0` = master). Owner-binding requires `0`.
+    sig_key_idx: u8,
+    /// Detached signer over the record's canonical bytes; returns the algo's raw
+    /// signature. The SK stays encapsulated here.
+    sign: AnycastSignFn,
+}
+
+impl AnycastSigner {
+    /// Construct from a detached signer. `owner_pubkey` must be the master
+    /// verifying key (so the BLAKE3 owner-binding holds); `sign(canonical)` must
+    /// return a raw `algo` signature over the bytes it is given.
+    pub fn new(
+        algo: SignatureAlgorithm,
+        owner_pubkey: Vec<u8>,
+        sig_key_idx: u8,
+        sign: AnycastSignFn,
+    ) -> Self {
+        Self {
+            algo,
+            owner_pubkey,
+            sig_key_idx,
+            sign,
+        }
+    }
+
+    /// Build + sign an anycast record. Ed25519 serializes to the v2 wire,
+    /// Falcon-512 / hybrid to v3 (chosen by `AnycastRecord::encode`).
+    fn sign_record(
+        &self,
+        service_tag: [u8; 4],
+        node_id: [u8; 32],
+        score: u16,
+        ttl: u32,
+    ) -> Option<AnycastRecord> {
+        let mut rec = AnycastRecord {
+            service_tag,
+            node_id,
+            score,
+            ttl,
+            signature: Some(AnycastRecordSig {
+                sig_algo: self.algo.wire_byte(),
+                owner_pubkey: self.owner_pubkey.clone(),
+                sig_key_idx: self.sig_key_idx,
+                // placeholder; canonical_bytes() excludes the signature itself.
+                signature: Vec::new(),
+            }),
+        };
+        let canonical = rec.canonical_bytes();
+        rec.signature.as_mut()?.signature = (self.sign)(&canonical);
+        Some(rec)
+    }
+}
 
 // ── Policy ────────────────────────────────────────────────────────────────────
 
@@ -166,6 +301,10 @@ pub struct AnycastService {
     /// signing_key`] at daemon startup once the sovereign master
     /// signing key is loaded.
     signing_key: Option<(Arc<ed25519_dalek::SigningKey>, u8)>,
+    /// Algo-generic owner-signer (v2 Ed25519 / v3 Falcon-512 / hybrid). When
+    /// `Some`, it takes precedence over `signing_key` so a PQ-only sovereign
+    /// identity can own-sign its advertisements. Set via [`Self::with_signer`].
+    generic_signer: Option<AnycastSigner>,
 }
 
 impl AnycastService {
@@ -176,6 +315,7 @@ impl AnycastService {
             reputation: Arc::new(AnycastReputation::new()),
             policy: AnycastResolvePolicy::default(),
             signing_key: None,
+            generic_signer: None,
         }
     }
 
@@ -194,6 +334,7 @@ impl AnycastService {
             reputation,
             policy: AnycastResolvePolicy::default(),
             signing_key: None,
+            generic_signer: None,
         }
     }
 
@@ -230,6 +371,20 @@ impl AnycastService {
         self
     }
 
+    /// Wire in an ALGO-GENERIC sovereign owner-signer so `advertise()` publishes
+    /// owner-signed records regardless of the identity's algorithm — v2 for
+    /// Ed25519, v3 for Falcon-512 / hybrid. Takes precedence over
+    /// [`Self::with_signing_key`]. This is the path a PQ-only sovereign identity
+    /// uses; without it such a node previously fell through to UNSIGNED v1
+    /// records that `SignedBound` resolvers drop. Caller must ensure
+    /// `BLAKE3(signer.public_key) == local_node_id` (sig_key_idx 0) for
+    /// `SignedBound` to admit our own records.
+    #[must_use]
+    pub fn with_signer(mut self, signer: AnycastSigner) -> Self {
+        self.generic_signer = Some(signer);
+        self
+    }
+
     /// Current resolve policy.  Surfaced for diagnostic /
     /// admin-debug commands.
     pub fn policy(&self) -> AnycastResolvePolicy {
@@ -250,6 +405,14 @@ impl AnycastService {
     /// Merges the local record into the existing DHT list and re-stores it.
     /// Call periodically (every `ttl_secs / 2`) to keep the entry fresh.
     pub fn advertise(&self, service_tag: [u8; 4], score: u16, ttl_secs: u32) {
+        // Algo-generic owner-signer takes precedence (covers Ed25519 AND
+        // Falcon-512 / hybrid) so a PQ-only sovereign identity own-signs its
+        // records too (A1 audit fix). Falls back to the Ed25519-only signing
+        // key, then to legacy unsigned v1.
+        if let Some(signer) = &self.generic_signer {
+            self.advertise_with_signer(service_tag, score, ttl_secs, signer);
+            return;
+        }
         // Audit batch 2026-05-25 phase O: auto-sign if the daemon
         // wired a signing key through `with_signing_key`.  IPC apps
         // calling `AnycastAdvertise` keep their existing wire format
@@ -310,6 +473,31 @@ impl AnycastService {
             signing_key,
         );
         list.upsert(signed_record);
+        self.dht.store_local(key, list.encode());
+    }
+
+    /// Algo-generic owner-signed advertise (v2 Ed25519 / v3 Falcon-512 /
+    /// hybrid). Signs the record with the wired [`AnycastSigner`]. On malformed
+    /// signer key material the advertise is SKIPPED (we never downgrade to an
+    /// unsigned record), and the existing list is left untouched.
+    fn advertise_with_signer(
+        &self,
+        service_tag: [u8; 4],
+        score: u16,
+        ttl_secs: u32,
+        signer: &AnycastSigner,
+    ) {
+        let Some(record) = signer.sign_record(service_tag, self.local_node_id, score, ttl_secs)
+        else {
+            return;
+        };
+        let key = AnycastRecord::dht_key(service_tag);
+        let mut list = self
+            .dht
+            .get_local(&key)
+            .map(|b| AnycastList::decode(&b))
+            .unwrap_or_default();
+        list.upsert(record);
         self.dht.store_local(key, list.encode());
     }
 
@@ -443,17 +631,19 @@ impl AnycastService {
                         }
                         if require_binding {
                             // Strictest gate: drop unless signature is valid
-                            // AND owner-binding holds.
-                            // `verify_owner_binding` already calls
-                            // `verify_signature` internally.
-                            return r.verify_owner_binding().is_ok();
+                            // AND owner-binding holds. The algo-generic path
+                            // admits v3 (Falcon-512 / hybrid) records too, not
+                            // just Ed25519 v2. `verify_record_owner_binding`
+                            // calls `verify_record_signature` internally.
+                            return verify_record_owner_binding(r).is_ok();
                         }
                         if !require_signed {
                             return true;
                         }
                         // Trust-policy gate: drop unsigned records and records
-                        // whose embedded sig doesn't verify under owner_pubkey.
-                        r.verify_signature().is_ok()
+                        // whose embedded sig doesn't verify under owner_pubkey
+                        // (any supported algorithm).
+                        verify_record_signature(r).is_ok()
                     })
                     .map(|r| {
                         let penalty = self.reputation.score_offset(r.node_id, service_tag);
@@ -518,7 +708,91 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use veil_dht::KademliaService;
-    use veil_proto::anycast::{ANYCAST_RECORD_SIZE, ANYCAST_RECORD_V2_SIZE};
+    use veil_proto::anycast::{ANYCAST_MAGIC_V3, ANYCAST_RECORD_SIZE, ANYCAST_RECORD_V2_SIZE};
+
+    /// Falcon-512 (v3) owner-signing round-trips through the wire and verifies —
+    /// the core of the A1 fix: a PQ-only identity can own-sign anycast records,
+    /// and a resolver admits them under the strictest (binding) policy.
+    #[test]
+    fn falcon_v3_sign_verify_and_binding_roundtrip() {
+        let kp = veil_crypto::generate_keypair(SignatureAlgorithm::Falcon512);
+        let pubkey_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&kp.public_key)
+            .unwrap();
+        let node_id: [u8; 32] = blake3::hash(&pubkey_bytes).into();
+        let signer = AnycastSigner::new(SignatureAlgorithm::Falcon512, pubkey_bytes.clone(), 0, {
+            let pk = kp.public_key.clone();
+            let sk = kp.private_key.clone();
+            Arc::new(move |msg: &[u8]| {
+                veil_crypto::sign_message(SignatureAlgorithm::Falcon512, &pk, &sk, msg).unwrap()
+            })
+        });
+        let rec = signer
+            .sign_record(*b"mbox", node_id, 5, 3600)
+            .expect("falcon sign");
+
+        // Serializes as v3 and round-trips exactly through the wire.
+        let enc = rec.encode();
+        assert_eq!(&enc[0..2], &ANYCAST_MAGIC_V3, "Falcon record is v3");
+        let dec = AnycastRecord::decode(&enc).unwrap();
+        assert_eq!(dec, rec);
+
+        // Generic verify + owner-binding accept it.
+        assert!(verify_record_signature(&dec).is_ok());
+        assert!(verify_record_owner_binding(&dec).is_ok());
+
+        // Tampered signature → verify fails.
+        let mut bad = dec.clone();
+        if let Some(s) = bad.signature.as_mut() {
+            s.signature[0] ^= 0xFF;
+        }
+        assert!(verify_record_signature(&bad).is_err());
+
+        // Forged binding (sig still valid, but node_id changed) → binding fails.
+        let mut forged = dec.clone();
+        forged.node_id[0] ^= 0xFF;
+        assert!(
+            verify_record_owner_binding(&forged).is_err(),
+            "BLAKE3(owner_pubkey) != node_id must be rejected",
+        );
+    }
+
+    /// The strictest resolve policy (`SignedBound`) admits a Falcon-signed v3
+    /// record whose owner-binding holds — proving the resolver-side generic
+    /// verify is wired into the policy.
+    #[test]
+    fn signed_bound_policy_admits_falcon_record() {
+        let kp = veil_crypto::generate_keypair(SignatureAlgorithm::Falcon512);
+        let pubkey_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&kp.public_key)
+            .unwrap();
+        let node_id: [u8; 32] = blake3::hash(&pubkey_bytes).into();
+        let dht = Arc::new(KademliaService::new([0x9; 32]));
+        let svc = AnycastService::with_reputation(
+            Arc::clone(&dht),
+            node_id,
+            Arc::new(AnycastReputation::new()),
+        )
+        .with_policy(AnycastResolvePolicy::SignedBound)
+        .with_signer(AnycastSigner::new(
+            SignatureAlgorithm::Falcon512,
+            pubkey_bytes.clone(),
+            0,
+            {
+                let pk = kp.public_key.clone();
+                let sk = kp.private_key.clone();
+                Arc::new(move |msg: &[u8]| {
+                    veil_crypto::sign_message(SignatureAlgorithm::Falcon512, &pk, &sk, msg).unwrap()
+                })
+            },
+        ));
+        svc.advertise(*b"mbox", 1, 3600);
+        let got = svc.resolve(*b"mbox", 8);
+        assert!(
+            got.node_ids.contains(&node_id),
+            "SignedBound must admit our own Falcon-signed v3 record",
+        );
+    }
 
     fn make_service(seed: u8) -> AnycastService {
         let dht = Arc::new(KademliaService::new([seed; 32]));

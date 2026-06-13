@@ -9,19 +9,18 @@ license = "AGPL-3.0-or-later"
 veil-dht = { path = "../veil-dht" }
 veil-proto = { path = "../veil-proto" }
 veil-util = { path = "../veil-util" }
+veil-types = { path = "../veil-types" }
+# Algo-generic sign/verify for v3 (Falcon-512 / hybrid) anycast records. This is
+# the one place anycast needs the PQ crypto path; veil-crypto depends only on
+# veil-{types,error,util}, so this stays acyclic (anycast → crypto → types).
+veil-crypto = { path = "../veil-crypto" }
+base64 = "0.22"
+blake3 = "1"
 
 # Ed25519 used by `advertise_signed` to bind the record to the local node's
 # identity key. Required public API; pulled in directly here rather than
 # re-exporting from veil-proto to keep dependency layering explicit.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-
-[dev-dependencies]
-# Used only by SignedBound policy tests to derive `node_id` from a signing
-# key's pubkey the same way the sovereign-identity layer does
-# (`BLAKE3(pubkey)`).  Production code never recomputes this — the binding
-# check lives in `veil_proto::anycast::AnycastRecord::verify_owner_binding`,
-# which has its own `blake3` dep.
-blake3 = "1"
 
 [lints]
 workspace = true
