@@ -36,17 +36,24 @@ pub const AAD: &[u8] = b"ovl1-ticket-v1";
 /// resumption load above this rate evicts older entries (security
 /// degrades to "old entries no longer replay-detected" — but their
 /// TTL still enforces the global expiry, so the worst replay window
-/// is `SESSION_TICKET_TTL_SECS` ≈ 30 days).
+/// is `SESSION_TICKET_TTL_SECS` ≈ 1 hour).
 pub const MAX_CONSUMED_TICKETS: usize = 8192;
 
 // ── TicketKey ─────────────────────────────────────────────────────────────────
 
 /// A 256-bit host ticket key used to AEAD-encrypt/decrypt session tickets.
 ///
-/// The key must be generated at node startup and rotated every
-/// `TICKET_KEY_ROTATION_SECS` seconds. Only the current key can encrypt
-/// new tickets; both the current and previous key can decrypt received tickets
-/// (to handle the transition window).
+/// The key is generated fresh at node startup and used for the node's
+/// lifetime.
+///
+/// NOTE: periodic key rotation — with a previous-key decrypt window to cover
+/// the transition — is the intended design but is **not yet wired**. There is
+/// no `TICKET_KEY_ROTATION_SECS` constant and no rotation task today, and
+/// [`TicketIssuer`] holds a single key (no previous-key slot). Consequently a
+/// ticket stays decryptable by this one key for the whole process lifetime;
+/// the `SESSION_TICKET_TTL_SECS` ceiling and the single-use `consumed_tickets`
+/// cache are what bound the actual exposure. When rotation lands, give
+/// `TicketIssuer` a `prev_key` and try it in `decrypt` before failing.
 ///
 /// # Memory hygiene (Phase 6 slice 6e)
 ///
@@ -54,11 +61,11 @@ pub const MAX_CONSUMED_TICKETS: usize = 8192;
 /// when `RLIMIT_MEMLOCK` permits, falls back to a zeroize-on-drop
 /// `Zeroizing<Vec<u8>>` when the budget is exhausted (same protection
 /// as the pre-Phase-6 `[u8; 32]` field).  The mlocked path closes the
-/// swap-to-disk vector: this is a **process-lifetime** key, so if pages
-/// holding it get evicted to swap, every issued session-resumption
-/// ticket up to the next rotation is decryptable by anyone with read
-/// access to the swap partition.  Pinning matters here more than for
-/// any other key in the system.
+/// swap-to-disk vector: this is a **process-lifetime** key (no rotation is
+/// wired — see above), so if pages holding it get evicted to swap, every
+/// session-resumption ticket issued during the process's life is decryptable
+/// by anyone with read access to the swap partition.  Pinning matters here
+/// more than for any other key in the system.
 ///
 /// `Drop` semantics are inherited from `SensitiveBytesN<32>`'s inner
 /// `SensitiveBytes` enum (both `Mlocked(MlockedBytes)` and

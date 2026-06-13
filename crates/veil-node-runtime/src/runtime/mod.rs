@@ -737,10 +737,10 @@ pub struct NodeRuntime {
     /// Populated by `spawn_discovery_initiator_task`; `None` before that task is spawned.
     discovery_trigger_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<()>>>>,
     /// H10 stage-B: session-resumption-domain state extracted into
-    /// [`Arc<ResumptionState>`]. `ticket_issuer` rotated every
-    /// `TICKET_KEY_ROTATION_SECS` seconds; per-peer `peer_tickets`
-    /// presented in HELLO TLV on reconnect. See
-    /// `node/runtime/resumption_state.rs`.
+    /// [`Arc<ResumptionState>`]. `ticket_issuer` is generated at startup and
+    /// held for the process lifetime (periodic rotation is intended but not
+    /// yet wired); per-peer `peer_tickets` presented in HELLO TLV on
+    /// reconnect. See `node/runtime/resumption_state.rs`.
     pub resumption: Arc<resumption_state::ResumptionState>,
     /// H10 stage-B: PEX-domain runtime state extracted into an owned
     /// `PexRuntime` bundle. Plain struct (not `Arc<...>`) because the
