@@ -3914,10 +3914,13 @@ dependencies = [
 name = "veil-anycast"
 version = "0.1.1"
 dependencies = [
+ "base64",
  "blake3",
  "ed25519-dalek",
+ "veil-crypto",
  "veil-dht",
  "veil-proto",
+ "veil-types",
  "veil-util",
 ]
 
