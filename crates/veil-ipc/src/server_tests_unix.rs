@@ -1333,6 +1333,8 @@ async fn full_delivery_channel_drops_frame_and_increments_counter() {
         // test, which never touches StreamOpen/StreamClose.
         let acceptor_streams =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let acceptor_routes =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         forward_endpoint(
             app_rx,
             delivery_tx,
@@ -1341,6 +1343,7 @@ async fn full_delivery_channel_drops_frame_and_increments_counter() {
             0,
             Some(metrics_clone),
             acceptor_streams,
+            acceptor_routes,
         )
         .await;
     });
