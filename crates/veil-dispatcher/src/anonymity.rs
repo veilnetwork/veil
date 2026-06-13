@@ -625,38 +625,59 @@ impl FrameDispatcher {
                     Ok(c) => c,
                     Err(_) => return DispatchResult::NoResponse,
                 };
-                // Δ2-d: ACK the originator that the circuit is fully established.
-                // Routed back down the return path (toward prev_link, re-tagged
-                // per hop like a return data cell); the originator marks it
-                // CONFIRMED. Emitted on install — independent of whether the
-                // piggy-backed registration below parses.
-                let ack = veil_anonymity::circuit_wire::CircuitBuiltPayload {
-                    circuit_id: circuit.circuit_id_in,
+                let circuit_id_in = circuit.circuit_id_in;
+
+                // diff-audit B1: the `CircuitBuilt` ACK must mean "this circuit is
+                // USABLE for its role", not merely "transport reached the
+                // terminus". The originator marks the circuit CONFIRMED on this
+                // ACK and FREEZES that path; if the piggy-backed cookie
+                // registration was rejected (squat / stale-epoch / malformed /
+                // registry full), the onion service is dark even though the path
+                // is up. So for a circuit that carries a rendezvous registration,
+                // emit the ACK ONLY AFTER the cookie→circuit binding succeeds — a
+                // failed registration leaves the originator UNconfirmed, so its
+                // maintenance tick re-selects a fresh path instead of freezing a
+                // service that can't be reached. A circuit with no registration
+                // payload (or arriving where no registry is configured) is a pure
+                // transport circuit and is ACK'd immediately, as before.
+                //
+                // R never learns the receiver's node_id (cookie-keyed,
+                // first-wins). A failed registration leaves the bare circuit
+                // installed (idle-GC'd) — anti-leak silent.
+                let usable = match (
+                    self.circuit_rendezvous.as_ref(),
+                    veil_anonymity::circuit_register::CircuitRegisterPayload::decode(&payload),
+                ) {
+                    (Some(reg), Some(p)) => match reg.register(&p, circuit, now) {
+                        Ok(()) => {
+                            self.logger.info(
+                                "anonymity.circuit.registered",
+                                "circuit-rendezvous registration bound a cookie to a return circuit",
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            self.logger.info(
+                                "anonymity.circuit.register_rejected",
+                                format!("circuit registration rejected: {e:?} — not ACKing"),
+                            );
+                            false
+                        }
+                    },
+                    // No registry here, or the payload is not a registration:
+                    // pure transport circuit — confirm transport reachability.
+                    _ => true,
                 };
-                self.send_relay_chain_msg(
-                    &NodeId::from(prev_link),
-                    RelayChainMsg::CircuitBuilt,
-                    &ack.encode(),
-                );
-                // The terminus payload is a signed circuit-rendezvous
-                // registration: bind its cookie → this circuit (cookie-keyed,
-                // first-wins; R never learns the receiver's node_id). A bad
-                // signature / cookie-squat / unparseable payload just leaves the
-                // bare circuit installed (idle-GC'd) — anti-leak silent.
-                if let Some(reg) = &self.circuit_rendezvous
-                    && let Some(p) =
-                        veil_anonymity::circuit_register::CircuitRegisterPayload::decode(&payload)
-                {
-                    match reg.register(&p, circuit, now) {
-                        Ok(()) => self.logger.info(
-                            "anonymity.circuit.registered",
-                            "circuit-rendezvous registration bound a cookie to a return circuit",
-                        ),
-                        Err(e) => self.logger.info(
-                            "anonymity.circuit.register_rejected",
-                            format!("circuit registration rejected: {e:?}"),
-                        ),
-                    }
+
+                if usable {
+                    let ack = veil_anonymity::circuit_wire::CircuitBuiltPayload {
+                        circuit_id: circuit_id_in,
+                    };
+                    self.send_relay_chain_msg(
+                        &NodeId::from(prev_link),
+                        RelayChainMsg::CircuitBuilt,
+                        &ack.encode(),
+                    );
                 }
             }
         }
@@ -1532,6 +1553,100 @@ mod tests {
                 .lookup(&cookie)
                 .is_none(),
             "teardown evicted the circuit-rendezvous subscription"
+        );
+    }
+
+    /// diff-audit B1: the terminus emits a `CircuitBuilt` ACK only when the
+    /// circuit is USABLE for its role. For a registration-carrying circuit that
+    /// means the cookie→circuit binding must SUCCEED first; a rejected
+    /// registration (here: a corrupted signature → `BadSignature`) must NOT
+    /// produce an ACK, so the originator stays unconfirmed and re-selects a
+    /// fresh path instead of freezing a service that R cannot route to.
+    #[test]
+    fn circuit_build_failed_registration_does_not_ack_b1() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use veil_anonymity::circuit_register::{CircuitRegisterPayload, CircuitRendezvousRegistry};
+        use veil_anonymity::circuit_setup::{CircuitSetupHop, build_circuit_setup};
+        use veil_anonymity::circuit_table::CircuitTable;
+        use veil_crypto::{generate_keypair, sign_message};
+        use veil_session::tx_registry::SessionTxRegistry;
+        use veil_types::SignatureAlgorithm;
+
+        // Returns (cookie_bound, ack_sent) for a build whose terminus payload is
+        // a registration with an optionally-corrupted signature.
+        let run = |corrupt_sig: bool| -> (bool, bool) {
+            let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+            let sk = StaticSecret::random_from_rng(OsRng);
+            let pk = PublicKey::from(&sk).to_bytes();
+            d.anonymity_x25519_sk = Some(std::sync::Arc::new(sk));
+            d.circuit_table = Some(std::sync::Arc::new(CircuitTable::new()));
+            d.circuit_rendezvous = Some(std::sync::Arc::new(CircuitRendezvousRegistry::new()));
+
+            // The ACK target is `prev_link` = the node the build arrived from.
+            let prev = [0xEE; 32];
+            let mut reg_tx = SessionTxRegistry::new();
+            let mut rx = reg_tx.register(NodeId::from(prev));
+            d.session_tx_registry = Some(std::sync::Arc::new(std::sync::RwLock::new(reg_tx)));
+
+            let cookie = [0x5B; 16];
+            let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+            let reg_pk: [u8; 32] = STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
+            let epoch = 1u64;
+            let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
+            let mut sig = sign_message(
+                SignatureAlgorithm::Ed25519,
+                &kp.public_key,
+                &kp.private_key,
+                &msg,
+            )
+            .unwrap();
+            if corrupt_sig {
+                sig[0] ^= 0xFF; // break the registration self-signature
+            }
+            let regp = CircuitRegisterPayload {
+                cookie,
+                reg_pk,
+                epoch,
+                signature: sig,
+            };
+
+            let hop = CircuitSetupHop {
+                node_id: [0u8; 32],
+                pubkey: pk,
+                circuit_id_in: 78,
+                circuit_id_out: 0,
+                circuit_key: [3u8; 32],
+            };
+            let env = build_circuit_setup(&[hop], &regp.encode()).unwrap();
+            let mut hdr = FrameHeader::new(
+                FrameFamily::RelayChain as u8,
+                RelayChainMsg::CircuitBuild as u16,
+            );
+            hdr.body_len = env.len() as u32;
+            d.dispatch_relay_chain(&hdr, &env, NodeId::from(prev));
+
+            let bound = d
+                .circuit_rendezvous
+                .as_ref()
+                .unwrap()
+                .lookup(&cookie)
+                .is_some();
+            let acked = rx.try_recv().is_ok();
+            (bound, acked)
+        };
+
+        // Positive control: a valid registration binds the cookie AND ACKs.
+        let (bound_ok, acked_ok) = run(false);
+        assert!(bound_ok, "valid registration must bind the cookie");
+        assert!(acked_ok, "a usable (registered) circuit must be ACK'd");
+
+        // Regression: a rejected registration binds NOTHING and emits NO ACK.
+        let (bound_bad, acked_bad) = run(true);
+        assert!(!bound_bad, "rejected registration must not bind the cookie");
+        assert!(
+            !acked_bad,
+            "B1: a rejected registration must NOT emit a CircuitBuilt ACK",
         );
     }
 
