@@ -14,21 +14,50 @@
 //     `veil_stream_close_finalizer` when the Dart object is GC'd —
 //     belt-and-suspenders against a forgotten `.close()`).
 //
-// Threading note: the underlying FFI calls block the calling Dart thread
-// for the duration of one daemon round-trip (`block_on` in Rust on a
-// pre-existing tokio worker pool).  We schedule each call via
-// `Future(() { ... })` to match the rest of the high-level surface
-// (see `client.dart` top-of-file).  A proper `Isolate.run` offload is
-// listed in the audit-trail for a future refactor.
+// Threading note (diff-audit H3): the underlying FFI calls block the calling
+// Dart thread for one daemon round-trip (`block_on` in Rust).  `read()` — which
+// can block INDEFINITELY waiting for data — runs on a WORKER isolate via
+// `Isolate.run` so it never freezes the UI isolate (Android ANR).  `write()`
+// completes promptly (flow-controlled) so it stays on `Future(() {...})` like
+// the rest of the surface.  Safe to drive the stream from a worker isolate: the
+// stream handle is a generational handle-table KEY (see `veil_stream_close` in
+// veilclient-ffi), Arc-looked-up per call, so a read racing `close()` returns a
+// clean table-miss error rather than a use-after-free.
 
 import 'dart:async';
 import 'dart:ffi';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
 import 'bindings.dart' as ffi;
 import 'types.dart';
+
+/// Top-level FFI stream read, run on a WORKER isolate via [Isolate.run]
+/// (diff-audit H3). Top-level (not a method) so the closure captures only the
+/// sendable `int` address + `maxBytes`, never `this`. The stream handle is a
+/// generational table key; `Pointer.fromAddress` + the FFI's own Arc lookup make
+/// cross-isolate use safe.
+Uint8List _ffiStreamReadOffIsolate(int streamAddr, int maxBytes) {
+  final stream = Pointer<ffi.VeilStreamFfi>.fromAddress(streamAddr);
+  final buf = calloc<Uint8>(maxBytes);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final n = ffi.veilStreamRead(stream, buf, maxBytes, errOut);
+    if (n < 0) {
+      throw VeilException(
+        'stream read failed: ${_readErrAndFree(errOut)}',
+        code: n,
+      );
+    }
+    if (n == 0) return Uint8List(0);
+    return Uint8List.fromList(buf.asTypedList(n));
+  } finally {
+    calloc.free(buf);
+    calloc.free(errOut);
+  }
+}
 
 /// GC-time safety-net for [VeilStream].  Fires
 /// `veil_stream_close` if the Dart object is GC'd without an
@@ -116,24 +145,11 @@ class VeilStream implements Finalizable {
         '(${ffi.veilMaxDataLen})',
       );
     }
-    return Future(() {
-      final buf = calloc<Uint8>(maxBytes);
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        final n = ffi.veilStreamRead(_stream, buf, maxBytes, errOut);
-        if (n < 0) {
-          throw VeilException(
-            'stream read failed: ${_readErrAndFree(errOut)}',
-            code: n,
-          );
-        }
-        if (n == 0) return Uint8List(0);
-        return Uint8List.fromList(buf.asTypedList(n));
-      } finally {
-        calloc.free(buf);
-        calloc.free(errOut);
-      }
-    });
+    // H3: run the (potentially indefinitely-blocking) FFI read on a WORKER
+    // isolate so a read with no data never freezes the UI isolate. The handle is
+    // passed by address (sendable); see `_ffiStreamReadOffIsolate`.
+    final addr = _stream.address;
+    return Isolate.run(() => _ffiStreamReadOffIsolate(addr, maxBytes));
   }
 
   /// Convenience: convert the pull-based [read] API into a push-based
