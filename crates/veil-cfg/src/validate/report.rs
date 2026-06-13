@@ -34,6 +34,17 @@ impl ValidationReport {
         self.issues.is_empty()
     }
 
+    /// Promote every non-fatal advisory into a fatal issue and return the
+    /// strict report. Used by the production-hardening profile
+    /// (`[global].strict_config_validation = true`): a risky-but-permitted
+    /// posture (push relay without wake-HMAC, mailbox without capability tokens,
+    /// unsigned DHT store, …) becomes a startup-blocking error rather than a
+    /// log line. Idempotent; preserves `fixed`.
+    pub fn into_strict(mut self) -> Self {
+        self.issues.append(&mut self.warnings);
+        self
+    }
+
     /// `true` iff the report carries at least one unresolved issue.
     pub fn has_unfixed_issues(&self) -> bool {
         !self.issues.is_empty()

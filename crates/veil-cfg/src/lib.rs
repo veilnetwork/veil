@@ -53,7 +53,7 @@ pub use store::{
 };
 pub use validate::{
     ValidationIssue, ValidationReport, validate, validate_and_fix, validate_and_fix_with_policy,
-    validate_with_policy,
+    validate_strict, validate_with_policy,
 };
 pub(crate) use value::{
     option_to_string, parse_optional_string, parse_optional_u16, parse_optional_u64,
