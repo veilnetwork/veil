@@ -52,6 +52,7 @@ veil-mailbox = { path = "../veil-mailbox" }
 veil-memory = { path = "../veil-memory" }
 veil-mesh = { path = "../veil-mesh" }
 veil-nat = { path = "../veil-nat" }
+veil-obfs4 = { path = "../veil-obfs4" }
 veil-observability = { path = "../veil-observability" }
 veil-pending-ack = { path = "../veil-pending-ack" }
 veil-pex = { path = "../veil-pex" }
