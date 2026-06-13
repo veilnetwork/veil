@@ -31,6 +31,11 @@ class VeilMailbox {
   /// start failing as expected.
   final Pointer<ffi.VeilHandle> _handle;
 
+  /// Serializes [fetch] calls (diff-audit M23). The count→into protocol uses a
+  /// single-slot daemon-side cache, so two concurrent fetches on the same
+  /// mailbox would interleave; each fetch chains behind this gate.
+  Future<void> _fetchGate = Future<void>.value();
+
   /// Deposit a blob in the recipient's mailbox.  Caller MUST encrypt
   /// the payload end-to-end before calling — relays cannot decrypt
   /// stored content.
@@ -220,91 +225,117 @@ class VeilMailbox {
         'authCookie must be 16 bytes, got ${authCookie.length}',
       );
     }
-    return Future(() {
-      final recv = calloc<Uint8>(32);
-      final cookie = calloc<Uint8>(16);
-      final outCount = calloc<Uint32>();
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        recv.asTypedList(32).setAll(0, receiverId);
-        cookie.asTypedList(16).setAll(0, authCookie);
-
-        // Step 1: count.  Daemon caches the result internally.
-        final rc1 = ffi.veilMailboxFetchCount(
-          _handle,
-          recv,
-          cookie,
-          outCount,
-          errOut,
-        );
-        if (rc1 != ffi.veilOk) {
-          throw VeilException(
-            'mailbox_fetch_count failed: ${_readErrAndFree(errOut)}',
-            code: rc1,
-          );
-        }
-        final count = outCount.value;
-        if (count == 0) return <MailboxBlob>[];
-
-        // Step 2: allocate descriptor array + a blob buffer sized at
-        // [veilMaxDataLen] cap (16 MiB) — daemon-side already caps
-        // per-blob, and a pending-list bigger than the cap is a sign of
-        // misconfiguration that the FFI will reject via INVALID_ARG
-        // (it does NOT lose the cache — caller can retry with larger
-        // buffer).  16 MiB is a sane upper bound for a single fetch.
-        const blobBufLen = ffi.veilMaxDataLen;
-        final descriptors = calloc<ffi.VeilMailboxBlobStruct>(count);
-        final blobBuf = calloc<Uint8>(blobBufLen);
+    // M23: serialize behind any in-flight fetch on this mailbox (single-slot
+    // daemon cache). Ignore a prior fetch's outcome so one failure can't block
+    // the next; always release the gate when this fetch finishes.
+    final prev = _fetchGate;
+    final gate = Completer<void>();
+    _fetchGate = gate.future;
+    try {
+      await prev;
+    } catch (_) {}
+    try {
+      return await Future(() {
+        final recv = calloc<Uint8>(32);
+        final cookie = calloc<Uint8>(16);
+        final outCount = calloc<Uint32>();
+        final errOut = calloc<Pointer<Utf8>>();
         try {
-          final rc2 = ffi.veilMailboxFetchInto(
+          recv.asTypedList(32).setAll(0, receiverId);
+          cookie.asTypedList(16).setAll(0, authCookie);
+
+          // Step 1: count.  Daemon caches the result internally.
+          final rc1 = ffi.veilMailboxFetchCount(
             _handle,
-            descriptors,
-            count,
-            blobBuf,
-            blobBufLen,
+            recv,
+            cookie,
+            outCount,
             errOut,
           );
-          if (rc2 < 0) {
+          if (rc1 != ffi.veilOk) {
             throw VeilException(
-              'mailbox_fetch_into failed: ${_readErrAndFree(errOut)}',
-              code: rc2,
+              'mailbox_fetch_count failed: ${_readErrAndFree(errOut)}',
+              code: rc1,
             );
           }
-          // rc2 = number of descriptors written; copy each blob payload
-          // into a Dart-owned Uint8List before freeing the buffer.
-          final result = <MailboxBlob>[];
-          for (var i = 0; i < rc2; i++) {
-            final d = descriptors[i];
-            final senderId = Uint8List(32);
-            final contentId = Uint8List(32);
-            for (var j = 0; j < 32; j++) {
-              senderId[j] = d.senderId[j];
-              contentId[j] = d.contentId[j];
-            }
-            final blob = d.blobLen > 0
-                ? Uint8List.fromList(d.blob.asTypedList(d.blobLen))
-                : Uint8List(0);
-            result.add(MailboxBlob(
-              senderId: senderId,
-              contentId: contentId,
-              depositedAt: d.depositedAt,
-              data: blob,
-            ));
+          final count = outCount.value;
+          if (count == 0) return <MailboxBlob>[];
+          // diff-audit M23: clamp the daemon-supplied count BEFORE allocating.
+          // `count` is a raw Uint32; a buggy/hostile daemon returning e.g.
+          // 0xFFFFFFFF would calloc ~375 GiB of descriptors and OOM-crash the app.
+          // A legitimate mailbox fetch never returns more than a few thousand
+          // blobs, so reject anything implausible.
+          const maxPendingBlobs = 8192;
+          if (count > maxPendingBlobs) {
+            throw VeilException(
+              'mailbox returned an implausible pending count ($count > '
+              '$maxPendingBlobs) — refusing to allocate',
+              code: ffi.veilErr,
+            );
           }
-          return result;
+
+          // Step 2: allocate descriptor array + a blob buffer sized at
+          // [veilMaxDataLen] cap (16 MiB) — daemon-side already caps
+          // per-blob, and a pending-list bigger than the cap is a sign of
+          // misconfiguration that the FFI will reject via INVALID_ARG
+          // (it does NOT lose the cache — caller can retry with larger
+          // buffer).  16 MiB is a sane upper bound for a single fetch.
+          const blobBufLen = ffi.veilMaxDataLen;
+          final descriptors = calloc<ffi.VeilMailboxBlobStruct>(count);
+          final blobBuf = calloc<Uint8>(blobBufLen);
+          try {
+            final rc2 = ffi.veilMailboxFetchInto(
+              _handle,
+              descriptors,
+              count,
+              blobBuf,
+              blobBufLen,
+              errOut,
+            );
+            if (rc2 < 0) {
+              throw VeilException(
+                'mailbox_fetch_into failed: ${_readErrAndFree(errOut)}',
+                code: rc2,
+              );
+            }
+            // rc2 = number of descriptors written; copy each blob payload
+            // into a Dart-owned Uint8List before freeing the buffer.
+            final result = <MailboxBlob>[];
+            for (var i = 0; i < rc2; i++) {
+              final d = descriptors[i];
+              final senderId = Uint8List(32);
+              final contentId = Uint8List(32);
+              for (var j = 0; j < 32; j++) {
+                senderId[j] = d.senderId[j];
+                contentId[j] = d.contentId[j];
+              }
+              final blob = d.blobLen > 0
+                  ? Uint8List.fromList(d.blob.asTypedList(d.blobLen))
+                  : Uint8List(0);
+              result.add(MailboxBlob(
+                senderId: senderId,
+                contentId: contentId,
+                depositedAt: d.depositedAt,
+                data: blob,
+              ));
+            }
+            return result;
+          } finally {
+            calloc.free(descriptors);
+            calloc.free(blobBuf);
+          }
         } finally {
-          calloc.free(descriptors);
-          calloc.free(blobBuf);
+          calloc.free(recv);
+          // authCookie is a 16-byte mailbox capability secret — wipe before free.
+          zeroizeNative(cookie, 16);
+          calloc.free(cookie);
+          calloc.free(outCount);
+          calloc.free(errOut);
         }
-      } finally {
-        calloc.free(recv);
-        // authCookie is a 16-byte mailbox capability secret — wipe before free.
-        zeroizeNative(cookie, 16);
-        calloc.free(cookie);
-        calloc.free(outCount);
-        calloc.free(errOut);
-      }
-    });
+      });
+    } finally {
+      gate.complete();
+    }
   }
 
   /// Acknowledge end-to-end receipt of a blob.  Daemon deletes the
@@ -337,8 +368,7 @@ class VeilMailbox {
         recv.asTypedList(32).setAll(0, receiverId);
         content.asTypedList(32).setAll(0, contentId);
         cookie.asTypedList(16).setAll(0, authCookie);
-        final rc =
-            ffi.veilMailboxAck(_handle, recv, content, cookie, errOut);
+        final rc = ffi.veilMailboxAck(_handle, recv, content, cookie, errOut);
         if (rc < 0) {
           throw VeilException(
             'mailbox_ack failed: ${_readErrAndFree(errOut)}',
