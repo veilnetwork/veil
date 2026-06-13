@@ -47,6 +47,12 @@ use veil_proto::identity_proof::IdentityProof;
 
 use super::publish::{PublishError, sign_identity_proof};
 
+/// Detached signer over arbitrary bytes with the active `identity_sk` — the SK
+/// stays encapsulated inside the closure. Returned by
+/// [`SovereignIdentity::anycast_owner_signer`]; aliased to keep that signature
+/// (and its caller) under clippy's `type_complexity` threshold.
+pub type IdentitySignFn = std::sync::Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Filename where the signed [`IdentityDocument`] is persisted.
@@ -229,6 +235,38 @@ impl SovereignIdentity {
     ///       .map(|sk| Arc::new(sk.clone()));
     pub fn ed25519_signing_key(&self) -> Option<&ed25519_dalek::SigningKey> {
         self.identity_sk.as_ed25519()
+    }
+
+    /// Algo-generic owner-signing material for anycast v3 records (A1 fix:
+    /// supersedes the Ed25519-only [`ed25519_signing_key`] above so a
+    /// Falcon-512 / hybrid sovereign can sign too, instead of falling back
+    /// to unsigned advertise).
+    ///
+    /// Returns `(algo_wire_byte, owner_pubkey, sign)` — the active
+    /// `identity_sk`'s algorithm, its public key, and a closure that signs
+    /// arbitrary bytes with it. The closure captures `Arc<Self>`, so it
+    /// outlives this borrow.
+    ///
+    /// Returns `None` unless this identity is **standalone**. Anycast
+    /// owner-binding requires the MASTER key: the record's owner_pubkey must
+    /// satisfy `BLAKE3(owner_pubkey) == node_id` with `sig_key_idx == 0`. Only
+    /// a standalone device holds the master key as its `identity_sk` (see
+    /// [`is_standalone`]); a multi-device subkey can't satisfy the binding, so
+    /// it must NOT advertise signed records (verifiers would reject them).
+    ///
+    /// [`ed25519_signing_key`]: Self::ed25519_signing_key
+    /// [`is_standalone`]: Self::is_standalone
+    pub fn anycast_owner_signer(
+        self: &std::sync::Arc<Self>,
+    ) -> Option<(u8, Vec<u8>, IdentitySignFn)> {
+        if !self.is_standalone() {
+            return None;
+        }
+        let algo = self.identity_sk.algo();
+        let owner_pubkey = self.identity_sk.public_key_bytes();
+        let me = std::sync::Arc::clone(self);
+        let sign: IdentitySignFn = std::sync::Arc::new(move |msg: &[u8]| me.identity_sk.sign(msg));
+        Some((algo, owner_pubkey, sign))
     }
 
     /// Convenience: use `document.sig_key_idx` as the active index.
@@ -1237,6 +1275,51 @@ mod tests {
         assert!(
             !sov.is_standalone(),
             "create_identity produces master != device → not standalone",
+        );
+    }
+
+    #[test]
+    fn anycast_owner_signer_standalone_signs_and_binds() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let (dir, _) = fresh_standalone_dir();
+        let sov = std::sync::Arc::new(SovereignIdentity::load_from_dir(&dir).unwrap());
+
+        let (algo_byte, owner_pubkey, sign) = sov
+            .anycast_owner_signer()
+            .expect("standalone identity must yield an owner-signer");
+
+        // Standalone seed is Ed25519 → wire byte 0, owner_pubkey == master_pubkey.
+        assert_eq!(algo_byte, 0, "standalone seed identity is Ed25519");
+        assert_eq!(
+            owner_pubkey, sov.document.master_pubkey,
+            "owner_pubkey must be the master verifying key",
+        );
+        // Owner-binding: BLAKE3(owner_pubkey) == node_id, with sig_key_idx 0.
+        assert_eq!(
+            blake3::hash(&owner_pubkey).as_bytes(),
+            sov.node_id(),
+            "BLAKE3(owner_pubkey) must equal node_id",
+        );
+
+        // The closure produces a valid Ed25519 signature over arbitrary bytes.
+        let msg = b"anycast canonical bytes under test";
+        let sig_bytes = sign(msg);
+        let vk = VerifyingKey::from_bytes(owner_pubkey.as_slice().try_into().unwrap())
+            .expect("32-byte ed25519 pubkey");
+        let sig = Signature::from_slice(&sig_bytes).expect("64-byte ed25519 sig");
+        vk.verify(msg, &sig)
+            .expect("owner-signer signature must verify under owner_pubkey");
+    }
+
+    #[test]
+    fn anycast_owner_signer_none_for_subkey() {
+        // A multi-device subkey identity is NOT standalone: it cannot satisfy
+        // the owner-binding, so it must not hand out an owner-signer.
+        let (dir, _out) = fresh_dir_with_identity();
+        let sov = std::sync::Arc::new(SovereignIdentity::load_from_dir(&dir).unwrap());
+        assert!(
+            sov.anycast_owner_signer().is_none(),
+            "non-standalone (subkey) identity must yield no owner-signer",
         );
     }
 
