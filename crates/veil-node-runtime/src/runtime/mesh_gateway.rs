@@ -425,6 +425,20 @@ impl NodeRuntime {
                     if already {
                         continue;
                     }
+                    // diff-audit M12: skip if we already recorded an
+                    // autodiscovered entry for this node_id. Without this, an
+                    // unreachable-but-beaconing gateway (no live session ever
+                    // forms) gets a BRAND-NEW entry every poll pass (~1/s →
+                    // ~86k/day), growing `state.peers` without bound. The first
+                    // pass already spawned a self-retrying outbound connector, so
+                    // re-inserting buys nothing.
+                    let already_recorded = lock_state(&state)
+                        .peers
+                        .values()
+                        .any(|p| *p.node_id.as_bytes() == gw.node_id);
+                    if already_recorded {
+                        continue;
+                    }
 
                     let peer_id = PeerId::new(peer_id_counter);
                     peer_id_counter = peer_id_counter.wrapping_add(1);
