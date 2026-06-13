@@ -519,7 +519,7 @@ extern "C" {
  * `socket_path` is treated as an anchor — see
  * [`veilclient::VeilClient::connect`] for backend discovery rules.
  */
- VeilHandle *veil_connect(const char *socket_path, char **err_out) ;
+ VeilHandle *veil_connect(const uint8_t *socket_path, uintptr_t socket_path_len, char **err_out) ;
 
 /**
  * Release the handle. Outstanding apps / streams keep the runtime
@@ -538,8 +538,10 @@ extern "C" {
  */
 
 VeilApp *veil_bind(VeilHandle *handle,
-                   const char *namespace_,
-                   const char *name,
+                   const uint8_t *namespace_,
+                   uintptr_t namespace_len,
+                   const uint8_t *name,
+                   uintptr_t name_len,
                    uint32_t endpoint_id,
                    char **err_out)
 ;
@@ -550,8 +552,10 @@ VeilApp *veil_bind(VeilHandle *handle,
  */
 
 VeilApp *veil_bind_named(VeilHandle *handle,
-                         const char *namespace_,
-                         const char *name,
+                         const uint8_t *namespace_,
+                         uintptr_t namespace_len,
+                         const uint8_t *name,
+                         uintptr_t name_len,
                          uint32_t endpoint_id,
                          char **err_out)
 ;
@@ -1103,9 +1107,9 @@ int veil_mailbox_ack(VeilHandle *handle,
  *. Forwards the URI bytes to the daemon, which decodes
  * them through the standard plain / encrypted / signed-invite paths.
  *
- * `uri` must be NUL-terminated UTF-8. `password` and `expected_issuer_pk`
- * may be NULL (for plain URIs / unsigned), or NUL-terminated UTF-8
- * strings.
+ * `uri` is `(ptr, len)` UTF-8 (no NUL terminator). `password` and
+ * `expected_issuer_pk` may be NULL (for plain URIs / unsigned) — pass a NULL
+ * pointer (length ignored) — or `(ptr, len)` UTF-8.
  *
  * On success / `VEIL_JOIN_ALREADY_REGISTERED`, `out_node_id_32` is
  * populated with the decoded peer's node_id. On any error status it is
@@ -1124,9 +1128,12 @@ int veil_mailbox_ack(VeilHandle *handle,
  */
 
 int veil_join_bootstrap_uri(VeilHandle *handle,
-                            const char *uri,
-                            const char *password,
-                            const char *expected_issuer_pk,
+                            const uint8_t *uri,
+                            uintptr_t uri_len,
+                            const uint8_t *password,
+                            uintptr_t password_len,
+                            const uint8_t *expected_issuer_pk,
+                            uintptr_t expected_issuer_pk_len,
                             uint8_t *out_node_id_32,
                             uint8_t *out_status,
                             char **err_out)
@@ -1139,9 +1146,9 @@ int veil_join_bootstrap_uri(VeilHandle *handle,
  * the FFI returns through `out_uri` — caller MUST free it via
  * [`veil_free_string`] after consuming.
  *
- * `password` may be `NULL` (plain `veil:bootstrap?…` URI) or a
- * NUL-terminated UTF-8 string (encrypted `veil:pair?…` envelope).
- * Empty / whitespace-only passwords are rejected with status
+ * `password` may be `NULL` (plain `veil:bootstrap?…` URI) — pass a NULL
+ * pointer (length ignored) — or `(ptr, len)` UTF-8 (encrypted `veil:pair?…`
+ * envelope). Empty / whitespace-only passwords are rejected with status
  * `VEIL_CREATE_INVITE_BAD_PASSWORD` so callers can re-prompt rather
  * than emitting an envelope encrypted under a trivial key.
  *
@@ -1159,7 +1166,8 @@ int veil_join_bootstrap_uri(VeilHandle *handle,
  */
 
 int veil_create_bootstrap_invite(VeilHandle *handle,
-                                 const char *password,
+                                 const uint8_t *password,
+                                 uintptr_t password_len,
                                  uint8_t *out_status,
                                  char **out_uri,
                                  char **err_out)
@@ -1369,64 +1377,12 @@ int veil_verify_wake_hmac(const uint8_t *key_32,
  int veil_set_event_handler(VeilHandle *handle, VeilEventCb cb, void *user, char **err_out) ;
 
 /**
- * Validate a BIP-39 master phrase. Returns `VEIL_OK` iff the
- * phrase is exactly 24 words from the English BIP-39 wordlist AND
- * the checksum verifies. Sets `*err_out` to a human-readable
- * description on failure (unknown word / wrong word count / bad
- * checksum).
+ * Validate a BIP-39 master phrase, zeroizing the caller's buffer on consume.
  *
- * Lightweight — no key derivation, no disk I/O. UI uses this to
- * give immediate feedback as the user types ("checksum invalid"
- * before they hit "Restore").
- *
- * **DEPRECATED (Epic 489.8): prefer [`veil_validate_bip39_phrase_zeroize`].**
- * This `*const c_char` form leaves the mnemonic in the caller's heap; the
- * `_zeroize` variant takes `*mut c_char` and wipes it in place. The Flutter
- * wrapper already uses the `_zeroize` variant. Kept only for ABI back-compat
- * with existing raw/C consumers; slated for removal at the next ABI break.
- */
- int veil_validate_bip39_phrase(const char *phrase, char **err_out) ;
-
-/**
- * Restore an identity from a BIP-39 master phrase.
- *
- * Decodes phrase → master_seed → derives identity_sk → builds a
- * fresh signed `IdentityDocument` → writes to `veil_dir`:
- *
- * * `identity_document.bin` (signed master+device cert chain)
- * * `instance.toml` (per-device label + sig key index)
- * * `identity_sk.bin` (this device's per-instance signing key)
- *
- * `instance_label` is the human-readable name shown in `identity show`
- * output on other devices belonging to the same identity_id (e.g.
- * "phone-2024-05"). Caps at 64 ASCII chars; longer names truncate.
- *
- * Idempotent: re-running with the same phrase + same veil_dir
- * regenerates the per-device identity_sk and rewrites the document.
- * The `node_id` (= BLAKE3(master_pk)) is **stable** across calls.
- *
- * Pow_difficulty is fixed at 0 for testnet builds; release builds
- * using `production-seeds` would set it from a release-policy file.
- *
- * Returns `VEIL_OK` on success. On failure sets `*err_out` to
- * a description and returns `VEIL_ERR`.
- *
- * **DEPRECATED (Epic 489.8): prefer
- * [`veil_restore_identity_from_phrase_zeroize`].** This `*const c_char` form
- * leaves the mnemonic in the caller's heap; the `_zeroize` variant takes
- * `*mut c_char` and wipes it in place. The Flutter wrapper already uses the
- * `_zeroize` variant. Kept only for ABI back-compat with existing raw/C
- * consumers; slated for removal at the next ABI break.
- */
-
-int veil_restore_identity_from_phrase(const char *phrase,
-                                      const char *veil_dir,
-                                      const char *instance_label,
-                                      char **err_out)
-;
-
-/**
- * Zero-on-consume variant [`veil_validate_bip39_phrase`].
+ * Returns `VEIL_OK` iff the phrase is exactly 24 words from the English BIP-39
+ * wordlist AND the checksum verifies. The `(phrase, phrase_len)` buffer is
+ * overwritten with `0` before returning, on every path. UI uses this for live
+ * feedback as the user types.
  *
  * Reads the phrase, runs the same validation, and unconditionally
  * overwrites the buffer bytes with `0` before returning — regardless
@@ -1434,22 +1390,30 @@ int veil_restore_identity_from_phrase(const char *phrase,
  * writable, NUL-terminated UTF-8 buffer (typical: malloc'd from C, or
  * `String.toNativeUtf8` in Dart).
  */
- int veil_validate_bip39_phrase_zeroize(char *phrase, char **err_out) ;
+ int veil_validate_bip39_phrase_zeroize(uint8_t *phrase, uintptr_t phrase_len, char **err_out) ;
 
 /**
- * Zero-on-consume variant [`veil_restore_identity_from_phrase`].
+ * Restore an identity from a BIP-39 master phrase, zeroizing the phrase on
+ * consume.
  *
- * Same contract as [`veil_restore_identity_from_phrase`] except
- * `phrase` is `*mut c_char` (caller-owned writable buffer). After
- * decoding the master seed, the phrase buffer is overwritten with `0`
- * in place — including on every error path — before this function
- * returns. `veil_dir` and `instance_label` are still `*const c_char`
- * (non-secret).
+ * Decodes `phrase` → master_seed → derives identity_sk → builds a fresh signed
+ * `IdentityDocument` and writes `identity_document.bin`, `instance.toml`, and
+ * `identity_sk.bin` to `veil_dir`. `instance_label` is the human-readable
+ * device name (capped at 64 chars). Idempotent: same phrase + same `veil_dir`
+ * regenerates the per-device key; the `node_id` (= BLAKE3(master_pk)) is stable.
+ *
+ * `phrase` is a SECRET, passed as a writable `(*mut u8, len)` buffer that is
+ * overwritten with `0` before return on EVERY path. `veil_dir` and
+ * `instance_label` are non-secret `(*const u8, len)` UTF-8. Returns `VEIL_OK`
+ * on success; on failure sets `*err_out` and returns `VEIL_ERR`.
  */
 
-int veil_restore_identity_from_phrase_zeroize(char *phrase,
-                                              const char *veil_dir,
-                                              const char *instance_label,
+int veil_restore_identity_from_phrase_zeroize(uint8_t *phrase,
+                                              uintptr_t phrase_len,
+                                              const uint8_t *veil_dir,
+                                              uintptr_t veil_dir_len,
+                                              const uint8_t *instance_label,
+                                              uintptr_t instance_label_len,
                                               char **err_out)
 ;
 
@@ -1475,29 +1439,35 @@ int veil_restore_identity_from_phrase_zeroize(char *phrase,
  * `argon2_params_override`.
  *
  * # Safety
- * `phrase` and (if non-NULL) `password` must each point to a writable,
- * NUL-terminated UTF-8 buffer.  `veil_dir` and `instance_label` must
- * be NUL-terminated UTF-8 (read-only).  `err_out` must be writable;
- * on non-OK returns it receives a pointer to a malloc'd UTF-8 string —
- * caller frees with [`veil_free_string`].
+ * `phrase` and (if non-NULL) `password` must each point to a writable buffer
+ * of at least the given length.  `veil_dir` and `instance_label` are read-only
+ * `(*const u8, len)` UTF-8.  `err_out` must be writable; on non-OK returns it
+ * receives a pointer to a malloc'd UTF-8 string — caller frees with
+ * [`veil_free_string`].
  */
 
-int veil_restore_identity_from_phrase_zeroize_with_password(char *phrase,
-                                                            const char *veil_dir,
-                                                            const char *instance_label,
-                                                            char *password,
+int veil_restore_identity_from_phrase_zeroize_with_password(uint8_t *phrase,
+                                                            uintptr_t phrase_len,
+                                                            const uint8_t *veil_dir,
+                                                            uintptr_t veil_dir_len,
+                                                            const uint8_t *instance_label,
+                                                            uintptr_t instance_label_len,
+                                                            uint8_t *password,
+                                                            uintptr_t password_len,
                                                             char **err_out)
 ;
 
 /**
  * Source-side: generate a pair-invite URI + initialize ceremony.
  * On success, `*out_uri` receives a malloc'd NUL-terminated UTF-8
- * string — caller frees with [`veil_free_string`].  `password` MUST
- * be NUL-terminated UTF-8 (the master_sk decryption passphrase).
+ * string — caller frees with [`veil_free_string`].  `password` is the
+ * master_sk decryption passphrase as `(ptr, len)` UTF-8; pass a NULL pointer
+ * (length ignored) for a standalone identity with no encrypted master.
  */
 
 int veil_pair_source_create_invite(VeilHandle *handle,
-                                   const char *password,
+                                   const uint8_t *password,
+                                   uintptr_t password_len,
                                    uint8_t *out_status,
                                    char **out_uri,
                                    char **err_out)
@@ -1542,7 +1512,8 @@ int veil_pair_source_handle_confirm(VeilHandle *handle,
  */
 
 int veil_pair_target_consume_uri(VeilHandle *handle,
-                                 const char *uri,
+                                 const uint8_t *uri,
+                                 uintptr_t uri_len,
                                  uint8_t *out_status,
                                  uint8_t *out_hello_buf,
                                  size_t out_hello_buf_cap,
