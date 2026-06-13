@@ -1412,28 +1412,44 @@ impl NodeRuntime {
         )
         .with_policy(anycast_policy);
         if let Some(sov) = self.identity.sovereign_identity.as_ref() {
-            if let Some(ed_sk) = sov.ed25519_signing_key() {
-                // sig_key_idx = 0 follows the IdentityDocument convention
-                // (master signing key).  Cloning a 32-byte SigningKey to
-                // Arc-share with the anycast service is cheap.
-                anycast_svc_builder =
-                    anycast_svc_builder.with_signing_key(std::sync::Arc::new(ed_sk.clone()), 0);
+            // A1 (audit) fix: algo-generic owner-signer — signs v2 (Ed25519) OR
+            // v3 (Falcon-512 / hybrid) records, so a PQ-only sovereign signs too
+            // instead of falling back to unsigned advertise. `sig_key_idx = 0`
+            // (master) follows the IdentityDocument convention and is required
+            // for the BLAKE3(owner_pubkey)==node_id owner-binding.
+            if let Some((algo_byte, owner_pubkey, sign)) = sov.anycast_owner_signer() {
+                match veil_types::SignatureAlgorithm::from_wire_byte(algo_byte) {
+                    Some(algo) => {
+                        anycast_svc_builder = anycast_svc_builder.with_signer(
+                            veil_anycast::AnycastSigner::new(algo, owner_pubkey, 0, sign),
+                        );
+                    }
+                    None => {
+                        // Unreachable in practice: `identity_sk.algo()` only ever
+                        // yields a known wire byte. Guard rather than panic.
+                        self.logger.warn(
+                            "anycast.signing.unknown_algo",
+                            "sovereign identity reports an unrecognized signature \
+                             algorithm byte: anycast records will be published \
+                             UNSIGNED",
+                        );
+                    }
+                }
             } else {
-                // A1 (audit): a PQ-only (Falcon-512) sovereign identity has no
-                // Ed25519 signing key, and anycast owner-signing is Ed25519-only
-                // on the wire today — so our anycast records would go out
-                // UNSIGNED. Peers on the DEFAULT `SignedBound` resolve policy
-                // drop unsigned records, so the advertise silently fails to
-                // resolve. Surface it loudly rather than failing silently;
-                // Falcon/hybrid anycast signing is a separate wire-compat
-                // exercise.
+                // `anycast_owner_signer` returns `None` only for a non-standalone
+                // (multi-device subkey) identity: its key is NOT the master, so a
+                // signed record's owner_pubkey could not satisfy the binding and
+                // verifiers would reject it. Such records would go out effectively
+                // unverifiable, so we publish UNSIGNED instead — peers on the
+                // default `SignedBound` resolve policy drop those, so anycast
+                // advertise is disabled for subkey identities. Surface it.
                 self.logger.warn(
-                    "anycast.signing.unsupported_pq_only",
-                    "sovereign identity is PQ-only (no Ed25519 signing key): \
-                     anycast records will be published UNSIGNED and dropped by \
-                     peers running the default SignedBound resolve policy, so \
-                     anycast advertise is effectively disabled until \
-                     Falcon/hybrid anycast signing ships",
+                    "anycast.signing.subkey_cannot_bind",
+                    "sovereign identity is a multi-device subkey (not standalone \
+                     master): it cannot satisfy the anycast owner-binding, so \
+                     records are published UNSIGNED and dropped by peers running \
+                     the default SignedBound resolve policy — anycast advertise is \
+                     effectively disabled for this identity",
                 );
             }
         }
