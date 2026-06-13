@@ -130,6 +130,35 @@ impl Drop for NodeIdMacKey {
     }
 }
 
+/// HKDF domain separator for [`NodeIdMacKey::derive_from_identity`]. Versioned
+/// so a future rederivation scheme can't collide with this one.
+pub const NODE_ID_MAC_DERIVE_INFO: &[u8] = b"veil-obfs4-node-id-mac-key:v1";
+
+impl NodeIdMacKey {
+    /// Derive the anti-probe MAC key from the listener's **public** identity —
+    /// the obfs4 "node_id_mac_key = HKDF(server identity)" model promised in
+    /// this module's header, realized.
+    ///
+    /// `verifying_key` is the listener owner's identity public key (the invite's
+    /// `vk`); `node_id` is its BLAKE3 fingerprint (the invite's `nid`,
+    /// `BLAKE3(vk)`). Both peers hold this material — the client from the invite,
+    /// the server from its own identity — so both derive the SAME key with no
+    /// shared secret to distribute, leak, or rotate.
+    ///
+    /// `verifying_key` (the BLAKE3 preimage) is the keying material and `node_id`
+    /// is the salt: an observer who only knows the public `node_id` cannot
+    /// recover `vk` (preimage resistance) and so cannot derive this key — the
+    /// anti-probe property reduces to "holds an invite", exactly the Tor obfs4
+    /// bridge-line trust model.
+    pub fn derive_from_identity(verifying_key: &[u8], node_id: &[u8; 32]) -> Self {
+        let hk = Hkdf::<Sha256>::new(Some(node_id), verifying_key);
+        let mut key = [0u8; 32];
+        hk.expand(NODE_ID_MAC_DERIVE_INFO, &mut key)
+            .expect("32 is a valid HKDF-SHA256 output length");
+        Self(key)
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn unix_timestamp() -> u64 {
@@ -564,6 +593,63 @@ mod tests {
 
     fn test_psk() -> NodeIdMacKey {
         NodeIdMacKey([0x42; 32])
+    }
+
+    // ── Option C: identity-derived node_id_mac_key ───────────────────────────
+
+    // node_id is BLAKE3(vk) in production; the derivation treats it as an
+    // opaque 32-byte salt, so the tests pin fixed bytes (no blake3 dep needed).
+    #[test]
+    fn derive_from_identity_is_deterministic() {
+        let vk = [0x11u8; 32];
+        let node_id = [0xE1u8; 32];
+        let a = NodeIdMacKey::derive_from_identity(&vk, &node_id);
+        let b = NodeIdMacKey::derive_from_identity(&vk, &node_id);
+        assert_eq!(a.0, b.0, "same identity must derive the same key");
+    }
+
+    #[test]
+    fn derive_from_identity_separates_distinct_listeners() {
+        let ka = NodeIdMacKey::derive_from_identity(&[0x11u8; 32], &[0xE1u8; 32]);
+        let kb = NodeIdMacKey::derive_from_identity(&[0x22u8; 32], &[0xE2u8; 32]);
+        assert_ne!(ka.0, kb.0, "distinct identities must derive distinct keys");
+        // Salt (node_id) must also matter: same vk, different node_id ⇒ different key.
+        let ka2 = NodeIdMacKey::derive_from_identity(&[0x11u8; 32], &[0x99u8; 32]);
+        assert_ne!(ka.0, ka2.0, "node_id salt must affect the derived key");
+    }
+
+    #[test]
+    fn derived_key_completes_handshake_and_wrong_identity_is_dropped() {
+        // Client (holds the invite ⇒ vk) and server (its own identity) derive
+        // the SAME key and the handshake succeeds — no shared secret distributed.
+        let vk = [0xABu8; 32];
+        let node_id = [0xCDu8; 32];
+        let server_key = NodeIdMacKey::derive_from_identity(&vk, &node_id);
+        let client_key = NodeIdMacKey::derive_from_identity(&vk, &node_id);
+
+        let (client_state, c_wire) = ClientHandshake::start(&client_key).unwrap();
+        let (server_out, s_wire) = ServerHandshake::accept_full(&c_wire, &server_key)
+            .expect("derived key must accept a matching client handshake");
+        let client_out = client_state.complete(&s_wire).unwrap();
+
+        // Agreement check: a frame wrapped under the client's c2s key must
+        // unwrap under the server's c2s key (identical direction keys ⇒ same
+        // session secret).
+        let mut tx = OutboundStream::new(client_out.dk_c_to_s);
+        let mut rx = InboundStream::new(server_out.dk_c_to_s);
+        let frame = tx.wrap_next(b"derived-key handshake").unwrap();
+        let (_, got) = rx.unwrap_next(&frame).unwrap();
+        assert_eq!(got, b"derived-key handshake");
+
+        // A prober that only knows node_id (public) but not vk derives a wrong
+        // key ⇒ server silent-drops. Model that with an unrelated vk.
+        let prober_key = NodeIdMacKey::derive_from_identity(&[0x00u8; 32], &node_id);
+        let (_pstate, p_wire) = ClientHandshake::start(&prober_key).unwrap();
+        assert_eq!(
+            ServerHandshake::accept_full(&p_wire, &server_key).unwrap_err(),
+            HandshakeError::ClientMacMismatch,
+            "handshake under a non-matching derived key must be dropped"
+        );
     }
 
     /// SECURITY regression (C-01): the handshake must carry NO plaintext

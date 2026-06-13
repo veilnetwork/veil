@@ -64,8 +64,8 @@ pub mod wire_variant;
 pub use wire_variant::WireFormatVariant;
 
 pub use ntor::{
-    ClientHandshake, ClientHandshakeOutput, HANDSHAKE_MAX_BYTES, HANDSHAKE_MIN_BYTES, NodeIdMacKey,
-    ServerHandshake, ServerHandshakeOutput,
+    ClientHandshake, ClientHandshakeOutput, HANDSHAKE_MAX_BYTES, HANDSHAKE_MIN_BYTES,
+    NODE_ID_MAC_DERIVE_INFO, NodeIdMacKey, ServerHandshake, ServerHandshakeOutput,
 };
 pub use stream::{
     Obfs4Stream, UpgradeError, obfs4_client_connect, obfs4_client_connect_variant,
