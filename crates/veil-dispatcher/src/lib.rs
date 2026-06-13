@@ -1362,7 +1362,17 @@ impl FrameDispatcher {
         if !self.capture_rate_limit.allow(*peer_id.as_bytes()) {
             return;
         }
-        let slot = lock!(self.capture_tx);
+        let mut slot = lock!(self.capture_tx);
+        // diff-audit M13: if the DebugCapture subscriber has dropped, retire the
+        // capture (clear the Sender + flag) so we stop paying the per-frame
+        // rate-limit + header-decode for a capture nobody reads. `capture_active`
+        // was previously never reset after a one-shot capture ended.
+        if matches!(&*slot, Some(tx) if tx.receiver_count() == 0) {
+            *slot = None;
+            self.capture_active
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         if let Some(ref tx) = *slot {
             if frame.len() < veil_proto::header::HEADER_SIZE {
                 return;
@@ -1424,23 +1434,31 @@ impl FrameDispatcher {
             .capture_active
             .load(std::sync::atomic::Ordering::Relaxed)
             && self.capture_rate_limit.allow(*peer_id.as_bytes())
-            && let Some(ref tx) = *lock!(self.capture_tx)
         {
-            let event = CaptureEvent::new_truncated(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as u64,
-                true, // inbound
-                *peer_id.as_bytes(),
-                self.local_node_id,
-                header.family,
-                header.msg_type,
-                header.body_len,
-                body,
-                false, // not e2e_plaintext
-            );
-            let _ = tx.send(event); // lagging receivers are silently dropped
+            let mut slot = lock!(self.capture_tx);
+            // diff-audit M13: retire the capture if its subscriber dropped (see
+            // capture_outbound) so capture_active doesn't stay set forever.
+            if matches!(&*slot, Some(tx) if tx.receiver_count() == 0) {
+                *slot = None;
+                self.capture_active
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            } else if let Some(ref tx) = *slot {
+                let event = CaptureEvent::new_truncated(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64,
+                    true, // inbound
+                    *peer_id.as_bytes(),
+                    self.local_node_id,
+                    header.family,
+                    header.msg_type,
+                    header.body_len,
+                    body,
+                    false, // not e2e_plaintext
+                );
+                let _ = tx.send(event); // lagging receivers are silently dropped
+            }
         }
 
         // ── Abuse pre-checks ────────────────────────────────────────────────

@@ -193,11 +193,23 @@ impl GatewayBridge {
                     }
                     seen.insert(envelope.content_id, now);
                 }
-                lock!(self.lifted).push(LiftedEnvelope {
-                    realm_id,
-                    src_node_id: frame.src_node_id,
-                    envelope,
-                });
+                // diff-audit M17: bound the lifted queue. It is drained by the
+                // veil layer; if that drain stalls, an unbounded `Vec` grows
+                // without limit. Drop the OLDEST entry past the cap (a stalled
+                // drain means the oldest frames are the most stale anyway) so a
+                // backpressured veil plane can't OOM the gateway.
+                const MAX_LIFTED: usize = 4096;
+                {
+                    let mut lifted = lock!(self.lifted);
+                    if lifted.len() >= MAX_LIFTED {
+                        lifted.remove(0);
+                    }
+                    lifted.push(LiftedEnvelope {
+                        realm_id,
+                        src_node_id: frame.src_node_id,
+                        envelope,
+                    });
+                }
             }
             Err(e) => {
                 log::warn!(
