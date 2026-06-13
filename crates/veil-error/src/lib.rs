@@ -163,9 +163,6 @@ pub enum ConfigError {
         /// Underlying reason provided by the crypto backend.
         details: String,
     },
-    /// OS-level failure installing the SIGINT/Ctrl+C handler.
-    #[error("failed to install interrupt handler: {0}")]
-    InterruptHandlerInstall(String),
     /// A shared-state mutex was found poisoned.
     #[error("shared state `{0}` was poisoned")]
     PoisonedState(&'static str),
