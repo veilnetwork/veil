@@ -5997,7 +5997,10 @@ impl NodeServices {
         relay_path: &[[u8; 32]],
         cookie: [u8; 16],
         reg_kp: &veil_crypto::GeneratedKeyPair,
-    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+    ) -> std::result::Result<
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        veil_types::AnonOnionSendError,
+    > {
         use base64::Engine;
         use veil_anonymity::circuit_origin::{OriginHop, build_origin_circuit};
         use veil_anonymity::circuit_register::CircuitRegisterPayload;
@@ -6063,6 +6066,10 @@ impl NodeServices {
         let (setup, origin) = build_origin_circuit(&hops, &reg.encode(), now)
             .map_err(|_| AnonOnionSendError::NoRelays)?;
         let first_hop = origin.first_hop;
+        // Δ2-d: share the circuit's confirmation flag with the caller so the
+        // maintenance tick can tell whether the terminus ACK'd this path (and
+        // re-select a fresh path if it never did).
+        let confirmed = std::sync::Arc::clone(&origin.confirmed);
         if !origin_table.insert(std::sync::Arc::new(origin)) {
             return Err(AnonOnionSendError::NoRelays); // origin table full
         }
@@ -6073,7 +6080,7 @@ impl NodeServices {
             veil_proto::family::RelayChainMsg::CircuitBuild,
             &setup,
         );
-        Ok(())
+        Ok(confirmed)
     }
 
     /// Register this node as a LOCATION-anonymous service (the prod entry point):
@@ -6248,7 +6255,7 @@ impl NodeServices {
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
         // Mint the registration keypair ONCE here; every rebuild reuses it (L1).
         let reg_keypair = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
-        self.build_onion_circuit_once(relay_path, cookie, &reg_keypair)?;
+        let confirmed = self.build_onion_circuit_once(relay_path, cookie, &reg_keypair)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -6278,6 +6285,7 @@ impl NodeServices {
             cookie,
             built_unix: now,
             reg_keypair,
+            confirmed,
         });
         Ok(())
     }
@@ -6320,23 +6328,57 @@ impl NodeServices {
 
         // Refresh at half the relay-side circuit idle TTL (300 s) → 150 s.
         const REFRESH_SECS: u64 = veil_anonymity::circuit_table::DEFAULT_CIRCUIT_TTL_SECS / 2;
-        let due: Vec<([u8; 16], Vec<[u8; 32]>, veil_crypto::GeneratedKeyPair)> = {
+        type DueEntry = (
+            [u8; 16],
+            Vec<[u8; 32]>,
+            veil_crypto::GeneratedKeyPair,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        );
+        let due: Vec<DueEntry> = {
             let svcs = lock!(self.anonymity.onion_services);
             svcs.iter()
                 .filter(|e| now_unix.saturating_sub(e.built_unix) >= REFRESH_SECS)
-                .map(|e| (e.cookie, e.relay_path.clone(), e.reg_keypair.clone()))
+                .map(|e| {
+                    (
+                        e.cookie,
+                        e.relay_path.clone(),
+                        e.reg_keypair.clone(),
+                        std::sync::Arc::clone(&e.confirmed),
+                    )
+                })
                 .collect()
         };
-        for (cookie, relay_path, reg_keypair) in due {
-            if self
-                .build_onion_circuit_once(&relay_path, cookie, &reg_keypair)
-                .is_ok()
-            {
+        for (cookie, relay_path, reg_keypair, prev_confirmed) in due {
+            // diff-audit Δ2-d: if the terminus never ACK'd the current circuit
+            // (CircuitBuilt), its path is suspect — a hop is likely dead. Pick a
+            // FRESH path rather than rebuilding the same frozen one. A confirmed
+            // circuit keeps its proven-live path. (Build stays optimistic, so a
+            // pre-Δ2-d terminus that never ACKs just causes path rotation, never
+            // a broken service.)
+            let reselect = !prev_confirmed.load(std::sync::atomic::Ordering::Relaxed);
+            let path = if reselect {
+                match self.select_onion_relay_path(relay_path.len()) {
+                    Ok(p) => {
+                        self.logger.info(
+                            "onion.circuit.reselect",
+                            "unconfirmed circuit — re-selecting a fresh relay path",
+                        );
+                        p
+                    }
+                    Err(_) => relay_path.clone(), // no fresh path available — retry same
+                }
+            } else {
+                relay_path.clone()
+            };
+            if let Ok(new_confirmed) = self.build_onion_circuit_once(&path, cookie, &reg_keypair) {
                 let mut svcs = lock!(self.anonymity.onion_services);
                 if let Some(e) = svcs.iter_mut().find(|e| e.cookie == cookie) {
                     e.built_unix = now_unix;
+                    e.relay_path = path.clone();
+                    e.confirmed = new_confirmed;
                 }
             }
+            let relay_path = path;
             // Re-publish the blinded descriptor under the CURRENT period so the
             // by-identity send path keeps resolving across period boundaries.
             // register_onion_service seals it only once; the descriptor's DHT key
