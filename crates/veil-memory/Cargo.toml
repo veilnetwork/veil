@@ -1,6 +1,6 @@
 [package]
 name = "veil-memory"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Global memory-budget manager (Epic 323): distributes a configurable RAM budget across veil components and triggers proportional eviction when exceeded.  Phase 6 extraction from veilcore."
 license = "AGPL-3.0-or-later"

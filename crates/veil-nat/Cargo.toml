@@ -1,6 +1,6 @@
 [package]
 name = "veil-nat"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "NAT traversal: ICE-style candidate discovery, UDP hole-punch, relay fallback. Phase 6 extraction from veilcore."
 license = "AGPL-3.0-or-later"

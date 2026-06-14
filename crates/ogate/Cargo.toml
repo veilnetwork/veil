@@ -1,6 +1,6 @@
 [package]
 name = "ogate"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Veil-network TUN bridge: connect two or more machines via virtual IP over the veil (open or authorized membership)."
