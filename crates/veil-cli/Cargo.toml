@@ -1,6 +1,6 @@
 [package]
 name = "veil-cli"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Veil network CLI — veil-cli binary + supporting cmd/ modules. Phase 5 of veilcore extraction."
 license = "AGPL-3.0-or-later"

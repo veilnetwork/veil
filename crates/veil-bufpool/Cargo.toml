@@ -1,6 +1,6 @@
 [package]
 name = "veil-bufpool"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Size-bucketed buffer pool for hot-path frame allocations (2026-05-13 OOM follow-up). Returns Vec<u8>-equivalent storage to the kernel between bursts so RSS stays flat under sustained throughput; complementary to jemalloc which already reduces fragmentation but doesn't eliminate burst-induced page-residency."
 license = "AGPL-3.0-or-later"
