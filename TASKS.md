@@ -14,6 +14,45 @@ Each epic ends by transitioning to the next via a re-analysis task.
 
 ---
 
+## Audit remediation batch 2026-06-14 (full-project audit + external report merge)
+
+A full-project security/quality audit was cross-validated against an external
+report. Validated findings were fixed brick-by-brick (build + clippy `-D
+warnings` + tests, each its own commit). External-report items were each
+validated before action — several were already-handled or false positives.
+
+### ✅ Fixed this batch
+
+| Finding | Fix | Commit |
+|---|---|---|
+| **F-CRYPTO-1/2** lazy-miner never terminates (unreachable cap → ~40% idle CPU) | exhaustion guard sweeps the full 2³² nonce space then stops; `into_config` uses `default_max_lazy_difficulty()` (no hardcoded 64) | `a13c79b` |
+| **DHT F1** 3 dead pub network methods (one a latent foot-gun returning an unverified value) | deleted + cascade-deleted the `interleave_capped_diverse` helper & its 2 tests; re-attached an orphaned doc | `97d5f2f` |
+| **DHT F2** always-false `closest.contains(&local_node_id)` disjunct | removed (find_closest excludes self per Kademlia) | `97d5f2f` |
+| **DHT F3** iterative Layer-1 filter doc-drift (stale "2× margin") | corrected to the strict `r_dist > peer_dist` rule | `97d5f2f` |
+| **Anon F3** `IntroducePayload::decode` accepted trailing bytes (`< total`) | exact-length (`!= total`) + trailing-byte rejection test | `bcbf3dc` |
+| **Anon F4** `cookie_unknown` logged for known-cookie replays/drops | `bool` → `CircuitIntroduceForward { Forwarded, KnownButDropped, NotCircuit }`; signal fires only on a truly unknown cookie | `bcbf3dc` |
+| **M-1** deterministic onion path + rendezvous-relay selection | Fisher–Yates over OsRng for middles; random R among published-eligible (pinned relays stay deterministic) | `512f84a` |
+| **M-2** partial-reload zombie on bad listen config | `validate_reloadable_config` now dry-runs per-listener `TransportUri::parse` + `listen_transport_context` before teardown (no socket probe → no same-address false-reject) + regression test | `a00cbf3` |
+| **F-CRYPTO-3** ctrlc interrupt-flag install/publish race | single `get_or_init` so handler + published flag are one Arc | `0cff82a` |
+| **obfs4 F2** handshake read silently truncated over-read bytes | document no-pipeline invariant + debug_assert it never over-reads | `0cff82a` |
+| **IPC B-1** test-only CString leak | reclaim the stale allocation in `prelude_succeeds_outside_tokio` | `0cff82a` |
+| **Session F1** ticket fast-path `verified_membership_cert: None` | corrected misleading comment — security no-op, but documented IPC-status completeness gap (`verified_peer_certs` is eviction-capped) | `0cff82a` |
+
+### ✅ Validated as already-handled (external report — no change needed)
+
+- **`require_wake_hmac` advisory** — already gated fatal by `strict_config_validation` (`veil-cfg/src/validate/mod.rs`); the advisory tier is by design.
+- **bandwidth-mimicry "no-op"** — already fail-closed with loud "no-op/deferred" warnings (`transport_glue.rs`); awaiting an operator pcap fixture (tracked below).
+- **IPC two-daemon stream-forwarding e2e gap** — closed earlier this session (`veilcore/src/sim/scenarios.rs` `ipc_stream_forwards_across_two_nodes`); that test also surfaced + fixed a real bidirectional-stream production bug.
+
+### ⏸ Deferred with proposal (design-heavy; re-open triggers below)
+
+- **EXT#4 — Anycast first-use Sybil / peer-controlled score** (`veil-anycast/src/lib.rs`). Reputation is post-failure only, so a first-use anycast target can be a fresh Sybil. *Proposal:* quorum/stake-weighted first-use admission (≥k independent attesters before a target is eligible) — needs a reputation-quorum design, not a point fix. *Re-open when:* anycast moves onto an untrusted-relay path.
+- **M-3 — unauthenticated `CircuitBuilt` ACK** (`veil-anonymity/src/circuit_wire.rs`). `CircuitBuiltPayload` is `[circuit_id u32]` with no MAC; a path member could forge premature build-confirmation. *Proposal:* bind the ACK with a per-hop MAC keyed by the circuit key. *Re-open when:* circuits extend across nodes outside the current trust assumption.
+- **EXT#2 — bandwidth-mimicry implementation** (landing-pad ready, fail-closed). *Proposal:* implement the shaping profile once the operator supplies a representative pcap fixture. *Re-open when:* the pcap lands.
+- **EXT#5 — pqcrypto migration** of the remaining classical-only paths. *Proposal:* stage behind the existing PQ feature flags as upstream pure-Rust ML-KEM/ML-DSA stabilise. *Re-open when:* a maintained pure-Rust backend is GA.
+
+---
+
 ## PoW-Gated Rendezvous epic (closed 2026-05-20)
 
 Stealth-listener architecture: nodes can configure `visibility = "stealth"` listeners that do NOT bind a port at startup.  Port comes alive on-demand only after a valid PoW-gated request lands.  Closes DPI methods #4 (IP-dict), #6 (block_options=2 all-ports), #16 (IPSNI rollback), #17 (IP/SNI priority).  See [`docs/en/PLAN_POW_GATED_RENDEZVOUS.md`](docs/en/PLAN_POW_GATED_RENDEZVOUS.md) for the design + [`docs/en/ANTICENSORSHIP_STRATEGY.md`](docs/en/ANTICENSORSHIP_STRATEGY.md) for the post-epic DPI assessment.
