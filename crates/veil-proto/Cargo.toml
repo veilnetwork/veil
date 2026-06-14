@@ -1,0 +1,35 @@
+[package]
+name = "veil-proto"
+version = "0.2.0"
+edition = "2024"
+description = "Veil network wire-format types, codecs, and on-wire constants. Phase 3 extraction from veilcore — pure-data definitions, no orchestration; sign/verify helpers live at the caller layer."
+license = "AGPL-3.0-or-later"
+
+[features]
+# Used by downstream crates (veilcore) so their #[cfg(test)] runs
+# inherit the low-difficulty PoW tiers that veil-proto's own
+# #[cfg(test)] uses (see `required_difficulty` in name_claim_v2.rs).
+# Without it the production tiers (≥ 22 bits) make tests time out.
+test-low-difficulty = []
+
+[dependencies]
+veil-bufpool = { path = "../veil-bufpool" }
+veil-error = { path = "../veil-error" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+base64 = "0.22"
+blake3 = "1.5"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+zeroize = { version = "1.7", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

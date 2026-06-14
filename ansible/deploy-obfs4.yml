@@ -1,0 +1,156 @@
+---
+# Deploy obfs4 transport support to veil nodes.
+#
+# Phases:
+# 1. Push fresh veil-cli binary (with obfs4-tcp Transport registered).
+# 2. Push the deployment-wide obfs4 PSK file.
+# 3. Patch node.toml [transport] obfs4_psk_file (idempotent).
+# 4. Restart veil service.
+# 5. Verify daemon came up + check obfs4 wiring via a local connect probe.
+#
+# Run options:
+#   # Generate a fresh PSK only:
+#   openssl rand 32 | base64 > /tmp/obfs4_psk.b64
+#
+#   # Canary single host:
+#   ansible-playbook -i inventory.yml deploy-obfs4.yml \
+#     --extra-vars 'obfs4_psk_path=/tmp/obfs4_psk.b64' \
+#     --limit node5
+#
+#   # Once canary is healthy, expand:
+#   ansible-playbook -i inventory.yml deploy-obfs4.yml \
+#     --extra-vars 'obfs4_psk_path=/tmp/obfs4_psk.b64' \
+#     --limit nodes
+#
+# IMPORTANT: same PSK file must reach every host that should accept obfs4
+# connections from each other.  Per-peer PSK lookup is planned as a
+# follow-up; for now a single network-wide PSK is shipped.
+
+- name: Deploy obfs4-tcp transport
+  hosts: all
+  become: true
+  serial: 1  # one host at a time, preserve quorum
+  vars:
+    veil_bin_src: "{{ playbook_dir }}/../target/release/veil-cli"
+    obfs4_psk_dest: /var/lib/veil/obfs4_psk.b64
+
+  tasks:
+    - name: Verify obfs4_psk_path extra-var supplied
+      ansible.builtin.fail:
+        msg: |
+          Pass --extra-vars 'obfs4_psk_path=/path/to/psk.b64' pointing
+          to a file containing one line of base64-encoded 32-byte PSK.
+          Generate: `openssl rand 32 | base64 > /tmp/obfs4_psk.b64`.
+      when: obfs4_psk_path is not defined
+
+    - name: Verify PSK file exists on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ obfs4_psk_path }}"
+      register: psk_stat
+
+    - name: Fail if PSK missing
+      ansible.builtin.fail:
+        msg: "PSK file {{ obfs4_psk_path }} not found on controller"
+      when: not psk_stat.stat.exists
+
+    - name: Verify veil-cli binary exists on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ veil_bin_src }}"
+      register: bin_stat
+
+    - name: Fail if binary missing
+      ansible.builtin.fail:
+        msg: |
+          Missing {{ veil_bin_src }}.  Build first with:
+          `cargo build --release -p veil-cli --bin veil-cli --features allow-empty-seeds`
+      when: not bin_stat.stat.exists
+
+    - name: Stop veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: stopped
+
+    - name: Push fresh veil-cli binary
+      ansible.builtin.copy:
+        src: "{{ veil_bin_src }}"
+        dest: /usr/local/bin/veil-cli
+        owner: root
+        group: root
+        mode: "0755"
+      register: binary_copy
+
+    - name: Push obfs4 PSK file
+      ansible.builtin.copy:
+        src: "{{ obfs4_psk_path }}"
+        dest: "{{ obfs4_psk_dest }}"
+        owner: veil
+        group: veil
+        mode: "0600"
+      register: psk_copy
+
+    - name: Ensure [transport] section exists in node.toml
+      ansible.builtin.shell:
+        cmd: |
+          if ! grep -qE '^\[transport\]$' /var/lib/veil/node.toml; then
+            printf '\n[transport]\n' >> /var/lib/veil/node.toml
+            echo "added"
+          else
+            echo "exists"
+          fi
+      register: transport_section
+      changed_when: transport_section.stdout == 'added'
+
+    - name: Set transport.obfs4_psk_file in node.toml (idempotent)
+      ansible.builtin.lineinfile:
+        path: /var/lib/veil/node.toml
+        regexp: '^obfs4_psk_file\s*='
+        line: 'obfs4_psk_file = "{{ obfs4_psk_dest }}"'
+        insertafter: '^\[transport\]$'
+        owner: veil
+        group: veil
+        mode: "0600"
+
+    - name: Start veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: started
+
+    - name: Wait for metrics endpoint (readiness probe)
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:19999/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "metrics still down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Show wait result
+      ansible.builtin.debug:
+        var: wait_result.stdout
+
+    - name: Verify no panic in journal with obfs4 config
+      ansible.builtin.shell:
+        cmd: |
+          journalctl -u veil.service --since "2 minutes ago" --no-pager | \
+            grep -E "panic|obfs4_psk_file|FATAL" || echo "clean"
+      register: journal_check
+      changed_when: false
+
+    - name: Show journal check
+      ansible.builtin.debug:
+        msg: "{{ journal_check.stdout_lines | default(['(clean)']) }}"
+
+    - name: Fail if daemon panicked
+      ansible.builtin.fail:
+        msg: "Daemon panic detected in journal: {{ journal_check.stdout }}"
+      when: "'panic' in (journal_check.stdout | lower)"

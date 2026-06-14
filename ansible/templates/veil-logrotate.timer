@@ -1,0 +1,16 @@
+[Unit]
+Description=Hourly trigger for veil logrotate
+
+[Timer]
+# Fire on every wall-clock hour boundary + 5 minutes к avoid colliding с
+# the daily logrotate.timer at midnight (which scans /etc/logrotate.d/*
+# и would otherwise contend на the same files).  Persistent=true so missed
+# fires (host down for а while) are caught up on next boot.
+OnCalendar=*:05:00
+Persistent=true
+# Slight randomisation so 8 cluster hosts don't all rotate simultaneously
+# (and momentarily double the FS write load на shared NFS / disk).
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

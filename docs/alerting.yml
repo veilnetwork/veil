@@ -1,0 +1,47 @@
+groups:
+  - name: veil
+    rules:
+      - alert: HighRouteMissRate
+        expr: rate(veil_route_miss_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Route miss rate > 100/s"
+          description: "Node {{ $labels.instance }} has high route miss rate. RecursiveRelay may be overloaded."
+
+      - alert: SessionCapacityHigh
+        expr: veil_active_sessions / 65536 > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Session usage > 80% of max_concurrent"
+          description: "Node {{ $labels.instance }} has {{ $value | humanizePercentage }} session capacity used."
+
+      - alert: BackpressureDrops
+        expr: rate(veil_rate_limit_drops_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Congestion backpressure dropping transit frames"
+          description: "Node {{ $labels.instance }} is dropping frames due to congestion (>78% load)."
+
+      - alert: SessionTxDrops
+        expr: rate(veil_session_tx_drops_total[5m]) > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Session TX queue overflow"
+          description: "Node {{ $labels.instance }} dropping frames due to full TX queues."
+
+      - alert: RateLimitDropsHigh
+        expr: rate(veil_rate_limit_drops_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rate-limit drops elevated"
+          description: "Possible flood attack or burst on {{ $labels.instance }} (rate-limiter dropping frames)."

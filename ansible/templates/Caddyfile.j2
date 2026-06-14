@@ -1,0 +1,104 @@
+{# Caddy v2 config template — Webtunnel + Let's Encrypt (Epic 488 follow-up,
+   anti-censorship strategy P1 #3).
+
+   Threat model: а VAS-class DPI active-probes veil's `:443` listener
+   by issuing а plain HTTP request and inspecting the response.  An
+   veil-only `webtunnel-wss://0.0.0.0:443` listener responds к non-
+   secret-path requests by serving а minimal decoy from
+   `webtunnel_decoy_dir`, but using а self-signed cert — the cert chain
+   itself is а red flag и the decoy is one-page-thin.
+
+   Solution: Caddy on `:443` с Let's Encrypt auto-cert serves the public
+   decoy site for ANY path не matching the secret token, и reverse-
+   proxies the WebSocket upgrade at `{{ webtunnel_secret_path }}` к
+   veil's loopback webtunnel listener.  The combination passes:
+
+   * **Cert authority validation** (#15 FakeTLS): real Let's Encrypt cert,
+     valid for the configured hostname.  CT-log searchable.
+   * **Active HTTP probe** (#15 / #20): hits Caddy's decoy site, sees
+     а multi-page static site indistinguishable от any other small
+     PHP-less Caddy deploy.
+   * **WebSocket upgrade fingerprint**: Caddy's reverse_proxy carries
+     the upgrade transparently; DPI sees а WSS connection that looks
+     ordinary.
+
+   Variables (set by `deploy-webtunnel-autotls.yml`):
+     * `veil_host` — public DNS hostname (used as TLS server_name + Let's Encrypt domain)
+     * `veil_email` — ACME contact email
+     * `webtunnel_secret_path` — `/_t/<random32>` path that proxies к veil
+     * `webtunnel_internal_port` — port on 127.0.0.1 где veil's webtunnel listens
+     * `webtunnel_decoy_root` — filesystem path served as the public decoy site
+-#}
+# Caddy v2 config — managed by ansible/deploy-webtunnel-autotls.yml.
+# Manual edits will be overwritten on re-deploy.
+
+{
+    email {{ veil_email }}
+    # Auto HTTPS on 443; HTTP on 80 is automatically redirected к HTTPS.
+    auto_https on
+    # Standard ACME directory.  Operators in regions where the default
+    # endpoint is blocked can switch к ZeroSSL via:
+    #   acme_ca https://acme.zerossl.com/v2/DV90
+}
+
+{{ veil_host }} {
+    # ── Webtunnel reverse-proxy ───────────────────────────────────────
+    # The secret path is а 32-char random token randomly chosen at
+    # deploy time.  Caddy proxies any request к this path к veil's
+    # loopback listener on `webtunnel_internal_port`.  Anything else
+    # (including а bare GET /) falls through к the static decoy site.
+    @veil path {{ webtunnel_secret_path }}*
+    handle @veil {
+        reverse_proxy 127.0.0.1:{{ webtunnel_internal_port }} {
+            # WSS upgrade requires HTTP/1.1; advertise as such even
+            # though Caddy will speak HTTP/2 к the client by default.
+            transport http {
+                versions 1.1
+            }
+            # Forward the standard upgrade-headers so veil's
+            # webtunnel handler sees the WS handshake unchanged.
+            header_up Connection {>Connection}
+            header_up Upgrade {>Upgrade}
+            header_up Sec-WebSocket-Key {>Sec-WebSocket-Key}
+            header_up Sec-WebSocket-Version {>Sec-WebSocket-Version}
+            header_up Sec-WebSocket-Protocol {>Sec-WebSocket-Protocol}
+            header_up Sec-WebSocket-Extensions {>Sec-WebSocket-Extensions}
+            # X-Real-IP for veil's scanner-shield IP-banning logic.
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+        }
+    }
+
+    # ── Static decoy site ─────────────────────────────────────────────
+    # Server every other path from `webtunnel_decoy_root`.  Multi-page
+    # site (index.html + about.html + sitemap.xml + robots.txt) что
+    # passes "looks like а real small website" active-probe heuristics.
+    handle {
+        root * {{ webtunnel_decoy_root }}
+        file_server {
+            hide .git .gitignore .DS_Store
+        }
+        # Standard security headers — also makes the site look mundane.
+        header {
+            X-Content-Type-Options "nosniff"
+            Referrer-Policy "strict-origin-when-cross-origin"
+            Strict-Transport-Security "max-age=31536000"
+            Cache-Control "public, max-age=3600"
+            # Remove the default Caddy banner — operator anonymity.
+            -Server
+        }
+    }
+
+    # ── Operational logging ───────────────────────────────────────────
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10mb
+            roll_keep 5
+            roll_keep_for 720h
+        }
+        # Don't log request bodies — those may include the webtunnel
+        # WS payload which is encrypted but identifying length-wise.
+        format json
+        level WARN
+    }
+}

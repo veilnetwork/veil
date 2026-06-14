@@ -1,0 +1,77 @@
+# cargo-deny policy (cycle-7 audit: the repo had no deny.toml, so a full
+# `cargo deny check` failed at the license stage on every MIT/Apache dep).
+#
+# Scope of this gate: THIRD-PARTY dependency hygiene — advisories, sources, and
+# license compliance. First-party (workspace) crates are AGPL-3.0-or-later (the
+# project license) and are skipped via `private.ignore` below; their license
+# field is a packaging concern, not a dependency-policy one.
+#
+# Run:  cargo deny check        (all)
+#       cargo deny check advisories sources licenses bans
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Fail on crates with an active RUSTSEC advisory or that have been yanked.
+yanked = "deny"
+# Consciously-accepted, tracked risks. These are `unmaintained` advisories (NOT
+# active vulnerabilities): the PQClean upstream was archived, so its Rust
+# bindings are flagged. Falcon (FN-DSA) has no mature maintained pure-Rust
+# alternative yet — we pin the current bindings and monitor for a FIPS-206 /
+# `fips206`-style replacement, then migrate. Remove these once one exists.
+# (Note: `cargo audit` did not surface these; `cargo deny` does.)
+ignore = [
+    "RUSTSEC-2026-0162", # pqcrypto-traits   — unmaintained (PQClean archived)
+    "RUSTSEC-2026-0163", # pqcrypto-internals — unmaintained (PQClean archived)
+    "RUSTSEC-2026-0165", # pqcrypto-falcon   — unmaintained (PQClean archived)
+]
+
+[licenses]
+version = 2
+# Skip our own workspace crates (AGPL-3.0-or-later; a few have no license field
+# yet — packaging cleanup, tracked separately). This gate is about deps.
+private = { ignore = true }
+confidence-threshold = 0.9
+# Permissive licenses present in the dependency tree (enumerated from
+# `cargo deny list` 2026-05-31). Anything outside this set must be reviewed
+# and added deliberately — a strong-copyleft dep (e.g. GPL) would be rejected.
+allow = [
+    # First-party workspace crates (the project license).
+    "AGPL-3.0-or-later",
+    # Permissive third-party licenses present in the dependency tree.
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+    "WTFPL",
+]
+
+[bans]
+# Surface NEW first-party duplicate-version deps (WARN, non-blocking) without
+# failing CI on the transitive ones we don't control. First-party crates have
+# been unified (toml fully deduped; thiserror/socket2 direct deps moved to the
+# current major). The remaining duplicates below are pulled by transitive
+# upstreams and clear when those bump.
+multiple-versions = "warn"
+wildcards = "allow"
+skip = [
+    { name = "thiserror", version = "=1.0.69" }, # via tokio-socks 0.5
+    { name = "rand", version = "=0.8.6" },        # via tungstenite 0.24 (transitive)
+    { name = "rand", version = "=0.10.1" },       # via hickory-resolver 0.26 (transitive)
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,50 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: veil-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "192.168.1.105:9090:9090"
+
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    container_name: veil-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      # Audit M9: anonymous visitors may VIEW the dashboards (this is a metrics
+      # console) but must NOT administer Grafana. Role downgraded Admin→Viewer
+      # so copying this compose onto a host where the bind below is reachable
+      # off-LAN can't hand an anonymous visitor admin (datasource/config
+      # tampering, topology/metrics exfiltration).
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      # Keep the login form enabled so an operator can still sign in as admin to
+      # manage Grafana (it was only disabled because anonymous==Admin made login
+      # pointless — which was the problem).
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      # Admin password from the environment — MANDATORY (F8). There is no
+      # predictable fallback: a forgotten override when this compose is moved to
+      # a reachable host previously left a guessable `veil-testnet` admin login.
+      # `:?` makes `docker compose up` fail fast until GRAFANA_ADMIN_PASSWORD is
+      # set (export it, e.g. via a .env file).
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD (no default admin password)}"
+    volumes:
+      - ./grafana-provisioning:/etc/grafana/provisioning:ro
+      - ./grafana-dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "192.168.1.105:3001:3000"
+
+volumes:
+  prom-data:
+  grafana-data:

@@ -1,0 +1,96 @@
+---
+# Emergency rollback: re-add the tcp:// listen entry alongside the
+# obfs4-tcp:// one.  Use when drop-tcp-listener.yml partitioned the
+# network due to stale PEX / DHT caches with tcp:// URIs.
+#
+# After this restores connectivity, peers will gradually re-propagate
+# obfs4-tcp:// addresses through PEX gossip.  Once observed across all
+# peer-state, drop-tcp-listener.yml can be re-run cleanly.
+
+- name: Restore tcp:// listen entry
+  hosts: all
+  become: true
+  serial: 1
+
+  tasks:
+    - name: Check current state
+      ansible.builtin.shell:
+        cmd: |
+          if grep -q 'transport = "tcp://0.0.0.0:5555"' /var/lib/veil/node.toml; then
+            echo "already-has-tcp"
+          else
+            echo "needs-restore"
+          fi
+      register: state
+      changed_when: false
+
+    - name: Skip already-fine hosts
+      ansible.builtin.meta: end_host
+      when: state.stdout == "already-has-tcp"
+
+    - name: Get advertised IP
+      ansible.builtin.shell:
+        cmd: grep -oP 'advertise = "obfs4-tcp://\K[^:]+' /var/lib/veil/node.toml | head -1
+      register: adv_ip
+      changed_when: false
+
+    - name: Build new listen line
+      ansible.builtin.set_fact:
+        listen_block: |
+          listen = [
+            { id = "0x00000001", transport = "tcp://0.0.0.0:5555", advertise = "tcp://{{ adv_ip.stdout }}:5555" },
+            { id = "0x00000002", transport = "obfs4-tcp://0.0.0.0:5556", advertise = "obfs4-tcp://{{ adv_ip.stdout }}:5556" }
+          ]
+
+    - name: Write new listen block through ansible copy then awk-replace
+      ansible.builtin.copy:
+        dest: /tmp/_veil_new_listen.txt
+        content: "{{ listen_block }}"
+        mode: "0644"
+
+    - name: Rewrite top-level listen= block
+      ansible.builtin.shell:
+        cmd: |
+          python3 - <<'PYEOF'
+          import re
+          with open('/tmp/_veil_new_listen.txt') as f:
+              new_block = f.read().rstrip()
+          path = "/var/lib/veil/node.toml"
+          with open(path) as f:
+              src = f.read()
+          pattern = re.compile(r'^listen\s*=\s*\[.*?\n?\]', re.DOTALL | re.MULTILINE)
+          if not pattern.search(src):
+              pattern = re.compile(r'^listen\s*=\s*\[[^\]]*\]', re.MULTILINE)
+          new_src = pattern.sub(new_block, src, count=1)
+          with open(path, "w") as f:
+              f.write(new_src)
+          print("restored")
+          PYEOF
+          rm -f /tmp/_veil_new_listen.txt
+        executable: /bin/bash
+
+    - name: Restart veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait for live veil session
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            n=$(curl -sS http://127.0.0.1:19999/metrics 2>/dev/null | \
+                grep '^veil_state_live_sessions ' | awk '{print $2}')
+            if [ -n "$n" ] && [ "$n" -gt 0 ]; then
+              echo "sessions=${n} after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "still 0 after 60s"
+          exit 1
+      register: sess
+      changed_when: false
+
+    - name: Show sessions
+      ansible.builtin.debug:
+        var: sess.stdout

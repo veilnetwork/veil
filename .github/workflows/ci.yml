@@ -1,0 +1,473 @@
+name: CI
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+
+# Audit batch 2026-05-27 Phase Q.6: reverted to tag-only triggering
+# after PR/branch-push runs exhausted the org's GitHub Actions
+# minutes budget.  Hygiene (clippy `-D warnings`, mutex-poison policy,
+# dead-code-anchor policy) is enforced locally and revalidated on release;
+# the cost of one regression slipping past a push is a pre-release
+# `gh workflow run ci.yml` (or just bump the tag if a fix is needed).
+#
+# History: Phase E19 (2026-05-21) added PR + branch triggers because
+# tag-only CI had let 4 mutex + 3 dead-code + 7 cfg-warning violations
+# slip in.  Phase Q.6 (2026-05-27) is the budget-driven rollback —
+# tradeoff is conscious, not accidental.
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  hygiene:
+    # Phase 6.50.b-followup: fmt + clippy lint gate.  Runs before `test`
+    # so PRs that fail style/lint don't burn full-build CI time.  Both
+    # checks are fast (<2 min combined on cached cargo).
+    name: Hygiene (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (with rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (warnings deny)
+        # Phase 6.50.b-followup: -D warnings gate locks in the clippy
+        # cleanup batch.  New lints must be fixed OR explicitly
+        # `#[allow(…)]`-d with a rationale comment before merge.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo check (cfg-warnings deny)
+        # Audit batch 2026-05-21 Phase E19: catch `unexpected_cfgs`
+        # warnings (e.g. references to features that have not been
+        # declared in this crate's Cargo.toml — Phase 4 extraction
+        # surfaced 7 such sites in veil-node-runtime).  Clippy alone
+        # doesn't fire on these; a dedicated `cargo check` pass with
+        # RUSTFLAGS=-D warnings catches them at compile-front-end.
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check --workspace --all-targets
+
+      - name: Install cbindgen
+        run: cargo install cbindgen --version "^0.29" --locked
+
+      - name: FFI header is up-to-date (cbindgen)
+        # Phase 6.50.b-followup: regenerate `veil_ffi.h` from Rust source
+        # and diff against committed copy.  Closes the "header drifts from
+        # lib.rs" bug class (e.g. NetworkKind.unknown = 4 vs 255 Dart
+        # binding mismatch that survived only because the header was
+        # hand-maintained and nobody noticed missing exports).  PRs that
+        # touch FFI signatures must regenerate (`./scripts/regen-ffi-header.sh`)
+        # and commit the updated header.
+        run: |
+          ./scripts/regen-ffi-header.sh
+          git diff --exit-code crates/veilclient-ffi/include/veil_ffi.h
+
+      - name: Mutex poison-recovery policy
+        # Phase 6.50.b-followup: enforce that production code uses the
+        # `lock!()`/`rlock!()`/`wlock!()` macros for Mutex/RwLock
+        # acquisitions instead of raw `.lock().unwrap()` / `.lock().expect()`.
+        # Macros recover from poison; raw `.unwrap()` aborts the holder task
+        # silently (or, at the FFI boundary, is UB).
+        run: ./scripts/check-mutex-poison-policy.sh
+
+      - name: #[allow(dead_code)] anchor policy
+        # Phase 6.50.b: every `#[allow(dead_code)]` attribute must have
+        # an explanation (doc-comment OR adjacent `#[cfg(...)]`).  See
+        # script docstring for full policy.
+        run: ./scripts/check-allow-dead-code-anchors.sh
+
+      - name: Cyrillic policy (runtime strings + CI tooling)
+        # Fails on Cyrillic-block chars in operator-visible Rust strings AND
+        # anywhere under scripts/ + .github/ (homoglyph review-obfuscation
+        # vector). See scripts/check-cyrillic-runtime-strings.sh.
+        run: ./scripts/check-cyrillic-runtime-strings.sh
+
+      - name: Install cargo-audit
+        # Phase 6.50.b audit-A2: `cargo audit` gates against the RustSec
+        # advisory DB on every push to main.  Pinned minor (^0.22) for
+        # reproducibility — minor bumps OK (new advisories only).
+        #
+        # Phase Q.2 bump: 0.21 does not parse CVSS 4.0 vector strings
+        # (`CVSS:4.0/...`) which RustSec started using as of
+        # RUSTSEC-2026-0076 (libcrux-ml-dsa).  0.22 series adds CVSS 4.0
+        # support through transitive `rustsec` ≥ 0.30.  Without the bump CI fails
+        # on a parse error even when the advisory does not affect us.
+        run: cargo install cargo-audit --version "^0.22" --locked
+
+      - name: cargo audit (RustSec advisory DB)
+        # Phase 6.50.b audit-A2: fail the CI if any known CVE lands in the
+        # transitive graph.  Allow-list is currently empty — the prior
+        # `RUSTSEC-2025-0134` ignore was retired after `rustls-pemfile`
+        # was migrated to `rustls-pki-types::pem::PemObject` (Phase
+        # 6.50.b followup).  Add new ignores ONLY with a reference to a
+        # tracking issue/Epic.
+        run: cargo audit --deny warnings
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version "^0.19" --locked
+
+      - name: cargo deny (advisories + bans + licenses + sources)
+        # Supply-chain gate (config: deny.toml). Catches RustSec advisories
+        # incl. `unmaintained` (which `cargo audit` does not surface), duplicate
+        # major versions (warn), a license allow-list, and crates.io-only sources.
+        run: cargo deny check
+
+  test:
+    name: Test
+    needs: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        # Phase Q.6 CI fix: GH Actions ubuntu-latest images pre-install
+        # ~30 GB of toolchains we don't need (Android SDK / NDK, .NET, GHC,
+        # CodeQL, Boost, prebuilt docker images).  Combined with our cached
+        # target/ (5-10 GB after debug build) the runner's 14 GB free disk
+        # exhausted and worker died with "No space left on device" while writing
+        # its own _diag log.  Remove what we don't use before checkout.
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install mold linker
+        # Phase Q.4 CI fix: GH Actions ubuntu-latest runners (7 GB RAM,
+        # 14 GB SSD) cannot link our largest test binaries (veil-app,
+        # veil-ipc, chat_client) under default lld — lld holds the
+        # full debug-info graph in memory and SIGBUS'es when mmap returns
+        # ENOMEM/EBUSY. `mold` is a drop-in replacement that uses parallel
+        # mmap'd output + dramatically smaller intermediate state — same
+        # workspace links comfortably under 2 GB peak RSS where lld peaks
+        # past 4 GB.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mold
+
+      - name: Install cargo-nextest
+        # Phase Q.5 CI fix: cargo-nextest replaces `cargo test` for lib/bins/
+        # tests passes — better process model (each test runs in its own
+        # process, not linker-bound batch), tighter parallelism control,
+        # 1.5-3x wall-clock speedup on our suite.  Doctests stay on
+        # `cargo test --doc` (nextest doesn't support doctests).  Pulled
+        # as a prebuilt binary so this step adds <2 seconds.
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux \
+            | tar zxf - -C "${HOME}/.cargo/bin"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        # Phase Q.4: route linker through mold for all rustc invocations
+        # in this job (build, test, doctest).  `-C link-arg=-fuse-ld=mold`
+        # passes the flag to the system cc driver which then picks mold.
+        #
+        # Phase Q.5: build with `test-low-difficulty,allow-empty-seeds` so
+        # the test run reuses these artifacts instead of doing a second
+        # incremental rebuild with different features (would invalidate
+        # most of the dependency graph).
+        env:
+          RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
+        run: cargo build --workspace --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds
+
+      - name: Run unit tests (nextest)
+        # Phase Q.5 CI fix: cargo-nextest run lib + bins + tests in parallel
+        # processes — 1.5-3x faster than `cargo test` for our suite (~600
+        # individual tests across 60+ crates) because the per-test process
+        # boundary saves linker memory and lets nextest schedule in priority
+        # order (long-tail tests start first).  Test-threads limit kept at
+        # 2 — PoW-based sim tests starve each other on shared cores.
+        #
+        # `test-low-difficulty,allow-empty-seeds` features lower the PoW
+        # threshold (24-bit → 16-bit) so identity / DHT / sim tests don't
+        # spend minutes searching nonces.
+        #
+        # Phase Q.4 retained: CARGO_PROFILE_DEV_DEBUG=1 cuts embedded debug
+        # info, mold linker keeps RSS under the runner's cap.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: '1'
+          RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
+        run: |
+          cargo nextest run \
+            --workspace \
+            --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds \
+            --lib --bins --tests \
+            --test-threads=2
+
+      - name: Run doctests
+        # nextest doesn't support doctests (rustc compiles them one-at-a-
+        # time through rustdoc — separate from the test-runner pipeline), so
+        # the doctest pass stays on stock cargo test.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: '1'
+          RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
+        run: |
+          cargo test \
+            --workspace \
+            --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds \
+            --doc \
+            -- --test-threads=2
+
+  windows-check:
+    name: Windows cross-compile check
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain with Windows target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install MinGW cross-compiler
+        # g++ is required by the RocksDB C++ source used behind the
+        # default `rocksdb-cold` feature; gcc alone is not enough.
+        # `mingw-w64-tools` ships the additional dev headers (assert.h,
+        # stdint.h, etc.) that the `ring-0.17` build script demands when
+        # rebuilding curve25519/p256 C sources on cross-compile.
+        # `nasm` is required by ring's SHA-x86_64 assembly path —
+        # without it ring's build.rs falls through to a slower pure-Rust
+        # impl on some configurations and emits warnings, but on Windows-GNU
+        # it can hard-fail the link step.
+        #
+        # **Threading-model:** Ubuntu's `g++-mingw-w64-x86-64` meta-package
+        # defaults to the **win32** thread variant, which lacks
+        # `__gthread_cond_*` symbols that RocksDB's C++ headers reference
+        # through `std::condition_variable`.  Install the **posix** variants
+        # explicitly and switch update-alternatives to point at them, so
+        # `clang++ --target=x86_64-pc-windows-gnu` picks up the right
+        # gthr-default.h.
+        run: |
+          sudo apt-get install -y \
+            gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix \
+            mingw-w64-tools nasm
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-windows-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check Windows compilation
+        # veil-cli, ogate, oproxy and veilclient-ffi now default to
+        # `tls-boring`, which links a cmake-built BoringSSL (`btls-sys`).
+        # Cross-compiling BoringSSL to `x86_64-pc-windows-gnu` from a Linux
+        # runner is not a supported configuration (and none of these are
+        # shipped as windows-gnu artifacts — the real Windows path is the
+        # `windows-test` job's native MSVC `-p veilcore --no-default-features`
+        # build; veilclient-ffi ships to android/iOS, not windows-gnu).
+        # Excluding the tls-boring-default crates keeps this a pure-Rust
+        # cross-compile check of the rest of the workspace (they are the only
+        # crates with tls-boring in their default set, so excluding them
+        # disables BoringSSL here; their libs are still checked transitively).
+        run: cargo check --target x86_64-pc-windows-gnu --workspace --exclude veil-cli --exclude ogate --exclude oproxy --exclude veilclient-ffi
+
+  windows-test:
+    # Epic 451.10: native Windows build + targeted tests for the TCP admin
+    # backend (Epic 451.7).  Runs on a real Windows runner so that:
+    #   - Unix-gated helpers that the Linux build skips (e.g. `libc::umask`)
+    #     are verified to remain correctly excluded.
+    #   - The TCP admin backend round-trips end-to-end on NT.
+    # Runs as a separate job rather than a matrix entry so that a Windows-only
+    # failure doesn't mask Linux regressions.
+    name: Windows native build + TCP admin tests
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # `pqcrypto-internals` (ML-KEM dep) emits MSVC-style `/arch:AVX2`
+      # when target = `*-windows-msvc`.  The runner's plain `clang`
+      # (GNU-mode) on PATH gets auto-detected by cc-rs but doesn't
+      # understand `/arch:` — build fails with "no such file or directory:
+      # '/arch:AVX2'".  Pin to `clang-cl` (MSVC-compatible driver, ships
+      # with LLVM on windows-latest), which speaks the same flag dialect.
+      - name: Build (no default features — skip RocksDB)
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        # `rocksdb-cold` requires MSVC + a full C++ build toolchain; the core
+        # veil code compiles cleanly without it.  Leaves the Windows
+        # server deployment path using the in-memory DHT (fine for the
+        # admin-protocol validation this job is concerned with).
+        run: cargo build -p veilcore --lib --no-default-features
+
+      # NB: `ogate`'s Windows compile (the `#[cfg(unix)]`-gating bug class that
+      # broke the v0.2.0 release) is validated by `release.yml`'s windows-msvc
+      # build, which runs on every tag. It is NOT checked here: `ogate` pulls
+      # `librocksdb-sys` as a transitive (non-toggleable) default, and this job
+      # deliberately avoids RocksDB on Windows (clang-cl can't build it under the
+      # runner's cc-rs config — see the `--no-default-features` veilcore build
+      # above), so any `cargo check -p ogate` here fails on RocksDB, not on the
+      # cfg gate. release.yml is the gate for that bug class.
+
+      - name: Run TCP admin integration tests
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        # The admin_tcp_* tests are #[ignore]-marked by default because their
+        # parallel flakiness on Linux hides real Windows regressions; running
+        # them explicitly here is their reason to exist.
+        run: cargo test -p veilcore --lib --no-default-features node::admin::tests::admin_tcp -- --ignored --test-threads=1
+
+      - name: Run token_file helpers
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        run: cargo test -p veilcore --lib --no-default-features node::admin_transport::tests -- --test-threads=1
+
+  bench:
+    name: Benchmark regression guard
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run benchmarks (regression check)
+        # Run briefly (--sample-size 10) just to verify no panics or
+        # gross regressions.  For full statistical analysis, use
+        # `cargo bench` locally.  Each bench target is enumerated
+        # explicitly so that `--sample-size 10` is never passed to a
+        # libtest harness (which rejects unknown flags).
+        #
+        # Bench list mirrors `veilcore/Cargo.toml [[bench]]` for
+        # the targets that are LIGHT enough to run on free CI minutes
+        # (sample-size=10 keeps each bench under ~30 s).  Heavy
+        # benches (`session_scale`, `dht_store_throughput`,
+        # `recursive_relay_chain`) are tested locally only — they
+        # spin up sim networks and take 1-2 min each.
+        #
+        # Phase 6.51: stale `mailbox_throughput` removed (deleted in
+        # crate-split phase 4 — `241b72e`); `hybrid_kex` (Epic 486.1)
+        # and `adversary_validation` (Epic 485.4) added to guard recent
+        # cryptographic primitives and operator-capacity-planning
+        # numbers respectively.
+        #
+        # `--features veil-bootstrap/allow-empty-seeds` is required:
+        # `cargo bench` builds in release-profile with `cfg(test)` stripped,
+        # which trips the `compile_error!` gate in veil-bootstrap's
+        # seed-list (asserts that release builds set EITHER
+        # `production-seeds` for real seeds OR `allow-empty-seeds`
+        # for testnet / CI use).  Without this feature CI fires the
+        # gate and every bench fails before reaching its harness.
+        run: |
+          cargo bench -p veilcore --features veil-bootstrap/allow-empty-seeds --bench dht_lookup            -- --sample-size 10
+          cargo bench -p veilcore --features veil-bootstrap/allow-empty-seeds --bench voice_stream          -- --sample-size 10
+          cargo bench -p veilcore --features veil-bootstrap/allow-empty-seeds --bench socks5_throughput     -- --sample-size 10
+          cargo bench -p veilcore --features veil-bootstrap/allow-empty-seeds --bench hybrid_kex            -- --sample-size 10
+          cargo bench -p veilcore --features veil-bootstrap/allow-empty-seeds --bench adversary_validation  -- --sample-size 10
+
+  devnet-smoke:
+    name: Devnet smoke test
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build veil binary
+        # `test-low-difficulty` drops PoW threshold from 24 → 16 bits, which
+        # cuts per-node `config init` from minutes → seconds on debug-mode
+        # ubuntu-latest (audit 2026-05-27 phase Q.4: CI runs were
+        # taking >1h, mostly PoW search in debug mode).
+        # `allow-empty-seeds` matches the bench jobs' build flags, so
+        # the cache key restored from `test` (which builds with test-low-
+        # difficulty for the test suite) is more likely to share artifacts.
+        run: cargo build -p veil-cli --features test-low-difficulty,allow-empty-seeds
+
+      - name: Start devnet (3 nodes)
+        env:
+          # Match the relaxed PoW threshold baked into the binary above —
+          # without this, the script's default `--difficulty 24` would still
+          # spend minutes mining a nonce that the daemon would accept in
+          # ~1 second at 16 bits.
+          DEVNET_POW_DIFFICULTY: "16"
+        run: |
+          chmod +x scripts/devnet.sh
+          scripts/devnet.sh start --nodes 3
+          sleep 3  # Let nodes connect
+
+      - name: Run smoke test
+        run: scripts/devnet.sh smoke
+
+      - name: Stop devnet
+        if: always()
+        run: scripts/devnet.sh stop

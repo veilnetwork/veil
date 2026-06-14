@@ -1,0 +1,27 @@
+[package]
+name = "veil-app"
+version = "0.2.0"
+edition = "2024"
+description = "Application-endpoint registry: per-app endpoint addressing, message channels, stream window tracking. Phase 6 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-bufpool = { path = "../veil-bufpool" }
+veil-discovery = { path = "../veil-discovery" }
+veil-error = { path = "../veil-error" }
+veil-proto = { path = "../veil-proto" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+base64 = "0.22"
+blake3 = "1.5"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["sync", "rt"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

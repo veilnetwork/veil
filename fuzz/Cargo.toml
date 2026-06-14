@@ -1,0 +1,59 @@
+[package]
+name = "veilcore-fuzz"
+version = "0.0.1"
+publish = false
+edition = "2024"
+
+# Explicitly excluded from the workspace — cargo-fuzz manages this crate.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+veilcore = { path = "../veilcore" }
+
+# Each fuzz target is a separate binary
+[[bin]]
+name = "fuzz_session_decode"
+path = "fuzz_targets/fuzz_session_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_delivery_decode"
+path = "fuzz_targets/fuzz_delivery_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_routing_decode"
+path = "fuzz_targets/fuzz_routing_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_app_decode"
+path = "fuzz_targets/fuzz_app_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ipc_decode"
+path = "fuzz_targets/fuzz_ipc_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_cipher_open"
+path = "fuzz_targets/fuzz_cipher_open.rs"
+test = false
+doc = false
+
+# Epic 247: protocol conformance fuzz target (relay_chain, ephemeral endpoint, mesh).
+[[bin]]
+name = "fuzz_proto_decode"
+path = "fuzz_targets/fuzz_proto_decode.rs"
+test = false
+doc = false

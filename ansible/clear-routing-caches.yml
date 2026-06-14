@@ -1,0 +1,87 @@
+---
+# Clear DHT routing cache + peers_discovered + route_cache + rtt + vivaldi.
+# After a transport-URI migration (e.g. tcp:// → obfs4-tcp://) these caches
+# hold stale transport URIs that block discovery of the new endpoints.
+#
+# Run serially with serial=1 so the cluster keeps an established quorum
+# during the rolling-clear.
+#
+# Backup files are written to /tmp/<file>.bak.YYYYMMDD-HHMMSS so an
+# operator can restore if something goes sideways.
+#
+# Run:
+#   ansible-playbook -i inventory.yml clear-routing-caches.yml
+
+- name: Clear routing caches to force obfs4 re-discovery
+  hosts: all
+  become: true
+  serial: 1
+
+  tasks:
+    - name: Stop veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: stopped
+
+    - name: Backup + clear routing caches
+      ansible.builtin.shell:
+        cmd: |
+          ts=$(date +%Y%m%d-%H%M%S)
+          for f in dht_routing.json peers_discovered.json route_cache.json rtt.json vivaldi.json; do
+            path=/var/lib/veil/$f
+            if [ -f "$path" ]; then
+              cp "$path" "/tmp/${f}.bak.${ts}"
+              case "$f" in
+                dht_routing.json) echo "{}" > "$path" ;;
+                peers_discovered.json) echo "[]" > "$path" ;;
+                *) rm -f "$path" ;;
+              esac
+              chown veil:veil "$path" 2>/dev/null || true
+              chmod 0600 "$path" 2>/dev/null || true
+            fi
+          done
+          echo "cleared"
+
+    - name: Start veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: started
+
+    - name: Wait for live sessions through obfs4 bootstrap_peers
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            n=$(curl -sS http://127.0.0.1:19999/metrics 2>/dev/null | \
+                grep '^veil_state_live_sessions ' | awk '{print $2}')
+            if [ -n "$n" ] && [ "$n" -gt 0 ]; then
+              echo "sessions=${n} after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "no sessions after 60s"
+          exit 1
+      register: sess
+      changed_when: false
+
+    - name: Show sessions
+      ansible.builtin.debug:
+        var: sess.stdout
+
+    - name: Verify connections via obfs4 (port 5556)
+      ansible.builtin.shell:
+        cmd: |
+          ss -tnp 2>/dev/null | awk '$5 ~ /:5556$/ || $4 ~ /:5556 / && /ESTAB/' | wc -l
+      register: obfs4_conn
+      changed_when: false
+
+    - name: Verify connections via legacy tcp (port 5555)
+      ansible.builtin.shell:
+        cmd: |
+          ss -tnp 2>/dev/null | awk '$5 ~ /:5555$/ || $4 ~ /:5555 / && /ESTAB/' | wc -l
+      register: tcp_conn
+      changed_when: false
+
+    - name: Show connection split
+      ansible.builtin.debug:
+        msg: "obfs4 (5556): {{ obfs4_conn.stdout }} ; tcp (5555): {{ tcp_conn.stdout }}"

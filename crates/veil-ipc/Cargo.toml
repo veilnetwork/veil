@@ -1,0 +1,39 @@
+[package]
+name = "veil-ipc"
+version = "0.2.0"
+edition = "2024"
+description = "Local IPC server for the Veil node (Epic 451): authenticated `APP_HELLO` handshake, per-client app-id binding, frame delivery to / from the in-process FrameDispatcher, and the `debug capture` / `transport_hints` / `recursive_query` admin paths.  Phase 6.3 extraction from veilcore — the IPC frame protocol now lives behind a small IpcMetrics trait + an Arc<dyn FrameBroadcaster>, so a stand-alone IPC server can be embedded into a CLI tool or mobile-side daemon without dragging the veilcore runtime."
+license = "AGPL-3.0-or-later"
+
+[features]
+# Enables 4 integration tests that construct veilcore-internal
+# `SessionTxRegistry` / `KademliaService` directly.  Off by default —
+# those tests will be migrated to veilcore/tests/ in a follow-up so
+# veil-ipc can run its own `cargo test` without cycling back into
+# veilcore.
+veilcore-internals-test = []
+
+[dependencies]
+veil-abuse = { path = "../veil-abuse" }
+veil-anycast = { path = "../veil-anycast" }
+veil-app = { path = "../veil-app" }
+veil-bufpool = { path = "../veil-bufpool" }
+veil-dispatcher-state = { path = "../veil-dispatcher-state" }
+veil-e2e = { path = "../veil-e2e" }
+veil-error = { path = "../veil-error" }
+veil-local-transport = { path = "../veil-local-transport" }
+veil-pending-ack = { path = "../veil-pending-ack" }
+veil-proto = { path = "../veil-proto" }
+veil-routing = { path = "../veil-routing" }
+veil-transport = { path = "../veil-transport" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+blake3 = "1.5"
+log = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["sync", "rt", "macros", "time", "io-util", "net"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Default notification title shown by `VeilDaemonService` when
+         the consumer app launches the foreground service без passing
+         а custom title.  Apps override это via the
+         `client.startBackgroundService(title: ...)` Dart API. -->
+    <string name="veil_default_title">Veil running</string>
+</resources>

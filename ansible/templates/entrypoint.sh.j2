@@ -1,0 +1,260 @@
+#!/bin/sh
+# entrypoint.sh — runs inside the veil container (bootstrap or node).
+#
+# Mirror of `docker/entrypoint.sh` with one extension: Ansible also
+# renders a `[[bootstrap_peers]]` block below based on inventory
+# `veil_bootstrap_peers`.
+#
+# Responsibilities:
+#   1. Wait for the Let's Encrypt live directory to exist (certbot sibling
+#      container drops fullchain.pem + privkey.pem there).
+#   2. On first boot, generate identity + patch config.toml with:
+#      - identity.role = core
+#      - [[listen]] entries for tcp / tls / quic / wss
+#      - metrics block
+#      - persist paths
+#      - [[bootstrap_peers]] from Ansible inventory
+#   3. Exec veil-cli node run --foreground.
+#
+# All subsequent boots reuse the existing config.
+set -eu
+
+: "${ROLE:=core}"
+: "${DIFFICULTY:=24}"
+: "${TCP_PORT:=5555}"
+: "${TLS_PORT:=9906}"
+: "${QUIC_PORT:=8443}"
+: "${WSS_PORT:=8443}"
+: "${MESH_UDP_PORT:=6666}"
+: "${METRICS_PORT:=}"
+: "${NO_TLS:=}"
+: "${ADVERTISE_HOST:=}"
+# HOST is required only when NO_TLS is empty (Let's Encrypt path needs it for
+# the cert SAN).  In NO_TLS mode the node listens TCP-only and advertises by
+# IP via ADVERTISE_HOST (operator-provided, typically the VPS public IPv4).
+if [ -z "${NO_TLS}" ]; then
+    : "${HOST:?HOST env variable is required (DNS name the cert was issued for)}"
+fi
+# In NO_TLS mode use ADVERTISE_HOST (or HOST as fallback) for listener
+# advertise URIs.  TLS-mode keeps the existing HOST semantics.
+ADVERTISE="${ADVERTISE_HOST:-${HOST:-}}"
+
+CONFIG="/var/lib/veil/node.toml"
+CERT_DIR="/etc/letsencrypt/live/${HOST}"
+FULLCHAIN="${CERT_DIR}/fullchain.pem"
+PRIVKEY="${CERT_DIR}/privkey.pem"
+
+log() { printf '\033[1;36m[entrypoint %s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+# ── 1. Wait for Let's Encrypt certs ──────────────────────────────────────────
+wait_for_certs() {
+    log "waiting for ${FULLCHAIN}"
+    i=0
+    while [ ! -s "${FULLCHAIN}" ] || [ ! -s "${PRIVKEY}" ]; do
+        i=$((i + 1))
+        if [ "$i" -gt 300 ]; then
+            echo "timeout waiting for Let's Encrypt cert at ${FULLCHAIN}" >&2
+            exit 1
+        fi
+        sleep 2
+    done
+    log "certs ready"
+}
+
+# ── 2. Generate / enrich config (idempotent) ─────────────────────────────────
+# Each step checks whether its artefact is already present; redeploys never
+# skip `listen add` just because `node.toml` exists (previous bug: container
+# restart during PoW mining left config with identity but no listeners —
+# entrypoint saw existing file, early-return-ed, node booted without any
+# ports bound).  Now identity generation is the only step gated on
+# "node.toml missing"; everything else is re-checked by content.
+generate_config() {
+    if [ ! -f "${CONFIG}" ]; then
+        log "generating identity (difficulty=${DIFFICULTY}) + default config"
+        veil-cli config init "${CONFIG}" --difficulty "${DIFFICULTY}"
+    else
+        log "config already present at ${CONFIG} — re-validating listeners / managed block"
+    fi
+
+    # identity.role is a first-class config key (see cfg/keys.rs); setting
+    # it is idempotent — runs every boot so config drift is auto-corrected.
+    veil-cli --config "${CONFIG}" config set identity.role "${ROLE}"
+
+    # Listeners — tcp (plain), tls (wrapped), quic (QUIC+TLS), wss (WebSocket
+    # over TLS).  All three TLS-bearing listeners share the same Let's
+    # Encrypt cert.  `advertise` uses the host's DNS name so other nodes
+    # learn the canonical endpoint rather than the container-internal bind.
+    # Gated on "no listen entries yet" — matches both `[[listen]]` headers
+    # and the inline-array `listen = [...]` form that `listen add` produces.
+    if ! grep -qE '^\s*listen\s*=|^\[\[listen\]\]' "${CONFIG}"; then
+        log "adding listeners"
+        if [ -n "${NO_TLS}" ]; then
+            # No-DNS / no-cert testnet path: TCP-only, advertised by IP.
+            # Other peers dial in via plain TCP; this node still dials OUT
+            # to TLS bootstrap peers (b1/b2/b3) using their pinned certs
+            # from `[[bootstrap_peers]]`.
+            veil-cli --config "${CONFIG}" listen add \
+                "tcp://0.0.0.0:${TCP_PORT}" \
+                --advertise "tcp://${ADVERTISE}:${TCP_PORT}"
+        else
+            veil-cli --config "${CONFIG}" listen add \
+                "tcp://0.0.0.0:${TCP_PORT}" \
+                --advertise "tcp://${HOST}:${TCP_PORT}"
+            veil-cli --config "${CONFIG}" listen add \
+                "tls://0.0.0.0:${TLS_PORT}" \
+                --advertise "tls://${HOST}:${TLS_PORT}" \
+                --tls-cert "${FULLCHAIN}" --tls-key "${PRIVKEY}"
+            veil-cli --config "${CONFIG}" listen add \
+                "quic://0.0.0.0:${QUIC_PORT}" \
+                --advertise "quic://${HOST}:${QUIC_PORT}" \
+                --tls-cert "${FULLCHAIN}" --tls-key "${PRIVKEY}"
+            veil-cli --config "${CONFIG}" listen add \
+                "wss://0.0.0.0:${WSS_PORT}/veil" \
+                --advertise "wss://${HOST}:${WSS_PORT}/veil" \
+                --tls-cert "${FULLCHAIN}" --tls-key "${PRIVKEY}"
+        fi
+    fi
+
+    # Managed block: metrics + persist paths + inventory-rendered
+    # bootstrap_peers.  `persist_enabled` is the crate default (true) so we
+    # don't set it explicitly.  Marker-guarded → idempotent.
+    if ! grep -q '# >>> entrypoint.sh managed block >>>' "${CONFIG}"; then
+        cat >> "${CONFIG}" <<EOF
+
+# >>> entrypoint.sh managed block >>>
+EOF
+
+        # Phase 6.50.b safe-default: generate random metrics auth_token
+        # для non-loopback bind, иначе anyone routable к the port
+        # could scrape role / session / mailbox / DHT telemetry.
+        if [ -n "${METRICS_PORT}" ]; then
+            METRICS_BIND="${METRICS_BIND:-0.0.0.0}"
+            METRICS_TOKEN_LINE=""
+            case "${METRICS_BIND}" in
+                127.0.0.1|::1|localhost)
+                    : # loopback — no token needed
+                    ;;
+                *)
+                    if [ -z "${METRICS_TOKEN:-}" ]; then
+                        METRICS_TOKEN="$(head -c 32 /dev/urandom | base64 | tr -d '+/=' | head -c 43)"
+                        log "generated random METRICS_TOKEN for non-loopback bind ${METRICS_BIND}"
+                    fi
+                    METRICS_TOKEN_LINE="auth_token = \"${METRICS_TOKEN}\""
+                    ;;
+            esac
+            cat >> "${CONFIG}" <<EOF
+
+[metrics]
+listen = "tcp://${METRICS_BIND}:${METRICS_PORT}"
+path = "/metrics"
+${METRICS_TOKEN_LINE}
+EOF
+        fi
+
+        cat >> "${CONFIG}" <<EOF
+
+[routing]
+cache_persist_path        = "/var/lib/veil/route_cache.json"
+rtt_persist_path          = "/var/lib/veil/rtt.json"
+vivaldi_persist_path      = "/var/lib/veil/vivaldi.json"
+gateway_persist_path      = "/var/lib/veil/gateway_list.json"
+peer_pubkeys_persist_path = "/var/lib/veil/peer_pubkeys.json"
+
+[dht]
+routing_persist_path = "/var/lib/veil/dht_routing.json"
+values_persist_path  = "/var/lib/veil/dht_values.json"
+EOF
+
+        {% for peer in bootstrap_peers | default([]) %}
+        cat >> "${CONFIG}" <<'EOF'
+
+[[bootstrap_peers]]
+transport  = "{{ peer.transport }}"
+public_key = "{{ peer.public_key }}"
+nonce      = "{{ peer.nonce }}"
+algo       = "{{ peer.algo | default('ed25519') }}"
+EOF
+        {% endfor %}
+
+        cat >> "${CONFIG}" <<EOF
+
+# <<< entrypoint.sh managed block <<<
+EOF
+    fi
+
+    log "validating config"
+    veil-cli --config "${CONFIG}" config validate
+
+    # Print the advertisement blob other operators paste into their
+    # bootstrap_peers array.
+    log "node identity:"
+    veil-cli --config "${CONFIG}" node show || true
+    log "bootstrap_peers snippet for other nodes:"
+    # Scope to the [Identity] section — a naive first-match grep would pick up
+    # the first [[bootstrap_peers]].public_key entry instead of our own.
+    PUB_KEY=$(sed -n '/^\[[Ii]dentity\]/,$ p' "${CONFIG}" | \
+        sed -nE 's/^\s*public_key\s*=\s*"([^"]*)".*/\1/p' | head -1)
+    NONCE=$(sed -n '/^\[[Ii]dentity\]/,$ p' "${CONFIG}" | \
+        sed -nE 's/^\s*nonce\s*=\s*"([^"]*)".*/\1/p' | head -1)
+    if [ -n "${NO_TLS}" ]; then
+        cat <<EOF
+
+╭───────────────────────────────────────────────────────────────╮
+│  Paste this into other nodes' config.toml                     │
+╰───────────────────────────────────────────────────────────────╯
+
+[[bootstrap_peers]]
+transport  = "tcp://${ADVERTISE}:${TCP_PORT}"
+public_key = "${PUB_KEY}"
+nonce      = "${NONCE}"
+algo       = "ed25519"
+
+EOF
+    else
+        cat <<EOF
+
+╭───────────────────────────────────────────────────────────────╮
+│  Paste ONE of these into other nodes' config.toml             │
+╰───────────────────────────────────────────────────────────────╯
+
+[[bootstrap_peers]]
+transport  = "tls://${HOST}:${TLS_PORT}"
+public_key = "${PUB_KEY}"
+nonce      = "${NONCE}"
+algo       = "ed25519"
+
+# Or QUIC:
+# transport  = "quic://${HOST}:${QUIC_PORT}"
+# Or plain TCP:
+# transport  = "tcp://${HOST}:${TCP_PORT}"
+# Or WSS:
+# transport  = "wss://${HOST}:${WSS_PORT}/veil"
+
+EOF
+    fi
+}
+
+# ── 3. Dispatch ──────────────────────────────────────────────────────────────
+cmd="${1:-run}"
+case "${cmd}" in
+    run)
+        if [ -z "${NO_TLS}" ]; then
+            wait_for_certs
+        else
+            log "NO_TLS=1 — skipping Let's Encrypt wait, listening on TCP only"
+        fi
+        generate_config
+        log "starting veil-cli node run"
+        exec veil-cli --config "${CONFIG}" node run --foreground
+        ;;
+    show)
+        exec veil-cli --config "${CONFIG}" node show
+        ;;
+    cli)
+        shift
+        exec veil-cli --config "${CONFIG}" "$@"
+        ;;
+    *)
+        exec "$@"
+        ;;
+esac

@@ -1,0 +1,137 @@
+---
+# Add an obfs4-tcp:// listen entry alongside the existing tcp:// one.
+# Idempotent: skips if obfs4-tcp already present in listen= line.
+# Restarts veil service when changed.
+#
+# Run:
+#   ansible-playbook -i inventory.yml add-obfs4-listener.yml \
+#     --extra-vars 'obfs4_port=5556' --limit node5
+
+- name: Add obfs4-tcp listen entry
+  hosts: all
+  become: true
+  serial: 1
+  vars:
+    obfs4_port_default: 5556
+
+  tasks:
+    - name: Check if obfs4-tcp already configured
+      ansible.builtin.shell:
+        cmd: grep -c 'obfs4-tcp://' /var/lib/veil/node.toml || true
+      register: existing_obfs4
+      changed_when: false
+
+    - name: Skip already-configured hosts
+      ansible.builtin.meta: end_host
+      when: existing_obfs4.stdout | int > 0
+
+    - name: Read current listen line
+      ansible.builtin.shell:
+        cmd: grep -E '^listen\s*=' /var/lib/veil/node.toml
+      register: listen_line
+      changed_when: false
+
+    - name: Fail if listen line not found
+      ansible.builtin.fail:
+        msg: "No listen= line in /var/lib/veil/node.toml"
+      when: listen_line.stdout == ""
+
+    - name: Get host's advertised IP
+      ansible.builtin.shell:
+        cmd: grep -oP 'advertise = "tcp://\K[^:]+' /var/lib/veil/node.toml | head -1
+      register: advertise_ip
+      changed_when: false
+
+    - name: Build new listen line
+      ansible.builtin.set_fact:
+        new_listen_line: >-
+          listen = [
+            { id = "0x00000001", transport = "tcp://0.0.0.0:5555", advertise = "tcp://{{ advertise_ip.stdout }}:5555" },
+            { id = "0x00000002", transport = "obfs4-tcp://0.0.0.0:{{ obfs4_port | default(obfs4_port_default) }}", advertise = "obfs4-tcp://{{ advertise_ip.stdout }}:{{ obfs4_port | default(obfs4_port_default) }}" }
+          ]
+
+    # Only replace the TOP-LEVEL listen line — the one before any
+    # [section] header.  Using ansible.builtin.replace with a regex that
+    # matches `^listen\s*=` would clobber `[metrics] listen` too, which
+    # is a string field.  Use Python for clean multi-line replacement.
+    - name: Replace TOP-LEVEL listen line with two-entry version
+      ansible.builtin.shell:
+        cmd: |
+          python3 << 'PYEOF'
+          import sys
+          path = "/var/lib/veil/node.toml"
+          new_block = '''{{ new_listen_line }}'''
+          with open(path) as f:
+              lines = f.readlines()
+          # Find the first `listen=` line BEFORE any [section] header.
+          first_section_idx = None
+          first_listen_idx = None
+          for i, line in enumerate(lines):
+              stripped = line.lstrip()
+              if stripped.startswith("[") and first_section_idx is None:
+                  first_section_idx = i
+                  break
+              if (stripped.startswith("listen=") or stripped.startswith("listen ="))\
+                  and first_listen_idx is None:
+                  first_listen_idx = i
+          if first_listen_idx is None or (first_section_idx is not None and first_listen_idx >= first_section_idx):
+              sys.stderr.write("ERROR: no top-level listen= line found before first [section]\n")
+              sys.exit(1)
+          lines[first_listen_idx] = new_block.rstrip() + "\n"
+          with open(path, "w") as f:
+              f.writelines(lines)
+          print("ok")
+          PYEOF
+        executable: /bin/bash
+      register: replace_result
+
+    - name: Restart veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait for metrics endpoint
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:19999/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Show wait result
+      ansible.builtin.debug:
+        var: wait_result.stdout
+
+    - name: Check journal for obfs4-tcp listen confirmation
+      ansible.builtin.shell:
+        cmd: |
+          journalctl -u veil.service --since "1 minute ago" --no-pager | \
+            grep -E "obfs4|listen|bound|error|panic" | tail -20
+      register: journal
+      changed_when: false
+
+    - name: Show journal
+      ansible.builtin.debug:
+        msg: "{{ journal.stdout_lines }}"
+
+    - name: Verify TCP socket bound on obfs4_port
+      ansible.builtin.shell:
+        cmd: ss -tlnp 'sport = :{{ obfs4_port | default(obfs4_port_default) }}' | grep -c LISTEN || true
+      register: sock_check
+      changed_when: false
+
+    - name: Show socket check
+      ansible.builtin.debug:
+        msg: "TCP listening on port {{ obfs4_port | default(obfs4_port_default) }}: {{ sock_check.stdout }}"
+
+    - name: Fail if socket not bound
+      ansible.builtin.fail:
+        msg: "obfs4-tcp listener did NOT bind on {{ obfs4_port | default(obfs4_port_default) }}"
+      when: sock_check.stdout | int < 1

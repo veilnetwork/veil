@@ -1,0 +1,305 @@
+name: release
+
+# Epic 484.1: deterministic release builds + signed UpdateManifest.
+#
+# Manually triggered (workflow_dispatch) — operator picks version,
+# decides whether to draft a fresh GitHub Release or attach to existing
+# tag.  Matrix builds for each supported target run in parallel; per-
+# target artifacts (binary + sha256.txt + manifest.bin) are uploaded
+# to the GitHub Release.
+#
+# Required GitHub repo secret:
+#   VEIL_RELEASE_IDENTITY_TOML — full TOML body of the issuer
+#                                   identity (algo + public_key +
+#                                   private_key).  Cold-storage
+#                                   release-signing key, distinct
+#                                   from any node identity.
+#
+# Verification (any user can run this locally):
+#   1. Download `veil-cli-<triple>` + `manifest.bin` from Release.
+#   2. `sha256sum veil-cli-<triple>` matches `binary_sha256` field
+#      decoded from the published manifest.
+#   3. Independent rebuild: clone repo, checkout same tag, run
+#      `scripts/build-release.sh --target <triple>
+#       --source-date-epoch <commit-author-date>` — output should
+#      have byte-identical SHA-256.
+#
+# Determinism enforced by `scripts/build-release.sh`:
+#   * `SOURCE_DATE_EPOCH` pinned to the tagged commit's author date.
+#   * `cargo build --locked` so Cargo.lock is not resolved fresh.
+#   * `RUSTFLAGS=--remap-path-prefix` strips host paths from debug info.
+#   * `CARGO_INCREMENTAL=0` so no per-machine state leaks in.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver string (e.g. 1.2.3) — must match a git tag if release_existing.'
+        required: true
+        type: string
+      min_compatible_version:
+        description: 'Minimum installed version that may apply this update.'
+        required: true
+        type: string
+      release_existing:
+        description: 'Attach to existing GitHub Release (else create new draft).'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # for release-attach
+
+jobs:
+  build:
+    name: build-${{ matrix.triple }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          # Static-musl build: same x86_64 platform but linked against
+          # musl libc.  Produced specifically for older Linux distros
+          # whose glibc lacks symbols GitHub's ubuntu-latest images bring
+          # (the runner pins a very recent glibc — binaries built there
+          # otherwise fail on old hosts with "GLIBC_2.39 not found").
+          # musl artifact runs on any Linux kernel ≥ 3.2 regardless of
+          # the host's libc version.
+          - triple: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            install_musl: true
+          # aarch64 static-musl: same no-glibc portability for ARM Linux
+          # (servers, SBCs). Cross-compiled by zig via cargo-zigbuild.
+          - triple: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            install_musl: true
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross_linker: aarch64-linux-gnu-gcc
+          - triple: aarch64-apple-darwin
+            runner: macos-14
+          - triple: x86_64-pc-windows-msvc
+            runner: windows-latest
+            is_windows: true
+          # Native Windows on ARM64. Cross-compiled from the x64 runner with
+          # clang-cl --target=aarch64-pc-windows-msvc.
+          - triple: aarch64-pc-windows-msvc
+            runner: windows-latest
+            is_windows: true
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Compute SOURCE_DATE_EPOCH from HEAD
+        id: epoch
+        shell: bash
+        run: echo "value=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.triple }}
+
+      - name: Install ARM64 Linux cross-linker
+        if: matrix.cross_linker == 'aarch64-linux-gnu-gcc'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Install cargo-zigbuild (musl C/C++ cross via zig)
+        if: matrix.install_musl == true
+        run: |
+          # The release binaries default to rocksdb-cold + tls-boring, so the
+          # musl target must cross-compile RocksDB and BoringSSL (C++). The
+          # musl.cc gcc cross-toolchain host is unreliable, so use zig instead:
+          # it ships a complete clang + musl libc + libc++ and cross-compiles
+          # C/C++ deps without an external toolchain download. zig and
+          # cargo-zigbuild both install from PyPI (reliable). build-release.sh
+          # then runs `cargo zigbuild` for this target via VEIL_CARGO_CMD.
+          # Pinned for reproducibility — bump deliberately (supply-chain).
+          pip3 install --user "cargo-zigbuild==0.22.3" "ziglang==0.16.0"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "VEIL_CARGO_CMD=zigbuild" >> "$GITHUB_ENV"
+
+      - name: Write release-signing identity (Linux host job only)
+        id: identity
+        if: matrix.runner == 'ubuntu-latest' && matrix.triple == 'x86_64-unknown-linux-gnu'
+        env:
+          IDENTITY_TOML: ${{ secrets.VEIL_RELEASE_IDENTITY_TOML }}
+        run: |
+          mkdir -p $RUNNER_TEMP/release-key
+          umask 077
+          printf '%s' "$IDENTITY_TOML" > $RUNNER_TEMP/release-key/identity.toml
+          echo "path=$RUNNER_TEMP/release-key/identity.toml" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries (Unix)
+        if: matrix.is_windows != true
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_linker }}
+          # blake3 (NEON C) + rocksdb (C++) build via cc-rs; without a target
+          # CC/CXX they fall back to host clang and miss the aarch64 multiarch
+          # headers (bits/wordsize.h not found). Point them at the cross gcc.
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          # musl cross env (CC/CXX/AR/LINKER/BINDGEN/CMAKE_TOOLCHAIN_FILE) is set
+          # by the "Install musl cross toolchain" step via $GITHUB_ENV.
+        run: |
+          ./scripts/build-release.sh \
+            --target ${{ matrix.triple }} \
+            --source-date-epoch ${{ steps.epoch.outputs.value }}
+
+      - name: Build release binaries (Windows)
+        if: matrix.is_windows == true
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.value }}
+          CARGO_INCREMENTAL: 0
+          RUSTFLAGS: '--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=C:\=/'
+          # The repo-global [env] CC=clang/CXX=clang++ (.cargo/config.toml, a
+          # rocksdb header workaround) is a gnu-driver clang and chokes on the
+          # MSVC-style flags crates add for *-windows-msvc (e.g. pqcrypto's
+          # /arch:AVX2). Use clang-cl (the MSVC driver) for this target.
+          CC_x86_64_pc_windows_msvc: clang-cl
+          CXX_x86_64_pc_windows_msvc: clang-cl
+          CC_aarch64_pc_windows_msvc: clang-cl
+          CXX_aarch64_pc_windows_msvc: clang-cl
+          # Drop the global gnu force-include (-include cstdint, .cargo/config.toml)
+          # on this target: cl rejects the gnu form, and the MSVC /FI form gets
+          # mangled by git-bash MSYS path conversion (/FI -> C:/.../FI). MSVC's STL
+          # pulls <cstdint> in transitively, so rocksdb's headers compile without it.
+          CXXFLAGS: ''
+        run: |
+          # Phase 6.50.b audit fix: switched from allow-empty-seeds to
+          # production-seeds.  Pre-fix a CI release artifact for Windows
+          # would be built without builtin seeds, producing a binary that
+          # won't bootstrap without manual peer config.  Now matches the
+          # Unix path through scripts/build-release.sh (which also
+          # defaults to production-seeds).  For testnet artifacts use
+          # a separate workflow that explicitly opts in.
+          cargo build --release --target ${{ matrix.triple }} --locked \
+            --bin veil-cli --bin ogate --bin oproxy-client --bin oproxy-server \
+            --features veil-bootstrap/production-seeds
+          stage="target/release-artifacts/${{ matrix.triple }}"
+          mkdir -p "$stage"
+          : > "$stage/sha256.txt"
+          for b in veil-cli ogate oproxy-client oproxy-server; do
+            src="target/${{ matrix.triple }}/release/${b}.exe"
+            cp "$src" "$stage/"
+            sha256sum "$stage/${b}.exe" | awk -v n="${b}.exe" '{print $1"  "n}' >> "$stage/sha256.txt"
+          done
+
+      - name: Sign manifest (host build only — has signing key)
+        if: steps.identity.outputs.path != ''
+        run: |
+          ./scripts/build-release.sh \
+            --target ${{ matrix.triple }} \
+            --source-date-epoch ${{ steps.epoch.outputs.value }} \
+            --sign \
+            --identity ${{ steps.identity.outputs.path }} \
+            --version ${{ inputs.version }} \
+            --min-compatible-version ${{ inputs.min_compatible_version }} \
+            --binary-url 'https://github.com/${{ github.repository }}/releases/download/v${{ inputs.version }}/veil-cli-${{ matrix.triple }}'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: release-${{ matrix.triple }}
+          path: target/release-artifacts/${{ matrix.triple }}/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      # F2: Ed25519 private key (openssl PEM) that signs the per-triple sha256
+      # manifests for the shell installer (scripts/install.sh). OPTIONAL — when
+      # the secret is unset, no `.sig` is produced and install.sh falls back to
+      # sha256-only with a warning (no regression). See docs/en/release-signing.md.
+      RELEASE_INSTALLER_ED25519_SK: ${{ secrets.RELEASE_INSTALLER_ED25519_SK }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: artifacts/
+
+      - name: Rename per-triple for release upload
+        shell: bash
+        run: |
+          mkdir -p out/
+          for d in artifacts/release-*/; do
+            triple="$(basename "$d" | sed 's/^release-//')"
+            for f in "$d"/*; do
+              base="$(basename "$f")"
+              # veil-cli         → veil-cli-<triple>
+              # veil-cli.exe     → veil-cli-<triple>.exe
+              # sha256.txt          → sha256-<triple>.txt
+              # manifest.bin        → manifest-<triple>.bin
+              ext=""
+              stem="$base"
+              case "$base" in
+                *.exe) ext=".exe"; stem="${base%.exe}" ;;
+                *.txt) ext=".txt"; stem="${base%.txt}" ;;
+                *.bin) ext=".bin"; stem="${base%.bin}" ;;
+              esac
+              cp "$f" "out/${stem}-${triple}${ext}"
+            done
+          done
+          ls -la out/
+
+      - name: Sign sha256 manifests for the installer (Ed25519) — F2
+        # Detached Ed25519 signature over each per-triple sha256 manifest, so
+        # scripts/install.sh can authenticate the manifest against a pinned key
+        # BEFORE trusting any hash it lists (closes the "compromised release
+        # artifact serves its own matching sha256" supply-chain gap). The `.sig`
+        # files land in out/ and are picked up by the `out/*` glob below.
+        # Skipped automatically when no signing secret is configured.
+        if: ${{ env.RELEASE_INSTALLER_ED25519_SK != '' }}
+        shell: bash
+        run: |
+          keyfile="$(mktemp)"; pubfile="$(mktemp)"
+          printf '%s' "$RELEASE_INSTALLER_ED25519_SK" > "$keyfile"
+          openssl pkey -in "$keyfile" -pubout -out "$pubfile"
+          # Fail-fast: the secret's public half MUST equal the key pinned in
+          # scripts/install.sh. Otherwise the installer would reject every
+          # release we sign here (wrong-key verification failure). Catches a
+          # mismatched/rotated secret at release time, not in users' installs.
+          pinned="$(sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' scripts/install.sh | tr -d '[:space:]')"
+          derived="$(tr -d '[:space:]' < "$pubfile")"
+          if [ -z "$pinned" ]; then
+            echo "::error::no pinned public key in scripts/install.sh (pinned_release_pubkey is empty) — arm it before signing releases"; exit 1
+          fi
+          if [ "$pinned" != "$derived" ]; then
+            echo "::error::RELEASE_INSTALLER_ED25519_SK public half does NOT match pinned_release_pubkey() in install.sh"; exit 1
+          fi
+          echo "secret public half matches the pinned installer key"
+          shopt -s nullglob
+          signed=0
+          for f in out/sha256-*.txt; do
+            openssl pkeyutl -sign -inkey "$keyfile" -rawin -in "$f" -out "$f.sig"
+            # Ship-time self-check: the published .sig MUST verify under the
+            # key's public half (catches a wrong / corrupt secret before release).
+            openssl pkeyutl -verify -pubin -inkey "$pubfile" -rawin \
+              -in "$f" -sigfile "$f.sig" \
+              || { echo "::error::installer signature self-check failed for $f"; exit 1; }
+            echo "signed + verified: $f.sig"
+            signed=$((signed + 1))
+          done
+          rm -f "$keyfile" "$pubfile"
+          [ "$signed" -gt 0 ] || { echo "::error::no sha256-*.txt manifests to sign"; exit 1; }
+
+      - name: Attach to Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: Release v${{ inputs.version }}
+          draft: ${{ !inputs.release_existing }}
+          files: out/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
