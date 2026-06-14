@@ -76,9 +76,8 @@ async fn read_handshake_message<S: AsyncRead + Unpin>(
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        // Try parsing with current buffer; if `TrailingBytes` we've over-read,
-        // truncate and accept.  If `TooShort`, keep reading.  If parsing
-        // succeeds, perfect.
+        // Try parsing with current buffer; if `TooShort`, keep reading. Once we
+        // have the declared total we accept.
         if buf.len() >= HANDSHAKE_MIN_BYTES {
             // Peek at declared pad_len to determine total length.
             // (No timestamp field on the wire since C-01.)
@@ -87,6 +86,20 @@ async fn read_handshake_message<S: AsyncRead + Unpin>(
                 let pad_len = buf[pad_len_offset] as usize;
                 let total = pad_len_offset + 1 + pad_len;
                 if buf.len() >= total {
+                    // No-pipeline invariant: obfs4 is strictly request/response
+                    // up to and including this handshake flight — the peer sends
+                    // NO post-handshake data until both handshakes complete, so a
+                    // single read never carries bytes past `total`. `truncate`
+                    // therefore only ever drops zero bytes. If a future framing
+                    // ever pipelines data into the handshake segment, those bytes
+                    // would be silently lost here; assert loudly in debug builds
+                    // so that change is caught rather than corrupting the stream.
+                    debug_assert_eq!(
+                        buf.len(),
+                        total,
+                        "obfs4 handshake read over-read past the message — peer \
+                         pipelined post-handshake data; truncate would drop it"
+                    );
                     buf.truncate(total);
                     return Ok(buf);
                 }

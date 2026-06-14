@@ -2,33 +2,30 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use veil_error::{ConfigError, Result};
+use veil_error::Result;
 
 pub(super) fn interrupt_flag() -> Result<&'static Arc<AtomicBool>> {
     static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-    // Separate OnceLock tracks whether the ctrlc handler is already installed
-    // avoiding the fragile string-matching on the error message.
-    static HANDLER_INSTALLED: OnceLock<()> = OnceLock::new();
-
-    if let Some(flag) = FLAG.get() {
-        return Ok(flag);
-    }
-
-    let flag = Arc::new(AtomicBool::new(false));
-    let handler_flag = Arc::clone(&flag);
-
-    // Install the Ctrl-C handler exactly once. Any subsequent call that
-    // arrives here (before FLAG is set) is safe to ignore because the handler
-    // is already pointing at the same static AtomicBool.
-    HANDLER_INSTALLED.get_or_init(|| {
+    // Create the flag AND install the handler inside a single `get_or_init`.
+    // `get_or_init`'s closure runs exactly once even under concurrent first
+    // calls (other threads block until it returns), so the Arc the handler
+    // captures is *guaranteed* to be the same Arc published to `FLAG`. The
+    // previous split (a separate `HANDLER_INSTALLED` OnceLock + `FLAG.set`)
+    // raced: thread A could install the handler against A's flag while thread
+    // B's flag won `FLAG.set`, decoupling the two — Ctrl-C then set a cell the
+    // search never read. Returning `Result` is kept for caller compatibility;
+    // the init is now infallible.
+    Ok(FLAG.get_or_init(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let handler_flag = Arc::clone(&flag);
+        // `set_handler` errors only if some OTHER subsystem already owns the
+        // process Ctrl-C handler; the interactive PoW interrupt is best-effort,
+        // so ignore that and keep the (then-inert) flag.
         let _ = ctrlc::set_handler(move || {
             handler_flag.store(true, Ordering::Relaxed);
         });
-    });
-
-    let _ = FLAG.set(flag);
-    FLAG.get()
-        .ok_or(ConfigError::PoisonedState("interrupt flag"))
+        flag
+    }))
 }
 
 /// Reset the interrupt flag to `false`.
