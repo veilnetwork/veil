@@ -1,0 +1,108 @@
+---
+- name: Deploy veil bootstrap node
+  hosts: bootstrap
+  become: true
+
+  vars:
+    bootstrap_peers: []
+    veil_container_name: veil-bootstrap
+
+  tasks:
+    - name: Install Docker (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Install Docker (RHEL/CentOS/Fedora)
+      block:
+        - name: Add Docker repo
+          ansible.builtin.command:
+            cmd: dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+            creates: /etc/yum.repos.d/docker-ce.repo
+        - name: Install Docker packages
+          ansible.builtin.dnf:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-compose-plugin
+            state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Ensure Docker is running
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create compose directory
+      ansible.builtin.file:
+        path: "{{ veil_compose_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Deploy docker-compose.yml
+      ansible.builtin.template:
+        src: templates/docker-compose.yml.j2
+        dest: "{{ veil_compose_dir }}/docker-compose.yml"
+        mode: "0640"
+      notify: Restart veil
+
+    - name: Deploy entrypoint.sh
+      ansible.builtin.template:
+        src: templates/entrypoint.sh.j2
+        dest: "{{ veil_compose_dir }}/entrypoint.sh"
+        mode: "0755"
+      notify: Restart veil
+
+    - name: Pull latest image
+      community.docker.docker_compose_v2:
+        project_src: "{{ veil_compose_dir }}"
+        pull: always
+        state: present
+      register: pull_result
+
+    - name: Start services
+      community.docker.docker_compose_v2:
+        project_src: "{{ veil_compose_dir }}"
+        state: present
+
+    # Force pending Restart-veil handlers (from template changes above)
+    # to run before the health check so the health wait validates the
+    # actual post-restart state, not a stale pre-handler snapshot.
+    # Without this, a broken entrypoint can slip through green as long as
+    # the pre-restart container was healthy.
+    - name: Flush handlers before health check
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for veil to become healthy
+      # On slow single-vCPU VPS the PoW mining at difficulty=24 can take
+      # 5–10 minutes on first boot; raise retry budget to 15 min so the
+      # healthcheck window covers realistic identity-generation time.
+      ansible.builtin.command:
+        cmd: docker inspect --format='{{ '{{' }}.State.Health.Status{{ '}}' }}' {{ veil_container_name }}
+      register: health
+      until: health.stdout == "healthy"
+      retries: 90
+      delay: 10
+      changed_when: false
+
+    - name: Print bootstrap_peers snippet
+      ansible.builtin.command:
+        cmd: docker logs {{ veil_container_name }}
+      register: logs
+      changed_when: false
+
+    - name: Show snippet
+      ansible.builtin.debug:
+        msg: "{{ logs.stdout_lines | select('search', 'bootstrap_peers|transport|public_key|nonce|algo') | list }}"
+
+  handlers:
+    - name: Restart veil
+      community.docker.docker_compose_v2:
+        project_src: "{{ veil_compose_dir }}"
+        state: restarted

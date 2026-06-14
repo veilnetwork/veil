@@ -1,0 +1,13 @@
+veil_image: veilnetwork/veil:testnet-v6.32
+veil_role: core
+veil_difficulty: 24
+
+tcp_port: 5555
+tls_port: 9906
+quic_port: 8443
+wss_port: 8443
+mesh_udp_port: 6666
+metrics_port: 19999
+
+veil_data_dir: /opt/veil
+veil_compose_dir: /opt/veil/compose

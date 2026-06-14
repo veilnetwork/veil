@@ -1,0 +1,24 @@
+**/*.sock*
+**/*.log
+**/*.json
+
+# Phase 6.49 audit — committed secrets cleanup (2026-05-08).
+# Per-node identity material и config.toml (which contains
+# `[Identity] private_key`) MUST NOT live в git.  Operators
+# regenerate after clone — see stend/SETUP.md.
+node*/config.toml
+node*/veil/
+node*/veil.txt
+
+# Audit batch 2026-05-25 phase K (cross-audit Git-hygiene closure):
+# private identity material и runtime state from the local 2-node
+# stand should never enter git.  Operators регенерируют через
+# stend/setup.sh on first clone; nothing here should diff.
+**/device_identity_sk.bin
+**/identity_document.bin
+**/mailbox/
+**/*.pid
+**/*.bin
+node*/ogate*.toml
+node*/peers_discovered.json
+node*/admin-audit.log*

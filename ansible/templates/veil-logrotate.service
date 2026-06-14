@@ -1,0 +1,15 @@
+[Unit]
+Description=Hourly logrotate for veil daemon logs
+Documentation=man:logrotate(8)
+
+[Service]
+Type=oneshot
+# Run logrotate ONLY against the veil config file.  The system default
+# `logrotate.service` walks /etc/logrotate.d/* once а day — that's far too
+# infrequent for veil daemons под high load (~230 MB/h log volume).
+# This systemd unit pairs с veil-logrotate.timer for hourly rotation
+# на just our config, без disturbing other system services.
+ExecStart=/usr/sbin/logrotate /etc/logrotate.d/veil
+# Allow the rotation operation up к 5 minutes (handles slow disks); kill
+# if hangs.
+TimeoutStartSec=300

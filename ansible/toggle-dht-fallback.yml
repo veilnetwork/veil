@@ -1,0 +1,88 @@
+---
+# A/B toggle for the iterative-DHT route-discovery fallback.
+#
+# Sets `routing.dht_fallback_enabled` in each target's node.toml and restarts
+# veil (one node at a time). Default target is the `nodes` group (the 5 leaf
+# nodes); use --limit to scope to a subset or a single host.
+#
+# REQUIRES a veil-cli binary that knows the `dht_fallback_enabled` key. Older
+# binaries silently ignore it (no deny_unknown_fields on RoutingConfig), so it
+# is harmless to set early — but it has no effect until the new binary is
+# deployed via deploy-binary-only.yml.
+#
+# WHY: in ~5h of testnet steady-state the FIND_NODE fallback resolved ~0% of
+# route-misses while the always-on recursive-relay handled ~100%. This knob
+# lets us A/B end-to-end delivery with the fallback ON vs OFF under chaos to
+# decide keep-vs-remove. Full procedure: ansible/RUNBOOK-ab-dht-fallback.md.
+#
+# Disable on all leaf nodes:
+#   ansible-playbook -i inventory.yml toggle-dht-fallback.yml -e fallback_enabled=false
+# Re-enable:
+#   ansible-playbook -i inventory.yml toggle-dht-fallback.yml -e fallback_enabled=true
+# Scope to a subset:
+#   ansible-playbook -i inventory.yml toggle-dht-fallback.yml -e fallback_enabled=false --limit node2,node5
+
+- name: Toggle routing.dht_fallback_enabled for A/B measurement
+  hosts: nodes
+  become: true
+  serial: 1 # one node at a time — preserve mesh connectivity across restarts
+
+  vars:
+    fallback_enabled: true
+    veil_config: /var/lib/veil/node.toml
+    metrics_url: http://127.0.0.1:19999/metrics
+
+  tasks:
+    - name: Ensure a [routing] section exists in node.toml
+      ansible.builtin.command:
+        cmd: "grep -qE '^\\[routing\\]' {{ veil_config }}"
+      changed_when: false
+
+    - name: "Set routing.dht_fallback_enabled = {{ fallback_enabled | bool | lower }}"
+      ansible.builtin.lineinfile:
+        path: "{{ veil_config }}"
+        regexp: '^\s*dht_fallback_enabled\s*='
+        line: "dht_fallback_enabled = {{ fallback_enabled | bool | lower }}"
+        insertafter: '^\[routing\]'
+        owner: veil
+        group: veil
+        mode: "0600"
+      register: cfg
+
+    - name: Validate config parses before any restart
+      ansible.builtin.command:
+        cmd: "/usr/local/bin/veil-cli --config {{ veil_config }} config validate"
+      changed_when: false
+
+    - name: Restart veil if the flag changed
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
+      when: cfg.changed
+
+    - name: Wait for the metrics endpoint to come back (≤30 s)
+      ansible.builtin.shell: |
+        for _ in $(seq 1 30); do
+          curl -sf {{ metrics_url }} >/dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        exit 1
+      register: ready
+      changed_when: false
+      failed_when: ready.rc != 0
+      when: cfg.changed
+
+    - name: Restart chat-node so its IPC session re-binds after the veil restart
+      ansible.builtin.systemd:
+        name: chat-node
+        state: restarted
+      when: cfg.changed
+
+    - name: Report the effective flag value
+      ansible.builtin.shell: "grep -E '^\\s*dht_fallback_enabled' {{ veil_config }} || echo '(absent -> default true)'"
+      changed_when: false
+      register: eff
+
+    - name: Show effective flag
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ eff.stdout }}"

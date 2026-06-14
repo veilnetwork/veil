@@ -1,0 +1,62 @@
+[package]
+name = "veil-dispatcher"
+version = "0.2.0"
+edition = "2024"
+description = "OVL1 frame dispatcher: routes incoming frames (control, session, discovery, app, anonymity, delivery, routing) to the correct service plane. Phase 3 of veilcore extraction."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-abuse = { path = "../veil-abuse" }
+veil-anonymity = { path = "../veil-anonymity" }
+veil-app = { path = "../veil-app" }
+veil-bootstrap = { path = "../veil-bootstrap" }
+veil-bufpool = { path = "../veil-bufpool" }
+veil-cfg = { path = "../veil-cfg" }
+veil-congestion = { path = "../veil-congestion" }
+veil-crypto = { path = "../veil-crypto" }
+veil-dht = { path = "../veil-dht" }
+veil-discovery = { path = "../veil-discovery" }
+veil-dispatcher-state = { path = "../veil-dispatcher-state" }
+veil-e2e = { path = "../veil-e2e" }
+veil-error = { path = "../veil-error" }
+veil-gateway = { path = "../veil-gateway" }
+veil-identity = { path = "../veil-identity" }
+veil-mesh = { path = "../veil-mesh" }
+veil-nat = { path = "../veil-nat" }
+veil-observability = { path = "../veil-observability" }
+veil-pending-ack = { path = "../veil-pending-ack" }
+veil-pex = { path = "../veil-pex" }
+veil-proto = { path = "../veil-proto" }
+veil-proxy = { path = "../veil-proxy" }
+veil-reputation = { path = "../veil-reputation" }
+veil-routing = { path = "../veil-routing" }
+veil-session = { path = "../veil-session" }
+veil-transport = { path = "../veil-transport" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+base64 = "0.22"
+blake3 = "1.5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+log = "0.4"
+rand = "0.8"
+rand_core = "0.6"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+# Enable the test-low-difficulty feature for our own #[cfg(test)] runs. The
+# store_sovereign_*_name_claim tests mine a NameClaim PoW via
+# veil-identity -> veil_proto::name_claim_v2::required_difficulty, whose
+# low test difficulty is gated on veil-proto's cfg(test) -- which does NOT
+# cross the crate boundary when veil-dispatcher is the crate under test. At
+# production difficulty (24-bit for a 5-char name) the 20M-attempt budget is
+# exhausted ~30% of runs (PowExhausted), so the test flakes. Mirror the opt-in
+# veil-identity / veil-dht / veil-node-runtime already use.
+veil-crypto = { path = "../veil-crypto", features = ["test-low-difficulty"] }
+veil-proto = { path = "../veil-proto", features = ["test-low-difficulty"] }
+
+[lints]
+workspace = true

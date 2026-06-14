@@ -1,0 +1,39 @@
+[package]
+name = "veil-session"
+version = "0.2.0"
+edition = "2024"
+description = "OVL1 session state machine — post-handshake frame loop, handoff, hot-standby, PoW-rendezvous, tx-registry. Phase 2 of veilcore extraction (see docs/en/PLAN_VEILCORE_EXTRACTION.md)."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-abuse = { path = "../veil-abuse" }
+veil-bufpool = { path = "../veil-bufpool" }
+veil-cfg = { path = "../veil-cfg" }
+veil-crypto = { path = "../veil-crypto" }
+veil-dht = { path = "../veil-dht" }
+veil-e2e = { path = "../veil-e2e" }
+veil-error = { path = "../veil-error" }
+veil-identity = { path = "../veil-identity" }
+veil-observability = { path = "../veil-observability" }
+veil-proto = { path = "../veil-proto" }
+veil-routing = { path = "../veil-routing" }
+veil-transport = { path = "../veil-transport" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+base64 = "0.22"
+blake3 = "1.5"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+log = "0.4"
+ml-kem = { version = "0.3.0-rc.1", features = ["getrandom"] }
+rand = "0.8"
+rand_core = "0.6"
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+zeroize = "1"
+
+[lints]
+workspace = true

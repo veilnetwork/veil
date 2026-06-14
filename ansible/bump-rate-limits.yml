@@ -1,0 +1,66 @@
+---
+# Bump per-peer frame-rate limits on the veil daemon.
+#
+# Default (post audit batch 2026-05-22): `rate_limit_fps = 200_000`,
+# `rate_limit_burst = 400_000` → **2 Gbps per peer** baseline at MTU 1500
+# (200K × 1500 = 300 MB/s headroom; 2 Gbps = ~167K fps).  This playbook is
+# kept as a one-off override knob: testnet may want **higher** for
+# multi-Gbps stress (rate_limit_fps = 500_000 ≈ 6 Gbps per peer), or
+# lower when constraining specific peer-pairs.
+#
+# Idempotent — re-runs only replace the block if values differ.
+#
+# Run:
+#   ansible-playbook -i inventory.yml bump-rate-limits.yml
+#
+# Override values:
+#   ansible-playbook -i inventory.yml bump-rate-limits.yml \
+#     -e rate_limit_fps=500000 -e rate_limit_burst=1000000
+
+- name: Bump abuse rate limits on veil daemon
+  hosts: all
+  become: true
+
+  vars:
+    # 200K fps × 1500 B/frame = 300 MB/s = 2.4 Gbps per peer (matches the
+    # daemon's built-in default; explicit override keeps the value visible
+    # in node.toml for operator audit).
+    rate_limit_fps: 200000
+    rate_limit_burst: 400000
+
+  tasks:
+    - name: Insert / update [abuse] block in node.toml
+      ansible.builtin.blockinfile:
+        path: /var/lib/veil/node.toml
+        marker: "# {mark} ANSIBLE MANAGED [abuse] block"
+        block: |
+          [abuse]
+          rate_limit_fps   = {{ rate_limit_fps }}
+          rate_limit_burst = {{ rate_limit_burst }}
+        owner: veil
+        group: veil
+        mode: "0644"
+      register: cfg_changed
+
+    - name: Restart veil if config changed (cascades to ogate via PartOf)
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
+      when: cfg_changed.changed
+
+    - name: Wait 5 s for veil + ogate to come up
+      ansible.builtin.pause:
+        seconds: 5
+      when: cfg_changed.changed
+
+    - name: Verify both services active
+      ansible.builtin.shell:
+        cmd: |
+          systemctl is-active veil
+          systemctl is-active ogate
+      register: status
+      changed_when: false
+
+    - name: Status
+      ansible.builtin.debug:
+        var: status.stdout_lines

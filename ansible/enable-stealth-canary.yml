@@ -1,0 +1,318 @@
+---
+# Slice 9 of the PoW-Gated Rendezvous epic — canary playbook to enable
+# a stealth listener (visibility=stealth + [listen.on_demand]) on ONE
+# testnet node.  Conservative defaults (pow_difficulty=12 — fast mining
+# for test window; production: 24) chosen for quick observability.
+#
+# Unlike Phase 5f's ephemeral-rotation canary, stealth listeners do NOT
+# bind a port at startup.  The dispatcher arm (Slice 6b) lights up the
+# port on-demand when a valid PoW-gated request lands; without an
+# end-to-end SDK-level initiator-await wiring (deferred to a future
+# slice), this canary primarily validates:
+#
+#   1. Daemon parses the [listen.on_demand] block correctly
+#   2. spawn_listeners constructs the controller + attaches to dispatcher
+#   3. `rendezvous.controller.wired` event fires in veil.log
+#   4. No port appears in `ss -tlnp` for the configured range (key
+#      anti-scan property)
+#   5. `veil_rendezvous_*` Prometheus surfaces are present (init at 0)
+#   6. No regression on existing listeners / sessions
+#
+# Idempotent: skips if a stealth listener with id={{ stealth_listen_id }}
+# already exists.
+#
+# Run:
+#   ansible-playbook -i inventory.yml enable-stealth-canary.yml \
+#     --limit node1
+#
+# Override defaults:
+#   --extra-vars 'stealth_pow_difficulty=24 stealth_range_lo=52000 stealth_range_hi=52999'
+
+- name: Enable stealth (PoW-Gated Rendezvous) listener on canary node
+  hosts: all
+  become: true
+  serial: 1
+  vars:
+    # Default canary settings — pow_difficulty=12 mines in milliseconds
+    # on a 2-vCPU VPS, fast feedback for the test window.  Production:
+    # bump to 24 (~0.5 sec mining cost per request) before rollout.
+    stealth_pow_difficulty: 12
+    stealth_range_lo: 52000
+    stealth_range_hi: 52999
+    stealth_ttl: "5m"
+    stealth_max_concurrent: 16
+    stealth_rate_limit: "3/h"
+    stealth_max_accepts: 1
+    stealth_bind_retries: 64
+    # Listener ID for the new stealth entry.  Must NOT collide with
+    # existing listener ids (testnet uses 0x00000002 + 0x00000003).
+    stealth_listen_id: "0x00000005"
+
+  tasks:
+    - name: Discover host's advertised IP
+      ansible.builtin.shell:
+        cmd: |
+          grep -oP 'advertise = "obfs4-tcp://\K[^:"]+' \
+            /var/lib/veil/node.toml | head -1
+      register: advertise_ip
+      changed_when: false
+
+    - name: Fail if advertised IP not found
+      ansible.builtin.fail:
+        msg: >-
+          Could not detect advertised obfs4-tcp IP from node.toml.
+          Stealth canary needs a host for composing the response URI
+          (advertise field).  Manual config required.
+      when: advertise_ip.stdout == ""
+
+    - name: Check if stealth listener already configured
+      ansible.builtin.shell:
+        cmd: |
+          grep -c 'id\s*=\s*"{{ stealth_listen_id }}"' \
+            /var/lib/veil/node.toml || true
+      register: existing_stealth
+      changed_when: false
+
+    - name: Skip already-configured hosts
+      ansible.builtin.meta: end_host
+      when: existing_stealth.stdout | int > 0
+
+    - name: Capture pre-change baseline metrics
+      ansible.builtin.shell:
+        cmd: |
+          curl -sS --max-time 5 http://127.0.0.1:{{ metrics_port }}/metrics \
+            | grep -E "^veil_(active_sessions|rendezvous_)" || true
+      register: baseline_metrics
+      changed_when: false
+
+    - name: Show baseline metrics
+      ansible.builtin.debug:
+        var: baseline_metrics.stdout_lines
+
+    # Append a NEW inline-table entry to the top-level `listen = [...]`
+    # array carrying visibility=stealth + an inline on_demand sub-table.
+    # Splice point: before the closing `]` of the TOP-LEVEL listen
+    # array (must NOT match a `[metrics] listen=` etc. — same caveat
+    # as Phase 5f's add-obfs4-listener playbook).
+    - name: Inject stealth listener entry into top-level listen array
+      ansible.builtin.shell:
+        cmd: |
+          python3 << 'PYEOF'
+          import re, sys
+          path = "/var/lib/veil/node.toml"
+          new_entry = (
+              ', { id = "{{ stealth_listen_id }}"'
+              ', transport = "obfs4-tcp://0.0.0.0:0"'
+              ', advertise = "obfs4-tcp://{{ advertise_ip.stdout }}:0"'
+              ', visibility = "stealth"'
+              ', on_demand = { '
+                  'range = [{{ stealth_range_lo }}, {{ stealth_range_hi }}]'
+                  ', pow_difficulty = {{ stealth_pow_difficulty }}'
+                  ', ttl = "{{ stealth_ttl }}"'
+                  ', max_concurrent = {{ stealth_max_concurrent }}'
+                  ', rate_limit = "{{ stealth_rate_limit }}"'
+                  ', max_accepts = {{ stealth_max_accepts }}'
+                  ', bind_retries = {{ stealth_bind_retries }}'
+              ' } }'
+          )
+          with open(path) as f:
+              src = f.read()
+          # Locate the TOP-LEVEL listen array (must precede any
+          # [section] header so we don't accidentally splice into
+          # [metrics].listen which is a string).
+          first_section_idx = None
+          for m in re.finditer(r'^\[[^\[]', src, re.MULTILINE):
+              first_section_idx = m.start()
+              break
+          search_window = src[:first_section_idx] if first_section_idx else src
+          # Find the closing `]` of the array assignment `listen = [ ... ]`.
+          # Match the literal `listen = [` then balance brackets to find
+          # the closing bracket at the matching depth.
+          start_m = re.search(r'(?:^|\n)listen\s*=\s*\[', search_window)
+          if not start_m:
+              sys.stderr.write("ERROR: top-level `listen = [...]` not found\n")
+              sys.exit(1)
+          depth = 0
+          end_idx = None
+          for i in range(start_m.end(), len(search_window)):
+              c = search_window[i]
+              if c == '[':
+                  depth += 1
+              elif c == ']':
+                  if depth == 0:
+                      end_idx = i
+                      break
+                  depth -= 1
+          if end_idx is None:
+              sys.stderr.write("ERROR: unclosed listen array\n")
+              sys.exit(1)
+          new_src = src[:end_idx] + new_entry + src[end_idx:]
+          with open(path, "w") as f:
+              f.write(new_src)
+          print("ok")
+          PYEOF
+        executable: /bin/bash
+      register: inject_result
+
+    - name: Show inject result
+      ansible.builtin.debug:
+        var: inject_result.stdout
+
+    - name: Validate config parses (config validate)
+      ansible.builtin.shell:
+        cmd: |
+          su -s /bin/sh veil -c \
+            '/usr/local/bin/veil-cli --config /var/lib/veil/node.toml config validate'
+      register: validate_result
+      changed_when: false
+      failed_when: validate_result.rc != 0
+
+    - name: Show validate output
+      ansible.builtin.debug:
+        msg: "{{ validate_result.stdout_lines | default(['(empty)']) }}"
+
+    - name: Restart veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait for metrics endpoint
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:{{ metrics_port }}/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Show wait result
+      ansible.builtin.debug:
+        var: wait_result.stdout
+
+    - name: Check veil.log for rendezvous wiring events + panic detection
+      ansible.builtin.shell:
+        cmd: |
+          grep -aE "rendezvous\.controller|panic" \
+            /var/log/veil/veil.log | tail -10
+      register: rendezvous_log
+      changed_when: false
+
+    - name: Show rendezvous log entries
+      ansible.builtin.debug:
+        msg: "{{ rendezvous_log.stdout_lines | default(['(no entries)']) }}"
+
+    - name: Fail if journal shows panic
+      ansible.builtin.fail:
+        msg: "PANIC in veil.log — stealth wiring failed.  Revert immediately."
+      when: "'panic' in (rendezvous_log.stdout | lower)"
+
+    - name: Confirm `rendezvous.controller.wired` event present
+      ansible.builtin.shell:
+        cmd: |
+          grep -aE "rendezvous\.controller\.wired" /var/log/veil/veil.log \
+            | tail -3 | grep -c "rendezvous.controller.wired" || true
+      register: wired_count
+      changed_when: false
+
+    - name: Show rendezvous.controller.wired count
+      ansible.builtin.debug:
+        msg: "rendezvous.controller.wired event count: {{ wired_count.stdout }}"
+
+    - name: Fail if controller did NOT attach
+      ansible.builtin.fail:
+        msg: >-
+          `rendezvous.controller.wired` event missing from veil.log.
+          Likely cause: identity is not Ed25519, or [listen.on_demand]
+          parsing failed, or visibility=stealth not set on the entry.
+          Inspect `/var/lib/veil/node.toml` + veil.log.
+      when: wired_count.stdout | int < 1
+
+    - name: Verify NO port open in the stealth range (anti-scan invariant)
+      ansible.builtin.shell:
+        cmd: |
+          ss -tlnp 'sport >= :{{ stealth_range_lo }} sport <= :{{ stealth_range_hi }}' \
+            2>/dev/null | grep -c LISTEN || true
+      register: stealth_ports_listening
+      changed_when: false
+
+    - name: Show stealth-port LISTEN count
+      ansible.builtin.debug:
+        msg: |
+          Stealth range {{ stealth_range_lo }}-{{ stealth_range_hi }}
+          LISTEN sockets count: {{ stealth_ports_listening.stdout }}
+          (Should be 0 — port comes alive only after a PoW-gated request lands.)
+
+    - name: Fail if a port is already bound (would invalidate stealth)
+      ansible.builtin.fail:
+        msg: >-
+          Port in stealth range {{ stealth_range_lo }}-{{ stealth_range_hi }}
+          is already listening BEFORE a request landed.  Either a stale
+          on-demand slot is leaking OR the listener was bound at startup
+          (config error?  Slice 6b dispatcher arm regression?).
+      when: stealth_ports_listening.stdout | int > 0
+
+    - name: Capture post-restart Prometheus metrics surfaces
+      ansible.builtin.shell:
+        cmd: |
+          curl -sS --max-time 5 http://127.0.0.1:{{ metrics_port }}/metrics \
+            | grep -E "^veil_rendezvous_" || true
+      register: rendezvous_metrics
+      changed_when: false
+
+    - name: Show rendezvous Prometheus surfaces
+      ansible.builtin.debug:
+        msg: "{{ rendezvous_metrics.stdout_lines | default(['(no metrics)']) }}"
+
+    - name: Confirm all 9 rendezvous metrics surfaces exposed
+      ansible.builtin.shell:
+        cmd: |
+          curl -sS --max-time 5 http://127.0.0.1:{{ metrics_port }}/metrics \
+            | grep -cE "^veil_rendezvous_(requests_(received|granted|rejected_(decode|verify|not_our_target|rate_limit|concurrency|bind_failed))_total|slots_in_use) " \
+            || true
+      register: metric_count
+      changed_when: false
+
+    - name: Fail if any of the 9 rendezvous metrics missing
+      ansible.builtin.fail:
+        msg: >-
+          Expected 9 rendezvous Prometheus surfaces, got
+          {{ metric_count.stdout }}.  Slice 7 wiring regression?  Inspect
+          the Prometheus output above and `crates/veil-observability/src/lib.rs`.
+      when: metric_count.stdout | int < 9
+
+    - name: Print follow-up instructions
+      ansible.builtin.debug:
+        msg: |
+          ✅ Stealth listener wired on {{ inventory_hostname }}.
+
+          Configuration:
+            listen_id      = {{ stealth_listen_id }}
+            advertise_host = {{ advertise_ip.stdout }}
+            range          = {{ stealth_range_lo }}..{{ stealth_range_hi }}
+            pow_difficulty = {{ stealth_pow_difficulty }} (bits)
+            ttl            = {{ stealth_ttl }}
+            rate_limit     = {{ stealth_rate_limit }} per requester
+            max_concurrent = {{ stealth_max_concurrent }}
+            max_accepts    = {{ stealth_max_accepts }}
+
+          Observability:
+            • Logs:       grep -aE "rendezvous\." /var/log/veil/veil.log
+            • Metrics:    curl -sS http://127.0.0.1:{{ metrics_port }}/metrics \\
+                            | grep veil_rendezvous_
+            • Ports:      ss -tlnp 'sport >= :{{ stealth_range_lo }} sport <= :{{ stealth_range_hi }}'
+                          (should stay empty until requests land)
+
+          End-to-end test requires SDK-level initiator wiring (deferred
+          to a future slice — see PLAN_POW_GATED_RENDEZVOUS.md).  For
+          now the canary validates: parsing, controller attach, no
+          port leak, and metrics availability.
+
+          Revert command if something goes wrong:
+              ansible-playbook -i inventory.yml revert-stealth-canary.yml \
+                --limit {{ inventory_hostname }}
