@@ -72,6 +72,11 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 // migrate opportunistically when touched.
 pub(crate) mod guard;
 
+// Embedded in-process node runtime (no `veil-cli` subprocess). Opt-in via the
+// `node-embedded` cargo feature so the default client-only build stays slim.
+#[cfg(feature = "node-embedded")]
+mod node;
+
 use libc::{size_t, ssize_t};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;

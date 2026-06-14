@@ -30,10 +30,21 @@ allow-empty-seeds = ["veilclient/allow-empty-seeds"]
 production-seeds  = ["veilclient/production-seeds"]
 test-low-difficulty = ["veilclient/test-low-difficulty"]
 
+# Embed a full veil node IN-PROCESS (no `veil-cli` subprocess) — for sandboxed
+# desktop + mobile (iOS) hosts that cannot spawn a child process. Pulls
+# veil-node-runtime with NO default features (in-memory DHT) to keep the heavy
+# C++ RocksDB cold store off mobile. Add `node-embedded-rocksdb` for a
+# persistent DHT on desktop/server.
+node-embedded = ["dep:veil-node-runtime", "dep:veil-cfg"]
+node-embedded-rocksdb = ["node-embedded", "veil-node-runtime/rocksdb-cold"]
+
 [dependencies]
 veilclient = { path = "../../veilclient" }
 veil-identity = { path = "../veil-identity" }
 veil-types = { path = "../veil-types" }
+# Embedded node runtime — optional, NO default features (see `node-embedded`).
+veil-node-runtime = { path = "../veil-node-runtime", default-features = false, optional = true }
+veil-cfg = { path = "../veil-cfg", optional = true }
 # Audit L-15: wrap the in-flight password copy in `Zeroizing` so the
 # `_zeroize_with_password` restore path scrubs every copy on drop.
 zeroize = "1"
