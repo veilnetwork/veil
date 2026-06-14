@@ -203,14 +203,28 @@ pub(crate) fn pick_rendezvous_relay(
             .collect()
     };
     if !pinned.is_empty() {
+        // Operator pin: honour the configured order deterministically (intent).
         return pinned
             .iter()
             .copied()
             .find(|p| connected.contains(p) && rendezvous_relay_published(dht, p));
     }
-    connected
+    // M-1: pick a RANDOM eligible relay rather than the first in iteration
+    // order. `connected` derives from HashMap iteration, which is fixed within a
+    // process, so `.find()` reused the SAME rendezvous point for every service
+    // registered by this node — concentrating load on one relay and making the
+    // node's rendezvous choice predictable. Each new registration now draws an
+    // independent R from the published-eligible set.
+    let eligible: Vec<[u8; 32]> = connected
         .into_iter()
-        .find(|c| rendezvous_relay_published(dht, c))
+        .filter(|c| rendezvous_relay_published(dht, c))
+        .collect();
+    if eligible.is_empty() {
+        return None;
+    }
+    use rand_core::{OsRng, RngCore};
+    let idx = (OsRng.next_u64() % eligible.len() as u64) as usize;
+    Some(eligible[idx])
 }
 
 /// Send a `RegisterRendezvous` frame to `relay` over its live session (inlines
