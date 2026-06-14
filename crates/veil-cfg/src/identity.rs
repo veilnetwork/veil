@@ -46,7 +46,9 @@ impl DomainIdentity {
             key_passphrase_file: None,
             key_passphrase_prompt: false,
             lazy_mining: true,
-            max_lazy_difficulty: 64,
+            // Single source of truth: never hardcode the cap (a literal 64 here
+            // re-introduced the unreachable-cap / never-terminating-miner footgun).
+            max_lazy_difficulty: crate::model::default_max_lazy_difficulty(),
         }
     }
 

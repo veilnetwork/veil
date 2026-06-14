@@ -96,6 +96,16 @@ pub(crate) async fn spawn_lazy_miner(
 
     let mut best_difficulty = current_difficulty;
     let mut candidate = start_nonce;
+    // Total candidate nonces examined this run. The identity nonce is a u32
+    // (`NONCE_LEN = 4` → 2^32 distinct values), so once we have swept the whole
+    // space without hitting `max_difficulty`, NO nonce satisfies the cap at this
+    // width — stop rather than `wrapping_add` back over the SAME nonces forever.
+    // Without this guard a cap the nonce space can't reach (e.g. ~37% of
+    // identities never produce a 32-bit score in 2^32 tries; 64 is unreachable
+    // for ANY identity) makes the miner grind a `spawn_blocking` core
+    // indefinitely — the exact ~40%-CPU-at-idle pathology the cap change targets.
+    let mut examined: u64 = 0;
+    const NONCE_SPACE: u64 = 1u64 << 32;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -172,6 +182,18 @@ pub(crate) async fn spawn_lazy_miner(
         }
 
         candidate = candidate.wrapping_add(BATCH_SIZE);
+        examined = examined.saturating_add(BATCH_SIZE as u64);
+        if examined >= NONCE_SPACE {
+            logger.info(
+                "lazy_miner.exhausted",
+                format!(
+                    "swept the full 2^32 nonce space; best difficulty \
+                     {best_difficulty} < cap {max_difficulty} is unreachable at \
+                     this nonce width — stopping (no further upgrade possible)"
+                ),
+            );
+            break;
+        }
 
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(YIELD_MS)) => {}

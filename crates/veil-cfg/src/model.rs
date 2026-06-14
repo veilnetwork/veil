@@ -3916,7 +3916,7 @@ fn default_lazy_mining() -> bool {
 fn is_default_lazy_mining(v: &bool) -> bool {
     *v == default_lazy_mining()
 }
-fn default_max_lazy_difficulty() -> u8 {
+pub(crate) fn default_max_lazy_difficulty() -> u8 {
     // Cap the lazy miner at a difficulty it can actually REACH so it
     // terminates. The miner upgrades the identity nonce toward this many
     // leading-zero score bits, each bit doubling the work (~2^d `pow_score`
