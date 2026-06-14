@@ -5,8 +5,14 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [features]
-default = ["rocksdb-cold"]
-# Epic 404.1: RocksDB cold tier for DHT TieredStore. Disable with --no-default-features.
+# rocksdb-cold is OPT-IN (not a default) so the client / embedded-node FFI
+# builds don't link the heavy C++ RocksDB cold store onto mobile (iOS/Android
+# use the in-memory DHT tier). Consumers that want persistence enable it
+# explicitly — `veil-cli` already does via its own default, and the embedded
+# FFI exposes `node-embedded-rocksdb` for desktop. A bare `cargo build`/test of
+# veilcore now uses the in-memory tier.
+default = []
+# Epic 404.1: RocksDB cold tier for DHT TieredStore.
 rocksdb-cold = ["dep:rocksdb", "veil-dht/rocksdb-cold"]
 # Epic 412.10: release-build safety gate on `BUILTIN_SEEDS`.  Enabling
 # `production-seeds` asserts that `node/bootstrap/seeds.rs::BUILTIN_SEEDS`
