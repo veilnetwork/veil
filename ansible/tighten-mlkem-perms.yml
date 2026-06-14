@@ -1,0 +1,40 @@
+---
+# Tighten on-disk `mlkem.key` file permissions on already-deployed nodes.
+#
+# The post-audit veil-cli builds write fresh keys at `0o600` via
+# `veil_util::atomic_write`, but nodes that generated their key with
+# the pre-audit binary still have the pre-fix permissions (typically
+# `0o644` from the default umask) — those files are owner-only-readable
+# logically (veil user) but world-readable on disk, leaking DK seed
+# to anyone with FS read access.
+#
+# This playbook chmods the existing keys to `0o600` without rotating
+# them. Safe to run repeatedly (idempotent).
+#
+# Run:
+#   ansible-playbook -i inventory.yml tighten-mlkem-perms.yml
+
+- name: Tighten ML-KEM key file permissions
+  hosts: all
+  become: true
+  tasks:
+    - name: Set mlkem.key to mode 0600 if exists
+      ansible.builtin.file:
+        path: /var/lib/veil/mlkem.key
+        mode: "0600"
+        owner: veil
+        group: veil
+      register: chmod_result
+      failed_when:
+        - chmod_result.failed | default(false)
+        - "'No such file or directory' not in (chmod_result.msg | default(''))"
+        - "'does not exist' not in (chmod_result.msg | default(''))"
+
+    - name: Show resulting state
+      ansible.builtin.stat:
+        path: /var/lib/veil/mlkem.key
+      register: key_stat
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "mlkem.key mode = {{ key_stat.stat.mode | default('absent') }}"

@@ -1,0 +1,16 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Must match `scrape_interval` in prometheus.yml — Grafana uses this
+      # to compute `$__rate_interval` (= max($__interval + timeInterval,
+      # 4 × timeInterval)).  Without it `$__rate_interval` evaluates to
+      # an empty string and rate() queries silently return No data on
+      # short ranges.
+      timeInterval: "15s"

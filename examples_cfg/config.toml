@@ -1,0 +1,18 @@
+[global]
+runtime_flavor = "multi_thread"  # or "current_thread"
+# worker_threads = <num_cpus>
+# max_blocking_threads = 512
+# thread_keep_alive_ms = 10000
+# thread_name = "tokio-rt-worker"
+# thread_stack_size = 2097152
+
+[transport.tls_client]
+backend = "rustls"
+fingerprint = "rustls"
+# connect_timeout_ms = 3000
+
+[transport.quic_client]
+backend = "native_quinn"
+
+[transport.websocket]
+browser_mode = "standard"

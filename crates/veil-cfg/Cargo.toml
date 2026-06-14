@@ -1,0 +1,51 @@
+[package]
+name = "veil-cfg"
+version = "0.2.0"
+edition = "2024"
+description = "Veil configuration types, file format, validators, and identity-config helpers. Phase 1 of veilcore extraction (see docs/en/PLAN_VEILCORE_EXTRACTION.md)."
+license = "AGPL-3.0-or-later"
+
+[features]
+# Phase 6.45 / Epic test-low-difficulty: opt the identity-PoW chain into
+# 16-bit difficulty so devnet binaries can boot in seconds.  Propagates
+# through veil-crypto + veil-identity + veil-proto.
+test-low-difficulty = [
+    "veil-crypto/test-low-difficulty",
+    "veil-proto/test-low-difficulty",
+]
+# Pass-through for TLS-boring (cfg's TLS-context glue reads bootstrap features).
+tls-boring = ["veil-transport/tls-boring"]
+# Backwards-compat no-op.
+tls-webpki-roots = ["veil-transport/tls-webpki-roots"]
+
+[dependencies]
+veil-adaptive = { path = "../veil-adaptive" }
+veil-crypto = { path = "../veil-crypto" }
+veil-error = { path = "../veil-error" }
+veil-identity = { path = "../veil-identity" }
+veil-observability = { path = "../veil-observability" }
+veil-proto = { path = "../veil-proto" }
+veil-transport = { path = "../veil-transport" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+base64 = "0.22"
+blake3 = "1.5"
+libc = "0.2"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+# tokio for the shared `build_tokio_runtime` factory used by veil-cli,
+# ogate, oproxy. Light features: just rt + rt-multi-thread. All consumer
+# crates already pull a fuller tokio anyway.
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread"] }
+toml = "0.9"
+toml_edit = "0.22"
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
+tempfile = "3"
+
+[lints]
+workspace = true

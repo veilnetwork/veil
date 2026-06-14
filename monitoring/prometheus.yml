@@ -1,0 +1,79 @@
+# Replace the 203.0.113.x placeholders (RFC 5737) with your real node IPs.
+#
+# LABELSET-UNIQUENESS WARNING — each scrape target MUST end up with a UNIQUE
+# label set, or Prometheus rejects the ENTIRE scrape ("duplicate sample for
+# timestamp" / num_dropped == number of samples in /metrics — i.e. the whole
+# scrape is dropped, not individual series). The veil /metrics endpoint emits
+# bare series (no instance/host of its own), so uniqueness comes from the
+# scrape config below: every target gets a distinct `host` label AND the
+# default `instance` = its `address:port`. Do NOT:
+#   * set a shared `instance` (e.g. `labels: { instance: veil }`),
+#   * `relabel`/`replacement` all targets to the same `instance`,
+#   * `labeldrop` `instance` (or `host`) — that collapses every node onto one
+#     time series and every scrape after the first looks like a duplicate.
+# Keep the per-target `host` label (it alone keeps series distinct even if
+# `instance` is ever overridden).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    network: veil-testnet
+
+scrape_configs:
+  - job_name: veil
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 203.0.113.11:19999
+        labels: { host: b1, role: bootstrap }
+      - targets:
+          - 203.0.113.12:19999
+        labels: { host: b2, role: bootstrap }
+      - targets:
+          - 203.0.113.13:19999
+        labels: { host: b3, role: bootstrap }
+      - targets:
+          - 203.0.113.21:19999
+        labels: { host: n1, role: node }
+      - targets:
+          - 203.0.113.22:19999
+        labels: { host: n2, role: node }
+      - targets:
+          - 203.0.113.23:19999
+        labels: { host: n3, role: node }
+      - targets:
+          - 203.0.113.24:19999
+        labels: { host: n4, role: node }
+      - targets:
+          - 203.0.113.25:19999
+        labels: { host: n5, role: node }
+      - targets:
+          - 203.0.113.26:19999
+        labels: { host: n6, role: node }
+      - targets:
+          - 203.0.113.27:19999
+        labels: { host: n7, role: node }
+      - targets:
+          - 203.0.113.28:19999
+        labels: { host: n8, role: node }
+      - targets:
+          - 203.0.113.29:19999
+        labels: { host: n9, role: node }
+      - targets:
+          - 203.0.113.30:19999
+        labels: { host: n10, role: node }
+      - targets:
+          - 203.0.113.31:19999
+        labels: { host: n11, role: node }
+      - targets:
+          - 203.0.113.32:19999
+        labels: { host: n12, role: node }
+      - targets:
+          - 203.0.113.33:19999
+        labels: { host: n13, role: node }
+      - targets:
+          - 203.0.113.34:19999
+        labels: { host: n14, role: node }
+      - targets:
+          - 203.0.113.35:19999
+        labels: { host: n15, role: node }

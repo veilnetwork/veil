@@ -1,0 +1,78 @@
+{
+  "dashboard": {
+    "title": "Veil Network",
+    "panels": [
+      {
+        "title": "Active Sessions",
+        "type": "stat",
+        "targets": [{"expr": "veil_active_sessions"}]
+      },
+      {
+        "title": "Route Cache Hits vs Misses",
+        "type": "graph",
+        "targets": [
+          {"expr": "rate(veil_route_cache_hits_total[5m])", "legendFormat": "hits/s"},
+          {"expr": "rate(veil_route_miss_total[5m])", "legendFormat": "misses/s"}
+        ]
+      },
+      {
+        "title": "RecursiveRelay",
+        "type": "graph",
+        "targets": [
+          {"expr": "rate(veil_recursive_relay_initiated_total[5m])", "legendFormat": "initiated/s"},
+          {"expr": "rate(veil_recursive_relay_forwarded_total[5m])", "legendFormat": "forwarded/s"},
+          {"expr": "rate(veil_recursive_relay_delivered_total[5m])", "legendFormat": "delivered/s"}
+        ]
+      },
+      {
+        "title": "Iterative-DHT route-discovery fallback (Phase 6.50.b)",
+        "type": "graph",
+        "targets": [
+          {"expr": "rate(veil_dht_fallback_triggered_total[5m])", "legendFormat": "triggered/s"},
+          {"expr": "rate(veil_dht_fallback_resolved_total[5m])", "legendFormat": "resolved/s"},
+          {"expr": "rate(veil_dht_fallback_miss_total[5m])", "legendFormat": "miss/s"}
+        ]
+      },
+      {
+        "title": "Gossip Rate",
+        "type": "graph",
+        "targets": [
+          {"expr": "rate(veil_gossip_announces_rx_total[5m])", "legendFormat": "announces/s"}
+        ]
+      },
+      {
+        "title": "Recursive Relay Forwards",
+        "type": "graph",
+        "targets": [
+          {"expr": "rate(veil_recursive_relay_forwarded_total[5m])", "legendFormat": "forwards/s"}
+        ]
+      },
+      {
+        "title": "Rate Limit Drops (Backpressure)",
+        "type": "graph",
+        "targets": [
+          {"expr": "rate(veil_rate_limit_drops_total[5m])", "legendFormat": "drops/s"}
+        ]
+      },
+      {
+        "title": "Session Outbox Drops (Backpressure)",
+        "type": "graph",
+        "targets": [
+          {"expr": "rate(veil_session_outbox_drops_total[5m])", "legendFormat": "drops/s"}
+        ]
+      },
+      {
+        "title": "DHT Store Size",
+        "type": "stat",
+        "targets": [{"expr": "veil_dht_store_total"}]
+      },
+      {
+        "title": "Session TX Drops",
+        "type": "graph",
+        "targets": [
+          {"expr": "rate(veil_session_tx_drops_total[5m])", "legendFormat": "drops/s"}
+        ]
+      }
+    ]
+  }
+}

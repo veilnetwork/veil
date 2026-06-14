@@ -1,0 +1,259 @@
+---
+# Deploy `chat_node` example to all 8 testnet hosts.
+#
+# Each host runs ONE chat_node binary that is BOTH a server (listens
+# for incoming MESSAGE frames) and a client (sends a MESSAGE to a
+# random peer every 0.1–2 s).
+#
+# Two-phase deploy because the IPC `bind` returns an opaque app_id
+# (function of namespace+name+local_node_id, not pre-computable from
+# the controller).  Phase 1 harvests app_ids; phase 2 distributes the
+# full peer list and starts the steady-state node.
+#
+# Run:
+#   ansible-playbook -i inventory.yml deploy-chat.yml
+#
+# Stop:
+#   ansible all -i inventory.yml -m systemd -a "name=chat-node state=stopped"
+
+- name: Deploy chat_node to testnet
+  hosts: all
+  become: true
+  # Fail the entire run if ANY host fails phase-1 app_id harvesting.
+  # Without this, ansible default behaviour (continue on per-host
+  # error) silently aggregates an INCOMPLETE peer-list excluding the
+  # failed host's app_id, distributes it to the survivors, and they
+  # never learn how to send messages to the failed host.  Observed
+  # 2026-05-08 on b3: failed=1 in phase 1 → 7 healthy hosts had no
+  # b3 entry → b3 rx ≈ 0 (sends fine, receives nothing).  Re-running
+  # the playbook with all hosts active fixes it, but the failure mode
+  # is silent.  `any_errors_fatal: true` makes the whole run abort on
+  # the first failure so operator notices immediately.
+  any_errors_fatal: true
+  vars:
+    chat_bin_src: "{{ playbook_dir }}/../target/release/examples/chat_node"
+    manifest_src: "/tmp/testnet-configs/manifest.json"
+    # Per-node generated app-traffic cap, kbit/s. chat_node reads this from
+    # the CHAT_TARGET_KBITS env var and paces sends accordingly. Default 200
+    # (the throttled observation scenario). Override with `-e chat_target_kbits=0`
+    # to restore the original full-rate stress cadence (~96 Mbit/s/node).
+    chat_target_kbits: 200
+
+  tasks:
+    # ── Phase 0: prerequisites ────────────────────────────────────────────────
+    - name: Verify chat_node binary on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ chat_bin_src }}"
+      register: bin_stat
+      run_once: true
+
+    - name: Fail if binary missing
+      ansible.builtin.fail:
+        msg: "Build first: cargo build --release -p veilclient --example chat_node --features veilcore/allow-empty-seeds,veilcore/test-low-difficulty"
+      when: not bin_stat.stat.exists
+
+    # Use veil-cli's own config setter — handles section creation,
+    # field placement, TOML escaping correctly.  Idempotent.
+    - name: Set ipc.enabled
+      become_user: veil
+      ansible.builtin.command:
+        cmd: /usr/local/bin/veil-cli --config /var/lib/veil/node.toml config set ipc.enabled true
+      changed_when: false
+
+    - name: Set ipc.socket_uri
+      become_user: veil
+      ansible.builtin.command:
+        cmd: /usr/local/bin/veil-cli --config /var/lib/veil/node.toml config set ipc.socket_uri unix:///var/lib/veil/app.sock
+      changed_when: false
+
+    - name: Validate config
+      become_user: veil
+      ansible.builtin.command:
+        cmd: /usr/local/bin/veil-cli --config /var/lib/veil/node.toml config validate
+      changed_when: false
+
+    - name: Restart veil so IPC server picks up new config
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
+
+    - name: Wait for app.sock
+      ansible.builtin.wait_for:
+        path: /var/lib/veil/app.sock
+        timeout: 30
+
+    - name: Stop any existing chat-node
+      ansible.builtin.systemd:
+        name: chat-node
+        state: stopped
+      failed_when: false
+
+    - name: Stop any prior echo_server processes
+      ansible.builtin.shell: |
+        pkill -f /usr/local/bin/echo_server
+        true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+
+    - name: Push chat_node binary
+      ansible.builtin.copy:
+        src: "{{ chat_bin_src }}"
+        dest: /usr/local/bin/chat_node
+        owner: root
+        group: root
+        mode: "0755"
+
+    # ── Phase 1: harvest app_ids ──────────────────────────────────────────────
+    # Run chat_node --dump-app-id and capture stdout per host.
+    - name: Harvest app_id per host
+      become_user: veil
+      ansible.builtin.command:
+        cmd: /usr/local/bin/chat_node --dump-app-id /var/lib/veil/app.sock {{ inventory_hostname }}
+      register: app_id_harvest
+      changed_when: false
+
+    - name: Show harvested app_id
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} -> app_id={{ app_id_harvest.stdout }}"
+
+    # ── Phase 2: build peer-list.txt on controller and push ───────────────────
+    - name: Build peer-list on controller
+      delegate_to: localhost
+      become: false
+      run_once: true
+      ansible.builtin.copy:
+        dest: /tmp/testnet-configs/peer-list.txt
+        content: |
+          # peer_node_id_hex  peer_app_id_hex  peer_endpoint_id  peer_name
+          {% for host in groups['all'] %}
+          {{ hostvars[host].veil_node_id }} {{ hostvars[host].chat_app_id }} 200 {{ host }}
+          {% endfor %}
+        mode: "0644"
+      vars:
+        # Map manifest host names back to inventory.  manifest uses b1/b2/b3 +
+        # n1..n5; inventory uses b1/b2/b3 + node1..node5.
+        manifest_lookup: "{{ lookup('file', manifest_src) | from_json }}"
+      when: false  # built below in a single task with the right facts
+
+    # Stash facts on each host so we can compose the file in one pass.
+    - name: Stash node_id + chat_app_id facts
+      ansible.builtin.set_fact:
+        chat_app_id: "{{ app_id_harvest.stdout | trim }}"
+        veil_node_id: "{{ (lookup('file', manifest_src) | from_json | selectattr('host', 'eq', inv_to_cfg[inventory_hostname]) | list | first).node_id }}"
+      vars:
+        inv_to_cfg:
+          b1: b1
+          b2: b2
+          b3: b3
+          node1: n1
+          node2: n2
+          node3: n3
+          node4: n4
+          node5: n5
+          node6: n6
+          node7: n7
+          node8: n8
+          node9: n9
+          node10: n10
+          node11: n11
+          node12: n12
+          node13: n13
+          node14: n14
+          node15: n15
+
+    - name: Compose peer-list on controller
+      delegate_to: localhost
+      become: false
+      run_once: true
+      ansible.builtin.copy:
+        dest: /tmp/testnet-configs/peer-list.txt
+        content: |
+          # peer_node_id_hex  peer_app_id_hex  peer_endpoint_id  peer_name
+          {% for h in ansible_play_hosts %}
+          {{ hostvars[h].veil_node_id }} {{ hostvars[h].chat_app_id }} 200 {{ h }}
+          {% endfor %}
+        mode: "0644"
+
+    - name: Push peer-list to host
+      ansible.builtin.copy:
+        src: /tmp/testnet-configs/peer-list.txt
+        dest: /var/lib/veil/chat-peers.txt
+        owner: veil
+        group: veil
+        mode: "0644"
+
+    # ── Phase 3: install systemd unit and start ───────────────────────────────
+    - name: Install chat-node systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/chat-node.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Veil testnet chat_node ({{ inventory_hostname }})
+          After=veil.service
+          # Phase 6.50.d cron #9: `Requires=` was previously used here,
+          # which causes chat-node to stop when veil stops but NOT
+          # to auto-restart when veil comes back.  After an emergency
+          # veil restart (e.g. RSS-watchdog action) the chat-node stayed
+          # silently inactive until manual intervention, masking what would
+          # otherwise be testnet-load data.  `PartOf=` cascades restarts
+          # in both directions — chat-node follows veil's lifecycle.
+          PartOf=veil.service
+          Requires=veil.service
+
+          [Service]
+          Type=simple
+          User=veil
+          Group=veil
+          Environment=VEIL_LOCAL_NODE_ID={{ veil_node_id }}
+          # Per-node generated-traffic cap (kbit/s). 0/unset → stress cadence.
+          Environment=CHAT_TARGET_KBITS={{ chat_target_kbits }}
+          # Wait 5 s after the veil daemon comes up before connecting.
+          # Without this, chat_node occasionally wedges on first send when
+          # the daemon's IPC socket is bound but its routing layer is still
+          # initialising — symptom: chat_node uses 0 CPU forever, watchdog
+          # never fires (no timer registered because main task is parked
+          # on a non-time-bound await).  Reproduces ~1/8 nodes after a
+          # `systemctl restart veil` cascade.
+          ExecStartPre=/bin/sleep 5
+          ExecStart=/usr/local/bin/chat_node /var/lib/veil/app.sock {{ inventory_hostname }} /var/lib/veil/chat-peers.txt
+          # Restart on ANY exit (including code=0 after Broken pipe).
+          # chat_node deliberately exits on Broken pipe so systemd
+          # reconnects us with a fresh IPC; on-failure misses code=0.
+          Restart=always
+          RestartSec=3
+          StandardOutput=append:/var/log/veil/chat-node.log
+          StandardError=append:/var/log/veil/chat-node.log
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reload systemd
+
+    - name: Force daemon-reload
+      ansible.builtin.meta: flush_handlers
+
+    - name: Start chat-node service
+      ansible.builtin.systemd:
+        name: chat-node
+        state: started
+        enabled: true
+
+    - name: Wait 5 s and tail log
+      ansible.builtin.shell: sleep 5; tail -20 /var/log/veil/chat-node.log
+      register: log_tail
+      changed_when: false
+
+    - name: Print chat-node log tail
+      ansible.builtin.debug:
+        var: log_tail.stdout_lines
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

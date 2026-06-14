@@ -1,0 +1,114 @@
+[package]
+name = "veil-node-runtime"
+version = "0.2.0"
+edition = "2024"
+description = "OVL1 node runtime — orchestration layer wiring dispatcher + session + DHT + identity + admin into a running daemon. Phase 4 of veilcore extraction."
+license = "AGPL-3.0-or-later"
+
+[features]
+# Forward upstream feature flags so cargo's `unexpected_cfgs` lint sees them
+# as declared in this crate (Phase 4 extraction moved the `cfg!(feature)` /
+# `#[cfg(feature)]` call sites here but the features stayed at the source
+# crates).  Each entry cascades through to the source declaration so enabling
+# `--features production-seeds` on veil-node-runtime activates the same
+# behaviour as enabling it on veil-bootstrap directly.
+production-seeds = ["veil-bootstrap/production-seeds"]
+allow-empty-seeds = ["veil-bootstrap/allow-empty-seeds"]
+rocksdb-cold = ["veil-dht/rocksdb-cold"]
+test-low-difficulty = [
+    "veil-crypto/test-low-difficulty",
+    "veil-dht/test-low-difficulty",
+    "veil-proto/test-low-difficulty",
+]
+
+[dependencies]
+# Secure per-run temp dir for deferred-init (`run_foreground_deferred`):
+# atomic O_EXCL mkdir, mode 0700, random name, RAII cleanup. (Promoted from
+# dev-dependencies — also used by tests.)
+tempfile = "3"
+veil-abuse = { path = "../veil-abuse" }
+veil-adaptive = { path = "../veil-adaptive" }
+veil-anonymity = { path = "../veil-anonymity" }
+veil-anycast = { path = "../veil-anycast" }
+veil-app = { path = "../veil-app" }
+veil-bloom = { path = "../veil-bloom" }
+veil-bootstrap = { path = "../veil-bootstrap" }
+veil-bufpool = { path = "../veil-bufpool" }
+veil-cfg = { path = "../veil-cfg" }
+veil-congestion = { path = "../veil-congestion" }
+veil-crypto = { path = "../veil-crypto" }
+veil-dht = { path = "../veil-dht" }
+veil-discovery = { path = "../veil-discovery" }
+veil-dispatcher = { path = "../veil-dispatcher" }
+veil-dispatcher-state = { path = "../veil-dispatcher-state" }
+veil-e2e = { path = "../veil-e2e" }
+veil-error = { path = "../veil-error" }
+veil-gateway = { path = "../veil-gateway" }
+veil-identity = { path = "../veil-identity" }
+veil-invite = { path = "../veil-invite" }
+veil-ipc = { path = "../veil-ipc" }
+veil-local-transport = { path = "../veil-local-transport" }
+veil-mailbox = { path = "../veil-mailbox" }
+veil-memory = { path = "../veil-memory" }
+veil-mesh = { path = "../veil-mesh" }
+veil-nat = { path = "../veil-nat" }
+veil-obfs4 = { path = "../veil-obfs4" }
+veil-observability = { path = "../veil-observability" }
+veil-pending-ack = { path = "../veil-pending-ack" }
+veil-pex = { path = "../veil-pex" }
+veil-proto = { path = "../veil-proto" }
+veil-proxy = { path = "../veil-proxy" }
+veil-push = { path = "../veil-push" }
+veil-reputation = { path = "../veil-reputation" }
+veil-routing = { path = "../veil-routing" }
+veil-session = { path = "../veil-session" }
+veil-transport = { path = "../veil-transport" }
+veil-types = { path = "../veil-types" }
+veil-update = { path = "../veil-update" }
+veil-util = { path = "../veil-util" }
+
+argon2 = "0.5"
+async-trait = "0.1"
+base64 = "0.22"
+bip39 = { version = "2", default-features = false, features = ["std"] }
+blake3 = "1.5"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+futures = "0.3"
+hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }
+hkdf = "0.12"
+libc = "0.2"
+log = "0.4"
+ml-kem = { version = "0.3.0-rc.1", features = ["getrandom"] }
+pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
+pqcrypto-traits = "0.3"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+# `rand_core` 0.6 (not the high-level `rand`): all randomness here goes through
+# `rand_core::OsRng`. Pinned to 0.6 because `OsRng` is handed to the dalek-2
+# ecosystem — `x25519_dalek::StaticSecret::random_from_rng(OsRng)` and
+# `ed25519_dalek::SigningKey::generate(&mut OsRng)` — whose `RngCore`/`CryptoRng`
+# bounds are rand_core-0.6-based (curve25519-dalek 4.x). Bumping to rand_core 0.9
+# (where `OsRng` is `TryRngCore`) breaks those call sites and yields no dedup
+# (curve25519-dalek pins 0.6 regardless). Migrate when dalek moves to 0.9.
+rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = "0.13"
+rpassword = "7"
+rustls = "0.23"
+rustls-pki-types = "1.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+socket2 = "0.6"
+subtle = "2"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-socks = "0.5"
+tokio-tungstenite = "0.24"
+toml = "0.9"
+url = "2.5"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1"
+
+[lints]
+workspace = true

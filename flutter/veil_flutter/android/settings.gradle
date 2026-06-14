@@ -1,0 +1,11 @@
+// Standalone gradle settings for the veil_flutter Android plugin.
+//
+// When the plugin is picked up by Flutter Tools as part of building
+// a consumer app, Flutter wires the plugin's `build.gradle` into the
+// app's gradle script — `settings.gradle` is consumer-side, not
+// plugin-side.  This file exists for one specific case: standalone
+// `./gradlew` invocations from inside the plugin directory (useful
+// for CI smoke tests that want to verify the plugin builds without
+// spinning up а full Flutter app).
+
+rootProject.name = 'veil_flutter'

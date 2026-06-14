@@ -1,0 +1,26 @@
+[package]
+name = "veil-anycast"
+version = "0.2.0"
+edition = "2024"
+description = "Anycast service-address resolution: stores AnycastList records in the local DHT, weighted-random candidate selection from healthy services. Phase 6 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-dht = { path = "../veil-dht" }
+veil-proto = { path = "../veil-proto" }
+veil-util = { path = "../veil-util" }
+veil-types = { path = "../veil-types" }
+# Algo-generic sign/verify for v3 (Falcon-512 / hybrid) anycast records. This is
+# the one place anycast needs the PQ crypto path; veil-crypto depends only on
+# veil-{types,error,util}, so this stays acyclic (anycast → crypto → types).
+veil-crypto = { path = "../veil-crypto" }
+base64 = "0.22"
+blake3 = "1"
+
+# Ed25519 used by `advertise_signed` to bind the record to the local node's
+# identity key. Required public API; pulled in directly here rather than
+# re-exporting from veil-proto to keep dependency layering explicit.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+[lints]
+workspace = true

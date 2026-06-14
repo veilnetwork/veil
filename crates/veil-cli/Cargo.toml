@@ -1,0 +1,109 @@
+[package]
+name = "veil-cli"
+version = "0.2.0"
+edition = "2024"
+description = "Veil network CLI — veil-cli binary + supporting cmd/ modules. Phase 5 of veilcore extraction."
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "veil-cli"
+path = "src/bin/cli.rs"
+
+[features]
+# `tls-boring` is ON by default: the BoringSSL backend powers browser-like TLS
+# ClientHello fingerprints + rotation (see docs/en/OPERATIONS.md → "TLS
+# ClientHello fingerprint rotation"), the censorship-resistance baseline. It
+# pulls a C/C++ BoringSSL build (needs `cmake` + a C toolchain).
+#
+# Pure-Rust / cross-compile builds (routers, embedded, no cmake) opt out:
+#     cargo build -p veil-cli --no-default-features --features rocksdb-cold
+# That restores the stock rustls TLS stack (single, non-morphable fingerprint).
+default = ["rocksdb-cold", "tls-boring"]
+rocksdb-cold = ["veilcore/rocksdb-cold"]
+production-seeds = ["veilcore/production-seeds"]
+allow-empty-seeds = ["veilcore/allow-empty-seeds"]
+slow-sim-tests = ["veilcore/slow-sim-tests"]
+test-low-difficulty = ["veilcore/test-low-difficulty"]
+tls-boring = ["veilcore/tls-boring"]
+tls-webpki-roots = ["veilcore/tls-webpki-roots"]
+
+[dependencies]
+veil-abuse = { path = "../veil-abuse" }
+veil-anonymity = { path = "../veil-anonymity" }
+veil-anycast = { path = "../veil-anycast" }
+veil-bootstrap = { path = "../veil-bootstrap" }
+veil-bufpool = { path = "../veil-bufpool" }
+veil-cfg = { path = "../veil-cfg" }
+veil-crypto = { path = "../veil-crypto" }
+veil-dht = { path = "../veil-dht" }
+veil-dispatcher = { path = "../veil-dispatcher" }
+veil-e2e = { path = "../veil-e2e" }
+veil-error = { path = "../veil-error" }
+veil-identity = { path = "../veil-identity" }
+veil-invite = { path = "../veil-invite" }
+veil-ipc = { path = "../veil-ipc" }
+veil-mailbox = { path = "../veil-mailbox" }
+veil-node-runtime = { path = "../veil-node-runtime" }
+veil-obfs4 = { path = "../veil-obfs4" }
+veil-observability = { path = "../veil-observability" }
+veil-proto = { path = "../veil-proto" }
+veil-session = { path = "../veil-session" }
+veil-transport = { path = "../veil-transport" }
+veil-types = { path = "../veil-types" }
+veil-update = { path = "../veil-update" }
+veil-util = { path = "../veil-util" }
+veilcore = { path = "../../veilcore" }
+
+base64 = "0.22"
+bip39 = { version = "2", default-features = false, features = ["std"] }
+blake3 = "1.5"
+clap = { version = "4.6.0", features = ["derive", "env"] }
+ctrlc = "3.4"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+futures = "0.3"
+libc = "0.2"
+log = "0.4"
+# Initialised in `cli.rs::main` so `log::*` facade events (used by
+# `try_lookup_or_discover`, dispatcher internals, and many helpers across
+# the workspace) actually reach stderr.  Without it those events were
+# silently dropped.  Audit batch 2026-05-23.
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+qrcode = { version = "0.14", default-features = false }
+rand = "0.8"
+rand_core = "0.6"
+rpassword = "7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["full"] }
+tokio-rustls = "0.26"
+toml = "0.9"
+zeroize = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
+
+# Windows Service mode — `veil-cli service install/uninstall/run`
+# registers the node with the Service Control Manager so it survives reboots
+# and logs to the Windows Event Log.  Non-Windows builds skip this dep entirely.
+# Moved here when veil-cli was extracted into its own crate but the dep
+# stayed behind in veilcore/Cargo.toml, breaking cross-compile to
+# x86_64-pc-windows-gnu (Linux→Windows CI gate).
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"
+# Re-list veil-proto with `test-low-difficulty` so `cargo test -p veil-cli`
+# mines NameClaim PoW (`required_difficulty`, defined in veil-proto) at the
+# lowered test difficulty. Without this, veil-proto is built as a plain
+# dependency (production difficulty: 24-28 bits for short alpha names), making
+# the `claim_name` tests slow and — paired with the mining budget — flaky.
+# Feature unification applies this only to the test/dev build, not the lib.
+# Mirrors the veilcore dev-dependency pattern.
+veil-proto = { path = "../veil-proto", features = ["test-low-difficulty"] }
+
+[lints]
+workspace = true

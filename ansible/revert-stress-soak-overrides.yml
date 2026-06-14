@@ -1,0 +1,73 @@
+---
+# Revert the 24h-stress-soak rekey-threshold overrides in node.toml.
+#
+# Sometime around 2026-05-09 the `[session]` block was edited on 8
+# testnet hosts with lowered rekey thresholds (compresses weeks of
+# rekey pressure into hours). The comment in the config promised a
+# REVERT before 2026-05-10 09:30 UTC — but the date has passed and the
+# overrides are still in place, exposing the cluster to unnecessarily
+# frequent rekeys and a misleading view of rekey-storm behaviour under
+# normal traffic.
+#
+# Production defaults:
+#   rekey_bytes_threshold     = 137_438_953_472  (128 GiB)
+#   rekey_time_threshold_secs = 2_764_800        (32 days)
+#
+# This playbook strips the stress-soak `[session]` block, leaving
+# defaults applied by veil-cli at config parse time.
+#
+# Run:
+#   ansible-playbook -i inventory.yml revert-stress-soak-overrides.yml
+
+- name: Revert stress-soak [session] overrides
+  hosts: all
+  become: true
+  serial: 1  # stagger restart so cluster keeps a quorum
+  tasks:
+    - name: Check if [session] block present
+      ansible.builtin.shell:
+        cmd: grep -c '^\[session\]$' /var/lib/veil/node.toml || true
+      register: session_present
+      changed_when: false
+
+    - name: Strip the stress-soak [session] block from node.toml (awk-based)
+      # `replace` module regex couldn't span multi-line comment block
+      # between `[session]` and the first key.  awk approach matches TASKS.md
+      # recipe: skip everything from `[session]` line to the next blank line
+      # (inclusive). Idempotent — if no [session] block present, no-op.
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eo pipefail
+          awk 'BEGIN{skip=0} /^\[session\]$/{skip=1; next} skip==1 && /^$/{skip=2; next} skip!=1 {print}' \
+            /var/lib/veil/node.toml > /var/lib/veil/node.toml.revert.tmp
+          # Sanity-check size — refuse to clobber if awk produced empty.
+          [ -s /var/lib/veil/node.toml.revert.tmp ] || { echo "awk produced empty output, refusing"; exit 1; }
+          mv /var/lib/veil/node.toml.revert.tmp /var/lib/veil/node.toml
+          chown veil:veil /var/lib/veil/node.toml
+          chmod 0600 /var/lib/veil/node.toml
+      when: session_present.stdout | int > 0
+      register: cfg_changed
+
+    - name: Restart veil if config changed (cascades to ogate via PartOf)
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
+      when: cfg_changed.changed | default(false)
+
+    - name: Wait 5 s for veil + ogate to come up
+      ansible.builtin.pause:
+        seconds: 5
+      when: cfg_changed.changed | default(false)
+
+    - name: Verify both services active
+      ansible.builtin.shell:
+        cmd: |
+          systemctl is-active veil
+          systemctl is-active ogate
+      register: status
+      changed_when: false
+
+    - name: Status
+      ansible.builtin.debug:
+        var: status.stdout_lines

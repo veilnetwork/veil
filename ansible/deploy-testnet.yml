@@ -1,0 +1,177 @@
+---
+# Phase 6.32 testnet — direct binary + systemd deploy.
+#
+# Skips the docker path because the build host's legacy docker builder
+# stalls inside cargo's release compile.  All 8 hosts run Ubuntu 24.04
+# with glibc 2.39 (matching the binary's max GLIBC_2.39 symbol exactly),
+# so the prebuilt veil-cli runs natively without a runtime image.
+#
+# Each host is configured with:
+#   - dedicated `veil` user + /var/lib/veil state dir + /var/log/veil
+#   - veil-cli binary in /usr/local/bin
+#   - per-host config at /var/lib/veil/node.toml (locally-pre-generated
+#     identity + listener + persist paths + bootstrap_peers)
+#   - systemd unit `veil.service`
+#   - firewall opens 5555/tcp (peer) + 19999/tcp (metrics scrape)
+#
+# Identities and configs are pre-built on the controller (see
+# /tmp/testnet-configs/) so PoW mining doesn't burn cycles on the 1-vCPU
+# VPS during deploy.
+#
+# Run with:
+#   ansible-playbook -i inventory.yml deploy-testnet.yml
+#
+# `tasks_dir` references the controller-local config bundle for the
+# host (mapped via `host_to_cfg`) — no shared state across hosts.
+
+- name: Deploy veil testnet
+  hosts: all
+  become: true
+  vars:
+    veil_bin_src: "{{ playbook_dir }}/../target/release/veil-cli"
+    config_root: "/tmp/testnet-configs"
+    host_to_cfg:
+      b1: b1
+      b2: b2
+      b3: b3
+      node1: n1
+      node2: n2
+      node3: n3
+      node4: n4
+      node5: n5
+
+  tasks:
+    - name: Verify per-host config exists on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ config_root }}/{{ host_to_cfg[inventory_hostname] }}/node-deploy.toml"
+      register: cfg_stat
+      run_once: false
+
+    - name: Fail if config missing
+      ansible.builtin.fail:
+        msg: "Missing config: {{ config_root }}/{{ host_to_cfg[inventory_hostname] }}/node-deploy.toml — run /tmp/build-testnet-configs.py first"
+      when: not cfg_stat.stat.exists
+
+    - name: Verify veil-cli binary exists on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ veil_bin_src }}"
+      register: bin_stat
+      run_once: true
+
+    - name: Fail if binary missing
+      ansible.builtin.fail:
+        msg: "Missing binary: {{ veil_bin_src }} — build first"
+      when: not bin_stat.stat.exists
+
+    - name: Create veil group
+      ansible.builtin.group:
+        name: veil
+        system: true
+
+    - name: Create veil user
+      ansible.builtin.user:
+        name: veil
+        group: veil
+        system: true
+        home: /var/lib/veil
+        create_home: true
+        shell: /usr/sbin/nologin
+
+    - name: Create state + log dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: veil
+        group: veil
+        mode: "0750"
+      loop:
+        - /var/lib/veil
+        - /var/log/veil
+
+    - name: Stop veil service if running (so binary can be replaced)
+      ansible.builtin.systemd:
+        name: veil
+        state: stopped
+      failed_when: false
+
+    - name: Copy veil-cli binary
+      ansible.builtin.copy:
+        src: "{{ veil_bin_src }}"
+        dest: /usr/local/bin/veil-cli
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy per-host config
+      ansible.builtin.copy:
+        src: "{{ config_root }}/{{ host_to_cfg[inventory_hostname] }}/node-deploy.toml"
+        dest: /var/lib/veil/node.toml
+        owner: veil
+        group: veil
+        mode: "0600"
+
+    - name: Install systemd unit
+      ansible.builtin.template:
+        src: templates/veil.service.j2
+        dest: /etc/systemd/system/veil.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd
+
+    - name: Open firewall ports (ufw)
+      ansible.builtin.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "5555"
+        - "19999"
+      failed_when: false
+
+    - name: Validate config before start
+      ansible.builtin.command:
+        cmd: /usr/local/bin/veil-cli --config /var/lib/veil/node.toml config validate
+      register: validate
+      changed_when: false
+
+    - name: Show validate output
+      ansible.builtin.debug:
+        var: validate.stdout_lines
+
+    - name: Force handlers (systemctl daemon-reload) before enable
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable + start veil service
+      ansible.builtin.systemd:
+        name: veil
+        state: started
+        enabled: true
+
+    - name: Wait for admin socket
+      ansible.builtin.wait_for:
+        path: /var/lib/veil/admin.sock
+        timeout: 60
+
+    - name: Run node show
+      become_user: veil
+      ansible.builtin.command:
+        cmd: /usr/local/bin/veil-cli --config /var/lib/veil/node.toml node show
+      register: node_show
+      changed_when: false
+      retries: 6
+      delay: 10
+      until: node_show.rc == 0
+
+    - name: Print node status
+      ansible.builtin.debug:
+        var: node_show.stdout_lines
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
