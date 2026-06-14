@@ -987,10 +987,8 @@ impl SimNetworkBuilder {
                 // Plain-Unix IPC server at a short /tmp path (well under the
                 // macOS 104-byte sun_path limit — the deep per-node veil_dir
                 // could blow it). Unique per (process, node index).
-                let sock = std::path::PathBuf::from("/tmp").join(format!(
-                    "veil-sim-ipc-{}-{i}.sock",
-                    std::process::id(),
-                ));
+                let sock = std::path::PathBuf::from("/tmp")
+                    .join(format!("veil-sim-ipc-{}-{i}.sock", std::process::id(),));
                 config.ipc = crate::cfg::IpcConfig {
                     enabled: true,
                     socket_uri: Some(format!("unix://{}", sock.display())),

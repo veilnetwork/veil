@@ -5439,7 +5439,8 @@ mod tests {
         let r = rt.block_on(async {
             let path = CString::new("/tmp/veil-h6.sock").unwrap();
             let mut err: *mut c_char = ptr::null_mut();
-            let h = unsafe { veil_connect(path.as_bytes().as_ptr(), path.as_bytes().len(), &mut err) };
+            let h =
+                unsafe { veil_connect(path.as_bytes().as_ptr(), path.as_bytes().len(), &mut err) };
             let err_string = if err.is_null() {
                 String::new()
             } else {

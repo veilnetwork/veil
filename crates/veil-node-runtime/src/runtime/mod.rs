@@ -5592,12 +5592,10 @@ mod listen_visibility_tests {
         use base64::Engine as _;
         let vk = [0x11u8; 32];
         let vk_b64 = base64::engine::general_purpose::STANDARD.encode(vk);
-        let node_id = *veil_cfg::NodeId::from_public_key(
-            veil_cfg::SignatureAlgorithm::Ed25519,
-            &vk_b64,
-        )
-        .expect("valid ed25519 pubkey")
-        .as_bytes();
+        let node_id =
+            *veil_cfg::NodeId::from_public_key(veil_cfg::SignatureAlgorithm::Ed25519, &vk_b64)
+                .expect("valid ed25519 pubkey")
+                .as_bytes();
         (vk_b64, node_id)
     }
 
@@ -5614,7 +5612,9 @@ mod listen_visibility_tests {
         )
         .expect("ed25519 obfs4 listener with no psk must derive");
         // Must equal the key a client derives from the invite's vk/node_id.
-        let vk = base64::engine::general_purpose::STANDARD.decode(&vk_b64).unwrap();
+        let vk = base64::engine::general_purpose::STANDARD
+            .decode(&vk_b64)
+            .unwrap();
         let expect = veil_obfs4::NodeIdMacKey::derive_from_identity(&vk, &node_id).0;
         assert_eq!(got, expect, "server and invite must derive the same key");
     }
