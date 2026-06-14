@@ -76,7 +76,10 @@ mod tests {
         }
 
         async fn hello(s: &mut UnixStream) {
-            let h = AppIpcHelloPayload { version: 1, flags: 0 };
+            let h = AppIpcHelloPayload {
+                version: 1,
+                flags: 0,
+            };
             send_frame(s, LocalAppMsg::AppHello as u16, &h.encode()).await;
             let _ = recv_until(s, LocalAppMsg::AppHelloOk as u16).await;
         }
@@ -110,10 +113,9 @@ mod tests {
                 name: b"acceptor".to_vec(),
             };
             send_frame(&mut b, LocalAppMsg::AppBind as u16, &bind.encode()).await;
-            let bind_ok = AppBindOkPayload::decode(
-                &recv_until(&mut b, LocalAppMsg::AppBindOk as u16).await,
-            )
-            .unwrap();
+            let bind_ok =
+                AppBindOkPayload::decode(&recv_until(&mut b, LocalAppMsg::AppBindOk as u16).await)
+                    .unwrap();
             let app_id = bind_ok.app_id;
 
             // ── A opens a stream to B's endpoint ────────────────────────────────
