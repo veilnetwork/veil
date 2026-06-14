@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.2.0 — 2026-06-14
+
+Minor release. Bundles everything on `main` since v0.1.1 (≈330 commits) plus the
+2026-06-14 audit-remediation batch below. **Breaking** vs v0.1.1 (hence the
+minor bump, pre-1.0 semver):
+
+- **FFI ABI** — all caller-supplied text inputs migrated to the explicit
+  `(ptr, len)` C ABI; the deprecated NUL-terminated phrase entry-points were
+  removed. `veilclient-ffi` is at 0.4.0. Regenerate bindings against the shipped
+  `veil_ffi.h`.
+- **Config** — the dead `gateway_failover_delay_secs` knob was removed; configs
+  that set it must drop the key (strict validation rejects unknown keys).
+- **Flutter plugin** — `connect` / `restoreIdentity` / stream `read` now run on
+  a worker isolate (ANR fix); Dart bindings moved to the explicit-length ABI.
+
+Auto-update: `min_compatible_version = 0.1.1` (the updater swaps the binary;
+any install ≥ 0.1.1 may apply this update).
+
+### Audit-remediation batch 2026-06-14 (full-project audit + external report merge)
+
+A full-project security/quality audit cross-validated against an external
+report. Validated findings fixed brick-by-brick (clippy `-D warnings` + tests
+each commit); already-handled items and false positives recorded, design-heavy
+items deferred with a re-open trigger (see `TASKS.md`).
+
+- **lazy-miner never terminates** (F-CRYPTO-1/2) — the background nonce miner
+  ground a core indefinitely toward an unreachable difficulty cap (~40% idle
+  CPU). Added a full-2³²-nonce-space exhaustion guard + single-sourced the cap
+  default (was a hardcoded 64); testnet idle CPU dropped from ~40% to <1%.
+- **DHT dead code + foot-gun** (DHT F1/F2/F3) — deleted three unused network
+  methods (one returned an *unverified* value), an always-false replica-store
+  disjunct, and corrected iterative-filter doc-drift.
+- **introduce decode hardening** (Anon F3) — `IntroducePayload::decode` now
+  requires exact length, rejecting smuggled trailing bytes.
+- **precise rendezvous logging** (Anon F4) — a known-cookie replay/drop is no
+  longer mislabelled `cookie_unknown`; the anti-probe signal fires only on a
+  genuinely unrecognised cookie.
+- **onion path diversity** (M-1) — onion middle-hops and the non-pinned
+  rendezvous relay are now drawn at random (was deterministic, concentrating
+  traffic and making paths predictable); operator-pinned relays stay ordered.
+- **reload-zombie guard** (M-2) — config reload now dry-runs each listener's
+  transport URI + context *before* tearing tasks down, closing an
+  online-but-dead state on a malformed listen config.
+- **interrupt-flag race** (F-CRYPTO-3) — the Ctrl-C PoW-interrupt flag and its
+  handler are now installed atomically (single `get_or_init`), so a concurrent
+  first-call can't decouple them.
+- **obfs4 handshake over-read** (obfs4 F2) — documented the no-pipeline
+  invariant + debug-assert it; the truncate path can no longer silently drop
+  bytes if framing ever changes.
+- **misc** — FFI test CString leak reclaimed; ticket fast-path
+  `verified_membership_cert` comment corrected (IPC-status completeness, not a
+  security gap).
+
 ## Audit batch 2026-06-02 (workspace security + code-quality)
 
 Full-workspace audit of `veil-*` + `veilcore` + `veilclient`,

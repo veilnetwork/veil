@@ -1,6 +1,6 @@
 [package]
 name = "veil-abuse"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Veil network abuse-mitigation primitives: per-peer rate limiter, ban list, violation tracker, replay window, PoW verifier, bandwidth gate, identity quota, DHT quota, backpressure. Phase 6 extraction from veilcore."
 license = "AGPL-3.0-or-later"

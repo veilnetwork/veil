@@ -1,6 +1,6 @@
 [package]
 name = "veil-proxy"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Veil SOCKS5 ingress + exit proxy + veil-stream connector (Epic 33). Phase 6 extraction from veilcore."
 license = "AGPL-3.0-or-later"

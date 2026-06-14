@@ -1,6 +1,6 @@
 [package]
 name = "veil-observability"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Veil observability: NodeLogger (structured stderr/file/JSON), NodeMetrics (atomic counters + histograms + gauges), MetricsSnapshot for Prometheus scrape. Phase 6 extraction from veilcore."
 license = "AGPL-3.0-or-later"

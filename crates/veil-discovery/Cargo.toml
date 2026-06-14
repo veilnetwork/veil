@@ -1,6 +1,6 @@
 [package]
 name = "veil-discovery"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Veil DiscoveryService: signed attachment announcements, app-endpoint registry forwarder, static directory.  Bridges sovereign-identity / app-endpoint payloads into the DHT layer.  Phase 6 extraction from veilcore."
 license = "AGPL-3.0-or-later"

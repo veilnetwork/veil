@@ -1,6 +1,6 @@
 [package]
 name = "veil-error"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Shared error type for the Veil network — ConfigError enum (legacy name; covers config + crypto + identity + ad-hoc command failures) plus the canonical Result alias.  Tier 0 leaf crate: every upper layer that returns errors depends on this one type."
 license = "AGPL-3.0-or-later"
