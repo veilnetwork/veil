@@ -153,9 +153,14 @@ mod tests {
         let mut err: *mut c_char = std::ptr::null_mut();
         let path = b"/nonexistent/definitely/no/such/config.toml";
         let handle = unsafe { veil_node_start(path.as_ptr(), path.len(), &mut err) };
-        assert!(handle.is_null(), "should not return a handle for a bad config");
+        assert!(
+            handle.is_null(),
+            "should not return a handle for a bad config"
+        );
         assert!(!err.is_null(), "should set an error string");
-        let msg = unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned();
+        let msg = unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
         assert!(msg.contains("config load failed"), "got: {msg}");
         unsafe { crate::veil_free_string(err) };
     }
