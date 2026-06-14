@@ -60,25 +60,15 @@ use crate::tun::Device;
 /// the default to stay under `MAX_FRAME_CIPHERTEXT_BYTES` (16 KiB).
 const EGRESS_FLUSH_BYTES_DEFAULT: usize = 14_000;
 
-/// Hard ceiling for a single solo-shipped packet's payload over obfs4.
-///
-/// Derived from `MAX_FRAME_CIPHERTEXT_BYTES = 16384` minus the worst-case
-/// obfs4 padding (1024), obfs4 hdr+tag (17), session AEAD tag (16),
-/// `FrameHeader` (24) and `AppSendPayload` header (72) — the same arithmetic
-/// as [`EGRESS_FLUSH_BYTES_DEFAULT`]'s rationale. A solo packet ABOVE this
-/// would make `wrap_frame` return `OversizedFrame`, exit the writer task and
-/// tear down the whole session; we drop just that packet instead. Operators
-/// should keep the tunnel MTU at or below this. (audit cycle-8 H10.)
-/// `pub(crate)` so `config::validate` can reject an MTU above the ceiling
-/// (diff-audit H6 — the old default 16000 sat ABOVE this, silently dropping
-/// every full-size packet).
-pub(crate) const MAX_OBFS4_SOLO_PAYLOAD_BYTES: usize = 15_231;
-
-// Compile-time invariant: the solo ceiling must stay strictly below the obfs4
-// frame ciphertext cap (`veil_obfs4::MAX_FRAME_CIPHERTEXT_BYTES = 16 * 1024`),
-// otherwise a solo packet at the ceiling could still trip OversizedFrame and
-// tear down the session the H10 guard exists to protect.
-const _: () = assert!(MAX_OBFS4_SOLO_PAYLOAD_BYTES < 16 * 1024);
+// Hard ceiling for a single solo-shipped packet's payload over obfs4
+// (`MAX_OBFS4_SOLO_PAYLOAD_BYTES`, defined at crate root so `config::validate`
+// reaches it on all platforms — a unix-only home broke the Windows release
+// build). Derived from `MAX_FRAME_CIPHERTEXT_BYTES = 16384` minus the worst-case
+// obfs4 padding (1024), obfs4 hdr+tag (17), session AEAD tag (16), `FrameHeader`
+// (24) and `AppSendPayload` header (72) — same arithmetic as
+// `EGRESS_FLUSH_BYTES_DEFAULT`'s rationale. Above it, `wrap_frame` would return
+// `OversizedFrame` and tear down the session, so we drop just that packet.
+use crate::MAX_OBFS4_SOLO_PAYLOAD_BYTES;
 
 fn egress_flush_bytes() -> usize {
     std::env::var("OGATE_BATCH_BYTES")
