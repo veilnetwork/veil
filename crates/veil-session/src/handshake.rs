@@ -616,10 +616,19 @@ where
                         // the original full handshake.
                         validated_sovereign_identity: None,
                         // Ticket resumption inherits the original session's
-                        // cert verification — we trust the ticket-binding
-                        // step, not re-verify cert here.  The cache entry
-                        // from the original handshake stays valid through the
-                        // session's lifetime.
+                        // cert verification — we trust the ticket-binding step
+                        // and do NOT re-verify the cert here. Session F1: this
+                        // is a security no-op (the resumed session is fully
+                        // authenticated by the ticket), but it IS an IPC-status
+                        // completeness gap — the cert is not re-surfaced into
+                        // `verified_peer_certs`, which is eviction-capped, so a
+                        // peer whose cert was evicted between its full handshake
+                        // and a later resumption can read as cert-less on the
+                        // ogate/oproxy status surface until its next FULL
+                        // handshake. Status-only; not threaded through the
+                        // ticket because the cert isn't carried in the encrypted
+                        // ticket blob (would need issuance-side plumbing on both
+                        // peers for a cosmetic surface).
                         verified_membership_cert: None,
                         // S3: ticket resumption skips ATTACH exchange,
                         // so no observed-addr is learned here. Apps
@@ -736,7 +745,9 @@ where
                     // See sibling fast-path comment — resumption bypasses
                     // sovereign proof exchange.
                     validated_sovereign_identity: None,
-                    // Ticket resumption inherits the original session's cert.
+                    // Ticket resumption inherits the original session's cert —
+                    // see sibling fast-path comment (Session F1): security no-op,
+                    // IPC-status completeness gap only.
                     verified_membership_cert: None,
                     // S3: see ticket-resumption sibling — no observed-addr
                     // learned on fast-path.

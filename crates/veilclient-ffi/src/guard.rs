@@ -283,12 +283,17 @@ mod tests {
     /// and clears any pre-existing err_out.
     #[test]
     fn prelude_succeeds_outside_tokio() {
-        let mut err: *mut c_char = std::ffi::CString::new("stale").unwrap().into_raw();
+        let stale = std::ffi::CString::new("stale").unwrap().into_raw();
+        let mut err: *mut c_char = stale;
         let err_ptr: *mut *mut c_char = &mut err;
         let outcome = unsafe { ffi_prelude(err_ptr, "test_op") };
         assert!(outcome.is_ok());
         // err_out should be cleared.
         assert!(unsafe { *err_ptr }.is_null());
+        // `clear_err` only NULLs the slot (the FFI caller owns the prior
+        // string), so reclaim the stale allocation here to keep the test
+        // leak-free under Miri / leak sanitizers.
+        unsafe { drop(std::ffi::CString::from_raw(stale)) };
     }
 
     /// `check_not_null` on a valid pointer succeeds; on NULL it
