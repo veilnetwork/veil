@@ -1,0 +1,220 @@
+---
+# Deploy `ogate` (veil TUN bridge) to all 8 testnet hosts.
+#
+# Each host runs ONE ogate binary that:
+#   * binds an IPC endpoint (namespace="ogate.<network>", name="ogate")
+#   * opens a TUN device with its assigned 192.168.0.0/16 address
+#   * forwards IP packets between TUN and veil peers
+#
+# Authorized mode: only the 8 testnet node_ids form the virtual LAN
+# (any other veil peer trying to inject will be drop'd at app layer).
+#
+# Run:
+#   ansible-playbook -i inventory.yml deploy-ogate.yml
+#
+# Reload peers without restart (after editing /etc/ogate/ogate.toml):
+#   ansible all -i inventory.yml -m systemd -a "name=ogate state=reloaded" --become
+#
+# Stop everywhere:
+#   ansible all -i inventory.yml -m systemd -a "name=ogate state=stopped enabled=no" --become
+
+# ── Phase A: gather per-host facts (no serial, so the template can
+#    cross-reference hostvars[h].veil_node_id for every other host
+#    during the serial:1 phase below).
+- name: Gather ogate facts (all hosts)
+  hosts: all
+  become: false
+  gather_facts: false
+
+  vars:
+    manifest_src: "/tmp/testnet-configs/manifest.json"
+    inv_to_cfg:
+      b1: b1
+      b2: b2
+      b3: b3
+      node1: n1
+      node2: n2
+      node3: n3
+      node4: n4
+      node5: n5
+
+  tasks:
+    - name: Assign veil_node_id per host (from manifest.json on controller)
+      ansible.builtin.set_fact:
+        veil_node_id: >-
+          {{ (lookup('file', manifest_src) | from_json
+               | items2dict(key_name='host', value_name='node_id'))
+             [inv_to_cfg[inventory_hostname]] }}
+
+    - name: Fail if host's node_id is missing from manifest
+      ansible.builtin.fail:
+        msg: "No node_id for {{ inventory_hostname }} (manifest name {{ inv_to_cfg[inventory_hostname] }}) — regenerate /tmp/testnet-configs/manifest.json"
+      when: veil_node_id is not defined or veil_node_id | length != 64
+
+# ── Phase B: rolling install + start (serial:1).
+- name: Deploy ogate testnet
+  hosts: all
+  become: true
+  any_errors_fatal: true
+  # Rolling deploy: take one host at a time, so a regression in the
+  # systemd unit / config does not kill all 8 simultaneously.  If host
+  # N fails to come up, the play stops and the remaining hosts keep
+  # serving their original state.
+  serial: 1
+
+  vars:
+    ogate_bin_src: "{{ playbook_dir }}/../target/release/ogate"
+    manifest_src: "/tmp/testnet-configs/manifest.json"
+
+    # ── ogate config knobs ────────────────────────────────────────────────────
+    ogate_network: "testnet"
+    ogate_app: "ogate"
+    ogate_mode: "authorized"
+    ogate_socket_path: "/var/lib/veil/app.sock"
+    ogate_iface_name: "ogate0"
+    # Testnet: super-jumbo MTU. Each veil session frame goes through
+    # many tokio await points (IPC → mpsc → PriorityQueue → encrypt →
+    # wire-channel → TCP), each one a scheduling round-trip. Bigger MTU
+    # Phase E24 (2026-05-22): MTU=16000 — sweet spot found via testnet
+    # MTU-sweep with padding disabled (Phase E23) + ack-skip (Phase E24).
+    # Throughput scaling almost linear with MTU up to 16K bucket boundary:
+    #   1500 → 166 Mbps  | 3000 → 296 Mbps  | 9000 → 612 Mbps
+    #   16000 → 786 Mbps single-stream / 849 Mbps -P 4
+    #   32000+ → delivery stalls (frame-size > bufpool 16 KiB bucket).
+    # ogate runs across ConfigType=tcp/obfs4 underlays, where TCP itself
+    # segments these IP packets transparently — there's no requirement
+    # to fit in 1500 B Ethernet frames.
+    ogate_mtu: 16000
+    ogate_prefix_v4: 16
+    ogate_endpoint_id: 1
+
+    # ── inventory-name → manifest-name (same as deploy-chat.yml) ──────────────
+    inv_to_cfg:
+      b1: b1
+      b2: b2
+      b3: b3
+      node1: n1
+      node2: n2
+      node3: n3
+      node4: n4
+      node5: n5
+
+    # ── inventory-name → 192.168.0.0/16 virtual address ───────────────────────
+    host_to_ogate_addr:
+      b1:    "192.168.0.1"
+      b2:    "192.168.0.2"
+      b3:    "192.168.0.3"
+      node1: "192.168.0.11"
+      node2: "192.168.0.12"
+      node3: "192.168.0.13"
+      node4: "192.168.0.14"
+      node5: "192.168.0.15"
+
+  tasks:
+    # ── Phase 0: prerequisites ────────────────────────────────────────────────
+    - name: Verify ogate binary on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ ogate_bin_src }}"
+      register: bin_stat
+      run_once: true
+
+    - name: Fail if binary missing
+      ansible.builtin.fail:
+        msg: >-
+          Build first:
+          cargo build --release -p ogate --features allow-empty-seeds
+      when: not bin_stat.stat.exists
+
+    # ── Phase 1: install binary ──────────────────────────────────────────────
+    - name: Ensure /usr/local/bin exists
+      ansible.builtin.file:
+        path: /usr/local/bin
+        state: directory
+        mode: "0755"
+
+    - name: Copy ogate binary
+      ansible.builtin.copy:
+        src: "{{ ogate_bin_src }}"
+        dest: /usr/local/bin/ogate
+        owner: root
+        group: root
+        mode: "0755"
+      register: binary_copy
+
+    # ── Phase 2: install config ──────────────────────────────────────────────
+    - name: Ensure /etc/ogate exists
+      ansible.builtin.file:
+        path: /etc/ogate
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Render ogate.toml
+      ansible.builtin.template:
+        src: templates/ogate.toml.j2
+        dest: /etc/ogate/ogate.toml
+        owner: root
+        group: root
+        mode: "0644"
+      register: config_render
+
+    # ── Phase 3: install systemd unit ────────────────────────────────────────
+    - name: Install ogate.service
+      ansible.builtin.template:
+        src: templates/ogate.service.j2
+        dest: /etc/systemd/system/ogate.service
+        owner: root
+        group: root
+        mode: "0644"
+      register: unit_installed
+
+    - name: Reload systemd if unit changed
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: unit_installed.changed
+
+    # ── Phase 4: start service ───────────────────────────────────────────────
+    - name: Enable + start ogate
+      ansible.builtin.systemd:
+        name: ogate
+        state: started
+        enabled: true
+
+    # Config changes that touch MTU / iface_name / local_addr are NOT
+    # hot-reloadable (see ogate's validate_reload). To keep this playbook
+    # safe without diffing TOML fields, just restart whenever the config
+    # changed at all — hot-reload still works for ad-hoc peer-table edits
+    # outside this playbook (kill -HUP $(pidof ogate)).
+    - name: Restart ogate if binary, unit, or config changed
+      ansible.builtin.systemd:
+        name: ogate
+        state: restarted
+      when: binary_copy.changed or unit_installed.changed or config_render.changed
+
+    # ── Phase 5: smoke check ─────────────────────────────────────────────────
+    - name: Wait 3 s for TUN device + IPC bind
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Check ogate interface exists with expected address
+      ansible.builtin.shell:
+        cmd: ip -4 -o addr show dev {{ ogate_iface_name }} | awk '{print $4}'
+      register: iface_addr
+      changed_when: false
+      failed_when: iface_addr.stdout != host_to_ogate_addr[inventory_hostname] + '/' + (ogate_prefix_v4 | string)
+
+    - name: Print ogate status
+      ansible.builtin.shell:
+        cmd: |
+          systemctl is-active ogate
+          ip -4 -o addr show dev {{ ogate_iface_name }}
+          tail -10 /var/log/veil/ogate.log 2>/dev/null || true
+      register: status_out
+      changed_when: false
+
+    - name: Status
+      ansible.builtin.debug:
+        var: status_out.stdout_lines

@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Apple privacy manifest для veil_flutter plugin (Epic 489.9).
+
+  Audit: this plugin implements end-to-end encrypted veil messaging.
+  It does NOT track users, NOT collect telemetry, NOT use ad SDKs.
+  Required-Reason API declarations are honest about which Apple APIs
+  the underlying veil daemon (linked statically) calls и why.
+
+  Apple compliance reference: WWDC23 "Get started with privacy
+  manifests"; NSPrivacyAccessedAPICategory* values must come from the
+  documented enumeration.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ========================================================
+         Tracking — veil does NOT track users в the IDFA / cross-
+         site sense.  Veil routes traffic; routing alone is not
+         tracking under Apple's definition.
+         ======================================================== -->
+    <key>NSPrivacyTracking</key>
+    <false/>
+
+    <!-- Empty list because we do not contact tracking domains. -->
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+
+    <!-- ========================================================
+         Collected Data Types
+         Veil does not COLLECT data from the device.  Messages
+         are user-originated content sent peer-to-peer (E2E
+         encrypted); we never see plaintext server-side and have no
+         server-side at all (relays cannot decrypt).  Per Apple's
+         clarification, encrypted user content transit is not "data
+         collection" for the purposes of this manifest.
+         ======================================================== -->
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array/>
+
+    <!-- ========================================================
+         Required Reason API declarations (Apple "Required Reason
+         API" rules — applies to specific Foundation / system APIs).
+
+         Each entry MUST justify its NSPrivacyAccessedAPIType use
+         с а sanctioned `NSPrivacyAccessedAPITypeReasons` value.
+         The list below covers every API surface used by veil's
+         underlying static library (veilclient-ffi → veilcore
+         → tokio + std).
+         ======================================================== -->
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array>
+        <!-- File timestamps: tokio's fs ops, cache file mtime checks
+             (e.g. discovered-peer cache write-on-tick).  Never used
+             к infer fingerprinting signals; only for cache hygiene
+             и log rotation. -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <!-- C617.1: "Inspect the user's own files" — own cache. -->
+                <string>C617.1</string>
+            </array>
+        </dict>
+
+        <!-- UserDefaults: kept ONLY for the one-shot legacy-token
+             migration path (audit batch 2026-05-23 promoted the APNs
+             token к Keychain).  After а device upgrades past the
+             migration, this access is не performed again.  Keychain
+             itself is не на the Required-Reason API list, so no
+             additional declaration is needed для the new storage path. -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <!-- CA92.1: "Access user defaults to read or write
+                     information that is only accessible to the app
+                     itself."  Used for one-shot legacy-token migration
+                     to Keychain. -->
+                <string>CA92.1</string>
+            </array>
+        </dict>
+
+        <!-- System boot time: veil's adaptive keepalive scheduler
+             reads this к bound idle / keepalive intervals across
+             system suspend (Epic 220).  Not used к build а device
+             fingerprint; the value never leaves the local process. -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <!-- 35F9.1: "Measure time elapsed between events
+                     within the app" — keepalive cadence. -->
+                <string>35F9.1</string>
+            </array>
+        </dict>
+
+        <!-- Disk space: pre-allocate sanity check before writing
+             the encrypted master_seed file (Epic 462) и the DHT
+             values cache.  Never reported to а server. -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <!-- E174.1: "Determine whether sufficient disk space
+                     is available before writing files." -->
+                <string>E174.1</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

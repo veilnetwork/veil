@@ -1,0 +1,30 @@
+[Unit]
+Description=oproxy server — veil-network SOCKS/HTTP exit ({{ inventory_hostname }})
+After=veil.service
+Requires=veil.service
+# Stop the proxy если the daemon stops — без the IPC socket the
+# proxy can't accept any new streams anyway.
+PartOf=veil.service
+
+[Service]
+Type=simple
+User=veil
+Group=veil
+ExecStart=/usr/local/bin/oproxy-server --config /etc/oproxy/server.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=append:/var/log/veil/oproxy-server.log
+StandardError=append:/var/log/veil/oproxy-server.log
+WorkingDirectory=/var/lib/veil
+
+# Sandboxing — same posture as veil.service.
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/veil /var/log/veil
+ProtectHome=true
+NoNewPrivileges=true
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

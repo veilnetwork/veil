@@ -1,0 +1,59 @@
+# Epic 447.4: nextest profiles.
+#
+# Default profile keeps the local dev sweep fast — the 3 heaviest
+# `sim::scenarios` tests (each 55-150s) are `#[ignore]`d behind the
+# `slow-sim-tests` cargo feature.  The `ci` profile enables that feature
+# (so the slow tests *are* compiled into the binary) and tells nextest to
+# run them via `--run-ignored=all`.
+#
+# Local dev:   `cargo nextest run`                                  (≈40 s)
+# Full sweep:  `cargo nextest run --profile ci`                     (≈3 min)
+
+# ── Concurrency-limited group for heavy daemon-spin-up / PoW-mining tests ──
+#
+# The veil-node-runtime `admin::tests` each start a full `NodeRuntime`
+# daemon, and the veil-cfg `integration_pow` tests mine identity PoW. When
+# many of these run concurrently (default `cargo nextest run` = one thread per
+# core, ×N on a shared machine) the daemons/miners starve each other: socket
+# bring-up and request round-trips blow past their in-test timeouts and the
+# tests flake — purely from CPU contention, not logic (they pass in isolation
+# and under the CI's `--test-threads=2`).
+#
+# Capping this group at one concurrent test removes the heavy-vs-heavy
+# contention at ANY global thread count, so the tests are robust whether run
+# locally (`cargo nextest run`) or in CI (`--test-threads=2`). Lighter tests
+# still fill the remaining threads.
+[test-groups]
+serial-heavy = { max-threads = 1 }
+
+[profile.default]
+# Surface SLOW lines for tests >30 s so devs notice if a test is creeping
+# back into "needs to be moved to slow-sim-tests" territory.
+slow-timeout = { period = "30s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = "package(veil-node-runtime) & test(/^admin/)"
+test-group = "serial-heavy"
+
+[[profile.default.overrides]]
+filter = "package(veil-cfg) & test(/integration_pow/)"
+test-group = "serial-heavy"
+
+[profile.ci]
+# CI runs the full set, including the heavy sim scenarios.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# Compile + run the slow sim tests too.
+default-filter = "all()"
+
+[[profile.ci.overrides]]
+filter = "package(veil-node-runtime) & test(/^admin/)"
+test-group = "serial-heavy"
+
+[[profile.ci.overrides]]
+filter = "package(veil-cfg) & test(/integration_pow/)"
+test-group = "serial-heavy"
+
+# `cargo nextest run --profile ci` still needs the cargo feature flag passed
+# explicitly, e.g.  `cargo nextest run --profile ci --features slow-sim-tests`
+# — there is no nextest config knob to inject feature flags.  Document that
+# requirement in CI scripts.

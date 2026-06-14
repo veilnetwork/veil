@@ -1,0 +1,72 @@
+---
+# Phase 6.50.b chaos-ban deployment — installs the per-host script that
+# bans a random active session for 600 s every 600 s, exercising the
+# iterative-DHT fallback path (Slice 5) under realistic load.
+#
+# Run with:
+#   ansible-playbook -i inventory.yml deploy-chaos-ban.yml
+#
+# Stop with:
+#   ansible all -i inventory.yml -m systemd -a "name=chaos-ban.service state=stopped enabled=no" --become
+
+- name: Deploy chaos-ban cycler
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Install chaos-ban-cycler.sh
+      ansible.builtin.copy:
+        src: templates/chaos-ban-cycler.sh
+        dest: /usr/local/bin/chaos-ban-cycler.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install chaos-ban.service systemd unit
+      ansible.builtin.template:
+        src: templates/chaos-ban.service.j2
+        dest: /etc/systemd/system/chaos-ban.service
+        owner: root
+        group: root
+        mode: "0644"
+      register: unit_installed
+
+    - name: Reload systemd if unit changed
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: unit_installed.changed
+
+    - name: Start chaos-ban.service
+      ansible.builtin.systemd:
+        name: chaos-ban.service
+        state: started
+        enabled: true
+
+    - name: Wait briefly for first cycle log line
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 10); do
+            if grep -q "chaos-ban started" /var/log/veil/chaos-ban.log 2>/dev/null; then
+              echo "started after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "no start log after 10s"
+          exit 1
+      register: start_check
+      changed_when: false
+
+    - name: Show start check
+      ansible.builtin.debug:
+        var: start_check.stdout
+
+    - name: Show first ban event
+      ansible.builtin.shell:
+        cmd: grep -E "(BAN|UNBAN)" /var/log/veil/chaos-ban.log | head -5
+      register: first_ban
+      changed_when: false
+
+    - name: Show ban activity
+      ansible.builtin.debug:
+        var: first_ban.stdout_lines

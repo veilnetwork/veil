@@ -1,0 +1,26 @@
+[package]
+name = "veil-discovery"
+version = "0.2.0"
+edition = "2024"
+description = "Veil DiscoveryService: signed attachment announcements, app-endpoint registry forwarder, static directory.  Bridges sovereign-identity / app-endpoint payloads into the DHT layer.  Phase 6 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-crypto = { path = "../veil-crypto" }
+veil-dht = { path = "../veil-dht" }
+veil-error = { path = "../veil-error" }
+veil-proto = { path = "../veil-proto" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+base64 = "0.22"
+blake3 = "1.5"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+log = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[lints]
+workspace = true

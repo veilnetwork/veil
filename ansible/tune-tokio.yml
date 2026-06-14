@@ -1,0 +1,57 @@
+---
+# Pin tokio worker_threads to physical vCPU count.
+#
+# Default: tokio detects num_cpus from the host bare-metal, not the
+# cgroup-restricted view. On a 1-vCPU VPS this spawns 7 worker threads
+# that fight over one core → 84% of daemon syscall time is `futex`
+# (lock contention). Setting worker_threads = nproc eliminates the
+# over-subscription and removes the contention.
+#
+# Run:
+#   ansible-playbook -i inventory.yml tune-tokio.yml
+
+- name: Pin tokio worker_threads to nproc on veil daemon
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Detect host CPU count
+      ansible.builtin.shell:
+        cmd: nproc
+      register: nproc_out
+      changed_when: false
+
+    - name: Set worker_threads under [global] in node.toml
+      ansible.builtin.lineinfile:
+        path: /var/lib/veil/node.toml
+        regexp: '^\s*worker_threads\s*='
+        line: 'worker_threads = {{ nproc_out.stdout | trim }}'
+        insertafter: '^\s*runtime_flavor\s*='
+        owner: veil
+        group: veil
+        mode: "0644"
+      register: cfg_changed
+
+    - name: Restart veil if config changed (cascades to ogate via PartOf)
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
+      when: cfg_changed.changed
+
+    - name: Wait 5 s for daemon + ogate to come up
+      ansible.builtin.pause:
+        seconds: 5
+      when: cfg_changed.changed
+
+    - name: Verify worker thread count after restart
+      ansible.builtin.shell:
+        cmd: |
+          PID=$(pidof veil-cli)
+          THREADS=$(ps -L -p $PID --no-headers | grep tokio-rt-worker | wc -l)
+          echo "tokio_workers=$THREADS expected=$(nproc)"
+      register: verify
+      changed_when: false
+
+    - name: Verification
+      ansible.builtin.debug:
+        var: verify.stdout

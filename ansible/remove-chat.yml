@@ -1,0 +1,46 @@
+---
+# Stop + disable + remove the chat-node testnet service.
+# Inverse of deploy-chat.yml — leaves the binary on disk in case
+# someone wants to restart manually; only removes systemd + log files
+# to avoid surprise re-starts after reboot.
+#
+# Run:
+#   ansible-playbook -i inventory.yml remove-chat.yml
+
+- name: Remove chat-node testnet service
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Stop + disable chat-node service (ignore missing)
+      ansible.builtin.systemd:
+        name: chat-node
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Delete chat-node systemd unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/chat-node.service
+        state: absent
+      register: unit_removed
+
+    - name: Reload systemd if unit was removed
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: unit_removed.changed
+
+    - name: Delete chat-node peer list
+      ansible.builtin.file:
+        path: /var/lib/veil/chat-peers.txt
+        state: absent
+
+    - name: Delete chat-node log
+      ansible.builtin.file:
+        path: /var/log/veil/chat-node.log
+        state: absent
+
+    # The binary is intentionally left in /usr/local/bin/chat_node so
+    # an operator can start the service manually for debugging without
+    # a redeploy. Use `ansible all -m file -a path=/usr/local/bin/chat_node state=absent --become`
+    # to nuke it explicitly when no longer wanted.

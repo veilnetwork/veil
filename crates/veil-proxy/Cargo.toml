@@ -1,0 +1,17 @@
+[package]
+name = "veil-proxy"
+version = "0.2.0"
+edition = "2024"
+description = "Veil SOCKS5 ingress + exit proxy + veil-stream connector (Epic 33). Phase 6 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-proto = { path = "../veil-proto" }
+veil-types = { path = "../veil-types" }
+
+async-trait = "0.1"
+log = "0.4"
+tokio = { version = "1.42", features = ["sync", "time", "rt", "io-util", "macros", "net"] }
+
+[lints]
+workspace = true

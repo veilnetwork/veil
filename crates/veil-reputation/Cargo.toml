@@ -1,0 +1,13 @@
+[package]
+name = "veil-reputation"
+version = "0.2.0"
+edition = "2024"
+description = "Per-identity reputation tracker: accrues uptime + successful-relay credits per sovereign node_id, survives key rotation, shared across multi-device identities. Phase 3 prep of veilcore extraction."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-cfg = { path = "../veil-cfg" }
+veil-types = { path = "../veil-types" }
+
+[lints]
+workspace = true

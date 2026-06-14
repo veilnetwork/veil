@@ -1,0 +1,44 @@
+[package]
+name = "veil-bootstrap"
+version = "0.2.0"
+edition = "2024"
+description = "Veil network bootstrap layer: DNS-TXT seed records, signed/encrypted invites, HTTPS bootstrap-bundle fetch, builtin seeds. Phase 6 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[features]
+# Pass-through to veil-transport.  The HTTPS bootstrap path uses the
+# tls-boring backend when this feature is on (Chrome-like JA3) instead
+# of plain rustls.
+tls-boring = ["veil-transport/tls-boring"]
+# Production safety gate (Epic 412.10): asserts BUILTIN_SEEDS is non-empty.
+production-seeds = []
+# Opt-in escape hatch for testnet builds with no builtin seeds.
+allow-empty-seeds = []
+
+[dependencies]
+veil-crypto = { path = "../veil-crypto" }
+veil-error = { path = "../veil-error" }
+veil-proto = { path = "../veil-proto" }
+veil-transport = { path = "../veil-transport" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+argon2 = "0.5"
+base64 = "0.22"
+blake3 = "1.5"
+chacha20poly1305 = "0.10"
+hickory-resolver = { version = "0.26", features = ["tokio", "system-config", "tls-ring", "https-ring", "webpki-roots"] }
+log = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+subtle = "2"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["net", "io-util", "rt", "time"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

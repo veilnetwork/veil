@@ -1,0 +1,59 @@
+[package]
+name = "veilclient-ffi"
+version = "0.4.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "C-FFI surface around veilclient — driver for non-Rust hosts (Flutter, Swift, Kotlin)"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+name       = "veilclient_ffi"
+
+[features]
+# `tls-boring` ON by default — the mobile lib carries the browser-like TLS
+# ClientHello + rotation backend (censorship-resistance baseline for the
+# mobile-apps stage). The android (`cargo ndk`) and iOS (xcframework) builds
+# inherit it via default features; BoringSSL cross-compiles to both
+# (aarch64-linux-android ELF + aarch64-apple-ios Mach-O, verified). Needs
+# `cmake` + a C toolchain at build time.
+#
+# Note: today the FFI surface is an IPC client (`veil_connect` to a daemon
+# socket), so the fingerprint is presented by whatever runs the node; the
+# default keeps the backend present and proven-buildable, ready for the
+# mobile-apps stage that wires an on-device node. Opt out (pure-Rust / no
+# cmake, ~1.2 MB smaller .so) with `--no-default-features`.
+default = ["tls-boring"]
+tls-boring = ["veilclient/tls-boring"]
+# Forward `veilclient` feature toggles for downstream
+# (Flutter plugin, mobile build script) opt-in.
+allow-empty-seeds = ["veilclient/allow-empty-seeds"]
+production-seeds  = ["veilclient/production-seeds"]
+test-low-difficulty = ["veilclient/test-low-difficulty"]
+
+[dependencies]
+veilclient = { path = "../../veilclient" }
+veil-identity = { path = "../veil-identity" }
+veil-types = { path = "../veil-types" }
+# Audit L-15: wrap the in-flight password copy in `Zeroizing` so the
+# `_zeroize_with_password` restore path scrubs every copy on drop.
+zeroize = "1"
+# Push-envelope sealing primitive (Epic 489.10) — exposed as a
+# stateless FFI helper so apps can seal FCM/APNs tokens locally
+# before calling `veil_set_push_envelope`.  Pulled directly to
+# avoid a round-trip through veilclient (sealing is pure crypto;
+# no daemon RPC needed).
+veil-anonymity = { path = "../veil-anonymity" }
+# Wake-HMAC primitive (slice 4.3.3) — same rationale: pure crypto,
+# avoid a round-trip through veilclient.  Used for the FFI verify
+# entry-point and the random-key generator that receivers persist
+# platform-side.
+veil-crypto = { path = "../veil-crypto" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+veil-proto = { path = "../veil-proto" }
+
+[lints]
+workspace = true

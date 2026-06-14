@@ -1,0 +1,121 @@
+---
+# Slice 9 of the PoW-Gated Rendezvous epic — revert the stealth-canary
+# playbook.  Removes the inline-table entry with the configured
+# `stealth_listen_id` (default 0x00000005) from the top-level
+# `listen = [...]` array, then restarts veil.
+#
+# Idempotent: skips if no entry with matching id is found.
+#
+# Run:
+#   ansible-playbook -i inventory.yml revert-stealth-canary.yml \
+#     --limit node1
+
+- name: Revert stealth (PoW-Gated Rendezvous) canary
+  hosts: all
+  become: true
+  serial: 1
+  vars:
+    stealth_listen_id: "0x00000005"
+
+  tasks:
+    - name: Check if stealth listener present
+      ansible.builtin.shell:
+        cmd: |
+          grep -c 'id\s*=\s*"{{ stealth_listen_id }}"' \
+            /var/lib/veil/node.toml || true
+      register: present
+      changed_when: false
+
+    - name: Skip already-reverted hosts
+      ansible.builtin.meta: end_host
+      when: present.stdout | int == 0
+
+    - name: Strip the stealth inline entry from the listen array
+      ansible.builtin.shell:
+        cmd: |
+          python3 << 'PYEOF'
+          import re, sys
+          path = "/var/lib/veil/node.toml"
+          target_id = "{{ stealth_listen_id }}"
+          with open(path) as f:
+              src = f.read()
+          # Strip ", { id = "{target_id}" ... }" — match the leading
+          # comma + space + the full inline-table balanced through any
+          # nested braces.  Use a DOTALL pattern + balance-counter.
+          marker = re.search(
+              r',\s*\{\s*id\s*=\s*"' + re.escape(target_id) + r'"',
+              src,
+          )
+          if not marker:
+              sys.stderr.write(f"ERROR: no inline entry with id={target_id} found\n")
+              sys.exit(1)
+          start = marker.start()
+          # Find the matching closing `}` for the inline table starting
+          # at `{` (where marker captures the opening brace).
+          brace_open_idx = src.index('{', marker.start())
+          depth = 1
+          end = None
+          i = brace_open_idx + 1
+          while i < len(src):
+              c = src[i]
+              if c == '{':
+                  depth += 1
+              elif c == '}':
+                  depth -= 1
+                  if depth == 0:
+                      end = i + 1
+                      break
+              i += 1
+          if end is None:
+              sys.stderr.write("ERROR: unclosed inline table\n")
+              sys.exit(1)
+          new_src = src[:start] + src[end:]
+          with open(path, "w") as f:
+              f.write(new_src)
+          print("ok")
+          PYEOF
+        executable: /bin/bash
+
+    - name: Validate config after revert
+      ansible.builtin.shell:
+        cmd: |
+          su -s /bin/sh veil -c \
+            '/usr/local/bin/veil-cli --config /var/lib/veil/node.toml config validate'
+      register: validate_result
+      changed_when: false
+      failed_when: validate_result.rc != 0
+
+    - name: Restart veil service
+      ansible.builtin.systemd:
+        name: veil.service
+        state: restarted
+
+    - name: Wait for metrics endpoint
+      ansible.builtin.shell:
+        cmd: |
+          for i in $(seq 1 60); do
+            if curl -sS --max-time 1 http://127.0.0.1:{{ metrics_port }}/metrics > /dev/null 2>&1; then
+              echo "metrics up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "down after 60s"
+          exit 1
+      register: wait_result
+      changed_when: false
+
+    - name: Confirm no rendezvous.controller.wired event after revert
+      ansible.builtin.shell:
+        cmd: |
+          journalctl -u veil.service --since "30 seconds ago" --no-pager \
+            | grep -cE "rendezvous\.controller\.wired" || true
+      register: post_revert_wired
+      changed_when: false
+
+    - name: Show post-revert status
+      ansible.builtin.debug:
+        msg: |
+          ✅ Stealth listener reverted on {{ inventory_hostname }}.
+          rendezvous.controller.wired in the last 30 sec: {{ post_revert_wired.stdout }}
+          (Should be 0 — controller not attached because no stealth listener configured.)

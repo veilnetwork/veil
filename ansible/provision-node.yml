@@ -1,0 +1,216 @@
+---
+# Bare-metal provisioning for fresh veil leaf nodes — matches the live testnet
+# layout (user `veil`, /usr/local/bin/veil-cli, /var/lib/veil/node.toml,
+# veil.service, shared obfs4 PSK). NO chat_node, NO chaos-ban. The node's
+# [Identity] auto-generates on first boot (PoW difficulty 24, ~5-10 min on a
+# slow VPS); it is NOT templated, so re-runs never clobber it.
+#
+# The arch-matched binary must exist on the controller, e.g. for aarch64:
+#   TRIPLE=aarch64-unknown-linux-musl \
+#     FEATURES=rocksdb-cold,tls-boring,allow-empty-seeds \
+#     scripts/cross-build-linux-musl.sh
+#
+# Run (provisions only `new_nodes`; play 1 only reads from node1):
+#   ansible-playbook -i inventory.yml provision-node.yml --forks 10
+#
+# The shared obfs4 PSK is fetched in-memory from an existing node and never
+# written to the repo (it is a network secret).
+
+- name: Fetch shared obfs4 PSK from an existing node
+  hosts: node1
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Slurp obfs4 PSK
+      ansible.builtin.slurp:
+        src: /var/lib/veil/obfs4_psk.b64
+      register: shared_obfs4_psk
+
+- name: Provision fresh veil leaf nodes
+  hosts: new_nodes
+  become: true
+  vars:
+    # Arch auto-detected per host from the gathered fact; picks the matching
+    # cross-built musl binary on the controller.
+    veil_triple: "{{ 'aarch64-unknown-linux-musl' if ansible_architecture == 'aarch64' else 'x86_64-unknown-linux-musl' }}"
+    veil_bin_src: "{{ playbook_dir }}/../target/{{ veil_triple }}/release/veil-cli"
+    metrics_url: "http://127.0.0.1:19999/metrics"
+
+  tasks:
+    - name: Verify arch-matched binary exists on controller
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ veil_bin_src }}"
+      register: bin_stat
+
+    - name: Fail if binary missing
+      ansible.builtin.fail:
+        msg: "Missing {{ veil_bin_src }} — build with TRIPLE={{ veil_triple }} scripts/cross-build-linux-musl.sh"
+      when: not bin_stat.stat.exists
+
+    - name: Ensure curl is present (for the readiness probe)
+      ansible.builtin.package:
+        name: curl
+        state: present
+
+    - name: Create veil group
+      ansible.builtin.group:
+        name: veil
+        system: true
+
+    - name: Create veil system user
+      ansible.builtin.user:
+        name: veil
+        system: true
+        group: veil
+        home: /var/lib/veil
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    - name: Create state + log directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: veil
+        group: veil
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /var/lib/veil, mode: "0750" }
+        - { path: /var/log/veil, mode: "0755" }
+
+    - name: Install veil-cli binary
+      ansible.builtin.copy:
+        src: "{{ veil_bin_src }}"
+        dest: /usr/local/bin/veil-cli
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart veil
+
+    - name: Install shared obfs4 PSK
+      ansible.builtin.copy:
+        content: "{{ hostvars['node1'].shared_obfs4_psk.content | b64decode }}"
+        dest: /var/lib/veil/obfs4_psk.b64
+        owner: veil
+        group: veil
+        mode: "0600"
+
+    - name: Write node.toml (only if absent — appended [Identity] survives re-runs)
+      ansible.builtin.template:
+        src: templates/node-leaf.toml.j2
+        dest: /var/lib/veil/node.toml
+        owner: veil
+        group: veil
+        mode: "0600"
+        force: false
+
+    # node run requires a valid [Identity] (nonce with >=24 leading zero bits);
+    # it does NOT auto-generate. Gate on `config validate` so this self-heals a
+    # missing OR too-weak identity and is a no-op once a valid one exists
+    # (including lazy_mining nonce upgrades the daemon writes back). config init
+    # mines difficulty 24 single-threaded (~5 min on a 1-core VPS); all nodes
+    # mine in parallel under --forks.
+    # `config validate` PASSES when [Identity] is absent (it is optional at
+    # validate level) but FAILS on a weak/invalid one; `node run` REQUIRES it.
+    # So regenerate when identity is missing OR the config does not validate.
+    - name: Check whether an [Identity] block is present
+      ansible.builtin.command:
+        cmd: grep -qE '^\[Identity\]' /var/lib/veil/node.toml
+      register: has_identity
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether the current config validates
+      ansible.builtin.command:
+        cmd: /usr/local/bin/veil-cli --config /var/lib/veil/node.toml config validate
+      register: cfg_valid
+      changed_when: false
+      failed_when: false
+
+    - name: Decide whether a fresh identity is needed
+      ansible.builtin.set_fact:
+        need_identity: "{{ has_identity.rc != 0 or cfg_valid.rc != 0 }}"
+
+    - name: Strip any existing (weak/invalid) [Identity] block
+      ansible.builtin.shell: |
+        awk '/^\[Identity\]/{skip=1; next} skip&&/^\[/{skip=0} !skip' /var/lib/veil/node.toml > /var/lib/veil/node.toml.tmp
+        mv /var/lib/veil/node.toml.tmp /var/lib/veil/node.toml
+      when: need_identity | bool
+
+    - name: Generate a fresh identity (difficulty 24)
+      ansible.builtin.command:
+        cmd: /usr/local/bin/veil-cli config init -d 24 -f /tmp/veil-idgen.toml
+      when: need_identity | bool
+
+    - name: Append the generated [Identity] block to node.toml
+      ansible.builtin.shell: |
+        awk '/^\[Identity\]/{f=1} f&&/^\[/&&!/^\[Identity\]/{exit} f' /tmp/veil-idgen.toml >> /var/lib/veil/node.toml
+      when: need_identity | bool
+
+    - name: Remove the identity-gen scratch file
+      ansible.builtin.file:
+        path: /tmp/veil-idgen.toml
+        state: absent
+      when: need_identity | bool
+
+    - name: Re-assert node.toml ownership/perms
+      ansible.builtin.file:
+        path: /var/lib/veil/node.toml
+        owner: veil
+        group: veil
+        mode: "0600"
+
+    - name: Validate the assembled config before starting (hard gate)
+      ansible.builtin.command:
+        cmd: /usr/local/bin/veil-cli --config /var/lib/veil/node.toml config validate
+      changed_when: false
+
+    - name: Install veil.service
+      ansible.builtin.template:
+        src: templates/veil.service.j2
+        dest: /etc/systemd/system/veil.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart veil
+
+    - name: Enable + start veil
+      ansible.builtin.systemd:
+        name: veil
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Flush handlers (restart if binary/unit changed) before readiness wait
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for metrics endpoint (identity is pre-generated, so startup is fast)
+      ansible.builtin.shell: |
+        for _ in $(seq 1 60); do
+          curl -sf {{ metrics_url }} >/dev/null 2>&1 && exit 0
+          sleep 5
+        done
+        exit 1
+      changed_when: false
+
+    - name: Wait for at least one active session (mesh join, up to 5 min)
+      ansible.builtin.shell: |
+        for _ in $(seq 1 60); do
+          n=$(curl -sS {{ metrics_url }} 2>/dev/null | awk '/^veil_active_sessions /{print $2}')
+          [ "${n:-0}" -ge 1 ] && { echo "active_sessions=$n"; exit 0; }
+          sleep 5
+        done
+        echo "no sessions after 5 min"; exit 1
+      register: join
+      changed_when: false
+
+    - name: Report mesh-join status
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} ({{ ansible_host }}): {{ join.stdout }}"
+
+  handlers:
+    - name: Restart veil
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
