@@ -3917,7 +3917,16 @@ fn is_default_lazy_mining(v: &bool) -> bool {
     *v == default_lazy_mining()
 }
 fn default_max_lazy_difficulty() -> u8 {
-    64
+    // Cap the lazy miner at a difficulty it can actually REACH so it
+    // terminates. The miner upgrades the identity nonce toward this many
+    // leading-zero score bits, each bit doubling the work (~2^d `pow_score`
+    // computations). 64 was effectively "mine forever" — 2^64 is
+    // computationally unreachable, so the `current >= cap` stop condition in
+    // `lazy_miner` never fired and every node burned ~40% of a core
+    // indefinitely (perf: `pow_score_raw_into` ~94% CPU at idle). 32 is a
+    // meaningful anti-sybil target (~4.3e9 attempts) that the miner does
+    // finish, after which CPU drops to idle.
+    32
 }
 fn is_default_max_lazy_difficulty(v: &u8) -> bool {
     *v == default_max_lazy_difficulty()
