@@ -96,3 +96,9 @@ exclude = []
 
 [macro_expansion]
 bitflags = false
+
+# Guard the optional embedded-node FFI (cargo feature `node-embedded`) behind a
+# C define so consumers building the client-only dylib don't see symbols their
+# binary lacks. Hosts that link the `node-embedded` build define this.
+[defines]
+"feature = node-embedded" = "VEIL_FFI_NODE_EMBEDDED"
