@@ -1896,6 +1896,37 @@ async fn reload_with_unapplyable_config_does_not_zombie() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn reload_with_malformed_listen_transport_does_not_zombie() {
+    // M-2: the LOCAL identity, peers, and full build_state dry-run all pass,
+    // but a listen entry's transport URI is malformed — caught only by
+    // `TransportUri::parse` / `listen_transport_context`, which run at BIND time
+    // inside spawn_all_services (AFTER do_stop_tasks) in the live reload path.
+    // Without the per-listener dry-run the reload would pass validation, tear
+    // down the tasks, then fail post-stop → zombie. The node must stay intact.
+    let path = save_test_config("reload-zombie-listen", runtime_config_with_listen()).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.expect("start");
+    assert!(runtime.shutdown_tx.is_some(), "tasks running after start");
+
+    // Valid identity + peers, malformed listen transport URI.
+    let mut bad = runtime_config_with_listen();
+    bad.listen[0].transport = "!!!not-a-transport-uri!!!".to_owned();
+    veil_cfg::save_config(&path, &bad).expect("write bad config");
+
+    let result = runtime.reload().await;
+    assert!(
+        result.is_err(),
+        "reload must reject a config with a malformed listen transport URI"
+    );
+    assert!(
+        runtime.shutdown_tx.is_some(),
+        "running node must stay intact (no zombie) on a bad listen URI reload"
+    );
+
+    runtime.stop().await.expect("stop");
+    let _ = fs::remove_file(&path);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn reload_with_malformed_peer_pubkey_does_not_zombie() {
     // audit cycle-10: completes the cycle-9 reload-zombie guard. The LOCAL
     // identity is valid (HandshakeIdentity::from_config passes), but a PEER's

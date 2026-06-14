@@ -45,7 +45,7 @@ use super::identity_loaders::{load_falcon_signer, load_signing_key};
 use super::{
     NodeRuntime, PeerPubkeySnapshot, RuntimeTasks, StopFlushContext, StopTasksContext,
     build_advertised_transports, build_relay_node_ids, build_state, build_target_labels,
-    lock_tasks, resolve_metrics_path,
+    listen_transport_context, lock_tasks, resolve_metrics_path,
 };
 
 impl NodeRuntime {
@@ -305,7 +305,7 @@ impl NodeRuntime {
     /// node intact on a bad reload.
     pub fn validate_reloadable_config(config: &veil_cfg::Config) -> Result<()> {
         veil_cfg::require_identity(config)?; // identity section present
-        let _ = veil_cfg::transport_glue::context_from_config(config)?;
+        let base_ctx = veil_cfg::transport_glue::context_from_config(config)?;
         let _ = HandshakeIdentity::from_config(config)?;
         // Dry-run the FULL state build so EVERY fallible step in `build_state`
         // is exercised here, BEFORE do_stop_tasks tears the node down — most
@@ -314,11 +314,11 @@ impl NodeRuntime {
         // the LOCAL identity, so a malformed PEER pubkey otherwise sailed
         // through validation and then failed inside `build_state` in
         // apply_reload_after_stop, AFTER the tasks were aborted and shutdown_tx
-        // taken → an online-but-dead zombie until process restart. The built
-        // NodeState is discarded; build_state is a pure constructor (no spawns),
-        // so this is cheap and future-proofs the gate against new fallible build
-        // steps. (audit cycle-10 — completes the cycle-9 reload-zombie fix.)
-        let _ = build_state(
+        // taken → an online-but-dead zombie until process restart. build_state
+        // is a pure constructor (no spawns), so this is cheap and future-proofs
+        // the gate against new fallible build steps. (audit cycle-10 — completes
+        // the cycle-9 reload-zombie fix.)
+        let dry_state = build_state(
             config,
             std::path::PathBuf::new(),
             false,
@@ -326,6 +326,21 @@ impl NodeRuntime {
             false,
             None,
         )?;
+        // M-2: exercise the per-listener fallible steps that `spawn_all_services`
+        // runs at bind time — `TransportUri::parse` and `listen_transport_context`
+        // (TLS cert/key + per-listener PSK file loading). These run AFTER
+        // do_stop_tasks in the live reload path, so a malformed listen transport
+        // URI / unreadable TLS cert / bad psk_file produced the same
+        // online-but-dead zombie that the peer-pubkey check above closes for
+        // peers. We deliberately DON'T probe the actual socket bind: the old
+        // listeners are still held here (validate runs before do_stop_tasks), so
+        // a real bind would EADDRINUSE-false-reject the common same-address
+        // reload. Port availability stays a residual; this catches the realistic
+        // misconfig (typo'd URI / rotated-out cert).
+        for listen in dry_state.listens.values() {
+            let _ = veil_transport::TransportUri::parse(&listen.transport)?;
+            let _ = listen_transport_context(&base_ctx, listen)?;
+        }
         Ok(())
     }
 
