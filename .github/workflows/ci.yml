@@ -347,6 +347,20 @@ jobs:
         # admin-protocol validation this job is concerned with).
         run: cargo build -p veilcore --lib --no-default-features
 
+      - name: Check ogate compiles on Windows (cfg-gating guard)
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        # `ogate` is NOT covered by the windows-gnu cross-check job (it is a
+        # `tls-boring`/BoringSSL crate, excluded there) and was previously only
+        # built for Windows inside the tag-only `release.yml` — so a `#[cfg(unix)]`
+        # name-resolution regression (a `#[cfg(unix)] mod bridge` item referenced
+        # unconditionally) slipped through CI and failed the v0.2.0 release build.
+        # `--no-default-features` drops tls-boring (no cmake/BoringSSL on the
+        # runner) but still type-checks the lib + bins, catching that bug class
+        # here on every tag CI instead of at release time.
+        run: cargo check -p ogate --no-default-features --lib --bins
+
       - name: Run TCP admin integration tests
         env:
           CC: clang-cl

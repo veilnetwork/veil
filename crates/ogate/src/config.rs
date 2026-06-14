@@ -301,7 +301,7 @@ impl OgateConfig {
         if self.prefix_v6 > 128 {
             return Err(ConfigError::Field("`prefix_v6` must be in 0..=128"));
         }
-        if self.mtu as usize > crate::bridge::MAX_OBFS4_SOLO_PAYLOAD_BYTES {
+        if self.mtu as usize > crate::MAX_OBFS4_SOLO_PAYLOAD_BYTES {
             // Above the obfs4 single-packet egress ceiling, full-size packets are
             // silently dropped (warn-only, no PMTU signal) → bulk transfers hang
             // (diff-audit H6). Reject at load instead of blackholing at runtime.
@@ -344,7 +344,7 @@ fn default_iface_name() -> String {
     "ogate0".to_owned()
 }
 /// TUN MTU.  Default 15000, clamped at/below the 15231 obfs4 egress ceiling
-/// (bridge::MAX_OBFS4_SOLO_PAYLOAD_BYTES). Near bufpool's 16 KiB bucket — the largest
+/// (crate::MAX_OBFS4_SOLO_PAYLOAD_BYTES). Near bufpool's 16 KiB bucket — the largest
 /// safe value before delivery breaks on bigger frames).  Phase E24
 /// (2026-05-22) measured MTU-sweep through ogate-tunnel:
 ///
@@ -362,7 +362,7 @@ fn default_iface_name() -> String {
 /// Operators on links with MTU restrictions (PPPoE 1492, VPN nested) can
 /// override through `[ogate] mtu = 1500` in config.
 fn default_mtu() -> u16 {
-    // Must stay at/below bridge::MAX_OBFS4_SOLO_PAYLOAD_BYTES (15231) — the old
+    // Must stay at/below crate::MAX_OBFS4_SOLO_PAYLOAD_BYTES (15231) — the old
     // default of 16000 sat ABOVE the egress ceiling, so a TCP-in-tunnel MSS
     // negotiated to ~15960 and every full-size segment was silently dropped
     // (warn-only, no ICMP frag-needed) → PMTU blackhole for bulk transfers
