@@ -2066,8 +2066,10 @@ impl FrameDispatcher {
                     }
                     out
                 };
-                let in_k_closest = closest.contains(&self.local_node_id)
-                    || closest.len() < k
+                // NB: no `closest.contains(&local_node_id)` term — per the
+                // comment above, `find_closest_nodes` excludes self by Kademlia
+                // convention, so that disjunct was always false (audit cleanup).
+                let in_k_closest = closest.len() < k
                     || closest
                         .last()
                         .map(|furthest| xor_dist(&self.local_node_id) < xor_dist(furthest))
