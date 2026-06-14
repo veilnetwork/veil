@@ -1210,9 +1210,13 @@ impl IntroducePayload {
             )));
         }
         let total = Self::FIXED_SIZE + ciphertext_len;
-        if blob.len() < total {
+        // Exact-length: reject trailing bytes as well as truncation. A blob
+        // longer than `total` carries unparsed bytes that no honest encoder
+        // produces — accepting them would let a peer smuggle data past the
+        // frame boundary (and silently de-sync any length-prefixed framing).
+        if blob.len() != total {
             return Err(RendezvousError::Malformed(format!(
-                "introduce truncated: have {}, need {total}",
+                "introduce length mismatch: have {}, need {total}",
                 blob.len()
             )));
         }
@@ -2621,6 +2625,21 @@ mod tests {
         .encode()
         .unwrap();
         buf.pop(); // chop one byte
+        assert!(IntroducePayload::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn epic482_5_introduce_trailing_bytes_rejected() {
+        // Exact-length decode: a blob longer than the declared frame must be
+        // rejected, not silently truncated to `total` (no smuggled tail).
+        let mut buf = IntroducePayload {
+            receiver_node_id: [0; NODE_ID_LEN],
+            auth_cookie: [0; AUTH_COOKIE_LEN],
+            ciphertext: vec![1, 2, 3, 4],
+        }
+        .encode()
+        .unwrap();
+        buf.push(0xFF); // append one stray byte past the frame
         assert!(IntroducePayload::decode(&buf).is_err());
     }
 

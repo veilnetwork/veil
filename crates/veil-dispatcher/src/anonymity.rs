@@ -79,6 +79,20 @@ fn circuit_now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Outcome of attempting to forward an introduce down a return circuit.
+/// Lets the caller tell a genuinely-unknown cookie apart from a known cookie
+/// whose cell was simply not (re)sent.
+enum CircuitIntroduceForward {
+    /// A fresh introduce cell was framed and sent down the circuit.
+    Forwarded,
+    /// The cookie maps to a known circuit subscription, but no cell was sent —
+    /// a replay we already forwarded, or a transient drop (cell oversize /
+    /// return-seq exhausted / encode failure). The cookie WAS known.
+    KnownButDropped,
+    /// No circuit-backed subscription exists for this cookie.
+    NotCircuit,
+}
+
 impl FrameDispatcher {
     /// Handle one inbound `FrameFamily::RelayChain` frame. See
     /// module docs for the per-frame flow.
@@ -349,18 +363,28 @@ impl FrameDispatcher {
                 // (onion-registered) subscription, keyed by cookie ALONE — for a
                 // LOCATION-anonymous service R forwards the introduce DOWN the
                 // receiver's return circuit instead of over a direct session.
-                if self.try_forward_introduce_via_circuit(&intro) {
-                    return DispatchResult::NoResponse;
+                match self.try_forward_introduce_via_circuit(&intro) {
+                    CircuitIntroduceForward::Forwarded
+                    | CircuitIntroduceForward::KnownButDropped => {
+                        // Cookie was a known circuit subscription — either
+                        // forwarded, or deliberately dropped (replay / cell
+                        // budget / seq-exhausted). NOT an unknown cookie, so
+                        // don't emit the cookie_unknown signal.
+                        return DispatchResult::NoResponse;
+                    }
+                    CircuitIntroduceForward::NotCircuit => {
+                        // No entry for this (receiver, cookie) in either the
+                        // session OR the circuit registry. Silent drop:
+                        // surfacing this would leak "this rendezvous serves
+                        // cookie X / Y" to sender probes — exactly what the
+                        // auth_cookie cipher-shape is designed to hide.
+                        self.logger.info(
+                            "anonymity.relay_chain.introduce.cookie_unknown",
+                            "no subscriber registered for this (receiver, auth_cookie); dropped",
+                        );
+                        return DispatchResult::NoResponse;
+                    }
                 }
-                // No entry for this (receiver, cookie). Silent drop:
-                // surfacing this would leak "this rendezvous serves
-                // cookie X / Y" to sender probes — exactly what the
-                // auth_cookie cipher-shape is designed to hide.
-                self.logger.info(
-                    "anonymity.relay_chain.introduce.cookie_unknown",
-                    "no subscriber registered for this (receiver, auth_cookie); dropped",
-                );
-                return DispatchResult::NoResponse;
             }
         };
         // Forward the ciphertext over the subscriber's OVL1 session.
@@ -904,17 +928,22 @@ impl FrameDispatcher {
     /// send it down that circuit toward the receiver. Returns `true` if handled.
     /// R is the circuit terminus, so it originates the return seq + seals one
     /// layer; intermediate hops add their layers, the receiver opens all N.
+    /// Attempt to forward an introduce down a receiver's return circuit.
+    /// Result distinguishes "cookie unknown to the circuit registry" from
+    /// "cookie known but cell not (re)sent", so the caller logs an unknown
+    /// cookie only when the cookie really is unrecognised — a duplicate or a
+    /// transient send-drop is NOT an unknown cookie.
     fn try_forward_introduce_via_circuit(
         &self,
         intro: &veil_anonymity::rendezvous::IntroducePayload,
-    ) -> bool {
+    ) -> CircuitIntroduceForward {
         use veil_anonymity::circuit_data::{Direction, apply_layer, wrap_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
         let Some(reg) = &self.circuit_rendezvous else {
-            return false;
+            return CircuitIntroduceForward::NotCircuit;
         };
         let Some(circuit) = reg.lookup(&intro.auth_cookie) else {
-            return false;
+            return CircuitIntroduceForward::NotCircuit;
         };
         // Δ2-g1: drop a byte-identical replayed introduce before it consumes
         // circuit bandwidth. Fingerprint the (public cookie ‖ sealed ciphertext);
@@ -928,18 +957,21 @@ impl FrameDispatcher {
             *h.finalize().as_bytes()
         };
         if lock!(self.circuit_introduce_seen).check_and_insert(fp) {
-            return false; // already forwarded this exact introduce recently
+            // Already forwarded this exact introduce recently. The cookie WAS
+            // known — caller must not mislabel it as an unknown cookie.
+            return CircuitIntroduceForward::KnownButDropped;
         }
         // Frame the introduce into a FIXED-SIZE cell, then apply R's (terminus)
         // return layer; intermediate hops add theirs, the originator peels all.
         let mut buf = match wrap_payload(&intro.ciphertext) {
             Ok(b) => b,
-            Err(_) => return false, // introduce larger than one cell — drop
+            // introduce larger than one cell — drop, but the cookie was known.
+            Err(_) => return CircuitIntroduceForward::KnownButDropped,
         };
         // D5: refuse to send if the return-seq space is exhausted (would reuse
         // keystream). Drop the cell; the circuit idle-GCs and is rebuilt fresh.
         let Some(seq) = circuit.alloc_return_seq() else {
-            return false;
+            return CircuitIntroduceForward::KnownButDropped;
         };
         apply_layer(&circuit.circuit_key, Direction::Return, seq, &mut buf);
         let cell = CircuitDataPayload {
@@ -954,11 +986,11 @@ impl FrameDispatcher {
                     RelayChainMsg::CircuitData,
                     &body,
                 );
-                true
+                CircuitIntroduceForward::Forwarded
             }
             // Oversize (too many return hops for the cell cap) — drop; the cell
-            // budget is a known b6 refinement.
-            Err(_) => false,
+            // budget is a known b6 refinement. Cookie was known.
+            Err(_) => CircuitIntroduceForward::KnownButDropped,
         }
     }
 
