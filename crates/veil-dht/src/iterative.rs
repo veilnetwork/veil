@@ -241,12 +241,11 @@ pub async fn find_node_iterative(
             // — eclipse mitigation, three layers.
             //
             // Layer 1 (XOR distance filter): drop contacts that are not
-            // *strictly closer* than the responder by at least 2× margin.
-            // A responder MUST demonstrate progress — i.e. point at peers
-            // genuinely closer to the target than itself.
-            // `r_dist > 2 * peer_dist` ⟺ `r_dist >> 1 > peer_dist` (big-endian).
-            //
-            // tightened to **strict** progress.
+            // *strictly closer* to the target than the responder itself. A
+            // responder MUST demonstrate progress — point at peers genuinely
+            // closer than itself. The rule is STRICT progress `r_dist > peer_dist`
+            // (the earlier 2×-margin / `r_dist >> 1 > peer_dist` formulation was
+            // superseded by the tightening described next).
             // Previously `r_dist >> 1 > peer_dist` rejected only contacts
             // STRICTLY farther than 2× — a same-distance responder
             // (`r_dist == peer_dist`) was admitted. A Sybil at distance D
