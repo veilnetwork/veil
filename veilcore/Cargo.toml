@@ -1,0 +1,241 @@
+[package]
+name = "veilcore"
+version = "0.2.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[features]
+default = ["rocksdb-cold"]
+# Epic 404.1: RocksDB cold tier for DHT TieredStore. Disable with --no-default-features.
+rocksdb-cold = ["dep:rocksdb", "veil-dht/rocksdb-cold"]
+# Epic 412.10: release-build safety gate on `BUILTIN_SEEDS`.  Enabling
+# `production-seeds` asserts that `node/bootstrap/seeds.rs::BUILTIN_SEEDS`
+# carries a real seed set for this build.  `allow-empty-seeds` is the
+# opt-in escape hatch for testnet / custom-deployment builds that are OK
+# with no builtin seeds (DNS / explicit peers / manual bootstrap).  In
+# release without either feature a `compile_error!` fires — prevents
+# accidentally shipping a production binary that can't bootstrap without
+# explicit config.
+production-seeds = ["veil-bootstrap/production-seeds"]
+allow-empty-seeds = ["veil-bootstrap/allow-empty-seeds"]
+# Epic 447.4: opt-in to the heaviest sim/scenarios tests (≥55 s each) which
+# are otherwise `#[ignore]`d by default to keep the local dev sweep fast.
+# Run with `cargo nextest run --features slow-sim-tests` (or in CI).
+slow-sim-tests = []
+# Epic test-low-difficulty: route the proto/crypto/dht/identity test-only
+# 16-bit PoW knob through veilcore so devnet binaries can boot in
+# seconds instead of waiting on production-tier (24-bit) identity-PoW
+# during local smoke tests.  Off by default; enable explicitly via
+# `cargo build --features test-low-difficulty` for devnet runs.
+test-low-difficulty = [
+    "veil-crypto/test-low-difficulty",
+    "veil-dht/test-low-difficulty",
+    "veil-identity/test-low-difficulty",
+    "veil-proto/test-low-difficulty",
+]
+# Epic 409.4 + 409.7: Anti-DPI TLS backend via BoringSSL (`boring` crate).
+# Enables Chrome-like TLS ClientHello fingerprint (JA3) and TLS 1.3 record
+# padding.  Default build uses rustls (pure Rust, no C deps); enable
+# `tls-boring` explicitly for public-facing gateway deployment where on-path
+# DPI fingerprints veil traffic.
+#
+# Requires clang + cmake + go on the build host.  Adds ~3 MB to the binary
+# and doubles compile time, so NOT recommended for low-flash routers.
+# Enables BoringSSL-backed TLS for **every** TLS-bearing transport:
+# `tls://`, `wss://`, `sockstls://`, and `quic://`.  Chrome-like JA3 on TCP
+# paths, JA4 on QUIC.  Uses the `btls` binding fork (by 0x676e67) rather than
+# Cloudflare's `boring`; `quinn-btls` is the only working QUIC crypto
+# provider backed by BoringSSL, and it drives the `btls` choice.  See Epic
+# 409 notes in TASKS.md.
+tls-boring = ["dep:btls", "dep:tokio-btls", "dep:quinn-btls", "veil-transport/tls-boring", "veil-bootstrap/tls-boring", "veil-update/tls-boring"]
+# Phase 6.50.b audit-C2: `tls-webpki-roots` is now a semver-stable
+# no-op kept for existing build configs (see veil-transport's feature
+# definition for the full history).  `use_system_roots = true` in
+# `transport.tls_client` config is now respected unconditionally —
+# webpki-roots is always present in the binary because
+# `veil-transport` needs it for the HTTPS bootstrap path.
+# Scheduled for removal in the next semver-major.
+tls-webpki-roots = ["veil-transport/tls-webpki-roots"]
+
+# Phase 5 (veilcore extraction): `veil-cli` binary moved to veil-cli crate.
+
+[dependencies]
+veil-abuse = { path = "../crates/veil-abuse" }
+veil-adaptive = { path = "../crates/veil-adaptive" }
+veil-anonymity = { path = "../crates/veil-anonymity" }
+veil-anycast = { path = "../crates/veil-anycast" }
+veil-app = { path = "../crates/veil-app" }
+veil-bootstrap = { path = "../crates/veil-bootstrap" }
+veil-bufpool = { path = "../crates/veil-bufpool" }
+veil-cfg = { path = "../crates/veil-cfg" }
+veil-congestion = { path = "../crates/veil-congestion" }
+veil-crypto = { path = "../crates/veil-crypto" }
+veil-dht = { path = "../crates/veil-dht" }
+veil-discovery = { path = "../crates/veil-discovery" }
+veil-dispatcher = { path = "../crates/veil-dispatcher" }
+veil-e2e = { path = "../crates/veil-e2e" }
+veil-error = { path = "../crates/veil-error" }
+veil-gateway = { path = "../crates/veil-gateway" }
+veil-identity = { path = "../crates/veil-identity" }
+veil-invite = { path = "../crates/veil-invite" }
+veil-ipc = { path = "../crates/veil-ipc" }
+veil-local-transport = { path = "../crates/veil-local-transport" }
+veil-bloom = { path = "../crates/veil-bloom" }
+veil-mailbox = { path = "../crates/veil-mailbox" }
+veil-memory = { path = "../crates/veil-memory" }
+veil-push = { path = "../crates/veil-push" }
+veil-mesh = { path = "../crates/veil-mesh" }
+veil-node-runtime = { path = "../crates/veil-node-runtime" }
+veil-nat = { path = "../crates/veil-nat" }
+veil-dispatcher-state = { path = "../crates/veil-dispatcher-state" }
+veil-observability = { path = "../crates/veil-observability" }
+veil-pending-ack = { path = "../crates/veil-pending-ack" }
+veil-pex = { path = "../crates/veil-pex" }
+veil-proxy = { path = "../crates/veil-proxy" }
+veil-reputation = { path = "../crates/veil-reputation" }
+veil-routing = { path = "../crates/veil-routing" }
+veil-session = { path = "../crates/veil-session" }
+veil-proto = { path = "../crates/veil-proto" }
+veil-transport = { path = "../crates/veil-transport" }
+veil-types = { path = "../crates/veil-types" }
+veil-update = { path = "../crates/veil-update" }
+veil-util = { path = "../crates/veil-util" }
+argon2 = "0.5"
+async-trait = "0.1"
+base64 = "0.22"
+bip39 = { version = "2", default-features = false, features = ["std"] }
+blake3 = "1.5"
+clap = { version = "4.6.0", features = ["derive", "env"] }
+ctrlc = "3.4"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hkdf = "0.12"
+ml-kem = { version = "0.3.0-rc.1", features = ["getrandom"] }
+sha2 = "0.10"
+subtle = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1"
+futures = "0.3"
+hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }
+libc = "0.2"
+log = "0.4"
+pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
+pqcrypto-traits = "0.3"
+# Epic 462.26: pure-Rust QR-code encoder for `veil-cli identity qr`.
+# default-features stripped so only the core encoder compiles — `image`
+# and `svg` features aren't needed for terminal rendering.
+qrcode = { version = "0.14", default-features = false }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = "0.13"
+rustls = "0.23"
+# Phase 6.50.b followup: dropped `rustls-pemfile` (RUSTSEC-2025-0134
+# unmaintained) — was a zombie dep here anyway (no `use rustls_pemfile`
+# in veilcore source; only `veil-transport` actually parsed PEM,
+# now migrated to `rustls-pki-types::pem::PemObject`).
+rustls-pki-types = "1.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+# Terminal-echo-disabled password prompt for interactive key_passphrase_prompt.
+# Pure-Rust, no C deps, stdlib + termios on Unix / Win32 console on Windows.
+rpassword = "7"
+tokio = { version = "1.42", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-socks = "0.5"
+tokio-tungstenite = "0.24"
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.9"
+toml_edit = "0.23"
+url = "2.5"
+# Epic 404.1: RocksDB cold tier (optional — behind `rocksdb-cold` feature).
+rocksdb = { version = "0.22", optional = true }
+# Epic 409.4 + 409.7 + 409.Q: BoringSSL-backed TLS/QUIC via the `btls` fork
+# for Chrome-like JA3/JA4 fingerprint.  Behind `tls-boring` feature
+# (not default).  `btls` is chosen over Cloudflare's `boring` because
+# `quinn-btls` (for QUIC) has a working upstream while `quinn-boring`
+# is pinned to a yanked `boring` version.
+btls = { version = "0.5", optional = true }
+tokio-btls = { version = "0.5", optional = true }
+quinn-btls = { version = "0.1", optional = true }
+
+# Phase 6.50.b audit-C2: dropped — `veil-transport` already pulls
+# `webpki-roots` as a direct (non-optional) dep, so listing it as
+# optional here was redundant.  The dep is still in the binary; only
+# this duplicated declaration is gone.
+
+# Epic 451.13: Windows Service mode — `veil-cli service install/uninstall/run`
+# registers the node with Service Control Manager so it survives reboots and
+# logs to the Windows Event Log.  Non-Windows builds skip this dep entirely.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
+# jemalloc as global allocator on Linux (2026-05-13 OOM follow-up).
+# glibc malloc fragments aggressively under bursty mixed-size workloads:
+# the veil daemon's chat_node-style 60 KB frame churn + session
+# tear-down/reconnect cycles from chaos-ban created ~5-10 MB/min ambient
+# RSS growth on bootstrap hubs — but not on non-bootstrap nodes which see
+# fewer/smaller relay paths.  RSS plateaued instantly when traffic was
+# stopped (no true leak), so the growth is purely allocator overhead
+# that does not get returned to OS.  jemalloc handles this pattern
+# orders-of-magnitude better.  Linux-only — Windows uses its own
+# fragmentation-resistant allocator.
+[target.'cfg(target_os = "linux")'.dependencies]
+# Phase 6.50.d.5n: `profiling` feature enables jemalloc's heap-profiling
+# support so we can dump heap callstacks via `MALLOC_CONF=prof:true,...`
+# and analyse with `jeprof`.  Build-time only — runtime overhead is gated
+# by `MALLOC_CONF=prof_active:true`, so production binaries can ship
+# with this feature without paying for profiling unless explicitly enabled
+# via the env at startup.
+tikv-jemallocator = { version = "0.6", features = ["profiling"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+# Phase 6.50.b chaos-sim V2-D: enable tokio time-pause + advance for
+# compressed-time tests.  Dev-only — `test-util` MUST NOT leak into
+# production builds, otherwise real-time code paths get a fake clock and
+# timers stop firing on a live node.
+tokio = { version = "1.42", features = ["full", "test-util"] }
+# Re-list veil-crypto with the test-low-difficulty feature enabled so
+# veilcore's own #[cfg(test)] runs inherit the 16-bit PoW that
+# crypto's #[cfg(test)] would have used pre-extraction.
+veil-crypto = { path = "../crates/veil-crypto", features = ["test-low-difficulty"] }
+veil-dht    = { path = "../crates/veil-dht",    features = ["test-low-difficulty"] }
+veil-proto  = { path = "../crates/veil-proto",  features = ["test-low-difficulty"] }
+proptest = "1"
+tempfile = "3"
+
+[[bench]]
+name = "dht_lookup"
+harness = false
+
+[[bench]]
+name = "voice_stream"
+harness = false
+
+[[bench]]
+name = "socks5_throughput"
+harness = false
+
+[[bench]]
+name = "dht_store_throughput"
+harness = false
+
+[[bench]]
+name = "session_scale"
+harness = false
+
+[[bench]]
+name = "recursive_relay_chain"
+harness = false
+
+[[bench]]
+name = "hybrid_kex"
+harness = false
+
+[[bench]]
+name = "adversary_validation"
+harness = false
+
+[lints]
+workspace = true

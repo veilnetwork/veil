@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Default notification icon — а minimal vector drawable so the plugin
+  doesn't pull in а raster bitmap that would conflict с consumer app
+  density buckets.  Apps wanting а branded icon override это by
+  shipping their own `veil_notification_icon.xml` (or .png) in
+  their `android/app/src/main/res/drawable/` — Android resource
+  merge takes the consumer's version on collision.
+
+  Status-bar icons must be monochrome (white on transparent); Android
+  applies the system colour automatically.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="?android:attr/colorAccent">
+    <!-- Three-circle "mesh" graphic: small triangle of nodes representing
+         peer-to-peer veil topology. -->
+    <path
+        android:fillColor="#ffffff"
+        android:pathData="M12,4 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+    <path
+        android:fillColor="#ffffff"
+        android:pathData="M5,16 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+    <path
+        android:fillColor="#ffffff"
+        android:pathData="M19,16 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+    <path
+        android:fillColor="#ffffff"
+        android:pathData="M12,6.5 L5,14 M12,6.5 L19,14 M5,16 L19,16"
+        android:strokeColor="#ffffff"
+        android:strokeWidth="1.5" />
+</vector>

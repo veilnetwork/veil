@@ -1,0 +1,38 @@
+[Unit]
+Description=ogate — veil-network TUN bridge ({{ inventory_hostname }})
+# Ride the veil daemon's lifecycle in both directions: when veil
+# stops, ogate stops too; when veil restarts, ogate follows. Same
+# pattern as chat-node.service before — see deploy-chat.yml for why
+# `PartOf=` is preferred over `Requires=`.
+PartOf=veil.service
+Requires=veil.service
+After=veil.service
+
+[Service]
+Type=simple
+# TUN device creation + route/ifconfig need CAP_NET_ADMIN. Run as the
+# `veil` user (NOT root): the app-IPC U9 gate drops app-socket
+# connections whose peer_uid != the daemon's own (veil) uid, with NO
+# root exception (audit cycle-7) — so a root ogate gets "Broken pipe" on
+# /var/lib/veil/app.sock. Ambient CAP_NET_ADMIN/CAP_NET_RAW grant the
+# TUN + route privileges without uid=0; /dev/net/tun is 0666 so the
+# veil user can open it.
+User=veil
+Group=veil
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+DeviceAllow=/dev/net/tun rw
+
+ExecStart=/usr/local/bin/ogate up --config /etc/ogate/ogate.toml
+
+# Reload peer table on SIGHUP — `systemctl reload ogate` triggers it.
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=append:/var/log/veil/ogate.log
+StandardError=append:/var/log/veil/ogate.log
+
+[Install]
+WantedBy=multi-user.target

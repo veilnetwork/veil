@@ -1,0 +1,39 @@
+# Phase 6.32 testnet Dockerfile.
+#
+# Skips the in-container Rust compile that the canonical `Dockerfile` runs —
+# the legacy docker builder on this host stalls silently inside `cargo
+# build --release` for a workspace this size.  Instead we COPY the
+# host-built binary directly into a debian:trixie-slim runtime image
+# (glibc 2.40, satisfies the binary's GLIBC_2.39 max symbol).
+#
+# Build prerequisite (run on host):
+#   cargo build --release -p veilcore --bin veil-cli \
+#       --features allow-empty-seeds,test-low-difficulty
+#
+# Then:
+#   docker build -f docker/Dockerfile.testnet -t veilnetwork/veil:testnet-vN .
+#   docker push veilnetwork/veil:testnet-vN
+
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system veil \
+    && useradd --system --gid veil --home-dir /var/lib/veil \
+        --no-create-home --shell /usr/sbin/nologin veil \
+    && install -d -m 0700 -o veil -g veil /var/lib/veil
+
+COPY target/release/veil-cli /usr/local/bin/veil-cli
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/veil-cli /usr/local/bin/entrypoint.sh
+
+EXPOSE 5555/tcp 9906/tcp 8443/tcp 8443/udp 6666/udp
+
+USER veil
+WORKDIR /var/lib/veil
+
+# tini as PID 1 so Ctrl-C propagates to veil-cli and it performs a graceful
+# shutdown (flush persist snapshots, close sessions) before the container exits.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+CMD ["run"]

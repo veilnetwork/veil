@@ -1,0 +1,24 @@
+[package]
+name = "veil-e2e"
+version = "0.2.0"
+edition = "2024"
+description = "End-to-end encrypted envelope wrapping for veil payloads: ML-KEM-768 KEM, ChaCha20-Poly1305 AEAD, HKDF-SHA256 key derivation, encrypted-at-rest cache for prekeys. Phase 6 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-proto = { path = "../veil-proto" }
+veil-util = { path = "../veil-util" }
+
+argon2 = "0.5"
+base64 = "0.22"
+blake3 = "1.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+ml-kem = { version = "0.3.0-rc.1", features = ["getrandom"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+thiserror = "2.0"
+zeroize = "1.8"
+
+[lints]
+workspace = true

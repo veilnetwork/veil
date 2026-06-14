@@ -1,0 +1,81 @@
+[package]
+name = "ogate"
+version = "0.2.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Veil-network TUN bridge: connect two or more machines via virtual IP over the veil (open or authorized membership)."
+
+[[bin]]
+name = "ogate"
+path = "src/main.rs"
+
+[lib]
+name = "ogate"
+path = "src/lib.rs"
+
+[features]
+# `tls-boring` ON by default — browser-like TLS ClientHello + rotation
+# (censorship-resistance baseline; needs cmake + a C toolchain at build time).
+# Opt out for pure-Rust / cross builds without cmake:
+#     cargo build -p ogate --no-default-features
+# See docs/en/OPERATIONS.md → "TLS ClientHello fingerprint rotation".
+default = ["tls-boring"]
+tls-boring = ["veilclient/tls-boring"]
+# Forward veilclient's bootstrap-seed feature flags so downstream
+# builds can opt into testnet / custom-deployment mode (no built-in
+# seeds compiled in).
+allow-empty-seeds = ["veilclient/allow-empty-seeds"]
+production-seeds  = ["veilclient/production-seeds"]
+
+[dependencies]
+# Veil SDK / IPC client.
+veilclient = { path = "../../veilclient" }
+veil-app   = { path = "../veil-app" }
+veil-cfg   = { path = "../veil-cfg" }
+veil-identity = { path = "../veil-identity" }
+veil-types = { path = "../veil-types" }
+veil-util  = { path = "../veil-util" }
+anyhow = "1"
+base64 = "0.22"
+
+# CLI + config + logging.
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+thiserror = "2.0"
+
+# Lock-free Arc swap for hot-reloading the peer / routing table.
+# Egress / ingress paths .load() on each packet — `ArcSwap` is the
+# right primitive here (read-mostly, occasional swap from SIGHUP).
+arc-swap = "1"
+
+# Async runtime.
+tokio = { version = "1", features = [
+    "net",
+    "io-util",
+    "sync",
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+    "fs",
+] }
+bytes = "1"
+
+# Cross-platform TUN device: Linux / macOS / Windows.
+# FreeBSD is handled via the platform-specific freebsd module
+# (raw /dev/tun + ioctl), so the tun crate is excluded there.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+tun = { version = "0.6", features = ["async"] }
+
+# FreeBSD-only: low-level /dev/tun support via nix + libc.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+nix = { version = "0.29", features = ["fs", "ioctl", "net", "socket"] }
+libc = "0.2"
+
+[lints]
+workspace = true

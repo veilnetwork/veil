@@ -1,0 +1,72 @@
+name: PR gate
+
+# Lightweight merge-gate on pull requests (audit cycle-4 O2).
+#
+# The full CI (build/test/windows/bench/devnet) is tag-only to conserve the
+# org's Actions budget (see ci.yml). That left PR merges with NO automated
+# policy/lint gate, so style/lint/policy regressions could reach main between
+# tags (history: tag-only CI once let 4 mutex + 3 dead-code + 7 cfg-warning
+# violations slip in). This job restores ONLY the fast hygiene checks (no
+# compile-heavy test/bench jobs) and cancels superseded runs to stay cheap.
+
+on:
+  pull_request:
+
+# Cancel an in-flight run when the PR is pushed again — only the latest commit
+# needs gating, which roughly halves spend on iterative PRs.
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  hygiene:
+    name: Hygiene (fmt + clippy + policy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (with rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (warnings deny)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo check (cfg-warnings deny)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check --workspace --all-targets
+
+      - name: Mutex poison-recovery policy
+        run: ./scripts/check-mutex-poison-policy.sh
+
+      - name: "#[allow(dead_code)] anchor policy"
+        run: ./scripts/check-allow-dead-code-anchors.sh
+
+      - name: Cyrillic policy (runtime strings + CI tooling)
+        run: ./scripts/check-cyrillic-runtime-strings.sh
+
+      - name: Stale CLI build-snippet policy
+        run: ./scripts/check-cli-build-snippets.sh

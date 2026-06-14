@@ -1,0 +1,79 @@
+all:
+  vars:
+    metrics_port: 19999
+
+  children:
+    # ── Bootstrap nodes ────────────────────────────────────────────────
+    # Public-facing seed nodes with DNS + TLS certs. Fill in your own
+    # hosts. The example values below use RFC 5737 documentation IPs
+    # (203.0.113.0/24) and example.com domains — replace them.
+    bootstrap:
+      hosts:
+        b1:
+          ansible_user: root
+          ansible_host: 203.0.113.11
+          veil_host: b1.example.com
+          veil_email: admin@example.com
+          veil_bootstrap_peers: []
+        b2:
+          ansible_user: root
+          ansible_host: 203.0.113.12
+          veil_host: b2.example.com
+          veil_email: admin@example.com
+          veil_bootstrap_peers: []
+        b3:
+          ansible_user: root
+          ansible_host: 203.0.113.13
+          veil_host: b3.example.com
+          veil_email: admin@example.com
+          veil_bootstrap_peers: []
+
+    # ── Relay / mesh nodes ─────────────────────────────────────────────
+    nodes:
+      vars:
+        # TCP-only hosts with no DNS/cert: advertise by IP
+        # (Ansible's `ansible_host`). They still dial OUT to the bootstrap
+        # nodes over TLS using the pinned certs in `bootstrap_peers`.
+        veil_no_tls: true
+        # Shared bootstrap peer set — every host under `nodes:` inherits
+        # these. Must match your built-in `BUILTIN_SEEDS` (seeds.rs) when
+        # you build with `--features production-seeds`. The public binary
+        # ships with EMPTY built-in seeds, so supply your own here.
+        #
+        # `public_key` / `nonce` are placeholders — generate real ones from
+        # your bootstrap nodes' identities and pin them here.
+        veil_bootstrap_peers:
+          - transport: "tls://b1.example.com:9906"
+            public_key: "REPLACE_WITH_B1_ED25519_PUBKEY_BASE64="
+            nonce: "REPLACE=="
+            algo: "ed25519"
+          - transport: "tls://b2.example.com:9906"
+            public_key: "REPLACE_WITH_B2_ED25519_PUBKEY_BASE64="
+            nonce: "REPLACE=="
+            algo: "ed25519"
+          - transport: "tls://b3.example.com:9906"
+            public_key: "REPLACE_WITH_B3_ED25519_PUBKEY_BASE64="
+            nonce: "REPLACE=="
+            algo: "ed25519"
+
+      hosts:
+        node1:
+          ansible_user: root
+          ansible_host: 203.0.113.21
+          veil_email: admin@example.com
+        node2:
+          ansible_user: root
+          ansible_host: 203.0.113.22
+          veil_email: admin@example.com
+        node3:
+          ansible_user: root
+          ansible_host: 203.0.113.23
+          veil_email: admin@example.com
+        node4:
+          ansible_user: root
+          ansible_host: 203.0.113.24
+          veil_email: admin@example.com
+        node5:
+          ansible_user: root
+          ansible_host: 203.0.113.25
+          veil_email: admin@example.com

@@ -1,0 +1,21 @@
+[package]
+name = "veil-pex"
+version = "0.2.0"
+edition = "2024"
+description = "Veil Peer Exchange (PEX) — random-walk peer discovery with PoW challenge + signed responses (Epic 436). Phase 6 extraction from veilcore."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+veil-crypto = { path = "../veil-crypto" }
+veil-proto = { path = "../veil-proto" }
+veil-types = { path = "../veil-types" }
+veil-util = { path = "../veil-util" }
+
+base64 = "0.22"
+blake3 = "1.5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["std"] }
+tokio = { version = "1.42", features = ["sync", "time", "rt", "macros"] }
+
+[lints]
+workspace = true

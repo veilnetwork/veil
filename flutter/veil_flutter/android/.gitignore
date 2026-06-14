@@ -1,0 +1,10 @@
+# Plugin Android build artifacts (Epic 489.3 follow-up).
+#
+# Native .so files are produced by gradle's `cargoBuild_*` tasks
+# (cargo-ndk → target/<triple>/release/libveilclient_ffi.so →
+# copied к src/main/jniLibs/<abi>/).  These should NEVER be
+# committed — they're build outputs, not source.
+src/main/jniLibs/
+build/
+.gradle/
+local.properties
