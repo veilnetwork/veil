@@ -1097,6 +1097,21 @@ pub async fn run_foreground(config_path: impl AsRef<Path>, foreground_mode: bool
 /// network under the ephemeral keypair — but without any peers configured and
 /// without any listen ports, so no traffic exists to be ascribed to it.
 pub async fn run_foreground_deferred() -> Result<()> {
+    // Convenience wrapper: no external shutdown source (signals / admin-stop
+    // still apply). Embedded hosts (the FFI `veil_node_stop`) want the
+    // shutdown-aware variant below.
+    run_foreground_deferred_with_shutdown(std::future::pending::<()>()).await
+}
+
+/// As [`run_foreground_deferred`] but awaits an additional `external_shutdown`
+/// future alongside the standard signal handlers — so an embedded host (the
+/// FFI node runtime) can trigger a graceful stop of a deferred-init node.
+/// Without this the deferred node is unstoppable (the bare
+/// [`run_foreground_deferred`] hardcodes a `pending()` shutdown).
+pub async fn run_foreground_deferred_with_shutdown<F>(external_shutdown: F) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     // Build stub config (CPU-heavy — runs PoW search; tolerated because
     // deferred-init is a one-time startup cost).
     let stub_config = veil_cfg::build_stub_config_with_ephemeral_identity()
@@ -1126,8 +1141,7 @@ pub async fn run_foreground_deferred() -> Result<()> {
     // held alive until this returns so the dir (and its secrets) persist for
     // the daemon's lifetime, then are scrubbed on graceful shutdown (the old
     // code leaked the dir to OS reap).
-    let result =
-        run_foreground_with_shutdown(&config_path, true, std::future::pending::<()>()).await;
+    let result = run_foreground_with_shutdown(&config_path, true, external_shutdown).await;
     drop(tmp_dir);
     result
 }
