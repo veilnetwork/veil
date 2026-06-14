@@ -6332,7 +6332,7 @@ impl NodeServices {
             .filter(|n| *n != r)
             .collect();
         let dht = std::sync::Arc::clone(&self.dht);
-        let mids: Vec<[u8; 32]> = discover_relay_hops(
+        let mut discovered: Vec<[u8; 32]> = discover_relay_hops(
             &candidates,
             |n| dht.get_local(&relay_directory_dht_key(n)),
             now_unix,
@@ -6340,11 +6340,27 @@ impl NodeServices {
         )
         .into_iter()
         .map(|d| d.hop.node_id)
-        .take(hop_count - 1)
         .collect();
-        if mids.len() < hop_count - 1 {
+        if discovered.len() < hop_count - 1 {
             return Err(AnonOnionSendError::NoRelays); // not enough relays to hide from R
         }
+        // M-1: randomise which middle relays we pick. `discover_relay_hops`
+        // returns hops in a deterministic (freshness/candidate) order, so a bare
+        // `.take(hop_count - 1)` always selected the SAME middles for a given
+        // directory snapshot — predictable paths concentrate traffic on a few
+        // relays and let an observer pre-compute likely hop sets. Fisher–Yates
+        // over OsRng so each registration draws an independent middle subset.
+        {
+            use rand_core::{OsRng, RngCore};
+            let n = discovered.len();
+            for i in (1..n).rev() {
+                // i+1 distinct outcomes; modulo bias is negligible for
+                // routing-table-sized n and not security-relevant to the draw.
+                let j = (OsRng.next_u64() % (i as u64 + 1)) as usize;
+                discovered.swap(i, j);
+            }
+        }
+        let mids: Vec<[u8; 32]> = discovered.into_iter().take(hop_count - 1).collect();
         let mut relay_path = mids;
         relay_path.push(r);
         Ok(relay_path)
