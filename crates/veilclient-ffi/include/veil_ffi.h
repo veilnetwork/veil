@@ -357,6 +357,13 @@ typedef struct VeilApp VeilApp;
  */
 typedef struct VeilHandle VeilHandle;
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Opaque handle to a running embedded node.
+ */
+typedef struct VeilNode VeilNode;
+#endif
+
 /**
  * Opaque veil stream — reliable ordered byte channel.
  *
@@ -1548,6 +1555,41 @@ int veil_pair_target_build_confirm(VeilHandle *handle,
                                    size_t *out_confirm_len,
                                    char **err_out)
 ;
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Start an embedded node from a config file at `config_path` (`(ptr,len)`,
+ * UTF-8). Non-blocking. Returns an opaque handle, or null with `*err_out` set
+ * (free it with `veil_free_string`).
+ *
+ * # Safety
+ * `config_path_ptr` must point to `config_path_len` readable bytes; `err_out`
+ * (if non-null) must be a writable `*mut c_char` slot.
+ */
+ VeilNode *veil_node_start(const uint8_t *config_path_ptr, size_t config_path_len, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Start an embedded node in deferred-init mode (ephemeral identity, no config
+ * file). Supply the real config later over the node's admin IPC.
+ *
+ * # Safety
+ * `err_out` (if non-null) must be a writable `*mut c_char` slot.
+ */
+ VeilNode *veil_node_start_deferred(char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Stop the embedded node: trigger graceful shutdown and join its thread.
+ * Consumes the handle.
+ *
+ * # Safety
+ * `node` must be a handle returned by `veil_node_start*` and not yet stopped.
+ */
+ void veil_node_stop(VeilNode *node) ;
+#endif
 
 #ifdef __cplusplus
 }  // extern "C"
