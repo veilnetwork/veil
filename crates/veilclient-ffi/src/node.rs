@@ -10,10 +10,11 @@
 //! `veil_connect` to it. Keeping start non-blocking avoids the FFI guessing
 //! when "ready" means.
 
-use std::ffi::{CString, c_char};
+use std::ffi::{CString, c_char, c_int};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use libc::size_t;
 use tokio::sync::oneshot;
@@ -22,6 +23,11 @@ use tokio::sync::oneshot;
 pub struct VeilNode {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Admin socket path — set when the node was started in deferred mode. This
+    /// is the channel `veil_node_apply_config` uses to promote the ephemeral
+    /// deferred node to its real (host-supplied) identity. `None` for nodes
+    /// started from a config file (their admin socket lives in that config).
+    admin_socket: Option<PathBuf>,
 }
 
 /// Write an owned error string into `*err_out` (freed by `veil_free_string`).
@@ -124,21 +130,49 @@ pub unsafe extern "C" fn veil_node_start(
         unsafe { set_err(err_out, &format!("config load failed: {e}")) };
         return std::ptr::null_mut();
     }
-    start_thread(Some(path), err_out)
+    start_thread(Some(path), None, err_out)
 }
 
-/// Start an embedded node in deferred-init mode (ephemeral identity, no config
-/// file). Supply the real config later over the node's admin IPC.
+/// Start an embedded node in deferred-init mode: it boots under an ephemeral
+/// throwaway identity, binds ONLY the admin socket at `admin_socket` (`(ptr,
+/// len)`, UTF-8 filesystem path), and waits. Promote it to its real identity by
+/// pushing a config with `veil_node_apply_config` — so the real private key
+/// never has to be written to a config file on disk.
+///
+/// Pick an ephemeral, identity-free path for `admin_socket` (e.g. one under a
+/// per-launch temp dir). Non-blocking; returns an opaque handle or null + err.
 ///
 /// # Safety
-/// `err_out` (if non-null) must be a writable `*mut c_char` slot.
+/// `admin_socket_ptr` must point to `admin_socket_len` readable bytes; `err_out`
+/// (if non-null) must be a writable `*mut c_char` slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_node_start_deferred(err_out: *mut *mut c_char) -> *mut VeilNode {
-    start_thread(None, err_out)
+pub unsafe extern "C" fn veil_node_start_deferred(
+    admin_socket_ptr: *const u8,
+    admin_socket_len: size_t,
+    err_out: *mut *mut c_char,
+) -> *mut VeilNode {
+    if admin_socket_ptr.is_null() {
+        unsafe { set_err(err_out, "admin_socket is null") };
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(admin_socket_ptr, admin_socket_len) };
+    let sock = match std::str::from_utf8(bytes) {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => {
+            unsafe { set_err(err_out, "admin_socket is not valid UTF-8") };
+            return std::ptr::null_mut();
+        }
+    };
+    start_thread(None, Some(sock), err_out)
 }
 
-fn start_thread(config: Option<PathBuf>, err_out: *mut *mut c_char) -> *mut VeilNode {
+fn start_thread(
+    config: Option<PathBuf>,
+    admin_socket: Option<PathBuf>,
+    err_out: *mut *mut c_char,
+) -> *mut VeilNode {
     let (tx, rx) = oneshot::channel::<()>();
+    let thread_admin_socket = admin_socket.clone();
     let spawn = std::thread::Builder::new()
         .name("veil-node".into())
         .spawn(move || {
@@ -162,8 +196,11 @@ fn start_thread(config: Option<PathBuf>, err_out: *mut *mut c_char) -> *mut Veil
                             .await
                     }
                     None => {
-                        veil_node_runtime::admin::run_foreground_deferred_with_shutdown(shutdown)
-                            .await
+                        veil_node_runtime::admin::run_foreground_deferred_with_shutdown(
+                            thread_admin_socket,
+                            shutdown,
+                        )
+                        .await
                     }
                 }
             });
@@ -176,10 +213,105 @@ fn start_thread(config: Option<PathBuf>, err_out: *mut *mut c_char) -> *mut Veil
         Ok(thread) => Box::into_raw(Box::new(VeilNode {
             shutdown: Mutex::new(Some(tx)),
             thread: Mutex::new(Some(thread)),
+            admin_socket,
         })),
         Err(e) => {
             unsafe { set_err(err_out, &format!("failed to spawn node thread: {e}")) };
             std::ptr::null_mut()
+        }
+    }
+}
+
+/// Promote a deferred-init node to its real identity by applying `config_toml`
+/// (`(ptr, len)`, UTF-8 — e.g. the bytes returned by `veil_config_init` and
+/// kept in the host's deniable storage) over the node's admin socket, IN MEMORY
+/// (`persist = false`, so nothing is written to disk). Retries briefly while the
+/// deferred node finishes binding its admin socket.
+///
+/// The node must have been started with `veil_node_start_deferred`. Returns 0 on
+/// success, -1 on failure with `*err_out` set (free it with `veil_free_string`).
+///
+/// # Safety
+/// `node` must be a live handle from `veil_node_start_deferred`; `config_ptr`
+/// must point to `config_len` readable bytes; `err_out` (if non-null) must be a
+/// writable `*mut c_char` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_node_apply_config(
+    node: *const VeilNode,
+    config_ptr: *const u8,
+    config_len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if node.is_null() {
+        unsafe { set_err(err_out, "node is null") };
+        return -1;
+    }
+    let node = unsafe { &*node };
+    let admin_socket = match &node.admin_socket {
+        Some(p) => p.clone(),
+        None => {
+            unsafe {
+                set_err(
+                    err_out,
+                    "node was not started in deferred mode (no admin socket to apply config to)",
+                )
+            };
+            return -1;
+        }
+    };
+    if config_ptr.is_null() {
+        unsafe { set_err(err_out, "config is null") };
+        return -1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(config_ptr, config_len) };
+    let toml_content = match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) => {
+            unsafe { set_err(err_out, "config is not valid UTF-8") };
+            return -1;
+        }
+    };
+
+    // A short-lived current-thread runtime drives the async admin client. The
+    // deferred node may still be binding its admin socket, so retry-connect for
+    // a few seconds before giving up.
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("apply_config runtime build failed: {e}")) };
+            return -1;
+        }
+    };
+    let outcome = rt.block_on(async {
+        let mut last_err = String::from("admin socket never became ready");
+        for _ in 0..50 {
+            let cmd = veil_node_runtime::admin::AdminCommand::ApplyConfig {
+                toml_content: toml_content.clone(),
+                persist: false,
+            };
+            match veil_node_runtime::admin::send_request(&admin_socket, cmd).await {
+                Ok(resp) => {
+                    return match resp.error {
+                        Some(e) => Err(format!("apply-config rejected: {e}")),
+                        None => Ok(()),
+                    };
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        Err(last_err)
+    });
+    match outcome {
+        Ok(()) => 0,
+        Err(e) => {
+            unsafe { set_err(err_out, &e) };
+            -1
         }
     }
 }
@@ -256,5 +388,41 @@ mod tests {
         assert!(!id.private_key.is_empty(), "has a private key");
         assert!(!id.public_key.is_empty(), "has a public key");
         assert!(id.node_id.is_some(), "has a node_id");
+    }
+
+    #[test]
+    fn apply_config_rejects_null_node() {
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let toml = b"[global]\n";
+        let rc = unsafe {
+            veil_node_apply_config(std::ptr::null(), toml.as_ptr(), toml.len(), &mut err)
+        };
+        assert_eq!(rc, -1);
+        unsafe {
+            if !err.is_null() {
+                crate::veil_free_string(err);
+            }
+        }
+    }
+
+    #[test]
+    fn apply_config_requires_a_deferred_node() {
+        // A node with no admin socket (i.e. not started deferred) is rejected
+        // immediately — no hang on admin-socket connect retries.
+        let node = VeilNode {
+            shutdown: Mutex::new(None),
+            thread: Mutex::new(None),
+            admin_socket: None,
+        };
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let toml = b"[global]\n";
+        let rc = unsafe { veil_node_apply_config(&node, toml.as_ptr(), toml.len(), &mut err) };
+        assert_eq!(rc, -1);
+        assert!(!err.is_null());
+        let msg = unsafe { CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(msg.contains("deferred"), "got: {msg}");
+        unsafe { crate::veil_free_string(err) };
     }
 }
