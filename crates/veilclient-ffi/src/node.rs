@@ -204,6 +204,14 @@ pub unsafe extern "C" fn veil_config_compose(
         return std::ptr::null_mut();
     }
     config.identity = identity_config.identity;
+    // The embedded deniable node is ephemeral and keeps NOTHING on disk: the
+    // host app holds all state in its encrypted container, so writing veil's
+    // snapshot files (DHT values, RTT/Vivaldi/gateway tables, peer pubkeys,
+    // discovered-peer cache) to the working dir would be a deniability leak and
+    // the source of the `dht.values.persist.flush_err` warning. Apply-config is
+    // a reload that re-spawns the persist tasks from THIS config, so the switch
+    // must be set here too (not only in the deferred stub).
+    config.persist_enabled = false;
 
     let toml = match veil_cfg::render_config_to_string(&config) {
         Ok(s) => s,
