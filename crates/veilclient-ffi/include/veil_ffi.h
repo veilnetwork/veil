@@ -1630,6 +1630,13 @@ char *veil_config_compose(const uint8_t *identity_toml_ptr,
  * Pick an ephemeral, identity-free path for `admin_socket` (e.g. one under a
  * per-launch temp dir). Non-blocking; returns an opaque handle or null + err.
  *
+ * `anonymous` arms `[anonymity]` in the stub boot config so the node is
+ * actually onion-reachable once its real identity is applied. It MUST be set
+ * here (at boot) rather than via `veil_node_apply_config`: anonymity is pinned
+ * at startup and the later apply-config (a reload) does not re-apply it. The
+ * published onion descriptor is sealed against the live identity, so it
+ * resolves to the real identity once `veil_node_apply_config` promotes it.
+ *
  * # Safety
  * `admin_socket_ptr` must point to `admin_socket_len` readable bytes; `err_out`
  * (if non-null) must be a writable `*mut c_char` slot.
@@ -1637,6 +1644,7 @@ char *veil_config_compose(const uint8_t *identity_toml_ptr,
 
 VeilNode *veil_node_start_deferred(const uint8_t *admin_socket_ptr,
                                    size_t admin_socket_len,
+                                   bool anonymous,
                                    char **err_out)
 ;
 #endif
