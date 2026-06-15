@@ -1581,6 +1581,33 @@ int veil_pair_target_build_confirm(VeilHandle *handle,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Compose a full, bootable node config by combining a stored identity (the
+ * config TOML from `veil_config_init`, kept in the host's deniable container)
+ * with EPHEMERAL runtime endpoints chosen per launch: `listen_transport` (e.g.
+ * `tcp://127.0.0.1:9931`), `ipc_socket`, and `admin_socket` (filesystem paths,
+ * wrapped as `unix://`). None of these endpoints are identity-bearing, so they
+ * are not stored — only the identity is. Returns the merged config as TOML
+ * (free with `veil_free_string`), or NULL with `*err_out` set.
+ *
+ * # Safety
+ * Each `*_ptr` must point to its `*_len` readable bytes; `err_out` (if non-null)
+ * must be a writable `*mut c_char` slot.
+ */
+
+char *veil_config_compose(const uint8_t *identity_toml_ptr,
+                          size_t identity_toml_len,
+                          const uint8_t *listen_transport_ptr,
+                          size_t listen_transport_len,
+                          const uint8_t *ipc_socket_ptr,
+                          size_t ipc_socket_len,
+                          const uint8_t *admin_socket_ptr,
+                          size_t admin_socket_len,
+                          char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Start an embedded node from a config file at `config_path` (`(ptr,len)`,
  * UTF-8). Non-blocking. Returns an opaque handle, or null with `*err_out` set
  * (free it with `veil_free_string`).
