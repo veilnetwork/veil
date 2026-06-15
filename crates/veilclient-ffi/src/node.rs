@@ -252,7 +252,9 @@ pub unsafe extern "C" fn veil_node_start(
         unsafe { set_err(err_out, &format!("config load failed: {e}")) };
         return std::ptr::null_mut();
     }
-    start_thread(Some(path), None, err_out)
+    // Config-file mode carries its own `[anonymity]` in that file — the stub
+    // `anonymous` flag only applies to the deferred (config-less) boot.
+    start_thread(Some(path), None, false, err_out)
 }
 
 /// Start an embedded node in deferred-init mode: it boots under an ephemeral
@@ -264,6 +266,13 @@ pub unsafe extern "C" fn veil_node_start(
 /// Pick an ephemeral, identity-free path for `admin_socket` (e.g. one under a
 /// per-launch temp dir). Non-blocking; returns an opaque handle or null + err.
 ///
+/// `anonymous` arms `[anonymity]` in the stub boot config so the node is
+/// actually onion-reachable once its real identity is applied. It MUST be set
+/// here (at boot) rather than via `veil_node_apply_config`: anonymity is pinned
+/// at startup and the later apply-config (a reload) does not re-apply it. The
+/// published onion descriptor is sealed against the live identity, so it
+/// resolves to the real identity once `veil_node_apply_config` promotes it.
+///
 /// # Safety
 /// `admin_socket_ptr` must point to `admin_socket_len` readable bytes; `err_out`
 /// (if non-null) must be a writable `*mut c_char` slot.
@@ -271,6 +280,7 @@ pub unsafe extern "C" fn veil_node_start(
 pub unsafe extern "C" fn veil_node_start_deferred(
     admin_socket_ptr: *const u8,
     admin_socket_len: size_t,
+    anonymous: bool,
     err_out: *mut *mut c_char,
 ) -> *mut VeilNode {
     if admin_socket_ptr.is_null() {
@@ -285,12 +295,13 @@ pub unsafe extern "C" fn veil_node_start_deferred(
             return std::ptr::null_mut();
         }
     };
-    start_thread(None, Some(sock), err_out)
+    start_thread(None, Some(sock), anonymous, err_out)
 }
 
 fn start_thread(
     config: Option<PathBuf>,
     admin_socket: Option<PathBuf>,
+    anonymous: bool,
     err_out: *mut *mut c_char,
 ) -> *mut VeilNode {
     let (tx, rx) = oneshot::channel::<()>();
@@ -320,6 +331,7 @@ fn start_thread(
                     None => {
                         veil_node_runtime::admin::run_foreground_deferred_with_shutdown(
                             thread_admin_socket,
+                            anonymous,
                             shutdown,
                         )
                         .await
@@ -652,7 +664,8 @@ mod tests {
         unsafe { crate::veil_free_string(full_ptr) };
         eprintln!("=== composed config ===\n{full}\n=======================");
 
-        let node = unsafe { veil_node_start_deferred(admin.as_ptr(), admin.len(), &mut err) };
+        let node =
+            unsafe { veil_node_start_deferred(admin.as_ptr(), admin.len(), false, &mut err) };
         assert!(!node.is_null(), "start_deferred returned null");
 
         let rc = unsafe { veil_node_apply_config(node, full.as_ptr(), full.len(), &mut err) };

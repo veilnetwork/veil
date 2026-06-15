@@ -321,7 +321,17 @@ pub fn parse_toml_str(content: &str) -> Result<Config> {
 /// one.  The temp dir lives only for the daemon's process lifetime
 /// and does not need to be cleaned up explicitly — modern OSes reap
 /// `$TMPDIR` on reboot.
-pub fn build_stub_config_with_ephemeral_identity() -> Result<Config> {
+/// When `anonymous`, the stub boots with `[anonymity]` already armed
+/// (`onion_service` + `receive_anonymous`). This matters for deferred-init: the
+/// anonymity x25519 key + onion-publish task are created ONCE at boot from this
+/// config and are NOT re-applied on the later identity-promoting apply-config
+/// (reload freezes `[anonymity]` by design). The published blinded descriptor,
+/// however, is sealed against the LIVE identity at publish time, so once the
+/// real identity is applied the descriptor resolves to it — booting the stub
+/// "anonymous" is therefore the way to make a deferred node actually onion-
+/// reachable. The throwaway stub identity is never published (publish is
+/// periodic, not at boot, and the identity is replaced within seconds).
+pub fn build_stub_config_with_ephemeral_identity(anonymous: bool) -> Result<Config> {
     use crate::model::{IdentityConfig, SignatureAlgorithm};
 
     // A FIXED, pre-mined throwaway identity (valid canonical-difficulty PoW),
@@ -343,7 +353,7 @@ pub fn build_stub_config_with_ephemeral_identity() -> Result<Config> {
                 super::ConfigError::ValidationFailed(format!("derive stub node_id: {e}"))
             })?;
 
-    let config = Config {
+    let mut config = Config {
         identity: Some(IdentityConfig {
             algo: SignatureAlgorithm::Ed25519,
             role: Default::default(),
@@ -364,6 +374,15 @@ pub fn build_stub_config_with_ephemeral_identity() -> Result<Config> {
         }),
         ..Config::default()
     };
+    if anonymous {
+        // Arm anonymity at boot: this creates the device x25519 key and lets the
+        // onion-publish task run (the boot-time gate is
+        // `relay_capable || receive_anonymous || onion_service`). `relay_capable`
+        // stays false — being location-anonymous does not require carrying other
+        // nodes' circuits.
+        config.anonymity.onion_service = true;
+        config.anonymity.receive_anonymous = true;
+    }
     Ok(config)
 }
 

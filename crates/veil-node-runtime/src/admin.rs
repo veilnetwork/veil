@@ -1100,7 +1100,7 @@ pub async fn run_foreground_deferred() -> Result<()> {
     // Convenience wrapper: no external shutdown source (signals / admin-stop
     // still apply). Embedded hosts (the FFI `veil_node_stop`) want the
     // shutdown-aware variant below.
-    run_foreground_deferred_with_shutdown(None, std::future::pending::<()>()).await
+    run_foreground_deferred_with_shutdown(None, false, std::future::pending::<()>()).await
 }
 
 /// As [`run_foreground_deferred`] but awaits an additional `external_shutdown`
@@ -1108,8 +1108,14 @@ pub async fn run_foreground_deferred() -> Result<()> {
 /// FFI node runtime) can trigger a graceful stop of a deferred-init node.
 /// Without this the deferred node is unstoppable (the bare
 /// [`run_foreground_deferred`] hardcodes a `pending()` shutdown).
+///
+/// `anonymous` arms `[anonymity]` in the stub boot config so the deferred node
+/// is actually onion-reachable once its real identity is applied — see
+/// [`veil_cfg::build_stub_config_with_ephemeral_identity`] for why this must be
+/// set at boot rather than via the later apply-config.
 pub async fn run_foreground_deferred_with_shutdown<F>(
     admin_socket: Option<PathBuf>,
+    anonymous: bool,
     external_shutdown: F,
 ) -> Result<()>
 where
@@ -1117,7 +1123,7 @@ where
 {
     // Build stub config (CPU-heavy — runs PoW search; tolerated because
     // deferred-init is a one-time startup cost).
-    let mut stub_config = veil_cfg::build_stub_config_with_ephemeral_identity()
+    let mut stub_config = veil_cfg::build_stub_config_with_ephemeral_identity(anonymous)
         .map_err(crate::error::NodeError::Config)?;
 
     // Caller-chosen admin socket (embedded hosts pick an ephemeral, identity-free
@@ -3799,7 +3805,7 @@ mod tests {
     /// coverage from the existing tests below.
     #[test]
     fn defer_init_stub_config_is_valid() {
-        let cfg = veil_cfg::build_stub_config_with_ephemeral_identity()
+        let cfg = veil_cfg::build_stub_config_with_ephemeral_identity(false)
             .expect("stub-config builder must succeed under normal pow difficulty");
 
         // Identity present.
@@ -3821,12 +3827,48 @@ mod tests {
             "stub must not configure bootstrap peers"
         );
 
+        // Non-anonymous stub: anonymity stays OFF (the boot-time x25519-key gate
+        // is `relay_capable || receive_anonymous || onion_service`).
+        assert!(!cfg.anonymity.onion_service);
+        assert!(!cfg.anonymity.receive_anonymous);
+
         // Validation passes — that's the whole point of the PoW search
         // in the builder.
         let validation = veil_cfg::validate(&cfg);
         assert!(
             validation.is_valid(),
             "stub config must pass validation: {}",
+            validation.format_issues()
+        );
+    }
+
+    /// `anonymous = true` arms `[anonymity]` in the stub so the deferred node
+    /// creates its x25519 key + onion-publish task at boot (the descriptor then
+    /// publishes under the real identity applied post-boot). Without this the
+    /// boot-time gate leaves the key None and onion is disabled forever.
+    #[test]
+    fn defer_init_stub_config_anonymous_arms_anonymity() {
+        let cfg = veil_cfg::build_stub_config_with_ephemeral_identity(true)
+            .expect("anonymous stub-config builder must succeed");
+        assert!(
+            cfg.anonymity.onion_service,
+            "anonymous stub must enable onion_service"
+        );
+        assert!(
+            cfg.anonymity.receive_anonymous,
+            "anonymous stub must enable receive_anonymous"
+        );
+        // Being location-anonymous must NOT silently turn the node into a relay
+        // for others' circuits.
+        assert!(
+            !cfg.anonymity.relay_capable,
+            "anonymous stub must not become relay_capable"
+        );
+        // Still a valid, bootable stub.
+        let validation = veil_cfg::validate(&cfg);
+        assert!(
+            validation.is_valid(),
+            "anonymous stub config must pass validation: {}",
             validation.format_issues()
         );
     }
