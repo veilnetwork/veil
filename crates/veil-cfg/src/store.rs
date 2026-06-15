@@ -323,39 +323,22 @@ pub fn parse_toml_str(content: &str) -> Result<Config> {
 /// `$TMPDIR` on reboot.
 pub fn build_stub_config_with_ephemeral_identity() -> Result<Config> {
     use crate::model::{IdentityConfig, SignatureAlgorithm};
-    use veil_crypto as crypto;
 
-    let keypair = crypto::generate_keypair(SignatureAlgorithm::Ed25519);
-    let pow = crypto::search_nonce(crypto::PowParams {
-        algo: SignatureAlgorithm::Ed25519,
-        public_key: crypto::Base64PublicKey::new(
-            SignatureAlgorithm::Ed25519,
-            keypair.public_key.clone(),
-        )
-        .map_err(|e| super::ConfigError::ValidationFailed(format!("stub pk: {e}")))?,
-        private_key: crypto::Base64PrivateKey::new(
-            SignatureAlgorithm::Ed25519,
-            keypair.private_key.clone(),
-        )
-        .map_err(|e| super::ConfigError::ValidationFailed(format!("stub sk: {e}")))?,
-        target_zero_bits: crypto::DEFAULT_POW_DIFFICULTY,
-        timeout: std::time::Duration::from_secs(60),
-        start_from: crypto::Base64Nonce::zero(),
-        threads: crypto::available_thread_count(),
-        progress: None,
-    })
-    .map_err(|e| super::ConfigError::ValidationFailed(format!("stub pow search: {e}")))?;
-    if pow.stop_reason != crypto::PowStopReason::Found {
-        return Err(super::ConfigError::ValidationFailed(format!(
-            "stub PoW search did not converge (best={} bits, reason={:?})",
-            pow.best_zero_bits, pow.stop_reason
-        )));
-    }
-    // node_id MUST equal blake3(public_key) per structural validation
-    // rule `identity_node_id_matches_public_key` — pre-compute or
-    // validation rejects the stub.
-    let derived_node_id =
-        crate::model::NodeId::from_public_key(SignatureAlgorithm::Ed25519, &keypair.public_key)
+    // A FIXED, pre-mined throwaway identity (valid canonical-difficulty PoW),
+    // used ONLY to satisfy the config schema + boot validation in deferred-init
+    // mode. The node binds NO listeners under it and replaces it via the first
+    // apply-config BEFORE any traffic, so a shared constant is safe — and it
+    // avoids a per-boot PoW search that, at the canonical difficulty, can miss
+    // its timeout on slow hardware and fail the boot outright. (Generated once
+    // via `veil_config_init`; see the deferred path in veilclient-ffi.)
+    const STUB_PUBLIC_KEY: &str = "Owg2N56YdWIRcQCM2cQPBT1qUurTcE/tQ2njCiBW6Q8=";
+    const STUB_PRIVATE_KEY: &str = "q9j8l7T6NRwquBdwz0WvwqWZthOySfgFVs+CRx78EbI=";
+    const STUB_NONCE: &str = "AenuSA==";
+
+    // node_id MUST equal blake3(public_key) per the structural validation rule
+    // `identity_node_id_matches_public_key` — derive it from the fixed key.
+    let node_id =
+        crate::model::NodeId::from_public_key(SignatureAlgorithm::Ed25519, STUB_PUBLIC_KEY)
             .map_err(|e| {
                 super::ConfigError::ValidationFailed(format!("derive stub node_id: {e}"))
             })?;
@@ -364,10 +347,10 @@ pub fn build_stub_config_with_ephemeral_identity() -> Result<Config> {
         identity: Some(IdentityConfig {
             algo: SignatureAlgorithm::Ed25519,
             role: Default::default(),
-            public_key: keypair.public_key,
-            private_key: keypair.private_key,
-            nonce: pow.best_nonce.into_inner(),
-            node_id: Some(derived_node_id),
+            public_key: STUB_PUBLIC_KEY.to_owned(),
+            private_key: STUB_PRIVATE_KEY.to_owned(),
+            nonce: STUB_NONCE.to_owned(),
+            node_id: Some(node_id),
             key_passphrase: None,
             key_passphrase_file: None,
             // Don't prompt — stub mode is non-interactive by definition
