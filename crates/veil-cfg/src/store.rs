@@ -374,6 +374,17 @@ pub fn build_stub_config_with_ephemeral_identity(anonymous: bool) -> Result<Conf
         }),
         ..Config::default()
     };
+    // The deferred stub is ALWAYS an ephemeral node (its identity is replaced by
+    // the first apply-config, and the host app keeps no config.toml on disk).
+    // Turn off ALL on-disk persistence: persist tasks are spawned once at boot
+    // from this config (a later reload won't add them), and for an embedded
+    // deniable node writing snapshots — DHT values, RTT/Vivaldi/gateway tables,
+    // peer pubkeys, discovered-peer cache — to veil's working dir is both a
+    // deniability leak (network metadata in cleartext outside the container) and
+    // the source of the recurring `dht.values.persist.flush_err` warning (the
+    // default snapshot path doesn't exist on the deferred path). Nothing the
+    // messenger needs depends on it: it bootstraps via invites + live sessions.
+    config.persist_enabled = false;
     if anonymous {
         // Arm anonymity at boot: this creates the device x25519 key and lets the
         // onion-publish task run (the boot-time gate is

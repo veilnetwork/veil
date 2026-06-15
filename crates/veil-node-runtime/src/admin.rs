@@ -3832,6 +3832,13 @@ mod tests {
         assert!(!cfg.anonymity.onion_service);
         assert!(!cfg.anonymity.receive_anonymous);
 
+        // Ephemeral node: ALL on-disk persistence is off (no snapshot writes —
+        // deniability + no spurious flush errors on the deferred path).
+        assert!(
+            !cfg.persist_enabled,
+            "deferred stub must not persist to disk"
+        );
+
         // Validation passes — that's the whole point of the PoW search
         // in the builder.
         let validation = veil_cfg::validate(&cfg);
@@ -3864,6 +3871,8 @@ mod tests {
             !cfg.anonymity.relay_capable,
             "anonymous stub must not become relay_capable"
         );
+        // Ephemeral even when anonymous — persistence stays off.
+        assert!(!cfg.persist_enabled);
         // Still a valid, bootable stub.
         let validation = veil_cfg::validate(&cfg);
         assert!(
