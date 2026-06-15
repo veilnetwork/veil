@@ -43,6 +43,48 @@ async fn node_state_builds_from_config() {
     let _ = fs::remove_file(path);
 }
 
+/// The deferred-boot `anonymous` flag must actually arm onion at the RUNTIME
+/// level, not just in the config struct: a node booted from the anonymous stub
+/// config hosts an onion service (`anonymity.onion_service_hops = Some`), while
+/// the plain stub does not. This is what makes a deferred node onion-reachable
+/// once its real identity is applied (the descriptor publishes under the live
+/// identity). Guards the xVeil "Route anonymously" path end to end on the veil
+/// side.
+#[tokio::test(flavor = "current_thread")]
+async fn deferred_anonymous_stub_arms_onion_at_runtime() {
+    // Plain deferred stub: NOT hosting an onion service.
+    let plain = save_test_config(
+        "stub-plain",
+        veil_cfg::build_stub_config_with_ephemeral_identity(false).unwrap(),
+    )
+    .unwrap();
+    let mut rt = NodeRuntime::start(&plain, true)
+        .await
+        .expect("plain stub starts");
+    assert!(
+        rt.anonymity.onion_service_hops.is_none(),
+        "non-anonymous stub must not host an onion service"
+    );
+    rt.stop().await.expect("plain stub stops");
+    let _ = fs::remove_file(plain);
+
+    // Anonymous deferred stub: onion IS armed at boot.
+    let anon = save_test_config(
+        "stub-anon",
+        veil_cfg::build_stub_config_with_ephemeral_identity(true).unwrap(),
+    )
+    .unwrap();
+    let mut rt = NodeRuntime::start(&anon, true)
+        .await
+        .expect("anonymous stub starts");
+    assert!(
+        rt.anonymity.onion_service_hops.is_some(),
+        "anonymous stub must arm the onion service at boot"
+    );
+    rt.stop().await.expect("anon stub stops");
+    let _ = fs::remove_file(anon);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn inbound_listen_creates_session() {
     let path =
