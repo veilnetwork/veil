@@ -33,6 +33,66 @@ unsafe fn set_err(err_out: *mut *mut c_char, msg: &str) {
     unsafe { *err_out = c.into_raw() };
 }
 
+/// Provision a fresh node identity IN-PROCESS — generate an Ed25519 keypair and
+/// mine its proof-of-work nonce — and return a ready-to-use config (TOML)
+/// carrying that identity, WITHOUT writing anything to disk. The host stores the
+/// returned bytes inside its own (deniable) container, so nothing
+/// identity-bearing (private key, node_id) ever touches the filesystem. This is
+/// the in-process replacement for `veil-cli config init` on mobile / sandboxed
+/// hosts.
+///
+/// `difficulty` is the PoW difficulty in leading zero bits; pass `0` for the
+/// canonical default. Mining runs synchronously on the calling thread (it can
+/// take a while), so call this off the host's UI thread.
+///
+/// Returns a newly allocated C string (free it with `veil_free_string`) on
+/// success, or NULL with `*err_out` set on failure.
+///
+/// # Safety
+/// `err_out` (if non-null) must be a writable `*mut c_char` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_config_init(
+    difficulty: u32,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    use veil_cfg::identity_ops::{IdentityPowParams, IdentityProvisionParams, IdentityUseCases};
+
+    let defaults = IdentityProvisionParams::default();
+    let pow = if difficulty == 0 {
+        IdentityPowParams::default()
+    } else {
+        IdentityPowParams {
+            difficulty,
+            ..IdentityPowParams::default()
+        }
+    };
+    let identity = match IdentityUseCases::new(pow).provision(defaults.algo, None) {
+        Ok(id) => id,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("identity provisioning failed: {e}")) };
+            return std::ptr::null_mut();
+        }
+    };
+    let config = veil_cfg::Config {
+        identity: Some(identity),
+        ..veil_cfg::Config::default()
+    };
+    let toml = match veil_cfg::render_config_to_string(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("config render failed: {e}")) };
+            return std::ptr::null_mut();
+        }
+    };
+    match CString::new(toml) {
+        Ok(c) => c.into_raw(),
+        Err(_) => {
+            unsafe { set_err(err_out, "rendered config contained a NUL byte") };
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Start an embedded node from a config file at `config_path` (`(ptr,len)`,
 /// UTF-8). Non-blocking. Returns an opaque handle, or null with `*err_out` set
 /// (free it with `veil_free_string`).
@@ -175,5 +235,26 @@ mod tests {
                 crate::veil_free_string(err);
             }
         }
+    }
+
+    #[test]
+    fn config_init_mines_identity_in_memory() {
+        let mut err: *mut c_char = std::ptr::null_mut();
+        // Low difficulty so the test is fast — the default is intentionally slow.
+        let out = unsafe { veil_config_init(8, &mut err) };
+        assert!(!out.is_null(), "expected a config string");
+        assert!(err.is_null(), "no error expected");
+        let toml = unsafe { CStr::from_ptr(out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(out) };
+
+        // The returned bytes are a parseable config carrying a usable identity —
+        // and nothing was written to disk to produce it.
+        let cfg = veil_cfg::parse_toml_str(&toml).expect("config parses back");
+        let id = cfg.identity.expect("identity present");
+        assert!(!id.private_key.is_empty(), "has a private key");
+        assert!(!id.public_key.is_empty(), "has a public key");
+        assert!(id.node_id.is_some(), "has a node_id");
     }
 }

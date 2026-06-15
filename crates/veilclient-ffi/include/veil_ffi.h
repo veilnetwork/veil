@@ -1558,6 +1558,29 @@ int veil_pair_target_build_confirm(VeilHandle *handle,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Provision a fresh node identity IN-PROCESS — generate an Ed25519 keypair and
+ * mine its proof-of-work nonce — and return a ready-to-use config (TOML)
+ * carrying that identity, WITHOUT writing anything to disk. The host stores the
+ * returned bytes inside its own (deniable) container, so nothing
+ * identity-bearing (private key, node_id) ever touches the filesystem. This is
+ * the in-process replacement for `veil-cli config init` on mobile / sandboxed
+ * hosts.
+ *
+ * `difficulty` is the PoW difficulty in leading zero bits; pass `0` for the
+ * canonical default. Mining runs synchronously on the calling thread (it can
+ * take a while), so call this off the host's UI thread.
+ *
+ * Returns a newly allocated C string (free it with `veil_free_string`) on
+ * success, or NULL with `*err_out` set on failure.
+ *
+ * # Safety
+ * `err_out` (if non-null) must be a writable `*mut c_char` slot.
+ */
+ char *veil_config_init(uint32_t difficulty, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Start an embedded node from a config file at `config_path` (`(ptr,len)`,
  * UTF-8). Non-blocking. Returns an opaque handle, or null with `*err_out` set
  * (free it with `veil_free_string`).
