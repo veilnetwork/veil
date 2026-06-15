@@ -407,9 +407,14 @@ pub unsafe extern "C" fn veil_node_apply_config(
             return -1;
         }
     };
+    // A deferred node binds its admin socket only AFTER mining its ephemeral
+    // stub identity, which at the canonical PoW difficulty can take tens of
+    // seconds. Retry connecting generously (returns immediately once admin is
+    // up); the ceiling only matters if the node never comes up at all.
+    const APPLY_CONNECT_ATTEMPTS: usize = 900; // ~90 s @ 100 ms
     let outcome = rt.block_on(async {
         let mut last_err = String::from("admin socket never became ready");
-        for _ in 0..50 {
+        for _ in 0..APPLY_CONNECT_ATTEMPTS {
             let cmd = veil_node_runtime::admin::AdminCommand::ApplyConfig {
                 toml_content: toml_content.clone(),
                 persist: false,
@@ -602,5 +607,63 @@ mod tests {
             .into_owned();
         assert!(msg.contains("deferred"), "got: {msg}");
         unsafe { crate::veil_free_string(err) };
+    }
+
+    // Reproduces the xVeil deniable-boot flow end to end: provision an identity,
+    // compose a full config around ephemeral sockets, start a deferred node, and
+    // promote it with apply-config. Heavy (boots a real node) — run explicitly:
+    //   cargo test -p veilclient-ffi --features node-embedded \
+    //     deferred_boot_then_apply -- --ignored --nocapture
+    #[test]
+    #[ignore = "boots a real node; run with --ignored --nocapture"]
+    fn deferred_boot_then_apply_brings_node_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin = dir.path().join("admin.sock").to_string_lossy().into_owned();
+        let ipc = dir.path().join("app.sock").to_string_lossy().into_owned();
+        let listen = "tcp://127.0.0.1:19099";
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        // difficulty 0 = canonical (matches the app); an 8-bit identity would be
+        // rejected by apply-config validation (floor is DEFAULT_POW_DIFFICULTY).
+        let id_ptr = unsafe { veil_config_init(0, &mut err) };
+        assert!(!id_ptr.is_null(), "config_init failed");
+        let id_toml = unsafe { CStr::from_ptr(id_ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(id_ptr) };
+
+        let full_ptr = unsafe {
+            veil_config_compose(
+                id_toml.as_ptr(),
+                id_toml.len(),
+                listen.as_ptr(),
+                listen.len(),
+                ipc.as_ptr(),
+                ipc.len(),
+                admin.as_ptr(),
+                admin.len(),
+                &mut err,
+            )
+        };
+        assert!(!full_ptr.is_null(), "compose failed");
+        let full = unsafe { CStr::from_ptr(full_ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(full_ptr) };
+        eprintln!("=== composed config ===\n{full}\n=======================");
+
+        let node = unsafe { veil_node_start_deferred(admin.as_ptr(), admin.len(), &mut err) };
+        assert!(!node.is_null(), "start_deferred returned null");
+
+        let rc = unsafe { veil_node_apply_config(node, full.as_ptr(), full.len(), &mut err) };
+        let apply_err = if err.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        unsafe { veil_node_stop(node) };
+        assert_eq!(rc, 0, "apply_config failed: {apply_err}");
     }
 }
