@@ -99,6 +99,128 @@ pub unsafe extern "C" fn veil_config_init(
     }
 }
 
+/// Read a `(ptr, len)` UTF-8 argument into an owned `String`, or set `*err_out`
+/// and return `None`. `what` names the argument for the error message.
+unsafe fn read_arg(
+    ptr: *const u8,
+    len: size_t,
+    what: &str,
+    err_out: *mut *mut c_char,
+) -> Option<String> {
+    if ptr.is_null() {
+        unsafe { set_err(err_out, &format!("{what} is null")) };
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Some(s.to_owned()),
+        Err(_) => {
+            unsafe { set_err(err_out, &format!("{what} is not valid UTF-8")) };
+            None
+        }
+    }
+}
+
+/// Compose a full, bootable node config by combining a stored identity (the
+/// config TOML from `veil_config_init`, kept in the host's deniable container)
+/// with EPHEMERAL runtime endpoints chosen per launch: `listen_transport` (e.g.
+/// `tcp://127.0.0.1:9931`), `ipc_socket`, and `admin_socket` (filesystem paths,
+/// wrapped as `unix://`). None of these endpoints are identity-bearing, so they
+/// are not stored — only the identity is. Returns the merged config as TOML
+/// (free with `veil_free_string`), or NULL with `*err_out` set.
+///
+/// # Safety
+/// Each `*_ptr` must point to its `*_len` readable bytes; `err_out` (if non-null)
+/// must be a writable `*mut c_char` slot.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn veil_config_compose(
+    identity_toml_ptr: *const u8,
+    identity_toml_len: size_t,
+    listen_transport_ptr: *const u8,
+    listen_transport_len: size_t,
+    ipc_socket_ptr: *const u8,
+    ipc_socket_len: size_t,
+    admin_socket_ptr: *const u8,
+    admin_socket_len: size_t,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    let identity_toml = match unsafe {
+        read_arg(
+            identity_toml_ptr,
+            identity_toml_len,
+            "identity_toml",
+            err_out,
+        )
+    } {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let listen = match unsafe {
+        read_arg(
+            listen_transport_ptr,
+            listen_transport_len,
+            "listen_transport",
+            err_out,
+        )
+    } {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let ipc = match unsafe { read_arg(ipc_socket_ptr, ipc_socket_len, "ipc_socket", err_out) } {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let admin =
+        match unsafe { read_arg(admin_socket_ptr, admin_socket_len, "admin_socket", err_out) } {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+
+    // Build the runtime endpoints as a TOML template so veil-cfg parses them
+    // into the right structs (no hand-constructed ListenConfig), then graft on
+    // the stored identity.
+    let template = format!(
+        "[[listen]]\nid = \"0x00000001\"\ntransport = \"{listen}\"\n\n\
+         [ipc]\nenabled = true\nsocket_uri = \"unix://{ipc}\"\n\n\
+         [global]\nadmin_socket = \"unix://{admin}\"\n"
+    );
+    let mut config = match veil_cfg::parse_toml_str(&template) {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("runtime template parse failed: {e}")) };
+            return std::ptr::null_mut();
+        }
+    };
+    let identity_config = match veil_cfg::parse_toml_str(&identity_toml) {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("identity parse failed: {e}")) };
+            return std::ptr::null_mut();
+        }
+    };
+    if identity_config.identity.is_none() {
+        unsafe { set_err(err_out, "identity_toml carries no [Identity]") };
+        return std::ptr::null_mut();
+    }
+    config.identity = identity_config.identity;
+
+    let toml = match veil_cfg::render_config_to_string(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("config render failed: {e}")) };
+            return std::ptr::null_mut();
+        }
+    };
+    match CString::new(toml) {
+        Ok(c) => c.into_raw(),
+        Err(_) => {
+            unsafe { set_err(err_out, "rendered config contained a NUL byte") };
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Start an embedded node from a config file at `config_path` (`(ptr,len)`,
 /// UTF-8). Non-blocking. Returns an opaque handle, or null with `*err_out` set
 /// (free it with `veil_free_string`).
@@ -388,6 +510,62 @@ mod tests {
         assert!(!id.private_key.is_empty(), "has a private key");
         assert!(!id.public_key.is_empty(), "has a public key");
         assert!(id.node_id.is_some(), "has a node_id");
+    }
+
+    #[test]
+    fn config_compose_merges_identity_with_runtime() {
+        // Mine an identity (the bytes a host stores in its container) ...
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let id_out = unsafe { veil_config_init(8, &mut err) };
+        assert!(!id_out.is_null());
+        let identity_toml = unsafe { CStr::from_ptr(id_out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(id_out) };
+
+        // ... then compose a bootable config around it with ephemeral endpoints.
+        let listen = b"tcp://127.0.0.1:9931";
+        let ipc = b"/tmp/xveil-test-ipc.sock";
+        let admin = b"/tmp/xveil-test-admin.sock";
+        let out = unsafe {
+            veil_config_compose(
+                identity_toml.as_ptr(),
+                identity_toml.len(),
+                listen.as_ptr(),
+                listen.len(),
+                ipc.as_ptr(),
+                ipc.len(),
+                admin.as_ptr(),
+                admin.len(),
+                &mut err,
+            )
+        };
+        assert!(!out.is_null(), "compose returned null");
+        let full = unsafe { CStr::from_ptr(out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(out) };
+
+        let cfg = veil_cfg::parse_toml_str(&full).expect("composed config parses");
+        // Identity preserved...
+        assert!(cfg.identity.is_some(), "identity merged in");
+        // ...and the runtime endpoints are present so the node can actually run.
+        assert_eq!(cfg.listen.len(), 1, "one listener");
+        assert!(cfg.ipc.enabled, "ipc enabled");
+        assert!(
+            cfg.ipc
+                .socket_uri
+                .as_deref()
+                .unwrap_or("")
+                .contains("xveil-test-ipc.sock")
+        );
+        assert!(
+            cfg.global
+                .admin_socket
+                .as_deref()
+                .unwrap_or("")
+                .contains("xveil-test-admin.sock")
+        );
     }
 
     #[test]
