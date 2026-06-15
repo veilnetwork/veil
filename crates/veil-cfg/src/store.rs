@@ -411,6 +411,15 @@ pub fn render_config(path: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Render `config` to its serialized TOML form **without touching the
+/// filesystem**. For callers that need the config bytes in memory rather than
+/// on disk — e.g. the embedded-node FFI returning a freshly provisioned
+/// identity so a host app can store it inside its own (deniable) container
+/// instead of a plaintext `config.toml`.
+pub fn render_config_to_string(config: &Config) -> Result<String> {
+    format::backend(FileFormat::Toml).render(config)
+}
+
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     let format = FileFormat::from_path(path)?;
     let backend = format::backend(format);
