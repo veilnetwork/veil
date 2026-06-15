@@ -1594,13 +1594,48 @@ int veil_pair_target_build_confirm(VeilHandle *handle,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Start an embedded node in deferred-init mode (ephemeral identity, no config
- * file). Supply the real config later over the node's admin IPC.
+ * Start an embedded node in deferred-init mode: it boots under an ephemeral
+ * throwaway identity, binds ONLY the admin socket at `admin_socket` (`(ptr,
+ * len)`, UTF-8 filesystem path), and waits. Promote it to its real identity by
+ * pushing a config with `veil_node_apply_config` — so the real private key
+ * never has to be written to a config file on disk.
+ *
+ * Pick an ephemeral, identity-free path for `admin_socket` (e.g. one under a
+ * per-launch temp dir). Non-blocking; returns an opaque handle or null + err.
  *
  * # Safety
- * `err_out` (if non-null) must be a writable `*mut c_char` slot.
+ * `admin_socket_ptr` must point to `admin_socket_len` readable bytes; `err_out`
+ * (if non-null) must be a writable `*mut c_char` slot.
  */
- VeilNode *veil_node_start_deferred(char **err_out) ;
+
+VeilNode *veil_node_start_deferred(const uint8_t *admin_socket_ptr,
+                                   size_t admin_socket_len,
+                                   char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Promote a deferred-init node to its real identity by applying `config_toml`
+ * (`(ptr, len)`, UTF-8 — e.g. the bytes returned by `veil_config_init` and
+ * kept in the host's deniable storage) over the node's admin socket, IN MEMORY
+ * (`persist = false`, so nothing is written to disk). Retries briefly while the
+ * deferred node finishes binding its admin socket.
+ *
+ * The node must have been started with `veil_node_start_deferred`. Returns 0 on
+ * success, -1 on failure with `*err_out` set (free it with `veil_free_string`).
+ *
+ * # Safety
+ * `node` must be a live handle from `veil_node_start_deferred`; `config_ptr`
+ * must point to `config_len` readable bytes; `err_out` (if non-null) must be a
+ * writable `*mut c_char` slot.
+ */
+
+int veil_node_apply_config(const VeilNode *node,
+                           const uint8_t *config_ptr,
+                           size_t config_len,
+                           char **err_out)
+;
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)

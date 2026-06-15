@@ -1100,7 +1100,7 @@ pub async fn run_foreground_deferred() -> Result<()> {
     // Convenience wrapper: no external shutdown source (signals / admin-stop
     // still apply). Embedded hosts (the FFI `veil_node_stop`) want the
     // shutdown-aware variant below.
-    run_foreground_deferred_with_shutdown(std::future::pending::<()>()).await
+    run_foreground_deferred_with_shutdown(None, std::future::pending::<()>()).await
 }
 
 /// As [`run_foreground_deferred`] but awaits an additional `external_shutdown`
@@ -1108,14 +1108,24 @@ pub async fn run_foreground_deferred() -> Result<()> {
 /// FFI node runtime) can trigger a graceful stop of a deferred-init node.
 /// Without this the deferred node is unstoppable (the bare
 /// [`run_foreground_deferred`] hardcodes a `pending()` shutdown).
-pub async fn run_foreground_deferred_with_shutdown<F>(external_shutdown: F) -> Result<()>
+pub async fn run_foreground_deferred_with_shutdown<F>(
+    admin_socket: Option<PathBuf>,
+    external_shutdown: F,
+) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     // Build stub config (CPU-heavy — runs PoW search; tolerated because
     // deferred-init is a one-time startup cost).
-    let stub_config = veil_cfg::build_stub_config_with_ephemeral_identity()
+    let mut stub_config = veil_cfg::build_stub_config_with_ephemeral_identity()
         .map_err(crate::error::NodeError::Config)?;
+
+    // Caller-chosen admin socket (embedded hosts pick an ephemeral, identity-free
+    // path they can reach with `apply-config`). Otherwise the default — derived
+    // from the per-run temp config path below — is used.
+    if let Some(sock) = &admin_socket {
+        stub_config.global.admin_socket = Some(format!("unix://{}", sock.display()));
+    }
 
     // Per-run temp working dir (mlkem.key + future identity_document.bin land
     // here). Created ATOMICALLY by `tempfile`: `O_EXCL` mkdir, mode 0700, and a
