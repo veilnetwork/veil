@@ -38,10 +38,23 @@ plugin glue for push-notification wake (Epic 489.10).
   s.pod_target_xcconfig = {
     'DEFINES_MODULE'   => 'YES',
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
-    # Static lib carries Rust runtime symbols; tell linker не к
-    # complain about unresolved symbols at the dylib stage — they're
-    # resolved at the final-app link.
-    'OTHER_LDFLAGS'    => '-lc++',
+    # The Dart side resolves the Rust FFI symbols at runtime via
+    # `DynamicLibrary.process()` (RTLD_DEFAULT) — there is no Swift call path
+    # to `veil_connect` / `veil_node_start_deferred` at compile time. Plain
+    # `vendored_libraries` linking pulls only the archive objects the compiled
+    # code REFERENCES; since nothing references the Rust symbols at link time,
+    # the linker pulls ZERO objects and the app ships without a single Rust
+    # symbol — `dlsym` fails at the first FFI call. `-force_load` pulls every
+    # object from the archive so the symbols are present and exported for the
+    # process-scope lookup. (hidden_volume's podspec does the same.)
+    # `-force_load` pulls every Rust object (FFI symbols are only referenced at
+    # runtime via dlsym, so plain linking would strip them). The `-framework`
+    # flags satisfy system deps the Rust staticlib references but cannot declare:
+    # SystemConfiguration (the `system-configuration` crate — `SCDynamicStore*`,
+    # network/proxy reachability) and Security (keychain / SecRandom in the TLS +
+    # crypto stack). Folded into OTHER_LDFLAGS because `s.frameworks` does not
+    # emit `-framework` under `use_frameworks!` for a vendored-staticlib pod.
+    'OTHER_LDFLAGS'    => '-lc++ -force_load "${PODS_TARGET_SRCROOT}/Frameworks/libveilclient_ffi.a" -framework SystemConfiguration -framework Security',
   }
 
   s.swift_version = '5.0'

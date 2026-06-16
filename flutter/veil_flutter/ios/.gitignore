@@ -1,0 +1,4 @@
+# The Rust staticlib is a build artifact, produced per-arch by
+# scripts/build-mobile.sh and dropped here for the podspec's
+# vendored_libraries. Never commit it (54MB+); rebuild on demand.
+Frameworks/
