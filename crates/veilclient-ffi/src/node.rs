@@ -427,10 +427,14 @@ pub unsafe extern "C" fn veil_node_apply_config(
             return -1;
         }
     };
-    // A deferred node binds its admin socket only AFTER mining its ephemeral
-    // stub identity, which at the canonical PoW difficulty can take tens of
-    // seconds. Retry connecting generously (returns immediately once admin is
-    // up); the ceiling only matters if the node never comes up at all.
+    // A deferred node binds its admin socket only once its runtime is up. The
+    // stub identity is a FIXED pre-mined constant (see
+    // `build_stub_config_with_ephemeral_identity`, `lazy_mining = false`), so
+    // there is NO per-boot PoW search — admin normally comes up within a second
+    // or two (tokio runtime spin-up + socket bind). The first attempt fires
+    // immediately and we only sleep AFTER a failed connect, so this returns the
+    // instant admin is ready. The generous ceiling is purely a failsafe for a
+    // node that never comes up at all (e.g. a port it can't bind).
     const APPLY_CONNECT_ATTEMPTS: usize = 900; // ~90 s @ 100 ms
     let outcome = rt.block_on(async {
         let mut last_err = String::from("admin socket never became ready");
