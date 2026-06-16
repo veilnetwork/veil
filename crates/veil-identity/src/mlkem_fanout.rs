@@ -60,6 +60,10 @@ use veil_proto::prekey_bundle::ALGO_ML_KEM_768;
 const AEAD_INFO_PREFIX: &[u8] = b"veil.mlkem_fanout.v1";
 const AEAD_NONCE_LEN: usize = 12;
 
+/// Wire-format version for a serialized fan-out blob (see [`encode_fanout_blob`]).
+/// Bump on any layout change so an old reader rejects a new blob cleanly.
+const FANOUT_BLOB_VERSION: u8 = 1;
+
 /// hard cap on the number of recipient certs
 /// passed to a single [`fanout_encrypt`] call. Each cert triggers an
 /// ML-KEM-768 encapsulation (~1.1 KiB ciphertext + AEAD work), so an
@@ -93,6 +97,8 @@ pub enum MlkemFanoutError {
     NoEnvelopeForInstance,
     #[error("too many fan-out certs ({given} > cap {cap})")]
     TooManyCerts { given: usize, cap: usize },
+    #[error("malformed fan-out blob: {0}")]
+    MalformedBlob(&'static str),
 }
 
 // ── Cert verification ────────────────────────────────────────────────────────
@@ -405,6 +411,139 @@ fn fanout_aad(
     aad.extend_from_slice(recipient_instance_id);
     aad.extend_from_slice(&cert_version.to_be_bytes());
     aad
+}
+
+// ── Blob serialization ───────────────────────────────────────────────────────
+//
+// A fan-out send produces `Vec<FanoutEnvelope>`, but neither `FanoutEnvelope`
+// nor the `Vec` has an on-the-wire form — and a store-and-forward use (mailbox
+// blob) needs to persist + later parse one. These two functions are that wire
+// format. The encoder is total; the decoder is the ONLY place that parses
+// attacker-supplied bytes, so it is length-prefix-strict and bounds-checked at
+// every step (never trusts a length, never over-reads, rejects trailing bytes).
+//
+// Layout (all integers big-endian):
+//   version: u8 (= FANOUT_BLOB_VERSION)
+//   count:   u8 (number of envelopes; <= MAX_FANOUT_CERTS)
+//   count × envelope:
+//     recipient_instance_id: 16 bytes
+//     cert_version:          u64
+//     kem_ciphertext:        u32 len + bytes
+//     nonce:                 AEAD_NONCE_LEN (12) bytes
+//     aead_ciphertext:       u32 len + bytes
+
+/// Serialize fan-out `envelopes` into a single self-describing blob. Inverse of
+/// [`decode_fanout_blob`]. Caps at [`MAX_FANOUT_CERTS`] (the same bound
+/// [`fanout_encrypt`] enforces), so a `Vec` produced by `fanout_encrypt` always
+/// round-trips.
+pub fn encode_fanout_blob(
+    envelopes: &[FanoutEnvelope],
+) -> Result<Vec<u8>, MlkemFanoutError> {
+    if envelopes.len() > MAX_FANOUT_CERTS {
+        return Err(MlkemFanoutError::TooManyCerts {
+            given: envelopes.len(),
+            cap: MAX_FANOUT_CERTS,
+        });
+    }
+    let mut out = Vec::new();
+    out.push(FANOUT_BLOB_VERSION);
+    out.push(envelopes.len() as u8); // <= MAX_FANOUT_CERTS (16) fits a u8
+    for e in envelopes {
+        out.extend_from_slice(&e.recipient_instance_id);
+        out.extend_from_slice(&e.cert_version.to_be_bytes());
+        // ML-KEM ciphertext + AEAD ciphertext are well under u32::MAX; encode
+        // their lengths defensively so the decoder can bound-check.
+        out.extend_from_slice(&(e.kem_ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&e.kem_ciphertext);
+        out.extend_from_slice(&e.nonce);
+        out.extend_from_slice(&(e.aead_ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&e.aead_ciphertext);
+    }
+    Ok(out)
+}
+
+/// A cursor over untrusted input that never reads past the end.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], MlkemFanoutError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|end| *end <= self.buf.len())
+            .ok_or(MlkemFanoutError::MalformedBlob("unexpected end of blob"))?;
+        let out = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> Result<u8, MlkemFanoutError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, MlkemFanoutError> {
+        let b = self.take(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, MlkemFanoutError> {
+        let b = self.take(8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(b);
+        Ok(u64::from_be_bytes(a))
+    }
+
+    /// Read a u32-length-prefixed byte string. The length is validated against
+    /// the remaining input by [`take`], so a forged huge length can never cause
+    /// an over-read or an out-of-proportion allocation.
+    fn var_bytes(&mut self) -> Result<Vec<u8>, MlkemFanoutError> {
+        let n = self.u32()? as usize;
+        Ok(self.take(n)?.to_vec())
+    }
+}
+
+/// Parse a blob produced by [`encode_fanout_blob`]. The inverse direction, and
+/// the security-sensitive one: it operates on untrusted bytes. Rejects a wrong
+/// version, an over-cap count, any truncation/over-read, and trailing bytes.
+pub fn decode_fanout_blob(blob: &[u8]) -> Result<Vec<FanoutEnvelope>, MlkemFanoutError> {
+    let mut r = Reader::new(blob);
+    let version = r.u8()?;
+    if version != FANOUT_BLOB_VERSION {
+        return Err(MlkemFanoutError::MalformedBlob("unsupported blob version"));
+    }
+    let count = r.u8()? as usize;
+    if count > MAX_FANOUT_CERTS {
+        return Err(MlkemFanoutError::MalformedBlob("envelope count over cap"));
+    }
+    let mut envelopes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut recipient_instance_id = [0u8; 16];
+        recipient_instance_id.copy_from_slice(r.take(16)?);
+        let cert_version = r.u64()?;
+        let kem_ciphertext = r.var_bytes()?;
+        let mut nonce = [0u8; AEAD_NONCE_LEN];
+        nonce.copy_from_slice(r.take(AEAD_NONCE_LEN)?);
+        let aead_ciphertext = r.var_bytes()?;
+        envelopes.push(FanoutEnvelope {
+            recipient_instance_id,
+            cert_version,
+            kem_ciphertext,
+            nonce,
+            aead_ciphertext,
+        });
+    }
+    // No trailing bytes: a strict parser refuses ambiguous input.
+    if r.pos != blob.len() {
+        return Err(MlkemFanoutError::MalformedBlob("trailing bytes after blob"));
+    }
+    Ok(envelopes)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -849,5 +988,128 @@ mod tests {
             matches!(err, MlkemFanoutError::NoEnvelopeForInstance),
             "{err:?}"
         );
+    }
+
+    // ── Blob serialization ───────────────────────────────────────────────────
+
+    /// Build `n` distinct structural envelopes (not cryptographically valid —
+    /// for exercising the serializer's framing, which is crypto-agnostic).
+    fn dummy_envelopes(n: usize) -> Vec<FanoutEnvelope> {
+        (0..n)
+            .map(|i| FanoutEnvelope {
+                recipient_instance_id: [i as u8; 16],
+                cert_version: (i as u64) << 40 | 0xABCD, // exercise the full u64
+                kem_ciphertext: vec![i as u8; 1088], // ML-KEM-768 ct size-ish
+                nonce: [i as u8 ^ 0x5A; AEAD_NONCE_LEN],
+                aead_ciphertext: vec![0xFFu8 ^ i as u8; 40 + i],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fanout_blob_round_trips_structurally() {
+        for n in [0usize, 1, 2, MAX_FANOUT_CERTS] {
+            let envs = dummy_envelopes(n);
+            let blob = encode_fanout_blob(&envs).unwrap();
+            let back = decode_fanout_blob(&blob).unwrap();
+            assert_eq!(envs, back, "round-trip mismatch for n={n}");
+        }
+    }
+
+    #[test]
+    fn fanout_blob_preserves_crypto_round_trip() {
+        // The real proof: serialize a genuine envelope, parse it back, and the
+        // recovered envelope still decrypts to the original plaintext.
+        let env = build_env();
+        let cert = build_cert(&env);
+        let verified = verify_mlkem_cert(&cert, &env.doc, env.now_unix_secs).unwrap();
+        let sender_id = [0xABu8; 32];
+        let envelopes = fanout_encrypt(
+            b"sealed for the mailbox",
+            std::slice::from_ref(&verified),
+            &sender_id,
+            &env.doc.node_id,
+        )
+        .unwrap();
+
+        let blob = encode_fanout_blob(&envelopes).unwrap();
+        let parsed = decode_fanout_blob(&blob).unwrap();
+
+        let pt = fanout_decrypt_one(
+            &parsed,
+            &verified.instance_id,
+            &env.doc.node_id,
+            &sender_id,
+            &env.mlkem_dk_seed,
+            cert.cert_version,
+        )
+        .unwrap();
+        assert_eq!(&*pt, b"sealed for the mailbox");
+    }
+
+    #[test]
+    fn encode_rejects_over_cap() {
+        let envs = dummy_envelopes(MAX_FANOUT_CERTS + 1);
+        let err = encode_fanout_blob(&envs).unwrap_err();
+        assert!(matches!(err, MlkemFanoutError::TooManyCerts { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn decode_rejects_empty_input() {
+        let err = decode_fanout_blob(&[]).unwrap_err();
+        assert!(matches!(err, MlkemFanoutError::MalformedBlob(_)), "{err:?}");
+    }
+
+    #[test]
+    fn decode_rejects_wrong_version() {
+        let mut blob = encode_fanout_blob(&dummy_envelopes(1)).unwrap();
+        blob[0] = FANOUT_BLOB_VERSION.wrapping_add(1);
+        let err = decode_fanout_blob(&blob).unwrap_err();
+        assert!(matches!(err, MlkemFanoutError::MalformedBlob(_)), "{err:?}");
+    }
+
+    #[test]
+    fn decode_rejects_over_cap_count() {
+        // A header claiming more envelopes than the cap is refused before any
+        // per-envelope parsing.
+        let blob = [FANOUT_BLOB_VERSION, (MAX_FANOUT_CERTS + 1) as u8];
+        let err = decode_fanout_blob(&blob).unwrap_err();
+        assert!(matches!(err, MlkemFanoutError::MalformedBlob(_)), "{err:?}");
+    }
+
+    #[test]
+    fn decode_rejects_truncation_at_every_length() {
+        // Lopping off ANY suffix must yield a clean error, never a panic or a
+        // partial parse — the decoder bound-checks every read.
+        let blob = encode_fanout_blob(&dummy_envelopes(2)).unwrap();
+        for cut in 1..blob.len() {
+            let err = decode_fanout_blob(&blob[..cut]).unwrap_err();
+            assert!(
+                matches!(err, MlkemFanoutError::MalformedBlob(_)),
+                "cut={cut}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let mut blob = encode_fanout_blob(&dummy_envelopes(1)).unwrap();
+        blob.push(0x00);
+        let err = decode_fanout_blob(&blob).unwrap_err();
+        assert!(matches!(err, MlkemFanoutError::MalformedBlob(_)), "{err:?}");
+    }
+
+    #[test]
+    fn decode_rejects_forged_oversized_length() {
+        // Forge the kem_ciphertext length field to a huge value. The decoder
+        // must reject it (length > remaining input) rather than attempt a giant
+        // allocation or over-read.
+        let blob = encode_fanout_blob(&dummy_envelopes(1)).unwrap();
+        let mut tampered = blob.clone();
+        // Layout: [ver:1][count:1][instance:16][cert_version:8][kem_len:u32]…
+        let kem_len_off = 1 + 1 + 16 + 8;
+        tampered[kem_len_off..kem_len_off + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        let err = decode_fanout_blob(&tampered).unwrap_err();
+        assert!(matches!(err, MlkemFanoutError::MalformedBlob(_)), "{err:?}");
     }
 }
