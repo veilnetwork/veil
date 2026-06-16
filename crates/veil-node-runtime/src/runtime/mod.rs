@@ -6914,6 +6914,24 @@ impl NodeServices {
             self.dht.store_local(relay_key, bytes);
         }
 
+        // The rendezvous relay alone is not enough: `select_onion_relay_path`
+        // needs >= hop_count-1 MIDDLE relays drawn from our connected peers and
+        // filtered by `get_local(relay_directory_dht_key(peer))`. A cold sender
+        // holds none of those entries (passive Kademlia replication hasn't run),
+        // so the circuit can't be built and the introduce silently fails with
+        // `InsufficientRelayCandidates { have: 0 }`. Actively FIND_VALUE + verify
+        // + cache the connected relays' directory entries first — the exact
+        // sender-side analogue of the recipient cold-start warm. (review fix)
+        let outbox: Arc<dyn veil_dht::FrameRouter> =
+            Arc::clone(&self.session_outbox) as Arc<dyn veil_dht::FrameRouter>;
+        service_tasks::warm_connected_relay_directory(
+            &self.live_sessions,
+            &self.dht,
+            &outbox,
+            &self.logger,
+        )
+        .await;
+
         self.send_via_rendezvous_authenticated(
             &ad,
             target_app_id,
