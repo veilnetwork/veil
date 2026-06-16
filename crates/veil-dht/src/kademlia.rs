@@ -1383,6 +1383,58 @@ impl KademliaService {
         lock!(self.inner).retain_fresh(now, DEFAULT_TTL);
     }
 
+    /// Iterative Kademlia FIND_VALUE lookup using live OVL1 sessions.
+    ///
+    /// Seeds from the local routing table + active-session peers, then walks the
+    /// network via [`NetworkPeerQuerier`] (real FIND_VALUE frames). Checks the
+    /// local store first (cheap hit).
+    ///
+    /// Does NOT cache the result: the value is attacker-supplied until the
+    /// CALLER verifies it (e.g. a signed relay-directory entry — verify its
+    /// signature before trusting/persisting it). Returns the raw bytes or `None`.
+    pub async fn find_value_iterative_network(
+        &self,
+        key: [u8; 32],
+        outbox: Arc<dyn FrameRouter>,
+    ) -> Option<Vec<u8>> {
+        if let Some(v) = self.get_local(&key) {
+            return Some(v);
+        }
+        let mut seeds: Vec<Contact> = {
+            let inner = lock!(self.inner);
+            inner
+                .routing
+                .find_closest(&key, self.k())
+                .into_iter()
+                .cloned()
+                .collect()
+        };
+        let mut seed_ids: std::collections::HashSet<[u8; 32]> =
+            seeds.iter().map(|c| c.node_id).collect();
+        for peer_id in outbox.peer_ids() {
+            if seed_ids.insert(peer_id) {
+                seeds.push(Contact::new(peer_id, ""));
+            }
+        }
+        let timeout = Duration::from_millis(self.dht_config.find_node_timeout_ms);
+        let querier = super::network_querier::NetworkPeerQuerier::with_cache(
+            Arc::clone(&outbox),
+            self.dht_config.k,
+            timeout,
+            Arc::clone(&self.transport_cache),
+            self.local_node_id(),
+        );
+        let params = super::iterative::IterativeParams::from(&self.dht_config);
+        super::iterative::find_value_iterative(
+            key,
+            seeds,
+            &querier,
+            |k| self.get_local(k),
+            &params,
+        )
+        .await
+    }
+
     /// Iterative Kademlia FIND_NODE lookup using live OVL1 sessions.
     ///
     /// Seeds from the local routing table, then queries peers via
