@@ -119,9 +119,13 @@ cargoTargetMap.each { abi, triple ->
         // safe release posture). Dev/testnet builds opt into the bootstrap-less
         // feature explicitly: `./gradlew ... -PveilSeedFeature=allow-empty-seeds`.
         def seedFeature = (project.findProperty('veilSeedFeature') ?: 'production-seeds').toString()
+        // `node-embedded` ships the in-process node runtime so the app can run a
+        // veil node without a subprocess (the deniable posture — nothing
+        // identity-bearing written to a config.toml). Pulls veil-node-runtime
+        // with NO default features, so RocksDB stays OFF the .so (in-memory DHT).
         commandLine 'cargo', 'ndk', '-t', abi, '--',
                     'build', '--release', '-p', 'veilclient-ffi',
-                    '--features', seedFeature
+                    '--features', "${seedFeature},node-embedded"
         // Capture stderr/stdout to gradle's log so build failures
         // surface clearly in а CI job's output.
         ignoreExitValue false
