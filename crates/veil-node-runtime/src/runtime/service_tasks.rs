@@ -293,13 +293,18 @@ async fn warm_connected_relay_directory(
 
 /// Send a `RegisterRendezvous` frame to `relay` over its live session (inlines
 /// `NodeRuntime::register_with_rendezvous`, which is unavailable from the task's
-/// `NodeServices` handle). Fire-and-forget — a no-op without a session.
+/// `NodeServices` handle).
+///
+/// Returns `true` iff the frame was actually queued on the relay's session (the
+/// relay is in the tx registry). `false` means the picked "live session" has no
+/// tx channel yet, so the caller MUST NOT treat the relay as registered — a
+/// fire-and-forget send must not be claimed as a registration that never left.
 pub(crate) fn rendezvous_register_with(
     session_tx_registry: &Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
     anonymity: &Arc<super::anonymity_state::AnonymityState>,
     relay: &[u8; 32],
     cookie: [u8; 16],
-) {
+) -> bool {
     use veil_anonymity::rendezvous::RegisterRendezvousPayload;
     use veil_proto::{
         codec::encode_header,
@@ -321,7 +326,7 @@ pub(crate) fn rendezvous_register_with(
     let mut frame = encode_header(&hdr).to_vec();
     frame.extend_from_slice(&body);
     let guard = wlock!(session_tx_registry);
-    let _ = guard.send_to(relay, veil_proto::priority::INTERACTIVE, frame);
+    guard.send_to(relay, veil_proto::priority::INTERACTIVE, frame)
 }
 
 /// Register/refresh a rendezvous publisher entry (the maintenance tick publishes
@@ -1325,37 +1330,57 @@ impl NodeRuntime {
                                         // slot before adding the new one (L4) — else
                                         // failover strands a stale ad that senders
                                         // black-hole into.
-                                        if let Some(old) = current
-                                            && old != relay
-                                        {
-                                            rendezvous_unregister_publisher(
-                                                &anonymity, &old, cookie,
-                                            );
-                                        }
-                                        rendezvous_register_with(
+                                        // Only commit to the new relay once the
+                                        // RegisterRendezvous frame actually leaves
+                                        // — a picked "live session" may not have a
+                                        // tx channel yet, in which case the frame
+                                        // is silently dropped and no relay ever
+                                        // sees the registration.
+                                        if !rendezvous_register_with(
                                             &session_tx_registry,
                                             &anonymity,
                                             &relay,
                                             cookie,
-                                        );
-                                        rendezvous_register_publisher(
-                                            &anonymity,
-                                            &relay,
-                                            cookie,
-                                            RENDEZVOUS_AD_VALIDITY_SECS,
-                                            // Plain rendezvous receiver: ad is
-                                            // signed under the sovereign identity
-                                            // (senders discover it by node_id).
-                                            None,
-                                        );
-                                        current = Some(relay);
-                                        logger.info(
-                                            "anonymity.rendezvous_recipient.registered",
-                                            format!(
-                                                "registered with rendezvous relay {}",
-                                                veil_util::hex_short(&relay),
-                                            ),
-                                        );
+                                        ) {
+                                            logger.info(
+                                                "anonymity.rendezvous_recipient.send_failed",
+                                                format!(
+                                                    "relay {} not yet sendable (no tx \
+                                                     channel); retrying",
+                                                    veil_util::hex_short(&relay),
+                                                ),
+                                            );
+                                        } else {
+                                            // Prune the prior relay's publisher slot
+                                            // now that the new registration took (L4)
+                                            // — else failover strands a stale ad that
+                                            // senders black-hole into.
+                                            if let Some(old) = current
+                                                && old != relay
+                                            {
+                                                rendezvous_unregister_publisher(
+                                                    &anonymity, &old, cookie,
+                                                );
+                                            }
+                                            rendezvous_register_publisher(
+                                                &anonymity,
+                                                &relay,
+                                                cookie,
+                                                RENDEZVOUS_AD_VALIDITY_SECS,
+                                                // Plain rendezvous receiver: ad is
+                                                // signed under the sovereign identity
+                                                // (senders discover it by node_id).
+                                                None,
+                                            );
+                                            current = Some(relay);
+                                            logger.info(
+                                                "anonymity.rendezvous_recipient.registered",
+                                                format!(
+                                                    "registered with rendezvous relay {}",
+                                                    veil_util::hex_short(&relay),
+                                                ),
+                                            );
+                                        }
                                     }
                                     None => logger.info(
                                         "anonymity.rendezvous_recipient.no_relay",
@@ -1364,13 +1389,17 @@ impl NodeRuntime {
                                 }
                             } else if ticks.is_multiple_of(RENDEZVOUS_REREGISTER_EVERY_TICKS) {
                                 // Refresh — the relay's registration is in-memory.
-                                if let Some(relay) = current {
-                                    rendezvous_register_with(
+                                if let Some(relay) = current
+                                    && !rendezvous_register_with(
                                         &session_tx_registry,
                                         &anonymity,
                                         &relay,
                                         cookie,
-                                    );
+                                    )
+                                {
+                                    // Relay no longer sendable — drop it so the
+                                    // next tick re-discovers + re-registers.
+                                    current = None;
                                 }
                             }
                         }
