@@ -234,7 +234,7 @@ pub(crate) fn pick_rendezvous_relay(
 /// node holds no connected relay's entry, so onion registration would stall for
 /// up to a full DHT republish interval. Bounded per call to cap RPC fan-out.
 /// Returns how many fresh entries were cached.
-async fn warm_connected_relay_directory(
+pub(crate) async fn warm_connected_relay_directory(
     live: &LiveSessions,
     dht: &Arc<veil_dht::KademliaService>,
     outbox: &Arc<dyn veil_dht::FrameRouter>,
