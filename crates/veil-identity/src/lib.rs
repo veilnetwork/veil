@@ -39,6 +39,7 @@ pub mod instance;
 pub mod master_file;
 pub mod master_qr;
 pub mod master_seed;
+pub mod mailbox_seal;
 pub mod migration;
 pub mod mlkem_fanout;
 pub mod network_access;
