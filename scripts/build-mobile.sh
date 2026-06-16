@@ -32,7 +32,14 @@ readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # `allow-empty-seeds` (no builtin seeds; relies on runtime config) must be opted
 # into explicitly AND requires VEIL_MOBILE_DEV=1 (see guard in main), so it
 # can never land in a release build by accident.
-readonly DEFAULT_FEATURES="production-seeds"
+#
+# `node-embedded` bundles the in-process node runtime so the mobile lib can run
+# a veil node WITHOUT a `veil-cli` subprocess — mandatory on iOS (Apple forbids
+# spawning child processes) and the deniable posture on Android (nothing
+# identity-bearing written to a config.toml). It pulls veil-node-runtime with
+# NO default features, so the heavy C++ RocksDB cold store stays OFF mobile
+# (in-memory DHT); add `node-embedded-rocksdb` only for desktop/server.
+readonly DEFAULT_FEATURES="production-seeds,node-embedded"
 
 # Targets supported by the Flutter plugin.  iOS / macOS targets require
 # a macOS host toolchain — script just invokes cargo, no platform check
