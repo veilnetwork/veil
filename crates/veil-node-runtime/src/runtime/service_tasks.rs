@@ -227,6 +227,70 @@ pub(crate) fn pick_rendezvous_relay(
     Some(eligible[idx])
 }
 
+/// Cold-start rendezvous discovery: actively FIND_VALUE the relay-directory
+/// entries of our CONNECTED peers and cache the VERIFIED ones locally, so
+/// [`pick_rendezvous_relay`] (which only reads `dht.get_local`) can find a relay
+/// without waiting for passive Kademlia replication to deliver one — a fresh
+/// node holds no connected relay's entry, so onion registration would stall for
+/// up to a full DHT republish interval. Bounded per call to cap RPC fan-out.
+/// Returns how many fresh entries were cached.
+async fn warm_connected_relay_directory(
+    live: &LiveSessions,
+    dht: &Arc<veil_dht::KademliaService>,
+    outbox: &Arc<dyn veil_dht::FrameRouter>,
+    logger: &Arc<veil_observability::NodeLogger>,
+) -> usize {
+    const MAX_WARM_PER_TICK: usize = 4;
+    let connected: Vec<[u8; 32]> = {
+        let g = lock!(live);
+        g.values()
+            .filter(|i| i.state == crate::types::SessionState::Active)
+            .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
+            .collect()
+    };
+    let mut cached = 0usize;
+    for peer in connected {
+        if cached >= MAX_WARM_PER_TICK {
+            break;
+        }
+        let key = veil_anonymity::directory::relay_directory_dht_key(&peer);
+        if dht.get_local(&key).is_some() {
+            continue; // already known locally
+        }
+        let Some(bytes) = dht
+            .find_value_iterative_network(key, Arc::clone(outbox))
+            .await
+        else {
+            continue; // peer published nothing (not a relay) or unreachable
+        };
+        // SECURITY: the bytes are attacker-supplied until checked. Only cache an
+        // entry that decodes, verifies its OWN signature, AND is bound to THIS
+        // peer's node_id — else a peer could serve an entry under another node's
+        // key (it's a well-known DHT key) and steer our rendezvous choice.
+        match veil_anonymity::directory::decode_entry(&bytes) {
+            Ok(entry)
+                if entry.node_id == peer
+                    && veil_anonymity::directory::verify_entry(&entry).is_ok() =>
+            {
+                dht.store_local(key, bytes);
+                cached += 1;
+            }
+            Ok(_) => logger.warn(
+                "anonymity.relay_directory.rejected",
+                format!(
+                    "relay-directory entry for {} failed node-id bind or signature",
+                    veil_util::hex_short(&peer)
+                ),
+            ),
+            Err(e) => logger.warn(
+                "anonymity.relay_directory.decode_failed",
+                format!("peer={} err={e}", veil_util::hex_short(&peer)),
+            ),
+        }
+    }
+    cached
+}
+
 /// Send a `RegisterRendezvous` frame to `relay` over its live session (inlines
 /// `NodeRuntime::register_with_rendezvous`, which is unavailable from the task's
 /// `NodeServices` handle). Fire-and-forget — a no-op without a session.
@@ -1209,6 +1273,9 @@ impl NodeRuntime {
         let live_sessions = Arc::clone(&self.live_sessions);
         let session_tx_registry = Arc::clone(&self.session_tx_registry);
         let anonymity = Arc::clone(&self.anonymity);
+        // RPC outbox for active FIND_VALUE of connected peers' relay-directory
+        // entries (cold-start discovery — see warm_connected_relay_directory).
+        let session_outbox = Arc::clone(&self.session_outbox);
         // Operator-pinned rendezvous relays (node-id hex), if any.
         let pinned: Vec<[u8; 32]> = config
             .anonymity
@@ -1231,6 +1298,7 @@ impl NodeRuntime {
             Arc::clone(&self.logger),
             "rendezvous_recipient",
             async move {
+                let outbox: Arc<dyn veil_dht::FrameRouter> = session_outbox;
                 let mut interval = tokio::time::interval(RENDEZVOUS_RECIPIENT_CHECK_INTERVAL);
                 let mut current: Option<[u8; 32]> = None;
                 let mut ticks: u64 = 0;
@@ -1243,6 +1311,14 @@ impl NodeRuntime {
                                     && rendezvous_relay_published(&dht, &r)
                             });
                             if !current_ok {
+                                // Cold-start: actively pull + verify connected
+                                // peers' relay-directory entries into the local
+                                // store so pick (get_local) can find one without
+                                // waiting on passive DHT replication.
+                                warm_connected_relay_directory(
+                                    &live_sessions, &dht, &outbox, &logger,
+                                )
+                                .await;
                                 match pick_rendezvous_relay(&live_sessions, &dht, &pinned) {
                                     Some(relay) => {
                                         // Prune the prior (failed) relay's publisher
