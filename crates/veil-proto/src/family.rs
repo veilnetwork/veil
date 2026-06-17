@@ -1060,6 +1060,12 @@ pub enum RelayChainMsg {
     /// rebuild rather than trusting a possibly-dead frozen one — the circuit
     /// itself stays usable in the meantime (build is still optimistic).
     CircuitBuilt = 7,
+    /// Receiver → relay: register a PRIVATE mailbox fetch cookie (NOT the
+    /// published rendezvous cookie) so the relay can authorize this receiver's
+    /// mailbox `fetch`/`ack`. Body is `RegisterMailboxCookiePayload`. Stored
+    /// keyed by the authenticated session source (no receiver_id in the body —
+    /// you can only register your own).
+    RegisterMailboxCookie = 8,
 }
 
 impl TryFrom<u16> for RelayChainMsg {
@@ -1074,6 +1080,7 @@ impl TryFrom<u16> for RelayChainMsg {
             5 => Ok(RelayChainMsg::CircuitData),
             6 => Ok(RelayChainMsg::CircuitTeardown),
             7 => Ok(RelayChainMsg::CircuitBuilt),
+            8 => Ok(RelayChainMsg::RegisterMailboxCookie),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::RelayChain as u8,
                 msg_type: v,
