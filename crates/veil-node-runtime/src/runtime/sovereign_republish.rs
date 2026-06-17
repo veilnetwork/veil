@@ -146,7 +146,23 @@ impl NodeRuntime {
                     dht_for_density.routing_table_contacts().len(),
                     TARGET_ROUTING_TABLE_DENSITY,
                 );
-                let mut next_republish_at = tokio::time::Instant::now() + initial_interval;
+                // First REPLICATED republish fires ~2 min after startup (once
+                // the routing table has peers), NOT a full interval (up to 6h)
+                // later. The startup one-shots publish LOCAL-ONLY (no peers
+                // exist yet — see DhtBackedPublisher::new), so a freshly-minted
+                // record (e.g. a new RelayKeyRecord on a just-restarted node)
+                // is not cross-node discoverable until the first with_replication
+                // republish. Firing it early closes that cold-start window from
+                // up to 6h down to ~minutes; steady-state cadence (recomputed
+                // adaptively after each tick) is unchanged. Shrunk under
+                // `test-low-difficulty` so devnet smoke tests don't wait 2 min.
+                #[cfg(any(test, feature = "test-low-difficulty"))]
+                const REPUBLISH_WARMUP: std::time::Duration =
+                    std::time::Duration::from_secs(3);
+                #[cfg(not(any(test, feature = "test-low-difficulty")))]
+                const REPUBLISH_WARMUP: std::time::Duration =
+                    std::time::Duration::from_secs(120);
+                let mut next_republish_at = tokio::time::Instant::now() + REPUBLISH_WARMUP;
                 let mut interval = tokio::time::interval_at(next_republish_at, initial_interval);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
