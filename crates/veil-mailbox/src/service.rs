@@ -47,6 +47,22 @@ pub const MAILBOX_PUT_ENDPOINT_ID: u32 = 1;
 /// KiB worst-case transient memory.
 pub const MAILBOX_PUT_ENDPOINT_CAPACITY: usize = 256;
 
+/// Endpoint id for the network FETCH operation. A receiver sends an
+/// AUTHENTICATED-with-reply request here; the relay verifies the requester's
+/// identity (`src_node_id`), gathers that receiver's stored blobs, and replies
+/// over the one-time reply path. Addressed `(relay_node_id, MAILBOX_APP_ID,
+/// MAILBOX_FETCH_ENDPOINT_ID)`.
+pub const MAILBOX_FETCH_ENDPOINT_ID: u32 = 2;
+
+/// mpsc channel buffer depth for the FETCH endpoint. Fetches are far rarer than
+/// puts (one per receiver wake, not per-message) so a shallow buffer suffices.
+pub const MAILBOX_FETCH_ENDPOINT_CAPACITY: usize = 64;
+
+/// Cap on the total blob bytes returned in a single network FETCH reply, so the
+/// response fits the anonymous reply path. A receiver re-fetches (after acking)
+/// to drain more. Smaller than the local-IPC fetch cap (which isn't onion-bound).
+pub const MAILBOX_FETCH_REPLY_MAX_BYTES: usize = 60 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
