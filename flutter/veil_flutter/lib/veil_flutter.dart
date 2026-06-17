@@ -33,7 +33,7 @@ export 'src/identity.dart'
         restoreIdentityEncrypted,
         validateBip39Phrase;
 export 'src/lifecycle.dart' show VeilLifecycleBinding;
-export 'src/mailbox.dart' show VeilMailbox;
+export 'src/mailbox.dart' show MailboxOpened, VeilMailbox;
 export 'src/multi_device_pairing.dart'
     show VeilMultiDevicePairingDialog, PairingRole;
 export 'src/pairing.dart' show VeilPairingDialog;
