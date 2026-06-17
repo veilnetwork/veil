@@ -50,6 +50,9 @@ pub mod pairing_invite;
 pub mod prekey_bundle;
 /// `Recipient` + `InstanceTag` addressing types.
 pub mod recipient;
+/// Relay X25519 KEM key record — resolvable by node_id over the DHT, so a
+/// receiver can advertise an always-on third-party relay as its mailbox host.
+pub mod relay_key;
 // a removed `revocation_gossip` (RevocationPush + summary
 // frames) — the in-band revocation flow it supported is gone; short
 // `valid_until_unix` is the replacement.
@@ -113,7 +116,8 @@ pub use ipc::{
     AppIpcRtSendPayload, AppIpcSendPayload, AppUnbindPayload, AuthAppDeliver, AuthDeliverFragment,
     CLIENT_MAX_VERSION, CLIENT_MIN_VERSION, CreateBootstrapInvitePayload,
     CreateBootstrapInviteResultPayload, EventPayload, IPC_PROTOCOL_VERSION, JoinBootstrapPayload,
-    JoinBootstrapResultPayload, LookupRendezvousReplicasPayload,
+    JoinBootstrapResultPayload, LookupRelayKeyPayload, LookupRelayKeyRespPayload,
+    LookupRendezvousReplicasPayload,
     LookupRendezvousReplicasRespPayload, MAILBOX_AUTH_COOKIE_LEN, MAX_AUTH_DELIVER_FRAGMENTS,
     MAX_AUTH_DELIVER_MSG_BYTES, MAX_CREATE_INVITE_DETAIL_LEN, MAX_CREATE_INVITE_PASSWORD_LEN,
     MAX_CREATE_INVITE_URI_LEN, MAX_EVENT_PAYLOAD_LEN, MAX_JOIN_DETAIL_LEN, MAX_JOIN_ISSUER_PK_LEN,
