@@ -1759,7 +1759,7 @@ impl NodeRuntime {
             let push_tx_for_app = push_tx.clone();
             let bridge: Arc<dyn veil_ipc::MailboxBackend> = Arc::new(MailboxIpcBridge::new(
                 Arc::clone(mailbox),
-                self.dispatcher.rendezvous_registry.clone(),
+                self.dispatcher.mailbox_cookie_registry.clone(),
                 push_tx,
                 Some(Arc::clone(&self.event_bus)),
             ));
@@ -2184,7 +2184,12 @@ use crate::builtin::PushTrigger;
 
 pub struct MailboxIpcBridge {
     mailbox: Arc<veil_mailbox::Mailbox>,
-    rendezvous_registry: Option<Arc<veil_anonymity::rendezvous::RendezvousRegistry>>,
+    /// PRIVATE mailbox fetch-cookie registry (NOT the published rendezvous
+    /// cookie) — authorizes fetch/ack. `None` when the node is not a mailbox
+    /// relay, in which case fetch/ack are unauthorised.
+    mailbox_cookie_registry: Option<
+        Arc<std::sync::RwLock<veil_anonymity::mailbox_cookie_registry::MailboxCookieRegistry>>,
+    >,
     push_trigger_tx: tokio::sync::mpsc::Sender<PushTrigger>,
     /// Event bus used to publish `MAILBOX_DRAINED` notifications after
     /// every authorised fetch.  Optional so non-IPC test contexts can
@@ -2196,33 +2201,31 @@ pub struct MailboxIpcBridge {
 impl MailboxIpcBridge {
     fn new(
         mailbox: Arc<veil_mailbox::Mailbox>,
-        rendezvous_registry: Option<Arc<veil_anonymity::rendezvous::RendezvousRegistry>>,
+        mailbox_cookie_registry: Option<
+            Arc<std::sync::RwLock<veil_anonymity::mailbox_cookie_registry::MailboxCookieRegistry>>,
+        >,
         push_trigger_tx: tokio::sync::mpsc::Sender<PushTrigger>,
         event_bus: Option<Arc<veil_ipc::EventBus>>,
     ) -> Self {
         Self {
             mailbox,
-            rendezvous_registry,
+            mailbox_cookie_registry,
             push_trigger_tx,
             event_bus,
         }
     }
 
-    /// Verify that `auth_cookie` is registered to `receiver_id` on
-    /// this relay's `RendezvousRegistry`. Without a registry (relay
-    /// not anonymity-capable) returns false — fetch/ack is unauthorised
-    /// in that mode.
+    /// Verify `auth_cookie` against this receiver's PRIVATE mailbox fetch
+    /// cookies (registered via `RelayChainMsg::RegisterMailboxCookie`, never the
+    /// published rendezvous cookie). Constant-time over the receiver's ≤2 valid
+    /// cookies. Without a registry (node not a mailbox relay) returns false.
     fn cookie_authorised(&self, receiver_id: [u8; 32], auth_cookie: [u8; 16]) -> bool {
-        let Some(reg) = &self.rendezvous_registry else {
+        let Some(reg) = &self.mailbox_cookie_registry else {
             return false;
         };
-        // Namespaced lookup: an entry exists under (receiver_id, cookie) iff
-        // THIS receiver registered THIS cookie. The registry being keyed by
-        // peer_node_id means a cookie-squatter registered under a different
-        // identity cannot shadow the lookup and deny the genuine receiver's
-        // fetch/ack (which the old cookie-only lookup + equality check was
-        // vulnerable to).
-        reg.lookup(&receiver_id, &auth_cookie).is_some()
+        reg.read()
+            .map(|r| r.is_authorised(&receiver_id, &auth_cookie))
+            .unwrap_or(false)
     }
 }
 
