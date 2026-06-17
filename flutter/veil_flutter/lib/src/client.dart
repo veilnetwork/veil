@@ -247,6 +247,54 @@ class VeilClient implements Finalizable {
     });
   }
 
+  /// Register a PLAIN rendezvous-publisher entry (mailbox-by-discovery): the
+  /// daemon's maintenance tick signs + publishes a v5 RendezvousAd under THIS
+  /// node's real id at [rendezvousNodeId]'s rendezvous slot, advertising the
+  /// relay's KEM key ([relayKemPk], `algo 0` = X25519 — e.g. a self-relay key
+  /// from [getRelayX25519Pubkey]) so a sender resolving the ad via
+  /// [VeilMailbox.lookupRendezvousReplicas] can anonymously deposit a mailbox
+  /// PUT. Replaces any existing entry with the same ([rendezvousNodeId],
+  /// [authCookie]). Pass an empty [relayKemPk] to advertise no key.
+  Future<void> registerRendezvousPublisher({
+    required Uint8List rendezvousNodeId,
+    required Uint8List authCookie,
+    required int validityWindowSecs,
+    int relayKemAlgo = 0,
+    Uint8List? relayKemPk,
+  }) async {
+    _ensureOpen();
+    if (rendezvousNodeId.length != 32 || authCookie.length != 16) {
+      throw ArgumentError(
+          'rendezvous_node_id must be 32 bytes and auth_cookie 16 bytes');
+    }
+    final kem = relayKemPk ?? Uint8List(0);
+    return Future(() {
+      final nodeId = calloc<Uint8>(32);
+      final cookie = calloc<Uint8>(16);
+      final kemPtr = kem.isNotEmpty ? calloc<Uint8>(kem.length) : nullptr;
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        nodeId.asTypedList(32).setAll(0, rendezvousNodeId);
+        cookie.asTypedList(16).setAll(0, authCookie);
+        if (kem.isNotEmpty) {
+          kemPtr.asTypedList(kem.length).setAll(0, kem);
+        }
+        final rc = ffi.veilRegisterRendezvousPublisher(_handle, nodeId, cookie,
+            validityWindowSecs, relayKemAlgo, kemPtr, kem.length, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+              'register_rendezvous_publisher failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+      } finally {
+        calloc.free(nodeId);
+        calloc.free(cookie);
+        if (kemPtr != nullptr) calloc.free(kemPtr);
+        calloc.free(errOut);
+      }
+    });
+  }
+
   /// Send [data] to a LOCATION-anonymous (onion) service addressed by its
   /// Ed25519 IDENTITY key ([serviceIdentityVk], 32 bytes — a `.onion`-like
   /// handle), NOT its node_id. The daemon resolves the service's unlinkable

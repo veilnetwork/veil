@@ -1624,6 +1624,80 @@ impl RegisterOnionServicePayload {
     }
 }
 
+// ── RegisterRendezvousPublisherPayload ───────────────────────────────────────
+
+/// App → daemon request to register a PLAIN rendezvous-publisher entry that
+/// advertises the relay's KEM key (mailbox-by-discovery). The maintenance tick
+/// then signs + publishes a v5 `RendezvousAd` under this node's real id.
+///
+/// Wire layout (BE integers):
+///   rendezvous_node_id:   [u8; 32]
+///   auth_cookie:          [u8; 16]
+///   validity_window_secs: u64
+///   relay_kem_algo:       u8
+///   relay_kem_pk_len:     u16, relay_kem_pk: [u8; len]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterRendezvousPublisherPayload {
+    pub rendezvous_node_id: [u8; 32],
+    pub auth_cookie: [u8; 16],
+    pub validity_window_secs: u64,
+    pub relay_kem_algo: u8,
+    pub relay_kem_pk: Vec<u8>,
+}
+
+impl RegisterRendezvousPublisherPayload {
+    /// Fixed prefix size before the variable-length KEM pubkey.
+    pub const HEADER_SIZE: usize = 32 + 16 + 8 + 1 + 2;
+
+    pub fn encode(&self) -> Vec<u8> {
+        debug_assert!(self.relay_kem_pk.len() <= MAX_RENDEZVOUS_KEM_PK_BYTES);
+        let kem_len = self.relay_kem_pk.len().min(u16::MAX as usize);
+        let mut buf = Vec::with_capacity(Self::HEADER_SIZE + kem_len);
+        buf.extend_from_slice(&self.rendezvous_node_id);
+        buf.extend_from_slice(&self.auth_cookie);
+        buf.extend_from_slice(&self.validity_window_secs.to_be_bytes());
+        buf.push(self.relay_kem_algo);
+        buf.extend_from_slice(&(kem_len as u16).to_be_bytes());
+        buf.extend_from_slice(&self.relay_kem_pk[..kem_len]);
+        buf
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::HEADER_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::HEADER_SIZE,
+                got: buf.len(),
+            });
+        }
+        let rendezvous_node_id = super::read_array::<32>(buf, 0)?;
+        let auth_cookie = super::read_array::<16>(buf, 32)?;
+        let validity_window_secs = super::read_u64_be(buf, 48)?;
+        let relay_kem_algo = buf[56];
+        let kem_len = super::read_u16_be(buf, 57)? as usize;
+        if kem_len > MAX_RENDEZVOUS_KEM_PK_BYTES {
+            return Err(ProtoError::ValueTooLarge {
+                field: "register_rendezvous_publisher.relay_kem_pk_len",
+                value: kem_len as u64,
+                max: MAX_RENDEZVOUS_KEM_PK_BYTES as u64,
+            });
+        }
+        let kem_end = Self::HEADER_SIZE + kem_len;
+        if buf.len() < kem_end {
+            return Err(ProtoError::BufferTooShort {
+                need: kem_end,
+                got: buf.len(),
+            });
+        }
+        Ok(Self {
+            rendezvous_node_id,
+            auth_cookie,
+            validity_window_secs,
+            relay_kem_algo,
+            relay_kem_pk: buf[Self::HEADER_SIZE..kem_end].to_vec(),
+        })
+    }
+}
+
 // ── SendToOnionServicePayload ────────────────────────────────────────────────
 
 /// App → daemon request to send to a LOCATION-anonymous service addressed by its
