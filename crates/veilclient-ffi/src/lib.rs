@@ -2665,6 +2665,173 @@ pub unsafe extern "C" fn veil_free_buf(ptr: *mut u8, len: size_t) {
     }
 }
 
+/// Seal `data` for `recipient`'s `(app_id, endpoint_id)` into an offline-mailbox
+/// blob (node-side E2E crypto: sign + DHT-resolve the recipient cert +
+/// fan-out-encrypt). On success returns [`VEIL_OK`] and writes a heap-allocated
+/// buffer to `*out_buf` (its length to `*out_len`); free it with
+/// [`veil_free_buf`]. On error returns a negative `VEIL_ERR_*`, sets `*err_out`,
+/// and leaves `*out_buf = NULL` / `*out_len = 0`.
+///
+/// `recipient` and `app_id` MUST point to ≥32 readable bytes; `data` to
+/// ≥`data_len` (may be NULL iff `data_len == 0`). `out_buf` / `out_len` MUST be
+/// valid writable pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_mailbox_seal(
+    handle: *mut VeilHandle,
+    recipient: *const u8,
+    app_id: *const u8,
+    endpoint_id: u32,
+    data: *const u8,
+    data_len: size_t,
+    out_buf: *mut *mut u8,
+    out_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_mailbox_seal") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "recipient" => recipient,
+        "app_id" => app_id,
+        "out_buf" => out_buf,
+        "out_len" => out_len,
+    );
+    unsafe {
+        *out_buf = ptr::null_mut();
+        *out_len = 0;
+    }
+    let mut recipient_arr = [0u8; 32];
+    let mut app_id_arr = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(recipient, recipient_arr.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(app_id, app_id_arr.as_mut_ptr(), 32);
+    }
+    let payload: Vec<u8> = if data_len == 0 {
+        Vec::new()
+    } else {
+        null_check!(err_out, "data" => data);
+        unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec()
+    };
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&handle_live.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client
+            .mailbox_seal(recipient_arr, app_id_arr, endpoint_id, payload)
+            .await
+    });
+    match res {
+        Ok(blob) => {
+            let boxed: Box<[u8]> = blob.into_boxed_slice();
+            let len = boxed.len();
+            let p = Box::into_raw(boxed) as *mut u8;
+            unsafe {
+                *out_buf = p;
+                *out_len = len;
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("mailbox_seal failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
+/// Open + verify a fetched offline-mailbox `blob` claimed to be from `sender`,
+/// decrypting under our current cert version `our_cert_version`. On success
+/// returns [`VEIL_OK`], writes the verified destination app id to `out_app_id`
+/// (32 bytes) + endpoint id to `*out_endpoint_id`, and a heap-allocated data
+/// buffer to `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
+///
+/// `sender` MUST point to ≥32 readable bytes; `blob` to ≥`blob_len`. `out_app_id`
+/// MUST point to ≥32 writable bytes; the other out-pointers MUST be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_mailbox_open(
+    handle: *mut VeilHandle,
+    sender: *const u8,
+    our_cert_version: u64,
+    blob: *const u8,
+    blob_len: size_t,
+    out_app_id: *mut u8,
+    out_endpoint_id: *mut u32,
+    out_data: *mut *mut u8,
+    out_data_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_mailbox_open") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "sender" => sender,
+        "out_app_id" => out_app_id,
+        "out_endpoint_id" => out_endpoint_id,
+        "out_data" => out_data,
+        "out_data_len" => out_data_len,
+    );
+    unsafe {
+        *out_data = ptr::null_mut();
+        *out_data_len = 0;
+        *out_endpoint_id = 0;
+    }
+    let mut sender_arr = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(sender, sender_arr.as_mut_ptr(), 32);
+    }
+    let blob_vec: Vec<u8> = if blob_len == 0 {
+        Vec::new()
+    } else {
+        null_check!(err_out, "blob" => blob);
+        unsafe { std::slice::from_raw_parts(blob, blob_len) }.to_vec()
+    };
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&handle_live.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client
+            .mailbox_open(blob_vec, sender_arr, our_cert_version)
+            .await
+    });
+    match res {
+        Ok((app_id, endpoint_id, data)) => {
+            let boxed: Box<[u8]> = data.into_boxed_slice();
+            let len = boxed.len();
+            let p = Box::into_raw(boxed) as *mut u8;
+            unsafe {
+                ptr::copy_nonoverlapping(app_id.as_ptr(), out_app_id, 32);
+                *out_endpoint_id = endpoint_id;
+                *out_data = p;
+                *out_data_len = len;
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("mailbox_open failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
 /// Fetch all blobs currently stored for `receiver_id`. `auth_cookie`
 /// must match a previously-registered rendezvous-publisher entry.
 ///
