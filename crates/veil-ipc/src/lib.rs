@@ -431,6 +431,88 @@ impl<T: RendezvousReplicaResolver + ?Sized> RendezvousReplicaResolver for std::s
     }
 }
 
+// ── Offline-mailbox seal/open sink ─────────────────────────────
+
+/// Outcome of [`MailboxCryptoSink::seal_blob`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailboxSealOutcome {
+    /// Sealed — carries the mailbox blob to `MailboxPut` at a relay.
+    Ok(Vec<u8>),
+    /// No sovereign identity is loaded on the node.
+    NoIdentity,
+    /// The recipient's ML-KEM cert could not be resolved + verified from DHT.
+    PeerUnresolved,
+    /// The seal operation itself failed (oversized / encrypt error).
+    Failed,
+}
+
+/// Outcome of [`MailboxCryptoSink::open_blob`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailboxOpenOutcome {
+    /// Opened + verified — carries the verified routing target + plaintext.
+    Ok {
+        /// Verified destination app id.
+        app_id: [u8; 32],
+        /// Verified destination endpoint id.
+        endpoint_id: u32,
+        /// Verified plaintext.
+        data: Vec<u8>,
+    },
+    /// No sovereign identity is loaded on the node.
+    NoIdentity,
+    /// The sender's identity document could not be resolved + verified from DHT.
+    PeerUnresolved,
+    /// The open/verify failed (decode / AEAD / signature / freshness).
+    Failed,
+}
+
+/// Hook the IPC server calls for `LocalAppMsg::MailboxSeal` / `MailboxOpen` —
+/// the node-side E2E crypto for offline (store-and-forward) delivery.
+/// Implemented by the runtime (the only place holding the sovereign signing key
+/// plus the ML-KEM decapsulation seed). Async because both walk the DHT (recipient
+/// cert / sender document resolution); a boxed future keeps the trait
+/// object-safe (same pattern as [`RendezvousReplicaResolver`]).
+pub trait MailboxCryptoSink: Send + Sync {
+    /// Seal `data` for `recipient_node_id`'s `(app_id, endpoint_id)`.
+    fn seal_blob<'a>(
+        &'a self,
+        recipient_node_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MailboxSealOutcome> + Send + 'a>>;
+
+    /// Open + verify `blob` claimed to be from `sender_node_id`, decrypting under
+    /// our cert version `our_cert_version`.
+    fn open_blob<'a>(
+        &'a self,
+        blob: Vec<u8>,
+        sender_node_id: [u8; 32],
+        our_cert_version: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MailboxOpenOutcome> + Send + 'a>>;
+}
+
+impl<T: MailboxCryptoSink + ?Sized> MailboxCryptoSink for std::sync::Arc<T> {
+    fn seal_blob<'a>(
+        &'a self,
+        recipient_node_id: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MailboxSealOutcome> + Send + 'a>> {
+        (**self).seal_blob(recipient_node_id, app_id, endpoint_id, data)
+    }
+
+    fn open_blob<'a>(
+        &'a self,
+        blob: Vec<u8>,
+        sender_node_id: [u8; 32],
+        our_cert_version: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MailboxOpenOutcome> + Send + 'a>> {
+        (**self).open_blob(blob, sender_node_id, our_cert_version)
+    }
+}
+
 // ── Peer-list provider ─────────────────────────────────────────
 
 /// Hook the IPC server calls when an app issues `LocalAppMsg::GetPeers`.
