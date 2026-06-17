@@ -565,6 +565,7 @@ impl FrameDispatcher {
         let is_mc = magic == Some(&veil_proto::mlkem_cert::MLKEM_CERT_MAGIC[..]);
         let is_sb = magic == Some(&veil_bootstrap::SIGNED_BUNDLE_MAGIC[..]);
         let is_desc = magic == Some(&veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC[..]);
+        let is_rk = magic == Some(&veil_proto::relay_key::RELAY_KEY_MAGIC[..]);
 
         if is_sb {
             // Signed operator bootstrap bundle (cf. `veil-bootstrap::
@@ -717,6 +718,28 @@ impl FrameDispatcher {
                 return Err(DispatchResult::Violation(
                     "Store: blinded descriptor failed self-verification".to_owned(),
                 ));
+            }
+            veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
+        } else if is_rk {
+            // RelayKeyRecord (relay X25519 KEM key, resolvable by node_id).
+            // STRUCTURALLY decoded here, NOT signature-verified — like
+            // NameClaim/IdentityDocument/InstanceRegistry/MlKemKeyCert, its
+            // `node_id` field is attacker-controlled at this gate, so we
+            // rate-limit per claimed id but attribute the bytes to the shared
+            // recursive bucket (the resolver re-verifies the subkey signature on
+            // read via `verify_relay_key`). Without this arm the record's magic
+            // ("RK") falls into the catch-all reject below and peers refuse its
+            // replication STORE — so it never becomes cross-node discoverable.
+            let id = match veil_proto::relay_key::RelayKeyRecord::decode(payload_value) {
+                Ok(r) => r.node_id,
+                Err(_) => {
+                    return Err(DispatchResult::Violation(
+                        "Store: malformed RelayKeyRecord".to_owned(),
+                    ));
+                }
+            };
+            if !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
+                return Err(DispatchResult::NoResponse);
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
         } else {

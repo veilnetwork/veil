@@ -166,6 +166,28 @@ impl NodeRuntime {
                 let mut interval = tokio::time::interval_at(next_republish_at, initial_interval);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+                // Cold-start warmup phase. The adaptive interval floors at 0.5×
+                // base (≈3h), so a republish that fires while the routing table
+                // is still sparse (just-restarted node, or a fleet-wide restart
+                // where ALL peers are cold) replicates to an INACCURATE K-closest
+                // set — `find_closest` can't see the true closest peers yet — and
+                // a freshly-minted record (e.g. a RelayKeyRecord with no prior
+                // replicas) then stays cross-node-unresolvable for ~3h. To
+                // recover, republish FREQUENTLY (every WARMUP_REPUBLISH_PERIOD)
+                // until the routing table is healthy (≥ WARMUP_HEALTHY_CONTACTS)
+                // or a bound is hit, so a republish lands once `find_closest` is
+                // accurate. Bounded so a genuinely tiny private network doesn't
+                // republish forever.
+                #[cfg(any(test, feature = "test-low-difficulty"))]
+                const WARMUP_REPUBLISH_PERIOD: std::time::Duration =
+                    std::time::Duration::from_secs(2);
+                #[cfg(not(any(test, feature = "test-low-difficulty")))]
+                const WARMUP_REPUBLISH_PERIOD: std::time::Duration =
+                    std::time::Duration::from_secs(90);
+                const WARMUP_HEALTHY_CONTACTS: usize = 16;
+                const MAX_WARMUP_REPUBLISHES: u32 = 12;
+                let mut warmup_republishes_left = MAX_WARMUP_REPUBLISHES;
+
                 // Fast on-change poll ticks at 60 s regardless of the
                 // main republish cadence.
                 let mut on_change_tick = tokio::time::interval(SOVEREIGN_ON_CHANGE_POLL_INTERVAL);
@@ -517,11 +539,22 @@ impl NodeRuntime {
                             // churn) gets a shorter one. Recreate the
                             // interval so subsequent `interval.tick`
                             // uses the new period.
-                            let next_period = adaptive_republish_interval(
-                                SOVEREIGN_REPUBLISH_INTERVAL,
-                                dht_for_density.routing_table_contacts().len(),
-                                TARGET_ROUTING_TABLE_DENSITY,
-                            );
+                            let contacts = dht_for_density.routing_table_contacts().len();
+                            // Stay in the frequent warmup cadence while the
+                            // routing table is still sparse (and the bound isn't
+                            // exhausted); otherwise use the adaptive steady-state.
+                            let next_period = if warmup_republishes_left > 0
+                                && contacts < WARMUP_HEALTHY_CONTACTS
+                            {
+                                warmup_republishes_left -= 1;
+                                WARMUP_REPUBLISH_PERIOD
+                            } else {
+                                adaptive_republish_interval(
+                                    SOVEREIGN_REPUBLISH_INTERVAL,
+                                    contacts,
+                                    TARGET_ROUTING_TABLE_DENSITY,
+                                )
+                            };
                             next_republish_at = tokio::time::Instant::now() + next_period;
                             interval = tokio::time::interval_at(
                                 next_republish_at,
