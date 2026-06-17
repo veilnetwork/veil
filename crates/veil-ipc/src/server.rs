@@ -23,7 +23,7 @@ use crate::handlers::mobile::{
 use crate::handlers::outbox::{handle_outbox_ack, handle_outbox_find_missing, handle_outbox_put};
 use crate::handlers::queries::{
     handle_get_mobile_status, handle_get_node_identity, handle_get_peers,
-    handle_join_bootstrap_uri, handle_lookup_rendezvous_replicas,
+    handle_join_bootstrap_uri, handle_lookup_relay_key, handle_lookup_rendezvous_replicas,
 };
 use crate::handlers::send::{IpcSendContext, handle_ipc_send, handle_rt_send};
 use crate::handlers::stream::handle_stream_open;
@@ -844,6 +844,10 @@ pub struct IpcServer {
     /// the IPC handler replies with empty list (apps see "no replica
     /// found" — same as DHT miss).
     rendezvous_resolver: Option<Arc<dyn crate::RendezvousReplicaResolver>>,
+    /// Resolves a node's relay X25519 KEM key by node_id over the DHT
+    /// (`LocalAppMsg::LookupRelayKey`). When `None`, the handler replies with
+    /// no key (apps see "unresolved" — same as a DHT miss).
+    relay_key_resolver: Option<Arc<dyn veil_types::RelayKeyResolver>>,
     /// Epic 489.7 generator side: hook the IPC handler calls when an
     /// app sends `LocalAppMsg::CreateBootstrapInvite`.  When `None`
     /// the handler replies with status `INTERNAL_ERROR` + "feature not
@@ -930,6 +934,7 @@ impl IpcServer {
             mailbox_crypto_sink: None,
             outbox_backend: None,
             rendezvous_resolver: None,
+            relay_key_resolver: None,
             bootstrap_invite_create_sink: None,
             pair_source_sink: None,
             pair_target_sink: None,
@@ -1001,6 +1006,17 @@ impl IpcServer {
         resolver: Arc<dyn crate::RendezvousReplicaResolver>,
     ) -> Self {
         self.rendezvous_resolver = Some(resolver);
+        self
+    }
+
+    /// Wire the relay-key resolver so apps can resolve a node's relay X25519
+    /// KEM key by node_id via IPC `LookupRelayKey`. Without it, the handler
+    /// always replies "unresolved".
+    pub fn with_relay_key_resolver(
+        mut self,
+        resolver: Arc<dyn veil_types::RelayKeyResolver>,
+    ) -> Self {
+        self.relay_key_resolver = Some(resolver);
         self
     }
 
@@ -1489,6 +1505,7 @@ impl IpcServer {
                         let mailbox_crypto_sink = self.mailbox_crypto_sink.clone();
                         let outbox_backend = self.outbox_backend.clone();
                         let rendezvous_resolver = self.rendezvous_resolver.clone();
+                        let relay_key_resolver = self.relay_key_resolver.clone();
                         let bootstrap_invite_create_sink =
                             self.bootstrap_invite_create_sink.clone();
                         let pair_source_sink = self.pair_source_sink.clone();
@@ -1510,7 +1527,7 @@ impl IpcServer {
                             // operators can diagnose IPC disconnects without
                             // strace. Tracing is wired in at log-level WARN
                             // by the daemon binary.
-                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, stream_bridge).await {
+                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, stream_bridge).await {
                                 eprintln!("[veil-ipc] client disconnected: {e} (kind={:?})", e.kind());
                             }
                         });
@@ -1622,6 +1639,7 @@ async fn handle_ipc_client(
     mailbox_crypto_sink: Option<Arc<dyn crate::MailboxCryptoSink>>,
     outbox_backend: Option<Arc<dyn crate::OutboxBackend>>,
     rendezvous_resolver: Option<Arc<dyn crate::RendezvousReplicaResolver>>,
+    relay_key_resolver: Option<Arc<dyn veil_types::RelayKeyResolver>>,
     bootstrap_invite_create_sink: Option<Arc<dyn crate::BootstrapInviteCreateSink>>,
     pair_source_sink: Option<Arc<dyn crate::PairSourceSink>>,
     pair_target_sink: Option<Arc<dyn crate::PairTargetSink>>,
@@ -2384,6 +2402,15 @@ async fn handle_ipc_client(
                             &body,
                             &mut client_state,
                             rendezvous_resolver.as_ref(),
+                        )
+                        .await?;
+                    }
+                    Ok(LocalAppMsg::LookupRelayKey) => {
+                        handle_lookup_relay_key(
+                            &mut wh,
+                            &body,
+                            &mut client_state,
+                            relay_key_resolver.as_ref(),
                         )
                         .await?;
                     }

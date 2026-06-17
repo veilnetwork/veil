@@ -86,6 +86,11 @@ impl NodeRuntime {
         // MlKemCert republish needs the node's own ML-KEM ek to re-sign
         // with a fresh validity window each tick.
         let mlkem_ek = Arc::clone(&self.identity.mlkem_ek);
+        // RelayKeyRecord republish: only relay-capable nodes have an anonymity
+        // X25519 keypair to advertise (`None` for non-relays — we skip the
+        // record entirely so we never publish a key the dispatcher can't
+        // actually decrypt onions for).
+        let relay_x25519_pk = self.anonymity_x25519_pk();
         // Veil dir for re-scanning persisted name claims on each tick
         // (so a claim added mid-session starts publishing at the next
         // republish without requiring a node restart).
@@ -398,6 +403,51 @@ impl NodeRuntime {
                                         veil_util::bytes_to_hex(sov.node_id()),
                                     ),
                                 ),
+                            }
+
+                            // RelayKeyRecord — only relay-capable nodes have an
+                            // anonymity X25519 key to advertise. Rebuilt each
+                            // tick with a fresh 30-day validity window so a
+                            // resolver always sees an unexpired record; keyed by
+                            // node_id, so the put replaces the prior slot.
+                            if let Some(relay_pk) = relay_x25519_pk {
+                                match sov.sign_relay_key(
+                                    relay_pk.to_vec(),
+                                    cert_valid_from,
+                                    cert_valid_from + 30 * 86_400,
+                                    1,
+                                ) {
+                                    Ok(record) => {
+                                        if let Err(e) =
+                                            veil_identity::publish::publish_relay_key(
+                                                &record, &publisher,
+                                            ).await
+                                        {
+                                            logger.warn(
+                                                "node.sovereign_identity.relay_key_republish_failed",
+                                                format!(
+                                                    "node_id={} — relay-key republish failed: {e}",
+                                                    veil_util::bytes_to_hex(sov.node_id()),
+                                                ),
+                                            );
+                                        } else {
+                                            logger.debug(
+                                                "node.sovereign_identity.relay_key_republished",
+                                                format!(
+                                                    "node_id={} relay_x25519 advertised",
+                                                    veil_util::bytes_to_hex(sov.node_id()),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => logger.warn(
+                                        "node.sovereign_identity.relay_key_sign_failed",
+                                        format!(
+                                            "node_id={} — relay-key sign failed: {e}",
+                                            veil_util::bytes_to_hex(sov.node_id()),
+                                        ),
+                                    ),
+                                }
                             }
 
                             // Persisted NameClaims — re-scan every tick

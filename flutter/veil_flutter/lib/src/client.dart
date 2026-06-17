@@ -225,6 +225,42 @@ class VeilClient implements Finalizable {
     });
   }
 
+  /// Resolve ANOTHER node's relay X25519 KEM public key (32 bytes) by its
+  /// [nodeId], over the DHT. Unlike [getRelayX25519Pubkey] (the LOCAL node's
+  /// own key), the daemon fetches + verifies the target's signed relay-key
+  /// record against its identity document. Returns `null` when unresolved (no
+  /// record published / DHT miss / verification failed). Lets a receiver
+  /// advertise an always-on third-party relay as its mailbox host knowing only
+  /// that relay's node_id.
+  Future<Uint8List?> lookupRelayX25519(Uint8List nodeId) async {
+    _ensureOpen();
+    if (nodeId.length != 32) {
+      throw ArgumentError('nodeId must be 32 bytes, got ${nodeId.length}');
+    }
+    return Future(() {
+      final node = calloc<Uint8>(32);
+      final out = calloc<Uint8>(32);
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        node.asTypedList(32).setAll(0, nodeId);
+        final rc = ffi.veilLookupRelayX25519(_handle, node, out, errOut);
+        if (rc == ffi.veilRelayX25519Unavailable) {
+          return null;
+        }
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+              'lookup_relay_x25519 failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+        return Uint8List.fromList(out.asTypedList(32));
+      } finally {
+        calloc.free(node);
+        calloc.free(out);
+        calloc.free(errOut);
+      }
+    });
+  }
+
   /// Register this node as a LOCATION-anonymous (onion) service: the daemon
   /// builds an onion circuit to a rendezvous relay (which never learns this
   /// node's location) and publishes the ad so clients can reach it by identity.

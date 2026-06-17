@@ -1727,6 +1727,70 @@ pub unsafe extern "C" fn veil_get_relay_x25519_pubkey(
     }
 }
 
+/// Resolve ANOTHER node's relay X25519 KEM public key by its `node_id`, over the
+/// DHT. Unlike [`veil_get_relay_x25519_pubkey`] (which returns the LOCAL node's
+/// own key), this asks the daemon to fetch + verify the target's signed
+/// `RelayKeyRecord` against its identity document. Lets a receiver advertise an
+/// always-on third-party relay as its mailbox host knowing only its node_id.
+///
+/// Returns:
+/// [`VEIL_OK`] — `out_pubkey_32` populated with the verified 32-byte key.
+/// [`VEIL_RELAY_X25519_UNAVAILABLE`] — unresolved (DHT miss / no record /
+///   verification failed); the node advertises no relay key.
+/// other negative codes — connection/protocol errors.
+///
+/// # Safety
+/// `handle` must be a live `VeilHandle*` from `veil_connect`.
+/// `node_id_32` must point to 32 readable bytes; `out_pubkey_32` to 32 writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_lookup_relay_x25519(
+    handle: *mut VeilHandle,
+    node_id_32: *const u8,
+    out_pubkey_32: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_lookup_relay_x25519") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "node_id_32" => node_id_32,
+        "out_pubkey_32" => out_pubkey_32,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let mut node_id = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(node_id_32, node_id.as_mut_ptr(), 32);
+    }
+    let bundle = Arc::clone(&handle_live.bundle);
+    let res = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client.lookup_relay_x25519(node_id).await
+    });
+    match res {
+        Ok(Some(pk)) => {
+            unsafe {
+                ptr::copy_nonoverlapping(pk.as_ptr(), out_pubkey_32, 32);
+            }
+            VEIL_OK
+        }
+        Ok(None) => VEIL_RELAY_X25519_UNAVAILABLE,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("lookup_relay_x25519 failed: {e}"));
+            }
+            VEIL_ERR
+        }
+    }
+}
+
 /// Register this node as a LOCATION-anonymous (onion) service: the daemon picks
 /// relays, builds an onion circuit to a rendezvous relay (which never learns
 /// this node's location), and publishes the ad so clients can reach this node by
