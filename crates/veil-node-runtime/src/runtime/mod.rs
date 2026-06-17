@@ -7310,6 +7310,8 @@ impl NodeServices {
             push_envelope: Vec::new(),
             capability_token: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
             wire_version: 0,
         };
 
@@ -7387,6 +7389,8 @@ impl NodeServices {
             push_envelope: Vec::new(),
             capability_token: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
             // Inert: the synthetic ad is never re-encoded or verified.
             wire_version: 0,
         };
