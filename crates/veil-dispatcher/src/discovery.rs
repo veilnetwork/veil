@@ -566,6 +566,7 @@ impl FrameDispatcher {
         let is_sb = magic == Some(&veil_bootstrap::SIGNED_BUNDLE_MAGIC[..]);
         let is_desc = magic == Some(&veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC[..]);
         let is_rk = magic == Some(&veil_proto::relay_key::RELAY_KEY_MAGIC[..]);
+        let is_ra = magic == Some(&veil_anonymity::rendezvous::MAGIC[..]);
 
         if is_sb {
             // Signed operator bootstrap bundle (cf. `veil-bootstrap::
@@ -735,6 +736,29 @@ impl FrameDispatcher {
                 Err(_) => {
                     return Err(DispatchResult::Violation(
                         "Store: malformed RelayKeyRecord".to_owned(),
+                    ));
+                }
+            };
+            if !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
+                return Err(DispatchResult::NoResponse);
+            }
+            veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
+        } else if is_ra {
+            // RendezvousAd (carries a receiver's mailbox/onion rendezvous relay
+            // node_id + its KEM key, keyed under the receiver's ad slots).
+            // STRUCTURALLY decoded here, NOT signature-verified — like
+            // NameClaim/IdentityDocument/.../RelayKeyRecord, so rate-limit per
+            // the ad's claimed receiver node_id but attribute bytes to the shared
+            // recursive bucket (the resolver re-verifies the ad signature +
+            // receiver-binding on read via verify_rendezvous_ad). Without this
+            // arm the "RA" magic falls into the catch-all reject below and peers
+            // refuse the ad's replication STORE — so a receiver's mailbox relay
+            // never becomes cross-node discoverable.
+            let id = match veil_anonymity::rendezvous::decode_rendezvous_ad(payload_value) {
+                Ok(ad) => ad.receiver_node_id,
+                Err(_) => {
+                    return Err(DispatchResult::Violation(
+                        "Store: malformed RendezvousAd".to_owned(),
                     ));
                 }
             };

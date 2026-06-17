@@ -106,7 +106,11 @@
 use veil_crypto::{sign_message, verify_message};
 use veil_types::SignatureAlgorithm;
 
-const MAGIC: &[u8; 2] = b"RA";
+/// 2-byte wire magic identifying a `RendezvousAd` value in the DHT. Public so
+/// the recursive-STORE plane's `validate_store_value_by_magic` can recognise +
+/// accept ad replication (the ad is structurally decoded + re-verified on the
+/// resolver read path, like the other identity-family records).
+pub const MAGIC: &[u8; 2] = b"RA";
 const VERSION_LEGACY: u8 = 1;
 const VERSION_V2: u8 = 2;
 const VERSION_V3: u8 = 3;
