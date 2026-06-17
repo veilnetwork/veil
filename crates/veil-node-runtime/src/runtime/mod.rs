@@ -1930,6 +1930,16 @@ impl NodeRuntime {
                 .anonymity
                 .relay_capable
                 .then(|| Arc::new(veil_anonymity::rendezvous::RendezvousRegistry::default())),
+            // Mailbox relays hold the SEPARATE private fetch-cookie registry
+            // (gated on mailbox.enabled, not relay_capable) used to authorize
+            // mailbox fetch/ack — never the published rendezvous cookie.
+            mailbox_cookie_registry: config.mailbox.enabled.then(|| {
+                Arc::new(std::sync::RwLock::new(
+                    veil_anonymity::mailbox_cookie_registry::MailboxCookieRegistry::new(
+                        veil_anonymity::mailbox_cookie_registry::DEFAULT_MAX_RECEIVERS,
+                    ),
+                ))
+            }),
             // Same relay-capable gate: only relays hold per-hop circuit state.
             circuit_table: config
                 .anonymity
