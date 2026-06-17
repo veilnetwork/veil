@@ -456,11 +456,161 @@ class VeilMailbox {
     });
   }
 
+  /// Seal [data] for [recipient]'s ([appId], [endpointId]) into an offline
+  /// mailbox blob: the node signs an auth-deliver, resolves the recipient's
+  /// ML-KEM cert over the DHT, and fan-out-encrypts. Returns the blob to hand to
+  /// [put]. Throws [VeilException] if the node has no identity, can't resolve the
+  /// recipient, or the seal fails.
+  Future<Uint8List> seal({
+    required Uint8List recipient,
+    required Uint8List appId,
+    required int endpointId,
+    required Uint8List data,
+  }) async {
+    _validateId(recipient, 'recipient');
+    _validateId(appId, 'appId');
+    return Future(() {
+      final rec = calloc<Uint8>(32);
+      final app = calloc<Uint8>(32);
+      final dataPtr = calloc<Uint8>(data.isEmpty ? 1 : data.length);
+      final outBuf = calloc<Pointer<Uint8>>();
+      final outLen = calloc<IntPtr>();
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        rec.asTypedList(32).setAll(0, recipient);
+        app.asTypedList(32).setAll(0, appId);
+        if (data.isNotEmpty) dataPtr.asTypedList(data.length).setAll(0, data);
+        final rc = ffi.veilMailboxSeal(
+          _handle,
+          rec,
+          app,
+          endpointId,
+          dataPtr,
+          data.length,
+          outBuf,
+          outLen,
+          errOut,
+        );
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+            'mailbox_seal failed: ${_readErrAndFree(errOut)}',
+            code: rc,
+          );
+        }
+        final bufPtr = outBuf.value;
+        final len = outLen.value;
+        if (bufPtr == nullptr) return Uint8List(0);
+        try {
+          return Uint8List.fromList(bufPtr.asTypedList(len));
+        } finally {
+          ffi.veilFreeBuf(bufPtr, len);
+        }
+      } finally {
+        calloc.free(rec);
+        calloc.free(app);
+        calloc.free(dataPtr);
+        calloc.free(outBuf);
+        calloc.free(outLen);
+        calloc.free(errOut);
+      }
+    });
+  }
+
+  /// Open + verify a fetched mailbox [blob] claimed to be from [sender],
+  /// decrypting under our current cert version [ourCertVersion]. Returns the
+  /// verified destination + plaintext. Throws [VeilException] on a failed
+  /// decrypt / signature / freshness check.
+  Future<MailboxOpened> open({
+    required Uint8List blob,
+    required Uint8List sender,
+    required int ourCertVersion,
+  }) async {
+    _validateId(sender, 'sender');
+    return Future(() {
+      final snd = calloc<Uint8>(32);
+      final blobPtr = calloc<Uint8>(blob.isEmpty ? 1 : blob.length);
+      final outAppId = calloc<Uint8>(32);
+      final outEndpoint = calloc<Uint32>();
+      final outData = calloc<Pointer<Uint8>>();
+      final outDataLen = calloc<IntPtr>();
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        snd.asTypedList(32).setAll(0, sender);
+        if (blob.isNotEmpty) blobPtr.asTypedList(blob.length).setAll(0, blob);
+        final rc = ffi.veilMailboxOpen(
+          _handle,
+          snd,
+          ourCertVersion,
+          blobPtr,
+          blob.length,
+          outAppId,
+          outEndpoint,
+          outData,
+          outDataLen,
+          errOut,
+        );
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+            'mailbox_open failed: ${_readErrAndFree(errOut)}',
+            code: rc,
+          );
+        }
+        final appId = Uint8List.fromList(outAppId.asTypedList(32));
+        final endpointId = outEndpoint.value;
+        final dataPtr = outData.value;
+        final dataLen = outDataLen.value;
+        Uint8List payload;
+        if (dataPtr == nullptr) {
+          payload = Uint8List(0);
+        } else {
+          try {
+            payload = Uint8List.fromList(dataPtr.asTypedList(dataLen));
+          } finally {
+            ffi.veilFreeBuf(dataPtr, dataLen);
+          }
+        }
+        return MailboxOpened(
+          appId: appId,
+          endpointId: endpointId,
+          data: payload,
+        );
+      } finally {
+        calloc.free(snd);
+        calloc.free(blobPtr);
+        calloc.free(outAppId);
+        calloc.free(outEndpoint);
+        calloc.free(outData);
+        calloc.free(outDataLen);
+        calloc.free(errOut);
+      }
+    });
+  }
+
   /// Library-internal: construct against a client's borrowed handle.
   /// External code goes through [VeilClient.mailbox] which calls
   /// this with the right pointer.
   static VeilMailbox forHandle(Pointer<ffi.VeilHandle> handle) =>
       VeilMailbox._(handle);
+}
+
+/// Result of [VeilMailbox.open]: the verified destination + plaintext of an
+/// opened offline-mailbox blob.
+class MailboxOpened {
+  /// The verified destination routing target + payload.
+  const MailboxOpened({
+    required this.appId,
+    required this.endpointId,
+    required this.data,
+  });
+
+  /// Verified destination app id (32 bytes).
+  final Uint8List appId;
+
+  /// Verified destination endpoint id.
+  final int endpointId;
+
+  /// Verified plaintext.
+  final Uint8List data;
 }
 
 /// Parse the length-prefixed replica buffer returned by
