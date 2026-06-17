@@ -345,6 +345,10 @@ pub(crate) fn rendezvous_register_publisher(
         validity_window_secs,
         push_envelope: Vec::new(),
         wake_hmac_envelope: Vec::new(),
+        // Onion/ephemeral ads are reached via the blinded descriptor, not
+        // mailbox PUTs — they advertise no relay KEM key.
+        rendezvous_kem_algo: 0,
+        rendezvous_kem_pk: Vec::new(),
         ephemeral_ad_identity,
     };
     let mut entries = lock!(anonymity.rendezvous_publisher_entries);
@@ -2977,6 +2981,10 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                     // Epic 489.10 slice 4.4: surface the sealed wake-HMAC envelope
                     // so the sender can propagate it into the mailbox PUT.
                     wake_hmac_envelope: ad.wake_hmac_envelope,
+                    // v5: the relay's KEM key — the seal target for an anonymous
+                    // mailbox deposit at this relay.
+                    rendezvous_kem_algo: ad.rendezvous_kem_algo,
+                    rendezvous_kem_pk: ad.rendezvous_kem_pk,
                 });
                 if out.len() >= cap {
                     break;
