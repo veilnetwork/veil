@@ -198,6 +198,33 @@ class VeilClient implements Finalizable {
     });
   }
 
+  /// Read the daemon's relay-side X25519 public key (32 bytes) — the seal
+  /// target a sender uses to anonymously deliver to this relay's app
+  /// endpoints (e.g. depositing a mailbox PUT). Returns `null` when the
+  /// daemon is not relay-capable (`anonymity.relay_capable` off).
+  Future<Uint8List?> getRelayX25519Pubkey() async {
+    _ensureOpen();
+    return Future(() {
+      final out = calloc<Uint8>(32);
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        final rc = ffi.veilGetRelayX25519Pubkey(_handle, out, errOut);
+        if (rc == ffi.veilRelayX25519Unavailable) {
+          return null;
+        }
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+              'get_relay_x25519_pubkey failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+        return Uint8List.fromList(out.asTypedList(32));
+      } finally {
+        calloc.free(out);
+        calloc.free(errOut);
+      }
+    });
+  }
+
   /// Register this node as a LOCATION-anonymous (onion) service: the daemon
   /// builds an onion circuit to a rendezvous relay (which never learns this
   /// node's location) and publishes the ad so clients can reach it by identity.
