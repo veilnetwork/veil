@@ -3169,6 +3169,80 @@ impl LookupRendezvousReplicasPayload {
     }
 }
 
+/// Payload [`crate::family::LocalAppMsg::LookupRelayKey`].
+///
+/// Wire layout: `[node_id (32)]` — 32 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LookupRelayKeyPayload {
+    /// Target node whose relay X25519 KEM key we want to resolve.
+    pub node_id: [u8; 32],
+}
+
+impl LookupRelayKeyPayload {
+    pub const WIRE_SIZE: usize = 32;
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.node_id.to_vec()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::WIRE_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::WIRE_SIZE,
+                got: buf.len(),
+            });
+        }
+        Ok(Self {
+            node_id: super::read_array::<32>(buf, 0)?,
+        })
+    }
+}
+
+/// Payload [`crate::family::LocalAppMsg::LookupRelayKeyResp`].
+///
+/// Wire layout: `[present (1) | relay_x25519 (32, only if present == 1)]`.
+/// `present == 0` means unresolved (DHT miss / verification failed) — no key
+/// follows, indistinguishable from "node advertises no relay key".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LookupRelayKeyRespPayload {
+    /// The verified 32-byte X25519 relay KEM key, or `None` if unresolved.
+    pub relay_x25519: Option<[u8; 32]>,
+}
+
+impl LookupRelayKeyRespPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        match self.relay_x25519 {
+            Some(pk) => {
+                let mut b = Vec::with_capacity(33);
+                b.push(1);
+                b.extend_from_slice(&pk);
+                b
+            }
+            None => vec![0u8],
+        }
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        match buf.first() {
+            Some(0) => Ok(Self { relay_x25519: None }),
+            Some(1) => {
+                if buf.len() < 33 {
+                    return Err(ProtoError::BufferTooShort {
+                        need: 33,
+                        got: buf.len(),
+                    });
+                }
+                Ok(Self {
+                    relay_x25519: Some(super::read_array::<32>(buf, 1)?),
+                })
+            }
+            _ => Err(ProtoError::Malformed(
+                "lookup_relay_key_resp: bad/empty present byte".into(),
+            )),
+        }
+    }
+}
+
 /// One replica entry returned by [`LookupRendezvousReplicasRespPayload`].
 ///
 /// Wire layout per entry:

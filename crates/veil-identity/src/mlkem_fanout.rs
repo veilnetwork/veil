@@ -54,6 +54,7 @@ use veil_crypto::x3dh::{
 use veil_proto::identity_document::{ALGO_ED25519, ALGO_FALCON512, IdentityDocument};
 use veil_proto::mlkem_cert::MlKemKeyCert;
 use veil_proto::prekey_bundle::ALGO_ML_KEM_768;
+use veil_proto::relay_key::{RELAY_KEM_ALGO_X25519, RelayKeyRecord, X25519_PK_LEN};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -181,6 +182,78 @@ pub fn verify_mlkem_cert(
         mlkem_pubkey: cert.mlkem_pubkey.clone(),
         cert_version: cert.cert_version,
     })
+}
+
+// ── RelayKeyRecord verification ──────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+pub enum RelayKeyError {
+    #[error("relay_key node_id {record:?} does not match doc {doc:?}")]
+    NodeIdMismatch { record: [u8; 32], doc: [u8; 32] },
+    #[error("relay_key signing_identity_key_idx {idx} out of bounds ({n} keys)")]
+    SigKeyIdxOutOfBounds { idx: u16, n: usize },
+    #[error("relay_key signature invalid under the signing subkey")]
+    SigInvalid,
+    #[error("relay_key is not valid at now (window: {from}..={until}, now = {now})")]
+    NotValidNow { from: u64, until: u64, now: u64 },
+    #[error("relay_key subkey algo {0} is not supported")]
+    UnsupportedSubkeyAlgo(u8),
+    #[error("relay_key KEM algo {0} is not supported")]
+    UnsupportedKemAlgo(u8),
+}
+
+/// Verify a [`RelayKeyRecord`] against a (separately-verified) `IdentityDocument`
+/// for the same `node_id`, returning the authenticated 32-byte X25519 relay KEM
+/// public key. Mirrors [`verify_mlkem_cert`]:
+/// 1. `record.node_id == doc.node_id`.
+/// 2. `record.signing_identity_key_idx` in-bounds for `doc.identity_keys`.
+/// 3. `record.relay_kem_algo` is supported (currently only X25519).
+/// 4. `record.valid_from_unix ≤ now_unix_secs ≤ record.valid_until_unix`.
+/// 5. `record.sig` verifies over `record.signing_message()` under the subkey.
+///
+/// The caller is responsible for verifying `doc` itself (chain to master) and
+/// for picking the highest `record_version` when several records resolve.
+pub fn verify_relay_key(
+    record: &RelayKeyRecord,
+    doc: &IdentityDocument,
+    now_unix_secs: u64,
+) -> Result<[u8; 32], RelayKeyError> {
+    if record.node_id != doc.node_id {
+        return Err(RelayKeyError::NodeIdMismatch {
+            record: record.node_id,
+            doc: doc.node_id,
+        });
+    }
+    let subkey = doc
+        .identity_keys
+        .get(record.signing_identity_key_idx as usize)
+        .ok_or(RelayKeyError::SigKeyIdxOutOfBounds {
+            idx: record.signing_identity_key_idx,
+            n: doc.identity_keys.len(),
+        })?;
+    if record.relay_kem_algo != RELAY_KEM_ALGO_X25519 {
+        return Err(RelayKeyError::UnsupportedKemAlgo(record.relay_kem_algo));
+    }
+    if !record.is_valid_at(now_unix_secs) {
+        return Err(RelayKeyError::NotValidNow {
+            from: record.valid_from_unix,
+            until: record.valid_until_unix,
+            now: now_unix_secs,
+        });
+    }
+    let msg = record.signing_message();
+    verify_subkey_sig(subkey.algo, &subkey.pubkey, &msg, &record.sig).map_err(|e| match e {
+        SubkeySigErr::Unsupported(a) => RelayKeyError::UnsupportedSubkeyAlgo(a),
+        SubkeySigErr::Bad => RelayKeyError::SigInvalid,
+    })?;
+    // Structurally guaranteed by decode for algo 0, but re-assert before we hand
+    // back a fixed-size array so a hand-built record can't slip a short key.
+    let pk: [u8; X25519_PK_LEN] = record
+        .relay_kem_pk
+        .as_slice()
+        .try_into()
+        .map_err(|_| RelayKeyError::UnsupportedKemAlgo(record.relay_kem_algo))?;
+    Ok(pk)
 }
 
 enum SubkeySigErr {
@@ -647,6 +720,79 @@ mod tests {
     // be failing for unrelated reasons.
     fn assert_doc_verifies(env: &Env) {
         verify_identity_document(&env.doc, env.now_unix_secs).expect("doc verifies");
+    }
+
+    fn build_relay_record(env: &Env, kem_pk: [u8; X25519_PK_LEN]) -> RelayKeyRecord {
+        let mut rec = RelayKeyRecord {
+            node_id: env.doc.node_id,
+            relay_kem_algo: RELAY_KEM_ALGO_X25519,
+            relay_kem_pk: kem_pk.to_vec(),
+            valid_from_unix: env.now_unix_secs - 60,
+            valid_until_unix: env.now_unix_secs + 24 * 3600,
+            record_version: 1,
+            signing_identity_key_idx: 0,
+            sig: Vec::new(),
+        };
+        let msg = rec.signing_message();
+        rec.sig = env.sub_sk.sign(&msg).to_bytes().to_vec();
+        rec
+    }
+
+    // ── verify_relay_key ─────────────────────────────────────────────────────
+
+    #[test]
+    fn relay_key_happy_path_returns_kem_pk() {
+        let env = build_env();
+        assert_doc_verifies(&env);
+        let kem = [0x5Au8; X25519_PK_LEN];
+        let rec = build_relay_record(&env, kem);
+        let got = verify_relay_key(&rec, &env.doc, env.now_unix_secs).unwrap();
+        assert_eq!(got, kem, "verify returns the advertised X25519 key");
+    }
+
+    #[test]
+    fn relay_key_tampered_sig_rejected() {
+        let env = build_env();
+        let mut rec = build_relay_record(&env, [0x5A; X25519_PK_LEN]);
+        rec.sig[0] ^= 0xFF;
+        let err = verify_relay_key(&rec, &env.doc, env.now_unix_secs).unwrap_err();
+        assert!(matches!(err, RelayKeyError::SigInvalid), "{err}");
+    }
+
+    #[test]
+    fn relay_key_tampered_pk_rejected() {
+        let env = build_env();
+        let mut rec = build_relay_record(&env, [0x5A; X25519_PK_LEN]);
+        // Flip a key byte WITHOUT re-signing — the signature no longer covers it.
+        rec.relay_kem_pk[0] ^= 0xFF;
+        let err = verify_relay_key(&rec, &env.doc, env.now_unix_secs).unwrap_err();
+        assert!(matches!(err, RelayKeyError::SigInvalid), "{err}");
+    }
+
+    #[test]
+    fn relay_key_node_id_mismatch_rejected() {
+        let env = build_env();
+        let mut rec = build_relay_record(&env, [0x5A; X25519_PK_LEN]);
+        rec.node_id = [0xAB; 32];
+        let err = verify_relay_key(&rec, &env.doc, env.now_unix_secs).unwrap_err();
+        assert!(matches!(err, RelayKeyError::NodeIdMismatch { .. }), "{err}");
+    }
+
+    #[test]
+    fn relay_key_expired_rejected() {
+        let env = build_env();
+        let rec = build_relay_record(&env, [0x5A; X25519_PK_LEN]);
+        let err = verify_relay_key(&rec, &env.doc, rec.valid_until_unix + 1).unwrap_err();
+        assert!(matches!(err, RelayKeyError::NotValidNow { .. }), "{err}");
+    }
+
+    #[test]
+    fn relay_key_sig_key_idx_out_of_bounds_rejected() {
+        let env = build_env();
+        let mut rec = build_relay_record(&env, [0x5A; X25519_PK_LEN]);
+        rec.signing_identity_key_idx = 9; // only 1 key in the doc
+        let err = verify_relay_key(&rec, &env.doc, env.now_unix_secs).unwrap_err();
+        assert!(matches!(err, RelayKeyError::SigKeyIdxOutOfBounds { .. }), "{err}");
     }
 
     // ── verify_mlkem_cert ────────────────────────────────────────────────────
