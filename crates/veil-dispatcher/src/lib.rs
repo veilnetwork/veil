@@ -1202,6 +1202,16 @@ pub struct FrameDispatcher {
     /// `IntroducePayload` frames to the matching subscriber.
     pub rendezvous_registry: Option<Arc<veil_anonymity::rendezvous::RendezvousRegistry>>,
 
+    /// Relay-side registry of receivers' PRIVATE mailbox fetch cookies (kept
+    /// separate from `rendezvous_registry`: the rendezvous cookie is published
+    /// in the ad, so authorizing mailbox fetch against it would let any contact
+    /// drain the mailbox). Populated by `RelayChainMsg::RegisterMailboxCookie`;
+    /// the mailbox bridge consults it to authorize fetch/ack. `None` when the
+    /// node is not a mailbox relay.
+    pub mailbox_cookie_registry: Option<
+        Arc<std::sync::RwLock<veil_anonymity::mailbox_cookie_registry::MailboxCookieRegistry>>,
+    >,
+
     // ── Stateful return circuits (onion-registration epic) ─────────────
     /// Per-hop circuit state for nodes that relay stateful circuits. `None`
     /// when not `relay_capable` (same gate as `rendezvous_registry`). Installed
@@ -1840,6 +1850,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         anonymity_relay_capable: false,
         introduce_replay_cache: Arc::new(veil_anonymity::rendezvous::IntroduceReplayCache::new()),
         rendezvous_registry: None,
+        mailbox_cookie_registry: None,
         circuit_table: None,
         circuit_rendezvous: None,
         circuit_origin: None,
@@ -2541,6 +2552,7 @@ mod tests {
                 veil_anonymity::rendezvous::IntroduceReplayCache::new(),
             ),
             rendezvous_registry: None,
+            mailbox_cookie_registry: None,
             circuit_table: None,
             circuit_rendezvous: None,
             circuit_origin: None,
