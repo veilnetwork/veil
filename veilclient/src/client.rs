@@ -2120,6 +2120,14 @@ pub struct RendezvousReplicaInfo {
     /// `mailbox_put` in that case and the relay falls back to an
     /// unauthenticated wake.
     pub wake_hmac_envelope: Vec<u8>,
+    /// KEM algorithm tag for [`Self::rendezvous_kem_pk`] (`0` = X25519).
+    pub rendezvous_kem_algo: u8,
+    /// The relay's KEM public key from the resolved v5 `RendezvousAd` — the
+    /// seal target the sender passes as `target_x25519_pk` to
+    /// [`VeilClient::send_anonymous_direct`] to anonymously deposit a
+    /// `MailboxPut` at this relay. Empty for pre-v5 ads / no advertised key
+    /// (the sender then falls back to the live rendezvous path).
+    pub rendezvous_kem_pk: Vec<u8>,
 }
 
 /// One outbox entry returned by [`VeilClient::outbox_find_missing`]
@@ -2583,6 +2591,8 @@ async fn reader_task(
                             push_envelope: e.push_envelope,
                             capability_token: e.capability_token,
                             wake_hmac_envelope: e.wake_hmac_envelope,
+                            rendezvous_kem_algo: e.rendezvous_kem_algo,
+                            rendezvous_kem_pk: e.rendezvous_kem_pk,
                         })
                         .collect();
                     let mut d = dispatch.lock().await;
