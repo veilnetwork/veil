@@ -18,9 +18,14 @@ use veil_proto::{
     MailboxPutStatus,
 };
 
-use crate::MailboxBlobOut;
+use veil_proto::ipc::{
+    MailboxCryptoStatus, MailboxOpenPayload, MailboxOpenResultPayload, MailboxSealPayload,
+    MailboxSealResultPayload,
+};
+
 use crate::frame_io::write_frame_wh;
 use crate::server::IpcClientState;
+use crate::{MailboxBlobOut, MailboxCryptoSink, MailboxOpenOutcome, MailboxSealOutcome};
 
 /// Cumulative-byte budget for a single `MailboxFetch` response (audit cycle-9).
 /// Kept well under the IPC frame body cap `MAX_FRAME_BODY` (16 MiB) with room
@@ -251,4 +256,119 @@ mod tests {
         let out = select_bounded_fetch_blobs(raw, 256, 12 * 1024 * 1024);
         assert_eq!(out.len(), 256, "entry-count cap holds when blobs are tiny");
     }
+}
+
+// ── Offline seal/open (node-side E2E crypto, distinct from the relay
+//    Put/Fetch/Ack above) ─────────────────────────────────────────────────────
+
+/// `LocalAppMsg::MailboxSeal`: app asks the node to seal `data` for a recipient
+/// into an offline-mailbox blob (the node holds the sovereign identity + does
+/// the DHT cert resolution). Replies `MailboxSealOk`. Malformed bodies are
+/// dropped silently; a missing sink (feature off) replies `Failed`.
+pub(crate) async fn handle_mailbox_seal(
+    wh: &mut IpcWriteHalf,
+    body: &[u8],
+    mailbox_crypto_sink: Option<&Arc<dyn MailboxCryptoSink>>,
+) -> std::io::Result<()> {
+    let Ok(req) = MailboxSealPayload::decode(body) else {
+        return Ok(());
+    };
+    let reply = match mailbox_crypto_sink {
+        Some(sink) => {
+            match sink
+                .seal_blob(req.recipient_node_id, req.app_id, req.endpoint_id, req.data)
+                .await
+            {
+                MailboxSealOutcome::Ok(blob) => MailboxSealResultPayload {
+                    status: MailboxCryptoStatus::Ok,
+                    blob,
+                },
+                MailboxSealOutcome::NoIdentity => MailboxSealResultPayload {
+                    status: MailboxCryptoStatus::NoIdentity,
+                    blob: Vec::new(),
+                },
+                MailboxSealOutcome::PeerUnresolved => MailboxSealResultPayload {
+                    status: MailboxCryptoStatus::PeerUnresolved,
+                    blob: Vec::new(),
+                },
+                MailboxSealOutcome::Failed => MailboxSealResultPayload {
+                    status: MailboxCryptoStatus::Failed,
+                    blob: Vec::new(),
+                },
+            }
+        }
+        None => MailboxSealResultPayload {
+            status: MailboxCryptoStatus::Failed,
+            blob: Vec::new(),
+        },
+    };
+    write_frame_wh(
+        wh,
+        FrameFamily::LocalApp as u8,
+        LocalAppMsg::MailboxSealOk as u16,
+        &reply.encode(),
+    )
+    .await
+}
+
+/// `LocalAppMsg::MailboxOpen`: app asks the node to open + verify a fetched
+/// mailbox blob (decrypt under our dk_seed, verify the sender's auth-deliver
+/// signature). Replies `MailboxOpenOk` with the verified routing target +
+/// plaintext, or a non-`Ok` status.
+pub(crate) async fn handle_mailbox_open(
+    wh: &mut IpcWriteHalf,
+    body: &[u8],
+    mailbox_crypto_sink: Option<&Arc<dyn MailboxCryptoSink>>,
+) -> std::io::Result<()> {
+    let Ok(req) = MailboxOpenPayload::decode(body) else {
+        return Ok(());
+    };
+    let reply = match mailbox_crypto_sink {
+        Some(sink) => match sink
+            .open_blob(req.blob, req.sender_node_id, req.our_cert_version)
+            .await
+        {
+            MailboxOpenOutcome::Ok {
+                app_id,
+                endpoint_id,
+                data,
+            } => MailboxOpenResultPayload {
+                status: MailboxCryptoStatus::Ok,
+                app_id,
+                endpoint_id,
+                data,
+            },
+            MailboxOpenOutcome::NoIdentity => MailboxOpenResultPayload {
+                status: MailboxCryptoStatus::NoIdentity,
+                app_id: [0u8; 32],
+                endpoint_id: 0,
+                data: Vec::new(),
+            },
+            MailboxOpenOutcome::PeerUnresolved => MailboxOpenResultPayload {
+                status: MailboxCryptoStatus::PeerUnresolved,
+                app_id: [0u8; 32],
+                endpoint_id: 0,
+                data: Vec::new(),
+            },
+            MailboxOpenOutcome::Failed => MailboxOpenResultPayload {
+                status: MailboxCryptoStatus::Failed,
+                app_id: [0u8; 32],
+                endpoint_id: 0,
+                data: Vec::new(),
+            },
+        },
+        None => MailboxOpenResultPayload {
+            status: MailboxCryptoStatus::Failed,
+            app_id: [0u8; 32],
+            endpoint_id: 0,
+            data: Vec::new(),
+        },
+    };
+    write_frame_wh(
+        wh,
+        FrameFamily::LocalApp as u8,
+        LocalAppMsg::MailboxOpenOk as u16,
+        &reply.encode(),
+    )
+    .await
 }
