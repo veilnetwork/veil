@@ -359,120 +359,135 @@ impl DhtMlKemEkResolver {
         Some(pk)
     }
 
-    /// Mirror of `NodeRuntime::dht_recursive_get` adapted for the shared
-    /// references that this resolver holds.  Does NOT depend on the
-    /// surrounding NodeRuntime so this module stays self-contained.
+    /// Recursive DHT FIND_VALUE walk — delegates to the shared
+    /// [`recursive_dht_get`] free function (also used by the rendezvous
+    /// resolver), passing this resolver's shared references.
     async fn dht_recursive_get(
         &self,
         key: [u8; 32],
         timeout: Duration,
         is_valid: impl Fn(&[u8]) -> bool,
     ) -> Option<Vec<u8>> {
-        // Validated local fast path. Only trust a locally mirror-cached value
-        // if it passes the caller's verification. A malicious FIND_VALUE
-        // responder can mirror-poison the local cache with a structurally-valid
-        // but forged identity-family record (NM/ID/IR/MC) under the victim's
-        // key — the dispatcher's `mirror_cache_key_ok` intentionally caches
-        // those without a signature check (verification is the resolver's job).
-        // Without this gate the poisoned entry short-circuits the remote walk
-        // and the caller's verify then yields `None` => persistent targeted DoS
-        // of cold-start E2E key resolution. On an invalid local value we fall
-        // through to the remote walk. (audit: DHT mirror-cache poisoning.)
-        if let Some(value) = self.dht.get_local(&key)
-            && is_valid(&value)
-        {
-            return Some(value);
-        }
-        // Drop the validator before the awaits below so it is never held across
-        // an await point (keeps this future `Send` regardless of its captures).
-        drop(is_valid);
-
-        // Pick the closest active session peers; bail if there are no
-        // peers to forward (solo recursive walk impossible).
-        let mut peers: Vec<[u8; 32]> = rlock!(self.session_tx_registry).peer_ids();
-        if peers.is_empty() {
-            return None;
-        }
-        peers.sort_by_key(|pid| {
-            let mut xor = [0u8; 32];
-            for i in 0..32 {
-                xor[i] = pid[i] ^ key[i];
-            }
-            xor
-        });
-
-        // Build the RecursiveQuery frame.
-        let query_id: [u8; 16] = {
-            let mut id = [0u8; 16];
-            rand_core::OsRng.fill_bytes(&mut id);
-            id
-        };
-        let q = RecursiveQueryPayload {
-            query_id,
-            target_key: key,
-            reply_to: self.local_node_id,
-            ttl: 40,
-            query_type: recursive_query_type::FIND_VALUE,
-            reply_port: 0,
-            payload: vec![],
-        };
-        let q_bytes = q.encode();
-        let mut hdr = FrameHeader::new(
-            veil_proto::family::FrameFamily::Routing as u8,
-            veil_proto::family::RoutingMsg::RecursiveQuery as u16,
-        );
-        hdr.body_len = q_bytes.len() as u32;
-        let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
-        frame.extend_from_slice(&q_bytes);
-
-        // Register oneshot for the matching RecursiveResponse.
-        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
-        {
-            use veil_proto::budget::MAX_PENDING_RECURSIVE;
-            let mut m = lock!(self.pending_recursive);
-            m.retain(|_, p| !p.tx.is_closed());
-            if m.len() >= MAX_PENDING_RECURSIVE {
-                return None;
-            }
-            m.insert(
-                query_id,
-                PendingRecursive {
-                    target_key: key,
-                    query_type: recursive_query_type::FIND_VALUE,
-                    tx,
-                },
-            );
-        }
-
-        // Forward to top-2 closest peers.
-        {
-            let guard = rlock!(self.session_tx_registry);
-            for pid in peers.iter().take(2) {
-                guard.send_to(
-                    pid,
-                    veil_proto::header::priority::INTERACTIVE,
-                    frame.clone(),
-                );
-            }
-        }
-
-        // Wait for the response OR timeout.
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(bytes)) => Some(bytes),
-            _ => {
-                // Cleanup pending entry on timeout — the dispatcher's
-                // own cleanup is best-effort but explicit removal here
-                // bounds memory deterministically.
-                let mut m = lock!(self.pending_recursive);
-                m.remove(&query_id);
-                None
-            }
-        }
+        recursive_dht_get(
+            &self.dht,
+            &self.session_tx_registry,
+            &self.pending_recursive,
+            self.local_node_id,
+            key,
+            timeout,
+            is_valid,
+        )
+        .await
     }
 
     fn log_dbg(&self, event: &'static str, node_id: &[u8; 32], detail: &str) {
         self.logger
             .debug(event, format!("target={} {}", hex8(node_id), detail));
+    }
+}
+
+/// Recursive DHT FIND_VALUE walk shared by the DHT resolvers (ML-KEM EK,
+/// relay-key, and rendezvous-ad). Mirrors `NodeRuntime::dht_recursive_get` but
+/// takes the shared references explicitly so it doesn't depend on any one
+/// resolver struct. Validated-local-fast-path (mirror-cache-poison resistant) →
+/// forward a `RecursiveQuery(FIND_VALUE)` to the top-2 closest session peers →
+/// await the matching `RecursiveResponse`. Returns `None` on local-miss +
+/// no-peers / timeout. `is_valid` gates ONLY the local fast path.
+#[allow(clippy::type_complexity)]
+pub(crate) async fn recursive_dht_get(
+    dht: &Arc<KademliaService>,
+    session_tx_registry: &Arc<RwLock<SessionTxRegistry>>,
+    pending_recursive: &Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
+    local_node_id: [u8; 32],
+    key: [u8; 32],
+    timeout: Duration,
+    is_valid: impl Fn(&[u8]) -> bool,
+) -> Option<Vec<u8>> {
+    // Validated local fast path. Only trust a locally mirror-cached value if it
+    // passes the caller's verification (a malicious FIND_VALUE responder can
+    // mirror-poison the local cache with a structurally-valid but forged
+    // identity-family record under the victim's key; verification is the
+    // resolver's job). On an invalid local value we fall through to the walk.
+    if let Some(value) = dht.get_local(&key)
+        && is_valid(&value)
+    {
+        return Some(value);
+    }
+    // Drop the validator before the awaits so it is never held across an await
+    // point (keeps the future `Send` regardless of its captures).
+    drop(is_valid);
+
+    let mut peers: Vec<[u8; 32]> = rlock!(session_tx_registry).peer_ids();
+    if peers.is_empty() {
+        return None;
+    }
+    peers.sort_by_key(|pid| {
+        let mut xor = [0u8; 32];
+        for i in 0..32 {
+            xor[i] = pid[i] ^ key[i];
+        }
+        xor
+    });
+
+    let query_id: [u8; 16] = {
+        let mut id = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut id);
+        id
+    };
+    let q = RecursiveQueryPayload {
+        query_id,
+        target_key: key,
+        reply_to: local_node_id,
+        ttl: 40,
+        query_type: recursive_query_type::FIND_VALUE,
+        reply_port: 0,
+        payload: vec![],
+    };
+    let q_bytes = q.encode();
+    let mut hdr = FrameHeader::new(
+        veil_proto::family::FrameFamily::Routing as u8,
+        veil_proto::family::RoutingMsg::RecursiveQuery as u16,
+    );
+    hdr.body_len = q_bytes.len() as u32;
+    let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
+    frame.extend_from_slice(&q_bytes);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    {
+        use veil_proto::budget::MAX_PENDING_RECURSIVE;
+        let mut m = lock!(pending_recursive);
+        m.retain(|_, p| !p.tx.is_closed());
+        if m.len() >= MAX_PENDING_RECURSIVE {
+            return None;
+        }
+        m.insert(
+            query_id,
+            PendingRecursive {
+                target_key: key,
+                query_type: recursive_query_type::FIND_VALUE,
+                tx,
+            },
+        );
+    }
+
+    {
+        let guard = rlock!(session_tx_registry);
+        for pid in peers.iter().take(2) {
+            guard.send_to(
+                pid,
+                veil_proto::header::priority::INTERACTIVE,
+                frame.clone(),
+            );
+        }
+    }
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(bytes)) => Some(bytes),
+        _ => {
+            let mut m = lock!(pending_recursive);
+            m.remove(&query_id);
+            None
+        }
     }
 }
 
