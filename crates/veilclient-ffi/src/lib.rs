@@ -2460,9 +2460,12 @@ unsafe fn mailbox_put_inner(
 ///     push_envelope_len:      u16, push_envelope:      [u8; len]
 ///     capability_token_len:   u16, capability_token:   [u8; len]
 ///     wake_hmac_envelope_len: u16, wake_hmac_envelope: [u8; len]
+///     rendezvous_kem_algo:    u8
+///     rendezvous_kem_pk_len:  u16, rendezvous_kem_pk:  [u8; len]
 fn serialize_replica_buf(replicas: &[veilclient::RendezvousReplicaInfo]) -> Vec<u8> {
     // Pre-size exactly: 4-byte count header + per-entry fixed 32+8 plus
-    // three u16 length prefixes (6) plus each blob's bytes.
+    // three u16 length prefixes (6) plus the v5 KEM trailer (1-byte algo + a
+    // u16 length prefix = 3) plus each blob's bytes.
     let body: usize = replicas
         .iter()
         .map(|r| {
@@ -2471,6 +2474,8 @@ fn serialize_replica_buf(replicas: &[veilclient::RendezvousReplicaInfo]) -> Vec<
                 + r.push_envelope.len()
                 + r.capability_token.len()
                 + r.wake_hmac_envelope.len()
+                + 3
+                + r.rendezvous_kem_pk.len()
         })
         .sum();
     let mut buf = Vec::with_capacity(4 + body);
@@ -2500,6 +2505,12 @@ fn serialize_replica_buf(replicas: &[veilclient::RendezvousReplicaInfo]) -> Vec<
             buf.extend_from_slice(&(len as u16).to_le_bytes());
             buf.extend_from_slice(&blob[..len]);
         }
+        // v5 KEM trailer: 1-byte algo + u16-length-prefixed relay KEM pubkey.
+        // Same self-consistent clamp as the blobs above (capped ≤ 2048 today).
+        buf.push(r.rendezvous_kem_algo);
+        let kem_len = r.rendezvous_kem_pk.len().min(u16::MAX as usize);
+        buf.extend_from_slice(&(kem_len as u16).to_le_bytes());
+        buf.extend_from_slice(&r.rendezvous_kem_pk[..kem_len]);
     }
     buf
 }
@@ -2532,8 +2543,10 @@ fn serialize_replica_buf(replicas: &[veilclient::RendezvousReplicaInfo]) -> Vec<
 ///     push_envelope_len:      u16, push_envelope:      [u8; len]
 ///     capability_token_len:   u16, capability_token:   [u8; len]
 ///     wake_hmac_envelope_len: u16, wake_hmac_envelope: [u8; len]
+///     rendezvous_kem_algo:    u8
+///     rendezvous_kem_pk_len:  u16, rendezvous_kem_pk:  [u8; len]
 /// (Per-blob length is u16; every blob is backend-capped well under
-/// 64 KiB — push ≤ 512 B, cap-token and wake-HMAC envelopes likewise.)
+/// 64 KiB — push ≤ 512 B, cap-token / wake-HMAC / relay-KEM-pk likewise.)
 ///
 /// # Safety
 /// `handle` MUST be a live `VeilHandle*` from `veil_connect`.
@@ -6178,7 +6191,9 @@ mod tests {
     /// reusing the serializer, so a layout change in either direction
     /// fails the round-trip.
     #[allow(clippy::type_complexity)]
-    fn parse_replica_buf(buf: &[u8]) -> Vec<([u8; 32], u64, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    fn parse_replica_buf(
+        buf: &[u8],
+    ) -> Vec<([u8; 32], u64, Vec<u8>, Vec<u8>, Vec<u8>, u8, Vec<u8>)> {
         let mut off = 0usize;
         let take = |buf: &[u8], off: &mut usize, n: usize| -> Vec<u8> {
             let out = buf[*off..*off + n].to_vec();
@@ -6199,7 +6214,11 @@ mod tests {
             let wake = blobs.pop().unwrap();
             let cap = blobs.pop().unwrap();
             let push = blobs.pop().unwrap();
-            out.push((rid, valid, push, cap, wake));
+            // v5 KEM trailer: algo byte + u16-len-prefixed pubkey.
+            let kem_algo = take(buf, &mut off, 1)[0];
+            let kem_len = u16::from_le_bytes(take(buf, &mut off, 2).try_into().unwrap()) as usize;
+            let kem_pk = take(buf, &mut off, kem_len);
+            out.push((rid, valid, push, cap, wake, kem_algo, kem_pk));
         }
         assert_eq!(off, buf.len(), "no trailing bytes in replica buffer");
         out
@@ -6214,19 +6233,24 @@ mod tests {
                 push_envelope: vec![1, 2, 3, 4, 5],
                 capability_token: vec![9, 8, 7],
                 wake_hmac_envelope: vec![0xAA, 0xBB],
+                rendezvous_kem_algo: 0,
+                rendezvous_kem_pk: vec![0xCC, 0xDD, 0xEE],
             },
-            // Second entry exercises empty blobs (all three len-prefixes 0).
+            // Second entry exercises empty blobs (all len-prefixes 0, incl. KEM).
             veilclient::RendezvousReplicaInfo {
                 relay_node_id: [0x22; 32],
                 valid_until_unix: 0,
                 push_envelope: vec![],
                 capability_token: vec![],
                 wake_hmac_envelope: vec![],
+                rendezvous_kem_algo: 0,
+                rendezvous_kem_pk: vec![],
             },
         ];
         let buf = serialize_replica_buf(&replicas);
-        // count header (4) + entry0 (32+8 + (2+5)+(2+3)+(2+2)) + entry1 (32+8 + 2+2+2)
-        let expected_len = 4 + (32 + 8 + 7 + 5 + 4) + (32 + 8 + 2 + 2 + 2);
+        // count(4) + entry0 (32+8 + (2+5)+(2+3)+(2+2) + 1+(2+3))
+        //          + entry1 (32+8 + 2+2+2 + 1+2)
+        let expected_len = 4 + (32 + 8 + 7 + 5 + 4 + 1 + 5) + (32 + 8 + 2 + 2 + 2 + 1 + 2);
         assert_eq!(buf.len(), expected_len, "exact serialized length");
 
         let parsed = parse_replica_buf(&buf);
@@ -6236,11 +6260,15 @@ mod tests {
         assert_eq!(parsed[0].2, vec![1, 2, 3, 4, 5]);
         assert_eq!(parsed[0].3, vec![9, 8, 7]);
         assert_eq!(parsed[0].4, vec![0xAA, 0xBB]);
+        assert_eq!(parsed[0].5, 0);
+        assert_eq!(parsed[0].6, vec![0xCC, 0xDD, 0xEE]);
         assert_eq!(parsed[1].0, [0x22; 32]);
         assert_eq!(parsed[1].1, 0);
         assert!(parsed[1].2.is_empty());
         assert!(parsed[1].3.is_empty());
         assert!(parsed[1].4.is_empty());
+        assert_eq!(parsed[1].5, 0);
+        assert!(parsed[1].6.is_empty());
     }
 
     #[test]
@@ -6266,6 +6294,8 @@ mod tests {
             push_envelope: vec![0; 10],
             capability_token: vec![1; 4],
             wake_hmac_envelope: vec![2; 6],
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: vec![3; 8],
         }];
         let mut buf = serialize_replica_buf(&replicas);
         buf.shrink_to_fit();

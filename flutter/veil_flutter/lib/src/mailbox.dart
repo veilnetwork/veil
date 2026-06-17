@@ -682,12 +682,25 @@ List<RendezvousReplica> _parseReplicaBuffer(Uint8List bytes) {
     final capabilityToken = takeBytes(capLen, 'capability_token');
     final wakeLen = needU16();
     final wakeHmacEnvelope = takeBytes(wakeLen, 'wake_hmac_envelope');
+    // v5 KEM trailer: algo byte + u16-length-prefixed relay KEM pubkey.
+    if (off + 1 > total) {
+      throw VeilException(
+        'malformed replica buffer: want rendezvous_kem_algo:u8 at $off, '
+        'have $total',
+      );
+    }
+    final rendezvousKemAlgo = data.getUint8(off);
+    off += 1;
+    final kemLen = needU16();
+    final rendezvousKemPk = takeBytes(kemLen, 'rendezvous_kem_pk');
     replicas.add(RendezvousReplica(
       relayNodeId: relayNodeId,
       validUntilUnix: validUntilUnix,
       pushEnvelope: pushEnvelope,
       capabilityToken: capabilityToken,
       wakeHmacEnvelope: wakeHmacEnvelope,
+      rendezvousKemAlgo: rendezvousKemAlgo,
+      rendezvousKemPk: rendezvousKemPk,
     ));
   }
   // Defensive (audit F3): the buffer must be fully consumed. A daemon bug that

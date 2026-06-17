@@ -221,6 +221,8 @@ class RendezvousReplica {
     required this.pushEnvelope,
     required this.capabilityToken,
     required this.wakeHmacEnvelope,
+    this.rendezvousKemAlgo = 0,
+    this.rendezvousKemPk = const [],
   });
 
   /// 32-byte node_id of the relay hosting this replica.
@@ -245,11 +247,22 @@ class RendezvousReplica {
   /// published no wake-HMAC envelope for this replica.
   final Uint8List wakeHmacEnvelope;
 
+  /// KEM algorithm tag for [rendezvousKemPk] (`0` = X25519).
+  final int rendezvousKemAlgo;
+
+  /// The relay's KEM public key from the resolved v5 RendezvousAd — the seal
+  /// target the sender passes as `targetX25519Pk` to
+  /// [VeilClient.sendAnonymousDirect] to anonymously deposit a mailbox PUT at
+  /// this relay's `(relayNodeId, MAILBOX_APP_ID, PUT_ENDPOINT)`. Empty for
+  /// pre-v5 ads / no advertised key (fall back to the live rendezvous path).
+  final List<int> rendezvousKemPk;
+
   @override
   String toString() =>
       'RendezvousReplica(relayNodeId=<${relayNodeId.length}B>, '
       'validUntilUnix=$validUntilUnix, pushLen=${pushEnvelope.length}, '
-      'capLen=${capabilityToken.length}, wakeLen=${wakeHmacEnvelope.length})';
+      'capLen=${capabilityToken.length}, wakeLen=${wakeHmacEnvelope.length}, '
+      'kemAlgo=$rendezvousKemAlgo, kemPkLen=${rendezvousKemPk.length})';
 }
 
 /// Result wire byte from a bootstrap-invite consume (Epic 489.7).
