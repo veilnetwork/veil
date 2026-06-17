@@ -68,6 +68,7 @@ pub use service::{
 };
 
 pub mod capability;
+pub mod fetch_cookie;
 pub use capability::{
     ALGO_ED25519, ALGO_FALCON512, CapTokenError, MAX_TOKEN_BYTES as MAX_CAPABILITY_TOKEN_BYTES,
     MailboxCapabilityToken, SIGN_CONTEXT as CAPABILITY_SIGN_CONTEXT,
