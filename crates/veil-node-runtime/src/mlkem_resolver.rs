@@ -109,24 +109,19 @@ impl DhtMlKemEkResolver {
     /// Core resolution body.  Each branch returns `None` on any failure
     /// — see module docstring.  Loggable failure points emit DEBUG events
     /// via `NodeLogger` so operators can diagnose with `log_level = "debug"`.
-    /// Resolve + verify the recipient's current ML-KEM cert — the full
-    /// [`VerifiedMlkemCert`] (instance_id + cert_version + node_id + EK), not
-    /// just the EK — via the DHT walk IdentityDocument → InstanceRegistry →
-    /// MlKemKeyCert, writing the EK back to the peer cache. Public so the fan-out
-    /// mailbox-seal path can obtain a cert (fan-out binds instance_id +
-    /// cert_version, which the EK-only [`resolve_ek`](MlKemEkResolver::resolve_ek)
-    /// surface discards).
-    pub async fn fetch_verified_cert(
+    /// Fetch + verify the target's `IdentityDocument` from the DHT (step 1 of
+    /// the cert walk, on its own). Public so the mailbox OPEN path can obtain the
+    /// sender's verified document — needed to check the auth-deliver signature —
+    /// without resolving an ML-KEM cert. Returns `None` on a DHT miss, a decode
+    /// failure, an invalid document signature, or a node_id mismatch.
+    pub async fn fetch_verified_document(
         &self,
         target_node_id: [u8; 32],
-    ) -> Option<VerifiedMlkemCert> {
-        self.log_dbg("mlkem_resolver.start", &target_node_id, "");
+    ) -> Option<IdentityDocument> {
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_secs();
-
-        // ── Step 1: IdentityDocument ────────────────────────────────
         let doc_key = IdentityDocument::dht_key(&target_node_id);
         let doc_bytes = match self
             .dht_recursive_get(doc_key, self.step_timeout, |b| {
@@ -168,6 +163,27 @@ impl DhtMlKemEkResolver {
             );
             return None;
         }
+        Some(doc)
+    }
+
+    /// Resolve + verify the recipient's current ML-KEM cert — the full
+    /// [`VerifiedMlkemCert`] (instance_id + cert_version + node_id + EK), not
+    /// just the EK — via the DHT walk IdentityDocument → InstanceRegistry →
+    /// MlKemKeyCert, writing the EK back to the peer cache. Public so the fan-out
+    /// mailbox-seal path can obtain a cert (fan-out binds instance_id +
+    /// cert_version, which the EK-only [`resolve_ek`](MlKemEkResolver::resolve_ek)
+    /// surface discards).
+    pub async fn fetch_verified_cert(
+        &self,
+        target_node_id: [u8; 32],
+    ) -> Option<VerifiedMlkemCert> {
+        self.log_dbg("mlkem_resolver.start", &target_node_id, "");
+        // ── Step 1: IdentityDocument ────────────────────────────────
+        let doc = self.fetch_verified_document(target_node_id).await?;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
 
         // ── Step 2: InstanceRegistry ────────────────────────────────
         let reg_key = InstanceRegistry::dht_key(&target_node_id);
