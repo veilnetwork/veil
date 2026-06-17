@@ -26,6 +26,10 @@ pub const MAILBOX_COOKIE_LEN: usize = 16;
 /// previous epoch).
 pub const MAX_COOKIES_PER_RECEIVER: usize = 2;
 
+/// Default cap on distinct receivers a relay tracks cookies for (LRU-evicted).
+/// ~50 bytes/receiver, so 64k ≈ 3 MiB worst case.
+pub const DEFAULT_MAX_RECEIVERS: usize = 65_536;
+
 type Cookie = [u8; MAILBOX_COOKIE_LEN];
 
 /// Constant-time equality for cookies — never early-exits, so a probing
@@ -131,6 +135,40 @@ impl MailboxCookieRegistry {
     }
 }
 
+/// Wire payload for `RelayChainMsg::RegisterMailboxCookie` (receiver → relay):
+/// just the 16-byte private fetch cookie. The receiver is the AUTHENTICATED
+/// session source, so there is no spoofable `receiver_id` in the body — a node
+/// can only register its own mailbox cookie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterMailboxCookiePayload {
+    /// The private fetch cookie to register for the (authenticated) sender.
+    pub cookie: [u8; MAILBOX_COOKIE_LEN],
+}
+
+impl RegisterMailboxCookiePayload {
+    /// Fixed wire size.
+    pub const WIRE_SIZE: usize = MAILBOX_COOKIE_LEN;
+
+    /// Encode to wire bytes.
+    #[must_use]
+    pub fn encode(&self) -> [u8; MAILBOX_COOKIE_LEN] {
+        self.cookie
+    }
+
+    /// Decode from wire bytes.
+    ///
+    /// # Errors
+    /// Returns an error string if `buf` is shorter than [`Self::WIRE_SIZE`].
+    pub fn decode(buf: &[u8]) -> Result<Self, &'static str> {
+        if buf.len() < Self::WIRE_SIZE {
+            return Err("RegisterMailboxCookiePayload: buffer too short");
+        }
+        let mut cookie = [0u8; MAILBOX_COOKIE_LEN];
+        cookie.copy_from_slice(&buf[..MAILBOX_COOKIE_LEN]);
+        Ok(Self { cookie })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +177,13 @@ mod tests {
     const R2: [u8; 32] = [2; 32];
     fn ck(b: u8) -> Cookie {
         [b; MAILBOX_COOKIE_LEN]
+    }
+
+    #[test]
+    fn payload_round_trips_and_rejects_short() {
+        let p = RegisterMailboxCookiePayload { cookie: ck(0x5A) };
+        assert_eq!(RegisterMailboxCookiePayload::decode(&p.encode()).unwrap(), p);
+        assert!(RegisterMailboxCookiePayload::decode(&[0u8; 15]).is_err());
     }
 
     #[test]

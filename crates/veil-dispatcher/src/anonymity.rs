@@ -127,6 +127,9 @@ impl FrameDispatcher {
             RelayChainMsg::UnregisterRendezvous => {
                 return self.handle_unregister_rendezvous(body, node_id);
             }
+            RelayChainMsg::RegisterMailboxCookie => {
+                return self.handle_register_mailbox_cookie(body, node_id);
+            }
             RelayChainMsg::ForwardIntroduce => return self.handle_forward_introduce(body, node_id),
             // Stateful return circuits (onion-registration epic). Control frames
             // over an established session (NOT fixed CELL_SIZE), so return before
@@ -399,6 +402,41 @@ impl FrameDispatcher {
         // veil-anonymity crate — convert to NodeId at the boundary.
         let target = NodeId::from(subscriber.peer_node_id);
         self.send_relay_chain_msg(&target, RelayChainMsg::ForwardIntroduce, &body_bytes);
+        DispatchResult::NoResponse
+    }
+
+    /// Receiver → relay: register a PRIVATE mailbox fetch cookie, keyed by the
+    /// authenticated session source (`node_id`) — so a node can only register
+    /// its own. Stored in the mailbox-specific registry (NOT the rendezvous one),
+    /// which the mailbox bridge consults to authorize fetch/ack. Fire-and-forget
+    /// (no reply); the receiver re-registers each epoch.
+    fn handle_register_mailbox_cookie(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
+        use veil_anonymity::mailbox_cookie_registry::RegisterMailboxCookiePayload;
+        let req = match RegisterMailboxCookiePayload::decode(body) {
+            Ok(p) => p,
+            Err(e) => {
+                return DispatchResult::Violation(format!("RegisterMailboxCookie decode: {e}"));
+            }
+        };
+        let Some(reg) = &self.mailbox_cookie_registry else {
+            // Node is not a mailbox relay — anti-leak silent drop (a Violation
+            // would identify "this node won't serve as a mailbox" to a prober).
+            return DispatchResult::NoResponse;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(mut w) = reg.write() {
+            w.register(*node_id.as_bytes(), req.cookie, now);
+            self.logger.info(
+                "mailbox.cookie.register.ok",
+                format!(
+                    "registered mailbox fetch-cookie from peer={}",
+                    veil_util::hex_short(node_id.as_bytes())
+                ),
+            );
+        }
         DispatchResult::NoResponse
     }
 
