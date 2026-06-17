@@ -44,7 +44,7 @@
 //!
 //! ```text
 //! magic : 2 B ("RA" — Rendezvous Ad)
-//! version : 1 B (1 = legacy without push_envelope; 2 = current with push_envelope)
+//! version : 1 B (1..=5; see "Version compatibility" below)
 //! sig_algo: 1 B (0=Ed25519, 1=Falcon-512, 2=Hybrid)
 //! receiver_node_id : 32 B (BLAKE3 of receiver's identity pubkey)
 //! rendezvous_node_id : 32 B (third-party meeting point, operator's choice)
@@ -52,29 +52,41 @@
 //! receiver_x25519_pk : 32 B (sender encrypts Introduce frame to this key)
 //! valid_from_unix : 8 B (BE)
 //! valid_until_unix : 8 B (BE)
-//! push_envelope_len : 2 B (BE; cap = 512; 0 = no push registered) — v2 only
+//! push_envelope_len : 2 B (BE; cap = 512; 0 = no push registered) — v2+
 //! push_envelope : var (opaque sealed FCM/APNs token, decryptable
 //! only by a push-relay operator the receiver trusts;
 //! relays on the path forward this verbatim to the
 //! configured push-relay when delivering an Introduce.
 //! Sealing format defined separately in push_envelope.rs;
-//! this layer treats the bytes as opaque.) — v2 only
+//! this layer treats the bytes as opaque.) — v2+
+//! capability_token_len : 2 B (BE; cap = 2048; 0 = none) — v3+
+//! capability_token : var (receiver-signed mailbox-PUT cap token) — v3+
+//! wake_hmac_env_len : 2 B (BE; cap = 128; 0 = none) — v4+
+//! wake_hmac_envelope : var (sealed wake-HMAC key to push-relay) — v4+
+//! rendezvous_kem_algo : 1 B (0 = X25519; reserved: ML-KEM) — v5+
+//! rendezvous_kem_pk_len: 2 B (BE; cap = 2048; 0 = no relay key) — v5+
+//! rendezvous_kem_pk : var (the RELAY's KEM pubkey — seal target for an
+//! anonymous mailbox PUT to this relay) — v5+
 //! issuer_pk_len : 2 B (BE; cap = 2048)
 //! issuer_pk : var (base64 of receiver's identity pubkey, utf-8)
 //! signature_len : 2 B (BE; cap = 2048)
 //! signature : var (issuer's signature over canonical message — covers
-//! push_envelope so a censor cannot strip / swap it)
+//! every field above incl. the length-prefixed envelopes /
+//! cap-token / relay KEM key, so a censor cannot strip,
+//! swap, or downgrade them)
 //! ```
 //!
 //! Typical Ed25519 ad: ~190 B. Typical Falcon-512: ~1.6 KiB. Hard
-//! cap: 4 KiB (matches MAX_DIRECTORY_ENTRY_BYTES — single audit
-//! ceiling for anonymity wire formats).
+//! cap: 8 KiB ([`MAX_RENDEZVOUS_AD_BYTES`]).
 //!
-//! Version compatibility: decoder accepts BOTH v1 (no push envelope —
-//! returns `push_envelope = vec![]`) and v2 (current). Encoder always
-//! emits v2 since the wire is not-live; legacy v1 ads stored in the
-//! DHT during the transition decode cleanly and re-sign as v2 on the
-//! receiver's next maintenance-tick refresh.
+//! Version compatibility: the decoder accepts v1..=v5 — each version is an
+//! additive superset of the prior, so a field is present iff
+//! `version >= the version that introduced it` (v2: push_envelope, v3:
+//! capability_token, v4: wake_hmac_envelope, v5: rendezvous_kem_*). Older ads
+//! decode with the newer fields empty. The encoder always emits v5; legacy ads
+//! stored in the DHT re-sign as v5 on the receiver's next maintenance-tick
+//! refresh. Each version has a DISJOINT signing domain (`:vN\0`) so a captured
+//! ad cannot be replayed or downgraded across versions.
 //!
 //! # Anti-tamper
 //!
@@ -98,12 +110,17 @@ const MAGIC: &[u8; 2] = b"RA";
 const VERSION_LEGACY: u8 = 1;
 const VERSION_V2: u8 = 2;
 const VERSION_V3: u8 = 3;
-/// Current wire-format version.  v4 adds the `wake_hmac_envelope`
-/// field (Epic 489.10 slice 4.3.2 — sealed wake-up HMAC key to the
-/// receiver's chosen push-relay).  Encoder always emits v4, decoder
-/// accepts v1 / v2 / v3 / v4 (older versions yield empty
-/// `wake_hmac_envelope`).
-const VERSION: u8 = 4;
+const VERSION_V4: u8 = 4;
+/// Current wire-format version.  v5 adds the relay's KEM public key
+/// (`rendezvous_kem_algo` + `rendezvous_kem_pk`) so a sender can anonymously
+/// deposit a mailbox PUT directly at the rendezvous relay without a second
+/// identity lookup.  The key is ALGORITHM-TAGGED + variable-length so the
+/// transport KEM can migrate to a post-quantum scheme (ML-KEM) without another
+/// wire-format break — `algo = 0` is classical X25519 (32 B), the only value
+/// produced/consumed today.  Encoder (v5 signer) always emits v5; decoder
+/// accepts v1 / v2 / v3 / v4 / v5 (older versions yield empty KEM fields,
+/// i.e. `algo = 0`, `pk = []` — "no relay key advertised").
+const VERSION: u8 = 5;
 // Domain separator bumped with v3 → v4 alongside the wire-format version
 // so that signatures over old (no-wake-HMAC) and new (wake-HMAC-aware)
 // ads cannot replay across versions — a censor that captured an old
@@ -116,6 +133,11 @@ const SIG_DOMAIN_V1: &[u8] = b"veil-rendezvous-ad:v1\0";
 const SIG_DOMAIN_V2: &[u8] = b"veil-rendezvous-ad:v2\0";
 const SIG_DOMAIN_V3: &[u8] = b"veil-rendezvous-ad:v3\0";
 const SIG_DOMAIN_V4: &[u8] = b"veil-rendezvous-ad:v4\0";
+// Domain bumped v4 → v5 alongside the wire bump: a censor that captured an
+// old v4 ad cannot forge a v5 by appending an arbitrary KEM key, since v5
+// canonical-message construction binds `rendezvous_kem_algo` + the
+// length-prefixed `rendezvous_kem_pk`, and v4's signing domain locks `:v4\0`.
+const SIG_DOMAIN_V5: &[u8] = b"veil-rendezvous-ad:v5\0";
 const NODE_ID_LEN: usize = 32;
 const X25519_PK_LEN: usize = 32;
 const AUTH_COOKIE_LEN: usize = 16;
@@ -149,6 +171,18 @@ pub const MAX_CAPABILITY_TOKEN_LEN: usize = 2048;
 /// key).  Receivers que opt out of HMAC authentication publish empty
 /// (`vec![]`); pre-v4 ads decoded under new code also yield empty.
 pub const MAX_WAKE_HMAC_ENVELOPE_LEN: usize = 128;
+
+/// KEM algorithm tag for `rendezvous_kem_pk` (v5+). `0` = classical X25519
+/// (32-byte key — the only value produced/consumed today). Reserved:
+/// `1` = ML-KEM-768, `2` = X25519+ML-KEM-768 hybrid. The tag lets the
+/// transport KEM migrate to post-quantum without another ad wire-format break.
+pub const RENDEZVOUS_KEM_ALGO_X25519: u8 = 0;
+
+/// Cap on `rendezvous_kem_pk` (v5+). Sized to fit an ML-KEM-768 public key
+/// (1184 B) with slack for a hybrid (X25519 ‖ ML-KEM-768 ≈ 1216 B) and future
+/// PQ schemes, while staying well under [`MAX_RENDEZVOUS_AD_BYTES`]. Today's
+/// X25519 key is 32 B. Empty (`vec![]`) = no relay key advertised.
+pub const MAX_RENDEZVOUS_KEM_PK_LEN: usize = 2048;
 
 /// Hard cap on wire size. Sized to accommodate Falcon-512
 /// (~1.2 KiB pubkey + ~700 B sig) plus the field overhead PLUS
@@ -194,6 +228,8 @@ pub enum RendezvousError {
     CapabilityTokenTooLarge { got: usize },
     #[error("wake_hmac_envelope_len {got} > {MAX_WAKE_HMAC_ENVELOPE_LEN} cap")]
     WakeHmacEnvelopeTooLarge { got: usize },
+    #[error("rendezvous_kem_pk_len {got} > {MAX_RENDEZVOUS_KEM_PK_LEN} cap")]
+    KemPkTooLarge { got: usize },
     #[error("validity window {got} secs > {MAX_VALIDITY_WINDOW_SECS} cap")]
     ValidityWindowTooLarge { got: u64 },
     #[error("inverted validity window: valid_from {from} > valid_until {until}")]
@@ -273,6 +309,21 @@ pub struct RendezvousAd {
     /// receivers running with trust-the-rate-limit only).  Cap
     /// [`MAX_WAKE_HMAC_ENVELOPE_LEN`].
     pub wake_hmac_envelope: Vec<u8>,
+    /// KEM algorithm tag for [`Self::rendezvous_kem_pk`] (v5+).
+    /// [`RENDEZVOUS_KEM_ALGO_X25519`] (`0`) = classical X25519. `0` for ads
+    /// decoded from pre-v5 wire (no relay key advertised).
+    pub rendezvous_kem_algo: u8,
+    /// The rendezvous RELAY's KEM public key — the seal target a sender uses to
+    /// anonymously deliver a mailbox PUT to this relay (`send_anonymous` to
+    /// `(rendezvous_node_id, MAILBOX_APP_ID, PUT_ENDPOINT)`). Distinct from
+    /// [`Self::receiver_x25519_pk`] (the RECEIVER's Introduce key). Algorithm
+    /// per [`Self::rendezvous_kem_algo`]; for `algo = 0` this is the relay's
+    /// 32-byte X25519 pubkey (the same key the receiver sealed
+    /// [`Self::push_envelope`] to). Empty (`vec![]`) when the receiver did not
+    /// advertise a relay key (pre-v5 ads / receiver opted out — senders then
+    /// fall back to the live rendezvous path). Cap
+    /// [`MAX_RENDEZVOUS_KEM_PK_LEN`].
+    pub rendezvous_kem_pk: Vec<u8>,
     /// Wire-format version this ad was decoded from (or freshly signed
     /// at). Preserved across decode → verify so verify can pick the
     /// matching canonical-message domain (v1 ads signed pre-push don't
@@ -397,7 +448,92 @@ pub fn sign_rendezvous_ad(
     if window > MAX_VALIDITY_WINDOW_SECS {
         return Err(RendezvousError::ValidityWindowTooLarge { got: window });
     }
-    let canonical = canonical_message_v4(
+    // Emit the CURRENT wire version (v5) with EMPTY relay-KEM fields
+    // (`algo = 0`, `pk = []` — "no relay key advertised"). Callers that want to
+    // advertise the relay's KEM key for anonymous mailbox deposit call
+    // [`sign_rendezvous_ad_v5`] directly. The validation above is a fast
+    // pre-check; v5 re-validates the same invariants.
+    sign_rendezvous_ad_v5(
+        receiver_node_id,
+        rendezvous_node_id,
+        auth_cookie,
+        receiver_x25519_pk,
+        valid_from_unix,
+        valid_until_unix,
+        push_envelope,
+        capability_token,
+        wake_hmac_envelope,
+        RENDEZVOUS_KEM_ALGO_X25519,
+        &[],
+        issuer_pk,
+        issuer_sk,
+        issuer_algo,
+    )
+}
+
+/// Build, sign, and encode a v5 rendezvous-point ad — like
+/// [`sign_rendezvous_ad`] but additionally binds the rendezvous RELAY's KEM
+/// public key (`rendezvous_kem_algo` + `rendezvous_kem_pk`) so a sender can
+/// anonymously deposit a mailbox PUT at the relay without a second lookup.
+///
+/// `rendezvous_kem_algo` is the KEM tag ([`RENDEZVOUS_KEM_ALGO_X25519`] today);
+/// `rendezvous_kem_pk` is the relay's KEM pubkey (32-byte X25519 for `algo=0`).
+/// Pass `(RENDEZVOUS_KEM_ALGO_X25519, &[])` to advertise no relay key (sender
+/// then falls back to the live rendezvous path); cap
+/// [`MAX_RENDEZVOUS_KEM_PK_LEN`].
+#[allow(clippy::too_many_arguments)]
+pub fn sign_rendezvous_ad_v5(
+    receiver_node_id: [u8; NODE_ID_LEN],
+    rendezvous_node_id: [u8; NODE_ID_LEN],
+    auth_cookie: [u8; AUTH_COOKIE_LEN],
+    receiver_x25519_pk: [u8; X25519_PK_LEN],
+    valid_from_unix: u64,
+    valid_until_unix: u64,
+    push_envelope: &[u8],
+    capability_token: &[u8],
+    wake_hmac_envelope: &[u8],
+    rendezvous_kem_algo: u8,
+    rendezvous_kem_pk: &[u8],
+    issuer_pk: &str,
+    issuer_sk: &str,
+    issuer_algo: SignatureAlgorithm,
+) -> Result<Vec<u8>, RendezvousError> {
+    if issuer_pk.len() > MAX_ISSUER_PK_LEN {
+        return Err(RendezvousError::IssuerPkTooLarge {
+            got: issuer_pk.len(),
+        });
+    }
+    if push_envelope.len() > MAX_PUSH_ENVELOPE_LEN {
+        return Err(RendezvousError::PushEnvelopeTooLarge {
+            got: push_envelope.len(),
+        });
+    }
+    if capability_token.len() > MAX_CAPABILITY_TOKEN_LEN {
+        return Err(RendezvousError::CapabilityTokenTooLarge {
+            got: capability_token.len(),
+        });
+    }
+    if wake_hmac_envelope.len() > MAX_WAKE_HMAC_ENVELOPE_LEN {
+        return Err(RendezvousError::WakeHmacEnvelopeTooLarge {
+            got: wake_hmac_envelope.len(),
+        });
+    }
+    if rendezvous_kem_pk.len() > MAX_RENDEZVOUS_KEM_PK_LEN {
+        return Err(RendezvousError::KemPkTooLarge {
+            got: rendezvous_kem_pk.len(),
+        });
+    }
+    if valid_until_unix < valid_from_unix {
+        return Err(RendezvousError::ValidityInverted {
+            from: valid_from_unix,
+            until: valid_until_unix,
+        });
+    }
+    let window = valid_until_unix - valid_from_unix;
+    if window > MAX_VALIDITY_WINDOW_SECS {
+        return Err(RendezvousError::ValidityWindowTooLarge { got: window });
+    }
+    let canonical = canonical_message_v5(
         &receiver_node_id,
         &rendezvous_node_id,
         &auth_cookie,
@@ -407,6 +543,8 @@ pub fn sign_rendezvous_ad(
         push_envelope,
         capability_token,
         wake_hmac_envelope,
+        rendezvous_kem_algo,
+        rendezvous_kem_pk,
     );
     let signature = sign_message(issuer_algo, issuer_pk, issuer_sk, &canonical)
         .map_err(|e| RendezvousError::Sign(format!("{e}")))?;
@@ -415,7 +553,7 @@ pub fn sign_rendezvous_ad(
             got: signature.len(),
         });
     }
-    let bytes = encode_body_v4(
+    let bytes = encode_body_v5(
         &receiver_node_id,
         &rendezvous_node_id,
         &auth_cookie,
@@ -425,6 +563,8 @@ pub fn sign_rendezvous_ad(
         push_envelope,
         capability_token,
         wake_hmac_envelope,
+        rendezvous_kem_algo,
+        rendezvous_kem_pk,
         issuer_pk.as_bytes(),
         issuer_algo,
         &signature,
@@ -459,6 +599,7 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
     }
     let version = read(blob, &mut p, 1)?[0];
     if version != VERSION
+        && version != VERSION_V4
         && version != VERSION_V3
         && version != VERSION_V2
         && version != VERSION_LEGACY
@@ -485,9 +626,10 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
     receiver_x25519_pk.copy_from_slice(read(blob, &mut p, X25519_PK_LEN)?);
     let valid_from_unix = u64::from_be_bytes(read(blob, &mut p, 8)?.try_into().unwrap());
     let valid_until_unix = u64::from_be_bytes(read(blob, &mut p, 8)?.try_into().unwrap());
-    // v2 / v3 / v4: push_envelope_len (BE u16) + push_envelope bytes.
-    // v1 skips this entirely; `push_envelope` field defaults to empty.
-    let push_envelope = if version == VERSION || version == VERSION_V3 || version == VERSION_V2 {
+    // Versions are additive supersets (v1 ⊂ v2 ⊂ v3 ⊂ v4 ⊂ v5), so each field
+    // is present iff `version >= the version that introduced it`.
+    // push_envelope: v2+ (v1 skips it; field defaults to empty).
+    let push_envelope = if version >= VERSION_V2 {
         let env_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
         if env_len > MAX_PUSH_ENVELOPE_LEN {
             return Err(RendezvousError::PushEnvelopeTooLarge { got: env_len });
@@ -496,9 +638,8 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
     } else {
         Vec::new()
     };
-    // v3 / v4: `capability_token` field after push_envelope.  Pre-v3
-    // ads decoded under new code yield empty.
-    let capability_token = if version == VERSION || version == VERSION_V3 {
+    // capability_token: v3+ (pre-v3 ads yield empty).
+    let capability_token = if version >= VERSION_V3 {
         let cap_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
         if cap_len > MAX_CAPABILITY_TOKEN_LEN {
             return Err(RendezvousError::CapabilityTokenTooLarge { got: cap_len });
@@ -507,11 +648,8 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
     } else {
         Vec::new()
     };
-    // v4-only `wake_hmac_envelope` field (Epic 489.10 slice 4.3.2).
-    // Lives between capability_token and issuer_pk.  Pre-v4 ads yield
-    // empty; receivers still emit ads with empty wake_hmac_envelope if
-    // they opted out of HMAC authentication.
-    let wake_hmac_envelope = if version == VERSION {
+    // wake_hmac_envelope: v4+ (Epic 489.10 slice 4.3.2). Pre-v4 ads yield empty.
+    let wake_hmac_envelope = if version >= VERSION_V4 {
         let env_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
         if env_len > MAX_WAKE_HMAC_ENVELOPE_LEN {
             return Err(RendezvousError::WakeHmacEnvelopeTooLarge { got: env_len });
@@ -519,6 +657,18 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
         read(blob, &mut p, env_len)?.to_vec()
     } else {
         Vec::new()
+    };
+    // rendezvous_kem_algo + rendezvous_kem_pk: v5+ (the relay's KEM key for
+    // anonymous mailbox deposit). Pre-v5 ads yield `algo = 0`, `pk = []`.
+    let (rendezvous_kem_algo, rendezvous_kem_pk) = if version >= VERSION {
+        let algo = read(blob, &mut p, 1)?[0];
+        let kem_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
+        if kem_len > MAX_RENDEZVOUS_KEM_PK_LEN {
+            return Err(RendezvousError::KemPkTooLarge { got: kem_len });
+        }
+        (algo, read(blob, &mut p, kem_len)?.to_vec())
+    } else {
+        (RENDEZVOUS_KEM_ALGO_X25519, Vec::new())
     };
     let pk_len = u16::from_be_bytes(read(blob, &mut p, 2)?.try_into().unwrap()) as usize;
     if pk_len > MAX_ISSUER_PK_LEN {
@@ -552,6 +702,8 @@ pub fn decode_rendezvous_ad(blob: &[u8]) -> Result<RendezvousAd, RendezvousError
         push_envelope,
         capability_token,
         wake_hmac_envelope,
+        rendezvous_kem_algo,
+        rendezvous_kem_pk,
         wire_version: version,
     })
 }
@@ -613,7 +765,7 @@ pub fn verify_rendezvous_ad(ad: &RendezvousAd) -> Result<(), RendezvousError> {
             &ad.push_envelope,
             &ad.capability_token,
         ),
-        VERSION => canonical_message_v4(
+        VERSION_V4 => canonical_message_v4(
             &ad.receiver_node_id,
             &ad.rendezvous_node_id,
             &ad.auth_cookie,
@@ -623,6 +775,19 @@ pub fn verify_rendezvous_ad(ad: &RendezvousAd) -> Result<(), RendezvousError> {
             &ad.push_envelope,
             &ad.capability_token,
             &ad.wake_hmac_envelope,
+        ),
+        VERSION => canonical_message_v5(
+            &ad.receiver_node_id,
+            &ad.rendezvous_node_id,
+            &ad.auth_cookie,
+            &ad.receiver_x25519_pk,
+            ad.valid_from_unix,
+            ad.valid_until_unix,
+            &ad.push_envelope,
+            &ad.capability_token,
+            &ad.wake_hmac_envelope,
+            ad.rendezvous_kem_algo,
+            &ad.rendezvous_kem_pk,
         ),
         v => {
             return Err(RendezvousError::Malformed(format!(
@@ -921,7 +1086,12 @@ fn canonical_message_v4(
     buf
 }
 
+// superseded by encode_body_v5 (signer always emits v5).  Retained for
+// symmetry with canonical_message_v4 (still needed by verify dispatch over
+// existing-on-DHT v4 ads) and for cfg(test) callers that construct synthetic
+// v4 wire to exercise backward-compat decode.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn encode_body_v4(
     receiver_node_id: &[u8; NODE_ID_LEN],
     rendezvous_node_id: &[u8; NODE_ID_LEN],
@@ -955,6 +1125,125 @@ fn encode_body_v4(
             + signature.len(),
     );
     out.extend_from_slice(MAGIC);
+    out.push(VERSION_V4);
+    out.push(match issuer_algo {
+        SignatureAlgorithm::Ed25519 => 0,
+        SignatureAlgorithm::Falcon512 => 1,
+        SignatureAlgorithm::Ed25519Falcon512Hybrid => 2,
+        SignatureAlgorithm::Ed25519Falcon1024Hybrid => 3,
+    });
+    out.extend_from_slice(receiver_node_id);
+    out.extend_from_slice(rendezvous_node_id);
+    out.extend_from_slice(auth_cookie);
+    out.extend_from_slice(receiver_x25519_pk);
+    out.extend_from_slice(&valid_from_unix.to_be_bytes());
+    out.extend_from_slice(&valid_until_unix.to_be_bytes());
+    out.extend_from_slice(&(push_envelope.len() as u16).to_be_bytes());
+    out.extend_from_slice(push_envelope);
+    out.extend_from_slice(&(capability_token.len() as u16).to_be_bytes());
+    out.extend_from_slice(capability_token);
+    out.extend_from_slice(&(wake_hmac_envelope.len() as u16).to_be_bytes());
+    out.extend_from_slice(wake_hmac_envelope);
+    out.extend_from_slice(&(issuer_pk_bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(issuer_pk_bytes);
+    out.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+    out.extend_from_slice(signature);
+    Ok(out)
+}
+
+/// v5 canonical-message form. Adds `rendezvous_kem_algo` (1 B) +
+/// length-prefixed `rendezvous_kem_pk` after the v4 wake_hmac_envelope tail.
+/// Same length-prefix-inclusion invariant: a censor cannot strip, replace, or
+/// append the relay KEM key without invalidating the v5 signature (and cannot
+/// downgrade to v4 — the `:v5\0` domain won't verify under v4 canonical).
+#[allow(clippy::too_many_arguments)]
+fn canonical_message_v5(
+    receiver_node_id: &[u8; NODE_ID_LEN],
+    rendezvous_node_id: &[u8; NODE_ID_LEN],
+    auth_cookie: &[u8; AUTH_COOKIE_LEN],
+    receiver_x25519_pk: &[u8; X25519_PK_LEN],
+    valid_from_unix: u64,
+    valid_until_unix: u64,
+    push_envelope: &[u8],
+    capability_token: &[u8],
+    wake_hmac_envelope: &[u8],
+    rendezvous_kem_algo: u8,
+    rendezvous_kem_pk: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        SIG_DOMAIN_V5.len()
+            + NODE_ID_LEN * 2
+            + AUTH_COOKIE_LEN
+            + X25519_PK_LEN
+            + 16
+            + 2
+            + push_envelope.len()
+            + 2
+            + capability_token.len()
+            + 2
+            + wake_hmac_envelope.len()
+            + 1
+            + 2
+            + rendezvous_kem_pk.len(),
+    );
+    buf.extend_from_slice(SIG_DOMAIN_V5);
+    buf.extend_from_slice(receiver_node_id);
+    buf.extend_from_slice(rendezvous_node_id);
+    buf.extend_from_slice(auth_cookie);
+    buf.extend_from_slice(receiver_x25519_pk);
+    buf.extend_from_slice(&valid_from_unix.to_be_bytes());
+    buf.extend_from_slice(&valid_until_unix.to_be_bytes());
+    buf.extend_from_slice(&(push_envelope.len() as u16).to_be_bytes());
+    buf.extend_from_slice(push_envelope);
+    buf.extend_from_slice(&(capability_token.len() as u16).to_be_bytes());
+    buf.extend_from_slice(capability_token);
+    buf.extend_from_slice(&(wake_hmac_envelope.len() as u16).to_be_bytes());
+    buf.extend_from_slice(wake_hmac_envelope);
+    buf.push(rendezvous_kem_algo);
+    buf.extend_from_slice(&(rendezvous_kem_pk.len() as u16).to_be_bytes());
+    buf.extend_from_slice(rendezvous_kem_pk);
+    buf
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_body_v5(
+    receiver_node_id: &[u8; NODE_ID_LEN],
+    rendezvous_node_id: &[u8; NODE_ID_LEN],
+    auth_cookie: &[u8; AUTH_COOKIE_LEN],
+    receiver_x25519_pk: &[u8; X25519_PK_LEN],
+    valid_from_unix: u64,
+    valid_until_unix: u64,
+    push_envelope: &[u8],
+    capability_token: &[u8],
+    wake_hmac_envelope: &[u8],
+    rendezvous_kem_algo: u8,
+    rendezvous_kem_pk: &[u8],
+    issuer_pk_bytes: &[u8],
+    issuer_algo: SignatureAlgorithm,
+    signature: &[u8],
+) -> Result<Vec<u8>, RendezvousError> {
+    let mut out = Vec::with_capacity(
+        2 + 1
+            + 1
+            + NODE_ID_LEN * 2
+            + AUTH_COOKIE_LEN
+            + X25519_PK_LEN
+            + 16
+            + 2
+            + push_envelope.len()
+            + 2
+            + capability_token.len()
+            + 2
+            + wake_hmac_envelope.len()
+            + 1
+            + 2
+            + rendezvous_kem_pk.len()
+            + 2
+            + issuer_pk_bytes.len()
+            + 2
+            + signature.len(),
+    );
+    out.extend_from_slice(MAGIC);
     out.push(VERSION);
     out.push(match issuer_algo {
         SignatureAlgorithm::Ed25519 => 0,
@@ -974,6 +1263,9 @@ fn encode_body_v4(
     out.extend_from_slice(capability_token);
     out.extend_from_slice(&(wake_hmac_envelope.len() as u16).to_be_bytes());
     out.extend_from_slice(wake_hmac_envelope);
+    out.push(rendezvous_kem_algo);
+    out.extend_from_slice(&(rendezvous_kem_pk.len() as u16).to_be_bytes());
+    out.extend_from_slice(rendezvous_kem_pk);
     out.extend_from_slice(&(issuer_pk_bytes.len() as u16).to_be_bytes());
     out.extend_from_slice(issuer_pk_bytes);
     out.extend_from_slice(&(signature.len() as u16).to_be_bytes());
@@ -3770,8 +4062,121 @@ mod tests {
         .unwrap();
         let ad = decode_rendezvous_ad(&bytes).unwrap();
         verify_rendezvous_ad(&ad).expect("v4 sig must verify");
+        // sign_rendezvous_ad now delegates to the v5 encoder (empty KEM); the
+        // wake envelope still round-trips and the ad is current-version.
         assert_eq!(ad.wire_version, VERSION);
         assert_eq!(ad.wake_hmac_envelope, wake_env);
+    }
+
+    #[test]
+    fn v5_round_trip_with_relay_kem_pk() {
+        // Sign a v5 ad carrying the relay's X25519 KEM key; decode + verify;
+        // confirm the encoder emits v5, the decoder reads both KEM fields, and
+        // the signature covers them.
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let relay_kem_pk = vec![0x77u8; 32]; // relay's X25519 pubkey (algo 0)
+        let bytes = sign_rendezvous_ad_v5(
+            coherent_node_id(&kp.public_key),
+            [0xBBu8; 32],
+            [0xCCu8; 16],
+            [0xDDu8; 32],
+            1_700_000_000,
+            1_700_000_000 + 86_400,
+            &[],
+            &[],
+            &[],
+            RENDEZVOUS_KEM_ALGO_X25519,
+            &relay_kem_pk,
+            &kp.public_key,
+            &kp.private_key,
+            SignatureAlgorithm::Ed25519,
+        )
+        .unwrap();
+        let ad = decode_rendezvous_ad(&bytes).unwrap();
+        verify_rendezvous_ad(&ad).expect("v5 sig must verify");
+        assert_eq!(ad.wire_version, VERSION);
+        assert_eq!(ad.rendezvous_kem_algo, RENDEZVOUS_KEM_ALGO_X25519);
+        assert_eq!(ad.rendezvous_kem_pk, relay_kem_pk);
+    }
+
+    #[test]
+    fn v5_relay_kem_pk_signed_in_canonical() {
+        // Tamper the relay KEM key post-sign — verify must reject (the key is
+        // length-prefixed into the v5 canonical message).
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let bytes = sign_rendezvous_ad_v5(
+            coherent_node_id(&kp.public_key),
+            [0xBBu8; 32],
+            [0xCCu8; 16],
+            [0xDDu8; 32],
+            1_700_000_000,
+            1_700_000_000 + 86_400,
+            &[],
+            &[],
+            &[],
+            RENDEZVOUS_KEM_ALGO_X25519,
+            &[0x77u8; 32],
+            &kp.public_key,
+            &kp.private_key,
+            SignatureAlgorithm::Ed25519,
+        )
+        .unwrap();
+        let mut ad = decode_rendezvous_ad(&bytes).unwrap();
+        ad.rendezvous_kem_pk[0] ^= 0xFF;
+        assert!(
+            verify_rendezvous_ad(&ad).is_err(),
+            "tampered relay KEM key must fail verify"
+        );
+    }
+
+    #[test]
+    fn v5_default_sign_emits_v5_with_empty_kem() {
+        // The plain (non-KEM) signer delegates to v5 and advertises no relay key.
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let bytes = sign_rendezvous_ad(
+            coherent_node_id(&kp.public_key),
+            [0xBBu8; 32],
+            [0xCCu8; 16],
+            [0xDDu8; 32],
+            1_700_000_000,
+            1_700_000_000 + 86_400,
+            &[],
+            &[],
+            &[],
+            &kp.public_key,
+            &kp.private_key,
+            SignatureAlgorithm::Ed25519,
+        )
+        .unwrap();
+        let ad = decode_rendezvous_ad(&bytes).unwrap();
+        verify_rendezvous_ad(&ad).expect("v5 empty-kem sig must verify");
+        assert_eq!(ad.wire_version, VERSION);
+        assert_eq!(ad.rendezvous_kem_algo, RENDEZVOUS_KEM_ALGO_X25519);
+        assert!(ad.rendezvous_kem_pk.is_empty());
+    }
+
+    #[test]
+    fn v5_oversized_kem_pk_rejected_at_sign() {
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let huge = vec![0u8; MAX_RENDEZVOUS_KEM_PK_LEN + 1];
+        let err = sign_rendezvous_ad_v5(
+            coherent_node_id(&kp.public_key),
+            [0xBBu8; 32],
+            [0xCCu8; 16],
+            [0xDDu8; 32],
+            1_700_000_000,
+            1_700_000_000 + 86_400,
+            &[],
+            &[],
+            &[],
+            RENDEZVOUS_KEM_ALGO_X25519,
+            &huge,
+            &kp.public_key,
+            &kp.private_key,
+            SignatureAlgorithm::Ed25519,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RendezvousError::KemPkTooLarge { .. }));
     }
 
     #[test]
@@ -4073,5 +4478,62 @@ mod tests {
             "v2 ads must decode to empty cap_token under slice-2 decoder"
         );
         verify_rendezvous_ad(&ad).expect("v2 sig must still verify under slice-2 verifier");
+    }
+
+    #[test]
+    fn v5_v4_legacy_decode_under_v5_yields_empty_kem() {
+        // Construct genuine v4 wire (encode_body_v4 + canonical_message_v4),
+        // then decode under the v5 decoder: verify must succeed via the v4
+        // canonical, and the relay-KEM fields must be empty (no key advertised).
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let wake_env = vec![0xEE; 64];
+        let receiver_node_id = coherent_node_id(&kp.public_key);
+        let rendezvous_node_id = [0xBBu8; 32];
+        let auth_cookie = [0xCCu8; 16];
+        let receiver_x25519_pk = [0xDDu8; 32];
+        let valid_from = 1_700_000_000;
+        let valid_until = valid_from + 86_400;
+        let canonical = canonical_message_v4(
+            &receiver_node_id,
+            &rendezvous_node_id,
+            &auth_cookie,
+            &receiver_x25519_pk,
+            valid_from,
+            valid_until,
+            &[],
+            &[],
+            &wake_env,
+        );
+        let signature = sign_message(
+            SignatureAlgorithm::Ed25519,
+            &kp.public_key,
+            &kp.private_key,
+            &canonical,
+        )
+        .unwrap();
+        let bytes = encode_body_v4(
+            &receiver_node_id,
+            &rendezvous_node_id,
+            &auth_cookie,
+            &receiver_x25519_pk,
+            valid_from,
+            valid_until,
+            &[],
+            &[],
+            &wake_env,
+            kp.public_key.as_bytes(),
+            SignatureAlgorithm::Ed25519,
+            &signature,
+        )
+        .unwrap();
+        let ad = decode_rendezvous_ad(&bytes).unwrap();
+        assert_eq!(ad.wire_version, VERSION_V4);
+        assert_eq!(ad.wake_hmac_envelope, wake_env);
+        assert_eq!(ad.rendezvous_kem_algo, RENDEZVOUS_KEM_ALGO_X25519);
+        assert!(
+            ad.rendezvous_kem_pk.is_empty(),
+            "v4 ads must decode to empty relay-KEM under the v5 decoder"
+        );
+        verify_rendezvous_ad(&ad).expect("v4 sig must still verify under the v5 verifier");
     }
 }
