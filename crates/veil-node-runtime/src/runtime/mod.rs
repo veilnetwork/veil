@@ -3415,6 +3415,10 @@ impl NodeRuntime {
             // .10 slice 4.3.2: defaults to empty (HMAC opt-out — receiver
             // upgrades via a separate IPC call wired in slice 4.3.3).
             wake_hmac_envelope: Vec::new(),
+            // Defaults to "no relay key advertised"; the receiver upgrades via
+            // `set_rendezvous_relay_kem` once it knows the relay's KEM pubkey.
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
             // Plain rendezvous receiver — signed under the sovereign identity.
             ephemeral_ad_identity: None,
         };
@@ -3478,6 +3482,33 @@ impl NodeRuntime {
             .find(|e| e.rendezvous_node_id == rendezvous_node_id && e.auth_cookie == auth_cookie)
         {
             entry.wake_hmac_envelope = wake_hmac_envelope;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the rendezvous RELAY's KEM key on an existing publisher entry
+    /// (matched by `(rendezvous_node_id, auth_cookie)`), so the next signed ad
+    /// refresh advertises it (v5 `rendezvous_kem_*`) and senders can anonymously
+    /// deposit a mailbox PUT directly at the relay. `algo = 0` is X25519; `pk`
+    /// is the relay's 32-byte X25519 pubkey (the same key the receiver sealed
+    /// its push envelope to). Pass `(0, vec![])` to clear it (senders fall back
+    /// to the live rendezvous path). Returns `true` if the entry was found.
+    pub fn set_rendezvous_relay_kem(
+        &self,
+        rendezvous_node_id: [u8; 32],
+        auth_cookie: [u8; 16],
+        relay_kem_algo: u8,
+        relay_kem_pk: Vec<u8>,
+    ) -> bool {
+        let mut entries = lock!(self.anonymity.rendezvous_publisher_entries);
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.rendezvous_node_id == rendezvous_node_id && e.auth_cookie == auth_cookie)
+        {
+            entry.rendezvous_kem_algo = relay_kem_algo;
+            entry.rendezvous_kem_pk = relay_kem_pk;
             true
         } else {
             false

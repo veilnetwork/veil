@@ -2026,6 +2026,11 @@ impl SetPushEnvelopeStatus {
 /// depending on the anonymity crate.
 pub const MAX_WAKE_HMAC_ENVELOPE_BYTES: usize = 128;
 
+/// Mirror of `veil_anonymity::rendezvous::MAX_RENDEZVOUS_KEM_PK_LEN`.
+/// Bounds the v5 relay-KEM-pubkey trailer on the `ReplicaWire` decode path
+/// (fits ML-KEM-768 with slack) without depending on the anonymity crate.
+pub const MAX_RENDEZVOUS_KEM_PK_BYTES: usize = 2048;
+
 /// Payload [`crate::family::LocalAppMsg::SetWakeHmacEnvelope`].  Receiver
 /// app uploads the sealed wake-HMAC envelope so the daemon embeds it in
 /// every subsequent signed RendezvousAd refresh.
@@ -3139,6 +3144,14 @@ pub struct ReplicaWire {
     /// pre-slice-2b daemons that emit only the first two trailers). Cap
     /// [`MAX_WAKE_HMAC_ENVELOPE_BYTES`].
     pub wake_hmac_envelope: Vec<u8>,
+    /// KEM algorithm tag for [`Self::rendezvous_kem_pk`] (`0` = X25519).
+    pub rendezvous_kem_algo: u8,
+    /// The relay's KEM public key from the resolved v5 `RendezvousAd` — the
+    /// seal target a sender uses to anonymously deposit a `MailboxPut` at this
+    /// relay. Empty for pre-v5 ads / no relay key. 4th (optional) trailer; a
+    /// pre-v5 daemon emits only the first three, so decode defaults to empty.
+    /// Cap [`MAX_RENDEZVOUS_KEM_PK_BYTES`].
+    pub rendezvous_kem_pk: Vec<u8>,
 }
 
 impl ReplicaWire {
@@ -3159,6 +3172,11 @@ impl ReplicaWire {
         // 3rd trailer (Epic 489.10 slice 2b): wake-HMAC envelope.
         buf.extend_from_slice(&(self.wake_hmac_envelope.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.wake_hmac_envelope);
+        // 4th trailer (v5): relay KEM key — algo byte + length-prefixed pubkey.
+        debug_assert!(self.rendezvous_kem_pk.len() <= MAX_RENDEZVOUS_KEM_PK_BYTES);
+        buf.push(self.rendezvous_kem_algo);
+        buf.extend_from_slice(&(self.rendezvous_kem_pk.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.rendezvous_kem_pk);
     }
 
     fn decode_from(buf: &[u8], offset: usize) -> Result<(Self, usize), ProtoError> {
@@ -3236,6 +3254,8 @@ impl ReplicaWire {
                     push_envelope,
                     capability_token,
                     wake_hmac_envelope: Vec::new(),
+                    rendezvous_kem_algo: 0,
+                    rendezvous_kem_pk: Vec::new(),
                 },
                 cap_end,
             ));
@@ -3257,6 +3277,43 @@ impl ReplicaWire {
             });
         }
         let wake_hmac_envelope = buf[wake_start..wake_end].to_vec();
+        // 4th trailer (v5): OPTIONAL relay KEM key (algo byte + len-prefixed
+        // pubkey). A pre-v5 daemon emits only the first three trailers — if
+        // fewer than 3 bytes (algo + u16 len) remain, default to "no key" and
+        // report `wake_end` as the consumed length so the container walks to
+        // the next entry boundary correctly.
+        if buf.len() < wake_end + 3 {
+            return Ok((
+                Self {
+                    relay_node_id,
+                    valid_until_unix,
+                    push_envelope,
+                    capability_token,
+                    wake_hmac_envelope,
+                    rendezvous_kem_algo: 0,
+                    rendezvous_kem_pk: Vec::new(),
+                },
+                wake_end,
+            ));
+        }
+        let rendezvous_kem_algo = buf[wake_end];
+        let kem_len = super::read_u16_be(buf, wake_end + 1)? as usize;
+        if kem_len > MAX_RENDEZVOUS_KEM_PK_BYTES {
+            return Err(ProtoError::ValueTooLarge {
+                field: "replica_wire.rendezvous_kem_pk_len",
+                value: kem_len as u64,
+                max: MAX_RENDEZVOUS_KEM_PK_BYTES as u64,
+            });
+        }
+        let kem_start = wake_end + 3;
+        let kem_end = kem_start + kem_len;
+        if buf.len() < kem_end {
+            return Err(ProtoError::BufferTooShort {
+                need: kem_end,
+                got: buf.len(),
+            });
+        }
+        let rendezvous_kem_pk = buf[kem_start..kem_end].to_vec();
         Ok((
             Self {
                 relay_node_id,
@@ -3264,8 +3321,10 @@ impl ReplicaWire {
                 push_envelope,
                 capability_token,
                 wake_hmac_envelope,
+                rendezvous_kem_algo,
+                rendezvous_kem_pk,
             },
-            wake_end,
+            kem_end,
         ))
     }
 }
@@ -6830,6 +6889,8 @@ mod tests {
             push_envelope: vec![0xEE; 60],
             capability_token: vec![],
             wake_hmac_envelope: vec![],
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: vec![],
         };
         let mut buf = Vec::new();
         r.encode_to(&mut buf);
@@ -6848,6 +6909,8 @@ mod tests {
             push_envelope: vec![0xEE; 60],
             capability_token: vec![0xAB; 40],
             wake_hmac_envelope: vec![0x5A; MAX_WAKE_HMAC_ENVELOPE_BYTES],
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: vec![],
         };
         let mut buf = Vec::new();
         r.encode_to(&mut buf);
@@ -6919,6 +6982,8 @@ mod tests {
                     push_envelope: vec![0xAA; 32],
                     capability_token: vec![0x01; 8],
                     wake_hmac_envelope: vec![0xB1; 16],
+                    rendezvous_kem_algo: 0,
+                    rendezvous_kem_pk: vec![],
                 },
                 ReplicaWire {
                     relay_node_id: [2u8; 32],
@@ -6926,6 +6991,8 @@ mod tests {
                     push_envelope: vec![],
                     capability_token: vec![],
                     wake_hmac_envelope: vec![0xB2; MAX_WAKE_HMAC_ENVELOPE_BYTES],
+                    rendezvous_kem_algo: 0,
+                    rendezvous_kem_pk: vec![],
                 },
                 ReplicaWire {
                     relay_node_id: [3u8; 32],
@@ -6933,6 +7000,8 @@ mod tests {
                     push_envelope: vec![0xCC; 60],
                     capability_token: vec![0x03; 4],
                     wake_hmac_envelope: vec![],
+                    rendezvous_kem_algo: 0,
+                    rendezvous_kem_pk: vec![],
                 },
             ],
         };
@@ -6955,6 +7024,8 @@ mod tests {
             push_envelope: vec![],
             capability_token: vec![],
             wake_hmac_envelope: vec![],
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: vec![],
         };
         let mut buf = Vec::new();
         r.encode_to(&mut buf);
@@ -6981,6 +7052,8 @@ mod tests {
                     push_envelope: vec![0xAA; 32],
                     capability_token: vec![],
                     wake_hmac_envelope: vec![],
+                    rendezvous_kem_algo: 0,
+                    rendezvous_kem_pk: vec![],
                 },
                 ReplicaWire {
                     relay_node_id: [2u8; 32],
@@ -6988,6 +7061,8 @@ mod tests {
                     push_envelope: vec![],
                     capability_token: vec![],
                     wake_hmac_envelope: vec![],
+                    rendezvous_kem_algo: 0,
+                    rendezvous_kem_pk: vec![],
                 },
                 ReplicaWire {
                     relay_node_id: [3u8; 32],
@@ -6995,6 +7070,8 @@ mod tests {
                     push_envelope: vec![0xCC; 60],
                     capability_token: vec![],
                     wake_hmac_envelope: vec![],
+                    rendezvous_kem_algo: 0,
+                    rendezvous_kem_pk: vec![],
                 },
             ],
         };

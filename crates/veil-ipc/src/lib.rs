@@ -393,6 +393,14 @@ pub struct ResolvedReplica {
     /// authenticated wake payload. Empty when the receiver did not register for
     /// wake-HMAC (defaults to empty for backward compat).
     pub wake_hmac_envelope: Vec<u8>,
+    /// KEM algorithm tag for [`Self::rendezvous_kem_pk`] (v5 ad). `0` = X25519.
+    pub rendezvous_kem_algo: u8,
+    /// The relay's KEM public key from the resolved v5 `RendezvousAd` — the
+    /// seal target a sender uses to anonymously deliver a `MailboxPut` to this
+    /// relay (`send_anonymous` to `(relay_node_id, MAILBOX_APP_ID, PUT)`).
+    /// Empty when the ad is pre-v5 or the receiver advertised no relay key
+    /// (sender then falls back to the live rendezvous path).
+    pub rendezvous_kem_pk: Vec<u8>,
 }
 
 /// Hook the IPC server calls when an app issues

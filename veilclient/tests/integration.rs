@@ -1132,6 +1132,8 @@ async fn t1_4_p7a_lookup_rendezvous_replicas_returns_resolver_output() {
                 // survive the ResolvedReplica → ReplicaWire (3rd trailer) →
                 // RendezvousReplicaInfo round-trip through the live IPC pipe.
                 wake_hmac_envelope: vec![0xC7; 48],
+                rendezvous_kem_algo: 0,
+                rendezvous_kem_pk: vec![],
             },
             ResolvedReplica {
                 relay_node_id: [2u8; 32],
@@ -1139,6 +1141,8 @@ async fn t1_4_p7a_lookup_rendezvous_replicas_returns_resolver_output() {
                 push_envelope: vec![],
                 capability_token: vec![],
                 wake_hmac_envelope: vec![],
+                rendezvous_kem_algo: 0,
+                rendezvous_kem_pk: vec![],
             },
         ],
     });

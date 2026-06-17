@@ -1323,6 +1323,16 @@ pub struct RendezvousPublisherEntry {
     /// receiver updates via a separate IPC call (slice 4.3.3) when
     /// the underlying key rotates.
     pub wake_hmac_envelope: Vec<u8>,
+    /// The rendezvous RELAY's KEM algorithm tag + public key, published in the
+    /// v5 ad ([`RendezvousAd::rendezvous_kem_pk`]) so a sender can anonymously
+    /// deposit a mailbox PUT directly at the relay. `algo = 0` + empty `pk`
+    /// means "no relay key advertised" (the default — senders fall back to the
+    /// live rendezvous path). Set by the receiver at registration from the
+    /// relay's X25519 pubkey (the same key it sealed [`Self::push_envelope`]
+    /// to). NOT advertised for ephemeral/onion-service ads (those are reached
+    /// via the blinded descriptor, not mailbox PUTs).
+    pub rendezvous_kem_algo: u8,
+    pub rendezvous_kem_pk: Vec<u8>,
     /// Per-service EPHEMERAL signing identity (diff-audit Δ2-c). `Some` for a
     /// LOCATION-ANONYMOUS (onion) service: the ad is signed + DHT-keyed under
     /// this pseudo identity instead of the real sovereign node_id, so it no
@@ -3570,6 +3580,8 @@ mod tests {
             validity_window_secs: 3600,
             push_envelope: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: None,
         };
         let e2 = e1.clone();

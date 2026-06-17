@@ -678,7 +678,7 @@ impl NodeRuntime {
         // since the maintenance period is short.
         use veil_anonymity::rendezvous::{
             MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, rendezvous_ad_dht_key_at,
-            rendezvous_ad_needs_refresh, sign_rendezvous_ad,
+            rendezvous_ad_needs_refresh, sign_rendezvous_ad_v5,
         };
         let snapshot = lock!(entries).clone();
         if snapshot.is_empty() {
@@ -758,7 +758,7 @@ impl NodeRuntime {
                     logger,
                 )
             };
-            let bytes = match sign_rendezvous_ad(
+            let bytes = match sign_rendezvous_ad_v5(
                 ad_node_id,
                 entry.rendezvous_node_id,
                 entry.auth_cookie,
@@ -768,6 +768,8 @@ impl NodeRuntime {
                 &entry.push_envelope, // .10: empty when no push registered
                 &cap_token,
                 &entry.wake_hmac_envelope, // .10 slice 4.3.2: empty until receiver opts in via IPC (slice 4.3.3)
+                entry.rendezvous_kem_algo, // v5: relay KEM key for anonymous mailbox deposit
+                &entry.rendezvous_kem_pk,  // empty until set via set_rendezvous_relay_kem
                 issuer_pk,
                 issuer_sk,
                 issuer_algo,
@@ -1174,6 +1176,8 @@ mod tests {
             validity_window_secs: 24 * 3600,
             push_envelope: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: None,
         }]));
 
@@ -1218,6 +1222,8 @@ mod tests {
             validity_window_secs: 3600,
             push_envelope: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: None,
         }]));
 
@@ -1280,6 +1286,8 @@ mod tests {
             validity_window_secs: 24 * 3600,
             push_envelope: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: None,
         }]));
 
@@ -1333,6 +1341,8 @@ mod tests {
             validity_window_secs: 24 * 3600,
             push_envelope: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
             ephemeral_ad_identity: Some(eph),
         }]));
 
