@@ -362,6 +362,41 @@ pub(crate) fn rendezvous_register_publisher(
     }
 }
 
+/// Like [`rendezvous_register_publisher`] but for a PLAIN (sovereign-signed)
+/// publisher that ALSO advertises the relay's KEM key — so a sender resolving
+/// the v5 ad can anonymously deposit a mailbox PUT at the relay. Dedups by
+/// (relay, cookie). The app-IPC entry point for mailbox-by-discovery.
+pub(crate) fn rendezvous_register_publisher_with_kem(
+    anonymity: &Arc<super::anonymity_state::AnonymityState>,
+    relay: &[u8; 32],
+    cookie: [u8; 16],
+    validity_window_secs: u64,
+    relay_kem_algo: u8,
+    relay_kem_pk: Vec<u8>,
+) {
+    let entry = veil_anonymity::rendezvous::RendezvousPublisherEntry {
+        rendezvous_node_id: *relay,
+        auth_cookie: cookie,
+        validity_window_secs,
+        push_envelope: Vec::new(),
+        wake_hmac_envelope: Vec::new(),
+        rendezvous_kem_algo: relay_kem_algo,
+        rendezvous_kem_pk: relay_kem_pk,
+        // Plain rendezvous receiver — signed under the sovereign identity so
+        // senders discover it by the receiver's real node_id.
+        ephemeral_ad_identity: None,
+    };
+    let mut entries = lock!(anonymity.rendezvous_publisher_entries);
+    if let Some(pos) = entries
+        .iter()
+        .position(|e| e.rendezvous_node_id == *relay && e.auth_cookie == cookie)
+    {
+        entries[pos] = entry;
+    } else {
+        entries.push(entry);
+    }
+}
+
 /// Remove a `(relay, cookie)` rendezvous publication (diff-audit L4). Used by the
 /// recipient task on relay failover to prune the prior (now-dead) relay's slot,
 /// which otherwise lingers forever — maintenance re-signs the stale ad each tick
@@ -2807,6 +2842,24 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                 .register_onion_service(hop_count)
                 .map(|_cookie| ())
         })
+    }
+
+    fn register_rendezvous_publisher(
+        &self,
+        rendezvous_node_id: [u8; 32],
+        auth_cookie: [u8; 16],
+        validity_window_secs: u64,
+        relay_kem_algo: u8,
+        relay_kem_pk: Vec<u8>,
+    ) {
+        rendezvous_register_publisher_with_kem(
+            &self.access.anonymity,
+            &rendezvous_node_id,
+            auth_cookie,
+            validity_window_secs,
+            relay_kem_algo,
+            relay_kem_pk,
+        );
     }
 
     fn send_to_onion_service<'a>(

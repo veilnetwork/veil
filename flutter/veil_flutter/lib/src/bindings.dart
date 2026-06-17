@@ -369,6 +369,27 @@ final int Function(Pointer<VeilHandle>, int, Pointer<Pointer<Utf8>>)
                 )>>('veil_register_onion_service')
         .asFunction();
 
+/// Register a plain rendezvous-publisher entry advertising the relay KEM key
+/// (mailbox-by-discovery). Args: handle, rendezvous_node_id(32B), auth_cookie
+/// (16B), validity_window_secs(u64), relay_kem_algo(u8), relay_kem_pk(ptr),
+/// kem_len, err_out. Returns `veilOk` once the daemon records the entry.
+final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Uint8>, int, int,
+        Pointer<Uint8>, int, Pointer<Pointer<Utf8>>)
+    veilRegisterRendezvousPublisher = nativeLib
+        .lookup<
+                NativeFunction<
+                    Int32 Function(
+                  Pointer<VeilHandle>,
+                  Pointer<Uint8>,
+                  Pointer<Uint8>,
+                  Uint64,
+                  Uint8,
+                  Pointer<Uint8>,
+                  IntPtr,
+                  Pointer<Pointer<Utf8>>,
+                )>>('veil_register_rendezvous_publisher')
+        .asFunction();
+
 final int Function(
   Pointer<VeilHandle>,
   Pointer<Uint8>,

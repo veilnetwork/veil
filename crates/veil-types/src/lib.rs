@@ -208,6 +208,23 @@ pub trait AnonOnionSender: Send + Sync {
         Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
     >;
 
+    /// Register a PLAIN rendezvous-publisher entry (the app-IPC entry point for
+    /// mailbox-by-discovery): the maintenance tick signs + publishes a v5
+    /// `RendezvousAd` under THIS node's real id at the receiver's rendezvous
+    /// slot, advertising the relay's KEM key (`relay_kem_algo` / `relay_kem_pk`,
+    /// `algo = 0` X25519) so a sender resolving the ad can anonymously deposit a
+    /// mailbox PUT at `rendezvous_node_id`. Replaces any existing entry with the
+    /// same `(rendezvous_node_id, auth_cookie)`. Empty `relay_kem_pk` advertises
+    /// no key. Local + infallible — just records the entry.
+    fn register_rendezvous_publisher(
+        &self,
+        rendezvous_node_id: [u8; 32],
+        auth_cookie: [u8; 16],
+        validity_window_secs: u64,
+        relay_kem_algo: u8,
+        relay_kem_pk: Vec<u8>,
+    );
+
     /// Send `data` to a LOCATION-anonymous service addressed by its Ed25519
     /// IDENTITY key (the unlinkable analogue of [`Self::send_authenticated`],
     /// which addresses by node_id). Resolves the service's per-period BLINDED
