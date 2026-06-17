@@ -17,7 +17,10 @@
 
 use std::collections::HashMap;
 
-use crate::fetch_cookie::MAILBOX_COOKIE_LEN;
+/// Wire length of a mailbox auth cookie (matches `auth_cookie: [u8; 16]` and
+/// `veil_mailbox::fetch_cookie::MAILBOX_COOKIE_LEN`). Defined locally so this
+/// relay-side registry has no dependency on the receiver-side derivation crate.
+pub const MAILBOX_COOKIE_LEN: usize = 16;
 
 /// How many recent cookies a receiver may have valid at once (current +
 /// previous epoch).

@@ -45,6 +45,7 @@ pub mod circuit_setup;
 pub mod circuit_table;
 pub mod circuit_wire;
 pub mod directory;
+pub mod mailbox_cookie_registry;
 pub mod onion;
 pub mod packet;
 pub mod push_envelope;
