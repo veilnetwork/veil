@@ -1507,15 +1507,22 @@ impl NodeRuntime {
         // sender's local `peer_mlkem_keys` cache misses for a target node_id,
         // the resolver fetches + verifies the recipient's EK from DHT (instance
         // registry walk + cert chain) and populates the cache.
+        // One concrete resolver instance serves BOTH the ML-KEM EK lookup AND
+        // the relay-X25519-by-node_id lookup (`RelayKeyResolver`) — they share
+        // the same DHT walk + document fetch, so we coerce the single Arc into
+        // both trait objects rather than building two.
+        let dht_key_resolver = Arc::new(crate::mlkem_resolver::DhtMlKemEkResolver::new(
+            Arc::clone(&self.dht),
+            Arc::clone(&self.session_tx_registry),
+            Arc::clone(&self.dispatcher.pending_recursive),
+            *self.identity.local_identity.node_id.as_bytes(),
+            Arc::clone(&self.identity.peer_mlkem_keys),
+            Arc::clone(&self.logger),
+        ));
         let mlkem_ek_resolver: Arc<dyn veil_types::MlKemEkResolver> =
-            Arc::new(crate::mlkem_resolver::DhtMlKemEkResolver::new(
-                Arc::clone(&self.dht),
-                Arc::clone(&self.session_tx_registry),
-                Arc::clone(&self.dispatcher.pending_recursive),
-                *self.identity.local_identity.node_id.as_bytes(),
-                Arc::clone(&self.identity.peer_mlkem_keys),
-                Arc::clone(&self.logger),
-            ));
+            Arc::clone(&dht_key_resolver) as Arc<dyn veil_types::MlKemEkResolver>;
+        let relay_key_resolver: Arc<dyn veil_types::RelayKeyResolver> =
+            dht_key_resolver as Arc<dyn veil_types::RelayKeyResolver>;
         // Authenticated anonymous (onion/rendezvous) sender for the IPC
         // `anonymous_authenticated` flag. Holds the access bundle + the
         // configured circuit length.
@@ -1538,6 +1545,7 @@ impl NodeRuntime {
             .with_route_updated(route_updated)
             .with_e2e_keys(Arc::clone(&self.identity.peer_mlkem_keys))
             .with_mlkem_ek_resolver(mlkem_ek_resolver)
+            .with_relay_key_resolver(relay_key_resolver)
             .with_anon_onion_sender(anon_onion_sender)
             // Offline-mailbox seal/open (node-side E2E crypto). DORMANT — no app
             // sends MailboxSeal/Open yet; wired so the path is live once an app

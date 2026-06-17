@@ -71,6 +71,7 @@ use veil_proto::instance_registry::{
 };
 use veil_proto::mlkem_cert::MlKemKeyCert;
 use veil_proto::name_claim_v2::{NAME_CLAIM_SIG_CONTEXT, NameClaim, required_difficulty};
+use veil_proto::relay_key::{RELAY_KEM_ALGO_X25519, RelayKeyRecord};
 use veil_proto::pairing_invite::PairingInvite;
 use veil_proto::prekey_bundle::ALGO_ML_KEM_768;
 
@@ -274,6 +275,53 @@ pub fn sign_mlkem_cert(
     let msg = cert.signing_message();
     cert.sig = signing_identity_sk.sign(&msg);
     Ok(cert)
+}
+
+/// Build + sign a fresh [`RelayKeyRecord`] advertising the node's relay X25519
+/// KEM public key, resolvable by `node_id` over the DHT. Mirrors
+/// [`sign_mlkem_cert`]: the active identity subkey signs over the canonical
+/// record bytes, and the verifier checks the signature against the indexed
+/// `IdentityDocument.identity_keys` entry.
+///
+/// `relay_kem_pk` must be a 32-byte X25519 public key (the only KEM algo today).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_relay_key(
+    node_id: [u8; 32],
+    relay_kem_pk: Vec<u8>,
+    valid_from_unix: u64,
+    valid_until_unix: u64,
+    record_version: u64,
+    signing_identity_key_idx: u16,
+    signing_identity_sk: &IdentitySigningKey,
+    doc: &IdentityDocument,
+) -> Result<RelayKeyRecord, PublishError> {
+    if valid_until_unix < valid_from_unix {
+        return Err(PublishError::ValidityWindowTooLong {
+            valid_from: valid_from_unix,
+            valid_until: valid_until_unix,
+            span: 0,
+        });
+    }
+    let idx = signing_identity_key_idx as usize;
+    if idx >= doc.identity_keys.len() {
+        return Err(PublishError::SigKeyIdxOutOfBounds {
+            idx: signing_identity_key_idx,
+            n: doc.identity_keys.len(),
+        });
+    }
+    let mut record = RelayKeyRecord {
+        node_id,
+        relay_kem_algo: RELAY_KEM_ALGO_X25519,
+        relay_kem_pk,
+        valid_from_unix,
+        valid_until_unix,
+        record_version,
+        signing_identity_key_idx,
+        sig: Vec::new(),
+    };
+    let msg = record.signing_message();
+    record.sig = signing_identity_sk.sign(&msg);
+    Ok(record)
 }
 
 // ── IdentityDocument re-sign ─────────────────────────────────────────────────
@@ -501,6 +549,16 @@ pub async fn publish_mlkem_cert(
 ) -> Result<(), PublishIoError> {
     let key = MlKemKeyCert::dht_key(&cert.node_id, &cert.instance_id);
     publisher.put(key, cert.encode()).await
+}
+
+/// Publish a signed [`RelayKeyRecord`] at its canonical DHT slot (keyed by
+/// `node_id`), so peers can resolve this node's relay X25519 KEM key.
+pub async fn publish_relay_key(
+    record: &RelayKeyRecord,
+    publisher: &(dyn IdentityPublisher + '_),
+) -> Result<(), PublishIoError> {
+    let key = RelayKeyRecord::dht_key(&record.node_id);
+    publisher.put(key, record.encode()).await
 }
 
 /// Publish a signed [`NameClaim`] at its canonical DHT slot.

@@ -621,6 +621,29 @@ impl SovereignIdentity {
         )
     }
 
+    /// Build + sign a fresh [`RelayKeyRecord`](veil_proto::relay_key::RelayKeyRecord)
+    /// advertising this node's relay X25519 KEM public key, resolvable by
+    /// `node_id` over the DHT. Only meaningful for a relay-capable node (one
+    /// with an anonymity X25519 keypair); callers gate on that.
+    pub fn sign_relay_key(
+        &self,
+        relay_kem_pk: Vec<u8>,
+        valid_from_unix: u64,
+        valid_until_unix: u64,
+        record_version: u64,
+    ) -> Result<veil_proto::relay_key::RelayKeyRecord, PublishError> {
+        crate::publish::sign_relay_key(
+            self.document.node_id,
+            relay_kem_pk,
+            valid_from_unix,
+            valid_until_unix,
+            record_version,
+            self.sig_key_idx,
+            &self.identity_sk,
+            &self.document,
+        )
+    }
+
     /// runtime: build + sign a fresh
     /// [`InstanceRegistry`](veil_proto::instance_registry::InstanceRegistry)
     /// that advertises this node's `instances`.
