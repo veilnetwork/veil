@@ -2144,6 +2144,40 @@ async fn handle_ipc_client(
                         frame.extend_from_slice(&status.to_be_bytes());
                         wh.write_all(&frame).await?;
                     }
+                    Ok(LocalAppMsg::RegisterRendezvousPublisher) => {
+                        use veil_proto::ipc::{RegisterRendezvousPublisherPayload, ipc_send_err};
+                        // Register a plain (sovereign-signed) rendezvous publisher
+                        // advertising the relay's KEM key — mailbox-by-discovery.
+                        // Rate-limit (D2): like the other register paths, gate the
+                        // entry write behind the per-connection token bucket.
+                        let status: u16 = if rate_limiter.as_mut().is_some_and(|rl| !rl.allow()) {
+                            ipc_send_err::RATE_LIMITED
+                        } else if let Ok(p) = RegisterRendezvousPublisherPayload::decode(&body) {
+                            match anon_onion_sender.as_deref() {
+                                Some(s) => {
+                                    s.register_rendezvous_publisher(
+                                        p.rendezvous_node_id,
+                                        p.auth_cookie,
+                                        p.validity_window_secs,
+                                        p.relay_kem_algo,
+                                        p.relay_kem_pk,
+                                    );
+                                    0
+                                }
+                                None => ipc_send_err::NO_RENDEZVOUS,
+                            }
+                        } else {
+                            ipc_send_err::INVALID_FLAGS
+                        };
+                        let mut hdr = FrameHeader::new(
+                            FrameFamily::LocalApp as u8,
+                            LocalAppMsg::RegisterRendezvousPublisherResult as u16,
+                        );
+                        hdr.body_len = 2;
+                        let mut frame = codec::encode_header(&hdr).to_vec();
+                        frame.extend_from_slice(&status.to_be_bytes());
+                        wh.write_all(&frame).await?;
+                    }
                     Ok(LocalAppMsg::SendToOnionService) => {
                         use veil_proto::ipc::{SendToOnionServicePayload, ipc_send_err};
                         // 0 = ok; else an ipc_send_err. Resolving + sending to an

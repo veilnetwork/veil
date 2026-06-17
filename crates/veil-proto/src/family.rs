@@ -804,6 +804,12 @@ pub enum LocalAppMsg {
     /// daemon → app: result of `MailboxOpen`. Body:
     /// [`crate::ipc::MailboxOpenResultPayload`].
     MailboxOpenOk = 82,
+    /// App → daemon: register a PLAIN rendezvous-publisher entry that advertises
+    /// the relay's KEM key (mailbox-by-discovery). Body:
+    /// [`crate::ipc::RegisterRendezvousPublisherPayload`].
+    RegisterRendezvousPublisher = 83,
+    /// daemon → app: result of `RegisterRendezvousPublisher` (2-byte status).
+    RegisterRendezvousPublisherResult = 84,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -893,6 +899,8 @@ impl TryFrom<u16> for LocalAppMsg {
             80 => Ok(LocalAppMsg::MailboxSealOk),
             81 => Ok(LocalAppMsg::MailboxOpen),
             82 => Ok(LocalAppMsg::MailboxOpenOk),
+            83 => Ok(LocalAppMsg::RegisterRendezvousPublisher),
+            84 => Ok(LocalAppMsg::RegisterRendezvousPublisherResult),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,
