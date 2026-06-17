@@ -340,6 +340,24 @@ final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
                 )>>('veil_get_node_id')
         .asFunction();
 
+/// Daemon is not relay-capable — `veil_get_relay_x25519_pubkey` returns this
+/// (mirrors `VEIL_RELAY_X25519_UNAVAILABLE` in veilclient-ffi).
+const int veilRelayX25519Unavailable = -10;
+
+/// Read the daemon's relay-side X25519 public key (32 bytes) into the
+/// out-buffer. Returns `veilOk` when populated, or
+/// `veilRelayX25519Unavailable` when the daemon is not relay-capable.
+final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
+    veilGetRelayX25519Pubkey = nativeLib
+        .lookup<
+                NativeFunction<
+                    Int32 Function(
+                  Pointer<VeilHandle>,
+                  Pointer<Uint8>,
+                  Pointer<Pointer<Utf8>>,
+                )>>('veil_get_relay_x25519_pubkey')
+        .asFunction();
+
 final int Function(Pointer<VeilHandle>, int, Pointer<Pointer<Utf8>>)
     veilRegisterOnionService = nativeLib
         .lookup<
