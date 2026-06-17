@@ -1500,6 +1500,10 @@ impl NodeRuntime {
             .with_e2e_keys(Arc::clone(&self.identity.peer_mlkem_keys))
             .with_mlkem_ek_resolver(mlkem_ek_resolver)
             .with_anon_onion_sender(anon_onion_sender)
+            // Offline-mailbox seal/open (node-side E2E crypto). DORMANT — no app
+            // sends MailboxSeal/Open yet; wired so the path is live once an app
+            // does.
+            .with_mailbox_crypto_sink(std::sync::Arc::new(self.mailbox_crypto()))
             .with_trace_sample_rate(config.routing.trace_sample_rate)
             .with_pending_ack(Arc::clone(&self.dispatcher.pending_ack))
             .with_pending_recursive(Arc::clone(&self.dispatcher.pending_recursive));
