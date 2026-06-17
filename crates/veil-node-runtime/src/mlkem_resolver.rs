@@ -44,7 +44,7 @@ use rand_core::RngCore;
 use veil_dht::KademliaService;
 use veil_dispatcher::PendingRecursive;
 use veil_e2e::PeerMlKemCache;
-use veil_identity::mlkem_fanout::verify_mlkem_cert;
+use veil_identity::mlkem_fanout::{VerifiedMlkemCert, verify_mlkem_cert};
 use veil_identity::verify::verify_identity_document;
 use veil_observability::NodeLogger;
 use veil_proto::header::FrameHeader;
@@ -109,7 +109,17 @@ impl DhtMlKemEkResolver {
     /// Core resolution body.  Each branch returns `None` on any failure
     /// — see module docstring.  Loggable failure points emit DEBUG events
     /// via `NodeLogger` so operators can diagnose with `log_level = "debug"`.
-    async fn fetch_inner(&self, target_node_id: [u8; 32]) -> Option<Vec<u8>> {
+    /// Resolve + verify the recipient's current ML-KEM cert — the full
+    /// [`VerifiedMlkemCert`] (instance_id + cert_version + node_id + EK), not
+    /// just the EK — via the DHT walk IdentityDocument → InstanceRegistry →
+    /// MlKemKeyCert, writing the EK back to the peer cache. Public so the fan-out
+    /// mailbox-seal path can obtain a cert (fan-out binds instance_id +
+    /// cert_version, which the EK-only [`resolve_ek`](MlKemEkResolver::resolve_ek)
+    /// surface discards).
+    pub async fn fetch_verified_cert(
+        &self,
+        target_node_id: [u8; 32],
+    ) -> Option<VerifiedMlkemCert> {
         self.log_dbg("mlkem_resolver.start", &target_node_id, "");
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -265,7 +275,15 @@ impl DhtMlKemEkResolver {
                 verified.mlkem_pubkey.len()
             ),
         );
-        Some(verified.mlkem_pubkey)
+        Some(verified)
+    }
+
+    /// EK-only resolution — the [`MlKemEkResolver`] trait surface used by the
+    /// live `veil_e2e::encrypt` path. Thin wrapper over [`fetch_verified_cert`]
+    /// (which already does the cache writeback), so both layers share one
+    /// resolution + verification path.
+    async fn fetch_inner(&self, target_node_id: [u8; 32]) -> Option<Vec<u8>> {
+        Some(self.fetch_verified_cert(target_node_id).await?.mlkem_pubkey)
     }
 
     /// Mirror of `NodeRuntime::dht_recursive_get` adapted for the shared
