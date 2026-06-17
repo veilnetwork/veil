@@ -358,6 +358,22 @@ final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
                 )>>('veil_get_relay_x25519_pubkey')
         .asFunction();
 
+/// Resolve ANOTHER node's relay X25519 public key by node_id over the DHT
+/// (node_id in, 32-byte key out). Returns `veilOk` when populated, or
+/// `veilRelayX25519Unavailable` when unresolved.
+final int Function(
+        Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
+    veilLookupRelayX25519 = nativeLib
+        .lookup<
+                NativeFunction<
+                    Int32 Function(
+                  Pointer<VeilHandle>,
+                  Pointer<Uint8>,
+                  Pointer<Uint8>,
+                  Pointer<Pointer<Utf8>>,
+                )>>('veil_lookup_relay_x25519')
+        .asFunction();
+
 final int Function(Pointer<VeilHandle>, int, Pointer<Pointer<Utf8>>)
     veilRegisterOnionService = nativeLib
         .lookup<

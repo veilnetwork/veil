@@ -1651,6 +1651,49 @@ impl NodeRuntime {
             } else {
                 None
             };
+
+        // One-shot relay-key publish at startup. If this node has an anonymity
+        // X25519 key (relay_capable / receive_anonymous / onion_service), publish
+        // a signed `RelayKeyRecord` so peers can resolve its relay X25519 by
+        // node_id alone (e.g. to advertise it as an always-on mailbox host). The
+        // 6h republish task refreshes it; this one-shot makes it resolvable
+        // immediately, mirroring the identity/registry/mlkem one-shots above.
+        if let (Some(sov), Some(relay_sk)) =
+            (&sovereign_identity, &anonymity_x25519_sk_for_dispatcher)
+        {
+            let relay_pk = x25519_dalek::PublicKey::from(relay_sk.as_ref()).to_bytes();
+            let publisher =
+                crate::identity_local::publisher_dht::DhtBackedPublisher::new(Arc::clone(&dht));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match sov.sign_relay_key(relay_pk.to_vec(), now, now + 30 * 86_400, 1) {
+                Ok(rec) => match veil_identity::publish::publish_relay_key(&rec, &publisher).await {
+                    Ok(()) => logger.info(
+                        "node.sovereign_identity.relay_key_published",
+                        format!(
+                            "node_id={} relay_x25519 advertised",
+                            veil_util::bytes_to_hex(sov.node_id()),
+                        ),
+                    ),
+                    Err(e) => logger.warn(
+                        "node.sovereign_identity.relay_key_publish_failed",
+                        format!(
+                            "node_id={} — relay-key DHT publish failed: {e}",
+                            veil_util::bytes_to_hex(sov.node_id()),
+                        ),
+                    ),
+                },
+                Err(e) => logger.warn(
+                    "node.sovereign_identity.relay_key_sign_failed",
+                    format!(
+                        "node_id={} — relay-key signing failed: {e}",
+                        veil_util::bytes_to_hex(sov.node_id()),
+                    ),
+                ),
+            }
+        }
         //.4 P2: open mailbox if operator
         // opted in. Storage lives at `<veil_dir>/mailbox/blobs.db`
         // (redb). Zero-valued config fields fall through to crate

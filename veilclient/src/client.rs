@@ -463,6 +463,9 @@ pub(crate) struct DispatchTable {
     ///.4 P5c: pending oneshot replies for `LookupRendezvousReplicas`.
     pub pending_lookup_replicas:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<Vec<RendezvousReplicaInfo>>>,
+    /// Pending oneshot replies for `LookupRelayKey` (relay X25519 by node_id).
+    pub pending_lookup_relay_key:
+        std::collections::VecDeque<tokio::sync::oneshot::Sender<Option<[u8; 32]>>>,
     /// push event sink. When set by [`VeilClient::events`]
     /// every incoming `LocalAppMsg::Event` is decoded and forwarded
     /// here. Single-subscriber by design — the Flutter UI fans the
@@ -582,6 +585,7 @@ impl DispatchTable {
             pending_outbox_find_missing: std::collections::VecDeque::new(),
             pending_outbox_ack: std::collections::VecDeque::new(),
             pending_lookup_replicas: std::collections::VecDeque::new(),
+            pending_lookup_relay_key: std::collections::VecDeque::new(),
             event_sink: None,
         }
     }
@@ -1509,6 +1513,41 @@ impl VeilClient {
             Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
             Err(_) => Err(ClientError::Protocol(
                 "timeout waiting for LookupRendezvousReplicasResp".into(),
+            )),
+        }
+    }
+
+    /// Resolve a node's relay X25519 KEM public key by `node_id` over the DHT.
+    ///
+    /// The daemon fetches + verifies the node's signed `RelayKeyRecord` against
+    /// its `IdentityDocument`. Returns `Ok(Some(pk))` with the verified 32-byte
+    /// key, or `Ok(None)` if unresolved (DHT miss / no record / verification
+    /// failed — indistinguishable by design). Lets a receiver advertise an
+    /// always-on third-party relay as its mailbox host knowing only its node_id.
+    pub async fn lookup_relay_x25519(
+        &self,
+        node_id: [u8; 32],
+    ) -> Result<Option<[u8; 32]>, ClientError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_lookup_relay_key);
+            if d.pending_lookup_relay_key.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(format!(
+                    "lookup_relay_x25519 queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
+                )));
+            }
+            d.pending_lookup_relay_key.push_back(tx);
+        }
+        let payload = veilcore::proto::LookupRelayKeyPayload { node_id };
+        self.writer
+            .write_frame(LocalAppMsg::LookupRelayKey as u16, &payload.encode())
+            .await?;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            Ok(Ok(pk)) => Ok(pk),
+            Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
+            Err(_) => Err(ClientError::Protocol(
+                "timeout waiting for LookupRelayKeyResp".into(),
             )),
         }
     }
@@ -2661,6 +2700,15 @@ async fn reader_task(
                     let mut d = dispatch.lock().await;
                     if let Some(tx) = pop_next_open(&mut d.pending_lookup_replicas) {
                         let _ = tx.send(entries);
+                    }
+                }
+            }
+            LocalAppMsg::LookupRelayKeyResp => {
+                use veilcore::proto::LookupRelayKeyRespPayload;
+                if let Ok(p) = LookupRelayKeyRespPayload::decode(&body) {
+                    let mut d = dispatch.lock().await;
+                    if let Some(tx) = pop_next_open(&mut d.pending_lookup_relay_key) {
+                        let _ = tx.send(p.relay_x25519);
                     }
                 }
             }

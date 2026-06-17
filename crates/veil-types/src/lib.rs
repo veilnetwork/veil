@@ -122,6 +122,19 @@ pub trait MlKemEkResolver: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>;
 }
 
+/// Reactively resolve a node's relay X25519 KEM public key by `node_id` over
+/// the DHT (fetch + verify its signed `RelayKeyRecord` against its
+/// `IdentityDocument`). Returns `None` on any failure (no record, no document,
+/// signature invalid, expired, timeout). Lets an OFFLINE receiver advertise an
+/// always-on third-party relay as its mailbox host — and a sender seal an
+/// anonymous deposit to it — knowing only that relay's `node_id`.
+pub trait RelayKeyResolver: Send + Sync {
+    fn resolve_relay_x25519(
+        &self,
+        target_node_id: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<[u8; 32]>> + Send + '_>>;
+}
+
 // ── AnonOnionSender — authenticated anonymous send over rendezvous ────────────
 //
 // Lets the IPC layer originate an authenticated anonymous onion send

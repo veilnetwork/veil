@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use veil_proto::{
     CreateBootstrapInvitePayload, CreateBootstrapInviteResultPayload, FrameFamily,
-    JoinBootstrapPayload, JoinBootstrapResultPayload, LocalAppMsg, LookupRendezvousReplicasPayload,
+    JoinBootstrapPayload, JoinBootstrapResultPayload, LocalAppMsg, LookupRelayKeyPayload,
+    LookupRelayKeyRespPayload, LookupRendezvousReplicasPayload,
     LookupRendezvousReplicasRespPayload, MAX_CREATE_INVITE_DETAIL_LEN, MAX_CREATE_INVITE_URI_LEN,
     MAX_JOIN_DETAIL_LEN, MAX_PAIR_CEREMONY_BYTES, MAX_PAIR_DETAIL_LEN, MAX_PAIR_URI_LEN,
     MAX_RENDEZVOUS_REPLICAS, MOBILE_BATTERY_AC_OR_UNKNOWN, MOBILE_LOW_BATTERY_THRESHOLD_DISABLED,
@@ -81,6 +82,36 @@ pub(crate) async fn handle_lookup_rendezvous_replicas(
         wh,
         FrameFamily::LocalApp as u8,
         LocalAppMsg::LookupRendezvousReplicasResp as u16,
+        &reply.encode(),
+    )
+    .await
+}
+
+pub(crate) async fn handle_lookup_relay_key(
+    wh: &mut IpcWriteHalf,
+    body: &[u8],
+    client_state: &mut IpcClientState,
+    relay_key_resolver: Option<&Arc<dyn veil_types::RelayKeyResolver>>,
+) -> std::io::Result<()> {
+    // App asks the daemon to resolve a node's relay X25519 KEM key by node_id.
+    // Daemon does the DHT walk + signature verification; reply carries the
+    // verified key or `None` (DHT miss / no record / verification failed —
+    // indistinguishable by design).
+    if !client_state.allow_query() {
+        return Ok(());
+    }
+    let Ok(req) = LookupRelayKeyPayload::decode(body) else {
+        return Ok(());
+    };
+    let relay_x25519 = match relay_key_resolver {
+        Some(r) => r.resolve_relay_x25519(req.node_id).await,
+        None => None,
+    };
+    let reply = LookupRelayKeyRespPayload { relay_x25519 };
+    write_frame_wh(
+        wh,
+        FrameFamily::LocalApp as u8,
+        LocalAppMsg::LookupRelayKeyResp as u16,
         &reply.encode(),
     )
     .await

@@ -44,16 +44,17 @@ use rand_core::RngCore;
 use veil_dht::KademliaService;
 use veil_dispatcher::PendingRecursive;
 use veil_e2e::PeerMlKemCache;
-use veil_identity::mlkem_fanout::{VerifiedMlkemCert, verify_mlkem_cert};
+use veil_identity::mlkem_fanout::{VerifiedMlkemCert, verify_mlkem_cert, verify_relay_key};
 use veil_identity::verify::verify_identity_document;
 use veil_observability::NodeLogger;
 use veil_proto::header::FrameHeader;
 use veil_proto::identity_document::IdentityDocument;
 use veil_proto::instance_registry::{INSTANCE_REGISTRY_SIG_CONTEXT, InstanceRegistry};
 use veil_proto::mlkem_cert::MlKemKeyCert;
+use veil_proto::relay_key::RelayKeyRecord;
 use veil_proto::routing::{RecursiveQueryPayload, recursive_query_type};
 use veil_session::SessionTxRegistry;
-use veil_types::{MlKemEkResolver, NodeIdBytes};
+use veil_types::{MlKemEkResolver, NodeIdBytes, RelayKeyResolver};
 use veil_util::{lock, rlock, wlock};
 
 /// Default per-step timeout when none is configured (3 sec).  Three
@@ -302,6 +303,62 @@ impl DhtMlKemEkResolver {
         Some(self.fetch_verified_cert(target_node_id).await?.mlkem_pubkey)
     }
 
+    /// Resolve + verify a node's relay X25519 KEM public key from the DHT:
+    /// fetch its verified `IdentityDocument` (to obtain the signing subkey),
+    /// then recursive-walk `RelayKeyRecord::dht_key(node_id)` and verify the
+    /// record's signature against that document via
+    /// [`verify_relay_key`](veil_identity::mlkem_fanout::verify_relay_key).
+    /// Returns the authenticated 32-byte X25519 key, or `None` on any failure
+    /// (no document, no record, bad signature, expired, timeout).
+    ///
+    /// Reuses the same document fetch + recursive-get the ML-KEM walk uses, so
+    /// the relay-key resolve shares the mirror-cache-poison-resistant fast path.
+    pub async fn fetch_relay_x25519(&self, target_node_id: [u8; 32]) -> Option<[u8; 32]> {
+        let doc = self.fetch_verified_document(target_node_id).await?;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let key = RelayKeyRecord::dht_key(&target_node_id);
+        let bytes = match self
+            .dht_recursive_get(key, self.step_timeout, |b| {
+                RelayKeyRecord::decode(b).ok().is_some_and(|r| {
+                    r.node_id == target_node_id && verify_relay_key(&r, &doc, now_unix).is_ok()
+                })
+            })
+            .await
+        {
+            Some(b) => b,
+            None => {
+                self.log_dbg("relay_key_resolver.dht_miss", &target_node_id, "");
+                return None;
+            }
+        };
+        let rec = RelayKeyRecord::decode(&bytes)
+            .map_err(|e| {
+                self.log_dbg(
+                    "relay_key_resolver.decode_failed",
+                    &target_node_id,
+                    &format!("{e}"),
+                )
+            })
+            .ok()?;
+        let pk = verify_relay_key(&rec, &doc, now_unix)
+            .map_err(|e| {
+                self.log_dbg(
+                    "relay_key_resolver.verify_failed",
+                    &target_node_id,
+                    &format!("{e}"),
+                )
+            })
+            .ok()?;
+        self.logger.debug(
+            "relay_key_resolver.resolved",
+            format!("target={} relay_x25519 resolved", hex8(&target_node_id)),
+        );
+        Some(pk)
+    }
+
     /// Mirror of `NodeRuntime::dht_recursive_get` adapted for the shared
     /// references that this resolver holds.  Does NOT depend on the
     /// surrounding NodeRuntime so this module stays self-contained.
@@ -425,6 +482,15 @@ impl MlKemEkResolver for DhtMlKemEkResolver {
         target_node_id: NodeIdBytes,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
         Box::pin(self.fetch_inner(target_node_id))
+    }
+}
+
+impl RelayKeyResolver for DhtMlKemEkResolver {
+    fn resolve_relay_x25519(
+        &self,
+        target_node_id: NodeIdBytes,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<[u8; 32]>> + Send + '_>> {
+        Box::pin(self.fetch_relay_x25519(target_node_id))
     }
 }
 
