@@ -5090,11 +5090,293 @@ impl PnetStatusResultPayload {
     }
 }
 
+// ── Offline-mailbox seal/open (node-side E2E crypto, distinct from the
+//    MailboxPut/Fetch/Ack relay transport) ─────────────────────────────────────
+
+/// Result status shared by [`MailboxSealResultPayload`] and
+/// [`MailboxOpenResultPayload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MailboxCryptoStatus {
+    /// Success — the sealed blob (seal) / verified message (open) follows.
+    Ok = 0,
+    /// No sovereign identity is loaded on the node.
+    NoIdentity = 1,
+    /// The peer's ML-KEM cert (seal) or identity document (open) could not be
+    /// resolved + verified from the DHT.
+    PeerUnresolved = 2,
+    /// The seal/open operation itself failed (encrypt, decode, AEAD, size, or
+    /// signature verification).
+    Failed = 3,
+}
+
+impl MailboxCryptoStatus {
+    /// Status byte.
+    pub fn to_wire(self) -> u8 {
+        self as u8
+    }
+    /// Parse from the status byte.
+    pub fn from_wire(b: u8) -> Result<Self, ProtoError> {
+        match b {
+            0 => Ok(Self::Ok),
+            1 => Ok(Self::NoIdentity),
+            2 => Ok(Self::PeerUnresolved),
+            3 => Ok(Self::Failed),
+            other => Err(ProtoError::Malformed(format!(
+                "MailboxCryptoStatus: unknown status byte {other}"
+            ))),
+        }
+    }
+}
+
+/// Payload [`crate::family::LocalAppMsg::MailboxSeal`] (app → node).
+///
+/// Wire layout: `[recipient_node_id(32) | app_id(32) | endpoint_id_u32_be(4) | data(rest)]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxSealPayload {
+    /// Recipient the message is sealed for.
+    pub recipient_node_id: [u8; 32],
+    /// Destination app id at the recipient.
+    pub app_id: [u8; 32],
+    /// Destination endpoint id at the recipient.
+    pub endpoint_id: u32,
+    /// Plaintext to seal.
+    pub data: Vec<u8>,
+}
+
+impl MailboxSealPayload {
+    /// Fixed-prefix size before the variable `data`.
+    pub const HEADER_SIZE: usize = 32 + 32 + 4;
+
+    /// Encode to wire bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.data.len());
+        buf.extend_from_slice(&self.recipient_node_id);
+        buf.extend_from_slice(&self.app_id);
+        buf.extend_from_slice(&self.endpoint_id.to_be_bytes());
+        buf.extend_from_slice(&self.data);
+        buf
+    }
+
+    /// Decode from wire bytes.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::HEADER_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::HEADER_SIZE,
+                got: buf.len(),
+            });
+        }
+        let recipient_node_id = super::read_array::<32>(buf, 0)?;
+        let app_id = super::read_array::<32>(buf, 32)?;
+        let endpoint_id = super::read_u32_be(buf, 64)?;
+        let data = buf[Self::HEADER_SIZE..].to_vec();
+        Ok(Self {
+            recipient_node_id,
+            app_id,
+            endpoint_id,
+            data,
+        })
+    }
+}
+
+/// Payload [`crate::family::LocalAppMsg::MailboxSealOk`] (node → app).
+///
+/// Wire layout: `[status(1) | blob(rest)]`. `blob` is the sealed mailbox blob,
+/// present only when `status == Ok`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxSealResultPayload {
+    /// Outcome of the seal.
+    pub status: MailboxCryptoStatus,
+    /// The sealed blob (empty unless `status == Ok`).
+    pub blob: Vec<u8>,
+}
+
+impl MailboxSealResultPayload {
+    /// Encode to wire bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + self.blob.len());
+        buf.push(self.status.to_wire());
+        buf.extend_from_slice(&self.blob);
+        buf
+    }
+
+    /// Decode from wire bytes.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        let status = MailboxCryptoStatus::from_wire(
+            *buf.first()
+                .ok_or(ProtoError::BufferTooShort { need: 1, got: 0 })?,
+        )?;
+        Ok(Self {
+            status,
+            blob: buf[1..].to_vec(),
+        })
+    }
+}
+
+/// Payload [`crate::family::LocalAppMsg::MailboxOpen`] (app → node).
+///
+/// Wire layout: `[sender_node_id(32) | our_cert_version_u64_be(8) | blob(rest)]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxOpenPayload {
+    /// Claimed sender (whose document the node resolves to verify the blob).
+    pub sender_node_id: [u8; 32],
+    /// Version of OUR currently-published ML-KEM cert (matches our `dk_seed`).
+    pub our_cert_version: u64,
+    /// The fetched mailbox blob to open + verify.
+    pub blob: Vec<u8>,
+}
+
+impl MailboxOpenPayload {
+    /// Fixed-prefix size before the variable `blob`.
+    pub const HEADER_SIZE: usize = 32 + 8;
+
+    /// Encode to wire bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.blob.len());
+        buf.extend_from_slice(&self.sender_node_id);
+        buf.extend_from_slice(&self.our_cert_version.to_be_bytes());
+        buf.extend_from_slice(&self.blob);
+        buf
+    }
+
+    /// Decode from wire bytes.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::HEADER_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::HEADER_SIZE,
+                got: buf.len(),
+            });
+        }
+        let sender_node_id = super::read_array::<32>(buf, 0)?;
+        let our_cert_version = super::read_u64_be(buf, 32)?;
+        let blob = buf[Self::HEADER_SIZE..].to_vec();
+        Ok(Self {
+            sender_node_id,
+            our_cert_version,
+            blob,
+        })
+    }
+}
+
+/// Payload [`crate::family::LocalAppMsg::MailboxOpenOk`] (node → app).
+///
+/// Wire layout: `[status(1) | app_id(32) | endpoint_id_u32_be(4) | data(rest)]`.
+/// `app_id` / `endpoint_id` / `data` carry the verified [`AuthAppDeliver`]'s
+/// routing target + payload, present only when `status == Ok`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxOpenResultPayload {
+    /// Outcome of the open + verify.
+    pub status: MailboxCryptoStatus,
+    /// Verified destination app id.
+    pub app_id: [u8; 32],
+    /// Verified destination endpoint id.
+    pub endpoint_id: u32,
+    /// Verified plaintext.
+    pub data: Vec<u8>,
+}
+
+impl MailboxOpenResultPayload {
+    /// Fixed-prefix size before the variable `data`.
+    pub const HEADER_SIZE: usize = 1 + 32 + 4;
+
+    /// Encode to wire bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.data.len());
+        buf.push(self.status.to_wire());
+        buf.extend_from_slice(&self.app_id);
+        buf.extend_from_slice(&self.endpoint_id.to_be_bytes());
+        buf.extend_from_slice(&self.data);
+        buf
+    }
+
+    /// Decode from wire bytes.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::HEADER_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::HEADER_SIZE,
+                got: buf.len(),
+            });
+        }
+        let status = MailboxCryptoStatus::from_wire(buf[0])?;
+        let app_id = super::read_array::<32>(buf, 1)?;
+        let endpoint_id = super::read_u32_be(buf, 33)?;
+        let data = buf[Self::HEADER_SIZE..].to_vec();
+        Ok(Self {
+            status,
+            app_id,
+            endpoint_id,
+            data,
+        })
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailbox_seal_payloads_round_trip() {
+        let req = MailboxSealPayload {
+            recipient_node_id: [0xA1; 32],
+            app_id: [0xB2; 32],
+            endpoint_id: 0x0102_0304,
+            data: b"seal me".to_vec(),
+        };
+        assert_eq!(MailboxSealPayload::decode(&req.encode()).unwrap(), req);
+
+        let ok = MailboxSealResultPayload {
+            status: MailboxCryptoStatus::Ok,
+            blob: vec![1, 2, 3, 4, 5],
+        };
+        assert_eq!(MailboxSealResultPayload::decode(&ok.encode()).unwrap(), ok);
+        // Error result carries an empty blob.
+        let err = MailboxSealResultPayload {
+            status: MailboxCryptoStatus::PeerUnresolved,
+            blob: Vec::new(),
+        };
+        assert_eq!(MailboxSealResultPayload::decode(&err.encode()).unwrap(), err);
+    }
+
+    #[test]
+    fn mailbox_open_payloads_round_trip() {
+        let req = MailboxOpenPayload {
+            sender_node_id: [0xC3; 32],
+            our_cert_version: 0xDEAD_BEEF_0000_0007,
+            blob: b"an opaque sealed blob".to_vec(),
+        };
+        assert_eq!(MailboxOpenPayload::decode(&req.encode()).unwrap(), req);
+
+        let ok = MailboxOpenResultPayload {
+            status: MailboxCryptoStatus::Ok,
+            app_id: [0x44; 32],
+            endpoint_id: 9,
+            data: b"recovered plaintext".to_vec(),
+        };
+        assert_eq!(MailboxOpenResultPayload::decode(&ok.encode()).unwrap(), ok);
+    }
+
+    #[test]
+    fn mailbox_crypto_status_round_trips_and_rejects_unknown() {
+        for s in [
+            MailboxCryptoStatus::Ok,
+            MailboxCryptoStatus::NoIdentity,
+            MailboxCryptoStatus::PeerUnresolved,
+            MailboxCryptoStatus::Failed,
+        ] {
+            assert_eq!(MailboxCryptoStatus::from_wire(s.to_wire()).unwrap(), s);
+        }
+        assert!(MailboxCryptoStatus::from_wire(99).is_err());
+    }
+
+    #[test]
+    fn mailbox_seal_open_reject_truncated_headers() {
+        assert!(MailboxSealPayload::decode(&[0u8; 67]).is_err()); // < 68
+        assert!(MailboxOpenPayload::decode(&[0u8; 39]).is_err()); // < 40
+        assert!(MailboxOpenResultPayload::decode(&[0u8; 36]).is_err()); // < 37
+        assert!(MailboxSealResultPayload::decode(&[]).is_err()); // empty
+    }
 
     #[test]
     fn send_to_onion_service_payload_roundtrip() {
