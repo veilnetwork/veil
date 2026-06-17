@@ -398,6 +398,14 @@ pub(crate) struct DispatchTable {
     /// generator side).
     pub pending_create_invite:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<CreateBootstrapInviteReply>>,
+    /// Offline-mailbox seal replies (`MailboxSealOk`).
+    pub pending_mailbox_seal: std::collections::VecDeque<
+        tokio::sync::oneshot::Sender<veilcore::proto::MailboxSealResultPayload>,
+    >,
+    /// Offline-mailbox open replies (`MailboxOpenOk`).
+    pub pending_mailbox_open: std::collections::VecDeque<
+        tokio::sync::oneshot::Sender<veilcore::proto::MailboxOpenResultPayload>,
+    >,
     /// Epic 489.8 multi-device pairing — Source side replies.
     pub pending_pair_source_create:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<PairCreateInviteReply>>,
@@ -549,6 +557,8 @@ impl DispatchTable {
             pending_pnet_status: std::collections::VecDeque::new(),
             pending_bootstrap_join: std::collections::VecDeque::new(),
             pending_create_invite: std::collections::VecDeque::new(),
+            pending_mailbox_seal: std::collections::VecDeque::new(),
+            pending_mailbox_open: std::collections::VecDeque::new(),
             pending_pair_source_create: std::collections::VecDeque::new(),
             pending_pair_source_hello: std::collections::VecDeque::new(),
             pending_pair_source_confirm: std::collections::VecDeque::new(),
@@ -1672,6 +1682,82 @@ impl VeilClient {
         await_rpc_reply(rx, "create_bootstrap_invite reply").await
     }
 
+    // ── Offline-mailbox seal/open (node-side E2E crypto) ───────────────
+
+    /// Seal `data` for `recipient`'s `(app_id, endpoint_id)` into an offline
+    /// mailbox blob (the node signs an auth-deliver + fan-out-encrypts to the
+    /// recipient's DHT-resolved cert). Returns the blob to `mailbox_put`.
+    pub async fn mailbox_seal(
+        &self,
+        recipient: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>, ClientError> {
+        let payload = veilcore::proto::MailboxSealPayload {
+            recipient_node_id: recipient,
+            app_id,
+            endpoint_id,
+            data,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_mailbox_seal);
+            if d.pending_mailbox_seal.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(format!(
+                    "mailbox_seal queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
+                )));
+            }
+            d.pending_mailbox_seal.push_back(tx);
+        }
+        self.writer
+            .write_frame(LocalAppMsg::MailboxSeal as u16, &payload.encode())
+            .await?;
+        let reply = await_rpc_reply(rx, "mailbox_seal reply").await?;
+        match reply.status {
+            veilcore::proto::MailboxCryptoStatus::Ok => Ok(reply.blob),
+            other => Err(ClientError::Protocol(format!("mailbox_seal failed: {other:?}"))),
+        }
+    }
+
+    /// Open + verify a fetched mailbox `blob` claimed to be from `sender`,
+    /// decrypting under our current cert version `our_cert_version`. Returns the
+    /// verified `(app_id, endpoint_id, data)`.
+    pub async fn mailbox_open(
+        &self,
+        blob: Vec<u8>,
+        sender: [u8; 32],
+        our_cert_version: u64,
+    ) -> Result<([u8; 32], u32, Vec<u8>), ClientError> {
+        let payload = veilcore::proto::MailboxOpenPayload {
+            sender_node_id: sender,
+            our_cert_version,
+            blob,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_mailbox_open);
+            if d.pending_mailbox_open.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(format!(
+                    "mailbox_open queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
+                )));
+            }
+            d.pending_mailbox_open.push_back(tx);
+        }
+        self.writer
+            .write_frame(LocalAppMsg::MailboxOpen as u16, &payload.encode())
+            .await?;
+        let reply = await_rpc_reply(rx, "mailbox_open reply").await?;
+        match reply.status {
+            veilcore::proto::MailboxCryptoStatus::Ok => {
+                Ok((reply.app_id, reply.endpoint_id, reply.data))
+            }
+            other => Err(ClientError::Protocol(format!("mailbox_open failed: {other:?}"))),
+        }
+    }
+
     // ── Multi-device pairing (Epic 489.8) ─────────────────────────────
 
     /// Source-side: generate a pair-invite URI + initialize ceremony.
@@ -2548,6 +2634,22 @@ async fn reader_task(
                     let mut d = dispatch.lock().await;
                     if let Some(tx) = pop_next_open(&mut d.pending_create_invite) {
                         let _ = tx.send(reply);
+                    }
+                }
+            }
+            LocalAppMsg::MailboxSealOk => {
+                if let Ok(p) = veilcore::proto::MailboxSealResultPayload::decode(&body) {
+                    let mut d = dispatch.lock().await;
+                    if let Some(tx) = pop_next_open(&mut d.pending_mailbox_seal) {
+                        let _ = tx.send(p);
+                    }
+                }
+            }
+            LocalAppMsg::MailboxOpenOk => {
+                if let Ok(p) = veilcore::proto::MailboxOpenResultPayload::decode(&body) {
+                    let mut d = dispatch.lock().await;
+                    if let Some(tx) = pop_next_open(&mut d.pending_mailbox_open) {
+                        let _ = tx.send(p);
                     }
                 }
             }
