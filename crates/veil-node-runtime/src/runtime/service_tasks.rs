@@ -1867,6 +1867,19 @@ impl NodeRuntime {
             //
             // Reuses `push_tx` cloned above so app-route puts trigger
             // pushes the same way IPC-route puts do.
+            // Anonymous-reply egress for network FETCH (built BEFORE the mutable
+            // `builtin_app_host` borrow so `self.access()` is free to borrow).
+            // Gated on the relay X25519 secret like push: without it the node
+            // can't run the onion send the reply needs. hop_count is nominal —
+            // a reply routes over the requester's one-time reply path.
+            let mailbox_reply_sender: Option<Arc<dyn veil_types::AnonOnionSender>> = self
+                .dispatcher
+                .anonymity_x25519_sk
+                .is_some()
+                .then(|| {
+                    Arc::new(RuntimeAnonOnionSender::new(self.access(), 2))
+                        as Arc<dyn veil_types::AnonOnionSender>
+                });
             if let Some(host) = self.builtin_app_host.as_mut() {
                 let app_ctx = host.make_context(
                     *self.identity.local_identity.node_id.as_bytes(),
@@ -1886,6 +1899,7 @@ impl NodeRuntime {
                     app_ctx,
                     Arc::clone(mailbox),
                     push_tx_opt,
+                    mailbox_reply_sender,
                 );
             }
         }

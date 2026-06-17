@@ -38,9 +38,11 @@ use std::sync::Arc;
 
 use veil_app::AppMessage;
 use veil_mailbox::{
-    MAILBOX_APP_ID, MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, Mailbox,
+    MAILBOX_APP_ID, MAILBOX_FETCH_ENDPOINT_CAPACITY, MAILBOX_FETCH_ENDPOINT_ID,
+    MAILBOX_FETCH_REPLY_MAX_BYTES, MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, Mailbox,
 };
-use veil_proto::MailboxPutPayload;
+use veil_proto::{MAX_MAILBOX_FETCH_ENTRIES, MailboxBlobWire, MailboxFetchRespPayload, MailboxPutPayload};
+use veil_types::AnonOnionSender;
 
 use super::host::{BuiltinAppHost, BuiltinEndpoint, ServiceContext, ServiceSpec};
 
@@ -82,41 +84,143 @@ pub const PUSH_TRIGGER_QUEUE_CAP: usize = 512;
 /// channel the configured push dispatcher consumes from; pass `None`
 /// to disable push triggering (e.g. relay running without anonymity X25519
 /// secret — without a key it can't unseal envelopes anyway).
+///
+/// `reply_sender` is the anonymous-reply egress used to answer network FETCH
+/// requests over their one-time reply path. Pass `None` to run PUT-only (a
+/// relay with no anon sender can still store, just not serve fetches).
 pub fn spawn_mailbox_app_service(
     host: &mut BuiltinAppHost,
     ctx: ServiceContext,
     mailbox: Arc<Mailbox>,
     push_trigger_tx: Option<tokio::sync::mpsc::Sender<PushTrigger>>,
+    reply_sender: Option<Arc<dyn AnonOnionSender>>,
 ) {
     let spec = ServiceSpec {
         name: "veil.mailbox.v1",
         app_id: MAILBOX_APP_ID,
-        endpoints: vec![BuiltinEndpoint {
-            endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
-            capacity: MAILBOX_PUT_ENDPOINT_CAPACITY,
-        }],
+        endpoints: vec![
+            BuiltinEndpoint {
+                endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
+                capacity: MAILBOX_PUT_ENDPOINT_CAPACITY,
+            },
+            BuiltinEndpoint {
+                endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
+                capacity: MAILBOX_FETCH_ENDPOINT_CAPACITY,
+            },
+        ],
     };
     host.spawn(ctx, spec, move |mut ctx, mut rxs| async move {
+        // Receivers are in spec.endpoints order: [PUT, FETCH].
         let mut put_rx = rxs.remove(0);
+        let mut fetch_rx = rxs.remove(0);
         loop {
             tokio::select! {
                 Some(msg) = put_rx.recv() => {
                     handle_put_message(&mailbox, push_trigger_tx.as_ref(), msg);
+                }
+                Some(msg) = fetch_rx.recv() => {
+                    handle_fetch_message(&mailbox, reply_sender.as_ref(), msg).await;
                 }
                 _ = ctx.shutdown.changed() => {
                     log::info!("veil-mailbox: app service stopping");
                     break;
                 }
                 else => {
-                    // recv returned None — registry dropped the sender
+                    // recv returned None — registry dropped the senders
                     // (shouldn't happen during normal operation; means
                     // the host is being torn down).
-                    log::info!("veil-mailbox: PUT endpoint closed");
+                    log::info!("veil-mailbox: PUT/FETCH endpoint closed");
                     break;
                 }
             }
         }
     });
+}
+
+/// Handle one incoming app message addressed to the FETCH endpoint.
+///
+/// The requester is AUTHENTICATED — the onion delivery cryptographically
+/// verified its identity, so `src_node_id` IS the receiver. We gather THAT
+/// receiver's stored blobs and reply over the one-time reply path (`reply_id`).
+/// No cookie: the verified identity is the authorization (a shared secret would
+/// only be a weaker, leakable substitute for the cryptographic proof we already
+/// have here). Bounded so the reply fits the anonymous reply path; the receiver
+/// re-fetches after acking to drain more.
+pub async fn handle_fetch_message(
+    mailbox: &Mailbox,
+    reply_sender: Option<&Arc<dyn AnonOnionSender>>,
+    msg: AppMessage,
+) {
+    let (src_node_id, reply_id) = match msg {
+        AppMessage::Deliver {
+            src_node_id,
+            reply_id,
+            ..
+        } => (src_node_id, reply_id),
+        other => {
+            log::debug!("veil-mailbox: ignoring non-Deliver on FETCH endpoint: {other:?}");
+            return;
+        }
+    };
+    // An UNAUTHENTICATED request (src_node_id == 0, the anonymous-send marker)
+    // or one with no reply path can't be served: we'd have no verified receiver
+    // to key the mailbox on, and nowhere to send the answer.
+    if src_node_id == [0u8; 32] || reply_id == 0 {
+        log::debug!("veil-mailbox: FETCH dropped (unauthenticated src or no reply path)");
+        return;
+    }
+    let Some(sender) = reply_sender else {
+        log::debug!("veil-mailbox: FETCH dropped — no reply egress configured");
+        return;
+    };
+    let blobs = match mailbox.fetch(src_node_id) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!(
+                "veil-mailbox: FETCH store error (recv={}): {e}",
+                hex_short(&src_node_id),
+            );
+            return;
+        }
+    };
+    // Bound the reply to fit one anonymous reply payload (oldest-first).
+    let mut total = 0usize;
+    let wire: Vec<MailboxBlobWire> = blobs
+        .into_iter()
+        .take(MAX_MAILBOX_FETCH_ENTRIES)
+        .take_while(|b| {
+            if total == 0 {
+                total = b.blob.len();
+                return true; // always emit at least one (guarantees progress)
+            }
+            if total + b.blob.len() > MAILBOX_FETCH_REPLY_MAX_BYTES {
+                return false;
+            }
+            total += b.blob.len();
+            true
+        })
+        .map(|b| MailboxBlobWire {
+            sender_id: b.sender_id,
+            content_id: b.content_id,
+            deposited_at: b.deposited_at,
+            blob: b.blob,
+        })
+        .collect();
+    let n = wire.len();
+    let resp = MailboxFetchRespPayload { blobs: wire }.encode();
+    match sender
+        .send_reply(reply_id, &resp, MAILBOX_APP_ID)
+        .await
+    {
+        Ok(()) => log::debug!(
+            "veil-mailbox: FETCH replied {n} blob(s) to recv={}",
+            hex_short(&src_node_id),
+        ),
+        Err(e) => log::warn!(
+            "veil-mailbox: FETCH reply failed (recv={}): {e:?}",
+            hex_short(&src_node_id),
+        ),
+    }
 }
 
 /// Handle one incoming app message addressed to the PUT endpoint.
@@ -349,7 +453,7 @@ mod tests {
         let mut host = BuiltinAppHost::new();
         let registry = Arc::new(AppEndpointRegistry::new());
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None);
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None, None);
 
         // Send a Deliver to MAILBOX_APP_ID + MAILBOX_PUT_ENDPOINT_ID.
         let recv = [11u8; 32];
@@ -388,7 +492,7 @@ mod tests {
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
         let (push_tx, mut push_rx) =
             tokio::sync::mpsc::channel::<PushTrigger>(PUSH_TRIGGER_QUEUE_CAP);
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), Some(push_tx));
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), Some(push_tx), None);
 
         let recv = [11u8; 32];
         let envelope = vec![0xEE; 60];
@@ -431,7 +535,7 @@ mod tests {
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
         let (push_tx, mut push_rx) =
             tokio::sync::mpsc::channel::<PushTrigger>(PUSH_TRIGGER_QUEUE_CAP);
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), Some(push_tx));
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), Some(push_tx), None);
 
         let payload = mk_payload(
             [1u8; 32],
@@ -469,7 +573,7 @@ mod tests {
         let mut host = BuiltinAppHost::new();
         let registry = Arc::new(AppEndpointRegistry::new());
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None);
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None, None);
 
         let sender = registry
             .get_sender(MAILBOX_APP_ID, MAILBOX_PUT_ENDPOINT_ID)
@@ -512,7 +616,7 @@ mod tests {
         let mut host = BuiltinAppHost::new();
         let registry = Arc::new(AppEndpointRegistry::new());
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None);
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None, None);
 
         let sender = registry
             .get_sender(MAILBOX_APP_ID, MAILBOX_PUT_ENDPOINT_ID)
@@ -540,5 +644,136 @@ mod tests {
         let stored = mailbox.fetch([1u8; 32]).unwrap();
         assert_eq!(stored.len(), 1);
         host.shutdown().await;
+    }
+
+    // ── FETCH endpoint ──────────────────────────────────────────────────────
+
+    /// Captures `send_reply` calls; every other AnonOnionSender method is
+    /// unreachable on the FETCH path and panics if hit.
+    struct MockReplySender {
+        captured: std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>, [u8; 32])>>>,
+    }
+
+    type AnonFut<'a> = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), veil_types::AnonOnionSendError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    impl veil_types::AnonOnionSender for MockReplySender {
+        fn send_reply<'a>(
+            &'a self,
+            reply_id: u64,
+            data: &'a [u8],
+            src_app_id: [u8; 32],
+        ) -> AnonFut<'a> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push((reply_id, data.to_vec(), src_app_id));
+            Box::pin(async { Ok(()) })
+        }
+        fn send_authenticated<'a>(&'a self, _: [u8; 32], _: [u8; 32], _: u32, _: &'a [u8]) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn send_authenticated_with_reply<'a>(
+            &'a self, _: [u8; 32], _: [u8; 32], _: u32, _: &'a [u8], _: [u8; 32], _: u32,
+        ) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn register_onion_service<'a>(&'a self, _: usize) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn register_rendezvous_publisher(&self, _: [u8; 32], _: [u8; 16], _: u64, _: u8, _: Vec<u8>) {
+            unimplemented!()
+        }
+        fn send_to_onion_service<'a>(&'a self, _: [u8; 32], _: [u8; 32], _: u32, _: &'a [u8], _: usize) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn send_to_onion_service_anonymous<'a>(
+            &'a self, _: [u8; 32], _: [u8; 32], _: u32, _: [u8; 32], _: &'a [u8], _: usize,
+        ) -> AnonFut<'a> {
+            unimplemented!()
+        }
+        fn send_anonymous_direct<'a>(
+            &'a self, _: [u8; 32], _: [u8; 32], _: [u8; 32], _: u32, _: [u8; 32], _: &'a [u8], _: usize,
+        ) -> AnonFut<'a> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn network_fetch_replies_with_authenticated_receivers_blobs() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        // Deposit a blob for the receiver that will authenticate as src_node_id.
+        let recv = [0x77u8; 32];
+        mailbox
+            .put(recv, [0xC1; 32], [0xAA; 32], b"sealed-blob".to_vec())
+            .unwrap();
+        // A different receiver's blob must NOT leak into recv's fetch.
+        mailbox
+            .put([0x99; 32], [0xC2; 32], [0xBB; 32], b"other".to_vec())
+            .unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+
+        // Authenticated delivery: src_node_id == recv, non-zero reply_id.
+        let msg = AppMessage::Deliver {
+            src_node_id: recv,
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+            reply_id: 99,
+        };
+        handle_fetch_message(&mailbox, Some(&sender), msg).await;
+
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1, "exactly one reply");
+        let (rid, data, src_app) = &cap[0];
+        assert_eq!(*rid, 99, "replies over the inbound reply_id");
+        assert_eq!(*src_app, MAILBOX_APP_ID, "reply owned by the mailbox app");
+        let resp = veil_proto::MailboxFetchRespPayload::decode(data).unwrap();
+        assert_eq!(resp.blobs.len(), 1, "only the receiver's own blob");
+        assert_eq!(resp.blobs[0].content_id, [0xC1; 32]);
+        assert_eq!(resp.blobs[0].blob, b"sealed-blob");
+    }
+
+    #[tokio::test]
+    async fn network_fetch_drops_unauthenticated_or_no_reply_path() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        mailbox
+            .put([0x77; 32], [0xC1; 32], [0xAA; 32], b"x".to_vec())
+            .unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+        // Anonymous source (src_node_id == 0): no verified receiver → drop.
+        let anon = AppMessage::Deliver {
+            src_node_id: [0u8; 32],
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+            reply_id: 5,
+        };
+        handle_fetch_message(&mailbox, Some(&sender), anon).await;
+        // No reply path (reply_id == 0): nowhere to answer → drop.
+        let noreply = AppMessage::Deliver {
+            src_node_id: [0x77u8; 32],
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+            reply_id: 0,
+        };
+        handle_fetch_message(&mailbox, Some(&sender), noreply).await;
+        assert!(captured.lock().unwrap().is_empty(), "no reply for either drop case");
     }
 }
