@@ -1935,7 +1935,12 @@ impl NodeRuntime {
         // OTHER nodes' replicas (asymmetric: lookup-side vs
         // serve-side roles).
         let resolver: Arc<dyn veil_ipc::RendezvousReplicaResolver> =
-            Arc::new(RendezvousResolverImpl::new(Arc::clone(&self.dht)));
+            Arc::new(RendezvousResolverImpl::new(
+                Arc::clone(&self.dht),
+                Arc::clone(&self.session_tx_registry),
+                Arc::clone(&self.dispatcher.pending_recursive),
+                *self.identity.local_identity.node_id.as_bytes(),
+            ));
         server = server.with_rendezvous_resolver(resolver);
         // log IpcServer::run failure instead of swallowing.
         // Previously `let _ = server.run.await` made bind failures, rename
@@ -2750,11 +2755,29 @@ async fn push_creds_watch_task(
 
 pub struct RendezvousResolverImpl {
     dht: Arc<veil_dht::KademliaService>,
+    // Shared refs for the recursive DHT walk (so resolve_replicas can find a
+    // receiver's rendezvous ad CROSS-NODE, not just in the local mirror cache).
+    session_tx_registry: Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
+    pending_recursive:
+        Arc<std::sync::Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher::PendingRecursive>>>,
+    local_node_id: [u8; 32],
 }
 
 impl RendezvousResolverImpl {
-    fn new(dht: Arc<veil_dht::KademliaService>) -> Self {
-        Self { dht }
+    fn new(
+        dht: Arc<veil_dht::KademliaService>,
+        session_tx_registry: Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
+        pending_recursive: Arc<
+            std::sync::Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher::PendingRecursive>>,
+        >,
+        local_node_id: [u8; 32],
+    ) -> Self {
+        Self {
+            dht,
+            session_tx_registry,
+            pending_recursive,
+            local_node_id,
+        }
     }
 }
 
@@ -3004,7 +3027,29 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                 std::collections::HashSet::new();
             for idx in 0..cap as u8 {
                 let key = rendezvous_ad_dht_key_at(&receiver_id, idx);
-                let bytes = match self.dht.get_local(&key) {
+                // Recursive DHT walk (not just get_local) so a SENDER can
+                // discover a RECEIVER's mailbox/rendezvous relay cross-node. The
+                // local-fast-path validator only trusts a cached ad that decodes,
+                // verifies, names this receiver, and is currently valid (mirror-
+                // cache-poison resistant); remote results are re-verified below.
+                let bytes = match crate::mlkem_resolver::recursive_dht_get(
+                    &self.dht,
+                    &self.session_tx_registry,
+                    &self.pending_recursive,
+                    self.local_node_id,
+                    key,
+                    std::time::Duration::from_secs(3),
+                    |b| {
+                        decode_rendezvous_ad(b)
+                            .ok()
+                            .filter(|ad| ad.receiver_node_id == receiver_id)
+                            .filter(|ad| verify_rendezvous_ad(ad).is_ok())
+                            .filter(|ad| is_currently_valid(ad, now).is_ok())
+                            .is_some()
+                    },
+                )
+                .await
+                {
                     Some(b) => b,
                     None => continue,
                 };
