@@ -1016,6 +1016,53 @@ int veil_lookup_rendezvous_replicas(VeilHandle *handle,
  void veil_free_buf(uint8_t *ptr, size_t len) ;
 
 /**
+ * Seal `data` for `recipient`'s `(app_id, endpoint_id)` into an offline-mailbox
+ * blob (node-side E2E crypto: sign + DHT-resolve the recipient cert +
+ * fan-out-encrypt). On success returns [`VEIL_OK`] and writes a heap-allocated
+ * buffer to `*out_buf` (its length to `*out_len`); free it with
+ * [`veil_free_buf`]. On error returns a negative `VEIL_ERR_*`, sets `*err_out`,
+ * and leaves `*out_buf = NULL` / `*out_len = 0`.
+ *
+ * `recipient` and `app_id` MUST point to ≥32 readable bytes; `data` to
+ * ≥`data_len` (may be NULL iff `data_len == 0`). `out_buf` / `out_len` MUST be
+ * valid writable pointers.
+ */
+
+int veil_mailbox_seal(VeilHandle *handle,
+                      const uint8_t *recipient,
+                      const uint8_t *app_id,
+                      uint32_t endpoint_id,
+                      const uint8_t *data,
+                      size_t data_len,
+                      uint8_t **out_buf,
+                      size_t *out_len,
+                      char **err_out)
+;
+
+/**
+ * Open + verify a fetched offline-mailbox `blob` claimed to be from `sender`,
+ * decrypting under our current cert version `our_cert_version`. On success
+ * returns [`VEIL_OK`], writes the verified destination app id to `out_app_id`
+ * (32 bytes) + endpoint id to `*out_endpoint_id`, and a heap-allocated data
+ * buffer to `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
+ *
+ * `sender` MUST point to ≥32 readable bytes; `blob` to ≥`blob_len`. `out_app_id`
+ * MUST point to ≥32 writable bytes; the other out-pointers MUST be writable.
+ */
+
+int veil_mailbox_open(VeilHandle *handle,
+                      const uint8_t *sender,
+                      uint64_t our_cert_version,
+                      const uint8_t *blob,
+                      size_t blob_len,
+                      uint8_t *out_app_id,
+                      uint32_t *out_endpoint_id,
+                      uint8_t **out_data,
+                      size_t *out_data_len,
+                      char **err_out)
+;
+
+/**
  * Fetch all blobs currently stored for `receiver_id`. `auth_cookie`
  * must match a previously-registered rendezvous-publisher entry.
  *
