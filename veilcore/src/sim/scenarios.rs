@@ -6751,6 +6751,8 @@ mod tests {
             push_envelope: Vec::new(),
             capability_token: Vec::new(),
             wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
             wire_version: 0,
         };
 

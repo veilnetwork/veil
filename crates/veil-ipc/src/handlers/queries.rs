@@ -70,6 +70,8 @@ pub(crate) async fn handle_lookup_rendezvous_replicas(
                 push_envelope: e.push_envelope,
                 capability_token: e.capability_token,
                 wake_hmac_envelope: e.wake_hmac_envelope,
+                rendezvous_kem_algo: e.rendezvous_kem_algo,
+                rendezvous_kem_pk: e.rendezvous_kem_pk,
             })
             .collect(),
         None => Vec::new(),
