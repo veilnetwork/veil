@@ -977,6 +977,66 @@ final void Function(Pointer<Uint8>, int) veilFreeBuf = nativeLib
             )>>('veil_free_buf')
     .asFunction();
 
+// Offline-mailbox seal: node signs an auth-deliver, DHT-resolves the recipient
+// cert, fan-out-encrypts, and returns the blob via `*out_buf` (caller frees with
+// [veilFreeBuf]). Returns 0 on OK; <0 VEIL_ERR otherwise.
+final int Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>, // recipient (32 B)
+  Pointer<Uint8>, // app_id (32 B)
+  int, // endpoint_id (u32)
+  Pointer<Uint8>, // data
+  int, // data_len
+  Pointer<Pointer<Uint8>>, // out_buf (node-allocated; caller frees)
+  Pointer<IntPtr>, // out_len
+  Pointer<Pointer<Utf8>>,
+) veilMailboxSeal = nativeLib
+    .lookup<
+            NativeFunction<
+                Int32 Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Uint8>>,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_mailbox_seal')
+    .asFunction();
+
+// Offline-mailbox open: node decrypts under our dk_seed + verifies the sender's
+// auth-deliver, writing the verified app_id (32 B) + endpoint_id + the data
+// buffer (via `*out_data`, caller frees with [veilFreeBuf]). Returns 0 on OK.
+final int Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>, // sender (32 B)
+  int, // our_cert_version (u64)
+  Pointer<Uint8>, // blob
+  int, // blob_len
+  Pointer<Uint8>, // out_app_id (32 B, caller-provided)
+  Pointer<Uint32>, // out_endpoint_id
+  Pointer<Pointer<Uint8>>, // out_data (node-allocated; caller frees)
+  Pointer<IntPtr>, // out_data_len
+  Pointer<Pointer<Utf8>>,
+) veilMailboxOpen = nativeLib
+    .lookup<
+            NativeFunction<
+                Int32 Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Uint64,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              Pointer<Uint32>,
+              Pointer<Pointer<Uint8>>,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_mailbox_open')
+    .asFunction();
+
 final int Function(
   Pointer<VeilHandle>,
   Pointer<Uint8>, // receiver_id
