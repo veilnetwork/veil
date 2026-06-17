@@ -12,7 +12,10 @@ use crate::handlers::anycast::{
     handle_anycast_withdraw, handle_transport_hint_query,
 };
 use crate::handlers::bind::handle_bind;
-use crate::handlers::mailbox::{handle_mailbox_ack, handle_mailbox_fetch, handle_mailbox_put};
+use crate::handlers::mailbox::{
+    handle_mailbox_ack, handle_mailbox_fetch, handle_mailbox_open, handle_mailbox_put,
+    handle_mailbox_seal,
+};
 use crate::handlers::mobile::{
     handle_network_changed, handle_set_mobile_background_mode, handle_set_push_envelope,
     handle_set_wake_hmac_envelope,
@@ -830,6 +833,9 @@ pub struct IpcServer {
     /// empty list (fetch) / `removed = 0` (ack) — feature off gracefully.
     /// Wired by the daemon if the operator opted into mailbox role.
     mailbox_backend: Option<Arc<dyn crate::MailboxBackend>>,
+    /// Offline seal/open (node-side E2E crypto for store-and-forward). When
+    /// `None`, `MailboxSeal`/`MailboxOpen` reply `Failed`. Wired by the daemon.
+    mailbox_crypto_sink: Option<Arc<dyn crate::MailboxCryptoSink>>,
     ///.4 P4: outbox backend (sender-side peer-sync store).
     /// When `None` the IPC handlers reply with empty list / removed=0 /
     /// stored=false — feature off gracefully.
@@ -921,6 +927,7 @@ impl IpcServer {
             client_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_IPC_CONCURRENT_CLIENTS)),
             push_envelope_sink: None,
             mailbox_backend: None,
+            mailbox_crypto_sink: None,
             outbox_backend: None,
             rendezvous_resolver: None,
             bootstrap_invite_create_sink: None,
@@ -967,6 +974,14 @@ impl IpcServer {
     /// an empty list, and `MailboxAck` returns `removed = 0`.
     pub fn with_mailbox_backend(mut self, backend: Arc<dyn crate::MailboxBackend>) -> Self {
         self.mailbox_backend = Some(backend);
+        self
+    }
+
+    /// Wire the offline seal/open crypto sink (node-side E2E for store-and-
+    /// forward delivery). Without this, `MailboxSeal`/`MailboxOpen` reply
+    /// `Failed`.
+    pub fn with_mailbox_crypto_sink(mut self, sink: Arc<dyn crate::MailboxCryptoSink>) -> Self {
+        self.mailbox_crypto_sink = Some(sink);
         self
     }
 
@@ -1471,6 +1486,7 @@ impl IpcServer {
                         let event_bus = self.event_bus.clone();
                         let push_envelope_sink = self.push_envelope_sink.clone();
                         let mailbox_backend = self.mailbox_backend.clone();
+                        let mailbox_crypto_sink = self.mailbox_crypto_sink.clone();
                         let outbox_backend = self.outbox_backend.clone();
                         let rendezvous_resolver = self.rendezvous_resolver.clone();
                         let bootstrap_invite_create_sink =
@@ -1494,7 +1510,7 @@ impl IpcServer {
                             // operators can diagnose IPC disconnects without
                             // strace. Tracing is wired in at log-level WARN
                             // by the daemon binary.
-                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, outbox_backend, rendezvous_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, stream_bridge).await {
+                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, stream_bridge).await {
                                 eprintln!("[veil-ipc] client disconnected: {e} (kind={:?})", e.kind());
                             }
                         });
@@ -1603,6 +1619,7 @@ async fn handle_ipc_client(
     event_bus: Option<Arc<crate::EventBus>>,
     push_envelope_sink: Option<Arc<dyn crate::PushEnvelopeSink>>,
     mailbox_backend: Option<Arc<dyn crate::MailboxBackend>>,
+    mailbox_crypto_sink: Option<Arc<dyn crate::MailboxCryptoSink>>,
     outbox_backend: Option<Arc<dyn crate::OutboxBackend>>,
     rendezvous_resolver: Option<Arc<dyn crate::RendezvousReplicaResolver>>,
     bootstrap_invite_create_sink: Option<Arc<dyn crate::BootstrapInviteCreateSink>>,
@@ -2298,6 +2315,12 @@ async fn handle_ipc_client(
                             mailbox_backend.as_ref(),
                         )
                         .await?;
+                    }
+                    Ok(LocalAppMsg::MailboxSeal) => {
+                        handle_mailbox_seal(&mut wh, &body, mailbox_crypto_sink.as_ref()).await?;
+                    }
+                    Ok(LocalAppMsg::MailboxOpen) => {
+                        handle_mailbox_open(&mut wh, &body, mailbox_crypto_sink.as_ref()).await?;
                     }
                     Ok(LocalAppMsg::OutboxPut) => {
                         handle_outbox_put(
