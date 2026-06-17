@@ -21,6 +21,7 @@ mod ip_slot;
 mod lifecycle;
 mod mailbox_state;
 mod maintenance;
+mod offline_seal;
 mod mesh_gateway;
 mod mobile_state;
 mod p_net_ban_sync;
