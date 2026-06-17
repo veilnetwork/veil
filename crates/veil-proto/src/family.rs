@@ -791,6 +791,19 @@ pub enum LocalAppMsg {
     /// daemon → app: result of `SendAnonymousDirect` (2-byte status code,
     /// `0` = ok, else an `ipc_send_err`).
     SendAnonymousDirectResult = 78,
+    /// App → daemon: seal a message into an offline-mailbox blob (the E2E crypto
+    /// only — the caller then `MailboxPut`s the returned blob to a relay). Body:
+    /// [`crate::ipc::MailboxSealPayload`].
+    MailboxSeal = 79,
+    /// daemon → app: result of `MailboxSeal`. Body:
+    /// [`crate::ipc::MailboxSealResultPayload`].
+    MailboxSealOk = 80,
+    /// App → daemon: open + verify an offline-mailbox blob fetched for us. Body:
+    /// [`crate::ipc::MailboxOpenPayload`].
+    MailboxOpen = 81,
+    /// daemon → app: result of `MailboxOpen`. Body:
+    /// [`crate::ipc::MailboxOpenResultPayload`].
+    MailboxOpenOk = 82,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -876,6 +889,10 @@ impl TryFrom<u16> for LocalAppMsg {
             76 => Ok(LocalAppMsg::SendToOnionServiceResult),
             77 => Ok(LocalAppMsg::SendAnonymousDirect),
             78 => Ok(LocalAppMsg::SendAnonymousDirectResult),
+            79 => Ok(LocalAppMsg::MailboxSeal),
+            80 => Ok(LocalAppMsg::MailboxSealOk),
+            81 => Ok(LocalAppMsg::MailboxOpen),
+            82 => Ok(LocalAppMsg::MailboxOpenOk),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,
