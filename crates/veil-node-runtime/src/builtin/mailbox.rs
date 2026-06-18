@@ -34,14 +34,19 @@
 //! sends `(receiver_id, envelope)` over the same `mpsc::UnboundedSender<PushTrigger>`
 //! the IPC bridge uses (P3a). A single push task drains both.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use veil_app::AppMessage;
 use veil_mailbox::{
     MAILBOX_APP_ID, MAILBOX_FETCH_ENDPOINT_CAPACITY, MAILBOX_FETCH_ENDPOINT_ID,
     MAILBOX_FETCH_REPLY_MAX_BYTES, MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, Mailbox,
 };
-use veil_proto::{MAX_MAILBOX_FETCH_ENTRIES, MailboxBlobWire, MailboxFetchRespPayload, MailboxPutPayload};
+use veil_proto::{
+    MAX_MAILBOX_FETCH_ENTRIES, MAX_MAILBOX_PUT_CHUNKS, MailboxBlobWire, MailboxFetchRespPayload,
+    MailboxPutChunkPayload, MailboxPutPayload,
+};
 use veil_types::AnonOnionSender;
 
 use super::host::{BuiltinAppHost, BuiltinEndpoint, ServiceContext, ServiceSpec};
@@ -75,6 +80,95 @@ pub struct PushTrigger {
 /// channel, so dropping a trigger only delays notification, does not lose
 /// the message itself).
 pub const PUSH_TRIGGER_QUEUE_CAP: usize = 512;
+
+/// Max concurrent in-flight deposit reassemblies (global RAM bound). Each holds
+/// ≤ `MAX_MAILBOX_PUT_CHUNKS` × the chunk size ≈ 60 KB, so the worst case is
+/// ~7.5 MB — and stale ones are evicted, so steady-state is far lower.
+const MAX_INFLIGHT_PUT_REASSEMBLIES: usize = 128;
+
+/// A partially-received deposit idle longer than this is evicted, so a hostile
+/// depositor cannot pin relay memory with half-sent deposits. A real deposit's
+/// chunks all arrive within a few seconds, so this never drops honest traffic.
+const PUT_REASSEMBLY_STALE: Duration = Duration::from_secs(30);
+
+struct PutReassembly {
+    chunk_total: u16,
+    chunks: Vec<Option<Vec<u8>>>,
+    received: u16,
+    last_activity: Instant,
+}
+
+/// Reassembles chunked network deposits ([`MailboxPutChunkPayload`]) keyed by the
+/// deposit's `content_id`. Anonymous deposits carry no authenticated source, so
+/// the key is the random per-message `content_id` (also the dedup key); bounds
+/// (max in-flight + stale-evict) keep a hostile depositor from exhausting memory.
+/// The assembled bytes are the depositor's encoded [`MailboxPutPayload`] — the
+/// E2E crypto is untouched, this only un-fragments the transport.
+#[derive(Default)]
+pub struct PutChunkReassembler {
+    inflight: HashMap<[u8; 32], PutReassembly>,
+}
+
+impl PutChunkReassembler {
+    /// Accept one chunk; returns the assembled `MailboxPutPayload` bytes when the
+    /// deposit is complete, else `None`. Malformed / out-of-range / capacity-
+    /// exceeding chunks are dropped (`None`), fail-safe.
+    pub fn accept(&mut self, c: MailboxPutChunkPayload, now: Instant) -> Option<Vec<u8>> {
+        if c.chunk_total == 0 || c.chunk_total > MAX_MAILBOX_PUT_CHUNKS {
+            return None;
+        }
+        if c.chunk_index >= c.chunk_total {
+            return None;
+        }
+        // Drop idle partial deposits before doing anything else (memory bound).
+        self.inflight
+            .retain(|_, r| now.duration_since(r.last_activity) < PUT_REASSEMBLY_STALE);
+
+        // A conflicting chunk_total for an existing key = corruption / an injected
+        // chunk under a guessed content_id → restart that reassembly.
+        if self
+            .inflight
+            .get(&c.content_id)
+            .is_some_and(|r| r.chunk_total != c.chunk_total)
+        {
+            self.inflight.remove(&c.content_id);
+        }
+        // Refuse a NEW key when full — never evict an in-progress honest deposit
+        // (they complete in seconds; the depositor's outbox retries on drop).
+        if !self.inflight.contains_key(&c.content_id)
+            && self.inflight.len() >= MAX_INFLIGHT_PUT_REASSEMBLIES
+        {
+            return None;
+        }
+
+        let complete = {
+            let r = self.inflight.entry(c.content_id).or_insert_with(|| PutReassembly {
+                chunk_total: c.chunk_total,
+                chunks: vec![None; c.chunk_total as usize],
+                received: 0,
+                last_activity: now,
+            });
+            r.last_activity = now;
+            let idx = c.chunk_index as usize;
+            if r.chunks[idx].is_none() {
+                r.received += 1;
+                r.chunks[idx] = Some(c.chunk_data);
+            } // duplicate index (relay redundancy / retry) → idempotent no-op
+            r.received == r.chunk_total
+        };
+
+        if complete {
+            let r = self.inflight.remove(&c.content_id)?;
+            let mut out = Vec::new();
+            for chunk in r.chunks {
+                out.extend_from_slice(&chunk.unwrap_or_default());
+            }
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
 
 /// Spawn the mailbox built-in app service on `host`. Idempotent at
 /// the program level — calling twice would panic at registry-bind
@@ -113,10 +207,13 @@ pub fn spawn_mailbox_app_service(
         // Receivers are in spec.endpoints order: [PUT, FETCH].
         let mut put_rx = rxs.remove(0);
         let mut fetch_rx = rxs.remove(0);
+        // Per-service deposit reassembler — the task is single-threaded, so the
+        // `&mut` needs no lock. State stays local to this service instance.
+        let mut reassembler = PutChunkReassembler::default();
         loop {
             tokio::select! {
                 Some(msg) = put_rx.recv() => {
-                    handle_put_message(&mailbox, push_trigger_tx.as_ref(), msg);
+                    handle_put_message(&mailbox, push_trigger_tx.as_ref(), &mut reassembler, msg);
                 }
                 Some(msg) = fetch_rx.recv() => {
                     handle_fetch_message(&mailbox, reply_sender.as_ref(), msg).await;
@@ -230,6 +327,7 @@ pub async fn handle_fetch_message(
 pub fn handle_put_message(
     mailbox: &Mailbox,
     push_trigger_tx: Option<&tokio::sync::mpsc::Sender<PushTrigger>>,
+    reassembler: &mut PutChunkReassembler,
     msg: AppMessage,
 ) {
     let (src_node_id, data) = match msg {
@@ -245,11 +343,29 @@ pub fn handle_put_message(
         }
     };
 
-    let req = match MailboxPutPayload::decode(&data) {
+    // A deposit arrives as one or more chunks (the full MailboxPutPayload often
+    // exceeds the single-cell anonymous-send budget). Reassemble by content_id;
+    // only proceed once the whole payload is recovered.
+    let chunk = match MailboxPutChunkPayload::decode(&data) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "veil-mailbox: PUT chunk decode failed (src={}): {e}",
+                hex_short(&src_node_id),
+            );
+            return;
+        }
+    };
+    let assembled = match reassembler.accept(chunk, Instant::now()) {
+        Some(bytes) => bytes,
+        None => return, // incomplete (or dropped) — await the remaining chunks
+    };
+
+    let req = match MailboxPutPayload::decode(&assembled) {
         Ok(r) => r,
         Err(e) => {
             log::warn!(
-                "veil-mailbox: PUT decode failed (src={}): {e}",
+                "veil-mailbox: PUT decode failed after reassembly (src={}): {e}",
                 hex_short(&src_node_id),
             );
             return;
@@ -428,6 +544,9 @@ mod tests {
         (Arc::new(mb), tmp)
     }
 
+    /// A whole deposit wrapped as a SINGLE PUT chunk (these test payloads are
+    /// small enough to fit one). The relay reassembles by content_id before
+    /// decoding the inner MailboxPutPayload.
     fn mk_payload(
         receiver_id: [u8; 32],
         content_id: [u8; 32],
@@ -435,7 +554,7 @@ mod tests {
         blob: Vec<u8>,
         envelope: Option<Vec<u8>>,
     ) -> Vec<u8> {
-        MailboxPutPayload {
+        let inner = MailboxPutPayload {
             receiver_id,
             content_id,
             sender_id,
@@ -444,7 +563,78 @@ mod tests {
             capability_token: None,
             wake_hmac_envelope: None,
         }
+        .encode();
+        MailboxPutChunkPayload {
+            content_id,
+            chunk_index: 0,
+            chunk_total: 1,
+            chunk_data: inner,
+        }
         .encode()
+    }
+
+    #[test]
+    fn put_chunk_reassembler_multi_chunk_round_trip() {
+        let mut ra = PutChunkReassembler::default();
+        let now = Instant::now();
+        let cid = [0x42u8; 32];
+        // Split an 800-byte payload into 4 chunks of 200; assemble = original.
+        let full: Vec<u8> = (0..800).map(|i| (i % 251) as u8).collect();
+        let chunks: Vec<&[u8]> = full.chunks(200).collect();
+        let total = chunks.len() as u16;
+        // Feed out of order; only the last completes.
+        let order = [2usize, 0, 3, 1];
+        let mut assembled = None;
+        for (k, &i) in order.iter().enumerate() {
+            let out = ra.accept(
+                MailboxPutChunkPayload {
+                    content_id: cid,
+                    chunk_index: i as u16,
+                    chunk_total: total,
+                    chunk_data: chunks[i].to_vec(),
+                },
+                now,
+            );
+            if k + 1 < order.len() {
+                assert!(out.is_none(), "must not complete before all chunks");
+            } else {
+                assembled = out;
+            }
+        }
+        assert_eq!(assembled.unwrap(), full, "reassembled bytes must equal the original");
+    }
+
+    #[test]
+    fn put_chunk_reassembler_evicts_stale_and_rejects_bad_input() {
+        let mut ra = PutChunkReassembler::default();
+        let t0 = Instant::now();
+        let cid = [1u8; 32];
+        // out-of-range index / zero total are dropped.
+        assert!(ra.accept(
+            MailboxPutChunkPayload { content_id: cid, chunk_index: 3, chunk_total: 2, chunk_data: vec![0] },
+            t0,
+        ).is_none());
+        assert!(ra.accept(
+            MailboxPutChunkPayload { content_id: cid, chunk_index: 0, chunk_total: 0, chunk_data: vec![0] },
+            t0,
+        ).is_none());
+        // a partial deposit (1 of 2) then a long idle gap → the next chunk for a
+        // DIFFERENT deposit triggers stale eviction; the partial never completes.
+        assert!(ra.accept(
+            MailboxPutChunkPayload { content_id: cid, chunk_index: 0, chunk_total: 2, chunk_data: vec![9] },
+            t0,
+        ).is_none());
+        let later = t0 + PUT_REASSEMBLY_STALE + Duration::from_secs(1);
+        let _ = ra.accept(
+            MailboxPutChunkPayload { content_id: [2u8; 32], chunk_index: 0, chunk_total: 1, chunk_data: vec![7] },
+            later,
+        );
+        // The stale partial was evicted: sending its 2nd chunk now starts fresh
+        // (chunk 1 alone, with chunk 0 gone) → still incomplete, no panic.
+        assert!(ra.accept(
+            MailboxPutChunkPayload { content_id: cid, chunk_index: 1, chunk_total: 2, chunk_data: vec![8] },
+            later,
+        ).is_none());
     }
 
     #[tokio::test]

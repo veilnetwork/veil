@@ -2269,6 +2269,77 @@ pub const MAX_MAILBOX_CAPABILITY_TOKEN_BYTES: usize = 2048;
 /// trailer-length fields with zero defaults. Old daemons receiving a
 /// new sender's payload ignore the trailing bytes (length is bounded
 /// by `MAX_FRAME_BODY`).
+/// Max `chunk_data` bytes carried by ONE [`MailboxPutChunkPayload`]. A network
+/// mailbox deposit travels as a sender-anonymous onion message capped at one
+/// 512-byte cell (`max_payload_for_hops(1) = 429 B`); after the AppDeliver +
+/// chunk-header overhead (~113 + 36 B) ≈ 280 B remain, so 240 leaves a safe
+/// margin. The depositor splits the encoded [`MailboxPutPayload`] across N such
+/// chunks; the relay reassembles before storing. (The FETCH reply path already
+/// fragments, so only the deposit needs this.)
+pub const MAILBOX_PUT_CHUNK_DATA_BYTES: usize = 240;
+
+/// Hard cap on `chunk_total` (a reassembled deposit ≤ this × the chunk size ≈
+/// 60 KB — comfortably above any real mailbox blob ~few KB; bounds relay memory).
+pub const MAX_MAILBOX_PUT_CHUNKS: u16 = 256;
+
+/// One fragment of a chunked network mailbox deposit (app → relay PUT endpoint).
+///
+/// The deposit's full [`MailboxPutPayload`] often exceeds the single-cell
+/// anonymous-send budget, so the depositor splits its encoded bytes into
+/// `chunk_total` pieces of ≤ [`MAILBOX_PUT_CHUNK_DATA_BYTES`] and sends each as a
+/// separate sender-anonymous PUT. The relay reassembles by `content_id` (the
+/// random message uuid — also the dedup key) and decodes the assembled bytes as
+/// a `MailboxPutPayload`. The E2E crypto is untouched: this only frames the
+/// already-sealed blob for transport.
+///
+/// Wire layout: `[content_id(32) | chunk_index_u16_be(2) | chunk_total_u16_be(2) | chunk_data(rest)]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxPutChunkPayload {
+    /// Reassembly key (= the deposit's `content_id`; random per message).
+    pub content_id: [u8; 32],
+    /// This fragment's index, `0..chunk_total`.
+    pub chunk_index: u16,
+    /// Total fragments in this deposit.
+    pub chunk_total: u16,
+    /// This fragment's slice of the encoded `MailboxPutPayload`.
+    pub chunk_data: Vec<u8>,
+}
+
+impl MailboxPutChunkPayload {
+    /// Fixed-prefix size before the variable `chunk_data`.
+    pub const HEADER_SIZE: usize = 32 + 2 + 2;
+
+    /// Encode to wire bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.chunk_data.len());
+        buf.extend_from_slice(&self.content_id);
+        buf.extend_from_slice(&self.chunk_index.to_be_bytes());
+        buf.extend_from_slice(&self.chunk_total.to_be_bytes());
+        buf.extend_from_slice(&self.chunk_data);
+        buf
+    }
+
+    /// Decode from wire bytes.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::HEADER_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::HEADER_SIZE,
+                got: buf.len(),
+            });
+        }
+        let content_id = super::read_array::<32>(buf, 0)?;
+        let chunk_index = super::read_u16_be(buf, 32)?;
+        let chunk_total = super::read_u16_be(buf, 34)?;
+        let chunk_data = buf[Self::HEADER_SIZE..].to_vec();
+        Ok(Self {
+            content_id,
+            chunk_index,
+            chunk_total,
+            chunk_data,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxPutPayload {
     /// Target receiver's `node_id`.
@@ -6508,6 +6579,29 @@ mod tests {
     }
 
     // ── Mailbox put/fetch/ack ─────────────────────────
+
+    #[test]
+    fn mailbox_put_chunk_round_trip() {
+        let c = MailboxPutChunkPayload {
+            content_id: [0x2C; 32],
+            chunk_index: 5,
+            chunk_total: 12,
+            chunk_data: vec![0xAB; MAILBOX_PUT_CHUNK_DATA_BYTES],
+        };
+        let buf = c.encode();
+        assert_eq!(buf.len(), MailboxPutChunkPayload::HEADER_SIZE + MAILBOX_PUT_CHUNK_DATA_BYTES);
+        assert_eq!(MailboxPutChunkPayload::decode(&buf).unwrap(), c);
+        // a final short chunk + a header-only (empty data) chunk both round-trip.
+        let tail = MailboxPutChunkPayload {
+            content_id: [0x2C; 32],
+            chunk_index: 11,
+            chunk_total: 12,
+            chunk_data: vec![1, 2, 3],
+        };
+        assert_eq!(MailboxPutChunkPayload::decode(&tail.encode()).unwrap(), tail);
+        // truncated buffer (< header) is rejected.
+        assert!(MailboxPutChunkPayload::decode(&[0u8; 35]).is_err());
+    }
 
     #[test]
     fn t1_4_p2_mailbox_put_round_trip() {
