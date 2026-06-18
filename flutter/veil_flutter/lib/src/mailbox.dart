@@ -522,27 +522,24 @@ class VeilMailbox {
   /// decrypt / signature / freshness check.
   Future<MailboxOpened> open({
     required Uint8List blob,
-    required Uint8List sender,
     required int ourCertVersion,
   }) async {
-    _validateId(sender, 'sender');
     return Future(() {
-      final snd = calloc<Uint8>(32);
       final blobPtr = calloc<Uint8>(blob.isEmpty ? 1 : blob.length);
+      final outSender = calloc<Uint8>(32);
       final outAppId = calloc<Uint8>(32);
       final outEndpoint = calloc<Uint32>();
       final outData = calloc<Pointer<Uint8>>();
       final outDataLen = calloc<IntPtr>();
       final errOut = calloc<Pointer<Utf8>>();
       try {
-        snd.asTypedList(32).setAll(0, sender);
         if (blob.isNotEmpty) blobPtr.asTypedList(blob.length).setAll(0, blob);
         final rc = ffi.veilMailboxOpen(
           _handle,
-          snd,
           ourCertVersion,
           blobPtr,
           blob.length,
+          outSender,
           outAppId,
           outEndpoint,
           outData,
@@ -555,6 +552,7 @@ class VeilMailbox {
             code: rc,
           );
         }
+        final senderNodeId = Uint8List.fromList(outSender.asTypedList(32));
         final appId = Uint8List.fromList(outAppId.asTypedList(32));
         final endpointId = outEndpoint.value;
         final dataPtr = outData.value;
@@ -570,13 +568,14 @@ class VeilMailbox {
           }
         }
         return MailboxOpened(
+          senderNodeId: senderNodeId,
           appId: appId,
           endpointId: endpointId,
           data: payload,
         );
       } finally {
-        calloc.free(snd);
         calloc.free(blobPtr);
+        calloc.free(outSender);
         calloc.free(outAppId);
         calloc.free(outEndpoint);
         calloc.free(outData);
@@ -593,15 +592,20 @@ class VeilMailbox {
       VeilMailbox._(handle);
 }
 
-/// Result of [VeilMailbox.open]: the verified destination + plaintext of an
-/// opened offline-mailbox blob.
+/// Result of [VeilMailbox.open]: the verified sender + destination + plaintext
+/// of an opened offline-mailbox blob.
 class MailboxOpened {
-  /// The verified destination routing target + payload.
+  /// The verified sender + destination routing target + payload.
   const MailboxOpened({
+    required this.senderNodeId,
     required this.appId,
     required this.endpointId,
     required this.data,
   });
+
+  /// Verified sender node_id (32 bytes) — recovered from the blob's sidecar and
+  /// confirmed by the auth-deliver signature, NOT a relay-supplied wire hint.
+  final Uint8List senderNodeId;
 
   /// Verified destination app id (32 bytes).
   final Uint8List appId;

@@ -1819,14 +1819,16 @@ impl VeilClient {
     /// Open + verify a fetched mailbox `blob` claimed to be from `sender`,
     /// decrypting under our current cert version `our_cert_version`. Returns the
     /// verified `(app_id, endpoint_id, data)`.
+    /// Open + verify a fetched mailbox blob. The sender is RECOVERED from the
+    /// blob's sidecar by the node (the anonymous deposit carries no usable wire
+    /// sender) and returned, crypto-verified, as the first tuple element
+    /// `(sender_node_id, app_id, endpoint_id, data)`.
     pub async fn mailbox_open(
         &self,
         blob: Vec<u8>,
-        sender: [u8; 32],
         our_cert_version: u64,
-    ) -> Result<([u8; 32], u32, Vec<u8>), ClientError> {
+    ) -> Result<([u8; 32], [u8; 32], u32, Vec<u8>), ClientError> {
         let payload = veilcore::proto::MailboxOpenPayload {
-            sender_node_id: sender,
             our_cert_version,
             blob,
         };
@@ -1847,7 +1849,7 @@ impl VeilClient {
         let reply = await_rpc_reply(rx, "mailbox_open reply").await?;
         match reply.status {
             veilcore::proto::MailboxCryptoStatus::Ok => {
-                Ok((reply.app_id, reply.endpoint_id, reply.data))
+                Ok((reply.sender_node_id, reply.app_id, reply.endpoint_id, reply.data))
             }
             other => Err(ClientError::Protocol(format!("mailbox_open failed: {other:?}"))),
         }

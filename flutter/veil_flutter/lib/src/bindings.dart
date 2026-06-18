@@ -1061,15 +1061,16 @@ final int Function(
             )>>('veil_mailbox_seal')
     .asFunction();
 
-// Offline-mailbox open: node decrypts under our dk_seed + verifies the sender's
-// auth-deliver, writing the verified app_id (32 B) + endpoint_id + the data
-// buffer (via `*out_data`, caller frees with [veilFreeBuf]). Returns 0 on OK.
+// Offline-mailbox open: node decrypts under our dk_seed, RECOVERS the sender
+// from the blob's sidecar + verifies its auth-deliver, writing the verified
+// sender (32 B) + app_id (32 B) + endpoint_id + the data buffer (via `*out_data`,
+// caller frees with [veilFreeBuf]). Returns 0 on OK.
 final int Function(
   Pointer<VeilHandle>,
-  Pointer<Uint8>, // sender (32 B)
   int, // our_cert_version (u64)
   Pointer<Uint8>, // blob
   int, // blob_len
+  Pointer<Uint8>, // out_sender (32 B, caller-provided)
   Pointer<Uint8>, // out_app_id (32 B, caller-provided)
   Pointer<Uint32>, // out_endpoint_id
   Pointer<Pointer<Uint8>>, // out_data (node-allocated; caller frees)
@@ -1080,10 +1081,10 @@ final int Function(
             NativeFunction<
                 Int32 Function(
               Pointer<VeilHandle>,
-              Pointer<Uint8>,
               Uint64,
               Pointer<Uint8>,
               IntPtr,
+              Pointer<Uint8>,
               Pointer<Uint8>,
               Pointer<Uint32>,
               Pointer<Pointer<Uint8>>,
