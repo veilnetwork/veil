@@ -362,7 +362,18 @@ impl FrameDispatcher {
                             // Peer's own routing record — attribute to the peer.
                             *node_id.as_bytes()
                         } else {
-                            let origin = match self.validate_store_value_by_magic(&payload.value) {
+                            // A STORE for a key we ALREADY hold is a TTL/content
+                            // refresh (the `dht_republish` task re-fans every
+                            // self-record via this DIRECT STORE path every
+                            // `republish_interval`), not new-state growth — exempt
+                            // it from the per-identity write quota so a node's own
+                            // self-authenticating records (rendezvous ad, relay key,
+                            // …) stay alive at the K-closest. NEW keys still pay the
+                            // quota. Mirrors the recursive STORE plane.
+                            let already_present = self.dht.get_local(&payload.key).is_some();
+                            let origin = match self
+                                .validate_store_value_by_magic_ex(&payload.value, already_present)
+                            {
                                 Ok(origin) => origin,
                                 Err(violation) => return violation,
                             };
@@ -556,6 +567,35 @@ impl FrameDispatcher {
         &self,
         payload_value: &[u8],
     ) -> Result<[u8; 32], DispatchResult> {
+        // Default: treat every write as a NEW record (quota applies). Callers on
+        // the replication/republish plane that already hold the key use
+        // `validate_store_value_by_magic_ex(.., already_present = true)` to skip
+        // the per-identity write quota for a TTL/content refresh — see below.
+        self.validate_store_value_by_magic_ex(payload_value, false)
+    }
+
+    /// As [`Self::validate_store_value_by_magic`], but `already_present` lets the
+    /// recursive-STORE replication plane signal that this exact DHT key is
+    /// ALREADY held locally. The per-identity write quota
+    /// (`DEFAULT_MAX_WRITES_PER_HOUR`) exists to bound how fast an
+    /// (unverified-at-this-gate) identity can grow DISTINCT-record state on a
+    /// holder. Re-storing a key we already hold is a TTL/content REFRESH — it
+    /// grows no state — so legitimate republication (a node keeping its own
+    /// rendezvous ad / relay key / app-endpoint records alive at the K-closest,
+    /// which `dht_republish` re-fans every `republish_interval` via BOTH the
+    /// recursive and the direct STORE plane) must NOT be throttled. Without this,
+    /// a node's own records climb the counter to the cap within minutes and then
+    /// every NEW key — including a receiver's plain rendezvous ad — is refused at
+    /// the K-closest, so a cold sender's FIND_VALUE finds no holder →
+    /// `NoRendezvous` → anonymous send / offline delivery to that receiver
+    /// silently fails. NEW (not-yet-held) keys still pay the quota, so an attacker
+    /// injecting fresh distinct records stays capped.
+    #[allow(clippy::result_large_err)]
+    pub fn validate_store_value_by_magic_ex(
+        &self,
+        payload_value: &[u8],
+        already_present: bool,
+    ) -> Result<[u8; 32], DispatchResult> {
         let magic = payload_value.get(..2);
         let is_app_ep = magic == Some(&veil_discovery::directory::APP_ENDPOINT_DHT_MAGIC[..]);
         let is_attach = magic == Some(&veil_discovery::directory::ATTACHMENT_DHT_MAGIC[..]);
@@ -663,7 +703,7 @@ impl FrameDispatcher {
                     ));
                 }
             };
-            if !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
+            if !already_present && !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
                 return Err(DispatchResult::NoResponse);
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
@@ -676,7 +716,7 @@ impl FrameDispatcher {
                     ));
                 }
             };
-            if !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
+            if !already_present && !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
                 return Err(DispatchResult::NoResponse);
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE // audit cycle-5 N1-residue
@@ -689,7 +729,7 @@ impl FrameDispatcher {
                     ));
                 }
             };
-            if !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
+            if !already_present && !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
                 return Err(DispatchResult::NoResponse);
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE // audit cycle-5 N1-residue
@@ -702,7 +742,7 @@ impl FrameDispatcher {
                     ));
                 }
             };
-            if !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
+            if !already_present && !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
                 return Err(DispatchResult::NoResponse);
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE // audit cycle-5 N1-residue
@@ -739,7 +779,7 @@ impl FrameDispatcher {
                     ));
                 }
             };
-            if !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
+            if !already_present && !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
                 return Err(DispatchResult::NoResponse);
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
@@ -762,7 +802,7 @@ impl FrameDispatcher {
                     ));
                 }
             };
-            if !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
+            if !already_present && !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
                 return Err(DispatchResult::NoResponse);
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
