@@ -457,8 +457,11 @@ pub enum MailboxSealOutcome {
 /// Outcome of [`MailboxCryptoSink::open_blob`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MailboxOpenOutcome {
-    /// Opened + verified — carries the verified routing target + plaintext.
+    /// Opened + verified — carries the verified sender, routing target + plaintext.
     Ok {
+        /// Verified sender node_id (recovered from the blob's sidecar and
+        /// confirmed by the auth-deliver signature — NOT a wire hint).
+        sender_node_id: [u8; 32],
         /// Verified destination app id.
         app_id: [u8; 32],
         /// Verified destination endpoint id.
@@ -490,12 +493,13 @@ pub trait MailboxCryptoSink: Send + Sync {
         data: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MailboxSealOutcome> + Send + 'a>>;
 
-    /// Open + verify `blob` claimed to be from `sender_node_id`, decrypting under
-    /// our cert version `our_cert_version`.
+    /// Open + verify `blob`, decrypting under our cert version `our_cert_version`.
+    /// The sender is RECOVERED from the blob's sidecar (not supplied by the
+    /// caller — on the anonymous mailbox path the wire sender is 0) and returned,
+    /// crypto-verified, in [`MailboxOpenOutcome::Ok`].
     fn open_blob<'a>(
         &'a self,
         blob: Vec<u8>,
-        sender_node_id: [u8; 32],
         our_cert_version: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MailboxOpenOutcome> + Send + 'a>>;
 }
@@ -514,10 +518,9 @@ impl<T: MailboxCryptoSink + ?Sized> MailboxCryptoSink for std::sync::Arc<T> {
     fn open_blob<'a>(
         &'a self,
         blob: Vec<u8>,
-        sender_node_id: [u8; 32],
         our_cert_version: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MailboxOpenOutcome> + Send + 'a>> {
-        (**self).open_blob(blob, sender_node_id, our_cert_version)
+        (**self).open_blob(blob, our_cert_version)
     }
 }
 

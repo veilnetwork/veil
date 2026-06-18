@@ -324,34 +324,36 @@ pub(crate) async fn handle_mailbox_open(
         return Ok(());
     };
     let reply = match mailbox_crypto_sink {
-        Some(sink) => match sink
-            .open_blob(req.blob, req.sender_node_id, req.our_cert_version)
-            .await
-        {
+        Some(sink) => match sink.open_blob(req.blob, req.our_cert_version).await {
             MailboxOpenOutcome::Ok {
+                sender_node_id,
                 app_id,
                 endpoint_id,
                 data,
             } => MailboxOpenResultPayload {
                 status: MailboxCryptoStatus::Ok,
+                sender_node_id,
                 app_id,
                 endpoint_id,
                 data,
             },
             MailboxOpenOutcome::NoIdentity => MailboxOpenResultPayload {
                 status: MailboxCryptoStatus::NoIdentity,
+                sender_node_id: [0u8; 32],
                 app_id: [0u8; 32],
                 endpoint_id: 0,
                 data: Vec::new(),
             },
             MailboxOpenOutcome::PeerUnresolved => MailboxOpenResultPayload {
                 status: MailboxCryptoStatus::PeerUnresolved,
+                sender_node_id: [0u8; 32],
                 app_id: [0u8; 32],
                 endpoint_id: 0,
                 data: Vec::new(),
             },
             MailboxOpenOutcome::Failed => MailboxOpenResultPayload {
                 status: MailboxCryptoStatus::Failed,
+                sender_node_id: [0u8; 32],
                 app_id: [0u8; 32],
                 endpoint_id: 0,
                 data: Vec::new(),
@@ -359,6 +361,7 @@ pub(crate) async fn handle_mailbox_open(
         },
         None => MailboxOpenResultPayload {
             status: MailboxCryptoStatus::Failed,
+            sender_node_id: [0u8; 32],
             app_id: [0u8; 32],
             endpoint_id: 0,
             data: Vec::new(),
