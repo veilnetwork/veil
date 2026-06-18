@@ -95,7 +95,14 @@
 use veil_crypto::{sign_message, verify_message};
 use veil_types::SignatureAlgorithm;
 
-const MAGIC: &[u8; 2] = b"RD";
+/// 2-byte DHT magic for relay-directory entries. Public so the recursive/direct
+/// STORE gate (`validate_store_value_by_magic`) and the republish driver
+/// (`is_self_authenticating_dht_value`) can recognise the record — without that
+/// the "RD" magic is refused on replication, the entry stays local-only at its
+/// publisher, and a cold sender can never resolve an arbitrary rendezvous
+/// relay's onion key (→ introduce silent-drop → `NoRendezvous`).
+pub const RELAY_DIRECTORY_DHT_MAGIC: &[u8; 2] = b"RD";
+const MAGIC: &[u8; 2] = RELAY_DIRECTORY_DHT_MAGIC;
 const VERSION: u8 = 1;
 const SIG_DOMAIN: &[u8] = b"veil-relay-directory:v1\0";
 const NODE_ID_LEN: usize = 32;
