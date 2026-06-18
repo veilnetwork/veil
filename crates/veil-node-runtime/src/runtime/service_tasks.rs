@@ -3025,68 +3025,46 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
             // shouldn't show up as two replicas to the sender.
             let mut seen_relays: std::collections::HashSet<[u8; 32]> =
                 std::collections::HashSet::new();
-            for idx in 0..cap as u8 {
+            // Walk all slots CONCURRENTLY — bounded total ≈ ONE walk's timeout,
+            // not cap × timeout — so resolve_replicas returns within the IPC
+            // reply window (5s) even when every slot misses (e.g. the ad hasn't
+            // replicated yet). The local-fast-path validator only trusts a cached
+            // ad that decodes, verifies, names this receiver, and is currently
+            // valid (mirror-cache-poison resistant); remote results re-verified.
+            let walks = (0..cap as u8).map(|idx| {
                 let key = rendezvous_ad_dht_key_at(&receiver_id, idx);
-                // Recursive DHT walk (not just get_local) so a SENDER can
-                // discover a RECEIVER's mailbox/rendezvous relay cross-node. The
-                // local-fast-path validator only trusts a cached ad that decodes,
-                // verifies, names this receiver, and is currently valid (mirror-
-                // cache-poison resistant); remote results are re-verified below.
-                let bytes = match crate::mlkem_resolver::recursive_dht_get(
-                    &self.dht,
-                    &self.session_tx_registry,
-                    &self.pending_recursive,
-                    self.local_node_id,
-                    key,
-                    std::time::Duration::from_secs(3),
-                    |b| {
-                        decode_rendezvous_ad(b)
-                            .ok()
-                            .filter(|ad| ad.receiver_node_id == receiver_id)
-                            .filter(|ad| verify_rendezvous_ad(ad).is_ok())
-                            .filter(|ad| is_currently_valid(ad, now).is_ok())
-                            .is_some()
-                    },
-                )
-                .await
-                {
-                    Some(b) => b,
-                    None => continue,
-                };
+                async move {
+                    crate::mlkem_resolver::recursive_dht_get(
+                        &self.dht,
+                        &self.session_tx_registry,
+                        &self.pending_recursive,
+                        self.local_node_id,
+                        key,
+                        std::time::Duration::from_millis(3500),
+                        |b| {
+                            decode_rendezvous_ad(b)
+                                .ok()
+                                .filter(|ad| ad.receiver_node_id == receiver_id)
+                                .filter(|ad| verify_rendezvous_ad(ad).is_ok())
+                                .filter(|ad| is_currently_valid(ad, now).is_ok())
+                                .is_some()
+                        },
+                    )
+                    .await
+                }
+            });
+            for bytes in futures::future::join_all(walks).await.into_iter().flatten() {
                 let ad = match decode_rendezvous_ad(&bytes) {
                     Ok(a) => a,
-                    Err(e) => {
-                        log::debug!(
-                            "rendezvous-resolver: decode failed for receiver {} slot {idx}: {e}",
-                            hex_short(&receiver_id),
-                        );
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
-                if let Err(e) = verify_rendezvous_ad(&ad) {
-                    log::debug!(
-                        "rendezvous-resolver: signature verify failed for receiver {} slot {idx}: {e}",
-                        hex_short(&receiver_id),
-                    );
-                    continue;
-                }
-                // Companion binding check: the ad served from receiver_id's
-                // DHT slot MUST name receiver_id. verify_rendezvous_ad already
-                // binds receiver_node_id↔issuer_pk, but this also rejects a
-                // valid-for-someone-else ad replicated into the wrong slot.
-                // Mirrors discover_relay_hops matching node_id to the fetch key.
-                if ad.receiver_node_id != receiver_id {
-                    log::debug!(
-                        "rendezvous-resolver: ad receiver_node_id mismatch for receiver {} slot {idx}",
-                        hex_short(&receiver_id),
-                    );
-                    continue;
-                }
-                if is_currently_valid(&ad, now).is_err() {
-                    log::debug!(
-                        "rendezvous-resolver: stale ad for receiver {} slot {idx}",
-                        hex_short(&receiver_id),
-                    );
+                // Re-verify remote results: signature + receiver-binding (the ad
+                // MUST name receiver_id — rejects a valid-for-someone-else ad
+                // returned for the wrong key) + freshness.
+                if verify_rendezvous_ad(&ad).is_err()
+                    || ad.receiver_node_id != receiver_id
+                    || is_currently_valid(&ad, now).is_err()
+                {
                     continue;
                 }
                 if !seen_relays.insert(ad.rendezvous_node_id) {
