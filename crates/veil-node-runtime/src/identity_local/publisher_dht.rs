@@ -116,95 +116,95 @@ impl IdentityPublisher for DhtBackedPublisher {
         // Local first — always succeeds.
         self.dht.store_local(dht_key, value.clone());
 
-        // Replicate, if wired. Skip if no peers in routing table
-        // yet (first boot, sparse devnet, etc.).
-        let Some(ref tx_reg) = self.session_tx_registry else {
-            return Ok(());
-        };
-        let candidates_with_uri = self
-            .dht
-            .find_closest_with_transport(&dht_key, veil_proto::budget::DHT_REPLICATION_K)
-            .into_iter()
-            .filter(|(n, _)| *n != self.local_node_id)
-            .collect::<Vec<_>>();
-        if candidates_with_uri.is_empty() {
-            return Ok(());
-        }
-
-        // — anti-eclipse safeguard. Compute the IP /24
-        // diversity of the K-closest set: count distinct three-octet
-        // IPv4 prefixes among candidates' transport URIs. If all K
-        // peers share the same /24 (or N-1 of them do), an attacker
-        // sitting under that subnet can refuse-to-serve our value
-        // and eclipse us from the public namespace — exactly the
-        // failure mode K-closest replication is supposed to prevent.
-        //
-        // Action when diversity is low: log a `dht.replication.low_diversity`
-        // warning AND continue replication anyway (don't refuse PUT —
-        // legitimate small private networks may genuinely have one
-        // /24 across all their peers, and we shouldn't break those).
-        // The warning is the operator's signal to add more diverse
-        // bootstrap peers / move to a less-suspicious topology.
-        let prefixes: Vec<Option<[u8; 3]>> = candidates_with_uri
-            .iter()
-            .map(|(_, uri)| extract_ipv4_prefix24(uri))
-            .collect();
-        let distinct_prefixes: std::collections::HashSet<[u8; 3]> =
-            prefixes.iter().filter_map(|p| *p).collect();
-        // Threshold: if more than 1 candidate AND ≤ 1 distinct
-        // prefix among IPv4 candidates, treat as eclipse-risk.
-        let total_v4 = prefixes.iter().filter(|p| p.is_some()).count();
-        if total_v4 >= 2 && distinct_prefixes.len() <= 1 {
-            log::warn!(
-                target: "dht.replication.low_diversity",
-                ".5 anti-eclipse: K-closest set for dht_key={} \
-                 has {} IPv4 peers all sharing one /24 prefix — \
-                 potential sybil cluster.  Replicating anyway, but \
-                 routing-table topology should be audited.",
-                bytes_to_hex_short(&dht_key),
-                total_v4,
-            );
-        }
-
-        let candidates: Vec<[u8; 32]> = candidates_with_uri.into_iter().map(|(n, _)| n).collect();
-
-        // Build the RecursiveQuery(STORE) frame once.
-        let query_id: [u8; 16] = {
-            use rand_core::RngCore;
-            let mut id = [0u8; 16];
-            rand_core::OsRng.fill_bytes(&mut id);
-            id
-        };
-        let q = veil_proto::routing::RecursiveQueryPayload {
-            query_id,
-            target_key: dht_key,
-            reply_to: self.local_node_id,
-            ttl: 40,
-            query_type: veil_proto::routing::recursive_query_type::STORE,
-            reply_port: 0,
-            payload: value,
-        };
-        let q_bytes = q.encode();
-        let mut hdr = veil_proto::header::FrameHeader::new(
-            veil_proto::family::FrameFamily::Routing as u8,
-            veil_proto::family::RoutingMsg::RecursiveQuery as u16,
-        );
-        hdr.body_len = q_bytes.len() as u32;
-        let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
-        frame.extend_from_slice(&q_bytes);
-
-        // Fan-out — fire-and-forget. Peers without a direct session
-        // are silently skipped; the STORE forwards greedy on
-        // receivers we DO have sessions to.
-        let guard = tx_reg.read().unwrap_or_else(|p| p.into_inner());
-        for peer in candidates {
-            let _ = guard.send_to(
-                &peer,
-                veil_proto::header::priority::INTERACTIVE,
-                frame.clone(),
-            );
+        // Replicate to the K-closest peers when a session-tx registry is wired
+        // (no-op until peers exist). Delegated to the shared sync helper so the
+        // rendezvous-ad maintenance publish replicates the same way.
+        if let Some(ref tx_reg) = self.session_tx_registry {
+            replicate_dht_value(&self.dht, tx_reg, self.local_node_id, dht_key, value);
         }
         Ok(())
+    }
+}
+
+/// Fire-and-forget K-closest replication of `(dht_key, value)`: find the
+/// `DHT_REPLICATION_K` closest peers in keyspace and send each a
+/// `RecursiveQuery(STORE)`. SYNCHRONOUS — `send_to` only queues frames (no
+/// await) — so a caller in a sync context (the rendezvous-ad maintenance
+/// publish) can replicate without an async hop. Used by
+/// [`DhtBackedPublisher::put`] and `NodeRuntime::tick_publish_rendezvous_ads`.
+pub(crate) fn replicate_dht_value(
+    dht: &Arc<KademliaService>,
+    tx_reg: &Arc<RwLock<SessionTxRegistry>>,
+    local_node_id: [u8; 32],
+    dht_key: [u8; 32],
+    value: Vec<u8>,
+) {
+    let candidates_with_uri = dht
+        .find_closest_with_transport(&dht_key, veil_proto::budget::DHT_REPLICATION_K)
+        .into_iter()
+        .filter(|(n, _)| *n != local_node_id)
+        .collect::<Vec<_>>();
+    if candidates_with_uri.is_empty() {
+        return;
+    }
+
+    // anti-eclipse safeguard: warn (but still replicate) if the K-closest set
+    // has ≥2 IPv4 peers all sharing one /24 prefix (potential sybil cluster).
+    let prefixes: Vec<Option<[u8; 3]>> = candidates_with_uri
+        .iter()
+        .map(|(_, uri)| extract_ipv4_prefix24(uri))
+        .collect();
+    let distinct_prefixes: std::collections::HashSet<[u8; 3]> =
+        prefixes.iter().filter_map(|p| *p).collect();
+    let total_v4 = prefixes.iter().filter(|p| p.is_some()).count();
+    if total_v4 >= 2 && distinct_prefixes.len() <= 1 {
+        log::warn!(
+            target: "dht.replication.low_diversity",
+            ".5 anti-eclipse: K-closest set for dht_key={} \
+             has {} IPv4 peers all sharing one /24 prefix — \
+             potential sybil cluster.  Replicating anyway, but \
+             routing-table topology should be audited.",
+            bytes_to_hex_short(&dht_key),
+            total_v4,
+        );
+    }
+
+    let candidates: Vec<[u8; 32]> = candidates_with_uri.into_iter().map(|(n, _)| n).collect();
+
+    // Build the RecursiveQuery(STORE) frame once.
+    let query_id: [u8; 16] = {
+        use rand_core::RngCore;
+        let mut id = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut id);
+        id
+    };
+    let q = veil_proto::routing::RecursiveQueryPayload {
+        query_id,
+        target_key: dht_key,
+        reply_to: local_node_id,
+        ttl: 40,
+        query_type: veil_proto::routing::recursive_query_type::STORE,
+        reply_port: 0,
+        payload: value,
+    };
+    let q_bytes = q.encode();
+    let mut hdr = veil_proto::header::FrameHeader::new(
+        veil_proto::family::FrameFamily::Routing as u8,
+        veil_proto::family::RoutingMsg::RecursiveQuery as u16,
+    );
+    hdr.body_len = q_bytes.len() as u32;
+    let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
+    frame.extend_from_slice(&q_bytes);
+
+    // Fan-out — fire-and-forget. Peers without a direct session are silently
+    // skipped; the STORE forwards greedily on receivers we DO have sessions to.
+    let guard = tx_reg.read().unwrap_or_else(|p| p.into_inner());
+    for peer in candidates {
+        let _ = guard.send_to(
+            &peer,
+            veil_proto::header::priority::INTERACTIVE,
+            frame.clone(),
+        );
     }
 }
 
