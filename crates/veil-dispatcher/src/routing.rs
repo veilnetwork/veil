@@ -2082,7 +2082,15 @@ impl FrameDispatcher {
                     // STORE could write arbitrary (key, value) pairs into
                     // the local TieredStore, bypassing the signed-store
                     // ownership invariants.
-                    let origin = match self.validate_store_value_by_magic(&q.payload) {
+                    // A STORE for a key we ALREADY hold is a TTL/content refresh
+                    // (republication), not new-state growth — exempt it from the
+                    // per-identity write quota so a node can keep its own
+                    // self-authenticating records (rendezvous ad, relay key, …)
+                    // alive at the K-closest. NEW keys still pay the quota.
+                    let already_present = self.dht.get_local(&q.target_key).is_some();
+                    let origin = match self
+                        .validate_store_value_by_magic_ex(&q.payload, already_present)
+                    {
                         Ok(origin) => origin,
                         Err(violation) => return violation,
                     };
