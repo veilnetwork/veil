@@ -92,6 +92,37 @@ typedef VeilEventCb = void Function(
   int payloadLen,
 );
 
+// Per-peer iteration callback for `veil_peers_list`. Invoked synchronously,
+// once per peer, for the duration of the call only — copy out anything kept.
+// node_id is 32 bytes; state/direction are wire bytes (VEIL_PEER_STATE_* /
+// VEIL_PEER_DIR_*); transport is a UTF-8 URI (NOT NUL-terminated; use len).
+typedef VeilPeerCbNative = Void Function(
+  Pointer<Void> user,
+  Pointer<Uint8> nodeId,
+  Uint8 state,
+  Uint8 direction,
+  Pointer<Uint8> transport,
+  IntPtr transportLen,
+);
+typedef VeilPeerCb = void Function(
+  Pointer<Void> user,
+  Pointer<Uint8> nodeId,
+  int state,
+  int direction,
+  Pointer<Uint8> transport,
+  int transportLen,
+);
+
+// Wire-byte session-state values for VeilPeerCb.state (mirrors veil_ffi.h).
+const int veilPeerStateConnecting = 0;
+const int veilPeerStateActive = 1;
+const int veilPeerStateClosed = 2;
+const int veilPeerStateUnknown = 255;
+
+// Wire-byte direction values for VeilPeerCb.direction.
+const int veilPeerDirInbound = 0;
+const int veilPeerDirOutbound = 1;
+
 // ── C-function lookups ───────────────────────────────────────────────────────
 
 final void Function(Pointer<Utf8>) veilFreeString = nativeLib
@@ -338,6 +369,21 @@ final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
                   Pointer<Uint8>,
                   Pointer<Pointer<Utf8>>,
                 )>>('veil_get_node_id')
+        .asFunction();
+
+/// Snapshot the daemon's peer sessions. Calls [cb] once per peer (bounded at
+/// 256 entries server-side). Returns [veilOk] or a negative error code.
+final int Function(Pointer<VeilHandle>, Pointer<NativeFunction<VeilPeerCbNative>>,
+        Pointer<Void>, Pointer<Pointer<Utf8>>) veilPeersList =
+    nativeLib
+        .lookup<
+                NativeFunction<
+                    Int32 Function(
+                  Pointer<VeilHandle>,
+                  Pointer<NativeFunction<VeilPeerCbNative>>,
+                  Pointer<Void>,
+                  Pointer<Pointer<Utf8>>,
+                )>>('veil_peers_list')
         .asFunction();
 
 /// Daemon is not relay-capable — `veil_get_relay_x25519_pubkey` returns this

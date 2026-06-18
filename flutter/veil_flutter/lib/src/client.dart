@@ -18,6 +18,7 @@
 // owned by Dart wrappers and freed on close().
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:isolate';
 import 'dart:typed_data';
@@ -256,6 +257,49 @@ class VeilClient implements Finalizable {
       } finally {
         calloc.free(node);
         calloc.free(out);
+        calloc.free(errOut);
+      }
+    });
+  }
+
+  /// Snapshot the daemon's peer sessions: each [VeilPeer] carries node_id,
+  /// session state, direction and transport URI. A point-in-time list (bounded
+  /// at 256 entries server-side) with NO timestamps at the FFI boundary, so a
+  /// caller that wants "last seen" must stamp it on observation. Returns an
+  /// empty list when the daemon reports no sessions.
+  Future<List<VeilPeer>> peers() async {
+    _ensureOpen();
+    return Future(() {
+      final out = <VeilPeer>[];
+      final errOut = calloc<Pointer<Utf8>>();
+      // Synchronous, same-thread callback: `isolateLocal` runs it inline for
+      // the duration of veil_peers_list, so we accumulate into `out` directly.
+      final cb = NativeCallable<ffi.VeilPeerCbNative>.isolateLocal(
+        (Pointer<Void> user, Pointer<Uint8> nodeId, int state, int direction,
+            Pointer<Uint8> transport, int transportLen) {
+          final id = Uint8List.fromList(nodeId.asTypedList(32));
+          final uri = transportLen > 0
+              ? utf8.decode(transport.asTypedList(transportLen),
+                  allowMalformed: true)
+              : '';
+          out.add(VeilPeer(
+            nodeId: id,
+            state: VeilPeerState.fromWire(state),
+            direction: VeilPeerDirection.fromWire(direction),
+            transport: uri,
+          ));
+        },
+      );
+      try {
+        final rc =
+            ffi.veilPeersList(_handle, cb.nativeFunction, nullptr, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException('peers_list failed: ${_readErrAndFree(errOut)}',
+              code: rc);
+        }
+        return out;
+      } finally {
+        cb.close();
         calloc.free(errOut);
       }
     });
