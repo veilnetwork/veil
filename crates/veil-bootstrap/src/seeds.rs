@@ -89,17 +89,37 @@ pub fn builtin_seeds() -> Vec<BootstrapPeer> {
     // `--features allow-empty-seeds` and supply peers via config /
     // `peers add` / DNS / an out-of-band bootstrap bundle.
     //
-    // Example entry shape (DO NOT ship as-is — fill in real values):
-    //
-    //   BootstrapPeer {
-    //       transport: "tls://b1.example.com:9906".to_owned(),
-    //       public_key: "<base64 ed25519 pubkey>".to_owned(),
-    //       nonce: "<base64 nonce>".to_owned(),
-    //       algo: SignatureAlgorithm::Ed25519,
-    //       tls_cert: None,
-    //       tls_ca_cert: None,
-    //   }
-    Vec::new()
+    // veilnetwork production seed nodes (veilnet1/2/3). obfs4-tcp, advertised by
+    // IP; the deployment-wide obfs4 PSK is supplied at runtime (it is a network
+    // anti-probe secret, NOT compiled in here). Ed25519 identity pubkey + PoW
+    // nonce per node (`config init -d 24`, lazy_mining pinned off so these stay
+    // stable). Built into the binary under `--features production-seeds`.
+    vec![
+        veil_types::BootstrapPeer {
+            transport: "obfs4-tcp://203.12.31.146:5556".to_owned(),
+            public_key: "VVxxLVptuXZ/qFV94aPP1daiz6ZYg2yf1JLbc1VHXhQ=".to_owned(),
+            nonce: "AdW8kw==".to_owned(),
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+        veil_types::BootstrapPeer {
+            transport: "obfs4-tcp://203.12.31.145:5556".to_owned(),
+            public_key: "9j/nd+Bm/lao9M+W/Bq+oee7X3H2JmR4w4vJ2ji2tU4=".to_owned(),
+            nonce: "AMiD9w==".to_owned(),
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+        veil_types::BootstrapPeer {
+            transport: "obfs4-tcp://203.12.31.134:5556".to_owned(),
+            public_key: "cjuRf8cH3KLWqwAT89NRn+8QG7JsXc6PH4jXjOM7SJM=".to_owned(),
+            nonce: "ACr87g==".to_owned(),
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        },
+    ]
 }
 
 /// DHT key under which the dynamically-published bootstrap bundle lives
