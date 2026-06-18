@@ -300,6 +300,7 @@ impl NodeRuntime {
                             &local_identity_for_publish,
                             &dht_for_publish,
                             &publish_logger,
+                            Some(&session_tx_registry_for_tick),
                         );
                         // Rebuild hosted onion-service circuits nearing their TTL.
                         access_for_onion.maintain_onion_circuits(
@@ -664,6 +665,10 @@ impl NodeRuntime {
         local_identity: &crate::local_identity::HandshakeIdentity,
         dht: &Arc<veil_dht::kademlia::KademliaService>,
         logger: &Arc<veil_observability::NodeLogger>,
+        // When wired, NON-ephemeral ads are also replicated to their K-closest
+        // peers so a SENDER can discover the receiver's relay cross-node. `None`
+        // (boot/tests) keeps the legacy local-only behaviour.
+        session_tx_registry: Option<&Arc<RwLock<veil_session::tx_registry::SessionTxRegistry>>>,
     ) -> usize {
         //.4 follow-up: publish each `RendezvousPublisherEntry`
         // under its own DHT slot (`rendezvous_ad_dht_key_at(receiver, idx)`)
@@ -783,6 +788,22 @@ impl NodeRuntime {
                     continue;
                 }
             };
+            // Replicate NON-EPHEMERAL ads to the K-closest peers so a SENDER can
+            // discover them cross-node (the mailbox-relay discovery path).
+            // Ephemeral (location-anonymous) ads are NOT replicated — that would
+            // route the STORE under the real node for a pseudo-identity ad; they
+            // stay local-only and use their own discovery path.
+            if let Some(tx_reg) = session_tx_registry
+                && entry.ephemeral_ad_identity.is_none()
+            {
+                crate::identity_local::publisher_dht::replicate_dht_value(
+                    dht,
+                    tx_reg,
+                    receiver_node_id,
+                    dht_key,
+                    bytes.clone(),
+                );
+            }
             dht.store_local(dht_key, bytes);
             logger.info(
                 "anonymity.rendezvous_ad.published",
@@ -1140,7 +1161,7 @@ mod tests {
         let dht_keys_before = dht.stored_keys();
 
         let count =
-            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger);
+            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
 
         assert_eq!(count, 0, "no publisher entries → tick must report 0");
         assert_eq!(
@@ -1182,7 +1203,7 @@ mod tests {
         }]));
 
         let count =
-            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger);
+            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(count, 1);
 
         // Fetch by deterministic DHT key derived from RECEIVER's node_id.
@@ -1227,7 +1248,7 @@ mod tests {
             ephemeral_ad_identity: None,
         }]));
 
-        let n = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger);
+        let n = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(n, 1, "tick must publish exactly one ad");
 
         let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
@@ -1292,14 +1313,14 @@ mod tests {
         }]));
 
         // First tick — publishes.
-        let n1 = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger);
+        let n1 = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(n1, 1);
         let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
         let bytes_after_first = dht.get_local(&key).expect("ad in DHT").to_vec();
 
         // Second tick without passage of time — ad is still very fresh
         // tick must skip and leave bytes byte-equal.
-        let n2 = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger);
+        let n2 = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(n2, 0, "still-fresh ad must NOT trigger republish");
         let bytes_after_second = dht.get_local(&key).expect("ad still in DHT").to_vec();
         assert_eq!(
@@ -1346,7 +1367,7 @@ mod tests {
             ephemeral_ad_identity: Some(eph),
         }]));
 
-        let n = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger);
+        let n = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(n, 1);
 
         // The ad is NOT at the sovereign node_id's key (no identity leak)...
