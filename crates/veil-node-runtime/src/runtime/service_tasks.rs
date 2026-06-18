@@ -1350,10 +1350,22 @@ impl NodeRuntime {
                     tokio::select! {
                         _ = interval.tick() => {
                             ticks = ticks.wrapping_add(1);
-                            let current_ok = current.is_some_and(|r| {
-                                rendezvous_session_live(&live_sessions, &r)
-                                    && rendezvous_relay_published(&dht, &r)
-                            });
+                            // STICKINESS (cold-start churn fix): keep the current
+                            // relay as long as our SESSION to it is live. We must
+                            // NOT abandon a working relay just because its
+                            // relay-directory entry transiently aged out of our
+                            // LOCAL store (`get_local` has a TTL; it's refreshed
+                            // only on `!current_ok`, a chicken-and-egg). The old
+                            // `&& rendezvous_relay_published` made `current_ok`
+                            // flip false roughly hourly even with the session up,
+                            // so the recipient re-picked a RANDOM relay — churning
+                            // the published ad so a cold sender resolves a relay we
+                            // already left (+ unregistered from) and its introduce
+                            // black-holes. The directory entry is still required at
+                            // PICK time (`pick_rendezvous_relay`) to build the
+                            // circuit; for KEEPING, session liveness is the bound.
+                            let current_ok = current
+                                .is_some_and(|r| rendezvous_session_live(&live_sessions, &r));
                             if !current_ok {
                                 // Cold-start: actively pull + verify connected
                                 // peers' relay-directory entries into the local
