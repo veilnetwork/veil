@@ -28,7 +28,6 @@ use rand_core::RngCore;
 use veil_dht::KademliaService;
 use veil_dispatcher::PendingRecursive;
 use veil_e2e::PeerMlKemCache;
-use veil_identity::auth_deliver::DEFAULT_AUTH_DELIVER_FRESHNESS_SECS;
 use veil_identity::mailbox_seal::{self, MailboxSealError};
 use veil_identity::sovereign::SovereignIdentity;
 use veil_observability::NodeLogger;
@@ -36,6 +35,14 @@ use veil_proto::ipc::AuthAppDeliver;
 use veil_session::SessionTxRegistry;
 
 use crate::mlkem_resolver::DhtMlKemEkResolver;
+
+/// Auth-deliver freshness window for the OFFLINE (mailbox) open path. Unlike the
+/// 300s live-onion window, a stored-and-forwarded message is delivered whenever
+/// the recipient next comes online — days later is normal — so the window must
+/// span realistic offline gaps. The real staleness bound is the relay's blob
+/// retention (an aged-out blob is simply gone); anti-replay is the per-
+/// (sender,nonce) replay cache + receiver-side content_id dedup, not freshness.
+const MAILBOX_OPEN_FRESHNESS_SECS: u64 = 7 * 86_400;
 
 /// Failure of a runtime offline seal/open.
 #[derive(Debug, thiserror::Error)]
@@ -148,7 +155,13 @@ impl RuntimeMailboxCrypto {
             our_cert_version,
             &sender_doc,
             now,
-            DEFAULT_AUTH_DELIVER_FRESHNESS_SECS,
+            // OFFLINE freshness: a mailbox message is delivered when the recipient
+            // next comes online — possibly days later — so the 300s LIVE-delivery
+            // window would reject every legitimate offline message as "stale".
+            // Bound it instead by the relay's blob retention (a blob that aged out
+            // can't be delivered at all); anti-replay is covered by the per-
+            // (sender,nonce) replay cache + receiver-side content_id dedup.
+            MAILBOX_OPEN_FRESHNESS_SECS,
         )
         .map_err(OfflineSealError::Open)
     }
