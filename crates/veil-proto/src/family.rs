@@ -1126,12 +1126,13 @@ mod tests {
             (RelayChainMsg::CircuitData, 5),
             (RelayChainMsg::CircuitTeardown, 6),
             (RelayChainMsg::CircuitBuilt, 7),
+            (RelayChainMsg::RegisterMailboxCookie, 8),
         ];
         for (variant, disc) in all {
             assert_eq!(variant as u16, disc);
             assert_eq!(RelayChainMsg::try_from(disc).unwrap(), variant);
         }
-        assert!(RelayChainMsg::try_from(8).is_err());
+        assert!(RelayChainMsg::try_from(9).is_err());
     }
 
     #[test]
