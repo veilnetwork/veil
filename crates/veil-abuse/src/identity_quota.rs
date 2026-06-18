@@ -44,8 +44,23 @@ use std::time::{Duration, Instant};
 
 // ── Defaults ─────────────────────────────────────────────────────────────────
 
-/// Default spec cap: 10 writes per identity per rolling hour.
-pub const DEFAULT_MAX_WRITES_PER_HOUR: u32 = 10;
+/// Default cap: writes per identity per rolling hour on the recursive-STORE
+/// plane (where the record's claimed id is unverified at the gate).
+///
+/// Sized for LEGITIMATE self-record republication, not the original 10 — which
+/// silently broke cross-node discovery. A single node publishes SEVERAL records
+/// under its own identity (plain rendezvous ad + a fresh ephemeral/onion ad per
+/// relay rotation + relay-key + identity/instance/mlkem records) and
+/// `dht_republish` re-fans each to the K-closest. The recursive-STORE plane now
+/// EXEMPTS refreshes of already-held keys from this quota
+/// (`validate_store_value_by_magic_ex(.., already_present=true)`), so in steady
+/// state a node consumes ~0 quota; the cap only bounds the rate of NEW distinct
+/// keys per identity. 10/hour starved the plain ad's first store behind the
+/// ephemeral-ad churn (each rotation = a new key), so a receiver stayed
+/// undiscoverable for up to a rolling hour → cold senders got `NoRendezvous`.
+/// This is a SECONDARY throttle: the per-origin (1 MiB) + global (~400 MB) byte
+/// caps and the per-peer DHT forwarding quota are the real state/DoS bounds.
+pub const DEFAULT_MAX_WRITES_PER_HOUR: u32 = 240;
 /// Default sliding-window length.
 pub const DEFAULT_WINDOW_SECS: u64 = 3600;
 /// Default GC age: idle buckets older than this are dropped by `gc`.
@@ -453,12 +468,13 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_uses_ten_per_hour() {
+    fn default_policy_caps_at_spec_writes_per_hour() {
         let q = IdentityWriteQuota::default_policy();
         let id = [0u8; 32];
         let now = Instant::now();
-        let mut allowed = 0;
-        for _ in 0..15 {
+        let mut allowed = 0u32;
+        // Attempt cap + 5 within a single window: exactly `cap` must pass.
+        for _ in 0..(DEFAULT_MAX_WRITES_PER_HOUR + 5) {
             if q.try_allow_at(&id, now).is_allowed() {
                 allowed += 1;
             }
@@ -537,9 +553,9 @@ mod tests {
     }
 
     #[test]
-    fn config_default_is_ten_per_hour() {
+    fn config_default_matches_spec_cap() {
         let c = IdentityQuotaConfig::default();
-        assert_eq!(c.max_writes_per_window, 10);
+        assert_eq!(c.max_writes_per_window, DEFAULT_MAX_WRITES_PER_HOUR);
         assert_eq!(c.window, Duration::from_secs(3600));
     }
 
