@@ -24,6 +24,58 @@ enum NetworkKind {
   final int wireByte;
 }
 
+/// Session state of a peer — mirrors `VEIL_PEER_STATE_*` wire bytes.
+enum VeilPeerState {
+  connecting(ffi.veilPeerStateConnecting),
+  active(ffi.veilPeerStateActive),
+  closed(ffi.veilPeerStateClosed),
+  unknown(ffi.veilPeerStateUnknown);
+
+  const VeilPeerState(this.wireByte);
+  final int wireByte;
+
+  static VeilPeerState fromWire(int b) {
+    for (final s in values) {
+      if (s.wireByte == b) return s;
+    }
+    return VeilPeerState.unknown;
+  }
+}
+
+/// Direction a peer session was established — mirrors `VEIL_PEER_DIR_*`.
+enum VeilPeerDirection {
+  inbound(ffi.veilPeerDirInbound),
+  outbound(ffi.veilPeerDirOutbound),
+  unknown(-1);
+
+  const VeilPeerDirection(this.wireByte);
+  final int wireByte;
+
+  static VeilPeerDirection fromWire(int b) {
+    for (final d in values) {
+      if (d.wireByte == b) return d;
+    }
+    return VeilPeerDirection.unknown;
+  }
+}
+
+/// One peer session as reported by `veil_peers_list`. A point-in-time snapshot:
+/// no timestamp at the FFI boundary — callers that want "last seen" must stamp
+/// it on observation. [nodeId] is 32 bytes; [transport] is the dial URI.
+class VeilPeer {
+  const VeilPeer({
+    required this.nodeId,
+    required this.state,
+    required this.direction,
+    required this.transport,
+  });
+
+  final Uint8List nodeId;
+  final VeilPeerState state;
+  final VeilPeerDirection direction;
+  final String transport;
+}
+
 /// Push event kind — mirrors `veil_proto::event_kind`.
 ///
 /// Forward-compat: a daemon emitting a kind we don't recognise yields
