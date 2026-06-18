@@ -41,6 +41,7 @@ impl NodeRuntime {
             &self.identity.local_identity,
             &self.dht,
             &self.logger,
+            None, // documented as local-only force-publish
         )
     }
 
