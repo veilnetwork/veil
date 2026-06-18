@@ -607,6 +607,7 @@ impl FrameDispatcher {
         let is_desc = magic == Some(&veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC[..]);
         let is_rk = magic == Some(&veil_proto::relay_key::RELAY_KEY_MAGIC[..]);
         let is_ra = magic == Some(&veil_anonymity::rendezvous::MAGIC[..]);
+        let is_rd = magic == Some(&veil_anonymity::directory::RELAY_DIRECTORY_DHT_MAGIC[..]);
 
         if is_sb {
             // Signed operator bootstrap bundle (cf. `veil-bootstrap::
@@ -799,6 +800,29 @@ impl FrameDispatcher {
                 Err(_) => {
                     return Err(DispatchResult::Violation(
                         "Store: malformed RendezvousAd".to_owned(),
+                    ));
+                }
+            };
+            if !already_present && !self.abuse.identity_write_quota.try_allow(&id).is_allowed() {
+                return Err(DispatchResult::NoResponse);
+            }
+            veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
+        } else if is_rd {
+            // RelayDirectoryEntry ("RD"): a relay's anonymity x25519 pk (for the
+            // outer onion layer), resolvable by node_id. STRUCTURALLY decoded
+            // here, NOT signature-verified — like RelayKeyRecord/RendezvousAd, so
+            // rate-limit per the entry's claimed node_id but attribute bytes to
+            // the shared recursive bucket (the resolver re-verifies the entry
+            // signature on read via `verify_entry`). Without this arm the "RD"
+            // magic falls into the catch-all reject below and peers refuse its
+            // replication STORE — so the entry stays local-only at the relay and
+            // a COLD sender can never resolve an arbitrary advertised rendezvous
+            // relay → introduce silent-drop → `NoRendezvous`.
+            let id = match veil_anonymity::directory::decode_entry(payload_value) {
+                Ok(e) => e.node_id,
+                Err(_) => {
+                    return Err(DispatchResult::Violation(
+                        "Store: malformed RelayDirectoryEntry".to_owned(),
                     ));
                 }
             };

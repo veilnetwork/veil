@@ -60,6 +60,16 @@ impl NodeRuntime {
             // blinded_pub) — `verify_descriptor_self`). Without this the descriptor
             // was store_local-only and by-identity send never resolved cross-node.
             || magic == veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC
+            // Relay-directory entry ("RD"): the relay's anonymity x25519 pk,
+            // resolvable by node_id, that a sender needs for the outer onion
+            // layer to the rendezvous relay. Without this it was store_local-only
+            // at the relay (never replicated to its K-closest), so a COLD sender
+            // — which hasn't organically cached the relay's entry — could not
+            // resolve an arbitrary advertised rendezvous relay → introduce
+            // silent-drop → `NoRendezvous`. Re-verified on the resolver read path
+            // (`verify_entry`); accepted at the STORE gate by the `RD` arm in
+            // `validate_store_value_by_magic`.
+            || magic == &veil_anonymity::directory::RELAY_DIRECTORY_DHT_MAGIC[..]
     }
 
     pub fn spawn_dht_republish_task(&mut self, republish_interval: std::time::Duration) {
