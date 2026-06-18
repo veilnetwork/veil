@@ -2912,21 +2912,23 @@ pub unsafe extern "C" fn veil_mailbox_seal(
     }
 }
 
-/// Open + verify a fetched offline-mailbox `blob` claimed to be from `sender`,
-/// decrypting under our current cert version `our_cert_version`. On success
-/// returns [`VEIL_OK`], writes the verified destination app id to `out_app_id`
-/// (32 bytes) + endpoint id to `*out_endpoint_id`, and a heap-allocated data
-/// buffer to `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
+/// Open + verify a fetched offline-mailbox `blob`, decrypting under our current
+/// cert version `our_cert_version`. The sender is RECOVERED from the blob's
+/// sidecar (the anonymous mailbox deposit carries no usable wire sender) and,
+/// once crypto-verified, written to `out_sender` (32 bytes). On success returns
+/// [`VEIL_OK`], writes the verified destination app id to `out_app_id` (32 bytes)
+/// + endpoint id to `*out_endpoint_id`, and a heap-allocated data buffer to
+/// `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
 ///
-/// `sender` MUST point to ≥32 readable bytes; `blob` to ≥`blob_len`. `out_app_id`
-/// MUST point to ≥32 writable bytes; the other out-pointers MUST be writable.
+/// `blob` MUST point to ≥`blob_len`. `out_sender` / `out_app_id` MUST each point
+/// to ≥32 writable bytes; the other out-pointers MUST be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_mailbox_open(
     handle: *mut VeilHandle,
-    sender: *const u8,
     our_cert_version: u64,
     blob: *const u8,
     blob_len: size_t,
+    out_sender: *mut u8,
     out_app_id: *mut u8,
     out_endpoint_id: *mut u32,
     out_data: *mut *mut u8,
@@ -2938,7 +2940,7 @@ pub unsafe extern "C" fn veil_mailbox_open(
     }
     null_check!(err_out,
         "handle" => handle,
-        "sender" => sender,
+        "out_sender" => out_sender,
         "out_app_id" => out_app_id,
         "out_endpoint_id" => out_endpoint_id,
         "out_data" => out_data,
@@ -2948,10 +2950,6 @@ pub unsafe extern "C" fn veil_mailbox_open(
         *out_data = ptr::null_mut();
         *out_data_len = 0;
         *out_endpoint_id = 0;
-    }
-    let mut sender_arr = [0u8; 32];
-    unsafe {
-        ptr::copy_nonoverlapping(sender, sender_arr.as_mut_ptr(), 32);
     }
     let blob_vec: Vec<u8> = if blob_len == 0 {
         Vec::new()
@@ -2970,16 +2968,15 @@ pub unsafe extern "C" fn veil_mailbox_open(
     let bundle = Arc::clone(&handle_live.bundle);
     let res = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
-        client
-            .mailbox_open(blob_vec, sender_arr, our_cert_version)
-            .await
+        client.mailbox_open(blob_vec, our_cert_version).await
     });
     match res {
-        Ok((app_id, endpoint_id, data)) => {
+        Ok((sender_id, app_id, endpoint_id, data)) => {
             let boxed: Box<[u8]> = data.into_boxed_slice();
             let len = boxed.len();
             let p = Box::into_raw(boxed) as *mut u8;
             unsafe {
+                ptr::copy_nonoverlapping(sender_id.as_ptr(), out_sender, 32);
                 ptr::copy_nonoverlapping(app_id.as_ptr(), out_app_id, 32);
                 *out_endpoint_id = endpoint_id;
                 *out_data = p;

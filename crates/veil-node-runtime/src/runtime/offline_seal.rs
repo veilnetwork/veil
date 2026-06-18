@@ -117,12 +117,23 @@ impl RuntimeMailboxCrypto {
     pub async fn open(
         &self,
         blob: &[u8],
-        sender_node_id: [u8; 32],
         our_cert_version: u64,
     ) -> Result<AuthAppDeliver, OfflineSealError> {
         let sovereign = self.sovereign.as_ref().ok_or(OfflineSealError::NoIdentity)?;
         let our_instance = sovereign.active_instance_id();
         let now = now_unix();
+        // Recover the sender from the blob's sidecar (the anonymous mailbox
+        // deposit carries no usable wire sender), then resolve + verify against
+        // its document. A forged sidecar yields a wrong id → the main-blob open
+        // below fails closed.
+        let sender_node_id = mailbox_seal::recover_sender_node_id(
+            blob,
+            &our_instance,
+            &self.local_node_id,
+            self.mlkem_dk_seed.as_array(),
+            our_cert_version,
+        )
+        .map_err(OfflineSealError::Open)?;
         let sender_doc = self
             .mlkem_resolver()
             .fetch_verified_document(sender_node_id)
@@ -165,13 +176,13 @@ impl veil_ipc::MailboxCryptoSink for RuntimeMailboxCrypto {
     fn open_blob<'a>(
         &'a self,
         blob: Vec<u8>,
-        sender_node_id: [u8; 32],
         our_cert_version: u64,
     ) -> Pin<Box<dyn Future<Output = veil_ipc::MailboxOpenOutcome> + Send + 'a>> {
         Box::pin(async move {
             use veil_ipc::MailboxOpenOutcome as O;
-            match self.open(&blob, sender_node_id, our_cert_version).await {
+            match self.open(&blob, our_cert_version).await {
                 Ok(auth) => O::Ok {
+                    sender_node_id: auth.sender_node_id,
                     app_id: auth.app_id,
                     endpoint_id: auth.endpoint_id,
                     data: auth.data,
@@ -217,12 +228,9 @@ impl super::NodeRuntime {
     pub async fn open_offline_blob(
         &self,
         blob: &[u8],
-        sender_node_id: [u8; 32],
         our_cert_version: u64,
     ) -> Result<AuthAppDeliver, OfflineSealError> {
-        self.mailbox_crypto()
-            .open(blob, sender_node_id, our_cert_version)
-            .await
+        self.mailbox_crypto().open(blob, our_cert_version).await
     }
 }
 

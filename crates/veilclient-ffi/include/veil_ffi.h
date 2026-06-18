@@ -736,6 +736,30 @@ VeilStreamFfi *veil_stream_open(VeilApp *app,
  int veil_get_relay_x25519_pubkey(VeilHandle *handle, uint8_t *out_pubkey_32, char **err_out) ;
 
 /**
+ * Resolve ANOTHER node's relay X25519 KEM public key by its `node_id`, over the
+ * DHT. Unlike [`veil_get_relay_x25519_pubkey`] (which returns the LOCAL node's
+ * own key), this asks the daemon to fetch + verify the target's signed
+ * `RelayKeyRecord` against its identity document. Lets a receiver advertise an
+ * always-on third-party relay as its mailbox host knowing only its node_id.
+ *
+ * Returns:
+ * [`VEIL_OK`] — `out_pubkey_32` populated with the verified 32-byte key.
+ * [`VEIL_RELAY_X25519_UNAVAILABLE`] — unresolved (DHT miss / no record /
+ *   verification failed); the node advertises no relay key.
+ * other negative codes — connection/protocol errors.
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*` from `veil_connect`.
+ * `node_id_32` must point to 32 readable bytes; `out_pubkey_32` to 32 writable.
+ */
+
+int veil_lookup_relay_x25519(VeilHandle *handle,
+                             const uint8_t *node_id_32,
+                             uint8_t *out_pubkey_32,
+                             char **err_out)
+;
+
+/**
  * Register this node as a LOCATION-anonymous (onion) service: the daemon picks
  * relays, builds an onion circuit to a rendezvous relay (which never learns
  * this node's location), and publishes the ad so clients can reach this node by
@@ -749,6 +773,36 @@ VeilStreamFfi *veil_stream_open(VeilApp *app,
  * `handle` must be a live `VeilHandle*` from `veil_connect`.
  */
  int veil_register_onion_service(VeilHandle *handle, uint32_t hop_count, char **err_out) ;
+
+/**
+ * Register a PLAIN rendezvous-publisher entry (mailbox-by-discovery): the
+ * daemon's maintenance tick signs + publishes a v5 `RendezvousAd` under THIS
+ * node's real id at `rendezvous_node_id`'s rendezvous slot, advertising the
+ * relay's KEM key so a sender resolving the ad (`veil_lookup_rendezvous_replicas`)
+ * can anonymously deposit a mailbox PUT at the relay. Replaces any existing
+ * entry with the same `(rendezvous_node_id, auth_cookie)`.
+ *
+ * `relay_kem_algo` is the KEM tag (`0` = X25519); `relay_kem_pk` / `kem_len`
+ * the relay's KEM pubkey (32-byte X25519 for algo 0; obtain a self-relay key
+ * via `veil_get_relay_x25519_pubkey`). Pass `kem_len = 0` to advertise no key.
+ *
+ * `VEIL_OK` once the daemon records the entry; `VEIL_ERR` otherwise.
+ *
+ * # Safety
+ * `handle` must be a live `VeilHandle*`. `rendezvous_node_id` must be readable
+ * for 32 bytes, `auth_cookie` for 16. `relay_kem_pk` must be readable for
+ * `kem_len` bytes (or NULL iff `kem_len == 0`).
+ */
+
+int veil_register_rendezvous_publisher(VeilHandle *handle,
+                                       const uint8_t *rendezvous_node_id,
+                                       const uint8_t *auth_cookie,
+                                       uint64_t validity_window_secs,
+                                       uint8_t relay_kem_algo,
+                                       const uint8_t *relay_kem_pk,
+                                       size_t kem_len,
+                                       char **err_out)
+;
 
 /**
  * Send `data` to a LOCATION-anonymous (onion) service addressed by its Ed25519
@@ -963,8 +1017,10 @@ int veil_mailbox_put_with_wake_hmac(VeilHandle *handle,
  *     push_envelope_len:      u16, push_envelope:      [u8; len]
  *     capability_token_len:   u16, capability_token:   [u8; len]
  *     wake_hmac_envelope_len: u16, wake_hmac_envelope: [u8; len]
+ *     rendezvous_kem_algo:    u8
+ *     rendezvous_kem_pk_len:  u16, rendezvous_kem_pk:  [u8; len]
  * (Per-blob length is u16; every blob is backend-capped well under
- * 64 KiB — push ≤ 512 B, cap-token and wake-HMAC envelopes likewise.)
+ * 64 KiB — push ≤ 512 B, cap-token / wake-HMAC / relay-KEM-pk likewise.)
  *
  * # Safety
  * `handle` MUST be a live `VeilHandle*` from `veil_connect`.
@@ -1040,21 +1096,23 @@ int veil_mailbox_seal(VeilHandle *handle,
 ;
 
 /**
- * Open + verify a fetched offline-mailbox `blob` claimed to be from `sender`,
- * decrypting under our current cert version `our_cert_version`. On success
- * returns [`VEIL_OK`], writes the verified destination app id to `out_app_id`
- * (32 bytes) + endpoint id to `*out_endpoint_id`, and a heap-allocated data
- * buffer to `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
+ * Open + verify a fetched offline-mailbox `blob`, decrypting under our current
+ * cert version `our_cert_version`. The sender is RECOVERED from the blob's
+ * sidecar (the anonymous mailbox deposit carries no usable wire sender) and,
+ * once crypto-verified, written to `out_sender` (32 bytes). On success returns
+ * [`VEIL_OK`], writes the verified destination app id to `out_app_id` (32 bytes)
+ * + endpoint id to `*out_endpoint_id`, and a heap-allocated data buffer to
+ * `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
  *
- * `sender` MUST point to ≥32 readable bytes; `blob` to ≥`blob_len`. `out_app_id`
- * MUST point to ≥32 writable bytes; the other out-pointers MUST be writable.
+ * `blob` MUST point to ≥`blob_len`. `out_sender` / `out_app_id` MUST each point
+ * to ≥32 writable bytes; the other out-pointers MUST be writable.
  */
 
 int veil_mailbox_open(VeilHandle *handle,
-                      const uint8_t *sender,
                       uint64_t our_cert_version,
                       const uint8_t *blob,
                       size_t blob_len,
+                      uint8_t *out_sender,
                       uint8_t *out_app_id,
                       uint32_t *out_endpoint_id,
                       uint8_t **out_data,
