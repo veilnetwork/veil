@@ -238,21 +238,18 @@ class VeilClient implements Finalizable {
     if (nodeId.length != 32) {
       throw ArgumentError('nodeId must be 32 bytes, got ${nodeId.length}');
     }
-    // BLOCKING DHT FIND_VALUE (can wait on a network timeout when the relay
-    // record isn't resolvable). Run it on a WORKER ISOLATE — `Future(() {...})`
-    // would only defer onto the SAME UI isolate and still freeze it for the
-    // whole lookup, which is what made the mailbox-registration retry hang the
-    // app. The connection handle is a process-global token (see [connect]), so
-    // the worker resolves the same native runtime via its int address.
-    final handleAddr = _handle.address;
-    return Isolate.run(() {
+    // NOTE: MUST stay on the calling isolate (Future, not Isolate.run). The
+    // Isolate.run closure here was unsendable ("object is unsendable - Class:
+    // VeilClient"), so the mailbox-registration lookup threw and the node never
+    // advertised a relay. This is a blocking DHT FIND_VALUE, but it runs on the
+    // registration timer / on connect, not a user tap.
+    return Future(() {
       final node = calloc<Uint8>(32);
       final out = calloc<Uint8>(32);
       final errOut = calloc<Pointer<Utf8>>();
       try {
         node.asTypedList(32).setAll(0, nodeId);
-        final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
-        final rc = ffi.veilLookupRelayX25519(handle, node, out, errOut);
+        final rc = ffi.veilLookupRelayX25519(_handle, node, out, errOut);
         if (rc == ffi.veilRelayX25519Unavailable) {
           return null;
         }
@@ -356,11 +353,13 @@ class VeilClient implements Finalizable {
           'rendezvous_node_id must be 32 bytes and auth_cookie 16 bytes');
     }
     final kem = relayKemPk ?? Uint8List(0);
-    // Blocking IPC round-trip (DHT publish) — run on a worker isolate so the
-    // mailbox-registration path never freezes the UI. Handle is a process-global
-    // token (see [connect]); pass its int address into the worker.
-    final handleAddr = _handle.address;
-    return Isolate.run(() {
+    // NOTE: this MUST stay on the calling isolate (Future, not Isolate.run).
+    // An Isolate.run closure here was captured as unsendable ("object is
+    // unsendable - Class: VeilClient"), so EVERY registration threw and the node
+    // never published its rendezvous ad — making it unreachable (no delivery).
+    // Registration runs on a background timer / on connect, not a user tap, so a
+    // brief block here doesn't freeze an interaction.
+    return Future(() {
       final nodeId = calloc<Uint8>(32);
       final cookie = calloc<Uint8>(16);
       final kemPtr = kem.isNotEmpty ? calloc<Uint8>(kem.length) : nullptr;
@@ -371,8 +370,7 @@ class VeilClient implements Finalizable {
         if (kem.isNotEmpty) {
           kemPtr.asTypedList(kem.length).setAll(0, kem);
         }
-        final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
-        final rc = ffi.veilRegisterRendezvousPublisher(handle, nodeId, cookie,
+        final rc = ffi.veilRegisterRendezvousPublisher(_handle, nodeId, cookie,
             validityWindowSecs, relayKemAlgo, kemPtr, kem.length, errOut);
         if (rc != ffi.veilOk) {
           throw VeilException(
