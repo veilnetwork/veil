@@ -12,6 +12,7 @@
 
 import 'dart:async';
 import 'dart:ffi';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -78,7 +79,11 @@ class VeilMailbox {
         '(${ffi.veilMaxDataLen})',
       );
     }
-    return Future(() {
+    // The deposit is a blocking onion transaction to the relay — run it on
+    // a worker isolate so a slow/unreachable relay never freezes the UI.
+    final handleAddr = _handle.address;
+    return Isolate.run(() {
+      final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
       final recv = calloc<Uint8>(32);
       final content = calloc<Uint8>(32);
       final sender = calloc<Uint8>(32);
@@ -127,7 +132,7 @@ class VeilMailbox {
         final int rc;
         if (wakeHmacEnvelope != null && wakeHmacEnvelope.isNotEmpty) {
           rc = ffi.veilMailboxPutWithWakeHmac(
-            _handle,
+            handle,
             recv,
             content,
             sender,
@@ -144,7 +149,7 @@ class VeilMailbox {
           );
         } else if (tokenPtr == nullptr) {
           rc = ffi.veilMailboxPut(
-            _handle,
+            handle,
             recv,
             content,
             sender,
@@ -157,7 +162,7 @@ class VeilMailbox {
           );
         } else {
           rc = ffi.veilMailboxPutWithCapability(
-            _handle,
+            handle,
             recv,
             content,
             sender,
@@ -235,7 +240,11 @@ class VeilMailbox {
       await prev;
     } catch (_) {}
     try {
-      return await Future(() {
+      // The two-call fetch hits the daemon/relay over the network — run it on
+      // a worker isolate so the 30 s drain never stutters the UI thread.
+      final handleAddr = _handle.address;
+      return await Isolate.run(() {
+        final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
         final recv = calloc<Uint8>(32);
         final cookie = calloc<Uint8>(16);
         final outCount = calloc<Uint32>();
@@ -246,7 +255,7 @@ class VeilMailbox {
 
           // Step 1: count.  Daemon caches the result internally.
           final rc1 = ffi.veilMailboxFetchCount(
-            _handle,
+            handle,
             recv,
             cookie,
             outCount,
@@ -285,7 +294,7 @@ class VeilMailbox {
           final blobBuf = calloc<Uint8>(blobBufLen);
           try {
             final rc2 = ffi.veilMailboxFetchInto(
-              _handle,
+              handle,
               descriptors,
               count,
               blobBuf,
@@ -413,7 +422,13 @@ class VeilMailbox {
         'maxReplicas must be in 0..255, got $maxReplicas',
       );
     }
-    return Future(() {
+    // Blocking DHT FIND — run it on a worker isolate so the UI thread
+    // never stalls (this is hit on every stash/drain to resolve the
+    // receiver's relay).  The handle table is process-global, so the
+    // worker re-derives the same connection from the raw address.
+    final handleAddr = _handle.address;
+    return Isolate.run(() {
+      final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
       final recv = calloc<Uint8>(32);
       final outBuf = calloc<Pointer<Uint8>>();
       final outLen = calloc<IntPtr>();
@@ -421,7 +436,7 @@ class VeilMailbox {
       try {
         recv.asTypedList(32).setAll(0, receiverId);
         final rc = ffi.veilLookupRendezvousReplicas(
-          _handle,
+          handle,
           recv,
           maxReplicas,
           outBuf,
@@ -469,7 +484,11 @@ class VeilMailbox {
   }) async {
     _validateId(recipient, 'recipient');
     _validateId(appId, 'appId');
-    return Future(() {
+    // ML-KEM cert resolution over the DHT + fan-out encryption — blocking,
+    // hit on every stash.  Run on a worker isolate to keep the UI fluid.
+    final handleAddr = _handle.address;
+    return Isolate.run(() {
+      final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
       final rec = calloc<Uint8>(32);
       final app = calloc<Uint8>(32);
       final dataPtr = calloc<Uint8>(data.isEmpty ? 1 : data.length);
@@ -481,7 +500,7 @@ class VeilMailbox {
         app.asTypedList(32).setAll(0, appId);
         if (data.isNotEmpty) dataPtr.asTypedList(data.length).setAll(0, data);
         final rc = ffi.veilMailboxSeal(
-          _handle,
+          handle,
           rec,
           app,
           endpointId,
