@@ -12,7 +12,6 @@
 
 import 'dart:async';
 import 'dart:ffi';
-import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -79,11 +78,10 @@ class VeilMailbox {
         '(${ffi.veilMaxDataLen})',
       );
     }
-    // The deposit is a blocking onion transaction to the relay — run it on
-    // a worker isolate so a slow/unreachable relay never freezes the UI.
-    final handleAddr = _handle.address;
-    return Isolate.run(() {
-      final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+    // NOTE: stays on the calling isolate (Future). Isolate.run here was
+    // unsendable (Class: VeilMailbox), breaking the offline deposit. Re-do
+    // off-isolate via a top-level worker once verified.
+    return Future(() {
       final recv = calloc<Uint8>(32);
       final content = calloc<Uint8>(32);
       final sender = calloc<Uint8>(32);
@@ -132,7 +130,7 @@ class VeilMailbox {
         final int rc;
         if (wakeHmacEnvelope != null && wakeHmacEnvelope.isNotEmpty) {
           rc = ffi.veilMailboxPutWithWakeHmac(
-            handle,
+            _handle,
             recv,
             content,
             sender,
@@ -149,7 +147,7 @@ class VeilMailbox {
           );
         } else if (tokenPtr == nullptr) {
           rc = ffi.veilMailboxPut(
-            handle,
+            _handle,
             recv,
             content,
             sender,
@@ -162,7 +160,7 @@ class VeilMailbox {
           );
         } else {
           rc = ffi.veilMailboxPutWithCapability(
-            handle,
+            _handle,
             recv,
             content,
             sender,
@@ -240,11 +238,10 @@ class VeilMailbox {
       await prev;
     } catch (_) {}
     try {
-      // The two-call fetch hits the daemon/relay over the network — run it on
-      // a worker isolate so the 30 s drain never stutters the UI thread.
-      final handleAddr = _handle.address;
-      return await Isolate.run(() {
-        final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+      // NOTE: stays on the calling isolate (Future). Isolate.run here was
+      // unsendable (Class: VeilMailbox), breaking the drain. Re-do off-isolate
+      // via a top-level worker once verified.
+      return await Future(() {
         final recv = calloc<Uint8>(32);
         final cookie = calloc<Uint8>(16);
         final outCount = calloc<Uint32>();
@@ -255,7 +252,7 @@ class VeilMailbox {
 
           // Step 1: count.  Daemon caches the result internally.
           final rc1 = ffi.veilMailboxFetchCount(
-            handle,
+            _handle,
             recv,
             cookie,
             outCount,
@@ -294,7 +291,7 @@ class VeilMailbox {
           final blobBuf = calloc<Uint8>(blobBufLen);
           try {
             final rc2 = ffi.veilMailboxFetchInto(
-              handle,
+              _handle,
               descriptors,
               count,
               blobBuf,
@@ -422,13 +419,10 @@ class VeilMailbox {
         'maxReplicas must be in 0..255, got $maxReplicas',
       );
     }
-    // Blocking DHT FIND — run it on a worker isolate so the UI thread
-    // never stalls (this is hit on every stash/drain to resolve the
-    // receiver's relay).  The handle table is process-global, so the
-    // worker re-derives the same connection from the raw address.
-    final handleAddr = _handle.address;
-    return Isolate.run(() {
-      final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+    // NOTE: stays on the calling isolate (Future). An Isolate.run closure here
+    // was unsendable ("object is unsendable - Class: VeilMailbox"), which broke
+    // the stash/drain relay resolution. Re-do off-isolate via a top-level worker.
+    return Future(() {
       final recv = calloc<Uint8>(32);
       final outBuf = calloc<Pointer<Uint8>>();
       final outLen = calloc<IntPtr>();
@@ -436,7 +430,7 @@ class VeilMailbox {
       try {
         recv.asTypedList(32).setAll(0, receiverId);
         final rc = ffi.veilLookupRendezvousReplicas(
-          handle,
+          _handle,
           recv,
           maxReplicas,
           outBuf,
@@ -484,11 +478,10 @@ class VeilMailbox {
   }) async {
     _validateId(recipient, 'recipient');
     _validateId(appId, 'appId');
-    // ML-KEM cert resolution over the DHT + fan-out encryption — blocking,
-    // hit on every stash.  Run on a worker isolate to keep the UI fluid.
-    final handleAddr = _handle.address;
-    return Isolate.run(() {
-      final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+    // NOTE: stays on the calling isolate (Future). Isolate.run here was
+    // unsendable (Class: VeilMailbox), breaking the offline seal. Re-do
+    // off-isolate via a top-level worker once verified.
+    return Future(() {
       final rec = calloc<Uint8>(32);
       final app = calloc<Uint8>(32);
       final dataPtr = calloc<Uint8>(data.isEmpty ? 1 : data.length);
@@ -500,7 +493,7 @@ class VeilMailbox {
         app.asTypedList(32).setAll(0, appId);
         if (data.isNotEmpty) dataPtr.asTypedList(data.length).setAll(0, data);
         final rc = ffi.veilMailboxSeal(
-          handle,
+          _handle,
           rec,
           app,
           endpointId,
