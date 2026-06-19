@@ -303,6 +303,19 @@ pub unsafe extern "C" fn veil_node_start_deferred(
             return std::ptr::null_mut();
         }
     };
+    // Android: `std::env::temp_dir()` defaults to /data/local/tmp, which a normal
+    // app CANNOT write — the deferred boot's `tempfile` working dir then fails
+    // with EACCES and the node thread exits before binding its admin socket, so
+    // apply_config sees ENOENT forever. The admin socket lives in an app-writable
+    // dir, so point TMPDIR (which temp_dir() honours) at its parent. This fixes
+    // every temp_dir() user in the embedded node at once, not just the deferred
+    // working dir.
+    #[cfg(target_os = "android")]
+    if let Some(parent) = sock.parent() {
+        // Safety: set once at boot, before the node thread (the env reader) is
+        // spawned, so there is no concurrent env access.
+        unsafe { std::env::set_var("TMPDIR", parent) };
+    }
     start_thread(None, Some(sock), anonymous, err_out)
 }
 
@@ -317,6 +330,21 @@ fn start_thread(
     let spawn = std::thread::Builder::new()
         .name("veil-node".into())
         .spawn(move || {
+            // Android: bridge the node's `log` output to logcat (tag `veilnode`)
+            // once — Rust stderr is invisible there, so without this the embedded
+            // node is undebuggable on-device. No-op on other platforms.
+            #[cfg(target_os = "android")]
+            {
+                use std::sync::Once;
+                static INIT: Once = Once::new();
+                INIT.call_once(|| {
+                    android_logger::init_once(
+                        android_logger::Config::default()
+                            .with_max_level(log::LevelFilter::Info)
+                            .with_tag("veilnode"),
+                    );
+                });
+            }
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -324,6 +352,8 @@ fn start_thread(
                 Ok(rt) => rt,
                 Err(e) => {
                     eprintln!("veil_node: tokio runtime build failed: {e}");
+                    #[cfg(target_os = "android")]
+                    log::error!("veil_node: tokio runtime build failed: {e}");
                     return;
                 }
             };
@@ -348,6 +378,8 @@ fn start_thread(
             });
             if let Err(e) = result {
                 eprintln!("veil_node: runtime exited with error: {e}");
+                #[cfg(target_os = "android")]
+                log::error!("veil_node: runtime exited with error: {e}");
             }
         });
 
