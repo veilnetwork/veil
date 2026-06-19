@@ -62,6 +62,12 @@ veil-crypto = { path = "../veil-crypto" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util"] }
 libc = "0.2"
 
+# Android: route the embedded node's `log` output to logcat so the in-process
+# node is debuggable on-device (Rust stderr is NOT captured by logcat).
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.13"
+log = "0.4"
+
 [dev-dependencies]
 tempfile = "3"
 veil-proto = { path = "../veil-proto" }
