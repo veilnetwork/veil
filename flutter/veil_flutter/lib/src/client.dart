@@ -238,13 +238,21 @@ class VeilClient implements Finalizable {
     if (nodeId.length != 32) {
       throw ArgumentError('nodeId must be 32 bytes, got ${nodeId.length}');
     }
-    return Future(() {
+    // BLOCKING DHT FIND_VALUE (can wait on a network timeout when the relay
+    // record isn't resolvable). Run it on a WORKER ISOLATE — `Future(() {...})`
+    // would only defer onto the SAME UI isolate and still freeze it for the
+    // whole lookup, which is what made the mailbox-registration retry hang the
+    // app. The connection handle is a process-global token (see [connect]), so
+    // the worker resolves the same native runtime via its int address.
+    final handleAddr = _handle.address;
+    return Isolate.run(() {
       final node = calloc<Uint8>(32);
       final out = calloc<Uint8>(32);
       final errOut = calloc<Pointer<Utf8>>();
       try {
         node.asTypedList(32).setAll(0, nodeId);
-        final rc = ffi.veilLookupRelayX25519(_handle, node, out, errOut);
+        final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+        final rc = ffi.veilLookupRelayX25519(handle, node, out, errOut);
         if (rc == ffi.veilRelayX25519Unavailable) {
           return null;
         }
@@ -348,7 +356,11 @@ class VeilClient implements Finalizable {
           'rendezvous_node_id must be 32 bytes and auth_cookie 16 bytes');
     }
     final kem = relayKemPk ?? Uint8List(0);
-    return Future(() {
+    // Blocking IPC round-trip (DHT publish) — run on a worker isolate so the
+    // mailbox-registration path never freezes the UI. Handle is a process-global
+    // token (see [connect]); pass its int address into the worker.
+    final handleAddr = _handle.address;
+    return Isolate.run(() {
       final nodeId = calloc<Uint8>(32);
       final cookie = calloc<Uint8>(16);
       final kemPtr = kem.isNotEmpty ? calloc<Uint8>(kem.length) : nullptr;
@@ -359,7 +371,8 @@ class VeilClient implements Finalizable {
         if (kem.isNotEmpty) {
           kemPtr.asTypedList(kem.length).setAll(0, kem);
         }
-        final rc = ffi.veilRegisterRendezvousPublisher(_handle, nodeId, cookie,
+        final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+        final rc = ffi.veilRegisterRendezvousPublisher(handle, nodeId, cookie,
             validityWindowSecs, relayKemAlgo, kemPtr, kem.length, errOut);
         if (rc != ffi.veilOk) {
           throw VeilException(
