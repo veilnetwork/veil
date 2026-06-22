@@ -143,7 +143,9 @@ impl RuntimeMailboxCrypto {
         .map_err(OfflineSealError::Open)?;
         let sender_doc = self
             .mlkem_resolver()
-            .fetch_verified_document(sender_node_id)
+            // The blob's sender is an arbitrary third party, not necessarily a
+            // connected peer — keep the XOR-closest recursive walk.
+            .fetch_verified_document(sender_node_id, None)
             .await
             .ok_or(OfflineSealError::SenderDocUnresolved)?;
         mailbox_seal::open_mailbox_blob(

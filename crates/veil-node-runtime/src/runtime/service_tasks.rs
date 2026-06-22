@@ -3053,6 +3053,9 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                         self.local_node_id,
                         key,
                         std::time::Duration::from_millis(3500),
+                        // A receiver's rendezvous ad may be held by any K-closest
+                        // node, not the receiver itself — keep the recursive walk.
+                        None,
                         |b| {
                             decode_rendezvous_ad(b)
                                 .ok()
