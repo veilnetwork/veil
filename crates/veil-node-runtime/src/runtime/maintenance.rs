@@ -143,7 +143,7 @@ impl NodeRuntime {
         // The veil_dir is the config file's parent; the on-change
         // reload poll in `runtime/sovereign_republish.rs` picks up the
         // mtime change within 60 s and DHT-republishes.
-        let sovereign_identity_for_reissue = self.identity.sovereign_identity.clone();
+        let mut sovereign_identity_for_reissue = self.identity.sovereign_identity.clone();
         let veil_dir_for_reissue = self
             .config_path
             .parent()
@@ -266,11 +266,15 @@ impl NodeRuntime {
                         // half-validity (standalone mode only). No-op when
                         // the doc still has > half its window remaining or
                         // when this node runs in multi-device mode.
-                        Self::tick_reissue_local_delegation(
+                        if let Some(reissued) = Self::tick_reissue_local_delegation(
                             sovereign_identity_for_reissue.as_ref(),
                             &veil_dir_for_reissue,
                             &reissue_logger,
-                        );
+                        ) {
+                            // Advance the in-memory handle so the next tick sees the
+                            // extended validity and no-ops (kills the per-second spin).
+                            sovereign_identity_for_reissue = Some(reissued);
+                        }
                         // persist the discovered-peer cache to
                         // disk if it has any entries. Cheap (single JSON
                         // write of ≤ 32 entries × ~250 B ≈ 8 KB) and
@@ -853,21 +857,27 @@ impl NodeRuntime {
     /// device; for those the tick logs at debug + is a no-op. The
     /// operator must run `veil-cli identity delegate-device` from
     /// the master before the existing 7-day delegation expires.
+    /// Returns the freshly-reissued sovereign when a reissue happened, so the
+    /// caller can swap it into its in-memory handle. Returns `None` on a no-op
+    /// (skip / not standalone / no sovereign) OR on failure. CRITICAL: the
+    /// caller MUST replace its `sovereign_identity` with the returned value —
+    /// the reissue extends the in-memory `valid_until`, and without the swap the
+    /// next 1 s maintenance tick reads the SAME stale `valid_until`, reissues
+    /// again, and spins every second (re-signing + writing the doc forever,
+    /// which degraded the seed nodes over days).
     pub fn tick_reissue_local_delegation(
         sovereign_identity: Option<&Arc<veil_identity::sovereign::SovereignIdentity>>,
         veil_dir: &std::path::Path,
         logger: &Arc<NodeLogger>,
-    ) {
+    ) -> Option<Arc<veil_identity::sovereign::SovereignIdentity>> {
         use veil_proto::identity_document::DELEGATION_VALIDITY_SECS;
 
-        let Some(sov) = sovereign_identity else {
-            return;
-        };
+        let sov = sovereign_identity?;
         if !sov.is_standalone() {
             // Multi-device: master_sk lives elsewhere — the on-change
             // reload poll picks up an externally-re-signed doc within
             // 60 s when the operator drops the new bytes in.
-            return;
+            return None;
         }
 
         let now_unix = std::time::SystemTime::now()
@@ -876,13 +886,11 @@ impl NodeRuntime {
             .unwrap_or(0);
 
         let active_idx = sov.sig_key_idx as usize;
-        let Some(active_key) = sov.document.identity_keys.get(active_idx) else {
-            return; // already validated at construction; defensive guard
-        };
+        let active_key = sov.document.identity_keys.get(active_idx)?;
         let valid_until = active_key.valid_until_unix;
         let half_validity = DELEGATION_VALIDITY_SECS / 2;
         if now_unix + half_validity < valid_until {
-            return; // > half the validity window still remains; cheap no-op
+            return None; // > half the validity window still remains; cheap no-op
         }
 
         let new_valid_until = now_unix.saturating_add(DELEGATION_VALIDITY_SECS);
@@ -896,7 +904,7 @@ impl NodeRuntime {
                         veil_util::bytes_to_hex(sov.node_id()),
                     ),
                 );
-                return;
+                return None;
             }
         };
 
@@ -909,7 +917,7 @@ impl NodeRuntime {
                     veil_util::bytes_to_hex(sov.node_id()),
                 ),
             );
-            return;
+            return None;
         }
         logger.info(
             "node.sovereign_identity.reissued",
@@ -921,6 +929,22 @@ impl NodeRuntime {
                 new_valid_until,
             ),
         );
+        // Reload the freshly-written doc so the caller's in-memory handle advances
+        // to the new validity window — the next tick then short-circuits at the
+        // `now + half_validity < valid_until` guard instead of re-reissuing.
+        match veil_identity::sovereign::SovereignIdentity::load_from_dir(veil_dir) {
+            Ok(reissued) => Some(Arc::new(reissued)),
+            Err(e) => {
+                logger.warn(
+                    "node.sovereign_identity.reissue_reload_failed",
+                    format!(
+                        "node_id={} — reissued doc written but reload failed: {e}",
+                        veil_util::bytes_to_hex(sov.node_id()),
+                    ),
+                );
+                None
+            }
+        }
     }
 
     /// Refresh the PII-safe runtime summary exposed to admin endpoints.
