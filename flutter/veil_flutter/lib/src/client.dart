@@ -40,6 +40,66 @@ String _readErrAndFree(Pointer<Pointer<Utf8>> errOut) {
   return msg;
 }
 
+// ── Off-isolate workers ──────────────────────────────────────────────
+// TOP-LEVEL (never instance methods/closures) so an `Isolate.run(() =>
+// _xWorker(handleAddr, ...))` computation captures only sendable values and can
+// be sent to the worker isolate. The veil connection handle is a process-global
+// token (the generational handle table lives in native memory), so the worker
+// re-derives the same connection from the raw int address.
+
+Uint8List? _lookupRelayX25519Worker(int handleAddr, Uint8List nodeId) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final node = calloc<Uint8>(32);
+  final out = calloc<Uint8>(32);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    node.asTypedList(32).setAll(0, nodeId);
+    final rc = ffi.veilLookupRelayX25519(handle, node, out, errOut);
+    if (rc == ffi.veilRelayX25519Unavailable) return null;
+    if (rc != ffi.veilOk) {
+      throw VeilException('lookup_relay_x25519 failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+    return Uint8List.fromList(out.asTypedList(32));
+  } finally {
+    calloc.free(node);
+    calloc.free(out);
+    calloc.free(errOut);
+  }
+}
+
+void _registerRendezvousPublisherWorker(
+  int handleAddr,
+  Uint8List rendezvousNodeId,
+  Uint8List authCookie,
+  int validityWindowSecs,
+  int relayKemAlgo,
+  Uint8List kem,
+) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final nodeId = calloc<Uint8>(32);
+  final cookie = calloc<Uint8>(16);
+  final kemPtr = kem.isNotEmpty ? calloc<Uint8>(kem.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    nodeId.asTypedList(32).setAll(0, rendezvousNodeId);
+    cookie.asTypedList(16).setAll(0, authCookie);
+    if (kem.isNotEmpty) kemPtr.asTypedList(kem.length).setAll(0, kem);
+    final rc = ffi.veilRegisterRendezvousPublisher(handle, nodeId, cookie,
+        validityWindowSecs, relayKemAlgo, kemPtr, kem.length, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+          'register_rendezvous_publisher failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+  } finally {
+    calloc.free(nodeId);
+    calloc.free(cookie);
+    if (kemPtr != nullptr) calloc.free(kemPtr);
+    calloc.free(errOut);
+  }
+}
+
 /// GC-time safety-net: if a Dart `VeilClient` becomes unreachable
 /// without calling [VeilClient.close], the finalizer fires
 /// `veil_close` to release the daemon-side handle.  Explicit close
@@ -238,33 +298,16 @@ class VeilClient implements Finalizable {
     if (nodeId.length != 32) {
       throw ArgumentError('nodeId must be 32 bytes, got ${nodeId.length}');
     }
-    // NOTE: MUST stay on the calling isolate (Future, not Isolate.run). The
-    // Isolate.run closure here was unsendable ("object is unsendable - Class:
-    // VeilClient"), so the mailbox-registration lookup threw and the node never
-    // advertised a relay. This is a blocking DHT FIND_VALUE, but it runs on the
-    // registration timer / on connect, not a user tap.
-    return Future(() {
-      final node = calloc<Uint8>(32);
-      final out = calloc<Uint8>(32);
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        node.asTypedList(32).setAll(0, nodeId);
-        final rc = ffi.veilLookupRelayX25519(_handle, node, out, errOut);
-        if (rc == ffi.veilRelayX25519Unavailable) {
-          return null;
-        }
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-              'lookup_relay_x25519 failed: ${_readErrAndFree(errOut)}',
-              code: rc);
-        }
-        return Uint8List.fromList(out.asTypedList(32));
-      } finally {
-        calloc.free(node);
-        calloc.free(out);
-        calloc.free(errOut);
-      }
-    });
+    // Blocking DHT FIND_VALUE (waits on a network timeout when the relay record
+    // isn't resolvable) — run on a WORKER ISOLATE so it never congests/blocks the
+    // calling isolate (which would stall the registration retries + the mailbox
+    // drain, and freeze the UI). Delegates to a TOP-LEVEL worker so the sent
+    // computation captures only sendable values (handle address int + the id) —
+    // an inline closure over this instance method was captured as unsendable
+    // ("object is unsendable - Class: VeilClient"). The handle is a process-global
+    // token (see [connect]); the worker re-derives it from the raw address.
+    final handleAddr = _handle.address;
+    return Isolate.run(() => _lookupRelayX25519Worker(handleAddr, nodeId));
   }
 
   /// Snapshot the daemon's peer sessions: each [VeilPeer] carries node_id,
@@ -353,37 +396,18 @@ class VeilClient implements Finalizable {
           'rendezvous_node_id must be 32 bytes and auth_cookie 16 bytes');
     }
     final kem = relayKemPk ?? Uint8List(0);
-    // NOTE: this MUST stay on the calling isolate (Future, not Isolate.run).
-    // An Isolate.run closure here was captured as unsendable ("object is
-    // unsendable - Class: VeilClient"), so EVERY registration threw and the node
-    // never published its rendezvous ad — making it unreachable (no delivery).
-    // Registration runs on a background timer / on connect, not a user tap, so a
-    // brief block here doesn't freeze an interaction.
-    return Future(() {
-      final nodeId = calloc<Uint8>(32);
-      final cookie = calloc<Uint8>(16);
-      final kemPtr = kem.isNotEmpty ? calloc<Uint8>(kem.length) : nullptr;
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        nodeId.asTypedList(32).setAll(0, rendezvousNodeId);
-        cookie.asTypedList(16).setAll(0, authCookie);
-        if (kem.isNotEmpty) {
-          kemPtr.asTypedList(kem.length).setAll(0, kem);
-        }
-        final rc = ffi.veilRegisterRendezvousPublisher(_handle, nodeId, cookie,
-            validityWindowSecs, relayKemAlgo, kemPtr, kem.length, errOut);
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-              'register_rendezvous_publisher failed: ${_readErrAndFree(errOut)}',
-              code: rc);
-        }
-      } finally {
-        calloc.free(nodeId);
-        calloc.free(cookie);
-        if (kemPtr != nullptr) calloc.free(kemPtr);
-        calloc.free(errOut);
-      }
-    });
+    // Blocking IPC round-trip (DHT publish) — off-isolate via a TOP-LEVEL worker
+    // (sendable captures only) so the mailbox-registration path never blocks the
+    // calling isolate or freezes the UI. See [_lookupRelayX25519Worker] note.
+    final handleAddr = _handle.address;
+    return Isolate.run(() => _registerRendezvousPublisherWorker(
+          handleAddr,
+          rendezvousNodeId,
+          authCookie,
+          validityWindowSecs,
+          relayKemAlgo,
+          kem,
+        ));
   }
 
   /// Send [data] to a LOCATION-anonymous (onion) service addressed by its
