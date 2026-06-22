@@ -256,14 +256,33 @@ impl SessionTxRegistry {
         }
 
         // Policy-compliant.  Accept iff no existing session OR existing
-        // is stale (closed).  Don't replace a live policy-compliant
-        // session — the first to register wins for that direction.
+        // is stale (closed) — the first to register wins for that direction.
+        //
+        // EXCEPTION (no-glare reconnect): in the `bypass_directional` case — a
+        // peer reconnecting to a bootstrap/relay, or an inbound from a peer we
+        // never dial — there is no symmetric counterpart racing us, so the
+        // directional "first-wins" tiebreak does not apply. Enforcing it there
+        // turns a stale-but-unreaped session into a PERMANENT dedup deadlock:
+        // the peer abandoned its old link (restart / NAT rebind / transport
+        // drop) yet every reconnect is rejected because the old `tx` has not
+        // closed (no traffic ⇒ idle-reap may be far off or absent). A completed
+        // handshake is authenticated proof the SAME identity wants a fresh
+        // session, so EVICT the stale entry and accept the new link. Dropping
+        // the old `tx` closes its channel, tearing the abandoned session task
+        // down. This cannot reintroduce the E20 glare storm — that needs two
+        // mutually-dialing peers, which `bypass_directional` excludes by
+        // construction (a bootstrap/relay we dial does not dial us back; a
+        // never-dialed inbound has no outbound counterpart).
         if let Some(existing) = self.senders.get(&peer_id)
             && !existing.is_closed()
+            && !bypass_directional
         {
             return None;
         }
-        // Stale entry survived prune_closed (rare race) — remove + insert fresh.
+        // No live policy-compliant session blocking us: either nothing here, a
+        // stale (closed) entry that survived prune_closed, or a no-glare
+        // reconnect that supersedes the old entry. Drop any prior sender (which
+        // reaps the abandoned session) and register fresh.
         self.senders.remove(&peer_id);
         self.last_active.remove(&peer_id);
 
@@ -611,6 +630,55 @@ mod tests {
             reg2.try_register_directional(smaller, &larger, false, false)
                 .is_some(),
             "canonical inbound (larger keeps inbound) accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn bypass_reconnect_evicts_stale_session_instead_of_deadlocking() {
+        // Regression for the production dedup storm: a NAT'd client reconnecting
+        // to its relay/bootstrap left a stale-but-unreaped session on the seed,
+        // and with `bypass_directional` the old code rejected EVERY reconnect
+        // ("duplicate session rejected") because the prior tx had not closed —
+        // deadlocking the client out of the network indefinitely. A fresh
+        // authenticated handshake in the no-glare case must EVICT the stale
+        // entry and accept the new link.
+        let mut reg = SessionTxRegistry::new();
+        let local = [0x11u8; 32];
+        let peer = [0xc1u8; 32]; // a relay/bootstrap → bypass case
+
+        // First inbound from the client: accepted. Hold the rx so the sender
+        // stays OPEN — this models the stale-but-not-closed session the storm
+        // kept rejecting against.
+        let _old_rx = reg
+            .try_register_directional(peer, &local, false, true)
+            .expect("first no-glare session accepted");
+        assert!(reg.has_session(&peer));
+
+        // The client reconnects on a new link (the old tx is still open). With
+        // bypass there is no glare, so the reconnect MUST be accepted, not
+        // rejected behind the unreaped old session.
+        let new_rx = reg.try_register_directional(peer, &local, false, true);
+        assert!(
+            new_rx.is_some(),
+            "no-glare reconnect must evict the stale session and be accepted, \
+             not deadlock behind the unreaped old tx"
+        );
+        assert!(reg.has_session(&peer), "the fresh session is registered");
+        // Replaced, not doubled — exactly one session for the peer.
+        assert_eq!(reg.len(), 1);
+
+        // And the directional glare guard is untouched: with bypass=false a live
+        // policy-violating session is still rejected.
+        let mut reg2 = SessionTxRegistry::new();
+        let smaller = [0x10u8; 32];
+        let larger = [0x90u8; 32];
+        let _rx = reg2
+            .try_register_directional(larger, &smaller, true, false)
+            .expect("canonical accepted");
+        assert!(
+            reg2.try_register_directional(larger, &smaller, false, false)
+                .is_none(),
+            "non-bypass dedup still rejects a duplicate (glare guard intact)"
         );
     }
 }
