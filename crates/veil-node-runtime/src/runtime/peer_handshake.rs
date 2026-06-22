@@ -968,6 +968,7 @@ pub async fn register_connection_session(
             source_ip,
             runtime.sessions_per_ip,
             *remote_identity.node_id.as_bytes(),
+            runtime.session_tx_registry.clone(),
             runtime.dispatcher.reputation.clone(),
             runtime.event_bus,
         ),

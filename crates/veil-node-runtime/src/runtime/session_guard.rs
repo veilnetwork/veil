@@ -17,16 +17,17 @@
 //! 8. `reputation`                   (Mutex; admin paths)
 //!
 //! `SessionGuard::drop` follows a strict subset:
-//! `live_sessions → session_registry → sessions_per_ip → reputation`.
+//! `live_sessions → session_registry → session_tx_registry → sessions_per_ip
+//! → reputation`.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
-use veil_util::lock;
+use std::sync::{Arc, Mutex, RwLock};
+use veil_util::{lock, wlock};
 
 use crate::types::{LinkId, SessionInfo};
 use veil_reputation::ReputationTracker;
-use veil_session::SessionRegistry;
+use veil_session::{SessionRegistry, SessionTxRegistry};
 
 use super::ip_slot::IpSlotTable;
 use super::{NodeLogger, NodeMetrics};
@@ -45,8 +46,19 @@ pub struct SessionGuard {
     source_ip: Option<IpAddr>,
     /// Shared per-IP session counter map.
     sessions_per_ip: Arc<IpSlotTable>,
-    /// Peer node_id for reputation tracking on session close.
+    /// Peer node_id for reputation tracking on session close. Also the key
+    /// under which this session's outbox sender lives in `session_tx_registry`.
     peer_node_id: [u8; 32],
+    /// Per-session outbox registry (node_id-keyed). On drop we remove THIS
+    /// session's sender so a dead session never lingers as a "zombie" entry that
+    /// makes the node_id-keyed dedup reject every reconnect from the peer. The
+    /// other teardown maps (`live_sessions` / `session_registry`) were always
+    /// cleared here; this one was previously cleared only on the runner's normal
+    /// exit, so any other drop path (panic / cancel / early teardown) orphaned
+    /// it — the production NAT'd-client dedup storm. Removal is gated on no other
+    /// LIVE session still owning this node_id (see `Drop`), so it can never evict
+    /// a newer same-node_id session's sender.
+    session_tx_registry: Arc<RwLock<SessionTxRegistry>>,
     /// Shared reputation tracker — `session_closed` called on drop.
     reputation: Option<Arc<Mutex<ReputationTracker>>>,
     /// Shared push-event bus — publish `SESSIONS_CHANGED` on drop so
@@ -66,6 +78,7 @@ impl SessionGuard {
         source_ip: Option<IpAddr>,
         sessions_per_ip: Arc<IpSlotTable>,
         peer_node_id: [u8; 32],
+        session_tx_registry: Arc<RwLock<SessionTxRegistry>>,
         reputation: Option<Arc<Mutex<ReputationTracker>>>,
         event_bus: Arc<veil_ipc::EventBus>,
     ) -> Self {
@@ -79,6 +92,7 @@ impl SessionGuard {
             source_ip,
             sessions_per_ip,
             peer_node_id,
+            session_tx_registry,
             reputation,
             event_bus,
         }
@@ -97,11 +111,18 @@ impl Drop for SessionGuard {
         // ── state mutations under locks (canonical order) ──────
 
         // live_sessions: remove this entry, observe new total for the
-        // SESSIONS_CHANGED publish below.
-        let new_count = {
+        // SESSIONS_CHANGED publish below. While holding the lock, also decide
+        // whether ANY OTHER live session still owns our peer_node_id — if so we
+        // must NOT touch the shared outbox sender below (it belongs to that
+        // newer session, not this dying one).
+        let (new_count, node_has_other_live_session) = {
             let mut sessions = lock!(self.live_sessions);
             sessions.remove(&self.link_id);
-            sessions.len()
+            let me = &self.peer_node_id;
+            let other = sessions
+                .values()
+                .any(|s| s.node_id.as_ref().is_some_and(|n| n.as_bytes() == me));
+            (sessions.len(), other)
         };
 
         // session_registry: resolve sovereign identity for reputation
@@ -119,6 +140,18 @@ impl Drop for SessionGuard {
             reg.remove(&self.session_id);
             id
         };
+
+        // session_tx_registry: remove THIS session's node_id-keyed outbox sender
+        // so a dead session can't linger as a zombie that makes dedup reject the
+        // peer's reconnects forever. Skip only if another live session still owns
+        // this node_id (it registered a fresh sender that supersedes ours). The
+        // node_id-keyed dedup guarantees at most one sender per node_id, and a
+        // newer session can only have registered after ours was already gone, so
+        // this removes our own entry — never a peer's. Canonical order slot 4
+        // (after session_registry, before sessions_per_ip).
+        if !node_has_other_live_session {
+            wlock!(self.session_tx_registry).unregister(&self.peer_node_id);
+        }
 
         // sessions_per_ip: decrement counter for inbound connections.
         // Released via IpSlotTable::release which atomically decrements
