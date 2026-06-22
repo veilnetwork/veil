@@ -1839,6 +1839,7 @@ pub fn session_guard_drop_publishes_sessions_changed() {
         None,
         sessions_per_ip,
         [0u8; 32],
+        Arc::new(std::sync::RwLock::new(veil_session::SessionTxRegistry::new())),
         None,
         Arc::clone(&bus),
     );
@@ -1849,6 +1850,96 @@ pub fn session_guard_drop_publishes_sessions_changed() {
     // BTreeMap was empty, remove of absent key still publishes
     // count=0 (current live count) — that the contract.
     assert_eq!(event.payload, 0u16.to_be_bytes().to_vec());
+}
+
+// ── SessionGuard reaps its orphaned outbox sender on drop ───────
+// Regression for the production NAT'd-client dedup storm: a dead session's
+// node_id-keyed sender in `session_tx_registry` was only cleared on the runner's
+// normal exit, so other teardown paths orphaned it — and the orphan then made
+// dedup reject every reconnect from that peer forever. The guard must reap its
+// own sender on drop, but NEVER one a newer same-node_id session owns.
+#[test]
+pub fn session_guard_drop_reaps_orphaned_tx_unless_node_has_other_session() {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex, RwLock};
+    use veil_cfg::{NodeId, PeerId};
+    use veil_ipc::EventBus;
+
+    use crate::types::{LinkId, SessionInfo, SessionSource, SessionState};
+
+    fn session_info(node: [u8; 32], link: u64) -> SessionInfo {
+        SessionInfo {
+            link_id: LinkId::new(link),
+            node_id: Some(NodeId::from(node)),
+            nonce: None,
+            matched_peer_id: None,
+            source: SessionSource::Outbound(PeerId::new(0u32)),
+            listener_handle: None,
+            state: SessionState::Active,
+            transport: "test".to_string(),
+            remote_addr: None,
+            description: String::new(),
+        }
+    }
+
+    fn build_guard(
+        live: &Arc<Mutex<BTreeMap<LinkId, SessionInfo>>>,
+        tx_reg: &Arc<RwLock<veil_session::SessionTxRegistry>>,
+        node: [u8; 32],
+        link: u64,
+    ) -> SessionGuard {
+        SessionGuard::new(
+            Arc::clone(live),
+            LinkId::new(link),
+            Arc::new(veil_observability::NodeLogger::new_noop()),
+            None,
+            [0u8; 32],
+            Arc::new(Mutex::new(veil_session::SessionRegistry::default())),
+            None,
+            Arc::new(super::ip_slot::IpSlotTable::new()),
+            node,
+            Arc::clone(tx_reg),
+            None,
+            Arc::new(EventBus::new()),
+        )
+    }
+
+    let node = [7u8; 32];
+
+    // CASE 1 — the dying session is the LAST owner of node_id → its orphaned
+    // (still-open) sender MUST be reaped, so the peer's next reconnect is no
+    // longer dedup-rejected.
+    {
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let _rx = tx_reg.write().unwrap().register(node); // keep the channel OPEN
+        assert!(tx_reg.read().unwrap().has_session(&node));
+
+        let live = Arc::new(Mutex::new(BTreeMap::new()));
+        live.lock().unwrap().insert(LinkId::new(1), session_info(node, 1));
+
+        drop(build_guard(&live, &tx_reg, node, 1));
+        assert!(
+            !tx_reg.read().unwrap().has_session(&node),
+            "orphaned outbox sender must be reaped when no other live session owns the node_id"
+        );
+    }
+
+    // CASE 2 — ANOTHER live session still owns node_id → the sender belongs to
+    // that newer session and MUST be preserved (never evict a peer's session).
+    {
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let _rx = tx_reg.write().unwrap().register(node);
+
+        let live = Arc::new(Mutex::new(BTreeMap::new()));
+        live.lock().unwrap().insert(LinkId::new(1), session_info(node, 1));
+        live.lock().unwrap().insert(LinkId::new(2), session_info(node, 2));
+
+        drop(build_guard(&live, &tx_reg, node, 1)); // drop link 1; link 2 still live
+        assert!(
+            tx_reg.read().unwrap().has_session(&node),
+            "a sender owned by another live session for the same node_id must NOT be evicted"
+        );
+    }
 }
 
 // ── sim hot-standby template-URI fix ───────────────────────
