@@ -118,6 +118,7 @@ impl DhtMlKemEkResolver {
     pub async fn fetch_verified_document(
         &self,
         target_node_id: [u8; 32],
+        direct_peer: Option<[u8; 32]>,
     ) -> Option<IdentityDocument> {
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -125,7 +126,7 @@ impl DhtMlKemEkResolver {
             .as_secs();
         let doc_key = IdentityDocument::dht_key(&target_node_id);
         let doc_bytes = match self
-            .dht_recursive_get(doc_key, self.step_timeout, |b| {
+            .dht_recursive_get(doc_key, self.step_timeout, direct_peer, |b| {
                 IdentityDocument::decode(b).ok().is_some_and(|d| {
                     d.node_id == target_node_id && verify_identity_document(&d, now_unix).is_ok()
                 })
@@ -180,7 +181,9 @@ impl DhtMlKemEkResolver {
     ) -> Option<VerifiedMlkemCert> {
         self.log_dbg("mlkem_resolver.start", &target_node_id, "");
         // ── Step 1: IdentityDocument ────────────────────────────────
-        let doc = self.fetch_verified_document(target_node_id).await?;
+        // ML-KEM resolves can target any third party (not necessarily a
+        // connected peer), so keep the XOR-closest recursive walk.
+        let doc = self.fetch_verified_document(target_node_id, None).await?;
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
@@ -189,7 +192,7 @@ impl DhtMlKemEkResolver {
         // ── Step 2: InstanceRegistry ────────────────────────────────
         let reg_key = InstanceRegistry::dht_key(&target_node_id);
         let reg_bytes = match self
-            .dht_recursive_get(reg_key, self.step_timeout, |b| {
+            .dht_recursive_get(reg_key, self.step_timeout, None, |b| {
                 InstanceRegistry::decode(b).ok().is_some_and(|r| {
                     r.node_id == target_node_id && verify_instance_registry_sig(&r, &doc)
                 })
@@ -232,7 +235,7 @@ impl DhtMlKemEkResolver {
         // ── Step 3: MlKemKeyCert ────────────────────────────────────
         let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance.instance_id);
         let cert_bytes = match self
-            .dht_recursive_get(cert_key, self.step_timeout, |b| {
+            .dht_recursive_get(cert_key, self.step_timeout, None, |b| {
                 MlKemKeyCert::decode(b)
                     .ok()
                     .is_some_and(|c| verify_mlkem_cert(&c, &doc, now_unix).is_ok())
@@ -314,14 +317,20 @@ impl DhtMlKemEkResolver {
     /// Reuses the same document fetch + recursive-get the ML-KEM walk uses, so
     /// the relay-key resolve shares the mirror-cache-poison-resistant fast path.
     pub async fn fetch_relay_x25519(&self, target_node_id: [u8; 32]) -> Option<[u8; 32]> {
-        let doc = self.fetch_verified_document(target_node_id).await?;
+        // Relay-key resolves are the cold-restart hot path: the target IS the
+        // relay we're connected to and about to register a mailbox with, so steer
+        // BOTH the document and the relay-key lookups straight at it (it answers
+        // authoritatively from store_local) rather than walking a cold table.
+        let doc = self
+            .fetch_verified_document(target_node_id, Some(target_node_id))
+            .await?;
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_secs();
         let key = RelayKeyRecord::dht_key(&target_node_id);
         let bytes = match self
-            .dht_recursive_get(key, self.step_timeout, |b| {
+            .dht_recursive_get(key, self.step_timeout, Some(target_node_id), |b| {
                 RelayKeyRecord::decode(b).ok().is_some_and(|r| {
                     r.node_id == target_node_id && verify_relay_key(&r, &doc, now_unix).is_ok()
                 })
@@ -366,6 +375,7 @@ impl DhtMlKemEkResolver {
         &self,
         key: [u8; 32],
         timeout: Duration,
+        direct_peer: Option<[u8; 32]>,
         is_valid: impl Fn(&[u8]) -> bool,
     ) -> Option<Vec<u8>> {
         recursive_dht_get(
@@ -375,6 +385,7 @@ impl DhtMlKemEkResolver {
             self.local_node_id,
             key,
             timeout,
+            direct_peer,
             is_valid,
         )
         .await
@@ -393,6 +404,21 @@ impl DhtMlKemEkResolver {
 /// forward a `RecursiveQuery(FIND_VALUE)` to the top-2 closest session peers →
 /// await the matching `RecursiveResponse`. Returns `None` on local-miss +
 /// no-peers / timeout. `is_valid` gates ONLY the local fast path.
+///
+/// `direct_peer` is the **connected-peer fast path** for cold routing tables:
+/// when resolving a record that the target node itself is the authoritative
+/// publisher of (its own relay-key / identity document) AND we already hold a
+/// live session to that node, the XOR-closest top-2 fan is pointless — the
+/// holder is right there on a connected socket. So if `direct_peer` is `Some`
+/// and that node is in our current session set, the `FIND_VALUE` is sent ONLY
+/// to it (it answers authoritatively from its own `store_local`), bypassing the
+/// recursive walk that times out on a barely-warm table after a restart. This
+/// is anonymity-safe: we send only to the relay we will OPENLY register a
+/// mailbox publisher with — it already knows we're connected — and the value is
+/// still verified byte-identically by `is_valid` / the caller's signature
+/// check, so a hostile direct peer can only withhold, never forge. All other
+/// callers (ML-KEM EK, rendezvous-ad, and third-party document lookups) pass
+/// `None` and keep the XOR-closest walk.
 #[allow(clippy::type_complexity)]
 pub(crate) async fn recursive_dht_get(
     dht: &Arc<KademliaService>,
@@ -401,6 +427,7 @@ pub(crate) async fn recursive_dht_get(
     local_node_id: [u8; 32],
     key: [u8; 32],
     timeout: Duration,
+    direct_peer: Option<[u8; 32]>,
     is_valid: impl Fn(&[u8]) -> bool,
 ) -> Option<Vec<u8>> {
     // Validated local fast path. Only trust a locally mirror-cached value if it
@@ -472,7 +499,16 @@ pub(crate) async fn recursive_dht_get(
 
     {
         let guard = rlock!(session_tx_registry);
-        for pid in peers.iter().take(2) {
+        // Connected-peer fast path: if we're resolving a record whose
+        // authoritative holder is a node we have a live session to, ask only it
+        // (it answers from its own store_local) instead of walking the cold
+        // table. Fall back to the XOR-closest top-2 fan when the direct peer is
+        // not connected (or no direct peer was given).
+        let direct_targets: Vec<[u8; 32]> = match direct_peer {
+            Some(dp) if peers.contains(&dp) => vec![dp],
+            _ => peers.iter().take(2).copied().collect(),
+        };
+        for pid in &direct_targets {
             guard.send_to(
                 pid,
                 veil_proto::header::priority::INTERACTIVE,
@@ -613,7 +649,7 @@ mod tests {
         dht.store_local(key, b"poisoned".to_vec());
         let resolver = make_test_resolver(Arc::clone(&dht));
         let got = resolver
-            .dht_recursive_get(key, Duration::from_millis(50), |_| false)
+            .dht_recursive_get(key, Duration::from_millis(50), None, |_| false)
             .await;
         assert_eq!(
             got, None,
@@ -628,8 +664,84 @@ mod tests {
         dht.store_local(key, b"good".to_vec());
         let resolver = make_test_resolver(Arc::clone(&dht));
         let got = resolver
-            .dht_recursive_get(key, Duration::from_millis(50), |_| true)
+            .dht_recursive_get(key, Duration::from_millis(50), None, |_| true)
             .await;
         assert_eq!(got, Some(b"good".to_vec()));
+    }
+
+    // Connected-peer fast path: when `direct_peer` is Some AND that node is in
+    // our live session set, the FIND_VALUE is sent ONLY to it (it answers
+    // authoritatively from its own store_local) — never the XOR-closest top-2
+    // fan. This is what lets a cold-restarted node resolve its relay's key in
+    // one hop instead of timing out on a barely-warm routing table.
+    #[tokio::test]
+    async fn recursive_get_direct_peer_targets_only_connected_holder() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let key = [42u8; 32]; // no local value → proceeds to the send fan
+        let mut reg = SessionTxRegistry::new();
+        let mut rx_a = reg.register([10u8; 32]);
+        let mut rx_b = reg.register([20u8; 32]);
+        let mut rx_c = reg.register([30u8; 32]);
+        let registry = Arc::new(RwLock::new(reg));
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        let _ = recursive_dht_get(
+            &dht,
+            &registry,
+            &pending,
+            [1u8; 32],
+            key,
+            Duration::from_millis(30),
+            Some([20u8; 32]), // a CONNECTED holder
+            |_| false,
+        )
+        .await;
+        assert!(
+            rx_b.try_recv().is_ok(),
+            "the connected direct peer must receive the query"
+        );
+        assert!(
+            rx_a.try_recv().is_err() && rx_c.try_recv().is_err(),
+            "non-target peers must NOT be queried on the fast path"
+        );
+    }
+
+    // When `direct_peer` is set but NOT connected, the resolver must fall back
+    // to the unchanged XOR-closest top-2 fan (so a stale/wrong hint never
+    // strands the lookup with zero outgoing queries).
+    #[tokio::test]
+    async fn recursive_get_unconnected_direct_peer_falls_back_to_closest_fan() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let key = [42u8; 32];
+        let mut reg = SessionTxRegistry::new();
+        let mut rx_a = reg.register([10u8; 32]);
+        let mut rx_b = reg.register([20u8; 32]);
+        let mut rx_c = reg.register([30u8; 32]);
+        let registry = Arc::new(RwLock::new(reg));
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        let _ = recursive_dht_get(
+            &dht,
+            &registry,
+            &pending,
+            [1u8; 32],
+            key,
+            Duration::from_millis(30),
+            Some([99u8; 32]), // NOT in the session set
+            |_| false,
+        )
+        .await;
+        let hits = [
+            rx_a.try_recv().is_ok(),
+            rx_b.try_recv().is_ok(),
+            rx_c.try_recv().is_ok(),
+        ]
+        .into_iter()
+        .filter(|x| *x)
+        .count();
+        assert_eq!(
+            hits, 2,
+            "an unconnected direct peer must fall back to the top-2 closest fan"
+        );
     }
 }
