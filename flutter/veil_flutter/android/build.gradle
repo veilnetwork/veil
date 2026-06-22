@@ -123,9 +123,17 @@ cargoTargetMap.each { abi, triple ->
         // veil node without a subprocess (the deniable posture — nothing
         // identity-bearing written to a config.toml). Pulls veil-node-runtime
         // with NO default features, so RocksDB stays OFF the .so (in-memory DHT).
-        commandLine 'cargo', 'ndk', '-t', abi, '--',
-                    'build', '--release', '-p', 'veilclient-ffi',
-                    '--features', "${seedFeature},node-embedded"
+        // `--no-default-features` drops `tls-boring` (BoringSSL): it fails to
+        // cross-compile under recent Android NDKs (libc++ `__countl_zero` in
+        // fipsmodule/bcm.cc) and the mobile node connects over obfs4, NOT a
+        // TLS-boring ClientHello — so the BoringSSL backend is dead weight here.
+        // Re-enable with `-PveilTlsBoring=true` if a build ever needs it.
+        def tlsBoring = (project.findProperty('veilTlsBoring') ?: 'false').toString() == 'true'
+        def featureArgs = tlsBoring
+            ? ['--features', "${seedFeature},node-embedded"]
+            : ['--no-default-features', '--features', "${seedFeature},node-embedded"]
+        commandLine(['cargo', 'ndk', '-t', abi, '--',
+                     'build', '--release', '-p', 'veilclient-ffi'] + featureArgs)
         // Capture stderr/stdout to gradle's log so build failures
         // surface clearly in а CI job's output.
         ignoreExitValue false
