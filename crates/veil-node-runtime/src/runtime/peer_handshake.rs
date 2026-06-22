@@ -29,7 +29,8 @@ use tokio::io::AsyncWriteExt;
 use crate::error::{NodeError, Result};
 use crate::state::NodeState;
 use crate::types::{
-    LinkId, ListenerHandle, PeerConfigEntry, PeerId, SessionInfo, SessionSource, SessionState,
+    LinkId, ListenerHandle, PeerConfigEntry, PeerId, PeerSource, SessionInfo, SessionSource,
+    SessionState,
 };
 use veil_cfg;
 use veil_routing::VivaldiCoord;
@@ -809,7 +810,18 @@ pub async fn register_connection_session(
                     })
                     .unwrap_or(false)
             } else {
-                matched_peer_id.is_none()
+                // Inbound: bypass the directional tiebreak unless this is a
+                // CONFIGURED mutual-dial peer. A no-record peer was always
+                // bypassed (no glare possible); now a dynamically-LEARNED peer
+                // (PEX/autodiscovered — possibly a NAT'd client we cannot dial
+                // back) is too, so the convention can't strand it by assigning
+                // the unreachable seed→peer direction. The configured mesh
+                // (Configured/Bootstrap) still gets the deterministic tiebreak.
+                // See `inbound_bypasses_directional`.
+                let matched_source = matched_peer_id.and_then(|pid| {
+                    lock_state(&runtime.state).peers.get(&pid).map(|e| e.source)
+                });
+                inbound_bypasses_directional(matched_source)
             };
         let reserved_outbox_rx = {
             let mut reg = runtime
@@ -1028,6 +1040,33 @@ pub fn match_configured_peer(
         .map(|peer| peer.peer_id)
 }
 
+/// Whether an INBOUND handshake should BYPASS the E20 directional glare
+/// tiebreak (i.e. be accepted unconditionally instead of obeying the
+/// smaller→larger canonical-direction rule).
+///
+/// `matched_source` is the `PeerSource` of our `state.peers` record for the
+/// remote, or `None` if we have no record.
+///
+/// The directional convention deterministically picks ONE surviving direction
+/// for a glaring pair without negotiation — but it only works when BOTH peers
+/// can actually dial each other. That holds for the CONFIGURED mesh
+/// (`Configured`/`Bootstrap` — mutual dialers). It does NOT hold for a
+/// dynamically-learned peer (`Exchanged` via PEX, `Autodiscovered` via beacon):
+/// such a peer may be undialable by us (e.g. a NAT'd client behind a symmetric
+/// NAT). For it, the convention can assign "we keep the outbound to them" — a
+/// direction that never materialises because our seed→peer dial dies in the NAT
+/// — and then its inbound is rejected FOREVER (observed in prod: a NAT'd client
+/// could never hold a session to its mailbox-relay seed; `session.open=0`,
+/// endless `session.dedup direction=inbound` on an otherwise-empty registry).
+/// So: bypass the tiebreak for a no-record or learned-source peer; keep it only
+/// for the configured mutual-dial mesh.
+pub fn inbound_bypasses_directional(matched_source: Option<PeerSource>) -> bool {
+    !matches!(
+        matched_source,
+        Some(PeerSource::Configured) | Some(PeerSource::Bootstrap)
+    )
+}
+
 pub fn peer_transport_context(
     base: &TransportContext,
     peer: &PeerConfigEntry,
@@ -1040,4 +1079,28 @@ pub fn peer_transport_context(
         ctx = ctx.with_client_identity_from_files(Path::new(cert), Path::new(key))?;
     }
     Ok(ctx)
+}
+
+#[cfg(test)]
+mod bypass_tests {
+    use super::inbound_bypasses_directional;
+    use crate::types::PeerSource;
+
+    #[test]
+    fn inbound_bypass_keeps_directional_only_for_configured_mesh() {
+        // No record of the peer → bypass (one-sided inbound, no glare).
+        assert!(inbound_bypasses_directional(None));
+
+        // Dynamically-learned peers (PEX / mesh beacon) — possibly NAT'd /
+        // undialable → bypass so the convention can't strand them on an
+        // unreachable canonical direction. This is the prod NAT'd-client fix.
+        assert!(inbound_bypasses_directional(Some(PeerSource::Exchanged)));
+        assert!(inbound_bypasses_directional(Some(PeerSource::Autodiscovered)));
+
+        // The CONFIGURED mutual-dial mesh ([[peers]] / [[bootstrap_peers]])
+        // still gets the deterministic E20 glare tiebreak — NOT bypassed —
+        // so seed↔seed glare resolution stays intact.
+        assert!(!inbound_bypasses_directional(Some(PeerSource::Configured)));
+        assert!(!inbound_bypasses_directional(Some(PeerSource::Bootstrap)));
+    }
 }
