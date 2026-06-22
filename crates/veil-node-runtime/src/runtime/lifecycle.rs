@@ -41,7 +41,9 @@ use veil_mesh::{GatewayBridge, MeshForwarder, NeighborTable};
 use veil_routing::{NeighborScorer, RouteCache, RttTable, VivaldiCoord};
 use veil_session::SessionRegistry;
 
-use super::identity_loaders::{load_falcon_signer, load_signing_key};
+use super::identity_loaders::{
+    build_standalone_sovereign_identity, load_falcon_signer, load_signing_key,
+};
 use super::{
     NodeRuntime, PeerPubkeySnapshot, RuntimeTasks, StopFlushContext, StopTasksContext,
     build_advertised_transports, build_relay_node_ids, build_state, build_target_labels,
@@ -412,9 +414,34 @@ impl NodeRuntime {
         // their own contexts are rebuilt — matches pre-PR5 semantics where
         // NodeServices.local_identity was the same stale Arc clone.
         let new_local_identity = Arc::new(HandshakeIdentity::from_config(&config)?);
+        // Deniable deferred boot promotes local_identity (the invite / address /
+        // rendezvous publisher / mailbox "me") from the throwaway STUB key to the
+        // REAL [identity] key on this reload. The sovereign identity — which signs
+        // and publishes the MlKemKeyCert / RelayKeyRecord / InstanceRegistry that
+        // REMOTE peers resolve to seal a mailbox deposit or open an onion
+        // introduce — was previously cloned forward verbatim, so it stayed under
+        // the STUB node_id while the address moved to the real id. Result: every
+        // remote mailbox_seal failed with PeerUnresolved and NOTHING could be
+        // delivered. Re-derive a standalone sovereign from the PROMOTED config so
+        // sovereign.node_id() == the invite id again. ONLY for standalone
+        // (degenerate, master_pk==device_pk) sovereigns — a provisioned
+        // multi-device IdentityDocument (is_standalone()==false) is never touched,
+        // and a rebuild for an unchanged identity is idempotent (same keypair →
+        // same node_id).
+        let new_sovereign = match self.identity.sovereign_identity.as_ref() {
+            Some(sov) if sov.is_standalone() => {
+                let veil_dir = self
+                    .config_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                build_standalone_sovereign_identity(veil_dir, &config, &self.logger)
+                    .or_else(|| Some(Arc::clone(sov)))
+            }
+            other => other.cloned(),
+        };
         self.identity = Arc::new(super::identity_state::IdentityState::new(
             new_local_identity,
-            self.identity.sovereign_identity.clone(),
+            new_sovereign,
             Arc::clone(&self.identity.peer_pubkeys),
             Arc::clone(&self.identity.peer_sovereign_identities),
             Arc::clone(&self.identity.peer_roles),
