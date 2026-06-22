@@ -12,6 +12,7 @@
 
 import 'dart:async';
 import 'dart:ffi';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -78,132 +79,12 @@ class VeilMailbox {
         '(${ffi.veilMaxDataLen})',
       );
     }
-    // NOTE: stays on the calling isolate (Future). Isolate.run here was
-    // unsendable (Class: VeilMailbox), breaking the offline deposit. Re-do
-    // off-isolate via a top-level worker once verified.
-    return Future(() {
-      final recv = calloc<Uint8>(32);
-      final content = calloc<Uint8>(32);
-      final sender = calloc<Uint8>(32);
-      final blobPtr = blob.isEmpty ? nullptr : calloc<Uint8>(blob.length);
-      final pushPtr = (pushEnvelope == null || pushEnvelope.isEmpty)
-          ? nullptr
-          : calloc<Uint8>(pushEnvelope.length);
-      final tokenPtr = (capabilityToken == null || capabilityToken.isEmpty)
-          ? nullptr
-          : calloc<Uint8>(capabilityToken.length);
-      final wakePtr = (wakeHmacEnvelope == null || wakeHmacEnvelope.isEmpty)
-          ? nullptr
-          : calloc<Uint8>(wakeHmacEnvelope.length);
-      final outEvicted = calloc<Uint32>();
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        recv.asTypedList(32).setAll(0, receiverId);
-        content.asTypedList(32).setAll(0, contentId);
-        sender.asTypedList(32).setAll(0, senderId);
-        if (blob.isNotEmpty) {
-          blobPtr.asTypedList(blob.length).setAll(0, blob);
-        }
-        if (pushEnvelope != null && pushEnvelope.isNotEmpty) {
-          pushPtr.asTypedList(pushEnvelope.length).setAll(0, pushEnvelope);
-        }
-        if (capabilityToken != null && capabilityToken.isNotEmpty) {
-          tokenPtr
-              .asTypedList(capabilityToken.length)
-              .setAll(0, capabilityToken);
-        }
-        if (wakeHmacEnvelope != null && wakeHmacEnvelope.isNotEmpty) {
-          wakePtr
-              .asTypedList(wakeHmacEnvelope.length)
-              .setAll(0, wakeHmacEnvelope);
-        }
-
-        // Dispatch:
-        //   * non-empty wakeHmacEnvelope → full wake-HMAC PUT (carries push +
-        //     capability + wake envelopes; capability/push may be NULL). An
-        //     empty/absent wake envelope falls through (audit F2: was branching
-        //     on `!= null`, so an empty envelope still took this path with a
-        //     NULL wakePtr — harmless, but inconsistent with the other two and
-        //     surprising; align it with `wakePtr`'s null-when-empty rule).
-        //   * else capabilityToken present → capability PUT (back-compat).
-        //   * else → plain PUT (back-compat).
-        final int rc;
-        if (wakeHmacEnvelope != null && wakeHmacEnvelope.isNotEmpty) {
-          rc = ffi.veilMailboxPutWithWakeHmac(
-            _handle,
-            recv,
-            content,
-            sender,
-            blobPtr,
-            blob.length,
-            pushPtr,
-            pushEnvelope?.length ?? 0,
-            tokenPtr,
-            capabilityToken?.length ?? 0,
-            wakePtr,
-            wakeHmacEnvelope.length,
-            outEvicted,
-            errOut,
-          );
-        } else if (tokenPtr == nullptr) {
-          rc = ffi.veilMailboxPut(
-            _handle,
-            recv,
-            content,
-            sender,
-            blobPtr,
-            blob.length,
-            pushPtr,
-            pushEnvelope?.length ?? 0,
-            outEvicted,
-            errOut,
-          );
-        } else {
-          rc = ffi.veilMailboxPutWithCapability(
-            _handle,
-            recv,
-            content,
-            sender,
-            blobPtr,
-            blob.length,
-            pushPtr,
-            pushEnvelope?.length ?? 0,
-            tokenPtr,
-            capabilityToken!.length,
-            outEvicted,
-            errOut,
-          );
-        }
-
-        if (rc < 0) {
-          throw VeilException(
-            'mailbox_put failed: ${_readErrAndFree(errOut)}',
-            code: rc,
-          );
-        }
-        return MailboxPutResult(
-          status: MailboxPutStatus.fromWire(rc),
-          evicted: outEvicted.value,
-        );
-      } finally {
-        calloc.free(recv);
-        calloc.free(content);
-        calloc.free(sender);
-        if (blobPtr != nullptr) calloc.free(blobPtr);
-        if (pushPtr != nullptr) calloc.free(pushPtr);
-        if (tokenPtr != nullptr) {
-          // capabilityToken is a receiver-signed capability secret — wipe before free.
-          zeroizeNative(tokenPtr, capabilityToken!.length);
-          calloc.free(tokenPtr);
-        }
-        // wakeHmacEnvelope is a sealed (relay-opaque) blob already published
-        // in the receiver's rendezvous ad — not a device-local secret, so a
-        // plain free (like pushPtr) is sufficient.
-        if (wakePtr != nullptr) calloc.free(wakePtr);
-        calloc.free(outEvicted);
-        calloc.free(errOut);
-      }
-    });
+    // Blocking onion deposit to the relay — off-isolate via a TOP-LEVEL worker
+    // (sendable captures only) so a slow/unreachable relay never blocks the
+    // calling isolate or freezes the UI. MailboxPutResult is plain data.
+    final handleAddr = _handle.address;
+    return Isolate.run(() => _putWorker(handleAddr, receiverId, contentId,
+        senderId, blob, pushEnvelope, capabilityToken, wakeHmacEnvelope));
   }
 
   /// Fetch all blobs currently pending for [receiverId].  [authCookie]
@@ -238,107 +119,12 @@ class VeilMailbox {
       await prev;
     } catch (_) {}
     try {
-      // NOTE: stays on the calling isolate (Future). Isolate.run here was
-      // unsendable (Class: VeilMailbox), breaking the drain. Re-do off-isolate
-      // via a top-level worker once verified.
-      return await Future(() {
-        final recv = calloc<Uint8>(32);
-        final cookie = calloc<Uint8>(16);
-        final outCount = calloc<Uint32>();
-        final errOut = calloc<Pointer<Utf8>>();
-        try {
-          recv.asTypedList(32).setAll(0, receiverId);
-          cookie.asTypedList(16).setAll(0, authCookie);
-
-          // Step 1: count.  Daemon caches the result internally.
-          final rc1 = ffi.veilMailboxFetchCount(
-            _handle,
-            recv,
-            cookie,
-            outCount,
-            errOut,
-          );
-          if (rc1 != ffi.veilOk) {
-            throw VeilException(
-              'mailbox_fetch_count failed: ${_readErrAndFree(errOut)}',
-              code: rc1,
-            );
-          }
-          final count = outCount.value;
-          if (count == 0) return <MailboxBlob>[];
-          // diff-audit M23: clamp the daemon-supplied count BEFORE allocating.
-          // `count` is a raw Uint32; a buggy/hostile daemon returning e.g.
-          // 0xFFFFFFFF would calloc ~375 GiB of descriptors and OOM-crash the app.
-          // A legitimate mailbox fetch never returns more than a few thousand
-          // blobs, so reject anything implausible.
-          const maxPendingBlobs = 8192;
-          if (count > maxPendingBlobs) {
-            throw VeilException(
-              'mailbox returned an implausible pending count ($count > '
-              '$maxPendingBlobs) — refusing to allocate',
-              code: ffi.veilErr,
-            );
-          }
-
-          // Step 2: allocate descriptor array + a blob buffer sized at
-          // [veilMaxDataLen] cap (16 MiB) — daemon-side already caps
-          // per-blob, and a pending-list bigger than the cap is a sign of
-          // misconfiguration that the FFI will reject via INVALID_ARG
-          // (it does NOT lose the cache — caller can retry with larger
-          // buffer).  16 MiB is a sane upper bound for a single fetch.
-          const blobBufLen = ffi.veilMaxDataLen;
-          final descriptors = calloc<ffi.VeilMailboxBlobStruct>(count);
-          final blobBuf = calloc<Uint8>(blobBufLen);
-          try {
-            final rc2 = ffi.veilMailboxFetchInto(
-              _handle,
-              descriptors,
-              count,
-              blobBuf,
-              blobBufLen,
-              errOut,
-            );
-            if (rc2 < 0) {
-              throw VeilException(
-                'mailbox_fetch_into failed: ${_readErrAndFree(errOut)}',
-                code: rc2,
-              );
-            }
-            // rc2 = number of descriptors written; copy each blob payload
-            // into a Dart-owned Uint8List before freeing the buffer.
-            final result = <MailboxBlob>[];
-            for (var i = 0; i < rc2; i++) {
-              final d = descriptors[i];
-              final senderId = Uint8List(32);
-              final contentId = Uint8List(32);
-              for (var j = 0; j < 32; j++) {
-                senderId[j] = d.senderId[j];
-                contentId[j] = d.contentId[j];
-              }
-              final blob = d.blobLen > 0
-                  ? Uint8List.fromList(d.blob.asTypedList(d.blobLen))
-                  : Uint8List(0);
-              result.add(MailboxBlob(
-                senderId: senderId,
-                contentId: contentId,
-                depositedAt: d.depositedAt,
-                data: blob,
-              ));
-            }
-            return result;
-          } finally {
-            calloc.free(descriptors);
-            calloc.free(blobBuf);
-          }
-        } finally {
-          calloc.free(recv);
-          // authCookie is a 16-byte mailbox capability secret — wipe before free.
-          zeroizeNative(cookie, 16);
-          calloc.free(cookie);
-          calloc.free(outCount);
-          calloc.free(errOut);
-        }
-      });
+      // The two-call fetch hits the daemon/relay over the network — off-isolate
+      // via a TOP-LEVEL worker (sendable captures only) so the 30s drain never
+      // blocks the calling isolate / UI. The _fetchGate serialization stays here.
+      final handleAddr = _handle.address;
+      return await Isolate.run(
+          () => _fetchWorker(handleAddr, receiverId, authCookie));
     } finally {
       gate.complete();
     }
@@ -419,50 +205,13 @@ class VeilMailbox {
         'maxReplicas must be in 0..255, got $maxReplicas',
       );
     }
-    // NOTE: stays on the calling isolate (Future). An Isolate.run closure here
-    // was unsendable ("object is unsendable - Class: VeilMailbox"), which broke
-    // the stash/drain relay resolution. Re-do off-isolate via a top-level worker.
-    return Future(() {
-      final recv = calloc<Uint8>(32);
-      final outBuf = calloc<Pointer<Uint8>>();
-      final outLen = calloc<IntPtr>();
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        recv.asTypedList(32).setAll(0, receiverId);
-        final rc = ffi.veilLookupRendezvousReplicas(
-          _handle,
-          recv,
-          maxReplicas,
-          outBuf,
-          outLen,
-          errOut,
-        );
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-            'lookup_rendezvous_replicas failed: ${_readErrAndFree(errOut)}',
-            code: rc,
-          );
-        }
-        final bufPtr = outBuf.value;
-        final len = outLen.value;
-        if (bufPtr == nullptr || len == 0) return <RendezvousReplica>[];
-        try {
-          // Copy into Dart-owned memory before parsing so the native
-          // buffer can be freed unconditionally in the inner `finally`.
-          final bytes = Uint8List.fromList(bufPtr.asTypedList(len));
-          return _parseReplicaBuffer(bytes);
-        } finally {
-          // ALWAYS release the daemon-allocated buffer — both on the
-          // happy path AND if parsing throws on a malformed reply.
-          ffi.veilFreeReplicaBuf(bufPtr, len);
-        }
-      } finally {
-        calloc.free(recv);
-        calloc.free(outBuf);
-        calloc.free(outLen);
-        calloc.free(errOut);
-      }
-    });
+    // Blocking DHT FIND (hit on every stash/drain to resolve the receiver's
+    // relay) — off-isolate via a TOP-LEVEL worker (sendable captures only) so it
+    // never blocks the calling isolate / UI. RendezvousReplica is plain data
+    // (sendable across the isolate boundary).
+    final handleAddr = _handle.address;
+    return Isolate.run(
+        () => _lookupReplicasWorker(handleAddr, receiverId, maxReplicas));
   }
 
   /// Seal [data] for [recipient]'s ([appId], [endpointId]) into an offline
@@ -478,54 +227,11 @@ class VeilMailbox {
   }) async {
     _validateId(recipient, 'recipient');
     _validateId(appId, 'appId');
-    // NOTE: stays on the calling isolate (Future). Isolate.run here was
-    // unsendable (Class: VeilMailbox), breaking the offline seal. Re-do
-    // off-isolate via a top-level worker once verified.
-    return Future(() {
-      final rec = calloc<Uint8>(32);
-      final app = calloc<Uint8>(32);
-      final dataPtr = calloc<Uint8>(data.isEmpty ? 1 : data.length);
-      final outBuf = calloc<Pointer<Uint8>>();
-      final outLen = calloc<IntPtr>();
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        rec.asTypedList(32).setAll(0, recipient);
-        app.asTypedList(32).setAll(0, appId);
-        if (data.isNotEmpty) dataPtr.asTypedList(data.length).setAll(0, data);
-        final rc = ffi.veilMailboxSeal(
-          _handle,
-          rec,
-          app,
-          endpointId,
-          dataPtr,
-          data.length,
-          outBuf,
-          outLen,
-          errOut,
-        );
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-            'mailbox_seal failed: ${_readErrAndFree(errOut)}',
-            code: rc,
-          );
-        }
-        final bufPtr = outBuf.value;
-        final len = outLen.value;
-        if (bufPtr == nullptr) return Uint8List(0);
-        try {
-          return Uint8List.fromList(bufPtr.asTypedList(len));
-        } finally {
-          ffi.veilFreeBuf(bufPtr, len);
-        }
-      } finally {
-        calloc.free(rec);
-        calloc.free(app);
-        calloc.free(dataPtr);
-        calloc.free(outBuf);
-        calloc.free(outLen);
-        calloc.free(errOut);
-      }
-    });
+    // ML-KEM cert resolution over the DHT + fan-out encryption — blocking, hit on
+    // every stash. Off-isolate via a TOP-LEVEL worker (sendable captures only).
+    final handleAddr = _handle.address;
+    return Isolate.run(
+        () => _sealWorker(handleAddr, recipient, appId, endpointId, data));
   }
 
   /// Open + verify a fetched mailbox [blob] claimed to be from [sender],
@@ -644,6 +350,244 @@ class MailboxOpened {
 /// Every field read is bounds-checked against [bytes.length]; a short
 /// or inconsistent buffer throws [VeilException] rather than reading
 /// out of range.
+// ── Off-isolate workers (TOP-LEVEL: capture only sendable values) ────────
+// An inline `Isolate.run(() {...})` over these instance methods was captured as
+// unsendable ("object is unsendable - Class: VeilMailbox"); delegating to a
+// top-level function keeps the sent computation free of `this`. The veil handle
+// is a process-global token, re-derived in the worker from its raw int address.
+
+List<RendezvousReplica> _lookupReplicasWorker(
+    int handleAddr, Uint8List receiverId, int maxReplicas) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final recv = calloc<Uint8>(32);
+  final outBuf = calloc<Pointer<Uint8>>();
+  final outLen = calloc<IntPtr>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    recv.asTypedList(32).setAll(0, receiverId);
+    final rc = ffi.veilLookupRendezvousReplicas(
+        handle, recv, maxReplicas, outBuf, outLen, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+          'lookup_rendezvous_replicas failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+    final bufPtr = outBuf.value;
+    final len = outLen.value;
+    if (bufPtr == nullptr || len == 0) return <RendezvousReplica>[];
+    try {
+      final bytes = Uint8List.fromList(bufPtr.asTypedList(len));
+      return _parseReplicaBuffer(bytes);
+    } finally {
+      ffi.veilFreeReplicaBuf(bufPtr, len);
+    }
+  } finally {
+    calloc.free(recv);
+    calloc.free(outBuf);
+    calloc.free(outLen);
+    calloc.free(errOut);
+  }
+}
+
+Uint8List _sealWorker(int handleAddr, Uint8List recipient, Uint8List appId,
+    int endpointId, Uint8List data) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final rec = calloc<Uint8>(32);
+  final app = calloc<Uint8>(32);
+  final dataPtr = calloc<Uint8>(data.isEmpty ? 1 : data.length);
+  final outBuf = calloc<Pointer<Uint8>>();
+  final outLen = calloc<IntPtr>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    rec.asTypedList(32).setAll(0, recipient);
+    app.asTypedList(32).setAll(0, appId);
+    if (data.isNotEmpty) dataPtr.asTypedList(data.length).setAll(0, data);
+    final rc = ffi.veilMailboxSeal(
+        handle, rec, app, endpointId, dataPtr, data.length, outBuf, outLen, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException('mailbox_seal failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+    final bufPtr = outBuf.value;
+    final len = outLen.value;
+    if (bufPtr == nullptr) return Uint8List(0);
+    try {
+      return Uint8List.fromList(bufPtr.asTypedList(len));
+    } finally {
+      ffi.veilFreeBuf(bufPtr, len);
+    }
+  } finally {
+    calloc.free(rec);
+    calloc.free(app);
+    calloc.free(dataPtr);
+    calloc.free(outBuf);
+    calloc.free(outLen);
+    calloc.free(errOut);
+  }
+}
+
+MailboxPutResult _putWorker(
+    int handleAddr,
+    Uint8List receiverId,
+    Uint8List contentId,
+    Uint8List senderId,
+    Uint8List blob,
+    Uint8List? pushEnvelope,
+    Uint8List? capabilityToken,
+    Uint8List? wakeHmacEnvelope) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final recv = calloc<Uint8>(32);
+  final content = calloc<Uint8>(32);
+  final sender = calloc<Uint8>(32);
+  final blobPtr = blob.isEmpty ? nullptr : calloc<Uint8>(blob.length);
+  final pushPtr = (pushEnvelope == null || pushEnvelope.isEmpty)
+      ? nullptr
+      : calloc<Uint8>(pushEnvelope.length);
+  final tokenPtr = (capabilityToken == null || capabilityToken.isEmpty)
+      ? nullptr
+      : calloc<Uint8>(capabilityToken.length);
+  final wakePtr = (wakeHmacEnvelope == null || wakeHmacEnvelope.isEmpty)
+      ? nullptr
+      : calloc<Uint8>(wakeHmacEnvelope.length);
+  final outEvicted = calloc<Uint32>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    recv.asTypedList(32).setAll(0, receiverId);
+    content.asTypedList(32).setAll(0, contentId);
+    sender.asTypedList(32).setAll(0, senderId);
+    if (blob.isNotEmpty) blobPtr.asTypedList(blob.length).setAll(0, blob);
+    if (pushEnvelope != null && pushEnvelope.isNotEmpty) {
+      pushPtr.asTypedList(pushEnvelope.length).setAll(0, pushEnvelope);
+    }
+    if (capabilityToken != null && capabilityToken.isNotEmpty) {
+      tokenPtr.asTypedList(capabilityToken.length).setAll(0, capabilityToken);
+    }
+    if (wakeHmacEnvelope != null && wakeHmacEnvelope.isNotEmpty) {
+      wakePtr.asTypedList(wakeHmacEnvelope.length).setAll(0, wakeHmacEnvelope);
+    }
+    final int rc;
+    if (wakeHmacEnvelope != null && wakeHmacEnvelope.isNotEmpty) {
+      rc = ffi.veilMailboxPutWithWakeHmac(
+          handle,
+          recv,
+          content,
+          sender,
+          blobPtr,
+          blob.length,
+          pushPtr,
+          pushEnvelope?.length ?? 0,
+          tokenPtr,
+          capabilityToken?.length ?? 0,
+          wakePtr,
+          wakeHmacEnvelope.length,
+          outEvicted,
+          errOut);
+    } else if (tokenPtr == nullptr) {
+      rc = ffi.veilMailboxPut(handle, recv, content, sender, blobPtr, blob.length,
+          pushPtr, pushEnvelope?.length ?? 0, outEvicted, errOut);
+    } else {
+      rc = ffi.veilMailboxPutWithCapability(
+          handle,
+          recv,
+          content,
+          sender,
+          blobPtr,
+          blob.length,
+          pushPtr,
+          pushEnvelope?.length ?? 0,
+          tokenPtr,
+          capabilityToken!.length,
+          outEvicted,
+          errOut);
+    }
+    if (rc < 0) {
+      throw VeilException('mailbox_put failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+    return MailboxPutResult(
+        status: MailboxPutStatus.fromWire(rc), evicted: outEvicted.value);
+  } finally {
+    calloc.free(recv);
+    calloc.free(content);
+    calloc.free(sender);
+    if (blobPtr != nullptr) calloc.free(blobPtr);
+    if (pushPtr != nullptr) calloc.free(pushPtr);
+    if (tokenPtr != nullptr) {
+      zeroizeNative(tokenPtr, capabilityToken!.length);
+      calloc.free(tokenPtr);
+    }
+    if (wakePtr != nullptr) calloc.free(wakePtr);
+    calloc.free(outEvicted);
+    calloc.free(errOut);
+  }
+}
+
+List<MailboxBlob> _fetchWorker(
+    int handleAddr, Uint8List receiverId, Uint8List authCookie) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final recv = calloc<Uint8>(32);
+  final cookie = calloc<Uint8>(16);
+  final outCount = calloc<Uint32>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    recv.asTypedList(32).setAll(0, receiverId);
+    cookie.asTypedList(16).setAll(0, authCookie);
+    final rc1 = ffi.veilMailboxFetchCount(handle, recv, cookie, outCount, errOut);
+    if (rc1 != ffi.veilOk) {
+      throw VeilException(
+          'mailbox_fetch_count failed: ${_readErrAndFree(errOut)}', code: rc1);
+    }
+    final count = outCount.value;
+    if (count == 0) return <MailboxBlob>[];
+    const maxPendingBlobs = 8192;
+    if (count > maxPendingBlobs) {
+      throw VeilException(
+          'mailbox returned an implausible pending count ($count > '
+          '$maxPendingBlobs) — refusing to allocate',
+          code: ffi.veilErr);
+    }
+    const blobBufLen = ffi.veilMaxDataLen;
+    final descriptors = calloc<ffi.VeilMailboxBlobStruct>(count);
+    final blobBuf = calloc<Uint8>(blobBufLen);
+    try {
+      final rc2 = ffi.veilMailboxFetchInto(
+          handle, descriptors, count, blobBuf, blobBufLen, errOut);
+      if (rc2 < 0) {
+        throw VeilException(
+            'mailbox_fetch_into failed: ${_readErrAndFree(errOut)}', code: rc2);
+      }
+      final result = <MailboxBlob>[];
+      for (var i = 0; i < rc2; i++) {
+        final d = descriptors[i];
+        final senderId = Uint8List(32);
+        final contentId = Uint8List(32);
+        for (var j = 0; j < 32; j++) {
+          senderId[j] = d.senderId[j];
+          contentId[j] = d.contentId[j];
+        }
+        final blob = d.blobLen > 0
+            ? Uint8List.fromList(d.blob.asTypedList(d.blobLen))
+            : Uint8List(0);
+        result.add(MailboxBlob(
+            senderId: senderId,
+            contentId: contentId,
+            depositedAt: d.depositedAt,
+            data: blob));
+      }
+      return result;
+    } finally {
+      calloc.free(descriptors);
+      calloc.free(blobBuf);
+    }
+  } finally {
+    calloc.free(recv);
+    zeroizeNative(cookie, 16);
+    calloc.free(cookie);
+    calloc.free(outCount);
+    calloc.free(errOut);
+  }
+}
+
 List<RendezvousReplica> _parseReplicaBuffer(Uint8List bytes) {
   final data = ByteData.sublistView(bytes);
   final total = bytes.length;
