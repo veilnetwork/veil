@@ -6953,6 +6953,7 @@ impl NodeServices {
         };
         use veil_types::AnonOnionSendError;
 
+        const AD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
         const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
         if self.identity.sovereign_identity.is_none() {
@@ -6963,15 +6964,16 @@ impl NodeServices {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        // Resolve the best currently-valid ad across the recipient's replica
-        // slots. verify_rendezvous_ad binds receiver_node_id↔issuer_pk; we also
-        // reject an ad replicated into the wrong slot.
-        let mut chosen: Option<veil_anonymity::rendezvous::RendezvousAd> = None;
-        for idx in 0..MAX_RENDEZVOUS_AD_SLOTS {
+        // Resolve all recipient replica slots concurrently. Empty slots are
+        // common on tiny DHTs; doing them sequentially multiplies the DHT miss
+        // timeout and can exceed the IPC reply budget before a live slot is
+        // reached.
+        let walks = (0..MAX_RENDEZVOUS_AD_SLOTS).map(|idx| {
             let key = rendezvous_ad_dht_key_at(&receiver_node_id, idx);
-            let Some(bytes) = self.dht_recursive_get(key, RESOLVE_TIMEOUT).await else {
-                continue;
-            };
+            async move { self.dht_recursive_get(key, AD_RESOLVE_TIMEOUT).await }
+        });
+        let mut ads = Vec::with_capacity(MAX_RENDEZVOUS_AD_SLOTS as usize);
+        for bytes in futures::future::join_all(walks).await.into_iter().flatten() {
             let Ok(ad) = decode_rendezvous_ad(&bytes) else {
                 continue;
             };
@@ -6981,9 +6983,13 @@ impl NodeServices {
             {
                 continue;
             }
-            chosen = Some(ad);
-            break;
+            ads.push(ad);
         }
+        // If stale pre-fix ads are still alive in the DHT, the fresh online ad
+        // has the highest rolling valid_until. Pick that one instead of the
+        // lowest-numbered valid slot.
+        ads.sort_by(|a, b| b.valid_until_unix.cmp(&a.valid_until_unix));
+        let chosen = ads.into_iter().next();
         let Some(ad) = chosen else {
             return Err(AnonOnionSendError::NoRendezvous);
         };
