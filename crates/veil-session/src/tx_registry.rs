@@ -223,12 +223,22 @@ impl SessionTxRegistry {
     /// Returns:
     /// * `Some(rx)` — accepted as the canonical session.  Caller proceeds.
     /// * `None` — caller is the loser; should `shutdown()` the stream.
+    /// `evict_open_on_dedup` — when the policy would otherwise reject because an
+    /// OPEN same-`peer_id` session already exists, REPLACE it instead: drop the
+    /// stale sender (closing its channel ⇒ the old runner's outbox drain returns
+    /// `Break` ⇒ it exits and frees its slot) and register the new one. The caller
+    /// sets this ONLY for a LEARNED inbound (a NAT'd client re-dialing): such a
+    /// peer only reconnects once ITS side has given up the old link, so
+    /// latest-wins is correct and immediately clears an M5 zombie's tx (which
+    /// otherwise blocks every reconnect until the liveness ceiling reaps it).
+    /// `false` preserves strict first-wins dedup — the mesh path always passes it.
     pub fn try_register_directional(
         &mut self,
         peer_id: impl Into<NodeId>,
         local_node_id: &NodeIdBytes,
         new_is_outbound: bool,
         bypass_directional: bool,
+        evict_open_on_dedup: bool,
     ) -> Option<mpsc::Receiver<PriorityFrame>> {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
@@ -257,13 +267,18 @@ impl SessionTxRegistry {
 
         // Policy-compliant.  Accept iff no existing session OR existing
         // is stale (closed).  Don't replace a live policy-compliant
-        // session — the first to register wins for that direction.
+        // session — the first to register wins for that direction — UNLESS
+        // `evict_open_on_dedup` (a LEARNED inbound reconnect): then the new
+        // session evicts the open-but-likely-zombie one (fall through to the
+        // remove+insert below; dropping the old sender exits its runner).
         if let Some(existing) = self.senders.get(&peer_id)
             && !existing.is_closed()
+            && !evict_open_on_dedup
         {
             return None;
         }
-        // Stale entry survived prune_closed (rare race) — remove + insert fresh.
+        // Stale entry survived prune_closed (rare race), OR we are evicting an
+        // open session for a learned reconnect — remove + insert fresh.
         self.senders.remove(&peer_id);
         self.last_active.remove(&peer_id);
 
@@ -573,7 +588,7 @@ mod tests {
         let peer = [0xc1u8; 32]; // smaller (e.g. a bootstrap)
         // Without bypass: policy rejects the larger side's outbound (the bug).
         assert!(
-            reg.try_register_directional(peer, &local, true, false)
+            reg.try_register_directional(peer, &local, true, false, false)
                 .is_none(),
             "directional policy rejects larger-node_id outbound"
         );
@@ -581,7 +596,7 @@ mod tests {
         // channel stays open for the has_session assertion — dropping it would
         // close the sender and read as no-session.
         let _rx = reg
-            .try_register_directional(peer, &local, true, true)
+            .try_register_directional(peer, &local, true, true, false)
             .expect("bypass lets the larger side keep its outbound to a bootstrap");
         assert!(reg.has_session(&peer), "accepted session is registered");
     }
@@ -596,21 +611,59 @@ mod tests {
 
         let mut reg = SessionTxRegistry::new();
         assert!(
-            reg.try_register_directional(larger, &smaller, true, false)
+            reg.try_register_directional(larger, &smaller, true, false, false)
                 .is_some(),
             "canonical smaller→larger outbound accepted"
         );
 
         let mut reg2 = SessionTxRegistry::new();
         assert!(
-            reg2.try_register_directional(smaller, &larger, true, false)
+            reg2.try_register_directional(smaller, &larger, true, false, false)
                 .is_none(),
             "non-canonical larger→smaller outbound rejected (glare dedup)"
         );
         assert!(
-            reg2.try_register_directional(smaller, &larger, false, false)
+            reg2.try_register_directional(smaller, &larger, false, false, false)
                 .is_some(),
             "canonical inbound (larger keeps inbound) accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn learned_reconnect_eviction_replaces_open_session() {
+        let mut reg = SessionTxRegistry::new();
+        // A learned NAT'd client re-dialing arrives INBOUND with bypass=true
+        // (the directional tiebreak is bypassed for learned peers — 6d390ef).
+        let local = [0x10u8; 32];
+        let peer = [0x90u8; 32];
+
+        // First learned inbound registers and stays open (hold its rx).
+        let mut rx1 = reg
+            .try_register_directional(peer, &local, false, true, false)
+            .expect("first learned inbound accepted");
+        assert!(reg.has_session(&peer));
+
+        // Reconnect WITHOUT the evict flag ⇒ strict first-wins dedup (this is the
+        // mesh path's behaviour); the open session is kept, the newcomer rejected.
+        assert!(
+            reg.try_register_directional(peer, &local, false, true, false)
+                .is_none(),
+            "open session ⇒ strict dedup when evict flag is false"
+        );
+        assert!(reg.has_session(&peer));
+
+        // Learned reconnect WITH the evict flag ⇒ replace the open (zombie)
+        // session with the fresh one.
+        let _rx2 = reg
+            .try_register_directional(peer, &local, false, true, true)
+            .expect("learned reconnect evicts the open session");
+        assert!(reg.has_session(&peer), "fresh session registered");
+        // The OLD sender was dropped, so its receiver is now disconnected — this
+        // is exactly what makes the stale runner's outbox drain return Break and
+        // exit (releasing its slot), instead of zombie-blocking every reconnect.
+        assert!(
+            matches!(rx1.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "evicted session's channel closes so its runner reaps itself"
         );
     }
 }
