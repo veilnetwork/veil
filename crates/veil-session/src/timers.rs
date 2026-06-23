@@ -158,6 +158,14 @@ impl SessionTimers {
                 >= self.idle_timeout * LIVENESS_CEILING_MULTIPLE
     }
 
+    /// Age of the last GENUINE peer frame (never advanced by `note_swap`).
+    /// Production accessor used by the keepalive-probe re-eval teardown so a
+    /// session that received genuine data inside the keepalive window is NOT
+    /// reaped even if its KeepaliveAck ledger looks stale.
+    pub fn genuine_rx_age(&self, now: Instant) -> Duration {
+        now.duration_since(self.last_genuine_rx)
+    }
+
     /// Mark a received-frame event. Resets BOTH `last_rx` and `last_genuine_rx`
     /// to `now`; caller also resets the per-stall-event `stall_trigger_fired`
     /// flag since "peer is responsive again".
@@ -283,6 +291,29 @@ mod tests {
         assert!(
             timers.liveness_ceiling_elapsed(t0 + Duration::from_secs(15)),
             "swap-loop must not mask a vanished peer past the liveness ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_rx_age_tracks_last_genuine_rx_and_ignores_swap() {
+        let mut timers = SessionTimers::new(Duration::from_secs(10), Duration::from_secs(5));
+        let t0 = timers.last_genuine_rx();
+        // age at +6s == 6s.
+        assert_eq!(
+            timers.genuine_rx_age(t0 + Duration::from_secs(6)),
+            Duration::from_secs(6)
+        );
+        // note_swap must NOT advance the genuine-RX ticker, so age keeps growing.
+        timers.note_swap(t0 + Duration::from_secs(4));
+        assert_eq!(
+            timers.genuine_rx_age(t0 + Duration::from_secs(8)),
+            Duration::from_secs(8)
+        );
+        // A genuine frame resets it.
+        timers.note_frame_received(t0 + Duration::from_secs(8));
+        assert_eq!(
+            timers.genuine_rx_age(t0 + Duration::from_secs(9)),
+            Duration::from_secs(1)
         );
     }
 

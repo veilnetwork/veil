@@ -296,6 +296,33 @@ pub(crate) fn hot_standby_should_auto_fire(enabled: bool, reason: &str) -> bool 
     enabled && reason != "primary_closed"
 }
 
+/// Per-episode warm-probe swap-attempt ceiling for the M5 re-eval teardown.
+pub(crate) const KEEPALIVE_SWAP_ATTEMPT_CEILING: u32 = 2;
+
+/// Pure teardown decision for the re-evaluable keepalive-probe-timeout path.
+/// Reaps ONLY when the probe ledger is stale AND no genuine inbound has
+/// arrived within the window AND failover is exhausted (no warm probe OR the
+/// swap-attempt ceiling is hit). `probe_timeout == 0` short-circuits to false
+/// (keepalive-disabled sessions are never reaped). Inputs are only Durations +
+/// scalars: no `SessionRunner`, no clock, no I/O.
+#[must_use]
+pub(crate) fn should_reeval_teardown(
+    probe_age: std::time::Duration,
+    probe_timeout: std::time::Duration,
+    swap_attempts: u32,
+    ceiling: u32,
+    last_genuine_rx_age: std::time::Duration,
+    hot_standby_ok: bool,
+) -> bool {
+    if probe_timeout.is_zero() {
+        return false;
+    }
+    let probe_stale = probe_age >= probe_timeout;
+    let genuine_stale = last_genuine_rx_age >= probe_timeout;
+    let no_failover = !hot_standby_ok || swap_attempts >= ceiling;
+    probe_stale && genuine_stale && no_failover
+}
+
 /// Session rekey trigger thresholds.
 ///
 /// Either threshold firing alone triggers an X25519 ephemeral rekey:
@@ -2771,6 +2798,11 @@ impl SessionRunner {
         // flight does NOT advance the timestamp.
         let mut pending_keepalive_probe = crate::keepalive_emit::PendingKeepaliveProbe::new();
         let mut keepalive_probe_trigger = crate::once_trigger::OnceTrigger::new();
+        // Per-episode warm-probe swap-attempt counter (M5 re-eval). Counts
+        // warm-probe spawns since the FIRST keepalive-probe-timeout fire of the
+        // current zombie episode. Reset to 0 on inbound KeepaliveAck (TX
+        // confirmed) and on a completed SwapStream (TX re-established).
+        let mut keepalive_swap_attempts: u32 = 0u32;
         // Timeout = 1 × keepalive_interval. A healthy peer acks within
         // < 1 s on a LAN, so waiting one full interval for the ack is
         // already generous. Initial c.2.2 shipped with 2 ×
@@ -3050,22 +3082,67 @@ impl SessionRunner {
                     // the signal that no failover is available, and
                     // letting the session zombie indefinitely is strictly
                     // worse than forcing a fresh reconnect.
+                    // Stage A: FIRST probe-timeout fire of the episode — arm the
+                    // trigger, attempt the first warm-probe spawn, count it. Do
+                    // NOT return here (re-eval below decides reap).
                     if keepalive_enabled
                         && !keepalive_probe_trigger.has_fired()
                         && keepalive_probe_timeout > std::time::Duration::ZERO
                         && let Some(t) = pending_keepalive_probe.oldest()
                         && now.duration_since(t) >= keepalive_probe_timeout
                         && keepalive_probe_trigger.try_fire()
-                        && !self.fire_hot_standby_trigger("keepalive_probe_timeout")
                     {
+                        let spawned = self.fire_hot_standby_trigger("keepalive_probe_timeout");
+                        keepalive_swap_attempts = keepalive_swap_attempts.saturating_add(1);
                         self.logger.info(
-                            "session.keepalive.timeout_close",
+                            "session.keepalive.probe_fired",
                             format!(
-                                "peer_id={} — no warm-probe available, tearing down zombie session",
+                                "peer_id={} warm_probe_spawned={spawned} attempt={keepalive_swap_attempts}",
                                 hex_short(&self.peer_id),
                             ),
                         );
-                        return;
+                    }
+                    // Stage B: RE-EVAL each keepalive tick while the trigger stays
+                    // fired (no KeepaliveAck cleared the ledger). The dedicated
+                    // probe wake is dropped after first fire
+                    // (compute_sleep_deadline gates on !fired) so this arm is
+                    // woken by next_keepalive every keepalive_interval; budget
+                    // ~2×probe_timeout + 1×interval. Re-spawn (bump counter) each
+                    // tick until an ack clears it or the helper says reap.
+                    else if keepalive_enabled
+                        && keepalive_probe_trigger.has_fired()
+                        && keepalive_probe_timeout > std::time::Duration::ZERO
+                        && let Some(t) = pending_keepalive_probe.oldest()
+                    {
+                        let probe_age = now.duration_since(t);
+                        if probe_age >= keepalive_probe_timeout {
+                            let spawned =
+                                self.fire_hot_standby_trigger("keepalive_probe_timeout");
+                            keepalive_swap_attempts =
+                                keepalive_swap_attempts.saturating_add(1);
+                            let genuine_age = timers.genuine_rx_age(now);
+                            if should_reeval_teardown(
+                                probe_age,
+                                keepalive_probe_timeout,
+                                keepalive_swap_attempts,
+                                KEEPALIVE_SWAP_ATTEMPT_CEILING,
+                                genuine_age,
+                                spawned,
+                            ) {
+                                self.logger.info(
+                                    "session.keepalive.timeout_close",
+                                    format!(
+                                        "peer_id={} — probe unacked {}ms, genuine_rx stale {}ms, swap_attempts={} (ceiling {}); reaping zombie",
+                                        hex_short(&self.peer_id),
+                                        probe_age.as_millis(),
+                                        genuine_age.as_millis(),
+                                        keepalive_swap_attempts,
+                                        KEEPALIVE_SWAP_ATTEMPT_CEILING,
+                                    ),
+                                );
+                                return;
+                            }
+                        }
                     }
                 }
                 // Rekey-threshold checks — both no-op unless a fresh
@@ -3209,6 +3286,13 @@ impl SessionRunner {
                         // rx-stall condition, so a subsequent stall can
                         // legitimately re-fire the trigger.
                         stall_trigger.clear();
+                        // A make-before-break swap re-established TX on a fresh
+                        // path, so the stale keepalive-probe ledger must reset —
+                        // else should_reeval_teardown trips on the NEXT keepalive
+                        // tick of the new transport (swap-reap race).
+                        pending_keepalive_probe.clear();
+                        keepalive_probe_trigger.clear();
+                        keepalive_swap_attempts = 0;
                         continue;
                     }
                     NextInput::RpcRequest(req) => {
@@ -3591,6 +3675,7 @@ impl SessionRunner {
                 );
                 pending_keepalive_probe.clear();
                 keepalive_probe_trigger.clear();
+                keepalive_swap_attempts = 0;
             }
 
             // ── Intercept RPC responses before general dispatch ───────────────
@@ -3979,5 +4064,90 @@ mod m1_empty_frame_aead_tests {
             .open(&bytes[HEADER_SIZE..], &aad)
             .expect("sealed empty frame must open");
         assert!(pt.is_empty(), "sealed empty frame opens to empty plaintext");
+    }
+}
+
+#[cfg(test)]
+mod reeval_teardown_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    const CEILING: u32 = KEEPALIVE_SWAP_ATTEMPT_CEILING;
+
+    /// (a) KeepaliveAck-before-2x: failover not exhausted → no teardown.
+    #[test]
+    fn ack_before_2x_no_teardown() {
+        assert!(!should_reeval_teardown(
+            TIMEOUT, // probe_age stale
+            TIMEOUT, 1, // swap_attempts < ceiling (2)
+            CEILING, TIMEOUT, // genuine stale
+            true, // hot_standby_ok
+        ));
+    }
+
+    /// (b) Fresh genuine RX protects even with attempts past ceiling + no
+    /// hot standby.
+    #[test]
+    fn fresh_genuine_rx_no_teardown() {
+        assert!(!should_reeval_teardown(
+            TIMEOUT,
+            TIMEOUT,
+            5,
+            CEILING,
+            TIMEOUT / 2, // genuine NOT stale
+            false,
+        ));
+    }
+
+    /// (c) THE core MUST-FIX #1 case: a multi-transport / learned-alt_uri
+    /// relay keeps hot_standby_ok == true forever, yet the ceiling reaps the
+    /// zombie once swap_attempts == ceiling.
+    #[test]
+    fn multi_transport_learned_alt_uri_reaps_at_ceiling() {
+        assert!(should_reeval_teardown(
+            TIMEOUT,
+            TIMEOUT,
+            CEILING, // == ceiling
+            CEILING,
+            TIMEOUT, // genuine stale
+            true,    // hot_standby_ok STAYS true — ceiling overrides
+        ));
+    }
+
+    /// (d) Probe not yet stale → no teardown.
+    #[test]
+    fn probe_not_stale_no_teardown() {
+        assert!(!should_reeval_teardown(
+            TIMEOUT / 2, // probe_age < timeout
+            TIMEOUT,
+            CEILING,
+            CEILING,
+            TIMEOUT,
+            false,
+        ));
+    }
+
+    /// (e) Zero probe_timeout (keepalive disabled) → never reap.
+    #[test]
+    fn zero_timeout_no_teardown() {
+        assert!(!should_reeval_teardown(
+            TIMEOUT,
+            Duration::ZERO,
+            CEILING,
+            CEILING,
+            TIMEOUT,
+            false,
+        ));
+    }
+
+    /// (f) Original M5 no-warm-probe case: no hot standby, first re-eval,
+    /// both stale → reap immediately.
+    #[test]
+    fn no_failover_first_reeval() {
+        assert!(should_reeval_teardown(
+            TIMEOUT, TIMEOUT, 0, // swap_attempts 0
+            CEILING, TIMEOUT, false, // no warm probe
+        ));
     }
 }
