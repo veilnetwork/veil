@@ -22,6 +22,7 @@ use crate::handle::AppHandle;
 /// instead of a UI hang. 5 s is generous for local IPC; per-call
 /// override is a future API addition if operators need it.
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAILBOX_SEAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// Helper for the common `tokio::oneshot::Receiver<T>` await pattern
 /// used by all RPC-shaped client methods. Folds three error cases
@@ -1809,7 +1810,15 @@ impl VeilClient {
         self.writer
             .write_frame(LocalAppMsg::MailboxSeal as u16, &payload.encode())
             .await?;
-        let reply = await_rpc_reply(rx, "mailbox_seal reply").await?;
+        let reply = match tokio::time::timeout(MAILBOX_SEAL_REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(_)) => return Err(ClientError::ConnectionClosed),
+            Err(_) => {
+                return Err(ClientError::Protocol(
+                    "timeout waiting for mailbox_seal reply".into(),
+                ));
+            }
+        };
         match reply.status {
             veilcore::proto::MailboxCryptoStatus::Ok => Ok(reply.blob),
             other => Err(ClientError::Protocol(format!("mailbox_seal failed: {other:?}"))),

@@ -2889,6 +2889,38 @@ impl RuntimeAnonOnionSender {
     }
 }
 
+fn replicas_from_freshest_ads(
+    mut ads: Vec<veil_anonymity::rendezvous::RendezvousAd>,
+    cap: usize,
+) -> Vec<veil_ipc::ResolvedReplica> {
+    ads.sort_by(|a, b| {
+        b.valid_until_unix
+            .cmp(&a.valid_until_unix)
+            .then_with(|| a.rendezvous_node_id.cmp(&b.rendezvous_node_id))
+    });
+
+    let mut out = Vec::with_capacity(cap);
+    let mut seen_relays: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    for ad in ads {
+        if !seen_relays.insert(ad.rendezvous_node_id) {
+            continue;
+        }
+        out.push(veil_ipc::ResolvedReplica {
+            relay_node_id: ad.rendezvous_node_id,
+            valid_until_unix: ad.valid_until_unix,
+            push_envelope: ad.push_envelope,
+            capability_token: ad.capability_token,
+            wake_hmac_envelope: ad.wake_hmac_envelope,
+            rendezvous_kem_algo: ad.rendezvous_kem_algo,
+            rendezvous_kem_pk: ad.rendezvous_kem_pk,
+        });
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out
+}
+
 impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
     fn send_authenticated<'a>(
         &'a self,
@@ -3112,12 +3144,6 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
             // legacy single-key publishers, so pre-T1.4 senders still
             // see one entry; new senders see all K configured slots.
             let cap = max_replicas.max(1).min(MAX_RENDEZVOUS_AD_SLOTS as usize);
-            let mut out = Vec::with_capacity(cap);
-            // Dedup by (relay_node_id) — operator misconfig that
-            // registers the same relay twice (different cookies)
-            // shouldn't show up as two replicas to the sender.
-            let mut seen_relays: std::collections::HashSet<[u8; 32]> =
-                std::collections::HashSet::new();
             // Walk all slots CONCURRENTLY — bounded total ≈ ONE walk's timeout,
             // not cap × timeout — so resolve_replicas returns within the IPC
             // reply window (5s) even when every slot misses (e.g. the ad hasn't
@@ -3149,6 +3175,7 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                     .await
                 }
             });
+            let mut ads = Vec::with_capacity(cap);
             for bytes in futures::future::join_all(walks).await.into_iter().flatten() {
                 let ad = match decode_rendezvous_ad(&bytes) {
                     Ok(a) => a,
@@ -3163,28 +3190,12 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                 {
                     continue;
                 }
-                if !seen_relays.insert(ad.rendezvous_node_id) {
-                    // Duplicate relay across slots — keep the first.
-                    continue;
-                }
-                out.push(veil_ipc::ResolvedReplica {
-                    relay_node_id: ad.rendezvous_node_id,
-                    valid_until_unix: ad.valid_until_unix,
-                    push_envelope: ad.push_envelope,
-                    capability_token: ad.capability_token,
-                    // Epic 489.10 slice 4.4: surface the sealed wake-HMAC envelope
-                    // so the sender can propagate it into the mailbox PUT.
-                    wake_hmac_envelope: ad.wake_hmac_envelope,
-                    // v5: the relay's KEM key — the seal target for an anonymous
-                    // mailbox deposit at this relay.
-                    rendezvous_kem_algo: ad.rendezvous_kem_algo,
-                    rendezvous_kem_pk: ad.rendezvous_kem_pk,
-                });
-                if out.len() >= cap {
-                    break;
-                }
+                ads.push(ad);
             }
-            out
+            // Prefer the freshest signed ad before relay dedup. This avoids
+            // returning a stale pre-cookie-fix ad just because it was in a
+            // lower-numbered slot for the same relay.
+            replicas_from_freshest_ads(ads, cap)
         })
     }
 }
@@ -3429,6 +3440,65 @@ mod tests {
             tls_cert: None,
             tls_ca_cert: None,
         }
+    }
+
+    fn test_rendezvous_ad(
+        relay_tag: u8,
+        valid_until_unix: u64,
+        kem_tag: u8,
+    ) -> veil_anonymity::rendezvous::RendezvousAd {
+        veil_anonymity::rendezvous::RendezvousAd {
+            receiver_node_id: [0x11; 32],
+            rendezvous_node_id: [relay_tag; 32],
+            auth_cookie: [0x22; 16],
+            receiver_x25519_pk: [0x33; 32],
+            valid_from_unix: 1_700_000_000,
+            valid_until_unix,
+            issuer_pk: String::new(),
+            issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
+            signature: Vec::new(),
+            push_envelope: Vec::new(),
+            capability_token: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: vec![kem_tag; 32],
+            wire_version: 5,
+        }
+    }
+
+    #[test]
+    fn rendezvous_replicas_prefer_freshest_before_relay_dedup() {
+        let stale_same_relay = test_rendezvous_ad(0xA1, 100, 1);
+        let fresh_other_relay = test_rendezvous_ad(0xB2, 200, 2);
+        let fresh_same_relay = test_rendezvous_ad(0xA1, 300, 3);
+
+        let out = replicas_from_freshest_ads(
+            vec![stale_same_relay, fresh_other_relay, fresh_same_relay],
+            8,
+        );
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].relay_node_id, [0xA1; 32]);
+        assert_eq!(out[0].valid_until_unix, 300);
+        assert_eq!(out[0].rendezvous_kem_pk, vec![3; 32]);
+        assert_eq!(out[1].relay_node_id, [0xB2; 32]);
+        assert_eq!(out[1].valid_until_unix, 200);
+    }
+
+    #[test]
+    fn rendezvous_replicas_respect_cap_after_freshness_sort() {
+        let out = replicas_from_freshest_ads(
+            vec![
+                test_rendezvous_ad(0xA1, 100, 1),
+                test_rendezvous_ad(0xB2, 300, 2),
+                test_rendezvous_ad(0xC3, 200, 3),
+            ],
+            1,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].relay_node_id, [0xB2; 32]);
+        assert_eq!(out[0].valid_until_unix, 300);
     }
 
     #[test]
