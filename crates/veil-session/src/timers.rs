@@ -3,9 +3,13 @@
 //! computation and the keepalive / cover-traffic / idle / rx-stall
 //! handlers:
 //!
-//! * `last_rx` — last successful frame-byte read (idle-timeout
-//!   ticker; stage (c.2) rx-stall threshold; sole input to the
-//!   `now - last_rx >= idle_timeout` check at runner.rs:1416)
+//! * `last_rx` — last successful frame-byte read OR transport swap
+//!   (idle-timeout ticker; stage (c.2) rx-stall threshold; sole input
+//!   to the `now - last_rx >= idle_timeout` check at runner.rs:1416)
+//! * `last_genuine_rx` — last successful frame-byte read ONLY (swaps
+//!   excluded); input to the hard liveness ceiling
+//!   (`liveness_ceiling_elapsed`) that reaps a session whose peer is
+//!   gone but whose `last_rx` a hot-standby swap-loop keeps refreshing
 //! * `next_keepalive` — scheduled time of the next outbound Keepalive
 //!   (jittered to defeat per-session timing fingerprints)
 //! * `next_cover` — scheduled time of the next outbound cover-Padding
@@ -33,8 +37,23 @@ use tokio::time::Instant;
 
 use crate::runner::{COVER_TRAFFIC_INTERVAL, jitter_cover_interval, jitter_keepalive_interval};
 
+/// Hard liveness ceiling as a multiple of `idle_timeout`. A session that has
+/// received NO genuine peer frame for this many idle-windows is torn down
+/// unconditionally — the backstop for the M5 zombie where a hot-standby swap
+/// keeps resetting `last_rx` (so the normal idle timeout never fires) while the
+/// NAT'd peer is actually gone. 3× the idle window sits well past any legitimate
+/// swap's first-frame latency (a live transport sees a keepalive every
+/// `keepalive_interval` ≤ idle_timeout), so only a truly dead session trips it.
+const LIVENESS_CEILING_MULTIPLE: u32 = 3;
+
 pub struct SessionTimers {
     last_rx: Instant,
+    /// Last GENUINE peer frame (advanced only by `note_frame_received`, never by
+    /// `note_swap`). `last_rx` is reset by a transport swap too, which is correct
+    /// for the normal idle window (a fresh transport deserves a fresh window) but
+    /// lets a doomed swap-loop mask a dead peer forever. `last_genuine_rx` ignores
+    /// swaps, so [`Self::liveness_ceiling_elapsed`] can reap that zombie.
+    last_genuine_rx: Instant,
     next_keepalive: Instant,
     next_cover: Instant,
     keepalive_interval: Duration,
@@ -55,6 +74,7 @@ impl SessionTimers {
         let now = Instant::now();
         Self {
             last_rx: now,
+            last_genuine_rx: now,
             next_keepalive: now + jitter_keepalive_interval(keepalive_interval),
             next_cover: now + jitter_cover_interval(COVER_TRAFFIC_INTERVAL),
             keepalive_interval,
@@ -73,6 +93,11 @@ impl SessionTimers {
     #[cfg(test)]
     pub fn last_rx(&self) -> Instant {
         self.last_rx
+    }
+
+    #[cfg(test)]
+    pub fn last_genuine_rx(&self) -> Instant {
+        self.last_genuine_rx
     }
 
     pub fn keepalive_enabled(&self) -> bool {
@@ -121,17 +146,32 @@ impl SessionTimers {
         self.idle_enabled && now.duration_since(self.last_rx) >= self.idle_timeout * 2 / 3
     }
 
-    /// Mark a received-frame event. Resets `last_rx` to `now`; caller
-    /// also resets the per-stall-event `stall_trigger_fired` flag
-    /// since "peer is responsive again".
-    pub fn note_frame_received(&mut self, now: Instant) {
-        self.last_rx = now;
+    /// Hard liveness ceiling: has [`LIVENESS_CEILING_MULTIPLE`]×idle_timeout
+    /// elapsed since the last GENUINE peer frame? Unlike [`Self::idle_timeout_elapsed`]
+    /// this ignores transport swaps (`note_swap`), so a hot-standby probe-loop
+    /// against a peer that is actually gone can no longer keep the session alive
+    /// indefinitely. Gated on `idle_enabled` (same configuration switch as the
+    /// idle timeout) so keepalive-disabled relay/test sessions are unaffected.
+    pub fn liveness_ceiling_elapsed(&self, now: Instant) -> bool {
+        self.idle_enabled
+            && now.duration_since(self.last_genuine_rx)
+                >= self.idle_timeout * LIVENESS_CEILING_MULTIPLE
     }
 
-    /// Mark a transport-swap event. Same effect as
-    /// `note_frame_received`: the swap itself is activity, and any
-    /// previously-fired stall trigger is cleared (caller's
-    /// responsibility).
+    /// Mark a received-frame event. Resets BOTH `last_rx` and `last_genuine_rx`
+    /// to `now`; caller also resets the per-stall-event `stall_trigger_fired`
+    /// flag since "peer is responsive again".
+    pub fn note_frame_received(&mut self, now: Instant) {
+        self.last_rx = now;
+        self.last_genuine_rx = now;
+    }
+
+    /// Mark a transport-swap event. Resets `last_rx` (the new transport deserves
+    /// a fresh idle window) but DELIBERATELY NOT `last_genuine_rx`: a swap is our
+    /// own recovery activity, not proof the peer is reachable. Only a real frame
+    /// (`note_frame_received`) advances the genuine-RX ticker, so a doomed
+    /// swap-loop still trips [`Self::liveness_ceiling_elapsed`]. Any previously-
+    /// fired stall trigger is cleared (caller's responsibility).
     pub fn note_swap(&mut self, now: Instant) {
         self.last_rx = now;
     }
@@ -215,6 +255,53 @@ mod tests {
             !timers.idle_timeout_elapsed(t0 + Duration::from_secs(7)),
             "fresh frame ⇒ idle ticker resets"
         );
+    }
+
+    #[tokio::test]
+    async fn liveness_ceiling_fires_at_three_times_idle() {
+        // idle=5 ⇒ ceiling=15.
+        let timers = SessionTimers::new(Duration::from_secs(10), Duration::from_secs(5));
+        let t0 = timers.last_genuine_rx();
+        assert!(!timers.liveness_ceiling_elapsed(t0 + Duration::from_secs(14)));
+        assert!(timers.liveness_ceiling_elapsed(t0 + Duration::from_secs(15)));
+    }
+
+    #[tokio::test]
+    async fn note_swap_does_not_reset_liveness_ceiling() {
+        // THE zombie property: a hot-standby swap-loop must NOT keep a dead peer's
+        // session alive. note_swap refreshes the idle ticker but NOT the genuine-RX
+        // ticker, so the ceiling still fires.
+        let mut timers = SessionTimers::new(Duration::from_secs(10), Duration::from_secs(5));
+        let t0 = timers.last_genuine_rx();
+        // Swap every 4 s (well inside both idle=5 and ceiling=15)...
+        timers.note_swap(t0 + Duration::from_secs(4));
+        timers.note_swap(t0 + Duration::from_secs(8));
+        timers.note_swap(t0 + Duration::from_secs(12));
+        // ...idle ticker keeps getting refreshed, so idle never trips:
+        assert!(!timers.idle_timeout_elapsed(t0 + Duration::from_secs(15)));
+        // ...but the genuine-RX ticker never moved, so the ceiling DOES trip:
+        assert!(
+            timers.liveness_ceiling_elapsed(t0 + Duration::from_secs(15)),
+            "swap-loop must not mask a vanished peer past the liveness ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_frame_received_resets_liveness_ceiling() {
+        let mut timers = SessionTimers::new(Duration::from_secs(10), Duration::from_secs(5));
+        let t0 = timers.last_genuine_rx();
+        // A genuine frame at 14 s resets the ceiling ticker...
+        timers.note_frame_received(t0 + Duration::from_secs(14));
+        // ...so at 15 s (was the ceiling) we're fine, and only 3×idle LATER trips.
+        assert!(!timers.liveness_ceiling_elapsed(t0 + Duration::from_secs(15)));
+        assert!(timers.liveness_ceiling_elapsed(t0 + Duration::from_secs(29)));
+    }
+
+    #[tokio::test]
+    async fn liveness_ceiling_disabled_when_idle_disabled() {
+        let timers = SessionTimers::new(Duration::from_secs(10), Duration::ZERO);
+        assert!(!timers.idle_enabled());
+        assert!(!timers.liveness_ceiling_elapsed(Instant::now() + Duration::from_secs(100_000)));
     }
 
     #[tokio::test]
