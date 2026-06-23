@@ -22,7 +22,13 @@ use crate::handle::AppHandle;
 /// instead of a UI hang. 5 s is generous for local IPC; per-call
 /// override is a future API addition if operators need it.
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const MAILBOX_SEAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+/// Longer budget for the DHT-resolve-backed RPCs (mailbox_seal,
+/// lookup_rendezvous_replicas): resolving a recipient's rendezvous ad does
+/// concurrent recursive DHT walks (~3.5s each on a cold/tiny routing table) plus
+/// signature verification, which races the 5s default and surfaces as a spurious
+/// reply timeout — driving the outbox to retry (duplicate live deliveries) and
+/// briefly block the UI. 12s clears the worst-case resolve with margin.
+const DHT_RESOLVE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// Helper for the common `tokio::oneshot::Receiver<T>` await pattern
 /// used by all RPC-shaped client methods. Folds three error cases
@@ -1509,7 +1515,7 @@ impl VeilClient {
                 &payload.encode(),
             )
             .await?;
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        match tokio::time::timeout(DHT_RESOLVE_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(entries)) => Ok(entries),
             Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
             Err(_) => Err(ClientError::Protocol(
@@ -1810,7 +1816,7 @@ impl VeilClient {
         self.writer
             .write_frame(LocalAppMsg::MailboxSeal as u16, &payload.encode())
             .await?;
-        let reply = match tokio::time::timeout(MAILBOX_SEAL_REQUEST_TIMEOUT, rx).await {
+        let reply = match tokio::time::timeout(DHT_RESOLVE_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(reply)) => reply,
             Ok(Err(_)) => return Err(ClientError::ConnectionClosed),
             Err(_) => {
