@@ -136,6 +136,138 @@ void _registerRendezvousPublisherWorker(
   }
 }
 
+// The four anonymous-send entrypoints below were originally wrapped in
+// `Future(() {...})`, which only DEFERS the work to a later microtask on the
+// SAME isolate — the synchronous, network-blocking FFI still ran on the UI
+// isolate. On a busy/slow node (mobile, NAT'd relay churn) the send can block
+// for seconds; on Android a >5s block on the main thread is a fatal ANR, which
+// is exactly what crashed the phone (chronic ANRs parked in
+// `veil_send_anonymous_*`). Mirroring peers()/seal()/lookup(), these now run on
+// a worker isolate via `Isolate.run` so a blocking send can never freeze the UI
+// (or ANR-kill the app). The send remains fire-and-forget from the caller's POV.
+
+void _sendAnonymousDirectWorker(
+  int handleAddr,
+  Uint8List targetNodeId,
+  Uint8List targetX25519Pk,
+  Uint8List targetAppId,
+  int targetEndpointId,
+  Uint8List srcAppId,
+  int hopCount,
+  Uint8List data,
+) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final nodeId = calloc<Uint8>(32);
+  final x25519 = calloc<Uint8>(32);
+  final appId = calloc<Uint8>(32);
+  final srcApp = calloc<Uint8>(32);
+  final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    nodeId.asTypedList(32).setAll(0, targetNodeId);
+    x25519.asTypedList(32).setAll(0, targetX25519Pk);
+    appId.asTypedList(32).setAll(0, targetAppId);
+    srcApp.asTypedList(32).setAll(0, srcAppId);
+    if (data.isNotEmpty) {
+      dataPtr.asTypedList(data.length).setAll(0, data);
+    }
+    final rc = ffi.veilSendAnonymousDirect(handle, nodeId, x25519, appId,
+        targetEndpointId, srcApp, hopCount, dataPtr, data.length, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+          'send_anonymous_direct failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+  } finally {
+    calloc.free(nodeId);
+    calloc.free(x25519);
+    calloc.free(appId);
+    calloc.free(srcApp);
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
+void _sendAnonymousAuthenticatedWorker(int appAddr, Uint8List dstNodeId,
+    Uint8List dstAppId, int dstEndpointId, Uint8List data) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final dstNode = calloc<Uint8>(32);
+  final dstApp = calloc<Uint8>(32);
+  final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    dstNode.asTypedList(32).setAll(0, dstNodeId);
+    dstApp.asTypedList(32).setAll(0, dstAppId);
+    if (data.isNotEmpty) {
+      dataPtr.asTypedList(data.length).setAll(0, data);
+    }
+    final rc = ffi.veilSendAnonymousAuthenticated(
+        app, dstNode, dstApp, dstEndpointId, dataPtr, data.length, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+          'anonymous authenticated send failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+  } finally {
+    calloc.free(dstNode);
+    calloc.free(dstApp);
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
+void _sendAnonymousAuthenticatedWithReplyWorker(
+    int appAddr,
+    Uint8List dstNodeId,
+    Uint8List dstAppId,
+    int dstEndpointId,
+    int replyEndpointId,
+    Uint8List data) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final dstNode = calloc<Uint8>(32);
+  final dstApp = calloc<Uint8>(32);
+  final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    dstNode.asTypedList(32).setAll(0, dstNodeId);
+    dstApp.asTypedList(32).setAll(0, dstAppId);
+    if (data.isNotEmpty) {
+      dataPtr.asTypedList(data.length).setAll(0, data);
+    }
+    final rc = ffi.veilSendAnonymousAuthenticatedWithReply(app, dstNode, dstApp,
+        dstEndpointId, replyEndpointId, dataPtr, data.length, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+          'anonymous authenticated send failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+  } finally {
+    calloc.free(dstNode);
+    calloc.free(dstApp);
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
+void _sendReplyWorker(int appAddr, int replyId, Uint8List data) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    if (data.isNotEmpty) {
+      dataPtr.asTypedList(data.length).setAll(0, data);
+    }
+    final rc = ffi.veilSendReply(app, replyId, dataPtr, data.length, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException('reply send failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+  } finally {
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
 /// GC-time safety-net: if a Dart `VeilClient` becomes unreachable
 /// without calling [VeilClient.close], the finalizer fires
 /// `veil_close` to release the daemon-side handle.  Explicit close
@@ -540,37 +672,17 @@ class VeilClient implements Finalizable {
       throw ArgumentError(
           'target_node_id, target_x25519_pk, target_app_id and src_app_id must be 32 bytes');
     }
-    return Future(() {
-      final nodeId = calloc<Uint8>(32);
-      final x25519 = calloc<Uint8>(32);
-      final appId = calloc<Uint8>(32);
-      final srcApp = calloc<Uint8>(32);
-      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        nodeId.asTypedList(32).setAll(0, targetNodeId);
-        x25519.asTypedList(32).setAll(0, targetX25519Pk);
-        appId.asTypedList(32).setAll(0, targetAppId);
-        srcApp.asTypedList(32).setAll(0, srcAppId);
-        if (data.isNotEmpty) {
-          dataPtr.asTypedList(data.length).setAll(0, data);
-        }
-        final rc = ffi.veilSendAnonymousDirect(_handle, nodeId, x25519, appId,
-            targetEndpointId, srcApp, hopCount, dataPtr, data.length, errOut);
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-              'send_anonymous_direct failed: ${_readErrAndFree(errOut)}',
-              code: rc);
-        }
-      } finally {
-        calloc.free(nodeId);
-        calloc.free(x25519);
-        calloc.free(appId);
-        calloc.free(srcApp);
-        if (dataPtr != nullptr) calloc.free(dataPtr);
-        calloc.free(errOut);
-      }
-    });
+    final handleAddr = _handle.address;
+    return Isolate.run(() => _sendAnonymousDirectWorker(
+          handleAddr,
+          targetNodeId,
+          targetX25519Pk,
+          targetAppId,
+          targetEndpointId,
+          srcAppId,
+          hopCount,
+          data,
+        ));
   }
 
   /// Consume a bootstrap-invite URI (Epic 489.7) — typically scanned
@@ -1450,31 +1562,9 @@ class AppHandle implements Finalizable {
     if (dstNodeId.length != 32 || dstAppId.length != 32) {
       throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
     }
-    return Future(() {
-      final dstNode = calloc<Uint8>(32);
-      final dstApp = calloc<Uint8>(32);
-      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        dstNode.asTypedList(32).setAll(0, dstNodeId);
-        dstApp.asTypedList(32).setAll(0, dstAppId);
-        if (data.isNotEmpty) {
-          dataPtr.asTypedList(data.length).setAll(0, data);
-        }
-        final rc = ffi.veilSendAnonymousAuthenticated(
-            _app, dstNode, dstApp, dstEndpointId, dataPtr, data.length, errOut);
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-              'anonymous authenticated send failed: ${_readErrAndFree(errOut)}',
-              code: rc);
-        }
-      } finally {
-        calloc.free(dstNode);
-        calloc.free(dstApp);
-        if (dataPtr != nullptr) calloc.free(dataPtr);
-        calloc.free(errOut);
-      }
-    });
+    final appAddr = _app.address;
+    return Isolate.run(() => _sendAnonymousAuthenticatedWorker(
+        appAddr, dstNodeId, dstAppId, dstEndpointId, data));
   }
 
   /// Like [sendAnonymousAuthenticated], but attach a one-time reply block so the
@@ -1492,31 +1582,9 @@ class AppHandle implements Finalizable {
     if (dstNodeId.length != 32 || dstAppId.length != 32) {
       throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
     }
-    return Future(() {
-      final dstNode = calloc<Uint8>(32);
-      final dstApp = calloc<Uint8>(32);
-      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        dstNode.asTypedList(32).setAll(0, dstNodeId);
-        dstApp.asTypedList(32).setAll(0, dstAppId);
-        if (data.isNotEmpty) {
-          dataPtr.asTypedList(data.length).setAll(0, data);
-        }
-        final rc = ffi.veilSendAnonymousAuthenticatedWithReply(_app, dstNode,
-            dstApp, dstEndpointId, replyEndpointId, dataPtr, data.length, errOut);
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-              'anonymous authenticated send failed: ${_readErrAndFree(errOut)}',
-              code: rc);
-        }
-      } finally {
-        calloc.free(dstNode);
-        calloc.free(dstApp);
-        if (dataPtr != nullptr) calloc.free(dataPtr);
-        calloc.free(errOut);
-      }
-    });
+    final appAddr = _app.address;
+    return Isolate.run(() => _sendAnonymousAuthenticatedWithReplyWorker(
+        appAddr, dstNodeId, dstAppId, dstEndpointId, replyEndpointId, data));
   }
 
   /// Reply to a message received over the authenticated anonymous transport,
@@ -1527,24 +1595,8 @@ class AppHandle implements Finalizable {
     required Uint8List data,
   }) async {
     _ensureOpen();
-    return Future(() {
-      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        if (data.isNotEmpty) {
-          dataPtr.asTypedList(data.length).setAll(0, data);
-        }
-        final rc =
-            ffi.veilSendReply(_app, replyId, dataPtr, data.length, errOut);
-        if (rc != ffi.veilOk) {
-          throw VeilException('reply send failed: ${_readErrAndFree(errOut)}',
-              code: rc);
-        }
-      } finally {
-        if (dataPtr != nullptr) calloc.free(dataPtr);
-        calloc.free(errOut);
-      }
-    });
+    final appAddr = _app.address;
+    return Isolate.run(() => _sendReplyWorker(appAddr, replyId, data));
   }
 
   /// Open a reliable bidirectional byte-stream to a remote endpoint.
