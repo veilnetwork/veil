@@ -133,6 +133,11 @@ impl NodeRuntime {
         let dispatcher_for_gossip = Arc::clone(&self.dispatcher);
         let dht_for_tick = Arc::clone(&self.dht);
         let session_tx_registry_for_tick = Arc::clone(&self.session_tx_registry);
+        // Components for the proactive relay-directory prefetch below (so the
+        // onion-service circuit build finds its hop keys in get_local instead of
+        // failing-and-retrying every 150 s until they passively replicate).
+        let pending_recursive_for_onion = Arc::clone(&self.dispatcher.pending_recursive);
+        let local_node_id_for_onion = self.dispatcher.local_node_id;
         // Whole-services handle so the tick can rebuild hosted onion-service
         // circuits before their TTL lapses (no-op unless this node registered an
         // onion service via `register_onion_circuit`).
@@ -306,6 +311,62 @@ impl NodeRuntime {
                             &publish_logger,
                             Some(&session_tx_registry_for_tick),
                         );
+                        // Proactively populate the local relay-directory cache
+                        // for the CONNECTED relays (the onion-circuit hop
+                        // candidates). The onion-service build resolves each
+                        // hop's X25519 key ONLY from get_local and FAILS the
+                        // whole build on a miss, retrying just once per 150 s
+                        // tick — so after a restart (empty cache) the receive
+                        // path could stay dark for many minutes while it waits
+                        // for entries to passively replicate (the client is not
+                        // K-closest to them, so it never gets a replica). Each
+                        // connected relay answers its OWN relay-directory entry
+                        // from its get_local in ONE hop, so a direct-peer
+                        // FIND_VALUE resolves it immediately. Bounded + cheap:
+                        // skips relays already cached; only the connected set.
+                        {
+                            use veil_anonymity::directory::{
+                                decode_entry, relay_directory_dht_key, verify_entry,
+                            };
+                            let relays: Vec<[u8; 32]> = session_tx_registry_for_tick
+                                .read()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .peer_ids();
+                            for relay in relays {
+                                let key = relay_directory_dht_key(&relay);
+                                if dht_for_publish.get_local(&key).is_some() {
+                                    continue;
+                                }
+                                if let Some(bytes) = crate::mlkem_resolver::recursive_dht_get(
+                                    &dht_for_publish,
+                                    &session_tx_registry_for_tick,
+                                    &pending_recursive_for_onion,
+                                    local_node_id_for_onion,
+                                    key,
+                                    std::time::Duration::from_millis(3500),
+                                    Some(relay), // connected-peer fast path
+                                    move |b| {
+                                        matches!(
+                                            decode_entry(b),
+                                            Ok(e) if e.node_id == relay
+                                                && verify_entry(&e).is_ok()
+                                        )
+                                    },
+                                )
+                                .await
+                                {
+                                    // Re-verify the REMOTE response before caching
+                                    // (recursive_dht_get gates is_valid only on the
+                                    // local fast path, not the fetched bytes).
+                                    if matches!(
+                                        decode_entry(&bytes),
+                                        Ok(e) if e.node_id == relay && verify_entry(&e).is_ok()
+                                    ) {
+                                        dht_for_publish.store_local(key, bytes);
+                                    }
+                                }
+                            }
+                        }
                         // Rebuild hosted onion-service circuits nearing their TTL.
                         access_for_onion.maintain_onion_circuits(
                             std::time::SystemTime::now()
