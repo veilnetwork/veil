@@ -791,14 +791,21 @@ pub async fn register_connection_session(
         let remote_nid = *remote_identity.node_id.as_bytes();
         let local_nid = *runtime.identity.local_identity.node_id.as_bytes();
         let new_is_outbound = matches!(source, SessionSource::Outbound(_));
+        // Source of the matched peer record (if any). Drives BOTH the directional
+        // bypass and reconnect-eviction eligibility below: Configured/Bootstrap is
+        // the mutually-dialing mesh; Exchanged/Autodiscovered is a LEARNED peer we
+        // may be unable to dial back (e.g. a NAT'd client behind symmetric NAT).
+        let matched_source = matched_peer_id
+            .and_then(|pid| lock_state(&runtime.state).peers.get(&pid).map(|e| e.source));
         // E20 directional-dedup is only sound when BOTH peers may dial each
         // other (real glare). Bypass it for one-sided connections, otherwise
         // the larger-node_id side is stranded at zero sessions:
         //   * outbound to a bootstrap — it has no prior knowledge of us and
         //     never dials back (observed: any node whose node_id sorted after
         //     every bootstrap node_id could never join the mesh);
-        //   * inbound from a peer we have no configured entry for — we will
-        //     never dial them, so no glare is possible.
+        //   * inbound from a learned/no-record peer — we will never dial them,
+        //     so no glare is possible. See `inbound_bypasses_directional`; the
+        //     configured mesh (Configured/Bootstrap) still gets the tiebreak.
         let bypass_directional = bypass_directional_override
             || if new_is_outbound {
                 matched_peer_id
@@ -810,30 +817,41 @@ pub async fn register_connection_session(
                     })
                     .unwrap_or(false)
             } else {
-                // Inbound: bypass the directional tiebreak unless this is a
-                // CONFIGURED mutual-dial peer. A no-record peer was always
-                // bypassed (no glare possible); now a dynamically-LEARNED peer
-                // (PEX/autodiscovered — possibly a NAT'd client we cannot dial
-                // back) is too, so the convention can't strand it by assigning
-                // the unreachable seed→peer direction. The configured mesh
-                // (Configured/Bootstrap) still gets the deterministic tiebreak.
-                // See `inbound_bypasses_directional`.
-                let matched_source = matched_peer_id.and_then(|pid| {
-                    lock_state(&runtime.state).peers.get(&pid).map(|e| e.source)
-                });
                 inbound_bypasses_directional(matched_source)
             };
+        // A LEARNED inbound (a NAT'd client re-dialing) may EVICT a stale
+        // same-node_id session instead of being deduped against it. The peer only
+        // reconnects once ITS side abandoned the old link, so latest-wins is
+        // correct AND immediately releases an M5 zombie's tx (otherwise every
+        // reconnect is deduped until the liveness ceiling reaps it). Gated by the
+        // SAME `inbound_bypasses_directional` classifier (6d390ef) that excludes
+        // the mutually-dialing mesh, so this cannot reintroduce the seed-mesh
+        // glare loop that the un-gated replace-on-dedup caused (reverted f053067).
+        let evict_stale_on_dedup = !new_is_outbound && inbound_bypasses_directional(matched_source);
         let reserved_outbox_rx = {
             let mut reg = runtime
                 .session_tx_registry
                 .write()
                 .unwrap_or_else(|p| p.into_inner());
-            reg.try_register_directional(
+            let evicted_open = evict_stale_on_dedup && reg.has_session(&remote_nid);
+            let rx = reg.try_register_directional(
                 remote_nid,
                 &local_nid,
                 new_is_outbound,
                 bypass_directional,
-            )
+                evict_stale_on_dedup,
+            );
+            if evicted_open && rx.is_some() {
+                runtime.logger.info(
+                    "session.reconnect_evict",
+                    format!(
+                        "node_id={} — learned inbound reconnect evicted a stale \
+                         session's tx (fast M5-zombie clear)",
+                        veil_util::hex_short(&remote_nid),
+                    ),
+                );
+            }
+            rx
         };
         let reserved_outbox_rx = match reserved_outbox_rx {
             Some(rx) => rx,
