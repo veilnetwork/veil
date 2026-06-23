@@ -514,9 +514,19 @@ pub(crate) async fn rendezvous_recipient_recheck(
     local_node_id: &[u8; 32],
     cookie: [u8; 16],
     log_key: &'static str,
+    force: bool,
 ) {
     let current_ok = current.is_some_and(|r| rendezvous_session_live(live_sessions, &r));
-    if current_ok {
+    if current_ok && !force {
+        return;
+    }
+    // force==true (event-driven wake): re-register with the CURRENT relay even
+    // though its session reads Active — it may be a zombie (relay RST'd + dropped
+    // our subscriber while info.state stays Active) or a transport-swapped path;
+    // either way the relay's in-memory subscriber map may not list us. A fresh
+    // RegisterRendezvous is one idempotent frame.
+    if current_ok && force && let Some(relay) = *current {
+        let _ = rendezvous_register_with(session_tx_registry, anonymity, &relay, cookie);
         return;
     }
     // Cold-start: actively pull + verify connected peers' relay-directory
@@ -1572,6 +1582,7 @@ impl NodeRuntime {
                                     &local_node_id,
                                     cookie,
                                     "anonymity.rendezvous_recipient.registered",
+                                    false,
                                 )
                                 .await;
                             } else if ticks.is_multiple_of(RENDEZVOUS_REREGISTER_EVERY_TICKS) {
@@ -1642,6 +1653,7 @@ impl NodeRuntime {
                                         &local_node_id,
                                         cookie,
                                         "anonymity.rendezvous_recipient.event_driven_reregister",
+                                        true,
                                     )
                                     .await;
                                 }
