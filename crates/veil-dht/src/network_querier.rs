@@ -22,6 +22,7 @@
 //! walker drops the peer naturally. Migration support (capability
 //! negotiation) is /.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -64,6 +65,18 @@ pub struct NetworkPeerQuerier {
     /// the PoW under the matching pair, so a forged or reused PoW
     /// never satisfies anyone else's check.
     local_node_id: [u8; 32],
+    /// Memoised resolve-PoW solutions: target node_id → (time_bucket, nonce).
+    /// A 16-bit PoW is ~65 k BLAKE3 hashes (~7 ms); re-mining it for the SAME
+    /// target on every `ResolveTransport` — which the outbound-connector and
+    /// onion-circuit retry loops do continuously when a peer/hop is unreachable
+    /// — was the dominant CPU cost on a stalled embedded node (profiled ~92%,
+    /// starving the IPC handler so app FFI calls hit their 12 s timeout and the
+    /// UI froze). A solution stays valid for its whole time bucket
+    /// (`RESOLVE_POW_BUCKET_SECONDS`), so reuse it within that window instead of
+    /// re-mining. Reuse is sound — the verifier only checks leading-zero-bits +
+    /// bucket freshness, not nonce uniqueness — and the map self-bounds to the
+    /// current bucket's targets.
+    resolve_pow_cache: Arc<Mutex<HashMap<[u8; 32], (u32, [u8; 16])>>>,
 }
 
 impl NetworkPeerQuerier {
@@ -102,6 +115,7 @@ impl NetworkPeerQuerier {
             find_node_timeout,
             cache,
             local_node_id,
+            resolve_pow_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -131,8 +145,7 @@ impl NetworkPeerQuerier {
     /// 1 M attempts > 2^20 ≫ 2^16); caller should treat it like an RPC
     /// failure and skip the lookup.
     fn build_resolve_transport_frame(&self, request_id: u32, node_id: [u8; 32]) -> Option<Vec<u8>> {
-        let (time_bucket, pow_nonce) =
-            veil_proto::discovery::mine_resolve_pow_now(&self.local_node_id, &node_id)?;
+        let (time_bucket, pow_nonce) = self.resolve_pow_for(node_id)?;
         let body = ResolveTransportPayload {
             node_id,
             time_bucket,
@@ -141,6 +154,38 @@ impl NetworkPeerQuerier {
         .encode()
         .to_vec();
         Some(self.build_frame(DiscoveryMsg::ResolveTransport, request_id, body))
+    }
+
+    /// Return a resolve-PoW for `node_id`, reusing a memoised solution from the
+    /// current time bucket if present, else mining a fresh one and caching it.
+    /// This collapses the repeated ~7 ms mines that a resolve-retry loop would
+    /// otherwise pay for the same target every attempt. The map is pruned to the
+    /// current bucket on each fresh mine so it can't grow unbounded.
+    fn resolve_pow_for(&self, node_id: [u8; 32]) -> Option<(u32, [u8; 16])> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let current_bucket = (now / veil_proto::discovery::RESOLVE_POW_BUCKET_SECONDS) as u32;
+        if let Some(&(bucket, nonce)) = self
+            .resolve_pow_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&node_id)
+            && bucket == current_bucket
+        {
+            return Some((bucket, nonce));
+        }
+        let mined = veil_proto::discovery::mine_resolve_pow_now(&self.local_node_id, &node_id)?;
+        let mut cache = self
+            .resolve_pow_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Drop stale-bucket entries before inserting → bounded by this bucket's
+        // distinct resolve targets.
+        cache.retain(|_, &mut (b, _)| b == mined.0);
+        cache.insert(node_id, mined);
+        Some(mined)
     }
 
     fn build_find_value_frame(&self, request_id: u32, key: [u8; 32]) -> Vec<u8> {
