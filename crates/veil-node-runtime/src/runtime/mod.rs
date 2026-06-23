@@ -1646,7 +1646,21 @@ impl NodeRuntime {
                 || config.anonymity.receive_anonymous
                 || config.anonymity.onion_service
             {
-                let sk = crate::identity_local::anonymity_x25519::load_or_create(&veil_dir_path)?;
+                // Prefer an existing persisted key (long-lived nodes never
+                // rotate); else DERIVE deterministically from the identity seed
+                // so ephemeral-runtime-dir nodes (xVeil clients recreate
+                // veil_dir every session) stop minting a fresh random key each
+                // launch — the churned pubkey silently black-holed delivery to
+                // peers holding an older ad (anonymity.relay_chain.forward
+                // .decrypt_failed). See anonymity_x25519::load_or_derive.
+                let (sk, src) = crate::identity_local::anonymity_x25519::load_or_derive(
+                    &veil_dir_path,
+                    sovereign_identity.is_some(),
+                )?;
+                logger.info(
+                    "node.anonymity_x25519.source",
+                    format!("anonymity x25519 key source={}", src.as_str()),
+                );
                 Some(Arc::new(sk))
             } else {
                 None
