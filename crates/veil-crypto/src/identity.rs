@@ -61,6 +61,48 @@ pub fn derive_master_sk_ed25519(master_seed: &[u8; MASTER_SEED_LEN]) -> Zeroizin
     out
 }
 
+/// Info string for the anonymity / relay X25519 secret derived from an
+/// identity's Ed25519 SK seed. See [`derive_anonymity_x25519_sk`].
+pub const ANONYMITY_X25519_DERIVATION_INFO: &[u8] = b"veil/anonymity-x25519/v1";
+
+/// Derive the node's **anonymity / relay X25519 secret** deterministically
+/// from its per-identity Ed25519 SK seed (`device_identity_sk.bin`).
+///
+/// HKDF-SHA256:
+/// ```text
+/// salt = None
+/// ikm  = identity_sk_seed (32 B, the Ed25519 SK seed)
+/// info = "veil/anonymity-x25519/v1"
+/// okm  = 32 B → x25519_dalek::StaticSecret::from
+/// ```
+///
+/// Why this exists: the anonymity X25519 keypair's PUBLIC half is what peers
+/// encrypt their sealed rendezvous introduces to (it is published in the
+/// node's signed `RelayKeyRecord`/ad, bound to the stable `node_id`). When the
+/// secret was instead `random_from_rng` per process and persisted only in the
+/// **ephemeral** runtime dir (xVeil regenerates that dir every session), the
+/// pubkey churned every launch — so a peer that resolved a slightly-older ad
+/// sealed to a key this node no longer held, and the AEAD silently failed
+/// (`anonymity.relay_chain.forward.decrypt_failed`), black-holing delivery with
+/// no signal to the sender. Deriving from the stable identity seed pins the
+/// keypair across sessions: even a stale cached ad still decrypts.
+///
+/// Anonymity note: this adds NO linkability beyond what is already public —
+/// the pubkey is already published in the signed ad bound to the (already
+/// stable) `node_id`, and the derivation is a one-way PRF that never reveals
+/// the seed. Per-identity isolation is automatic: master and each decoy load
+/// their OWN `device_identity_sk.bin`, so they derive DISTINCT anonymity keys.
+///
+/// Returns the raw 32-byte scalar [`Zeroizing`]-wrapped; the caller feeds it to
+/// `x25519_dalek::StaticSecret::from` (which clamps internally).
+pub fn derive_anonymity_x25519_sk(identity_sk_seed: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, identity_sk_seed);
+    let mut out = Zeroizing::new([0u8; 32]);
+    hk.expand(ANONYMITY_X25519_DERIVATION_INFO, out.as_mut())
+        .expect("32 bytes < 255 * hash_len");
+    out
+}
+
 /// Derive a `node_id` from a public key.
 ///
 /// simplifies this from the previous domain-tag-prefixed shape
@@ -141,6 +183,48 @@ mod tests {
         let a = derive_master_sk_ed25519(&[0x42u8; 32]);
         let b = derive_master_sk_ed25519(&[0x43u8; 32]);
         assert_ne!(*a, *b);
+    }
+
+    #[test]
+    fn anonymity_x25519_derivation_is_deterministic() {
+        let seed = [0x42u8; 32];
+        let a = derive_anonymity_x25519_sk(&seed);
+        let b = derive_anonymity_x25519_sk(&seed);
+        assert_eq!(*a, *b, "same identity seed must yield the same anonymity key");
+    }
+
+    #[test]
+    fn anonymity_x25519_changes_with_seed() {
+        // Cross-identity isolation: master and decoy (distinct seeds) MUST
+        // derive distinct anonymity keys — no cross-identity linkage.
+        let a = derive_anonymity_x25519_sk(&[0x42u8; 32]);
+        let b = derive_anonymity_x25519_sk(&[0x43u8; 32]);
+        assert_ne!(*a, *b);
+    }
+
+    #[test]
+    fn anonymity_x25519_is_domain_separated_from_master_sk() {
+        // Same seed, different info label → different key. Guards against the
+        // anonymity key ever colliding with the identity signing key.
+        let seed = [0x42u8; 32];
+        let anon = derive_anonymity_x25519_sk(&seed);
+        let master = derive_master_sk_ed25519(&seed);
+        assert_ne!(*anon, *master);
+    }
+
+    #[test]
+    fn anonymity_x25519_known_answer_vector() {
+        // KAT: pins the wire-visible derivation for an all-zero seed so a future
+        // refactor that changes the KDF/label (and would silently invalidate
+        // every peer's sealed introduce) fails loudly here. If this ever needs
+        // to change it is a deliberate, coordinated key rotation.
+        let okm = derive_anonymity_x25519_sk(&[0u8; 32]);
+        let hex: String = okm.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "962fb33d42c62c80e1c8ca1f88b0a3a8d23f317020057a8716ca7f56b0d4e89e",
+            "anonymity-x25519 KDF output changed — coordinated rotation only"
+        );
     }
 
     #[test]
