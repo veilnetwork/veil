@@ -144,8 +144,12 @@ impl NetworkPeerQuerier {
     /// nonce in the current minute (vanishingly unlikely at 16 bits —
     /// 1 M attempts > 2^20 ≫ 2^16); caller should treat it like an RPC
     /// failure and skip the lookup.
-    fn build_resolve_transport_frame(&self, request_id: u32, node_id: [u8; 32]) -> Option<Vec<u8>> {
-        let (time_bucket, pow_nonce) = self.resolve_pow_for(node_id)?;
+    async fn build_resolve_transport_frame(
+        &self,
+        request_id: u32,
+        node_id: [u8; 32],
+    ) -> Option<Vec<u8>> {
+        let (time_bucket, pow_nonce) = self.resolve_pow_for(node_id).await?;
         let body = ResolveTransportPayload {
             node_id,
             time_bucket,
@@ -161,22 +165,35 @@ impl NetworkPeerQuerier {
     /// This collapses the repeated ~7 ms mines that a resolve-retry loop would
     /// otherwise pay for the same target every attempt. The map is pruned to the
     /// current bucket on each fresh mine so it can't grow unbounded.
-    fn resolve_pow_for(&self, node_id: [u8; 32]) -> Option<(u32, [u8; 16])> {
+    ///
+    /// A cache MISS mines on `spawn_blocking`, NOT inline: a 16-bit BLAKE3 grind
+    /// must never run on a tokio runtime worker (it would block that worker's
+    /// async tasks — IPC + session I/O — for the mine's duration, the same
+    /// starvation that timed out app FFI calls + hung the UI). PEX + lazy PoW
+    /// already do this; this is the last inline PoW moved off the hot path.
+    async fn resolve_pow_for(&self, node_id: [u8; 32]) -> Option<(u32, [u8; 16])> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let current_bucket = (now / veil_proto::discovery::RESOLVE_POW_BUCKET_SECONDS) as u32;
-        if let Some(&(bucket, nonce)) = self
-            .resolve_pow_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&node_id)
-            && bucket == current_bucket
         {
-            return Some((bucket, nonce));
-        }
-        let mined = veil_proto::discovery::mine_resolve_pow_now(&self.local_node_id, &node_id)?;
+            let cache = self
+                .resolve_pow_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(&(bucket, nonce)) = cache.get(&node_id)
+                && bucket == current_bucket
+            {
+                return Some((bucket, nonce));
+            }
+        } // release the lock BEFORE the await — never hold a std Mutex across .await
+        let local_node_id = self.local_node_id;
+        let mined = tokio::task::spawn_blocking(move || {
+            veil_proto::discovery::mine_resolve_pow_now(&local_node_id, &node_id)
+        })
+        .await
+        .ok()??;
         let mut cache = self
             .resolve_pow_cache
             .lock()
@@ -212,7 +229,7 @@ impl NetworkPeerQuerier {
     /// wrong node_id) is silently rejected here.
     async fn resolve_transport_rpc(&self, peer_id: [u8; 32], node_id: [u8; 32]) -> Option<String> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let frame = self.build_resolve_transport_frame(request_id, node_id)?;
+        let frame = self.build_resolve_transport_frame(request_id, node_id).await?;
         let rx = self.outbox.send_request(peer_id, request_id, frame)?;
         let body = match timeout(self.find_node_timeout, rx).await {
             Ok(Ok(Some(body))) => body,
