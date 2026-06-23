@@ -227,6 +227,77 @@ pub(crate) fn pick_rendezvous_relay(
     Some(eligible[idx])
 }
 
+/// Derive the 16-byte rendezvous auth-cookie DETERMINISTICALLY from a node_id:
+/// the two 16-byte halves XOR-folded. Stable across process restarts and
+/// bit-for-bit identical to the app-side derivation
+/// (`MailboxService._deriveCookie`), so the node's built-in receiver task and the
+/// app's mailbox publisher converge on ONE cookie per identity instead of each
+/// minting a random one. A random cookie made the two mechanisms advertise the
+/// same relay under DIFFERENT cookies, so a sender that resolved one publisher
+/// slot used a cookie the other slot's subscriber never registered → the relay
+/// dropped the introduce (`cookie_unknown`). The node_id is public (it keys the
+/// ad), so a derived cookie reveals nothing the ad does not already.
+pub(crate) fn rendezvous_cookie_from_node_id(node_id: &[u8; 32]) -> [u8; 16] {
+    let mut cookie = [0u8; 16];
+    for i in 0..16 {
+        cookie[i] = node_id[i] ^ node_id[i + 16];
+    }
+    cookie
+}
+
+/// Order two node_ids by Kademlia XOR distance to `anchor`: compare `a ^ anchor`
+/// against `b ^ anchor` as big-endian 256-bit integers.
+fn xor_distance_cmp(anchor: &[u8; 32], a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
+    for i in 0..32 {
+        let (da, db) = (a[i] ^ anchor[i], b[i] ^ anchor[i]);
+        if da != db {
+            return da.cmp(&db);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Like [`pick_rendezvous_relay`] but DETERMINISTIC: among the published-eligible
+/// connected relays, pick the one CLOSEST (Kademlia XOR distance) to `anchor`
+/// (the receiver's own node_id).
+///
+/// A plain rendezvous receiver re-registers on every reconnect/restart and MUST
+/// keep advertising the SAME relay it actually drains. `pick_rendezvous_relay`'s
+/// random draw (M-1) re-picked a fresh relay each time, leaving a trail of stale
+/// ad slots at relays the receiver no longer serviced — so a sender resolving an
+/// old slot deposited into a black hole and incoming delivery silently failed.
+/// XOR-to-anchor is STABLE per identity (collapses the slots to one) yet still
+/// SPREADS load across relays — different receivers anchor to different relays —
+/// and leaks nothing: the chosen relay is published in the ad regardless. The M-1
+/// concern (unpredictable rendezvous point) applies to the LOCATION-anonymous
+/// onion path, which keeps the random `pick_rendezvous_relay`; a plain receiver's
+/// relay is already public in its sovereign-signed ad. Pinned relays still win,
+/// honoured in operator order.
+pub(crate) fn pick_rendezvous_relay_deterministic(
+    live: &LiveSessions,
+    dht: &Arc<veil_dht::KademliaService>,
+    pinned: &[[u8; 32]],
+    anchor: &[u8; 32],
+) -> Option<[u8; 32]> {
+    let connected: Vec<[u8; 32]> = {
+        let g = lock!(live);
+        g.values()
+            .filter(|i| i.state == crate::types::SessionState::Active)
+            .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
+            .collect()
+    };
+    if !pinned.is_empty() {
+        return pinned
+            .iter()
+            .copied()
+            .find(|p| connected.contains(p) && rendezvous_relay_published(dht, p));
+    }
+    connected
+        .into_iter()
+        .filter(|c| rendezvous_relay_published(dht, c))
+        .min_by(|a, b| xor_distance_cmp(anchor, a, b))
+}
+
 /// Cold-start rendezvous discovery: actively FIND_VALUE the relay-directory
 /// entries of our CONNECTED peers and cache the VERIFIED ones locally, so
 /// [`pick_rendezvous_relay`] (which only reads `dht.get_local`) can find a relay
@@ -1331,12 +1402,17 @@ impl NodeRuntime {
                     .map(|n| *n.as_bytes())
             })
             .collect();
-        // Per-process cookie tying our published ad to our relay registration.
-        let mut cookie = [0u8; 16];
-        {
-            use rand_core::RngCore;
-            rand_core::OsRng.fill_bytes(&mut cookie);
-        }
+        // DETERMINISTIC cookie tying our published ad to our relay registration:
+        // XOR-folded from our node_id so it is STABLE across restarts AND bit-for-
+        // bit identical to the app-side mailbox publisher
+        // (`MailboxService._deriveCookie`). A random per-process cookie made the
+        // built-in receiver task and the app's mailbox advertise the SAME relay
+        // under DIFFERENT cookies, so a sender that resolved one publisher slot
+        // used a cookie the other slot's subscriber never registered → the relay
+        // dropped the introduce (`cookie_unknown`) and incoming delivery silently
+        // failed. The node_id is public (it keys the ad), so this leaks nothing.
+        let local_node_id = *self.identity.local_identity.node_id.as_bytes();
+        let cookie = rendezvous_cookie_from_node_id(&local_node_id);
 
         let handle = supervised_spawn(
             Arc::clone(&self.logger),
@@ -1375,7 +1451,12 @@ impl NodeRuntime {
                                     &live_sessions, &dht, &outbox, &logger,
                                 )
                                 .await;
-                                match pick_rendezvous_relay(&live_sessions, &dht, &pinned) {
+                                match pick_rendezvous_relay_deterministic(
+                                    &live_sessions,
+                                    &dht,
+                                    &pinned,
+                                    &local_node_id,
+                                ) {
                                     Some(relay) => {
                                         // Prune the prior (failed) relay's publisher
                                         // slot before adding the new one (L4) — else
@@ -3356,6 +3437,67 @@ mod tests {
         let kept = filter_self_seeds(peers, "ME");
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|p| p.public_key != "ME"));
+    }
+
+    // ── deterministic rendezvous cookie + relay anchor ────────────────────
+
+    #[test]
+    fn rendezvous_cookie_is_deterministic_xor_fold() {
+        let mut id = [0u8; 32];
+        for (i, b) in id.iter_mut().enumerate() {
+            *b = i as u8; // 0,1,..,31
+        }
+        let c = rendezvous_cookie_from_node_id(&id);
+        // XOR-fold: c[i] = id[i] ^ id[i+16]; here i ^ (i+16) == 16 for all i.
+        assert_eq!(c, [16u8; 16]);
+        // Deterministic: same input → same cookie, every call.
+        assert_eq!(c, rendezvous_cookie_from_node_id(&id));
+    }
+
+    #[test]
+    fn rendezvous_cookie_matches_app_side_derivation() {
+        // Mirror of Dart `MailboxService._deriveCookie` (c[i] = id[i] ^ id[i+16]).
+        let id: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7) ^ 0x5a);
+        let want: [u8; 16] = std::array::from_fn(|i| id[i] ^ id[i + 16]);
+        assert_eq!(rendezvous_cookie_from_node_id(&id), want);
+    }
+
+    #[test]
+    fn xor_distance_cmp_orders_by_kademlia_metric() {
+        use std::cmp::Ordering;
+        let anchor = [0u8; 32];
+        let near = {
+            let mut n = [0u8; 32];
+            n[31] = 1; // distance 1
+            n
+        };
+        let far = {
+            let mut f = [0u8; 32];
+            f[0] = 1; // distance 2^248
+            f
+        };
+        assert_eq!(xor_distance_cmp(&anchor, &near, &far), Ordering::Less);
+        assert_eq!(xor_distance_cmp(&anchor, &far, &near), Ordering::Greater);
+        assert_eq!(xor_distance_cmp(&anchor, &near, &near), Ordering::Equal);
+    }
+
+    #[test]
+    fn xor_distance_min_is_stable_and_anchor_relative() {
+        // The closest-to-anchor relay is picked deterministically, and DIFFERENT
+        // anchors (receivers) select DIFFERENT relays from the same set — the
+        // load-spreading property that replaces the old random draw.
+        let relays = [[0x10u8; 32], [0x20u8; 32], [0x30u8; 32]];
+        let pick = |anchor: &[u8; 32]| {
+            *relays
+                .iter()
+                .min_by(|a, b| xor_distance_cmp(anchor, a, b))
+                .unwrap()
+        };
+        // Anchor near 0x10 → picks 0x10; stable across repeated calls.
+        assert_eq!(pick(&[0x11u8; 32]), [0x10u8; 32]);
+        assert_eq!(pick(&[0x11u8; 32]), [0x10u8; 32]);
+        // A different receiver anchors elsewhere → different relay.
+        assert_eq!(pick(&[0x2eu8; 32]), [0x20u8; 32]);
     }
 
     // ── BootstrapWatchdog: decision-fn coverage ──────────────────────────
