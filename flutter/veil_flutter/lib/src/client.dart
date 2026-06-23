@@ -68,6 +68,42 @@ Uint8List? _lookupRelayX25519Worker(int handleAddr, Uint8List nodeId) {
   }
 }
 
+List<VeilPeer> _peersWorker(int handleAddr) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final out = <VeilPeer>[];
+  final errOut = calloc<Pointer<Utf8>>();
+  // The callback is created INSIDE this worker isolate, so `isolateLocal` runs
+  // it inline on this isolate for the duration of veil_peers_list — we
+  // accumulate into `out` directly and return it (plain data, sendable back).
+  final cb = NativeCallable<ffi.VeilPeerCbNative>.isolateLocal(
+    (Pointer<Void> user, Pointer<Uint8> nodeId, int state, int direction,
+        Pointer<Uint8> transport, int transportLen) {
+      final id = Uint8List.fromList(nodeId.asTypedList(32));
+      final uri = transportLen > 0
+          ? utf8.decode(transport.asTypedList(transportLen),
+              allowMalformed: true)
+          : '';
+      out.add(VeilPeer(
+        nodeId: id,
+        state: VeilPeerState.fromWire(state),
+        direction: VeilPeerDirection.fromWire(direction),
+        transport: uri,
+      ));
+    },
+  );
+  try {
+    final rc = ffi.veilPeersList(handle, cb.nativeFunction, nullptr, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException('peers_list failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+    return out;
+  } finally {
+    cb.close();
+    calloc.free(errOut);
+  }
+}
+
 void _registerRendezvousPublisherWorker(
   int handleAddr,
   Uint8List rendezvousNodeId,
@@ -317,40 +353,14 @@ class VeilClient implements Finalizable {
   /// empty list when the daemon reports no sessions.
   Future<List<VeilPeer>> peers() async {
     _ensureOpen();
-    return Future(() {
-      final out = <VeilPeer>[];
-      final errOut = calloc<Pointer<Utf8>>();
-      // Synchronous, same-thread callback: `isolateLocal` runs it inline for
-      // the duration of veil_peers_list, so we accumulate into `out` directly.
-      final cb = NativeCallable<ffi.VeilPeerCbNative>.isolateLocal(
-        (Pointer<Void> user, Pointer<Uint8> nodeId, int state, int direction,
-            Pointer<Uint8> transport, int transportLen) {
-          final id = Uint8List.fromList(nodeId.asTypedList(32));
-          final uri = transportLen > 0
-              ? utf8.decode(transport.asTypedList(transportLen),
-                  allowMalformed: true)
-              : '';
-          out.add(VeilPeer(
-            nodeId: id,
-            state: VeilPeerState.fromWire(state),
-            direction: VeilPeerDirection.fromWire(direction),
-            transport: uri,
-          ));
-        },
-      );
-      try {
-        final rc =
-            ffi.veilPeersList(_handle, cb.nativeFunction, nullptr, errOut);
-        if (rc != ffi.veilOk) {
-          throw VeilException('peers_list failed: ${_readErrAndFree(errOut)}',
-              code: rc);
-        }
-        return out;
-      } finally {
-        cb.close();
-        calloc.free(errOut);
-      }
-    });
+    // veil_peers_list is a BLOCKING FFI that takes the node's session-state
+    // lock; while the node is busy (e.g. a NAT'd-mobile session-churn storm)
+    // that lock is contended, so running it on the calling isolate froze the UI
+    // whenever the peers screen polled it. Off-isolate via a TOP-LEVEL worker
+    // (the handle address is sendable; the result is plain data) so a busy node
+    // can never block the UI. Mirrors the mailbox seal/fetch workers.
+    final handleAddr = _handle.address;
+    return Isolate.run(() => _peersWorker(handleAddr));
   }
 
   /// Register this node as a LOCATION-anonymous (onion) service: the daemon
