@@ -105,7 +105,13 @@ impl IdentityUseCases {
             key_passphrase: None,
             key_passphrase_file: None,
             key_passphrase_prompt: false,
-            lazy_mining: true,
+            // Default OFF: lazy-mining is a CPU-heavy background grind (raising
+            // the identity's anti-sybil difficulty) that is NOT needed for the
+            // node to function — the canonical mine already gives a usable
+            // identity. On resource-constrained / mobile clients it competes with
+            // the latency-critical async runtime. The app opts INTO it via a
+            // setting (composeConfig overrides this per the user's preference).
+            lazy_mining: false,
             // Use the reachable default cap, NOT a hardcoded 64. 64 leading-zero
             // score bits is 2^64 — computationally unreachable — so the
             // `current >= cap` stop in `lazy_miner` never fires and the node
