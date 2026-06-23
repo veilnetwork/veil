@@ -106,7 +106,14 @@ impl IdentityUseCases {
             key_passphrase_file: None,
             key_passphrase_prompt: false,
             lazy_mining: true,
-            max_lazy_difficulty: 64,
+            // Use the reachable default cap, NOT a hardcoded 64. 64 leading-zero
+            // score bits is 2^64 — computationally unreachable — so the
+            // `current >= cap` stop in `lazy_miner` never fires and the node
+            // grinds `pow_score_raw_into` at ~one-core-forever (observed ~92% on
+            // an embedded client, starving IPC → 12s FFI timeouts + UI hangs).
+            // The default (32) is a meaningful anti-sybil target the miner
+            // actually finishes, after which CPU returns to idle.
+            max_lazy_difficulty: crate::model::default_max_lazy_difficulty(),
         })
     }
 
