@@ -2945,6 +2945,31 @@ impl SessionRunner {
                         );
                         return;
                     }
+                    // Hard liveness-ceiling backstop (M5 zombie reaper). When a
+                    // keepalive-probe timeout fires the hot-standby trigger but the
+                    // warm probe can't recover a vanished NAT'd peer, the probe's
+                    // `note_swap` keeps refreshing `last_rx` so `idle_timeout` above
+                    // never fires; the outbox rx stays alive
+                    // (`SessionTxRegistry::has_session` ⇒ true) and EVERY reconnect
+                    // from that peer is deduped (the observed 3000+/peer storm).
+                    // `liveness_ceiling_elapsed` ignores swaps — it tracks only
+                    // genuine peer frames — so a peer that has sent nothing real for
+                    // 3×idle_timeout is torn down unconditionally, releasing the tx
+                    // so the next reconnect succeeds. Mesh-safe by construction: a
+                    // live mesh session receives genuine keepalive frames every
+                    // `keepalive_interval` (≤ idle_timeout), so its genuine-RX ticker
+                    // never ages into the ceiling.
+                    if timers.liveness_ceiling_elapsed(now) {
+                        self.logger.warn(
+                            "session.liveness_ceiling",
+                            format!(
+                                "peer_id={} — no genuine frame past the liveness ceiling; \
+                                 reaping zombie session to release its tx",
+                                hex_short(&self.peer_id),
+                            ),
+                        );
+                        return;
+                    }
                     // stage (c.2): proactive rx-stall trigger.
                     // Fire when rx has been silent for 2/3 of idle_timeout —
                     // the configured idle window gives us the deadline
