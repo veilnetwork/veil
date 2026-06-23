@@ -91,6 +91,91 @@ pub fn load_or_create(veil_dir: &Path) -> std::io::Result<x25519_dalek::StaticSe
     Ok(sk)
 }
 
+/// Derive the anonymity X25519 secret DETERMINISTICALLY from this identity's
+/// Ed25519 SK seed (HKDF-SHA256, domain-separated). The public half is what
+/// peers seal their rendezvous introduces to, so pinning it to the stable
+/// identity seed means the key no longer churns across sessions — even a peer
+/// holding a slightly-stale ad still decrypts. See
+/// [`veil_crypto::identity::derive_anonymity_x25519_sk`].
+pub fn derive_from_identity_seed(
+    seed: &veil_util::sensitive_bytes::SensitiveBytesN<32>,
+) -> x25519_dalek::StaticSecret {
+    let okm = veil_crypto::identity::derive_anonymity_x25519_sk(seed.as_array());
+    // `*okm` copies the 32 bytes into StaticSecret::from (which clamps); `okm`
+    // itself is Zeroizing and wipes on drop.
+    x25519_dalek::StaticSecret::from(*okm)
+}
+
+/// Where the anonymity X25519 secret came from — surfaced at the call site for
+/// field diagnosis (`node.anonymity_x25519.source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonymityKeySource {
+    /// An existing on-disk key file was loaded verbatim (long-lived nodes — no
+    /// rotation).
+    Persisted,
+    /// Derived deterministically from the identity Ed25519 SK seed (the fix for
+    /// ephemeral-runtime-dir nodes such as the xVeil clients).
+    IdentityDerived,
+    /// No persisted key and no usable identity seed — a fresh random key was
+    /// generated and persisted (legacy / identity-less seed daemons).
+    FallbackRandom,
+}
+
+impl AnonymityKeySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Persisted => "persisted",
+            Self::IdentityDerived => "identity_derived",
+            Self::FallbackRandom => "fallback_random",
+        }
+    }
+}
+
+/// Resolve the anonymity X25519 secret, preferring STABILITY across sessions.
+///
+/// Order (first match wins):
+/// 1. An existing persisted `device_anonymity_x25519_sk.bin` — loaded verbatim,
+///    so a long-lived operator/seed node NEVER rotates its key on upgrade.
+/// 2. Else, when this node has a sovereign identity, DERIVE the key from its
+///    Ed25519 SK seed. This is the fix for ephemeral-runtime-dir nodes (xVeil
+///    clients recreate `veil_dir` every session, so step 1 never matches and the
+///    old code minted a fresh RANDOM key each launch — churning the published
+///    pubkey and silently black-holing delivery to peers holding an older ad).
+///    The seed is itself stable across sessions (it is the identity), so the
+///    derived key is too. A sovereign identity with NO Ed25519 seed file
+///    (`NotFound`, e.g. a Falcon multi-device node) falls through to step 3.
+/// 3. Else, generate + persist a fresh random key (legacy [`load_or_create`]).
+///
+/// Returns the secret plus where it came from (for logging).
+pub fn load_or_derive(
+    veil_dir: &Path,
+    sovereign_present: bool,
+) -> std::io::Result<(x25519_dalek::StaticSecret, AnonymityKeySource)> {
+    // 1. An existing persisted key wins — never rotate a node that already has one.
+    if let Some(sk) = load(veil_dir)? {
+        return Ok((sk, AnonymityKeySource::Persisted));
+    }
+    // 2. Ephemeral-dir node with an identity: derive deterministically.
+    if sovereign_present {
+        match veil_identity::sovereign_flow::load_identity_sk(veil_dir) {
+            Ok(seed) => {
+                return Ok((
+                    derive_from_identity_seed(&seed),
+                    AnonymityKeySource::IdentityDerived,
+                ));
+            }
+            // Identity present but no Ed25519 seed file (Falcon multi-device,
+            // etc.) — fall through to a random+persisted key rather than failing
+            // to start.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // 3. Fallback: random + persist (legacy behaviour).
+    let sk = load_or_create(veil_dir)?;
+    Ok((sk, AnonymityKeySource::FallbackRandom))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +239,67 @@ mod tests {
         let meta = std::fs::metadata(key_path(tmp.path())).unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected 0o600, got {:o}", mode);
+    }
+
+    // ── load_or_derive ───────────────────────────────────────────────────────
+
+    /// An existing persisted key WINS even when a sovereign identity is present:
+    /// long-lived nodes (the seeds) must NOT rotate their anonymity key on
+    /// upgrade. This is the no-rotation safety guarantee.
+    #[test]
+    fn load_or_derive_prefers_existing_persisted_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        save(tmp.path(), &existing).unwrap();
+        // Also drop an identity seed so the derive branch WOULD be eligible.
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x11u8; 32]);
+        veil_identity::sovereign_flow::save_identity_sk(tmp.path(), &seed).unwrap();
+
+        let (sk, src) = load_or_derive(tmp.path(), true).unwrap();
+        assert_eq!(src, AnonymityKeySource::Persisted);
+        assert_eq!(
+            PublicKey::from(&sk).to_bytes(),
+            PublicKey::from(&existing).to_bytes(),
+            "existing key must be returned unchanged (no rotation)"
+        );
+    }
+
+    /// An ephemeral-dir node (no persisted anonymity key) with a sovereign
+    /// identity DERIVES from the identity seed — deterministically and matching
+    /// the standalone derive helper. This is the actual delivery fix.
+    #[test]
+    fn load_or_derive_derives_from_identity_seed_when_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x22u8; 32]);
+        veil_identity::sovereign_flow::save_identity_sk(tmp.path(), &seed).unwrap();
+
+        let (sk, src) = load_or_derive(tmp.path(), true).unwrap();
+        assert_eq!(src, AnonymityKeySource::IdentityDerived);
+        assert_eq!(
+            PublicKey::from(&sk).to_bytes(),
+            PublicKey::from(&derive_from_identity_seed(&seed)).to_bytes(),
+        );
+        // Deriving in a SECOND fresh dir from the SAME seed yields the SAME key
+        // (the cross-session stability that fixes the stale-ad black-hole). A
+        // derive run must NOT write a key file (no on-disk artifact).
+        assert!(!key_path(tmp.path()).exists(), "derive must not persist a key file");
+        let tmp2 = tempfile::tempdir().unwrap();
+        veil_identity::sovereign_flow::save_identity_sk(tmp2.path(), &seed).unwrap();
+        let (sk2, _) = load_or_derive(tmp2.path(), true).unwrap();
+        assert_eq!(
+            PublicKey::from(&sk).to_bytes(),
+            PublicKey::from(&sk2).to_bytes(),
+            "same identity seed across sessions must give the same anonymity key"
+        );
+    }
+
+    /// Identity-less node with no key file: fall back to a fresh random key that
+    /// is persisted (legacy behaviour for relay-only daemons without a seed).
+    #[test]
+    fn load_or_derive_falls_back_to_random_without_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_sk, src) = load_or_derive(tmp.path(), false).unwrap();
+        assert_eq!(src, AnonymityKeySource::FallbackRandom);
+        assert!(key_path(tmp.path()).exists(), "fallback must persist the random key");
     }
 }
