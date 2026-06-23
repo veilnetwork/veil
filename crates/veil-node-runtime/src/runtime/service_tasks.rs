@@ -156,8 +156,17 @@ async fn process_auth_deliver(
 
 // ── rendezvous-recipient lifecycle (Epic 482 v1) ─────────────────────────────
 
-/// How often the rendezvous-recipient task re-checks its registration.
-const RENDEZVOUS_RECIPIENT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the rendezvous-recipient task re-checks its registration. A short
+/// backstop that catches any session-close event missed via a broadcast
+/// `Lagged`; event-driven wakes do the bulk of the work.
+const RENDEZVOUS_RECIPIENT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+/// Min-interval debounce gate for event-driven re-checks: coalesces a burst of
+/// `SESSIONS_CHANGED` events into at most one re-check per window.
+const RENDEZVOUS_SESSION_EVENT_DEBOUNCE: std::time::Duration =
+    std::time::Duration::from_millis(100);
+/// Max extra random jitter (ms) added per backstop tick so the re-register
+/// cadence is not a fixed, identity-linkable heartbeat.
+const RENDEZVOUS_TICK_JITTER_MS: u64 = 3000;
 /// Ad validity window the recipient requests (the maintenance tick refreshes the
 /// published ad before half-life). Comfortably longer than the check interval.
 const RENDEZVOUS_AD_VALIDITY_SECS: u64 = 3600;
@@ -479,6 +488,88 @@ pub(crate) fn rendezvous_unregister_publisher(
 ) {
     lock!(anonymity.rendezvous_publisher_entries)
         .retain(|e| !(e.rendezvous_node_id == *relay && e.auth_cookie == cookie));
+}
+
+/// Shared cold-path re-pick + re-register for the rendezvous-recipient task.
+///
+/// SINGLE source of truth for the `!current_ok` block, called from BOTH the
+/// backstop-tick arm and the event-driven (`SESSIONS_CHANGED`) arm so the two
+/// can never drift. It re-applies the stickiness gate itself (early-returns when
+/// the current relay's session is still live), so it is idempotent and safe to
+/// call from either arm — an event for an unrelated peer is a no-op while the
+/// current relay stays live. Must be an `async fn` (not a closure) because it
+/// awaits [`warm_connected_relay_directory`] and async closures are unstable;
+/// `current` is `&mut` so it mutates the long-lived loop local, `log_key` lets
+/// the tick vs event arm emit distinct observability keys.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rendezvous_recipient_recheck(
+    current: &mut Option<[u8; 32]>,
+    live_sessions: &LiveSessions,
+    dht: &Arc<veil_dht::KademliaService>,
+    outbox: &Arc<dyn veil_dht::FrameRouter>,
+    session_tx_registry: &Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
+    anonymity: &Arc<super::anonymity_state::AnonymityState>,
+    logger: &Arc<veil_observability::NodeLogger>,
+    pinned: &[[u8; 32]],
+    local_node_id: &[u8; 32],
+    cookie: [u8; 16],
+    log_key: &'static str,
+) {
+    let current_ok = current.is_some_and(|r| rendezvous_session_live(live_sessions, &r));
+    if current_ok {
+        return;
+    }
+    // Cold-start: actively pull + verify connected peers' relay-directory
+    // entries into the local store so pick (get_local) can find one without
+    // waiting on passive DHT replication.
+    warm_connected_relay_directory(live_sessions, dht, outbox, logger).await;
+    match pick_rendezvous_relay_deterministic(live_sessions, dht, pinned, local_node_id) {
+        Some(relay) => {
+            // Only commit to the new relay once the RegisterRendezvous frame
+            // actually leaves — a picked "live session" may not have a tx
+            // channel yet, in which case the frame is silently dropped and no
+            // relay ever sees the registration.
+            if !rendezvous_register_with(session_tx_registry, anonymity, &relay, cookie) {
+                logger.info(
+                    "anonymity.rendezvous_recipient.send_failed",
+                    format!(
+                        "relay {} not yet sendable (no tx channel); retrying",
+                        veil_util::hex_short(&relay),
+                    ),
+                );
+            } else {
+                // Prune the prior relay's publisher slot now that the new
+                // registration took (L4) — else failover strands a stale ad
+                // that senders black-hole into.
+                if let Some(old) = *current
+                    && old != relay
+                {
+                    rendezvous_unregister_publisher(anonymity, &old, cookie);
+                }
+                rendezvous_register_publisher(
+                    anonymity,
+                    &relay,
+                    cookie,
+                    RENDEZVOUS_AD_VALIDITY_SECS,
+                    // Plain rendezvous receiver: ad is signed under the sovereign
+                    // identity (senders discover it by node_id).
+                    None,
+                );
+                *current = Some(relay);
+                logger.info(
+                    log_key,
+                    format!(
+                        "registered with rendezvous relay {}",
+                        veil_util::hex_short(&relay),
+                    ),
+                );
+            }
+        }
+        None => logger.info(
+            "anonymity.rendezvous_recipient.no_relay",
+            "no reachable published rendezvous relay yet; retrying",
+        ),
+    }
 }
 
 impl NodeRuntime {
@@ -1383,6 +1474,10 @@ impl NodeRuntime {
             return;
         };
         let mut shutdown_rx = shutdown_tx.subscribe();
+        // SAME EventBus that SessionGuard::drop publishes SESSIONS_CHANGED on, so
+        // a session-close event-driven wake re-registers within the reconnect RTT
+        // instead of waiting up to a full backstop tick.
+        let event_bus = Arc::clone(&self.event_bus);
         let logger = Arc::clone(&self.logger);
         let dht = Arc::clone(&self.dht);
         let live_sessions = Arc::clone(&self.live_sessions);
@@ -1420,12 +1515,34 @@ impl NodeRuntime {
             async move {
                 let outbox: Arc<dyn veil_dht::FrameRouter> = session_outbox;
                 let mut interval = tokio::time::interval(RENDEZVOUS_RECIPIENT_CHECK_INTERVAL);
+                // Don't let the backstop burst-catch-up after time spent in the
+                // event arm or the jitter sleep.
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 let mut current: Option<[u8; 32]> = None;
                 let mut ticks: u64 = 0;
+                let mut sessions_rx = event_bus.subscribe();
+                // Seed one debounce-window in the past so the FIRST session change
+                // re-checks immediately.
+                let mut last_event_check =
+                    tokio::time::Instant::now() - RENDEZVOUS_SESSION_EVENT_DEBOUNCE;
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
                             ticks = ticks.wrapping_add(1);
+                            // Per-tick fresh random jitter (0..3s) so the backstop
+                            // cadence is not a fixed, identity-linkable heartbeat.
+                            // MissedTickBehavior::Delay keeps this sleep from
+                            // bursting the backstop.
+                            {
+                                use rand_core::{OsRng, RngCore};
+                                let j = OsRng.next_u64() % RENDEZVOUS_TICK_JITTER_MS;
+                                if j > 0 {
+                                    tokio::time::sleep(
+                                        std::time::Duration::from_millis(j),
+                                    )
+                                    .await;
+                                }
+                            }
                             // STICKINESS (cold-start churn fix): keep the current
                             // relay as long as our SESSION to it is live. We must
                             // NOT abandon a working relay just because its
@@ -1443,82 +1560,20 @@ impl NodeRuntime {
                             let current_ok = current
                                 .is_some_and(|r| rendezvous_session_live(&live_sessions, &r));
                             if !current_ok {
-                                // Cold-start: actively pull + verify connected
-                                // peers' relay-directory entries into the local
-                                // store so pick (get_local) can find one without
-                                // waiting on passive DHT replication.
-                                warm_connected_relay_directory(
-                                    &live_sessions, &dht, &outbox, &logger,
-                                )
-                                .await;
-                                match pick_rendezvous_relay_deterministic(
+                                rendezvous_recipient_recheck(
+                                    &mut current,
                                     &live_sessions,
                                     &dht,
+                                    &outbox,
+                                    &session_tx_registry,
+                                    &anonymity,
+                                    &logger,
                                     &pinned,
                                     &local_node_id,
-                                ) {
-                                    Some(relay) => {
-                                        // Prune the prior (failed) relay's publisher
-                                        // slot before adding the new one (L4) — else
-                                        // failover strands a stale ad that senders
-                                        // black-hole into.
-                                        // Only commit to the new relay once the
-                                        // RegisterRendezvous frame actually leaves
-                                        // — a picked "live session" may not have a
-                                        // tx channel yet, in which case the frame
-                                        // is silently dropped and no relay ever
-                                        // sees the registration.
-                                        if !rendezvous_register_with(
-                                            &session_tx_registry,
-                                            &anonymity,
-                                            &relay,
-                                            cookie,
-                                        ) {
-                                            logger.info(
-                                                "anonymity.rendezvous_recipient.send_failed",
-                                                format!(
-                                                    "relay {} not yet sendable (no tx \
-                                                     channel); retrying",
-                                                    veil_util::hex_short(&relay),
-                                                ),
-                                            );
-                                        } else {
-                                            // Prune the prior relay's publisher slot
-                                            // now that the new registration took (L4)
-                                            // — else failover strands a stale ad that
-                                            // senders black-hole into.
-                                            if let Some(old) = current
-                                                && old != relay
-                                            {
-                                                rendezvous_unregister_publisher(
-                                                    &anonymity, &old, cookie,
-                                                );
-                                            }
-                                            rendezvous_register_publisher(
-                                                &anonymity,
-                                                &relay,
-                                                cookie,
-                                                RENDEZVOUS_AD_VALIDITY_SECS,
-                                                // Plain rendezvous receiver: ad is
-                                                // signed under the sovereign identity
-                                                // (senders discover it by node_id).
-                                                None,
-                                            );
-                                            current = Some(relay);
-                                            logger.info(
-                                                "anonymity.rendezvous_recipient.registered",
-                                                format!(
-                                                    "registered with rendezvous relay {}",
-                                                    veil_util::hex_short(&relay),
-                                                ),
-                                            );
-                                        }
-                                    }
-                                    None => logger.info(
-                                        "anonymity.rendezvous_recipient.no_relay",
-                                        "no reachable published rendezvous relay yet; retrying",
-                                    ),
-                                }
+                                    cookie,
+                                    "anonymity.rendezvous_recipient.registered",
+                                )
+                                .await;
                             } else if ticks.is_multiple_of(RENDEZVOUS_REREGISTER_EVERY_TICKS) {
                                 // Refresh — the relay's registration is in-memory.
                                 if let Some(relay) = current
@@ -1532,6 +1587,63 @@ impl NodeRuntime {
                                     // Relay no longer sendable — drop it so the
                                     // next tick re-discovers + re-registers.
                                     current = None;
+                                }
+                            }
+                        }
+                        recv = sessions_rx.recv() => {
+                            // Event-driven wake: collapse the no-subscriber window
+                            // from a full backstop tick to the reconnect+register
+                            // RTT. The shared fn re-applies the stickiness gate, so
+                            // an event for an unrelated peer is a no-op while the
+                            // current relay stays live.
+                            let changed = match recv {
+                                Ok(ev) => {
+                                    ev.kind == veil_proto::event_kind::SESSIONS_CHANGED
+                                }
+                                // Buffer overflowed: re-check anyway (the shared fn
+                                // is a no-op when current_ok); the backstop tick
+                                // catches anything dropped.
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                                // Bus dropped (shutdown); exit the loop.
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            };
+                            if changed {
+                                let now = tokio::time::Instant::now();
+                                if now.duration_since(last_event_check)
+                                    >= RENDEZVOUS_SESSION_EVENT_DEBOUNCE
+                                {
+                                    last_event_check = now;
+                                    // Coalesce a burst: drain queued events
+                                    // non-blockingly so a 200+/s storm collapses
+                                    // into a SINGLE re-check.
+                                    loop {
+                                        match sessions_rx.try_recv() {
+                                            Ok(_) => {}
+                                            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                                                break
+                                            }
+                                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                                                break
+                                            }
+                                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                                                break
+                                            }
+                                        }
+                                    }
+                                    rendezvous_recipient_recheck(
+                                        &mut current,
+                                        &live_sessions,
+                                        &dht,
+                                        &outbox,
+                                        &session_tx_registry,
+                                        &anonymity,
+                                        &logger,
+                                        &pinned,
+                                        &local_node_id,
+                                        cookie,
+                                        "anonymity.rendezvous_recipient.event_driven_reregister",
+                                    )
+                                    .await;
                                 }
                             }
                         }
