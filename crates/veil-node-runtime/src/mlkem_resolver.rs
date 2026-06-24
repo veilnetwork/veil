@@ -62,6 +62,25 @@ use veil_util::{lock, rlock, wlock};
 /// at ~9 sec in the worst case.
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// TTL for the verified-cert fast-path cache. A recipient's ML-KEM EK is
+/// **stable for the lifetime of its instance** — `mlkem_dk_seed` is fixed and
+/// the 6-hourly `MlKemKeyCert` republish only refreshes the signature +
+/// timestamp, not the EK — so a previously-verified [`VerifiedMlkemCert`] stays
+/// valid until the recipient rotates to a *new* instance (fresh install /
+/// identity reset). A 30-min TTL bounds that rare rotation window while letting
+/// an active conversation reuse a single DHT walk across **all** its live-E2E
+/// encrypts AND offline mailbox seals, instead of re-walking on every call.
+const CERT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// `node_id → (verified cert, when-resolved)`. Shared across the live-E2E and
+/// offline-mailbox-seal resolver instances (both built over `self.identity`),
+/// so a live send warms the cache the subsequent seal reuses — this is what
+/// makes the offline-deposit path fast + resilient to transient DHT misses
+/// (it used to do a fresh 3-step DHT walk on **every** seal). LRU-bounded by
+/// [`MAX_PEER_MLKEM_CACHE`](veil_proto::budget::MAX_PEER_MLKEM_CACHE).
+pub type PeerMlKemCertCache =
+    std::collections::HashMap<[u8; 32], (VerifiedMlkemCert, std::time::Instant)>;
+
 /// DHT-driven impl of [`MlKemEkResolver`].  Wraps the same set of
 /// `Arc`-shared runtime components that `NodeRuntime::dht_recursive_get`
 /// uses, plus a write-through to `peer_mlkem_keys` cache.
@@ -71,8 +90,15 @@ pub struct DhtMlKemEkResolver {
     pending_recursive: Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
     local_node_id: [u8; 32],
     peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
+    /// Verified-cert fast-path cache (see [`PeerMlKemCertCache`]). Shared with
+    /// the other resolver instance over `self.identity` so live + seal paths
+    /// warm each other.
+    cert_cache: Arc<RwLock<PeerMlKemCertCache>>,
     logger: Arc<NodeLogger>,
     step_timeout: Duration,
+    /// Verified-cert cache TTL. Defaults to [`CERT_CACHE_TTL`]; overridable
+    /// via [`with_cert_ttl`](Self::with_cert_ttl) for tests.
+    cert_ttl: Duration,
 }
 
 impl DhtMlKemEkResolver {
@@ -86,6 +112,7 @@ impl DhtMlKemEkResolver {
         pending_recursive: Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
         local_node_id: [u8; 32],
         peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
+        cert_cache: Arc<RwLock<PeerMlKemCertCache>>,
         logger: Arc<NodeLogger>,
     ) -> Self {
         Self {
@@ -94,8 +121,10 @@ impl DhtMlKemEkResolver {
             pending_recursive,
             local_node_id,
             peer_mlkem_keys,
+            cert_cache,
             logger,
             step_timeout: DEFAULT_STEP_TIMEOUT,
+            cert_ttl: CERT_CACHE_TTL,
         }
     }
 
@@ -104,6 +133,15 @@ impl DhtMlKemEkResolver {
     #[must_use]
     pub fn with_step_timeout(mut self, t: Duration) -> Self {
         self.step_timeout = t;
+        self
+    }
+
+    /// Override the verified-cert cache TTL. Test-only knob — production keeps
+    /// [`CERT_CACHE_TTL`]; lets a test force-expire a cached entry (TTL = 0)
+    /// without time travel.
+    #[must_use]
+    pub fn with_cert_ttl(mut self, t: Duration) -> Self {
+        self.cert_ttl = t;
         self
     }
 
@@ -180,6 +218,20 @@ impl DhtMlKemEkResolver {
         target_node_id: [u8; 32],
     ) -> Option<VerifiedMlkemCert> {
         self.log_dbg("mlkem_resolver.start", &target_node_id, "");
+        // ── Step 0: verified-cert fast path ─────────────────────────
+        // A recently-verified cert for this recipient short-circuits the
+        // whole 3-step DHT walk. The EK is instance-stable (see
+        // `CERT_CACHE_TTL`), so a fresh cache entry is as good as a
+        // re-resolve — and it's what makes the offline mailbox-seal path
+        // (which walked the DHT on *every* seal) fast + resilient to a
+        // transient DHT miss, since a live encrypt to the same peer will
+        // have warmed this cache moments earlier.
+        if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
+            && ts.elapsed() < self.cert_ttl
+        {
+            self.log_dbg("mlkem_resolver.cert.cache_hit", &target_node_id, "");
+            return Some(cert.clone());
+        }
         // ── Step 1: IdentityDocument ────────────────────────────────
         // ML-KEM resolves can target any third party (not necessarily a
         // connected peer), so keep the XOR-closest recursive walk.
@@ -286,6 +338,20 @@ impl DhtMlKemEkResolver {
                 target_node_id,
                 (verified.mlkem_pubkey.clone(), std::time::Instant::now()),
             );
+        }
+        // Verified-cert cache writeback (same LRU policy) — feeds the Step 0
+        // fast path above for every subsequent live encrypt + offline seal.
+        {
+            let mut cc = wlock!(self.cert_cache);
+            if cc.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
+                && let Some(oldest) = cc
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(id, _)| *id)
+            {
+                cc.remove(&oldest);
+            }
+            cc.insert(target_node_id, (verified.clone(), std::time::Instant::now()));
         }
         self.logger.debug(
             "mlkem_resolver.resolved",
@@ -633,8 +699,72 @@ mod tests {
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             [1u8; 32],
             Arc::new(RwLock::new(PeerMlKemCache::new())),
+            Arc::new(RwLock::new(PeerMlKemCertCache::new())),
             Arc::new(NodeLogger::new_noop()),
         )
+    }
+
+    /// Resolver whose verified-cert cache we hold a handle to, so a test can
+    /// pre-seed it and observe the Step-0 fast path.
+    fn make_test_resolver_with_cert_cache(
+        dht: Arc<KademliaService>,
+        cert_cache: Arc<RwLock<PeerMlKemCertCache>>,
+    ) -> DhtMlKemEkResolver {
+        DhtMlKemEkResolver::new(
+            dht,
+            Arc::new(RwLock::new(SessionTxRegistry::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            [1u8; 32],
+            Arc::new(RwLock::new(PeerMlKemCache::new())),
+            cert_cache,
+            Arc::new(NodeLogger::new_noop()),
+        )
+    }
+
+    fn dummy_cert(node_id: [u8; 32]) -> VerifiedMlkemCert {
+        VerifiedMlkemCert {
+            node_id,
+            instance_id: [0xab; 16],
+            mlkem_algo: 1,
+            mlkem_pubkey: vec![0x42; 32],
+            cert_version: 7,
+        }
+    }
+
+    // The verified-cert fast path is what makes the offline mailbox-seal +
+    // live-E2E encrypt paths fast: a recently-resolved cert short-circuits the
+    // 3-step DHT walk. With NO peers configured a real walk yields `None`, so a
+    // `Some(_)` here can ONLY have come from the cache.
+    #[tokio::test]
+    async fn fetch_verified_cert_returns_fresh_cache_entry_without_dht() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let target = [9u8; 32];
+        let cert_cache = Arc::new(RwLock::new(PeerMlKemCertCache::new()));
+        wlock!(cert_cache).insert(target, (dummy_cert(target), std::time::Instant::now()));
+        let resolver = make_test_resolver_with_cert_cache(Arc::clone(&dht), cert_cache);
+        assert_eq!(
+            resolver.fetch_verified_cert(target).await,
+            Some(dummy_cert(target)),
+            "a fresh cached cert must short-circuit the DHT walk"
+        );
+    }
+
+    // TTL gate: with TTL = 0 even a just-inserted entry is stale, so the fast
+    // path is skipped and the peerless DHT walk yields `None`. Proves the TTL
+    // is actually enforced — a stale entry never gets served past rotation.
+    #[tokio::test]
+    async fn fetch_verified_cert_ignores_expired_cache_entry() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let target = [9u8; 32];
+        let cert_cache = Arc::new(RwLock::new(PeerMlKemCertCache::new()));
+        wlock!(cert_cache).insert(target, (dummy_cert(target), std::time::Instant::now()));
+        let resolver = make_test_resolver_with_cert_cache(Arc::clone(&dht), cert_cache)
+            .with_cert_ttl(Duration::from_secs(0));
+        assert_eq!(
+            resolver.fetch_verified_cert(target).await,
+            None,
+            "an expired cache entry must NOT short-circuit; must fall through to the DHT"
+        );
     }
 
     // Regression for the DHT mirror-cache poison DoS fix: the validated local
