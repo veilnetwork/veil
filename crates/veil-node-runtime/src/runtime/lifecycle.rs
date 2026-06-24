@@ -447,6 +447,7 @@ impl NodeRuntime {
             Arc::clone(&self.identity.peer_roles),
             Arc::clone(&self.identity.mlkem_ek),
             Arc::clone(&self.identity.peer_mlkem_keys),
+            Arc::clone(&self.identity.peer_mlkem_certs),
             Arc::clone(&self.identity.per_session_mlkem_dk),
         ));
         // re-prime global mobile background-mode

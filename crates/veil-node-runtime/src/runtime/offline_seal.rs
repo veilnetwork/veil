@@ -34,7 +34,7 @@ use veil_observability::NodeLogger;
 use veil_proto::ipc::AuthAppDeliver;
 use veil_session::SessionTxRegistry;
 
-use crate::mlkem_resolver::DhtMlKemEkResolver;
+use crate::mlkem_resolver::{DhtMlKemEkResolver, PeerMlKemCertCache};
 
 /// Auth-deliver freshness window for the OFFLINE (mailbox) open path. Unlike the
 /// 300s live-onion window, a stored-and-forwarded message is delivered whenever
@@ -68,6 +68,7 @@ pub struct RuntimeMailboxCrypto {
     pending_recursive: Arc<Mutex<HashMap<[u8; 16], PendingRecursive>>>,
     local_node_id: [u8; 32],
     peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
+    peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
     sovereign: Option<Arc<SovereignIdentity>>,
     mlkem_dk_seed: Arc<veil_util::sensitive_bytes::SensitiveBytesN<{ veil_e2e::DK_SEED_BYTES }>>,
     logger: Arc<NodeLogger>,
@@ -83,6 +84,7 @@ impl RuntimeMailboxCrypto {
             Arc::clone(&self.pending_recursive),
             self.local_node_id,
             Arc::clone(&self.peer_mlkem_keys),
+            Arc::clone(&self.peer_mlkem_certs),
             Arc::clone(&self.logger),
         )
     }
@@ -220,6 +222,7 @@ impl super::NodeRuntime {
             pending_recursive: Arc::clone(&self.dispatcher.pending_recursive),
             local_node_id: *self.identity.local_identity.node_id.as_bytes(),
             peer_mlkem_keys: Arc::clone(&self.identity.peer_mlkem_keys),
+            peer_mlkem_certs: Arc::clone(&self.identity.peer_mlkem_certs),
             sovereign: self.identity.sovereign_identity.clone(),
             mlkem_dk_seed: Arc::clone(&self.mlkem_dk_seed),
             logger: Arc::clone(&self.logger),
