@@ -103,6 +103,56 @@ pub fn derive_anonymity_x25519_sk(identity_sk_seed: &[u8; 32]) -> Zeroizing<[u8;
     out
 }
 
+/// Info string for an onion service's rendezvous auth-cookie. The current
+/// blinded-descriptor period (`now / PERIOD_SECS`, 8 LE bytes) is appended to
+/// this constant before expansion. See [`derive_onion_auth_cookie`].
+pub const ONION_AUTH_COOKIE_DERIVATION_INFO: &[u8] = b"veil/onion-auth-cookie/v1";
+
+/// Derive an onion service's 16-byte rendezvous **auth-cookie** deterministically
+/// from its per-identity Ed25519 SK seed and the current blinded-descriptor
+/// `period` (`current_period(now) = now / 86400`).
+///
+/// HKDF-SHA256:
+/// ```text
+/// salt = None
+/// ikm  = identity_sk_seed (32 B, the Ed25519 SK seed)
+/// info = "veil/onion-auth-cookie/v1" ‖ period.to_le_bytes()
+/// okm  = 16 B → the auth-cookie
+/// ```
+///
+/// Why this exists: the cookie is the value the relay keys its circuit-rendezvous
+/// subscriber table by AND the value a sender copies out of the resolved ad /
+/// blinded descriptor into its introduce. When it was `OsRng`-minted per process
+/// (`register_onion_service`), every restart rotated it: the recipient re-registered
+/// the relay under a NEW cookie while a sender resolved an ad (≤24 h valid) carrying
+/// the OLD cookie, so `lookup(cookie)` missed and the relay silently dropped the
+/// introduce (`cookie_unknown`) — black-holing delivery to a node that restarts every
+/// few minutes. Deriving it from the stable identity seed makes a restart re-mint the
+/// SAME cookie, so it matches whatever ad the sender resolves.
+///
+/// Anonymity note: the cookie is the only field a rendezvous relay sees in PLAINTEXT
+/// (toward senders it travels inside the sealed blinded descriptor). It is derived
+/// from the SECRET seed — NOT from `node_id` like the plain-path
+/// [`super::...`]-style cookie — so it is opaque and non-invertible: a relay cannot
+/// link it to a guessed identity (no confirmation oracle), preserving the blinded
+/// descriptor's unlinkability. The `period` term makes the cookie rotate in lockstep
+/// with the blinded descriptor's per-period DHT key / enc key / signature, so the
+/// relay's ability to cluster this receiver's rendezvous activity is bounded to the
+/// SAME 24 h period the design already concedes — period N and N+1 are unlinkable. A
+/// seed-only (period-less) cookie would be a forever-stable relay pseudonym and is
+/// deliberately NOT used. Per-identity isolation is automatic: master and each decoy
+/// load their OWN `device_identity_sk.bin`, deriving DISTINCT cookies. The cookie is
+/// PUBLIC, so it is returned unwrapped (not [`Zeroizing`]); only the seed is secret.
+pub fn derive_onion_auth_cookie(identity_sk_seed: &[u8; 32], period: u64) -> [u8; 16] {
+    let hk = Hkdf::<Sha256>::new(None, identity_sk_seed);
+    let mut info = ONION_AUTH_COOKIE_DERIVATION_INFO.to_vec();
+    info.extend_from_slice(&period.to_le_bytes());
+    let mut out = [0u8; 16];
+    hk.expand(&info, &mut out)
+        .expect("16 bytes < 255 * hash_len");
+    out
+}
+
 /// Derive a `node_id` from a public key.
 ///
 /// simplifies this from the previous domain-tag-prefixed shape
@@ -210,6 +260,38 @@ mod tests {
         let anon = derive_anonymity_x25519_sk(&seed);
         let master = derive_master_sk_ed25519(&seed);
         assert_ne!(*anon, *master);
+    }
+
+    #[test]
+    fn onion_auth_cookie_is_stable_across_restarts() {
+        // The whole point: same identity seed + same period MUST yield the same
+        // 16-byte cookie, so a process restart re-mints a value the relay still
+        // has registered (a rotating cookie was the cookie_unknown black-hole).
+        let seed = [0x42u8; 32];
+        let a = derive_onion_auth_cookie(&seed, 19876);
+        let b = derive_onion_auth_cookie(&seed, 19876);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn onion_auth_cookie_rotates_per_period() {
+        // Adjacent blinded-descriptor periods MUST produce independent cookies so
+        // a relay cannot link the receiver's rendezvous across the 24h boundary
+        // (the cookie rotates in lockstep with the descriptor's DHT/enc/sig keys).
+        let seed = [0x42u8; 32];
+        let a = derive_onion_auth_cookie(&seed, 19876);
+        let b = derive_onion_auth_cookie(&seed, 19877);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn onion_auth_cookie_isolated_between_identities() {
+        // master and decoy (distinct seeds) MUST derive distinct cookies in the
+        // same period — no cross-identity linkage at the relay surface.
+        let p = 19876u64;
+        let a = derive_onion_auth_cookie(&[0x42u8; 32], p);
+        let b = derive_onion_auth_cookie(&[0x43u8; 32], p);
+        assert_ne!(a, b);
     }
 
     #[test]
