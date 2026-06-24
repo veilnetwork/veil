@@ -6474,8 +6474,38 @@ impl NodeServices {
 
         let relay_path = self.select_onion_relay_path(hop_count)?;
         let r = *relay_path.last().expect("non-empty relay path");
-        let mut cookie = [0u8; 16];
-        OsRng.fill_bytes(&mut cookie);
+        // Derive a per-identity, per-period rendezvous cookie (HKDF of the
+        // sovereign Ed25519 seed) instead of a fresh OsRng value. A random cookie
+        // rotated on every process restart: the relay re-registered under a NEW
+        // cookie while a sender resolved an ad (<=24h valid) carrying the OLD one
+        // -> lookup(cookie) missed -> cookie_unknown black-hole on a node that
+        // restarts every few minutes. The derivation is STABLE across restarts
+        // within the 24h blinded-descriptor period and rotates per period in
+        // lockstep with the descriptor (so a relay cannot link the receiver's
+        // rendezvous across the boundary). Seed-derived (NOT node_id) keeps it
+        // opaque to the relay, preserving the descriptor's unlinkability. No
+        // sovereign identity -> cannot publish a descriptor anyway -> keep random.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let period = veil_anonymity::blinded_descriptor::current_period(now_unix);
+        let cookie: [u8; 16] = match self
+            .identity
+            .sovereign_identity
+            .as_ref()
+            .and_then(|sov| sov.ed25519_signing_key())
+        {
+            Some(ed) => {
+                let seed = zeroize::Zeroizing::new(ed.to_bytes());
+                veil_crypto::identity::derive_onion_auth_cookie(&*seed, period)
+            }
+            None => {
+                let mut c = [0u8; 16];
+                OsRng.fill_bytes(&mut c);
+                c
+            }
+        };
 
         // Build + register the circuit (no session register — that is the leak),
         // then publish the ad so clients can find us.
@@ -6678,6 +6708,26 @@ impl NodeServices {
                 .collect()
         };
         for (cookie, relay_path, reg_keypair, prev_confirmed, registration_epoch) in due {
+            // Rotate the rendezvous cookie WITH the blinded-descriptor period. The
+            // entry was minted under its build-time period, but a long-running node
+            // crosses 24h boundaries; keeping one cookie across periods would
+            // re-introduce the cross-period relay link that per-period rotation is
+            // built to deny. Re-derive for the CURRENT period each tick (seed-derived,
+            // STABLE within a period so restarts still match); a random-fallback entry
+            // (no sovereign identity) keeps its cookie. Used for BOTH the relay
+            // re-registration AND the descriptor re-publish so they cannot diverge;
+            // the in-memory entry is re-keyed to the new cookie on a successful build.
+            let period_now = veil_anonymity::blinded_descriptor::current_period(now_unix);
+            let cookie_now = self
+                .identity
+                .sovereign_identity
+                .as_ref()
+                .and_then(|sov| sov.ed25519_signing_key())
+                .map(|ed| {
+                    let seed = zeroize::Zeroizing::new(ed.to_bytes());
+                    veil_crypto::identity::derive_onion_auth_cookie(&*seed, period_now)
+                })
+                .unwrap_or(cookie);
             // diff-audit Δ2-d: if the terminus never ACK'd the current circuit
             // (CircuitBuilt), its path is suspect — a hop is likely dead. Pick a
             // FRESH path rather than rebuilding the same frozen one. A confirmed
@@ -6700,13 +6750,16 @@ impl NodeServices {
                 relay_path.clone()
             };
             if let Ok(new_confirmed) =
-                self.build_onion_circuit_once(&path, cookie, &reg_keypair, &registration_epoch)
+                self.build_onion_circuit_once(&path, cookie_now, &reg_keypair, &registration_epoch)
             {
                 let mut svcs = lock!(self.anonymity.onion_services);
+                // Locate by the OLD cookie (the due-tuple value), then re-key the
+                // entry to cookie_now so subsequent ticks track the current period.
                 if let Some(e) = svcs.iter_mut().find(|e| e.cookie == cookie) {
                     e.built_unix = now_unix;
                     e.relay_path = path.clone();
                     e.confirmed = new_confirmed;
+                    e.cookie = cookie_now;
                 }
             }
             let relay_path = path;
@@ -6720,7 +6773,7 @@ impl NodeServices {
             // rebuild result — discoverability shouldn't hinge on one tick's
             // rebuild succeeding.
             if let Some(&rendezvous) = relay_path.last() {
-                self.publish_blinded_descriptor(rendezvous, cookie);
+                self.publish_blinded_descriptor(rendezvous, cookie_now);
             }
         }
     }
