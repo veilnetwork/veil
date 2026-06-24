@@ -34,6 +34,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::local_identity::HandshakeIdentity;
+use crate::mlkem_resolver::PeerMlKemCertCache;
 use crate::types::NodeIdBytes;
 use veil_e2e::{DK_SEED_BYTES, EK_BYTES, PeerMlKemCache};
 use veil_identity::sovereign::SovereignIdentity;
@@ -80,6 +81,12 @@ pub struct IdentityState {
     /// Shared with `FrameDispatcher` so the relay-send path can encrypt E2E.
     pub peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
 
+    /// Verified-cert (full `VerifiedMlkemCert`) fast-path cache, shared across
+    /// the live-E2E + offline-mailbox-seal DHT resolver instances so one DHT
+    /// walk serves both — kills the per-seal DHT round-trip that made offline
+    /// deposit time out / `PeerUnresolved`. See [`PeerMlKemCertCache`].
+    pub peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
+
     /// per-session ephemeral ML-KEM DK seeds shared with
     /// `CryptoContext`. Maps `peer_id → dk_seed`; shared with
     /// `FrameDispatcher` for E2E decryption.
@@ -108,6 +115,7 @@ impl IdentityState {
         peer_roles: Arc<Mutex<PeerLruCache<u8>>>,
         mlkem_ek: Arc<[u8; EK_BYTES]>,
         peer_mlkem_keys: Arc<RwLock<PeerMlKemCache>>,
+        peer_mlkem_certs: Arc<RwLock<PeerMlKemCertCache>>,
         per_session_mlkem_dk: Arc<
             Mutex<
                 std::collections::HashMap<
@@ -125,6 +133,7 @@ impl IdentityState {
             peer_roles,
             mlkem_ek,
             peer_mlkem_keys,
+            peer_mlkem_certs,
             per_session_mlkem_dk,
         }
     }

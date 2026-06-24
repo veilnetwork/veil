@@ -1386,6 +1386,15 @@ impl NodeRuntime {
             Arc::new(std::sync::RwLock::new(
                 veil_e2e::PeerMlKemCache::with_capacity(veil_proto::budget::MAX_PEER_MLKEM_CACHE),
             ));
+        // Verified-cert fast-path cache, shared by the live-E2E + offline-seal
+        // ML-KEM resolvers so one DHT walk serves both (kills per-seal walks).
+        let shared_peer_mlkem_certs: Arc<
+            std::sync::RwLock<crate::mlkem_resolver::PeerMlKemCertCache>,
+        > = Arc::new(std::sync::RwLock::new(
+            crate::mlkem_resolver::PeerMlKemCertCache::with_capacity(
+                veil_proto::budget::MAX_PEER_MLKEM_CACHE,
+            ),
+        ));
         // per-session ephemeral ML-KEM DK seeds (key = peer_id, value =
         // SensitiveBytesN<64>-wrapped dk_seed).  Phase 6 slice 6h —
         // values are mlocked while the session is open.
@@ -2192,7 +2201,7 @@ impl NodeRuntime {
             session_tx_registry: shared_session_tx_registry,
             session_outbox,
             wire_stream_counter: Arc::new(AtomicU32::new(1)),
-            // bundle 8 identity-domain fields into one Arc.
+            // bundle identity-domain fields into one Arc.
             identity: Arc::new(identity_state::IdentityState::new(
                 Arc::clone(&local_identity),
                 sovereign_identity.clone(),
@@ -2201,6 +2210,7 @@ impl NodeRuntime {
                 Arc::clone(&peer_roles),
                 Arc::clone(&mlkem_ek),
                 Arc::clone(&shared_peer_mlkem_keys),
+                Arc::clone(&shared_peer_mlkem_certs),
                 Arc::clone(&shared_per_session_mlkem_dk),
             )),
             sessions_per_ip: Arc::new(ip_slot::IpSlotTable::new()),
