@@ -321,11 +321,15 @@ pub fn parse_toml_str(content: &str) -> Result<Config> {
 /// one.  The temp dir lives only for the daemon's process lifetime
 /// and does not need to be cleaned up explicitly — modern OSes reap
 /// `$TMPDIR` on reboot.
-/// When `anonymous`, the stub boots with `[anonymity]` already armed
-/// (`onion_service` + `receive_anonymous`). This matters for deferred-init: the
-/// anonymity x25519 key + onion-publish task are created ONCE at boot from this
-/// config and are NOT re-applied on the later identity-promoting apply-config
-/// (reload freezes `[anonymity]` by design). The published blinded descriptor,
+/// The stub ALWAYS boots with `receive_anonymous = true` (plain rendezvous
+/// RECEIVE = reachability: register a subscriber at a relay so it forwards
+/// introduces to us — needed for ANY NAT'd node, anonymous or not; without it
+/// the node publishes a rendezvous ad but services no introduces). When
+/// `anonymous`, it ADDITIONALLY arms `onion_service` (location anonymity). This
+/// matters for deferred-init: the anonymity x25519 key + onion-publish task are
+/// created ONCE at boot from this config and are NOT re-applied on the later
+/// identity-promoting apply-config (reload freezes `[anonymity]` by design).
+/// The published blinded descriptor,
 /// however, is sealed against the LIVE identity at publish time, so once the
 /// real identity is applied the descriptor resolves to it — booting the stub
 /// "anonymous" is therefore the way to make a deferred node actually onion-
@@ -385,14 +389,24 @@ pub fn build_stub_config_with_ephemeral_identity(anonymous: bool) -> Result<Conf
     // default snapshot path doesn't exist on the deferred path). Nothing the
     // messenger needs depends on it: it bootstraps via invites + live sessions.
     config.persist_enabled = false;
+    // `receive_anonymous` = plain rendezvous RECEIVE = REACHABILITY, NOT
+    // anonymity. It runs `spawn_rendezvous_recipient_task`, which registers a
+    // subscriber at a relay (over our DIRECT node_id-keyed session) so the relay
+    // forwards introduces addressed to our deterministic cookie. The relay
+    // learns nothing new — our node_id already keys the sovereign-signed ad we
+    // publish unconditionally. Without it a NAT'd node publishes that ad but
+    // registers NO subscriber, so the relay drops every introduce with
+    // `cookie_unknown` and the node is unreachable. So enable it ALWAYS — a
+    // non-anonymous NAT'd receiver needs it just as much as an anonymous one.
+    // It also mints the device x25519 key via the boot gate
+    // (`relay_capable || receive_anonymous || onion_service`), needed to unseal
+    // introduces. `relay_capable` stays false (we don't carry others' circuits).
+    config.anonymity.receive_anonymous = true;
     if anonymous {
-        // Arm anonymity at boot: this creates the device x25519 key and lets the
-        // onion-publish task run (the boot-time gate is
-        // `relay_capable || receive_anonymous || onion_service`). `relay_capable`
-        // stays false — being location-anonymous does not require carrying other
-        // nodes' circuits.
+        // LOCATION anonymity (opt-in): additionally run the onion service so
+        // peers/relays never learn this identity's IP and it can't be correlated
+        // to the user's other identities. Independent of reachability above.
         config.anonymity.onion_service = true;
-        config.anonymity.receive_anonymous = true;
     }
     Ok(config)
 }

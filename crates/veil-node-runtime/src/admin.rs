@@ -3827,10 +3827,16 @@ mod tests {
             "stub must not configure bootstrap peers"
         );
 
-        // Non-anonymous stub: anonymity stays OFF (the boot-time x25519-key gate
-        // is `relay_capable || receive_anonymous || onion_service`).
+        // Non-anonymous stub: LOCATION anonymity (onion) stays OFF, but
+        // `receive_anonymous` (plain rendezvous RECEIVE = reachability) is ALWAYS
+        // on so a NAT'd non-anon node can be reached by node_id. It also mints
+        // the x25519 key via the boot gate (`relay_capable || receive_anonymous
+        // || onion_service`).
         assert!(!cfg.anonymity.onion_service);
-        assert!(!cfg.anonymity.receive_anonymous);
+        assert!(
+            cfg.anonymity.receive_anonymous,
+            "stub always enables receive_anonymous (reachability)"
+        );
 
         // Ephemeral node: ALL on-disk persistence is off (no snapshot writes —
         // deniability + no spurious flush errors on the deferred path).
