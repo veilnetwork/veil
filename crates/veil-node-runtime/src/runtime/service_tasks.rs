@@ -197,6 +197,26 @@ fn rendezvous_relay_published(dht: &Arc<veil_dht::KademliaService>, node_id: &[u
         .is_some()
 }
 
+/// Handshake-advertised peer capability flags (`node_id → cap bitset`), cloned
+/// from the dispatcher's `peer_cap_flags`.
+type PeerCapFlags = Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], u8>>>;
+
+/// True iff `node_id` advertised the `CAN_RELAY` capability in its handshake
+/// (cached in `peer_cap_flags`). This is the RELIABLE relay signal for a
+/// CONNECTED peer: unlike [`rendezvous_relay_published`] it needs no DHT
+/// FIND_VALUE for the relay-directory entry — that lookup is flaky on a sparse
+/// network and its cached entry expires, which churned the recipient task's
+/// `no_relay` even while it held a live session to a perfectly good relay. A
+/// node we are connected to that advertised CAN_RELAY is a valid rendezvous
+/// relay regardless of whether its RD has propagated to our local DHT shard.
+fn peer_advertised_relay(cap_flags: &PeerCapFlags, node_id: &[u8; 32]) -> bool {
+    cap_flags
+        .read()
+        .ok()
+        .and_then(|m| m.get(node_id).copied())
+        .is_some_and(|f| f & veil_proto::session::cap_flags::CAN_RELAY != 0)
+}
+
 /// Pick a rendezvous relay: a session-live, published peer. If `pinned` is
 /// non-empty, restrict to that operator list; otherwise auto-pick.
 pub(crate) fn pick_rendezvous_relay(
@@ -212,11 +232,10 @@ pub(crate) fn pick_rendezvous_relay(
             .collect()
     };
     if !pinned.is_empty() {
-        // Operator pin: honour the configured order deterministically (intent).
-        return pinned
-            .iter()
-            .copied()
-            .find(|p| connected.contains(p) && rendezvous_relay_published(dht, p));
+        // Operator pin = TRUSTED relay: register at a connected one WITHOUT the
+        // RD-discovery check (which is unreliable on a sparse DHT and churns the
+        // registration). Honour the configured order deterministically (intent).
+        return pinned.iter().copied().find(|p| connected.contains(p));
     }
     // M-1: pick a RANDOM eligible relay rather than the first in iteration
     // order. `connected` derives from HashMap iteration, which is fixed within a
@@ -285,6 +304,7 @@ fn xor_distance_cmp(anchor: &[u8; 32], a: &[u8; 32], b: &[u8; 32]) -> std::cmp::
 pub(crate) fn pick_rendezvous_relay_deterministic(
     live: &LiveSessions,
     dht: &Arc<veil_dht::KademliaService>,
+    cap_flags: &PeerCapFlags,
     pinned: &[[u8; 32]],
     anchor: &[u8; 32],
 ) -> Option<[u8; 32]> {
@@ -296,14 +316,19 @@ pub(crate) fn pick_rendezvous_relay_deterministic(
             .collect()
     };
     if !pinned.is_empty() {
-        return pinned
-            .iter()
-            .copied()
-            .find(|p| connected.contains(p) && rendezvous_relay_published(dht, p));
+        // Operator-pinned relays are TRUSTED rendezvous points: register at a
+        // connected one WITHOUT requiring its relay-directory entry (RD) to be
+        // DHT-discoverable first. On a small/sparse network the warm FIND_VALUE
+        // for the RD is unreliable and the cached entry expires, so demanding it
+        // churns the registration (no_relay) even though the relay IS connected
+        // and the operator explicitly asserted it is a rendezvous relay. The RD
+        // check is for AUTO-discovery of UNtrusted relays — redundant for an
+        // explicit pin. Honour the pin order deterministically.
+        return pinned.iter().copied().find(|p| connected.contains(p));
     }
     connected
         .into_iter()
-        .filter(|c| rendezvous_relay_published(dht, c))
+        .filter(|c| rendezvous_relay_published(dht, c) || peer_advertised_relay(cap_flags, c))
         .min_by(|a, b| xor_distance_cmp(anchor, a, b))
 }
 
@@ -506,6 +531,7 @@ pub(crate) async fn rendezvous_recipient_recheck(
     current: &mut Option<[u8; 32]>,
     live_sessions: &LiveSessions,
     dht: &Arc<veil_dht::KademliaService>,
+    cap_flags: &PeerCapFlags,
     outbox: &Arc<dyn veil_dht::FrameRouter>,
     session_tx_registry: &Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
     anonymity: &Arc<super::anonymity_state::AnonymityState>,
@@ -533,7 +559,7 @@ pub(crate) async fn rendezvous_recipient_recheck(
     // entries into the local store so pick (get_local) can find one without
     // waiting on passive DHT replication.
     warm_connected_relay_directory(live_sessions, dht, outbox, logger).await;
-    match pick_rendezvous_relay_deterministic(live_sessions, dht, pinned, local_node_id) {
+    match pick_rendezvous_relay_deterministic(live_sessions, dht, cap_flags, pinned, local_node_id) {
         Some(relay) => {
             // Only commit to the new relay once the RegisterRendezvous frame
             // actually leaves — a picked "live session" may not have a tx
@@ -1491,6 +1517,10 @@ impl NodeRuntime {
         let logger = Arc::clone(&self.logger);
         let dht = Arc::clone(&self.dht);
         let live_sessions = Arc::clone(&self.live_sessions);
+        // Handshake-advertised peer capabilities — lets the relay picker confirm
+        // a CONNECTED relay (CAN_RELAY) without a flaky DHT relay-directory
+        // FIND_VALUE, which churned the registration with `no_relay`.
+        let peer_cap_flags = Arc::clone(&self.dispatcher.crypto.peer_cap_flags);
         let session_tx_registry = Arc::clone(&self.session_tx_registry);
         let anonymity = Arc::clone(&self.anonymity);
         // RPC outbox for active FIND_VALUE of connected peers' relay-directory
@@ -1574,6 +1604,7 @@ impl NodeRuntime {
                                     &mut current,
                                     &live_sessions,
                                     &dht,
+                                    &peer_cap_flags,
                                     &outbox,
                                     &session_tx_registry,
                                     &anonymity,
@@ -1645,6 +1676,7 @@ impl NodeRuntime {
                                         &mut current,
                                         &live_sessions,
                                         &dht,
+                                        &peer_cap_flags,
                                         &outbox,
                                         &session_tx_registry,
                                         &anonymity,
