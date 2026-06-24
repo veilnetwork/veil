@@ -1734,6 +1734,7 @@ impl NodeRuntime {
             Arc::clone(&self.dispatcher.pending_recursive),
             *self.identity.local_identity.node_id.as_bytes(),
             Arc::clone(&self.identity.peer_mlkem_keys),
+            Arc::clone(&self.identity.peer_mlkem_certs),
             Arc::clone(&self.logger),
         ));
         let mlkem_ek_resolver: Arc<dyn veil_types::MlKemEkResolver> =
