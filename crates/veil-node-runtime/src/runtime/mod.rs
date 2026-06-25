@@ -1077,11 +1077,22 @@ impl NodeRuntime {
         // inline. Wrapped in Zeroizing<String> so the heap contents are wiped
         // when this binding drops at end of `start`.
         let key_passphrase = crate::key_passphrase::resolve_key_passphrase(&config, &logger)?;
-        let (mlkem_ek_arr, mlkem_dk_arr) = veil_e2e::load_or_generate_mlkem_key_encrypted(
-            &mlkem_key_path,
-            key_passphrase.as_deref().map(|p| p.as_str()),
-        )
-        .map_err(|e| crate::error::NodeError::InvalidArgument(format!("{e}")))?;
+        // Resolve the ML-KEM mailbox keypair with STABILITY across restarts:
+        // an existing persisted `mlkem.key` wins; else derive deterministically
+        // from the identity seed (the fix for ephemeral-runtime-dir clients whose
+        // key used to churn every launch, breaking reverse store-and-forward
+        // delivery); else random+persist. `device_identity_sk.bin` is already on
+        // disk here (the sovereign auto-load below reads it), so no code move.
+        let (mlkem_ek_arr, mlkem_dk_arr, mlkem_key_src) =
+            crate::identity_local::mlkem_dk::load_or_derive(
+                &mlkem_key_path,
+                &veil_dir_path,
+                key_passphrase.as_deref().map(|p| p.as_str()),
+            )?;
+        logger.info(
+            "node.mlkem_dk.source",
+            format!("mlkem dk_seed source={}", mlkem_key_src.as_str()),
+        );
         // Explicit drop here documents the intent: passphrase no longer needed
         // after Argon2-derive completed inside the loader. Zeroizing's Drop
         // wipes the String's heap allocation on this line.
