@@ -2320,6 +2320,65 @@ async fn handle_ipc_client(
                         frame.extend_from_slice(&status.to_be_bytes());
                         wh.write_all(&frame).await?;
                     }
+                    Ok(LocalAppMsg::SendAuthenticatedDirectWithReply) => {
+                        use veil_proto::ipc::{
+                            SendAuthenticatedDirectWithReplyPayload, ipc_send_err,
+                        };
+                        // 0 = ok; else an ipc_send_err. AUTHENTICATED, KEM-key-
+                        // given sender-anonymous send to a known relay (NO ad
+                        // resolve) WITH a one-time reply block — the mailbox FETCH.
+                        // The reply is delivered back to (src_app_id,
+                        // reply_endpoint_id) on this client.
+                        // Rate-limit (D2) + src_app_id ownership (D1).
+                        let status: u16 = if rate_limiter.as_mut().is_some_and(|rl| !rl.allow()) {
+                            ipc_send_err::RATE_LIMITED
+                        } else if let Ok(p) =
+                            SendAuthenticatedDirectWithReplyPayload::decode(&body)
+                        {
+                            // src_app_id is the sender's app identity AND the app
+                            // the reply lands at; it must belong to this client.
+                            if !client_state.has_app_id(&p.src_app_id) {
+                                ipc_send_err::SPOOFED_SRC
+                            } else {
+                                match anon_onion_sender.as_deref() {
+                                    Some(s) => {
+                                        match s
+                                            .send_authenticated_direct_with_reply(
+                                                p.target_node_id,
+                                                p.target_x25519_pk,
+                                                p.target_app_id,
+                                                p.target_endpoint_id,
+                                                &p.data,
+                                                p.src_app_id,
+                                                p.reply_endpoint_id,
+                                            )
+                                            .await
+                                        {
+                                            Ok(()) => 0,
+                                            Err(veil_types::AnonOnionSendError::NoRelays) => {
+                                                ipc_send_err::NO_ROUTE
+                                            }
+                                            Err(
+                                                veil_types::AnonOnionSendError::PayloadTooLarge,
+                                            ) => ipc_send_err::PAYLOAD_TOO_LARGE,
+                                            Err(_) => ipc_send_err::NO_ROUTE,
+                                        }
+                                    }
+                                    None => ipc_send_err::NO_ROUTE,
+                                }
+                            }
+                        } else {
+                            ipc_send_err::INVALID_FLAGS
+                        };
+                        let mut hdr = FrameHeader::new(
+                            FrameFamily::LocalApp as u8,
+                            LocalAppMsg::SendAuthenticatedDirectWithReplyResult as u16,
+                        );
+                        hdr.body_len = 2;
+                        let mut frame = codec::encode_header(&hdr).to_vec();
+                        frame.extend_from_slice(&status.to_be_bytes());
+                        wh.write_all(&frame).await?;
+                    }
                     Ok(LocalAppMsg::TransportHintQuery) => {
                         handle_transport_hint_query(&mut wh, hint_registry.as_ref()).await?;
                     }

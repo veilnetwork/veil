@@ -561,6 +561,71 @@ impl AppSender {
             .await
     }
 
+    /// Like [`Self::send_anonymous_authenticated_with_reply`], but the caller
+    /// GIVES the relay's KEM key (`dst_x25519_pk`) directly — so the daemon
+    /// routes the source-routed onion STRAIGHT to `(dst_node_id, dst_x25519_pk)`
+    /// with NO rendezvous-ad self-resolve (the flaky lookup that returned
+    /// `NoRendezvous`). Still authenticated (the relay verifies us) and still
+    /// attaches a one-time reply block delivered back to `(this app,
+    /// reply_endpoint_id)`. The KEM-key-given mailbox FETCH. `dst_x25519_pk` is
+    /// a PUBLIC key (the relay's published KEM key). Awaits the daemon's status
+    /// ack (unlike the self-resolving variant, which is fire-and-forget).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_anonymous_authenticated_direct_with_reply(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_x25519_pk: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        reply_endpoint_id: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        use crate::client::{MAX_PENDING_OPS, prune_closed};
+        // hop_count is advisory on the wire — the daemon routes at its configured
+        // default circuit length (same hop the self-resolving authenticated send
+        // uses). Carried for SendAnonymousDirect wire symmetry; we pass 0 so the
+        // daemon's default governs.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_send_authenticated_direct_with_reply);
+            if d.pending_send_authenticated_direct_with_reply.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(format!(
+                    "send_anonymous_authenticated_direct_with_reply queue at cap \
+                     ({MAX_PENDING_OPS}); daemon may be hung"
+                )));
+            }
+            d.pending_send_authenticated_direct_with_reply.push_back(tx);
+        }
+        let payload = veilcore::proto::SendAuthenticatedDirectWithReplyPayload {
+            target_node_id: dst_node_id,
+            target_x25519_pk: dst_x25519_pk,
+            target_app_id: dst_app_id,
+            src_app_id: self.app_id,
+            target_endpoint_id: dst_endpoint_id,
+            reply_endpoint_id,
+            hop_count: 0,
+            data: data.to_vec(),
+        };
+        self.writer
+            .write_frame(
+                LocalAppMsg::SendAuthenticatedDirectWithReply as u16,
+                &payload.encode(),
+            )
+            .await?;
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(0)) => Ok(()),
+            Ok(Ok(code)) => Err(ClientError::Protocol(format!(
+                "send_anonymous_authenticated_direct_with_reply rejected by daemon \
+                 (status {code})"
+            ))),
+            Ok(Err(_)) => Err(ClientError::Protocol("daemon dropped reply".into())),
+            Err(_) => Err(ClientError::Protocol(
+                "timeout waiting for SendAuthenticatedDirectWithReplyResult".into(),
+            )),
+        }
+    }
+
     /// Reply by opaque `reply_id` (mirror [`AppHandle::reply`]). Routes back
     /// over the original sender's rendezvous path; no public ad either side.
     pub async fn reply(&self, reply_id: u64, data: &[u8]) -> Result<(), ClientError> {
