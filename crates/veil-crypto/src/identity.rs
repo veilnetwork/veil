@@ -103,6 +103,50 @@ pub fn derive_anonymity_x25519_sk(identity_sk_seed: &[u8; 32]) -> Zeroizing<[u8;
     out
 }
 
+/// Info string for the node's ML-KEM-768 mailbox decapsulation seed, derived
+/// from an identity's Ed25519 SK seed. See [`derive_mlkem_dk_seed`].
+pub const MLKEM_DK_SEED_DERIVATION_INFO: &[u8] = b"veil/mlkem-dk-seed/v1";
+
+/// Derive the node's **ML-KEM-768 mailbox decapsulation seed** (64 B)
+/// deterministically from its per-identity Ed25519 SK seed
+/// (`device_identity_sk.bin`).
+///
+/// HKDF-SHA256:
+/// ```text
+/// salt = None
+/// ikm  = identity_sk_seed (32 B, the Ed25519 SK seed)
+/// info = "veil/mlkem-dk-seed/v1"
+/// okm  = 64 B → DK768::from_seed (recomputes the matching EK deterministically)
+/// ```
+///
+/// Why this exists: the mailbox ML-KEM keypair's PUBLIC half (the encapsulation
+/// key) is published in the node's signed `MlKemKeyCert`, bound to the stable
+/// `node_id`; offline senders seal store-and-forward blobs to it. When the
+/// decapsulation seed was instead generated at random per process and persisted
+/// only in the **ephemeral** runtime dir (xVeil recreates that dir every
+/// session), the published EK churned every launch — so after a restart a peer's
+/// already-sealed blob decrypted to nothing and the open failed AEAD
+/// (`mailbox_open … Failed`), black-holing reverse delivery with no signal to the
+/// sender. Deriving from the stable identity seed pins the keypair across
+/// sessions: even a peer's stale cached cert still opens.
+///
+/// Anonymity note: adds NO linkability beyond what is already public — the EK is
+/// already published in a signed cert bound to the (already stable) `node_id`,
+/// and HKDF is a one-way PRF that never reveals the seed. The distinct info
+/// string domain-separates this from the anonymity X25519 key derived from the
+/// SAME seed. Per-identity isolation is automatic: master and each decoy load
+/// their OWN `device_identity_sk.bin`, so they derive DISTINCT keys.
+///
+/// Rotation (future, operator-initiated): bump the info string to `…/v2` AND the
+/// published `cert_version`, with a grace window — do not rotate silently.
+pub fn derive_mlkem_dk_seed(identity_sk_seed: &[u8; 32]) -> Zeroizing<[u8; 64]> {
+    let hk = Hkdf::<Sha256>::new(None, identity_sk_seed);
+    let mut out = Zeroizing::new([0u8; 64]);
+    hk.expand(MLKEM_DK_SEED_DERIVATION_INFO, out.as_mut())
+        .expect("64 bytes < 255 * hash_len");
+    out
+}
+
 /// Info string for an onion service's rendezvous auth-cookie. The current
 /// blinded-descriptor period (`now / PERIOD_SECS`, 8 LE bytes) is appended to
 /// this constant before expansion. See [`derive_onion_auth_cookie`].
@@ -260,6 +304,33 @@ mod tests {
         let anon = derive_anonymity_x25519_sk(&seed);
         let master = derive_master_sk_ed25519(&seed);
         assert_ne!(*anon, *master);
+    }
+
+    #[test]
+    fn mlkem_dk_seed_is_deterministic() {
+        // The whole point: same identity seed MUST yield the same 64-byte ML-KEM
+        // decapsulation seed across restarts, so a peer's already-sealed mailbox
+        // blob still opens after we restart (a rotating key was the AEAD black-hole).
+        let seed = [0x42u8; 32];
+        assert_eq!(*derive_mlkem_dk_seed(&seed), *derive_mlkem_dk_seed(&seed));
+    }
+
+    #[test]
+    fn mlkem_dk_seed_changes_with_seed() {
+        // Cross-identity isolation: master and decoy (distinct seeds) MUST derive
+        // distinct mailbox keys — no cross-identity linkage.
+        assert_ne!(*derive_mlkem_dk_seed(&[0x42u8; 32]), *derive_mlkem_dk_seed(&[0x43u8; 32]));
+    }
+
+    #[test]
+    fn mlkem_dk_seed_is_domain_separated_from_anonymity_key() {
+        // Same seed, different info label → the ML-KEM seed's first 32 bytes must
+        // NOT equal the anonymity x25519 key. Proves the domain string actually
+        // separates the two derivations from the SAME identity seed.
+        let seed = [0x42u8; 32];
+        let mlkem = derive_mlkem_dk_seed(&seed);
+        let anon = derive_anonymity_x25519_sk(&seed);
+        assert_ne!(mlkem[..32], *anon);
     }
 
     #[test]
