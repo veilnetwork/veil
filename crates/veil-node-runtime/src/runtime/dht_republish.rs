@@ -70,6 +70,16 @@ impl NodeRuntime {
             // (`verify_entry`); accepted at the STORE gate by the `RD` arm in
             // `validate_store_value_by_magic`.
             || magic == &veil_anonymity::directory::RELAY_DIRECTORY_DHT_MAGIC[..]
+            // RelayKeyRecord ("RK"): the relay's signed X25519 KEM pubkey,
+            // resolvable by node_id, that a sender needs to seal an anonymous
+            // mailbox deposit to an always-on relay. Same gap class as "RD"
+            // above: accepted at the STORE gate (`validate_store_value_by_magic`)
+            // and self-authenticating (signed under the publisher's identity
+            // subkey; verified by `verify_relay_key` on the read path), but
+            // missing here — so a forwarding node that cached an RK never
+            // republished it, leaving it store_local-only at the publisher and
+            // un-discoverable to any node that hadn't organically cached it.
+            || magic == &veil_proto::relay_key::RELAY_KEY_MAGIC[..]
     }
 
     pub fn spawn_dht_republish_task(&mut self, republish_interval: std::time::Duration) {
