@@ -1832,6 +1832,76 @@ impl SendAnonymousDirectPayload {
     }
 }
 
+// ── SendAuthenticatedDirectWithReplyPayload ──────────────────────────────────
+
+/// App → daemon request for an AUTHENTICATED, KEM-key-GIVEN sender-anonymous
+/// send to a KNOWN relay addressed by its `(target_node_id, target_x25519_pk)`,
+/// WITH a one-time reply block attached. Unlike [`SendAnonymousDirectPayload`]
+/// the recipient cryptographically verifies the sender (this is the mailbox
+/// FETCH, keyed on the verified receiver identity); unlike the self-resolving
+/// authenticated send it carries the relay's KEM key directly, so the daemon
+/// routes the onion straight to it with NO rendezvous-ad resolve. The reply is
+/// delivered back to `(src_app_id, reply_endpoint_id)` on this node.
+///
+/// Wire layout:
+/// ```text
+/// [0..32]    target_node_id [u8; 32]
+/// [32..64]   target_x25519_pk [u8; 32]      relay anonymity/KEM x25519
+/// [64..96]   target_app_id [u8; 32]
+/// [96..128]  src_app_id [u8; 32]            reply is delivered back to this app
+/// [128..132] target_endpoint_id u32 BE
+/// [132..136] reply_endpoint_id u32 BE       reply arrives at (src_app_id, this)
+/// [136..140] hop_count u32 BE               advisory; daemon uses its default
+/// [140..]    data                            opaque payload (tail; empty for FETCH)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendAuthenticatedDirectWithReplyPayload {
+    pub target_node_id: [u8; 32],
+    pub target_x25519_pk: [u8; 32],
+    pub target_app_id: [u8; 32],
+    pub src_app_id: [u8; 32],
+    pub target_endpoint_id: u32,
+    pub reply_endpoint_id: u32,
+    pub hop_count: u32,
+    pub data: Vec<u8>,
+}
+
+impl SendAuthenticatedDirectWithReplyPayload {
+    pub const FIXED_SIZE: usize = 32 + 32 + 32 + 32 + 4 + 4 + 4; // 140
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::FIXED_SIZE + self.data.len());
+        out.extend_from_slice(&self.target_node_id);
+        out.extend_from_slice(&self.target_x25519_pk);
+        out.extend_from_slice(&self.target_app_id);
+        out.extend_from_slice(&self.src_app_id);
+        out.extend_from_slice(&self.target_endpoint_id.to_be_bytes());
+        out.extend_from_slice(&self.reply_endpoint_id.to_be_bytes());
+        out.extend_from_slice(&self.hop_count.to_be_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::FIXED_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::FIXED_SIZE,
+                got: buf.len(),
+            });
+        }
+        Ok(Self {
+            target_node_id: super::read_array::<32>(buf, 0)?,
+            target_x25519_pk: super::read_array::<32>(buf, 32)?,
+            target_app_id: super::read_array::<32>(buf, 64)?,
+            src_app_id: super::read_array::<32>(buf, 96)?,
+            target_endpoint_id: super::read_u32_be(buf, 128)?,
+            reply_endpoint_id: super::read_u32_be(buf, 132)?,
+            hop_count: super::read_u32_be(buf, 136)?,
+            data: buf[Self::FIXED_SIZE..].to_vec(),
+        })
+    }
+}
+
 // ── AppIpcRtSendPayload ─────────────────────────────────────────────────────
 
 /// Sent by the IPC client to dispatch a real-time (RT) frame into the veil.

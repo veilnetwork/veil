@@ -249,6 +249,44 @@ void _sendAnonymousAuthenticatedWithReplyWorker(
   }
 }
 
+void _sendAnonymousAuthenticatedDirectWithReplyWorker(
+    int appAddr,
+    Uint8List dstNodeId,
+    Uint8List dstX25519Pk,
+    Uint8List dstAppId,
+    int dstEndpointId,
+    int replyEndpointId,
+    Uint8List data) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final dstNode = calloc<Uint8>(32);
+  final dstX25519 = calloc<Uint8>(32);
+  final dstApp = calloc<Uint8>(32);
+  final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    dstNode.asTypedList(32).setAll(0, dstNodeId);
+    dstX25519.asTypedList(32).setAll(0, dstX25519Pk);
+    dstApp.asTypedList(32).setAll(0, dstAppId);
+    if (data.isNotEmpty) {
+      dataPtr.asTypedList(data.length).setAll(0, data);
+    }
+    final rc = ffi.veilSendAnonymousAuthenticatedDirectWithReply(app, dstNode,
+        dstX25519, dstApp, dstEndpointId, replyEndpointId, dataPtr, data.length,
+        errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+          'anonymous authenticated direct send failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+  } finally {
+    calloc.free(dstNode);
+    calloc.free(dstX25519);
+    calloc.free(dstApp);
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
 void _sendReplyWorker(int appAddr, int replyId, Uint8List data) {
   final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
   final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
@@ -1585,6 +1623,40 @@ class AppHandle implements Finalizable {
     final appAddr = _app.address;
     return Isolate.run(() => _sendAnonymousAuthenticatedWithReplyWorker(
         appAddr, dstNodeId, dstAppId, dstEndpointId, replyEndpointId, data));
+  }
+
+  /// Like [sendAnonymousAuthenticatedWithReply], but the caller GIVES the
+  /// relay's KEM key ([dstX25519Pk], 32 bytes) directly — so the daemon routes
+  /// the source-routed onion STRAIGHT to ([dstNodeId], [dstX25519Pk]) with NO
+  /// rendezvous-ad self-resolve (the flaky lookup that returned NoRendezvous).
+  /// Still authenticated (the relay verifies us) and still attaches a one-time
+  /// reply block delivered back to (this app, [replyEndpointId]), surfacing as a
+  /// non-zero [IncomingMessage.replyId]. The KEM-key-given mailbox FETCH;
+  /// [dstX25519Pk] is a PUBLIC key (the relay's published KEM key).
+  Future<void> sendAnonymousAuthenticatedDirectWithReply({
+    required Uint8List dstNodeId,
+    required Uint8List dstX25519Pk,
+    required Uint8List dstAppId,
+    required int dstEndpointId,
+    required int replyEndpointId,
+    required Uint8List data,
+  }) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32 ||
+        dstX25519Pk.length != 32 ||
+        dstAppId.length != 32) {
+      throw ArgumentError(
+          'dst_node_id, dst_x25519_pk and dst_app_id must be 32 bytes');
+    }
+    final appAddr = _app.address;
+    return Isolate.run(() => _sendAnonymousAuthenticatedDirectWithReplyWorker(
+        appAddr,
+        dstNodeId,
+        dstX25519Pk,
+        dstAppId,
+        dstEndpointId,
+        replyEndpointId,
+        data));
   }
 
   /// Reply to a message received over the authenticated anonymous transport,

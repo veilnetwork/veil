@@ -1085,6 +1085,108 @@ pub unsafe extern "C" fn veil_send_anonymous_authenticated_with_reply(
     }
 }
 
+/// Like [`veil_send_anonymous_authenticated_with_reply`], but the caller GIVES
+/// the relay's KEM key (`dst_x25519_pk`, 32 bytes) directly — so the daemon
+/// routes the source-routed onion straight to `(dst_node_id, dst_x25519_pk)`
+/// with NO rendezvous-ad self-resolve (the flaky lookup that returned
+/// `NoRendezvous`). Still authenticated (the relay verifies the sender) and
+/// still attaches a one-time reply block delivered back to
+/// `(this app, reply_endpoint_id)`. This is the KEM-key-given mailbox FETCH;
+/// `dst_x25519_pk` is a PUBLIC key (the relay's published KEM key). All three
+/// `dst_*` arrays are 32 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_send_anonymous_authenticated_direct_with_reply(
+    app: *mut VeilApp,
+    dst_node_id: *const u8,
+    dst_x25519_pk: *const u8,
+    dst_app_id: *const u8,
+    dst_endpoint_id: u32,
+    reply_endpoint_id: u32,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe {
+        guard::ffi_prelude(err_out, "veil_send_anonymous_authenticated_direct_with_reply")
+    } {
+        return rc;
+    }
+    null_check!(err_out,
+        "app" => app,
+        "dst_node_id" => dst_node_id,
+        "dst_x25519_pk" => dst_x25519_pk,
+        "dst_app_id" => dst_app_id,
+    );
+    if data.is_null() && len > 0 {
+        unsafe {
+            write_err(err_out, "data is NULL but len > 0");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe {
+            write_err(
+                err_out,
+                format!("data len {len} exceeds VEIL_MAX_DATA_LEN ({VEIL_MAX_DATA_LEN})"),
+            );
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let mut dst_node = [0u8; 32];
+    let mut dst_x25519 = [0u8; 32];
+    let mut dst_app = [0u8; 32];
+    // SAFETY: all three pointers NULL-checked above; caller guarantees 32
+    // readable bytes each (size per the C header).
+    unsafe {
+        ptr::copy_nonoverlapping(dst_node_id, dst_node.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(dst_x25519_pk, dst_x25519.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(dst_app_id, dst_app.as_mut_ptr(), 32);
+    }
+    let payload: Vec<u8> = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    let send_res: Result<(), ClientError> = app_ref.bundle.runtime.block_on(async {
+        let inner_guard = app_ref.sender.lock().await;
+        let Some(sender) = inner_guard.as_ref() else {
+            return Err(ClientError::Protocol("app already closed".to_string()));
+        };
+        sender
+            .send_anonymous_authenticated_direct_with_reply(
+                dst_node,
+                dst_x25519,
+                dst_app,
+                dst_endpoint_id,
+                reply_endpoint_id,
+                &payload,
+            )
+            .await
+    });
+    match send_res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            let s = e.to_string();
+            unsafe {
+                write_err(err_out, format!("authenticated anonymous direct send failed: {s}"));
+            }
+            if s.contains("app already closed") {
+                VEIL_ERR_CLOSED
+            } else {
+                VEIL_ERR
+            }
+        }
+    }
+}
+
 /// Reply to a message received over the authenticated anonymous transport,
 /// addressing it by the opaque `reply_id` from the recv callback. The daemon
 /// routes the reply back over the original sender's rendezvous path — no public

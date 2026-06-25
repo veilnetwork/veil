@@ -817,6 +817,14 @@ pub enum LocalAppMsg {
     /// daemon → app: result of `LookupRelayKey`. Body:
     /// [`crate::ipc::LookupRelayKeyRespPayload`].
     LookupRelayKeyResp = 86,
+    /// App → daemon: AUTHENTICATED, KEM-key-GIVEN sender-anonymous send to a
+    /// known relay by `(node_id, x25519_pk)` WITH a one-time reply block (the
+    /// KEM-key-given mailbox FETCH). Body:
+    /// [`crate::ipc::SendAuthenticatedDirectWithReplyPayload`].
+    SendAuthenticatedDirectWithReply = 87,
+    /// daemon → app: result of `SendAuthenticatedDirectWithReply` (2-byte status
+    /// code, `0` = ok, else an `ipc_send_err`).
+    SendAuthenticatedDirectWithReplyResult = 88,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -910,6 +918,8 @@ impl TryFrom<u16> for LocalAppMsg {
             84 => Ok(LocalAppMsg::RegisterRendezvousPublisherResult),
             85 => Ok(LocalAppMsg::LookupRelayKey),
             86 => Ok(LocalAppMsg::LookupRelayKeyResp),
+            87 => Ok(LocalAppMsg::SendAuthenticatedDirectWithReply),
+            88 => Ok(LocalAppMsg::SendAuthenticatedDirectWithReplyResult),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,
