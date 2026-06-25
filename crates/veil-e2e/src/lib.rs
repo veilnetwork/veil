@@ -388,6 +388,25 @@ fn parse_dk(seed: &[u8]) -> Result<DK768, E2eError> {
     Ok(DK768::from_seed(arr))
 }
 
+/// Recompute the ML-KEM-768 keypair `(ek, dk_seed)` from a 64-byte decapsulation
+/// seed. Pure function of the seed: `DK768::from_seed` is deterministic and the
+/// EK is recomputed from it, so a deterministically-derived seed (see
+/// [`veil_crypto::identity::derive_mlkem_dk_seed`]) yields a STABLE keypair
+/// across restarts. The single home for the seed→keypair recompute used by both
+/// the persisted-key loader and the identity-derived path.
+pub fn keypair_from_dk_seed(
+    seed: &[u8; DK_SEED_BYTES],
+) -> Result<([u8; EK_BYTES], [u8; DK_SEED_BYTES]), E2eError> {
+    let dk = parse_dk(seed)?;
+    let ek: [u8; EK_BYTES] = dk
+        .encapsulation_key()
+        .to_bytes()
+        .as_slice()
+        .try_into()
+        .map_err(|_| E2eError::InvalidDk(EK_BYTES))?;
+    Ok((ek, *seed))
+}
+
 // ── Key persistence ───────────────────────────────────────────────────────────
 
 const PEM_HEADER: &str = "-----BEGIN VEIL ML-KEM-768 KEY-----";
@@ -796,6 +815,25 @@ mod tests {
         let env = encrypt(&ek, &src, &dst, plaintext).unwrap();
         let recovered = decrypt(&dk, &src, &dst, &env).unwrap();
         assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn keypair_from_dk_seed_is_stable_and_openable() {
+        // Regression for the reverse-delivery black-hole: a deterministic 64-byte
+        // dk_seed yields a STABLE keypair, and a payload sealed to its EK opens
+        // with the dk_seed re-derived from the SAME seed — exactly the cross-
+        // restart property that makes a peer's already-sealed mailbox blob open.
+        let seed = [0x55u8; DK_SEED_BYTES];
+        let (ek, dk) = keypair_from_dk_seed(&seed).unwrap();
+        let (ek2, dk2) = keypair_from_dk_seed(&seed).unwrap();
+        assert_eq!(ek, ek2, "same seed must give the same EK");
+        assert_eq!(dk, dk2);
+        assert_eq!(dk, seed, "dk_seed is returned verbatim");
+        // The EK genuinely matches the dk_seed across a simulated restart.
+        let (src, dst) = ids();
+        let env = encrypt(&ek, &src, &dst, b"reverse delivery").unwrap();
+        let recovered = decrypt(&dk2, &src, &dst, &env).unwrap();
+        assert_eq!(recovered, b"reverse delivery");
     }
 
     /// C-09 foundation: the sender (encapsulate) and recipient (decapsulate)
