@@ -242,65 +242,16 @@ class VeilMailbox {
     required Uint8List blob,
     required int ourCertVersion,
   }) async {
-    return Future(() {
-      final blobPtr = calloc<Uint8>(blob.isEmpty ? 1 : blob.length);
-      final outSender = calloc<Uint8>(32);
-      final outAppId = calloc<Uint8>(32);
-      final outEndpoint = calloc<Uint32>();
-      final outData = calloc<Pointer<Uint8>>();
-      final outDataLen = calloc<IntPtr>();
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        if (blob.isNotEmpty) blobPtr.asTypedList(blob.length).setAll(0, blob);
-        final rc = ffi.veilMailboxOpen(
-          _handle,
-          ourCertVersion,
-          blobPtr,
-          blob.length,
-          outSender,
-          outAppId,
-          outEndpoint,
-          outData,
-          outDataLen,
-          errOut,
-        );
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-            'mailbox_open failed: ${_readErrAndFree(errOut)}',
-            code: rc,
-          );
-        }
-        final senderNodeId = Uint8List.fromList(outSender.asTypedList(32));
-        final appId = Uint8List.fromList(outAppId.asTypedList(32));
-        final endpointId = outEndpoint.value;
-        final dataPtr = outData.value;
-        final dataLen = outDataLen.value;
-        Uint8List payload;
-        if (dataPtr == nullptr) {
-          payload = Uint8List(0);
-        } else {
-          try {
-            payload = Uint8List.fromList(dataPtr.asTypedList(dataLen));
-          } finally {
-            ffi.veilFreeBuf(dataPtr, dataLen);
-          }
-        }
-        return MailboxOpened(
-          senderNodeId: senderNodeId,
-          appId: appId,
-          endpointId: endpointId,
-          data: payload,
-        );
-      } finally {
-        calloc.free(blobPtr);
-        calloc.free(outSender);
-        calloc.free(outAppId);
-        calloc.free(outEndpoint);
-        calloc.free(outData);
-        calloc.free(outDataLen);
-        calloc.free(errOut);
-      }
-    });
+    // Open + verify decrypts under our dk_seed and — for a v2 blob or a missing
+    // embedded sender doc — resolves the sender's document over the DHT. That is
+    // BLOCKING (a tokio block_on that can park on a slow/timed-out DHT walk) and
+    // is hit on every drained blob. It MUST run off the UI isolate via a
+    // TOP-LEVEL worker (sendable captures only), exactly like seal/fetch/put.
+    // Running it inline (`Future(() => …)`, which stays on the current isolate)
+    // froze the whole app on every drain — a stale un-openable blob's DHT
+    // fallback parked the main isolate for seconds at a time.
+    final handleAddr = _handle.address;
+    return Isolate.run(() => _openWorker(handleAddr, ourCertVersion, blob));
   }
 
   /// Library-internal: construct against a client's borrowed handle.
@@ -385,6 +336,67 @@ List<RendezvousReplica> _lookupReplicasWorker(
     calloc.free(recv);
     calloc.free(outBuf);
     calloc.free(outLen);
+    calloc.free(errOut);
+  }
+}
+
+MailboxOpened _openWorker(int handleAddr, int ourCertVersion, Uint8List blob) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final blobPtr = calloc<Uint8>(blob.isEmpty ? 1 : blob.length);
+  final outSender = calloc<Uint8>(32);
+  final outAppId = calloc<Uint8>(32);
+  final outEndpoint = calloc<Uint32>();
+  final outData = calloc<Pointer<Uint8>>();
+  final outDataLen = calloc<IntPtr>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    if (blob.isNotEmpty) blobPtr.asTypedList(blob.length).setAll(0, blob);
+    final rc = ffi.veilMailboxOpen(
+      handle,
+      ourCertVersion,
+      blobPtr,
+      blob.length,
+      outSender,
+      outAppId,
+      outEndpoint,
+      outData,
+      outDataLen,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'mailbox_open failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+    final senderNodeId = Uint8List.fromList(outSender.asTypedList(32));
+    final appId = Uint8List.fromList(outAppId.asTypedList(32));
+    final endpointId = outEndpoint.value;
+    final dataPtr = outData.value;
+    final dataLen = outDataLen.value;
+    Uint8List payload;
+    if (dataPtr == nullptr) {
+      payload = Uint8List(0);
+    } else {
+      try {
+        payload = Uint8List.fromList(dataPtr.asTypedList(dataLen));
+      } finally {
+        ffi.veilFreeBuf(dataPtr, dataLen);
+      }
+    }
+    return MailboxOpened(
+      senderNodeId: senderNodeId,
+      appId: appId,
+      endpointId: endpointId,
+      data: payload,
+    );
+  } finally {
+    calloc.free(blobPtr);
+    calloc.free(outSender);
+    calloc.free(outAppId);
+    calloc.free(outEndpoint);
+    calloc.free(outData);
+    calloc.free(outDataLen);
     calloc.free(errOut);
   }
 }
