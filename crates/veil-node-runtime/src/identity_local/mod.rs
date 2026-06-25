@@ -15,4 +15,5 @@ pub use veil_identity::{
 };
 
 pub mod anonymity_x25519;
+pub mod mlkem_dk;
 pub mod publisher_dht;
