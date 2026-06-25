@@ -452,6 +452,10 @@ pub(crate) struct DispatchTable {
     /// Pending oneshot replies for `SendAnonymousDirect` (2-byte status; 0=ok).
     pub pending_send_anonymous_direct:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
+    /// Pending oneshot replies for `SendAuthenticatedDirectWithReply` (the
+    /// KEM-key-given mailbox FETCH; 2-byte status; 0=ok).
+    pub pending_send_authenticated_direct_with_reply:
+        std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
     ///.4 P2: pending oneshot replies for `MailboxPut`.
     pub pending_mailbox_put:
         std::collections::VecDeque<tokio::sync::oneshot::Sender<MailboxPutReply>>,
@@ -585,6 +589,7 @@ impl DispatchTable {
             pending_register_rendezvous_publisher: std::collections::VecDeque::new(),
             pending_send_to_onion_service: std::collections::VecDeque::new(),
             pending_send_anonymous_direct: std::collections::VecDeque::new(),
+            pending_send_authenticated_direct_with_reply: std::collections::VecDeque::new(),
             pending_mailbox_put: std::collections::VecDeque::new(),
             pending_mailbox_fetch: std::collections::VecDeque::new(),
             pending_mailbox_ack: std::collections::VecDeque::new(),
@@ -2625,6 +2630,15 @@ async fn reader_task(
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
                 if let Some(tx) = pop_next_open(&mut d.pending_send_anonymous_direct) {
+                    let _ = tx.send(status);
+                }
+            }
+            LocalAppMsg::SendAuthenticatedDirectWithReplyResult if body.len() >= 2 => {
+                let status = u16::from_be_bytes([body[0], body[1]]);
+                let mut d = dispatch.lock().await;
+                if let Some(tx) =
+                    pop_next_open(&mut d.pending_send_authenticated_direct_with_reply)
+                {
                     let _ = tx.send(status);
                 }
             }

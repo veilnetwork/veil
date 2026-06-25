@@ -7004,6 +7004,138 @@ impl NodeServices {
         Ok(())
     }
 
+    /// Authenticated anonymous send to a KNOWN relay (KEM key given) with an
+    /// optional one-time reply block — the mailbox FETCH primitive.
+    ///
+    /// This is the proven key-given direct-onion send (reaches the target as the
+    /// final onion hop with NO rendezvous-ad resolve, exactly like the mailbox
+    /// DEPOSIT) plus the one-time reply-block construction from
+    /// [`Self::send_via_rendezvous_authenticated`]. It exists because the mailbox
+    /// drain must reach the RELAY directly: a relay publishes no `RendezvousAd`
+    /// for itself, so the ad-resolving [`Self::send_anonymous_authenticated_to`]
+    /// always returns `NoRendezvous` for a relay node_id. Here the caller hands us
+    /// the relay's KEM key (cached at registration), so the sealed `AuthAppDeliver`
+    /// is onion-routed straight to the relay — zero DHT ad lookup, no
+    /// `NoRendezvous`.
+    ///
+    /// Anonymity: the forward send is a source-routed onion (the relay learns
+    /// nothing of our location); the relay sees our sovereign node_id ONLY because
+    /// the mailbox is, by design, keyed on the verified receiver identity
+    /// (identical exposure to the ad-resolving path this replaces). The reply
+    /// rides a one-time onion reply circuit to a relay WE pick, forwarded by
+    /// cookie alone, so the mailbox relay cannot correlate our identity to a
+    /// network location or to the reply path. No plain/direct-session fallback —
+    /// on `InsufficientRelayCandidates` this errors rather than degrading.
+    ///
+    /// FETCH `data` is empty, so the signed `AuthAppDeliver` is a single onion
+    /// cell — no fragmentation loop (unlike the rendezvous path).
+    pub fn send_anonymous_authenticated_direct_with_reply(
+        &self,
+        target_node_id: [u8; 32],
+        target_x25519_pk: [u8; 32],
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        data: &[u8],
+        hop_count: usize,
+        // `Some((reply_app_id, reply_endpoint_id))` attaches a one-time reply
+        // block so the relay can answer our mailbox over an onion reply circuit
+        // WITHOUT either side publishing a public ad.
+        reply: Option<([u8; 32], u32)>,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        use rand_core::RngCore;
+
+        const REPLY_CIRCUIT_HOPS: usize = 2;
+
+        let sovereign = self
+            .identity
+            .sovereign_identity
+            .as_ref()
+            .ok_or(veil_anonymity::sender::SenderError::MissingSenderIdentity)?;
+
+        // PREPARE the reply block (select relay path + cookie) so its bytes are
+        // counted in the size check below, but DEFER building the onion circuit
+        // (which registers a cookie at R_a) until AFTER the size check passes —
+        // otherwise a late size failure would strand the ephemeral circuit + its
+        // R_a registration (presence leak + idle-GC churn). Mirrors
+        // `send_via_rendezvous_authenticated` exactly.
+        let (reply_block, pending_reply_circuit) = match reply {
+            Some((reply_app_id, reply_endpoint_id)) => {
+                // We must own the anonymity key to unseal the eventual reply
+                // (receive-capable: `receive_anonymous`/`relay_capable`).
+                let x25519_pk = match self.dispatcher.anonymity_x25519_sk.as_ref() {
+                    Some(sk) => x25519_dalek::PublicKey::from(sk.as_ref()).to_bytes(),
+                    None => {
+                        return Err(veil_anonymity::sender::SenderError::MissingReplyCapability);
+                    }
+                };
+                let relay_path = self.select_onion_relay_path(REPLY_CIRCUIT_HOPS).map_err(|_| {
+                    veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                        need: REPLY_CIRCUIT_HOPS,
+                        have: 0,
+                    }
+                })?;
+                let relay = *relay_path.last().expect("non-empty relay path");
+                let mut cookie = [0u8; 16];
+                rand_core::OsRng.fill_bytes(&mut cookie);
+                let reply_reg_kp =
+                    veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+                let block = veil_proto::ReplyBlock {
+                    rendezvous_node_id: relay,
+                    auth_cookie: cookie,
+                    x25519_pk,
+                    reply_app_id,
+                    reply_endpoint_id,
+                    receiver_node_id: *self.identity.local_identity.node_id.as_bytes(),
+                };
+                (Some(block), Some((relay_path, cookie, reply_reg_kp)))
+            }
+            None => (None, None),
+        };
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let nonce = rand_core::OsRng.next_u64();
+
+        let auth = sovereign.sign_auth_deliver(
+            target_node_id,
+            target_app_id,
+            target_endpoint_id,
+            now_unix,
+            nonce,
+            data.to_vec(),
+            reply_block,
+        );
+        let auth_bytes = auth.encode();
+        if auth_bytes.len() > veil_proto::MAX_AUTH_DELIVER_MSG_BYTES {
+            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
+                hop_count,
+                got: data.len(),
+                max: veil_proto::MAX_AUTH_DELIVER_MSG_BYTES,
+            });
+        }
+
+        // Size OK — NOW build the ephemeral reply circuit (registers the cookie at
+        // R_a). A size failure above returns without ever creating one.
+        if let Some((relay_path, cookie, reply_reg_kp)) = pending_reply_circuit {
+            let reply_epoch = std::sync::atomic::AtomicU64::new(0);
+            self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch)
+                .map_err(|_| {
+                    veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                        need: REPLY_CIRCUIT_HOPS,
+                        have: 0,
+                    }
+                })?;
+        }
+
+        let mut payload_bytes = Vec::with_capacity(1 + auth_bytes.len());
+        payload_bytes.push(veil_anonymity::rendezvous::final_hop_kind::APP_DELIVER_AUTH);
+        payload_bytes.extend_from_slice(&auth_bytes);
+
+        self.send_anonymous_onion(&payload_bytes, target_node_id, target_x25519_pk, hop_count)
+    }
+
     /// Resolve the recipient's `RendezvousAd` and send an authenticated
     /// anonymous message to it (Epic 482 v1, "any recipient"). This is the
     /// production entry point behind the IPC `anonymous_authenticated` flag.

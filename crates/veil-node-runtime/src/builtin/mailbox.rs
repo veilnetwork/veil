@@ -873,6 +873,11 @@ mod tests {
         ) -> AnonFut<'a> {
             unimplemented!()
         }
+        fn send_authenticated_direct_with_reply<'a>(
+            &'a self, _: [u8; 32], _: [u8; 32], _: [u8; 32], _: u32, _: &'a [u8], _: [u8; 32], _: u32,
+        ) -> AnonFut<'a> {
+            Box::pin(async { Ok(()) })
+        }
         fn register_onion_service<'a>(&'a self, _: usize) -> AnonFut<'a> {
             unimplemented!()
         }

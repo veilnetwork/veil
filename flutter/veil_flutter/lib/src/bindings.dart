@@ -310,6 +310,35 @@ final int Function(
             )>>('veil_send_anonymous_authenticated_with_reply')
     .asFunction();
 
+/// Like [veilSendAnonymousAuthenticatedWithReply], but with an explicit relay
+/// KEM key (`dstX25519Pk`, 32 bytes) so the daemon routes straight to the relay
+/// with NO rendezvous-ad self-resolve. The KEM-key-given mailbox FETCH.
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>, // dstNodeId
+  Pointer<Uint8>, // dstX25519Pk
+  Pointer<Uint8>, // dstAppId
+  int, // dstEndpointId
+  int, // replyEndpointId
+  Pointer<Uint8>, // data
+  int, // len
+  Pointer<Pointer<Utf8>>, // errOut
+) veilSendAnonymousAuthenticatedDirectWithReply = nativeLib
+    .lookup<
+            NativeFunction<
+                Int32 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Uint32,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_send_anonymous_authenticated_direct_with_reply')
+    .asFunction();
+
 final int Function(
   Pointer<VeilApp>,
   int,

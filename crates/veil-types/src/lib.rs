@@ -195,6 +195,28 @@ pub trait AnonOnionSender: Send + Sync {
         Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
     >;
 
+    /// Like [`Self::send_authenticated_with_reply`], but the caller GIVES the
+    /// target's `(target_node_id, target_x25519_pk)` directly (a known mailbox
+    /// relay), so the implementation routes a source-routed onion straight to it
+    /// with NO rendezvous-ad resolve (eliminates the flaky self-resolve that
+    /// returns `NoRendezvous`). Still authenticated — the relay verifies the
+    /// sender — and still attaches a one-time reply block addressed to
+    /// `(reply_app_id, reply_endpoint_id)` on this node so the relay can answer
+    /// WITHOUT either side publishing a public ad. The circuit length is the
+    /// implementation's configured default.
+    fn send_authenticated_direct_with_reply<'a>(
+        &'a self,
+        target_node_id: [u8; 32],
+        target_x25519_pk: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: &'a [u8],
+        reply_app_id: [u8; 32],
+        reply_endpoint_id: u32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), AnonOnionSendError>> + Send + 'a>,
+    >;
+
     /// Reply to an earlier authenticated message via the opaque `reply_id` the
     /// recipient app received with it. The implementation sends back over the
     /// original sender's rendezvous path. `src_app_id` is the replying app; it
