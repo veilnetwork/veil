@@ -1067,46 +1067,16 @@ impl NodeRuntime {
         let transport_ctx = Arc::new(veil_cfg::transport_glue::context_from_config(&config)?);
         let local_identity = Arc::new(HandshakeIdentity::from_config(&config)?);
 
-        // 62.3: ML-KEM-768 keypair — load from disk or generate at first run.
+        // veil_dir is the node config's parent — home of the identity files
+        // (`device_identity_sk.bin`, `mlkem.key`) read by the sovereign load and
+        // the ML-KEM key resolution. The ML-KEM keypair is resolved AFTER the
+        // sovereign auto-load below (not here), because its identity-derived path
+        // needs `device_identity_sk.bin`, which the standalone-identity build
+        // writes during that auto-load.
         let veil_dir_path = config_path
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
-        let mlkem_key_path = veil_dir_path.join("mlkem.key");
-        // Resolve passphrase via the priority cascade: prompt > env > file >
-        // inline. Wrapped in Zeroizing<String> so the heap contents are wiped
-        // when this binding drops at end of `start`.
-        let key_passphrase = crate::key_passphrase::resolve_key_passphrase(&config, &logger)?;
-        // Resolve the ML-KEM mailbox keypair with STABILITY across restarts:
-        // an existing persisted `mlkem.key` wins; else derive deterministically
-        // from the identity seed (the fix for ephemeral-runtime-dir clients whose
-        // key used to churn every launch, breaking reverse store-and-forward
-        // delivery); else random+persist. `device_identity_sk.bin` is already on
-        // disk here (the sovereign auto-load below reads it), so no code move.
-        let (mlkem_ek_arr, mlkem_dk_arr, mlkem_key_src) =
-            crate::identity_local::mlkem_dk::load_or_derive(
-                &mlkem_key_path,
-                &veil_dir_path,
-                key_passphrase.as_deref().map(|p| p.as_str()),
-            )?;
-        logger.info(
-            "node.mlkem_dk.source",
-            format!("mlkem dk_seed source={}", mlkem_key_src.as_str()),
-        );
-        // Explicit drop here documents the intent: passphrase no longer needed
-        // after Argon2-derive completed inside the loader. Zeroizing's Drop
-        // wipes the String's heap allocation on this line.
-        drop(key_passphrase);
-        let mlkem_ek = Arc::new(mlkem_ek_arr);
-        // Phase 6 slice 6g — wrap the long-lived DK seed in a
-        // SensitiveBytesN<64> wrapper so the bytes are mlock-pinned
-        // (or zeroize-on-drop fallback) for the process lifetime.  The
-        // raw `[u8; 64]` from `load_or_generate_mlkem_key_encrypted`
-        // gets copied into the mlocked storage and the source array
-        // goes out of scope at the end of this statement (stack drop).
-        let mlkem_dk_seed = Arc::new(veil_util::sensitive_bytes::SensitiveBytesN::<
-            { veil_e2e::DK_SEED_BYTES },
-        >::from_bytes(mlkem_dk_arr));
 
         // sovereign-identity auto-load. Three paths:
         //
@@ -1159,6 +1129,37 @@ impl NodeRuntime {
                 build_standalone_sovereign_identity(&veil_dir_path, &config, &logger)
             }
         };
+
+        // ML-KEM-768 mailbox keypair — resolved HERE, after the sovereign
+        // auto-load, because the IDENTITY-DERIVED path (the stable-key fix) reads
+        // `device_identity_sk.bin`, which the standalone-identity build writes
+        // during that auto-load. Resolving it before the load silently fell back
+        // to a random per-launch key (the reverse store-and-forward black-hole:
+        // a peer's blob sealed to last launch's published EK could not be opened
+        // after a restart). An existing persisted `mlkem.key` still wins
+        // (operator/seed nodes never rotate); a node with no identity seed
+        // (Falcon, or sovereign load failed) falls back to random+persist.
+        let mlkem_key_path = veil_dir_path.join("mlkem.key");
+        // Passphrase cascade: prompt > env > file > inline. Zeroizing<String>
+        // wipes the heap contents when it drops just below.
+        let key_passphrase = crate::key_passphrase::resolve_key_passphrase(&config, &logger)?;
+        let (mlkem_ek_arr, mlkem_dk_arr, mlkem_key_src) =
+            crate::identity_local::mlkem_dk::load_or_derive(
+                &mlkem_key_path,
+                &veil_dir_path,
+                key_passphrase.as_deref().map(|p| p.as_str()),
+            )?;
+        logger.info(
+            "node.mlkem_dk.source",
+            format!("mlkem dk_seed source={}", mlkem_key_src.as_str()),
+        );
+        drop(key_passphrase);
+        let mlkem_ek = Arc::new(mlkem_ek_arr);
+        // mlock-pin the long-lived DK seed for the process lifetime (or
+        // zeroize-on-drop fallback); the source array drops at end of statement.
+        let mlkem_dk_seed = Arc::new(veil_util::sensitive_bytes::SensitiveBytesN::<
+            { veil_e2e::DK_SEED_BYTES },
+        >::from_bytes(mlkem_dk_arr));
 
         // d removed the persistent RevocationCache; document
         // freshness now relies on `valid_until_unix` alone.
