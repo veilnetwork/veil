@@ -30,6 +30,7 @@ use veil_dispatcher::PendingRecursive;
 use veil_e2e::PeerMlKemCache;
 use veil_identity::mailbox_seal::{self, MailboxSealError};
 use veil_identity::sovereign::SovereignIdentity;
+use veil_identity::verify::verify_identity_document;
 use veil_observability::NodeLogger;
 use veil_proto::ipc::AuthAppDeliver;
 use veil_session::SessionTxRegistry;
@@ -116,8 +117,16 @@ impl RuntimeMailboxCrypto {
             .fetch_verified_cert(recipient_node_id)
             .await
             .ok_or(OfflineSealError::RecipientCertUnresolved)?;
-        mailbox_seal::seal_mailbox_blob(&auth, &cert, &self.local_node_id, &recipient_node_id)
-            .map_err(OfflineSealError::Seal)
+        // Embed our own signed document so an offline recipient can verify us
+        // without a DHT resolve (see `open` + `seal_mailbox_blob`).
+        mailbox_seal::seal_mailbox_blob(
+            &auth,
+            &cert,
+            &self.local_node_id,
+            &recipient_node_id,
+            &sovereign.document,
+        )
+        .map_err(OfflineSealError::Seal)
     }
 
     /// Open + verify a mailbox blob fetched for us, decrypting under our
@@ -143,13 +152,34 @@ impl RuntimeMailboxCrypto {
             our_cert_version,
         )
         .map_err(OfflineSealError::Open)?;
-        let sender_doc = self
-            .mlkem_resolver()
-            // The blob's sender is an arbitrary third party, not necessarily a
-            // connected peer — keep the XOR-closest recursive walk.
-            .fetch_verified_document(sender_node_id, None)
-            .await
-            .ok_or(OfflineSealError::SenderDocUnresolved)?;
+        // Prefer the sender's OWN document embedded in the blob (v3): it is
+        // self-authenticating, so we verify it locally and open with NO DHT
+        // round-trip — the reachability proof that lets a NAT'd / cold-routing-
+        // table recipient (e.g. a phone whose recursive walk finds 0 contacts)
+        // open the message that previously failed `SenderDocUnresolved`. Fall back
+        // to a DHT resolve only for a legacy v2 blob, or if the embed is
+        // absent/forged (then it fails closed exactly like an unresolved lookup).
+        let embedded = mailbox_seal::recover_embedded_sender_doc(
+            blob,
+            &our_instance,
+            &self.local_node_id,
+            &sender_node_id,
+            self.mlkem_dk_seed.as_array(),
+            our_cert_version,
+        )
+        .filter(|doc| {
+            doc.node_id == sender_node_id && verify_identity_document(doc, now).is_ok()
+        });
+        let sender_doc = match embedded {
+            Some(doc) => doc,
+            None => self
+                .mlkem_resolver()
+                // The blob's sender is an arbitrary third party, not necessarily a
+                // connected peer — keep the XOR-closest recursive walk.
+                .fetch_verified_document(sender_node_id, None)
+                .await
+                .ok_or(OfflineSealError::SenderDocUnresolved)?,
+        };
         mailbox_seal::open_mailbox_blob(
             blob,
             &our_instance,
