@@ -280,20 +280,33 @@ pub async fn handle_fetch_message(
             return;
         }
     };
-    // Bound the reply to fit one anonymous reply payload (oldest-first).
+    // Bound the reply so the whole encoded MailboxFetchRespPayload fits in ONE
+    // signed AuthDeliver. The reply rides a single auth-deliver capped at
+    // MAX_AUTH_DELIVER_MSG_BYTES (~6 KB, fragmented); the old 60 KB cap let a
+    // backlog overflow it → send_reply failed PayloadTooLarge → the reply was
+    // never sent and the receiver could NEVER drain (blobs then accumulate past
+    // 6 KB permanently). Account for the per-blob wire header too, and leave
+    // margin for the AuthDeliver framing (sig + node_id + fields) + resp count.
+    // Oldest-first; the receiver re-fetches to drain the rest (FETCH is
+    // non-destructive, deduped receiver-side by content_id).
+    const PER_BLOB_WIRE_HDR: usize = 32 + 32 + 8 + 4; // sender_id+content_id+deposited_at+blob_len
+    let reply_budget = veil_proto::MAX_AUTH_DELIVER_MSG_BYTES
+        .saturating_sub(512)
+        .min(MAILBOX_FETCH_REPLY_MAX_BYTES);
     let mut total = 0usize;
     let wire: Vec<MailboxBlobWire> = blobs
         .into_iter()
         .take(MAX_MAILBOX_FETCH_ENTRIES)
         .take_while(|b| {
+            let cost = b.blob.len() + PER_BLOB_WIRE_HDR;
             if total == 0 {
-                total = b.blob.len();
+                total = cost;
                 return true; // always emit at least one (guarantees progress)
             }
-            if total + b.blob.len() > MAILBOX_FETCH_REPLY_MAX_BYTES {
+            if total + cost > reply_budget {
                 return false;
             }
-            total += b.blob.len();
+            total += cost;
             true
         })
         .map(|b| MailboxBlobWire {
