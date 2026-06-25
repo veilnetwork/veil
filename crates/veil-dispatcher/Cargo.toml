@@ -5,6 +5,13 @@ edition = "2024"
 description = "OVL1 frame dispatcher: routes incoming frames (control, session, discovery, app, anonymity, delivery, routing) to the correct service plane. Phase 3 of veilcore extraction."
 license = "AGPL-3.0-or-later"
 
+[features]
+# Verbose relay-path tracing (cookie_unknown / session_forwarded / register.ok
+# logged WITH the rendezvous cookie) for debugging delivery. OFF by default —
+# the cookie is a subscriber-linkable value, so production builds keep the
+# opaque messages. Enable with `--features veil-dispatcher/relay-trace`.
+relay-trace = []
+
 [dependencies]
 veil-abuse = { path = "../veil-abuse" }
 veil-anonymity = { path = "../veil-anonymity" }

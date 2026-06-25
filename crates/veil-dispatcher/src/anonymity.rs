@@ -381,6 +381,28 @@ impl FrameDispatcher {
                         // surfacing this would leak "this rendezvous serves
                         // cookie X / Y" to sender probes — exactly what the
                         // auth_cookie cipher-shape is designed to hide.
+                        // INSTRUMENT (`relay-trace` feature, OFF in prod): log the
+                        // introduce's (receiver, cookie) so it can be diffed
+                        // against the register.ok keys. The default build keeps the
+                        // opaque message (surfacing the cookie would leak "this
+                        // rendezvous serves cookie X" to sender probes).
+                        #[cfg(feature = "relay-trace")]
+                        {
+                            let cu_cookie: String = intro
+                                .auth_cookie
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
+                            self.logger.info(
+                                "anonymity.relay_chain.introduce.cookie_unknown",
+                                format!(
+                                    "no subscriber for receiver={} cookie={}; dropped",
+                                    veil_util::hex_short(&intro.receiver_node_id),
+                                    cu_cookie,
+                                ),
+                            );
+                        }
+                        #[cfg(not(feature = "relay-trace"))]
                         self.logger.info(
                             "anonymity.relay_chain.introduce.cookie_unknown",
                             "no subscriber registered for this (receiver, auth_cookie); dropped",
@@ -401,6 +423,23 @@ impl FrameDispatcher {
         // subscriber.peer_node_id is the raw [u8; 32] from the
         // veil-anonymity crate — convert to NodeId at the boundary.
         let target = NodeId::from(subscriber.peer_node_id);
+        // INSTRUMENT (`relay-trace` feature, OFF in prod): the session-forward
+        // path is otherwise SILENT, so a live plain/session introduce delivery
+        // left no log (only the circuit path logged introduce.forwarded) — making
+        // "forwarded=0" misleading.
+        #[cfg(feature = "relay-trace")]
+        {
+            let sf_cookie: String =
+                intro.auth_cookie.iter().map(|b| format!("{b:02x}")).collect();
+            self.logger.info(
+                "anonymity.relay_chain.introduce.session_forwarded",
+                format!(
+                    "forwarded to receiver={} cookie={}",
+                    veil_util::hex_short(&subscriber.peer_node_id),
+                    sf_cookie,
+                ),
+            );
+        }
         self.send_relay_chain_msg(&target, RelayChainMsg::ForwardIntroduce, &body_bytes);
         DispatchResult::NoResponse
     }
@@ -470,6 +509,28 @@ impl FrameDispatcher {
         };
         match reg.register(req.auth_cookie, subscriber) {
             Ok(()) => {
+                // INSTRUMENT (`relay-trace` feature, OFF in prod): include the
+                // cookie so a register.ok can be diffed against an introduce's
+                // cookie_unknown. Default build omits it (a registered cookie is a
+                // subscriber-linkable value).
+                #[cfg(feature = "relay-trace")]
+                {
+                    let reg_cookie: String = req
+                        .auth_cookie
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    self.logger.info(
+                        "anonymity.relay_chain.register.ok",
+                        format!(
+                            "registered cookie={} from peer={}; total registrations={}",
+                            reg_cookie,
+                            veil_util::hex_short(node_id.as_bytes()),
+                            reg.len(),
+                        ),
+                    );
+                }
+                #[cfg(not(feature = "relay-trace"))]
                 self.logger.info(
                     "anonymity.relay_chain.register.ok",
                     format!(
