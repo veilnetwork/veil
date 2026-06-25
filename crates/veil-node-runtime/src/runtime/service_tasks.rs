@@ -3135,6 +3135,40 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
         })
     }
 
+    fn send_authenticated_direct_with_reply<'a>(
+        &'a self,
+        target_node_id: [u8; 32],
+        target_x25519_pk: [u8; 32],
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        data: &'a [u8],
+        reply_app_id: [u8; 32],
+        reply_endpoint_id: u32,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), veil_types::AnonOnionSendError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            // The KEM-key-given mailbox FETCH: route a source-routed onion
+            // straight to the known relay (NO ad resolve), authenticated, with a
+            // one-time reply block so the relay answers over our return circuit.
+            self.access
+                .send_anonymous_authenticated_direct_with_reply(
+                    target_node_id,
+                    target_x25519_pk,
+                    app_id,
+                    endpoint_id,
+                    data,
+                    self.hop_count,
+                    Some((reply_app_id, reply_endpoint_id)),
+                )
+                .map_err(super::map_sender_err)
+        })
+    }
+
     fn send_reply<'a>(
         &'a self,
         reply_id: u64,
