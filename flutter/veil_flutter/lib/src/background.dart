@@ -85,4 +85,31 @@ class VeilBackground {
     if (!Platform.isAndroid) return;
     await _channel.invokeMethod<void>('stopBackgroundService');
   }
+
+  /// Whether the app is exempt from battery optimisation (Doze). A foreground
+  /// service is NOT enough on Doze + aggressive OEMs — without this exemption the
+  /// OS still suspends the process when backgrounded, so the node stops receiving.
+  /// True on non-Android (no such restriction) and pre-Android-6.
+  static Future<bool> isIgnoringBatteryOptimizations() async {
+    if (!Platform.isAndroid) return true;
+    return await _channel
+            .invokeMethod<bool>('isIgnoringBatteryOptimizations') ??
+        true;
+  }
+
+  /// Show the system dialog asking the user to exempt the app from battery
+  /// optimisation (so the foreground service is actually allowed to keep the
+  /// process alive). No-op off Android.
+  static Future<void> requestIgnoreBatteryOptimizations() async {
+    if (!Platform.isAndroid) return;
+    await _channel.invokeMethod<void>('requestIgnoreBatteryOptimizations');
+  }
+
+  /// Open this app's system details screen — where MIUI/HyperOS/OneUI hide the
+  /// per-app "Autostart" + "No battery restrictions" knobs a foreground service
+  /// still needs on those OEMs. No-op off Android.
+  static Future<void> openBackgroundSettings() async {
+    if (!Platform.isAndroid) return;
+    await _channel.invokeMethod<void>('openBackgroundSettings');
+  }
 }
