@@ -17,7 +17,10 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -113,6 +116,65 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                 }
                 ctx.startService(intent)
                 result.success(null)
+            }
+            // ── Background-execution permission (battery optimisation) ───────
+            // A foreground service alone is NOT enough on Doze + aggressive
+            // OEMs (MIUI/HyperOS, OneUI): unless the app is battery-exempt the
+            // OS still suspends/kills the process when backgrounded, so the
+            // node stops receiving and notifications/replies die. These let the
+            // app check + request the exemption (and deep-link to the per-app
+            // settings where OEMs hide "Autostart").
+            "isIgnoringBatteryOptimizations" -> {
+                val pm = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    pm?.isIgnoringBatteryOptimizations(ctx.packageName) ?: true
+                } else {
+                    true
+                }
+                result.success(ok)
+            }
+            "requestIgnoreBatteryOptimizations" -> {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+                    result.success(true)
+                    return
+                }
+                try {
+                    val intent = Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:${ctx.packageName}"),
+                    )
+                    val act = activity
+                    if (act != null) {
+                        act.startActivity(intent)
+                    } else {
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        ctx.startActivity(intent)
+                    }
+                    result.success(true)
+                } catch (e: Exception) {
+                    result.success(false)
+                }
+            }
+            "openBackgroundSettings" -> {
+                // The app-details screen, where MIUI/HyperOS exposes "Autostart"
+                // and "No battery restrictions" — the per-app knobs a foreground
+                // service still needs on those OEMs.
+                try {
+                    val intent = Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:${ctx.packageName}"),
+                    )
+                    val act = activity
+                    if (act != null) {
+                        act.startActivity(intent)
+                    } else {
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        ctx.startActivity(intent)
+                    }
+                    result.success(true)
+                } catch (e: Exception) {
+                    result.success(false)
+                }
             }
             // ── Push channel (Epic 489.10) ──────────────────────────────
             "notifyWakeup" -> {
