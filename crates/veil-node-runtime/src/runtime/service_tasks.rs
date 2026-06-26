@@ -461,6 +461,20 @@ pub(crate) fn rendezvous_register_publisher(
         .iter()
         .position(|e| e.rendezvous_node_id == *relay && e.auth_cookie == cookie)
     {
+        // PRESERVE a KEM key already advertised for this (relay, cookie). The app
+        // registers the relay's KEM pk (mailbox-by-discovery, the deposit target)
+        // and the built-in recipient task re-registers the SAME (relay, cookie)
+        // KEM-LESS on its tick — a full overwrite would DROP the KEM, so a sender
+        // resolves the ad with usable(KEM)=0 and cannot deposit offline mail
+        // (observed on-device as a persistent stash failure). Carry the existing
+        // KEM forward; this entry still functions as a rendezvous publisher, it
+        // just keeps the mailbox KEM it already had.
+        let mut entry = entry;
+        let existing = &entries[pos];
+        if !existing.rendezvous_kem_pk.is_empty() {
+            entry.rendezvous_kem_algo = existing.rendezvous_kem_algo;
+            entry.rendezvous_kem_pk = existing.rendezvous_kem_pk.clone();
+        }
         entries[pos] = entry;
     } else {
         entries.push(entry);
@@ -3655,6 +3669,65 @@ mod tests {
             rendezvous_kem_pk: vec![kem_tag; 32],
             wire_version: 5,
         }
+    }
+
+    #[test]
+    fn kemless_reregister_preserves_existing_kem() {
+        // The app registers the relay's KEM pk (mailbox-by-discovery deposit
+        // target); veil's built-in receiver task then re-registers the SAME
+        // (relay, cookie) KEM-LESS on its tick. A full overwrite would drop the
+        // KEM and a sender would resolve usable(KEM)=0 (cannot deposit offline
+        // mail) — so the KEM-less path must PRESERVE an existing KEM.
+        let sk = std::sync::Arc::new(x25519_dalek::StaticSecret::from([7u8; 32]));
+        let state = std::sync::Arc::new(
+            crate::runtime::anonymity_state::AnonymityState::new(
+                false,
+                0,
+                sk,
+                None,
+                Vec::new(),
+            ),
+        );
+        let relay = [0xAB; 32];
+        let cookie = [0xCD; 16];
+        let kem = vec![0x42u8; 32];
+
+        rendezvous_register_publisher_with_kem(&state, &relay, cookie, 3600, 1, kem.clone());
+        rendezvous_register_publisher(&state, &relay, cookie, 3600, None);
+
+        let entries = lock!(state.rendezvous_publisher_entries);
+        assert_eq!(entries.len(), 1, "same (relay,cookie) dedups to one entry");
+        assert_eq!(
+            entries[0].rendezvous_kem_pk, kem,
+            "KEM key must survive a KEM-less re-register (else usable(KEM)=0)"
+        );
+        assert_eq!(entries[0].rendezvous_kem_algo, 1);
+    }
+
+    #[test]
+    fn kem_register_overwrites_kemless() {
+        // The reverse order must ALSO end KEM-bearing: a KEM-less entry first,
+        // then the app's KEM register, leaves the entry with the KEM.
+        let sk = std::sync::Arc::new(x25519_dalek::StaticSecret::from([9u8; 32]));
+        let state = std::sync::Arc::new(
+            crate::runtime::anonymity_state::AnonymityState::new(
+                false,
+                0,
+                sk,
+                None,
+                Vec::new(),
+            ),
+        );
+        let relay = [0x01; 32];
+        let cookie = [0x02; 16];
+        let kem = vec![0x55u8; 32];
+
+        rendezvous_register_publisher(&state, &relay, cookie, 3600, None);
+        rendezvous_register_publisher_with_kem(&state, &relay, cookie, 3600, 1, kem.clone());
+
+        let entries = lock!(state.rendezvous_publisher_entries);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].rendezvous_kem_pk, kem);
     }
 
     #[test]
