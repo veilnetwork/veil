@@ -25,7 +25,8 @@
 library veil_flutter;
 
 export 'src/background.dart' show VeilBackground;
-export 'src/client.dart' show VeilClient, AppHandle;
+export 'src/client.dart'
+    show VeilClient, AppHandle, veilSealBytes, veilUnsealBytes;
 export 'src/identity.dart'
     show
         hasBip39WordCount,

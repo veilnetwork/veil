@@ -1287,6 +1287,73 @@ final void Function(Pointer<VeilStreamFfi>) veilStreamClose = nativeLib
     )
     .asFunction();
 
+// Block up to `timeout_ms` for a remote peer to open an inbound stream to a
+// bound endpoint. Returns a stream handle + writes the initiator's node_id to
+// `out_src_node_id` (32 B). NULL on timeout (no err) so the caller polls; NULL
+// with err on a fatal condition.
+final Pointer<VeilStreamFfi> Function(
+  Pointer<VeilApp>,
+  int,
+  Pointer<Uint8>,
+  Pointer<Pointer<Utf8>>,
+) veilStreamAccept = nativeLib
+    .lookup<
+            NativeFunction<
+                Pointer<VeilStreamFfi> Function(
+              Pointer<VeilApp>,
+              Uint64,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_stream_accept')
+    .asFunction();
+
+// ── Blob AEAD (XChaCha20-Poly1305) for the out-of-container file store ───────
+// seal/unseal(key32, nonce24, input, len, *out_buf, *out_len, err) -> 0 OK / <0.
+// Output buffer freed with [veilFreeBuf].
+final int Function(
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Uint8>>,
+  Pointer<IntPtr>,
+  Pointer<Pointer<Utf8>>,
+) veilSeal = nativeLib
+    .lookup<
+            NativeFunction<
+                Int32 Function(
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Uint8>>,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_seal')
+    .asFunction();
+
+final int Function(
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Uint8>>,
+  Pointer<IntPtr>,
+  Pointer<Pointer<Utf8>>,
+) veilUnseal = nativeLib
+    .lookup<
+            NativeFunction<
+                Int32 Function(
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Uint8>>,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_unseal')
+    .asFunction();
+
 // ── NativeFinalizer pointers ─────────────────────────────────────────────────
 //
 // NativeFinalizer attaches a C-callable cleanup function to a Dart object;
