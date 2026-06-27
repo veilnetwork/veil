@@ -3065,8 +3065,19 @@ fn replicas_from_freshest_ads(
     cap: usize,
 ) -> Vec<veil_ipc::ResolvedReplica> {
     ads.sort_by(|a, b| {
-        b.valid_until_unix
-            .cmp(&a.valid_until_unix)
+        // Prefer an ad that carries a usable KEM key. A KEM-less ad (empty
+        // `rendezvous_kem_pk`) can never be sealed to for offline delivery, so it
+        // must lose to ANY KEM-bearing ad regardless of recency — otherwise a
+        // stale, long-lived KEM-less ad (e.g. a pre-KEM-preserve publisher's 24h
+        // ad) outranks the publisher's fresh but shorter-lived KEM ad purely by
+        // `valid_until`, the sender resolves the KEM-less one, and offline
+        // delivery to that receiver silently fails (usable(KEM)=0 at the sender).
+        // Only when NO KEM-bearing ad exists do we fall back to a KEM-less one.
+        let a_kemless = a.rendezvous_kem_pk.is_empty();
+        let b_kemless = b.rendezvous_kem_pk.is_empty();
+        a_kemless
+            .cmp(&b_kemless) // false (KEM-bearing) sorts before true (KEM-less)
+            .then_with(|| b.valid_until_unix.cmp(&a.valid_until_unix)) // then freshest
             .then_with(|| a.rendezvous_node_id.cmp(&b.rendezvous_node_id))
     });
 
@@ -3747,6 +3758,28 @@ mod tests {
         assert_eq!(out[0].rendezvous_kem_pk, vec![3; 32]);
         assert_eq!(out[1].relay_node_id, [0xB2; 32]);
         assert_eq!(out[1].valid_until_unix, 200);
+    }
+
+    #[test]
+    fn rendezvous_replicas_prefer_kem_bearing_over_a_fresher_kemless() {
+        // The on-device regression: a stale KEM-LESS ad with a LATER valid_until
+        // must NOT shadow a fresh KEM-bearing ad — sealing offline mail needs the
+        // KEM key, so a KEM-less winner means usable(KEM)=0 and delivery fails.
+        let stale_kemless = veil_anonymity::rendezvous::RendezvousAd {
+            rendezvous_kem_pk: Vec::new(), // no relay KEM key
+            ..test_rendezvous_ad(0xA1, 999, 0)
+        };
+        let fresh_kem = test_rendezvous_ad(0xB2, 100, 7); // earlier, but KEM-bearing
+
+        let out = replicas_from_freshest_ads(vec![stale_kemless, fresh_kem], 8);
+
+        assert_eq!(out.len(), 2);
+        // The KEM-bearing ad wins despite its EARLIER valid_until.
+        assert_eq!(out[0].relay_node_id, [0xB2; 32]);
+        assert_eq!(out[0].rendezvous_kem_pk, vec![7; 32]);
+        // The KEM-less ad is still returned, but only as the last-resort fallback.
+        assert_eq!(out[1].relay_node_id, [0xA1; 32]);
+        assert!(out[1].rendezvous_kem_pk.is_empty());
     }
 
     #[test]
