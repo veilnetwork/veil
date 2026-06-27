@@ -390,7 +390,29 @@ impl SessionTxRegistry {
                 true
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.drops_total.fetch_add(1, Ordering::Relaxed);
+                // LIMIT: the per-session TX channel (depth = self.capacity) is
+                // full, so this frame is silently dropped — the caller only sees
+                // a `false` return, never a reason. This is a prime bulk-transfer
+                // loss source (a fast sender outruns the peer's drain). Surface
+                // it: debug per drop, throttled warn so it's visible but not a
+                // flood.
+                let n = self.drops_total.fetch_add(1, Ordering::Relaxed) + 1;
+                log::debug!(
+                    "LIMIT tx_queue: session TX channel FULL — frame dropped \
+                     (peer {}, cap {}, total_drops {})",
+                    veil_util::hex_short(peer_id),
+                    self.capacity,
+                    n,
+                );
+                if n.is_power_of_two() || n % 1000 == 0 {
+                    log::warn!(
+                        "LIMIT tx_queue: {} frames dropped on full session \
+                         channels (cap {}); latest peer {}",
+                        n,
+                        self.capacity,
+                        veil_util::hex_short(peer_id),
+                    );
+                }
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
