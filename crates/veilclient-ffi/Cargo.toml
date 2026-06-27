@@ -59,6 +59,9 @@ veil-anonymity = { path = "../veil-anonymity" }
 # entry-point and the random-key generator that receivers persist
 # platform-side.
 veil-crypto = { path = "../veil-crypto" }
+# XChaCha20-Poly1305 for veil_seal/veil_unseal — encrypts large file blobs stored
+# OUTSIDE the deniable container (key derived from the unlocked container).
+chacha20poly1305 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util"] }
 libc = "0.2"
 

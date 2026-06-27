@@ -80,8 +80,9 @@ mod node;
 use libc::{size_t, ssize_t};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::mpsc;
 use veilclient::{
-    AppHandle, AppReceiver, AppSender, ClientError, IncomingMessage, VeilClient,
+    AppHandle, AppSender, ClientError, IncomingMessage, IncomingStream, VeilClient,
     VeilStream as SdkStream,
 };
 
@@ -374,7 +375,14 @@ pub struct VeilHandle {
 pub struct VeilApp {
     bundle: Arc<RuntimeBundle>,
     sender: TokioMutex<Option<AppSender>>,
-    receiver: TokioMutex<Option<AppReceiver>>,
+    /// Raw inbound-DATAGRAM channel, drained by the single persistent recv
+    /// task. Split out of the SDK [`AppReceiver`] (`into_parts`) so the
+    /// inbound-STREAM channel can be drained independently — a `select!` over
+    /// both halves of one `&mut AppReceiver` is a borrow conflict.
+    msg_rx: TokioMutex<Option<mpsc::Receiver<IncomingMessage>>>,
+    /// Raw inbound-STREAM channel, drained by `veil_stream_accept` (pull). A
+    /// remote peer opening a byte-stream to this endpoint lands here.
+    inbound_streams: TokioMutex<Option<mpsc::Receiver<IncomingStream>>>,
     /// `app_id` cached at bind time so callers can read it after the
     /// receiver has been moved into a recv loop.
     app_id: [u8; 32],
@@ -685,10 +693,14 @@ unsafe fn bind_internal(
     // split immediately so `set_recv_handler` doesn't
     // need to do anything destructive to the send half.
     let (sender, receiver) = app_handle.into_split();
+    // Split the receiver into its datagram + stream channels so each is drained
+    // by an independent owner (recv task vs veil_stream_accept).
+    let (msg_rx, inbound_streams) = receiver.into_parts();
     let app = VeilApp {
         bundle,
         sender: TokioMutex::new(Some(sender)),
-        receiver: TokioMutex::new(Some(receiver)),
+        msg_rx: TokioMutex::new(Some(msg_rx)),
+        inbound_streams: TokioMutex::new(Some(inbound_streams)),
         recv_cb: Arc::new(StdMutex::new(None)),
         app_id,
         endpoint_id: ep_id,
@@ -1395,10 +1407,10 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
     // inversion. (A future change that locks `receiver` while holding `recv_task`
     // would introduce one; keep this ordering.) If the task already exists, the
     // swap above is all that's needed.
-    let mut receiver_guard = app_ref.receiver.blocking_lock();
+    let mut receiver_guard = app_ref.msg_rx.blocking_lock();
     let mut task_guard = app_ref.recv_task.lock().unwrap_or_else(|e| e.into_inner());
     if task_guard.is_none() {
-        let mut receiver = match receiver_guard.take() {
+        let mut msg_rx = match receiver_guard.take() {
             Some(r) => r,
             None => {
                 // App already closed before the first handler install. Clear the
@@ -1413,13 +1425,13 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
         };
         let cb_cell = Arc::clone(&app_ref.recv_cb);
         let task = app_ref.bundle.runtime.spawn(async move {
-            while let Ok(Some(IncomingMessage {
+            while let Some(IncomingMessage {
                 src_node_id,
                 src_app_id,
                 data,
                 reply_id,
                 ..
-            })) = receiver.recv().await
+            }) = msg_rx.recv().await
             {
                 // Copy the current callback out of the slot; never hold the
                 // lock across the C callback.
@@ -1544,6 +1556,175 @@ pub unsafe extern "C" fn veil_stream_open(
         writer: TokioMutex::new(Some(wr)),
     };
     HandleTable::insert(stream_table(), stream) as *mut VeilStreamFfi
+}
+
+/// Block up to `timeout_ms` for a remote peer to open an inbound byte-stream to
+/// a bound endpoint. On success returns an owned stream handle (drive it with
+/// `veil_stream_read`/`veil_stream_write`/`veil_stream_close`) and writes the
+/// initiator's 32-byte node_id into `out_src_node_id` (caller-allocated, 32 B).
+/// Returns NULL on TIMEOUT with NO error written, so the caller can poll in a
+/// loop; returns NULL WITH an error on a fatal condition (app closed / the
+/// inbound-stream channel went away). This is the receive-side counterpart to
+/// `veil_stream_open` — without it an inbound stream is stranded in the SDK.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_stream_accept(
+    app: *mut VeilApp,
+    timeout_ms: u64,
+    out_src_node_id: *mut u8,
+    err_out: *mut *mut c_char,
+) -> *mut VeilStreamFfi {
+    if unsafe { guard::ffi_prelude(err_out, "veil_stream_accept") }.is_err() {
+        return ptr::null_mut();
+    }
+    null_check_with_default!(err_out, ptr::null_mut(),
+        "app" => app,
+        "out_src_node_id" => out_src_node_id,
+    );
+    get_or_return!(app_ref, app_table(), app, err_out, ptr::null_mut(), "VeilApp");
+    // Drain the inbound-stream channel with a bounded wait. Holding the lock
+    // across the await serializes accept calls — fine: a single accept loop owns
+    // the receive side. A modest timeout lets the Dart caller poll/abort.
+    let accepted = app_ref.bundle.runtime.block_on(async {
+        let mut guard = app_ref.inbound_streams.lock().await;
+        let Some(rx) = guard.as_mut() else {
+            return Err("inbound-stream receiver gone (app closed)".to_string());
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(incoming)) => Ok(Some(incoming)),
+            Ok(None) => Err("inbound-stream channel closed".to_string()),
+            Err(_elapsed) => Ok(None), // timeout — caller polls again
+        }
+    });
+    match accepted {
+        Ok(Some(incoming)) => {
+            unsafe {
+                ptr::copy_nonoverlapping(incoming.src_node_id.as_ptr(), out_src_node_id, 32);
+            }
+            let (rd, wr) = tokio::io::split(incoming.stream);
+            let stream = VeilStreamFfi {
+                bundle: Arc::clone(&app_ref.bundle),
+                reader: TokioMutex::new(Some(rd)),
+                writer: TokioMutex::new(Some(wr)),
+            };
+            HandleTable::insert(stream_table(), stream) as *mut VeilStreamFfi
+        }
+        Ok(None) => ptr::null_mut(), // timeout — not an error
+        Err(e) => {
+            unsafe {
+                write_err(err_out, e);
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+/// XChaCha20-Poly1305 AEAD seal of `plaintext` under a 32-byte `key` + 24-byte
+/// `nonce` (no associated data). Writes the ciphertext+tag to a freshly
+/// allocated buffer (`*out_buf`/`*out_len`); free it with `veil_free_buf`. Used
+/// by the host to encrypt large file blobs stored OUTSIDE the deniable container
+/// under a key derived from the unlocked container — the blob is opaque
+/// ciphertext at rest. Crypto stays in audited Rust; the key never persists.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_seal(
+    key: *const u8,
+    nonce: *const u8,
+    plaintext: *const u8,
+    plaintext_len: size_t,
+    out_buf: *mut *mut u8,
+    out_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_seal") } {
+        return rc;
+    }
+    null_check!(err_out, "key" => key, "nonce" => nonce, "out_buf" => out_buf, "out_len" => out_len);
+    unsafe {
+        *out_buf = ptr::null_mut();
+        *out_len = 0;
+    }
+    let pt: &[u8] = if plaintext_len == 0 {
+        &[]
+    } else {
+        null_check!(err_out, "plaintext" => plaintext);
+        unsafe { std::slice::from_raw_parts(plaintext, plaintext_len) }
+    };
+    unsafe { aead_run(true, key, nonce, pt, out_buf, out_len, err_out) }
+}
+
+/// Inverse of [`veil_seal`]: XChaCha20-Poly1305 open. Fails (VEIL_ERR) on a bad
+/// key/nonce/tag. Output (plaintext) buffer freed via `veil_free_buf`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_unseal(
+    key: *const u8,
+    nonce: *const u8,
+    ciphertext: *const u8,
+    ciphertext_len: size_t,
+    out_buf: *mut *mut u8,
+    out_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_unseal") } {
+        return rc;
+    }
+    null_check!(err_out, "key" => key, "nonce" => nonce, "ciphertext" => ciphertext,
+        "out_buf" => out_buf, "out_len" => out_len);
+    unsafe {
+        *out_buf = ptr::null_mut();
+        *out_len = 0;
+    }
+    let ct = unsafe { std::slice::from_raw_parts(ciphertext, ciphertext_len) };
+    unsafe { aead_run(false, key, nonce, ct, out_buf, out_len, err_out) }
+}
+
+/// Shared XChaCha20-Poly1305 core for [`veil_seal`]/[`veil_unseal`]. `seal=true`
+/// encrypts, `false` decrypts. Returns the result in a heap buffer.
+unsafe fn aead_run(
+    seal: bool,
+    key: *const u8,
+    nonce: *const u8,
+    input: &[u8],
+    out_buf: *mut *mut u8,
+    out_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+    let mut key_arr = [0u8; 32];
+    let mut nonce_arr = [0u8; 24];
+    unsafe {
+        ptr::copy_nonoverlapping(key, key_arr.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(nonce, nonce_arr.as_mut_ptr(), 24);
+    }
+    let cipher = XChaCha20Poly1305::new((&key_arr).into());
+    let xn = XNonce::from_slice(&nonce_arr);
+    let res = if seal {
+        cipher.encrypt(xn, input)
+    } else {
+        cipher.decrypt(xn, input)
+    };
+    match res {
+        Ok(out) => {
+            let boxed: Box<[u8]> = out.into_boxed_slice();
+            let len = boxed.len();
+            let p = Box::into_raw(boxed) as *mut u8;
+            unsafe {
+                *out_buf = p;
+                *out_len = len;
+            }
+            VEIL_OK
+        }
+        Err(_) => {
+            unsafe {
+                write_err(err_out, if seal { "seal failed" } else { "unseal failed (bad key/nonce/tag)" });
+            }
+            VEIL_ERR
+        }
+    }
 }
 
 /// Write `len` bytes to the stream.

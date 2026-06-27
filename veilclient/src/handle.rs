@@ -755,4 +755,19 @@ impl AppReceiver {
     pub async fn accept_stream(&mut self) -> Option<IncomingStream> {
         self.inbound_streams_rx.recv().await
     }
+
+    /// Split into the raw datagram + inbound-stream channels so a host (e.g.
+    /// the C FFI) can drain each on an independent task. `select!`-ing
+    /// [`recv`](Self::recv) and [`accept_stream`](Self::accept_stream) on the
+    /// same `&mut self` is a borrow conflict; owning the two channels
+    /// separately resolves it. Both channels remain bound to the original
+    /// endpoint until dropped.
+    pub fn into_parts(
+        self,
+    ) -> (
+        mpsc::Receiver<IncomingMessage>,
+        mpsc::Receiver<IncomingStream>,
+    ) {
+        (self.rx, self.inbound_streams_rx)
+    }
 }
