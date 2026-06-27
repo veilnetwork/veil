@@ -371,6 +371,12 @@ impl FrameDispatcher {
         if let Some(ref cm) = self.congestion_monitor
             && cm.score_u8() > 200
         {
+            log::warn!(
+                "LIMIT rate_limited(congestion_shed): relay load {}/255 (>200 ≈ 78%) \
+                 — dropping FORWARD from peer {}",
+                cm.score_u8(),
+                veil_util::hex_short(peer_id.as_bytes()),
+            );
             if let Some(m) = &self.metrics {
                 m.inc_rate_limit_drops();
             }
@@ -1427,7 +1433,10 @@ impl FrameDispatcher {
             }
             AddChunkResult::Pending => {}
             AddChunkResult::Rejected(reason) => {
-                self.logger.warn("chunk.rejected", reason);
+                // LIMIT-prefixed so any quota/limit drop is greppable in debug
+                // (per-sender / global reassembly quotas, metadata mismatch, …).
+                self.logger
+                    .warn("chunk.rejected", &format!("LIMIT chunk_reassembly: {reason}"));
             }
         }
     }
