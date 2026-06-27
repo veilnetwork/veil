@@ -98,6 +98,53 @@ Uint8List _aead(
 // token (the generational handle table lives in native memory), so the worker
 // re-derives the same connection from the raw int address.
 
+/// Off-isolate body of [AppHandle.openStream] — veil_stream_open blocks the
+/// thread until the stream FSM is set up, so it runs here. Returns the new
+/// stream's raw pointer address (re-wrapped on the main isolate).
+int _openStreamWorker(int appAddr, Uint8List dstNode, Uint8List dstApp,
+    int endpoint, int window) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final dn = calloc<Uint8>(32)..asTypedList(32).setAll(0, dstNode);
+  final da = calloc<Uint8>(32)..asTypedList(32).setAll(0, dstApp);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final ptr = ffi.veilStreamOpen(app, dn, da, endpoint, window, errOut);
+    if (ptr == nullptr) {
+      throw VeilException('stream open failed: ${_readErrAndFree(errOut)}');
+    }
+    return ptr.address;
+  } finally {
+    calloc.free(dn);
+    calloc.free(da);
+    calloc.free(errOut);
+  }
+}
+
+/// Off-isolate body of [AppHandle.acceptStream] — the blocking veil_stream_accept
+/// runs here so an accept loop never freezes the UI. Returns null on timeout,
+/// throws on a fatal error, or the accepted stream's raw pointer address + the
+/// initiator node_id (re-wrapped on the main isolate via the global handle table).
+({int streamAddr, Uint8List src})? _acceptStreamWorker(
+    int appAddr, int timeoutMs) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final outNode = calloc<Uint8>(32);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final ptr = ffi.veilStreamAccept(app, timeoutMs, outNode, errOut);
+    if (ptr == nullptr) {
+      if (errOut.value == nullptr) return null; // timeout
+      throw VeilException('stream accept failed: ${_readErrAndFree(errOut)}');
+    }
+    return (
+      streamAddr: ptr.address,
+      src: Uint8List.fromList(outNode.asTypedList(32)),
+    );
+  } finally {
+    calloc.free(outNode);
+    calloc.free(errOut);
+  }
+}
+
 Uint8List? _lookupRelayX25519Worker(int handleAddr, Uint8List nodeId) {
   final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
   final node = calloc<Uint8>(32);
@@ -1743,33 +1790,13 @@ class AppHandle implements Finalizable {
     if (initialWindow <= 0) {
       throw ArgumentError('initialWindow must be > 0, got $initialWindow');
     }
-    return Future(() {
-      final dstNode = calloc<Uint8>(32);
-      final dstApp = calloc<Uint8>(32);
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        dstNode.asTypedList(32).setAll(0, dstNodeId);
-        dstApp.asTypedList(32).setAll(0, dstAppId);
-        final ptr = ffi.veilStreamOpen(
-          _app,
-          dstNode,
-          dstApp,
-          dstEndpointId,
-          initialWindow,
-          errOut,
-        );
-        if (ptr == nullptr) {
-          throw VeilException(
-            'stream open failed: ${_readErrAndFree(errOut)}',
-          );
-        }
-        return VeilStream.fromFfi(ptr);
-      } finally {
-        calloc.free(dstNode);
-        calloc.free(dstApp);
-        calloc.free(errOut);
-      }
-    });
+    // veil_stream_open BLOCKS the calling thread until the daemon-side stream
+    // FSM is set up (observed ~seconds on-device — it does NOT return instantly).
+    // Run it on a worker isolate so it can never ANR/freeze the UI.
+    final appAddr = _app.address;
+    final addr = await Isolate.run(() => _openStreamWorker(
+        appAddr, dstNodeId, dstAppId, dstEndpointId, initialWindow));
+    return VeilStream.fromFfi(Pointer<ffi.VeilStreamFfi>.fromAddress(addr));
   }
 
   /// Wait up to [timeout] for a remote peer to open an inbound byte-stream to
@@ -1780,29 +1807,19 @@ class AppHandle implements Finalizable {
     Duration timeout = const Duration(seconds: 2),
   }) async {
     _ensureOpen();
-    return Future(() {
-      final outNode = calloc<Uint8>(32);
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        final ptr = ffi.veilStreamAccept(
-          _app,
-          timeout.inMilliseconds,
-          outNode,
-          errOut,
-        );
-        if (ptr == nullptr) {
-          // NULL with NO error written == timeout (the caller polls again);
-          // NULL with an error == fatal (app closed / channel gone).
-          if (errOut.value == nullptr) return null;
-          throw VeilException('stream accept failed: ${_readErrAndFree(errOut)}');
-        }
-        final src = Uint8List.fromList(outNode.asTypedList(32));
-        return (stream: VeilStream.fromFfi(ptr), srcNodeId: src);
-      } finally {
-        calloc.free(outNode);
-        calloc.free(errOut);
-      }
-    });
+    // veil_stream_accept BLOCKS the calling thread for up to `timeout` — run it
+    // on a worker isolate (like VeilStream.read) so an accept LOOP can't freeze
+    // the UI. The native handle table is process-global, so the worker hands back
+    // the raw pointer address and we re-wrap it here.
+    final appAddr = _app.address;
+    final ms = timeout.inMilliseconds;
+    final r = await Isolate.run(() => _acceptStreamWorker(appAddr, ms));
+    if (r == null) return null;
+    return (
+      stream: VeilStream.fromFfi(
+          Pointer<ffi.VeilStreamFfi>.fromAddress(r.streamAddr)),
+      srcNodeId: r.src,
+    );
   }
 
   /// Subscribe to inbound datagrams.  Replaces any prior handler —
