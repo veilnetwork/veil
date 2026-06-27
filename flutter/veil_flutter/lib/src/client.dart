@@ -40,6 +40,57 @@ String _readErrAndFree(Pointer<Pointer<Utf8>> errOut) {
   return msg;
 }
 
+/// XChaCha20-Poly1305 seal (key 32 B, nonce 24 B; no associated data) — encrypts
+/// [plaintext] for the out-of-container blob store. Returns ciphertext + 16-B
+/// tag. Synchronous; chunk a large blob into segments and run on a worker
+/// isolate for big inputs. Crypto runs in audited Rust (`veil_seal`).
+Uint8List veilSealBytes(Uint8List key, Uint8List nonce, Uint8List plaintext) =>
+    _aead(ffi.veilSeal, key, nonce, plaintext, 'seal');
+
+/// Inverse of [veilSealBytes]; throws [VeilException] on a bad key/nonce/tag.
+Uint8List veilUnsealBytes(
+        Uint8List key, Uint8List nonce, Uint8List ciphertext) =>
+    _aead(ffi.veilUnseal, key, nonce, ciphertext, 'unseal');
+
+Uint8List _aead(
+  int Function(Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>, int,
+          Pointer<Pointer<Uint8>>, Pointer<IntPtr>, Pointer<Pointer<Utf8>>)
+      fn,
+  Uint8List key,
+  Uint8List nonce,
+  Uint8List input,
+  String label,
+) {
+  if (key.length != 32) throw ArgumentError('key must be 32 bytes');
+  if (nonce.length != 24) throw ArgumentError('nonce must be 24 bytes');
+  final keyP = calloc<Uint8>(32);
+  final nonceP = calloc<Uint8>(24);
+  final Pointer<Uint8> inP =
+      input.isEmpty ? nullptr : calloc<Uint8>(input.length);
+  final outBuf = calloc<Pointer<Uint8>>();
+  final outLen = calloc<IntPtr>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    keyP.asTypedList(32).setAll(0, key);
+    nonceP.asTypedList(24).setAll(0, nonce);
+    if (input.isNotEmpty) inP.asTypedList(input.length).setAll(0, input);
+    final rc = fn(keyP, nonceP, inP, input.length, outBuf, outLen, errOut);
+    if (rc != 0) {
+      throw VeilException('$label failed: ${_readErrAndFree(errOut)}');
+    }
+    final out = Uint8List.fromList(outBuf.value.asTypedList(outLen.value));
+    ffi.veilFreeBuf(outBuf.value, outLen.value);
+    return out;
+  } finally {
+    calloc.free(keyP);
+    calloc.free(nonceP);
+    if (input.isNotEmpty) calloc.free(inP);
+    calloc.free(outBuf);
+    calloc.free(outLen);
+    calloc.free(errOut);
+  }
+}
+
 // ── Off-isolate workers ──────────────────────────────────────────────
 // TOP-LEVEL (never instance methods/closures) so an `Isolate.run(() =>
 // _xWorker(handleAddr, ...))` computation captures only sendable values and can
@@ -1716,6 +1767,39 @@ class AppHandle implements Finalizable {
       } finally {
         calloc.free(dstNode);
         calloc.free(dstApp);
+        calloc.free(errOut);
+      }
+    });
+  }
+
+  /// Wait up to [timeout] for a remote peer to open an inbound byte-stream to
+  /// this endpoint. Returns the [VeilStream] + the initiator's 32-byte node_id,
+  /// or `null` on TIMEOUT (so a server loop can poll/abort). The receive-side
+  /// counterpart to [openStream]; used for any-size file transfer.
+  Future<({VeilStream stream, Uint8List srcNodeId})?> acceptStream({
+    Duration timeout = const Duration(seconds: 2),
+  }) async {
+    _ensureOpen();
+    return Future(() {
+      final outNode = calloc<Uint8>(32);
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        final ptr = ffi.veilStreamAccept(
+          _app,
+          timeout.inMilliseconds,
+          outNode,
+          errOut,
+        );
+        if (ptr == nullptr) {
+          // NULL with NO error written == timeout (the caller polls again);
+          // NULL with an error == fatal (app closed / channel gone).
+          if (errOut.value == nullptr) return null;
+          throw VeilException('stream accept failed: ${_readErrAndFree(errOut)}');
+        }
+        final src = Uint8List.fromList(outNode.asTypedList(32));
+        return (stream: VeilStream.fromFfi(ptr), srcNodeId: src);
+      } finally {
+        calloc.free(outNode);
         calloc.free(errOut);
       }
     });
