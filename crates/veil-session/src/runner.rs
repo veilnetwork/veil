@@ -3853,8 +3853,18 @@ impl SessionRunner {
             DispatchResult::RateLimited => {
                 // Send a Backpressure signal at most once per cooldown.
                 // Excess frames are silently dropped — no violation, no ban.
+                log::debug!(
+                    "LIMIT rate_limited: inbound frame DROPPED from peer {} \
+                     (over capacity / relay congestion-shed)",
+                    hex_short(&self.peer_id),
+                );
                 let now = std::time::Instant::now();
                 if bp_signal.try_arm(now) {
+                    log::warn!(
+                        "LIMIT rate_limited: backpressure ARMED -> peer {} \
+                         — sustained inbound exceeds capacity",
+                        hex_short(&self.peer_id),
+                    );
                     let bp_hdr = veil_proto::header::FrameHeader::new(
                         veil_proto::family::FrameFamily::Control as u8,
                         veil_proto::family::ControlMsg::Backpressure as u16,
