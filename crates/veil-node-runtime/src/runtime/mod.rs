@@ -6974,6 +6974,31 @@ impl NodeServices {
             });
         }
 
+        // Reassembly is ALL-OR-NOTHING across the fragments: the recipient
+        // verifies the signed whole only once every fragment of `msg_id` lands.
+        // Each fragment is one tiny onion cell (~100-200 B), independently lost,
+        // so at F fragments the delivery odds collapse as (1-p)^F — a 27-fragment
+        // bulk chunk at p≈0.27 / redundancy 1 delivers ~0.01%. Single-fragment
+        // chat text is fine at redundancy 1, but any MULTI-fragment message
+        // (bulk file content) needs redundancy to survive: each fragment is then
+        // sent over `redundancy` independent circuits and de-duped by
+        // (msg_id, frag_idx), lifting per-fragment delivery to 1-p^redundancy.
+        // Auto-bump here so small messages stay cheap and only bulk pays the cost
+        // — no API/FFI plumbing, and the reply path's explicit 3 is preserved.
+        const BULK_FRAGMENT_THRESHOLD: usize = 3;
+        const BULK_REDUNDANCY: usize = 3;
+        let redundancy = if frag_count >= BULK_FRAGMENT_THRESHOLD {
+            let bumped = redundancy.max(BULK_REDUNDANCY);
+            log::debug!(
+                "onion bulk send: {frag_count} fragments (chunk_size={chunk_size}, \
+                 hop_count={hop_count}) -> redundancy {bumped} over independent circuits \
+                 (per-fragment delivery 1-p^{bumped})",
+            );
+            bumped
+        } else {
+            redundancy
+        };
+
         // S4: all size/fragment validation passed — NOW build the ephemeral reply
         // circuit (registers the cookie at R_a). Doing it here means a size
         // failure above returns without ever creating a circuit to strand.
