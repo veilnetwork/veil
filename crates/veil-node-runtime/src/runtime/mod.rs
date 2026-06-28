@@ -7252,10 +7252,18 @@ impl NodeServices {
             }
             ads.push(ad);
         }
-        // If stale pre-fix ads are still alive in the DHT, the fresh online ad
-        // has the highest rolling valid_until. Pick that one instead of the
-        // lowest-numbered valid slot.
-        ads.sort_by(|a, b| b.valid_until_unix.cmp(&a.valid_until_unix));
+        // Pick the most-recently-PUBLISHED ad (highest valid_from_unix, set to
+        // now at publish), NOT the highest valid_until. The auth_cookie is
+        // per-period (derive_onion_auth_cookie(seed, now/86400)), so the
+        // freshest-published ad carries the cookie that matches the receiver's
+        // CURRENT registration. Ranking by valid_until preferred a stale ad from
+        // a previous period that merely has a LONGER validity window (e.g. an old
+        // 24h ad over today's 1h ad) — its old-period cookie then mismatched at
+        // the relay and EVERY introduce was dropped as `cookie_unknown` (the
+        // onion content path's residual ~30% loss after the replica-resolver fix;
+        // this `send_anonymous_authenticated_to` selection is the one the content
+        // send actually uses).
+        ads.sort_by(|a, b| b.valid_from_unix.cmp(&a.valid_from_unix));
         let chosen = ads.into_iter().next();
         let Some(ad) = chosen else {
             return Err(AnonOnionSendError::NoRendezvous);
