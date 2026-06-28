@@ -3077,7 +3077,19 @@ fn replicas_from_freshest_ads(
         let b_kemless = b.rendezvous_kem_pk.is_empty();
         a_kemless
             .cmp(&b_kemless) // false (KEM-bearing) sorts before true (KEM-less)
-            .then_with(|| b.valid_until_unix.cmp(&a.valid_until_unix)) // then freshest
+            // Then prefer the most-recently-PUBLISHED ad, by `valid_from_unix`
+            // (set to now_unix at publish — see maintenance.rs) — NOT
+            // `valid_until_unix`. The ad's `auth_cookie` is PER-PERIOD
+            // (derive_onion_auth_cookie(seed, now/86400)), so an ad published in a
+            // previous period carries an OLD cookie that no longer matches what the
+            // receiver currently registers at its relay. Ranking by `valid_until`
+            // preferred a yesterday-published 24h ad (old cookie, long window) over
+            // today's 1h ad (fresh cookie, short window): the sender copied the old
+            // cookie into its introduce and the relay dropped EVERY introduce with
+            // `cookie_unknown` (observed ~95-98% loss on the onion content path).
+            // `valid_from` makes the current-period ad win, so its cookie matches
+            // the receiver's live registration.
+            .then_with(|| b.valid_from_unix.cmp(&a.valid_from_unix))
             .then_with(|| a.rendezvous_node_id.cmp(&b.rendezvous_node_id))
     });
 
@@ -3668,7 +3680,11 @@ mod tests {
             rendezvous_node_id: [relay_tag; 32],
             auth_cookie: [0x22; 16],
             receiver_x25519_pk: [0x33; 32],
-            valid_from_unix: 1_700_000_000,
+            // Freshness now ranks by valid_from (publish time); make the helper's
+            // valid_from track its valid_until so the existing "higher rank wins"
+            // tests still express the same ordering. The dedicated divergence test
+            // below sets valid_from / valid_until independently.
+            valid_from_unix: 1_700_000_000 + valid_until_unix,
             valid_until_unix,
             issuer_pk: String::new(),
             issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
@@ -3780,6 +3796,40 @@ mod tests {
         // The KEM-less ad is still returned, but only as the last-resort fallback.
         assert_eq!(out[1].relay_node_id, [0xA1; 32]);
         assert!(out[1].rendezvous_kem_pk.is_empty());
+    }
+
+    #[test]
+    fn rendezvous_replicas_prefer_freshest_published_not_longest_valid() {
+        // THE cookie_unknown root cause. The auth_cookie is per-PERIOD, so the ad
+        // PUBLISHED most recently (highest valid_from) carries the cookie that
+        // matches the receiver's current registration. A stale ad published in a
+        // previous period but with a LONGER validity window (later valid_until)
+        // carries an OLD cookie. Selection must prefer the fresh-publish ad even
+        // though it expires sooner — otherwise the sender's introduce is dropped
+        // with cookie_unknown. Same relay so dedup keeps exactly one.
+        let now = 1_700_000_000u64;
+        let stale_long = veil_anonymity::rendezvous::RendezvousAd {
+            rendezvous_node_id: [0xA1; 32],
+            valid_from_unix: now - 86_400, // published yesterday (old-period cookie)
+            valid_until_unix: now + 3600,  // ...but a long 24h-ish window
+            rendezvous_kem_pk: vec![1; 32],
+            ..test_rendezvous_ad(0xA1, 0, 1)
+        };
+        let fresh_short = veil_anonymity::rendezvous::RendezvousAd {
+            rendezvous_node_id: [0xA1; 32],
+            valid_from_unix: now,         // published now (current-period cookie)
+            valid_until_unix: now + 600,  // ...short window — would LOSE on valid_until
+            rendezvous_kem_pk: vec![2; 32],
+            ..test_rendezvous_ad(0xA1, 0, 2)
+        };
+        let out = replicas_from_freshest_ads(vec![stale_long, fresh_short], 8);
+        assert_eq!(out.len(), 1, "same relay dedups to one");
+        assert_eq!(
+            out[0].rendezvous_kem_pk,
+            vec![2; 32],
+            "the freshest-PUBLISHED ad (current-period cookie) must win, not the \
+             longest-valid stale one",
+        );
     }
 
     #[test]
