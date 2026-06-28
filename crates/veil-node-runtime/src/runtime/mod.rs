@@ -6492,7 +6492,6 @@ impl NodeServices {
         hop_count: usize,
     ) -> std::result::Result<[u8; 16], veil_types::AnonOnionSendError> {
         use rand_core::{OsRng, RngCore};
-        use veil_anonymity::directory::DEFAULT_FRESHNESS_WINDOW_SECS;
 
         let relay_path = self.select_onion_relay_path(hop_count)?;
         let r = *relay_path.last().expect("non-empty relay path");
@@ -6561,7 +6560,11 @@ impl NodeServices {
             &self.anonymity,
             &r,
             cookie,
-            DEFAULT_FRESHNESS_WINDOW_SECS,
+            // Short rendezvous-ad TTL (NOT the 24h directory default): a stale ad
+            // a sender cached before this receiver rotated relay/cookie must
+            // self-expire fast, else its introduces black-hole as cookie_unknown.
+            // The ~15s refresh tick keeps the live ad alive.
+            service_tasks::RENDEZVOUS_AD_VALIDITY_SECS,
             ephemeral_ad_identity,
         );
 
