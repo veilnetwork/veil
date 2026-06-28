@@ -6532,6 +6532,16 @@ impl NodeServices {
         // Build + register the circuit (no session register — that is the leak),
         // then publish the ad so clients can find us.
         self.register_onion_circuit(&relay_path, cookie)?;
+        // COOKIE-DIAG: the cookie THIS node registers at the relay + publishes in
+        // its ad. A sender's `rendezvous.cookie.introduce` line for this node must
+        // carry the SAME cookie, else the relay drops the introduce (cookie_unknown).
+        log::info!(
+            "rendezvous.cookie.register: relay={} cookie={} period={} me={}",
+            veil_util::hex_short(&r),
+            cookie.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            period,
+            veil_util::hex_short(self.identity.local_identity.node_id.as_bytes()),
+        );
         // Δ2-c: sign + DHT-key the ad under a per-service EPHEMERAL pseudo
         // identity (derived from this service's registration keypair, minted by
         // register_onion_circuit above), NOT our sovereign node_id — otherwise
@@ -6774,6 +6784,17 @@ impl NodeServices {
             if let Ok(new_confirmed) =
                 self.build_onion_circuit_once(&path, cookie_now, &reg_keypair, &registration_epoch)
             {
+                // COOKIE-DIAG (periodic re-register): the cookie this node now
+                // holds at its relay. Must equal what senders put in introduces.
+                log::info!(
+                    "rendezvous.cookie.register(periodic): cookie={} period={} me={}",
+                    cookie_now
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    period_now,
+                    veil_util::hex_short(self.identity.local_identity.node_id.as_bytes()),
+                );
                 let mut svcs = lock!(self.anonymity.onion_services);
                 // Locate by the OLD cookie (the due-tuple value), then re-key the
                 // entry to cookie_now so subsequent ticks track the current period.
