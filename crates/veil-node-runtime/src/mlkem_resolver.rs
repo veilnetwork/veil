@@ -593,6 +593,155 @@ pub(crate) async fn recursive_dht_get(
     }
 }
 
+/// Fetch independently-served candidates for one DHT key, including a valid
+/// local value but never letting that local value short-circuit the network
+/// fan-out.  Rendezvous ads need this stronger read than the ordinary
+/// [`recursive_dht_get`]: after a receiver moves to another relay, its old ad
+/// remains correctly signed and unexpired, yet its `(relay, cookie)` is no
+/// longer live. Comparing replies from several directly-connected DHT peers is
+/// what lets the caller select the newest `valid_from_unix` and repair its
+/// local mirror.
+///
+/// Each peer gets a distinct query id. A shared query id would complete on the
+/// first response and reproduce the original first-replica-wins bug.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn recursive_dht_get_candidates<F>(
+    dht: &Arc<KademliaService>,
+    session_tx_registry: &Arc<RwLock<SessionTxRegistry>>,
+    pending_recursive: &Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
+    local_node_id: [u8; 32],
+    key: [u8; 32],
+    timeout: Duration,
+    max_peers: usize,
+    is_valid: F,
+) -> Vec<Vec<u8>>
+where
+    F: Fn(&[u8]) -> bool,
+{
+    let mut out = Vec::new();
+    if let Some(value) = dht.get_local(&key)
+        && is_valid(&value)
+    {
+        out.push(value);
+    }
+
+    let mut peers: Vec<[u8; 32]> = rlock!(session_tx_registry).peer_ids();
+    peers.sort_by_key(|pid| {
+        let mut xor = [0u8; 32];
+        for i in 0..32 {
+            xor[i] = pid[i] ^ key[i];
+        }
+        xor
+    });
+    peers.truncate(max_peers.clamp(1, veil_proto::budget::DHT_REPLICATION_K));
+    if peers.is_empty() {
+        return out;
+    }
+
+    struct Query {
+        query_id: [u8; 16],
+        peer: [u8; 32],
+        frame: Vec<u8>,
+        rx: tokio::sync::oneshot::Receiver<Vec<u8>>,
+    }
+
+    let mut queries = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let mut query_id = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut query_id);
+        let q = RecursiveQueryPayload {
+            query_id,
+            target_key: key,
+            reply_to: local_node_id,
+            ttl: 40,
+            query_type: recursive_query_type::FIND_VALUE,
+            reply_port: 0,
+            payload: vec![],
+        };
+        let q_bytes = q.encode();
+        let mut hdr = FrameHeader::new(
+            veil_proto::family::FrameFamily::Routing as u8,
+            veil_proto::family::RoutingMsg::RecursiveQuery as u16,
+        );
+        hdr.body_len = q_bytes.len() as u32;
+        let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
+        frame.extend_from_slice(&q_bytes);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = lock!(pending_recursive);
+            pending.retain(|_, p| !p.tx.is_closed());
+            if pending.len() >= veil_proto::budget::MAX_PENDING_RECURSIVE {
+                break;
+            }
+            pending.insert(
+                query_id,
+                PendingRecursive {
+                    target_key: key,
+                    query_type: recursive_query_type::FIND_VALUE,
+                    tx,
+                },
+            );
+        }
+        queries.push(Query {
+            query_id,
+            peer,
+            frame,
+            rx,
+        });
+    }
+
+    // Only wait for frames that actually entered a live session queue.
+    let mut sent = Vec::with_capacity(queries.len());
+    {
+        let guard = rlock!(session_tx_registry);
+        for query in queries {
+            if guard.send_to(
+                &query.peer,
+                veil_proto::header::priority::INTERACTIVE,
+                query.frame.clone(),
+            ) {
+                sent.push(query);
+            } else {
+                lock!(pending_recursive).remove(&query.query_id);
+            }
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let query_ids: Vec<_> = sent.iter().map(|q| q.query_id).collect();
+    let mut replies: futures::stream::FuturesUnordered<_> = sent
+        .into_iter()
+        .map(|query| async move {
+            tokio::time::timeout_at(deadline, query.rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        })
+        .collect();
+    use futures::StreamExt;
+    while let Some(reply) = replies.next().await {
+        if let Some(bytes) = reply
+            && !bytes.is_empty()
+            && is_valid(&bytes)
+        {
+            out.push(bytes);
+        }
+    }
+    // Dispatcher removes successful entries; this also clears timed-out ones.
+    let mut pending = lock!(pending_recursive);
+    for query_id in query_ids {
+        pending.remove(&query_id);
+    }
+    drop(pending);
+
+    // Exact duplicates from replicated holders carry no additional routing
+    // information and only inflate the downstream sort/cache.
+    out.sort();
+    out.dedup();
+    out
+}
+
 impl MlKemEkResolver for DhtMlKemEkResolver {
     fn resolve_ek(
         &self,
@@ -797,6 +946,61 @@ mod tests {
             .dht_recursive_get(key, Duration::from_millis(50), None, |_| true)
             .await;
         assert_eq!(got, Some(b"good".to_vec()));
+    }
+
+    // Rendezvous regression: a valid local value must be INCLUDED but must not
+    // end the lookup. Each connected replica gets its own query id, so a fresh
+    // value held by one seed survives another seed returning the same stale
+    // value as our local mirror. The rendezvous layer can then compare
+    // `valid_from_unix` and choose the fresh route.
+    #[tokio::test]
+    async fn recursive_get_candidates_does_not_short_circuit_on_valid_local_value() {
+        let dht = Arc::new(KademliaService::new([1u8; 32]));
+        let key = [42u8; 32];
+        let stale = b"valid-stale-ad".to_vec();
+        let fresh = b"valid-fresh-ad".to_vec();
+        dht.store_local(key, stale.clone());
+
+        let mut reg = SessionTxRegistry::new();
+        let rx_a = reg.register([10u8; 32]);
+        let rx_b = reg.register([20u8; 32]);
+        let registry = Arc::new(RwLock::new(reg));
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        let spawn_answer =
+            |mut rx: tokio::sync::mpsc::Receiver<veil_session::PriorityFrame>,
+             pending: Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
+             value: Vec<u8>| {
+                tokio::spawn(async move {
+                    let (_, frame) = rx.recv().await.expect("replica query frame");
+                    let query = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .expect("decode recursive FIND_VALUE");
+                    let waiter = lock!(pending)
+                        .remove(&query.query_id)
+                        .expect("query registered before send");
+                    let _ = waiter.tx.send(value);
+                })
+            };
+        let answer_a = spawn_answer(rx_a, Arc::clone(&pending), stale.clone());
+        let answer_b = spawn_answer(rx_b, Arc::clone(&pending), fresh.clone());
+
+        let got = recursive_dht_get_candidates(
+            &dht,
+            &registry,
+            &pending,
+            [1u8; 32],
+            key,
+            Duration::from_secs(1),
+            2,
+            |_| true,
+        )
+        .await;
+        answer_a.await.unwrap();
+        answer_b.await.unwrap();
+
+        assert_eq!(got.len(), 2, "exact stale duplicates are deduplicated");
+        assert!(got.contains(&stale), "valid local candidate is preserved");
+        assert!(got.contains(&fresh), "fresh remote candidate is not hidden");
     }
 
     // Connected-peer fast path: when `direct_peer` is Some AND that node is in
