@@ -168,8 +168,16 @@ const RENDEZVOUS_SESSION_EVENT_DEBOUNCE: std::time::Duration =
 /// cadence is not a fixed, identity-linkable heartbeat.
 const RENDEZVOUS_TICK_JITTER_MS: u64 = 3000;
 /// Ad validity window the recipient requests (the maintenance tick refreshes the
-/// published ad before half-life). Comfortably longer than the check interval.
-const RENDEZVOUS_AD_VALIDITY_SECS: u64 = 3600;
+/// published ad before half-life). Comfortably longer than the check interval
+/// (RENDEZVOUS_RECIPIENT_CHECK_INTERVAL = 15s), but kept SHORT on purpose: this
+/// is also how long a STALE ad (a previous-relay/cookie ad a sender resolved +
+/// cached before the receiver rotated) stays usable. At 1h it black-holed
+/// delivery for up to an hour after a receiver restart (the sender's cached ad
+/// pointed at a relay the receiver no longer registers → cookie_unknown on every
+/// introduce). 10 min bounds that self-heal window while the ~15s refresh keeps
+/// the live ad alive with ~40x margin. pub(crate) so the initial onion-service
+/// register (runtime::mod) uses the same window, not the 24h directory default.
+pub(crate) const RENDEZVOUS_AD_VALIDITY_SECS: u64 = 600;
 /// Re-register with the (still-live) current relay every N ticks — the relay's
 /// cookie map is in-memory, so this survives a relay restart.
 const RENDEZVOUS_REREGISTER_EVERY_TICKS: u64 = 5;
