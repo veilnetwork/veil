@@ -7217,10 +7217,6 @@ impl NodeServices {
         // block (see `send_via_rendezvous_authenticated`).
         reply: Option<([u8; 32], u32)>,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
-        use veil_anonymity::rendezvous::{
-            MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
-            rendezvous_ad_dht_key_at, verify_rendezvous_ad,
-        };
         use veil_types::AnonOnionSendError;
 
         const AD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
@@ -7229,32 +7225,23 @@ impl NodeServices {
         if self.identity.sovereign_identity.is_none() {
             return Err(AnonOnionSendError::NoIdentity);
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        // Resolve all recipient replica slots concurrently. Empty slots are
-        // common on tiny DHTs; doing them sequentially multiplies the DHT miss
-        // timeout and can exceed the IPC reply budget before a live slot is
-        // reached.
-        let walks = (0..MAX_RENDEZVOUS_AD_SLOTS).map(|idx| {
-            let key = rendezvous_ad_dht_key_at(&receiver_node_id, idx);
-            async move { self.dht_recursive_get(key, AD_RESOLVE_TIMEOUT).await }
-        });
-        let mut ads = Vec::with_capacity(MAX_RENDEZVOUS_AD_SLOTS as usize);
-        for bytes in futures::future::join_all(walks).await.into_iter().flatten() {
-            let Ok(ad) = decode_rendezvous_ad(&bytes) else {
-                continue;
-            };
-            if verify_rendezvous_ad(&ad).is_err()
-                || ad.receiver_node_id != receiver_node_id
-                || is_currently_valid(&ad, now).is_err()
-            {
-                continue;
-            }
-            ads.push(ad);
-        }
+        // A merely-valid local ad is not sufficient here. The receiver may
+        // have reconnected and moved to a different relay while the old signed
+        // ad remains unexpired; using it produces a valid-looking introduce at
+        // a relay that no longer owns the cookie (`cookie_unknown`). Compare
+        // independently-served candidates on a short cadence and repair the
+        // local mirror with the newest publication.
+        let mut ads = service_tasks::resolve_fresh_rendezvous_ads(
+            &self.dht,
+            &self.session_tx_registry,
+            &self.dispatcher.pending_recursive,
+            *self.identity.local_identity.node_id.as_bytes(),
+            &self.anonymity.rendezvous_resolve_cache,
+            &self.logger,
+            receiver_node_id,
+            AD_RESOLVE_TIMEOUT,
+        )
+        .await;
         // Pick the most-recently-PUBLISHED ad (highest valid_from_unix, set to
         // now at publish), NOT the highest valid_until. The auth_cookie is
         // per-period (derive_onion_auth_cookie(seed, now/86400)), so the
