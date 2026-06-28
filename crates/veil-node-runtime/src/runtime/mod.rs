@@ -6852,6 +6852,15 @@ impl NodeServices {
     pub fn send_via_rendezvous_authenticated(
         &self,
         ad: &veil_anonymity::rendezvous::RendezvousAd,
+        // Additional DISTINCT-relay ads for the SAME recipient (it registered on
+        // several rendezvous relays). When non-empty, fragments are ROUND-ROBINED
+        // across `[ad] + these` — independent endpoint relays carry different
+        // fragments, so the recipient's aggregate receive throughput scales with
+        // the relay count instead of funneling `redundancy` copies of every
+        // fragment through ONE relay. Empty → the classic single-relay path with
+        // `redundancy` retransmit. No new exposure: the recipient already
+        // registered the SAME cookie at each of these relays.
+        extra_relays: &[veil_anonymity::rendezvous::RendezvousAd],
         target_app_id: [u8; 32],
         target_endpoint_id: u32,
         data: &[u8],
@@ -7009,16 +7018,37 @@ impl NodeServices {
         // (msg_id, frag_idx), lifting per-fragment delivery to 1-p^redundancy.
         // Auto-bump here so small messages stay cheap and only bulk pays the cost
         // — no API/FFI plumbing, and the reply path's explicit 3 is preserved.
+        // The rendezvous relays to spread across: the primary `ad` plus any
+        // distinct extra relays the recipient registered on (dedup by relay id).
+        let mut relays: Vec<&veil_anonymity::rendezvous::RendezvousAd> = vec![ad];
+        for e in extra_relays {
+            if !relays
+                .iter()
+                .any(|r| r.rendezvous_node_id == e.rendezvous_node_id)
+            {
+                relays.push(e);
+            }
+        }
+        let parallel = relays.len() > 1;
+
+        // Reliability vs parallelism. With ONE relay, a multi-fragment (bulk)
+        // message needs redundant retransmit to survive cell loss (reassembly is
+        // all-or-nothing). With SEVERAL relays we PARALLELISE instead — 1x per
+        // fragment, round-robined across relays — so independent endpoints lift
+        // aggregate throughput; the chunk-granular re-request refills any dropped
+        // fragment. Funnelling `redundancy` copies through one relay is then pure
+        // waste, so the bulk bump is dropped when parallelising.
         const BULK_FRAGMENT_THRESHOLD: usize = 3;
         const BULK_REDUNDANCY: usize = 3;
-        let redundancy = if frag_count >= BULK_FRAGMENT_THRESHOLD {
-            let bumped = redundancy.max(BULK_REDUNDANCY);
+        let redundancy = if parallel {
             log::debug!(
-                "onion bulk send: {frag_count} fragments (chunk_size={chunk_size}, \
-                 hop_count={hop_count}) -> redundancy {bumped} over independent circuits \
-                 (per-fragment delivery 1-p^{bumped})",
+                "onion bulk send: {frag_count} fragments round-robined across {} \
+                 rendezvous relays (parallel endpoints, redundancy 1)",
+                relays.len(),
             );
-            bumped
+            1
+        } else if frag_count >= BULK_FRAGMENT_THRESHOLD {
+            redundancy.max(BULK_REDUNDANCY)
         } else {
             redundancy
         };
@@ -7056,10 +7086,28 @@ impl NodeServices {
             let mut sealed_plaintext = Vec::with_capacity(1 + frag_bytes.len());
             sealed_plaintext.push(final_hop_kind::APP_DELIVER_AUTH);
             sealed_plaintext.extend_from_slice(&frag_bytes);
-            // Bounded retransmit: send the fragment `redundancy` times over
-            // independent circuits; the recipient de-dups by (msg_id, frag_idx).
-            for _ in 0..redundancy.max(1) {
-                self.send_sealed_introduce(ad, &sealed_plaintext, hop_count, circuit_backed)?;
+            if parallel {
+                // Round-robin: this fragment rides ONE relay; consecutive
+                // fragments ride DIFFERENT relays → independent circuits to
+                // distinct endpoints, so the recipient receives in parallel.
+                let relay = relays[idx % relays.len()];
+                self.send_sealed_introduce(
+                    relay,
+                    &sealed_plaintext,
+                    hop_count,
+                    circuit_backed,
+                )?;
+            } else {
+                // Bounded retransmit: send the fragment `redundancy` times over
+                // independent circuits; the recipient de-dups by (msg_id, frag_idx).
+                for _ in 0..redundancy.max(1) {
+                    self.send_sealed_introduce(
+                        ad,
+                        &sealed_plaintext,
+                        hop_count,
+                        circuit_backed,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -7254,20 +7302,51 @@ impl NodeServices {
         // this `send_anonymous_authenticated_to` selection is the one the content
         // send actually uses).
         ads.sort_by(|a, b| b.valid_from_unix.cmp(&a.valid_from_unix));
-        let chosen = ads.into_iter().next();
-        let Some(ad) = chosen else {
+        if ads.is_empty() {
             return Err(AnonOnionSendError::NoRendezvous);
-        };
+        }
+        // Keep up to MAX distinct-relay ads (freshest-first). The recipient
+        // registered on several rendezvous relays; bulk content is round-robined
+        // across them for parallel-endpoint throughput instead of funnelling
+        // redundant copies through one. The freshest is the primary (its cookie
+        // matches the current registration); the rest are extra parallel
+        // endpoints. A recipient on a single relay yields one ad → classic path.
+        const MAX_PARALLEL_RELAYS: usize = 3;
+        // The freshest ad (sorted by valid_from desc) defines the CURRENT-period
+        // auth_cookie. Spread ONLY across relays whose ad carries that SAME cookie:
+        // a stale ad (a previous period, or a relay the recipient hasn't re-
+        // registered this period) has a cookie that no longer matches that relay's
+        // live registration, so an introduce there is dropped as cookie_unknown —
+        // wasting the send + forcing a re-request. Same-cookie ⇒ same period ⇒ the
+        // recipient is currently registered there with this cookie.
+        let primary_cookie = ads[0].auth_cookie;
+        let mut chosen: Vec<veil_anonymity::rendezvous::RendezvousAd> = Vec::new();
+        let mut seen_relays = std::collections::HashSet::new();
+        for a in ads {
+            if a.auth_cookie != primary_cookie {
+                continue; // stale-cookie relay → would cookie_unknown there
+            }
+            if seen_relays.insert(a.rendezvous_node_id) {
+                chosen.push(a);
+                if chosen.len() >= MAX_PARALLEL_RELAYS {
+                    break;
+                }
+            }
+        }
 
-        // Pre-resolve the rendezvous relay's directory entry into our local DHT
-        // shard so `send_via_rendezvous_authenticated`'s `get_local` lookup finds
-        // it (otherwise that path silent-drops when the entry isn't organically
-        // cached — review fix).
-        let relay_key = veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id);
-        if self.dht.get_local(&relay_key).is_none()
-            && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
-        {
-            self.dht.store_local(relay_key, bytes);
+        // Pre-resolve EACH chosen relay's directory entry into our local DHT shard
+        // so `send_via_rendezvous_authenticated`'s `get_local` lookup finds it for
+        // every relay we round-robin across (otherwise that path silent-drops when
+        // the entry isn't organically cached — review fix).
+        for a in &chosen {
+            let relay_key = veil_anonymity::directory::relay_directory_dht_key(
+                &a.rendezvous_node_id,
+            );
+            if self.dht.get_local(&relay_key).is_none()
+                && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
+            {
+                self.dht.store_local(relay_key, bytes);
+            }
         }
 
         // The rendezvous relay alone is not enough: `select_onion_relay_path`
@@ -7289,7 +7368,8 @@ impl NodeServices {
         .await;
 
         self.send_via_rendezvous_authenticated(
-            &ad,
+            &chosen[0],
+            &chosen[1..], // extra distinct-relay endpoints → round-robin parallelism
             target_app_id,
             target_endpoint_id,
             data,
@@ -7345,6 +7425,7 @@ impl NodeServices {
 
         self.send_via_rendezvous_authenticated(
             &ad,
+            &[], // by-identity resolves a single descriptor → one relay, no spread
             target_app_id,
             target_endpoint_id,
             data,
@@ -7751,6 +7832,7 @@ impl NodeServices {
 
         self.send_via_rendezvous_authenticated(
             &ad,
+            &[], // a reply targets the one relay in the reply block
             block.reply_app_id,
             block.reply_endpoint_id,
             data,
