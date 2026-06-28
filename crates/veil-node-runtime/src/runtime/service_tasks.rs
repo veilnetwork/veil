@@ -293,29 +293,23 @@ fn xor_distance_cmp(anchor: &[u8; 32], a: &[u8; 32], b: &[u8; 32]) -> std::cmp::
     std::cmp::Ordering::Equal
 }
 
-/// Like [`pick_rendezvous_relay`] but DETERMINISTIC: among the published-eligible
-/// connected relays, pick the one CLOSEST (Kademlia XOR distance) to `anchor`
-/// (the receiver's own node_id).
+/// Like [`pick_rendezvous_relay`] but DETERMINISTIC: order published-eligible
+/// connected relays by Kademlia XOR distance to `anchor` (the receiver's own
+/// node_id), then cap them to the number of rendezvous-ad slots.
 ///
-/// A plain rendezvous receiver re-registers on every reconnect/restart and MUST
-/// keep advertising the SAME relay it actually drains. `pick_rendezvous_relay`'s
-/// random draw (M-1) re-picked a fresh relay each time, leaving a trail of stale
-/// ad slots at relays the receiver no longer serviced — so a sender resolving an
-/// old slot deposited into a black hole and incoming delivery silently failed.
-/// XOR-to-anchor is STABLE per identity (collapses the slots to one) yet still
-/// SPREADS load across relays — different receivers anchor to different relays —
-/// and leaks nothing: the chosen relay is published in the ad regardless. The M-1
-/// concern (unpredictable rendezvous point) applies to the LOCATION-anonymous
-/// onion path, which keeps the random `pick_rendezvous_relay`; a plain receiver's
-/// relay is already public in its sovereign-signed ad. Pinned relays still win,
-/// honoured in operator order.
-pub(crate) fn pick_rendezvous_relay_deterministic(
+/// A receiver registers the same cookie at every returned relay: mobile/obfs
+/// sessions can churn between seeds faster than a replacement ad propagates,
+/// so a single active registration turns every still-valid ad for the previous
+/// relay into a temporary black hole. Different receiver anchors still spread
+/// the preferred (slot-0) relay across the network. Pinned relays retain their
+/// operator order.
+pub(crate) fn pick_rendezvous_relays_deterministic(
     live: &LiveSessions,
     dht: &Arc<veil_dht::KademliaService>,
     cap_flags: &PeerCapFlags,
     pinned: &[[u8; 32]],
     anchor: &[u8; 32],
-) -> Option<[u8; 32]> {
+) -> Vec<[u8; 32]> {
     let connected: Vec<[u8; 32]> = {
         let g = lock!(live);
         g.values()
@@ -323,7 +317,7 @@ pub(crate) fn pick_rendezvous_relay_deterministic(
             .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
             .collect()
     };
-    if !pinned.is_empty() {
+    let mut eligible = if !pinned.is_empty() {
         // Operator-pinned relays are TRUSTED rendezvous points: register at a
         // connected one WITHOUT requiring its relay-directory entry (RD) to be
         // DHT-discoverable first. On a small/sparse network the warm FIND_VALUE
@@ -332,12 +326,22 @@ pub(crate) fn pick_rendezvous_relay_deterministic(
         // and the operator explicitly asserted it is a rendezvous relay. The RD
         // check is for AUTO-discovery of UNtrusted relays — redundant for an
         // explicit pin. Honour the pin order deterministically.
-        return pinned.iter().copied().find(|p| connected.contains(p));
-    }
-    connected
-        .into_iter()
-        .filter(|c| rendezvous_relay_published(dht, c) || peer_advertised_relay(cap_flags, c))
-        .min_by(|a, b| xor_distance_cmp(anchor, a, b))
+        pinned
+            .iter()
+            .copied()
+            .filter(|p| connected.contains(p))
+            .collect::<Vec<_>>()
+    } else {
+        let mut relays = connected
+            .into_iter()
+            .filter(|c| rendezvous_relay_published(dht, c) || peer_advertised_relay(cap_flags, c))
+            .collect::<Vec<_>>();
+        relays.sort_by(|a, b| xor_distance_cmp(anchor, a, b));
+        relays
+    };
+    eligible.dedup();
+    eligible.truncate(veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize);
+    eligible
 }
 
 /// Cold-start rendezvous discovery: actively FIND_VALUE the relay-directory
@@ -524,19 +528,6 @@ pub(crate) fn rendezvous_register_publisher_with_kem(
     }
 }
 
-/// Remove a `(relay, cookie)` rendezvous publication (diff-audit L4). Used by the
-/// recipient task on relay failover to prune the prior (now-dead) relay's slot,
-/// which otherwise lingers forever — maintenance re-signs the stale ad each tick
-/// and senders take the first valid slot → black-hole.
-pub(crate) fn rendezvous_unregister_publisher(
-    anonymity: &Arc<super::anonymity_state::AnonymityState>,
-    relay: &[u8; 32],
-    cookie: [u8; 16],
-) {
-    lock!(anonymity.rendezvous_publisher_entries)
-        .retain(|e| !(e.rendezvous_node_id == *relay && e.auth_cookie == cookie));
-}
-
 /// Shared cold-path re-pick + re-register for the rendezvous-recipient task.
 ///
 /// SINGLE source of truth for the `!current_ok` block, called from BOTH the
@@ -568,66 +559,68 @@ pub(crate) async fn rendezvous_recipient_recheck(
     if current_ok && !force {
         return;
     }
-    // force==true (event-driven wake): re-register with the CURRENT relay even
-    // though its session reads Active — it may be a zombie (relay RST'd + dropped
-    // our subscriber while info.state stays Active) or a transport-swapped path;
-    // either way the relay's in-memory subscriber map may not list us. A fresh
-    // RegisterRendezvous is one idempotent frame.
-    if current_ok && force && let Some(relay) = *current {
-        let _ = rendezvous_register_with(session_tx_registry, anonymity, &relay, cookie);
-        return;
-    }
     // Cold-start: actively pull + verify connected peers' relay-directory
     // entries into the local store so pick (get_local) can find one without
     // waiting on passive DHT replication.
     warm_connected_relay_directory(live_sessions, dht, outbox, logger).await;
-    match pick_rendezvous_relay_deterministic(live_sessions, dht, cap_flags, pinned, local_node_id) {
-        Some(relay) => {
-            // Only commit to the new relay once the RegisterRendezvous frame
-            // actually leaves — a picked "live session" may not have a tx
-            // channel yet, in which case the frame is silently dropped and no
-            // relay ever sees the registration.
-            if !rendezvous_register_with(session_tx_registry, anonymity, &relay, cookie) {
-                logger.info(
-                    "anonymity.rendezvous_recipient.send_failed",
-                    format!(
-                        "relay {} not yet sendable (no tx channel); retrying",
-                        veil_util::hex_short(&relay),
-                    ),
-                );
-            } else {
-                // Prune the prior relay's publisher slot now that the new
-                // registration took (L4) — else failover strands a stale ad
-                // that senders black-hole into.
-                if let Some(old) = *current
-                    && old != relay
-                {
-                    rendezvous_unregister_publisher(anonymity, &old, cookie);
-                }
-                rendezvous_register_publisher(
-                    anonymity,
-                    &relay,
-                    cookie,
-                    RENDEZVOUS_AD_VALIDITY_SECS,
-                    // Plain rendezvous receiver: ad is signed under the sovereign
-                    // identity (senders discover it by node_id).
-                    None,
-                );
-                *current = Some(relay);
-                logger.info(
-                    log_key,
-                    format!(
-                        "registered with rendezvous relay {}",
-                        veil_util::hex_short(&relay),
-                    ),
-                );
-            }
+    let candidates = pick_rendezvous_relays_deterministic(
+        live_sessions,
+        dht,
+        cap_flags,
+        pinned,
+        local_node_id,
+    );
+    let mut registered = Vec::with_capacity(candidates.len());
+    for relay in candidates {
+        if rendezvous_register_with(session_tx_registry, anonymity, &relay, cookie) {
+            rendezvous_register_publisher(
+                anonymity,
+                &relay,
+                cookie,
+                RENDEZVOUS_AD_VALIDITY_SECS,
+                None,
+            );
+            registered.push(relay);
+        } else {
+            logger.info(
+                "anonymity.rendezvous_recipient.send_failed",
+                format!(
+                    "relay {} not yet sendable (no tx channel); retrying",
+                    veil_util::hex_short(&relay),
+                ),
+            );
         }
-        None => logger.info(
+    }
+    if registered.is_empty() {
+        *current = None;
+        logger.info(
             "anonymity.rendezvous_recipient.no_relay",
             "no reachable published rendezvous relay yet; retrying",
-        ),
+        );
+        return;
     }
+
+    // Keep only live plain-identity slots for this cookie. Ephemeral onion
+    // services have independent publisher identities and must not be touched.
+    let live_set: std::collections::HashSet<_> = registered.iter().copied().collect();
+    lock!(anonymity.rendezvous_publisher_entries).retain(|entry| {
+        entry.ephemeral_ad_identity.is_some()
+            || entry.auth_cookie != cookie
+            || live_set.contains(&entry.rendezvous_node_id)
+    });
+    *current = registered.first().copied();
+    logger.info(
+        log_key,
+        format!(
+            "registered with {} rendezvous relays: {}",
+            registered.len(),
+            registered
+                .iter()
+                .map(veil_util::hex_short)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
 }
 
 impl NodeRuntime {
@@ -1639,19 +1632,25 @@ impl NodeRuntime {
                                 )
                                 .await;
                             } else if ticks.is_multiple_of(RENDEZVOUS_REREGISTER_EVERY_TICKS) {
-                                // Refresh — the relay's registration is in-memory.
-                                if let Some(relay) = current
-                                    && !rendezvous_register_with(
-                                        &session_tx_registry,
-                                        &anonymity,
-                                        &relay,
-                                        cookie,
-                                    )
-                                {
-                                    // Relay no longer sendable — drop it so the
-                                    // next tick re-discovers + re-registers.
-                                    current = None;
-                                }
+                                // Refresh every live replica registration. Relay
+                                // subscriber maps are in-memory, and sessions to
+                                // mobile/obfs peers can churn independently.
+                                rendezvous_recipient_recheck(
+                                    &mut current,
+                                    &live_sessions,
+                                    &dht,
+                                    &peer_cap_flags,
+                                    &outbox,
+                                    &session_tx_registry,
+                                    &anonymity,
+                                    &logger,
+                                    &pinned,
+                                    &local_node_id,
+                                    cookie,
+                                    "anonymity.rendezvous_recipient.refreshed",
+                                    true,
+                                )
+                                .await;
                             }
                         }
                         recv = sessions_rx.recv() => {
@@ -4003,6 +4002,46 @@ mod tests {
         assert_eq!(pick(&[0x11u8; 32]), [0x10u8; 32]);
         // A different receiver anchors elsewhere → different relay.
         assert_eq!(pick(&[0x2eu8; 32]), [0x20u8; 32]);
+    }
+
+    #[test]
+    fn rendezvous_replica_picker_keeps_all_connected_pins_up_to_slot_cap() {
+        use crate::types::{LinkId, NodeId, SessionInfo, SessionSource, SessionState};
+
+        let pinned: Vec<[u8; 32]> = (1u8..=10).map(|n| [n; 32]).collect();
+        let mut sessions = std::collections::BTreeMap::new();
+        for (idx, node) in pinned.iter().enumerate() {
+            sessions.insert(
+                LinkId::new(idx as u64 + 1),
+                SessionInfo {
+                    link_id: LinkId::new(idx as u64 + 1),
+                    node_id: Some(NodeId::from(*node)),
+                    nonce: None,
+                    matched_peer_id: None,
+                    source: SessionSource::Inbound(crate::types::ListenId::new(1)),
+                    listener_handle: None,
+                    state: SessionState::Active,
+                    transport: "test".to_owned(),
+                    remote_addr: None,
+                    description: String::new(),
+                },
+            );
+        }
+        let live = Arc::new(std::sync::Mutex::new(sessions));
+        let dht = Arc::new(veil_dht::KademliaService::new([9u8; 32]));
+        let caps = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        let got = pick_rendezvous_relays_deterministic(
+            &live,
+            &dht,
+            &caps,
+            &pinned,
+            &[9u8; 32],
+        );
+        assert_eq!(
+            got,
+            pinned[..veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize]
+        );
     }
 
     // ── BootstrapWatchdog: decision-fn coverage ──────────────────────────
