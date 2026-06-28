@@ -748,7 +748,8 @@ impl NodeRuntime {
         // since the maintenance period is short.
         use veil_anonymity::rendezvous::{
             MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, rendezvous_ad_dht_key_at,
-            rendezvous_ad_needs_refresh, sign_rendezvous_ad_v5,
+            is_currently_valid, rendezvous_ad_needs_refresh, sign_rendezvous_ad_v5,
+            verify_rendezvous_ad,
         };
         let snapshot = lock!(entries).clone();
         if snapshot.is_empty() {
@@ -786,9 +787,31 @@ impl NodeRuntime {
                 ),
             };
             let dht_key = rendezvous_ad_dht_key_at(&ad_node_id, idx as u8);
-            // Slot-level freshness check.
+            // Slot-level freshness check. Time freshness alone is NOT enough:
+            // the recipient can fail over to another relay while the previous
+            // ad still has most of its validity window left. Skipping solely on
+            // `valid_until` leaves the old relay/cookie published until
+            // half-life, and senders then black-hole every introduce at a relay
+            // where the recipient is no longer registered. Only preserve an ad
+            // when it is both cryptographically valid and an exact projection
+            // of the current publisher entry. Any route or envelope change is
+            // therefore visible on the next maintenance tick.
             if let Some(existing_bytes) = dht.get_local(&dht_key)
                 && let Ok(ad) = decode_rendezvous_ad(&existing_bytes)
+                && verify_rendezvous_ad(&ad).is_ok()
+                && is_currently_valid(&ad, now_unix).is_ok()
+                && ad.receiver_node_id == ad_node_id
+                && ad.issuer_pk == issuer_pk
+                && ad.issuer_algo == issuer_algo
+                && ad.rendezvous_node_id == entry.rendezvous_node_id
+                && ad.auth_cookie == entry.auth_cookie
+                && ad.receiver_x25519_pk == receiver_x25519_pk
+                && ad.push_envelope == entry.push_envelope
+                && ad.wake_hmac_envelope == entry.wake_hmac_envelope
+                && ad.rendezvous_kem_algo == entry.rendezvous_kem_algo
+                && ad.rendezvous_kem_pk == entry.rendezvous_kem_pk
+                && ad.valid_until_unix.saturating_sub(ad.valid_from_unix)
+                    == entry.validity_window_secs
                 && !rendezvous_ad_needs_refresh(
                     ad.valid_until_unix,
                     now_unix,
@@ -1412,6 +1435,53 @@ mod tests {
             bytes_after_first, bytes_after_second,
             "DHT bytes must be unchanged when republish was skipped"
         );
+    }
+
+    /// A relay failover must invalidate the freshness shortcut immediately.
+    /// The old ad can still have nearly its full validity window remaining, but
+    /// it points at a relay where this receiver no longer owns the cookie.
+    #[test]
+    fn publish_rendezvous_replaces_fresh_ad_after_relay_failover() {
+        use veil_anonymity::rendezvous::{
+            RendezvousPublisherEntry, decode_rendezvous_ad, rendezvous_ad_dht_key,
+        };
+
+        let identity = fresh_identity();
+        let sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let dht = Arc::new(KademliaService::new(*identity.node_id.as_bytes()));
+        let logger = Arc::new(NodeLogger::new_noop());
+        let old_relay = [0x11; 32];
+        let new_relay = [0x22; 32];
+        let cookie = [0x33; 16];
+        let entries = Arc::new(Mutex::new(vec![RendezvousPublisherEntry {
+            rendezvous_node_id: old_relay,
+            auth_cookie: cookie,
+            validity_window_secs: 600,
+            push_envelope: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
+            ephemeral_ad_identity: None,
+        }]));
+
+        let first = NodeRuntime::tick_publish_rendezvous_ads(
+            &entries, &sk, &identity, &dht, &logger, None,
+        );
+        assert_eq!(first, 1);
+
+        // Fail over immediately, long before the old 10-minute ad reaches its
+        // five-minute half-life.
+        lock!(entries)[0].rendezvous_node_id = new_relay;
+        let second = NodeRuntime::tick_publish_rendezvous_ads(
+            &entries, &sk, &identity, &dht, &logger, None,
+        );
+        assert_eq!(second, 1, "route change must force immediate republish");
+
+        let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
+        let bytes = dht.get_local(&key).expect("replacement ad in DHT");
+        let ad = decode_rendezvous_ad(&bytes).expect("decode replacement ad");
+        assert_eq!(ad.rendezvous_node_id, new_relay);
+        assert_eq!(ad.auth_cookie, cookie);
     }
 
     /// diff-audit Δ2-c: an onion-service ad (ephemeral_ad_identity = Some) is
