@@ -2212,6 +2212,8 @@ impl NodeRuntime {
                 Arc::clone(&self.session_tx_registry),
                 Arc::clone(&self.dispatcher.pending_recursive),
                 *self.identity.local_identity.node_id.as_bytes(),
+                Arc::clone(&self.anonymity.rendezvous_resolve_cache),
+                Arc::clone(&self.logger),
             ));
         server = server.with_rendezvous_resolver(resolver);
         // log IpcServer::run failure instead of swallowing.
@@ -3009,30 +3011,23 @@ async fn push_creds_watch_task(
 
 // ── T1.4 P5c: rendezvous-replica resolver ──────────────────────
 //
-// Local-DHT-only lookup for the receiver's RendezvousAd. Apps call
-// `LocalAppMsg::LookupRendezvousReplicas` → IPC server → this impl →
-// `KademliaService::get_local` → decode + verify → ResolvedReplica.
-//
-// Recursive DHT query (cross-node hop) is intentionally NOT done here:
-// it would require `Arc<NodeRuntime>` (creating a circular reference)
-// or duplicating `dht_get_replicated` plumbing. Receiver's
-// republishes-every-half-life-tick keep the local cache populated on
-// any node that has spoken to the receiver recently — the gap that
-// remains is "I never met receiver before", which apps can paper over
-// by first sending a direct-delivery probe (which will populate DHT
-// cache as a side effect) before retrying the lookup.
-//
-// Future K=3 multi-key publication makes this resolver return all K
-// entries — Vec wire format already accommodates.
+// Replica-aware lookup for the receiver's RendezvousAd. Apps call
+// `LocalAppMsg::LookupRendezvousReplicas` → IPC server → this impl, which
+// periodically compares independently-served DHT values instead of accepting
+// one still-valid local mirror forever. This matters because receiver relay
+// rotation invalidates reachability before the old signed ad itself expires.
 
 pub struct RendezvousResolverImpl {
     dht: Arc<veil_dht::KademliaService>,
     // Shared refs for the recursive DHT walk (so resolve_replicas can find a
     // receiver's rendezvous ad CROSS-NODE, not just in the local mirror cache).
     session_tx_registry: Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
-    pending_recursive:
-        Arc<std::sync::Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher::PendingRecursive>>>,
+    pending_recursive: Arc<
+        std::sync::Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher::PendingRecursive>>,
+    >,
     local_node_id: [u8; 32],
+    resolve_cache: Arc<super::anonymity_state::RendezvousResolveCache>,
+    logger: Arc<veil_observability::NodeLogger>,
 }
 
 impl RendezvousResolverImpl {
@@ -3040,17 +3035,139 @@ impl RendezvousResolverImpl {
         dht: Arc<veil_dht::KademliaService>,
         session_tx_registry: Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
         pending_recursive: Arc<
-            std::sync::Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher::PendingRecursive>>,
+            std::sync::Mutex<
+                std::collections::HashMap<[u8; 16], veil_dispatcher::PendingRecursive>,
+            >,
         >,
         local_node_id: [u8; 32],
+        resolve_cache: Arc<super::anonymity_state::RendezvousResolveCache>,
+        logger: Arc<veil_observability::NodeLogger>,
     ) -> Self {
         Self {
             dht,
             session_tx_registry,
             pending_recursive,
             local_node_id,
+            resolve_cache,
+            logger,
         }
     }
+}
+
+/// Resolve every requested rendezvous-ad slot from independent connected DHT
+/// peers, compare all still-valid signed candidates by publication time, and
+/// write the winner for each slot back into the local mirror.  A plain
+/// `recursive_dht_get` cannot do this: its valid-local fast path returns an old
+/// ad immediately, even after the receiver moved to another relay, so the
+/// sender keeps producing `cookie_unknown` until the ad expires.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn resolve_fresh_rendezvous_ads(
+    dht: &Arc<veil_dht::KademliaService>,
+    session_tx_registry: &Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
+    pending_recursive: &Arc<
+        std::sync::Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher::PendingRecursive>>,
+    >,
+    local_node_id: [u8; 32],
+    resolve_cache: &Arc<super::anonymity_state::RendezvousResolveCache>,
+    logger: &Arc<veil_observability::NodeLogger>,
+    receiver_id: [u8; 32],
+    timeout: std::time::Duration,
+) -> Vec<veil_anonymity::rendezvous::RendezvousAd> {
+    use veil_anonymity::rendezvous::{
+        MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
+        rendezvous_ad_dht_key_at, verify_rendezvous_ad,
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(ads) = resolve_cache.get(&receiver_id, now) {
+        return ads;
+    }
+    let _refresh_guard = resolve_cache.lock_refresh(receiver_id).await;
+    // Another send may have completed the refresh while this one waited for
+    // the per-recipient single-flight lock.
+    if let Some(ads) = resolve_cache.get(&receiver_id, now) {
+        return ads;
+    }
+
+    // Always fill the cache from every system slot. The IPC caller may request
+    // only one returned replica, but caching that partial lookup would hide a
+    // fresher ad in another slot from the live send path for the cache TTL.
+    let walks = (0..MAX_RENDEZVOUS_AD_SLOTS).map(|idx| {
+        let key = rendezvous_ad_dht_key_at(&receiver_id, idx);
+        async move {
+            let candidates = crate::mlkem_resolver::recursive_dht_get_candidates(
+                dht,
+                session_tx_registry,
+                pending_recursive,
+                local_node_id,
+                key,
+                timeout,
+                // Query every normal replication holder we can reach directly.
+                // On the three-seed production topology this deliberately asks
+                // all three instead of accepting whichever seed replies first.
+                veil_proto::budget::DHT_REPLICATION_K,
+                |bytes| {
+                    decode_rendezvous_ad(bytes)
+                        .ok()
+                        .filter(|ad| ad.receiver_node_id == receiver_id)
+                        .filter(|ad| verify_rendezvous_ad(ad).is_ok())
+                        .filter(|ad| is_currently_valid(ad, now).is_ok())
+                        .is_some()
+                },
+            )
+            .await;
+            (idx, key, candidates)
+        }
+    });
+
+    let mut ads = Vec::new();
+    for (_idx, key, candidates) in futures::future::join_all(walks).await {
+        let mut decoded: Vec<_> = candidates
+            .into_iter()
+            .filter_map(|bytes| decode_rendezvous_ad(&bytes).ok().map(|ad| (ad, bytes)))
+            .collect();
+        // Repair the ordinary local DHT mirror with this slot's newest
+        // publication. The short resolve cache still controls when the next
+        // network comparison happens; the local write merely keeps other DHT
+        // consumers from seeing a known-older value meanwhile.
+        decoded.sort_by_key(|(ad, _)| std::cmp::Reverse(ad.valid_from_unix));
+        if let Some((_, bytes)) = decoded.first() {
+            dht.store_local(key, bytes.clone());
+        }
+        ads.extend(decoded.into_iter().map(|(ad, _)| ad));
+    }
+
+    // Dedupe identical signed ads returned by several replica holders, while
+    // preserving distinct relay/slot publications for the caller's policy.
+    ads.sort_by(|a, b| {
+        b.valid_from_unix
+            .cmp(&a.valid_from_unix)
+            .then_with(|| a.rendezvous_node_id.cmp(&b.rendezvous_node_id))
+            .then_with(|| a.auth_cookie.cmp(&b.auth_cookie))
+    });
+    ads.dedup_by(|a, b| {
+        a.valid_from_unix == b.valid_from_unix
+            && a.rendezvous_node_id == b.rendezvous_node_id
+            && a.auth_cookie == b.auth_cookie
+    });
+
+    if !ads.is_empty() {
+        logger.info(
+            "anonymity.rendezvous.resolve.refreshed",
+            format!(
+                "receiver={} candidates={} freshest_relay={} valid_from={}",
+                veil_util::hex_short(&receiver_id),
+                ads.len(),
+                veil_util::hex_short(&ads[0].rendezvous_node_id),
+                ads[0].valid_from_unix,
+            ),
+        );
+        resolve_cache.put(receiver_id, ads.clone());
+    }
+    ads
 }
 
 /// Adapts the runtime's `NodeServices` to the IPC-layer [`veil_types::
@@ -3367,67 +3484,30 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
         Box<dyn std::future::Future<Output = Vec<veil_ipc::ResolvedReplica>> + Send + 'a>,
     > {
         Box::pin(async move {
-            use veil_anonymity::rendezvous::{
-                MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
-                rendezvous_ad_dht_key_at, verify_rendezvous_ad,
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
             // Walk every slot up to caller's cap or system max
             // whichever is lower. Slot 0 produces the same key as
             // legacy single-key publishers, so pre-T1.4 senders still
             // see one entry; new senders see all K configured slots.
-            let cap = max_replicas.max(1).min(MAX_RENDEZVOUS_AD_SLOTS as usize);
+            let cap = max_replicas
+                .max(1)
+                .min(veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize);
             // Walk all slots CONCURRENTLY — bounded total ≈ ONE walk's timeout,
             // not cap × timeout — so resolve_replicas returns within the IPC
             // reply window (5s) even when every slot misses (e.g. the ad hasn't
             // replicated yet). The local-fast-path validator only trusts a cached
             // ad that decodes, verifies, names this receiver, and is currently
             // valid (mirror-cache-poison resistant); remote results re-verified.
-            let walks = (0..cap as u8).map(|idx| {
-                let key = rendezvous_ad_dht_key_at(&receiver_id, idx);
-                async move {
-                    crate::mlkem_resolver::recursive_dht_get(
-                        &self.dht,
-                        &self.session_tx_registry,
-                        &self.pending_recursive,
-                        self.local_node_id,
-                        key,
-                        std::time::Duration::from_millis(3500),
-                        // A receiver's rendezvous ad may be held by any K-closest
-                        // node, not the receiver itself — keep the recursive walk.
-                        None,
-                        |b| {
-                            decode_rendezvous_ad(b)
-                                .ok()
-                                .filter(|ad| ad.receiver_node_id == receiver_id)
-                                .filter(|ad| verify_rendezvous_ad(ad).is_ok())
-                                .filter(|ad| is_currently_valid(ad, now).is_ok())
-                                .is_some()
-                        },
-                    )
-                    .await
-                }
-            });
-            let mut ads = Vec::with_capacity(cap);
-            for bytes in futures::future::join_all(walks).await.into_iter().flatten() {
-                let ad = match decode_rendezvous_ad(&bytes) {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                // Re-verify remote results: signature + receiver-binding (the ad
-                // MUST name receiver_id — rejects a valid-for-someone-else ad
-                // returned for the wrong key) + freshness.
-                if verify_rendezvous_ad(&ad).is_err()
-                    || ad.receiver_node_id != receiver_id
-                    || is_currently_valid(&ad, now).is_err()
-                {
-                    continue;
-                }
-                ads.push(ad);
-            }
+            let ads = resolve_fresh_rendezvous_ads(
+                &self.dht,
+                &self.session_tx_registry,
+                &self.pending_recursive,
+                self.local_node_id,
+                &self.resolve_cache,
+                &self.logger,
+                receiver_id,
+                std::time::Duration::from_millis(3500),
+            )
+            .await;
             // Prefer the freshest signed ad before relay dedup. This avoids
             // returning a stale pre-cookie-fix ad just because it was in a
             // lower-numbered slot for the same relay.

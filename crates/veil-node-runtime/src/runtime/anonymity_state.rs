@@ -26,12 +26,138 @@
 use std::sync::{Arc, Mutex};
 
 use veil_anonymity::relay_reputation::RelayReputation;
-use veil_anonymity::rendezvous::RendezvousPublisherEntry;
+use veil_anonymity::rendezvous::{RendezvousAd, RendezvousPublisherEntry, is_currently_valid};
 
 /// Default TTL for a stored reply block — the brick-4 freshness window.
 pub const DEFAULT_REPLY_BLOCK_TTL_SECS: u64 = 300;
 /// Default cap on concurrently-stored reply blocks (FIFO-evicted).
 pub const DEFAULT_REPLY_BLOCK_CAP: usize = 4096;
+
+/// How long a sender may reuse a network-validated rendezvous route before it
+/// must ask the DHT replicas again.  This is deliberately much shorter than a
+/// signed ad's validity window: an ad can remain cryptographically valid after
+/// its receiver reconnects and moves to a different rendezvous relay, but that
+/// old relay no longer has the cookie registration and drops every introduce.
+pub const RENDEZVOUS_RESOLVE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Bound the per-recipient route cache independently of DHT storage limits.
+const MAX_RENDEZVOUS_RESOLVE_CACHE: usize = 1024;
+
+#[derive(Clone)]
+struct CachedRendezvousAds {
+    ads: Vec<RendezvousAd>,
+    checked_at: std::time::Instant,
+}
+
+/// Short-lived cache of ads that were compared across independent DHT
+/// replicas.  The ordinary Kademlia local store cannot serve this purpose: it
+/// keeps one still-valid value per key and therefore used to pin a sender to an
+/// old `(relay, cookie)` for the ad's entire TTL after receiver relay rotation.
+pub struct RendezvousResolveCache {
+    inner: Mutex<std::collections::HashMap<[u8; 32], CachedRendezvousAds>>,
+    refresh_locks: Mutex<std::collections::HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
+    ttl: std::time::Duration,
+    cap: usize,
+}
+
+impl RendezvousResolveCache {
+    pub fn new() -> Self {
+        Self::with_params(RENDEZVOUS_RESOLVE_CACHE_TTL, MAX_RENDEZVOUS_RESOLVE_CACHE)
+    }
+
+    fn with_params(ttl: std::time::Duration, cap: usize) -> Self {
+        Self {
+            inner: Mutex::new(std::collections::HashMap::new()),
+            refresh_locks: Mutex::new(std::collections::HashMap::new()),
+            ttl,
+            cap: cap.max(1),
+        }
+    }
+
+    /// Coalesce a burst of sends to the same recipient into one network
+    /// refresh. Content chunks are intentionally numerous; without this
+    /// single-flight lock, an expired route cache could launch one DHT fan-out
+    /// per chunk before the first refresh completed.
+    pub async fn lock_refresh(&self, receiver: [u8; 32]) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.refresh_locks.lock().unwrap_or_else(|p| p.into_inner());
+            if locks.len() >= self.cap && !locks.contains_key(&receiver) {
+                // Entries are tiny and only coordinate transient work. Prefer
+                // dropping an unlocked handle over unbounded growth; a guard
+                // already held elsewhere retains its Arc and remains valid.
+                if let Some(id) = locks
+                    .iter()
+                    .find(|(_, lock)| Arc::strong_count(lock) == 1)
+                    .map(|(id, _)| *id)
+                {
+                    locks.remove(&id);
+                }
+            }
+            Arc::clone(
+                locks
+                    .entry(receiver)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        lock.lock_owned().await
+    }
+
+    /// Return a recently network-validated route set, filtering out ads whose
+    /// signed validity ended while the cache entry was resident.
+    pub fn get(&self, receiver: &[u8; 32], now_unix: u64) -> Option<Vec<RendezvousAd>> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = inner.get(receiver)?;
+        if entry.checked_at.elapsed() >= self.ttl {
+            inner.remove(receiver);
+            return None;
+        }
+        let ads: Vec<_> = entry
+            .ads
+            .iter()
+            .filter(|ad| is_currently_valid(ad, now_unix).is_ok())
+            .cloned()
+            .collect();
+        if ads.is_empty() {
+            inner.remove(receiver);
+            None
+        } else {
+            Some(ads)
+        }
+    }
+
+    pub fn put(&self, receiver: [u8; 32], ads: Vec<RendezvousAd>) {
+        if ads.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.len() >= self.cap
+            && !inner.contains_key(&receiver)
+            && let Some(oldest) = inner
+                .iter()
+                .min_by_key(|(_, entry)| entry.checked_at)
+                .map(|(id, _)| *id)
+        {
+            inner.remove(&oldest);
+            self.refresh_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&oldest);
+        }
+        inner.insert(
+            receiver,
+            CachedRendezvousAds {
+                ads,
+                checked_at: std::time::Instant::now(),
+            },
+        );
+    }
+}
+
+impl Default for RendezvousResolveCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Bounded, TTL'd store of one-time reply blocks (reply-channel). The
 /// auth-deliver task inserts a block when a verified message carries a reply
@@ -197,6 +323,11 @@ pub struct AnonymityState {
     /// rendezvous-routed inbound delivery touch this.
     pub rendezvous_publisher_entries: Arc<Mutex<Vec<RendezvousPublisherEntry>>>,
 
+    /// Sender-side short-lived, network-validated rendezvous route cache.  It
+    /// is shared by the live onion send path and the mailbox-replica IPC lookup
+    /// so neither can get pinned to a still-valid but no-longer-live local ad.
+    pub rendezvous_resolve_cache: Arc<RendezvousResolveCache>,
+
     /// Per-node anonymity-relay failure ledger (Epic 482.3/482.4 Phase A).
     /// Records relays observed to misbehave — a chosen first hop with no live
     /// session (send-time), or a relayed delivery that exhausted retransmits
@@ -291,6 +422,7 @@ impl AnonymityState {
             advertised_bps,
             x25519_sk,
             rendezvous_publisher_entries: Arc::new(Mutex::new(Vec::new())),
+            rendezvous_resolve_cache: Arc::new(RendezvousResolveCache::new()),
             relay_reputation: Arc::new(RelayReputation::new()),
             reply_block_store: Arc::new(ReplyBlockStore::new()),
             auth_deliver_replay_cache: Arc::new(
@@ -306,6 +438,43 @@ impl AnonymityState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ad(receiver: u8, relay: u8, valid_from: u64, valid_until: u64) -> RendezvousAd {
+        RendezvousAd {
+            receiver_node_id: [receiver; 32],
+            rendezvous_node_id: [relay; 32],
+            auth_cookie: [relay; 16],
+            receiver_x25519_pk: [3; 32],
+            valid_from_unix: valid_from,
+            valid_until_unix: valid_until,
+            issuer_pk: String::new(),
+            issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
+            signature: Vec::new(),
+            push_envelope: Vec::new(),
+            capability_token: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
+            wire_version: 5,
+        }
+    }
+
+    #[test]
+    fn rendezvous_resolve_cache_is_short_lived_and_filters_expired_ads() {
+        let receiver = [7; 32];
+        let cache = RendezvousResolveCache::with_params(std::time::Duration::from_secs(60), 4);
+        cache.put(receiver, vec![ad(7, 1, 90, 200), ad(7, 2, 10, 99)]);
+        let got = cache.get(&receiver, 100).expect("fresh cache entry");
+        assert_eq!(got.len(), 1, "signed-expired ad must be removed");
+        assert_eq!(got[0].rendezvous_node_id, [1; 32]);
+
+        let immediately_stale = RendezvousResolveCache::with_params(std::time::Duration::ZERO, 4);
+        immediately_stale.put(receiver, vec![ad(7, 3, 90, 200)]);
+        assert!(
+            immediately_stale.get(&receiver, 100).is_none(),
+            "route-cache TTL, not the ad validity window, controls re-resolution"
+        );
+    }
 
     fn rb(tag: u8) -> veil_proto::ReplyBlock {
         veil_proto::ReplyBlock {
