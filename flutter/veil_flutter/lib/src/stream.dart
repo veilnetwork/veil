@@ -235,6 +235,48 @@ String _readErrAndFree(Pointer<Pointer<Utf8>> errOut) {
   return msg;
 }
 
+/// Off-isolate FFI write for [VeilAnonStream]. Top-level so the closure captures
+/// only the sendable address + bytes. CRITICAL: the FFI write `block_on`s and can
+/// BLOCK when the send buffer back-pressures (a slow onion can't drain it) — on
+/// the UI isolate that is an ANR, so writes run on a worker isolate like reads.
+void _ffiAnonStreamWriteOffIsolate(int streamAddr, Uint8List data) {
+  final stream = Pointer<ffi.VeilAnonStreamFfi>.fromAddress(streamAddr);
+  final dataPtr = data.isEmpty ? nullptr : calloc<Uint8>(data.length);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    if (data.isNotEmpty) {
+      dataPtr.asTypedList(data.length).setAll(0, data);
+    }
+    final rc = ffi.veilAnonStreamWrite(stream, dataPtr, data.length, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'anon stream write failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+  } finally {
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
+/// Off-isolate FFI finish for [VeilAnonStream] (same ANR concern as write).
+void _ffiAnonStreamFinishOffIsolate(int streamAddr) {
+  final stream = Pointer<ffi.VeilAnonStreamFfi>.fromAddress(streamAddr);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final rc = ffi.veilAnonStreamFinish(stream, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'anon stream finish failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+  } finally {
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate FFI read for [VeilAnonStream] (mirrors [_ffiStreamReadOffIsolate]).
 Uint8List _ffiAnonStreamReadOffIsolate(int streamAddr, int maxBytes) {
   final stream = Pointer<ffi.VeilAnonStreamFfi>.fromAddress(streamAddr);
@@ -271,6 +313,8 @@ class VeilAnonStream {
   bool _closed = false;
 
   /// Queue [data] for reliable delivery (flow-controlled). Empty is a no-op.
+  /// Runs on a worker isolate — the FFI write can block on back-pressure, which
+  /// on the UI isolate would freeze the app (ANR).
   Future<void> write(Uint8List data) async {
     _ensureOpen();
     if (data.length > ffi.veilMaxDataLen) {
@@ -278,25 +322,8 @@ class VeilAnonStream {
         'data length ${data.length} exceeds veilMaxDataLen (${ffi.veilMaxDataLen})',
       );
     }
-    return Future(() {
-      final dataPtr = data.isEmpty ? nullptr : calloc<Uint8>(data.length);
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        if (data.isNotEmpty) {
-          dataPtr.asTypedList(data.length).setAll(0, data);
-        }
-        final rc = ffi.veilAnonStreamWrite(_stream, dataPtr, data.length, errOut);
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-            'anon stream write failed: ${_readErrAndFree(errOut)}',
-            code: rc,
-          );
-        }
-      } finally {
-        if (dataPtr != nullptr) calloc.free(dataPtr);
-        calloc.free(errOut);
-      }
-    });
+    final addr = _stream.address;
+    return Isolate.run(() => _ffiAnonStreamWriteOffIsolate(addr, data));
   }
 
   /// Read up to [maxBytes]. Empty = clean EOF. Runs on a worker isolate (the
@@ -311,23 +338,11 @@ class VeilAnonStream {
   }
 
   /// Half-close the send direction (a FIN follows the last queued byte); the
-  /// peer reads EOF.
+  /// peer reads EOF. Off-isolate (same ANR concern as [write]).
   Future<void> finish() async {
     _ensureOpen();
-    return Future(() {
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        final rc = ffi.veilAnonStreamFinish(_stream, errOut);
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-            'anon stream finish failed: ${_readErrAndFree(errOut)}',
-            code: rc,
-          );
-        }
-      } finally {
-        calloc.free(errOut);
-      }
-    });
+    final addr = _stream.address;
+    return Isolate.run(() => _ffiAnonStreamFinishOffIsolate(addr));
   }
 
   /// Close + release the handle (idempotent).
