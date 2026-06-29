@@ -913,13 +913,14 @@ impl FrameDispatcher {
         {
             return match origin.open_return(cell.seq, &cell.ciphertext) {
                 Ok(opened) => {
-                    // onion-stream Phase 1c: if a byte-STREAM owns this origin
-                    // circuit, hand it the opened cell and stop. Otherwise it is a
-                    // sealed introduce R forwarded down the circuit (path unchanged
-                    // — the sink is `None` for every non-stream circuit).
-                    if let Some(sink) = &self.on_circuit_return
-                        && sink(cell.circuit_id, opened.clone())
+                    // onion-stream Phase 1c: a return cell on a REGISTERED stream
+                    // circuit is delivered to its channel; any other id is a sealed
+                    // introduce R forwarded down the circuit (path unchanged — no
+                    // circuit is registered in `stream_recv` for introduce traffic).
+                    if let Ok(map) = self.stream_recv.lock()
+                        && let Some(tx) = map.get(&cell.circuit_id)
                     {
+                        let _ = tx.try_send(opened); // drop-on-full; ARQ recovers
                         return DispatchResult::NoResponse;
                     }
                     self.process_introduce_ciphertext(&opened, &link)
