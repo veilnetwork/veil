@@ -56,12 +56,16 @@ struct InFlight {
 struct Pipe {
     ch: Channel,
     flight: Vec<InFlight>,
+    /// Total cells the sender handed in (incl. ones later dropped) — the wire
+    /// send count, for measuring retransmit overhead.
+    injected: u64,
 }
 impl Pipe {
     fn new(ch: Channel) -> Self {
-        Pipe { ch, flight: Vec::new() }
+        Pipe { ch, flight: Vec::new(), injected: 0 }
     }
     fn inject(&mut self, now: u64, bytes: &[u8], rng: &mut Rng) {
+        self.injected += 1;
         // Drop?
         if rng.unit() < self.ch.loss {
             return;
@@ -103,6 +107,8 @@ struct Outcome {
     b_events: Vec<Event>,
     steps: u64,
     completed: bool,
+    /// Cells A (the sender) put on the wire, incl. retransmits.
+    tx_cells: u64,
 }
 
 /// Drive a one-way transfer of `payload` from A→B over `ch` (both directions use
@@ -195,7 +201,15 @@ fn run_oneway(payload: &[u8], ch: Channel, seed: u64, cfg: Config) -> Outcome {
         b.on_timeout(now);
     }
 
-    Outcome { received, max_cwnd_a, a_events, b_events, steps, completed }
+    Outcome {
+        received,
+        max_cwnd_a,
+        a_events,
+        b_events,
+        steps,
+        completed,
+        tx_cells: a2b.injected,
+    }
 }
 
 fn payload(n: usize, seed: u64) -> Vec<u8> {
@@ -233,6 +247,24 @@ fn thirty_percent_loss_still_completes_intact() {
     let out = run_oneway(&data, Channel::lossy(0.30), 11, Config::default());
     assert!(out.completed, "30% loss did not complete in {} steps", out.steps);
     assert_eq!(out.received, data, "ARQ failed to repair 30% loss");
+}
+
+#[test]
+fn sack_keeps_retransmit_overhead_bounded() {
+    // SACK-aware retransmit must resend roughly the LOST cells, not re-send
+    // cells the receiver already SACKed. 20% loss → expect well under 2× the
+    // payload on the wire (a SACK-blind retransmitter inflates far past that).
+    let data = payload(120_000, 21);
+    let out = run_oneway(&data, Channel::lossy(0.20), 5, Config::default());
+    assert!(out.completed, "did not complete");
+    assert_eq!(out.received, data);
+    let payload_cells = data.len().div_ceil(veil_onion_stream::MSS) as u64;
+    assert!(
+        out.tx_cells < payload_cells * 2,
+        "retransmit overhead too high: {} cells sent for {} payload cells",
+        out.tx_cells,
+        payload_cells
+    );
 }
 
 #[test]
