@@ -32,6 +32,7 @@ members = [
     "crates/veil-obfs4",
     "crates/veil-obfs4-smoke",
     "crates/veil-observability",
+    "crates/veil-onion-stream",
     "crates/veil-dispatcher-state",
     "crates/veil-pending-ack",
     "crates/veil-pex",
