@@ -107,30 +107,103 @@ impl OnionStream {
     /// Read up to `buf.len()` delivered bytes. `Ok(0)` = clean EOF; an
     /// `Err(ConnectionReset)` = the stream was aborted (the app should resume).
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.residual.is_empty() {
-            match self.data_rx.recv().await {
-                Some(chunk) => self.residual = chunk,
-                None => {
-                    return match self.end_reason() {
-                        End::Reset(r) => Err(io::Error::new(
-                            io::ErrorKind::ConnectionReset,
-                            format!("onion stream reset ({r})"),
-                        )),
-                        _ => Ok(0), // clean EOF
-                    };
-                }
-            }
-        }
-        let n = buf.len().min(self.residual.len());
-        buf[..n].copy_from_slice(&self.residual[..n]);
-        self.residual.drain(..n);
-        Ok(n)
+        pull(&mut self.data_rx, &mut self.residual, &self.end, buf).await
     }
 
     /// Current end state (Open / Eof / Reset).
     pub fn end_reason(&self) -> End {
-        *self.end.lock().unwrap_or_else(|p| p.into_inner())
+        end_of(&self.end)
     }
+
+    /// Split into independently-owned read + write halves so a caller can read
+    /// and write concurrently (the FFI does this — one mutex over the whole
+    /// stream would deadlock a blocking read against a write).
+    pub fn into_split(self) -> (OnionReader, OnionWriter) {
+        (
+            OnionReader {
+                data_rx: self.data_rx,
+                residual: self.residual,
+                end: self.end.clone(),
+            },
+            OnionWriter {
+                cmd_tx: self.cmd_tx,
+                end: self.end,
+            },
+        )
+    }
+}
+
+/// Read half of a split [`OnionStream`].
+pub struct OnionReader {
+    data_rx: mpsc::Receiver<Vec<u8>>,
+    residual: Vec<u8>,
+    end: Arc<Mutex<End>>,
+}
+impl OnionReader {
+    /// See [`OnionStream::read`].
+    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        pull(&mut self.data_rx, &mut self.residual, &self.end, buf).await
+    }
+    pub fn end_reason(&self) -> End {
+        end_of(&self.end)
+    }
+}
+
+/// Write half of a split [`OnionStream`].
+pub struct OnionWriter {
+    cmd_tx: mpsc::Sender<AppCmd>,
+    end: Arc<Mutex<End>>,
+}
+impl OnionWriter {
+    /// See [`OnionStream::write_all`].
+    pub async fn write_all(&self, data: &[u8]) -> io::Result<()> {
+        self.cmd_tx
+            .send(AppCmd::Write(data.to_vec()))
+            .await
+            .map_err(|_| broken())
+    }
+    /// See [`OnionStream::finish`].
+    pub async fn finish(&self) -> io::Result<()> {
+        self.cmd_tx.send(AppCmd::Finish).await.map_err(|_| broken())
+    }
+    /// See [`OnionStream::reset`].
+    pub async fn reset(&self, reason: u8) {
+        let _ = self.cmd_tx.send(AppCmd::Reset(reason)).await;
+    }
+    pub fn end_reason(&self) -> End {
+        end_of(&self.end)
+    }
+}
+
+fn end_of(end: &Arc<Mutex<End>>) -> End {
+    *end.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Shared read implementation for [`OnionStream`] + [`OnionReader`].
+async fn pull(
+    data_rx: &mut mpsc::Receiver<Vec<u8>>,
+    residual: &mut Vec<u8>,
+    end: &Arc<Mutex<End>>,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    if residual.is_empty() {
+        match data_rx.recv().await {
+            Some(chunk) => *residual = chunk,
+            None => {
+                return match end_of(end) {
+                    End::Reset(r) => Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        format!("onion stream reset ({r})"),
+                    )),
+                    _ => Ok(0), // clean EOF
+                };
+            }
+        }
+    }
+    let n = buf.len().min(residual.len());
+    buf[..n].copy_from_slice(&residual[..n]);
+    residual.drain(..n);
+    Ok(n)
 }
 
 fn broken() -> io::Error {
