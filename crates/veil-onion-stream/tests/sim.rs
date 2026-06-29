@@ -268,6 +268,41 @@ fn sack_keeps_retransmit_overhead_bounded() {
 }
 
 #[test]
+fn high_bdp_sack_does_not_storm() {
+    // Mirror the onion path: SECONDS of RTT + a large window keeps THOUSANDS of
+    // cells in flight at once. A naive "retransmit every un-SACKed hole below the
+    // highest SACK" then re-sends most of the in-flight window on each SACK — the
+    // ~10× duplicate storm seen on-device. RFC 6675 IsLost (resend only a segment
+    // with >=3 higher-seq SACKed segments) must keep overhead bounded. The 25 ms
+    // `sack_keeps_retransmit_overhead_bounded` channel is too low-BDP to expose
+    // this; a real RTT does.
+    let mss = veil_onion_stream::MSS as u32;
+    let cfg = Config {
+        init_rto_ms: 12_000,
+        min_rto_ms: 10_000,
+        max_rto_ms: 60_000,
+        recv_window: 8192 * mss,
+        init_cwnd: 32 * mss,
+        ..Config::default()
+    };
+    let data = payload(400_000, 31);
+    // ~1 s one-way (≈2 s RTT) — far below the 10 s RTO floor, so EVERY retransmit
+    // here is SACK-driven; this isolates mark_holes from the RTO path.
+    let ch = Channel { loss: 0.10, dup: 0.0, base_delay: 1000, jitter: 50 };
+    let out = run_oneway(&data, ch, 77, cfg);
+    assert!(out.completed, "high-BDP transfer did not complete in {} steps", out.steps);
+    assert_eq!(out.received, data);
+    let payload_cells = data.len().div_ceil(veil_onion_stream::MSS) as u64;
+    assert!(
+        out.tx_cells < payload_cells * 2,
+        "SACK storm at high BDP: {} cells sent for {} payload cells (~{:.1}× overhead)",
+        out.tx_cells,
+        payload_cells,
+        out.tx_cells as f64 / payload_cells as f64
+    );
+}
+
+#[test]
 fn reordering_and_duplication_complete_intact() {
     let data = payload(100_000, 4);
     let ch = Channel { loss: 0.05, dup: 0.10, base_delay: 25, jitter: 80 };
