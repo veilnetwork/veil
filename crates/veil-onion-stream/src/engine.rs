@@ -87,6 +87,10 @@ struct Seg {
     is_fin: bool,
     sent_ms: u64,
     retransmitted: bool,
+    /// The receiver SACKed this segment — it's received, never retransmit it.
+    sacked: bool,
+    /// Marked for retransmission (a hole below the highest SACK, or an RTO).
+    needs_resend: bool,
 }
 impl Seg {
     /// Sequence space this segment consumes (FIN consumes 1).
@@ -110,7 +114,6 @@ struct TxState {
     dup_acks: u32,
     in_recovery: bool,
     recover: u32, // NewReno: snd_nxt at the moment loss was detected
-    resend_front: bool, // a retransmit of the oldest seg is due
     // RTT / RTO (Jacobson-Karels), millis.
     srtt: Option<u32>,
     rttvar: u32,
@@ -191,7 +194,6 @@ impl StreamEngine {
                 dup_acks: 0,
                 in_recovery: false,
                 recover: iss,
-                resend_front: false,
                 srtt: None,
                 rttvar: 0,
                 rto_ms: cfg.init_rto_ms,
@@ -419,11 +421,21 @@ impl StreamEngine {
         }
     }
 
-    fn on_ack(&mut self, ack: u32, win: u32, _sacks: &SackVec, now: u64) {
+    fn on_ack(&mut self, ack: u32, win: u32, sacks: &SackVec, now: u64) {
         self.tx.rwnd = win;
         self.note_peer_progress();
         if self.phase == Phase::SynSent || self.phase == Phase::Closed {
             return;
+        }
+        // SACK: mark fully-covered unacked segments as RECEIVED so a later RTO /
+        // fast-retransmit never resends them (the big source of duplicate cells
+        // over the high-RTT onion path).
+        for r in sacks.as_slice() {
+            for s in self.tx.segs.iter_mut() {
+                if seq::geq(s.seq, r.start) && seq::leq(s.end(), r.end) {
+                    s.sacked = true;
+                }
+            }
         }
         let mss = self.cfg.mss as u32;
 
@@ -453,9 +465,9 @@ impl StreamEngine {
                     self.tx.in_recovery = false; // full recovery
                     self.tx.cwnd = self.tx.ssthresh.max(mss);
                 } else {
-                    // partial ACK: retransmit next hole, deflate by acked.
+                    // partial ACK: retransmit the remaining holes, deflate by acked.
                     self.tx.cwnd = self.tx.cwnd.saturating_sub(acked).max(mss);
-                    self.tx.resend_front = true;
+                    self.mark_holes();
                     self.tx.cwnd = self.tx.cwnd.saturating_add(mss);
                 }
             } else if self.tx.cwnd < self.tx.ssthresh {
@@ -475,7 +487,7 @@ impl StreamEngine {
             if self.tx.dup_acks == 3 && !self.tx.in_recovery {
                 let flight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
                 self.tx.ssthresh = (flight / 2).max(2 * mss);
-                self.tx.resend_front = true; // fast retransmit
+                self.mark_holes(); // fast retransmit (SACK-aware)
                 self.tx.cwnd = self.tx.ssthresh.saturating_add(3 * mss);
                 self.tx.in_recovery = true;
                 self.tx.recover = self.tx.snd_nxt;
@@ -522,17 +534,18 @@ impl StreamEngine {
             return true;
         }
         if self.phase == Phase::Established {
-            // 3a. Retransmit the oldest unacked segment first.
-            if self.tx.resend_front {
-                self.tx.resend_front = false;
-                if !self.tx.segs.is_empty() {
-                    self.encode_seg(SegPos::Front, out);
-                    return true;
-                }
+            // 3a. Retransmit a marked hole first — SACK-aware, so we never resend
+            //     a segment the receiver already acknowledged out of order.
+            if let Some(idx) = self.tx.segs.iter().position(|s| s.needs_resend) {
+                self.tx.segs[idx].needs_resend = false;
+                self.tx.segs[idx].retransmitted = true;
+                self.tx.segs[idx].sent_ms = now;
+                self.encode_seg_at(idx, out);
+                return true;
             }
             // 3b. New data / FIN, congestion + flow limited.
             if self.create_next_segment(now) {
-                self.encode_seg(SegPos::Back, out);
+                self.encode_seg_at(self.tx.segs.len() - 1, out);
                 return true;
             }
         }
@@ -596,6 +609,8 @@ impl StreamEngine {
                 is_fin: false,
                 sent_ms: now,
                 retransmitted: false,
+                sacked: false,
+                needs_resend: false,
             });
             if self.tx.rto_deadline.is_none() {
                 self.tx.rto_deadline = Some(now + self.tx.rto_ms);
@@ -613,6 +628,8 @@ impl StreamEngine {
                 is_fin: true,
                 sent_ms: now,
                 retransmitted: false,
+                sacked: false,
+                needs_resend: false,
             });
             if self.tx.rto_deadline.is_none() {
                 self.tx.rto_deadline = Some(now + self.tx.rto_ms);
@@ -622,13 +639,9 @@ impl StreamEngine {
         false
     }
 
-    fn encode_seg(&mut self, pos: SegPos, out: &mut Vec<u8>) {
-        let seg = match pos {
-            SegPos::Front => self.tx.segs.front_mut(),
-            SegPos::Back => self.tx.segs.back_mut(),
-        }
-        .expect("encode_seg on empty queue");
+    fn encode_seg_at(&self, idx: usize, out: &mut Vec<u8>) {
         let win = self.rx.advertised();
+        let seg = &self.tx.segs[idx];
         let frame = if seg.is_fin {
             Frame::Fin { stream_id: self.stream_id, seq: seg.seq }
         } else {
@@ -640,6 +653,36 @@ impl StreamEngine {
             }
         };
         encode(frame, out);
+    }
+
+    /// Mark which unacked segments to retransmit (SACK-aware). If the receiver
+    /// has SACKed anything, retransmit every UN-SACKed segment below the highest
+    /// SACK (the holes) — multi-loss recovers in one RTT instead of one hole per
+    /// RTT. With no SACK info, the oldest unacked segment is the presumed loss.
+    fn mark_holes(&mut self) {
+        let mut hi: Option<u32> = None;
+        for s in &self.tx.segs {
+            if s.sacked {
+                hi = Some(match hi {
+                    Some(h) if seq::geq(h, s.end()) => h,
+                    _ => s.end(),
+                });
+            }
+        }
+        match hi {
+            Some(hi) => {
+                for s in self.tx.segs.iter_mut() {
+                    if !s.sacked && seq::lt(s.seq, hi) {
+                        s.needs_resend = true;
+                    }
+                }
+            }
+            None => {
+                if let Some(f) = self.tx.segs.front_mut() {
+                    f.needs_resend = true;
+                }
+            }
+        }
     }
 
     fn make_ack(&self) -> Frame<'static> {
@@ -707,11 +750,11 @@ impl StreamEngine {
             self.tx.cwnd = mss; // collapse to slow start
             self.tx.in_recovery = false;
             self.tx.dup_acks = 0;
-            if let Some(s) = self.tx.segs.front_mut() {
-                s.retransmitted = true;
-                s.sent_ms = now;
+            // Retransmit the oldest UN-SACKed unacked segment (poll_transmit
+            // stamps sent_ms/retransmitted when it actually re-sends it).
+            if let Some(s) = self.tx.segs.iter_mut().find(|s| !s.sacked) {
+                s.needs_resend = true;
             }
-            self.tx.resend_front = true;
             self.tx.rto_ms = (self.tx.rto_ms * 2).min(self.cfg.max_rto_ms); // backoff
             self.tx.rto_deadline = Some(now + self.tx.rto_ms);
         }
@@ -747,12 +790,6 @@ impl StreamEngine {
         self.rst_to_send = Some(reset_reason::TIMED_OUT);
         self.events.push_back(Event::Reset(reset_reason::TIMED_OUT));
     }
-}
-
-#[derive(Clone, Copy)]
-enum SegPos {
-    Front,
-    Back,
 }
 
 fn encode(frame: Frame<'_>, out: &mut Vec<u8>) {
