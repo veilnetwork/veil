@@ -19,6 +19,35 @@ use std::time::Duration;
 use libc::size_t;
 use tokio::sync::oneshot;
 
+/// Minimal `log` -> stderr bridge for non-Android hosts. The embedded node's
+/// runtime emits some diagnostics through the `log` crate (e.g. the onion-stream
+/// `relay-pick` line), but on desktop nothing consumes `log`, so those vanish
+/// (only the node's own tracing logger reaches stderr). Bridge them — non-
+/// panicking: a failed stderr write is swallowed, never aborts (see the FFI
+/// `diag` crash). Android already routes `log` to logcat via `android_logger`.
+#[cfg(not(target_os = "android"))]
+struct StderrLogBridge;
+
+#[cfg(not(target_os = "android"))]
+impl log::Log for StderrLogBridge {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Info
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[{} {}] {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+    }
+    fn flush(&self) {}
+}
+
 /// Opaque handle to a running embedded node.
 pub struct VeilNode {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
@@ -343,6 +372,19 @@ fn start_thread(
                             .with_max_level(log::LevelFilter::Info)
                             .with_tag("veilnode"),
                     );
+                });
+            }
+            // Desktop/iOS: bridge `log` -> stderr once so the runtime's `log`
+            // diagnostics (onion-stream relay-pick &c.) are visible here too.
+            #[cfg(not(target_os = "android"))]
+            {
+                use std::sync::Once;
+                static INIT: Once = Once::new();
+                static BRIDGE: StderrLogBridge = StderrLogBridge;
+                INIT.call_once(|| {
+                    if log::set_logger(&BRIDGE).is_ok() {
+                        log::set_max_level(log::LevelFilter::Info);
+                    }
                 });
             }
             let rt = match tokio::runtime::Builder::new_multi_thread()
