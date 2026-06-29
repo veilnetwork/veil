@@ -6290,6 +6290,54 @@ fn map_sender_err(e: veil_anonymity::sender::SenderError) -> veil_types::AnonOni
     }
 }
 
+/// A pinned stateful onion circuit for an anonymous byte-stream (Phase 1b of the
+/// onion-stream speedup). Built ONCE — the setup envelope installs a per-hop XOR
+/// key at each relay — then carries cheap fixed-size `CircuitData` cells with NO
+/// per-cell ECDH and NO per-cell signature. (The per-cell circuit build + sign/
+/// verify of the datagram path is what inflates the RTT and drives the spurious-
+/// recovery slowdown the byte-stream hits.) This node is the ORIGINATOR: it
+/// sends FORWARD cells toward the terminus and opens RETURN cells via the
+/// dispatcher origin table. ADDITIVE — no existing anonymous-send path changes.
+pub struct DataCircuit {
+    first_hop: [u8; 32],
+    origin_circuit_id: u32,
+    /// Per-hop keys, first-hop → terminus order (wraps each FORWARD cell).
+    keys: Vec<[u8; 32]>,
+    /// Next FORWARD seq. 0 is reserved (the wire numbers from 1), so the first
+    /// allocation returns 1. NEVER wraps — a reused seq reuses an XOR keystream
+    /// (breaks confidentiality); exhaustion returns `None` so the caller rotates
+    /// the circuit (in practice the 600 s origin-table TTL rotates first).
+    next_seq: std::sync::atomic::AtomicU32,
+    confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DataCircuit {
+    /// The originator-link circuit id (return cells carry it; also the splice key
+    /// at R once the rendezvous-splice path lands).
+    pub fn origin_circuit_id(&self) -> u32 {
+        self.origin_circuit_id
+    }
+
+    /// First hop's node id (return cells arrive from here).
+    pub fn first_hop(&self) -> [u8; 32] {
+        self.first_hop
+    }
+
+    /// Whether the terminus's `CircuitBuilt` ACK has confirmed the whole path.
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Allocate the next FORWARD seq (1, 2, 3, …); `None` once the 32-bit space
+    /// is exhausted (never wrap — XOR keystream reuse).
+    fn alloc_seq(&self) -> Option<u32> {
+        let prev = self
+            .next_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        prev.checked_add(1)
+    }
+}
+
 impl NodeServices {
     /// Register a LOCATION-anonymous service (onion-registration b5b-runtime):
     /// build an onion circuit whose terminus is the rendezvous relay R
@@ -6409,6 +6457,100 @@ impl NodeServices {
             &setup,
         );
         Ok(confirmed)
+    }
+
+    /// Open a pinned [`DataCircuit`] through `relay_path` (`relay_path[0]` first
+    /// hop, `relay_path.last()` the terminus), carrying `terminus_payload` to the
+    /// terminus (e.g. a signed registration so it can route returns back). The
+    /// originating `OriginCircuit` is inserted into the dispatcher origin table so
+    /// its RETURN cells dispatch here; the `CircuitBuild` envelope goes to the
+    /// first hop. Returns a handle for [`Self::send_circuit_cell`]. ADDITIVE — the
+    /// onion-stream CellDuplex (Phase 1d) will use it; no existing path changes.
+    pub fn open_data_circuit(
+        &self,
+        relay_path: &[[u8; 32]],
+        terminus_payload: &[u8],
+    ) -> std::result::Result<DataCircuit, veil_types::AnonOnionSendError> {
+        use veil_anonymity::circuit_origin::{OriginHop, build_origin_circuit};
+        use veil_anonymity::directory::{decode_entry, relay_directory_dht_key};
+        use veil_types::AnonOnionSendError;
+
+        if relay_path.is_empty() {
+            return Err(AnonOnionSendError::NoRelays);
+        }
+        // Receive-capable only: we must own the origin table to open returns.
+        let Some(origin_table) = &self.dispatcher.circuit_origin else {
+            return Err(AnonOnionSendError::NoIdentity);
+        };
+        // Resolve each hop's anonymity X25519 key from the local relay directory.
+        let mut hops = Vec::with_capacity(relay_path.len());
+        for nid in relay_path {
+            let bytes = self
+                .dht
+                .get_local(&relay_directory_dht_key(nid))
+                .ok_or(AnonOnionSendError::NoRelays)?;
+            let entry = decode_entry(&bytes).map_err(|_| AnonOnionSendError::NoRelays)?;
+            hops.push(OriginHop {
+                node_id: *nid,
+                pubkey: entry.x25519_pk,
+            });
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (setup, origin) = build_origin_circuit(&hops, terminus_payload, now)
+            .map_err(|_| AnonOnionSendError::NoRelays)?;
+        // Snapshot what the handle needs BEFORE the origin moves into the table.
+        let circ = DataCircuit {
+            first_hop: origin.first_hop,
+            origin_circuit_id: origin.origin_circuit_id,
+            keys: origin.circuit_keys.clone(),
+            next_seq: std::sync::atomic::AtomicU32::new(0),
+            confirmed: std::sync::Arc::clone(&origin.confirmed),
+        };
+        if !origin_table.insert(std::sync::Arc::new(origin)) {
+            return Err(AnonOnionSendError::NoRelays); // origin table full
+        }
+        self.send_relay_chain_frame(
+            &circ.first_hop,
+            veil_proto::family::RelayChainMsg::CircuitBuild,
+            &setup,
+        );
+        Ok(circ)
+    }
+
+    /// Send one FORWARD data cell over a pinned [`DataCircuit`]: `wrap_payload`
+    /// (fixed 384 B) → XOR every hop layer → `CircuitData` to the first hop. No
+    /// per-cell ECDH, no per-cell signature. `payload` ≤ `MAX_CIRCUIT_INNER`
+    /// (382 B). ADDITIVE helper.
+    pub fn send_circuit_cell(
+        &self,
+        circ: &DataCircuit,
+        payload: &[u8],
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        use veil_anonymity::circuit_data::{Direction, apply_layers, wrap_payload};
+        use veil_anonymity::circuit_wire::CircuitDataPayload;
+        use veil_types::AnonOnionSendError;
+
+        let seq = circ.alloc_seq().ok_or(AnonOnionSendError::NoRelays)?; // exhausted → rotate
+        let mut buf = wrap_payload(payload).map_err(|_| AnonOnionSendError::PayloadTooLarge)?;
+        apply_layers(&circ.keys, Direction::Forward, seq, &mut buf)
+            .map_err(|_| AnonOnionSendError::NoRelays)?;
+        let cell = CircuitDataPayload {
+            circuit_id: circ.origin_circuit_id,
+            seq,
+            ciphertext: buf,
+        };
+        let enc = cell
+            .encode()
+            .map_err(|_| AnonOnionSendError::NoRelays)?;
+        self.send_relay_chain_frame(
+            &circ.first_hop,
+            veil_proto::family::RelayChainMsg::CircuitData,
+            &enc,
+        );
+        Ok(())
     }
 
     /// Register this node as a LOCATION-anonymous service (the prod entry point):
