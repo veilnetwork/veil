@@ -60,7 +60,18 @@ impl AnonStreamHub {
         let (in_tx, in_rx) = mpsc::channel(1024);
         tokio::spawn(async move {
             while let Some(msg) = msg_rx.recv().await {
-                let addr = Addr { node: msg.src_node_id, app: msg.src_app_id };
+                // The authenticated anonymous transport delivers src_app_id =
+                // [0;32] (it carries no sender app id — service_tasks.rs). So
+                // DERIVE the peer's onion-stream endpoint app from its node id —
+                // it's the deterministic `app_id(node, ns, name)` both ends bind
+                // under. Using the zeroed src_app_id would address returns to an
+                // unbound endpoint ("no app bound to endpoint_id=12" → dropped).
+                let app = veil_app::address::app_id(
+                    &msg.src_node_id,
+                    STREAM_NAMESPACE,
+                    STREAM_NAME,
+                );
+                let addr = Addr { node: msg.src_node_id, app };
                 if in_tx.send((addr, msg.data)).await.is_err() {
                     break;
                 }
