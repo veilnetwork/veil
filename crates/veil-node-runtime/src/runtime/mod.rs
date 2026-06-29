@@ -6617,13 +6617,29 @@ impl NodeServices {
     > {
         use veil_anonymity::directory::relay_directory_dht_key;
         use veil_types::AnonOnionSendError;
-        let mut relays: Vec<[u8; 32]> = self
-            .dht
-            .routing_table_contacts()
+        // R candidates = CONNECTED (session) peers whose relay-directory entry
+        // (their anonymity x25519, needed to onion-wrap to them) is cached
+        // locally — the rendezvous relays we actually have a session to, NOT the
+        // DHT routing table (which rarely holds them). Deterministic (smallest
+        // node_id) so both ends agree on R with no handshake.
+        let sessions: Vec<[u8; 32]> = rlock!(self.session_tx_registry)
+            .active_node_ids()
             .into_iter()
-            .map(|c| c.node_id)
+            .collect();
+        let mut relays: Vec<[u8; 32]> = sessions
+            .iter()
+            .copied()
             .filter(|nid| self.dht.get_local(&relay_directory_dht_key(nid)).is_some())
             .collect();
+        self.logger.info(
+            "onion-stream.relay-pick",
+            format!(
+                "sessions={} relay-dir-resolvable={} routing={}",
+                sessions.len(),
+                relays.len(),
+                self.dht.routing_table_contacts().len()
+            ),
+        );
         relays.sort_unstable();
         let r = *relays.first().ok_or(AnonOnionSendError::NoRelays)?;
         self.open_stream_circuit(&[r], cookie, reg_kp, last_epoch)
