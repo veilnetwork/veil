@@ -1247,13 +1247,13 @@ pub struct FrameDispatcher {
     /// receiver's introduce replay cache — this closes the amplification).
     pub circuit_introduce_seen: Arc<Mutex<ExpiryCache<[u8; 32]>>>,
 
-    /// Optional sink for circuit RETURN cells belonging to an anonymous byte-
-    /// STREAM rather than a sealed introduce (onion-stream Phase 1c). Called with
-    /// `(origin_circuit_id, opened_bytes)`; returns `true` if it consumed a stream
-    /// cell. `None` (or `false`) → the cell falls through to the introduce path
-    /// UNCHANGED. The runtime owns the per-circuit channels, so tokio/mpsc stay
-    /// out of the dispatcher.
-    pub on_circuit_return: Option<Arc<dyn Fn(u32, Vec<u8>) -> bool + Send + Sync>>,
+    /// Per-origin-circuit sinks for anonymous byte-STREAM return cells (onion-
+    /// stream Phase 1c), keyed by `origin_circuit_id`. A return `CircuitData`
+    /// whose id is registered here is a STREAM cell → delivered to its channel;
+    /// any other id is a sealed introduce and takes the UNCHANGED path. The
+    /// runtime registers/removes channels via `open_data_circuit`. Mirrors
+    /// `pending_diag` (so tokio/mpsc here is already a dispatcher dep).
+    pub stream_recv: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
 }
 
 /// Constant-time pad applied to banned-peer drops in `dispatch()`.
@@ -1862,7 +1862,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         circuit_table: None,
         circuit_rendezvous: None,
         circuit_origin: None,
-        on_circuit_return: None,
+        stream_recv: Arc::new(Mutex::new(HashMap::new())),
         circuit_introduce_seen: Arc::new(Mutex::new(ExpiryCache::new(
             Duration::from_secs(300),
             4096,
@@ -2565,7 +2565,7 @@ mod tests {
             circuit_table: None,
             circuit_rendezvous: None,
             circuit_origin: None,
-            on_circuit_return: None,
+            stream_recv: Arc::new(Mutex::new(HashMap::new())),
             circuit_introduce_seen: Arc::new(Mutex::new(ExpiryCache::new(
                 Duration::from_secs(300),
                 4096,
