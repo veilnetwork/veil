@@ -40,6 +40,7 @@ node-embedded-rocksdb = ["node-embedded", "veil-node-runtime/rocksdb-cold"]
 
 [dependencies]
 veilclient = { path = "../../veilclient" }
+veil-onion-stream = { path = "../veil-onion-stream" }
 veil-identity = { path = "../veil-identity" }
 veil-types = { path = "../veil-types" }
 # Embedded node runtime — optional, NO default features (see `node-embedded`).
