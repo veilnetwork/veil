@@ -1246,6 +1246,14 @@ pub struct FrameDispatcher {
     /// bandwidth (duplicate DELIVERY is already blocked downstream by the
     /// receiver's introduce replay cache — this closes the amplification).
     pub circuit_introduce_seen: Arc<Mutex<ExpiryCache<[u8; 32]>>>,
+
+    /// Optional sink for circuit RETURN cells belonging to an anonymous byte-
+    /// STREAM rather than a sealed introduce (onion-stream Phase 1c). Called with
+    /// `(origin_circuit_id, opened_bytes)`; returns `true` if it consumed a stream
+    /// cell. `None` (or `false`) → the cell falls through to the introduce path
+    /// UNCHANGED. The runtime owns the per-circuit channels, so tokio/mpsc stay
+    /// out of the dispatcher.
+    pub on_circuit_return: Option<Arc<dyn Fn(u32, Vec<u8>) -> bool + Send + Sync>>,
 }
 
 /// Constant-time pad applied to banned-peer drops in `dispatch()`.
@@ -1854,6 +1862,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         circuit_table: None,
         circuit_rendezvous: None,
         circuit_origin: None,
+        on_circuit_return: None,
         circuit_introduce_seen: Arc::new(Mutex::new(ExpiryCache::new(
             Duration::from_secs(300),
             4096,
@@ -2556,6 +2565,7 @@ mod tests {
             circuit_table: None,
             circuit_rendezvous: None,
             circuit_origin: None,
+            on_circuit_return: None,
             circuit_introduce_seen: Arc::new(Mutex::new(ExpiryCache::new(
                 Duration::from_secs(300),
                 4096,

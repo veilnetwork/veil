@@ -912,7 +912,18 @@ impl FrameDispatcher {
             .and_then(|t| t.lookup(&link, cell.circuit_id))
         {
             return match origin.open_return(cell.seq, &cell.ciphertext) {
-                Ok(introduce_ct) => self.process_introduce_ciphertext(&introduce_ct, &link),
+                Ok(opened) => {
+                    // onion-stream Phase 1c: if a byte-STREAM owns this origin
+                    // circuit, hand it the opened cell and stop. Otherwise it is a
+                    // sealed introduce R forwarded down the circuit (path unchanged
+                    // — the sink is `None` for every non-stream circuit).
+                    if let Some(sink) = &self.on_circuit_return
+                        && sink(cell.circuit_id, opened.clone())
+                    {
+                        return DispatchResult::NoResponse;
+                    }
+                    self.process_introduce_ciphertext(&opened, &link)
+                }
                 Err(_) => DispatchResult::NoResponse, // a layer failed AEAD — drop
             };
         }
