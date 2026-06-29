@@ -2001,6 +2001,121 @@ mod tests {
         );
     }
 
+    /// R-SPLICE end-to-end (the core of the pinned-circuit stream): a FORWARD
+    /// CircuitData arriving at a terminus, framed `[target_cookie 16][bytes]`
+    /// whose cookie is circuit-registered, is forwarded down THAT receiver's
+    /// circuit as a RETURN cell carrying EXACTLY those bytes — no sign/verify, no
+    /// dedup. This is the splice the throughput path depends on (sender→R→receiver),
+    /// distinct from the signed-introduce flow. Keys are READ from the installed
+    /// circuits (not assumed) so the test is robust to key derivation.
+    #[tokio::test]
+    async fn circuit_forward_splices_to_registered_cookie_return() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use veil_anonymity::circuit_data::{Direction, apply_layer, read_payload, wrap_payload};
+        use veil_anonymity::circuit_register::{CircuitRegisterPayload, CircuitRendezvousRegistry};
+        use veil_anonymity::circuit_setup::{CircuitSetupHop, build_circuit_setup};
+        use veil_anonymity::circuit_table::CircuitTable;
+        use veil_anonymity::circuit_wire::CircuitDataPayload;
+        use veil_crypto::{generate_keypair, sign_message};
+        use veil_session::tx_registry::SessionTxRegistry;
+        use veil_types::SignatureAlgorithm;
+
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let sk = StaticSecret::random_from_rng(OsRng);
+        let pk = PublicKey::from(&sk).to_bytes();
+        d.anonymity_x25519_sk = Some(std::sync::Arc::new(sk));
+        d.circuit_table = Some(std::sync::Arc::new(CircuitTable::new()));
+        d.circuit_rendezvous = Some(std::sync::Arc::new(CircuitRendezvousRegistry::new()));
+
+        // Capture frames R emits toward the RECEIVER's hop (the spliced return).
+        let recv_hop = [0xEE; 32];
+        let send_hop = [0xDD; 32];
+        let mut reg_tx = SessionTxRegistry::new();
+        let mut recv_rx = reg_tx.register(NodeId::from(recv_hop));
+        let _send_rx = reg_tx.register(NodeId::from(send_hop)); // drain any sender-side ACK
+        d.session_tx_registry = Some(std::sync::Arc::new(std::sync::RwLock::new(reg_tx)));
+
+        // (1) RECEIVER's circuit at R: a terminus build whose payload registers a
+        //     cookie, arriving from recv_hop → binds cookie → this return circuit.
+        let cookie = [0x5A; 16];
+        let recv_cid = 77u32;
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let reg_pk: [u8; 32] = STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
+        let epoch = 1u64;
+        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
+        let sig =
+            sign_message(SignatureAlgorithm::Ed25519, &kp.public_key, &kp.private_key, &msg)
+                .unwrap();
+        let regp = CircuitRegisterPayload { cookie, reg_pk, epoch, signature: sig };
+        let rhop = CircuitSetupHop {
+            node_id: [0u8; 32],
+            pubkey: pk,
+            circuit_id_in: recv_cid,
+            circuit_id_out: 0,
+            circuit_key: [3u8; 32],
+        };
+        let renv = build_circuit_setup(&[rhop], &regp.encode()).unwrap();
+        let mut rhdr =
+            FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::CircuitBuild as u16);
+        rhdr.body_len = renv.len() as u32;
+        d.dispatch_relay_chain(&rhdr, &renv, NodeId::from(recv_hop));
+        assert!(
+            d.circuit_rendezvous.as_ref().unwrap().lookup(&cookie).is_some(),
+            "receiver cookie bound to its return circuit"
+        );
+        let _ = recv_rx.try_recv(); // drain the CircuitBuilt ACK toward recv_hop
+
+        // (2) SENDER's circuit at R: a plain terminus build arriving from send_hop.
+        let send_cid = 42u32;
+        let shop = CircuitSetupHop {
+            node_id: [0u8; 32],
+            pubkey: pk,
+            circuit_id_in: send_cid,
+            circuit_id_out: 0,
+            circuit_key: [7u8; 32],
+        };
+        let senv = build_circuit_setup(&[shop], b"no-reg").unwrap();
+        let mut shdr =
+            FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::CircuitBuild as u16);
+        shdr.body_len = senv.len() as u32;
+        d.dispatch_relay_chain(&shdr, &senv, NodeId::from(send_hop));
+
+        // Read the INSTALLED keys (build may derive, so don't assume the setup key).
+        let table = d.circuit_table.as_ref().unwrap();
+        let send_key = table.lookup_forward(&send_hop, send_cid).unwrap().circuit_key;
+        let recv_key = table.lookup_forward(&recv_hop, recv_cid).unwrap().circuit_key;
+
+        // (3) FORWARD CircuitData on the sender's circuit, framed `[cookie][bytes]`
+        //     and encrypted with the sender circuit's forward layer (R XORs back).
+        let post_cookie = b"[sender-node-32B..]+stream cell".to_vec();
+        let mut framed = Vec::with_capacity(16 + post_cookie.len());
+        framed.extend_from_slice(&cookie);
+        framed.extend_from_slice(&post_cookie);
+        let fseq = 1u32;
+        let mut fbuf = wrap_payload(&framed).unwrap();
+        apply_layer(&send_key, Direction::Forward, fseq, &mut fbuf);
+        let fwd = CircuitDataPayload { circuit_id: send_cid, seq: fseq, ciphertext: fbuf };
+        let fbody = fwd.encode().unwrap();
+        let mut fhdr =
+            FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::CircuitData as u16);
+        fhdr.body_len = fbody.len() as u32;
+        d.dispatch_relay_chain(&fhdr, &fbody, NodeId::from(send_hop));
+
+        // (4) R spliced a RETURN cell toward the receiver hop on recv_cid. Decode,
+        //     peel the receiver circuit's return layer, unwrap → exactly the bytes.
+        let (_prio, frame) = recv_rx
+            .try_recv()
+            .expect("splice must emit a return cell toward the receiver hop");
+        let ret = CircuitDataPayload::decode(&frame[veil_proto::header::HEADER_SIZE..])
+            .expect("decode spliced return CircuitData");
+        assert_eq!(ret.circuit_id, recv_cid, "return cell rides the receiver's circuit_id_in");
+        let mut rbuf = ret.ciphertext.clone();
+        apply_layer(&recv_key, Direction::Return, ret.seq, &mut rbuf);
+        let got = read_payload(&rbuf).expect("unwrap the spliced payload");
+        assert_eq!(got, post_cookie, "splice forwarded EXACTLY the post-cookie bytes");
+    }
+
     /// diff-audit Δ2-d: a `CircuitBuilt` ACK arriving from the first hop, tagged
     /// with our origin circuit id, marks that origin circuit CONFIRMED.
     #[test]
