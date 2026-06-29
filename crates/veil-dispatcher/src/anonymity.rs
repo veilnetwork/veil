@@ -817,6 +817,7 @@ impl FrameDispatcher {
     /// from `next_link`) gets ANOTHER layer and is passed toward the originator.
     fn handle_circuit_data(&self, body: &[u8], node_id: NodeId) -> DispatchResult {
         use veil_anonymity::circuit_data::{Direction, apply_layer, read_payload};
+        use veil_anonymity::circuit_register::COOKIE_LEN;
         use veil_anonymity::circuit_wire::CircuitDataPayload;
         let cell = match CircuitDataPayload::decode(body) {
             Ok(c) => c,
@@ -860,12 +861,34 @@ impl FrameDispatcher {
                         }
                     }
                     None => {
-                        // Terminus: the framed payload is the delivered message.
-                        let n = read_payload(&buf).map(|p| p.len()).unwrap_or(0);
-                        self.logger.info(
-                            "anonymity.circuit.terminus_data",
-                            format!("circuit terminus rx {n} B"),
-                        );
+                        // Terminus. onion-stream R-SPLICE: a framed payload of
+                        // `[target_cookie 16][stream bytes]` whose cookie is a
+                        // circuit-registered rendezvous cookie is forwarded down
+                        // THAT receiver's circuit as a RETURN cell — the bulk
+                        // bidirectional splice (like try_forward_introduce_via_circuit
+                        // but no signature/dedup; the byte-stream layer above gives
+                        // reliability + ordering). Anything else is a plain terminus
+                        // delivery (logged). Forward-terminus CircuitData carries no
+                        // other traffic today, so this overload is safe.
+                        let payload = read_payload(&buf);
+                        let mut spliced = false;
+                        if let Some(p) = &payload
+                            && p.len() >= COOKIE_LEN
+                            && let Some(reg) = &self.circuit_rendezvous
+                        {
+                            let mut cookie = [0u8; COOKIE_LEN];
+                            cookie.copy_from_slice(&p[..COOKIE_LEN]);
+                            if let Some(circuit) = reg.lookup(&cookie) {
+                                self.splice_stream_cell(&circuit, &p[COOKIE_LEN..]);
+                                spliced = true;
+                            }
+                        }
+                        if !spliced && let Some(p) = &payload {
+                            self.logger.info(
+                                "anonymity.circuit.terminus_data",
+                                format!("circuit terminus rx {} B", p.len()),
+                            );
+                        }
                     }
                 }
                 return DispatchResult::NoResponse;
@@ -1102,6 +1125,40 @@ impl FrameDispatcher {
             // Oversize (too many return hops for the cell cap) — drop; the cell
             // budget is a known b6 refinement. Cookie was known.
             Err(_) => CircuitIntroduceForward::KnownButDropped,
+        }
+    }
+
+    /// onion-stream R-SPLICE: forward `bytes` down an already-registered receiver
+    /// circuit as a RETURN cell — the bulk-data analogue of
+    /// `try_forward_introduce_via_circuit` (no signature, no dedup; the byte-stream
+    /// engine above provides reliability + ordering). The receiver opens it via
+    /// `OriginCircuit::open_return` → its `stream_recv` channel (Phase 1c).
+    fn splice_stream_cell(
+        &self,
+        circuit: &veil_anonymity::circuit_table::CircuitState,
+        bytes: &[u8],
+    ) {
+        use veil_anonymity::circuit_data::{Direction, apply_layer, wrap_payload};
+        use veil_anonymity::circuit_wire::CircuitDataPayload;
+        let mut buf = match wrap_payload(bytes) {
+            Ok(b) => b,
+            Err(_) => return, // larger than one cell — drop (stream MSS keeps small)
+        };
+        let Some(seq) = circuit.alloc_return_seq() else {
+            return; // return-seq exhausted — drop; the circuit idle-GCs + rebuilds
+        };
+        apply_layer(&circuit.circuit_key, Direction::Return, seq, &mut buf);
+        let cell = CircuitDataPayload {
+            circuit_id: circuit.circuit_id_in,
+            seq,
+            ciphertext: buf,
+        };
+        if let Ok(body) = cell.encode() {
+            self.send_relay_chain_msg(
+                &NodeId::from(circuit.prev_link),
+                RelayChainMsg::CircuitData,
+                &body,
+            );
         }
     }
 
