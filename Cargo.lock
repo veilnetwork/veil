@@ -4537,6 +4537,9 @@ dependencies = [
 [[package]]
 name = "veil-onion-stream"
 version = "0.1.0"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "veil-pending-ack"
