@@ -814,8 +814,22 @@ impl StreamEngine {
     fn pace_interval_ms(&self) -> u64 {
         let Some(srtt) = self.tx.srtt else { return 0 };
         let mss = self.cfg.mss as u64;
-        let cwnd = self.tx.cwnd.max(self.cfg.mss as u32) as u64;
-        (mss.saturating_mul(srtt as u64) / cwnd).max(1)
+        // Spread the EFFECTIVE window (min of cwnd and the peer's rwnd) across one
+        // RTT — never cwnd alone. When cwnd has run far past a smaller rwnd, pacing
+        // off cwnd would send much faster than the window can ever drain, rebuilding
+        // the very relay-queue backlog pacing exists to avoid.
+        let win = self.tx.cwnd.min(self.tx.rwnd).max(self.cfg.mss as u32) as u64;
+        let base = mss.saturating_mul(srtt as u64) / win;
+        // In slow start (incl. post-loss re-ramp), pace 2x faster so cwnd can
+        // still DOUBLE each RTT. At 1x, pacing releases ~one segment per interval
+        // → cwnd grows only linearly (1 MSS/RTT) → recovery from a collapse is
+        // glacial on a multi-second onion RTT (the "stuck at 44 %" crawl). 2x is
+        // the standard slow-start pacing gain.
+        if self.tx.cwnd < self.tx.ssthresh {
+            (base / 2).max(1)
+        } else {
+            base.max(1)
+        }
     }
 
     /// Is there new data/FIN we could send right now (window allows), with only

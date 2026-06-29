@@ -95,14 +95,16 @@ impl AnonStreamHub {
             max_rto_ms: 60_000,
             handshake_rto_ms: 6_000,
             max_retransmits: 15,
-            // Window sized to ~bandwidth·RTT (~768 KB fills ~200 KB/s at a few-s
-            // base RTT) but NO larger: with sender pacing keeping the relay queue
-            // empty, a tight window bounds both bufferbloat latency AND the
-            // loss-recovery scope if a gentle overshoot ever does drop cells.
-            // (A 3 MB window let slow-start overshoot to ~1.5 MB in flight, burst
-            // the relay queue, and lose ~3000 cells at once → a glacial 1-cell-
-            // per-RTT recovery stall at ~6 %. Pacing + this cap removes that.)
-            recv_window: 2048 * mss,
+            // Window kept BELOW the path's standing-queue-drop threshold so a
+            // single circuit stays in the loss-free regime end-to-end. On-device
+            // the first ~1.5 MB streamed with zero loss (oo=0) until inflight
+            // filled a 768 KB window (~553 KB+) and built a standing queue at the
+            // relay → periodic drop → cwnd RTO-collapse → glacial 1-seg/RTT crawl
+            // on the multi-second RTT. ~384 KB stays under that onset; combined
+            // with pacing the relay queue never backs up, so there is nothing to
+            // drop and cwnd never collapses. (Per-circuit throughput is then ~the
+            // path rate; aggregate speed comes from running circuits in parallel.)
+            recv_window: 1024 * mss,
             init_cwnd: 32 * mss,
             ..Config::default()
         };
