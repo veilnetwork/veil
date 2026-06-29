@@ -6,10 +6,13 @@ description = "Reliable, congestion-controlled byte-stream over an anonymous oni
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+# Async driver only (the protocol core in engine.rs is sans-IO / dependency-free).
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 
 [dev-dependencies]
-# Deterministic PRNG for the loss/reorder/dup simulation harness (no external dep:
-# a tiny SplitMix64 lives in tests). Nothing required here yet.
+# `test-util` enables paused/auto-advancing virtual time so async tests run the
+# RTO/retransmit timeline instantly + deterministically.
+tokio = { version = "1", features = ["test-util", "rt", "macros", "time", "sync"] }
 
 [lints]
 workspace = true
