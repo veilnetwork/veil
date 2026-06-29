@@ -1018,6 +1018,9 @@ impl NodeRuntime {
             circuit_table: self.dispatcher.circuit_table.clone(),
             circuit_rendezvous: self.dispatcher.circuit_rendezvous.clone(),
             circuit_origin: self.dispatcher.circuit_origin.clone(),
+            // onion-stream Phase 1c: share the live stream return-cell sinks across
+            // the reload so in-flight streams survive a config reload.
+            stream_recv: self.dispatcher.stream_recv.clone(),
         }
     }
 

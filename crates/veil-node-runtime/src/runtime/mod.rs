@@ -2031,6 +2031,11 @@ impl NodeRuntime {
             circuit_origin: anonymity_x25519_sk_for_dispatcher
                 .is_some()
                 .then(|| Arc::new(veil_anonymity::circuit_origin::OriginCircuitTable::new())),
+            // onion-stream Phase 1c: per-origin-circuit sinks for byte-stream
+            // return cells (empty until `open_data_circuit` registers one).
+            stream_recv: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         });
         // cleanup: pre-build the hot-standby controller and
         // its prerequisite Arcs (handoff_ack_waiters, swap_registry)
@@ -6470,7 +6475,10 @@ impl NodeServices {
         &self,
         relay_path: &[[u8; 32]],
         terminus_payload: &[u8],
-    ) -> std::result::Result<DataCircuit, veil_types::AnonOnionSendError> {
+    ) -> std::result::Result<
+        (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
+        veil_types::AnonOnionSendError,
+    > {
         use veil_anonymity::circuit_origin::{OriginHop, build_origin_circuit};
         use veil_anonymity::directory::{decode_entry, relay_directory_dht_key};
         use veil_types::AnonOnionSendError;
@@ -6509,15 +6517,33 @@ impl NodeServices {
             next_seq: std::sync::atomic::AtomicU32::new(0),
             confirmed: std::sync::Arc::clone(&origin.confirmed),
         };
+        // Register the stream return-cell sink keyed by origin_circuit_id BEFORE
+        // sending the build, so no early return cell is dropped once it comes up.
+        // The dispatcher's CircuitData origin branch routes matching ids here.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        if let Ok(mut map) = self.dispatcher.stream_recv.lock() {
+            map.insert(circ.origin_circuit_id, tx);
+        }
         if !origin_table.insert(std::sync::Arc::new(origin)) {
-            return Err(AnonOnionSendError::NoRelays); // origin table full
+            if let Ok(mut map) = self.dispatcher.stream_recv.lock() {
+                map.remove(&circ.origin_circuit_id); // roll back on table-full
+            }
+            return Err(AnonOnionSendError::NoRelays);
         }
         self.send_relay_chain_frame(
             &circ.first_hop,
             veil_proto::family::RelayChainMsg::CircuitBuild,
             &setup,
         );
-        Ok(circ)
+        Ok((circ, rx))
+    }
+
+    /// Remove a pinned circuit's stream return-cell sink (call on stream close).
+    /// The `OriginCircuitTable` reaps the circuit itself by idle TTL.
+    pub fn close_data_circuit(&self, origin_circuit_id: u32) {
+        if let Ok(mut map) = self.dispatcher.stream_recv.lock() {
+            map.remove(&origin_circuit_id);
+        }
     }
 
     /// Send one FORWARD data cell over a pinned [`DataCircuit`]: `wrap_payload`
