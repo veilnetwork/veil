@@ -799,6 +799,10 @@ impl NodeRuntime {
         // single lifecycle list shared with cold start — see
         // `NodeRuntime::spawn_service`.
         self.spawn_all_services(&config).await?;
+        // onion-stream Phase 1d: re-publish the LIVE (post-reload) services for
+        // the embedded FFI — a deferred-init node reloads from an empty stub to
+        // the real config, and this overwrites the stub's empty-DHT services.
+        crate::runtime::services::publish_embedded_services(self.access());
         Ok(())
     }
 

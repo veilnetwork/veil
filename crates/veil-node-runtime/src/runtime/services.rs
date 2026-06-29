@@ -32,17 +32,24 @@ use veil_util::lock;
 /// feeds), and `veilclient-ffi` grabs it to drive stateful stream circuits
 /// directly, bypassing IPC. Embedded-only (one in-process node per process); set
 /// once at start (first wins).
-static EMBEDDED_SERVICES: std::sync::OnceLock<NodeServices> = std::sync::OnceLock::new();
+static EMBEDDED_SERVICES: std::sync::Mutex<Option<NodeServices>> = std::sync::Mutex::new(None);
 
-/// Publish the in-process node's services for the embedded FFI (idempotent).
+/// Publish the in-process node's services for the embedded FFI. OVERWRITES — a
+/// deferred-init node first starts under an empty STUB config (empty DHT) and
+/// then applies the real config via reload; both paths re-publish, so the LIVE
+/// (post-reload) services win. Without this the FFI captured the stub's empty DHT
+/// → circuit relay selection found nothing → datagram fallback.
 pub fn publish_embedded_services(services: NodeServices) {
-    let _ = EMBEDDED_SERVICES.set(services);
+    if let Ok(mut g) = EMBEDDED_SERVICES.lock() {
+        *g = Some(services);
+    }
 }
 
-/// The in-process node's services, if an embedded node has started — the embedded
-/// FFI's direct handle to `open_stream_circuit` / `send_circuit_cell`.
-pub fn embedded_services() -> Option<&'static NodeServices> {
-    EMBEDDED_SERVICES.get()
+/// A clone of the in-process node's CURRENT services, if an embedded node is up —
+/// the embedded FFI's handle to `open_stream_circuit_auto` / `send_circuit_cell`.
+/// `NodeServices` is all-Arc-clones, so the clone shares the live node state.
+pub fn embedded_services() -> Option<NodeServices> {
+    EMBEDDED_SERVICES.lock().ok().and_then(|g| g.clone())
 }
 
 #[allow(unused_imports)]
