@@ -35,6 +35,9 @@ pub mod types;
 
 pub use error::{NodeError, Result};
 pub use runtime::NodeRuntime;
+// onion-stream Phase 1d: embedded-node bridge so veilclient-ffi can drive pinned
+// stream circuits in-process (the IPC surface has no circuit path).
+pub use runtime::services::{embedded_services, publish_embedded_services};
 pub use state::NodeState;
 pub use types::{
     LinkId, ListenConfigEntry, ListenId, ListenerHandle, NodeId, NodeIdBytes, NodeSummary,
