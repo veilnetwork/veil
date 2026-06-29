@@ -238,34 +238,48 @@ fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Optio
     tokio::spawn(async move {
         let reg_kp = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
         let epoch = AtomicU64::new(0);
-        match services_bg
-            .open_stream_circuit_auto(cookie, &reg_kp, &epoch)
-            .await
-        {
-            Ok((circ, mut recv_rx)) => {
-                // Inbound feed: each return cell is `[sender_node 32][stream cell]`.
-                tokio::spawn(async move {
-                    while let Some(framed) = recv_rx.recv().await {
-                        if framed.len() < 32 {
-                            continue;
-                        }
-                        let mut node = [0u8; 32];
-                        node.copy_from_slice(&framed[..32]);
-                        let app =
-                            veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
-                        let cell = framed[32..].to_vec();
-                        if in_tx.send((Addr { node, app }, cell)).await.is_err() {
-                            break;
-                        }
+        // The proactive open fires at hub creation — which, on the RECEIVER, is the
+        // accept loop starting right after node-arm, BEFORE any relay session is up
+        // (observed on-device: connected=0 routing=3 -> NoRelays). warm only works
+        // over connected relays, so RETRY with backoff until sessions establish and
+        // a terminus R resolves. Cheap while connected=0 (the empty warm returns at
+        // once); the loop ends on first success and the task dies with the runtime
+        // on app exit, so an indefinite wait through a long pre-unlock idle is fine.
+        let mut backoff_ms = 1_500u64;
+        let mut attempt = 0u32;
+        let (circ, mut recv_rx) = loop {
+            attempt += 1;
+            match services_bg
+                .open_stream_circuit_auto(cookie, &reg_kp, &epoch)
+                .await
+            {
+                Ok(pair) => break pair,
+                Err(e) => {
+                    if attempt == 1 || attempt % 15 == 0 {
+                        diag(&format!("onion-stream: circuit open retry #{attempt}: {e:?}"));
                     }
-                });
-                *circuit_slot.lock().await = Some(circ);
-                diag("onion-stream: PINNED CIRCUIT opened");
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = backoff_ms.saturating_mul(2).min(8_000);
+                }
             }
-            Err(e) => {
-                diag(&format!("onion-stream: circuit open FAILED: {e:?}"));
+        };
+        // Inbound feed: each return cell is `[sender_node 32][stream cell]`.
+        tokio::spawn(async move {
+            while let Some(framed) = recv_rx.recv().await {
+                if framed.len() < 32 {
+                    continue;
+                }
+                let mut node = [0u8; 32];
+                node.copy_from_slice(&framed[..32]);
+                let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
+                let cell = framed[32..].to_vec();
+                if in_tx.send((Addr { node, app }, cell)).await.is_err() {
+                    break;
+                }
             }
-        }
+        });
+        *circuit_slot.lock().await = Some(circ);
+        diag(&format!("onion-stream: PINNED CIRCUIT opened (after {attempt} tries)"));
     });
     Some(CircuitCells { services, me, circuit })
 }

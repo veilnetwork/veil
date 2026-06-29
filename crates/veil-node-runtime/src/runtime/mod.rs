@@ -6646,19 +6646,31 @@ impl NodeServices {
         };
         candidates.sort_unstable();
         candidates.dedup();
+        // `candidates` is already sorted+deduped, so the filter preserves
+        // ascending-node_id order: `resolvable.first()` is the lowest-node_id
+        // relay we have a session to AND whose relay-dir is cached. Non-relay
+        // peers (other clients) have no relay-dir entry, so they're excluded
+        // automatically — only the seed-relays survive. Both ends therefore
+        // converge on the SAME R once both have warmed the same relay set; the
+        // residual risk is a ramp-up skew (picking before the globally-lowest
+        // seed is warmed), which the R= log below makes observable on-device.
         let resolvable: Vec<[u8; 32]> = candidates
             .iter()
             .copied()
             .filter(|nid| self.dht.get_local(&relay_directory_dht_key(nid)).is_some())
             .collect();
+        let chosen = resolvable.first().copied();
         // log::warn so it reaches Android logcat (the node's tracing logger doesn't).
         log::warn!(
-            "onion-stream.relay-pick warmed={warmed} connected={} relay-dir-resolvable={} routing={}",
+            "onion-stream.relay-pick warmed={warmed} connected={} resolvable={} routing={} R={}",
             candidates.len(),
             resolvable.len(),
-            self.dht.routing_table_contacts().len()
+            self.dht.routing_table_contacts().len(),
+            chosen
+                .map(|r| format!("{:02x}{:02x}{:02x}{:02x}", r[0], r[1], r[2], r[3]))
+                .unwrap_or_else(|| "none".to_owned()),
         );
-        let r = *resolvable.first().ok_or(AnonOnionSendError::NoRelays)?;
+        let r = chosen.ok_or(AnonOnionSendError::NoRelays)?;
         self.open_stream_circuit(&[r], cookie, reg_kp, last_epoch)
     }
 
