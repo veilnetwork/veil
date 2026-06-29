@@ -34,7 +34,7 @@ mod resumption_state;
 mod routing_health;
 mod routing_state;
 mod service_tasks;
-mod services;
+pub mod services;
 mod session_defaults;
 mod session_guard;
 mod sovereign_republish;
@@ -2453,6 +2453,9 @@ impl NodeRuntime {
         // cannot drift out of sync. The dispatch table lives in
         // `spawn_service`.
         runtime.spawn_all_services(&config).await?;
+        // onion-stream Phase 1d: publish a services view for the embedded FFI to
+        // drive pinned stream circuits in-process (the IPC surface has none).
+        crate::runtime::services::publish_embedded_services(runtime.access());
         Ok(runtime)
     }
 
