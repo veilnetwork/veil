@@ -655,33 +655,31 @@ impl StreamEngine {
         encode(frame, out);
     }
 
-    /// Mark which unacked segments to retransmit (SACK-aware). If the receiver
-    /// has SACKed anything, retransmit every UN-SACKed segment below the highest
-    /// SACK (the holes) — multi-loss recovers in one RTT instead of one hole per
-    /// RTT. With no SACK info, the oldest unacked segment is the presumed loss.
+    /// Mark which unacked segments to retransmit (SACK-aware, RFC 6675 `IsLost`).
+    /// A segment is treated as lost ONLY if at least `DUP_THRESH` higher-seq
+    /// segments have been SACKed — otherwise it's most likely still in flight, so
+    /// retransmitting it (as a naive "every hole below the highest SACK" would)
+    /// floods the high-BDP onion path with thousands of premature duplicates.
     fn mark_holes(&mut self) {
-        let mut hi: Option<u32> = None;
-        for s in &self.tx.segs {
+        const DUP_THRESH: usize = 3;
+        // Segments are in ascending seq order; walking from the back, count the
+        // SACKed segments seen so far (those with a higher seq than the current).
+        let mut sacked_above = 0usize;
+        let mut any = false;
+        for s in self.tx.segs.iter_mut().rev() {
             if s.sacked {
-                hi = Some(match hi {
-                    Some(h) if seq::geq(h, s.end()) => h,
-                    _ => s.end(),
-                });
+                sacked_above += 1;
+            } else if sacked_above >= DUP_THRESH {
+                s.needs_resend = true;
+                any = true;
             }
         }
-        match hi {
-            Some(hi) => {
-                for s in self.tx.segs.iter_mut() {
-                    if !s.sacked && seq::lt(s.seq, hi) {
-                        s.needs_resend = true;
-                    }
-                }
-            }
-            None => {
-                if let Some(f) = self.tx.segs.front_mut() {
-                    f.needs_resend = true;
-                }
-            }
+        // Fallback (classic fast-retransmit): nothing meets the SACK loss bar yet
+        // → retransmit just the oldest unacked segment.
+        if !any
+            && let Some(f) = self.tx.segs.front_mut()
+        {
+            f.needs_resend = true;
         }
     }
 
