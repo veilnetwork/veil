@@ -8,8 +8,14 @@
 //! `SYN`), and hands each stream a [`CellDuplex`] that sends via the shared
 //! [`CellSender`] and receives from its own channel.
 //!
+//! Addressing: a cell is sent to an [`Addr`] = `(peer node id, peer stream-
+//! endpoint app id)`. The opener supplies the peer's app id (derived from the
+//! peer node + the well-known stream endpoint name); the accept side reuses the
+//! SYN's authenticated sender address for its return path — no app-id derivation
+//! lives in this crate.
+//!
 //! The crate stays transport-agnostic: [`CellSender`] is the only seam veilclient
-//! implements (over `AppSender`), and inbound `(peer, cell)` pairs are fed in
+//! implements (over `AppSender`), and inbound `(Addr, cell)` pairs are fed in
 //! through a channel (drained from the `AppReceiver`). Everything here is unit-
 //! tested against an in-memory bus.
 
@@ -25,14 +31,22 @@ use crate::driver::{CellDuplex, OnionStream};
 use crate::engine::Config;
 use crate::wire::Frame;
 
-/// 32-byte node id of a peer.
+/// 32-byte node id.
 pub type Peer = [u8; 32];
+
+/// A peer's stream endpoint: its node id + the app id its onion-stream endpoint
+/// is bound under (anonymous sends are addressed to `(node, app, endpoint)`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Addr {
+    pub node: Peer,
+    pub app: [u8; 32],
+}
 
 /// Sends one cell toward a peer over the anonymous transport (best-effort: a
 /// drop downstream is fine, the stream's ARQ repairs it). The receive side is
 /// fed to the [`StreamMux`] separately (it owns inbound demux).
 pub trait CellSender: Send + Sync + 'static {
-    fn send(&self, dst: Peer, cell: Vec<u8>) -> impl Future<Output = io::Result<()>> + Send;
+    fn send(&self, dst: Addr, cell: Vec<u8>) -> impl Future<Output = io::Result<()>> + Send;
 }
 
 /// Per-stream inbound queue depth (cells). Bounded: a slow stream drops excess
@@ -48,7 +62,7 @@ type Routes = Arc<Mutex<HashMap<StreamKey, mpsc::Sender<Vec<u8>>>>>;
 /// sender, receives from its demux channel. Deregisters its route on drop.
 struct MuxDuplex<S: CellSender> {
     sender: Arc<S>,
-    peer: Peer,
+    peer: Addr,
     key: StreamKey,
     routes: Routes,
     inbound_rx: mpsc::Receiver<Vec<u8>>,
@@ -81,28 +95,22 @@ pub struct StreamMux<S: CellSender> {
     cfg: Config,
     routes: Routes,
     next_id: Arc<AtomicU32>,
-    accept_rx: mpsc::Receiver<(OnionStream, Peer)>,
+    accept_rx: mpsc::Receiver<(OnionStream, Addr)>,
 }
 
 impl<S: CellSender> StreamMux<S> {
     /// `me` = this node's id (used to split the stream-id space so the two
-    /// directions never collide). `inbound` carries `(src_peer, cell)` drained
+    /// directions never collide). `inbound` carries `(src_addr, cell)` drained
     /// from the anonymous receive path. Spawns the demux task.
     pub fn new(
         me: Peer,
         sender: Arc<S>,
-        inbound: mpsc::Receiver<(Peer, Vec<u8>)>,
+        inbound: mpsc::Receiver<(Addr, Vec<u8>)>,
         cfg: Config,
     ) -> Self {
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_BACKLOG);
-        tokio::spawn(demux(
-            sender.clone(),
-            inbound,
-            routes.clone(),
-            accept_tx,
-            cfg,
-        ));
+        tokio::spawn(demux(sender.clone(), inbound, routes.clone(), accept_tx, cfg));
         StreamMux {
             me,
             sender,
@@ -115,14 +123,14 @@ impl<S: CellSender> StreamMux<S> {
 
     /// Open a new stream to `peer`. The returned [`OnionStream`] is live
     /// immediately (its SYN goes out on first poll).
-    pub fn open(&self, peer: Peer) -> OnionStream {
+    pub fn open(&self, peer: Addr) -> OnionStream {
         // Split the id space by node order so this node's opened ids never
         // collide with the peer's opened ids on either side.
-        let parity = if self.me < peer { 0 } else { 1 };
+        let parity = if self.me < peer.node { 0 } else { 1 };
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
         let sid = (n << 1) | parity;
         let (tx, rx) = mpsc::channel(STREAM_INBOX);
-        let key = (peer, sid);
+        let key = (peer.node, sid);
         self.routes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -139,7 +147,7 @@ impl<S: CellSender> StreamMux<S> {
 
     /// Accept the next inbound stream a peer opened to us, or `None` if the
     /// transport closed.
-    pub async fn accept(&mut self) -> Option<(OnionStream, Peer)> {
+    pub async fn accept(&mut self) -> Option<(OnionStream, Addr)> {
         self.accept_rx.recv().await
     }
 }
@@ -153,16 +161,16 @@ fn initial_seq(sid: u32) -> u32 {
 
 async fn demux<S: CellSender>(
     sender: Arc<S>,
-    mut inbound: mpsc::Receiver<(Peer, Vec<u8>)>,
+    mut inbound: mpsc::Receiver<(Addr, Vec<u8>)>,
     routes: Routes,
-    accept_tx: mpsc::Sender<(OnionStream, Peer)>,
+    accept_tx: mpsc::Sender<(OnionStream, Addr)>,
     cfg: Config,
 ) {
     while let Some((src, cell)) = inbound.recv().await {
         let Some(frame) = Frame::decode(&cell) else {
             continue; // junk
         };
-        let key = (src, frame.stream_id());
+        let key = (src.node, frame.stream_id());
         // Existing stream?
         {
             let routes_g = routes.lock().unwrap_or_else(|p| p.into_inner());
@@ -200,29 +208,26 @@ mod tests {
     use super::*;
 
     /// In-memory bus: each node's inbound-cell sink, keyed by node id.
-    type Bus = Arc<Mutex<HashMap<Peer, mpsc::Sender<(Peer, Vec<u8>)>>>>;
+    type Bus = Arc<Mutex<HashMap<Peer, mpsc::Sender<(Addr, Vec<u8>)>>>>;
+    type Inbound = mpsc::Receiver<(Addr, Vec<u8>)>;
 
-    fn node(b: u8) -> Peer {
-        [b; 32]
+    fn addr(b: u8) -> Addr {
+        Addr { node: [b; 32], app: [b ^ 0xA5; 32] }
     }
 
-    /// In-memory bus: routes (dst, cell) from `me` to dst's inbound channel as
-    /// `(me, cell)`, dropping a `loss` fraction.
+    /// Routes (dst, cell) from `me` to dst's inbound channel as `(me, cell)`,
+    /// dropping a `loss`/1000 fraction (deterministic, counter-driven).
     struct BusSender {
-        me: Peer,
+        me: Addr,
         bus: Bus,
-        loss: u32, // out of 1000
+        loss: u32,
         ctr: AtomicU32,
     }
     impl CellSender for BusSender {
-        async fn send(&self, dst: Peer, cell: Vec<u8>) -> io::Result<()> {
+        async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
             let n = self.ctr.fetch_add(1, Ordering::Relaxed);
-            // Deterministic pseudo-loss from a counter (no real RNG in tests).
             if (n.wrapping_mul(2_654_435_761) % 1000) >= self.loss {
-                let tx = {
-                    let g = self.bus.lock().unwrap();
-                    g.get(&dst).cloned()
-                };
+                let tx = self.bus.lock().unwrap().get(&dst.node).cloned();
                 if let Some(tx) = tx {
                     let _ = tx.try_send((self.me, cell));
                 }
@@ -254,20 +259,24 @@ mod tests {
             .collect()
     }
 
-    async fn run(loss: u32, n: usize) {
-        let a = node(1);
-        let b = node(2);
+    fn wire_bus(a: Addr, b: Addr, loss: u32) -> (Bus, Inbound, Inbound) {
         let bus: Bus = Arc::new(Mutex::new(HashMap::new()));
-        let (a_in_tx, a_in_rx) = mpsc::channel(8192);
-        let (b_in_tx, b_in_rx) = mpsc::channel(8192);
-        bus.lock().unwrap().insert(a, a_in_tx);
-        bus.lock().unwrap().insert(b, b_in_tx);
+        let (a_tx, a_rx) = mpsc::channel(8192);
+        let (b_tx, b_rx) = mpsc::channel(8192);
+        bus.lock().unwrap().insert(a.node, a_tx);
+        bus.lock().unwrap().insert(b.node, b_tx);
+        let _ = loss;
+        (bus, a_rx, b_rx)
+    }
 
+    async fn run(loss: u32, n: usize) {
+        let (a, b) = (addr(1), addr(2));
+        let (bus, a_rx, b_rx) = wire_bus(a, b, loss);
         let sa = Arc::new(BusSender { me: a, bus: bus.clone(), loss, ctr: AtomicU32::new(0) });
         let sb = Arc::new(BusSender { me: b, bus: bus.clone(), loss, ctr: AtomicU32::new(7) });
         let cfg = Config::default();
-        let mux_a = StreamMux::new(a, sa, a_in_rx, cfg);
-        let mut mux_b = StreamMux::new(b, sb, b_in_rx, cfg);
+        let mux_a = StreamMux::new(a.node, sa, a_rx, cfg);
+        let mut mux_b = StreamMux::new(b.node, sb, b_rx, cfg);
 
         let data = payload(n, 0x1234);
         let send_data = data.clone();
@@ -297,19 +306,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn mux_two_streams_dont_cross() {
-        // A opens two streams to B; each must accept independently + intact.
-        let a = node(1);
-        let b = node(2);
-        let bus: Bus = Arc::new(Mutex::new(HashMap::new()));
-        let (a_in_tx, a_in_rx) = mpsc::channel(8192);
-        let (b_in_tx, b_in_rx) = mpsc::channel(8192);
-        bus.lock().unwrap().insert(a, a_in_tx);
-        bus.lock().unwrap().insert(b, b_in_tx);
+        let (a, b) = (addr(1), addr(2));
+        let (bus, a_rx, b_rx) = wire_bus(a, b, 0);
         let sa = Arc::new(BusSender { me: a, bus: bus.clone(), loss: 0, ctr: AtomicU32::new(0) });
         let sb = Arc::new(BusSender { me: b, bus: bus.clone(), loss: 0, ctr: AtomicU32::new(9) });
         let cfg = Config::default();
-        let mux_a = StreamMux::new(a, sa, a_in_rx, cfg);
-        let mut mux_b = StreamMux::new(b, sb, b_in_rx, cfg);
+        let mux_a = StreamMux::new(a.node, sa, a_rx, cfg);
+        let mut mux_b = StreamMux::new(b.node, sb, b_rx, cfg);
 
         let d1 = payload(20_000, 1);
         let d2 = payload(20_000, 2);
@@ -326,14 +329,12 @@ mod tests {
             s2.finish().await.unwrap();
             s2
         });
-        // Accept both; match by length-prefix-free content compare.
         let (mut r1, _) = mux_b.accept().await.unwrap();
         let (mut r2, _) = mux_b.accept().await.unwrap();
         let g1 = read_all(&mut r1, 20_000).await;
         let g2 = read_all(&mut r2, 20_000).await;
         let _ = t1.await.unwrap();
         let _ = t2.await.unwrap();
-        // Order of acceptance isn't guaranteed; match either assignment.
         let ok = (g1 == d1 && g2 == d2) || (g1 == d2 && g2 == d1);
         assert!(ok, "two muxed streams crossed or corrupted");
     }
