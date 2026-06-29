@@ -26,6 +26,22 @@ use veil_anonymity::circuit_register::COOKIE_LEN;
 use veil_onion_stream::{Addr, CellSender, Config, OnionStream, StreamMux};
 use veilclient::{AppSender, IncomingMessage};
 
+/// Emit a one-line diagnostic that NEVER panics. `eprintln!` PANICS if the
+/// underlying stderr write fails — and under `flutter run` the desktop app's
+/// stderr is a pipe that can break, so an `eprintln!` mid-stream panicked and,
+/// unwinding across the `extern "C"` FFI boundary, aborted the whole process
+/// (the observed silent desktop crash). Write directly and swallow any error;
+/// mirror to logcat on Android (the node's tracing logger doesn't reach it).
+fn diag(msg: &str) {
+    #[cfg(target_os = "android")]
+    log::warn!("{msg}");
+    #[cfg(not(target_os = "android"))]
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{msg}");
+    }
+}
+
 /// Well-known endpoint the onion-stream cells ride (distinct from the chat
 /// inbox). Both peers bind it; a peer's app id is `deriveAppId(peer_node,
 /// STREAM_NAMESPACE, STREAM_NAME)` — the caller supplies it (mirrors how the
@@ -173,9 +189,7 @@ impl AnonStreamHub {
             HubCells::Circuit(_) => "onion-stream: circuit mode — opening R in background",
             HubCells::Anon(_) => "onion-stream: datagram path (no embedded node)",
         };
-        eprintln!("{backend}");
-        #[cfg(target_os = "android")]
-        log::warn!("{}", backend);
+        diag(backend);
 
         // The onion RTT is SECONDS and highly variable; floor the RTO so it only
         // fires on REAL loss, pace the sender, and cap the window below the path's
@@ -246,14 +260,10 @@ fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Optio
                     }
                 });
                 *circuit_slot.lock().await = Some(circ);
-                eprintln!("onion-stream: PINNED CIRCUIT opened");
-                #[cfg(target_os = "android")]
-                log::warn!("onion-stream: PINNED CIRCUIT opened");
+                diag("onion-stream: PINNED CIRCUIT opened");
             }
             Err(e) => {
-                eprintln!("onion-stream: circuit open FAILED: {e:?}");
-                #[cfg(target_os = "android")]
-                log::warn!("onion-stream: circuit open FAILED: {:?}", e);
+                diag(&format!("onion-stream: circuit open FAILED: {e:?}"));
             }
         }
     });
