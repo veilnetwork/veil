@@ -6622,41 +6622,44 @@ impl NodeServices {
         // locally — the rendezvous relays we actually have a session to, NOT the
         // DHT routing table (which rarely holds them). Deterministic (smallest
         // node_id) so both ends agree on R with no handshake.
-        const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        // R candidates = our DHT routing-table contacts (the connected relays /
-        // seeds), deterministic by node_id so both ends agree on the same R.
-        let mut candidates: Vec<[u8; 32]> = self
-            .dht
-            .routing_table_contacts()
-            .into_iter()
-            .map(|c| c.node_id)
-            .collect();
+        // FETCH + cache the CONNECTED relays' relay-directory entries (their
+        // anonymity x25519, needed to onion-wrap to R) — the proven cold-start warm
+        // the datagram path runs; the pinned-seed setup never caches them
+        // organically (the documented DHT-completeness wall).
+        let outbox: Arc<dyn veil_dht::FrameRouter> =
+            Arc::clone(&self.session_outbox) as Arc<dyn veil_dht::FrameRouter>;
+        let warmed = service_tasks::warm_connected_relay_directory(
+            &self.live_sessions,
+            &self.dht,
+            &outbox,
+            &self.logger,
+        )
+        .await;
+        // R candidates = connected (active-session) relays whose relay-dir is now
+        // cached — deterministic by node_id so both ends agree on the same R.
+        let mut candidates: Vec<[u8; 32]> = {
+            let g = lock!(self.live_sessions);
+            g.values()
+                .filter(|i| i.state == crate::types::SessionState::Active)
+                .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
+                .collect()
+        };
         candidates.sort_unstable();
-        // Pick the FIRST candidate whose relay-directory entry (R's anonymity
-        // x25519, needed to onion-wrap to R) we can obtain — FETCHING it into the
-        // local cache if absent. The pinned-seed setup never caches it organically
-        // (the documented DHT-completeness wall); this mirrors the pre-resolve in
-        // send_anonymous_authenticated_to.
-        for r in &candidates {
-            let key = relay_directory_dht_key(r);
-            if self.dht.get_local(&key).is_none()
-                && let Some(bytes) = self.dht_recursive_get(key, RESOLVE_TIMEOUT).await
-            {
-                self.dht.store_local(key, bytes);
-            }
-            if self.dht.get_local(&key).is_some() {
-                self.logger.info(
-                    "onion-stream.relay-pick",
-                    format!("R resolved, candidates={}", candidates.len()),
-                );
-                return self.open_stream_circuit(&[*r], cookie, reg_kp, last_epoch);
-            }
-        }
-        self.logger.info(
-            "onion-stream.relay-pick",
-            format!("no resolvable R among candidates={}", candidates.len()),
+        candidates.dedup();
+        let resolvable: Vec<[u8; 32]> = candidates
+            .iter()
+            .copied()
+            .filter(|nid| self.dht.get_local(&relay_directory_dht_key(nid)).is_some())
+            .collect();
+        // log::warn so it reaches Android logcat (the node's tracing logger doesn't).
+        log::warn!(
+            "onion-stream.relay-pick warmed={warmed} connected={} relay-dir-resolvable={} routing={}",
+            candidates.len(),
+            resolvable.len(),
+            self.dht.routing_table_contacts().len()
         );
-        Err(AnonOnionSendError::NoRelays)
+        let r = *resolvable.first().ok_or(AnonOnionSendError::NoRelays)?;
+        self.open_stream_circuit(&[r], cookie, reg_kp, last_epoch)
     }
 
     /// Send one FORWARD data cell over a pinned [`DataCircuit`]: `wrap_payload`
