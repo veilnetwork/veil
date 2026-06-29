@@ -25,6 +25,26 @@ use std::{
 };
 use veil_util::lock;
 
+/// Embedded-node bridge (onion-stream Phase 1d): the FFI runs the node IN-PROCESS
+/// but `veilclient` talks to it over IPC, which has no pinned-circuit surface. So
+/// the runtime publishes a [`NodeServices`] VIEW here at startup (Arc clones of
+/// the LIVE node state — incl. the dispatcher whose `stream_recv` the R-splice
+/// feeds), and `veilclient-ffi` grabs it to drive stateful stream circuits
+/// directly, bypassing IPC. Embedded-only (one in-process node per process); set
+/// once at start (first wins).
+static EMBEDDED_SERVICES: std::sync::OnceLock<NodeServices> = std::sync::OnceLock::new();
+
+/// Publish the in-process node's services for the embedded FFI (idempotent).
+pub fn publish_embedded_services(services: NodeServices) {
+    let _ = EMBEDDED_SERVICES.set(services);
+}
+
+/// The in-process node's services, if an embedded node has started — the embedded
+/// FFI's direct handle to `open_stream_circuit` / `send_circuit_cell`.
+pub fn embedded_services() -> Option<&'static NodeServices> {
+    EMBEDDED_SERVICES.get()
+}
+
 #[allow(unused_imports)]
 use tokio::{
     io::AsyncWriteExt,
