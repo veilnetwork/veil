@@ -1307,6 +1307,99 @@ final Pointer<VeilStreamFfi> Function(
             )>>('veil_stream_accept')
     .asFunction();
 
+// ── Anonymous reliable streams (onion-routed + congestion-controlled) ────────
+// Same byte-stream surface as veil_stream_*, but the cells ride the anonymous
+// rendezvous transport with the app-layer ARQ + congestion control of
+// `veil-onion-stream` — the fix for the bulk-transfer throughput wall. Keyed off
+// the client handle (a node-wide hub, lazily bound).
+final class VeilAnonStreamFfi extends Opaque {}
+
+// open(handle, dst_node32*, dst_app32*, err) -> stream* (NULL on err).
+final Pointer<VeilAnonStreamFfi> Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  Pointer<Pointer<Utf8>>,
+) veilAnonStreamOpen = nativeLib
+    .lookup<
+            NativeFunction<
+                Pointer<VeilAnonStreamFfi> Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_anon_stream_open')
+    .asFunction();
+
+// accept(handle, timeout_ms, out_src_node32*, out_src_app32*, err) -> stream*
+// (NULL on timeout with no err, so the caller polls; NULL+err on fatal).
+final Pointer<VeilAnonStreamFfi> Function(
+  Pointer<VeilHandle>,
+  int,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  Pointer<Pointer<Utf8>>,
+) veilAnonStreamAccept = nativeLib
+    .lookup<
+            NativeFunction<
+                Pointer<VeilAnonStreamFfi> Function(
+              Pointer<VeilHandle>,
+              Uint64,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_anon_stream_accept')
+    .asFunction();
+
+// read -> ssize_t (IntPtr): n>0 bytes, 0 = clean EOF, <0 = reset (resume).
+final int Function(
+  Pointer<VeilAnonStreamFfi>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilAnonStreamRead = nativeLib
+    .lookup<
+            NativeFunction<
+                IntPtr Function(
+              Pointer<VeilAnonStreamFfi>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_anon_stream_read')
+    .asFunction();
+
+final int Function(
+  Pointer<VeilAnonStreamFfi>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilAnonStreamWrite = nativeLib
+    .lookup<
+            NativeFunction<
+                Int32 Function(
+              Pointer<VeilAnonStreamFfi>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_anon_stream_write')
+    .asFunction();
+
+final int Function(Pointer<VeilAnonStreamFfi>, Pointer<Pointer<Utf8>>)
+    veilAnonStreamFinish = nativeLib
+        .lookup<
+                NativeFunction<
+                    Int32 Function(
+                  Pointer<VeilAnonStreamFfi>,
+                  Pointer<Pointer<Utf8>>,
+                )>>('veil_anon_stream_finish')
+        .asFunction();
+
+final void Function(Pointer<VeilAnonStreamFfi>) veilAnonStreamClose = nativeLib
+    .lookup<NativeFunction<Void Function(Pointer<VeilAnonStreamFfi>)>>(
+      'veil_anon_stream_close',
+    )
+    .asFunction();
+
 // ── Blob AEAD (XChaCha20-Poly1305) for the out-of-container file store ───────
 // seal/unseal(key32, nonce24, input, len, *out_buf, *out_len, err) -> 0 OK / <0.
 // Output buffer freed with [veilFreeBuf].
