@@ -78,7 +78,27 @@ impl AnonStreamHub {
             }
         });
         let cells = Arc::new(AnonCells { sender: sender.clone() });
-        let mux = Arc::new(StreamMux::new(me, cells, in_rx, Config::default()));
+        // The onion RTT is SECONDS and highly variable (relay queues), so the
+        // ms-scale defaults fire the RTO long before an ACK can return → every
+        // cell looks "lost" → cwnd collapses to 1 + the RTO backs off to its cap
+        // → a ~1-cell-per-30s crawl. Start the RTO conservative AND floor it so
+        // the Jacobson-Karels estimator can warm up from real samples (and so a
+        // latency spike can't mis-fire), and widen the window to keep enough in
+        // flight to fill the high-RTT pipe.
+        let mss = veil_onion_stream::MSS as u32;
+        let cfg = Config {
+            init_rto_ms: 10_000,
+            min_rto_ms: 2_000,
+            max_rto_ms: 60_000,
+            handshake_rto_ms: 6_000,
+            max_retransmits: 15,
+            // Window ≥ bandwidth·RTT so the pipe can fill: ~3 MB covers ~228 KB/s
+            // at ~13 s RTT. cwnd slow-starts up to it (capped by real loss).
+            recv_window: 8192 * mss,
+            init_cwnd: 32 * mss,
+            ..Config::default()
+        };
+        let mux = Arc::new(StreamMux::new(me, cells, in_rx, cfg));
         AnonStreamHub { mux, _sender: sender }
     }
 
