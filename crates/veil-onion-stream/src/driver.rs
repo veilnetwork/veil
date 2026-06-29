@@ -227,8 +227,19 @@ async fn drive<D: CellDuplex>(
     let now_ms = |b: &Instant| b.elapsed().as_millis() as u64;
     let mut cmd_open = true;
     let mut cell = Vec::with_capacity(crate::wire::MAX_CELL);
+    let mut last_diag = 0u64; // TEMP diagnostic: throttle the state dump to ~2 s.
     loop {
         let now = now_ms(&base);
+
+        // TEMP diagnostic — periodic engine-state dump so a stall is visible on
+        // both ends (phone: log → logcat; desktop: eprintln → stderr). Remove
+        // once the high-BDP transfer is debugged.
+        if now.saturating_sub(last_diag) >= 2000 {
+            last_diag = now;
+            let s = engine.debug_summary();
+            log::warn!("onion-stream diag: {s}");
+            eprintln!("onion-stream diag: {s}");
+        }
 
         // 0. Once the peer has finished AND we've handed off everything we
         //    received, close our own (often empty) write half so both ends
