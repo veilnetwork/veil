@@ -145,6 +145,56 @@ int _openStreamWorker(int appAddr, Uint8List dstNode, Uint8List dstApp,
   }
 }
 
+/// Off-isolate body of [VeilClient.openAnonStream] — veil_anon_stream_open
+/// blocks until the hub binds + the stream is set up. Returns the stream's raw
+/// pointer address.
+int _anonStreamOpenWorker(int handleAddr, Uint8List dstNode, Uint8List dstApp) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final dn = calloc<Uint8>(32)..asTypedList(32).setAll(0, dstNode);
+  final da = calloc<Uint8>(32)..asTypedList(32).setAll(0, dstApp);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final ptr = ffi.veilAnonStreamOpen(handle, dn, da, errOut);
+    if (ptr == nullptr) {
+      throw VeilException('anon stream open failed: ${_readErrAndFree(errOut)}');
+    }
+    return ptr.address;
+  } finally {
+    calloc.free(dn);
+    calloc.free(da);
+    calloc.free(errOut);
+  }
+}
+
+/// Off-isolate body of [VeilClient.acceptAnonStream]. Null on timeout; throws on
+/// a fatal error; else the stream address + the initiator's node id + onion-
+/// stream app id.
+({int streamAddr, Uint8List src, Uint8List srcApp})? _anonStreamAcceptWorker(
+    int handleAddr, int timeoutMs) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final outNode = calloc<Uint8>(32);
+  final outApp = calloc<Uint8>(32);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final ptr =
+        ffi.veilAnonStreamAccept(handle, timeoutMs, outNode, outApp, errOut);
+    if (ptr == nullptr) {
+      if (errOut.value == nullptr) return null; // timeout
+      throw VeilException(
+          'anon stream accept failed: ${_readErrAndFree(errOut)}');
+    }
+    return (
+      streamAddr: ptr.address,
+      src: Uint8List.fromList(outNode.asTypedList(32)),
+      srcApp: Uint8List.fromList(outApp.asTypedList(32)),
+    );
+  } finally {
+    calloc.free(outNode);
+    calloc.free(outApp);
+    calloc.free(errOut);
+  }
+}
+
 Uint8List? _lookupRelayX25519Worker(int handleAddr, Uint8List nodeId) {
   final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
   final node = calloc<Uint8>(32);
@@ -561,6 +611,44 @@ class VeilClient implements Finalizable {
         calloc.free(errOut);
       }
     });
+  }
+
+  /// Open an ANONYMOUS reliable byte-stream to a peer (onion-routed +
+  /// congestion-controlled — reaches NAT'd/anonymous peers the direct
+  /// [AppHandle.openStream] can't). [dstAppId] is the peer's onion-stream
+  /// endpoint app id (derived from the peer node + the "onion-stream" endpoint
+  /// name, the same way the chat app id is derived). Blocks off the UI isolate.
+  Future<VeilAnonStream> openAnonStream({
+    required Uint8List dstNodeId,
+    required Uint8List dstAppId,
+  }) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32 || dstAppId.length != 32) {
+      throw ArgumentError('dstNodeId and dstAppId must be 32 bytes');
+    }
+    final handleAddr = _handle.address;
+    final addr = await Isolate.run(
+        () => _anonStreamOpenWorker(handleAddr, dstNodeId, dstAppId));
+    return VeilAnonStream.fromFfi(
+        Pointer<ffi.VeilAnonStreamFfi>.fromAddress(addr));
+  }
+
+  /// Accept the next inbound anonymous stream, or null on [timeout] (a server
+  /// loop polls). Returns the stream + the initiator's node id and onion-stream
+  /// app id. Blocks off the UI isolate.
+  Future<({VeilAnonStream stream, Uint8List srcNodeId, Uint8List srcAppId})?>
+      acceptAnonStream({Duration timeout = const Duration(seconds: 2)}) async {
+    _ensureOpen();
+    final handleAddr = _handle.address;
+    final r = await Isolate.run(
+        () => _anonStreamAcceptWorker(handleAddr, timeout.inMilliseconds));
+    if (r == null) return null;
+    return (
+      stream: VeilAnonStream.fromFfi(
+          Pointer<ffi.VeilAnonStreamFfi>.fromAddress(r.streamAddr)),
+      srcNodeId: r.src,
+      srcAppId: r.srcApp,
+    );
   }
 
   /// Read the daemon's relay-side X25519 public key (32 bytes) — the seal
