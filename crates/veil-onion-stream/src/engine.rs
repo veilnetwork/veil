@@ -287,6 +287,37 @@ impl StreamEngine {
         self.tx.cwnd
     }
 
+    /// Debug snapshot (for diagnostics / tests).
+    pub fn debug_summary(&self) -> String {
+        format!(
+            "phase={:?} una={} nxt={} cwnd={} ssth={} rwnd={} segs={} pending={} dup={} recov={} \
+             | rcv_nxt={} read_buf={} oo={} ack_pending={} eof={} fin(req={},sent={},ack={}) \
+             hs_dl={:?} rto_dl={:?} persist_dl={:?} probe={}",
+            self.phase,
+            self.tx.snd_una,
+            self.tx.snd_nxt,
+            self.tx.cwnd,
+            self.tx.ssthresh,
+            self.tx.rwnd,
+            self.tx.segs.len(),
+            self.tx.pending.len(),
+            self.tx.dup_acks,
+            self.tx.in_recovery,
+            self.rx.rcv_nxt,
+            self.rx.read_buf.len(),
+            self.rx.oo.len(),
+            self.ack_pending,
+            self.rx.eof,
+            self.tx.fin_requested,
+            self.tx.fin_sent,
+            self.tx.fin_acked,
+            self.hs_deadline,
+            self.tx.rto_deadline,
+            self.persist_deadline,
+            self.force_probe,
+        )
+    }
+
     // ---- inbound --------------------------------------------------------
 
     /// Feed one received cell (the circuit's inner payload).
@@ -633,6 +664,9 @@ impl StreamEngine {
         if self.phase == Phase::Closed {
             return;
         }
+        if self.syn_acked {
+            self.hs_deadline = None; // stale once the handshake is confirmed
+        }
         // Handshake retransmit + retry cap.
         if let Some(dl) = self.hs_deadline
             && now >= dl
@@ -650,8 +684,15 @@ impl StreamEngine {
             }
             self.hs_deadline = Some(now + self.cfg.handshake_rto_ms);
         }
-        // Data RTO + retry cap.
+        // Data RTO + retry cap. If the deadline is stale (nothing left unacked),
+        // CLEAR it — leaving a past deadline would make the driver's timer fire
+        // every poll as sleep(0) and busy-spin.
         if let Some(dl) = self.tx.rto_deadline
+            && now >= dl
+            && self.tx.segs.is_empty()
+        {
+            self.tx.rto_deadline = None;
+        } else if let Some(dl) = self.tx.rto_deadline
             && now >= dl
             && !self.tx.segs.is_empty()
         {
