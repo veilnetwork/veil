@@ -80,19 +80,26 @@ impl CellSender for AnonCells {
 /// identity, so it rides in-band — acceptable on the trusted test net).
 struct CircuitCells {
     services: veil_node_runtime::NodeServices,
-    circuit: veil_node_runtime::DataCircuit,
     me: [u8; 32],
+    /// Filled by the background open task once the circuit to R is up. Sends
+    /// before then are dropped (the ARQ / handshake RTO retransmits).
+    circuit: Arc<tokio::sync::Mutex<Option<veil_node_runtime::DataCircuit>>>,
 }
 
 impl CellSender for CircuitCells {
     async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
+        let guard = self.circuit.lock().await;
+        let Some(circuit) = guard.as_ref() else {
+            // Circuit not up yet — drop this cell; the ARQ/handshake RTO resends.
+            return Ok(());
+        };
         let cookie = stream_cookie(&dst.node);
         let mut env = Vec::with_capacity(COOKIE_LEN + 32 + cell.len());
         env.extend_from_slice(&cookie);
         env.extend_from_slice(&self.me);
         env.extend_from_slice(&cell);
         self.services
-            .send_circuit_cell(&self.circuit, &env)
+            .send_circuit_cell(circuit, &env)
             .map_err(|e| io::Error::other(format!("circuit stream send: {e:?}")))
     }
 }
@@ -163,8 +170,8 @@ impl AnonStreamHub {
         };
         // Surface which backend engaged (desktop: stderr; phone: logcat).
         let backend = match &cells {
-            HubCells::Circuit(_) => "onion-stream: PINNED CIRCUIT engaged",
-            HubCells::Anon(_) => "onion-stream: datagram path (circuit not engaged)",
+            HubCells::Circuit(_) => "onion-stream: circuit mode — opening R in background",
+            HubCells::Anon(_) => "onion-stream: datagram path (no embedded node)",
         };
         eprintln!("{backend}");
         #[cfg(target_os = "android")]
@@ -204,40 +211,51 @@ impl AnonStreamHub {
 /// cells into (Addr, cell). `None` (→ datagram fallback) if not embedded or no
 /// relay is resolvable yet.
 fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Option<CircuitCells> {
-    let services = match veil_node_runtime::embedded_services() {
-        Some(s) => s,
-        None => {
-            eprintln!("onion-stream: circuit skip — no embedded_services (node not up?)");
-            #[cfg(target_os = "android")]
-            log::warn!("onion-stream: circuit skip — no embedded_services");
-            return None;
-        }
-    };
-    let my_cookie = stream_cookie(&me);
-    let reg_kp = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
-    let epoch = AtomicU64::new(0);
-    let (circuit, mut recv_rx) = match services.open_stream_circuit_auto(my_cookie, &reg_kp, &epoch) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("onion-stream: circuit skip — open_stream_circuit_auto failed: {e:?}");
-            #[cfg(target_os = "android")]
-            log::warn!("onion-stream: circuit skip — open failed: {:?}", e);
-            return None;
-        }
-    };
+    // Only available with an in-process embedded node; else datagram path.
+    let services = veil_node_runtime::embedded_services()?;
+    let cookie = stream_cookie(&me);
+    let circuit: Arc<tokio::sync::Mutex<Option<veil_node_runtime::DataCircuit>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    // Open the circuit to R in the BACKGROUND (async relay-dir fetch + CircuitBuild
+    // + ACK). Proactive (not lazy-on-send) so the RECEIVER is ready to take inbound
+    // splices before it ever sends. Cells before it's up drop; the ARQ resends.
+    let circuit_slot = Arc::clone(&circuit);
+    let services_bg = services.clone();
     tokio::spawn(async move {
-        while let Some(framed) = recv_rx.recv().await {
-            if framed.len() < 32 {
-                continue;
+        let reg_kp = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+        let epoch = AtomicU64::new(0);
+        match services_bg
+            .open_stream_circuit_auto(cookie, &reg_kp, &epoch)
+            .await
+        {
+            Ok((circ, mut recv_rx)) => {
+                // Inbound feed: each return cell is `[sender_node 32][stream cell]`.
+                tokio::spawn(async move {
+                    while let Some(framed) = recv_rx.recv().await {
+                        if framed.len() < 32 {
+                            continue;
+                        }
+                        let mut node = [0u8; 32];
+                        node.copy_from_slice(&framed[..32]);
+                        let app =
+                            veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
+                        let cell = framed[32..].to_vec();
+                        if in_tx.send((Addr { node, app }, cell)).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                *circuit_slot.lock().await = Some(circ);
+                eprintln!("onion-stream: PINNED CIRCUIT opened");
+                #[cfg(target_os = "android")]
+                log::warn!("onion-stream: PINNED CIRCUIT opened");
             }
-            let mut node = [0u8; 32];
-            node.copy_from_slice(&framed[..32]);
-            let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
-            let cell = framed[32..].to_vec();
-            if in_tx.send((Addr { node, app }, cell)).await.is_err() {
-                break;
+            Err(e) => {
+                eprintln!("onion-stream: circuit open FAILED: {e:?}");
+                #[cfg(target_os = "android")]
+                log::warn!("onion-stream: circuit open FAILED: {:?}", e);
             }
         }
     });
-    Some(CircuitCells { services, circuit, me })
+    Some(CircuitCells { services, me, circuit })
 }
