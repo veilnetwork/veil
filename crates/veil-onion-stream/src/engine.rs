@@ -121,6 +121,11 @@ struct TxState {
     rto_deadline: Option<u64>,
     /// Consecutive RTO firings with no intervening new-data ack (dead detection).
     consec_rto: u32,
+    /// Pacing: earliest time the next NEW-data segment may go on the wire. The
+    /// sender emits one cwnd's worth of data per smoothed RTT as an even trickle
+    /// instead of bursting it — a burst overruns the onion relay's bounded queue
+    /// and triggers catastrophic multi-thousand-cell loss (slow-start overshoot).
+    pace_next_ms: u64,
     fin_requested: bool,
     fin_sent: bool,
     fin_acked: bool,
@@ -199,6 +204,7 @@ impl StreamEngine {
                 rto_ms: cfg.init_rto_ms,
                 rto_deadline: None,
                 consec_rto: 0,
+                pace_next_ms: 0,
                 fin_requested: false,
                 fin_sent: false,
                 fin_acked: false,
@@ -291,32 +297,39 @@ impl StreamEngine {
 
     /// Debug snapshot (for diagnostics / tests).
     pub fn debug_summary(&self) -> String {
+        let sacked = self.tx.segs.iter().filter(|s| s.sacked).count();
+        let resend = self.tx.segs.iter().filter(|s| s.needs_resend).count();
+        let inflight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
         format!(
-            "phase={:?} una={} nxt={} cwnd={} ssth={} rwnd={} segs={} pending={} dup={} recov={} \
-             | rcv_nxt={} read_buf={} oo={} ack_pending={} eof={} fin(req={},sent={},ack={}) \
-             hs_dl={:?} rto_dl={:?} persist_dl={:?} probe={}",
+            "phase={:?} una={} nxt={} inflight={} cwnd={} ssth={} rwnd={} segs={}(sack={} resend={}) \
+             pending={} dup={} recov={} consec_rto={} | rcv_nxt={} read_buf={} oo={} oo_bytes={} \
+             adv={} ack_pending={} eof={} fin(req={},sent={},ack={}) rto_dl={:?} persist_dl={:?}",
             self.phase,
             self.tx.snd_una,
             self.tx.snd_nxt,
+            inflight,
             self.tx.cwnd,
             self.tx.ssthresh,
             self.tx.rwnd,
             self.tx.segs.len(),
+            sacked,
+            resend,
             self.tx.pending.len(),
             self.tx.dup_acks,
             self.tx.in_recovery,
+            self.tx.consec_rto,
             self.rx.rcv_nxt,
             self.rx.read_buf.len(),
             self.rx.oo.len(),
+            self.rx.oo_bytes,
+            self.rx.advertised(),
             self.ack_pending,
             self.rx.eof,
             self.tx.fin_requested,
             self.tx.fin_sent,
             self.tx.fin_acked,
-            self.hs_deadline,
             self.tx.rto_deadline,
             self.persist_deadline,
-            self.force_probe,
         )
     }
 
@@ -543,8 +556,13 @@ impl StreamEngine {
                 self.encode_seg_at(idx, out);
                 return true;
             }
-            // 3b. New data / FIN, congestion + flow limited.
-            if self.create_next_segment(now) {
+            // 3b. New data / FIN, congestion + flow limited + PACED. Emit at most
+            //     one new segment per pacing interval so a cwnd's worth of data
+            //     trickles out across an RTT instead of bursting (a burst overruns
+            //     the relay queue → slow-start-overshoot collapse). A persist probe
+            //     bypasses pacing. Retransmits (3a above) are never paced.
+            if (self.force_probe || now >= self.tx.pace_next_ms) && self.create_next_segment(now) {
+                self.tx.pace_next_ms = now + self.pace_interval_ms();
                 self.encode_seg_at(self.tx.segs.len() - 1, out);
                 return true;
             }
@@ -780,7 +798,35 @@ impl StreamEngine {
         merge(self.hs_deadline);
         merge(self.tx.rto_deadline);
         merge(self.persist_deadline);
+        // If new data is ready but held back only by pacing, wake to release it.
+        if self.phase == Phase::Established && self.paced_send_ready() {
+            merge(Some(self.tx.pace_next_ms));
+        }
         t
+    }
+
+    /// Per-segment pacing interval (ms): spread one `cwnd` of bytes across one
+    /// smoothed RTT so the send rate tracks the bottleneck without bursting.
+    /// Returns 0 until the first RTT sample — the initial cwnd (a few dozen
+    /// cells) is small enough to burst safely, and pacing it off a guessed RTT
+    /// would crawl. Floored at 1 ms once paced to bound driver wakeups (the
+    /// implied ~MSS/ms cap sits far above any onion path's real throughput).
+    fn pace_interval_ms(&self) -> u64 {
+        let Some(srtt) = self.tx.srtt else { return 0 };
+        let mss = self.cfg.mss as u64;
+        let cwnd = self.tx.cwnd.max(self.cfg.mss as u32) as u64;
+        (mss.saturating_mul(srtt as u64) / cwnd).max(1)
+    }
+
+    /// Is there new data/FIN we could send right now (window allows), with only
+    /// the pacing clock holding it back?
+    fn paced_send_ready(&self) -> bool {
+        let window = self.tx.cwnd.min(self.tx.rwnd);
+        let inflight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
+        if seq::geq(inflight, window) {
+            return false; // window-limited, not pace-limited
+        }
+        !self.tx.pending.is_empty() || (self.tx.fin_requested && !self.tx.fin_sent)
     }
 
     fn declare_dead(&mut self) {
