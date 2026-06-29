@@ -4825,6 +4825,7 @@ dependencies = [
  "veil-crypto",
  "veil-identity",
  "veil-node-runtime",
+ "veil-onion-stream",
  "veil-proto",
  "veil-types",
  "veilclient",

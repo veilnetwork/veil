@@ -75,6 +75,7 @@ pub(crate) mod guard;
 // Embedded in-process node runtime (no `veil-cli` subprocess). Opt-in via the
 // `node-embedded` cargo feature so the default client-only build stays slim.
 #[cfg(feature = "node-embedded")]
+mod anon_stream;
 mod node;
 
 use libc::{size_t, ssize_t};
@@ -312,6 +313,11 @@ fn stream_table() -> &'static StdMutex<HandleTable<VeilStreamFfi>> {
     T.get_or_init(|| StdMutex::new(HandleTable::new()))
 }
 
+fn anon_stream_table() -> &'static StdMutex<HandleTable<VeilAnonStreamFfi>> {
+    static T: OnceLock<StdMutex<HandleTable<VeilAnonStreamFfi>>> = OnceLock::new();
+    T.get_or_init(|| StdMutex::new(HandleTable::new()))
+}
+
 /// USE-path liveness guard: resolve a raw handle token to its live `Arc<T>`
 /// BEFORE any dereference or async work, turning a use-after-close / ABA /
 /// unknown / wrong-type token into a clean error return instead of UB. Binds
@@ -359,6 +365,10 @@ pub struct VeilHandle {
     /// [`veil_close`] or replaced on subsequent
     /// `set_event_handler` calls.
     event_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Node-wide anonymous-stream multiplexer, built lazily on the first
+    /// `veil_anon_stream_open`/`veil_anon_stream_accept` (binds a dedicated
+    /// onion-stream endpoint + spawns the demux).
+    anon_hub: TokioMutex<Option<Arc<anon_stream::AnonStreamHub>>>,
 }
 
 /// Opaque app endpoint.
@@ -409,6 +419,272 @@ pub struct VeilStreamFfi {
     bundle: Arc<RuntimeBundle>,
     reader: TokioMutex<Option<tokio::io::ReadHalf<SdkStream>>>,
     writer: TokioMutex<Option<tokio::io::WriteHalf<SdkStream>>>,
+}
+
+/// Handle to one ANONYMOUS reliable byte-stream (onion-routed, congestion-
+/// controlled — see [`anon_stream`]). Split read/write halves so a caller can
+/// read + write concurrently without one mutex deadlocking a blocking read
+/// against a write.
+pub struct VeilAnonStreamFfi {
+    bundle: Arc<RuntimeBundle>,
+    reader: TokioMutex<Option<veil_onion_stream::OnionReader>>,
+    writer: TokioMutex<Option<veil_onion_stream::OnionWriter>>,
+}
+
+/// Get-or-lazily-build this node's anonymous-stream hub (binds the dedicated
+/// onion-stream endpoint once, on first use).
+fn ensure_anon_hub(
+    bundle: &Arc<RuntimeBundle>,
+    slot: &TokioMutex<Option<Arc<anon_stream::AnonStreamHub>>>,
+) -> Result<Arc<anon_stream::AnonStreamHub>, String> {
+    bundle.runtime.block_on(async {
+        let mut g = slot.lock().await;
+        if let Some(h) = g.as_ref() {
+            return Ok(h.clone());
+        }
+        let (me, app) = {
+            let client = bundle.client.lock().await;
+            let me = client
+                .node_identity()
+                .await
+                .map_err(|e| format!("node_identity: {e}"))?
+                .node_id;
+            let app = client
+                .bind_named(
+                    anon_stream::STREAM_NAMESPACE,
+                    anon_stream::STREAM_NAME,
+                    anon_stream::STREAM_ENDPOINT_ID,
+                )
+                .await
+                .map_err(|e| format!("bind onion-stream endpoint: {e}"))?;
+            (me, app)
+        };
+        let (sender, receiver) = app.into_split();
+        let (msg_rx, _streams) = receiver.into_parts();
+        let hub = Arc::new(anon_stream::AnonStreamHub::new(me, sender, msg_rx));
+        *g = Some(hub.clone());
+        Ok(hub)
+    })
+}
+
+/// Open an anonymous reliable byte-stream to a peer. `dst_app_id` is the peer's
+/// onion-stream endpoint app id (`deriveAppId(peer_node, "xveil",
+/// "onion-stream")` — the Dart caller derives it, mirroring `veil_stream_open`).
+/// Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_anon_stream_open(
+    handle: *mut VeilHandle,
+    dst_node_id: *const u8,
+    dst_app_id: *const u8,
+    err_out: *mut *mut c_char,
+) -> *mut VeilAnonStreamFfi {
+    if unsafe { guard::ffi_prelude(err_out, "veil_anon_stream_open") }.is_err() {
+        return ptr::null_mut();
+    }
+    null_check_with_default!(err_out, ptr::null_mut(),
+        "handle" => handle,
+        "dst_node_id" => dst_node_id,
+        "dst_app_id" => dst_app_id,
+    );
+    get_or_return!(handle_live, handle_table(), handle, err_out, ptr::null_mut(), "VeilHandle");
+    let mut node = [0u8; 32];
+    let mut app = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(dst_node_id, node.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(dst_app_id, app.as_mut_ptr(), 32);
+    }
+    let hub = match ensure_anon_hub(&handle_live.bundle, &handle_live.anon_hub) {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("anon stream open: {e}")) };
+            return ptr::null_mut();
+        }
+    };
+    let bundle = Arc::clone(&handle_live.bundle);
+    // open() spawns the stream driver, so it must run inside the runtime.
+    let stream = bundle
+        .runtime
+        .block_on(async { hub.open(veil_onion_stream::Addr { node, app }) });
+    let (rd, wr) = stream.into_split();
+    let ffi = VeilAnonStreamFfi {
+        bundle,
+        reader: TokioMutex::new(Some(rd)),
+        writer: TokioMutex::new(Some(wr)),
+    };
+    HandleTable::insert(anon_stream_table(), ffi) as *mut VeilAnonStreamFfi
+}
+
+/// Accept the next inbound anonymous stream, or NULL on timeout (no error) /
+/// error. On success writes the initiator's 32-byte node id + onion-stream app
+/// id into the out params (caller-allocated, 32 B each).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_anon_stream_accept(
+    handle: *mut VeilHandle,
+    timeout_ms: u64,
+    out_src_node_id: *mut u8,
+    out_src_app_id: *mut u8,
+    err_out: *mut *mut c_char,
+) -> *mut VeilAnonStreamFfi {
+    if unsafe { guard::ffi_prelude(err_out, "veil_anon_stream_accept") }.is_err() {
+        return ptr::null_mut();
+    }
+    null_check_with_default!(err_out, ptr::null_mut(),
+        "handle" => handle,
+        "out_src_node_id" => out_src_node_id,
+        "out_src_app_id" => out_src_app_id,
+    );
+    get_or_return!(handle_live, handle_table(), handle, err_out, ptr::null_mut(), "VeilHandle");
+    let hub = match ensure_anon_hub(&handle_live.bundle, &handle_live.anon_hub) {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("anon stream accept: {e}")) };
+            return ptr::null_mut();
+        }
+    };
+    let bundle = Arc::clone(&handle_live.bundle);
+    let accepted = bundle.runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), hub.accept()).await
+    });
+    match accepted {
+        Ok(Some((stream, src))) => {
+            unsafe {
+                ptr::copy_nonoverlapping(src.node.as_ptr(), out_src_node_id, 32);
+                ptr::copy_nonoverlapping(src.app.as_ptr(), out_src_app_id, 32);
+            }
+            let (rd, wr) = stream.into_split();
+            let ffi = VeilAnonStreamFfi {
+                bundle,
+                reader: TokioMutex::new(Some(rd)),
+                writer: TokioMutex::new(Some(wr)),
+            };
+            HandleTable::insert(anon_stream_table(), ffi) as *mut VeilAnonStreamFfi
+        }
+        Ok(None) => ptr::null_mut(),  // hub closed
+        Err(_elapsed) => ptr::null_mut(), // timeout — caller polls again
+    }
+}
+
+/// Read up to `cap` bytes. Returns the count (0 = clean EOF), or a negative
+/// error code (the stream was reset → the app should resume).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_anon_stream_read(
+    stream: *mut VeilAnonStreamFfi,
+    buf: *mut u8,
+    cap: size_t,
+    err_out: *mut *mut c_char,
+) -> ssize_t {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_anon_stream_read") } {
+        return rc as ssize_t;
+    }
+    if stream.is_null() || buf.is_null() {
+        unsafe { write_err(err_out, "stream or buf is NULL") };
+        return VEIL_ERR_INVALID_ARG as ssize_t;
+    }
+    if cap == 0 {
+        return 0;
+    }
+    if cap > VEIL_MAX_DATA_LEN {
+        unsafe { write_err(err_out, format!("cap {cap} exceeds VEIL_MAX_DATA_LEN")) };
+        return VEIL_ERR_INVALID_ARG as ssize_t;
+    }
+    get_or_return!(stream_ref, anon_stream_table(), stream, err_out, VEIL_ERR_INVALID_ARG as ssize_t, "VeilAnonStreamFfi");
+    let res: Result<usize, String> = stream_ref.bundle.runtime.block_on(async {
+        let mut guard = stream_ref.reader.lock().await;
+        let Some(rd) = guard.as_mut() else {
+            return Err("stream closed".to_string());
+        };
+        let mut tmp = vec![0u8; cap];
+        let n = rd.read(&mut tmp).await.map_err(|e| e.to_string())?;
+        unsafe { ptr::copy_nonoverlapping(tmp.as_ptr(), buf, n) };
+        Ok(n)
+    });
+    match res {
+        Ok(n) => n as ssize_t,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            VEIL_ERR as ssize_t
+        }
+    }
+}
+
+/// Queue `len` bytes for reliable delivery. Returns `VEIL_OK` / a negative code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_anon_stream_write(
+    stream: *mut VeilAnonStreamFfi,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_anon_stream_write") } {
+        return rc;
+    }
+    null_check!(err_out, "stream" => stream);
+    if data.is_null() && len > 0 {
+        unsafe { write_err(err_out, "data is NULL but len > 0") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if len > VEIL_MAX_DATA_LEN {
+        unsafe { write_err(err_out, format!("data len {len} exceeds VEIL_MAX_DATA_LEN")) };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(stream_ref, anon_stream_table(), stream, err_out, VEIL_ERR_INVALID_ARG, "VeilAnonStreamFfi");
+    let payload = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    let res: Result<(), String> = stream_ref.bundle.runtime.block_on(async {
+        let guard = stream_ref.writer.lock().await;
+        let Some(wr) = guard.as_ref() else {
+            return Err("stream closed".to_string());
+        };
+        wr.write_all(&payload).await.map_err(|e| e.to_string())
+    });
+    match res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            VEIL_ERR_CLOSED
+        }
+    }
+}
+
+/// Half-close the send direction (a FIN follows the last queued byte). The peer
+/// reads EOF. Returns `VEIL_OK` / a negative code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_anon_stream_finish(
+    stream: *mut VeilAnonStreamFfi,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_anon_stream_finish") } {
+        return rc;
+    }
+    null_check!(err_out, "stream" => stream);
+    get_or_return!(stream_ref, anon_stream_table(), stream, err_out, VEIL_ERR_INVALID_ARG, "VeilAnonStreamFfi");
+    let res: Result<(), String> = stream_ref.bundle.runtime.block_on(async {
+        let guard = stream_ref.writer.lock().await;
+        let Some(wr) = guard.as_ref() else {
+            return Err("stream closed".to_string());
+        };
+        wr.finish().await.map_err(|e| e.to_string())
+    });
+    match res {
+        Ok(()) => VEIL_OK,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            VEIL_ERR_CLOSED
+        }
+    }
+}
+
+/// Close + free the stream handle (idempotent, NULL-safe). Dropping it closes
+/// the cmd channel → the driver finishes cleanly and the mux route deregisters.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_anon_stream_close(stream: *mut VeilAnonStreamFfi) {
+    if stream.is_null() {
+        return;
+    }
+    let _ = HandleTable::remove(anon_stream_table(), stream as usize);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -600,6 +876,7 @@ pub unsafe extern "C" fn veil_connect(
         VeilHandle {
             bundle,
             event_task: StdMutex::new(None),
+            anon_hub: TokioMutex::new(None),
         },
     ) as *mut VeilHandle
 }
