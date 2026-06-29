@@ -25,7 +25,7 @@ use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::driver::{CellDuplex, OnionStream};
 use crate::engine::Config;
@@ -95,7 +95,7 @@ pub struct StreamMux<S: CellSender> {
     cfg: Config,
     routes: Routes,
     next_id: Arc<AtomicU32>,
-    accept_rx: mpsc::Receiver<(OnionStream, Addr)>,
+    accept_rx: AsyncMutex<mpsc::Receiver<(OnionStream, Addr)>>,
 }
 
 impl<S: CellSender> StreamMux<S> {
@@ -117,7 +117,7 @@ impl<S: CellSender> StreamMux<S> {
             cfg,
             routes,
             next_id: Arc::new(AtomicU32::new(1)),
-            accept_rx,
+            accept_rx: AsyncMutex::new(accept_rx),
         }
     }
 
@@ -146,9 +146,9 @@ impl<S: CellSender> StreamMux<S> {
     }
 
     /// Accept the next inbound stream a peer opened to us, or `None` if the
-    /// transport closed.
-    pub async fn accept(&mut self) -> Option<(OnionStream, Addr)> {
-        self.accept_rx.recv().await
+    /// transport closed. `&self` so a shared mux can both open and accept.
+    pub async fn accept(&self) -> Option<(OnionStream, Addr)> {
+        self.accept_rx.lock().await.recv().await
     }
 }
 
@@ -276,7 +276,7 @@ mod tests {
         let sb = Arc::new(BusSender { me: b, bus: bus.clone(), loss, ctr: AtomicU32::new(7) });
         let cfg = Config::default();
         let mux_a = StreamMux::new(a.node, sa, a_rx, cfg);
-        let mut mux_b = StreamMux::new(b.node, sb, b_rx, cfg);
+        let mux_b = StreamMux::new(b.node, sb, b_rx, cfg);
 
         let data = payload(n, 0x1234);
         let send_data = data.clone();
@@ -312,7 +312,7 @@ mod tests {
         let sb = Arc::new(BusSender { me: b, bus: bus.clone(), loss: 0, ctr: AtomicU32::new(9) });
         let cfg = Config::default();
         let mux_a = StreamMux::new(a.node, sa, a_rx, cfg);
-        let mut mux_b = StreamMux::new(b.node, sb, b_rx, cfg);
+        let mux_b = StreamMux::new(b.node, sb, b_rx, cfg);
 
         let d1 = payload(20_000, 1);
         let d2 = payload(20_000, 2);
