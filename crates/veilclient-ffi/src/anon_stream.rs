@@ -87,8 +87,11 @@ impl AnonStreamHub {
         // flight to fill the high-RTT pipe.
         let mss = veil_onion_stream::MSS as u32;
         let cfg = Config {
-            init_rto_ms: 10_000,
-            min_rto_ms: 2_000,
+            // The onion RTT is several seconds; floor the RTO at 10 s so it only
+            // fires on REAL loss, never before an ACK can return (the SACK-aware
+            // retransmit + fast-retransmit handle actual loss faster than this).
+            init_rto_ms: 12_000,
+            min_rto_ms: 10_000,
             max_rto_ms: 60_000,
             handshake_rto_ms: 6_000,
             max_retransmits: 15,
