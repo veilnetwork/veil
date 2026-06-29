@@ -79,7 +79,7 @@ impl CellSender for AnonCells {
 /// target reads `my_node` to demux the peer (the splice strips the sender's
 /// identity, so it rides in-band — acceptable on the trusted test net).
 struct CircuitCells {
-    services: &'static veil_node_runtime::NodeServices,
+    services: veil_node_runtime::NodeServices,
     circuit: veil_node_runtime::DataCircuit,
     me: [u8; 32],
 }
@@ -204,13 +204,27 @@ impl AnonStreamHub {
 /// cells into (Addr, cell). `None` (→ datagram fallback) if not embedded or no
 /// relay is resolvable yet.
 fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Option<CircuitCells> {
-    let services = veil_node_runtime::embedded_services()?;
+    let services = match veil_node_runtime::embedded_services() {
+        Some(s) => s,
+        None => {
+            eprintln!("onion-stream: circuit skip — no embedded_services (node not up?)");
+            #[cfg(target_os = "android")]
+            log::warn!("onion-stream: circuit skip — no embedded_services");
+            return None;
+        }
+    };
     let my_cookie = stream_cookie(&me);
     let reg_kp = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
     let epoch = AtomicU64::new(0);
-    let (circuit, mut recv_rx) = services
-        .open_stream_circuit_auto(my_cookie, &reg_kp, &epoch)
-        .ok()?;
+    let (circuit, mut recv_rx) = match services.open_stream_circuit_auto(my_cookie, &reg_kp, &epoch) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("onion-stream: circuit skip — open_stream_circuit_auto failed: {e:?}");
+            #[cfg(target_os = "android")]
+            log::warn!("onion-stream: circuit skip — open failed: {:?}", e);
+            return None;
+        }
+    };
     tokio::spawn(async move {
         while let Some(framed) = recv_rx.recv().await {
             if framed.len() < 32 {
