@@ -4821,6 +4821,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "veil-anonymity",
+ "veil-app",
  "veil-cfg",
  "veil-crypto",
  "veil-identity",
