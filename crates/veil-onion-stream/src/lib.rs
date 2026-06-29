@@ -56,9 +56,11 @@
 
 pub mod driver;
 pub mod engine;
+pub mod mux;
 pub mod seq;
 pub mod wire;
 
 pub use driver::{CellDuplex, End, OnionStream};
 pub use engine::{Config, Event, StreamEngine};
+pub use mux::{CellSender, Peer, StreamMux};
 pub use wire::{Frame, MAX_CELL, MSS, SackRange};
