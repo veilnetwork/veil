@@ -95,9 +95,14 @@ impl AnonStreamHub {
             max_rto_ms: 60_000,
             handshake_rto_ms: 6_000,
             max_retransmits: 15,
-            // Window ≥ bandwidth·RTT so the pipe can fill: ~3 MB covers ~228 KB/s
-            // at ~13 s RTT. cwnd slow-starts up to it (capped by real loss).
-            recv_window: 8192 * mss,
+            // Window sized to ~bandwidth·RTT (~768 KB fills ~200 KB/s at a few-s
+            // base RTT) but NO larger: with sender pacing keeping the relay queue
+            // empty, a tight window bounds both bufferbloat latency AND the
+            // loss-recovery scope if a gentle overshoot ever does drop cells.
+            // (A 3 MB window let slow-start overshoot to ~1.5 MB in flight, burst
+            // the relay queue, and lose ~3000 cells at once → a glacial 1-cell-
+            // per-RTT recovery stall at ~6 %. Pacing + this cap removes that.)
+            recv_window: 2048 * mss,
             init_cwnd: 32 * mss,
             ..Config::default()
         };
