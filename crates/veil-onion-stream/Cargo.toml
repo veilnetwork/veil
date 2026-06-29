@@ -1,0 +1,15 @@
+[package]
+name = "veil-onion-stream"
+version = "0.1.0"
+edition = "2024"
+description = "Reliable, congestion-controlled byte-stream over an anonymous onion circuit's lossy fixed-size cell channel (end-to-end ARQ + AIMD CC + clean EOF/RST for resumable transfers). Sans-IO core: deterministic, transport-agnostic."
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+
+[dev-dependencies]
+# Deterministic PRNG for the loss/reorder/dup simulation harness (no external dep:
+# a tiny SplitMix64 lives in tests). Nothing required here yet.
+
+[lints]
+workspace = true
