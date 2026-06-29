@@ -6606,7 +6606,7 @@ impl NodeServices {
     /// (R is first hop AND terminus): R sees the sender directly, acceptable on a
     /// trusted test net; production uses a multi-hop path to a resolved rendezvous
     /// ad. `None`-relays error if no resolvable relay is known yet.
-    pub fn open_stream_circuit_auto(
+    pub async fn open_stream_circuit_auto(
         &self,
         cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
         reg_kp: &veil_crypto::GeneratedKeyPair,
@@ -6622,27 +6622,41 @@ impl NodeServices {
         // locally — the rendezvous relays we actually have a session to, NOT the
         // DHT routing table (which rarely holds them). Deterministic (smallest
         // node_id) so both ends agree on R with no handshake.
-        let sessions: Vec<[u8; 32]> = rlock!(self.session_tx_registry)
-            .active_node_ids()
+        const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        // R candidates = our DHT routing-table contacts (the connected relays /
+        // seeds), deterministic by node_id so both ends agree on the same R.
+        let mut candidates: Vec<[u8; 32]> = self
+            .dht
+            .routing_table_contacts()
             .into_iter()
+            .map(|c| c.node_id)
             .collect();
-        let mut relays: Vec<[u8; 32]> = sessions
-            .iter()
-            .copied()
-            .filter(|nid| self.dht.get_local(&relay_directory_dht_key(nid)).is_some())
-            .collect();
+        candidates.sort_unstable();
+        // Pick the FIRST candidate whose relay-directory entry (R's anonymity
+        // x25519, needed to onion-wrap to R) we can obtain — FETCHING it into the
+        // local cache if absent. The pinned-seed setup never caches it organically
+        // (the documented DHT-completeness wall); this mirrors the pre-resolve in
+        // send_anonymous_authenticated_to.
+        for r in &candidates {
+            let key = relay_directory_dht_key(r);
+            if self.dht.get_local(&key).is_none()
+                && let Some(bytes) = self.dht_recursive_get(key, RESOLVE_TIMEOUT).await
+            {
+                self.dht.store_local(key, bytes);
+            }
+            if self.dht.get_local(&key).is_some() {
+                self.logger.info(
+                    "onion-stream.relay-pick",
+                    format!("R resolved, candidates={}", candidates.len()),
+                );
+                return self.open_stream_circuit(&[*r], cookie, reg_kp, last_epoch);
+            }
+        }
         self.logger.info(
             "onion-stream.relay-pick",
-            format!(
-                "sessions={} relay-dir-resolvable={} routing={}",
-                sessions.len(),
-                relays.len(),
-                self.dht.routing_table_contacts().len()
-            ),
+            format!("no resolvable R among candidates={}", candidates.len()),
         );
-        relays.sort_unstable();
-        let r = *relays.first().ok_or(AnonOnionSendError::NoRelays)?;
-        self.open_stream_circuit(&[r], cookie, reg_kp, last_epoch)
+        Err(AnonOnionSendError::NoRelays)
     }
 
     /// Send one FORWARD data cell over a pinned [`DataCircuit`]: `wrap_payload`
