@@ -4,16 +4,25 @@
 //! fast sender outruns the relays' bounded TX queues and ~80 % of a bulk
 //! transfer is dropped (the ~200 KB/s file-transfer wall). [`AnonStreamHub`]
 //! fixes that by running `veil-onion-stream` (end-to-end ARQ + AIMD congestion
-//! control) OVER the same anonymous-authenticated send/recv: it binds one
-//! dedicated stream endpoint and multiplexes [`OnionStream`]s over it, keyed by
-//! `(peer_node, stream_id)`. The crypto cost per cell is exactly today's
-//! anonymous send; the win is the CC clocking the sender to the bottleneck
-//! relay instead of blasting.
+//! control) over a [`CellSender`]. Two backends:
+//!
+//! - DEFAULT (`AnonCells`): each cell rides `send_anonymous_authenticated` — a
+//!   FRESH onion circuit + per-cell signature/verify. Reliable, but the per-cell
+//!   circuit build inflates the RTT and the varying paths cause reordering →
+//!   spurious recoveries → ~42 KB/s (device-measured).
+//! - PINNED CIRCUIT (`CircuitCells`, opt-in `VEIL_ONION_STREAM_CIRCUIT=1`): one
+//!   build-once stateful onion circuit to a rendezvous relay R; cheap XOR
+//!   `CircuitData` cells, no per-cell ECDH/signature, in-order, stable RTT. R
+//!   splices each cell onto the peer's registered circuit. Validation-grade
+//!   shortcut (deterministic cookies + auto-agreed R + in-band sender id); needs
+//!   the embedded node (in-process `NodeServices`).
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use tokio::sync::mpsc;
+use veil_anonymity::circuit_register::COOKIE_LEN;
 use veil_onion_stream::{Addr, CellSender, Config, OnionStream, StreamMux};
 use veilclient::{AppSender, IncomingMessage};
 
@@ -25,8 +34,32 @@ pub const STREAM_NAMESPACE: &str = "xveil";
 pub const STREAM_NAME: &str = "onion-stream";
 pub const STREAM_ENDPOINT_ID: u32 = 12;
 
-/// [`CellSender`] over `send_anonymous_authenticated` — the only veil-specific
-/// seam the generic mux needs.
+/// Gate for the PINNED STATEFUL-CIRCUIT stream path (Phase 1d). TEST-BUILD
+/// DEFAULT = ON (env vars can't be set on the mobile app, and on open-failure we
+/// fall back to the datagram path anyway). Set `VEIL_ONION_STREAM_CIRCUIT=0` to
+/// force the datagram path (e.g. on desktop). Both peers must agree (same build).
+/// FOR MERGE: flip the default back to opt-in.
+const CIRCUIT_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT";
+
+/// Whether to attempt the pinned-circuit backend (default ON; `=0` forces off).
+fn circuit_enabled() -> bool {
+    std::env::var(CIRCUIT_ENV).map(|v| v != "0").unwrap_or(true)
+}
+
+/// Smaller MSS for the circuit path so the onion-stream cell + the
+/// `[cookie 16][sender_node 32]` splice envelope fit one 384-B CircuitData cell.
+const CIRCUIT_MSS: usize = 256;
+
+/// Deterministic 16-byte stream cookie for a node — both ends derive the peer's
+/// the same way (domain-separated app-id, distinct from the chat endpoint).
+fn stream_cookie(node: &[u8; 32]) -> [u8; COOKIE_LEN] {
+    let id = veil_app::address::app_id(node, STREAM_NAMESPACE, "stream-cookie");
+    let mut c = [0u8; COOKIE_LEN];
+    c.copy_from_slice(&id[..COOKIE_LEN]);
+    c
+}
+
+/// [`CellSender`] over `send_anonymous_authenticated` — the default datagram path.
 struct AnonCells {
     sender: Arc<AppSender>,
 }
@@ -40,75 +73,110 @@ impl CellSender for AnonCells {
     }
 }
 
+/// [`CellSender`] over a PINNED stateful onion circuit to a rendezvous relay R.
+/// Each cell goes as `[target_cookie 16][my_node 32][stream cell]`: R strips the
+/// cookie and splices `[my_node][cell]` down the target's registered circuit; the
+/// target reads `my_node` to demux the peer (the splice strips the sender's
+/// identity, so it rides in-band — acceptable on the trusted test net).
+struct CircuitCells {
+    services: &'static veil_node_runtime::NodeServices,
+    circuit: veil_node_runtime::DataCircuit,
+    me: [u8; 32],
+}
+
+impl CellSender for CircuitCells {
+    async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
+        let cookie = stream_cookie(&dst.node);
+        let mut env = Vec::with_capacity(COOKIE_LEN + 32 + cell.len());
+        env.extend_from_slice(&cookie);
+        env.extend_from_slice(&self.me);
+        env.extend_from_slice(&cell);
+        self.services
+            .send_circuit_cell(&self.circuit, &env)
+            .map_err(|e| io::Error::other(format!("circuit stream send: {e:?}")))
+    }
+}
+
+/// One of the two [`CellSender`] backends (gated at hub build).
+enum HubCells {
+    Anon(AnonCells),
+    Circuit(CircuitCells),
+}
+
+impl CellSender for HubCells {
+    async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
+        match self {
+            HubCells::Anon(c) => c.send(dst, cell).await,
+            HubCells::Circuit(c) => c.send(dst, cell).await,
+        }
+    }
+}
+
+/// Inbound feed for the datagram path: authenticated anonymous datagrams on the
+/// stream endpoint → (Addr{src_node, derived_app}, cell).
+fn spawn_anon_feed(mut msg_rx: mpsc::Receiver<IncomingMessage>, in_tx: mpsc::Sender<(Addr, Vec<u8>)>) {
+    tokio::spawn(async move {
+        while let Some(msg) = msg_rx.recv().await {
+            // The authenticated anonymous transport delivers src_app_id = [0;32]
+            // (no sender app id) — DERIVE the peer's stream endpoint app from its
+            // node id (the deterministic `app_id(node, ns, name)` both ends bind).
+            let app = veil_app::address::app_id(&msg.src_node_id, STREAM_NAMESPACE, STREAM_NAME);
+            let addr = Addr { node: msg.src_node_id, app };
+            if in_tx.send((addr, msg.data)).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
 /// Node-wide multiplexer for anonymous streams (one per node, built lazily on
 /// the first open/accept). Keeps the stream endpoint bound for its lifetime.
 pub struct AnonStreamHub {
-    mux: Arc<StreamMux<AnonCells>>,
+    mux: Arc<StreamMux<HubCells>>,
     _sender: Arc<AppSender>,
 }
 
 impl AnonStreamHub {
     /// Build over a freshly-bound stream endpoint's `sender` + raw inbound
-    /// datagram channel `msg_rx` (from `AppReceiver::into_parts`). `me` = this
-    /// node id. MUST be called inside the tokio runtime (spawns the inbound
-    /// feed + the mux demux).
-    pub fn new(me: [u8; 32], sender: AppSender, mut msg_rx: mpsc::Receiver<IncomingMessage>) -> Self {
+    /// datagram channel `msg_rx`. `me` = this node id. MUST be called inside the
+    /// tokio runtime. Opts into the pinned-circuit backend when
+    /// `VEIL_ONION_STREAM_CIRCUIT` is set AND an embedded node is present AND a
+    /// rendezvous relay is resolvable; otherwise the datagram path (no regression).
+    pub fn new(me: [u8; 32], sender: AppSender, msg_rx: mpsc::Receiver<IncomingMessage>) -> Self {
         let sender = Arc::new(sender);
-        // Inbound feed: authenticated anonymous datagrams on the stream endpoint
-        // → (Addr{src_node, src_app}, cell). The src address is the peer's stream
-        // endpoint, which is exactly where the accept side sends its returns.
         let (in_tx, in_rx) = mpsc::channel(1024);
-        tokio::spawn(async move {
-            while let Some(msg) = msg_rx.recv().await {
-                // The authenticated anonymous transport delivers src_app_id =
-                // [0;32] (it carries no sender app id — service_tasks.rs). So
-                // DERIVE the peer's onion-stream endpoint app from its node id —
-                // it's the deterministic `app_id(node, ns, name)` both ends bind
-                // under. Using the zeroed src_app_id would address returns to an
-                // unbound endpoint ("no app bound to endpoint_id=12" → dropped).
-                let app = veil_app::address::app_id(
-                    &msg.src_node_id,
-                    STREAM_NAMESPACE,
-                    STREAM_NAME,
-                );
-                let addr = Addr { node: msg.src_node_id, app };
-                if in_tx.send((addr, msg.data)).await.is_err() {
-                    break;
-                }
+
+        // Try the pinned-circuit backend (default on) + embedded; else datagram.
+        let circuit_cells = if circuit_enabled() {
+            try_open_circuit(me, in_tx.clone())
+        } else {
+            None
+        };
+
+        let (cells, mss) = match circuit_cells {
+            Some(c) => (HubCells::Circuit(c), CIRCUIT_MSS),
+            None => {
+                // Datagram path (default / fallback): feed inbound from msg_rx.
+                spawn_anon_feed(msg_rx, in_tx);
+                (HubCells::Anon(AnonCells { sender: sender.clone() }), veil_onion_stream::MSS)
             }
-        });
-        let cells = Arc::new(AnonCells { sender: sender.clone() });
-        // The onion RTT is SECONDS and highly variable (relay queues), so the
-        // ms-scale defaults fire the RTO long before an ACK can return → every
-        // cell looks "lost" → cwnd collapses to 1 + the RTO backs off to its cap
-        // → a ~1-cell-per-30s crawl. Start the RTO conservative AND floor it so
-        // the Jacobson-Karels estimator can warm up from real samples (and so a
-        // latency spike can't mis-fire), and widen the window to keep enough in
-        // flight to fill the high-RTT pipe.
-        let mss = veil_onion_stream::MSS as u32;
+        };
+
+        // The onion RTT is SECONDS and highly variable; floor the RTO so it only
+        // fires on REAL loss, pace the sender, and cap the window below the path's
+        // standing-queue-drop onset (see the device-debug saga in memory).
         let cfg = Config {
-            // The onion RTT is several seconds; floor the RTO at 10 s so it only
-            // fires on REAL loss, never before an ACK can return (the SACK-aware
-            // retransmit + fast-retransmit handle actual loss faster than this).
+            mss,
             init_rto_ms: 12_000,
             min_rto_ms: 10_000,
             max_rto_ms: 60_000,
             handshake_rto_ms: 6_000,
             max_retransmits: 15,
-            // Window kept BELOW the path's standing-queue-drop threshold so a
-            // single circuit stays in the loss-free regime end-to-end. On-device
-            // the first ~1.5 MB streamed with zero loss (oo=0) until inflight
-            // filled a 768 KB window (~553 KB+) and built a standing queue at the
-            // relay → periodic drop → cwnd RTO-collapse → glacial 1-seg/RTT crawl
-            // on the multi-second RTT. ~384 KB stays under that onset; combined
-            // with pacing the relay queue never backs up, so there is nothing to
-            // drop and cwnd never collapses. (Per-circuit throughput is then ~the
-            // path rate; aggregate speed comes from running circuits in parallel.)
-            recv_window: 1024 * mss,
-            init_cwnd: 32 * mss,
+            recv_window: (1024 * mss) as u32,
+            init_cwnd: (32 * mss) as u32,
             ..Config::default()
         };
-        let mux = Arc::new(StreamMux::new(me, cells, in_rx, cfg));
+        let mux = Arc::new(StreamMux::new(me, Arc::new(cells), in_rx, cfg));
         AnonStreamHub { mux, _sender: sender }
     }
 
@@ -121,4 +189,33 @@ impl AnonStreamHub {
     pub async fn accept(&self) -> Option<(OnionStream, Addr)> {
         self.mux.accept().await
     }
+}
+
+/// Open the pinned stream circuit to an auto-agreed R, register this node's
+/// cookie, and spawn the inbound feed that turns `[sender_node 32][cell]` return
+/// cells into (Addr, cell). `None` (→ datagram fallback) if not embedded or no
+/// relay is resolvable yet.
+fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Option<CircuitCells> {
+    let services = veil_node_runtime::embedded_services()?;
+    let my_cookie = stream_cookie(&me);
+    let reg_kp = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+    let epoch = AtomicU64::new(0);
+    let (circuit, mut recv_rx) = services
+        .open_stream_circuit_auto(my_cookie, &reg_kp, &epoch)
+        .ok()?;
+    tokio::spawn(async move {
+        while let Some(framed) = recv_rx.recv().await {
+            if framed.len() < 32 {
+                continue;
+            }
+            let mut node = [0u8; 32];
+            node.copy_from_slice(&framed[..32]);
+            let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
+            let cell = framed[32..].to_vec();
+            if in_tx.send((Addr { node, app }, cell)).await.is_err() {
+                break;
+            }
+        }
+    });
+    Some(CircuitCells { services, circuit, me })
 }
