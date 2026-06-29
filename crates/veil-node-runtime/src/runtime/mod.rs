@@ -6546,6 +6546,56 @@ impl NodeServices {
         }
     }
 
+    /// Open a pinned stream circuit to a rendezvous relay R (`relay_path.last()`)
+    /// and REGISTER `cookie` at R, so the R-splice (`splice_stream_cell`) can
+    /// forward a peer's `[cookie][bytes]` cells down THIS circuit (Phase 1c++).
+    /// `reg_kp` signs the registration (first-wins anti-squat); `last_epoch` is the
+    /// per-cookie monotonic freshness counter. Returns the [`DataCircuit`] send
+    /// handle + the inbound return-cell channel. A bidirectional stream uses one
+    /// of these per endpoint; the CellDuplex sends `[peer_cookie][bytes]` forward
+    /// cells and reads returns off the channel. Mirrors `build_onion_circuit_once`'s
+    /// registration, but keeps the data-plane handle instead of just the ACK flag.
+    pub fn open_stream_circuit(
+        &self,
+        relay_path: &[[u8; 32]],
+        cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
+        reg_kp: &veil_crypto::GeneratedKeyPair,
+        last_epoch: &std::sync::atomic::AtomicU64,
+    ) -> std::result::Result<
+        (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
+        veil_types::AnonOnionSendError,
+    > {
+        use base64::Engine;
+        use veil_anonymity::circuit_register::CircuitRegisterPayload;
+        use veil_types::AnonOnionSendError;
+
+        let reg_pk: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(&reg_kp.public_key)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or(AnonOnionSendError::NoIdentity)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let epoch = next_monotonic_epoch(last_epoch, now);
+        let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
+        let sig = veil_crypto::sign_message(
+            veil_types::SignatureAlgorithm::Ed25519,
+            &reg_kp.public_key,
+            &reg_kp.private_key,
+            &msg,
+        )
+        .map_err(|_| AnonOnionSendError::NoIdentity)?;
+        let reg = CircuitRegisterPayload {
+            cookie,
+            reg_pk,
+            epoch,
+            signature: sig,
+        };
+        self.open_data_circuit(relay_path, &reg.encode())
+    }
+
     /// Send one FORWARD data cell over a pinned [`DataCircuit`]: `wrap_payload`
     /// (fixed 384 B) → XOR every hop layer → `CircuitData` to the first hop. No
     /// per-cell ECDH, no per-cell signature. `payload` ≤ `MAX_CIRCUIT_INNER`
