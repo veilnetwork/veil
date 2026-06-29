@@ -66,12 +66,15 @@ veil-crypto = { path = "../veil-crypto" }
 chacha20poly1305 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util"] }
 libc = "0.2"
+# `log` facade — all targets. Android routes it to logcat via android_logger
+# (below); desktop/iOS bridge it to stderr (see node.rs StderrLogBridge) so the
+# embedded node's `log` diagnostics (onion-stream relay-pick &c.) are visible.
+log = "0.4"
 
 # Android: route the embedded node's `log` output to logcat so the in-process
 # node is debuggable on-device (Rust stderr is NOT captured by logcat).
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.13"
-log = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
