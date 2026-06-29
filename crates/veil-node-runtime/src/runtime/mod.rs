@@ -6599,6 +6599,36 @@ impl NodeServices {
         self.open_data_circuit(relay_path, &reg.encode())
     }
 
+    /// Like [`Self::open_stream_circuit`] but PICKS the rendezvous relay R itself:
+    /// the relay-directory-resolvable routing-table contact with the smallest
+    /// node_id (DETERMINISTIC, so both endpoints on the same network agree on R
+    /// without a handshake — the onion-stream validation shortcut). 1-hop circuit
+    /// (R is first hop AND terminus): R sees the sender directly, acceptable on a
+    /// trusted test net; production uses a multi-hop path to a resolved rendezvous
+    /// ad. `None`-relays error if no resolvable relay is known yet.
+    pub fn open_stream_circuit_auto(
+        &self,
+        cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
+        reg_kp: &veil_crypto::GeneratedKeyPair,
+        last_epoch: &std::sync::atomic::AtomicU64,
+    ) -> std::result::Result<
+        (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
+        veil_types::AnonOnionSendError,
+    > {
+        use veil_anonymity::directory::relay_directory_dht_key;
+        use veil_types::AnonOnionSendError;
+        let mut relays: Vec<[u8; 32]> = self
+            .dht
+            .routing_table_contacts()
+            .into_iter()
+            .map(|c| c.node_id)
+            .filter(|nid| self.dht.get_local(&relay_directory_dht_key(nid)).is_some())
+            .collect();
+        relays.sort_unstable();
+        let r = *relays.first().ok_or(AnonOnionSendError::NoRelays)?;
+        self.open_stream_circuit(&[r], cookie, reg_kp, last_epoch)
+    }
+
     /// Send one FORWARD data cell over a pinned [`DataCircuit`]: `wrap_payload`
     /// (fixed 384 B) → XOR every hop layer → `CircuitData` to the first hop. No
     /// per-cell ECDH, no per-cell signature. `payload` ≤ `MAX_CIRCUIT_INNER`
