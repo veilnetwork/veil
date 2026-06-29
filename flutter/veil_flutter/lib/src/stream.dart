@@ -234,3 +234,116 @@ String _readErrAndFree(Pointer<Pointer<Utf8>> errOut) {
   errOut.value = nullptr;
   return msg;
 }
+
+/// Off-isolate FFI read for [VeilAnonStream] (mirrors [_ffiStreamReadOffIsolate]).
+Uint8List _ffiAnonStreamReadOffIsolate(int streamAddr, int maxBytes) {
+  final stream = Pointer<ffi.VeilAnonStreamFfi>.fromAddress(streamAddr);
+  final buf = calloc<Uint8>(maxBytes);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final n = ffi.veilAnonStreamRead(stream, buf, maxBytes, errOut);
+    if (n < 0) {
+      throw VeilException(
+        'anon stream read failed: ${_readErrAndFree(errOut)}',
+        code: n,
+      );
+    }
+    if (n == 0) return Uint8List(0);
+    return Uint8List.fromList(buf.asTypedList(n));
+  } finally {
+    calloc.free(buf);
+    calloc.free(errOut);
+  }
+}
+
+/// An ANONYMOUS reliable bidirectional byte-stream (onion-routed, congestion-
+/// controlled). Same surface as [VeilStream], but reaches NAT'd/anonymous peers
+/// the direct stream can't (it rides the rendezvous transport with app-layer
+/// ARQ + CC). Construct via [VeilClient.openAnonStream] / [acceptAnonStream].
+///
+/// `read` returns empty on clean EOF; a [VeilException] (negative code) means
+/// the stream was RESET (interrupted) — the app should resume, not treat it as
+/// a clean end.
+class VeilAnonStream {
+  VeilAnonStream._(this._stream);
+
+  final Pointer<ffi.VeilAnonStreamFfi> _stream;
+  bool _closed = false;
+
+  /// Queue [data] for reliable delivery (flow-controlled). Empty is a no-op.
+  Future<void> write(Uint8List data) async {
+    _ensureOpen();
+    if (data.length > ffi.veilMaxDataLen) {
+      throw ArgumentError(
+        'data length ${data.length} exceeds veilMaxDataLen (${ffi.veilMaxDataLen})',
+      );
+    }
+    return Future(() {
+      final dataPtr = data.isEmpty ? nullptr : calloc<Uint8>(data.length);
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        if (data.isNotEmpty) {
+          dataPtr.asTypedList(data.length).setAll(0, data);
+        }
+        final rc = ffi.veilAnonStreamWrite(_stream, dataPtr, data.length, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+            'anon stream write failed: ${_readErrAndFree(errOut)}',
+            code: rc,
+          );
+        }
+      } finally {
+        if (dataPtr != nullptr) calloc.free(dataPtr);
+        calloc.free(errOut);
+      }
+    });
+  }
+
+  /// Read up to [maxBytes]. Empty = clean EOF. Runs on a worker isolate (the
+  /// FFI read blocks until data arrives).
+  Future<Uint8List> read({int maxBytes = 65536}) async {
+    _ensureOpen();
+    if (maxBytes <= 0 || maxBytes > ffi.veilMaxDataLen) {
+      throw ArgumentError('maxBytes out of range: $maxBytes');
+    }
+    final addr = _stream.address;
+    return Isolate.run(() => _ffiAnonStreamReadOffIsolate(addr, maxBytes));
+  }
+
+  /// Half-close the send direction (a FIN follows the last queued byte); the
+  /// peer reads EOF.
+  Future<void> finish() async {
+    _ensureOpen();
+    return Future(() {
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        final rc = ffi.veilAnonStreamFinish(_stream, errOut);
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+            'anon stream finish failed: ${_readErrAndFree(errOut)}',
+            code: rc,
+          );
+        }
+      } finally {
+        calloc.free(errOut);
+      }
+    });
+  }
+
+  /// Close + release the handle (idempotent).
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    ffi.veilAnonStreamClose(_stream);
+  }
+
+  void _ensureOpen() {
+    if (_closed) {
+      throw VeilException('anon stream already closed', code: ffi.veilErrClosed);
+    }
+  }
+
+  /// Internal: wrap a raw FFI pointer from `veil_anon_stream_open/accept`.
+  static VeilAnonStream fromFfi(Pointer<ffi.VeilAnonStreamFfi> ptr) =>
+      VeilAnonStream._(ptr);
+}
