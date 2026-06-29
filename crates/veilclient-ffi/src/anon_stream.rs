@@ -161,6 +161,14 @@ impl AnonStreamHub {
                 (HubCells::Anon(AnonCells { sender: sender.clone() }), veil_onion_stream::MSS)
             }
         };
+        // Surface which backend engaged (desktop: stderr; phone: logcat).
+        let backend = match &cells {
+            HubCells::Circuit(_) => "onion-stream: PINNED CIRCUIT engaged",
+            HubCells::Anon(_) => "onion-stream: datagram path (circuit not engaged)",
+        };
+        eprintln!("{backend}");
+        #[cfg(target_os = "android")]
+        log::warn!("{}", backend);
 
         // The onion RTT is SECONDS and highly variable; floor the RTO so it only
         // fires on REAL loss, pace the sender, and cap the window below the path's
