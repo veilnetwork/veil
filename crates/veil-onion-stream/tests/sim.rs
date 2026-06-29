@@ -109,6 +109,9 @@ struct Outcome {
     completed: bool,
     /// Cells A (the sender) put on the wire, incl. retransmits.
     tx_cells: u64,
+    /// Largest number of cells A emitted at a single virtual-time instant — the
+    /// burst size pacing is meant to keep small.
+    max_burst_a: u64,
 }
 
 /// Drive a one-way transfer of `payload` from A→B over `ch` (both directions use
@@ -131,14 +134,17 @@ fn run_oneway(payload: &[u8], ch: Channel, seed: u64, cfg: Config) -> Outcome {
     let mut steps = 0u64;
     let cap = 20_000_000u64;
     let mut completed = false;
+    let mut max_burst_a = 0u64; // most cells A put on the wire at one instant
 
     while steps < cap {
         steps += 1;
         // 1. Drain both engines' transmits at `now`.
         let mut buf = Vec::new();
+        let before = a2b.injected;
         while a.poll_transmit(now, &mut buf) {
             a2b.inject(now, &buf, &mut rng);
         }
+        max_burst_a = max_burst_a.max(a2b.injected - before);
         while b.poll_transmit(now, &mut buf) {
             b2a.inject(now, &buf, &mut rng);
         }
@@ -209,6 +215,7 @@ fn run_oneway(payload: &[u8], ch: Channel, seed: u64, cfg: Config) -> Outcome {
         steps,
         completed,
         tx_cells: a2b.injected,
+        max_burst_a,
     }
 }
 
@@ -299,6 +306,38 @@ fn high_bdp_sack_does_not_storm() {
         out.tx_cells,
         payload_cells,
         out.tx_cells as f64 / payload_cells as f64
+    );
+}
+
+#[test]
+fn pacing_spreads_sends_no_burst() {
+    // On a clean high-RTT path slow-start grows cwnd large. WITHOUT pacing the
+    // sender dumps a whole cwnd of new segments the instant a cumulative ACK
+    // frees the window — exactly the burst that overran the onion relay queue
+    // on-device (slow-start overshoot → ~3000-cell loss → 1-cell/RTT stall).
+    // Pacing must cap the single-instant burst to a small constant (the initial
+    // unpaced window aside) while still letting cwnd grow.
+    let cfg = Config {
+        recv_window: 4096 * veil_onion_stream::MSS as u32,
+        ..Config::default()
+    };
+    let data = payload(600_000, 41);
+    let ch = Channel { loss: 0.0, dup: 0.0, base_delay: 500, jitter: 0 }; // ~1 s RTT
+    let out = run_oneway(&data, ch, 9, cfg);
+    assert!(out.completed, "clean transfer did not complete in {} steps", out.steps);
+    assert_eq!(out.received, data);
+    // Slow-start still grew cwnd well past the initial window...
+    assert!(
+        out.max_cwnd_a > cfg.init_cwnd * 4,
+        "cwnd did not grow under pacing: {}",
+        out.max_cwnd_a
+    );
+    // ...yet no single instant dumped more than a small burst (init_cwnd is
+    // 10·MSS; the steady state is ~1 segment per pacing tick).
+    assert!(
+        out.max_burst_a <= 48,
+        "sender burst too large ({} cells) — pacing is not spreading sends",
+        out.max_burst_a
     );
 }
 
