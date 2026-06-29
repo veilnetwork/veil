@@ -1939,6 +1939,68 @@ mod tests {
         }
     }
 
+    /// onion-stream Phase 1c: a return `CircuitData` on a circuit registered in
+    /// `stream_recv` is delivered to its BYTE-STREAM channel (not the introduce
+    /// path). Proves the recv-hook end of the stateful-circuit data plane.
+    #[tokio::test]
+    async fn circuit_return_routes_to_stream_recv() {
+        use veil_anonymity::circuit_data::{Direction, apply_layer, wrap_payload};
+        use veil_anonymity::circuit_origin::{OriginCircuit, OriginCircuitTable};
+        use veil_anonymity::circuit_wire::CircuitDataPayload;
+
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        d.circuit_origin = Some(std::sync::Arc::new(OriginCircuitTable::new()));
+
+        // A circuit THIS node originated, R the 1-hop terminus (placeholder key —
+        // we craft the exact return cell R would emit).
+        let r_id = [0x9C; 32];
+        let r_key = [0x44u8; 32];
+        let origin_cid = 4242u32;
+        d.circuit_origin
+            .as_ref()
+            .unwrap()
+            .insert(std::sync::Arc::new(OriginCircuit {
+                circuit_keys: vec![r_key],
+                first_hop: r_id,
+                origin_circuit_id: origin_cid,
+                created_unix: 0,
+                confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }));
+
+        // Register a byte-stream sink for this circuit (what open_data_circuit does).
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        d.stream_recv.lock().unwrap().insert(origin_cid, tx);
+
+        // R frames the stream bytes into a fixed cell + applies its return layer.
+        let stream_bytes = b"onion-stream cell payload".to_vec();
+        let seq = 1u32;
+        let mut buf = wrap_payload(&stream_bytes).unwrap();
+        apply_layer(&r_key, Direction::Return, seq, &mut buf);
+        let cell = CircuitDataPayload {
+            circuit_id: origin_cid,
+            seq,
+            ciphertext: buf,
+        };
+        let body = cell.encode().unwrap();
+        let mut hdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitData as u16,
+        );
+        hdr.body_len = body.len() as u32;
+        d.dispatch_relay_chain(&hdr, &body, NodeId::from(r_id));
+
+        // Delivered to the STREAM channel (opened across the circuit), NOT the
+        // introduce path.
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("stream cell not delivered in 500ms")
+            .expect("channel closed");
+        assert_eq!(
+            got, stream_bytes,
+            "stream_recv must receive the opened return-cell bytes"
+        );
+    }
+
     /// diff-audit Δ2-d: a `CircuitBuilt` ACK arriving from the first hop, tagged
     /// with our origin circuit id, marks that origin circuit CONFIRMED.
     #[test]
