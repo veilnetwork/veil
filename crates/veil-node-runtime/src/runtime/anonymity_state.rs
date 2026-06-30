@@ -328,6 +328,12 @@ pub struct AnonymityState {
     /// so neither can get pinned to a still-valid but no-longer-live local ad.
     pub rendezvous_resolve_cache: Arc<RendezvousResolveCache>,
 
+    /// Single-flight guard for cold relay-directory warming on stream circuit
+    /// open. A file download can start several parallel stream workers; without
+    /// coalescing, each worker probes the same relay-directory DHT keys at once
+    /// and legitimate traffic can trip recursive-query abuse limits.
+    pub stream_relay_directory_warm_lock: Arc<tokio::sync::Mutex<()>>,
+
     /// Per-node anonymity-relay failure ledger (Epic 482.3/482.4 Phase A).
     /// Records relays observed to misbehave — a chosen first hop with no live
     /// session (send-time), or a relayed delivery that exhausted retransmits
@@ -423,6 +429,7 @@ impl AnonymityState {
             x25519_sk,
             rendezvous_publisher_entries: Arc::new(Mutex::new(Vec::new())),
             rendezvous_resolve_cache: Arc::new(RendezvousResolveCache::new()),
+            stream_relay_directory_warm_lock: Arc::new(tokio::sync::Mutex::new(())),
             relay_reputation: Arc::new(RelayReputation::new()),
             reply_block_store: Arc::new(ReplyBlockStore::new()),
             auth_deliver_replay_cache: Arc::new(
