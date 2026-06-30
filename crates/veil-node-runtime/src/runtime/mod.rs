@@ -6646,6 +6646,54 @@ impl NodeServices {
         relays
     }
 
+    /// Operator-pinned rendezvous relays configured for this receiver.
+    ///
+    /// Stream receivers use this as a cold-start source before the node-level
+    /// rendezvous-recipient task has published its ordinary mailbox ad. The stream
+    /// path still builds an onion circuit to the relay and publishes its own
+    /// stream-cookie ad after confirmation.
+    pub fn pinned_rendezvous_relays(&self) -> Vec<[u8; 32]> {
+        self.anonymity.pinned_rendezvous_relays.clone()
+    }
+
+    /// Publish a plain rendezvous ad for a just-confirmed stream circuit.
+    ///
+    /// The stream backend uses a domain-separated `stream-cookie-v2`, distinct
+    /// from the mailbox receiver cookie. Therefore it cannot rely on the
+    /// node-level mailbox publisher entry: senders resolve the receiver's ad to
+    /// learn `R` and the receiver X25519 key, then address circuit cells to the
+    /// deterministic stream cookie.
+    pub fn publish_stream_rendezvous_ad(&self, relay: [u8; 32], cookie: [u8; 16]) {
+        service_tasks::rendezvous_register_publisher(
+            &self.anonymity,
+            &relay,
+            cookie,
+            service_tasks::RENDEZVOUS_AD_VALIDITY_SECS,
+            None,
+        );
+        let published = NodeRuntime::tick_publish_rendezvous_ads(
+            &self.anonymity.rendezvous_publisher_entries,
+            self.anonymity.x25519_sk.as_ref(),
+            self.identity.local_identity.as_ref(),
+            &self.dht,
+            &self.logger,
+            Some(&self.session_tx_registry),
+        );
+        if published > 0 {
+            self.logger.info(
+                "anonymity.stream_rendezvous_ad.published",
+                format!(
+                    "relay={} cookie={}",
+                    veil_util::hex_short(&relay),
+                    cookie
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                ),
+            );
+        }
+    }
+
     /// Decrypt a small onion-stream peer-introduction payload sealed to this
     /// node's advertised rendezvous X25519 key. Used by the pinned stream
     /// circuit to hide the sender node id from the rendezvous relay while still
