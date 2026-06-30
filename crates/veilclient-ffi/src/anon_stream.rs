@@ -153,6 +153,12 @@ const CIRCUIT_REFRESH_POLL: Duration = Duration::from_secs(5);
 const CIRCUIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_DATA_PACE_US_ENV: &str = "VEIL_ONION_STREAM_DATA_PACE_US";
 const CIRCUIT_DATA_PACE_US_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_DATA_PACE_US";
+const CIRCUIT_RECV_WINDOW_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_RECV_WINDOW";
+const CIRCUIT_MAX_PACING_BATCH_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_MAX_PACING_BATCH";
+const CIRCUIT_MAX_RETRANSMITS_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_MAX_RETRANSMITS";
+const CIRCUIT_INIT_RTO_MS_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_INIT_RTO_MS";
+const CIRCUIT_MIN_RTO_MS_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_MIN_RTO_MS";
+const CIRCUIT_MAX_RTO_MS_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_MAX_RTO_MS";
 const DEFAULT_DATA_PACE_US: u64 = 100;
 const MIN_DATA_PACE_US: u64 = 50;
 const MAX_DATA_PACE_US: u64 = 5_000;
@@ -368,6 +374,22 @@ fn stream_data_pace_interval() -> Duration {
         .unwrap_or(DEFAULT_DATA_PACE_US)
         .clamp(MIN_DATA_PACE_US, MAX_DATA_PACE_US);
     Duration::from_micros(micros)
+}
+
+fn env_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 impl CellSender for CircuitCells {
@@ -721,20 +743,61 @@ impl AnonStreamHub {
         // cwnd + slow-start still find the real ceiling if the relay can't sustain
         // it). The LOSSY datagram path keeps the small window — a big one there
         // re-arms the slow-start-overshoot relay-queue drop the saga fought.
+        let is_circuit = matches!(&cells, HubCells::Circuit(_));
         let recv_window = match &cells {
             // Bound standing data to a little over 3x the measured clean-path
             // BDP (~225 KiB at 1.5 MiB/s × 150 ms). The former 3–4 MiB window
             // let a fixed-rate pacer build a multi-megabyte relay queue before
             // end-to-end loss became visible, producing tens of thousands of
             // correlated drops and an RTO collapse.
-            HubCells::Circuit(_) => 896 * 1024,
+            HubCells::Circuit(_) => env_u32(
+                CIRCUIT_RECV_WINDOW_ENV,
+                896 * 1024,
+                (64 * 1024) as u32,
+                (8 * 1024 * 1024) as u32,
+            ),
             HubCells::Anon(_) => (1024 * mss) as u32,
         };
+        let init_rto_ms = if is_circuit {
+            env_u64(CIRCUIT_INIT_RTO_MS_ENV, 12_000, 1_000, 120_000)
+        } else {
+            12_000
+        };
+        let min_rto_ms = if is_circuit {
+            env_u64(CIRCUIT_MIN_RTO_MS_ENV, 10_000, 500, 120_000)
+        } else {
+            10_000
+        };
+        let max_rto_ms = if is_circuit {
+            env_u64(CIRCUIT_MAX_RTO_MS_ENV, 60_000, min_rto_ms, 300_000)
+        } else {
+            60_000
+        };
+        let max_retransmits = if is_circuit {
+            env_u32(CIRCUIT_MAX_RETRANSMITS_ENV, 2, 1, 30)
+        } else {
+            15
+        };
+        let max_pacing_batch = if is_circuit {
+            // 12 × 318 B/ms ≈ 3.8 MB/s stream-payload ceiling: comfortably
+            // above the old 1.5 MB/s target while still keeping bursts half
+            // the previous 24-cell aggressive profile.
+            env_u32(CIRCUIT_MAX_PACING_BATCH_ENV, 12, 1, 128)
+        } else {
+            4
+        };
+        if is_circuit {
+            diag(&format!(
+                "onion-stream: circuit cfg mss={mss} rwnd={recv_window} \
+                 batch={max_pacing_batch} rto={init_rto_ms}/{min_rto_ms}/{max_rto_ms}ms \
+                 max_retx={max_retransmits}",
+            ));
+        }
         let cfg = Config {
             mss,
-            init_rto_ms: 12_000,
-            min_rto_ms: 10_000,
-            max_rto_ms: 60_000,
+            init_rto_ms,
+            min_rto_ms,
+            max_rto_ms,
             handshake_rto_ms: 6_000,
             // On the pinned circuit path a no-ACK RTO usually means the
             // current stream/circuit went black-hole, not that a little more
@@ -742,27 +805,16 @@ impl AnonStreamHub {
             // resume on a fresh stream instead of waiting ~2 minutes for its
             // payload-write idle timeout. The datagram path keeps the conservative
             // retry budget.
-            max_retransmits: if matches!(&cells, HubCells::Circuit(_)) {
-                2
-            } else {
-                15
-            },
+            max_retransmits,
             recv_window,
             init_cwnd: (32 * mss) as u32,
-            max_pacing_batch: if matches!(&cells, HubCells::Circuit(_)) {
-                // 12 × 318 B/ms ≈ 3.8 MB/s stream-payload ceiling: comfortably
-                // above the old 1.5 MB/s target while still keeping bursts half
-                // the previous 24-cell aggressive profile.
-                12
-            } else {
-                4
-            },
-            rto_rewind_no_sack: matches!(&cells, HubCells::Circuit(_)),
+            max_pacing_batch,
+            rto_rewind_no_sack: is_circuit,
             // Every ACK consumes the same fixed-size circuit cell as DATA.
             // The pinned path is loss-free/in-order, so cumulative ACKs can be
             // thinned without delaying loss signalling: gaps and duplicates
             // still ACK immediately, and the timer bounds tail latency.
-            ack_every: if matches!(&cells, HubCells::Circuit(_)) {
+            ack_every: if is_circuit {
                 // A little more ACK traffic buys faster loss signalling and keeps
                 // SACK state fresh during relay-queue drops.
                 16
