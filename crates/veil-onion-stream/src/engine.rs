@@ -334,6 +334,9 @@ impl StreamEngine {
     pub fn inflight_bytes(&self) -> u32 {
         self.tx.snd_nxt.wrapping_sub(self.tx.snd_una)
     }
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
 
     /// Debug snapshot (for diagnostics / tests).
     pub fn debug_summary(&self) -> String {

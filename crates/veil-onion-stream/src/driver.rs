@@ -225,10 +225,25 @@ async fn drive<D: CellDuplex>(
 ) {
     let base = Instant::now();
     let now_ms = |b: &Instant| b.elapsed().as_millis() as u64;
+    let debug_summary_period_ms = std::env::var("VEIL_ONION_STREAM_DEBUG_SUMMARY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0);
+    let mut next_debug_summary_ms = debug_summary_period_ms.unwrap_or(0);
     let mut cmd_open = true;
     let mut cell = Vec::with_capacity(crate::wire::MAX_CELL);
     loop {
         let now = now_ms(&base);
+        if let Some(period_ms) = debug_summary_period_ms
+            && now >= next_debug_summary_ms
+        {
+            eprintln!(
+                "onion-stream-driver[{}]: {}",
+                engine.stream_id(),
+                engine.debug_summary()
+            );
+            next_debug_summary_ms = now.saturating_add(period_ms);
+        }
 
         // 0. Once the peer has finished AND we've handed off everything we
         //    received, close our own (often empty) write half so both ends
