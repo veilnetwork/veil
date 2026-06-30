@@ -50,16 +50,25 @@ pub const STREAM_NAMESPACE: &str = "xveil";
 pub const STREAM_NAME: &str = "onion-stream";
 pub const STREAM_ENDPOINT_ID: u32 = 12;
 
-/// Gate for the PINNED STATEFUL-CIRCUIT stream path (Phase 1d). TEST-BUILD
-/// DEFAULT = ON (env vars can't be set on the mobile app, and on open-failure we
-/// fall back to the datagram path anyway). Set `VEIL_ONION_STREAM_CIRCUIT=0` to
-/// force the datagram path (e.g. on desktop). Both peers must agree (same build).
-/// FOR MERGE: flip the default back to opt-in.
+/// Gate for the PINNED STATEFUL-CIRCUIT stream path (Phase 1d).
+///
+/// Production-safe default is OFF: the stable datagram path remains the default
+/// unless a test/dev build explicitly opts into the validation-grade pinned
+/// circuit with `VEIL_ONION_STREAM_CIRCUIT=1|true|yes|on`. Both peers must agree.
 const CIRCUIT_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT";
 
-/// Whether to attempt the pinned-circuit backend (default ON; `=0` forces off).
+/// Whether to attempt the pinned-circuit backend (default OFF; opt in via env).
 fn circuit_enabled() -> bool {
-    std::env::var(CIRCUIT_ENV).map(|v| v != "0").unwrap_or(true)
+    std::env::var(CIRCUIT_ENV)
+        .map(|v| circuit_env_value_enabled(&v))
+        .unwrap_or(false)
+}
+
+fn circuit_env_value_enabled(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Smaller MSS for the circuit path so the onion-stream cell + the
@@ -396,4 +405,22 @@ fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Optio
         me,
         circuit,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::circuit_env_value_enabled;
+
+    #[test]
+    fn circuit_env_is_strict_opt_in() {
+        for value in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(circuit_env_value_enabled(value), "{value:?} should opt in");
+        }
+        for value in ["", "0", "false", "no", "off", "anything-else"] {
+            assert!(
+                !circuit_env_value_enabled(value),
+                "{value:?} should leave circuit mode off"
+            );
+        }
+    }
 }

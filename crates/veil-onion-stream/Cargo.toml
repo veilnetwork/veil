@@ -8,9 +8,6 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 # Async driver only (the protocol core in engine.rs is sans-IO / dependency-free).
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
-# Lightweight logging facade for the driver's periodic state diagnostics; the
-# host routes it (android_logger → logcat on phone, tracing-log on desktop).
-log = "0.4"
 
 [dev-dependencies]
 # `test-util` enables paused/auto-advancing virtual time so async tests run the
