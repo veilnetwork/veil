@@ -126,11 +126,6 @@ struct TxState {
     /// instead of bursting it — a burst overruns the onion relay's bounded queue
     /// and triggers catastrophic multi-thousand-cell loss (slow-start overshoot).
     pace_next_ms: u64,
-    /// Pacing: NEW-data segments still permitted to leave in the current pace
-    /// tick. A fat window over a fast path implies far MORE than one segment per
-    /// millisecond; the budget releases that many per 1 ms tick instead of
-    /// capping at one (the old `.max(1)` floor pinned throughput at ~MSS/ms).
-    pace_budget: u32,
     fin_requested: bool,
     fin_sent: bool,
     fin_acked: bool,
@@ -210,7 +205,6 @@ impl StreamEngine {
                 rto_deadline: None,
                 consec_rto: 0,
                 pace_next_ms: 0,
-                pace_budget: 0,
                 fin_requested: false,
                 fin_sent: false,
                 fin_acked: false,
@@ -562,19 +556,13 @@ impl StreamEngine {
                 self.encode_seg_at(idx, out);
                 return true;
             }
-            // 3b. New data / FIN, congestion + flow limited + PACED. Each pace
-            //     tick refills a BUDGET of segments (≥1) sized to the window/RTT
-            //     rate, so a cwnd's worth trickles across an RTT without bursting
-            //     — but a fat pipe releases many segments per ms instead of being
-            //     pinned at one. A persist probe bypasses pacing; retransmits (3a)
-            //     are never paced.
-            if now >= self.tx.pace_next_ms {
-                let (interval, batch) = self.pace_params();
-                self.tx.pace_budget = batch;
-                self.tx.pace_next_ms = now + interval;
-            }
-            if (self.force_probe || self.tx.pace_budget > 0) && self.create_next_segment(now) {
-                self.tx.pace_budget = self.tx.pace_budget.saturating_sub(1);
+            // 3b. New data / FIN, congestion + flow limited + PACED. Emit at most
+            //     one new segment per pacing interval so a cwnd's worth of data
+            //     trickles out across an RTT instead of bursting (a burst overruns
+            //     the relay queue → slow-start-overshoot collapse). A persist probe
+            //     bypasses pacing. Retransmits (3a above) are never paced.
+            if (self.force_probe || now >= self.tx.pace_next_ms) && self.create_next_segment(now) {
+                self.tx.pace_next_ms = now + self.pace_interval_ms();
                 self.encode_seg_at(self.tx.segs.len() - 1, out);
                 return true;
             }
@@ -817,32 +805,30 @@ impl StreamEngine {
         t
     }
 
-    /// Pacing as `(tick_interval_ms, segments_per_tick)`: spread the EFFECTIVE
-    /// window (`min(cwnd, rwnd)`, ×2 in slow start so cwnd can still DOUBLE each
-    /// RTT) across one smoothed RTT. When that rate exceeds one segment per
-    /// millisecond — a fat window over a fast relay — release a PROPORTIONAL
-    /// BATCH per 1 ms tick instead of one. The previous single-segment `.max(1)`
-    /// interval floor pinned throughput at ~MSS/ms (≈256 KB/s at a 256 B circuit
-    /// MSS), far BELOW a 100 Mb/s relay's real capacity — which is exactly what
-    /// capped the device transfer at 134 KB/s with a 27 MB cwnd and ZERO loss.
-    /// Returns `(0, u32::MAX)` until the first RTT sample — the initial cwnd (a
-    /// few dozen cells) is small enough to burst safely, and pacing off a guessed
-    /// RTT would crawl. cwnd + slow-start still bound the rate, so a window spread
-    /// evenly across one RTT never bursts the relay queue.
-    fn pace_params(&self) -> (u64, u32) {
-        let Some(srtt) = self.tx.srtt else { return (0, u32::MAX) };
+    /// Per-segment pacing interval (ms): spread one `cwnd` of bytes across one
+    /// smoothed RTT so the send rate tracks the bottleneck without bursting.
+    /// Returns 0 until the first RTT sample — the initial cwnd (a few dozen
+    /// cells) is small enough to burst safely, and pacing it off a guessed RTT
+    /// would crawl. Floored at 1 ms once paced to bound driver wakeups (the
+    /// implied ~MSS/ms cap sits far above any onion path's real throughput).
+    fn pace_interval_ms(&self) -> u64 {
+        let Some(srtt) = self.tx.srtt else { return 0 };
+        let mss = self.cfg.mss as u64;
+        // Spread the EFFECTIVE window (min of cwnd and the peer's rwnd) across one
+        // RTT — never cwnd alone. When cwnd has run far past a smaller rwnd, pacing
+        // off cwnd would send much faster than the window can ever drain, rebuilding
+        // the very relay-queue backlog pacing exists to avoid.
         let win = self.tx.cwnd.min(self.tx.rwnd).max(self.cfg.mss as u32) as u64;
-        let gain: u64 = if self.tx.cwnd < self.tx.ssthresh { 2 } else { 1 };
-        // Desired rate = win·gain bytes per srtt ms = (win·gain)/(srtt·mss) segs/ms.
-        let num = win.saturating_mul(gain);
-        let den = (srtt as u64).max(1).saturating_mul(self.cfg.mss as u64);
-        if num >= den {
-            // ≥1 seg/ms → 1 ms tick, batch = ⌊rate⌋ segments. Cap to bound a
-            // single driver-loop's work; the send window still gates each segment.
-            (1, (num / den).clamp(1, 4096) as u32)
+        let base = mss.saturating_mul(srtt as u64) / win;
+        // In slow start (incl. post-loss re-ramp), pace 2x faster so cwnd can
+        // still DOUBLE each RTT. At 1x, pacing releases ~one segment per interval
+        // → cwnd grows only linearly (1 MSS/RTT) → recovery from a collapse is
+        // glacial on a multi-second onion RTT (the "stuck at 44 %" crawl). 2x is
+        // the standard slow-start pacing gain.
+        if self.tx.cwnd < self.tx.ssthresh {
+            (base / 2).max(1)
         } else {
-            // <1 seg/ms → one segment per ⌈den/num⌉ ms tick.
-            ((den / num).max(1), 1)
+            base.max(1)
         }
     }
 
