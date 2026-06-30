@@ -207,7 +207,7 @@ fn rendezvous_relay_published(dht: &Arc<veil_dht::KademliaService>, node_id: &[u
 
 /// Handshake-advertised peer capability flags (`node_id → cap bitset`), cloned
 /// from the dispatcher's `peer_cap_flags`.
-type PeerCapFlags = Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], u8>>>;
+pub(crate) type PeerCapFlags = Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], u8>>>;
 
 /// True iff `node_id` advertised the `ANONYMITY_RELAY` capability in its handshake
 /// (cached in `peer_cap_flags`). This is the RELIABLE relay signal for a
@@ -360,6 +360,7 @@ pub(crate) async fn warm_connected_relay_directory(
     dht: &Arc<veil_dht::KademliaService>,
     outbox: &Arc<dyn veil_dht::FrameRouter>,
     logger: &Arc<veil_observability::NodeLogger>,
+    cap_flags: Option<&PeerCapFlags>,
 ) -> usize {
     const MAX_WARM_PER_TICK: usize = 4;
     let connected: Vec<[u8; 32]> = {
@@ -371,6 +372,15 @@ pub(crate) async fn warm_connected_relay_directory(
     };
     let mut cached = 0usize;
     for peer in connected {
+        // Do not recursively probe every connected peer's relay-directory key.
+        // Ordinary transport relays / app endpoints do not publish anonymity
+        // relay-directory entries, so their key is a permanent miss; probing it
+        // on every stream-open looks like DHT abuse to relay nodes and can get a
+        // sender auto-banned mid-transfer. A fresh handshake capability bit is a
+        // cheaper and stronger filter than speculative DHT lookup.
+        if cap_flags.is_some_and(|flags| !peer_advertised_anonymity_relay(flags, &peer)) {
+            continue;
+        }
         if cached >= MAX_WARM_PER_TICK {
             break;
         }
@@ -566,7 +576,7 @@ pub(crate) async fn rendezvous_recipient_recheck(
     // Cold-start: actively pull + verify connected peers' relay-directory
     // entries into the local store so pick (get_local) can find one without
     // waiting on passive DHT replication.
-    warm_connected_relay_directory(live_sessions, dht, outbox, logger).await;
+    warm_connected_relay_directory(live_sessions, dht, outbox, logger, Some(cap_flags)).await;
     let candidates =
         pick_rendezvous_relays_deterministic(live_sessions, dht, cap_flags, pinned, local_node_id);
     let mut registered = Vec::with_capacity(candidates.len());
