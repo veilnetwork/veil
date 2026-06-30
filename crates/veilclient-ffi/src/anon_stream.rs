@@ -10,16 +10,19 @@
 //!   FRESH onion circuit + per-cell signature/verify. Reliable, but the per-cell
 //!   circuit build inflates the RTT and the varying paths cause reordering →
 //!   spurious recoveries → ~42 KB/s (device-measured).
-//! - PINNED CIRCUIT (`CircuitCells`, opt-in `VEIL_ONION_STREAM_CIRCUIT=1`): one
-//!   build-once stateful onion circuit to a rendezvous relay R; cheap XOR
+//! - PINNED CIRCUIT (`CircuitCells`, opt-in `VEIL_ONION_STREAM_CIRCUIT=1`): a
+//!   build-once inbound stateful circuit to this node's published rendezvous relay
+//!   plus lazy per-peer outbound circuits to each receiver's published R; cheap XOR
 //!   `CircuitData` cells, no per-cell ECDH/signature, in-order, stable RTT. R
-//!   splices each cell onto the peer's registered circuit. Validation-grade
-//!   shortcut (deterministic cookies + auto-agreed R + in-band sender id); needs
-//!   the embedded node (in-process `NodeServices`).
+//!   splices each cell onto the peer's registered circuit. Still carries validation
+//!   shortcuts (deterministic stream cookies + in-band sender id); needs the
+//!   embedded node (in-process `NodeServices`).
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use veil_anonymity::circuit_register::COOKIE_LEN;
@@ -50,31 +53,52 @@ pub const STREAM_NAMESPACE: &str = "xveil";
 pub const STREAM_NAME: &str = "onion-stream";
 pub const STREAM_ENDPOINT_ID: u32 = 12;
 
-/// Gate for the PINNED STATEFUL-CIRCUIT stream path (Phase 1d).
+/// Gate for the PINNED STATEFUL-CIRCUIT stream path.
 ///
 /// Production-safe default is OFF: the stable datagram path remains the default
-/// unless a test/dev build explicitly opts into the validation-grade pinned
-/// circuit with `VEIL_ONION_STREAM_CIRCUIT=1|true|yes|on`. Both peers must agree.
+/// unless a deployment explicitly opts into the pinned circuit. Values:
+///
+/// - `1|true|yes|on|published|prod|production`: resolve published rendezvous ads
+///   and build per-peer circuits to the receiver's R (normal path).
+/// - `validation|legacy|min-routing`: old test-net shortcut where both endpoints
+///   independently pick `min(routing)` as R.
+///
+/// Both peers must agree.
 const CIRCUIT_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT";
 
-/// Whether to attempt the pinned-circuit backend (default OFF; opt in via env).
-fn circuit_enabled() -> bool {
-    std::env::var(CIRCUIT_ENV)
-        .map(|v| circuit_env_value_enabled(&v))
-        .unwrap_or(false)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CircuitMode {
+    PublishedRendezvous,
+    ValidationMinRouting,
 }
 
-fn circuit_env_value_enabled(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+/// Whether/how to attempt the pinned-circuit backend (default OFF; opt in via env).
+fn circuit_mode() -> Option<CircuitMode> {
+    std::env::var(CIRCUIT_ENV)
+        .ok()
+        .and_then(|v| circuit_env_value_mode(&v))
+}
+
+fn circuit_env_value_mode(v: &str) -> Option<CircuitMode> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "published" | "prod" | "production" => {
+            Some(CircuitMode::PublishedRendezvous)
+        }
+        "validation" | "legacy" | "min-routing" | "min_routing" => {
+            Some(CircuitMode::ValidationMinRouting)
+        }
+        _ => None,
+    }
 }
 
 /// Smaller MSS for the circuit path so the onion-stream cell + the
 /// `[cookie 16][sender_node 32]` splice envelope fit one 384-B CircuitData cell.
 const CIRCUIT_MSS: usize =
     veil_onion_stream::wire::MAX_CELL - COOKIE_LEN - 32 - veil_onion_stream::wire::DATA_OVERHEAD; // 318 B payload, exactly fills 382-B inner
+const CIRCUIT_HOPS: usize = 2;
+const CIRCUIT_REFRESH_AFTER: Duration = Duration::from_secs(120);
+const CIRCUIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+const CIRCUIT_RETIRE_GRACE: Duration = Duration::from_secs(30);
 
 /// Deterministic 16-byte stream cookie for a node — both ends derive the peer's
 /// the same way (domain-separated app-id, distinct from the chat endpoint).
@@ -106,19 +130,32 @@ impl CellSender for AnonCells {
 /// Each cell goes as `[target_cookie 16][my_node 32][stream cell]`: R strips the
 /// cookie and splices `[my_node][cell]` down the target's registered circuit; the
 /// target reads `my_node` to demux the peer (the splice strips the sender's
-/// identity, so it rides in-band — acceptable on the trusted test net).
+/// identity, so it rides in-band — the next production-anonymity item removes
+/// this clear sender id).
 struct CircuitCells {
     services: veil_node_runtime::NodeServices,
     me: [u8; 32],
-    /// Filled by the background open task once the circuit to R is up. Sends
-    /// before then are dropped (the ARQ / handshake RTO retransmits).
-    circuit: Arc<tokio::sync::Mutex<Option<veil_node_runtime::DataCircuit>>>,
+    mode: CircuitMode,
+    reg_kp: Arc<veil_crypto::GeneratedKeyPair>,
+    epoch: Arc<AtomicU64>,
+    in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
+    /// Filled by the background open task once this node's receiving circuit is up.
+    /// Validation mode also uses this single circuit for outbound sends.
+    inbound_circuit: Arc<tokio::sync::Mutex<Option<Arc<veil_node_runtime::DataCircuit>>>>,
+    /// Published-ad mode opens one outbound circuit per receiver R. Each circuit
+    /// also registers our stream cookie at that R so ACKs can splice back.
+    outbound_circuits: Arc<tokio::sync::Mutex<HashMap<[u8; 32], CircuitEntry>>>,
+}
+
+#[derive(Clone)]
+struct CircuitEntry {
+    circuit: Arc<veil_node_runtime::DataCircuit>,
+    opened_at: Instant,
 }
 
 impl CellSender for CircuitCells {
     async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
-        let guard = self.circuit.lock().await;
-        let Some(circuit) = guard.as_ref() else {
+        let Some(circuit) = self.circuit_for(dst.node).await? else {
             // Circuit not up yet — drop this cell; the ARQ/handshake RTO resends.
             return Ok(());
         };
@@ -128,8 +165,62 @@ impl CellSender for CircuitCells {
         env.extend_from_slice(&self.me);
         env.extend_from_slice(&cell);
         self.services
-            .send_circuit_cell(circuit, &env)
+            .send_circuit_cell(&circuit, &env)
             .map_err(|e| io::Error::other(format!("circuit stream send: {e:?}")))
+    }
+}
+
+impl CircuitCells {
+    async fn circuit_for(
+        &self,
+        dst_node: [u8; 32],
+    ) -> io::Result<Option<Arc<veil_node_runtime::DataCircuit>>> {
+        match self.mode {
+            CircuitMode::ValidationMinRouting => Ok(self.inbound_circuit.lock().await.clone()),
+            CircuitMode::PublishedRendezvous => self.ensure_outbound_circuit(dst_node).await,
+        }
+    }
+
+    async fn ensure_outbound_circuit(
+        &self,
+        dst_node: [u8; 32],
+    ) -> io::Result<Option<Arc<veil_node_runtime::DataCircuit>>> {
+        let now = Instant::now();
+        if let Some(entry) = self.outbound_circuits.lock().await.get(&dst_node)
+            && now.duration_since(entry.opened_at) < CIRCUIT_REFRESH_AFTER
+        {
+            return Ok(Some(Arc::clone(&entry.circuit)));
+        }
+
+        let (candidate, recv_rx) = self
+            .services
+            .open_stream_circuit_to_receiver_ad(
+                dst_node,
+                stream_cookie(&self.me),
+                &self.reg_kp,
+                &self.epoch,
+                CIRCUIT_HOPS,
+            )
+            .await
+            .map_err(|e| io::Error::other(format!("circuit stream open to receiver ad: {e:?}")))?;
+
+        if !confirm_circuit(&candidate).await {
+            self.services
+                .close_data_circuit(candidate.origin_circuit_id());
+            return Ok(None);
+        }
+
+        spawn_circuit_feed(recv_rx, self.in_tx.clone());
+        let candidate = Arc::new(candidate);
+        let retired = self.outbound_circuits.lock().await.insert(
+            dst_node,
+            CircuitEntry {
+                circuit: Arc::clone(&candidate),
+                opened_at: Instant::now(),
+            },
+        );
+        retire_circuit_later(&self.services, retired.map(|r| r.circuit));
+        Ok(Some(candidate))
     }
 }
 
@@ -188,9 +279,9 @@ impl AnonStreamHub {
         let sender = Arc::new(sender);
         let (in_tx, in_rx) = mpsc::channel(1024);
 
-        // Try the pinned-circuit backend (default on) + embedded; else datagram.
-        let circuit_cells = if circuit_enabled() {
-            try_open_circuit(me, in_tx.clone())
+        // Try the pinned-circuit backend (explicit opt-in) + embedded; else datagram.
+        let circuit_cells = if let Some(mode) = circuit_mode() {
+            try_open_circuit(me, in_tx.clone(), mode)
         } else {
             None
         };
@@ -210,7 +301,14 @@ impl AnonStreamHub {
         };
         // Surface which backend engaged (desktop: stderr; phone: logcat).
         let backend = match &cells {
-            HubCells::Circuit(_) => "onion-stream: circuit mode — opening R in background",
+            HubCells::Circuit(c) => match c.mode {
+                CircuitMode::PublishedRendezvous => {
+                    "onion-stream: circuit mode — published rendezvous ads"
+                }
+                CircuitMode::ValidationMinRouting => {
+                    "onion-stream: circuit mode — validation min-routing"
+                }
+            },
             HubCells::Anon(_) => "onion-stream: datagram path (no embedded node)",
         };
         diag(backend);
@@ -280,16 +378,24 @@ impl AnonStreamHub {
     }
 }
 
-/// Open the pinned stream circuit to an auto-agreed R, register this node's
-/// cookie, and spawn the inbound feed that turns `[sender_node 32][cell]` return
-/// cells into (Addr, cell). `None` (→ datagram fallback) if not embedded or no
-/// relay is resolvable yet.
-fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Option<CircuitCells> {
+/// Open the pinned inbound stream circuit, register this node's cookie, and spawn
+/// the inbound feed that turns `[sender_node 32][cell]` return cells into
+/// (Addr, cell). Published mode uses this node's advertised rendezvous R;
+/// validation mode uses the old auto-agreed test-net R. `None` (→ datagram
+/// fallback) if not embedded.
+fn try_open_circuit(
+    me: [u8; 32],
+    in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
+    mode: CircuitMode,
+) -> Option<CircuitCells> {
     // Only available with an in-process embedded node; else datagram path.
     let services = veil_node_runtime::embedded_services()?;
     let cookie = stream_cookie(&me);
-    let circuit: Arc<tokio::sync::Mutex<Option<veil_node_runtime::DataCircuit>>> =
+    let inbound_circuit: Arc<tokio::sync::Mutex<Option<Arc<veil_node_runtime::DataCircuit>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
+    let outbound_circuits = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let reg_kp = Arc::new(services.onion_stream_registration_keypair());
+    let epoch = Arc::new(AtomicU64::new(0));
     // Open the circuit to R in the BACKGROUND (async relay-dir fetch + CircuitBuild
     // + ACK). Proactive (not lazy-on-send) so the RECEIVER is ready to take inbound
     // splices before it ever sends. Cells before it's up drop; the ARQ resends.
@@ -299,15 +405,12 @@ fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Optio
     // CellSender still existed, but R no longer had the forward lookup. Refresh at
     // 120 s, wait for CircuitBuilt before swapping, and leave the old return sink
     // alive briefly so in-flight cells from the previous path can drain.
-    let circuit_slot = Arc::clone(&circuit);
+    let circuit_slot = Arc::clone(&inbound_circuit);
     let services_bg = services.clone();
+    let reg_kp_bg = Arc::clone(&reg_kp);
+    let epoch_bg = Arc::clone(&epoch);
+    let in_tx_bg = in_tx.clone();
     tokio::spawn(async move {
-        const REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
-        const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        const RETIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-
-        let reg_kp = services_bg.onion_stream_registration_keypair();
-        let epoch = AtomicU64::new(0);
         // The proactive open fires at hub creation — which, on the RECEIVER, is the
         // accept loop starting right after node-arm, BEFORE any relay session is up
         // (observed on-device: connected=0 routing=3 -> NoRelays). warm only works
@@ -320,10 +423,25 @@ fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Optio
         let mut generation = 0u64;
         loop {
             attempt += 1;
-            let (candidate, mut recv_rx) = match services_bg
-                .open_stream_circuit_auto(cookie, &reg_kp, &epoch)
-                .await
-            {
+            let opened = match mode {
+                CircuitMode::PublishedRendezvous => {
+                    services_bg
+                        .open_stream_circuit_to_receiver_ad(
+                            me,
+                            cookie,
+                            &reg_kp_bg,
+                            &epoch_bg,
+                            CIRCUIT_HOPS,
+                        )
+                        .await
+                }
+                CircuitMode::ValidationMinRouting => {
+                    services_bg
+                        .open_stream_circuit_auto(cookie, &reg_kp_bg, &epoch_bg)
+                        .await
+                }
+            };
+            let (candidate, recv_rx) = match opened {
                 Ok(pair) => pair,
                 Err(e) => {
                     if attempt == 1 || attempt % 15 == 0 {
@@ -340,11 +458,7 @@ fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Optio
             // open_stream_circuit_auto is intentionally optimistic: it returns
             // once CircuitBuild is queued. Do not publish the handle until R has
             // accepted the cookie registration and CircuitBuilt came back.
-            let confirm_deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
-            while !candidate.is_confirmed() && tokio::time::Instant::now() < confirm_deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            if !candidate.is_confirmed() {
+            if !confirm_circuit(&candidate).await {
                 services_bg.close_data_circuit(candidate.origin_circuit_id());
                 if attempt == 1 || attempt % 15 == 0 {
                     diag(&format!(
@@ -359,66 +473,109 @@ fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Optio
             // Inbound feed: each return cell is `[sender_node 32][stream cell]`.
             // Start it before swapping so cells arriving immediately after the
             // confirmation are already consumed from the bounded return queue.
-            let feed_tx = in_tx.clone();
-            tokio::spawn(async move {
-                while let Some(framed) = recv_rx.recv().await {
-                    if framed.len() < 32 {
-                        continue;
-                    }
-                    let mut node = [0u8; 32];
-                    node.copy_from_slice(&framed[..32]);
-                    let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
-                    let cell = framed[32..].to_vec();
-                    if feed_tx.send((Addr { node, app }, cell)).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            spawn_circuit_feed(recv_rx, in_tx_bg.clone());
 
-            let retired = circuit_slot.lock().await.replace(candidate);
+            let retired = circuit_slot.lock().await.replace(Arc::new(candidate));
             generation += 1;
             backoff_ms = 1_500;
             if generation == 1 {
                 diag(&format!(
-                    "onion-stream: PINNED CIRCUIT opened (after {attempt} tries)"
+                    "onion-stream: PINNED CIRCUIT opened ({mode:?}, after {attempt} tries)"
                 ));
             } else {
                 diag(&format!(
-                    "onion-stream: PINNED CIRCUIT refreshed (generation {generation})"
+                    "onion-stream: PINNED CIRCUIT refreshed ({mode:?}, generation {generation})"
                 ));
             }
 
-            if let Some(old) = retired {
-                let old_id = old.origin_circuit_id();
-                let retire_services = services_bg.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(RETIRE_GRACE).await;
-                    retire_services.close_data_circuit(old_id);
-                });
-            }
+            retire_circuit_later(&services_bg, retired);
 
-            tokio::time::sleep(REFRESH_AFTER).await;
+            tokio::time::sleep(CIRCUIT_REFRESH_AFTER).await;
         }
     });
     Some(CircuitCells {
         services,
         me,
-        circuit,
+        mode,
+        reg_kp,
+        epoch,
+        in_tx,
+        inbound_circuit,
+        outbound_circuits,
     })
+}
+
+async fn confirm_circuit(circuit: &veil_node_runtime::DataCircuit) -> bool {
+    let confirm_deadline = tokio::time::Instant::now() + CIRCUIT_CONFIRM_TIMEOUT;
+    while !circuit.is_confirmed() && tokio::time::Instant::now() < confirm_deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    circuit.is_confirmed()
+}
+
+fn spawn_circuit_feed(mut recv_rx: mpsc::Receiver<Vec<u8>>, in_tx: mpsc::Sender<(Addr, Vec<u8>)>) {
+    tokio::spawn(async move {
+        while let Some(framed) = recv_rx.recv().await {
+            if framed.len() < 32 {
+                continue;
+            }
+            let mut node = [0u8; 32];
+            node.copy_from_slice(&framed[..32]);
+            let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
+            let cell = framed[32..].to_vec();
+            if in_tx.send((Addr { node, app }, cell)).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn retire_circuit_later(
+    services: &veil_node_runtime::NodeServices,
+    circuit: Option<Arc<veil_node_runtime::DataCircuit>>,
+) {
+    if let Some(old) = circuit {
+        let old_id = old.origin_circuit_id();
+        let retire_services = services.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CIRCUIT_RETIRE_GRACE).await;
+            retire_services.close_data_circuit(old_id);
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::circuit_env_value_enabled;
+    use super::{CircuitMode, circuit_env_value_mode};
 
     #[test]
     fn circuit_env_is_strict_opt_in() {
-        for value in ["1", "true", "TRUE", " yes ", "On"] {
-            assert!(circuit_env_value_enabled(value), "{value:?} should opt in");
+        for value in [
+            "1",
+            "true",
+            "TRUE",
+            " yes ",
+            "On",
+            "published",
+            "prod",
+            "production",
+        ] {
+            assert_eq!(
+                circuit_env_value_mode(value),
+                Some(CircuitMode::PublishedRendezvous),
+                "{value:?} should opt into published-rendezvous circuit mode"
+            );
+        }
+        for value in ["validation", "legacy", "min-routing", "min_routing"] {
+            assert_eq!(
+                circuit_env_value_mode(value),
+                Some(CircuitMode::ValidationMinRouting),
+                "{value:?} should opt into validation circuit mode"
+            );
         }
         for value in ["", "0", "false", "no", "off", "anything-else"] {
             assert!(
-                !circuit_env_value_enabled(value),
+                circuit_env_value_mode(value).is_none(),
                 "{value:?} should leave circuit mode off"
             );
         }
