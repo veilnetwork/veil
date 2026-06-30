@@ -6626,34 +6626,38 @@ impl NodeServices {
         self.open_data_circuit(relay_path, &reg.encode())
     }
 
-    /// Open a pinned stream circuit to the receiver's PUBLISHED rendezvous relay.
+    /// Relays advertised by this process's plain rendezvous publisher entries.
     ///
-    /// This is the production-safe stream counterpart of
-    /// [`Self::send_anonymous_authenticated_to`]: resolve the receiver's freshest
-    /// signed `RendezvousAd`, actively cache the chosen relay's directory entry,
-    /// warm connected relay directory entries for middle-hop selection, then build a
-    /// multi-hop stateful circuit ending at that published R. The caller-supplied
-    /// `cookie` is THIS origin's stream cookie; registering it at the receiver's R
-    /// lets return cells (ACKs / reverse stream data) splice back over this same
-    /// circuit.
-    pub async fn open_stream_circuit_to_receiver_ad(
+    /// The mobile/desktop app registers mailbox rendezvous publishers on several
+    /// relays. The onion-stream receive side must register its stream cookie at
+    /// those same relays; otherwise a sender that resolves any valid published ad
+    /// other than our one chosen stream relay black-holes at R.
+    pub fn local_published_rendezvous_relays(&self) -> Vec<[u8; 32]> {
+        let mut relays: Vec<[u8; 32]> = lock!(self.anonymity.rendezvous_publisher_entries)
+            .iter()
+            // Ephemeral onion-service ads are separate blinded-descriptor
+            // services; the plain identity ads are the peer-visible mailbox
+            // rendezvous slots that stream senders resolve by node id.
+            .filter(|e| e.ephemeral_ad_identity.is_none())
+            .map(|e| e.rendezvous_node_id)
+            .collect();
+        relays.sort_unstable();
+        relays.dedup();
+        relays
+    }
+
+    /// Resolve the receiver's currently valid published rendezvous relays in the
+    /// same deterministic order every caller sees: newest ads first, then relay
+    /// id. Returned relays are de-duplicated while preserving that order.
+    pub async fn resolve_stream_rendezvous_relays(
         &self,
         receiver_node_id: [u8; 32],
-        cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
-        reg_kp: &veil_crypto::GeneratedKeyPair,
-        last_epoch: &std::sync::atomic::AtomicU64,
-        hop_count: usize,
-    ) -> std::result::Result<
-        (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
-        veil_types::AnonOnionSendError,
-    > {
-        use veil_anonymity::directory::relay_directory_dht_key;
+    ) -> std::result::Result<Vec<[u8; 32]>, veil_types::AnonOnionSendError> {
         use veil_types::AnonOnionSendError;
 
         const AD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
-        const RELAY_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-        let mut ads = service_tasks::resolve_fresh_rendezvous_ads(
+        let ads = service_tasks::resolve_fresh_rendezvous_ads(
             &self.dht,
             &self.session_tx_registry,
             &self.dispatcher.pending_recursive,
@@ -6664,12 +6668,25 @@ impl NodeServices {
             AD_RESOLVE_TIMEOUT,
         )
         .await;
-        ads.sort_by(|a, b| b.valid_from_unix.cmp(&a.valid_from_unix));
-        let Some(ad) = ads.into_iter().next() else {
-            return Err(AnonOnionSendError::NoRendezvous);
-        };
 
-        let relay_key = relay_directory_dht_key(&ad.rendezvous_node_id);
+        let mut relays = Vec::new();
+        for ad in ads {
+            if !relays.contains(&ad.rendezvous_node_id) {
+                relays.push(ad.rendezvous_node_id);
+            }
+        }
+        if relays.is_empty() {
+            return Err(AnonOnionSendError::NoRendezvous);
+        }
+        Ok(relays)
+    }
+
+    async fn cache_stream_relay_directory(&self, relay: [u8; 32]) {
+        use veil_anonymity::directory::relay_directory_dht_key;
+
+        const RELAY_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let relay_key = relay_directory_dht_key(&relay);
         if self.dht.get_local(&relay_key).is_none()
             && let Some(bytes) = self
                 .dht_recursive_get(relay_key, RELAY_RESOLVE_TIMEOUT)
@@ -6677,6 +6694,25 @@ impl NodeServices {
         {
             self.dht.store_local(relay_key, bytes);
         }
+    }
+
+    /// Open a pinned stream circuit ending at an exact published rendezvous relay.
+    ///
+    /// Used by the receive side to register the same stream cookie at every live
+    /// published R, and by the send side after it has chosen one of the receiver's
+    /// fresh ads.
+    pub async fn open_stream_circuit_to_rendezvous_relay(
+        &self,
+        rendezvous_node_id: [u8; 32],
+        cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
+        reg_kp: &veil_crypto::GeneratedKeyPair,
+        last_epoch: &std::sync::atomic::AtomicU64,
+        hop_count: usize,
+    ) -> std::result::Result<
+        (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
+        veil_types::AnonOnionSendError,
+    > {
+        self.cache_stream_relay_directory(rendezvous_node_id).await;
 
         let outbox: Arc<dyn veil_dht::FrameRouter> =
             Arc::clone(&self.session_outbox) as Arc<dyn veil_dht::FrameRouter>;
@@ -6688,8 +6724,47 @@ impl NodeServices {
         )
         .await;
 
-        let relay_path = self.select_onion_relay_path_to(ad.rendezvous_node_id, hop_count)?;
+        let relay_path = self.select_onion_relay_path_to(rendezvous_node_id, hop_count)?;
         self.open_stream_circuit(&relay_path, cookie, reg_kp, last_epoch)
+    }
+
+    /// Open a pinned stream circuit to the receiver's PUBLISHED rendezvous relay.
+    ///
+    /// This is the production-safe stream counterpart of
+    /// [`Self::send_anonymous_authenticated_to`]: resolve the receiver's freshest
+    /// signed `RendezvousAd`s, then try their relays in deterministic freshness
+    /// order until one stateful circuit opens. The caller-supplied `cookie` is
+    /// THIS origin's stream cookie; registering it at the receiver's R lets return
+    /// cells (ACKs / reverse stream data) splice back over this same circuit.
+    pub async fn open_stream_circuit_to_receiver_ad(
+        &self,
+        receiver_node_id: [u8; 32],
+        cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
+        reg_kp: &veil_crypto::GeneratedKeyPair,
+        last_epoch: &std::sync::atomic::AtomicU64,
+        hop_count: usize,
+    ) -> std::result::Result<
+        (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
+        veil_types::AnonOnionSendError,
+    > {
+        use veil_types::AnonOnionSendError;
+
+        let relays = self
+            .resolve_stream_rendezvous_relays(receiver_node_id)
+            .await?;
+        let mut last_err = AnonOnionSendError::NoRelays;
+        for relay in relays {
+            match self
+                .open_stream_circuit_to_rendezvous_relay(
+                    relay, cookie, reg_kp, last_epoch, hop_count,
+                )
+                .await
+            {
+                Ok(opened) => return Ok(opened),
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
     }
 
     /// Like [`Self::open_stream_circuit`] but PICKS the rendezvous relay R itself:
