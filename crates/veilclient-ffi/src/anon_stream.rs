@@ -801,7 +801,14 @@ fn try_open_circuit(
     mode: CircuitMode,
 ) -> Option<CircuitCells> {
     // Only available with an in-process embedded node; else datagram path.
-    let services = veil_node_runtime::embedded_services()?;
+    //
+    // Prefer the services published by the SAME node id as this IPC handle.
+    // A single global services slot works for one embedded node, but two
+    // identities in one host process otherwise race: whichever node published
+    // last would drive every pinned circuit. The fallback keeps the old
+    // single-node behavior for hosts that have not published keyed services.
+    let services = veil_node_runtime::embedded_services_for(&me)
+        .or_else(veil_node_runtime::embedded_services)?;
     let cookie = stream_cookie(&me);
     let inbound_circuits: Arc<tokio::sync::Mutex<Vec<Arc<veil_node_runtime::DataCircuit>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
