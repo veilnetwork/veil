@@ -194,6 +194,19 @@ impl AnonStreamHub {
         // The onion RTT is SECONDS and highly variable; floor the RTO so it only
         // fires on REAL loss, pace the sender, and cap the window below the path's
         // standing-queue-drop onset (see the device-debug saga in memory).
+        //
+        // recv_window IS the throughput cap: pacing spreads `min(cwnd, rwnd)` over
+        // one RTT, so steady-state ≈ 2·rwnd/srtt. On the in-order, LOSS-FREE pinned
+        // circuit the window is the SOLE limiter — a 37 MB device transfer ran with
+        // cwnd→27 MB and ZERO retransmits, capped at 134 KB/s = 2·256 KB / 3.8 s.
+        // Widen it ~12× there to fill the multi-second-RTT pipe (targets ~1.5 MB/s;
+        // cwnd + slow-start still find the real ceiling if the relay can't sustain
+        // it). The LOSSY datagram path keeps the small window — a big one there
+        // re-arms the slow-start-overshoot relay-queue drop the saga fought.
+        let recv_window = match &cells {
+            HubCells::Circuit(_) => (12_288 * mss) as u32, // mss 256 → 3 MB
+            HubCells::Anon(_) => (1024 * mss) as u32,
+        };
         let cfg = Config {
             mss,
             init_rto_ms: 12_000,
@@ -201,7 +214,7 @@ impl AnonStreamHub {
             max_rto_ms: 60_000,
             handshake_rto_ms: 6_000,
             max_retransmits: 15,
-            recv_window: (1024 * mss) as u32,
+            recv_window,
             init_cwnd: (32 * mss) as u32,
             ..Config::default()
         };
