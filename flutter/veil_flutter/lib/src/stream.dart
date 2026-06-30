@@ -25,6 +25,7 @@
 // clean table-miss error rather than a use-after-free.
 
 import 'dart:async';
+import 'dart:collection';
 import 'dart:ffi';
 import 'dart:isolate';
 import 'dart:typed_data';
@@ -33,6 +34,73 @@ import 'package:ffi/ffi.dart';
 
 import 'bindings.dart' as ffi;
 import 'types.dart';
+
+const _anonStreamReadConcurrency = int.fromEnvironment(
+  'VEIL_ANON_STREAM_READ_CONCURRENCY',
+  defaultValue: 4,
+);
+const _anonStreamWriteConcurrency = int.fromEnvironment(
+  'VEIL_ANON_STREAM_WRITE_CONCURRENCY',
+  defaultValue: 1,
+);
+
+int _clampAnonStreamConcurrency(int value) {
+  if (value < 1) return 1;
+  if (value > 16) return 16;
+  return value;
+}
+
+final _anonStreamReadGate = _AsyncGate(
+  _clampAnonStreamConcurrency(_anonStreamReadConcurrency),
+);
+final _anonStreamWriteGate = _AsyncGate(
+  _clampAnonStreamConcurrency(_anonStreamWriteConcurrency),
+);
+
+/// Tiny FIFO async semaphore for native anonymous-stream calls.
+///
+/// `Isolate.run` protects the UI isolate from a blocking FFI call, but firing a
+/// new worker isolate for every concurrent range-stream chunk lets the Dart side
+/// pre-buffer multiple 256 KiB writes into independent onion-stream drivers. The
+/// Rust sender already paces DATA cells per destination; this gate keeps the FFI
+/// boundary from building a second, larger queue above that pacer. Reads have a
+/// separate gate so a slow write can never starve receive-window draining.
+class _AsyncGate {
+  _AsyncGate(this._capacity) : _available = _capacity;
+
+  final int _capacity;
+  int _available;
+  final _waiters = Queue<Completer<void>>();
+
+  Future<T> run<T>(Future<T> Function() op) async {
+    await _acquire();
+    try {
+      return await op();
+    } finally {
+      _release();
+    }
+  }
+
+  Future<void> _acquire() {
+    if (_available > 0) {
+      _available--;
+      return Future<void>.value();
+    }
+    final waiter = Completer<void>();
+    _waiters.addLast(waiter);
+    return waiter.future;
+  }
+
+  void _release() {
+    if (_waiters.isNotEmpty) {
+      _waiters.removeFirst().complete();
+      return;
+    }
+    if (_available < _capacity) {
+      _available++;
+    }
+  }
+}
 
 /// Top-level FFI stream read, run on a WORKER isolate via [Isolate.run]
 /// (diff-audit H3). Top-level (not a method) so the closure captures only the
@@ -323,7 +391,9 @@ class VeilAnonStream {
       );
     }
     final addr = _stream.address;
-    return Isolate.run(() => _ffiAnonStreamWriteOffIsolate(addr, data));
+    return _anonStreamWriteGate.run(
+      () => Isolate.run(() => _ffiAnonStreamWriteOffIsolate(addr, data)),
+    );
   }
 
   /// Read up to [maxBytes]. Empty = clean EOF. Runs on a worker isolate (the
@@ -334,7 +404,9 @@ class VeilAnonStream {
       throw ArgumentError('maxBytes out of range: $maxBytes');
     }
     final addr = _stream.address;
-    return Isolate.run(() => _ffiAnonStreamReadOffIsolate(addr, maxBytes));
+    return _anonStreamReadGate.run(
+      () => Isolate.run(() => _ffiAnonStreamReadOffIsolate(addr, maxBytes)),
+    );
   }
 
   /// Half-close the send direction (a FIN follows the last queued byte); the
@@ -342,7 +414,9 @@ class VeilAnonStream {
   Future<void> finish() async {
     _ensureOpen();
     final addr = _stream.address;
-    return Isolate.run(() => _ffiAnonStreamFinishOffIsolate(addr));
+    return _anonStreamWriteGate.run(
+      () => Isolate.run(() => _ffiAnonStreamFinishOffIsolate(addr)),
+    );
   }
 
   /// Close + release the handle (idempotent).
@@ -354,7 +428,8 @@ class VeilAnonStream {
 
   void _ensureOpen() {
     if (_closed) {
-      throw VeilException('anon stream already closed', code: ffi.veilErrClosed);
+      throw VeilException('anon stream already closed',
+          code: ffi.veilErrClosed);
     }
   }
 
