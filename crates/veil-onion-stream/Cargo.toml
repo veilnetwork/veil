@@ -7,6 +7,7 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 # Async driver only (the protocol core in engine.rs is sans-IO / dependency-free).
+log = "0.4"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 
 [dev-dependencies]

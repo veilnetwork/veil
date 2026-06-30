@@ -51,7 +51,14 @@ pub trait CellSender: Send + Sync + 'static {
 
 /// Per-stream inbound queue depth (cells). Bounded: a slow stream drops excess
 /// (ARQ recovers) rather than back-pressuring the shared demux.
-const STREAM_INBOX: usize = 256;
+///
+/// The pinned-circuit fast path can legitimately deliver a few hundred tiny
+/// stream cells in one scheduler burst (session-frame batching + relay splice).
+/// A 256-cell inbox turned those healthy bursts into artificial loss before the
+/// stream driver got scheduled, which then cascaded into coarse RTO recovery.
+/// 4096 cells is ~1.5 MiB of fixed-size circuit payload worst-case per active
+/// stream and matches the session outbox/PQ burst budget.
+const STREAM_INBOX: usize = 4096;
 /// Pending not-yet-accepted inbound streams.
 const ACCEPT_BACKLOG: usize = 64;
 
