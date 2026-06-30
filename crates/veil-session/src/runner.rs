@@ -2573,6 +2573,11 @@ pub fn apply_tx_cipher(
     Some(out_pooled.into_shared())
 }
 
+/// Exact wire length after [`apply_tx_cipher`] seals one plaintext OVL1 frame.
+fn encrypted_wire_len(frame_len: usize) -> Option<usize> {
+    frame_len.checked_add(veil_crypto::session_cipher::AEAD_OVERHEAD)
+}
+
 // ── TLS record size padding ──────────────────────────────────────
 
 /// Target wire sizes for coalesced (real + padding) writes. Chosen to match
@@ -2671,6 +2676,14 @@ pub fn pick_tls_bucket(wire_len: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Wire length after optional TLS-bucket padding, without advancing the cipher.
+fn padded_wire_len(real_wire_len: usize) -> usize {
+    if !padding_enabled() {
+        return real_wire_len;
+    }
+    pick_tls_bucket(real_wire_len).unwrap_or(real_wire_len)
 }
 
 /// Coalesce a real encrypted wire with a padding frame sized so the combined
@@ -3116,10 +3129,8 @@ impl SessionRunner {
                     {
                         let probe_age = now.duration_since(t);
                         if probe_age >= keepalive_probe_timeout {
-                            let spawned =
-                                self.fire_hot_standby_trigger("keepalive_probe_timeout");
-                            keepalive_swap_attempts =
-                                keepalive_swap_attempts.saturating_add(1);
+                            let spawned = self.fire_hot_standby_trigger("keepalive_probe_timeout");
+                            keepalive_swap_attempts = keepalive_swap_attempts.saturating_add(1);
                             let genuine_age = timers.genuine_rx_age(now);
                             if should_reeval_teardown(
                                 probe_age,
@@ -3190,7 +3201,8 @@ impl SessionRunner {
                 } else {
                     PQ_DRAIN_FRAMES_PER_PASS
                 };
-                let mut encrypted_batch = Vec::new();
+                let mut encrypted_batch_frames = Vec::new();
+                let mut encrypted_batch_wire_len = 0usize;
                 while !coalesce_active
                     && drained_this_pass < drain_cap
                     // Do not pop a frame unless the dedicated writer can accept
@@ -3203,14 +3215,15 @@ impl SessionRunner {
                     drained_this_pass += 1;
                     // Capture the plaintext frame before any encryption.
                     self.dispatcher.capture_outbound(self.peer_id, &outgoing);
-                    if let Some(cipher) = self.crypto.tx_cipher.as_mut() {
-                        // Encrypt now, preserving frame/cipher order, but defer
-                        // padding + writer admission until the group is complete.
-                        let enc = match apply_tx_cipher(&outgoing, cipher) {
-                            Some(enc) => enc,
-                            None => return, // cipher/header error — close session
+                    if self.crypto.tx_cipher.is_some() {
+                        let Some(next_len) = encrypted_wire_len(outgoing.len())
+                            .and_then(|n| encrypted_batch_wire_len.checked_add(n))
+                        else {
+                            self.on_primary_write_error(&mut write_error_count);
+                            return;
                         };
-                        encrypted_batch.extend_from_slice(&enc);
+                        encrypted_batch_wire_len = next_len;
+                        encrypted_batch_frames.push(outgoing.clone());
                     } else {
                         // No encryption: convert Arc-backed bytes to owned Vec
                         // for the wire channel. Padding is not applied
@@ -3233,33 +3246,46 @@ impl SessionRunner {
                         mlkem_rekey.record_bytes(tx_len);
                     }
                 }
-                if !encrypted_batch.is_empty() {
+                if !encrypted_batch_frames.is_empty() {
+                    // Check the operator bandwidth bucket BEFORE encrypting. A
+                    // dropped encrypted frame burns the implicit AEAD nonce and
+                    // permanently desynchronises the session.
+                    let planned_wire_len = padded_wire_len(encrypted_batch_wire_len);
+                    if !self.dispatcher.allow_outbound_bandwidth(planned_wire_len) {
+                        continue;
+                    }
                     let cipher = self
                         .crypto
                         .tx_cipher
                         .as_mut()
                         .expect("encrypted pass must retain its TX cipher");
+                    let mut encrypted_batch = Vec::with_capacity(encrypted_batch_wire_len);
+                    for frame in encrypted_batch_frames {
+                        let enc = match apply_tx_cipher(&frame, cipher) {
+                            Some(enc) => enc,
+                            None => return, // cipher/header error — close session
+                        };
+                        encrypted_batch.extend_from_slice(&enc);
+                    }
                     // One standard HTTPS-sized bucket for the concatenated real
                     // frames. The receiver already parses consecutive encrypted
                     // OVL1 frames, then silently consumes the final padding frame.
                     let wire = coalesce_with_padding(&encrypted_batch, Some(cipher));
-                    if self.dispatcher.allow_outbound_bandwidth(wire.len()) {
-                        let tx_len = wire.len() as u64;
-                        let wire_pool = veil_bufpool::pooled_shared_from_vec(wire);
-                        if Self::push_wire(&wire_tx, wire_pool, &self.metrics).is_err() {
-                            // Capacity was checked before popping/encrypting. A
-                            // failure now therefore means the writer closed (or
-                            // an invariant broke); encrypted frames cannot be
-                            // dropped without desynchronising the session cipher.
-                            self.on_primary_write_error(&mut write_error_count);
-                            return;
-                        }
-                        if let Some(m) = &self.metrics {
-                            m.add_transport_bytes_tx(tx_len);
-                        }
-                        rekey.record_bytes(tx_len);
-                        mlkem_rekey.record_bytes(tx_len);
+                    let tx_len = wire.len() as u64;
+                    let wire_pool = veil_bufpool::pooled_shared_from_vec(wire);
+                    if Self::push_wire(&wire_tx, wire_pool, &self.metrics).is_err() {
+                        // Capacity was checked before popping/encrypting. A
+                        // failure now therefore means the writer closed (or
+                        // an invariant broke); encrypted frames cannot be
+                        // dropped without desynchronising the session cipher.
+                        self.on_primary_write_error(&mut write_error_count);
+                        return;
                     }
+                    if let Some(m) = &self.metrics {
+                        m.add_transport_bytes_tx(tx_len);
+                    }
+                    rekey.record_bytes(tx_len);
+                    mlkem_rekey.record_bytes(tx_len);
                 }
                 // deferred : stamp the coalescer's last-drain time after a
                 // successful drain pass (any frames emitted). Doing it
@@ -3848,6 +3874,19 @@ impl SessionRunner {
                 if wire_tx.capacity() == 0 {
                     return false;
                 }
+                let planned_wire_len = if self.crypto.tx_cipher.is_some() {
+                    match encrypted_wire_len(resp_bytes.len()) {
+                        Some(n) => n,
+                        None => return true,
+                    }
+                } else {
+                    resp_bytes.len()
+                };
+                // Apply bandwidth limiting before encryption for the same nonce
+                // safety reason as the pq-drain path.
+                if !self.dispatcher.allow_outbound_bandwidth(planned_wire_len) {
+                    return false;
+                }
                 // Capture the plaintext response before any encryption.
                 self.dispatcher.capture_outbound(self.peer_id, &resp_bytes);
                 // Encrypt the response body if the session uses encryption.
@@ -3861,25 +3900,14 @@ impl SessionRunner {
                 };
 
                 let resp_len = wire_bytes.len() as u64;
-                // Outbound bandwidth enforcement — the same gate the pq-drain
-                // path applies (runner.rs ~3098). Dispatcher-generated responses
-                // previously bypassed the limiter entirely, so a request flood
-                // (e.g. RouteRequest → RouteResponse) could pull unlimited
-                // response bandwidth past the operator's configured cap. Over the
-                // cap we drop the response (don't count it as tx, don't advance
-                // rekey byte accounting) but keep the session open — dropping a
-                // reply is the limiter's intended behaviour, matching the drain
-                // path. (audit cycle-8 F12.)
-                if self.dispatcher.allow_outbound_bandwidth(wire_bytes.len()) {
-                    if let Some(m) = &self.metrics {
-                        m.add_transport_bytes_tx(resp_len);
-                    }
-                    rekey.record_bytes(resp_len);
-                    mlkem_rekey.record_bytes(resp_len);
-                    if Self::push_wire(wire_tx, wire_bytes, &self.metrics).is_err() {
-                        self.on_primary_write_error(write_error_count);
-                        return true;
-                    }
+                if let Some(m) = &self.metrics {
+                    m.add_transport_bytes_tx(resp_len);
+                }
+                rekey.record_bytes(resp_len);
+                mlkem_rekey.record_bytes(resp_len);
+                if Self::push_wire(wire_tx, wire_bytes, &self.metrics).is_err() {
+                    self.on_primary_write_error(write_error_count);
+                    return true;
                 }
             }
             DispatchResult::NoResponse => {}
@@ -4182,7 +4210,7 @@ mod reeval_teardown_tests {
             TIMEOUT, // probe_age stale
             TIMEOUT, 1, // swap_attempts < ceiling (2)
             CEILING, TIMEOUT, // genuine stale
-            true, // hot_standby_ok
+            true,    // hot_standby_ok
         ));
     }
 
@@ -4206,11 +4234,8 @@ mod reeval_teardown_tests {
     #[test]
     fn multi_transport_learned_alt_uri_reaps_at_ceiling() {
         assert!(should_reeval_teardown(
-            TIMEOUT,
-            TIMEOUT,
-            CEILING, // == ceiling
-            CEILING,
-            TIMEOUT, // genuine stale
+            TIMEOUT, TIMEOUT, CEILING, // == ceiling
+            CEILING, TIMEOUT, // genuine stale
             true,    // hot_standby_ok STAYS true — ceiling overrides
         ));
     }
