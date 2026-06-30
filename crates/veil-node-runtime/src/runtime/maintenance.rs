@@ -747,8 +747,8 @@ impl NodeRuntime {
         // ticks) get their new entries published next tick — acceptable
         // since the maintenance period is short.
         use veil_anonymity::rendezvous::{
-            MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, rendezvous_ad_dht_key_at,
-            is_currently_valid, rendezvous_ad_needs_refresh, sign_rendezvous_ad_v5,
+            MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
+            rendezvous_ad_dht_key_at, rendezvous_ad_needs_refresh, sign_rendezvous_ad_v5,
             verify_rendezvous_ad,
         };
         let snapshot = lock!(entries).clone();
@@ -1356,7 +1356,8 @@ mod tests {
             ephemeral_ad_identity: None,
         }]));
 
-        let n = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let n =
+            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(n, 1, "tick must publish exactly one ad");
 
         let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
@@ -1421,14 +1422,16 @@ mod tests {
         }]));
 
         // First tick — publishes.
-        let n1 = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let n1 =
+            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(n1, 1);
         let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
         let bytes_after_first = dht.get_local(&key).expect("ad in DHT").to_vec();
 
         // Second tick without passage of time — ad is still very fresh
         // tick must skip and leave bytes byte-equal.
-        let n2 = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let n2 =
+            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(n2, 0, "still-fresh ad must NOT trigger republish");
         let bytes_after_second = dht.get_local(&key).expect("ad still in DHT").to_vec();
         assert_eq!(
@@ -1464,17 +1467,15 @@ mod tests {
             ephemeral_ad_identity: None,
         }]));
 
-        let first = NodeRuntime::tick_publish_rendezvous_ads(
-            &entries, &sk, &identity, &dht, &logger, None,
-        );
+        let first =
+            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(first, 1);
 
         // Fail over immediately, long before the old 10-minute ad reaches its
         // five-minute half-life.
         lock!(entries)[0].rendezvous_node_id = new_relay;
-        let second = NodeRuntime::tick_publish_rendezvous_ads(
-            &entries, &sk, &identity, &dht, &logger, None,
-        );
+        let second =
+            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(second, 1, "route change must force immediate republish");
 
         let key = rendezvous_ad_dht_key(identity.node_id.as_bytes());
@@ -1522,7 +1523,8 @@ mod tests {
             ephemeral_ad_identity: Some(eph),
         }]));
 
-        let n = NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
+        let n =
+            NodeRuntime::tick_publish_rendezvous_ads(&entries, &sk, &identity, &dht, &logger, None);
         assert_eq!(n, 1);
 
         // The ad is NOT at the sovereign node_id's key (no identity leak)...

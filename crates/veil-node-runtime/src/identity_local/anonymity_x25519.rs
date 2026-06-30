@@ -282,7 +282,10 @@ mod tests {
         // Deriving in a SECOND fresh dir from the SAME seed yields the SAME key
         // (the cross-session stability that fixes the stale-ad black-hole). A
         // derive run must NOT write a key file (no on-disk artifact).
-        assert!(!key_path(tmp.path()).exists(), "derive must not persist a key file");
+        assert!(
+            !key_path(tmp.path()).exists(),
+            "derive must not persist a key file"
+        );
         let tmp2 = tempfile::tempdir().unwrap();
         veil_identity::sovereign_flow::save_identity_sk(tmp2.path(), &seed).unwrap();
         let (sk2, _) = load_or_derive(tmp2.path(), true).unwrap();
@@ -300,6 +303,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (_sk, src) = load_or_derive(tmp.path(), false).unwrap();
         assert_eq!(src, AnonymityKeySource::FallbackRandom);
-        assert!(key_path(tmp.path()).exists(), "fallback must persist the random key");
+        assert!(
+            key_path(tmp.path()).exists(),
+            "fallback must persist the random key"
+        );
     }
 }

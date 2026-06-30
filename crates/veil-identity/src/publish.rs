@@ -71,9 +71,9 @@ use veil_proto::instance_registry::{
 };
 use veil_proto::mlkem_cert::MlKemKeyCert;
 use veil_proto::name_claim_v2::{NAME_CLAIM_SIG_CONTEXT, NameClaim, required_difficulty};
-use veil_proto::relay_key::{RELAY_KEM_ALGO_X25519, RelayKeyRecord};
 use veil_proto::pairing_invite::PairingInvite;
 use veil_proto::prekey_bundle::ALGO_ML_KEM_768;
+use veil_proto::relay_key::{RELAY_KEM_ALGO_X25519, RelayKeyRecord};
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 

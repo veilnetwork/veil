@@ -110,7 +110,13 @@ impl<S: CellSender> StreamMux<S> {
     ) -> Self {
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_BACKLOG);
-        tokio::spawn(demux(sender.clone(), inbound, routes.clone(), accept_tx, cfg));
+        tokio::spawn(demux(
+            sender.clone(),
+            inbound,
+            routes.clone(),
+            accept_tx,
+            cfg,
+        ));
         StreamMux {
             me,
             sender,
@@ -212,7 +218,10 @@ mod tests {
     type Inbound = mpsc::Receiver<(Addr, Vec<u8>)>;
 
     fn addr(b: u8) -> Addr {
-        Addr { node: [b; 32], app: [b ^ 0xA5; 32] }
+        Addr {
+            node: [b; 32],
+            app: [b ^ 0xA5; 32],
+        }
     }
 
     /// Routes (dst, cell) from `me` to dst's inbound channel as `(me, cell)`,
@@ -272,8 +281,18 @@ mod tests {
     async fn run(loss: u32, n: usize) {
         let (a, b) = (addr(1), addr(2));
         let (bus, a_rx, b_rx) = wire_bus(a, b, loss);
-        let sa = Arc::new(BusSender { me: a, bus: bus.clone(), loss, ctr: AtomicU32::new(0) });
-        let sb = Arc::new(BusSender { me: b, bus: bus.clone(), loss, ctr: AtomicU32::new(7) });
+        let sa = Arc::new(BusSender {
+            me: a,
+            bus: bus.clone(),
+            loss,
+            ctr: AtomicU32::new(0),
+        });
+        let sb = Arc::new(BusSender {
+            me: b,
+            bus: bus.clone(),
+            loss,
+            ctr: AtomicU32::new(7),
+        });
         let cfg = Config::default();
         let mux_a = StreamMux::new(a.node, sa, a_rx, cfg);
         let mux_b = StreamMux::new(b.node, sb, b_rx, cfg);
@@ -308,8 +327,18 @@ mod tests {
     async fn mux_two_streams_dont_cross() {
         let (a, b) = (addr(1), addr(2));
         let (bus, a_rx, b_rx) = wire_bus(a, b, 0);
-        let sa = Arc::new(BusSender { me: a, bus: bus.clone(), loss: 0, ctr: AtomicU32::new(0) });
-        let sb = Arc::new(BusSender { me: b, bus: bus.clone(), loss: 0, ctr: AtomicU32::new(9) });
+        let sa = Arc::new(BusSender {
+            me: a,
+            bus: bus.clone(),
+            loss: 0,
+            ctr: AtomicU32::new(0),
+        });
+        let sb = Arc::new(BusSender {
+            me: b,
+            bus: bus.clone(),
+            loss: 0,
+            ctr: AtomicU32::new(9),
+        });
         let cfg = Config::default();
         let mux_a = StreamMux::new(a.node, sa, a_rx, cfg);
         let mux_b = StreamMux::new(b.node, sb, b_rx, cfg);

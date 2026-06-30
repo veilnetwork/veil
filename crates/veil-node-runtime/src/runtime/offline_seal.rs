@@ -100,7 +100,10 @@ impl RuntimeMailboxCrypto {
         endpoint_id: u32,
         data: &[u8],
     ) -> Result<Vec<u8>, OfflineSealError> {
-        let sovereign = self.sovereign.as_ref().ok_or(OfflineSealError::NoIdentity)?;
+        let sovereign = self
+            .sovereign
+            .as_ref()
+            .ok_or(OfflineSealError::NoIdentity)?;
         let now = now_unix();
         let nonce = rand_core::OsRng.next_u64();
         let auth = sovereign.sign_auth_deliver(
@@ -137,7 +140,10 @@ impl RuntimeMailboxCrypto {
         blob: &[u8],
         our_cert_version: u64,
     ) -> Result<AuthAppDeliver, OfflineSealError> {
-        let sovereign = self.sovereign.as_ref().ok_or(OfflineSealError::NoIdentity)?;
+        let sovereign = self
+            .sovereign
+            .as_ref()
+            .ok_or(OfflineSealError::NoIdentity)?;
         let our_instance = sovereign.active_instance_id();
         let now = now_unix();
         // Recover the sender from the blob's sidecar (the anonymous mailbox
@@ -167,9 +173,7 @@ impl RuntimeMailboxCrypto {
             self.mlkem_dk_seed.as_array(),
             our_cert_version,
         )
-        .filter(|doc| {
-            doc.node_id == sender_node_id && verify_identity_document(doc, now).is_ok()
-        });
+        .filter(|doc| doc.node_id == sender_node_id && verify_identity_document(doc, now).is_ok());
         let sender_doc = match embedded {
             Some(doc) => doc,
             None => self
@@ -211,7 +215,10 @@ impl veil_ipc::MailboxCryptoSink for RuntimeMailboxCrypto {
     ) -> Pin<Box<dyn Future<Output = veil_ipc::MailboxSealOutcome> + Send + 'a>> {
         Box::pin(async move {
             use veil_ipc::MailboxSealOutcome as O;
-            match self.seal(recipient_node_id, app_id, endpoint_id, &data).await {
+            match self
+                .seal(recipient_node_id, app_id, endpoint_id, &data)
+                .await
+            {
                 Ok(blob) => O::Ok(blob),
                 Err(OfflineSealError::NoIdentity) => O::NoIdentity,
                 Err(OfflineSealError::RecipientCertUnresolved) => O::PeerUnresolved,

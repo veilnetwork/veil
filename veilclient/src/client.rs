@@ -1832,7 +1832,9 @@ impl VeilClient {
         };
         match reply.status {
             veilcore::proto::MailboxCryptoStatus::Ok => Ok(reply.blob),
-            other => Err(ClientError::Protocol(format!("mailbox_seal failed: {other:?}"))),
+            other => Err(ClientError::Protocol(format!(
+                "mailbox_seal failed: {other:?}"
+            ))),
         }
     }
 
@@ -1868,10 +1870,15 @@ impl VeilClient {
             .await?;
         let reply = await_rpc_reply(rx, "mailbox_open reply").await?;
         match reply.status {
-            veilcore::proto::MailboxCryptoStatus::Ok => {
-                Ok((reply.sender_node_id, reply.app_id, reply.endpoint_id, reply.data))
-            }
-            other => Err(ClientError::Protocol(format!("mailbox_open failed: {other:?}"))),
+            veilcore::proto::MailboxCryptoStatus::Ok => Ok((
+                reply.sender_node_id,
+                reply.app_id,
+                reply.endpoint_id,
+                reply.data,
+            )),
+            other => Err(ClientError::Protocol(format!(
+                "mailbox_open failed: {other:?}"
+            ))),
         }
     }
 
@@ -2636,8 +2643,7 @@ async fn reader_task(
             LocalAppMsg::SendAuthenticatedDirectWithReplyResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) =
-                    pop_next_open(&mut d.pending_send_authenticated_direct_with_reply)
+                if let Some(tx) = pop_next_open(&mut d.pending_send_authenticated_direct_with_reply)
                 {
                     let _ = tx.send(status);
                 }

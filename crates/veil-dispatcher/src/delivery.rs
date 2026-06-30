@@ -1435,8 +1435,10 @@ impl FrameDispatcher {
             AddChunkResult::Rejected(reason) => {
                 // LIMIT-prefixed so any quota/limit drop is greppable in debug
                 // (per-sender / global reassembly quotas, metadata mismatch, …).
-                self.logger
-                    .warn("chunk.rejected", &format!("LIMIT chunk_reassembly: {reason}"));
+                self.logger.warn(
+                    "chunk.rejected",
+                    &format!("LIMIT chunk_reassembly: {reason}"),
+                );
             }
         }
     }

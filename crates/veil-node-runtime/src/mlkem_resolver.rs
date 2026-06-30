@@ -213,10 +213,7 @@ impl DhtMlKemEkResolver {
     /// mailbox-seal path can obtain a cert (fan-out binds instance_id +
     /// cert_version, which the EK-only [`resolve_ek`](MlKemEkResolver::resolve_ek)
     /// surface discards).
-    pub async fn fetch_verified_cert(
-        &self,
-        target_node_id: [u8; 32],
-    ) -> Option<VerifiedMlkemCert> {
+    pub async fn fetch_verified_cert(&self, target_node_id: [u8; 32]) -> Option<VerifiedMlkemCert> {
         self.log_dbg("mlkem_resolver.start", &target_node_id, "");
         // ── Step 0: verified-cert fast path ─────────────────────────
         // A recently-verified cert for this recipient short-circuits the
@@ -344,14 +341,14 @@ impl DhtMlKemEkResolver {
         {
             let mut cc = wlock!(self.cert_cache);
             if cc.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
-                && let Some(oldest) = cc
-                    .iter()
-                    .min_by_key(|(_, (_, ts))| *ts)
-                    .map(|(id, _)| *id)
+                && let Some(oldest) = cc.iter().min_by_key(|(_, (_, ts))| *ts).map(|(id, _)| *id)
             {
                 cc.remove(&oldest);
             }
-            cc.insert(target_node_id, (verified.clone(), std::time::Instant::now()));
+            cc.insert(
+                target_node_id,
+                (verified.clone(), std::time::Instant::now()),
+            );
         }
         self.logger.debug(
             "mlkem_resolver.resolved",

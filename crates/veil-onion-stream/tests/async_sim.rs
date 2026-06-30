@@ -50,8 +50,18 @@ fn duplex_pair(loss: f64, seed: u64) -> (MemDuplex, MemDuplex) {
     let (a_tx, b_rx) = mpsc::channel(4096);
     let (b_tx, a_rx) = mpsc::channel(4096);
     (
-        MemDuplex { tx: a_tx, rx: a_rx, loss, rng: Rng(seed) },
-        MemDuplex { tx: b_tx, rx: b_rx, loss, rng: Rng(seed ^ 0xDEAD_BEEF) },
+        MemDuplex {
+            tx: a_tx,
+            rx: a_rx,
+            loss,
+            rng: Rng(seed),
+        },
+        MemDuplex {
+            tx: b_tx,
+            rx: b_rx,
+            loss,
+            rng: Rng(seed ^ 0xDEAD_BEEF),
+        },
     )
 }
 
@@ -125,7 +135,9 @@ async fn async_reset_surfaces_as_read_error_not_eof() {
     assert!(n > 0);
 
     // Abort mid-stream — the receiver must see an error, NOT a clean EOF.
-    sender.reset(veil_onion_stream::wire::reset_reason::APP).await;
+    sender
+        .reset(veil_onion_stream::wire::reset_reason::APP)
+        .await;
     let err = read_to_end(&mut receiver).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
 }
