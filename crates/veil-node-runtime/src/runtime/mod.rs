@@ -6347,6 +6347,31 @@ impl DataCircuit {
 }
 
 impl NodeServices {
+    /// Derive the onion-stream circuit-registration key from this node's stable
+    /// identity secret. The rendezvous registry is first-registration-wins for
+    /// a cookie, so generating this key randomly in each stream hub made a hub
+    /// recreation look like a cookie hijack and R rejected every new circuit
+    /// until the old 600-second subscription expired.
+    ///
+    /// Use a domain-separated one-way derivation instead of the identity key
+    /// itself: the relay sees only this registration public key, not the node's
+    /// published handshake public key. A stable stream cookie requires an
+    /// equally stable anti-squat key across runtime and process restarts.
+    pub fn onion_stream_registration_keypair(&self) -> veil_crypto::GeneratedKeyPair {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let seed = blake3::derive_key(
+            "veil/onion-stream-registration/ed25519/v1",
+            self.identity.local_identity.private_key.as_bytes(),
+        );
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        veil_crypto::GeneratedKeyPair {
+            algo: veil_types::SignatureAlgorithm::Ed25519,
+            public_key: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+            private_key: STANDARD.encode(signing_key.to_bytes()),
+        }
+    }
+
     /// Register a LOCATION-anonymous service (onion-registration b5b-runtime):
     /// build an onion circuit whose terminus is the rendezvous relay R
     /// (`relay_path.last()`), and register `cookie` AT R over that circuit —
