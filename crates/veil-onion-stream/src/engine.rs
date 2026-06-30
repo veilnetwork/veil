@@ -837,14 +837,9 @@ impl StreamEngine {
         let num = win.saturating_mul(gain);
         let den = (srtt as u64).max(1).saturating_mul(self.cfg.mss as u64);
         if num >= den {
-            // ≥1 seg/ms → 1 ms tick, batch = ⌊rate⌋ segments, but cap the per-tick
-            // BURST small. A fat batch (device round 6: ~163 segs = 42 KB/ms)
-            // overruns the rendezvous relay's bounded per-circuit queue → a PACKET
-            // of drops with no dup-ACKs → RTO (not fast-retransmit) → cwnd collapse
-            // to 1 MSS → glacial 1-seg/RTT recovery (the freeze). A small burst
-            // keeps any loss ISOLATED → dup-ACK → graceful cwnd/2. cap 4 → up to
-            // ~1 MB/s at a 256 B MSS / 1 ms tick, ~4x the old 256 KB/s floor.
-            (1, (num / den).clamp(1, 4) as u32)
+            // ≥1 seg/ms → 1 ms tick, batch = ⌊rate⌋ segments. Cap to bound a
+            // single driver-loop's work; the send window still gates each segment.
+            (1, (num / den).clamp(1, 4096) as u32)
         } else {
             // <1 seg/ms → one segment per ⌈den/num⌉ ms tick.
             ((den / num).max(1), 1)
