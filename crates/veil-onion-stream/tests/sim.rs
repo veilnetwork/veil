@@ -409,9 +409,9 @@ fn circuit_profile_clean_path_exceeds_target_throughput() {
     // stream idled at ~135 KiB/s because pacing/window choices prevented it
     // from filling the path. Model the circuit wire shape (318-byte MSS after
     // the rendezvous splice envelope) and a measured-ish 150 ms RTT. On a lossless
-    // path the stream core must comfortably exceed the 1.5 MiB/s target; if this
-    // drops, either the old one-segment/ms floor came back or the circuit window
-    // is too small to feed the pipe.
+    // path the stream core must no longer hover at the old 1.5 MiB/s target; if
+    // this drops, either the old one-segment/ms floor came back or the circuit
+    // window/batch profile is too small to feed the pipe.
     let circuit_mss =
         veil_onion_stream::MAX_CELL - 16 - 32 - veil_onion_stream::wire::DATA_OVERHEAD;
     let cfg = Config {
@@ -422,7 +422,7 @@ fn circuit_profile_clean_path_exceeds_target_throughput() {
         handshake_rto_ms: 6_000,
         recv_window: 896 * 1024,
         init_cwnd: (32 * circuit_mss) as u32,
-        max_pacing_batch: 8,
+        max_pacing_batch: 12,
         ack_every: 16,
         ack_delay_ms: 5,
         ..Config::default()
@@ -446,9 +446,16 @@ fn circuit_profile_clean_path_exceeds_target_throughput() {
         .expect("payload completion time must be tracked");
     assert!(payload_ms > 0, "payload elapsed time must be non-zero");
     let mib_per_s = data.len() as f64 * 1000.0 / payload_ms as f64 / (1024.0 * 1024.0);
+    let target_mib_per_s = 2.0;
+    eprintln!(
+        "clean circuit profile: {mib_per_s:.2} MiB/s over {payload_ms} ms \
+         (close={} ms, max_burst={}, tx_cells={})",
+        out.elapsed_ms, out.max_burst_a, out.tx_cells
+    );
     assert!(
-        mib_per_s >= 1.5,
-        "clean circuit profile too slow: {mib_per_s:.2} MiB/s over {payload_ms} ms \
+        mib_per_s >= target_mib_per_s,
+        "clean circuit profile too slow: {mib_per_s:.2} MiB/s < \
+         {target_mib_per_s:.2} MiB/s over {payload_ms} ms \
          (close={} ms); \
          max_cwnd={} max_inflight={} tx_cells={} max_burst={} A={} B={}",
         out.elapsed_ms,
