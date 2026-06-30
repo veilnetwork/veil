@@ -6626,6 +6626,72 @@ impl NodeServices {
         self.open_data_circuit(relay_path, &reg.encode())
     }
 
+    /// Open a pinned stream circuit to the receiver's PUBLISHED rendezvous relay.
+    ///
+    /// This is the production-safe stream counterpart of
+    /// [`Self::send_anonymous_authenticated_to`]: resolve the receiver's freshest
+    /// signed `RendezvousAd`, actively cache the chosen relay's directory entry,
+    /// warm connected relay directory entries for middle-hop selection, then build a
+    /// multi-hop stateful circuit ending at that published R. The caller-supplied
+    /// `cookie` is THIS origin's stream cookie; registering it at the receiver's R
+    /// lets return cells (ACKs / reverse stream data) splice back over this same
+    /// circuit.
+    pub async fn open_stream_circuit_to_receiver_ad(
+        &self,
+        receiver_node_id: [u8; 32],
+        cookie: [u8; veil_anonymity::circuit_register::COOKIE_LEN],
+        reg_kp: &veil_crypto::GeneratedKeyPair,
+        last_epoch: &std::sync::atomic::AtomicU64,
+        hop_count: usize,
+    ) -> std::result::Result<
+        (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
+        veil_types::AnonOnionSendError,
+    > {
+        use veil_anonymity::directory::relay_directory_dht_key;
+        use veil_types::AnonOnionSendError;
+
+        const AD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
+        const RELAY_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let mut ads = service_tasks::resolve_fresh_rendezvous_ads(
+            &self.dht,
+            &self.session_tx_registry,
+            &self.dispatcher.pending_recursive,
+            *self.identity.local_identity.node_id.as_bytes(),
+            &self.anonymity.rendezvous_resolve_cache,
+            &self.logger,
+            receiver_node_id,
+            AD_RESOLVE_TIMEOUT,
+        )
+        .await;
+        ads.sort_by(|a, b| b.valid_from_unix.cmp(&a.valid_from_unix));
+        let Some(ad) = ads.into_iter().next() else {
+            return Err(AnonOnionSendError::NoRendezvous);
+        };
+
+        let relay_key = relay_directory_dht_key(&ad.rendezvous_node_id);
+        if self.dht.get_local(&relay_key).is_none()
+            && let Some(bytes) = self
+                .dht_recursive_get(relay_key, RELAY_RESOLVE_TIMEOUT)
+                .await
+        {
+            self.dht.store_local(relay_key, bytes);
+        }
+
+        let outbox: Arc<dyn veil_dht::FrameRouter> =
+            Arc::clone(&self.session_outbox) as Arc<dyn veil_dht::FrameRouter>;
+        service_tasks::warm_connected_relay_directory(
+            &self.live_sessions,
+            &self.dht,
+            &outbox,
+            &self.logger,
+        )
+        .await;
+
+        let relay_path = self.select_onion_relay_path_to(ad.rendezvous_node_id, hop_count)?;
+        self.open_stream_circuit(&relay_path, cookie, reg_kp, last_epoch)
+    }
+
     /// Like [`Self::open_stream_circuit`] but PICKS the rendezvous relay R itself:
     /// the relay-directory-resolvable routing-table contact with the smallest
     /// node_id (DETERMINISTIC, so both endpoints on the same network agree on R
@@ -6759,16 +6825,9 @@ impl NodeServices {
         &self,
         hop_count: usize,
     ) -> std::result::Result<Vec<[u8; 32]>, veil_types::AnonOnionSendError> {
-        use veil_anonymity::directory::{
-            DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
-        };
         use veil_types::AnonOnionSendError;
 
         let hop_count = hop_count.max(2);
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         // Δ2-h: honour the operator's pinned rendezvous relays (was `&[]`, which
         // silently ignored the `[anonymity].rendezvous_relays` pin on this path).
         let r = service_tasks::pick_rendezvous_relay(
@@ -6777,6 +6836,33 @@ impl NodeServices {
             &self.anonymity.pinned_rendezvous_relays,
         )
         .ok_or(AnonOnionSendError::NoRelays)?;
+        self.select_onion_relay_path_to(r, hop_count)
+    }
+
+    /// Pick a multi-hop relay path ending at a specific published rendezvous relay.
+    ///
+    /// Used when the receiver has already told us (via its signed rendezvous ad)
+    /// which R owns its cookie. Unlike the validation shortcut, this keeps at least
+    /// one middle hop before R so the rendezvous relay cannot directly observe the
+    /// origin transport session.
+    pub(crate) fn select_onion_relay_path_to(
+        &self,
+        r: [u8; 32],
+        hop_count: usize,
+    ) -> std::result::Result<Vec<[u8; 32]>, veil_types::AnonOnionSendError> {
+        use veil_anonymity::directory::{
+            DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
+        };
+        use veil_types::AnonOnionSendError;
+
+        let hop_count = hop_count.max(2);
+        if self.dht.get_local(&relay_directory_dht_key(&r)).is_none() {
+            return Err(AnonOnionSendError::NoRelays);
+        }
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let candidates: Vec<[u8; 32]> = self
             .dht
             .routing_table_contacts()
