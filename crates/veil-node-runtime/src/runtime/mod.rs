@@ -21,9 +21,9 @@ mod ip_slot;
 mod lifecycle;
 mod mailbox_state;
 mod maintenance;
-mod offline_seal;
 mod mesh_gateway;
 mod mobile_state;
+mod offline_seal;
 mod p_net_ban_sync;
 mod peer_handshake;
 mod persist_tasks;
@@ -1704,22 +1704,24 @@ impl NodeRuntime {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             match sov.sign_relay_key(relay_pk.to_vec(), now, now + 30 * 86_400, 1) {
-                Ok(rec) => match veil_identity::publish::publish_relay_key(&rec, &publisher).await {
-                    Ok(()) => logger.info(
-                        "node.sovereign_identity.relay_key_published",
-                        format!(
-                            "node_id={} relay_x25519 advertised",
-                            veil_util::bytes_to_hex(sov.node_id()),
+                Ok(rec) => {
+                    match veil_identity::publish::publish_relay_key(&rec, &publisher).await {
+                        Ok(()) => logger.info(
+                            "node.sovereign_identity.relay_key_published",
+                            format!(
+                                "node_id={} relay_x25519 advertised",
+                                veil_util::bytes_to_hex(sov.node_id()),
+                            ),
                         ),
-                    ),
-                    Err(e) => logger.warn(
-                        "node.sovereign_identity.relay_key_publish_failed",
-                        format!(
-                            "node_id={} — relay-key DHT publish failed: {e}",
-                            veil_util::bytes_to_hex(sov.node_id()),
+                        Err(e) => logger.warn(
+                            "node.sovereign_identity.relay_key_publish_failed",
+                            format!(
+                                "node_id={} — relay-key DHT publish failed: {e}",
+                                veil_util::bytes_to_hex(sov.node_id()),
+                            ),
                         ),
-                    ),
-                },
+                    }
+                }
                 Err(e) => logger.warn(
                     "node.sovereign_identity.relay_key_sign_failed",
                     format!(
@@ -6732,9 +6734,7 @@ impl NodeServices {
             seq,
             ciphertext: buf,
         };
-        let enc = cell
-            .encode()
-            .map_err(|_| AnonOnionSendError::NoRelays)?;
+        let enc = cell.encode().map_err(|_| AnonOnionSendError::NoRelays)?;
         self.send_relay_chain_frame(
             &circ.first_hop,
             veil_proto::family::RelayChainMsg::CircuitData,
@@ -6869,7 +6869,10 @@ impl NodeServices {
         log::info!(
             "rendezvous.cookie.register: relay={} cookie={} period={} me={}",
             veil_util::hex_short(&r),
-            cookie.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            cookie
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
             period,
             veil_util::hex_short(self.identity.local_identity.node_id.as_bytes()),
         );
@@ -7423,22 +7426,12 @@ impl NodeServices {
                 // fragments ride DIFFERENT relays → independent circuits to
                 // distinct endpoints, so the recipient receives in parallel.
                 let relay = relays[idx % relays.len()];
-                self.send_sealed_introduce(
-                    relay,
-                    &sealed_plaintext,
-                    hop_count,
-                    circuit_backed,
-                )?;
+                self.send_sealed_introduce(relay, &sealed_plaintext, hop_count, circuit_backed)?;
             } else {
                 // Bounded retransmit: send the fragment `redundancy` times over
                 // independent circuits; the recipient de-dups by (msg_id, frag_idx).
                 for _ in 0..redundancy.max(1) {
-                    self.send_sealed_introduce(
-                        ad,
-                        &sealed_plaintext,
-                        hop_count,
-                        circuit_backed,
-                    )?;
+                    self.send_sealed_introduce(ad, &sealed_plaintext, hop_count, circuit_backed)?;
                 }
             }
         }
@@ -7509,12 +7502,14 @@ impl NodeServices {
                         return Err(veil_anonymity::sender::SenderError::MissingReplyCapability);
                     }
                 };
-                let relay_path = self.select_onion_relay_path(REPLY_CIRCUIT_HOPS).map_err(|_| {
-                    veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
-                        need: REPLY_CIRCUIT_HOPS,
-                        have: 0,
-                    }
-                })?;
+                let relay_path =
+                    self.select_onion_relay_path(REPLY_CIRCUIT_HOPS)
+                        .map_err(|_| {
+                            veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                                need: REPLY_CIRCUIT_HOPS,
+                                have: 0,
+                            }
+                        })?;
                 let relay = *relay_path.last().expect("non-empty relay path");
                 let mut cookie = [0u8; 16];
                 rand_core::OsRng.fill_bytes(&mut cookie);
@@ -7562,12 +7557,12 @@ impl NodeServices {
         if let Some((relay_path, cookie, reply_reg_kp)) = pending_reply_circuit {
             let reply_epoch = std::sync::atomic::AtomicU64::new(0);
             self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch)
-                .map_err(|_| {
-                    veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                .map_err(
+                    |_| veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
                         need: REPLY_CIRCUIT_HOPS,
                         have: 0,
-                    }
-                })?;
+                    },
+                )?;
         }
 
         let mut payload_bytes = Vec::with_capacity(1 + auth_bytes.len());
@@ -7671,9 +7666,8 @@ impl NodeServices {
         // every relay we round-robin across (otherwise that path silent-drops when
         // the entry isn't organically cached — review fix).
         for a in &chosen {
-            let relay_key = veil_anonymity::directory::relay_directory_dht_key(
-                &a.rendezvous_node_id,
-            );
+            let relay_key =
+                veil_anonymity::directory::relay_directory_dht_key(&a.rendezvous_node_id);
             if self.dht.get_local(&relay_key).is_none()
                 && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
             {

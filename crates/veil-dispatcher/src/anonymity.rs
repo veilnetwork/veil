@@ -429,8 +429,11 @@ impl FrameDispatcher {
         // "forwarded=0" misleading.
         #[cfg(feature = "relay-trace")]
         {
-            let sf_cookie: String =
-                intro.auth_cookie.iter().map(|b| format!("{b:02x}")).collect();
+            let sf_cookie: String = intro
+                .auth_cookie
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             self.logger.info(
                 "anonymity.relay_chain.introduce.session_forwarded",
                 format!(
@@ -515,11 +518,8 @@ impl FrameDispatcher {
                 // subscriber-linkable value).
                 #[cfg(feature = "relay-trace")]
                 {
-                    let reg_cookie: String = req
-                        .auth_cookie
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
+                    let reg_cookie: String =
+                        req.auth_cookie.iter().map(|b| format!("{b:02x}")).collect();
                     self.logger.info(
                         "anonymity.relay_chain.register.ok",
                         format!(
@@ -2044,10 +2044,19 @@ mod tests {
         let reg_pk: [u8; 32] = STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
         let epoch = 1u64;
         let msg = CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch);
-        let sig =
-            sign_message(SignatureAlgorithm::Ed25519, &kp.public_key, &kp.private_key, &msg)
-                .unwrap();
-        let regp = CircuitRegisterPayload { cookie, reg_pk, epoch, signature: sig };
+        let sig = sign_message(
+            SignatureAlgorithm::Ed25519,
+            &kp.public_key,
+            &kp.private_key,
+            &msg,
+        )
+        .unwrap();
+        let regp = CircuitRegisterPayload {
+            cookie,
+            reg_pk,
+            epoch,
+            signature: sig,
+        };
         let rhop = CircuitSetupHop {
             node_id: [0u8; 32],
             pubkey: pk,
@@ -2056,12 +2065,18 @@ mod tests {
             circuit_key: [3u8; 32],
         };
         let renv = build_circuit_setup(&[rhop], &regp.encode()).unwrap();
-        let mut rhdr =
-            FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::CircuitBuild as u16);
+        let mut rhdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitBuild as u16,
+        );
         rhdr.body_len = renv.len() as u32;
         d.dispatch_relay_chain(&rhdr, &renv, NodeId::from(recv_hop));
         assert!(
-            d.circuit_rendezvous.as_ref().unwrap().lookup(&cookie).is_some(),
+            d.circuit_rendezvous
+                .as_ref()
+                .unwrap()
+                .lookup(&cookie)
+                .is_some(),
             "receiver cookie bound to its return circuit"
         );
         let _ = recv_rx.try_recv(); // drain the CircuitBuilt ACK toward recv_hop
@@ -2076,15 +2091,23 @@ mod tests {
             circuit_key: [7u8; 32],
         };
         let senv = build_circuit_setup(&[shop], b"no-reg").unwrap();
-        let mut shdr =
-            FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::CircuitBuild as u16);
+        let mut shdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitBuild as u16,
+        );
         shdr.body_len = senv.len() as u32;
         d.dispatch_relay_chain(&shdr, &senv, NodeId::from(send_hop));
 
         // Read the INSTALLED keys (build may derive, so don't assume the setup key).
         let table = d.circuit_table.as_ref().unwrap();
-        let send_key = table.lookup_forward(&send_hop, send_cid).unwrap().circuit_key;
-        let recv_key = table.lookup_forward(&recv_hop, recv_cid).unwrap().circuit_key;
+        let send_key = table
+            .lookup_forward(&send_hop, send_cid)
+            .unwrap()
+            .circuit_key;
+        let recv_key = table
+            .lookup_forward(&recv_hop, recv_cid)
+            .unwrap()
+            .circuit_key;
 
         // (3) FORWARD CircuitData on the sender's circuit, framed `[cookie][bytes]`
         //     and encrypted with the sender circuit's forward layer (R XORs back).
@@ -2095,10 +2118,16 @@ mod tests {
         let fseq = 1u32;
         let mut fbuf = wrap_payload(&framed).unwrap();
         apply_layer(&send_key, Direction::Forward, fseq, &mut fbuf);
-        let fwd = CircuitDataPayload { circuit_id: send_cid, seq: fseq, ciphertext: fbuf };
+        let fwd = CircuitDataPayload {
+            circuit_id: send_cid,
+            seq: fseq,
+            ciphertext: fbuf,
+        };
         let fbody = fwd.encode().unwrap();
-        let mut fhdr =
-            FrameHeader::new(FrameFamily::RelayChain as u8, RelayChainMsg::CircuitData as u16);
+        let mut fhdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitData as u16,
+        );
         fhdr.body_len = fbody.len() as u32;
         d.dispatch_relay_chain(&fhdr, &fbody, NodeId::from(send_hop));
 
@@ -2109,11 +2138,17 @@ mod tests {
             .expect("splice must emit a return cell toward the receiver hop");
         let ret = CircuitDataPayload::decode(&frame[veil_proto::header::HEADER_SIZE..])
             .expect("decode spliced return CircuitData");
-        assert_eq!(ret.circuit_id, recv_cid, "return cell rides the receiver's circuit_id_in");
+        assert_eq!(
+            ret.circuit_id, recv_cid,
+            "return cell rides the receiver's circuit_id_in"
+        );
         let mut rbuf = ret.ciphertext.clone();
         apply_layer(&recv_key, Direction::Return, ret.seq, &mut rbuf);
         let got = read_payload(&rbuf).expect("unwrap the spliced payload");
-        assert_eq!(got, post_cookie, "splice forwarded EXACTLY the post-cookie bytes");
+        assert_eq!(
+            got, post_cookie,
+            "splice forwarded EXACTLY the post-cookie bytes"
+        );
     }
 
     /// diff-audit Δ2-d: a `CircuitBuilt` ACK arriving from the first hop, tagged

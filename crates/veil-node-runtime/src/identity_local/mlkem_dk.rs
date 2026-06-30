@@ -18,7 +18,9 @@
 use std::path::Path;
 
 use veil_crypto::identity::derive_mlkem_dk_seed;
-use veil_e2e::{DK_SEED_BYTES, EK_BYTES, keypair_from_dk_seed, load_or_generate_mlkem_key_encrypted};
+use veil_e2e::{
+    DK_SEED_BYTES, EK_BYTES, keypair_from_dk_seed, load_or_generate_mlkem_key_encrypted,
+};
 
 use crate::error::NodeError;
 
@@ -118,7 +120,10 @@ mod tests {
 
         let (ek, _dk, src) = load_or_derive(&key_path, tmp.path(), None).unwrap();
         assert_eq!(src, MlKemKeySource::Persisted);
-        assert_eq!(ek, ek_file, "existing key must be returned unchanged (no rotation)");
+        assert_eq!(
+            ek, ek_file,
+            "existing key must be returned unchanged (no rotation)"
+        );
     }
 
     /// An ephemeral-dir node (no persisted key) with an identity DERIVES from the
@@ -146,7 +151,10 @@ mod tests {
         save_seed(tmp2.path(), 0x22);
         let (ek2, _dk2, _src2) =
             load_or_derive(&tmp2.path().join("mlkem.key"), tmp2.path(), None).unwrap();
-        assert_eq!(ek, ek2, "same identity seed across sessions must give the same EK");
+        assert_eq!(
+            ek, ek2,
+            "same identity seed across sessions must give the same EK"
+        );
     }
 
     /// Two DIFFERENT identities derive DIFFERENT keys (master/decoy isolation).

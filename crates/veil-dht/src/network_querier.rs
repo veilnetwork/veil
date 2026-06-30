@@ -229,7 +229,9 @@ impl NetworkPeerQuerier {
     /// wrong node_id) is silently rejected here.
     async fn resolve_transport_rpc(&self, peer_id: [u8; 32], node_id: [u8; 32]) -> Option<String> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let frame = self.build_resolve_transport_frame(request_id, node_id).await?;
+        let frame = self
+            .build_resolve_transport_frame(request_id, node_id)
+            .await?;
         let rx = self.outbox.send_request(peer_id, request_id, frame)?;
         let body = match timeout(self.find_node_timeout, rx).await {
             Ok(Ok(Some(body))) => body,
