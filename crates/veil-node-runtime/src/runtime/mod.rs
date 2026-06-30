@@ -6635,42 +6635,53 @@ impl NodeServices {
             &self.logger,
         )
         .await;
-        // R candidates = connected (active-session) relays whose relay-dir is now
-        // cached — deterministic by node_id so both ends agree on the same R.
-        let mut candidates: Vec<[u8; 32]> = {
+        // DETERMINISTIC terminus: the lowest-node_id contact in the routing
+        // table. Both ends seed routing from the SAME bootstrap relays, so its
+        // minimum (a seed-relay — this deployment's seeds sort below the clients)
+        // is IDENTICAL on both ends, and the splice only rendezvous if BOTH
+        // register at one R. Picking the lowest currently-RESOLVABLE relay
+        // diverged on-device: the desktop had warmed only 2 of 3 relay-dirs and
+        // chose c6ace22e while the phone (3 of 3) chose 3d3575c9 → the splice
+        // never met → the pull stream RESET. So fix R = min(routing) and WAIT —
+        // via the caller's retry loop — until THAT specific R's relay-dir is
+        // cached (the warm above fetches connected relays'); never silently fall
+        // back to a different R. (Validation shortcut: assumes the lowest routing
+        // contact is a relay; prod wants the receiver's published rendezvous R.)
+        let mut routing: Vec<[u8; 32]> = self
+            .dht
+            .routing_table_contacts()
+            .into_iter()
+            .map(|c| c.node_id)
+            .collect();
+        routing.sort_unstable();
+        routing.dedup();
+        let connected = {
             let g = lock!(self.live_sessions);
             g.values()
                 .filter(|i| i.state == crate::types::SessionState::Active)
-                .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
-                .collect()
+                .count()
         };
-        candidates.sort_unstable();
-        candidates.dedup();
-        // `candidates` is already sorted+deduped, so the filter preserves
-        // ascending-node_id order: `resolvable.first()` is the lowest-node_id
-        // relay we have a session to AND whose relay-dir is cached. Non-relay
-        // peers (other clients) have no relay-dir entry, so they're excluded
-        // automatically — only the seed-relays survive. Both ends therefore
-        // converge on the SAME R once both have warmed the same relay set; the
-        // residual risk is a ramp-up skew (picking before the globally-lowest
-        // seed is warmed), which the R= log below makes observable on-device.
-        let resolvable: Vec<[u8; 32]> = candidates
-            .iter()
-            .copied()
-            .filter(|nid| self.dht.get_local(&relay_directory_dht_key(nid)).is_some())
-            .collect();
-        let chosen = resolvable.first().copied();
+        let r = match routing.first() {
+            Some(r) => *r,
+            None => {
+                log::warn!("onion-stream.relay-pick routing=0 connected={connected} (no contacts)");
+                return Err(AnonOnionSendError::NoRelays);
+            }
+        };
+        let r_resolvable = self.dht.get_local(&relay_directory_dht_key(&r)).is_some();
         // log::warn so it reaches Android logcat (the node's tracing logger doesn't).
         log::warn!(
-            "onion-stream.relay-pick warmed={warmed} connected={} resolvable={} routing={} R={}",
-            candidates.len(),
-            resolvable.len(),
-            self.dht.routing_table_contacts().len(),
-            chosen
-                .map(|r| format!("{:02x}{:02x}{:02x}{:02x}", r[0], r[1], r[2], r[3]))
-                .unwrap_or_else(|| "none".to_owned()),
+            "onion-stream.relay-pick warmed={warmed} connected={connected} routing={} R={:02x}{:02x}{:02x}{:02x} r_resolvable={r_resolvable}",
+            routing.len(),
+            r[0],
+            r[1],
+            r[2],
+            r[3],
         );
-        let r = chosen.ok_or(AnonOnionSendError::NoRelays)?;
+        if !r_resolvable {
+            // The deterministic R isn't cached yet — retry (NOT a different R).
+            return Err(AnonOnionSendError::NoRelays);
+        }
         self.open_stream_circuit(&[r], cookie, reg_kp, last_epoch)
     }
 
