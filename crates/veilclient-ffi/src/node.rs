@@ -393,7 +393,7 @@ fn start_thread(
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    eprintln!("veil_node: tokio runtime build failed: {e}");
+                    crate::ffi_diag(&format!("veil_node: tokio runtime build failed: {e}"));
                     #[cfg(target_os = "android")]
                     log::error!("veil_node: tokio runtime build failed: {e}");
                     return;
@@ -419,7 +419,7 @@ fn start_thread(
                 }
             });
             if let Err(e) = result {
-                eprintln!("veil_node: runtime exited with error: {e}");
+                crate::ffi_diag(&format!("veil_node: runtime exited with error: {e}"));
                 #[cfg(target_os = "android")]
                 log::error!("veil_node: runtime exited with error: {e}");
             }
@@ -748,7 +748,9 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         unsafe { crate::veil_free_string(full_ptr) };
-        eprintln!("=== composed config ===\n{full}\n=======================");
+        crate::ffi_diag(&format!(
+            "=== composed config ===\n{full}\n======================="
+        ));
 
         let node =
             unsafe { veil_node_start_deferred(admin.as_ptr(), admin.len(), false, &mut err) };
