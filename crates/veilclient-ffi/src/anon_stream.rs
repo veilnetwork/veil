@@ -14,9 +14,10 @@
 //!   build-once inbound stateful circuit to this node's published rendezvous relay
 //!   plus lazy per-peer outbound circuits to each receiver's published R; cheap XOR
 //!   `CircuitData` cells, no per-cell ECDH/signature, in-order, stable RTT. R
-//!   splices each cell onto the peer's registered circuit. Still carries validation
-//!   shortcuts (deterministic stream cookies + in-band sender id); needs the
-//!   embedded node (in-process `NodeServices`).
+//!   splices each cell onto the peer's registered circuit. Published mode hides
+//!   the sender node id from R behind an opaque per-circuit tag plus encrypted
+//!   handshake intro; validation mode keeps the old clear sender-id shortcut.
+//!   Needs the embedded node (in-process `NodeServices`).
 
 use std::collections::HashMap;
 use std::io;
@@ -24,6 +25,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rand_core::{OsRng, RngCore};
 use tokio::sync::mpsc;
 use veil_anonymity::circuit_register::COOKIE_LEN;
 use veil_onion_stream::wire::Frame;
@@ -126,9 +128,17 @@ fn android_circuit_property_mode() -> Option<CircuitMode> {
 }
 
 /// Smaller MSS for the circuit path so the onion-stream cell + the
-/// `[cookie 16][sender_node 32]` splice envelope fit one 384-B CircuitData cell.
-const CIRCUIT_MSS: usize =
-    veil_onion_stream::wire::MAX_CELL - COOKIE_LEN - 32 - veil_onion_stream::wire::DATA_OVERHEAD; // 318 B payload, exactly fills 382-B inner
+/// `[cookie 16][peer_tag 32]` splice envelope fit one 384-B CircuitData cell.
+const CIRCUIT_PEER_TAG_LEN: usize = 32;
+const CIRCUIT_MSS: usize = veil_onion_stream::wire::MAX_CELL
+    - COOKIE_LEN
+    - CIRCUIT_PEER_TAG_LEN
+    - veil_onion_stream::wire::DATA_OVERHEAD; // 318 B payload, exactly fills 382-B inner
+const CIRCUIT_INTRO_MARKER: u8 = 0xA7;
+const CIRCUIT_INTRO_PLAINTEXT_MAGIC: &[u8; 16] = b"xveil-stream-v1!";
+const CIRCUIT_INTRO_PLAINTEXT_LEN: usize = 16 + CIRCUIT_PEER_TAG_LEN + 32;
+const CIRCUIT_INTRO_LEN: usize =
+    veil_anonymity::rendezvous::INTRODUCE_OVERHEAD + CIRCUIT_INTRO_PLAINTEXT_LEN;
 const CIRCUIT_HOPS: usize = 2;
 const CIRCUIT_IDLE_REFRESH_AFTER: Duration = Duration::from_secs(45);
 // A long-lived outbound circuit can black-hole after a bulk stream RTOs. The
@@ -159,6 +169,70 @@ fn stream_cookie(node: &[u8; 32]) -> [u8; COOKIE_LEN] {
     c
 }
 
+fn random_peer_tag() -> [u8; CIRCUIT_PEER_TAG_LEN] {
+    let mut tag = [0u8; CIRCUIT_PEER_TAG_LEN];
+    OsRng.fill_bytes(&mut tag);
+    tag
+}
+
+fn stream_peer_intro_plaintext(
+    sender_node: &[u8; 32],
+    peer_tag: &[u8; CIRCUIT_PEER_TAG_LEN],
+) -> [u8; CIRCUIT_INTRO_PLAINTEXT_LEN] {
+    let mut out = [0u8; CIRCUIT_INTRO_PLAINTEXT_LEN];
+    out[..16].copy_from_slice(CIRCUIT_INTRO_PLAINTEXT_MAGIC);
+    out[16..16 + CIRCUIT_PEER_TAG_LEN].copy_from_slice(peer_tag);
+    out[16 + CIRCUIT_PEER_TAG_LEN..].copy_from_slice(sender_node);
+    out
+}
+
+fn parse_stream_peer_intro_plaintext(
+    peer_tag: &[u8; CIRCUIT_PEER_TAG_LEN],
+    plaintext: &[u8],
+) -> Option<[u8; 32]> {
+    if plaintext.len() != CIRCUIT_INTRO_PLAINTEXT_LEN {
+        return None;
+    }
+    if &plaintext[..16] != CIRCUIT_INTRO_PLAINTEXT_MAGIC {
+        return None;
+    }
+    if &plaintext[16..16 + CIRCUIT_PEER_TAG_LEN] != peer_tag {
+        return None;
+    }
+    let mut node = [0u8; 32];
+    node.copy_from_slice(&plaintext[16 + CIRCUIT_PEER_TAG_LEN..]);
+    Some(node)
+}
+
+fn seal_stream_peer_intro(
+    sender_node: &[u8; 32],
+    peer_tag: &[u8; CIRCUIT_PEER_TAG_LEN],
+    receiver_x25519_pk: &[u8; 32],
+) -> io::Result<Vec<u8>> {
+    let plaintext = stream_peer_intro_plaintext(sender_node, peer_tag);
+    let sealed = veil_anonymity::rendezvous::encrypt_introduce(&plaintext, receiver_x25519_pk)
+        .map_err(|e| io::Error::other(format!("seal stream peer intro: {e:?}")))?;
+    if sealed.len() != CIRCUIT_INTRO_LEN {
+        return Err(io::Error::other(format!(
+            "sealed stream peer intro length {} != {CIRCUIT_INTRO_LEN}",
+            sealed.len()
+        )));
+    }
+    Ok(sealed)
+}
+
+fn open_stream_peer_intro(
+    services: &veil_node_runtime::NodeServices,
+    peer_tag: &[u8; CIRCUIT_PEER_TAG_LEN],
+    sealed: &[u8],
+) -> Option<[u8; 32]> {
+    if sealed.len() != CIRCUIT_INTRO_LEN {
+        return None;
+    }
+    let plaintext = services.decrypt_stream_peer_intro(sealed)?;
+    parse_stream_peer_intro_plaintext(peer_tag, &plaintext)
+}
+
 /// [`CellSender`] over `send_anonymous_authenticated` — the default datagram path.
 struct AnonCells {
     sender: Arc<AppSender>,
@@ -174,11 +248,10 @@ impl CellSender for AnonCells {
 }
 
 /// [`CellSender`] over a PINNED stateful onion circuit to a rendezvous relay R.
-/// Each cell goes as `[target_cookie 16][my_node 32][stream cell]`: R strips the
-/// cookie and splices `[my_node][cell]` down the target's registered circuit; the
-/// target reads `my_node` to demux the peer (the splice strips the sender's
-/// identity, so it rides in-band — the next production-anonymity item removes
-/// this clear sender id).
+/// Validation cells go as `[target_cookie 16][my_node 32][stream cell]`. In
+/// published mode the relay sees only `[target_cookie 16][peer_tag 32][cell]`;
+/// SYN/SYN_ACK prepend one encrypted peer-intro after `peer_tag` so only the
+/// receiver can map the opaque tag back to the sender's node id.
 struct CircuitCells {
     services: veil_node_runtime::NodeServices,
     me: [u8; 32],
@@ -206,28 +279,89 @@ struct CircuitCells {
 #[derive(Clone)]
 struct CircuitEntry {
     circuit: Arc<veil_node_runtime::DataCircuit>,
+    peer_tag: [u8; CIRCUIT_PEER_TAG_LEN],
+    receiver_x25519_pk: [u8; 32],
     opened_at: Instant,
     last_used: Instant,
     last_non_handshake: Instant,
 }
 
+impl CircuitEntry {
+    fn route(&self) -> CircuitRoute {
+        CircuitRoute {
+            circuit: Arc::clone(&self.circuit),
+            envelope: CircuitEnvelope::ProtectedIntro {
+                peer_tag: self.peer_tag,
+                receiver_x25519_pk: self.receiver_x25519_pk,
+            },
+        }
+    }
+}
+
+struct CircuitRoute {
+    circuit: Arc<veil_node_runtime::DataCircuit>,
+    envelope: CircuitEnvelope,
+}
+
+#[derive(Clone, Copy)]
+enum CircuitEnvelope {
+    LegacyClearSender {
+        sender_node: [u8; 32],
+    },
+    ProtectedIntro {
+        peer_tag: [u8; CIRCUIT_PEER_TAG_LEN],
+        receiver_x25519_pk: [u8; 32],
+    },
+}
+
 impl CellSender for CircuitCells {
     async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
-        let is_handshake = matches!(
-            Frame::decode(&cell),
-            Some(Frame::Syn { .. } | Frame::SynAck { .. })
-        );
-        let Some(circuit) = self.circuit_for(dst.node, is_handshake).await? else {
+        let decoded = Frame::decode(&cell);
+        let is_handshake = matches!(decoded, Some(Frame::Syn { .. } | Frame::SynAck { .. }));
+        let Some(route) = self.circuit_for(dst.node, is_handshake).await? else {
             // Circuit not up yet — drop this cell; the ARQ/handshake RTO resends.
             return Ok(());
         };
         let cookie = stream_cookie(&dst.node);
-        let mut env = Vec::with_capacity(COOKIE_LEN + 32 + cell.len());
+        let protected_intro_len =
+            matches!(route.envelope, CircuitEnvelope::ProtectedIntro { .. }) && is_handshake;
+        let mut env = Vec::with_capacity(
+            COOKIE_LEN
+                + CIRCUIT_PEER_TAG_LEN
+                + cell.len()
+                + if protected_intro_len {
+                    1 + CIRCUIT_INTRO_LEN
+                } else {
+                    0
+                },
+        );
         env.extend_from_slice(&cookie);
-        env.extend_from_slice(&self.me);
+        match route.envelope {
+            CircuitEnvelope::LegacyClearSender { sender_node } => {
+                env.extend_from_slice(&sender_node);
+            }
+            CircuitEnvelope::ProtectedIntro {
+                peer_tag,
+                receiver_x25519_pk,
+            } => {
+                env.extend_from_slice(&peer_tag);
+                if is_handshake {
+                    let intro = seal_stream_peer_intro(&self.me, &peer_tag, &receiver_x25519_pk)?;
+                    env.push(CIRCUIT_INTRO_MARKER);
+                    env.extend_from_slice(&intro);
+                }
+            }
+        }
         env.extend_from_slice(&cell);
+        if env.len() > veil_onion_stream::wire::MAX_CELL {
+            return Err(io::Error::other(format!(
+                "circuit stream envelope too large: {} > {}",
+                env.len(),
+                veil_onion_stream::wire::MAX_CELL
+            )));
+        }
         self.services
-            .send_circuit_cell(&circuit, &env)
+            .send_circuit_cell(&route.circuit, &env)
             .map_err(|e| io::Error::other(format!("circuit stream send: {e:?}")))?;
         mark_circuit_activity(&self.activity);
         if !is_handshake {
@@ -242,11 +376,20 @@ impl CircuitCells {
         &self,
         dst_node: [u8; 32],
         is_handshake: bool,
-    ) -> io::Result<Option<Arc<veil_node_runtime::DataCircuit>>> {
+    ) -> io::Result<Option<CircuitRoute>> {
         match self.mode {
-            CircuitMode::ValidationMinRouting => {
-                Ok(self.inbound_circuits.lock().await.first().cloned())
-            }
+            CircuitMode::ValidationMinRouting => Ok(self
+                .inbound_circuits
+                .lock()
+                .await
+                .first()
+                .cloned()
+                .map(|circuit| CircuitRoute {
+                    circuit,
+                    envelope: CircuitEnvelope::LegacyClearSender {
+                        sender_node: self.me,
+                    },
+                })),
             CircuitMode::PublishedRendezvous => {
                 self.ensure_outbound_circuit(dst_node, is_handshake).await
             }
@@ -257,7 +400,7 @@ impl CircuitCells {
         &self,
         dst_node: [u8; 32],
         is_handshake: bool,
-    ) -> io::Result<Option<Arc<veil_node_runtime::DataCircuit>>> {
+    ) -> io::Result<Option<CircuitRoute>> {
         let now = Instant::now();
         let retired = {
             let mut circuits = self.outbound_circuits.lock().await;
@@ -275,7 +418,7 @@ impl CircuitCells {
                     circuits.remove(&dst_node).map(|entry| entry.circuit)
                 } else if idle_for < CIRCUIT_IDLE_REFRESH_AFTER {
                     entry.last_used = now;
-                    return Ok(Some(Arc::clone(&entry.circuit)));
+                    return Ok(Some(entry.route()));
                 } else {
                     diag(&format!(
                         "onion-stream: outbound circuit idle for {}s — reopening in background",
@@ -293,7 +436,7 @@ impl CircuitCells {
         {
             let circuits = self.outbound_circuits.lock().await;
             if let Some(entry) = circuits.get(&dst_node) {
-                return Ok(Some(Arc::clone(&entry.circuit)));
+                return Ok(Some(entry.route()));
             }
         }
 
@@ -361,7 +504,7 @@ impl CircuitCells {
     async fn open_outbound_for_handshake(
         &self,
         dst_node: [u8; 32],
-    ) -> io::Result<Option<Arc<veil_node_runtime::DataCircuit>>> {
+    ) -> io::Result<Option<CircuitRoute>> {
         let now = Instant::now();
         let should_open = {
             let mut opening = self.outbound_opening.lock().await;
@@ -397,7 +540,7 @@ impl CircuitCells {
             let deadline = Instant::now() + CIRCUIT_CONFIRM_TIMEOUT;
             while Instant::now() < deadline {
                 if let Some(entry) = self.outbound_circuits.lock().await.get(&dst_node) {
-                    return Ok(Some(Arc::clone(&entry.circuit)));
+                    return Ok(Some(entry.route()));
                 }
                 if !self.outbound_opening.lock().await.contains_key(&dst_node) {
                     break;
@@ -407,9 +550,7 @@ impl CircuitCells {
         }
 
         let circuits = self.outbound_circuits.lock().await;
-        Ok(circuits
-            .get(&dst_node)
-            .map(|entry| Arc::clone(&entry.circuit)))
+        Ok(circuits.get(&dst_node).map(CircuitEntry::route))
     }
 }
 
@@ -666,10 +807,16 @@ fn try_open_circuit(
                     continue;
                 }
 
-                // Inbound feed: each return cell is `[sender_node 32][stream cell]`.
+                // Inbound feed: legacy validation cells are `[sender_node 32][cell]`;
+                // published cells are `[peer_tag 32][intro?][cell]`.
                 // Start it before swapping so cells arriving immediately after the
                 // confirmation are already consumed from the bounded return queue.
-                spawn_circuit_feed(recv_rx, in_tx_bg.clone(), Some(Arc::clone(&activity_bg)));
+                spawn_circuit_feed(
+                    services_bg.clone(),
+                    recv_rx,
+                    in_tx_bg.clone(),
+                    Some(Arc::clone(&activity_bg)),
+                );
                 if let Some(relay) = relay {
                     confirmed_relays.push(relay);
                 }
@@ -839,42 +986,72 @@ async fn open_outbound_circuit(
     activity: Arc<Mutex<Instant>>,
     outbound_circuits: Arc<tokio::sync::Mutex<HashMap<[u8; 32], CircuitEntry>>>,
 ) -> Result<(), String> {
-    let (candidate, recv_rx) = services
-        .open_stream_circuit_to_receiver_ad(
-            dst_node,
-            stream_cookie(&me),
-            &reg_kp,
-            &epoch,
-            CIRCUIT_HOPS,
-        )
+    let ads = services
+        .resolve_stream_rendezvous_ads(dst_node)
         .await
-        .map_err(|e| format!("open to receiver ad: {e:?}"))?;
+        .map_err(|e| format!("resolve receiver ads: {e:?}"))?;
 
-    if !confirm_circuit(&candidate).await {
-        services.close_data_circuit(candidate.origin_circuit_id());
-        return Err("confirmation timed out".to_string());
+    let mut last_err = "no receiver rendezvous ad opened".to_string();
+    for ad in ads {
+        let (candidate, recv_rx) = match services
+            .open_stream_circuit_to_rendezvous_relay(
+                ad.rendezvous_node_id,
+                stream_cookie(&me),
+                &reg_kp,
+                &epoch,
+                CIRCUIT_HOPS,
+            )
+            .await
+        {
+            Ok(opened) => opened,
+            Err(e) => {
+                last_err = format!(
+                    "R={} open failed: {e:?}",
+                    short_node(&ad.rendezvous_node_id)
+                );
+                continue;
+            }
+        };
+
+        if !confirm_circuit(&candidate).await {
+            services.close_data_circuit(candidate.origin_circuit_id());
+            last_err = format!(
+                "R={} confirmation timed out",
+                short_node(&ad.rendezvous_node_id)
+            );
+            continue;
+        }
+
+        spawn_circuit_feed(
+            services.clone(),
+            recv_rx,
+            in_tx,
+            Some(Arc::clone(&activity)),
+        );
+        let candidate = Arc::new(candidate);
+        let now = Instant::now();
+        let retired = outbound_circuits.lock().await.insert(
+            dst_node,
+            CircuitEntry {
+                circuit: Arc::clone(&candidate),
+                peer_tag: random_peer_tag(),
+                receiver_x25519_pk: ad.receiver_x25519_pk,
+                opened_at: now,
+                last_used: now,
+                last_non_handshake: now,
+            },
+        );
+        mark_circuit_activity(&activity);
+        diag(&format!(
+            "onion-stream: outbound circuit ready for {} via R={}",
+            short_node(&dst_node),
+            short_node(&ad.rendezvous_node_id)
+        ));
+        let retired = retired.map(|r| r.circuit).into_iter().collect();
+        retire_circuits_later(&services, retired);
+        return Ok(());
     }
-
-    spawn_circuit_feed(recv_rx, in_tx, Some(Arc::clone(&activity)));
-    let candidate = Arc::new(candidate);
-    let now = Instant::now();
-    let retired = outbound_circuits.lock().await.insert(
-        dst_node,
-        CircuitEntry {
-            circuit: Arc::clone(&candidate),
-            opened_at: now,
-            last_used: now,
-            last_non_handshake: now,
-        },
-    );
-    mark_circuit_activity(&activity);
-    diag(&format!(
-        "onion-stream: outbound circuit ready for {}",
-        short_node(&dst_node)
-    ));
-    let retired = retired.map(|r| r.circuit).into_iter().collect();
-    retire_circuits_later(&services, retired);
-    Ok(())
+    Err(format!("open to receiver ad: {last_err}"))
 }
 
 async fn confirm_circuit(circuit: &veil_node_runtime::DataCircuit) -> bool {
@@ -886,22 +1063,49 @@ async fn confirm_circuit(circuit: &veil_node_runtime::DataCircuit) -> bool {
 }
 
 fn spawn_circuit_feed(
+    services: veil_node_runtime::NodeServices,
     mut recv_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
     activity: Option<Arc<Mutex<Instant>>>,
 ) {
     tokio::spawn(async move {
+        let mut peer_tags = HashMap::<[u8; CIRCUIT_PEER_TAG_LEN], [u8; 32]>::new();
         while let Some(framed) = recv_rx.recv().await {
             if let Some(activity) = activity.as_ref() {
                 mark_circuit_activity(activity);
             }
-            if framed.len() < 32 {
+            if framed.len() < CIRCUIT_PEER_TAG_LEN {
                 continue;
             }
-            let mut node = [0u8; 32];
-            node.copy_from_slice(&framed[..32]);
+            let mut tag = [0u8; CIRCUIT_PEER_TAG_LEN];
+            tag.copy_from_slice(&framed[..CIRCUIT_PEER_TAG_LEN]);
+            let mut cell_offset = CIRCUIT_PEER_TAG_LEN;
+            let node = if framed.get(cell_offset) == Some(&CIRCUIT_INTRO_MARKER) {
+                if framed.len() < cell_offset + 1 + CIRCUIT_INTRO_LEN {
+                    continue;
+                }
+                let sealed = &framed[cell_offset + 1..cell_offset + 1 + CIRCUIT_INTRO_LEN];
+                let Some(node) = open_stream_peer_intro(&services, &tag, sealed) else {
+                    continue;
+                };
+                if peer_tags.len() >= 4096 && !peer_tags.contains_key(&tag) {
+                    peer_tags.clear();
+                }
+                peer_tags.insert(tag, node);
+                cell_offset += 1 + CIRCUIT_INTRO_LEN;
+                node
+            } else if let Some(node) = peer_tags.get(&tag) {
+                *node
+            } else {
+                // Backward-compatible validation/legacy path: the first 32 bytes
+                // are the clear sender node id rather than an opaque tag.
+                tag
+            };
+            if framed.len() <= cell_offset {
+                continue;
+            }
             let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
-            let cell = framed[32..].to_vec();
+            let cell = framed[cell_offset..].to_vec();
             if in_tx.send((Addr { node, app }, cell)).await.is_err() {
                 break;
             }
@@ -942,7 +1146,12 @@ fn retire_circuits_later(
 
 #[cfg(test)]
 mod tests {
-    use super::{CircuitMode, circuit_env_value_mode};
+    use super::{
+        CIRCUIT_INTRO_LEN, CIRCUIT_MSS, CIRCUIT_PEER_TAG_LEN, CircuitMode, circuit_env_value_mode,
+        parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
+    };
+    use veil_anonymity::circuit_register::COOKIE_LEN;
+    use veil_onion_stream::wire::{DATA_OVERHEAD, Frame, MAX_CELL};
 
     #[test]
     fn circuit_env_is_strict_opt_in() {
@@ -975,5 +1184,66 @@ mod tests {
                 "{value:?} should leave circuit mode off"
             );
         }
+    }
+
+    #[test]
+    fn protected_circuit_envelopes_fit_one_cell_without_reducing_data_mss() {
+        let payload = [0xABu8; CIRCUIT_MSS];
+        let data = Frame::Data {
+            stream_id: 7,
+            seq: 0,
+            win: 1024,
+            payload: &payload,
+        }
+        .encode();
+        assert_eq!(
+            COOKIE_LEN + CIRCUIT_PEER_TAG_LEN + data.len(),
+            MAX_CELL,
+            "protected DATA must still exactly fill one CircuitData inner cell"
+        );
+        assert_eq!(
+            CIRCUIT_MSS,
+            MAX_CELL - COOKIE_LEN - CIRCUIT_PEER_TAG_LEN - DATA_OVERHEAD
+        );
+
+        let syn = Frame::Syn {
+            stream_id: 7,
+            isn: 11,
+            win: 4096,
+        }
+        .encode();
+        let syn_ack = Frame::SynAck {
+            stream_id: 7,
+            isn: 13,
+            win: 4096,
+            ack: 11,
+        }
+        .encode();
+        assert!(COOKIE_LEN + CIRCUIT_PEER_TAG_LEN + 1 + CIRCUIT_INTRO_LEN + syn.len() <= MAX_CELL);
+        assert!(
+            COOKIE_LEN + CIRCUIT_PEER_TAG_LEN + 1 + CIRCUIT_INTRO_LEN + syn_ack.len() <= MAX_CELL
+        );
+    }
+
+    #[test]
+    fn stream_peer_intro_plaintext_is_bound_to_peer_tag() {
+        let sender = [0x11u8; 32];
+        let tag = [0x22u8; CIRCUIT_PEER_TAG_LEN];
+        let plaintext = stream_peer_intro_plaintext(&sender, &tag);
+        assert_eq!(
+            parse_stream_peer_intro_plaintext(&tag, &plaintext),
+            Some(sender)
+        );
+
+        let mut other_tag = tag;
+        other_tag[0] ^= 0x01;
+        assert_eq!(
+            parse_stream_peer_intro_plaintext(&other_tag, &plaintext),
+            None
+        );
+
+        let mut wrong_domain = plaintext;
+        wrong_domain[0] ^= 0x01;
+        assert_eq!(parse_stream_peer_intro_plaintext(&tag, &wrong_domain), None);
     }
 }
