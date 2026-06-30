@@ -6743,19 +6743,35 @@ impl NodeServices {
         (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
         veil_types::AnonOnionSendError,
     > {
-        self.cache_stream_relay_directory(rendezvous_node_id).await;
+        let relay_path = match self.select_onion_relay_path_to(rendezvous_node_id, hop_count) {
+            Ok(path) => path,
+            Err(_) => {
+                let _warm_guard = self.anonymity.stream_relay_directory_warm_lock.lock().await;
 
-        let outbox: Arc<dyn veil_dht::FrameRouter> =
-            Arc::clone(&self.session_outbox) as Arc<dyn veil_dht::FrameRouter>;
-        service_tasks::warm_connected_relay_directory(
-            &self.live_sessions,
-            &self.dht,
-            &outbox,
-            &self.logger,
-        )
-        .await;
+                // Another parallel stream worker may have completed the
+                // cold-start warm while we waited for the single-flight
+                // guard. Re-check before doing any network DHT work.
+                match self.select_onion_relay_path_to(rendezvous_node_id, hop_count) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        self.cache_stream_relay_directory(rendezvous_node_id).await;
 
-        let relay_path = self.select_onion_relay_path_to(rendezvous_node_id, hop_count)?;
+                        let outbox: Arc<dyn veil_dht::FrameRouter> =
+                            Arc::clone(&self.session_outbox) as Arc<dyn veil_dht::FrameRouter>;
+                        service_tasks::warm_connected_relay_directory(
+                            &self.live_sessions,
+                            &self.dht,
+                            &outbox,
+                            &self.logger,
+                            Some(&self.dispatcher.crypto.peer_cap_flags),
+                        )
+                        .await;
+
+                        self.select_onion_relay_path_to(rendezvous_node_id, hop_count)?
+                    }
+                }
+            }
+        };
         self.open_stream_circuit(&relay_path, cookie, reg_kp, last_epoch)
     }
 
@@ -6832,6 +6848,7 @@ impl NodeServices {
             &self.dht,
             &outbox,
             &self.logger,
+            Some(&self.dispatcher.crypto.peer_cap_flags),
         )
         .await;
         // DETERMINISTIC terminus: the lowest-node_id contact in the routing
@@ -7882,6 +7899,7 @@ impl NodeServices {
             &self.dht,
             &outbox,
             &self.logger,
+            Some(&self.dispatcher.crypto.peer_cap_flags),
         )
         .await;
 
