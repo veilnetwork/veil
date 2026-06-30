@@ -182,7 +182,10 @@ mod tests {
     #[test]
     fn payload_round_trips_and_rejects_short() {
         let p = RegisterMailboxCookiePayload { cookie: ck(0x5A) };
-        assert_eq!(RegisterMailboxCookiePayload::decode(&p.encode()).unwrap(), p);
+        assert_eq!(
+            RegisterMailboxCookiePayload::decode(&p.encode()).unwrap(),
+            p
+        );
         assert!(RegisterMailboxCookiePayload::decode(&[0u8; 15]).is_err());
     }
 
@@ -192,7 +195,10 @@ mod tests {
         reg.register(R1, ck(0xAA), 100);
         assert!(reg.is_authorised(&R1, &ck(0xAA)));
         assert!(!reg.is_authorised(&R1, &ck(0xBB)), "wrong cookie rejected");
-        assert!(!reg.is_authorised(&R2, &ck(0xAA)), "wrong receiver rejected");
+        assert!(
+            !reg.is_authorised(&R2, &ck(0xAA)),
+            "wrong receiver rejected"
+        );
     }
 
     #[test]
@@ -205,7 +211,10 @@ mod tests {
         reg.register(R1, ck(3), 300); // epoch E+1 -> {3,2}, 1 dropped
         assert!(reg.is_authorised(&R1, &ck(3)));
         assert!(reg.is_authorised(&R1, &ck(2)));
-        assert!(!reg.is_authorised(&R1, &ck(1)), "two-epochs-old cookie invalid");
+        assert!(
+            !reg.is_authorised(&R1, &ck(1)),
+            "two-epochs-old cookie invalid"
+        );
     }
 
     #[test]
@@ -226,7 +235,10 @@ mod tests {
         reg.register([11; 32], ck(2), 200);
         reg.register([12; 32], ck(3), 300); // evicts [10] (oldest)
         assert_eq!(reg.len(), 2);
-        assert!(!reg.is_authorised(&[10; 32], &ck(1)), "LRU receiver evicted");
+        assert!(
+            !reg.is_authorised(&[10; 32], &ck(1)),
+            "LRU receiver evicted"
+        );
         assert!(reg.is_authorised(&[11; 32], &ck(2)));
         assert!(reg.is_authorised(&[12; 32], &ck(3)));
     }

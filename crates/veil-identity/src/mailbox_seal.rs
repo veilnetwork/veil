@@ -145,8 +145,9 @@ pub fn seal_mailbox_blob(
     )?;
     let sealed_doc_blob = encode_fanout_blob(&sealed_doc)?;
 
-    let mut out =
-        Vec::with_capacity(1 + 4 + sidecar_blob.len() + 4 + sealed_doc_blob.len() + main_blob.len());
+    let mut out = Vec::with_capacity(
+        1 + 4 + sidecar_blob.len() + 4 + sealed_doc_blob.len() + main_blob.len(),
+    );
     out.push(MAILBOX_BLOB_V3);
     out.extend_from_slice(&(sidecar_blob.len() as u32).to_be_bytes());
     out.extend_from_slice(&sidecar_blob);
@@ -256,7 +257,13 @@ pub fn open_mailbox_blob(
         cert_version,
     )?;
     let auth = AuthAppDeliver::decode(inner.as_slice()).map_err(MailboxSealError::Decode)?;
-    verify_auth_deliver(&auth, sender_doc, our_node_id, now_unix, freshness_window_secs)?;
+    verify_auth_deliver(
+        &auth,
+        sender_doc,
+        our_node_id,
+        now_unix,
+        freshness_window_secs,
+    )?;
     Ok(auth)
 }
 
@@ -358,7 +365,8 @@ mod tests {
             b"offline hello".to_vec(),
             None,
         );
-        let blob = seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let blob =
+            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
 
         let opened = open_mailbox_blob(
             &blob,
@@ -397,13 +405,17 @@ mod tests {
             b"sealed-sender hello".to_vec(),
             None,
         );
-        let blob = seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let blob =
+            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
 
         // 1) recover the sender from the sidecar with NO prior knowledge of it.
         let recovered =
             recover_sender_node_id(&blob, &instance, &recipient_id, &dk_seed, cert.cert_version)
                 .unwrap();
-        assert_eq!(recovered, sender_id, "sidecar must yield the real sender id");
+        assert_eq!(
+            recovered, sender_id,
+            "sidecar must yield the real sender id"
+        );
 
         // 2) open the main blob using the recovered id; verifies under the doc.
         let opened = open_mailbox_blob(
@@ -430,8 +442,10 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, instance, dk_seed) = recipient();
 
-        let auth = sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 7, b"x".to_vec(), None);
-        let mut blob = seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let auth =
+            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 7, b"x".to_vec(), None);
+        let mut blob =
+            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
         // Flip a byte well inside the sidecar fan-out blob's interior.
         let tamper_at = blob.len() / 4;
         blob[tamper_at] ^= 0xFF;
@@ -451,8 +465,10 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, instance, dk_seed) = recipient();
 
-        let auth = sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 1, b"x".to_vec(), None);
-        let blob = seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let auth =
+            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 1, b"x".to_vec(), None);
+        let blob =
+            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
 
         let err = open_mailbox_blob(
             &blob,
@@ -476,8 +492,10 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, _instance, dk_seed) = recipient();
 
-        let auth = sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 1, b"x".to_vec(), None);
-        let blob = seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let auth =
+            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 1, b"x".to_vec(), None);
+        let blob =
+            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
 
         let err = open_mailbox_blob(
             &blob,
@@ -500,8 +518,10 @@ mod tests {
         let sender_id = *sov.node_id();
         let (cert, recipient_id, instance, dk_seed) = recipient();
 
-        let auth = sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 1, b"x".to_vec(), None);
-        let mut blob = seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+        let auth =
+            sov.sign_auth_deliver(recipient_id, [0xCCu8; 32], 9, NOW, 1, b"x".to_vec(), None);
+        let mut blob =
+            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
         // Flip a byte at the tail (inside the AEAD ciphertext) → AEAD auth fails.
         let last = blob.len() - 1;
         blob[last] ^= 0xFF;

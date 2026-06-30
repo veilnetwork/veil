@@ -32,17 +32,27 @@ impl Rng {
 
 #[derive(Clone, Copy)]
 struct Channel {
-    loss: f64,      // per-cell drop probability
-    dup: f64,       // per-cell duplication probability
+    loss: f64,       // per-cell drop probability
+    dup: f64,        // per-cell duplication probability
     base_delay: u64, // one-way propagation (ms)
-    jitter: u64,    // extra uniform [0,jitter] ms → reordering
+    jitter: u64,     // extra uniform [0,jitter] ms → reordering
 }
 impl Channel {
     fn perfect() -> Self {
-        Channel { loss: 0.0, dup: 0.0, base_delay: 25, jitter: 0 }
+        Channel {
+            loss: 0.0,
+            dup: 0.0,
+            base_delay: 25,
+            jitter: 0,
+        }
     }
     fn lossy(loss: f64) -> Self {
-        Channel { loss, dup: 0.0, base_delay: 25, jitter: 0 }
+        Channel {
+            loss,
+            dup: 0.0,
+            base_delay: 25,
+            jitter: 0,
+        }
     }
 }
 
@@ -62,7 +72,11 @@ struct Pipe {
 }
 impl Pipe {
     fn new(ch: Channel) -> Self {
-        Pipe { ch, flight: Vec::new(), injected: 0 }
+        Pipe {
+            ch,
+            flight: Vec::new(),
+            injected: 0,
+        }
     }
     fn inject(&mut self, now: u64, bytes: &[u8], rng: &mut Rng) {
         self.injected += 1;
@@ -72,7 +86,10 @@ impl Pipe {
         }
         let deliver = |p: &mut Pipe, r: &mut Rng| {
             let arrive = now + p.ch.base_delay + r.range(0, p.ch.jitter + 1);
-            p.flight.push(InFlight { arrive, bytes: bytes.to_vec() });
+            p.flight.push(InFlight {
+                arrive,
+                bytes: bytes.to_vec(),
+            });
         };
         deliver(self, rng);
         if rng.unit() < self.ch.dup {
@@ -231,7 +248,10 @@ fn perfect_channel_transfers_intact() {
     assert!(out.completed, "did not complete in {} steps", out.steps);
     assert_eq!(out.received, data, "byte mismatch over a clean channel");
     assert!(out.b_events.contains(&Event::Connected));
-    assert!(out.b_events.contains(&Event::PeerFinished), "B must see clean EOF");
+    assert!(
+        out.b_events.contains(&Event::PeerFinished),
+        "B must see clean EOF"
+    );
     // Slow start must have grown the window past the initial value.
     assert!(
         out.max_cwnd_a >= Config::default().init_cwnd * 2,
@@ -244,7 +264,11 @@ fn perfect_channel_transfers_intact() {
 fn ten_percent_loss_still_completes_intact() {
     let data = payload(120_000, 2);
     let out = run_oneway(&data, Channel::lossy(0.10), 7, Config::default());
-    assert!(out.completed, "10% loss did not complete in {} steps", out.steps);
+    assert!(
+        out.completed,
+        "10% loss did not complete in {} steps",
+        out.steps
+    );
     assert_eq!(out.received, data, "ARQ failed to repair 10% loss");
 }
 
@@ -252,7 +276,11 @@ fn ten_percent_loss_still_completes_intact() {
 fn thirty_percent_loss_still_completes_intact() {
     let data = payload(80_000, 3);
     let out = run_oneway(&data, Channel::lossy(0.30), 11, Config::default());
-    assert!(out.completed, "30% loss did not complete in {} steps", out.steps);
+    assert!(
+        out.completed,
+        "30% loss did not complete in {} steps",
+        out.steps
+    );
     assert_eq!(out.received, data, "ARQ failed to repair 30% loss");
 }
 
@@ -295,9 +323,18 @@ fn high_bdp_sack_does_not_storm() {
     let data = payload(400_000, 31);
     // ~1 s one-way (≈2 s RTT) — far below the 10 s RTO floor, so EVERY retransmit
     // here is SACK-driven; this isolates mark_holes from the RTO path.
-    let ch = Channel { loss: 0.10, dup: 0.0, base_delay: 1000, jitter: 50 };
+    let ch = Channel {
+        loss: 0.10,
+        dup: 0.0,
+        base_delay: 1000,
+        jitter: 50,
+    };
     let out = run_oneway(&data, ch, 77, cfg);
-    assert!(out.completed, "high-BDP transfer did not complete in {} steps", out.steps);
+    assert!(
+        out.completed,
+        "high-BDP transfer did not complete in {} steps",
+        out.steps
+    );
     assert_eq!(out.received, data);
     let payload_cells = data.len().div_ceil(veil_onion_stream::MSS) as u64;
     assert!(
@@ -322,9 +359,18 @@ fn pacing_spreads_sends_no_burst() {
         ..Config::default()
     };
     let data = payload(600_000, 41);
-    let ch = Channel { loss: 0.0, dup: 0.0, base_delay: 500, jitter: 0 }; // ~1 s RTT
+    let ch = Channel {
+        loss: 0.0,
+        dup: 0.0,
+        base_delay: 500,
+        jitter: 0,
+    }; // ~1 s RTT
     let out = run_oneway(&data, ch, 9, cfg);
-    assert!(out.completed, "clean transfer did not complete in {} steps", out.steps);
+    assert!(
+        out.completed,
+        "clean transfer did not complete in {} steps",
+        out.steps
+    );
     assert_eq!(out.received, data);
     // Slow-start still grew cwnd well past the initial window...
     assert!(
@@ -344,18 +390,36 @@ fn pacing_spreads_sends_no_burst() {
 #[test]
 fn reordering_and_duplication_complete_intact() {
     let data = payload(100_000, 4);
-    let ch = Channel { loss: 0.05, dup: 0.10, base_delay: 25, jitter: 80 };
+    let ch = Channel {
+        loss: 0.05,
+        dup: 0.10,
+        base_delay: 25,
+        jitter: 80,
+    };
     let out = run_oneway(&data, ch, 99, Config::default());
-    assert!(out.completed, "reorder+dup did not complete in {} steps", out.steps);
+    assert!(
+        out.completed,
+        "reorder+dup did not complete in {} steps",
+        out.steps
+    );
     assert_eq!(out.received, data, "reassembly failed under reorder+dup");
 }
 
 #[test]
 fn heavy_combined_impairment_completes() {
     let data = payload(60_000, 5);
-    let ch = Channel { loss: 0.20, dup: 0.05, base_delay: 40, jitter: 120 };
+    let ch = Channel {
+        loss: 0.20,
+        dup: 0.05,
+        base_delay: 40,
+        jitter: 120,
+    };
     let out = run_oneway(&data, ch, 2024, Config::default());
-    assert!(out.completed, "combined impairment did not complete in {} steps", out.steps);
+    assert!(
+        out.completed,
+        "combined impairment did not complete in {} steps",
+        out.steps
+    );
     assert_eq!(out.received, data);
 }
 
@@ -373,14 +437,21 @@ fn small_payload_and_empty_payload() {
 fn dead_link_resets_with_timeout_not_eof() {
     // 100% loss: nothing ever gets through → retransmit cap → RST(TIMED_OUT).
     let data = payload(10_000, 6);
-    let cfg = Config { max_retransmits: 6, ..Config::default() };
+    let cfg = Config {
+        max_retransmits: 6,
+        ..Config::default()
+    };
     let out = run_oneway(&data, Channel::lossy(1.0), 1, cfg);
     assert!(!out.completed, "a dead link must not complete");
     let saw_timeout = out
         .a_events
         .iter()
         .any(|e| matches!(e, Event::Reset(r) if *r == reset_reason::TIMED_OUT));
-    assert!(saw_timeout, "expected Reset(TIMED_OUT), got {:?}", out.a_events);
+    assert!(
+        saw_timeout,
+        "expected Reset(TIMED_OUT), got {:?}",
+        out.a_events
+    );
     assert!(
         !out.b_events.contains(&Event::PeerFinished),
         "must NOT look like clean EOF"

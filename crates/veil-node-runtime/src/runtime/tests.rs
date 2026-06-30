@@ -1839,7 +1839,9 @@ pub fn session_guard_drop_publishes_sessions_changed() {
         None,
         sessions_per_ip,
         [0u8; 32],
-        Arc::new(std::sync::RwLock::new(veil_session::SessionTxRegistry::new())),
+        Arc::new(std::sync::RwLock::new(
+            veil_session::SessionTxRegistry::new(),
+        )),
         None,
         Arc::clone(&bus),
     );
@@ -1915,7 +1917,9 @@ pub fn session_guard_drop_reaps_orphaned_tx_unless_node_has_other_session() {
         assert!(tx_reg.read().unwrap().has_session(&node));
 
         let live = Arc::new(Mutex::new(BTreeMap::new()));
-        live.lock().unwrap().insert(LinkId::new(1), session_info(node, 1));
+        live.lock()
+            .unwrap()
+            .insert(LinkId::new(1), session_info(node, 1));
 
         drop(build_guard(&live, &tx_reg, node, 1));
         assert!(
@@ -1931,8 +1935,12 @@ pub fn session_guard_drop_reaps_orphaned_tx_unless_node_has_other_session() {
         let _rx = tx_reg.write().unwrap().register(node);
 
         let live = Arc::new(Mutex::new(BTreeMap::new()));
-        live.lock().unwrap().insert(LinkId::new(1), session_info(node, 1));
-        live.lock().unwrap().insert(LinkId::new(2), session_info(node, 2));
+        live.lock()
+            .unwrap()
+            .insert(LinkId::new(1), session_info(node, 1));
+        live.lock()
+            .unwrap()
+            .insert(LinkId::new(2), session_info(node, 2));
 
         drop(build_guard(&live, &tx_reg, node, 1)); // drop link 1; link 2 still live
         assert!(

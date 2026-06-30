@@ -284,7 +284,10 @@ mod tests {
         let seed = [0x42u8; 32];
         let a = derive_anonymity_x25519_sk(&seed);
         let b = derive_anonymity_x25519_sk(&seed);
-        assert_eq!(*a, *b, "same identity seed must yield the same anonymity key");
+        assert_eq!(
+            *a, *b,
+            "same identity seed must yield the same anonymity key"
+        );
     }
 
     #[test]
@@ -319,7 +322,10 @@ mod tests {
     fn mlkem_dk_seed_changes_with_seed() {
         // Cross-identity isolation: master and decoy (distinct seeds) MUST derive
         // distinct mailbox keys — no cross-identity linkage.
-        assert_ne!(*derive_mlkem_dk_seed(&[0x42u8; 32]), *derive_mlkem_dk_seed(&[0x43u8; 32]));
+        assert_ne!(
+            *derive_mlkem_dk_seed(&[0x42u8; 32]),
+            *derive_mlkem_dk_seed(&[0x43u8; 32])
+        );
     }
 
     #[test]
@@ -374,8 +380,7 @@ mod tests {
         let okm = derive_anonymity_x25519_sk(&[0u8; 32]);
         let hex: String = okm.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex,
-            "962fb33d42c62c80e1c8ca1f88b0a3a8d23f317020057a8716ca7f56b0d4e89e",
+            hex, "962fb33d42c62c80e1c8ca1f88b0a3a8d23f317020057a8716ca7f56b0d4e89e",
             "anonymity-x25519 KDF output changed — coordinated rotation only"
         );
     }

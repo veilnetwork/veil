@@ -563,13 +563,8 @@ pub(crate) async fn rendezvous_recipient_recheck(
     // entries into the local store so pick (get_local) can find one without
     // waiting on passive DHT replication.
     warm_connected_relay_directory(live_sessions, dht, outbox, logger).await;
-    let candidates = pick_rendezvous_relays_deterministic(
-        live_sessions,
-        dht,
-        cap_flags,
-        pinned,
-        local_node_id,
-    );
+    let candidates =
+        pick_rendezvous_relays_deterministic(live_sessions, dht, cap_flags, pinned, local_node_id);
     let mut registered = Vec::with_capacity(candidates.len());
     for relay in candidates {
         if rendezvous_register_with(session_tx_registry, anonymity, &relay, cookie) {
@@ -2151,11 +2146,8 @@ impl NodeRuntime {
             // Gated on the relay X25519 secret like push: without it the node
             // can't run the onion send the reply needs. hop_count is nominal —
             // a reply routes over the requester's one-time reply path.
-            let mailbox_reply_sender: Option<Arc<dyn veil_types::AnonOnionSender>> = self
-                .dispatcher
-                .anonymity_x25519_sk
-                .is_some()
-                .then(|| {
+            let mailbox_reply_sender: Option<Arc<dyn veil_types::AnonOnionSender>> =
+                self.dispatcher.anonymity_x25519_sk.is_some().then(|| {
                     Arc::new(RuntimeAnonOnionSender::new(self.access(), 2))
                         as Arc<dyn veil_types::AnonOnionSender>
                 });
@@ -3793,15 +3785,13 @@ mod tests {
         // KEM and a sender would resolve usable(KEM)=0 (cannot deposit offline
         // mail) — so the KEM-less path must PRESERVE an existing KEM.
         let sk = std::sync::Arc::new(x25519_dalek::StaticSecret::from([7u8; 32]));
-        let state = std::sync::Arc::new(
-            crate::runtime::anonymity_state::AnonymityState::new(
-                false,
-                0,
-                sk,
-                None,
-                Vec::new(),
-            ),
-        );
+        let state = std::sync::Arc::new(crate::runtime::anonymity_state::AnonymityState::new(
+            false,
+            0,
+            sk,
+            None,
+            Vec::new(),
+        ));
         let relay = [0xAB; 32];
         let cookie = [0xCD; 16];
         let kem = vec![0x42u8; 32];
@@ -3823,15 +3813,13 @@ mod tests {
         // The reverse order must ALSO end KEM-bearing: a KEM-less entry first,
         // then the app's KEM register, leaves the entry with the KEM.
         let sk = std::sync::Arc::new(x25519_dalek::StaticSecret::from([9u8; 32]));
-        let state = std::sync::Arc::new(
-            crate::runtime::anonymity_state::AnonymityState::new(
-                false,
-                0,
-                sk,
-                None,
-                Vec::new(),
-            ),
-        );
+        let state = std::sync::Arc::new(crate::runtime::anonymity_state::AnonymityState::new(
+            false,
+            0,
+            sk,
+            None,
+            Vec::new(),
+        ));
         let relay = [0x01; 32];
         let cookie = [0x02; 16];
         let kem = vec![0x55u8; 32];
@@ -3904,8 +3892,8 @@ mod tests {
         };
         let fresh_short = veil_anonymity::rendezvous::RendezvousAd {
             rendezvous_node_id: [0xA1; 32],
-            valid_from_unix: now,         // published now (current-period cookie)
-            valid_until_unix: now + 600,  // ...short window — would LOSE on valid_until
+            valid_from_unix: now,        // published now (current-period cookie)
+            valid_until_unix: now + 600, // ...short window — would LOSE on valid_until
             rendezvous_kem_pk: vec![2; 32],
             ..test_rendezvous_ad(0xA1, 0, 2)
         };
@@ -4031,13 +4019,7 @@ mod tests {
         let dht = Arc::new(veil_dht::KademliaService::new([9u8; 32]));
         let caps = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
-        let got = pick_rendezvous_relays_deterministic(
-            &live,
-            &dht,
-            &caps,
-            &pinned,
-            &[9u8; 32],
-        );
+        let got = pick_rendezvous_relays_deterministic(&live, &dht, &caps, &pinned, &[9u8; 32]);
         assert_eq!(
             got,
             pinned[..veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize]

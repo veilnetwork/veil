@@ -95,7 +95,8 @@ mod tests {
     #[test]
     fn distinct_per_secret() {
         let a = derive_mailbox_fetch_cookie(SECRET, &RELAY_A, 100);
-        let b = derive_mailbox_fetch_cookie(b"a DIFFERENT identity secret entirely!!", &RELAY_A, 100);
+        let b =
+            derive_mailbox_fetch_cookie(b"a DIFFERENT identity secret entirely!!", &RELAY_A, 100);
         assert_ne!(a, b, "different identities must not share a cookie");
     }
 
