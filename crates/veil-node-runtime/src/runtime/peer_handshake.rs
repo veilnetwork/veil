@@ -1113,7 +1113,9 @@ mod bypass_tests {
         // undialable → bypass so the convention can't strand them on an
         // unreachable canonical direction. This is the prod NAT'd-client fix.
         assert!(inbound_bypasses_directional(Some(PeerSource::Exchanged)));
-        assert!(inbound_bypasses_directional(Some(PeerSource::Autodiscovered)));
+        assert!(inbound_bypasses_directional(Some(
+            PeerSource::Autodiscovered
+        )));
 
         // The CONFIGURED mutual-dial mesh ([[peers]] / [[bootstrap_peers]])
         // still gets the deterministic E20 glare tiebreak — NOT bypassed —

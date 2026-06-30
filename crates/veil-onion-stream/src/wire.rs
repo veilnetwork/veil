@@ -151,7 +151,11 @@ impl Frame<'_> {
         out.clear();
         out.push(PROTO_VER);
         match *self {
-            Frame::Syn { stream_id, isn, win } => {
+            Frame::Syn {
+                stream_id,
+                isn,
+                win,
+            } => {
                 out.push(ty::SYN);
                 put_u32(out, stream_id);
                 put_u32(out, isn);
@@ -411,7 +415,11 @@ mod tests {
             payload: &payload,
         };
         let enc = f.encode();
-        assert_eq!(enc.len(), MAX_CELL, "full DATA cell must be exactly MAX_CELL");
+        assert_eq!(
+            enc.len(),
+            MAX_CELL,
+            "full DATA cell must be exactly MAX_CELL"
+        );
         assert_eq!(Frame::decode(&enc).unwrap(), f);
     }
 
@@ -424,7 +432,13 @@ mod tests {
                 end: i * 10 + 5,
             }));
         }
-        assert!(!sacks.push(SackRange { start: 9999, end: 10000 }), "9th push rejected");
+        assert!(
+            !sacks.push(SackRange {
+                start: 9999,
+                end: 10000
+            }),
+            "9th push rejected"
+        );
         let f = Frame::Ack {
             stream_id: 42,
             ack: 0,
@@ -446,7 +460,10 @@ mod tests {
         };
         let enc = f.encode();
         for cut in 0..enc.len() {
-            assert!(Frame::decode(&enc[..cut]).is_none(), "prefix {cut} must not decode");
+            assert!(
+                Frame::decode(&enc[..cut]).is_none(),
+                "prefix {cut} must not decode"
+            );
         }
     }
 
