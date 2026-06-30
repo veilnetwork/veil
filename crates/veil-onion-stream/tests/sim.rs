@@ -120,9 +120,14 @@ impl Pipe {
 struct Outcome {
     received: Vec<u8>,
     max_cwnd_a: u32,
+    max_inflight_a: u32,
+    final_a: String,
+    final_b: String,
     a_events: Vec<Event>,
     b_events: Vec<Event>,
     steps: u64,
+    elapsed_ms: u64,
+    payload_received_ms: Option<u64>,
     completed: bool,
     /// Cells A (the sender) put on the wire, incl. retransmits.
     tx_cells: u64,
@@ -146,12 +151,14 @@ fn run_oneway(payload: &[u8], ch: Channel, seed: u64, cfg: Config) -> Outcome {
     let mut a_events = Vec::new();
     let mut b_events = Vec::new();
     let mut max_cwnd_a = 0u32;
+    let mut max_inflight_a = 0u32;
 
     let mut now = 0u64;
     let mut steps = 0u64;
     let cap = 20_000_000u64;
     let mut completed = false;
     let mut max_burst_a = 0u64; // most cells A put on the wire at one instant
+    let mut payload_received_ms = None;
 
     while steps < cap {
         steps += 1;
@@ -166,6 +173,7 @@ fn run_oneway(payload: &[u8], ch: Channel, seed: u64, cfg: Config) -> Outcome {
             b2a.inject(now, &buf, &mut rng);
         }
         max_cwnd_a = max_cwnd_a.max(a.cwnd());
+        max_inflight_a = max_inflight_a.max(a.inflight_bytes());
 
         // 2. Pump reader on B + drain events.
         let mut tmp = [0u8; 4096];
@@ -175,6 +183,9 @@ fn run_oneway(payload: &[u8], ch: Channel, seed: u64, cfg: Config) -> Outcome {
                 break;
             }
             received.extend_from_slice(&tmp[..n]);
+            if received.len() == payload.len() && payload_received_ms.is_none() {
+                payload_received_ms = Some(now);
+            }
         }
         while let Some(e) = a.poll_event() {
             a_events.push(e);
@@ -227,9 +238,14 @@ fn run_oneway(payload: &[u8], ch: Channel, seed: u64, cfg: Config) -> Outcome {
     Outcome {
         received,
         max_cwnd_a,
+        max_inflight_a,
+        final_a: a.debug_summary(),
+        final_b: b.debug_summary(),
         a_events,
         b_events,
         steps,
+        elapsed_ms: now,
+        payload_received_ms,
         completed,
         tx_cells: a2b.injected,
         max_burst_a,
@@ -383,6 +399,69 @@ fn pacing_spreads_sends_no_burst() {
     assert!(
         out.max_burst_a <= 48,
         "sender burst too large ({} cells) — pacing is not spreading sends",
+        out.max_burst_a
+    );
+}
+
+#[test]
+fn circuit_profile_clean_path_exceeds_target_throughput() {
+    // Regression guard for the original device symptom: a clean pinned-circuit
+    // stream idled at ~135 KiB/s because pacing/window choices prevented it
+    // from filling the path. Model the circuit wire shape (318-byte MSS after
+    // the rendezvous splice envelope) and a measured-ish 150 ms RTT. On a lossless
+    // path the stream core must comfortably exceed the 1.5 MiB/s target; if this
+    // drops, either the old one-segment/ms floor came back or the circuit window
+    // is too small to feed the pipe.
+    let circuit_mss =
+        veil_onion_stream::MAX_CELL - 16 - 32 - veil_onion_stream::wire::DATA_OVERHEAD;
+    let cfg = Config {
+        mss: circuit_mss,
+        init_rto_ms: 12_000,
+        min_rto_ms: 10_000,
+        max_rto_ms: 60_000,
+        handshake_rto_ms: 6_000,
+        recv_window: 896 * 1024,
+        init_cwnd: (32 * circuit_mss) as u32,
+        max_pacing_batch: 8,
+        ack_every: 16,
+        ack_delay_ms: 5,
+        ..Config::default()
+    };
+    let data = payload(8 * 1024 * 1024, 51);
+    let ch = Channel {
+        loss: 0.0,
+        dup: 0.0,
+        base_delay: 75,
+        jitter: 0,
+    };
+    let out = run_oneway(&data, ch, 5150, cfg);
+    assert!(
+        out.completed,
+        "clean circuit-profile transfer did not complete in {} steps",
+        out.steps
+    );
+    assert_eq!(out.received, data);
+    let payload_ms = out
+        .payload_received_ms
+        .expect("payload completion time must be tracked");
+    assert!(payload_ms > 0, "payload elapsed time must be non-zero");
+    let mib_per_s = data.len() as f64 * 1000.0 / payload_ms as f64 / (1024.0 * 1024.0);
+    assert!(
+        mib_per_s >= 1.5,
+        "clean circuit profile too slow: {mib_per_s:.2} MiB/s over {payload_ms} ms \
+         (close={} ms); \
+         max_cwnd={} max_inflight={} tx_cells={} max_burst={} A={} B={}",
+        out.elapsed_ms,
+        out.max_cwnd_a,
+        out.max_inflight_a,
+        out.tx_cells,
+        out.max_burst_a,
+        out.final_a,
+        out.final_b
+    );
+    assert!(
+        out.max_burst_a <= 48,
+        "clean circuit profile burst too large: {} cells",
         out.max_burst_a
     );
 }

@@ -331,6 +331,9 @@ impl StreamEngine {
     pub fn cwnd(&self) -> u32 {
         self.tx.cwnd
     }
+    pub fn inflight_bytes(&self) -> u32 {
+        self.tx.snd_nxt.wrapping_sub(self.tx.snd_una)
+    }
 
     /// Debug snapshot (for diagnostics / tests).
     pub fn debug_summary(&self) -> String {
