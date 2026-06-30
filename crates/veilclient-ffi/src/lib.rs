@@ -87,6 +87,17 @@ use veilclient::{
     VeilStream as SdkStream,
 };
 
+/// Emit an FFI-side diagnostic without panicking if stderr is closed/broken.
+pub(crate) fn ffi_diag(msg: &str) {
+    #[cfg(target_os = "android")]
+    log::warn!("{msg}");
+    #[cfg(not(target_os = "android"))]
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{msg}");
+    }
+}
+
 // ── Status constants ─────────────────────────────────────────────────────────
 
 /// Operation succeeded.
@@ -486,7 +497,14 @@ pub unsafe extern "C" fn veil_anon_stream_open(
         "dst_node_id" => dst_node_id,
         "dst_app_id" => dst_app_id,
     );
-    get_or_return!(handle_live, handle_table(), handle, err_out, ptr::null_mut(), "VeilHandle");
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        ptr::null_mut(),
+        "VeilHandle"
+    );
     let mut node = [0u8; 32];
     let mut app = [0u8; 32];
     unsafe {
@@ -533,7 +551,14 @@ pub unsafe extern "C" fn veil_anon_stream_accept(
         "out_src_node_id" => out_src_node_id,
         "out_src_app_id" => out_src_app_id,
     );
-    get_or_return!(handle_live, handle_table(), handle, err_out, ptr::null_mut(), "VeilHandle");
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        ptr::null_mut(),
+        "VeilHandle"
+    );
     let hub = match ensure_anon_hub(&handle_live.bundle, &handle_live.anon_hub) {
         Ok(h) => h,
         Err(e) => {
@@ -559,7 +584,7 @@ pub unsafe extern "C" fn veil_anon_stream_accept(
             };
             HandleTable::insert(anon_stream_table(), ffi) as *mut VeilAnonStreamFfi
         }
-        Ok(None) => ptr::null_mut(),  // hub closed
+        Ok(None) => ptr::null_mut(),      // hub closed
         Err(_elapsed) => ptr::null_mut(), // timeout — caller polls again
     }
 }
@@ -587,7 +612,14 @@ pub unsafe extern "C" fn veil_anon_stream_read(
         unsafe { write_err(err_out, format!("cap {cap} exceeds VEIL_MAX_DATA_LEN")) };
         return VEIL_ERR_INVALID_ARG as ssize_t;
     }
-    get_or_return!(stream_ref, anon_stream_table(), stream, err_out, VEIL_ERR_INVALID_ARG as ssize_t, "VeilAnonStreamFfi");
+    get_or_return!(
+        stream_ref,
+        anon_stream_table(),
+        stream,
+        err_out,
+        VEIL_ERR_INVALID_ARG as ssize_t,
+        "VeilAnonStreamFfi"
+    );
     let res: Result<usize, String> = stream_ref.bundle.runtime.block_on(async {
         let mut guard = stream_ref.reader.lock().await;
         let Some(rd) = guard.as_mut() else {
@@ -627,7 +659,14 @@ pub unsafe extern "C" fn veil_anon_stream_write(
         unsafe { write_err(err_out, format!("data len {len} exceeds VEIL_MAX_DATA_LEN")) };
         return VEIL_ERR_INVALID_ARG;
     }
-    get_or_return!(stream_ref, anon_stream_table(), stream, err_out, VEIL_ERR_INVALID_ARG, "VeilAnonStreamFfi");
+    get_or_return!(
+        stream_ref,
+        anon_stream_table(),
+        stream,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilAnonStreamFfi"
+    );
     let payload = if len == 0 {
         Vec::new()
     } else {
@@ -660,7 +699,14 @@ pub unsafe extern "C" fn veil_anon_stream_finish(
         return rc;
     }
     null_check!(err_out, "stream" => stream);
-    get_or_return!(stream_ref, anon_stream_table(), stream, err_out, VEIL_ERR_INVALID_ARG, "VeilAnonStreamFfi");
+    get_or_return!(
+        stream_ref,
+        anon_stream_table(),
+        stream,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilAnonStreamFfi"
+    );
     let res: Result<(), String> = stream_ref.bundle.runtime.block_on(async {
         let guard = stream_ref.writer.lock().await;
         let Some(wr) = guard.as_ref() else {
@@ -1396,7 +1442,10 @@ pub unsafe extern "C" fn veil_send_anonymous_authenticated_direct_with_reply(
     err_out: *mut *mut c_char,
 ) -> c_int {
     if let Err(rc) = unsafe {
-        guard::ffi_prelude(err_out, "veil_send_anonymous_authenticated_direct_with_reply")
+        guard::ffi_prelude(
+            err_out,
+            "veil_send_anonymous_authenticated_direct_with_reply",
+        )
     } {
         return rc;
     }
@@ -1465,7 +1514,10 @@ pub unsafe extern "C" fn veil_send_anonymous_authenticated_direct_with_reply(
         Err(e) => {
             let s = e.to_string();
             unsafe {
-                write_err(err_out, format!("authenticated anonymous direct send failed: {s}"));
+                write_err(
+                    err_out,
+                    format!("authenticated anonymous direct send failed: {s}"),
+                );
             }
             if s.contains("app already closed") {
                 VEIL_ERR_CLOSED
@@ -1761,7 +1813,7 @@ pub unsafe extern "C" fn veil_app_set_recv_handler(
                             base, total_len,
                         )));
                     }
-                    eprintln!(
+                    ffi_diag(
                         "[veilclient-ffi] recv-handler callback panicked; \
                          frame dropped, channel kept open",
                     );
@@ -1857,7 +1909,14 @@ pub unsafe extern "C" fn veil_stream_accept(
         "app" => app,
         "out_src_node_id" => out_src_node_id,
     );
-    get_or_return!(app_ref, app_table(), app, err_out, ptr::null_mut(), "VeilApp");
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        ptr::null_mut(),
+        "VeilApp"
+    );
     // Drain the inbound-stream channel with a bounded wait. Holding the lock
     // across the await serializes accept calls — fine: a single accept loop owns
     // the receive side. A modest timeout lets the Dart caller poll/abort.
@@ -1866,12 +1925,7 @@ pub unsafe extern "C" fn veil_stream_accept(
         let Some(rx) = guard.as_mut() else {
             return Err("inbound-stream receiver gone (app closed)".to_string());
         };
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            rx.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx.recv()).await {
             Ok(Some(incoming)) => Ok(Some(incoming)),
             Ok(None) => Err("inbound-stream channel closed".to_string()),
             Err(_elapsed) => Ok(None), // timeout — caller polls again
@@ -1997,7 +2051,14 @@ unsafe fn aead_run(
         }
         Err(_) => {
             unsafe {
-                write_err(err_out, if seal { "seal failed" } else { "unseal failed (bad key/nonce/tag)" });
+                write_err(
+                    err_out,
+                    if seal {
+                        "seal failed"
+                    } else {
+                        "unseal failed (bad key/nonce/tag)"
+                    },
+                );
             }
             VEIL_ERR
         }
@@ -2478,7 +2539,10 @@ pub unsafe extern "C" fn veil_register_rendezvous_publisher(
         Ok(()) => VEIL_OK,
         Err(e) => {
             unsafe {
-                write_err(err_out, format!("register_rendezvous_publisher failed: {e}"));
+                write_err(
+                    err_out,
+                    format!("register_rendezvous_publisher failed: {e}"),
+                );
             }
             VEIL_ERR
         }
@@ -4299,7 +4363,7 @@ pub unsafe extern "C" fn veil_peers_list(
                     );
                 }));
                 if result.is_err() {
-                    eprintln!(
+                    ffi_diag(
                         "[veilclient-ffi] peers_list callback panicked; \
                          entry skipped, iteration continues",
                     );
@@ -5016,7 +5080,7 @@ pub unsafe extern "C" fn veil_set_event_handler(
                         )));
                     }
                 }
-                eprintln!(
+                ffi_diag(
                     "[veilclient-ffi] event-handler callback panicked; \
                      event dropped, stream kept open",
                 );
