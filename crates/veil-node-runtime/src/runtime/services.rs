@@ -18,21 +18,36 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard, RwLock,
+        Arc, Mutex, MutexGuard, OnceLock, RwLock,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Instant,
 };
 use veil_util::lock;
 
-/// Embedded-node bridge (onion-stream Phase 1d): the FFI runs the node IN-PROCESS
-/// but `veilclient` talks to it over IPC, which has no pinned-circuit surface. So
-/// the runtime publishes a [`NodeServices`] VIEW here at startup (Arc clones of
-/// the LIVE node state — incl. the dispatcher whose `stream_recv` the R-splice
-/// feeds), and `veilclient-ffi` grabs it to drive stateful stream circuits
-/// directly, bypassing IPC. Embedded-only (one in-process node per process); set
-/// once at start (first wins).
-static EMBEDDED_SERVICES: std::sync::Mutex<Option<NodeServices>> = std::sync::Mutex::new(None);
+/// Embedded-node bridge (onion-stream Phase 1d): the FFI runs nodes IN-PROCESS
+/// but `veilclient` talks to them over IPC, which has no pinned-circuit surface.
+/// So each runtime publishes a [`NodeServices`] VIEW here at startup (Arc clones
+/// of the LIVE node state — incl. the dispatcher whose `stream_recv` the
+/// R-splice feeds), and `veilclient-ffi` grabs the view matching the IPC
+/// handle's node_id to drive stateful stream circuits directly, bypassing IPC.
+///
+/// The original bridge was a single global `Option<NodeServices>`, which worked
+/// for one mobile/desktop identity but made two embedded nodes in one process
+/// race: the last one to boot silently stole every anonymous-stream circuit.
+/// Keep a `latest` fallback for old single-node callers, but key the production
+/// lookup by node_id so multi-identity and local two-node embedded tests use the
+/// right circuit context.
+#[derive(Default)]
+struct EmbeddedServicesRegistry {
+    latest: Option<NodeServices>,
+    by_node: BTreeMap<[u8; 32], NodeServices>,
+}
+
+fn embedded_services_registry() -> &'static Mutex<EmbeddedServicesRegistry> {
+    static REGISTRY: OnceLock<Mutex<EmbeddedServicesRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(EmbeddedServicesRegistry::default()))
+}
 
 /// Publish the in-process node's services for the embedded FFI. OVERWRITES — a
 /// deferred-init node first starts under an empty STUB config (empty DHT) and
@@ -40,16 +55,29 @@ static EMBEDDED_SERVICES: std::sync::Mutex<Option<NodeServices>> = std::sync::Mu
 /// (post-reload) services win. Without this the FFI captured the stub's empty DHT
 /// → circuit relay selection found nothing → datagram fallback.
 pub fn publish_embedded_services(services: NodeServices) {
-    if let Ok(mut g) = EMBEDDED_SERVICES.lock() {
-        *g = Some(services);
+    let node_id = services.local_node_id();
+    if let Ok(mut g) = embedded_services_registry().lock() {
+        g.by_node.insert(node_id, services.clone());
+        g.latest = Some(services);
     }
+}
+
+/// A clone of the CURRENT services for a specific embedded node id.
+pub fn embedded_services_for(node_id: &[u8; 32]) -> Option<NodeServices> {
+    embedded_services_registry()
+        .lock()
+        .ok()
+        .and_then(|g| g.by_node.get(node_id).cloned())
 }
 
 /// A clone of the in-process node's CURRENT services, if an embedded node is up —
 /// the embedded FFI's handle to `open_stream_circuit_auto` / `send_circuit_cell`.
 /// `NodeServices` is all-Arc-clones, so the clone shares the live node state.
 pub fn embedded_services() -> Option<NodeServices> {
-    EMBEDDED_SERVICES.lock().ok().and_then(|g| g.clone())
+    embedded_services_registry()
+        .lock()
+        .ok()
+        .and_then(|g| g.latest.clone())
 }
 
 #[allow(unused_imports)]
