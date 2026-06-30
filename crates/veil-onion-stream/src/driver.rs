@@ -227,20 +227,8 @@ async fn drive<D: CellDuplex>(
     let now_ms = |b: &Instant| b.elapsed().as_millis() as u64;
     let mut cmd_open = true;
     let mut cell = Vec::with_capacity(crate::wire::MAX_CELL);
-    let mut last_debug_ms = 0u64;
     loop {
         let now = now_ms(&base);
-        if now.saturating_sub(last_debug_ms) >= 2_000
-            && (engine.send_buffer_len() > 0 || engine.readable_len() > 0)
-        {
-            last_debug_ms = now;
-            log::warn!(
-                "onion-stream-driver: send_buf={} readable={} {}",
-                engine.send_buffer_len(),
-                engine.readable_len(),
-                engine.debug_summary()
-            );
-        }
 
         // 0. Once the peer has finished AND we've handed off everything we
         //    received, close our own (often empty) write half so both ends
