@@ -6646,13 +6646,27 @@ impl NodeServices {
         relays
     }
 
-    /// Resolve the receiver's currently valid published rendezvous relays in the
+    /// Decrypt a small onion-stream peer-introduction payload sealed to this
+    /// node's advertised rendezvous X25519 key. Used by the pinned stream
+    /// circuit to hide the sender node id from the rendezvous relay while still
+    /// letting the receiver demux stream cells by the real peer id.
+    pub fn decrypt_stream_peer_intro(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        let sk = self.dispatcher.anonymity_x25519_sk.as_ref()?;
+        veil_anonymity::rendezvous::decrypt_introduce(ciphertext, sk.as_ref()).ok()
+    }
+
+    /// Resolve the receiver's currently valid published rendezvous ads in the
     /// same deterministic order every caller sees: newest ads first, then relay
-    /// id. Returned relays are de-duplicated while preserving that order.
-    pub async fn resolve_stream_rendezvous_relays(
+    /// id. The full ad is needed by the pinned stream path so handshake cells can
+    /// seal a peer-introduction payload to the receiver's X25519 key without
+    /// exposing the sender node id to the rendezvous relay.
+    pub async fn resolve_stream_rendezvous_ads(
         &self,
         receiver_node_id: [u8; 32],
-    ) -> std::result::Result<Vec<[u8; 32]>, veil_types::AnonOnionSendError> {
+    ) -> std::result::Result<
+        Vec<veil_anonymity::rendezvous::RendezvousAd>,
+        veil_types::AnonOnionSendError,
+    > {
         use veil_types::AnonOnionSendError;
 
         const AD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
@@ -6668,6 +6682,23 @@ impl NodeServices {
             AD_RESOLVE_TIMEOUT,
         )
         .await;
+
+        if ads.is_empty() {
+            return Err(AnonOnionSendError::NoRendezvous);
+        }
+        Ok(ads)
+    }
+
+    /// Resolve the receiver's currently valid published rendezvous relays in the
+    /// same deterministic order every caller sees: newest ads first, then relay
+    /// id. Returned relays are de-duplicated while preserving that order.
+    pub async fn resolve_stream_rendezvous_relays(
+        &self,
+        receiver_node_id: [u8; 32],
+    ) -> std::result::Result<Vec<[u8; 32]>, veil_types::AnonOnionSendError> {
+        use veil_types::AnonOnionSendError;
+
+        let ads = self.resolve_stream_rendezvous_ads(receiver_node_id).await?;
 
         let mut relays = Vec::new();
         for ad in ads {
