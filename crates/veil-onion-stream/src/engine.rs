@@ -38,6 +38,15 @@ pub struct Config {
     pub max_retransmits: u32,
     /// Handshake (SYN/SYN_ACK) retransmit interval.
     pub handshake_rto_ms: u64,
+    /// Maximum number of NEW-data segments released on one millisecond pacing
+    /// tick. This bounds the microburst presented to the carrier while allowing
+    /// rates above the old one-MSS-per-ms ceiling.
+    pub max_pacing_batch: u32,
+    /// Number of contiguous advancing DATA segments acknowledged by one
+    /// cumulative ACK. Gaps, duplicates and FIN always ACK immediately.
+    pub ack_every: u8,
+    /// Maximum delay before acknowledging a partial [`Self::ack_every`] group.
+    pub ack_delay_ms: u64,
 }
 
 impl Default for Config {
@@ -53,6 +62,9 @@ impl Default for Config {
             max_rto_ms: 30_000,
             max_retransmits: 12,
             handshake_rto_ms: 1000,
+            max_pacing_batch: 4,
+            ack_every: 2,
+            ack_delay_ms: 5,
         }
     }
 }
@@ -95,7 +107,11 @@ struct Seg {
 impl Seg {
     /// Sequence space this segment consumes (FIN consumes 1).
     fn span(&self) -> u32 {
-        if self.is_fin { 1 } else { self.data.len() as u32 }
+        if self.is_fin {
+            1
+        } else {
+            self.data.len() as u32
+        }
     }
     fn end(&self) -> u32 {
         self.seq.wrapping_add(self.span())
@@ -126,6 +142,8 @@ struct TxState {
     /// instead of bursting it — a burst overruns the onion relay's bounded queue
     /// and triggers catastrophic multi-thousand-cell loss (slow-start overshoot).
     pace_next_ms: u64,
+    /// New-data segments left in the current millisecond pacing tick.
+    pace_budget: u32,
     fin_requested: bool,
     fin_sent: bool,
     fin_acked: bool,
@@ -156,6 +174,10 @@ pub struct StreamEngine {
     /// Consecutive handshake retransmits with no peer response (dead detection).
     hs_retries: u32,
     ack_pending: bool,
+    /// Delayed-ACK state: ACK after the configured number of advancing DATA
+    /// segments, or after a short timer. Gaps/duplicates/FIN are immediate.
+    ack_eliciting: u8,
+    ack_deadline: Option<u64>,
     rst_to_send: Option<u8>,
     /// Zero-window persist timer: when the peer advertises a 0 window and we have
     /// data to send, probe periodically so a re-opened window can't deadlock us.
@@ -205,6 +227,7 @@ impl StreamEngine {
                 rto_deadline: None,
                 consec_rto: 0,
                 pace_next_ms: 0,
+                pace_budget: 0,
                 fin_requested: false,
                 fin_sent: false,
                 fin_acked: false,
@@ -224,6 +247,8 @@ impl StreamEngine {
             hs_deadline: None,
             hs_retries: 0,
             ack_pending: false,
+            ack_eliciting: 0,
+            ack_deadline: None,
             rst_to_send: None,
             persist_deadline: None,
             force_probe: false,
@@ -303,7 +328,9 @@ impl StreamEngine {
         format!(
             "phase={:?} una={} nxt={} inflight={} cwnd={} ssth={} rwnd={} segs={}(sack={} resend={}) \
              pending={} dup={} recov={} consec_rto={} | rcv_nxt={} read_buf={} oo={} oo_bytes={} \
-             adv={} ack_pending={} eof={} fin(req={},sent={},ack={}) rto_dl={:?} persist_dl={:?}",
+             adv={} ack_pending={} eof={} fin(req={},sent={},ack={}) \
+             srtt={:?} rttvar={} rto={}ms pace_next={}ms delayed_ack={}/{:?} \
+             rto_dl={:?} persist_dl={:?}",
             self.phase,
             self.tx.snd_una,
             self.tx.snd_nxt,
@@ -328,6 +355,12 @@ impl StreamEngine {
             self.tx.fin_requested,
             self.tx.fin_sent,
             self.tx.fin_acked,
+            self.tx.srtt,
+            self.tx.rttvar,
+            self.tx.rto_ms,
+            self.tx.pace_next_ms,
+            self.ack_eliciting,
+            self.ack_deadline,
             self.tx.rto_deadline,
             self.persist_deadline,
         )
@@ -346,8 +379,12 @@ impl StreamEngine {
         match frame {
             Frame::Syn { isn, win, .. } => self.on_syn(isn, win, now),
             Frame::SynAck { isn, win, ack, .. } => self.on_synack(isn, win, ack, now),
-            Frame::Data { seq, win, payload, .. } => self.on_data(seq, win, payload, now),
-            Frame::Ack { ack, win, sacks, .. } => self.on_ack(ack, win, &sacks, now),
+            Frame::Data {
+                seq, win, payload, ..
+            } => self.on_data(seq, win, payload, now),
+            Frame::Ack {
+                ack, win, sacks, ..
+            } => self.on_ack(ack, win, &sacks, now),
             Frame::Fin { seq, .. } => self.on_peer_fin(seq, now),
             Frame::Rst { reason, .. } => self.on_rst(reason),
         }
@@ -382,10 +419,10 @@ impl StreamEngine {
             self.hs_deadline = None;
             self.hs_retries = 0;
             self.phase = Phase::Established;
-            self.ack_pending = true; // tell the peer we're up (implicit SYN_ACK ack)
+            self.ack_now(); // tell the peer we're up (implicit SYN_ACK ack)
             self.events.push_back(Event::Connected);
         } else if self.phase == Phase::Established {
-            self.ack_pending = true;
+            self.ack_now();
         }
     }
 
@@ -407,10 +444,8 @@ impl StreamEngine {
         if payload.is_empty() {
             return;
         }
-        let _ = now;
-        self.rx.accept(seg_seq, payload);
-        // Always (dup-)ACK so the sender can fast-retransmit on gaps.
-        self.ack_pending = true;
+        let advanced = self.rx.accept(seg_seq, payload);
+        self.ack_data(advanced, now);
     }
 
     fn on_peer_fin(&mut self, fin_seq: u32, now: u64) {
@@ -424,7 +459,7 @@ impl StreamEngine {
         if self.rx.eof && !self.events.iter().any(|e| *e == Event::PeerFinished) {
             self.events.push_back(Event::PeerFinished);
         }
-        self.ack_pending = true;
+        self.ack_now();
     }
 
     fn on_rst(&mut self, reason: u8) {
@@ -438,6 +473,12 @@ impl StreamEngine {
         self.tx.rwnd = win;
         self.note_peer_progress();
         if self.phase == Phase::SynSent || self.phase == Phase::Closed {
+            return;
+        }
+        // Never let a malformed/hostile cumulative ACK advance beyond bytes we
+        // actually sent. Besides corrupting snd_una, that would turn byte-counted
+        // congestion growth below into an arbitrary cwnd jump.
+        if seq::gt(ack, self.tx.snd_nxt) {
             return;
         }
         // SACK: mark fully-covered unacked segments as RECEIVED so a later RTO /
@@ -484,9 +525,17 @@ impl StreamEngine {
                     self.tx.cwnd = self.tx.cwnd.saturating_add(mss);
                 }
             } else if self.tx.cwnd < self.tx.ssthresh {
-                self.tx.cwnd = self.tx.cwnd.saturating_add(acked.min(mss)); // slow start
+                // Appropriate Byte Counting: cumulative/delayed ACKs represent
+                // every newly acknowledged byte, not one synthetic MSS. This
+                // keeps slow-start growth invariant when the receiver thins
+                // fixed-size ACK cells (ACK×2 and ACK×32 should both roughly
+                // double cwnd per RTT).
+                self.tx.cwnd = self.tx.cwnd.saturating_add(acked);
             } else {
-                let inc = ((mss as u64 * mss as u64) / self.tx.cwnd.max(1) as u64).max(1) as u32;
+                // One MSS per cwnd bytes acknowledged, scaled by the actual
+                // cumulative ACK span so delayed ACKs do not slow additive
+                // increase merely by reducing packet count.
+                let inc = ((mss as u64 * acked as u64) / self.tx.cwnd.max(1) as u64).max(1) as u32;
                 self.tx.cwnd = self.tx.cwnd.saturating_add(inc); // congestion avoidance
             }
 
@@ -517,7 +566,13 @@ impl StreamEngine {
     pub fn poll_transmit(&mut self, now: u64, out: &mut Vec<u8>) -> bool {
         // 1. RST is terminal + highest priority.
         if let Some(reason) = self.rst_to_send.take() {
-            encode(Frame::Rst { stream_id: self.stream_id, reason }, out);
+            encode(
+                Frame::Rst {
+                    stream_id: self.stream_id,
+                    reason,
+                },
+                out,
+            );
             return true;
         }
         // 2. Handshake.
@@ -556,13 +611,16 @@ impl StreamEngine {
                 self.encode_seg_at(idx, out);
                 return true;
             }
-            // 3b. New data / FIN, congestion + flow limited + PACED. Emit at most
-            //     one new segment per pacing interval so a cwnd's worth of data
-            //     trickles out across an RTT instead of bursting (a burst overruns
-            //     the relay queue → slow-start-overshoot collapse). A persist probe
-            //     bypasses pacing. Retransmits (3a above) are never paced.
-            if (self.force_probe || now >= self.tx.pace_next_ms) && self.create_next_segment(now) {
-                self.tx.pace_next_ms = now + self.pace_interval_ms();
+            // 3b. New data / FIN, congestion + flow limited + PACED. At rates
+            //     above one segment/ms, refill a small per-tick budget instead of
+            //     flattening every path to the old MSS/ms timer floor.
+            if now >= self.tx.pace_next_ms {
+                let (interval, batch) = self.pace_params();
+                self.tx.pace_budget = batch;
+                self.tx.pace_next_ms = now + interval;
+            }
+            if (self.force_probe || self.tx.pace_budget > 0) && self.create_next_segment(now) {
+                self.tx.pace_budget = self.tx.pace_budget.saturating_sub(1);
                 self.encode_seg_at(self.tx.segs.len() - 1, out);
                 return true;
             }
@@ -570,6 +628,8 @@ impl StreamEngine {
         // 4. Standalone ACK.
         if self.ack_pending && self.phase != Phase::Closed {
             self.ack_pending = false;
+            self.ack_eliciting = 0;
+            self.ack_deadline = None;
             let f = self.make_ack();
             encode(f, out);
             return true;
@@ -661,7 +721,10 @@ impl StreamEngine {
         let win = self.rx.advertised();
         let seg = &self.tx.segs[idx];
         let frame = if seg.is_fin {
-            Frame::Fin { stream_id: self.stream_id, seq: seg.seq }
+            Frame::Fin {
+                stream_id: self.stream_id,
+                seq: seg.seq,
+            }
         } else {
             Frame::Data {
                 stream_id: self.stream_id,
@@ -694,9 +757,7 @@ impl StreamEngine {
         }
         // Fallback (classic fast-retransmit): nothing meets the SACK loss bar yet
         // → retransmit just the oldest unacked segment.
-        if !any
-            && let Some(f) = self.tx.segs.front_mut()
-        {
+        if !any && let Some(f) = self.tx.segs.front_mut() {
             f.needs_resend = true;
         }
     }
@@ -722,6 +783,9 @@ impl StreamEngine {
     pub fn on_timeout(&mut self, now: u64) {
         if self.phase == Phase::Closed {
             return;
+        }
+        if self.ack_deadline.is_some_and(|dl| now >= dl) {
+            self.ack_now();
         }
         if self.syn_acked {
             self.hs_deadline = None; // stale once the handshake is confirmed
@@ -798,6 +862,7 @@ impl StreamEngine {
         merge(self.hs_deadline);
         merge(self.tx.rto_deadline);
         merge(self.persist_deadline);
+        merge(self.ack_deadline);
         // If new data is ready but held back only by pacing, wake to release it.
         if self.phase == Phase::Established && self.paced_send_ready() {
             merge(Some(self.tx.pace_next_ms));
@@ -805,30 +870,32 @@ impl StreamEngine {
         t
     }
 
-    /// Per-segment pacing interval (ms): spread one `cwnd` of bytes across one
-    /// smoothed RTT so the send rate tracks the bottleneck without bursting.
-    /// Returns 0 until the first RTT sample — the initial cwnd (a few dozen
-    /// cells) is small enough to burst safely, and pacing it off a guessed RTT
-    /// would crawl. Floored at 1 ms once paced to bound driver wakeups (the
-    /// implied ~MSS/ms cap sits far above any onion path's real throughput).
-    fn pace_interval_ms(&self) -> u64 {
-        let Some(srtt) = self.tx.srtt else { return 0 };
-        let mss = self.cfg.mss as u64;
+    /// Pacing as `(tick_interval_ms, segments_per_tick)`. Sub-millisecond rates
+    /// are represented by a small batch on a 1 ms tick; slower rates use one
+    /// segment every N milliseconds.
+    fn pace_params(&self) -> (u64, u32) {
+        let Some(srtt) = self.tx.srtt else {
+            return (0, u32::MAX);
+        };
         // Spread the EFFECTIVE window (min of cwnd and the peer's rwnd) across one
         // RTT — never cwnd alone. When cwnd has run far past a smaller rwnd, pacing
         // off cwnd would send much faster than the window can ever drain, rebuilding
         // the very relay-queue backlog pacing exists to avoid.
         let win = self.tx.cwnd.min(self.tx.rwnd).max(self.cfg.mss as u32) as u64;
-        let base = mss.saturating_mul(srtt as u64) / win;
-        // In slow start (incl. post-loss re-ramp), pace 2x faster so cwnd can
-        // still DOUBLE each RTT. At 1x, pacing releases ~one segment per interval
-        // → cwnd grows only linearly (1 MSS/RTT) → recovery from a collapse is
-        // glacial on a multi-second onion RTT (the "stuck at 44 %" crawl). 2x is
-        // the standard slow-start pacing gain.
-        if self.tx.cwnd < self.tx.ssthresh {
-            (base / 2).max(1)
+        let gain = if self.tx.cwnd < self.tx.ssthresh {
+            2
         } else {
-            base.max(1)
+            1
+        };
+        let num = win.saturating_mul(gain);
+        let den = (srtt as u64).max(1).saturating_mul(self.cfg.mss as u64);
+        if num >= den {
+            (
+                1,
+                (num / den).clamp(1, self.cfg.max_pacing_batch.max(1) as u64) as u32,
+            )
+        } else {
+            (den.div_ceil(num).max(1), 1)
         }
     }
 
@@ -847,6 +914,31 @@ impl StreamEngine {
         self.phase = Phase::Closed;
         self.rst_to_send = Some(reset_reason::TIMED_OUT);
         self.events.push_back(Event::Reset(reset_reason::TIMED_OUT));
+    }
+
+    /// Queue an immediate cumulative ACK. Used for gaps, duplicates, FIN and
+    /// handshake confirmation where waiting would delay recovery/progress.
+    fn ack_now(&mut self) {
+        self.ack_pending = true;
+        self.ack_eliciting = 0;
+        self.ack_deadline = None;
+    }
+
+    /// TCP-style delayed ACK: cumulatively acknowledge every configured group
+    /// of advancing DATA segments, otherwise within the configured delay. A
+    /// non-advancing segment is a gap/duplicate and must emit a dup-ACK
+    /// immediately for fast retransmit.
+    fn ack_data(&mut self, advanced: bool, now: u64) {
+        if !advanced {
+            self.ack_now();
+            return;
+        }
+        self.ack_eliciting = self.ack_eliciting.saturating_add(1);
+        if self.ack_eliciting >= self.cfg.ack_every.max(1) {
+            self.ack_now();
+        } else if self.ack_deadline.is_none() {
+            self.ack_deadline = Some(now + self.cfg.ack_delay_ms.max(1));
+        }
     }
 }
 

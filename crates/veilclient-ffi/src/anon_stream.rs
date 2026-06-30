@@ -64,12 +64,16 @@ fn circuit_enabled() -> bool {
 
 /// Smaller MSS for the circuit path so the onion-stream cell + the
 /// `[cookie 16][sender_node 32]` splice envelope fit one 384-B CircuitData cell.
-const CIRCUIT_MSS: usize = 256;
+const CIRCUIT_MSS: usize =
+    veil_onion_stream::wire::MAX_CELL - COOKIE_LEN - 32 - veil_onion_stream::wire::DATA_OVERHEAD; // 318 B payload, exactly fills 382-B inner
 
 /// Deterministic 16-byte stream cookie for a node — both ends derive the peer's
 /// the same way (domain-separated app-id, distinct from the chat endpoint).
 fn stream_cookie(node: &[u8; 32]) -> [u8; COOKIE_LEN] {
-    let id = veil_app::address::app_id(node, STREAM_NAMESPACE, "stream-cookie");
+    // v2 leaves any pre-fix registration (whose random anti-squat key cannot be
+    // reproduced after a hub restart) in a different relay-registry slot. Both
+    // updated peers derive the same v2 cookie immediately; no 600 s TTL wait.
+    let id = veil_app::address::app_id(node, STREAM_NAMESPACE, "stream-cookie-v2");
     let mut c = [0u8; COOKIE_LEN];
     c.copy_from_slice(&id[..COOKIE_LEN]);
     c
@@ -137,14 +141,20 @@ impl CellSender for HubCells {
 
 /// Inbound feed for the datagram path: authenticated anonymous datagrams on the
 /// stream endpoint → (Addr{src_node, derived_app}, cell).
-fn spawn_anon_feed(mut msg_rx: mpsc::Receiver<IncomingMessage>, in_tx: mpsc::Sender<(Addr, Vec<u8>)>) {
+fn spawn_anon_feed(
+    mut msg_rx: mpsc::Receiver<IncomingMessage>,
+    in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
+) {
     tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
             // The authenticated anonymous transport delivers src_app_id = [0;32]
             // (no sender app id) — DERIVE the peer's stream endpoint app from its
             // node id (the deterministic `app_id(node, ns, name)` both ends bind).
             let app = veil_app::address::app_id(&msg.src_node_id, STREAM_NAMESPACE, STREAM_NAME);
-            let addr = Addr { node: msg.src_node_id, app };
+            let addr = Addr {
+                node: msg.src_node_id,
+                app,
+            };
             if in_tx.send((addr, msg.data)).await.is_err() {
                 break;
             }
@@ -181,7 +191,12 @@ impl AnonStreamHub {
             None => {
                 // Datagram path (default / fallback): feed inbound from msg_rx.
                 spawn_anon_feed(msg_rx, in_tx);
-                (HubCells::Anon(AnonCells { sender: sender.clone() }), veil_onion_stream::MSS)
+                (
+                    HubCells::Anon(AnonCells {
+                        sender: sender.clone(),
+                    }),
+                    veil_onion_stream::MSS,
+                )
             }
         };
         // Surface which backend engaged (desktop: stderr; phone: logcat).
@@ -204,7 +219,12 @@ impl AnonStreamHub {
         // it). The LOSSY datagram path keeps the small window — a big one there
         // re-arms the slow-start-overshoot relay-queue drop the saga fought.
         let recv_window = match &cells {
-            HubCells::Circuit(_) => (12_288 * mss) as u32, // mss 256 → 3 MB
+            // Bound standing data to a little over 3x the measured clean-path
+            // BDP (~225 KiB at 1.5 MiB/s × 150 ms). The former 3–4 MiB window
+            // let a fixed-rate pacer build a multi-megabyte relay queue before
+            // end-to-end loss became visible, producing tens of thousands of
+            // correlated drops and an RTO collapse.
+            HubCells::Circuit(_) => 896 * 1024,
             HubCells::Anon(_) => (1024 * mss) as u32,
         };
         let cfg = Config {
@@ -216,10 +236,28 @@ impl AnonStreamHub {
             max_retransmits: 15,
             recv_window,
             init_cwnd: (32 * mss) as u32,
+            max_pacing_batch: if matches!(&cells, HubCells::Circuit(_)) {
+                24
+            } else {
+                4
+            },
+            // Every ACK consumes the same fixed-size circuit cell as DATA.
+            // The pinned path is loss-free/in-order, so cumulative ACKs can be
+            // thinned without delaying loss signalling: gaps and duplicates
+            // still ACK immediately, and the timer bounds tail latency.
+            ack_every: if matches!(&cells, HubCells::Circuit(_)) {
+                32
+            } else {
+                2
+            },
+            ack_delay_ms: 5,
             ..Config::default()
         };
         let mux = Arc::new(StreamMux::new(me, Arc::new(cells), in_rx, cfg));
-        AnonStreamHub { mux, _sender: sender }
+        AnonStreamHub {
+            mux,
+            _sender: sender,
+        }
     }
 
     /// Open a stream to a peer (`dst` = its node id + stream-endpoint app id).
@@ -246,10 +284,20 @@ fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Optio
     // Open the circuit to R in the BACKGROUND (async relay-dir fetch + CircuitBuild
     // + ACK). Proactive (not lazy-on-send) so the RECEIVER is ready to take inbound
     // splices before it ever sends. Cells before it's up drop; the ARQ resends.
+    //
+    // A relay circuit is idle-GC'd after 300 s. Keeping this handle forever made
+    // the first transfer after five idle minutes black-hole: the local origin and
+    // CellSender still existed, but R no longer had the forward lookup. Refresh at
+    // 120 s, wait for CircuitBuilt before swapping, and leave the old return sink
+    // alive briefly so in-flight cells from the previous path can drain.
     let circuit_slot = Arc::clone(&circuit);
     let services_bg = services.clone();
     tokio::spawn(async move {
-        let reg_kp = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+        const REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+        const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        const RETIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let reg_kp = services_bg.onion_stream_registration_keypair();
         let epoch = AtomicU64::new(0);
         // The proactive open fires at hub creation — which, on the RECEIVER, is the
         // accept loop starting right after node-arm, BEFORE any relay session is up
@@ -260,39 +308,92 @@ fn try_open_circuit(me: [u8; 32], in_tx: mpsc::Sender<(Addr, Vec<u8>)>) -> Optio
         // on app exit, so an indefinite wait through a long pre-unlock idle is fine.
         let mut backoff_ms = 1_500u64;
         let mut attempt = 0u32;
-        let (circ, mut recv_rx) = loop {
+        let mut generation = 0u64;
+        loop {
             attempt += 1;
-            match services_bg
+            let (candidate, mut recv_rx) = match services_bg
                 .open_stream_circuit_auto(cookie, &reg_kp, &epoch)
                 .await
             {
-                Ok(pair) => break pair,
+                Ok(pair) => pair,
                 Err(e) => {
                     if attempt == 1 || attempt % 15 == 0 {
-                        diag(&format!("onion-stream: circuit open retry #{attempt}: {e:?}"));
+                        diag(&format!(
+                            "onion-stream: circuit open retry #{attempt}: {e:?}"
+                        ));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms = backoff_ms.saturating_mul(2).min(8_000);
-                }
-            }
-        };
-        // Inbound feed: each return cell is `[sender_node 32][stream cell]`.
-        tokio::spawn(async move {
-            while let Some(framed) = recv_rx.recv().await {
-                if framed.len() < 32 {
                     continue;
                 }
-                let mut node = [0u8; 32];
-                node.copy_from_slice(&framed[..32]);
-                let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
-                let cell = framed[32..].to_vec();
-                if in_tx.send((Addr { node, app }, cell)).await.is_err() {
-                    break;
-                }
+            };
+
+            // open_stream_circuit_auto is intentionally optimistic: it returns
+            // once CircuitBuild is queued. Do not publish the handle until R has
+            // accepted the cookie registration and CircuitBuilt came back.
+            let confirm_deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
+            while !candidate.is_confirmed() && tokio::time::Instant::now() < confirm_deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-        });
-        *circuit_slot.lock().await = Some(circ);
-        diag(&format!("onion-stream: PINNED CIRCUIT opened (after {attempt} tries)"));
+            if !candidate.is_confirmed() {
+                services_bg.close_data_circuit(candidate.origin_circuit_id());
+                if attempt == 1 || attempt % 15 == 0 {
+                    diag(&format!(
+                        "onion-stream: circuit confirmation timed out on attempt #{attempt}"
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = backoff_ms.saturating_mul(2).min(8_000);
+                continue;
+            }
+
+            // Inbound feed: each return cell is `[sender_node 32][stream cell]`.
+            // Start it before swapping so cells arriving immediately after the
+            // confirmation are already consumed from the bounded return queue.
+            let feed_tx = in_tx.clone();
+            tokio::spawn(async move {
+                while let Some(framed) = recv_rx.recv().await {
+                    if framed.len() < 32 {
+                        continue;
+                    }
+                    let mut node = [0u8; 32];
+                    node.copy_from_slice(&framed[..32]);
+                    let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
+                    let cell = framed[32..].to_vec();
+                    if feed_tx.send((Addr { node, app }, cell)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let retired = circuit_slot.lock().await.replace(candidate);
+            generation += 1;
+            backoff_ms = 1_500;
+            if generation == 1 {
+                diag(&format!(
+                    "onion-stream: PINNED CIRCUIT opened (after {attempt} tries)"
+                ));
+            } else {
+                diag(&format!(
+                    "onion-stream: PINNED CIRCUIT refreshed (generation {generation})"
+                ));
+            }
+
+            if let Some(old) = retired {
+                let old_id = old.origin_circuit_id();
+                let retire_services = services_bg.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(RETIRE_GRACE).await;
+                    retire_services.close_data_circuit(old_id);
+                });
+            }
+
+            tokio::time::sleep(REFRESH_AFTER).await;
+        }
     });
-    Some(CircuitCells { services, me, circuit })
+    Some(CircuitCells {
+        services,
+        me,
+        circuit,
+    })
 }

@@ -40,13 +40,15 @@ pub const DEFAULT_WEIGHTS: [u32; 4] = [8, 4, 2, 1];
 /// connect attempts and all-tiny gauges (the leak sat between the bounded
 /// mpsc and the wire, completely unmetered).
 ///
-/// Raised 64 → 1024 to align with `PQ_DRAIN_FRAMES_PER_PASS = 256`. The
+/// Raised 64 → 4096 to align with the upstream per-session outbox and absorb a
+/// full high-BDP circuit window without shedding already-admitted frames. The
 /// older cap of 64 was below one drain pass, so `drain_outbox_into_pq`
 /// kept shedding mid-priority frames every burst — the upstream mpsc
 /// (cap 4096) effectively decimated to 64 on the way to the wire. Cap
-/// 1024 at 60 KiB ≈ 60 MiB worst case; production frames are 60-300 B
-/// (control) to 64 KiB (data), so steady state is well below this.
-pub const DEFAULT_MAX_DEPTH: usize = 1024;
+/// 4096 at 60 KiB is a pessimistic 240 MiB worst case; production frames are
+/// overwhelmingly 60–450 B (including circuit data), and the runner drains
+/// up to 256 per pass, so steady state is well below this.
+pub const DEFAULT_MAX_DEPTH: usize = 4096;
 
 // ── PriorityQueue ─────────────────────────────────────────────────────────────
 

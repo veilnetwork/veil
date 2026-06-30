@@ -3176,41 +3176,41 @@ impl SessionRunner {
                 let coalesce_until =
                     outbound_coalescer.coalesce_deadline(coalesce_window, pq.peek_priority());
                 let mut drained_this_pass = 0usize;
+                // Encrypt several already-queued OVL1 frames back-to-back and
+                // add ONE padding frame for the whole group. Small circuit-data
+                // frames are ~420 B on this layer, so this packs 3 into the
+                // 1300-B bucket (or a larger ready burst into 4096/16384) instead
+                // of spending a separate 1300-B bucket on every 300-B payload.
+                // There is no waiting window here: only frames already in `pq`
+                // are grouped, so interactive latency does not increase.
+                const ENCRYPTED_BATCH_FRAMES: usize = PQ_DRAIN_FRAMES_PER_PASS;
+                let encrypted_pass = self.crypto.tx_cipher.is_some();
+                let drain_cap = if encrypted_pass {
+                    ENCRYPTED_BATCH_FRAMES
+                } else {
+                    PQ_DRAIN_FRAMES_PER_PASS
+                };
+                let mut encrypted_batch = Vec::new();
                 while !coalesce_active
-                    && drained_this_pass < PQ_DRAIN_FRAMES_PER_PASS
+                    && drained_this_pass < drain_cap
+                    // Do not pop a frame unless the dedicated writer can accept
+                    // it. Previously a full (but healthy) channel was treated as
+                    // a write failure below and tore down the whole obfs4/TCP
+                    // session during a short bulk burst.
+                    && wire_tx.capacity() > 0
                     && let Some(outgoing) = pq.pop()
                 {
                     drained_this_pass += 1;
                     // Capture the plaintext frame before any encryption.
                     self.dispatcher.capture_outbound(self.peer_id, &outgoing);
                     if let Some(cipher) = self.crypto.tx_cipher.as_mut() {
-                        // Encrypt and write the ciphertext.
+                        // Encrypt now, preserving frame/cipher order, but defer
+                        // padding + writer admission until the group is complete.
                         let enc = match apply_tx_cipher(&outgoing, cipher) {
                             Some(enc) => enc,
                             None => return, // cipher/header error — close session
                         };
-                        // coalesce real frame + padding frame so
-                        // the TLS layer emits a single record of a standard
-                        // HTTPS bucket size (1300 / 4096 / 16384 B). DPI
-                        // cannot infer OVL1 frame sizes from TLS record
-                        // lengths. Padding frames are session-type and
-                        // silently discarded by the receiver.
-                        let wire = coalesce_with_padding(&enc, Some(cipher));
-                        // Outbound bandwidth enforcement.
-                        if !self.dispatcher.allow_outbound_bandwidth(wire.len()) {
-                            continue; // drop frame — bandwidth limit exceeded
-                        }
-                        let tx_len = wire.len() as u64;
-                        let wire_pool = veil_bufpool::pooled_shared_from_vec(wire);
-                        if Self::push_wire(&wire_tx, wire_pool, &self.metrics).is_err() {
-                            self.on_primary_write_error(&mut write_error_count);
-                            return; // wire channel closed (writer task exited)
-                        }
-                        if let Some(m) = &self.metrics {
-                            m.add_transport_bytes_tx(tx_len);
-                        }
-                        rekey.record_bytes(tx_len);
-                        mlkem_rekey.record_bytes(tx_len);
+                        encrypted_batch.extend_from_slice(&enc);
                     } else {
                         // No encryption: convert Arc-backed bytes to owned Vec
                         // for the wire channel. Padding is not applied
@@ -3218,7 +3218,39 @@ impl SessionRunner {
                         // is an encrypted session frame.
                         let tx_len = outgoing.len() as u64;
                         // outgoing is already a PooledShared — pass through.
-                        if Self::push_wire(&wire_tx, outgoing.clone(), &self.metrics).is_err() {
+                        match Self::push_wire(&wire_tx, outgoing.clone(), &self.metrics) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => continue,
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                self.on_primary_write_error(&mut write_error_count);
+                                return;
+                            }
+                        }
+                        if let Some(m) = &self.metrics {
+                            m.add_transport_bytes_tx(tx_len);
+                        }
+                        rekey.record_bytes(tx_len);
+                        mlkem_rekey.record_bytes(tx_len);
+                    }
+                }
+                if !encrypted_batch.is_empty() {
+                    let cipher = self
+                        .crypto
+                        .tx_cipher
+                        .as_mut()
+                        .expect("encrypted pass must retain its TX cipher");
+                    // One standard HTTPS-sized bucket for the concatenated real
+                    // frames. The receiver already parses consecutive encrypted
+                    // OVL1 frames, then silently consumes the final padding frame.
+                    let wire = coalesce_with_padding(&encrypted_batch, Some(cipher));
+                    if self.dispatcher.allow_outbound_bandwidth(wire.len()) {
+                        let tx_len = wire.len() as u64;
+                        let wire_pool = veil_bufpool::pooled_shared_from_vec(wire);
+                        if Self::push_wire(&wire_tx, wire_pool, &self.metrics).is_err() {
+                            // Capacity was checked before popping/encrypting. A
+                            // failure now therefore means the writer closed (or
+                            // an invariant broke); encrypted frames cannot be
+                            // dropped without desynchronising the session cipher.
                             self.on_primary_write_error(&mut write_error_count);
                             return;
                         }
@@ -3810,6 +3842,12 @@ impl SessionRunner {
     ) -> bool {
         match result {
             DispatchResult::Response(resp_bytes) => {
+                // Never advance the implicit AEAD nonce unless the encrypted
+                // frame has a writer slot. Dropping after encryption permanently
+                // desynchronises every later frame on this session.
+                if wire_tx.capacity() == 0 {
+                    return false;
+                }
                 // Capture the plaintext response before any encryption.
                 self.dispatcher.capture_outbound(self.peer_id, &resp_bytes);
                 // Encrypt the response body if the session uses encryption.
@@ -3865,6 +3903,12 @@ impl SessionRunner {
                          — sustained inbound exceeds capacity",
                         hex_short(&self.peer_id),
                     );
+                    // Fire-and-forget means "skip before encryption" when the
+                    // writer is saturated — never seal then drop, which burns an
+                    // implicit AEAD nonce and makes the peer close the session.
+                    if wire_tx.capacity() == 0 {
+                        return false;
+                    }
                     let bp_hdr = veil_proto::header::FrameHeader::new(
                         veil_proto::family::FrameFamily::Control as u8,
                         veil_proto::family::ControlMsg::Backpressure as u16,
@@ -4074,6 +4118,52 @@ mod m1_empty_frame_aead_tests {
             .open(&bytes[HEADER_SIZE..], &aad)
             .expect("sealed empty frame must open");
         assert!(pt.is_empty(), "sealed empty frame opens to empty plaintext");
+    }
+
+    #[test]
+    fn several_encrypted_frames_share_one_padding_bucket_and_stay_parseable() {
+        let padding_was_enabled = padding_enabled();
+        set_padding_enabled(true);
+        let key = [0x22u8; 32];
+        let mut tx = SessionCipher::new(&key, true);
+        let bodies = [vec![0xA1; 300], vec![0xB2; 300], vec![0xC3; 300]];
+        let mut real_batch = Vec::new();
+
+        for (i, body) in bodies.iter().enumerate() {
+            let mut hdr = FrameHeader::new(FrameFamily::Control as u8, i as u16 + 1);
+            hdr.body_len = body.len() as u32;
+            let mut frame = encode_header(&hdr).to_vec();
+            frame.extend_from_slice(body);
+            let sealed = apply_tx_cipher(&frame, &mut tx).expect("seal real frame");
+            real_batch.extend_from_slice(&sealed);
+        }
+
+        let wire = coalesce_with_padding(&real_batch, Some(&mut tx));
+        assert_eq!(wire.len(), 1300, "three small real frames share one bucket");
+
+        let mut rx = SessionCipher::new(&key, true);
+        let mut cursor = 0usize;
+        let mut opened = Vec::new();
+        while cursor < wire.len() {
+            let hdr = decode_header(&wire[cursor..]).expect("decode concatenated header");
+            let frame_len = HEADER_SIZE + hdr.body_len as usize;
+            let body_start = cursor + HEADER_SIZE;
+            let body_end = cursor + frame_len;
+            let aad = frame_aad(hdr.family, hdr.msg_type);
+            let plaintext = rx
+                .open(&wire[body_start..body_end], &aad)
+                .expect("open concatenated frame in cipher order");
+            opened.push((hdr.family, hdr.msg_type, plaintext));
+            cursor = body_end;
+        }
+
+        assert_eq!(opened.len(), 4, "three real frames plus one padding frame");
+        for (i, expected) in bodies.iter().enumerate() {
+            assert_eq!(opened[i].2, *expected);
+        }
+        assert_eq!(opened[3].0, FrameFamily::Session as u8);
+        assert_eq!(opened[3].1, SessionMsg::Padding as u16);
+        set_padding_enabled(padding_was_enabled);
     }
 }
 
