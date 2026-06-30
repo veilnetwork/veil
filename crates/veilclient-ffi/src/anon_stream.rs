@@ -172,6 +172,8 @@ const MAX_DATA_PACE_US: u64 = 5_000;
 // in-flight stream midway through the file.
 const CIRCUIT_RETIRE_GRACE: Duration = Duration::from_secs(600);
 
+type SharedPeerTags = Arc<Mutex<HashMap<[u8; CIRCUIT_PEER_TAG_LEN], [u8; 32]>>>;
+
 /// Deterministic 16-byte stream cookie for a node — both ends derive the peer's
 /// the same way (domain-separated app-id, distinct from the chat endpoint).
 fn stream_cookie(node: &[u8; 32]) -> [u8; COOKIE_LEN] {
@@ -299,6 +301,11 @@ struct CircuitCells {
     /// overfills the relay/session queue. This serialises DATA cells at the circuit
     /// sender boundary while leaving SYN/SYN_ACK/ACK/RST latency low.
     data_pacer: Arc<StreamDataPacer>,
+    /// Published-mode peer-introductions are carried only on SYN/SYN_ACK, but
+    /// the relay-side cookie mapping may later move DATA/ACK cells to a different
+    /// local receive circuit after a legitimate re-registration at the same R.
+    /// Keep tag→node mappings hub-wide so demux survives that circuit switch.
+    peer_tags: SharedPeerTags,
 }
 
 #[derive(Clone)]
@@ -356,6 +363,13 @@ impl StreamDataPacer {
         if self.interval.is_zero() {
             return;
         }
+        // `tokio::time::sleep(100us)` is effectively a ~1ms sleep on common
+        // desktop/mobile schedulers. Sleeping for every sub-ms cell silently
+        // reintroduces the old one-cell-per-ms throughput ceiling. Instead,
+        // reserve sub-ms slots in the shared schedule and only park once the
+        // accumulated delay reaches the scheduler's millisecond granularity; the
+        // stream engine's own `max_pacing_batch` still bounds the microburst.
+        let min_sleep = Duration::from_millis(1);
         let delay = {
             let now = Instant::now();
             let mut next_by_peer = self.next_by_peer.lock().await;
@@ -364,7 +378,7 @@ impl StreamDataPacer {
             *next = scheduled + self.interval;
             scheduled.saturating_duration_since(now)
         };
-        if !delay.is_zero() {
+        if delay >= min_sleep {
             tokio::time::sleep(delay).await;
         }
     }
@@ -494,7 +508,10 @@ impl CircuitCells {
                 let idle_for = now.duration_since(entry.last_used);
                 let age = now.duration_since(entry.opened_at);
                 let quiet_for = now.duration_since(entry.last_non_handshake);
-                if is_handshake && age >= CIRCUIT_HANDSHAKE_REOPEN_AFTER {
+                if is_handshake
+                    && age >= CIRCUIT_HANDSHAKE_REOPEN_AFTER
+                    && quiet_for >= CIRCUIT_HANDSHAKE_REOPEN_AFTER
+                {
                     diag_node(
                         &self.me,
                         &format!(
@@ -573,6 +590,7 @@ impl CircuitCells {
         let activity = Arc::clone(&self.activity);
         let outbound_circuits = Arc::clone(&self.outbound_circuits);
         let outbound_opening = Arc::clone(&self.outbound_opening);
+        let peer_tags = Arc::clone(&self.peer_tags);
         tokio::spawn(async move {
             let opened = open_outbound_circuit(
                 services.clone(),
@@ -583,6 +601,7 @@ impl CircuitCells {
                 in_tx,
                 activity,
                 outbound_circuits,
+                peer_tags,
             )
             .await;
             outbound_opening.lock().await.remove(&dst_node);
@@ -624,6 +643,7 @@ impl CircuitCells {
                 self.in_tx.clone(),
                 Arc::clone(&self.activity),
                 Arc::clone(&self.outbound_circuits),
+                Arc::clone(&self.peer_tags),
             )
             .await;
             self.outbound_opening.lock().await.remove(&dst_node);
@@ -887,6 +907,7 @@ fn try_open_circuit(
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let outbound_circuits = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let outbound_opening = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let peer_tags: SharedPeerTags = Arc::new(Mutex::new(HashMap::new()));
     let data_pace_interval = stream_data_pace_interval();
     let data_pacer = Arc::new(StreamDataPacer::new(data_pace_interval));
     let activity = Arc::new(Mutex::new(Instant::now()));
@@ -915,6 +936,7 @@ fn try_open_circuit(
     let epoch_bg = Arc::clone(&epoch);
     let in_tx_bg = in_tx.clone();
     let activity_bg = Arc::clone(&activity);
+    let peer_tags_bg = Arc::clone(&peer_tags);
     tokio::spawn(async move {
         // The proactive open fires at hub creation — which, on the RECEIVER, is the
         // accept loop starting right after node-arm, BEFORE any relay session is up
@@ -971,9 +993,13 @@ fn try_open_circuit(
                         recv_rx,
                         in_tx_bg.clone(),
                         Some(Arc::clone(&activity_bg)),
+                        Arc::clone(&peer_tags_bg),
                     );
                     retire_circuits_later(&services_bg, vec![Arc::new(candidate)]);
                     continue;
+                }
+                if let Some(relay) = relay {
+                    services_bg.publish_stream_rendezvous_ad(relay, cookie);
                 }
 
                 // Inbound feed: legacy validation cells are `[sender_node 32][cell]`;
@@ -985,6 +1011,7 @@ fn try_open_circuit(
                     recv_rx,
                     in_tx_bg.clone(),
                     Some(Arc::clone(&activity_bg)),
+                    Arc::clone(&peer_tags_bg),
                 );
                 if let Some(relay) = relay {
                     confirmed_relays.push(relay);
@@ -1090,6 +1117,7 @@ fn try_open_circuit(
         outbound_circuits,
         outbound_opening,
         data_pacer,
+        peer_tags,
     })
 }
 
@@ -1116,6 +1144,11 @@ async fn open_inbound_circuits(
             .map(|(circuit, rx)| vec![(None, circuit, rx)]),
         CircuitMode::PublishedRendezvous => {
             let mut relays = services.local_published_rendezvous_relays();
+            for relay in services.pinned_rendezvous_relays() {
+                if !relays.contains(&relay) {
+                    relays.push(relay);
+                }
+            }
             if let Ok(resolved) = services.resolve_stream_rendezvous_relays(me).await {
                 for relay in resolved {
                     if !relays.contains(&relay) {
@@ -1171,6 +1204,7 @@ async fn open_outbound_circuit(
     in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
     activity: Arc<Mutex<Instant>>,
     outbound_circuits: Arc<tokio::sync::Mutex<HashMap<[u8; 32], CircuitEntry>>>,
+    peer_tags: SharedPeerTags,
 ) -> Result<(), String> {
     let ads = services
         .resolve_stream_rendezvous_ads(dst_node)
@@ -1214,6 +1248,7 @@ async fn open_outbound_circuit(
                 recv_rx,
                 in_tx.clone(),
                 Some(Arc::clone(&activity)),
+                Arc::clone(&peer_tags),
             );
             retire_circuits_later(&services, vec![Arc::new(candidate)]);
             continue;
@@ -1224,6 +1259,7 @@ async fn open_outbound_circuit(
             recv_rx,
             in_tx,
             Some(Arc::clone(&activity)),
+            Arc::clone(&peer_tags),
         );
         let candidate = Arc::new(candidate);
         let now = Instant::now();
@@ -1267,9 +1303,9 @@ fn spawn_circuit_feed(
     mut recv_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
     activity: Option<Arc<Mutex<Instant>>>,
+    peer_tags: SharedPeerTags,
 ) {
     tokio::spawn(async move {
-        let mut peer_tags = HashMap::<[u8; CIRCUIT_PEER_TAG_LEN], [u8; 32]>::new();
         while let Some(framed) = recv_rx.recv().await {
             if let Some(activity) = activity.as_ref() {
                 mark_circuit_activity(activity);
@@ -1288,14 +1324,22 @@ fn spawn_circuit_feed(
                 let Some(node) = open_stream_peer_intro(&services, &tag, sealed) else {
                     continue;
                 };
-                if peer_tags.len() >= 4096 && !peer_tags.contains_key(&tag) {
-                    peer_tags.clear();
+                {
+                    let mut tags = peer_tags.lock().unwrap_or_else(|p| p.into_inner());
+                    if tags.len() >= 4096 && !tags.contains_key(&tag) {
+                        tags.clear();
+                    }
+                    tags.insert(tag, node);
                 }
-                peer_tags.insert(tag, node);
                 cell_offset += 1 + CIRCUIT_INTRO_LEN;
                 node
-            } else if let Some(node) = peer_tags.get(&tag) {
-                *node
+            } else if let Some(node) = peer_tags
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&tag)
+                .copied()
+            {
+                node
             } else {
                 // Backward-compatible validation/legacy path: the first 32 bytes
                 // are the clear sender node id rather than an opaque tag.
