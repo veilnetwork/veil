@@ -66,6 +66,7 @@ veil-crypto = { path = "../veil-crypto" }
 chacha20poly1305 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util"] }
 libc = "0.2"
+rand_core = { version = "0.6", features = ["getrandom"] }
 # `log` facade — all targets. Android routes it to logcat via android_logger
 # (below); desktop/iOS bridge it to stderr (see node.rs StderrLogBridge) so the
 # embedded node's `log` diagnostics (onion-stream relay-pick &c.) are visible.
