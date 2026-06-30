@@ -543,10 +543,10 @@ impl AnonStreamHub {
             recv_window,
             init_cwnd: (32 * mss) as u32,
             max_pacing_batch: if matches!(&cells, HubCells::Circuit(_)) {
-                // 8 × 318 B/ms ≈ 2.5 MB/s stream-payload ceiling: still above
-                // the 1.5 MB/s target, but much less likely to overflow the
-                // bounded relay/session queues than the previous 24-cell bursts.
-                8
+                // 12 × 318 B/ms ≈ 3.8 MB/s stream-payload ceiling: comfortably
+                // above the old 1.5 MB/s target while still keeping bursts half
+                // the previous 24-cell aggressive profile.
+                12
             } else {
                 4
             },
