@@ -157,11 +157,9 @@ impl NodeRuntime {
                 // adaptively after each tick) is unchanged. Shrunk under
                 // `test-low-difficulty` so devnet smoke tests don't wait 2 min.
                 #[cfg(any(test, feature = "test-low-difficulty"))]
-                const REPUBLISH_WARMUP: std::time::Duration =
-                    std::time::Duration::from_secs(3);
+                const REPUBLISH_WARMUP: std::time::Duration = std::time::Duration::from_secs(3);
                 #[cfg(not(any(test, feature = "test-low-difficulty")))]
-                const REPUBLISH_WARMUP: std::time::Duration =
-                    std::time::Duration::from_secs(120);
+                const REPUBLISH_WARMUP: std::time::Duration = std::time::Duration::from_secs(120);
                 let mut next_republish_at = tokio::time::Instant::now() + REPUBLISH_WARMUP;
                 let mut interval = tokio::time::interval_at(next_republish_at, initial_interval);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

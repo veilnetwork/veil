@@ -5691,7 +5691,10 @@ mod tests {
             status: MailboxCryptoStatus::PeerUnresolved,
             blob: Vec::new(),
         };
-        assert_eq!(MailboxSealResultPayload::decode(&err.encode()).unwrap(), err);
+        assert_eq!(
+            MailboxSealResultPayload::decode(&err.encode()).unwrap(),
+            err
+        );
     }
 
     #[test]
@@ -6659,7 +6662,10 @@ mod tests {
             chunk_data: vec![0xAB; MAILBOX_PUT_CHUNK_DATA_BYTES],
         };
         let buf = c.encode();
-        assert_eq!(buf.len(), MailboxPutChunkPayload::HEADER_SIZE + MAILBOX_PUT_CHUNK_DATA_BYTES);
+        assert_eq!(
+            buf.len(),
+            MailboxPutChunkPayload::HEADER_SIZE + MAILBOX_PUT_CHUNK_DATA_BYTES
+        );
         assert_eq!(MailboxPutChunkPayload::decode(&buf).unwrap(), c);
         // a final short chunk + a header-only (empty data) chunk both round-trip.
         let tail = MailboxPutChunkPayload {
@@ -6668,7 +6674,10 @@ mod tests {
             chunk_total: 12,
             chunk_data: vec![1, 2, 3],
         };
-        assert_eq!(MailboxPutChunkPayload::decode(&tail.encode()).unwrap(), tail);
+        assert_eq!(
+            MailboxPutChunkPayload::decode(&tail.encode()).unwrap(),
+            tail
+        );
         // truncated buffer (< header) is rejected.
         assert!(MailboxPutChunkPayload::decode(&[0u8; 35]).is_err());
     }

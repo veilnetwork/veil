@@ -2088,12 +2088,11 @@ impl FrameDispatcher {
                     // self-authenticating records (rendezvous ad, relay key, …)
                     // alive at the K-closest. NEW keys still pay the quota.
                     let already_present = self.dht.get_local(&q.target_key).is_some();
-                    let origin = match self
-                        .validate_store_value_by_magic_ex(&q.payload, already_present)
-                    {
-                        Ok(origin) => origin,
-                        Err(violation) => return violation,
-                    };
+                    let origin =
+                        match self.validate_store_value_by_magic_ex(&q.payload, already_present) {
+                            Ok(origin) => origin,
+                            Err(violation) => return violation,
+                        };
                     // audit cycle-7 (HIGH — DHT key-binding): same canonical-key
                     // binding as the direct STORE arm (dispatch_discovery). An
                     // owner-verified AP/AT/SB record may only be written under its

@@ -142,12 +142,15 @@ impl PutChunkReassembler {
         }
 
         let complete = {
-            let r = self.inflight.entry(c.content_id).or_insert_with(|| PutReassembly {
-                chunk_total: c.chunk_total,
-                chunks: vec![None; c.chunk_total as usize],
-                received: 0,
-                last_activity: now,
-            });
+            let r = self
+                .inflight
+                .entry(c.content_id)
+                .or_insert_with(|| PutReassembly {
+                    chunk_total: c.chunk_total,
+                    chunks: vec![None; c.chunk_total as usize],
+                    received: 0,
+                    last_activity: now,
+                });
             r.last_activity = now;
             let idx = c.chunk_index as usize;
             if r.chunks[idx].is_none() {
@@ -318,10 +321,7 @@ pub async fn handle_fetch_message(
         .collect();
     let n = wire.len();
     let resp = MailboxFetchRespPayload { blobs: wire }.encode();
-    match sender
-        .send_reply(reply_id, &resp, MAILBOX_APP_ID)
-        .await
-    {
+    match sender.send_reply(reply_id, &resp, MAILBOX_APP_ID).await {
         Ok(()) => log::debug!(
             "veil-mailbox: FETCH replied {n} blob(s) to recv={}",
             hex_short(&src_node_id),
@@ -614,7 +614,11 @@ mod tests {
                 assembled = out;
             }
         }
-        assert_eq!(assembled.unwrap(), full, "reassembled bytes must equal the original");
+        assert_eq!(
+            assembled.unwrap(),
+            full,
+            "reassembled bytes must equal the original"
+        );
     }
 
     #[test]
@@ -623,31 +627,68 @@ mod tests {
         let t0 = Instant::now();
         let cid = [1u8; 32];
         // out-of-range index / zero total are dropped.
-        assert!(ra.accept(
-            MailboxPutChunkPayload { content_id: cid, chunk_index: 3, chunk_total: 2, chunk_data: vec![0] },
-            t0,
-        ).is_none());
-        assert!(ra.accept(
-            MailboxPutChunkPayload { content_id: cid, chunk_index: 0, chunk_total: 0, chunk_data: vec![0] },
-            t0,
-        ).is_none());
+        assert!(
+            ra.accept(
+                MailboxPutChunkPayload {
+                    content_id: cid,
+                    chunk_index: 3,
+                    chunk_total: 2,
+                    chunk_data: vec![0]
+                },
+                t0,
+            )
+            .is_none()
+        );
+        assert!(
+            ra.accept(
+                MailboxPutChunkPayload {
+                    content_id: cid,
+                    chunk_index: 0,
+                    chunk_total: 0,
+                    chunk_data: vec![0]
+                },
+                t0,
+            )
+            .is_none()
+        );
         // a partial deposit (1 of 2) then a long idle gap → the next chunk for a
         // DIFFERENT deposit triggers stale eviction; the partial never completes.
-        assert!(ra.accept(
-            MailboxPutChunkPayload { content_id: cid, chunk_index: 0, chunk_total: 2, chunk_data: vec![9] },
-            t0,
-        ).is_none());
+        assert!(
+            ra.accept(
+                MailboxPutChunkPayload {
+                    content_id: cid,
+                    chunk_index: 0,
+                    chunk_total: 2,
+                    chunk_data: vec![9]
+                },
+                t0,
+            )
+            .is_none()
+        );
         let later = t0 + PUT_REASSEMBLY_STALE + Duration::from_secs(1);
         let _ = ra.accept(
-            MailboxPutChunkPayload { content_id: [2u8; 32], chunk_index: 0, chunk_total: 1, chunk_data: vec![7] },
+            MailboxPutChunkPayload {
+                content_id: [2u8; 32],
+                chunk_index: 0,
+                chunk_total: 1,
+                chunk_data: vec![7],
+            },
             later,
         );
         // The stale partial was evicted: sending its 2nd chunk now starts fresh
         // (chunk 1 alone, with chunk 0 gone) → still incomplete, no panic.
-        assert!(ra.accept(
-            MailboxPutChunkPayload { content_id: cid, chunk_index: 1, chunk_total: 2, chunk_data: vec![8] },
-            later,
-        ).is_none());
+        assert!(
+            ra.accept(
+                MailboxPutChunkPayload {
+                    content_id: cid,
+                    chunk_index: 1,
+                    chunk_total: 2,
+                    chunk_data: vec![8]
+                },
+                later,
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -878,35 +919,81 @@ mod tests {
                 .push((reply_id, data.to_vec(), src_app_id));
             Box::pin(async { Ok(()) })
         }
-        fn send_authenticated<'a>(&'a self, _: [u8; 32], _: [u8; 32], _: u32, _: &'a [u8]) -> AnonFut<'a> {
+        fn send_authenticated<'a>(
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: &'a [u8],
+        ) -> AnonFut<'a> {
             unimplemented!()
         }
         fn send_authenticated_with_reply<'a>(
-            &'a self, _: [u8; 32], _: [u8; 32], _: u32, _: &'a [u8], _: [u8; 32], _: u32,
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: &'a [u8],
+            _: [u8; 32],
+            _: u32,
         ) -> AnonFut<'a> {
             unimplemented!()
         }
         fn send_authenticated_direct_with_reply<'a>(
-            &'a self, _: [u8; 32], _: [u8; 32], _: [u8; 32], _: u32, _: &'a [u8], _: [u8; 32], _: u32,
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: &'a [u8],
+            _: [u8; 32],
+            _: u32,
         ) -> AnonFut<'a> {
             Box::pin(async { Ok(()) })
         }
         fn register_onion_service<'a>(&'a self, _: usize) -> AnonFut<'a> {
             unimplemented!()
         }
-        fn register_rendezvous_publisher(&self, _: [u8; 32], _: [u8; 16], _: u64, _: u8, _: Vec<u8>) {
+        fn register_rendezvous_publisher(
+            &self,
+            _: [u8; 32],
+            _: [u8; 16],
+            _: u64,
+            _: u8,
+            _: Vec<u8>,
+        ) {
             unimplemented!()
         }
-        fn send_to_onion_service<'a>(&'a self, _: [u8; 32], _: [u8; 32], _: u32, _: &'a [u8], _: usize) -> AnonFut<'a> {
+        fn send_to_onion_service<'a>(
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: &'a [u8],
+            _: usize,
+        ) -> AnonFut<'a> {
             unimplemented!()
         }
         fn send_to_onion_service_anonymous<'a>(
-            &'a self, _: [u8; 32], _: [u8; 32], _: u32, _: [u8; 32], _: &'a [u8], _: usize,
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: [u8; 32],
+            _: &'a [u8],
+            _: usize,
         ) -> AnonFut<'a> {
             unimplemented!()
         }
         fn send_anonymous_direct<'a>(
-            &'a self, _: [u8; 32], _: [u8; 32], _: [u8; 32], _: u32, _: [u8; 32], _: &'a [u8], _: usize,
+            &'a self,
+            _: [u8; 32],
+            _: [u8; 32],
+            _: [u8; 32],
+            _: u32,
+            _: [u8; 32],
+            _: &'a [u8],
+            _: usize,
         ) -> AnonFut<'a> {
             unimplemented!()
         }
@@ -982,6 +1069,9 @@ mod tests {
             reply_id: 0,
         };
         handle_fetch_message(&mailbox, Some(&sender), noreply).await;
-        assert!(captured.lock().unwrap().is_empty(), "no reply for either drop case");
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "no reply for either drop case"
+        );
     }
 }

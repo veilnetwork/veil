@@ -509,9 +509,7 @@ fn fanout_aad(
 /// [`decode_fanout_blob`]. Caps at [`MAX_FANOUT_CERTS`] (the same bound
 /// [`fanout_encrypt`] enforces), so a `Vec` produced by `fanout_encrypt` always
 /// round-trips.
-pub fn encode_fanout_blob(
-    envelopes: &[FanoutEnvelope],
-) -> Result<Vec<u8>, MlkemFanoutError> {
+pub fn encode_fanout_blob(envelopes: &[FanoutEnvelope]) -> Result<Vec<u8>, MlkemFanoutError> {
     if envelopes.len() > MAX_FANOUT_CERTS {
         return Err(MlkemFanoutError::TooManyCerts {
             given: envelopes.len(),
@@ -792,7 +790,10 @@ mod tests {
         let mut rec = build_relay_record(&env, [0x5A; X25519_PK_LEN]);
         rec.signing_identity_key_idx = 9; // only 1 key in the doc
         let err = verify_relay_key(&rec, &env.doc, env.now_unix_secs).unwrap_err();
-        assert!(matches!(err, RelayKeyError::SigKeyIdxOutOfBounds { .. }), "{err}");
+        assert!(
+            matches!(err, RelayKeyError::SigKeyIdxOutOfBounds { .. }),
+            "{err}"
+        );
     }
 
     // ── verify_mlkem_cert ────────────────────────────────────────────────────
@@ -1145,7 +1146,7 @@ mod tests {
             .map(|i| FanoutEnvelope {
                 recipient_instance_id: [i as u8; 16],
                 cert_version: (i as u64) << 40 | 0xABCD, // exercise the full u64
-                kem_ciphertext: vec![i as u8; 1088], // ML-KEM-768 ct size-ish
+                kem_ciphertext: vec![i as u8; 1088],     // ML-KEM-768 ct size-ish
                 nonce: [i as u8 ^ 0x5A; AEAD_NONCE_LEN],
                 aead_ciphertext: vec![0xFFu8 ^ i as u8; 40 + i],
             })
@@ -1197,7 +1198,10 @@ mod tests {
     fn encode_rejects_over_cap() {
         let envs = dummy_envelopes(MAX_FANOUT_CERTS + 1);
         let err = encode_fanout_blob(&envs).unwrap_err();
-        assert!(matches!(err, MlkemFanoutError::TooManyCerts { .. }), "{err:?}");
+        assert!(
+            matches!(err, MlkemFanoutError::TooManyCerts { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

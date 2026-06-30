@@ -1425,14 +1425,8 @@ impl KademliaService {
             self.local_node_id(),
         );
         let params = super::iterative::IterativeParams::from(&self.dht_config);
-        super::iterative::find_value_iterative(
-            key,
-            seeds,
-            &querier,
-            |k| self.get_local(k),
-            &params,
-        )
-        .await
+        super::iterative::find_value_iterative(key, seeds, &querier, |k| self.get_local(k), &params)
+            .await
     }
 
     /// Iterative Kademlia FIND_NODE lookup using live OVL1 sessions.

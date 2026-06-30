@@ -289,7 +289,10 @@ mod tests {
         r.valid_until_unix = 1_900_000_000;
         let bytes = r.encode();
         let err = RelayKeyRecord::decode(&bytes).unwrap_err();
-        assert!(err.to_string().contains("valid_until < valid_from"), "{err}");
+        assert!(
+            err.to_string().contains("valid_until < valid_from"),
+            "{err}"
+        );
     }
 
     #[test]
