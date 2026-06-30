@@ -209,20 +209,22 @@ fn rendezvous_relay_published(dht: &Arc<veil_dht::KademliaService>, node_id: &[u
 /// from the dispatcher's `peer_cap_flags`.
 type PeerCapFlags = Arc<std::sync::RwLock<std::collections::HashMap<[u8; 32], u8>>>;
 
-/// True iff `node_id` advertised the `CAN_RELAY` capability in its handshake
+/// True iff `node_id` advertised the `ANONYMITY_RELAY` capability in its handshake
 /// (cached in `peer_cap_flags`). This is the RELIABLE relay signal for a
 /// CONNECTED peer: unlike [`rendezvous_relay_published`] it needs no DHT
 /// FIND_VALUE for the relay-directory entry — that lookup is flaky on a sparse
 /// network and its cached entry expires, which churned the recipient task's
 /// `no_relay` even while it held a live session to a perfectly good relay. A
-/// node we are connected to that advertised CAN_RELAY is a valid rendezvous
-/// relay regardless of whether its RD has propagated to our local DHT shard.
-fn peer_advertised_relay(cap_flags: &PeerCapFlags, node_id: &[u8; 32]) -> bool {
+/// node we are connected to that advertised ANONYMITY_RELAY is a valid
+/// rendezvous relay regardless of whether its RD has propagated to our local DHT
+/// shard. `CAN_RELAY` is deliberately insufficient: it is the ordinary transport
+/// forwarding bit, not an opt-in to carry onion anonymity circuits.
+fn peer_advertised_anonymity_relay(cap_flags: &PeerCapFlags, node_id: &[u8; 32]) -> bool {
     cap_flags
         .read()
         .ok()
         .and_then(|m| m.get(node_id).copied())
-        .is_some_and(|f| f & veil_proto::session::cap_flags::CAN_RELAY != 0)
+        .is_some_and(|f| f & veil_proto::session::cap_flags::ANONYMITY_RELAY != 0)
 }
 
 /// Pick a rendezvous relay: a session-live, published peer. If `pinned` is
@@ -334,7 +336,9 @@ pub(crate) fn pick_rendezvous_relays_deterministic(
     } else {
         let mut relays = connected
             .into_iter()
-            .filter(|c| rendezvous_relay_published(dht, c) || peer_advertised_relay(cap_flags, c))
+            .filter(|c| {
+                rendezvous_relay_published(dht, c) || peer_advertised_anonymity_relay(cap_flags, c)
+            })
             .collect::<Vec<_>>();
         relays.sort_by(|a, b| xor_distance_cmp(anchor, a, b));
         relays
@@ -4023,6 +4027,49 @@ mod tests {
         assert_eq!(
             got,
             pinned[..veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize]
+        );
+    }
+
+    #[test]
+    fn rendezvous_replica_picker_requires_anonymity_relay_capability() {
+        use crate::types::{LinkId, NodeId, SessionInfo, SessionSource, SessionState};
+
+        let ordinary_relay = [0x11u8; 32];
+        let anonymity_relay = [0x22u8; 32];
+        let mut sessions = std::collections::BTreeMap::new();
+        for (idx, node) in [ordinary_relay, anonymity_relay].iter().enumerate() {
+            sessions.insert(
+                LinkId::new(idx as u64 + 1),
+                SessionInfo {
+                    link_id: LinkId::new(idx as u64 + 1),
+                    node_id: Some(NodeId::from(*node)),
+                    nonce: None,
+                    matched_peer_id: None,
+                    source: SessionSource::Inbound(crate::types::ListenId::new(1)),
+                    listener_handle: None,
+                    state: SessionState::Active,
+                    transport: "test".to_owned(),
+                    remote_addr: None,
+                    description: String::new(),
+                },
+            );
+        }
+        let live = Arc::new(std::sync::Mutex::new(sessions));
+        let dht = Arc::new(veil_dht::KademliaService::new([9u8; 32]));
+        let caps = Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([
+            (ordinary_relay, veil_proto::session::cap_flags::CAN_RELAY),
+            (
+                anonymity_relay,
+                veil_proto::session::cap_flags::CAN_RELAY
+                    | veil_proto::session::cap_flags::ANONYMITY_RELAY,
+            ),
+        ])));
+
+        let got = pick_rendezvous_relays_deterministic(&live, &dht, &caps, &[], &[9u8; 32]);
+        assert_eq!(
+            got,
+            vec![anonymity_relay],
+            "ordinary CAN_RELAY transport peers must not become onion rendezvous relays",
         );
     }
 
