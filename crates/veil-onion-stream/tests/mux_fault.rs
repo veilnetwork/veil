@@ -311,7 +311,10 @@ async fn fresh_stream_recovers_after_midstream_return_blackhole() {
     assert_eq!(prefix, b"prefix");
 
     bus.set_drop_all_b_to_a(true);
-    accepted.write_all(b"-this-tail-is-blackholed").await.unwrap();
+    accepted
+        .write_all(b"-this-tail-is-blackholed")
+        .await
+        .unwrap();
     accepted.finish().await.unwrap();
     let stalled = tokio::time::timeout(Duration::from_millis(500), first.read(&mut [0u8; 8])).await;
     assert!(
