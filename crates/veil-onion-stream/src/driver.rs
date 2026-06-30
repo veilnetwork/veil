@@ -212,9 +212,9 @@ fn broken() -> io::Error {
 
 /// Stop accepting new app writes once this many bytes are buffered unsent
 /// (send-side back-pressure; the bounded cmd channel then stalls `write_all`).
-const SEND_HIGH_WATER: usize = 1 << 20;
+const SEND_HIGH_WATER: usize = 4 << 20;
 /// Chunk size for moving delivered bytes out of the engine to the reader.
-const DELIVER_CHUNK: usize = 16 * 1024;
+const DELIVER_CHUNK: usize = 256 * 1024;
 
 async fn drive<D: CellDuplex>(
     mut engine: StreamEngine,
@@ -227,8 +227,20 @@ async fn drive<D: CellDuplex>(
     let now_ms = |b: &Instant| b.elapsed().as_millis() as u64;
     let mut cmd_open = true;
     let mut cell = Vec::with_capacity(crate::wire::MAX_CELL);
+    let mut last_debug_ms = 0u64;
     loop {
         let now = now_ms(&base);
+        if now.saturating_sub(last_debug_ms) >= 2_000
+            && (engine.send_buffer_len() > 0 || engine.readable_len() > 0)
+        {
+            last_debug_ms = now;
+            log::warn!(
+                "onion-stream-driver: send_buf={} readable={} {}",
+                engine.send_buffer_len(),
+                engine.readable_len(),
+                engine.debug_summary()
+            );
+        }
 
         // 0. Once the peer has finished AND we've handed off everything we
         //    received, close our own (often empty) write half so both ends
@@ -238,15 +250,7 @@ async fn drive<D: CellDuplex>(
             engine.finish();
         }
 
-        // 1. Drain everything the engine wants to put on the wire.
-        while engine.poll_transmit(now, &mut cell) {
-            if duplex.send_cell(&cell).await.is_err() {
-                engine.reset(reset_reason::APP); // circuit permanently gone
-                break;
-            }
-        }
-
-        // 2. Surface terminal events.
+        // 1. Surface terminal events.
         while let Some(ev) = engine.poll_event() {
             match ev {
                 Event::PeerFinished => set_end(&end, End::Eof),
@@ -255,8 +259,14 @@ async fn drive<D: CellDuplex>(
             }
         }
 
-        // 3. Move delivered bytes to the reader, bounded by channel capacity so a
+        // 2. Move delivered bytes to the reader, bounded by channel capacity so a
         //    slow reader closes the receive window (real end-to-end flow control).
+        //
+        // Do this BEFORE transmitting ACKs: ACK frames advertise free receive
+        // window. If we ACK first and only then drain `read_buf`, a long in-order
+        // transfer can repeatedly advertise a near-zero window even though the app
+        // is about to consume the bytes immediately, forcing the sender into
+        // zero-window/persist pulses.
         loop {
             let Ok(permit) = data_tx.try_reserve() else {
                 break;
@@ -268,6 +278,15 @@ async fn drive<D: CellDuplex>(
             }
             tmp.truncate(n);
             permit.send(tmp);
+        }
+
+        // 3. Drain everything the engine wants to put on the wire. ACKs emitted
+        // here now see the receive buffer after the app handoff above.
+        while engine.poll_transmit(now, &mut cell) {
+            if duplex.send_cell(&cell).await.is_err() {
+                engine.reset(reset_reason::APP); // circuit permanently gone
+                break;
+            }
         }
 
         // 4. Done? Terminal RST, or both directions cleanly finished.
