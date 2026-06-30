@@ -562,6 +562,7 @@ pub(crate) async fn rendezvous_recipient_recheck(
     outbox: &Arc<dyn veil_dht::FrameRouter>,
     session_tx_registry: &Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
     anonymity: &Arc<super::anonymity_state::AnonymityState>,
+    identity: &Arc<super::identity_state::IdentityState>,
     logger: &Arc<veil_observability::NodeLogger>,
     pinned: &[[u8; 32]],
     local_node_id: &[u8; 32],
@@ -630,6 +631,20 @@ pub(crate) async fn rendezvous_recipient_recheck(
                 .join(","),
         ),
     );
+    let published = super::NodeRuntime::tick_publish_rendezvous_ads(
+        &anonymity.rendezvous_publisher_entries,
+        anonymity.x25519_sk.as_ref(),
+        identity.local_identity.as_ref(),
+        dht,
+        logger,
+        Some(session_tx_registry),
+    );
+    if published > 0 {
+        logger.info(
+            "anonymity.rendezvous_recipient.published_immediate",
+            format!("published {published} rendezvous ad(s) after registration"),
+        );
+    }
 }
 
 impl NodeRuntime {
@@ -1547,6 +1562,7 @@ impl NodeRuntime {
         let peer_cap_flags = Arc::clone(&self.dispatcher.crypto.peer_cap_flags);
         let session_tx_registry = Arc::clone(&self.session_tx_registry);
         let anonymity = Arc::clone(&self.anonymity);
+        let identity = Arc::clone(&self.identity);
         // RPC outbox for active FIND_VALUE of connected peers' relay-directory
         // entries (cold-start discovery — see warm_connected_relay_directory).
         let session_outbox = Arc::clone(&self.session_outbox);
@@ -1632,6 +1648,7 @@ impl NodeRuntime {
                                     &outbox,
                                     &session_tx_registry,
                                     &anonymity,
+                                    &identity,
                                     &logger,
                                     &pinned,
                                     &local_node_id,
@@ -1652,6 +1669,7 @@ impl NodeRuntime {
                                     &outbox,
                                     &session_tx_registry,
                                     &anonymity,
+                                    &identity,
                                     &logger,
                                     &pinned,
                                     &local_node_id,
@@ -1710,6 +1728,7 @@ impl NodeRuntime {
                                         &outbox,
                                         &session_tx_registry,
                                         &anonymity,
+                                        &identity,
                                         &logger,
                                         &pinned,
                                         &local_node_id,
