@@ -151,6 +151,11 @@ const CIRCUIT_HANDSHAKE_REOPEN_AFTER: Duration = Duration::from_secs(15);
 const CIRCUIT_PUBLISHED_RELAY_EXPAND_AFTER: Duration = Duration::from_secs(5);
 const CIRCUIT_REFRESH_POLL: Duration = Duration::from_secs(5);
 const CIRCUIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_DATA_PACE_US_ENV: &str = "VEIL_ONION_STREAM_DATA_PACE_US";
+const CIRCUIT_DATA_PACE_US_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_DATA_PACE_US";
+const DEFAULT_DATA_PACE_US: u64 = 100;
+const MIN_DATA_PACE_US: u64 = 50;
+const MAX_DATA_PACE_US: u64 = 5_000;
 // Existing streams may still be using the previous published rendezvous relay
 // for their ACK path after a refresh. Keep the old circuit/registration around
 // long enough for a multi-megabyte transfer to drain instead of black-holing the
@@ -236,10 +241,14 @@ fn open_stream_peer_intro(
 /// [`CellSender`] over `send_anonymous_authenticated` — the default datagram path.
 struct AnonCells {
     sender: Arc<AppSender>,
+    data_pacer: Arc<StreamDataPacer>,
 }
 
 impl CellSender for AnonCells {
     async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
+        if matches!(Frame::decode(&cell), Some(Frame::Data { .. })) {
+            self.data_pacer.wait(dst.node).await;
+        }
         self.sender
             .send_anonymous_authenticated(dst.node, dst.app, STREAM_ENDPOINT_ID, &cell)
             .await
@@ -274,6 +283,12 @@ struct CircuitCells {
     /// in the background. A stream cell sender must never block the stream driver
     /// on circuit construction; the ARQ layer retransmits dropped cells.
     outbound_opening: Arc<tokio::sync::Mutex<HashMap<[u8; 32], Instant>>>,
+    /// Shared DATA-cell pacer per destination node. Multiple onion streams to the
+    /// same peer share one pinned rendezvous/circuit bottleneck; if every stream
+    /// independently paces at the path ceiling, their aggregate burst still
+    /// overfills the relay/session queue. This serialises DATA cells at the circuit
+    /// sender boundary while leaving SYN/SYN_ACK/ACK/RST latency low.
+    data_pacer: Arc<StreamDataPacer>,
 }
 
 #[derive(Clone)]
@@ -314,10 +329,52 @@ enum CircuitEnvelope {
     },
 }
 
+struct StreamDataPacer {
+    interval: Duration,
+    next_by_peer: tokio::sync::Mutex<HashMap<[u8; 32], Instant>>,
+}
+
+impl StreamDataPacer {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next_by_peer: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn wait(&self, peer: [u8; 32]) {
+        if self.interval.is_zero() {
+            return;
+        }
+        let delay = {
+            let now = Instant::now();
+            let mut next_by_peer = self.next_by_peer.lock().await;
+            let next = next_by_peer.entry(peer).or_insert(now);
+            let scheduled = if *next > now { *next } else { now };
+            *next = scheduled + self.interval;
+            scheduled.saturating_duration_since(now)
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+fn stream_data_pace_interval() -> Duration {
+    let micros = std::env::var(STREAM_DATA_PACE_US_ENV)
+        .or_else(|_| std::env::var(CIRCUIT_DATA_PACE_US_ENV))
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DATA_PACE_US)
+        .clamp(MIN_DATA_PACE_US, MAX_DATA_PACE_US);
+    Duration::from_micros(micros)
+}
+
 impl CellSender for CircuitCells {
     async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
         let decoded = Frame::decode(&cell);
         let is_handshake = matches!(decoded, Some(Frame::Syn { .. } | Frame::SynAck { .. }));
+        let is_data = matches!(decoded, Some(Frame::Data { .. }));
         let Some(route) = self.circuit_for(dst.node, is_handshake).await? else {
             // Circuit not up yet — drop this cell; the ARQ/handshake RTO resends.
             return Ok(());
@@ -359,6 +416,9 @@ impl CellSender for CircuitCells {
                 env.len(),
                 veil_onion_stream::wire::MAX_CELL
             )));
+        }
+        if is_data {
+            self.data_pacer.wait(dst.node).await;
         }
         self.services
             .send_circuit_cell(&route.circuit, &env)
@@ -621,9 +681,15 @@ impl AnonStreamHub {
             None => {
                 // Datagram path (default / fallback): feed inbound from msg_rx.
                 spawn_anon_feed(msg_rx, in_tx);
+                let data_pace_interval = stream_data_pace_interval();
+                diag(&format!(
+                    "onion-stream: datagram shared DATA pacer {}us",
+                    data_pace_interval.as_micros()
+                ));
                 (
                     HubCells::Anon(AnonCells {
                         sender: sender.clone(),
+                        data_pacer: Arc::new(StreamDataPacer::new(data_pace_interval)),
                     }),
                     veil_onion_stream::MSS,
                 )
@@ -741,9 +807,15 @@ fn try_open_circuit(
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let outbound_circuits = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let outbound_opening = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let data_pace_interval = stream_data_pace_interval();
+    let data_pacer = Arc::new(StreamDataPacer::new(data_pace_interval));
     let activity = Arc::new(Mutex::new(Instant::now()));
     let reg_kp = Arc::new(services.onion_stream_registration_keypair());
     let epoch = Arc::new(AtomicU64::new(0));
+    diag(&format!(
+        "onion-stream: circuit shared DATA pacer {}us",
+        data_pace_interval.as_micros()
+    ));
     // Open the circuit to R in the BACKGROUND (async relay-dir fetch + CircuitBuild
     // + ACK). Proactive (not lazy-on-send) so the RECEIVER is ready to take inbound
     // splices before it ever sends. Cells before it's up drop; the ARQ resends.
@@ -907,6 +979,7 @@ fn try_open_circuit(
         inbound_circuits,
         outbound_circuits,
         outbound_opening,
+        data_pacer,
     })
 }
 
