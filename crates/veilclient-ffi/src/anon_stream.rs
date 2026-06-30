@@ -48,6 +48,10 @@ fn diag(msg: &str) {
     }
 }
 
+fn diag_node(node: &[u8; 32], msg: &str) {
+    diag(&format!("onion-stream[{}]: {msg}", short_node(node)));
+}
+
 /// Well-known endpoint the onion-stream cells ride (distinct from the chat
 /// inbox). Both peers bind it; a peer's app id is `deriveAppId(peer_node,
 /// STREAM_NAMESPACE, STREAM_NAME)` — the caller supplies it (mirrors how the
@@ -491,21 +495,29 @@ impl CircuitCells {
                 let age = now.duration_since(entry.opened_at);
                 let quiet_for = now.duration_since(entry.last_non_handshake);
                 if is_handshake && age >= CIRCUIT_HANDSHAKE_REOPEN_AFTER {
-                    diag(&format!(
-                        "onion-stream: outbound circuit handshake on old/quiet path \
-                         (age={}s quiet={}s) — reopening",
-                        age.as_secs(),
-                        quiet_for.as_secs()
-                    ));
+                    diag_node(
+                        &self.me,
+                        &format!(
+                            "outbound circuit handshake on old/quiet path \
+                         to {} (age={}s quiet={}s) — reopening",
+                            short_node(&dst_node),
+                            age.as_secs(),
+                            quiet_for.as_secs()
+                        ),
+                    );
                     circuits.remove(&dst_node).map(|entry| entry.circuit)
                 } else if idle_for < CIRCUIT_IDLE_REFRESH_AFTER {
                     entry.last_used = now;
                     return Ok(Some(entry.route()));
                 } else {
-                    diag(&format!(
-                        "onion-stream: outbound circuit idle for {}s — reopening in background",
-                        idle_for.as_secs()
-                    ));
+                    diag_node(
+                        &self.me,
+                        &format!(
+                            "outbound circuit to {} idle for {}s — reopening in background",
+                            short_node(&dst_node),
+                            idle_for.as_secs()
+                        ),
+                    );
                     circuits.remove(&dst_node).map(|entry| entry.circuit)
                 }
             } else {
@@ -575,10 +587,13 @@ impl CircuitCells {
             .await;
             outbound_opening.lock().await.remove(&dst_node);
             if let Err(e) = opened {
-                diag(&format!(
-                    "onion-stream: outbound circuit open failed for {}: {e}",
-                    short_node(&dst_node)
-                ));
+                diag_node(
+                    &me,
+                    &format!(
+                        "outbound circuit open failed for {}: {e}",
+                        short_node(&dst_node)
+                    ),
+                );
             }
         });
     }
@@ -613,10 +628,13 @@ impl CircuitCells {
             .await;
             self.outbound_opening.lock().await.remove(&dst_node);
             if let Err(e) = opened {
-                diag(&format!(
-                    "onion-stream: outbound circuit handshake-open failed for {}: {e}",
-                    short_node(&dst_node)
-                ));
+                diag_node(
+                    &self.me,
+                    &format!(
+                        "outbound circuit handshake-open failed for {}: {e}",
+                        short_node(&dst_node)
+                    ),
+                );
             }
         } else {
             let deadline = Instant::now() + CIRCUIT_CONFIRM_TIMEOUT;
@@ -704,10 +722,13 @@ impl AnonStreamHub {
                 // Datagram path (default / fallback): feed inbound from msg_rx.
                 spawn_anon_feed(msg_rx, in_tx);
                 let data_pace_interval = stream_data_pace_interval();
-                diag(&format!(
-                    "onion-stream: datagram shared DATA pacer {}us",
-                    data_pace_interval.as_micros()
-                ));
+                diag_node(
+                    &me,
+                    &format!(
+                        "datagram shared DATA pacer {}us",
+                        data_pace_interval.as_micros()
+                    ),
+                );
                 (
                     HubCells::Anon(AnonCells {
                         sender: sender.clone(),
@@ -720,16 +741,12 @@ impl AnonStreamHub {
         // Surface which backend engaged (desktop: stderr; phone: logcat).
         let backend = match &cells {
             HubCells::Circuit(c) => match c.mode {
-                CircuitMode::PublishedRendezvous => {
-                    "onion-stream: circuit mode — published rendezvous ads"
-                }
-                CircuitMode::ValidationMinRouting => {
-                    "onion-stream: circuit mode — validation min-routing"
-                }
+                CircuitMode::PublishedRendezvous => "circuit mode — published rendezvous ads",
+                CircuitMode::ValidationMinRouting => "circuit mode — validation min-routing",
             },
-            HubCells::Anon(_) => "onion-stream: datagram path (no embedded node)",
+            HubCells::Anon(_) => "datagram path (no embedded node)",
         };
-        diag(backend);
+        diag_node(&me, backend);
 
         // The onion RTT is SECONDS and highly variable; floor the RTO so it only
         // fires on REAL loss, pace the sender, and cap the window below the path's
@@ -739,10 +756,10 @@ impl AnonStreamHub {
         // one RTT, so steady-state ≈ 2·rwnd/srtt. On the in-order, LOSS-FREE pinned
         // circuit the window is the SOLE limiter — a 37 MB device transfer ran with
         // cwnd→27 MB and ZERO retransmits, capped at 134 KB/s = 2·256 KB / 3.8 s.
-        // Widen it ~12× there to fill the multi-second-RTT pipe (targets ~1.5 MB/s;
-        // cwnd + slow-start still find the real ceiling if the relay can't sustain
-        // it). The LOSSY datagram path keeps the small window — a big one there
-        // re-arms the slow-start-overshoot relay-queue drop the saga fought.
+        // Keep the circuit window large enough for useful throughput but below
+        // the local relay/backpressure cliff. The autonomous embedded harness
+        // reliably moved 1 MiB at 512 KiB × batch4; 896 KiB × batch12 reset the
+        // stream on the same stand.
         let is_circuit = matches!(&cells, HubCells::Circuit(_));
         let recv_window = match &cells {
             // Bound standing data to a little over 3x the measured clean-path
@@ -752,7 +769,7 @@ impl AnonStreamHub {
             // correlated drops and an RTO collapse.
             HubCells::Circuit(_) => env_u32(
                 CIRCUIT_RECV_WINDOW_ENV,
-                896 * 1024,
+                512 * 1024,
                 (64 * 1024) as u32,
                 (8 * 1024 * 1024) as u32,
             ),
@@ -774,24 +791,28 @@ impl AnonStreamHub {
             60_000
         };
         let max_retransmits = if is_circuit {
-            env_u32(CIRCUIT_MAX_RETRANSMITS_ENV, 2, 1, 30)
+            env_u32(CIRCUIT_MAX_RETRANSMITS_ENV, 5, 1, 30)
         } else {
             15
         };
         let max_pacing_batch = if is_circuit {
-            // 12 × 318 B/ms ≈ 3.8 MB/s stream-payload ceiling: comfortably
-            // above the old 1.5 MB/s target while still keeping bursts half
-            // the previous 24-cell aggressive profile.
-            env_u32(CIRCUIT_MAX_PACING_BATCH_ENV, 12, 1, 128)
+            // 4 × 318 B/ms ≈ 1.27 MB/s stream-payload ceiling before ACK/relay
+            // overhead. Higher batches remain available via env while tuning,
+            // but batch8 already produced a header-idle failure on the local
+            // embedded pinned-path harness.
+            env_u32(CIRCUIT_MAX_PACING_BATCH_ENV, 4, 1, 128)
         } else {
             4
         };
         if is_circuit {
-            diag(&format!(
-                "onion-stream: circuit cfg mss={mss} rwnd={recv_window} \
+            diag_node(
+                &me,
+                &format!(
+                    "circuit cfg mss={mss} rwnd={recv_window} \
                  batch={max_pacing_batch} rto={init_rto_ms}/{min_rto_ms}/{max_rto_ms}ms \
                  max_retx={max_retransmits}",
-            ));
+                ),
+            );
         }
         let cfg = Config {
             mss,
@@ -871,10 +892,13 @@ fn try_open_circuit(
     let activity = Arc::new(Mutex::new(Instant::now()));
     let reg_kp = Arc::new(services.onion_stream_registration_keypair());
     let epoch = Arc::new(AtomicU64::new(0));
-    diag(&format!(
-        "onion-stream: circuit shared DATA pacer {}us",
-        data_pace_interval.as_micros()
-    ));
+    diag_node(
+        &me,
+        &format!(
+            "circuit shared DATA pacer {}us",
+            data_pace_interval.as_micros()
+        ),
+    );
     // Open the circuit to R in the BACKGROUND (async relay-dir fetch + CircuitBuild
     // + ACK). Proactive (not lazy-on-send) so the RECEIVER is ready to take inbound
     // splices before it ever sends. Cells before it's up drop; the ARQ resends.
@@ -911,9 +935,7 @@ fn try_open_circuit(
                     Ok(opened) => opened,
                     Err(e) => {
                         if attempt == 1 || attempt % 15 == 0 {
-                            diag(&format!(
-                                "onion-stream: circuit open retry #{attempt}: {e:?}"
-                            ));
+                            diag_node(&me, &format!("circuit open retry #{attempt}: {e:?}"));
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         backoff_ms = backoff_ms.saturating_mul(2).min(8_000);
@@ -928,13 +950,29 @@ fn try_open_circuit(
                 // CircuitBuild is queued. Do not publish the handle until R has
                 // accepted the cookie registration and CircuitBuilt came back.
                 if !confirm_circuit(&candidate).await {
-                    services_bg.close_data_circuit(candidate.origin_circuit_id());
                     if let Some(relay) = relay {
-                        diag(&format!(
-                            "onion-stream: inbound circuit confirmation timed out at R={}",
-                            short_node(&relay)
-                        ));
+                        diag_node(
+                            &me,
+                            &format!(
+                                "inbound circuit confirmation timed out at R={} — keeping receive sink for grace",
+                                short_node(&relay)
+                            ),
+                        );
                     }
+                    // The confirmation ACK can be lost after the rendezvous relay
+                    // has already accepted the cookie registration. If we close
+                    // the local stream sink immediately, that relay-side cookie
+                    // mapping becomes a blackhole until the next successful
+                    // refresh replaces it. Keep the receive half alive for the
+                    // normal retire grace; if the registration never landed, it
+                    // stays idle and is cleaned up later.
+                    spawn_circuit_feed(
+                        services_bg.clone(),
+                        recv_rx,
+                        in_tx_bg.clone(),
+                        Some(Arc::clone(&activity_bg)),
+                    );
+                    retire_circuits_later(&services_bg, vec![Arc::new(candidate)]);
                     continue;
                 }
 
@@ -956,9 +994,10 @@ fn try_open_circuit(
 
             if confirmed.is_empty() {
                 if attempt == 1 || attempt % 15 == 0 {
-                    diag(&format!(
-                        "onion-stream: circuit confirmation timed out on attempt #{attempt}"
-                    ));
+                    diag_node(
+                        &me,
+                        &format!("circuit confirmation timed out on attempt #{attempt}"),
+                    );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = backoff_ms.saturating_mul(2).min(8_000);
@@ -985,15 +1024,21 @@ fn try_open_circuit(
                 )
             };
             if generation == 1 {
-                diag(&format!(
-                    "onion-stream: PINNED CIRCUIT opened ({mode:?}, {} registration(s), after {attempt} tries){relay_suffix}",
-                    circuit_slot.lock().await.len()
-                ));
+                diag_node(
+                    &me,
+                    &format!(
+                        "PINNED CIRCUIT opened ({mode:?}, {} registration(s), after {attempt} tries){relay_suffix}",
+                        circuit_slot.lock().await.len()
+                    ),
+                );
             } else {
-                diag(&format!(
-                    "onion-stream: PINNED CIRCUIT refreshed ({mode:?}, {} registration(s), generation {generation}){relay_suffix}",
-                    circuit_slot.lock().await.len()
-                ));
+                diag_node(
+                    &me,
+                    &format!(
+                        "PINNED CIRCUIT refreshed ({mode:?}, {} registration(s), generation {generation}){relay_suffix}",
+                        circuit_slot.lock().await.len()
+                    ),
+                );
             }
 
             retire_circuits_later(&services_bg, retired);
@@ -1009,19 +1054,25 @@ fn try_open_circuit(
                         && generation_age >= CIRCUIT_PUBLISHED_RELAY_EXPAND_AFTER
                         && idle_for >= CIRCUIT_PUBLISHED_RELAY_EXPAND_AFTER
                     {
-                        diag(&format!(
-                            "onion-stream: published rendezvous set expanded {have}->{want} — refreshing inbound circuits"
-                        ));
+                        diag_node(
+                            &me,
+                            &format!(
+                                "published rendezvous set expanded {have}->{want} — refreshing inbound circuits"
+                            ),
+                        );
                         break;
                     }
                 }
                 if generation_age >= CIRCUIT_IDLE_REFRESH_AFTER
                     && idle_for >= CIRCUIT_IDLE_REFRESH_AFTER
                 {
-                    diag(&format!(
-                        "onion-stream: inbound circuit idle for {}s — refreshing",
-                        idle_for.as_secs()
-                    ));
+                    diag_node(
+                        &me,
+                        &format!(
+                            "inbound circuit idle for {}s — refreshing",
+                            idle_for.as_secs()
+                        ),
+                    );
                     break;
                 }
             }
@@ -1092,10 +1143,13 @@ async fn open_inbound_circuits(
                     Ok((circuit, rx)) => opened.push((Some(relay), circuit, rx)),
                     Err(e) => {
                         last_err = e;
-                        diag(&format!(
-                            "onion-stream: inbound published R={} open failed: {last_err:?}",
-                            short_node(&relay)
-                        ));
+                        diag_node(
+                            &me,
+                            &format!(
+                                "inbound published R={} open failed: {last_err:?}",
+                                short_node(&relay)
+                            ),
+                        );
                     }
                 }
             }
@@ -1146,11 +1200,22 @@ async fn open_outbound_circuit(
         };
 
         if !confirm_circuit(&candidate).await {
-            services.close_data_circuit(candidate.origin_circuit_id());
             last_err = format!(
                 "R={} confirmation timed out",
                 short_node(&ad.rendezvous_node_id)
             );
+            // As on the inbound side, timeout does not prove the rendezvous
+            // registration failed; it may only mean the CircuitBuilt ACK was lost
+            // on the return path. Keep a receive feed alive so any peer cells
+            // spliced to this just-registered cookie still reach the mux while a
+            // later retransmit/open picks a confirmed send path.
+            spawn_circuit_feed(
+                services.clone(),
+                recv_rx,
+                in_tx.clone(),
+                Some(Arc::clone(&activity)),
+            );
+            retire_circuits_later(&services, vec![Arc::new(candidate)]);
             continue;
         }
 
@@ -1174,11 +1239,14 @@ async fn open_outbound_circuit(
             },
         );
         mark_circuit_activity(&activity);
-        diag(&format!(
-            "onion-stream: outbound circuit ready for {} via R={}",
-            short_node(&dst_node),
-            short_node(&ad.rendezvous_node_id)
-        ));
+        diag_node(
+            &me,
+            &format!(
+                "outbound circuit ready for {} via R={}",
+                short_node(&dst_node),
+                short_node(&ad.rendezvous_node_id)
+            ),
+        );
         let retired = retired.map(|r| r.circuit).into_iter().collect();
         retire_circuits_later(&services, retired);
         return Ok(());
