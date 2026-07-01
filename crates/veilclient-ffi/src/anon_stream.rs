@@ -19,7 +19,7 @@
 //!   handshake intro; validation mode keeps the old clear sender-id shortcut.
 //!   Needs the embedded node (in-process `NodeServices`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -317,6 +317,13 @@ struct CircuitEntry {
     opened_at: Instant,
     last_used: Instant,
     last_non_handshake: Instant,
+    /// Stream ids whose SYN/SYN_ACK already used this circuit. A no-progress
+    /// handshake retransmits those cells several times before the app-level
+    /// manifest timeout fires; treating that retransmit as "new work on an old
+    /// quiet circuit" rotated the path mid-handshake and made the accepted
+    /// stream EOF before its 48-byte request arrived. New stream ids after the
+    /// same quiet window still force a fresh circuit, which is the resume path.
+    handshake_streams: HashSet<u32>,
 }
 
 impl CircuitEntry {
@@ -423,9 +430,13 @@ fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
 impl CellSender for CircuitCells {
     async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
         let decoded = Frame::decode(&cell);
-        let is_handshake = matches!(decoded, Some(Frame::Syn { .. } | Frame::SynAck { .. }));
+        let handshake_stream_id = match decoded {
+            Some(Frame::Syn { stream_id, .. } | Frame::SynAck { stream_id, .. }) => Some(stream_id),
+            _ => None,
+        };
+        let is_handshake = handshake_stream_id.is_some();
         let is_data = matches!(decoded, Some(Frame::Data { .. }));
-        let Some(route) = self.circuit_for(dst.node, is_handshake).await? else {
+        let Some(route) = self.circuit_for(dst.node, handshake_stream_id).await? else {
             // Circuit not up yet — drop this cell; the ARQ/handshake RTO resends.
             return Ok(());
         };
@@ -485,7 +496,7 @@ impl CircuitCells {
     async fn circuit_for(
         &self,
         dst_node: [u8; 32],
-        is_handshake: bool,
+        handshake_stream_id: Option<u32>,
     ) -> io::Result<Option<CircuitRoute>> {
         match self.mode {
             CircuitMode::ValidationMinRouting => Ok(self
@@ -501,7 +512,8 @@ impl CircuitCells {
                     },
                 })),
             CircuitMode::PublishedRendezvous => {
-                self.ensure_outbound_circuit(dst_node, is_handshake).await
+                self.ensure_outbound_circuit(dst_node, handshake_stream_id)
+                    .await
             }
         }
     }
@@ -509,7 +521,7 @@ impl CircuitCells {
     async fn ensure_outbound_circuit(
         &self,
         dst_node: [u8; 32],
-        is_handshake: bool,
+        handshake_stream_id: Option<u32>,
     ) -> io::Result<Option<CircuitRoute>> {
         let now = Instant::now();
         let retired = {
@@ -518,21 +530,32 @@ impl CircuitCells {
                 let idle_for = now.duration_since(entry.last_used);
                 let age = now.duration_since(entry.opened_at);
                 let quiet_for = now.duration_since(entry.last_non_handshake);
-                if is_handshake
-                    && age >= CIRCUIT_HANDSHAKE_REOPEN_AFTER
-                    && quiet_for >= CIRCUIT_HANDSHAKE_REOPEN_AFTER
-                {
-                    diag_node(
-                        &self.me,
-                        &format!(
-                            "outbound circuit handshake on old/quiet path \
-                         to {} (age={}s quiet={}s) — reopening",
-                            short_node(&dst_node),
-                            age.as_secs(),
-                            quiet_for.as_secs()
-                        ),
-                    );
-                    circuits.remove(&dst_node).map(|entry| entry.circuit)
+                if let Some(stream_id) = handshake_stream_id {
+                    let known_handshake = entry.handshake_streams.contains(&stream_id);
+                    if age >= CIRCUIT_HANDSHAKE_REOPEN_AFTER
+                        && quiet_for >= CIRCUIT_HANDSHAKE_REOPEN_AFTER
+                        && !known_handshake
+                    {
+                        diag_node(
+                            &self.me,
+                            &format!(
+                                "outbound circuit handshake on old/quiet path \
+                         to {} (stream={} age={}s quiet={}s) — reopening",
+                                short_node(&dst_node),
+                                stream_id,
+                                age.as_secs(),
+                                quiet_for.as_secs()
+                            ),
+                        );
+                        circuits.remove(&dst_node).map(|entry| entry.circuit)
+                    } else {
+                        entry.last_used = now;
+                        if entry.handshake_streams.len() >= 256 && !known_handshake {
+                            entry.handshake_streams.clear();
+                        }
+                        entry.handshake_streams.insert(stream_id);
+                        return Ok(Some(entry.route()));
+                    }
                 } else if idle_for < CIRCUIT_IDLE_REFRESH_AFTER {
                     entry.last_used = now;
                     return Ok(Some(entry.route()));
@@ -561,7 +584,7 @@ impl CircuitCells {
             }
         }
 
-        if is_handshake {
+        if handshake_stream_id.is_some() {
             return self.open_outbound_for_handshake(dst_node).await;
         }
 
@@ -1275,6 +1298,7 @@ async fn open_outbound_circuit(
                 opened_at: now,
                 last_used: now,
                 last_non_handshake: now,
+                handshake_streams: HashSet::new(),
             },
         );
         mark_circuit_activity(&activity);
