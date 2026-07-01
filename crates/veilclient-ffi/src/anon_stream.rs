@@ -926,8 +926,10 @@ fn try_open_circuit(
     // identities in one host process otherwise race: whichever node published
     // last would drive every pinned circuit. The fallback keeps the old
     // single-node behavior for hosts that have not published keyed services.
-    let services = veil_node_runtime::embedded_services_for(&me)
-        .or_else(veil_node_runtime::embedded_services)?;
+    let services = veil_node_runtime::embedded_services_for(&me).or_else(|| {
+        let latest = veil_node_runtime::embedded_services()?;
+        (latest.local_node_id() == me).then_some(latest)
+    })?;
     let cookie = stream_cookie(&me);
     let inbound_circuits: Arc<tokio::sync::Mutex<Vec<Arc<veil_node_runtime::DataCircuit>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
