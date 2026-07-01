@@ -3926,7 +3926,11 @@ impl SessionRunner {
                 );
                 let now = std::time::Instant::now();
                 if bp_signal.try_arm(now) {
-                    log::warn!(
+                    // Backpressure is an expected congestion signal on busy
+                    // streams.  Keep the signal itself, but do not WARN-flood
+                    // embedded/mobile hosts; stdout/logcat backpressure can
+                    // become the bottleneck under high-rate synthetic tests.
+                    log::debug!(
                         "LIMIT rate_limited: backpressure ARMED -> peer {} \
                          — sustained inbound exceeds capacity",
                         hex_short(&self.peer_id),
