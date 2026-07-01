@@ -169,7 +169,15 @@ pub(crate) fn replicate_dht_value(
         );
     }
 
-    let candidates: Vec<[u8; 32]> = candidates_with_uri.into_iter().map(|(n, _)| n).collect();
+    let mut candidates: Vec<[u8; 32]> = candidates_with_uri.into_iter().map(|(n, _)| n).collect();
+    {
+        let guard = tx_reg.read().unwrap_or_else(|p| p.into_inner());
+        for peer in guard.peer_ids() {
+            if peer != local_node_id && !candidates.contains(&peer) {
+                candidates.push(peer);
+            }
+        }
+    }
 
     // Build the RecursiveQuery(STORE) frame once.
     let query_id: [u8; 16] = {
