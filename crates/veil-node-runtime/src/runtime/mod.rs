@@ -6760,19 +6760,118 @@ impl NodeServices {
         Ok(relays)
     }
 
-    async fn cache_stream_relay_directory(&self, relay: [u8; 32]) {
+    fn valid_stream_relay_directory_entry(relay: [u8; 32], bytes: &[u8]) -> bool {
+        use veil_anonymity::directory::{decode_entry, verify_entry};
+
+        matches!(
+            decode_entry(bytes),
+            Ok(entry) if entry.node_id == relay && verify_entry(&entry).is_ok()
+        )
+    }
+
+    async fn cache_stream_relay_directory(&self, relay: [u8; 32]) -> bool {
         use veil_anonymity::directory::relay_directory_dht_key;
 
-        const RELAY_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const RELAY_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
 
         let relay_key = relay_directory_dht_key(&relay);
-        if self.dht.get_local(&relay_key).is_none()
-            && let Some(bytes) = self
-                .dht_recursive_get(relay_key, RELAY_RESOLVE_TIMEOUT)
-                .await
+        if self
+            .dht
+            .get_local(&relay_key)
+            .is_some_and(|bytes| Self::valid_stream_relay_directory_entry(relay, &bytes))
+        {
+            return true;
+        }
+
+        // A stream circuit to an exact rendezvous R needs R's relay-directory
+        // entry (its onion X25519 key). In the sparse pinned/mobile topology, R
+        // is often a directly-connected relay while the local DHT shard is still
+        // cold. Ask that exact connected peer first; it answers authoritatively
+        // from its own store_local, and the signature/node-id binding below keeps
+        // a malicious peer from poisoning the cache.
+        if let Some(bytes) = crate::mlkem_resolver::recursive_dht_get(
+            &self.dht,
+            &self.session_tx_registry,
+            &self.dispatcher.pending_recursive,
+            *self.identity.local_identity.node_id.as_bytes(),
+            relay_key,
+            RELAY_RESOLVE_TIMEOUT,
+            Some(relay),
+            move |bytes| Self::valid_stream_relay_directory_entry(relay, bytes),
+        )
+        .await
+            && Self::valid_stream_relay_directory_entry(relay, &bytes)
         {
             self.dht.store_local(relay_key, bytes);
+            return true;
         }
+
+        false
+    }
+
+    async fn cache_stream_relay_directories_for_path(
+        &self,
+        rendezvous_node_id: [u8; 32],
+        hop_count: usize,
+    ) -> usize {
+        const MAX_STREAM_RELAY_PREWARM: usize = 8;
+
+        let mut relays = Vec::with_capacity(MAX_STREAM_RELAY_PREWARM);
+        relays.push(rendezvous_node_id);
+
+        for relay in &self.anonymity.pinned_rendezvous_relays {
+            if !relays.contains(relay) {
+                relays.push(*relay);
+            }
+        }
+        for entry in lock!(self.anonymity.rendezvous_publisher_entries).iter() {
+            if entry.ephemeral_ad_identity.is_none() && !relays.contains(&entry.rendezvous_node_id)
+            {
+                relays.push(entry.rendezvous_node_id);
+            }
+        }
+
+        // Add a small bounded set of currently-connected peers that explicitly
+        // advertised ANONYMITY_RELAY. For published-mode CIRCUIT_HOPS=2 we need
+        // at least one middle relay distinct from R; relying on the periodic
+        // maintenance prewarm leaves a cold embedded/mobile endpoint in NoRelays
+        // until the next tick.
+        let active_anon_relays = {
+            let flags = self
+                .dispatcher
+                .crypto
+                .peer_cap_flags
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            let sessions = lock!(self.live_sessions);
+            sessions
+                .values()
+                .filter(|i| i.state == crate::types::SessionState::Active)
+                .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
+                .filter(|node_id| {
+                    flags
+                        .get(node_id)
+                        .copied()
+                        .is_some_and(|f| f & veil_proto::session::cap_flags::ANONYMITY_RELAY != 0)
+                })
+                .collect::<Vec<_>>()
+        };
+        for relay in active_anon_relays {
+            if relays.len() >= MAX_STREAM_RELAY_PREWARM.max(hop_count + 1) {
+                break;
+            }
+            if !relays.contains(&relay) {
+                relays.push(relay);
+            }
+        }
+
+        let mut cached = 0usize;
+        for relay in relays {
+            if self.cache_stream_relay_directory(relay).await {
+                cached += 1;
+            }
+        }
+        cached
     }
 
     /// Open a pinned stream circuit ending at an exact published rendezvous relay.
@@ -6802,7 +6901,9 @@ impl NodeServices {
                 match self.select_onion_relay_path_to(rendezvous_node_id, hop_count) {
                     Ok(path) => path,
                     Err(_) => {
-                        self.cache_stream_relay_directory(rendezvous_node_id).await;
+                        let cached = self
+                            .cache_stream_relay_directories_for_path(rendezvous_node_id, hop_count)
+                            .await;
 
                         let outbox: Arc<dyn veil_dht::FrameRouter> =
                             Arc::clone(&self.session_outbox) as Arc<dyn veil_dht::FrameRouter>;
@@ -6815,7 +6916,16 @@ impl NodeServices {
                         )
                         .await;
 
-                        self.select_onion_relay_path_to(rendezvous_node_id, hop_count)?
+                        let path =
+                            self.select_onion_relay_path_to(rendezvous_node_id, hop_count)?;
+                        if cached > 0 {
+                            log::debug!(
+                                "onion-stream.relay-directory.prewarmed cached={} R={}",
+                                cached,
+                                veil_util::hex_short(&rendezvous_node_id),
+                            );
+                        }
+                        path
                     }
                 }
             }
@@ -7034,13 +7144,24 @@ impl NodeServices {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let candidates: Vec<[u8; 32]> = self
+        let mut candidates: Vec<[u8; 32]> = self
             .dht
             .routing_table_contacts()
             .into_iter()
             .map(|c| c.node_id)
-            .filter(|n| *n != r)
             .collect();
+        {
+            let sessions = lock!(self.live_sessions);
+            candidates.extend(
+                sessions
+                    .values()
+                    .filter(|i| i.state == crate::types::SessionState::Active)
+                    .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes())),
+            );
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.retain(|n| *n != r);
         let dht = std::sync::Arc::clone(&self.dht);
         let mut discovered: Vec<[u8; 32]> = discover_relay_hops(
             &candidates,
