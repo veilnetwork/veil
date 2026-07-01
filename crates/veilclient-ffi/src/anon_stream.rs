@@ -164,6 +164,7 @@ const CIRCUIT_INIT_RTO_MS_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_INIT_RTO_MS";
 const CIRCUIT_MIN_RTO_MS_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_MIN_RTO_MS";
 const CIRCUIT_MAX_RTO_MS_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_MAX_RTO_MS";
 const DEFAULT_DATA_PACE_US: u64 = 100;
+const DEFAULT_CIRCUIT_DATA_PACE_US: u64 = 50;
 const MIN_DATA_PACE_US: u64 = 50;
 const MAX_DATA_PACE_US: u64 = 5_000;
 // Existing streams may still be using the previous published rendezvous relay
@@ -384,12 +385,21 @@ impl StreamDataPacer {
     }
 }
 
-fn stream_data_pace_interval() -> Duration {
-    let micros = std::env::var(STREAM_DATA_PACE_US_ENV)
-        .or_else(|_| std::env::var(CIRCUIT_DATA_PACE_US_ENV))
+fn stream_data_pace_interval(is_circuit: bool) -> Duration {
+    let default = if is_circuit {
+        DEFAULT_CIRCUIT_DATA_PACE_US
+    } else {
+        DEFAULT_DATA_PACE_US
+    };
+    let raw = if is_circuit {
+        std::env::var(CIRCUIT_DATA_PACE_US_ENV).or_else(|_| std::env::var(STREAM_DATA_PACE_US_ENV))
+    } else {
+        std::env::var(STREAM_DATA_PACE_US_ENV)
+    };
+    let micros = raw
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_DATA_PACE_US)
+        .unwrap_or(default)
         .clamp(MIN_DATA_PACE_US, MAX_DATA_PACE_US);
     Duration::from_micros(micros)
 }
@@ -741,7 +751,7 @@ impl AnonStreamHub {
             None => {
                 // Datagram path (default / fallback): feed inbound from msg_rx.
                 spawn_anon_feed(msg_rx, in_tx);
-                let data_pace_interval = stream_data_pace_interval();
+                let data_pace_interval = stream_data_pace_interval(false);
                 diag_node(
                     &me,
                     &format!(
@@ -768,28 +778,22 @@ impl AnonStreamHub {
         };
         diag_node(&me, backend);
 
-        // The onion RTT is SECONDS and highly variable; floor the RTO so it only
-        // fires on REAL loss, pace the sender, and cap the window below the path's
-        // standing-queue-drop onset (see the device-debug saga in memory).
+        // The onion RTT is variable and relay queues can punish coarse bursts:
+        // floor the RTO so it only fires on real loss, pace the sender, and keep
+        // an explicit receive window instead of letting cwnd grow unbounded.
         //
-        // recv_window IS the throughput cap: pacing spreads `min(cwnd, rwnd)` over
-        // one RTT, so steady-state ≈ 2·rwnd/srtt. On the in-order, LOSS-FREE pinned
-        // circuit the window is the SOLE limiter — a 37 MB device transfer ran with
-        // cwnd→27 MB and ZERO retransmits, capped at 134 KB/s = 2·256 KB / 3.8 s.
-        // Keep the circuit window large enough for useful throughput but below
-        // the local relay/backpressure cliff. The autonomous embedded harness
-        // reliably moved 1 MiB at 512 KiB × batch4; 896 KiB × batch12 reset the
-        // stream on the same stand.
+        // The original 1-cell/ms pacer floor capped clean transfers at ~135 KiB/s.
+        // After converting both stream and circuit pacing to small millisecond
+        // batches, the autonomous embedded harness reliably moves 8 MiB over
+        // published rendezvous with 4 MiB × batch64 × 50us (~1.2 MiB/s single
+        // stream, ~1.7 MiB/s with two range streams) without RTO collapse.
         let is_circuit = matches!(&cells, HubCells::Circuit(_));
         let recv_window = match &cells {
-            // Bound standing data to a little over 3x the measured clean-path
-            // BDP (~225 KiB at 1.5 MiB/s × 150 ms). The former 3–4 MiB window
-            // let a fixed-rate pacer build a multi-megabyte relay queue before
-            // end-to-end loss became visible, producing tens of thousands of
-            // correlated drops and an RTO collapse.
+            // 4 MiB is large enough to cover high-BDP phone↔desktop paths and
+            // small enough to keep memory/standing queue bounded per stream.
             HubCells::Circuit(_) => env_u32(
                 CIRCUIT_RECV_WINDOW_ENV,
-                512 * 1024,
+                4 * 1024 * 1024,
                 (64 * 1024) as u32,
                 (8 * 1024 * 1024) as u32,
             ),
@@ -816,11 +820,10 @@ impl AnonStreamHub {
             15
         };
         let max_pacing_batch = if is_circuit {
-            // 4 × 318 B/ms ≈ 1.27 MB/s stream-payload ceiling before ACK/relay
-            // overhead. Higher batches remain available via env while tuning,
-            // but batch8 already produced a header-idle failure on the local
-            // embedded pinned-path harness.
-            env_u32(CIRCUIT_MAX_PACING_BATCH_ENV, 4, 1, 128)
+            // Pacing uses millisecond ticks for scheduler realism; 64 cells/tick
+            // is still only ~20 KiB microbursts at MSS=318 and is further shaped
+            // by the shared circuit DATA pacer.
+            env_u32(CIRCUIT_MAX_PACING_BATCH_ENV, 64, 1, 128)
         } else {
             4
         };
@@ -908,7 +911,7 @@ fn try_open_circuit(
     let outbound_circuits = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let outbound_opening = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_tags: SharedPeerTags = Arc::new(Mutex::new(HashMap::new()));
-    let data_pace_interval = stream_data_pace_interval();
+    let data_pace_interval = stream_data_pace_interval(true);
     let data_pacer = Arc::new(StreamDataPacer::new(data_pace_interval));
     let activity = Arc::new(Mutex::new(Instant::now()));
     let reg_kp = Arc::new(services.onion_stream_registration_keypair());
