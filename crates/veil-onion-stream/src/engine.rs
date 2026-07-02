@@ -95,6 +95,19 @@ pub struct Config {
     pub ack_every: u8,
     /// Maximum delay before acknowledging a partial [`Self::ack_every`] group.
     pub ack_delay_ms: u64,
+    /// Warm-start seed for the BBR-lite bottleneck estimate (bytes/sec), from
+    /// a previous stream to the same peer. 0 = cold start. A warm stream
+    /// engages BBR pacing/window shaping from the first byte (no
+    /// 1 MiB engage gate, no STARTUP): the 10s max-window naturally expires
+    /// the seed once real samples land, and NewReno loss handling still
+    /// applies underneath, so a stale (too-high) seed self-corrects within a
+    /// window while a too-low seed is out-probed at the steady 5/4 gain.
+    /// Callers should seed conservatively (e.g. half the last measured rate).
+    pub warm_btl_bw: u64,
+    /// Warm-start seed for the windowed-minimum RTT (ms). Only used when
+    /// [`Self::warm_btl_bw`] is non-zero. 0 = none (the seed then waits for
+    /// the first live RTT sample before the window cap engages).
+    pub warm_rtt_min_ms: u32,
     /// Optional driver-side diagnostic dump period. 0 disables it.
     pub debug_summary_ms: u64,
 }
@@ -118,6 +131,8 @@ impl Default for Config {
             bbr: false,
             ack_every: 2,
             ack_delay_ms: 5,
+            warm_btl_bw: 0,
+            warm_rtt_min_ms: 0,
             debug_summary_ms: 0,
         }
     }
@@ -305,6 +320,23 @@ impl StreamEngine {
     }
 
     fn new(stream_id: u32, cfg: Config, iss: u32) -> Self {
+        // Warm start: seed the delivery model from a previous stream to the
+        // same peer so a follow-up bulk stream skips the estimator climb (the
+        // cold ramp costs seconds per stream; see Config::warm_btl_bw). The
+        // seed enters the same windowed-max filter as live samples, so it
+        // expires like any sample once real data flows.
+        let warm = cfg.bbr && cfg.warm_btl_bw > 0;
+        let warm_rtt = (warm && cfg.warm_rtt_min_ms > 0).then_some((cfg.warm_rtt_min_ms, 0u64));
+        let mut init_cwnd = cfg.init_cwnd.max(cfg.mss as u32);
+        if let Some((rtt_ms, _)) = warm_rtt {
+            // Open the first flight near the seeded BDP (capped: an unpaced
+            // pre-first-ACK burst rides the carrier's token-bucket pacer, and
+            // a bounded relay queue should never see a multi-MiB wall).
+            let bdp = (cfg.warm_btl_bw.saturating_mul(rtt_ms as u64) / 1000)
+                .min(1024 * 1024)
+                .min(cfg.recv_window as u64) as u32;
+            init_cwnd = init_cwnd.max(bdp);
+        }
         Self {
             stream_id,
             cfg,
@@ -315,7 +347,7 @@ impl StreamEngine {
                 snd_nxt: iss,
                 pending: VecDeque::new(),
                 segs: VecDeque::new(),
-                cwnd: cfg.init_cwnd.max(cfg.mss as u32),
+                cwnd: init_cwnd,
                 ssthresh: cfg.init_ssthresh,
                 rwnd: cfg.mss as u32, // until the peer tells us, allow one segment
                 dup_acks: 0,
@@ -335,13 +367,20 @@ impl StreamEngine {
                 fin_acked: false,
                 delivered: 0,
                 rate_samples: VecDeque::new(),
-                bw_samples: VecDeque::new(),
-                btl_bw: 0,
-                bbr_startup: true,
+                bw_samples: if warm {
+                    VecDeque::from([(0, cfg.warm_btl_bw)])
+                } else {
+                    VecDeque::new()
+                },
+                btl_bw: if warm { cfg.warm_btl_bw } else { 0 },
+                // A warm stream starts at the steady 5/4 probe gain: the seed
+                // is already near capacity, and a 2x STARTUP probe on top of
+                // it would overshoot a path that may have degraded since.
+                bbr_startup: !warm,
                 bbr_bw_at_probe: 0,
                 bbr_stall_rounds: 0,
                 bbr_probe_checked_ms: 0,
-                rtt_min: None,
+                rtt_min: warm_rtt.map(|(r, t)| (r.max(1), t)),
             },
             rx: RxState {
                 rcv_nxt: 0,
@@ -435,6 +474,16 @@ impl StreamEngine {
     }
     pub fn stream_id(&self) -> u32 {
         self.stream_id
+    }
+    /// Final BBR-lite delivery model, for warm-starting a follow-up stream to
+    /// the same peer: `(btl_bw bytes/sec, rtt_min ms, delivered bytes)`.
+    /// `btl_bw`/`rtt_min` are 0 when the model never warmed up.
+    pub fn delivery_model(&self) -> (u64, u32, u64) {
+        (
+            self.tx.btl_bw,
+            self.tx.rtt_min.map(|(r, _)| r).unwrap_or(0),
+            self.tx.delivered,
+        )
     }
     pub fn debug_summary_period_ms(&self) -> u64 {
         self.cfg.debug_summary_ms
@@ -1170,7 +1219,7 @@ impl StreamEngine {
         if self.cfg.bbr
             && self.tx.btl_bw > 0
             && self.tx.rtt_min.is_some()
-            && self.tx.delivered >= BBR_ENGAGE_DELIVERED
+            && (self.tx.delivered >= BBR_ENGAGE_DELIVERED || self.cfg.warm_btl_bw > 0)
         {
             // STARTUP doubles the estimate each round trip; steady state
             // probes at 5/4 (see bbr_startup).
@@ -1415,7 +1464,10 @@ impl TxState {
     /// delay product, once both estimates exist. `None` (startup / bbr off)
     /// means no extra cap.
     fn bbr_window_cap(&self, cfg: &Config) -> Option<u32> {
-        if !cfg.bbr || self.btl_bw == 0 || self.delivered < BBR_ENGAGE_DELIVERED {
+        if !cfg.bbr
+            || self.btl_bw == 0
+            || (self.delivered < BBR_ENGAGE_DELIVERED && cfg.warm_btl_bw == 0)
+        {
             return None;
         }
         let (rtt_min, _) = self.rtt_min?;
@@ -1618,6 +1670,35 @@ mod tests {
         // Without estimates the cap must vanish (startup behaves classically).
         e.tx.btl_bw = 0;
         assert_eq!(e.effective_send_window(), e.tx.cwnd.min(e.tx.rwnd));
+    }
+
+    #[test]
+    fn warm_start_engages_bbr_from_the_first_byte() {
+        let cfg = Config {
+            bbr: true,
+            recv_window: 4 * 1024 * 1024,
+            warm_btl_bw: 6_000_000,
+            warm_rtt_min_ms: 150,
+            ..Config::default()
+        };
+        let e = StreamEngine::connect(7, cfg, 0, 10_000);
+        // Model seeded, no STARTUP overdrive, window cap live at zero bytes
+        // delivered (a cold stream would return None until 1 MiB).
+        assert_eq!(e.tx.btl_bw, 6_000_000);
+        assert!(!e.tx.bbr_startup);
+        assert_eq!(e.tx.rtt_min.map(|(r, _)| r), Some(150));
+        let bdp = 6_000_000u64 * 150 / 1000; // 900 KB
+        assert_eq!(e.tx.bbr_window_cap(&e.cfg), Some(2 * bdp as u32));
+        // First flight opens near the seeded BDP (capped at 1 MiB).
+        assert_eq!(e.tx.cwnd, bdp as u32);
+        // A cold config keeps the engage gate.
+        let cold = Config {
+            bbr: true,
+            ..Config::default()
+        };
+        let c = StreamEngine::connect(8, cold, 0, 10_000);
+        assert_eq!(c.tx.bbr_window_cap(&c.cfg), None);
+        assert!(c.tx.bbr_startup);
     }
 
     #[test]
