@@ -4820,6 +4820,7 @@ dependencies = [
  "libc",
  "log",
  "rand_core 0.6.4",
+ "sha2",
  "tempfile",
  "tokio",
  "veil-anonymity",

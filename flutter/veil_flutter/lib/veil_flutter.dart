@@ -40,6 +40,7 @@ export 'src/multi_device_pairing.dart'
 export 'src/pairing.dart' show VeilPairingDialog;
 export 'src/push.dart' show VeilPush, PushProvider;
 export 'src/share_invite.dart' show VeilShareInviteDialog;
+export 'src/crypto.dart' show VeilCrypto;
 export 'src/stream.dart' show VeilStream, VeilAnonStream;
 export 'src/types.dart'
     show
