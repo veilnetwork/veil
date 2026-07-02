@@ -253,9 +253,11 @@ const ANDROID_OUTBOUND_POOL_PROP: &str = "debug.veil.onion_stream_outbound_pool"
 const ANDROID_ACK_OUTBOUND_POOL_PROP: &str = "debug.veil.onion_stream_ack_outbound_pool";
 const ANDROID_BULK_ROUTE_ACTIVE_LIMIT_PROP: &str =
     "debug.veil.onion_stream_bulk_route_active_limit";
+const ANDROID_MAX_PACING_BATCH_PROP: &str = "debug.veil.onion_stream_max_pacing_batch";
+const ANDROID_DATA_PACE_US_PROP: &str = "debug.veil.onion_stream_data_pace_us";
 const DEFAULT_DATA_PACE_US: u64 = 100;
 const DEFAULT_CIRCUIT_DATA_PACE_US: u64 = 50;
-const MIN_DATA_PACE_US: u64 = 50;
+const MIN_DATA_PACE_US: u64 = 10;
 const MAX_DATA_PACE_US: u64 = 5_000;
 const DEFAULT_CIRCUIT_OUTBOUND_POOL: usize = 3;
 const DEFAULT_CIRCUIT_ACK_OUTBOUND_POOL: usize = 1;
@@ -727,12 +729,25 @@ impl StreamDataPacer {
         // reserve sub-ms slots in the shared schedule and only park once the
         // accumulated delay reaches the scheduler's millisecond granularity; the
         // stream engine's own `max_pacing_batch` still bounds the microburst.
+        //
+        // Token-bucket credit: the park can overshoot badly (Android coalesces
+        // a 1ms sleep to several ms). Resetting the schedule to `now` after an
+        // overshoot forfeited the unused slots, which quantized the whole peer
+        // to burst-size cells per REAL sleep duration (~1.4 MiB/s live instead
+        // of the configured rate). Let the schedule lag `now` by a bounded
+        // credit so an oversleep is repaid by the next burst; the credit cap
+        // keeps the burst in the same range the engine's pacing batch allows.
         let min_sleep = Duration::from_millis(1);
+        let burst_credit = (self.interval * 64).max(Duration::from_millis(5));
         let delay = {
             let now = Instant::now();
             let mut next_by_peer = self.next_by_peer.lock().await;
             let next = next_by_peer.entry(peer).or_insert(now);
-            let scheduled = if *next > now { *next } else { now };
+            let earliest = now.checked_sub(burst_credit).unwrap_or(now);
+            if *next < earliest {
+                *next = earliest;
+            }
+            let scheduled = *next;
             *next = scheduled + self.interval;
             scheduled.saturating_duration_since(now)
         };
@@ -749,12 +764,14 @@ fn stream_data_pace_interval(is_circuit: bool) -> Duration {
         DEFAULT_DATA_PACE_US
     };
     let raw = if is_circuit {
-        std::env::var(CIRCUIT_DATA_PACE_US_ENV).or_else(|_| std::env::var(STREAM_DATA_PACE_US_ENV))
+        std::env::var(CIRCUIT_DATA_PACE_US_ENV)
+            .or_else(|_| std::env::var(STREAM_DATA_PACE_US_ENV))
+            .ok()
+            .or_else(|| android_string_property(ANDROID_DATA_PACE_US_PROP))
     } else {
-        std::env::var(STREAM_DATA_PACE_US_ENV)
+        std::env::var(STREAM_DATA_PACE_US_ENV).ok()
     };
     let micros = raw
-        .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(default)
         .clamp(MIN_DATA_PACE_US, MAX_DATA_PACE_US);
@@ -1913,10 +1930,20 @@ impl AnonStreamHub {
         };
         let init_cwnd = ((init_cwnd_mss * mss).min(recv_window as usize)) as u32;
         let max_pacing_batch = if is_circuit {
-            // Pacing uses millisecond ticks for scheduler realism; 64 cells/tick
-            // is still only ~20 KiB microbursts at MSS=318 and is further shaped
-            // by the shared circuit DATA pacer.
-            env_u32(CIRCUIT_MAX_PACING_BATCH_ENV, 64, 1, 128)
+            // Pacing uses millisecond ticks for scheduler realism, but on
+            // Android the driver timer coalesces well past 1ms, so one batch
+            // per wake quantizes the whole stream to batch/wake-interval
+            // (64 cells / ~12.5ms real wake = ~1.6 MiB/s live phone ceiling).
+            // 256 keeps a phone sender fed across coalesced wakes; the actual
+            // wire burst stays bounded by the shared circuit DATA pacer's
+            // token-bucket credit, not by this engine-side budget.
+            env_or_android_u32(
+                CIRCUIT_MAX_PACING_BATCH_ENV,
+                ANDROID_MAX_PACING_BATCH_PROP,
+                256,
+                1,
+                512,
+            )
         } else {
             4
         };
