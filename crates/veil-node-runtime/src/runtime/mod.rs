@@ -7447,6 +7447,23 @@ impl NodeServices {
         }
     }
 
+    /// The onion service's rendezvous registration keypair for `period`,
+    /// derived from the sovereign identity seed (see
+    /// `veil_crypto::identity::derive_onion_reg_seed` for why and for the
+    /// anonymity argument). `None` without a sovereign identity — the caller
+    /// falls back to a random keypair, matching the cookie's own fallback.
+    fn derived_onion_reg_keypair(&self, period: u64) -> Option<veil_crypto::GeneratedKeyPair> {
+        self.identity
+            .sovereign_identity
+            .as_ref()
+            .and_then(|sov| sov.ed25519_signing_key())
+            .map(|ed| {
+                let seed = zeroize::Zeroizing::new(ed.to_bytes());
+                let reg_seed = veil_crypto::identity::derive_onion_reg_seed(&seed, period);
+                veil_crypto::ed25519_keypair_from_seed(&reg_seed)
+            })
+    }
+
     /// Register a location-anonymous service: build its onion circuit + record it
     /// so the maintenance tick keeps it alive ([`Self::maintain_onion_circuits`]).
     /// `relay_path` is first→terminus (terminus = rendezvous relay R); each hop's
@@ -7459,8 +7476,25 @@ impl NodeServices {
         relay_path: &[[u8; 32]],
         cookie: [u8; 16],
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
-        // Mint the registration keypair ONCE here; every rebuild reuses it (L1).
-        let reg_keypair = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+        // Registration keypair: seed-derived per blinded-descriptor period, like
+        // the cookie itself (L1 kept it stable across REBUILDS; deriving it makes
+        // it stable across PROCESS RESTARTS too). R's registry is first-wins
+        // anti-squat, so a random per-process key meant an abrupt restart within
+        // one period came back with the same derived cookie but a foreign reg_pk
+        // and was rejected (CookieClaimed) until the dead subscription aged out
+        // (600 s GC) — a live-path black hole on a small-relay topology. With the
+        // derived key the restart is a same-key refresh; `next_monotonic_epoch`
+        // tracks wall-clock, so the fresh registration's epoch is already above
+        // the relay's stored one. No sovereign identity → random cookie AND
+        // random key (nothing to be stable against).
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let period = veil_anonymity::blinded_descriptor::current_period(now_unix);
+        let reg_keypair = self.derived_onion_reg_keypair(period).unwrap_or_else(|| {
+            veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519)
+        });
         // B2: per-service monotonic registration-epoch counter, reused on every
         // rebuild so re-registrations strictly increase even within one second.
         let registration_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -7582,6 +7616,15 @@ impl NodeServices {
                     veil_crypto::identity::derive_onion_auth_cookie(&*seed, period_now)
                 })
                 .unwrap_or(cookie);
+            // The registration keypair rotates WITH the cookie's period (same
+            // derivation cadence): re-deriving here keeps the pair the relay
+            // holds equal to what a crash-restarted process would derive, so a
+            // restart right after a period boundary still lands on the same-key
+            // refresh path instead of CookieClaimed. Random-fallback entries
+            // keep their minted keypair (their cookie never rotates either).
+            let reg_keypair = self
+                .derived_onion_reg_keypair(period_now)
+                .unwrap_or(reg_keypair);
             // diff-audit Δ2-d: if the terminus never ACK'd the current circuit
             // (CircuitBuilt), its path is suspect — a hop is likely dead. Pick a
             // FRESH path rather than rebuilding the same frozen one. A confirmed
@@ -7625,6 +7668,7 @@ impl NodeServices {
                     e.relay_path = path.clone();
                     e.confirmed = new_confirmed;
                     e.cookie = cookie_now;
+                    e.reg_keypair = reg_keypair.clone();
                 }
             }
             let relay_path = path;

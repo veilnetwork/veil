@@ -197,6 +197,42 @@ pub fn derive_onion_auth_cookie(identity_sk_seed: &[u8; 32], period: u64) -> [u8
     out
 }
 
+/// Info string for an onion service's rendezvous REGISTRATION Ed25519 key seed.
+/// The blinded-descriptor period is appended like the auth-cookie's. See
+/// [`derive_onion_reg_seed`].
+pub const ONION_REG_KEY_DERIVATION_INFO: &[u8] = b"veil/onion-reg-key/v1";
+
+/// Derive the Ed25519 SK seed for an onion service's rendezvous registration
+/// keypair, deterministically from the identity seed and the current
+/// blinded-descriptor `period` (same period as [`derive_onion_auth_cookie`]).
+///
+/// Why this exists: the relay's cookie registry is first-wins anti-squat — a
+/// registration with a DIFFERENT `reg_pk` on an existing cookie is rejected
+/// (`CookieClaimed`). The keypair used to be `OsRng`-minted per process, so an
+/// ABRUPT restart (crash / kill / battery) within one cookie period came back
+/// with the same derived cookie but a NEW reg_pk, and the relay refused the
+/// re-registration until the dead subscription aged out (teardown or the 600 s
+/// GC) — on a small-relay topology that is a live-path black hole of up to
+/// 10 minutes. Deriving the key from the SAME (seed, period) pair makes the
+/// restarted process a same-key refresh: a strictly-fresher epoch rebinds the
+/// cookie to the NEW circuit immediately.
+///
+/// Anonymity: exactly the auth-cookie's argument — seed-derived (opaque to the
+/// relay, no confirmation oracle) and period-scoped (rotates in lockstep with
+/// the cookie, so the relay's clustering ability stays bounded to the 24 h
+/// period the design already concedes; a period-less key would be a forever
+/// pseudonym). The relay already sees the cookie rotate per period; the reg_pk
+/// riding the same period adds no new linkage.
+pub fn derive_onion_reg_seed(identity_sk_seed: &[u8; 32], period: u64) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, identity_sk_seed);
+    let mut info = ONION_REG_KEY_DERIVATION_INFO.to_vec();
+    info.extend_from_slice(&period.to_le_bytes());
+    let mut out = Zeroizing::new([0u8; 32]);
+    hk.expand(&info, out.as_mut())
+        .expect("32 bytes < 255 * hash_len");
+    out
+}
+
 /// Derive a `node_id` from a public key.
 ///
 /// simplifies this from the previous domain-tag-prefixed shape
@@ -369,6 +405,44 @@ mod tests {
         let a = derive_onion_auth_cookie(&[0x42u8; 32], p);
         let b = derive_onion_auth_cookie(&[0x43u8; 32], p);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn onion_reg_seed_stable_within_period_rotates_across() {
+        // The whole point: a crash-restarted process re-derives the SAME
+        // registration key within a period (same-key refresh at the relay, no
+        // CookieClaimed), while period N and N+1 keys are unlinkable — the reg
+        // key rotates in lockstep with the auth-cookie.
+        let seed = [0x42u8; 32];
+        let p = 19876u64;
+        let restart_a = derive_onion_reg_seed(&seed, p);
+        let restart_b = derive_onion_reg_seed(&seed, p);
+        assert_eq!(*restart_a, *restart_b, "restart must re-derive the same key");
+        let next = derive_onion_reg_seed(&seed, p + 1);
+        assert_ne!(*restart_a, *next, "periods must not share a reg key");
+        // Distinct identities (master vs decoy) never share a reg key.
+        let other = derive_onion_reg_seed(&[0x43u8; 32], p);
+        assert_ne!(*restart_a, *other);
+        // Domain separation from the auth-cookie derivation: the cookie is
+        // PUBLIC while the reg seed is SECRET key material — the 16-byte cookie
+        // must not be a prefix of the reg seed under the same (seed, period).
+        let cookie = derive_onion_auth_cookie(&seed, p);
+        assert_ne!(cookie[..], restart_a[..16]);
+    }
+
+    #[test]
+    fn onion_reg_seed_yields_deterministic_ed25519() {
+        // Two "processes" derive byte-identical keypairs — the relay sees the
+        // same reg_pk and takes the refresh path instead of first-wins reject.
+        let seed = [0x77u8; 32];
+        let a = crate::ed25519_keypair_from_seed(&derive_onion_reg_seed(&seed, 20000));
+        let b = crate::ed25519_keypair_from_seed(&derive_onion_reg_seed(&seed, 20000));
+        assert_eq!(a.public_key, b.public_key);
+        assert_eq!(a.private_key, b.private_key);
+        // And the keypair actually signs/verifies.
+        let sig = crate::sign_message(a.algo, &a.public_key, &a.private_key, b"probe")
+            .expect("sign");
+        crate::verify_message(a.algo, &a.public_key, b"probe", &sig).expect("verify");
     }
 
     #[test]
