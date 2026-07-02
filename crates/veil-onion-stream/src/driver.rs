@@ -78,6 +78,20 @@ pub trait CellDuplex: Send {
         let _ = (stream_id, end);
         std::future::ready(())
     }
+    /// The stream's final delivery model (measured bottleneck rate, min RTT,
+    /// total delivered bytes), reported once just before `on_stream_closed`.
+    /// Carriers may cache it per peer to warm-start follow-up streams (see
+    /// `Config::warm_btl_bw`). Default: ignored.
+    fn on_stream_model(
+        &mut self,
+        stream_id: u32,
+        btl_bw: u64,
+        rtt_min_ms: u32,
+        delivered: u64,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (stream_id, btl_bw, rtt_min_ms, delivered);
+        std::future::ready(())
+    }
 }
 
 /// How a stream ended — the resumability signal the app keys on.
@@ -591,6 +605,12 @@ async fn drive<D: CellDuplex>(
             End::Reset(reset_reason::APP)
         },
     ) {}
+    let (btl_bw, rtt_min_ms, delivered) = engine.delivery_model();
+    if btl_bw > 0 {
+        duplex
+            .on_stream_model(engine.stream_id(), btl_bw, rtt_min_ms, delivered)
+            .await;
+    }
     duplex
         .on_stream_closed(engine.stream_id(), end_of(&end))
         .await;

@@ -2011,13 +2011,17 @@ impl AnonStreamHub {
         // timer fires, while still overrideable for hostile WAN probes.
         let is_circuit = matches!(&cells, HubCells::Circuit(_));
         let recv_window = match &cells {
-            // 4 MiB is large enough to cover high-BDP phone↔desktop paths and
-            // small enough to keep memory/standing queue bounded per stream.
+            // Must cover the path BDP with probe headroom or the advertised
+            // window becomes the throughput cap: post-BBR-fix a single circuit
+            // stream sustains ~12 MB/s at ~150-300ms live RTT (~2-3.6 MiB of
+            // flight), and the 3x-BDP STARTUP probe brushed the old 4 MiB
+            // ceiling. BBR's 2x-BDP steady cap keeps the standing queue small,
+            // so the larger advert costs memory only when actually in flight.
             HubCells::Circuit(_) => env_u32(
                 CIRCUIT_RECV_WINDOW_ENV,
-                4 * 1024 * 1024,
+                8 * 1024 * 1024,
                 (64 * 1024) as u32,
-                (8 * 1024 * 1024) as u32,
+                (16 * 1024 * 1024) as u32,
             ),
             HubCells::Anon(_) => (1024 * mss) as u32,
         };
