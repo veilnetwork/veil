@@ -266,13 +266,32 @@ const ANDROID_MAX_PACING_BATCH_PROP: &str = "debug.veil.onion_stream_max_pacing_
 const ANDROID_DATA_PACE_US_PROP: &str = "debug.veil.onion_stream_data_pace_us";
 const CIRCUIT_BBR_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_BBR";
 const ANDROID_BBR_PROP: &str = "debug.veil.onion_stream_bbr";
-/// Stripe one bulk stream's DATA runs across up to this many distinct
+/// Stripe one bulk stream's DATA cells across up to this many distinct
 /// outbound routes (distinct first-hop sessions). 1 = classic single-route
-/// pinning. The per-flow ceiling lives in the first-hop session TCPs (live:
-/// one flow ~15-17 MB/s raw, three parallel flows ~29 MB/s aggregate), so a
-/// single engine striping across sessions harvests the aggregate without the
-/// multi-engine contention that made 4 independent range streams SLOWER than
-/// one stream.
+/// pinning.
+///
+/// ⚠️ PROVEN NOT TO WORK as a throughput lever; kept default-1 (off) as a
+/// gated experiment base only. The premise was sound — the per-flow ceiling
+/// is the first-hop session TCP (live: one flow ~15-17 MB/s, three parallel
+/// ~29 MB/s), so one engine fanning its wire across sessions should harvest
+/// the aggregate. It does not, because a SINGLE BBR/NewReno control loop
+/// cannot distinguish cross-path REORDERING from loss. Two independent
+/// striping layouts were measured against a clean-seed single-route baseline
+/// (64 MiB, fresh rendezvous registries):
+///   * contiguous chunks (seq-block per route): the head-of-line block on a
+///     lagging route stalls snd_una with nothing above it to SACK -> a
+///     no-SACK RTO collapses the window (sack=0, wb=0, ssthresh pinned
+///     ~155 KB, ~3x slowdown).
+///   * interleaved cells (round-robin): the reordering generates >=3 dup-ACKs
+///     within the first RTT -> fast-retransmit recovery cuts ssthresh ~200 KB
+///     -> congestion-avoidance crawl (~4x slowdown).
+/// Both collapse via the loss detector misreading reordering. Making this a
+/// real gain needs a reordering-tolerant / per-path-sequenced redesign (RACK
+/// time-threshold loss detection, or MPTCP-style per-subflow seq with a
+/// resequencing layer above) — a substantial CC change, not a knob. The
+/// negative result is deliberately preserved here so it is not re-attempted
+/// naively. (Earlier notes blamed rendezvous CookieClaimed; that was wrong —
+/// clean-seed runs reproduced the collapse with zero registration errors.)
 const CIRCUIT_STRIPE_ROUTES_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_STRIPE_ROUTES";
 const ANDROID_STRIPE_ROUTES_PROP: &str = "debug.veil.onion_stream_stripe_routes";
 const DEFAULT_CIRCUIT_STRIPE_ROUTES: usize = 1;
@@ -1164,28 +1183,122 @@ impl CircuitCells {
         routes.push(&route);
         routes.extend(alternates.iter());
         let n = routes.len();
-        // Rotate which route gets the head chunk so the oldest bytes are not
-        // always serialized on the primary (the counter advanced above).
+        // INTERLEAVE cells across routes (round-robin), do NOT hand each route a
+        // contiguous seq-block. Contiguous blocks head-of-line-block the stream:
+        // seq [0..k) on a fast route and [k..2k) on a slow one means snd_una
+        // cannot advance past the fast route's data until the slow route
+        // catches up, and if that lag exceeds the RTO the receiver has nothing
+        // above the hole to SACK -> a no-SACK RTO collapses the window even
+        // with ZERO packet loss (measured: sack=0, wb=0, yet ssthresh pinned at
+        // ~155 KB for the whole transfer, 3x slowdown). Interleaving spreads
+        // every route's cells through the seq space, so one route lagging just
+        // leaves SACKable gaps that higher-seq cells from the other routes
+        // expose -> fast-retransmit, not a no-SACK RTO. The receiver's oo
+        // reassembly already tolerates the reordering.
         let base = (self.stripe_rr.load(Ordering::Relaxed) as usize) % n;
-        let chunk = run_len.div_ceil(n);
-        let mut remaining = run_len;
-        let mut idx = 0usize;
-        while remaining > 0 {
-            let this = chunk.min(remaining);
-            let r = routes[(base + idx) % n];
-            let (sent, err) = self.send_chunk_on_route(dst.node, r, this, cells)?;
-            if let Some(err) = err {
-                // Enqueue failure on this route: drop the chunk's tail (ARQ
-                // repairs), mark the route, and keep going on the others.
-                self.finish_failed_chunk(dst.node, r, err, this - sent, cells)
-                    .await?;
+        // Drain the run once; dispatch cell i to route (base+i) % n.
+        let run: Vec<Vec<u8>> = cells.drain(..run_len).collect();
+        let cookie = stream_cookie(&dst.node);
+        let mut per_route_ok = vec![true; n];
+        let mut failed_routes: Vec<usize> = Vec::new();
+        let mut i = 0usize;
+        while i < run.len() {
+            let ri = (base + i) % n;
+            if !per_route_ok[ri] {
+                // Route already failed this run: requeue for ARQ repair on a
+                // healthy route in a later pass, skip it.
+                cells.push_back(run[i].clone());
+                i += 1;
+                continue;
             }
-            remaining -= this;
-            idx += 1;
+            match self.send_one_cell_on_route(&cookie, routes[ri], &run[i]) {
+                Ok(true) => i += 1,
+                Ok(false) => {
+                    // Enqueue rejected (not queue-full): mark the route dead for
+                    // the rest of this run; requeue this cell for ARQ repair.
+                    per_route_ok[ri] = false;
+                    failed_routes.push(ri);
+                    cells.push_back(run[i].clone());
+                    i += 1;
+                }
+                Err(_) => {
+                    // Local first-hop TX queue full: push this cell and the
+                    // whole undelivered tail back (front, in order) so the
+                    // driver retries them next poll. No manufactured loss.
+                    for cell in run[i..].iter().rev() {
+                        cells.push_front(cell.clone());
+                    }
+                    for ri in failed_routes {
+                        self.mark_route_send_failed(
+                            dst.node,
+                            routes[ri],
+                            veil_node_runtime::DataCircuitSendError::QueueFull,
+                        )
+                        .await;
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "circuit first-hop TX queue full (striped)",
+                    ));
+                }
+            }
+        }
+        for ri in failed_routes {
+            self.mark_route_send_failed(
+                dst.node,
+                routes[ri],
+                veil_node_runtime::DataCircuitSendError::QueueFull,
+            )
+            .await;
         }
         mark_circuit_activity(&self.activity);
         self.mark_outbound_non_handshake(dst.node, &route).await;
         Ok(())
+    }
+
+    /// Send ONE already-decoded stream cell on `route`. `Ok(true)` = accepted,
+    /// `Ok(false)` = route enqueue rejected (mark it), `Err(WouldBlock)` =
+    /// local first-hop TX queue full (retry the exact cell).
+    fn send_one_cell_on_route(
+        &self,
+        cookie: &[u8; COOKIE_LEN],
+        route: &CircuitRoute,
+        cell: &[u8],
+    ) -> io::Result<bool> {
+        let data_payload_len = match Frame::decode(cell) {
+            Some(Frame::Data { payload, .. }) => payload.len(),
+            _ => 0,
+        };
+        let mut env = Vec::with_capacity(COOKIE_LEN + CIRCUIT_PEER_TAG_LEN + cell.len());
+        env.extend_from_slice(cookie);
+        match route.envelope {
+            CircuitEnvelope::LegacyClearSender { sender_node } => {
+                env.extend_from_slice(&sender_node);
+            }
+            CircuitEnvelope::ProtectedIntro { peer_tag, .. } => {
+                env.extend_from_slice(&peer_tag);
+            }
+        }
+        env.extend_from_slice(cell);
+        if env.len() > veil_onion_stream::wire::MAX_CELL {
+            return Err(io::Error::other("circuit stream envelope too large"));
+        }
+        match self
+            .services
+            .send_circuit_cell_detailed(&route.circuit, &env)
+        {
+            Ok(()) => {
+                if let Some(stats) = route.stats.as_ref() {
+                    stats.record_send(true, data_payload_len);
+                }
+                Ok(true)
+            }
+            Err(veil_node_runtime::DataCircuitSendError::QueueFull) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "circuit first-hop TX queue full",
+            )),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Send `count` cells from the front of `cells` on `route`. Returns how
