@@ -28,10 +28,16 @@ use crate::circuit::CircuitError;
 use crate::circuit_setup::CIRCUIT_KEY_LEN;
 
 /// Fixed on-the-wire size of a circuit data cell's payload field — constant for
-/// EVERY cell so size never reveals hop position. Sized to hold the largest
-/// sealed introduce (`MAX_INTRODUCE_CIPHERTEXT` = 320) + the length prefix +
-/// slack.
-pub const CIRCUIT_PAYLOAD_BYTES: usize = 384;
+/// EVERY cell so size never reveals hop position (still holds: every cell is
+/// the same, larger, quantum). Must comfortably hold the largest sealed
+/// introduce (`MAX_INTRODUCE_CIPHERTEXT` = 320) + the length prefix.
+///
+/// 2026-07-02 flag-day bump 384 -> 4096: the reliable onion stream's live
+/// ceiling was per-CELL processing cost on phones (syscalls/wakes/locks per
+/// 318-byte MSS), not bandwidth. A ~10.7x larger cell cuts the per-byte
+/// overhead by the same factor. BREAKING: every relay and client on a network
+/// must agree on this constant (each hop validates the fixed size).
+pub const CIRCUIT_PAYLOAD_BYTES: usize = 4096;
 /// Length-prefix width inside the fixed payload (`[len u16 BE][bytes][pad]`).
 const LEN_PREFIX: usize = 2;
 /// Largest real payload that fits one fixed cell.
