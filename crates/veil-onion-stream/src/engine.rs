@@ -110,6 +110,20 @@ pub struct Config {
     pub warm_rtt_min_ms: u32,
     /// Optional driver-side diagnostic dump period. 0 disables it.
     pub debug_summary_ms: u64,
+    /// RACK-style time-threshold loss detection (RFC 8985 shape). Replaces the
+    /// SACK-count (`IsLost`, 3 SACKed-above) and 3-dup-ACK triggers: a segment
+    /// is marked lost only when one sent LATER was delivered AND the segment's
+    /// send time is older than `rtt + reorder window`. Reordering (e.g. cells
+    /// of one stream striped across routes with different latencies) then
+    /// costs a delay allowance instead of a spurious retransmit + window
+    /// collapse. The RTO remains the tail-loss fallback, unchanged.
+    pub rack: bool,
+    /// Floor for the RACK reordering window (ms). The window otherwise adapts
+    /// from observed reordering (max delivery gap of overtaken originals) with
+    /// a min-RTT/4 base — but the FIRST flight over multi-route striping has
+    /// observed nothing yet, so a carrier that knowingly reorders (route
+    /// striping) should set a floor covering the expected cross-route delta.
+    pub rack_reo_floor_ms: u32,
 }
 
 impl Default for Config {
@@ -134,6 +148,8 @@ impl Default for Config {
             warm_btl_bw: 0,
             warm_rtt_min_ms: 0,
             debug_summary_ms: 0,
+            rack: false,
+            rack_reo_floor_ms: 0,
         }
     }
 }
@@ -255,6 +271,21 @@ struct TxState {
     bbr_probe_checked_ms: u64,
     /// Windowed minimum round-trip time (ms) and the time it was recorded.
     rtt_min: Option<(u32, u64)>,
+    // ---- RACK time-threshold loss detection (maintained only when cfg.rack) ----
+    /// Send time of the most recently SENT original segment known delivered
+    /// (0 = none yet). Retransmitted segments never feed this: without wire
+    /// timestamps their ACK cannot be attributed to a specific transmission.
+    rack_xmit_ms: u64,
+    /// End sequence of that segment — tie-break between equal send times.
+    rack_end_seq: u32,
+    /// RTT measured on that most recent delivery (ms).
+    rack_rtt_ms: u32,
+    /// Largest observed reordering gap (ms): when an overtaken original is
+    /// finally delivered, how much LATER-sent data had already been delivered.
+    /// Under route striping this converges on the cross-route latency delta.
+    rack_reo_max_ms: u32,
+    /// Wake-up for segments whose RACK loss deadline is still in the future.
+    rack_deadline: Option<u64>,
 }
 
 struct RxState {
@@ -389,6 +420,11 @@ impl StreamEngine {
                 bbr_stall_rounds: 0,
                 bbr_probe_checked_ms: 0,
                 rtt_min: warm_rtt.map(|(r, t)| (r.max(1), t)),
+                rack_xmit_ms: 0,
+                rack_end_seq: 0,
+                rack_rtt_ms: 0,
+                rack_reo_max_ms: 0,
+                rack_deadline: None,
             },
             rx: RxState {
                 rcv_nxt: 0,
@@ -507,7 +543,8 @@ impl StreamEngine {
              pending={} dup={} recov={} consec_rto={} | rcv_nxt={} read_buf={} oo={} oo_bytes={} \
              adv={} ack_pending={} eof={} fin(req={},sent={},ack={}) \
              srtt={:?} rttvar={} rto={}ms pace_next={}ms delayed_ack={}/{:?} \
-             rto_dl={:?} persist_dl={:?} bbr_bw={} bbr_rtt_min={:?} bbr_cap={:?}",
+             rto_dl={:?} persist_dl={:?} bbr_bw={} bbr_rtt_min={:?} bbr_cap={:?} \
+             rack={} reo_wnd={} rack_rtt={}",
             self.phase,
             self.tx.snd_una,
             self.tx.snd_nxt,
@@ -543,6 +580,9 @@ impl StreamEngine {
             self.tx.btl_bw,
             self.tx.rtt_min.map(|(rtt, _)| rtt),
             self.tx.bbr_window_cap(&self.cfg),
+            self.cfg.rack,
+            self.rack_reo_wnd(),
+            self.tx.rack_rtt_ms,
         )
     }
 
@@ -665,9 +705,14 @@ impl StreamEngine {
         // fast-retransmit never resends them (the big source of duplicate cells
         // over the high-RTT onion path).
         for r in sacks.as_slice() {
-            for s in self.tx.segs.iter_mut() {
-                if seq::geq(s.seq, r.start) && seq::leq(s.end(), r.end) {
-                    s.sacked = true;
+            for i in 0..self.tx.segs.len() {
+                let s = &self.tx.segs[i];
+                if !s.sacked && seq::geq(s.seq, r.start) && seq::leq(s.end(), r.end) {
+                    let (sent_ms, end, retransmitted) = (s.sent_ms, s.end(), s.retransmitted);
+                    self.tx.segs[i].sacked = true;
+                    if self.cfg.rack && !retransmitted {
+                        self.tx.rack_on_delivery(sent_ms, end, now);
+                    }
                 }
             }
         }
@@ -681,6 +726,9 @@ impl StreamEngine {
                     let s = self.tx.segs.pop_front().unwrap();
                     if !s.retransmitted {
                         rtt_sample = Some(now.saturating_sub(s.sent_ms) as u32);
+                        if self.cfg.rack {
+                            self.tx.rack_on_delivery(s.sent_ms, s.end(), now);
+                        }
                     }
                     if s.is_fin {
                         self.tx.fin_acked = true;
@@ -705,7 +753,10 @@ impl StreamEngine {
                 } else {
                     // partial ACK: retransmit the remaining holes, deflate by acked.
                     self.tx.cwnd = self.tx.cwnd.saturating_sub(acked).max(mss);
-                    self.mark_holes(true);
+                    if !self.cfg.rack {
+                        // RACK re-detects at the end of on_ack by time instead.
+                        self.mark_holes(true);
+                    }
                     self.tx.cwnd = self.tx.cwnd.saturating_add(mss);
                 }
             } else if self.tx.cwnd < self.tx.ssthresh {
@@ -733,30 +784,9 @@ impl StreamEngine {
         } else if ack == self.tx.snd_una && !self.tx.segs.is_empty() {
             // ---- duplicate ACK ----
             self.tx.dup_acks += 1;
-            if self.tx.dup_acks == 3 && !self.tx.in_recovery {
-                let flight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
-                let fast_retx_basis = if self.cfg.rto_rewind_no_sack {
-                    // Circuit rewind can make the current flight tiny: the
-                    // lost burst has been moved back to `pending`, while stale
-                    // dup-ACKs for the old hole may still arrive. Treat those
-                    // dup-ACKs as a repair signal, but do not recut the already
-                    // reduced RTO window down to a few MSS just because the
-                    // post-rewind probe flight is small.
-                    let effective_cwnd = self.tx.cwnd.min(self.tx.rwnd).max(mss);
-                    let rewind_floor = if self.tx.rewind_high.is_some() {
-                        self.tx.ssthresh.saturating_mul(2)
-                    } else {
-                        0
-                    };
-                    flight.max(effective_cwnd).max(rewind_floor)
-                } else {
-                    flight
-                };
-                self.tx.ssthresh = self.loss_decrease_window(fast_retx_basis, mss);
+            if self.tx.dup_acks == 3 && !self.tx.in_recovery && !self.cfg.rack {
+                self.enter_fast_recovery();
                 self.mark_holes(true); // fast retransmit (SACK-aware)
-                self.tx.cwnd = self.tx.ssthresh.saturating_add(3 * mss);
-                self.tx.in_recovery = true;
-                self.tx.recover = self.tx.snd_nxt;
             } else if self.tx.in_recovery {
                 self.tx.cwnd = self.tx.cwnd.saturating_add(mss); // inflate
                 // New dup-ACKs can carry fresh SACK blocks that expose additional
@@ -766,9 +796,45 @@ impl StreamEngine {
                 // "oldest unacked" fallback here: during recovery that would send
                 // one speculative retransmit per dup-ACK and rebuild the duplicate
                 // storm this SACK logic exists to avoid.
-                self.mark_holes(false);
+                if !self.cfg.rack {
+                    self.mark_holes(false);
+                }
             }
         }
+        // RACK: every ACK (cumulative, SACK or duplicate) may have advanced the
+        // delivery frontier — re-run time-threshold detection once per ACK. A
+        // dup-ACK count never declares loss here; only time + a later delivery.
+        if self.cfg.rack && self.rack_detect_loss(now) && !self.tx.in_recovery {
+            self.enter_fast_recovery();
+        }
+    }
+
+    /// Multiplicative decrease + enter NewReno recovery (loss just detected by
+    /// the dup-ACK/SACK trigger or by RACK). Hole marking is the caller's job.
+    fn enter_fast_recovery(&mut self) {
+        let mss = self.cfg.mss as u32;
+        let flight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
+        let fast_retx_basis = if self.cfg.rto_rewind_no_sack {
+            // Circuit rewind can make the current flight tiny: the
+            // lost burst has been moved back to `pending`, while stale
+            // dup-ACKs for the old hole may still arrive. Treat those
+            // dup-ACKs as a repair signal, but do not recut the already
+            // reduced RTO window down to a few MSS just because the
+            // post-rewind probe flight is small.
+            let effective_cwnd = self.tx.cwnd.min(self.tx.rwnd).max(mss);
+            let rewind_floor = if self.tx.rewind_high.is_some() {
+                self.tx.ssthresh.saturating_mul(2)
+            } else {
+                0
+            };
+            flight.max(effective_cwnd).max(rewind_floor)
+        } else {
+            flight
+        };
+        self.tx.ssthresh = self.loss_decrease_window(fast_retx_basis, mss);
+        self.tx.cwnd = self.tx.ssthresh.saturating_add(3 * mss);
+        self.tx.in_recovery = true;
+        self.tx.recover = self.tx.snd_nxt;
     }
 
     // ---- outbound -------------------------------------------------------
@@ -1012,6 +1078,60 @@ impl StreamEngine {
         }
     }
 
+    /// RACK reordering window: how long a segment may trail a later-sent,
+    /// already-delivered segment before it is declared lost. Adapts upward
+    /// from observed reordering (cross-route delta under striping), with a
+    /// min-RTT/4 base and a carrier-set floor for knowingly-reordering paths.
+    fn rack_reo_wnd(&self) -> u32 {
+        let base = match self.tx.rtt_min {
+            Some((r, _)) => r / 4,
+            None => self.tx.srtt.unwrap_or(0) / 4,
+        };
+        base.max(self.cfg.rack_reo_floor_ms)
+            .max((self.tx.rack_reo_max_ms / 4).saturating_mul(5))
+            .max(5)
+    }
+
+    /// RACK time-threshold loss detection (RFC 8985 shape). A segment is lost
+    /// only if (a) some segment sent NO EARLIER than it has been delivered and
+    /// (b) more than `delivered RTT + reordering window` has elapsed since the
+    /// segment's last (re)transmission. Segments whose deadline is still in
+    /// the future arm the reorder timer instead. Returns whether anything was
+    /// newly marked for retransmission.
+    fn rack_detect_loss(&mut self, now: u64) -> bool {
+        if self.tx.rack_xmit_ms == 0 || self.phase != Phase::Established {
+            self.tx.rack_deadline = None;
+            return false;
+        }
+        let timeout = self.tx.rack_rtt_ms as u64 + self.rack_reo_wnd() as u64;
+        let (rack_xmit, rack_end) = (self.tx.rack_xmit_ms, self.tx.rack_end_seq);
+        let mut any = false;
+        let mut next: Option<u64> = None;
+        for s in self.tx.segs.iter_mut() {
+            if s.sacked || s.needs_resend {
+                continue;
+            }
+            // Unlike the SACK-count scanner, a retransmitted segment is NOT
+            // skipped: its send time was refreshed at retransmission, so if it
+            // is overtaken AGAIN the repair itself was lost — re-repair it
+            // before the coarse RTO.
+            let sent_no_later = s.sent_ms < rack_xmit
+                || (s.sent_ms == rack_xmit && seq::leq(s.end(), rack_end));
+            if !sent_no_later {
+                continue;
+            }
+            let deadline = s.sent_ms + timeout;
+            if now >= deadline {
+                s.needs_resend = true;
+                any = true;
+            } else {
+                next = Some(next.map_or(deadline, |c: u64| c.min(deadline)));
+            }
+        }
+        self.tx.rack_deadline = next;
+        any
+    }
+
     fn mark_oldest_unsacked_for_rto(&mut self) {
         if let Some(s) = self.tx.segs.iter_mut().find(|s| !s.sacked) {
             // RTO means the current repair attempt itself may have been lost.
@@ -1067,6 +1187,16 @@ impl StreamEngine {
                 _ => {}
             }
             self.hs_deadline = Some(now + self.cfg.handshake_rto_ms);
+        }
+        // RACK reorder timer: a segment's loss deadline lay in the future when
+        // detection last ran — re-check now that it has passed.
+        if self.cfg.rack
+            && let Some(dl) = self.tx.rack_deadline
+            && now >= dl
+            && self.rack_detect_loss(now)
+            && !self.tx.in_recovery
+        {
+            self.enter_fast_recovery();
         }
         // Data RTO + retry cap. If the deadline is stale (nothing left unacked),
         // CLEAR it — leaving a past deadline would make the driver's timer fire
@@ -1203,6 +1333,7 @@ impl StreamEngine {
         };
         merge(self.hs_deadline);
         merge(self.tx.rto_deadline);
+        merge(self.tx.rack_deadline);
         merge(self.persist_deadline);
         merge(self.ack_deadline);
         // If new data is ready but held back only by pacing, wake to release it.
@@ -1380,6 +1511,27 @@ impl TxState {
                 self.rewind_high = None;
                 self.rewind_fin = false;
             }
+        }
+    }
+
+    /// Record one delivered ORIGINAL segment into the RACK state. Advances the
+    /// "most recently sent, known delivered" point and, when the delivered
+    /// segment had been overtaken (a later send already delivered), learns the
+    /// reordering window from the gap.
+    fn rack_on_delivery(&mut self, seg_sent_ms: u64, seg_end: u32, now: u64) {
+        if self.rack_xmit_ms > seg_sent_ms {
+            // Overtaken original finally arrived: the send-time gap to the
+            // newest delivered segment is exactly the reordering tolerance
+            // RACK must allow before declaring the next such laggard lost.
+            let sample = (self.rack_xmit_ms - seg_sent_ms).min(u32::MAX as u64) as u32;
+            self.rack_reo_max_ms = self.rack_reo_max_ms.max(sample);
+        }
+        if seg_sent_ms > self.rack_xmit_ms
+            || (seg_sent_ms == self.rack_xmit_ms && seq::gt(seg_end, self.rack_end_seq))
+        {
+            self.rack_xmit_ms = seg_sent_ms;
+            self.rack_end_seq = seg_end;
+            self.rack_rtt_ms = now.saturating_sub(seg_sent_ms).min(u32::MAX as u64) as u32;
         }
     }
 
