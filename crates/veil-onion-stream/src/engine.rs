@@ -18,6 +18,31 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::seq;
 use crate::wire::{Frame, MSS, SackRange, SackVec, reset_reason};
 
+// ---- BBR-lite estimator tuning (see `Config::bbr`) ----
+/// Sliding window each delivery-rate sample is computed over.
+const BBR_RATE_WINDOW_MS: u64 = 2_000;
+/// Minimum spacing between delivery checkpoints.
+const BBR_SAMPLE_SPACING_MS: u64 = 20;
+/// Minimum span/bytes before a window qualifies as a rate sample — thinner
+/// windows are treated as app-limited and leave the estimate untouched.
+const BBR_MIN_SPAN_MS: u64 = 300;
+const BBR_MIN_DELIVERED: u64 = 64 * 1024;
+/// The bottleneck-rate estimate is the MAX of qualifying samples over this
+/// window (classic BBR shape). A max filter cannot self-trap: pacing runs at
+/// 5/4 of the estimate, so if the path has more capacity a faster sample
+/// appears and ratchets the estimate up; if the path degrades, the stale
+/// maximum simply expires. A decay-based estimator was tried first and
+/// collapsed live (own pacing fed the lower samples it then decayed toward).
+const BBR_BW_WINDOW_MS: u64 = 10_000;
+/// Minimum spacing between stored bandwidth samples.
+const BBR_BW_SAMPLE_SPACING_MS: u64 = 100;
+/// BBR engages only after this many bytes were delivered on the stream, so
+/// slow start first climbs to a realistic rate: an estimate seeded from the
+/// first slow-start round-trips caps the window at a crawl.
+const BBR_ENGAGE_DELIVERED: u64 = 1024 * 1024;
+/// Expiry of the windowed-minimum RTT sample.
+const BBR_MIN_RTT_WINDOW_MS: u64 = 30_000;
+
 /// Tunables. Bytes for windows, millis for timers.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -55,6 +80,16 @@ pub struct Config {
     /// available bandwidth. Reliability is unchanged; this only controls how
     /// much sending rate we retain while SACK/RTO repairs the holes.
     pub loss_decrease_per_mille: u16,
+    /// BBR-lite shaping: pace new data at 5/4 of the measured delivery rate
+    /// and cap the effective send window at 2x the measured
+    /// bandwidth-delay product instead of filling min(cwnd, rwnd). Without
+    /// this, loss-free paths (the pinned circuit) grow cwnd unbounded and park
+    /// a full receive window of cells in sender-side queues — live srtt
+    /// inflated to seconds of pure queueing delay, which slows RTO/loss
+    /// detection and failover. Throughput is unchanged (the drain rate is the
+    /// bottleneck either way); this only bounds the standing queue. NewReno
+    /// loss handling stays active underneath (the caps compose via min).
+    pub bbr: bool,
     /// Number of contiguous advancing DATA segments acknowledged by one
     /// cumulative ACK. Gaps, duplicates and FIN always ACK immediately.
     pub ack_every: u8,
@@ -80,6 +115,7 @@ impl Default for Config {
             max_pacing_batch: 4,
             rto_rewind_no_sack: false,
             loss_decrease_per_mille: 500,
+            bbr: false,
             ack_every: 2,
             ack_delay_ms: 5,
             debug_summary_ms: 0,
@@ -177,6 +213,18 @@ struct TxState {
     fin_requested: bool,
     fin_sent: bool,
     fin_acked: bool,
+    // ---- BBR-lite delivery model (maintained only when cfg.bbr) ----
+    /// Total bytes acknowledged by cumulative ACK advance.
+    delivered: u64,
+    /// Delivery checkpoints (t_ms, delivered) spanning the rate window.
+    rate_samples: VecDeque<(u64, u64)>,
+    /// Qualifying rate samples (t_ms, bytes/sec); the estimate is their max
+    /// over [`BBR_BW_WINDOW_MS`] (see the constants for why max, not decay).
+    bw_samples: VecDeque<(u64, u64)>,
+    /// Measured bottleneck delivery rate, bytes/sec (windowed max).
+    btl_bw: u64,
+    /// Windowed minimum round-trip time (ms) and the time it was recorded.
+    rtt_min: Option<(u32, u64)>,
 }
 
 struct RxState {
@@ -270,6 +318,11 @@ impl StreamEngine {
                 fin_requested: false,
                 fin_sent: false,
                 fin_acked: false,
+                delivered: 0,
+                rate_samples: VecDeque::new(),
+                bw_samples: VecDeque::new(),
+                btl_bw: 0,
+                rtt_min: None,
             },
             rx: RxState {
                 rcv_nxt: 0,
@@ -378,7 +431,7 @@ impl StreamEngine {
              pending={} dup={} recov={} consec_rto={} | rcv_nxt={} read_buf={} oo={} oo_bytes={} \
              adv={} ack_pending={} eof={} fin(req={},sent={},ack={}) \
              srtt={:?} rttvar={} rto={}ms pace_next={}ms delayed_ack={}/{:?} \
-             rto_dl={:?} persist_dl={:?}",
+             rto_dl={:?} persist_dl={:?} bbr_bw={} bbr_rtt_min={:?} bbr_cap={:?}",
             self.phase,
             self.tx.snd_una,
             self.tx.snd_nxt,
@@ -411,6 +464,9 @@ impl StreamEngine {
             self.ack_deadline,
             self.tx.rto_deadline,
             self.persist_deadline,
+            self.tx.btl_bw,
+            self.tx.rtt_min.map(|(rtt, _)| rtt),
+            self.tx.bbr_window_cap(&self.cfg),
         )
     }
 
@@ -562,6 +618,9 @@ impl StreamEngine {
             self.tx.trim_rewound_pending_after_ack(ack);
             self.tx.dup_acks = 0;
             self.tx.consec_rto = 0; // progress: reset dead-link counter
+            if self.cfg.bbr {
+                self.tx.bbr_on_delivered(acked, now);
+            }
 
             if self.tx.in_recovery {
                 if seq::geq(ack, self.tx.recover) {
@@ -589,6 +648,9 @@ impl StreamEngine {
             }
 
             if let Some(r) = rtt_sample {
+                if self.cfg.bbr {
+                    self.tx.bbr_on_rtt(r, now);
+                }
                 self.tx.update_rto(r, &self.cfg);
             }
             self.tx.arm_or_clear_rto(now);
@@ -684,7 +746,20 @@ impl StreamEngine {
             //    rebuilds the burst that caused the loss.
             if now >= self.tx.pace_next_ms {
                 let (interval, batch) = self.pace_params();
-                self.tx.pace_budget = batch;
+                // Scale the refill by how late the driver actually woke: one
+                // nominal batch per REAL wake quantizes the send rate to
+                // batch/wake-interval on coalesced mobile timers (live this
+                // stalled the BBR estimator exactly at the quantized rate).
+                // Catch-up is bounded to 8 nominal ticks and the overall
+                // max_pacing_batch; the carrier's shared token-bucket pacer
+                // still shapes the wire burst.
+                let prev_refill = self.tx.pace_next_ms.saturating_sub(interval);
+                let elapsed = now.saturating_sub(prev_refill).max(interval);
+                let ticks = (elapsed / interval.max(1)).clamp(1, 8);
+                self.tx.pace_budget = (batch as u64)
+                    .saturating_mul(ticks)
+                    .min(self.cfg.max_pacing_batch.max(1) as u64)
+                    as u32;
                 self.tx.pace_next_ms = now + interval;
             }
             // 3a. Retransmit a marked hole first — SACK-aware, so we never resend
@@ -736,11 +811,22 @@ impl StreamEngine {
             && (!self.tx.pending.is_empty() || (self.tx.fin_requested && !self.tx.fin_sent))
     }
 
+    /// Send window for NEW data: min(cwnd, peer rwnd), further capped at
+    /// 2x the measured BDP when BBR-lite shaping is active so a loss-free
+    /// path does not park a full receive window in queues.
+    fn effective_send_window(&self) -> u32 {
+        let window = self.tx.cwnd.min(self.tx.rwnd);
+        match self.tx.bbr_window_cap(&self.cfg) {
+            Some(cap) => window.min(cap),
+            None => window,
+        }
+    }
+
     /// Create the next DATA/FIN segment if the send window allows; returns true
     /// if one was pushed onto `segs` (the caller then encodes `segs.back()`).
     fn create_next_segment(&mut self, now: u64) -> bool {
         let mss = self.cfg.mss as u32;
-        let window = self.tx.cwnd.min(self.tx.rwnd);
+        let window = self.effective_send_window();
         let inflight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
         let probe = self.force_probe;
         if !probe && seq::geq(inflight, window) {
@@ -1057,6 +1143,29 @@ impl StreamEngine {
         let Some(srtt) = self.tx.srtt else {
             return (0, u32::MAX);
         };
+        // BBR-lite: once the delivery model is warm, pace at 5/4 of the
+        // measured bottleneck rate — enough overdrive to keep probing for
+        // more bandwidth while the 2xBDP window cap bounds the standing
+        // queue. Window/srtt pacing below would chase its own queueing delay
+        // (srtt inflates -> rate holds at the same self-built queue).
+        if self.cfg.bbr
+            && self.tx.btl_bw > 0
+            && self.tx.rtt_min.is_some()
+            && self.tx.delivered >= BBR_ENGAGE_DELIVERED
+        {
+            let rate = self.tx.btl_bw.saturating_mul(5) / 4; // bytes/sec
+            let mss = self.cfg.mss.max(1) as u64;
+            // Pick a tick long enough to release >=4 whole cells, then round
+            // the per-tick budget UP: rounding down quantized the real rate to
+            // a fraction of the target (live: half), which fed the estimator
+            // slower samples than it paced for.
+            let cells_per_sec = (rate / mss).max(1);
+            let interval = (4_000 / cells_per_sec).clamp(1, 100);
+            let batch = (rate.saturating_mul(interval))
+                .div_ceil(1000 * mss)
+                .clamp(1, self.cfg.max_pacing_batch.max(1) as u64) as u32;
+            return (interval, batch);
+        }
         // Spread the EFFECTIVE window (min of cwnd and the peer's rwnd) across one
         // RTT — never cwnd alone. When cwnd has run far past a smaller rwnd, pacing
         // off cwnd would send much faster than the window can ever drain, rebuilding
@@ -1085,7 +1194,7 @@ impl StreamEngine {
         if self.tx.segs.iter().any(|s| s.needs_resend) {
             return true;
         }
-        let window = self.tx.cwnd.min(self.tx.rwnd);
+        let window = self.effective_send_window();
         let inflight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
         if seq::geq(inflight, window) {
             return false; // window-limited, not pace-limited
@@ -1183,6 +1292,87 @@ impl TxState {
                 self.rewind_fin = false;
             }
         }
+    }
+
+    /// Record newly delivered bytes and refresh the bottleneck-rate estimate
+    /// over a sliding window of delivery checkpoints. Quiet/app-limited spans
+    /// produce no qualifying sample and leave the estimate untouched.
+    fn bbr_on_delivered(&mut self, acked: u32, now: u64) {
+        self.delivered = self.delivered.saturating_add(acked as u64);
+        let push = self
+            .rate_samples
+            .back()
+            .is_none_or(|&(t, _)| now >= t + BBR_SAMPLE_SPACING_MS);
+        if push {
+            self.rate_samples.push_back((now, self.delivered));
+        }
+        while self.rate_samples.len() > 2 {
+            let Some(&(t, _)) = self.rate_samples.front() else {
+                break;
+            };
+            if now.saturating_sub(t) > BBR_RATE_WINDOW_MS {
+                self.rate_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        let (Some(&(t0, d0)), Some(&(t1, d1))) =
+            (self.rate_samples.front(), self.rate_samples.back())
+        else {
+            return;
+        };
+        let span = t1.saturating_sub(t0);
+        let bytes = d1.saturating_sub(d0);
+        if span < BBR_MIN_SPAN_MS || bytes < BBR_MIN_DELIVERED {
+            return;
+        }
+        let sample = bytes.saturating_mul(1000) / span.max(1);
+        let store = self
+            .bw_samples
+            .back()
+            .is_none_or(|&(t, _)| now >= t + BBR_BW_SAMPLE_SPACING_MS);
+        if store {
+            self.bw_samples.push_back((now, sample));
+        } else if let Some(back) = self.bw_samples.back_mut() {
+            back.1 = back.1.max(sample);
+        }
+        while let Some(&(t, _)) = self.bw_samples.front() {
+            if now.saturating_sub(t) > BBR_BW_WINDOW_MS && self.bw_samples.len() > 1 {
+                self.bw_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.btl_bw = self
+            .bw_samples
+            .iter()
+            .map(|&(_, rate)| rate)
+            .max()
+            .unwrap_or(0);
+    }
+
+    /// Windowed-minimum RTT: keep the smallest clean sample, but let the
+    /// window expire so a route change eventually re-anchors the estimate.
+    fn bbr_on_rtt(&mut self, r_ms: u32, now: u64) {
+        let replace = match self.rtt_min {
+            None => true,
+            Some((min, stamp)) => r_ms <= min || now.saturating_sub(stamp) > BBR_MIN_RTT_WINDOW_MS,
+        };
+        if replace {
+            self.rtt_min = Some((r_ms.max(1), now));
+        }
+    }
+
+    /// Effective-window cap at 2x the measured bandwidth-delay product, once
+    /// both estimates exist. `None` (startup / bbr off) means no extra cap.
+    fn bbr_window_cap(&self, cfg: &Config) -> Option<u32> {
+        if !cfg.bbr || self.btl_bw == 0 || self.delivered < BBR_ENGAGE_DELIVERED {
+            return None;
+        }
+        let (rtt_min, _) = self.rtt_min?;
+        let bdp = self.btl_bw.saturating_mul(rtt_min as u64) / 1000;
+        let floor = (cfg.init_cwnd as u64).max(64 * cfg.mss as u64);
+        Some(bdp.saturating_mul(2).clamp(floor, u32::MAX as u64) as u32)
     }
 
     fn update_rto(&mut self, r_ms: u32, cfg: &Config) {
@@ -1314,6 +1504,76 @@ impl RxState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bbr_rate_estimate_ratchets_up_and_ignores_thin_windows() {
+        let cfg = Config {
+            bbr: true,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 10_000);
+        // Deliver 1 MiB over 1s in 20ms steps -> ~1 MiB/s estimate.
+        let step_bytes = (1024 * 1024) / 50;
+        for i in 0..=50u64 {
+            e.tx.bbr_on_delivered(step_bytes, i * 20);
+        }
+        let mib = 1024 * 1024;
+        assert!(
+            e.tx.btl_bw > mib * 8 / 10 && e.tx.btl_bw < mib * 12 / 10,
+            "estimate ~1 MiB/s, got {}",
+            e.tx.btl_bw
+        );
+        let before = e.tx.btl_bw;
+        // A thin (app-limited) window: a trickle far below BBR_MIN_DELIVERED
+        // must not crater the estimate.
+        for i in 51..=80u64 {
+            e.tx.bbr_on_delivered(100, i * 20);
+        }
+        assert!(
+            e.tx.btl_bw >= before / 2,
+            "thin window cratered the estimate: {} -> {}",
+            before,
+            e.tx.btl_bw
+        );
+    }
+
+    #[test]
+    fn bbr_window_cap_bounds_effective_window_at_two_bdp() {
+        let cfg = Config {
+            bbr: true,
+            recv_window: 4 * 1024 * 1024,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 10_000);
+        e.tx.rwnd = cfg.recv_window;
+        e.tx.cwnd = 16 * 1024 * 1024; // loss-free growth far past the path BDP
+        e.tx.btl_bw = 3 * 1024 * 1024; // 3 MiB/s
+        e.tx.delivered = BBR_ENGAGE_DELIVERED; // model warm
+        e.tx.rtt_min = Some((200, 0)); // 200ms propagation
+        // BDP = 3 MiB/s * 0.2s = 614.4 KiB; cap = 2x.
+        let cap = e.tx.bbr_window_cap(&e.cfg).expect("model warm");
+        let bdp = 3 * 1024 * 1024 * 200 / 1000;
+        assert_eq!(cap, 2 * bdp);
+        assert_eq!(e.effective_send_window(), cap);
+        // Without estimates the cap must vanish (startup behaves classically).
+        e.tx.btl_bw = 0;
+        assert_eq!(e.effective_send_window(), e.tx.cwnd.min(e.tx.rwnd));
+    }
+
+    #[test]
+    fn bbr_min_rtt_keeps_min_until_window_expiry() {
+        let cfg = Config {
+            bbr: true,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 10_000);
+        e.tx.bbr_on_rtt(180, 0);
+        e.tx.bbr_on_rtt(900, 1_000); // queue-inflated sample: ignored
+        assert_eq!(e.tx.rtt_min.map(|(r, _)| r), Some(180));
+        // After the window expires a fresh (even larger) sample re-anchors.
+        e.tx.bbr_on_rtt(400, BBR_MIN_RTT_WINDOW_MS + 2_000);
+        assert_eq!(e.tx.rtt_min.map(|(r, _)| r), Some(400));
+    }
 
     fn engine_with_tiny_no_sack_flight(rto_rewind_no_sack: bool) -> StreamEngine {
         let mss = MSS as u32;
