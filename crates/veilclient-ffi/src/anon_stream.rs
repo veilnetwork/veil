@@ -266,6 +266,19 @@ const ANDROID_MAX_PACING_BATCH_PROP: &str = "debug.veil.onion_stream_max_pacing_
 const ANDROID_DATA_PACE_US_PROP: &str = "debug.veil.onion_stream_data_pace_us";
 const CIRCUIT_BBR_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_BBR";
 const ANDROID_BBR_PROP: &str = "debug.veil.onion_stream_bbr";
+/// Stripe one bulk stream's DATA runs across up to this many distinct
+/// outbound routes (distinct first-hop sessions). 1 = classic single-route
+/// pinning. The per-flow ceiling lives in the first-hop session TCPs (live:
+/// one flow ~15-17 MB/s raw, three parallel flows ~29 MB/s aggregate), so a
+/// single engine striping across sessions harvests the aggregate without the
+/// multi-engine contention that made 4 independent range streams SLOWER than
+/// one stream.
+const CIRCUIT_STRIPE_ROUTES_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_STRIPE_ROUTES";
+const ANDROID_STRIPE_ROUTES_PROP: &str = "debug.veil.onion_stream_stripe_routes";
+const DEFAULT_CIRCUIT_STRIPE_ROUTES: usize = 1;
+/// Below this many cells a run is not worth splitting (per-chunk route
+/// resolve/bookkeeping would dominate; reordering absorbs nothing).
+const STRIPE_MIN_RUN_CELLS: usize = 32;
 const DEFAULT_DATA_PACE_US: u64 = 100;
 const DEFAULT_CIRCUIT_DATA_PACE_US: u64 = 50;
 const MIN_DATA_PACE_US: u64 = 10;
@@ -464,6 +477,12 @@ struct CircuitCells {
     outbound_pool_target: usize,
     ack_outbound_pool_target: usize,
     bulk_route_active_limit: usize,
+    /// Max distinct routes one bulk stream's DATA runs stripe across (see
+    /// [`CIRCUIT_STRIPE_ROUTES_ENV`]); 1 = single-route pinning.
+    stripe_routes: usize,
+    /// Rotates the chunk->route mapping between striped runs so the pinned
+    /// primary is not always the sequence head.
+    stripe_rr: Arc<AtomicU64>,
     /// Published-mode peer-introductions are carried only on SYN/SYN_ACK, but
     /// the relay-side cookie mapping may later move DATA/ACK cells to a different
     /// local receive circuit after a legitimate re-registration at the same R.
@@ -1099,11 +1118,93 @@ impl CircuitCells {
             cells.drain(..run_len);
             return Ok(());
         }
-        let cookie = stream_cookie(&dst.node);
         self.data_pacer.wait_n(dst.node, run_len as u32).await;
+        // Route striping: the per-flow ceiling is the first-hop session TCP,
+        // so split a large run into contiguous chunks across additional
+        // healthy pool routes with DISTINCT first hops. One engine keeps one
+        // delivery model/reassembly; only the wire fans out. The pinned
+        // primary stays the health/RTO anchor and always carries a chunk.
+        let alternates = if self.stripe_routes > 1 && run_len >= STRIPE_MIN_RUN_CELLS {
+            self.stripe_alternates(dst.node, &route, self.stripe_routes - 1)
+                .await
+        } else {
+            Vec::new()
+        };
+        if self.stripe_routes > 1 {
+            // Debug visibility: EVERY striped run, sampled non-striped runs.
+            let tick = self.stripe_rr.fetch_add(1, Ordering::Relaxed);
+            if !alternates.is_empty() || tick.is_multiple_of(64) {
+                diag_node(
+                    &self.me,
+                    &format!(
+                        "stripe run for {} stream={} run_len={} alternates={} primary_hop={}",
+                        short_node(&dst.node),
+                        stream_id,
+                        run_len,
+                        alternates.len(),
+                        short_node(&route.circuit.first_hop()),
+                    ),
+                );
+            }
+        }
+        if alternates.is_empty() {
+            let (sent, err) = self.send_chunk_on_route(dst.node, &route, run_len, cells)?;
+            if sent > 0 {
+                mark_circuit_activity(&self.activity);
+                self.mark_outbound_non_handshake(dst.node, &route).await;
+            }
+            if let Some(err) = err {
+                return self
+                    .finish_failed_chunk(dst.node, &route, err, run_len - sent, cells)
+                    .await;
+            }
+            return Ok(());
+        }
+        let mut routes: Vec<&CircuitRoute> = Vec::with_capacity(1 + alternates.len());
+        routes.push(&route);
+        routes.extend(alternates.iter());
+        let n = routes.len();
+        // Rotate which route gets the head chunk so the oldest bytes are not
+        // always serialized on the primary (the counter advanced above).
+        let base = (self.stripe_rr.load(Ordering::Relaxed) as usize) % n;
+        let chunk = run_len.div_ceil(n);
+        let mut remaining = run_len;
+        let mut idx = 0usize;
+        while remaining > 0 {
+            let this = chunk.min(remaining);
+            let r = routes[(base + idx) % n];
+            let (sent, err) = self.send_chunk_on_route(dst.node, r, this, cells)?;
+            if let Some(err) = err {
+                // Enqueue failure on this route: drop the chunk's tail (ARQ
+                // repairs), mark the route, and keep going on the others.
+                self.finish_failed_chunk(dst.node, r, err, this - sent, cells)
+                    .await?;
+            }
+            remaining -= this;
+            idx += 1;
+        }
+        mark_circuit_activity(&self.activity);
+        self.mark_outbound_non_handshake(dst.node, &route).await;
+        Ok(())
+    }
+
+    /// Send `count` cells from the front of `cells` on `route`. Returns how
+    /// many were accepted plus the enqueue error, if one stopped the chunk
+    /// early. `Err(WouldBlock)` = local first-hop TX queue full, unsent cells
+    /// stay queued for the driver's retry. On a non-queue enqueue failure the
+    /// caller decides how much of the tail to drop
+    /// (see [`Self::finish_failed_chunk`]).
+    fn send_chunk_on_route(
+        &self,
+        dst_node: [u8; 32],
+        route: &CircuitRoute,
+        count: usize,
+        cells: &mut std::collections::VecDeque<Vec<u8>>,
+    ) -> io::Result<(usize, Option<veil_node_runtime::DataCircuitSendError>)> {
+        let cookie = stream_cookie(&dst_node);
         let mut sent = 0usize;
-        while sent < run_len {
-            let cell = cells.front().expect("run bounded by deque len");
+        while sent < count {
+            let cell = cells.front().expect("chunk bounded by deque len");
             let data_payload_len = match Frame::decode(cell) {
                 Some(Frame::Data { payload, .. }) => payload.len(),
                 _ => 0,
@@ -1138,11 +1239,7 @@ impl CircuitCells {
                         "circuit first-hop TX queue full",
                     ));
                 }
-                self.mark_route_send_failed(dst.node, &route, e).await;
-                // Route enqueue failure == dropped cells; ARQ retransmits while
-                // route selection moves off the cooled path.
-                cells.drain(..run_len - sent);
-                break;
+                return Ok((sent, Some(e)));
             }
             if let Some(stats) = route.stats.as_ref() {
                 if let Some(snapshot) = stats.record_send(true, data_payload_len) {
@@ -1151,7 +1248,7 @@ impl CircuitCells {
                             &self.me,
                             &format!(
                                 "outbound route stats for {} via R={} path={} {snapshot}",
-                                short_node(&dst.node),
+                                short_node(&dst_node),
                                 short_node(&relay),
                                 short_path(route.circuit.relay_path()),
                             ),
@@ -1162,9 +1259,94 @@ impl CircuitCells {
             cells.pop_front();
             sent += 1;
         }
-        mark_circuit_activity(&self.activity);
-        self.mark_outbound_non_handshake(dst.node, &route).await;
+        Ok((sent, None))
+    }
+
+    /// A route rejected an enqueue mid-chunk (not queue-full): mark it and
+    /// drop the chunk's remaining cells — ARQ retransmits them, and route
+    /// selection moves off the cooled path.
+    async fn finish_failed_chunk(
+        &self,
+        dst_node: [u8; 32],
+        route: &CircuitRoute,
+        err: veil_node_runtime::DataCircuitSendError,
+        remaining: usize,
+        cells: &mut std::collections::VecDeque<Vec<u8>>,
+    ) -> io::Result<()> {
+        self.mark_route_send_failed(dst_node, route, err).await;
+        cells.drain(..remaining.min(cells.len()));
         Ok(())
+    }
+
+    /// Healthy pool routes to stripe extra chunks over: distinct circuit AND
+    /// distinct first hop from the primary and from each other (same first
+    /// hop = same session TCP = no extra per-flow ceiling), not cooled, with
+    /// a live, non-stale first-hop session.
+    async fn stripe_alternates(
+        &self,
+        dst_node: [u8; 32],
+        primary: &CircuitRoute,
+        max_extra: usize,
+    ) -> Vec<CircuitRoute> {
+        if max_extra == 0 {
+            return Vec::new();
+        }
+        let cooldown_now = Instant::now();
+        let cooled_relays = {
+            let cooldowns = self
+                .route_cooldowns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cooldowns.clone()
+        };
+        let cooled_first_hops = {
+            let cooldowns = self
+                .first_hop_cooldowns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cooldowns.clone()
+        };
+        let mut used_first_hops = vec![primary.circuit.first_hop()];
+        let mut out = Vec::new();
+        // NEVER block the stream driver on the pool mutex: the background
+        // opener holds it across circuit construction, and an await here
+        // stalls the whole driver task (no sends, no ACK processing) for
+        // hundreds of milliseconds right when the first big flight goes out —
+        // live this poisoned the delivery model into a permanent crawl.
+        // Contended lock == no striping for this run; the next run retries.
+        let Ok(circuits) = self.outbound_circuits.try_lock() else {
+            return Vec::new();
+        };
+        if let Some(entries) = circuits.get(&dst_node) {
+            for entry in entries {
+                if out.len() >= max_extra {
+                    break;
+                }
+                let first_hop = entry.circuit.first_hop();
+                if used_first_hops.contains(&first_hop) {
+                    continue;
+                }
+                if cooled_relays
+                    .get(&entry.rendezvous_node)
+                    .is_some_and(|until| *until > cooldown_now)
+                    || cooled_first_hops
+                        .get(&first_hop)
+                        .is_some_and(|until| *until > cooldown_now)
+                {
+                    continue;
+                }
+                if !self.services.has_live_session(&first_hop) {
+                    continue;
+                }
+                let route = entry.route();
+                if self.route_session_stale(&route) {
+                    continue;
+                }
+                used_first_hops.push(first_hop);
+                out.push(route);
+            }
+        }
+        out
     }
 
     async fn circuit_for(
@@ -1899,6 +2081,23 @@ impl CellSender for HubCells {
         }
     }
 
+    // MUST forward: without this the trait's default cell-by-cell loop hides
+    // the circuit path's batched run sender (one route resolve + one pacer
+    // reserve + one bookkeeping pass per DATA run, and the route-striping
+    // split). Live this silently degraded every stream back to the scalar
+    // per-cell path — batching worked in unit tests (which drive
+    // CircuitCells directly) but never end-to-end through the hub.
+    async fn send_many(
+        &self,
+        dst: Addr,
+        cells: &mut std::collections::VecDeque<Vec<u8>>,
+    ) -> io::Result<()> {
+        match self {
+            HubCells::Anon(c) => c.send_many(dst, cells).await,
+            HubCells::Circuit(c) => c.send_many(dst, cells).await,
+        }
+    }
+
     async fn on_stream_data_rto(&self, dst: Addr, stream_id: u32, consec_rto: u32, snd_una: u32) {
         match self {
             HubCells::Anon(_) => {}
@@ -2250,13 +2449,21 @@ fn try_open_circuit(
         0,
         MAX_CIRCUIT_BULK_ROUTE_ACTIVE_LIMIT,
     );
+    let stripe_routes = env_or_android_usize(
+        CIRCUIT_STRIPE_ROUTES_ENV,
+        ANDROID_STRIPE_ROUTES_PROP,
+        DEFAULT_CIRCUIT_STRIPE_ROUTES,
+        1,
+        MAX_CIRCUIT_OUTBOUND_POOL,
+    )
+    .min(outbound_pool_target);
     let activity = Arc::new(Mutex::new(Instant::now()));
     let reg_kp = Arc::new(services.onion_stream_registration_keypair());
     let epoch = Arc::new(AtomicU64::new(0));
     diag_node(
         &me,
         &format!(
-            "circuit shared DATA pacer {}us outbound_pool={outbound_pool_target} ack_pool={ack_outbound_pool_target} bulk_route_active_limit={bulk_route_active_limit}",
+            "circuit shared DATA pacer {}us outbound_pool={outbound_pool_target} ack_pool={ack_outbound_pool_target} bulk_route_active_limit={bulk_route_active_limit} stripe_routes={stripe_routes}",
             data_pace_interval.as_micros(),
         ),
     );
@@ -2464,6 +2671,8 @@ fn try_open_circuit(
         outbound_pool_target,
         ack_outbound_pool_target,
         bulk_route_active_limit,
+        stripe_routes,
+        stripe_rr: Arc::new(AtomicU64::new(0)),
         peer_tags,
         outbound_peer_tags,
     })
