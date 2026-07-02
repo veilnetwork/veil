@@ -9,7 +9,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 // tokio's monotonic clock (NOT std::time::Instant): it honours `start_paused`'s
 // virtual time in tests, so the engine's clock and the driver's sleeps share one
 // timeline. In production it is the real monotonic clock.
@@ -24,6 +24,19 @@ use crate::wire::reset_reason;
 pub trait CellDuplex: Send {
     fn send_cell(&mut self, cell: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
     fn recv_cell(&mut self) -> impl Future<Output = io::Result<Option<Vec<u8>>>> + Send;
+    fn on_data_rto(
+        &mut self,
+        stream_id: u32,
+        consec_rto: u32,
+        snd_una: u32,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (stream_id, consec_rto, snd_una);
+        std::future::ready(())
+    }
+    fn on_stream_closed(&mut self, stream_id: u32, end: End) -> impl Future<Output = ()> + Send {
+        let _ = (stream_id, end);
+        std::future::ready(())
+    }
 }
 
 /// How a stream ended — the resumability signal the app keys on.
@@ -50,6 +63,7 @@ pub struct OnionStream {
     data_rx: mpsc::Receiver<Vec<u8>>,
     residual: Vec<u8>,
     end: Arc<Mutex<End>>,
+    abort: OnionAbort,
 }
 
 impl OnionStream {
@@ -76,12 +90,17 @@ impl OnionStream {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (data_tx, data_rx) = mpsc::channel(16);
         let end = Arc::new(Mutex::new(End::Open));
+        let abort = OnionAbort {
+            end: end.clone(),
+            notify: Arc::new(Notify::new()),
+        };
         tokio::spawn(drive(engine, duplex, cmd_rx, data_tx, end.clone()));
         OnionStream {
             cmd_tx,
             data_rx,
             residual: Vec::new(),
             end,
+            abort,
         }
     }
 
@@ -101,18 +120,33 @@ impl OnionStream {
 
     /// Abort the stream; the peer observes [`End::Reset`].
     pub async fn reset(&self, reason: u8) {
+        self.abort.abort(reason);
         let _ = self.cmd_tx.send(AppCmd::Reset(reason)).await;
     }
 
     /// Read up to `buf.len()` delivered bytes. `Ok(0)` = clean EOF; an
     /// `Err(ConnectionReset)` = the stream was aborted (the app should resume).
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        pull(&mut self.data_rx, &mut self.residual, &self.end, buf).await
+        pull(
+            &mut self.data_rx,
+            &mut self.residual,
+            &self.end,
+            &self.abort,
+            buf,
+        )
+        .await
     }
 
     /// Current end state (Open / Eof / Reset).
     pub fn end_reason(&self) -> End {
         end_of(&self.end)
+    }
+
+    /// Cloneable local abort handle. This lets FFI `close()` wake an in-flight
+    /// blocking read immediately even if the async driver has not yet consumed
+    /// the reset command.
+    pub fn abort_handle(&self) -> OnionAbort {
+        self.abort.clone()
     }
 
     /// Split into independently-owned read + write halves so a caller can read
@@ -124,12 +158,30 @@ impl OnionStream {
                 data_rx: self.data_rx,
                 residual: self.residual,
                 end: self.end.clone(),
+                abort: self.abort.clone(),
             },
             OnionWriter {
                 cmd_tx: self.cmd_tx,
                 end: self.end,
+                abort: self.abort,
             },
         )
+    }
+}
+
+/// Cloneable local abort signal shared by the read/write halves.
+#[derive(Clone)]
+pub struct OnionAbort {
+    end: Arc<Mutex<End>>,
+    notify: Arc<Notify>,
+}
+
+impl OnionAbort {
+    /// Mark the local stream as reset and wake readers currently parked in
+    /// `read()`. The wire-level RST is still sent through [`OnionWriter::reset`].
+    pub fn abort(&self, reason: u8) {
+        set_end(&self.end, End::Reset(reason));
+        self.notify.notify_waiters();
     }
 }
 
@@ -138,11 +190,19 @@ pub struct OnionReader {
     data_rx: mpsc::Receiver<Vec<u8>>,
     residual: Vec<u8>,
     end: Arc<Mutex<End>>,
+    abort: OnionAbort,
 }
 impl OnionReader {
     /// See [`OnionStream::read`].
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        pull(&mut self.data_rx, &mut self.residual, &self.end, buf).await
+        pull(
+            &mut self.data_rx,
+            &mut self.residual,
+            &self.end,
+            &self.abort,
+            buf,
+        )
+        .await
     }
     pub fn end_reason(&self) -> End {
         end_of(&self.end)
@@ -153,6 +213,7 @@ impl OnionReader {
 pub struct OnionWriter {
     cmd_tx: mpsc::Sender<AppCmd>,
     end: Arc<Mutex<End>>,
+    abort: OnionAbort,
 }
 impl OnionWriter {
     /// See [`OnionStream::write_all`].
@@ -168,7 +229,12 @@ impl OnionWriter {
     }
     /// See [`OnionStream::reset`].
     pub async fn reset(&self, reason: u8) {
+        self.abort.abort(reason);
         let _ = self.cmd_tx.send(AppCmd::Reset(reason)).await;
+    }
+    /// Locally wake readers without waiting for the async driver command queue.
+    pub fn abort_local(&self, reason: u8) {
+        self.abort.abort(reason);
     }
     pub fn end_reason(&self) -> End {
         end_of(&self.end)
@@ -184,17 +250,28 @@ async fn pull(
     data_rx: &mut mpsc::Receiver<Vec<u8>>,
     residual: &mut Vec<u8>,
     end: &Arc<Mutex<End>>,
+    abort: &OnionAbort,
     buf: &mut [u8],
 ) -> io::Result<usize> {
     if residual.is_empty() {
-        match data_rx.recv().await {
+        if let End::Reset(r) = end_of(end) {
+            return reset_err(r);
+        }
+        let recv = tokio::select! {
+            biased;
+            _ = abort.notify.notified() => {
+                if let End::Reset(r) = end_of(end) {
+                    return reset_err(r);
+                }
+                data_rx.recv().await
+            }
+            recv = data_rx.recv() => recv,
+        };
+        match recv {
             Some(chunk) => *residual = chunk,
             None => {
                 return match end_of(end) {
-                    End::Reset(r) => Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        format!("onion stream reset ({r})"),
-                    )),
+                    End::Reset(r) => reset_err(r),
                     _ => Ok(0), // clean EOF
                 };
             }
@@ -206,6 +283,13 @@ async fn pull(
     Ok(n)
 }
 
+fn reset_err<T>(reason: u8) -> io::Result<T> {
+    Err(io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        format!("onion stream reset ({reason})"),
+    ))
+}
+
 fn broken() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "onion stream driver gone")
 }
@@ -215,6 +299,35 @@ fn broken() -> io::Error {
 const SEND_HIGH_WATER: usize = 4 << 20;
 /// Chunk size for moving delivered bytes out of the engine to the reader.
 const DELIVER_CHUNK: usize = 256 * 1024;
+/// Local transport backpressure retry cadence. `WouldBlock` means the cell did
+/// not enter the next bounded queue, so keep the exact encoded cell and retry it
+/// instead of turning local queue pressure into end-to-end packet loss.
+const SEND_WOULD_BLOCK_RETRY_MS: u64 = 1;
+const DEBUG_SUMMARY_ENV: &str = "VEIL_ONION_STREAM_DEBUG_SUMMARY_MS";
+
+fn debug_summary_period_ms(configured: u64) -> Option<u64> {
+    let from_env = std::env::var(DEBUG_SUMMARY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let period = configured.max(from_env);
+    if period > 0 { Some(period) } else { None }
+}
+
+#[cfg(target_os = "android")]
+fn debug_summary_log(stream_id: u32, summary: String) {
+    log::info!("onion-stream-driver[{stream_id}]: {summary}");
+}
+
+#[cfg(not(target_os = "android"))]
+fn debug_summary_log(stream_id: u32, summary: String) {
+    use std::io::Write as _;
+
+    let _ = writeln!(
+        std::io::stderr(),
+        "onion-stream-driver[{stream_id}]: {summary}"
+    );
+}
 
 async fn drive<D: CellDuplex>(
     mut engine: StreamEngine,
@@ -225,22 +338,36 @@ async fn drive<D: CellDuplex>(
 ) {
     let base = Instant::now();
     let now_ms = |b: &Instant| b.elapsed().as_millis() as u64;
-    let debug_summary_period_ms = std::env::var("VEIL_ONION_STREAM_DEBUG_SUMMARY_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0);
+    let debug_summary_period_ms = debug_summary_period_ms(engine.debug_summary_period_ms());
     let mut next_debug_summary_ms = debug_summary_period_ms.unwrap_or(0);
     let mut cmd_open = true;
     let mut cell = Vec::with_capacity(crate::wire::MAX_CELL);
+    let mut blocked_cell: Option<Vec<u8>> = None;
+    let mut send_retry_at: Option<u64> = None;
+    let mut blocked_since_ms: Option<u64> = None;
+    let mut would_block_total: u64 = 0;
+    let mut would_block_retries: u64 = 0;
+    let mut would_block_recovered: u64 = 0;
     loop {
         let now = now_ms(&base);
         if let Some(period_ms) = debug_summary_period_ms
             && now >= next_debug_summary_ms
         {
-            eprintln!(
-                "onion-stream-driver[{}]: {}",
+            let blocked_age_ms = blocked_since_ms
+                .map(|since| now.saturating_sub(since))
+                .unwrap_or(0);
+            debug_summary_log(
                 engine.stream_id(),
-                engine.debug_summary()
+                format!(
+                    "now={now} blocked_cell={} blocked_age={}ms wb_total={} \
+                     wb_retries={} wb_recovered={} {}",
+                    blocked_cell.is_some(),
+                    blocked_age_ms,
+                    would_block_total,
+                    would_block_retries,
+                    would_block_recovered,
+                    engine.debug_summary()
+                ),
             );
             next_debug_summary_ms = now.saturating_add(period_ms);
         }
@@ -259,6 +386,14 @@ async fn drive<D: CellDuplex>(
                 Event::PeerFinished => set_end(&end, End::Eof),
                 Event::Reset(r) => set_end(&end, End::Reset(r)),
                 Event::Connected => {}
+                Event::DataRto {
+                    consec_rto,
+                    snd_una,
+                } => {
+                    duplex
+                        .on_data_rto(engine.stream_id(), consec_rto, snd_una)
+                        .await;
+                }
             }
         }
 
@@ -285,10 +420,52 @@ async fn drive<D: CellDuplex>(
 
         // 3. Drain everything the engine wants to put on the wire. ACKs emitted
         // here now see the receive buffer after the app handoff above.
-        while engine.poll_transmit(now, &mut cell) {
-            if duplex.send_cell(&cell).await.is_err() {
-                engine.reset(reset_reason::APP); // circuit permanently gone
-                break;
+        //
+        // A `WouldBlock` from the cell carrier is local backpressure (bounded
+        // session TX queue full), not proof that the peer/path lost a packet. The
+        // engine has already committed this encoded cell to its sent flight, so
+        // silently dropping it would manufacture loss and drive RTO/cwnd collapse.
+        // Keep exactly one blocked encoded cell and retry it before polling more
+        // engine output.
+        if let Some(blocked) = blocked_cell.take() {
+            if send_retry_at.is_none_or(|at| now >= at) {
+                match duplex.send_cell(&blocked).await {
+                    Ok(()) => {
+                        send_retry_at = None;
+                        blocked_since_ms = None;
+                        would_block_recovered = would_block_recovered.saturating_add(1);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        blocked_cell = Some(blocked);
+                        would_block_total = would_block_total.saturating_add(1);
+                        would_block_retries = would_block_retries.saturating_add(1);
+                        blocked_since_ms.get_or_insert(now);
+                        send_retry_at = Some(now.saturating_add(SEND_WOULD_BLOCK_RETRY_MS));
+                    }
+                    Err(_) => {
+                        engine.reset(reset_reason::APP); // circuit permanently gone
+                    }
+                }
+            } else {
+                blocked_cell = Some(blocked);
+            }
+        }
+        if blocked_cell.is_none() && !engine.is_closed() {
+            while engine.poll_transmit(now, &mut cell) {
+                match duplex.send_cell(&cell).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        blocked_cell = Some(cell.clone());
+                        would_block_total = would_block_total.saturating_add(1);
+                        blocked_since_ms.get_or_insert(now);
+                        send_retry_at = Some(now.saturating_add(SEND_WOULD_BLOCK_RETRY_MS));
+                        break;
+                    }
+                    Err(_) => {
+                        engine.reset(reset_reason::APP); // circuit permanently gone
+                        break;
+                    }
+                }
             }
         }
 
@@ -298,7 +475,12 @@ async fn drive<D: CellDuplex>(
         }
 
         // 5. Block until the next thing happens.
-        let timeout_at = engine.next_timeout();
+        let mut timeout_at = engine.next_timeout();
+        if blocked_cell.is_some()
+            && let Some(retry_at) = send_retry_at
+        {
+            timeout_at = Some(timeout_at.map_or(retry_at, |t| t.min(retry_at)));
+        }
         tokio::select! {
             biased;
             cmd = cmd_rx.recv(), if cmd_open && engine.send_buffer_len() < SEND_HIGH_WATER => {
@@ -352,6 +534,9 @@ async fn drive<D: CellDuplex>(
             End::Reset(reset_reason::APP)
         },
     ) {}
+    duplex
+        .on_stream_closed(engine.stream_id(), end_of(&end))
+        .await;
     // Dropping `data_tx` here makes the reader observe EOF/reset.
 }
 

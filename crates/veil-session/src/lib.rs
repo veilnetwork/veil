@@ -55,4 +55,4 @@ pub use fsm::{SessionFsm, SessionHandshakeData, SessionPhase};
 pub use manager::{RemoteRole, SessionEntry, SessionId, SessionRegistry};
 pub use outbox::SessionOutbox;
 pub use priority_queue::{DEFAULT_WEIGHTS, PriorityQueue};
-pub use tx_registry::{PriorityFrame, SessionTxRegistry};
+pub use tx_registry::{PriorityFrame, SendToError, SessionTxRegistry};
