@@ -3,7 +3,7 @@
 //! Deterministic (seeded PRNG) so a failure reproduces byte-for-byte.
 
 use veil_onion_stream::engine::{Config, Event, StreamEngine};
-use veil_onion_stream::wire::reset_reason;
+use veil_onion_stream::wire::{Frame, reset_reason};
 
 /// Tiny deterministic PRNG (SplitMix64) — no external dep.
 struct Rng(u64);
@@ -79,7 +79,14 @@ impl Pipe {
         }
     }
     fn inject(&mut self, now: u64, bytes: &[u8], rng: &mut Rng) {
+        self.inject_with_drop(now, bytes, rng, false);
+    }
+
+    fn inject_with_drop(&mut self, now: u64, bytes: &[u8], rng: &mut Rng, force_drop: bool) {
         self.injected += 1;
+        if force_drop {
+            return;
+        }
         // Drop?
         if rng.unit() < self.ch.loss {
             return;
@@ -231,6 +238,126 @@ fn run_oneway(payload: &[u8], ch: Channel, seed: u64, cfg: Config) -> Outcome {
             a.on_cell(&cell, now);
         }
         // 6. Fire timers.
+        a.on_timeout(now);
+        b.on_timeout(now);
+    }
+
+    Outcome {
+        received,
+        max_cwnd_a,
+        max_inflight_a,
+        final_a: a.debug_summary(),
+        final_b: b.debug_summary(),
+        a_events,
+        b_events,
+        steps,
+        elapsed_ms: now,
+        payload_received_ms,
+        completed,
+        tx_cells: a2b.injected,
+        max_burst_a,
+    }
+}
+
+/// Drive a one-way transfer with a deterministic A→B drop predicate. This lets
+/// tests model the live single-route failure shape: an early head DATA cell is
+/// lost while later tail cells and ACK/SACK traffic continue to flow.
+fn run_oneway_scripted_a2b_drop<F>(
+    payload: &[u8],
+    ch: Channel,
+    seed: u64,
+    cfg: Config,
+    mut drop: F,
+) -> Outcome
+where
+    F: FnMut(u64, &[u8]) -> bool,
+{
+    let mut rng = Rng::new(seed);
+    let mut a = StreamEngine::connect(1, cfg, 0, 1000);
+    let mut b = StreamEngine::accept(1, cfg, 0, 7000);
+    a.write(payload);
+    a.finish();
+
+    let mut a2b = Pipe::new(ch);
+    let mut b2a = Pipe::new(ch);
+    let mut received: Vec<u8> = Vec::new();
+    let mut a_events = Vec::new();
+    let mut b_events = Vec::new();
+    let mut max_cwnd_a = 0u32;
+    let mut max_inflight_a = 0u32;
+
+    let mut now = 0u64;
+    let mut steps = 0u64;
+    let cap = 20_000_000u64;
+    let mut completed = false;
+    let mut max_burst_a = 0u64;
+    let mut payload_received_ms = None;
+
+    while steps < cap {
+        steps += 1;
+        let mut buf = Vec::new();
+        let before = a2b.injected;
+        while a.poll_transmit(now, &mut buf) {
+            let force_drop = drop(now, &buf);
+            a2b.inject_with_drop(now, &buf, &mut rng, force_drop);
+        }
+        max_burst_a = max_burst_a.max(a2b.injected - before);
+        while b.poll_transmit(now, &mut buf) {
+            b2a.inject(now, &buf, &mut rng);
+        }
+        max_cwnd_a = max_cwnd_a.max(a.cwnd());
+        max_inflight_a = max_inflight_a.max(a.inflight_bytes());
+
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = b.read(&mut tmp);
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&tmp[..n]);
+            if received.len() == payload.len() && payload_received_ms.is_none() {
+                payload_received_ms = Some(now);
+            }
+        }
+        while let Some(e) = a.poll_event() {
+            a_events.push(e);
+        }
+        while let Some(e) = b.poll_event() {
+            b_events.push(e);
+        }
+
+        if received.len() == payload.len() && b.is_eof() && a.is_send_complete() {
+            completed = true;
+            break;
+        }
+        if a.is_closed() && a_events.iter().any(|e| matches!(e, Event::Reset(_))) {
+            break;
+        }
+        if b.is_closed() && b_events.iter().any(|e| matches!(e, Event::Reset(_))) {
+            break;
+        }
+
+        let mut next: Option<u64> = None;
+        let mut merge = |x: Option<u64>| {
+            if let Some(v) = x {
+                next = Some(next.map_or(v, |c: u64| c.min(v)));
+            }
+        };
+        merge(a2b.next_arrival());
+        merge(b2a.next_arrival());
+        merge(a.next_timeout());
+        merge(b.next_timeout());
+        let Some(t) = next else {
+            break;
+        };
+        now = now.max(t);
+
+        for cell in a2b.drain_due(now) {
+            b.on_cell(&cell, now);
+        }
+        for cell in b2a.drain_due(now) {
+            a.on_cell(&cell, now);
+        }
         a.on_timeout(now);
         b.on_timeout(now);
     }
@@ -470,6 +597,67 @@ fn circuit_profile_clean_path_exceeds_target_throughput() {
         out.max_burst_a <= 48,
         "clean circuit profile burst too large: {} cells",
         out.max_burst_a
+    );
+}
+
+#[test]
+fn circuit_profile_stubborn_head_hole_completes_without_reset() {
+    // Live single-route runs can lose an early DATA cell, deliver a large tail
+    // behind it, then lose the first repair too. The receiver then advertises a
+    // shrinking window because its out-of-order buffer is full of tail data. This
+    // scripted test gives us a cheap local reproduction target for that shape
+    // without requiring a phone + three relays for every recovery experiment.
+    let circuit_mss =
+        veil_onion_stream::MAX_CELL - 16 - 32 - veil_onion_stream::wire::DATA_OVERHEAD;
+    let cfg = Config {
+        mss: circuit_mss,
+        init_rto_ms: 12_000,
+        min_rto_ms: 10_000,
+        max_rto_ms: 60_000,
+        handshake_rto_ms: 6_000,
+        recv_window: 896 * 1024,
+        init_cwnd: (32 * circuit_mss) as u32,
+        max_pacing_batch: 12,
+        ack_every: 16,
+        ack_delay_ms: 5,
+        rto_rewind_no_sack: true,
+        ..Config::default()
+    };
+    let data = payload(4 * 1024 * 1024, 61);
+    let ch = Channel {
+        loss: 0.0,
+        dup: 0.0,
+        base_delay: 75,
+        jitter: 0,
+    };
+    let mut target_seq: Option<u32> = None;
+    let mut drops_left = 2usize;
+    let out = run_oneway_scripted_a2b_drop(&data, ch, 6161, cfg, |_, cell| {
+        let Some(Frame::Data { seq, .. }) = Frame::decode(cell) else {
+            return false;
+        };
+        let target =
+            *target_seq.get_or_insert(1000 + 1 + (512 * 1024 / circuit_mss * circuit_mss) as u32);
+        if seq == target && drops_left > 0 {
+            drops_left -= 1;
+            return true;
+        }
+        false
+    });
+    assert!(
+        out.completed,
+        "stubborn head-hole transfer did not complete in {} ms / {} steps; A={} B={}",
+        out.elapsed_ms, out.steps, out.final_a, out.final_b
+    );
+    assert_eq!(out.received, data);
+    assert!(
+        !out.a_events.iter().any(|e| matches!(e, Event::Reset(_))),
+        "sender reset under stubborn head-hole: {:?}",
+        out.a_events
+    );
+    eprintln!(
+        "stubborn head-hole circuit profile: payload_ms={:?} close={} tx_cells={} max_inflight={}",
+        out.payload_received_ms, out.elapsed_ms, out.tx_cells, out.max_inflight_a
     );
 }
 
