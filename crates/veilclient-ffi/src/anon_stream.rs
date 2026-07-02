@@ -298,13 +298,20 @@ const DEFAULT_STRIPE_RACK_REO_FLOOR_MS: u32 = 1_500;
 ///   * interleaved cells (round-robin): the reordering generates >=3 dup-ACKs
 ///     within the first RTT -> fast-retransmit recovery cuts ssthresh ~200 KB
 ///     -> congestion-avoidance crawl (~4x slowdown).
-/// Both collapse via the loss detector misreading reordering. Making this a
-/// real gain needs a reordering-tolerant / per-path-sequenced redesign (RACK
-/// time-threshold loss detection, or MPTCP-style per-subflow seq with a
-/// resequencing layer above) — a substantial CC change, not a knob. The
-/// negative result is deliberately preserved here so it is not re-attempted
-/// naively. (Earlier notes blamed rendezvous CookieClaimed; that was wrong —
-/// clean-seed runs reproduced the collapse with zero registration errors.)
+/// Both collapse via the loss detector misreading reordering. (Earlier notes
+/// blamed rendezvous CookieClaimed; that was wrong — clean-seed runs
+/// reproduced the collapse with zero registration errors.)
+///
+/// UPDATE (RACK, engine Config::rack default-on for circuits): the collapse
+/// is GONE — with time-threshold loss detection striped runs show zero
+/// spurious resends and never cut ssthresh (5-pair device A/B, 64 MiB).
+/// Striping is now SAFE to enable, but stays default-1 because it did not
+/// out-run single-route in healthy windows (median 14.2s vs 13.3s): the
+/// chain's funnel is the receiver-side R->receiver single obfs4/TCP flow
+/// (~12-14 MB/s), which one route already saturates, while striping adds a
+/// reorder-window delay. It DID dodge a degraded-route window (7.5s vs
+/// 36.3s), so it remains a deliberate opt-in for sender-uplink-limited or
+/// flaky-route scenarios — flipping it on requires nothing else now.
 const CIRCUIT_STRIPE_ROUTES_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_STRIPE_ROUTES";
 const ANDROID_STRIPE_ROUTES_PROP: &str = "debug.veil.onion_stream_stripe_routes";
 const DEFAULT_CIRCUIT_STRIPE_ROUTES: usize = 1;
