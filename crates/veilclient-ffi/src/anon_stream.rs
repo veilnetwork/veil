@@ -62,15 +62,22 @@ pub const STREAM_ENDPOINT_ID: u32 = 12;
 
 /// Gate for the PINNED STATEFUL-CIRCUIT stream path.
 ///
-/// Production-safe default is OFF: the stable datagram path remains the default
-/// unless a deployment explicitly opts into the pinned circuit. On Android,
-/// where process env is not normally injectable, the same values are also read
-/// from system property `debug.veil.onion_stream_circuit`. Values:
+/// Default is ON (published-rendezvous mode): the pinned circuit IS the
+/// production bulk path — it was opt-in only while experimental, and a
+/// distribution build launched without the soak harness's env then silently
+/// ran the legacy ~40 KB/s datagram path (live symptom: file transfers that
+/// never finish, while a soak-launched peer on the circuit backend cannot
+/// interoperate on bulk streams at all). Runtime fallback to the datagram
+/// path still happens automatically when no embedded node is present or the
+/// circuit backend fails to start. On Android, where process env is not
+/// normally injectable, the same values are also read from system property
+/// `debug.veil.onion_stream_circuit`. Values:
 ///
-/// - `1|true|yes|on|published|prod|production`: resolve published rendezvous ads
-///   and build per-peer circuits to the receiver's R (normal path).
-/// - `validation|legacy|min-routing`: old test-net shortcut where both endpoints
-///   independently pick `min(routing)` as R.
+/// - unset / `1|true|yes|on|published|prod|production`: resolve published
+///   rendezvous ads and build per-peer circuits to the receiver's R.
+/// - `validation|legacy|min-routing`: old test-net shortcut where both
+///   endpoints independently pick `min(routing)` as R.
+/// - anything else (`0|off|false|datagram|…`): force the datagram path.
 ///
 /// Both peers must agree.
 const CIRCUIT_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT";
@@ -80,7 +87,6 @@ const CIRCUIT_PREFER_RENDEZVOUS_ENV: &str = "VEIL_ONION_STREAM_PREFER_RENDEZVOUS
 // transfers without session resets. Operators can still override this order via
 // VEIL_ONION_STREAM_PREFER_RENDEZVOUS / debug.veil.onion_stream_prefer_rendezvous.
 const CIRCUIT_TEST_STAND_PREFERRED_RENDEZVOUS_PREFIX: &str = "3d3575c9";
-#[cfg(target_os = "android")]
 const ANDROID_CIRCUIT_PROP: &str = "debug.veil.onion_stream_circuit";
 const ANDROID_PREFER_RENDEZVOUS_PROP: &str = "debug.veil.onion_stream_prefer_rendezvous";
 
@@ -90,12 +96,16 @@ enum CircuitMode {
     ValidationMinRouting,
 }
 
-/// Whether/how to attempt the pinned-circuit backend (default OFF; opt in via env).
+/// Whether/how to attempt the pinned-circuit backend (default ON; an explicit
+/// env/property value can force a mode or the datagram path — see CIRCUIT_ENV).
 fn circuit_mode() -> Option<CircuitMode> {
-    std::env::var(CIRCUIT_ENV)
+    match std::env::var(CIRCUIT_ENV)
         .ok()
-        .and_then(|v| circuit_env_value_mode(&v))
-        .or_else(android_circuit_property_mode)
+        .or_else(|| android_string_property(ANDROID_CIRCUIT_PROP))
+    {
+        Some(v) => circuit_env_value_mode(&v),
+        None => Some(CircuitMode::PublishedRendezvous),
+    }
 }
 
 fn circuit_env_value_mode(v: &str) -> Option<CircuitMode> {
@@ -108,16 +118,6 @@ fn circuit_env_value_mode(v: &str) -> Option<CircuitMode> {
         }
         _ => None,
     }
-}
-
-#[cfg(not(target_os = "android"))]
-fn android_circuit_property_mode() -> Option<CircuitMode> {
-    None
-}
-
-#[cfg(target_os = "android")]
-fn android_circuit_property_mode() -> Option<CircuitMode> {
-    android_system_property(ANDROID_CIRCUIT_PROP).and_then(|value| circuit_env_value_mode(&value))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -2282,9 +2282,9 @@ pub struct AnonStreamHub {
 impl AnonStreamHub {
     /// Build over a freshly-bound stream endpoint's `sender` + raw inbound
     /// datagram channel `msg_rx`. `me` = this node id. MUST be called inside the
-    /// tokio runtime. Opts into the pinned-circuit backend when
-    /// `VEIL_ONION_STREAM_CIRCUIT` is set AND an embedded node is present AND a
-    /// rendezvous relay is resolvable; otherwise the datagram path (no regression).
+    /// tokio runtime. Uses the pinned-circuit backend by default when an embedded
+    /// node is present and a rendezvous relay is resolvable (override via
+    /// `VEIL_ONION_STREAM_CIRCUIT`); otherwise the datagram path (no regression).
     pub fn new(me: [u8; 32], sender: AppSender, msg_rx: mpsc::Receiver<IncomingMessage>) -> Self {
         let sender = Arc::new(sender);
         let (in_tx, in_rx) = mpsc::channel(1024);
