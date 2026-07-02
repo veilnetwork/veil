@@ -43,6 +43,28 @@ pub trait CellDuplex: Send {
         }
     }
     fn recv_cell(&mut self) -> impl Future<Output = io::Result<Option<Vec<u8>>>> + Send;
+    /// Receive at least one cell, draining up to `max` already-buffered cells
+    /// into `out` without extra wakeups. Returns the number received; `0`
+    /// means the carrier is closed. Must be cancel-safe (used in `select!`).
+    /// The default forwards one cell per call; channel-backed carriers should
+    /// override with a batched receive so the driver processes inbound bursts
+    /// in one loop turn instead of one full turn per cell.
+    fn recv_cells(
+        &mut self,
+        out: &mut Vec<Vec<u8>>,
+        max: usize,
+    ) -> impl Future<Output = io::Result<usize>> + Send {
+        async move {
+            let _ = max;
+            match self.recv_cell().await? {
+                Some(cell) => {
+                    out.push(cell);
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+    }
     fn on_data_rto(
         &mut self,
         stream_id: u32,
@@ -327,6 +349,11 @@ const SEND_WOULD_BLOCK_RETRY_MS: u64 = 1;
 /// already bounds one poll pass (<= max_pacing_batch); this is a backstop so
 /// a stuck carrier cannot accumulate unbounded committed cells locally.
 const MAX_OUTBOUND_BURST: usize = 512;
+/// Upper bound on inbound cells drained per loop turn. The relay splice can
+/// legitimately deliver hundreds of cells in one scheduler burst; processing
+/// them in one turn (one ACK/transmit pass) instead of one full loop turn per
+/// cell is where the receive-side batching win comes from.
+const MAX_RX_BURST: usize = 256;
 const DEBUG_SUMMARY_ENV: &str = "VEIL_ONION_STREAM_DEBUG_SUMMARY_MS";
 
 fn debug_summary_period_ms(configured: u64) -> Option<u64> {
@@ -366,6 +393,8 @@ async fn drive<D: CellDuplex>(
     let mut next_debug_summary_ms = debug_summary_period_ms.unwrap_or(0);
     let mut cmd_open = true;
     let mut cell = Vec::with_capacity(crate::wire::MAX_CELL);
+    // Inbound burst buffer for `recv_cells` — reused across loop turns.
+    let mut rx_cells: Vec<Vec<u8>> = Vec::new();
     // Cells the engine has committed to flight but the carrier has not yet
     // accepted (batch in progress or local backpressure). FIFO preserves the
     // engine's emission order.
@@ -516,10 +545,13 @@ async fn drive<D: CellDuplex>(
                     None => { cmd_open = false; engine.finish(); } // handle dropped → finish send
                 }
             }
-            inbound = duplex.recv_cell() => {
+            inbound = duplex.recv_cells(&mut rx_cells, MAX_RX_BURST) => {
                 match inbound {
-                    Ok(Some(c)) => { let n = now_ms(&base); engine.on_cell(&c, n); }
-                    Ok(None) | Err(_) => { engine.reset(reset_reason::TIMED_OUT); } // circuit closed
+                    Ok(n) if n > 0 => {
+                        let now = now_ms(&base);
+                        for c in rx_cells.drain(..) { engine.on_cell(&c, now); }
+                    }
+                    Ok(_) | Err(_) => { engine.reset(reset_reason::TIMED_OUT); } // circuit closed
                 }
             }
             () = wait_until(&base, timeout_at) => {
