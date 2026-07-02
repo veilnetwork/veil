@@ -206,12 +206,21 @@ fn short_cookie(cookie: &[u8; COOKIE_LEN]) -> String {
 }
 
 /// Smaller MSS for the circuit path so the onion-stream cell + the
-/// `[cookie 16][peer_tag 32]` splice envelope fit one 384-B CircuitData cell.
+/// `[cookie 16][peer_tag 32]` splice envelope exactly fill one fixed
+/// CircuitData cell (4096-B since the 2026-07-02 flag-day bump).
 const CIRCUIT_PEER_TAG_LEN: usize = 32;
 const CIRCUIT_MSS: usize = veil_onion_stream::wire::MAX_CELL
     - COOKIE_LEN
     - CIRCUIT_PEER_TAG_LEN
-    - veil_onion_stream::wire::DATA_OVERHEAD; // 318 B payload, exactly fills 382-B inner
+    - veil_onion_stream::wire::DATA_OVERHEAD;
+// The onion-stream crate is transport-agnostic, so its MAX_CELL cannot
+// reference veil-anonymity directly; hold the tie here where both crates are
+// visible. The send path caps every splice envelope (cookie + tag + stream
+// cell) at MAX_CELL, so MAX_CELL must not exceed what the circuit's fixed
+// inner payload accepts. A max-size DATA envelope fills it exactly:
+// COOKIE(16) + TAG(32) + DATA_OVERHEAD(16) + CIRCUIT_MSS == MAX_CELL.
+const _: () =
+    assert!(veil_onion_stream::wire::MAX_CELL <= veil_anonymity::circuit_data::MAX_CIRCUIT_INNER);
 const CIRCUIT_INTRO_MARKER: u8 = 0xA7;
 const CIRCUIT_INTRO_PLAINTEXT_MAGIC: &[u8; 16] = b"xveil-stream-v1!";
 const CIRCUIT_INTRO_PLAINTEXT_LEN: usize = 16 + CIRCUIT_PEER_TAG_LEN + 32;

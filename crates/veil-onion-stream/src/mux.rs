@@ -93,9 +93,9 @@ pub trait CellSender: Send + Sync + 'static {
 /// stream cells in one scheduler burst (session-frame batching + relay splice).
 /// A 256-cell inbox turned those healthy bursts into artificial loss before the
 /// stream driver got scheduled, which then cascaded into coarse RTO recovery.
-/// 4096 cells is ~1.5 MiB of fixed-size circuit payload worst-case per active
-/// stream and matches the session outbox/PQ burst budget.
-const STREAM_INBOX: usize = 4096;
+/// With the 4 KiB cell (2026-07-02 bump) 1024 cells is ~4 MiB worst-case per
+/// active stream — one full receive window.
+const STREAM_INBOX: usize = 1024;
 /// Pending not-yet-accepted inbound streams.
 const ACCEPT_BACKLOG: usize = 64;
 
