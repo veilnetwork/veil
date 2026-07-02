@@ -231,6 +231,13 @@ struct TxState {
     /// Estimate at the last plateau check and consecutive no-growth rounds.
     bbr_bw_at_probe: u64,
     bbr_stall_rounds: u8,
+    /// Last time the STARTUP plateau was evaluated. Stored bw samples arrive
+    /// as fast as every [`BBR_BW_SAMPLE_SPACING_MS`] while the estimate itself
+    /// is a sliding-window AVERAGE that needs seconds to reflect a rate
+    /// doubling — checking "no growth" per sample burned the 3-round budget in
+    /// ~300ms and exited STARTUP far below capacity (live: plateaus at ~3 MB/s
+    /// on a ~6 MB/s path). Classic BBR checks once per round trip; do the same.
+    bbr_probe_checked_ms: u64,
     /// Windowed minimum round-trip time (ms) and the time it was recorded.
     rtt_min: Option<(u32, u64)>,
 }
@@ -333,6 +340,7 @@ impl StreamEngine {
                 bbr_startup: true,
                 bbr_bw_at_probe: 0,
                 bbr_stall_rounds: 0,
+                bbr_probe_checked_ms: 0,
                 rtt_min: None,
             },
             rx: RxState {
@@ -1367,16 +1375,25 @@ impl TxState {
             .max()
             .unwrap_or(0);
         // STARTUP plateau detection (classic BBR shape): stay at 2x pacing
-        // gain until the estimate stops growing >=25% for three stored
-        // samples, then drop to the steady 5/4 probe gain.
+        // gain until the estimate stops growing >=25% for three ROUND TRIPS,
+        // then drop to the steady 5/4 probe gain. The cadence must be a round
+        // trip (not a stored sample): samples land every ~100ms while the
+        // windowed-average estimate needs a couple of seconds to reflect a
+        // rate doubling, so a per-sample check spent its 3-stall budget in
+        // ~300ms of estimator LAG and exited STARTUP at half the path rate
+        // (live: stuck at ~3 MB/s on a path whose probe later reached ~6).
         if self.bbr_startup && store {
-            if self.btl_bw > self.bbr_bw_at_probe.saturating_mul(5) / 4 {
-                self.bbr_bw_at_probe = self.btl_bw;
-                self.bbr_stall_rounds = 0;
-            } else {
-                self.bbr_stall_rounds = self.bbr_stall_rounds.saturating_add(1);
-                if self.bbr_stall_rounds >= 3 {
-                    self.bbr_startup = false;
+            let round_ms = (self.srtt.unwrap_or(0) as u64).max(BBR_MIN_SPAN_MS);
+            if now >= self.bbr_probe_checked_ms.saturating_add(round_ms) {
+                self.bbr_probe_checked_ms = now;
+                if self.btl_bw > self.bbr_bw_at_probe.saturating_mul(5) / 4 {
+                    self.bbr_bw_at_probe = self.btl_bw;
+                    self.bbr_stall_rounds = 0;
+                } else {
+                    self.bbr_stall_rounds = self.bbr_stall_rounds.saturating_add(1);
+                    if self.bbr_stall_rounds >= 3 {
+                        self.bbr_startup = false;
+                    }
                 }
             }
         }
@@ -1394,8 +1411,9 @@ impl TxState {
         }
     }
 
-    /// Effective-window cap at 2x the measured bandwidth-delay product, once
-    /// both estimates exist. `None` (startup / bbr off) means no extra cap.
+    /// Effective-window cap at a small multiple of the measured bandwidth-
+    /// delay product, once both estimates exist. `None` (startup / bbr off)
+    /// means no extra cap.
     fn bbr_window_cap(&self, cfg: &Config) -> Option<u32> {
         if !cfg.bbr || self.btl_bw == 0 || self.delivered < BBR_ENGAGE_DELIVERED {
             return None;
@@ -1403,7 +1421,14 @@ impl TxState {
         let (rtt_min, _) = self.rtt_min?;
         let bdp = self.btl_bw.saturating_mul(rtt_min as u64) / 1000;
         let floor = (cfg.init_cwnd as u64).max(64 * cfg.mss as u64);
-        Some(bdp.saturating_mul(2).clamp(floor, u32::MAX as u64) as u32)
+        // STARTUP paces at 2x the estimate; sustaining that probe needs
+        // 2x btl_bw x srtt of flight, and with live srtt a notch above rtt_min
+        // a 2x-BDP cap starves the very probe that is supposed to discover the
+        // path rate (classic BBR runs cwnd_gain ~2.89 in STARTUP for the same
+        // reason). Steady state keeps the tight 2x cap that bounds the
+        // standing queue.
+        let gain = if self.bbr_startup { 3 } else { 2 };
+        Some(bdp.saturating_mul(gain).clamp(floor, u32::MAX as u64) as u32)
     }
 
     fn update_rto(&mut self, r_ms: u32, cfg: &Config) {
@@ -1581,14 +1606,67 @@ mod tests {
         e.tx.btl_bw = 3 * 1024 * 1024; // 3 MiB/s
         e.tx.delivered = BBR_ENGAGE_DELIVERED; // model warm
         e.tx.rtt_min = Some((200, 0)); // 200ms propagation
-        // BDP = 3 MiB/s * 0.2s = 614.4 KiB; cap = 2x.
-        let cap = e.tx.bbr_window_cap(&e.cfg).expect("model warm");
         let bdp = 3 * 1024 * 1024 * 200 / 1000;
+        // While STARTUP still probes at 2x pacing, the cap must leave the
+        // probe headroom (3x BDP).
+        assert_eq!(e.tx.bbr_window_cap(&e.cfg), Some(3 * bdp));
+        // Steady state: BDP = 3 MiB/s * 0.2s = 614.4 KiB; cap = 2x.
+        e.tx.bbr_startup = false;
+        let cap = e.tx.bbr_window_cap(&e.cfg).expect("model warm");
         assert_eq!(cap, 2 * bdp);
         assert_eq!(e.effective_send_window(), cap);
         // Without estimates the cap must vanish (startup behaves classically).
         e.tx.btl_bw = 0;
         assert_eq!(e.effective_send_window(), e.tx.cwnd.min(e.tx.rwnd));
+    }
+
+    #[test]
+    fn bbr_startup_survives_estimator_lag_and_exits_on_a_real_plateau() {
+        let cfg = Config {
+            bbr: true,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 10_000);
+        e.tx.srtt = Some(150);
+        // Exponential ramp: the delivery rate doubles every 300ms round trip
+        // (what 2x STARTUP pacing produces on an uncongested path), from
+        // 500 KB/s up to a 6 MB/s ceiling, sampled in 20ms delivery steps.
+        // The windowed-average estimator lags a doubling by ~a window, so a
+        // per-sample plateau check would see three "no growth" samples within
+        // ~300ms and bail out of STARTUP mid-climb; the per-round-trip check
+        // must ride the whole ramp.
+        let rate_at = |t_ms: u64| -> u64 {
+            let doublings = (t_ms as f64) / 300.0;
+            ((500_000.0_f64) * doublings.exp2()).min(6_000_000.0) as u64
+        };
+        let mut t = 0u64;
+        let mut climb_exit: Option<u64> = None;
+        while t < 3_000 {
+            t += 20;
+            let bytes = rate_at(t) * 20 / 1000;
+            e.tx.bbr_on_delivered(bytes as u32, t);
+            if !e.tx.bbr_startup && climb_exit.is_none() && rate_at(t) < 6_000_000 {
+                climb_exit = Some(t);
+            }
+        }
+        assert_eq!(
+            climb_exit, None,
+            "STARTUP exited mid-climb at t={climb_exit:?} (estimator lag misread as a plateau)"
+        );
+        // Hold the ceiling: the estimate converges and STARTUP must now exit.
+        while t < 8_000 {
+            t += 20;
+            e.tx.bbr_on_delivered((6_000_000u64 * 20 / 1000) as u32, t);
+        }
+        assert!(
+            !e.tx.bbr_startup,
+            "STARTUP never exited on a genuine plateau"
+        );
+        assert!(
+            e.tx.btl_bw > 4_500_000,
+            "estimate should be near the 6 MB/s ceiling, got {}",
+            e.tx.btl_bw
+        );
     }
 
     #[test]
