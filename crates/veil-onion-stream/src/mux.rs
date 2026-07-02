@@ -24,6 +24,7 @@ use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -93,14 +94,51 @@ pub trait CellSender: Send + Sync + 'static {
 /// stream cells in one scheduler burst (session-frame batching + relay splice).
 /// A 256-cell inbox turned those healthy bursts into artificial loss before the
 /// stream driver got scheduled, which then cascaded into coarse RTO recovery.
-/// With the 4 KiB cell (2026-07-02 bump) 1024 cells is ~4 MiB worst-case per
-/// active stream — one full receive window.
-const STREAM_INBOX: usize = 1024;
+/// With the 4 KiB cell (2026-07-02 bump) 2048 cells is ~8 MiB worst-case per
+/// active stream — one full receive window (the advert grew alongside the
+/// post-BBR-fix ~12 MB/s single-stream rate; the channel allocates lazily, so
+/// the worst case is only reached when that much really is in flight).
+const STREAM_INBOX: usize = 2048;
 /// Pending not-yet-accepted inbound streams.
 const ACCEPT_BACKLOG: usize = 64;
 
 type StreamKey = (Peer, u32);
 type Routes = Arc<Mutex<HashMap<StreamKey, mpsc::Sender<Vec<u8>>>>>;
+
+/// Per-peer final delivery models `(btl_bw B/s, rtt_min ms, recorded)` from
+/// closed streams, used to warm-start the next stream's BBR estimator (see
+/// `Config::warm_btl_bw`). The cold estimator climb costs seconds per stream;
+/// ranged bulk pulls open a fresh stream per range and paid it every time.
+type BwCache = Arc<Mutex<HashMap<Peer, (u64, u32, Instant)>>>;
+
+/// Ignore cached delivery models older than this — path conditions drift and
+/// a warm seed is a head start, not a promise (the estimator's own windowed
+/// filters correct a stale seed within seconds either way).
+const BW_CACHE_TTL: Duration = Duration::from_secs(600);
+/// Only streams that moved real bulk update the cache: a short control stream
+/// measures the pacer, not the path.
+const BW_CACHE_MIN_DELIVERED: u64 = 2 * 1024 * 1024;
+/// Seed at half the measured rate: cheap insurance against a degraded path,
+/// while the 5/4 probe gain recovers the other half within a couple of
+/// bandwidth windows.
+const BW_CACHE_SEED_NUM: u64 = 1;
+const BW_CACHE_SEED_DEN: u64 = 2;
+
+/// Apply a fresh cached model (if any) to a per-stream config.
+fn warm_config(cfg: Config, cache: &BwCache, peer: Peer) -> Config {
+    let mut cfg = cfg;
+    if !cfg.bbr {
+        return cfg;
+    }
+    let g = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(&(bw, rtt_min_ms, at)) = g.get(&peer)
+        && at.elapsed() <= BW_CACHE_TTL
+    {
+        cfg.warm_btl_bw = bw.saturating_mul(BW_CACHE_SEED_NUM) / BW_CACHE_SEED_DEN;
+        cfg.warm_rtt_min_ms = rtt_min_ms;
+    }
+    cfg
+}
 
 /// A [`CellDuplex`] for one muxed stream: sends to a fixed peer via the shared
 /// sender, receives from its demux channel. Deregisters its route on drop.
@@ -109,6 +147,7 @@ struct MuxDuplex<S: CellSender> {
     peer: Addr,
     key: StreamKey,
     routes: Routes,
+    bw_cache: BwCache,
     inbound_rx: mpsc::Receiver<Vec<u8>>,
 }
 
@@ -138,6 +177,21 @@ impl<S: CellSender> CellDuplex for MuxDuplex<S> {
             .on_stream_closed(self.peer, stream_id, end)
             .await;
     }
+    async fn on_stream_model(
+        &mut self,
+        _stream_id: u32,
+        btl_bw: u64,
+        rtt_min_ms: u32,
+        delivered: u64,
+    ) {
+        if btl_bw == 0 || delivered < BW_CACHE_MIN_DELIVERED {
+            return;
+        }
+        self.bw_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(self.peer.node, (btl_bw, rtt_min_ms, Instant::now()));
+    }
 }
 
 impl<S: CellSender> Drop for MuxDuplex<S> {
@@ -157,6 +211,7 @@ pub struct StreamMux<S: CellSender> {
     sender: Arc<S>,
     cfg: Config,
     routes: Routes,
+    bw_cache: BwCache,
     next_id: Arc<AtomicU32>,
     accept_rx: AsyncMutex<mpsc::Receiver<(OnionStream, Addr)>>,
 }
@@ -172,11 +227,13 @@ impl<S: CellSender> StreamMux<S> {
         cfg: Config,
     ) -> Self {
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let bw_cache: BwCache = Arc::new(Mutex::new(HashMap::new()));
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_BACKLOG);
         tokio::spawn(demux(
             sender.clone(),
             inbound,
             routes.clone(),
+            bw_cache.clone(),
             accept_tx,
             cfg,
         ));
@@ -185,6 +242,7 @@ impl<S: CellSender> StreamMux<S> {
             sender,
             cfg,
             routes,
+            bw_cache,
             next_id: Arc::new(AtomicU32::new(1)),
             accept_rx: AsyncMutex::new(accept_rx),
         }
@@ -209,9 +267,11 @@ impl<S: CellSender> StreamMux<S> {
             peer,
             key,
             routes: self.routes.clone(),
+            bw_cache: self.bw_cache.clone(),
             inbound_rx: rx,
         };
-        OnionStream::connect(duplex, self.cfg, sid, initial_seq(sid))
+        let cfg = warm_config(self.cfg, &self.bw_cache, peer.node);
+        OnionStream::connect(duplex, cfg, sid, initial_seq(sid))
     }
 
     /// Accept the next inbound stream a peer opened to us, or `None` if the
@@ -236,6 +296,7 @@ async fn demux<S: CellSender>(
     sender: Arc<S>,
     mut inbound: mpsc::Receiver<(Addr, Vec<u8>)>,
     routes: Routes,
+    bw_cache: BwCache,
     accept_tx: mpsc::Sender<(OnionStream, Addr)>,
     cfg: Config,
 ) {
@@ -290,8 +351,13 @@ async fn demux<S: CellSender>(
                 peer: src,
                 key,
                 routes: routes.clone(),
+                bw_cache: bw_cache.clone(),
                 inbound_rx: rx,
             };
+            // The accept side is the bulk SENDER in a ranged pull (the peer
+            // opens a stream and we serve the payload), so it needs the warm
+            // seed at least as much as the open side.
+            let cfg = warm_config(cfg, &bw_cache, src.node);
             let stream = OnionStream::accept(duplex, cfg, key.1, initial_seq(key.1));
             if accept_tx.send((stream, src)).await.is_err() {
                 return; // nobody is accepting anymore
@@ -303,6 +369,46 @@ async fn demux<S: CellSender>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_config_seeds_from_fresh_cache_only() {
+        let cache: BwCache = Arc::new(Mutex::new(HashMap::new()));
+        let peer = [7u8; 32];
+        let base = Config {
+            bbr: true,
+            ..Config::default()
+        };
+        // Empty cache → cold.
+        assert_eq!(warm_config(base, &cache, peer).warm_btl_bw, 0);
+        // Fresh entry → half-rate seed + rtt.
+        cache
+            .lock()
+            .unwrap()
+            .insert(peer, (8_000_000, 150, Instant::now()));
+        let warmed = warm_config(base, &cache, peer);
+        assert_eq!(warmed.warm_btl_bw, 4_000_000);
+        assert_eq!(warmed.warm_rtt_min_ms, 150);
+        // Stale entry → cold again.
+        cache.lock().unwrap().insert(
+            peer,
+            (
+                8_000_000,
+                150,
+                Instant::now() - (BW_CACHE_TTL + Duration::from_secs(1)),
+            ),
+        );
+        assert_eq!(warm_config(base, &cache, peer).warm_btl_bw, 0);
+        // bbr off → never seeded.
+        let no_bbr = Config {
+            bbr: false,
+            ..Config::default()
+        };
+        cache
+            .lock()
+            .unwrap()
+            .insert(peer, (8_000_000, 150, Instant::now()));
+        assert_eq!(warm_config(no_bbr, &cache, peer).warm_btl_bw, 0);
+    }
 
     /// In-memory bus: each node's inbound-cell sink, keyed by node id.
     type Bus = Arc<Mutex<HashMap<Peer, mpsc::Sender<(Addr, Vec<u8>)>>>>;
