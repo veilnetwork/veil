@@ -2020,10 +2020,10 @@ mod tests {
         e.tx.cwnd = 2_000_000;
         e.tx.ssthresh = 2_000_000;
         e.tx.snd_una = 40_000;
-        e.tx.snd_nxt = e.tx.snd_una + 1024 * mss;
+        e.tx.snd_nxt = e.tx.snd_una + 256 * mss;
         e.tx.rto_deadline = Some(100);
-        for i in 0..1024 {
-            let missing_hole = i % 64 == 0;
+        for i in 0..256 {
+            let missing_hole = i % 16 == 0;
             e.tx.segs.push_back(Seg {
                 seq: e.tx.snd_una + i * mss,
                 data: vec![i as u8; MSS],
@@ -2037,7 +2037,7 @@ mod tests {
 
         e.on_timeout(100);
 
-        assert_eq!(e.tx.ssthresh, 1024 * mss / 2);
+        assert_eq!(e.tx.ssthresh, 256 * mss / 2);
         assert_eq!(e.tx.cwnd, e.tx.ssthresh);
         assert!(
             !e.tx.segs.is_empty(),
@@ -2068,10 +2068,10 @@ mod tests {
         e.tx.cwnd = 2_000_000;
         e.tx.ssthresh = 2_000_000;
         e.tx.snd_una = 40_000;
-        e.tx.snd_nxt = e.tx.snd_una + 1024 * mss;
+        e.tx.snd_nxt = e.tx.snd_una + 256 * mss;
         e.tx.rto_deadline = Some(100);
-        for i in 0..1024 {
-            let missing_hole = i % 64 == 0;
+        for i in 0..256 {
+            let missing_hole = i % 16 == 0;
             e.tx.segs.push_back(Seg {
                 seq: e.tx.snd_una + i * mss,
                 data: vec![i as u8; MSS],
@@ -2085,7 +2085,7 @@ mod tests {
 
         e.on_timeout(100);
 
-        assert_eq!(e.tx.ssthresh, (1024 * mss * 3) / 4);
+        assert_eq!(e.tx.ssthresh, (256 * mss * 3) / 4);
         assert_eq!(e.tx.cwnd, e.tx.ssthresh);
         assert!(
             e.tx.segs.iter().any(|s| s.needs_resend),

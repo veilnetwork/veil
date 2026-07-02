@@ -37,7 +37,14 @@ use crate::circuit_setup::CIRCUIT_KEY_LEN;
 /// 318-byte MSS), not bandwidth. A ~10.7x larger cell cuts the per-byte
 /// overhead by the same factor. BREAKING: every relay and client on a network
 /// must agree on this constant (each hop validates the fixed size).
-pub const CIRCUIT_PAYLOAD_BYTES: usize = 4096;
+///
+/// 2026-07-02 second bump 4096 -> 16384: the next ceiling was still per-cell
+/// work, now on the RELAY (~90% of one vCPU at ~12 MB/s splice = ~3k cells/s
+/// each way) and in the local stack benchmark (19.3 MiB/s loopback). 4x fewer
+/// cells per byte cuts both. Cost: small control/chat sends still pad to one
+/// uniform cell, now 16 KiB on the wire — accepted for the same uniformity
+/// reason as the first bump.
+pub const CIRCUIT_PAYLOAD_BYTES: usize = 16384;
 /// Length-prefix width inside the fixed payload (`[len u16 BE][bytes][pad]`).
 const LEN_PREFIX: usize = 2;
 /// Largest real payload that fits one fixed cell.
