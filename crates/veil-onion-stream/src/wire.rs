@@ -16,14 +16,15 @@ pub const PROTO_VER: u8 = 1;
 /// Max opaque bytes the circuit carries in one cell (`MAX_CIRCUIT_INNER`).
 /// Tracks veil-anonymity's `CIRCUIT_PAYLOAD_BYTES - 2` (this crate stays
 /// transport-agnostic, so the tie is by convention; veilclient-ffi holds a
-/// compile-time assert). 2026-07-02: bumped with the circuit cell 384 -> 4096.
-pub const MAX_CELL: usize = 4094;
+/// compile-time assert). 2026-07-02: bumped with the circuit cell
+/// 384 -> 4096 -> 16384.
+pub const MAX_CELL: usize = 16382;
 
 /// `DATA` fixed overhead: `ver+type(2) + stream_id(4) + seq(4) + win(4) + len(2)`.
 pub const DATA_OVERHEAD: usize = 16;
 
 /// Max stream payload bytes per `DATA` cell — the stream MSS.
-pub const MSS: usize = MAX_CELL - DATA_OVERHEAD; // 4078
+pub const MSS: usize = MAX_CELL - DATA_OVERHEAD; // 16366
 
 /// Max selective-ACK ranges in one `ACK` frame (15 + 8·8 = 79 B ≤ MAX_CELL).
 pub const MAX_SACKS: usize = 8;
