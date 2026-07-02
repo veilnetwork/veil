@@ -255,6 +255,8 @@ const ANDROID_BULK_ROUTE_ACTIVE_LIMIT_PROP: &str =
     "debug.veil.onion_stream_bulk_route_active_limit";
 const ANDROID_MAX_PACING_BATCH_PROP: &str = "debug.veil.onion_stream_max_pacing_batch";
 const ANDROID_DATA_PACE_US_PROP: &str = "debug.veil.onion_stream_data_pace_us";
+const CIRCUIT_BBR_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_BBR";
+const ANDROID_BBR_PROP: &str = "debug.veil.onion_stream_bbr";
 const DEFAULT_DATA_PACE_US: u64 = 100;
 const DEFAULT_CIRCUIT_DATA_PACE_US: u64 = 50;
 const MIN_DATA_PACE_US: u64 = 10;
@@ -2096,6 +2098,11 @@ impl AnonStreamHub {
             0
         };
         let loss_decrease_per_mille = if is_circuit { 750 } else { 500 };
+        // BBR-lite queue shaping (see engine Config::bbr). Circuit-only and
+        // default ON: the loss-free pinned circuit otherwise parks a full
+        // receive window in sender-side queues (live srtt ~2.3s of pure
+        // queueing), which slows RTO/loss detection and route failover.
+        let bbr = is_circuit && env_or_android_u32(CIRCUIT_BBR_ENV, ANDROID_BBR_PROP, 1, 0, 1) == 1;
         if is_circuit {
             let outbound_pool = match &cells {
                 HubCells::Circuit(c) => c.outbound_pool_target,
@@ -2117,7 +2124,7 @@ impl AnonStreamHub {
                  batch={max_pacing_batch} rto={init_rto_ms}/{min_rto_ms}/{max_rto_ms}ms \
                  max_retx={max_retransmits} outbound_pool={outbound_pool} ack_pool={ack_pool} \
                  bulk_route_active_limit={bulk_route_limit} \
-                 loss_beta={loss_decrease_per_mille}/1000 \
+                 loss_beta={loss_decrease_per_mille}/1000 bbr={bbr} \
                  debug_summary={debug_summary_ms}ms",
                 ),
             );
@@ -2140,6 +2147,7 @@ impl AnonStreamHub {
             max_pacing_batch,
             rto_rewind_no_sack: is_circuit,
             loss_decrease_per_mille,
+            bbr,
             // Every ACK consumes the same fixed-size circuit cell as DATA.
             // The pinned path is loss-free/in-order, so cumulative ACKs can be
             // thinned without delaying loss signalling: gaps and duplicates
