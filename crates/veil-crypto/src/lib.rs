@@ -22,5 +22,7 @@ pub use pow::{
     PowStopReason, available_thread_count, default_nonce_base64, pow_score, reset_interrupt_flag,
     search_nonce,
 };
-pub use signature::{GeneratedKeyPair, generate_keypair, sign_message, verify_message};
+pub use signature::{
+    GeneratedKeyPair, ed25519_keypair_from_seed, generate_keypair, sign_message, verify_message,
+};
 pub use types::{Base64Nonce, Base64PrivateKey, Base64PublicKey};

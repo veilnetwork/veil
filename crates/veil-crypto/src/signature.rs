@@ -46,6 +46,18 @@ impl std::fmt::Debug for GeneratedKeyPair {
     }
 }
 
+/// Deterministic Ed25519 keypair from a 32-byte SK seed (e.g. an HKDF-derived
+/// seed — see `identity::derive_onion_reg_seed`). Same encoding as
+/// [`generate_keypair`]; the caller owns the seed's derivation domain.
+pub fn ed25519_keypair_from_seed(seed: &[u8; 32]) -> GeneratedKeyPair {
+    let signing_key = SigningKey::from_bytes(seed);
+    GeneratedKeyPair {
+        algo: SignatureAlgorithm::Ed25519,
+        public_key: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        private_key: STANDARD.encode(signing_key.to_bytes()),
+    }
+}
+
 pub fn generate_keypair(algo: SignatureAlgorithm) -> GeneratedKeyPair {
     match algo {
         SignatureAlgorithm::Ed25519 => {
