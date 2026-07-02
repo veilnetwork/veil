@@ -702,6 +702,22 @@ int veilRestoreIdentityFromPhraseZeroizeWithPassword(
         password == nullptr ? 0 : password.length,
         errOut);
 
+// ── Native SHA-256 (content-manifest hashing) ───────────────────────────────
+
+final int Function(
+  Pointer<Uint8>, // data
+  int, // len
+  Pointer<Uint8>, // out32
+) veilSha256Raw = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+            )>>('veil_sha256')
+    .asFunction();
+
 // ── Push-envelope sealing (Epic 489.10) ─────────────────────────────────────
 
 /// Per-envelope wire overhead (eph_pk + nonce + tag).  Mirrors

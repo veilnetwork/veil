@@ -4649,6 +4649,35 @@ pub const VEIL_MAX_PUSH_TOKEN_LEN: size_t = 384;
 /// Hard cap on sealed envelope length (mirrors MAX_PUSH_ENVELOPE_LEN).
 pub const VEIL_MAX_PUSH_ENVELOPE_LEN: size_t = 512;
 
+/// SHA-256 of `data` (`len` bytes) written to the caller-owned 32-byte
+/// buffer `out32`.  Stateless — does not need a `VeilHandle`.  Exposed for
+/// the app's content-manifest hashing: Dart's pure `package:crypto` digest
+/// runs at ~35 MB/s on a phone, so hashing a large file before its offer
+/// dominated the send latency; the native digest is ~30-50x faster.
+/// Returns [`VEIL_OK`] or [`VEIL_ERR_INVALID_ARG`].
+///
+/// # Safety
+///
+/// `data` must point to `len` readable bytes (or be NULL only when `len`
+/// is 0).  `out32` MUST point to at least 32 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_sha256(data: *const u8, len: size_t, out32: *mut u8) -> c_int {
+    use sha2::{Digest as _, Sha256};
+    if out32.is_null() || (data.is_null() && len > 0) {
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let input: &[u8] = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }
+    };
+    let digest = Sha256::digest(input);
+    unsafe {
+        std::ptr::copy_nonoverlapping(digest.as_ptr(), out32, 32);
+    }
+    VEIL_OK
+}
+
 /// Seal a raw FCM/APNs token to the push-relay identified by a 32-byte
 /// X25519 public key.  Stateless — does not need an `VeilHandle`.
 /// The relay pubkey is typically obtained from `veil_get_node_id` of
