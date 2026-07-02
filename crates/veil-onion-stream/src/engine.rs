@@ -373,11 +373,19 @@ impl StreamEngine {
                     VecDeque::new()
                 },
                 btl_bw: if warm { cfg.warm_btl_bw } else { 0 },
-                // A warm stream starts at the steady 5/4 probe gain: the seed
-                // is already near capacity, and a 2x STARTUP probe on top of
-                // it would overshoot a path that may have degraded since.
-                bbr_startup: !warm,
-                bbr_bw_at_probe: 0,
+                // A warm stream STAYS in STARTUP, seeded: skipping it (the
+                // first design) pinned every follow-up stream at 5/4 gain of
+                // the cached model, which (a) is HALF the previous rate (the
+                // mux seeds at 1/2 — so 2x STARTUP pacing of the seed probes
+                // exactly the cached rate, not beyond it) and (b) can never
+                // climb out of a model cached during a degraded minute (live:
+                // ranged pulls crawled at 0.5-0.8 MB/s for 100s on a path
+                // doing 5+ MB/s). Seeding bbr_bw_at_probe with the warm model
+                // starts the plateau clock AT the cache: a path that does not
+                // grow >=25%/round beyond it exits STARTUP within ~3 round
+                // trips (bounded overshoot), a better path keeps the 2x climb.
+                bbr_startup: true,
+                bbr_bw_at_probe: if warm { cfg.warm_btl_bw } else { 0 },
                 bbr_stall_rounds: 0,
                 bbr_probe_checked_ms: 0,
                 rtt_min: warm_rtt.map(|(r, t)| (r.max(1), t)),
@@ -1689,13 +1697,18 @@ mod tests {
             ..Config::default()
         };
         let e = StreamEngine::connect(7, cfg, 0, 10_000);
-        // Model seeded, no STARTUP overdrive, window cap live at zero bytes
-        // delivered (a cold stream would return None until 1 MiB).
+        // Model seeded, window cap live at zero bytes delivered (a cold
+        // stream would return None until 1 MiB). STARTUP is KEPT, with the
+        // plateau clock anchored at the seed: the mux caches half the
+        // previous rate, so the 2x STARTUP pacing probes exactly the cached
+        // rate and only a genuinely faster path keeps the climb alive.
         assert_eq!(e.tx.btl_bw, 6_000_000);
-        assert!(!e.tx.bbr_startup);
+        assert!(e.tx.bbr_startup);
+        assert_eq!(e.tx.bbr_bw_at_probe, 6_000_000);
         assert_eq!(e.tx.rtt_min.map(|(r, _)| r), Some(150));
         let bdp = 6_000_000u64 * 150 / 1000; // 900 KB
-        assert_eq!(e.tx.bbr_window_cap(&e.cfg), Some(2 * bdp as u32));
+        // STARTUP window cap leaves probe headroom (3x BDP).
+        assert_eq!(e.tx.bbr_window_cap(&e.cfg), Some(3 * bdp as u32));
         // First flight opens near the seeded BDP (capped at 1 MiB).
         assert_eq!(e.tx.cwnd, bdp as u32);
         // A cold config keeps the engage gate.
@@ -1706,6 +1719,70 @@ mod tests {
         let c = StreamEngine::connect(8, cold, 0, 10_000);
         assert_eq!(c.tx.bbr_window_cap(&c.cfg), None);
         assert!(c.tx.bbr_startup);
+    }
+
+    #[test]
+    fn warm_startup_climbs_past_the_seed_and_exits_on_a_degraded_path() {
+        // Faster path than the cache: the seeded STARTUP must keep the 2x
+        // climb well past the warm model instead of idling at 5/4 of it.
+        let cfg = Config {
+            bbr: true,
+            warm_btl_bw: 1_500_000, // mux seeds HALF the previous ~3 MB/s
+            warm_rtt_min_ms: 150,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 10_000);
+        e.tx.srtt = Some(150);
+        assert!(e.tx.bbr_startup);
+        // Path really sustains 12 MB/s: delivery doubles per 300ms round from
+        // the probed (2x seed = cached) rate up to the ceiling.
+        let rate_at = |t_ms: u64| -> u64 {
+            let doublings = (t_ms as f64) / 300.0;
+            ((3_000_000.0_f64) * doublings.exp2()).min(12_000_000.0) as u64
+        };
+        let mut t = 0u64;
+        while t < 3_000 {
+            t += 20;
+            let bytes = rate_at(t) * 20 / 1000;
+            e.tx.bbr_on_delivered(bytes as u32, t);
+            if rate_at(t) < 12_000_000 {
+                assert!(
+                    e.tx.bbr_startup,
+                    "warm STARTUP bailed mid-climb at t={t} (btl_bw={})",
+                    e.tx.btl_bw
+                );
+            }
+        }
+        assert!(
+            e.tx.btl_bw > 9_000_000,
+            "warm stream should discover the faster path, got {}",
+            e.tx.btl_bw
+        );
+
+        // Degraded path: real delivery never grows >=25%/round past the seed,
+        // so STARTUP must exit within a few round trips (bounded overshoot).
+        let cfg = Config {
+            bbr: true,
+            warm_btl_bw: 4_000_000,
+            warm_rtt_min_ms: 150,
+            ..Config::default()
+        };
+        let mut d = StreamEngine::connect(9, cfg, 0, 10_000);
+        d.tx.srtt = Some(150);
+        let mut t = 0u64;
+        let mut exit_at = None;
+        while t < 3_000 {
+            t += 20;
+            d.tx.bbr_on_delivered((800_000u64 * 20 / 1000) as u32, t);
+            if !d.tx.bbr_startup && exit_at.is_none() {
+                exit_at = Some(t);
+            }
+        }
+        let exit = exit_at.expect("STARTUP never exited on a degraded path");
+        assert!(
+            exit <= 1_000,
+            "degraded-path exit should take ~3 rounds, took {exit}ms"
+        );
     }
 
     #[test]
