@@ -36,6 +36,10 @@ struct Channel {
     dup: f64,        // per-cell duplication probability
     base_delay: u64, // one-way propagation (ms)
     jitter: u64,     // extra uniform [0,jitter] ms → reordering
+    /// Two-path striping model: cells alternate between these one-way delays
+    /// (overrides `base_delay`), e.g. a stream round-robined across two onion
+    /// routes with different latencies. Systematic reordering, zero loss.
+    two_path: Option<(u64, u64)>,
 }
 impl Channel {
     fn perfect() -> Self {
@@ -44,6 +48,7 @@ impl Channel {
             dup: 0.0,
             base_delay: 25,
             jitter: 0,
+            two_path: None,
         }
     }
     fn lossy(loss: f64) -> Self {
@@ -52,6 +57,7 @@ impl Channel {
             dup: 0.0,
             base_delay: 25,
             jitter: 0,
+            two_path: None,
         }
     }
 }
@@ -92,7 +98,18 @@ impl Pipe {
             return;
         }
         let deliver = |p: &mut Pipe, r: &mut Rng| {
-            let arrive = now + p.ch.base_delay + r.range(0, p.ch.jitter + 1);
+            let base = match p.ch.two_path {
+                // Round-robin cells across the two simulated routes.
+                Some((fast, slow)) => {
+                    if p.injected % 2 == 0 {
+                        fast
+                    } else {
+                        slow
+                    }
+                }
+                None => p.ch.base_delay,
+            };
+            let arrive = now + base + r.range(0, p.ch.jitter + 1);
             p.flight.push(InFlight {
                 arrive,
                 bytes: bytes.to_vec(),
@@ -432,7 +449,9 @@ fn sack_keeps_retransmit_overhead_bounded() {
     // SACK-aware retransmit must resend roughly the LOST cells, not re-send
     // cells the receiver already SACKed. 20% loss → expect well under 2× the
     // payload on the wire (a SACK-blind retransmitter inflates far past that).
-    let data = payload(120_000, 21);
+    // Sized in cells, not bytes: at the 16K cell a byte-fixed payload is a
+    // handful of cells and the bound drowns in small-number noise.
+    let data = payload(300 * veil_onion_stream::MSS, 21);
     let out = run_oneway(&data, Channel::lossy(0.20), 5, Config::default());
     assert!(out.completed, "did not complete");
     assert_eq!(out.received, data);
@@ -463,7 +482,9 @@ fn high_bdp_sack_does_not_storm() {
         init_cwnd: 32 * mss,
         ..Config::default()
     };
-    let data = payload(400_000, 31);
+    // ~1k cells in flight regardless of the cell size (byte-fixed sizing left
+    // ~25 cells after the 16K flag-day — statistically meaningless).
+    let data = payload(1024 * veil_onion_stream::MSS, 31);
     // ~1 s one-way (≈2 s RTT) — far below the 10 s RTO floor, so EVERY retransmit
     // here is SACK-driven; this isolates mark_holes from the RTO path.
     let ch = Channel {
@@ -471,6 +492,7 @@ fn high_bdp_sack_does_not_storm() {
         dup: 0.0,
         base_delay: 1000,
         jitter: 50,
+        two_path: None,
     };
     let out = run_oneway(&data, ch, 77, cfg);
     assert!(
@@ -507,6 +529,7 @@ fn pacing_spreads_sends_no_burst() {
         dup: 0.0,
         base_delay: 500,
         jitter: 0,
+        two_path: None,
     }; // ~1 s RTT
     let out = run_oneway(&data, ch, 9, cfg);
     assert!(
@@ -560,6 +583,7 @@ fn circuit_profile_clean_path_exceeds_target_throughput() {
         dup: 0.0,
         base_delay: 75,
         jitter: 0,
+        two_path: None,
     };
     let out = run_oneway(&data, ch, 5150, cfg);
     assert!(
@@ -629,6 +653,7 @@ fn circuit_profile_stubborn_head_hole_completes_without_reset() {
         dup: 0.0,
         base_delay: 75,
         jitter: 0,
+        two_path: None,
     };
     let mut target_seq: Option<u32> = None;
     let mut drops_left = 2usize;
@@ -669,6 +694,7 @@ fn reordering_and_duplication_complete_intact() {
         dup: 0.10,
         base_delay: 25,
         jitter: 80,
+        two_path: None,
     };
     let out = run_oneway(&data, ch, 99, Config::default());
     assert!(
@@ -687,6 +713,7 @@ fn heavy_combined_impairment_completes() {
         dup: 0.05,
         base_delay: 40,
         jitter: 120,
+        two_path: None,
     };
     let out = run_oneway(&data, ch, 2024, Config::default());
     assert!(
@@ -743,4 +770,169 @@ fn smaller_window_throttles_but_completes() {
     let out = run_oneway(&data, Channel::lossy(0.05), 5, cfg);
     assert!(out.completed, "tight-window transfer did not complete");
     assert_eq!(out.received, data);
+}
+
+// ---- RACK time-threshold loss detection --------------------------------
+
+/// Cells striped across two routes with a 400 ms one-way latency delta:
+/// systematic cross-path reordering, ZERO real loss. The SACK-count detector
+/// (3 SACKed above ⇒ lost) reads this as constant loss and collapses — the
+/// conclusive on-device multipath failure. RACK must adapt its reordering
+/// window (no floor given here) and deliver with near-zero spurious resends.
+#[test]
+fn rack_two_path_reorder_adapts_without_spurious_collapse() {
+    let mss = veil_onion_stream::MSS;
+    let data = payload(300 * mss, 42);
+    let ch = Channel {
+        loss: 0.0,
+        dup: 0.0,
+        base_delay: 0,
+        jitter: 0,
+        two_path: Some((100, 500)),
+    };
+    let cfg = Config {
+        rack: true,
+        // Handshake over the slow route RTTs at exactly the 1s default —
+        // keep the SYN retransmit out of the wire-cell accounting.
+        handshake_rto_ms: 3_000,
+        ..Config::default()
+    };
+    let out = run_oneway(&data, ch, 9, cfg);
+    assert!(out.completed, "two-path transfer did not complete");
+    assert_eq!(out.received, data, "byte corruption under reordering");
+    let payload_cells = data.len().div_ceil(mss) as u64;
+    // Spurious resends are allowed while the reorder window is still
+    // learning (costs ~15% of the first flights; ACKs alternate routes too,
+    // so the window must grow past the data delta before it converges). The
+    // SACK-count detector resends a large share of EVERY flight here and
+    // collapses ssthresh; anything near-payload proves adaptation.
+    assert!(
+        out.tx_cells < payload_cells + payload_cells / 4 + 8,
+        "spurious retransmit storm under two-path reordering: {} cells for {} payload",
+        out.tx_cells,
+        payload_cells
+    );
+    assert!(
+        !out
+            .a_events
+            .iter()
+            .any(|e| matches!(e, Event::DataRto { .. })),
+        "reordering alone must never fire the RTO: {:?}",
+        out.a_events
+    );
+}
+
+/// Same two-path striping with a carrier-set reorder floor covering the
+/// cross-route delta (what the striping carrier will configure): NO spurious
+/// retransmit at all — every wire cell is a payload cell.
+#[test]
+fn rack_two_path_reorder_floor_zero_spurious() {
+    let mss = veil_onion_stream::MSS;
+    let data = payload(300 * mss, 43);
+    let ch = Channel {
+        loss: 0.0,
+        dup: 0.0,
+        base_delay: 0,
+        jitter: 0,
+        two_path: Some((100, 500)),
+    };
+    let cfg = Config {
+        rack: true,
+        // The floor must cover the worst delivery-report skew: slow-route
+        // DATA + slow-route ACK vs fast+fast = both one-way deltas (800 ms
+        // here; this sim reorders the ACK direction too).
+        rack_reo_floor_ms: 1_000,
+        handshake_rto_ms: 3_000,
+        ..Config::default()
+    };
+    let mut data_cells = 0u64;
+    let out = run_oneway_scripted_a2b_drop(&data, ch, 10, cfg, |_, cell| {
+        if matches!(Frame::decode(cell), Some(Frame::Data { .. })) {
+            data_cells += 1;
+        }
+        false // count only — never drop
+    });
+    assert!(out.completed, "two-path transfer did not complete");
+    assert_eq!(out.received, data);
+    let payload_cells = data.len().div_ceil(mss) as u64;
+    // Every DATA cell on the wire is a payload cell — zero spurious resends.
+    assert_eq!(
+        data_cells, payload_cells,
+        "expected zero spurious DATA resends with a covering reorder floor"
+    );
+}
+
+/// Real mid-stream loss UNDER two-path reordering must be repaired by the
+/// RACK timer well before the coarse RTO: two DATA originals are dropped
+/// deterministically, the RTO floor is 10 s, so completion near clean-path
+/// time proves time-threshold repair worked. (Tail loss is out of scope —
+/// with no later delivery RACK has no signal; that is the RTO's job.)
+#[test]
+fn rack_repairs_real_loss_under_reordering_before_rto() {
+    let mss = veil_onion_stream::MSS;
+    let data = payload(300 * mss, 44);
+    let ch = Channel {
+        loss: 0.0,
+        dup: 0.0,
+        base_delay: 0,
+        jitter: 0,
+        two_path: Some((100, 500)),
+    };
+    let cfg = Config {
+        rack: true,
+        rack_reo_floor_ms: 600,
+        handshake_rto_ms: 3_000,
+        init_rto_ms: 12_000,
+        min_rto_ms: 10_000,
+        max_rto_ms: 60_000,
+        ..Config::default()
+    };
+    let mut data_seen = 0u64;
+    let out = run_oneway_scripted_a2b_drop(&data, ch, 11, cfg, |_, cell| {
+        let Some(Frame::Data { .. }) = Frame::decode(cell) else {
+            return false;
+        };
+        data_seen += 1;
+        // Drop two mid-stream originals (each seq passes here once more as a
+        // retransmit, which must get through).
+        matches!(data_seen, 40 | 41)
+    });
+    assert!(out.completed, "two-path transfer with drops did not complete");
+    assert_eq!(out.received, data, "ARQ failed under loss + reordering");
+    assert!(
+        out.elapsed_ms < 10_000,
+        "repair leaned on the RTO instead of the RACK timer: {} ms",
+        out.elapsed_ms
+    );
+    assert!(
+        !out
+            .a_events
+            .iter()
+            .any(|e| matches!(e, Event::DataRto { .. })),
+        "RTO fired for a RACK-repairable mid-stream loss: {:?}",
+        out.a_events
+    );
+}
+
+/// RACK on a plain single lossy path: parity with the SACK-count detector —
+/// still completes intact with bounded overhead (regression guard for making
+/// RACK the default on the circuit path).
+#[test]
+fn rack_single_path_loss_parity() {
+    let mss = veil_onion_stream::MSS;
+    let data = payload(300 * mss, 45);
+    let cfg = Config {
+        rack: true,
+        ..Config::default()
+    };
+    let out = run_oneway(&data, Channel::lossy(0.20), 5, cfg);
+    assert!(out.completed, "20% loss did not complete with RACK");
+    assert_eq!(out.received, data);
+    let payload_cells = data.len().div_ceil(mss) as u64;
+    assert!(
+        out.tx_cells < payload_cells * 2,
+        "RACK retransmit overhead too high: {} cells for {} payload",
+        out.tx_cells,
+        payload_cells
+    );
 }
