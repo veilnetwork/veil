@@ -1229,12 +1229,19 @@ impl StreamEngine {
                 self.tx.btl_bw.saturating_mul(5) / 4
             }; // bytes/sec
             let mss = self.cfg.mss.max(1) as u64;
-            // Pick a tick long enough to release >=4 whole cells, then round
+            // Pick a tick long enough to release >=32 whole cells, then round
             // the per-tick budget UP: rounding down quantized the real rate to
             // a fraction of the target (live: half), which fed the estimator
-            // slower samples than it paced for.
+            // slower samples than it paced for. The >=32 emission quantum
+            // (was >=4) matters twice on a phone: 8x fewer driver wakes at the
+            // same rate, and the carrier only fans a DATA run out across
+            // multiple routes when a single emission is big enough to be worth
+            // splitting (route striping; live the 4-cell runs never met the
+            // stripe threshold). The carrier's shared token-bucket pacer still
+            // shapes the wire burst, and one 32-cell tick (~130 KB) is far
+            // below the relay-queue sizes that caused historic burst loss.
             let cells_per_sec = (rate / mss).max(1);
-            let interval = (4_000 / cells_per_sec).clamp(1, 100);
+            let interval = (32_000 / cells_per_sec).clamp(1, 100);
             let batch = (rate.saturating_mul(interval))
                 .div_ceil(1000 * mss)
                 .clamp(1, self.cfg.max_pacing_batch.max(1) as u64) as u32;
