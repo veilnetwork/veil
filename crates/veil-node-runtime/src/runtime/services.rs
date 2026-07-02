@@ -596,6 +596,7 @@ impl NodeRuntime {
             identity: Arc::clone(&self.identity),
             state: Arc::clone(&self.state),
             live_sessions: Arc::clone(&self.live_sessions),
+            session_close_generations: Arc::clone(&self.session_close_generations),
             next_link_id: Arc::clone(&self.next_link_id),
             pending_accepts: Arc::clone(&self.pending_accepts),
             logger: Arc::clone(&self.logger),
@@ -704,6 +705,7 @@ impl NodeRuntime {
 
             let state = Arc::clone(&self.state);
             let live_sessions = Arc::clone(&self.live_sessions);
+            let session_close_generations = Arc::clone(&self.session_close_generations);
             let event_bus = Arc::clone(&self.event_bus);
             let tasks = Arc::clone(&self.tasks);
             // cleanup: bundle replaces 7 individual Arc clones.
@@ -859,6 +861,7 @@ impl NodeRuntime {
                                         identity:            Arc::clone(&identity),
                                         state:               Arc::clone(&state),
                                         live_sessions:       Arc::clone(&live_sessions),
+                                        session_close_generations: Arc::clone(&session_close_generations),
                                         event_bus:           Arc::clone(&event_bus),
                                         next_link_id:        Arc::clone(&next_link_id),
                                         logger:              Arc::clone(&logger),
@@ -1273,6 +1276,7 @@ impl NodeRuntime {
             identity: Arc::clone(&self.identity),
             state: Arc::clone(&self.state),
             live_sessions: Arc::clone(&self.live_sessions),
+            session_close_generations: Arc::clone(&self.session_close_generations),
             event_bus: Arc::clone(&self.event_bus),
             next_link_id: Arc::clone(&self.next_link_id),
             logger: Arc::clone(&self.logger),

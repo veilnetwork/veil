@@ -4538,6 +4538,7 @@ dependencies = [
 name = "veil-onion-stream"
 version = "0.1.0"
 dependencies = [
+ "log",
  "tokio",
 ]
 
