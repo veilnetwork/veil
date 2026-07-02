@@ -2991,52 +2991,61 @@ fn spawn_circuit_feed(
     peer_tags: SharedPeerTags,
 ) {
     tokio::spawn(async move {
-        while let Some(framed) = recv_rx.recv().await {
+        // Drain inbound bursts: the relay splice delivers many cells per
+        // scheduler turn, and one activity stamp per batch is enough.
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        'feed: loop {
+            batch.clear();
+            if recv_rx.recv_many(&mut batch, 256).await == 0 {
+                break;
+            }
             if let Some(activity) = activity.as_ref() {
                 mark_circuit_activity(activity);
             }
-            if framed.len() < CIRCUIT_PEER_TAG_LEN {
-                continue;
-            }
-            let mut tag = [0u8; CIRCUIT_PEER_TAG_LEN];
-            tag.copy_from_slice(&framed[..CIRCUIT_PEER_TAG_LEN]);
-            let mut cell_offset = CIRCUIT_PEER_TAG_LEN;
-            let node = if framed.get(cell_offset) == Some(&CIRCUIT_INTRO_MARKER) {
-                if framed.len() < cell_offset + 1 + CIRCUIT_INTRO_LEN {
+            for framed in batch.drain(..) {
+                if framed.len() < CIRCUIT_PEER_TAG_LEN {
                     continue;
                 }
-                let sealed = &framed[cell_offset + 1..cell_offset + 1 + CIRCUIT_INTRO_LEN];
-                let Some(node) = open_stream_peer_intro(&services, &tag, sealed) else {
-                    continue;
-                };
-                {
-                    let mut tags = peer_tags.lock().unwrap_or_else(|p| p.into_inner());
-                    if tags.len() >= 4096 && !tags.contains_key(&tag) {
-                        tags.clear();
+                let mut tag = [0u8; CIRCUIT_PEER_TAG_LEN];
+                tag.copy_from_slice(&framed[..CIRCUIT_PEER_TAG_LEN]);
+                let mut cell_offset = CIRCUIT_PEER_TAG_LEN;
+                let node = if framed.get(cell_offset) == Some(&CIRCUIT_INTRO_MARKER) {
+                    if framed.len() < cell_offset + 1 + CIRCUIT_INTRO_LEN {
+                        continue;
                     }
-                    tags.insert(tag, node);
+                    let sealed = &framed[cell_offset + 1..cell_offset + 1 + CIRCUIT_INTRO_LEN];
+                    let Some(node) = open_stream_peer_intro(&services, &tag, sealed) else {
+                        continue;
+                    };
+                    {
+                        let mut tags = peer_tags.lock().unwrap_or_else(|p| p.into_inner());
+                        if tags.len() >= 4096 && !tags.contains_key(&tag) {
+                            tags.clear();
+                        }
+                        tags.insert(tag, node);
+                    }
+                    cell_offset += 1 + CIRCUIT_INTRO_LEN;
+                    node
+                } else if let Some(node) = peer_tags
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&tag)
+                    .copied()
+                {
+                    node
+                } else {
+                    // Backward-compatible validation/legacy path: the first 32 bytes
+                    // are the clear sender node id rather than an opaque tag.
+                    tag
+                };
+                if framed.len() <= cell_offset {
+                    continue;
                 }
-                cell_offset += 1 + CIRCUIT_INTRO_LEN;
-                node
-            } else if let Some(node) = peer_tags
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&tag)
-                .copied()
-            {
-                node
-            } else {
-                // Backward-compatible validation/legacy path: the first 32 bytes
-                // are the clear sender node id rather than an opaque tag.
-                tag
-            };
-            if framed.len() <= cell_offset {
-                continue;
-            }
-            let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
-            let cell = framed[cell_offset..].to_vec();
-            if in_tx.send((Addr { node, app }, cell)).await.is_err() {
-                break;
+                let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
+                let cell = framed[cell_offset..].to_vec();
+                if in_tx.send((Addr { node, app }, cell)).await.is_err() {
+                    break 'feed;
+                }
             }
         }
     });

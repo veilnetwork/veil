@@ -125,6 +125,9 @@ impl<S: CellSender> CellDuplex for MuxDuplex<S> {
     async fn recv_cell(&mut self) -> io::Result<Option<Vec<u8>>> {
         Ok(self.inbound_rx.recv().await)
     }
+    async fn recv_cells(&mut self, out: &mut Vec<Vec<u8>>, max: usize) -> io::Result<usize> {
+        Ok(self.inbound_rx.recv_many(out, max).await)
+    }
     async fn on_data_rto(&mut self, stream_id: u32, consec_rto: u32, snd_una: u32) {
         self.sender
             .on_stream_data_rto(self.peer, stream_id, consec_rto, snd_una)
@@ -225,6 +228,10 @@ fn initial_seq(sid: u32) -> u32 {
     sid.wrapping_mul(2_654_435_761) // Knuth multiplicative hash
 }
 
+/// Inbound cells drained from the hub per demux turn. One routes-lock spans a
+/// whole batch of routable cells; only SYNs (new streams) take the slow path.
+const DEMUX_RX_BURST: usize = 256;
+
 async fn demux<S: CellSender>(
     sender: Arc<S>,
     mut inbound: mpsc::Receiver<(Addr, Vec<u8>)>,
@@ -232,39 +239,63 @@ async fn demux<S: CellSender>(
     accept_tx: mpsc::Sender<(OnionStream, Addr)>,
     cfg: Config,
 ) {
-    while let Some((src, cell)) = inbound.recv().await {
-        let Some(frame) = Frame::decode(&cell) else {
-            continue; // junk
-        };
-        let key = (src.node, frame.stream_id());
-        // Existing stream?
+    let mut batch: Vec<(Addr, Vec<u8>)> = Vec::new();
+    let mut new_streams: Vec<(Addr, Vec<u8>)> = Vec::new();
+    loop {
+        batch.clear();
+        if inbound.recv_many(&mut batch, DEMUX_RX_BURST).await == 0 {
+            return; // hub feed closed
+        }
+        // Fast path: route the whole batch under ONE lock. In the handshake
+        // protocol no DATA precedes the peer's SYN_ACK, so a not-yet-routed
+        // non-SYN cell here is stale/junk exactly as it was per-cell.
+        new_streams.clear();
         {
             let routes_g = routes.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(tx) = routes_g.get(&key) {
-                let _ = tx.try_send(cell); // full → drop, ARQ recovers
-                continue;
+            for (src, cell) in batch.drain(..) {
+                let Some(frame) = Frame::decode(&cell) else {
+                    continue; // junk
+                };
+                let key = (src.node, frame.stream_id());
+                if let Some(tx) = routes_g.get(&key) {
+                    let _ = tx.try_send(cell); // full → drop, ARQ recovers
+                } else if matches!(frame, Frame::Syn { .. }) {
+                    new_streams.push((src, cell));
+                }
             }
         }
-        // New inbound stream — only a SYN may create one.
-        if !matches!(frame, Frame::Syn { .. }) {
-            continue;
-        }
-        let (tx, rx) = mpsc::channel(STREAM_INBOX);
-        let _ = tx.try_send(cell); // deliver the SYN itself
-        routes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(key, tx);
-        let duplex = MuxDuplex {
-            sender: sender.clone(),
-            peer: src,
-            key,
-            routes: routes.clone(),
-            inbound_rx: rx,
-        };
-        let stream = OnionStream::accept(duplex, cfg, key.1, initial_seq(key.1));
-        if accept_tx.send((stream, src)).await.is_err() {
-            break; // nobody is accepting anymore
+        // Slow path: new inbound streams — only a SYN may create one. Re-check
+        // the route per cell so a duplicate SYN in the same batch attaches to
+        // the stream its first copy created.
+        for (src, cell) in new_streams.drain(..) {
+            let key = (
+                src.node,
+                Frame::decode(&cell).expect("decoded above").stream_id(),
+            );
+            {
+                let routes_g = routes.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(tx) = routes_g.get(&key) {
+                    let _ = tx.try_send(cell);
+                    continue;
+                }
+            }
+            let (tx, rx) = mpsc::channel(STREAM_INBOX);
+            let _ = tx.try_send(cell); // deliver the SYN itself
+            routes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key, tx);
+            let duplex = MuxDuplex {
+                sender: sender.clone(),
+                peer: src,
+                key,
+                routes: routes.clone(),
+                inbound_rx: rx,
+            };
+            let stream = OnionStream::accept(duplex, cfg, key.1, initial_seq(key.1));
+            if accept_tx.send((stream, src)).await.is_err() {
+                return; // nobody is accepting anymore
+            }
         }
     }
 }
