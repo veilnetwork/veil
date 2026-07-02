@@ -266,6 +266,19 @@ const ANDROID_MAX_PACING_BATCH_PROP: &str = "debug.veil.onion_stream_max_pacing_
 const ANDROID_DATA_PACE_US_PROP: &str = "debug.veil.onion_stream_data_pace_us";
 const CIRCUIT_BBR_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_BBR";
 const ANDROID_BBR_PROP: &str = "debug.veil.onion_stream_bbr";
+/// RACK time-threshold loss detection (engine `Config::rack`), circuit-only.
+/// Default ON: the SACK-count/dup-ACK detector misreads any reordering (ACK
+/// jitter across route remaps, and systematically under route striping) as
+/// loss; RACK declares loss by TIME past a later delivery instead.
+const CIRCUIT_RACK_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_RACK";
+const ANDROID_RACK_PROP: &str = "debug.veil.onion_stream_rack";
+/// Floor (ms) for RACK's adaptive reordering window. Defaults to 0 on a
+/// single pinned route (min-RTT/4 base + adaptation suffice) and to
+/// [`DEFAULT_STRIPE_RACK_REO_FLOOR_MS`] when route striping is enabled, so
+/// the FIRST striped flight already tolerates the cross-route delivery skew.
+const CIRCUIT_RACK_REO_FLOOR_MS_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_RACK_REO_FLOOR_MS";
+const ANDROID_RACK_REO_FLOOR_MS_PROP: &str = "debug.veil.onion_stream_rack_reo_floor_ms";
+const DEFAULT_STRIPE_RACK_REO_FLOOR_MS: u32 = 1_500;
 /// Stripe one bulk stream's DATA cells across up to this many distinct
 /// outbound routes (distinct first-hop sessions). 1 = classic single-route
 /// pinning.
@@ -2428,6 +2441,26 @@ impl AnonStreamHub {
         // receive window in sender-side queues (live srtt ~2.3s of pure
         // queueing), which slows RTO/loss detection and route failover.
         let bbr = is_circuit && env_or_android_u32(CIRCUIT_BBR_ENV, ANDROID_BBR_PROP, 1, 0, 1) == 1;
+        // RACK loss detection (see CIRCUIT_RACK_ENV). The reorder floor
+        // defaults high when this hub stripes DATA across routes: adaptation
+        // alone pays a spurious-resend learning tax on the first flights.
+        let rack =
+            is_circuit && env_or_android_u32(CIRCUIT_RACK_ENV, ANDROID_RACK_PROP, 1, 0, 1) == 1;
+        let stripe_active = match &cells {
+            HubCells::Circuit(c) => c.stripe_routes > 1,
+            HubCells::Anon(_) => false,
+        };
+        let rack_reo_floor_ms = env_or_android_u32(
+            CIRCUIT_RACK_REO_FLOOR_MS_ENV,
+            ANDROID_RACK_REO_FLOOR_MS_PROP,
+            if stripe_active {
+                DEFAULT_STRIPE_RACK_REO_FLOOR_MS
+            } else {
+                0
+            },
+            0,
+            60_000,
+        );
         if is_circuit {
             let outbound_pool = match &cells {
                 HubCells::Circuit(c) => c.outbound_pool_target,
@@ -2450,6 +2483,7 @@ impl AnonStreamHub {
                  max_retx={max_retransmits} outbound_pool={outbound_pool} ack_pool={ack_pool} \
                  bulk_route_active_limit={bulk_route_limit} \
                  loss_beta={loss_decrease_per_mille}/1000 bbr={bbr} \
+                 rack={rack} rack_reo_floor={rack_reo_floor_ms}ms \
                  debug_summary={debug_summary_ms}ms",
                 ),
             );
@@ -2486,6 +2520,8 @@ impl AnonStreamHub {
             },
             ack_delay_ms: 5,
             debug_summary_ms,
+            rack,
+            rack_reo_floor_ms,
             ..Config::default()
         };
         let mux = Arc::new(StreamMux::new(me, Arc::new(cells), in_rx, cfg));
