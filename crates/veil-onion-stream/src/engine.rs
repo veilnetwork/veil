@@ -223,6 +223,14 @@ struct TxState {
     bw_samples: VecDeque<(u64, u64)>,
     /// Measured bottleneck delivery rate, bytes/sec (windowed max).
     btl_bw: u64,
+    /// STARTUP phase: pace at 2x the estimate until it plateaus. Without it a
+    /// low first sample (taken during a hiccup) needs ~10 probe windows at
+    /// 5/4 gain to climb to the real capacity — live this made whole 16 MiB
+    /// transfers ride the climb (bimodal 9s vs 21s runs on the same path).
+    bbr_startup: bool,
+    /// Estimate at the last plateau check and consecutive no-growth rounds.
+    bbr_bw_at_probe: u64,
+    bbr_stall_rounds: u8,
     /// Windowed minimum round-trip time (ms) and the time it was recorded.
     rtt_min: Option<(u32, u64)>,
 }
@@ -322,6 +330,9 @@ impl StreamEngine {
                 rate_samples: VecDeque::new(),
                 bw_samples: VecDeque::new(),
                 btl_bw: 0,
+                bbr_startup: true,
+                bbr_bw_at_probe: 0,
+                bbr_stall_rounds: 0,
                 rtt_min: None,
             },
             rx: RxState {
@@ -1153,7 +1164,13 @@ impl StreamEngine {
             && self.tx.rtt_min.is_some()
             && self.tx.delivered >= BBR_ENGAGE_DELIVERED
         {
-            let rate = self.tx.btl_bw.saturating_mul(5) / 4; // bytes/sec
+            // STARTUP doubles the estimate each round trip; steady state
+            // probes at 5/4 (see bbr_startup).
+            let rate = if self.tx.bbr_startup {
+                self.tx.btl_bw.saturating_mul(2)
+            } else {
+                self.tx.btl_bw.saturating_mul(5) / 4
+            }; // bytes/sec
             let mss = self.cfg.mss.max(1) as u64;
             // Pick a tick long enough to release >=4 whole cells, then round
             // the per-tick budget UP: rounding down quantized the real rate to
@@ -1349,6 +1366,20 @@ impl TxState {
             .map(|&(_, rate)| rate)
             .max()
             .unwrap_or(0);
+        // STARTUP plateau detection (classic BBR shape): stay at 2x pacing
+        // gain until the estimate stops growing >=25% for three stored
+        // samples, then drop to the steady 5/4 probe gain.
+        if self.bbr_startup && store {
+            if self.btl_bw > self.bbr_bw_at_probe.saturating_mul(5) / 4 {
+                self.bbr_bw_at_probe = self.btl_bw;
+                self.bbr_stall_rounds = 0;
+            } else {
+                self.bbr_stall_rounds = self.bbr_stall_rounds.saturating_add(1);
+                if self.bbr_stall_rounds >= 3 {
+                    self.bbr_startup = false;
+                }
+            }
+        }
     }
 
     /// Windowed-minimum RTT: keep the smallest clean sample, but let the
