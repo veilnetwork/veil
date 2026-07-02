@@ -47,6 +47,24 @@ pub struct Addr {
 /// fed to the [`StreamMux`] separately (it owns inbound demux).
 pub trait CellSender: Send + Sync + 'static {
     fn send(&self, dst: Addr, cell: Vec<u8>) -> impl Future<Output = io::Result<()>> + Send;
+    /// Send an ordered burst of cells to one peer. Accepted cells are popped
+    /// from the front of `cells`; on `Err` the failing cell and everything
+    /// after it stay queued for the caller to retry (`WouldBlock`) or tear
+    /// down. The default forwards cell-by-cell; carriers with per-cell
+    /// route/pacing/lock overhead should override and amortize it.
+    fn send_many(
+        &self,
+        dst: Addr,
+        cells: &mut std::collections::VecDeque<Vec<u8>>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            while let Some(front) = cells.front() {
+                self.send(dst, front.clone()).await?;
+                cells.pop_front();
+            }
+            Ok(())
+        }
+    }
     fn on_stream_data_rto(
         &self,
         dst: Addr,
@@ -97,6 +115,12 @@ struct MuxDuplex<S: CellSender> {
 impl<S: CellSender> CellDuplex for MuxDuplex<S> {
     async fn send_cell(&mut self, cell: &[u8]) -> io::Result<()> {
         self.sender.send(self.peer, cell.to_vec()).await
+    }
+    async fn send_cells(
+        &mut self,
+        cells: &mut std::collections::VecDeque<Vec<u8>>,
+    ) -> io::Result<()> {
+        self.sender.send_many(self.peer, cells).await
     }
     async fn recv_cell(&mut self) -> io::Result<Option<Vec<u8>>> {
         Ok(self.inbound_rx.recv().await)
