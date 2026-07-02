@@ -141,3 +141,24 @@ async fn async_reset_surfaces_as_read_error_not_eof() {
     let err = read_to_end(&mut receiver).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn local_abort_wakes_pending_split_read() {
+    let (da, db) = duplex_pair(0.0, 6);
+    let cfg = Config::default();
+    let _sender = OnionStream::connect(da, cfg, 10, 1000);
+    let receiver = OnionStream::accept(db, cfg, 10, 7000);
+    let abort = receiver.abort_handle();
+    let (mut reader, _writer) = receiver.into_split();
+
+    let read = tokio::spawn(async move {
+        let mut buf = [0u8; 1];
+        reader.read(&mut buf).await
+    });
+    tokio::task::yield_now().await;
+
+    abort.abort(veil_onion_stream::wire::reset_reason::APP);
+
+    let err = read.await.unwrap().unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+}

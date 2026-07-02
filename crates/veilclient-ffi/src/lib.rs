@@ -438,6 +438,7 @@ pub struct VeilStreamFfi {
 /// against a write.
 pub struct VeilAnonStreamFfi {
     bundle: Arc<RuntimeBundle>,
+    abort: veil_onion_stream::OnionAbort,
     reader: TokioMutex<Option<veil_onion_stream::OnionReader>>,
     writer: TokioMutex<Option<veil_onion_stream::OnionWriter>>,
 }
@@ -523,9 +524,11 @@ pub unsafe extern "C" fn veil_anon_stream_open(
     let stream = bundle
         .runtime
         .block_on(async { hub.open(veil_onion_stream::Addr { node, app }) });
+    let abort = stream.abort_handle();
     let (rd, wr) = stream.into_split();
     let ffi = VeilAnonStreamFfi {
         bundle,
+        abort,
         reader: TokioMutex::new(Some(rd)),
         writer: TokioMutex::new(Some(wr)),
     };
@@ -576,9 +579,11 @@ pub unsafe extern "C" fn veil_anon_stream_accept(
                 ptr::copy_nonoverlapping(src.node.as_ptr(), out_src_node_id, 32);
                 ptr::copy_nonoverlapping(src.app.as_ptr(), out_src_app_id, 32);
             }
+            let abort = stream.abort_handle();
             let (rd, wr) = stream.into_split();
             let ffi = VeilAnonStreamFfi {
                 bundle,
+                abort,
                 reader: TokioMutex::new(Some(rd)),
                 writer: TokioMutex::new(Some(wr)),
             };
@@ -723,14 +728,41 @@ pub unsafe extern "C" fn veil_anon_stream_finish(
     }
 }
 
-/// Close + free the stream handle (idempotent, NULL-safe). Dropping it closes
-/// the cmd channel → the driver finishes cleanly and the mux route deregisters.
+/// Close + free the stream handle (idempotent, NULL-safe). This is the graceful
+/// resource-release path: dropping the write half closes the command channel, so
+/// the driver finishes the send direction rather than resetting normal EOF.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_anon_stream_close(stream: *mut VeilAnonStreamFfi) {
     if stream.is_null() {
         return;
     }
     let _ = HandleTable::remove(anon_stream_table(), stream as usize);
+}
+
+/// Abort + free the stream handle (idempotent, NULL-safe). Use for timeout /
+/// retry cancellation. A Dart timeout may call this while another FFI worker is
+/// blocked inside `read()`, and removing the generational handle alone does not
+/// wake that already-cloned Arc. First signal the local read half, then send a
+/// best-effort RST through the driver so the peer/route settle too.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_anon_stream_abort(stream: *mut VeilAnonStreamFfi) {
+    if stream.is_null() {
+        return;
+    }
+    let Some(stream_ref) = HandleTable::remove(anon_stream_table(), stream as usize) else {
+        return;
+    };
+    stream_ref
+        .abort
+        .abort(veil_onion_stream::wire::reset_reason::APP);
+    let bundle = Arc::clone(&stream_ref.bundle);
+    let _task = bundle.runtime.spawn(async move {
+        let guard = stream_ref.writer.lock().await;
+        if let Some(wr) = guard.as_ref() {
+            wr.abort_local(veil_onion_stream::wire::reset_reason::APP);
+            wr.reset(veil_onion_stream::wire::reset_reason::APP).await;
+        }
+    });
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
