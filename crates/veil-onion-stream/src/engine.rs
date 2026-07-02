@@ -48,11 +48,20 @@ pub struct Config {
     /// opt-in for transports whose internal queues can drop a contiguous burst
     /// while still reporting send success (the pinned circuit path).
     pub rto_rewind_no_sack: bool,
+    /// Multiplicative decrease after SACK/fast-retransmit loss, in per-mille.
+    /// Classic NewReno is 500 (halve the window). Pinned onion circuits use a
+    /// softer cut: their "loss" is often local relay/session queue churn or a
+    /// route reset, not evidence that the full anonymous path has half the
+    /// available bandwidth. Reliability is unchanged; this only controls how
+    /// much sending rate we retain while SACK/RTO repairs the holes.
+    pub loss_decrease_per_mille: u16,
     /// Number of contiguous advancing DATA segments acknowledged by one
     /// cumulative ACK. Gaps, duplicates and FIN always ACK immediately.
     pub ack_every: u8,
     /// Maximum delay before acknowledging a partial [`Self::ack_every`] group.
     pub ack_delay_ms: u64,
+    /// Optional driver-side diagnostic dump period. 0 disables it.
+    pub debug_summary_ms: u64,
 }
 
 impl Default for Config {
@@ -70,8 +79,10 @@ impl Default for Config {
             handshake_rto_ms: 1000,
             max_pacing_batch: 4,
             rto_rewind_no_sack: false,
+            loss_decrease_per_mille: 500,
             ack_every: 2,
             ack_delay_ms: 5,
+            debug_summary_ms: 0,
         }
     }
 }
@@ -81,6 +92,9 @@ impl Default for Config {
 pub enum Event {
     /// Handshake complete — the stream may carry data both ways.
     Connected,
+    /// A DATA retransmission timeout fired without new cumulative ACK progress.
+    /// Useful to the carrier for route health/failover; not terminal.
+    DataRto { consec_rto: u32, snd_una: u32 },
     /// The peer sent FIN: the read side has reached clean EOF.
     PeerFinished,
     /// Abnormal teardown — NOT EOF. The app should resume (`reason` from
@@ -155,6 +169,11 @@ struct TxState {
     /// ACKs up to this point are still valid even though `snd_nxt` was rewound
     /// to `snd_una` and the bytes were moved back into `pending`.
     rewind_high: Option<u32>,
+    /// Whether the rewound no-SACK flight included a FIN at `rewind_high`.
+    /// If a late cumulative ACK reaches that point, the old FIN was accepted and
+    /// must complete the stream even though the FIN segment itself was removed
+    /// from `segs` during rewind.
+    rewind_fin: bool,
     fin_requested: bool,
     fin_sent: bool,
     fin_acked: bool,
@@ -198,6 +217,13 @@ pub struct StreamEngine {
 }
 
 impl StreamEngine {
+    fn loss_decrease_window(&self, basis: u32, mss: u32) -> u32 {
+        let beta = u64::from(self.cfg.loss_decrease_per_mille.clamp(1, 1000));
+        ((u64::from(basis) * beta) / 1000)
+            .max(u64::from(2 * mss))
+            .min(u64::from(u32::MAX)) as u32
+    }
+
     /// Initiator side: queues a SYN. `iss` = our initial send sequence.
     pub fn connect(stream_id: u32, cfg: Config, now: u64, iss: u32) -> Self {
         let mut e = Self::new(stream_id, cfg, iss);
@@ -240,6 +266,7 @@ impl StreamEngine {
                 pace_next_ms: 0,
                 pace_budget: 0,
                 rewind_high: None,
+                rewind_fin: false,
                 fin_requested: false,
                 fin_sent: false,
                 fin_acked: false,
@@ -336,6 +363,9 @@ impl StreamEngine {
     }
     pub fn stream_id(&self) -> u32 {
         self.stream_id
+    }
+    pub fn debug_summary_period_ms(&self) -> u64 {
+        self.cfg.debug_summary_ms
     }
 
     /// Debug snapshot (for diagnostics / tests).
@@ -567,7 +597,24 @@ impl StreamEngine {
             self.tx.dup_acks += 1;
             if self.tx.dup_acks == 3 && !self.tx.in_recovery {
                 let flight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
-                self.tx.ssthresh = (flight / 2).max(2 * mss);
+                let fast_retx_basis = if self.cfg.rto_rewind_no_sack {
+                    // Circuit rewind can make the current flight tiny: the
+                    // lost burst has been moved back to `pending`, while stale
+                    // dup-ACKs for the old hole may still arrive. Treat those
+                    // dup-ACKs as a repair signal, but do not recut the already
+                    // reduced RTO window down to a few MSS just because the
+                    // post-rewind probe flight is small.
+                    let effective_cwnd = self.tx.cwnd.min(self.tx.rwnd).max(mss);
+                    let rewind_floor = if self.tx.rewind_high.is_some() {
+                        self.tx.ssthresh.saturating_mul(2)
+                    } else {
+                        0
+                    };
+                    flight.max(effective_cwnd).max(rewind_floor)
+                } else {
+                    flight
+                };
+                self.tx.ssthresh = self.loss_decrease_window(fast_retx_basis, mss);
                 self.mark_holes(true); // fast retransmit (SACK-aware)
                 self.tx.cwnd = self.tx.ssthresh.saturating_add(3 * mss);
                 self.tx.in_recovery = true;
@@ -803,6 +850,17 @@ impl StreamEngine {
         }
     }
 
+    fn mark_oldest_unsacked_for_rto(&mut self) {
+        if let Some(s) = self.tx.segs.iter_mut().find(|s| !s.sacked) {
+            // RTO means the current repair attempt itself may have been lost.
+            // Unlike fast-retransmit's SACK scanner, do not skip a segment just
+            // because it was retransmitted once already; the oldest unsacked
+            // head-hole is exactly what keeps the receiver's out-of-order tail
+            // from draining.
+            s.needs_resend = true;
+        }
+    }
+
     fn make_ack(&self) -> Frame<'static> {
         let mut sacks = SackVec::new();
         for (start, end) in self.rx.sack_blocks() {
@@ -865,14 +923,55 @@ impl StreamEngine {
                 self.declare_dead();
                 return;
             }
+            self.events.push_back(Event::DataRto {
+                consec_rto: self.tx.consec_rto,
+                snd_una: self.tx.snd_una,
+            });
             let mss = self.cfg.mss as u32;
             let flight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
-            let ssthresh = (flight / 2).max(2 * mss);
+            let no_sack_rewind = self.cfg.rto_rewind_no_sack
+                && self.tx.segs.iter().all(|s| !s.sacked)
+                && self.tx.segs.iter().any(|s| !s.is_fin);
+            let rto_basis = if no_sack_rewind {
+                // In the pinned circuit path we rewind no-SACK RTO flights back
+                // into `pending`. A follow-up RTO can therefore fire while only
+                // a tiny retransmission probe is in flight even though the path
+                // had already earned a much larger usable window. Basing
+                // ssthresh only on that probe collapses the stream into
+                // congestion-avoidance at a few KiB and recreates the observed
+                // ~135 KiB/s crawl. Use the effective pre-RTO window as the
+                // congestion signal floor, capped by rwnd, while keeping classic
+                // flight/2 behaviour for normal/SACK RTOs.
+                let effective_cwnd = self.tx.cwnd.min(self.tx.rwnd).max(mss);
+                flight.max(effective_cwnd)
+            } else {
+                flight
+            };
+            let ssthresh = if no_sack_rewind && self.tx.consec_rto == 1 {
+                // The pinned circuit path can see one coarse no-SACK RTO from
+                // ACK/route jitter even while the route is otherwise healthy
+                // (live traces: no send failures / no local WouldBlock). Route
+                // no-progress handling intentionally starts at the *second*
+                // consecutive RTO; make the first one a softer signal too so a
+                // single delayed ACK does not halve a multi-MiB earned window.
+                // If the path is truly black-holed, the next RTO uses the
+                // classic 1/2 cut and the carrier marks the route no-progress.
+                ((rto_basis as u64 * 3) / 4).max((2 * mss) as u64) as u32
+            } else if self.cfg.rto_rewind_no_sack && !no_sack_rewind {
+                // Circuit transport with SACK feedback: repair only the proven
+                // holes, but keep a softer multiplicative-decrease policy than
+                // classic TCP. The receiver already has higher-sequence data, so
+                // this is commonly a relay/session queue hiccup; halving the
+                // window repeatedly leaves long single-stream transfers crawling.
+                self.loss_decrease_window(rto_basis, mss)
+            } else {
+                (rto_basis / 2).max(2 * mss)
+            };
             self.tx.ssthresh = ssthresh;
             self.tx.in_recovery = false;
             self.tx.dup_acks = 0;
             self.tx.rto_ms = (self.tx.rto_ms * 2).min(self.cfg.max_rto_ms); // backoff
-            if self.cfg.rto_rewind_no_sack && self.tx.segs.iter().all(|s| !s.sacked && !s.is_fin) {
+            if no_sack_rewind {
                 // No SACK feedback means the receiver has not reported any
                 // higher-sequence data. In the pinned-circuit path this commonly
                 // happens when an internal bounded queue drops a contiguous burst:
@@ -892,6 +991,22 @@ impl StreamEngine {
                 self.tx.pace_next_ms = now;
                 self.tx.pace_budget = 0;
                 self.tx.rto_deadline = None;
+            } else if self.cfg.rto_rewind_no_sack {
+                // Circuit transport, but we DO have SACK feedback. This is not
+                // the "rewind the whole contiguous burst" case above: the
+                // receiver already holds higher-sequence data, so replaying the
+                // whole flight would create a duplicate storm. Still, classic
+                // RTO collapse to 1 MSS is pathological here: the large SACKed
+                // tail keeps `inflight` huge while only a few holes need repair,
+                // and one-MSS pacing can leave the stream stuck for many RTOs.
+                // Keep a reduced but usable cwnd and let the SACK loss scanner
+                // mark the proven holes for paced retransmit.
+                self.tx.cwnd = ssthresh.max(self.cfg.init_cwnd).min(self.tx.rwnd).max(mss);
+                self.mark_holes(true);
+                self.mark_oldest_unsacked_for_rto();
+                self.tx.pace_next_ms = now;
+                self.tx.pace_budget = 0;
+                self.tx.rto_deadline = Some(now + self.tx.rto_ms);
             } else {
                 self.tx.cwnd = mss; // classic RTO collapse to slow start
                 // With SACK feedback, keep the selective-retransmit model: the
@@ -991,14 +1106,22 @@ impl StreamEngine {
     fn requeue_unsacked_flight_for_rto(&mut self) {
         let rewind_high = self.tx.snd_nxt;
         let mut requeued = VecDeque::new();
+        let mut rewound_fin = false;
         for seg in self.tx.segs.drain(..) {
-            debug_assert!(!seg.is_fin);
+            if seg.is_fin {
+                rewound_fin = true;
+                continue;
+            }
             requeued.extend(seg.data);
         }
         requeued.append(&mut self.tx.pending);
         self.tx.pending = requeued;
         self.tx.snd_nxt = self.tx.snd_una;
         self.tx.rewind_high = Some(rewind_high);
+        self.tx.rewind_fin = rewound_fin;
+        if rewound_fin {
+            self.tx.fin_sent = false;
+        }
     }
 
     /// Queue an immediate cumulative ACK. Used for gaps, duplicates, FIN and
@@ -1041,13 +1164,23 @@ impl TxState {
     fn trim_rewound_pending_after_ack(&mut self, ack: u32) {
         if let Some(high) = self.rewind_high {
             if seq::gt(ack, self.snd_nxt) {
-                let drop_bytes = ack.wrapping_sub(self.snd_nxt) as usize;
+                let mut drop_bytes = ack.wrapping_sub(self.snd_nxt) as usize;
+                if self.rewind_fin && seq::geq(ack, high) {
+                    // FIN consumes one sequence number but has no byte in
+                    // `pending`, so a late ACK for a rewound FIN must not drain
+                    // one extra application byte.
+                    drop_bytes = drop_bytes.saturating_sub(1);
+                }
                 let n = drop_bytes.min(self.pending.len());
                 self.pending.drain(..n);
                 self.snd_nxt = ack;
             }
             if seq::geq(ack, high) {
+                if self.rewind_fin {
+                    self.fin_acked = true;
+                }
                 self.rewind_high = None;
+                self.rewind_fin = false;
             }
         }
     }
@@ -1175,5 +1308,254 @@ impl RxState {
             }
         }
         blocks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine_with_tiny_no_sack_flight(rto_rewind_no_sack: bool) -> StreamEngine {
+        let mss = MSS as u32;
+        let cfg = Config {
+            mss: MSS,
+            init_cwnd: 32 * mss,
+            recv_window: 3 * 1024 * 1024,
+            rto_rewind_no_sack,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 10_000);
+        e.phase = Phase::Established;
+        e.syn_acked = true;
+        e.tx.rwnd = cfg.recv_window;
+        e.tx.cwnd = 1_400_000;
+        e.tx.ssthresh = 1_400_000;
+        e.tx.snd_una = 20_000;
+        e.tx.snd_nxt = e.tx.snd_una + 4 * mss;
+        e.tx.rto_deadline = Some(100);
+        e.tx.pending.extend([0xaa, 0xbb, 0xcc]);
+        for i in 0..4 {
+            e.tx.segs.push_back(Seg {
+                seq: e.tx.snd_una + i * mss,
+                data: vec![i as u8; MSS],
+                is_fin: false,
+                sent_ms: 0,
+                retransmitted: false,
+                sacked: false,
+                needs_resend: false,
+            });
+        }
+        e
+    }
+
+    #[test]
+    fn first_no_sack_rto_rewind_uses_soft_window_cut() {
+        let mut e = engine_with_tiny_no_sack_flight(true);
+        let old_pending = e.tx.pending.len();
+        let old_una = e.tx.snd_una;
+
+        e.on_timeout(100);
+
+        assert_eq!(e.tx.ssthresh, 1_050_000);
+        assert_eq!(e.tx.cwnd, 1_050_000);
+        assert_eq!(e.tx.snd_nxt, old_una);
+        assert!(e.tx.segs.is_empty());
+        assert_eq!(e.tx.pending.len(), 4 * MSS + old_pending);
+        assert_eq!(e.tx.rto_deadline, None);
+    }
+
+    #[test]
+    fn repeated_no_sack_rto_rewind_uses_classic_half_cut() {
+        let mut e = engine_with_tiny_no_sack_flight(true);
+        e.tx.consec_rto = 1;
+
+        e.on_timeout(100);
+
+        assert_eq!(e.tx.ssthresh, 700_000);
+        assert_eq!(e.tx.cwnd, 700_000);
+    }
+
+    #[test]
+    fn dupacks_after_rewind_do_not_recut_ssthresh_to_tiny_flight() {
+        let mut e = engine_with_tiny_no_sack_flight(true);
+        let mss = MSS as u32;
+        e.tx.cwnd = 1_050_000;
+        e.tx.ssthresh = 1_050_000;
+        e.tx.rewind_high = Some(e.tx.snd_nxt.wrapping_add(1_000_000));
+
+        let mut dup = Vec::new();
+        Frame::Ack {
+            stream_id: e.stream_id,
+            ack: e.tx.snd_una,
+            win: e.cfg.recv_window,
+            sacks: SackVec::new(),
+        }
+        .encode_into(&mut dup);
+
+        e.on_cell(&dup, 10);
+        e.on_cell(&dup, 11);
+        e.on_cell(&dup, 12);
+
+        assert!(e.tx.in_recovery);
+        assert_eq!(e.tx.ssthresh, 1_050_000);
+        assert_eq!(e.tx.cwnd, 1_050_000 + 3 * mss);
+        assert!(
+            e.tx.segs.iter().any(|s| s.needs_resend),
+            "third dupACK should still trigger repair"
+        );
+    }
+
+    #[test]
+    fn no_sack_rto_rewind_handles_fin_tail() {
+        let mut e = engine_with_tiny_no_sack_flight(true);
+        let old_una = e.tx.snd_una;
+        e.tx.pending.clear();
+        e.tx.fin_requested = true;
+        e.tx.fin_sent = true;
+        let fin_seq = e.tx.snd_nxt;
+        e.tx.snd_nxt = e.tx.snd_nxt.wrapping_add(1);
+        let old_high = e.tx.snd_nxt;
+        e.tx.segs.push_back(Seg {
+            seq: fin_seq,
+            data: Vec::new(),
+            is_fin: true,
+            sent_ms: 0,
+            retransmitted: false,
+            sacked: false,
+            needs_resend: false,
+        });
+
+        e.on_timeout(100);
+
+        assert_eq!(e.tx.snd_nxt, old_una);
+        assert!(e.tx.segs.is_empty());
+        assert_eq!(e.tx.pending.len(), 4 * MSS);
+        assert!(e.tx.fin_requested);
+        assert!(!e.tx.fin_sent, "rewound FIN must be sent again after DATA");
+        assert!(!e.tx.fin_acked);
+        assert_eq!(e.tx.rewind_high, Some(old_high));
+        assert!(e.tx.rewind_fin);
+
+        let mut ack = Vec::new();
+        Frame::Ack {
+            stream_id: e.stream_id,
+            ack: old_high,
+            win: e.cfg.recv_window,
+            sacks: SackVec::new(),
+        }
+        .encode_into(&mut ack);
+        e.on_cell(&ack, 101);
+
+        assert_eq!(e.tx.pending.len(), 0);
+        assert_eq!(e.tx.snd_una, old_high);
+        assert_eq!(e.tx.snd_nxt, old_high);
+        assert_eq!(e.tx.rewind_high, None);
+        assert!(!e.tx.rewind_fin);
+        assert!(e.tx.fin_acked);
+        assert!(e.is_send_complete());
+    }
+
+    #[test]
+    fn classic_rto_still_uses_flight_and_collapses_cwnd() {
+        let mut e = engine_with_tiny_no_sack_flight(false);
+        let mss = MSS as u32;
+
+        e.on_timeout(100);
+
+        assert_eq!(e.tx.ssthresh, 2 * mss);
+        assert_eq!(e.tx.cwnd, mss);
+        assert_eq!(e.tx.segs.len(), 4);
+        assert!(e.tx.segs.front().unwrap().needs_resend);
+        assert_eq!(e.tx.rto_deadline, Some(100 + e.tx.rto_ms));
+    }
+
+    #[test]
+    fn circuit_sack_rto_keeps_repair_window_and_marks_holes() {
+        let mss = MSS as u32;
+        let cfg = Config {
+            mss: MSS,
+            init_cwnd: 32 * mss,
+            recv_window: 3 * 1024 * 1024,
+            rto_rewind_no_sack: true,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(9, cfg, 0, 30_000);
+        e.phase = Phase::Established;
+        e.syn_acked = true;
+        e.tx.rwnd = cfg.recv_window;
+        e.tx.cwnd = 2_000_000;
+        e.tx.ssthresh = 2_000_000;
+        e.tx.snd_una = 40_000;
+        e.tx.snd_nxt = e.tx.snd_una + 1024 * mss;
+        e.tx.rto_deadline = Some(100);
+        for i in 0..1024 {
+            let missing_hole = i % 64 == 0;
+            e.tx.segs.push_back(Seg {
+                seq: e.tx.snd_una + i * mss,
+                data: vec![i as u8; MSS],
+                is_fin: false,
+                sent_ms: 0,
+                retransmitted: false,
+                sacked: !missing_hole,
+                needs_resend: false,
+            });
+        }
+
+        e.on_timeout(100);
+
+        assert_eq!(e.tx.ssthresh, 1024 * mss / 2);
+        assert_eq!(e.tx.cwnd, e.tx.ssthresh);
+        assert!(
+            !e.tx.segs.is_empty(),
+            "SACK RTO must not rewind the whole flight"
+        );
+        assert!(
+            e.tx.segs.iter().any(|s| s.needs_resend),
+            "SACK RTO should mark proven holes for paced repair"
+        );
+        assert_eq!(e.tx.rto_deadline, Some(100 + e.tx.rto_ms));
+    }
+
+    #[test]
+    fn circuit_sack_rto_can_use_soft_loss_decrease() {
+        let mss = MSS as u32;
+        let cfg = Config {
+            mss: MSS,
+            init_cwnd: 32 * mss,
+            recv_window: 3 * 1024 * 1024,
+            rto_rewind_no_sack: true,
+            loss_decrease_per_mille: 750,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(10, cfg, 0, 30_000);
+        e.phase = Phase::Established;
+        e.syn_acked = true;
+        e.tx.rwnd = cfg.recv_window;
+        e.tx.cwnd = 2_000_000;
+        e.tx.ssthresh = 2_000_000;
+        e.tx.snd_una = 40_000;
+        e.tx.snd_nxt = e.tx.snd_una + 1024 * mss;
+        e.tx.rto_deadline = Some(100);
+        for i in 0..1024 {
+            let missing_hole = i % 64 == 0;
+            e.tx.segs.push_back(Seg {
+                seq: e.tx.snd_una + i * mss,
+                data: vec![i as u8; MSS],
+                is_fin: false,
+                sent_ms: 0,
+                retransmitted: false,
+                sacked: !missing_hole,
+                needs_resend: false,
+            });
+        }
+
+        e.on_timeout(100);
+
+        assert_eq!(e.tx.ssthresh, (1024 * mss * 3) / 4);
+        assert_eq!(e.tx.cwnd, e.tx.ssthresh);
+        assert!(
+            e.tx.segs.iter().any(|s| s.needs_resend),
+            "SACK RTO should still mark proven holes for paced repair"
+        );
     }
 }

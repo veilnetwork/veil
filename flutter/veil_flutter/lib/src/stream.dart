@@ -37,11 +37,11 @@ import 'types.dart';
 
 const _anonStreamReadConcurrency = int.fromEnvironment(
   'VEIL_ANON_STREAM_READ_CONCURRENCY',
-  defaultValue: 4,
+  defaultValue: 16,
 );
 const _anonStreamWriteConcurrency = int.fromEnvironment(
   'VEIL_ANON_STREAM_WRITE_CONCURRENCY',
-  defaultValue: 1,
+  defaultValue: 16,
 );
 
 int _clampAnonStreamConcurrency(int value) {
@@ -59,12 +59,15 @@ final _anonStreamWriteGate = _AsyncGate(
 
 /// Tiny FIFO async semaphore for native anonymous-stream calls.
 ///
-/// `Isolate.run` protects the UI isolate from a blocking FFI call, but firing a
-/// new worker isolate for every concurrent range-stream chunk lets the Dart side
-/// pre-buffer multiple 256 KiB writes into independent onion-stream drivers. The
-/// Rust sender already paces DATA cells per destination; this gate keeps the FFI
-/// boundary from building a second, larger queue above that pacer. Reads have a
-/// separate gate so a slow write can never starve receive-window draining.
+/// `Isolate.run` protects the UI isolate from a blocking FFI call. Keep the
+/// default capacity aligned with xVeil's normal p8→p10 ranged file pulls plus
+/// their retry/manifest probes: a smaller read/write gate silently turns
+/// app-level fanout back into a serialized backpressure point (observed as
+/// manifest-read starvation and ~1 MiB/s on 64 MiB anonymous transfers even
+/// while the Rust stream windows were under-filled). The Rust sender already
+/// paces DATA cells per destination, so this gate is only a guardrail against
+/// unbounded FFI isolate fanout. Reads have a separate gate so a slow write can
+/// never starve receive-window draining.
 class _AsyncGate {
   _AsyncGate(this._capacity) : _available = _capacity;
 
@@ -424,6 +427,15 @@ class VeilAnonStream {
     if (_closed) return;
     _closed = true;
     ffi.veilAnonStreamClose(_stream);
+  }
+
+  /// Abort + release the handle (idempotent). Use this for timeout/retry
+  /// cancellation when another worker isolate may be blocked in [read]; normal
+  /// EOF/cleanup should use [close] so the peer sees a graceful finish.
+  Future<void> abort() async {
+    if (_closed) return;
+    _closed = true;
+    ffi.veilAnonStreamAbort(_stream);
   }
 
   void _ensureOpen() {

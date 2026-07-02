@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
-use crate::driver::{CellDuplex, OnionStream};
+use crate::driver::{CellDuplex, End, OnionStream};
 use crate::engine::Config;
 use crate::wire::Frame;
 
@@ -47,6 +47,25 @@ pub struct Addr {
 /// fed to the [`StreamMux`] separately (it owns inbound demux).
 pub trait CellSender: Send + Sync + 'static {
     fn send(&self, dst: Addr, cell: Vec<u8>) -> impl Future<Output = io::Result<()>> + Send;
+    fn on_stream_data_rto(
+        &self,
+        dst: Addr,
+        stream_id: u32,
+        consec_rto: u32,
+        snd_una: u32,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (dst, stream_id, consec_rto, snd_una);
+        std::future::ready(())
+    }
+    fn on_stream_closed(
+        &self,
+        dst: Addr,
+        stream_id: u32,
+        end: End,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (dst, stream_id, end);
+        std::future::ready(())
+    }
 }
 
 /// Per-stream inbound queue depth (cells). Bounded: a slow stream drops excess
@@ -81,6 +100,16 @@ impl<S: CellSender> CellDuplex for MuxDuplex<S> {
     }
     async fn recv_cell(&mut self) -> io::Result<Option<Vec<u8>>> {
         Ok(self.inbound_rx.recv().await)
+    }
+    async fn on_data_rto(&mut self, stream_id: u32, consec_rto: u32, snd_una: u32) {
+        self.sender
+            .on_stream_data_rto(self.peer, stream_id, consec_rto, snd_una)
+            .await;
+    }
+    async fn on_stream_closed(&mut self, stream_id: u32, end: End) {
+        self.sender
+            .on_stream_closed(self.peer, stream_id, end)
+            .await;
     }
 }
 

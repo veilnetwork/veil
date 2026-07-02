@@ -6,6 +6,7 @@ description = "Reliable, congestion-controlled byte-stream over an anonymous oni
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+log = "0.4"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 
 [dev-dependencies]

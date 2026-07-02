@@ -141,6 +141,10 @@ pub struct NodeServices {
     /// live-session map (link-level metadata) — moved out of
     /// `NodeState`. Shared with `NodeRuntime.live_sessions`.
     pub live_sessions: Arc<Mutex<std::collections::BTreeMap<LinkId, SessionInfo>>>,
+    /// Monotonic per-peer session-close generation. Incremented when a session
+    /// runner exits, so higher layers with long-lived handles can notice that a
+    /// relay session they were using has churned since the handle was opened.
+    session_close_generations: Arc<Mutex<std::collections::HashMap<[u8; 32], u64>>>,
     next_link_id: Arc<AtomicU64>,
     pending_accepts: Arc<Mutex<AcceptWaiters>>,
     pub logger: Arc<NodeLogger>,
@@ -255,6 +259,8 @@ pub struct SessionRuntimeContext {
     state: Arc<Mutex<NodeState>>,
     /// live-session metadata, co-located with `NodeRuntime.live_sessions`.
     live_sessions: Arc<Mutex<std::collections::BTreeMap<LinkId, SessionInfo>>>,
+    /// Shared close-generation map; see [`NodeServices::session_close_generation`].
+    session_close_generations: Arc<Mutex<std::collections::HashMap<[u8; 32], u64>>>,
     /// shared push-event bus, mirrored from `NodeRuntime` so
     /// `register_connection_session` can publish `SESSIONS_CHANGED`
     /// on every fresh insert. Cheap to clone (`Arc`).
@@ -525,6 +531,9 @@ pub struct NodeRuntime {
     /// state. : moved out of `NodeState` since the data is
     /// pure runtime (live sockets), not config-surface state.
     pub live_sessions: Arc<Mutex<std::collections::BTreeMap<LinkId, SessionInfo>>>,
+    /// Monotonic per-peer session-close generation, shared with service handles
+    /// and session runtime contexts.
+    session_close_generations: Arc<Mutex<std::collections::HashMap<[u8; 32], u64>>>,
     /// OVL1 session registry — tracks fully handshaken sessions keyed by
     /// `SessionId` (derived from `SESSION_CONFIRM`). Carries
     /// sovereign-identity outputs (identity proof, capabilities, role)
@@ -2083,6 +2092,7 @@ impl NodeRuntime {
             hint_registry,
             state,
             live_sessions: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            session_close_generations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             session_registry: shared_session_registry,
             app_registry,
             gateway,
@@ -5015,6 +5025,7 @@ impl NodeServices {
             identity: Arc::clone(&self.identity),
             state: Arc::clone(&self.state),
             live_sessions: Arc::clone(&self.live_sessions),
+            session_close_generations: Arc::clone(&self.session_close_generations),
             event_bus: Arc::clone(&self.event_bus),
             next_link_id: Arc::clone(&self.next_link_id),
             logger: Arc::clone(&self.logger),
@@ -5213,6 +5224,25 @@ impl NodeServices {
     /// The local node's 32-byte ID.
     pub fn local_node_id(&self) -> [u8; 32] {
         *self.identity.local_identity.node_id.as_bytes()
+    }
+
+    /// Monotonic generation incremented whenever the session runner for `peer`
+    /// exits. Long-lived circuit handles can sample this at open time and later
+    /// detect that their first-hop relay session churned underneath them.
+    pub fn session_close_generation(&self, peer: &[u8; 32]) -> u64 {
+        lock!(self.session_close_generations)
+            .get(peer)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether the session TX registry currently has a live sender for `peer`.
+    /// Long-lived circuit handles use this as a cheap pre-flight guard: a route
+    /// can become unusable before its close-generation observer has noticed the
+    /// runner exit, and otherwise the next `CircuitData` enqueue fails as
+    /// `NoRelays`.
+    pub fn has_live_session(&self, peer: &[u8; 32]) -> bool {
+        rlock!(self.session_tx_registry).has_session(peer)
     }
 
     /// Register a channel that will receive the next Pong/TraceHop for `seq`.
@@ -5589,6 +5619,19 @@ pub fn spawn_inbound_session(
             // ensures the channel is gone before any close-handler runs.
             wlock!(inbound.runtime.session_tx_registry).unregister(peer_id.as_bytes());
             inbound.runtime.session_outbox.unregister(peer_id);
+            {
+                let mut generations = lock!(inbound.runtime.session_close_generations);
+                if generations.len() >= 4096 && !generations.contains_key(peer_id.as_bytes()) {
+                    generations.clear();
+                }
+                let next = generations
+                    .get(peer_id.as_bytes())
+                    .copied()
+                    .unwrap_or(0)
+                    .wrapping_add(1)
+                    .max(1);
+                generations.insert(*peer_id.as_bytes(), next);
+            }
             // Evict ML-KEM key for this peer so stale keys don't persist.
             wlock!(inbound.runtime.identity.peer_mlkem_keys).remove(peer_id.as_bytes());
             // Evict per-session ephemeral DK so stale keys don't persist.
@@ -6310,6 +6353,7 @@ fn map_sender_err(e: veil_anonymity::sender::SenderError) -> veil_types::AnonOni
 /// dispatcher origin table. ADDITIVE — no existing anonymous-send path changes.
 pub struct DataCircuit {
     first_hop: [u8; 32],
+    relay_path: Vec<[u8; 32]>,
     origin_circuit_id: u32,
     /// Per-hop keys, first-hop → terminus order (wraps each FORWARD cell).
     keys: Vec<[u8; 32]>,
@@ -6319,6 +6363,31 @@ pub struct DataCircuit {
     /// the circuit (in practice the 600 s origin-table TTL rotates first).
     next_seq: std::sync::atomic::AtomicU32,
     confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Detailed local enqueue result for pinned circuit DATA. This is intentionally
+/// more precise than the public anonymous-send IPC error: onion streams need to
+/// distinguish a broken/missing first-hop route from a merely full local
+/// session TX queue, otherwise local backpressure becomes fake packet loss and
+/// collapses the stream congestion window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataCircuitSendError {
+    NoRelays,
+    QueueFull,
+    PayloadTooLarge,
+}
+
+impl From<DataCircuitSendError> for veil_types::AnonOnionSendError {
+    fn from(value: DataCircuitSendError) -> Self {
+        match value {
+            DataCircuitSendError::NoRelays | DataCircuitSendError::QueueFull => {
+                veil_types::AnonOnionSendError::NoRelays
+            }
+            DataCircuitSendError::PayloadTooLarge => {
+                veil_types::AnonOnionSendError::PayloadTooLarge
+            }
+        }
+    }
 }
 
 impl DataCircuit {
@@ -6331,6 +6400,11 @@ impl DataCircuit {
     /// First hop's node id (return cells arrive from here).
     pub fn first_hop(&self) -> [u8; 32] {
         self.first_hop
+    }
+
+    /// Full origin relay path, first hop → terminus.
+    pub fn relay_path(&self) -> &[[u8; 32]] {
+        &self.relay_path
     }
 
     /// Whether the terminus's `CircuitBuilt` ACK has confirmed the whole path.
@@ -6486,11 +6560,16 @@ impl NodeServices {
         }
 
         // Send the CircuitBuild envelope to the first hop over its session.
-        self.send_relay_chain_frame(
-            &first_hop,
-            veil_proto::family::RelayChainMsg::CircuitBuild,
-            &setup,
-        );
+        if self
+            .send_relay_chain_frame(
+                &first_hop,
+                veil_proto::family::RelayChainMsg::CircuitBuild,
+                &setup,
+            )
+            .is_err()
+        {
+            return Err(AnonOnionSendError::NoRelays);
+        }
         Ok(confirmed)
     }
 
@@ -6542,6 +6621,7 @@ impl NodeServices {
         // Snapshot what the handle needs BEFORE the origin moves into the table.
         let circ = DataCircuit {
             first_hop: origin.first_hop,
+            relay_path: relay_path.to_vec(),
             origin_circuit_id: origin.origin_circuit_id,
             keys: origin.circuit_keys.clone(),
             next_seq: std::sync::atomic::AtomicU32::new(0),
@@ -6560,11 +6640,20 @@ impl NodeServices {
             }
             return Err(AnonOnionSendError::NoRelays);
         }
-        self.send_relay_chain_frame(
-            &circ.first_hop,
-            veil_proto::family::RelayChainMsg::CircuitBuild,
-            &setup,
-        );
+        if self
+            .send_relay_chain_frame(
+                &circ.first_hop,
+                veil_proto::family::RelayChainMsg::CircuitBuild,
+                &setup,
+            )
+            .is_err()
+        {
+            if let Ok(mut map) = self.dispatcher.stream_recv.lock() {
+                map.remove(&circ.origin_circuit_id); // roll back on no live first-hop session
+            }
+            self.close_data_circuit(circ.origin_circuit_id);
+            return Err(AnonOnionSendError::NoRelays);
+        }
         Ok((circ, rx))
     }
 
@@ -7068,25 +7157,42 @@ impl NodeServices {
         circ: &DataCircuit,
         payload: &[u8],
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        self.send_circuit_cell_detailed(circ, payload)
+            .map_err(Into::into)
+    }
+
+    /// Detailed sibling of [`Self::send_circuit_cell`] for stream transports.
+    /// `QueueFull` means the cell has NOT entered the next local queue and should
+    /// be retried as local backpressure, not treated as an end-to-end loss.
+    pub fn send_circuit_cell_detailed(
+        &self,
+        circ: &DataCircuit,
+        payload: &[u8],
+    ) -> std::result::Result<(), DataCircuitSendError> {
         use veil_anonymity::circuit_data::{Direction, apply_layers, wrap_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
-        use veil_types::AnonOnionSendError;
 
-        let seq = circ.alloc_seq().ok_or(AnonOnionSendError::NoRelays)?; // exhausted → rotate
-        let mut buf = wrap_payload(payload).map_err(|_| AnonOnionSendError::PayloadTooLarge)?;
+        let seq = circ.alloc_seq().ok_or(DataCircuitSendError::NoRelays)?; // exhausted → rotate
+        let mut buf = wrap_payload(payload).map_err(|_| DataCircuitSendError::PayloadTooLarge)?;
         apply_layers(&circ.keys, Direction::Forward, seq, &mut buf)
-            .map_err(|_| AnonOnionSendError::NoRelays)?;
+            .map_err(|_| DataCircuitSendError::NoRelays)?;
         let cell = CircuitDataPayload {
             circuit_id: circ.origin_circuit_id,
             seq,
             ciphertext: buf,
         };
-        let enc = cell.encode().map_err(|_| AnonOnionSendError::NoRelays)?;
+        let enc = cell.encode().map_err(|_| DataCircuitSendError::NoRelays)?;
         self.send_relay_chain_frame(
             &circ.first_hop,
             veil_proto::family::RelayChainMsg::CircuitData,
             &enc,
-        );
+        )
+        .map_err(|err| match err {
+            veil_session::SendToError::Full => DataCircuitSendError::QueueFull,
+            veil_session::SendToError::Missing | veil_session::SendToError::Closed => {
+                DataCircuitSendError::NoRelays
+            }
+        })?;
         Ok(())
     }
 
@@ -7543,7 +7649,7 @@ impl NodeServices {
         peer: &[u8; 32],
         msg: veil_proto::family::RelayChainMsg,
         body: &[u8],
-    ) {
+    ) -> std::result::Result<(), veil_session::SendToError> {
         use veil_proto::{codec::encode_header, family::FrameFamily, header::FrameHeader};
         let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, msg as u16);
         hdr.body_len = body.len() as u32;
@@ -7551,7 +7657,7 @@ impl NodeServices {
         let mut frame = encode_header(&hdr).to_vec();
         frame.extend_from_slice(body);
         let guard = wlock!(self.session_tx_registry);
-        let _ = guard.send_to(peer, veil_proto::priority::INTERACTIVE, frame);
+        guard.send_to_result(peer, veil_proto::priority::INTERACTIVE, frame)
     }
 
     /// Authenticated rendezvous send (Epic 482 v1, "any recipient"): like

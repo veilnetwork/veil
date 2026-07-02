@@ -78,6 +78,19 @@ pub struct SessionTxRegistry {
     drops_total: Arc<AtomicU64>,
 }
 
+/// Detailed result for a per-session send attempt.
+///
+/// The long-standing `send_to* -> bool` API intentionally hides transport
+/// details from most callers. Bulk onion/circuit diagnostics need the
+/// difference though: "no live session" and "session TX queue full" have very
+/// different meanings for congestion-control analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendToError {
+    Missing,
+    Full,
+    Closed,
+}
+
 impl Default for SessionTxRegistry {
     fn default() -> Self {
         Self {
@@ -357,7 +370,17 @@ impl SessionTxRegistry {
         // Bridge for legacy Vec-producing call sites — wraps without
         // copy but bypasses pool reuse on drop. Prefer `send_to_arc`
         // when the caller already holds a `PooledShared`.
-        self.send_to_arc(
+        self.send_to_result(peer_id, priority, bytes).is_ok()
+    }
+
+    /// Detailed sibling of [`Self::send_to`] for diagnostics-sensitive callers.
+    pub fn send_to_result(
+        &self,
+        peer_id: &NodeIdBytes,
+        priority: u8,
+        bytes: Vec<u8>,
+    ) -> Result<(), SendToError> {
+        self.send_to_arc_result(
             peer_id,
             priority,
             veil_bufpool::pooled_shared_from_vec(bytes),
@@ -378,16 +401,26 @@ impl SessionTxRegistry {
         priority: u8,
         frame: veil_bufpool::PooledShared,
     ) -> bool {
+        self.send_to_arc_result(peer_id, priority, frame).is_ok()
+    }
+
+    /// Detailed sibling of [`Self::send_to_arc`].
+    pub fn send_to_arc_result(
+        &self,
+        peer_id: &NodeIdBytes,
+        priority: u8,
+        frame: veil_bufpool::PooledShared,
+    ) -> Result<(), SendToError> {
         let tx = match self.senders.get(peer_id) {
             Some(s) => s,
-            None => return false,
+            None => return Err(SendToError::Missing),
         };
         match tx.try_send((priority, frame)) {
             Ok(_) => {
                 if let Some(ts) = self.last_active.get(peer_id) {
                     ts.store(now_ms(), Ordering::Relaxed);
                 }
-                true
+                Ok(())
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 // LIMIT: the per-session TX channel (depth = self.capacity) is
@@ -413,12 +446,12 @@ impl SessionTxRegistry {
                         veil_util::hex_short(peer_id),
                     );
                 }
-                false
+                Err(SendToError::Full)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Stale entry — closed receiver. Cleanup deferred to next
                 // write-lock op (prune_closed).
-                false
+                Err(SendToError::Closed)
             }
         }
     }

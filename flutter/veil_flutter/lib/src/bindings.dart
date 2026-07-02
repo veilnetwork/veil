@@ -136,8 +136,8 @@ final void Function(Pointer<Utf8>) veilFreeString = nativeLib
 final Pointer<VeilHandle> Function(Pointer<Uint8>, int, Pointer<Pointer<Utf8>>)
     _connectNative = nativeLib
         .lookup<
-                NativeFunction<
-                    Pointer<VeilHandle> Function(
+            NativeFunction<
+                Pointer<VeilHandle> Function(
                   Pointer<Uint8>,
                   IntPtr,
                   Pointer<Pointer<Utf8>>,
@@ -166,8 +166,8 @@ final Pointer<VeilApp> Function(
   Pointer<Pointer<Utf8>>,
 ) _bindNative = nativeLib
     .lookup<
-            NativeFunction<
-                Pointer<VeilApp> Function(
+        NativeFunction<
+            Pointer<VeilApp> Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               IntPtr,
@@ -198,8 +198,8 @@ final Pointer<VeilApp> Function(
   Pointer<Pointer<Utf8>>,
 ) _bindNamedNative = nativeLib
     .lookup<
-            NativeFunction<
-                Pointer<VeilApp> Function(
+        NativeFunction<
+            Pointer<VeilApp> Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               IntPtr,
@@ -220,15 +220,14 @@ Pointer<VeilApp> veilBindNamed(
     _bindNamedNative(handle, namespace.cast<Uint8>(), namespace.length,
         name.cast<Uint8>(), name.length, endpointId, errOut);
 
-final int Function(Pointer<VeilApp>, Pointer<Uint8>) veilAppGetAppId =
-    nativeLib
-        .lookup<
-                NativeFunction<
-                    Int32 Function(
-                  Pointer<VeilApp>,
-                  Pointer<Uint8>,
-                )>>('veil_app_get_app_id')
-        .asFunction();
+final int Function(Pointer<VeilApp>, Pointer<Uint8>) veilAppGetAppId = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+            )>>('veil_app_get_app_id')
+    .asFunction();
 
 final int Function(Pointer<VeilApp>) veilAppGetEndpointId = nativeLib
     .lookup<NativeFunction<Uint32 Function(Pointer<VeilApp>)>>(
@@ -252,8 +251,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSend = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilApp>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -274,8 +273,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSendAnonymousAuthenticated = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilApp>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -297,8 +296,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSendAnonymousAuthenticatedWithReply = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilApp>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -325,8 +324,8 @@ final int Function(
   Pointer<Pointer<Utf8>>, // errOut
 ) veilSendAnonymousAuthenticatedDirectWithReply = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilApp>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -347,8 +346,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSendReply = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilApp>,
               Uint64,
               Pointer<Uint8>,
@@ -364,8 +363,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilAppSetRecvHandler = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilApp>,
               Pointer<NativeFunction<VeilRecvCbNative>>,
               Pointer<Void>,
@@ -380,8 +379,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSetEventHandler = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<NativeFunction<VeilEventCbNative>>,
               Pointer<Void>,
@@ -392,8 +391,8 @@ final int Function(
 final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
     veilGetNodeId = nativeLib
         .lookup<
-                NativeFunction<
-                    Int32 Function(
+            NativeFunction<
+                Int32 Function(
                   Pointer<VeilHandle>,
                   Pointer<Uint8>,
                   Pointer<Pointer<Utf8>>,
@@ -402,12 +401,12 @@ final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
 
 /// Snapshot the daemon's peer sessions. Calls [cb] once per peer (bounded at
 /// 256 entries server-side). Returns [veilOk] or a negative error code.
-final int Function(Pointer<VeilHandle>, Pointer<NativeFunction<VeilPeerCbNative>>,
-        Pointer<Void>, Pointer<Pointer<Utf8>>) veilPeersList =
-    nativeLib
+final int Function(Pointer<VeilHandle>,
+        Pointer<NativeFunction<VeilPeerCbNative>>, Pointer<Void>, Pointer<Pointer<Utf8>>)
+    veilPeersList = nativeLib
         .lookup<
-                NativeFunction<
-                    Int32 Function(
+            NativeFunction<
+                Int32 Function(
                   Pointer<VeilHandle>,
                   Pointer<NativeFunction<VeilPeerCbNative>>,
                   Pointer<Void>,
@@ -425,8 +424,8 @@ const int veilRelayX25519Unavailable = -10;
 final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
     veilGetRelayX25519Pubkey = nativeLib
         .lookup<
-                NativeFunction<
-                    Int32 Function(
+            NativeFunction<
+                Int32 Function(
                   Pointer<VeilHandle>,
                   Pointer<Uint8>,
                   Pointer<Pointer<Utf8>>,
@@ -436,12 +435,12 @@ final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
 /// Resolve ANOTHER node's relay X25519 public key by node_id over the DHT
 /// (node_id in, 32-byte key out). Returns `veilOk` when populated, or
 /// `veilRelayX25519Unavailable` when unresolved.
-final int Function(
-        Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
+final int Function(Pointer<VeilHandle>,
+        Pointer<Uint8>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
     veilLookupRelayX25519 = nativeLib
         .lookup<
-                NativeFunction<
-                    Int32 Function(
+            NativeFunction<
+                Int32 Function(
                   Pointer<VeilHandle>,
                   Pointer<Uint8>,
                   Pointer<Uint8>,
@@ -452,8 +451,8 @@ final int Function(
 final int Function(Pointer<VeilHandle>, int, Pointer<Pointer<Utf8>>)
     veilRegisterOnionService = nativeLib
         .lookup<
-                NativeFunction<
-                    Int32 Function(
+            NativeFunction<
+                Int32 Function(
                   Pointer<VeilHandle>,
                   Uint32,
                   Pointer<Pointer<Utf8>>,
@@ -464,12 +463,12 @@ final int Function(Pointer<VeilHandle>, int, Pointer<Pointer<Utf8>>)
 /// (mailbox-by-discovery). Args: handle, rendezvous_node_id(32B), auth_cookie
 /// (16B), validity_window_secs(u64), relay_kem_algo(u8), relay_kem_pk(ptr),
 /// kem_len, err_out. Returns `veilOk` once the daemon records the entry.
-final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Uint8>, int, int,
-        Pointer<Uint8>, int, Pointer<Pointer<Utf8>>)
+final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Uint8>, int,
+        int, Pointer<Uint8>, int, Pointer<Pointer<Utf8>>)
     veilRegisterRendezvousPublisher = nativeLib
         .lookup<
-                NativeFunction<
-                    Int32 Function(
+            NativeFunction<
+                Int32 Function(
                   Pointer<VeilHandle>,
                   Pointer<Uint8>,
                   Pointer<Uint8>,
@@ -492,8 +491,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSendToOnionService = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -517,8 +516,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSendToOnionServiceAnonymous = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -544,8 +543,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSendAnonymousDirect = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -565,8 +564,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSetBackgroundMode = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Int32,
               Pointer<Pointer<Utf8>>,
@@ -580,8 +579,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilNotifyNetworkChanged = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Int32,
               Uint16,
@@ -600,8 +599,8 @@ final int Function(
 final int Function(Pointer<Uint8>, int, Pointer<Pointer<Utf8>>)
     _validateBip39PhraseZeroizeNative = nativeLib
         .lookup<
-                NativeFunction<
-                    Int32 Function(
+            NativeFunction<
+                Int32 Function(
                   Pointer<Uint8>,
                   IntPtr,
                   Pointer<Pointer<Utf8>>,
@@ -625,8 +624,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) _restoreIdentityFromPhraseZeroizeNative = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<Uint8>,
               IntPtr,
               Pointer<Uint8>,
@@ -644,9 +643,13 @@ int veilRestoreIdentityFromPhraseZeroize(
   Pointer<Pointer<Utf8>> errOut,
 ) =>
     _restoreIdentityFromPhraseZeroizeNative(
-        phrase.cast<Uint8>(), phrase.length,
-        veilDir.cast<Uint8>(), veilDir.length,
-        instanceLabel.cast<Uint8>(), instanceLabel.length, errOut);
+        phrase.cast<Uint8>(),
+        phrase.length,
+        veilDir.cast<Uint8>(),
+        veilDir.length,
+        instanceLabel.cast<Uint8>(),
+        instanceLabel.length,
+        errOut);
 
 /// `_zeroize_with_password` variant — same contract as
 /// [veilRestoreIdentityFromPhraseZeroize] plus an optional
@@ -667,8 +670,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) _restoreIdentityFromPhraseZeroizeWithPasswordNative = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<Uint8>,
               IntPtr,
               Pointer<Uint8>,
@@ -689,9 +692,12 @@ int veilRestoreIdentityFromPhraseZeroizeWithPassword(
   Pointer<Pointer<Utf8>> errOut,
 ) =>
     _restoreIdentityFromPhraseZeroizeWithPasswordNative(
-        phrase.cast<Uint8>(), phrase.length,
-        veilDir.cast<Uint8>(), veilDir.length,
-        instanceLabel.cast<Uint8>(), instanceLabel.length,
+        phrase.cast<Uint8>(),
+        phrase.length,
+        veilDir.cast<Uint8>(),
+        veilDir.length,
+        instanceLabel.cast<Uint8>(),
+        instanceLabel.length,
         password == nullptr ? nullptr : password.cast<Uint8>(),
         password == nullptr ? 0 : password.length,
         errOut);
@@ -723,8 +729,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSealPushEnvelope = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<Uint8>,
               IntPtr,
               Pointer<Uint8>,
@@ -742,8 +748,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilGenerateWakeHmacKey = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<Uint8>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_generate_wake_hmac_key')
@@ -759,8 +765,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilVerifyWakeHmac = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<Uint8>,
               Pointer<Uint8>,
               IntPtr,
@@ -780,8 +786,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSetPushEnvelope = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -804,8 +810,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSetWakeHmacEnvelope = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -839,12 +845,14 @@ final int Function(
   Pointer<Uint8>, // password ptr (nullable)
   int, // password_len
   Pointer<Uint8>, // out_status
-  Pointer<Pointer<Utf8>>, // out_uri (malloc'd UTF-8 — caller frees with veil_free_string)
+  Pointer<
+      Pointer<
+          Utf8>>, // out_uri (malloc'd UTF-8 — caller frees with veil_free_string)
   Pointer<Pointer<Utf8>>, // err_out
 ) _createBootstrapInviteNative = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               IntPtr,
@@ -882,8 +890,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) _joinBootstrapUriNative = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               IntPtr,
@@ -968,8 +976,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilMailboxPut = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -998,8 +1006,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilMailboxPutWithCapability = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -1038,8 +1046,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilMailboxPutWithWakeHmac = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -1070,8 +1078,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilLookupRendezvousReplicas = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Uint8,
@@ -1086,8 +1094,8 @@ final int Function(
 /// length to reconstruct the boxed slice for deallocation).
 final void Function(Pointer<Uint8>, int) veilFreeReplicaBuf = nativeLib
     .lookup<
-            NativeFunction<
-                Void Function(
+        NativeFunction<
+            Void Function(
               Pointer<Uint8>,
               IntPtr,
             )>>('veil_free_replica_buf')
@@ -1100,8 +1108,8 @@ final void Function(Pointer<Uint8>, int) veilFreeReplicaBuf = nativeLib
 /// once per callback that received a non-null pointer, after copying the bytes.
 final void Function(Pointer<Uint8>, int) veilFreeBuf = nativeLib
     .lookup<
-            NativeFunction<
-                Void Function(
+        NativeFunction<
+            Void Function(
               Pointer<Uint8>,
               IntPtr,
             )>>('veil_free_buf')
@@ -1122,8 +1130,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilMailboxSeal = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -1153,8 +1161,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilMailboxOpen = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Uint64,
               Pointer<Uint8>,
@@ -1176,8 +1184,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilMailboxFetchCount = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -1195,8 +1203,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilMailboxFetchInto = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<VeilMailboxBlobStruct>,
               Uint32,
@@ -1214,8 +1222,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilMailboxAck = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -1235,8 +1243,8 @@ final Pointer<VeilStreamFfi> Function(
   Pointer<Pointer<Utf8>>,
 ) veilStreamOpen = nativeLib
     .lookup<
-            NativeFunction<
-                Pointer<VeilStreamFfi> Function(
+        NativeFunction<
+            Pointer<VeilStreamFfi> Function(
               Pointer<VeilApp>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -1253,8 +1261,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilStreamWrite = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilStreamFfi>,
               Pointer<Uint8>,
               IntPtr,
@@ -1272,8 +1280,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilStreamRead = nativeLib
     .lookup<
-            NativeFunction<
-                IntPtr Function(
+        NativeFunction<
+            IntPtr Function(
               Pointer<VeilStreamFfi>,
               Pointer<Uint8>,
               IntPtr,
@@ -1298,8 +1306,8 @@ final Pointer<VeilStreamFfi> Function(
   Pointer<Pointer<Utf8>>,
 ) veilStreamAccept = nativeLib
     .lookup<
-            NativeFunction<
-                Pointer<VeilStreamFfi> Function(
+        NativeFunction<
+            Pointer<VeilStreamFfi> Function(
               Pointer<VeilApp>,
               Uint64,
               Pointer<Uint8>,
@@ -1322,8 +1330,8 @@ final Pointer<VeilAnonStreamFfi> Function(
   Pointer<Pointer<Utf8>>,
 ) veilAnonStreamOpen = nativeLib
     .lookup<
-            NativeFunction<
-                Pointer<VeilAnonStreamFfi> Function(
+        NativeFunction<
+            Pointer<VeilAnonStreamFfi> Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -1341,8 +1349,8 @@ final Pointer<VeilAnonStreamFfi> Function(
   Pointer<Pointer<Utf8>>,
 ) veilAnonStreamAccept = nativeLib
     .lookup<
-            NativeFunction<
-                Pointer<VeilAnonStreamFfi> Function(
+        NativeFunction<
+            Pointer<VeilAnonStreamFfi> Function(
               Pointer<VeilHandle>,
               Uint64,
               Pointer<Uint8>,
@@ -1359,8 +1367,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilAnonStreamRead = nativeLib
     .lookup<
-            NativeFunction<
-                IntPtr Function(
+        NativeFunction<
+            IntPtr Function(
               Pointer<VeilAnonStreamFfi>,
               Pointer<Uint8>,
               IntPtr,
@@ -1375,8 +1383,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilAnonStreamWrite = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilAnonStreamFfi>,
               Pointer<Uint8>,
               IntPtr,
@@ -1387,8 +1395,8 @@ final int Function(
 final int Function(Pointer<VeilAnonStreamFfi>, Pointer<Pointer<Utf8>>)
     veilAnonStreamFinish = nativeLib
         .lookup<
-                NativeFunction<
-                    Int32 Function(
+            NativeFunction<
+                Int32 Function(
                   Pointer<VeilAnonStreamFfi>,
                   Pointer<Pointer<Utf8>>,
                 )>>('veil_anon_stream_finish')
@@ -1397,6 +1405,12 @@ final int Function(Pointer<VeilAnonStreamFfi>, Pointer<Pointer<Utf8>>)
 final void Function(Pointer<VeilAnonStreamFfi>) veilAnonStreamClose = nativeLib
     .lookup<NativeFunction<Void Function(Pointer<VeilAnonStreamFfi>)>>(
       'veil_anon_stream_close',
+    )
+    .asFunction();
+
+final void Function(Pointer<VeilAnonStreamFfi>) veilAnonStreamAbort = nativeLib
+    .lookup<NativeFunction<Void Function(Pointer<VeilAnonStreamFfi>)>>(
+      'veil_anon_stream_abort',
     )
     .asFunction();
 
@@ -1413,8 +1427,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilSeal = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<Uint8>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -1435,8 +1449,8 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 ) veilUnseal = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<Uint8>,
               Pointer<Uint8>,
               Pointer<Uint8>,
@@ -1467,16 +1481,16 @@ final Pointer<NativeFunction<Void Function(Pointer<Void>)>>
         .lookup<NativeFunction<Void Function(Pointer<Void>)>>('veil_close');
 
 final Pointer<NativeFunction<Void Function(Pointer<Void>)>>
-    veilAppCloseFinalizerPtr = nativeLib
-        .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
-          'veil_app_close',
-        );
+    veilAppCloseFinalizerPtr =
+    nativeLib.lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+  'veil_app_close',
+);
 
 final Pointer<NativeFunction<Void Function(Pointer<Void>)>>
-    veilStreamCloseFinalizerPtr = nativeLib
-        .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
-          'veil_stream_close',
-        );
+    veilStreamCloseFinalizerPtr =
+    nativeLib.lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+  'veil_stream_close',
+);
 
 // ── Multi-device pairing (Epic 489.8) ───────────────────────────────────────
 
@@ -1515,8 +1529,8 @@ final int Function(
   Pointer<Pointer<Utf8>>, // err_out
 ) _pairSourceCreateInviteNative = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               IntPtr,
@@ -1553,8 +1567,8 @@ final int Function(
   Pointer<Pointer<Utf8>>, // err_out
 ) veilPairSourceHandleHello = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               IntPtr,
@@ -1575,8 +1589,8 @@ final int Function(
   Pointer<Pointer<Utf8>>, // err_out
 ) veilPairSourceHandleConfirm = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               IntPtr,
@@ -1596,8 +1610,8 @@ final int Function(
   Pointer<Pointer<Utf8>>, // err_out
 ) _pairTargetConsumeUriNative = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               IntPtr,
@@ -1630,8 +1644,8 @@ final int Function(
   Pointer<Pointer<Utf8>>, // err_out
 ) veilPairTargetHandleCert = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Pointer<Uint8>,
               IntPtr,
@@ -1651,8 +1665,8 @@ final int Function(
   Pointer<Pointer<Utf8>>, // err_out
 ) veilPairTargetBuildConfirm = nativeLib
     .lookup<
-            NativeFunction<
-                Int32 Function(
+        NativeFunction<
+            Int32 Function(
               Pointer<VeilHandle>,
               Uint8,
               Pointer<Uint8>,

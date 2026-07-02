@@ -55,6 +55,7 @@ use veil_util::{lock, wlock};
 // cfg-gating the import avoids unused-import warning in non-test builds.
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 use super::{AuthDeliverInbound, DispatchResult, FrameDispatcher};
 use veil_anonymity::{
@@ -77,6 +78,78 @@ fn circuit_now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[derive(Default)]
+struct CircuitDataDiag {
+    rx: u64,
+    fwd_relay_ok: u64,
+    fwd_relay_fail: u64,
+    fwd_terminus: u64,
+    splice_hit: u64,
+    splice_miss: u64,
+    splice_ok: u64,
+    splice_fail: u64,
+    ret_relay_ok: u64,
+    ret_relay_fail: u64,
+    send_missing: u64,
+    send_full: u64,
+    send_closed: u64,
+    origin_open_ok: u64,
+    origin_open_err: u64,
+    origin_stream_ok: u64,
+    origin_stream_full: u64,
+    origin_stream_missing: u64,
+    unknown: u64,
+    last_logged_rx: u64,
+    last_log: Option<std::time::Instant>,
+}
+
+static CIRCUIT_DATA_DIAG: OnceLock<StdMutex<CircuitDataDiag>> = OnceLock::new();
+
+fn circuit_data_diag(update: impl FnOnce(&mut CircuitDataDiag)) {
+    let mut diag = CIRCUIT_DATA_DIAG
+        .get_or_init(|| StdMutex::new(CircuitDataDiag::default()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    update(&mut diag);
+    if diag.rx == diag.last_logged_rx {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if diag
+        .last_log
+        .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(2))
+    {
+        return;
+    }
+    diag.last_log = Some(now);
+    diag.last_logged_rx = diag.rx;
+    log::info!(
+        "onion-stream.circuit-data rx={} fwd_relay={}/{} fwd_terminus={} \
+         splice_hit={} splice_miss={} splice_send={}/{} ret_relay={}/{} \
+         send_err=missing:{} full:{} closed:{} \
+         origin_open={}/{} origin_stream=ok:{} full:{} missing:{} unknown={}",
+        diag.rx,
+        diag.fwd_relay_ok,
+        diag.fwd_relay_fail,
+        diag.fwd_terminus,
+        diag.splice_hit,
+        diag.splice_miss,
+        diag.splice_ok,
+        diag.splice_fail,
+        diag.ret_relay_ok,
+        diag.ret_relay_fail,
+        diag.send_missing,
+        diag.send_full,
+        diag.send_closed,
+        diag.origin_open_ok,
+        diag.origin_open_err,
+        diag.origin_stream_ok,
+        diag.origin_stream_full,
+        diag.origin_stream_missing,
+        diag.unknown,
+    );
 }
 
 /// Outcome of attempting to forward an introduce down a return circuit.
@@ -823,6 +896,7 @@ impl FrameDispatcher {
             Ok(c) => c,
             Err(_) => return DispatchResult::NoResponse,
         };
+        circuit_data_diag(|d| d.rx = d.rx.saturating_add(1));
         let link = *node_id.as_bytes();
         let now = circuit_now_unix();
 
@@ -853,11 +927,18 @@ impl FrameDispatcher {
                             ciphertext: buf,
                         };
                         if let Ok(b) = out.encode() {
-                            self.send_relay_chain_msg(
+                            let sent = self.send_relay_chain_msg(
                                 &NodeId::from(nl),
                                 RelayChainMsg::CircuitData,
                                 &b,
                             );
+                            circuit_data_diag(|d| {
+                                if sent {
+                                    d.fwd_relay_ok = d.fwd_relay_ok.saturating_add(1);
+                                } else {
+                                    d.fwd_relay_fail = d.fwd_relay_fail.saturating_add(1);
+                                }
+                            });
                         }
                     }
                     None => {
@@ -870,6 +951,7 @@ impl FrameDispatcher {
                         // reliability + ordering). Anything else is a plain terminus
                         // delivery (logged). Forward-terminus CircuitData carries no
                         // other traffic today, so this overload is safe.
+                        circuit_data_diag(|d| d.fwd_terminus = d.fwd_terminus.saturating_add(1));
                         let payload = read_payload(&buf);
                         let mut spliced = false;
                         if let Some(p) = &payload
@@ -879,8 +961,14 @@ impl FrameDispatcher {
                             let mut cookie = [0u8; COOKIE_LEN];
                             cookie.copy_from_slice(&p[..COOKIE_LEN]);
                             if let Some(circuit) = reg.lookup(&cookie) {
-                                self.splice_stream_cell(&circuit, &p[COOKIE_LEN..]);
-                                spliced = true;
+                                circuit_data_diag(|d| {
+                                    d.splice_hit = d.splice_hit.saturating_add(1)
+                                });
+                                spliced = self.splice_stream_cell(&circuit, &p[COOKIE_LEN..]);
+                            } else {
+                                circuit_data_diag(|d| {
+                                    d.splice_miss = d.splice_miss.saturating_add(1);
+                                });
                             }
                         }
                         if !spliced && let Some(p) = &payload {
@@ -914,11 +1002,18 @@ impl FrameDispatcher {
                     ciphertext: buf,
                 };
                 if let Ok(b) = out.encode() {
-                    self.send_relay_chain_msg(
+                    let sent = self.send_relay_chain_msg(
                         &NodeId::from(state.prev_link),
                         RelayChainMsg::CircuitData,
                         &b,
                     );
+                    circuit_data_diag(|d| {
+                        if sent {
+                            d.ret_relay_ok = d.ret_relay_ok.saturating_add(1);
+                        } else {
+                            d.ret_relay_fail = d.ret_relay_fail.saturating_add(1);
+                        }
+                    });
                 }
                 return DispatchResult::NoResponse;
             }
@@ -936,6 +1031,7 @@ impl FrameDispatcher {
         {
             return match origin.open_return(cell.seq, &cell.ciphertext) {
                 Ok(opened) => {
+                    circuit_data_diag(|d| d.origin_open_ok = d.origin_open_ok.saturating_add(1));
                     // onion-stream Phase 1c: a return cell on a REGISTERED stream
                     // circuit is delivered to its channel; any other id is a sealed
                     // introduce R forwarded down the circuit (path unchanged — no
@@ -943,16 +1039,40 @@ impl FrameDispatcher {
                     if let Ok(map) = self.stream_recv.lock()
                         && let Some(tx) = map.get(&cell.circuit_id)
                     {
-                        let _ = tx.try_send(opened); // drop-on-full; ARQ recovers
+                        match tx.try_send(opened) {
+                            Ok(()) => circuit_data_diag(|d| {
+                                d.origin_stream_ok = d.origin_stream_ok.saturating_add(1);
+                            }),
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                circuit_data_diag(|d| {
+                                    d.origin_stream_full = d.origin_stream_full.saturating_add(1);
+                                });
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                circuit_data_diag(|d| {
+                                    d.origin_stream_missing =
+                                        d.origin_stream_missing.saturating_add(1);
+                                });
+                            }
+                        }
                         return DispatchResult::NoResponse;
                     }
+                    circuit_data_diag(|d| {
+                        d.origin_stream_missing = d.origin_stream_missing.saturating_add(1);
+                    });
                     self.process_introduce_ciphertext(&opened, &link)
                 }
-                Err(_) => DispatchResult::NoResponse, // a layer failed AEAD — drop
+                Err(_) => {
+                    circuit_data_diag(|d| {
+                        d.origin_open_err = d.origin_open_err.saturating_add(1);
+                    });
+                    DispatchResult::NoResponse // a layer failed AEAD — drop
+                }
             };
         }
 
         // Unknown circuit — anti-leak silent drop.
+        circuit_data_diag(|d| d.unknown = d.unknown.saturating_add(1));
         DispatchResult::NoResponse
     }
 
@@ -1137,15 +1257,19 @@ impl FrameDispatcher {
         &self,
         circuit: &veil_anonymity::circuit_table::CircuitState,
         bytes: &[u8],
-    ) {
+    ) -> bool {
         use veil_anonymity::circuit_data::{Direction, apply_layer, wrap_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
         let mut buf = match wrap_payload(bytes) {
             Ok(b) => b,
-            Err(_) => return, // larger than one cell — drop (stream MSS keeps small)
+            Err(_) => {
+                circuit_data_diag(|d| d.splice_fail = d.splice_fail.saturating_add(1));
+                return false; // larger than one cell — drop (stream MSS keeps small)
+            }
         };
         let Some(seq) = circuit.alloc_return_seq() else {
-            return; // return-seq exhausted — drop; the circuit idle-GCs + rebuilds
+            circuit_data_diag(|d| d.splice_fail = d.splice_fail.saturating_add(1));
+            return false; // return-seq exhausted — drop; the circuit idle-GCs + rebuilds
         };
         apply_layer(&circuit.circuit_key, Direction::Return, seq, &mut buf);
         let cell = CircuitDataPayload {
@@ -1154,26 +1278,36 @@ impl FrameDispatcher {
             ciphertext: buf,
         };
         if let Ok(body) = cell.encode() {
-            self.send_relay_chain_msg(
+            let sent = self.send_relay_chain_msg(
                 &NodeId::from(circuit.prev_link),
                 RelayChainMsg::CircuitData,
                 &body,
             );
+            circuit_data_diag(|d| {
+                if sent {
+                    d.splice_ok = d.splice_ok.saturating_add(1);
+                } else {
+                    d.splice_fail = d.splice_fail.saturating_add(1);
+                }
+            });
+            return sent;
         }
+        circuit_data_diag(|d| d.splice_fail = d.splice_fail.saturating_add(1));
+        false
     }
 
     /// Send a `RelayChain::<msg>` frame with the given body bytes to
     /// the named peer's session. Used by the rendezvous-relay
     /// state machine for receiver↔rendezvous control frames AND
     /// for forwarding cells / introduces.
-    fn send_relay_chain_msg(&self, node_id: &NodeId, msg: RelayChainMsg, body: &[u8]) {
+    fn send_relay_chain_msg(&self, node_id: &NodeId, msg: RelayChainMsg, body: &[u8]) -> bool {
         use veil_proto::codec::encode_header;
         let Some(ref reg) = self.session_tx_registry else {
             self.logger.info(
                 "anonymity.relay_chain.send.no_registry",
                 "session_tx_registry not wired; cannot send",
             );
-            return;
+            return false;
         };
         let mut hdr = FrameHeader::new(FrameFamily::RelayChain as u8, msg as u16);
         hdr.body_len = body.len() as u32;
@@ -1181,15 +1315,30 @@ impl FrameDispatcher {
         let mut frame = encode_header(&hdr).to_vec();
         frame.extend_from_slice(body);
         let guard = wlock!(reg);
-        if !guard.send_to(node_id.as_bytes(), veil_proto::priority::INTERACTIVE, frame) {
+        if let Err(err) =
+            guard.send_to_result(node_id.as_bytes(), veil_proto::priority::INTERACTIVE, frame)
+        {
+            circuit_data_diag(|d| match err {
+                veil_session::SendToError::Missing => {
+                    d.send_missing = d.send_missing.saturating_add(1);
+                }
+                veil_session::SendToError::Full => {
+                    d.send_full = d.send_full.saturating_add(1);
+                }
+                veil_session::SendToError::Closed => {
+                    d.send_closed = d.send_closed.saturating_add(1);
+                }
+            });
             self.logger.info(
                 "anonymity.relay_chain.send.peer_unreachable",
                 format!(
-                    "peer={} has no live session; dropped",
+                    "peer={} send failed ({err:?}); dropped",
                     veil_util::hex_short(node_id.as_bytes()),
                 ),
             );
+            return false;
         }
+        true
     }
 
     /// Forward `outbound_cell` to `next_hop` as a fresh
