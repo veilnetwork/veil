@@ -720,7 +720,14 @@ impl StreamDataPacer {
     }
 
     async fn wait(&self, peer: [u8; 32]) {
-        if self.interval.is_zero() {
+        self.wait_n(peer, 1).await
+    }
+
+    /// Reserve `n` consecutive pacing slots with ONE schedule update and at
+    /// most one park. Batched senders reserve their whole DATA run up front
+    /// instead of taking the pacer lock per cell.
+    async fn wait_n(&self, peer: [u8; 32], n: u32) {
+        if self.interval.is_zero() || n == 0 {
             return;
         }
         // `tokio::time::sleep(100us)` is effectively a ~1ms sleep on common
@@ -748,7 +755,7 @@ impl StreamDataPacer {
                 *next = earliest;
             }
             let scheduled = *next;
-            *next = scheduled + self.interval;
+            *next = scheduled + self.interval * n;
             scheduled.saturating_duration_since(now)
         };
         if delay >= min_sleep {
@@ -820,6 +827,42 @@ fn env_or_android_usize(
 }
 
 impl CellSender for CircuitCells {
+    async fn send_many(
+        &self,
+        dst: Addr,
+        cells: &mut std::collections::VecDeque<Vec<u8>>,
+    ) -> io::Result<()> {
+        while !cells.is_empty() {
+            // Gather the front run of plain DATA cells for one stream id. Every
+            // other frame kind (handshake/ACK/FIN/RST) takes the scalar path,
+            // which owns route-class selection and protected-intro sealing.
+            let mut run_stream_id = None;
+            let mut run_len = 0usize;
+            for cell in cells.iter() {
+                match Frame::decode(cell) {
+                    Some(Frame::Data { stream_id, .. })
+                        if run_stream_id.is_none_or(|sid| sid == stream_id) =>
+                    {
+                        run_stream_id = Some(stream_id);
+                        run_len += 1;
+                    }
+                    _ => break,
+                }
+            }
+            match run_stream_id {
+                Some(stream_id) if run_len > 1 => {
+                    self.send_data_run(dst, stream_id, run_len, cells).await?;
+                }
+                _ => {
+                    let front = cells.front().expect("checked non-empty").clone();
+                    self.send(dst, front).await?;
+                    cells.pop_front();
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
         let decoded = Frame::decode(&cell);
         let stream_id = decoded.as_ref().map(|frame| frame.stream_id());
@@ -1019,6 +1062,100 @@ impl CellSender for CircuitCells {
 }
 
 impl CircuitCells {
+    /// Send a contiguous run of DATA cells for one stream over one resolved
+    /// route: one route lookup, one staleness check, one pacer reservation and
+    /// one activity/bookkeeping pass for the whole run. The per-cell scalar
+    /// path takes 3-4 async lock acquisitions per 318-byte cell, which at
+    /// 7-9k cells/s dominated the live phone sender in kernel/wake time.
+    async fn send_data_run(
+        &self,
+        dst: Addr,
+        stream_id: u32,
+        run_len: usize,
+        cells: &mut std::collections::VecDeque<Vec<u8>>,
+    ) -> io::Result<()> {
+        let Some(route) = self
+            .circuit_for(dst.node, Some(stream_id), RouteClass::Bulk, false)
+            .await?
+        else {
+            // Circuit not up yet — drop the run; the stream's ARQ resends.
+            cells.drain(..run_len);
+            return Ok(());
+        };
+        if self.route_session_stale(&route) {
+            self.mark_route_stale(dst.node, &route).await;
+            // Stale route == dropped run: ARQ retransmits on a fresh path.
+            cells.drain(..run_len);
+            return Ok(());
+        }
+        let cookie = stream_cookie(&dst.node);
+        self.data_pacer.wait_n(dst.node, run_len as u32).await;
+        let mut sent = 0usize;
+        while sent < run_len {
+            let cell = cells.front().expect("run bounded by deque len");
+            let data_payload_len = match Frame::decode(cell) {
+                Some(Frame::Data { payload, .. }) => payload.len(),
+                _ => 0,
+            };
+            let mut env = Vec::with_capacity(COOKIE_LEN + CIRCUIT_PEER_TAG_LEN + cell.len());
+            env.extend_from_slice(&cookie);
+            match route.envelope {
+                CircuitEnvelope::LegacyClearSender { sender_node } => {
+                    env.extend_from_slice(&sender_node);
+                }
+                CircuitEnvelope::ProtectedIntro { peer_tag, .. } => {
+                    env.extend_from_slice(&peer_tag);
+                }
+            }
+            env.extend_from_slice(cell);
+            if env.len() > veil_onion_stream::wire::MAX_CELL {
+                return Err(io::Error::other(format!(
+                    "circuit stream envelope too large: {} > {}",
+                    env.len(),
+                    veil_onion_stream::wire::MAX_CELL
+                )));
+            }
+            if let Err(e) = self
+                .services
+                .send_circuit_cell_detailed(&route.circuit, &env)
+            {
+                if e == veil_node_runtime::DataCircuitSendError::QueueFull {
+                    // Sent cells are gone; the failing cell and the rest of the
+                    // run stay queued for the caller's WouldBlock retry.
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "circuit first-hop TX queue full",
+                    ));
+                }
+                self.mark_route_send_failed(dst.node, &route, e).await;
+                // Route enqueue failure == dropped cells; ARQ retransmits while
+                // route selection moves off the cooled path.
+                cells.drain(..run_len - sent);
+                break;
+            }
+            if let Some(stats) = route.stats.as_ref() {
+                if let Some(snapshot) = stats.record_send(true, data_payload_len) {
+                    if let Some(relay) = route.rendezvous_node {
+                        diag_node(
+                            &self.me,
+                            &format!(
+                                "outbound route stats for {} via R={} path={} {snapshot}",
+                                short_node(&dst.node),
+                                short_node(&relay),
+                                short_path(route.circuit.relay_path()),
+                            ),
+                        );
+                    }
+                }
+            }
+            cells.pop_front();
+            sent += 1;
+        }
+        mark_circuit_activity(&self.activity);
+        self.mark_outbound_non_handshake(dst.node, &route).await;
+        Ok(())
+    }
+
     async fn circuit_for(
         &self,
         dst_node: [u8; 32],

@@ -23,6 +23,25 @@ use crate::wire::reset_reason;
 /// failure (circuit torn down). `recv_cell` returns `None` on clean close.
 pub trait CellDuplex: Send {
     fn send_cell(&mut self, cell: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
+    /// Send a burst of cells in order. Cells the carrier accepts are popped
+    /// from the front of `cells`; on `Err` the failing cell and everything
+    /// after it stay queued so the caller can retry (`WouldBlock`) or tear
+    /// down. The default forwards cell-by-cell; carriers with per-cell
+    /// route/pacing/lock overhead should override and amortize it across the
+    /// run.
+    fn send_cells(
+        &mut self,
+        cells: &mut std::collections::VecDeque<Vec<u8>>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            while let Some(front) = cells.front() {
+                let cell = front.clone();
+                self.send_cell(&cell).await?;
+                cells.pop_front();
+            }
+            Ok(())
+        }
+    }
     fn recv_cell(&mut self) -> impl Future<Output = io::Result<Option<Vec<u8>>>> + Send;
     fn on_data_rto(
         &mut self,
@@ -303,6 +322,11 @@ const DELIVER_CHUNK: usize = 256 * 1024;
 /// not enter the next bounded queue, so keep the exact encoded cell and retry it
 /// instead of turning local queue pressure into end-to-end packet loss.
 const SEND_WOULD_BLOCK_RETRY_MS: u64 = 1;
+/// Upper bound on cells pulled out of the engine into the local outbound
+/// burst before handing it to the carrier. The engine's own pacing budget
+/// already bounds one poll pass (<= max_pacing_batch); this is a backstop so
+/// a stuck carrier cannot accumulate unbounded committed cells locally.
+const MAX_OUTBOUND_BURST: usize = 512;
 const DEBUG_SUMMARY_ENV: &str = "VEIL_ONION_STREAM_DEBUG_SUMMARY_MS";
 
 fn debug_summary_period_ms(configured: u64) -> Option<u64> {
@@ -342,7 +366,10 @@ async fn drive<D: CellDuplex>(
     let mut next_debug_summary_ms = debug_summary_period_ms.unwrap_or(0);
     let mut cmd_open = true;
     let mut cell = Vec::with_capacity(crate::wire::MAX_CELL);
-    let mut blocked_cell: Option<Vec<u8>> = None;
+    // Cells the engine has committed to flight but the carrier has not yet
+    // accepted (batch in progress or local backpressure). FIFO preserves the
+    // engine's emission order.
+    let mut outbound: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
     let mut send_retry_at: Option<u64> = None;
     let mut blocked_since_ms: Option<u64> = None;
     let mut would_block_total: u64 = 0;
@@ -361,7 +388,7 @@ async fn drive<D: CellDuplex>(
                 format!(
                     "now={now} blocked_cell={} blocked_age={}ms wb_total={} \
                      wb_retries={} wb_recovered={} {}",
-                    blocked_cell.is_some(),
+                    outbound.len(),
                     blocked_age_ms,
                     would_block_total,
                     would_block_retries,
@@ -418,53 +445,51 @@ async fn drive<D: CellDuplex>(
             permit.send(tmp);
         }
 
-        // 3. Drain everything the engine wants to put on the wire. ACKs emitted
-        // here now see the receive buffer after the app handoff above.
+        // 3. Drain everything the engine wants to put on the wire and hand it
+        // to the carrier as ordered bursts (the carrier amortizes route lookup,
+        // pacing and per-cell locking across a run). ACKs emitted here see the
+        // receive buffer after the app handoff above.
         //
         // A `WouldBlock` from the cell carrier is local backpressure (bounded
-        // session TX queue full), not proof that the peer/path lost a packet. The
-        // engine has already committed this encoded cell to its sent flight, so
-        // silently dropping it would manufacture loss and drive RTO/cwnd collapse.
-        // Keep exactly one blocked encoded cell and retry it before polling more
+        // session TX queue full), not proof that the peer/path lost a packet.
+        // The engine has already committed every polled cell to its sent
+        // flight, so silently dropping one would manufacture loss and drive
+        // RTO/cwnd collapse. Whatever the carrier does not accept stays queued
+        // in `outbound` (in emission order) and is retried before polling more
         // engine output.
-        if let Some(blocked) = blocked_cell.take() {
-            if send_retry_at.is_none_or(|at| now >= at) {
-                match duplex.send_cell(&blocked).await {
-                    Ok(()) => {
-                        send_retry_at = None;
-                        blocked_since_ms = None;
+        loop {
+            if outbound.is_empty() && !engine.is_closed() {
+                while outbound.len() < MAX_OUTBOUND_BURST && engine.poll_transmit(now, &mut cell) {
+                    outbound.push_back(cell.clone());
+                }
+            }
+            if outbound.is_empty() {
+                break;
+            }
+            if send_retry_at.is_some_and(|at| now < at) {
+                break;
+            }
+            let retrying = send_retry_at.is_some();
+            match duplex.send_cells(&mut outbound).await {
+                Ok(()) => {
+                    send_retry_at = None;
+                    blocked_since_ms = None;
+                    if retrying {
                         would_block_recovered = would_block_recovered.saturating_add(1);
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        blocked_cell = Some(blocked);
-                        would_block_total = would_block_total.saturating_add(1);
-                        would_block_retries = would_block_retries.saturating_add(1);
-                        blocked_since_ms.get_or_insert(now);
-                        send_retry_at = Some(now.saturating_add(SEND_WOULD_BLOCK_RETRY_MS));
-                    }
-                    Err(_) => {
-                        engine.reset(reset_reason::APP); // circuit permanently gone
-                    }
                 }
-            } else {
-                blocked_cell = Some(blocked);
-            }
-        }
-        if blocked_cell.is_none() && !engine.is_closed() {
-            while engine.poll_transmit(now, &mut cell) {
-                match duplex.send_cell(&cell).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        blocked_cell = Some(cell.clone());
-                        would_block_total = would_block_total.saturating_add(1);
-                        blocked_since_ms.get_or_insert(now);
-                        send_retry_at = Some(now.saturating_add(SEND_WOULD_BLOCK_RETRY_MS));
-                        break;
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    would_block_total = would_block_total.saturating_add(1);
+                    if retrying {
+                        would_block_retries = would_block_retries.saturating_add(1);
                     }
-                    Err(_) => {
-                        engine.reset(reset_reason::APP); // circuit permanently gone
-                        break;
-                    }
+                    blocked_since_ms.get_or_insert(now);
+                    send_retry_at = Some(now.saturating_add(SEND_WOULD_BLOCK_RETRY_MS));
+                    break;
+                }
+                Err(_) => {
+                    engine.reset(reset_reason::APP); // circuit permanently gone
+                    break;
                 }
             }
         }
@@ -476,7 +501,7 @@ async fn drive<D: CellDuplex>(
 
         // 5. Block until the next thing happens.
         let mut timeout_at = engine.next_timeout();
-        if blocked_cell.is_some()
+        if !outbound.is_empty()
             && let Some(retry_at) = send_retry_at
         {
             timeout_at = Some(timeout_at.map_or(retry_at, |t| t.min(retry_at)));
