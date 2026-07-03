@@ -153,6 +153,129 @@ impl RendezvousResolveCache {
     }
 }
 
+impl RendezvousResolveCache {
+    /// Drop a receiver's cached route so the NEXT send re-compares independent
+    /// DHT replicas even inside the TTL. Used by the sender-side stall detector:
+    /// repeated un-answered sends mean the cached (relay, cookie) may be a
+    /// black hole (`cookie_unknown` at the relay is deliberately silent), so
+    /// waiting out the TTL just re-fires into it.
+    pub fn remove(&self, receiver: &[u8; 32]) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(receiver);
+    }
+}
+
+// ── Sender-side anonymous-delivery stall detector ────────────────────────────
+
+/// Consecutive un-answered anonymous sends to one receiver before the route is
+/// treated as stalled. Kept small: a healthy peer answers the very first
+/// send (delivery-ACK via the attached reply block or a live frame).
+pub const ANON_SEND_STALL_THRESHOLD: u32 = 3;
+/// Minimum age of the oldest un-answered send before the stall verdict can
+/// trip — a burst of content chunks legitimately outruns the first ACK.
+pub const ANON_SEND_STALL_MIN_SECS: u64 = 8;
+/// How long one stall verdict stays in force before the cache is invalidated
+/// again (bounds forced re-resolves to one per window while stalled).
+pub const ANON_SEND_WIDEN_SECS: u64 = 60;
+/// Bound on tracked receivers (LRU-ish evict of the stalest entry).
+const MAX_STALL_ENTRIES: usize = 512;
+
+/// Verdict of [`AnonSendStallTracker::note_send`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StallVerdict {
+    /// Widen this send's introduce fan-out with connected relay candidates —
+    /// the receiver may be live-registered at a relay its resolvable ads
+    /// don't name (stale ad / incomplete DHT propagation).
+    pub widen: bool,
+    /// Also drop the receiver's resolve-cache entry (at most once per
+    /// [`ANON_SEND_WIDEN_SECS`]) so this send re-compares fresh replicas.
+    pub invalidate_cache: bool,
+}
+
+#[derive(Default, Clone, Copy)]
+struct StallEntry {
+    unanswered: u32,
+    first_unix: u64,
+    widen_until: u64,
+}
+
+/// Detects the "sender keeps introducing into a black hole" failure the
+/// fire-and-forget introduce path cannot see directly: the relay drops an
+/// introduce whose (receiver, cookie) has no live registration WITHOUT any
+/// signal to the sender (`cookie_unknown` is silent by design — surfacing it
+/// would leak subscriber sets to probes). The only sender-observable truth is
+/// the ABSENCE of any verified inbound from that receiver while our sends to
+/// it pile up — their delivery-ACKs, replies and re-requests all arrive as
+/// verified `AuthAppDeliver`s. Tracked per receiver; a verified inbound clears
+/// the streak ([`note_answer`], hooked into the auth-deliver verify task).
+pub struct AnonSendStallTracker {
+    inner: Mutex<std::collections::HashMap<[u8; 32], StallEntry>>,
+}
+
+impl AnonSendStallTracker {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Record one more anonymous send toward `receiver` and judge the route.
+    pub fn note_send(&self, receiver: [u8; 32], now_unix: u64) -> StallVerdict {
+        let mut m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if m.len() >= MAX_STALL_ENTRIES
+            && !m.contains_key(&receiver)
+            && let Some(stalest) = m
+                .iter()
+                .min_by_key(|(_, e)| e.first_unix)
+                .map(|(id, _)| *id)
+        {
+            m.remove(&stalest);
+        }
+        let e = m.entry(receiver).or_default();
+        if e.unanswered == 0 {
+            e.first_unix = now_unix;
+        }
+        e.unanswered = e.unanswered.saturating_add(1);
+        if e.widen_until > now_unix {
+            // Already stalled this window: keep widening, no fresh invalidate.
+            return StallVerdict {
+                widen: true,
+                invalidate_cache: false,
+            };
+        }
+        if e.unanswered >= ANON_SEND_STALL_THRESHOLD
+            && now_unix.saturating_sub(e.first_unix) >= ANON_SEND_STALL_MIN_SECS
+        {
+            e.widen_until = now_unix + ANON_SEND_WIDEN_SECS;
+            return StallVerdict {
+                widen: true,
+                invalidate_cache: true,
+            };
+        }
+        StallVerdict {
+            widen: false,
+            invalidate_cache: false,
+        }
+    }
+
+    /// A VERIFIED inbound from `sender` proves the route from them works (and
+    /// their ACKs are how our own sends are answered) — clear their streak.
+    pub fn note_answer(&self, sender: &[u8; 32]) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sender);
+    }
+}
+
+impl Default for AnonSendStallTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Default for RendezvousResolveCache {
     fn default() -> Self {
         Self::new()
@@ -374,6 +497,12 @@ pub struct AnonymityState {
     /// honoured this, but `select_onion_relay_path` (onion-service / reply
     /// circuits) used to ignore it (diff-audit Δ2-h) — empty = auto-pick.
     pub pinned_rendezvous_relays: Vec<[u8; 32]>,
+
+    /// Sender-side anonymous-delivery stall detector (see
+    /// [`AnonSendStallTracker`]): trips a forced re-resolve + widened introduce
+    /// fan-out when repeated sends to a receiver draw no verified inbound.
+    /// Short-term memory only; resetting on config reload is acceptable.
+    pub send_stall: Arc<AnonSendStallTracker>,
 }
 
 /// One hosted onion service to keep alive (see [`AnonymityState::onion_services`]).
@@ -438,6 +567,7 @@ impl AnonymityState {
             onion_services: Arc::new(Mutex::new(Vec::new())),
             onion_service_hops,
             pinned_rendezvous_relays,
+            send_stall: Arc::new(AnonSendStallTracker::new()),
         }
     }
 }
@@ -539,5 +669,50 @@ mod tests {
         let _id2 = s.store(rb(2), OWNER, 0);
         let _id3 = s.store(rb(3), OWNER, 0); // over cap → evicts id1
         assert_eq!(s.peek(id1, OWNER, 0), None, "oldest evicted");
+    }
+
+    #[test]
+    fn stall_tracker_trips_after_threshold_and_min_age() {
+        let t = AnonSendStallTracker::new();
+        let r = [7u8; 32];
+        // Two quick sends: below the count threshold.
+        assert!(!t.note_send(r, 100).widen);
+        assert!(!t.note_send(r, 101).widen);
+        // Third send but still inside the min-age window: not yet.
+        assert!(!t.note_send(r, 102).widen);
+        // Past the min age with the streak intact: trips, invalidates once.
+        let v = t.note_send(r, 100 + ANON_SEND_STALL_MIN_SECS);
+        assert!(v.widen && v.invalidate_cache);
+        // Subsequent sends inside the window keep widening WITHOUT another
+        // cache invalidation (bounds forced re-resolves).
+        let v2 = t.note_send(r, 101 + ANON_SEND_STALL_MIN_SECS);
+        assert!(v2.widen && !v2.invalidate_cache);
+        // After the widen window lapses and the streak persists, it re-trips
+        // with a fresh invalidation.
+        let v3 = t.note_send(r, 102 + ANON_SEND_STALL_MIN_SECS + ANON_SEND_WIDEN_SECS);
+        assert!(v3.widen && v3.invalidate_cache);
+    }
+
+    #[test]
+    fn stall_tracker_clears_on_verified_answer() {
+        let t = AnonSendStallTracker::new();
+        let r = [8u8; 32];
+        for i in 0..5 {
+            t.note_send(r, 100 + i);
+        }
+        assert!(t.note_send(r, 100 + ANON_SEND_STALL_MIN_SECS + 5).widen);
+        // A verified inbound from the peer resets everything.
+        t.note_answer(&r);
+        assert!(!t.note_send(r, 200 + ANON_SEND_STALL_MIN_SECS).widen);
+    }
+
+    #[test]
+    fn resolve_cache_remove_forces_refresh() {
+        let c = RendezvousResolveCache::new();
+        let r = [9u8; 32];
+        c.put(r, vec![ad(9, 1, 0, 100)]);
+        assert!(c.get(&r, 50).is_some());
+        c.remove(&r);
+        assert!(c.get(&r, 50).is_none(), "removed entry must not serve");
     }
 }
