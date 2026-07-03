@@ -40,8 +40,9 @@ use std::time::{Duration, Instant};
 
 use veil_app::AppMessage;
 use veil_mailbox::{
-    MAILBOX_APP_ID, MAILBOX_FETCH_ENDPOINT_CAPACITY, MAILBOX_FETCH_ENDPOINT_ID,
-    MAILBOX_FETCH_REPLY_MAX_BYTES, MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, Mailbox,
+    MAILBOX_ACK_ENDPOINT_CAPACITY, MAILBOX_ACK_ENDPOINT_ID, MAILBOX_APP_ID,
+    MAILBOX_FETCH_ENDPOINT_CAPACITY, MAILBOX_FETCH_ENDPOINT_ID, MAILBOX_FETCH_REPLY_MAX_BYTES,
+    MAILBOX_PUT_ENDPOINT_CAPACITY, MAILBOX_PUT_ENDPOINT_ID, Mailbox,
 };
 use veil_proto::{
     MAX_MAILBOX_FETCH_ENTRIES, MAX_MAILBOX_PUT_CHUNKS, MailboxBlobWire, MailboxFetchRespPayload,
@@ -204,12 +205,17 @@ pub fn spawn_mailbox_app_service(
                 endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
                 capacity: MAILBOX_FETCH_ENDPOINT_CAPACITY,
             },
+            BuiltinEndpoint {
+                endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
+                capacity: MAILBOX_ACK_ENDPOINT_CAPACITY,
+            },
         ],
     };
     host.spawn(ctx, spec, move |mut ctx, mut rxs| async move {
-        // Receivers are in spec.endpoints order: [PUT, FETCH].
+        // Receivers are in spec.endpoints order: [PUT, FETCH, ACK].
         let mut put_rx = rxs.remove(0);
         let mut fetch_rx = rxs.remove(0);
+        let mut ack_rx = rxs.remove(0);
         // Per-service deposit reassembler — the task is single-threaded, so the
         // `&mut` needs no lock. State stays local to this service instance.
         let mut reassembler = PutChunkReassembler::default();
@@ -220,6 +226,9 @@ pub fn spawn_mailbox_app_service(
                 }
                 Some(msg) = fetch_rx.recv() => {
                     handle_fetch_message(&mailbox, reply_sender.as_ref(), msg).await;
+                }
+                Some(msg) = ack_rx.recv() => {
+                    handle_ack_message(&mailbox, msg);
                 }
                 _ = ctx.shutdown.changed() => {
                     log::info!("veil-mailbox: app service stopping");
@@ -328,6 +337,53 @@ pub async fn handle_fetch_message(
         ),
         Err(e) => log::warn!(
             "veil-mailbox: FETCH reply failed (recv={}): {e:?}",
+            hex_short(&src_node_id),
+        ),
+    }
+}
+
+/// Handle one incoming app message addressed to the ACK endpoint.
+///
+/// Same auth model as FETCH: the onion delivery cryptographically verified the
+/// requester, so `src_node_id` IS the receiver — it can only drop its OWN
+/// blobs. Payload = the 32-byte `content_id` to drop (fire-and-forget, no
+/// reply). Without this endpoint an already-processed blob was re-served on
+/// every fetch until its 7-day TTL — pure wasted onion bandwidth, and a
+/// permanently-undecryptable deposit kept the receiver's drain loop at max
+/// cadence the whole time. All paths fail-safe: malformed/unauthenticated
+/// requests are logged + discarded.
+pub fn handle_ack_message(mailbox: &Mailbox, msg: AppMessage) {
+    let (src_node_id, data) = match msg {
+        AppMessage::Deliver {
+            src_node_id, data, ..
+        } => (src_node_id, data),
+        other => {
+            log::debug!("veil-mailbox: ignoring non-Deliver on ACK endpoint: {other:?}");
+            return;
+        }
+    };
+    // Unauthenticated (src == 0 = anonymous-send marker) acks could drop OTHER
+    // receivers' mail — reject, exactly like FETCH.
+    if src_node_id == [0u8; 32] {
+        log::debug!("veil-mailbox: ACK dropped (unauthenticated src)");
+        return;
+    }
+    let Ok(content_id) = <[u8; 32]>::try_from(&data[..]) else {
+        log::debug!(
+            "veil-mailbox: ACK dropped (payload len {} != 32, recv={})",
+            data.len(),
+            hex_short(&src_node_id),
+        );
+        return;
+    };
+    match mailbox.ack(src_node_id, content_id) {
+        Ok(removed) => log::debug!(
+            "veil-mailbox: ACK recv={} content={} removed={removed}",
+            hex_short(&src_node_id),
+            hex_short(&content_id),
+        ),
+        Err(e) => log::warn!(
+            "veil-mailbox: ACK store error (recv={}): {e}",
             hex_short(&src_node_id),
         ),
     }
@@ -584,6 +640,53 @@ mod tests {
             chunk_data: inner,
         }
         .encode()
+    }
+
+    /// A Deliver addressed to the ACK endpoint, as the dispatcher would form it.
+    fn ack_deliver(src_node_id: [u8; 32], data: Vec<u8>) -> AppMessage {
+        AppMessage::Deliver {
+            src_node_id,
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_ACK_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(data),
+            reply_id: 0,
+        }
+    }
+
+    #[test]
+    fn ack_endpoint_drops_own_blob_only() {
+        let (mb, _tmp) = fresh_mailbox();
+        let recv_a = [0xA1u8; 32];
+        let recv_b = [0xB1u8; 32];
+        let cid = [0xC1u8; 32];
+        mb.put(recv_a, cid, [3u8; 32], vec![1, 2, 3]).unwrap();
+        mb.put(recv_b, cid, [3u8; 32], vec![4, 5, 6]).unwrap();
+
+        // Receiver A acks its blob — only A's copy is dropped.
+        handle_ack_message(&mb, ack_deliver(recv_a, cid.to_vec()));
+        assert!(mb.fetch(recv_a).unwrap().is_empty(), "A's blob must be acked away");
+        assert_eq!(mb.fetch(recv_b).unwrap().len(), 1, "B's blob must survive A's ack");
+    }
+
+    #[test]
+    fn ack_endpoint_rejects_unauthenticated_and_malformed() {
+        let (mb, _tmp) = fresh_mailbox();
+        let recv = [0xA2u8; 32];
+        let cid = [0xC2u8; 32];
+        mb.put(recv, cid, [3u8; 32], vec![9]).unwrap();
+
+        // Unauthenticated (anonymous-send marker src == 0) must not drop mail.
+        handle_ack_message(&mb, ack_deliver([0u8; 32], cid.to_vec()));
+        assert_eq!(mb.fetch(recv).unwrap().len(), 1);
+
+        // Malformed payload (wrong length) is ignored without panicking.
+        handle_ack_message(&mb, ack_deliver(recv, vec![1, 2, 3]));
+        assert_eq!(mb.fetch(recv).unwrap().len(), 1);
+
+        // Ack of an unknown content id is a harmless no-op.
+        handle_ack_message(&mb, ack_deliver(recv, [0xEEu8; 32].to_vec()));
+        assert_eq!(mb.fetch(recv).unwrap().len(), 1);
     }
 
     #[test]
