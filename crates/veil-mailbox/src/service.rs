@@ -72,6 +72,22 @@ pub const MAILBOX_ACK_ENDPOINT_ID: u32 = 3;
 /// rate (a handful per fetch), same order of magnitude as FETCH.
 pub const MAILBOX_ACK_ENDPOINT_CAPACITY: usize = 64;
 
+/// Endpoint id for the in-network deposit WAKE. When a relay stores a deposit
+/// for receiver R and R has a LIVE direct session with the relay, the relay
+/// sends a tiny empty datagram to `(R, MAILBOX_APP_ID, MAILBOX_WAKE_ENDPOINT_ID)`
+/// over that session — "you have mail, drain now" — collapsing pull latency
+/// from the receiver's poll schedule to ~one RTT without any third-party push.
+/// No new linkage: the relay already stores deposits addressed to R's public
+/// node_id AND holds R's authenticated session; the wake's deposit→forward
+/// timing profile equals the live-introduce forward the relay performs anyway.
+/// Additive: a receiver older than this endpoint has nothing bound and its
+/// registry drops the deliver silently; a relay older than it never sends one.
+pub const MAILBOX_WAKE_ENDPOINT_ID: u32 = 4;
+
+/// mpsc channel buffer depth for the receiver-side WAKE listener. Wakes are
+/// relay-debounced per receiver; a shallow buffer suffices.
+pub const MAILBOX_WAKE_ENDPOINT_CAPACITY: usize = 32;
+
 /// Cap on the total blob bytes returned in a single network FETCH reply, so the
 /// response fits the anonymous reply path. A receiver re-fetches (after acking)
 /// to drain more. Smaller than the local-IPC fetch cap (which isn't onion-bound).

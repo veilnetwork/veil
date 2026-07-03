@@ -91,6 +91,11 @@ enum VeilEventKind {
   /// precisely when the daemon is done draining rather than padding to
   /// a hardcoded timeout.  See [VeilEvent.drainedCount] helper.
   mailboxDrained(ffi.veilEventMailboxDrained),
+  /// A mailbox relay signalled over our live session that it just stored a
+  /// deposit for us (in-network wake — no third-party push). Empty payload;
+  /// the client should drain its mailbox promptly. Best-effort hint: a missed
+  /// wake only delays the next scheduled drain.
+  mailboxWake(ffi.veilEventMailboxWake),
   unknown(-1);
 
   const VeilEventKind(this.wireByte);

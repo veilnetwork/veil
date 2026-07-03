@@ -8128,6 +8128,39 @@ impl NodeServices {
         if self.identity.sovereign_identity.is_none() {
             return Err(AnonOnionSendError::NoIdentity);
         }
+        // Sender-side stall self-heal. The introduce is fire-and-forget and a
+        // relay drops a cookie-less introduce SILENTLY (`cookie_unknown` must
+        // not answer probes), so the only sender-observable failure is "my
+        // sends to R pile up and nothing verified ever comes back from R"
+        // (their delivery-ACKs / replies all arrive as verified AuthDeliver —
+        // see the note_answer hook in process_auth_deliver). When that trips:
+        //  * drop R's resolve-cache entry (once per window) so THIS send
+        //    re-compares fresh replicas instead of re-firing into the hole;
+        //  * widen the introduce fan-out below with connected relay candidates
+        //    ordered by XOR distance to R — approximating R's OWN deterministic
+        //    relay pick, so if R is live-registered at a relay whose fresh ad
+        //    simply hasn't propagated to us, the introduce still lands there.
+        let stall_now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stall = self
+            .anonymity
+            .send_stall
+            .note_send(receiver_node_id, stall_now_unix);
+        if stall.invalidate_cache {
+            self.anonymity
+                .rendezvous_resolve_cache
+                .remove(&receiver_node_id);
+            self.logger.info(
+                "anonymity.sender.stall",
+                format!(
+                    "no verified inbound from {} across repeated sends — forcing \
+                     fresh ad resolve + widened introduce fan-out",
+                    veil_util::hex_short(&receiver_node_id),
+                ),
+            );
+        }
         // A merely-valid local ad is not sufficient here. The receiver may
         // have reconnected and moved to a different relay while the old signed
         // ad remains unexpired; using it produces a valid-looking introduce at
@@ -8186,6 +8219,47 @@ impl NodeServices {
                 if chosen.len() >= MAX_PARALLEL_RELAYS {
                     break;
                 }
+            }
+        }
+        // Stalled route: additionally introduce at connected relay candidates
+        // the resolvable ads did NOT name, XOR-ordered by R's node_id (the same
+        // metric R's own recipient task uses to pick its relays, so the overlap
+        // is high). The chat cookie is deterministic per identity — identical at
+        // every relay R registers with — so the primary cookie is the right one
+        // at a widened relay too; where R is NOT registered the introduce drops
+        // exactly like today (silent, bounded). The receiver's E2E key comes
+        // from the freshest ad; only the rendezvous target differs.
+        if stall.widen {
+            const WIDEN_EXTRA_RELAYS: usize = 2;
+            let widened = service_tasks::pick_rendezvous_relays_deterministic(
+                &self.live_sessions,
+                &self.dht,
+                &self.dispatcher.crypto.peer_cap_flags,
+                &[],
+                &receiver_node_id,
+            );
+            let template = chosen[0].clone();
+            let mut added = 0usize;
+            for relay in widened {
+                if added >= WIDEN_EXTRA_RELAYS {
+                    break;
+                }
+                if seen_relays.insert(relay) {
+                    let mut ad = template.clone();
+                    ad.rendezvous_node_id = relay;
+                    chosen.push(ad);
+                    added += 1;
+                }
+            }
+            if added > 0 {
+                self.logger.info(
+                    "anonymity.sender.stall_widen",
+                    format!(
+                        "stalled route to {} — introducing at {added} extra \
+                         connected relay(s) beyond the resolved ads",
+                        veil_util::hex_short(&receiver_node_id),
+                    ),
+                );
             }
         }
 
