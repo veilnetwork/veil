@@ -416,8 +416,7 @@ pub fn fanout_encrypt(
 /// its 16-byte `instance_id`;
 /// the 64-byte ML-KEM-768 decapsulation seed for the cert currently
 /// published under this instance;
-/// the matching `cert_version` (so rotations don't silently decap
-/// under the wrong seed).
+/// `cert_version` as a FAST-PATH HINT only — see below.
 pub fn fanout_decrypt_one(
     envelopes: &[FanoutEnvelope],
     recipient_instance_id: &[u8; 16],
@@ -426,40 +425,68 @@ pub fn fanout_decrypt_one(
     decapsulation_seed: &[u8; ML_KEM_768_DK_SEED_LEN],
     cert_version: u64,
 ) -> Result<Zeroizing<Vec<u8>>, MlkemFanoutError> {
-    let env = envelopes
+    // Match by INSTANCE only; the caller's `cert_version` is tried first as a
+    // fast path but never REQUIRED. The version the sender actually sealed
+    // under is carried in the envelope and is already CRYPTOGRAPHICALLY bound —
+    // it feeds both the decapsulation KDF and the AEAD AAD below — so a forged
+    // `env.cert_version` fails closed exactly like a tampered ciphertext, and
+    // after a real key rotation an old-version envelope fails decapsulation
+    // (the semantics the strict matcher was standing in for).
+    //
+    // Requiring an exact match on the caller-supplied number silently
+    // BLACK-HOLED the whole offline-mailbox path: the runtime publishes its
+    // cert with `cert_version = 1` while the app-side open passed `0`, so
+    // every sealed deposit ever fetched died with NoEnvelopeForInstance
+    // (surfaced as a generic "Failed") and the receiver quarantined it.
+    let mut candidates: Vec<&FanoutEnvelope> = envelopes
         .iter()
-        .find(|e| {
-            &e.recipient_instance_id == recipient_instance_id && e.cert_version == cert_version
-        })
-        .ok_or(MlkemFanoutError::NoEnvelopeForInstance)?;
+        .filter(|e| &e.recipient_instance_id == recipient_instance_id)
+        .collect();
+    if candidates.is_empty() {
+        return Err(MlkemFanoutError::NoEnvelopeForInstance);
+    }
+    candidates.sort_by_key(|e| e.cert_version != cert_version); // hint first
 
-    let session_key = recipient_decapsulate(
-        ALGO_ML_KEM_768,
-        decapsulation_seed,
-        &env.kem_ciphertext,
-        sender_node_id,
-        recipient_node_id,
-        recipient_instance_id,
-        cert_version_u32(env.cert_version),
-    )?;
+    let mut last_err = MlkemFanoutError::AeadFailed;
+    for env in candidates {
+        let session_key = match recipient_decapsulate(
+            ALGO_ML_KEM_768,
+            decapsulation_seed,
+            &env.kem_ciphertext,
+            sender_node_id,
+            recipient_node_id,
+            recipient_instance_id,
+            cert_version_u32(env.cert_version),
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                last_err = MlkemFanoutError::X3dh(e);
+                continue;
+            }
+        };
 
-    let aad = fanout_aad(
-        sender_node_id,
-        recipient_node_id,
-        recipient_instance_id,
-        env.cert_version,
-    );
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&session_key[..]));
-    let pt = cipher
-        .decrypt(
+        let aad = fanout_aad(
+            sender_node_id,
+            recipient_node_id,
+            recipient_instance_id,
+            env.cert_version,
+        );
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&session_key[..]));
+        match cipher.decrypt(
             Nonce::from_slice(&env.nonce),
             Payload {
                 msg: &env.aead_ciphertext,
                 aad: &aad,
             },
-        )
-        .map_err(|_| MlkemFanoutError::AeadFailed)?;
-    Ok(Zeroizing::new(pt))
+        ) {
+            Ok(pt) => return Ok(Zeroizing::new(pt)),
+            Err(_) => {
+                last_err = MlkemFanoutError::AeadFailed;
+                continue;
+            }
+        }
+    }
+    Err(last_err)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1109,7 +1136,12 @@ mod tests {
     }
 
     #[test]
-    fn fanout_decrypt_fails_for_wrong_cert_version() {
+    fn fanout_decrypt_survives_wrong_cert_version_hint() {
+        // The caller's cert_version is a FAST-PATH HINT, not a gate: the real
+        // version is carried in the envelope and cryptographically bound (KDF +
+        // AAD), so a wrong hint with the RIGHT seed must still open. The old
+        // strict matcher here is exactly what black-holed the offline mailbox
+        // (runtime publishes cert_version=1, the app-side open passed 0).
         let env = build_env();
         let cert = build_cert(&env);
         let verified = verify_mlkem_cert(&cert, &env.doc, env.now_unix_secs).unwrap();
@@ -1121,8 +1153,9 @@ mod tests {
             &env.doc.node_id,
         )
         .unwrap();
-        // Caller claims cert_version=2, envelope was cert_version=1.
-        let err = fanout_decrypt_one(
+        // Caller claims cert_version=2, envelope was cert_version=1 — same
+        // seed, so it opens anyway.
+        let pt = fanout_decrypt_one(
             &envelopes,
             &verified.instance_id,
             &env.doc.node_id,
@@ -1130,10 +1163,23 @@ mod tests {
             &env.mlkem_dk_seed,
             2,
         )
+        .unwrap();
+        assert_eq!(&pt[..], b"hi");
+        // A WRONG SEED (a rotated key) still fails closed regardless of hint.
+        let mut rotated = *env.mlkem_dk_seed;
+        rotated[0] ^= 0xFF;
+        let err = fanout_decrypt_one(
+            &envelopes,
+            &verified.instance_id,
+            &env.doc.node_id,
+            &sender_id,
+            &Zeroizing::new(rotated),
+            1,
+        )
         .unwrap_err();
         assert!(
-            matches!(err, MlkemFanoutError::NoEnvelopeForInstance),
-            "{err:?}"
+            !matches!(err, MlkemFanoutError::NoEnvelopeForInstance),
+            "a seed mismatch must fail in crypto, not by version filtering: {err:?}"
         );
     }
 
