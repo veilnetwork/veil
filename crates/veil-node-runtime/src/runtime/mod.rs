@@ -7434,6 +7434,38 @@ impl NodeServices {
     /// rotation, ≤ MAX_ONION_SERVICES entries) and the callers sit on the
     /// async maintenance tick / IPC path where blocking would stall the
     /// executor — the typical wait is one relay round-trip (~40-100 ms).
+    /// Bounded wait for a just-built EPHEMERAL REPLY circuit's `CircuitBuilt`
+    /// ACK before the caller fires the introduce that hands out its cookie.
+    /// The receiver's delivery-ACK comes back FAST (one introduce-forward +
+    /// processing, often <100 ms) and can otherwise reach our reply relay
+    /// BEFORE our own registration ACK — relay-trace measured exactly that
+    /// residual after the publish barrier: 3× `cookie_unknown` on the reply
+    /// cookie ~100 ms before its `circuit.registered`. The lost delivery-ACK
+    /// then feeds the stall tracker a FALSE miss and slows churn recovery.
+    /// Blocking is acceptable here: reply-expecting sends are user-message
+    /// rate, the surrounding send path already blocks on crypto + session
+    /// enqueue, and the typical wait is one relay round-trip (~40–100 ms).
+    /// After 1 s proceed anyway (old behavior): the ACK may still land before
+    /// the receiver answers, and a dead relay path shouldn't stall the send.
+    fn wait_reply_circuit_confirmed(&self, confirmed: &std::sync::atomic::AtomicBool) {
+        const TIMEOUT_MS: u64 = 1_000;
+        const POLL_MS: u64 = 10;
+        let mut waited_ms = 0u64;
+        while !confirmed.load(std::sync::atomic::Ordering::Relaxed) && waited_ms < TIMEOUT_MS {
+            std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+            waited_ms += POLL_MS;
+        }
+        if !confirmed.load(std::sync::atomic::Ordering::Relaxed) {
+            self.logger.info(
+                "anonymity.reply_circuit.unconfirmed",
+                format!(
+                    "no CircuitBuilt ACK for the reply circuit within {TIMEOUT_MS}ms — \
+                     sending anyway (delivery-ACK may race the registration)"
+                ),
+            );
+        }
+    }
+
     fn publish_after_circuit_confirmed(
         &self,
         confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -8019,13 +8051,15 @@ impl NodeServices {
             // throwaway epoch counter is fine — the registration is unique at R
             // and never collides; the epoch is just `unix_now`.
             let reply_epoch = std::sync::atomic::AtomicU64::new(0);
-            self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch, true)
+            let confirmed = self
+                .build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch, true)
                 .map_err(
                     |_| veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
                         need: REPLY_CIRCUIT_HOPS,
                         have: 0,
                     },
                 )?;
+            self.wait_reply_circuit_confirmed(&confirmed);
         }
 
         let mut msg_id = [0u8; 16];
@@ -8179,13 +8213,15 @@ impl NodeServices {
         // R_a). A size failure above returns without ever creating one.
         if let Some((relay_path, cookie, reply_reg_kp)) = pending_reply_circuit {
             let reply_epoch = std::sync::atomic::AtomicU64::new(0);
-            self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch, true)
+            let confirmed = self
+                .build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch, true)
                 .map_err(
                     |_| veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
                         need: REPLY_CIRCUIT_HOPS,
                         have: 0,
                     },
                 )?;
+            self.wait_reply_circuit_confirmed(&confirmed);
         }
 
         let mut payload_bytes = Vec::with_capacity(1 + auth_bytes.len());
