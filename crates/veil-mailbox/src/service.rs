@@ -58,6 +58,20 @@ pub const MAILBOX_FETCH_ENDPOINT_ID: u32 = 2;
 /// puts (one per receiver wake, not per-message) so a shallow buffer suffices.
 pub const MAILBOX_FETCH_ENDPOINT_CAPACITY: usize = 64;
 
+/// Endpoint id for the network ACK operation. A receiver that has processed a
+/// fetched blob (delivered it — or established it can NEVER open it) sends an
+/// AUTHENTICATED fire-and-forget message here whose payload is the 32-byte
+/// `content_id`; the relay verifies the requester's identity (`src_node_id`)
+/// exactly like FETCH and drops `(src_node_id, content_id)`. Without this,
+/// every already-processed blob was re-served on EVERY fetch until its 7-day
+/// TTL. Additive: a client older than the endpoint never sends here; a relay
+/// older than it has nothing bound and drops the deliver (TTL-only as before).
+pub const MAILBOX_ACK_ENDPOINT_ID: u32 = 3;
+
+/// mpsc channel buffer depth for the ACK endpoint. Acks arrive at the drain
+/// rate (a handful per fetch), same order of magnitude as FETCH.
+pub const MAILBOX_ACK_ENDPOINT_CAPACITY: usize = 64;
+
 /// Cap on the total blob bytes returned in a single network FETCH reply, so the
 /// response fits the anonymous reply path. A receiver re-fetches (after acking)
 /// to drain more. Smaller than the local-IPC fetch cap (which isn't onion-bound).
