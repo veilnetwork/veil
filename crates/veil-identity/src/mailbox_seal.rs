@@ -389,6 +389,44 @@ mod tests {
     }
 
     #[test]
+    fn open_succeeds_with_mismatching_cert_version_hint() {
+        // THE production black hole: the runtime publishes its cert with
+        // cert_version = 1 while the app-side open passed 0. The version is a
+        // fast-path HINT — the envelope carries (and cryptographically binds)
+        // the real one — so open must still succeed.
+        let sov = sender_sovereign("sender");
+        let sender_id = *sov.node_id();
+        let (cert, recipient_id, instance, dk_seed) = recipient();
+        assert_ne!(cert.cert_version, 0, "test premise: sealed under v != 0");
+
+        let auth = sov.sign_auth_deliver(
+            recipient_id,
+            [0xCCu8; 32],
+            9,
+            NOW,
+            0x7777,
+            b"survives version hint mismatch".to_vec(),
+            None,
+        );
+        let blob =
+            seal_mailbox_blob(&auth, &cert, &sender_id, &recipient_id, &sov.document).unwrap();
+
+        let opened = open_mailbox_blob(
+            &blob,
+            &instance,
+            &recipient_id,
+            &sender_id,
+            &dk_seed,
+            0, // the exact wrong hint the app sent
+            &sov.document,
+            NOW,
+            DEFAULT_AUTH_DELIVER_FRESHNESS_SECS,
+        )
+        .unwrap();
+        assert_eq!(opened.data, b"survives version hint mismatch");
+    }
+
+    #[test]
     fn sidecar_recovers_sender_then_opens() {
         // The anonymous-path flow: the recipient does NOT know the sender a
         // priori — it recovers it from the sidecar, then opens the main blob.
