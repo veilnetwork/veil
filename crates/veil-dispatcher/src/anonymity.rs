@@ -440,12 +440,43 @@ impl FrameDispatcher {
                 // LOCATION-anonymous service R forwards the introduce DOWN the
                 // receiver's return circuit instead of over a direct session.
                 match self.try_forward_introduce_via_circuit(&intro) {
-                    CircuitIntroduceForward::Forwarded
-                    | CircuitIntroduceForward::KnownButDropped => {
+                    #[allow(unused_variables)]
+                    disposition @ (CircuitIntroduceForward::Forwarded
+                    | CircuitIntroduceForward::KnownButDropped) => {
                         // Cookie was a known circuit subscription — either
                         // forwarded, or deliberately dropped (replay / cell
                         // budget / seq-exhausted). NOT an unknown cookie, so
                         // don't emit the cookie_unknown signal.
+                        // INSTRUMENT (`relay-trace` feature, OFF in prod): both
+                        // outcomes are otherwise silent, so a trace diff can't
+                        // tell "delivered down the circuit" from "known cookie
+                        // but cell dropped". Log the disposition + cookie.
+                        #[cfg(feature = "relay-trace")]
+                        {
+                            let cf_cookie: String = intro
+                                .auth_cookie
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
+                            let (sig, msg) = match disposition {
+                                CircuitIntroduceForward::Forwarded => (
+                                    "anonymity.relay_chain.introduce.circuit_forwarded",
+                                    "forwarded down the return circuit",
+                                ),
+                                _ => (
+                                    "anonymity.relay_chain.introduce.known_but_dropped",
+                                    "known circuit cookie; cell dropped (replay/budget/seq)",
+                                ),
+                            };
+                            self.logger.info(
+                                sig,
+                                format!(
+                                    "{msg}: receiver={} cookie={}",
+                                    veil_util::hex_short(&intro.receiver_node_id),
+                                    cf_cookie,
+                                ),
+                            );
+                        }
                         return DispatchResult::NoResponse;
                     }
                     CircuitIntroduceForward::NotCircuit => {
@@ -862,6 +893,23 @@ impl FrameDispatcher {
                 ) {
                     (Some(reg), Some(p)) => match reg.register(&p, circuit, now) {
                         Ok(()) => {
+                            // INSTRUMENT (`relay-trace` feature, OFF in prod): the
+                            // circuit path is the anonymous receiver's registration,
+                            // so a cookie_unknown diff needs its cookie too. Default
+                            // build keeps the cookie out of the log (linkable value).
+                            #[cfg(feature = "relay-trace")]
+                            {
+                                let cr_cookie: String =
+                                    p.cookie.iter().map(|b| format!("{b:02x}")).collect();
+                                self.logger.info(
+                                    "anonymity.circuit.registered",
+                                    format!(
+                                        "circuit-rendezvous registration bound cookie={cr_cookie} epoch={} to a return circuit",
+                                        p.epoch,
+                                    ),
+                                );
+                            }
+                            #[cfg(not(feature = "relay-trace"))]
                             self.logger.info(
                                 "anonymity.circuit.registered",
                                 "circuit-rendezvous registration bound a cookie to a return circuit",
@@ -869,6 +917,19 @@ impl FrameDispatcher {
                             true
                         }
                         Err(e) => {
+                            #[cfg(feature = "relay-trace")]
+                            {
+                                let cr_cookie: String =
+                                    p.cookie.iter().map(|b| format!("{b:02x}")).collect();
+                                self.logger.info(
+                                    "anonymity.circuit.register_rejected",
+                                    format!(
+                                        "circuit registration rejected: {e:?} cookie={cr_cookie} epoch={} — not ACKing",
+                                        p.epoch,
+                                    ),
+                                );
+                            }
+                            #[cfg(not(feature = "relay-trace"))]
                             self.logger.info(
                                 "anonymity.circuit.register_rejected",
                                 format!("circuit registration rejected: {e:?} — not ACKing"),
