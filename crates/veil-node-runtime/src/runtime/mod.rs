@@ -6478,6 +6478,10 @@ impl NodeServices {
         // paths) pass a fresh counter — a unique (cookie, reg_pk) never collides
         // at R, so the epoch is just `unix_now`.
         last_epoch: &std::sync::atomic::AtomicU64,
+        // True for an EPHEMERAL REPLY circuit: an introduce arriving back down
+        // it proves OUR live introduce reached the peer (see
+        // `OriginCircuit::is_reply` / the sender stall detector).
+        is_reply: bool,
     ) -> std::result::Result<
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         veil_types::AnonOnionSendError,
@@ -6548,8 +6552,9 @@ impl NodeServices {
         };
 
         // Build the origin circuit with the registration as terminus payload.
-        let (setup, origin) = build_origin_circuit(&hops, &reg.encode(), now)
+        let (setup, mut origin) = build_origin_circuit(&hops, &reg.encode(), now)
             .map_err(|_| AnonOnionSendError::NoRelays)?;
+        origin.is_reply = is_reply;
         let first_hop = origin.first_hop;
         // Δ2-d: share the circuit's confirmation flag with the caller so the
         // maintenance tick can tell whether the terminus ACK'd this path (and
@@ -7498,8 +7503,13 @@ impl NodeServices {
         // B2: per-service monotonic registration-epoch counter, reused on every
         // rebuild so re-registrations strictly increase even within one second.
         let registration_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let confirmed =
-            self.build_onion_circuit_once(relay_path, cookie, &reg_keypair, &registration_epoch)?;
+        let confirmed = self.build_onion_circuit_once(
+            relay_path,
+            cookie,
+            &reg_keypair,
+            &registration_epoch,
+            false, // hosted service, not a reply circuit
+        )?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -7646,9 +7656,13 @@ impl NodeServices {
             } else {
                 relay_path.clone()
             };
-            if let Ok(new_confirmed) =
-                self.build_onion_circuit_once(&path, cookie_now, &reg_keypair, &registration_epoch)
-            {
+            if let Ok(new_confirmed) = self.build_onion_circuit_once(
+                &path,
+                cookie_now,
+                &reg_keypair,
+                &registration_epoch,
+                false, // hosted service rebuild, not a reply circuit
+            ) {
                 // COOKIE-DIAG (periodic re-register): the cookie this node now
                 // holds at its relay. Must equal what senders put in introduces.
                 log::info!(
@@ -7924,7 +7938,7 @@ impl NodeServices {
             // throwaway epoch counter is fine — the registration is unique at R
             // and never collides; the epoch is just `unix_now`.
             let reply_epoch = std::sync::atomic::AtomicU64::new(0);
-            self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch)
+            self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch, true)
                 .map_err(
                     |_| veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
                         need: REPLY_CIRCUIT_HOPS,
@@ -8084,7 +8098,7 @@ impl NodeServices {
         // R_a). A size failure above returns without ever creating one.
         if let Some((relay_path, cookie, reply_reg_kp)) = pending_reply_circuit {
             let reply_epoch = std::sync::atomic::AtomicU64::new(0);
-            self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch)
+            self.build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch, true)
                 .map_err(
                     |_| veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
                         need: REPLY_CIRCUIT_HOPS,

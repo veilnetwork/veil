@@ -47,6 +47,13 @@ pub struct OriginCircuit {
     /// `false` until the ACK arrives — the maintenance tick re-selects an
     /// unconfirmed path rather than rebuilding a possibly-dead frozen one.
     pub confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// True when this is an EPHEMERAL REPLY circuit (built per outgoing send to
+    /// carry the recipient's answer back). An introduce arriving down a reply
+    /// circuit is the recipient ANSWERING something we sent live — the one
+    /// signal that proves OUR OWN live introduce reached them (a generic
+    /// verified inbound only proves them→us). The sender-side stall detector
+    /// keys off this. False for hosted-service / data circuits.
+    pub is_reply: bool,
 }
 
 impl Drop for OriginCircuit {
@@ -139,6 +146,7 @@ pub fn build_origin_circuit(
         origin_circuit_id: cids[0],
         created_unix: now_unix,
         confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        is_reply: false, // callers building a REPLY circuit set this afterwards
     };
     Ok((setup, origin))
 }
@@ -301,8 +309,18 @@ mod tests {
         apply_layer(&k[1], Direction::Return, seq, &mut cell);
         apply_layer(&k[0], Direction::Return, seq, &mut cell);
         assert_eq!(origin.open_return(seq, &cell).unwrap(), b"introduce-bytes");
-        // Wrong seq → garbage framing → error.
-        assert!(origin.open_return(seq + 1, &cell).is_err());
+        // Wrong seq → wrong keystream → garbage. The framing check REJECTS most
+        // garbage but is not authenticated, so with random per-run keys the
+        // garbage occasionally parses (pre-existing ~1-in-few flake when this
+        // asserted is_err()). The real invariant: the payload is never
+        // recovered.
+        assert!(
+            origin
+                .open_return(seq + 1, &cell)
+                .map(|p| p != b"introduce-bytes")
+                .unwrap_or(true),
+            "wrong seq must never recover the true payload"
+        );
     }
 
     #[test]
