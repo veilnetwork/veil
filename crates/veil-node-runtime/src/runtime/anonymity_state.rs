@@ -260,6 +260,22 @@ impl AnonSendStallTracker {
         }
     }
 
+    /// Read the CURRENT verdict for `receiver` without recording a send.
+    /// Used by sends that attach NO reply block (sync beacons, acks, content
+    /// chunks): the peer is not expected to answer those promptly, so counting
+    /// them as "unanswered" made a quiet-but-healthy route look stalled (a
+    /// beacon every ~20s re-tripped the verdict on a fixed cadence forever).
+    /// They still RIDE an active widen window — only reply-expecting sends
+    /// drive the accounting, because their delivery-ACK returns over the
+    /// sender's own reply circuit and is therefore a true me→R health probe.
+    pub fn peek(&self, receiver: &[u8; 32], now_unix: u64) -> StallVerdict {
+        let m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        StallVerdict {
+            widen: m.get(receiver).is_some_and(|e| e.widen_until > now_unix),
+            invalidate_cache: false,
+        }
+    }
+
     /// A VERIFIED inbound from `sender` proves the route from them works (and
     /// their ACKs are how our own sends are answered) — clear their streak.
     pub fn note_answer(&self, sender: &[u8; 32]) {
@@ -704,6 +720,31 @@ mod tests {
         // A verified inbound from the peer resets everything.
         t.note_answer(&r);
         assert!(!t.note_send(r, 200 + ANON_SEND_STALL_MIN_SECS).widen);
+    }
+
+    #[test]
+    fn stall_tracker_peek_reads_without_counting() {
+        let t = AnonSendStallTracker::new();
+        let r = [10u8; 32];
+        // Any number of reply-less sends must never trip the verdict on their
+        // own (a sync beacon every ~20s is legitimately unanswered).
+        for i in 0..50 {
+            assert!(!t.peek(&r, 100 + i).widen);
+        }
+        // Reply-expecting sends drive the accounting as before…
+        for i in 0..3 {
+            t.note_send(r, 200 + i);
+        }
+        assert!(t.note_send(r, 200 + ANON_SEND_STALL_MIN_SECS).widen);
+        // …and once tripped, reply-less sends RIDE the widen window via peek.
+        let v = t.peek(&r, 201 + ANON_SEND_STALL_MIN_SECS);
+        assert!(v.widen && !v.invalidate_cache);
+        // After the window lapses with no further reply-expecting sends, peek
+        // returns to normal (no self-re-tripping).
+        assert!(
+            !t.peek(&r, 200 + ANON_SEND_STALL_MIN_SECS + ANON_SEND_WIDEN_SECS + 1)
+                .widen
+        );
     }
 
     #[test]
