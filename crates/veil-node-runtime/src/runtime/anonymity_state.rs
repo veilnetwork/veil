@@ -179,6 +179,18 @@ pub const ANON_SEND_STALL_MIN_SECS: u64 = 8;
 /// How long one stall verdict stays in force before the cache is invalidated
 /// again (bounds forced re-resolves to one per window while stalled).
 pub const ANON_SEND_WIDEN_SECS: u64 = 60;
+/// Consecutive widen windows a peer may open WITHOUT a reply-circuit answer
+/// before we GIVE UP widening it. Widening helps a FLAPPY live path (a
+/// cookie_unknown race a fresh relay resolves); a path that stays silent
+/// across this many windows is genuinely dead here (a DHT/registration
+/// completeness wall widening cannot cross), so continuing only adds onion
+/// load with no benefit — back off and let the mailbox + wake path carry
+/// delivery. A reply-circuit answer at any point clears the streak.
+pub const ANON_SEND_MAX_WIDEN_WINDOWS: u32 = 3;
+/// Rest period after giving up: no widen, no forced re-resolve. Bounds the
+/// cost on a dead path to a short burst every this often (the path may have
+/// recovered by then, so we retry).
+pub const ANON_SEND_DORMANT_SECS: u64 = 600;
 /// Bound on tracked receivers (LRU-ish evict of the stalest entry).
 const MAX_STALL_ENTRIES: usize = 512;
 
@@ -199,6 +211,11 @@ struct StallEntry {
     unanswered: u32,
     first_unix: u64,
     widen_until: u64,
+    /// Widen windows opened since the last reply-circuit answer.
+    widen_windows: u32,
+    /// While > now, the peer is in the give-up rest period: no widen, no
+    /// forced re-resolve (see [`ANON_SEND_DORMANT_SECS`]).
+    dormant_until: u64,
 }
 
 /// Detects the "sender keeps introducing into a black hole" failure the
@@ -234,6 +251,19 @@ impl AnonSendStallTracker {
             m.remove(&stalest);
         }
         let e = m.entry(receiver).or_default();
+        // Gave up on this peer recently — rest (no widen / no re-resolve) so a
+        // genuinely-dead live path doesn't keep loading the node. Still count
+        // the send so the streak is warm when the rest period ends.
+        if e.dormant_until > now_unix {
+            if e.unanswered == 0 {
+                e.first_unix = now_unix;
+            }
+            e.unanswered = e.unanswered.saturating_add(1);
+            return StallVerdict {
+                widen: false,
+                invalidate_cache: false,
+            };
+        }
         if e.unanswered == 0 {
             e.first_unix = now_unix;
         }
@@ -248,6 +278,20 @@ impl AnonSendStallTracker {
         if e.unanswered >= ANON_SEND_STALL_THRESHOLD
             && now_unix.saturating_sub(e.first_unix) >= ANON_SEND_STALL_MIN_SECS
         {
+            e.widen_windows = e.widen_windows.saturating_add(1);
+            if e.widen_windows > ANON_SEND_MAX_WIDEN_WINDOWS {
+                // Widened this many windows and still no reply-circuit answer —
+                // the live path is dead here, not flappy. Back off: the mailbox
+                // + wake path carries delivery without loading the node.
+                e.dormant_until = now_unix + ANON_SEND_DORMANT_SECS;
+                e.widen_windows = 0;
+                e.widen_until = 0;
+                e.unanswered = 0;
+                return StallVerdict {
+                    widen: false,
+                    invalidate_cache: false,
+                };
+            }
             e.widen_until = now_unix + ANON_SEND_WIDEN_SECS;
             return StallVerdict {
                 widen: true,
@@ -271,7 +315,9 @@ impl AnonSendStallTracker {
     pub fn peek(&self, receiver: &[u8; 32], now_unix: u64) -> StallVerdict {
         let m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         StallVerdict {
-            widen: m.get(receiver).is_some_and(|e| e.widen_until > now_unix),
+            widen: m.get(receiver).is_some_and(|e| {
+                e.dormant_until <= now_unix && e.widen_until > now_unix
+            }),
             invalidate_cache: false,
         }
     }
@@ -720,6 +766,43 @@ mod tests {
         // A verified inbound from the peer resets everything.
         t.note_answer(&r);
         assert!(!t.note_send(r, 200 + ANON_SEND_STALL_MIN_SECS).widen);
+    }
+
+    #[test]
+    fn stall_tracker_gives_up_after_max_widen_windows() {
+        let t = AnonSendStallTracker::new();
+        let r = [11u8; 32];
+        // Drive one widen window per WIDEN_SECS with no reply-circuit answer.
+        // The first ANON_SEND_MAX_WIDEN_WINDOWS windows widen; the next one
+        // gives up (dormant), so widen goes false.
+        let mut now = 100u64;
+        // Prime the streak past threshold + min-age so the first note_send trips.
+        t.note_send(r, now);
+        t.note_send(r, now + 1);
+        now += ANON_SEND_STALL_MIN_SECS;
+        let mut widened = 0;
+        let mut gave_up = false;
+        for _ in 0..(ANON_SEND_MAX_WIDEN_WINDOWS + 2) {
+            let v = t.note_send(r, now);
+            if v.widen {
+                widened += 1;
+            } else {
+                gave_up = true;
+                break;
+            }
+            now += ANON_SEND_WIDEN_SECS + 1; // advance to the next window
+        }
+        assert_eq!(widened, ANON_SEND_MAX_WIDEN_WINDOWS);
+        assert!(gave_up, "must stop widening after the window cap");
+        // During the rest period peek does NOT widen even though a stale
+        // widen_until might linger.
+        assert!(!t.peek(&r, now).widen);
+        // A reply-circuit answer clears the give-up state — widening can resume.
+        t.note_answer(&r);
+        t.note_send(r, now);
+        t.note_send(r, now + 1);
+        let v = t.note_send(r, now + ANON_SEND_STALL_MIN_SECS);
+        assert!(v.widen, "a reply-circuit answer must re-enable widening");
     }
 
     #[test]
