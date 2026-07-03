@@ -58,6 +58,10 @@ async fn process_auth_deliver(
     local_node_id: &[u8; 32],
     freshness_window: u64,
     now_unix: u64,
+    // True when the message arrived DOWN one of OUR ephemeral reply circuits —
+    // the peer answering something we sent LIVE (me→R proof for the stall
+    // detector). False for inbound via our rendezvous registration / session.
+    via_reply_circuit: bool,
 ) {
     // 1. Resolve the sender's identity document (DHT), bound to EXACTLY the
     //    claimed sender_node_id — no migration follow: a migrated-away signer
@@ -111,12 +115,18 @@ async fn process_auth_deliver(
         return;
     }
 
-    // A verified inbound from this peer proves the anonymous route FROM them
-    // works — and their delivery-ACKs / replies are exactly how our own sends
-    // to them get answered. Clear any sender-side stall streak toward them
-    // (see AnonSendStallTracker; the send path widens its introduce fan-out
-    // while a peer's streak is tripped).
-    access.anonymity.send_stall.note_answer(&auth.sender_node_id);
+    // Clear the sender-side stall streak ONLY when the peer answered through
+    // one of OUR ephemeral reply circuits: a stashed (mailbox) copy of our
+    // message carries no reply block, so a reply-circuit answer proves OUR
+    // LIVE introduce reached them. A generic verified inbound (their message
+    // via OUR rendezvous registration) only proves them→us — clearing on it
+    // masked a dead me→them live path whenever the reverse direction was
+    // healthy (their live ACK for a mailbox-delivered message kept resetting
+    // the streak, the fan-out never widened, and every message paid the
+    // mailbox latency).
+    if via_reply_circuit {
+        access.anonymity.send_stall.note_answer(&auth.sender_node_id);
+    }
 
     // 4. Deliver with the VERIFIED sender node_id. If the message carried a
     //    one-time reply path, store it daemon-side and surface a non-zero
@@ -1489,9 +1499,18 @@ impl NodeRuntime {
                                 .unwrap_or(0);
                             // Resolve a complete AuthAppDeliver from the inbound:
                             // a Full message arrives whole; Fragments reassemble.
+                            // via_reply: whether it came DOWN one of OUR reply
+                            // circuits (for a fragmented message: the flag of
+                            // the COMPLETING fragment — replies/ACKs are single-
+                            // fragment, so this is exact where it matters).
+                            let mut via_reply = false;
                             let auth = match inbound {
                                 veil_dispatcher::AuthDeliverInbound::Full(a) => Some(*a),
-                                veil_dispatcher::AuthDeliverInbound::Fragment(frag) => {
+                                veil_dispatcher::AuthDeliverInbound::Fragment {
+                                    frag,
+                                    via_reply_circuit,
+                                } => {
+                                    via_reply = via_reply_circuit;
                                     use veil_identity::auth_deliver::ReassembleOutcome;
                                     match reassembler.push(frag, now_unix) {
                                         ReassembleOutcome::Complete(bytes) => {
@@ -1526,6 +1545,7 @@ impl NodeRuntime {
                                     &local_node_id,
                                     freshness_window,
                                     now_unix,
+                                    via_reply,
                                 )
                                 .await;
                             }
