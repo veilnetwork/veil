@@ -41,4 +41,6 @@ pub mod host;
 pub mod mailbox;
 
 pub use host::{BuiltinAppHost, BuiltinEndpoint, ServiceContext, ServiceSpec};
-pub use mailbox::{PushTrigger, spawn_mailbox_app_service};
+pub use mailbox::{
+    MailboxWakeSender, PushTrigger, spawn_mailbox_app_service, spawn_mailbox_wake_listener,
+};

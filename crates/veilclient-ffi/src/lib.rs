@@ -5012,6 +5012,10 @@ pub const VEIL_EVENT_IDENTITY_ROTATED: u8 = 2;
 /// subscribe so they can complete precisely at drain completion instead of
 /// padding to a hardcoded fallback timeout.
 pub const VEIL_EVENT_MAILBOX_DRAINED: u8 = 3;
+/// A mailbox relay signalled over our live session that it just stored a
+/// deposit for us (in-network wake — no third-party push). Empty payload;
+/// the client should drain its mailbox promptly. Best-effort hint.
+pub const VEIL_EVENT_MAILBOX_WAKE: u8 = 5;
 
 /// Push-event callback. Invoked from a tokio worker thread for every
 /// `LocalAppMsg::Event` frame the daemon emits while this handler is

@@ -42,6 +42,7 @@ const int veilEventSessionsChanged = 0;
 const int veilEventMobileTierChanged = 1;
 const int veilEventIdentityRotated = 2;
 const int veilEventMailboxDrained = 3;
+const int veilEventMailboxWake = 5;
 
 // ── Wake-HMAC constants + verdict codes (Epic 489.10 slice 4.3.3) ────────────
 

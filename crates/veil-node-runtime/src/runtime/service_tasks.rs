@@ -111,6 +111,13 @@ async fn process_auth_deliver(
         return;
     }
 
+    // A verified inbound from this peer proves the anonymous route FROM them
+    // works — and their delivery-ACKs / replies are exactly how our own sends
+    // to them get answered. Clear any sender-side stall streak toward them
+    // (see AnonSendStallTracker; the send path widens its introduce fan-out
+    // while a peer's streak is tripped).
+    access.anonymity.send_stall.note_answer(&auth.sender_node_id);
+
     // 4. Deliver with the VERIFIED sender node_id. If the message carried a
     //    one-time reply path, store it daemon-side and surface a non-zero
     //    reply_id so the app can reply (the block never crosses to the app).
@@ -2088,6 +2095,22 @@ impl NodeRuntime {
                 &self.anonymity.rendezvous_publisher_entries,
             )));
         server = server.with_push_envelope_sink(push_envelope_sink);
+        // In-network deposit-wake LISTENER: every node may be a mailbox
+        // RECEIVER (not just relays), so bind the wake endpoint unconditionally
+        // — an inbound wake datagram from a relay becomes a MAILBOX_WAKE event
+        // the client SDK turns into an immediate drain. Nodes older than this
+        // endpoint simply have nothing bound and drop the wake silently.
+        if let Some(host) = self.builtin_app_host.as_mut() {
+            let wake_ctx = host.make_context(
+                *self.identity.local_identity.node_id.as_bytes(),
+                Arc::clone(&self.app_registry),
+            );
+            crate::builtin::spawn_mailbox_wake_listener(
+                host,
+                wake_ctx,
+                Arc::clone(&self.event_bus),
+            );
+        }
         //.4 P2/P3: wire mailbox IPC bridge
         // + push-dispatch task. Only present when operator opted in
         // (`mailbox.enabled`). Without it, `MailboxPut/Fetch/Ack`
@@ -2198,12 +2221,62 @@ impl NodeRuntime {
                     drop(push_tx_for_app);
                     None
                 };
+                // In-network deposit WAKE sender: on a stored deposit, send a
+                // tiny empty datagram to the receiver's wake endpoint over its
+                // LIVE direct session with this relay (SessionTxRegistry is the
+                // liveness test — no session, no frame). Debounced per receiver
+                // so a backlog flush can't storm a client; a dropped wake only
+                // costs latency (the poll schedule still drains). No new
+                // linkage: the relay already stores deposits addressed to R's
+                // public node_id AND authenticates R's session; the timing
+                // profile equals the live-introduce forward it performs anyway.
+                let wake_sender: crate::builtin::MailboxWakeSender = {
+                    const WAKE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+                    const MAX_WAKE_DEBOUNCE_ENTRIES: usize = 1024;
+                    let tx_registry = Arc::clone(&self.session_tx_registry);
+                    let last_wake: std::sync::Mutex<
+                        std::collections::HashMap<[u8; 32], std::time::Instant>,
+                    > = std::sync::Mutex::new(std::collections::HashMap::new());
+                    Arc::new(move |receiver: &[u8; 32]| -> bool {
+                        {
+                            let mut m = last_wake.lock().unwrap_or_else(|p| p.into_inner());
+                            let now = std::time::Instant::now();
+                            if m.get(receiver)
+                                .is_some_and(|t| now.duration_since(*t) < WAKE_DEBOUNCE)
+                            {
+                                return false;
+                            }
+                            if m.len() >= MAX_WAKE_DEBOUNCE_ENTRIES {
+                                m.retain(|_, t| now.duration_since(*t) < WAKE_DEBOUNCE);
+                            }
+                            m.insert(*receiver, now);
+                        }
+                        let payload = veil_proto::AppSendPayload {
+                            src_app_id: veil_mailbox::MAILBOX_APP_ID,
+                            app_id: veil_mailbox::MAILBOX_APP_ID,
+                            endpoint_id: veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID,
+                            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+                        };
+                        let body = payload.encode();
+                        let mut hdr = veil_proto::header::FrameHeader::new(
+                            veil_proto::family::FrameFamily::App as u8,
+                            veil_proto::family::AppMsg::AppSend as u16,
+                        );
+                        hdr.body_len = body.len() as u32;
+                        hdr.set_priority(veil_proto::priority::INTERACTIVE);
+                        let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
+                        frame.extend_from_slice(&body);
+                        let guard = wlock!(tx_registry);
+                        guard.send_to(receiver, veil_proto::priority::INTERACTIVE, frame)
+                    })
+                };
                 crate::builtin::spawn_mailbox_app_service(
                     host,
                     app_ctx,
                     Arc::clone(mailbox),
                     push_tx_opt,
                     mailbox_reply_sender,
+                    Some(wake_sender),
                 );
             }
         }
