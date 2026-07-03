@@ -360,7 +360,15 @@ pub enum AuthDeliverInbound {
     /// A complete signed message (direct onion final-hop).
     Full(Box<veil_proto::AuthAppDeliver>),
     /// One fragment of a signed message (rendezvous path).
-    Fragment(veil_proto::AuthDeliverFragment),
+    Fragment {
+        frag: veil_proto::AuthDeliverFragment,
+        /// True when the fragment arrived DOWN one of OUR ephemeral reply
+        /// circuits — i.e. the peer is ANSWERING something we sent live, the
+        /// one signal that proves our own live introduce reached them. Feeds
+        /// the sender-side stall detector; a generic inbound (via our
+        /// rendezvous registration) only proves peer→us and must not.
+        via_reply_circuit: bool,
+    },
 }
 
 /// type alias for the authenticated-delivery channel sender from the sync
