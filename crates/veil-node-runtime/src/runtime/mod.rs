@@ -7380,25 +7380,92 @@ impl NodeServices {
                     veil_types::SignatureAlgorithm::Ed25519,
                 )
             });
-        service_tasks::rendezvous_register_publisher(
-            &self.anonymity,
-            &r,
-            cookie,
-            // Short rendezvous-ad TTL (NOT the 24h directory default): a stale ad
-            // a sender cached before this receiver rotated relay/cookie must
-            // self-expire fast, else its introduces black-hole as cookie_unknown.
-            // The ~15s refresh tick keeps the live ad alive.
-            service_tasks::RENDEZVOUS_AD_VALIDITY_SECS,
-            ephemeral_ad_identity,
-        );
-
-        // Also publish a BLINDED descriptor (3c): identity-unlinkable in the DHT.
-        // A client that knows our Ed25519 identity key derives the descriptor's
-        // DHT key + decryption key; an enumerator sees only a rotating key + an
-        // opaque ciphertext. Best-effort (needs an Ed25519 sovereign identity).
-        self.publish_blinded_descriptor(r, cookie);
+        // ORDERING BARRIER (publish-before-register race): the descriptor/ad
+        // must not become resolvable before the relay has BOUND the cookie —
+        // `register_onion_circuit` fires the build and returns immediately,
+        // while the terminus registration only takes effect when the
+        // `CircuitBuilt` ACK lands. Publishing right here let a stall-watching
+        // sender resolve the fresh descriptor and fire its whole queued
+        // introduce burst ~40 ms BEFORE the registration (relay-trace measured:
+        // 60 introduces silently dropped as cookie_unknown, recovery deferred
+        // to the sender's next stall window — the churn minute-outliers).
+        // Defer both publishes until the entry's `confirmed` flag flips.
+        let confirmed = lock!(self.anonymity.onion_services)
+            .iter()
+            .find(|e| e.cookie == cookie)
+            .map(|e| std::sync::Arc::clone(&e.confirmed));
+        let relay = r;
+        let publish = move |this: &NodeServices| {
+            service_tasks::rendezvous_register_publisher(
+                &this.anonymity,
+                &relay,
+                cookie,
+                // Short rendezvous-ad TTL (NOT the 24h directory default): a stale ad
+                // a sender cached before this receiver rotated relay/cookie must
+                // self-expire fast, else its introduces black-hole as cookie_unknown.
+                // The ~15s refresh tick keeps the live ad alive.
+                service_tasks::RENDEZVOUS_AD_VALIDITY_SECS,
+                ephemeral_ad_identity,
+            );
+            // Also publish a BLINDED descriptor (3c): identity-unlinkable in the DHT.
+            // A client that knows our Ed25519 identity key derives the descriptor's
+            // DHT key + decryption key; an enumerator sees only a rotating key + an
+            // opaque ciphertext. Best-effort (needs an Ed25519 sovereign identity).
+            this.publish_blinded_descriptor(relay, cookie);
+        };
+        match confirmed {
+            Some(flag) => self.publish_after_circuit_confirmed(flag, publish),
+            // Entry already evicted (slot-cap race) — nothing to wait on;
+            // publish now, matching the old behavior.
+            None => publish(self),
+        }
 
         Ok(cookie)
+    }
+
+    /// Run `publish` once `confirmed` flips true — i.e. once the rendezvous
+    /// relay ACK'd this circuit's registration (`CircuitBuilt`) — so a cookie
+    /// is never RESOLVABLE before it is LIVE at the relay (the
+    /// publish-before-register race; see `register_onion_service`). Bounded:
+    /// after ~3 s without an ACK it publishes anyway — discoverability must
+    /// not hard-fail on a lost ACK; the maintenance tick already re-selects a
+    /// fresh path for unconfirmed circuits (Δ2-d). A short-lived thread (not a
+    /// blocking poll in the caller): registrations are rare (startup + period
+    /// rotation, ≤ MAX_ONION_SERVICES entries) and the callers sit on the
+    /// async maintenance tick / IPC path where blocking would stall the
+    /// executor — the typical wait is one relay round-trip (~40-100 ms).
+    fn publish_after_circuit_confirmed(
+        &self,
+        confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        publish: impl FnOnce(&NodeServices) + Send + 'static,
+    ) {
+        const CONFIRM_TIMEOUT_MS: u64 = 3_000;
+        const POLL_MS: u64 = 20;
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let mut waited_ms = 0u64;
+            while !confirmed.load(std::sync::atomic::Ordering::Relaxed)
+                && waited_ms < CONFIRM_TIMEOUT_MS
+            {
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+                waited_ms += POLL_MS;
+            }
+            if confirmed.load(std::sync::atomic::Ordering::Relaxed) {
+                this.logger.info(
+                    "anonymity.publish.after_confirm",
+                    format!("circuit registration ACK'd after ~{waited_ms}ms — publishing ad"),
+                );
+            } else {
+                this.logger.warn(
+                    "anonymity.publish.unconfirmed",
+                    format!(
+                        "no CircuitBuilt ACK within {CONFIRM_TIMEOUT_MS}ms — publishing \
+                         anyway (ad may briefly black-hole until the rebuild tick)"
+                    ),
+                );
+            }
+            publish(&this);
+        });
     }
 
     /// Seal + store a blinded service descriptor for the current period (3c).
@@ -7656,13 +7723,14 @@ impl NodeServices {
             } else {
                 relay_path.clone()
             };
-            if let Ok(new_confirmed) = self.build_onion_circuit_once(
+            let built = self.build_onion_circuit_once(
                 &path,
                 cookie_now,
                 &reg_keypair,
                 &registration_epoch,
                 false, // hosted service rebuild, not a reply circuit
-            ) {
+            );
+            if let Ok(new_confirmed) = &built {
                 // COOKIE-DIAG (periodic re-register): the cookie this node now
                 // holds at its relay. Must equal what senders put in introduces.
                 log::info!(
@@ -7680,7 +7748,7 @@ impl NodeServices {
                 if let Some(e) = svcs.iter_mut().find(|e| e.cookie == cookie) {
                     e.built_unix = now_unix;
                     e.relay_path = path.clone();
-                    e.confirmed = new_confirmed;
+                    e.confirmed = std::sync::Arc::clone(new_confirmed);
                     e.cookie = cookie_now;
                     e.reg_keypair = reg_keypair.clone();
                 }
@@ -7692,11 +7760,24 @@ impl NodeServices {
             // rotates every PERIOD_SECS (24 h), so without this refresh a sender
             // computing the current-period key stops finding it after ~1–2 periods
             // (it only tolerates ±1). REFRESH_SECS (150 s) ≪ the period, so a fresh
-            // descriptor is always present under the live key. Decoupled from the
-            // rebuild result — discoverability shouldn't hinge on one tick's
-            // rebuild succeeding.
+            // descriptor is always present under the live key.
             if let Some(&rendezvous) = relay_path.last() {
-                self.publish_blinded_descriptor(rendezvous, cookie_now);
+                match built {
+                    // Same publish-before-register barrier as the initial
+                    // registration: at a period boundary `cookie_now` is a
+                    // cookie the relay has never seen — publishing it before
+                    // the rebuild's CircuitBuilt ACK reopens the race there.
+                    Ok(new_confirmed) => {
+                        self.publish_after_circuit_confirmed(new_confirmed, move |this| {
+                            this.publish_blinded_descriptor(rendezvous, cookie_now);
+                        });
+                    }
+                    // Build failed: publish immediately, matching the old
+                    // "decoupled from the rebuild result" behavior —
+                    // discoverability shouldn't hinge on one tick's rebuild
+                    // succeeding (the next tick retries in REFRESH_SECS).
+                    Err(_) => self.publish_blinded_descriptor(rendezvous, cookie_now),
+                }
             }
         }
     }
