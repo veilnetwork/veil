@@ -8144,10 +8144,22 @@ impl NodeServices {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let stall = self
-            .anonymity
-            .send_stall
-            .note_send(receiver_node_id, stall_now_unix);
+        // Only reply-expecting sends DRIVE the stall accounting: their
+        // delivery-ACK comes back over OUR ephemeral reply circuit, so its
+        // absence is a true me→R signal. Beacons / acks / content chunks carry
+        // no reply block and are legitimately unanswered — counting them made
+        // a quiet-but-healthy pair re-trip the verdict every widen window.
+        // They still ride an ACTIVE widen (peek) so a stalled route widens
+        // every outgoing frame, not just the messages.
+        let stall = if reply.is_some() {
+            self.anonymity
+                .send_stall
+                .note_send(receiver_node_id, stall_now_unix)
+        } else {
+            self.anonymity
+                .send_stall
+                .peek(&receiver_node_id, stall_now_unix)
+        };
         if stall.invalidate_cache {
             self.anonymity
                 .rendezvous_resolve_cache
