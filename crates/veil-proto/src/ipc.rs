@@ -5274,6 +5274,12 @@ pub mod event_kind {
     /// no end-to-end ACK, so absence of this event is NOT proof of delivery.
     /// Payload: `[u8; 32] content_id` of the failed message.
     pub const ANON_SEND_FAILED: u8 = 4;
+    /// A mailbox relay signalled over our live direct session that it just
+    /// STORED a deposit for us (in-network wake, no third-party push). The
+    /// client should drain its mailbox promptly instead of waiting out its
+    /// poll back-off. Best-effort hint — a missed wake only delays the next
+    /// scheduled drain, never loses the deposit. Payload: empty.
+    pub const MAILBOX_WAKE: u8 = 5;
 }
 
 /// Payload [`crate::family::LocalAppMsg::Event`].

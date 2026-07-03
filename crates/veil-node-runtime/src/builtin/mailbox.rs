@@ -70,6 +70,14 @@ pub struct PushTrigger {
     pub wake_hmac_envelope: Option<Vec<u8>>,
 }
 
+/// Sends the in-network deposit WAKE: a tiny empty datagram to the receiver's
+/// `(MAILBOX_APP_ID, MAILBOX_WAKE_ENDPOINT_ID)` over its LIVE direct session
+/// with this relay (see the constant's doc in veil-mailbox). Returns whether a
+/// frame was actually queued (false = no live session / debounced). Injected
+/// as a closure so this module needs no `SessionTxRegistry` dependency; the
+/// runtime builds it where the registry lives.
+pub type MailboxWakeSender = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
+
 /// bound the push-trigger channel.
 /// Pre-fix the channel was `unbounded_channel`; an attacker spamming
 /// `MailboxPut` faster than the push-dispatch task drains would cause
@@ -192,6 +200,9 @@ pub fn spawn_mailbox_app_service(
     mailbox: Arc<Mailbox>,
     push_trigger_tx: Option<tokio::sync::mpsc::Sender<PushTrigger>>,
     reply_sender: Option<Arc<dyn AnonOnionSender>>,
+    // In-network deposit wake toward the receiver's live session (None =
+    // feature off, e.g. tests / a node with no session registry).
+    wake_sender: Option<MailboxWakeSender>,
 ) {
     let spec = ServiceSpec {
         name: "veil.mailbox.v1",
@@ -222,7 +233,13 @@ pub fn spawn_mailbox_app_service(
         loop {
             tokio::select! {
                 Some(msg) = put_rx.recv() => {
-                    handle_put_message(&mailbox, push_trigger_tx.as_ref(), &mut reassembler, msg);
+                    handle_put_message(
+                        &mailbox,
+                        push_trigger_tx.as_ref(),
+                        wake_sender.as_ref(),
+                        &mut reassembler,
+                        msg,
+                    );
                 }
                 Some(msg) = fetch_rx.recv() => {
                     handle_fetch_message(&mailbox, reply_sender.as_ref(), msg).await;
@@ -241,6 +258,54 @@ pub fn spawn_mailbox_app_service(
                     log::info!("veil-mailbox: PUT/FETCH endpoint closed");
                     break;
                 }
+            }
+        }
+    });
+}
+
+/// Spawn the receiver-side WAKE listener: binds
+/// `(MAILBOX_APP_ID, MAILBOX_WAKE_ENDPOINT_ID)` and, for every datagram that
+/// lands there, publishes a `MAILBOX_WAKE` event on the daemon event bus so
+/// the client app drains its mailbox promptly (the payload is ignored — the
+/// wake is a pure hint). Runs on EVERY node (not just mailbox relays): any
+/// node may be a mailbox RECEIVER. The sender is a directly-connected session
+/// peer; a spoofed/spammy wake can only cause a bounded early drain (the app
+/// debounces), never data loss — same threat class as any live inbound frame.
+pub fn spawn_mailbox_wake_listener(
+    host: &mut BuiltinAppHost,
+    ctx: ServiceContext,
+    event_bus: Arc<veil_ipc::EventBus>,
+) {
+    use veil_mailbox::{MAILBOX_WAKE_ENDPOINT_CAPACITY, MAILBOX_WAKE_ENDPOINT_ID};
+    let spec = ServiceSpec {
+        name: "veil.mailbox.wake.v1",
+        app_id: MAILBOX_APP_ID,
+        endpoints: vec![BuiltinEndpoint {
+            endpoint_id: MAILBOX_WAKE_ENDPOINT_ID,
+            capacity: MAILBOX_WAKE_ENDPOINT_CAPACITY,
+        }],
+    };
+    host.spawn(ctx, spec, move |mut ctx, mut rxs| async move {
+        let mut wake_rx = rxs.remove(0);
+        loop {
+            tokio::select! {
+                Some(msg) = wake_rx.recv() => {
+                    if let AppMessage::Deliver { src_node_id, .. } = msg {
+                        log::debug!(
+                            "veil-mailbox: deposit wake from relay {} — publishing event",
+                            hex_short(&src_node_id),
+                        );
+                        event_bus.publish(veil_proto::EventPayload {
+                            kind: veil_proto::event_kind::MAILBOX_WAKE,
+                            payload: Vec::new(),
+                        });
+                    }
+                }
+                _ = ctx.shutdown.changed() => {
+                    log::info!("veil-mailbox: wake listener stopping");
+                    break;
+                }
+                else => break,
             }
         }
     });
@@ -396,6 +461,7 @@ pub fn handle_ack_message(mailbox: &Mailbox, msg: AppMessage) {
 pub fn handle_put_message(
     mailbox: &Mailbox,
     push_trigger_tx: Option<&tokio::sync::mpsc::Sender<PushTrigger>>,
+    wake_sender: Option<&MailboxWakeSender>,
     reassembler: &mut PutChunkReassembler,
     msg: AppMessage,
 ) {
@@ -503,6 +569,19 @@ pub fn handle_put_message(
                 hex_short(&req.receiver_id),
                 hex_short(&req.content_id),
             );
+            // In-network wake: if the receiver has a LIVE direct session with
+            // this relay, tell it mail just landed so it drains NOW instead of
+            // on its poll back-off. Best-effort + relay-debounced inside the
+            // closure; independent of the (FCM/APNs) push envelope below —
+            // most deposits carry no envelope at all.
+            if let Some(wake) = wake_sender
+                && wake(&req.receiver_id)
+            {
+                log::debug!(
+                    "veil-mailbox: deposit wake sent (recv={})",
+                    hex_short(&req.receiver_id),
+                );
+            }
             // Push trigger only when a) we have a tx and b) sender
             // supplied a non-empty envelope.
             if let Some(tx) = push_trigger_tx
@@ -800,7 +879,7 @@ mod tests {
         let mut host = BuiltinAppHost::new();
         let registry = Arc::new(AppEndpointRegistry::new());
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None, None);
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None, None, None);
 
         // Send a Deliver to MAILBOX_APP_ID + MAILBOX_PUT_ENDPOINT_ID.
         let recv = [11u8; 32];
@@ -832,6 +911,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_service_fires_in_network_wake_on_stored() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let mut host = BuiltinAppHost::new();
+        let registry = Arc::new(AppEndpointRegistry::new());
+        let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
+        // Counting wake sender — the runtime's real closure sends a session
+        // frame; here we only assert the hook fires with the right receiver.
+        let woken: Arc<std::sync::Mutex<Vec<[u8; 32]>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let woken_in = Arc::clone(&woken);
+        let wake: MailboxWakeSender = Arc::new(move |r| {
+            woken_in.lock().unwrap().push(*r);
+            true
+        });
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None, None, Some(wake));
+
+        let recv = [11u8; 32];
+        // NO push envelope: the wake must fire regardless (most deposits carry
+        // no FCM/APNs envelope at all).
+        let payload = mk_payload(recv, [22u8; 32], [33u8; 32], b"x".to_vec(), None);
+        let sender = registry
+            .get_sender(MAILBOX_APP_ID, MAILBOX_PUT_ENDPOINT_ID)
+            .unwrap();
+        sender
+            .try_send(AppMessage::Deliver {
+                src_node_id: [33u8; 32],
+                src_app_id: [0u8; 32],
+                app_id: MAILBOX_APP_ID,
+                endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
+                data: veil_bufpool::pooled_shared_from_vec(payload),
+                reply_id: 0,
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(woken.lock().unwrap().as_slice(), &[recv]);
+        // A DUPLICATE deposit must not wake again (only Stored does).
+        let dup = mk_payload(recv, [22u8; 32], [33u8; 32], b"x".to_vec(), None);
+        let sender2 = registry
+            .get_sender(MAILBOX_APP_ID, MAILBOX_PUT_ENDPOINT_ID)
+            .unwrap();
+        sender2
+            .try_send(AppMessage::Deliver {
+                src_node_id: [33u8; 32],
+                src_app_id: [0u8; 32],
+                app_id: MAILBOX_APP_ID,
+                endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
+                data: veil_bufpool::pooled_shared_from_vec(dup),
+                reply_id: 0,
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(woken.lock().unwrap().len(), 1, "duplicate must not re-wake");
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wake_listener_publishes_mailbox_wake_event() {
+        let mut host = BuiltinAppHost::new();
+        let registry = Arc::new(AppEndpointRegistry::new());
+        let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
+        let bus = Arc::new(veil_ipc::EventBus::new());
+        let mut events = bus.subscribe();
+        spawn_mailbox_wake_listener(&mut host, ctx, Arc::clone(&bus));
+
+        let sender = registry
+            .get_sender(MAILBOX_APP_ID, veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID)
+            .expect("wake endpoint registered");
+        sender
+            .try_send(AppMessage::Deliver {
+                src_node_id: [44u8; 32],
+                src_app_id: [0u8; 32],
+                app_id: MAILBOX_APP_ID,
+                endpoint_id: veil_mailbox::MAILBOX_WAKE_ENDPOINT_ID,
+                data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+                reply_id: 0,
+            })
+            .unwrap();
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event");
+        assert_eq!(ev.kind, veil_proto::event_kind::MAILBOX_WAKE);
+        assert!(ev.payload.is_empty());
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn t1_4_p5b_app_service_fires_push_trigger_on_stored_with_envelope() {
         let (mailbox, _tmp) = fresh_mailbox();
         let mut host = BuiltinAppHost::new();
@@ -839,7 +1005,7 @@ mod tests {
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
         let (push_tx, mut push_rx) =
             tokio::sync::mpsc::channel::<PushTrigger>(PUSH_TRIGGER_QUEUE_CAP);
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), Some(push_tx), None);
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), Some(push_tx), None, None);
 
         let recv = [11u8; 32];
         let envelope = vec![0xEE; 60];
@@ -882,7 +1048,7 @@ mod tests {
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
         let (push_tx, mut push_rx) =
             tokio::sync::mpsc::channel::<PushTrigger>(PUSH_TRIGGER_QUEUE_CAP);
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), Some(push_tx), None);
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), Some(push_tx), None, None);
 
         let payload = mk_payload(
             [1u8; 32],
@@ -920,7 +1086,7 @@ mod tests {
         let mut host = BuiltinAppHost::new();
         let registry = Arc::new(AppEndpointRegistry::new());
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None, None);
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None, None, None);
 
         let sender = registry
             .get_sender(MAILBOX_APP_ID, MAILBOX_PUT_ENDPOINT_ID)
@@ -963,7 +1129,7 @@ mod tests {
         let mut host = BuiltinAppHost::new();
         let registry = Arc::new(AppEndpointRegistry::new());
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None, None);
+        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), None, None, None);
 
         let sender = registry
             .get_sender(MAILBOX_APP_ID, MAILBOX_PUT_ENDPOINT_ID)
