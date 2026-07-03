@@ -658,15 +658,24 @@ impl FrameDispatcher {
                 return DispatchResult::Violation(format!("ForwardIntroduce decode: {e}"));
             }
         };
-        self.process_introduce_ciphertext(&p.ciphertext, node_id.as_bytes())
+        // Session-forwarded: arrived via our RENDEZVOUS registration, not one
+        // of our reply circuits.
+        self.process_introduce_ciphertext(&p.ciphertext, node_id.as_bytes(), false)
     }
 
     /// Decrypt a sealed introduce ciphertext (replay-protected) with our
     /// anonymity key and dispatch the inner final-hop payload (APP_DELIVER /
     /// APP_DELIVER_AUTH). Shared by the SESSION forward path
     /// ([`Self::handle_forward_introduce`]) and the CIRCUIT origin-receive path
-    /// (a return cell the originator opened — b5b).
-    fn process_introduce_ciphertext(&self, ciphertext: &[u8], peer: &[u8; 32]) -> DispatchResult {
+    /// (a return cell the originator opened — b5b). `via_reply_circuit` is true
+    /// only on the latter when the opened circuit is one of OUR ephemeral reply
+    /// circuits (see [`AuthDeliverInbound::Fragment`]).
+    fn process_introduce_ciphertext(
+        &self,
+        ciphertext: &[u8],
+        peer: &[u8; 32],
+        via_reply_circuit: bool,
+    ) -> DispatchResult {
         let Some(ref sk) = self.anonymity_x25519_sk else {
             // Not configured for anonymity — silent drop (anti-leak).
             self.logger.info(
@@ -764,7 +773,10 @@ impl FrameDispatcher {
                 // A fragment of a signed AuthAppDeliver — hand to the runtime
                 // task to reassemble + verify + deliver with the VERIFIED sender.
                 match veil_proto::AuthDeliverFragment::decode(inner) {
-                    Ok(frag) => self.enqueue_auth_deliver(AuthDeliverInbound::Fragment(frag)),
+                    Ok(frag) => self.enqueue_auth_deliver(AuthDeliverInbound::Fragment {
+                        frag,
+                        via_reply_circuit,
+                    }),
                     Err(e) => self.logger.info(
                         "anonymity.relay_chain.forward.auth_decode_failed",
                         format!("AuthDeliverFragment decode: {e}"),
@@ -1060,7 +1072,10 @@ impl FrameDispatcher {
                     circuit_data_diag(|d| {
                         d.origin_stream_missing = d.origin_stream_missing.saturating_add(1);
                     });
-                    self.process_introduce_ciphertext(&opened, &link)
+                    // A return cell on OUR circuit: if this circuit is one of
+                    // our ephemeral REPLY circuits, the payload is the peer
+                    // answering something we sent live (me→R proof).
+                    self.process_introduce_ciphertext(&opened, &link, origin.is_reply)
                 }
                 Err(_) => {
                     circuit_data_diag(|d| {
@@ -1643,7 +1658,7 @@ mod tests {
         // The direct onion final-hop enqueues a whole message.
         let auth = match got {
             crate::AuthDeliverInbound::Full(a) => a,
-            crate::AuthDeliverInbound::Fragment(_) => panic!("expected Full, got Fragment"),
+            crate::AuthDeliverInbound::Fragment { .. } => panic!("expected Full, got Fragment"),
         };
         assert_eq!(auth.sender_node_id, [0x5A; 32]);
         assert_eq!(auth.nonce, 42);
@@ -2039,6 +2054,7 @@ mod tests {
                 origin_circuit_id: origin_cid,
                 created_unix: 0,
                 confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                is_reply: false,
             }));
 
         // The sealed introduce the sender produced (sealed to OUR anonymity key).
@@ -2114,6 +2130,7 @@ mod tests {
                 origin_circuit_id: origin_cid,
                 created_unix: 0,
                 confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                is_reply: false,
             }));
 
         // Register a byte-stream sink for this circuit (what open_data_circuit does).
@@ -2322,6 +2339,7 @@ mod tests {
                 origin_circuit_id: origin_cid,
                 created_unix: 0,
                 confirmed: std::sync::Arc::clone(&confirmed),
+                is_reply: false,
             }));
         assert!(!confirmed.load(std::sync::atomic::Ordering::Relaxed));
 
