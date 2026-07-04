@@ -311,6 +311,21 @@ pub fn spawn_mailbox_wake_listener(
     });
 }
 
+/// Per-blob wire header inside a `MailboxFetchRespPayload` entry:
+/// sender_id + content_id + deposited_at + blob_len.
+const PER_BLOB_WIRE_HDR: usize = 32 + 32 + 8 + 4;
+
+/// Bytes one FETCH reply may carry. The reply rides a SINGLE signed
+/// AuthDeliver capped at `MAX_AUTH_DELIVER_MSG_BYTES` (~6 KB, fragmented);
+/// leave margin for the AuthDeliver framing (sig + node_id + fields) + the
+/// resp count. A blob whose wire cost exceeds this can NEVER be fetched —
+/// both the FETCH packer and the PUT gate key off this same number.
+fn fetch_reply_budget() -> usize {
+    veil_proto::MAX_AUTH_DELIVER_MSG_BYTES
+        .saturating_sub(512)
+        .min(MAILBOX_FETCH_REPLY_MAX_BYTES)
+}
+
 /// Handle one incoming app message addressed to the FETCH endpoint.
 ///
 /// The requester is AUTHENTICATED — the onion delivery cryptographically
@@ -358,41 +373,55 @@ pub async fn handle_fetch_message(
         }
     };
     // Bound the reply so the whole encoded MailboxFetchRespPayload fits in ONE
-    // signed AuthDeliver. The reply rides a single auth-deliver capped at
-    // MAX_AUTH_DELIVER_MSG_BYTES (~6 KB, fragmented); the old 60 KB cap let a
-    // backlog overflow it → send_reply failed PayloadTooLarge → the reply was
-    // never sent and the receiver could NEVER drain (blobs then accumulate past
-    // 6 KB permanently). Account for the per-blob wire header too, and leave
-    // margin for the AuthDeliver framing (sig + node_id + fields) + resp count.
-    // Oldest-first; the receiver re-fetches to drain the rest (FETCH is
-    // non-destructive, deduped receiver-side by content_id).
-    const PER_BLOB_WIRE_HDR: usize = 32 + 32 + 8 + 4; // sender_id+content_id+deposited_at+blob_len
-    let reply_budget = veil_proto::MAX_AUTH_DELIVER_MSG_BYTES
-        .saturating_sub(512)
-        .min(MAILBOX_FETCH_REPLY_MAX_BYTES);
+    // signed AuthDeliver (see [fetch_reply_budget]). Oldest-first; the receiver
+    // re-fetches to drain the rest (FETCH is non-destructive, deduped
+    // receiver-side by content_id).
+    //
+    // A blob that ALONE exceeds the budget can never be served: emitting it
+    // (the old "always emit at least one" progress rule) made send_reply fail
+    // PayloadTooLarge on EVERY fetch, and since the queue is oldest-first the
+    // oversized blob stayed at its head — permanently wedging that receiver's
+    // mailbox and starving every deliverable blob behind it (observed in
+    // production). Purge such blobs instead: undeliverable-by-protocol mail is
+    // dead mail (the PUT gate now rejects new ones at the door; this clears
+    // any already stored).
+    let reply_budget = fetch_reply_budget();
     let mut total = 0usize;
-    let wire: Vec<MailboxBlobWire> = blobs
-        .into_iter()
-        .take(MAX_MAILBOX_FETCH_ENTRIES)
-        .take_while(|b| {
-            let cost = b.blob.len() + PER_BLOB_WIRE_HDR;
-            if total == 0 {
-                total = cost;
-                return true; // always emit at least one (guarantees progress)
+    let mut wire: Vec<MailboxBlobWire> = Vec::new();
+    for b in blobs {
+        if wire.len() >= MAX_MAILBOX_FETCH_ENTRIES {
+            break;
+        }
+        let cost = b.blob.len() + PER_BLOB_WIRE_HDR;
+        if cost > reply_budget {
+            match mailbox.ack(src_node_id, b.content_id) {
+                Ok(removed) => log::warn!(
+                    "veil-mailbox: purged oversized blob (recv={} cid={} {}B > \
+                     fetch budget {reply_budget}B, removed={removed}) — it could \
+                     never ride a FETCH reply",
+                    hex_short(&src_node_id),
+                    hex_short(&b.content_id),
+                    b.blob.len(),
+                ),
+                Err(e) => log::warn!(
+                    "veil-mailbox: failed to purge oversized blob (recv={} cid={}): {e}",
+                    hex_short(&src_node_id),
+                    hex_short(&b.content_id),
+                ),
             }
-            if total + cost > reply_budget {
-                return false;
-            }
-            total += cost;
-            true
-        })
-        .map(|b| MailboxBlobWire {
+            continue; // the NEXT blob may well fit — keep packing
+        }
+        if total + cost > reply_budget {
+            break; // deliverable, just not THIS round — a later fetch gets it
+        }
+        total += cost;
+        wire.push(MailboxBlobWire {
             sender_id: b.sender_id,
             content_id: b.content_id,
             deposited_at: b.deposited_at,
             blob: b.blob,
-        })
-        .collect();
+        });
+    }
     let n = wire.len();
     let resp = MailboxFetchRespPayload { blobs: wire }.encode();
     match sender.send_reply(reply_id, &resp, MAILBOX_APP_ID).await {
@@ -516,6 +545,26 @@ pub fn handle_put_message(
             hex_short(&req.sender_id),
             hex_short(&src_node_id),
         );
+    }
+
+    // Reject a deposit whose blob could never be FETCHED back out: PUT accepts
+    // chunked payloads far past the reply cap (MAX_MAILBOX_BLOB_BYTES = 1 MB vs
+    // ~5.6 KB deliverable), so without this gate an oversized deposit was
+    // stored, then wedged its receiver's queue head forever (send_reply
+    // PayloadTooLarge on every drain). Fail it loudly at the door instead.
+    {
+        let cost = req.blob.len() + PER_BLOB_WIRE_HDR;
+        let budget = fetch_reply_budget();
+        if cost > budget {
+            log::warn!(
+                "veil-mailbox: PUT rejected (recv={} cid={} blob {}B + hdr > \
+                 fetch budget {budget}B — would be permanently unfetchable)",
+                hex_short(&req.receiver_id),
+                hex_short(&req.content_id),
+                req.blob.len(),
+            );
+            return;
+        }
     }
 
     let envelope_for_push = req.push_envelope.clone();
@@ -1342,5 +1391,99 @@ mod tests {
             captured.lock().unwrap().is_empty(),
             "no reply for either drop case"
         );
+    }
+
+    #[tokio::test]
+    async fn network_fetch_purges_oversized_head_blob_and_serves_next() {
+        let (mailbox, _tmp) = fresh_mailbox();
+        let recv = [0x77u8; 32];
+        // Pre-existing oversized deposit (stored via the raw store API, as by a
+        // relay predating the PUT gate): ALONE it exceeds the reply budget, so
+        // under the old "always emit at least one" rule it rode every reply,
+        // failed PayloadTooLarge each time, and wedged the queue head forever.
+        let oversized = vec![0xEE; fetch_reply_budget()];
+        mailbox.put(recv, [0xC1; 32], [0xAA; 32], oversized).unwrap();
+        // A perfectly deliverable blob stuck BEHIND it.
+        mailbox
+            .put(recv, [0xC2; 32], [0xAA; 32], b"deliverable".to_vec())
+            .unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender: Arc<dyn veil_types::AnonOnionSender> = Arc::new(MockReplySender {
+            captured: std::sync::Arc::clone(&captured),
+        });
+        let msg = AppMessage::Deliver {
+            src_node_id: recv,
+            src_app_id: [0u8; 32],
+            app_id: MAILBOX_APP_ID,
+            endpoint_id: MAILBOX_FETCH_ENDPOINT_ID,
+            data: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+            reply_id: 7,
+        };
+        handle_fetch_message(&mailbox, Some(&sender), msg).await;
+
+        // The reply carries ONLY the deliverable blob and fits the budget.
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1, "exactly one reply");
+        let resp = veil_proto::MailboxFetchRespPayload::decode(&cap[0].1).unwrap();
+        assert_eq!(resp.blobs.len(), 1);
+        assert_eq!(resp.blobs[0].content_id, [0xC2; 32]);
+        // The oversized blob is PURGED from the store, not merely skipped —
+        // otherwise it stays at the queue head as a permanent tombstone.
+        let left = mailbox.fetch(recv).unwrap();
+        assert_eq!(left.len(), 1, "oversized blob gone from the store");
+        assert_eq!(left[0].content_id, [0xC2; 32]);
+    }
+
+    #[test]
+    fn put_endpoint_rejects_unfetchable_oversized_blob() {
+        let (mb, _tmp) = fresh_mailbox();
+        let recv = [0x55u8; 32];
+        let mut ra = PutChunkReassembler::default();
+        // Blob big enough that blob + per-entry wire header exceeds one FETCH
+        // reply — storing it would make it permanently unfetchable.
+        let payload = mk_payload(
+            recv,
+            [0xC9; 32],
+            [0x33; 32],
+            vec![0xEE; fetch_reply_budget()],
+            None,
+        );
+        handle_put_message(
+            &mb,
+            None,
+            None,
+            &mut ra,
+            AppMessage::Deliver {
+                src_node_id: [0x33u8; 32],
+                src_app_id: [0u8; 32],
+                app_id: MAILBOX_APP_ID,
+                endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
+                data: veil_bufpool::pooled_shared_from_vec(payload),
+                reply_id: 0,
+            },
+        );
+        assert!(
+            mb.fetch(recv).unwrap().is_empty(),
+            "unfetchable deposit must be rejected at the door"
+        );
+
+        // Control: a normal-sized deposit through the same path still lands.
+        let ok = mk_payload(recv, [0xCA; 32], [0x33; 32], b"fits".to_vec(), None);
+        handle_put_message(
+            &mb,
+            None,
+            None,
+            &mut ra,
+            AppMessage::Deliver {
+                src_node_id: [0x33u8; 32],
+                src_app_id: [0u8; 32],
+                app_id: MAILBOX_APP_ID,
+                endpoint_id: MAILBOX_PUT_ENDPOINT_ID,
+                data: veil_bufpool::pooled_shared_from_vec(ok),
+                reply_id: 0,
+            },
+        );
+        assert_eq!(mb.fetch(recv).unwrap().len(), 1, "normal deposit still stored");
     }
 }
