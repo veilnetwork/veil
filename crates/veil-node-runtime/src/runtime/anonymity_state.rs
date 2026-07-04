@@ -251,18 +251,41 @@ impl AnonSendStallTracker {
             m.remove(&stalest);
         }
         let e = m.entry(receiver).or_default();
-        // Gave up on this peer recently — rest (no widen / no re-resolve) so a
-        // genuinely-dead live path doesn't keep loading the node. Still count
-        // the send so the streak is warm when the rest period ends.
+        // Gave up on this peer recently — rest (no widen) so a genuinely-dead
+        // live path doesn't keep loading the node. Still count the send so the
+        // streak is warm when the rest period ends.
         if e.dormant_until > now_unix {
             if e.unanswered == 0 {
                 e.first_unix = now_unix;
             }
             e.unanswered = e.unanswered.saturating_add(1);
+            // Bounded RESOLVE PROBE while dormant (one cache invalidate per
+            // [`ANON_SEND_WIDEN_SECS`], no widen): a receiver that comes BACK
+            // republishes its ad within seconds, but a fully-suppressed rest
+            // period kept introducing into the DEAD cached route for up to
+            // [`ANON_SEND_DORMANT_SECS`] — observed as minutes of silent
+            // drops AFTER the receiver had recovered. The probe re-compares
+            // fresh replicas; a live receiver's route then heals on the very
+            // next send (and its answer dissolves the streak), while a
+            // still-dead peer costs one DHT resolve per window instead of
+            // widened onion bursts. `widen_until` is dead state inside
+            // dormant (peek gates widen on `dormant_until <= now`), so it is
+            // reused as the probe timer.
+            let probe = e.widen_until <= now_unix;
+            if probe {
+                e.widen_until = now_unix + ANON_SEND_WIDEN_SECS;
+            }
             return StallVerdict {
                 widen: false,
-                invalidate_cache: false,
+                invalidate_cache: probe,
             };
+        }
+        if e.dormant_until != 0 {
+            // Dormant just expired — clear it AND the probe timer that
+            // borrowed `widen_until`, so a leftover probe deadline can't
+            // masquerade as an active widen window.
+            e.dormant_until = 0;
+            e.widen_until = 0;
         }
         if e.unanswered == 0 {
             e.first_unix = now_unix;
@@ -315,9 +338,13 @@ impl AnonSendStallTracker {
     pub fn peek(&self, receiver: &[u8; 32], now_unix: u64) -> StallVerdict {
         let m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         StallVerdict {
-            widen: m.get(receiver).is_some_and(|e| {
-                e.dormant_until <= now_unix && e.widen_until > now_unix
-            }),
+            // `dormant_until == 0` (never dormant, or cleared by the first
+            // post-dormant `note_send`): while a dormant stamp is present —
+            // active OR just expired — `widen_until` may be the borrowed
+            // resolve-probe deadline, not a widen window.
+            widen: m
+                .get(receiver)
+                .is_some_and(|e| e.dormant_until == 0 && e.widen_until > now_unix),
             invalidate_cache: false,
         }
     }
@@ -827,6 +854,52 @@ mod tests {
         assert!(
             !t.peek(&r, 200 + ANON_SEND_STALL_MIN_SECS + ANON_SEND_WIDEN_SECS + 1)
                 .widen
+        );
+    }
+
+    #[test]
+    fn stall_tracker_dormant_probes_resolve_once_per_window() {
+        let t = AnonSendStallTracker::new();
+        let r = [12u8; 32];
+        // Drive into dormant: prime + exhaust the widen-window cap.
+        let mut now = 100u64;
+        t.note_send(r, now);
+        t.note_send(r, now + 1);
+        now += ANON_SEND_STALL_MIN_SECS;
+        for _ in 0..=ANON_SEND_MAX_WIDEN_WINDOWS {
+            t.note_send(r, now);
+            now += ANON_SEND_WIDEN_SECS + 1;
+        }
+        // We are dormant. The FIRST dormant send probes (cache invalidate, so
+        // the next send re-compares fresh replicas — a receiver that came back
+        // republishes within seconds and the route heals immediately) but
+        // never widens.
+        let v = t.note_send(r, now);
+        assert!(!v.widen && v.invalidate_cache, "first dormant send probes");
+        // Further sends inside the same probe window stay fully quiet.
+        let v = t.note_send(r, now + 1);
+        assert!(!v.widen && !v.invalidate_cache);
+        let v = t.note_send(r, now + ANON_SEND_WIDEN_SECS - 1);
+        assert!(!v.widen && !v.invalidate_cache);
+        // Next window → next probe. Bounded: one resolve per window, not one
+        // per send.
+        let v = t.note_send(r, now + ANON_SEND_WIDEN_SECS + 1);
+        assert!(!v.widen && v.invalidate_cache, "one probe per window");
+        // peek during dormant must not mistake the borrowed probe timer for an
+        // active widen window.
+        assert!(!t.peek(&r, now + ANON_SEND_WIDEN_SECS + 2).widen);
+        // After dormant expires, the leftover probe deadline must not
+        // masquerade as a widen window for reply-LESS sends (peek).
+        let after = now + ANON_SEND_DORMANT_SECS + 1;
+        assert!(!t.peek(&r, after).widen);
+        // The dormant-counted streak is deliberately kept WARM: the first
+        // reply-expecting send after the rest period trips a fresh widen
+        // window immediately (with a fresh re-resolve), instead of waiting
+        // out threshold + min-age again.
+        let v = t.note_send(r, after);
+        assert!(
+            v.widen && v.invalidate_cache,
+            "post-dormant send retries promptly on a warm streak"
         );
     }
 

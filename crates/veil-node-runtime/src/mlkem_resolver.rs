@@ -163,6 +163,29 @@ impl DhtMlKemEkResolver {
             .ok()?
             .as_secs();
         let doc_key = IdentityDocument::dht_key(&target_node_id);
+        // No authoritative holder given → compare EVERY reachable holder and
+        // take the freshest issue (see [`Self::dht_get_freshest`]): a stale
+        // but still-valid document replica must not win the walk. With a
+        // direct peer the caller knows the authoritative holder (relay-key
+        // resolves), so the single steered walk stays.
+        if direct_peer.is_none() {
+            let doc = self
+                .dht_get_freshest(
+                    doc_key,
+                    |b| {
+                        IdentityDocument::decode(b).ok().filter(|d| {
+                            d.node_id == target_node_id
+                                && verify_identity_document(d, now_unix).is_ok()
+                        })
+                    },
+                    |d| (d.issued_at_unix, 0),
+                )
+                .await;
+            if doc.is_none() {
+                self.log_dbg("mlkem_resolver.doc.dht_miss", &target_node_id, "");
+            }
+            return doc;
+        }
         let doc_bytes = match self
             .dht_recursive_get(doc_key, self.step_timeout, direct_peer, |b| {
                 IdentityDocument::decode(b).ok().is_some_and(|d| {
@@ -239,73 +262,67 @@ impl DhtMlKemEkResolver {
             .as_secs();
 
         // ── Step 2: InstanceRegistry ────────────────────────────────
+        // Freshest-of-candidates (see [`Self::dht_get_freshest`]): a stale
+        // registry replica — including OUR OWN local mirror — points at an
+        // outdated instance and downstream seals target the wrong material.
+        // Freshness = the newest instance the registry has seen.
         let reg_key = InstanceRegistry::dht_key(&target_node_id);
-        let reg_bytes = match self
-            .dht_recursive_get(reg_key, self.step_timeout, None, |b| {
-                InstanceRegistry::decode(b).ok().is_some_and(|r| {
-                    r.node_id == target_node_id && verify_instance_registry_sig(&r, &doc)
-                })
-            })
+        let reg = match self
+            .dht_get_freshest(
+                reg_key,
+                |b| {
+                    InstanceRegistry::decode(b).ok().filter(|r| {
+                        r.node_id == target_node_id && verify_instance_registry_sig(r, &doc)
+                    })
+                },
+                |r| {
+                    (
+                        r.instances
+                            .iter()
+                            .map(|i| i.last_seen_unix_ms)
+                            .max()
+                            .unwrap_or(0),
+                        0,
+                    )
+                },
+            )
             .await
         {
-            Some(b) => b,
+            Some(r) => r,
             None => {
                 self.log_dbg("mlkem_resolver.registry.dht_miss", &target_node_id, "");
                 return None;
             }
         };
-        let reg = InstanceRegistry::decode(&reg_bytes)
-            .map_err(|e| {
-                self.log_dbg(
-                    "mlkem_resolver.registry.decode_failed",
-                    &target_node_id,
-                    &format!("{e}"),
-                )
-            })
-            .ok()?;
-        if reg.node_id != target_node_id {
-            self.log_dbg(
-                "mlkem_resolver.registry.node_id_mismatch",
-                &target_node_id,
-                "DHT returned InstanceRegistry for a different node_id",
-            );
-            return None;
-        }
-        if !verify_instance_registry_sig(&reg, &doc) {
-            self.log_dbg(
-                "mlkem_resolver.registry.sig_invalid",
-                &target_node_id,
-                "InstanceRegistry signature failed verification against IdentityDocument subkeys",
-            );
-            return None;
-        }
         let instance = reg.instances.iter().max_by_key(|i| i.last_seen_unix_ms)?;
 
         // ── Step 3: MlKemKeyCert ────────────────────────────────────
+        // Freshest-of-candidates by the cert's OWN supersede order:
+        // `cert_version` is the documented monotonic rotation counter,
+        // `valid_from_unix` breaks ties between republications of the same
+        // version. First-replica-wins here was THE production message-loss
+        // path: a mid-churn re-resolve returned a stale cert whose EK no
+        // longer matched the receiver's dk → every blob sealed to it failed
+        // open (`Fanout(AeadFailed)`) and was quarantined away.
         let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance.instance_id);
-        let cert_bytes = match self
-            .dht_recursive_get(cert_key, self.step_timeout, None, |b| {
-                MlKemKeyCert::decode(b)
-                    .ok()
-                    .is_some_and(|c| verify_mlkem_cert(&c, &doc, now_unix).is_ok())
-            })
+        let cert = match self
+            .dht_get_freshest(
+                cert_key,
+                |b| {
+                    MlKemKeyCert::decode(b)
+                        .ok()
+                        .filter(|c| verify_mlkem_cert(c, &doc, now_unix).is_ok())
+                },
+                |c| (c.cert_version, c.valid_from_unix),
+            )
             .await
         {
-            Some(b) => b,
+            Some(c) => c,
             None => {
                 self.log_dbg("mlkem_resolver.cert.dht_miss", &target_node_id, "");
                 return None;
             }
         };
-        let cert = MlKemKeyCert::decode(&cert_bytes)
-            .map_err(|e| {
-                self.log_dbg(
-                    "mlkem_resolver.cert.decode_failed",
-                    &target_node_id,
-                    &format!("{e}"),
-                )
-            })
-            .ok()?;
         let verified = verify_mlkem_cert(&cert, &doc, now_unix)
             .map_err(|e| {
                 self.log_dbg(
@@ -429,6 +446,48 @@ impl DhtMlKemEkResolver {
             format!("target={} relay_x25519 resolved", hex8(&target_node_id)),
         );
         Some(pk)
+    }
+
+    /// Multi-replica FIND_VALUE: ask every directly-reachable replication
+    /// holder (never letting a local mirror short-circuit the fan-out), keep
+    /// the candidates that decode + verify, pick the FRESHEST by `freshness`,
+    /// and repair the local mirror with the winner's bytes.
+    ///
+    /// The ML-KEM walk analogue of the rendezvous freshest-ad selection
+    /// (`replicas_from_freshest_ads`): after receiver churn a STALE replica of
+    /// the identity document / instance registry / key cert stays correctly
+    /// signed and unexpired, so the old first-replica-wins walk could seal a
+    /// mailbox blob to OUTDATED material — the receiver then cannot open it
+    /// (generic `Failed`), quarantines it, and the message is destroyed. A
+    /// sender that compares all reachable holders and takes the newest cannot
+    /// be downgraded by one lagging replica.
+    async fn dht_get_freshest<T>(
+        &self,
+        key: [u8; 32],
+        decode_verify: impl Fn(&[u8]) -> Option<T>,
+        freshness: impl Fn(&T) -> (u64, u64),
+    ) -> Option<T> {
+        let candidates = recursive_dht_get_candidates(
+            &self.dht,
+            &self.session_tx_registry,
+            &self.pending_recursive,
+            self.local_node_id,
+            key,
+            self.step_timeout,
+            veil_proto::budget::DHT_REPLICATION_K,
+            |b| decode_verify(b).is_some(),
+        )
+        .await;
+        let mut decoded: Vec<(T, Vec<u8>)> = candidates
+            .into_iter()
+            .filter_map(|bytes| decode_verify(&bytes).map(|v| (v, bytes)))
+            .collect();
+        decoded.sort_by_key(|(v, _)| std::cmp::Reverse(freshness(v)));
+        let (winner, bytes) = decoded.into_iter().next()?;
+        // Keep other DHT consumers (and our own next walk) from re-reading a
+        // known-older value from the ordinary local mirror.
+        self.dht.store_local(key, bytes);
+        Some(winner)
     }
 
     /// Recursive DHT FIND_VALUE walk — delegates to the shared
