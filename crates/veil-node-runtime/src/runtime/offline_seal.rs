@@ -243,7 +243,19 @@ impl veil_ipc::MailboxCryptoSink for RuntimeMailboxCrypto {
                 },
                 Err(OfflineSealError::NoIdentity) => O::NoIdentity,
                 Err(OfflineSealError::SenderDocUnresolved) => O::PeerUnresolved,
-                Err(_) => O::Failed,
+                Err(e) => {
+                    // The IPC surface collapses every open failure into a
+                    // generic `Failed`, which made the production loss class
+                    // (fresh legitimate blobs failing open after receiver
+                    // churn) undiagnosable: NoEnvelopeForInstance (sealed to a
+                    // STALE instance/cert from an inconsistent DHT replica),
+                    // AeadFailed (wrong EK era) and X3dh decap errors all look
+                    // identical to the app. Keep the wire status unchanged,
+                    // but log the full error chain — receiver-side, so one
+                    // churn repro pins the exact class.
+                    log::warn!("mailbox_open failed (detail): {e:?}");
+                    O::Failed
+                }
             }
         })
     }
