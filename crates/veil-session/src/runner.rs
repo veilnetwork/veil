@@ -1547,6 +1547,11 @@ impl SessionRunner {
                 tickets.remove(&oldest_id);
             }
             tickets.insert(self.peer_id, entry);
+            log::info!(
+                "resume.ticket.armed peer={} count={} — stored resume ticket from server",
+                veil_util::hex_short(&self.peer_id),
+                tickets.len(),
+            );
         }
     }
 
