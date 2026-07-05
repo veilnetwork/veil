@@ -27,6 +27,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- WAKE_LOCK: the foreground service holds a PARTIAL wake lock so the CPU
+         keeps running with the screen off. Without it Doze suspends the CPU
+         between maintenance windows and the daemon's socket keepalive + the
+         onion circuit heartbeat timers stop firing, so the first-hop TCP dies
+         and inbound messages stall until the next wake. Held only while the
+         opt-in background service runs. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application>
         <service
