@@ -65,6 +65,10 @@ veil-anonymity = { path = "../veil-anonymity" }
 # entry-point and the random-key generator that receivers persist
 # platform-side.
 veil-crypto = { path = "../veil-crypto" }
+# base64 for the opt-in message-signature FFI (`veil_identity_sign` /
+# `veil_identity_verify`): `verify_message` takes a base64 public key, so the
+# raw 32-byte key the caller passes is re-encoded before the audited verify.
+base64 = "0.22"
 # XChaCha20-Poly1305 for veil_seal/veil_unseal — encrypts large file blobs stored
 # OUTSIDE the deniable container (key derived from the unlocked container).
 chacha20poly1305 = "0.10"

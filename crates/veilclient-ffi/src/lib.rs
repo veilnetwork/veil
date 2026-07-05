@@ -76,6 +76,10 @@ pub(crate) mod guard;
 // `node-embedded` cargo feature so the default client-only build stays slim.
 #[cfg(feature = "node-embedded")]
 mod anon_stream;
+// Opt-in message-authorship signature FFI (needs veil-cfg to parse the caller's
+// identity TOML — enabled by node-embedded).
+#[cfg(feature = "node-embedded")]
+mod identity_sign;
 mod node;
 
 use libc::{size_t, ssize_t};
