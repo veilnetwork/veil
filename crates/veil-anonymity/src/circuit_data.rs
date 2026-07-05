@@ -139,6 +139,25 @@ pub fn wrap_payload(payload: &[u8]) -> Result<Vec<u8>, CircuitError> {
     Ok(buf)
 }
 
+/// Payload of a FORWARD keepalive "heartbeat" cell. The receiver periodically
+/// sends this UP its own inbound rendezvous circuit so the first-hop TCP
+/// session — and every hop's socket along the path — stays warm. An idle
+/// receiver's socket otherwise dies (mobile power-save / NAT rebind / VPN) and
+/// the rendezvous relay's downstream introduce pushes queue behind a dead TCP
+/// until the receiver next transmits, which on-device turned prompt delivery
+/// into 10–60 s stalls that flushed in a batch on the next outbound cell.
+///
+/// The terminus recognises this exact payload and silently drops it (it carries
+/// no data). Deliberately shorter than [`crate::circuit_register::COOKIE_LEN`]
+/// (16) so it can never be mistaken for a stream-splice cookie prefix.
+pub const CIRCUIT_HEARTBEAT_MAGIC: &[u8] = b"veil/hb1";
+
+/// True if a peeled forward-terminus payload is a keepalive heartbeat (see
+/// [`CIRCUIT_HEARTBEAT_MAGIC`]).
+pub fn is_heartbeat(payload: &[u8]) -> bool {
+    payload == CIRCUIT_HEARTBEAT_MAGIC
+}
+
 /// Read the payload back out of a peeled fixed-size cell buffer.
 pub fn read_payload(buf: &[u8]) -> Option<Vec<u8>> {
     if buf.len() < LEN_PREFIX {
@@ -306,6 +325,38 @@ mod tests {
             "342756a953c82f875ae70511ffbed52bf60cc4f99a892cac1a458aebc98d4e11",
             "circuit keystream changed — coordinated flag-day only"
         );
+    }
+
+    #[test]
+    fn heartbeat_forward_roundtrip_and_recognition() {
+        // A heartbeat travels FORWARD: the originator applies every hop's layer,
+        // each relay peels one, the terminus reads the plaintext back out and
+        // recognises the magic. Mirrors `return_path_three_hops_fixed_size` but
+        // in the forward direction (the keepalive path added for dead-idle-TCP).
+        let (k0, k1, k2) = (k(10), k(20), k(30));
+        let seq = 42u32;
+        let mut cell = wrap_payload(CIRCUIT_HEARTBEAT_MAGIC).unwrap();
+        apply_layers(&[k0, k1, k2], Direction::Forward, seq, &mut cell).unwrap();
+        assert_eq!(cell.len(), CIRCUIT_PAYLOAD_BYTES, "fixed size on the wire");
+        // Each hop peels its own layer; the terminus peels the last and reads it.
+        apply_layer(&k0, Direction::Forward, seq, &mut cell);
+        apply_layer(&k1, Direction::Forward, seq, &mut cell);
+        apply_layer(&k2, Direction::Forward, seq, &mut cell);
+        let payload = read_payload(&cell).unwrap();
+        assert!(is_heartbeat(&payload), "terminus recognises the heartbeat");
+        // Ordinary payloads are not heartbeats.
+        assert!(!is_heartbeat(b"introduce-bytes"));
+        assert!(!is_heartbeat(b""));
+    }
+
+    #[test]
+    fn heartbeat_magic_cannot_be_a_splice_cookie() {
+        // The terminus only attempts a stream splice when the payload is at
+        // least COOKIE_LEN (16) bytes; keeping the heartbeat shorter guarantees
+        // it can never be mistaken for a cookie prefix even before the explicit
+        // is_heartbeat() check.
+        use crate::circuit_register::COOKIE_LEN;
+        assert!(CIRCUIT_HEARTBEAT_MAGIC.len() < COOKIE_LEN);
     }
 
     #[test]
