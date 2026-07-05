@@ -8216,33 +8216,18 @@ impl NodeServices {
             sealed_plaintext.push(final_hop_kind::APP_DELIVER_AUTH);
             sealed_plaintext.extend_from_slice(&frag_bytes);
             if parallel {
-                // Round-robin fragments across relays for throughput. But when
-                // there are FEWER fragments than relays — the common
-                // SINGLE-fragment chat-text case — a bare `relays[idx % len]`
-                // sends the one fragment to ONE relay and leaves the other
-                // registered rendezvous relays idle, so the message has NO
-                // redundancy: a single lost cell on the R→recipient hop then
-                // drops it to the (~12 s) mailbox-drain backstop. Device-verified
-                // 2026-07-05: desktop→phone chat text was intermittently slow for
-                // exactly this reason (live ~3 s when the one relay's forward
-                // landed, else a drain cycle later), while multi-fragment file
-                // content — which fills every relay — was consistently fast.
-                // Spread each fragment across the block of ⌈relays/frags⌉ distinct
-                // endpoints it owns: a 1-fragment message rides ALL registered
-                // relays (independent-path redundancy), while bulk stays 1x per
-                // fragment (⌈3/27⌉ = 1 → unchanged). Recipient de-dups by
-                // (msg_id, frag_idx). Anonymity is unchanged — these are the same
-                // relays the recipient registered its cookie at.
-                let per_frag = relays.len().div_ceil(frag_count).max(1);
-                for k in 0..per_frag {
-                    let relay = relays[(idx * per_frag + k) % relays.len()];
-                    self.send_sealed_introduce(
-                        relay,
-                        &sealed_plaintext,
-                        hop_count,
-                        circuit_backed,
-                    )?;
-                }
+                // Round-robin fragments across relays for throughput, ONE copy
+                // per fragment. A ⌈relays/frags⌉ per-fragment spread briefly
+                // lived here to mask single-fragment chat losses, but those were
+                // introduces landing on relays without a live registration
+                // (`cookie_unknown`): the spread is now generation-gated to the
+                // receiver's CURRENT registration set, so a single chain lands
+                // and the extra copies were pure traffic (device-verified
+                // 2026-07-05: 15/15 delivered at redundancy=1). A genuine
+                // R→recipient cell loss falls back to the mailbox-drain hot
+                // window, same as bulk fragments.
+                let relay = relays[idx % relays.len()];
+                self.send_sealed_introduce(relay, &sealed_plaintext, hop_count, circuit_backed)?;
             } else {
                 // Bounded retransmit: send the fragment `redundancy` times over
                 // independent circuits; the recipient de-dups by (msg_id, frag_idx).
@@ -8510,26 +8495,52 @@ impl NodeServices {
         if ads.is_empty() {
             return Err(AnonOnionSendError::NoRendezvous);
         }
+        // The receiver's CHAT cookie is deterministic + public
+        // (`rendezvous_cookie_from_node_id`, the same XOR-fold the recipient
+        // task and the app's mailbox publisher register under). Filter to it
+        // UP FRONT: the resolved union can also contain other same-receiver
+        // publications (e.g. the onion-stream cookie published for a
+        // just-opened stream circuit) whose valid_from can outrank the chat
+        // ads — taking ads[0].auth_cookie blindly then aimed every chat
+        // introduce at the stream registration. Fall back to the freshest
+        // ad's cookie only if no ad carries the expected chat cookie
+        // (unexpected publisher — behave like the legacy selection).
+        let expected_cookie =
+            service_tasks::rendezvous_cookie_from_node_id(&receiver_node_id);
+        let primary_cookie = if ads.iter().any(|a| a.auth_cookie == expected_cookie) {
+            expected_cookie
+        } else {
+            ads[0].auth_cookie
+        };
         // Keep up to MAX distinct-relay ads (freshest-first). The recipient
         // registered on several rendezvous relays; bulk content is round-robined
         // across them for parallel-endpoint throughput instead of funnelling
-        // redundant copies through one. The freshest is the primary (its cookie
-        // matches the current registration); the rest are extra parallel
-        // endpoints. A recipient on a single relay yields one ad → classic path.
+        // redundant copies through one. A recipient on a single relay yields one
+        // ad → classic path.
         const MAX_PARALLEL_RELAYS: usize = 3;
-        // The freshest ad (sorted by valid_from desc) defines the CURRENT-period
-        // auth_cookie. Spread ONLY across relays whose ad carries that SAME cookie:
-        // a stale ad (a previous period, or a relay the recipient hasn't re-
-        // registered this period) has a cookie that no longer matches that relay's
-        // live registration, so an introduce there is dropped as cookie_unknown —
-        // wasting the send + forcing a re-request. Same-cookie ⇒ same period ⇒ the
-        // recipient is currently registered there with this cookie.
-        let primary_cookie = ads[0].auth_cookie;
+        // GENERATION gate: the receiver re-signs ALL its plain ads together with
+        // one shared valid_from stamp (see `tick_publish_rendezvous_ads`), so
+        // "the receiver's current relay set" is exactly the same-cookie ads
+        // carrying the NEWEST stamp. The chat cookie itself never rotates, so
+        // cookie equality cannot tell a live relay from one the receiver left
+        // minutes ago whose unexpired ad still floats around DHT replicas — the
+        // relay dropped that registration the moment the receiver's session
+        // closed, and an introduce there is silently dropped as cookie_unknown.
+        // Spreading strictly within the newest generation keeps every parallel
+        // introduce on a relay of the receiver's current registration set.
+        let primary_generation = ads
+            .iter()
+            .find(|a| a.auth_cookie == primary_cookie)
+            .map(|a| a.valid_from_unix)
+            .unwrap_or(ads[0].valid_from_unix);
         let mut chosen: Vec<veil_anonymity::rendezvous::RendezvousAd> = Vec::new();
         let mut seen_relays = std::collections::HashSet::new();
         for a in ads {
             if a.auth_cookie != primary_cookie {
-                continue; // stale-cookie relay → would cookie_unknown there
+                continue; // different publication (e.g. stream cookie)
+            }
+            if a.valid_from_unix != primary_generation {
+                continue; // stale generation → receiver likely left this relay
             }
             if seen_relays.insert(a.rendezvous_node_id) {
                 chosen.push(a);
