@@ -256,6 +256,59 @@ where
     K: Fn(&[u8; 32]) -> Option<String>,
     P: Fn(&[u8; 32]) -> u32,
 {
+    pick_circuit_hops_latency_aware_with_diversity_and_reputation_guarded(
+        candidates,
+        n,
+        rtt_estimator,
+        diversity_key_of,
+        reputation_penalty_ms,
+        |_| true, // no liveness gate — every candidate is guard-eligible
+    )
+}
+
+/// Like [`pick_circuit_hops_latency_aware_with_diversity_and_reputation`] but
+/// the FIRST hop (guard slot) prefers candidates for which `first_hop_live`
+/// returns `true` — in production, "we hold a live direct session to this
+/// relay" ([`SessionTxRegistry::has_session`]-shaped).
+///
+/// Why the first hop is special: the built cell is handed to `hops[0]` over a
+/// DIRECT session — there is no dial-on-demand on the send path, so picking a
+/// sessionless first hop silently drops the entire cell (the send layer
+/// returns `false` and the message dies until an app-layer retry). Middle and
+/// terminus hops are reached THROUGH the circuit and need no local session,
+/// so the liveness gate deliberately applies to the guard slot only — the
+/// anonymity set of later hops is untouched.
+///
+/// Anonymity: Tor-guard semantics. The first hop already learns our IP by
+/// virtue of the direct session, so preferring already-connected relays
+/// reveals nothing new; it pins the guard slot to the live-session set
+/// (typically small), which is the same trade Tor makes deliberately with
+/// persistent guards.
+///
+/// Selection:
+/// 1. Score + sort all candidates (same as the ungated variant).
+/// 2. Guard slot = best-scored candidate with `first_hop_live == true`;
+///    if NO live candidate exists, fall back to the best-scored overall
+///    (exactly the previous behavior — a cold node still builds circuits).
+/// 3. Remaining `n-1` picks: diversity walk over the rest in score order,
+///    seeded with the guard's diversity key.
+pub fn pick_circuit_hops_latency_aware_with_diversity_and_reputation_guarded<F, K, P, G>(
+    candidates: &[DiscoveredRelay],
+    n: usize,
+    rtt_estimator: F,
+    diversity_key_of: K,
+    reputation_penalty_ms: P,
+    first_hop_live: G,
+) -> CircuitPickResult
+where
+    F: Fn(&[u8; 32]) -> Option<u32>,
+    K: Fn(&[u8; 32]) -> Option<String>,
+    P: Fn(&[u8; 32]) -> u32,
+    G: Fn(&[u8; 32]) -> bool,
+{
+    if n == 0 {
+        return Some(Vec::new());
+    }
     let distinct: Vec<&DiscoveredRelay> = dedup_by_node_id(candidates);
     if distinct.len() < n {
         return None;
@@ -275,8 +328,23 @@ where
         .collect();
     scored.sort_by_key(|(score, _)| *score);
 
+    // Guard slot: best-scored live candidate, else best-scored overall
+    // (index 0 — identical to the ungated walk's first pick).
+    let guard_idx = scored
+        .iter()
+        .position(|(_, c)| first_hop_live(&c.hop.node_id))
+        .unwrap_or(0);
+    let (_, guard) = scored.remove(guard_idx);
+
     let mut seen_keys: HashSet<String> = HashSet::new();
+    if let Some(key) = diversity_key_of(&guard.hop.node_id) {
+        seen_keys.insert(key);
+    }
     let mut picked: Vec<Hop> = Vec::with_capacity(n);
+    picked.push(guard.hop);
+    if picked.len() == n {
+        return Some(picked);
+    }
     for (_, c) in scored {
         if let Some(key) = diversity_key_of(&c.hop.node_id)
             && !seen_keys.insert(key)
@@ -289,6 +357,51 @@ where
         }
     }
     None
+}
+
+/// Guard-slot sibling of [`pick_circuit_hops_latency_aware`] for the
+/// degraded latency-only fallback path (no AS-diverse set exists): sort by
+/// RTT, first hop prefers `first_hop_live` candidates, rest are the best of
+/// the remainder. Falls back to the plain best-scored pick when no live
+/// candidate exists — see the guarded diversity variant for the rationale.
+pub fn pick_circuit_hops_latency_aware_guarded<F, G>(
+    candidates: &[DiscoveredRelay],
+    n: usize,
+    rtt_estimator: F,
+    first_hop_live: G,
+) -> CircuitPickResult
+where
+    F: Fn(&[u8; 32]) -> Option<u32>,
+    G: Fn(&[u8; 32]) -> bool,
+{
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let distinct: Vec<&DiscoveredRelay> = dedup_by_node_id(candidates);
+    if distinct.len() < n {
+        return None;
+    }
+    let mut scored: Vec<(u64, &DiscoveredRelay)> = distinct
+        .iter()
+        .map(|c| {
+            let rtt = rtt_estimator(&c.hop.node_id)
+                .map(|x| x as u64)
+                .unwrap_or(u64::MAX);
+            (rtt, *c)
+        })
+        .collect();
+    scored.sort_by_key(|(rtt, _)| *rtt);
+
+    let guard_idx = scored
+        .iter()
+        .position(|(_, c)| first_hop_live(&c.hop.node_id))
+        .unwrap_or(0);
+    let (_, guard) = scored.remove(guard_idx);
+
+    let mut picked: Vec<Hop> = Vec::with_capacity(n);
+    picked.push(guard.hop);
+    picked.extend(scored.into_iter().take(n - 1).map(|(_, c)| c.hop));
+    Some(picked)
 }
 
 /// Dedup candidate list by `node_id`, preserving first-occurrence
@@ -873,5 +986,167 @@ mod tests {
         )
         .unwrap();
         assert_eq!(picked[0].node_id[0], 2, "after 1 failure: honest mid wins");
+    }
+
+    // ── first-hop liveness guard (2a first-attempt-loss fix) ─────────
+
+    /// RTT map: node_id[0] → rtt. Missing → None (unknown).
+    fn rtt_by_first_byte(
+        map: Vec<(u8, u32)>,
+    ) -> impl Fn(&[u8; 32]) -> Option<u32> {
+        move |id: &[u8; 32]| map.iter().find(|(b, _)| *b == id[0]).map(|(_, r)| *r)
+    }
+
+    fn live_set(bytes: Vec<u8>) -> impl Fn(&[u8; 32]) -> bool {
+        move |id: &[u8; 32]| bytes.contains(&id[0])
+    }
+
+    #[test]
+    fn guard_prefers_live_first_hop_over_faster_dead_one() {
+        // node1 fastest but dead; node3 live. Guard slot must be node3,
+        // and the faster dead node1 is still eligible for the middle slot.
+        let pool = vec![
+            fixture_hop(1, 0xAA),
+            fixture_hop(2, 0xBB),
+            fixture_hop(3, 0xCC),
+        ];
+        let rtt = rtt_by_first_byte(vec![(1, 10), (2, 20), (3, 300)]);
+        let picked = pick_circuit_hops_latency_aware_with_diversity_and_reputation_guarded(
+            &pool,
+            2,
+            &rtt,
+            |_| None,
+            |_| 0,
+            live_set(vec![3]),
+        )
+        .expect("2 hops from 3");
+        assert_eq!(picked[0].node_id[0], 3, "guard slot must be the live node");
+        assert_eq!(picked[1].node_id[0], 1, "middle slot stays best-RTT, liveness-blind");
+    }
+
+    #[test]
+    fn guard_picks_best_scored_among_live() {
+        let pool = (1..=4).map(|i| fixture_hop(i, i)).collect::<Vec<_>>();
+        let rtt = rtt_by_first_byte(vec![(1, 5), (2, 50), (3, 30), (4, 40)]);
+        let picked = pick_circuit_hops_latency_aware_with_diversity_and_reputation_guarded(
+            &pool,
+            1,
+            &rtt,
+            |_| None,
+            |_| 0,
+            live_set(vec![2, 3]),
+        )
+        .expect("1 hop");
+        assert_eq!(
+            picked[0].node_id[0], 3,
+            "among live {{2,3}} the lower-RTT node3 must win the guard slot"
+        );
+    }
+
+    #[test]
+    fn guard_falls_back_to_ungated_pick_when_no_live_candidate() {
+        let pool = vec![fixture_hop(1, 0xAA), fixture_hop(2, 0xBB)];
+        let rtt = rtt_by_first_byte(vec![(1, 10), (2, 20)]);
+        let picked = pick_circuit_hops_latency_aware_with_diversity_and_reputation_guarded(
+            &pool,
+            2,
+            &rtt,
+            |_| None,
+            |_| 0,
+            |_| false, // nothing live
+        )
+        .expect("fallback must still build");
+        assert_eq!(
+            picked[0].node_id[0], 1,
+            "no live candidate → previous behavior (best RTT first)"
+        );
+        assert_eq!(picked[1].node_id[0], 2);
+    }
+
+    #[test]
+    fn guard_seeds_diversity_with_guard_key() {
+        // Guard node3 shares a /16 with node1 — the middle slot must skip
+        // node1 (same diversity key as the already-picked guard) and take
+        // node2 despite node1's better RTT.
+        let pool = vec![
+            fixture_hop(1, 0xAA),
+            fixture_hop(2, 0xBB),
+            fixture_hop(3, 0xCC),
+        ];
+        let rtt = rtt_by_first_byte(vec![(1, 10), (2, 20), (3, 30)]);
+        let diversity = |id: &[u8; 32]| -> Option<String> {
+            match id[0] {
+                1 | 3 => Some("v4:10.0".to_string()),
+                2 => Some("v4:20.0".to_string()),
+                _ => None,
+            }
+        };
+        let picked = pick_circuit_hops_latency_aware_with_diversity_and_reputation_guarded(
+            &pool,
+            2,
+            &rtt,
+            &diversity,
+            |_| 0,
+            live_set(vec![3]),
+        )
+        .expect("2 hops");
+        assert_eq!(picked[0].node_id[0], 3, "guard = live node3");
+        assert_eq!(
+            picked[1].node_id[0], 2,
+            "node1 shares the guard's /16 and must be skipped"
+        );
+    }
+
+    #[test]
+    fn guard_gated_variant_matches_legacy_when_all_live() {
+        let pool = (1..=5).map(|i| fixture_hop(i, i)).collect::<Vec<_>>();
+        let rtt = rtt_by_first_byte(vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]);
+        let legacy = pick_circuit_hops_latency_aware_with_diversity_and_reputation(
+            &pool,
+            3,
+            &rtt,
+            |_| None,
+            |_| 0,
+        )
+        .unwrap();
+        let guarded = pick_circuit_hops_latency_aware_with_diversity_and_reputation_guarded(
+            &pool,
+            3,
+            &rtt,
+            |_| None,
+            |_| 0,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.iter().map(|h| h.node_id).collect::<Vec<_>>(),
+            guarded.iter().map(|h| h.node_id).collect::<Vec<_>>(),
+            "|_| true guard must reproduce the ungated pick exactly"
+        );
+    }
+
+    #[test]
+    fn guard_latency_only_variant_prefers_live_first_hop() {
+        let pool = vec![
+            fixture_hop(1, 0xAA),
+            fixture_hop(2, 0xBB),
+            fixture_hop(3, 0xCC),
+        ];
+        let rtt = rtt_by_first_byte(vec![(1, 10), (2, 20), (3, 300)]);
+        let picked =
+            pick_circuit_hops_latency_aware_guarded(&pool, 2, &rtt, live_set(vec![3]))
+                .expect("2 hops");
+        assert_eq!(picked[0].node_id[0], 3, "guard slot = live node");
+        assert_eq!(picked[1].node_id[0], 1, "rest = best remaining RTT");
+    }
+
+    #[test]
+    fn guard_latency_only_falls_back_when_no_live() {
+        let pool = vec![fixture_hop(1, 0xAA), fixture_hop(2, 0xBB)];
+        let rtt = rtt_by_first_byte(vec![(1, 10), (2, 20)]);
+        let picked = pick_circuit_hops_latency_aware_guarded(&pool, 2, &rtt, |_| false)
+            .expect("fallback builds");
+        assert_eq!(picked[0].node_id[0], 1);
+        assert_eq!(picked[1].node_id[0], 2);
     }
 }

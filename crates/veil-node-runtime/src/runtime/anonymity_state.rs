@@ -56,6 +56,10 @@ struct CachedRendezvousAds {
 pub struct RendezvousResolveCache {
     inner: Mutex<std::collections::HashMap<[u8; 32], CachedRendezvousAds>>,
     refresh_locks: Mutex<std::collections::HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
+    // Send-path usage marks (receiver → last send-initiated resolve), feeding
+    // the background refresh task: only recently-messaged receivers get
+    // proactive re-walks, so an idle node adds no DHT load.
+    last_send_use: Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>,
     ttl: std::time::Duration,
     cap: usize,
 }
@@ -69,9 +73,55 @@ impl RendezvousResolveCache {
         Self {
             inner: Mutex::new(std::collections::HashMap::new()),
             refresh_locks: Mutex::new(std::collections::HashMap::new()),
+            last_send_use: Mutex::new(std::collections::HashMap::new()),
             ttl,
             cap: cap.max(1),
         }
+    }
+
+    /// Mark `receiver` as an active send target. Called on every SEND-path
+    /// resolve, NOT on background refreshes (those must not keep themselves
+    /// alive past the activity window). Bounded by `cap`, oldest-use eviction.
+    pub fn note_send_use(&self, receiver: [u8; 32]) {
+        let mut uses = self.last_send_use.lock().unwrap_or_else(|p| p.into_inner());
+        if uses.len() >= self.cap
+            && !uses.contains_key(&receiver)
+            && let Some(oldest) = uses.iter().min_by_key(|(_, t)| **t).map(|(id, _)| *id)
+        {
+            uses.remove(&oldest);
+        }
+        uses.insert(receiver, std::time::Instant::now());
+    }
+
+    /// Receivers that (a) were send-resolved within `active_window` and
+    /// (b) whose cache entry is missing or expires within `refresh_ahead`.
+    /// These are the targets the background refresh task should re-walk NOW so
+    /// the next send finds a warm cache instead of paying the synchronous DHT
+    /// walk (up to its full multi-second timeout). Stale usage marks are pruned
+    /// here, so a peer the app stopped messaging drops out of the refresh set
+    /// after `active_window`.
+    pub fn refresh_candidates(
+        &self,
+        active_window: std::time::Duration,
+        refresh_ahead: std::time::Duration,
+    ) -> Vec<[u8; 32]> {
+        let active: Vec<[u8; 32]> = {
+            let mut uses = self.last_send_use.lock().unwrap_or_else(|p| p.into_inner());
+            uses.retain(|_, t| t.elapsed() < active_window);
+            uses.keys().copied().collect()
+        };
+        if active.is_empty() {
+            return Vec::new();
+        }
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        active
+            .into_iter()
+            .filter(|receiver| {
+                inner
+                    .get(receiver)
+                    .is_none_or(|entry| entry.checked_at.elapsed() + refresh_ahead >= self.ttl)
+            })
+            .collect()
     }
 
     /// Coalesce a burst of sends to the same recipient into one network
@@ -699,6 +749,50 @@ mod tests {
         assert!(
             immediately_stale.get(&receiver, 100).is_none(),
             "route-cache TTL, not the ad validity window, controls re-resolution"
+        );
+    }
+
+    #[test]
+    fn refresh_candidates_only_active_and_near_expiry() {
+        let cache = RendezvousResolveCache::with_params(std::time::Duration::from_secs(60), 4);
+        let window = std::time::Duration::from_secs(300);
+        let margin = std::time::Duration::from_secs(6);
+        let receiver = [7; 32];
+
+        // Never send-resolved → not a candidate even with an empty cache.
+        assert!(cache.refresh_candidates(window, margin).is_empty());
+
+        // Active but no cache entry → immediate candidate (first walk failed
+        // or entry got invalidated — the refresher should retry).
+        cache.note_send_use(receiver);
+        assert_eq!(cache.refresh_candidates(window, margin), vec![receiver]);
+
+        // Fresh entry well inside TTL−margin → nothing to do.
+        cache.put(receiver, vec![ad(7, 1, 90, 200)]);
+        assert!(cache.refresh_candidates(window, margin).is_empty());
+
+        // Entry aged past TTL−margin → candidate again. Model by shrinking
+        // the margin window instead of sleeping: margin ≥ ttl makes any
+        // entry age qualify.
+        assert_eq!(
+            cache.refresh_candidates(window, std::time::Duration::from_secs(60)),
+            vec![receiver],
+            "entry expiring within the refresh-ahead margin must re-walk"
+        );
+
+        // Activity window elapsed → receiver drains out of the proactive set
+        // (zero idle DHT load). ZERO window drops every mark.
+        assert!(
+            cache
+                .refresh_candidates(std::time::Duration::ZERO, std::time::Duration::from_secs(60))
+                .is_empty(),
+            "inactive receivers must not be refreshed"
+        );
+        // ...and stays drained on the next normal-window call (marks pruned).
+        assert!(
+            cache
+                .refresh_candidates(window, std::time::Duration::from_secs(60))
+                .is_empty()
         );
     }
 

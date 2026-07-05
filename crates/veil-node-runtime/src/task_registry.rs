@@ -92,6 +92,12 @@ pub enum RuntimeService {
     /// periodically (the relay's registration is in-memory). No-op unless
     /// `[anonymity].receive_anonymous`.
     RendezvousRecipient,
+    /// Refresh-ahead for the sender-side rendezvous resolve cache: re-walks
+    /// the DHT for recently-messaged receivers before their cache entry
+    /// expires, so a send never pays the recursive resolve (up to its
+    /// multi-second timeout) synchronously. Idle-safe — the proactive set
+    /// drains once sends stop (activity window).
+    RendezvousResolveRefresh,
 
     // ── P-Net (private veil network) ──────────────────────────────────
     /// Periodic poll of the local DHT store for PBAN-prefixed records,
@@ -165,6 +171,7 @@ impl RuntimeService {
         Self::SovereignIdentityRepublish,
         Self::AuthDeliverHandler,
         Self::RendezvousRecipient,
+        Self::RendezvousResolveRefresh,
         Self::PNetBanSync,
         Self::UpdateCheck,
         // Proxy / IPC / discovery.
