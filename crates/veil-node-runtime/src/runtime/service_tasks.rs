@@ -402,8 +402,28 @@ pub(crate) async fn warm_connected_relay_directory(
             break;
         }
         let key = veil_anonymity::directory::relay_directory_dht_key(&peer);
-        if dht.get_local(&key).is_some() {
-            continue; // already known locally
+        // Skip only when the local entry is present AND fresh by the SAME
+        // freshness predicate the consumers apply (`discover_relay_hops`).
+        // A bare `get_local().is_some()` skip left a hole: an entry still in
+        // the store but past DEFAULT_FRESHNESS_WINDOW_SECS is filtered out by
+        // every circuit-building consumer, so the warm "succeeded" while the
+        // reply path kept failing NoRelays until the relay's next republish
+        // happened to propagate here.
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let fresh = !veil_anonymity::directory::discover_relay_hops(
+                &[peer],
+                |n| dht.get_local(&veil_anonymity::directory::relay_directory_dht_key(n)),
+                now_unix,
+                veil_anonymity::directory::DEFAULT_FRESHNESS_WINDOW_SECS,
+            )
+            .is_empty();
+            if fresh {
+                continue; // already known locally AND fresh
+            }
         }
         let Some(bytes) = dht
             .find_value_iterative_network(key, Arc::clone(outbox))
@@ -3512,6 +3532,24 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
         >,
     > {
         Box::pin(async move {
+            // The FETCH's reply path builds an onion circuit, which needs the
+            // connected relays' relay-directory entries (R terminus + middles)
+            // fresh in the LOCAL store. Those cached entries expire between the
+            // relays' republish rounds, so a whole drain pass used to fail
+            // bursty NoRelays ("status 2") until a republish drifted in.
+            // Actively re-warm first — the exact pre-warm the ad-resolving
+            // send path already runs; no-op (zero RPC) when everything is
+            // cached and fresh.
+            let outbox: Arc<dyn veil_dht::FrameRouter> =
+                Arc::clone(&self.access.session_outbox) as Arc<dyn veil_dht::FrameRouter>;
+            warm_connected_relay_directory(
+                &self.access.live_sessions,
+                &self.access.dht,
+                &outbox,
+                &self.access.logger,
+                Some(&self.access.dispatcher.crypto.peer_cap_flags),
+            )
+            .await;
             // The KEM-key-given mailbox FETCH: route a source-routed onion
             // straight to the known relay (NO ad resolve), authenticated, with a
             // one-time reply block so the relay answers over our return circuit.
@@ -3525,7 +3563,17 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                     self.hop_count,
                     Some((reply_app_id, reply_endpoint_id)),
                 )
-                .map_err(super::map_sender_err)
+                .map_err(|e| {
+                    // Every daemon-side FETCH rejection funnels through here
+                    // before the coarse AnonOnionSendError→u16 collapse the
+                    // client reports as "status 2" — log the real SenderError
+                    // so failure bursts are diagnosable.
+                    log::warn!(
+                        "mailbox.fetch.send_failed relay={} err={e:?}",
+                        veil_util::hex_short(&target_node_id),
+                    );
+                    super::map_sender_err(e)
+                })
         })
     }
 

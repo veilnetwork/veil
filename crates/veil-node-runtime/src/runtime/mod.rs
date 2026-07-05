@@ -7228,7 +7228,20 @@ impl NodeServices {
             &self.dht,
             &self.anonymity.pinned_rendezvous_relays,
         )
-        .ok_or(AnonOnionSendError::NoRelays)?;
+        .ok_or_else(|| {
+            // Which of the NoRelays conditions actually fired — needed to
+            // diagnose the bursty reply-path failures (all concurrent sends
+            // share this state, so one lapse fails a whole drain pass).
+            log::warn!(
+                "anonymity.reply_path.no_rendezvous_relay live_active={} pinned={}",
+                lock!(self.live_sessions)
+                    .values()
+                    .filter(|i| i.state == crate::types::SessionState::Active)
+                    .count(),
+                self.anonymity.pinned_rendezvous_relays.len(),
+            );
+            AnonOnionSendError::NoRelays
+        })?;
         self.select_onion_relay_path_to(r, hop_count)
     }
 
@@ -7250,6 +7263,10 @@ impl NodeServices {
 
         let hop_count = hop_count.max(2);
         if self.dht.get_local(&relay_directory_dht_key(&r)).is_none() {
+            log::warn!(
+                "anonymity.reply_path.r_directory_missing r={}",
+                veil_util::hex_short(&r),
+            );
             return Err(AnonOnionSendError::NoRelays);
         }
         let now_unix = std::time::SystemTime::now()
@@ -7285,7 +7302,16 @@ impl NodeServices {
         .map(|d| d.hop.node_id)
         .collect();
         if discovered.len() < hop_count - 1 {
-            return Err(AnonOnionSendError::NoRelays); // not enough relays to hide from R
+            // not enough relays to hide from R
+            log::warn!(
+                "anonymity.reply_path.middles_insufficient r={} candidates={} \
+                 discovered_fresh={} need={}",
+                veil_util::hex_short(&r),
+                candidates.len(),
+                discovered.len(),
+                hop_count - 1,
+            );
+            return Err(AnonOnionSendError::NoRelays);
         }
         // M-1: randomise which middle relays we pick. `discover_relay_hops`
         // returns hops in a deterministic (freshness/candidate) order, so a bare
@@ -8186,14 +8212,21 @@ impl NodeServices {
                         return Err(veil_anonymity::sender::SenderError::MissingReplyCapability);
                     }
                 };
-                let relay_path =
-                    self.select_onion_relay_path(REPLY_CIRCUIT_HOPS)
-                        .map_err(|_| {
-                            veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
-                                need: REPLY_CIRCUIT_HOPS,
-                                have: 0,
-                            }
-                        })?;
+                let relay_path = self
+                    .select_onion_relay_path(REPLY_CIRCUIT_HOPS)
+                    .map_err(|e| {
+                        // Surface the REAL reason before collapsing to the
+                        // coarse IPC-visible error — this used to vanish into
+                        // "status 2/NO_ROUTE" and made the mailbox-FETCH
+                        // failure bursts undiagnosable from logs.
+                        log::warn!(
+                            "mailbox.fetch.reply_path_failed hops={REPLY_CIRCUIT_HOPS} err={e:?}"
+                        );
+                        veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                            need: REPLY_CIRCUIT_HOPS,
+                            have: 0,
+                        }
+                    })?;
                 let relay = *relay_path.last().expect("non-empty relay path");
                 let mut cookie = [0u8; 16];
                 rand_core::OsRng.fill_bytes(&mut cookie);
@@ -8242,12 +8275,19 @@ impl NodeServices {
             let reply_epoch = std::sync::atomic::AtomicU64::new(0);
             let confirmed = self
                 .build_onion_circuit_once(&relay_path, cookie, &reply_reg_kp, &reply_epoch, true)
-                .map_err(
-                    |_| veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
+                .map_err(|e| {
+                    // See reply_path_failed above — keep the real circuit-build
+                    // error visible instead of the generic NO_ROUTE it becomes
+                    // at the IPC boundary.
+                    log::warn!(
+                        "mailbox.fetch.reply_circuit_failed relay={} err={e:?}",
+                        veil_util::hex_short(relay_path.last().unwrap_or(&[0u8; 32])),
+                    );
+                    veil_anonymity::sender::SenderError::InsufficientRelayCandidates {
                         need: REPLY_CIRCUIT_HOPS,
                         have: 0,
-                    },
-                )?;
+                    }
+                })?;
             self.wait_reply_circuit_confirmed(&confirmed);
         }
 
