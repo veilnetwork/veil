@@ -40,6 +40,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
 class VeilDaemonService : Service() {
@@ -53,7 +54,18 @@ class VeilDaemonService : Service() {
         private const val CHANNEL_ID = "veil_daemon"
         private const val CHANNEL_NAME = "Veil daemon"
         private const val NOTIFICATION_ID = 0xfee1
+        private const val WAKE_LOCK_TAG = "veil:daemon"
     }
+
+    // Partial wake lock held for the service's lifetime. A foreground service
+    // stops the process being KILLED, but under Doze (screen off, stationary)
+    // the CPU is still suspended between maintenance windows — so the daemon's
+    // socket keepalive and the onion circuit heartbeat timers stop firing and
+    // the first-hop TCP dies, stalling inbound messages until the next wake.
+    // A PARTIAL_WAKE_LOCK keeps the CPU (not the screen) running so those timers
+    // fire on schedule and the connection stays warm. Costs battery — which is
+    // exactly why the whole background service is opt-in.
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -68,6 +80,7 @@ class VeilDaemonService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                releaseWakeLock()
                 stopForegroundCompat()
                 stopSelf()
                 return START_NOT_STICKY
@@ -77,12 +90,32 @@ class VeilDaemonService : Service() {
                     ?: getString(R.string.veil_default_title)
                 val text = intent?.getStringExtra(EXTRA_NOTIFICATION_TEXT)
                 startForegroundCompat(buildNotification(title, text))
+                acquireWakeLock()
             }
         }
         // START_STICKY: if the OS kills us under memory pressure,
         // re-create the service on next available opportunity.  Persistent-
         // by-design for a P2P connection-maintaining service.
         return START_STICKY
+    }
+
+    override fun onDestroy() {
+        releaseWakeLock()
+        super.onDestroy()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG).apply {
+            setReferenceCounted(false)
+            acquire() // released explicitly on ACTION_STOP / onDestroy
+        }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
     }
 
     override fun onBind(intent: Intent?): IBinder? = null  // not bind-API'd
