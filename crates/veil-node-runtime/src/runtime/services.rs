@@ -175,6 +175,7 @@ impl NodeRuntime {
             S::SovereignIdentityRepublish => self.spawn_sovereign_identity_republish_task(),
             S::AuthDeliverHandler => self.spawn_auth_deliver_handler(),
             S::RendezvousRecipient => self.spawn_rendezvous_recipient_task(config),
+            S::RendezvousResolveRefresh => self.spawn_rendezvous_resolve_refresh_task(),
             S::PNetBanSync => self.spawn_p_net_ban_sync_task(),
             S::UpdateCheck => self.spawn_update_check_task(config),
 
