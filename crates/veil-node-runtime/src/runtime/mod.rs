@@ -4341,6 +4341,90 @@ impl NodeServices {
         }
     }
 
+    /// Actively FETCH + locally cache the relay-directory (RD) entries of a set
+    /// of KNOWN relay node_ids, regardless of whether we hold a live session to
+    /// each. Sibling of [`service_tasks::warm_connected_relay_directory`], which
+    /// only warms the SESSION-connected set.
+    ///
+    /// Why this exists (reverse-leg fix): the reply / introduce circuit builders
+    /// (`select_onion_relay_path_to`, `send_sealed_introduce`) require several
+    /// DISTINCT relays whose RD is fresh in the local store. A desktop holding a
+    /// session to every seed warms all of them via `warm_connected_relay_directory`.
+    /// A mobile node on cellular/Doze sustains ~one relay session, so the connected-
+    /// only warm caches at most ONE RD — the multi-hop reply/introduce then fails
+    /// `middles_insufficient` / `InsufficientRelayCandidates { have: 0 }` and the
+    /// live-ACK is lost. `dht_recursive_get` walks the DHT over WHATEVER session
+    /// exists, so the single live relay is enough to pull the other seeds' RDs.
+    ///
+    /// Bounded fan-out (`max_fetch`) + freshness-skip: an entry already fresh
+    /// locally costs zero RPC, so in steady state this is a no-op. Only the same
+    /// signature-bound, node-id-bound entries the connected warm accepts are cached.
+    ///
+    /// Uses `find_value_iterative_network` (the client-driven iterative Kademlia
+    /// lookup the proven `warm_connected_relay_directory` uses), NOT
+    /// `dht_recursive_get` (server-side recursion) — on the sparse pinned-seed
+    /// network the iterative walk is the one that reliably resolves relay-directory
+    /// keys.
+    pub(crate) async fn warm_known_relay_directory(
+        &self,
+        relays: &[[u8; 32]],
+        max_fetch: usize,
+        _timeout: std::time::Duration,
+    ) -> usize {
+        use veil_anonymity::directory::{
+            DEFAULT_FRESHNESS_WINDOW_SECS, decode_entry, discover_relay_hops,
+            relay_directory_dht_key, verify_entry,
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let outbox: Arc<dyn veil_dht::FrameRouter> =
+            Arc::clone(&self.session_outbox) as Arc<dyn veil_dht::FrameRouter>;
+        let mut fetched = 0usize;
+        let mut cached = 0usize;
+        for relay in relays {
+            if fetched >= max_fetch {
+                break;
+            }
+            // Skip when the local entry is present AND fresh by the SAME predicate
+            // the circuit-building consumers apply — a stale-but-present entry is
+            // filtered out downstream, so it must be re-fetched (not treated as a hit).
+            let fresh = !discover_relay_hops(
+                std::slice::from_ref(relay),
+                |n| self.dht.get_local(&relay_directory_dht_key(n)),
+                now_unix,
+                DEFAULT_FRESHNESS_WINDOW_SECS,
+            )
+            .is_empty();
+            if fresh {
+                continue;
+            }
+            fetched += 1;
+            let key = relay_directory_dht_key(relay);
+            let Some(bytes) = self
+                .dht
+                .find_value_iterative_network(key, Arc::clone(&outbox))
+                .await
+            else {
+                continue;
+            };
+            // SECURITY: attacker-supplied until checked — the RD key is well-known,
+            // so only cache an entry that decodes, verifies its OWN signature, AND
+            // is bound to THIS relay's node_id (else a peer could steer our relay
+            // choice by serving another node's entry under this key). Same gate as
+            // `warm_connected_relay_directory`.
+            match decode_entry(&bytes) {
+                Ok(entry) if entry.node_id == *relay && verify_entry(&entry).is_ok() => {
+                    self.dht.store_local(key, bytes);
+                    cached += 1;
+                }
+                _ => {}
+            }
+        }
+        cached
+    }
+
     pub async fn resolve_identity_verified(
         &self,
         node_id: [u8; 32],
@@ -9000,6 +9084,29 @@ impl NodeServices {
             self.dht.store_local(relay_key, bytes);
         }
 
+        // Reverse-leg RD-staleness fix: the introduce cell `send_via_rendezvous_
+        // authenticated` builds needs several DISTINCT relays whose RD is fresh
+        // locally (`usable_relays` in `send_sealed_introduce`). On mobile we hold
+        // ~one relay session, so `warm_connected_relay_directory` (session-only)
+        // caches at most one RD → the guard falls back to a sessionless first hop
+        // and the live-ACK evaporates (`guard_fallback` / `send_failed Missing`).
+        // Actively pull the KNOWN relay set's RDs over whatever session exists so
+        // the freshest-first pick has real candidates. Bounded + freshness-gated
+        // (a no-op when already warm). The connected relay stays the guard's
+        // preferred first hop; this just makes it — and the middles — RD-fresh.
+        {
+            let mut relays: Vec<[u8; 32]> = self
+                .dht
+                .routing_table_contacts()
+                .into_iter()
+                .map(|c| c.node_id)
+                .collect();
+            relays.sort_unstable();
+            relays.dedup();
+            self.warm_known_relay_directory(&relays, 6, RESOLVE_TIMEOUT)
+                .await;
+        }
+
         self.send_via_rendezvous_authenticated(
             &ad,
             &[], // a reply targets the one relay in the reply block
@@ -9123,13 +9230,31 @@ impl NodeServices {
         // rendezvous is the Final-hop, not a middle-hop).
         // W0 measurement: time selection vs build (see send_anonymous).
         let t_select = std::time::Instant::now();
-        let candidate_node_ids: Vec<[u8; 32]> = self
+        let mut candidate_node_ids: Vec<[u8; 32]> = self
             .dht
             .routing_table_contacts()
             .into_iter()
             .map(|c| c.node_id)
-            .filter(|nid| *nid != ad.rendezvous_node_id)
             .collect();
+        // Union the live-session relays into the candidate pool (mirrors
+        // `select_onion_relay_path_to`). A relay we hold a session to is the
+        // guard's preferred first hop, but it only becomes a valid candidate here
+        // if it appears in the pool AND its RD is fresh — the pre-warm at the
+        // async call sites (`send_reply` / mailbox FETCH) makes the RD fresh; this
+        // guarantees the relay is present even if it briefly dropped out of the
+        // routing table between handshake and send.
+        {
+            let sessions = lock!(self.live_sessions);
+            candidate_node_ids.extend(
+                sessions
+                    .values()
+                    .filter(|i| i.state == crate::types::SessionState::Active)
+                    .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes())),
+            );
+        }
+        candidate_node_ids.sort_unstable();
+        candidate_node_ids.dedup();
+        candidate_node_ids.retain(|nid| *nid != ad.rendezvous_node_id);
         let usable_relays = discover_relay_hops(
             &candidate_node_ids,
             |node_id| dht.get_local(&relay_directory_dht_key(node_id)),

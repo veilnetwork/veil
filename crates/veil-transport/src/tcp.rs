@@ -17,6 +17,32 @@ use super::{
     uri::TransportUri,
 };
 
+/// Upper bound we impose on the TCP Maximum Segment Size of every veil TCP
+/// socket (outbound and accepted).
+///
+/// Device-verified 2026-07-05: a cellular carrier silently black-holed
+/// seed→phone 1348-byte (full-MSS) segments — precisely the OVL1
+/// KEY_AGREEMENT payload (ML-KEM + Falcon) — while filtering ICMP
+/// fragmentation-needed, so path-MTU discovery went blind and the handshake
+/// dead-locked at the 10 s timeout (the phone could never complete a single
+/// full handshake, so it never bootstrapped a resumption ticket → every
+/// redial stayed a cold handshake → permanent 0 live sessions). Capping
+/// outgoing segments to 1200 bytes (comfortably under the observed
+/// ~1240–1388 B effective path-MTU floor on that link) lets the handshake
+/// through. 1200 mirrors the seed-side `iptables … TCPMSS --set-mss 1200`
+/// mitigation but travels with the binary, so a fresh node / re-imaged seed
+/// stays fixed without any firewall state.
+pub(crate) const DOWNLINK_MSS_CLAMP: u32 = 1200;
+
+/// Best-effort clamp of `TCP_MAXSEG` on an established socket so this node
+/// never emits full-MSS segments that a constrained downlink black-holes
+/// (see [`DOWNLINK_MSS_CLAMP`]). A failure here is a missed optimisation,
+/// never a correctness problem (the option is absent on a few exotic
+/// targets and the kernel bounds the value), so the `Err` is swallowed.
+pub(crate) fn clamp_downlink_mss(stream: &TcpStream) {
+    let _ = SockRef::from(stream).set_tcp_mss(DOWNLINK_MSS_CLAMP);
+}
+
 /// Plain TCP `Transport` implementation. No encryption or framing — use a
 /// TLS layer above this transport for confidentiality.
 #[derive(Debug, Default)]
@@ -103,6 +129,7 @@ pub(crate) async fn connect_tcp_stream(
                     let ka = TcpKeepalive::new().with_time(idle);
                     SockRef::from(&stream).set_tcp_keepalive(&ka)?;
                 }
+                clamp_downlink_mss(&stream);
                 return Ok(stream);
             }
             Ok(Err(err)) => last_err = Some(err),
@@ -161,6 +188,7 @@ impl TransportListener for TcpTransportListener {
                 let ka = TcpKeepalive::new().with_time(idle);
                 SockRef::from(&stream).set_tcp_keepalive(&ka)?;
             }
+            clamp_downlink_mss(&stream);
             let local_addr = stream.local_addr().ok();
             let peer = peer_meta("tcp", self.bind_uri.clone(), local_addr, Some(remote_addr));
             Ok(boxed_stream_connection(peer, stream))
