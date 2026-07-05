@@ -6822,6 +6822,7 @@ impl NodeServices {
             &self.logger,
             receiver_node_id,
             AD_RESOLVE_TIMEOUT,
+            false,
         )
         .await;
 
@@ -8345,6 +8346,7 @@ impl NodeServices {
             &self.logger,
             receiver_node_id,
             AD_RESOLVE_TIMEOUT,
+            false,
         )
         .await;
         // Pick the most-recently-PUBLISHED ad (highest valid_from_unix, set to
@@ -8629,10 +8631,7 @@ impl NodeServices {
             directory::{
                 DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
             },
-            sender::{
-                DiversityOutcome,
-                build_outbound_anonymous_cell_with_diversity_reported_and_reputation,
-            },
+            sender::{DiversityOutcome, build_outbound_anonymous_cell_guarded},
         };
 
         // W0 measurement (anonymity-preserving plan): time the SELECTION phase
@@ -8709,19 +8708,46 @@ impl NodeServices {
         let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
         let reputation_penalty_ms =
             move |node_id: &[u8; 32]| -> u32 { relay_reputation.rtt_penalty_ms(*node_id) };
+        // First-hop liveness guard: the finished cell is handed to hops[0]
+        // over a DIRECT session (no dial-on-demand below), so a sessionless
+        // first hop means the cell silently evaporates — the dominant
+        // first-attempt-loss source. Snapshot the live-session set and let
+        // the picker prefer it for the guard slot. Tor-guard semantics: the
+        // first hop learns our IP from the direct session anyway, so
+        // preferring already-connected relays reveals nothing new.
+        let live_first_hops: std::collections::HashSet<[u8; 32]> = self
+            .dispatcher
+            .session_tx_registry
+            .as_ref()
+            .map(|reg| rlock!(reg).active_node_ids())
+            .unwrap_or_default();
+        let first_hop_live = |node_id: &[u8; 32]| live_first_hops.contains(node_id);
         let select_us = t_select.elapsed().as_micros();
         let t_build = std::time::Instant::now();
-        let ((first_hop_node_id, cell), diversity) =
-            build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
-                payload,
-                &usable_relays,
-                rtt_estimator,
-                diversity_key_of,
-                reputation_penalty_ms,
-                target_node_id,
-                target_x25519_pk,
-                hop_count,
-            )?;
+        let ((first_hop_node_id, cell), diversity) = build_outbound_anonymous_cell_guarded(
+            payload,
+            &usable_relays,
+            rtt_estimator,
+            diversity_key_of,
+            reputation_penalty_ms,
+            first_hop_live,
+            target_node_id,
+            target_x25519_pk,
+            hop_count,
+        )?;
+        if !live_first_hops.contains(&first_hop_node_id) {
+            // Guard fallback: no live-session candidate was available in the
+            // relay pool (or the target itself is the first hop) — this send
+            // rides the old sessionless-first-hop odds and may be lost until
+            // an app-layer retry.
+            log::warn!(
+                "anonymity.first_hop.guard_fallback path=onion first_hop={} \
+                 live_sessions={} usable={}",
+                veil_util::hex_short(&first_hop_node_id),
+                live_first_hops.len(),
+                usable_relays.len(),
+            );
+        }
         // W0 measurement: selection (candidate prep + discovery + diversity map)
         // vs build (pick + onion wrap). The anonymity-preserving plan expects
         // selection to dominate → justifies W2 selection-input caching.
@@ -8760,15 +8786,21 @@ impl NodeServices {
         frame.extend_from_slice(&cell);
         if let Some(ref reg) = self.dispatcher.session_tx_registry {
             let guard = wlock!(reg);
-            let sent = guard.send_to(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
+            let sent =
+                guard.send_to_result(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
             drop(guard);
-            if !sent {
-                // Signal 1 (Epic 482.3/482.4 Phase A): the chosen anonymity
-                // first hop has no live session — record it so the picker
-                // downweights it next time. This is per-sender-LOCAL memory and
-                // changes NO external behaviour (we still return Ok, no
-                // synchronous error), so it does not leak first-hop reachability
-                // to a sender-side observer (the reason this stays fire-and-forget).
+            if let Err(e) = sent {
+                // The cell is lost. With the first-hop liveness guard above
+                // this should be rare (session died between snapshot and
+                // send, or TX queue Full ≠ no session). Log the reason —
+                // Full vs Missing/Closed need different remedies — and
+                // record the failure so the picker downweights this relay.
+                // Still fire-and-forget (return Ok): a synchronous error
+                // would leak first-hop reachability to a sender-side observer.
+                log::warn!(
+                    "anonymity.first_hop.send_failed path=onion reason={e:?} first_hop={}",
+                    veil_util::hex_short(&first_hop_node_id),
+                );
                 self.anonymity
                     .relay_reputation
                     .record_failure(first_hop_node_id);
@@ -9023,10 +9055,7 @@ impl NodeServices {
             directory::{
                 DEFAULT_FRESHNESS_WINDOW_SECS, discover_relay_hops, relay_directory_dht_key,
             },
-            sender::{
-                DiversityOutcome,
-                build_outbound_anonymous_cell_with_diversity_reported_and_reputation,
-            },
+            sender::{DiversityOutcome, build_outbound_anonymous_cell_guarded},
         };
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -9094,19 +9123,40 @@ impl NodeServices {
         let relay_reputation = Arc::clone(&self.anonymity.relay_reputation);
         let reputation_penalty_ms =
             move |node_id: &[u8; 32]| -> u32 { relay_reputation.rtt_penalty_ms(*node_id) };
+        // First-hop liveness guard — same rationale as `send_anonymous_onion`:
+        // the introduce cell dies silently if hops[0] has no live session, so
+        // the guard slot prefers the live-session set (Tor-guard semantics).
+        let live_first_hops: std::collections::HashSet<[u8; 32]> = self
+            .dispatcher
+            .session_tx_registry
+            .as_ref()
+            .map(|reg| rlock!(reg).active_node_ids())
+            .unwrap_or_default();
+        let first_hop_live = |node_id: &[u8; 32]| live_first_hops.contains(node_id);
         let select_us = t_select.elapsed().as_micros();
         let t_build = std::time::Instant::now();
-        let ((first_hop_node_id, cell), diversity) =
-            build_outbound_anonymous_cell_with_diversity_reported_and_reputation(
-                &payload_bytes,
-                &usable_relays,
-                rtt_estimator,
-                diversity_key_of,
-                reputation_penalty_ms,
-                ad.rendezvous_node_id,
-                rendezvous_relay.hop.pubkey,
-                hop_count,
-            )?;
+        let ((first_hop_node_id, cell), diversity) = build_outbound_anonymous_cell_guarded(
+            &payload_bytes,
+            &usable_relays,
+            rtt_estimator,
+            diversity_key_of,
+            reputation_penalty_ms,
+            first_hop_live,
+            ad.rendezvous_node_id,
+            rendezvous_relay.hop.pubkey,
+            hop_count,
+        )?;
+        if !live_first_hops.contains(&first_hop_node_id) {
+            // Guard fallback: no live-session candidate in the pool — this
+            // introduce rides the old sessionless-first-hop odds.
+            log::warn!(
+                "anonymity.first_hop.guard_fallback path=introduce first_hop={} \
+                 live_sessions={} usable={}",
+                veil_util::hex_short(&first_hop_node_id),
+                live_first_hops.len(),
+                usable_relays.len(),
+            );
+        }
         // W0 measurement (see send_anonymous).
         log::debug!(
             "anonymity.rendezvous.timing select_us={select_us} build_us={} \
@@ -9136,12 +9186,19 @@ impl NodeServices {
         frame.extend_from_slice(&cell);
         if let Some(ref reg) = self.dispatcher.session_tx_registry {
             let guard = wlock!(reg);
-            let sent = guard.send_to(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
+            let sent =
+                guard.send_to_result(&first_hop_node_id, veil_proto::priority::INTERACTIVE, frame);
             drop(guard);
-            if !sent {
-                // Signal 1 (Phase A): chosen anonymity first hop has no live
-                // session — record it (per-sender-local, no external behaviour
-                // change). See send_anonymous.
+            if let Err(e) = sent {
+                // Introduce lost. Rare with the liveness guard above (session
+                // died between snapshot and send, or TX queue Full). Log the
+                // reason + record the failure; still fire-and-forget (see
+                // send_anonymous — a synchronous error would leak first-hop
+                // reachability).
+                log::warn!(
+                    "anonymity.first_hop.send_failed path=introduce reason={e:?} first_hop={}",
+                    veil_util::hex_short(&first_hop_node_id),
+                );
                 self.anonymity
                     .relay_reputation
                     .record_failure(first_hop_node_id);

@@ -63,7 +63,8 @@
 use super::cell::CELL_SIZE;
 use super::circuit::Hop;
 use super::circuit_builder::{
-    pick_circuit_hops_latency_aware, pick_circuit_hops_latency_aware_with_diversity_and_reputation,
+    pick_circuit_hops_latency_aware_guarded,
+    pick_circuit_hops_latency_aware_with_diversity_and_reputation_guarded,
 };
 use super::directory::DiscoveredRelay;
 use super::packet::{MAX_HOPS_PER_CELL, PacketError, build_anonymous_cell, max_payload_for_hops};
@@ -266,6 +267,49 @@ where
     K: Fn(&[u8; 32]) -> Option<String>,
     P: Fn(&[u8; 32]) -> u32,
 {
+    build_outbound_anonymous_cell_guarded(
+        payload,
+        discovered_candidates,
+        rtt_estimator,
+        diversity_key_of,
+        reputation_penalty_ms,
+        |_| true, // no liveness gate — every candidate is guard-eligible
+        target_node_id,
+        target_x25519_pk,
+        hop_count,
+    )
+}
+
+/// Full-stack cell builder (diversity + reputation + **first-hop liveness
+/// guard**): like
+/// [`build_outbound_anonymous_cell_with_diversity_reported_and_reputation`]
+/// but `first_hop_live` gates the GUARD slot — `hops[0]` prefers candidates
+/// the caller holds a live direct session to. The built cell is dispatched to
+/// `hops[0]` over that session with no dial-on-demand, so a sessionless first
+/// hop means the cell silently evaporates (first-attempt loss); this closes
+/// that class at selection time. Falls back to the ungated pick when no live
+/// candidate exists in the pool. Middle/terminus selection is untouched (they
+/// are reached through the circuit, not via a local session). See
+/// [`pick_circuit_hops_latency_aware_with_diversity_and_reputation_guarded`]
+/// for the Tor-guard anonymity rationale.
+#[allow(clippy::too_many_arguments)]
+pub fn build_outbound_anonymous_cell_guarded<F, K, P, G>(
+    payload: &[u8],
+    discovered_candidates: &[DiscoveredRelay],
+    rtt_estimator: F,
+    diversity_key_of: K,
+    reputation_penalty_ms: P,
+    first_hop_live: G,
+    target_node_id: [u8; 32],
+    target_x25519_pk: [u8; 32],
+    hop_count: usize,
+) -> Result<(OutboundAnonymousCell, DiversityOutcome), SenderError>
+where
+    F: Fn(&[u8; 32]) -> Option<u32>,
+    K: Fn(&[u8; 32]) -> Option<String>,
+    P: Fn(&[u8; 32]) -> u32,
+    G: Fn(&[u8; 32]) -> bool,
+{
     // A 1-hop circuit has no relay hops to diversify, so it is trivially "full".
     let mut diversity_outcome = DiversityOutcome::Full;
     if hop_count == 0 {
@@ -324,27 +368,33 @@ where
         // the same /16, or the extractor returns None for everyone).
         // This keeps a partial-AS-protection circuit working when a
         // strict-diversity circuit would fail outright.
-        let (picked, outcome) = match pick_circuit_hops_latency_aware_with_diversity_and_reputation(
-            &pool,
-            n_relays,
-            &rtt_estimator,
-            &diversity_key_of,
-            &reputation_penalty_ms,
-        ) {
-            Some(p) => (p, DiversityOutcome::Full),
-            None => (
-                // No diverse set exists — fall back to latency-only so a
-                // partial-protection circuit still works rather than failing
-                // outright, but report the degradation so the caller can meter it.
-                pick_circuit_hops_latency_aware(&pool, n_relays, &rtt_estimator).ok_or(
-                    SenderError::InsufficientRelayCandidates {
+        let (picked, outcome) =
+            match pick_circuit_hops_latency_aware_with_diversity_and_reputation_guarded(
+                &pool,
+                n_relays,
+                &rtt_estimator,
+                &diversity_key_of,
+                &reputation_penalty_ms,
+                &first_hop_live,
+            ) {
+                Some(p) => (p, DiversityOutcome::Full),
+                None => (
+                    // No diverse set exists — fall back to latency-only so a
+                    // partial-protection circuit still works rather than failing
+                    // outright, but report the degradation so the caller can meter it.
+                    pick_circuit_hops_latency_aware_guarded(
+                        &pool,
+                        n_relays,
+                        &rtt_estimator,
+                        &first_hop_live,
+                    )
+                    .ok_or(SenderError::InsufficientRelayCandidates {
                         need: n_relays,
                         have: pool.len(),
-                    },
-                )?,
-                DiversityOutcome::DegradedToLatency,
-            ),
-        };
+                    })?,
+                    DiversityOutcome::DegradedToLatency,
+                ),
+            };
         diversity_outcome = outcome;
         hops.extend(picked);
     }
@@ -890,5 +940,97 @@ mod tests {
             CellPeelResult::Final { payload } => assert_eq!(payload.as_slice(), b"diverse payload"),
             _ => unreachable!(),
         }
+    }
+
+    // ── first-hop liveness guard (2a first-attempt-loss fix) ─────────
+
+    #[test]
+    fn guard_builder_first_hop_is_live_candidate_and_cell_peels() {
+        // relay1 fastest but sessionless; relay3 live. The dispatched-to
+        // first hop MUST be relay3, and the cell must still peel end-to-end
+        // through the guard-chosen chain.
+        let (sk_r1, r1) = fresh_relay(1);
+        let (sk_r3, r3) = fresh_relay(3);
+        let (_, r2) = fresh_relay(2);
+        let (target_sk, target_pk) = fresh_keypair();
+        let mut target_id = [0u8; 32];
+        target_id[0] = 9;
+
+        let rtt = |id: &[u8; 32]| -> Option<u32> {
+            match id[0] {
+                1 => Some(10),
+                2 => Some(20),
+                3 => Some(300),
+                _ => None,
+            }
+        };
+        let live = |id: &[u8; 32]| id[0] == 3;
+
+        let ((first_hop, cell), _) = build_outbound_anonymous_cell_guarded(
+            b"guarded payload",
+            &[r1.clone(), r2, r3.clone()],
+            rtt,
+            |_| None,
+            |_| 0,
+            live,
+            target_id,
+            target_pk,
+            3, // 2 relays + target
+        )
+        .expect("guarded build succeeds");
+
+        assert_eq!(
+            first_hop[0], 3,
+            "first hop must be the live relay3 despite relay1's better RTT"
+        );
+
+        // relay1 keeps the middle slot (best remaining RTT) — peel through
+        // r3 → r1 → target to prove the cell is well-formed in guard order.
+        let to_middle = match peel_anonymous_cell(&cell, &sk_r3).unwrap() {
+            CellPeelResult::Forward {
+                next_hop,
+                outbound_cell,
+            } => {
+                assert_eq!(next_hop[0], 1, "middle slot stays liveness-blind best-RTT");
+                outbound_cell
+            }
+            _ => unreachable!("guard hop must Forward"),
+        };
+        let to_target = match peel_anonymous_cell(&to_middle, &sk_r1).unwrap() {
+            CellPeelResult::Forward { outbound_cell, .. } => outbound_cell,
+            _ => unreachable!("middle hop must Forward"),
+        };
+        match peel_anonymous_cell(&to_target, &target_sk).unwrap() {
+            CellPeelResult::Final { payload } => {
+                assert_eq!(payload.as_slice(), b"guarded payload")
+            }
+            _ => unreachable!("target must get Final"),
+        }
+    }
+
+    #[test]
+    fn guard_builder_falls_back_when_nothing_live() {
+        // No live sessions at all: previous behavior (best-RTT first hop),
+        // send still builds — a cold node must not fail to construct cells.
+        let (_, r1) = fresh_relay(1);
+        let (_, r2) = fresh_relay(2);
+        let (_, target_pk) = fresh_keypair();
+        let mut target_id = [0u8; 32];
+        target_id[0] = 9;
+
+        let rtt = |id: &[u8; 32]| -> Option<u32> { Some(id[0] as u32 * 10) };
+        let ((first_hop, _), _) = build_outbound_anonymous_cell_guarded(
+            b"cold payload",
+            &[r1, r2],
+            rtt,
+            |_| None,
+            |_| 0,
+            |_| false,
+            target_id,
+            target_pk,
+            2,
+        )
+        .expect("fallback build succeeds");
+        assert_eq!(first_hop[0], 1, "no live candidate → ungated best-RTT pick");
     }
 }
