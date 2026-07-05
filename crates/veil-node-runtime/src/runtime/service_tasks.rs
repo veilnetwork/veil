@@ -3565,6 +3565,25 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                     .into_iter()
                     .map(|c| c.node_id)
                     .collect();
+                // Union in the ACTIVE live-session relays. The reply circuit's
+                // middle selection (`select_onion_relay_path_to`) draws candidates
+                // from routing_table ∪ live_sessions, but this warm sourced only the
+                // routing table. On mobile the seeds are frequently present as live
+                // sessions yet ABSENT from the routing table (it thins across Doze),
+                // so their RD was never fetched here → the middle selection filtered
+                // them as missing → `middles_insufficient` → the drain's reply circuit
+                // never built and desktop→phone stalled intermittently. Mirror the
+                // selector's candidate set so every relay it might pick as a middle
+                // gets its RD warmed first. Freshness-gated + capped ⇒ a no-op (zero
+                // RPC) whenever those RDs are already fresh, so no extra radio wakeups.
+                {
+                    let g = lock!(self.access.live_sessions);
+                    relays.extend(
+                        g.values()
+                            .filter(|i| i.state == crate::types::SessionState::Active)
+                            .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes())),
+                    );
+                }
                 relays.sort_unstable();
                 relays.dedup();
                 self.access

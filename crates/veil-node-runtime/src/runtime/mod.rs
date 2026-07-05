@@ -9101,6 +9101,20 @@ impl NodeServices {
                 .into_iter()
                 .map(|c| c.node_id)
                 .collect();
+            // Union in ACTIVE live-session relays too — the introduce/reply middle
+            // selection draws from routing_table ∪ live_sessions, but this warm only
+            // sourced the routing table, which thins to near-empty across Doze on
+            // mobile while the seed sessions stay live. Mirror the selector's set so
+            // the session-backed relays' RD is warmed for the middle pick. Freshness-
+            // gated + capped ⇒ no-op (zero RPC) when already fresh.
+            {
+                let g = lock!(self.live_sessions);
+                relays.extend(
+                    g.values()
+                        .filter(|i| i.state == crate::types::SessionState::Active)
+                        .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes())),
+                );
+            }
             relays.sort_unstable();
             relays.dedup();
             self.warm_known_relay_directory(&relays, 6, RESOLVE_TIMEOUT)
