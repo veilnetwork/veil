@@ -2357,6 +2357,75 @@ impl NodeRuntime {
     /// Runs at `DELIVERY_ACK_CHECK_INTERVAL_MS` intervals. For each timed-out
     /// entry it either retransmits (via session_tx_registry) or fires a
     /// `AppSendFailed` event to the originating app via the local app registry.
+    /// Refresh-ahead for rendezvous route resolution: re-walk the DHT for
+    /// recently-messaged receivers BEFORE their resolve-cache entry expires,
+    /// so the send path always finds a warm cache. Without this, any send
+    /// cadence slower than [`RENDEZVOUS_RESOLVE_CACHE_TTL`] pays the full
+    /// recursive walk (up to its multi-second timeout) synchronously inside
+    /// the send — the dominant residual send-latency tail once first-hop
+    /// liveness is guarded. Scope: only receivers send-resolved within the
+    /// activity window (marked via `note_send_use`); a node that stops
+    /// messaging adds zero steady-state DHT load after the window drains.
+    pub fn spawn_rendezvous_resolve_refresh_task(&mut self) {
+        // Re-resolve entries that expire within this margin. Must exceed the
+        // tick so an entry can't expire between two ticks unseen; TTL 15s −
+        // 6s = re-walk from age ~9s, i.e. roughly one walk per TTL per
+        // active receiver.
+        const REFRESH_AHEAD: std::time::Duration = std::time::Duration::from_secs(6);
+        const TICK: std::time::Duration = std::time::Duration::from_secs(5);
+        // A receiver stays in the proactive set this long after the last
+        // send-path resolve; afterwards it must be re-marked by a real send.
+        // Mirrors the dormant-peer give-up philosophy: a dead conversation
+        // must not keep loading the DHT.
+        const ACTIVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+        const AD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
+
+        let dht = Arc::clone(&self.dht);
+        let session_tx_registry = Arc::clone(&self.session_tx_registry);
+        let pending_recursive = Arc::clone(&self.dispatcher.pending_recursive);
+        let local_node_id = *self.identity.local_identity.node_id.as_bytes();
+        let resolve_cache = Arc::clone(&self.anonymity.rendezvous_resolve_cache);
+        let logger = Arc::clone(&self.logger);
+        let Some(shutdown_tx) = &self.shutdown_tx else {
+            return;
+        };
+        let mut shutdown_rx = shutdown_tx.subscribe();
+
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(TICK);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown_rx.changed() => { break; }
+                }
+                let candidates = resolve_cache.refresh_candidates(ACTIVE_WINDOW, REFRESH_AHEAD);
+                for receiver_id in candidates {
+                    let refreshed = resolve_fresh_rendezvous_ads(
+                        &dht,
+                        &session_tx_registry,
+                        &pending_recursive,
+                        local_node_id,
+                        &resolve_cache,
+                        &logger,
+                        receiver_id,
+                        AD_RESOLVE_TIMEOUT,
+                        true, // force: bypass fast-paths, don't re-mark activity
+                    )
+                    .await;
+                    logger.debug(
+                        "anonymity.rendezvous.resolve.refresh_ahead",
+                        format!(
+                            "receiver={} candidates={}",
+                            veil_util::hex_short(&receiver_id),
+                            refreshed.len(),
+                        ),
+                    );
+                }
+            }
+        });
+        lock_tasks(&self.tasks).sessions.push(handle);
+    }
+
     pub fn spawn_pending_ack_tick(&mut self) {
         use veil_dispatcher::pending_ack::AckTickOutcome;
         use veil_proto::budget::DELIVERY_ACK_CHECK_INTERVAL_MS;
@@ -3189,6 +3258,11 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     logger: &Arc<veil_observability::NodeLogger>,
     receiver_id: [u8; 32],
     timeout: std::time::Duration,
+    // `true` for the background refresh-ahead task: bypass the cache
+    // fast-paths (the entry is still TTL-fresh — that's WHY it can be
+    // re-walked before a send hits an expired one) and don't mark the
+    // receiver as send-active (the refresher must not keep itself alive).
+    force_refresh: bool,
 ) -> Vec<veil_anonymity::rendezvous::RendezvousAd> {
     use veil_anonymity::rendezvous::{
         MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
@@ -3199,13 +3273,20 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if let Some(ads) = resolve_cache.get(&receiver_id, now) {
-        return ads;
+    if !force_refresh {
+        // Feed the refresh-ahead task: this receiver is being actively sent
+        // to, keep its route warm for the activity window.
+        resolve_cache.note_send_use(receiver_id);
+        if let Some(ads) = resolve_cache.get(&receiver_id, now) {
+            return ads;
+        }
     }
     let _refresh_guard = resolve_cache.lock_refresh(receiver_id).await;
     // Another send may have completed the refresh while this one waited for
     // the per-recipient single-flight lock.
-    if let Some(ads) = resolve_cache.get(&receiver_id, now) {
+    if !force_refresh
+        && let Some(ads) = resolve_cache.get(&receiver_id, now)
+    {
         return ads;
     }
 
@@ -3623,6 +3704,7 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                 &self.logger,
                 receiver_id,
                 std::time::Duration::from_millis(3500),
+                false,
             )
             .await;
             // Prefer the freshest signed ad before relay dedup. This avoids
