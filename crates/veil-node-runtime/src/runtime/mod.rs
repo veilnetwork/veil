@@ -7450,10 +7450,36 @@ impl NodeServices {
     fn wait_reply_circuit_confirmed(&self, confirmed: &std::sync::atomic::AtomicBool) {
         const TIMEOUT_MS: u64 = 1_000;
         const POLL_MS: u64 = 10;
-        let mut waited_ms = 0u64;
-        while !confirmed.load(std::sync::atomic::Ordering::Relaxed) && waited_ms < TIMEOUT_MS {
-            std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-            waited_ms += POLL_MS;
+        let wait = || {
+            let mut waited_ms = 0u64;
+            while !confirmed.load(std::sync::atomic::Ordering::Relaxed) && waited_ms < TIMEOUT_MS {
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+                waited_ms += POLL_MS;
+            }
+        };
+        // This wait runs ON a tokio worker: the async send path (IPC handler
+        // task) calls the sync sender inline. A plain thread::sleep PARKS that
+        // worker together with its task queue — and the inbound dispatch that
+        // would process the very CircuitBuilt ACK we are waiting for sits in
+        // that queue. Device-log evidence: only 15/1148 confirmations landed
+        // inside a wait window, while 791/938 landed within 200ms AFTER the
+        // timeout expired — i.e. the wait essentially NEVER succeeded, every
+        // reply-expecting send (chat message, mailbox FETCH) paid the full
+        // 1000ms, and the introduce still fired with an unregistered reply
+        // cookie (the exact race this wait exists to close; the receiver's
+        // delivery-ACK then died as cookie_unknown). block_in_place hands the
+        // worker's queue to other threads so the ACK is processed DURING the
+        // wait (~100-250ms typical) and the poll returns early — the race is
+        // actually closed now, and the 1s ceiling is the rare-case bound, not
+        // the common cost. Fallback for non-runtime / current-thread contexts
+        // (e.g. the FFI admin client): the old plain sleep, unchanged.
+        let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
+            .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false);
+        if on_multi_thread_runtime {
+            tokio::task::block_in_place(wait);
+        } else {
+            wait();
         }
         if !confirmed.load(std::sync::atomic::Ordering::Relaxed) {
             self.logger.info(
