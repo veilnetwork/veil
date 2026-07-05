@@ -8216,11 +8216,33 @@ impl NodeServices {
             sealed_plaintext.push(final_hop_kind::APP_DELIVER_AUTH);
             sealed_plaintext.extend_from_slice(&frag_bytes);
             if parallel {
-                // Round-robin: this fragment rides ONE relay; consecutive
-                // fragments ride DIFFERENT relays → independent circuits to
-                // distinct endpoints, so the recipient receives in parallel.
-                let relay = relays[idx % relays.len()];
-                self.send_sealed_introduce(relay, &sealed_plaintext, hop_count, circuit_backed)?;
+                // Round-robin fragments across relays for throughput. But when
+                // there are FEWER fragments than relays — the common
+                // SINGLE-fragment chat-text case — a bare `relays[idx % len]`
+                // sends the one fragment to ONE relay and leaves the other
+                // registered rendezvous relays idle, so the message has NO
+                // redundancy: a single lost cell on the R→recipient hop then
+                // drops it to the (~12 s) mailbox-drain backstop. Device-verified
+                // 2026-07-05: desktop→phone chat text was intermittently slow for
+                // exactly this reason (live ~3 s when the one relay's forward
+                // landed, else a drain cycle later), while multi-fragment file
+                // content — which fills every relay — was consistently fast.
+                // Spread each fragment across the block of ⌈relays/frags⌉ distinct
+                // endpoints it owns: a 1-fragment message rides ALL registered
+                // relays (independent-path redundancy), while bulk stays 1x per
+                // fragment (⌈3/27⌉ = 1 → unchanged). Recipient de-dups by
+                // (msg_id, frag_idx). Anonymity is unchanged — these are the same
+                // relays the recipient registered its cookie at.
+                let per_frag = relays.len().div_ceil(frag_count).max(1);
+                for k in 0..per_frag {
+                    let relay = relays[(idx * per_frag + k) % relays.len()];
+                    self.send_sealed_introduce(
+                        relay,
+                        &sealed_plaintext,
+                        hop_count,
+                        circuit_backed,
+                    )?;
+                }
             } else {
                 // Bounded retransmit: send the fragment `redundancy` times over
                 // independent circuits; the recipient de-dups by (msg_id, frag_idx).
