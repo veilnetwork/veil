@@ -227,7 +227,18 @@ const CIRCUIT_INTRO_PLAINTEXT_LEN: usize = 16 + CIRCUIT_PEER_TAG_LEN + 32;
 const CIRCUIT_INTRO_LEN: usize =
     veil_anonymity::rendezvous::INTRODUCE_OVERHEAD + CIRCUIT_INTRO_PLAINTEXT_LEN;
 const CIRCUIT_HOPS: usize = 2;
-const CIRCUIT_IDLE_REFRESH_AFTER: Duration = Duration::from_secs(45);
+// How long a pinned INBOUND circuit may sit idle (no received data) before it is
+// rebuilt on a fresh path. Raised 45s -> 300s: the 45s rebuild cadence was pure
+// churn now that (a) the 15s forward heartbeat keeps the circuit + its hop TCP
+// sessions alive, and (b) the recipient recheck re-registers the rendezvous
+// cookie every 15s (subscription TTL 600s), so neither liveness nor the relay
+// registration needs a frequent circuit rebuild. Each rebuild opens a brief
+// window where an introduce forwarded down the retiring generation stalls until
+// the sender's retry hits the new one — device-observed as ~10-20s inbound
+// stalls (desktop receiver, 234 generations/session). Fewer rebuilds = fewer
+// such windows. Still bounded well under the 600s cookie TTL so a genuinely
+// dead path (heartbeat failing) still rotates for path freshness.
+const CIRCUIT_IDLE_REFRESH_AFTER: Duration = Duration::from_secs(300);
 // A long-lived outbound circuit can black-hole after a bulk stream RTOs. The
 // content layer then opens a fresh stream and sends SYNs, but idle-based refresh
 // alone keeps reusing the same stale circuit because every retry updates
@@ -237,6 +248,19 @@ const CIRCUIT_IDLE_REFRESH_AFTER: Duration = Duration::from_secs(45);
 const CIRCUIT_HANDSHAKE_REOPEN_AFTER: Duration = Duration::from_secs(15);
 const CIRCUIT_PUBLISHED_RELAY_EXPAND_AFTER: Duration = Duration::from_secs(5);
 const CIRCUIT_REFRESH_POLL: Duration = Duration::from_secs(5);
+// How often the receiver sends a FORWARD keepalive heartbeat up each pinned
+// inbound circuit (`veil_anonymity::circuit_data::CIRCUIT_HEARTBEAT_MAGIC`).
+// The inbound circuit is otherwise receive-only, so its first-hop TCP session
+// only carries traffic when the node happens to transmit for another reason;
+// left idle it dies (mobile power-save / NAT rebind / VPN) and the rendezvous
+// relay's downstream introduce pushes queue behind a dead socket until the
+// node next sends — the measured 10–60 s delivery stalls that flushed in a
+// batch. 15 s beats the ~10–20 s stalls and stays well under the session
+// keepalive base (30 s, stretched ×up-to-120 in background). One tiny cell per
+// circuit per interval — negligible cost. Must be a multiple-ish of
+// CIRCUIT_REFRESH_POLL (5 s); the poll loop fires it on the first tick at/after
+// the interval.
+const CIRCUIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const CIRCUIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_DATA_PACE_US_ENV: &str = "VEIL_ONION_STREAM_DATA_PACE_US";
 const CIRCUIT_DATA_PACE_US_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_DATA_PACE_US";
@@ -2773,9 +2797,33 @@ fn try_open_circuit(
 
             retire_circuits_later(&services_bg, retired);
 
+            let mut last_heartbeat = Instant::now();
             loop {
                 tokio::time::sleep(CIRCUIT_REFRESH_POLL).await;
-                let generation_age = Instant::now().saturating_duration_since(generation_opened_at);
+                let now = Instant::now();
+                // Keepalive: send a forward heartbeat UP each confirmed inbound
+                // circuit so its first-hop TCP session (and every hop's socket
+                // along the path) stays warm. Without it an idle receiver's
+                // socket dies and the relay's downstream introduce push queues
+                // behind a dead TCP until the receiver next transmits — the
+                // on-device delivery stalls. Snapshot the Arcs so the (sync)
+                // sends don't hold the slot lock; a QueueFull/NoRelays here is
+                // harmless (the next tick retries, and a truly dead circuit is
+                // rotated by the idle-refresh below).
+                if now.saturating_duration_since(last_heartbeat)
+                    >= CIRCUIT_HEARTBEAT_INTERVAL
+                {
+                    last_heartbeat = now;
+                    let circs: Vec<Arc<veil_node_runtime::DataCircuit>> =
+                        circuit_slot.lock().await.iter().cloned().collect();
+                    for circ in &circs {
+                        let _ = services_bg.send_circuit_cell(
+                            circ,
+                            veil_anonymity::circuit_data::CIRCUIT_HEARTBEAT_MAGIC,
+                        );
+                    }
+                }
+                let generation_age = now.saturating_duration_since(generation_opened_at);
                 let idle_for = circuit_idle_for(&activity_bg);
                 if mode == CircuitMode::PublishedRendezvous {
                     let have = circuit_slot.lock().await.len();

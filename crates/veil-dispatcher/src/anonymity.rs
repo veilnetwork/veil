@@ -86,6 +86,7 @@ struct CircuitDataDiag {
     fwd_relay_ok: u64,
     fwd_relay_fail: u64,
     fwd_terminus: u64,
+    fwd_terminus_heartbeat: u64,
     splice_hit: u64,
     splice_miss: u64,
     splice_ok: u64,
@@ -126,7 +127,7 @@ fn circuit_data_diag(update: impl FnOnce(&mut CircuitDataDiag)) {
     diag.last_log = Some(now);
     diag.last_logged_rx = diag.rx;
     log::info!(
-        "onion-stream.circuit-data rx={} fwd_relay={}/{} fwd_terminus={} \
+        "onion-stream.circuit-data rx={} fwd_relay={}/{} fwd_terminus={} hb={} \
          splice_hit={} splice_miss={} splice_send={}/{} ret_relay={}/{} \
          send_err=missing:{} full:{} closed:{} \
          origin_open={}/{} origin_stream=ok:{} full:{} missing:{} unknown={}",
@@ -134,6 +135,7 @@ fn circuit_data_diag(update: impl FnOnce(&mut CircuitDataDiag)) {
         diag.fwd_relay_ok,
         diag.fwd_relay_fail,
         diag.fwd_terminus,
+        diag.fwd_terminus_heartbeat,
         diag.splice_hit,
         diag.splice_miss,
         diag.splice_ok,
@@ -1026,6 +1028,19 @@ impl FrameDispatcher {
                         // other traffic today, so this overload is safe.
                         circuit_data_diag(|d| d.fwd_terminus = d.fwd_terminus.saturating_add(1));
                         let payload = read_payload(&buf);
+                        // Receiver keepalive: a heartbeat cell sent UP its own
+                        // inbound circuit to keep the path's TCP sessions warm.
+                        // It carries no data — absorb it silently (do NOT log it
+                        // as terminus_data, and never try to splice it).
+                        if let Some(p) = &payload
+                            && veil_anonymity::circuit_data::is_heartbeat(p)
+                        {
+                            circuit_data_diag(|d| {
+                                d.fwd_terminus_heartbeat =
+                                    d.fwd_terminus_heartbeat.saturating_add(1)
+                            });
+                            return DispatchResult::NoResponse;
+                        }
                         let mut spliced = false;
                         if let Some(p) = &payload
                             && p.len() >= COOKIE_LEN
