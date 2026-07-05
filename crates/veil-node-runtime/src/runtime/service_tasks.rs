@@ -3550,6 +3550,31 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                 Some(&self.access.dispatcher.crypto.peer_cap_flags),
             )
             .await;
+            // Reverse-leg RD-staleness fix: the reply block's circuit
+            // (`select_onion_relay_path`) needs R + `REPLY_CIRCUIT_HOPS-1` middles
+            // with fresh RDs. The connected warm above caches only session-backed
+            // relays' RDs — one on mobile — so the reply path fails
+            // `middles_insufficient` / `have: 0` and the drain's ACK never returns.
+            // Additionally pull the KNOWN relay set's RDs over whatever session
+            // exists (bounded + freshness-gated → no-op when already warm).
+            {
+                let mut relays: Vec<[u8; 32]> = self
+                    .access
+                    .dht
+                    .routing_table_contacts()
+                    .into_iter()
+                    .map(|c| c.node_id)
+                    .collect();
+                relays.sort_unstable();
+                relays.dedup();
+                self.access
+                    .warm_known_relay_directory(
+                        &relays,
+                        6,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await;
+            }
             // The KEM-key-given mailbox FETCH: route a source-routed onion
             // straight to the known relay (NO ad resolve), authenticated, with a
             // one-time reply block so the relay answers over our return circuit.

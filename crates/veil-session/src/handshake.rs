@@ -381,6 +381,22 @@ where
     };
     let hello_bytes = hello.encode();
 
+    // resume observability: distinguish a client attaching a ticket (resume
+    // attempt) from a cold dial. Emitted via `log::info!` so it reaches the
+    // phone's logcat (NodeLogger session.* events do not). Grep `resume.`.
+    if resume_ticket.is_some() {
+        log::info!(
+            "resume.client.attempt local={} — HELLO carries resume ticket",
+            veil_util::hex_short(&local_node_id_bytes),
+        );
+    } else if let Some(rid) = known_remote_id {
+        log::info!(
+            "resume.client.cold local={} peer={} — no stored ticket, full handshake",
+            veil_util::hex_short(&local_node_id_bytes),
+            veil_util::hex_short(&rid),
+        );
+    }
+
     // silent-server pattern for active-probe DPI resistance.
     //
     // Original protocol had BOTH sides write HELLO immediately on TCP/TLS
@@ -571,6 +587,10 @@ where
                     }
 
                     let node_id = node_id_from_bytes(remote_id)?;
+                    log::info!(
+                        "resume.server.success peer={} — ticket accepted, fast-path (no ML-KEM/Falcon)",
+                        veil_util::hex_short(&remote_id),
+                    );
                     let remote_role = RemoteRole::from(remote_attach.role);
                     // Derive FRESH session keys from the ticket's original keys +
                     // both resumption nonces (client's from HELLO, ours from the
@@ -640,6 +660,10 @@ where
                 // peer_id mismatch → fall through to full handshake.
             }
             // Ticket invalid or expired → fall through to full handshake.
+            log::info!(
+                "resume.server.reject peer={} — ticket present but not resumed (bad/expired/replayed/nonce-missing), full handshake",
+                veil_util::hex_short(&remote_id),
+            );
         }
     } else if let Some(ref _entry) = resume_ticket {
         // ── Client path ──────────────────────────────────────────────────────
@@ -693,6 +717,10 @@ where
                 }
 
                 let node_id = node_id_from_bytes(remote_id)?;
+                log::info!(
+                    "resume.client.success peer={} — server ATTACH, fast-path resumed (1-RTT, fit under 10s)",
+                    veil_util::hex_short(&remote_id),
+                );
                 // Derive FRESH keys from our stored original keys + both
                 // resumption nonces (ours from the HELLO, the responder's from
                 // its ATTACH). NEVER restore the originals into a counter-0
@@ -758,6 +786,10 @@ where
                 // Server rejected the ticket (expired/tampered) — C6 fallback.
                 // We already read the remote IDENTITY body. Process it now, then
                 // send our own IDENTITY and continue with the full handshake.
+                log::info!(
+                    "resume.client.fallback peer={} — server rejected ticket (IDENTITY not ATTACH), full handshake (must fit 10s w/ ML-KEM+Falcon)",
+                    veil_util::hex_short(&remote_id),
+                );
                 if let Some(f) = capture {
                     f(true, family, SessionMsg::Identity as u16, &body, remote_id);
                 }
