@@ -716,8 +716,14 @@ impl NodeRuntime {
     ///    `local_node_id`, NOT from rendezvous_node_id — receivers
     ///    publish under their own identity so senders looking up
     ///    `@receiver` find them).
-    /// 2. Decode + check freshness. If still has > half-window
-    ///    remaining, skip (no DHT churn for entries already fresh).
+    /// 2. Decode + check freshness. PLAIN slots are GENERATION-batched:
+    ///    they are only skipped when every plain slot is fresh AND all
+    ///    share one `valid_from` stamp — otherwise ALL plain slots are
+    ///    re-signed together with a single new stamp, so senders can
+    ///    identify the receiver's current relay set as "the ads with the
+    ///    newest valid_from" and never spread introduces onto a stale
+    ///    relay from an older generation (`cookie_unknown` black hole).
+    ///    Ephemeral slots keep independent per-slot freshness.
     /// 3. Otherwise sign a fresh ad with `valid_from = now`
     ///    `valid_until = now + entry.validity_window_secs` and
     ///    `dht.store_local(...)`.
@@ -764,6 +770,76 @@ impl NodeRuntime {
         // Cap per-receiver slots at MAX_RENDEZVOUS_AD_SLOTS to bound
         // DHT footprint when the entries vec grows pathologically.
         let n_slots = snapshot.len().min(MAX_RENDEZVOUS_AD_SLOTS as usize);
+        // Slot-level freshness probe. Time freshness alone is NOT enough:
+        // the recipient can fail over to another relay while the previous
+        // ad still has most of its validity window left. Skipping solely on
+        // `valid_until` leaves the old relay/cookie published until
+        // half-life, and senders then black-hole every introduce at a relay
+        // where the recipient is no longer registered. Only treat an ad as
+        // fresh when it is both cryptographically valid and an exact
+        // projection of the current publisher entry, so any route or
+        // envelope change is visible on the next maintenance tick.
+        // Returns the fresh ad's `valid_from_unix` (its GENERATION stamp).
+        let slot_fresh_stamp =
+            |idx: usize, entry: &veil_anonymity::rendezvous::RendezvousPublisherEntry| {
+                let (ad_node_id, issuer_pk, issuer_algo) = match &entry.ephemeral_ad_identity {
+                    Some(eph) => (eph.pseudo_node_id, eph.public_key.as_str(), eph.algo),
+                    None => (
+                        receiver_node_id,
+                        local_identity.public_key.as_str(),
+                        local_identity.algo,
+                    ),
+                };
+                let dht_key = rendezvous_ad_dht_key_at(&ad_node_id, idx as u8);
+                let existing_bytes = dht.get_local(&dht_key)?;
+                let ad = decode_rendezvous_ad(&existing_bytes).ok()?;
+                (verify_rendezvous_ad(&ad).is_ok()
+                    && is_currently_valid(&ad, now_unix).is_ok()
+                    && ad.receiver_node_id == ad_node_id
+                    && ad.issuer_pk == issuer_pk
+                    && ad.issuer_algo == issuer_algo
+                    && ad.rendezvous_node_id == entry.rendezvous_node_id
+                    && ad.auth_cookie == entry.auth_cookie
+                    && ad.receiver_x25519_pk == receiver_x25519_pk
+                    && ad.push_envelope == entry.push_envelope
+                    && ad.wake_hmac_envelope == entry.wake_hmac_envelope
+                    && ad.rendezvous_kem_algo == entry.rendezvous_kem_algo
+                    && ad.rendezvous_kem_pk == entry.rendezvous_kem_pk
+                    && ad.valid_until_unix.saturating_sub(ad.valid_from_unix)
+                        == entry.validity_window_secs
+                    && !rendezvous_ad_needs_refresh(
+                        ad.valid_until_unix,
+                        now_unix,
+                        entry.validity_window_secs,
+                    ))
+                .then_some(ad.valid_from_unix)
+            };
+        // GENERATION batching for the PLAIN (sovereign-signed) slots: senders
+        // resolve the union of every slot's replicas across the DHT, and a
+        // still-valid ad for a relay the receiver has since left cannot be
+        // recalled — the relay dropped the registration the moment the session
+        // closed, so an introduce there is dropped as `cookie_unknown`. The
+        // sender therefore needs a way to tell "the receiver's CURRENT relay
+        // set" apart from that stale tail. Contract: all plain slots are
+        // re-signed TOGETHER with one shared `valid_from` (the generation
+        // stamp), so the live set is exactly "the ads carrying the newest
+        // valid_from" and the send path can refuse to spread onto any relay
+        // from an older generation. Consequently a single stale/refresh-due
+        // plain slot re-stamps ALL plain slots (n_slots is small; the extra
+        // signs are negligible next to a sender black-holing an introduce).
+        // Ephemeral (onion-service) ads live in a different DHT key space and
+        // keep independent per-slot freshness.
+        let plain_batch_fresh = {
+            let stamps: Vec<Option<u64>> = snapshot
+                .iter()
+                .take(n_slots)
+                .enumerate()
+                .filter(|(_, e)| e.ephemeral_ad_identity.is_none())
+                .map(|(idx, e)| slot_fresh_stamp(idx, e))
+                .collect();
+            stamps.iter().all(|s| s.is_some())
+                && stamps.windows(2).all(|w| w[0] == w[1])
+        };
         let mut published = 0usize;
         for (idx, entry) in snapshot.iter().take(n_slots).enumerate() {
             // Δ2-c: a LOCATION-ANONYMOUS service signs + DHT-keys its ad under a
@@ -787,37 +863,15 @@ impl NodeRuntime {
                 ),
             };
             let dht_key = rendezvous_ad_dht_key_at(&ad_node_id, idx as u8);
-            // Slot-level freshness check. Time freshness alone is NOT enough:
-            // the recipient can fail over to another relay while the previous
-            // ad still has most of its validity window left. Skipping solely on
-            // `valid_until` leaves the old relay/cookie published until
-            // half-life, and senders then black-hole every introduce at a relay
-            // where the recipient is no longer registered. Only preserve an ad
-            // when it is both cryptographically valid and an exact projection
-            // of the current publisher entry. Any route or envelope change is
-            // therefore visible on the next maintenance tick.
-            if let Some(existing_bytes) = dht.get_local(&dht_key)
-                && let Ok(ad) = decode_rendezvous_ad(&existing_bytes)
-                && verify_rendezvous_ad(&ad).is_ok()
-                && is_currently_valid(&ad, now_unix).is_ok()
-                && ad.receiver_node_id == ad_node_id
-                && ad.issuer_pk == issuer_pk
-                && ad.issuer_algo == issuer_algo
-                && ad.rendezvous_node_id == entry.rendezvous_node_id
-                && ad.auth_cookie == entry.auth_cookie
-                && ad.receiver_x25519_pk == receiver_x25519_pk
-                && ad.push_envelope == entry.push_envelope
-                && ad.wake_hmac_envelope == entry.wake_hmac_envelope
-                && ad.rendezvous_kem_algo == entry.rendezvous_kem_algo
-                && ad.rendezvous_kem_pk == entry.rendezvous_kem_pk
-                && ad.valid_until_unix.saturating_sub(ad.valid_from_unix)
-                    == entry.validity_window_secs
-                && !rendezvous_ad_needs_refresh(
-                    ad.valid_until_unix,
-                    now_unix,
-                    entry.validity_window_secs,
-                )
-            {
+            // Freshness: plain slots are generation-batched (all fresh AND
+            // sharing one valid_from stamp, see `plain_batch_fresh`) so the
+            // send path can identify the current relay set by the newest
+            // stamp; ephemeral slots keep independent per-slot freshness.
+            let fresh = match &entry.ephemeral_ad_identity {
+                Some(_) => slot_fresh_stamp(idx, entry).is_some(),
+                None => plain_batch_fresh,
+            };
+            if fresh {
                 continue;
             }
             let valid_from = now_unix;
