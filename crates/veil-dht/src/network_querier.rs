@@ -42,6 +42,34 @@ use veil_proto::discovery::{
 use veil_proto::family::{DiscoveryMsg, FrameFamily};
 use veil_proto::header::FrameHeader;
 
+/// Process-global request-id source shared by EVERY querier instance.
+///
+/// The SessionRunner's pending-response table is keyed by `request_id`
+/// alone (per session), and `PendingResponseTable::insert` on a duplicate id
+/// EVICTS the previous waiter (fulfils it with `None`) and hands the earlier
+/// request's response to the later waiter. Each short-lived querier used to
+/// start its own counter at 1, so two lookups walking concurrently — e.g.
+/// several relay-directory warms racing at boot, or every consumer
+/// re-warming in a failure loop — sent the SAME ids to the SAME seed and
+/// collided near-deterministically: one caller got a silent miss, the other
+/// got the WRONG value (live 2026-07-06: relay-directory entries rejected
+/// with "failed node-id bind" at boot, then every retry silently returned
+/// None → `InsufficientRelayCandidates {have: 0}` until an app restart). One
+/// process-wide counter makes ids unique until u32 wraparound (4 G requests),
+/// which no session outlives with the pending table's TTL eviction.
+static NEXT_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Next process-unique request id; skips 0, which `send_oneway` reserves for
+/// fire-and-forget frames that must never match a pending entry.
+fn next_global_request_id() -> u32 {
+    loop {
+        let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 /// Implements [`PeerQuerier`] by sending actual OVL1 FIND_NODE / V2 frames.
 ///
 /// Owns (or shares) a [`TransportCache`] used to skip the
@@ -49,7 +77,6 @@ use veil_proto::header::FrameHeader;
 /// is still warm.
 pub struct NetworkPeerQuerier {
     outbox: Arc<dyn FrameRouter>,
-    next_request_id: AtomicU32,
     /// Number of closest nodes to request per FIND_NODE query.
     k: u8,
     /// Timeout for a single FIND_NODE / FIND_VALUE / ResolveTransport
@@ -110,7 +137,6 @@ impl NetworkPeerQuerier {
     ) -> Self {
         Self {
             outbox,
-            next_request_id: AtomicU32::new(1),
             k,
             find_node_timeout,
             cache,
@@ -228,7 +254,7 @@ impl NetworkPeerQuerier {
     /// resolver that returned a forged transport (or one for the
     /// wrong node_id) is silently rejected here.
     async fn resolve_transport_rpc(&self, peer_id: [u8; 32], node_id: [u8; 32]) -> Option<String> {
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let request_id = next_global_request_id();
         let frame = self
             .build_resolve_transport_frame(request_id, node_id)
             .await?;
@@ -321,11 +347,13 @@ impl PeerQuerier for NetworkPeerQuerier {
     ) -> Pin<Box<dyn Future<Output = Vec<Contact>> + Send + 'a>> {
         Box::pin(async move {
             // ── Step 1: FindNodeV2 ─────────────────────────────────────
-            // wrapping_add: u32 counter wraps after ~4B requests. The
-            // pending map is bounded (`max_pending_responses`) and entries
-            // are TTL-evicted long before any realistic wraparound, so
-            // collision risk is negligible in practice.
-            let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            // Ids come from the PROCESS-GLOBAL counter (see
+            // NEXT_REQUEST_ID): the pending map is keyed by request_id
+            // alone, so per-instance counters made concurrent walks
+            // collide on the same seed. u32 wraparound (~4B requests) is
+            // harmless — the pending map is bounded and TTL-evicted long
+            // before any realistic reuse window.
+            let request_id = next_global_request_id();
             let frame = self.build_find_node_v2_frame(request_id, target);
             let Some(rx) = self.outbox.send_request(peer_id, request_id, frame) else {
                 return vec![];
@@ -352,7 +380,7 @@ impl PeerQuerier for NetworkPeerQuerier {
         key: [u8; 32],
     ) -> Pin<Box<dyn Future<Output = FindValueResult> + Send + 'a>> {
         Box::pin(async move {
-            let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed); // see find_node for wraparound rationale
+            let request_id = next_global_request_id(); // see find_node for id-uniqueness rationale
             let frame = self.build_find_value_frame(request_id, key);
 
             let Some(rx) = self.outbox.send_request(peer_id, request_id, frame) else {
@@ -380,5 +408,37 @@ impl PeerQuerier for NetworkPeerQuerier {
                 _ => FindValueResult::Nodes(vec![]),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod request_id_tests {
+    use super::*;
+
+    /// Ids must be unique across "querier instances" (the free fn IS the
+    /// shared source) and across threads, and 0 must never be handed out —
+    /// `send_oneway` reserves it for never-matched fire-and-forget frames.
+    /// Pin the invariant that killed the per-instance counters: concurrent
+    /// lookups drawing ids at the same time must never collide.
+    #[test]
+    fn global_request_ids_unique_across_threads_and_nonzero() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..1000)
+                        .map(|_| next_global_request_id())
+                        .collect::<Vec<u32>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<u32> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("thread"))
+            .collect();
+        assert!(all.iter().all(|id| *id != 0), "0 is reserved for oneway");
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "duplicate request ids handed out");
     }
 }
