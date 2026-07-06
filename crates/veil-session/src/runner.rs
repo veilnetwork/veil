@@ -299,12 +299,27 @@ pub(crate) fn hot_standby_should_auto_fire(enabled: bool, reason: &str) -> bool 
 /// Per-episode warm-probe swap-attempt ceiling for the M5 re-eval teardown.
 pub(crate) const KEEPALIVE_SWAP_ATTEMPT_CEILING: u32 = 2;
 
+/// Unacked-probe age (as a multiple of `probe_timeout`) past which a FRESH
+/// genuine-RX no longer vetoes the re-eval reap. The dispatcher answers every
+/// inbound Keepalive with an immediate REALTIME KeepaliveAck over a reliable
+/// transport, so a probe ledger that stays unacked for this many whole
+/// windows *while genuine inbound keeps flowing* is proof of a
+/// one-directional TX wedge (our send direction black-holes, RX alive) — the
+/// half-dead state the plain `genuine_stale` gate was masking. 3 windows
+/// (90 s at the default 30 s interval) sits far above any legitimate
+/// ack-latency (TCP retransmit under loss is seconds, not minutes) so only a
+/// truly wedged TX trips it.
+pub(crate) const TX_WEDGE_PROBE_MULTIPLE: u32 = 3;
+
 /// Pure teardown decision for the re-evaluable keepalive-probe-timeout path.
-/// Reaps ONLY when the probe ledger is stale AND no genuine inbound has
-/// arrived within the window AND failover is exhausted (no warm probe OR the
-/// swap-attempt ceiling is hit). `probe_timeout == 0` short-circuits to false
-/// (keepalive-disabled sessions are never reaped). Inputs are only Durations +
-/// scalars: no `SessionRunner`, no clock, no I/O.
+/// Reaps ONLY when the probe ledger is stale AND failover is exhausted (no
+/// warm probe OR the swap-attempt ceiling is hit) AND either (a) no genuine
+/// inbound arrived within the window — the peer-gone M5 zombie — or (b) the
+/// ledger has been unacked for [`TX_WEDGE_PROBE_MULTIPLE`] whole windows —
+/// the one-directional TX wedge where live inbound would otherwise mask a
+/// black-holed send direction forever. `probe_timeout == 0` short-circuits to
+/// false (keepalive-disabled sessions are never reaped). Inputs are only
+/// Durations + scalars: no `SessionRunner`, no clock, no I/O.
 #[must_use]
 pub(crate) fn should_reeval_teardown(
     probe_age: std::time::Duration,
@@ -319,8 +334,9 @@ pub(crate) fn should_reeval_teardown(
     }
     let probe_stale = probe_age >= probe_timeout;
     let genuine_stale = last_genuine_rx_age >= probe_timeout;
+    let tx_wedged = probe_age >= probe_timeout * TX_WEDGE_PROBE_MULTIPLE;
     let no_failover = !hot_standby_ok || swap_attempts >= ceiling;
-    probe_stale && genuine_stale && no_failover
+    probe_stale && (genuine_stale || tx_wedged) && no_failover
 }
 
 /// Session rekey trigger thresholds.
@@ -3148,7 +3164,7 @@ impl SessionRunner {
                                 self.logger.info(
                                     "session.keepalive.timeout_close",
                                     format!(
-                                        "peer_id={} — probe unacked {}ms, genuine_rx stale {}ms, swap_attempts={} (ceiling {}); reaping zombie",
+                                        "peer_id={} — probe unacked {}ms, genuine_rx age {}ms, swap_attempts={} (ceiling {}); reaping zombie (tx-wedge if genuine fresh)",
                                         hex_short(&self.peer_id),
                                         probe_age.as_millis(),
                                         genuine_age.as_millis(),
@@ -4282,6 +4298,51 @@ mod reeval_teardown_tests {
         assert!(should_reeval_teardown(
             TIMEOUT, TIMEOUT, 0, // swap_attempts 0
             CEILING, TIMEOUT, false, // no warm probe
+        ));
+    }
+
+    /// (g) One-directional TX wedge: genuine RX perfectly fresh (peer keeps
+    /// sending) but our keepalives have gone unacked for
+    /// TX_WEDGE_PROBE_MULTIPLE whole windows → fresh RX must NOT veto the
+    /// reap.
+    #[test]
+    fn tx_wedge_reaps_despite_fresh_genuine_rx() {
+        assert!(should_reeval_teardown(
+            TIMEOUT * TX_WEDGE_PROBE_MULTIPLE,
+            TIMEOUT,
+            CEILING,
+            CEILING,
+            Duration::ZERO, // genuine RX fresh — inbound alive
+            false,
+        ));
+    }
+
+    /// (h) Below the wedge multiple the fresh-RX veto still holds — a probe
+    /// stale for only 2 windows with live inbound is NOT yet proof of a
+    /// wedge (ack may be riding a loss-retransmit).
+    #[test]
+    fn tx_wedge_below_multiple_fresh_rx_still_protects() {
+        assert!(!should_reeval_teardown(
+            TIMEOUT * (TX_WEDGE_PROBE_MULTIPLE - 1),
+            TIMEOUT,
+            CEILING,
+            CEILING,
+            Duration::ZERO,
+            false,
+        ));
+    }
+
+    /// (i) TX wedge with failover still available (hot-standby swaps below
+    /// ceiling) → no reap; the swap path gets its chance first.
+    #[test]
+    fn tx_wedge_with_failover_no_teardown() {
+        assert!(!should_reeval_teardown(
+            TIMEOUT * TX_WEDGE_PROBE_MULTIPLE,
+            TIMEOUT,
+            1, // swap_attempts < ceiling
+            CEILING,
+            Duration::ZERO,
+            true, // hot_standby_ok
         ));
     }
 }
