@@ -1600,18 +1600,80 @@ impl CircuitCells {
                                 >= CIRCUIT_HANDSHAKE_REOPEN_AFTER
                     });
                     if is_handshake && old_quiet {
-                        diag_node(
-                            &self.me,
-                            &format!(
-                                "outbound circuit pool handshake on old/quiet path \
+                        // MAKE-BEFORE-BREAK (device-verified regression,
+                        // 2026-07-06): retiring the WHOLE pool here killed the
+                        // routes still carrying LIVE streams. On a real-WAN
+                        // path the serve side's in-flight reply route died
+                        // mid-transfer ("driver gone"), the puller timed out
+                        // waiting for its manifest, retried with a NEW
+                        // handshake and re-tripped this branch — a
+                        // self-sustaining churn loop (20 MB transfers never
+                        // completed on the production seeds while a 200 KB
+                        // file could slip through between reopen cycles; a
+                        // zero-RTT local mesh reopens fast enough that the
+                        // loop never bites, which is why the live tests
+                        // stayed green). Retire only the genuinely idle
+                        // circuits; keep every route with active streams and
+                        // refill the pool in the background.
+                        let mut kept: Vec<CircuitEntry> = Vec::new();
+                        let mut idle: Vec<CircuitEntry> = Vec::new();
+                        for entry in entries.drain(..) {
+                            if entry.stats.active_streams() > 0 {
+                                kept.push(entry);
+                            } else {
+                                idle.push(entry);
+                            }
+                        }
+                        if kept.is_empty() {
+                            diag_node(
+                                &self.me,
+                                &format!(
+                                    "outbound circuit pool handshake on old/quiet path \
                          to {} (stream={} routes={}) — reopening",
-                                short_node(&dst_node),
+                                    short_node(&dst_node),
+                                    stream_id,
+                                    idle.len(),
+                                ),
+                            );
+                            circuits.remove(&dst_node);
+                            Some(idle.into_iter().map(|entry| entry.circuit).collect())
+                        } else {
+                            diag_node(
+                                &self.me,
+                                &format!(
+                                    "outbound circuit pool handshake on old/quiet path \
+                         to {} (stream={}) — keeping {} live route(s), retiring {} idle, \
+                         refilling in background",
+                                    short_node(&dst_node),
+                                    stream_id,
+                                    kept.len(),
+                                    idle.len(),
+                                ),
+                            );
+                            entries.extend(kept);
+                            let route = self.select_outbound_route(
+                                dst_node,
+                                entries,
                                 stream_id,
-                                entries.len(),
-                            ),
-                        );
-                        let entries = circuits.remove(&dst_node).unwrap_or_default();
-                        Some(entries.into_iter().map(|entry| entry.circuit).collect())
+                                route_class,
+                                now,
+                            );
+                            drop(circuits);
+                            retire_circuits_later(
+                                &self.services,
+                                idle.into_iter().map(|entry| entry.circuit).collect(),
+                            );
+                            self.ensure_outbound_opening(dst_node, route_class).await;
+                            if let Some(route) = route {
+                                return Ok(Some(route));
+                            }
+                            // Every live route is momentarily unusable
+                            // (cooldown / admission limit) — open a fresh
+                            // handshake circuit rather than dropping the SYN.
+                            return self
+                                .open_outbound_for_handshake(dst_node, route_class)
+                                .await;
+                        }
                     } else {
                         let route = self.select_outbound_route(
                             dst_node,
@@ -2759,8 +2821,40 @@ fn try_open_circuit(
             }
 
             let retired = {
+                // MERGE the freshly confirmed circuits into the slot instead of
+                // replacing it wholesale (device-verified 2026-07-06): on a
+                // lossy WAN one refresh cycle often confirms only a SUBSET of
+                // the pool target (1 of 3 was typical against the production
+                // seeds). A blind replace then DROPPED still-live confirmed
+                // registrations, so the receiver's reachable relay set jumped
+                // around every cycle (R=[c92]→R=[3d]→…) and a sender's
+                // circuit pool never kept a stable route — mid-transfer
+                // resets plus relay cooldowns chasing a moving target.
+                // Replace only the entries whose terminus relay was
+                // re-confirmed THIS cycle; keep the others (a truly dead
+                // registration expires at its terminus by registry TTL, and
+                // the next refresh cycle retries the missing relays anyway).
+                let confirmed_termini: std::collections::HashSet<[u8; 32]> = confirmed
+                    .iter()
+                    .filter_map(|c| c.relay_path().last().copied())
+                    .collect();
                 let mut slot = circuit_slot.lock().await;
-                std::mem::replace(&mut *slot, confirmed)
+                let mut retired: Vec<Arc<veil_node_runtime::DataCircuit>> = Vec::new();
+                let mut next: Vec<Arc<veil_node_runtime::DataCircuit>> = Vec::new();
+                for old in slot.drain(..) {
+                    if old
+                        .relay_path()
+                        .last()
+                        .is_some_and(|r| confirmed_termini.contains(r))
+                    {
+                        retired.push(old);
+                    } else {
+                        next.push(old);
+                    }
+                }
+                next.extend(confirmed);
+                *slot = next;
+                retired
             };
             let generation_opened_at = Instant::now();
             generation += 1;
