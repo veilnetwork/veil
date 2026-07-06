@@ -1356,6 +1356,22 @@ final Pointer<VeilAnonStreamFfi> Function(
             )>>('veil_anon_stream_open')
     .asFunction();
 
+// warm_peer(handle, dst_node32*, err) -> 0 ok / -1 err. Fire-and-forget
+// pre-warm of the outbound circuit pool toward a peer (background open).
+final int Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>,
+  Pointer<Pointer<Utf8>>,
+) veilAnonStreamWarmPeer = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_anon_stream_warm_peer')
+    .asFunction();
+
 // accept(handle, timeout_ms, out_src_node32*, out_src_app32*, err) -> stream*
 // (NULL on timeout with no err, so the caller polls; NULL+err on fatal).
 final Pointer<VeilAnonStreamFfi> Function(

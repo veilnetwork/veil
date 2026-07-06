@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -275,6 +275,21 @@ const CIRCUIT_CONFIRM_PROBE_INTERVAL: Duration = Duration::from_millis(1_500);
 // registry TTL, so a relay that keeps losing our CircuitBuild forward would
 // otherwise go dark for pullers that resolve its still-published ad.
 const CIRCUIT_UNCONFIRMED_RETRY_AFTER: Duration = Duration::from_secs(30);
+// Inbound starvation: the receive side of this hub is provably dead while we
+// keep TALKING into the network. Live incident shape (2026-07-06, reproduced
+// on the bench after a long netem window): every registration confirmed, the
+// 15 s heartbeats flow, retrying pulls/serves keep the circuits "active" —
+// but the relay→us return leg black-holes, so idle-refresh (gated on
+// idle_for, which SENDS keep resetting) never fires and the pool stays
+// "healthy" forever. Manual app restart was the only cure. Trigger: we sent
+// hub traffic within SEND_RECENT (real stream cells — heartbeats bypass the
+// activity stamp) yet received NOTHING for STARVATION_AFTER → rebuild +
+// re-register the inbound generation. generation_age must also exceed the
+// threshold so a fresh generation gets a full window to deliver before it
+// can be recycled (this also bounds the retry cadence while the network
+// stays broken).
+const CIRCUIT_INBOUND_STARVATION_AFTER: Duration = Duration::from_secs(90);
+const CIRCUIT_INBOUND_STARVATION_SEND_RECENT: Duration = Duration::from_secs(20);
 const STREAM_DATA_PACE_US_ENV: &str = "VEIL_ONION_STREAM_DATA_PACE_US";
 const CIRCUIT_DATA_PACE_US_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_DATA_PACE_US";
 const CIRCUIT_RECV_WINDOW_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_RECV_WINDOW";
@@ -403,6 +418,35 @@ const CIRCUIT_ROUTE_BUSY_RECENT_DATA_GRACE: Duration = Duration::from_secs(2);
 const CIRCUIT_ROUTE_BUSY_MIN_DATA_CELLS: u64 = 1024;
 const CIRCUIT_ROUTE_BUSY_RTO_EVENTS: u64 = 6;
 const CIRCUIT_ROUTE_NO_PROGRESS_COOLDOWN: Duration = Duration::from_secs(20);
+// Throughput-aware route shedding. A sick-but-alive chain under RACK repair
+// rarely RTOs — losses get repaired by later deliveries, cwnd adapts, and the
+// stream just CRAWLS (device A/B 2026-07-06: 20 MB in 183 s on one netem'd
+// chain vs 15 s on a clean one), so neither consec_rto nor the no-progress
+// path ever fires. Measure per-route DATA throughput over a sliding window;
+// after enough consecutive windows that are BUSY (enough bytes to rule out an
+// app-limited stream) yet SLOW (below the crawl floor), remap the bulk stream
+// to another usable pool route — non-quarantine, rendezvous kept warm, same
+// semantics as the no-progress remap. Anti-flap: per-peer shed cooldown, and
+// the fresh route starts with a zeroed window streak so it gets a full
+// measurement period before it can be shed again.
+const CIRCUIT_ROUTE_SHED_WINDOW: Duration = Duration::from_secs(5);
+// Crawl floor: clean chains against the production seeds sustain ≥1 MB/s;
+// the netem'd sick chain crawled at ~115 KB/s. 256 KiB/s splits those with
+// margin on both sides.
+const CIRCUIT_ROUTE_SHED_FLOOR_BPS: u64 = 256 * 1024;
+// Windows carrying less than this many bytes are treated as app-limited
+// (chat, trickle) and never count toward the slow streak.
+const CIRCUIT_ROUTE_SHED_MIN_WINDOW_BYTES: u64 = 128 * 1024;
+const CIRCUIT_ROUTE_SHED_SLOW_WINDOWS: u32 = 2;
+const CIRCUIT_ROUTE_SHED_COOLDOWN: Duration = Duration::from_secs(20);
+// How long a route stays marked "crawling" after its last busy-but-slow
+// window. The mark (a) biases route selection away from the sick chain for
+// NEW streams — short serve/manifest streams otherwise keep landing on it
+// via round-robin and dying on the peer's manifest timeout ("sender not
+// serving", workers adapt-down) — and (b) expires on its own so a healed
+// path gets a probation pick again without needing bulk traffic to prove
+// itself first. A busy-and-fast window clears the mark immediately.
+const CIRCUIT_ROUTE_SLOW_MARK_TTL: Duration = Duration::from_secs(60);
 // Existing streams may still be using the previous published rendezvous relay
 // for their ACK path after a refresh. Keep the old circuit/registration around
 // long enough for a multi-megabyte transfer to drain instead of black-holing the
@@ -545,6 +589,9 @@ struct CircuitCells {
     /// this hub. The inbound registration may be refreshed after a quiet period,
     /// but never while a file transfer is actively moving DATA/ACK cells.
     activity: Arc<Mutex<Instant>>,
+    /// Last RECEIVED cell (feeds only — sends never move it). Input to the
+    /// inbound-starvation refresh (see CIRCUIT_INBOUND_STARVATION_AFTER).
+    inbound_activity: Arc<Mutex<Instant>>,
     /// Filled by the background open task once this node's receiving circuit(s)
     /// are up. Published mode keeps one registration per advertised rendezvous
     /// relay; validation mode keeps a single circuit and also uses it for sends.
@@ -559,6 +606,10 @@ struct CircuitCells {
     next_outbound_route: Arc<Mutex<HashMap<([u8; 32], RouteClass), usize>>>,
     route_cooldowns: RouteCooldowns,
     first_hop_cooldowns: FirstHopCooldowns,
+    /// Per-destination anti-flap mark for throughput shedding: a crawling
+    /// bulk stream is remapped off its route at most once per
+    /// [`CIRCUIT_ROUTE_SHED_COOLDOWN`] per peer.
+    bulk_shed_marks: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
     /// Peers for which a cold/stale outbound circuit is currently being opened
     /// in the background. A stream cell sender must never block the stream driver
     /// on circuit construction; the ARQ layer retransmits dropped cells.
@@ -659,6 +710,25 @@ struct CircuitRouteStats {
     rto_events: AtomicU64,
     last_data_at: Mutex<Option<Instant>>,
     stream_rtos: Mutex<HashMap<u32, StreamRtoStats>>,
+    /// Sliding DATA-throughput window for slow-route shedding (see the
+    /// CIRCUIT_ROUTE_SHED_* constants). Updated inline by `record_send`.
+    rate_window: Mutex<RateWindow>,
+    /// Consecutive finalized windows that were busy-but-slow. Read by the
+    /// shed decision after each DATA send and by the selection health bias;
+    /// cleared by a busy-and-fast window or by the slow-mark TTL. An idle /
+    /// app-limited window leaves it untouched — a shed route goes idle
+    /// immediately, and an instant reset would erase the very mark that
+    /// keeps new streams off the sick chain.
+    slow_windows: AtomicU32,
+    /// Slow-mark expiry, as milliseconds since `opened_at` (0 = unmarked).
+    /// Refreshed on every busy-but-slow window; see
+    /// [`CIRCUIT_ROUTE_SLOW_MARK_TTL`].
+    slow_mark_expiry_ms: AtomicU64,
+}
+
+struct RateWindow {
+    started: Instant,
+    bytes: u64,
 }
 
 struct StreamRtoStats {
@@ -678,6 +748,12 @@ impl CircuitRouteStats {
             rto_events: AtomicU64::new(0),
             last_data_at: Mutex::new(None),
             stream_rtos: Mutex::new(HashMap::new()),
+            rate_window: Mutex::new(RateWindow {
+                started: opened_at,
+                bytes: 0,
+            }),
+            slow_windows: AtomicU32::new(0),
+            slow_mark_expiry_ms: AtomicU64::new(0),
         }
     }
 
@@ -704,9 +780,11 @@ impl CircuitRouteStats {
             let data_cells = self.data_cells.fetch_add(1, Ordering::Relaxed) + 1;
             self.data_bytes
                 .fetch_add(data_bytes as u64, Ordering::Relaxed);
+            let now = Instant::now();
             if let Ok(mut last_data_at) = self.last_data_at.lock() {
-                *last_data_at = Some(Instant::now());
+                *last_data_at = Some(now);
             }
+            self.note_rate_window(data_bytes as u64, now);
             if data_cells % 8192 == 0 {
                 return Some(self.snapshot());
             }
@@ -714,6 +792,60 @@ impl CircuitRouteStats {
             self.control_cells.fetch_add(1, Ordering::Relaxed);
         }
         None
+    }
+
+    /// Accumulate DATA payload bytes into the sliding shed window; when the
+    /// window elapses, finalize it into the busy-but-slow streak. Only a
+    /// busy-and-FAST window (or the mark TTL) clears the streak; an idle or
+    /// app-limited window leaves it as is, so the crawling mark survives the
+    /// route going quiet right after its stream was shed away.
+    fn note_rate_window(&self, data_bytes: u64, now: Instant) {
+        let Ok(mut window) = self.rate_window.lock() else {
+            return;
+        };
+        window.bytes = window.bytes.saturating_add(data_bytes);
+        let elapsed = now.saturating_duration_since(window.started);
+        if elapsed < CIRCUIT_ROUTE_SHED_WINDOW {
+            return;
+        }
+        let busy = window.bytes >= CIRCUIT_ROUTE_SHED_MIN_WINDOW_BYTES;
+        // bytes/elapsed < floor  ⇔  bytes*1000 < floor*elapsed_ms (integer-safe)
+        let slow = (window.bytes as u128) * 1000
+            < (CIRCUIT_ROUTE_SHED_FLOOR_BPS as u128) * elapsed.as_millis();
+        window.started = now;
+        window.bytes = 0;
+        if busy && slow {
+            // An expired mark means the old streak is stale evidence —
+            // restart the count instead of resuming it.
+            if !self.slow_marked(now) && self.slow_windows.load(Ordering::Relaxed) > 0 {
+                self.slow_windows.store(1, Ordering::Relaxed);
+            } else {
+                self.slow_windows.fetch_add(1, Ordering::Relaxed);
+            }
+            let expiry = now.saturating_duration_since(self.opened_at) + CIRCUIT_ROUTE_SLOW_MARK_TTL;
+            self.slow_mark_expiry_ms
+                .store(expiry.as_millis() as u64, Ordering::Relaxed);
+        } else if busy {
+            self.slow_windows.store(0, Ordering::Relaxed);
+            self.slow_mark_expiry_ms.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Active busy-but-slow streak length; 0 once the mark TTL has lapsed.
+    fn slow_windows(&self, now: Instant) -> u32 {
+        if self.slow_marked(now) {
+            self.slow_windows.load(Ordering::Relaxed)
+        } else {
+            0
+        }
+    }
+
+    /// Is this route currently marked as crawling (recent busy-but-slow
+    /// window, TTL not yet lapsed)?
+    fn slow_marked(&self, now: Instant) -> bool {
+        let expiry_ms = self.slow_mark_expiry_ms.load(Ordering::Relaxed);
+        expiry_ms > 0
+            && (now.saturating_duration_since(self.opened_at).as_millis() as u64) < expiry_ms
     }
 
     fn record_send_failure(&self) -> RouteStatsSnapshot {
@@ -1089,6 +1221,12 @@ impl CellSender for CircuitCells {
         if !is_handshake {
             self.mark_outbound_non_handshake(dst.node, &route).await;
         }
+        if is_data && route_class == RouteClass::Bulk {
+            if let Some(stream_id) = stream_id {
+                self.maybe_shed_slow_bulk_route(dst.node, stream_id, &route)
+                    .await;
+            }
+        }
         Ok(())
     }
 
@@ -1392,6 +1530,8 @@ impl CircuitCells {
                     .finish_failed_chunk(dst.node, &route, err, run_len - sent, cells)
                     .await;
             }
+            self.maybe_shed_slow_bulk_route(dst.node, stream_id, &route)
+                .await;
             return Ok(());
         }
         let mut routes: Vec<&CircuitRoute> = Vec::with_capacity(1 + alternates.len());
@@ -1468,6 +1608,8 @@ impl CircuitCells {
         }
         mark_circuit_activity(&self.activity);
         self.mark_outbound_non_handshake(dst.node, &route).await;
+        self.maybe_shed_slow_bulk_route(dst.node, stream_id, &route)
+            .await;
         Ok(())
     }
 
@@ -1978,6 +2120,13 @@ impl CircuitCells {
             } else {
                 usable_indices
             };
+        // NOTE deliberately NO slow-mark bias here (tried 2026-07-06 and
+        // reverted): a route that kills streams instantly (<128 KB sent, so
+        // never a busy window, never marked) stayed "healthy" while the
+        // merely-slow routes were marked and excluded — the filter then
+        // funneled EVERY new stream into the black hole and the pull
+        // serialized into single-attempt retries. Plain round-robin spreads
+        // that risk; the slow mark only gates the shed TARGET choice.
         let idx = {
             let mut next = self
                 .next_outbound_route
@@ -2250,6 +2399,160 @@ impl CircuitCells {
             .await;
     }
 
+    /// Throughput-aware route shedding. RACK repair keeps a sick-but-alive
+    /// chain making steady progress with almost no RTO events, so the
+    /// no-progress/quarantine paths never fire and a bulk stream can crawl
+    /// at ~100 KB/s while a clean pool route sits idle (device A/B
+    /// 2026-07-06: 20 MB in 183 s on a netem'd chain vs 15 s clean). After
+    /// [`CIRCUIT_ROUTE_SHED_SLOW_WINDOWS`] consecutive busy-but-slow windows
+    /// on the stream's sticky route, rebind the stream DIRECTLY to the best
+    /// other usable pool route — non-quarantine: the slow relay's circuit
+    /// stays pooled and warm (it may be slow only for this path direction,
+    /// and cooling it under a small relay set starves the pool). Anti-flap:
+    /// per-peer [`CIRCUIT_ROUTE_SHED_COOLDOWN`] between sheds, and the fresh
+    /// route needs its own full window streak before it can be shed.
+    async fn maybe_shed_slow_bulk_route(
+        &self,
+        dst_node: [u8; 32],
+        stream_id: u32,
+        route: &CircuitRoute,
+    ) {
+        if self.mode != CircuitMode::PublishedRendezvous {
+            return;
+        }
+        let Some(stats) = route.stats.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if stats.slow_windows(now) < CIRCUIT_ROUTE_SHED_SLOW_WINDOWS {
+            return;
+        }
+        let Some(relay) = route.rendezvous_node else {
+            return;
+        };
+        // Read-only cooldown probe; the mark is written only when the remap
+        // actually executes, so a no-alternative pool doesn't burn it.
+        {
+            let marks = self
+                .bulk_shed_marks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(last) = marks.get(&dst_node) {
+                if now.saturating_duration_since(*last) < CIRCUIT_ROUTE_SHED_COOLDOWN {
+                    return;
+                }
+            }
+        }
+        let cooled_relays: HashSet<[u8; 32]> = {
+            let cooldowns = self
+                .route_cooldowns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cooldowns
+                .iter()
+                .filter(|(_, until)| **until > now)
+                .map(|(node, _)| *node)
+                .collect()
+        };
+        let cooled_first_hops: HashSet<[u8; 32]> = {
+            let cooldowns = self
+                .first_hop_cooldowns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cooldowns
+                .iter()
+                .filter(|(_, until)| **until > now)
+                .map(|(node, _)| *node)
+                .collect()
+        };
+        let slow_first_hop = route.circuit.first_hop();
+        let target = {
+            let circuits = self.outbound_circuits.lock().await;
+            circuits.get(&dst_node).and_then(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        let entry_first_hop = entry.circuit.first_hop();
+                        entry.rendezvous_node != relay
+                            && !cooled_relays.contains(&entry.rendezvous_node)
+                            && !cooled_first_hops.contains(&entry_first_hop)
+                            && self.services.has_live_session(&entry_first_hop)
+                            // A marked target is measurably crawling too —
+                            // remapping onto it is pure churn (observed live
+                            // as a 3d↔c92 ping-pong every shed cooldown).
+                            // With no unmarked alternative, stay put and let
+                            // the marks expire / the pool refill.
+                            && !entry.stats.slow_marked(now)
+                    })
+                    // Prefer a distinct first hop (the slowness may live in
+                    // the shared first-hop session), then the least-loaded
+                    // route.
+                    .min_by_key(|entry| {
+                        (
+                            entry.circuit.first_hop() == slow_first_hop,
+                            entry.stats.active_streams(),
+                        )
+                    })
+                    .map(|entry| entry.route())
+            })
+        };
+        let Some(target) = target else {
+            // No usable alternative right now: keep the streak and kick a
+            // refill so the shed fires as soon as the pool widens.
+            self.ensure_outbound_opening(dst_node, RouteClass::Bulk).await;
+            return;
+        };
+        let swapped = {
+            let mut routes = self.stream_routes.lock().await;
+            let key = (dst_node, stream_id, RouteClass::Bulk);
+            // Rebind only if the stream is still pinned to the slow relay —
+            // a concurrent no-progress/stale remap may already have moved it.
+            match routes.get(&key) {
+                Some(current) if current.rendezvous_node == Some(relay) => {
+                    if let Some(new_stats) = target.stats.as_ref() {
+                        let _ = new_stats.record_stream_open();
+                    }
+                    if let Some(old_route) = routes.insert(key, target.clone()) {
+                        record_stream_route_closed(RouteClass::Bulk, &old_route);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !swapped {
+            return;
+        }
+        // Deliberately KEEP the old route's slow mark: it now steers the
+        // selection health bias away from the sick chain for new streams,
+        // and it self-expires via CIRCUIT_ROUTE_SLOW_MARK_TTL.
+        {
+            let mut marks = self
+                .bulk_shed_marks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            marks.retain(|_, at| now.saturating_duration_since(*at) < CIRCUIT_ROUTE_SHED_COOLDOWN);
+            marks.insert(dst_node, now);
+        }
+        diag_node(
+            &self.me,
+            &format!(
+                "outbound slow-route shed for {} stream={} via R={} path={} -> R={} path={} {} — keeping rendezvous warm",
+                short_node(&dst_node),
+                stream_id,
+                short_node(&relay),
+                short_path(route.circuit.relay_path()),
+                target
+                    .rendezvous_node
+                    .map(|r| short_node(&r))
+                    .unwrap_or_else(|| "-".to_string()),
+                short_path(target.circuit.relay_path()),
+                stats.snapshot(),
+            ),
+        );
+        self.ensure_outbound_opening(dst_node, RouteClass::Bulk).await;
+    }
+
     async fn mark_route_send_failed(
         &self,
         dst_node: [u8; 32],
@@ -2332,6 +2635,21 @@ impl CircuitCells {
         }
     }
 
+    /// Startup/pre-transfer warm: kick the background outbound-pool open
+    /// toward `dst_node` without sending anything. A freshly-restarted node's
+    /// first serve/pull otherwise pays the full cold-pool price inside the
+    /// peer's 25 s manifest window (attempt 1 dies, attempt 2 rides the pool
+    /// the failure opened). Idempotent and cheap: `ensure_outbound_opening`
+    /// debounces concurrent opens and the open task itself tops up an
+    /// already-full pool as a no-op.
+    async fn warm_outbound(&self, dst_node: [u8; 32]) {
+        if self.mode != CircuitMode::PublishedRendezvous {
+            return;
+        }
+        self.ensure_outbound_opening(dst_node, RouteClass::Bulk)
+            .await;
+    }
+
     async fn ensure_outbound_opening(&self, dst_node: [u8; 32], route_class: RouteClass) {
         let now = Instant::now();
         {
@@ -2353,6 +2671,7 @@ impl CircuitCells {
         let epoch = Arc::clone(&self.epoch);
         let in_tx = self.in_tx.clone();
         let activity = Arc::clone(&self.activity);
+        let inbound_activity = Arc::clone(&self.inbound_activity);
         let outbound_circuits = Arc::clone(&self.outbound_circuits);
         let outbound_opening = Arc::clone(&self.outbound_opening);
         let peer_tags = Arc::clone(&self.peer_tags);
@@ -2369,6 +2688,7 @@ impl CircuitCells {
                 epoch,
                 in_tx,
                 activity,
+                inbound_activity,
                 outbound_circuits,
                 peer_tags,
                 outbound_peer_tags,
@@ -2416,6 +2736,7 @@ impl CircuitCells {
                 Arc::clone(&self.epoch),
                 self.in_tx.clone(),
                 Arc::clone(&self.activity),
+                Arc::clone(&self.inbound_activity),
                 Arc::clone(&self.outbound_circuits),
                 Arc::clone(&self.peer_tags),
                 Arc::clone(&self.outbound_peer_tags),
@@ -2533,6 +2854,9 @@ fn spawn_anon_feed(
 /// the first open/accept). Keeps the stream endpoint bound for its lifetime.
 pub struct AnonStreamHub {
     mux: Arc<StreamMux<HubCells>>,
+    /// Direct handle to the cell backend for out-of-band operations
+    /// (outbound-pool pre-warm) that must not ride the stream path.
+    cells: Arc<HubCells>,
     _sender: Arc<AppSender>,
 }
 
@@ -2788,9 +3112,11 @@ impl AnonStreamHub {
             rack_reo_floor_ms,
             ..Config::default()
         };
-        let mux = Arc::new(StreamMux::new(me, Arc::new(cells), in_rx, cfg));
+        let cells = Arc::new(cells);
+        let mux = Arc::new(StreamMux::new(me, Arc::clone(&cells), in_rx, cfg));
         AnonStreamHub {
             mux,
+            cells,
             _sender: sender,
         }
     }
@@ -2803,6 +3129,14 @@ impl AnonStreamHub {
     /// Accept the next inbound stream, or `None` if the transport closed.
     pub async fn accept(&self) -> Option<(OnionStream, Addr)> {
         self.mux.accept().await
+    }
+
+    /// Pre-warm the outbound circuit pool toward `dst_node` (no-op on the
+    /// datagram backend). See `CircuitCells::warm_outbound` for why.
+    pub async fn warm_outbound(&self, dst_node: [u8; 32]) {
+        if let HubCells::Circuit(c) = self.cells.as_ref() {
+            c.warm_outbound(dst_node).await;
+        }
     }
 }
 
@@ -2878,6 +3212,7 @@ fn try_open_circuit(
     )
     .min(outbound_pool_target);
     let activity = Arc::new(Mutex::new(Instant::now()));
+    let inbound_activity = Arc::new(Mutex::new(Instant::now()));
     let reg_kp = Arc::new(services.onion_stream_registration_keypair());
     let epoch = Arc::new(AtomicU64::new(0));
     diag_node(
@@ -2903,6 +3238,7 @@ fn try_open_circuit(
     let epoch_bg = Arc::clone(&epoch);
     let in_tx_bg = in_tx.clone();
     let activity_bg = Arc::clone(&activity);
+    let inbound_activity_bg = Arc::clone(&inbound_activity);
     let peer_tags_bg = Arc::clone(&peer_tags);
     tokio::spawn(async move {
         // The proactive open fires at hub creation — which, on the RECEIVER, is the
@@ -2915,6 +3251,12 @@ fn try_open_circuit(
         let mut backoff_ms = 1_500u64;
         let mut attempt = 0u32;
         let mut generation = 0u64;
+        // Consecutive short-pool early refreshes (see the unconfirmed-retry
+        // gate in the poll loop below). Doubles the required generation age
+        // per streak step so a relay that keeps failing confirmation can't
+        // make the receiver storm re-register cycles; reset to 0 the moment
+        // a cycle confirms its full relay set.
+        let mut early_refresh_streak = 0u32;
         loop {
             attempt += 1;
             let opened =
@@ -2947,6 +3289,7 @@ fn try_open_circuit(
                     recv_rx,
                     in_tx_bg.clone(),
                     Some(Arc::clone(&activity_bg)),
+                    Some(Arc::clone(&inbound_activity_bg)),
                     Arc::clone(&peer_tags_bg),
                     Some(candidate.confirmed_flag()),
                 );
@@ -3031,6 +3374,9 @@ fn try_open_circuit(
             let generation_opened_at = Instant::now();
             generation += 1;
             backoff_ms = 1_500;
+            if unconfirmed_relay_count == 0 {
+                early_refresh_streak = 0;
+            }
             let relay_suffix = if confirmed_relays.is_empty() {
                 String::new()
             } else {
@@ -3110,16 +3456,51 @@ fn try_open_circuit(
                 // A relay that failed confirmation outright (no ACK, no probe
                 // echo) has no live binding from this cycle; its previous
                 // binding survives at most the registry TTL while its ad stays
-                // published. Re-run the register cycle early — but still only
-                // when idle, so an in-flight transfer is never rotated.
-                if unconfirmed_relay_count > 0
-                    && generation_age >= CIRCUIT_UNCONFIRMED_RETRY_AFTER
-                    && idle_for >= CIRCUIT_UNCONFIRMED_RETRY_AFTER
+                // published. Re-run the register cycle early. Deliberately NOT
+                // gated on idle: a short pool is exactly what makes transfers
+                // crawl, and retrying transfers keep the circuit busy — an
+                // idle gate here was a livelock (pool sat at 1/3 for tens of
+                // minutes under load, device-observed 2026-07-06). Rotation is
+                // safe mid-transfer because the refresh cycle MERGES: still-
+                // live confirmed circuits stay in the slot and every feed
+                // lands in the same in_tx. Anti-storm: the required age
+                // doubles per consecutive early refresh (30s → 60s → 120s →
+                // 240s, capped by the 300s idle-refresh ceiling) and resets
+                // once a cycle confirms the full set.
+                let unconfirmed_retry_after = CIRCUIT_UNCONFIRMED_RETRY_AFTER
+                    .saturating_mul(1u32 << early_refresh_streak.min(4))
+                    .min(CIRCUIT_IDLE_REFRESH_AFTER);
+                if unconfirmed_relay_count > 0 && generation_age >= unconfirmed_retry_after {
+                    early_refresh_streak = early_refresh_streak.saturating_add(1);
+                    diag_node(
+                        &me,
+                        &format!(
+                            "{unconfirmed_relay_count} relay registration(s) unconfirmed — early refresh to re-register (streak {early_refresh_streak}, next after {}s)",
+                            unconfirmed_retry_after.as_secs()
+                        ),
+                    );
+                    break;
+                }
+                // Inbound starvation: we are actively sending stream cells
+                // (idle_for is fresh — and sends are what keep it fresh) yet
+                // NOTHING has been received hub-wide for the whole starvation
+                // window. The relay→us return legs are dead even though every
+                // registration is "confirmed", and the idle-refresh below can
+                // never fire because our own retries keep resetting idle_for
+                // (bench-reproduced 2026-07-06 after a long netem window; the
+                // live 14:00 incident needed manual client restarts for
+                // exactly this state). Rebuild + re-register the generation.
+                let inbound_idle = circuit_idle_for(&inbound_activity_bg);
+                if generation_age >= CIRCUIT_INBOUND_STARVATION_AFTER
+                    && inbound_idle >= CIRCUIT_INBOUND_STARVATION_AFTER
+                    && idle_for < CIRCUIT_INBOUND_STARVATION_SEND_RECENT
                 {
                     diag_node(
                         &me,
                         &format!(
-                            "{unconfirmed_relay_count} relay registration(s) unconfirmed — early refresh to re-register"
+                            "inbound starvation: sending (last send/recv {}s ago) but nothing received for {}s — rebuilding inbound circuits",
+                            idle_for.as_secs(),
+                            inbound_idle.as_secs()
                         ),
                     );
                     break;
@@ -3147,12 +3528,14 @@ fn try_open_circuit(
         epoch,
         in_tx,
         activity,
+        inbound_activity,
         inbound_circuits,
         outbound_circuits,
         stream_routes,
         next_outbound_route,
         route_cooldowns,
         first_hop_cooldowns,
+        bulk_shed_marks: Arc::new(Mutex::new(HashMap::new())),
         outbound_opening,
         data_pacer,
         outbound_pool_target,
@@ -3249,6 +3632,7 @@ async fn open_outbound_circuit(
     epoch: Arc<AtomicU64>,
     in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
     activity: Arc<Mutex<Instant>>,
+    inbound_activity: Arc<Mutex<Instant>>,
     outbound_circuits: Arc<tokio::sync::Mutex<OutboundCircuitPool>>,
     peer_tags: SharedPeerTags,
     outbound_peer_tags: SharedOutboundPeerTags,
@@ -3563,6 +3947,7 @@ async fn open_outbound_circuit(
             recv_rx,
             in_tx.clone(),
             Some(Arc::clone(&activity)),
+            Some(Arc::clone(&inbound_activity)),
             Arc::clone(&peer_tags),
             Some(candidate.confirmed_flag()),
         );
@@ -3727,6 +4112,7 @@ fn spawn_circuit_feed(
     mut recv_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
     activity: Option<Arc<Mutex<Instant>>>,
+    inbound_activity: Option<Arc<Mutex<Instant>>>,
     peer_tags: SharedPeerTags,
     confirmed: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
@@ -3741,6 +4127,12 @@ fn spawn_circuit_feed(
             }
             if let Some(activity) = activity.as_ref() {
                 mark_circuit_activity(activity);
+            }
+            // RECEIVE-only stamp for the inbound-starvation detector: sends
+            // also move `activity`, so it can't distinguish "network answers
+            // us" from "we keep shouting into a void".
+            if let Some(inbound) = inbound_activity.as_ref() {
+                mark_circuit_activity(inbound);
             }
             for framed in batch.drain(..) {
                 if veil_anonymity::circuit_data::is_probe_echo(&framed) {
