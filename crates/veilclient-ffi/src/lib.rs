@@ -598,6 +598,43 @@ pub unsafe extern "C" fn veil_anon_stream_accept(
     }
 }
 
+/// Pre-warm the anonymous-stream outbound circuit pool toward a peer.
+/// Fire-and-forget: kicks the background pool open (resolve ads + open +
+/// confirm) and returns immediately, so a freshly-restarted node's first
+/// serve/pull does not pay the cold-pool price inside the peer's manifest
+/// window. Idempotent; cheap when the pool is already up. Returns 0 on
+/// dispatch, -1 on error (NULL args / dead handle / hub bind failure).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_anon_stream_warm_peer(
+    handle: *mut VeilHandle,
+    dst_node_id: *const u8,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    if unsafe { guard::ffi_prelude(err_out, "veil_anon_stream_warm_peer") }.is_err() {
+        return -1;
+    }
+    null_check_with_default!(err_out, -1,
+        "handle" => handle,
+        "dst_node_id" => dst_node_id,
+    );
+    get_or_return!(handle_live, handle_table(), handle, err_out, -1, "VeilHandle");
+    let mut node = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(dst_node_id, node.as_mut_ptr(), 32);
+    }
+    let hub = match ensure_anon_hub(&handle_live.bundle, &handle_live.anon_hub) {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("anon stream warm: {e}")) };
+            return -1;
+        }
+    };
+    handle_live.bundle.runtime.spawn(async move {
+        hub.warm_outbound(node).await;
+    });
+    0
+}
+
 /// Read up to `cap` bytes. Returns the count (0 = clean EOF), or a negative
 /// error code (the stream was reset → the app should resume).
 #[unsafe(no_mangle)]
