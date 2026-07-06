@@ -158,6 +158,27 @@ pub fn is_heartbeat(payload: &[u8]) -> bool {
     payload == CIRCUIT_HEARTBEAT_MAGIC
 }
 
+/// Loopback splice-probe payload. A stream receiver whose `CircuitBuilt` ACK
+/// has not arrived sends `[own_cookie ‖ CIRCUIT_PROBE_MAGIC]` UP the candidate
+/// circuit; the terminus's ordinary stream splice forwards the MAGIC back DOWN
+/// whatever circuit the cookie is currently bound to. Receiving the echo on the
+/// candidate proves the cookie→circuit binding end-to-end — the relay binds the
+/// cookie BEFORE emitting the ACK, so a lost ACK regularly leaves a LIVE binding
+/// whose receiver would otherwise time out and blackhole it. Unlike the one-shot
+/// ACK, the probe is retryable, and it exercises the exact splice path senders
+/// will use. No relay-side changes: to the terminus this is a normal spliced
+/// cell.
+///
+/// MUST stay shorter than the 32-byte stream peer tag so a feed that does not
+/// expect probes drops the echo silently instead of parsing it as `[tag][cell]`.
+pub const CIRCUIT_PROBE_MAGIC: &[u8] = b"veil/probe-echo1";
+
+/// True if a return cell delivered up a receiver's own stream circuit is a
+/// loopback splice-probe echo (see [`CIRCUIT_PROBE_MAGIC`]).
+pub fn is_probe_echo(payload: &[u8]) -> bool {
+    payload == CIRCUIT_PROBE_MAGIC
+}
+
 /// Read the payload back out of a peeled fixed-size cell buffer.
 pub fn read_payload(buf: &[u8]) -> Option<Vec<u8>> {
     if buf.len() < LEN_PREFIX {
@@ -357,6 +378,23 @@ mod tests {
         // is_heartbeat() check.
         use crate::circuit_register::COOKIE_LEN;
         assert!(CIRCUIT_HEARTBEAT_MAGIC.len() < COOKIE_LEN);
+    }
+
+    #[test]
+    fn probe_magic_shape_invariants() {
+        use crate::circuit_register::COOKIE_LEN;
+        // The echo travels down the receiver's circuit like any spliced cell.
+        // Shorter than the 32-byte peer tag → a feed that does not expect
+        // probes drops it silently instead of parsing [tag][cell]; at least
+        // COOKIE_LEN so the terminus never reads it as a bare heartbeat, and
+        // distinct from the heartbeat magic outright.
+        assert!(CIRCUIT_PROBE_MAGIC.len() < 32);
+        // The full probe sent UP is [cookie ‖ magic]; its spliced echo is the
+        // bare magic. Neither may collide with the heartbeat handling.
+        assert!(CIRCUIT_PROBE_MAGIC.len() >= COOKIE_LEN);
+        assert!(!is_heartbeat(CIRCUIT_PROBE_MAGIC));
+        assert!(is_probe_echo(CIRCUIT_PROBE_MAGIC));
+        assert!(!is_probe_echo(b"introduce-bytes"));
     }
 
     #[test]
