@@ -6496,6 +6496,14 @@ impl DataCircuit {
         self.confirmed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The shared confirmed flag itself (the same cell the dispatcher sets on
+    /// the `CircuitBuilt` ACK). The stream layer hands it to the circuit's
+    /// return-cell feed so a loopback splice-probe echo can confirm the path
+    /// when the one-shot ACK was lost on a lossy WAN.
+    pub fn confirmed_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.confirmed)
+    }
+
     /// Allocate the next FORWARD seq (1, 2, 3, …); `None` once the 32-bit space
     /// is exhausted (never wrap — XOR keystream reuse).
     fn alloc_seq(&self) -> Option<u32> {

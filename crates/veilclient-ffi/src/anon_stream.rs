@@ -262,6 +262,19 @@ const CIRCUIT_REFRESH_POLL: Duration = Duration::from_secs(5);
 // the interval.
 const CIRCUIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const CIRCUIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+// Loopback splice-probe cadence inside the confirm window: give the ordinary
+// CircuitBuilt ACK a short head start, then probe repeatedly (each probe is an
+// independent end-to-end proof; WAN loss that eats the one-shot ACK rarely eats
+// every probe in the window too).
+const CIRCUIT_CONFIRM_PROBE_INITIAL_DELAY: Duration = Duration::from_millis(1_000);
+const CIRCUIT_CONFIRM_PROBE_INTERVAL: Duration = Duration::from_millis(1_500);
+// When some published relays failed confirmation (no ACK *and* no probe echo —
+// the registration really is absent at that relay), re-run the open/register
+// cycle after this much idle instead of waiting the full idle-refresh (300 s):
+// the relay's PREVIOUS binding for our cookie survives at most the 600 s
+// registry TTL, so a relay that keeps losing our CircuitBuild forward would
+// otherwise go dark for pullers that resolve its still-published ad.
+const CIRCUIT_UNCONFIRMED_RETRY_AFTER: Duration = Duration::from_secs(30);
 const STREAM_DATA_PACE_US_ENV: &str = "VEIL_ONION_STREAM_DATA_PACE_US";
 const CIRCUIT_DATA_PACE_US_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_DATA_PACE_US";
 const CIRCUIT_RECV_WINDOW_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_RECV_WINDOW";
@@ -2756,53 +2769,47 @@ fn try_open_circuit(
 
             let mut confirmed = Vec::with_capacity(opened.len());
             let mut confirmed_relays = Vec::with_capacity(opened.len());
+            let mut unconfirmed_relay_count = 0usize;
             for (relay, candidate, recv_rx) in opened {
-                // Circuit open is intentionally optimistic: it returns once
-                // CircuitBuild is queued. Do not publish the handle until R has
-                // accepted the cookie registration and CircuitBuilt came back.
-                if !confirm_circuit(&candidate).await {
-                    if let Some(relay) = relay {
-                        diag_node(
-                            &me,
-                            &format!(
-                                "inbound circuit confirmation timed out at R={} — keeping receive sink for grace",
-                                short_node(&relay)
-                            ),
-                        );
-                    }
-                    // The confirmation ACK can be lost after the rendezvous relay
-                    // has already accepted the cookie registration. If we close
-                    // the local stream sink immediately, that relay-side cookie
-                    // mapping becomes a blackhole until the next successful
-                    // refresh replaces it. Keep the receive half alive for the
-                    // normal retire grace; if the registration never landed, it
-                    // stays idle and is cleaned up later.
-                    spawn_circuit_feed(
-                        services_bg.clone(),
-                        recv_rx,
-                        in_tx_bg.clone(),
-                        Some(Arc::clone(&activity_bg)),
-                        Arc::clone(&peer_tags_bg),
-                    );
-                    retire_circuits_later(&services_bg, vec![Arc::new(candidate)]);
-                    continue;
-                }
-                if let Some(relay) = relay {
-                    services_bg.publish_stream_rendezvous_ad(relay, cookie);
-                }
-
                 // Inbound feed: legacy validation cells are `[sender_node 32][cell]`;
-                // published cells are `[peer_tag 32][intro?][cell]`.
-                // Start it before swapping so cells arriving immediately after the
-                // confirmation are already consumed from the bounded return queue.
+                // published cells are `[peer_tag 32][intro?][cell]`. Start it
+                // BEFORE confirmation: it consumes cells arriving right after
+                // the registration lands, and it recognises the loopback
+                // splice-probe echo that confirms the path when the one-shot
+                // CircuitBuilt ACK is lost (see confirm_circuit_with_probe).
                 spawn_circuit_feed(
                     services_bg.clone(),
                     recv_rx,
                     in_tx_bg.clone(),
                     Some(Arc::clone(&activity_bg)),
                     Arc::clone(&peer_tags_bg),
+                    Some(candidate.confirmed_flag()),
                 );
+                // Circuit open is intentionally optimistic: it returns once
+                // CircuitBuild is queued. Do not publish the handle until R has
+                // accepted the cookie registration and either CircuitBuilt or a
+                // loopback splice-probe echo came back.
+                if !confirm_circuit_with_probe(&services_bg, &candidate, &cookie).await {
+                    if let Some(relay) = relay {
+                        diag_node(
+                            &me,
+                            &format!(
+                                "inbound circuit confirmation timed out at R={} (no ACK, no probe echo) — keeping receive sink for grace",
+                                short_node(&relay)
+                            ),
+                        );
+                        unconfirmed_relay_count += 1;
+                    }
+                    // Even with probes, the registration can in principle be
+                    // live with every echo lost. Keep the receive half alive
+                    // for the normal retire grace so a late splice still lands;
+                    // if the registration never landed, it stays idle and is
+                    // cleaned up later.
+                    retire_circuits_later(&services_bg, vec![Arc::new(candidate)]);
+                    continue;
+                }
                 if let Some(relay) = relay {
+                    services_bg.publish_stream_rendezvous_ad(relay, cookie);
                     confirmed_relays.push(relay);
                 }
                 confirmed.push(Arc::new(candidate));
@@ -2934,6 +2941,23 @@ fn try_open_circuit(
                         );
                         break;
                     }
+                }
+                // A relay that failed confirmation outright (no ACK, no probe
+                // echo) has no live binding from this cycle; its previous
+                // binding survives at most the registry TTL while its ad stays
+                // published. Re-run the register cycle early — but still only
+                // when idle, so an in-flight transfer is never rotated.
+                if unconfirmed_relay_count > 0
+                    && generation_age >= CIRCUIT_UNCONFIRMED_RETRY_AFTER
+                    && idle_for >= CIRCUIT_UNCONFIRMED_RETRY_AFTER
+                {
+                    diag_node(
+                        &me,
+                        &format!(
+                            "{unconfirmed_relay_count} relay registration(s) unconfirmed — early refresh to re-register"
+                        ),
+                    );
+                    break;
                 }
                 if generation_age >= CIRCUIT_IDLE_REFRESH_AFTER
                     && idle_for >= CIRCUIT_IDLE_REFRESH_AFTER
@@ -3363,9 +3387,21 @@ async fn open_outbound_circuit(
             }
         };
 
-        if !confirm_circuit(&candidate).await {
+        // Start the return-cell feed immediately: it consumes early peer cells
+        // AND recognises the loopback splice-probe echo used below — the open
+        // above registered OUR cookie at this relay, so a probe up this
+        // candidate echoes back down it exactly as on the inbound side.
+        spawn_circuit_feed(
+            services.clone(),
+            recv_rx,
+            in_tx.clone(),
+            Some(Arc::clone(&activity)),
+            Arc::clone(&peer_tags),
+            Some(candidate.confirmed_flag()),
+        );
+        if !confirm_circuit_with_probe(&services, &candidate, &stream_cookie(&me)).await {
             last_err = format!(
-                "R={} confirmation timed out after {}ms",
+                "R={} confirmation timed out after {}ms (no ACK, no probe echo)",
                 short_node(&ad.rendezvous_node_id),
                 started.elapsed().as_millis()
             );
@@ -3375,18 +3411,9 @@ async fn open_outbound_circuit(
                 CIRCUIT_ROUTE_SEND_COOLDOWN,
             );
             diag_node(&me, &format!("outbound {last_err}"));
-            // As on the inbound side, timeout does not prove the rendezvous
-            // registration failed; it may only mean the CircuitBuilt ACK was lost
-            // on the return path. Keep a receive feed alive so any peer cells
-            // spliced to this just-registered cookie still reach the mux while a
-            // later retransmit/open picks a confirmed send path.
-            spawn_circuit_feed(
-                services.clone(),
-                recv_rx,
-                in_tx.clone(),
-                Some(Arc::clone(&activity)),
-                Arc::clone(&peer_tags),
-            );
+            // Even with probes the registration can be live with every echo
+            // lost; the feed above keeps receiving for the retire grace while
+            // a later open picks a confirmed send path.
             retire_circuits_later(&services, vec![Arc::new(candidate)]);
             continue;
         }
@@ -3403,13 +3430,6 @@ async fn open_outbound_circuit(
             );
             mark_first_hop_cooldown(&first_hop_cooldowns, first_hop, CIRCUIT_ROUTE_SEND_COOLDOWN);
             diag_node(&me, &format!("outbound {last_err}"));
-            spawn_circuit_feed(
-                services.clone(),
-                recv_rx,
-                in_tx.clone(),
-                Some(Arc::clone(&activity)),
-                Arc::clone(&peer_tags),
-            );
             retire_circuits_later(&services, vec![candidate]);
             continue;
         }
@@ -3424,13 +3444,6 @@ async fn open_outbound_circuit(
                 short_node(&first_hop)
             );
             diag_node(&me, &format!("outbound {last_err}"));
-            spawn_circuit_feed(
-                services.clone(),
-                recv_rx,
-                in_tx.clone(),
-                Some(Arc::clone(&activity)),
-                Arc::clone(&peer_tags),
-            );
             retire_circuits_later(&services, vec![candidate]);
             continue;
         }
@@ -3449,13 +3462,6 @@ async fn open_outbound_circuit(
             );
         }
 
-        spawn_circuit_feed(
-            services.clone(),
-            recv_rx,
-            in_tx.clone(),
-            Some(Arc::clone(&activity)),
-            Arc::clone(&peer_tags),
-        );
         opened_entries.push(CircuitEntry {
             circuit: Arc::clone(&candidate),
             rendezvous_node: ad.rendezvous_node_id,
@@ -3511,12 +3517,51 @@ async fn confirm_circuit(circuit: &veil_node_runtime::DataCircuit) -> bool {
     circuit.is_confirmed()
 }
 
+/// Like [`confirm_circuit`], but for a circuit that carries a cookie
+/// registration: while waiting for the `CircuitBuilt` ACK, periodically send a
+/// loopback splice probe `[own_cookie ‖ PROBE_MAGIC]` UP the candidate. The
+/// terminus binds the cookie BEFORE it emits the ACK, and the ACK is a single
+/// unacknowledged return frame — on a lossy WAN it is lost regularly while the
+/// binding is LIVE. Timing out on the flag alone then retires the only circuit
+/// the relay will splice to (the fresher registration epoch already displaced
+/// the previous binding), blackholing that relay until a later cycle
+/// re-confirms — device-observed as `origin_stream ok:0 missing:N` on the
+/// server plus pullers dying at `waiting manifest`. If the binding landed, the
+/// terminus splices the probe back DOWN this very circuit and the feed sets the
+/// same confirmed flag: a retryable, end-to-end proof over the exact splice
+/// path senders use, with no relay-side changes. No ACK *and* no echo within
+/// the window means the registration really is absent — retiring is correct.
+async fn confirm_circuit_with_probe(
+    services: &veil_node_runtime::NodeServices,
+    circuit: &veil_node_runtime::DataCircuit,
+    cookie: &[u8; COOKIE_LEN],
+) -> bool {
+    let started = tokio::time::Instant::now();
+    let confirm_deadline = started + CIRCUIT_CONFIRM_TIMEOUT;
+    let mut next_probe = started + CIRCUIT_CONFIRM_PROBE_INITIAL_DELAY;
+    let mut probe = Vec::with_capacity(
+        COOKIE_LEN + veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC.len(),
+    );
+    probe.extend_from_slice(cookie);
+    probe.extend_from_slice(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC);
+    while !circuit.is_confirmed() && tokio::time::Instant::now() < confirm_deadline {
+        if tokio::time::Instant::now() >= next_probe {
+            // QueueFull/NoRelays are fine — the next tick simply re-probes.
+            let _ = services.send_circuit_cell(circuit, &probe);
+            next_probe += CIRCUIT_CONFIRM_PROBE_INTERVAL;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    circuit.is_confirmed()
+}
+
 fn spawn_circuit_feed(
     services: veil_node_runtime::NodeServices,
     mut recv_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
     activity: Option<Arc<Mutex<Instant>>>,
     peer_tags: SharedPeerTags,
+    confirmed: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     tokio::spawn(async move {
         // Drain inbound bursts: the relay splice delivers many cells per
@@ -3531,6 +3576,15 @@ fn spawn_circuit_feed(
                 mark_circuit_activity(activity);
             }
             for framed in batch.drain(..) {
+                if veil_anonymity::circuit_data::is_probe_echo(&framed) {
+                    // Loopback splice-probe echo: the terminus binding is
+                    // proven live end-to-end — confirm the circuit and swallow
+                    // the cell (it carries no data).
+                    if let Some(flag) = confirmed.as_ref() {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
+                }
                 if framed.len() < CIRCUIT_PEER_TAG_LEN {
                     continue;
                 }
