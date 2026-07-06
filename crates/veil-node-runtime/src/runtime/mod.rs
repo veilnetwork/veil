@@ -7058,6 +7058,49 @@ impl NodeServices {
                 cached += 1;
             }
         }
+
+        // Mirror the MIDDLE-selector's candidate set so every relay
+        // `select_onion_relay_path_to` might pick as a middle has its RD warmed
+        // — not just R / pinned / cap-flag-advertised sessions. On a mobile
+        // node the per-relay `cache_stream_relay_directory` above (server-side
+        // `recursive_dht_get` with a direct-peer hint) is unreliable for a seed
+        // that is a middle-candidate but not yet a settled session, so
+        // `discover_relay_hops` kept finding < hop_count-1 fresh middles and
+        // the whole onion stream failed `middles_insufficient` / NoRelays even
+        // with all three seed sessions live (device-observed 2026-07-06). Warm
+        // the selector's exact candidate set (routing_table ∪ live_sessions)
+        // over WHATEVER session exists using the iterative Kademlia walk — the
+        // one that reliably resolves RD keys on the sparse pinned-seed net.
+        // Freshness-gated + capped ⇒ zero RPC once fresh (no extra radio
+        // wakeups). This is the same fix the mailbox FETCH reply-leg already
+        // applies (service_tasks.rs `warm_known_relay_directory`).
+        let selector_candidates: Vec<[u8; 32]> = {
+            let mut c: Vec<[u8; 32]> = self
+                .dht
+                .routing_table_contacts()
+                .into_iter()
+                .map(|contact| contact.node_id)
+                .collect();
+            {
+                let sessions = lock!(self.live_sessions);
+                c.extend(
+                    sessions
+                        .values()
+                        .filter(|i| i.state == crate::types::SessionState::Active)
+                        .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes())),
+                );
+            }
+            c.sort_unstable();
+            c.dedup();
+            c
+        };
+        cached += self
+            .warm_known_relay_directory(
+                &selector_candidates,
+                MAX_STREAM_RELAY_PREWARM,
+                std::time::Duration::from_secs(5),
+            )
+            .await;
         cached
     }
 
