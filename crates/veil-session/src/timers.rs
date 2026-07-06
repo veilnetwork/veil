@@ -24,13 +24,27 @@
 //! **Critical invariant** locked in by gate Test 5
 //! (`phase650b_idle_timeout_fires_during_awaiting_ack_when_peer_silent`
 //! commit `7a8237f`):
-//! `last_rx` must be advanced ONLY by `note_frame_received` (peer
-//! activity) or `note_swap` (transport handover); the runner's own
-//! rekey / keepalive / cover emission MUST NOT advance it, else
-//! a silently-disconnecting peer would leave the session hung
-//! forever. This struct's API enforces the invariant by exposing
-//! `last_rx` as a read-only accessor — only `note_frame_received`
-//! and `note_swap` are mutators.
+//! `last_rx` must be advanced ONLY by `note_rx_activity` /
+//! `note_frame_received` (peer activity) or `note_swap` (transport
+//! handover); the runner's own rekey / keepalive / cover emission MUST
+//! NOT advance it, else a silently-disconnecting peer would leave the
+//! session hung forever. This struct's API enforces the invariant by
+//! exposing `last_rx` as a read-only accessor — only those three are
+//! mutators.
+//!
+//! **Genuine-liveness gating.** `note_rx_activity` advances `last_rx`
+//! ONLY (any inbound frame, including keepalives, proves the line is not
+//! idle). `note_frame_received` additionally advances `last_genuine_rx`
+//! and is called ONLY for DATA-bearing frames — never for a received
+//! Keepalive / KeepaliveAck / Padding. This is load-bearing: the
+//! keepalive-probe teardown reaps on `last_genuine_rx` staleness, and a
+//! bulk-saturated-but-healthy session can have its KeepaliveAck queued
+//! behind data for minutes. If received keepalives advanced the genuine
+//! ticker, that teardown could not tell "peer sends only keepalives"
+//! (a real one-directional TX wedge) from "peer floods us with data but
+//! our ack is queued" (a healthy loaded session) — and it reaped the
+//! latter (observed live 2026-07-06: seed↔seed splice session reaped at
+//! `genuine_rx age 0ms`, collapsing every circuit on it).
 
 use std::time::Duration;
 use tokio::time::Instant;
@@ -166,9 +180,21 @@ impl SessionTimers {
         now.duration_since(self.last_genuine_rx)
     }
 
-    /// Mark a received-frame event. Resets BOTH `last_rx` and `last_genuine_rx`
-    /// to `now`; caller also resets the per-stall-event `stall_trigger_fired`
+    /// Mark ANY inbound-frame event (data OR keepalive/cover). Advances
+    /// `last_rx` only — the line is demonstrably not idle — but deliberately
+    /// NOT `last_genuine_rx`: a received keepalive is not proof the peer is
+    /// doing genuine work, and letting it advance the genuine ticker would
+    /// blind the keepalive-probe teardown to a one-directional TX wedge (see
+    /// the module doc). Caller resets the per-stall `stall_trigger_fired`
     /// flag since "peer is responsive again".
+    pub fn note_rx_activity(&mut self, now: Instant) {
+        self.last_rx = now;
+    }
+
+    /// Mark a GENUINE DATA-frame event (never a keepalive / cover frame).
+    /// Resets BOTH `last_rx` and `last_genuine_rx` — this is the only inbound
+    /// signal that resets the liveness ceiling and the keepalive-probe
+    /// teardown's staleness check.
     pub fn note_frame_received(&mut self, now: Instant) {
         self.last_rx = now;
         self.last_genuine_rx = now;
@@ -314,6 +340,31 @@ mod tests {
         assert_eq!(
             timers.genuine_rx_age(t0 + Duration::from_secs(9)),
             Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn note_rx_activity_advances_last_rx_but_not_genuine() {
+        // A received keepalive keeps the line non-idle (last_rx moves) but
+        // must NOT refresh the genuine ticker — else a keepalive-only wedge
+        // is indistinguishable from a live session.
+        let mut timers = SessionTimers::new(Duration::from_secs(10), Duration::from_secs(5));
+        let t0 = timers.last_genuine_rx();
+        timers.note_rx_activity(t0 + Duration::from_secs(4));
+        // last_rx advanced → not idle at +4s past a fresh window.
+        assert_eq!(timers.last_rx(), t0 + Duration::from_secs(4));
+        // genuine ticker did NOT advance → still ages from t0.
+        assert_eq!(
+            timers.genuine_rx_age(t0 + Duration::from_secs(6)),
+            Duration::from_secs(6)
+        );
+        // ...so the liveness ceiling (3×idle=15s) still trips on schedule
+        // even though keepalives keep arriving every 4s.
+        timers.note_rx_activity(t0 + Duration::from_secs(8));
+        timers.note_rx_activity(t0 + Duration::from_secs(12));
+        assert!(
+            timers.liveness_ceiling_elapsed(t0 + Duration::from_secs(15)),
+            "keepalive-only RX must not mask a genuinely wedged peer"
         );
     }
 

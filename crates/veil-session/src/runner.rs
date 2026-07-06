@@ -299,27 +299,40 @@ pub(crate) fn hot_standby_should_auto_fire(enabled: bool, reason: &str) -> bool 
 /// Per-episode warm-probe swap-attempt ceiling for the M5 re-eval teardown.
 pub(crate) const KEEPALIVE_SWAP_ATTEMPT_CEILING: u32 = 2;
 
-/// Unacked-probe age (as a multiple of `probe_timeout`) past which a FRESH
-/// genuine-RX no longer vetoes the re-eval reap. The dispatcher answers every
-/// inbound Keepalive with an immediate REALTIME KeepaliveAck over a reliable
-/// transport, so a probe ledger that stays unacked for this many whole
-/// windows *while genuine inbound keeps flowing* is proof of a
-/// one-directional TX wedge (our send direction black-holes, RX alive) — the
-/// half-dead state the plain `genuine_stale` gate was masking. 3 windows
-/// (90 s at the default 30 s interval) sits far above any legitimate
-/// ack-latency (TCP retransmit under loss is seconds, not minutes) so only a
-/// truly wedged TX trips it.
-pub(crate) const TX_WEDGE_PROBE_MULTIPLE: u32 = 3;
+/// Is this a pure liveness / cover frame that must NOT advance the
+/// genuine-RX ticker? Keepalive (both the Control and legacy Session
+/// variants), KeepaliveAck, and cover Padding carry no genuine work — a peer
+/// that can only send us these while our keepalive-probes go unacked is the
+/// one-directional TX-wedge the teardown must catch, whereas a peer flooding
+/// us with DATA is a healthy loaded session the teardown must spare. Every
+/// other frame family/type counts as genuine data.
+#[must_use]
+pub(crate) fn is_liveness_frame(family: u8, msg_type: u16) -> bool {
+    use veil_proto::family::{ControlMsg, FrameFamily, SessionMsg};
+    if family == FrameFamily::Control as u8 {
+        msg_type == ControlMsg::Keepalive as u16 || msg_type == ControlMsg::KeepaliveAck as u16
+    } else if family == FrameFamily::Session as u8 {
+        msg_type == SessionMsg::Keepalive as u16 || msg_type == SessionMsg::Padding as u16
+    } else {
+        false
+    }
+}
 
 /// Pure teardown decision for the re-evaluable keepalive-probe-timeout path.
-/// Reaps ONLY when the probe ledger is stale AND failover is exhausted (no
-/// warm probe OR the swap-attempt ceiling is hit) AND either (a) no genuine
-/// inbound arrived within the window — the peer-gone M5 zombie — or (b) the
-/// ledger has been unacked for [`TX_WEDGE_PROBE_MULTIPLE`] whole windows —
-/// the one-directional TX wedge where live inbound would otherwise mask a
-/// black-holed send direction forever. `probe_timeout == 0` short-circuits to
-/// false (keepalive-disabled sessions are never reaped). Inputs are only
-/// Durations + scalars: no `SessionRunner`, no clock, no I/O.
+/// Reaps ONLY when the probe ledger is stale AND no genuine inbound DATA
+/// arrived within the window AND failover is exhausted (no warm probe OR the
+/// swap-attempt ceiling is hit). `probe_timeout == 0` short-circuits to false
+/// (keepalive-disabled sessions are never reaped). Inputs are only Durations
+/// + scalars: no `SessionRunner`, no clock, no I/O.
+///
+/// `last_genuine_rx_age` is now gated on DATA frames only (see
+/// [`is_liveness_frame`] and timers.rs), so `genuine_stale` is a HONEST
+/// discriminator: it stays fresh under a bulk splice (healthy loaded session,
+/// never reap) and goes stale when the peer can only exchange keepalives
+/// (real one-directional wedge, reap + re-dial). A prior timer-based override
+/// that reaped regardless of genuine-RX was REMOVED — it fired on a live
+/// seed↔seed splice at `genuine_rx age 0ms` and collapsed every circuit on
+/// that session (the phone→desktop serve "window", 2026-07-06).
 #[must_use]
 pub(crate) fn should_reeval_teardown(
     probe_age: std::time::Duration,
@@ -334,9 +347,8 @@ pub(crate) fn should_reeval_teardown(
     }
     let probe_stale = probe_age >= probe_timeout;
     let genuine_stale = last_genuine_rx_age >= probe_timeout;
-    let tx_wedged = probe_age >= probe_timeout * TX_WEDGE_PROBE_MULTIPLE;
     let no_failover = !hot_standby_ok || swap_attempts >= ceiling;
-    probe_stale && (genuine_stale || tx_wedged) && no_failover
+    probe_stale && genuine_stale && no_failover
 }
 
 /// Session rekey trigger thresholds.
@@ -3164,7 +3176,7 @@ impl SessionRunner {
                                 self.logger.info(
                                     "session.keepalive.timeout_close",
                                     format!(
-                                        "peer_id={} — probe unacked {}ms, genuine_rx age {}ms, swap_attempts={} (ceiling {}); reaping zombie (tx-wedge if genuine fresh)",
+                                        "peer_id={} — probe unacked {}ms, genuine_rx (data) stale {}ms, swap_attempts={} (ceiling {}); reaping zombie",
                                         hex_short(&self.peer_id),
                                         probe_age.as_millis(),
                                         genuine_age.as_millis(),
@@ -3499,8 +3511,11 @@ impl SessionRunner {
                     }
                 }
             }
-            // Update last_rx after successfully reading the first byte of a frame.
-            timers.note_frame_received(tokio::time::Instant::now());
+            // Any inbound frame (data OR keepalive) proves the line is not
+            // idle → advance last_rx. The GENUINE-liveness ticker is advanced
+            // separately, only for DATA frames, once the header is decoded
+            // below (see `is_liveness_frame`).
+            timers.note_rx_activity(tokio::time::Instant::now());
             // stage (c.2): peer is responsive again, so a
             // future stall can re-fire the trigger.
             stall_trigger.clear();
@@ -3528,6 +3543,18 @@ impl SessionRunner {
                     break;
                 }
             };
+
+            // Genuine-liveness gate: a DATA-bearing frame (anything that is
+            // NOT a keepalive / keepalive-ack / cover-padding) resets the
+            // genuine-RX ticker the keepalive-probe teardown reaps on. A
+            // received keepalive must NOT — otherwise a peer that can only
+            // send us keepalives (our TX to it is wedged) looks identical to
+            // a peer flooding us with data, and the teardown either never
+            // fires or (with a timer band-aid) fires on the healthy loaded
+            // session. See timers.rs module doc.
+            if !is_liveness_frame(header.family, header.msg_type) {
+                timers.note_frame_received(tokio::time::Instant::now());
+            }
 
             // ── Read body ────────────────────────────────────────────────────
             // Safety: `decode_header` already rejected body_len > MAX_FRAME_BODY
@@ -4301,48 +4328,39 @@ mod reeval_teardown_tests {
         ));
     }
 
-    /// (g) One-directional TX wedge: genuine RX perfectly fresh (peer keeps
-    /// sending) but our keepalives have gone unacked for
-    /// TX_WEDGE_PROBE_MULTIPLE whole windows → fresh RX must NOT veto the
-    /// reap.
+    /// (g) THE regression guard: a bulk-saturated healthy session — genuine
+    /// DATA arriving right now (age 0) so `last_genuine_rx` is fresh — must
+    /// NEVER be reaped, no matter how far behind its keepalive-ACK falls
+    /// (probe unacked for many windows because the ACK is queued behind
+    /// data). This is the live 2026-07-06 false-positive: a seed↔seed splice
+    /// session reaped at `genuine_rx age 0ms`, collapsing every circuit on
+    /// it. Data-gated genuine-RX + no timer override ⇒ no reap.
     #[test]
-    fn tx_wedge_reaps_despite_fresh_genuine_rx() {
+    fn loaded_session_fresh_data_rx_never_reaped() {
+        assert!(!should_reeval_teardown(
+            TIMEOUT * 10, // probe unacked for 10 windows — ack queued behind bulk
+            TIMEOUT,
+            CEILING,
+            CEILING,
+            Duration::ZERO, // genuine DATA flowing NOW
+            false,
+        ));
+    }
+
+    /// (h) One-directional TX wedge: the peer can only send us keepalives
+    /// (which no longer advance the genuine ticker), so `last_genuine_rx`
+    /// goes stale after one window even while `last_rx` stays fresh. With
+    /// failover exhausted the session is reaped + re-dialed — task-1 wedge
+    /// detection preserved WITHOUT the timer band-aid.
+    #[test]
+    fn keepalive_only_wedge_reaps_via_genuine_stale() {
         assert!(should_reeval_teardown(
-            TIMEOUT * TX_WEDGE_PROBE_MULTIPLE,
+            TIMEOUT, // probe stale (one window)
             TIMEOUT,
             CEILING,
             CEILING,
-            Duration::ZERO, // genuine RX fresh — inbound alive
+            TIMEOUT, // genuine DATA stale — peer sends only keepalives
             false,
-        ));
-    }
-
-    /// (h) Below the wedge multiple the fresh-RX veto still holds — a probe
-    /// stale for only 2 windows with live inbound is NOT yet proof of a
-    /// wedge (ack may be riding a loss-retransmit).
-    #[test]
-    fn tx_wedge_below_multiple_fresh_rx_still_protects() {
-        assert!(!should_reeval_teardown(
-            TIMEOUT * (TX_WEDGE_PROBE_MULTIPLE - 1),
-            TIMEOUT,
-            CEILING,
-            CEILING,
-            Duration::ZERO,
-            false,
-        ));
-    }
-
-    /// (i) TX wedge with failover still available (hot-standby swaps below
-    /// ceiling) → no reap; the swap path gets its chance first.
-    #[test]
-    fn tx_wedge_with_failover_no_teardown() {
-        assert!(!should_reeval_teardown(
-            TIMEOUT * TX_WEDGE_PROBE_MULTIPLE,
-            TIMEOUT,
-            1, // swap_attempts < ceiling
-            CEILING,
-            Duration::ZERO,
-            true, // hot_standby_ok
         ));
     }
 }
