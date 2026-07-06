@@ -133,11 +133,6 @@ impl NodeRuntime {
         let dispatcher_for_gossip = Arc::clone(&self.dispatcher);
         let dht_for_tick = Arc::clone(&self.dht);
         let session_tx_registry_for_tick = Arc::clone(&self.session_tx_registry);
-        // Components for the proactive relay-directory prefetch below (so the
-        // onion-service circuit build finds its hop keys in get_local instead of
-        // failing-and-retrying every 150 s until they passively replicate).
-        let pending_recursive_for_onion = Arc::clone(&self.dispatcher.pending_recursive);
-        let local_node_id_for_onion = self.dispatcher.local_node_id;
         // Whole-services handle so the tick can rebuild hosted onion-service
         // circuits before their TTL lapses (no-op unless this node registered an
         // onion service via `register_onion_circuit`).
@@ -326,38 +321,62 @@ impl NodeRuntime {
                         // skips relays already cached; only the connected set.
                         {
                             use veil_anonymity::directory::{
-                                decode_entry, relay_directory_dht_key, verify_entry,
+                                DEFAULT_FRESHNESS_WINDOW_SECS, decode_entry, discover_relay_hops,
+                                relay_directory_dht_key, verify_entry,
                             };
-                            let relays: Vec<[u8; 32]> = session_tx_registry_for_tick
+                            // Mirror the onion middle-selector's FULL candidate set
+                            // (connected sessions ∪ routing table): every relay a
+                            // stream / reply / service circuit might pick as a hop.
+                            let mut relays: Vec<[u8; 32]> = session_tx_registry_for_tick
                                 .read()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .peer_ids();
+                            relays.extend(
+                                dht_for_publish
+                                    .routing_table_contacts()
+                                    .into_iter()
+                                    .map(|c| c.node_id),
+                            );
+                            relays.sort_unstable();
+                            relays.dedup();
+                            let now_unix = veil_util::unix_secs_now_u64();
+                            let outbox: Arc<dyn veil_dht::FrameRouter> =
+                                Arc::clone(&session_outbox_for_remint)
+                                    as Arc<dyn veil_dht::FrameRouter>;
                             for relay in relays {
                                 let key = relay_directory_dht_key(&relay);
-                                if dht_for_publish.get_local(&key).is_some() {
+                                // FRESHNESS-gated (not a bare `is_some`): a present-but-
+                                // stale entry is filtered out by every circuit-building
+                                // consumer (`discover_relay_hops`), so it must be
+                                // re-fetched, not treated as a hit.
+                                let fresh = !discover_relay_hops(
+                                    std::slice::from_ref(&relay),
+                                    |n| dht_for_publish.get_local(&relay_directory_dht_key(n)),
+                                    now_unix,
+                                    DEFAULT_FRESHNESS_WINDOW_SECS,
+                                )
+                                .is_empty();
+                                if fresh {
                                     continue;
                                 }
-                                if let Some(bytes) = crate::mlkem_resolver::recursive_dht_get(
-                                    &dht_for_publish,
-                                    &session_tx_registry_for_tick,
-                                    &pending_recursive_for_onion,
-                                    local_node_id_for_onion,
-                                    key,
-                                    std::time::Duration::from_millis(3500),
-                                    Some(relay), // connected-peer fast path
-                                    move |b| {
-                                        matches!(
-                                            decode_entry(b),
-                                            Ok(e) if e.node_id == relay
-                                                && verify_entry(&e).is_ok()
-                                        )
-                                    },
-                                )
-                                .await
+                                // Use the ITERATIVE Kademlia walk, NOT the direct-peer
+                                // `recursive_dht_get` used here before: on the sparse
+                                // pinned-seed net the direct-peer recursion resolved RD
+                                // keys only intermittently, so the client sat at
+                                // r_directory_missing / NoRelays and could not build an
+                                // onion STREAM circuit even with all seed sessions live
+                                // (device-observed 2026-07-07). The iterative lookup is
+                                // the one that reliably resolves RD keys there; running
+                                // it every tick retries until the walk succeeds, then the
+                                // entry is cached for the freshness window. Freshness-
+                                // gated ⇒ zero RPC once fresh.
+                                if let Some(bytes) = dht_for_publish
+                                    .find_value_iterative_network(key, Arc::clone(&outbox))
+                                    .await
                                 {
-                                    // Re-verify the REMOTE response before caching
-                                    // (recursive_dht_get gates is_valid only on the
-                                    // local fast path, not the fetched bytes).
+                                    // Re-verify the REMOTE response before caching (the
+                                    // RD key is well-known; a peer could serve another
+                                    // node's entry under it to steer our hop choice).
                                     if matches!(
                                         decode_entry(&bytes),
                                         Ok(e) if e.node_id == relay && verify_entry(&e).is_ok()
