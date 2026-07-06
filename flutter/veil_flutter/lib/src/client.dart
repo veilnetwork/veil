@@ -166,6 +166,25 @@ int _anonStreamOpenWorker(int handleAddr, Uint8List dstNode, Uint8List dstApp) {
   }
 }
 
+/// Off-isolate body of [VeilClient.warmAnonStreamPeer] — the native call is
+/// fire-and-forget but the first invocation may lazily bind the stream hub,
+/// so keep it off the UI isolate like the other anon-stream entry points.
+void _anonStreamWarmPeerWorker(int handleAddr, Uint8List dstNode) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final dn = calloc<Uint8>(32)..asTypedList(32).setAll(0, dstNode);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final rc = ffi.veilAnonStreamWarmPeer(handle, dn, errOut);
+    if (rc != 0) {
+      throw VeilException(
+          'anon stream warm failed: ${_readErrAndFree(errOut)}');
+    }
+  } finally {
+    calloc.free(dn);
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate body of [VeilClient.acceptAnonStream]. Null on timeout; throws on
 /// a fatal error; else the stream address + the initiator's node id + onion-
 /// stream app id.
@@ -631,6 +650,20 @@ class VeilClient implements Finalizable {
         () => _anonStreamOpenWorker(handleAddr, dstNodeId, dstAppId));
     return VeilAnonStream.fromFfi(
         Pointer<ffi.VeilAnonStreamFfi>.fromAddress(addr));
+  }
+
+  /// Pre-warm the anonymous-stream outbound circuit pool toward a peer.
+  /// Fire-and-forget on the native side (the pool opens in the background);
+  /// call it when a transfer to [dstNodeId] is likely soon (pending offer /
+  /// download resume) so the first stream attempt doesn't pay the cold-pool
+  /// price. Idempotent and cheap when the pool is already warm.
+  Future<void> warmAnonStreamPeer({required Uint8List dstNodeId}) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32) {
+      throw ArgumentError('dstNodeId must be 32 bytes');
+    }
+    final handleAddr = _handle.address;
+    await Isolate.run(() => _anonStreamWarmPeerWorker(handleAddr, dstNodeId));
   }
 
   /// Accept the next inbound anonymous stream, or null on [timeout] (a server
