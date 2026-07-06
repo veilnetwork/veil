@@ -360,7 +360,26 @@ const DEFAULT_CIRCUIT_DATA_PACE_US: u64 = 50;
 const MIN_DATA_PACE_US: u64 = 10;
 const MAX_DATA_PACE_US: u64 = 5_000;
 const DEFAULT_CIRCUIT_OUTBOUND_POOL: usize = 3;
-const DEFAULT_CIRCUIT_ACK_OUTBOUND_POOL: usize = 1;
+/// How many of the (shared) outbound pool entries pure-ACK cells may SELECT
+/// from. Historically 1 (ACKs pinned to pool entry #0 for a stable ACK clock),
+/// which made the return leg a single point of failure with no health signal:
+/// a pure ACK never RTOs, so a lossy/black-holed ACK chain is invisible to the
+/// receiver — the sender stalls (snd_una frozen), RTO-retransmits, the receiver
+/// re-ACKs into the same dead chain forever. Span the full pool so a cooled or
+/// dead entry #0 no longer silently drops every ACK.
+const DEFAULT_CIRCUIT_ACK_OUTBOUND_POOL: usize = 3;
+/// Total copies of each pure-ACK cell sent over DISTINCT rendezvous routes
+/// (1 = no redundancy). ACK cells are ~100 bytes vs 16 KiB DATA cells and are
+/// cumulative/idempotent, so duplicating them across two return chains costs
+/// <1% overhead while turning return-leg loss p into p² for the ACK clock.
+/// The engine ignores regressing cumulative ACKs and (with RACK, the circuit
+/// default) never enters recovery from duplicate-ACK counts, so extra copies
+/// are correctness-neutral. Same relays the stream already uses — no new
+/// anonymity exposure.
+const CIRCUIT_ACK_REDUNDANCY_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT_ACK_REDUNDANCY";
+const ANDROID_ACK_REDUNDANCY_PROP: &str = "debug.veil.onion_stream_ack_redundancy";
+const DEFAULT_CIRCUIT_ACK_REDUNDANCY: usize = 2;
+const MAX_CIRCUIT_ACK_REDUNDANCY: usize = 4;
 const DEFAULT_CIRCUIT_BULK_ROUTE_ACTIVE_LIMIT: usize = 2;
 const DEFAULT_CIRCUIT_INIT_CWND_MSS: usize = 64;
 const MAX_CIRCUIT_INIT_CWND_MSS: usize = 256;
@@ -552,6 +571,11 @@ struct CircuitCells {
     data_pacer: Arc<StreamDataPacer>,
     outbound_pool_target: usize,
     ack_outbound_pool_target: usize,
+    /// Total copies of each pure-ACK cell across distinct rendezvous routes
+    /// (see [`CIRCUIT_ACK_REDUNDANCY_ENV`]); 1 = single-copy classic.
+    ack_redundancy: usize,
+    /// Diagnostic counter of redundant ACK copies actually sent (sampled log).
+    ack_dup_sent: Arc<AtomicU64>,
     bulk_route_active_limit: usize,
     /// Max distinct routes one bulk stream's DATA runs stripe across (see
     /// [`CIRCUIT_STRIPE_ROUTES_ENV`]); 1 = single-route pinning.
@@ -983,6 +1007,15 @@ impl CellSender for CircuitCells {
             Some(Frame::Ack { .. }) => RouteClass::Ack,
             _ => RouteClass::Bulk,
         };
+        // Redundant return-path copies for pure ACKs (see `send_ack_copies`).
+        // Attempted on EVERY exit below — including no-route and stale-route,
+        // where the classic path silently drops the ACK with nothing to resend
+        // it: the copies are then the only thing keeping the ACK clock alive.
+        let ack_copies = if route_class == RouteClass::Ack {
+            self.ack_redundancy.saturating_sub(1)
+        } else {
+            0
+        };
         let handshake_stream_id = match decoded {
             Some(Frame::Syn { stream_id, .. } | Frame::SynAck { stream_id, .. }) => Some(stream_id),
             _ => None,
@@ -994,54 +1027,28 @@ impl CellSender for CircuitCells {
             .await?
         else {
             // Circuit not up yet — drop this cell; the ARQ/handshake RTO resends.
+            if ack_copies > 0 {
+                self.send_ack_copies(dst.node, None, &cell, ack_copies).await;
+            }
             return Ok(());
         };
         if self.route_session_stale(&route) {
             self.mark_route_stale(dst.node, &route).await;
             // Treat stale route exactly like a dropped cell. The stream engine
             // retransmits, while route selection/opening moves to a fresh path.
+            if ack_copies > 0 {
+                self.send_ack_copies(dst.node, route.rendezvous_node, &cell, ack_copies)
+                    .await;
+            }
             return Ok(());
         }
-        let cookie = stream_cookie(&dst.node);
-        let protected_intro_len =
-            matches!(route.envelope, CircuitEnvelope::ProtectedIntro { .. }) && is_handshake;
-        let mut env = Vec::with_capacity(
-            COOKIE_LEN
-                + CIRCUIT_PEER_TAG_LEN
-                + cell.len()
-                + if protected_intro_len {
-                    1 + CIRCUIT_INTRO_LEN
-                } else {
-                    0
-                },
-        );
-        env.extend_from_slice(&cookie);
-        match route.envelope {
-            CircuitEnvelope::LegacyClearSender { sender_node } => {
-                env.extend_from_slice(&sender_node);
-            }
-            CircuitEnvelope::ProtectedIntro {
-                peer_tag,
-                receiver_x25519_pk,
-            } => {
-                env.extend_from_slice(&peer_tag);
-                if is_handshake {
-                    let intro = seal_stream_peer_intro(&self.me, &peer_tag, &receiver_x25519_pk)?;
-                    env.push(CIRCUIT_INTRO_MARKER);
-                    env.extend_from_slice(&intro);
-                }
-            }
-        }
-        env.extend_from_slice(&cell);
-        if env.len() > veil_onion_stream::wire::MAX_CELL {
-            return Err(io::Error::other(format!(
-                "circuit stream envelope too large: {} > {}",
-                env.len(),
-                veil_onion_stream::wire::MAX_CELL
-            )));
-        }
+        let env = self.stream_envelope(&dst.node, &route, &cell, is_handshake)?;
         if is_data {
             self.data_pacer.wait(dst.node).await;
+        }
+        if ack_copies > 0 {
+            self.send_ack_copies(dst.node, route.rendezvous_node, &cell, ack_copies)
+                .await;
         }
         if let Err(e) = self
             .services
@@ -1168,6 +1175,157 @@ impl CellSender for CircuitCells {
 }
 
 impl CircuitCells {
+    /// Build the on-wire circuit envelope for `cell` over `route`:
+    /// `[cookie][sender-or-peer-tag][optional sealed intro][cell]`.
+    fn stream_envelope(
+        &self,
+        dst_node: &[u8; 32],
+        route: &CircuitRoute,
+        cell: &[u8],
+        is_handshake: bool,
+    ) -> io::Result<Vec<u8>> {
+        let cookie = stream_cookie(dst_node);
+        let protected_intro_len =
+            matches!(route.envelope, CircuitEnvelope::ProtectedIntro { .. }) && is_handshake;
+        let mut env = Vec::with_capacity(
+            COOKIE_LEN
+                + CIRCUIT_PEER_TAG_LEN
+                + cell.len()
+                + if protected_intro_len {
+                    1 + CIRCUIT_INTRO_LEN
+                } else {
+                    0
+                },
+        );
+        env.extend_from_slice(&cookie);
+        match route.envelope {
+            CircuitEnvelope::LegacyClearSender { sender_node } => {
+                env.extend_from_slice(&sender_node);
+            }
+            CircuitEnvelope::ProtectedIntro {
+                peer_tag,
+                receiver_x25519_pk,
+            } => {
+                env.extend_from_slice(&peer_tag);
+                if is_handshake {
+                    let intro = seal_stream_peer_intro(&self.me, &peer_tag, &receiver_x25519_pk)?;
+                    env.push(CIRCUIT_INTRO_MARKER);
+                    env.extend_from_slice(&intro);
+                }
+            }
+        }
+        env.extend_from_slice(cell);
+        if env.len() > veil_onion_stream::wire::MAX_CELL {
+            return Err(io::Error::other(format!(
+                "circuit stream envelope too large: {} > {}",
+                env.len(),
+                veil_onion_stream::wire::MAX_CELL
+            )));
+        }
+        Ok(env)
+    }
+
+    /// Best-effort redundant copies of a pure-ACK cell over up to `max_extra`
+    /// pool routes whose rendezvous relay DIFFERS from the primary's (and from
+    /// each other's). A pure ACK is never retransmitted by ARQ — losing it on a
+    /// single sticky return chain freezes the sender's window with no feedback
+    /// signal anywhere. Copies are cumulative/idempotent, ~100 B each, and ride
+    /// relays the stream already uses. Never blocks the driver (`try_lock`,
+    /// like [`Self::stripe_alternates`]) and never surfaces errors: the primary
+    /// send path owns route-health bookkeeping.
+    async fn send_ack_copies(
+        &self,
+        dst_node: [u8; 32],
+        primary_relay: Option<[u8; 32]>,
+        cell: &[u8],
+        max_extra: usize,
+    ) {
+        if max_extra == 0 {
+            return;
+        }
+        let cooldown_now = Instant::now();
+        let cooled_relays = {
+            let cooldowns = self
+                .route_cooldowns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cooldowns.clone()
+        };
+        let cooled_first_hops = {
+            let cooldowns = self
+                .first_hop_cooldowns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cooldowns.clone()
+        };
+        let copies = {
+            let Ok(circuits) = self.outbound_circuits.try_lock() else {
+                return;
+            };
+            let Some(entries) = circuits.get(&dst_node) else {
+                return;
+            };
+            let mut used_relays: Vec<[u8; 32]> = primary_relay.into_iter().collect();
+            let mut copies = Vec::new();
+            for entry in entries {
+                if copies.len() >= max_extra {
+                    break;
+                }
+                if used_relays.contains(&entry.rendezvous_node) {
+                    continue;
+                }
+                let first_hop = entry.circuit.first_hop();
+                if cooled_relays
+                    .get(&entry.rendezvous_node)
+                    .is_some_and(|until| *until > cooldown_now)
+                    || cooled_first_hops
+                        .get(&first_hop)
+                        .is_some_and(|until| *until > cooldown_now)
+                {
+                    continue;
+                }
+                if !self.services.has_live_session(&first_hop) {
+                    continue;
+                }
+                let route = entry.route();
+                if self.route_session_stale(&route) {
+                    continue;
+                }
+                used_relays.push(entry.rendezvous_node);
+                copies.push(route);
+            }
+            copies
+        };
+        for alt in copies {
+            let Ok(env) = self.stream_envelope(&dst_node, &alt, cell, false) else {
+                continue;
+            };
+            if self
+                .services
+                .send_circuit_cell_detailed(&alt.circuit, &env)
+                .is_ok()
+            {
+                if let Some(stats) = alt.stats.as_ref() {
+                    let _ = stats.record_send(false, 0);
+                }
+                let sent = self.ack_dup_sent.fetch_add(1, Ordering::Relaxed);
+                if sent.is_multiple_of(512) {
+                    diag_node(
+                        &self.me,
+                        &format!(
+                            "redundant ACK copy #{} for {} via R={}",
+                            sent + 1,
+                            short_node(&dst_node),
+                            alt.rendezvous_node
+                                .map(|relay| short_node(&relay))
+                                .unwrap_or_else(|| "-".to_string()),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     /// Send a contiguous run of DATA cells for one stream over one resolved
     /// route: one route lookup, one staleness check, one pacer reservation and
     /// one activity/bookkeeping pass for the whole run. The per-cell scalar
@@ -2697,6 +2855,13 @@ fn try_open_circuit(
         MAX_CIRCUIT_OUTBOUND_POOL,
     )
     .min(outbound_pool_target);
+    let ack_redundancy = env_or_android_usize(
+        CIRCUIT_ACK_REDUNDANCY_ENV,
+        ANDROID_ACK_REDUNDANCY_PROP,
+        DEFAULT_CIRCUIT_ACK_REDUNDANCY,
+        1,
+        MAX_CIRCUIT_ACK_REDUNDANCY,
+    );
     let bulk_route_active_limit = env_or_android_usize(
         CIRCUIT_BULK_ROUTE_ACTIVE_LIMIT_ENV,
         ANDROID_BULK_ROUTE_ACTIVE_LIMIT_PROP,
@@ -2718,7 +2883,7 @@ fn try_open_circuit(
     diag_node(
         &me,
         &format!(
-            "circuit shared DATA pacer {}us outbound_pool={outbound_pool_target} ack_pool={ack_outbound_pool_target} bulk_route_active_limit={bulk_route_active_limit} stripe_routes={stripe_routes}",
+            "circuit shared DATA pacer {}us outbound_pool={outbound_pool_target} ack_pool={ack_outbound_pool_target} ack_redundancy={ack_redundancy} bulk_route_active_limit={bulk_route_active_limit} stripe_routes={stripe_routes}",
             data_pace_interval.as_micros(),
         ),
     );
@@ -2992,6 +3157,8 @@ fn try_open_circuit(
         data_pacer,
         outbound_pool_target,
         ack_outbound_pool_target,
+        ack_redundancy,
+        ack_dup_sent: Arc::new(AtomicU64::new(0)),
         bulk_route_active_limit,
         stripe_routes,
         stripe_rr: Arc::new(AtomicU64::new(0)),
