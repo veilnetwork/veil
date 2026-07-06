@@ -3407,6 +3407,28 @@ fn replicas_from_freshest_ads(
     mut ads: Vec<veil_anonymity::rendezvous::RendezvousAd>,
     cap: usize,
 ) -> Vec<veil_ipc::ResolvedReplica> {
+    // GENERATION gate (mirrors the live-introduce spread): the receiver
+    // re-signs all its plain ads together with one shared valid_from stamp
+    // (see tick_publish_rendezvous_ads), so the newest stamp identifies its
+    // CURRENT relay set. Depositing at a relay from an older generation puts
+    // the blob where the receiver may no longer be registered or drain —
+    // wasted (or lost, if every copy lands stale). Small skew tolerance for
+    // ads fetched from lagging replicas mid-republish.
+    const DEPOSIT_GENERATION_SKEW_SECS: u64 = 30;
+    if let Some(newest) = ads.iter().map(|a| a.valid_from_unix).max() {
+        let gated: Vec<_> = ads
+            .iter()
+            .filter(|a| {
+                a.valid_from_unix.saturating_add(DEPOSIT_GENERATION_SKEW_SECS) >= newest
+            })
+            .cloned()
+            .collect();
+        // Never gate down to nothing usable: an all-stale view (resolver hit
+        // only lagging replicas) still deposits somewhere rather than failing.
+        if !gated.is_empty() {
+            ads = gated;
+        }
+    }
     ads.sort_by(|a, b| {
         // Prefer an ad that carries a usable KEM key. A KEM-less ad (empty
         // `rendezvous_kem_pk`) can never be sealed to for offline delivery, so it
@@ -4134,8 +4156,10 @@ mod tests {
 
     #[test]
     fn rendezvous_replicas_prefer_freshest_before_relay_dedup() {
-        let stale_same_relay = test_rendezvous_ad(0xA1, 100, 1);
-        let fresh_other_relay = test_rendezvous_ad(0xB2, 200, 2);
+        // Same-generation stamps (within the deposit skew window): the same
+        // relay's freshest ad wins the dedup, the other relay stays.
+        let stale_same_relay = test_rendezvous_ad(0xA1, 280, 1);
+        let fresh_other_relay = test_rendezvous_ad(0xB2, 290, 2);
         let fresh_same_relay = test_rendezvous_ad(0xA1, 300, 3);
 
         let out = replicas_from_freshest_ads(
@@ -4148,7 +4172,30 @@ mod tests {
         assert_eq!(out[0].valid_until_unix, 300);
         assert_eq!(out[0].rendezvous_kem_pk, vec![3; 32]);
         assert_eq!(out[1].relay_node_id, [0xB2; 32]);
-        assert_eq!(out[1].valid_until_unix, 200);
+        assert_eq!(out[1].valid_until_unix, 290);
+    }
+
+    #[test]
+    fn rendezvous_replicas_gate_out_older_generations() {
+        // The receiver batch-stamps all its plain ads with one valid_from (see
+        // tick_publish_rendezvous_ads), so a much older stamp is a PREVIOUS
+        // relay set — depositing there wastes (or loses) the blob. The gate
+        // drops it, but never gates down to an empty result.
+        let old_generation = test_rendezvous_ad(0xA1, 100, 1);
+        let current = test_rendezvous_ad(0xB2, 300, 2);
+
+        let out = replicas_from_freshest_ads(
+            vec![old_generation.clone(), current],
+            8,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].relay_node_id, [0xB2; 32]);
+
+        // An all-stale view (resolver hit only lagging replicas) still
+        // deposits somewhere rather than failing.
+        let out = replicas_from_freshest_ads(vec![old_generation], 8);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].relay_node_id, [0xA1; 32]);
     }
 
     #[test]
@@ -4158,9 +4205,11 @@ mod tests {
         // KEM key, so a KEM-less winner means usable(KEM)=0 and delivery fails.
         let stale_kemless = veil_anonymity::rendezvous::RendezvousAd {
             rendezvous_kem_pk: Vec::new(), // no relay KEM key
-            ..test_rendezvous_ad(0xA1, 999, 0)
+            ..test_rendezvous_ad(0xA1, 120, 0)
         };
-        let fresh_kem = test_rendezvous_ad(0xB2, 100, 7); // earlier, but KEM-bearing
+        // Slightly earlier stamp, same generation (within the deposit skew
+        // window) — a KEM-bearing ad must still outrank the KEM-less one.
+        let fresh_kem = test_rendezvous_ad(0xB2, 100, 7);
 
         let out = replicas_from_freshest_ads(vec![stale_kemless, fresh_kem], 8);
 
