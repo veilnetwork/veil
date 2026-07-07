@@ -4381,8 +4381,17 @@ impl NodeServices {
             .unwrap_or(0);
         let outbox: Arc<dyn veil_dht::FrameRouter> =
             Arc::clone(&self.session_outbox) as Arc<dyn veil_dht::FrameRouter>;
+        // Peers we hold a live session with: for these we can ask the relay
+        // DIRECTLY for its own RD entry (one deterministic hop) instead of the
+        // XOR-converging iterative walk, which on the sparse pinned-seed net
+        // never queries the far-from-key holder → have:0 under live sessions.
+        let session_peers: std::collections::HashSet<[u8; 32]> =
+            outbox.peer_ids().into_iter().collect();
         let mut fetched = 0usize;
         let mut cached = 0usize;
+        let mut direct_ok = 0usize;
+        let mut walk_ok = 0usize;
+        let mut failed = 0usize;
         for relay in relays {
             if fetched >= max_fetch {
                 break;
@@ -4402,11 +4411,33 @@ impl NodeServices {
             }
             fetched += 1;
             let key = relay_directory_dht_key(relay);
-            let Some(bytes) = self
-                .dht
-                .find_value_iterative_network(key, Arc::clone(&outbox))
-                .await
-            else {
+            // DIRECT-FIRST for connected relays (deterministic single hop to the
+            // node that store_local's its OWN entry), then fall back to the
+            // iterative walk (routing-table-only relays, or a direct miss).
+            let mut from_direct = false;
+            let bytes = if session_peers.contains(relay) {
+                match self
+                    .dht
+                    .find_value_from_peer(*relay, key, Arc::clone(&outbox))
+                    .await
+                {
+                    Some(b) => {
+                        from_direct = true;
+                        Some(b)
+                    }
+                    None => {
+                        self.dht
+                            .find_value_iterative_network(key, Arc::clone(&outbox))
+                            .await
+                    }
+                }
+            } else {
+                self.dht
+                    .find_value_iterative_network(key, Arc::clone(&outbox))
+                    .await
+            };
+            let Some(bytes) = bytes else {
+                failed += 1;
                 continue;
             };
             // SECURITY: attacker-supplied until checked — the RD key is well-known,
@@ -4418,9 +4449,21 @@ impl NodeServices {
                 Ok(entry) if entry.node_id == *relay && verify_entry(&entry).is_ok() => {
                     self.dht.store_local(key, bytes);
                     cached += 1;
+                    if from_direct {
+                        direct_ok += 1;
+                    } else {
+                        walk_ok += 1;
+                    }
                 }
-                _ => {}
+                _ => failed += 1,
             }
+        }
+        if fetched > 0 {
+            log::info!(
+                "anonymity.relay_directory.warm_known fetched={fetched} cached={cached} direct={direct_ok} walk={walk_ok} failed={failed} session_peers={} relays={}",
+                session_peers.len(),
+                relays.len(),
+            );
         }
         cached
     }
@@ -6699,10 +6742,13 @@ impl NodeServices {
         // Resolve each hop's anonymity X25519 key from the local relay directory.
         let mut hops = Vec::with_capacity(relay_path.len());
         for nid in relay_path {
-            let bytes = self
-                .dht
-                .get_local(&relay_directory_dht_key(nid))
-                .ok_or(AnonOnionSendError::NoRelays)?;
+            let Some(bytes) = self.dht.get_local(&relay_directory_dht_key(nid)) else {
+                log::warn!(
+                    "open_data_circuit NoRelays: hop {} RD missing in get_local",
+                    veil_util::hex_short(nid),
+                );
+                return Err(AnonOnionSendError::NoRelays);
+            };
             let entry = decode_entry(&bytes).map_err(|_| AnonOnionSendError::NoRelays)?;
             hops.push(OriginHop {
                 node_id: *nid,

@@ -343,6 +343,13 @@ impl NodeRuntime {
                             let outbox: Arc<dyn veil_dht::FrameRouter> =
                                 Arc::clone(&session_outbox_for_remint)
                                     as Arc<dyn veil_dht::FrameRouter>;
+                            // Relays we hold a live session with: ask them DIRECTLY.
+                            let session_peers: std::collections::HashSet<[u8; 32]> =
+                                outbox.peer_ids().into_iter().collect();
+                            let mut kept = 0usize;
+                            let mut direct_ok = 0usize;
+                            let mut walk_ok = 0usize;
+                            let mut failed = 0usize;
                             for relay in relays {
                                 let key = relay_directory_dht_key(&relay);
                                 // FRESHNESS-gated (not a bare `is_some`): a present-but-
@@ -359,31 +366,68 @@ impl NodeRuntime {
                                 if fresh {
                                     continue;
                                 }
-                                // Use the ITERATIVE Kademlia walk, NOT the direct-peer
-                                // `recursive_dht_get` used here before: on the sparse
-                                // pinned-seed net the direct-peer recursion resolved RD
-                                // keys only intermittently, so the client sat at
-                                // r_directory_missing / NoRelays and could not build an
-                                // onion STREAM circuit even with all seed sessions live
-                                // (device-observed 2026-07-07). The iterative lookup is
-                                // the one that reliably resolves RD keys there; running
-                                // it every tick retries until the walk succeeds, then the
-                                // entry is cached for the freshness window. Freshness-
-                                // gated ⇒ zero RPC once fresh.
-                                if let Some(bytes) = dht_for_publish
-                                    .find_value_iterative_network(key, Arc::clone(&outbox))
-                                    .await
-                                {
-                                    // Re-verify the REMOTE response before caching (the
-                                    // RD key is well-known; a peer could serve another
-                                    // node's entry under it to steer our hop choice).
-                                    if matches!(
-                                        decode_entry(&bytes),
-                                        Ok(e) if e.node_id == relay && verify_entry(&e).is_ok()
-                                    ) {
-                                        dht_for_publish.store_local(key, bytes);
+                                kept += 1;
+                                // DIRECT-FIRST for connected relays: the RD entry is
+                                // store_local-only at its OWN relay (republished every
+                                // tick, never replicated to the key's K-closest), and
+                                // that relay is XOR-FAR from its own RD key — so the
+                                // iterative walk, which converges toward the key and
+                                // admits only strictly-closer contacts, can fail to ever
+                                // query the holder even over a live session (device-
+                                // observed have:0 under 3/3 seed sessions 2026-07-07).
+                                // A single-hop FIND_VALUE to that exact peer resolves
+                                // deterministically. Fall back to the iterative walk for
+                                // routing-table-only relays or a direct miss.
+                                let mut from_direct = false;
+                                let bytes = if session_peers.contains(&relay) {
+                                    match dht_for_publish
+                                        .find_value_from_peer(relay, key, Arc::clone(&outbox))
+                                        .await
+                                    {
+                                        Some(b) => {
+                                            from_direct = true;
+                                            Some(b)
+                                        }
+                                        None => {
+                                            dht_for_publish
+                                                .find_value_iterative_network(
+                                                    key,
+                                                    Arc::clone(&outbox),
+                                                )
+                                                .await
+                                        }
                                     }
+                                } else {
+                                    dht_for_publish
+                                        .find_value_iterative_network(key, Arc::clone(&outbox))
+                                        .await
+                                };
+                                let Some(bytes) = bytes else {
+                                    failed += 1;
+                                    continue;
+                                };
+                                // Re-verify the REMOTE response before caching (the
+                                // RD key is well-known; a peer could serve another
+                                // node's entry under it to steer our hop choice).
+                                if matches!(
+                                    decode_entry(&bytes),
+                                    Ok(e) if e.node_id == relay && verify_entry(&e).is_ok()
+                                ) {
+                                    dht_for_publish.store_local(key, bytes);
+                                    if from_direct {
+                                        direct_ok += 1;
+                                    } else {
+                                        walk_ok += 1;
+                                    }
+                                } else {
+                                    failed += 1;
                                 }
+                            }
+                            if kept > 0 {
+                                log::info!(
+                                    "anonymity.relay_directory.keeper_warm stale={kept} direct={direct_ok} walk={walk_ok} failed={failed} session_peers={}",
+                                    session_peers.len(),
+                                );
                             }
                         }
                         // Rebuild hosted onion-service circuits nearing their TTL.
