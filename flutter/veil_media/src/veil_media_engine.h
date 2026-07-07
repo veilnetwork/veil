@@ -31,6 +31,12 @@
 extern "C" {
 #endif
 
+// The engine object is compiled with WebRTC's flags, which include
+// -fvisibility=hidden. Force DEFAULT visibility on this whole control ABI so
+// the symbols are exported from libveil_media.dylib (Dart resolves them via
+// DynamicLibrary.process()).
+#pragma GCC visibility push(default)
+
 typedef struct VeilMediaEngine VeilMediaEngine;
 
 /* Result codes. 0 == OK; negatives are errors. */
@@ -93,6 +99,8 @@ void veil_media_free_string(char *s);
 
 /* ABI/build probe: returns a static version string (no free). */
 const char *veil_media_version(void);
+
+#pragma GCC visibility pop
 
 #ifdef __cplusplus
 } /* extern "C" */
