@@ -339,6 +339,10 @@ impl NodeRuntime {
                             );
                             relays.sort_unstable();
                             relays.dedup();
+                            // Never warm our own RD key (self can appear via the
+                            // session registry / routing table).
+                            let me_id = dht_for_publish.local_node_id();
+                            relays.retain(|n| *n != me_id);
                             let now_unix = veil_util::unix_secs_now_u64();
                             let outbox: Arc<dyn veil_dht::FrameRouter> =
                                 Arc::clone(&session_outbox_for_remint)
