@@ -178,12 +178,34 @@ impl OriginCircuitTable {
         }
     }
 
-    /// Record an originated circuit. Returns `false` if at capacity.
+    /// Record an originated circuit. Returns `false` only if at capacity AND no
+    /// disposable entry can be reclaimed.
+    ///
+    /// When full, evict the OLDEST ephemeral REPLY circuit to make room. Reply
+    /// circuits are one-shot (built fresh per mailbox-fetch drain); on the
+    /// reverse leg a drain that never gets its reply back retries and builds a
+    /// new reply circuit each time. At the 10-min TTL those accumulate to the
+    /// cap (256) and then EVERY origin-circuit build fails NoRelays — including
+    /// the persistent STREAM circuits that carry file transfers (device-observed
+    /// bursty `mailbox.fetch.reply_circuit_failed`). Persistent circuits
+    /// (stream / onion-service, `is_reply == false`) are NEVER evicted here, so
+    /// the disposable reply churn can't starve them; if the table is genuinely
+    /// full of persistent state, reject (the honest cap).
     pub fn insert(&self, circuit: Arc<OriginCircuit>) -> bool {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let key = (circuit.first_hop, circuit.origin_circuit_id);
         if !g.contains_key(&key) && g.len() >= self.cap {
-            return false;
+            let victim = g
+                .iter()
+                .filter(|(_, c)| c.is_reply)
+                .min_by_key(|(_, c)| c.created_unix)
+                .map(|(k, _)| *k);
+            match victim {
+                Some(k) => {
+                    g.remove(&k);
+                }
+                None => return false,
+            }
         }
         g.insert(key, circuit);
         true
@@ -215,6 +237,11 @@ impl OriginCircuitTable {
 
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Capacity cap (max concurrently-originated circuits).
+    pub fn cap(&self) -> usize {
+        self.cap
     }
 
     pub fn is_empty(&self) -> bool {

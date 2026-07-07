@@ -6638,10 +6638,13 @@ impl NodeServices {
         // Resolve each hop's anonymity X25519 key from the local directory.
         let mut hops = Vec::with_capacity(relay_path.len());
         for nid in relay_path {
-            let bytes = self
-                .dht
-                .get_local(&relay_directory_dht_key(nid))
-                .ok_or(AnonOnionSendError::NoRelays)?;
+            let Some(bytes) = self.dht.get_local(&relay_directory_dht_key(nid)) else {
+                log::warn!(
+                    "build_onion_circuit_once NoRelays: hop {} RD missing in get_local",
+                    veil_util::hex_short(nid),
+                );
+                return Err(AnonOnionSendError::NoRelays);
+            };
             let entry = decode_entry(&bytes).map_err(|_| AnonOnionSendError::NoRelays)?;
             hops.push(OriginHop {
                 node_id: *nid,
@@ -6687,8 +6690,13 @@ impl NodeServices {
         };
 
         // Build the origin circuit with the registration as terminus payload.
-        let (setup, mut origin) = build_origin_circuit(&hops, &reg.encode(), now)
-            .map_err(|_| AnonOnionSendError::NoRelays)?;
+        let (setup, mut origin) = match build_origin_circuit(&hops, &reg.encode(), now) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("build_onion_circuit_once NoRelays: build_origin_circuit failed: {e:?}");
+                return Err(AnonOnionSendError::NoRelays);
+            }
+        };
         origin.is_reply = is_reply;
         let first_hop = origin.first_hop;
         // Δ2-d: share the circuit's confirmation flag with the caller so the
@@ -6696,6 +6704,11 @@ impl NodeServices {
         // re-select a fresh path if it never did).
         let confirmed = std::sync::Arc::clone(&origin.confirmed);
         if !origin_table.insert(std::sync::Arc::new(origin)) {
+            log::warn!(
+                "build_onion_circuit_once NoRelays: origin_table FULL (cap {}, len {})",
+                origin_table.cap(),
+                origin_table.len(),
+            );
             return Err(AnonOnionSendError::NoRelays); // origin table full
         }
 
@@ -6708,6 +6721,10 @@ impl NodeServices {
             )
             .is_err()
         {
+            log::warn!(
+                "build_onion_circuit_once NoRelays: CircuitBuild send to first hop {} failed (no live session)",
+                veil_util::hex_short(&first_hop),
+            );
             return Err(AnonOnionSendError::NoRelays);
         }
         Ok(confirmed)
@@ -7516,6 +7533,38 @@ impl NodeServices {
                 // routing-table-sized n and not security-relevant to the draw.
                 let j = (OsRng.next_u64() % (i as u64 + 1)) as usize;
                 discovered.swap(i, j);
+            }
+        }
+        // The FIRST hop must be reachable over a LIVE session: we send its
+        // CircuitBuild frame directly to it (every later hop is reached via
+        // relay-chain forwarding, so those need no session of ours). A middle is
+        // admitted purely on RD freshness above, so the shuffle can put an
+        // RD-fresh-but-session-less relay at index 0 — the circuit then builds a
+        // valid path whose CircuitBuild send fails NoRelays at build time. This
+        // is the reply/reverse-leg's dominant failure (bursty
+        // reply_circuit_failed on the mailbox drain: RD present, no session to
+        // the picked first middle). The stream path masked it with a post-build
+        // has_live_session retire+retry; the reply path has none. Promote a
+        // session-backed discovered relay to index 0 (keeps the shuffle's
+        // randomness among the session-backed set). Selecting the first hop
+        // through a relay we already transport to is not an anonymity loss — the
+        // first hop always observes our origin session regardless.
+        {
+            let session_peers: std::collections::HashSet<[u8; 32]> = {
+                let sessions = lock!(self.live_sessions);
+                sessions
+                    .values()
+                    .filter(|i| i.state == crate::types::SessionState::Active)
+                    .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
+                    .collect()
+            };
+            if !discovered.is_empty() && !session_peers.contains(&discovered[0]) {
+                if let Some(pos) = discovered.iter().position(|n| session_peers.contains(n)) {
+                    discovered.swap(0, pos);
+                }
+                // else: no discovered middle is session-backed — the build's
+                // CircuitBuild send will fail NoRelays, the honest outcome (we
+                // hold no session to reach any usable first hop right now).
             }
         }
         let mids: Vec<[u8; 32]> = discovered.into_iter().take(hop_count - 1).collect();
