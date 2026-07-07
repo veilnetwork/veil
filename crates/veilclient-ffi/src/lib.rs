@@ -63,7 +63,7 @@
 #![cfg(unix)]
 
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -76,6 +76,11 @@ pub(crate) mod guard;
 // `node-embedded` cargo feature so the default client-only build stays slim.
 #[cfg(feature = "node-embedded")]
 mod anon_stream;
+// Lossy media-datagram side channel (calls: RTP/RTCP) over the anonymous
+// circuit. Rides the embedded node's circuit pool, so it shares anon_stream's
+// gating.
+#[cfg(feature = "node-embedded")]
+mod media;
 // Opt-in message-authorship signature FFI (needs veil-cfg to parse the caller's
 // identity TOML — enabled by node-embedded).
 #[cfg(feature = "node-embedded")]
@@ -633,6 +638,178 @@ pub unsafe extern "C" fn veil_anon_stream_warm_peer(
         hub.warm_outbound(node).await;
     });
     0
+}
+
+// ---------------------------------------------------------------------------
+// Media datagram channel (Phase 2 of calls): a lossy RTP/RTCP path over the
+// anonymous onion circuit. Per-packet flow is native↔native (a C++/ObjC++
+// `webrtc::Transport` shim calls `veil_media_send_datagram` and receives via
+// `veil_media_set_recv_callback`); Dart drives control only (open/close). See
+// `media.rs` for the wire magic + inbound registry and `veil_media_abi.h` for
+// the shared header.
+// ---------------------------------------------------------------------------
+
+/// One open media channel. Holds a BOUNDED outbound queue and the drain task
+/// that pumps it into the hub's lossy datagram send. Bounded because real-time
+/// media must drop rather than buffer when it outpaces the circuit.
+#[cfg(feature = "node-embedded")]
+struct MediaChannel {
+    tx: mpsc::Sender<Vec<u8>>,
+    peer: [u8; 32],
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Open media channels keyed by the opaque id handed to the host.
+#[cfg(feature = "node-embedded")]
+static MEDIA_CHANNELS: std::sync::LazyLock<
+    StdMutex<std::collections::HashMap<u64, MediaChannel>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashMap::new()));
+
+/// Monotonic channel-id source (never reuses 0, which the ABI reserves for
+/// "error / invalid").
+#[cfg(feature = "node-embedded")]
+static MEDIA_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Outbound queue depth per channel. At ~50 audio pkts/s (20 ms Opus) this is
+/// ~5 s of backlog before drop — far more than a real-time path should ever
+/// accumulate, so overflow means the circuit is genuinely wedged and dropping
+/// is correct.
+#[cfg(feature = "node-embedded")]
+const MEDIA_TX_QUEUE: usize = 256;
+
+/// Open a lossy MEDIA datagram channel to `peer` over the anonymous circuit
+/// (reuses the reliable stream's rendezvous/pool and warms the circuit in the
+/// background). Per-packet RTP/RTCP then flows native↔native via
+/// [`veil_media_send_datagram`] / [`veil_media_set_recv_callback`]. Returns an
+/// opaque channel id (> 0), or 0 on error.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_open_channel(
+    handle: *mut VeilHandle,
+    peer_node_id: *const u8,
+    err_out: *mut *mut c_char,
+) -> u64 {
+    if unsafe { guard::ffi_prelude(err_out, "veil_media_open_channel") }.is_err() {
+        return 0;
+    }
+    null_check_with_default!(err_out, 0u64,
+        "handle" => handle,
+        "peer_node_id" => peer_node_id,
+    );
+    get_or_return!(handle_live, handle_table(), handle, err_out, 0u64, "VeilHandle");
+    let mut peer = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), 32);
+    }
+    let hub = match ensure_anon_hub(&handle_live.bundle, &handle_live.anon_hub) {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("media open: {e}")) };
+            return 0;
+        }
+    };
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MEDIA_TX_QUEUE);
+    let send_hub = hub.clone();
+    // One drain task per channel: warm the circuit, then pump queued datagrams
+    // into the lossy send. `send_datagram` itself drops on QueueFull/no-route,
+    // so a wedged circuit degrades to silent loss, never to a stall.
+    let task = handle_live.bundle.runtime.spawn(async move {
+        send_hub.media_open_channel(peer).await;
+        while let Some(pkt) = rx.recv().await {
+            send_hub.media_send_datagram(peer, &pkt).await;
+        }
+    });
+    let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    MEDIA_CHANNELS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(id, MediaChannel { tx, peer, task });
+    id
+}
+
+/// Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING: returns 0 if
+/// queued, 1 if dropped (queue full / channel closing) — the caller's real-time
+/// media thread must never block. Returns -1 on a NULL/zero-length payload or an
+/// unknown `chan`.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_send_datagram(
+    chan: u64,
+    ptr: *const u8,
+    len: size_t,
+) -> c_int {
+    if chan == 0 || ptr.is_null() || len == 0 {
+        return -1;
+    }
+    let payload = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(ch) = map.get(&chan) else {
+        return -1;
+    };
+    match ch.tx.try_send(payload) {
+        Ok(()) => 0,
+        Err(mpsc::error::TrySendError::Full(_)) => 1,
+        Err(mpsc::error::TrySendError::Closed(_)) => -1,
+    }
+}
+
+/// Install the C recv callback invoked (native↔native, from a tokio worker)
+/// once per inbound media datagram from `chan`'s peer, with the wire magic
+/// already stripped. Replaces any prior callback; `cb == NULL` clears it.
+/// Returns 0, or -1 on an unknown `chan`.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_set_recv_callback(
+    chan: u64,
+    cb: Option<media::MediaRecvFn>,
+    ctx: *mut c_void,
+) -> c_int {
+    let peer = {
+        let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get(&chan) {
+            Some(ch) => ch.peer,
+            None => return -1,
+        }
+    };
+    match cb {
+        Some(cb) => media::set_recv_callback(peer, cb, ctx),
+        None => media::clear_recv_callback(peer),
+    }
+    0
+}
+
+/// Close a media channel: stops the drain task, drops the outbound queue, and
+/// clears the peer's recv callback. Idempotent (unknown `chan` is a no-op).
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_close_channel(chan: u64) {
+    let ch = MEDIA_CHANNELS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&chan);
+    if let Some(ch) = ch {
+        // Dropping `ch.tx` already closes the queue (the drain loop ends), but
+        // abort to reclaim the task promptly even if it is mid-await.
+        ch.task.abort();
+        media::clear_recv_callback(ch.peer);
+    }
+}
+
+/// Diagnostic: number of inbound media datagrams received from `peer_node_id`
+/// (32 bytes) since process start. Lets a host confirm receipt without wiring a
+/// cross-thread recv callback (used by the Phase 2 two-node datagram probe).
+/// Returns 0 on a NULL pointer.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_recv_count(peer_node_id: *const u8) -> u64 {
+    if peer_node_id.is_null() {
+        return 0;
+    }
+    let mut peer = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), 32);
+    }
+    media::recv_count(peer)
 }
 
 /// Read up to `cap` bytes. Returns the count (0 = clean EOF), or a negative

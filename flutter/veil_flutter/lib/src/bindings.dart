@@ -1372,6 +1372,46 @@ final int Function(
             )>>('veil_anon_stream_warm_peer')
     .asFunction();
 
+// ── Media datagram channel (calls: lossy RTP/RTCP over the anon circuit) ─────
+// Shares the anon-stream circuit pool but skips ARQ/pacing (drop-late, no
+// retransmit). Per-packet flow is native↔native in production; these bindings
+// drive control + a diagnostic recv counter for the Phase 2 two-node probe.
+// See veil_media_abi.h.
+
+// open_channel(handle, peer_node32*, err) -> chan id (u64; 0 on error).
+final int Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>,
+  Pointer<Pointer<Utf8>>,
+) veilMediaOpenChannel = nativeLib
+    .lookup<
+        NativeFunction<
+            Uint64 Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_media_open_channel')
+    .asFunction();
+
+// send_datagram(chan, ptr, len) -> 0 queued / 1 dropped / -1 invalid.
+final int Function(int, Pointer<Uint8>, int) veilMediaSendDatagram = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(Uint64, Pointer<Uint8>, IntPtr)>>(
+      'veil_media_send_datagram')
+    .asFunction();
+
+// close_channel(chan).
+final void Function(int) veilMediaCloseChannel = nativeLib
+    .lookup<NativeFunction<Void Function(Uint64)>>('veil_media_close_channel')
+    .asFunction();
+
+// recv_count(peer_node32*) -> inbound datagram count from that peer.
+final int Function(Pointer<Uint8>) veilMediaRecvCount = nativeLib
+    .lookup<
+        NativeFunction<Uint64 Function(Pointer<Uint8>)>>('veil_media_recv_count')
+    .asFunction();
+
 // accept(handle, timeout_ms, out_src_node32*, out_src_app32*, err) -> stream*
 // (NULL on timeout with no err, so the caller polls; NULL+err on fatal).
 final Pointer<VeilAnonStreamFfi> Function(
