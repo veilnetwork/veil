@@ -1,0 +1,37 @@
+name: veil_media
+description: >-
+  Real-time media engine (audio/video/screen) for veil calls. Drives a
+  codec-stripped libwebrtc (no ICE/STUN/TURN/SDP/PeerConnection/DTLS) via a
+  custom webrtc::Transport that pipes RTP/RTCP over the veil media datagram
+  channel (veilclient-ffi veil_media_* ABI). Per-packet media flows
+  native<->native; Dart drives control only.
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+# FFI plugin: no Dart platform-channel, just a native build per platform that
+# links the trimmed WebRTC + the veil_media C++ shim and re-exports the
+# veil_media_engine_* extern "C" ABI Dart binds to. veilclient-ffi (the
+# veil_media_* datagram ABI) is already linked into the host app, so the shim
+# resolves those symbols from the process (DynamicLibrary.process on Apple).
+flutter:
+  plugin:
+    platforms:
+      macos:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true
+      android:
+        ffiPlugin: true
