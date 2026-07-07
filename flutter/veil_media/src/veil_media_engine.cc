@@ -35,6 +35,8 @@
 #include "api/scoped_refptr.h"
 #include "api/task_queue/task_queue_base.h"
 #include "api/task_queue/task_queue_factory.h"
+#include "api/units/time_delta.h"
+#include "rtc_base/event.h"
 #include "call/audio_receive_stream.h"
 #include "call/audio_send_stream.h"
 #include "call/audio_state.h"
@@ -57,6 +59,23 @@ char* dup_cstr(const std::string& s) {
 }
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
+// Run `f` synchronously on `tq` and block until it finishes. webrtc::Call and
+// its streams must be created/destroyed on the worker task queue (they call
+// TaskQueueBase::Current(), which is null on the FFI caller thread → crash).
+template <typename F>
+void run_on(webrtc::TaskQueueBase* tq, F f) {
+  if (tq == nullptr || tq->IsCurrent()) {
+    f();
+    return;
+  }
+  webrtc::Event done;
+  tq->PostTask([&f, &done]() mutable {
+    f();
+    done.Set();
+  });
+  done.Wait(webrtc::TimeDelta::Seconds(10));
+}
+
 // SSRC from the first 4 bytes of a node id (never 0 — 0 is an invalid SSRC).
 uint32_t ssrc_of(const uint8_t id[32]) {
   uint32_t s = (uint32_t(id[0]) << 24) | (uint32_t(id[1]) << 16) |
@@ -164,31 +183,34 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
   const uint32_t local_ssrc = ssrc_of(engine->local);
   const uint32_t remote_ssrc = ssrc_of(engine->peer);
 
-  if (send && ws->send_stream == nullptr) {
-    webrtc::AudioSendStream::Config sc(ws->shim.get());  // sets send_transport
-    sc.rtp.ssrc = local_ssrc;
-    // TWCC: the send-side bandwidth estimator needs this both ways.
-    sc.rtp.extensions.emplace_back(
-        webrtc::RtpExtension::kTransportSequenceNumberUri,
-        webrtc::RtpHeaderExtensionId(1));
-    sc.encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
-    sc.send_codec_spec = webrtc::AudioSendStream::Config::SendCodecSpec(
-        kOpusPayloadType, webrtc::SdpAudioFormat("opus", 48000, 2));
-    ws->send_stream = ws->call->CreateAudioSendStream(sc);
-    if (ws->send_stream) ws->send_stream->Start();
-  }
-  if (recv && ws->recv_stream == nullptr) {
-    webrtc::AudioReceiveStreamInterface::Config rc;
-    rc.rtp.remote_ssrc = remote_ssrc;
-    rc.rtp.local_ssrc = local_ssrc;
-    rc.rtcp_send_transport = ws->shim.get();
-    rc.decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-    // SdpAudioFormat has no default ctor, so operator[] won't work — emplace.
-    rc.decoder_map.emplace(kOpusPayloadType,
-                           webrtc::SdpAudioFormat("opus", 48000, 2));
-    ws->recv_stream = ws->call->CreateAudioReceiveStream(rc);
-    if (ws->recv_stream) ws->recv_stream->Start();
-  }
+  // Streams must be created on the Call's worker queue.
+  run_on(ws->worker_tq.get(), [&]() {
+    if (send && ws->send_stream == nullptr) {
+      webrtc::AudioSendStream::Config sc(ws->shim.get());  // sets send_transport
+      sc.rtp.ssrc = local_ssrc;
+      // TWCC: the send-side bandwidth estimator needs this both ways.
+      sc.rtp.extensions.emplace_back(
+          webrtc::RtpExtension::kTransportSequenceNumberUri,
+          webrtc::RtpHeaderExtensionId(1));
+      sc.encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
+      sc.send_codec_spec = webrtc::AudioSendStream::Config::SendCodecSpec(
+          kOpusPayloadType, webrtc::SdpAudioFormat("opus", 48000, 2));
+      ws->send_stream = ws->call->CreateAudioSendStream(sc);
+      if (ws->send_stream) ws->send_stream->Start();
+    }
+    if (recv && ws->recv_stream == nullptr) {
+      webrtc::AudioReceiveStreamInterface::Config rc;
+      rc.rtp.remote_ssrc = remote_ssrc;
+      rc.rtp.local_ssrc = local_ssrc;
+      rc.rtcp_send_transport = ws->shim.get();
+      rc.decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
+      // SdpAudioFormat has no default ctor, so operator[] won't work — emplace.
+      rc.decoder_map.emplace(kOpusPayloadType,
+                             webrtc::SdpAudioFormat("opus", 48000, 2));
+      ws->recv_stream = ws->call->CreateAudioReceiveStream(rc);
+      if (ws->recv_stream) ws->recv_stream->Start();
+    }
+  });
   engine->audio_running.store(true);
   return VEIL_MEDIA_OK;
 #else
@@ -204,16 +226,18 @@ int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws && engine->ws->call) {
     WebrtcState* ws = engine->ws.get();
-    if (ws->send_stream) {
-      ws->send_stream->Stop();
-      ws->call->DestroyAudioSendStream(ws->send_stream);
-      ws->send_stream = nullptr;
-    }
-    if (ws->recv_stream) {
-      ws->recv_stream->Stop();
-      ws->call->DestroyAudioReceiveStream(ws->recv_stream);
-      ws->recv_stream = nullptr;
-    }
+    run_on(ws->worker_tq.get(), [&]() {
+      if (ws->send_stream) {
+        ws->send_stream->Stop();
+        ws->call->DestroyAudioSendStream(ws->send_stream);
+        ws->send_stream = nullptr;
+      }
+      if (ws->recv_stream) {
+        ws->recv_stream->Stop();
+        ws->call->DestroyAudioReceiveStream(ws->recv_stream);
+        ws->recv_stream = nullptr;
+      }
+    });
   }
 #endif
   return VEIL_MEDIA_OK;
