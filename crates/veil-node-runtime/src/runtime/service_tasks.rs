@@ -3566,6 +3566,30 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
         >,
     > {
         Box::pin(async move {
+            // Cold-boot / no-session gate: the reply-path warm below and
+            // `select_onion_relay_path` resolve relay directories OVER live
+            // sessions. On the FIRST drain tick right after arm — before any
+            // handshake completes — there are zero active sessions, so the warm
+            // is a no-op and select returns have:0, emitting a spurious
+            // `reply_path_failed` / `send_failed` WARN (device-observed: exactly
+            // one per cold boot, then the next tick succeeds once a session is
+            // up). Skip this round quietly and return NoRelays (NOT Ok, so the
+            // caller does not mark the relay drained) — the drain retries and,
+            // with a session up, the RD warms in one direct hop and the fetch
+            // lands.
+            {
+                let active = lock!(self.access.live_sessions)
+                    .values()
+                    .filter(|i| i.state == crate::types::SessionState::Active)
+                    .count();
+                if active == 0 {
+                    log::debug!(
+                        "mailbox.fetch skipped for {}: no active session yet (cold boot)",
+                        veil_util::hex_short(&target_node_id),
+                    );
+                    return Err(veil_types::AnonOnionSendError::NoRelays);
+                }
+            }
             // The FETCH's reply path builds an onion circuit, which needs the
             // connected relays' relay-directory entries (R terminus + middles)
             // fresh in the LOCAL store. Those cached entries expire between the
