@@ -29,9 +29,8 @@ dev_dependencies:
 flutter:
   plugin:
     platforms:
+      # macOS only for now — the libveil_media.dylib artifact + podspec exist for
+      # macOS (desktop). iOS/Android are added when their native builds are wired
+      # (declaring them here without build files breaks `flutter build ios/apk`).
       macos:
-        ffiPlugin: true
-      ios:
-        ffiPlugin: true
-      android:
         ffiPlugin: true
