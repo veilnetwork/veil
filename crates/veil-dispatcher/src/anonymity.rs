@@ -101,6 +101,14 @@ struct CircuitDataDiag {
     origin_stream_ok: u64,
     origin_stream_full: u64,
     origin_stream_missing: u64,
+    // A return cell that opened on one of OUR origin circuits but is NOT in
+    // `stream_recv` — i.e. a sealed introduce/reply (mailbox path), NOT a
+    // stream data cell. This is the EXPECTED path for reply circuits (built
+    // without a stream_recv sink); counting it as `origin_stream_missing`
+    // conflated normal mailbox traffic with a genuinely dropped stream sink
+    // and made `ok:0 missing:N` look like a stream failure when the node was
+    // only ever receiving introduce/reply cells.
+    origin_introduce: u64,
     unknown: u64,
     last_logged_rx: u64,
     last_log: Option<std::time::Instant>,
@@ -130,7 +138,7 @@ fn circuit_data_diag(update: impl FnOnce(&mut CircuitDataDiag)) {
         "onion-stream.circuit-data rx={} fwd_relay={}/{} fwd_terminus={} hb={} \
          splice_hit={} splice_miss={} splice_send={}/{} ret_relay={}/{} \
          send_err=missing:{} full:{} closed:{} \
-         origin_open={}/{} origin_stream=ok:{} full:{} missing:{} unknown={}",
+         origin_open={}/{} origin_stream=ok:{} full:{} missing:{} introduce:{} unknown={}",
         diag.rx,
         diag.fwd_relay_ok,
         diag.fwd_relay_fail,
@@ -150,6 +158,7 @@ fn circuit_data_diag(update: impl FnOnce(&mut CircuitDataDiag)) {
         diag.origin_stream_ok,
         diag.origin_stream_full,
         diag.origin_stream_missing,
+        diag.origin_introduce,
         diag.unknown,
     );
 }
@@ -1137,6 +1146,10 @@ impl FrameDispatcher {
                                 });
                             }
                             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                // TRUE stream failure: the sink WAS registered
+                                // for this circuit but its receiver (feed task)
+                                // has been dropped while the sender entry lingers
+                                // — a genuinely dead stream circuit.
                                 circuit_data_diag(|d| {
                                     d.origin_stream_missing =
                                         d.origin_stream_missing.saturating_add(1);
@@ -1145,8 +1158,13 @@ impl FrameDispatcher {
                         }
                         return DispatchResult::NoResponse;
                     }
+                    // NOT registered in `stream_recv`: this circuit is a reply/
+                    // introduce circuit (built without a stream sink), so the
+                    // opened bytes are a sealed introduce, not a stream data
+                    // cell. Count it separately — it is NOT a dropped stream
+                    // sink. (A genuinely closed stream sink is `Closed` above.)
                     circuit_data_diag(|d| {
-                        d.origin_stream_missing = d.origin_stream_missing.saturating_add(1);
+                        d.origin_introduce = d.origin_introduce.saturating_add(1);
                     });
                     // A return cell on OUR circuit: if this circuit is one of
                     // our ephemeral REPLY circuits, the payload is the peer
