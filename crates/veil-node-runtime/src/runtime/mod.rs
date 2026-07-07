@@ -7138,6 +7138,9 @@ impl NodeServices {
             }
             c.sort_unstable();
             c.dedup();
+            // Never warm our own RD key (self can appear via routing/sessions).
+            let me = self.dht.local_node_id();
+            c.retain(|n| *n != me);
             c
         };
         cached += self
@@ -7471,7 +7474,12 @@ impl NodeServices {
         }
         candidates.sort_unstable();
         candidates.dedup();
-        candidates.retain(|n| *n != r);
+        // Exclude R (the terminus, must differ from middles) and ourselves (our
+        // own node id can appear via routing table / a self session entry; we
+        // must never pick ourselves as a middle hop, and our RD key never
+        // resolves locally anyway).
+        let me = self.dht.local_node_id();
+        candidates.retain(|n| *n != r && *n != me);
         let dht = std::sync::Arc::clone(&self.dht);
         let mut discovered: Vec<[u8; 32]> = discover_relay_hops(
             &candidates,

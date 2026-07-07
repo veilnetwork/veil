@@ -1452,6 +1452,12 @@ impl KademliaService {
         key: [u8; 32],
         outbox: Arc<dyn FrameRouter>,
     ) -> Option<Vec<u8>> {
+        // Never query ourselves: our own node id can land in a warm candidate
+        // set (routing table ∪ sessions), and a FIND_VALUE to self only wastes
+        // an RPC and returns NODES (we don't publish our own RD key). Skip it.
+        if peer_id == self.local_node_id() {
+            return None;
+        }
         use crate::iterative::{FindValueResult, PeerQuerier};
         let timeout = Duration::from_millis(self.dht_config.find_node_timeout_ms);
         let querier = super::network_querier::NetworkPeerQuerier::with_cache(
