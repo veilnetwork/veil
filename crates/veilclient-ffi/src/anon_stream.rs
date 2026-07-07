@@ -4042,19 +4042,46 @@ async fn open_outbound_circuit(
         return Err(format!("open to receiver ad: {last_err}"));
     }
     let opened_count = opened_entries.len();
-    let retired = outbound_circuits
-        .lock()
-        .await
-        .insert(dst_node, opened_entries)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|entry| entry.circuit)
+    // MAKE-BEFORE-BREAK refill (device-verified churn root, 2026-07-07): this
+    // refill used to full-REPLACE the pool, retiring every prior circuit. Fired
+    // by the 5 s degraded-pool poll while the pool sits at 2/3 usable ads, it
+    // retired the very circuit an in-flight manifest fetch was waiting on — the
+    // puller timed out (8 s), retried, re-tripped the poll, and a fresh (often
+    // COLD, ~10 s full handshake) reopen churned every ~15 s. That kept
+    // desktop<->phone transfers stuck at 0% for ~70 s while a small file could
+    // slip between reopen cycles. Preserve prior circuits that carry a live
+    // stream (active_streams>0, the signal already trusted at the handshake
+    // teardown) or were just built (opened_at within the confirm window; unlike
+    // last_used, opened_at is not bumped by handshake retries, so a genuinely
+    // old dead route is still retired). Dedup against freshly-opened first-hops
+    // and cap the pool so it cannot grow unbounded.
+    let opened_first_hops: HashSet<[u8; 32]> = opened_entries
+        .iter()
+        .map(|entry| entry.circuit.first_hop())
         .collect();
+    let merge_now = Instant::now();
+    let mut pool = outbound_circuits.lock().await;
+    let prior = pool.remove(&dst_node).unwrap_or_default();
+    let mut retired: Vec<Arc<veil_node_runtime::DataCircuit>> = Vec::new();
+    let mut merged = opened_entries;
+    for entry in prior {
+        let busy = entry.stats.active_streams() > 0;
+        let fresh = merge_now.duration_since(entry.opened_at) < CIRCUIT_CONFIRM_TIMEOUT;
+        let dup = opened_first_hops.contains(&entry.circuit.first_hop());
+        if (busy || fresh) && !dup && merged.len() < MAX_CIRCUIT_OUTBOUND_POOL {
+            merged.push(entry);
+        } else {
+            retired.push(entry.circuit);
+        }
+    }
+    let kept_in_flight = merged.len().saturating_sub(opened_count);
+    pool.insert(dst_node, merged);
+    drop(pool);
     retire_circuits_later(&services, retired);
     diag_node(
         &me,
         &format!(
-            "outbound circuit pool ready for {} routes={opened_count}/{pool_target}",
+            "outbound circuit pool ready for {} routes={opened_count}/{pool_target} (kept {kept_in_flight} in-flight)",
             short_node(&dst_node),
         ),
     );
