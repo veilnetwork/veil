@@ -7,13 +7,14 @@ import 'native.dart';
 /// Opaque engine handle (VeilMediaEngine*).
 final class VeilMediaEngineHandle extends Opaque {}
 
-// create(veil_chan u64, peer_id u8[32]) -> engine*
-final Pointer<VeilMediaEngineHandle> Function(int, Pointer<Uint8>)
-    veilMediaEngineCreate = nativeLib
+// create(veil_chan u64, local_id u8[32], peer_id u8[32]) -> engine*
+final Pointer<VeilMediaEngineHandle> Function(
+        int, Pointer<Uint8>, Pointer<Uint8>) veilMediaEngineCreate =
+    nativeLib
         .lookup<
             NativeFunction<
-                Pointer<VeilMediaEngineHandle> Function(
-                    Uint64, Pointer<Uint8>)>>('veil_media_engine_create')
+                Pointer<VeilMediaEngineHandle> Function(Uint64, Pointer<Uint8>,
+                    Pointer<Uint8>)>>('veil_media_engine_create')
         .asFunction();
 
 // destroy(engine*)
