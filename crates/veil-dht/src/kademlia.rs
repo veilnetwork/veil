@@ -1429,6 +1429,58 @@ impl KademliaService {
             .await
     }
 
+    /// DIRECT single-hop FIND_VALUE to ONE specific peer (no walk).
+    ///
+    /// The iterative walk converges toward `key` and admits only contacts that
+    /// make strict XOR progress (`r_dist < peer_dist`). A relay-directory entry
+    /// is `store_local`-only at its OWN relay (republished every maintenance
+    /// tick, never replicated to the key's K-closest), and that relay is
+    /// XOR-FAR from its own RD key. On a sparse pinned-seed network the walk can
+    /// therefore fail to ever query the one node that holds the value even when
+    /// we hold a live session to it — device-observed as
+    /// `InsufficientRelayCandidates {have:0}` under 3/3 live seed sessions
+    /// (2026-07-07). Asking THAT peer directly is deterministic: it answers its
+    /// own key from `get_local` in one hop. Does NOT short-circuit on our own
+    /// local store — the caller warms precisely because the local copy is
+    /// absent or stale, and the peer's response is its current (fresh) entry.
+    ///
+    /// Like `find_value_iterative_network`, does NOT cache: the value is
+    /// attacker-supplied until the CALLER verifies it (signature + node-id bind).
+    pub async fn find_value_from_peer(
+        &self,
+        peer_id: [u8; 32],
+        key: [u8; 32],
+        outbox: Arc<dyn FrameRouter>,
+    ) -> Option<Vec<u8>> {
+        use crate::iterative::{FindValueResult, PeerQuerier};
+        let timeout = Duration::from_millis(self.dht_config.find_node_timeout_ms);
+        let querier = super::network_querier::NetworkPeerQuerier::with_cache(
+            Arc::clone(&outbox),
+            self.dht_config.k,
+            timeout,
+            Arc::clone(&self.transport_cache),
+            self.local_node_id(),
+        );
+        match querier.find_value(peer_id, key).await {
+            FindValueResult::Value(v) => {
+                log::info!(
+                    "dht.find_value_from_peer peer={} VALUE len={}",
+                    veil_util::hex_short(&peer_id),
+                    v.len()
+                );
+                Some(v)
+            }
+            FindValueResult::Nodes(n) => {
+                log::info!(
+                    "dht.find_value_from_peer peer={} NODES n={} (no value)",
+                    veil_util::hex_short(&peer_id),
+                    n.len()
+                );
+                None
+            }
+        }
+    }
+
     /// Iterative Kademlia FIND_NODE lookup using live OVL1 sessions.
     ///
     /// Seeds from the local routing table, then queries peers via

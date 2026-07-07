@@ -425,10 +425,22 @@ pub(crate) async fn warm_connected_relay_directory(
                 continue; // already known locally AND fresh
             }
         }
-        let Some(bytes) = dht
-            .find_value_iterative_network(key, Arc::clone(outbox))
-            .await
-        else {
+        // Every `peer` here is a CONNECTED session peer, so ask it DIRECTLY for
+        // its OWN relay-directory entry (deterministic single hop — it answers
+        // its own key from get_local) before falling back to the iterative walk.
+        // The walk converges toward the RD key and can fail to ever query the
+        // holder on the sparse pinned-seed net, where the RD entry lives ONLY at
+        // its relay (store_local, never replicated to the key's K-closest) and
+        // the relay is XOR-far from its own key — device-observed have:0 under
+        // 3/3 live seed sessions (2026-07-07).
+        let bytes = match dht.find_value_from_peer(peer, key, Arc::clone(outbox)).await {
+            Some(b) => Some(b),
+            None => {
+                dht.find_value_iterative_network(key, Arc::clone(outbox))
+                    .await
+            }
+        };
+        let Some(bytes) = bytes else {
             continue; // peer published nothing (not a relay) or unreachable
         };
         // SECURITY: the bytes are attacker-supplied until checked. Only cache an
