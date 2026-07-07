@@ -1,0 +1,97 @@
+/* SPDX-License-Identifier: MIT
+ *
+ * veil_media_engine.h — control ABI for the veil call media engine.
+ *
+ * The engine wraps a codec-stripped libwebrtc (webrtc::Call + AudioState, no
+ * ICE/PeerConnection) and drives it through a custom webrtc::Transport that
+ * pipes RTP/RTCP over the veil media datagram channel (see veil_media_abi.h in
+ * veilclient-ffi). Per-packet media never touches Dart; this ABI is CONTROL
+ * ONLY — create/start/stop, mute, device enumerate/select, stats.
+ *
+ * Threading: create/destroy and start/stop are expected on one control thread
+ * (the Dart FFI caller). The engine owns its own webrtc worker/network threads
+ * internally. Callbacks (none yet in this control ABI) would be marshalled by
+ * the caller.
+ *
+ * Lifetime: `veil_media_engine_create` returns an opaque handle; free it with
+ * `veil_media_engine_destroy`. The caller owns the veil media channel (opened
+ * via veil_media_open_channel) and passes its id in; the engine registers its
+ * recv callback on that channel and sends via it, but does NOT close it.
+ */
+
+#ifndef VEIL_MEDIA_ENGINE_H
+#define VEIL_MEDIA_ENGINE_H
+
+#pragma once
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct VeilMediaEngine VeilMediaEngine;
+
+/* Result codes. 0 == OK; negatives are errors. */
+#define VEIL_MEDIA_OK 0
+#define VEIL_MEDIA_ERR -1          /* generic failure */
+#define VEIL_MEDIA_ERR_ARG -2      /* bad argument (null handle, etc.) */
+#define VEIL_MEDIA_ERR_STATE -3    /* wrong state (e.g. audio already started) */
+#define VEIL_MEDIA_ERR_DEVICE -4   /* device enumerate/select failed */
+
+/*
+ * Create a media engine bound to an already-open veil media channel.
+ *   veil_chan   : channel id from veil_media_open_channel (RTP/RTCP transport).
+ *   peer_id     : 32-byte peer node id (diagnostics / future per-peer keying).
+ * The engine installs its inbound recv callback on `veil_chan` and sends
+ * outbound RTP/RTCP through it. Returns NULL on failure.
+ */
+VeilMediaEngine *veil_media_engine_create(uint64_t veil_chan,
+                                          const uint8_t *peer_id);
+
+/* Tear down: stops all streams, unregisters the recv callback, frees the
+ * engine. Does NOT close the veil media channel (caller owns it). */
+void veil_media_engine_destroy(VeilMediaEngine *engine);
+
+/* ---- Audio ---------------------------------------------------------------
+ * Start/stop a bidirectional (or one-way) Opus audio session. `send` mounts
+ * mic capture -> Opus encode -> RTP -> Transport; `recv` mounts RTP ->
+ * Opus/NetEQ -> speaker. Idempotent per direction. */
+int veil_media_engine_start_audio(VeilMediaEngine *engine, int send, int recv);
+int veil_media_engine_stop_audio(VeilMediaEngine *engine);
+
+/* Local mic mute (stop transmitting) / remote playout mute. */
+int veil_media_engine_set_mic_muted(VeilMediaEngine *engine, int muted);
+int veil_media_engine_set_speaker_muted(VeilMediaEngine *engine, int muted);
+
+/* ---- Device selection ----------------------------------------------------
+ * Enumerate returns a heap-allocated JSON C string
+ * [{"id":"...","label":"...","kind":"input|output"}], or NULL on failure.
+ * Free it with veil_media_free_string. Select by the opaque "id". Switchable
+ * mid-call. (iOS routes via AVAudioSession, not indices — the engine hides
+ * that behind the same API.) */
+char *veil_media_engine_list_audio_inputs(VeilMediaEngine *engine);
+char *veil_media_engine_list_audio_outputs(VeilMediaEngine *engine);
+int veil_media_engine_select_audio_input(VeilMediaEngine *engine,
+                                         const char *id);
+int veil_media_engine_select_audio_output(VeilMediaEngine *engine,
+                                          const char *id);
+
+/* ---- Stats ---------------------------------------------------------------
+ * Heap JSON snapshot {"tx_pkts","rx_pkts","tx_bytes","rx_bytes",
+ * "rtt_ms","jitter_ms","loss_pct","target_bitrate_bps",...} or NULL.
+ * Free with veil_media_free_string. */
+char *veil_media_engine_get_stats(VeilMediaEngine *engine);
+
+/* Free any char* returned by this ABI. */
+void veil_media_free_string(char *s);
+
+/* ABI/build probe: returns a static version string (no free). */
+const char *veil_media_version(void);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* VEIL_MEDIA_ENGINE_H */
