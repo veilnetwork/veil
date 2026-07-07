@@ -44,21 +44,25 @@ class VeilMediaEngine {
   bool _disposed = false;
 
   /// Create an engine over an already-open veil media channel [veilChan]
-  /// (from `VeilFlutterTransport.openMediaChannel`). [peerId] is the 32-byte
-  /// peer node id. Returns null if the native create failed.
+  /// (from `VeilFlutterTransport.openMediaChannel`). [localId] is OUR 32-byte
+  /// node id and [peerId] the peer's — SSRCs are derived from them so the two
+  /// ends agree without extra negotiation. Returns null if native create fails.
   static VeilMediaEngine? create({
     required int veilChan,
+    required Uint8List localId,
     required Uint8List peerId,
   }) {
-    if (peerId.length != 32) {
-      throw ArgumentError('peerId must be 32 bytes');
+    if (localId.length != 32 || peerId.length != 32) {
+      throw ArgumentError('localId and peerId must be 32 bytes');
     }
+    final local = calloc<Uint8>(32)..asTypedList(32).setAll(0, localId);
     final peer = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerId);
     try {
-      final ptr = ffi.veilMediaEngineCreate(veilChan, peer);
+      final ptr = ffi.veilMediaEngineCreate(veilChan, local, peer);
       if (ptr == nullptr) return null;
       return VeilMediaEngine._(ptr);
     } finally {
+      calloc.free(local);
       calloc.free(peer);
     }
   }

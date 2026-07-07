@@ -43,11 +43,15 @@ typedef struct VeilMediaEngine VeilMediaEngine;
 /*
  * Create a media engine bound to an already-open veil media channel.
  *   veil_chan   : channel id from veil_media_open_channel (RTP/RTCP transport).
- *   peer_id     : 32-byte peer node id (diagnostics / future per-peer keying).
- * The engine installs its inbound recv callback on `veil_chan` and sends
- * outbound RTP/RTCP through it. Returns NULL on failure.
+ *   local_id    : 32-byte OUR node id — used to derive our send SSRC.
+ *   peer_id     : 32-byte peer node id — used to derive the expected recv SSRC.
+ * SSRCs are derived from the node ids so the two endpoints agree without an
+ * extra negotiation: our send-ssrc = f(local_id) = peer's recv remote-ssrc, and
+ * vice versa. The engine installs its inbound recv callback on `veil_chan` and
+ * sends outbound RTP/RTCP through it. Returns NULL on failure.
  */
 VeilMediaEngine *veil_media_engine_create(uint64_t veil_chan,
+                                          const uint8_t *local_id,
                                           const uint8_t *peer_id);
 
 /* Tear down: stops all streams, unregisters the recv callback, frees the
