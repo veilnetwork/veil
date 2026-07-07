@@ -1363,6 +1363,80 @@ impl CircuitCells {
         Ok(env)
     }
 
+    /// Send one lossy MEDIA datagram over the SAME outbound circuit pool as the
+    /// reliable stream, bypassing the `Frame`/ARQ/pacing machinery entirely.
+    ///
+    /// The payload is prefixed with [`crate::media::MEDIA_MAGIC`] (a byte
+    /// distinct from `PROTO_VER`, so the peer's [`spawn_circuit_feed`] peels it
+    /// off before the stream demux). There is no retransmit, no ACK copies, and
+    /// no pacing: on no-route / stale-route / `QueueFull` the datagram is
+    /// silently dropped — the media codec's PLC/FEC absorbs the gap, and a
+    /// late packet is worthless. Reuses the outbound pool + make-before-break
+    /// refill that `circuit_for` already drives.
+    ///
+    /// Returns `true` if the cell entered the first-hop TX queue, `false` if it
+    /// was dropped.
+    async fn send_datagram(&self, dst_node: [u8; 32], payload: &[u8]) -> bool {
+        // Media only exists on the published-rendezvous circuit backend; the
+        // validation/datagram fallbacks have no lossy path.
+        if self.mode != CircuitMode::PublishedRendezvous {
+            return false;
+        }
+        let mut cell = Vec::with_capacity(1 + payload.len());
+        cell.push(crate::media::MEDIA_MAGIC);
+        cell.extend_from_slice(payload);
+        // `stream_id = None`, `Bulk`, `is_handshake = false`: reuse the peer's
+        // existing bulk pool without pinning a stream route. A `None` result
+        // means no route is up yet — `circuit_for` has already kicked a
+        // background open, so just drop this datagram (no ARQ) and let the next
+        // one ride the warm pool.
+        let route = match self
+            .circuit_for(dst_node, None, RouteClass::Bulk, false)
+            .await
+        {
+            Ok(Some(route)) => route,
+            _ => return false,
+        };
+        if self.route_session_stale(&route) {
+            self.mark_route_stale(dst_node, &route).await;
+            return false;
+        }
+        // Attach the sender intro (is_handshake=true for the ENVELOPE only —
+        // circuit_for above still selects a Bulk route). On a ProtectedIntro
+        // circuit the peer_tag is opaque, so without the intro the receiver
+        // can't map peer_tag→our node and would mis-attribute the datagram.
+        // Unlike the reliable stream, a call establishes NO prior handshake on
+        // this circuit (signaling rides the mailbox), so media must carry the
+        // intro itself. Each cell pads to a full circuit cell regardless, so the
+        // intro bytes are effectively free; the only cost is a per-cell seal
+        // (negligible at media rates — optimizable to first-cell-per-route once
+        // an ack path exists).
+        let env = match self.stream_envelope(&dst_node, &route, &cell, true) {
+            Ok(env) => env,
+            // Oversized (payload > one cell) — drop; callers batch to fit.
+            Err(_) => return false,
+        };
+        match self
+            .services
+            .send_circuit_cell_detailed(&route.circuit, &env)
+        {
+            Ok(()) => {
+                mark_circuit_activity(&self.activity);
+                self.mark_outbound_non_handshake(dst_node, &route).await;
+                true
+            }
+            // First-hop TX queue full → drop-late. Media never retransmits, and
+            // surfacing backpressure would only stall the codec's real-time clock.
+            Err(veil_node_runtime::DataCircuitSendError::QueueFull) => false,
+            Err(e) => {
+                // Keep pool health honest so a dead route is reaped, exactly as
+                // the stream send path does on enqueue failure.
+                self.mark_route_send_failed(dst_node, &route, e).await;
+                false
+            }
+        }
+    }
+
     /// Best-effort redundant copies of a pure-ACK cell over up to `max_extra`
     /// pool routes whose rendezvous relay DIFFERS from the primary's (and from
     /// each other's). A pure ACK is never retransmitted by ARQ — losing it on a
@@ -3138,6 +3212,28 @@ impl AnonStreamHub {
             c.warm_outbound(dst_node).await;
         }
     }
+
+    /// Warm the outbound circuit for a media channel to `peer`. Media reuses the
+    /// reliable stream's rendezvous/pool (the hub already registers our inbound
+    /// cookie and resolves the peer's ad), so this just kicks a background open
+    /// of the shared bulk pool — no separate registration. No-op on the
+    /// datagram fallback (media requires the embedded circuit backend).
+    pub async fn media_open_channel(&self, peer: [u8; 32]) {
+        if let HubCells::Circuit(c) = self.cells.as_ref() {
+            c.ensure_outbound_opening(peer, RouteClass::Bulk).await;
+        }
+    }
+
+    /// Send one lossy media datagram to `peer`. Returns `true` if it entered the
+    /// first-hop TX queue, `false` if dropped (no route yet / stale route /
+    /// `QueueFull` / datagram-fallback backend without a lossy path).
+    pub async fn media_send_datagram(&self, peer: [u8; 32], payload: &[u8]) -> bool {
+        if let HubCells::Circuit(c) = self.cells.as_ref() {
+            c.send_datagram(peer, payload).await
+        } else {
+            false
+        }
+    }
 }
 
 /// Open the pinned inbound stream circuit, register this node's cookie, and spawn
@@ -4207,6 +4303,15 @@ fn spawn_circuit_feed(
                     tag
                 };
                 if framed.len() <= cell_offset {
+                    continue;
+                }
+                // Lossy MEDIA datagram? A leading MEDIA_MAGIC (distinct from the
+                // stream `PROTO_VER`) means this cell bypasses the reliable
+                // demux: peel the magic and hand the payload to the media recv
+                // sink, then skip the stream path entirely. Stream and media
+                // coexist on one circuit, cleanly split by this first byte.
+                if framed.get(cell_offset) == Some(&crate::media::MEDIA_MAGIC) {
+                    crate::media::dispatch_inbound(node, &framed[cell_offset + 1..]);
                     continue;
                 }
                 let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);

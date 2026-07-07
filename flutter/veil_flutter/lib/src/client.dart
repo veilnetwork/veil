@@ -185,6 +185,25 @@ void _anonStreamWarmPeerWorker(int handleAddr, Uint8List dstNode) {
   }
 }
 
+/// Off-isolate body of [VeilClient.openMediaChannel] — the first call may
+/// lazily bind the stream hub, so keep it off the UI isolate. Returns the
+/// opaque channel id (0 on error → thrown here).
+int _mediaOpenChannelWorker(int handleAddr, Uint8List peerNode) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerNode);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final chan = ffi.veilMediaOpenChannel(handle, pn, errOut);
+    if (chan == 0) {
+      throw VeilException('media open failed: ${_readErrAndFree(errOut)}');
+    }
+    return chan;
+  } finally {
+    calloc.free(pn);
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate body of [VeilClient.acceptAnonStream]. Null on timeout; throws on
 /// a fatal error; else the stream address + the initiator's node id + onion-
 /// stream app id.
@@ -664,6 +683,55 @@ class VeilClient implements Finalizable {
     }
     final handleAddr = _handle.address;
     await Isolate.run(() => _anonStreamWarmPeerWorker(handleAddr, dstNodeId));
+  }
+
+  /// Open a lossy MEDIA datagram channel to [dstNodeId] (calls: RTP/RTCP). It
+  /// reuses the anon-stream circuit pool and warms the circuit in the
+  /// background. Returns an opaque channel id for [sendMediaDatagram] /
+  /// [closeMediaChannel]. Bind may lazily create the hub, so run off the UI
+  /// isolate like the anon-stream entry points.
+  Future<int> openMediaChannel({required Uint8List dstNodeId}) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32) {
+      throw ArgumentError('dstNodeId must be 32 bytes');
+    }
+    final handleAddr = _handle.address;
+    return Isolate.run(() => _mediaOpenChannelWorker(handleAddr, dstNodeId));
+  }
+
+  /// Enqueue one media datagram on [chan]. NON-BLOCKING (returns immediately);
+  /// no handle needed. Returns 0 queued / 1 dropped (queue full) / -1 invalid.
+  /// The native side drops rather than blocks when the circuit can't keep up.
+  int sendMediaDatagram(int chan, Uint8List payload) {
+    _ensureOpen();
+    if (payload.isEmpty) return -1;
+    final buf = calloc<Uint8>(payload.length)
+      ..asTypedList(payload.length).setAll(0, payload);
+    try {
+      return ffi.veilMediaSendDatagram(chan, buf, payload.length);
+    } finally {
+      calloc.free(buf);
+    }
+  }
+
+  /// Close a media channel (stops the drain task + clears its recv callback).
+  /// Idempotent.
+  void closeMediaChannel(int chan) {
+    ffi.veilMediaCloseChannel(chan);
+  }
+
+  /// Diagnostic: number of inbound media datagrams received from [peerNodeId]
+  /// since process start (lets a host confirm receipt without a recv callback).
+  int mediaRecvCount(Uint8List peerNodeId) {
+    if (peerNodeId.length != 32) {
+      throw ArgumentError('peerNodeId must be 32 bytes');
+    }
+    final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerNodeId);
+    try {
+      return ffi.veilMediaRecvCount(pn);
+    } finally {
+      calloc.free(pn);
+    }
   }
 
   /// Accept the next inbound anonymous stream, or null on [timeout] (a server
