@@ -78,6 +78,20 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineStopAudio(_ptr) == 0;
   }
 
+  /// Start the VP8 video session over the same veil channel (distinct SSRC).
+  /// With VEIL_MEDIA_TEST_VIDEO=1 the send stream is driven by a built-in
+  /// synthetic frame generator (pipeline bring-up); otherwise feed it via a
+  /// platform capturer (native). Idempotent per direction.
+  bool startVideo({bool send = true, bool recv = true}) {
+    _ensure();
+    return ffi.veilMediaEngineStartVideo(_ptr, send ? 1 : 0, recv ? 1 : 0) == 0;
+  }
+
+  bool stopVideo() {
+    _ensure();
+    return ffi.veilMediaEngineStopVideo(_ptr) == 0;
+  }
+
   void setMicMuted(bool muted) {
     _ensure();
     ffi.veilMediaEngineSetMicMuted(_ptr, muted ? 1 : 0);

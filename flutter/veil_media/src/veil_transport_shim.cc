@@ -128,12 +128,18 @@ void VeilTransportShim::DeliverOnNetworkThread(
     return;
   }
 
-  // RTP: parse then deliver. Audio-only for Phase 3 (video adds MediaType::VIDEO
-  // in Phase 4); the demuxer resolves the real media type from SSRC/MID.
+  // RTP: parse then deliver. Call::DeliverRtpPacket routes to the audio vs video
+  // demuxer BY the MediaType (not a hint) — so pick it from the SSRC. Audio and
+  // video share this one datagram channel; the video SSRC is registered via
+  // SetRemoteVideoSsrc when a video recv stream is created.
   webrtc::RtpPacketReceived rtp;
   if (!rtp.Parse(packet)) return;
+  const uint32_t vssrc = remote_video_ssrc_.load();
+  const webrtc::MediaType mt = (vssrc != 0 && rtp.Ssrc() == vssrc)
+                                   ? webrtc::MediaType::VIDEO
+                                   : webrtc::MediaType::AUDIO;
   receiver->DeliverRtpPacket(
-      webrtc::MediaType::AUDIO, std::move(rtp),
+      mt, std::move(rtp),
       /*undemuxable_packet_handler=*/
       [](const webrtc::RtpPacketReceived& /*parsed*/) {
         return false;  // drop packets we can't demux (no SSRC match)
