@@ -104,9 +104,33 @@ class AvfCameraCapturer : public CameraCapturer {
     (void)fps;
     if (session_) return true;
     @autoreleasepool {
-      AVCaptureDevice* dev =
-          [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-      if (!dev) return false;
+      // Find a video capture device. `defaultDeviceWithMediaType:` returns nil
+      // for the built-in camera on some macOS versions (observed on macOS 26
+      // even with camera TCC granted — its userPreferredCamera resolves to
+      // null), so enumerate explicitly with a discovery session and only fall
+      // back to the legacy default.
+      NSMutableArray<AVCaptureDeviceType>* types = [NSMutableArray
+          arrayWithObject:AVCaptureDeviceTypeBuiltInWideAngleCamera];
+      if (@available(macOS 14.0, *)) {
+        [types addObject:AVCaptureDeviceTypeExternal];
+        [types addObject:AVCaptureDeviceTypeContinuityCamera];
+      }
+      AVCaptureDeviceDiscoverySession* ds = [AVCaptureDeviceDiscoverySession
+          discoverySessionWithDeviceTypes:types
+                                mediaType:AVMediaTypeVideo
+                                 position:AVCaptureDevicePositionUnspecified];
+      AVCaptureDevice* dev = nil;
+      for (AVCaptureDevice* d in ds.devices) {  // prefer the built-in camera
+        if ([d.deviceType isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera]) {
+          dev = d;
+          break;
+        }
+      }
+      if (dev == nil) dev = ds.devices.firstObject;
+      if (dev == nil) {
+        dev = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+      }
+      if (dev == nil) return false;
       NSError* err = nil;
       AVCaptureDeviceInput* input =
           [AVCaptureDeviceInput deviceInputWithDevice:dev error:&err];
