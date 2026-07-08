@@ -75,6 +75,33 @@ int veil_media_engine_stop_audio(VeilMediaEngine *engine);
 int veil_media_engine_set_mic_muted(VeilMediaEngine *engine, int muted);
 int veil_media_engine_set_speaker_muted(VeilMediaEngine *engine, int muted);
 
+/* ---- Video (Phase 4) -----------------------------------------------------
+ * A VP8 video session over the SAME veil media channel as audio, on a distinct
+ * SSRC. `send` mounts a video source -> VP8 encode -> RTP -> Transport; `recv`
+ * mounts RTP -> VP8 decode -> the frame callback. Idempotent per direction.
+ * Frames are I420. Set VEIL_MEDIA_TEST_VIDEO=1 in the environment to drive the
+ * send stream from a built-in synthetic frame generator (pipeline bring-up)
+ * instead of pushed frames. */
+int veil_media_engine_start_video(VeilMediaEngine *engine, int send, int recv);
+int veil_media_engine_stop_video(VeilMediaEngine *engine);
+
+/* Push one captured I420 frame into the video send stream (platform camera /
+ * screen capturer, or Dart). Planes may be strided; pass ts_us=0 to stamp now.
+ * No-op if video send isn't started. */
+int veil_media_engine_push_video_frame(VeilMediaEngine *engine,
+                                       const uint8_t *y, const uint8_t *u,
+                                       const uint8_t *v, int width, int height,
+                                       int stride_y, int stride_u, int stride_v,
+                                       int64_t ts_us);
+
+/* Decoded remote frames (recv). The I420 planes are valid ONLY for the call;
+ * copy if retained. Runs on a webrtc decode thread. cb=NULL clears it. */
+typedef void (*VeilVideoFrameFn)(void *ctx, const uint8_t *y, const uint8_t *u,
+                                 const uint8_t *v, int width, int height,
+                                 int stride_y, int stride_u, int stride_v);
+int veil_media_engine_set_video_frame_callback(VeilMediaEngine *engine,
+                                               VeilVideoFrameFn cb, void *ctx);
+
 /* ---- Device selection ----------------------------------------------------
  * Enumerate returns a heap-allocated JSON C string
  * [{"id":"...","label":"...","kind":"input|output"}], or NULL on failure.
