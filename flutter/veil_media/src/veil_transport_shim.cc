@@ -8,7 +8,10 @@
 
 #include "veil_transport_shim.h"
 
+#include <atomic>
+#include <cstdarg>
 #include <cstddef>
+#include <cstdio>
 #include <span>
 #include <utility>
 #include <vector>
@@ -32,6 +35,18 @@ int veil_media_set_recv_callback(uint64_t chan, VeilMediaRecvFn cb, void* ctx);
 }
 
 namespace veil_media {
+namespace {
+void slog(const char* fmt, ...) {
+  FILE* f = fopen("/tmp/veil_media_diag.log", "a");
+  if (!f) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fputc('\n', f);
+  fclose(f);
+}
+}  // namespace
 
 VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
                                      webrtc::Call* call,
@@ -57,6 +72,14 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
                                 const webrtc::PacketOptions& options) {
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
+  {
+    static std::atomic<uint64_t> n{0};
+    const uint64_t c = n.fetch_add(1);
+    if (c % 100 == 0)
+      slog("shim SendRtp #%llu chan=%llu len=%zu rc=%d",
+           (unsigned long long)c, (unsigned long long)veil_chan_,
+           packet.size(), rc);
+  }
   // rc: 0 queued, 1 dropped (queue full), -1 invalid. A media transport is
   // lossy by design, so report success even on a local drop — the congestion
   // controller reacts to TWCC feedback, not to our queue depth, and returning
