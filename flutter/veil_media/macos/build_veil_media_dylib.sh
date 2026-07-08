@@ -41,15 +41,18 @@ e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
 cmd=e['command'] if e.get('command') else ' '.join(e['arguments'])
 s=re.search(r'(\S*call/call\.cc)',cmd).group(1)
 cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
-p=cmd.split(' ',1); cmd=p[0]+' -DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir+' '+p[1]
+extra='-DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir
+if src.endswith('.mm'): extra+=' -fobjc-arc'  # Objective-C++ (AVAudioEngine ADM)
+p=cmd.split(' ',1); cmd=p[0]+' '+extra+' '+p[1]
 open('/dev/stdout','w').write('cd "'+e['directory']+'"\n'+cmd+'\n')
 PY
   bash "$TMP/tu.sh"
 }
 
-echo "==> compiling engine + shim with the WebRTC toolchain"
+echo "==> compiling engine + shim + avf_adm with the WebRTC toolchain"
 compile_tu "$SRCDIR/veil_media_engine.cc" "$TMP/engine.o"
 compile_tu "$SRCDIR/veil_transport_shim.cc" "$TMP/shim.o"
+compile_tu "$SRCDIR/veil_avf_adm.mm" "$TMP/avf_adm.o"
 
 printf '_veil_media_*\n' > "$TMP/exported.txt"
 
@@ -60,14 +63,14 @@ SDK="sdk/xcode_links/$(ls sdk/xcode_links | grep -iE 'MacOSX[0-9].*\.sdk$' | hea
 echo "==> linking libveil_media.dylib (sdk=$SDK)"
 # shellcheck disable=SC2086
 "$CLANGXX" -dynamiclib -o "$DEST/libveil_media.dylib" \
-  "$TMP/engine.o" "$TMP/shim.o" obj/libwebrtc.a $CXX_OBJS \
+  "$TMP/engine.o" "$TMP/shim.o" "$TMP/avf_adm.o" obj/libwebrtc.a $CXX_OBJS \
   -Wl,-dead_strip -Wl,-undefined,dynamic_lookup \
   -Wl,-exported_symbols_list,"$TMP/exported.txt" \
   -install_name @rpath/libveil_media.dylib \
   --target=arm64-apple-macos -isysroot "$SDK" \
   -framework Foundation -framework CoreFoundation -framework CoreAudio -framework AudioToolbox \
   -framework AudioUnit -framework CoreServices -framework IOKit -framework SystemConfiguration \
-  -framework Security -framework CoreMedia -framework ApplicationServices
+  -framework Security -framework CoreMedia -framework AVFoundation -framework ApplicationServices
 
 echo "==> done: $DEST/libveil_media.dylib ($(du -h "$DEST/libveil_media.dylib" | cut -f1))"
 nm -gU "$DEST/libveil_media.dylib" | grep -c "T _veil_media_" | xargs echo "exported veil_media_* symbols:"

@@ -32,7 +32,9 @@
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/environment/environment.h"
 #include "api/environment/environment_factory.h"
+#include "api/media_types.h"
 #include "api/rtp_header_extension_id.h"
+#include "api/rtp_headers.h"
 #include "api/rtp_parameters.h"
 #include "api/scoped_refptr.h"
 #include "api/task_queue/task_queue_base.h"
@@ -46,6 +48,7 @@
 #include "call/call_config.h"
 #include "modules/audio_mixer/audio_mixer_impl.h"
 
+#include "veil_avf_adm.h"
 #include "veil_transport_shim.h"
 #endif
 
@@ -151,8 +154,11 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   ws->network_tq = ws->env.task_queue_factory().CreateTaskQueue(
       "veil-net", webrtc::TaskQueueFactory::Priority::kHigh);
 
-  ws->adm = webrtc::CreateAudioDeviceModule(
-      ws->env, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
+  // AVAudioEngine-backed ADM: the platform HAL ADM (kPlatformDefaultAudio)
+  // reports RecordingIsAvailable=0 and hangs InitRecording inside this dylib
+  // embed, so no mic audio reaches the send stream. The custom ADM captures via
+  // AVAudioEngine (clean TCC integration) and is the portable path.
+  ws->adm = veil_media::CreateVeilAvfAdm(ws->env);
   if (ws->adm) {
     const int32_t init_rc = ws->adm->Init();
     bool rec_avail = false, play_avail = false;
@@ -216,6 +222,11 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
 
   // Streams must be created on the Call's worker queue.
   run_on(ws->worker_tq.get(), [&]() {
+    // The Call's audio network state defaults to kNetworkDown, which makes the
+    // send transport hold every RTP packet in the pacer (only RTCP leaks out on
+    // its own path). Bring the audio channel up so mic audio actually flows.
+    ws->call->SignalChannelNetworkState(webrtc::MediaType::AUDIO,
+                                        webrtc::kNetworkUp);
     if (send && ws->send_stream == nullptr) {
       webrtc::AudioSendStream::Config sc(ws->shim.get());  // sets send_transport
       sc.rtp.ssrc = local_ssrc;
@@ -244,32 +255,21 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
   });
   // webrtc::Call does NOT drive the AudioDeviceModule the way PeerConnection
   // does — start capture/playout explicitly, else the send stream has no audio
-  // frames (only RTCP flows) and the recv stream is never played out. CRITICAL:
-  // do this on the CALLING thread, NOT the Call worker queue — CoreAudio's
-  // StartRecording can block, and blocking the worker wedges the whole Call
-  // (no RTP/RTCP goes out at all).
-  // NOTE (macOS): the CoreAudio ADM in this build reports RecordingIsAvailable=0
-  // / PlayoutIsAvailable=0 and InitRecording/InitPlayout block or fail, which
-  // hangs the app. Until that's resolved, gate the ADM start behind an env flag
-  // so the engine stays stable (call reaches `active`, RTCP/RTP transport works;
-  // real capture is a follow-up). Set VEIL_MEDIA_START_ADM=1 to experiment.
-  if (ws->adm && std::getenv("VEIL_MEDIA_START_ADM") != nullptr) {
-    if (send && !ws->adm->Recording()) {
-      const int32_t sd = ws->adm->SetRecordingDevice(0);
-      const int32_t im = ws->adm->InitMicrophone();
-      const int32_t ir = ws->adm->InitRecording();
-      const int32_t sr = ws->adm->StartRecording();
-      vlog("send: SetRecDev=%d InitMic=%d InitRec=%d StartRec=%d Recording=%d",
-           sd, im, ir, sr, ws->adm->Recording());
+  // frames (only RTCP flows) and the recv stream is never played out. The
+  // AVAudioEngine ADM's start is non-blocking + idempotent (all engine work is
+  // serialized on its own GCD queue), so this is safe on the calling thread and
+  // AudioState toggling it too on the worker queue just no-ops.
+  if (ws->adm) {
+    if (send) {
+      ws->adm->InitRecording();
+      ws->adm->StartRecording();
     }
-    if (recv && !ws->adm->Playing()) {
-      const int32_t pd = ws->adm->SetPlayoutDevice(0);
-      ws->adm->InitSpeaker();
-      const int32_t ip = ws->adm->InitPlayout();
-      const int32_t sp = ws->adm->StartPlayout();
-      vlog("recv: SetPlayDev=%d InitPlayout=%d StartPlayout=%d Playing=%d", pd,
-           ip, sp, ws->adm->Playing());
+    if (recv) {
+      ws->adm->InitPlayout();
+      ws->adm->StartPlayout();
     }
+    vlog("adm start: recording=%d playing=%d", ws->adm->Recording(),
+         ws->adm->Playing());
   }
   // A few seconds in, log the send stream's packet counters — the definitive
   // "is audio actually going out" check.

@@ -1,0 +1,359 @@
+/* SPDX-License-Identifier: MIT
+ *
+ * veil_avf_adm.mm — AVAudioEngine-backed AudioDeviceModule (see veil_avf_adm.h).
+ *
+ * Capture:  engine.inputNode --tap--> AVAudioConverter(-> 48k int16 mono)
+ *           --> FineAudioBuffer::DeliverRecordedData --> AudioDeviceBuffer
+ *           --> AudioTransport (send stream / Opus).
+ * Playout:  AudioTransport (mixed recv) --> AudioDeviceBuffer
+ *           --> FineAudioBuffer::GetPlayoutData --> AVAudioSourceNode render
+ *           --> mainMixerNode --> output.
+ *
+ * All AVAudioEngine graph mutations + start/stop are serialized on a dedicated
+ * GCD queue so StartRecording/StartPlayout (called by AudioState on the Call
+ * worker queue) never block the caller for long and never race the graph.
+ */
+#import <AVFoundation/AVFoundation.h>
+#import <Foundation/Foundation.h>
+
+#include "veil_avf_adm.h"
+
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+#include <atomic>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <span>
+#include <vector>
+
+#include "api/audio/audio_device_defines.h"
+#include "api/make_ref_counted.h"
+#include "modules/audio_device/audio_device_buffer.h"
+#include "modules/audio_device/fine_audio_buffer.h"
+#include "modules/audio_device/include/audio_device_default.h"
+
+namespace veil_media {
+namespace {
+
+constexpr uint32_t kSampleRate = 48000;
+constexpr size_t kChannels = 1;
+constexpr int kRecordDelayMs = 10;
+constexpr int kPlayoutDelayMs = 40;
+constexpr size_t kPlayTmpSamples = 8192;  // render blocks are ~512-4096 frames
+
+void alog(const char* fmt, ...) {
+  FILE* f = fopen("/tmp/veil_media_diag.log", "a");
+  if (!f) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fputc('\n', f);
+  fclose(f);
+}
+
+class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
+                       webrtc::AudioDeviceModule> {
+ public:
+  explicit VeilAvfAdm(const webrtc::Environment& env)
+      : env_(env),
+        audio_device_buffer_(env, /*create_detached=*/true) {
+    engine_queue_ = dispatch_queue_create("veil.avf.adm", DISPATCH_QUEUE_SERIAL);
+    play_tmp_.resize(kPlayTmpSamples, 0);
+  }
+  ~VeilAvfAdm() override { Terminate(); }
+
+  // --- AudioTransport plumbing --------------------------------------------
+  int32_t RegisterAudioCallback(webrtc::AudioTransport* cb) override {
+    return audio_device_buffer_.RegisterAudioCallback(cb);
+  }
+
+  int32_t Init() override {
+    if (initialized_) return 0;
+    audio_device_buffer_.SetRecordingSampleRate(kSampleRate);
+    audio_device_buffer_.SetRecordingChannels(kChannels);
+    audio_device_buffer_.SetPlayoutSampleRate(kSampleRate);
+    audio_device_buffer_.SetPlayoutChannels(kChannels);
+    rec_fine_ = std::make_unique<webrtc::FineAudioBuffer>(&audio_device_buffer_);
+    play_fine_ = std::make_unique<webrtc::FineAudioBuffer>(&audio_device_buffer_);
+    initialized_ = true;
+    alog("avf_adm: Init ok (48k mono)");
+    return 0;
+  }
+  bool Initialized() const override { return initialized_; }
+
+  int32_t Terminate() override {
+    if (!initialized_) return 0;
+    recording_.store(false);
+    playing_.store(false);
+    dispatch_sync(engine_queue_, ^{
+      TeardownEngineLocked();
+    });
+    rec_fine_.reset();
+    play_fine_.reset();
+    initialized_ = false;
+    return 0;
+  }
+
+  // --- availability / device enumeration (single virtual device) ----------
+  int16_t PlayoutDevices() override { return 1; }
+  int16_t RecordingDevices() override { return 1; }
+  int32_t PlayoutIsAvailable(bool* available) override {
+    *available = true;
+    return 0;
+  }
+  int32_t RecordingIsAvailable(bool* available) override {
+    *available = true;
+    return 0;
+  }
+  int32_t RecordingDeviceName(uint16_t /*index*/,
+                              char name[webrtc::kAdmMaxDeviceNameSize],
+                              char guid[webrtc::kAdmMaxGuidSize]) override {
+    std::snprintf(name, webrtc::kAdmMaxDeviceNameSize, "AVAudioEngine Input");
+    guid[0] = '\0';
+    return 0;
+  }
+  int32_t PlayoutDeviceName(uint16_t /*index*/,
+                            char name[webrtc::kAdmMaxDeviceNameSize],
+                            char guid[webrtc::kAdmMaxGuidSize]) override {
+    std::snprintf(name, webrtc::kAdmMaxDeviceNameSize, "AVAudioEngine Output");
+    guid[0] = '\0';
+    return 0;
+  }
+
+  int32_t InitPlayout() override {
+    playout_initialized_ = true;
+    return 0;
+  }
+  bool PlayoutIsInitialized() const override { return playout_initialized_; }
+  int32_t InitRecording() override {
+    recording_initialized_ = true;
+    return 0;
+  }
+  bool RecordingIsInitialized() const override { return recording_initialized_; }
+
+  // --- start / stop (called by AudioState on the Call worker queue) --------
+  int32_t StartRecording() override {
+    if (!initialized_) Init();
+    recording_.store(true);
+    dispatch_sync(engine_queue_, ^{
+      if (rec_fine_) rec_fine_->ResetRecord();
+      audio_device_buffer_.StartRecording();
+      ReconfigureLocked();
+    });
+    alog("avf_adm: StartRecording");
+    return 0;
+  }
+  int32_t StopRecording() override {
+    recording_.store(false);
+    dispatch_sync(engine_queue_, ^{
+      audio_device_buffer_.StopRecording();
+      ReconfigureLocked();
+    });
+    return 0;
+  }
+  bool Recording() const override { return recording_.load(); }
+
+  int32_t StartPlayout() override {
+    if (!initialized_) Init();
+    playing_.store(true);
+    dispatch_sync(engine_queue_, ^{
+      if (play_fine_) play_fine_->ResetPlayout();
+      audio_device_buffer_.StartPlayout();
+      ReconfigureLocked();
+    });
+    alog("avf_adm: StartPlayout");
+    return 0;
+  }
+  int32_t StopPlayout() override {
+    playing_.store(false);
+    dispatch_sync(engine_queue_, ^{
+      audio_device_buffer_.StopPlayout();
+      ReconfigureLocked();
+    });
+    return 0;
+  }
+  bool Playing() const override { return playing_.load(); }
+
+ private:
+  // Rebuild engine run-state to match recording_/playing_. Runs on engine_queue_.
+  void ReconfigureLocked() {
+    EnsureEngineLocked();
+    if (engine_ == nil) return;
+    if (engine_.isRunning) [engine_ stop];
+
+    AVAudioInputNode* input = engine_.inputNode;
+    [input removeTapOnBus:0];
+    if (recording_.load()) {
+      AVAuthorizationStatus mic_auth =
+          [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+      alog("avf_adm: mic auth=%ld (0=notDetermined 2=denied 3=authorized)",
+           (long)mic_auth);
+      AVAudioFormat* tap_fmt = [input outputFormatForBus:0];
+      if (tap_fmt.sampleRate > 0 && tap_fmt.channelCount > 0) {
+        int16_format_ = [[AVAudioFormat alloc]
+            initWithCommonFormat:AVAudioPCMFormatInt16
+                      sampleRate:kSampleRate
+                        channels:(AVAudioChannelCount)kChannels
+                     interleaved:YES];
+        capture_converter_ = [[AVAudioConverter alloc] initFromFormat:tap_fmt
+                                                             toFormat:int16_format_];
+        const double ratio = (double)kSampleRate / tap_fmt.sampleRate;
+        InstallCaptureTapLocked(input, tap_fmt, ratio);
+      } else {
+        alog("avf_adm: input format not ready (sr=%.0f ch=%u) — mic ungranted?",
+             tap_fmt.sampleRate, (unsigned)tap_fmt.channelCount);
+      }
+    }
+
+    if (recording_.load() || playing_.load()) {
+      [engine_ prepare];
+      NSError* err = nil;
+      if (![engine_ startAndReturnError:&err]) {
+        alog("avf_adm: engine start FAILED: %s",
+             err ? err.localizedDescription.UTF8String : "?");
+      } else {
+        alog("avf_adm: engine running (rec=%d play=%d)", (int)recording_.load(),
+             (int)playing_.load());
+      }
+    }
+  }
+
+  void InstallCaptureTapLocked(AVAudioInputNode* input,
+                               AVAudioFormat* tap_fmt,
+                               double ratio) {
+    VeilAvfAdm* self = this;
+    [input installTapOnBus:0
+                bufferSize:1024
+                    format:tap_fmt
+                     block:^(AVAudioPCMBuffer* buffer, AVAudioTime* /*when*/) {
+                       self->OnCaptureBuffer(buffer, ratio);
+                     }];
+  }
+
+  // Runs on a CoreAudio capture thread.
+  void OnCaptureBuffer(AVAudioPCMBuffer* buffer, double ratio) {
+    if (!recording_.load() || capture_converter_ == nil || !rec_fine_) return;
+    const AVAudioFrameCount cap =
+        (AVAudioFrameCount)(buffer.frameLength * ratio) + 256;
+    AVAudioPCMBuffer* out =
+        [[AVAudioPCMBuffer alloc] initWithPCMFormat:int16_format_
+                                      frameCapacity:cap];
+    if (out == nil) return;
+    __block BOOL fed = NO;
+    NSError* err = nil;
+    [capture_converter_
+        convertToBuffer:out
+                  error:&err
+     withInputFromBlock:^AVAudioBuffer*(AVAudioPacketCount /*n*/,
+                                        AVAudioConverterInputStatus* status) {
+       if (fed) {
+         *status = AVAudioConverterInputStatus_NoDataNow;
+         return (AVAudioBuffer*)nil;
+       }
+       fed = YES;
+       *status = AVAudioConverterInputStatus_HaveData;
+       return (AVAudioBuffer*)buffer;
+     }];
+    const AVAudioFrameCount n = out.frameLength;
+    if (n == 0 || out.int16ChannelData == nullptr) return;
+    const int16_t* data = out.int16ChannelData[0];
+    rec_fine_->DeliverRecordedData(
+        std::span<const int16_t>(data, (size_t)n * kChannels), kRecordDelayMs);
+    // Diagnostic: is the tap firing, and is it real audio (maxAbs>0) or silence?
+    const uint64_t c = cap_count_.fetch_add(1);
+    if (c % 100 == 0) {
+      int16_t mx = 0;
+      for (AVAudioFrameCount i = 0; i < n; ++i) {
+        int16_t v = data[i];
+        int16_t a = v < 0 ? (int16_t)-v : v;
+        if (a > mx) mx = a;
+      }
+      alog("avf_adm: capture #%llu frames=%u maxAbs=%d",
+           (unsigned long long)c, (unsigned)n, (int)mx);
+    }
+  }
+
+  void EnsureEngineLocked() {
+    if (engine_ != nil) return;
+    engine_ = [[AVAudioEngine alloc] init];
+    AVAudioFormat* src_fmt = [[AVAudioFormat alloc]
+        initWithCommonFormat:AVAudioPCMFormatFloat32
+                  sampleRate:kSampleRate
+                    channels:(AVAudioChannelCount)kChannels
+                 interleaved:NO];
+    VeilAvfAdm* self = this;
+    source_node_ = [[AVAudioSourceNode alloc]
+        initWithFormat:src_fmt
+           renderBlock:^OSStatus(BOOL* is_silence,
+                                 const AudioTimeStamp* /*ts*/,
+                                 AVAudioFrameCount frame_count,
+                                 AudioBufferList* out) {
+             return self->OnRenderPlayout(is_silence, frame_count, out);
+           }];
+    [engine_ attachNode:source_node_];
+    [engine_ connect:source_node_ to:engine_.mainMixerNode format:src_fmt];
+  }
+
+  // Runs on the CoreAudio render thread.
+  OSStatus OnRenderPlayout(BOOL* is_silence,
+                           AVAudioFrameCount frame_count,
+                           AudioBufferList* out) {
+    if (out == nullptr || out->mNumberBuffers < 1) return noErr;
+    float* dst = (float*)out->mBuffers[0].mData;
+    const size_t need = (size_t)frame_count * kChannels;
+    if (!playing_.load() || !play_fine_ || dst == nullptr ||
+        need > play_tmp_.size()) {
+      if (dst != nullptr) std::memset(dst, 0, frame_count * sizeof(float));
+      *is_silence = YES;
+      return noErr;
+    }
+    play_fine_->GetPlayoutData(std::span<int16_t>(play_tmp_.data(), need),
+                               kPlayoutDelayMs);
+    const float inv = 1.0f / 32768.0f;
+    for (AVAudioFrameCount i = 0; i < frame_count; ++i) {
+      dst[i] = (float)play_tmp_[i] * inv;
+    }
+    return noErr;
+  }
+
+  void TeardownEngineLocked() {
+    if (engine_ == nil) return;
+    if (engine_.isRunning) [engine_ stop];
+    [engine_.inputNode removeTapOnBus:0];
+    engine_ = nil;
+    source_node_ = nil;
+    capture_converter_ = nil;
+    int16_format_ = nil;
+  }
+
+  webrtc::Environment env_;
+  webrtc::AudioDeviceBuffer audio_device_buffer_;
+  std::unique_ptr<webrtc::FineAudioBuffer> rec_fine_;
+  std::unique_ptr<webrtc::FineAudioBuffer> play_fine_;
+  std::vector<int16_t> play_tmp_;
+
+  bool initialized_ = false;
+  bool playout_initialized_ = false;
+  bool recording_initialized_ = false;
+  std::atomic<bool> recording_{false};
+  std::atomic<bool> playing_{false};
+  std::atomic<uint64_t> cap_count_{0};
+
+  dispatch_queue_t engine_queue_ = nil;
+  AVAudioEngine* engine_ = nil;
+  AVAudioSourceNode* source_node_ = nil;
+  AVAudioConverter* capture_converter_ = nil;
+  AVAudioFormat* int16_format_ = nil;
+};
+
+}  // namespace
+
+webrtc::scoped_refptr<webrtc::AudioDeviceModule> CreateVeilAvfAdm(
+    const webrtc::Environment& env) {
+  return webrtc::make_ref_counted<VeilAvfAdm>(env);
+}
+
+}  // namespace veil_media
+#endif  // VEIL_MEDIA_HAVE_WEBRTC
