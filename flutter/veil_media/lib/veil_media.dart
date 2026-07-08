@@ -104,6 +104,20 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineStopVideo(_ptr) == 0;
   }
 
+  /// Open the platform camera and drive the video send stream from it (video
+  /// send must already be started). Returns false if this platform has no
+  /// camera backend (Android, for now) or the device can't be opened — the
+  /// call still runs (receive/render unaffected). Idempotent.
+  bool startCamera({int width = 352, int height = 288, int fps = 15}) {
+    _ensure();
+    return ffi.veilMediaEngineStartCamera(_ptr, width, height, fps) == 0;
+  }
+
+  bool stopCamera() {
+    _ensure();
+    return ffi.veilMediaEngineStopCamera(_ptr) == 0;
+  }
+
   /// The latest decoded remote video frame (RGBA), or null if there is no NEW
   /// frame since the last call. Poll at the display rate.
   VeilVideoFrame? getVideoFrame() {

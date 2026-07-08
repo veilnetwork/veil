@@ -85,6 +85,15 @@ int veil_media_engine_set_speaker_muted(VeilMediaEngine *engine, int muted);
 int veil_media_engine_start_video(VeilMediaEngine *engine, int send, int recv);
 int veil_media_engine_stop_video(VeilMediaEngine *engine);
 
+/* Open the platform camera and drive the video send stream from it (near
+ * width x height at fps; the camera picks the closest supported format). Video
+ * send must already be started (veil_media_engine_start_video send=1). Returns
+ * VEIL_MEDIA_OK, or VEIL_MEDIA_ERR_STATE if this platform has no camera backend
+ * or the device can't be opened. Idempotent. */
+int veil_media_engine_start_camera(VeilMediaEngine *engine, int width,
+                                   int height, int fps);
+int veil_media_engine_stop_camera(VeilMediaEngine *engine);
+
 /* Push one captured I420 frame into the video send stream (platform camera /
  * screen capturer, or Dart). Planes may be strided; pass ts_us=0 to stamp now.
  * No-op if video send isn't started. */
