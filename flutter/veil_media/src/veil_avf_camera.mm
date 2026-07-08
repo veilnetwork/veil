@@ -156,12 +156,21 @@ class AvfCameraCapturer : public CameraCapturer {
       [out setSampleBufferDelegate:delegate queue:q];
       if ([session canAddOutput:out]) [session addOutput:out];
       [session commitConfiguration];
-      [session startRunning];
-
       session_ = session;
       output_ = out;
       delegate_ = delegate;
       queue_ = q;
+      // [session startRunning] can block for a while (camera warm-up, and it can
+      // wedge harder when permission is not yet granted). Start() runs
+      // synchronously on the FFI/UI isolate (engine.cc drives start_camera from
+      // the Flutter caller), so kick startRunning OFF that thread — otherwise the
+      // whole app freezes on accept. Guard with session_==session so a Stop()
+      // that raced in first doesn't leave an orphaned running session.
+      dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+          if (session_ == session) [session startRunning];
+        }
+      });
     }
     return true;
   }
