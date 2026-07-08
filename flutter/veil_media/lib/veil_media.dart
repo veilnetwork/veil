@@ -36,12 +36,24 @@ class MediaDevice {
       );
 }
 
+/// A decoded remote video frame: tightly-packed RGBA (width*height*4 bytes).
+class VeilVideoFrame {
+  const VeilVideoFrame(
+      {required this.rgba, required this.width, required this.height});
+  final Uint8List rgba;
+  final int width;
+  final int height;
+}
+
 /// A live media engine bound to one veil media datagram channel.
 class VeilMediaEngine {
   VeilMediaEngine._(this._ptr);
 
   final Pointer<ffi.VeilMediaEngineHandle> _ptr;
   bool _disposed = false;
+  Pointer<Uint8>? _frameBuf; // reused RGBA pull buffer
+  int _frameCap = 0;
+  int _lastFrameSeq = 0;
 
   /// Create an engine over an already-open veil media channel [veilChan]
   /// (from `VeilFlutterTransport.openMediaChannel`). [localId] is OUR 32-byte
@@ -92,6 +104,40 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineStopVideo(_ptr) == 0;
   }
 
+  /// The latest decoded remote video frame (RGBA), or null if there is no NEW
+  /// frame since the last call. Poll at the display rate.
+  VeilVideoFrame? getVideoFrame() {
+    _ensure();
+    final wp = calloc<Int32>();
+    final hp = calloc<Int32>();
+    try {
+      _frameBuf ??= (() {
+        _frameCap = 640 * 480 * 4;
+        return calloc<Uint8>(_frameCap);
+      })();
+      var seq = ffi.veilMediaEngineGetVideoFrame(_ptr, _frameBuf!, _frameCap, wp, hp);
+      if (seq == -1) {
+        // Buffer too small — grow to the reported dimensions and retry once.
+        final need = wp.value * hp.value * 4;
+        if (need > 0) {
+          calloc.free(_frameBuf!);
+          _frameCap = need;
+          _frameBuf = calloc<Uint8>(_frameCap);
+          seq = ffi.veilMediaEngineGetVideoFrame(_ptr, _frameBuf!, _frameCap, wp, hp);
+        }
+      }
+      if (seq <= 0 || seq == _lastFrameSeq) return null;
+      _lastFrameSeq = seq;
+      final w = wp.value, h = hp.value;
+      if (w <= 0 || h <= 0) return null;
+      final rgba = Uint8List.fromList(_frameBuf!.asTypedList(w * h * 4));
+      return VeilVideoFrame(rgba: rgba, width: w, height: h);
+    } finally {
+      calloc.free(wp);
+      calloc.free(hp);
+    }
+  }
+
   void setMicMuted(bool muted) {
     _ensure();
     ffi.veilMediaEngineSetMicMuted(_ptr, muted ? 1 : 0);
@@ -132,6 +178,10 @@ class VeilMediaEngine {
     if (_disposed) return;
     _disposed = true;
     ffi.veilMediaEngineDestroy(_ptr);
+    if (_frameBuf != null) {
+      calloc.free(_frameBuf!);
+      _frameBuf = null;
+    }
   }
 
   /// Native engine build/version string.

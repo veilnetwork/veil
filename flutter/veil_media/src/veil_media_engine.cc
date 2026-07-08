@@ -74,6 +74,7 @@
 #include "api/video/video_source_interface.h"
 #include "api/video/video_sink_interface.h"
 #include "api/video/video_broadcaster.h"
+#include "third_party/libyuv/include/libyuv/convert_argb.h"  // I420ToABGR
 #include "rtc_base/time_utils.h"  // webrtc::TimeMicros
 
 #if defined(__APPLE__)
@@ -140,34 +141,47 @@ uint32_t video_ssrc_of(const uint8_t id[32]) {
   return s == 0 ? 2u : s;
 }
 
-// Sink for decoded remote video frames: forwards I420 planes to the C-ABI
-// callback (Dart/render). OnFrame runs on a webrtc decode thread.
+// Sink for decoded remote video frames: converts each to RGBA and holds the
+// latest so Dart can pull it at the display rate (a pull avoids the async
+// callback's stale-buffer race). OnFrame runs on a webrtc decode thread.
 class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
-  void set_callback(VeilVideoFrameFn cb, void* ctx) {
-    std::lock_guard<std::mutex> l(m_);
-    cb_ = cb;
-    ctx_ = ctx;
-  }
   void OnFrame(const webrtc::VideoFrame& frame) override {
-    VeilVideoFrameFn cb;
-    void* ctx;
-    {
-      std::lock_guard<std::mutex> l(m_);
-      cb = cb_;
-      ctx = ctx_;
-    }
-    if (cb == nullptr) return;
     auto buf = frame.video_frame_buffer()->ToI420();
     if (buf == nullptr) return;
-    cb(ctx, buf->DataY(), buf->DataU(), buf->DataV(), buf->width(),
-       buf->height(), buf->StrideY(), buf->StrideU(), buf->StrideV());
+    const int w = buf->width(), h = buf->height();
+    if (w <= 0 || h <= 0) return;
+    const size_t need = static_cast<size_t>(w) * h * 4;
+    std::lock_guard<std::mutex> l(m_);
+    if (rgba_.size() < need) rgba_.resize(need);
+    // I420 -> tightly packed RGBA (libyuv "ABGR" word == R,G,B,A bytes in memory,
+    // which is what a Flutter rgba8888 texture / decodeImageFromPixels expects).
+    libyuv::I420ToABGR(buf->DataY(), buf->StrideY(), buf->DataU(),
+                       buf->StrideU(), buf->DataV(), buf->StrideV(),
+                       rgba_.data(), w * 4, w, h);
+    w_ = w;
+    h_ = h;
+    ++seq_;
+  }
+  // Copy the latest frame into dst. Returns seq (>0) if copied, 0 if none yet,
+  // -1 if dst_cap too small (out_w/out_h still set).
+  int get_frame(uint8_t* dst, int dst_cap, int* out_w, int* out_h) {
+    std::lock_guard<std::mutex> l(m_);
+    if (seq_ == 0 || w_ <= 0) return 0;
+    if (out_w) *out_w = w_;
+    if (out_h) *out_h = h_;
+    const size_t need = static_cast<size_t>(w_) * h_ * 4;
+    if (dst == nullptr || dst_cap < 0 || static_cast<size_t>(dst_cap) < need)
+      return -1;
+    std::memcpy(dst, rgba_.data(), need);
+    return static_cast<int>(seq_);
   }
 
  private:
   std::mutex m_;
-  VeilVideoFrameFn cb_ = nullptr;
-  void* ctx_ = nullptr;
+  std::vector<uint8_t> rgba_;  // latest frame, RGBA (guarded by m_)
+  int w_ = 0, h_ = 0;
+  uint32_t seq_ = 0;
 };
 
 // Copy a (possibly strided) I420 frame into the broadcaster (encoder source).
@@ -601,17 +615,19 @@ int veil_media_engine_push_video_frame(VeilMediaEngine* engine,
 #endif
 }
 
-int veil_media_engine_set_video_frame_callback(VeilMediaEngine* engine,
-                                               VeilVideoFrameFn cb, void* ctx) {
-  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+int veil_media_engine_get_video_frame(VeilMediaEngine* engine, uint8_t* dst,
+                                      int dst_cap, int* out_w, int* out_h) {
+  if (engine == nullptr) return 0;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws && engine->ws->video_sink)
-    engine->ws->video_sink->set_callback(cb, ctx);
+    return engine->ws->video_sink->get_frame(dst, dst_cap, out_w, out_h);
 #else
-  (void)cb;
-  (void)ctx;
+  (void)dst;
+  (void)dst_cap;
+  (void)out_w;
+  (void)out_h;
 #endif
-  return VEIL_MEDIA_OK;
+  return 0;
 }
 
 int veil_media_engine_set_mic_muted(VeilMediaEngine* engine, int muted) {
