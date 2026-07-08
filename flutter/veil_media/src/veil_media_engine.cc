@@ -473,19 +473,29 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv) {
       sc.encoder_settings.bitrate_allocator_factory =
           ws->video_bitrate_alloc_factory.get();  // REQUIRED (deref, no null-check)
 
+      // Bitrate/framerate are kept LOW for now: the veil media datagram path
+      // pads every packet to a 16KB onion cell, so VP8's packet rate otherwise
+      // floods the circuit and starves audio. Until RTP is batched into cells,
+      // cap the rate so audio + video coexist. (VEIL_MEDIA_VIDEO_KBPS overrides.)
+      int kbps = 150;
+      if (const char* e = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
+        int v = std::atoi(e);
+        if (v > 0) kbps = v;
+      }
+      const int bps = kbps * 1000;
       webrtc::VideoEncoderConfig ec;
       ec.codec_type = webrtc::kVideoCodecVP8;
       ec.video_format = webrtc::SdpVideoFormat::VP8();
       ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
       ec.number_of_streams = 1;
-      ec.max_bitrate_bps = 2000000;
+      ec.max_bitrate_bps = bps;
       webrtc::VideoStream layer;  // ≥1 layer REQUIRED (default factory DCHECK)
       layer.active = true;
-      layer.min_bitrate_bps = 100000;
-      layer.target_bitrate_bps = 1000000;
-      layer.max_bitrate_bps = 2000000;
-      layer.max_framerate = 30;
-      layer.max_qp = 56;
+      layer.min_bitrate_bps = 30000;
+      layer.target_bitrate_bps = bps * 2 / 3;
+      layer.max_bitrate_bps = bps;
+      layer.max_framerate = 15;
+      layer.max_qp = 63;
       ec.simulcast_layers.push_back(layer);
 
       ws->video_send_stream =
