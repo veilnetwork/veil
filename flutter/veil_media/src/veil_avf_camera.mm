@@ -19,12 +19,15 @@
 #include <vector>
 
 #include "third_party/libyuv/include/libyuv/convert.h"  // NV12ToI420
+#include "third_party/libyuv/include/libyuv/scale.h"     // I420Scale
 
 // ---- ObjC sample-buffer delegate: NV12 -> I420 -> callback ----------------
 @interface VeilCamDelegate : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate> {
  @public
   veil_media::CameraFrameCb cb_;
-  std::vector<uint8_t> y_, u_, v_;
+  int target_w_;             // downscale captured frames to <= this width (0 = off)
+  std::vector<uint8_t> y_, u_, v_;     // NV12->I420 at capture resolution
+  std::vector<uint8_t> sy_, su_, sv_;  // scaled-down I420 (encoder input)
 }
 @end
 
@@ -54,7 +57,27 @@
     v_.resize((size_t)cw * ch);
     libyuv::NV12ToI420(srcY, srcYStride, srcUV, srcUVStride, y_.data(), w,
                        u_.data(), cw, v_.data(), cw, w, h);
-    cb_(y_.data(), u_.data(), v_.data(), w, h, w, cw, cw, /*ts_us=*/0);
+
+    // Downscale before handing to the encoder: cameras hand us 720p/1080p, but
+    // the veil path caps VP8 at a low bitrate (every RTP packet is padded to a
+    // 16KB onion cell), so a full-res keyframe fans out into hundreds of cells
+    // and adds seconds of latency. Scaling to <= target_w_ (aspect-preserved,
+    // even dims) keeps keyframes small and the pipeline responsive.
+    if (target_w_ > 0 && w > target_w_) {
+      int ow = target_w_ & ~1;                       // even width
+      int oh = ((h * ow / w) + 1) & ~1;              // aspect-preserved even height
+      if (oh < 2) oh = 2;
+      const int ocw = (ow + 1) / 2, och = (oh + 1) / 2;
+      sy_.resize((size_t)ow * oh);
+      su_.resize((size_t)ocw * och);
+      sv_.resize((size_t)ocw * och);
+      libyuv::I420Scale(y_.data(), w, u_.data(), cw, v_.data(), cw, w, h,
+                        sy_.data(), ow, su_.data(), ocw, sv_.data(), ocw, ow, oh,
+                        libyuv::kFilterBilinear);
+      cb_(sy_.data(), su_.data(), sv_.data(), ow, oh, ow, ocw, ocw, /*ts_us=*/0);
+    } else {
+      cb_(y_.data(), u_.data(), v_.data(), w, h, w, cw, cw, /*ts_us=*/0);
+    }
   }
   CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 }
@@ -97,6 +120,7 @@ class AvfCameraCapturer : public CameraCapturer {
 
       VeilCamDelegate* delegate = [[VeilCamDelegate alloc] init];
       delegate->cb_ = cb_;
+      delegate->target_w_ = width;  // downscale capture to this width before encode
       AVCaptureVideoDataOutput* out = [[AVCaptureVideoDataOutput alloc] init];
       out.videoSettings = @{
         (id)kCVPixelBufferPixelFormatTypeKey :
