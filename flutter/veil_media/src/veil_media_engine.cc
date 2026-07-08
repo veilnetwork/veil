@@ -605,7 +605,7 @@ int veil_media_engine_stop_video(VeilMediaEngine* engine) {
 int veil_media_engine_start_camera(VeilMediaEngine* engine, int width,
                                    int height, int fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
-#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && (defined(__APPLE__) || defined(__linux__))
   WebrtcState* ws = engine->ws.get();
   if (!ws || !ws->video_source) return VEIL_MEDIA_ERR_STATE;
   if (ws->camera) return VEIL_MEDIA_OK;  // already capturing
