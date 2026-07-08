@@ -33,7 +33,7 @@ compile_tu() {  # $1=src  $2=out.o
 import json,sys,re
 cc=json.load(open(sys.argv[1])); src,out,shimdir=sys.argv[2],sys.argv[3],sys.argv[4]
 e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
-cmd=e['command'] if e.get('command') else ' '.join(e['arguments'])
+cmd=(e['command'] if e.get('command') else ' '.join(e['arguments'])).strip()
 s=re.search(r'(\S*call/call\.cc)',cmd).group(1)
 cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
 p=cmd.split(' ',1); cmd=p[0]+' -DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir+' '+p[1]
@@ -53,25 +53,40 @@ cat > "$TMP/exports.map" <<'MAP'
 MAP
 
 cd "$WEBRTC_SRC/$WEBRTC_OUT"
+# Chromium __Cr libc++ + libc++abi + libunwind objects (webrtc builds all three;
+# the NDK's own libc++/unwinder would clash with the __Cr namespace, so we bring
+# our own and suppress the driver's C++/unwind defaults below).
 CXX_OBJS="$(find obj/buildtools/third_party/libc++ obj/buildtools/third_party/libc++abi -name '*.o')"
-# NDK clang used for target compiles (from the android call.cc command).
-CLANGXX="$(python3 - "$CC_JSON" <<'PY'
+UNWIND_OBJS="$(find obj/buildtools/third_party/libunwind -name '*.o')"
+[ -n "$UNWIND_OBJS" ] || { echo "no libunwind objects — build libwebrtc first" >&2; exit 1; }
+# Reuse the exact Chromium clang + android --target/--sysroot from the call.cc
+# command (there is no NDK clang in this stripped toolchain).
+read -r CLANGXX TGT SYSROOT <<EOF
+$(python3 - "$CC_JSON" <<'PY'
 import json,sys,re
 cc=json.load(open(sys.argv[1]))
 e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
-cmd=e['command'] if e.get('command') else ' '.join(e['arguments'])
-print(cmd.split(' ',1)[0])
+cmd=(e['command'] if e.get('command') else ' '.join(e['arguments'])).strip()
+tgt=re.search(r'--target=\S+',cmd); sr=re.search(r'--sysroot=(\S+)',cmd)
+print(cmd.split(' ',1)[0], tgt.group(0) if tgt else '', sr.group(1) if sr else '')
 PY
-)"
-
-echo "==> linking libveil_media.so"
+)
+EOF
+# AAudio's libaaudio.so lives only in the API 26+ lib dir; add it to the search path.
+AAUDIO_L="$SYSROOT/usr/lib/aarch64-linux-android/26"
+echo "==> linking libveil_media.so ($TGT, sysroot + api26 aaudio)"
 # shellcheck disable=SC2086
 "$CLANGXX" -shared -o "$DEST/libveil_media.so" \
-  "$TMP/engine.o" "$TMP/shim.o" "$TMP/aaudio_adm.o" obj/libwebrtc.a $CXX_OBJS \
-  --target=aarch64-linux-android21 \
+  $TGT --sysroot="$SYSROOT" -nostdlib++ -unwindlib=none \
+  "$TMP/engine.o" "$TMP/shim.o" "$TMP/aaudio_adm.o" obj/libwebrtc.a $CXX_OBJS $UNWIND_OBJS \
+  -L"$AAUDIO_L" \
   -Wl,--gc-sections -Wl,--version-script,"$TMP/exports.map" \
-  -Wl,--allow-shlib-undefined -Wl,-soname,libveil_media.so \
-  -static-libstdc++ -llog -laaudio -lOpenSLES -landroid
+  -Wl,-soname,libveil_media.so \
+  -llog -laaudio -lOpenSLES -landroid
+
+# Strip debug info (the ELF ships with debug_info otherwise → ~5MB smaller).
+STRIP="$(dirname "$CLANGXX")/llvm-strip"
+[ -x "$STRIP" ] && "$STRIP" --strip-unneeded "$DEST/libveil_media.so" 2>/dev/null || true
 
 echo "==> done: $DEST/libveil_media.so ($(du -h "$DEST/libveil_media.so" | cut -f1))"
 "${CLANGXX%clang++}llvm-nm" -D --defined-only "$DEST/libveil_media.so" 2>/dev/null | grep -c " T veil_media_" | xargs echo "exported veil_media_* symbols:"
