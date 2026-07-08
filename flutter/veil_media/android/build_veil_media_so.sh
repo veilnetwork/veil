@@ -85,8 +85,11 @@ echo "==> linking libveil_media.so ($TGT, sysroot + api26 aaudio)"
   -llog -laaudio -lOpenSLES -landroid
 
 # Strip debug info (the ELF ships with debug_info otherwise → ~5MB smaller).
+# VEIL_MEDIA_NO_STRIP=1 keeps symbols for crash symbolication.
 STRIP="$(dirname "$CLANGXX")/llvm-strip"
-[ -x "$STRIP" ] && "$STRIP" --strip-unneeded "$DEST/libveil_media.so" 2>/dev/null || true
+if [ -z "${VEIL_MEDIA_NO_STRIP:-}" ]; then
+  [ -x "$STRIP" ] && "$STRIP" --strip-unneeded "$DEST/libveil_media.so" 2>/dev/null || true
+fi
 
 # DT_NEEDED on libveilclient_ffi.so: it defines the two undefined veil_media_*
 # symbols (send_datagram / set_recv_callback). An explicit NEEDED makes the
