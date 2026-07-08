@@ -19,6 +19,7 @@
 #include "api/task_queue/task_queue_base.h"
 #include "call/call.h"
 #include "call/packet_receiver.h"
+#include "modules/rtp_rtcp/include/rtp_rtcp_defines.h"  // kVideoPayloadTypeFrequency
 #include "modules/rtp_rtcp/source/rtp_packet_received.h"
 #include "modules/rtp_rtcp/source/rtp_util.h"  // webrtc::IsRtcpPacket
 #include "rtc_base/copy_on_write_buffer.h"
@@ -135,11 +136,17 @@ void VeilTransportShim::DeliverOnNetworkThread(
   webrtc::RtpPacketReceived rtp;
   if (!rtp.Parse(packet)) return;
   const uint32_t vssrc = remote_video_ssrc_.load();
-  const webrtc::MediaType mt = (vssrc != 0 && rtp.Ssrc() == vssrc)
-                                   ? webrtc::MediaType::VIDEO
-                                   : webrtc::MediaType::AUDIO;
+  const bool is_video = (vssrc != 0 && rtp.Ssrc() == vssrc);
+  if (is_video) {
+    // Video RTP uses the fixed 90 kHz clock. The audio path gets its clock from
+    // the registered Opus codec, but nothing sets it for video on our custom
+    // DeliverRtpPacket route, so the receive-statistics RTC_CHECK_GT(frequency,
+    // 0) aborts (SIGABRT on the worker thread). Set it here.
+    rtp.set_payload_type_frequency(webrtc::kVideoPayloadTypeFrequency);
+  }
   receiver->DeliverRtpPacket(
-      mt, std::move(rtp),
+      is_video ? webrtc::MediaType::VIDEO : webrtc::MediaType::AUDIO,
+      std::move(rtp),
       /*undemuxable_packet_handler=*/
       [](const webrtc::RtpPacketReceived& /*parsed*/) {
         return false;  // drop packets we can't demux (no SSRC match)
