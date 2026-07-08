@@ -190,8 +190,13 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
           [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
       alog("avf_adm: mic auth=%ld (0=notDetermined 2=denied 3=authorized)",
            (long)mic_auth);
+      // Only attempt mic capture when it can actually work: authorization must
+      // not be denied/restricted (a denied mic makes installTapOnBus throw or
+      // deliver silence) and the input node must report a usable format.
+      const bool mic_ok = (mic_auth != AVAuthorizationStatusDenied &&
+                           mic_auth != AVAuthorizationStatusRestricted);
       AVAudioFormat* tap_fmt = [input outputFormatForBus:0];
-      if (tap_fmt.sampleRate > 0 && tap_fmt.channelCount > 0) {
+      if (mic_ok && tap_fmt.sampleRate > 0 && tap_fmt.channelCount > 0) {
         int16_format_ = [[AVAudioFormat alloc]
             initWithCommonFormat:AVAudioPCMFormatInt16
                       sampleRate:kSampleRate
@@ -201,6 +206,9 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                                                              toFormat:int16_format_];
         const double ratio = (double)kSampleRate / tap_fmt.sampleRate;
         InstallCaptureTapLocked(input, tap_fmt, ratio);
+      } else if (!mic_ok) {
+        alog("avf_adm: mic not authorized (auth=%ld) — playout only, no capture",
+             (long)mic_auth);
       } else {
         alog("avf_adm: input format not ready (sr=%.0f ch=%u) — mic ungranted?",
              tap_fmt.sampleRate, (unsigned)tap_fmt.channelCount);
@@ -208,14 +216,22 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     }
 
     if (recording_.load() || playing_.load()) {
-      [engine_ prepare];
-      NSError* err = nil;
-      if (![engine_ startAndReturnError:&err]) {
-        alog("avf_adm: engine start FAILED: %s",
-             err ? err.localizedDescription.UTF8String : "?");
-      } else {
-        alog("avf_adm: engine running (rec=%d play=%d)", (int)recording_.load(),
-             (int)playing_.load());
+      // prepare/start can also throw (not just return an error) on a bad graph
+      // or a mid-call route change — guard the same way so audio trouble never
+      // aborts the app.
+      @try {
+        [engine_ prepare];
+        NSError* err = nil;
+        if (![engine_ startAndReturnError:&err]) {
+          alog("avf_adm: engine start FAILED: %s",
+               err ? err.localizedDescription.UTF8String : "?");
+        } else {
+          alog("avf_adm: engine running (rec=%d play=%d)",
+               (int)recording_.load(), (int)playing_.load());
+        }
+      } @catch (NSException* e) {
+        alog("avf_adm: engine prepare/start threw (%s)",
+             e.reason.UTF8String ? e.reason.UTF8String : "?");
       }
     }
   }
@@ -224,12 +240,25 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                                AVAudioFormat* tap_fmt,
                                double ratio) {
     VeilAvfAdm* self = this;
-    [input installTapOnBus:0
-                bufferSize:1024
-                    format:tap_fmt
-                     block:^(AVAudioPCMBuffer* buffer, AVAudioTime* /*when*/) {
-                       self->OnCaptureBuffer(buffer, ratio);
-                     }];
+    // AVAudioEngine THROWS (does not return an error) if the tap format no
+    // longer matches the input node's hardware format — e.g. the audio route
+    // switches mid-call (Bluetooth/headset connect, default device change)
+    // between reading outputFormatForBus and installing the tap. An uncaught
+    // ObjC exception across this ObjC++/C++ boundary calls std::terminate and
+    // aborts the whole app. Catch it and degrade to "no mic this cycle"; a
+    // later Reconfigure re-tries with the current format.
+    @try {
+      [input installTapOnBus:0
+                  bufferSize:1024
+                      format:tap_fmt
+                       block:^(AVAudioPCMBuffer* buffer, AVAudioTime* /*when*/) {
+                         self->OnCaptureBuffer(buffer, ratio);
+                       }];
+    } @catch (NSException* e) {
+      alog("avf_adm: installTapOnBus threw (%s) — skipping mic capture",
+           e.reason.UTF8String ? e.reason.UTF8String : "?");
+      capture_converter_ = nil;
+    }
   }
 
   // Runs on a CoreAudio capture thread.
@@ -292,8 +321,17 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                                  AudioBufferList* out) {
              return self->OnRenderPlayout(is_silence, frame_count, out);
            }];
-    [engine_ attachNode:source_node_];
-    [engine_ connect:source_node_ to:engine_.mainMixerNode format:src_fmt];
+    // attach/connect can throw on a format mismatch with the mixer; guard so a
+    // graph-build failure degrades instead of aborting the app.
+    @try {
+      [engine_ attachNode:source_node_];
+      [engine_ connect:source_node_ to:engine_.mainMixerNode format:src_fmt];
+    } @catch (NSException* e) {
+      alog("avf_adm: attach/connect threw (%s)",
+           e.reason.UTF8String ? e.reason.UTF8String : "?");
+      engine_ = nil;  // leave un-built; ReconfigureLocked bails on engine_==nil
+      source_node_ = nil;
+    }
   }
 
   // Runs on the CoreAudio render thread.
