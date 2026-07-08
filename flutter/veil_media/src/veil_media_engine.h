@@ -94,13 +94,14 @@ int veil_media_engine_push_video_frame(VeilMediaEngine *engine,
                                        int stride_y, int stride_u, int stride_v,
                                        int64_t ts_us);
 
-/* Decoded remote frames (recv). The I420 planes are valid ONLY for the call;
- * copy if retained. Runs on a webrtc decode thread. cb=NULL clears it. */
-typedef void (*VeilVideoFrameFn)(void *ctx, const uint8_t *y, const uint8_t *u,
-                                 const uint8_t *v, int width, int height,
-                                 int stride_y, int stride_u, int stride_v);
-int veil_media_engine_set_video_frame_callback(VeilMediaEngine *engine,
-                                               VeilVideoFrameFn cb, void *ctx);
+/* Pull the latest decoded remote frame as tightly-packed RGBA (width*height*4
+ * bytes, row stride width*4). Copies into `dst` (capacity `dst_cap`) and sets
+ * *out_w/*out_h. Returns a monotonic frame sequence (>0) when a frame was
+ * copied, 0 if none decoded yet, or -1 if `dst_cap` is too small (out_w/out_h
+ * are still set so the caller can resize + retry). Poll at the display rate and
+ * repaint only when the returned sequence changes. Thread-safe. */
+int veil_media_engine_get_video_frame(VeilMediaEngine *engine, uint8_t *dst,
+                                      int dst_cap, int *out_w, int *out_h);
 
 /* ---- Device selection ----------------------------------------------------
  * Enumerate returns a heap-allocated JSON C string
