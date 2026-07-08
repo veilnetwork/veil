@@ -13,7 +13,9 @@
 
 #include "veil_media_engine.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -21,7 +23,10 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
 #include "api/audio/audio_device.h"
@@ -47,6 +52,22 @@
 #include "call/call.h"
 #include "call/call_config.h"
 #include "modules/audio_mixer/audio_mixer_impl.h"
+// --- Video (Phase 4): VP8 send/recv over the same veil channel ---
+#include "call/video_send_stream.h"
+#include "call/video_receive_stream.h"
+#include "video/config/video_encoder_config.h"
+#include "api/video_codecs/builtin_video_encoder_factory.h"
+#include "api/video_codecs/builtin_video_decoder_factory.h"
+#include "api/video/builtin_video_bitrate_allocator_factory.h"
+#include "api/video_codecs/sdp_video_format.h"
+#include "api/video/video_codec_type.h"
+#include "api/video/video_frame.h"
+#include "api/video/i420_buffer.h"
+#include "api/video/video_rotation.h"
+#include "api/video/video_source_interface.h"
+#include "api/video/video_sink_interface.h"
+#include "api/video/video_broadcaster.h"
+#include "rtc_base/time_utils.h"  // webrtc::TimeMicros
 
 #if defined(__APPLE__)
 #include "veil_avf_adm.h"
@@ -105,6 +126,66 @@ uint32_t ssrc_of(const uint8_t id[32]) {
   return s == 0 ? 1u : s;
 }
 
+// Video SSRC — derived from the node id but distinct from the audio SSRC so the
+// far side (and our shim) can demux audio vs video on the one datagram channel.
+uint32_t video_ssrc_of(const uint8_t id[32]) {
+  uint32_t s = ssrc_of(id) ^ 0x000000FFu ^ 0x56440000u;  // "VD" tag
+  return s == 0 ? 2u : s;
+}
+
+// Sink for decoded remote video frames: forwards I420 planes to the C-ABI
+// callback (Dart/render). OnFrame runs on a webrtc decode thread.
+class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
+ public:
+  void set_callback(VeilVideoFrameFn cb, void* ctx) {
+    std::lock_guard<std::mutex> l(m_);
+    cb_ = cb;
+    ctx_ = ctx;
+  }
+  void OnFrame(const webrtc::VideoFrame& frame) override {
+    VeilVideoFrameFn cb;
+    void* ctx;
+    {
+      std::lock_guard<std::mutex> l(m_);
+      cb = cb_;
+      ctx = ctx_;
+    }
+    if (cb == nullptr) return;
+    auto buf = frame.video_frame_buffer()->ToI420();
+    if (buf == nullptr) return;
+    cb(ctx, buf->DataY(), buf->DataU(), buf->DataV(), buf->width(),
+       buf->height(), buf->StrideY(), buf->StrideU(), buf->StrideV());
+  }
+
+ private:
+  std::mutex m_;
+  VeilVideoFrameFn cb_ = nullptr;
+  void* ctx_ = nullptr;
+};
+
+// Copy a (possibly strided) I420 frame into the broadcaster (encoder source).
+void push_i420(webrtc::VideoBroadcaster* source, const uint8_t* y,
+               const uint8_t* u, const uint8_t* v, int width, int height,
+               int stride_y, int stride_u, int stride_v, int64_t ts_us) {
+  if (source == nullptr || width <= 0 || height <= 0) return;
+  auto buf = webrtc::I420Buffer::Create(width, height);
+  const int cw = (width + 1) / 2, ch = (height + 1) / 2;
+  for (int r = 0; r < height; ++r)
+    std::memcpy(buf->MutableDataY() + r * buf->StrideY(), y + r * stride_y,
+                width);
+  for (int r = 0; r < ch; ++r)
+    std::memcpy(buf->MutableDataU() + r * buf->StrideU(), u + r * stride_u, cw);
+  for (int r = 0; r < ch; ++r)
+    std::memcpy(buf->MutableDataV() + r * buf->StrideV(), v + r * stride_v, cw);
+  webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                 .set_video_frame_buffer(buf)
+                                 .set_timestamp_us(ts_us ? ts_us
+                                                         : webrtc::TimeMicros())
+                                 .set_rotation(webrtc::kVideoRotation_0)
+                                 .build();
+  source->OnFrame(frame);
+}
+
 // All webrtc state, constructed together in create() (Environment has no
 // default ctor, so it can't be a bare member of the C-ABI handle).
 struct WebrtcState {
@@ -119,6 +200,16 @@ struct WebrtcState {
   std::unique_ptr<veil_media::VeilTransportShim> shim;
   webrtc::AudioSendStream* send_stream = nullptr;             // owned by Call
   webrtc::AudioReceiveStreamInterface* recv_stream = nullptr;  // owned by Call
+  // Video (Phase 4) — factories + source/sink outlive the streams.
+  std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory;
+  std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory;
+  std::unique_ptr<webrtc::VideoBitrateAllocatorFactory> video_bitrate_alloc_factory;
+  std::unique_ptr<webrtc::VideoBroadcaster> video_source;  // pushable
+  std::unique_ptr<VeilVideoSink> video_sink;               // renderer
+  webrtc::VideoSendStream* video_send_stream = nullptr;              // owned by Call
+  webrtc::VideoReceiveStreamInterface* video_recv_stream = nullptr;  // owned by Call
+  std::thread test_video_thread;         // synthetic source (VEIL_MEDIA_TEST_VIDEO)
+  std::atomic<bool> test_video_run{false};
 };
 #endif
 
@@ -204,6 +295,8 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
       veil_chan, ws->call.get(), ws->network_tq.get());
   ws->shim->Start();
 
+  ws->video_sink = std::make_unique<VeilVideoSink>();
+
   engine->ws = std::move(ws);
 #endif
   return engine.release();
@@ -211,6 +304,7 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
 
 void veil_media_engine_destroy(VeilMediaEngine* engine) {
   if (engine == nullptr) return;
+  veil_media_engine_stop_video(engine);
   veil_media_engine_stop_audio(engine);
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws) {
@@ -329,6 +423,171 @@ int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
       }
     });
   }
+#endif
+  return VEIL_MEDIA_OK;
+}
+
+int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
+  WebrtcState* ws = engine->ws.get();
+  const uint32_t local_v = video_ssrc_of(engine->local);
+  const uint32_t remote_v = video_ssrc_of(engine->peer);
+  constexpr int kVp8Pt = 96;
+
+  run_on(ws->worker_tq.get(), [&]() {
+    // Video has its own network state (defaults kNetworkDown); bring it up.
+    ws->call->SignalChannelNetworkState(webrtc::MediaType::VIDEO,
+                                        webrtc::kNetworkUp);
+    if (!ws->video_encoder_factory)
+      ws->video_encoder_factory = webrtc::CreateBuiltinVideoEncoderFactory();
+    if (!ws->video_decoder_factory)
+      ws->video_decoder_factory = webrtc::CreateBuiltinVideoDecoderFactory();
+    if (!ws->video_bitrate_alloc_factory)
+      ws->video_bitrate_alloc_factory =
+          webrtc::CreateBuiltinVideoBitrateAllocatorFactory();
+    if (!ws->video_source)
+      ws->video_source = std::make_unique<webrtc::VideoBroadcaster>();
+
+    if (send && ws->video_send_stream == nullptr) {
+      webrtc::VideoSendStream::Config sc(ws->shim.get());  // sets send_transport
+      sc.rtp.ssrcs = {local_v};                            // NOTE: vector
+      sc.rtp.payload_name = "VP8";
+      sc.rtp.payload_type = kVp8Pt;
+      sc.rtp.extensions.emplace_back(
+          webrtc::RtpExtension::kTransportSequenceNumberUri,
+          webrtc::RtpHeaderExtensionId(1));  // TWCC, same id as audio
+      sc.encoder_settings.encoder_factory = ws->video_encoder_factory.get();
+      sc.encoder_settings.bitrate_allocator_factory =
+          ws->video_bitrate_alloc_factory.get();  // REQUIRED (deref, no null-check)
+
+      webrtc::VideoEncoderConfig ec;
+      ec.codec_type = webrtc::kVideoCodecVP8;
+      ec.video_format = webrtc::SdpVideoFormat::VP8();
+      ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
+      ec.number_of_streams = 1;
+      ec.max_bitrate_bps = 2000000;
+      webrtc::VideoStream layer;  // ≥1 layer REQUIRED (default factory DCHECK)
+      layer.active = true;
+      layer.min_bitrate_bps = 100000;
+      layer.target_bitrate_bps = 1000000;
+      layer.max_bitrate_bps = 2000000;
+      layer.max_framerate = 30;
+      layer.max_qp = 56;
+      ec.simulcast_layers.push_back(layer);
+
+      ws->video_send_stream =
+          ws->call->CreateVideoSendStream(std::move(sc), std::move(ec));
+      if (ws->video_send_stream) {
+        ws->video_send_stream->SetSource(
+            ws->video_source.get(),
+            webrtc::DegradationPreference::MAINTAIN_FRAMERATE);
+        ws->video_send_stream->Start();
+      }
+    }
+    if (recv && ws->video_recv_stream == nullptr) {
+      webrtc::VideoReceiveStreamInterface::Config rc(
+          ws->shim.get(), ws->video_decoder_factory.get());
+      rc.rtp.remote_ssrc = remote_v;    // do NOT set local_ssrc (deprecated)
+      rc.renderer = ws->video_sink.get();
+      rc.decoders.emplace_back(webrtc::SdpVideoFormat::VP8(), kVp8Pt);
+      ws->video_recv_stream = ws->call->CreateVideoReceiveStream(std::move(rc));
+      if (ws->video_recv_stream) ws->video_recv_stream->Start();
+    }
+  });
+  // Route inbound video RTP (this SSRC) to the video demuxer in the shim.
+  ws->shim->SetRemoteVideoSsrc(remote_v);
+  vlog("video: start send=%d recv=%d ssrc(local=%u remote=%u)", send, recv,
+       local_v, remote_v);
+
+  // Built-in synthetic source (VEIL_MEDIA_TEST_VIDEO) — a moving gradient at
+  // ~30fps into the broadcaster, so video RTP flows without a real capturer.
+  if (send && std::getenv("VEIL_MEDIA_TEST_VIDEO") != nullptr &&
+      !ws->test_video_run.load()) {
+    ws->test_video_run.store(true);
+    ws->test_video_thread = std::thread([ws]() {
+      const int w = 320, h = 240;
+      const int cw = (w + 1) / 2, chh = (h + 1) / 2;
+      std::vector<uint8_t> yb(w * h), ub(cw * chh), vb(cw * chh);
+      uint32_t f = 0;
+      while (ws->test_video_run.load()) {
+        for (int j = 0; j < h; ++j)
+          for (int i = 0; i < w; ++i)
+            yb[j * w + i] = static_cast<uint8_t>(i + j + f);
+        std::fill(ub.begin(), ub.end(), static_cast<uint8_t>(128));
+        std::fill(vb.begin(), vb.end(), static_cast<uint8_t>(128 + f));
+        push_i420(ws->video_source.get(), yb.data(), ub.data(), vb.data(), w, h,
+                  w, cw, cw, 0);
+        if ((f % 60) == 0) vlog("test video: pushed %u frames", f);
+        ++f;
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
+      }
+    });
+  }
+  return VEIL_MEDIA_OK;
+#else
+  (void)send;
+  (void)recv;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+int veil_media_engine_stop_video(VeilMediaEngine* engine) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws) return VEIL_MEDIA_OK;
+  WebrtcState* ws = engine->ws.get();
+  // Stop the synthetic source first so no OnFrame races the stream teardown.
+  if (ws->test_video_run.exchange(false) && ws->test_video_thread.joinable())
+    ws->test_video_thread.join();
+  if (ws->call) {
+    run_on(ws->worker_tq.get(), [&]() {
+      if (ws->video_send_stream) {
+        ws->video_send_stream->Stop();
+        ws->call->DestroyVideoSendStream(ws->video_send_stream);
+        ws->video_send_stream = nullptr;
+      }
+      if (ws->video_recv_stream) {
+        ws->video_recv_stream->Stop();
+        ws->call->DestroyVideoReceiveStream(ws->video_recv_stream);
+        ws->video_recv_stream = nullptr;
+      }
+    });
+  }
+  if (ws->shim) ws->shim->SetRemoteVideoSsrc(0);
+#endif
+  return VEIL_MEDIA_OK;
+}
+
+int veil_media_engine_push_video_frame(VeilMediaEngine* engine,
+                                       const uint8_t* y, const uint8_t* u,
+                                       const uint8_t* v, int width, int height,
+                                       int stride_y, int stride_u, int stride_v,
+                                       int64_t ts_us) {
+  if (engine == nullptr || y == nullptr || u == nullptr || v == nullptr)
+    return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->ws->video_source) return VEIL_MEDIA_ERR_STATE;
+  push_i420(engine->ws->video_source.get(), y, u, v, width, height, stride_y,
+            stride_u, stride_v, ts_us);
+  return VEIL_MEDIA_OK;
+#else
+  (void)width; (void)height; (void)stride_y; (void)stride_u; (void)stride_v;
+  (void)ts_us;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+int veil_media_engine_set_video_frame_callback(VeilMediaEngine* engine,
+                                               VeilVideoFrameFn cb, void* ctx) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (engine->ws && engine->ws->video_sink)
+    engine->ws->video_sink->set_callback(cb, ctx);
+#else
+  (void)cb;
+  (void)ctx;
 #endif
   return VEIL_MEDIA_OK;
 }
