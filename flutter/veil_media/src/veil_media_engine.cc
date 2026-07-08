@@ -82,6 +82,7 @@
 #elif defined(__ANDROID__)
 #include "veil_aaudio_adm.h"
 #endif
+#include "veil_camera.h"
 #include "veil_transport_shim.h"
 #endif
 
@@ -231,6 +232,7 @@ struct WebrtcState {
   webrtc::VideoReceiveStreamInterface* video_recv_stream = nullptr;  // owned by Call
   std::thread test_video_thread;         // synthetic source (VEIL_MEDIA_TEST_VIDEO)
   std::atomic<bool> test_video_run{false};
+  std::unique_ptr<veil_media::CameraCapturer> camera;  // real capture source
 };
 #endif
 
@@ -574,7 +576,11 @@ int veil_media_engine_stop_video(VeilMediaEngine* engine) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws) return VEIL_MEDIA_OK;
   WebrtcState* ws = engine->ws.get();
-  // Stop the synthetic source first so no OnFrame races the stream teardown.
+  // Stop the sources first so no OnFrame races the stream teardown.
+  if (ws->camera) {
+    ws->camera->Stop();
+    ws->camera.reset();
+  }
   if (ws->test_video_run.exchange(false) && ws->test_video_thread.joinable())
     ws->test_video_thread.join();
   if (ws->call) {
@@ -592,6 +598,50 @@ int veil_media_engine_stop_video(VeilMediaEngine* engine) {
     });
   }
   if (ws->shim) ws->shim->SetRemoteVideoSsrc(0);
+#endif
+  return VEIL_MEDIA_OK;
+}
+
+int veil_media_engine_start_camera(VeilMediaEngine* engine, int width,
+                                   int height, int fps) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+  WebrtcState* ws = engine->ws.get();
+  if (!ws || !ws->video_source) return VEIL_MEDIA_ERR_STATE;
+  if (ws->camera) return VEIL_MEDIA_OK;  // already capturing
+  if (width <= 0) width = 352;
+  if (height <= 0) height = 288;
+  if (fps <= 0) fps = 15;
+  // Feed each captured I420 frame straight into the VP8 send source. The
+  // callback runs on the capture queue; push_i420 copies synchronously.
+  webrtc::VideoBroadcaster* src = ws->video_source.get();
+  ws->camera.reset(veil_media::CreatePlatformCamera(
+      [src](const uint8_t* y, const uint8_t* u, const uint8_t* v, int w, int h,
+            int sy, int su, int sv, int64_t ts_us) {
+        push_i420(src, y, u, v, w, h, sy, su, sv, ts_us);
+      }));
+  if (!ws->camera) return VEIL_MEDIA_ERR_STATE;
+  if (!ws->camera->Start(width, height, fps)) {
+    ws->camera.reset();
+    return VEIL_MEDIA_ERR_STATE;
+  }
+  vlog("camera: started %dx%d@%d", width, height, fps);
+  return VEIL_MEDIA_OK;
+#else
+  (void)width;
+  (void)height;
+  (void)fps;
+  return VEIL_MEDIA_ERR_STATE;  // no camera backend on this platform yet
+#endif
+}
+
+int veil_media_engine_stop_camera(VeilMediaEngine* engine) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (engine->ws && engine->ws->camera) {
+    engine->ws->camera->Stop();
+    engine->ws->camera.reset();
+  }
 #endif
   return VEIL_MEDIA_OK;
 }
