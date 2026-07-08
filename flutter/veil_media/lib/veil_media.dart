@@ -118,6 +118,37 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineStopCamera(_ptr) == 0;
   }
 
+  Pointer<Uint8>? _pushBuf; // reused Y|U|V staging buffer for pushVideoFrame
+  int _pushCap = 0;
+
+  /// Push one captured I420 frame (tightly packed: [y]=w*h, [u]=[v]=cw*ch) into
+  /// the video send stream. For platforms without a native camera backend
+  /// (Android), a Dart capturer converts camera frames to I420 and calls this.
+  /// Returns false if video send isn't started. Not thread-safe; call from one
+  /// isolate at the capture rate.
+  bool pushVideoFrame(Uint8List y, Uint8List u, Uint8List v, int width, int height) {
+    _ensure();
+    final total = y.length + u.length + v.length;
+    if (total <= 0) return false;
+    if (_pushBuf == null || _pushCap < total) {
+      if (_pushBuf != null) calloc.free(_pushBuf!);
+      _pushCap = total;
+      _pushBuf = calloc<Uint8>(_pushCap);
+    }
+    final buf = _pushBuf!;
+    final view = buf.asTypedList(total);
+    view.setRange(0, y.length, y);
+    view.setRange(y.length, y.length + u.length, u);
+    view.setRange(y.length + u.length, total, v);
+    final yp = buf;
+    final up = buf + y.length;
+    final vp = buf + (y.length + u.length);
+    final cw = (width + 1) ~/ 2;
+    final rc = ffi.veilMediaEnginePushVideoFrame(
+        _ptr, yp, up, vp, width, height, width, cw, cw, 0);
+    return rc == 0;
+  }
+
   /// The latest decoded remote video frame (RGBA), or null if there is no NEW
   /// frame since the last call. Poll at the display rate.
   VeilVideoFrame? getVideoFrame() {
@@ -195,6 +226,10 @@ class VeilMediaEngine {
     if (_frameBuf != null) {
       calloc.free(_frameBuf!);
       _frameBuf = null;
+    }
+    if (_pushBuf != null) {
+      calloc.free(_pushBuf!);
+      _pushBuf = null;
     }
   }
 
