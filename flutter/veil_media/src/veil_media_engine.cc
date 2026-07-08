@@ -48,7 +48,11 @@
 #include "call/call_config.h"
 #include "modules/audio_mixer/audio_mixer_impl.h"
 
+#if defined(__APPLE__)
 #include "veil_avf_adm.h"
+#elif defined(__ANDROID__)
+#include "veil_aaudio_adm.h"
+#endif
 #include "veil_transport_shim.h"
 #endif
 
@@ -158,7 +162,14 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   // reports RecordingIsAvailable=0 and hangs InitRecording inside this dylib
   // embed, so no mic audio reaches the send stream. The custom ADM captures via
   // AVAudioEngine (clean TCC integration) and is the portable path.
+#if defined(__APPLE__)
   ws->adm = veil_media::CreateVeilAvfAdm(ws->env);
+#elif defined(__ANDROID__)
+  ws->adm = veil_media::CreateVeilAAudioAdm(ws->env);
+#else
+  ws->adm = webrtc::CreateAudioDeviceModule(
+      ws->env, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
+#endif
   if (ws->adm) {
     const int32_t init_rc = ws->adm->Init();
     bool rec_avail = false, play_avail = false;
