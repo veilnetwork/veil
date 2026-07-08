@@ -88,5 +88,15 @@ echo "==> linking libveil_media.so ($TGT, sysroot + api26 aaudio)"
 STRIP="$(dirname "$CLANGXX")/llvm-strip"
 [ -x "$STRIP" ] && "$STRIP" --strip-unneeded "$DEST/libveil_media.so" 2>/dev/null || true
 
+# DT_NEEDED on libveilclient_ffi.so: it defines the two undefined veil_media_*
+# symbols (send_datagram / set_recv_callback). An explicit NEEDED makes the
+# android linker resolve them when this .so is dlopen'd — a plain RTLD_GLOBAL
+# preload from the Dart FFI side does NOT promote across bionic's namespaces.
+if command -v patchelf >/dev/null 2>&1; then
+  patchelf --add-needed libveilclient_ffi.so "$DEST/libveil_media.so" || true
+else
+  echo "WARN: patchelf missing — add DT_NEEDED libveilclient_ffi.so manually" >&2
+fi
+
 echo "==> done: $DEST/libveil_media.so ($(du -h "$DEST/libveil_media.so" | cut -f1))"
 "${CLANGXX%clang++}llvm-nm" -D --defined-only "$DEST/libveil_media.so" 2>/dev/null | grep -c " T veil_media_" | xargs echo "exported veil_media_* symbols:"
