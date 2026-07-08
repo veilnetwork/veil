@@ -137,12 +137,20 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   int32_t StartRecording() override {
     if (!initialized_) Init();
     recording_.store(true);
-    dispatch_sync(engine_queue_, ^{
+    // dispatch_ASYNC (not sync): StartRecording is invoked synchronously from the
+    // FFI caller — the Flutter UI isolate (engine.cc calls adm->StartRecording()
+    // straight from veil_media_engine_start_audio). The reconfigure it drives can
+    // block on a cold CoreAudio setup or a denied/absent mic
+    // ([AVAudioEngine startAndReturnError:] can wedge), and a dispatch_sync there
+    // freezes the WHOLE app (device-observed: desktop UI hangs on accept). The
+    // serial engine_queue_ still preserves start/stop order; audio just comes up a
+    // beat later instead of taking the UI thread down with it.
+    dispatch_async(engine_queue_, ^{
       if (rec_fine_) rec_fine_->ResetRecord();
       audio_device_buffer_.StartRecording();
       ReconfigureLocked();
     });
-    alog("avf_adm: StartRecording");
+    alog("avf_adm: StartRecording (async)");
     return 0;
   }
   int32_t StopRecording() override {
@@ -158,12 +166,14 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   int32_t StartPlayout() override {
     if (!initialized_) Init();
     playing_.store(true);
-    dispatch_sync(engine_queue_, ^{
+    // dispatch_ASYNC — same reason as StartRecording: never block the FFI/UI
+    // isolate on the CoreAudio engine start (it can wedge when the mic is denied).
+    dispatch_async(engine_queue_, ^{
       if (play_fine_) play_fine_->ResetPlayout();
       audio_device_buffer_.StartPlayout();
       ReconfigureLocked();
     });
-    alog("avf_adm: StartPlayout");
+    alog("avf_adm: StartPlayout (async)");
     return 0;
   }
   int32_t StopPlayout() override {
