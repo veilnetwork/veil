@@ -60,11 +60,17 @@ cd "$WEBRTC_SRC/$WEBRTC_OUT"
 CXX_OBJS="$(find obj/buildtools/third_party/libc++ obj/buildtools/third_party/libc++abi -name '*.o')"
 SDK="sdk/xcode_links/$(ls sdk/xcode_links | grep -iE 'MacOSX[0-9].*\.sdk$' | head -1)"
 
-echo "==> linking libveil_media.dylib (sdk=$SDK)"
+# dead_strip keeps the dylib ~4MB, but it can drop codec code that WebRTC's
+# builtin factories reach only through internal function-pointer tables (the VP8
+# video encoder factory crashed with a null call). Set VEIL_MEDIA_NO_DEADSTRIP=1
+# to link the whole reachable graph while diagnosing that.
+DEADSTRIP="-Wl,-dead_strip"
+[ -n "${VEIL_MEDIA_NO_DEADSTRIP:-}" ] && DEADSTRIP=""
+echo "==> linking libveil_media.dylib (sdk=$SDK, deadstrip='${DEADSTRIP}')"
 # shellcheck disable=SC2086
 "$CLANGXX" -dynamiclib -o "$DEST/libveil_media.dylib" \
   "$TMP/engine.o" "$TMP/shim.o" "$TMP/avf_adm.o" obj/libwebrtc.a $CXX_OBJS \
-  -Wl,-dead_strip -Wl,-undefined,dynamic_lookup \
+  $DEADSTRIP -Wl,-undefined,dynamic_lookup \
   -Wl,-exported_symbols_list,"$TMP/exported.txt" \
   -install_name @rpath/libveil_media.dylib \
   --target=arm64-apple-macos -isysroot "$SDK" \

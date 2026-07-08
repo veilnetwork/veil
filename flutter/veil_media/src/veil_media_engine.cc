@@ -56,8 +56,15 @@
 #include "call/video_send_stream.h"
 #include "call/video_receive_stream.h"
 #include "video/config/video_encoder_config.h"
-#include "api/video_codecs/builtin_video_encoder_factory.h"
-#include "api/video_codecs/builtin_video_decoder_factory.h"
+// Header-only template factories (VP8 only): CreateBuiltin*Video*Factory live in
+// separate GN targets that `ninja webrtc` does NOT pull into libwebrtc.a, so
+// calling them crashes (undefined -> null under -undefined dynamic_lookup). The
+// templates instantiate in this TU and reference the VP8 impls that ARE in
+// libwebrtc.a.
+#include "api/video_codecs/video_encoder_factory_template.h"
+#include "api/video_codecs/video_encoder_factory_template_libvpx_vp8_adapter.h"
+#include "api/video_codecs/video_decoder_factory_template.h"
+#include "api/video_codecs/video_decoder_factory_template_libvpx_vp8_adapter.h"
 #include "api/video/builtin_video_bitrate_allocator_factory.h"
 #include "api/video_codecs/sdp_video_format.h"
 #include "api/video/video_codec_type.h"
@@ -441,9 +448,13 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv) {
     ws->call->SignalChannelNetworkState(webrtc::MediaType::VIDEO,
                                         webrtc::kNetworkUp);
     if (!ws->video_encoder_factory)
-      ws->video_encoder_factory = webrtc::CreateBuiltinVideoEncoderFactory();
+      ws->video_encoder_factory =
+          std::make_unique<webrtc::VideoEncoderFactoryTemplate<
+              webrtc::LibvpxVp8EncoderTemplateAdapter>>();
     if (!ws->video_decoder_factory)
-      ws->video_decoder_factory = webrtc::CreateBuiltinVideoDecoderFactory();
+      ws->video_decoder_factory =
+          std::make_unique<webrtc::VideoDecoderFactoryTemplate<
+              webrtc::LibvpxVp8DecoderTemplateAdapter>>();
     if (!ws->video_bitrate_alloc_factory)
       ws->video_bitrate_alloc_factory =
           webrtc::CreateBuiltinVideoBitrateAllocatorFactory();
@@ -479,6 +490,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv) {
 
       ws->video_send_stream =
           ws->call->CreateVideoSendStream(std::move(sc), std::move(ec));
+      vlog("video: send stream=%p", (void*)ws->video_send_stream);
       if (ws->video_send_stream) {
         ws->video_send_stream->SetSource(
             ws->video_source.get(),
