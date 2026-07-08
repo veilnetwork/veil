@@ -713,10 +713,31 @@ pub unsafe extern "C" fn veil_media_open_channel(
     // One drain task per channel: warm the circuit, then pump queued datagrams
     // into the lossy send. `send_datagram` itself drops on QueueFull/no-route,
     // so a wedged circuit degrades to silent loss, never to a stall.
+    //
+    // Self-heal a stale route: the initial `media_open_channel` resolves the
+    // peer's rendezvous ONCE. If the channel is opened before the peer has
+    // (re)published a reachable rendezvous ad — e.g. a call whose callee is a
+    // just-woken NAT'd phone that registers seconds/minutes later — that resolve
+    // finds stale/absent ads, the circuit points nowhere, and EVERY datagram is
+    // silently dropped for the whole call (device-observed: desktop->phone media
+    // 0% while phone->desktop was fine). A run of no-route drops is the signal to
+    // re-resolve: re-call `media_open_channel` (ensure_outbound_opening rebuilds
+    // with a fresh resolve past its own dedup window), so we pick the peer up the
+    // moment it becomes reachable instead of staying dark. Healthy sends return
+    // true and reset the counter, so a flowing call pays nothing.
+    const MEDIA_REWARM_EVERY_DROPS: u32 = 20;
     let task = handle_live.bundle.runtime.spawn(async move {
         send_hub.media_open_channel(peer).await;
+        let mut consecutive_drops: u32 = 0;
         while let Some(pkt) = rx.recv().await {
-            send_hub.media_send_datagram(peer, &pkt).await;
+            if send_hub.media_send_datagram(peer, &pkt).await {
+                consecutive_drops = 0;
+            } else {
+                consecutive_drops += 1;
+                if consecutive_drops % MEDIA_REWARM_EVERY_DROPS == 1 {
+                    send_hub.media_open_channel(peer).await;
+                }
+            }
         }
     });
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
