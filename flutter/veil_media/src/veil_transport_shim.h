@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <span>
 
@@ -68,6 +69,11 @@ class VeilTransportShim : public webrtc::Transport {
   bool SendRtcp(std::span<const uint8_t> packet,
                 const webrtc::PacketOptions& options) override;
 
+  // Tell the shim which inbound RTP SSRC is video, so DeliverRtpPacket is called
+  // with MediaType::VIDEO (the Call routes to the audio vs video demuxer BY the
+  // media type — a wrong type black-holes the packet). 0 = no video (all audio).
+  void SetRemoteVideoSsrc(uint32_t ssrc) { remote_video_ssrc_.store(ssrc); }
+
  private:
   // C trampoline for veil_media_set_recv_callback(cb(ctx,ptr,len)).
   static void OnVeilDatagram(void* ctx, const uint8_t* ptr, size_t len);
@@ -77,6 +83,7 @@ class VeilTransportShim : public webrtc::Transport {
   const uint64_t veil_chan_;
   webrtc::Call* const call_;
   webrtc::TaskQueueBase* const network_queue_;
+  std::atomic<uint32_t> remote_video_ssrc_{0};
   bool started_ = false;
 };
 
