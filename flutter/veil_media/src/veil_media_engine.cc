@@ -14,7 +14,9 @@
 #include "veil_media_engine.h"
 
 #include <atomic>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -51,6 +53,19 @@ namespace {
 
 const char* kVersion = "veil_media 0.0.1 (phase3)";
 constexpr int kOpusPayloadType = 111;  // SDP convention (Opus, 48k, stereo)
+
+// Diagnostic log to a file (a GUI app's stderr is not captured by the unified
+// log). Best-effort; append.
+void vlog(const char* fmt, ...) {
+  FILE* f = fopen("/tmp/veil_media_diag.log", "a");
+  if (!f) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fputc('\n', f);
+  fclose(f);
+}
 
 char* dup_cstr(const std::string& s) {
   char* out = static_cast<char*>(std::malloc(s.size() + 1));
@@ -138,7 +153,16 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
 
   ws->adm = webrtc::CreateAudioDeviceModule(
       ws->env, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
-  if (ws->adm) ws->adm->Init();
+  if (ws->adm) {
+    const int32_t init_rc = ws->adm->Init();
+    bool rec_avail = false, play_avail = false;
+    ws->adm->RecordingIsAvailable(&rec_avail);
+    ws->adm->PlayoutIsAvailable(&play_avail);
+    vlog("adm: Init=%d Initialized=%d recDevs=%d playDevs=%d recAvail=%d "
+         "playAvail=%d",
+         init_rc, ws->adm->Initialized(), (int)ws->adm->RecordingDevices(),
+         (int)ws->adm->PlayoutDevices(), rec_avail, play_avail);
+  }
   ws->apm = webrtc::BuiltinAudioProcessingBuilder().Build(ws->env);
 
   webrtc::AudioState::Config asc;
@@ -146,6 +170,13 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   asc.audio_processing = ws->apm;
   asc.audio_device_module = ws->adm;
   ws->audio_state = webrtc::AudioState::Create(asc);
+  // Route the ADM's recorded audio into the AudioState's transport. In the
+  // PeerConnection path WebRtcVoiceEngine does this; on the direct Call path we
+  // must — without it the mic records but no audio reaches the send stream (only
+  // RTCP flows).
+  if (ws->adm && ws->audio_state) {
+    ws->adm->RegisterAudioCallback(ws->audio_state->audio_transport());
+  }
 
   webrtc::CallConfig call_cfg(ws->env, ws->worker_tq.get(),
                               ws->network_tq.get());
@@ -211,6 +242,48 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
       if (ws->recv_stream) ws->recv_stream->Start();
     }
   });
+  // webrtc::Call does NOT drive the AudioDeviceModule the way PeerConnection
+  // does — start capture/playout explicitly, else the send stream has no audio
+  // frames (only RTCP flows) and the recv stream is never played out. CRITICAL:
+  // do this on the CALLING thread, NOT the Call worker queue — CoreAudio's
+  // StartRecording can block, and blocking the worker wedges the whole Call
+  // (no RTP/RTCP goes out at all).
+  // NOTE (macOS): the CoreAudio ADM in this build reports RecordingIsAvailable=0
+  // / PlayoutIsAvailable=0 and InitRecording/InitPlayout block or fail, which
+  // hangs the app. Until that's resolved, gate the ADM start behind an env flag
+  // so the engine stays stable (call reaches `active`, RTCP/RTP transport works;
+  // real capture is a follow-up). Set VEIL_MEDIA_START_ADM=1 to experiment.
+  if (ws->adm && std::getenv("VEIL_MEDIA_START_ADM") != nullptr) {
+    if (send && !ws->adm->Recording()) {
+      const int32_t sd = ws->adm->SetRecordingDevice(0);
+      const int32_t im = ws->adm->InitMicrophone();
+      const int32_t ir = ws->adm->InitRecording();
+      const int32_t sr = ws->adm->StartRecording();
+      vlog("send: SetRecDev=%d InitMic=%d InitRec=%d StartRec=%d Recording=%d",
+           sd, im, ir, sr, ws->adm->Recording());
+    }
+    if (recv && !ws->adm->Playing()) {
+      const int32_t pd = ws->adm->SetPlayoutDevice(0);
+      ws->adm->InitSpeaker();
+      const int32_t ip = ws->adm->InitPlayout();
+      const int32_t sp = ws->adm->StartPlayout();
+      vlog("recv: SetPlayDev=%d InitPlayout=%d StartPlayout=%d Playing=%d", pd,
+           ip, sp, ws->adm->Playing());
+    }
+  }
+  // A few seconds in, log the send stream's packet counters — the definitive
+  // "is audio actually going out" check.
+  if (ws->send_stream) {
+    ws->worker_tq->PostDelayedTask(
+        [ws]() {
+          if (ws->send_stream) {
+            const auto s = ws->send_stream->GetStats();
+            vlog("sendstream @3s: packets_sent=%lld bytes=%lld",
+                 (long long)s.packets_sent, (long long)s.payload_bytes_sent);
+          }
+        },
+        webrtc::TimeDelta::Seconds(3));
+  }
   engine->audio_running.store(true);
   return VEIL_MEDIA_OK;
 #else
@@ -226,6 +299,12 @@ int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws && engine->ws->call) {
     WebrtcState* ws = engine->ws.get();
+    // Stop the ADM off the worker queue (see start_audio — StartRecording/
+    // StopRecording can block CoreAudio and must not wedge the Call worker).
+    if (ws->adm) {
+      if (ws->adm->Recording()) ws->adm->StopRecording();
+      if (ws->adm->Playing()) ws->adm->StopPlayout();
+    }
     run_on(ws->worker_tq.get(), [&]() {
       if (ws->send_stream) {
         ws->send_stream->Stop();
