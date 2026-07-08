@@ -34,3 +34,8 @@ flutter:
       # (declaring them here without build files breaks `flutter build ios/apk`).
       macos:
         ffiPlugin: true
+      # Linux desktop — libveil_media.so (from-source linux-x64 WebRTC + the V4L2
+      # camera capturer) is built by linux/build_veil_media_so_linux.sh and
+      # bundled via linux/CMakeLists.txt. Audio uses WebRTC's builtin linux ADM.
+      linux:
+        ffiPlugin: true

@@ -1,0 +1,4 @@
+# Prebuilt native engine — a build artifact (like macos/Frameworks/*.dylib),
+# produced by build_veil_media_so_linux.sh and delivered out-of-band, not
+# committed. The build script + CMakeLists here are the tracked recipe.
+*.so
