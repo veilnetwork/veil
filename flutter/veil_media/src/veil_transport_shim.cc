@@ -92,15 +92,14 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
            (unsigned long long)c, (unsigned long long)veil_chan_,
            packet.size(), rc);
   }
-  // rc: 0 queued, 1 dropped (queue full), -1 invalid. A media transport is
-  // lossy by design, so report success even on a local drop — the congestion
-  // controller reacts to TWCC feedback, not to our queue depth, and returning
-  // false here would trip spurious send failures inside the pacer.
-  const bool sent = rc >= 0;
+  // rc: 0 queued, 1 dropped (queue full), -1 invalid. Queue-full means this
+  // packet already lost its real-time slot; report it as unsent so WebRTC does
+  // not treat local buffering as healthy delivery and build a stale tail.
+  const bool sent = rc == 0;
 
   // Close the send-side GCC timing loop. Our datagram send is synchronous on
   // the network thread, so stamp "now" and report immediately.
-  if (options.packet_id != -1) {
+  if (sent && options.packet_id != -1) {
     call_->OnSentPacket(
         webrtc::SentPacketInfo(options.packet_id, webrtc::TimeMillis()));
   }
@@ -112,7 +111,7 @@ bool VeilTransportShim::SendRtcp(std::span<const uint8_t> packet,
   (void)options;  // RTCP carries no packet_id to feed back.
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
-  return rc >= 0;
+  return rc == 0;
 }
 
 // static — invoked on a tokio worker thread (foreign to WebRTC). Copy the bytes
