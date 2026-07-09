@@ -57,9 +57,9 @@ final int Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineStopVideo =
         .asFunction();
 
 // push_video_frame(engine*, y, u, v, w, h, stride_y, stride_u, stride_v, ts_us) -> int
-final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Uint8>, Pointer<Uint8>,
-        Pointer<Uint8>, int, int, int, int, int, int) veilMediaEnginePushVideoFrame =
-    nativeLib
+final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Uint8>,
+        Pointer<Uint8>, Pointer<Uint8>, int, int, int, int, int, int)
+    veilMediaEnginePushVideoFrame = nativeLib
         .lookup<
             NativeFunction<
                 Int32 Function(
@@ -97,9 +97,26 @@ final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Uint8>, int,
     nativeLib
         .lookup<
             NativeFunction<
-                Int32 Function(Pointer<VeilMediaEngineHandle>, Pointer<Uint8>,
-                    Int32, Pointer<Int32>,
+                Int32 Function(
+                    Pointer<VeilMediaEngineHandle>,
+                    Pointer<Uint8>,
+                    Int32,
+                    Pointer<Int32>,
                     Pointer<Int32>)>>('veil_media_engine_get_video_frame')
+        .asFunction();
+
+// get_local_video_frame(engine*, dst, dst_cap, out_w, out_h) -> int seq
+final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Uint8>, int,
+        Pointer<Int32>, Pointer<Int32>) veilMediaEngineGetLocalVideoFrame =
+    nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                    Pointer<VeilMediaEngineHandle>,
+                    Pointer<Uint8>,
+                    Int32,
+                    Pointer<Int32>,
+                    Pointer<Int32>)>>('veil_media_engine_get_local_video_frame')
         .asFunction();
 
 // set_mic_muted(engine*, muted int) -> int
@@ -124,16 +141,16 @@ final int Function(Pointer<VeilMediaEngineHandle>, int)
 final Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)
     veilMediaEngineListAudioInputs = nativeLib
         .lookup<
-            NativeFunction<
-                Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)>>(
+                NativeFunction<
+                    Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)>>(
             'veil_media_engine_list_audio_inputs')
         .asFunction();
 
 final Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)
     veilMediaEngineListAudioOutputs = nativeLib
         .lookup<
-            NativeFunction<
-                Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)>>(
+                NativeFunction<
+                    Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)>>(
             'veil_media_engine_list_audio_outputs')
         .asFunction();
 
@@ -158,8 +175,8 @@ final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Utf8>)
 final Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)
     veilMediaEngineGetStats = nativeLib
         .lookup<
-            NativeFunction<
-                Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)>>(
+                NativeFunction<
+                    Pointer<Utf8> Function(Pointer<VeilMediaEngineHandle>)>>(
             'veil_media_engine_get_stats')
         .asFunction();
 
