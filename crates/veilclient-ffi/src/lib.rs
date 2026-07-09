@@ -670,12 +670,14 @@ static MEDIA_CHANNELS: std::sync::LazyLock<
 #[cfg(feature = "node-embedded")]
 static MEDIA_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Outbound queue depth per channel. At ~50 audio pkts/s (20 ms Opus) this is
-/// ~5 s of backlog before drop — far more than a real-time path should ever
-/// accumulate, so overflow means the circuit is genuinely wedged and dropping
-/// is correct.
+/// Outbound queue depth per channel. Keep this intentionally small: media is a
+/// real-time path, and a deep FIFO turns transient overload into seconds of
+/// stale audio/video. At ~50 audio pkts/s (20 ms Opus), 32 packets is well under
+/// a second; video bursts can still absorb tiny jitter, but sustained overload
+/// drops new packets quickly instead of letting latency climb for the rest of
+/// the call.
 #[cfg(feature = "node-embedded")]
-const MEDIA_TX_QUEUE: usize = 256;
+const MEDIA_TX_QUEUE: usize = 32;
 
 /// Open a lossy MEDIA datagram channel to `peer` over the anonymous circuit
 /// (reuses the reliable stream's rendezvous/pool and warms the circuit in the
