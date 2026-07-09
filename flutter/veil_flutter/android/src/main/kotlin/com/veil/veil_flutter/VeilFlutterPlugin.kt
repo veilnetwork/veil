@@ -98,10 +98,14 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             "startBackgroundService" -> {
                 val title = call.argument<String>("title")
                 val text  = call.argument<String>("text")
+                val hangupAction = call.argument<Boolean>("hangupAction") ?: false
+                val ringing = call.argument<Boolean>("ringing") ?: false
                 val intent = Intent(ctx, VeilDaemonService::class.java).apply {
                     action = VeilDaemonService.ACTION_START
                     if (title != null) putExtra(VeilDaemonService.EXTRA_NOTIFICATION_TITLE, title)
                     if (text  != null) putExtra(VeilDaemonService.EXTRA_NOTIFICATION_TEXT, text)
+                    putExtra(VeilDaemonService.EXTRA_HANGUP_ACTION, hangupAction)
+                    putExtra(VeilDaemonService.EXTRA_RINGING, ringing)
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     ctx.startForegroundService(intent)

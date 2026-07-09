@@ -68,11 +68,18 @@ class VeilBackground {
   ///
   /// Idempotent — calling start when the service is already running
   /// just refreshes the notification text.
-  static Future<void> start({String? title, String? text}) async {
+  static Future<void> start({
+    String? title,
+    String? text,
+    bool hangupAction = false,
+    bool ringing = false,
+  }) async {
     if (!Platform.isAndroid) return;
     await _channel.invokeMethod<void>('startBackgroundService', <String, dynamic>{
       if (title != null) 'title': title,
       if (text  != null) 'text':  text,
+      if (hangupAction) 'hangupAction': true,
+      if (ringing) 'ringing': true,
     });
   }
 
