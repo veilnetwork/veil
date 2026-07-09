@@ -9,10 +9,12 @@
 #include "veil_transport_shim.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdio>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -37,6 +39,9 @@ int veil_media_set_recv_callback(uint64_t chan, VeilMediaRecvFn cb, void* ctx);
 
 namespace veil_media {
 namespace {
+constexpr size_t kMaxInboundPendingPackets = 256;
+constexpr size_t kMaxInboundPendingBytes = 4 * 1024 * 1024;
+
 void slog(const char* fmt, ...) {
   FILE* f = fopen("/tmp/veil_media_diag.log", "a");
   if (!f) return;
@@ -57,16 +62,22 @@ VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
 VeilTransportShim::~VeilTransportShim() { Stop(); }
 
 void VeilTransportShim::Start() {
-  if (started_) return;
+  bool expected = false;
+  if (!started_.compare_exchange_strong(expected, true)) return;
   veil_media_set_recv_callback(veil_chan_, &VeilTransportShim::OnVeilDatagram,
                                this);
-  started_ = true;
 }
 
 void VeilTransportShim::Stop() {
-  if (!started_) return;
+  bool expected = true;
+  if (!started_.compare_exchange_strong(expected, false)) return;
   veil_media_set_recv_callback(veil_chan_, nullptr, nullptr);
-  started_ = false;
+  for (int i = 0; i < 200; ++i) {
+    if (inbound_pending_packets_.load(std::memory_order_acquire) == 0) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  slog("shim Stop timed out with pending inbound packets=%zu bytes=%zu",
+       inbound_pending_packets_.load(), inbound_pending_bytes_.load());
 }
 
 bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
@@ -110,10 +121,33 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
                                        size_t len) {
   auto* self = static_cast<VeilTransportShim*>(ctx);
   if (self == nullptr || ptr == nullptr || len == 0) return;
+  if (!self->started_.load(std::memory_order_acquire)) return;
+  const size_t pending_packets =
+      self->inbound_pending_packets_.load(std::memory_order_relaxed);
+  const size_t pending_bytes =
+      self->inbound_pending_bytes_.load(std::memory_order_relaxed);
+  if (pending_packets >= kMaxInboundPendingPackets ||
+      pending_bytes + len > kMaxInboundPendingBytes) {
+    const uint64_t dropped =
+        self->inbound_dropped_overload_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (dropped == 1 || dropped % 500 == 0) {
+      slog("shim drop inbound overload chan=%llu pending=%zu bytes=%zu len=%zu drops=%llu",
+           (unsigned long long)self->veil_chan_, pending_packets,
+           pending_bytes, len, (unsigned long long)dropped);
+    }
+    return;
+  }
   std::vector<uint8_t> owned(ptr, ptr + len);
+  self->inbound_pending_packets_.fetch_add(1, std::memory_order_release);
+  self->inbound_pending_bytes_.fetch_add(owned.size(), std::memory_order_release);
   self->network_queue_->PostTask(
       [self, buf = std::move(owned)]() mutable {
-        self->DeliverOnNetworkThread(std::span<const uint8_t>(buf));
+        if (self->started_.load(std::memory_order_acquire)) {
+          self->DeliverOnNetworkThread(std::span<const uint8_t>(buf));
+        }
+        self->inbound_pending_bytes_.fetch_sub(buf.size(),
+                                               std::memory_order_release);
+        self->inbound_pending_packets_.fetch_sub(1, std::memory_order_release);
       });
 }
 
