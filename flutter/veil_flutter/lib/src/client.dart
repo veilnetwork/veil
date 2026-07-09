@@ -205,6 +205,29 @@ int _mediaOpenChannelWorker(int handleAddr, Uint8List peerNode) {
   }
 }
 
+/// Off-isolate body of [AppHandle.openDirectMediaChannel]. The native media
+/// channel keeps the app sender and pumps RTP/RTCP over direct app datagrams.
+int _directMediaOpenChannelWorker(
+    int appAddr, Uint8List peerNode, Uint8List peerApp, int peerEndpoint) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerNode);
+  final pa = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerApp);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final chan =
+        ffi.veilMediaOpenDirectChannel(app, pn, pa, peerEndpoint, errOut);
+    if (chan == 0) {
+      throw VeilException(
+          'direct media open failed: ${_readErrAndFree(errOut)}');
+    }
+    return chan;
+  } finally {
+    calloc.free(pn);
+    calloc.free(pa);
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate body of [VeilClient.nodeId] — the native call performs an IPC
 /// request via tokio block_on, so it must not run on Flutter's UI isolate.
 Uint8List _nodeIdWorker(int handleAddr) {
@@ -782,6 +805,27 @@ class VeilClient implements Finalizable {
       return ffi.veilMediaRecvCount(pn);
     } finally {
       calloc.free(pn);
+    }
+  }
+
+  /// Deliver a direct media datagram received on a Dart-bound media app endpoint
+  /// into the native media callback registry used by veil_media.
+  int dispatchDirectMediaDatagram({
+    required Uint8List srcNodeId,
+    required Uint8List payload,
+  }) {
+    if (srcNodeId.length != 32) {
+      throw ArgumentError('srcNodeId must be 32 bytes');
+    }
+    if (payload.isEmpty) return -1;
+    final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, srcNodeId);
+    final buf = calloc<Uint8>(payload.length)
+      ..asTypedList(payload.length).setAll(0, payload);
+    try {
+      return ffi.veilMediaDispatchDirectDatagram(pn, buf, payload.length);
+    } finally {
+      calloc.free(pn);
+      calloc.free(buf);
     }
   }
 
@@ -2009,6 +2053,22 @@ class AppHandle implements Finalizable {
     final addr = await Isolate.run(() => _openStreamWorker(
         appAddr, dstNodeId, dstAppId, dstEndpointId, initialWindow));
     return VeilStream.fromFfi(Pointer<ffi.VeilStreamFfi>.fromAddress(addr));
+  }
+
+  /// Open a media channel whose outgoing RTP/RTCP is sent as direct app
+  /// datagrams from this endpoint to the peer's media endpoint.
+  Future<int> openDirectMediaChannel({
+    required Uint8List dstNodeId,
+    required Uint8List dstAppId,
+    required int dstEndpointId,
+  }) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32 || dstAppId.length != 32) {
+      throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
+    }
+    final appAddr = _app.address;
+    return Isolate.run(() => _directMediaOpenChannelWorker(
+        appAddr, dstNodeId, dstAppId, dstEndpointId));
   }
 
   /// Wait up to [timeout] for a remote peer to open an inbound byte-stream to

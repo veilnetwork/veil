@@ -404,7 +404,7 @@ pub struct VeilHandle {
 /// regardless of whether a recv handler is installed.
 pub struct VeilApp {
     bundle: Arc<RuntimeBundle>,
-    sender: TokioMutex<Option<AppSender>>,
+    sender: Arc<TokioMutex<Option<AppSender>>>,
     /// Raw inbound-DATAGRAM channel, drained by the single persistent recv
     /// task. Split out of the SDK [`AppReceiver`] (`into_parts`) so the
     /// inbound-STREAM channel can be drained independently — a `select!` over
@@ -804,6 +804,77 @@ pub unsafe extern "C" fn veil_media_open_channel(
     id
 }
 
+/// Open a lossy MEDIA datagram channel to `peer` over a direct app endpoint.
+/// Outbound RTP/RTCP is sent from `app` to `(peer_node_id, peer_app_id,
+/// peer_endpoint_id)`. Inbound direct media datagrams must be received by the
+/// host on the same app endpoint and fed to
+/// [`veil_media_dispatch_direct_datagram`].
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_open_direct_channel(
+    app: *mut VeilApp,
+    peer_node_id: *const u8,
+    peer_app_id: *const u8,
+    peer_endpoint_id: u32,
+    err_out: *mut *mut c_char,
+) -> u64 {
+    if unsafe { guard::ffi_prelude(err_out, "veil_media_open_direct_channel") }.is_err() {
+        return 0;
+    }
+    null_check_with_default!(err_out, 0u64,
+        "app" => app,
+        "peer_node_id" => peer_node_id,
+        "peer_app_id" => peer_app_id,
+    );
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        0u64,
+        "VeilApp"
+    );
+    let mut peer = [0u8; 32];
+    let mut peer_app = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(peer_app_id, peer_app.as_mut_ptr(), 32);
+    }
+
+    let (tx_hi, mut rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
+    let (tx_video, mut rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
+    let sender = Arc::clone(&app_ref.sender);
+    let task = app_ref.bundle.runtime.spawn(async move {
+        loop {
+            let pkt = tokio::select! {
+                biased;
+                Some(pkt) = rx_hi.recv() => pkt,
+                Some(pkt) = rx_video.recv() => pkt,
+                else => break,
+            };
+            let guard = sender.lock().await;
+            let Some(sender) = guard.as_ref() else {
+                break;
+            };
+            let _ = sender.send_owned(peer, peer_app, peer_endpoint_id, pkt).await;
+        }
+    });
+    let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    MEDIA_CHANNELS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            id,
+            MediaChannel {
+                tx_hi,
+                tx_video,
+                peer,
+                task,
+            },
+        );
+    id
+}
+
 /// Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING: returns 0 if
 /// queued, 1 if dropped (queue full / channel closing) — the caller's real-time
 /// media thread must never block. Returns -1 on a NULL/zero-length payload or an
@@ -829,6 +900,28 @@ pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len
         Err(mpsc::error::TrySendError::Full(_)) => 1,
         Err(mpsc::error::TrySendError::Closed(_)) => -1,
     }
+}
+
+/// Feed one direct-P2P media datagram received by the host on the media app
+/// endpoint into the shared native media callback registry. The host is
+/// responsible for authenticating/filtering the source app id before calling.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_dispatch_direct_datagram(
+    peer_node_id: *const u8,
+    ptr: *const u8,
+    len: size_t,
+) -> c_int {
+    if peer_node_id.is_null() || ptr.is_null() || len == 0 {
+        return -1;
+    }
+    let mut peer = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), 32);
+    }
+    let payload = unsafe { std::slice::from_raw_parts(ptr, len) };
+    media::dispatch_inbound(peer, payload);
+    0
 }
 
 /// Install the C recv callback invoked (native↔native, from a tokio worker)
@@ -1349,7 +1442,7 @@ unsafe fn bind_internal(
     let (msg_rx, inbound_streams) = receiver.into_parts();
     let app = VeilApp {
         bundle,
-        sender: TokioMutex::new(Some(sender)),
+        sender: Arc::new(TokioMutex::new(Some(sender))),
         msg_rx: TokioMutex::new(Some(msg_rx)),
         inbound_streams: TokioMutex::new(Some(inbound_streams)),
         recv_cb: Arc::new(StdMutex::new(None)),
