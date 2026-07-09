@@ -204,6 +204,25 @@ int _mediaOpenChannelWorker(int handleAddr, Uint8List peerNode) {
   }
 }
 
+/// Off-isolate body of [VeilClient.nodeId] — the native call performs an IPC
+/// request via tokio block_on, so it must not run on Flutter's UI isolate.
+Uint8List _nodeIdWorker(int handleAddr) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final out = calloc<Uint8>(32);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final rc = ffi.veilGetNodeId(handle, out, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException('get_node_id failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+    return Uint8List.fromList(out.asTypedList(32));
+  } finally {
+    calloc.free(out);
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate body of [VeilClient.acceptAnonStream]. Null on timeout; throws on
 /// a fatal error; else the stream address + the initiator's node id + onion-
 /// stream app id.
@@ -633,22 +652,8 @@ class VeilClient implements Finalizable {
   /// Read the daemon's `node_id` (32 bytes BLAKE3 of its signing pubkey).
   Future<Uint8List> nodeId() async {
     _ensureOpen();
-    return Future(() {
-      final out = calloc<Uint8>(32);
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        final rc = ffi.veilGetNodeId(_handle, out, errOut);
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-              'get_node_id failed: ${_readErrAndFree(errOut)}',
-              code: rc);
-        }
-        return Uint8List.fromList(out.asTypedList(32));
-      } finally {
-        calloc.free(out);
-        calloc.free(errOut);
-      }
-    });
+    final handleAddr = _handle.address;
+    return Isolate.run(() => _nodeIdWorker(handleAddr));
   }
 
   /// Open an ANONYMOUS reliable byte-stream to a peer (onion-routed +
