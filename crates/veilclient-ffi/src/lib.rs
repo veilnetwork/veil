@@ -682,9 +682,9 @@ static MEDIA_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// Split audio/RTCP/unknown from VP8 RTP so a video keyframe burst has room
 /// without putting audio behind a long video backlog.
 #[cfg(feature = "node-embedded")]
-const MEDIA_TX_HI_QUEUE: usize = 32;
+const MEDIA_TX_HI_QUEUE: usize = 16;
 #[cfg(feature = "node-embedded")]
-const MEDIA_TX_VIDEO_QUEUE: usize = 96;
+const MEDIA_TX_VIDEO_QUEUE: usize = 24;
 
 #[cfg(feature = "node-embedded")]
 fn media_is_vp8_rtp(payload: &[u8]) -> bool {
