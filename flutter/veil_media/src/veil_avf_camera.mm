@@ -178,14 +178,20 @@ class AvfCameraCapturer : public CameraCapturer {
   void Stop() override {
     @autoreleasepool {
       if (delegate_) delegate_->cb_ = nullptr;  // stop delivering before teardown
-      if (session_) {
-        [session_ stopRunning];
-        if (output_) [session_ removeOutput:output_];
-      }
+      AVCaptureSession* session = session_;
+      AVCaptureVideoDataOutput* output = output_;
       session_ = nil;
       output_ = nil;
       delegate_ = nil;
       queue_ = nil;
+      if (session) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+          @autoreleasepool {
+            if (session.running) [session stopRunning];
+            if (output) [session removeOutput:output];
+          }
+        });
+      }
     }
   }
 
