@@ -23,7 +23,8 @@ import 'src/bindings.dart' as ffi;
 
 /// An enumerated audio device.
 class MediaDevice {
-  const MediaDevice({required this.id, required this.label, required this.kind});
+  const MediaDevice(
+      {required this.id, required this.label, required this.kind});
 
   final String id;
   final String label;
@@ -54,6 +55,9 @@ class VeilMediaEngine {
   Pointer<Uint8>? _frameBuf; // reused RGBA pull buffer
   int _frameCap = 0;
   int _lastFrameSeq = 0;
+  Pointer<Uint8>? _localFrameBuf; // reused local RGBA pull buffer
+  int _localFrameCap = 0;
+  int _lastLocalFrameSeq = 0;
 
   /// Create an engine over an already-open veil media channel [veilChan]
   /// (from `VeilFlutterTransport.openMediaChannel`). [localId] is OUR 32-byte
@@ -126,7 +130,8 @@ class VeilMediaEngine {
   /// (Android), a Dart capturer converts camera frames to I420 and calls this.
   /// Returns false if video send isn't started. Not thread-safe; call from one
   /// isolate at the capture rate.
-  bool pushVideoFrame(Uint8List y, Uint8List u, Uint8List v, int width, int height) {
+  bool pushVideoFrame(
+      Uint8List y, Uint8List u, Uint8List v, int width, int height) {
     _ensure();
     final total = y.length + u.length + v.length;
     if (total <= 0) return false;
@@ -152,30 +157,72 @@ class VeilMediaEngine {
   /// The latest decoded remote video frame (RGBA), or null if there is no NEW
   /// frame since the last call. Poll at the display rate.
   VeilVideoFrame? getVideoFrame() {
+    return _getFrame(
+      buffer: () => _frameBuf,
+      setBuffer: (p) => _frameBuf = p,
+      capacity: () => _frameCap,
+      setCapacity: (v) => _frameCap = v,
+      lastSeq: () => _lastFrameSeq,
+      setLastSeq: (v) => _lastFrameSeq = v,
+      pull: ffi.veilMediaEngineGetVideoFrame,
+    );
+  }
+
+  /// The latest local camera frame (RGBA), or null if there is no NEW frame
+  /// since the last call. Poll at the display rate for a self-preview tile.
+  VeilVideoFrame? getLocalVideoFrame() {
+    return _getFrame(
+      buffer: () => _localFrameBuf,
+      setBuffer: (p) => _localFrameBuf = p,
+      capacity: () => _localFrameCap,
+      setCapacity: (v) => _localFrameCap = v,
+      lastSeq: () => _lastLocalFrameSeq,
+      setLastSeq: (v) => _lastLocalFrameSeq = v,
+      pull: ffi.veilMediaEngineGetLocalVideoFrame,
+    );
+  }
+
+  VeilVideoFrame? _getFrame({
+    required Pointer<Uint8>? Function() buffer,
+    required void Function(Pointer<Uint8>?) setBuffer,
+    required int Function() capacity,
+    required void Function(int) setCapacity,
+    required int Function() lastSeq,
+    required void Function(int) setLastSeq,
+    required int Function(Pointer<ffi.VeilMediaEngineHandle>, Pointer<Uint8>,
+            int, Pointer<Int32>, Pointer<Int32>)
+        pull,
+  }) {
     _ensure();
     final wp = calloc<Int32>();
     final hp = calloc<Int32>();
     try {
-      _frameBuf ??= (() {
-        _frameCap = 640 * 480 * 4;
-        return calloc<Uint8>(_frameCap);
-      })();
-      var seq = ffi.veilMediaEngineGetVideoFrame(_ptr, _frameBuf!, _frameCap, wp, hp);
+      var frameBuf = buffer();
+      var frameCap = capacity();
+      if (frameBuf == null) {
+        frameCap = 640 * 480 * 4;
+        frameBuf = calloc<Uint8>(frameCap);
+        setCapacity(frameCap);
+        setBuffer(frameBuf);
+      }
+      var seq = pull(_ptr, frameBuf, frameCap, wp, hp);
       if (seq == -1) {
         // Buffer too small — grow to the reported dimensions and retry once.
         final need = wp.value * hp.value * 4;
         if (need > 0) {
-          calloc.free(_frameBuf!);
-          _frameCap = need;
-          _frameBuf = calloc<Uint8>(_frameCap);
-          seq = ffi.veilMediaEngineGetVideoFrame(_ptr, _frameBuf!, _frameCap, wp, hp);
+          calloc.free(frameBuf);
+          frameCap = need;
+          frameBuf = calloc<Uint8>(frameCap);
+          setCapacity(frameCap);
+          setBuffer(frameBuf);
+          seq = pull(_ptr, frameBuf, frameCap, wp, hp);
         }
       }
-      if (seq <= 0 || seq == _lastFrameSeq) return null;
-      _lastFrameSeq = seq;
+      if (seq <= 0 || seq == lastSeq()) return null;
+      setLastSeq(seq);
       final w = wp.value, h = hp.value;
       if (w <= 0 || h <= 0) return null;
-      final rgba = Uint8List.fromList(_frameBuf!.asTypedList(w * h * 4));
+      final rgba = Uint8List.fromList(frameBuf.asTypedList(w * h * 4));
       return VeilVideoFrame(rgba: rgba, width: w, height: h);
     } finally {
       calloc.free(wp);
@@ -199,7 +246,8 @@ class VeilMediaEngine {
   List<MediaDevice> listAudioOutputs() =>
       _devices(ffi.veilMediaEngineListAudioOutputs(_ptr));
 
-  bool selectAudioInput(String id) => _select(id, ffi.veilMediaEngineSelectAudioInput);
+  bool selectAudioInput(String id) =>
+      _select(id, ffi.veilMediaEngineSelectAudioInput);
 
   bool selectAudioOutput(String id) =>
       _select(id, ffi.veilMediaEngineSelectAudioOutput);
@@ -227,6 +275,10 @@ class VeilMediaEngine {
       calloc.free(_frameBuf!);
       _frameBuf = null;
     }
+    if (_localFrameBuf != null) {
+      calloc.free(_localFrameBuf!);
+      _localFrameBuf = null;
+    }
     if (_pushBuf != null) {
       calloc.free(_pushBuf!);
       _pushBuf = null;
@@ -244,8 +296,8 @@ class VeilMediaEngine {
     if (_disposed) throw StateError('VeilMediaEngine used after dispose()');
   }
 
-  bool _select(
-      String id, int Function(Pointer<ffi.VeilMediaEngineHandle>, Pointer<Utf8>) fn) {
+  bool _select(String id,
+      int Function(Pointer<ffi.VeilMediaEngineHandle>, Pointer<Utf8>) fn) {
     _ensure();
     final c = id.toNativeUtf8();
     try {

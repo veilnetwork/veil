@@ -150,16 +150,21 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   void OnFrame(const webrtc::VideoFrame& frame) override {
     auto buf = frame.video_frame_buffer()->ToI420();
     if (buf == nullptr) return;
-    const int w = buf->width(), h = buf->height();
+    store_i420(buf->DataY(), buf->DataU(), buf->DataV(), buf->width(),
+              buf->height(), buf->StrideY(), buf->StrideU(), buf->StrideV());
+  }
+
+  void store_i420(const uint8_t* y, const uint8_t* u, const uint8_t* v, int w,
+                  int h, int stride_y, int stride_u, int stride_v) {
+    if (y == nullptr || u == nullptr || v == nullptr) return;
     if (w <= 0 || h <= 0) return;
     const size_t need = static_cast<size_t>(w) * h * 4;
     std::lock_guard<std::mutex> l(m_);
     if (rgba_.size() < need) rgba_.resize(need);
     // I420 -> tightly packed RGBA (libyuv "ABGR" word == R,G,B,A bytes in memory,
     // which is what a Flutter rgba8888 texture / decodeImageFromPixels expects).
-    libyuv::I420ToABGR(buf->DataY(), buf->StrideY(), buf->DataU(),
-                       buf->StrideU(), buf->DataV(), buf->StrideV(),
-                       rgba_.data(), w * 4, w, h);
+    libyuv::I420ToABGR(y, stride_y, u, stride_u, v, stride_v, rgba_.data(),
+                       w * 4, w, h);
     w_ = w;
     h_ = h;
     ++seq_;
@@ -228,6 +233,7 @@ struct WebrtcState {
   std::unique_ptr<webrtc::VideoBitrateAllocatorFactory> video_bitrate_alloc_factory;
   std::unique_ptr<webrtc::VideoBroadcaster> video_source;  // pushable
   std::unique_ptr<VeilVideoSink> video_sink;               // renderer
+  std::unique_ptr<VeilVideoSink> local_video_sink;         // self-preview
   webrtc::VideoSendStream* video_send_stream = nullptr;              // owned by Call
   webrtc::VideoReceiveStreamInterface* video_recv_stream = nullptr;  // owned by Call
   std::thread test_video_thread;         // synthetic source (VEIL_MEDIA_TEST_VIDEO)
@@ -319,6 +325,7 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   ws->shim->Start();
 
   ws->video_sink = std::make_unique<VeilVideoSink>();
+  ws->local_video_sink = std::make_unique<VeilVideoSink>();
 
   engine->ws = std::move(ws);
 #endif
@@ -615,9 +622,12 @@ int veil_media_engine_start_camera(VeilMediaEngine* engine, int width,
   // Feed each captured I420 frame straight into the VP8 send source. The
   // callback runs on the capture queue; push_i420 copies synchronously.
   webrtc::VideoBroadcaster* src = ws->video_source.get();
+  VeilVideoSink* local_sink = ws->local_video_sink.get();
   ws->camera.reset(veil_media::CreatePlatformCamera(
-      [src](const uint8_t* y, const uint8_t* u, const uint8_t* v, int w, int h,
-            int sy, int su, int sv, int64_t ts_us) {
+      [src, local_sink](const uint8_t* y, const uint8_t* u, const uint8_t* v,
+                        int w, int h, int sy, int su, int sv, int64_t ts_us) {
+        if (local_sink)
+          local_sink->store_i420(y, u, v, w, h, sy, su, sv);
         push_i420(src, y, u, v, w, h, sy, su, sv, ts_us);
       }));
   if (!ws->camera) return VEIL_MEDIA_ERR_STATE;
@@ -655,6 +665,9 @@ int veil_media_engine_push_video_frame(VeilMediaEngine* engine,
     return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->video_source) return VEIL_MEDIA_ERR_STATE;
+  if (engine->ws->local_video_sink)
+    engine->ws->local_video_sink->store_i420(y, u, v, width, height, stride_y,
+                                             stride_u, stride_v);
   push_i420(engine->ws->video_source.get(), y, u, v, width, height, stride_y,
             stride_u, stride_v, ts_us);
   return VEIL_MEDIA_OK;
@@ -671,6 +684,22 @@ int veil_media_engine_get_video_frame(VeilMediaEngine* engine, uint8_t* dst,
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws && engine->ws->video_sink)
     return engine->ws->video_sink->get_frame(dst, dst_cap, out_w, out_h);
+#else
+  (void)dst;
+  (void)dst_cap;
+  (void)out_w;
+  (void)out_h;
+#endif
+  return 0;
+}
+
+int veil_media_engine_get_local_video_frame(VeilMediaEngine* engine,
+                                            uint8_t* dst, int dst_cap,
+                                            int* out_w, int* out_h) {
+  if (engine == nullptr) return 0;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (engine->ws && engine->ws->local_video_sink)
+    return engine->ws->local_video_sink->get_frame(dst, dst_cap, out_w, out_h);
 #else
   (void)dst;
   (void)dst_cap;
