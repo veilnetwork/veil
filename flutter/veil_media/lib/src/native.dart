@@ -2,11 +2,51 @@ import 'dart:ffi';
 import 'dart:io';
 
 import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart';
 
 // bionic dlopen flags (android). RTLD_LOCAL is 0 (Dart's default), so a bare
 // DynamicLibrary.open does NOT expose the loaded lib's symbols to later loads.
 const int _rtldNow = 0x00002;
 const int _rtldGlobal = 0x00100;
+String? _androidNativeLibraryDir() {
+  try {
+    final lines = File('/proc/self/maps').readAsLinesSync();
+    for (final line in lines) {
+      final marker = line.contains('/libveilclient_ffi.so')
+          ? '/libveilclient_ffi.so'
+          : line.contains('/libflutter.so')
+              ? '/libflutter.so'
+              : null;
+      if (marker == null) continue;
+      final idx = line.indexOf('/data/app/');
+      final end = line.indexOf(marker);
+      if (idx >= 0 && end > idx) return line.substring(idx, end);
+    }
+  } catch (_) {}
+  return null;
+}
+
+Pointer<Void> _dlopenGlobalAndroidPath(String path) {
+  final proc = DynamicLibrary.process();
+  final dlopen = proc.lookupFunction<
+      Pointer<Void> Function(Pointer<Utf8>, Int32),
+      Pointer<Void> Function(Pointer<Utf8>, int)>('dlopen');
+  final dlerror =
+      proc.lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
+          'dlerror');
+  final name = path.toNativeUtf8();
+  try {
+    final handle = dlopen(name, _rtldNow | _rtldGlobal);
+    if (handle == nullptr) {
+      final err = dlerror();
+      final msg = err == nullptr ? 'unknown error' : err.toDartString();
+      debugPrint('veil_media: dlopen $path global failed: $msg');
+    }
+    return handle;
+  } finally {
+    malloc.free(name);
+  }
+}
 
 /// Android: re-open [soname] with RTLD_GLOBAL so its symbols join the global
 /// scope. libveil_media.so leaves veil_media_send_datagram /
@@ -14,19 +54,29 @@ const int _rtldGlobal = 0x00100;
 /// on ELF they only resolve if veilclient_ffi is global BEFORE veil_media loads.
 void _preloadGlobalAndroid(String soname) {
   try {
-    final proc = DynamicLibrary.process();
-    final dlopen = proc.lookupFunction<
-        Pointer<Void> Function(Pointer<Utf8>, Int32),
-        Pointer<Void> Function(Pointer<Utf8>, int)>('dlopen');
-    final name = soname.toNativeUtf8();
-    try {
-      dlopen(name, _rtldNow | _rtldGlobal);
-    } finally {
-      malloc.free(name);
+    if (soname == 'libveil_media_camera_stub.so') {
+      final nativeDir = _androidNativeLibraryDir();
+      if (nativeDir != null && nativeDir.isNotEmpty) {
+        _dlopenGlobalAndroidPath('$nativeDir/$soname');
+      }
     }
-  } catch (_) {
+    _dlopenGlobalAndroidPath(soname);
+  } catch (e) {
+    debugPrint('veil_media: dlopen $soname global threw: $e');
     // best effort; veil_media may still resolve if veilclient_ffi is global
   }
+}
+
+DynamicLibrary _openAndroid() {
+  _preloadGlobalAndroid('libveilclient_ffi.so');
+  _preloadGlobalAndroid('libveil_media_camera_stub.so');
+  final nativeDir = _androidNativeLibraryDir();
+  if (nativeDir != null && nativeDir.isNotEmpty) {
+    final path = '$nativeDir/libveil_media.so';
+    final handle = _dlopenGlobalAndroidPath(path);
+    if (handle != nullptr) return DynamicLibrary.open(path);
+  }
+  return DynamicLibrary.open('libveil_media.so');
 }
 
 /// Resolve the native veil_media library.
@@ -60,8 +110,7 @@ DynamicLibrary _open() {
     return DynamicLibrary.process();
   }
   if (Platform.isAndroid) {
-    _preloadGlobalAndroid('libveilclient_ffi.so');
-    return DynamicLibrary.open('libveil_media.so');
+    return _openAndroid();
   }
   if (Platform.isLinux) {
     return DynamicLibrary.open('libveil_media.so');
