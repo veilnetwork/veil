@@ -28,6 +28,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 
@@ -84,7 +85,10 @@ class VeilTransportShim : public webrtc::Transport {
   webrtc::Call* const call_;
   webrtc::TaskQueueBase* const network_queue_;
   std::atomic<uint32_t> remote_video_ssrc_{0};
-  bool started_ = false;
+  std::atomic<bool> started_{false};
+  std::atomic<size_t> inbound_pending_packets_{0};
+  std::atomic<size_t> inbound_pending_bytes_{0};
+  std::atomic<uint64_t> inbound_dropped_overload_{0};
 };
 
 }  // namespace veil_media

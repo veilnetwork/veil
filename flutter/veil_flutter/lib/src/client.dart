@@ -156,7 +156,8 @@ int _anonStreamOpenWorker(int handleAddr, Uint8List dstNode, Uint8List dstApp) {
   try {
     final ptr = ffi.veilAnonStreamOpen(handle, dn, da, errOut);
     if (ptr == nullptr) {
-      throw VeilException('anon stream open failed: ${_readErrAndFree(errOut)}');
+      throw VeilException(
+          'anon stream open failed: ${_readErrAndFree(errOut)}');
     }
     return ptr.address;
   } finally {
@@ -262,7 +263,8 @@ Uint8List? _lookupRelayX25519Worker(int handleAddr, Uint8List nodeId) {
     final rc = ffi.veilLookupRelayX25519(handle, node, out, errOut);
     if (rc == ffi.veilRelayX25519Unavailable) return null;
     if (rc != ffi.veilOk) {
-      throw VeilException('lookup_relay_x25519 failed: ${_readErrAndFree(errOut)}',
+      throw VeilException(
+          'lookup_relay_x25519 failed: ${_readErrAndFree(errOut)}',
           code: rc);
     }
     return Uint8List.fromList(out.asTypedList(32));
@@ -475,8 +477,15 @@ void _sendAnonymousAuthenticatedDirectWithReplyWorker(
     if (data.isNotEmpty) {
       dataPtr.asTypedList(data.length).setAll(0, data);
     }
-    final rc = ffi.veilSendAnonymousAuthenticatedDirectWithReply(app, dstNode,
-        dstX25519, dstApp, dstEndpointId, replyEndpointId, dataPtr, data.length,
+    final rc = ffi.veilSendAnonymousAuthenticatedDirectWithReply(
+        app,
+        dstNode,
+        dstX25519,
+        dstApp,
+        dstEndpointId,
+        replyEndpointId,
+        dataPtr,
+        data.length,
         errOut);
     if (rc != ffi.veilOk) {
       throw VeilException(
@@ -506,6 +515,43 @@ void _sendReplyWorker(int appAddr, int replyId, Uint8List data) {
           code: rc);
     }
   } finally {
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
+/// Off-isolate body of [AppHandle.send]. The native `veil_send` takes the app
+/// sender lock and `block_on`s the daemon send path. That is usually quick, but
+/// call signaling heartbeats exercise it during exactly the busy media periods
+/// where a contended node can park the caller; keep it off Flutter's UI isolate.
+void _sendWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
+    int dstEndpointId, Uint8List data) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final dstNode = calloc<Uint8>(32);
+  final dstApp = calloc<Uint8>(32);
+  final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    dstNode.asTypedList(32).setAll(0, dstNodeId);
+    dstApp.asTypedList(32).setAll(0, dstAppId);
+    if (data.isNotEmpty) {
+      dataPtr.asTypedList(data.length).setAll(0, data);
+    }
+    final rc = ffi.veilSend(
+      app,
+      dstNode,
+      dstApp,
+      dstEndpointId,
+      dataPtr,
+      data.length,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException('send failed: ${_readErrAndFree(errOut)}', code: rc);
+    }
+  } finally {
+    calloc.free(dstNode);
+    calloc.free(dstApp);
     if (dataPtr != nullptr) calloc.free(dataPtr);
     calloc.free(errOut);
   }
@@ -898,7 +944,8 @@ class VeilClient implements Finalizable {
   }) async {
     _ensureOpen();
     if (serviceIdentityVk.length != 32 || targetAppId.length != 32) {
-      throw ArgumentError('service_identity_vk and target_app_id must be 32 bytes');
+      throw ArgumentError(
+          'service_identity_vk and target_app_id must be 32 bytes');
     }
     return Future(() {
       final idVk = calloc<Uint8>(32);
@@ -1793,8 +1840,7 @@ class VeilClient implements Finalizable {
 
   void _ensureOpen() {
     if (_closed) {
-      throw VeilException('handle already closed',
-          code: ffi.veilErrClosed);
+      throw VeilException('handle already closed', code: ffi.veilErrClosed);
     }
   }
 }
@@ -1845,37 +1891,9 @@ class AppHandle implements Finalizable {
     if (dstNodeId.length != 32 || dstAppId.length != 32) {
       throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
     }
-    return Future(() {
-      final dstNode = calloc<Uint8>(32);
-      final dstApp = calloc<Uint8>(32);
-      final dataPtr = data.isNotEmpty ? calloc<Uint8>(data.length) : nullptr;
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        dstNode.asTypedList(32).setAll(0, dstNodeId);
-        dstApp.asTypedList(32).setAll(0, dstAppId);
-        if (data.isNotEmpty) {
-          dataPtr.asTypedList(data.length).setAll(0, data);
-        }
-        final rc = ffi.veilSend(
-          _app,
-          dstNode,
-          dstApp,
-          dstEndpointId,
-          dataPtr,
-          data.length,
-          errOut,
-        );
-        if (rc != ffi.veilOk) {
-          throw VeilException('send failed: ${_readErrAndFree(errOut)}',
-              code: rc);
-        }
-      } finally {
-        calloc.free(dstNode);
-        calloc.free(dstApp);
-        if (dataPtr != nullptr) calloc.free(dataPtr);
-        calloc.free(errOut);
-      }
-    });
+    final appAddr = _app.address;
+    return Isolate.run(
+        () => _sendWorker(appAddr, dstNodeId, dstAppId, dstEndpointId, data));
   }
 
   /// Send [data] as an AUTHENTICATED anonymous message over the
