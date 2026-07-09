@@ -13,6 +13,8 @@
 //! all unit-tested in isolation. Wiring it into the DHT (a new record kind,
 //! resolve/publish, the conflict-replace rule) is a later brick.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use blake3::Hasher;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use veil_util::leading_zero_bits;
@@ -173,6 +175,141 @@ fn cumulative_weight(
     Some(total)
 }
 
+/// Outcome of a [`mine_seeds`] run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MineOutcome {
+    /// The heaviest seeds found (≤ [`MAX_NICKNAME_SEEDS`]).
+    pub seeds: Vec<[u8; 32]>,
+    /// Cumulative weight of [`Self::seeds`].
+    pub weight: u64,
+    /// Hashes actually computed (for progress / effort reporting).
+    pub hashes_done: u64,
+    /// Whether `target_weight` was reached (false = budget/cancel stopped it).
+    pub hit_target: bool,
+}
+
+/// Mine PoW seeds for `name` under `owner_node_id`, keeping the heaviest
+/// [`MAX_NICKNAME_SEEDS`] and stopping when their cumulative weight reaches
+/// `target_weight`, `max_hashes` is spent, or `cancel` flips true.
+///
+/// `salt` seeds the search region so concurrent miners explore different
+/// nonces (the FFI layer passes a random value; tests pass a fixed one). The
+/// heavy loop is CPU-bound and MUST run off the UI isolate.
+pub fn mine_seeds(
+    name: &str,
+    owner_node_id: &[u8; 32],
+    target_weight: u64,
+    max_hashes: u64,
+    salt: u64,
+    cancel: &AtomicBool,
+) -> Option<MineOutcome> {
+    mine_seeds_continue(name, owner_node_id, &[], target_weight, max_hashes, salt, cancel)
+}
+
+/// Like [`mine_seeds`], but continues from a `prior` seed set — so a host can
+/// mine in bounded chunks (each with a fresh random `salt`), threading the
+/// running best set back in, and cancel simply by not calling again. Duplicate
+/// or invalid prior seeds are dropped; the result is always a clean top-N set.
+pub fn mine_seeds_continue(
+    name: &str,
+    owner_node_id: &[u8; 32],
+    prior: &[[u8; 32]],
+    target_weight: u64,
+    max_hashes: u64,
+    salt: u64,
+    cancel: &AtomicBool,
+) -> Option<MineOutcome> {
+    let norm = normalize_name(name)?;
+    let mut kept: Vec<(u64, [u8; 32])> = Vec::with_capacity(MAX_NICKNAME_SEEDS + 1);
+    // Seed the working set from prior seeds (dedup by keeping the map keyed on
+    // the seed bytes; recompute each weight so a caller can't inflate).
+    for s in prior {
+        if kept.iter().any(|(_, k)| k == s) {
+            continue;
+        }
+        let w = seed_weight(&norm, owner_node_id, s);
+        if w >= 2 {
+            kept.push((w, *s));
+        }
+    }
+    kept.sort_by(|a, b| b.0.cmp(&a.0));
+    kept.truncate(MAX_NICKNAME_SEEDS);
+    if !kept.is_empty() && kept.iter().map(|(w, _)| *w).sum::<u64>() >= target_weight {
+        let weight = kept.iter().map(|(w, _)| *w).sum();
+        return Some(MineOutcome {
+            seeds: kept.into_iter().map(|(_, s)| s).collect(),
+            weight,
+            hashes_done: 0,
+            hit_target: true,
+        });
+    }
+    let mut hashes_done = 0u64;
+    let mut counter = 0u64;
+    let mut hit_target = false;
+    while hashes_done < max_hashes {
+        // Check cancellation every 4096 hashes — cheap, responsive.
+        if counter & 0xFFF == 0 && cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut seed = [0u8; 32];
+        seed[0..8].copy_from_slice(&counter.to_le_bytes());
+        seed[8..16].copy_from_slice(&salt.to_le_bytes());
+        counter += 1;
+        hashes_done += 1;
+        let w = seed_weight(&norm, owner_node_id, &seed);
+        if w < 2 {
+            continue; // a bits=0 seed adds ~nothing to the cumulative weight
+        }
+        if kept.iter().any(|(_, k)| *k == seed) {
+            continue; // never double-count a seed already kept (e.g. from prior)
+        }
+        kept.push((w, seed));
+        kept.sort_by(|a, b| b.0.cmp(&a.0));
+        kept.truncate(MAX_NICKNAME_SEEDS);
+        if kept.iter().map(|(w, _)| *w).sum::<u64>() >= target_weight {
+            hit_target = true;
+            break;
+        }
+    }
+    let weight = kept.iter().map(|(w, _)| *w).sum();
+    Some(MineOutcome {
+        seeds: kept.into_iter().map(|(_, s)| s).collect(),
+        weight,
+        hashes_done,
+        hit_target,
+    })
+}
+
+/// Bounds-checked little-endian byte reader for [`NicknameRecord::from_bytes`].
+struct Reader<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(n)?;
+        let s = self.b.get(self.at..end)?;
+        self.at = end;
+        Some(s)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn arr32(&mut self) -> Option<[u8; 32]> {
+        self.take(32)?.try_into().ok()
+    }
+    fn arr64(&mut self) -> Option<[u8; 64]> {
+        self.take(64)?.try_into().ok()
+    }
+}
+
 impl NicknameRecord {
     /// Deterministic bytes covered by [`Self::sig`]. Every field except the
     /// signature, length-prefixed so no two distinct records share bytes.
@@ -192,6 +329,53 @@ impl NicknameRecord {
         }
         out.extend_from_slice(&self.issued_at_unix.to_le_bytes());
         out
+    }
+
+    /// Full wire encoding: the canonical bytes followed by the 64-byte
+    /// signature. This is what crosses the FFI boundary and (later) lands in
+    /// the DHT. Round-trips with [`Self::from_bytes`].
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = self.canonical_bytes();
+        out.extend_from_slice(&self.sig);
+        out
+    }
+
+    /// Parse a record from [`Self::to_bytes`]. Structural only — call
+    /// [`Self::verify`] afterwards for cryptographic validity. Returns `None`
+    /// on any truncation / bad length prefix.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader { b: bytes, at: 0 };
+        let version = r.u8()?;
+        let name_len = r.u32()? as usize;
+        let name = String::from_utf8(r.take(name_len)?.to_vec()).ok()?;
+        let owner_node_id = r.arr32()?;
+        let owner_sign_pk = r.arr32()?;
+        let weight_kind = WeightKind::from_tag(r.u8()?)?;
+        let weight = r.u64()?;
+        let seed_count = r.u32()? as usize;
+        if seed_count > MAX_NICKNAME_SEEDS {
+            return None;
+        }
+        let mut pow_seeds = Vec::with_capacity(seed_count);
+        for _ in 0..seed_count {
+            pow_seeds.push(r.arr32()?);
+        }
+        let issued_at_unix = r.u64()?;
+        let sig = r.arr64()?;
+        if r.at != bytes.len() {
+            return None; // trailing garbage
+        }
+        Some(NicknameRecord {
+            version,
+            name,
+            owner_node_id,
+            owner_sign_pk,
+            weight_kind,
+            weight,
+            pow_seeds,
+            issued_at_unix,
+            sig,
+        })
     }
 
     /// Build and sign a record for an already-mined seed set. `signing_key` is
@@ -390,6 +574,67 @@ mod tests {
             None => {}
             Some(rec) => assert_eq!(rec.verify(), Err(NicknameError::UnderLengthFloor)),
         }
+    }
+
+    #[test]
+    fn miner_reaches_target_and_signs() {
+        let (sk, node_id) = test_key();
+        let name = "longenoughname";
+        let target = length_weight_floor(name.len());
+        let cancel = AtomicBool::new(false);
+        let out = mine_seeds(name, &node_id, target, 5_000_000, 42, &cancel).unwrap();
+        assert!(out.hit_target);
+        assert!(out.weight >= target);
+        assert!(out.seeds.len() <= MAX_NICKNAME_SEEDS);
+        let rec = NicknameRecord::sign(name, &sk, node_id, out.seeds, 1000).unwrap();
+        assert_eq!(rec.verify(), Ok(()));
+    }
+
+    #[test]
+    fn miner_honors_cancel() {
+        let (_sk, node_id) = test_key();
+        let cancel = AtomicBool::new(true); // pre-cancelled
+        let out = mine_seeds("longenoughname", &node_id, u64::MAX, 5_000_000, 1, &cancel)
+            .unwrap();
+        assert!(!out.hit_target);
+        // Cancel is checked at counter&0xFFF==0, so at most a few thousand hashes.
+        assert!(out.hashes_done <= 4096);
+    }
+
+    #[test]
+    fn miner_honors_hash_budget() {
+        let (_sk, node_id) = test_key();
+        let cancel = AtomicBool::new(false);
+        // Impossible target, tiny budget → stops at the budget, not the target.
+        let out = mine_seeds("longenoughname", &node_id, u64::MAX, 1000, 1, &cancel)
+            .unwrap();
+        assert!(!out.hit_target);
+        assert_eq!(out.hashes_done, 1000);
+    }
+
+    #[test]
+    fn record_bytes_roundtrip() {
+        let (sk, node_id) = test_key();
+        let name = "longenoughname";
+        let seeds = mine(name, &node_id, length_weight_floor(name.len()));
+        let rec = NicknameRecord::sign(name, &sk, node_id, seeds, 1000).unwrap();
+        let bytes = rec.to_bytes();
+        let parsed = NicknameRecord::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, rec);
+        assert_eq!(parsed.verify(), Ok(()));
+    }
+
+    #[test]
+    fn from_bytes_rejects_truncated_and_trailing() {
+        let (sk, node_id) = test_key();
+        let name = "longenoughname";
+        let seeds = mine(name, &node_id, length_weight_floor(name.len()));
+        let rec = NicknameRecord::sign(name, &sk, node_id, seeds, 1000).unwrap();
+        let bytes = rec.to_bytes();
+        assert!(NicknameRecord::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(NicknameRecord::from_bytes(&extra).is_none());
     }
 
     #[test]
