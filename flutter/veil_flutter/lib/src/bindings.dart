@@ -1393,13 +1393,40 @@ final int Function(
             )>>('veil_media_open_channel')
     .asFunction();
 
-// send_datagram(chan, ptr, len) -> 0 queued / 1 dropped / -1 invalid.
-final int Function(int, Pointer<Uint8>, int) veilMediaSendDatagram = nativeLib
+// open_direct_channel(app, peer_node32*, peer_app32*, peer_endpoint, err)
+// -> chan id (u64; 0 on error).
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilMediaOpenDirectChannel = nativeLib
     .lookup<
         NativeFunction<
-            Int32 Function(Uint64, Pointer<Uint8>, IntPtr)>>(
-      'veil_media_send_datagram')
+            Uint64 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_media_open_direct_channel')
     .asFunction();
+
+// send_datagram(chan, ptr, len) -> 0 queued / 1 dropped / -1 invalid.
+final int Function(int, Pointer<Uint8>, int) veilMediaSendDatagram = nativeLib
+    .lookup<NativeFunction<Int32 Function(Uint64, Pointer<Uint8>, IntPtr)>>(
+        'veil_media_send_datagram')
+    .asFunction();
+
+// dispatch_direct(peer_node32*, ptr, len) -> 0 delivered/accepted, -1 invalid.
+final int Function(Pointer<Uint8>, Pointer<Uint8>, int)
+    veilMediaDispatchDirectDatagram = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<Uint8>, Pointer<Uint8>,
+                    IntPtr)>>('veil_media_dispatch_direct_datagram')
+        .asFunction();
 
 // close_channel(chan).
 final void Function(int) veilMediaCloseChannel = nativeLib
@@ -1408,8 +1435,8 @@ final void Function(int) veilMediaCloseChannel = nativeLib
 
 // recv_count(peer_node32*) -> inbound datagram count from that peer.
 final int Function(Pointer<Uint8>) veilMediaRecvCount = nativeLib
-    .lookup<
-        NativeFunction<Uint64 Function(Pointer<Uint8>)>>('veil_media_recv_count')
+    .lookup<NativeFunction<Uint64 Function(Pointer<Uint8>)>>(
+        'veil_media_recv_count')
     .asFunction();
 
 // accept(handle, timeout_ms, out_src_node32*, out_src_app32*, err) -> stream*

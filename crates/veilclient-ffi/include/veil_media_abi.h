@@ -42,6 +42,8 @@ extern "C" {
 
 /* Opaque connection handle (same type as `veil_ffi.h`'s `VeilHandle`). */
 typedef struct VeilHandle VeilHandle;
+/* Opaque app endpoint (same type as `veil_ffi.h`'s `VeilApp`). */
+typedef struct VeilApp VeilApp;
 
 /*
  * Recv callback: (ctx, ptr, len). Invoked once per inbound media datagram from
@@ -61,12 +63,34 @@ uint64_t veil_media_open_channel(VeilHandle *handle,
                                  char **err_out);
 
 /*
+ * Open a lossy MEDIA datagram channel to `peer_node_id` over a direct app
+ * endpoint. Outbound datagrams are sent from `app` to
+ * (`peer_node_id`, `peer_app_id`, `peer_endpoint_id`). Inbound datagrams must be
+ * received by the host on `app`, source-filtered, then fed to
+ * `veil_media_dispatch_direct_datagram`.
+ */
+uint64_t veil_media_open_direct_channel(VeilApp *app,
+                                        const uint8_t *peer_node_id,
+                                        const uint8_t *peer_app_id,
+                                        uint32_t peer_endpoint_id,
+                                        char **err_out);
+
+/*
  * Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING. Returns:
  *    0  queued
  *    1  dropped (queue full / channel closing)
  *   -1  invalid argument (NULL/zero-length payload, or unknown `chan`)
  */
 int veil_media_send_datagram(uint64_t chan, const uint8_t *ptr, size_t len);
+
+/*
+ * Feed one already-authenticated direct-P2P media datagram from `peer_node_id`
+ * into the native media receive callback registry. The host is responsible for
+ * checking that the datagram arrived from the expected media app_id.
+ */
+int veil_media_dispatch_direct_datagram(const uint8_t *peer_node_id,
+                                        const uint8_t *ptr,
+                                        size_t len);
 
 /*
  * Install (or, with `cb == NULL`, clear) the recv callback for inbound media
