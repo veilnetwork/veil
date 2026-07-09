@@ -456,6 +456,51 @@ impl NicknameRecord {
     }
 }
 
+/// Outcome of the DHT STORE gate for a nickname key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreDecision {
+    /// Store the incoming record (no valid incumbent, or it displaces one).
+    Accept,
+    /// Keep the incumbent — the incoming record does not displace it.
+    RejectKeepExisting,
+    /// The incoming record is itself invalid; do not store it.
+    RejectInvalid,
+}
+
+/// The replace-on-heavier gate a DHT node applies when a STORE arrives for a
+/// nickname key `NM || blake3(name)`. `incoming` is the serialized candidate;
+/// `existing` is the currently-stored bytes for that key (None if empty).
+///
+/// - Invalid incoming (bad parse / signature / PoW / floor) → `RejectInvalid`.
+/// - Incoming for a DIFFERENT name than the key implies is the caller's job to
+///   check via [`nickname_key`]; this gate assumes the key matches the name.
+/// - No valid incumbent (empty, junk, or a record for a different name) →
+///   `Accept` (a valid record replaces nothing/garbage).
+/// - Valid incumbent → `Accept` iff `incoming.displaces(existing)`.
+pub fn nickname_store_decision(existing: Option<&[u8]>, incoming: &[u8]) -> StoreDecision {
+    let Some(incoming_rec) = NicknameRecord::from_bytes(incoming) else {
+        return StoreDecision::RejectInvalid;
+    };
+    if incoming_rec.verify().is_err() {
+        return StoreDecision::RejectInvalid;
+    }
+    // Parse the incumbent; treat an unparseable/invalid/mismatched-name one as
+    // "no valid incumbent" so a real record can always overwrite garbage.
+    let valid_incumbent = existing
+        .and_then(NicknameRecord::from_bytes)
+        .filter(|r| r.verify().is_ok() && r.name == incoming_rec.name);
+    match valid_incumbent {
+        None => StoreDecision::Accept,
+        Some(inc) => {
+            if incoming_rec.displaces(&inc) {
+                StoreDecision::Accept
+            } else {
+                StoreDecision::RejectKeepExisting
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +680,97 @@ mod tests {
         let mut extra = bytes.clone();
         extra.push(0);
         assert!(NicknameRecord::from_bytes(&extra).is_none());
+    }
+
+    #[test]
+    fn store_gate_accepts_first_and_heavier() {
+        let (sk, node_id) = test_key();
+        let name = "longenoughname";
+        let floor = length_weight_floor(name.len());
+        let light = NicknameRecord::sign(
+            name,
+            &sk,
+            node_id,
+            mine(name, &node_id, floor),
+            1000,
+        )
+        .unwrap();
+        let light_bytes = light.to_bytes();
+
+        // First claim → accept (no incumbent).
+        assert_eq!(
+            nickname_store_decision(None, &light_bytes),
+            StoreDecision::Accept,
+        );
+
+        // Same record again → keep existing (not strictly heavier/newer).
+        assert_eq!(
+            nickname_store_decision(Some(&light_bytes), &light_bytes),
+            StoreDecision::RejectKeepExisting,
+        );
+
+        // Heavier record → accept (displaces).
+        let heavy = NicknameRecord::sign(
+            name,
+            &sk,
+            node_id,
+            mine(name, &node_id, floor.saturating_mul(4)),
+            500,
+        )
+        .unwrap();
+        if heavy.weight > light.weight {
+            assert_eq!(
+                nickname_store_decision(Some(&light_bytes), &heavy.to_bytes()),
+                StoreDecision::Accept,
+            );
+            // ...and the reverse (lighter over heavier) is rejected.
+            assert_eq!(
+                nickname_store_decision(Some(&heavy.to_bytes()), &light_bytes),
+                StoreDecision::RejectKeepExisting,
+            );
+        }
+    }
+
+    #[test]
+    fn store_gate_rejects_invalid_incoming() {
+        let (sk, node_id) = test_key();
+        let name = "longenoughname";
+        let mut rec = NicknameRecord::sign(
+            name,
+            &sk,
+            node_id,
+            mine(name, &node_id, length_weight_floor(name.len())),
+            1000,
+        )
+        .unwrap();
+        rec.owner_node_id = [0u8; 32]; // breaks owner binding
+        assert_eq!(
+            nickname_store_decision(None, &rec.to_bytes()),
+            StoreDecision::RejectInvalid,
+        );
+        assert_eq!(
+            nickname_store_decision(None, b"not a record"),
+            StoreDecision::RejectInvalid,
+        );
+    }
+
+    #[test]
+    fn store_gate_overwrites_garbage_incumbent() {
+        let (sk, node_id) = test_key();
+        let name = "longenoughname";
+        let rec = NicknameRecord::sign(
+            name,
+            &sk,
+            node_id,
+            mine(name, &node_id, length_weight_floor(name.len())),
+            1000,
+        )
+        .unwrap();
+        // A valid record replaces junk / an unparseable incumbent.
+        assert_eq!(
+            nickname_store_decision(Some(b"garbage"), &rec.to_bytes()),
+            StoreDecision::Accept,
+        );
     }
 
     #[test]
