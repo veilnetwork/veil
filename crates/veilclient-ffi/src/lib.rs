@@ -622,7 +622,14 @@ pub unsafe extern "C" fn veil_anon_stream_warm_peer(
         "handle" => handle,
         "dst_node_id" => dst_node_id,
     );
-    get_or_return!(handle_live, handle_table(), handle, err_out, -1, "VeilHandle");
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        -1,
+        "VeilHandle"
+    );
     let mut node = [0u8; 32];
     unsafe {
         ptr::copy_nonoverlapping(dst_node_id, node.as_mut_ptr(), 32);
@@ -654,30 +661,55 @@ pub unsafe extern "C" fn veil_anon_stream_warm_peer(
 /// media must drop rather than buffer when it outpaces the circuit.
 #[cfg(feature = "node-embedded")]
 struct MediaChannel {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx_hi: mpsc::Sender<Vec<u8>>,
+    tx_video: mpsc::Sender<Vec<u8>>,
     peer: [u8; 32],
     task: tokio::task::JoinHandle<()>,
 }
 
 /// Open media channels keyed by the opaque id handed to the host.
 #[cfg(feature = "node-embedded")]
-static MEDIA_CHANNELS: std::sync::LazyLock<
-    StdMutex<std::collections::HashMap<u64, MediaChannel>>,
-> = std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashMap::new()));
+static MEDIA_CHANNELS: std::sync::LazyLock<StdMutex<std::collections::HashMap<u64, MediaChannel>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashMap::new()));
 
 /// Monotonic channel-id source (never reuses 0, which the ABI reserves for
 /// "error / invalid").
 #[cfg(feature = "node-embedded")]
 static MEDIA_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Outbound queue depth per channel. Keep this intentionally small: media is a
-/// real-time path, and a deep FIFO turns transient overload into seconds of
-/// stale audio/video. At ~50 audio pkts/s (20 ms Opus), 32 packets is well under
-/// a second; video bursts can still absorb tiny jitter, but sustained overload
-/// drops new packets quickly instead of letting latency climb for the rest of
-/// the call.
+/// Outbound queue depth per media channel. Keep this bounded: media is a real-
+/// time path, and a deep FIFO turns transient overload into stale audio/video.
+/// Split audio/RTCP/unknown from VP8 RTP so a video keyframe burst has room
+/// without putting audio behind a long video backlog.
 #[cfg(feature = "node-embedded")]
-const MEDIA_TX_QUEUE: usize = 32;
+const MEDIA_TX_HI_QUEUE: usize = 32;
+#[cfg(feature = "node-embedded")]
+const MEDIA_TX_VIDEO_QUEUE: usize = 96;
+
+#[cfg(feature = "node-embedded")]
+fn media_is_vp8_rtp(payload: &[u8]) -> bool {
+    if payload.len() < 2 || (payload[0] >> 6) != 2 {
+        return false;
+    }
+    // rtcp-mux RTCP packet types occupy the 64..=95 range. Video RTP is the
+    // fixed VP8 payload type configured by veil_media_engine.cc.
+    (payload[1] & 0x7f) == 96
+}
+
+#[cfg(all(test, feature = "node-embedded"))]
+mod media_priority_tests {
+    use super::media_is_vp8_rtp;
+
+    #[test]
+    fn media_priority_classifies_only_vp8_rtp_as_video() {
+        assert!(media_is_vp8_rtp(&[0x80, 96, 0, 1]));
+        assert!(media_is_vp8_rtp(&[0x80, 0x80 | 96, 0, 1]));
+        assert!(!media_is_vp8_rtp(&[0x80, 111, 0, 1])); // Opus RTP.
+        assert!(!media_is_vp8_rtp(&[0x80, 72, 0, 1])); // RTCP mux range.
+        assert!(!media_is_vp8_rtp(&[0x40, 96, 0, 1])); // Not RTP v2.
+        assert!(!media_is_vp8_rtp(&[0x80]));
+    }
+}
 
 /// Open a lossy MEDIA datagram channel to `peer` over the anonymous circuit
 /// (reuses the reliable stream's rendezvous/pool and warms the circuit in the
@@ -698,7 +730,14 @@ pub unsafe extern "C" fn veil_media_open_channel(
         "handle" => handle,
         "peer_node_id" => peer_node_id,
     );
-    get_or_return!(handle_live, handle_table(), handle, err_out, 0u64, "VeilHandle");
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        0u64,
+        "VeilHandle"
+    );
     let mut peer = [0u8; 32];
     unsafe {
         ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), 32);
@@ -710,7 +749,8 @@ pub unsafe extern "C" fn veil_media_open_channel(
             return 0;
         }
     };
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MEDIA_TX_QUEUE);
+    let (tx_hi, mut rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
+    let (tx_video, mut rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
     let send_hub = hub.clone();
     // One drain task per channel: warm the circuit, then pump queued datagrams
     // into the lossy send. `send_datagram` itself drops on QueueFull/no-route,
@@ -731,7 +771,13 @@ pub unsafe extern "C" fn veil_media_open_channel(
     let task = handle_live.bundle.runtime.spawn(async move {
         send_hub.media_open_channel(peer).await;
         let mut consecutive_drops: u32 = 0;
-        while let Some(pkt) = rx.recv().await {
+        loop {
+            let pkt = tokio::select! {
+                biased;
+                Some(pkt) = rx_hi.recv() => pkt,
+                Some(pkt) = rx_video.recv() => pkt,
+                else => break,
+            };
             if send_hub.media_send_datagram(peer, &pkt).await {
                 consecutive_drops = 0;
             } else {
@@ -746,7 +792,15 @@ pub unsafe extern "C" fn veil_media_open_channel(
     MEDIA_CHANNELS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(id, MediaChannel { tx, peer, task });
+        .insert(
+            id,
+            MediaChannel {
+                tx_hi,
+                tx_video,
+                peer,
+                task,
+            },
+        );
     id
 }
 
@@ -756,11 +810,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
 /// unknown `chan`.
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_media_send_datagram(
-    chan: u64,
-    ptr: *const u8,
-    len: size_t,
-) -> c_int {
+pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len: size_t) -> c_int {
     if chan == 0 || ptr.is_null() || len == 0 {
         return -1;
     }
@@ -769,7 +819,12 @@ pub unsafe extern "C" fn veil_media_send_datagram(
     let Some(ch) = map.get(&chan) else {
         return -1;
     };
-    match ch.tx.try_send(payload) {
+    let tx = if media_is_vp8_rtp(&payload) {
+        &ch.tx_video
+    } else {
+        &ch.tx_hi
+    };
+    match tx.try_send(payload) {
         Ok(()) => 0,
         Err(mpsc::error::TrySendError::Full(_)) => 1,
         Err(mpsc::error::TrySendError::Closed(_)) => -1,
