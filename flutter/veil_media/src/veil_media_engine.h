@@ -94,6 +94,17 @@ int veil_media_engine_start_camera(VeilMediaEngine *engine, int width,
                                    int height, int fps);
 int veil_media_engine_stop_camera(VeilMediaEngine *engine);
 
+/* Screen share: capture the main display into the SAME VP8 send source the
+ * camera uses (frames downscaled to <= width, at fps) — a source switch, not
+ * a new track, so the peer renders it with no changes. Starting the screen
+ * stops a running camera (one source at a time); the app layer restores the
+ * camera when the share ends. macOS backend only for now; other platforms
+ * return VEIL_MEDIA_ERR_STATE. The first use triggers the OS Screen Recording
+ * consent prompt (no frames until granted + app restart). Idempotent. */
+int veil_media_engine_start_screen(VeilMediaEngine *engine, int width,
+                                   int fps);
+int veil_media_engine_stop_screen(VeilMediaEngine *engine);
+
 /* Push one captured I420 frame into the video send stream (platform camera /
  * screen capturer, or Dart). Planes may be strided; pass ts_us=0 to stamp now.
  * No-op if video send isn't started. */

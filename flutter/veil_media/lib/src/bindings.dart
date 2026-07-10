@@ -91,6 +91,22 @@ final int Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineStopCamera =
             'veil_media_engine_stop_camera')
         .asFunction();
 
+// start_screen(engine*, width int, fps int) -> int
+final int Function(Pointer<VeilMediaEngineHandle>, int, int)
+    veilMediaEngineStartScreen = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilMediaEngineHandle>, Int32,
+                    Int32)>>('veil_media_engine_start_screen')
+        .asFunction();
+
+// stop_screen(engine*) -> int
+final int Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineStopScreen =
+    nativeLib
+        .lookup<NativeFunction<Int32 Function(Pointer<VeilMediaEngineHandle>)>>(
+            'veil_media_engine_stop_screen')
+        .asFunction();
+
 // get_video_frame(engine*, dst, dst_cap, out_w, out_h) -> int seq
 final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Uint8>, int,
         Pointer<Int32>, Pointer<Int32>) veilMediaEngineGetVideoFrame =
