@@ -35,6 +35,15 @@ export 'src/identity.dart'
         validateBip39Phrase;
 export 'src/lifecycle.dart' show VeilLifecycleBinding;
 export 'src/mailbox.dart' show MailboxOpened, VeilMailbox;
+export 'src/nickname.dart'
+    show
+        NicknameMineOutcome,
+        ResolvedNickname,
+        claimNickname,
+        mineNicknameChunk,
+        nicknameLengthFloor,
+        normalizeNickname,
+        resolveNickname;
 export 'src/multi_device_pairing.dart'
     show VeilMultiDevicePairingDialog, PairingRole;
 export 'src/pairing.dart' show VeilPairingDialog;
