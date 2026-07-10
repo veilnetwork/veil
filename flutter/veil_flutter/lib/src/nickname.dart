@@ -10,6 +10,7 @@
 // anonymous identities: a public name is a linkability signal). They block
 // for up to `timeoutMs`, so call them through `Isolate.run` too.
 
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -223,10 +224,59 @@ int claimNickname({
   }
 }
 
+/// [mineNicknameChunk] off the current isolate. A top-level indirection so
+/// the `Isolate.run` closure captures ONLY its sendable arguments — a closure
+/// written inline inside a widget/StateNotifier method silently captures
+/// `this` (→ controllers, the element tree) and throws "object is unsendable".
+Future<NicknameMineOutcome> mineNicknameChunkAsync({
+  required String name,
+  required Uint8List ownerNodeId,
+  required int targetWeight,
+  required int maxHashes,
+  Uint8List? priorSeeds,
+}) {
+  return Isolate.run(() => mineNicknameChunk(
+        name: name,
+        ownerNodeId: ownerNodeId,
+        targetWeight: targetWeight,
+        maxHashes: maxHashes,
+        priorSeeds: priorSeeds,
+      ));
+}
+
+/// [claimNickname] off the current isolate (see [mineNicknameChunkAsync] for
+/// why this indirection is a top-level function, not an inline closure).
+Future<int> claimNicknameAsync({
+  required Uint8List ownerNodeId,
+  required String name,
+  required Uint8List seeds,
+  int timeoutMs = 0,
+}) {
+  return Isolate.run(() => claimNickname(
+        ownerNodeId: ownerNodeId,
+        name: name,
+        seeds: seeds,
+        timeoutMs: timeoutMs,
+      ));
+}
+
+/// [resolveNickname] off the current isolate (see [mineNicknameChunkAsync]).
+Future<ResolvedNickname?> resolveNicknameAsync({
+  required Uint8List selfNodeId,
+  required String name,
+  int timeoutMs = 0,
+}) {
+  return Isolate.run(() => resolveNickname(
+        selfNodeId: selfNodeId,
+        name: name,
+        timeoutMs: timeoutMs,
+      ));
+}
+
 /// Resolve the current owner of a nickname via the embedded node running
 /// as `selfNodeId`. Returns `null` when the name has no valid owner
 /// (available). Throws [VeilException] on error (no embedded node, bad
-/// name). Blocking — call through `Isolate.run`.
+/// name). Blocking — call through [resolveNicknameAsync].
 ResolvedNickname? resolveNickname({
   required Uint8List selfNodeId,
   required String name,

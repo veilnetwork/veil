@@ -40,10 +40,13 @@ export 'src/nickname.dart'
         NicknameMineOutcome,
         ResolvedNickname,
         claimNickname,
+        claimNicknameAsync,
         mineNicknameChunk,
+        mineNicknameChunkAsync,
         nicknameLengthFloor,
         normalizeNickname,
-        resolveNickname;
+        resolveNickname,
+        resolveNicknameAsync;
 export 'src/multi_device_pairing.dart'
     show VeilMultiDevicePairingDialog, PairingRole;
 export 'src/pairing.dart' show VeilPairingDialog;
