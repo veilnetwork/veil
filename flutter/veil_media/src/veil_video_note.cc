@@ -43,9 +43,11 @@
 #include "api/video/video_frame.h"
 #include "api/video/video_frame_type.h"
 #include "api/video_codecs/video_codec.h"
+#include "api/video_codecs/video_decoder.h"
 #include "api/video_codecs/video_encoder.h"
 #include "modules/video_coding/codecs/vp8/include/vp8.h"
 #include "rtc_base/buffer.h"
+#include "third_party/libyuv/include/libyuv/convert_argb.h"  // I420ToABGR
 
 #if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
 #define VEIL_VNOTE_HAVE_NATIVE_CAMERA 1
@@ -247,6 +249,60 @@ class VnoteEncodeSink : public webrtc::EncodedImageCallback {
   std::vector<VideoRec> recs;  // guarded by the recorder's video mutex
 };
 
+// Latest-decoded-frame sink (the VeilVideoSink pattern from the call engine):
+// Decoded() runs on the decode call stack; the RGBA copy is pulled by the app.
+class VnoteDecodeSink : public webrtc::DecodedImageCallback {
+ public:
+  int32_t Decoded(webrtc::VideoFrame& frame) override {
+    auto buf = frame.video_frame_buffer()->ToI420();
+    if (buf == nullptr) return 0;
+    const int w = buf->width(), h = buf->height();
+    if (w <= 0 || h <= 0) return 0;
+    const size_t need = (size_t)w * h * 4;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (rgba_.size() < need) rgba_.resize(need);
+    libyuv::I420ToABGR(buf->DataY(), buf->StrideY(), buf->DataU(),
+                       buf->StrideU(), buf->DataV(), buf->StrideV(),
+                       rgba_.data(), w * 4, w, h);
+    w_ = w;
+    h_ = h;
+    ++seq_;
+    return 0;
+  }
+
+  int get_frame(uint8_t* dst, int dst_cap, int* out_w, int* out_h) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (seq_ == 0 || w_ <= 0) return 0;
+    if (out_w) *out_w = w_;
+    if (out_h) *out_h = h_;
+    const size_t need = (size_t)w_ * h_ * 4;
+    if (dst == nullptr || dst_cap < 0 || (size_t)dst_cap < need) return -1;
+    std::memcpy(dst, rgba_.data(), need);
+    return (int)seq_;
+  }
+
+ private:
+  std::mutex mu_;
+  std::vector<uint8_t> rgba_;
+  int w_ = 0, h_ = 0;
+  uint32_t seq_ = 0;
+};
+
+uint32_t rd_u32le(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+         ((uint32_t)p[3] << 24);
+}
+uint16_t rd_u16le(const uint8_t* p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+struct VnoteFrameRef {
+  uint32_t ts_ms;
+  bool key;
+  size_t off;  // into the player's owned container copy
+  uint32_t len;
+};
+
 }  // namespace
 #endif  // VEIL_MEDIA_HAVE_WEBRTC
 
@@ -261,6 +317,7 @@ struct VeilVnoteRecorder {
   std::unique_ptr<VnoteAudioSink> audio;
   bool mic_recording = false;
 
+  bool want_native_camera = true;
   // Video. All encoder state is guarded by video_mu — camera frames arrive on
   // the capture queue, push_frame on the FFI thread, stop() on control.
   std::mutex video_mu;
@@ -373,11 +430,13 @@ void encode_i420(VeilVnoteRecorder* rec, const uint8_t* y, const uint8_t* u,
 
 extern "C" {
 
-VeilVnoteRecorder* veil_media_vnote_recorder_create(int width, int fps) {
+VeilVnoteRecorder* veil_media_vnote_recorder_create(int width, int fps,
+                                                    int native_camera) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   webrtc::Environment env = webrtc::CreateEnvironment();
   auto rec = new VeilVnoteRecorder(env, width > 0 ? width & ~1 : kDefaultSquare,
                                    fps > 0 ? fps : kDefaultFps);
+  rec->want_native_camera = native_camera != 0;
 #if defined(__APPLE__)
   rec->adm = veil_media::CreateVeilAvfAdm(rec->env);
 #elif defined(__ANDROID__)
@@ -408,6 +467,7 @@ VeilVnoteRecorder* veil_media_vnote_recorder_create(int width, int fps) {
 #else
   (void)width;
   (void)fps;
+  (void)native_camera;
   return nullptr;
 #endif
 }
@@ -440,6 +500,7 @@ int veil_media_vnote_recorder_start(VeilVnoteRecorder* rec) {
 #if defined(VEIL_VNOTE_HAVE_NATIVE_CAMERA)
   // Platform camera; frames flow into the VP8 encoder. Android has no native
   // backend — its Dart capturer pushes via veil_media_vnote_recorder_push_frame.
+  if (rec->want_native_camera)
   rec->camera.reset(veil_media::CreatePlatformCamera(
       [rec](const uint8_t* y, const uint8_t* u, const uint8_t* v, int w, int h,
             int sy, int su, int sv, int64_t /*ts_us*/) {
@@ -583,6 +644,216 @@ int veil_media_vnote_recorder_stop(VeilVnoteRecorder* rec, uint8_t** out_bytes,
 
 void veil_media_vnote_free_bytes(uint8_t* bytes) {
   if (bytes) free(bytes);
+}
+
+// ── Player ──────────────────────────────────────────────────────────────────
+
+struct VeilVnotePlayer {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  webrtc::Environment env;
+  std::vector<uint8_t> bytes;        // owned copy of the container
+  std::vector<VnoteFrameRef> frames; // offsets into `bytes`
+  size_t audio_off = 0;
+  uint32_t audio_len = 0;
+  int width = 0, height = 0, fps = 0;
+  uint32_t duration_ms = 0;
+
+  std::unique_ptr<webrtc::VideoDecoder> dec;
+  VnoteDecodeSink sink;
+  std::mutex mu;          // decode-position state below
+  size_t next_idx = 0;    // next frame to decode
+  int64_t last_ts = -1;   // ts of the last decoded frame (-1 = none)
+
+  explicit VeilVnotePlayer(webrtc::Environment e) : env(std::move(e)) {}
+#endif
+};
+
+extern "C" VeilVnotePlayer* veil_media_vnote_player_create(
+    const uint8_t* vnote, size_t len) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  // Strict parse — the clip arrives over the network. Every offset is
+  // bounds-checked; any inconsistency rejects the whole container.
+  if (vnote == nullptr || len < 24) return nullptr;
+  if (std::memcmp(vnote, "VN01", 4) != 0 || vnote[4] != 1) return nullptr;
+  const uint8_t flags = vnote[5];
+  const uint16_t w = rd_u16le(vnote + 6);
+  const uint16_t h = rd_u16le(vnote + 8);
+  const uint8_t fps = vnote[10];
+  const uint32_t dur = rd_u32le(vnote + 12);
+  const uint32_t audio_len = rd_u32le(vnote + 16);
+  const uint32_t frame_count = rd_u32le(vnote + 20);
+  if ((uint64_t)24 + audio_len > len) return nullptr;
+  if ((flags & 1) && audio_len == 0) return nullptr;
+
+  auto p = new VeilVnotePlayer(webrtc::CreateEnvironment());
+  p->bytes.assign(vnote, vnote + len);
+  p->audio_off = 24;
+  p->audio_len = audio_len;
+  p->width = w;
+  p->height = h;
+  p->fps = fps;
+  p->duration_ms = dur;
+
+  size_t off = 24 + audio_len;
+  p->frames.reserve(frame_count);
+  uint32_t last_ts = 0;
+  for (uint32_t i = 0; i < frame_count; i++) {
+    if (off + 9 > len) { delete p; return nullptr; }
+    VnoteFrameRef f;
+    f.ts_ms = rd_u32le(p->bytes.data() + off);
+    f.key = (p->bytes[off + 4] & 1) != 0;
+    f.len = rd_u32le(p->bytes.data() + off + 5);
+    off += 9;
+    if (f.len == 0 || off + f.len > len) { delete p; return nullptr; }
+    if (f.ts_ms < last_ts) { delete p; return nullptr; }  // monotonic
+    last_ts = f.ts_ms;
+    f.off = off;
+    off += f.len;
+    p->frames.push_back(f);
+  }
+  if (off != len) { delete p; return nullptr; }  // trailing garbage
+  if (!p->frames.empty() && !p->frames.front().key) { delete p; return nullptr; }
+
+  if (!p->frames.empty()) {
+    p->dec = webrtc::CreateVp8Decoder(p->env);
+    if (!p->dec) { delete p; return nullptr; }
+    webrtc::VideoDecoder::Settings s;
+    s.set_codec_type(webrtc::kVideoCodecVP8);
+    s.set_number_of_cores(2);
+    if (!p->dec->Configure(s)) { delete p; return nullptr; }
+    p->dec->RegisterDecodeCompleteCallback(&p->sink);
+  }
+  return p;
+#else
+  (void)vnote;
+  (void)len;
+  return nullptr;
+#endif
+}
+
+extern "C" int veil_media_vnote_player_duration_ms(VeilVnotePlayer* p) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  return p ? (int)p->duration_ms : 0;
+#else
+  (void)p;
+  return 0;
+#endif
+}
+
+extern "C" int veil_media_vnote_player_width(VeilVnotePlayer* p) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  return p ? p->width : 0;
+#else
+  (void)p;
+  return 0;
+#endif
+}
+
+extern "C" int veil_media_vnote_player_height(VeilVnotePlayer* p) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  return p ? p->height : 0;
+#else
+  (void)p;
+  return 0;
+#endif
+}
+
+extern "C" int veil_media_vnote_player_has_audio(VeilVnotePlayer* p) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  return (p && p->audio_len > 0) ? 1 : 0;
+#else
+  (void)p;
+  return 0;
+#endif
+}
+
+extern "C" int veil_media_vnote_player_audio(VeilVnotePlayer* p,
+                                             uint8_t** out_bytes,
+                                             size_t* out_len) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!p || !out_bytes || !out_len) return VEIL_VNOTE_ERR_ARG;
+  *out_bytes = nullptr;
+  *out_len = 0;
+  if (p->audio_len == 0) return VEIL_VNOTE_ERR;
+  uint8_t* buf = (uint8_t*)malloc(p->audio_len);
+  if (!buf) return VEIL_VNOTE_ERR;
+  std::memcpy(buf, p->bytes.data() + p->audio_off, p->audio_len);
+  *out_bytes = buf;
+  *out_len = p->audio_len;
+  return VEIL_VNOTE_OK;
+#else
+  (void)p; (void)out_bytes; (void)out_len;
+  return VEIL_VNOTE_ERR;
+#endif
+}
+
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+namespace {
+// Decode one indexed frame into the sink. Caller holds p->mu.
+void vnote_decode_one(VeilVnotePlayer* p, const VnoteFrameRef& f) {
+  webrtc::EncodedImage img;
+  img.SetEncodedData(
+      webrtc::EncodedImageBuffer::Create(p->bytes.data() + f.off, f.len));
+  img.SetRtpTimestamp(f.ts_ms * 90);
+  img.SetFrameType(f.key ? webrtc::VideoFrameType::kVideoFrameKey
+                         : webrtc::VideoFrameType::kVideoFrameDelta);
+  img._encodedWidth = (uint32_t)p->width;
+  img._encodedHeight = (uint32_t)p->height;
+  p->dec->Decode(img, /*render_time_ms=*/f.ts_ms);
+}
+}  // namespace
+#endif
+
+extern "C" int veil_media_vnote_player_frame_at(VeilVnotePlayer* p, int ms,
+                                                uint8_t* dst, int dst_cap,
+                                                int* out_w, int* out_h) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!p) return 0;
+  if (ms < 0) ms = 0;
+  if (!p->frames.empty() && p->dec) {
+    std::lock_guard<std::mutex> lk(p->mu);
+    // Rewind: restart from the nearest keyframe at/before [ms]. (The VP8
+    // reference chain resets at a keyframe, so decoding forward from there
+    // reproduces the exact frame.)
+    if ((int64_t)ms < p->last_ts) {
+      size_t k = 0;
+      for (size_t i = 0; i < p->frames.size(); i++) {
+        if (p->frames[i].ts_ms > (uint32_t)ms) break;
+        if (p->frames[i].key) k = i;
+      }
+      p->next_idx = k;
+      p->last_ts = -1;
+    }
+    while (p->next_idx < p->frames.size() &&
+           p->frames[p->next_idx].ts_ms <= (uint32_t)ms) {
+      const auto& f = p->frames[p->next_idx];
+      vnote_decode_one(p, f);
+      p->last_ts = f.ts_ms;
+      p->next_idx++;
+    }
+    // Nothing decoded yet (ms before the first frame) — prime with frame 0 so
+    // the bubble shows the opening frame immediately.
+    if (p->last_ts < 0 && !p->frames.empty()) {
+      vnote_decode_one(p, p->frames[0]);
+      p->last_ts = p->frames[0].ts_ms;
+      p->next_idx = 1;
+    }
+  }
+  return p->sink.get_frame(dst, dst_cap, out_w, out_h);
+#else
+  (void)p; (void)ms; (void)dst; (void)dst_cap; (void)out_w; (void)out_h;
+  return 0;
+#endif
+}
+
+extern "C" void veil_media_vnote_player_destroy(VeilVnotePlayer* p) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!p) return;
+  if (p->dec) p->dec->Release();
+  delete p;
+#else
+  (void)p;
+#endif
 }
 
 void veil_media_vnote_recorder_destroy(VeilVnoteRecorder* rec) {
