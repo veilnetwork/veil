@@ -23,6 +23,7 @@ mod mailbox_state;
 mod maintenance;
 mod mesh_gateway;
 mod mobile_state;
+mod nickname;
 mod offline_seal;
 mod p_net_ban_sync;
 mod peer_handshake;

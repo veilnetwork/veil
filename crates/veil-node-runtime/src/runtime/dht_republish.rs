@@ -80,6 +80,15 @@ impl NodeRuntime {
             // republished it, leaving it store_local-only at the publisher and
             // un-discoverable to any node that hadn't organically cached it.
             || magic == &veil_proto::relay_key::RELAY_KEY_MAGIC[..]
+            // NicknameRecord ("NK"): fully self-authenticating (owner binding
+            // node_id == blake3(pk) + ed25519 sig + cumulative PoW), accepted
+            // at the STORE gate via `nickname_store_gate` which additionally
+            // applies the replace-on-heavier conflict rule — so republishing
+            // an incumbent can never clobber a heavier record at the
+            // receiver. Without this arm a nickname decays after one DHT TTL
+            // and the name silently un-resolves (this IS the auto-renewal
+            // path: holders and the owner alike keep re-fanning the record).
+            || magic == &veil_crypto::nickname::NICKNAME_DHT_MAGIC[..]
     }
 
     pub fn spawn_dht_republish_task(&mut self, republish_interval: std::time::Duration) {
