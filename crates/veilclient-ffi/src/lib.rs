@@ -85,6 +85,10 @@ mod media;
 // identity TOML — enabled by node-embedded).
 #[cfg(feature = "node-embedded")]
 mod identity_sign;
+// Networked nickname claim/resolve (needs the in-process embedded node's
+// NodeServices; the pure nickname helpers in lib.rs stay feature-free).
+#[cfg(feature = "node-embedded")]
+mod nickname_net;
 mod node;
 
 use libc::{size_t, ssize_t};
