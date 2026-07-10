@@ -4115,19 +4115,49 @@ impl NodeServices {
         // `|_| true` to preserve the old unconditional fast path.
         validate: impl Fn(&[u8]) -> bool,
     ) -> Vec<Vec<u8>> {
-        // Validated local fast path. A local value that fails `validate`
-        // (poisoned / unverifiable) does NOT short-circuit — it falls through to
-        // the remote quorum below.
-        if let Some(value) = self.dht.get_local(&key)
-            && validate(&value)
-        {
+        self.dht_get_replicated_inner(key, n_replicas, timeout, validate, true)
+            .await
+    }
+
+    /// Contested-record variant (nicknames): ownership is displaceable by
+    /// cumulative PoW weight, so a VALID local copy is necessary but NOT
+    /// sufficient — a stale lighter record still verifies, and letting it
+    /// short-circuit the remote quorum would blind the holder to a heavier
+    /// displacement forever (the owner-changed re-verify would never fire on
+    /// exactly the nodes that mirrored the old owner). The validated local
+    /// value joins the replica set instead of ending the fetch; the caller's
+    /// displacement pick decides the winner.
+    pub async fn dht_get_replicated_contested(
+        &self,
+        key: [u8; 32],
+        n_replicas: usize,
+        timeout: std::time::Duration,
+        validate: impl Fn(&[u8]) -> bool,
+    ) -> Vec<Vec<u8>> {
+        self.dht_get_replicated_inner(key, n_replicas, timeout, validate, false)
+            .await
+    }
+
+    async fn dht_get_replicated_inner(
+        &self,
+        key: [u8; 32],
+        n_replicas: usize,
+        timeout: std::time::Duration,
+        validate: impl Fn(&[u8]) -> bool,
+        local_fast_path: bool,
+    ) -> Vec<Vec<u8>> {
+        // Validated local value. A local value that fails `validate`
+        // (poisoned / unverifiable) never short-circuits and never joins the
+        // replica set — the resolver's post-quorum `store_local` repairs it.
+        let mut local = self.dht.get_local(&key).filter(|value| validate(value));
+        if local_fast_path && let Some(value) = local.take() {
             return vec![value];
         }
         let n = n_replicas.clamp(1, veil_proto::budget::DHT_REPLICATION_K);
 
         let mut peers: Vec<[u8; 32]> = rlock!(self.session_tx_registry).peer_ids();
         if peers.is_empty() {
-            return Vec::new();
+            return local.into_iter().collect();
         }
         peers.sort_by_key(|pid| {
             let mut xor = [0u8; 32];
@@ -4138,7 +4168,7 @@ impl NodeServices {
         });
         let targets: Vec<[u8; 32]> = peers.into_iter().take(n).collect();
         if targets.is_empty() {
-            return Vec::new();
+            return local.into_iter().collect();
         }
 
         let local_node_id = *self.identity.local_identity.node_id.as_bytes();
@@ -4243,6 +4273,11 @@ impl NodeServices {
             {
                 out.push(payload);
             }
+        }
+        // Contested mode: the validated local copy is one replica among the
+        // remote ones, never the whole answer.
+        if let Some(value) = local {
+            out.push(value);
         }
         out
     }
