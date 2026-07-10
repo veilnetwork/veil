@@ -49,8 +49,9 @@ const RESOLVE_REPLICAS: usize = 5;
 impl NodeServices {
     /// Resolve the current owner record for `name` (leading `@` accepted).
     ///
-    /// Fetches up to [`RESOLVE_REPLICAS`] replicas (validated local fast
-    /// path first, then recursive FIND_VALUE quorum), verifies each
+    /// Fetches up to [`RESOLVE_REPLICAS`] replicas (recursive FIND_VALUE
+    /// quorum; a validated local mirror counts as ONE replica and never
+    /// short-circuits the walk — contested fetch), verifies each
     /// (`NicknameRecord::verify`: owner binding + signature + recomputed
     /// cumulative PoW + length floor + name match), and returns the record
     /// that displaces all others — or `None` when the name is free.
@@ -71,8 +72,11 @@ impl NodeServices {
             NicknameRecord::from_bytes(bytes)
                 .is_some_and(|r| r.name == norm && r.verify().is_ok())
         };
+        // Contested fetch: a valid LOCAL mirror must not short-circuit the
+        // remote quorum — a stale lighter record still verifies, and the
+        // whole point of re-resolving is spotting a heavier displacement.
         let replicas = self
-            .dht_get_replicated(key, RESOLVE_REPLICAS, timeout, is_valid)
+            .dht_get_replicated_contested(key, RESOLVE_REPLICAS, timeout, is_valid)
             .await;
         let mut best: Option<NicknameRecord> = None;
         for bytes in &replicas {
