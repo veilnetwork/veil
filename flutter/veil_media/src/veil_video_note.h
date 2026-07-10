@@ -1,0 +1,112 @@
+/* SPDX-License-Identifier: MIT
+ *
+ * veil_video_note.h — video-note ("кружочек") recorder ABI.
+ *
+ * Records the camera + microphone ENTIRELY INTO RAM as the VNOTE1 container:
+ * VP8 video frames + an embedded VOICE_OPUS audio block, both produced by the
+ * SAME vendored libwebrtc the call engine uses. No platform recorder is
+ * involved on purpose — MediaRecorder/AVAssetWriter write plaintext FILES
+ * (canon violation), and no standard container plays from RAM on both
+ * platforms anyway (AVPlayer cannot decode WebM/VP8, the same trap as
+ * Opus/AVFoundation for voice). Playback is the in-app twin brick: VP8 decode
+ * -> frame pull (like remote call video), audio via the voice WAV path.
+ *
+ * VNOTE1 container (self-describing, little-endian):
+ *   offset 0 : "VN01" magic (4 bytes)
+ *   offset 4 : u8  version = 1
+ *   offset 5 : u8  flags (bit0 = has audio, bit1 = has video)
+ *   offset 6 : u16 width   (encoded, square after center-crop)
+ *   offset 8 : u16 height
+ *   offset 10: u8  fps (target)
+ *   offset 11: u8  reserved = 0
+ *   offset 12: u32 duration_ms
+ *   offset 16: u32 audio_len — byte length of the embedded audio block
+ *   offset 20: u32 video_frame_count
+ *   offset 24: audio_len bytes — a complete VOICE_OPUS ("VOP1") block, decoded
+ *              by the existing voice bricks (decode-to-WAV works unchanged)
+ *   then     : video_frame_count x [ u32 ts_ms ][ u8 flags(bit0=keyframe) ]
+ *                                  [ u32 len ][ len VP8 bytes ]
+ *
+ * Capture sources: macOS/Linux use the platform camera capturer the calls use
+ * (veil_camera.h) — start() opens it. Android has NO native camera backend:
+ * the Dart-side capturer (same as calls) feeds frames through
+ * veil_media_vnote_recorder_push_frame instead, and start() only starts the
+ * microphone there.
+ *
+ * Threading: create/start/stop/destroy on one control thread. Camera frames
+ * arrive on the capture queue, mic PCM on the audio thread; level/elapsed are
+ * safe to poll from the UI.
+ *
+ * The recorder builds its own ADM (mic) exactly like the voice recorder — the
+ * app layer must not run a call and a video-note recording at the same time
+ * (one AudioTransport per ADM; two live ADMs would double-tap the mic HW).
+ */
+
+#ifndef VEIL_VIDEO_NOTE_H
+#define VEIL_VIDEO_NOTE_H
+
+#pragma once
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#pragma GCC visibility push(default)
+
+typedef struct VeilVnoteRecorder VeilVnoteRecorder;
+
+#define VEIL_VNOTE_OK 0
+#define VEIL_VNOTE_ERR -1
+#define VEIL_VNOTE_ERR_ARG -2
+#define VEIL_VNOTE_ERR_DEVICE -3
+
+/* Create a recorder targeting a [width]x[width] square at [fps] (camera
+ * frames are center-cropped square and downscaled; <=0 picks the defaults
+ * 480 @ 24). Builds the platform ADM + Opus encoder + VP8 encoder. Returns
+ * NULL when the native layer is unavailable. Does NOT start capture. */
+VeilVnoteRecorder* veil_media_vnote_recorder_create(int width, int fps);
+
+/* Begin capturing: microphone always; the platform camera where a native
+ * backend exists (macOS/Linux — Android pushes frames from Dart instead).
+ * Returns VEIL_VNOTE_ERR_DEVICE if the mic can't be opened. Idempotent. */
+int veil_media_vnote_recorder_start(VeilVnoteRecorder* rec);
+
+/* Feed one strided I420 frame (the Dart camera capturer on Android; also the
+ * synthetic-frame path in tests). Same plane/stride contract as
+ * veil_media_engine_push_video_frame. ts_us <= 0 stamps "now". */
+int veil_media_vnote_recorder_push_frame(VeilVnoteRecorder* rec,
+                                         const uint8_t* y, const uint8_t* u,
+                                         const uint8_t* v, int width,
+                                         int height, int stride_y,
+                                         int stride_u, int stride_v,
+                                         int64_t ts_us);
+
+/* Most-recent smoothed mic level in 0..1 (live meter). */
+float veil_media_vnote_recorder_level(VeilVnoteRecorder* rec);
+
+/* Elapsed recording time so far, in ms (wall clock since start). */
+int veil_media_vnote_recorder_elapsed_ms(VeilVnoteRecorder* rec);
+
+/* Stop capture and finalize the VNOTE1 stream. On success *out_bytes is a
+ * malloc'd buffer (free with veil_media_vnote_free_bytes), *out_len its
+ * size, *out_duration_ms the clip length. An empty clip (no frames AND no
+ * audio) yields out_len 0. */
+int veil_media_vnote_recorder_stop(VeilVnoteRecorder* rec, uint8_t** out_bytes,
+                                   size_t* out_len, int* out_duration_ms);
+
+/* Free a buffer returned by veil_media_vnote_recorder_stop. */
+void veil_media_vnote_free_bytes(uint8_t* bytes);
+
+/* Free the recorder (stops capture if still running). Idempotent. */
+void veil_media_vnote_recorder_destroy(VeilVnoteRecorder* rec);
+
+#pragma GCC visibility pop
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* VEIL_VIDEO_NOTE_H */
