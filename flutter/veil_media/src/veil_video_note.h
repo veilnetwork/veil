@@ -65,9 +65,13 @@ typedef struct VeilVnoteRecorder VeilVnoteRecorder;
 
 /* Create a recorder targeting a [width]x[width] square at [fps] (camera
  * frames are center-cropped square and downscaled; <=0 picks the defaults
- * 480 @ 24). Builds the platform ADM + Opus encoder + VP8 encoder. Returns
- * NULL when the native layer is unavailable. Does NOT start capture. */
-VeilVnoteRecorder* veil_media_vnote_recorder_create(int width, int fps);
+ * 480 @ 24). [native_camera] != 0 makes start() open the platform camera
+ * where a backend exists; 0 = frames come ONLY through push_frame (the
+ * Android path, and tests that must not mix in a real camera). Builds the
+ * platform ADM + Opus encoder + VP8 encoder. Returns NULL when the native
+ * layer is unavailable. Does NOT start capture. */
+VeilVnoteRecorder* veil_media_vnote_recorder_create(int width, int fps,
+                                                    int native_camera);
 
 /* Begin capturing: microphone always; the platform camera where a native
  * backend exists (macOS/Linux — Android pushes frames from Dart instead).
@@ -102,6 +106,42 @@ void veil_media_vnote_free_bytes(uint8_t* bytes);
 
 /* Free the recorder (stops capture if still running). Idempotent. */
 void veil_media_vnote_recorder_destroy(VeilVnoteRecorder* rec);
+
+/* ── Playback ───────────────────────────────────────────────────────────────
+ *
+ * Pull-driven decode: the app plays the AUDIO section through the existing
+ * voice path (decode-to-WAV -> loopback -> platform player — exact position,
+ * pause, speed for free) and polls veil_media_vnote_player_frame_at with that
+ * position; the player decodes forward on demand (VP8 decode of a small
+ * square is sub-millisecond) and rewinds via the nearest preceding keyframe.
+ * No decode thread, no A/V clock of its own. */
+
+typedef struct VeilVnotePlayer VeilVnotePlayer;
+
+/* Parse a VNOTE1 byte stream (copies it; strict bounds checks — the clip is
+ * network-received). Returns NULL on a malformed container. */
+VeilVnotePlayer* veil_media_vnote_player_create(const uint8_t* vnote,
+                                                size_t len);
+
+int veil_media_vnote_player_duration_ms(VeilVnotePlayer* p);
+int veil_media_vnote_player_width(VeilVnotePlayer* p);
+int veil_media_vnote_player_height(VeilVnotePlayer* p);
+int veil_media_vnote_player_has_audio(VeilVnotePlayer* p);
+
+/* Copy out the embedded VOICE_OPUS audio block (malloc'd; free with
+ * veil_media_vnote_free_bytes). VEIL_VNOTE_ERR when the note is silent. */
+int veil_media_vnote_player_audio(VeilVnotePlayer* p, uint8_t** out_bytes,
+                                  size_t* out_len);
+
+/* Decode up to the frame at [ms] and copy the latest decoded frame as tightly
+ * packed RGBA into dst. Returns a monotonically increasing seq (>0) when a
+ * frame is available, 0 when none decoded yet, -1 when dst_cap is too small
+ * (out_w/out_h are still set — resize and retry). Rewinding restarts from the
+ * nearest preceding keyframe. */
+int veil_media_vnote_player_frame_at(VeilVnotePlayer* p, int ms, uint8_t* dst,
+                                     int dst_cap, int* out_w, int* out_h);
+
+void veil_media_vnote_player_destroy(VeilVnotePlayer* p);
 
 #pragma GCC visibility pop
 
