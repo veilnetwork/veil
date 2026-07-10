@@ -51,6 +51,7 @@ compile_tu "$SRCDIR/veil_transport_shim.cc" "$TMP/shim.o"
 compile_tu "$SRCDIR/veil_v4l2_camera.cc" "$TMP/v4l2.o"
 compile_tu "$SRCDIR/veil_audio_record.cc" "$TMP/record.o"
 compile_tu "$SRCDIR/veil_audio_play.cc" "$TMP/play.o"
+compile_tu "$SRCDIR/veil_video_note.cc" "$TMP/vnote.o"
 
 # ELF export control: only veil_media_* global.
 cat > "$TMP/exports.map" <<'MAP'
@@ -85,7 +86,7 @@ echo "==> linking libveil_media.so ($TGT, lld, sysroot libgcc unwinder)"
 # shellcheck disable=SC2086
 "$CLANGXX" -shared -o "$DEST/libveil_media.so" \
   $TGT --sysroot="$SYSROOT" -fuse-ld=lld -nostdlib++ -rtlib=libgcc -unwindlib=libgcc \
-  "$TMP/engine.o" "$TMP/shim.o" "$TMP/v4l2.o" "$TMP/record.o" "$TMP/play.o" obj/libwebrtc.a $CXX_OBJS \
+  "$TMP/engine.o" "$TMP/shim.o" "$TMP/v4l2.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS \
   -Wl,--gc-sections -Wl,--version-script,"$TMP/exports.map" \
   -Wl,-soname,libveil_media.so -Wl,-rpath,'$ORIGIN' \
   -lpthread -ldl -lrt -lm -lX11
