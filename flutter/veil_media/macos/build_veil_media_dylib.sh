@@ -57,6 +57,7 @@ compile_tu "$SRCDIR/veil_avf_camera.mm" "$TMP/avf_camera.o"
 compile_tu "$SRCDIR/veil_avf_screen.mm" "$TMP/avf_screen.o"
 compile_tu "$SRCDIR/veil_audio_record.cc" "$TMP/record.o"
 compile_tu "$SRCDIR/veil_audio_play.cc" "$TMP/play.o"
+compile_tu "$SRCDIR/veil_video_note.cc" "$TMP/vnote.o"
 
 printf '_veil_media_*\n' > "$TMP/exported.txt"
 
@@ -73,7 +74,7 @@ DEADSTRIP="-Wl,-dead_strip"
 echo "==> linking libveil_media.dylib (sdk=$SDK, deadstrip='${DEADSTRIP}')"
 # shellcheck disable=SC2086
 "$CLANGXX" -dynamiclib -o "$DEST/libveil_media.dylib" \
-  "$TMP/engine.o" "$TMP/shim.o" "$TMP/avf_adm.o" "$TMP/avf_camera.o" "$TMP/avf_screen.o" "$TMP/record.o" "$TMP/play.o" obj/libwebrtc.a $CXX_OBJS \
+  "$TMP/engine.o" "$TMP/shim.o" "$TMP/avf_adm.o" "$TMP/avf_camera.o" "$TMP/avf_screen.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS \
   $DEADSTRIP -Wl,-undefined,dynamic_lookup \
   -Wl,-exported_symbols_list,"$TMP/exported.txt" \
   -install_name @rpath/libveil_media.dylib \
