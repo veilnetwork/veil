@@ -260,3 +260,81 @@ final void Function(Pointer<VeilAudioRecorderHandle>) veilMediaRecorderDestroy =
                 Void Function(Pointer<VeilAudioRecorderHandle>)>>(
             'veil_media_recorder_destroy')
         .asFunction();
+
+// ---- Voice-message player (VOICE_OPUS -> PCM -> ADM speaker) ---------------
+
+/// Opaque player handle (VeilAudioPlayer*).
+final class VeilAudioPlayerHandle extends Opaque {}
+
+// player_create(voice_opus*, len) -> player* (NULL on failure)
+final Pointer<VeilAudioPlayerHandle> Function(Pointer<Uint8>, int)
+    veilMediaPlayerCreate = nativeLib
+        .lookup<
+            NativeFunction<
+                Pointer<VeilAudioPlayerHandle> Function(
+                    Pointer<Uint8>, Size)>>('veil_media_player_create')
+        .asFunction();
+
+// player_start(player*) -> int
+final int Function(Pointer<VeilAudioPlayerHandle>) veilMediaPlayerStart =
+    nativeLib
+        .lookup<NativeFunction<Int32 Function(Pointer<VeilAudioPlayerHandle>)>>(
+            'veil_media_player_start')
+        .asFunction();
+
+final int Function(Pointer<VeilAudioPlayerHandle>) veilMediaPlayerPause =
+    nativeLib
+        .lookup<NativeFunction<Int32 Function(Pointer<VeilAudioPlayerHandle>)>>(
+            'veil_media_player_pause')
+        .asFunction();
+
+final int Function(Pointer<VeilAudioPlayerHandle>) veilMediaPlayerResume =
+    nativeLib
+        .lookup<NativeFunction<Int32 Function(Pointer<VeilAudioPlayerHandle>)>>(
+            'veil_media_player_resume')
+        .asFunction();
+
+// player_seek(player*, ms) -> int
+final int Function(Pointer<VeilAudioPlayerHandle>, int) veilMediaPlayerSeek =
+    nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                    Pointer<VeilAudioPlayerHandle>, Int32)>>(
+            'veil_media_player_seek')
+        .asFunction();
+
+// player_set_speed(player*, speed) -> int
+final int Function(Pointer<VeilAudioPlayerHandle>, double)
+    veilMediaPlayerSetSpeed = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                    Pointer<VeilAudioPlayerHandle>, Float)>>(
+            'veil_media_player_set_speed')
+        .asFunction();
+
+final int Function(Pointer<VeilAudioPlayerHandle>) veilMediaPlayerPositionMs =
+    nativeLib
+        .lookup<NativeFunction<Int32 Function(Pointer<VeilAudioPlayerHandle>)>>(
+            'veil_media_player_position_ms')
+        .asFunction();
+
+final int Function(Pointer<VeilAudioPlayerHandle>) veilMediaPlayerDurationMs =
+    nativeLib
+        .lookup<NativeFunction<Int32 Function(Pointer<VeilAudioPlayerHandle>)>>(
+            'veil_media_player_duration_ms')
+        .asFunction();
+
+final int Function(Pointer<VeilAudioPlayerHandle>) veilMediaPlayerIsPlaying =
+    nativeLib
+        .lookup<NativeFunction<Int32 Function(Pointer<VeilAudioPlayerHandle>)>>(
+            'veil_media_player_is_playing')
+        .asFunction();
+
+// player_destroy(player*)
+final void Function(Pointer<VeilAudioPlayerHandle>) veilMediaPlayerDestroy =
+    nativeLib
+        .lookup<NativeFunction<Void Function(Pointer<VeilAudioPlayerHandle>)>>(
+            'veil_media_player_destroy')
+        .asFunction();

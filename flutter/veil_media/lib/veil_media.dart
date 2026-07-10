@@ -408,3 +408,64 @@ class VeilAudioRecorder {
     }
   }
 }
+
+/// Plays a VOICE_OPUS clip (from [VeilAudioRecorder]/sendVoice) through the
+/// native decoder + ADM speaker — no OS media framework, no plaintext on disk.
+/// Create with the clip bytes, [start], poll [positionMs]/[isPlaying] for the
+/// progress UI, and [dispose] when done. Supports [pause]/[resume]/[seek] and
+/// variable [setSpeed] (1.0 / 1.5 / 2.0).
+class VeilAudioPlayer {
+  VeilAudioPlayer._(this._ptr, this._buf);
+
+  Pointer<ffi.VeilAudioPlayerHandle> _ptr;
+  Pointer<Uint8>? _buf; // the native copy of the clip bytes, freed on dispose
+
+  /// Create a player over [voiceOpus] (the stored clip). Returns null on a bad
+  /// container / decoder failure / native unavailability.
+  static VeilAudioPlayer? create(Uint8List voiceOpus) {
+    if (voiceOpus.isEmpty) return null;
+    final buf = calloc<Uint8>(voiceOpus.length);
+    buf.asTypedList(voiceOpus.length).setAll(0, voiceOpus);
+    final p = ffi.veilMediaPlayerCreate(buf, voiceOpus.length);
+    if (p == nullptr) {
+      calloc.free(buf);
+      return null;
+    }
+    return VeilAudioPlayer._(p, buf);
+  }
+
+  bool get _alive => _ptr != nullptr;
+
+  bool start() => _alive && ffi.veilMediaPlayerStart(_ptr) == 0;
+  void pause() {
+    if (_alive) ffi.veilMediaPlayerPause(_ptr);
+  }
+
+  void resume() {
+    if (_alive) ffi.veilMediaPlayerResume(_ptr);
+  }
+
+  void seekMs(int ms) {
+    if (_alive) ffi.veilMediaPlayerSeek(_ptr, ms);
+  }
+
+  void setSpeed(double speed) {
+    if (_alive) ffi.veilMediaPlayerSetSpeed(_ptr, speed);
+  }
+
+  int get positionMs => _alive ? ffi.veilMediaPlayerPositionMs(_ptr) : 0;
+  int get durationMs => _alive ? ffi.veilMediaPlayerDurationMs(_ptr) : 0;
+  bool get isPlaying => _alive && ffi.veilMediaPlayerIsPlaying(_ptr) != 0;
+
+  /// Stop playout + free the player and its clip buffer. Idempotent.
+  void dispose() {
+    if (_ptr != nullptr) {
+      ffi.veilMediaPlayerDestroy(_ptr);
+      _ptr = nullptr;
+    }
+    if (_buf != null) {
+      calloc.free(_buf!);
+      _buf = null;
+    }
+  }
+}
