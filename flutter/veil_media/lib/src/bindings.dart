@@ -338,3 +338,18 @@ final void Function(Pointer<VeilAudioPlayerHandle>) veilMediaPlayerDestroy =
         .lookup<NativeFunction<Void Function(Pointer<VeilAudioPlayerHandle>)>>(
             'veil_media_player_destroy')
         .asFunction();
+
+// decode_wav(voice_opus*, len, out_wav**, out_len*) -> int
+final int Function(Pointer<Uint8>, int, Pointer<Pointer<Uint8>>, Pointer<Size>)
+    veilMediaDecodeWav = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<Uint8>, Size, Pointer<Pointer<Uint8>>,
+                    Pointer<Size>)>>('veil_media_decode_wav')
+        .asFunction();
+
+// free_wav(wav*)
+final void Function(Pointer<Uint8>) veilMediaFreeWav = nativeLib
+    .lookup<NativeFunction<Void Function(Pointer<Uint8>)>>(
+        'veil_media_free_wav')
+    .asFunction();

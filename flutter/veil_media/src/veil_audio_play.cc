@@ -384,6 +384,60 @@ void veil_media_free_pcm(float* pcm) {
   if (pcm) free(pcm);
 }
 
+int veil_media_decode_wav(const uint8_t* voice_opus, size_t len,
+                          uint8_t** out_wav, size_t* out_len) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (out_wav) *out_wav = nullptr;
+  if (out_len) *out_len = 0;
+  if (!out_wav || !out_len) return VEIL_PLAY_ERR_ARG;
+  webrtc::Environment env = webrtc::CreateEnvironment();
+  std::vector<int16_t> pcm;  // mono @ the clip's rate
+  int rate = kSampleRate;
+  if (!decode_voice_opus(voice_opus, len, env, &pcm, &rate) || pcm.empty()) {
+    plog("player: wav decode failed / empty");
+    return VEIL_PLAY_ERR;
+  }
+  const size_t data_len = pcm.size() * sizeof(int16_t);
+  const size_t total = 44 + data_len;
+  uint8_t* buf = (uint8_t*)malloc(total);
+  if (!buf) return VEIL_PLAY_ERR;
+  const auto wr_u32 = [](uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+  };
+  const auto wr_u16 = [](uint8_t* p, uint16_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+  };
+  std::memcpy(buf, "RIFF", 4);
+  wr_u32(buf + 4, (uint32_t)(36 + data_len));
+  std::memcpy(buf + 8, "WAVE", 4);
+  std::memcpy(buf + 12, "fmt ", 4);
+  wr_u32(buf + 16, 16);                   // fmt chunk size
+  wr_u16(buf + 20, 1);                    // PCM
+  wr_u16(buf + 22, 1);                    // mono
+  wr_u32(buf + 24, (uint32_t)rate);
+  wr_u32(buf + 28, (uint32_t)rate * 2u);  // byte rate (rate * ch * 16/8)
+  wr_u16(buf + 32, 2);                    // block align
+  wr_u16(buf + 34, 16);                   // bits per sample
+  std::memcpy(buf + 36, "data", 4);
+  wr_u32(buf + 40, (uint32_t)data_len);
+  std::memcpy(buf + 44, pcm.data(), data_len);
+  *out_wav = buf;
+  *out_len = total;
+  return VEIL_PLAY_OK;
+#else
+  (void)voice_opus; (void)len; (void)out_wav; (void)out_len;
+  return VEIL_PLAY_ERR;
+#endif
+}
+
+void veil_media_free_wav(uint8_t* wav) {
+  if (wav) free(wav);
+}
+
 void veil_media_player_destroy(VeilAudioPlayer* p) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!p) return;

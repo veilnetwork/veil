@@ -78,6 +78,17 @@ int veil_media_decode_pcm16k(const uint8_t* voice_opus, size_t len,
 /* Free a buffer returned by veil_media_decode_pcm16k. */
 void veil_media_free_pcm(float* pcm);
 
+/* Decode a VOICE_OPUS clip to a complete RIFF/WAV byte stream (mono int16 PCM
+ * at the clip's rate) held in RAM, so the OS media frameworks — which cannot
+ * decode Opus (AVFoundation) — can play it from a loopback URL with seeking.
+ * On success returns VEIL_PLAY_OK and sets *out_wav to a malloc'd buffer
+ * (free with veil_media_free_wav) and *out_len to its size. */
+int veil_media_decode_wav(const uint8_t* voice_opus, size_t len,
+                          uint8_t** out_wav, size_t* out_len);
+
+/* Free a buffer returned by veil_media_decode_wav. */
+void veil_media_free_wav(uint8_t* wav);
+
 #pragma GCC visibility pop
 
 #ifdef __cplusplus
