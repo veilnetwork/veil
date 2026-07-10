@@ -12,6 +12,7 @@
 #include "veil_audio_play.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -344,6 +345,43 @@ int veil_media_player_is_playing(VeilAudioPlayer* p) {
   (void)p;
   return 0;
 #endif
+}
+
+int veil_media_decode_pcm16k(const uint8_t* voice_opus, size_t len,
+                             float** out_pcm, int* out_samples) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (out_pcm) *out_pcm = nullptr;
+  if (out_samples) *out_samples = 0;
+  webrtc::Environment env = webrtc::CreateEnvironment();
+  std::vector<int16_t> pcm;  // mono @ the clip's rate (48k)
+  int rate = kSampleRate;
+  if (!decode_voice_opus(voice_opus, len, env, &pcm, &rate) || pcm.empty()) {
+    return VEIL_PLAY_ERR;
+  }
+  // Downsample to 16 kHz mono float32 by averaging each rate/16000 group
+  // (48k -> /3). Averaging is a cheap anti-alias; whisper is robust.
+  const int decim = rate / 16000;
+  const int step = decim < 1 ? 1 : decim;
+  const int out_n = (int)(pcm.size() / step);
+  if (out_n <= 0) return VEIL_PLAY_ERR;
+  float* buf = (float*)malloc((size_t)out_n * sizeof(float));
+  if (!buf) return VEIL_PLAY_ERR;
+  for (int i = 0; i < out_n; i++) {
+    int32_t acc = 0;
+    for (int j = 0; j < step; j++) acc += pcm[(size_t)i * step + j];
+    buf[i] = (float)(acc / step) / 32768.f;
+  }
+  if (out_pcm) *out_pcm = buf; else free(buf);
+  if (out_samples) *out_samples = out_n;
+  return VEIL_PLAY_OK;
+#else
+  (void)voice_opus; (void)len; (void)out_pcm; (void)out_samples;
+  return VEIL_PLAY_ERR;
+#endif
+}
+
+void veil_media_free_pcm(float* pcm) {
+  if (pcm) free(pcm);
 }
 
 void veil_media_player_destroy(VeilAudioPlayer* p) {
