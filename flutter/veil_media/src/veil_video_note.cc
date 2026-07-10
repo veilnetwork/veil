@@ -270,6 +270,19 @@ class VnoteDecodeSink : public webrtc::DecodedImageCallback {
     return 0;
   }
 
+  // Direct I420 store (the recorder's self-preview uses the same sink).
+  void store_i420(const uint8_t* y, const uint8_t* u, const uint8_t* v, int w,
+                  int h, int sy, int su, int sv) {
+    if (!y || !u || !v || w <= 0 || h <= 0) return;
+    const size_t need = (size_t)w * h * 4;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (rgba_.size() < need) rgba_.resize(need);
+    libyuv::I420ToABGR(y, sy, u, su, v, sv, rgba_.data(), w * 4, w, h);
+    w_ = w;
+    h_ = h;
+    ++seq_;
+  }
+
   int get_frame(uint8_t* dst, int dst_cap, int* out_w, int* out_h) {
     std::lock_guard<std::mutex> lk(mu_);
     if (seq_ == 0 || w_ <= 0) return 0;
@@ -318,6 +331,7 @@ struct VeilVnoteRecorder {
   bool mic_recording = false;
 
   bool want_native_camera = true;
+  VnoteDecodeSink preview;  // latest captured frame (live self-preview)
   // Video. All encoder state is guarded by video_mu — camera frames arrive on
   // the capture queue, push_frame on the FFI thread, stop() on control.
   std::mutex video_mu;
@@ -412,6 +426,9 @@ void encode_i420(VeilVnoteRecorder* rec, const uint8_t* y, const uint8_t* u,
       webrtc::I420Buffer::Copy(s, s, cy, sy, cu, su, cv, sv);
   buf->ScaleFrom(*cropped);
 
+  rec->preview.store_i420(buf->DataY(), buf->DataU(), buf->DataV(),
+                          buf->width(), buf->height(), buf->StrideY(),
+                          buf->StrideU(), buf->StrideV());
   const bool want_key = ts_ms - rec->last_key_ms >= kKeyframeEveryMs;
   if (want_key) rec->last_key_ms = ts_ms;
   webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
@@ -542,6 +559,17 @@ float veil_media_vnote_recorder_level(VeilVnoteRecorder* rec) {
 #else
   (void)rec;
   return 0.f;
+#endif
+}
+
+int veil_media_vnote_recorder_frame(VeilVnoteRecorder* rec, uint8_t* dst,
+                                    int dst_cap, int* out_w, int* out_h) {
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!rec) return 0;
+  return rec->preview.get_frame(dst, dst_cap, out_w, out_h);
+#else
+  (void)rec; (void)dst; (void)dst_cap; (void)out_w; (void)out_h;
+  return 0;
 #endif
 }
 
