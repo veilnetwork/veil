@@ -1728,7 +1728,7 @@ impl FrameDispatcher {
 
     // ── Recursive DHT routing ─────────────────────────────────────
 
-    fn handle_recursive_query(&self, body: &[u8], peer_id: NodeId) -> DispatchResult {
+    pub(crate) fn handle_recursive_query(&self, body: &[u8], peer_id: NodeId) -> DispatchResult {
         // Per-peer rate limit BEFORE decode: a flood of malformed queries should
         // also be quenched. Distinct `query_id` values bypass the dedup below
         // but each one still costs sig-verify, lookup, and TTL-slot work — so
@@ -2082,6 +2082,32 @@ impl FrameDispatcher {
                     // STORE could write arbitrary (key, value) pairs into
                     // the local TieredStore, bypassing the signed-store
                     // ownership invariants.
+                    // Nickname records ("NK") carry a replace-on-heavier
+                    // conflict rule — route them through the dedicated gate
+                    // (verify + displacement + canonical key + quota), same as
+                    // the direct STORE arm. Strictly additive: every other
+                    // record kind takes the unchanged path below.
+                    if q.payload.get(..2)
+                        == Some(&veil_crypto::nickname::NICKNAME_DHT_MAGIC[..])
+                    {
+                        let origin =
+                            match self.nickname_store_gate(&q.target_key, &q.payload) {
+                                Ok(origin) => origin,
+                                Err(disposition) => return disposition,
+                            };
+                        if !self.dht.store_with_origin(
+                            q.target_key,
+                            q.payload.clone(),
+                            origin,
+                        ) {
+                            // per-origin byte cap exceeded — drop silently.
+                            return DispatchResult::NoResponse;
+                        }
+                        if let Some(resp) = build_signed(vec![1]) {
+                            send_response(resp);
+                        }
+                        return DispatchResult::NoResponse;
+                    }
                     // A STORE for a key we ALREADY hold is a TTL/content refresh
                     // (republication), not new-state growth — exempt it from the
                     // per-identity write quota so a node can keep its own
@@ -2565,7 +2591,12 @@ impl FrameDispatcher {
                         // responder's OWN can no longer be cached under a victim's
                         // key. (Structurally-decoded nc/id/ir/mc keep prior
                         // behaviour; they are re-verified on the resolver path.)
-                        && self.mirror_cache_key_ok(&resp.payload, &p.target_key) =>
+                        && self.mirror_cache_key_ok(&resp.payload, &p.target_key)
+                        // …AND for nickname records ("NK") apply the
+                        // replace-on-heavier rule so a lighter (but valid)
+                        // record in a response can never clobber a heavier
+                        // incumbent in the local cache.
+                        && self.nickname_mirror_ok(&p.target_key, &resp.payload) =>
                 {
                     // payload = raw value bytes; mirror into the local DHT so
                     // subsequent lookups resolve without another round-trip.

@@ -5448,6 +5448,220 @@ mod tests {
         );
     }
 
+    // ── Nickname STORE gate ("NK", replace-on-heavier) ───────────────────────
+
+    /// Mine seeds until the cumulative weight reaches `target` (deterministic:
+    /// fixed salt, generous budget, asserts the target was hit).
+    fn mine_nickname_seeds(name: &str, owner: &[u8; 32], target: u64) -> Vec<[u8; 32]> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let out = veil_crypto::nickname::mine_seeds(name, owner, target, 200_000_000, 7, &cancel)
+            .expect("valid nickname");
+        assert!(out.hit_target, "test miner must reach target weight {target}");
+        out.seeds
+    }
+
+    /// Build a signed nickname record whose weight is ≥ `target_weight`.
+    fn signed_nickname(
+        name: &str,
+        sk_byte: u8,
+        target_weight: u64,
+        issued_at: u64,
+    ) -> veil_crypto::nickname::NicknameRecord {
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::from_bytes(&[sk_byte; 32]);
+        let node_id = *blake3::hash(&sk.verifying_key().to_bytes()).as_bytes();
+        let seeds = mine_nickname_seeds(name, &node_id, target_weight);
+        veil_crypto::nickname::NicknameRecord::sign(name, &sk, node_id, seeds, issued_at)
+            .expect("signable record")
+    }
+
+    /// First claim for a free name → accepted and present in the local store.
+    #[test]
+    fn nickname_store_first_claim_accepted() {
+        use veil_proto::discovery::StorePayload;
+        let name = "nicknamegatetest";
+        let floor = veil_crypto::nickname::length_weight_floor(name.chars().count());
+        let rec = signed_nickname(name, 0x11, floor, 1000);
+        let key = veil_crypto::nickname::nickname_dht_key(name).unwrap();
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let (hdr, body) = make_store_frame(&StorePayload::unsigned(key, rec.to_bytes()));
+        let result = dispatcher.dispatch(&hdr, &body, [0x01u8; 32]);
+        assert!(
+            matches!(result, DispatchResult::NoResponse),
+            "valid first claim must be accepted, got {result:?}",
+        );
+        assert_eq!(
+            dispatcher.dht.get_local(&key).as_deref(),
+            Some(&rec.to_bytes()[..]),
+            "record must be in the local store",
+        );
+    }
+
+    /// A lighter record must NOT displace a heavier incumbent (silent keep,
+    /// not a violation) — and a heavier one MUST displace a lighter incumbent.
+    #[test]
+    fn nickname_store_displacement_by_weight() {
+        use veil_proto::discovery::StorePayload;
+        let name = "nicknamegatetest";
+        let floor = veil_crypto::nickname::length_weight_floor(name.chars().count());
+        let light = signed_nickname(name, 0x22, floor, 1000);
+        // Strictly heavier by construction: target = 2 × light's actual weight.
+        let heavy = signed_nickname(name, 0x33, light.weight.saturating_mul(2), 500);
+        assert!(heavy.weight > light.weight);
+        let key = veil_crypto::nickname::nickname_dht_key(name).unwrap();
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+
+        // light lands first…
+        let (h1, b1) = make_store_frame(&StorePayload::unsigned(key, light.to_bytes()));
+        assert!(matches!(
+            dispatcher.dispatch(&h1, &b1, [0x01u8; 32]),
+            DispatchResult::NoResponse
+        ));
+        // …heavier displaces it…
+        let (h2, b2) = make_store_frame(&StorePayload::unsigned(key, heavy.to_bytes()));
+        assert!(matches!(
+            dispatcher.dispatch(&h2, &b2, [0x01u8; 32]),
+            DispatchResult::NoResponse
+        ));
+        assert_eq!(
+            dispatcher.dht.get_local(&key).as_deref(),
+            Some(&heavy.to_bytes()[..]),
+            "heavier record must displace the lighter incumbent",
+        );
+        // …and the lighter one bounces off silently (NoResponse, incumbent kept).
+        let (h3, b3) = make_store_frame(&StorePayload::unsigned(key, light.to_bytes()));
+        assert!(
+            matches!(
+                dispatcher.dispatch(&h3, &b3, [0x01u8; 32]),
+                DispatchResult::NoResponse
+            ),
+            "a lighter republish is benign, not a violation",
+        );
+        assert_eq!(
+            dispatcher.dht.get_local(&key).as_deref(),
+            Some(&heavy.to_bytes()[..]),
+            "lighter record must NOT displace the heavier incumbent",
+        );
+    }
+
+    /// Same owner, same weight, newer issued_at → refresh replaces the bytes.
+    #[test]
+    fn nickname_store_same_owner_refresh() {
+        use ed25519_dalek::SigningKey;
+        use veil_proto::discovery::StorePayload;
+        let name = "nicknamegatetest";
+        let floor = veil_crypto::nickname::length_weight_floor(name.chars().count());
+        let sk = SigningKey::from_bytes(&[0x44u8; 32]);
+        let node_id = *blake3::hash(&sk.verifying_key().to_bytes()).as_bytes();
+        let seeds = mine_nickname_seeds(name, &node_id, floor);
+        let old = veil_crypto::nickname::NicknameRecord::sign(name, &sk, node_id, seeds.clone(), 1000)
+            .unwrap();
+        let fresh = veil_crypto::nickname::NicknameRecord::sign(name, &sk, node_id, seeds, 2000)
+            .unwrap();
+        let key = veil_crypto::nickname::nickname_dht_key(name).unwrap();
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let (h1, b1) = make_store_frame(&StorePayload::unsigned(key, old.to_bytes()));
+        assert!(matches!(
+            dispatcher.dispatch(&h1, &b1, [0x01u8; 32]),
+            DispatchResult::NoResponse
+        ));
+        let (h2, b2) = make_store_frame(&StorePayload::unsigned(key, fresh.to_bytes()));
+        assert!(matches!(
+            dispatcher.dispatch(&h2, &b2, [0x01u8; 32]),
+            DispatchResult::NoResponse
+        ));
+        assert_eq!(
+            dispatcher.dht.get_local(&key).as_deref(),
+            Some(&fresh.to_bytes()[..]),
+            "same-owner newer issued_at must refresh the stored bytes",
+        );
+    }
+
+    /// Garbage carrying the "NK" magic → Violation (never stored).
+    #[test]
+    fn nickname_store_garbage_rejected() {
+        use veil_proto::discovery::StorePayload;
+        let key = veil_crypto::nickname::nickname_dht_key("nicknamegatetest").unwrap();
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let mut junk = veil_crypto::nickname::NICKNAME_DHT_MAGIC.to_vec();
+        junk.extend_from_slice(b"not a nickname record");
+        let (hdr, body) = make_store_frame(&StorePayload::unsigned(key, junk));
+        let result = dispatcher.dispatch(&hdr, &body, [0x01u8; 32]);
+        assert!(
+            matches!(result, DispatchResult::Violation(_)),
+            "NK-magic garbage must be a violation, got {result:?}",
+        );
+        assert!(dispatcher.dht.get_local(&key).is_none());
+    }
+
+    /// A valid record stored under a key ≠ its canonical nickname key →
+    /// Violation (canonical key binding, cycle-7 invariant).
+    #[test]
+    fn nickname_store_non_canonical_key_rejected() {
+        use veil_proto::discovery::StorePayload;
+        let name = "nicknamegatetest";
+        let floor = veil_crypto::nickname::length_weight_floor(name.chars().count());
+        let rec = signed_nickname(name, 0x55, floor, 1000);
+        // Another (valid) nickname key — not this record's canonical key.
+        let wrong_key = veil_crypto::nickname::nickname_dht_key("someothernickname").unwrap();
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let (hdr, body) = make_store_frame(&StorePayload::unsigned(wrong_key, rec.to_bytes()));
+        let result = dispatcher.dispatch(&hdr, &body, [0x01u8; 32]);
+        assert!(
+            matches!(result, DispatchResult::Violation(_)),
+            "record under a non-canonical key must be a violation, got {result:?}",
+        );
+        assert!(dispatcher.dht.get_local(&wrong_key).is_none());
+    }
+
+    /// The RECURSIVE STORE plane applies the same gate: a valid record lands,
+    /// a lighter one cannot displace it (silent keep), junk is a violation.
+    #[test]
+    fn nickname_store_recursive_plane_gated() {
+        use veil_proto::routing::{RecursiveQueryPayload, recursive_query_type};
+        let name = "nicknamegatetest";
+        let floor = veil_crypto::nickname::length_weight_floor(name.chars().count());
+        let light = signed_nickname(name, 0x66, floor, 1000);
+        let heavy = signed_nickname(name, 0x77, light.weight.saturating_mul(2), 500);
+        let key = veil_crypto::nickname::nickname_dht_key(name).unwrap();
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let mk = |value: Vec<u8>, id_byte: u8| {
+            RecursiveQueryPayload {
+                query_id: [id_byte; 16],
+                target_key: key,
+                reply_to: [0x09u8; 32],
+                ttl: 8,
+                query_type: recursive_query_type::STORE,
+                reply_port: 0,
+                payload: value,
+            }
+            .encode()
+        };
+        let peer = veil_cfg::NodeId::from([0x01u8; 32]);
+        // Empty routing table → this node is trivially in the K-closest set.
+        let result = dispatcher.handle_recursive_query(&mk(heavy.to_bytes(), 1), peer);
+        assert!(matches!(result, DispatchResult::NoResponse));
+        assert_eq!(
+            dispatcher.dht.get_local(&key).as_deref(),
+            Some(&heavy.to_bytes()[..]),
+            "recursive STORE of a valid record must land in the local store",
+        );
+        let result = dispatcher.handle_recursive_query(&mk(light.to_bytes(), 2), peer);
+        assert!(matches!(result, DispatchResult::NoResponse));
+        assert_eq!(
+            dispatcher.dht.get_local(&key).as_deref(),
+            Some(&heavy.to_bytes()[..]),
+            "recursive plane must keep the heavier incumbent",
+        );
+        let mut junk = veil_crypto::nickname::NICKNAME_DHT_MAGIC.to_vec();
+        junk.extend_from_slice(b"garbage");
+        let result = dispatcher.handle_recursive_query(&mk(junk, 3), peer);
+        assert!(
+            matches!(result, DispatchResult::Violation(_)),
+            "recursive plane must reject NK-magic junk as a violation, got {result:?}",
+        );
+    }
+
     /// c: signed STORE with valid signature and key == BLAKE3(pubkey) → accepted.
     #[test]
     fn store_signed_valid_accepted() {
