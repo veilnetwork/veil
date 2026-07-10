@@ -122,6 +122,22 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineStopCamera(_ptr) == 0;
   }
 
+  /// Share the main display into the video send stream (video send must be
+  /// started). Replaces a running camera as the single video source — the
+  /// receiver renders it with no changes. Returns false where this platform
+  /// has no screen backend (macOS only for now) or capture can't start. The
+  /// first ever use triggers the OS Screen Recording consent prompt; until
+  /// granted (plus an app restart) the share runs black. Idempotent.
+  bool startScreen({int width = 640, int fps = 10}) {
+    _ensure();
+    return ffi.veilMediaEngineStartScreen(_ptr, width, fps) == 0;
+  }
+
+  bool stopScreen() {
+    _ensure();
+    return ffi.veilMediaEngineStopScreen(_ptr) == 0;
+  }
+
   Pointer<Uint8>? _pushBuf; // reused Y|U|V staging buffer for pushVideoFrame
   int _pushCap = 0;
 
