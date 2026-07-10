@@ -46,6 +46,8 @@ echo "==> compiling engine + shim + aaudio_adm (android NDK toolchain)"
 compile_tu "$SRCDIR/veil_media_engine.cc" "$TMP/engine.o"
 compile_tu "$SRCDIR/veil_transport_shim.cc" "$TMP/shim.o"
 compile_tu "$SRCDIR/veil_aaudio_adm.cc"   "$TMP/aaudio_adm.o"
+compile_tu "$SRCDIR/veil_audio_record.cc" "$TMP/record.o"
+compile_tu "$SRCDIR/veil_audio_play.cc"   "$TMP/play.o"
 
 # ELF export control: only veil_media_* global.
 cat > "$TMP/exports.map" <<'MAP'
@@ -78,7 +80,7 @@ echo "==> linking libveil_media.so ($TGT, sysroot + api26 aaudio)"
 # shellcheck disable=SC2086
 "$CLANGXX" -shared -o "$DEST/libveil_media.so" \
   $TGT --sysroot="$SYSROOT" -nostdlib++ -unwindlib=none \
-  "$TMP/engine.o" "$TMP/shim.o" "$TMP/aaudio_adm.o" obj/libwebrtc.a $CXX_OBJS $UNWIND_OBJS \
+  "$TMP/engine.o" "$TMP/shim.o" "$TMP/aaudio_adm.o" "$TMP/record.o" "$TMP/play.o" obj/libwebrtc.a $CXX_OBJS $UNWIND_OBJS \
   -L"$AAUDIO_L" \
   -Wl,--gc-sections -Wl,--version-script,"$TMP/exports.map" \
   -Wl,-soname,libveil_media.so \
