@@ -425,6 +425,238 @@ class VeilAudioRecorder {
   }
 }
 
+/// A finished video note: the VNOTE1 byte stream (store this) + duration.
+class VnoteRecording {
+  const VnoteRecording({required this.bytes, required this.durationMs});
+  final Uint8List bytes;
+  final int durationMs;
+}
+
+/// Records a video note ("кружочек"): camera + mic -> VP8 + Opus -> the
+/// in-RAM VNOTE1 container (no plaintext ever hits disk). On platforms with a
+/// native camera backend (macOS/Linux) [start] opens it; on Android the Dart
+/// camera capturer feeds [pushFrame] instead. Poll [level]/[elapsedMs] for
+/// the UI and [frame] for the live round self-preview.
+class VeilVnoteRecorder {
+  VeilVnoteRecorder._(this._ptr);
+
+  Pointer<ffi.VeilVnoteRecorderHandle> _ptr;
+  Pointer<Uint8>? _frameBuf;
+  int _frameCap = 0;
+  int _lastFrameSeq = 0;
+  Pointer<Uint8>? _pushBuf;
+  int _pushCap = 0;
+
+  static VeilVnoteRecorder? create(
+      {int width = 480, int fps = 24, bool nativeCamera = true}) {
+    final p = ffi.veilVnoteRecorderCreate(width, fps, nativeCamera ? 1 : 0);
+    if (p == nullptr) return null;
+    return VeilVnoteRecorder._(p);
+  }
+
+  bool get _alive => _ptr != nullptr;
+
+  bool start() => _alive && ffi.veilVnoteRecorderStart(_ptr) == 0;
+
+  double get level => _alive ? ffi.veilVnoteRecorderLevel(_ptr) : 0;
+  int get elapsedMs => _alive ? ffi.veilVnoteRecorderElapsedMs(_ptr) : 0;
+
+  /// Push one tightly-packed I420 frame (the Android Dart capturer path).
+  bool pushFrame(Uint8List y, Uint8List u, Uint8List v, int width, int height) {
+    if (!_alive) return false;
+    final total = y.length + u.length + v.length;
+    if (total <= 0) return false;
+    if (_pushBuf == null || _pushCap < total) {
+      if (_pushBuf != null) calloc.free(_pushBuf!);
+      _pushCap = total;
+      _pushBuf = calloc<Uint8>(_pushCap);
+    }
+    final buf = _pushBuf!;
+    final view = buf.asTypedList(total);
+    view.setRange(0, y.length, y);
+    view.setRange(y.length, y.length + u.length, u);
+    view.setRange(y.length + u.length, total, v);
+    final cw = (width + 1) ~/ 2;
+    final rc = ffi.veilVnoteRecorderPushFrame(_ptr, buf, buf + y.length,
+        buf + y.length + u.length, width, height, width, cw, cw, 0);
+    return rc == 0;
+  }
+
+  /// The latest captured frame (RGBA, post crop/scale — exactly what is being
+  /// encoded), or null if there is no NEW frame since the last call.
+  VeilVideoFrame? frame() {
+    if (!_alive) return null;
+    final wp = calloc<Int32>();
+    final hp = calloc<Int32>();
+    try {
+      var buf = _frameBuf;
+      if (buf == null) {
+        _frameCap = 480 * 480 * 4;
+        buf = calloc<Uint8>(_frameCap);
+        _frameBuf = buf;
+      }
+      var seq = ffi.veilVnoteRecorderFrame(_ptr, buf, _frameCap, wp, hp);
+      if (seq == -1) {
+        final need = wp.value * hp.value * 4;
+        if (need > 0) {
+          calloc.free(buf);
+          _frameCap = need;
+          buf = calloc<Uint8>(_frameCap);
+          _frameBuf = buf;
+          seq = ffi.veilVnoteRecorderFrame(_ptr, buf, _frameCap, wp, hp);
+        }
+      }
+      if (seq <= 0 || seq == _lastFrameSeq) return null;
+      _lastFrameSeq = seq;
+      final w = wp.value, h = hp.value;
+      if (w <= 0 || h <= 0) return null;
+      return VeilVideoFrame(
+          rgba: Uint8List.fromList(buf.asTypedList(w * h * 4)),
+          width: w,
+          height: h);
+    } finally {
+      calloc.free(wp);
+      calloc.free(hp);
+    }
+  }
+
+  /// Stop and finalize. Null when the clip is empty.
+  VnoteRecording? stop() {
+    if (!_alive) return null;
+    final outBytes = calloc<Pointer<Uint8>>();
+    final outLen = calloc<Size>();
+    final outDur = calloc<Int32>();
+    try {
+      final rc = ffi.veilVnoteRecorderStop(_ptr, outBytes, outLen, outDur);
+      if (rc != 0 || outLen.value == 0 || outBytes.value == nullptr) {
+        return null;
+      }
+      final bytes = Uint8List.fromList(outBytes.value.asTypedList(outLen.value));
+      ffi.veilVnoteFreeBytes(outBytes.value);
+      return VnoteRecording(bytes: bytes, durationMs: outDur.value);
+    } finally {
+      calloc.free(outBytes);
+      calloc.free(outLen);
+      calloc.free(outDur);
+    }
+  }
+
+  void dispose() {
+    if (_ptr != nullptr) {
+      ffi.veilVnoteRecorderDestroy(_ptr);
+      _ptr = nullptr;
+    }
+    if (_frameBuf != null) {
+      calloc.free(_frameBuf!);
+      _frameBuf = null;
+    }
+    if (_pushBuf != null) {
+      calloc.free(_pushBuf!);
+      _pushBuf = null;
+    }
+  }
+}
+
+/// Plays a VNOTE1 clip: pull-driven — play the [audio] block through the
+/// voice path (exact position/pause/speed) and poll [frameAt] with that
+/// position; the native side decodes forward on demand and rewinds via the
+/// nearest keyframe.
+class VeilVnotePlayer {
+  VeilVnotePlayer._(this._ptr);
+
+  Pointer<ffi.VeilVnotePlayerHandle> _ptr;
+  Pointer<Uint8>? _frameBuf;
+  int _frameCap = 0;
+
+  /// Null on a malformed container (strict native parse — clips arrive over
+  /// the network).
+  static VeilVnotePlayer? create(Uint8List vnote) {
+    if (vnote.isEmpty) return null;
+    final buf = calloc<Uint8>(vnote.length);
+    buf.asTypedList(vnote.length).setAll(0, vnote);
+    final p = ffi.veilVnotePlayerCreate(buf, vnote.length);
+    calloc.free(buf); // the native side copies
+    if (p == nullptr) return null;
+    return VeilVnotePlayer._(p);
+  }
+
+  bool get _alive => _ptr != nullptr;
+
+  int get durationMs => _alive ? ffi.veilVnotePlayerDurationMs(_ptr) : 0;
+  int get width => _alive ? ffi.veilVnotePlayerWidth(_ptr) : 0;
+  int get height => _alive ? ffi.veilVnotePlayerHeight(_ptr) : 0;
+  bool get hasAudio => _alive && ffi.veilVnotePlayerHasAudio(_ptr) != 0;
+
+  /// The embedded VOICE_OPUS audio block (decode/play it with the voice
+  /// bricks), or null for a silent note.
+  Uint8List? audio() {
+    if (!_alive) return null;
+    final outBytes = calloc<Pointer<Uint8>>();
+    final outLen = calloc<Size>();
+    try {
+      final rc = ffi.veilVnotePlayerAudio(_ptr, outBytes, outLen);
+      if (rc != 0 || outBytes.value == nullptr || outLen.value == 0) {
+        return null;
+      }
+      final bytes = Uint8List.fromList(outBytes.value.asTypedList(outLen.value));
+      ffi.veilVnoteFreeBytes(outBytes.value);
+      return bytes;
+    } finally {
+      calloc.free(outBytes);
+      calloc.free(outLen);
+    }
+  }
+
+  /// The frame at [ms] into the clip (RGBA), or null when nothing decoded
+  /// yet. Safe to call at the UI frame rate.
+  VeilVideoFrame? frameAt(int ms) {
+    if (!_alive) return null;
+    final wp = calloc<Int32>();
+    final hp = calloc<Int32>();
+    try {
+      var buf = _frameBuf;
+      if (buf == null) {
+        _frameCap = width > 0 ? width * height * 4 : 480 * 480 * 4;
+        if (_frameCap <= 0) _frameCap = 480 * 480 * 4;
+        buf = calloc<Uint8>(_frameCap);
+        _frameBuf = buf;
+      }
+      var seq = ffi.veilVnotePlayerFrameAt(_ptr, ms, buf, _frameCap, wp, hp);
+      if (seq == -1) {
+        final need = wp.value * hp.value * 4;
+        if (need > 0) {
+          calloc.free(buf);
+          _frameCap = need;
+          buf = calloc<Uint8>(_frameCap);
+          _frameBuf = buf;
+          seq = ffi.veilVnotePlayerFrameAt(_ptr, ms, buf, _frameCap, wp, hp);
+        }
+      }
+      if (seq <= 0) return null;
+      final w = wp.value, h = hp.value;
+      if (w <= 0 || h <= 0) return null;
+      return VeilVideoFrame(
+          rgba: Uint8List.fromList(buf.asTypedList(w * h * 4)),
+          width: w,
+          height: h);
+    } finally {
+      calloc.free(wp);
+      calloc.free(hp);
+    }
+  }
+
+  void dispose() {
+    if (_ptr != nullptr) {
+      ffi.veilVnotePlayerDestroy(_ptr);
+      _ptr = nullptr;
+    }
+    if (_frameBuf != null) {
+      calloc.free(_frameBuf!);
+      _frameBuf = null;
+    }
+  }
+}
+
 /// Decode a VOICE_OPUS clip (from [VeilAudioRecorder]) into a complete
 /// RIFF/WAV byte stream held in RAM (mono int16 PCM at the clip's rate), so
 /// playback can ride the OS media players — which cannot decode Opus
