@@ -83,6 +83,7 @@
 #include "veil_aaudio_adm.h"
 #endif
 #include "veil_camera.h"
+#include "veil_screen.h"
 #include "veil_transport_shim.h"
 #endif
 
@@ -239,6 +240,7 @@ struct WebrtcState {
   std::thread test_video_thread;         // synthetic source (VEIL_MEDIA_TEST_VIDEO)
   std::atomic<bool> test_video_run{false};
   std::unique_ptr<veil_media::CameraCapturer> camera;  // real capture source
+  std::unique_ptr<veil_media::ScreenCapturer> screen;  // screen-share source
 };
 #endif
 
@@ -588,6 +590,10 @@ int veil_media_engine_stop_video(VeilMediaEngine* engine) {
     ws->camera->Stop();
     ws->camera.reset();
   }
+  if (ws->screen) {
+    ws->screen->Stop();
+    ws->screen.reset();
+  }
   if (ws->test_video_run.exchange(false) && ws->test_video_thread.joinable())
     ws->test_video_thread.join();
   if (ws->call) {
@@ -652,6 +658,57 @@ int veil_media_engine_stop_camera(VeilMediaEngine* engine) {
   if (engine->ws && engine->ws->camera) {
     engine->ws->camera->Stop();
     engine->ws->camera.reset();
+  }
+#endif
+  return VEIL_MEDIA_OK;
+}
+
+int veil_media_engine_start_screen(VeilMediaEngine* engine, int width,
+                                   int fps) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__APPLE__)
+  WebrtcState* ws = engine->ws.get();
+  if (!ws || !ws->video_source) return VEIL_MEDIA_ERR_STATE;
+  if (ws->screen) return VEIL_MEDIA_OK;  // already sharing
+  if (width <= 0) width = 640;
+  if (fps <= 0) fps = 10;
+  // One source at a time: the screen replaces the camera on the SAME VP8 send
+  // source (interleaved frames from two sources would fight over the encoder).
+  // The app layer restores the camera when the share ends.
+  if (ws->camera) {
+    ws->camera->Stop();
+    ws->camera.reset();
+  }
+  webrtc::VideoBroadcaster* src = ws->video_source.get();
+  VeilVideoSink* local_sink = ws->local_video_sink.get();
+  ws->screen.reset(veil_media::CreatePlatformScreen(
+      [src, local_sink](const uint8_t* y, const uint8_t* u, const uint8_t* v,
+                        int w, int h, int sy, int su, int sv, int64_t ts_us) {
+        if (local_sink)
+          local_sink->store_i420(y, u, v, w, h, sy, su, sv);
+        push_i420(src, y, u, v, w, h, sy, su, sv, ts_us);
+      }));
+  if (!ws->screen) return VEIL_MEDIA_ERR_STATE;
+  if (!ws->screen->Start(width, fps)) {
+    ws->screen.reset();
+    return VEIL_MEDIA_ERR_STATE;
+  }
+  vlog("screen: started w<=%d@%d", width, fps);
+  return VEIL_MEDIA_OK;
+#else
+  (void)width;
+  (void)fps;
+  return VEIL_MEDIA_ERR_STATE;  // no screen backend on this platform yet
+#endif
+}
+
+int veil_media_engine_stop_screen(VeilMediaEngine* engine) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (engine->ws && engine->ws->screen) {
+    engine->ws->screen->Stop();
+    engine->ws->screen.reset();
+    vlog("screen: stopped");
   }
 #endif
   return VEIL_MEDIA_OK;
