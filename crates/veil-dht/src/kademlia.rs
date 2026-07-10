@@ -1938,6 +1938,35 @@ mod tests {
         assert!(matches!(resp, FindValueResponse::Value(v) if v == b"record"));
     }
 
+    #[tokio::test]
+    async fn find_value_from_peer_never_queries_self() {
+        // Our own node id can land in a warm candidate set (routing table ∪
+        // sessions); the guard must cut the self-query BEFORE any network I/O
+        // — a FIND_VALUE to self only wastes an RPC and answers NODES (the
+        // 11th-root follow-up, 80d6c6c). The router panics on any dispatch,
+        // so reaching the network at all fails the test.
+        struct PanicRouter;
+        impl FrameRouter for PanicRouter {
+            fn send_request(
+                &self,
+                _peer: [u8; 32],
+                _request_id: u32,
+                _frame: Vec<u8>,
+            ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+                panic!("find_value_from_peer(self) must not reach the network");
+            }
+            fn peer_ids(&self) -> Vec<[u8; 32]> {
+                Vec::new()
+            }
+        }
+        let me = [0x0Au8; 32];
+        let svc = make_test_kademlia_service(me);
+        let got = svc
+            .find_value_from_peer(me, [0x42u8; 32], Arc::new(PanicRouter))
+            .await;
+        assert!(got.is_none(), "self query must short-circuit to None");
+    }
+
     #[test]
     fn find_value_unknown_key_returns_nodes() {
         let svc = service(0);
