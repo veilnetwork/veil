@@ -91,6 +91,13 @@ int veil_media_vnote_recorder_push_frame(VeilVnoteRecorder* rec,
 /* Most-recent smoothed mic level in 0..1 (live meter). */
 float veil_media_vnote_recorder_level(VeilVnoteRecorder* rec);
 
+/* Copy the latest CAPTURED frame (post crop/scale — exactly what is being
+ * encoded) as tightly packed RGBA into dst: the live round self-preview.
+ * Returns seq (>0) when copied, 0 when none yet, -1 when dst_cap is too
+ * small (out_w/out_h still set). */
+int veil_media_vnote_recorder_frame(VeilVnoteRecorder* rec, uint8_t* dst,
+                                    int dst_cap, int* out_w, int* out_h);
+
 /* Elapsed recording time so far, in ms (wall clock since start). */
 int veil_media_vnote_recorder_elapsed_ms(VeilVnoteRecorder* rec);
 
