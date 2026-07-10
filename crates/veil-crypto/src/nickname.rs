@@ -23,6 +23,15 @@ use veil_util::leading_zero_bits;
 /// heaviest seeds dominate any realistic contest while bounding record size.
 pub const MAX_NICKNAME_SEEDS: usize = 64;
 
+/// Wire magic identifying a [`NicknameRecord`] value in the DHT (first two
+/// bytes of [`NicknameRecord::to_bytes`]). The dispatcher STORE gate routes
+/// record kinds by this prefix. `b"NM"` — the design doc's kind tag — is
+/// already taken on the value plane by the legacy `NameClaim` v2
+/// (`veil_proto::name_claim_v2::NAME_CLAIM_MAGIC`), so nickname records use
+/// `b"NK"`; the `NM` tag lives on in the key-derivation domain (see
+/// [`nickname_dht_key`]).
+pub const NICKNAME_DHT_MAGIC: [u8; 2] = *b"NK";
+
 /// Name length bounds (normalized).
 pub const MIN_NICKNAME_LEN: usize = 3;
 pub const MAX_NICKNAME_LEN: usize = 32;
@@ -120,6 +129,23 @@ pub fn normalize_name(input: &str) -> Option<String> {
 pub fn nickname_key(name: &str) -> Option<[u8; 32]> {
     let norm = normalize_name(name)?;
     Some(*blake3::hash(norm.as_bytes()).as_bytes())
+}
+
+/// The full 32-byte DHT key a nickname record is stored under:
+/// `blake3("veil.nickname_dht.v1:NM" || nickname_key(name))` — the design's
+/// `NM ‖ blake3(normalize(name))` with the kind tag folded into the hash
+/// domain, matching every other record kind (`relay_directory_dht_key`,
+/// `rendezvous_ad_dht_key`, `NameClaim::dht_key`, …). A literal `NM` byte
+/// prefix would cluster ALL nickname keys in one corner of the Kademlia XOR
+/// keyspace, concentrating every nickname on the same K-closest nodes; the
+/// domain-hash keeps them uniformly spread. Returns `None` for an
+/// un-normalizable name.
+pub fn nickname_dht_key(name: &str) -> Option<[u8; 32]> {
+    let body = nickname_key(name)?;
+    let mut h = Hasher::new();
+    h.update(b"veil.nickname_dht.v1:NM");
+    h.update(&body);
+    Some(*h.finalize().as_bytes())
 }
 
 /// Minimum cumulative weight a name of `char_len` must carry. Short names cost
@@ -331,20 +357,27 @@ impl NicknameRecord {
         out
     }
 
-    /// Full wire encoding: the canonical bytes followed by the 64-byte
-    /// signature. This is what crosses the FFI boundary and (later) lands in
-    /// the DHT. Round-trips with [`Self::from_bytes`].
+    /// Full wire encoding: the [`NICKNAME_DHT_MAGIC`] prefix, the canonical
+    /// bytes, then the 64-byte signature. This is what crosses the FFI
+    /// boundary and lands in the DHT (the dispatcher STORE gate dispatches on
+    /// the magic). The magic is framing, not content — the signature covers
+    /// [`Self::canonical_bytes`] only. Round-trips with [`Self::from_bytes`].
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = self.canonical_bytes();
+        let mut out = Vec::with_capacity(2 + 160 + self.pow_seeds.len() * 32);
+        out.extend_from_slice(&NICKNAME_DHT_MAGIC);
+        out.extend_from_slice(&self.canonical_bytes());
         out.extend_from_slice(&self.sig);
         out
     }
 
     /// Parse a record from [`Self::to_bytes`]. Structural only — call
     /// [`Self::verify`] afterwards for cryptographic validity. Returns `None`
-    /// on any truncation / bad length prefix.
+    /// on a missing/wrong magic prefix or any truncation / bad length prefix.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader { b: bytes, at: 0 };
+        if r.take(2)? != NICKNAME_DHT_MAGIC {
+            return None;
+        }
         let version = r.u8()?;
         let name_len = r.u32()? as usize;
         let name = String::from_utf8(r.take(name_len)?.to_vec()).ok()?;
@@ -551,6 +584,30 @@ mod tests {
     fn key_is_stable_and_normalized() {
         assert_eq!(nickname_key("VART"), nickname_key("  vart "));
         assert!(nickname_key("no").is_none());
+    }
+
+    #[test]
+    fn dht_key_is_stable_normalized_and_distinct() {
+        assert_eq!(nickname_dht_key("VART"), nickname_dht_key("  vart "));
+        assert_ne!(nickname_dht_key("vart"), nickname_dht_key("varta"));
+        // The full key is domain-separated from the bare name hash.
+        assert_ne!(nickname_dht_key("vart"), nickname_key("vart"));
+        assert!(nickname_dht_key("no").is_none());
+    }
+
+    #[test]
+    fn wire_bytes_carry_magic_and_require_it() {
+        let (sk, node_id) = test_key();
+        let name = "longenoughname";
+        let seeds = mine(name, &node_id, length_weight_floor(name.len()));
+        let rec = NicknameRecord::sign(name, &sk, node_id, seeds, 1000).unwrap();
+        let bytes = rec.to_bytes();
+        assert_eq!(&bytes[..2], &NICKNAME_DHT_MAGIC[..]);
+        // Stripping or corrupting the magic must fail the parse.
+        assert!(NicknameRecord::from_bytes(&bytes[2..]).is_none());
+        let mut bad = bytes.clone();
+        bad[0] = b'X';
+        assert!(NicknameRecord::from_bytes(&bad).is_none());
     }
 
     #[test]

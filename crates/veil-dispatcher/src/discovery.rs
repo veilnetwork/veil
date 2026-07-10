@@ -358,6 +358,30 @@ impl FrameDispatcher {
                         // ONLY truly-unsigned junk that bypassed validation, without
                         // breaking these self-authenticating record types.
                         let self_key: [u8; 32] = *blake3::hash(node_id.as_bytes()).as_bytes();
+                        // Nickname records ("NK") carry a replace-on-heavier
+                        // conflict rule that plain last-write-wins storage
+                        // cannot express — route them through the dedicated
+                        // gate (verify + displacement + canonical key + quota)
+                        // instead of the generic magic validator. Strictly
+                        // additive: every other record kind is untouched.
+                        if payload.key != self_key
+                            && payload.value.get(..2)
+                                == Some(&veil_crypto::nickname::NICKNAME_DHT_MAGIC[..])
+                        {
+                            let origin =
+                                match self.nickname_store_gate(&payload.key, &payload.value) {
+                                    Ok(origin) => origin,
+                                    Err(disposition) => return disposition,
+                                };
+                            if !self
+                                .dht
+                                .store_with_origin(payload.key, payload.value, origin)
+                            {
+                                // per-origin byte cap exceeded — soft-drop.
+                                return DispatchResult::RateLimited;
+                            }
+                            return DispatchResult::NoResponse;
+                        }
                         let origin = if payload.key == self_key {
                             // Peer's own routing record — attribute to the peer.
                             *node_id.as_bytes()
@@ -608,6 +632,7 @@ impl FrameDispatcher {
         let is_rk = magic == Some(&veil_proto::relay_key::RELAY_KEY_MAGIC[..]);
         let is_ra = magic == Some(&veil_anonymity::rendezvous::MAGIC[..]);
         let is_rd = magic == Some(&veil_anonymity::directory::RELAY_DIRECTORY_DHT_MAGIC[..]);
+        let is_nk = magic == Some(&veil_crypto::nickname::NICKNAME_DHT_MAGIC[..]);
 
         if is_sb {
             // Signed operator bootstrap bundle (cf. `veil-bootstrap::
@@ -830,6 +855,41 @@ impl FrameDispatcher {
                 return Err(DispatchResult::NoResponse);
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
+        } else if is_nk {
+            // NicknameRecord ("NK", veil-crypto::nickname). Unlike nc/id/ir/mc
+            // this record is CRYPTOGRAPHICALLY self-authenticating at this gate
+            // (owner binding node_id == blake3(pk) + ed25519 sig + recomputed
+            // cumulative PoW + per-length floor), so — like AP/AT — attribute
+            // bytes to the REAL verified owner. NOTE: this arm alone does NOT
+            // apply the replace-on-heavier conflict rule (it has no DHT-key /
+            // incumbent context); both STORE ingress arms route "NK" through
+            // `nickname_store_gate` BEFORE reaching here, and the FIND_VALUE
+            // mirror-cache adds `nickname_mirror_ok`. This arm covers the
+            // mirror-cache's structural pre-check and any future value-only
+            // caller.
+            let rec = match veil_crypto::nickname::NicknameRecord::from_bytes(payload_value) {
+                Some(r) => r,
+                None => {
+                    return Err(DispatchResult::Violation(
+                        "Store: malformed NicknameRecord".to_owned(),
+                    ));
+                }
+            };
+            if rec.verify().is_err() {
+                return Err(DispatchResult::Violation(
+                    "Store: NicknameRecord failed verification".to_owned(),
+                ));
+            }
+            if !already_present
+                && !self
+                    .abuse
+                    .identity_write_quota
+                    .try_allow(&rec.owner_node_id)
+                    .is_allowed()
+            {
+                return Err(DispatchResult::NoResponse);
+            }
+            rec.owner_node_id
         } else {
             return Err(DispatchResult::Violation(
                 "Store: unrecognised payload magic — recursive plane requires a signed-record magic prefix"
@@ -886,6 +946,17 @@ impl FrameDispatcher {
                 Some(canonical) => canonical == *target_key,
                 None => false,
             }
+        } else if magic == &veil_crypto::nickname::NICKNAME_DHT_MAGIC[..] {
+            // NicknameRecord: owner-VERIFIED at this gate (self-authenticating
+            // sig + PoW), and its canonical key IS a pure function of the
+            // record's name — bind it, else a valid record for name A could be
+            // stored/cached under name B's key and poison resolver lookups.
+            match veil_crypto::nickname::NicknameRecord::from_bytes(payload) {
+                Some(rec) if rec.verify().is_ok() => {
+                    veil_crypto::nickname::nickname_dht_key(&rec.name) == Some(*target_key)
+                }
+                _ => false,
+            }
         } else {
             // nc / id / ir / mc: caching left unchanged (returns true). The
             // canonical key IS structurally derivable from the record's
@@ -901,5 +972,88 @@ impl FrameDispatcher {
             // one missing check, which this method adds.)
             true
         }
+    }
+
+    /// STORE gate for nickname records (`"NK"` magic, see
+    /// `veil_crypto::nickname`). Nicknames are the one record kind whose
+    /// acceptance depends on the INCUMBENT: ownership is contestable by
+    /// cumulative PoW weight, so a store must apply the replace-on-heavier
+    /// rule (`nickname_store_decision`) instead of last-write-wins. Used by
+    /// BOTH ingress planes (direct `DiscoveryMsg::Store` arm and the
+    /// `RecursiveQuery::STORE` arm in routing.rs).
+    ///
+    /// Returns the per-origin accounting bucket (the VERIFIED owner node id,
+    /// like AP/AT) when the record should be written, or the dispatch
+    /// disposition when it should not:
+    /// * invalid record (parse / sig / PoW / floor) → `Violation`;
+    /// * record stored under a key ≠ its canonical `nickname_dht_key` →
+    ///   `Violation` (same key-binding invariant as AP/AT/SB, cycle-7);
+    /// * does not displace the valid incumbent → `NoResponse` (a lighter or
+    ///   equal-weight republish is benign, not a protocol violation);
+    /// * identity-write quota refused a NEW key → `NoResponse`.
+    #[allow(clippy::result_large_err)]
+    pub fn nickname_store_gate(
+        &self,
+        key: &[u8; 32],
+        value: &[u8],
+    ) -> Result<[u8; 32], DispatchResult> {
+        use veil_crypto::nickname::{
+            NicknameRecord, StoreDecision, nickname_dht_key, nickname_store_decision,
+        };
+        let existing = self.dht.get_local(key);
+        match nickname_store_decision(existing.as_deref(), value) {
+            StoreDecision::RejectInvalid => Err(DispatchResult::Violation(
+                "Store: invalid NicknameRecord (parse/signature/PoW/floor)".to_owned(),
+            )),
+            StoreDecision::RejectKeepExisting => Err(DispatchResult::NoResponse),
+            StoreDecision::Accept => {
+                // The decision already fully verified the incoming record.
+                let rec = match NicknameRecord::from_bytes(value) {
+                    Some(r) => r,
+                    None => {
+                        return Err(DispatchResult::Violation(
+                            "Store: malformed NicknameRecord".to_owned(),
+                        ));
+                    }
+                };
+                // Canonical-key binding: a verified record may only live under
+                // its own name's key.
+                if nickname_dht_key(&rec.name) != Some(*key) {
+                    return Err(DispatchResult::Violation(
+                        "Store: NicknameRecord stored under non-canonical DHT key".to_owned(),
+                    ));
+                }
+                // Displacing/refreshing an EXISTING key is not new-state
+                // growth — only NEW keys pay the per-identity write quota
+                // (mirrors the `already_present` exemption of the generic
+                // magic validator).
+                if existing.is_none()
+                    && !self
+                        .abuse
+                        .identity_write_quota
+                        .try_allow(&rec.owner_node_id)
+                        .is_allowed()
+                {
+                    return Err(DispatchResult::NoResponse);
+                }
+                Ok(rec.owner_node_id)
+            }
+        }
+    }
+
+    /// FIND_VALUE mirror-cache admission for nickname values: `true` for every
+    /// non-nickname payload (unchanged behaviour), and for `"NK"` payloads only
+    /// when the record would DISPLACE the local incumbent under
+    /// `nickname_store_decision` — so a lighter (but valid) record returned by
+    /// a resolver response can never clobber a heavier record we already hold.
+    pub fn nickname_mirror_ok(&self, key: &[u8; 32], value: &[u8]) -> bool {
+        if value.get(..2) != Some(&veil_crypto::nickname::NICKNAME_DHT_MAGIC[..]) {
+            return true;
+        }
+        let existing = self.dht.get_local(key);
+        matches!(
+            veil_crypto::nickname::nickname_store_decision(existing.as_deref(), value),
+            veil_crypto::nickname::StoreDecision::Accept
+        )
     }
 }
