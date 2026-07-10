@@ -409,6 +409,30 @@ class VeilAudioRecorder {
   }
 }
 
+/// Decode a VOICE_OPUS clip (from [VeilAudioRecorder]) into a complete
+/// RIFF/WAV byte stream held in RAM (mono int16 PCM at the clip's rate), so
+/// playback can ride the OS media players — which cannot decode Opus
+/// (AVFoundation) — via a loopback URL with seeking. Returns null on a bad
+/// container / decoder failure / native unavailability.
+Uint8List? decodeVoiceWav(Uint8List voiceOpus) {
+  if (voiceOpus.isEmpty) return null;
+  final inBuf = calloc<Uint8>(voiceOpus.length);
+  inBuf.asTypedList(voiceOpus.length).setAll(0, voiceOpus);
+  final outWav = calloc<Pointer<Uint8>>();
+  final outLen = calloc<Size>();
+  try {
+    final rc = ffi.veilMediaDecodeWav(inBuf, voiceOpus.length, outWav, outLen);
+    if (rc != 0 || outWav.value == nullptr || outLen.value == 0) return null;
+    final wav = Uint8List.fromList(outWav.value.asTypedList(outLen.value));
+    ffi.veilMediaFreeWav(outWav.value);
+    return wav;
+  } finally {
+    calloc.free(inBuf);
+    calloc.free(outWav);
+    calloc.free(outLen);
+  }
+}
+
 /// Plays a VOICE_OPUS clip (from [VeilAudioRecorder]/sendVoice) through the
 /// native decoder + ADM speaker — no OS media framework, no plaintext on disk.
 /// Create with the clip bytes, [start], poll [positionMs]/[isPlaying] for the
