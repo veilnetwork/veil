@@ -149,18 +149,25 @@ pub fn nickname_dht_key(name: &str) -> Option<[u8; 32]> {
 }
 
 /// Minimum cumulative weight a name of `char_len` must carry. Short names cost
-/// exponentially more (3 chars ≫ 32 chars) — the anti-squatting floor. Tuned
-/// modestly for v1; every verifier enforces the same curve.
+/// exponentially more (3 chars ≫ 32 chars) — the anti-squatting floor. Every
+/// verifier enforces the same curve, so retuning it is a consensus change —
+/// only safe while no records are deployed.
 pub fn length_weight_floor(char_len: usize) -> u64 {
-    // Floor bits: 3→28, 4→24, 5→20, 6→18, 7→16, then -1/char down to a base
-    // of 8 for long names. weight = 2^bits.
+    // Floor bits: 3→35, 4→31, 5→26, 6→22, 7→19, then -1/char from 16 down
+    // to a base of 8 for long names. weight = 2^bits.
+    //
+    // Calibrated 2026-07-10 on a mid-range phone (release blake3 in the
+    // app's mining chunks, ~2.8M hashes/s; observed cumulative weight ≈
+    // 2.8 × hashes): 3 chars ≈ 1.2 h, 4 ≈ 5 min, 5 ≈ 9 s, 6 ≈ 0.5 s,
+    // 7+ effectively instant — "short names cost hours, long names cost
+    // seconds".
     let bits: u32 = match char_len {
-        0..=3 => 28,
-        4 => 24,
-        5 => 20,
-        6 => 18,
-        7 => 16,
-        n => 16u32.saturating_sub((n as u32).saturating_sub(7)).max(8),
+        0..=3 => 35,
+        4 => 31,
+        5 => 26,
+        6 => 22,
+        7 => 19,
+        n => 16u32.saturating_sub((n as u32).saturating_sub(8)).max(8),
     };
     1u64 << bits
 }
