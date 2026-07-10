@@ -68,6 +68,16 @@ int veil_media_player_is_playing(VeilAudioPlayer* p);
 /* Stop playout and free the player. */
 void veil_media_player_destroy(VeilAudioPlayer* p);
 
+/* Decode a VOICE_OPUS clip to 16 kHz mono float32 PCM (the input on-device
+ * speech-to-text/whisper expects). On success returns VEIL_PLAY_OK and sets
+ * *out_pcm to a malloc'd float buffer (free with veil_media_free_pcm) and
+ * *out_samples to the sample count. Returns an error on a bad container. */
+int veil_media_decode_pcm16k(const uint8_t* voice_opus, size_t len,
+                             float** out_pcm, int* out_samples);
+
+/* Free a buffer returned by veil_media_decode_pcm16k. */
+void veil_media_free_pcm(float* pcm);
+
 #pragma GCC visibility pop
 
 #ifdef __cplusplus
