@@ -1781,6 +1781,15 @@ pub fn is_self_authenticating_accepts_attachment_magic() {
 }
 
 #[test]
+pub fn is_self_authenticating_accepts_nickname_magic() {
+    // "NK" — NicknameRecord (auto-renewal path for claimed names).
+    let mut v = Vec::new();
+    v.extend_from_slice(&veil_crypto::nickname::NICKNAME_DHT_MAGIC);
+    v.extend_from_slice(&[0u8; 32]);
+    assert!(NodeRuntime::is_self_authenticating_dht_value(&v));
+}
+
+#[test]
 pub fn is_self_authenticating_rejects_unsigned_legacy() {
     // Raw AppEndpointEntry legacy format: starts with node_id (32 bytes)
     // first two bytes unlikely to match any magic by accident.
