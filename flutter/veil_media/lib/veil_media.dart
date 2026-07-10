@@ -321,3 +321,90 @@ class VeilMediaEngine {
     }
   }
 }
+
+/// A finished voice recording: the VOICE_OPUS byte stream (store this), the
+/// clip duration, and a peak-normalized amplitude waveform (0..1 per bar).
+class VoiceRecording {
+  const VoiceRecording({
+    required this.bytes,
+    required this.durationMs,
+    required this.waveform,
+  });
+
+  final Uint8List bytes;
+  final int durationMs;
+  final List<double> waveform;
+}
+
+/// Records the microphone to an in-RAM Opus stream via the veil_media native
+/// recorder (no plaintext ever hits disk). One recorder == one clip; create,
+/// [start], poll [level]/[elapsedMs] for the live UI, then [stop] to get the
+/// bytes + waveform. [dispose] frees the native handle (also stops capture).
+///
+/// All calls are on the control isolate. The native capture runs on the OS
+/// audio thread; [level] is lock-free so the UI can poll it at frame rate.
+class VeilAudioRecorder {
+  VeilAudioRecorder._(this._ptr);
+
+  Pointer<ffi.VeilAudioRecorderHandle> _ptr;
+
+  /// Create a recorder (builds the platform ADM + Opus encoder). Returns null
+  /// if the native layer is unavailable or the encoder can't be built.
+  static VeilAudioRecorder? create() {
+    final p = ffi.veilMediaRecorderCreate();
+    if (p == nullptr) return null;
+    return VeilAudioRecorder._(p);
+  }
+
+  bool get _alive => _ptr != nullptr;
+
+  /// Begin capturing. Returns true on success; false if the mic can't be opened
+  /// (e.g. the OS permission was denied) — the caller should surface that.
+  bool start() => _alive && ffi.veilMediaRecorderStart(_ptr) == 0;
+
+  /// Most-recent smoothed capture level in 0..1, for a live meter.
+  double get level => _alive ? ffi.veilMediaRecorderLevel(_ptr) : 0;
+
+  /// Elapsed captured milliseconds so far.
+  int get elapsedMs => _alive ? ffi.veilMediaRecorderElapsedMs(_ptr) : 0;
+
+  /// Stop capture and finalize. [waveformBars] amplitude bars are computed
+  /// natively. Returns null if nothing usable was captured (empty clip).
+  VoiceRecording? stop({int waveformBars = 48}) {
+    if (!_alive) return null;
+    final outBytes = calloc<Pointer<Uint8>>();
+    final outLen = calloc<Size>();
+    final outDur = calloc<Int32>();
+    final wf = calloc<Uint8>(waveformBars);
+    try {
+      final rc = ffi.veilMediaRecorderStop(
+          _ptr, outBytes, outLen, outDur, wf, waveformBars);
+      if (rc != 0) return null;
+      final len = outLen.value;
+      final durationMs = outDur.value;
+      final waveform = [
+        for (var i = 0; i < waveformBars; i++) wf[i] / 255.0,
+      ];
+      if (len == 0 || outBytes.value == nullptr) {
+        return null; // empty clip (silence / instant release)
+      }
+      final bytes = Uint8List.fromList(outBytes.value.asTypedList(len));
+      ffi.veilMediaRecorderFreeBytes(outBytes.value);
+      return VoiceRecording(
+          bytes: bytes, durationMs: durationMs, waveform: waveform);
+    } finally {
+      calloc.free(outBytes);
+      calloc.free(outLen);
+      calloc.free(outDur);
+      calloc.free(wf);
+    }
+  }
+
+  /// Free the native recorder (stops capture if still running). Idempotent.
+  void dispose() {
+    if (_ptr != nullptr) {
+      ffi.veilMediaRecorderDestroy(_ptr);
+      _ptr = nullptr;
+    }
+  }
+}
