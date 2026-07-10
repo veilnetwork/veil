@@ -97,6 +97,10 @@ impl NodeRuntime {
         // KademliaService; the maintenance tick periodically calls
         // `evict_stale` to keep cold entries from accumulating.
         let transport_cache = self.dht.transport_cache();
+        // Sweep follow-up (same class as L-6/prune_expired above): the
+        // per-identity DHT write-quota GC was implemented + tested but had NO
+        // periodic caller — on a long-lived node the bucket map only grew.
+        let identity_write_quota = Arc::clone(&self.dispatcher.abuse.identity_write_quota);
         // backlog: re-mint our own announcement at half-validity
         // so long-running peers don't go silent ~30 days after startup.
         // The session_outbox is used to re-gossip the fresh bundle to
@@ -165,6 +169,9 @@ impl NodeRuntime {
             // deferred : tick counter for throttle decision.
             // Wraps at u64::MAX (~580 billion years at 1 Hz, not a concern).
             let mut tick_index: u64 = 0;
+            // Hourly cadence for the identity-quota GC (its gc_at doc assumes
+            // an infrequent caller — the LRU rebuild is O(n log n)).
+            let mut last_identity_quota_gc = std::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -246,6 +253,16 @@ impl NodeRuntime {
                                         format!("cookies_removed={dropped}"),
                                     );
                                 }
+                            }
+                            // Per-identity DHT write-quota GC (see capture
+                            // comment above): drop buckets idle past the
+                            // policy window so the map stays bounded on
+                            // long-lived nodes.
+                            if last_identity_quota_gc.elapsed()
+                                >= std::time::Duration::from_secs(3600)
+                            {
+                                last_identity_quota_gc = std::time::Instant::now();
+                                identity_write_quota.gc_at(std::time::Instant::now());
                             }
                             // follow-up: refresh adaptive params so
                             // the proximity gate scales with network size on
