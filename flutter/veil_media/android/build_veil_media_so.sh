@@ -36,7 +36,17 @@ e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
 cmd=(e['command'] if e.get('command') else ' '.join(e['arguments'])).strip()
 s=re.search(r'(\S*call/call\.cc)',cmd).group(1)
 cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
-p=cmd.split(' ',1); cmd=p[0]+' -DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir+' '+p[1]
+# Retarget the veil TUs to android API 26: the AAudio ADM uses AAudio APIs
+# introduced in 26, and libwebrtc is built at a lower min API (23) which makes
+# those calls -Werror,-Wunguarded-availability. veil's AAudio path is API 26+
+# by design (mirrors the old .so), so compile the veil TUs at 26.
+cmd=re.sub(r'(--target=aarch64-linux-android)\d+', r'\g<1>26', cmd)
+cmd=re.sub(r'-D__ANDROID_API__=\d+', '-D__ANDROID_API__=26', cmd)
+# -Wno-error=deprecated-declarations: the android webrtc build is stricter
+# (-Werror) than mac; the engine uses a deprecated-but-functional webrtc field
+# (local_ssrc). Downgrade to a warning so the veil source builds against current
+# webrtc without touching engine behaviour.
+p=cmd.split(' ',1); cmd=p[0]+' -DVEIL_MEDIA_HAVE_WEBRTC=1 -Wno-error=deprecated-declarations -I'+shimdir+' '+p[1]
 open('/dev/stdout','w').write('cd "'+e['directory']+'"\n'+cmd+'\n')
 PY
   bash "$TMP/tu.sh"

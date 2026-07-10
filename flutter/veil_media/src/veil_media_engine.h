@@ -105,7 +105,7 @@ int veil_media_engine_push_video_frame(VeilMediaEngine *engine,
 
 /* Pull the latest decoded remote frame as tightly-packed RGBA (width*height*4
  * bytes, row stride width*4). Copies into `dst` (capacity `dst_cap`) and sets
- * *out_w/*out_h. Returns a monotonic frame sequence (>0) when a frame was
+ * *out_w / *out_h. Returns a monotonic frame sequence (>0) when a frame was
  * copied, 0 if none decoded yet, or -1 if `dst_cap` is too small (the output
  * width/height pointers are still set so the caller can resize + retry). Poll
  * at the display rate and repaint only when the returned sequence changes.
