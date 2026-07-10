@@ -1776,3 +1776,149 @@ final int Function(
               Pointer<Pointer<Utf8>>,
             )>>('veil_pair_target_build_confirm')
     .asFunction();
+
+// ── Nicknames (human-readable names over veil) ───────────────────────────────
+//
+// Pure helpers (normalize / floor / mine / verify) are network-free; claim +
+// resolve talk to the in-process embedded node (node-embedded builds only).
+// Mining is chunked: each `veilNicknameMine` call is bounded by `maxHashes`;
+// the caller loops off the UI isolate, threading the returned seed set back
+// in as `priorSeeds`, and cancels by simply not calling again.
+
+/// `veil_nickname_resolve` verdict: the name has no valid owner (available).
+const int veilNicknameFree = 1;
+
+// Normalize a candidate nickname. Writes normalized ASCII bytes to *out_buf
+// (free with [veilFreeBuf]). VEIL_OK, or VEIL_ERR_INVALID_ARG on a bad name.
+final int Function(
+  Pointer<Uint8>, // name (UTF-8)
+  int, // name_len
+  Pointer<Pointer<Uint8>>, // out_buf
+  Pointer<IntPtr>, // out_len
+  Pointer<Pointer<Utf8>>, // err_out
+) veilNicknameNormalize = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Uint8>>,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_nickname_normalize')
+    .asFunction();
+
+// The cumulative PoW weight floor for a name of this length (0 on bad name).
+final int Function(
+  Pointer<Uint8>, // name (UTF-8)
+  int, // name_len
+) veilNicknameLengthFloor = nativeLib
+    .lookup<
+        NativeFunction<
+            Uint64 Function(
+              Pointer<Uint8>,
+              IntPtr,
+            )>>('veil_nickname_length_floor')
+    .asFunction();
+
+// Mine PoW seeds (one bounded chunk). On VEIL_OK, *out_buf holds a serialized
+// outcome (free with [veilFreeBuf]):
+//   hit_target:u8 | weight:u64 LE | hashes:u64 LE | seed_count:u32 LE | seeds.
+final int Function(
+  Pointer<Uint8>, // name (UTF-8)
+  int, // name_len
+  Pointer<Uint8>, // owner_node_id (32 B)
+  Pointer<Uint8>, // prior_seeds (count*32 B, may be nullptr)
+  int, // prior_seeds_len
+  int, // target_weight (u64)
+  int, // max_hashes (u64)
+  Pointer<Pointer<Uint8>>, // out_buf
+  Pointer<IntPtr>, // out_len
+  Pointer<Pointer<Utf8>>, // err_out
+) veilNicknameMine = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Uint64,
+              Uint64,
+              Pointer<Pointer<Uint8>>,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_nickname_mine')
+    .asFunction();
+
+// Verify a serialized NicknameRecord (owner binding + sig + PoW + floor).
+final int Function(
+  Pointer<Uint8>, // record bytes
+  int, // record_len
+  Pointer<Pointer<Utf8>>, // err_out
+) veilNicknameVerify = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_nickname_verify')
+    .asFunction();
+
+// Sign an already-mined seed set with the sovereign key of the embedded node
+// running as owner_node_id and publish to the DHT. On VEIL_OK writes the
+// published record's cumulative weight to *out_weight. Errors carry the
+// node-side reason (under-floor / taken-with-weight-W / multi-device subkey /
+// no embedded node) in *err_out.
+final int Function(
+  Pointer<Uint8>, // owner_node_id (32 B)
+  Pointer<Uint8>, // name (UTF-8)
+  int, // name_len
+  Pointer<Uint8>, // seeds (count*32 B, may be nullptr)
+  int, // seeds_len
+  int, // timeout_ms (u64; 0 = default)
+  Pointer<Uint64>, // out_weight
+  Pointer<Pointer<Utf8>>, // err_out
+) veilNicknameClaim = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Uint64,
+              Pointer<Uint64>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_nickname_claim')
+    .asFunction();
+
+// Resolve the current owner of a nickname via the embedded node running as
+// self_node_id. VEIL_OK = owner found (out_owner/out_weight/out_issued_at
+// filled); [veilNicknameFree] = name is available; negative = error.
+final int Function(
+  Pointer<Uint8>, // self_node_id (32 B)
+  Pointer<Uint8>, // name (UTF-8)
+  int, // name_len
+  int, // timeout_ms (u64; 0 = default)
+  Pointer<Uint8>, // out_owner (32 B, caller-provided)
+  Pointer<Uint64>, // out_weight
+  Pointer<Uint64>, // out_issued_at
+  Pointer<Pointer<Utf8>>, // err_out
+) veilNicknameResolve = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Uint64,
+              Pointer<Uint8>,
+              Pointer<Uint64>,
+              Pointer<Uint64>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_nickname_resolve')
+    .asFunction();
