@@ -597,6 +597,18 @@ final int Function(
 // `veil_restore_identity_from_phrase` were removed — these zeroize variants
 // (caller-writable buffer wiped in place before return, success and error
 // paths both) are the only entry points.
+// Fresh 24-word master phrase (onboarding). Out-string is malloc'd by the
+// native side — copy immediately, then scrub + free with [veilFreeString].
+final int Function(Pointer<Pointer<Utf8>>, Pointer<Pointer<Utf8>>)
+    veilGenerateMasterPhrase = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                  Pointer<Pointer<Utf8>>,
+                  Pointer<Pointer<Utf8>>,
+                )>>('veil_generate_master_phrase')
+        .asFunction();
+
 final int Function(Pointer<Uint8>, int, Pointer<Pointer<Utf8>>)
     _validateBip39PhraseZeroizeNative = nativeLib
         .lookup<

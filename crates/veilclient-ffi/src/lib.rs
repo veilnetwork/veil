@@ -5755,6 +5755,60 @@ pub const VEIL_DEFAULT_RESTORE_VALIDITY_SECS: u64 = 30 * 24 * 3600;
 // (The earlier non-zeroizing `*const c_char` forms were removed in the
 // explicit-length ABI migration — they left the mnemonic in caller memory.)
 
+/// Generate a FRESH master identity phrase: a new random 32-byte master seed
+/// encoded as the 24-word English mnemonic (veil master-phrase checksum). The
+/// seed material lives only inside this call and zeroizes on drop — the
+/// returned phrase is its ONLY representation. Flow: show it to the user for
+/// the paper backup, confirm, then create the identity DETERMINISTICALLY via
+/// `veil_restore_identity_from_phrase_zeroize` with this same phrase, so a
+/// fresh onboarding and a later disaster-recovery restore agree on node_id.
+///
+/// On success writes a NUL-terminated UTF-8 phrase into `*phrase_out`; the
+/// caller MUST free it with `veil_free_string`, and should zero the buffer
+/// first (the Dart wrapper copies into an immutable String and scrubs the
+/// native bytes — same posture as the validate/restore zeroize variants).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_generate_master_phrase(
+    phrase_out: *mut *mut c_char,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        clear_err(err_out);
+    }
+    if phrase_out.is_null() {
+        unsafe {
+            write_err(err_out, "phrase_out is NULL");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let seed = veil_identity::master_seed::generate_master_seed();
+    let mnemonic = match veil_identity::master_seed::encode_master_seed_to_phrase(&seed) {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe {
+                write_err(err_out, format!("phrase encode failed: {e}"));
+            }
+            return VEIL_ERR;
+        }
+    };
+    // The intermediate String zeroizes on drop; the CString we hand out is the
+    // caller's to scrub + free (veil_free_string).
+    let phrase = zeroize::Zeroizing::new(mnemonic.to_string());
+    let cs = match CString::new(phrase.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            unsafe {
+                write_err(err_out, "phrase contained NUL");
+            }
+            return VEIL_ERR;
+        }
+    };
+    unsafe {
+        *phrase_out = cs.into_raw();
+    }
+    VEIL_OK
+}
+
 /// Validate a BIP-39 master phrase, zeroizing the caller's buffer on consume.
 ///
 /// Returns `VEIL_OK` iff the phrase is exactly 24 words from the English BIP-39
@@ -6948,6 +7002,45 @@ mod tests {
         unsafe {
             veil_free_string(ptr::null_mut());
         }
+    }
+
+    /// Onboarding phrase epic: a freshly generated master phrase is 24 words
+    /// and round-trips through the production decoder (checksum valid) — the
+    /// same phrase later drives the deterministic restore.
+    #[test]
+    fn generate_master_phrase_roundtrips() {
+        let mut phrase: *mut c_char = ptr::null_mut();
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_generate_master_phrase(&mut phrase, &mut err) };
+        assert_eq!(rc, VEIL_OK);
+        assert!(!phrase.is_null());
+        let s = unsafe { CStr::from_ptr(phrase) }
+            .to_str()
+            .expect("utf-8 phrase")
+            .to_string();
+        assert_eq!(s.split(' ').count(), 24);
+        assert!(
+            veil_identity::master_seed::decode_master_seed_from_phrase(&s).is_ok(),
+            "generated phrase must satisfy the master-phrase checksum"
+        );
+        // Two calls must not collide (fresh entropy each time).
+        let mut phrase2: *mut c_char = ptr::null_mut();
+        let rc2 = unsafe { veil_generate_master_phrase(&mut phrase2, &mut err) };
+        assert_eq!(rc2, VEIL_OK);
+        let s2 = unsafe { CStr::from_ptr(phrase2) }.to_str().unwrap();
+        assert_ne!(s, s2);
+        unsafe {
+            veil_free_string(phrase);
+            veil_free_string(phrase2);
+        }
+    }
+
+    #[test]
+    fn generate_master_phrase_null_out_is_invalid_arg() {
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe { veil_generate_master_phrase(ptr::null_mut(), &mut err) };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        unsafe { veil_free_string(err) };
     }
 
     #[test]
