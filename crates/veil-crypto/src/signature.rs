@@ -26,6 +26,40 @@ pub struct GeneratedKeyPair {
     pub private_key: String,
 }
 
+/// Raw hybrid keypair for callers that must never materialise private key
+/// bytes as an ordinary base64 `String` (encrypted sovereign bundles, HSM
+/// bridges). The Ed25519 half is deterministic from [seed]; the Falcon-512
+/// half is freshly generated and therefore must be preserved by the caller.
+pub struct GeneratedHybrid512RawKeyPair {
+    pub public_key: Vec<u8>,
+    pub private_key: Zeroizing<Vec<u8>>,
+}
+
+pub fn hybrid512_keypair_from_ed25519_seed(seed: &[u8; 32]) -> GeneratedHybrid512RawKeyPair {
+    let ed = SigningKey::from_bytes(seed);
+    let (fal_pk, fal_sk) = falcon512::keypair();
+    let fal_pk_bytes = fal_pk.as_bytes();
+    let fal_sk_bytes = fal_sk.as_bytes();
+    assert_eq!(
+        fal_pk_bytes.len(),
+        897,
+        "Falcon-512 public-key size invariant changed"
+    );
+
+    let mut public_key = Vec::with_capacity(32 + fal_pk_bytes.len());
+    public_key.extend_from_slice(&ed.verifying_key().to_bytes());
+    public_key.extend_from_slice(fal_pk_bytes);
+
+    let mut private_key = Zeroizing::new(Vec::with_capacity(34 + fal_sk_bytes.len()));
+    private_key.extend_from_slice(&ed.to_bytes());
+    private_key.extend_from_slice(&(fal_sk_bytes.len() as u16).to_le_bytes());
+    private_key.extend_from_slice(fal_sk_bytes);
+    GeneratedHybrid512RawKeyPair {
+        public_key,
+        private_key,
+    }
+}
+
 impl std::fmt::Debug for GeneratedKeyPair {
     /// Redacting `Debug` — a stray `debug!("{kp:?}")` must NOT leak signing
     /// material. Mirrors the redacted-Debug pattern on the sibling key-wrapper

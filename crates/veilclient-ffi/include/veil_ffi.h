@@ -1964,6 +1964,69 @@ int veil_sovereign_signer_sign(VeilSovereignSigner *signer,
 ;
 
 /**
+ * Create a portable Ed25519+Falcon512 sovereign bundle encrypted with the
+ * recovery phrase. The mutable phrase is wiped on every path. The returned
+ * ciphertext buffer is freed with [`veil_free_buf`].
+ */
+
+int veil_sovereign_bundle_create_hybrid512_zeroize(uint8_t *phrase,
+                                                   size_t phrase_len,
+                                                   uint8_t **out_bundle,
+                                                   size_t *out_bundle_len,
+                                                   char **err_out)
+;
+
+/**
+ * Decrypt a local sovereign bundle and open a short-lived variable-algorithm
+ * signer. Neither phrase nor plaintext key material crosses back to the host.
+ */
+
+int veil_sovereign_signer_open_bundle_zeroize(const uint8_t *bundle,
+                                              size_t bundle_len,
+                                              uint8_t *phrase,
+                                              size_t phrase_len,
+                                              VeilSovereignSigner **out_signer,
+                                              uint8_t *out_algorithm,
+                                              uint8_t *out_node_id,
+                                              size_t out_node_id_cap,
+                                              uint8_t *out_public_key,
+                                              size_t out_public_key_cap,
+                                              size_t *out_public_key_len,
+                                              char **err_out)
+;
+
+/**
+ * Variable-length sovereign signature API. `out_signature_len` receives the
+ * exact number of bytes written (64 for Ed25519, ~700-830 for hybrid-512).
+ */
+
+int veil_sovereign_signer_sign_into(VeilSovereignSigner *signer,
+                                    const uint8_t *message,
+                                    size_t message_len,
+                                    uint8_t *out_signature,
+                                    size_t out_signature_cap,
+                                    size_t *out_signature_len,
+                                    char **err_out)
+;
+
+/**
+ * Verify an algorithm-tagged sovereign signature and bind the supplied node
+ * id to the full public key. Invalid signatures return VEIL_OK + false.
+ */
+
+int veil_sovereign_verify(uint8_t algorithm,
+                          const uint8_t *node_id,
+                          const uint8_t *public_key,
+                          size_t public_key_len,
+                          const uint8_t *message,
+                          size_t message_len,
+                          const uint8_t *signature,
+                          size_t signature_len,
+                          bool *out_valid,
+                          char **err_out)
+;
+
+/**
  * Close a sovereign signing burst. Double-close and stale handles are safe
  * no-ops; the generational table prevents ABA reuse.
  */
