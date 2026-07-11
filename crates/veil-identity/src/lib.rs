@@ -51,6 +51,7 @@ pub mod publish;
 pub mod resolver;
 pub mod signing_key;
 pub mod sovereign;
+pub mod sovereign_bundle;
 pub mod sovereign_flow;
 pub mod verify;
 

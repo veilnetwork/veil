@@ -18,6 +18,7 @@ final NativeFinalizer _sovereignSignerFinalizer =
 final class VeilSovereignSigner implements Finalizable {
   VeilSovereignSigner._(
     this._handle,
+    this.algorithm,
     this.nodeId,
     this.publicKey,
   ) {
@@ -29,6 +30,9 @@ final class VeilSovereignSigner implements Finalizable {
   }
 
   Pointer<ffi.VeilSovereignSigner> _handle;
+
+  /// Canonical Veil signature algorithm name.
+  final String algorithm;
 
   /// BLAKE3-derived sovereign node id (32 bytes).
   final Uint8List nodeId;
@@ -61,6 +65,7 @@ final class VeilSovereignSigner implements Finalizable {
       }
       return VeilSovereignSigner._(
         signerOut.value,
+        'ed25519',
         Uint8List.fromList(nodeIdOut.asTypedList(32)),
         Uint8List.fromList(publicKeyOut.asTypedList(32)),
       );
@@ -73,6 +78,57 @@ final class VeilSovereignSigner implements Finalizable {
     }
   }
 
+  /// Decrypt [bundle] with [phrase] and open a hybrid one-burst signer.
+  factory VeilSovereignSigner.openBundle(
+    Uint8List bundle,
+    String phrase,
+  ) {
+    final bundleBuf = calloc<Uint8>(bundle.length);
+    final phraseC = phrase.toNativeUtf8();
+    final signerOut = calloc<Pointer<ffi.VeilSovereignSigner>>();
+    final algorithmOut = calloc<Uint8>();
+    final nodeIdOut = calloc<Uint8>(32);
+    final publicKeyOut = calloc<Uint8>(1024);
+    final publicKeyLenOut = calloc<IntPtr>();
+    final errOut = calloc<Pointer<Utf8>>();
+    try {
+      bundleBuf.asTypedList(bundle.length).setAll(0, bundle);
+      final rc = ffi.veilSovereignSignerOpenBundleZeroize(
+        bundleBuf,
+        bundle.length,
+        phraseC.cast<Uint8>(),
+        phraseC.length,
+        signerOut,
+        algorithmOut,
+        nodeIdOut,
+        32,
+        publicKeyOut,
+        1024,
+        publicKeyLenOut,
+        errOut,
+      );
+      if (rc != ffi.veilOk) {
+        throw VeilException(_takeError(errOut), code: rc);
+      }
+      final publicKeyLen = publicKeyLenOut.value;
+      return VeilSovereignSigner._(
+        signerOut.value,
+        _algorithmName(algorithmOut.value),
+        Uint8List.fromList(nodeIdOut.asTypedList(32)),
+        Uint8List.fromList(publicKeyOut.asTypedList(publicKeyLen)),
+      );
+    } finally {
+      calloc.free(bundleBuf);
+      calloc.free(phraseC);
+      calloc.free(signerOut);
+      calloc.free(algorithmOut);
+      calloc.free(nodeIdOut);
+      calloc.free(publicKeyOut);
+      calloc.free(publicKeyLenOut);
+      calloc.free(errOut);
+    }
+  }
+
   /// Sign arbitrary canonical membership bytes with the sovereign key.
   Uint8List sign(Uint8List message) {
     final handle = _handle;
@@ -80,27 +136,32 @@ final class VeilSovereignSigner implements Finalizable {
       throw StateError('Sovereign signer is closed');
     }
     final messageBuf = calloc<Uint8>(message.isEmpty ? 1 : message.length);
-    final signatureOut = calloc<Uint8>(64);
+    final signatureOut = calloc<Uint8>(1024);
+    final signatureLenOut = calloc<IntPtr>();
     final errOut = calloc<Pointer<Utf8>>();
     try {
       if (message.isNotEmpty) {
         messageBuf.asTypedList(message.length).setAll(0, message);
       }
-      final rc = ffi.veilSovereignSignerSign(
+      final rc = ffi.veilSovereignSignerSignInto(
         handle,
         messageBuf,
         message.length,
         signatureOut,
-        64,
+        1024,
+        signatureLenOut,
         errOut,
       );
       if (rc != ffi.veilOk) {
         throw VeilException(_takeError(errOut), code: rc);
       }
-      return Uint8List.fromList(signatureOut.asTypedList(64));
+      return Uint8List.fromList(
+        signatureOut.asTypedList(signatureLenOut.value),
+      );
     } finally {
       calloc.free(messageBuf);
       calloc.free(signatureOut);
+      calloc.free(signatureLenOut);
       calloc.free(errOut);
     }
   }
@@ -114,6 +175,104 @@ final class VeilSovereignSigner implements Finalizable {
     ffi.veilSovereignSignerClose(handle.cast<Void>());
   }
 }
+
+/// Create a fresh hybrid sovereign bundle. Only encrypted bytes return to
+/// Dart; the mutable native phrase copy and all plaintext key bytes are wiped.
+Uint8List createHybrid512SovereignBundle(String phrase) {
+  final phraseC = phrase.toNativeUtf8();
+  final bundleOut = calloc<Pointer<Uint8>>();
+  final bundleLenOut = calloc<IntPtr>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final rc = ffi.veilSovereignBundleCreateHybrid512Zeroize(
+      phraseC.cast<Uint8>(),
+      phraseC.length,
+      bundleOut,
+      bundleLenOut,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException(_takeError(errOut), code: rc);
+    }
+    return Uint8List.fromList(
+      bundleOut.value.asTypedList(bundleLenOut.value),
+    );
+  } finally {
+    if (bundleOut.value != nullptr) {
+      ffi.veilFreeBuf(bundleOut.value, bundleLenOut.value);
+    }
+    calloc.free(phraseC);
+    calloc.free(bundleOut);
+    calloc.free(bundleLenOut);
+    calloc.free(errOut);
+  }
+}
+
+/// Verify a sovereign signature and its full-public-key node-id binding.
+bool verifySovereignSignature({
+  required String algorithm,
+  required Uint8List nodeId,
+  required Uint8List publicKey,
+  required Uint8List message,
+  required Uint8List signature,
+}) {
+  if (nodeId.length != 32) return false;
+  final algorithmWire = _algorithmWire(algorithm);
+  if (algorithmWire == null) return false;
+  final nodeBuf = calloc<Uint8>(32);
+  final publicBuf = calloc<Uint8>(publicKey.length);
+  final messageBuf = calloc<Uint8>(message.isEmpty ? 1 : message.length);
+  final signatureBuf = calloc<Uint8>(signature.length);
+  final validOut = calloc<Bool>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    nodeBuf.asTypedList(32).setAll(0, nodeId);
+    publicBuf.asTypedList(publicKey.length).setAll(0, publicKey);
+    if (message.isNotEmpty) {
+      messageBuf.asTypedList(message.length).setAll(0, message);
+    }
+    signatureBuf.asTypedList(signature.length).setAll(0, signature);
+    final rc = ffi.veilSovereignVerify(
+      algorithmWire,
+      nodeBuf,
+      publicBuf,
+      publicKey.length,
+      messageBuf,
+      message.length,
+      signatureBuf,
+      signature.length,
+      validOut,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException(_takeError(errOut), code: rc);
+    }
+    return validOut.value;
+  } finally {
+    calloc.free(nodeBuf);
+    calloc.free(publicBuf);
+    calloc.free(messageBuf);
+    calloc.free(signatureBuf);
+    calloc.free(validOut);
+    calloc.free(errOut);
+  }
+}
+
+String _algorithmName(int wire) => switch (wire) {
+      1 => 'ed25519',
+      2 => 'falcon512',
+      3 => 'ed25519+falcon512',
+      4 => 'ed25519+falcon1024',
+      _ => throw VeilException('unsupported sovereign algorithm $wire'),
+    };
+
+int? _algorithmWire(String name) => switch (name) {
+      'ed25519' => 1,
+      'falcon512' => 2,
+      'ed25519+falcon512' => 3,
+      'ed25519+falcon1024' => 4,
+      _ => null,
+    };
 
 String _takeError(Pointer<Pointer<Utf8>> errOut) {
   final err = errOut.value;
