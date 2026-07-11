@@ -128,6 +128,94 @@ pub unsafe extern "C" fn veil_config_init(
     }
 }
 
+/// Like `veil_config_init`, but the Ed25519 identity is DERIVED FROM A MASTER
+/// PHRASE instead of random (onboarding-phrase epic P2): phrase → master seed
+/// (checksum verified) → the SAME HKDF the sovereign restore uses
+/// (`veil_crypto::identity::derive_master_sk_ed25519`) → keypair; only the
+/// anti-sybil nonce is searched. `node_id` depends only on the public key, so
+/// the identity is deterministic in the phrase — a later disaster-recovery
+/// restore lands on the SAME node_id — while the nonce is simply re-mined.
+///
+/// The caller's `(phrase, phrase_len)` buffer is overwritten with `0` before
+/// returning on EVERY path (same contract as the validate/restore zeroize
+/// variants); the decoded seed and derived secret zeroize on drop. Returns
+/// the rendered config TOML (free with `veil_free_string`), or NULL with
+/// `err_out` set. `difficulty` 0 = canonical.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_config_init_from_phrase_zeroize(
+    phrase: *mut u8,
+    phrase_len: size_t,
+    difficulty: u32,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    use veil_cfg::identity_ops::{IdentityPowParams, IdentityUseCases};
+
+    if phrase.is_null() {
+        unsafe { set_err(err_out, "phrase is null") };
+        return std::ptr::null_mut();
+    }
+    if phrase_len > 4096 {
+        unsafe { set_err(err_out, "phrase too long (>4 KiB)") };
+        return std::ptr::null_mut();
+    }
+    // Copy into an owned zeroizing buffer, then scrub the caller's bytes
+    // immediately — the plaintext window collapses to this call regardless
+    // of which error path is taken below.
+    let owned = zeroize::Zeroizing::new(
+        unsafe { std::slice::from_raw_parts(phrase, phrase_len) }.to_vec(),
+    );
+    unsafe { std::ptr::write_bytes(phrase, 0, phrase_len) };
+    let phrase_str = match std::str::from_utf8(&owned) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe { set_err(err_out, "phrase is not valid UTF-8") };
+            return std::ptr::null_mut();
+        }
+    };
+    let seed = match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("phrase decode failed: {e}")) };
+            return std::ptr::null_mut();
+        }
+    };
+    let sk_seed = veil_crypto::identity::derive_master_sk_ed25519(&seed);
+    let pow = if difficulty == 0 {
+        IdentityPowParams::default()
+    } else {
+        IdentityPowParams {
+            difficulty,
+            ..IdentityPowParams::default()
+        }
+    };
+    let identity =
+        match IdentityUseCases::new(pow).provision_ed25519_from_secret(&sk_seed, None) {
+            Ok(id) => id,
+            Err(e) => {
+                unsafe { set_err(err_out, &format!("identity provisioning failed: {e}")) };
+                return std::ptr::null_mut();
+            }
+        };
+    let config = veil_cfg::Config {
+        identity: Some(identity),
+        ..veil_cfg::Config::default()
+    };
+    let toml = match veil_cfg::render_config_to_string(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("config render failed: {e}")) };
+            return std::ptr::null_mut();
+        }
+    };
+    match CString::new(toml) {
+        Ok(c) => c.into_raw(),
+        Err(_) => {
+            unsafe { set_err(err_out, "rendered config contained a NUL byte") };
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Read a `(ptr, len)` UTF-8 argument into an owned `String`, or set `*err_out`
 /// and return `None`. `what` names the argument for the error message.
 unsafe fn read_arg(
@@ -564,6 +652,65 @@ pub unsafe extern "C" fn veil_node_stop(node: *mut VeilNode) {
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    /// Onboarding-phrase epic P2: the identity config is DETERMINISTIC in the
+    /// phrase (same public_key + node_id across calls — a later restore lands
+    /// on the same identity), the caller's phrase buffer is scrubbed, and a
+    /// garbage phrase is rejected.
+    #[test]
+    fn config_init_from_phrase_is_deterministic_in_the_phrase() {
+        let mut phrase_ptr: *mut c_char = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { crate::veil_generate_master_phrase(&mut phrase_ptr, &mut err) };
+        assert_eq!(rc, crate::VEIL_OK);
+        let phrase = unsafe { CStr::from_ptr(phrase_ptr) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        unsafe { crate::veil_free_string(phrase_ptr) };
+
+        fn init(phrase: &str) -> String {
+            let mut buf = phrase.as_bytes().to_vec();
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let toml_ptr = unsafe {
+                veil_config_init_from_phrase_zeroize(buf.as_mut_ptr(), buf.len(), 1, &mut err)
+            };
+            assert!(!toml_ptr.is_null(), "init from phrase failed");
+            assert!(
+                buf.iter().all(|b| *b == 0),
+                "caller phrase buffer must be scrubbed"
+            );
+            let s = unsafe { CStr::from_ptr(toml_ptr) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            unsafe { crate::veil_free_string(toml_ptr) };
+            s
+        }
+        fn field(toml: &str, key: &str) -> String {
+            toml.lines()
+                .find(|l| l.trim_start().starts_with(key))
+                .unwrap_or_else(|| panic!("no {key} in config"))
+                .trim()
+                .to_string()
+        }
+
+        let a = init(&phrase);
+        let b = init(&phrase);
+        assert_eq!(field(&a, "public_key"), field(&b, "public_key"));
+        assert_eq!(field(&a, "node_id"), field(&b, "node_id"));
+
+        // Garbage phrase → NULL + error, buffer still scrubbed.
+        let mut junk = b"not a phrase at all".to_vec();
+        let mut err2: *mut c_char = std::ptr::null_mut();
+        let p = unsafe {
+            veil_config_init_from_phrase_zeroize(junk.as_mut_ptr(), junk.len(), 1, &mut err2)
+        };
+        assert!(p.is_null());
+        assert!(!err2.is_null());
+        assert!(junk.iter().all(|b| *b == 0));
+        unsafe { crate::veil_free_string(err2) };
+    }
 
     #[test]
     fn start_rejects_unreadable_config() {

@@ -123,6 +123,46 @@ impl IdentityUseCases {
         })
     }
 
+    /// Provision from an EXPLICIT Ed25519 secret seed (32 bytes): the same
+    /// shape as [`Self::provision`], but the keypair is caller-derived — the
+    /// master-phrase onboarding path, where `node_id` must be DETERMINISTIC
+    /// in the phrase — and only the anti-sybil nonce is searched.
+    pub fn provision_ed25519_from_secret(
+        &self,
+        sk_seed: &[u8; 32],
+        progress: Option<mpsc::Sender<crypto::PowProgress>>,
+    ) -> cfg::Result<IdentityConfig> {
+        let algo = SignatureAlgorithm::Ed25519;
+        let keypair = crypto::ed25519_keypair_from_seed(sk_seed);
+        let node_id = cfg::NodeId::from_public_key(algo, &keypair.public_key)?;
+        let nonce = self
+            .search_for_explicit_key_material(
+                ExplicitKeyMaterial {
+                    algo,
+                    public_key: keypair.public_key.clone(),
+                    private_key: keypair.private_key.clone(),
+                },
+                crypto::Base64Nonce::zero(),
+                progress,
+            )?
+            .best_nonce
+            .into_inner();
+        Ok(IdentityConfig {
+            algo,
+            role: Default::default(),
+            public_key: keypair.public_key,
+            private_key: keypair.private_key,
+            nonce,
+            node_id: Some(node_id),
+            key_passphrase: None,
+            key_passphrase_file: None,
+            key_passphrase_prompt: false,
+            // Same rationale as [provision]: lazy mining is app-opt-in.
+            lazy_mining: false,
+            max_lazy_difficulty: crate::model::default_max_lazy_difficulty(),
+        })
+    }
+
     pub fn recompute_nonce(&self, identity: &mut IdentityConfig) -> cfg::Result<bool> {
         let result = self.search_for_explicit_key_material(
             ExplicitKeyMaterial {
