@@ -139,6 +139,10 @@ class _HomeState extends State<_Home> {
         // BG-handler integration).  Real BGProcessingTask consumers
         // subscribe through VeilPush.handleWakeup's onWake hook.
         break;
+      case VeilEventKind.mailboxWake:
+        // The example has no platform push-token setup; a real app forwards
+        // this wake event to its mailbox-drain coordinator.
+        break;
       case VeilEventKind.unknown:
         break;
     }

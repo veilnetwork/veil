@@ -23,9 +23,10 @@ pragma_once = true
 # manually list only what's actually referenced in the generated body:
 #   stdint.h  → uint8/16/32/64_t
 #   stddef.h  → size_t
+#   stdbool.h → bool (`veil_node_start_deferred`)
 #   sys/types.h → ssize_t (POSIX; Windows consumers typically alias).
 no_includes = true
-sys_includes = ["stdint.h", "stddef.h", "sys/types.h"]
+sys_includes = ["stdint.h", "stddef.h", "stdbool.h", "sys/types.h"]
 documentation = true
 documentation_style = "doxy"
 style = "type"
