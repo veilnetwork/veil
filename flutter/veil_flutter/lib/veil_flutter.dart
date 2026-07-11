@@ -29,6 +29,7 @@ export 'src/client.dart'
     show VeilClient, AppHandle, veilSealBytes, veilUnsealBytes;
 export 'src/identity.dart'
     show
+        generateMasterPhrase,
         hasBip39WordCount,
         restoreIdentity,
         restoreIdentityEncrypted,

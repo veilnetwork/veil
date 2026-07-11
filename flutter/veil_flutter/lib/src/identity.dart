@@ -27,6 +27,47 @@ import 'package:ffi/ffi.dart';
 import 'bindings.dart' as ffi;
 import 'types.dart';
 
+/// Generate a FRESH 24-word master phrase (new random master seed encoded
+/// with veil's master-phrase checksum).  The native seed material is
+/// zeroized inside the call — the returned phrase is its ONLY
+/// representation.  Onboarding flow: show it for the paper backup, confirm,
+/// then create the identity deterministically via [restoreIdentity] with
+/// this same phrase, so a fresh onboarding and a later disaster-recovery
+/// restore agree on the node_id.
+///
+/// The malloc'd native buffer is scrubbed and freed before returning; the
+/// immutable Dart String survives (same unavoidable posture as
+/// [validateBip39Phrase]'s input).
+///
+/// Throws [VeilException] on failure (rare — would indicate a bug).
+String generateMasterPhrase() {
+  final phraseOut = calloc<Pointer<Utf8>>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final rc = ffi.veilGenerateMasterPhrase(phraseOut, errOut);
+    if (rc != ffi.veilOk) {
+      final errPtr = errOut.value;
+      final msg = errPtr == nullptr ? '<no detail>' : errPtr.toDartString();
+      if (errPtr != nullptr) ffi.veilFreeString(errPtr);
+      throw VeilException(msg, code: rc);
+    }
+    final ptr = phraseOut.value;
+    final phrase = ptr.toDartString();
+    // Scrub the native copy (ASCII mnemonic → byte length == char length),
+    // then free it. The window of the plaintext in native heap collapses to
+    // this call.
+    final bytes = ptr.cast<Uint8>();
+    for (var i = 0; i < phrase.length; i++) {
+      bytes[i] = 0;
+    }
+    ffi.veilFreeString(ptr);
+    return phrase;
+  } finally {
+    calloc.free(phraseOut);
+    calloc.free(errOut);
+  }
+}
+
 /// Validate a BIP-39 master phrase synchronously (no disk I/O, no
 /// daemon).  Returns `true` if the phrase is exactly 24 words from
 /// the English BIP-39 wordlist AND the checksum verifies.
