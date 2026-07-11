@@ -31,4 +31,47 @@ void main() {
         ? 'set VEIL_FFI_DYLIB to run native FFI coverage'
         : false,
   );
+
+  test(
+    'encrypted hybrid bundle opens, signs and rejects wrong phrase',
+    () {
+      final phrase = generateMasterPhrase();
+      final bundle = createHybrid512SovereignBundle(phrase);
+      expect(bundle, isNotEmpty);
+      final signer = VeilSovereignSigner.openBundle(bundle, phrase);
+      expect(signer.algorithm, 'ed25519+falcon512');
+      expect(signer.nodeId, hasLength(32));
+      expect(signer.publicKey, hasLength(929));
+      final message = Uint8List.fromList('hybrid-membership-v2'.codeUnits);
+      final signature = signer.sign(message);
+      expect(signature.length, greaterThan(64));
+      expect(
+        verifySovereignSignature(
+          algorithm: signer.algorithm,
+          nodeId: signer.nodeId,
+          publicKey: signer.publicKey,
+          message: message,
+          signature: signature,
+        ),
+        isTrue,
+      );
+      signer.close();
+
+      expect(
+        () => VeilSovereignSigner.openBundle(
+          bundle,
+          generateMasterPhrase(),
+        ),
+        throwsA(isA<VeilException>()),
+      );
+      final tampered = Uint8List.fromList(bundle)..last ^= 1;
+      expect(
+        () => VeilSovereignSigner.openBundle(tampered, phrase),
+        throwsA(isA<VeilException>()),
+      );
+    },
+    skip: nativeDylib == null || nativeDylib.isEmpty
+        ? 'set VEIL_FFI_DYLIB to run native FFI coverage'
+        : false,
+  );
 }

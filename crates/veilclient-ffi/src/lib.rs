@@ -66,6 +66,7 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use zeroize::Zeroizing;
 
 // Phase 6.49 unified FFI boundary helpers.  See module-level doc for
 // migration plan; new FFI fns use these directly, existing fns
@@ -166,7 +167,12 @@ struct RuntimeBundle {
 /// derived seed never crosses the FFI boundary and is zeroized when the last
 /// in-flight operation releases this handle.
 pub struct VeilSovereignSigner {
-    sk_seed: zeroize::Zeroizing<[u8; 32]>,
+    key: SovereignSignerKey,
+}
+
+enum SovereignSignerKey {
+    RecoveryEd25519(zeroize::Zeroizing<[u8; 32]>),
+    Bundle(veil_identity::sovereign_bundle::SovereignMaterial),
 }
 
 impl Drop for RuntimeBundle {
@@ -842,14 +848,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         "peer_node_id" => peer_node_id,
         "peer_app_id" => peer_app_id,
     );
-    get_or_return!(
-        app_ref,
-        app_table(),
-        app,
-        err_out,
-        0u64,
-        "VeilApp"
-    );
+    get_or_return!(app_ref, app_table(), app, err_out, 0u64, "VeilApp");
     let mut peer = [0u8; 32];
     let mut peer_app = [0u8; 32];
     unsafe {
@@ -872,7 +871,9 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             let Some(sender) = guard.as_ref() else {
                 break;
             };
-            let _ = sender.send_owned(peer, peer_app, peer_endpoint_id, pkt).await;
+            let _ = sender
+                .send_owned(peer, peer_app, peer_endpoint_id, pkt)
+                .await;
         }
     });
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3923,10 +3924,7 @@ pub unsafe extern "C" fn veil_nickname_normalize(
 /// The cumulative PoW weight a name of this length must carry (the anti-squat
 /// floor) — the host mines until it reaches this. 0 on a bad name.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_nickname_length_floor(
-    name: *const u8,
-    name_len: size_t,
-) -> u64 {
+pub unsafe extern "C" fn veil_nickname_length_floor(name: *const u8, name_len: size_t) -> u64 {
     if name.is_null() {
         return 0;
     }
@@ -6255,7 +6253,9 @@ pub unsafe extern "C" fn veil_sovereign_signer_open_from_phrase_zeroize(
     let node_id = veil_crypto::identity::compute_node_id(&public_key);
     let token = HandleTable::insert(
         sovereign_signer_table(),
-        VeilSovereignSigner { sk_seed },
+        VeilSovereignSigner {
+            key: SovereignSignerKey::RecoveryEd25519(sk_seed),
+        },
     );
     unsafe {
         ptr::copy_nonoverlapping(node_id.as_ptr(), out_node_id, 32);
@@ -6290,11 +6290,249 @@ pub unsafe extern "C" fn veil_sovereign_signer_sign(
         unsafe { write_err(err_out, "sovereign signer is closed or invalid") };
         return VEIL_ERR_CLOSED;
     };
-    use ed25519_dalek::Signer as _;
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&live.sk_seed);
     let message = unsafe { std::slice::from_raw_parts(message, message_len) };
+    let SovereignSignerKey::RecoveryEd25519(sk_seed) = &live.key else {
+        unsafe { write_err(err_out, "use variable-length signer API for bundle signer") };
+        return VEIL_ERR_INVALID_ARG;
+    };
+    use ed25519_dalek::Signer as _;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(sk_seed);
     let signature = signing_key.sign(message).to_bytes();
     unsafe { ptr::copy_nonoverlapping(signature.as_ptr(), out_signature, 64) };
+    VEIL_OK
+}
+
+/// Create a portable Ed25519+Falcon512 sovereign bundle encrypted with the
+/// recovery phrase. The mutable phrase is wiped on every path. The returned
+/// ciphertext buffer is freed with [`veil_free_buf`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_sovereign_bundle_create_hybrid512_zeroize(
+    phrase: *mut u8,
+    phrase_len: size_t,
+    out_bundle: *mut *mut u8,
+    out_bundle_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    if !out_bundle.is_null() {
+        unsafe { *out_bundle = ptr::null_mut() }
+    }
+    if !out_bundle_len.is_null() {
+        unsafe { *out_bundle_len = 0 }
+    }
+    if phrase.is_null()
+        || phrase_len > MAX_FFI_CSTR_LEN
+        || out_bundle.is_null()
+        || out_bundle_len.is_null()
+    {
+        if !phrase.is_null() && phrase_len <= MAX_FFI_CSTR_LEN {
+            unsafe { volatile_wipe(phrase, phrase_len) };
+        }
+        unsafe { write_err(err_out, "invalid sovereign bundle create arguments") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let owned = Zeroizing::new(
+        unsafe { std::slice::from_raw_parts(phrase.cast_const(), phrase_len) }.to_vec(),
+    );
+    unsafe { volatile_wipe(phrase, phrase_len) };
+    match veil_identity::sovereign_bundle::create_hybrid512(&owned) {
+        Ok(bundle) => {
+            let boxed = bundle.into_boxed_slice();
+            let len = boxed.len();
+            unsafe {
+                *out_bundle = Box::into_raw(boxed).cast();
+                *out_bundle_len = len;
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe { write_err(err_out, e.to_string()) };
+            VEIL_ERR
+        }
+    }
+}
+
+/// Decrypt a local sovereign bundle and open a short-lived variable-algorithm
+/// signer. Neither phrase nor plaintext key material crosses back to the host.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_sovereign_signer_open_bundle_zeroize(
+    bundle: *const u8,
+    bundle_len: size_t,
+    phrase: *mut u8,
+    phrase_len: size_t,
+    out_signer: *mut *mut VeilSovereignSigner,
+    out_algorithm: *mut u8,
+    out_node_id: *mut u8,
+    out_node_id_cap: size_t,
+    out_public_key: *mut u8,
+    out_public_key_cap: size_t,
+    out_public_key_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    if !out_signer.is_null() {
+        unsafe { *out_signer = ptr::null_mut() }
+    }
+    if !out_public_key_len.is_null() {
+        unsafe { *out_public_key_len = 0 }
+    }
+    if bundle.is_null()
+        || bundle_len == 0
+        || bundle_len > 16 * 1024
+        || phrase.is_null()
+        || phrase_len > MAX_FFI_CSTR_LEN
+        || out_signer.is_null()
+        || out_algorithm.is_null()
+        || out_node_id.is_null()
+        || out_node_id_cap < 32
+        || out_public_key.is_null()
+        || out_public_key_len.is_null()
+    {
+        if !phrase.is_null() && phrase_len <= MAX_FFI_CSTR_LEN {
+            unsafe { volatile_wipe(phrase, phrase_len) };
+        }
+        unsafe { write_err(err_out, "invalid sovereign bundle open arguments") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let owned_phrase = Zeroizing::new(
+        unsafe { std::slice::from_raw_parts(phrase.cast_const(), phrase_len) }.to_vec(),
+    );
+    unsafe { volatile_wipe(phrase, phrase_len) };
+    let encrypted = unsafe { std::slice::from_raw_parts(bundle, bundle_len) };
+    let material = match veil_identity::sovereign_bundle::open(encrypted, &owned_phrase) {
+        Ok(value) => value,
+        Err(e) => {
+            unsafe { write_err(err_out, e.to_string()) };
+            return VEIL_ERR;
+        }
+    };
+    if material.public_key.len() > out_public_key_cap {
+        unsafe { write_err(err_out, "sovereign public-key output buffer too small") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let node_id = material.node_id();
+    let algorithm = material.algorithm.wire_byte();
+    let public_key_len = material.public_key.len();
+    unsafe {
+        ptr::copy_nonoverlapping(node_id.as_ptr(), out_node_id, 32);
+        ptr::copy_nonoverlapping(material.public_key.as_ptr(), out_public_key, public_key_len);
+        *out_algorithm = algorithm;
+        *out_public_key_len = public_key_len;
+    }
+    let token = HandleTable::insert(
+        sovereign_signer_table(),
+        VeilSovereignSigner {
+            key: SovereignSignerKey::Bundle(material),
+        },
+    );
+    unsafe { *out_signer = token as *mut VeilSovereignSigner };
+    VEIL_OK
+}
+
+/// Variable-length sovereign signature API. `out_signature_len` receives the
+/// exact number of bytes written (64 for Ed25519, ~700-830 for hybrid-512).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_sovereign_signer_sign_into(
+    signer: *mut VeilSovereignSigner,
+    message: *const u8,
+    message_len: size_t,
+    out_signature: *mut u8,
+    out_signature_cap: size_t,
+    out_signature_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    if !out_signature_len.is_null() {
+        unsafe { *out_signature_len = 0 }
+    }
+    if signer.is_null()
+        || message.is_null()
+        || message_len > VEIL_MAX_DATA_LEN
+        || out_signature.is_null()
+        || out_signature_len.is_null()
+    {
+        unsafe { write_err(err_out, "invalid sovereign signer sign-into arguments") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let Some(live) = HandleTable::get(sovereign_signer_table(), signer as usize) else {
+        unsafe { write_err(err_out, "sovereign signer is closed or invalid") };
+        return VEIL_ERR_CLOSED;
+    };
+    let message = unsafe { std::slice::from_raw_parts(message, message_len) };
+    let signature = match &live.key {
+        SovereignSignerKey::RecoveryEd25519(seed) => {
+            use ed25519_dalek::Signer as _;
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .sign(message)
+                .to_bytes()
+                .to_vec()
+        }
+        SovereignSignerKey::Bundle(material) => match material.sign(message) {
+            Ok(value) => value,
+            Err(e) => {
+                unsafe { write_err(err_out, e.to_string()) };
+                return VEIL_ERR;
+            }
+        },
+    };
+    if signature.len() > out_signature_cap {
+        unsafe { write_err(err_out, "sovereign signature output buffer too small") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(signature.as_ptr(), out_signature, signature.len());
+        *out_signature_len = signature.len();
+    }
+    VEIL_OK
+}
+
+/// Verify an algorithm-tagged sovereign signature and bind the supplied node
+/// id to the full public key. Invalid signatures return VEIL_OK + false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_sovereign_verify(
+    algorithm: u8,
+    node_id: *const u8,
+    public_key: *const u8,
+    public_key_len: size_t,
+    message: *const u8,
+    message_len: size_t,
+    signature: *const u8,
+    signature_len: size_t,
+    out_valid: *mut bool,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    if !out_valid.is_null() {
+        unsafe { *out_valid = false }
+    }
+    if node_id.is_null()
+        || public_key.is_null()
+        || public_key_len > 4096
+        || message.is_null()
+        || message_len > VEIL_MAX_DATA_LEN
+        || signature.is_null()
+        || signature_len > 4096
+        || out_valid.is_null()
+    {
+        unsafe { write_err(err_out, "invalid sovereign verify arguments") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let Some(algorithm) = veil_types::SignatureAlgorithm::from_wire_byte(algorithm) else {
+        return VEIL_OK;
+    };
+    let expected_node = unsafe { std::slice::from_raw_parts(node_id, 32) };
+    let public_key = unsafe { std::slice::from_raw_parts(public_key, public_key_len) };
+    if veil_crypto::identity::compute_node_id(public_key).as_slice() != expected_node {
+        return VEIL_OK;
+    }
+    let message = unsafe { std::slice::from_raw_parts(message, message_len) };
+    let signature = unsafe { std::slice::from_raw_parts(signature, signature_len) };
+    use base64::Engine as _;
+    let public_b64 = base64::engine::general_purpose::STANDARD.encode(public_key);
+    unsafe {
+        *out_valid =
+            veil_crypto::verify_message(algorithm, &public_b64, message, signature).is_ok();
+    }
     VEIL_OK
 }
 
@@ -7704,6 +7942,105 @@ mod tests {
         assert!(phrase_buf.iter().all(|byte| *byte == 0));
         assert!(!err.is_null());
         unsafe { veil_free_string(err) };
+    }
+
+    #[test]
+    fn sovereign_hybrid_bundle_ffi_round_trip_is_variable_length_and_zeroizing() {
+        let phrase = fresh_phrase();
+        let mut create_phrase = phrase.as_bytes().to_vec();
+        let create_len = create_phrase.len();
+        let mut bundle_ptr: *mut u8 = ptr::null_mut();
+        let mut bundle_len = 0usize;
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_sovereign_bundle_create_hybrid512_zeroize(
+                create_phrase.as_mut_ptr(),
+                create_len,
+                &mut bundle_ptr,
+                &mut bundle_len,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert!(err.is_null());
+        assert!(create_phrase.iter().all(|byte| *byte == 0));
+        assert!(!bundle_ptr.is_null());
+        let bundle = unsafe { std::slice::from_raw_parts(bundle_ptr, bundle_len) };
+
+        let mut open_phrase = phrase.as_bytes().to_vec();
+        let open_len = open_phrase.len();
+        let mut signer: *mut VeilSovereignSigner = ptr::null_mut();
+        let mut algorithm = 0u8;
+        let mut node_id = [0u8; 32];
+        let mut public_key = [0u8; 1024];
+        let mut public_key_len = 0usize;
+        let rc = unsafe {
+            veil_sovereign_signer_open_bundle_zeroize(
+                bundle.as_ptr(),
+                bundle.len(),
+                open_phrase.as_mut_ptr(),
+                open_len,
+                &mut signer,
+                &mut algorithm,
+                node_id.as_mut_ptr(),
+                node_id.len(),
+                public_key.as_mut_ptr(),
+                public_key.len(),
+                &mut public_key_len,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert!(err.is_null());
+        assert!(open_phrase.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            algorithm,
+            veil_types::SignatureAlgorithm::Ed25519Falcon512Hybrid.wire_byte()
+        );
+        assert_eq!(public_key_len, 929);
+        assert_eq!(
+            node_id,
+            veil_crypto::identity::compute_node_id(&public_key[..public_key_len])
+        );
+
+        let message = b"xveil-sovereign-hybrid-probe";
+        let mut signature = [0u8; 1024];
+        let mut signature_len = 0usize;
+        let rc = unsafe {
+            veil_sovereign_signer_sign_into(
+                signer,
+                message.as_ptr(),
+                message.len(),
+                signature.as_mut_ptr(),
+                signature.len(),
+                &mut signature_len,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert!(signature_len > 64);
+        let mut valid = false;
+        let rc = unsafe {
+            veil_sovereign_verify(
+                algorithm,
+                node_id.as_ptr(),
+                public_key.as_ptr(),
+                public_key_len,
+                message.as_ptr(),
+                message.len(),
+                signature.as_ptr(),
+                signature_len,
+                &mut valid,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert!(valid);
+
+        unsafe {
+            veil_sovereign_signer_close(signer);
+            veil_free_buf(bundle_ptr, bundle_len);
+        }
     }
 
     // (validate accept/garbage/null are covered by the `phase647_h8_*` zeroize

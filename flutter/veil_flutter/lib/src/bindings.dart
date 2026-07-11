@@ -790,6 +790,106 @@ final Pointer<NativeFunction<Void Function(Pointer<Void>)>>
 final void Function(Pointer<Void>) veilSovereignSignerClose =
     veilSovereignSignerClosePointer.asFunction();
 
+final int Function(
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Uint8>>,
+  Pointer<IntPtr>,
+  Pointer<Pointer<Utf8>>,
+) veilSovereignBundleCreateHybrid512Zeroize = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Uint8>>,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_sovereign_bundle_create_hybrid512_zeroize')
+    .asFunction();
+
+final int Function(
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<VeilSovereignSigner>>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<IntPtr>,
+  Pointer<Pointer<Utf8>>,
+) veilSovereignSignerOpenBundleZeroize = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<VeilSovereignSigner>>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_sovereign_signer_open_bundle_zeroize')
+    .asFunction();
+
+final int Function(
+  Pointer<VeilSovereignSigner>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<IntPtr>,
+  Pointer<Pointer<Utf8>>,
+) veilSovereignSignerSignInto = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilSovereignSigner>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_sovereign_signer_sign_into')
+    .asFunction();
+
+final int Function(
+  int,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Bool>,
+  Pointer<Pointer<Utf8>>,
+) veilSovereignVerify = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Uint8,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Bool>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_sovereign_verify')
+    .asFunction();
+
 // ── Native SHA-256 (content-manifest hashing) ───────────────────────────────
 
 final int Function(
