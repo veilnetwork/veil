@@ -50,6 +50,9 @@ veil-cfg = { path = "../veil-cfg", optional = true }
 # Audit L-15: wrap the in-flight password copy in `Zeroizing` so the
 # `_zeroize_with_password` restore path scrubs every copy on drop.
 zeroize = "1"
+# Short-lived sovereign signing handles keep the Ed25519 seed behind the FFI
+# boundary and sign raw control bytes without base64-encoding private material.
+ed25519-dalek = { version = "2.1", features = ["zeroize"] }
 # Native SHA-256 for the app's content-manifest hashing (`veil_sha256`):
 # Dart's pure `package:crypto` digests at ~35 MB/s on a phone, which made
 # hashing a 64 MiB file (~1.8 s) the dominant pre-offer latency of a send.

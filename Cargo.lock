@@ -4819,6 +4819,7 @@ dependencies = [
  "android_logger",
  "base64",
  "chacha20poly1305",
+ "ed25519-dalek",
  "libc",
  "log",
  "rand_core 0.6.4",

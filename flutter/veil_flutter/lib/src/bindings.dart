@@ -61,6 +61,8 @@ final class VeilApp extends Opaque {}
 
 final class VeilStreamFfi extends Opaque {}
 
+final class VeilSovereignSigner extends Opaque {}
+
 // ── Callback typedefs ────────────────────────────────────────────────────────
 
 typedef VeilRecvCbNative = Void Function(
@@ -714,6 +716,79 @@ int veilRestoreIdentityFromPhraseZeroizeWithPassword(
         password == nullptr ? nullptr : password.cast<Uint8>(),
         password == nullptr ? 0 : password.length,
         errOut);
+
+// ── Short-lived sovereign signer ───────────────────────────────────────────
+
+final int Function(
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<VeilSovereignSigner>>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) _sovereignSignerOpenFromPhraseZeroizeNative = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<VeilSovereignSigner>>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_sovereign_signer_open_from_phrase_zeroize')
+    .asFunction();
+
+int veilSovereignSignerOpenFromPhraseZeroize(
+  Pointer<Utf8> phrase,
+  Pointer<Pointer<VeilSovereignSigner>> outSigner,
+  Pointer<Uint8> outNodeId,
+  Pointer<Uint8> outPublicKey,
+  Pointer<Pointer<Utf8>> errOut,
+) =>
+    _sovereignSignerOpenFromPhraseZeroizeNative(
+      phrase.cast<Uint8>(),
+      phrase.length,
+      outSigner,
+      outNodeId,
+      32,
+      outPublicKey,
+      32,
+      errOut,
+    );
+
+final int Function(
+  Pointer<VeilSovereignSigner>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilSovereignSignerSign = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilSovereignSigner>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_sovereign_signer_sign')
+    .asFunction();
+
+final Pointer<NativeFunction<Void Function(Pointer<Void>)>>
+    veilSovereignSignerClosePointer =
+    nativeLib.lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+  'veil_sovereign_signer_close',
+);
+
+final void Function(Pointer<Void>) veilSovereignSignerClose =
+    veilSovereignSignerClosePointer.asFunction();
 
 // ── Native SHA-256 (content-manifest hashing) ───────────────────────────────
 

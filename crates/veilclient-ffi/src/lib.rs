@@ -162,6 +162,13 @@ struct RuntimeBundle {
     pending_mailbox_fetch: StdMutex<Option<Vec<veilclient::MailboxBlobInfo>>>,
 }
 
+/// Short-lived sovereign signing burst opened from a recovery phrase. The
+/// derived seed never crosses the FFI boundary and is zeroized when the last
+/// in-flight operation releases this handle.
+pub struct VeilSovereignSigner {
+    sk_seed: zeroize::Zeroizing<[u8; 32]>,
+}
+
 impl Drop for RuntimeBundle {
     fn drop(&mut self) {
         // SAFETY: `drop` runs exactly once per value; we take the Runtime out
@@ -339,6 +346,11 @@ fn stream_table() -> &'static StdMutex<HandleTable<VeilStreamFfi>> {
 
 fn anon_stream_table() -> &'static StdMutex<HandleTable<VeilAnonStreamFfi>> {
     static T: OnceLock<StdMutex<HandleTable<VeilAnonStreamFfi>>> = OnceLock::new();
+    T.get_or_init(|| StdMutex::new(HandleTable::new()))
+}
+
+fn sovereign_signer_table() -> &'static StdMutex<HandleTable<VeilSovereignSigner>> {
+    static T: OnceLock<StdMutex<HandleTable<VeilSovereignSigner>>> = OnceLock::new();
     T.get_or_init(|| StdMutex::new(HandleTable::new()))
 }
 
@@ -6181,6 +6193,124 @@ pub unsafe extern "C" fn veil_restore_identity_from_phrase_zeroize_with_password
     }
 }
 
+// ── One-burst sovereign signing FFI ────────────────────────────
+
+/// Open a short-lived sovereign signer from a recovery phrase.
+///
+/// The writable phrase buffer is wiped on every path. Only an opaque handle,
+/// the public key, and its node id cross back to the caller; the decoded master
+/// seed and derived signing seed remain in native memory and zeroize on drop.
+/// Call [`veil_sovereign_signer_close`] immediately after the membership-signing
+/// burst.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_sovereign_signer_open_from_phrase_zeroize(
+    phrase: *mut u8,
+    phrase_len: size_t,
+    out_signer: *mut *mut VeilSovereignSigner,
+    out_node_id: *mut u8,
+    out_node_id_cap: size_t,
+    out_public_key: *mut u8,
+    out_public_key_cap: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    if !out_signer.is_null() {
+        unsafe { *out_signer = ptr::null_mut() };
+    }
+    if phrase.is_null()
+        || out_signer.is_null()
+        || out_node_id.is_null()
+        || out_public_key.is_null()
+        || out_node_id_cap < 32
+        || out_public_key_cap < 32
+        || phrase_len > MAX_FFI_CSTR_LEN
+    {
+        unsafe { write_err(err_out, "invalid sovereign signer open arguments") };
+        if !phrase.is_null() && phrase_len <= MAX_FFI_CSTR_LEN {
+            unsafe { volatile_wipe(phrase, phrase_len) };
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let owned = zeroize::Zeroizing::new(
+        unsafe { std::slice::from_raw_parts(phrase as *const u8, phrase_len) }.to_vec(),
+    );
+    unsafe { volatile_wipe(phrase, phrase_len) };
+    let phrase_str = match std::str::from_utf8(&owned) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe { write_err(err_out, "phrase is not valid UTF-8") };
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let master_seed = match veil_identity::master_seed::decode_master_seed_from_phrase(phrase_str) {
+        Ok(seed) => seed,
+        Err(e) => {
+            unsafe { write_err(err_out, format!("invalid phrase: {e}")) };
+            return VEIL_ERR;
+        }
+    };
+    let sk_seed = veil_crypto::identity::derive_master_sk_ed25519(&master_seed);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+    let public_key = signing_key.verifying_key().to_bytes();
+    let node_id = veil_crypto::identity::compute_node_id(&public_key);
+    let token = HandleTable::insert(
+        sovereign_signer_table(),
+        VeilSovereignSigner { sk_seed },
+    );
+    unsafe {
+        ptr::copy_nonoverlapping(node_id.as_ptr(), out_node_id, 32);
+        ptr::copy_nonoverlapping(public_key.as_ptr(), out_public_key, 32);
+        *out_signer = token as *mut VeilSovereignSigner;
+    }
+    VEIL_OK
+}
+
+/// Sign one message during an open sovereign burst. The output is a raw
+/// 64-byte Ed25519 signature.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_sovereign_signer_sign(
+    signer: *mut VeilSovereignSigner,
+    message: *const u8,
+    message_len: size_t,
+    out_signature: *mut u8,
+    out_signature_cap: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    if signer.is_null()
+        || message.is_null()
+        || message_len > VEIL_MAX_DATA_LEN
+        || out_signature.is_null()
+        || out_signature_cap < 64
+    {
+        unsafe { write_err(err_out, "invalid sovereign signer sign arguments") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let Some(live) = HandleTable::get(sovereign_signer_table(), signer as usize) else {
+        unsafe { write_err(err_out, "sovereign signer is closed or invalid") };
+        return VEIL_ERR_CLOSED;
+    };
+    use ed25519_dalek::Signer as _;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&live.sk_seed);
+    let message = unsafe { std::slice::from_raw_parts(message, message_len) };
+    let signature = signing_key.sign(message).to_bytes();
+    unsafe { ptr::copy_nonoverlapping(signature.as_ptr(), out_signature, 64) };
+    VEIL_OK
+}
+
+/// Close a sovereign signing burst. Double-close and stale handles are safe
+/// no-ops; the generational table prevents ABA reuse.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_sovereign_signer_close(signer: *mut VeilSovereignSigner) {
+    if signer.is_null() {
+        return;
+    }
+    drop(HandleTable::remove(
+        sovereign_signer_table(),
+        signer as usize,
+    ));
+}
+
 // ── Multi-device pairing FFI (Epic 489.8) ──────────────────────
 
 /// Wire-byte status codes for Source-side pairing ops.  Mirror
@@ -7480,6 +7610,100 @@ mod tests {
         let mnemonic =
             veil_identity::master_seed::encode_master_seed_to_phrase(&seed).expect("seed → phrase");
         std::ffi::CString::new(mnemonic.to_string()).unwrap()
+    }
+
+    #[test]
+    fn sovereign_signer_is_one_burst_phrase_bound_and_zeroizing() {
+        let phrase = fresh_phrase();
+        let mut phrase_buf = phrase.as_bytes().to_vec();
+        let phrase_len = phrase_buf.len();
+        let mut signer: *mut VeilSovereignSigner = ptr::null_mut();
+        let mut node_id = [0u8; 32];
+        let mut public_key = [0u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+
+        let rc = unsafe {
+            veil_sovereign_signer_open_from_phrase_zeroize(
+                phrase_buf.as_mut_ptr(),
+                phrase_len,
+                &mut signer,
+                node_id.as_mut_ptr(),
+                node_id.len(),
+                public_key.as_mut_ptr(),
+                public_key.len(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert!(err.is_null());
+        assert!(!signer.is_null());
+        assert!(phrase_buf.iter().all(|byte| *byte == 0));
+        assert_eq!(node_id, veil_crypto::identity::compute_node_id(&public_key));
+
+        let message = b"xveil-device-membership-v2";
+        let mut signature = [0u8; 64];
+        let rc = unsafe {
+            veil_sovereign_signer_sign(
+                signer,
+                message.as_ptr(),
+                message.len(),
+                signature.as_mut_ptr(),
+                signature.len(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert!(err.is_null());
+        ed25519_dalek::VerifyingKey::from_bytes(&public_key)
+            .expect("valid sovereign public key")
+            .verify_strict(message, &ed25519_dalek::Signature::from_bytes(&signature))
+            .expect("signature verifies against exported public key");
+
+        unsafe { veil_sovereign_signer_close(signer) };
+        let rc = unsafe {
+            veil_sovereign_signer_sign(
+                signer,
+                message.as_ptr(),
+                message.len(),
+                signature.as_mut_ptr(),
+                signature.len(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_CLOSED);
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+            veil_sovereign_signer_close(signer);
+        }
+    }
+
+    #[test]
+    fn sovereign_signer_rejects_invalid_phrase_after_wiping_it() {
+        let mut phrase_buf = b"not a recovery phrase".to_vec();
+        let phrase_len = phrase_buf.len();
+        let mut signer: *mut VeilSovereignSigner = ptr::null_mut();
+        let mut node_id = [0u8; 32];
+        let mut public_key = [0u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+
+        let rc = unsafe {
+            veil_sovereign_signer_open_from_phrase_zeroize(
+                phrase_buf.as_mut_ptr(),
+                phrase_len,
+                &mut signer,
+                node_id.as_mut_ptr(),
+                node_id.len(),
+                public_key.as_mut_ptr(),
+                public_key.len(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR);
+        assert!(signer.is_null());
+        assert!(phrase_buf.iter().all(|byte| *byte == 0));
+        assert!(!err.is_null());
+        unsafe { veil_free_string(err) };
     }
 
     // (validate accept/garbage/null are covered by the `phase647_h8_*` zeroize
