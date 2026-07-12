@@ -1977,6 +1977,42 @@ int veil_sovereign_bundle_create_hybrid512_zeroize(uint8_t *phrase,
 ;
 
 /**
+ * Re-wrap an existing XVSB into an XVRC recovery certificate while preserving
+ * the exact full public key and derived node id. Phrase and recovery-code
+ * buffers are wiped on every path; only encrypted certificate bytes return.
+ */
+
+int veil_sovereign_recovery_certificate_export_zeroize(const uint8_t *bundle,
+                                                       size_t bundle_len,
+                                                       uint8_t *phrase,
+                                                       size_t phrase_len,
+                                                       uint8_t *recovery_code,
+                                                       size_t recovery_code_len,
+                                                       uint8_t **out_certificate,
+                                                       size_t *out_certificate_len,
+                                                       char **err_out)
+;
+
+/**
+ * Open an XVRC with its independent recovery code as a short-lived hybrid
+ * signer. The code is wiped before return and plaintext material stays native.
+ */
+
+int veil_sovereign_signer_open_recovery_certificate_zeroize(const uint8_t *certificate,
+                                                            size_t certificate_len,
+                                                            uint8_t *recovery_code,
+                                                            size_t recovery_code_len,
+                                                            VeilSovereignSigner **out_signer,
+                                                            uint8_t *out_algorithm,
+                                                            uint8_t *out_node_id,
+                                                            size_t out_node_id_cap,
+                                                            uint8_t *out_public_key,
+                                                            size_t out_public_key_cap,
+                                                            size_t *out_public_key_len,
+                                                            char **err_out)
+;
+
+/**
  * Decrypt a local sovereign bundle and open a short-lived variable-algorithm
  * signer. Neither phrase nor plaintext key material crosses back to the host.
  */

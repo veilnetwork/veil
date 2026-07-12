@@ -813,6 +813,32 @@ final int Function(
   int,
   Pointer<Uint8>,
   int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Uint8>>,
+  Pointer<IntPtr>,
+  Pointer<Pointer<Utf8>>,
+) veilSovereignRecoveryCertificateExportZeroize = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Uint8>>,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_sovereign_recovery_certificate_export_zeroize')
+    .asFunction();
+
+final int Function(
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
   Pointer<Pointer<VeilSovereignSigner>>,
   Pointer<Uint8>,
   Pointer<Uint8>,
@@ -838,6 +864,38 @@ final int Function(
               Pointer<IntPtr>,
               Pointer<Pointer<Utf8>>,
             )>>('veil_sovereign_signer_open_bundle_zeroize')
+    .asFunction();
+
+final int Function(
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<VeilSovereignSigner>>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<IntPtr>,
+  Pointer<Pointer<Utf8>>,
+) veilSovereignSignerOpenRecoveryCertificateZeroize = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<VeilSovereignSigner>>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<IntPtr>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_sovereign_signer_open_recovery_certificate_zeroize')
     .asFunction();
 
 final int Function(
