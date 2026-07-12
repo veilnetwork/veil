@@ -937,6 +937,84 @@ class VeilClient implements Finalizable {
     });
   }
 
+  /// Register a location-anonymous service under a random per-capability
+  /// Ed25519 [identitySeed], never this node's sovereign identity. The caller's
+  /// writable 32-byte list is scrubbed before this method yields; native scrubs
+  /// its FFI copy on every path and retains the seed only in zeroizing runtime
+  /// memory for descriptor refresh. Returns the public `.onion`-like service
+  /// identity suitable for a capability link.
+  Future<Uint8List> registerEphemeralOnionService(
+    Uint8List identitySeed, {
+    int hopCount = 3,
+  }) {
+    _ensureOpen();
+    if (identitySeed.length != 32) {
+      throw ArgumentError('identitySeed must be exactly 32 writable bytes');
+    }
+    final seedPtr = calloc<Uint8>(32);
+    seedPtr.asTypedList(32).setAll(0, identitySeed);
+    identitySeed.fillRange(0, identitySeed.length, 0);
+    return Future(() {
+      final publicKey = calloc<Uint8>(32);
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        final rc = ffi.veilRegisterEphemeralOnionServiceZeroize(
+          _handle,
+          seedPtr,
+          hopCount,
+          publicKey,
+          errOut,
+        );
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+            'register_ephemeral_onion_service failed: '
+            '${_readErrAndFree(errOut)}',
+            code: rc,
+          );
+        }
+        return Uint8List.fromList(publicKey.asTypedList(32));
+      } finally {
+        // Native already zeroes this buffer; repeat before free as a host-side
+        // defense if a future ABI regression returns before its scrub.
+        seedPtr.asTypedList(32).fillRange(0, 32, 0);
+        calloc.free(seedPtr);
+        calloc.free(publicKey);
+        calloc.free(errOut);
+      }
+    });
+  }
+
+  /// Stop refreshing one ephemeral service. Idempotent and deliberately does
+  /// not reveal whether the public key was currently registered.
+  Future<void> withdrawEphemeralOnionService(Uint8List identityVk) async {
+    _ensureOpen();
+    if (identityVk.length != 32) {
+      throw ArgumentError('identityVk must be exactly 32 bytes');
+    }
+    return Future(() {
+      final publicKey = calloc<Uint8>(32)
+        ..asTypedList(32).setAll(0, identityVk);
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        final rc = ffi.veilWithdrawEphemeralOnionService(
+          _handle,
+          publicKey,
+          errOut,
+        );
+        if (rc != ffi.veilOk) {
+          throw VeilException(
+            'withdraw_ephemeral_onion_service failed: '
+            '${_readErrAndFree(errOut)}',
+            code: rc,
+          );
+        }
+      } finally {
+        calloc.free(publicKey);
+        calloc.free(errOut);
+      }
+    });
+  }
+
   /// Register a PLAIN rendezvous-publisher entry (mailbox-by-discovery): the
   /// daemon's maintenance tick signs + publishes a v5 RendezvousAd under THIS
   /// node's real id at [rendezvousNodeId]'s rendezvous slot, advertising the

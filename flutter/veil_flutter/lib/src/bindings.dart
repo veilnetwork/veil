@@ -462,6 +462,42 @@ final int Function(Pointer<VeilHandle>, int, Pointer<Pointer<Utf8>>)
                 )>>('veil_register_onion_service')
         .asFunction();
 
+/// Register a blinded onion service under a caller-owned random Ed25519 seed.
+/// The native function ZEROIZES the writable 32-byte seed buffer and writes the
+/// corresponding public service identity to the 32-byte out buffer.
+final int Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  Pointer<Pointer<Utf8>>,
+) veilRegisterEphemeralOnionServiceZeroize = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Uint32,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_register_ephemeral_onion_service_zeroize')
+    .asFunction();
+
+/// Idempotently stop maintaining one ephemeral onion service by its public key.
+final int Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>,
+  Pointer<Pointer<Utf8>>,
+) veilWithdrawEphemeralOnionService = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_withdraw_ephemeral_onion_service')
+    .asFunction();
+
 /// Register a plain rendezvous-publisher entry advertising the relay KEM key
 /// (mailbox-by-discovery). Args: handle, rendezvous_node_id(32B), auth_cookie
 /// (16B), validity_window_secs(u64), relay_kem_algo(u8), relay_kem_pk(ptr),

@@ -3446,6 +3446,27 @@ impl NodeRuntime {
         self.access().register_onion_service(hop_count)
     }
 
+    /// Register a location-anonymous service under a random APPLICATION-owned
+    /// Ed25519 identity instead of this node's sovereign identity. The public
+    /// key is a `.onion`-like capability address: DHT records are blinded per
+    /// period and reveal neither this node_id nor the sovereign public key.
+    /// The seed stays zeroizing inside the runtime until withdrawn.
+    pub fn register_ephemeral_onion_service(
+        &self,
+        identity_seed: zeroize::Zeroizing<[u8; 32]>,
+        hop_count: usize,
+    ) -> std::result::Result<[u8; 32], veil_types::AnonOnionSendError> {
+        self.access()
+            .register_ephemeral_onion_service(identity_seed, hop_count)
+    }
+
+    /// Stop refreshing a previously registered ephemeral service. Existing
+    /// descriptors/circuits age out naturally; the application must also drop
+    /// capability requests immediately so revoke has no response oracle.
+    pub fn withdraw_ephemeral_onion_service(&self, identity_vk: [u8; 32]) -> bool {
+        self.access().withdraw_ephemeral_onion_service(identity_vk)
+    }
+
     /// Send an authenticated anonymous message to a location-anonymous service
     /// addressed by its Ed25519 IDENTITY key, resolving its unlinkable blinded
     /// descriptor. See [`NodeServices::send_to_onion_service`].
@@ -7613,7 +7634,110 @@ impl NodeServices {
         &self,
         hop_count: usize,
     ) -> std::result::Result<[u8; 16], veil_types::AnonOnionSendError> {
+        let seed = self.sovereign_onion_identity_seed();
+        self.register_onion_service_with_identity(hop_count, seed, false)
+            .map(|(cookie, _)| cookie)
+    }
+
+    pub fn register_ephemeral_onion_service(
+        &self,
+        identity_seed: zeroize::Zeroizing<[u8; 32]>,
+        hop_count: usize,
+    ) -> std::result::Result<[u8; 32], veil_types::AnonOnionSendError> {
+        let seed = std::sync::Arc::new(identity_seed);
+        self.register_onion_service_with_identity(hop_count, Some(seed), true)
+            .map(|(_, vk)| vk.expect("ephemeral identity seed always has a public key"))
+    }
+
+    pub fn withdraw_ephemeral_onion_service(&self, identity_vk: [u8; 32]) -> bool {
+        let mut services = lock!(self.anonymity.onion_services);
+        let mut removed = Vec::new();
+        services.retain(|entry| {
+            let matches = entry.ephemeral
+                && entry
+                    .descriptor_identity_seed
+                    .as_deref()
+                    .map(|seed| {
+                        veil_crypto::key_blinding::ed25519_public_from_seed(seed) == identity_vk
+                    })
+                    .unwrap_or(false);
+            if matches {
+                if let Some(&relay) = entry.relay_path.last() {
+                    removed.push((relay, entry.cookie));
+                }
+            }
+            !matches
+        });
+        drop(services);
+        for (relay, cookie) in &removed {
+            let mut publishers = lock!(self.anonymity.rendezvous_publisher_entries);
+            publishers.retain(|entry| {
+                !(entry.rendezvous_node_id == *relay && entry.auth_cookie == *cookie)
+            });
+        }
+        !removed.is_empty()
+    }
+
+    fn sovereign_onion_identity_seed(
+        &self,
+    ) -> Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>> {
+        self.identity
+            .sovereign_identity
+            .as_ref()
+            .and_then(|sov| sov.ed25519_signing_key())
+            .map(|ed| std::sync::Arc::new(zeroize::Zeroizing::new(ed.to_bytes())))
+    }
+
+    fn register_onion_service_with_identity(
+        &self,
+        hop_count: usize,
+        identity_seed: Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>>,
+        ephemeral: bool,
+    ) -> std::result::Result<([u8; 16], Option<[u8; 32]>), veil_types::AnonOnionSendError> {
         use rand_core::{OsRng, RngCore};
+
+        // Keep the existing hard work cap, but NEVER evict an older live
+        // capability silently: that would turn an apparently-valid public link
+        // into a black hole. Re-registering the same identity is allowed.
+        const MAX_ONION_SERVICES: usize = 8;
+        // Always reserve one slot for the config-driven sovereign service.
+        // Otherwise seven live links plus one more capability could prevent
+        // the node's ordinary anonymous endpoint from starting after restart.
+        const MAX_EPHEMERAL_ONION_SERVICES: usize = MAX_ONION_SERVICES - 1;
+        let requested_vk = identity_seed
+            .as_deref()
+            .map(|seed| veil_crypto::key_blinding::ed25519_public_from_seed(seed));
+        {
+            let services = lock!(self.anonymity.onion_services);
+            let already_registered = requested_vk.and_then(|vk| {
+                services.iter().find_map(|entry| {
+                    entry
+                        .descriptor_identity_seed
+                        .as_deref()
+                        .filter(|seed| {
+                            veil_crypto::key_blinding::ed25519_public_from_seed(seed) == vk
+                        })
+                        .map(|_| (entry.cookie, Some(vk)))
+                })
+            });
+            if let Some(existing) = already_registered {
+                return Ok(existing);
+            }
+            let cap = if ephemeral {
+                MAX_EPHEMERAL_ONION_SERVICES
+            } else {
+                MAX_ONION_SERVICES
+            };
+            if services.len() >= cap {
+                self.logger.warn(
+                    "onion.service.capacity",
+                    format!(
+                        "onion-service slot cap ({cap}) reached — refusing registration"
+                    ),
+                );
+                return Err(veil_types::AnonOnionSendError::NoRelays);
+            }
+        }
 
         let relay_path = self.select_onion_relay_path(hop_count)?;
         let r = *relay_path.last().expect("non-empty relay path");
@@ -7633,16 +7757,11 @@ impl NodeServices {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let period = veil_anonymity::blinded_descriptor::current_period(now_unix);
-        let cookie: [u8; 16] = match self
-            .identity
-            .sovereign_identity
-            .as_ref()
-            .and_then(|sov| sov.ed25519_signing_key())
-        {
-            Some(ed) => {
-                let seed = zeroize::Zeroizing::new(ed.to_bytes());
-                veil_crypto::identity::derive_onion_auth_cookie(&*seed, period)
-            }
+        let identity_vk = identity_seed
+            .as_deref()
+            .map(|seed| veil_crypto::key_blinding::ed25519_public_from_seed(seed));
+        let cookie: [u8; 16] = match identity_seed.as_deref() {
+            Some(seed) => veil_crypto::identity::derive_onion_auth_cookie(seed, period),
             None => {
                 let mut c = [0u8; 16];
                 OsRng.fill_bytes(&mut c);
@@ -7652,7 +7771,12 @@ impl NodeServices {
 
         // Build + register the circuit (no session register — that is the leak),
         // then publish the ad so clients can find us.
-        self.register_onion_circuit(&relay_path, cookie)?;
+        self.register_onion_circuit_with_identity(
+            &relay_path,
+            cookie,
+            identity_seed.clone(),
+            ephemeral,
+        )?;
         // COOKIE-DIAG: the cookie THIS node registers at the relay + publishes in
         // its ad. A sender's `rendezvous.cookie.introduce` line for this node must
         // carry the SAME cookie, else the relay drops the introduce (cookie_unknown).
@@ -7696,6 +7820,7 @@ impl NodeServices {
             .find(|e| e.cookie == cookie)
             .map(|e| std::sync::Arc::clone(&e.confirmed));
         let relay = r;
+        let publish_seed = identity_seed.clone();
         let publish = move |this: &NodeServices| {
             service_tasks::rendezvous_register_publisher(
                 &this.anonymity,
@@ -7708,11 +7833,12 @@ impl NodeServices {
                 service_tasks::RENDEZVOUS_AD_VALIDITY_SECS,
                 ephemeral_ad_identity,
             );
-            // Also publish a BLINDED descriptor (3c): identity-unlinkable in the DHT.
-            // A client that knows our Ed25519 identity key derives the descriptor's
-            // DHT key + decryption key; an enumerator sees only a rotating key + an
-            // opaque ciphertext. Best-effort (needs an Ed25519 sovereign identity).
-            this.publish_blinded_descriptor(relay, cookie);
+            // Also publish a BLINDED descriptor (3c): identity-unlinkable in the
+            // DHT. Capability services use their random per-share identity here,
+            // never the host's sovereign key.
+            if let Some(seed) = publish_seed.as_deref() {
+                this.publish_blinded_descriptor_for(seed, relay, cookie);
+            }
         };
         match confirmed {
             Some(flag) => self.publish_after_circuit_confirmed(flag, publish),
@@ -7721,7 +7847,7 @@ impl NodeServices {
             None => publish(self),
         }
 
-        Ok(cookie)
+        Ok((cookie, identity_vk))
     }
 
     /// Run `publish` once `confirmed` flips true — i.e. once the rendezvous
@@ -7827,15 +7953,16 @@ impl NodeServices {
         });
     }
 
-    /// Seal + store a blinded service descriptor for the current period (3c).
-    /// Best-effort: a no-op unless we hold an Ed25519 sovereign identity.
-    fn publish_blinded_descriptor(&self, rendezvous: [u8; 32], cookie: [u8; 16]) {
-        let Some(sov) = self.identity.sovereign_identity.as_ref() else {
-            return;
-        };
-        let Some(ed) = sov.ed25519_signing_key() else {
-            return;
-        };
+    /// Seal + store a blinded service descriptor for one explicit service
+    /// identity. The seed may be the normal sovereign Ed25519 seed OR a random
+    /// per-capability seed; the descriptor wire/DHT layer cannot distinguish
+    /// them and therefore cannot link the latter to this node's identity.
+    fn publish_blinded_descriptor_for(
+        &self,
+        identity_seed: &[u8; 32],
+        rendezvous: [u8; 32],
+        cookie: [u8; 16],
+    ) {
         let Some(x25519_pk) = self
             .dispatcher
             .anonymity_x25519_sk
@@ -7844,7 +7971,6 @@ impl NodeServices {
         else {
             return;
         };
-        let identity_sk = ed.to_bytes();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -7857,7 +7983,7 @@ impl NodeServices {
             receiver_x25519_pk: x25519_pk,
         };
         if let Some((dht_key, bytes)) =
-            veil_anonymity::blinded_descriptor::seal_descriptor(&identity_sk, period, &body)
+            veil_anonymity::blinded_descriptor::seal_descriptor(identity_seed, period, &body)
         {
             // diff-audit L5: replicate to the K-closest peers immediately (not
             // store_local-only). A by-identity sender resolves the descriptor at
@@ -7879,20 +8005,18 @@ impl NodeServices {
     }
 
     /// The onion service's rendezvous registration keypair for `period`,
-    /// derived from the sovereign identity seed (see
+    /// derived from that SERVICE identity seed (see
     /// `veil_crypto::identity::derive_onion_reg_seed` for why and for the
-    /// anonymity argument). `None` without a sovereign identity — the caller
+    /// anonymity argument). `None` without a descriptor identity — the caller
     /// falls back to a random keypair, matching the cookie's own fallback.
-    fn derived_onion_reg_keypair(&self, period: u64) -> Option<veil_crypto::GeneratedKeyPair> {
-        self.identity
-            .sovereign_identity
-            .as_ref()
-            .and_then(|sov| sov.ed25519_signing_key())
-            .map(|ed| {
-                let seed = zeroize::Zeroizing::new(ed.to_bytes());
-                let reg_seed = veil_crypto::identity::derive_onion_reg_seed(&seed, period);
-                veil_crypto::ed25519_keypair_from_seed(&reg_seed)
-            })
+    fn onion_reg_keypair_for_seed(
+        identity_seed: Option<&[u8; 32]>,
+        period: u64,
+    ) -> Option<veil_crypto::GeneratedKeyPair> {
+        identity_seed.map(|seed| {
+            let reg_seed = veil_crypto::identity::derive_onion_reg_seed(seed, period);
+            veil_crypto::ed25519_keypair_from_seed(&reg_seed)
+        })
     }
 
     /// Register a location-anonymous service: build its onion circuit + record it
@@ -7906,6 +8030,21 @@ impl NodeServices {
         &self,
         relay_path: &[[u8; 32]],
         cookie: [u8; 16],
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        self.register_onion_circuit_with_identity(
+            relay_path,
+            cookie,
+            self.sovereign_onion_identity_seed(),
+            false,
+        )
+    }
+
+    fn register_onion_circuit_with_identity(
+        &self,
+        relay_path: &[[u8; 32]],
+        cookie: [u8; 16],
+        descriptor_identity_seed: Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>>,
+        ephemeral: bool,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
         // Registration keypair: seed-derived per blinded-descriptor period, like
         // the cookie itself (L1 kept it stable across REBUILDS; deriving it makes
@@ -7923,9 +8062,11 @@ impl NodeServices {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let period = veil_anonymity::blinded_descriptor::current_period(now_unix);
-        let reg_keypair = self.derived_onion_reg_keypair(period).unwrap_or_else(|| {
-            veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519)
-        });
+        let reg_keypair = Self::onion_reg_keypair_for_seed(
+            descriptor_identity_seed.as_deref().map(|seed| &**seed),
+            period,
+        )
+        .unwrap_or_else(|| veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519));
         // B2: per-service monotonic registration-epoch counter, reused on every
         // rebuild so re-registrations strictly increase even within one second.
         let registration_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -7950,15 +8091,12 @@ impl NodeServices {
         // amplification. Evict the oldest (FIFO) once at capacity so the work per
         // tick stays bounded; the rate-limiter on the IPC arm bounds call rate.
         const MAX_ONION_SERVICES: usize = 8;
-        while svcs.len() >= MAX_ONION_SERVICES {
-            let evicted = svcs.remove(0);
+        if svcs.len() >= MAX_ONION_SERVICES {
             self.logger.warn(
-                "onion.service.evicted",
-                format!(
-                    "onion-service slot cap ({MAX_ONION_SERVICES}) reached — evicted oldest cookie={}",
-                    veil_util::bytes_to_hex(&evicted.cookie),
-                ),
+                "onion.service.capacity_race",
+                "onion-service cap filled concurrently after circuit build",
             );
+            return Err(veil_types::AnonOnionSendError::NoRelays);
         }
         svcs.push(anonymity_state::OnionServiceEntry {
             relay_path: relay_path.to_vec(),
@@ -7967,6 +8105,8 @@ impl NodeServices {
             reg_keypair,
             confirmed,
             registration_epoch,
+            descriptor_identity_seed,
+            ephemeral,
         });
         Ok(())
     }
@@ -7986,7 +8126,13 @@ impl NodeServices {
         // self-deadlock thanks to the edition-2024 if-let temporary-drop rule —
         // a latent footgun that an edition downgrade or refactor would re-arm.
         if let Some(hops) = self.anonymity.onion_service_hops {
-            let none_registered = { lock!(self.anonymity.onion_services).is_empty() };
+            // Ephemeral capability services share this registry; their presence
+            // must not suppress the config-driven NORMAL sovereign service.
+            let none_registered = {
+                !lock!(self.anonymity.onion_services)
+                    .iter()
+                    .any(|entry| !entry.ephemeral)
+            };
             if none_registered {
                 let _ = self.register_onion_service(hops);
             }
@@ -8015,6 +8161,7 @@ impl NodeServices {
             veil_crypto::GeneratedKeyPair,
             std::sync::Arc<std::sync::atomic::AtomicBool>,
             std::sync::Arc<std::sync::atomic::AtomicU64>,
+            Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>>,
         );
         let due: Vec<DueEntry> = {
             let svcs = lock!(self.anonymity.onion_services);
@@ -8027,11 +8174,20 @@ impl NodeServices {
                         e.reg_keypair.clone(),
                         std::sync::Arc::clone(&e.confirmed),
                         std::sync::Arc::clone(&e.registration_epoch),
+                        e.descriptor_identity_seed.clone(),
                     )
                 })
                 .collect()
         };
-        for (cookie, relay_path, reg_keypair, prev_confirmed, registration_epoch) in due {
+        for (
+            cookie,
+            relay_path,
+            reg_keypair,
+            prev_confirmed,
+            registration_epoch,
+            descriptor_identity_seed,
+        ) in due
+        {
             // Rotate the rendezvous cookie WITH the blinded-descriptor period. The
             // entry was minted under its build-time period, but a long-running node
             // crosses 24h boundaries; keeping one cookie across periods would
@@ -8042,15 +8198,9 @@ impl NodeServices {
             // re-registration AND the descriptor re-publish so they cannot diverge;
             // the in-memory entry is re-keyed to the new cookie on a successful build.
             let period_now = veil_anonymity::blinded_descriptor::current_period(now_unix);
-            let cookie_now = self
-                .identity
-                .sovereign_identity
-                .as_ref()
-                .and_then(|sov| sov.ed25519_signing_key())
-                .map(|ed| {
-                    let seed = zeroize::Zeroizing::new(ed.to_bytes());
-                    veil_crypto::identity::derive_onion_auth_cookie(&*seed, period_now)
-                })
+            let cookie_now = descriptor_identity_seed
+                .as_deref()
+                .map(|seed| veil_crypto::identity::derive_onion_auth_cookie(seed, period_now))
                 .unwrap_or(cookie);
             // The registration keypair rotates WITH the cookie's period (same
             // derivation cadence): re-deriving here keeps the pair the relay
@@ -8058,9 +8208,11 @@ impl NodeServices {
             // restart right after a period boundary still lands on the same-key
             // refresh path instead of CookieClaimed. Random-fallback entries
             // keep their minted keypair (their cookie never rotates either).
-            let reg_keypair = self
-                .derived_onion_reg_keypair(period_now)
-                .unwrap_or(reg_keypair);
+            let reg_keypair = Self::onion_reg_keypair_for_seed(
+                descriptor_identity_seed.as_deref().map(|seed| &**seed),
+                period_now,
+            )
+            .unwrap_or(reg_keypair);
             // diff-audit Δ2-d: if the terminus never ACK'd the current circuit
             // (CircuitBuilt), its path is suspect — a hop is likely dead. Pick a
             // FRESH path rather than rebuilding the same frozen one. A confirmed
@@ -8121,6 +8273,7 @@ impl NodeServices {
             // (it only tolerates ±1). REFRESH_SECS (150 s) ≪ the period, so a fresh
             // descriptor is always present under the live key.
             if let Some(&rendezvous) = relay_path.last() {
+                let publish_seed = descriptor_identity_seed.clone();
                 match built {
                     // Same publish-before-register barrier as the initial
                     // registration: at a period boundary `cookie_now` is a
@@ -8128,14 +8281,20 @@ impl NodeServices {
                     // the rebuild's CircuitBuilt ACK reopens the race there.
                     Ok(new_confirmed) => {
                         self.publish_after_circuit_confirmed(new_confirmed, move |this| {
-                            this.publish_blinded_descriptor(rendezvous, cookie_now);
+                            if let Some(seed) = publish_seed.as_deref() {
+                                this.publish_blinded_descriptor_for(seed, rendezvous, cookie_now);
+                            }
                         });
                     }
                     // Build failed: publish immediately, matching the old
                     // "decoupled from the rebuild result" behavior —
                     // discoverability shouldn't hinge on one tick's rebuild
                     // succeeding (the next tick retries in REFRESH_SECS).
-                    Err(_) => self.publish_blinded_descriptor(rendezvous, cookie_now),
+                    Err(_) => {
+                        if let Some(seed) = publish_seed.as_deref() {
+                            self.publish_blinded_descriptor_for(seed, rendezvous, cookie_now);
+                        }
+                    }
                 }
             }
         }
@@ -8695,8 +8854,7 @@ impl NodeServices {
         // introduce at the stream registration. Fall back to the freshest
         // ad's cookie only if no ad carries the expected chat cookie
         // (unexpected publisher — behave like the legacy selection).
-        let expected_cookie =
-            service_tasks::rendezvous_cookie_from_node_id(&receiver_node_id);
+        let expected_cookie = service_tasks::rendezvous_cookie_from_node_id(&receiver_node_id);
         let primary_cookie = if ads.iter().any(|a| a.auth_cookie == expected_cookie) {
             expected_cookie
         } else {
