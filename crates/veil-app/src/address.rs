@@ -116,6 +116,15 @@ pub fn ephemeral_app_id(
     blake3::derive_key(EPHEMERAL_APP_ID_CONTEXT, &ikm)
 }
 
+/// Derive a stable capability-scoped app id shared across sovereign nodes.
+/// Callers must feed a high-entropy secret alias as [name]; the result is opaque
+/// and deliberately contains no node identity input.
+pub fn capability_app_id(namespace: &str, name: &str) -> [u8; 32] {
+    let zero_node = [0u8; 32];
+    let ikm = build_app_id_ikm(&zero_node, None, namespace, name);
+    blake3::derive_key("veil.capability_app_id.v1", &ikm[32..])
+}
+
 // ── AppAddress ────────────────────────────────────────────────────────────────
 
 /// A fully-qualified address for a single application endpoint on a node.
@@ -257,6 +266,18 @@ mod tests {
             ephemeral_app_id(&n, &t1, "ns", "app"),
             ephemeral_app_id(&n, &t2, "ns", "app"),
         );
+    }
+
+    #[test]
+    fn capability_app_id_is_node_independent_and_domain_separated() {
+        let capability = capability_app_id("xveil.cloud", "secret-alias");
+        assert_eq!(
+            capability,
+            capability_app_id("xveil.cloud", "secret-alias")
+        );
+        assert_ne!(capability, capability_app_id("xveil.cloud", "other"));
+        assert_ne!(capability, app_id(&[0u8; 32], "xveil.cloud", "secret-alias"));
+        assert_ne!(capability, app_id(&[9u8; 32], "xveil.cloud", "secret-alias"));
     }
 
     #[test]

@@ -402,6 +402,29 @@ final int Function(Pointer<VeilHandle>, Pointer<Uint8>, Pointer<Pointer<Utf8>>)
                 )>>('veil_get_node_id')
         .asFunction();
 
+/// Bind a stable capability-scoped endpoint (app id excludes node identity).
+final Pointer<VeilApp> Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilBindCapability = nativeLib
+    .lookup<
+        NativeFunction<
+            Pointer<VeilApp> Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Size,
+              Pointer<Uint8>,
+              Size,
+              Uint32,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_bind_capability')
+    .asFunction();
+
 /// Snapshot the daemon's peer sessions. Calls [cb] once per peer (bounded at
 /// 256 entries server-side). Returns [veilOk] or a negative error code.
 final int Function(Pointer<VeilHandle>,
