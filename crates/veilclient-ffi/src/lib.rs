@@ -1403,6 +1403,7 @@ unsafe fn bind_internal(
     endpoint_id: u32,
     err_out: *mut *mut c_char,
     named: bool,
+    capability: bool,
 ) -> *mut VeilApp {
     if unsafe { guard::ffi_prelude(err_out, "veil_bind") }.is_err() {
         return ptr::null_mut();
@@ -1434,7 +1435,9 @@ unsafe fn bind_internal(
     let bundle = Arc::clone(&handle_live.bundle);
     let bind_res: Result<AppHandle, ClientError> = bundle.runtime.block_on(async {
         let client = bundle.client.lock().await;
-        if named {
+        if capability {
+            client.bind_capability(ns, nm, endpoint_id).await
+        } else if named {
             client.bind_named(ns, nm, endpoint_id).await
         } else {
             client.bind(ns, nm, endpoint_id).await
@@ -1492,6 +1495,7 @@ pub unsafe extern "C" fn veil_bind(
             endpoint_id,
             err_out,
             false,
+            false,
         )
     }
 }
@@ -1517,6 +1521,34 @@ pub unsafe extern "C" fn veil_bind_named(
             name_len,
             endpoint_id,
             err_out,
+            true,
+            false,
+        )
+    }
+}
+
+/// Bind a stable high-entropy capability alias whose app id is independent of
+/// the local sovereign node id. Returns NULL on failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_bind_capability(
+    handle: *mut VeilHandle,
+    namespace: *const u8,
+    namespace_len: usize,
+    name: *const u8,
+    name_len: usize,
+    endpoint_id: u32,
+    err_out: *mut *mut c_char,
+) -> *mut VeilApp {
+    unsafe {
+        bind_internal(
+            handle,
+            namespace,
+            namespace_len,
+            name,
+            name_len,
+            endpoint_id,
+            err_out,
+            false,
             true,
         )
     }

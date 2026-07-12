@@ -363,6 +363,14 @@ pub mod ipc_bind_flags {
     ///
     /// Use named mode (`flags = 0`) for well-known services that need a stable address.
     pub const EPHEMERAL: u16 = 0x0001;
+
+    /// Capability-scoped stable binding. The node derives `app_id` only from
+    /// `(namespace, name)` under a separate domain, so devices hosting the same
+    /// bearer capability can expose the same opaque endpoint without revealing
+    /// or depending on either sovereign `node_id`. The name MUST contain
+    /// high-entropy capability material; this is for secret aliases, not public
+    /// well-known services.
+    pub const CAPABILITY: u16 = 0x0002;
 }
 
 /// Sent by the node when an `APP_BIND` cannot be honoured.
