@@ -9058,8 +9058,6 @@ impl NodeServices {
         data: &[u8],
         hop_count: usize,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
-        use veil_anonymity::rendezvous::final_hop_kind;
-
         let ad = self.resolve_onion_service_ad(&service_identity_vk).await?;
 
         // Unauthenticated final-hop payload: src_node_id zero (anonymity).
@@ -9072,13 +9070,84 @@ impl NodeServices {
             reply_id: 0,
         };
         let app_deliver_bytes = app_deliver.encode();
-        let mut sealed_plaintext = Vec::with_capacity(1 + app_deliver_bytes.len());
-        sealed_plaintext.push(final_hop_kind::APP_DELIVER);
-        sealed_plaintext.extend_from_slice(&app_deliver_bytes);
 
         // by-identity anonymous send → circuit-backed: pseudo cleartext id (L3).
-        self.send_sealed_introduce(&ad, &sealed_plaintext, hop_count, true)
+        // AppDeliver framing alone is 112 B and introduce HPKE adds another
+        // 60 B, leaving far less than one public-cloud chunk in the 320 B
+        // ciphertext budget. Fragment the opaque AppDeliver bytes without
+        // adding a sovereign signature (the receiver must still see node_id=0).
+        self.send_via_rendezvous_anonymous_payload(&ad, &app_deliver_bytes, hop_count, true)
             .map_err(map_sender_err)
+    }
+
+    fn send_via_rendezvous_anonymous_payload(
+        &self,
+        ad: &veil_anonymity::rendezvous::RendezvousAd,
+        app_deliver_bytes: &[u8],
+        hop_count: usize,
+        circuit_backed: bool,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        use rand_core::RngCore;
+        use veil_anonymity::rendezvous::{
+            INTRODUCE_OVERHEAD, IntroducePayload, MAX_INTRODUCE_CIPHERTEXT, final_hop_kind,
+        };
+
+        let final_budget = veil_anonymity::packet::max_payload_for_hops(hop_count).ok_or(
+            veil_anonymity::sender::SenderError::HopCountExceedsCellBudget {
+                hop_count,
+                max: veil_anonymity::packet::MAX_HOPS_PER_CELL,
+            },
+        )?;
+        let ciphertext_budget = final_budget
+            .saturating_sub(1 + IntroducePayload::FIXED_SIZE)
+            .min(MAX_INTRODUCE_CIPHERTEXT);
+        let plaintext_budget = ciphertext_budget.saturating_sub(INTRODUCE_OVERHEAD);
+        if 1 + app_deliver_bytes.len() <= plaintext_budget {
+            let mut plaintext = Vec::with_capacity(1 + app_deliver_bytes.len());
+            plaintext.push(final_hop_kind::APP_DELIVER);
+            plaintext.extend_from_slice(app_deliver_bytes);
+            return self.send_sealed_introduce(ad, &plaintext, hop_count, circuit_backed);
+        }
+
+        let chunk_size =
+            plaintext_budget.saturating_sub(1 + veil_proto::AuthDeliverFragment::HEADER_SIZE);
+        if chunk_size == 0 {
+            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
+                hop_count,
+                got: app_deliver_bytes.len(),
+                max: 0,
+            });
+        }
+        let frag_count = app_deliver_bytes.len().div_ceil(chunk_size);
+        if frag_count == 0 || frag_count > veil_proto::MAX_AUTH_DELIVER_FRAGMENTS as usize {
+            return Err(veil_anonymity::sender::SenderError::PayloadTooLarge {
+                hop_count,
+                got: app_deliver_bytes.len(),
+                max: chunk_size * veil_proto::MAX_AUTH_DELIVER_FRAGMENTS as usize,
+            });
+        }
+        let mut msg_id = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut msg_id);
+        // Multi-fragment delivery is all-or-nothing. Match the authenticated
+        // bulk path's bounded redundancy; app-level chunk retry handles the
+        // remaining loss without unbounded transport amplification.
+        let redundancy = if frag_count >= 3 { 3 } else { 1 };
+        for (index, chunk) in app_deliver_bytes.chunks(chunk_size).enumerate() {
+            let fragment = veil_proto::AuthDeliverFragment {
+                msg_id,
+                frag_count: frag_count as u16,
+                frag_idx: index as u16,
+                chunk: chunk.to_vec(),
+            };
+            let encoded = fragment.encode();
+            let mut plaintext = Vec::with_capacity(1 + encoded.len());
+            plaintext.push(final_hop_kind::APP_DELIVER_FRAGMENT);
+            plaintext.extend_from_slice(&encoded);
+            for _ in 0..redundancy {
+                self.send_sealed_introduce(ad, &plaintext, hop_count, circuit_backed)?;
+            }
+        }
+        Ok(())
     }
 
     /// Send `data` to a KNOWN peer `(target_node_id, target_x25519_pk)` as an

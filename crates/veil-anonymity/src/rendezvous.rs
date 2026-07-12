@@ -1438,6 +1438,12 @@ pub mod final_hop_kind {
     /// (authenticated onion delivery v1). Unlike [`APP_DELIVER`], the recipient
     /// learns + verifies WHO sent the message.
     pub const APP_DELIVER_AUTH: u8 = 0x03;
+    /// Body is an `AuthDeliverFragment` framing chunk, reused as a bounded
+    /// generic byte reassembly envelope for an UNAUTHENTICATED
+    /// `AppDeliverPayload`. The completed delivery always surfaces a zero
+    /// src_node_id; this supports capability traffic larger than one introduce
+    /// without turning it into an identity-bearing authenticated send.
+    pub const APP_DELIVER_FRAGMENT: u8 = 0x04;
 }
 
 /// Cap on `IntroducePayload.ciphertext` length. Sized to the Final-hop budget
