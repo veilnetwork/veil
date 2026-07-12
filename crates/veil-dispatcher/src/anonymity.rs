@@ -825,6 +825,17 @@ impl FrameDispatcher {
                     ),
                 }
             }
+            final_hop_kind::APP_DELIVER_FRAGMENT => {
+                match veil_proto::AuthDeliverFragment::decode(inner) {
+                    Ok(frag) => {
+                        self.enqueue_auth_deliver(AuthDeliverInbound::AnonymousFragment { frag })
+                    }
+                    Err(e) => self.logger.info(
+                        "anonymity.relay_chain.forward.anonymous_fragment_decode_failed",
+                        format!("anonymous AppDeliver fragment decode: {e}"),
+                    ),
+                }
+            }
             other => self.logger.info(
                 "anonymity.relay_chain.forward.unknown_kind",
                 format!("rendezvous plaintext kind=0x{other:02x} not recognised; dropped"),
@@ -1753,6 +1764,9 @@ mod tests {
         let auth = match got {
             crate::AuthDeliverInbound::Full(a) => a,
             crate::AuthDeliverInbound::Fragment { .. } => panic!("expected Full, got Fragment"),
+            crate::AuthDeliverInbound::AnonymousFragment { .. } => {
+                panic!("expected Full, got AnonymousFragment")
+            }
         };
         assert_eq!(auth.sender_node_id, [0x5A; 32]);
         assert_eq!(auth.nonce, 42);
@@ -1876,6 +1890,58 @@ mod tests {
         hdr.body_len = body.len() as u32;
         let result = dispatcher.dispatch_relay_chain(&hdr, &body, NodeId::from([0xEE; 32]));
         assert!(matches!(result, DispatchResult::NoResponse));
+    }
+
+    /// A rendezvous-forwarded anonymous fragment is decrypted and handed to
+    /// the runtime's bounded reassembler without acquiring sender identity.
+    #[tokio::test]
+    async fn anonymous_fragment_forward_enqueues_without_attribution() {
+        use veil_anonymity::rendezvous::{
+            ForwardIntroducePayload, encrypt_introduce, final_hop_kind,
+        };
+
+        let mut dispatcher = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let local_sk = StaticSecret::random_from_rng(OsRng);
+        let local_pk = PublicKey::from(&local_sk).to_bytes();
+        dispatcher.anonymity_x25519_sk = Some(Arc::new(local_sk));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        *veil_util::lock!(dispatcher.auth_deliver_tx) = Some(tx);
+
+        let fragment = veil_proto::AuthDeliverFragment {
+            msg_id: [0xA5; 16],
+            frag_count: 2,
+            frag_idx: 1,
+            chunk: b"opaque-app-deliver-tail".to_vec(),
+        };
+        let mut plaintext = vec![final_hop_kind::APP_DELIVER_FRAGMENT];
+        plaintext.extend_from_slice(&fragment.encode());
+        let ciphertext = encrypt_introduce(&plaintext, &local_pk).unwrap();
+        let body = ForwardIntroducePayload { ciphertext }.encode().unwrap();
+        let mut hdr = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::ForwardIntroduce as u16,
+        );
+        hdr.body_len = body.len() as u32;
+
+        let result = dispatcher.dispatch_relay_chain(
+            &hdr,
+            &body,
+            NodeId::from([0xEE; 32]),
+        );
+        assert!(matches!(result, DispatchResult::NoResponse));
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("anonymous fragment was not enqueued")
+            .expect("runtime channel closed");
+        match got {
+            crate::AuthDeliverInbound::AnonymousFragment { frag } => {
+                assert_eq!(frag.msg_id, fragment.msg_id);
+                assert_eq!(frag.frag_count, 2);
+                assert_eq!(frag.frag_idx, 1);
+                assert_eq!(frag.chunk, fragment.chunk);
+            }
+            other => panic!("expected AnonymousFragment, got {other:?}"),
+        }
     }
 
     /// CircuitBuild at the terminus installs circuit state keyed by

@@ -171,6 +171,49 @@ async fn process_auth_deliver(
     }
 }
 
+/// Decode and deliver one completely reassembled anonymous AppDeliver. The
+/// sender controls the encrypted payload, so attribution is forced to the
+/// anonymous zero node id even if a malicious fragment stream encoded another
+/// value. App-level capability MACs remain responsible for authorization.
+fn process_anonymous_deliver(
+    bytes: &[u8],
+    access: &super::NodeServices,
+    logger: &Arc<veil_observability::NodeLogger>,
+) {
+    let deliver = match veil_proto::AppDeliverPayload::decode(bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            logger.info(
+                "anonymity.anonymous_deliver.reassembled_decode_failed",
+                format!("reassembled AppDeliverPayload decode: {error}"),
+            );
+            return;
+        }
+    };
+    let data_len = deliver.data.len();
+    let endpoint_id = deliver.endpoint_id;
+    let delivered = access.dispatcher.app_registry.route_ipc_deliver(
+        [0u8; 32],
+        deliver.src_app_id,
+        deliver.app_id,
+        endpoint_id,
+        deliver.data,
+    );
+    if delivered {
+        logger.info(
+            "anonymity.anonymous_deliver.delivered",
+            format!(
+                "delivered {data_len} reassembled anonymous bytes to endpoint_id={endpoint_id}"
+            ),
+        );
+    } else {
+        logger.info(
+            "anonymity.anonymous_deliver.unbound",
+            format!("no app bound to endpoint_id={endpoint_id}; {data_len} bytes dropped"),
+        );
+    }
+}
+
 // ── rendezvous-recipient lifecycle (Epic 482 v1) ─────────────────────────────
 
 /// How often the rendezvous-recipient task re-checks its registration. A short
@@ -1516,6 +1559,7 @@ impl NodeRuntime {
         // (the direct onion path delivers whole `Full` messages). Single-owner —
         // the task processes serially, so no lock.
         let mut reassembler = veil_identity::auth_deliver::AuthDeliverReassembler::new();
+        let mut anonymous_reassembler = veil_identity::auth_deliver::AuthDeliverReassembler::new();
 
         let handle = supervised_spawn(
             Arc::clone(&self.logger),
@@ -1566,6 +1610,20 @@ impl NodeRuntime {
                                             None
                                         }
                                     }
+                                },
+                                veil_dispatcher::AuthDeliverInbound::AnonymousFragment { frag } => {
+                                    use veil_identity::auth_deliver::ReassembleOutcome;
+                                    match anonymous_reassembler.push(frag, now_unix) {
+                                        ReassembleOutcome::Complete(bytes) => {
+                                            process_anonymous_deliver(&bytes, &access, &logger);
+                                        }
+                                        ReassembleOutcome::Pending => {}
+                                        ReassembleOutcome::Rejected => logger.info(
+                                            "anonymity.anonymous_deliver.fragment_rejected",
+                                            "anonymous AppDeliver fragment rejected (bounds/inconsistent)",
+                                        ),
+                                    }
+                                    None
                                 }
                             };
                             if let Some(auth) = auth {

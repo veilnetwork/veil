@@ -369,6 +369,12 @@ pub enum AuthDeliverInbound {
         /// rendezvous registration) only proves peer→us and must not.
         via_reply_circuit: bool,
     },
+    /// One fragment of an unauthenticated `AppDeliverPayload`. It shares the
+    /// bounded fragment wire/reassembly machinery but is never signature-
+    /// verified or attributed to a node identity.
+    AnonymousFragment {
+        frag: veil_proto::AuthDeliverFragment,
+    },
 }
 
 /// type alias for the authenticated-delivery channel sender from the sync
