@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use libc::size_t;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 /// Minimal `log` -> stderr bridge for non-Android hosts. The embedded node's
 /// runtime emits some diagnostics through the `log` crate (e.g. the onion-stream
@@ -50,7 +50,7 @@ impl log::Log for StderrLogBridge {
 
 /// Opaque handle to a running embedded node.
 pub struct VeilNode {
-    shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    shutdown: Mutex<Option<watch::Sender<bool>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     /// Admin socket path — set when the node was started in deferred mode. This
     /// is the channel `veil_node_apply_config` uses to promote the ephemeral
@@ -442,7 +442,8 @@ fn start_thread(
     anonymous: bool,
     err_out: *mut *mut c_char,
 ) -> *mut VeilNode {
-    let (tx, rx) = oneshot::channel::<()>();
+    let (tx, mut rx) = watch::channel(false);
+    let mut shutdown_deadline = rx.clone();
     let thread_admin_socket = admin_socket.clone();
     let spawn = std::thread::Builder::new()
         .name("veil-node".into())
@@ -488,9 +489,13 @@ fn start_thread(
                 }
             };
             let shutdown = async move {
-                let _ = rx.await;
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
             };
-            let result = rt.block_on(async move {
+            let foreground = async move {
                 match config {
                     Some(p) => {
                         veil_node_runtime::admin::run_foreground_with_shutdown(p, true, shutdown)
@@ -505,12 +510,39 @@ fn start_thread(
                         .await
                     }
                 }
+            };
+            let result = rt.block_on(async move {
+                tokio::pin!(foreground);
+                tokio::select! {
+                    result = &mut foreground => Some(result),
+                    _ = async move {
+                        while !*shutdown_deadline.borrow() {
+                            if shutdown_deadline.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } => None,
+                }
             });
-            if let Err(e) = result {
+            if let Some(Err(e)) = result {
                 crate::ffi_diag(&format!("veil_node: runtime exited with error: {e}"));
                 #[cfg(target_os = "android")]
                 log::error!("veil_node: runtime exited with error: {e}");
+            } else if result.is_none() {
+                crate::ffi_diag(
+                    "veil_node: graceful shutdown exceeded 5s; cancelling residual tasks",
+                );
             }
+            // `NodeRuntime::stop` owns and joins its tracked services, but
+            // defensive/background work spawned below the overlay stack may
+            // still be alive (for example an in-flight onion resolve). A plain
+            // Runtime drop waits forever for any blocking task that outlives
+            // the node, which makes the synchronous `veil_node_stop`/thread
+            // join hang the embedding process during shutdown. Cancel all
+            // remaining async work and bound the wait for blocking work at the
+            // outermost owner. The normal graceful path above still runs first.
+            rt.shutdown_timeout(Duration::from_secs(5));
         });
 
     match spawn {
@@ -641,7 +673,7 @@ pub unsafe extern "C" fn veil_node_stop(node: *mut VeilNode) {
     }
     let node = unsafe { Box::from_raw(node) };
     if let Some(tx) = node.shutdown.lock().unwrap().take() {
-        let _ = tx.send(());
+        let _ = tx.send(true);
     }
     if let Some(thread) = node.thread.lock().unwrap().take() {
         let _ = thread.join();
