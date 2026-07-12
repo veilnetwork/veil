@@ -1601,6 +1601,18 @@ pub unsafe extern "C" fn veil_app_close(app: *mut VeilApp) {
     {
         task.abort();
     }
+    // `AppSender::Drop` is deliberately best-effort when no Tokio runtime is
+    // entered, which is exactly the normal Dart/FFI close context. Before this
+    // explicit close the local dispatch table and daemon binding survived
+    // until the whole VeilClient disconnected, so rebinding a retired public-
+    // capability endpoint failed with "already bound on this connection".
+    let bundle = Arc::clone(&app_box.bundle);
+    let sender = Arc::clone(&app_box.sender);
+    bundle.runtime.block_on(async move {
+        if let Some(sender) = sender.lock().await.take() {
+            sender.close().await;
+        }
+    });
     drop(app_box);
 }
 

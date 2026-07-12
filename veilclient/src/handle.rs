@@ -131,6 +131,7 @@ impl AppHandle {
             endpoint_id,
             writer,
             dispatch,
+            unbind_on_drop: true,
         };
         let receiver = AppReceiver {
             rx,
@@ -429,10 +430,16 @@ pub struct AppSender {
     /// Held so the dispatch table is updated on drop (unbind path)
     /// matching the lifetime semantics of the original AppHandle.
     dispatch: Arc<Mutex<DispatchTable>>,
+    /// Explicit [close](Self::close) performs the unbind synchronously and
+    /// clears this flag so Drop cannot enqueue a duplicate frame.
+    unbind_on_drop: bool,
 }
 
 impl Drop for AppSender {
     fn drop(&mut self) {
+        if !self.unbind_on_drop {
+            return;
+        }
         // same `Handle::try_current` guard as
         // `AppHandle::drop` — see that impl for the full rationale.
         if tokio::runtime::Handle::try_current().is_err() {
@@ -460,6 +467,28 @@ impl Drop for AppSender {
 }
 
 impl AppSender {
+    /// Reliably release this endpoint and its local dispatch slots.
+    ///
+    /// Unlike Drop, this works when the caller originated outside Tokio (the
+    /// FFI close path): the caller enters a runtime and awaits the APP_UNBIND
+    /// write instead of relying on a spawned best-effort cleanup task.
+    pub async fn close(mut self) {
+        self.unbind_on_drop = false;
+        {
+            let mut d = self.dispatch.lock().await;
+            d.endpoints.remove(&self.endpoint_id);
+            d.inbound_streams.remove(&self.endpoint_id);
+        }
+        let payload = AppUnbindPayload {
+            app_id: self.app_id,
+            endpoint_id: self.endpoint_id,
+        };
+        let _ = self
+            .writer
+            .write_frame(LocalAppMsg::AppUnbind as u16, &payload.encode())
+            .await;
+    }
+
     /// Returns this endpoint's numeric ID.
     pub fn endpoint_id(&self) -> u32 {
         self.endpoint_id

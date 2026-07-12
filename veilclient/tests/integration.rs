@@ -97,6 +97,30 @@ async fn echo_roundtrip_via_veilclient() {
     let _ = server_handle.await;
 }
 
+#[tokio::test]
+async fn explicit_sender_close_allows_same_connection_rebind() {
+    let sock = temp_socket();
+    let (shutdown_tx, server_handle) = start_server(sock.clone()).await;
+    let client = veilclient::VeilClient::connect(&sock).await.unwrap();
+
+    let first = client
+        .bind_named("test.explicit-close", "provider", 40)
+        .await
+        .unwrap();
+    let (sender, receiver) = first.into_split();
+    drop(receiver);
+    sender.close().await;
+
+    let rebound = client
+        .bind_named("test.explicit-close", "provider", 40)
+        .await
+        .expect("explicit close must release the SDK and daemon endpoint");
+    drop(rebound);
+
+    let _ = shutdown_tx.send(true);
+    let _ = server_handle.await;
+}
+
 // ── Bounded-channel regression: slow stream consumer is silently closed ──
 //
 // Audit batch 2026-05-23, HIGH-finding follow-up: per-stream `StreamEvent`
