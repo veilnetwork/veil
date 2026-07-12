@@ -29,6 +29,7 @@ use veil_dht::KademliaService;
 use veil_dispatcher::PendingRecursive;
 use veil_e2e::PeerMlKemCache;
 use veil_identity::mailbox_seal::{self, MailboxSealError};
+use veil_identity::mlkem_fanout::VerifiedMlkemCert;
 use veil_identity::sovereign::SovereignIdentity;
 use veil_identity::verify::verify_identity_document;
 use veil_observability::NodeLogger;
@@ -44,6 +45,23 @@ use crate::mlkem_resolver::{DhtMlKemEkResolver, PeerMlKemCertCache};
 /// retention (an aged-out blob is simply gone); anti-replay is the per-
 /// (sender,nonce) replay cache + receiver-side content_id dedup, not freshness.
 const MAILBOX_OPEN_FRESHNESS_SECS: u64 = 7 * 86_400;
+const LOCAL_MLKEM_CERT_VERSION: u64 = 1;
+
+fn local_verified_cert(
+    node_id: [u8; 32],
+    instance_id: [u8; 16],
+    dk_seed: &[u8; veil_e2e::DK_SEED_BYTES],
+) -> Result<VerifiedMlkemCert, OfflineSealError> {
+    let (ek, _) = veil_e2e::keypair_from_dk_seed(dk_seed)
+        .map_err(|error| OfflineSealError::LocalKey(error.to_string()))?;
+    Ok(VerifiedMlkemCert {
+        node_id,
+        instance_id,
+        mlkem_algo: veil_proto::prekey_bundle::ALGO_ML_KEM_768,
+        mlkem_pubkey: ek.to_vec(),
+        cert_version: LOCAL_MLKEM_CERT_VERSION,
+    })
+}
 
 /// Failure of a runtime offline seal/open.
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +72,8 @@ pub enum OfflineSealError {
     RecipientCertUnresolved,
     #[error("could not resolve + verify the sender's identity document from the DHT")]
     SenderDocUnresolved,
+    #[error("could not derive the local ML-KEM recipient key: {0}")]
+    LocalKey(String),
     #[error("seal: {0}")]
     Seal(#[source] MailboxSealError),
     #[error("open: {0}")]
@@ -115,11 +135,21 @@ impl RuntimeMailboxCrypto {
             data.to_vec(),
             None,
         );
-        let cert = self
-            .mlkem_resolver()
-            .fetch_verified_cert(recipient_node_id)
-            .await
-            .ok_or(OfflineSealError::RecipientCertUnresolved)?;
+        // Sealing to ourselves is a normal first-document operation. Never
+        // depend on a DHT round-trip for our own certificate: the runtime owns
+        // the exact DK seed and sovereign instance binding already.
+        let cert = if recipient_node_id == self.local_node_id {
+            local_verified_cert(
+                self.local_node_id,
+                sovereign.active_instance_id(),
+                self.mlkem_dk_seed.as_array(),
+            )?
+        } else {
+            self.mlkem_resolver()
+                .fetch_verified_cert(recipient_node_id)
+                .await
+                .ok_or(OfflineSealError::RecipientCertUnresolved)?
+        };
         // Embed our own signed document so an offline recipient can verify us
         // without a DHT resolve (see `open` + `seal_mailbox_blob`).
         mailbox_seal::seal_mailbox_blob(
@@ -306,4 +336,22 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_recipient_cert_is_derived_without_dht() {
+        let node_id = [7; 32];
+        let instance_id = [9; 16];
+        let seed = [11; veil_e2e::DK_SEED_BYTES];
+        let cert = local_verified_cert(node_id, instance_id, &seed).unwrap();
+
+        assert_eq!(cert.node_id, node_id);
+        assert_eq!(cert.instance_id, instance_id);
+        assert_eq!(cert.cert_version, LOCAL_MLKEM_CERT_VERSION);
+        assert_eq!(cert.mlkem_pubkey.len(), veil_e2e::EK_BYTES);
+    }
 }
