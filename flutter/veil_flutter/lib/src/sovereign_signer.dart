@@ -1,4 +1,6 @@
 import 'dart:ffi';
+import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -129,6 +131,59 @@ final class VeilSovereignSigner implements Finalizable {
     }
   }
 
+  /// Open an XVRC recovery certificate with its independent recovery code.
+  /// The restored signer has the exact same full public key and node id as the
+  /// XVSB from which the certificate was exported.
+  factory VeilSovereignSigner.openRecoveryCertificate(
+    Uint8List certificate,
+    String recoveryCode,
+  ) {
+    final certificateBuf = calloc<Uint8>(certificate.length);
+    final codeC = recoveryCode.toNativeUtf8();
+    final signerOut = calloc<Pointer<ffi.VeilSovereignSigner>>();
+    final algorithmOut = calloc<Uint8>();
+    final nodeIdOut = calloc<Uint8>(32);
+    final publicKeyOut = calloc<Uint8>(1024);
+    final publicKeyLenOut = calloc<IntPtr>();
+    final errOut = calloc<Pointer<Utf8>>();
+    try {
+      certificateBuf.asTypedList(certificate.length).setAll(0, certificate);
+      final rc = ffi.veilSovereignSignerOpenRecoveryCertificateZeroize(
+        certificateBuf,
+        certificate.length,
+        codeC.cast<Uint8>(),
+        codeC.length,
+        signerOut,
+        algorithmOut,
+        nodeIdOut,
+        32,
+        publicKeyOut,
+        1024,
+        publicKeyLenOut,
+        errOut,
+      );
+      if (rc != ffi.veilOk) {
+        throw VeilException(_takeError(errOut), code: rc);
+      }
+      final publicKeyLen = publicKeyLenOut.value;
+      return VeilSovereignSigner._(
+        signerOut.value,
+        _algorithmName(algorithmOut.value),
+        Uint8List.fromList(nodeIdOut.asTypedList(32)),
+        Uint8List.fromList(publicKeyOut.asTypedList(publicKeyLen)),
+      );
+    } finally {
+      calloc.free(certificateBuf);
+      calloc.free(codeC);
+      calloc.free(signerOut);
+      calloc.free(algorithmOut);
+      calloc.free(nodeIdOut);
+      calloc.free(publicKeyOut);
+      calloc.free(publicKeyLenOut);
+      calloc.free(errOut);
+    }
+  }
+
   /// Sign arbitrary canonical membership bytes with the sovereign key.
   Uint8List sign(Uint8List message) {
     final handle = _handle;
@@ -204,6 +259,60 @@ Uint8List createHybrid512SovereignBundle(String phrase) {
     calloc.free(phraseC);
     calloc.free(bundleOut);
     calloc.free(bundleLenOut);
+    calloc.free(errOut);
+  }
+}
+
+/// Generate an independent 256-bit recovery code. Store it separately from the
+/// XVRC file: possessing both grants the same sovereign authority as the phrase.
+String generateSovereignRecoveryCode() {
+  final random = Random.secure();
+  final bytes = List<int>.generate(32, (_) => random.nextInt(256));
+  return 'xvrc-${base64Url.encode(bytes).replaceAll('=', '')}';
+}
+
+/// Re-wrap an existing XVSB or XVRC credential as a fresh XVRC recovery
+/// certificate. Plaintext key material never crosses into Dart; mutable
+/// current-secret/new-code FFI copies are wiped.
+Uint8List exportSovereignRecoveryCertificate(
+  Uint8List bundle,
+  String phrase,
+  String recoveryCode,
+) {
+  final bundleBuf = calloc<Uint8>(bundle.length);
+  final phraseC = phrase.toNativeUtf8();
+  final codeC = recoveryCode.toNativeUtf8();
+  final certificateOut = calloc<Pointer<Uint8>>();
+  final certificateLenOut = calloc<IntPtr>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    bundleBuf.asTypedList(bundle.length).setAll(0, bundle);
+    final rc = ffi.veilSovereignRecoveryCertificateExportZeroize(
+      bundleBuf,
+      bundle.length,
+      phraseC.cast<Uint8>(),
+      phraseC.length,
+      codeC.cast<Uint8>(),
+      codeC.length,
+      certificateOut,
+      certificateLenOut,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException(_takeError(errOut), code: rc);
+    }
+    return Uint8List.fromList(
+      certificateOut.value.asTypedList(certificateLenOut.value),
+    );
+  } finally {
+    if (certificateOut.value != nullptr) {
+      ffi.veilFreeBuf(certificateOut.value, certificateLenOut.value);
+    }
+    calloc.free(bundleBuf);
+    calloc.free(phraseC);
+    calloc.free(codeC);
+    calloc.free(certificateOut);
+    calloc.free(certificateLenOut);
     calloc.free(errOut);
   }
 }
