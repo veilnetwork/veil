@@ -57,6 +57,8 @@ export 'src/sovereign_signer.dart'
     show
         VeilSovereignSigner,
         createHybrid512SovereignBundle,
+        exportSovereignRecoveryCertificate,
+        generateSovereignRecoveryCode,
         verifySovereignSignature;
 export 'src/crypto.dart' show VeilCrypto;
 export 'src/stream.dart' show VeilStream, VeilAnonStream;

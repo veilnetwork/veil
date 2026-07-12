@@ -20,12 +20,16 @@ use crate::master_file::{
 };
 
 const MAGIC: &[u8; 4] = b"XVSB";
+const RECOVERY_MAGIC: &[u8; 4] = b"XVRC";
 const VERSION: u8 = 1;
 const KDF_ARGON2ID: u8 = 1;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const AAD: &[u8] = b"xveil.sovereign.bundle.v1";
+const RECOVERY_AAD: &[u8] = b"xveil.sovereign.recovery-certificate.v1";
 const MAX_BUNDLE_BYTES: usize = 16 * 1024;
+const MIN_RECOVERY_CODE_BYTES: usize = 32;
+const MAX_RECOVERY_CODE_BYTES: usize = 256;
 const MAX_M_COST_KIB: u32 = 1_048_576;
 const MAX_T_COST: u32 = 1000;
 const MAX_P_COST: u8 = 64;
@@ -114,6 +118,7 @@ pub fn open(bundle: &[u8], phrase: &[u8]) -> Result<SovereignMaterial, Sovereign
             .map_err(|_| SovereignBundleError::WrongPasswordOrTampered)?,
     );
     let material = parse_plaintext(&plaintext)?;
+    validate_material_keypair(&material)?;
 
     // Bind the encrypted random Falcon half to the recovery phrase's stable
     // Ed25519 half. This also rejects a validly encrypted bundle copied from a
@@ -130,6 +135,147 @@ pub fn open(bundle: &[u8], phrase: &[u8]) -> Result<SovereignMaterial, Sovereign
         return Err(SovereignBundleError::WrongPasswordOrTampered);
     }
     Ok(material)
+}
+
+/// Re-wrap an existing XVSB as an offline recovery certificate. The exact
+/// Ed25519+Falcon512 material is preserved, so its full public key and derived
+/// node id do not rotate. Both passwords are caller-owned mutable buffers at
+/// the FFI layer and are wiped there; plaintext keys stay in `Zeroizing` RAM.
+pub fn export_recovery_certificate(
+    credential: &[u8],
+    current_secret: &[u8],
+    recovery_code: &[u8],
+) -> Result<Vec<u8>, SovereignBundleError> {
+    validate_recovery_code(recovery_code)?;
+    let material = if credential.starts_with(MAGIC) {
+        open(credential, current_secret)?
+    } else if credential.starts_with(RECOVERY_MAGIC) {
+        open_recovery_certificate(credential, current_secret)?
+    } else {
+        return Err(SovereignBundleError::Malformed(
+            "unsupported sovereign credential".into(),
+        ));
+    };
+    encode_recovery_material(&material, recovery_code)
+}
+
+/// Open an XVRC recovery certificate with its independent high-entropy code.
+/// Unlike XVSB, the password is not a BIP-39 phrase; continuity is proven by
+/// the public node id bound into the outer AEAD header plus a private/public
+/// signing self-check after decryption.
+pub fn open_recovery_certificate(
+    certificate: &[u8],
+    recovery_code: &[u8],
+) -> Result<SovereignMaterial, SovereignBundleError> {
+    if certificate.len() > MAX_BUNDLE_BYTES {
+        return Err(SovereignBundleError::Malformed(
+            "recovery certificate too large".into(),
+        ));
+    }
+    validate_recovery_code(recovery_code)?;
+    let parsed = parse_recovery_outer(certificate)?;
+    validate_costs(parsed.m_cost, parsed.t_cost, parsed.p_cost)?;
+    let key = derive_key(
+        recovery_code,
+        parsed.salt,
+        parsed.m_cost,
+        parsed.t_cost,
+        parsed.p_cost,
+    )?;
+    let aad = recovery_aad(&parsed.node_id);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key[..]));
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(parsed.nonce),
+                Payload {
+                    msg: parsed.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| SovereignBundleError::WrongPasswordOrTampered)?,
+    );
+    let material = parse_plaintext(&plaintext)?;
+    validate_material_keypair(&material)?;
+    if material.node_id() != parsed.node_id {
+        return Err(SovereignBundleError::WrongPasswordOrTampered);
+    }
+    Ok(material)
+}
+
+fn validate_recovery_code(code: &[u8]) -> Result<(), SovereignBundleError> {
+    if !(MIN_RECOVERY_CODE_BYTES..=MAX_RECOVERY_CODE_BYTES).contains(&code.len()) {
+        return Err(SovereignBundleError::Malformed(
+            "recovery code length out of range".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn recovery_aad(node_id: &[u8; 32]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(RECOVERY_AAD.len() + node_id.len());
+    aad.extend_from_slice(RECOVERY_AAD);
+    aad.extend_from_slice(node_id);
+    aad
+}
+
+fn encode_recovery_material(
+    material: &SovereignMaterial,
+    recovery_code: &[u8],
+) -> Result<Vec<u8>, SovereignBundleError> {
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(
+        7 + material.public_key.len() + material.private_key.len(),
+    ));
+    plaintext.push(material.algorithm.wire_byte());
+    plaintext.extend_from_slice(&(material.public_key.len() as u16).to_be_bytes());
+    plaintext.extend_from_slice(&material.public_key);
+    plaintext.extend_from_slice(&(material.private_key.len() as u16).to_be_bytes());
+    plaintext.extend_from_slice(&material.private_key);
+
+    let node_id = material.node_id();
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+    let key = derive_key(
+        recovery_code,
+        &salt,
+        DEFAULT_M_COST_KIB,
+        DEFAULT_T_COST,
+        DEFAULT_P_COST as u8,
+    )?;
+    let aad = recovery_aad(&node_id);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key[..]));
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| SovereignBundleError::Crypto("AEAD encrypt".into()))?;
+
+    let mut out = Vec::with_capacity(64 + ciphertext.len());
+    out.extend_from_slice(RECOVERY_MAGIC);
+    out.push(VERSION);
+    out.push(KDF_ARGON2ID);
+    out.extend_from_slice(&node_id);
+    out.extend_from_slice(&DEFAULT_M_COST_KIB.to_be_bytes());
+    out.extend_from_slice(&DEFAULT_T_COST.to_be_bytes());
+    out.push(DEFAULT_P_COST as u8);
+    out.push(SALT_LEN as u8);
+    out.extend_from_slice(&salt);
+    out.push(NONCE_LEN as u8);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+    out.extend_from_slice(&ciphertext);
+    if out.len() > MAX_BUNDLE_BYTES {
+        return Err(SovereignBundleError::Malformed(
+            "encoded recovery certificate too large".into(),
+        ));
+    }
+    Ok(out)
 }
 
 fn encode_material(
@@ -195,6 +341,16 @@ struct ParsedOuter<'a> {
     ciphertext: &'a [u8],
 }
 
+struct ParsedRecoveryOuter<'a> {
+    node_id: [u8; 32],
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u8,
+    salt: &'a [u8],
+    nonce: &'a [u8],
+    ciphertext: &'a [u8],
+}
+
 fn parse_outer(bytes: &[u8]) -> Result<ParsedOuter<'_>, SovereignBundleError> {
     let mut p = 0usize;
     let take = |p: &mut usize, n: usize| -> Result<&[u8], SovereignBundleError> {
@@ -232,6 +388,57 @@ fn parse_outer(bytes: &[u8]) -> Result<ParsedOuter<'_>, SovereignBundleError> {
         return Err(SovereignBundleError::Malformed("trailing bytes".into()));
     }
     Ok(ParsedOuter {
+        m_cost,
+        t_cost,
+        p_cost,
+        salt,
+        nonce,
+        ciphertext,
+    })
+}
+
+fn parse_recovery_outer(bytes: &[u8]) -> Result<ParsedRecoveryOuter<'_>, SovereignBundleError> {
+    let mut p = 0usize;
+    let take = |p: &mut usize, n: usize| -> Result<&[u8], SovereignBundleError> {
+        let end = p
+            .checked_add(n)
+            .ok_or_else(|| SovereignBundleError::Malformed("length overflow".into()))?;
+        let value = bytes
+            .get(*p..end)
+            .ok_or_else(|| SovereignBundleError::Malformed("truncated".into()))?;
+        *p = end;
+        Ok(value)
+    };
+    if take(&mut p, 4)? != RECOVERY_MAGIC || take(&mut p, 1)?[0] != VERSION {
+        return Err(SovereignBundleError::Malformed(
+            "bad recovery magic/version".into(),
+        ));
+    }
+    if take(&mut p, 1)?[0] != KDF_ARGON2ID {
+        return Err(SovereignBundleError::Malformed("unsupported KDF".into()));
+    }
+    let mut node_id = [0u8; 32];
+    node_id.copy_from_slice(take(&mut p, 32)?);
+    let m_cost = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap());
+    let t_cost = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap());
+    let p_cost = take(&mut p, 1)?[0];
+    let salt_len = take(&mut p, 1)?[0] as usize;
+    if salt_len != SALT_LEN {
+        return Err(SovereignBundleError::Malformed("bad salt length".into()));
+    }
+    let salt = take(&mut p, salt_len)?;
+    let nonce_len = take(&mut p, 1)?[0] as usize;
+    if nonce_len != NONCE_LEN {
+        return Err(SovereignBundleError::Malformed("bad nonce length".into()));
+    }
+    let nonce = take(&mut p, nonce_len)?;
+    let ct_len = u32::from_be_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
+    let ciphertext = take(&mut p, ct_len)?;
+    if p != bytes.len() {
+        return Err(SovereignBundleError::Malformed("trailing bytes".into()));
+    }
+    Ok(ParsedRecoveryOuter {
+        node_id,
         m_cost,
         t_cost,
         p_cost,
@@ -291,6 +498,14 @@ fn parse_plaintext(bytes: &[u8]) -> Result<SovereignMaterial, SovereignBundleErr
         public_key,
         private_key,
     })
+}
+
+fn validate_material_keypair(material: &SovereignMaterial) -> Result<(), SovereignBundleError> {
+    const CHALLENGE: &[u8] = b"xveil.sovereign.material-keypair.v1";
+    let signature = material.sign(CHALLENGE)?;
+    let public_b64 = STANDARD.encode(&material.public_key);
+    veil_crypto::verify_message(material.algorithm, &public_b64, CHALLENGE, &signature)
+        .map_err(|_| SovereignBundleError::WrongPasswordOrTampered)
 }
 
 fn validate_costs(m: u32, t: u32, p: u8) -> Result<(), SovereignBundleError> {
@@ -374,6 +589,69 @@ mod tests {
         assert!(matches!(
             open(&bundle, recovery_phrase.as_bytes()),
             Err(SovereignBundleError::WrongPasswordOrTampered)
+        ));
+    }
+
+    #[test]
+    fn recovery_certificate_preserves_full_public_key_and_node_id() {
+        let phrase = phrase();
+        let bundle = create_hybrid512(phrase.as_bytes()).unwrap();
+        let original = open(&bundle, phrase.as_bytes()).unwrap();
+        let code = b"xvrc-6DJm7JdJ55YtS5Xx1QEe9T9VyuXxJY2QpQqZ";
+        let certificate = export_recovery_certificate(&bundle, phrase.as_bytes(), code).unwrap();
+        assert_eq!(&certificate[..4], RECOVERY_MAGIC);
+        assert_eq!(&certificate[6..38], &original.node_id());
+
+        let restored = open_recovery_certificate(&certificate, code).unwrap();
+        assert_eq!(restored.algorithm, original.algorithm);
+        assert_eq!(restored.public_key, original.public_key);
+        assert_eq!(restored.node_id(), original.node_id());
+        let message = b"xveil-recovery-continuity";
+        let signature = restored.sign(message).unwrap();
+        veil_crypto::verify_message(
+            restored.algorithm,
+            &STANDARD.encode(&restored.public_key),
+            message,
+            &signature,
+        )
+        .unwrap();
+
+        let next_code = b"xvrc-next-independent-code-123456789012345";
+        let replacement =
+            export_recovery_certificate(&certificate, code, next_code).unwrap();
+        let reopened = open_recovery_certificate(&replacement, next_code).unwrap();
+        assert_eq!(reopened.node_id(), original.node_id());
+        assert_eq!(reopened.public_key, original.public_key);
+    }
+
+    #[test]
+    fn recovery_certificate_wrong_code_tamper_and_weak_code_fail_closed() {
+        let phrase = phrase();
+        let bundle = create_hybrid512(phrase.as_bytes()).unwrap();
+        let code = b"xvrc-correct-code-with-at-least-32-bytes";
+        let other = b"xvrc-other-code-with-at-least-32-bytes!!";
+        let certificate = export_recovery_certificate(&bundle, phrase.as_bytes(), code).unwrap();
+        assert!(matches!(
+            open_recovery_certificate(&certificate, other),
+            Err(SovereignBundleError::WrongPasswordOrTampered)
+        ));
+
+        let mut header_tamper = certificate.clone();
+        header_tamper[6] ^= 1; // public node id is AEAD-bound
+        assert!(matches!(
+            open_recovery_certificate(&header_tamper, code),
+            Err(SovereignBundleError::WrongPasswordOrTampered)
+        ));
+        let mut ciphertext_tamper = certificate;
+        let last = ciphertext_tamper.len() - 1;
+        ciphertext_tamper[last] ^= 1;
+        assert!(matches!(
+            open_recovery_certificate(&ciphertext_tamper, code),
+            Err(SovereignBundleError::WrongPasswordOrTampered)
+        ));
+        assert!(matches!(
+            export_recovery_certificate(&bundle, phrase.as_bytes(), b"short"),
+            Err(SovereignBundleError::Malformed(_))
         ));
     }
 }

@@ -6352,6 +6352,160 @@ pub unsafe extern "C" fn veil_sovereign_bundle_create_hybrid512_zeroize(
     }
 }
 
+/// Re-wrap an existing XVSB or XVRC credential into a fresh XVRC recovery
+/// certificate while preserving the exact full public key and derived node id.
+/// Current-secret and new-code buffers are wiped on every path; only encrypted
+/// certificate bytes return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_sovereign_recovery_certificate_export_zeroize(
+    bundle: *const u8,
+    bundle_len: size_t,
+    phrase: *mut u8,
+    phrase_len: size_t,
+    recovery_code: *mut u8,
+    recovery_code_len: size_t,
+    out_certificate: *mut *mut u8,
+    out_certificate_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    if !out_certificate.is_null() {
+        unsafe { *out_certificate = ptr::null_mut() }
+    }
+    if !out_certificate_len.is_null() {
+        unsafe { *out_certificate_len = 0 }
+    }
+    let valid_phrase = !phrase.is_null() && phrase_len <= MAX_FFI_CSTR_LEN;
+    let valid_code = !recovery_code.is_null() && recovery_code_len <= MAX_FFI_CSTR_LEN;
+    if bundle.is_null()
+        || bundle_len == 0
+        || bundle_len > 16 * 1024
+        || !valid_phrase
+        || !valid_code
+        || out_certificate.is_null()
+        || out_certificate_len.is_null()
+    {
+        if valid_phrase {
+            unsafe { volatile_wipe(phrase, phrase_len) };
+        }
+        if valid_code {
+            unsafe { volatile_wipe(recovery_code, recovery_code_len) };
+        }
+        unsafe { write_err(err_out, "invalid recovery certificate export arguments") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let owned_phrase = Zeroizing::new(
+        unsafe { std::slice::from_raw_parts(phrase.cast_const(), phrase_len) }.to_vec(),
+    );
+    let owned_code = Zeroizing::new(
+        unsafe { std::slice::from_raw_parts(recovery_code.cast_const(), recovery_code_len) }
+            .to_vec(),
+    );
+    unsafe {
+        volatile_wipe(phrase, phrase_len);
+        volatile_wipe(recovery_code, recovery_code_len);
+    }
+    let encrypted = unsafe { std::slice::from_raw_parts(bundle, bundle_len) };
+    match veil_identity::sovereign_bundle::export_recovery_certificate(
+        encrypted,
+        &owned_phrase,
+        &owned_code,
+    ) {
+        Ok(certificate) => {
+            let boxed = certificate.into_boxed_slice();
+            let len = boxed.len();
+            unsafe {
+                *out_certificate = Box::into_raw(boxed).cast();
+                *out_certificate_len = len;
+            }
+            VEIL_OK
+        }
+        Err(e) => {
+            unsafe { write_err(err_out, e.to_string()) };
+            VEIL_ERR
+        }
+    }
+}
+
+/// Open an XVRC with its independent recovery code as a short-lived hybrid
+/// signer. The code is wiped before return and plaintext material stays native.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_sovereign_signer_open_recovery_certificate_zeroize(
+    certificate: *const u8,
+    certificate_len: size_t,
+    recovery_code: *mut u8,
+    recovery_code_len: size_t,
+    out_signer: *mut *mut VeilSovereignSigner,
+    out_algorithm: *mut u8,
+    out_node_id: *mut u8,
+    out_node_id_cap: size_t,
+    out_public_key: *mut u8,
+    out_public_key_cap: size_t,
+    out_public_key_len: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { clear_err(err_out) };
+    if !out_signer.is_null() {
+        unsafe { *out_signer = ptr::null_mut() }
+    }
+    if !out_public_key_len.is_null() {
+        unsafe { *out_public_key_len = 0 }
+    }
+    let valid_code = !recovery_code.is_null() && recovery_code_len <= MAX_FFI_CSTR_LEN;
+    if certificate.is_null()
+        || certificate_len == 0
+        || certificate_len > 16 * 1024
+        || !valid_code
+        || out_signer.is_null()
+        || out_algorithm.is_null()
+        || out_node_id.is_null()
+        || out_node_id_cap < 32
+        || out_public_key.is_null()
+        || out_public_key_len.is_null()
+    {
+        if valid_code {
+            unsafe { volatile_wipe(recovery_code, recovery_code_len) };
+        }
+        unsafe { write_err(err_out, "invalid recovery certificate open arguments") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let owned_code = Zeroizing::new(
+        unsafe { std::slice::from_raw_parts(recovery_code.cast_const(), recovery_code_len) }
+            .to_vec(),
+    );
+    unsafe { volatile_wipe(recovery_code, recovery_code_len) };
+    let encrypted = unsafe { std::slice::from_raw_parts(certificate, certificate_len) };
+    let material =
+        match veil_identity::sovereign_bundle::open_recovery_certificate(encrypted, &owned_code) {
+            Ok(value) => value,
+            Err(e) => {
+                unsafe { write_err(err_out, e.to_string()) };
+                return VEIL_ERR;
+            }
+        };
+    if material.public_key.len() > out_public_key_cap {
+        unsafe { write_err(err_out, "sovereign public-key output buffer too small") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let node_id = material.node_id();
+    let algorithm = material.algorithm.wire_byte();
+    let public_key_len = material.public_key.len();
+    unsafe {
+        ptr::copy_nonoverlapping(node_id.as_ptr(), out_node_id, 32);
+        ptr::copy_nonoverlapping(material.public_key.as_ptr(), out_public_key, public_key_len);
+        *out_algorithm = algorithm;
+        *out_public_key_len = public_key_len;
+    }
+    let token = HandleTable::insert(
+        sovereign_signer_table(),
+        VeilSovereignSigner {
+            key: SovereignSignerKey::Bundle(material),
+        },
+    );
+    unsafe { *out_signer = token as *mut VeilSovereignSigner };
+    VEIL_OK
+}
+
 /// Decrypt a local sovereign bundle and open a short-lived variable-algorithm
 /// signer. Neither phrase nor plaintext key material crosses back to the host.
 #[unsafe(no_mangle)]
@@ -8039,6 +8193,98 @@ mod tests {
 
         unsafe {
             veil_sovereign_signer_close(signer);
+            veil_free_buf(bundle_ptr, bundle_len);
+        }
+    }
+
+    #[test]
+    fn sovereign_recovery_certificate_ffi_preserves_node_id_and_wipes_codes() {
+        let phrase = fresh_phrase();
+        let mut create_phrase = phrase.as_bytes().to_vec();
+        let create_len = create_phrase.len();
+        let mut bundle_ptr: *mut u8 = ptr::null_mut();
+        let mut bundle_len = 0usize;
+        let mut err: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                veil_sovereign_bundle_create_hybrid512_zeroize(
+                    create_phrase.as_mut_ptr(),
+                    create_len,
+                    &mut bundle_ptr,
+                    &mut bundle_len,
+                    &mut err,
+                )
+            },
+            VEIL_OK
+        );
+
+        let mut export_phrase = phrase.as_bytes().to_vec();
+        let export_phrase_len = export_phrase.len();
+        let mut export_code = b"xvrc-ffi-code-with-more-than-thirty-two-randomish-bytes".to_vec();
+        let export_code_len = export_code.len();
+        let mut certificate_ptr: *mut u8 = ptr::null_mut();
+        let mut certificate_len = 0usize;
+        assert_eq!(
+            unsafe {
+                veil_sovereign_recovery_certificate_export_zeroize(
+                    bundle_ptr,
+                    bundle_len,
+                    export_phrase.as_mut_ptr(),
+                    export_phrase_len,
+                    export_code.as_mut_ptr(),
+                    export_code_len,
+                    &mut certificate_ptr,
+                    &mut certificate_len,
+                    &mut err,
+                )
+            },
+            VEIL_OK
+        );
+        assert!(err.is_null());
+        assert!(export_phrase.iter().all(|byte| *byte == 0));
+        assert!(export_code.iter().all(|byte| *byte == 0));
+        let certificate =
+            unsafe { std::slice::from_raw_parts(certificate_ptr.cast_const(), certificate_len) };
+        assert_eq!(&certificate[..4], b"XVRC");
+
+        let mut open_code = b"xvrc-ffi-code-with-more-than-thirty-two-randomish-bytes".to_vec();
+        let open_code_len = open_code.len();
+        let mut signer: *mut VeilSovereignSigner = ptr::null_mut();
+        let mut algorithm = 0u8;
+        let mut node_id = [0u8; 32];
+        let mut public_key = [0u8; 1024];
+        let mut public_key_len = 0usize;
+        assert_eq!(
+            unsafe {
+                veil_sovereign_signer_open_recovery_certificate_zeroize(
+                    certificate.as_ptr(),
+                    certificate.len(),
+                    open_code.as_mut_ptr(),
+                    open_code_len,
+                    &mut signer,
+                    &mut algorithm,
+                    node_id.as_mut_ptr(),
+                    node_id.len(),
+                    public_key.as_mut_ptr(),
+                    public_key.len(),
+                    &mut public_key_len,
+                    &mut err,
+                )
+            },
+            VEIL_OK
+        );
+        assert!(err.is_null());
+        assert!(open_code.iter().all(|byte| *byte == 0));
+        assert_eq!(public_key_len, 929);
+        assert_eq!(
+            node_id,
+            veil_crypto::identity::compute_node_id(&public_key[..public_key_len])
+        );
+        assert_eq!(&certificate[6..38], &node_id);
+
+        unsafe {
+            veil_sovereign_signer_close(signer);
+            veil_free_buf(certificate_ptr, certificate_len);
             veil_free_buf(bundle_ptr, bundle_len);
         }
     }

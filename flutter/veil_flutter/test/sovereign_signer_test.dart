@@ -74,4 +74,49 @@ void main() {
         ? 'set VEIL_FFI_DYLIB to run native FFI coverage'
         : false,
   );
+
+  test(
+    'recovery certificate preserves the full sovereign node id',
+    () {
+      final phrase = generateMasterPhrase();
+      final bundle = createHybrid512SovereignBundle(phrase);
+      final original = VeilSovereignSigner.openBundle(bundle, phrase);
+      final code = generateSovereignRecoveryCode();
+      expect(code, startsWith('xvrc-'));
+      final certificate = exportSovereignRecoveryCertificate(
+        bundle,
+        phrase,
+        code,
+      );
+      expect(String.fromCharCodes(certificate.take(4)), 'XVRC');
+
+      final restored = VeilSovereignSigner.openRecoveryCertificate(
+        certificate,
+        code,
+      );
+      expect(restored.algorithm, original.algorithm);
+      expect(restored.nodeId, original.nodeId);
+      expect(restored.publicKey, original.publicKey);
+      expect(certificate.sublist(6, 38), original.nodeId);
+      restored.close();
+      original.close();
+
+      expect(
+        () => VeilSovereignSigner.openRecoveryCertificate(
+          certificate,
+          generateSovereignRecoveryCode(),
+        ),
+        throwsA(isA<VeilException>()),
+      );
+      final tampered = Uint8List.fromList(certificate);
+      tampered[6] ^= 1;
+      expect(
+        () => VeilSovereignSigner.openRecoveryCertificate(tampered, code),
+        throwsA(isA<VeilException>()),
+      );
+    },
+    skip: nativeDylib == null || nativeDylib.isEmpty
+        ? 'set VEIL_FFI_DYLIB to run native FFI coverage'
+        : false,
+  );
 }
