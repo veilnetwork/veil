@@ -366,6 +366,74 @@ void _registerRendezvousPublisherWorker(
   }
 }
 
+Uint8List _registerEphemeralOnionServiceWorker(
+  int handleAddr,
+  Uint8List seed,
+  int hopCount,
+) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final seedPtr = calloc<Uint8>(32)..asTypedList(32).setAll(0, seed);
+  final publicKey = calloc<Uint8>(32);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final rc = ffi.veilRegisterEphemeralOnionServiceZeroize(
+      handle,
+      seedPtr,
+      hopCount,
+      publicKey,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'register_ephemeral_onion_service failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+    return Uint8List.fromList(publicKey.asTypedList(32));
+  } finally {
+    seed.fillRange(0, seed.length, 0);
+    seedPtr.asTypedList(32).fillRange(0, 32, 0);
+    calloc.free(seedPtr);
+    calloc.free(publicKey);
+    calloc.free(errOut);
+  }
+}
+
+int _bindCapabilityWorker(
+  int handleAddr,
+  Uint8List namespace,
+  Uint8List name,
+  int endpointId,
+) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final nsPtr = calloc<Uint8>(namespace.length)
+    ..asTypedList(namespace.length).setAll(0, namespace);
+  final namePtr = calloc<Uint8>(name.length)
+    ..asTypedList(name.length).setAll(0, name);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final app = ffi.veilBindCapability(
+      handle,
+      nsPtr,
+      namespace.length,
+      namePtr,
+      name.length,
+      endpointId,
+      errOut,
+    );
+    if (app == nullptr) {
+      throw VeilException(
+        'bind capability failed: ${_readErrAndFree(errOut)}',
+      );
+    }
+    return app.address;
+  } finally {
+    calloc.free(nsPtr);
+    calloc.free(namePtr);
+    calloc.free(errOut);
+  }
+}
+
 // The four anonymous-send entrypoints below were originally wrapped in
 // `Future(() {...})`, which only DEFERS the work to a later microtask on the
 // SAME isolate — the synchronous, network-blocking FFI still ran on the UI
@@ -946,42 +1014,25 @@ class VeilClient implements Finalizable {
   Future<Uint8List> registerEphemeralOnionService(
     Uint8List identitySeed, {
     int hopCount = 3,
-  }) {
+  }) async {
     _ensureOpen();
     if (identitySeed.length != 32) {
       throw ArgumentError('identitySeed must be exactly 32 writable bytes');
     }
-    final seedPtr = calloc<Uint8>(32);
-    seedPtr.asTypedList(32).setAll(0, identitySeed);
+    final seed = Uint8List.fromList(identitySeed);
     identitySeed.fillRange(0, identitySeed.length, 0);
-    return Future(() {
-      final publicKey = calloc<Uint8>(32);
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        final rc = ffi.veilRegisterEphemeralOnionServiceZeroize(
-          _handle,
-          seedPtr,
+    final handleAddr = _handle.address;
+    try {
+      return await Isolate.run(
+        () => _registerEphemeralOnionServiceWorker(
+          handleAddr,
+          seed,
           hopCount,
-          publicKey,
-          errOut,
-        );
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-            'register_ephemeral_onion_service failed: '
-            '${_readErrAndFree(errOut)}',
-            code: rc,
-          );
-        }
-        return Uint8List.fromList(publicKey.asTypedList(32));
-      } finally {
-        // Native already zeroes this buffer; repeat before free as a host-side
-        // defense if a future ABI regression returns before its scrub.
-        seedPtr.asTypedList(32).fillRange(0, 32, 0);
-        calloc.free(seedPtr);
-        calloc.free(publicKey);
-        calloc.free(errOut);
-      }
-    });
+        ),
+      );
+    } finally {
+      seed.fillRange(0, seed.length, 0);
+    }
   }
 
   /// Stop refreshing one ephemeral service. Idempotent and deliberately does
@@ -1917,35 +1968,16 @@ class VeilClient implements Finalizable {
     int endpointId = 0,
   }) async {
     _ensureOpen();
-    return Future(() {
-      final ns = Uint8List.fromList(utf8.encode(namespace));
-      final nm = Uint8List.fromList(utf8.encode(name));
-      final nsPtr = ns.isEmpty ? nullptr : calloc<Uint8>(ns.length);
-      final nmPtr = nm.isEmpty ? nullptr : calloc<Uint8>(nm.length);
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        if (ns.isNotEmpty) nsPtr.asTypedList(ns.length).setAll(0, ns);
-        if (nm.isNotEmpty) nmPtr.asTypedList(nm.length).setAll(0, nm);
-        final app = ffi.veilBindCapability(
-          _handle,
-          nsPtr,
-          ns.length,
-          nmPtr,
-          nm.length,
-          endpointId,
-          errOut,
-        );
-        if (app == nullptr) {
-          throw VeilException(
-              'bind capability failed: ${_readErrAndFree(errOut)}');
-        }
-        return AppHandle._(app);
-      } finally {
-        if (nsPtr != nullptr) calloc.free(nsPtr);
-        if (nmPtr != nullptr) calloc.free(nmPtr);
-        calloc.free(errOut);
-      }
-    });
+    final ns = Uint8List.fromList(utf8.encode(namespace));
+    final nm = Uint8List.fromList(utf8.encode(name));
+    if (ns.isEmpty || nm.isEmpty) {
+      throw ArgumentError('capability namespace and name must not be empty');
+    }
+    final handleAddr = _handle.address;
+    final appAddr = await Isolate.run(
+      () => _bindCapabilityWorker(handleAddr, ns, nm, endpointId),
+    );
+    return AppHandle._(Pointer<ffi.VeilApp>.fromAddress(appAddr));
   }
 
   Future<AppHandle> _bindCommon({
