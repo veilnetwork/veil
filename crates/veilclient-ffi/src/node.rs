@@ -297,10 +297,20 @@ pub unsafe extern "C" fn veil_config_compose(
     // Build the runtime endpoints as a TOML template so veil-cfg parses them
     // into the right structs (no hand-constructed ListenConfig), then graft on
     // the stored identity.
+    let ipc_endpoint = if ipc.contains("://") {
+        ipc
+    } else {
+        format!("unix://{ipc}")
+    };
+    let admin_endpoint = if admin.contains("://") {
+        admin
+    } else {
+        format!("unix://{admin}")
+    };
     let template = format!(
         "[[listen]]\nid = \"0x00000001\"\ntransport = \"{listen}\"\n\n\
-         [ipc]\nenabled = true\nsocket_uri = \"unix://{ipc}\"\n\n\
-         [global]\nadmin_socket = \"unix://{admin}\"\n"
+         [ipc]\nenabled = true\nsocket_uri = \"{ipc_endpoint}\"\n\n\
+         [global]\nadmin_socket = \"{admin_endpoint}\"\n"
     );
     let mut config = match veil_cfg::parse_toml_str(&template) {
         Ok(c) => c,
@@ -379,17 +389,18 @@ pub unsafe extern "C" fn veil_node_start(
     }
     // Config-file mode carries its own `[anonymity]` in that file — the stub
     // `anonymous` flag only applies to the deferred (config-less) boot.
-    start_thread(Some(path), None, false, err_out)
+    start_thread(Some(path), None, None, false, err_out)
 }
 
 /// Start an embedded node in deferred-init mode: it boots under an ephemeral
-/// throwaway identity, binds ONLY the admin socket at `admin_socket` (`(ptr,
-/// len)`, UTF-8 filesystem path), and waits. Promote it to its real identity by
+/// throwaway identity, binds ONLY the admin endpoint at `admin_socket` (`(ptr,
+/// len)`, UTF-8 Unix path or authenticated loopback-TCP URI), and waits. Promote it to its real identity by
 /// pushing a config with `veil_node_apply_config` — so the real private key
 /// never has to be written to a config file on disk.
 ///
-/// Pick an ephemeral, identity-free path for `admin_socket` (e.g. one under a
-/// per-launch temp dir). Non-blocking; returns an opaque handle or null + err.
+/// Pick an ephemeral, identity-free endpoint for `admin_socket` (e.g. a path
+/// under a per-launch temp dir, or `tcp://127.0.0.1:0?runtime_dir=...`).
+/// Non-blocking; returns an opaque handle or null + err.
 ///
 /// `anonymous` arms `[anonymity]` in the stub boot config so the node is
 /// actually onion-reachable once its real identity is applied. It MUST be set
@@ -413,12 +424,33 @@ pub unsafe extern "C" fn veil_node_start_deferred(
         return std::ptr::null_mut();
     }
     let bytes = unsafe { std::slice::from_raw_parts(admin_socket_ptr, admin_socket_len) };
-    let sock = match std::str::from_utf8(bytes) {
-        Ok(s) => PathBuf::from(s),
+    let endpoint = match std::str::from_utf8(bytes) {
+        Ok(s) if s.contains("://") => s.to_owned(),
+        Ok(s) => format!("unix://{s}"),
         Err(_) => {
             unsafe { set_err(err_out, "admin_socket is not valid UTF-8") };
             return std::ptr::null_mut();
         }
+    };
+    let anchor = if let Some(path) = endpoint.strip_prefix("unix://") {
+        PathBuf::from(path)
+    } else if endpoint.starts_with("tcp://") {
+        let runtime_dir = endpoint
+            .split_once('?')
+            .and_then(|(_, query)| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("runtime_dir="))
+            })
+            .filter(|value| !value.is_empty());
+        let Some(runtime_dir) = runtime_dir else {
+            unsafe { set_err(err_out, "TCP admin endpoint requires runtime_dir") };
+            return std::ptr::null_mut();
+        };
+        PathBuf::from(runtime_dir).join("admin.anchor")
+    } else {
+        unsafe { set_err(err_out, "admin_socket must use unix:// or tcp://") };
+        return std::ptr::null_mut();
     };
     // Android: `std::env::temp_dir()` defaults to /data/local/tmp, which a normal
     // app CANNOT write — the deferred boot's `tempfile` working dir then fails
@@ -428,23 +460,24 @@ pub unsafe extern "C" fn veil_node_start_deferred(
     // every temp_dir() user in the embedded node at once, not just the deferred
     // working dir.
     #[cfg(target_os = "android")]
-    if let Some(parent) = sock.parent() {
+    if let Some(parent) = anchor.parent() {
         // Safety: set once at boot, before the node thread (the env reader) is
         // spawned, so there is no concurrent env access.
         unsafe { std::env::set_var("TMPDIR", parent) };
     }
-    start_thread(None, Some(sock), anonymous, err_out)
+    start_thread(None, Some(endpoint), Some(anchor), anonymous, err_out)
 }
 
 fn start_thread(
     config: Option<PathBuf>,
+    admin_endpoint: Option<String>,
     admin_socket: Option<PathBuf>,
     anonymous: bool,
     err_out: *mut *mut c_char,
 ) -> *mut VeilNode {
     let (tx, mut rx) = watch::channel(false);
     let mut shutdown_deadline = rx.clone();
-    let thread_admin_socket = admin_socket.clone();
+    let thread_admin_endpoint = admin_endpoint;
     let spawn = std::thread::Builder::new()
         .name("veil-node".into())
         .spawn(move || {
@@ -503,7 +536,7 @@ fn start_thread(
                     }
                     None => {
                         veil_node_runtime::admin::run_foreground_deferred_with_shutdown(
-                            thread_admin_socket,
+                            thread_admin_endpoint,
                             anonymous,
                             shutdown,
                         )
@@ -847,6 +880,49 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("xveil-test-admin.sock")
+        );
+    }
+
+    #[test]
+    fn config_compose_preserves_authenticated_loopback_endpoints() {
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let id_out = unsafe { veil_config_init(8, &mut err) };
+        assert!(!id_out.is_null());
+        let identity_toml = unsafe { CStr::from_ptr(id_out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(id_out) };
+
+        let listen = b"tcp://127.0.0.1:9931";
+        let ipc = b"tcp://127.0.0.1:0?runtime_dir=/tmp/xveil-ios";
+        let admin = b"tcp://127.0.0.1:0?runtime_dir=/tmp/xveil-ios";
+        let out = unsafe {
+            veil_config_compose(
+                identity_toml.as_ptr(),
+                identity_toml.len(),
+                listen.as_ptr(),
+                listen.len(),
+                ipc.as_ptr(),
+                ipc.len(),
+                admin.as_ptr(),
+                admin.len(),
+                &mut err,
+            )
+        };
+        assert!(!out.is_null(), "compose returned null");
+        let full = unsafe { CStr::from_ptr(out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::veil_free_string(out) };
+
+        let cfg = veil_cfg::parse_toml_str(&full).expect("composed config parses");
+        assert_eq!(
+            cfg.ipc.socket_uri.as_deref(),
+            Some(std::str::from_utf8(ipc).unwrap())
+        );
+        assert_eq!(
+            cfg.global.admin_socket.as_deref(),
+            Some(std::str::from_utf8(admin).unwrap())
         );
     }
 

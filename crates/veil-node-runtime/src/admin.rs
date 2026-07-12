@@ -1114,7 +1114,7 @@ pub async fn run_foreground_deferred() -> Result<()> {
 /// [`veil_cfg::build_stub_config_with_ephemeral_identity`] for why this must be
 /// set at boot rather than via the later apply-config.
 pub async fn run_foreground_deferred_with_shutdown<F>(
-    admin_socket: Option<PathBuf>,
+    admin_endpoint: Option<String>,
     anonymous: bool,
     external_shutdown: F,
 ) -> Result<()>
@@ -1126,11 +1126,12 @@ where
     let mut stub_config = veil_cfg::build_stub_config_with_ephemeral_identity(anonymous)
         .map_err(crate::error::NodeError::Config)?;
 
-    // Caller-chosen admin socket (embedded hosts pick an ephemeral, identity-free
-    // path they can reach with `apply-config`). Otherwise the default — derived
-    // from the per-run temp config path below — is used.
-    if let Some(sock) = &admin_socket {
-        stub_config.global.admin_socket = Some(format!("unix://{}", sock.display()));
+    // Caller-chosen admin endpoint (embedded hosts pick either an ephemeral
+    // Unix path or authenticated loopback-TCP discovery URI they can reach with
+    // `apply-config`). Otherwise the default derived from the temp config below
+    // is used.
+    if let Some(endpoint) = &admin_endpoint {
+        stub_config.global.admin_socket = Some(endpoint.clone());
     }
 
     // Per-run temp working dir (mlkem.key + future identity_document.bin land
