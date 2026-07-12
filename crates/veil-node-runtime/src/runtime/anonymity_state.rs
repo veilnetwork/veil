@@ -678,6 +678,19 @@ pub struct OnionServiceEntry {
     /// it is monotonic AND still tracks wall-clock. Shared (`Arc`) so the value
     /// persists across rebuilds of this entry.
     pub registration_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+
+    /// Ed25519 seed whose public key addresses this blinded descriptor. The
+    /// normal node service stores its sovereign Ed25519 seed here; capability
+    /// services store a random per-share seed. Keeping it in one Arc avoids
+    /// secret copies during maintenance, and Zeroizing scrubs it when revoke
+    /// removes the last entry/reference. `None` preserves the legacy
+    /// no-sovereign random-circuit fallback (which publishes no descriptor).
+    pub descriptor_identity_seed: Option<Arc<zeroize::Zeroizing<[u8; 32]>>>,
+
+    /// True only for application-created capability services. Prevents the
+    /// withdrawal API from stopping the node's normal sovereign service and
+    /// lets config auto-start distinguish the two kinds.
+    pub ephemeral: bool,
 }
 
 impl AnonymityState {
@@ -784,7 +797,10 @@ mod tests {
         // (zero idle DHT load). ZERO window drops every mark.
         assert!(
             cache
-                .refresh_candidates(std::time::Duration::ZERO, std::time::Duration::from_secs(60))
+                .refresh_candidates(
+                    std::time::Duration::ZERO,
+                    std::time::Duration::from_secs(60)
+                )
                 .is_empty(),
             "inactive receivers must not be refreshed"
         );
@@ -946,8 +962,11 @@ mod tests {
         // After the window lapses with no further reply-expecting sends, peek
         // returns to normal (no self-re-tripping).
         assert!(
-            !t.peek(&r, 200 + ANON_SEND_STALL_MIN_SECS + ANON_SEND_WIDEN_SECS + 1)
-                .widen
+            !t.peek(
+                &r,
+                200 + ANON_SEND_STALL_MIN_SECS + ANON_SEND_WIDEN_SECS + 1
+            )
+            .widen
         );
     }
 

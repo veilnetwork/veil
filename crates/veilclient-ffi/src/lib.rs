@@ -2897,6 +2897,138 @@ pub unsafe extern "C" fn veil_register_onion_service(
     }
 }
 
+fn embedded_services_for_bundle(
+    bundle: &Arc<RuntimeBundle>,
+) -> Result<veil_node_runtime::NodeServices, String> {
+    let me = bundle.runtime.block_on(async {
+        let client = bundle.client.lock().await;
+        client
+            .node_identity()
+            .await
+            .map(|identity| identity.node_id)
+            .map_err(|e| format!("node_identity: {e}"))
+    })?;
+    veil_node_runtime::embedded_services_for(&me)
+        .or_else(|| {
+            let latest = veil_node_runtime::embedded_services()?;
+            (latest.local_node_id() == me).then_some(latest)
+        })
+        .ok_or_else(|| "embedded node services unavailable for this handle".to_string())
+}
+
+/// Register a location-anonymous service under a caller-owned random Ed25519
+/// seed rather than the node's sovereign key. The seed buffer is writable and
+/// is ZEROED immediately on every post-validation path. On success writes the
+/// corresponding 32-byte public service identity to `out_identity_vk`; this is
+/// the only address that belongs in a public capability link. The blinded DHT
+/// descriptor and rendezvous advert contain no sovereign public key/node id.
+///
+/// Embedded-node only: the service circuit lives in this process's node
+/// runtime. Re-register the same seed after restart; registration is idempotent
+/// within a descriptor period. At most the runtime's bounded hosted-service cap
+/// may be active.
+///
+/// # Safety
+/// `identity_seed_32` must point to 32 WRITABLE bytes; they are zeroized.
+/// `out_identity_vk_32` must point to 32 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_register_ephemeral_onion_service_zeroize(
+    handle: *mut VeilHandle,
+    identity_seed_32: *mut u8,
+    hop_count: u32,
+    out_identity_vk_32: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) =
+        unsafe { guard::ffi_prelude(err_out, "veil_register_ephemeral_onion_service_zeroize") }
+    {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "identity_seed_32" => identity_seed_32,
+        "out_identity_vk_32" => out_identity_vk_32,
+    );
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    unsafe {
+        ptr::copy_nonoverlapping(identity_seed_32, seed.as_mut_ptr(), 32);
+        ptr::write_bytes(identity_seed_32, 0, 32);
+    }
+    if seed.iter().all(|byte| *byte == 0) {
+        unsafe { write_err(err_out, "ephemeral service seed must not be all-zero") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let services = match embedded_services_for_bundle(&handle_live.bundle) {
+        Ok(services) => services,
+        Err(error) => {
+            unsafe { write_err(err_out, error) };
+            return VEIL_ERR;
+        }
+    };
+    let public_key = match services.register_ephemeral_onion_service(seed, hop_count as usize) {
+        Ok(public_key) => public_key,
+        Err(error) => {
+            unsafe {
+                write_err(
+                    err_out,
+                    format!("register_ephemeral_onion_service failed: {error:?}"),
+                )
+            };
+            return VEIL_ERR;
+        }
+    };
+    unsafe { ptr::copy_nonoverlapping(public_key.as_ptr(), out_identity_vk_32, 32) };
+    VEIL_OK
+}
+
+/// Stop maintaining one caller-owned ephemeral onion service. Idempotent:
+/// unknown/already-withdrawn public keys return `VEIL_OK` too, so this local
+/// lifecycle API never becomes a remote existence oracle. DHT ciphertext and
+/// the circuit age out naturally; the host must reject capability requests as
+/// soon as its encrypted registry marks the share revoked.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_withdraw_ephemeral_onion_service(
+    handle: *mut VeilHandle,
+    identity_vk_32: *const u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_withdraw_ephemeral_onion_service") }
+    {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "identity_vk_32" => identity_vk_32,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let mut public_key = [0u8; 32];
+    unsafe { ptr::copy_nonoverlapping(identity_vk_32, public_key.as_mut_ptr(), 32) };
+    let services = match embedded_services_for_bundle(&handle_live.bundle) {
+        Ok(services) => services,
+        Err(error) => {
+            unsafe { write_err(err_out, error) };
+            return VEIL_ERR;
+        }
+    };
+    services.withdraw_ephemeral_onion_service(public_key);
+    VEIL_OK
+}
+
 /// Register a PLAIN rendezvous-publisher entry (mailbox-by-discovery): the
 /// daemon's maintenance tick signs + publishes a v5 `RendezvousAd` under THIS
 /// node's real id at `rendezvous_node_id`'s rendezvous slot, advertising the
@@ -8618,5 +8750,45 @@ mod tests {
         // Caller would parse here; we just confirm the free path is sound
         // (run under `cargo test` / Miri this proves no double-free / leak).
         unsafe { veil_free_replica_buf(ptr, len) };
+    }
+
+    #[test]
+    fn ephemeral_service_registration_zeroizes_seed_before_dead_handle_error() {
+        let mut seed = [0xA5u8; 32];
+        let mut public_key = [0u8; 32];
+        let mut error: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_register_ephemeral_onion_service_zeroize(
+                1usize as *mut VeilHandle,
+                seed.as_mut_ptr(),
+                3,
+                public_key.as_mut_ptr(),
+                &mut error,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert_eq!(seed, [0u8; 32], "writable caller seed is always scrubbed");
+        assert!(!error.is_null());
+        unsafe { veil_free_string(error) };
+    }
+
+    #[test]
+    fn ephemeral_service_registration_rejects_zero_seed_after_scrub() {
+        let mut seed = [0u8; 32];
+        let mut public_key = [0u8; 32];
+        let mut error: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_register_ephemeral_onion_service_zeroize(
+                1usize as *mut VeilHandle,
+                seed.as_mut_ptr(),
+                3,
+                public_key.as_mut_ptr(),
+                &mut error,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert_eq!(seed, [0u8; 32]);
+        assert!(!error.is_null());
+        unsafe { veil_free_string(error) };
     }
 }
