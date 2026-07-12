@@ -105,8 +105,24 @@ pub(crate) async fn handle_bind(
         }
     };
     let ephemeral = bind.flags & veil_proto::ipc::ipc_bind_flags::EPHEMERAL != 0;
+    let capability = bind.flags & veil_proto::ipc::ipc_bind_flags::CAPABILITY != 0;
+    if ephemeral && capability {
+        let err = AppBindErrPayload {
+            error_code: ipc_bind_err::INVALID_REQUEST,
+            detail: b"EPHEMERAL and CAPABILITY bind flags are mutually exclusive".to_vec(),
+        };
+        return write_frame_wh(
+            wh,
+            FrameFamily::LocalApp as u8,
+            LocalAppMsg::AppBindErr as u16,
+            &err.encode(),
+        )
+        .await;
+    }
     let app_id = if ephemeral {
         veil_app::address::ephemeral_app_id(node_id, client_token, namespace, name)
+    } else if capability {
+        veil_app::address::capability_app_id(namespace, name)
     } else {
         veil_app::address::app_id(node_id, namespace, name)
     };
@@ -119,7 +135,7 @@ pub(crate) async fn handle_bind(
     match app_registry.try_register(app_id, bind.endpoint_id, 4096) {
         Ok((handle, rx)) => {
             // Create per-app socket marker in PerApp mode.
-            let socket_path = if !ephemeral {
+            let socket_path = if !ephemeral && !capability {
                 app_socket_dir.and_then(|dir| build_per_app_socket(dir, &app_id))
             } else {
                 None

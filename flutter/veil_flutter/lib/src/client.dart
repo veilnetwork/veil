@@ -1908,6 +1908,46 @@ class VeilClient implements Finalizable {
         namespace: namespace, name: name, endpointId: endpointId, named: true);
   }
 
+  /// Bind a secret stable capability alias. Unlike [bindNamed], its app id is
+  /// independent of this node id and can therefore be shared by several
+  /// sovereign devices hosting the same capability.
+  Future<AppHandle> bindCapability({
+    required String namespace,
+    required String name,
+    int endpointId = 0,
+  }) async {
+    _ensureOpen();
+    return Future(() {
+      final ns = Uint8List.fromList(utf8.encode(namespace));
+      final nm = Uint8List.fromList(utf8.encode(name));
+      final nsPtr = ns.isEmpty ? nullptr : calloc<Uint8>(ns.length);
+      final nmPtr = nm.isEmpty ? nullptr : calloc<Uint8>(nm.length);
+      final errOut = calloc<Pointer<Utf8>>();
+      try {
+        if (ns.isNotEmpty) nsPtr.asTypedList(ns.length).setAll(0, ns);
+        if (nm.isNotEmpty) nmPtr.asTypedList(nm.length).setAll(0, nm);
+        final app = ffi.veilBindCapability(
+          _handle,
+          nsPtr,
+          ns.length,
+          nmPtr,
+          nm.length,
+          endpointId,
+          errOut,
+        );
+        if (app == nullptr) {
+          throw VeilException(
+              'bind capability failed: ${_readErrAndFree(errOut)}');
+        }
+        return AppHandle._(app);
+      } finally {
+        if (nsPtr != nullptr) calloc.free(nsPtr);
+        if (nmPtr != nullptr) calloc.free(nmPtr);
+        calloc.free(errOut);
+      }
+    });
+  }
+
   Future<AppHandle> _bindCommon({
     required String namespace,
     required String name,
