@@ -93,7 +93,7 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* ptr,
 
 namespace {
 
-const char* kVersion = "veil_media 0.0.2 (group-audio)";
+const char* kVersion = "veil_media 0.0.3 (group-video)";
 constexpr int kOpusPayloadType = 111;  // SDP convention (Opus, 48k, stereo)
 
 // Diagnostic log to a file (a GUI app's stderr is not captured by the unified
