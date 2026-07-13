@@ -50,9 +50,13 @@ const AUTH_DELIVER_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// replay caches key on that id, while reassembly keys on the inner
 /// `(transfer_id, chunk_index, orig_content_id)`, so this preserves terminal
 /// dedup/ACK semantics and lets a piece lost after hop one traverse again.
-fn prepare_ack_retransmit_frame(frame: &[u8], next_hop: [u8; 32]) -> Option<Vec<u8>> {
+/// Ordinary ACK-tracked frames retain their terminal content id and advance the
+/// bounded Forward delivery-attempt suffix instead.
+fn prepare_ack_retransmit_frame(frame: &[u8], next_hop: [u8; 32], attempt: u32) -> Option<Vec<u8>> {
     use rand_core::RngCore;
-    use veil_proto::delivery::{CHUNKED_ENVELOPE_MARKER, OFFSET_CONTENT_ID, OFFSET_PAYLOAD};
+    use veil_proto::delivery::{
+        CHUNKED_ENVELOPE_MARKER, FORWARD_DELIVERY_ATTEMPT_MARKER, OFFSET_CONTENT_ID, OFFSET_PAYLOAD,
+    };
 
     let header = veil_proto::header::HEADER_SIZE;
     let envelope = header.checked_add(32)?;
@@ -67,6 +71,10 @@ fn prepare_ack_retransmit_frame(frame: &[u8], next_hop: [u8; 32]) -> Option<Vec<
         let mut content_id = [0u8; 32];
         rand_core::OsRng.fill_bytes(&mut content_id);
         out[content_id_offset..content_id_offset + 32].copy_from_slice(&content_id);
+    } else if out.len() >= 2 && out[out.len() - 2] == FORWARD_DELIVERY_ATTEMPT_MARKER {
+        let attempt = u8::try_from(attempt).ok()?;
+        let last = out.len() - 1;
+        out[last] = attempt;
     }
     Some(out)
 }
@@ -2683,7 +2691,8 @@ impl NodeRuntime {
                             // retry that was lost after the first hop.
                             let send_batch = |hop: [u8; 32]| -> bool {
                                 for frame in frames.iter() {
-                                    let Some(prepared) = prepare_ack_retransmit_frame(frame, hop)
+                                    let Some(prepared) =
+                                        prepare_ack_retransmit_frame(frame, hop, attempt)
                                     else {
                                         return false;
                                     };
@@ -4187,6 +4196,44 @@ mod tests {
     use veil_cfg::{BootstrapPeer, SignatureAlgorithm};
 
     #[test]
+    fn ordinary_retransmit_advances_attempt_without_changing_terminal_content_id() {
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::FrameHeader;
+
+        let envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any([0x21; 32]),
+            sender_node_id: [0x22; 32],
+            src_app_id: [0x23; 32],
+            app_id: [0x24; 32],
+            endpoint_id: 9,
+            content_id: [0x25; 32],
+            created_at: 1,
+            ttl_secs: 30,
+            payload: vec![1, 2, 3],
+            trace_id: 0,
+            require_ack: true,
+        };
+        let body = ForwardPayload {
+            next_hop_node_id: [0x26; 32],
+            envelope,
+            relay_hops: 0,
+            delivery_attempt: Some(1),
+        }
+        .encode();
+        let mut header = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+        header.body_len = body.len() as u32;
+        let frame = veil_proto::codec::encode_frame(&header, &body);
+
+        let retried = prepare_ack_retransmit_frame(&frame, [0x27; 32], 2).unwrap();
+        let retried = ForwardPayload::decode(&retried[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(retried.next_hop_node_id, [0x27; 32]);
+        assert_eq!(retried.envelope.content_id, [0x25; 32]);
+        assert_eq!(retried.delivery_attempt, Some(2));
+        assert!(prepare_ack_retransmit_frame(&frame, [0x27; 32], 256).is_none());
+    }
+
+    #[test]
     fn chunk_retransmit_refreshes_only_carrier_id_and_next_hop() {
         use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope, ForwardPayload};
         use veil_proto::family::{DeliveryMsg, FrameFamily};
@@ -4218,14 +4265,15 @@ mod tests {
             next_hop_node_id: [0x88; 32],
             envelope,
             relay_hops: 0,
+            delivery_attempt: None,
         }
         .encode();
         let mut header = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
         header.body_len = body.len() as u32;
         let frame = veil_proto::codec::encode_frame(&header, &body);
 
-        let first = prepare_ack_retransmit_frame(&frame, [0x99; 32]).unwrap();
-        let second = prepare_ack_retransmit_frame(&frame, [0xAA; 32]).unwrap();
+        let first = prepare_ack_retransmit_frame(&frame, [0x99; 32], 2).unwrap();
+        let second = prepare_ack_retransmit_frame(&frame, [0xAA; 32], 2).unwrap();
         let first = ForwardPayload::decode(&first[veil_proto::header::HEADER_SIZE..]).unwrap();
         let second = ForwardPayload::decode(&second[veil_proto::header::HEADER_SIZE..]).unwrap();
         assert_eq!(first.next_hop_node_id, [0x99; 32]);
@@ -4279,6 +4327,7 @@ mod tests {
                 next_hop_node_id: [0xB7; 32],
                 envelope,
                 relay_hops: 0,
+                delivery_attempt: None,
             }
             .encode();
             let mut header =
@@ -4303,7 +4352,7 @@ mod tests {
         let mut completed = 0;
         let mut replayed_tail = 0;
         for (index, frame) in frames.iter().enumerate() {
-            let retried = prepare_ack_retransmit_frame(frame, [0xC1; 32]).unwrap();
+            let retried = prepare_ack_retransmit_frame(frame, [0xC1; 32], 2).unwrap();
             let fwd = ForwardPayload::decode(&retried[veil_proto::HEADER_SIZE..]).unwrap();
             assert_ne!(fwd.envelope.content_id, [index as u8 + 1; 32]);
             let chunk = ChunkedEnvelopePayload::decode(&fwd.envelope.payload).unwrap();
