@@ -289,6 +289,131 @@ final int Function(Pointer<VeilGroupMediaEngineHandle>, Pointer<Uint8>)
                 )>>('veil_media_group_engine_peer_rx_packets')
         .asFunction();
 
+final int Function(Pointer<VeilGroupMediaEngineHandle>)
+    veilMediaGroupEngineStartVideo = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilGroupMediaEngineHandle>)>>(
+          'veil_media_group_engine_start_video',
+        )
+        .asFunction();
+
+final int Function(Pointer<VeilGroupMediaEngineHandle>)
+    veilMediaGroupEngineStopVideo = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilGroupMediaEngineHandle>)>>(
+          'veil_media_group_engine_stop_video',
+        )
+        .asFunction();
+
+final int Function(Pointer<VeilGroupMediaEngineHandle>, int, int, int)
+    veilMediaGroupEngineStartCamera = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                  Pointer<VeilGroupMediaEngineHandle>,
+                  Int32,
+                  Int32,
+                  Int32,
+                )>>('veil_media_group_engine_start_camera')
+        .asFunction();
+
+final int Function(Pointer<VeilGroupMediaEngineHandle>)
+    veilMediaGroupEngineStopCamera = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilGroupMediaEngineHandle>)>>(
+          'veil_media_group_engine_stop_camera',
+        )
+        .asFunction();
+
+final int Function(Pointer<VeilGroupMediaEngineHandle>, int, int)
+    veilMediaGroupEngineStartScreen = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                  Pointer<VeilGroupMediaEngineHandle>,
+                  Int32,
+                  Int32,
+                )>>('veil_media_group_engine_start_screen')
+        .asFunction();
+
+final int Function(Pointer<VeilGroupMediaEngineHandle>)
+    veilMediaGroupEngineStopScreen = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilGroupMediaEngineHandle>)>>(
+          'veil_media_group_engine_stop_screen',
+        )
+        .asFunction();
+
+final int Function(
+  Pointer<VeilGroupMediaEngineHandle>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  int,
+  int,
+  int,
+  int,
+  int,
+) veilMediaGroupEnginePushVideoFrame = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilGroupMediaEngineHandle>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Int32,
+              Int32,
+              Int32,
+              Int32,
+              Int32,
+              Int64,
+            )>>('veil_media_group_engine_push_video_frame')
+    .asFunction();
+
+final int Function(
+  Pointer<VeilGroupMediaEngineHandle>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Int32>,
+  Pointer<Int32>,
+) veilMediaGroupEngineGetPeerVideoFrame = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilGroupMediaEngineHandle>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Int32,
+              Pointer<Int32>,
+              Pointer<Int32>,
+            )>>('veil_media_group_engine_get_peer_video_frame')
+    .asFunction();
+
+final int Function(
+  Pointer<VeilGroupMediaEngineHandle>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Int32>,
+  Pointer<Int32>,
+) veilMediaGroupEngineGetLocalVideoFrame = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilGroupMediaEngineHandle>,
+              Pointer<Uint8>,
+              Int32,
+              Pointer<Int32>,
+              Pointer<Int32>,
+            )>>('veil_media_group_engine_get_local_video_frame')
+    .asFunction();
+
 // ---- Voice-message recorder (mic -> Opus -> RAM) --------------------------
 
 /// Opaque recorder handle (VeilAudioRecorder*).
