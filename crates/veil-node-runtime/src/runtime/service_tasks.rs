@@ -45,6 +45,32 @@ const AUTH_DELIVER_CHANNEL_CAP: usize = 256;
 /// serial verify queue when a sender's document is unreachable.
 const AUTH_DELIVER_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Clone one tracked Forward frame for a retry, patching its direct next hop.
+/// Chunk carriers additionally receive a fresh outer `content_id`: relay
+/// replay caches key on that id, while reassembly keys on the inner
+/// `(transfer_id, chunk_index, orig_content_id)`, so this preserves terminal
+/// dedup/ACK semantics and lets a piece lost after hop one traverse again.
+fn prepare_ack_retransmit_frame(frame: &[u8], next_hop: [u8; 32]) -> Option<Vec<u8>> {
+    use rand_core::RngCore;
+    use veil_proto::delivery::{CHUNKED_ENVELOPE_MARKER, OFFSET_CONTENT_ID, OFFSET_PAYLOAD};
+
+    let header = veil_proto::header::HEADER_SIZE;
+    let envelope = header.checked_add(32)?;
+    let payload_offset = envelope.checked_add(OFFSET_PAYLOAD)?;
+    let content_id_offset = envelope.checked_add(OFFSET_CONTENT_ID)?;
+    if frame.len() <= payload_offset || frame.len() < content_id_offset.checked_add(32)? {
+        return None;
+    }
+    let mut out = frame.to_vec();
+    out[header..header + 32].copy_from_slice(&next_hop);
+    if out[payload_offset] == CHUNKED_ENVELOPE_MARKER {
+        let mut content_id = [0u8; 32];
+        rand_core::OsRng.fill_bytes(&mut content_id);
+        out[content_id_offset..content_id_offset + 32].copy_from_slice(&content_id);
+    }
+    Some(out)
+}
+
 /// Resolve the sender, verify (signature + freshness + subkey), replay-check,
 /// and deliver one COMPLETE authenticated message with the VERIFIED sender
 /// node_id. Shared by the direct-onion (`Full`) and rendezvous (reassembled
@@ -2629,7 +2655,7 @@ impl NodeRuntime {
                         AckTickOutcome::Retransmit {
                             next_hop,
                             dst_node_id,
-                            frame_bytes,
+                            frames,
                             content_id,
                             attempt,
                         } => {
@@ -2642,39 +2668,45 @@ impl NodeRuntime {
                             logger.info(
                                 "delivery.retransmit",
                                 format!(
-                                    "content_id={} dst={} next_hop={} attempt={}",
+                                    "content_id={} dst={} next_hop={} attempt={} frames={}",
                                     veil_util::hex_short(&content_id),
                                     veil_util::hex_short(&dst_node_id),
                                     veil_util::hex_short(&next_hop),
                                     attempt,
+                                    frames.len(),
                                 ),
                             );
+                            // Every chunk carrier gets a fresh OUTER content id
+                            // per attempt. Its transfer/index/original id stays
+                            // unchanged, so the destination fills only missing
+                            // pieces while relay replay caches cannot suppress a
+                            // retry that was lost after the first hop.
+                            let send_batch = |hop: [u8; 32]| -> bool {
+                                for frame in frames.iter() {
+                                    let Some(prepared) = prepare_ack_retransmit_frame(frame, hop)
+                                    else {
+                                        return false;
+                                    };
+                                    if !reg.send_to(
+                                        &hop,
+                                        veil_proto::header::priority::INTERACTIVE,
+                                        prepared,
+                                    ) {
+                                        return false;
+                                    }
+                                }
+                                true
+                            };
                             // Try original hop first.
-                            let sent = reg.send_to(
-                                &next_hop,
-                                veil_proto::header::priority::INTERACTIVE,
-                                frame_bytes.to_vec(),
-                            );
+                            let sent = send_batch(next_hop);
                             if !sent {
                                 // Original hop dead — re-route via the
                                 // pre-computed route-cache hop (looked up above,
                                 // before the registry guard was taken).
                                 if let Some(new_hop) = reroute_hops.get(&dst_node_id).copied() {
-                                    // Patch next_hop_node_id in the frame (bytes 24..56
-                                    // right after the 24-byte header).
-                                    let mut patched = frame_bytes.to_vec();
-                                    let hs = veil_proto::header::HEADER_SIZE;
-                                    if patched.len() >= hs + 32 {
-                                        patched[hs..hs + 32].copy_from_slice(&new_hop);
-                                        if reg.send_to(
-                                            &new_hop,
-                                            veil_proto::header::priority::INTERACTIVE,
-                                            patched,
-                                        ) {
-                                            // Update stored next_hop for future retransmits.
-                                            lock!(pending_ack)
-                                                .update_next_hop(&content_id, new_hop);
-                                        }
+                                    if send_batch(new_hop) {
+                                        // Update stored next_hop for future retransmits.
+                                        lock!(pending_ack).update_next_hop(&content_id, new_hop);
                                     }
                                 }
                             }
@@ -4153,6 +4185,147 @@ pub fn evaluate_watchdog_tick(
 mod tests {
     use super::*;
     use veil_cfg::{BootstrapPeer, SignatureAlgorithm};
+
+    #[test]
+    fn chunk_retransmit_refreshes_only_carrier_id_and_next_hop() {
+        use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope, ForwardPayload};
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::FrameHeader;
+
+        let chunk = ChunkedEnvelopePayload {
+            transfer_id: [0x11; 16],
+            chunk_index: 2,
+            chunk_count: 4,
+            total_size: 9,
+            orig_content_id: [0x22; 32],
+            require_ack: true,
+            data: vec![7, 8, 9],
+        };
+        let envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any([0x33; 32]),
+            sender_node_id: [0x44; 32],
+            src_app_id: [0x55; 32],
+            app_id: [0x66; 32],
+            endpoint_id: 7,
+            content_id: [0x77; 32],
+            created_at: 1,
+            ttl_secs: 30,
+            payload: chunk.encode(),
+            trace_id: 9,
+            require_ack: false,
+        };
+        let body = ForwardPayload {
+            next_hop_node_id: [0x88; 32],
+            envelope,
+            relay_hops: 0,
+        }
+        .encode();
+        let mut header = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+        header.body_len = body.len() as u32;
+        let frame = veil_proto::codec::encode_frame(&header, &body);
+
+        let first = prepare_ack_retransmit_frame(&frame, [0x99; 32]).unwrap();
+        let second = prepare_ack_retransmit_frame(&frame, [0xAA; 32]).unwrap();
+        let first = ForwardPayload::decode(&first[veil_proto::header::HEADER_SIZE..]).unwrap();
+        let second = ForwardPayload::decode(&second[veil_proto::header::HEADER_SIZE..]).unwrap();
+        assert_eq!(first.next_hop_node_id, [0x99; 32]);
+        assert_eq!(second.next_hop_node_id, [0xAA; 32]);
+        assert_ne!(first.envelope.content_id, [0x77; 32]);
+        assert_ne!(second.envelope.content_id, [0x77; 32]);
+        assert_ne!(first.envelope.content_id, second.envelope.content_id);
+        assert_eq!(
+            ChunkedEnvelopePayload::decode(&first.envelope.payload).unwrap(),
+            chunk
+        );
+        assert_eq!(
+            ChunkedEnvelopePayload::decode(&second.envelope.payload).unwrap(),
+            chunk
+        );
+    }
+
+    #[test]
+    fn whole_batch_retry_fills_loss_once_and_leaves_no_phantom_transfer() {
+        use veil_dispatcher::envelope_chunks::{AddChunkResult, EnvelopeChunkReassembler};
+        use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope, ForwardPayload};
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::FrameHeader;
+
+        let transfer_id = [0xB1; 16];
+        let original_id = [0xB2; 32];
+        let make_frame = |index: u32| {
+            let chunk = ChunkedEnvelopePayload {
+                transfer_id,
+                chunk_index: index,
+                chunk_count: 4,
+                total_size: 8,
+                orig_content_id: original_id,
+                require_ack: true,
+                data: vec![index as u8; 2],
+            };
+            let envelope = DeliveryEnvelope {
+                recipient: veil_proto::recipient::Recipient::any([0xB3; 32]),
+                sender_node_id: [0xB4; 32],
+                src_app_id: [0xB5; 32],
+                app_id: [0xB6; 32],
+                endpoint_id: 1,
+                content_id: [index as u8 + 1; 32],
+                created_at: 1,
+                ttl_secs: 30,
+                payload: chunk.encode(),
+                trace_id: 0,
+                require_ack: false,
+            };
+            let body = ForwardPayload {
+                next_hop_node_id: [0xB7; 32],
+                envelope,
+                relay_hops: 0,
+            }
+            .encode();
+            let mut header =
+                FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            header.body_len = body.len() as u32;
+            veil_proto::codec::encode_frame(&header, &body)
+        };
+        let frames: Vec<_> = (0..4).map(make_frame).collect();
+        let mut reassembler = EnvelopeChunkReassembler::new();
+
+        // First attempt arrives reordered and loses index 2 after the relay;
+        // 3,0,1 remain buffered.
+        for index in [3usize, 0, 1] {
+            let fwd = ForwardPayload::decode(&frames[index][veil_proto::HEADER_SIZE..]).unwrap();
+            let chunk = ChunkedEnvelopePayload::decode(&fwd.envelope.payload).unwrap();
+            assert!(matches!(
+                reassembler.add(&fwd.envelope, chunk, 100),
+                AddChunkResult::Pending
+            ));
+        }
+
+        let mut completed = 0;
+        let mut replayed_tail = 0;
+        for (index, frame) in frames.iter().enumerate() {
+            let retried = prepare_ack_retransmit_frame(frame, [0xC1; 32]).unwrap();
+            let fwd = ForwardPayload::decode(&retried[veil_proto::HEADER_SIZE..]).unwrap();
+            assert_ne!(fwd.envelope.content_id, [index as u8 + 1; 32]);
+            let chunk = ChunkedEnvelopePayload::decode(&fwd.envelope.payload).unwrap();
+            match reassembler.add(&fwd.envelope, chunk, 101) {
+                AddChunkResult::Complete(envelope) => {
+                    completed += 1;
+                    assert_eq!(envelope.content_id, original_id);
+                    assert_eq!(envelope.payload, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+                }
+                AddChunkResult::CompletedReplay(id) => {
+                    replayed_tail += 1;
+                    assert_eq!(id, original_id);
+                }
+                AddChunkResult::Pending | AddChunkResult::Rejected("duplicate chunk") => {}
+                other => panic!("unexpected retry outcome: {other:?}"),
+            }
+        }
+        assert_eq!(completed, 1);
+        assert_eq!(replayed_tail, 1);
+        assert_eq!(reassembler.transfer_count(), 0);
+        assert_eq!(reassembler.buffered_bytes(), 0);
+    }
 
     fn peer(pk: &str) -> BootstrapPeer {
         BootstrapPeer {

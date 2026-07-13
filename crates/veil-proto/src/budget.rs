@@ -623,6 +623,17 @@ pub const MAX_PENDING_ACK_ENTRIES: usize = 1_024;
 /// of headroom for normal bursty senders while bounding worst-case abuse.
 pub const MAX_PENDING_ACK_PER_PEER: usize = 16;
 
+/// Global bytes retained for acknowledged-delivery retransmits. Chunk batches
+/// can approach [`MAX_REASSEMBLY_BYTES`], so count-only caps are insufficient:
+/// 1024 maximum-sized entries would otherwise pin tens of GiB. 144 MiB keeps
+/// two maximum transfers trackable while bounding the process-wide retry heap.
+pub const MAX_PENDING_ACK_BYTES: usize = 144 * 1024 * 1024;
+
+/// Per-destination share of [`MAX_PENDING_ACK_BYTES`]. One maximum-size
+/// transfer plus framing overhead remains trackable; an unreachable peer
+/// cannot monopolise the entire global retry heap.
+pub const MAX_PENDING_ACK_BYTES_PER_PEER: usize = 72 * 1024 * 1024;
+
 // ── Application-layer stream limits ──────────────────────────────────────────
 
 /// Maximum total concurrently open application streams across all peers.
