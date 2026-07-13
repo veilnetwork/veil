@@ -346,6 +346,10 @@ class VeilGroupMediaEngine {
 
   final Pointer<ffi.VeilGroupMediaEngineHandle> _ptr;
   bool _disposed = false;
+  final Map<String, _GroupFrameBuffer> _peerFrameBuffers = {};
+  final _GroupFrameBuffer _localFrameBuffer = _GroupFrameBuffer();
+  Pointer<Uint8>? _pushBuf;
+  int _pushCap = 0;
 
   static VeilGroupMediaEngine? create({required Uint8List localId}) {
     if (localId.length != 32) {
@@ -365,9 +369,13 @@ class VeilGroupMediaEngine {
         return ffi.veilMediaGroupEngineAddPeer(_ptr, veilChan, peer) == 0;
       });
 
-  bool removePeer(Uint8List peerId) => _withPeer(peerId, (peer) {
-        return ffi.veilMediaGroupEngineRemovePeer(_ptr, peer) == 0;
-      });
+  bool removePeer(Uint8List peerId) {
+    final removed = _withPeer(peerId, (peer) {
+      return ffi.veilMediaGroupEngineRemovePeer(_ptr, peer) == 0;
+    });
+    if (removed) _peerFrameBuffers.remove(base64Encode(peerId))?.dispose();
+    return removed;
+  }
 
   int peerRxPackets(Uint8List peerId) => _withPeer(peerId, (peer) {
         return ffi.veilMediaGroupEnginePeerRxPackets(_ptr, peer);
@@ -388,10 +396,115 @@ class VeilGroupMediaEngine {
     ffi.veilMediaGroupEngineSetMicMuted(_ptr, muted ? 1 : 0);
   }
 
+  bool startVideo() {
+    _ensure();
+    return ffi.veilMediaGroupEngineStartVideo(_ptr) == 0;
+  }
+
+  bool stopVideo() {
+    _ensure();
+    return ffi.veilMediaGroupEngineStopVideo(_ptr) == 0;
+  }
+
+  bool startCamera({int width = 352, int height = 198, int fps = 15}) {
+    _ensure();
+    return ffi.veilMediaGroupEngineStartCamera(_ptr, width, height, fps) == 0;
+  }
+
+  bool stopCamera() {
+    _ensure();
+    return ffi.veilMediaGroupEngineStopCamera(_ptr) == 0;
+  }
+
+  bool startScreen({int width = 640, int fps = 10}) {
+    _ensure();
+    return ffi.veilMediaGroupEngineStartScreen(_ptr, width, fps) == 0;
+  }
+
+  bool stopScreen() {
+    _ensure();
+    return ffi.veilMediaGroupEngineStopScreen(_ptr) == 0;
+  }
+
+  bool pushVideoFrame(
+    Uint8List y,
+    Uint8List u,
+    Uint8List v,
+    int width,
+    int height,
+  ) {
+    _ensure();
+    final total = y.length + u.length + v.length;
+    if (total <= 0) return false;
+    if (_pushBuf == null || _pushCap < total) {
+      if (_pushBuf != null) calloc.free(_pushBuf!);
+      _pushCap = total;
+      _pushBuf = calloc<Uint8>(_pushCap);
+    }
+    final buffer = _pushBuf!;
+    final view = buffer.asTypedList(total);
+    view.setRange(0, y.length, y);
+    view.setRange(y.length, y.length + u.length, u);
+    view.setRange(y.length + u.length, total, v);
+    final chromaWidth = (width + 1) ~/ 2;
+    return ffi.veilMediaGroupEnginePushVideoFrame(
+          _ptr,
+          buffer,
+          buffer + y.length,
+          buffer + y.length + u.length,
+          width,
+          height,
+          width,
+          chromaWidth,
+          chromaWidth,
+          0,
+        ) ==
+        0;
+  }
+
+  VeilVideoFrame? getPeerVideoFrame(Uint8List peerId) {
+    final state = _peerFrameBuffers.putIfAbsent(
+      base64Encode(peerId),
+      _GroupFrameBuffer.new,
+    );
+    return _withPeer(peerId, (peer) {
+      return state.pull((dst, capacity, width, height) {
+        return ffi.veilMediaGroupEngineGetPeerVideoFrame(
+          _ptr,
+          peer,
+          dst,
+          capacity,
+          width,
+          height,
+        );
+      });
+    });
+  }
+
+  VeilVideoFrame? getLocalVideoFrame() => _localFrameBuffer.pull(
+        (dst, capacity, width, height) =>
+            ffi.veilMediaGroupEngineGetLocalVideoFrame(
+          _ptr,
+          dst,
+          capacity,
+          width,
+          height,
+        ),
+      );
+
   void dispose() {
     if (_disposed) return;
     _disposed = true;
     ffi.veilMediaGroupEngineDestroy(_ptr);
+    for (final state in _peerFrameBuffers.values) {
+      state.dispose();
+    }
+    _peerFrameBuffers.clear();
+    _localFrameBuffer.dispose();
+    if (_pushBuf != null) {
+      calloc.free(_pushBuf!);
+      _pushBuf = null;
+    }
   }
 
   T _withPeer<T>(Uint8List peerId, T Function(Pointer<Uint8>) action) {
@@ -409,6 +522,64 @@ class VeilGroupMediaEngine {
     if (_disposed) {
       throw StateError('VeilGroupMediaEngine used after dispose()');
     }
+  }
+}
+
+typedef _GroupFramePull = int Function(
+  Pointer<Uint8> dst,
+  int capacity,
+  Pointer<Int32> width,
+  Pointer<Int32> height,
+);
+
+class _GroupFrameBuffer {
+  Pointer<Uint8>? _buffer;
+  int _capacity = 0;
+  int _lastSeq = 0;
+
+  VeilVideoFrame? pull(_GroupFramePull pull) {
+    final width = calloc<Int32>();
+    final height = calloc<Int32>();
+    try {
+      var buffer = _buffer;
+      if (buffer == null) {
+        _capacity = 640 * 480 * 4;
+        buffer = calloc<Uint8>(_capacity);
+        _buffer = buffer;
+      }
+      var seq = pull(buffer, _capacity, width, height);
+      if (seq == -1) {
+        final need = width.value * height.value * 4;
+        if (need > 0) {
+          calloc.free(buffer);
+          _capacity = need;
+          buffer = calloc<Uint8>(_capacity);
+          _buffer = buffer;
+          seq = pull(buffer, _capacity, width, height);
+        }
+      }
+      if (seq <= 0 || seq == _lastSeq) return null;
+      _lastSeq = seq;
+      final w = width.value, h = height.value;
+      if (w <= 0 || h <= 0) return null;
+      return VeilVideoFrame(
+        rgba: Uint8List.fromList(buffer.asTypedList(w * h * 4)),
+        width: w,
+        height: h,
+      );
+    } finally {
+      calloc.free(width);
+      calloc.free(height);
+    }
+  }
+
+  void dispose() {
+    if (_buffer != null) {
+      calloc.free(_buffer!);
+      _buffer = null;
+    }
+    _capacity = 0;
+    _lastSeq = 0;
   }
 }
 
