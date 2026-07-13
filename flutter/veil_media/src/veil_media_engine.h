@@ -98,6 +98,32 @@ int veil_media_group_engine_set_mic_muted(VeilGroupMediaEngine *engine,
 uint64_t veil_media_group_engine_peer_rx_packets(
     VeilGroupMediaEngine *engine, const uint8_t *peer_id);
 
+/* ---- N-party video ------------------------------------------------------
+ * One shared VP8 send stream/source is fanned out to every current peer. Each
+ * peer owns an independent receive stream + latest-frame sink on the same
+ * WebRTC Call as group audio. Video SSRCs are derived from the full node id in
+ * a domain distinct from group audio; collisions reject the peer fail-closed.
+ * RTP never crosses Dart. */
+int veil_media_group_engine_start_video(VeilGroupMediaEngine *engine);
+int veil_media_group_engine_stop_video(VeilGroupMediaEngine *engine);
+int veil_media_group_engine_start_camera(VeilGroupMediaEngine *engine,
+                                         int width, int height, int fps);
+int veil_media_group_engine_stop_camera(VeilGroupMediaEngine *engine);
+int veil_media_group_engine_start_screen(VeilGroupMediaEngine *engine,
+                                         int width, int fps);
+int veil_media_group_engine_stop_screen(VeilGroupMediaEngine *engine);
+int veil_media_group_engine_push_video_frame(
+    VeilGroupMediaEngine *engine, const uint8_t *y, const uint8_t *u,
+    const uint8_t *v, int width, int height, int stride_y, int stride_u,
+    int stride_v, int64_t ts_us);
+/* Per-peer remote frame pull; same return contract as the 1:1 getter below. */
+int veil_media_group_engine_get_peer_video_frame(
+    VeilGroupMediaEngine *engine, const uint8_t *peer_id, uint8_t *dst,
+    int dst_cap, int *out_w, int *out_h);
+int veil_media_group_engine_get_local_video_frame(
+    VeilGroupMediaEngine *engine, uint8_t *dst, int dst_cap, int *out_w,
+    int *out_h);
+
 /* ---- Video (Phase 4) -----------------------------------------------------
  * A VP8 video session over the SAME veil media channel as audio, on a distinct
  * SSRC. `send` mounts a video source -> VP8 encode -> RTP -> Transport; `recv`
