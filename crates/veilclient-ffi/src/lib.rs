@@ -3033,6 +3033,78 @@ pub unsafe extern "C" fn veil_register_ephemeral_onion_service_zeroize(
     VEIL_OK
 }
 
+/// Provider-slotted form of
+/// [`veil_register_ephemeral_onion_service_zeroize`]. Linked devices hosting
+/// the same capability seed must use distinct slots in `0..8`; the runtime
+/// publishes a collision-free descriptor for that slot while retaining the
+/// legacy descriptor for old resolvers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_register_ephemeral_onion_service_zeroize_v2(
+    handle: *mut VeilHandle,
+    identity_seed_32: *mut u8,
+    hop_count: u32,
+    provider_slot: u8,
+    out_identity_vk_32: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) =
+        unsafe { guard::ffi_prelude(err_out, "veil_register_ephemeral_onion_service_zeroize_v2") }
+    {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "identity_seed_32" => identity_seed_32,
+        "out_identity_vk_32" => out_identity_vk_32,
+    );
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    unsafe {
+        ptr::copy_nonoverlapping(identity_seed_32, seed.as_mut_ptr(), 32);
+        ptr::write_bytes(identity_seed_32, 0, 32);
+    }
+    if seed.iter().all(|byte| *byte == 0) {
+        unsafe { write_err(err_out, "ephemeral service seed must not be all-zero") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    if provider_slot >= veil_anonymity::blinded_descriptor::MAX_PROVIDER_SLOTS {
+        unsafe { write_err(err_out, "provider_slot must be in 0..8") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let services = match embedded_services_for_bundle(&handle_live.bundle) {
+        Ok(services) => services,
+        Err(error) => {
+            unsafe { write_err(err_out, error) };
+            return VEIL_ERR;
+        }
+    };
+    let public_key = match services.register_ephemeral_onion_service_with_provider_slot(
+        seed,
+        hop_count as usize,
+        provider_slot,
+    ) {
+        Ok(public_key) => public_key,
+        Err(error) => {
+            unsafe {
+                write_err(
+                    err_out,
+                    format!("register_ephemeral_onion_service failed: {error:?}"),
+                )
+            };
+            return VEIL_ERR;
+        }
+    };
+    unsafe { ptr::copy_nonoverlapping(public_key.as_ptr(), out_identity_vk_32, 32) };
+    VEIL_OK
+}
+
 /// Stop maintaining one caller-owned ephemeral onion service. Idempotent:
 /// unknown/already-withdrawn public keys return `VEIL_OK` too, so this local
 /// lifecycle API never becomes a remote existence oracle. DHT ciphertext and
@@ -8832,6 +8904,27 @@ mod tests {
         };
         assert_eq!(rc, VEIL_ERR_INVALID_ARG);
         assert_eq!(seed, [0u8; 32]);
+        assert!(!error.is_null());
+        unsafe { veil_free_string(error) };
+    }
+
+    #[test]
+    fn provider_slot_registration_rejects_range_after_seed_scrub() {
+        let mut seed = [0x5Au8; 32];
+        let mut public_key = [0u8; 32];
+        let mut error: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            veil_register_ephemeral_onion_service_zeroize_v2(
+                1usize as *mut VeilHandle,
+                seed.as_mut_ptr(),
+                3,
+                veil_anonymity::blinded_descriptor::MAX_PROVIDER_SLOTS,
+                public_key.as_mut_ptr(),
+                &mut error,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert_eq!(seed, [0u8; 32], "invalid slot still scrubs caller seed");
         assert!(!error.is_null());
         unsafe { veil_free_string(error) };
     }

@@ -60,6 +60,7 @@ impl NodeRuntime {
             // blinded_pub) — `verify_descriptor_self`). Without this the descriptor
             // was store_local-only and by-identity send never resolved cross-node.
             || magic == veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC
+            || magic == veil_anonymity::blinded_descriptor::PROVIDER_DESCRIPTOR_DHT_MAGIC
             // Relay-directory entry ("RD"): the relay's anonymity x25519 pk,
             // resolvable by node_id, that a sender needs for the outer onion
             // layer to the rendezvous relay. Without this it was store_local-only

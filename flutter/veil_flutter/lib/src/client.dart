@@ -370,16 +370,18 @@ Uint8List _registerEphemeralOnionServiceWorker(
   int handleAddr,
   Uint8List seed,
   int hopCount,
+  int providerSlot,
 ) {
   final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
   final seedPtr = calloc<Uint8>(32)..asTypedList(32).setAll(0, seed);
   final publicKey = calloc<Uint8>(32);
   final errOut = calloc<Pointer<Utf8>>();
   try {
-    final rc = ffi.veilRegisterEphemeralOnionServiceZeroize(
+    final rc = ffi.veilRegisterEphemeralOnionServiceZeroizeV2(
       handle,
       seedPtr,
       hopCount,
+      providerSlot,
       publicKey,
       errOut,
     );
@@ -1014,10 +1016,15 @@ class VeilClient implements Finalizable {
   Future<Uint8List> registerEphemeralOnionService(
     Uint8List identitySeed, {
     int hopCount = 3,
+    int providerSlot = 0,
   }) async {
     _ensureOpen();
     if (identitySeed.length != 32) {
       throw ArgumentError('identitySeed must be exactly 32 writable bytes');
+    }
+    if (providerSlot < 0 || providerSlot >= 8) {
+      throw ArgumentError.value(
+          providerSlot, 'providerSlot', 'must be in 0..8');
     }
     final seed = Uint8List.fromList(identitySeed);
     identitySeed.fillRange(0, identitySeed.length, 0);
@@ -1028,6 +1035,7 @@ class VeilClient implements Finalizable {
           handleAddr,
           seed,
           hopCount,
+          providerSlot,
         ),
       );
     } finally {

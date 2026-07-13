@@ -506,6 +506,26 @@ final int Function(
             )>>('veil_register_ephemeral_onion_service_zeroize')
     .asFunction();
 
+final int Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>,
+  int,
+  int,
+  Pointer<Uint8>,
+  Pointer<Pointer<Utf8>>,
+) veilRegisterEphemeralOnionServiceZeroizeV2 = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Uint32,
+              Uint8,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_register_ephemeral_onion_service_zeroize_v2')
+    .asFunction();
+
 /// Idempotently stop maintaining one ephemeral onion service by its public key.
 final int Function(
   Pointer<VeilHandle>,
