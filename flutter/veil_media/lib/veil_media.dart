@@ -338,6 +338,80 @@ class VeilMediaEngine {
   }
 }
 
+/// One native N-party audio engine: a single mic/Opus send stream is fanned out
+/// to peer channels while WebRTC mixes every peer receive stream into one ADM
+/// playout. The caller owns and closes all channels.
+class VeilGroupMediaEngine {
+  VeilGroupMediaEngine._(this._ptr);
+
+  final Pointer<ffi.VeilGroupMediaEngineHandle> _ptr;
+  bool _disposed = false;
+
+  static VeilGroupMediaEngine? create({required Uint8List localId}) {
+    if (localId.length != 32) {
+      throw ArgumentError('localId must be 32 bytes');
+    }
+    final local = calloc<Uint8>(32)..asTypedList(32).setAll(0, localId);
+    try {
+      final ptr = ffi.veilMediaGroupEngineCreate(local);
+      return ptr == nullptr ? null : VeilGroupMediaEngine._(ptr);
+    } finally {
+      calloc.free(local);
+    }
+  }
+
+  bool addPeer({required int veilChan, required Uint8List peerId}) =>
+      _withPeer(peerId, (peer) {
+        return ffi.veilMediaGroupEngineAddPeer(_ptr, veilChan, peer) == 0;
+      });
+
+  bool removePeer(Uint8List peerId) => _withPeer(peerId, (peer) {
+        return ffi.veilMediaGroupEngineRemovePeer(_ptr, peer) == 0;
+      });
+
+  int peerRxPackets(Uint8List peerId) => _withPeer(peerId, (peer) {
+        return ffi.veilMediaGroupEnginePeerRxPackets(_ptr, peer);
+      });
+
+  bool startAudio() {
+    _ensure();
+    return ffi.veilMediaGroupEngineStartAudio(_ptr) == 0;
+  }
+
+  bool stopAudio() {
+    _ensure();
+    return ffi.veilMediaGroupEngineStopAudio(_ptr) == 0;
+  }
+
+  void setMicMuted(bool muted) {
+    _ensure();
+    ffi.veilMediaGroupEngineSetMicMuted(_ptr, muted ? 1 : 0);
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    ffi.veilMediaGroupEngineDestroy(_ptr);
+  }
+
+  T _withPeer<T>(Uint8List peerId, T Function(Pointer<Uint8>) action) {
+    _ensure();
+    if (peerId.length != 32) throw ArgumentError('peerId must be 32 bytes');
+    final peer = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerId);
+    try {
+      return action(peer);
+    } finally {
+      calloc.free(peer);
+    }
+  }
+
+  void _ensure() {
+    if (_disposed) {
+      throw StateError('VeilGroupMediaEngine used after dispose()');
+    }
+  }
+}
+
 /// A finished voice recording: the VOICE_OPUS byte stream (store this), the
 /// clip duration, and a peak-normalized amplitude waveform (0..1 per bar).
 class VoiceRecording {
@@ -531,7 +605,8 @@ class VeilVnoteRecorder {
       if (rc != 0 || outLen.value == 0 || outBytes.value == nullptr) {
         return null;
       }
-      final bytes = Uint8List.fromList(outBytes.value.asTypedList(outLen.value));
+      final bytes =
+          Uint8List.fromList(outBytes.value.asTypedList(outLen.value));
       ffi.veilVnoteFreeBytes(outBytes.value);
       return VnoteRecording(bytes: bytes, durationMs: outDur.value);
     } finally {
@@ -598,7 +673,8 @@ class VeilVnotePlayer {
       if (rc != 0 || outBytes.value == nullptr || outLen.value == 0) {
         return null;
       }
-      final bytes = Uint8List.fromList(outBytes.value.asTypedList(outLen.value));
+      final bytes =
+          Uint8List.fromList(outBytes.value.asTypedList(outLen.value));
       ffi.veilVnoteFreeBytes(outBytes.value);
       return bytes;
     } finally {
