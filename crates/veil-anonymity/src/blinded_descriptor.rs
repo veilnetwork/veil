@@ -21,6 +21,7 @@ use rand_core::{OsRng, RngCore};
 
 const ENC_KEY_DOMAIN: &[u8] = b"veil.descriptor.enc.v1\0";
 const DHT_KEY_DOMAIN: &[u8] = b"veil.descriptor.dhtkey.v1\0";
+const PROVIDER_DHT_KEY_DOMAIN: &[u8] = b"veil.descriptor.provider.dhtkey.v2\0";
 const AAD_DOMAIN: &[u8] = b"veil.descriptor.aad.v1";
 
 /// Descriptor time-period length (24 h, Tor-v3-ish). The blinded key + DHT key +
@@ -119,6 +120,8 @@ fn enc_key(identity_vk: &[u8; 32], period: u64) -> [u8; 32] {
 /// `blinded_pub` + a signature under it, and its DHT key is `H(domain ‖
 /// blinded_pub)` — see [`verify_descriptor_self`].
 pub const DESCRIPTOR_DHT_MAGIC: &[u8; 2] = b"od";
+pub const PROVIDER_DESCRIPTOR_DHT_MAGIC: &[u8; 2] = b"o2";
+pub const MAX_PROVIDER_SLOTS: u8 = 8;
 const SIG_LEN: usize = 64;
 const NONCE_LEN: usize = 12;
 
@@ -274,6 +277,162 @@ pub fn verify_descriptor_self(bytes: &[u8]) -> Option<[u8; 32]> {
     Some(*h.finalize().as_bytes())
 }
 
+/// One of a small fixed set of provider-specific descriptor keys. Linked
+/// owner devices receive distinct slots from their private device-group order;
+/// a bearer resolves every slot without learning how many providers exist.
+pub fn provider_descriptor_dht_key(
+    identity_vk: &[u8; 32],
+    period: u64,
+    provider_slot: u8,
+) -> Option<[u8; 32]> {
+    if provider_slot >= MAX_PROVIDER_SLOTS {
+        return None;
+    }
+    let blinded = veil_crypto::key_blinding::blinded_public(identity_vk, period)?;
+    let mut h = blake3::Hasher::new();
+    h.update(PROVIDER_DHT_KEY_DOMAIN);
+    h.update(&blinded);
+    h.update(&[provider_slot]);
+    Some(*h.finalize().as_bytes())
+}
+
+/// Provider-slotted v2 descriptor. Slot is signed and part of the canonical
+/// DHT key, so a valid record cannot be moved between slots by a DHT holder.
+pub fn seal_provider_descriptor(
+    identity_sk: &[u8; 32],
+    period: u64,
+    provider_slot: u8,
+    body: &BlindedDescriptorBody,
+) -> Option<([u8; 32], Vec<u8>)> {
+    if provider_slot >= MAX_PROVIDER_SLOTS {
+        return None;
+    }
+    let identity_vk = veil_crypto::key_blinding::ed25519_public_from_seed(identity_sk);
+    let blinded_pub = veil_crypto::key_blinding::blinded_public(&identity_vk, period)?;
+    let mut nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let key = enc_key(&identity_vk, period);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &body.encode(),
+                aad: AAD_DOMAIN,
+            },
+        )
+        .ok()?;
+    let mut signed = Vec::with_capacity(1 + 32 + NONCE_LEN + ciphertext.len());
+    signed.push(provider_slot);
+    signed.extend_from_slice(&blinded_pub);
+    signed.extend_from_slice(&nonce);
+    signed.extend_from_slice(&ciphertext);
+    let sig = veil_crypto::key_blinding::sign_blinded(identity_sk, period, &signed)?;
+
+    let mut out = Vec::with_capacity(2 + 1 + 32 + NONCE_LEN + 2 + ciphertext.len() + SIG_LEN);
+    out.extend_from_slice(PROVIDER_DESCRIPTOR_DHT_MAGIC);
+    out.push(provider_slot);
+    out.extend_from_slice(&blinded_pub);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&(ciphertext.len() as u16).to_be_bytes());
+    out.extend_from_slice(&ciphertext);
+    out.extend_from_slice(&sig);
+    Some((
+        provider_descriptor_dht_key(&identity_vk, period, provider_slot)?,
+        out,
+    ))
+}
+
+pub fn open_provider_descriptor(
+    identity_vk: &[u8; 32],
+    period: u64,
+    expected_slot: u8,
+    bytes: &[u8],
+) -> Option<BlindedDescriptorBody> {
+    if expected_slot >= MAX_PROVIDER_SLOTS
+        || bytes.get(..2)? != PROVIDER_DESCRIPTOR_DHT_MAGIC
+        || *bytes.get(2)? != expected_slot
+    {
+        return None;
+    }
+    let bytes = &bytes[3..];
+    let fixed = 32 + NONCE_LEN + 2;
+    if bytes.len() < fixed + SIG_LEN {
+        return None;
+    }
+    let blinded_pub: [u8; 32] = bytes[..32].try_into().ok()?;
+    if veil_crypto::key_blinding::blinded_public(identity_vk, period)? != blinded_pub {
+        return None;
+    }
+    let nonce: [u8; NONCE_LEN] = bytes[32..32 + NONCE_LEN].try_into().ok()?;
+    let ct_len = u16::from_be_bytes([bytes[32 + NONCE_LEN], bytes[33 + NONCE_LEN]]) as usize;
+    let ct_start = fixed;
+    let ct_end = ct_start.checked_add(ct_len)?;
+    if bytes.len() != ct_end + SIG_LEN {
+        return None;
+    }
+    let ciphertext = &bytes[ct_start..ct_end];
+    let sig: [u8; SIG_LEN] = bytes[ct_end..].try_into().ok()?;
+    let mut signed = Vec::with_capacity(1 + 32 + NONCE_LEN + ciphertext.len());
+    signed.push(expected_slot);
+    signed.extend_from_slice(&blinded_pub);
+    signed.extend_from_slice(&nonce);
+    signed.extend_from_slice(ciphertext);
+    if !veil_crypto::key_blinding::verify_blinded(identity_vk, period, &signed, &sig) {
+        return None;
+    }
+    let key = enc_key(identity_vk, period);
+    let plaintext = ChaCha20Poly1305::new(Key::from_slice(&key))
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext,
+                aad: AAD_DOMAIN,
+            },
+        )
+        .ok()?;
+    BlindedDescriptorBody::decode(&plaintext)
+}
+
+/// Self-verification and canonical-key derivation for the STORE/mirror gates.
+pub fn verify_provider_descriptor_self(bytes: &[u8]) -> Option<[u8; 32]> {
+    if bytes.get(..2)? != PROVIDER_DESCRIPTOR_DHT_MAGIC {
+        return None;
+    }
+    let provider_slot = *bytes.get(2)?;
+    if provider_slot >= MAX_PROVIDER_SLOTS {
+        return None;
+    }
+    let body = &bytes[3..];
+    let fixed = 32 + NONCE_LEN + 2;
+    if body.len() < fixed + SIG_LEN {
+        return None;
+    }
+    let blinded_pub: [u8; 32] = body[..32].try_into().ok()?;
+    let nonce = &body[32..32 + NONCE_LEN];
+    let ct_len = u16::from_be_bytes([body[32 + NONCE_LEN], body[33 + NONCE_LEN]]) as usize;
+    let ct_start = fixed;
+    let ct_end = ct_start.checked_add(ct_len)?;
+    if body.len() != ct_end + SIG_LEN {
+        return None;
+    }
+    let ciphertext = &body[ct_start..ct_end];
+    let sig: [u8; SIG_LEN] = body[ct_end..].try_into().ok()?;
+    let mut signed = Vec::with_capacity(1 + 32 + NONCE_LEN + ciphertext.len());
+    signed.push(provider_slot);
+    signed.extend_from_slice(&blinded_pub);
+    signed.extend_from_slice(nonce);
+    signed.extend_from_slice(ciphertext);
+    if !veil_crypto::key_blinding::verify_under_blinded_pub(&blinded_pub, &signed, &sig) {
+        return None;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(PROVIDER_DHT_KEY_DOMAIN);
+    h.update(&blinded_pub);
+    h.update(&[provider_slot]);
+    Some(*h.finalize().as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +532,58 @@ mod tests {
             descriptor_dht_key(&vk, 2).unwrap(),
             "DHT key rotates per period"
         );
+    }
+
+    #[test]
+    fn provider_descriptor_roundtrip_and_slot_binding() {
+        let (id_sk, id_vk) = identity();
+        let period = 17;
+        let expected = body(0x71);
+        let (key, descriptor) =
+            seal_provider_descriptor(&id_sk, period, 3, &expected).unwrap();
+
+        assert_eq!(
+            key,
+            provider_descriptor_dht_key(&id_vk, period, 3).unwrap()
+        );
+        assert_eq!(
+            open_provider_descriptor(&id_vk, period, 3, &descriptor),
+            Some(expected)
+        );
+        assert_eq!(verify_provider_descriptor_self(&descriptor), Some(key));
+        assert!(open_provider_descriptor(&id_vk, period, 2, &descriptor).is_none());
+        assert_ne!(
+            key,
+            provider_descriptor_dht_key(&id_vk, period, 4).unwrap()
+        );
+        assert_ne!(
+            key,
+            provider_descriptor_dht_key(&id_vk, period + 1, 3).unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_descriptor_rejects_tamper_and_out_of_range_slot() {
+        let (id_sk, id_vk) = identity();
+        let (_, descriptor) =
+            seal_provider_descriptor(&id_sk, 4, 0, &body(0x44)).unwrap();
+
+        let mut moved = descriptor.clone();
+        moved[2] = 1;
+        assert_eq!(verify_provider_descriptor_self(&moved), None);
+        assert!(open_provider_descriptor(&id_vk, 4, 1, &moved).is_none());
+
+        let mut ciphertext_tamper = descriptor.clone();
+        ciphertext_tamper[3 + 32 + NONCE_LEN + 2] ^= 1;
+        assert_eq!(verify_provider_descriptor_self(&ciphertext_tamper), None);
+        assert!(
+            open_provider_descriptor(&id_vk, 4, 0, &ciphertext_tamper).is_none()
+        );
+
+        assert!(provider_descriptor_dht_key(&id_vk, 4, MAX_PROVIDER_SLOTS).is_none());
+        assert!(
+            seal_provider_descriptor(&id_sk, 4, MAX_PROVIDER_SLOTS, &body(1)).is_none()
+        );
+        assert_eq!(verify_provider_descriptor_self(&[]), None);
     }
 }

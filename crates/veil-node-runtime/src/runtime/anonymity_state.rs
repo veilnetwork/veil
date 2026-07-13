@@ -687,6 +687,11 @@ pub struct OnionServiceEntry {
     /// no-sovereign random-circuit fallback (which publishes no descriptor).
     pub descriptor_identity_seed: Option<Arc<zeroize::Zeroizing<[u8; 32]>>>,
 
+    /// Fixed public-discovery slot for a linked-device capability provider.
+    /// `None` is the sovereign service; ephemeral services publish both the
+    /// legacy single record and their collision-free v2 slot.
+    pub descriptor_provider_slot: Option<u8>,
+
     /// True only for application-created capability services. Prevents the
     /// withdrawal API from stopping the node's normal sovereign service and
     /// lets config auto-start distinguish the two kinds.
