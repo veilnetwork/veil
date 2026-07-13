@@ -624,9 +624,6 @@ pub(crate) async fn handle_ipc_send(
                 // NO_ROUTE on the relay path) and reassembled via a metadata-
                 // losing epidemic broadcast.
                 //
-                // NOTE: sender-side ACK *retransmit* is not wired for chunked
-                // messages (the pending-ack tracker is single-frame); the
-                // destination still emits an end-to-end ACK on `orig_content_id`.
                 if envelope.payload.len() > veil_proto::delivery::MAX_ENVELOPE_PAYLOAD {
                     use veil_proto::budget::{MAX_CHUNK_PAYLOAD, MAX_REASSEMBLY_BYTES};
                     use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope};
@@ -645,12 +642,7 @@ pub(crate) async fn handle_ipc_send(
                         return wh.write_all(&frame).await;
                     }
 
-                    let pieces: Vec<Vec<u8>> = envelope
-                        .payload
-                        .chunks(MAX_CHUNK_PAYLOAD)
-                        .map(|c| c.to_vec())
-                        .collect();
-                    let chunk_count = pieces.len() as u32;
+                    let chunk_count = total_size.div_ceil(MAX_CHUNK_PAYLOAD) as u32;
                     let mut transfer_id = [0u8; 16];
                     {
                         use rand_core::RngCore;
@@ -723,20 +715,31 @@ pub(crate) async fn handle_ipc_send(
                     // a hop that dies mid-stream are harmless on retry.)
                     let mut delivered = false;
                     for next_hop in &hops_to_try {
-                        let mut all_ok = true;
-                        for (i, piece) in pieces.iter().enumerate() {
-                            let frame = make_chunk_frame(*next_hop, i as u32, piece);
-                            if !reg.send_to(
+                        let frames: Vec<Vec<u8>> = envelope
+                            .payload
+                            .chunks(MAX_CHUNK_PAYLOAD)
+                            .enumerate()
+                            .map(|(i, piece)| make_chunk_frame(*next_hop, i as u32, piece))
+                            .collect();
+                        let all_ok = frames.iter().all(|frame| {
+                            reg.send_to(
                                 next_hop,
                                 veil_proto::header::priority::INTERACTIVE,
-                                frame,
-                            ) {
-                                all_ok = false;
-                                break;
-                            }
-                        }
+                                frame.clone(),
+                            )
+                        });
                         if all_ok {
                             delivered = true;
+                            if want_ack && let Some(tracker) = ctx.pending_ack {
+                                let _ = lock!(tracker).register_batch(
+                                    orig_content_id,
+                                    *next_hop,
+                                    send.dst_node_id,
+                                    send.src_app_id,
+                                    ack_key,
+                                    frames,
+                                );
+                            }
                             break;
                         }
                         if let Some(cache) = route_cache {

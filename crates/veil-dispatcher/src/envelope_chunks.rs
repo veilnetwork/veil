@@ -37,6 +37,12 @@ pub const MAX_TRANSFERS_PER_SENDER: usize = MAX_CONCURRENT_TRANSFERS / 4;
 /// [`MAX_TRANSFERS_PER_SENDER`].
 pub const MAX_REASSEMBLY_BYTES_PER_SENDER: usize = MAX_REASSEMBLY_BYTES / 4;
 
+/// Recently completed transfer ids retained to suppress the tail of a whole-
+/// batch retransmit. Without this, the chunk that fills the final hole removes
+/// the active state and later duplicate indices in the same retry open a new
+/// phantom partial transfer until TTL. Fixed-size, tiny tombstones only.
+pub const MAX_COMPLETED_TRANSFERS: usize = 1_024;
+
 /// Outcome of feeding one chunk into the reassembler.
 #[derive(Debug)]
 pub enum AddChunkResult {
@@ -45,6 +51,10 @@ pub enum AddChunkResult {
     /// All chunks received — the reconstructed original envelope is ready for
     /// terminal delivery.
     Complete(Box<DeliveryEnvelope>),
+    /// This transfer already completed recently. The dispatcher may re-emit
+    /// the cached final ACK for the original content id, but must not reopen
+    /// reassembly state.
+    CompletedReplay([u8; 32]),
     /// Chunk ignored (duplicate index, inconsistent metadata, or caps hit). The
     /// `&'static str` is a short reason for logging.
     Rejected(&'static str),
@@ -71,10 +81,16 @@ struct TransferState {
     deadline: u64,
 }
 
+struct CompletedTransfer {
+    orig_content_id: [u8; 32],
+    deadline: u64,
+}
+
 /// Bounded reassembler for relay-chunked envelopes.
 #[derive(Default)]
 pub struct EnvelopeChunkReassembler {
     transfers: HashMap<TransferId, TransferState>,
+    completed: HashMap<TransferId, CompletedTransfer>,
     total_buffered: usize,
 }
 
@@ -107,6 +123,14 @@ impl EnvelopeChunkReassembler {
     ) -> AddChunkResult {
         // Opportunistic eviction of timed-out partials on each add.
         self.evict_expired(now);
+
+        if let Some(done) = self.completed.get(&chunk.transfer_id) {
+            return if done.orig_content_id == chunk.orig_content_id {
+                AddChunkResult::CompletedReplay(done.orig_content_id)
+            } else {
+                AddChunkResult::Rejected("completed transfer metadata mismatch")
+            };
+        }
 
         let entry = self.transfers.get_mut(&chunk.transfer_id);
         if entry.is_none() {
@@ -209,6 +233,7 @@ impl EnvelopeChunkReassembler {
         }
         let state = self.transfers.remove(transfer_id).expect("present");
         self.total_buffered = self.total_buffered.saturating_sub(state.received_bytes);
+        let completion_deadline = state.deadline;
 
         let mut payload = Vec::with_capacity(state.total_size as usize);
         for piece in state.received.into_iter() {
@@ -216,19 +241,36 @@ impl EnvelopeChunkReassembler {
             payload.extend_from_slice(&piece.expect("all chunks present"));
         }
 
+        let orig_content_id = state.orig_content_id;
         let envelope = DeliveryEnvelope {
             recipient: state.recipient,
             sender_node_id: state.sender_node_id,
             src_app_id: state.src_app_id,
             app_id: state.app_id,
             endpoint_id: state.endpoint_id,
-            content_id: state.orig_content_id,
+            content_id: orig_content_id,
             created_at: veil_util::unix_secs_now_u64(),
             ttl_secs: 0,
             payload,
             trace_id: 0,
             require_ack: state.require_ack,
         };
+        if self.completed.len() >= MAX_COMPLETED_TRANSFERS
+            && let Some(oldest) = self
+                .completed
+                .iter()
+                .min_by_key(|(_, entry)| entry.deadline)
+                .map(|(id, _)| *id)
+        {
+            self.completed.remove(&oldest);
+        }
+        self.completed.insert(
+            *transfer_id,
+            CompletedTransfer {
+                orig_content_id,
+                deadline: completion_deadline,
+            },
+        );
         AddChunkResult::Complete(Box::new(envelope))
     }
 
@@ -250,6 +292,7 @@ impl EnvelopeChunkReassembler {
             keep
         });
         self.total_buffered = self.total_buffered.saturating_sub(freed);
+        self.completed.retain(|_, state| now <= state.deadline);
         before - self.transfers.len()
     }
 }
@@ -407,6 +450,60 @@ mod tests {
             AddChunkResult::Complete(env) => assert_eq!(env.payload, vec![1, 2, 3]),
             other => panic!("expected Complete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn completed_transfer_tail_is_dropped_without_reopening_partial_state() {
+        let mut r = EnvelopeChunkReassembler::new();
+        let tid = [0x81; 16];
+        assert!(matches!(
+            r.add(&carrier([1; 32]), chunk(tid, 0, 2, 4, vec![1, 2]), 100),
+            AddChunkResult::Pending
+        ));
+        assert!(matches!(
+            r.add(&carrier([2; 32]), chunk(tid, 1, 2, 4, vec![3, 4]), 100),
+            AddChunkResult::Complete(_)
+        ));
+        assert!(matches!(
+            r.add(&carrier([3; 32]), chunk(tid, 1, 2, 4, vec![3, 4]), 101),
+            AddChunkResult::CompletedReplay(id) if id == [0xAA; 32]
+        ));
+        assert_eq!(r.transfer_count(), 0);
+        assert_eq!(r.buffered_bytes(), 0);
+
+        let mut collision = chunk(tid, 0, 2, 4, vec![1, 2]);
+        collision.orig_content_id = [0xBB; 32];
+        assert!(matches!(
+            r.add(&carrier([4; 32]), collision, 101),
+            AddChunkResult::Rejected("completed transfer metadata mismatch")
+        ));
+
+        // After the bounded tombstone TTL, a genuinely new transfer may reuse
+        // the id (128-bit random collision is theoretical, but lifecycle stays finite).
+        r.evict_expired(100 + CHUNK_REASSEMBLY_TTL_SECS + 1);
+        assert!(matches!(
+            r.add(
+                &carrier([5; 32]),
+                chunk(tid, 0, 2, 4, vec![1, 2]),
+                100 + CHUNK_REASSEMBLY_TTL_SECS + 1,
+            ),
+            AddChunkResult::Pending
+        ));
+    }
+
+    #[test]
+    fn completed_transfer_tombstones_are_bounded() {
+        let mut r = EnvelopeChunkReassembler::new();
+        for index in 0..=MAX_COMPLETED_TRANSFERS {
+            let mut tid = [0u8; 16];
+            tid[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            assert!(matches!(
+                r.add(&carrier([index as u8; 32]), chunk(tid, 0, 1, 1, vec![1]), 0),
+                AddChunkResult::Complete(_)
+            ));
+        }
+        assert_eq!(r.completed.len(), MAX_COMPLETED_TRANSFERS);
+        assert_eq!(r.transfer_count(), 0);
     }
 
     #[test]

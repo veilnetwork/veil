@@ -20,17 +20,19 @@ use std::{
 };
 
 use veil_proto::budget::{
-    DELIVERY_ACK_TIMEOUT_MS, MAX_DELIVERY_ATTEMPTS, MAX_PENDING_ACK_ENTRIES,
-    MAX_PENDING_ACK_PER_PEER,
+    DELIVERY_ACK_TIMEOUT_MS, MAX_DELIVERY_ATTEMPTS, MAX_PENDING_ACK_BYTES,
+    MAX_PENDING_ACK_BYTES_PER_PEER, MAX_PENDING_ACK_ENTRIES, MAX_PENDING_ACK_PER_PEER,
 };
 
 // ── PendingEntry ──────────────────────────────────────────────────────────────
 
 struct PendingEntry {
-    /// Raw wire-encoded `ForwardPayload` bytes ready to retransmit.
-    /// `Arc` avoids cloning the full frame on every retransmit attempt.
-    frame_bytes: Arc<[u8]>,
-    /// Direct next-hop to send `frame_bytes` (may be an intermediate relay
+    /// One or more raw wire-encoded `ForwardPayload` frames. A normal envelope
+    /// has one; a chunked transfer retains its complete carrier batch under the
+    /// ORIGINAL content id and retransmits it until the final E2E ACK arrives.
+    frames: Arc<[Arc<[u8]>]>,
+    frame_bytes_len: usize,
+    /// Direct next-hop to send `frames` (may be an intermediate relay
     /// NOT the final recipient). This is the node whose session we must use
     /// for `session_tx_registry.send_to` on retransmit.
     next_hop: [u8; 32],
@@ -66,7 +68,7 @@ pub enum AckTickOutcome {
         next_hop: [u8; 32],
         /// Final recipient — for logging / app notification only.
         dst_node_id: [u8; 32],
-        frame_bytes: Arc<[u8]>,
+        frames: Arc<[Arc<[u8]>]>,
         attempt: u32,
     },
     /// All attempts exhausted — notify the application.
@@ -87,13 +89,46 @@ pub enum AckTickOutcome {
 }
 
 /// Tracks in-flight envelopes that require an end-to-end ACK.
-#[derive(Default)]
 pub struct PendingAckTracker {
     pending: HashMap<[u8; 32], PendingEntry>,
     /// per-peer entry counter for the per-peer cap.
     /// Keyed by `dst_node_id` (final recipient); incremented on register and
     /// decremented on ack / failure / retain-drop.
     per_peer: HashMap<[u8; 32], u32>,
+    total_bytes: usize,
+    per_peer_bytes: HashMap<[u8; 32], usize>,
+    limits: TrackerLimits,
+}
+
+#[derive(Clone, Copy)]
+struct TrackerLimits {
+    entries: usize,
+    entries_per_peer: usize,
+    bytes: usize,
+    bytes_per_peer: usize,
+}
+
+impl Default for TrackerLimits {
+    fn default() -> Self {
+        Self {
+            entries: MAX_PENDING_ACK_ENTRIES,
+            entries_per_peer: MAX_PENDING_ACK_PER_PEER,
+            bytes: MAX_PENDING_ACK_BYTES,
+            bytes_per_peer: MAX_PENDING_ACK_BYTES_PER_PEER,
+        }
+    }
+}
+
+impl Default for PendingAckTracker {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            per_peer: HashMap::new(),
+            total_bytes: 0,
+            per_peer_bytes: HashMap::new(),
+            limits: TrackerLimits::default(),
+        }
+    }
 }
 
 impl PendingAckTracker {
@@ -121,12 +156,69 @@ impl PendingAckTracker {
         ack_key: [u8; 32],
         frame_bytes: impl Into<Arc<[u8]>>,
     ) -> bool {
+        let frame = frame_bytes.into();
+        self.register_frames(
+            content_id,
+            next_hop,
+            dst_node_id,
+            src_app_id,
+            ack_key,
+            vec![frame].into(),
+        )
+    }
+
+    /// Register all carrier frames for one chunked original envelope. The
+    /// receiver acknowledges only `content_id` after full reassembly and E2E
+    /// delivery, so the batch is one pending entry and one failure outcome.
+    pub fn register_batch(
+        &mut self,
+        content_id: [u8; 32],
+        next_hop: [u8; 32],
+        dst_node_id: [u8; 32],
+        src_app_id: [u8; 32],
+        ack_key: [u8; 32],
+        frames: Vec<Vec<u8>>,
+    ) -> bool {
+        if frames.is_empty() {
+            return false;
+        }
+        let frames: Vec<Arc<[u8]>> = frames.into_iter().map(Arc::from).collect();
+        self.register_frames(
+            content_id,
+            next_hop,
+            dst_node_id,
+            src_app_id,
+            ack_key,
+            frames.into(),
+        )
+    }
+
+    fn register_frames(
+        &mut self,
+        content_id: [u8; 32],
+        next_hop: [u8; 32],
+        dst_node_id: [u8; 32],
+        src_app_id: [u8; 32],
+        ack_key: [u8; 32],
+        frames: Arc<[Arc<[u8]>]>,
+    ) -> bool {
+        let frame_bytes_len = frames
+            .iter()
+            .try_fold(0usize, |sum, frame| sum.checked_add(frame.len()));
+        let Some(frame_bytes_len) = frame_bytes_len else {
+            return false;
+        };
         // Only gate on the growth caps when this registration actually grows
         // the relevant table — re-registering an EXISTING content_id replaces
         // in place and must not be rejected just because the table is full.
         // (audit cycle-8 F13.)
         let existing_dst = self.pending.get(&content_id).map(|e| e.dst_node_id);
-        if existing_dst.is_none() && self.pending.len() >= MAX_PENDING_ACK_ENTRIES {
+        let existing_bytes = self
+            .pending
+            .get(&content_id)
+            .map(|entry| entry.frame_bytes_len)
+            .unwrap_or(0);
+        if existing_dst.is_none() && self.pending.len() >= self.limits.entries {
             return false;
         }
         // Per-peer cap: enforce only when this registration adds to
@@ -135,9 +227,28 @@ impl PendingAckTracker {
         // the per-peer count unchanged, so it must not be denied at the cap.
         if existing_dst != Some(dst_node_id) {
             let peer_count = self.per_peer.get(&dst_node_id).copied().unwrap_or(0);
-            if (peer_count as usize) >= MAX_PENDING_ACK_PER_PEER {
+            if (peer_count as usize) >= self.limits.entries_per_peer {
                 return false;
             }
+        }
+        let next_total = self
+            .total_bytes
+            .saturating_sub(existing_bytes)
+            .checked_add(frame_bytes_len);
+        if next_total.is_none_or(|bytes| bytes > self.limits.bytes) {
+            return false;
+        }
+        let current_peer_bytes = self.per_peer_bytes.get(&dst_node_id).copied().unwrap_or(0);
+        let replaced_here = if existing_dst == Some(dst_node_id) {
+            existing_bytes
+        } else {
+            0
+        };
+        let next_peer_bytes = current_peer_bytes
+            .saturating_sub(replaced_here)
+            .checked_add(frame_bytes_len);
+        if next_peer_bytes.is_none_or(|bytes| bytes > self.limits.bytes_per_peer) {
+            return false;
         }
         let deadline = Instant::now() + Duration::from_millis(DELIVERY_ACK_TIMEOUT_MS);
         // When re-registering a
@@ -150,7 +261,8 @@ impl PendingAckTracker {
         let prior = self.pending.insert(
             content_id,
             PendingEntry {
-                frame_bytes: frame_bytes.into(),
+                frames,
+                frame_bytes_len,
                 next_hop,
                 dst_node_id,
                 src_app_id,
@@ -159,6 +271,15 @@ impl PendingAckTracker {
                 deadline,
             },
         );
+        self.total_bytes = next_total.expect("validated above");
+        if let Some(previous) = prior.as_ref() {
+            decrement_peer_bytes(
+                &mut self.per_peer_bytes,
+                &previous.dst_node_id,
+                previous.frame_bytes_len,
+            );
+        }
+        *self.per_peer_bytes.entry(dst_node_id).or_insert(0) += frame_bytes_len;
         match prior {
             None => {
                 // Fresh insert — increment the new peer's counter.
@@ -182,6 +303,12 @@ impl PendingAckTracker {
     pub fn ack(&mut self, content_id: &[u8; 32]) {
         if let Some(entry) = self.pending.remove(content_id) {
             decrement_peer(&mut self.per_peer, &entry.dst_node_id);
+            self.total_bytes = self.total_bytes.saturating_sub(entry.frame_bytes_len);
+            decrement_peer_bytes(
+                &mut self.per_peer_bytes,
+                &entry.dst_node_id,
+                entry.frame_bytes_len,
+            );
         }
     }
 
@@ -194,6 +321,8 @@ impl PendingAckTracker {
     pub fn ack_and_get_info(&mut self, content_id: &[u8; 32]) -> Option<([u8; 32], [u8; 32])> {
         self.pending.remove(content_id).map(|e| {
             decrement_peer(&mut self.per_peer, &e.dst_node_id);
+            self.total_bytes = self.total_bytes.saturating_sub(e.frame_bytes_len);
+            decrement_peer_bytes(&mut self.per_peer_bytes, &e.dst_node_id, e.frame_bytes_len);
             (e.next_hop, e.src_app_id)
         })
     }
@@ -225,6 +354,8 @@ impl PendingAckTracker {
         let mut outcomes = Vec::new();
         let timeout = Duration::from_millis(DELIVERY_ACK_TIMEOUT_MS);
         let per_peer = &mut self.per_peer;
+        let per_peer_bytes = &mut self.per_peer_bytes;
+        let total_bytes = &mut self.total_bytes;
 
         self.pending.retain(|&content_id, entry| {
             if now < entry.deadline {
@@ -239,6 +370,8 @@ impl PendingAckTracker {
                 });
                 // decrement per-peer counter on failure.
                 decrement_peer(per_peer, &entry.dst_node_id);
+                decrement_peer_bytes(per_peer_bytes, &entry.dst_node_id, entry.frame_bytes_len);
+                *total_bytes = total_bytes.saturating_sub(entry.frame_bytes_len);
                 false
             } else {
                 entry.attempts += 1;
@@ -247,7 +380,7 @@ impl PendingAckTracker {
                     content_id,
                     next_hop: entry.next_hop,
                     dst_node_id: entry.dst_node_id,
-                    frame_bytes: Arc::clone(&entry.frame_bytes),
+                    frames: Arc::clone(&entry.frames),
                     attempt: entry.attempts,
                 });
                 true
@@ -263,6 +396,12 @@ impl PendingAckTracker {
     }
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
+    }
+
+    /// Number of carrier frames retained for one logical acknowledged message.
+    /// Useful for metrics and black-box wiring tests; returns no frame bytes.
+    pub fn tracked_frame_count(&self, content_id: &[u8; 32]) -> Option<usize> {
+        self.pending.get(content_id).map(|entry| entry.frames.len())
     }
 
     /// Update the stored `next_hop` for a tracked entry so that future
@@ -281,6 +420,19 @@ fn decrement_peer(per_peer: &mut HashMap<[u8; 32], u32>, dst_node_id: &[u8; 32])
     if let Some(c) = per_peer.get_mut(dst_node_id) {
         *c = c.saturating_sub(1);
         if *c == 0 {
+            per_peer.remove(dst_node_id);
+        }
+    }
+}
+
+fn decrement_peer_bytes(
+    per_peer: &mut HashMap<[u8; 32], usize>,
+    dst_node_id: &[u8; 32],
+    bytes: usize,
+) {
+    if let Some(current) = per_peer.get_mut(dst_node_id) {
+        *current = current.saturating_sub(bytes);
+        if *current == 0 {
             per_peer.remove(dst_node_id);
         }
     }
@@ -409,5 +561,66 @@ mod tests {
                 if next_hop == hop() && dst_node_id == dst()
         ));
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn chunk_batch_is_one_entry_and_ack_releases_all_bytes() {
+        let mut t = PendingAckTracker::new();
+        assert!(t.register_batch(
+            cid(4),
+            hop(),
+            dst(),
+            src(),
+            [0x44; 32],
+            vec![vec![1, 2, 3], vec![4, 5], vec![6]],
+        ));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.total_bytes, 6);
+        assert_eq!(t.per_peer_bytes.get(&dst()), Some(&6));
+
+        t.pending.get_mut(&cid(4)).unwrap().deadline =
+            Instant::now() - std::time::Duration::from_millis(1);
+        let outcomes = t.tick();
+        match &outcomes[0] {
+            AckTickOutcome::Retransmit {
+                frames, attempt, ..
+            } => {
+                assert_eq!(*attempt, 2);
+                assert_eq!(frames.len(), 3);
+                assert_eq!(&*frames[0], &[1, 2, 3]);
+                assert_eq!(&*frames[1], &[4, 5]);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+
+        t.ack(&cid(4));
+        assert_eq!(t.total_bytes, 0);
+        assert!(t.per_peer_bytes.is_empty());
+    }
+
+    #[test]
+    fn byte_caps_and_replacement_accounting_are_enforced() {
+        let mut t = PendingAckTracker::new();
+        t.limits.bytes = 8;
+        t.limits.bytes_per_peer = 6;
+        assert!(t.register_batch(
+            cid(5),
+            hop(),
+            dst(),
+            src(),
+            [0; 32],
+            vec![vec![0; 3], vec![0; 3]],
+        ));
+        assert!(!t.register(cid(6), hop(), dst(), src(), [0; 32], vec![0]));
+
+        // Replacing the same id subtracts its old bytes before applying caps.
+        assert!(t.register(cid(5), hop(), dst(), src(), [0; 32], vec![9, 9]));
+        assert_eq!(t.total_bytes, 2);
+        assert_eq!(t.per_peer_bytes.get(&dst()), Some(&2));
+
+        let other_dst = [0xBC; 32];
+        assert!(t.register(cid(7), hop(), other_dst, src(), [0; 32], vec![0; 6]));
+        assert_eq!(t.total_bytes, 8);
+        assert!(!t.register(cid(8), hop(), other_dst, src(), [0; 32], vec![1]));
     }
 }

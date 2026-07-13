@@ -1431,6 +1431,16 @@ impl FrameDispatcher {
                 // longer chunk-marked, so it takes the normal decrypt+deliver path.
                 self.terminal_deliver(*reassembled, peer_id);
             }
+            AddChunkResult::CompletedReplay(orig_content_id) => {
+                let replay = {
+                    lock!(self.terminal_ack_replay)
+                        .get(&orig_content_id)
+                        .copied()
+                };
+                if let Some((sender, ack_key)) = replay {
+                    self.send_delivery_ack(sender, orig_content_id, ack_key);
+                }
+            }
             AddChunkResult::Pending => {}
             AddChunkResult::Rejected(reason) => {
                 // LIMIT-prefixed so any quota/limit drop is greppable in debug

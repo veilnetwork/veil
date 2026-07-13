@@ -32,6 +32,23 @@ fn temp_socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("veil-ipc-test-{}-{}.sock", id, n))
 }
 
+struct CapturingPeerBroadcaster {
+    peer_id: [u8; 32],
+    tx: tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>,
+}
+
+impl veil_types::FrameBroadcaster for CapturingPeerBroadcaster {
+    fn send_to(&self, peer_id: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool {
+        peer_id == &self.peer_id && self.tx.send((priority, bytes)).is_ok()
+    }
+
+    fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
+
+    fn active_node_ids(&self) -> Vec<[u8; 32]> {
+        vec![self.peer_id]
+    }
+}
+
 async fn connect_and_hello(sock: &PathBuf) -> UnixStream {
     let mut client = UnixStream::connect(sock).await.unwrap();
     // Write HELLO frame
@@ -1495,6 +1512,115 @@ async fn anonymous_send_payload_starts_with_meta_e2e_marker() {
         fwd.envelope.src_app_id, [0u8; 32],
         "src_app_id must be zero"
     );
+
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    let _ = sh.await;
+}
+
+#[tokio::test]
+async fn acknowledged_oversized_send_registers_one_complete_chunk_batch() {
+    use veil_proto::budget::MAX_CHUNK_PAYLOAD;
+    use veil_proto::delivery::{ChunkedEnvelopePayload, ForwardPayload, MAX_ENVELOPE_PAYLOAD};
+    use veil_routing::RouteCache;
+    use veil_types::FrameBroadcaster;
+
+    let sock = temp_socket_path();
+    let local = [0x31; 32];
+    let relay = [0x32; 32];
+    let destination = [0x33; 32];
+    let route_cache = Arc::new(RwLock::new(RouteCache::new(Duration::from_secs(60))));
+    route_cache
+        .write()
+        .unwrap()
+        .insert(destination, relay, 10_000, 2);
+    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session_reg: Arc<dyn FrameBroadcaster> = Arc::new(CapturingPeerBroadcaster {
+        peer_id: relay,
+        tx: relay_tx,
+    });
+    let pending = Arc::new(std::sync::Mutex::new(
+        veil_pending_ack::PendingAckTracker::new(),
+    ));
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let registry = Arc::new(AppEndpointRegistry::new());
+    let mut server = IpcServer::new(
+        IpcEndpoint::Unix(sock.clone()),
+        shutdown_rx,
+        Arc::clone(&registry),
+        local,
+    )
+    .with_session_tx_registry(session_reg)
+    .with_route_cache(Arc::clone(&route_cache))
+    .with_pending_ack(Arc::clone(&pending));
+    let sh = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = connect_and_hello(&sock).await;
+    let bind = AppBindPayload {
+        endpoint_id: 1,
+        flags: 0,
+        namespace: b"test".to_vec(),
+        name: b"chunk-batch".to_vec(),
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+    let (_, body) = recv_ipc_frame(&mut client).await;
+    let app = AppBindOkPayload::decode(&body).unwrap();
+    let payload_len = MAX_ENVELOPE_PAYLOAD + MAX_CHUNK_PAYLOAD + 7;
+    let send = AppIpcSendPayload {
+        src_app_id: app.app_id,
+        dst_node_id: destination,
+        app_id: [0x34; 32],
+        endpoint_id: 8,
+        data: veil_bufpool::pooled_shared_from_vec(vec![0xA5; payload_len]),
+        require_ack: true,
+        anonymous: false,
+        anonymous_authenticated: false,
+        expect_reply: false,
+        is_reply: false,
+        reply_id: 0,
+        reply_endpoint_id: 0,
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &send.encode()).await;
+    let (response, _) = recv_ipc_frame(&mut client).await;
+    assert_eq!(response.msg_type, LocalAppMsg::AppSendOk as u16);
+
+    let mut chunks = Vec::new();
+    let first = tokio::time::timeout(Duration::from_secs(2), relay_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    let first_fwd = ForwardPayload::decode(&first[veil_proto::HEADER_SIZE..]).unwrap();
+    let first_chunk = ChunkedEnvelopePayload::decode(&first_fwd.envelope.payload).unwrap();
+    let chunk_count = first_chunk.chunk_count as usize;
+    chunks.push((first_fwd.envelope.content_id, first_chunk));
+    for _ in 1..chunk_count {
+        let frame = tokio::time::timeout(Duration::from_secs(2), relay_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        let fwd = ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        chunks.push((
+            fwd.envelope.content_id,
+            ChunkedEnvelopePayload::decode(&fwd.envelope.payload).unwrap(),
+        ));
+    }
+    let original = chunks[0].1.orig_content_id;
+    assert!(
+        chunks
+            .iter()
+            .all(|(_, chunk)| chunk.orig_content_id == original)
+    );
+    let carrier_ids: std::collections::HashSet<_> =
+        chunks.iter().map(|(content_id, _)| *content_id).collect();
+    assert_eq!(carrier_ids.len(), chunk_count);
+    let tracker = pending.lock().unwrap();
+    assert_eq!(tracker.len(), 1);
+    assert_eq!(tracker.tracked_frame_count(&original), Some(chunk_count));
+    drop(tracker);
 
     drop(client);
     let _ = shutdown_tx.send(true);
