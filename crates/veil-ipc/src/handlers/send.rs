@@ -777,7 +777,8 @@ pub(crate) async fn handle_ipc_send(
                 // TransitFrame is used relay-to-relay when both peers negotiate
                 // transit_relay capability; the IPC originator uses ForwardPayload for now.
                 let make_fwd_frame = |next_hop: [u8; 32]| -> Vec<u8> {
-                    let body_len = 32 + env_bytes.len() + 8 + 1;
+                    let attempt_suffix_len = if send.require_ack { 2 } else { 0 };
+                    let body_len = 32 + env_bytes.len() + 8 + 1 + attempt_suffix_len;
                     let mut hdr = FrameHeader::new(
                         veil_proto::family::FrameFamily::Delivery as u8,
                         DeliveryMsg::Forward as u16,
@@ -788,6 +789,10 @@ pub(crate) async fn handle_ipc_send(
                     frame.extend_from_slice(&env_bytes);
                     frame.extend_from_slice(&trace_bytes);
                     frame.push(0u8); // relay_hops = 0 at origin
+                    if send.require_ack {
+                        frame.push(veil_proto::delivery::FORWARD_DELIVERY_ATTEMPT_MARKER);
+                        frame.push(1); // initial delivery attempt
+                    }
                     frame
                 };
 

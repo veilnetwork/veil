@@ -1567,6 +1567,48 @@ async fn acknowledged_oversized_send_registers_one_complete_chunk_batch() {
     send_ipc_frame(&mut client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
     let (_, body) = recv_ipc_frame(&mut client).await;
     let app = AppBindOkPayload::decode(&body).unwrap();
+
+    let ordinary = AppIpcSendPayload {
+        src_app_id: app.app_id,
+        dst_node_id: destination,
+        app_id: [0x34; 32],
+        endpoint_id: 8,
+        data: veil_bufpool::pooled_shared_from_vec(vec![1, 2, 3]),
+        require_ack: true,
+        anonymous: false,
+        anonymous_authenticated: false,
+        expect_reply: false,
+        is_reply: false,
+        reply_id: 0,
+        reply_endpoint_id: 0,
+    };
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::AppIpcSend as u16,
+        &ordinary.encode(),
+    )
+    .await;
+    let (response, _) = recv_ipc_frame(&mut client).await;
+    assert_eq!(response.msg_type, LocalAppMsg::AppSendOk as u16);
+    let ordinary_frame = tokio::time::timeout(Duration::from_secs(2), relay_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    let ordinary_fwd = ForwardPayload::decode(&ordinary_frame[veil_proto::HEADER_SIZE..]).unwrap();
+    assert_eq!(ordinary_fwd.delivery_attempt, Some(1));
+    assert_eq!(
+        pending
+            .lock()
+            .unwrap()
+            .tracked_frame_count(&ordinary_fwd.envelope.content_id),
+        Some(1)
+    );
+    pending
+        .lock()
+        .unwrap()
+        .ack(&ordinary_fwd.envelope.content_id);
+
     let payload_len = MAX_ENVELOPE_PAYLOAD + MAX_CHUNK_PAYLOAD + 7;
     let send = AppIpcSendPayload {
         src_app_id: app.app_id,

@@ -28,6 +28,20 @@ pub fn rand_seed_for_pick(trace_id: u64) -> u64 {
     x
 }
 
+/// Encode the Forward trailer shared by direct-sovereign, route-cache and
+/// gateway forwarding. Keeping the optional delivery-attempt extension here
+/// prevents a fallback path from silently downgrading relay-safe retries.
+fn forward_suffix(payload: &ForwardPayload, relay_hops_out: u8) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(9 + usize::from(payload.delivery_attempt.is_some()) * 2);
+    suffix.extend_from_slice(&payload.envelope.trace_id.to_be_bytes());
+    suffix.push(relay_hops_out);
+    if let Some(attempt) = payload.delivery_attempt {
+        suffix.push(veil_proto::delivery::FORWARD_DELIVERY_ATTEMPT_MARKER);
+        suffix.push(attempt);
+    }
+    suffix
+}
+
 /// Per-candidate routing attributes captured once at relay-forward
 /// time so the scoring loop doesn't re-acquire `rtt_table` / `peer_
 /// vivaldi` locks for every candidate.  Stored parallel to the
@@ -137,9 +151,7 @@ impl FrameDispatcher {
         // single-allocation pattern). The only per-target difference
         // is the 32-byte `next_hop_node_id` prefix.
         let envelope_bytes = payload.envelope.encode();
-        let mut suffix = Vec::with_capacity(9);
-        suffix.extend_from_slice(&payload.envelope.trace_id.to_be_bytes());
-        suffix.push(relay_hops_out);
+        let suffix = forward_suffix(payload, relay_hops_out);
         let body_len = 32 + envelope_bytes.len() + suffix.len();
         let total_wire_len = veil_proto::header::HEADER_SIZE + body_len;
 
@@ -438,8 +450,12 @@ impl FrameDispatcher {
             }
         }
 
-        // Forward dedup: enforce unique content_id on every relayed frame.
-        // Zero content_id would allow unlimited replay — reject outright.
+        // Forward dedup. Legacy frames get one relay pass per terminal
+        // content_id. New acknowledged frames carry a bounded delivery-attempt
+        // ordinal, so a downstream loss can traverse the same first relay on
+        // attempts 2/3 without weakening loop suppression inside one attempt.
+        // The domain-separated attempt keys live in the floodable relay cache;
+        // terminal replay safety remains keyed on the original content_id.
         {
             let content_id = payload.envelope.content_id;
             if content_id == [0u8; 32] {
@@ -447,7 +463,28 @@ impl FrameDispatcher {
                     "DELIVERY_FORWARD: zero content_id not allowed on relay path".to_owned(),
                 ));
             }
-            if lock!(self.forward_seen_content).check_and_insert(content_id) {
+            let duplicate = if let Some(attempt) = payload.delivery_attempt {
+                if !payload.envelope.require_ack
+                    || attempt == 0
+                    || u32::from(attempt) > veil_proto::budget::MAX_DELIVERY_ATTEMPTS
+                {
+                    return Err(DispatchResult::Violation(
+                        "DELIVERY_FORWARD: invalid delivery_attempt".to_owned(),
+                    ));
+                }
+                // Reserve the legacy key too. Its duplicate result is ignored
+                // for numbered attempts, but a relay cannot strip the extension
+                // later and gain an additional unnumbered forwarding pass.
+                let _ = lock!(self.forward_seen_content).check_and_insert(content_id);
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"veil/forward-delivery-attempt/v1");
+                hasher.update(&content_id);
+                hasher.update(&[attempt]);
+                lock!(self.forward_seen_set).check_and_insert(*hasher.finalize().as_bytes())
+            } else {
+                lock!(self.forward_seen_content).check_and_insert(content_id)
+            };
+            if duplicate {
                 return Err(DispatchResult::NoResponse);
             }
         }
@@ -797,12 +834,7 @@ impl FrameDispatcher {
             return false;
         }
         let envelope_bytes = payload.envelope.encode();
-        let gw_suffix: Vec<u8> = {
-            let mut s = Vec::with_capacity(9);
-            s.extend_from_slice(&payload.envelope.trace_id.to_be_bytes());
-            s.push(relay_hops_out);
-            s
-        };
+        let gw_suffix = forward_suffix(payload, relay_hops_out);
         let body_len = 32 + envelope_bytes.len() + gw_suffix.len();
         let mut fwd_hdr = veil_proto::header::FrameHeader::new(
             veil_proto::family::FrameFamily::Delivery as u8,
@@ -935,12 +967,7 @@ impl FrameDispatcher {
             // fields — including `trace_id == 0` — or the receiver will reject
             // the frame with "bad Forward: buffer too short".
             let envelope_bytes = payload.envelope.encode();
-            let suffix: Vec<u8> = {
-                let mut s = Vec::with_capacity(9);
-                s.extend_from_slice(&payload.envelope.trace_id.to_be_bytes());
-                s.push(relay_hops_out);
-                s
-            };
+            let suffix = forward_suffix(&payload, relay_hops_out);
             let body_len = 32 + envelope_bytes.len() + suffix.len();
             let total_wire_len = veil_proto::header::HEADER_SIZE + body_len;
             let make_fwd_frame = |hop: NodeIdBytes| -> Vec<u8> {
@@ -2093,6 +2120,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn numbered_delivery_attempts_cross_a_relay_once_each_and_stay_bounded() {
+        use crate::{DispatchResult, make_test_dispatcher};
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+
+        let peer = [0xA1; 32];
+        let content_id = [0xC1; 32];
+        let envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any([0xB1; 32]),
+            sender_node_id: peer,
+            src_app_id: [0xA2; 32],
+            app_id: [0xB2; 32],
+            endpoint_id: 7,
+            content_id,
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: 60,
+            payload: vec![1, 2, 3],
+            trace_id: 0,
+            require_ack: true,
+        };
+        let mut forward = ForwardPayload {
+            next_hop_node_id: [0xD1; 32],
+            envelope,
+            relay_hops: 0,
+            delivery_attempt: Some(1),
+        };
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let peer = NodeId::from(peer);
+
+        for attempt in 1..=veil_proto::budget::MAX_DELIVERY_ATTEMPTS as u8 {
+            forward.delivery_attempt = Some(attempt);
+            assert!(matches!(
+                dispatcher.check_relay_preconditions(&forward, peer),
+                Ok(1)
+            ));
+            assert!(matches!(
+                dispatcher.check_relay_preconditions(&forward, peer),
+                Err(DispatchResult::NoResponse)
+            ));
+        }
+
+        forward.delivery_attempt =
+            Some(u8::try_from(veil_proto::budget::MAX_DELIVERY_ATTEMPTS).unwrap() + 1);
+        assert!(matches!(
+            dispatcher.check_relay_preconditions(&forward, peer),
+            Err(DispatchResult::Violation(_))
+        ));
+
+        // Stripping the extension cannot buy an extra legacy forwarding pass.
+        forward.delivery_attempt = None;
+        assert!(matches!(
+            dispatcher.check_relay_preconditions(&forward, peer),
+            Err(DispatchResult::NoResponse)
+        ));
+
+        // Attempt ordinals are meaningful only for ACK-tracked envelopes.
+        forward.envelope.content_id = [0xC2; 32];
+        forward.envelope.require_ack = false;
+        forward.delivery_attempt = Some(1);
+        assert!(matches!(
+            dispatcher.check_relay_preconditions(&forward, peer),
+            Err(DispatchResult::Violation(_))
+        ));
+    }
+
     /// Terminal DELIVERY_FORWARD replay guard: two identical terminal Forward
     /// frames (same non-zero `content_id`) addressed to the local node must
     /// result in exactly ONE app delivery — the second is silently dropped by
@@ -2139,6 +2231,7 @@ mod tests {
             next_hop_node_id: recipient_id,
             envelope,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let body = fwd.encode();
         let mut hdr = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
@@ -2281,6 +2374,7 @@ mod tests {
                 next_hop_node_id: recipient_id,
                 envelope,
                 relay_hops: 0,
+                delivery_attempt: None,
             }
             .encode();
             let mut hdr =
@@ -2417,6 +2511,7 @@ mod tests {
             next_hop_node_id: local_id,
             envelope,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let rr = RecursiveRelayPayload {
             dst_node_id: local_id,
@@ -2477,6 +2572,7 @@ mod tests {
             next_hop_node_id: dst,
             envelope,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let rr = RecursiveRelayPayload {
             dst_node_id: dst,
@@ -2716,6 +2812,7 @@ mod tests {
             next_hop_node_id: alice_id, // not meaningful for sovereign path
             envelope,
             relay_hops: 0,
+            delivery_attempt: None,
         };
 
         // Fire the fast-path directly.
@@ -2768,6 +2865,7 @@ mod tests {
             next_hop_node_id: [0xCC; 32],
             envelope,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         assert!(!disp.try_sovereign_direct_forward(
             &fwd,
@@ -2850,6 +2948,7 @@ mod tests {
             next_hop_node_id: [0xCC; 32],
             envelope,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         assert!(!disp.try_sovereign_direct_forward(
             &fwd,

@@ -130,7 +130,8 @@ pub struct DeliveryEnvelope {
     ///
     /// When `true` the final recipient sends back a `DeliveryStatus(DELIVERED)`
     /// frame addressed to `sender_node_id`. The sender retransmits the envelope
-    /// (same `content_id`) until it receives the ACK or exhausts attempts.
+    /// with the same terminal `content_id` and an incremented Forward
+    /// `delivery_attempt` until it receives the ACK or exhausts attempts.
     ///
     /// Encoded as `DELIVERY_FLAG_REQUIRE_ACK` in the high bit of the wire
     /// `ttl_secs` field — backward-compatible with older nodes that don't know
@@ -262,6 +263,12 @@ impl DeliveryEnvelope {
 
 // ── ForwardPayload ────────────────────────────────────────────────────────────
 
+/// Optional extension marker preceding a delivery-attempt ordinal in a
+/// [`ForwardPayload`]. Legacy decoders ignore bytes after `relay_hops`; new
+/// relays preserve this two-byte suffix and use `(content_id, attempt)` for
+/// relay-loop dedup while terminal delivery still keys on `content_id` alone.
+pub const FORWARD_DELIVERY_ATTEMPT_MARKER: u8 = 0xA7;
+
 /// Request to forward an envelope to the next hop.
 ///
 /// Wire layout:
@@ -270,6 +277,8 @@ impl DeliveryEnvelope {
 /// [32..] DeliveryEnvelope (self-framed)
 /// [end..+8] trace_id u64 BE
 /// [end+8..+1] relay_hops u8
+/// [end+9] optional 0xA7 extension marker
+/// [end+10] optional delivery_attempt u8 (1..=MAX_DELIVERY_ATTEMPTS)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardPayload {
@@ -283,6 +292,10 @@ pub struct ForwardPayload {
     /// node drops the frame (returns `Violation`) when this reaches
     /// [`crate::budget::MAX_RELAY_HOPS`].
     pub relay_hops: u8,
+    /// End-to-end acknowledged-delivery attempt ordinal. `None` is the legacy
+    /// wire form. Relays validate the bounded range and deduplicate each
+    /// attempt separately; the final recipient deliberately ignores it.
+    pub delivery_attempt: Option<u8>,
 }
 
 impl ForwardPayload {
@@ -290,11 +303,17 @@ impl ForwardPayload {
     /// `relay_hops` (1 byte) after the envelope.
     pub fn encode(&self) -> Vec<u8> {
         let env_bytes = self.envelope.encode();
-        let mut buf = Vec::with_capacity(32 + env_bytes.len() + 8 + 1);
+        let mut buf = Vec::with_capacity(
+            32 + env_bytes.len() + 8 + 1 + usize::from(self.delivery_attempt.is_some()) * 2,
+        );
         buf.extend_from_slice(&self.next_hop_node_id);
         buf.extend_from_slice(&env_bytes);
         buf.extend_from_slice(&self.envelope.trace_id.to_be_bytes());
         buf.push(self.relay_hops);
+        if let Some(attempt) = self.delivery_attempt {
+            buf.push(FORWARD_DELIVERY_ATTEMPT_MARKER);
+            buf.push(attempt);
+        }
         buf
     }
 
@@ -319,10 +338,16 @@ impl ForwardPayload {
         }
         envelope.trace_id = super::read_u64_be(buf, after_env)?;
         let relay_hops = buf[after_env + 8];
+        let delivery_attempt = if buf.get(need) == Some(&FORWARD_DELIVERY_ATTEMPT_MARKER) {
+            buf.get(need + 1).copied()
+        } else {
+            None
+        };
         Ok(Self {
             next_hop_node_id,
             envelope,
             relay_hops,
+            delivery_attempt,
         })
     }
 }
@@ -1064,6 +1089,7 @@ mod tests {
             next_hop_node_id: [9u8; 32],
             envelope: sample_envelope(),
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let encoded = payload.encode();
         let decoded = ForwardPayload::decode(&encoded).unwrap();
@@ -1085,6 +1111,7 @@ mod tests {
             next_hop_node_id: [7u8; 32],
             envelope: sample_envelope(),
             relay_hops: 5,
+            delivery_attempt: None,
         };
         let encoded = payload.encode();
         let decoded = ForwardPayload::decode(&encoded).unwrap();
@@ -1112,12 +1139,31 @@ mod tests {
             next_hop_node_id: [3u8; 32],
             envelope: env,
             relay_hops: 12,
+            delivery_attempt: Some(2),
         };
         let encoded = payload.encode();
         let decoded = ForwardPayload::decode(&encoded).unwrap();
         assert_eq!(decoded.envelope.trace_id, 0xDEAD_BEEF_1234_5678);
         assert_eq!(decoded.relay_hops, 12);
+        assert_eq!(decoded.delivery_attempt, Some(2));
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn forward_unknown_or_truncated_extension_stays_legacy_compatible() {
+        let payload = ForwardPayload {
+            next_hop_node_id: [4u8; 32],
+            envelope: sample_envelope(),
+            relay_hops: 1,
+            delivery_attempt: None,
+        };
+        let mut unknown = payload.encode();
+        unknown.extend_from_slice(&[0xEE, 7, 8]);
+        assert_eq!(ForwardPayload::decode(&unknown).unwrap(), payload);
+
+        let mut truncated = payload.encode();
+        truncated.push(FORWARD_DELIVERY_ATTEMPT_MARKER);
+        assert_eq!(ForwardPayload::decode(&truncated).unwrap(), payload);
     }
 
     #[test]
