@@ -3460,6 +3460,20 @@ impl NodeRuntime {
             .register_ephemeral_onion_service(identity_seed, hop_count)
     }
 
+    pub fn register_ephemeral_onion_service_with_provider_slot(
+        &self,
+        identity_seed: zeroize::Zeroizing<[u8; 32]>,
+        hop_count: usize,
+        provider_slot: u8,
+    ) -> std::result::Result<[u8; 32], veil_types::AnonOnionSendError> {
+        self.access()
+            .register_ephemeral_onion_service_with_provider_slot(
+                identity_seed,
+                hop_count,
+                provider_slot,
+            )
+    }
+
     /// Stop refreshing a previously registered ephemeral service. Existing
     /// descriptors/circuits age out naturally; the application must also drop
     /// capability requests immediately so revoke has no response oracle.
@@ -7635,7 +7649,7 @@ impl NodeServices {
         hop_count: usize,
     ) -> std::result::Result<[u8; 16], veil_types::AnonOnionSendError> {
         let seed = self.sovereign_onion_identity_seed();
-        self.register_onion_service_with_identity(hop_count, seed, false)
+        self.register_onion_service_with_identity(hop_count, seed, false, None)
             .map(|(cookie, _)| cookie)
     }
 
@@ -7644,8 +7658,20 @@ impl NodeServices {
         identity_seed: zeroize::Zeroizing<[u8; 32]>,
         hop_count: usize,
     ) -> std::result::Result<[u8; 32], veil_types::AnonOnionSendError> {
+        self.register_ephemeral_onion_service_with_provider_slot(identity_seed, hop_count, 0)
+    }
+
+    pub fn register_ephemeral_onion_service_with_provider_slot(
+        &self,
+        identity_seed: zeroize::Zeroizing<[u8; 32]>,
+        hop_count: usize,
+        provider_slot: u8,
+    ) -> std::result::Result<[u8; 32], veil_types::AnonOnionSendError> {
+        if provider_slot >= veil_anonymity::blinded_descriptor::MAX_PROVIDER_SLOTS {
+            return Err(veil_types::AnonOnionSendError::NoRelays);
+        }
         let seed = std::sync::Arc::new(identity_seed);
-        self.register_onion_service_with_identity(hop_count, Some(seed), true)
+        self.register_onion_service_with_identity(hop_count, Some(seed), true, Some(provider_slot))
             .map(|(_, vk)| vk.expect("ephemeral identity seed always has a public key"))
     }
 
@@ -7693,6 +7719,7 @@ impl NodeServices {
         hop_count: usize,
         identity_seed: Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>>,
         ephemeral: bool,
+        descriptor_provider_slot: Option<u8>,
     ) -> std::result::Result<([u8; 16], Option<[u8; 32]>), veil_types::AnonOnionSendError> {
         use rand_core::{OsRng, RngCore};
 
@@ -7717,11 +7744,29 @@ impl NodeServices {
                         .filter(|seed| {
                             veil_crypto::key_blinding::ed25519_public_from_seed(seed) == vk
                         })
+                        .filter(|_| entry.descriptor_provider_slot == descriptor_provider_slot)
                         .map(|_| (entry.cookie, Some(vk)))
                 })
             });
             if let Some(existing) = already_registered {
                 return Ok(existing);
+            }
+            let identity_registered = requested_vk.is_some_and(|vk| {
+                services.iter().any(|entry| {
+                    entry
+                        .descriptor_identity_seed
+                        .as_deref()
+                        .is_some_and(|seed| {
+                            veil_crypto::key_blinding::ed25519_public_from_seed(seed) == vk
+                        })
+                })
+            });
+            if identity_registered {
+                self.logger.warn(
+                    "onion.service.provider_slot_change",
+                    "withdraw the existing capability identity before changing its provider slot",
+                );
+                return Err(veil_types::AnonOnionSendError::NoRelays);
             }
             let cap = if ephemeral {
                 MAX_EPHEMERAL_ONION_SERVICES
@@ -7731,9 +7776,7 @@ impl NodeServices {
             if services.len() >= cap {
                 self.logger.warn(
                     "onion.service.capacity",
-                    format!(
-                        "onion-service slot cap ({cap}) reached — refusing registration"
-                    ),
+                    format!("onion-service slot cap ({cap}) reached — refusing registration"),
                 );
                 return Err(veil_types::AnonOnionSendError::NoRelays);
             }
@@ -7761,7 +7804,11 @@ impl NodeServices {
             .as_deref()
             .map(|seed| veil_crypto::key_blinding::ed25519_public_from_seed(seed));
         let cookie: [u8; 16] = match identity_seed.as_deref() {
-            Some(seed) => veil_crypto::identity::derive_onion_auth_cookie(seed, period),
+            Some(seed) => Self::onion_auth_cookie_for_seed(
+                seed,
+                period,
+                descriptor_provider_slot,
+            ),
             None => {
                 let mut c = [0u8; 16];
                 OsRng.fill_bytes(&mut c);
@@ -7776,6 +7823,7 @@ impl NodeServices {
             cookie,
             identity_seed.clone(),
             ephemeral,
+            descriptor_provider_slot,
         )?;
         // COOKIE-DIAG: the cookie THIS node registers at the relay + publishes in
         // its ad. A sender's `rendezvous.cookie.introduce` line for this node must
@@ -7821,6 +7869,7 @@ impl NodeServices {
             .map(|e| std::sync::Arc::clone(&e.confirmed));
         let relay = r;
         let publish_seed = identity_seed.clone();
+        let publish_slot = descriptor_provider_slot;
         let publish = move |this: &NodeServices| {
             service_tasks::rendezvous_register_publisher(
                 &this.anonymity,
@@ -7837,7 +7886,7 @@ impl NodeServices {
             // DHT. Capability services use their random per-share identity here,
             // never the host's sovereign key.
             if let Some(seed) = publish_seed.as_deref() {
-                this.publish_blinded_descriptor_for(seed, relay, cookie);
+                this.publish_blinded_descriptor_for(seed, relay, cookie, publish_slot);
             }
         };
         match confirmed {
@@ -7962,6 +8011,7 @@ impl NodeServices {
         identity_seed: &[u8; 32],
         rendezvous: [u8; 32],
         cookie: [u8; 16],
+        provider_slot: Option<u8>,
     ) {
         let Some(x25519_pk) = self
             .dispatcher
@@ -8002,6 +8052,23 @@ impl NodeServices {
                 bytes,
             );
         }
+        if let Some(provider_slot) = provider_slot
+            && let Some((dht_key, bytes)) =
+                veil_anonymity::blinded_descriptor::seal_provider_descriptor(
+                    identity_seed,
+                    period,
+                    provider_slot,
+                    &body,
+                )
+        {
+            dht_publish_replicated_via(
+                &self.dht,
+                &self.session_tx_registry,
+                *self.identity.local_identity.node_id.as_bytes(),
+                dht_key,
+                bytes,
+            );
+        }
     }
 
     /// The onion service's rendezvous registration keypair for `period`,
@@ -8012,11 +8079,32 @@ impl NodeServices {
     fn onion_reg_keypair_for_seed(
         identity_seed: Option<&[u8; 32]>,
         period: u64,
+        provider_slot: Option<u8>,
     ) -> Option<veil_crypto::GeneratedKeyPair> {
         identity_seed.map(|seed| {
-            let reg_seed = veil_crypto::identity::derive_onion_reg_seed(seed, period);
+            let reg_seed = match provider_slot {
+                Some(slot) => {
+                    veil_crypto::identity::derive_onion_provider_reg_seed(seed, period, slot)
+                }
+                None => veil_crypto::identity::derive_onion_reg_seed(seed, period),
+            };
             veil_crypto::ed25519_keypair_from_seed(&reg_seed)
         })
+    }
+
+    fn onion_auth_cookie_for_seed(
+        identity_seed: &[u8; 32],
+        period: u64,
+        provider_slot: Option<u8>,
+    ) -> [u8; 16] {
+        match provider_slot {
+            Some(slot) => veil_crypto::identity::derive_onion_provider_auth_cookie(
+                identity_seed,
+                period,
+                slot,
+            ),
+            None => veil_crypto::identity::derive_onion_auth_cookie(identity_seed, period),
+        }
     }
 
     /// Register a location-anonymous service: build its onion circuit + record it
@@ -8036,6 +8124,7 @@ impl NodeServices {
             cookie,
             self.sovereign_onion_identity_seed(),
             false,
+            None,
         )
     }
 
@@ -8045,6 +8134,7 @@ impl NodeServices {
         cookie: [u8; 16],
         descriptor_identity_seed: Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>>,
         ephemeral: bool,
+        descriptor_provider_slot: Option<u8>,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
         // Registration keypair: seed-derived per blinded-descriptor period, like
         // the cookie itself (L1 kept it stable across REBUILDS; deriving it makes
@@ -8065,6 +8155,7 @@ impl NodeServices {
         let reg_keypair = Self::onion_reg_keypair_for_seed(
             descriptor_identity_seed.as_deref().map(|seed| &**seed),
             period,
+            descriptor_provider_slot,
         )
         .unwrap_or_else(|| veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519));
         // B2: per-service monotonic registration-epoch counter, reused on every
@@ -8106,6 +8197,7 @@ impl NodeServices {
             confirmed,
             registration_epoch,
             descriptor_identity_seed,
+            descriptor_provider_slot,
             ephemeral,
         });
         Ok(())
@@ -8162,6 +8254,7 @@ impl NodeServices {
             std::sync::Arc<std::sync::atomic::AtomicBool>,
             std::sync::Arc<std::sync::atomic::AtomicU64>,
             Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>>,
+            Option<u8>,
         );
         let due: Vec<DueEntry> = {
             let svcs = lock!(self.anonymity.onion_services);
@@ -8175,6 +8268,7 @@ impl NodeServices {
                         std::sync::Arc::clone(&e.confirmed),
                         std::sync::Arc::clone(&e.registration_epoch),
                         e.descriptor_identity_seed.clone(),
+                        e.descriptor_provider_slot,
                     )
                 })
                 .collect()
@@ -8186,6 +8280,7 @@ impl NodeServices {
             prev_confirmed,
             registration_epoch,
             descriptor_identity_seed,
+            descriptor_provider_slot,
         ) in due
         {
             // Rotate the rendezvous cookie WITH the blinded-descriptor period. The
@@ -8200,7 +8295,13 @@ impl NodeServices {
             let period_now = veil_anonymity::blinded_descriptor::current_period(now_unix);
             let cookie_now = descriptor_identity_seed
                 .as_deref()
-                .map(|seed| veil_crypto::identity::derive_onion_auth_cookie(seed, period_now))
+                .map(|seed| {
+                    Self::onion_auth_cookie_for_seed(
+                        seed,
+                        period_now,
+                        descriptor_provider_slot,
+                    )
+                })
                 .unwrap_or(cookie);
             // The registration keypair rotates WITH the cookie's period (same
             // derivation cadence): re-deriving here keeps the pair the relay
@@ -8211,6 +8312,7 @@ impl NodeServices {
             let reg_keypair = Self::onion_reg_keypair_for_seed(
                 descriptor_identity_seed.as_deref().map(|seed| &**seed),
                 period_now,
+                descriptor_provider_slot,
             )
             .unwrap_or(reg_keypair);
             // diff-audit Δ2-d: if the terminus never ACK'd the current circuit
@@ -8274,6 +8376,7 @@ impl NodeServices {
             // descriptor is always present under the live key.
             if let Some(&rendezvous) = relay_path.last() {
                 let publish_seed = descriptor_identity_seed.clone();
+                let publish_slot = descriptor_provider_slot;
                 match built {
                     // Same publish-before-register barrier as the initial
                     // registration: at a period boundary `cookie_now` is a
@@ -8282,7 +8385,12 @@ impl NodeServices {
                     Ok(new_confirmed) => {
                         self.publish_after_circuit_confirmed(new_confirmed, move |this| {
                             if let Some(seed) = publish_seed.as_deref() {
-                                this.publish_blinded_descriptor_for(seed, rendezvous, cookie_now);
+                                this.publish_blinded_descriptor_for(
+                                    seed,
+                                    rendezvous,
+                                    cookie_now,
+                                    publish_slot,
+                                );
                             }
                         });
                     }
@@ -8292,7 +8400,12 @@ impl NodeServices {
                     // succeeding (the next tick retries in REFRESH_SECS).
                     Err(_) => {
                         if let Some(seed) = publish_seed.as_deref() {
-                            self.publish_blinded_descriptor_for(seed, rendezvous, cookie_now);
+                            self.publish_blinded_descriptor_for(
+                                seed,
+                                rendezvous,
+                                cookie_now,
+                                publish_slot,
+                            );
                         }
                     }
                 }
@@ -9026,10 +9139,14 @@ impl NodeServices {
         if self.identity.sovereign_identity.is_none() {
             return Err(AnonOnionSendError::NoIdentity);
         }
-        let ad = self.resolve_onion_service_ad(&service_identity_vk).await?;
+        let ads = self.resolve_onion_service_ads(&service_identity_vk).await?;
+        let ad = Self::select_rendezvous_candidates(&ads, data, 1)
+            .into_iter()
+            .next()
+            .ok_or(AnonOnionSendError::NoRendezvous)?;
 
         self.send_via_rendezvous_authenticated(
-            &ad,
+            ad,
             &[], // by-identity resolves a single descriptor → one relay, no spread
             target_app_id,
             target_endpoint_id,
@@ -9058,7 +9175,7 @@ impl NodeServices {
         data: &[u8],
         hop_count: usize,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
-        let ad = self.resolve_onion_service_ad(&service_identity_vk).await?;
+        let ads = self.resolve_onion_service_ads(&service_identity_vk).await?;
 
         // Unauthenticated final-hop payload: src_node_id zero (anonymity).
         let app_deliver = veil_proto::AppDeliverPayload {
@@ -9076,8 +9193,34 @@ impl NodeServices {
         // 60 B, leaving far less than one public-cloud chunk in the 320 B
         // ciphertext budget. Fragment the opaque AppDeliver bytes without
         // adding a sovereign signature (the receiver must still see node_id=0).
-        self.send_via_rendezvous_anonymous_payload(&ad, &app_deliver_bytes, hop_count, true)
-            .map_err(map_sender_err)
+        // A send enqueue cannot prove end-to-end delivery, so a sequential
+        // fallback would be illusory. Fan out to at most three independently
+        // hosted providers. Cloud requests carry a fresh nonce; hashing the
+        // opaque request rotates the starting provider across retries while a
+        // fixed cap bounds traffic and duplicate responses.
+        let mut first_error = None;
+        let mut enqueued = 0usize;
+        let candidates = Self::select_rendezvous_candidates(&ads, data, 3);
+        for ad in &candidates {
+            match self.send_via_rendezvous_anonymous_payload(
+                ad,
+                &app_deliver_bytes,
+                hop_count,
+                true,
+            ) {
+                Ok(()) => enqueued += 1,
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if candidates.is_empty() {
+            return Err(veil_types::AnonOnionSendError::NoRendezvous);
+        }
+        match (enqueued, first_error) {
+            (0, Some(error)) => Err(map_sender_err(error)),
+            (0, None) => Err(veil_types::AnonOnionSendError::NoRendezvous),
+            _ => Ok(()),
+        }
     }
 
     fn send_via_rendezvous_anonymous_payload(
@@ -9391,11 +9534,68 @@ impl NodeServices {
     /// a wrong-period attempt simply fails to open). Also pre-resolves the
     /// rendezvous relay's directory entry into our local shard so the onion build
     /// finds it. `NoRendezvous` if no descriptor resolves/decrypts.
-    async fn resolve_onion_service_ad(
+    fn select_rendezvous_candidates<'a>(
+        ads: &'a [veil_anonymity::rendezvous::RendezvousAd],
+        request_bytes: &[u8],
+        limit: usize,
+    ) -> Vec<&'a veil_anonymity::rendezvous::RendezvousAd> {
+        if ads.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"veil.provider.candidate-order.v1\0");
+        hash.update(request_bytes);
+        let digest = hash.finalize();
+        let mut start_bytes = [0u8; 8];
+        start_bytes.copy_from_slice(&digest.as_bytes()[..8]);
+        let start = (u64::from_le_bytes(start_bytes) as usize) % ads.len();
+        (0..ads.len().min(limit))
+            .map(|offset| &ads[(start + offset) % ads.len()])
+            .collect()
+    }
+
+    async fn resolve_onion_service_period_bodies(
         &self,
         service_identity_vk: &[u8; 32],
-    ) -> std::result::Result<veil_anonymity::rendezvous::RendezvousAd, veil_types::AnonOnionSendError>
-    {
+        period: u64,
+        timeout: std::time::Duration,
+    ) -> Vec<veil_anonymity::blinded_descriptor::BlindedDescriptorBody> {
+        use veil_anonymity::blinded_descriptor as bd;
+
+        let provider_lookups = (0..bd::MAX_PROVIDER_SLOTS).filter_map(|slot| {
+            bd::provider_descriptor_dht_key(service_identity_vk, period, slot)
+                .map(|key| (slot, key))
+        });
+        let lookups = provider_lookups
+            .map(|(slot, key)| (Some(slot), key))
+            .chain(bd::descriptor_dht_key(service_identity_vk, period).map(|key| (None, key)));
+        let results = futures::future::join_all(lookups.map(|(slot, key)| async move {
+            let bytes = self.dht_recursive_get(key, timeout).await?;
+            let body = match slot {
+                Some(slot) => {
+                    bd::open_provider_descriptor(service_identity_vk, period, slot, &bytes)
+                }
+                None => bd::open_descriptor(service_identity_vk, period, &bytes),
+            }?;
+            Some(body)
+        }))
+        .await;
+        let mut bodies = Vec::new();
+        for body in results.into_iter().flatten() {
+            if !bodies.contains(&body) {
+                bodies.push(body);
+            }
+        }
+        bodies
+    }
+
+    async fn resolve_onion_service_ads(
+        &self,
+        service_identity_vk: &[u8; 32],
+    ) -> std::result::Result<
+        Vec<veil_anonymity::rendezvous::RendezvousAd>,
+        veil_types::AnonOnionSendError,
+    > {
         use veil_anonymity::blinded_descriptor as bd;
         use veil_types::AnonOnionSendError;
 
@@ -9407,51 +9607,75 @@ impl NodeServices {
             .unwrap_or(0);
         let cur = bd::current_period(now);
 
-        let mut body: Option<bd::BlindedDescriptorBody> = None;
-        for period in [cur, cur.saturating_sub(1), cur.saturating_add(1)] {
-            let Some(dht_key) = bd::descriptor_dht_key(service_identity_vk, period) else {
-                continue;
-            };
-            let Some(bytes) = self.dht_recursive_get(dht_key, RESOLVE_TIMEOUT).await else {
-                continue;
-            };
-            if let Some(b) = bd::open_descriptor(service_identity_vk, period, &bytes) {
-                body = Some(b);
-                break;
+        // Query every fixed slot, not "until missing": the lookup shape must
+        // not reveal the provider count. Legacy `od` participates as a ninth
+        // compatibility candidate. Adjacent periods are queried only when the
+        // current period has no valid descriptor at all.
+        let mut bodies = self
+            .resolve_onion_service_period_bodies(service_identity_vk, cur, RESOLVE_TIMEOUT)
+            .await;
+        if bodies.is_empty() {
+            let adjacent = futures::future::join_all([
+                self.resolve_onion_service_period_bodies(
+                    service_identity_vk,
+                    cur.saturating_sub(1),
+                    RESOLVE_TIMEOUT,
+                ),
+                self.resolve_onion_service_period_bodies(
+                    service_identity_vk,
+                    cur.saturating_add(1),
+                    RESOLVE_TIMEOUT,
+                ),
+            ])
+            .await;
+            for body in adjacent.into_iter().flatten() {
+                if !bodies.contains(&body) {
+                    bodies.push(body);
+                }
             }
         }
-        let Some(body) = body else {
+        if bodies.is_empty() {
             return Err(AnonOnionSendError::NoRendezvous);
-        };
+        }
 
-        // Synthesize the ad the send path reads. Only routing + receiver_node_id
-        // are consulted; the ad-signature fields are not (we decrypted + verified
-        // the descriptor ourselves), so they stay empty.
-        let ad = veil_anonymity::rendezvous::RendezvousAd {
-            receiver_node_id: body.receiver_node_id,
-            rendezvous_node_id: body.rendezvous_node_id,
-            auth_cookie: body.auth_cookie,
-            receiver_x25519_pk: body.receiver_x25519_pk,
-            valid_from_unix: 0,
-            valid_until_unix: u64::MAX,
-            issuer_pk: String::new(),
-            issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
-            signature: Vec::new(),
-            push_envelope: Vec::new(),
-            capability_token: Vec::new(),
-            wake_hmac_envelope: Vec::new(),
-            rendezvous_kem_algo: 0,
-            rendezvous_kem_pk: Vec::new(),
-            wire_version: 0,
-        };
+        let ads: Vec<_> = bodies
+            .into_iter()
+            .map(|body| veil_anonymity::rendezvous::RendezvousAd {
+                receiver_node_id: body.receiver_node_id,
+                rendezvous_node_id: body.rendezvous_node_id,
+                auth_cookie: body.auth_cookie,
+                receiver_x25519_pk: body.receiver_x25519_pk,
+                valid_from_unix: 0,
+                valid_until_unix: u64::MAX,
+                issuer_pk: String::new(),
+                issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
+                signature: Vec::new(),
+                push_envelope: Vec::new(),
+                capability_token: Vec::new(),
+                wake_hmac_envelope: Vec::new(),
+                rendezvous_kem_algo: 0,
+                rendezvous_kem_pk: Vec::new(),
+                wire_version: 0,
+            })
+            .collect();
 
-        let relay_key = veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id);
-        if self.dht.get_local(&relay_key).is_none()
-            && let Some(bytes) = self.dht_recursive_get(relay_key, RESOLVE_TIMEOUT).await
-        {
+        let relay_keys: Vec<_> = ads
+            .iter()
+            .map(|ad| veil_anonymity::directory::relay_directory_dht_key(&ad.rendezvous_node_id))
+            .collect();
+        let resolved = futures::future::join_all(relay_keys.iter().map(|relay_key| async move {
+            if self.dht.get_local(relay_key).is_some() {
+                return None;
+            }
+            self.dht_recursive_get(*relay_key, RESOLVE_TIMEOUT)
+                .await
+                .map(|bytes| (*relay_key, bytes))
+        }))
+        .await;
+        for (relay_key, bytes) in resolved.into_iter().flatten() {
             self.dht.store_local(relay_key, bytes);
         }
-        Ok(ad)
+        Ok(ads)
     }
 
     /// Reply to a previously-received authenticated message via its one-time

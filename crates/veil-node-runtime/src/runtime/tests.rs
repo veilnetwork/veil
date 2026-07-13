@@ -25,6 +25,55 @@ use super::peer_handshake::{
 use super::uri_helpers::{uri_has_port_zero, uri_scheme};
 use super::*;
 
+fn provider_test_ad(tag: u8) -> veil_anonymity::rendezvous::RendezvousAd {
+    veil_anonymity::rendezvous::RendezvousAd {
+        receiver_node_id: [tag; 32],
+        rendezvous_node_id: [tag.wrapping_add(1); 32],
+        auth_cookie: [tag; 16],
+        receiver_x25519_pk: [tag.wrapping_add(2); 32],
+        valid_from_unix: 0,
+        valid_until_unix: u64::MAX,
+        issuer_pk: String::new(),
+        issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
+        signature: Vec::new(),
+        push_envelope: Vec::new(),
+        capability_token: Vec::new(),
+        wake_hmac_envelope: Vec::new(),
+        rendezvous_kem_algo: 0,
+        rendezvous_kem_pk: Vec::new(),
+        wire_version: 0,
+    }
+}
+
+#[test]
+fn capability_provider_candidates_are_bounded_and_nonce_rotated() {
+    let ads: Vec<_> = (0..6).map(provider_test_ad).collect();
+    let selected = NodeServices::select_rendezvous_candidates(&ads, b"request-a", 3);
+    assert_eq!(selected.len(), 3);
+    assert!(selected.windows(2).all(|pair| {
+        pair[0].rendezvous_node_id != pair[1].rendezvous_node_id
+    }));
+    assert_eq!(
+        selected
+            .iter()
+            .map(|ad| ad.rendezvous_node_id)
+            .collect::<Vec<_>>(),
+        NodeServices::select_rendezvous_candidates(&ads, b"request-a", 3)
+            .iter()
+            .map(|ad| ad.rendezvous_node_id)
+            .collect::<Vec<_>>()
+    );
+
+    let starts: std::collections::HashSet<_> = (0u8..64)
+        .map(|nonce| {
+            NodeServices::select_rendezvous_candidates(&ads, &[nonce], 3)[0]
+                .rendezvous_node_id
+        })
+        .collect();
+    assert!(starts.len() > 1, "fresh request nonces must rotate providers");
+    assert!(NodeServices::select_rendezvous_candidates(&ads, b"x", 0).is_empty());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn node_state_builds_from_config() {
     let path = save_test_config("node-runtime-build", runtime_config_with_listen()).unwrap();
