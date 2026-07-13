@@ -15,6 +15,7 @@
  */
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
 
 #include "veil_avf_adm.h"
 
@@ -43,14 +44,26 @@ constexpr int kPlayoutDelayMs = 40;
 constexpr size_t kPlayTmpSamples = 8192;  // render blocks are ~512-4096 frames
 
 void alog(const char* fmt, ...) {
-  FILE* f = fopen("/tmp/veil_media_diag.log", "a");
-  if (!f) return;
   va_list ap;
   va_start(ap, fmt);
+#if TARGET_OS_IPHONE
+  // iOS has no process-global writable /tmp. Keep diagnostics in the unified
+  // device log; values are structural only (permission/state/frame counts),
+  // never PCM or identity material.
+  char line[512];
+  vsnprintf(line, sizeof(line), fmt, ap);
+  NSLog(@"veil_media: %s", line);
+#else
+  FILE* f = fopen("/tmp/veil_media_diag.log", "a");
+  if (!f) {
+    va_end(ap);
+    return;
+  }
   vfprintf(f, fmt, ap);
-  va_end(ap);
   fputc('\n', f);
   fclose(f);
+#endif
+  va_end(ap);
 }
 
 class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
@@ -316,6 +329,41 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
 
   void EnsureEngineLocked() {
     if (engine_ != nil) return;
+#if TARGET_OS_IPHONE
+    // AVAudioEngine does not choose a bidirectional voice route on iOS by
+    // itself. Configure the process audio session before touching inputNode:
+    // VoiceChat enables the platform AEC path, Bluetooth headsets remain
+    // available, and the built-in speaker is the safe default for a call.
+    AVAudioSession* session = [AVAudioSession sharedInstance];
+    NSError* session_error = nil;
+    const AVAudioSessionCategoryOptions options =
+        AVAudioSessionCategoryOptionAllowBluetoothHFP |
+        AVAudioSessionCategoryOptionDefaultToSpeaker;
+    if (![session setCategory:AVAudioSessionCategoryPlayAndRecord
+                         mode:AVAudioSessionModeVoiceChat
+                      options:options
+                        error:&session_error]) {
+      alog("avf_adm: setCategory failed: %s",
+           session_error ? session_error.localizedDescription.UTF8String : "?");
+    }
+    session_error = nil;
+    [session setPreferredSampleRate:kSampleRate error:&session_error];
+    if (session_error) {
+      alog("avf_adm: preferred sample rate failed: %s",
+           session_error.localizedDescription.UTF8String);
+    }
+    session_error = nil;
+    [session setPreferredIOBufferDuration:0.01 error:&session_error];
+    if (session_error) {
+      alog("avf_adm: preferred IO duration failed: %s",
+           session_error.localizedDescription.UTF8String);
+    }
+    session_error = nil;
+    if (![session setActive:YES error:&session_error]) {
+      alog("avf_adm: audio session activation failed: %s",
+           session_error ? session_error.localizedDescription.UTF8String : "?");
+    }
+#endif
     engine_ = [[AVAudioEngine alloc] init];
     AVAudioFormat* src_fmt = [[AVAudioFormat alloc]
         initWithCommonFormat:AVAudioPCMFormatFloat32
@@ -374,6 +422,17 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     source_node_ = nil;
     capture_converter_ = nil;
     int16_format_ = nil;
+#if TARGET_OS_IPHONE
+    NSError* session_error = nil;
+    [[AVAudioSession sharedInstance]
+        setActive:NO
+      withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+            error:&session_error];
+    if (session_error) {
+      alog("avf_adm: audio session deactivation failed: %s",
+           session_error.localizedDescription.UTF8String);
+    }
+#endif
   }
 
   webrtc::Environment env_;

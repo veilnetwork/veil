@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * veil_avf_camera.mm — AVCaptureSession-backed CameraCapturer for macOS.
+ * veil_avf_camera.mm — AVCaptureSession-backed CameraCapturer for Apple.
  *
  * Opens the default video camera, requests NV12 output, converts each frame to
  * I420 (libyuv::NV12ToI420) and hands the planes to the CameraFrameCb on the
@@ -12,6 +12,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
 
 #include "veil_camera.h"
 
@@ -104,11 +105,9 @@ class AvfCameraCapturer : public CameraCapturer {
     (void)fps;
     if (session_) return true;
     @autoreleasepool {
-      // Find a video capture device. `defaultDeviceWithMediaType:` returns nil
-      // for the built-in camera on some macOS versions (observed on macOS 26
-      // even with camera TCC granted — its userPreferredCamera resolves to
-      // null), so enumerate explicitly with a discovery session and only fall
-      // back to the legacy default.
+      // Find a video capture device. macOS needs explicit discovery on some
+      // releases; iOS should prefer the front camera for a call.
+#if TARGET_OS_OSX
       NSMutableArray<AVCaptureDeviceType>* types = [NSMutableArray
           arrayWithObject:AVCaptureDeviceTypeBuiltInWideAngleCamera];
       if (@available(macOS 14.0, *)) {
@@ -130,6 +129,18 @@ class AvfCameraCapturer : public CameraCapturer {
       if (dev == nil) {
         dev = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
       }
+#else
+      AVCaptureDevice* dev = [AVCaptureDevice
+          defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInWideAngleCamera
+                             mediaType:AVMediaTypeVideo
+                              position:AVCaptureDevicePositionFront];
+      if (dev == nil) {
+        dev = [AVCaptureDevice
+            defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInWideAngleCamera
+                               mediaType:AVMediaTypeVideo
+                                position:AVCaptureDevicePositionBack];
+      }
+#endif
       if (dev == nil) return false;
       NSError* err = nil;
       AVCaptureDeviceInput* input =
