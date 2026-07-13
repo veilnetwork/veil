@@ -3380,6 +3380,7 @@ mod tests {
             next_hop_node_id: c_id,
             envelope: delivery.clone(),
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -3458,6 +3459,7 @@ mod tests {
             next_hop_node_id: b_id,
             envelope: delivery,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4260,6 +4262,7 @@ mod tests {
             next_hop_node_id: b_id,
             envelope: delivery,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4324,6 +4327,7 @@ mod tests {
             next_hop_node_id: c_id,
             envelope: delivery,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4353,6 +4357,69 @@ mod tests {
         assert!(
             second.is_err(),
             "relay must NOT have sent a second (replayed) frame to C"
+        );
+    }
+
+    #[test]
+    fn relay_forwards_next_numbered_attempt_after_downstream_loss() {
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+
+        let a_id = [0xA3; 32];
+        let b_id = [0xB3; 32];
+        let c_id = [0xC3; 32];
+        let content_id = [0x43; 32];
+        let delivery = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any(c_id),
+            sender_node_id: a_id,
+            src_app_id: [0xA4; 32],
+            app_id: [0xC4; 32],
+            endpoint_id: 3,
+            content_id,
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: 30,
+            payload: b"retry me".to_vec(),
+            trace_id: 0,
+            require_ack: true,
+        };
+        let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut rx_c = tx_reg.write().unwrap().register(c_id);
+        let relay = make_gossip_dispatcher(
+            b_id,
+            Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xB3; 32])),
+            Arc::clone(&tx_reg),
+            vec![],
+        );
+        let header = FrameHeader::new(
+            FrameFamily::Delivery as u8,
+            veil_proto::family::DeliveryMsg::Forward as u16,
+        );
+        let make_attempt = |attempt| {
+            ForwardPayload {
+                next_hop_node_id: c_id,
+                envelope: delivery.clone(),
+                relay_hops: 0,
+                delivery_attempt: Some(attempt),
+            }
+            .encode()
+        };
+
+        relay.dispatch(&header, &make_attempt(1), a_id);
+        let first = rx_c.try_recv().expect("attempt 1 forwarded").1;
+        let first = ForwardPayload::decode(&first[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(first.delivery_attempt, Some(1));
+        assert_eq!(first.envelope.content_id, content_id);
+
+        // The first frame is deliberately treated as lost after this relay.
+        relay.dispatch(&header, &make_attempt(2), a_id);
+        let second = rx_c.try_recv().expect("attempt 2 forwarded").1;
+        let second = ForwardPayload::decode(&second[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(second.delivery_attempt, Some(2));
+        assert_eq!(second.envelope.content_id, content_id);
+
+        relay.dispatch(&header, &make_attempt(2), a_id);
+        assert!(
+            rx_c.try_recv().is_err(),
+            "a duplicate inside attempt 2 must still be suppressed"
         );
     }
 
@@ -4394,6 +4461,7 @@ mod tests {
             next_hop_node_id: c_id,
             envelope: delivery,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4461,6 +4529,7 @@ mod tests {
             next_hop_node_id: c_id,
             envelope: delivery,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4521,6 +4590,7 @@ mod tests {
             next_hop_node_id: c_id,
             envelope: delivery.clone(),
             relay_hops: MAX_RELAY_HOPS,
+            delivery_attempt: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4539,6 +4609,7 @@ mod tests {
             next_hop_node_id: c_id,
             envelope: delivery,
             relay_hops: MAX_RELAY_HOPS - 1,
+            delivery_attempt: None,
         };
         let fwd_ok_bytes = fwd_ok.encode();
         let result_ok = disp_b.dispatch(&fwd_hdr, &fwd_ok_bytes, a_id);
@@ -4703,6 +4774,7 @@ mod tests {
             next_hop_node_id: b_id,
             envelope: delivery,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
@@ -6602,6 +6674,7 @@ mod tests {
             next_hop_node_id: c_id,
             envelope: delivery,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -6680,6 +6753,7 @@ mod tests {
             next_hop_node_id: c_id,
             envelope: delivery,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -6728,6 +6802,7 @@ mod tests {
             next_hop_node_id: c_id,
             envelope: delivery2,
             relay_hops: 0,
+            delivery_attempt: None,
         };
         let fwd2_bytes = fwd2.encode();
         disp_b.dispatch(&fwd_hdr, &fwd2_bytes, a_id);
