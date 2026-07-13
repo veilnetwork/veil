@@ -42,10 +42,8 @@ cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
 # by design (mirrors the old .so), so compile the veil TUs at 26.
 cmd=re.sub(r'(--target=aarch64-linux-android)\d+', r'\g<1>26', cmd)
 cmd=re.sub(r'-D__ANDROID_API__=\d+', '-D__ANDROID_API__=26', cmd)
-# -Wno-error=deprecated-declarations: the android webrtc build is stricter
-# (-Werror) than mac; the engine uses a deprecated-but-functional webrtc field
-# (local_ssrc). Downgrade to a warning so the veil source builds against current
-# webrtc without touching engine behaviour.
+# Keep deprecation warnings non-fatal when the Android WebRTC checkout exposes
+# a legacy API that the macOS checkout still accepts.
 p=cmd.split(' ',1); cmd=p[0]+' -DVEIL_MEDIA_HAVE_WEBRTC=1 -Wno-error=deprecated-declarations -I'+shimdir+' '+p[1]
 open('/dev/stdout','w').write('cd "'+e['directory']+'"\n'+cmd+'\n')
 PY

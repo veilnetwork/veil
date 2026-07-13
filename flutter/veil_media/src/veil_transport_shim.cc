@@ -137,6 +137,7 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
     return;
   }
   std::vector<uint8_t> owned(ptr, ptr + len);
+  self->inbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
   self->inbound_pending_packets_.fetch_add(1, std::memory_order_release);
   self->inbound_pending_bytes_.fetch_add(owned.size(), std::memory_order_release);
   self->network_queue_->PostTask(
