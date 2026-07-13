@@ -7,6 +7,9 @@ import 'native.dart';
 /// Opaque engine handle (VeilMediaEngine*).
 final class VeilMediaEngineHandle extends Opaque {}
 
+/// Opaque N-party audio engine handle (VeilGroupMediaEngine*).
+final class VeilGroupMediaEngineHandle extends Opaque {}
+
 // create(veil_chan u64, local_id u8[32], peer_id u8[32]) -> engine*
 final Pointer<VeilMediaEngineHandle> Function(
         int, Pointer<Uint8>, Pointer<Uint8>) veilMediaEngineCreate =
@@ -207,6 +210,85 @@ final Pointer<Utf8> Function() veilMediaVersion = nativeLib
     .lookup<NativeFunction<Pointer<Utf8> Function()>>('veil_media_version')
     .asFunction();
 
+// ---- N-party audio engine -------------------------------------------------
+
+final Pointer<VeilGroupMediaEngineHandle> Function(Pointer<Uint8>)
+    veilMediaGroupEngineCreate = nativeLib
+        .lookup<
+            NativeFunction<
+                Pointer<VeilGroupMediaEngineHandle> Function(
+                    Pointer<Uint8>)>>('veil_media_group_engine_create')
+        .asFunction();
+
+final void Function(Pointer<VeilGroupMediaEngineHandle>)
+    veilMediaGroupEngineDestroy = nativeLib
+        .lookup<
+            NativeFunction<Void Function(Pointer<VeilGroupMediaEngineHandle>)>>(
+          'veil_media_group_engine_destroy',
+        )
+        .asFunction();
+
+final int Function(
+  Pointer<VeilGroupMediaEngineHandle>,
+  int,
+  Pointer<Uint8>,
+) veilMediaGroupEngineAddPeer = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilGroupMediaEngineHandle>,
+              Uint64,
+              Pointer<Uint8>,
+            )>>('veil_media_group_engine_add_peer')
+    .asFunction();
+
+final int Function(Pointer<VeilGroupMediaEngineHandle>, Pointer<Uint8>)
+    veilMediaGroupEngineRemovePeer = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                  Pointer<VeilGroupMediaEngineHandle>,
+                  Pointer<Uint8>,
+                )>>('veil_media_group_engine_remove_peer')
+        .asFunction();
+
+final int Function(Pointer<VeilGroupMediaEngineHandle>)
+    veilMediaGroupEngineStartAudio = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilGroupMediaEngineHandle>)>>(
+          'veil_media_group_engine_start_audio',
+        )
+        .asFunction();
+
+final int Function(Pointer<VeilGroupMediaEngineHandle>)
+    veilMediaGroupEngineStopAudio = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilGroupMediaEngineHandle>)>>(
+          'veil_media_group_engine_stop_audio',
+        )
+        .asFunction();
+
+final int Function(Pointer<VeilGroupMediaEngineHandle>, int)
+    veilMediaGroupEngineSetMicMuted = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilGroupMediaEngineHandle>, Int32)>>(
+          'veil_media_group_engine_set_mic_muted',
+        )
+        .asFunction();
+
+final int Function(Pointer<VeilGroupMediaEngineHandle>, Pointer<Uint8>)
+    veilMediaGroupEnginePeerRxPackets = nativeLib
+        .lookup<
+            NativeFunction<
+                Uint64 Function(
+                  Pointer<VeilGroupMediaEngineHandle>,
+                  Pointer<Uint8>,
+                )>>('veil_media_group_engine_peer_rx_packets')
+        .asFunction();
+
 // ---- Voice-message recorder (mic -> Opus -> RAM) --------------------------
 
 /// Opaque recorder handle (VeilAudioRecorder*).
@@ -220,31 +302,28 @@ final Pointer<VeilAudioRecorderHandle> Function() veilMediaRecorderCreate =
         .asFunction();
 
 // recorder_start(recorder*) -> int
-final int Function(Pointer<VeilAudioRecorderHandle>) veilMediaRecorderStart =
-    nativeLib
-        .lookup<
-            NativeFunction<
-                Int32 Function(Pointer<VeilAudioRecorderHandle>)>>(
-            'veil_media_recorder_start')
-        .asFunction();
+final int Function(
+    Pointer<
+        VeilAudioRecorderHandle>) veilMediaRecorderStart = nativeLib
+    .lookup<NativeFunction<Int32 Function(Pointer<VeilAudioRecorderHandle>)>>(
+        'veil_media_recorder_start')
+    .asFunction();
 
 // recorder_level(recorder*) -> float 0..1
-final double Function(Pointer<VeilAudioRecorderHandle>) veilMediaRecorderLevel =
-    nativeLib
-        .lookup<
-            NativeFunction<
-                Float Function(Pointer<VeilAudioRecorderHandle>)>>(
-            'veil_media_recorder_level')
-        .asFunction();
+final double Function(
+    Pointer<
+        VeilAudioRecorderHandle>) veilMediaRecorderLevel = nativeLib
+    .lookup<NativeFunction<Float Function(Pointer<VeilAudioRecorderHandle>)>>(
+        'veil_media_recorder_level')
+    .asFunction();
 
 // recorder_elapsed_ms(recorder*) -> int
-final int Function(Pointer<VeilAudioRecorderHandle>)
-    veilMediaRecorderElapsedMs = nativeLib
-        .lookup<
-            NativeFunction<
-                Int32 Function(Pointer<VeilAudioRecorderHandle>)>>(
-            'veil_media_recorder_elapsed_ms')
-        .asFunction();
+final int Function(
+    Pointer<
+        VeilAudioRecorderHandle>) veilMediaRecorderElapsedMs = nativeLib
+    .lookup<NativeFunction<Int32 Function(Pointer<VeilAudioRecorderHandle>)>>(
+        'veil_media_recorder_elapsed_ms')
+    .asFunction();
 
 // recorder_stop(recorder*, out_bytes**, out_len*, out_duration_ms*,
 //               waveform_out*, waveform_bars) -> int
@@ -269,13 +348,12 @@ final void Function(Pointer<Uint8>) veilMediaRecorderFreeBytes = nativeLib
     .asFunction();
 
 // recorder_destroy(recorder*)
-final void Function(Pointer<VeilAudioRecorderHandle>) veilMediaRecorderDestroy =
-    nativeLib
-        .lookup<
-            NativeFunction<
-                Void Function(Pointer<VeilAudioRecorderHandle>)>>(
-            'veil_media_recorder_destroy')
-        .asFunction();
+final void Function(
+    Pointer<
+        VeilAudioRecorderHandle>) veilMediaRecorderDestroy = nativeLib
+    .lookup<NativeFunction<Void Function(Pointer<VeilAudioRecorderHandle>)>>(
+        'veil_media_recorder_destroy')
+    .asFunction();
 
 // ---- Voice-message player (VOICE_OPUS -> PCM -> ADM speaker) ---------------
 
@@ -315,9 +393,8 @@ final int Function(Pointer<VeilAudioPlayerHandle>, int) veilMediaPlayerSeek =
     nativeLib
         .lookup<
             NativeFunction<
-                Int32 Function(
-                    Pointer<VeilAudioPlayerHandle>, Int32)>>(
-            'veil_media_player_seek')
+                Int32 Function(Pointer<VeilAudioPlayerHandle>,
+                    Int32)>>('veil_media_player_seek')
         .asFunction();
 
 // player_set_speed(player*, speed) -> int
@@ -325,9 +402,8 @@ final int Function(Pointer<VeilAudioPlayerHandle>, double)
     veilMediaPlayerSetSpeed = nativeLib
         .lookup<
             NativeFunction<
-                Int32 Function(
-                    Pointer<VeilAudioPlayerHandle>, Float)>>(
-            'veil_media_player_set_speed')
+                Int32 Function(Pointer<VeilAudioPlayerHandle>,
+                    Float)>>('veil_media_player_set_speed')
         .asFunction();
 
 final int Function(Pointer<VeilAudioPlayerHandle>) veilMediaPlayerPositionMs =
@@ -367,17 +443,16 @@ final Pointer<VeilVnoteRecorderHandle> Function(int, int, int)
     veilVnoteRecorderCreate = nativeLib
         .lookup<
             NativeFunction<
-                Pointer<VeilVnoteRecorderHandle> Function(Int32, Int32,
-                    Int32)>>('veil_media_vnote_recorder_create')
+                Pointer<VeilVnoteRecorderHandle> Function(
+                    Int32, Int32, Int32)>>('veil_media_vnote_recorder_create')
         .asFunction();
 
-final int Function(Pointer<VeilVnoteRecorderHandle>) veilVnoteRecorderStart =
-    nativeLib
-        .lookup<
-            NativeFunction<
-                Int32 Function(Pointer<VeilVnoteRecorderHandle>)>>(
-            'veil_media_vnote_recorder_start')
-        .asFunction();
+final int Function(
+    Pointer<
+        VeilVnoteRecorderHandle>) veilVnoteRecorderStart = nativeLib
+    .lookup<NativeFunction<Int32 Function(Pointer<VeilVnoteRecorderHandle>)>>(
+        'veil_media_vnote_recorder_start')
+    .asFunction();
 
 // vnote_recorder_push_frame(rec*, y,u,v, w,h, sy,su,sv, ts_us) -> int
 final int Function(Pointer<VeilVnoteRecorderHandle>, Pointer<Uint8>,
@@ -398,13 +473,12 @@ final int Function(Pointer<VeilVnoteRecorderHandle>, Pointer<Uint8>,
                     Int64)>>('veil_media_vnote_recorder_push_frame')
         .asFunction();
 
-final double Function(Pointer<VeilVnoteRecorderHandle>)
-    veilVnoteRecorderLevel = nativeLib
-        .lookup<
-            NativeFunction<
-                Float Function(Pointer<VeilVnoteRecorderHandle>)>>(
-            'veil_media_vnote_recorder_level')
-        .asFunction();
+final double Function(
+    Pointer<
+        VeilVnoteRecorderHandle>) veilVnoteRecorderLevel = nativeLib
+    .lookup<NativeFunction<Float Function(Pointer<VeilVnoteRecorderHandle>)>>(
+        'veil_media_vnote_recorder_level')
+    .asFunction();
 
 // vnote_recorder_frame(rec*, dst, cap, out_w, out_h) -> int seq
 final int Function(Pointer<VeilVnoteRecorderHandle>, Pointer<Uint8>, int,
@@ -420,13 +494,12 @@ final int Function(Pointer<VeilVnoteRecorderHandle>, Pointer<Uint8>, int,
                     Pointer<Int32>)>>('veil_media_vnote_recorder_frame')
         .asFunction();
 
-final int Function(Pointer<VeilVnoteRecorderHandle>)
-    veilVnoteRecorderElapsedMs = nativeLib
-        .lookup<
-            NativeFunction<
-                Int32 Function(Pointer<VeilVnoteRecorderHandle>)>>(
-            'veil_media_vnote_recorder_elapsed_ms')
-        .asFunction();
+final int Function(
+    Pointer<
+        VeilVnoteRecorderHandle>) veilVnoteRecorderElapsedMs = nativeLib
+    .lookup<NativeFunction<Int32 Function(Pointer<VeilVnoteRecorderHandle>)>>(
+        'veil_media_vnote_recorder_elapsed_ms')
+    .asFunction();
 
 // vnote_recorder_stop(rec*, out_bytes**, out_len*, out_duration_ms*) -> int
 final int Function(Pointer<VeilVnoteRecorderHandle>, Pointer<Pointer<Uint8>>,
@@ -446,13 +519,12 @@ final void Function(Pointer<Uint8>) veilVnoteFreeBytes = nativeLib
         'veil_media_vnote_free_bytes')
     .asFunction();
 
-final void Function(Pointer<VeilVnoteRecorderHandle>)
-    veilVnoteRecorderDestroy = nativeLib
-        .lookup<
-            NativeFunction<
-                Void Function(Pointer<VeilVnoteRecorderHandle>)>>(
-            'veil_media_vnote_recorder_destroy')
-        .asFunction();
+final void Function(
+    Pointer<
+        VeilVnoteRecorderHandle>) veilVnoteRecorderDestroy = nativeLib
+    .lookup<NativeFunction<Void Function(Pointer<VeilVnoteRecorderHandle>)>>(
+        'veil_media_vnote_recorder_destroy')
+    .asFunction();
 
 // vnote_player_create(bytes*, len) -> player* (NULL on a malformed container)
 final Pointer<VeilVnotePlayerHandle> Function(Pointer<Uint8>, int)
@@ -488,9 +560,9 @@ final int Function(Pointer<VeilVnotePlayerHandle>) veilVnotePlayerHasAudio =
         .asFunction();
 
 // vnote_player_audio(player*, out**, out_len*) -> int
-final int Function(Pointer<VeilVnotePlayerHandle>, Pointer<Pointer<Uint8>>,
-        Pointer<Size>) veilVnotePlayerAudio =
-    nativeLib
+final int Function(
+        Pointer<VeilVnotePlayerHandle>, Pointer<Pointer<Uint8>>, Pointer<Size>)
+    veilVnotePlayerAudio = nativeLib
         .lookup<
             NativeFunction<
                 Int32 Function(

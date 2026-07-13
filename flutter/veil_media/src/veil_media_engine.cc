@@ -76,6 +76,7 @@
 #include "api/video/video_broadcaster.h"
 #include "third_party/libyuv/include/libyuv/convert_argb.h"  // I420ToABGR
 #include "rtc_base/time_utils.h"  // webrtc::TimeMicros
+#include "rtc_base/network/sent_packet.h"  // webrtc::SentPacketInfo
 
 #if defined(__APPLE__)
 #include "veil_avf_adm.h"
@@ -87,9 +88,12 @@
 #include "veil_transport_shim.h"
 #endif
 
+extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* ptr,
+                                         size_t len);
+
 namespace {
 
-const char* kVersion = "veil_media 0.0.1 (phase3)";
+const char* kVersion = "veil_media 0.0.2 (group-audio)";
 constexpr int kOpusPayloadType = 111;  // SDP convention (Opus, 48k, stereo)
 
 // Diagnostic log to a file (a GUI app's stderr is not captured by the unified
@@ -142,6 +146,76 @@ uint32_t video_ssrc_of(const uint8_t id[32]) {
   uint32_t s = ssrc_of(id) ^ 0x000000FFu ^ 0x56440000u;  // "VD" tag
   return s == 0 ? 2u : s;
 }
+
+// Group receive streams share one webrtc::Call, so derive from the whole node
+// id rather than the first four bytes used by the legacy 1:1 engine. A room
+// rejects the extremely unlikely collision instead of binding media to the
+// wrong authenticated participant.
+uint32_t group_audio_ssrc_of(const uint8_t id[32]) {
+  uint32_t hash = 2166136261u;  // FNV-1a
+  for (size_t i = 0; i < 32; ++i) {
+    hash ^= id[i];
+    hash *= 16777619u;
+  }
+  hash ^= 0x47415544u;  // "GAUD"
+  return hash == 0 ? 1u : hash;
+}
+
+std::string node_key(const uint8_t id[32]) {
+  return std::string(reinterpret_cast<const char*>(id), 32);
+}
+
+// One encoded RTP stream is copied to every current peer channel. WebRTC gets
+// one OnSentPacket notification per RTP packet (not one per fanout copy), so
+// its pacer/BWE clock cannot be inflated by room size.
+class GroupFanoutTransport : public webrtc::Transport {
+ public:
+  explicit GroupFanoutTransport(webrtc::Call* call) : call_(call) {}
+
+  void Add(uint64_t chan) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (std::find(channels_.begin(), channels_.end(), chan) == channels_.end())
+      channels_.push_back(chan);
+  }
+
+  void Remove(uint64_t chan) {
+    std::lock_guard<std::mutex> lock(mu_);
+    channels_.erase(std::remove(channels_.begin(), channels_.end(), chan),
+                    channels_.end());
+  }
+
+  bool SendRtp(std::span<const uint8_t> packet,
+               const webrtc::PacketOptions& options) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    bool any = false;
+    for (const uint64_t chan : channels_) {
+      any = veil_media_send_datagram(chan, packet.data(), packet.size()) == 0 ||
+            any;
+    }
+    if (any && options.packet_id != -1) {
+      call_->OnSentPacket(
+          webrtc::SentPacketInfo(options.packet_id, webrtc::TimeMillis()));
+    }
+    return any;
+  }
+
+  bool SendRtcp(std::span<const uint8_t> packet,
+                const webrtc::PacketOptions& options) override {
+    (void)options;
+    std::lock_guard<std::mutex> lock(mu_);
+    bool any = false;
+    for (const uint64_t chan : channels_) {
+      any = veil_media_send_datagram(chan, packet.data(), packet.size()) == 0 ||
+            any;
+    }
+    return any;
+  }
+
+ private:
+  webrtc::Call* const call_;
+  std::mutex mu_;
+  std::vector<uint64_t> channels_;
+};
 
 // Sink for decoded remote video frames: converts each to RGBA and holds the
 // latest so Dart can pull it at the display rate (a pull avoids the async
@@ -242,6 +316,28 @@ struct WebrtcState {
   std::unique_ptr<veil_media::CameraCapturer> camera;  // real capture source
   std::unique_ptr<veil_media::ScreenCapturer> screen;  // screen-share source
 };
+
+struct GroupPeerState {
+  uint64_t chan = 0;
+  uint8_t id[32] = {0};
+  uint32_t audio_ssrc = 0;
+  std::unique_ptr<veil_media::VeilTransportShim> shim;
+  webrtc::AudioReceiveStreamInterface* recv_stream = nullptr;  // owned by Call
+};
+
+struct GroupWebrtcState {
+  explicit GroupWebrtcState(webrtc::Environment e) : env(std::move(e)) {}
+  webrtc::Environment env;
+  std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> worker_tq;
+  std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> network_tq;
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
+  webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
+  webrtc::scoped_refptr<webrtc::AudioState> audio_state;
+  std::unique_ptr<webrtc::Call> call;
+  std::unique_ptr<GroupFanoutTransport> fanout;
+  webrtc::AudioSendStream* send_stream = nullptr;  // owned by Call
+  std::map<std::string, std::unique_ptr<GroupPeerState>> peers;
+};
 #endif
 
 }  // namespace
@@ -255,6 +351,15 @@ struct VeilMediaEngine {
   bool speaker_muted = false;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   std::unique_ptr<WebrtcState> ws;
+#endif
+};
+
+struct VeilGroupMediaEngine {
+  uint8_t local[32] = {0};
+  std::atomic<bool> audio_running{false};
+  bool mic_muted = false;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  std::unique_ptr<GroupWebrtcState> ws;
 #endif
 };
 
@@ -348,6 +453,244 @@ void veil_media_engine_destroy(VeilMediaEngine* engine) {
   delete engine;
 }
 
+VeilGroupMediaEngine* veil_media_group_engine_create(
+    const uint8_t* local_id) {
+  if (local_id == nullptr) return nullptr;
+  auto engine = std::make_unique<VeilGroupMediaEngine>();
+  std::memcpy(engine->local, local_id, 32);
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  webrtc::Environment env = webrtc::CreateEnvironment();
+  auto ws = std::make_unique<GroupWebrtcState>(env);
+  ws->worker_tq = ws->env.task_queue_factory().CreateTaskQueue(
+      "veil-group-worker", webrtc::TaskQueueFactory::Priority::kNormal);
+  ws->network_tq = ws->env.task_queue_factory().CreateTaskQueue(
+      "veil-group-net", webrtc::TaskQueueFactory::Priority::kHigh);
+#if defined(__APPLE__)
+  ws->adm = veil_media::CreateVeilAvfAdm(ws->env);
+#elif defined(__ANDROID__)
+  ws->adm = veil_media::CreateVeilAAudioAdm(ws->env);
+#else
+  ws->adm = webrtc::CreateAudioDeviceModule(
+      ws->env, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
+#endif
+  if (ws->adm) ws->adm->Init();
+  ws->apm = webrtc::BuiltinAudioProcessingBuilder().Build(ws->env);
+  webrtc::AudioState::Config asc;
+  asc.audio_mixer = webrtc::AudioMixerImpl::Create();
+  asc.audio_processing = ws->apm;
+  asc.audio_device_module = ws->adm;
+  ws->audio_state = webrtc::AudioState::Create(asc);
+  if (ws->adm && ws->audio_state)
+    ws->adm->RegisterAudioCallback(ws->audio_state->audio_transport());
+  webrtc::CallConfig call_cfg(ws->env, ws->worker_tq.get(),
+                              ws->network_tq.get());
+  call_cfg.audio_state = ws->audio_state;
+  ws->call = webrtc::Call::Create(std::move(call_cfg));
+  ws->fanout = std::make_unique<GroupFanoutTransport>(ws->call.get());
+  engine->ws = std::move(ws);
+#endif
+  return engine.release();
+}
+
+int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
+                                     uint64_t veil_chan,
+                                     const uint8_t* peer_id) {
+  if (engine == nullptr || peer_id == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
+  GroupWebrtcState* ws = engine->ws.get();
+  const std::string key = node_key(peer_id);
+  auto existing = ws->peers.find(key);
+  if (existing != ws->peers.end())
+    return existing->second->chan == veil_chan ? VEIL_MEDIA_OK
+                                                : VEIL_MEDIA_ERR_STATE;
+  const uint32_t remote_ssrc = group_audio_ssrc_of(peer_id);
+  for (const auto& entry : ws->peers) {
+    if (entry.second->audio_ssrc == remote_ssrc) return VEIL_MEDIA_ERR_STATE;
+  }
+  auto peer = std::make_unique<GroupPeerState>();
+  peer->chan = veil_chan;
+  peer->audio_ssrc = remote_ssrc;
+  std::memcpy(peer->id, peer_id, 32);
+  peer->shim = std::make_unique<veil_media::VeilTransportShim>(
+      veil_chan, ws->call.get(), ws->network_tq.get());
+  peer->shim->Start();
+  ws->fanout->Add(veil_chan);
+  if (engine->audio_running.load()) {
+    run_on(ws->worker_tq.get(), [&]() {
+      webrtc::AudioReceiveStreamInterface::Config rc;
+      rc.rtp.remote_ssrc = remote_ssrc;
+      rc.rtcp_send_transport = peer->shim.get();
+      rc.decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
+      rc.decoder_map.emplace(kOpusPayloadType,
+                             webrtc::SdpAudioFormat("opus", 48000, 2));
+      peer->recv_stream = ws->call->CreateAudioReceiveStream(rc);
+      if (peer->recv_stream) peer->recv_stream->Start();
+    });
+    if (peer->recv_stream == nullptr) {
+      ws->fanout->Remove(veil_chan);
+      peer->shim->Stop();
+      return VEIL_MEDIA_ERR_STATE;
+    }
+  }
+  ws->peers.emplace(key, std::move(peer));
+  vlog("group audio: add peer ssrc=%u peers=%zu", remote_ssrc,
+       ws->peers.size());
+  return VEIL_MEDIA_OK;
+#else
+  (void)veil_chan;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+int veil_media_group_engine_remove_peer(VeilGroupMediaEngine* engine,
+                                        const uint8_t* peer_id) {
+  if (engine == nullptr || peer_id == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
+  GroupWebrtcState* ws = engine->ws.get();
+  const auto it = ws->peers.find(node_key(peer_id));
+  if (it == ws->peers.end()) return VEIL_MEDIA_OK;
+  GroupPeerState* peer = it->second.get();
+  ws->fanout->Remove(peer->chan);
+  peer->shim->Stop();
+  run_on(ws->worker_tq.get(), [&]() {
+    if (peer->recv_stream) {
+      peer->recv_stream->Stop();
+      ws->call->DestroyAudioReceiveStream(peer->recv_stream);
+      peer->recv_stream = nullptr;
+    }
+  });
+  ws->peers.erase(it);
+  vlog("group audio: remove peer peers=%zu", ws->peers.size());
+#endif
+  return VEIL_MEDIA_OK;
+}
+
+int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+  if (engine->audio_running.load()) return VEIL_MEDIA_OK;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
+  GroupWebrtcState* ws = engine->ws.get();
+  const uint32_t local_ssrc = group_audio_ssrc_of(engine->local);
+  run_on(ws->worker_tq.get(), [&]() {
+    ws->call->SignalChannelNetworkState(webrtc::MediaType::AUDIO,
+                                        webrtc::kNetworkUp);
+    if (ws->send_stream == nullptr) {
+      webrtc::AudioSendStream::Config sc(ws->fanout.get());
+      sc.rtp.ssrc = local_ssrc;
+      sc.rtp.extensions.emplace_back(
+          webrtc::RtpExtension::kTransportSequenceNumberUri,
+          webrtc::RtpHeaderExtensionId(1));
+      sc.encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
+      sc.send_codec_spec = webrtc::AudioSendStream::Config::SendCodecSpec(
+          kOpusPayloadType, webrtc::SdpAudioFormat("opus", 48000, 2));
+      ws->send_stream = ws->call->CreateAudioSendStream(sc);
+      if (ws->send_stream) {
+        ws->send_stream->SetMuted(engine->mic_muted);
+        ws->send_stream->Start();
+      }
+    }
+    for (auto& entry : ws->peers) {
+      GroupPeerState* peer = entry.second.get();
+      if (peer->recv_stream) continue;
+      webrtc::AudioReceiveStreamInterface::Config rc;
+      rc.rtp.remote_ssrc = peer->audio_ssrc;
+      rc.rtcp_send_transport = peer->shim.get();
+      rc.decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
+      rc.decoder_map.emplace(kOpusPayloadType,
+                             webrtc::SdpAudioFormat("opus", 48000, 2));
+      peer->recv_stream = ws->call->CreateAudioReceiveStream(rc);
+      if (peer->recv_stream) peer->recv_stream->Start();
+    }
+  });
+  if (ws->send_stream == nullptr) return VEIL_MEDIA_ERR_STATE;
+  if (ws->adm) {
+    ws->adm->InitRecording();
+    ws->adm->StartRecording();
+    ws->adm->InitPlayout();
+    ws->adm->StartPlayout();
+  }
+  engine->audio_running.store(true);
+  vlog("group audio: started peers=%zu", ws->peers.size());
+  return VEIL_MEDIA_OK;
+#else
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+int veil_media_group_engine_stop_audio(VeilGroupMediaEngine* engine) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+  if (!engine->audio_running.exchange(false)) return VEIL_MEDIA_OK;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (engine->ws && engine->ws->call) {
+    GroupWebrtcState* ws = engine->ws.get();
+    if (ws->adm) {
+      if (ws->adm->Recording()) ws->adm->StopRecording();
+      if (ws->adm->Playing()) ws->adm->StopPlayout();
+    }
+    run_on(ws->worker_tq.get(), [&]() {
+      if (ws->send_stream) {
+        ws->send_stream->Stop();
+        ws->call->DestroyAudioSendStream(ws->send_stream);
+        ws->send_stream = nullptr;
+      }
+      for (auto& entry : ws->peers) {
+        GroupPeerState* peer = entry.second.get();
+        if (peer->recv_stream) {
+          peer->recv_stream->Stop();
+          ws->call->DestroyAudioReceiveStream(peer->recv_stream);
+          peer->recv_stream = nullptr;
+        }
+      }
+    });
+  }
+#endif
+  return VEIL_MEDIA_OK;
+}
+
+int veil_media_group_engine_set_mic_muted(VeilGroupMediaEngine* engine,
+                                          int muted) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+  engine->mic_muted = muted != 0;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (engine->ws && engine->ws->send_stream)
+    engine->ws->send_stream->SetMuted(engine->mic_muted);
+#endif
+  return VEIL_MEDIA_OK;
+}
+
+uint64_t veil_media_group_engine_peer_rx_packets(
+    VeilGroupMediaEngine* engine, const uint8_t* peer_id) {
+  if (engine == nullptr || peer_id == nullptr) return 0;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws) return 0;
+  const auto it = engine->ws->peers.find(node_key(peer_id));
+  if (it == engine->ws->peers.end() || !it->second->shim) return 0;
+  return it->second->shim->inbound_packet_count();
+#else
+  return 0;
+#endif
+}
+
+void veil_media_group_engine_destroy(VeilGroupMediaEngine* engine) {
+  if (engine == nullptr) return;
+  veil_media_group_engine_stop_audio(engine);
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (engine->ws) {
+    for (auto& entry : engine->ws->peers) {
+      engine->ws->fanout->Remove(entry.second->chan);
+      entry.second->shim->Stop();
+    }
+    engine->ws->peers.clear();
+    engine->ws->call.reset();
+    if (engine->ws->adm) engine->ws->adm->Terminate();
+  }
+#endif
+  delete engine;
+}
+
 int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
   if (engine->audio_running.load()) return VEIL_MEDIA_OK;  // idempotent
@@ -380,7 +723,6 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
     if (recv && ws->recv_stream == nullptr) {
       webrtc::AudioReceiveStreamInterface::Config rc;
       rc.rtp.remote_ssrc = remote_ssrc;
-      rc.rtp.local_ssrc = local_ssrc;
       rc.rtcp_send_transport = ws->shim.get();
       rc.decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
       // SdpAudioFormat has no default ctor, so operator[] won't work — emplace.
