@@ -29,9 +29,11 @@ dev_dependencies:
 flutter:
   plugin:
     platforms:
-      # macOS only for now — the libveil_media.dylib artifact + podspec exist for
-      # macOS (desktop). iOS/Android are added when their native builds are wired
-      # (declaring them here without build files breaks `flutter build ios/apk`).
+      # Apple device builds force-load the control shim and link the pinned
+      # codec-stripped WebRTC archive through CocoaPods. Dart resolves the
+      # resulting C ABI from DynamicLibrary.process().
+      ios:
+        ffiPlugin: true
       macos:
         ffiPlugin: true
       # Linux desktop — libveil_media.so (from-source linux-x64 WebRTC + the V4L2
