@@ -38,6 +38,7 @@ extern "C" {
 #pragma GCC visibility push(default)
 
 typedef struct VeilMediaEngine VeilMediaEngine;
+typedef struct VeilGroupMediaEngine VeilGroupMediaEngine;
 
 /* Result codes. 0 == OK; negatives are errors. */
 #define VEIL_MEDIA_OK 0
@@ -74,6 +75,28 @@ int veil_media_engine_stop_audio(VeilMediaEngine *engine);
 /* Local mic mute (stop transmitting) / remote playout mute. */
 int veil_media_engine_set_mic_muted(VeilMediaEngine *engine, int muted);
 int veil_media_engine_set_speaker_muted(VeilMediaEngine *engine, int muted);
+
+/* ---- N-party audio ------------------------------------------------------
+ * One group engine owns exactly one ADM, AudioState/AudioMixer and Opus send
+ * stream. Each peer contributes one veil datagram channel and one receive
+ * stream. The single encoded mic stream is fanned out natively; decoded peer
+ * streams are mixed by WebRTC before the ADM speaker callback. Packet bytes
+ * never cross Dart. Channels remain caller-owned. */
+VeilGroupMediaEngine *veil_media_group_engine_create(
+    const uint8_t *local_id);
+void veil_media_group_engine_destroy(VeilGroupMediaEngine *engine);
+int veil_media_group_engine_add_peer(VeilGroupMediaEngine *engine,
+                                     uint64_t veil_chan,
+                                     const uint8_t *peer_id);
+int veil_media_group_engine_remove_peer(VeilGroupMediaEngine *engine,
+                                        const uint8_t *peer_id);
+int veil_media_group_engine_start_audio(VeilGroupMediaEngine *engine);
+int veil_media_group_engine_stop_audio(VeilGroupMediaEngine *engine);
+int veil_media_group_engine_set_mic_muted(VeilGroupMediaEngine *engine,
+                                          int muted);
+/* Monotonic inbound datagram count for one peer, or 0 if absent. */
+uint64_t veil_media_group_engine_peer_rx_packets(
+    VeilGroupMediaEngine *engine, const uint8_t *peer_id);
 
 /* ---- Video (Phase 4) -----------------------------------------------------
  * A VP8 video session over the SAME veil media channel as audio, on a distinct

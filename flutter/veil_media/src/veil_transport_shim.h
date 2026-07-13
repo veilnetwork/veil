@@ -75,6 +75,12 @@ class VeilTransportShim : public webrtc::Transport {
   // media type — a wrong type black-holes the packet). 0 = no video (all audio).
   void SetRemoteVideoSsrc(uint32_t ssrc) { remote_video_ssrc_.store(ssrc); }
 
+  // Monotonic count of accepted inbound datagrams. Group-call control uses it
+  // as a per-peer media-liveness signal without moving packet bytes into Dart.
+  uint64_t inbound_packet_count() const {
+    return inbound_packet_count_.load(std::memory_order_relaxed);
+  }
+
  private:
   // C trampoline for veil_media_set_recv_callback(cb(ctx,ptr,len)).
   static void OnVeilDatagram(void* ctx, const uint8_t* ptr, size_t len);
@@ -89,6 +95,7 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<size_t> inbound_pending_packets_{0};
   std::atomic<size_t> inbound_pending_bytes_{0};
   std::atomic<uint64_t> inbound_dropped_overload_{0};
+  std::atomic<uint64_t> inbound_packet_count_{0};
 };
 
 }  // namespace veil_media
