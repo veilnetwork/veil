@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 
 namespace {
@@ -68,6 +69,9 @@ int main() {
   if (veil_media_group_engine_stop_audio(engine) != VEIL_MEDIA_OK) return 16;
   veil_media_group_engine_destroy(engine);
   if (registered_callbacks.load() != 0) return 17;
+  if (std::strcmp(veil_media_version(), "veil_media 0.0.3 (group-video)") !=
+      0)
+    return 18;
   std::printf("group audio+video smoke ok; native datagrams=%llu\n",
               static_cast<unsigned long long>(sent_datagrams.load()));
   return 0;
