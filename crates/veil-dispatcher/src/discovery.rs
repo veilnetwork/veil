@@ -629,6 +629,8 @@ impl FrameDispatcher {
         let is_mc = magic == Some(&veil_proto::mlkem_cert::MLKEM_CERT_MAGIC[..]);
         let is_sb = magic == Some(&veil_bootstrap::SIGNED_BUNDLE_MAGIC[..]);
         let is_desc = magic == Some(&veil_anonymity::blinded_descriptor::DESCRIPTOR_DHT_MAGIC[..]);
+        let is_provider_desc =
+            magic == Some(&veil_anonymity::blinded_descriptor::PROVIDER_DESCRIPTOR_DHT_MAGIC[..]);
         let is_rk = magic == Some(&veil_proto::relay_key::RELAY_KEY_MAGIC[..]);
         let is_ra = magic == Some(&veil_anonymity::rendezvous::MAGIC[..]);
         let is_rd = magic == Some(&veil_anonymity::directory::RELAY_DIRECTORY_DHT_MAGIC[..]);
@@ -784,6 +786,15 @@ impl FrameDispatcher {
             if veil_anonymity::blinded_descriptor::verify_descriptor_self(payload_value).is_none() {
                 return Err(DispatchResult::Violation(
                     "Store: blinded descriptor failed self-verification".to_owned(),
+                ));
+            }
+            veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
+        } else if is_provider_desc {
+            if veil_anonymity::blinded_descriptor::verify_provider_descriptor_self(payload_value)
+                .is_none()
+            {
+                return Err(DispatchResult::Violation(
+                    "Store: provider descriptor failed self-verification".to_owned(),
                 ));
             }
             veil_dht::store::ORIGIN_RECURSIVE_BUNDLE
@@ -943,6 +954,11 @@ impl FrameDispatcher {
             // to target_key, else a valid descriptor could be stored under a
             // victim's / arbitrary key and poison resolver lookups.
             match veil_anonymity::blinded_descriptor::verify_descriptor_self(payload) {
+                Some(canonical) => canonical == *target_key,
+                None => false,
+            }
+        } else if magic == &veil_anonymity::blinded_descriptor::PROVIDER_DESCRIPTOR_DHT_MAGIC[..] {
+            match veil_anonymity::blinded_descriptor::verify_provider_descriptor_self(payload) {
                 Some(canonical) => canonical == *target_key,
                 None => false,
             }

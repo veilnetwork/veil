@@ -151,6 +151,8 @@ pub fn derive_mlkem_dk_seed(identity_sk_seed: &[u8; 32]) -> Zeroizing<[u8; 64]> 
 /// blinded-descriptor period (`now / PERIOD_SECS`, 8 LE bytes) is appended to
 /// this constant before expansion. See [`derive_onion_auth_cookie`].
 pub const ONION_AUTH_COOKIE_DERIVATION_INFO: &[u8] = b"veil/onion-auth-cookie/v1";
+pub const ONION_PROVIDER_AUTH_COOKIE_DERIVATION_INFO: &[u8] =
+    b"veil/onion-provider-auth-cookie/v2";
 
 /// Derive an onion service's 16-byte rendezvous **auth-cookie** deterministically
 /// from its per-identity Ed25519 SK seed and the current blinded-descriptor
@@ -197,10 +199,31 @@ pub fn derive_onion_auth_cookie(identity_sk_seed: &[u8; 32], period: u64) -> [u8
     out
 }
 
+/// Provider-separated rendezvous cookie for linked devices sharing one
+/// capability identity. The public slot is domain-separated from the legacy
+/// sovereign derivation and prevents same-relay registrations from collapsing
+/// to one cookie.
+pub fn derive_onion_provider_auth_cookie(
+    identity_sk_seed: &[u8; 32],
+    period: u64,
+    provider_slot: u8,
+) -> [u8; 16] {
+    let hk = Hkdf::<Sha256>::new(None, identity_sk_seed);
+    let mut info = ONION_PROVIDER_AUTH_COOKIE_DERIVATION_INFO.to_vec();
+    info.extend_from_slice(&period.to_le_bytes());
+    info.push(provider_slot);
+    let mut out = [0u8; 16];
+    hk.expand(&info, &mut out)
+        .expect("16 bytes < 255 * hash_len");
+    out
+}
+
 /// Info string for an onion service's rendezvous REGISTRATION Ed25519 key seed.
 /// The blinded-descriptor period is appended like the auth-cookie's. See
 /// [`derive_onion_reg_seed`].
 pub const ONION_REG_KEY_DERIVATION_INFO: &[u8] = b"veil/onion-reg-key/v1";
+pub const ONION_PROVIDER_REG_KEY_DERIVATION_INFO: &[u8] =
+    b"veil/onion-provider-reg-key/v2";
 
 /// Derive the Ed25519 SK seed for an onion service's rendezvous registration
 /// keypair, deterministically from the identity seed and the current
@@ -227,6 +250,24 @@ pub fn derive_onion_reg_seed(identity_sk_seed: &[u8; 32], period: u64) -> Zeroiz
     let hk = Hkdf::<Sha256>::new(None, identity_sk_seed);
     let mut info = ONION_REG_KEY_DERIVATION_INFO.to_vec();
     info.extend_from_slice(&period.to_le_bytes());
+    let mut out = Zeroizing::new([0u8; 32]);
+    hk.expand(&info, out.as_mut())
+        .expect("32 bytes < 255 * hash_len");
+    out
+}
+
+/// Registration-key counterpart of [`derive_onion_provider_auth_cookie`].
+/// Cookie and registration key both include the slot so two linked providers
+/// can safely choose the same rendezvous relay without overwriting each other.
+pub fn derive_onion_provider_reg_seed(
+    identity_sk_seed: &[u8; 32],
+    period: u64,
+    provider_slot: u8,
+) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, identity_sk_seed);
+    let mut info = ONION_PROVIDER_REG_KEY_DERIVATION_INFO.to_vec();
+    info.extend_from_slice(&period.to_le_bytes());
+    info.push(provider_slot);
     let mut out = Zeroizing::new([0u8; 32]);
     hk.expand(&info, out.as_mut())
         .expect("32 bytes < 255 * hash_len");
@@ -443,6 +484,26 @@ mod tests {
         let sig = crate::sign_message(a.algo, &a.public_key, &a.private_key, b"probe")
             .expect("sign");
         crate::verify_message(a.algo, &a.public_key, b"probe", &sig).expect("verify");
+    }
+
+    #[test]
+    fn onion_provider_cookie_and_registration_are_slot_isolated() {
+        let seed = [0x61u8; 32];
+        let period = 20_001;
+        let cookie0 = derive_onion_provider_auth_cookie(&seed, period, 0);
+        let cookie1 = derive_onion_provider_auth_cookie(&seed, period, 1);
+        assert_ne!(cookie0, cookie1);
+        assert_ne!(cookie0, derive_onion_auth_cookie(&seed, period));
+        assert_eq!(
+            cookie0,
+            derive_onion_provider_auth_cookie(&seed, period, 0)
+        );
+
+        let reg0 = derive_onion_provider_reg_seed(&seed, period, 0);
+        let reg1 = derive_onion_provider_reg_seed(&seed, period, 1);
+        assert_ne!(*reg0, *reg1);
+        assert_ne!(*reg0, *derive_onion_reg_seed(&seed, period));
+        assert_ne!(cookie0[..], reg0[..16]);
     }
 
     #[test]
