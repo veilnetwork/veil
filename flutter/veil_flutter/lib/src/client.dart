@@ -7,10 +7,10 @@
 // does NOT offload work to another thread (diff-audit H3 corrected the prior
 // comment that wrongly claimed `Isolate.run`).  Genuinely blocking / CPU-heavy
 // calls must use `Isolate.run` to avoid freezing the UI: `connect` (IPC
-// APP_HELLO handshake) and `restoreIdentity{,Encrypted}` (key derivation /
-// Argon2id) now do, as does `VeilStream.read()`.  The remaining `Future(()
-// {...})` calls are quick IPC round-trips; drive any that prove heavy from a
-// worker isolate too.
+// APP_HELLO handshake), `joinBootstrapUri` (network join), and
+// `restoreIdentity{,Encrypted}` (key derivation / Argon2id) now do, as does
+// `VeilStream.read()`.  The remaining `Future(() {...})` calls are quick IPC
+// round-trips; drive any that prove heavy from a worker isolate too.
 //
 // Memory: every Pointer<Utf8> from C must be freed with veilFreeString
 // after consumption.  Every malloc'd buffer we hand to FFI is freed in
@@ -243,6 +243,67 @@ Uint8List _nodeIdWorker(int handleAddr) {
     return Uint8List.fromList(out.asTypedList(32));
   } finally {
     calloc.free(out);
+    calloc.free(errOut);
+  }
+}
+
+/// Off-isolate body of [VeilClient.joinBootstrapUri]. The daemon may dial and
+/// negotiate a transport before returning, so this is not a quick IPC query:
+/// Android recorded an input-dispatch ANR with the UI thread blocked in
+/// `veil_join_bootstrap_uri` when it ran through `Future(() {...})`.
+({int status, Uint8List peerNodeId, String? detail}) _joinBootstrapUriWorker(
+  int handleAddr,
+  String uri,
+  String? password,
+  String? expectedIssuerPk,
+) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final uriC = uri.toNativeUtf8();
+  final pwC = password == null ? nullptr : password.toNativeUtf8();
+  final pkC =
+      expectedIssuerPk == null ? nullptr : expectedIssuerPk.toNativeUtf8();
+  final outNodeId = calloc<Uint8>(32);
+  final outStatus = calloc<Uint8>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final rc = ffi.veilJoinBootstrapUri(
+      handle,
+      uriC,
+      pwC,
+      pkC,
+      outNodeId,
+      outStatus,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'join_bootstrap_uri failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+    // err_out on success-paths carries a detail string (decode error message
+    // or similar) rather than a transport error.
+    final errPtr = errOut.value;
+    String? detail;
+    if (errPtr != nullptr) {
+      detail = errPtr.toDartString();
+      ffi.veilFreeString(errPtr);
+      errOut.value = nullptr;
+    }
+    return (
+      status: outStatus.value,
+      peerNodeId: Uint8List.fromList(outNodeId.asTypedList(32)),
+      detail: detail,
+    );
+  } finally {
+    calloc.free(uriC);
+    if (pwC != nullptr) {
+      zeroizeNative(pwC.cast<Uint8>(), pwC.length);
+      calloc.free(pwC);
+    }
+    if (pkC != nullptr) calloc.free(pkC);
+    calloc.free(outNodeId);
+    calloc.free(outStatus);
     calloc.free(errOut);
   }
 }
@@ -1267,60 +1328,20 @@ class VeilClient implements Finalizable {
     String? expectedIssuerPk,
   }) async {
     _ensureOpen();
-    return Future(() {
-      final uriC = uri.toNativeUtf8();
-      final pwC = (password == null) ? nullptr : password.toNativeUtf8();
-      final pkC = (expectedIssuerPk == null)
-          ? nullptr
-          : expectedIssuerPk.toNativeUtf8();
-      final outNodeId = calloc<Uint8>(32);
-      final outStatus = calloc<Uint8>();
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        final rc = ffi.veilJoinBootstrapUri(
-          _handle,
-          uriC,
-          pwC,
-          pkC,
-          outNodeId,
-          outStatus,
-          errOut,
-        );
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-            'join_bootstrap_uri failed: ${_readErrAndFree(errOut)}',
-            code: rc,
-          );
-        }
-        // err_out on success-paths carries a detail string (decode
-        // error message or similar) — surface it but don't throw.
-        final errPtr = errOut.value;
-        String? detail;
-        if (errPtr != nullptr) {
-          detail = errPtr.toDartString();
-          ffi.veilFreeString(errPtr);
-          errOut.value = nullptr;
-        }
-        return JoinBootstrapResult(
-          status: JoinBootstrapStatus.fromWire(outStatus.value),
-          peerNodeId: Uint8List.fromList(outNodeId.asTypedList(32)),
-          detail: detail,
-        );
-      } finally {
-        calloc.free(uriC);
-        if (pwC != nullptr) {
-          // Wipe the passphrase bytes before releasing the native buffer
-          // (mirrors the cookie/HMAC zeroize) so the secret can't linger in
-          // freed heap / a core dump.
-          zeroizeNative(pwC.cast<Uint8>(), pwC.length);
-          calloc.free(pwC);
-        }
-        if (pkC != nullptr) calloc.free(pkC);
-        calloc.free(outNodeId);
-        calloc.free(outStatus);
-        calloc.free(errOut);
-      }
-    });
+    final handleAddr = _handle.address;
+    final result = await Isolate.run(
+      () => _joinBootstrapUriWorker(
+        handleAddr,
+        uri,
+        password,
+        expectedIssuerPk,
+      ),
+    );
+    return JoinBootstrapResult(
+      status: JoinBootstrapStatus.fromWire(result.status),
+      peerNodeId: result.peerNodeId,
+      detail: result.detail,
+    );
   }
 
   /// Ask the daemon to assemble a bootstrap-invite URI from its own
