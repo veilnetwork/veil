@@ -213,6 +213,23 @@ const CIRCUIT_MSS: usize = veil_onion_stream::wire::MAX_CELL
     - COOKIE_LEN
     - CIRCUIT_PEER_TAG_LEN
     - veil_onion_stream::wire::DATA_OVERHEAD;
+// The external-node fallback sends every stream cell as one authenticated app
+// payload. That envelope is capped at MAX_AUTH_DELIVER_MSG_BYTES *after* the
+// sovereign header + signature are added, so it cannot reuse the 16 KiB
+// circuit MSS. Doing so lets SYN/SYN_ACK through (they are tiny) but makes
+// every full DATA cell oversized: the IPC write succeeds before the daemon
+// rejects the signed envelope, and the stream stalls forever at byte zero.
+//
+// 4 KiB leaves over 2 KiB for the AuthAppDeliver header and even its maximum
+// accepted signature. It is deliberately a cell-size bound; DATA_OVERHEAD is
+// removed below to obtain the engine's payload MSS. The circuit backend keeps
+// the full fixed-cell MSS above.
+const DATAGRAM_MAX_CELL: usize = 4096;
+const DATAGRAM_MSS: usize = DATAGRAM_MAX_CELL - veil_onion_stream::wire::DATA_OVERHEAD;
+const DATAGRAM_AUTH_DELIVER_MAX: usize = 6144;
+const DATAGRAM_AUTH_SIGNATURE_MAX: usize = 1024;
+const _: () =
+    assert!(DATAGRAM_MAX_CELL + DATAGRAM_AUTH_SIGNATURE_MAX + 128 <= DATAGRAM_AUTH_DELIVER_MAX);
 // The onion-stream crate is transport-agnostic, so its MAX_CELL cannot
 // reference veil-anonymity directly; hold the tie here where both crates are
 // visible. The send path caps every splice envelope (cookie + tag + stream
@@ -2969,7 +2986,7 @@ impl AnonStreamHub {
                         sender: sender.clone(),
                         data_pacer: Arc::new(StreamDataPacer::new(data_pace_interval)),
                     }),
-                    veil_onion_stream::MSS,
+                    DATAGRAM_MSS,
                 )
             }
         };
@@ -4383,7 +4400,8 @@ fn retire_circuits_later(
 #[cfg(test)]
 mod tests {
     use super::{
-        CIRCUIT_INTRO_LEN, CIRCUIT_MSS, CIRCUIT_PEER_TAG_LEN, CircuitMode, circuit_env_value_mode,
+        CIRCUIT_INTRO_LEN, CIRCUIT_MSS, CIRCUIT_PEER_TAG_LEN, CircuitMode, DATAGRAM_AUTH_DELIVER_MAX,
+        DATAGRAM_AUTH_SIGNATURE_MAX, DATAGRAM_MAX_CELL, DATAGRAM_MSS, circuit_env_value_mode,
         parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
     };
     use veil_anonymity::circuit_register::COOKIE_LEN;
@@ -4458,6 +4476,33 @@ mod tests {
         assert!(COOKIE_LEN + CIRCUIT_PEER_TAG_LEN + 1 + CIRCUIT_INTRO_LEN + syn.len() <= MAX_CELL);
         assert!(
             COOKIE_LEN + CIRCUIT_PEER_TAG_LEN + 1 + CIRCUIT_INTRO_LEN + syn_ack.len() <= MAX_CELL
+        );
+    }
+
+    #[test]
+    fn datagram_data_cell_fits_authenticated_delivery_envelope() {
+        assert_eq!(
+            DATAGRAM_AUTH_DELIVER_MAX,
+            veil_proto::MAX_AUTH_DELIVER_MSG_BYTES,
+            "the fallback bound must track AuthAppDeliver's wire cap"
+        );
+        assert_eq!(
+            DATAGRAM_AUTH_SIGNATURE_MAX,
+            veil_proto::AuthAppDeliver::MAX_SIG_LEN,
+            "the fallback headroom must track AuthAppDeliver's signature cap"
+        );
+        let payload = vec![0xCDu8; DATAGRAM_MSS];
+        let data = Frame::Data {
+            stream_id: 9,
+            seq: 0,
+            win: 4096,
+            payload: &payload,
+        }
+        .encode();
+        assert_eq!(data.len(), DATAGRAM_MAX_CELL);
+        assert!(
+            data.len() + DATAGRAM_AUTH_SIGNATURE_MAX + 128 <= DATAGRAM_AUTH_DELIVER_MAX,
+            "fallback DATA plus the maximum authenticated envelope must fit"
         );
     }
 
