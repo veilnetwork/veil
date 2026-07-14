@@ -12,10 +12,13 @@
 //! about where on-disk state lives, not a protocol concern.
 
 use std::fs;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use rand::seq::index;
 use veil_cfg::{self, instance::LocalInstance, sovereign_flow};
 use veil_proto::identity_document::IdentityDocument;
+use zeroize::Zeroize as _;
 
 use super::output::{CommandIo, OutputEvent};
 
@@ -69,6 +72,8 @@ pub enum IdentityCliError {
     DhtKey(String),
     #[error("internal: {0}")]
     Internal(String),
+    #[error("recovery phrase confirmation: {0}")]
+    RecoveryConfirmation(String),
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -260,6 +265,23 @@ fn create<I: CommandIo>(
         }
     }
 
+    // Interactive phrase confirmation must be a real terminal ceremony.
+    // Check before creating any identity files so a redirected/non-interactive
+    // invocation fails without leaving a provisioned-but-unconfirmed identity
+    // behind. Explicit automation has to opt out with the long, loud flag.
+    let needs_phrase_confirmation =
+        !matches!(algo, veil_types::SignatureAlgorithm::Falcon512) && !args.yes_i_wrote_it_down;
+    if needs_phrase_confirmation
+        && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal())
+    {
+        return Err(IdentityCliError::RecoveryConfirmation(
+            "interactive creation requires terminal stdin and stdout so the three requested \
+             words can be entered without echo; for reviewed CI/automation only, pass \
+             --yes-i-wrote-it-down"
+                .to_owned(),
+        ));
+    }
+
     if args.pow_difficulty.is_some() {
         io.emit(OutputEvent::message(
             "warning: --pow-difficulty is deprecated and has no effect; \
@@ -295,22 +317,150 @@ fn create<I: CommandIo>(
 
     emit_creation_summary(io, &out, &doc_path)?;
 
-    // The user confirmation step — skipped for non-interactive
-    // runs with `--yes-i-wrote-it-down`. Interactive prompts
-    // require a TTY and stdin-no-echo; we defer that wiring to
-    // a later revision. For now, emit a loud reminder when the
-    // flag isn't set.
-    if !args.yes_i_wrote_it_down {
-        io.emit(OutputEvent::message(
-            "⚠  Interactive confirmation is not yet wired in this build. \
-             The library-layer flow always requires --yes-i-wrote-it-down \
-             pending stdin-no-echo integration. Write the phrase down \
-             BEFORE continuing to rely on this identity."
-                .to_owned(),
-        ));
+    if needs_phrase_confirmation {
+        confirm_recovery_phrase(io, &out.master_seed_phrase)?;
     }
 
     Ok(())
+}
+
+const RECOVERY_CONFIRMATION_WORD_COUNT: usize = 3;
+
+// `rpassword::prompt_password` writes its prompt before it switches the
+// terminal to no-echo mode. A very fast typist (or a PTY driver) can therefore
+// get the first bytes echoed in that small scheduling window. Pre-arm echo-off
+// on Unix; rpassword still owns raw input, editing, signal handling, and final
+// restoration, then this outer guard restores the original terminal state.
+#[cfg(unix)]
+struct StdinEchoGuard {
+    fd: std::os::fd::RawFd,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl StdinEchoGuard {
+    fn hide() -> std::io::Result<Self> {
+        use std::mem::MaybeUninit;
+        use std::os::fd::AsRawFd as _;
+
+        let fd = std::io::stdin().as_raw_fd();
+        let mut original = MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `original` points to valid writable storage and `fd` is the
+        // already-validated terminal stdin for this process.
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: tcgetattr succeeded and initialized the whole termios value.
+        let original = unsafe { original.assume_init() };
+        let mut hidden = original;
+        hidden.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        // SAFETY: `hidden` is a valid termios copied from this terminal.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { fd, original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StdinEchoGuard {
+    fn drop(&mut self) {
+        // Best-effort restoration during unwinding/error paths. There is no
+        // useful recovery action if the terminal itself has disappeared.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+fn read_hidden_recovery_word(position: usize) -> std::io::Result<String> {
+    #[cfg(unix)]
+    let _echo_guard = StdinEchoGuard::hide()?;
+
+    rpassword::prompt_password(format!("Retype recovery word #{:02}: ", position + 1))
+}
+
+fn sample_confirmation_positions<R: rand::Rng + ?Sized>(
+    word_count: usize,
+    rng: &mut R,
+) -> Result<[usize; RECOVERY_CONFIRMATION_WORD_COUNT], IdentityCliError> {
+    if word_count < RECOVERY_CONFIRMATION_WORD_COUNT {
+        return Err(IdentityCliError::RecoveryConfirmation(format!(
+            "expected at least {RECOVERY_CONFIRMATION_WORD_COUNT} recovery words, got {word_count}"
+        )));
+    }
+    let mut positions = index::sample(rng, word_count, RECOVERY_CONFIRMATION_WORD_COUNT).into_vec();
+    positions.sort_unstable();
+    positions.try_into().map_err(|_| {
+        IdentityCliError::RecoveryConfirmation(
+            "internal error while selecting recovery words".to_owned(),
+        )
+    })
+}
+
+fn confirmation_attempt<F>(
+    words: &[&str],
+    positions: &[usize; RECOVERY_CONFIRMATION_WORD_COUNT],
+    mut read_hidden_word: F,
+) -> Result<bool, IdentityCliError>
+where
+    F: FnMut(usize) -> std::io::Result<String>,
+{
+    let mut all_match = true;
+    for &position in positions {
+        let expected = words.get(position).ok_or_else(|| {
+            IdentityCliError::RecoveryConfirmation(format!(
+                "selected recovery word #{} is out of range",
+                position + 1
+            ))
+        })?;
+        let mut entered = read_hidden_word(position).map_err(|error| {
+            IdentityCliError::RecoveryConfirmation(format!(
+                "could not read hidden word #{}: {error}",
+                position + 1
+            ))
+        })?;
+        all_match &= entered.trim() == *expected;
+        entered.zeroize();
+    }
+    Ok(all_match)
+}
+
+fn confirm_recovery_phrase<I: CommandIo>(
+    io: &mut I,
+    phrase: &bip39::Mnemonic,
+) -> Result<(), IdentityCliError> {
+    let words: Vec<&str> = phrase.words().collect();
+    let positions = sample_confirmation_positions(words.len(), &mut rand::thread_rng())?;
+
+    io.emit(OutputEvent::message(
+        "Confirm the paper copy by retyping the requested words. Input is hidden (no echo)."
+            .to_owned(),
+    ));
+    std::io::stdout().flush().map_err(|error| {
+        IdentityCliError::RecoveryConfirmation(format!(
+            "could not flush recovery phrase display: {error}"
+        ))
+    })?;
+
+    loop {
+        let matches = confirmation_attempt(&words, &positions, read_hidden_recovery_word)?;
+        if matches {
+            io.emit(OutputEvent::message(
+                "Recovery phrase confirmed. Keep the paper copy private and offline.".to_owned(),
+            ));
+            return Ok(());
+        }
+        io.emit(OutputEvent::message(
+            "The three words did not match. Check the paper copy and retry; input remains hidden."
+                .to_owned(),
+        ));
+        std::io::stdout().flush().map_err(|error| {
+            IdentityCliError::RecoveryConfirmation(format!(
+                "could not flush recovery confirmation retry: {error}"
+            ))
+        })?;
+    }
 }
 
 fn emit_creation_summary<I: CommandIo>(
@@ -2146,6 +2296,8 @@ fn parse_hex_nibble(b: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use rand::{SeedableRng as _, rngs::StdRng};
+
     use super::*;
     use veil_identity::sovereign::NAME_CLAIMS_DIR;
 
@@ -2194,6 +2346,61 @@ mod tests {
             algo: "ed25519".into(),
             accept_no_recovery: false,
         }
+    }
+
+    #[test]
+    fn recovery_confirmation_positions_are_random_unique_sorted_and_in_range() {
+        let mut rng = StdRng::seed_from_u64(0x5eed);
+        let first = sample_confirmation_positions(24, &mut rng).unwrap();
+        let second = sample_confirmation_positions(24, &mut rng).unwrap();
+
+        for positions in [first, second] {
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(positions.iter().all(|position| *position < 24));
+        }
+        assert_ne!(
+            first, second,
+            "successive samples should not be fixed positions"
+        );
+    }
+
+    #[test]
+    fn recovery_confirmation_checks_all_three_hidden_inputs() {
+        let words = ["alpha", "bravo", "charlie", "delta"];
+        let positions = [0, 2, 3];
+        let mut requested = Vec::new();
+        let mut entered =
+            [" alpha ".to_owned(), "wrong".to_owned(), "delta".to_owned()].into_iter();
+
+        let matches = confirmation_attempt(&words, &positions, |position| {
+            requested.push(position);
+            Ok(entered.next().unwrap())
+        })
+        .unwrap();
+
+        assert!(!matches);
+        assert_eq!(requested, positions);
+    }
+
+    #[test]
+    fn recovery_confirmation_accepts_matching_trimmed_words() {
+        let words = ["alpha", "bravo", "charlie", "delta"];
+        let positions = [0, 1, 3];
+        let mut entered = ["alpha\n", " bravo ", "delta\r\n"].into_iter();
+
+        let matches = confirmation_attempt(&words, &positions, |_| {
+            Ok(entered.next().unwrap().to_owned())
+        })
+        .unwrap();
+
+        assert!(matches);
+    }
+
+    #[test]
+    fn recovery_confirmation_rejects_too_short_phrase() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let error = sample_confirmation_positions(2, &mut rng).unwrap_err();
+        assert!(matches!(error, IdentityCliError::RecoveryConfirmation(_)));
     }
 
     #[test]
