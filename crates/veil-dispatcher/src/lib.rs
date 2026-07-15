@@ -2296,7 +2296,7 @@ mod tests {
         let d = make_test_dispatcher(NodeRole::Core);
         let peer: [u8; 32] = [0x10u8; 32];
         let app_id = [0xA0u8; 32];
-        let (_handle, _rx) = d.app_registry.register(app_id, 1, 256);
+        let (_handle, mut rx) = d.app_registry.register(app_id, 1, 256);
 
         // Build a 160-byte Opus frame (typical 20ms @ 8 kHz).
         let opus_frame = vec![0xABu8; 160];
@@ -2305,6 +2305,7 @@ mod tests {
         let start = Instant::now();
         for seq in 0u32..50 {
             let payload = AppRtDataPayload {
+                src_app_id: [0xB0u8; 32],
                 app_id,
                 endpoint_id: 1,
                 seq,
@@ -2331,6 +2332,17 @@ mod tests {
         // Verify metrics were incremented.
         let snap = d.metrics.as_ref().unwrap().snapshot();
         assert_eq!(snap.rt_frames_rx_total, 50);
+
+        match rx.try_recv().expect("first RT frame routed") {
+            veil_app::registry::AppMessage::RtData {
+                src_node_id,
+                payload,
+            } => {
+                assert_eq!(src_node_id, peer, "source must come from session");
+                assert_eq!(payload.src_app_id, [0xB0u8; 32]);
+            }
+            other => panic!("unexpected routed message: {other:?}"),
+        }
     }
 
     // ── gossip A←→B←→C relay — RouteCache populated automatically ─

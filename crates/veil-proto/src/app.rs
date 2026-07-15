@@ -428,9 +428,14 @@ impl AppWindowUpdatePayload {
 /// [49..53] payload_type u32 BE (codec ID, app-defined)
 /// [53..57] payload_len u32 BE
 /// [57..] payload bytes
+/// [57+payload_len..] src_app_id [u8; 32] (optional compatibility tail)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppRtDataPayload {
+    /// Originating app's `app_id`. Appended after the payload on the wire so
+    /// older receivers safely ignore it. A missing legacy tail decodes to
+    /// zero and must be treated as unauthenticated by applications.
+    pub src_app_id: [u8; 32],
     /// Target app's `app_id`.
     pub app_id: [u8; 32],
     /// Endpoint delivering the RT frame.
@@ -472,6 +477,7 @@ impl AppRtDataPayload {
         };
         buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         buf.extend_from_slice(payload);
+        buf.extend_from_slice(&self.src_app_id);
         buf
     }
 
@@ -511,7 +517,16 @@ impl AppRtDataPayload {
                     need: usize::MAX,
                     got: buf.len(),
                 })?;
+        let src_app_id = if payload_end
+            .checked_add(32)
+            .is_some_and(|end| buf.len() >= end)
+        {
+            super::read_array::<32>(buf, payload_end)?
+        } else {
+            [0u8; 32]
+        };
         Ok(Self {
+            src_app_id,
             app_id,
             endpoint_id,
             seq,
@@ -647,6 +662,7 @@ mod tests {
     #[test]
     fn app_rt_data_roundtrip() {
         let p = AppRtDataPayload {
+            src_app_id: [0x5Au8; 32],
             app_id: sample_app_id(),
             endpoint_id: 42,
             seq: 1234,
@@ -663,6 +679,7 @@ mod tests {
     #[test]
     fn app_rt_data_empty_payload() {
         let p = AppRtDataPayload {
+            src_app_id: [0x5Bu8; 32],
             app_id: sample_app_id(),
             endpoint_id: 1,
             seq: 0,
@@ -680,5 +697,24 @@ mod tests {
     fn app_rt_data_too_short() {
         let err = AppRtDataPayload::decode(&[0u8; 10]).unwrap_err();
         assert!(matches!(err, ProtoError::BufferTooShort { .. }));
+    }
+
+    #[test]
+    fn app_rt_data_legacy_without_source_fails_closed() {
+        let p = AppRtDataPayload {
+            src_app_id: [0x5Cu8; 32],
+            app_id: sample_app_id(),
+            endpoint_id: 7,
+            seq: 9,
+            timestamp_us: 11,
+            marker: 0,
+            payload_type: 111,
+            payload: b"legacy-compatible".to_vec(),
+        };
+        let mut encoded = p.encode();
+        encoded.truncate(encoded.len() - 32);
+        let decoded = AppRtDataPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.src_app_id, [0u8; 32]);
+        assert_eq!(decoded.payload, p.payload);
     }
 }
