@@ -1737,6 +1737,48 @@ final int Function(
             )>>('veil_media_open_direct_channel')
     .asFunction();
 
+// open_relay_channel(app, peer_node32*, peer_app32*, peer_endpoint, err)
+// -> chan id (u64; 0 on error). Uses Delivery relay routing, not onion.
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilMediaOpenRelayChannel = nativeLib
+    .lookup<
+        NativeFunction<
+            Uint64 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_media_open_relay_channel')
+    .asFunction();
+
+// start_direct_receiver(app, source_ns, ns_len, source_name, name_len, err)
+// -> VEIL_OK or error. Inbound RTP stays native and never crosses Dart.
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilMediaStartDirectReceiver = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_media_start_direct_receiver')
+    .asFunction();
+
 // send_datagram(chan, ptr, len) -> 0 queued / 1 dropped / -1 invalid.
 final int Function(int, Pointer<Uint8>, int) veilMediaSendDatagram = nativeLib
     .lookup<NativeFunction<Int32 Function(Uint64, Pointer<Uint8>, IntPtr)>>(
@@ -1745,8 +1787,7 @@ final int Function(int, Pointer<Uint8>, int) veilMediaSendDatagram = nativeLib
 
 // repair_channel(chan) -> 0 queued / 1 already pending / -1 invalid/direct.
 final int Function(int) veilMediaRepairChannel = nativeLib
-    .lookup<NativeFunction<Int32 Function(Uint64)>>(
-        'veil_media_repair_channel')
+    .lookup<NativeFunction<Int32 Function(Uint64)>>('veil_media_repair_channel')
     .asFunction();
 
 // dispatch_direct(peer_node32*, ptr, len) -> 0 delivered/accepted, -1 invalid.
