@@ -929,6 +929,7 @@ pub(crate) async fn handle_rt_send(
     };
 
     let rt_payload = AppRtDataPayload {
+        src_app_id: send.src_app_id,
         app_id: send.dst_app_id,
         endpoint_id: send.endpoint_id,
         seq: send.seq,

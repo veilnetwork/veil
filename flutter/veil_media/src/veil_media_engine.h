@@ -130,8 +130,11 @@ int veil_media_group_engine_get_local_video_frame(
  * mounts RTP -> VP8 decode -> the frame callback. Idempotent per direction.
  * Frames are I420. Set VEIL_MEDIA_TEST_VIDEO=1 in the environment to drive the
  * send stream from a built-in synthetic frame generator (pipeline bring-up)
- * instead of pushed frames. */
-int veil_media_engine_start_video(VeilMediaEngine *engine, int send, int recv);
+ * instead of pushed frames. `max_bitrate_kbps` and `max_fps` are explicit so
+ * direct P2P can use a quality profile while padded onion media stays
+ * conservative. Values <= 0 select the 150 kbps / 15 fps privacy-path defaults. */
+int veil_media_engine_start_video(VeilMediaEngine *engine, int send, int recv,
+                                  int max_bitrate_kbps, int max_fps);
 int veil_media_engine_stop_video(VeilMediaEngine *engine);
 
 /* Open the platform camera and drive the video send stream from it (near

@@ -61,7 +61,11 @@ pub enum AppMessage {
         reply_id: u64,
     },
     /// Real-time media frame (loss-tolerant, no window check).
-    RtData(AppRtDataPayload),
+    RtData {
+        /// Authenticated node id from the session that carried the frame.
+        src_node_id: [u8; 32],
+        payload: AppRtDataPayload,
+    },
     /// Epidemic flood broadcast received from the veil.
     EpidemicBroadcast {
         /// Original sender of the broadcast.
@@ -328,12 +332,18 @@ impl AppEndpointRegistry {
     /// Route an `AppRtData` real-time frame to the matching endpoint.
     ///
     /// Returns `true` if the endpoint was found and the message was queued.
-    pub fn route_rt_data(&self, payload: AppRtDataPayload) -> bool {
+    pub fn route_rt_data(&self, src_node_id: [u8; 32], payload: AppRtDataPayload) -> bool {
         let key = EndpointKey {
             app_id: payload.app_id,
             endpoint_id: payload.endpoint_id,
         };
-        self.send_to(key, AppMessage::RtData(payload))
+        self.send_to(
+            key,
+            AppMessage::RtData {
+                src_node_id,
+                payload,
+            },
+        )
     }
 
     /// Route an `AppSend` datagram to the matching endpoint.

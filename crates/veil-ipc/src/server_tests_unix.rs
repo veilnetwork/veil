@@ -3,9 +3,9 @@ use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use veil_app::registry::AppEndpointRegistry;
 use veil_proto::{
-    AppBindErrPayload, AppBindOkPayload, AppBindPayload, AppIpcRtSendPayload, AppIpcSendPayload,
-    STREAM_INITIAL_WINDOW, StreamOpenErrPayload, StreamOpenOkPayload, StreamOpenPayload,
-    ipc_bind_err, stream_open_err,
+    AppBindErrPayload, AppBindOkPayload, AppBindPayload, AppDeliverPayload, AppIpcRtSendPayload,
+    AppIpcSendPayload, AppRtDataPayload, STREAM_INITIAL_WINDOW, StreamOpenErrPayload,
+    StreamOpenOkPayload, StreamOpenPayload, ipc_bind_err, stream_open_err,
 };
 
 fn node_id() -> [u8; 32] {
@@ -337,6 +337,58 @@ async fn e2e_local_send_delivers_to_receiver() {
 
     drop(client_a);
     drop(client_b);
+    let _ = shutdown_tx.send(true);
+    let _ = sh.await;
+}
+
+#[tokio::test]
+async fn inbound_rt_delivery_preserves_authenticated_source() {
+    let sock = temp_socket_path();
+    let (mut server, shutdown_tx, registry) = make_server(sock.clone());
+    let sh = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = connect_and_hello(&sock).await;
+    let bind = AppBindPayload {
+        endpoint_id: 42,
+        flags: 0,
+        namespace: b"media".to_vec(),
+        name: b"direct".to_vec(),
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+    let (hdr, body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(hdr.msg_type, LocalAppMsg::AppBindOk as u16);
+    let target_app_id = AppBindOkPayload::decode(&body).unwrap().app_id;
+
+    let src_node_id = [0x71u8; 32];
+    let src_app_id = [0x72u8; 32];
+    assert!(registry.route_rt_data(
+        src_node_id,
+        AppRtDataPayload {
+            src_app_id,
+            app_id: target_app_id,
+            endpoint_id: 42,
+            seq: 5,
+            timestamp_us: 6,
+            marker: 1,
+            payload_type: 111,
+            payload: b"rtp-packet".to_vec(),
+        },
+    ));
+
+    let (hdr, body) = tokio::time::timeout(Duration::from_millis(500), recv_ipc_frame(&mut client))
+        .await
+        .expect("timeout waiting for inbound RT delivery");
+    assert_eq!(hdr.msg_type, LocalAppMsg::AppDeliver as u16);
+    let delivered = AppDeliverPayload::decode(&body).unwrap();
+    assert_eq!(delivered.src_node_id, src_node_id);
+    assert_eq!(delivered.src_app_id, src_app_id);
+    assert_eq!(delivered.app_id, target_app_id);
+    assert_eq!(delivered.endpoint_id, 42);
+    assert_eq!(&*delivered.data, b"rtp-packet");
+    assert_eq!(delivered.reply_id, 0);
+
+    drop(client);
     let _ = shutdown_tx.send(true);
     let _ = sh.await;
 }
@@ -1765,6 +1817,7 @@ async fn rt_send_dispatched_at_realtime_priority() {
 
     // Decode AppRtDataPayload and verify fields.
     let rt = AppRtDataPayload::decode(&frame_bytes[veil_proto::HEADER_SIZE..]).unwrap();
+    assert_eq!(rt.src_app_id, src_app_id, "src_app_id must survive RT wire");
     assert_eq!(rt.app_id, dst_app_id, "app_id must be dst_app_id");
     assert_eq!(rt.endpoint_id, 7);
     assert_eq!(rt.seq, 42);

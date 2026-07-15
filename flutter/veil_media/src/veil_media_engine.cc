@@ -325,6 +325,8 @@ struct WebrtcState {
   std::atomic<bool> test_video_run{false};
   std::unique_ptr<veil_media::CameraCapturer> camera;  // real capture source
   std::unique_ptr<veil_media::ScreenCapturer> screen;  // screen-share source
+  int video_target_bitrate_bps = 0;
+  int video_max_fps = 0;
 };
 
 struct GroupPeerState {
@@ -1188,7 +1190,8 @@ int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
   return VEIL_MEDIA_OK;
 }
 
-int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv) {
+int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
+                                  int max_bitrate_kbps, int max_fps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
@@ -1227,16 +1230,19 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv) {
       sc.encoder_settings.bitrate_allocator_factory =
           ws->video_bitrate_alloc_factory.get();  // REQUIRED (deref, no null-check)
 
-      // Bitrate/framerate are kept LOW for now: the veil media datagram path
-      // pads every packet to a 16KB onion cell, so VP8's packet rate otherwise
-      // floods the circuit and starves audio. Until RTP is batched into cells,
-      // cap the rate so audio + video coexist. (VEIL_MEDIA_VIDEO_KBPS overrides.)
-      int kbps = 150;
+      // The caller selects a route-aware budget: direct P2P can spend more,
+      // while the onion fallback stays conservative even though several RTP
+      // packets now share each padded cell. (VEIL_MEDIA_VIDEO_KBPS overrides.)
+      int kbps = max_bitrate_kbps > 0 ? max_bitrate_kbps : 150;
       if (const char* e = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
         int v = std::atoi(e);
         if (v > 0) kbps = v;
       }
+      kbps = std::clamp(kbps, 30, 2500);
+      const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 5, 30);
       const int bps = kbps * 1000;
+      ws->video_target_bitrate_bps = bps;
+      ws->video_max_fps = fps;
       webrtc::VideoEncoderConfig ec;
       ec.codec_type = webrtc::kVideoCodecVP8;
       ec.video_format = webrtc::SdpVideoFormat::VP8();
@@ -1248,7 +1254,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv) {
       layer.min_bitrate_bps = 30000;
       layer.target_bitrate_bps = bps * 2 / 3;
       layer.max_bitrate_bps = bps;
-      layer.max_framerate = 15;
+      layer.max_framerate = fps;
       layer.max_qp = 63;
       ec.simulcast_layers.push_back(layer);
 
@@ -1258,7 +1264,8 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv) {
       if (ws->video_send_stream) {
         ws->video_send_stream->SetSource(
             ws->video_source.get(),
-            webrtc::DegradationPreference::MAINTAIN_FRAMERATE);
+            kbps > 150 ? webrtc::DegradationPreference::BALANCED
+                       : webrtc::DegradationPreference::MAINTAIN_FRAMERATE);
         ws->video_send_stream->Start();
       }
     }
@@ -1599,11 +1606,30 @@ int veil_media_engine_select_audio_output(VeilMediaEngine* engine,
 
 char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
   if (engine == nullptr) return nullptr;
-  // Aggregate from AudioSendStream::GetStats()/AudioReceiveStreamInterface::
-  // GetStats() — wired in a later pass; placeholder shape for now.
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  WebrtcState* ws = engine->ws.get();
+  if (ws && ws->shim) {
+    char json[384];
+    std::snprintf(
+        json, sizeof(json),
+        "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"tx_bytes\":%llu,"
+        "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
+        "\"rtt_ms\":0,\"jitter_ms\":0,\"loss_pct\":0,"
+        "\"target_bitrate_bps\":%d,\"max_fps\":%d}",
+        static_cast<unsigned long long>(ws->shim->outbound_packet_count()),
+        static_cast<unsigned long long>(ws->shim->inbound_packet_count()),
+        static_cast<unsigned long long>(ws->shim->outbound_byte_count()),
+        static_cast<unsigned long long>(ws->shim->inbound_byte_count()),
+        static_cast<unsigned long long>(ws->shim->outbound_dropped_count()),
+        static_cast<unsigned long long>(ws->shim->inbound_dropped_count()),
+        ws->video_target_bitrate_bps, ws->video_max_fps);
+    return dup_cstr(json);
+  }
+#endif
   return dup_cstr(
-      "{\"tx_pkts\":0,\"rx_pkts\":0,\"tx_bytes\":0,\"rx_bytes\":0,\"rtt_ms\":0,"
-      "\"jitter_ms\":0,\"loss_pct\":0,\"target_bitrate_bps\":0}");
+      "{\"tx_pkts\":0,\"rx_pkts\":0,\"tx_bytes\":0,\"rx_bytes\":0,"
+      "\"tx_drops\":0,\"rx_drops\":0,\"rtt_ms\":0,\"jitter_ms\":0,"
+      "\"loss_pct\":0,\"target_bitrate_bps\":0,\"max_fps\":0}");
 }
 
 void veil_media_free_string(char* s) {

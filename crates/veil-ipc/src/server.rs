@@ -659,9 +659,23 @@ async fn forward_endpoint(
                 let payload = StreamClosePayload { stream_id };
                 encode_ipc_frame(LocalAppMsg::StreamClose as u16, &payload.encode())
             }
-            AppMessage::RtData(p) => {
-                // Forward as STREAM_RT_DATA with the full AppRtDataPayload body.
-                encode_ipc_frame(LocalAppMsg::StreamRtData as u16, &p.encode())
+            AppMessage::RtData {
+                src_node_id,
+                payload,
+            } => {
+                // Deliver through the existing SDK datagram event so clients
+                // receive the authenticated session source. RTP already owns
+                // its sequence/timestamp metadata; the app needs the raw RTP
+                // bytes plus trusted node/app identity, not a second RT API.
+                let deliver = AppDeliverPayload {
+                    src_node_id,
+                    src_app_id: payload.src_app_id,
+                    app_id: payload.app_id,
+                    endpoint_id: payload.endpoint_id,
+                    data: veil_bufpool::pooled_shared_from_vec(payload.payload),
+                    reply_id: 0,
+                };
+                encode_ipc_frame(LocalAppMsg::AppDeliver as u16, &deliver.encode())
             }
             // epidemic broadcasts are not forwarded via the per-endpoint
             // IPC stream (they arrive through the registry's broadcast_epidemic path
