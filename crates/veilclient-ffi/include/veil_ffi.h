@@ -357,6 +357,15 @@
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * First byte of a media cell containing several RTP/RTCP datagrams. Keeping a
+ * distinct top-level magic makes old receivers drop the unknown cell instead
+ * of passing a batch envelope to WebRTC as if it were RTP.
+ */
+#define MEDIA_BATCH_MAGIC 66
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * `veil_nickname_resolve`: positive verdict for "the name is free" (no valid
  * owner record found) — not an error.
  */
@@ -638,6 +647,19 @@ uint64_t veil_media_open_direct_channel(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Request a make-before-break anonymous route refresh for an open media
+ * channel. This is deliberately separate from send success: an onion packet
+ * can enter the first-hop queue successfully and still be black-holed farther
+ * along the circuit. The peer reports that end-to-end silence over the live
+ * call heartbeat, and the host forwards it here. Returns 0 when queued, 1 when
+ * an equivalent repair is already pending, and -1 for an unknown/direct
+ * channel.
+ */
+ int veil_media_repair_channel(uint64_t chan) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Feed one direct-P2P media datagram received by the host on the media app
  * endpoint into the shared native media callback registry. The host is
  * responsible for authenticating/filtering the source app id before calling.
@@ -773,6 +795,20 @@ VeilApp *veil_bind_named(VeilHandle *handle,
                          uintptr_t name_len,
                          uint32_t endpoint_id,
                          char **err_out)
+;
+
+/**
+ * Bind a stable high-entropy capability alias whose app id is independent of
+ * the local sovereign node id. Returns NULL on failure.
+ */
+
+VeilApp *veil_bind_capability(VeilHandle *handle,
+                              const uint8_t *namespace_,
+                              uintptr_t namespace_len,
+                              const uint8_t *name,
+                              uintptr_t name_len,
+                              uint32_t endpoint_id,
+                              char **err_out)
 ;
 
 /**
@@ -1053,6 +1089,60 @@ int veil_lookup_relay_x25519(VeilHandle *handle,
  * `handle` must be a live `VeilHandle*` from `veil_connect`.
  */
  int veil_register_onion_service(VeilHandle *handle, uint32_t hop_count, char **err_out) ;
+
+/**
+ * Register a location-anonymous service under a caller-owned random Ed25519
+ * seed rather than the node's sovereign key. The seed buffer is writable and
+ * is ZEROED immediately on every post-validation path. On success writes the
+ * corresponding 32-byte public service identity to `out_identity_vk`; this is
+ * the only address that belongs in a public capability link. The blinded DHT
+ * descriptor and rendezvous advert contain no sovereign public key/node id.
+ *
+ * Embedded-node only: the service circuit lives in this process's node
+ * runtime. Re-register the same seed after restart; registration is idempotent
+ * within a descriptor period. At most the runtime's bounded hosted-service cap
+ * may be active.
+ *
+ * # Safety
+ * `identity_seed_32` must point to 32 WRITABLE bytes; they are zeroized.
+ * `out_identity_vk_32` must point to 32 writable bytes.
+ */
+
+int veil_register_ephemeral_onion_service_zeroize(VeilHandle *handle,
+                                                  uint8_t *identity_seed_32,
+                                                  uint32_t hop_count,
+                                                  uint8_t *out_identity_vk_32,
+                                                  char **err_out)
+;
+
+/**
+ * Provider-slotted form of
+ * [`veil_register_ephemeral_onion_service_zeroize`]. Linked devices hosting
+ * the same capability seed must use distinct slots in `0..8`; the runtime
+ * publishes a collision-free descriptor for that slot while retaining the
+ * legacy descriptor for old resolvers.
+ */
+
+int veil_register_ephemeral_onion_service_zeroize_v2(VeilHandle *handle,
+                                                     uint8_t *identity_seed_32,
+                                                     uint32_t hop_count,
+                                                     uint8_t provider_slot,
+                                                     uint8_t *out_identity_vk_32,
+                                                     char **err_out)
+;
+
+/**
+ * Stop maintaining one caller-owned ephemeral onion service. Idempotent:
+ * unknown/already-withdrawn public keys return `VEIL_OK` too, so this local
+ * lifecycle API never becomes a remote existence oracle. DHT ciphertext and
+ * the circuit age out naturally; the host must reject capability requests as
+ * soon as its encrypted registry marks the share revoked.
+ */
+
+int veil_withdraw_ephemeral_onion_service(VeilHandle *handle,
+                                          const uint8_t *identity_vk_32,
+                                          char **err_out)
+;
 
 /**
  * Register a PLAIN rendezvous-publisher entry (mailbox-by-discovery): the
@@ -1977,9 +2067,10 @@ int veil_sovereign_bundle_create_hybrid512_zeroize(uint8_t *phrase,
 ;
 
 /**
- * Re-wrap an existing XVSB into an XVRC recovery certificate while preserving
- * the exact full public key and derived node id. Phrase and recovery-code
- * buffers are wiped on every path; only encrypted certificate bytes return.
+ * Re-wrap an existing XVSB or XVRC credential into a fresh XVRC recovery
+ * certificate while preserving the exact full public key and derived node id.
+ * Current-secret and new-code buffers are wiped on every path; only encrypted
+ * certificate bytes return.
  */
 
 int veil_sovereign_recovery_certificate_export_zeroize(const uint8_t *bundle,
@@ -2351,13 +2442,14 @@ char *veil_config_compose(const uint8_t *identity_toml_ptr,
 
 /**
  * Start an embedded node in deferred-init mode: it boots under an ephemeral
- * throwaway identity, binds ONLY the admin socket at `admin_socket` (`(ptr,
- * len)`, UTF-8 filesystem path), and waits. Promote it to its real identity by
+ * throwaway identity, binds ONLY the admin endpoint at `admin_socket` (`(ptr,
+ * len)`, UTF-8 Unix path or authenticated loopback-TCP URI), and waits. Promote it to its real identity by
  * pushing a config with `veil_node_apply_config` — so the real private key
  * never has to be written to a config file on disk.
  *
- * Pick an ephemeral, identity-free path for `admin_socket` (e.g. one under a
- * per-launch temp dir). Non-blocking; returns an opaque handle or null + err.
+ * Pick an ephemeral, identity-free endpoint for `admin_socket` (e.g. a path
+ * under a per-launch temp dir, or `tcp://127.0.0.1:0?runtime_dir=...`).
+ * Non-blocking; returns an opaque handle or null + err.
  *
  * `anonymous` arms `[anonymity]` in the stub boot config so the node is
  * actually onion-reachable once its real identity is applied. It MUST be set
