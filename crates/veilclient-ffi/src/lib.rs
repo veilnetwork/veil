@@ -684,7 +684,7 @@ pub unsafe extern "C" fn veil_anon_stream_warm_peer(
 #[cfg(feature = "node-embedded")]
 struct MediaChannel {
     tx_hi: mpsc::Sender<Vec<u8>>,
-    tx_video: mpsc::Sender<Vec<u8>>,
+    video: MediaVideoIngress,
     /// Anonymous channels accept an out-of-band end-to-end repair request.
     /// The receiver of the media asks the sender to refresh its outbound
     /// rendezvous pool when RTP/RTCP has gone dark even though signaling is
@@ -692,6 +692,20 @@ struct MediaChannel {
     repair_tx: Option<mpsc::Sender<()>>,
     peer: [u8; 32],
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Packet ingress is sufficient for onion/P2P because their drain paths accept
+/// packets as quickly as WebRTC emits them. A relayed send performs more work
+/// per packet (E2E envelope + relay routing), so a tiny packet FIFO can retain
+/// only the first few fragments of a VP8 keyframe. Buffer relay video by RTP
+/// frame instead: a frame is either admitted whole or dropped whole.
+#[cfg(feature = "node-embedded")]
+enum MediaVideoIngress {
+    Packets(mpsc::Sender<Vec<u8>>),
+    RelayFrames {
+        tx: mpsc::Sender<Vec<Vec<u8>>>,
+        assembler: RelayVideoFrameAssembler,
+    },
 }
 
 /// Open media channels keyed by the opaque id handed to the host.
@@ -716,6 +730,73 @@ const MEDIA_TX_HI_QUEUE: usize = 8;
 #[cfg(feature = "node-embedded")]
 const MEDIA_TX_VIDEO_QUEUE: usize = 4;
 
+/// At 20 fps the queued portion is at most ~200 ms of complete video. Including
+/// the frame currently being drained and the in-progress assembler, pathological
+/// output remains bounded to ~3 MiB per channel. Ordinary 640x360 VP8 frames are
+/// much smaller; the cap keeps malformed/self-buggy output from turning the
+/// realtime path into an allocator sink.
+#[cfg(feature = "node-embedded")]
+const RELAY_VIDEO_FRAME_QUEUE: usize = 4;
+#[cfg(feature = "node-embedded")]
+const RELAY_VIDEO_FRAME_MAX_PACKETS: usize = 512;
+#[cfg(feature = "node-embedded")]
+const RELAY_VIDEO_FRAME_MAX_BYTES: usize = 512 * 1024;
+
+#[cfg(feature = "node-embedded")]
+#[derive(Default)]
+struct RelayVideoFrameAssembler {
+    timestamp: Option<u32>,
+    packets: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+#[cfg(feature = "node-embedded")]
+enum RelayVideoFramePush {
+    Pending,
+    Complete(Vec<Vec<u8>>),
+    Dropped,
+}
+
+#[cfg(feature = "node-embedded")]
+impl RelayVideoFrameAssembler {
+    fn push(&mut self, packet: Vec<u8>) -> RelayVideoFramePush {
+        if packet.len() < 8 || (packet[0] >> 6) != 2 {
+            self.reset();
+            return RelayVideoFramePush::Dropped;
+        }
+        let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        if self.timestamp.is_some_and(|current| current != timestamp) {
+            // A new frame started before the previous marker arrived. Never
+            // forward the orphan prefix: it cannot be decoded and only adds
+            // latency ahead of the next complete frame.
+            self.reset();
+        }
+        self.timestamp = Some(timestamp);
+        let next_bytes = self.bytes.saturating_add(packet.len());
+        if self.packets.len() >= RELAY_VIDEO_FRAME_MAX_PACKETS
+            || next_bytes > RELAY_VIDEO_FRAME_MAX_BYTES
+        {
+            self.reset();
+            return RelayVideoFramePush::Dropped;
+        }
+        let marker = packet[1] & 0x80 != 0;
+        self.bytes = next_bytes;
+        self.packets.push(packet);
+        if !marker {
+            return RelayVideoFramePush::Pending;
+        }
+        self.timestamp = None;
+        self.bytes = 0;
+        RelayVideoFramePush::Complete(std::mem::take(&mut self.packets))
+    }
+
+    fn reset(&mut self) {
+        self.timestamp = None;
+        self.packets.clear();
+        self.bytes = 0;
+    }
+}
+
 #[cfg(feature = "node-embedded")]
 fn media_is_vp8_rtp(payload: &[u8]) -> bool {
     if payload.len() < 2 || (payload[0] >> 6) != 2 {
@@ -728,7 +809,19 @@ fn media_is_vp8_rtp(payload: &[u8]) -> bool {
 
 #[cfg(all(test, feature = "node-embedded"))]
 mod media_priority_tests {
-    use super::{media_is_vp8_rtp, veil_media_repair_channel};
+    use super::{
+        RELAY_VIDEO_FRAME_MAX_BYTES, RelayVideoFrameAssembler, RelayVideoFramePush,
+        media_is_vp8_rtp, veil_media_repair_channel,
+    };
+
+    fn video_packet(timestamp: u32, marker: bool, fill: u8) -> Vec<u8> {
+        let mut packet = vec![0u8; 120];
+        packet[0] = 0x80;
+        packet[1] = 96 | if marker { 0x80 } else { 0 };
+        packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
+        packet[8..].fill(fill);
+        packet
+    }
 
     #[test]
     fn media_priority_classifies_only_vp8_rtp_as_video() {
@@ -744,6 +837,58 @@ mod media_priority_tests {
     fn media_repair_rejects_zero_and_unknown_channels() {
         assert_eq!(unsafe { veil_media_repair_channel(0) }, -1);
         assert_eq!(unsafe { veil_media_repair_channel(u64::MAX) }, -1);
+    }
+
+    #[test]
+    fn relay_video_assembler_admits_a_complete_frame_atomically() {
+        let mut assembler = RelayVideoFrameAssembler::default();
+        assert!(matches!(
+            assembler.push(video_packet(7, false, 1)),
+            RelayVideoFramePush::Pending
+        ));
+        assert!(matches!(
+            assembler.push(video_packet(7, false, 2)),
+            RelayVideoFramePush::Pending
+        ));
+        let RelayVideoFramePush::Complete(frame) = assembler.push(video_packet(7, true, 3)) else {
+            panic!("marker must complete the frame");
+        };
+        assert_eq!(frame.len(), 3);
+        assert_eq!(frame[0][8], 1);
+        assert_eq!(frame[2][8], 3);
+    }
+
+    #[test]
+    fn relay_video_assembler_discards_an_unterminated_old_frame() {
+        let mut assembler = RelayVideoFrameAssembler::default();
+        assert!(matches!(
+            assembler.push(video_packet(7, false, 1)),
+            RelayVideoFramePush::Pending
+        ));
+        let RelayVideoFramePush::Complete(frame) = assembler.push(video_packet(8, true, 2)) else {
+            panic!("new timestamp marker must complete only the new frame");
+        };
+        assert_eq!(frame.len(), 1);
+        assert_eq!(frame[0][8], 2);
+    }
+
+    #[test]
+    fn relay_video_assembler_bounds_pathological_frames_and_recovers() {
+        let mut assembler = RelayVideoFrameAssembler::default();
+        let mut first = video_packet(7, false, 1);
+        first.resize(RELAY_VIDEO_FRAME_MAX_BYTES / 2 + 1, 1);
+        assert!(matches!(
+            assembler.push(first.clone()),
+            RelayVideoFramePush::Pending
+        ));
+        assert!(matches!(
+            assembler.push(first),
+            RelayVideoFramePush::Dropped
+        ));
+        let RelayVideoFramePush::Complete(frame) = assembler.push(video_packet(8, true, 2)) else {
+            panic!("assembler must recover immediately after a bounded drop");
+        };
+        assert_eq!(frame.len(), 1);
     }
 }
 
@@ -873,7 +1018,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
             id,
             MediaChannel {
                 tx_hi,
-                tx_video,
+                video: MediaVideoIngress::Packets(tx_video),
                 repair_tx: Some(repair_tx),
                 peer,
                 task,
@@ -1001,7 +1146,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             id,
             MediaChannel {
                 tx_hi,
-                tx_video,
+                video: MediaVideoIngress::Packets(tx_video),
                 repair_tx: None,
                 peer,
                 task,
@@ -1040,37 +1185,63 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
     }
 
     let (tx_hi, mut rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
-    let (tx_video, mut rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
+    let (tx_video_frames, mut rx_video_frames) =
+        mpsc::channel::<Vec<Vec<u8>>>(RELAY_VIDEO_FRAME_QUEUE);
     let sender = Arc::clone(&app_ref.sender);
     let task = app_ref.bundle.runtime.spawn(async move {
         let mut prefer_video = false;
         loop {
-            let pkt = if prefer_video {
-                match rx_video.try_recv() {
-                    Ok(pkt) => pkt,
+            enum Work {
+                High(Vec<u8>),
+                VideoFrame(Vec<Vec<u8>>),
+            }
+            let work = if prefer_video {
+                match rx_video_frames.try_recv() {
+                    Ok(frame) => Work::VideoFrame(frame),
                     Err(_) => tokio::select! {
                         biased;
-                        Some(pkt) = rx_hi.recv() => pkt,
-                        Some(pkt) = rx_video.recv() => pkt,
+                        Some(pkt) = rx_hi.recv() => Work::High(pkt),
+                        Some(frame) = rx_video_frames.recv() => Work::VideoFrame(frame),
                         else => break,
                     },
                 }
             } else {
                 tokio::select! {
                     biased;
-                    Some(pkt) = rx_hi.recv() => pkt,
-                    Some(pkt) = rx_video.recv() => pkt,
+                    Some(pkt) = rx_hi.recv() => Work::High(pkt),
+                    Some(frame) = rx_video_frames.recv() => Work::VideoFrame(frame),
                     else => break,
                 }
             };
-            prefer_video = !media_is_vp8_rtp(&pkt);
+            prefer_video = matches!(work, Work::High(_));
             let guard = sender.lock().await;
             let Some(sender) = guard.as_ref() else {
                 break;
             };
-            let _ = sender
-                .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, pkt)
-                .await;
+            match work {
+                Work::High(pkt) => {
+                    let _ = sender
+                        .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, pkt)
+                        .await;
+                }
+                Work::VideoFrame(frame) => {
+                    // Preserve the whole encoded frame and its packet order.
+                    // Give queued Opus/RTCP one slot after every four video
+                    // packets so a large keyframe cannot create an audio gap.
+                    for (index, pkt) in frame.into_iter().enumerate() {
+                        if index % 4 == 0
+                            && let Ok(high) = rx_hi.try_recv()
+                        {
+                            let _ = sender
+                                .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, high)
+                                .await;
+                        }
+                        let _ = sender
+                            .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, pkt)
+                            .await;
+                    }
+                }
+            }
         }
     });
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1081,7 +1252,10 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             id,
             MediaChannel {
                 tx_hi,
-                tx_video,
+                video: MediaVideoIngress::RelayFrames {
+                    tx: tx_video_frames,
+                    assembler: RelayVideoFrameAssembler::default(),
+                },
                 repair_tx: None,
                 peer,
                 task,
@@ -1101,19 +1275,32 @@ pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len
         return -1;
     }
     let payload = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(ch) = map.get(&chan) else {
+    let mut map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(ch) = map.get_mut(&chan) else {
         return -1;
     };
-    let tx = if media_is_vp8_rtp(&payload) {
-        &ch.tx_video
-    } else {
-        &ch.tx_hi
-    };
-    match tx.try_send(payload) {
-        Ok(()) => 0,
-        Err(mpsc::error::TrySendError::Full(_)) => 1,
-        Err(mpsc::error::TrySendError::Closed(_)) => -1,
+    if !media_is_vp8_rtp(&payload) {
+        return match ch.tx_hi.try_send(payload) {
+            Ok(()) => 0,
+            Err(mpsc::error::TrySendError::Full(_)) => 1,
+            Err(mpsc::error::TrySendError::Closed(_)) => -1,
+        };
+    }
+    match &mut ch.video {
+        MediaVideoIngress::Packets(tx) => match tx.try_send(payload) {
+            Ok(()) => 0,
+            Err(mpsc::error::TrySendError::Full(_)) => 1,
+            Err(mpsc::error::TrySendError::Closed(_)) => -1,
+        },
+        MediaVideoIngress::RelayFrames { tx, assembler } => match assembler.push(payload) {
+            RelayVideoFramePush::Pending => 0,
+            RelayVideoFramePush::Dropped => 1,
+            RelayVideoFramePush::Complete(frame) => match tx.try_send(frame) {
+                Ok(()) => 0,
+                Err(mpsc::error::TrySendError::Full(_)) => 1,
+                Err(mpsc::error::TrySendError::Closed(_)) => -1,
+            },
+        },
     }
 }
 
@@ -7838,7 +8025,10 @@ mod tests {
             expected,
             direct_media_source_app(&[0x43; 32], "xveil", "media")
         );
-        assert_ne!(expected, direct_media_source_app(&peer, "xveil", "messages"));
+        assert_ne!(
+            expected,
+            direct_media_source_app(&peer, "xveil", "messages")
+        );
     }
 
     /// diff-audit M26 (explicit-length ABI): a non-NULL but non-UTF-8 password
