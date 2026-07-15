@@ -1,6 +1,6 @@
 [package]
 name = "veil-app"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Application-endpoint registry: per-app endpoint addressing, message channels, stream window tracking. Phase 6 extraction from veilcore."
 license = "AGPL-3.0-or-later"

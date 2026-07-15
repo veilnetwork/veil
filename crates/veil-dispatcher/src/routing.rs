@@ -2087,19 +2087,15 @@ impl FrameDispatcher {
                     // (verify + displacement + canonical key + quota), same as
                     // the direct STORE arm. Strictly additive: every other
                     // record kind takes the unchanged path below.
-                    if q.payload.get(..2)
-                        == Some(&veil_crypto::nickname::NICKNAME_DHT_MAGIC[..])
-                    {
-                        let origin =
-                            match self.nickname_store_gate(&q.target_key, &q.payload) {
-                                Ok(origin) => origin,
-                                Err(disposition) => return disposition,
-                            };
-                        if !self.dht.store_with_origin(
-                            q.target_key,
-                            q.payload.clone(),
-                            origin,
-                        ) {
+                    if q.payload.get(..2) == Some(&veil_crypto::nickname::NICKNAME_DHT_MAGIC[..]) {
+                        let origin = match self.nickname_store_gate(&q.target_key, &q.payload) {
+                            Ok(origin) => origin,
+                            Err(disposition) => return disposition,
+                        };
+                        if !self
+                            .dht
+                            .store_with_origin(q.target_key, q.payload.clone(), origin)
+                        {
                             // per-origin byte cap exceeded — drop silently.
                             return DispatchResult::NoResponse;
                         }

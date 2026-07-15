@@ -69,8 +69,7 @@ impl NodeServices {
             .ok_or_else(|| "not a valid nickname (3..=32 chars of [a-z0-9_])".to_string())?;
         let key = nickname_dht_key(&norm).expect("normalized name always derives a key");
         let is_valid = |bytes: &[u8]| -> bool {
-            NicknameRecord::from_bytes(bytes)
-                .is_some_and(|r| r.name == norm && r.verify().is_ok())
+            NicknameRecord::from_bytes(bytes).is_some_and(|r| r.name == norm && r.verify().is_ok())
         };
         // Contested fetch: a valid LOCAL mirror must not short-circuit the
         // remote quorum — a stale lighter record still verifies, and the

@@ -342,8 +342,7 @@ mod tests {
         apply_layer(&key, Direction::Forward, 1, &mut ks);
         let hex: String = ks.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex,
-            "342756a953c82f875ae70511ffbed52bf60cc4f99a892cac1a458aebc98d4e11",
+            hex, "342756a953c82f875ae70511ffbed52bf60cc4f99a892cac1a458aebc98d4e11",
             "circuit keystream changed — coordinated flag-day only"
         );
     }

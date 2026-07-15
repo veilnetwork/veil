@@ -1,6 +1,6 @@
 [package]
 name = "veil-fingerprint"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "DPI-fingerprint regression test infrastructure (Epic 488.2 carry-over, anti-censorship P2 #5). Build byte-level n-gram models of OVL1 traffic + compare them to reference fingerprint distributions (uniform random for obfs4, Chrome HTTPS for tls-boring, etc.) so wire-format changes can't silently leak a distinguishability signal."
 license = "AGPL-3.0-or-later"
