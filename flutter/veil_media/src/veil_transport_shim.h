@@ -80,6 +80,21 @@ class VeilTransportShim : public webrtc::Transport {
   uint64_t inbound_packet_count() const {
     return inbound_packet_count_.load(std::memory_order_relaxed);
   }
+  uint64_t inbound_byte_count() const {
+    return inbound_byte_count_.load(std::memory_order_relaxed);
+  }
+  uint64_t outbound_packet_count() const {
+    return outbound_packet_count_.load(std::memory_order_relaxed);
+  }
+  uint64_t outbound_byte_count() const {
+    return outbound_byte_count_.load(std::memory_order_relaxed);
+  }
+  uint64_t outbound_dropped_count() const {
+    return outbound_dropped_count_.load(std::memory_order_relaxed);
+  }
+  uint64_t inbound_dropped_count() const {
+    return inbound_dropped_overload_.load(std::memory_order_relaxed);
+  }
 
  private:
   // C trampoline for veil_media_set_recv_callback(cb(ctx,ptr,len)).
@@ -96,6 +111,10 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<size_t> inbound_pending_bytes_{0};
   std::atomic<uint64_t> inbound_dropped_overload_{0};
   std::atomic<uint64_t> inbound_packet_count_{0};
+  std::atomic<uint64_t> inbound_byte_count_{0};
+  std::atomic<uint64_t> outbound_packet_count_{0};
+  std::atomic<uint64_t> outbound_byte_count_{0};
+  std::atomic<uint64_t> outbound_dropped_count_{0};
 };
 
 }  // namespace veil_media

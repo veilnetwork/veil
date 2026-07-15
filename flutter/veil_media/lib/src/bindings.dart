@@ -43,13 +43,13 @@ final int Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineStopAudio =
             'veil_media_engine_stop_audio')
         .asFunction();
 
-// start_video(engine*, send int, recv int) -> int
-final int Function(Pointer<VeilMediaEngineHandle>, int, int)
+// start_video(engine*, send int, recv int, max_bitrate_kbps int, max_fps int) -> int
+final int Function(Pointer<VeilMediaEngineHandle>, int, int, int, int)
     veilMediaEngineStartVideo = nativeLib
         .lookup<
             NativeFunction<
-                Int32 Function(Pointer<VeilMediaEngineHandle>, Int32,
-                    Int32)>>('veil_media_engine_start_video')
+                Int32 Function(Pointer<VeilMediaEngineHandle>, Int32, Int32,
+                    Int32, Int32)>>('veil_media_engine_start_video')
         .asFunction();
 
 // stop_video(engine*) -> int

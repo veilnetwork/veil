@@ -540,6 +540,39 @@ impl AppSender {
             .await
     }
 
+    /// Send one loss-tolerant media datagram at REALTIME session priority.
+    ///
+    /// Mirrors [`AppHandle::send_rt_data`] for split handles used by native
+    /// media pumps. Delivery is fire-and-forget and may be dropped when the
+    /// direct session is absent or congested.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_rt_data(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        seq: u32,
+        timestamp_us: u64,
+        marker: u8,
+        payload_type: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        let payload = AppIpcRtSendPayload {
+            dst_node_id,
+            src_app_id: self.app_id,
+            dst_app_id,
+            endpoint_id: dst_endpoint_id,
+            seq,
+            timestamp_us,
+            marker,
+            payload_type,
+            data: data.to_vec(),
+        };
+        self.writer
+            .write_frame(LocalAppMsg::AppRtSend as u16, &payload.encode())
+            .await
+    }
+
     /// Send an AUTHENTICATED anonymous message (mirror
     /// [`AppHandle::send_anonymous_authenticated`]). The onion hides the
     /// sender's location from relays; the recipient verifies the sender.

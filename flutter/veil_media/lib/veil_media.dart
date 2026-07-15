@@ -98,9 +98,21 @@ class VeilMediaEngine {
   /// With VEIL_MEDIA_TEST_VIDEO=1 the send stream is driven by a built-in
   /// synthetic frame generator (pipeline bring-up); otherwise feed it via a
   /// platform capturer (native). Idempotent per direction.
-  bool startVideo({bool send = true, bool recv = true}) {
+  bool startVideo({
+    bool send = true,
+    bool recv = true,
+    int maxBitrateKbps = 150,
+    int maxFps = 15,
+  }) {
     _ensure();
-    return ffi.veilMediaEngineStartVideo(_ptr, send ? 1 : 0, recv ? 1 : 0) == 0;
+    return ffi.veilMediaEngineStartVideo(
+          _ptr,
+          send ? 1 : 0,
+          recv ? 1 : 0,
+          maxBitrateKbps,
+          maxFps,
+        ) ==
+        0;
   }
 
   bool stopVideo() {

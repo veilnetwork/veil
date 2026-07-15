@@ -701,12 +701,15 @@ static MEDIA_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 
 /// Outbound queue depth per media channel. Keep this bounded: media is a real-
 /// time path, and a deep FIFO turns transient overload into stale audio/video.
-/// Split audio/RTCP/unknown from VP8 RTP so a video keyframe burst has room
-/// without putting audio behind a long video backlog.
+/// Split audio/RTCP/unknown from VP8 RTP so a video keyframe burst cannot put
+/// audio behind it. These caps are intentionally tiny: WebRTC already has its
+/// own pacer, so a second 16/24-packet FIFO only preserved stale media and added
+/// hundreds of milliseconds under congestion. Queue-full is reported as loss
+/// to WebRTC; a later keyframe/Opus PLC recovers without replaying an old tail.
 #[cfg(feature = "node-embedded")]
-const MEDIA_TX_HI_QUEUE: usize = 16;
+const MEDIA_TX_HI_QUEUE: usize = 8;
 #[cfg(feature = "node-embedded")]
-const MEDIA_TX_VIDEO_QUEUE: usize = 24;
+const MEDIA_TX_VIDEO_QUEUE: usize = 4;
 
 #[cfg(feature = "node-embedded")]
 fn media_is_vp8_rtp(payload: &[u8]) -> bool {
@@ -793,14 +796,44 @@ pub unsafe extern "C" fn veil_media_open_channel(
     let task = handle_live.bundle.runtime.spawn(async move {
         send_hub.media_open_channel(peer).await;
         let mut consecutive_drops: u32 = 0;
+        let mut pending: Option<Vec<u8>> = None;
         loop {
-            let pkt = tokio::select! {
-                biased;
-                Some(pkt) = rx_hi.recv() => pkt,
-                Some(pkt) = rx_video.recv() => pkt,
-                else => break,
+            let first = if let Some(pkt) = pending.take() {
+                pkt
+            } else {
+                tokio::select! {
+                    biased;
+                    Some(pkt) = rx_hi.recv() => pkt,
+                    Some(pkt) = rx_video.recv() => pkt,
+                    else => break,
+                }
             };
-            if send_hub.media_send_datagram(peer, &pkt).await {
+            // WebRTC emits a video frame as a tight RTP burst. Drain packets
+            // already queued at this instant into one padded onion cell; never
+            // wait for another packet, so batching adds no timer latency.
+            const MAX_BATCH_PACKETS: usize = 12;
+            let mut body_len = 2 + 2 + first.len();
+            let mut packets = vec![first];
+            while packets.len() < MAX_BATCH_PACKETS {
+                // The first packet above remains biased toward audio/RTCP, but
+                // once that real-time slot is secured, drain video first. Opus
+                // is effectively continuous; preferring `rx_hi` here as well
+                // could starve every VP8 keyframe while audio kept flowing.
+                // A batch therefore carries prompt audio plus as much of the
+                // already-queued video burst as fits in the same padded cell.
+                let next = rx_video.try_recv().or_else(|_| rx_hi.try_recv());
+                let Ok(pkt) = next else {
+                    break;
+                };
+                let next_len = body_len.saturating_add(2 + pkt.len());
+                if next_len > anon_stream::MEDIA_BATCH_BODY_MAX {
+                    pending = Some(pkt);
+                    break;
+                }
+                body_len = next_len;
+                packets.push(pkt);
+            }
+            if send_hub.media_send_datagrams(peer, &packets).await {
                 consecutive_drops = 0;
             } else {
                 consecutive_drops += 1;
@@ -856,24 +889,80 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         ptr::copy_nonoverlapping(peer_app_id, peer_app.as_mut_ptr(), 32);
     }
 
+    // Opening an AppSender does not prove that the embedded node currently has
+    // a direct session to the peer. REALTIME frames intentionally have no
+    // relay fallback, so accepting a "direct" channel without this check would
+    // create a valid-looking black hole until the session happened to appear.
+    // Fail the open instead; Dart then selects the anonymous media channel.
+    let direct_ready = app_ref.bundle.runtime.block_on(async {
+        let client = app_ref.bundle.client.lock().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.peer_pnet_status(&peer),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|status| status.admitted)
+    });
+    if !direct_ready {
+        unsafe { write_err(err_out, "direct media session is not active") };
+        return 0;
+    }
+
     let (tx_hi, mut rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
     let (tx_video, mut rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
     let sender = Arc::clone(&app_ref.sender);
     let task = app_ref.bundle.runtime.spawn(async move {
+        let started = std::time::Instant::now();
+        let mut transport_seq = 0u32;
+        let mut prefer_video = false;
         loop {
-            let pkt = tokio::select! {
-                biased;
-                Some(pkt) = rx_hi.recv() => pkt,
-                Some(pkt) = rx_video.recv() => pkt,
-                else => break,
+            let pkt = if prefer_video {
+                match rx_video.try_recv() {
+                    Ok(pkt) => pkt,
+                    Err(_) => tokio::select! {
+                        biased;
+                        Some(pkt) = rx_hi.recv() => pkt,
+                        Some(pkt) = rx_video.recv() => pkt,
+                        else => break,
+                    },
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    Some(pkt) = rx_hi.recv() => pkt,
+                    Some(pkt) = rx_video.recv() => pkt,
+                    else => break,
+                }
             };
+            // Audio/RTCP wins the first contested slot, then one queued VP8
+            // packet gets the next slot. Without this bounded alternation the
+            // continuously-ready Opus queue can starve video indefinitely.
+            prefer_video = !media_is_vp8_rtp(&pkt);
             let guard = sender.lock().await;
             let Some(sender) = guard.as_ref() else {
                 break;
             };
+            let (marker, payload_type) = if pkt.len() >= 2 && (pkt[0] >> 6) == 2 {
+                ((pkt[1] >> 7) & 1, u32::from(pkt[1] & 0x7f))
+            } else {
+                (0, 0)
+            };
+            let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             let _ = sender
-                .send_owned(peer, peer_app, peer_endpoint_id, pkt)
+                .send_rt_data(
+                    peer,
+                    peer_app,
+                    peer_endpoint_id,
+                    transport_seq,
+                    timestamp_us,
+                    marker,
+                    payload_type,
+                    &pkt,
+                )
                 .await;
+            transport_seq = transport_seq.wrapping_add(1);
         }
     });
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -96,6 +96,12 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
   // packet already lost its real-time slot; report it as unsent so WebRTC does
   // not treat local buffering as healthy delivery and build a stale tail.
   const bool sent = rc == 0;
+  if (sent) {
+    outbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
+    outbound_byte_count_.fetch_add(packet.size(), std::memory_order_relaxed);
+  } else {
+    outbound_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+  }
 
   // Close the send-side GCC timing loop. Our datagram send is synchronous on
   // the network thread, so stamp "now" and report immediately.
@@ -111,7 +117,13 @@ bool VeilTransportShim::SendRtcp(std::span<const uint8_t> packet,
   (void)options;  // RTCP carries no packet_id to feed back.
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
-  return rc == 0;
+  if (rc == 0) {
+    outbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
+    outbound_byte_count_.fetch_add(packet.size(), std::memory_order_relaxed);
+    return true;
+  }
+  outbound_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+  return false;
 }
 
 // static — invoked on a tokio worker thread (foreign to WebRTC). Copy the bytes
@@ -138,6 +150,7 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
   }
   std::vector<uint8_t> owned(ptr, ptr + len);
   self->inbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
+  self->inbound_byte_count_.fetch_add(len, std::memory_order_relaxed);
   self->inbound_pending_packets_.fetch_add(1, std::memory_order_release);
   self->inbound_pending_bytes_.fetch_add(owned.size(), std::memory_order_release);
   self->network_queue_->PostTask(
