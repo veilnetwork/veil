@@ -1,0 +1,56 @@
+---
+# Lower the DHT republish interval so relay-directory + rendezvous entries
+# propagate to fresh nodes quickly (default is 1800s = 30 min, which makes a
+# just-joined onion recipient wait up to half an hour to discover any relay).
+# Testnet tuning only.
+#
+#   ansible-playbook -i inventory.yml set-dht-republish.yml -e republish_secs=60
+- name: Set dht.republish_interval_secs
+  hosts: nodes:bootstrap
+  become: true
+  serial: 4
+
+  vars:
+    republish_secs: 60
+    veil_config: /var/lib/veil/node.toml
+    metrics_url: http://127.0.0.1:19999/metrics
+
+  tasks:
+    - name: Ensure a [dht] section exists
+      ansible.builtin.command:
+        cmd: "grep -qE '^\\[dht\\]' {{ veil_config }}"
+      changed_when: false
+
+    - name: "Set dht.republish_interval_secs = {{ republish_secs }}"
+      ansible.builtin.lineinfile:
+        path: "{{ veil_config }}"
+        regexp: '^\s*republish_interval_secs\s*='
+        line: "republish_interval_secs = {{ republish_secs }}"
+        insertafter: '^\[dht\]'
+        owner: veil
+        group: veil
+        mode: "0600"
+      register: cfg
+
+    - name: Validate config before restart
+      ansible.builtin.command:
+        cmd: "/usr/local/bin/veil-cli --config {{ veil_config }} config validate"
+      changed_when: false
+
+    - name: Restart veil if changed
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
+      when: cfg.changed
+
+    - name: Wait for metrics to return (<=30 s)
+      ansible.builtin.shell: |
+        for _ in $(seq 1 30); do
+          curl -sf {{ metrics_url }} >/dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        exit 1
+      register: ready
+      changed_when: false
+      failed_when: ready.rc != 0
+      when: cfg.changed

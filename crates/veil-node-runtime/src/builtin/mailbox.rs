@@ -793,8 +793,15 @@ mod tests {
 
         // Receiver A acks its blob — only A's copy is dropped.
         handle_ack_message(&mb, ack_deliver(recv_a, cid.to_vec()));
-        assert!(mb.fetch(recv_a).unwrap().is_empty(), "A's blob must be acked away");
-        assert_eq!(mb.fetch(recv_b).unwrap().len(), 1, "B's blob must survive A's ack");
+        assert!(
+            mb.fetch(recv_a).unwrap().is_empty(),
+            "A's blob must be acked away"
+        );
+        assert_eq!(
+            mb.fetch(recv_b).unwrap().len(),
+            1,
+            "B's blob must survive A's ack"
+        );
     }
 
     #[test]
@@ -1054,7 +1061,14 @@ mod tests {
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
         let (push_tx, mut push_rx) =
             tokio::sync::mpsc::channel::<PushTrigger>(PUSH_TRIGGER_QUEUE_CAP);
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), Some(push_tx), None, None);
+        spawn_mailbox_app_service(
+            &mut host,
+            ctx,
+            Arc::clone(&mailbox),
+            Some(push_tx),
+            None,
+            None,
+        );
 
         let recv = [11u8; 32];
         let envelope = vec![0xEE; 60];
@@ -1097,7 +1111,14 @@ mod tests {
         let ctx = host.make_context([0u8; 32], Arc::clone(&registry));
         let (push_tx, mut push_rx) =
             tokio::sync::mpsc::channel::<PushTrigger>(PUSH_TRIGGER_QUEUE_CAP);
-        spawn_mailbox_app_service(&mut host, ctx, Arc::clone(&mailbox), Some(push_tx), None, None);
+        spawn_mailbox_app_service(
+            &mut host,
+            ctx,
+            Arc::clone(&mailbox),
+            Some(push_tx),
+            None,
+            None,
+        );
 
         let payload = mk_payload(
             [1u8; 32],
@@ -1402,7 +1423,9 @@ mod tests {
         // under the old "always emit at least one" rule it rode every reply,
         // failed PayloadTooLarge each time, and wedged the queue head forever.
         let oversized = vec![0xEE; fetch_reply_budget()];
-        mailbox.put(recv, [0xC1; 32], [0xAA; 32], oversized).unwrap();
+        mailbox
+            .put(recv, [0xC1; 32], [0xAA; 32], oversized)
+            .unwrap();
         // A perfectly deliverable blob stuck BEHIND it.
         mailbox
             .put(recv, [0xC2; 32], [0xAA; 32], b"deliverable".to_vec())
@@ -1484,6 +1507,10 @@ mod tests {
                 reply_id: 0,
             },
         );
-        assert_eq!(mb.fetch(recv).unwrap().len(), 1, "normal deposit still stored");
+        assert_eq!(
+            mb.fetch(recv).unwrap().len(),
+            1,
+            "normal deposit still stored"
+        );
     }
 }

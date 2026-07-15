@@ -1,6 +1,6 @@
 [package]
 name = "veil-session-integration-tests"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Integration tests for `veil-session`'s runner state machine.  Extracted from veilcore in audit batch 2026-05-21 Phase D14 — large 5568-LoC test file that previously coupled veilcore-private modules now compiles against the published surface of veil-session + sibling crates."
 license = "AGPL-3.0-or-later"

@@ -1,6 +1,6 @@
 [package]
 name = "veil-proto"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Veil network wire-format types, codecs, and on-wire constants. Phase 3 extraction from veilcore — pure-data definitions, no orchestration; sign/verify helpers live at the caller layer."
 license = "AGPL-3.0-or-later"
