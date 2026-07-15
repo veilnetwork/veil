@@ -75,6 +75,26 @@ uint64_t veil_media_open_direct_channel(VeilApp *app,
                                         uint32_t peer_endpoint_id,
                                         char **err_out);
 
+/* Open a non-onion Delivery-relay media channel for direct identities. */
+uint64_t veil_media_open_relay_channel(VeilApp *app,
+                                       const uint8_t *peer_node_id,
+                                       const uint8_t *peer_app_id,
+                                       uint32_t peer_endpoint_id,
+                                       char **err_out);
+
+/*
+ * Drain inbound datagrams from `app` directly into the native media registry.
+ * The authenticated source node plus (`source_namespace`, `source_name`) must
+ * derive the frame's source app_id; mismatches are silently dropped. This takes
+ * exclusive ownership of the app receiver and must precede any generic handler.
+ */
+int veil_media_start_direct_receiver(VeilApp *app,
+                                     const uint8_t *source_namespace,
+                                     size_t source_namespace_len,
+                                     const uint8_t *source_name,
+                                     size_t source_name_len,
+                                     char **err_out);
+
 /*
  * Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING. Returns:
  *    0  queued

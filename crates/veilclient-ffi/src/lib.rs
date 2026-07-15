@@ -916,13 +916,18 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
     // a direct session to the peer. REALTIME frames intentionally have no
     // relay fallback, so accepting a "direct" channel without this check would
     // create a valid-looking black hole until the session happened to appear.
-    // Fail the open instead; Dart then selects the anonymous media channel.
+    // Fail the open instead; the host must preserve the negotiated route and
+    // surface/retry the direct failure rather than silently selecting onion.
     let direct_ready = app_ref.bundle.runtime.block_on(async {
-        let client = app_ref.bundle.client.lock().await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client.peer_pnet_status(&peer),
-        )
+        // The shared client mutex can itself be occupied by a slow control RPC
+        // (join/discovery/call signalling). Keep the lock acquisition inside
+        // the same deadline as PnetStatusQuery; otherwise a nominally bounded
+        // P2P probe can outlive the call FSM's media-start timeout and prevent
+        // the caller from reaching its relay fallback.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let client = app_ref.bundle.client.lock().await;
+            client.peer_pnet_status(&peer).await
+        })
         .await
         .ok()
         .and_then(Result::ok)
@@ -986,6 +991,86 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 )
                 .await;
             transport_seq = transport_seq.wrapping_add(1);
+        }
+    });
+    let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    MEDIA_CHANNELS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            id,
+            MediaChannel {
+                tx_hi,
+                tx_video,
+                repair_tx: None,
+                peer,
+                task,
+            },
+        );
+    id
+}
+
+/// Open a lossy MEDIA channel forced through the ordinary Delivery relay path
+/// (no onion circuit). The daemon E2E-encrypts each datagram for `peer`; relay
+/// nodes see addressing metadata but never RTP/RTCP bytes. Intended only for
+/// direct-identity calls when the preferred P2P route is unavailable.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_open_relay_channel(
+    app: *mut VeilApp,
+    peer_node_id: *const u8,
+    peer_app_id: *const u8,
+    peer_endpoint_id: u32,
+    err_out: *mut *mut c_char,
+) -> u64 {
+    if unsafe { guard::ffi_prelude(err_out, "veil_media_open_relay_channel") }.is_err() {
+        return 0;
+    }
+    null_check_with_default!(err_out, 0u64,
+        "app" => app,
+        "peer_node_id" => peer_node_id,
+        "peer_app_id" => peer_app_id,
+    );
+    get_or_return!(app_ref, app_table(), app, err_out, 0u64, "VeilApp");
+    let mut peer = [0u8; 32];
+    let mut peer_app = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(peer_app_id, peer_app.as_mut_ptr(), 32);
+    }
+
+    let (tx_hi, mut rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
+    let (tx_video, mut rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
+    let sender = Arc::clone(&app_ref.sender);
+    let task = app_ref.bundle.runtime.spawn(async move {
+        let mut prefer_video = false;
+        loop {
+            let pkt = if prefer_video {
+                match rx_video.try_recv() {
+                    Ok(pkt) => pkt,
+                    Err(_) => tokio::select! {
+                        biased;
+                        Some(pkt) = rx_hi.recv() => pkt,
+                        Some(pkt) = rx_video.recv() => pkt,
+                        else => break,
+                    },
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    Some(pkt) = rx_hi.recv() => pkt,
+                    Some(pkt) = rx_video.recv() => pkt,
+                    else => break,
+                }
+            };
+            prefer_video = !media_is_vp8_rtp(&pkt);
+            let guard = sender.lock().await;
+            let Some(sender) = guard.as_ref() else {
+                break;
+            };
+            let _ = sender
+                .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, pkt)
+                .await;
         }
     });
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1076,6 +1161,104 @@ pub unsafe extern "C" fn veil_media_dispatch_direct_datagram(
     let payload = unsafe { std::slice::from_raw_parts(ptr, len) };
     media::dispatch_inbound(peer, payload);
     0
+}
+
+#[cfg(feature = "node-embedded")]
+fn direct_media_source_app(node_id: &[u8; 32], namespace: &str, name: &str) -> [u8; 32] {
+    veil_app::app_id(node_id, namespace, name)
+}
+
+/// Drain one bound app endpoint directly into the native media callback
+/// registry, bypassing the host language's event loop entirely.
+///
+/// `source_namespace` + `source_name` identify the well-known named app that a
+/// remote media sender must use. The authenticated session `src_node_id` is
+/// combined with those names to derive the only accepted `src_app_id`; frames
+/// from another app on the same peer are silently dropped. This preserves the
+/// source-app check previously performed in Dart without copying every RTP
+/// packet through the UI isolate.
+///
+/// This function takes exclusive ownership of the app's datagram receiver. It
+/// must be called before [`veil_app_set_recv_handler`].
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_start_direct_receiver(
+    app: *mut VeilApp,
+    source_namespace: *const u8,
+    source_namespace_len: size_t,
+    source_name: *const u8,
+    source_name_len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_media_start_direct_receiver") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "app" => app,
+        "source_namespace" => source_namespace,
+        "source_name" => source_name,
+    );
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let namespace = match std::str::from_utf8(unsafe {
+        std::slice::from_raw_parts(source_namespace, source_namespace_len)
+    }) {
+        Ok(v) => v.to_owned(),
+        Err(_) => {
+            unsafe { write_err(err_out, "source_namespace is not valid UTF-8") };
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    let name = match std::str::from_utf8(unsafe {
+        std::slice::from_raw_parts(source_name, source_name_len)
+    }) {
+        Ok(v) => v.to_owned(),
+        Err(_) => {
+            unsafe { write_err(err_out, "source_name is not valid UTF-8") };
+            return VEIL_ERR_INVALID_ARG;
+        }
+    };
+    if namespace.is_empty() || name.is_empty() {
+        unsafe { write_err(err_out, "source namespace/name must be non-empty") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+
+    let mut receiver_guard = app_ref.msg_rx.blocking_lock();
+    let mut task_guard = app_ref.recv_task.lock().unwrap_or_else(|e| e.into_inner());
+    if task_guard.is_some() {
+        unsafe { write_err(err_out, "app receiver already has a handler") };
+        return VEIL_ERR_CLOSED;
+    }
+    let Some(mut msg_rx) = receiver_guard.take() else {
+        unsafe { write_err(err_out, "app receiver is closed") };
+        return VEIL_ERR_CLOSED;
+    };
+    let task = app_ref.bundle.runtime.spawn(async move {
+        while let Some(IncomingMessage {
+            src_node_id,
+            src_app_id,
+            data,
+            ..
+        }) = msg_rx.recv().await
+        {
+            // Compute rather than cache by untrusted sender id: the media
+            // endpoint is long-lived, so a stream of one-shot authenticated
+            // peers must not grow an unbounded source-id map.
+            let expected = direct_media_source_app(&src_node_id, &namespace, &name);
+            if src_app_id != expected {
+                continue;
+            }
+            media::dispatch_inbound(src_node_id, &data);
+        }
+    });
+    *task_guard = Some(task);
+    VEIL_OK
 }
 
 /// Install the C recv callback invoked (native↔native, from a tokio worker)
@@ -7643,6 +7826,20 @@ pub unsafe extern "C" fn veil_pair_target_build_confirm(
 mod tests {
     use super::*;
     use std::ffi::CStr;
+
+    #[cfg(feature = "node-embedded")]
+    #[test]
+    fn direct_media_receiver_binds_named_app_to_authenticated_node() {
+        let peer = [0x42; 32];
+        let expected = direct_media_source_app(&peer, "xveil", "media");
+
+        assert_eq!(expected, veil_app::app_id(&peer, "xveil", "media"));
+        assert_ne!(
+            expected,
+            direct_media_source_app(&[0x43; 32], "xveil", "media")
+        );
+        assert_ne!(expected, direct_media_source_app(&peer, "xveil", "messages"));
+    }
 
     /// diff-audit M26 (explicit-length ABI): a non-NULL but non-UTF-8 password
     /// must NOT collapse to `None` (which silently emits a plaintext invite) —
