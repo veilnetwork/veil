@@ -685,6 +685,11 @@ pub unsafe extern "C" fn veil_anon_stream_warm_peer(
 struct MediaChannel {
     tx_hi: mpsc::Sender<Vec<u8>>,
     tx_video: mpsc::Sender<Vec<u8>>,
+    /// Anonymous channels accept an out-of-band end-to-end repair request.
+    /// The receiver of the media asks the sender to refresh its outbound
+    /// rendezvous pool when RTP/RTCP has gone dark even though signaling is
+    /// still alive. Direct channels leave this `None`.
+    repair_tx: Option<mpsc::Sender<()>>,
     peer: [u8; 32],
     task: tokio::task::JoinHandle<()>,
 }
@@ -723,7 +728,7 @@ fn media_is_vp8_rtp(payload: &[u8]) -> bool {
 
 #[cfg(all(test, feature = "node-embedded"))]
 mod media_priority_tests {
-    use super::media_is_vp8_rtp;
+    use super::{media_is_vp8_rtp, veil_media_repair_channel};
 
     #[test]
     fn media_priority_classifies_only_vp8_rtp_as_video() {
@@ -733,6 +738,12 @@ mod media_priority_tests {
         assert!(!media_is_vp8_rtp(&[0x80, 72, 0, 1])); // RTCP mux range.
         assert!(!media_is_vp8_rtp(&[0x40, 96, 0, 1])); // Not RTP v2.
         assert!(!media_is_vp8_rtp(&[0x80]));
+    }
+
+    #[test]
+    fn media_repair_rejects_zero_and_unknown_channels() {
+        assert_eq!(unsafe { veil_media_repair_channel(0) }, -1);
+        assert_eq!(unsafe { veil_media_repair_channel(u64::MAX) }, -1);
     }
 }
 
@@ -776,6 +787,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
     };
     let (tx_hi, mut rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
     let (tx_video, mut rx_video) = mpsc::channel::<Vec<u8>>(MEDIA_TX_VIDEO_QUEUE);
+    let (repair_tx, mut repair_rx) = mpsc::channel::<()>(1);
     let send_hub = hub.clone();
     // One drain task per channel: warm the circuit, then pump queued datagrams
     // into the lossy send. `send_datagram` itself drops on QueueFull/no-route,
@@ -803,6 +815,16 @@ pub unsafe extern "C" fn veil_media_open_channel(
             } else {
                 tokio::select! {
                     biased;
+                    Some(()) = repair_rx.recv() => {
+                        // The request is end-to-end evidence from the peer,
+                        // unlike a successful enqueue to our first hop. Force
+                        // a fresh rendezvous resolve/pool open. The opener is
+                        // make-before-break and preserves routes carrying live
+                        // reliable streams, so repairing a call cannot tear a
+                        // concurrent file transfer down.
+                        send_hub.media_open_channel(peer).await;
+                        continue;
+                    }
                     Some(pkt) = rx_hi.recv() => pkt,
                     Some(pkt) = rx_video.recv() => pkt,
                     else => break,
@@ -852,6 +874,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
             MediaChannel {
                 tx_hi,
                 tx_video,
+                repair_tx: Some(repair_tx),
                 peer,
                 task,
             },
@@ -974,6 +997,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             MediaChannel {
                 tx_hi,
                 tx_video,
+                repair_tx: None,
                 peer,
                 task,
             },
@@ -1002,6 +1026,30 @@ pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len
         &ch.tx_hi
     };
     match tx.try_send(payload) {
+        Ok(()) => 0,
+        Err(mpsc::error::TrySendError::Full(_)) => 1,
+        Err(mpsc::error::TrySendError::Closed(_)) => -1,
+    }
+}
+
+/// Request a make-before-break anonymous route refresh for an open media
+/// channel. This is deliberately separate from send success: an onion packet
+/// can enter the first-hop queue successfully and still be black-holed farther
+/// along the circuit. The peer reports that end-to-end silence over the live
+/// call heartbeat, and the host forwards it here. Returns 0 when queued, 1 when
+/// an equivalent repair is already pending, and -1 for an unknown/direct
+/// channel.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_repair_channel(chan: u64) -> c_int {
+    if chan == 0 {
+        return -1;
+    }
+    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(repair_tx) = map.get(&chan).and_then(|ch| ch.repair_tx.as_ref()) else {
+        return -1;
+    };
+    match repair_tx.try_send(()) {
         Ok(()) => 0,
         Err(mpsc::error::TrySendError::Full(_)) => 1,
         Err(mpsc::error::TrySendError::Closed(_)) => -1,
