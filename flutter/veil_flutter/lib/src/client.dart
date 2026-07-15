@@ -228,6 +228,28 @@ int _directMediaOpenChannelWorker(
   }
 }
 
+/// Off-isolate body of [AppHandle.openRelayMediaChannel].
+int _relayMediaOpenChannelWorker(
+    int appAddr, Uint8List peerNode, Uint8List peerApp, int peerEndpoint) {
+  final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
+  final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerNode);
+  final pa = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerApp);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final chan =
+        ffi.veilMediaOpenRelayChannel(app, pn, pa, peerEndpoint, errOut);
+    if (chan == 0) {
+      throw VeilException(
+          'relay media open failed: ${_readErrAndFree(errOut)}');
+    }
+    return chan;
+  } finally {
+    calloc.free(pn);
+    calloc.free(pa);
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate body of [VeilClient.nodeId] — the native call performs an IPC
 /// request via tokio block_on, so it must not run on Flutter's UI isolate.
 Uint8List _nodeIdWorker(int handleAddr) {
@@ -2256,6 +2278,62 @@ class AppHandle implements Finalizable {
     final appAddr = _app.address;
     return Isolate.run(() => _directMediaOpenChannelWorker(
         appAddr, dstNodeId, dstAppId, dstEndpointId));
+  }
+
+  /// Open a media channel over the non-onion Delivery relay path. This is the
+  /// fallback for calls where both identities are direct but P2P is unavailable.
+  Future<int> openRelayMediaChannel({
+    required Uint8List dstNodeId,
+    required Uint8List dstAppId,
+    required int dstEndpointId,
+  }) async {
+    _ensureOpen();
+    if (dstNodeId.length != 32 || dstAppId.length != 32) {
+      throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
+    }
+    final appAddr = _app.address;
+    return Isolate.run(() => _relayMediaOpenChannelWorker(
+        appAddr, dstNodeId, dstAppId, dstEndpointId));
+  }
+
+  /// Install the native direct-media receive pump on this endpoint. Incoming
+  /// RTP/RTCP is source-app verified and dispatched native-to-native, avoiding
+  /// a copy and scheduling hop through the Dart UI isolate for every packet.
+  void startDirectMediaReceiver({
+    required String sourceNamespace,
+    required String sourceName,
+  }) {
+    _ensureOpen();
+    final ns = Uint8List.fromList(utf8.encode(sourceNamespace));
+    final name = Uint8List.fromList(utf8.encode(sourceName));
+    if (ns.isEmpty || name.isEmpty) {
+      throw ArgumentError('sourceNamespace and sourceName must be non-empty');
+    }
+    final nsPtr = calloc<Uint8>(ns.length)
+      ..asTypedList(ns.length).setAll(0, ns);
+    final namePtr = calloc<Uint8>(name.length)
+      ..asTypedList(name.length).setAll(0, name);
+    final errOut = calloc<Pointer<Utf8>>();
+    try {
+      final rc = ffi.veilMediaStartDirectReceiver(
+        _app,
+        nsPtr,
+        ns.length,
+        namePtr,
+        name.length,
+        errOut,
+      );
+      if (rc != ffi.veilOk) {
+        throw VeilException(
+          'direct media receiver failed: ${_readErrAndFree(errOut)}',
+          code: rc,
+        );
+      }
+    } finally {
+      calloc.free(nsPtr);
+      calloc.free(namePtr);
+      calloc.free(errOut);
+    }
   }
 
   /// Wait up to [timeout] for a remote peer to open an inbound byte-stream to

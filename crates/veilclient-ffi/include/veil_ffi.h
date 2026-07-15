@@ -637,6 +637,34 @@ uint64_t veil_media_open_direct_channel(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Open a lossy MEDIA datagram channel over the non-onion Delivery relay path.
+ * Intended for direct identities when P2P is unavailable.
+ */
+uint64_t veil_media_open_relay_channel(VeilApp *app,
+                                       const uint8_t *peer_node_id,
+                                       const uint8_t *peer_app_id,
+                                       uint32_t peer_endpoint_id,
+                                       char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Drain inbound direct-media datagrams into the native media callback registry
+ * without a host-language hop. Source app ids are verified by deriving the
+ * named app from the authenticated source node.
+ */
+int veil_media_start_direct_receiver(VeilApp *app,
+                                     const uint8_t *source_namespace,
+                                     size_t source_namespace_len,
+                                     const uint8_t *source_name,
+                                     size_t source_name_len,
+                                     char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Enqueue one media datagram (RTP/RTCP) on `chan`. NON-BLOCKING: returns 0 if
  * queued, 1 if dropped (queue full / channel closing) — the caller's real-time
  * media thread must never block. Returns -1 on a NULL/zero-length payload or an

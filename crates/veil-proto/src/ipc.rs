@@ -1036,6 +1036,12 @@ pub const IPC_SEND_FLAG_EXPECT_REPLY: u32 = 0x0000_0008;
 /// destination flags.
 pub const IPC_SEND_FLAG_IS_REPLY: u32 = 0x0000_0010;
 
+/// Force a non-anonymous datagram through the Delivery relay path even when a
+/// direct session to the destination exists, and enqueue relay frames at
+/// REALTIME priority. Used by call media after a direct route fails. Unknown
+/// flag bits are ignored by older nodes, which preserves wire compatibility.
+pub const IPC_SEND_FLAG_RELAY_REALTIME: u32 = 0x0000_0020;
+
 /// Sent by the IPC client to dispatch a datagram into the veil network.
 ///
 /// Wire layout:
@@ -1046,7 +1052,8 @@ pub const IPC_SEND_FLAG_IS_REPLY: u32 = 0x0000_0010;
 /// [96..100] endpoint_id u32 BE (destination endpoint)
 /// [100..104] flags u32 BE (bit 0 = REQUIRE_ACK, bit 1 = ANONYMOUS,
 ///                           bit 2 = ANONYMOUS_AUTHENTICATED,
-///                           bit 3 = EXPECT_REPLY, bit 4 = IS_REPLY)
+///                           bit 3 = EXPECT_REPLY, bit 4 = IS_REPLY,
+///                           bit 5 = RELAY_REALTIME)
 /// [104..108] data_len u32 BE
 /// [108..108+data_len] data bytes
 /// [D..D+8]   reply_id u64 BE     (trailing; optional — 0 if absent)

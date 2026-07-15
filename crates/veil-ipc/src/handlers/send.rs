@@ -189,6 +189,47 @@ async fn try_lookup_or_discover(
     result
 }
 
+/// Return live first-hop candidates for an explicitly relay-only send.
+///
+/// A realtime relay fallback must never silently collapse back to the final
+/// peer's direct session.  Cached multi-hop routes are preferred; when route
+/// discovery has only learned the direct peer (or has not populated the cache
+/// yet), any other live overlay session is already a valid first relay hop.
+/// This avoids putting the 500 ms reactive-discovery wait on every RTP packet.
+fn relay_hops_to_try(
+    dst: &[u8; 32],
+    route_cache: Option<&RwLock<veil_routing::RouteCache>>,
+    session_tx_registry: &dyn FrameBroadcaster,
+) -> Vec<[u8; 32]> {
+    let mut hops = Vec::new();
+
+    if let Some(cache) = route_cache {
+        for hop in rlock!(cache).lookup_all(dst) {
+            if &hop != dst && !hops.contains(&hop) {
+                hops.push(hop);
+            }
+        }
+    }
+
+    // Prefer peers closest to the destination in XOR space, matching the
+    // recursive routing start policy.  Cached routes above remain first.
+    let mut active = session_tx_registry.active_node_ids();
+    active.sort_by_key(|peer| {
+        let mut xor = [0u8; 32];
+        for i in 0..32 {
+            xor[i] = peer[i] ^ dst[i];
+        }
+        xor
+    });
+    for peer in active {
+        if &peer != dst && !hops.contains(&peer) {
+            hops.push(peer);
+        }
+    }
+
+    hops
+}
+
 /// Write an `APP_SEND_FAILED(RATE_LIMITED)` frame and return `true`.
 ///
 /// Returns `false` without writing anything when `rate_limiter` is `None`
@@ -269,6 +310,14 @@ pub(crate) async fn handle_ipc_send(
         return Ok(());
     }
 
+    // This additive flag is intentionally read from the stable raw flags word:
+    // AppIpcSendPayload ignores unknown bits, so old clients/servers remain
+    // compatible without growing its public struct and every literal user.
+    let relay_realtime = body
+        .get(100..104)
+        .and_then(|v| <[u8; 4]>::try_from(v).ok())
+        .map(u32::from_be_bytes)
+        .is_some_and(|flags| flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME != 0);
     let send = match AppIpcSendPayload::decode(body) {
         Ok(s) => s,
         Err(_) => return Ok(()), // drop malformed
@@ -406,26 +455,36 @@ pub(crate) async fn handle_ipc_send(
         let mut frame = codec::encode_header(&hdr).to_vec();
         frame.extend_from_slice(&payload_bytes);
 
-        let sent = reg.send_to(
-            &send.dst_node_id,
-            veil_proto::header::priority::INTERACTIVE,
-            frame,
-        );
+        let sent = !relay_realtime
+            && reg.send_to(
+                &send.dst_node_id,
+                veil_proto::header::priority::INTERACTIVE,
+                frame,
+            );
 
         if !sent {
             // No direct session. Try relay via RouteCache next-hop.
             // If the cache is empty, attempt reactive route discovery:
             // flood a ROUTE_REQUEST and wait up to 500 ms for a response.
-            let hop = try_lookup_or_discover(
-                &send.dst_node_id,
-                local_node_id,
-                route_cache,
-                session_tx_registry,
-                route_updated,
-                peer_mlkem_keys,
-                ctx.pending_recursive,
-            )
-            .await;
+            let forced_relay_hops = if relay_realtime {
+                relay_hops_to_try(&send.dst_node_id, route_cache, reg)
+            } else {
+                Vec::new()
+            };
+            let hop = if relay_realtime {
+                forced_relay_hops.first().copied()
+            } else {
+                try_lookup_or_discover(
+                    &send.dst_node_id,
+                    local_node_id,
+                    route_cache,
+                    session_tx_registry,
+                    route_updated,
+                    peer_mlkem_keys,
+                    ctx.pending_recursive,
+                )
+                .await
+            };
 
             if let Some(hop) = hop {
                 use veil_proto::delivery::DeliveryEnvelope;
@@ -653,7 +712,9 @@ pub(crate) async fn handle_ipc_send(
                     let trace_bytes = trace_id.to_be_bytes();
 
                     // Candidate relay hops: primary then cached alternatives.
-                    let hops_to_try: Vec<[u8; 32]> = {
+                    let hops_to_try: Vec<[u8; 32]> = if relay_realtime {
+                        forced_relay_hops.clone()
+                    } else {
                         let mut v = vec![hop];
                         if let Some(cache) = route_cache {
                             for alt in rlock!(cache).lookup_all(&send.dst_node_id) {
@@ -797,7 +858,9 @@ pub(crate) async fn handle_ipc_send(
                 };
 
                 // Try primary hop first; on failure fall back to cached alternatives.
-                let hops_to_try: Vec<[u8; 32]> = {
+                let hops_to_try: Vec<[u8; 32]> = if relay_realtime {
+                    forced_relay_hops.clone()
+                } else {
                     let mut v = vec![hop];
                     if let Some(cache) = route_cache {
                         for alt in rlock!(cache).lookup_all(&send.dst_node_id) {
@@ -813,7 +876,11 @@ pub(crate) async fn handle_ipc_send(
                     let fwd_frame = make_fwd_frame(next_hop);
                     let relayed = reg.send_to(
                         &next_hop,
-                        veil_proto::header::priority::INTERACTIVE,
+                        if relay_realtime {
+                            veil_proto::header::priority::REALTIME
+                        } else {
+                            veil_proto::header::priority::INTERACTIVE
+                        },
                         fwd_frame.clone(),
                     );
                     if relayed {
@@ -1012,5 +1079,52 @@ fn emit_e2e_plaintext_capture(
             true, // e2e_plaintext
         );
         let _ = tx.send(ev);
+    }
+}
+
+#[cfg(test)]
+mod relay_hop_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct ActivePeers(Vec<[u8; 32]>);
+
+    impl FrameBroadcaster for ActivePeers {
+        fn send_to(&self, _peer_id: &[u8; 32], _priority: u8, _bytes: Vec<u8>) -> bool {
+            true
+        }
+
+        fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
+
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn forced_relay_never_selects_the_destination_direct_session() {
+        let dst = [0x10; 32];
+        let relay = [0x20; 32];
+        let mut cache = veil_routing::RouteCache::new(Duration::from_secs(60));
+        cache.insert(dst, dst, 1, 1);
+        cache.insert(dst, relay, 2, 2);
+        let cache = RwLock::new(cache);
+        let peers = ActivePeers(vec![dst, relay]);
+
+        assert_eq!(relay_hops_to_try(&dst, Some(&cache), &peers), vec![relay]);
+    }
+
+    #[test]
+    fn forced_relay_uses_live_overlay_peer_without_waiting_for_discovery() {
+        let dst = [0x10; 32];
+        let nearest = [0x11; 32];
+        let farther = [0x30; 32];
+        let peers = ActivePeers(vec![farther, dst, nearest, nearest]);
+
+        assert_eq!(
+            relay_hops_to_try(&dst, None, &peers),
+            vec![nearest, farther]
+        );
     }
 }
