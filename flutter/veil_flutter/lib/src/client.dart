@@ -919,6 +919,14 @@ class VeilClient implements Finalizable {
     }
   }
 
+  /// Ask an anonymous media channel to make-before-break refresh its outbound
+  /// rendezvous/circuit pool. Returns 0 queued / 1 already pending / -1 when
+  /// [chan] is invalid or direct-P2P.
+  int repairMediaChannel(int chan) {
+    _ensureOpen();
+    return ffi.veilMediaRepairChannel(chan);
+  }
+
   /// Close a media channel (stops the drain task + clears its recv callback).
   /// Idempotent.
   void closeMediaChannel(int chan) {

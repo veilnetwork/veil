@@ -1743,6 +1743,12 @@ final int Function(int, Pointer<Uint8>, int) veilMediaSendDatagram = nativeLib
         'veil_media_send_datagram')
     .asFunction();
 
+// repair_channel(chan) -> 0 queued / 1 already pending / -1 invalid/direct.
+final int Function(int) veilMediaRepairChannel = nativeLib
+    .lookup<NativeFunction<Int32 Function(Uint64)>>(
+        'veil_media_repair_channel')
+    .asFunction();
+
 // dispatch_direct(peer_node32*, ptr, len) -> 0 delivered/accepted, -1 invalid.
 final int Function(Pointer<Uint8>, Pointer<Uint8>, int)
     veilMediaDispatchDirectDatagram = nativeLib
