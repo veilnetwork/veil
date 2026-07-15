@@ -5456,7 +5456,10 @@ mod tests {
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let out = veil_crypto::nickname::mine_seeds(name, owner, target, 200_000_000, 7, &cancel)
             .expect("valid nickname");
-        assert!(out.hit_target, "test miner must reach target weight {target}");
+        assert!(
+            out.hit_target,
+            "test miner must reach target weight {target}"
+        );
         out.seeds
     }
 
@@ -5554,10 +5557,11 @@ mod tests {
         let sk = SigningKey::from_bytes(&[0x44u8; 32]);
         let node_id = *blake3::hash(&sk.verifying_key().to_bytes()).as_bytes();
         let seeds = mine_nickname_seeds(name, &node_id, floor);
-        let old = veil_crypto::nickname::NicknameRecord::sign(name, &sk, node_id, seeds.clone(), 1000)
-            .unwrap();
-        let fresh = veil_crypto::nickname::NicknameRecord::sign(name, &sk, node_id, seeds, 2000)
-            .unwrap();
+        let old =
+            veil_crypto::nickname::NicknameRecord::sign(name, &sk, node_id, seeds.clone(), 1000)
+                .unwrap();
+        let fresh =
+            veil_crypto::nickname::NicknameRecord::sign(name, &sk, node_id, seeds, 2000).unwrap();
         let key = veil_crypto::nickname::nickname_dht_key(name).unwrap();
         let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
         let (h1, b1) = make_store_frame(&StorePayload::unsigned(key, old.to_bytes()));

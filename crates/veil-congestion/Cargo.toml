@@ -1,6 +1,6 @@
 [package]
 name = "veil-congestion"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Per-node congestion monitor: tracks load (relay sessions, total sessions, queue depth), exposes a 0..=255 congestion score + admission-control flag. Phase 3 prep of veilcore extraction."
 license = "AGPL-3.0-or-later"

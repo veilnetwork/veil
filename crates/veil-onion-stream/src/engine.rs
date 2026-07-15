@@ -1115,8 +1115,8 @@ impl StreamEngine {
             // skipped: its send time was refreshed at retransmission, so if it
             // is overtaken AGAIN the repair itself was lost — re-repair it
             // before the coarse RTO.
-            let sent_no_later = s.sent_ms < rack_xmit
-                || (s.sent_ms == rack_xmit && seq::leq(s.end(), rack_end));
+            let sent_no_later =
+                s.sent_ms < rack_xmit || (s.sent_ms == rack_xmit && seq::leq(s.end(), rack_end));
             if !sent_no_later {
                 continue;
             }

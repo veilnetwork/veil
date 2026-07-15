@@ -784,7 +784,10 @@ mod tests {
         // (zero idle DHT load). ZERO window drops every mark.
         assert!(
             cache
-                .refresh_candidates(std::time::Duration::ZERO, std::time::Duration::from_secs(60))
+                .refresh_candidates(
+                    std::time::Duration::ZERO,
+                    std::time::Duration::from_secs(60)
+                )
                 .is_empty(),
             "inactive receivers must not be refreshed"
         );
@@ -946,8 +949,11 @@ mod tests {
         // After the window lapses with no further reply-expecting sends, peek
         // returns to normal (no self-re-tripping).
         assert!(
-            !t.peek(&r, 200 + ANON_SEND_STALL_MIN_SECS + ANON_SEND_WIDEN_SECS + 1)
-                .widen
+            !t.peek(
+                &r,
+                200 + ANON_SEND_STALL_MIN_SECS + ANON_SEND_WIDEN_SECS + 1
+            )
+            .widen
         );
     }
 

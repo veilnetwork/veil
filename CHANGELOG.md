@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.0 — 2026-07-15
+
+Feature release covering the signed `main` history after v0.2.0.
+
+- Added the embedded, diskless node lifecycle and mobile FFI configuration
+  path used by Flutter on Android, iOS, macOS, and Linux.
+- Added authenticated offline mailbox sealing, relay replication, fetch/ACK,
+  recovery, and sender verification across the Rust, C, and Dart APIs.
+- Added reliable anonymous streams, low-latency media channels, and direct-P2P
+  media with policy-controlled relay/onion routing.
+- Added sovereign identity operations and cumulative-PoW nickname claim and
+  resolution APIs.
+- Hardened relay discovery, rendezvous registration, circuit recovery, queue
+  pressure, and cold-start behavior; leaf deployments are relay-capable by
+  default, with operational playbooks for staged rollout.
+- Updated `anyhow` to 1.0.103, `crossbeam-epoch` to 0.9.20, and
+  `quinn-proto` to 0.11.15, and aligned Android builds on API 24.
+
+`veilclient-ffi` remains on its independent 0.4.x ABI line and the new
+`veil-onion-stream` crate remains on its independent 0.1.x line.
+
 ## v0.2.0 — 2026-06-14
 
 Minor release. Bundles everything on `main` since v0.1.1 (≈330 commits) plus the

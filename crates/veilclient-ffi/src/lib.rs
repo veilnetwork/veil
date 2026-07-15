@@ -63,7 +63,9 @@
 #![cfg(unix)]
 
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_void};
+#[cfg(feature = "node-embedded")]
+use std::os::raw::c_void;
+use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -89,6 +91,7 @@ mod identity_sign;
 // NodeServices; the pure nickname helpers in lib.rs stay feature-free).
 #[cfg(feature = "node-embedded")]
 mod nickname_net;
+#[cfg(feature = "node-embedded")]
 mod node;
 
 use libc::{size_t, ssize_t};
@@ -337,6 +340,7 @@ fn stream_table() -> &'static StdMutex<HandleTable<VeilStreamFfi>> {
     T.get_or_init(|| StdMutex::new(HandleTable::new()))
 }
 
+#[cfg(feature = "node-embedded")]
 fn anon_stream_table() -> &'static StdMutex<HandleTable<VeilAnonStreamFfi>> {
     static T: OnceLock<StdMutex<HandleTable<VeilAnonStreamFfi>>> = OnceLock::new();
     T.get_or_init(|| StdMutex::new(HandleTable::new()))
@@ -392,6 +396,7 @@ pub struct VeilHandle {
     /// Node-wide anonymous-stream multiplexer, built lazily on the first
     /// `veil_anon_stream_open`/`veil_anon_stream_accept` (binds a dedicated
     /// onion-stream endpoint + spawns the demux).
+    #[cfg(feature = "node-embedded")]
     anon_hub: TokioMutex<Option<Arc<anon_stream::AnonStreamHub>>>,
 }
 
@@ -449,6 +454,7 @@ pub struct VeilStreamFfi {
 /// controlled — see [`anon_stream`]). Split read/write halves so a caller can
 /// read + write concurrently without one mutex deadlocking a blocking read
 /// against a write.
+#[cfg(feature = "node-embedded")]
 pub struct VeilAnonStreamFfi {
     bundle: Arc<RuntimeBundle>,
     abort: veil_onion_stream::OnionAbort,
@@ -458,6 +464,7 @@ pub struct VeilAnonStreamFfi {
 
 /// Get-or-lazily-build this node's anonymous-stream hub (binds the dedicated
 /// onion-stream endpoint once, on first use).
+#[cfg(feature = "node-embedded")]
 fn ensure_anon_hub(
     bundle: &Arc<RuntimeBundle>,
     slot: &TokioMutex<Option<Arc<anon_stream::AnonStreamHub>>>,
@@ -497,6 +504,7 @@ fn ensure_anon_hub(
 /// "onion-stream")` — the Dart caller derives it, mirroring `veil_stream_open`).
 /// Returns NULL on error.
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_open(
     handle: *mut VeilHandle,
     dst_node_id: *const u8,
@@ -552,6 +560,7 @@ pub unsafe extern "C" fn veil_anon_stream_open(
 /// error. On success writes the initiator's 32-byte node id + onion-stream app
 /// id into the out params (caller-allocated, 32 B each).
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_accept(
     handle: *mut VeilHandle,
     timeout_ms: u64,
@@ -614,6 +623,7 @@ pub unsafe extern "C" fn veil_anon_stream_accept(
 /// window. Idempotent; cheap when the pool is already up. Returns 0 on
 /// dispatch, -1 on error (NULL args / dead handle / hub bind failure).
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_warm_peer(
     handle: *mut VeilHandle,
     dst_node_id: *const u8,
@@ -830,14 +840,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         "peer_node_id" => peer_node_id,
         "peer_app_id" => peer_app_id,
     );
-    get_or_return!(
-        app_ref,
-        app_table(),
-        app,
-        err_out,
-        0u64,
-        "VeilApp"
-    );
+    get_or_return!(app_ref, app_table(), app, err_out, 0u64, "VeilApp");
     let mut peer = [0u8; 32];
     let mut peer_app = [0u8; 32];
     unsafe {
@@ -860,7 +863,9 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             let Some(sender) = guard.as_ref() else {
                 break;
             };
-            let _ = sender.send_owned(peer, peer_app, peer_endpoint_id, pkt).await;
+            let _ = sender
+                .send_owned(peer, peer_app, peer_endpoint_id, pkt)
+                .await;
         }
     });
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -990,6 +995,7 @@ pub unsafe extern "C" fn veil_media_recv_count(peer_node_id: *const u8) -> u64 {
 /// Read up to `cap` bytes. Returns the count (0 = clean EOF), or a negative
 /// error code (the stream was reset → the app should resume).
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_read(
     stream: *mut VeilAnonStreamFfi,
     buf: *mut u8,
@@ -1039,6 +1045,7 @@ pub unsafe extern "C" fn veil_anon_stream_read(
 
 /// Queue `len` bytes for reliable delivery. Returns `VEIL_OK` / a negative code.
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_write(
     stream: *mut VeilAnonStreamFfi,
     data: *const u8,
@@ -1089,6 +1096,7 @@ pub unsafe extern "C" fn veil_anon_stream_write(
 /// Half-close the send direction (a FIN follows the last queued byte). The peer
 /// reads EOF. Returns `VEIL_OK` / a negative code.
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_finish(
     stream: *mut VeilAnonStreamFfi,
     err_out: *mut *mut c_char,
@@ -1125,6 +1133,7 @@ pub unsafe extern "C" fn veil_anon_stream_finish(
 /// resource-release path: dropping the write half closes the command channel, so
 /// the driver finishes the send direction rather than resetting normal EOF.
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_close(stream: *mut VeilAnonStreamFfi) {
     if stream.is_null() {
         return;
@@ -1138,6 +1147,7 @@ pub unsafe extern "C" fn veil_anon_stream_close(stream: *mut VeilAnonStreamFfi) 
 /// wake that already-cloned Arc. First signal the local read half, then send a
 /// best-effort RST through the driver so the peer/route settle too.
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_abort(stream: *mut VeilAnonStreamFfi) {
     if stream.is_null() {
         return;
@@ -1347,6 +1357,7 @@ pub unsafe extern "C" fn veil_connect(
         VeilHandle {
             bundle,
             event_task: StdMutex::new(None),
+            #[cfg(feature = "node-embedded")]
             anon_hub: TokioMutex::new(None),
         },
     ) as *mut VeilHandle
@@ -3911,10 +3922,7 @@ pub unsafe extern "C" fn veil_nickname_normalize(
 /// The cumulative PoW weight a name of this length must carry (the anti-squat
 /// floor) — the host mines until it reaches this. 0 on a bad name.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_nickname_length_floor(
-    name: *const u8,
-    name_len: size_t,
-) -> u64 {
+pub unsafe extern "C" fn veil_nickname_length_floor(name: *const u8, name_len: size_t) -> u64 {
     if name.is_null() {
         return 0;
     }
