@@ -101,7 +101,7 @@ impl Pipe {
             let base = match p.ch.two_path {
                 // Round-robin cells across the two simulated routes.
                 Some((fast, slow)) => {
-                    if p.injected % 2 == 0 {
+                    if p.injected.is_multiple_of(2) {
                         fast
                     } else {
                         slow

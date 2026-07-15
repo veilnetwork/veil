@@ -17,6 +17,8 @@ Feature release covering the signed `main` history after v0.2.0.
   default, with operational playbooks for staged rollout.
 - Updated `anyhow` to 1.0.103, `crossbeam-epoch` to 0.9.20, and
   `quinn-proto` to 0.11.15, and aligned Android builds on API 24.
+- Restored the zero-warning Rust 1.97 gate and made the Unix-only TCP MSS
+  clamp a safe no-op on Windows.
 
 `veilclient-ffi` remains on its independent 0.4.x ABI line and the new
 `veil-onion-stream` crate remains on its independent 0.1.x line.

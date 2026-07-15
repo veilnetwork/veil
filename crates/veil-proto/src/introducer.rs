@@ -59,7 +59,7 @@ use super::cursor::{read_array, read_bytes, read_u8, read_u16, read_u64};
 use super::time_validity::WIRE_SKEW_SECS;
 
 /// "IN" — identifies an IntroduceRequest value on the wire.
-pub const INTRODUCE_MAGIC: [u8; 2] = [b'I', b'N'];
+pub const INTRODUCE_MAGIC: [u8; 2] = *b"IN";
 
 /// Current wire format version.
 pub const INTRODUCE_V1: u8 = 1;

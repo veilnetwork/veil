@@ -88,7 +88,7 @@ use super::master_seed::MASTER_SEED_LEN;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Magic bytes identifying an encrypted-master file.
-pub const MASTER_FILE_MAGIC: [u8; 2] = [b'I', b'M'];
+pub const MASTER_FILE_MAGIC: [u8; 2] = *b"IM";
 /// Wire-format version.
 pub const MASTER_FILE_V1: u8 = 1;
 

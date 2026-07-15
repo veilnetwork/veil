@@ -541,7 +541,7 @@ impl DhtMlKemEkResolver {
 /// check, so a hostile direct peer can only withhold, never forge. All other
 /// callers (ML-KEM EK, rendezvous-ad, and third-party document lookups) pass
 /// `None` and keep the XOR-closest walk.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) async fn recursive_dht_get(
     dht: &Arc<KademliaService>,
     session_tx_registry: &Arc<RwLock<SessionTxRegistry>>,

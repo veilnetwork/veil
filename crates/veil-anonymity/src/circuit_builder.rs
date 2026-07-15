@@ -1086,7 +1086,7 @@ mod tests {
             &pool,
             2,
             &rtt,
-            &diversity,
+            diversity,
             |_| 0,
             live_set(vec![3]),
         )

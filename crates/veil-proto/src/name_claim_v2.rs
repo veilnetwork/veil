@@ -49,7 +49,7 @@ use super::cursor::{read_array, read_bytes, read_u8, read_u16, read_u32, read_u6
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// "NM" — identifies a NameClaim value on the wire.
-pub const NAME_CLAIM_MAGIC: [u8; 2] = [b'N', b'M'];
+pub const NAME_CLAIM_MAGIC: [u8; 2] = *b"NM";
 /// Wire-format version.
 pub const NAME_CLAIM_V1: u8 = 1;
 /// Domain-separated signing context.

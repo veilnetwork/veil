@@ -112,7 +112,7 @@ pub struct NicknameRecord {
 pub fn normalize_name(input: &str) -> Option<String> {
     let lowered: String = input.trim().to_ascii_lowercase();
     let len = lowered.chars().count();
-    if len < MIN_NICKNAME_LEN || len > MAX_NICKNAME_LEN {
+    if !(MIN_NICKNAME_LEN..=MAX_NICKNAME_LEN).contains(&len) {
         return None;
     }
     if !lowered
@@ -269,7 +269,7 @@ pub fn mine_seeds_continue(
             kept.push((w, *s));
         }
     }
-    kept.sort_by(|a, b| b.0.cmp(&a.0));
+    kept.sort_by_key(|item| std::cmp::Reverse(item.0));
     kept.truncate(MAX_NICKNAME_SEEDS);
     if !kept.is_empty() && kept.iter().map(|(w, _)| *w).sum::<u64>() >= target_weight {
         let weight = kept.iter().map(|(w, _)| *w).sum();
@@ -301,7 +301,7 @@ pub fn mine_seeds_continue(
             continue; // never double-count a seed already kept (e.g. from prior)
         }
         kept.push((w, seed));
-        kept.sort_by(|a, b| b.0.cmp(&a.0));
+        kept.sort_by_key(|item| std::cmp::Reverse(item.0));
         kept.truncate(MAX_NICKNAME_SEEDS);
         if kept.iter().map(|(w, _)| *w).sum::<u64>() >= target_weight {
             hit_target = true;
@@ -572,7 +572,7 @@ mod tests {
                 continue; // a bits=0 seed adds ~nothing; skip to converge fast
             }
             kept.push((w, seed));
-            kept.sort_by(|a, b| b.0.cmp(&a.0));
+            kept.sort_by_key(|item| std::cmp::Reverse(item.0));
             kept.truncate(MAX_NICKNAME_SEEDS);
             if kept.iter().map(|(w, _)| *w).sum::<u64>() >= target {
                 break;
