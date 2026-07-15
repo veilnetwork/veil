@@ -193,7 +193,7 @@ impl ColdBackend for InMemoryCold {
         // entries whose ts < cutoff in O(k log n) where k is the number of
         // expired entries.
         let mut expired_keys: Vec<[u8; 32]> = Vec::new();
-        for (&(ts, key), _) in self.order.iter() {
+        for &(ts, key) in self.order.keys() {
             if ts < cutoff {
                 expired_keys.push(key);
             } else {

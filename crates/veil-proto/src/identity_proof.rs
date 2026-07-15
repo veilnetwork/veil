@@ -78,7 +78,7 @@ use super::cursor::{read_array, read_bytes, read_u8, read_u16, read_u32, read_u6
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-pub const IDENTITY_PROOF_MAGIC: [u8; 2] = [b'I', b'P'];
+pub const IDENTITY_PROOF_MAGIC: [u8; 2] = *b"IP";
 pub const IDENTITY_PROOF_V1: u8 = 1;
 
 /// Context prefix the identity_sk signs along with the ephemeral pk.
