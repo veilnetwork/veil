@@ -1233,8 +1233,10 @@ mod tests {
 
     /// Captures `send_reply` calls; every other AnonOnionSender method is
     /// unreachable on the FETCH path and panics if hit.
+    type CapturedReplies = std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>, [u8; 32])>>>;
+
     struct MockReplySender {
-        captured: std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>, [u8; 32])>>>,
+        captured: CapturedReplies,
     }
 
     type AnonFut<'a> = std::pin::Pin<

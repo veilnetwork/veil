@@ -34,11 +34,11 @@ use crate::ProtoError;
 // ── Magic + versions ─────────────────────────────────────────────────────────
 
 /// Hello: target → source.
-pub const PAIR_HELLO_MAGIC: [u8; 2] = [b'P', b'H'];
+pub const PAIR_HELLO_MAGIC: [u8; 2] = *b"PH";
 /// Cert: source → target.
-pub const PAIR_CERT_MAGIC: [u8; 2] = [b'P', b'C'];
+pub const PAIR_CERT_MAGIC: [u8; 2] = *b"PC";
 /// Confirm: target → source (final).
-pub const PAIR_CONFIRM_MAGIC: [u8; 2] = [b'P', b'F'];
+pub const PAIR_CONFIRM_MAGIC: [u8; 2] = *b"PF";
 
 pub const PAIR_HELLO_V1: u8 = 1;
 pub const PAIR_CERT_V1: u8 = 1;

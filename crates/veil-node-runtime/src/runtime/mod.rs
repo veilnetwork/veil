@@ -7594,10 +7594,11 @@ impl NodeServices {
                     .filter_map(|i| i.node_id.as_ref().map(|n| *n.as_bytes()))
                     .collect()
             };
-            if !discovered.is_empty() && !session_peers.contains(&discovered[0]) {
-                if let Some(pos) = discovered.iter().position(|n| session_peers.contains(n)) {
-                    discovered.swap(0, pos);
-                }
+            if !discovered.is_empty()
+                && !session_peers.contains(&discovered[0])
+                && let Some(pos) = discovered.iter().position(|n| session_peers.contains(n))
+            {
+                discovered.swap(0, pos);
                 // else: no discovered middle is session-backed — the build's
                 // CircuitBuild send will fail NoRelays, the honest outcome (we
                 // hold no session to reach any usable first hop right now).
@@ -7641,7 +7642,7 @@ impl NodeServices {
         {
             Some(ed) => {
                 let seed = zeroize::Zeroizing::new(ed.to_bytes());
-                veil_crypto::identity::derive_onion_auth_cookie(&*seed, period)
+                veil_crypto::identity::derive_onion_auth_cookie(&seed, period)
             }
             None => {
                 let mut c = [0u8; 16];
@@ -8049,7 +8050,7 @@ impl NodeServices {
                 .and_then(|sov| sov.ed25519_signing_key())
                 .map(|ed| {
                     let seed = zeroize::Zeroizing::new(ed.to_bytes());
-                    veil_crypto::identity::derive_onion_auth_cookie(&*seed, period_now)
+                    veil_crypto::identity::derive_onion_auth_cookie(&seed, period_now)
                 })
                 .unwrap_or(cookie);
             // The registration keypair rotates WITH the cookie's period (same
@@ -8454,6 +8455,7 @@ impl NodeServices {
     ///
     /// FETCH `data` is empty, so the signed `AuthAppDeliver` is a single onion
     /// cell — no fragmentation loop (unlike the rendezvous path).
+    #[allow(clippy::too_many_arguments)]
     pub fn send_anonymous_authenticated_direct_with_reply(
         &self,
         target_node_id: [u8; 32],
@@ -8681,7 +8683,7 @@ impl NodeServices {
         // onion content path's residual ~30% loss after the replica-resolver fix;
         // this `send_anonymous_authenticated_to` selection is the one the content
         // send actually uses).
-        ads.sort_by(|a, b| b.valid_from_unix.cmp(&a.valid_from_unix));
+        ads.sort_by_key(|ad| std::cmp::Reverse(ad.valid_from_unix));
         if ads.is_empty() {
             return Err(AnonOnionSendError::NoRendezvous);
         }

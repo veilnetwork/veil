@@ -3859,20 +3859,6 @@ pub unsafe extern "C" fn veil_free_replica_buf(ptr: *mut u8, len: size_t) {
     }
 }
 
-/// Free a callback buffer handed to a recv- or event-handler callback
-/// (cycle-7 H6).  `ptr` MUST be the base pointer the callback received — for
-/// recv that is the `src_node_id` pointer (the buffer is laid out
-/// `[node_id(32) | app_id(32) | data]`); for events it is the `payload`
-/// pointer — and `len` MUST be the buffer's total length (recv: `64 + data_len`;
-/// events: `payload_len`).  Safe to call on `ptr == NULL` (no-op).
-///
-/// The callback contract is callee-owns-the-buffer: the host MUST call this
-/// exactly once per callback invocation that received a non-NULL pointer, after
-/// it has finished copying the bytes it needs. This lets the host retain the
-/// pointer past the synchronous call (e.g. Dart `NativeCallable.listener`,
-/// which marshals to the isolate and reads the bytes later) without a
-/// use-after-free.
-///
 // ── Nicknames ───────────────────────────────────────────────────────────────
 // Human-readable names over veil (see veil-crypto::nickname). The host mines
 // PoW seeds OFF the UI isolate (a bounded, chunked, cancellable loop), then
@@ -3966,7 +3952,7 @@ pub unsafe extern "C" fn veil_nickname_mine(
         unsafe { write_err(err_out, "null argument") };
         return VEIL_ERR_INVALID_ARG;
     }
-    if prior_seeds_len % 32 != 0 {
+    if !prior_seeds_len.is_multiple_of(32) {
         unsafe { write_err(err_out, "prior_seeds length must be a multiple of 32") };
         return VEIL_ERR_INVALID_ARG;
     }
@@ -4053,6 +4039,15 @@ pub unsafe extern "C" fn veil_nickname_verify(
     }
 }
 
+/// Free a callback buffer handed to a recv- or event-handler callback.
+/// `ptr` MUST be the base pointer the callback received — for recv that is the
+/// `src_node_id` pointer (layout `[node_id(32) | app_id(32) | data]`); for
+/// events it is the `payload` pointer. `len` MUST be the total buffer length.
+/// Safe to call on `ptr == NULL` (no-op).
+///
+/// The host must call this exactly once per callback invocation that received a
+/// non-NULL pointer, after copying the bytes it needs.
+///
 /// # Safety
 /// `ptr` MUST be NULL or the exact base pointer a recv/event callback received
 /// and has NOT already freed, and `len` MUST equal that buffer's total length.
@@ -4157,8 +4152,8 @@ pub unsafe extern "C" fn veil_mailbox_seal(
 /// sidecar (the anonymous mailbox deposit carries no usable wire sender) and,
 /// once crypto-verified, written to `out_sender` (32 bytes). On success returns
 /// [`VEIL_OK`], writes the verified destination app id to `out_app_id` (32 bytes)
-/// + endpoint id to `*out_endpoint_id`, and a heap-allocated data buffer to
-/// `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
+/// and the endpoint id to `*out_endpoint_id`. A heap-allocated data buffer is written
+/// to `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
 ///
 /// `blob` MUST point to ≥`blob_len`. `out_sender` / `out_app_id` MUST each point
 /// to ≥32 writable bytes; the other out-pointers MUST be writable.

@@ -40,7 +40,16 @@ pub(crate) const DOWNLINK_MSS_CLAMP: u32 = 1200;
 /// never a correctness problem (the option is absent on a few exotic
 /// targets and the kernel bounds the value), so the `Err` is swallowed.
 pub(crate) fn clamp_downlink_mss(stream: &TcpStream) {
-    let _ = SockRef::from(stream).set_tcp_mss(DOWNLINK_MSS_CLAMP);
+    #[cfg(unix)]
+    {
+        let _ = SockRef::from(stream).set_tcp_mss(DOWNLINK_MSS_CLAMP);
+    }
+    #[cfg(not(unix))]
+    {
+        // socket2 exposes TCP_MAXSEG only on Unix. Keep the call sites
+        // platform-neutral; Windows retains the kernel-selected MSS.
+        let _ = (stream, DOWNLINK_MSS_CLAMP);
+    }
 }
 
 /// Plain TCP `Transport` implementation. No encryption or framing — use a

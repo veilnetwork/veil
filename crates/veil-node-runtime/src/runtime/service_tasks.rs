@@ -50,6 +50,7 @@ const AUTH_DELIVER_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// node_id. Shared by the direct-onion (`Full`) and rendezvous (reassembled
 /// `Fragment`) paths. Every failure is logged and dropped — never surfaced to
 /// the anonymous sender (that would leak recipient liveness).
+#[allow(clippy::too_many_arguments)]
 async fn process_auth_deliver(
     auth: veil_proto::AuthAppDeliver,
     access: &super::NodeServices,
