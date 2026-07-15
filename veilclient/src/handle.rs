@@ -179,6 +179,27 @@ impl AppHandle {
             .await
     }
 
+    /// Send a loss-tolerant datagram through the non-onion Delivery relay path
+    /// at REALTIME priority, even if a direct session also exists.
+    pub async fn send_relay_realtime_owned(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_owned(
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME,
+                &data,
+            )
+            .await
+    }
+
     /// Send `data` as an AUTHENTICATED anonymous message over the
     /// onion/rendezvous transport. Unlike a plain send, the onion hides the
     /// sender's network location from every relay while the recipient
@@ -535,6 +556,27 @@ impl AppSender {
                 &dst_app_id,
                 dst_endpoint_id,
                 0,
+                &data,
+            )
+            .await
+    }
+
+    /// Send a loss-tolerant datagram through the non-onion Delivery relay path
+    /// at REALTIME priority, even if a direct session also exists.
+    pub async fn send_relay_realtime_owned(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.writer
+            .write_app_ipc_send_owned(
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME,
                 &data,
             )
             .await
