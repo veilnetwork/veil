@@ -50,7 +50,7 @@ use super::cursor::BoundedDecoder;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-pub const RELAY_KEY_MAGIC: [u8; 2] = [b'R', b'K'];
+pub const RELAY_KEY_MAGIC: [u8; 2] = *b"RK";
 pub const RELAY_KEY_V1: u8 = 1;
 pub const RELAY_KEY_SIG_CONTEXT: &[u8] = b"veil.relay_key.v1";
 

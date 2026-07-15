@@ -5423,7 +5423,7 @@ mod tests {
                  silent-server reorder in handshake.rs MUST keep server \
                  quiet until client sends a valid HELLO.",
                 bytes.len(),
-                &bytes,
+                bytes,
             );
             drop(probe);
         }
@@ -5446,7 +5446,7 @@ mod tests {
                 !bytes.windows(4).any(|w| w == b"OVL1"),
                 ".3 junk probe: server response contains `OVL1` \
                  magic prefix: {:02x?}",
-                &bytes,
+                bytes,
             );
             drop(probe);
         }
@@ -5470,7 +5470,7 @@ mod tests {
                 !bytes.windows(4).any(|w| w == b"OVL1"),
                 ".3 partial-OVL1 probe: server echoed `OVL1` magic \
                  in response to crafted-magic+junk: {:02x?}",
-                &bytes,
+                bytes,
             );
             drop(probe);
         }

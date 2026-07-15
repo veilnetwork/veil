@@ -76,7 +76,7 @@ use veil_util::bytes_to_hex;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-pub const PAIRING_INVITE_MAGIC: [u8; 2] = [b'P', b'I'];
+pub const PAIRING_INVITE_MAGIC: [u8; 2] = *b"PI";
 pub const PAIRING_INVITE_V1: u8 = 1;
 
 /// Domain-separated signing-message prefix. Always prepended to
