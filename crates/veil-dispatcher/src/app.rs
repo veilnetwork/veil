@@ -264,7 +264,7 @@ impl FrameDispatcher {
                     m.inc_rt_frames_rx();
                     m.check_and_count_rt_seq_gap(&payload.app_id, payload.endpoint_id, payload.seq);
                 }
-                self.app_registry.route_rt_data(payload);
+                self.app_registry.route_rt_data(*node_id.as_bytes(), payload);
                 DispatchResult::NoResponse
             }
         }

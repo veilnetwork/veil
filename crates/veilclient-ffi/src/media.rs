@@ -26,6 +26,32 @@ use std::sync::{LazyLock, Mutex};
 /// collision, separated only by this byte.
 pub const MEDIA_MAGIC: u8 = 0x4d; // 'M'
 
+/// First byte of a media cell containing several RTP/RTCP datagrams. Keeping a
+/// distinct top-level magic makes old receivers drop the unknown cell instead
+/// of passing a batch envelope to WebRTC as if it were RTP.
+pub const MEDIA_BATCH_MAGIC: u8 = 0x42; // 'B'
+
+/// Encode multiple datagrams behind [`MEDIA_BATCH_MAGIC`]. Layout:
+/// `[count u16][len u16][packet]...`. Returns `None` for an empty batch, an
+/// oversized packet/count, or when the encoded body exceeds `max_bytes`.
+pub fn encode_batch(packets: &[Vec<u8>], max_bytes: usize) -> Option<Vec<u8>> {
+    let count = u16::try_from(packets.len()).ok()?;
+    if count == 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(max_bytes.min(4096));
+    out.extend_from_slice(&count.to_be_bytes());
+    for packet in packets {
+        let len = u16::try_from(packet.len()).ok()?;
+        if out.len().checked_add(2 + packet.len())? > max_bytes {
+            return None;
+        }
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(packet);
+    }
+    Some(out)
+}
+
 /// C recv callback: `(ctx, ptr, len)`. Invoked from the circuit feed task once
 /// per inbound media datagram, with the magic byte already stripped. It must not
 /// block (it hands the packet straight to the media engine's RTP receiver).
@@ -85,6 +111,45 @@ pub fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
     }
 }
 
+/// Decode and deliver one batched media cell. The entire cell is dropped on
+/// malformed length/count data; partial delivery would make corruption depend
+/// on packet position and complicate loss accounting.
+pub fn dispatch_inbound_batch(peer: [u8; 32], body: &[u8]) {
+    if body.len() < 2 {
+        return;
+    }
+    let count = u16::from_be_bytes([body[0], body[1]]) as usize;
+    if count == 0 || count > 64 {
+        return;
+    }
+    let mut offset = 2usize;
+    let mut packets = Vec::with_capacity(count);
+    for _ in 0..count {
+        let Some(len_end) = offset.checked_add(2) else {
+            return;
+        };
+        if len_end > body.len() {
+            return;
+        }
+        let len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+        offset = len_end;
+        let Some(end) = offset.checked_add(len) else {
+            return;
+        };
+        if len == 0 || end > body.len() {
+            return;
+        }
+        packets.push(&body[offset..end]);
+        offset = end;
+    }
+    if offset != body.len() {
+        return;
+    }
+    for packet in packets {
+        dispatch_inbound(peer, packet);
+    }
+}
+
 /// Number of inbound media datagrams received from `peer` since process start.
 /// The all-zero peer is a diagnostic wildcard: it returns the GRAND TOTAL across
 /// every peer (useful when the sender's node id isn't yet known to the receiver).
@@ -103,6 +168,7 @@ mod tests {
 
     static RX_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RX_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     extern "C" fn record(_ctx: *mut c_void, _ptr: *const u8, len: usize) {
         RX_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -111,6 +177,7 @@ mod tests {
 
     #[test]
     fn dispatch_routes_by_peer_and_honors_clear() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let peer_a = [1u8; 32];
         let peer_b = [2u8; 32];
         RX_CALLS.store(0, Ordering::SeqCst);
@@ -135,5 +202,35 @@ mod tests {
         // A media cell's first byte must never be mistaken for a stream frame,
         // so the inbound demux can split the two by that byte alone.
         assert_ne!(MEDIA_MAGIC, veil_onion_stream::wire::PROTO_VER);
+        assert_ne!(MEDIA_BATCH_MAGIC, veil_onion_stream::wire::PROTO_VER);
+        assert_ne!(MEDIA_BATCH_MAGIC, MEDIA_MAGIC);
+    }
+
+    #[test]
+    fn batch_roundtrip_delivers_each_packet() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let peer = [3u8; 32];
+        RX_CALLS.store(0, Ordering::SeqCst);
+        RX_BYTES.store(0, Ordering::SeqCst);
+        set_recv_callback(peer, record, std::ptr::null_mut());
+        let packets = vec![vec![1u8; 120], vec![2u8; 130], vec![3u8; 140]];
+        let encoded = encode_batch(&packets, 1024).unwrap();
+        dispatch_inbound_batch(peer, &encoded);
+        clear_recv_callback(peer);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 3);
+        assert_eq!(RX_BYTES.load(Ordering::SeqCst), 390);
+    }
+
+    #[test]
+    fn malformed_batch_is_atomic_drop() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let peer = [4u8; 32];
+        RX_CALLS.store(0, Ordering::SeqCst);
+        set_recv_callback(peer, record, std::ptr::null_mut());
+        let mut encoded = encode_batch(&[vec![1u8; 10], vec![2u8; 10]], 128).unwrap();
+        encoded.pop();
+        dispatch_inbound_batch(peer, &encoded);
+        clear_recv_callback(peer);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 0);
     }
 }
