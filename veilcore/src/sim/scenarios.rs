@@ -18,6 +18,7 @@ mod tests {
     // endpoint on B, open A→B, exchange bytes BOTH ways, close. First end-to-end
     // coverage of the full IPC stream-forwarding chain (the remote-stream
     // mechanics are otherwise only unit-tested against a mocked broadcaster).
+    #[cfg(unix)]
     mod ipc_stream_e2e {
         use super::*;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
