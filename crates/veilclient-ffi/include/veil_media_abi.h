@@ -84,6 +84,13 @@ uint64_t veil_media_open_direct_channel(VeilApp *app,
 int veil_media_send_datagram(uint64_t chan, const uint8_t *ptr, size_t len);
 
 /*
+ * Request a make-before-break refresh of an anonymous channel's outbound
+ * rendezvous/circuit pool after the peer reports end-to-end media silence.
+ * Returns 0 when queued, 1 when already pending, -1 for invalid/direct.
+ */
+int veil_media_repair_channel(uint64_t chan);
+
+/*
  * Feed one already-authenticated direct-P2P media datagram from `peer_node_id`
  * into the native media receive callback registry. The host is responsible for
  * checking that the datagram arrived from the expected media app_id.
