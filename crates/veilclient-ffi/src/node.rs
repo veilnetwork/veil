@@ -552,10 +552,10 @@ pub unsafe extern "C" fn veil_node_stop(node: *mut VeilNode) {
         return;
     }
     let node = unsafe { Box::from_raw(node) };
-    if let Some(tx) = node.shutdown.lock().unwrap().take() {
+    if let Some(tx) = veil_util::lock!(node.shutdown).take() {
         let _ = tx.send(());
     }
-    if let Some(thread) = node.thread.lock().unwrap().take() {
+    if let Some(thread) = veil_util::lock!(node.thread).take() {
         let _ = thread.join();
     }
 }
