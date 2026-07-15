@@ -1,6 +1,6 @@
 [package]
 name = "veil-cfg"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Veil configuration types, file format, validators, and identity-config helpers. Phase 1 of veilcore extraction (see docs/en/PLAN_VEILCORE_EXTRACTION.md)."
 license = "AGPL-3.0-or-later"

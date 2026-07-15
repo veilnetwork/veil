@@ -4356,9 +4356,7 @@ mod reeval_teardown_tests {
     fn keepalive_only_wedge_reaps_via_genuine_stale() {
         assert!(should_reeval_teardown(
             TIMEOUT, // probe stale (one window)
-            TIMEOUT,
-            CEILING,
-            CEILING,
+            TIMEOUT, CEILING, CEILING,
             TIMEOUT, // genuine DATA stale — peer sends only keepalives
             false,
         ));

@@ -8695,8 +8695,7 @@ impl NodeServices {
         // introduce at the stream registration. Fall back to the freshest
         // ad's cookie only if no ad carries the expected chat cookie
         // (unexpected publisher — behave like the legacy selection).
-        let expected_cookie =
-            service_tasks::rendezvous_cookie_from_node_id(&receiver_node_id);
+        let expected_cookie = service_tasks::rendezvous_cookie_from_node_id(&receiver_node_id);
         let primary_cookie = if ads.iter().any(|a| a.auth_cookie == expected_cookie) {
             expected_cookie
         } else {

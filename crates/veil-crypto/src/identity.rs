@@ -417,7 +417,10 @@ mod tests {
         let p = 19876u64;
         let restart_a = derive_onion_reg_seed(&seed, p);
         let restart_b = derive_onion_reg_seed(&seed, p);
-        assert_eq!(*restart_a, *restart_b, "restart must re-derive the same key");
+        assert_eq!(
+            *restart_a, *restart_b,
+            "restart must re-derive the same key"
+        );
         let next = derive_onion_reg_seed(&seed, p + 1);
         assert_ne!(*restart_a, *next, "periods must not share a reg key");
         // Distinct identities (master vs decoy) never share a reg key.
@@ -440,8 +443,8 @@ mod tests {
         assert_eq!(a.public_key, b.public_key);
         assert_eq!(a.private_key, b.private_key);
         // And the keypair actually signs/verifies.
-        let sig = crate::sign_message(a.algo, &a.public_key, &a.private_key, b"probe")
-            .expect("sign");
+        let sig =
+            crate::sign_message(a.algo, &a.public_key, &a.private_key, b"probe").expect("sign");
         crate::verify_message(a.algo, &a.public_key, b"probe", &sig).expect("verify");
     }
 

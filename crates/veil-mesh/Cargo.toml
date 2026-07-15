@@ -1,6 +1,6 @@
 [package]
 name = "veil-mesh"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Veil network local-LAN mesh layer: realm-scoped UDP broadcast (Epic 406), beacon discovery, neighbor table, gateway-bridge for cross-realm traffic. Phase 4 extraction from veilcore."
 license = "AGPL-3.0-or-later"

@@ -1,6 +1,6 @@
 [package]
 name = "veil-udp-obfs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Stateless AEAD-per-datagram obfuscation for UDP plaintext transports. Phase 1a of PLAN_TRANSPORT_OBFUSCATION.md — hides OVL1 wire fingerprint from passive DPI, tolerates UDP loss/reorder/duplication via per-datagram self-contained framing."
 license = "AGPL-3.0-or-later"
