@@ -21,6 +21,18 @@ use super::ProtoError;
 /// Payloads larger than this are rejected at decode time.
 pub const MAX_ENVELOPE_PAYLOAD: usize = 1024 * 1024;
 
+/// Sender-side threshold above which an envelope is split into relay-
+/// preserving chunk envelopes even though it would still FIT in a single
+/// [`MAX_ENVELOPE_PAYLOAD`] frame. A session stream serializes each frame
+/// contiguously, so one near-1-MiB Forward occupies the wire for ~a second
+/// on a 5-10 Mbps relay/mobile uplink and everything queued behind it —
+/// including live call media — eats that as head-of-line delay. 64 KiB
+/// chunks match `MAX_CHUNK_PAYLOAD` and keep the worst-case occupancy in
+/// the tens of milliseconds. Receive-side validation is unchanged: the
+/// chunked path has been the production wire form for large payloads all
+/// along, this only lowers when the sender reaches for it.
+pub const ENVELOPE_CHUNKING_THRESHOLD: usize = 64 * 1024;
+
 /// Maximum TTL a peer may claim for a `DeliveryEnvelope` (7 days in seconds).
 ///
 /// Clamped on decode so that a peer cannot keep messages in relays/mailboxes
