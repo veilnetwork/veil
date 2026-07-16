@@ -2296,6 +2296,16 @@ class AppHandle implements Finalizable {
         appAddr, dstNodeId, dstAppId, dstEndpointId));
   }
 
+  /// Enable/disable audio+RTCP batching on a RELAY media channel opened by
+  /// [openRelayMediaChannel]. Turn on ONLY after call signaling proves the
+  /// peer's protocol version decodes MEDIA_BATCH_MAGIC cells — a batched
+  /// cell is silent noise to an older build. Returns 0 on success, -1 for
+  /// an unknown or non-relay channel.
+  int setRelayMediaBatching(int chan, bool on) {
+    _ensureOpen();
+    return ffi.veilMediaChannelSetBatching(chan, on ? 1 : 0);
+  }
+
   /// Install the native direct-media receive pump on this endpoint. Incoming
   /// RTP/RTCP is source-app verified and dispatched native-to-native, avoiding
   /// a copy and scheduling hop through the Dart UI isolate for every packet.
