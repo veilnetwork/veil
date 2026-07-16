@@ -64,14 +64,18 @@ VeilTransportShim::~VeilTransportShim() { Stop(); }
 void VeilTransportShim::Start() {
   bool expected = false;
   if (!started_.compare_exchange_strong(expected, true)) return;
-  veil_media_set_recv_callback(veil_chan_, &VeilTransportShim::OnVeilDatagram,
-                               this);
+  const int rc = veil_media_set_recv_callback(
+      veil_chan_, &VeilTransportShim::OnVeilDatagram, this);
+  // A failed registration is a silently dead inbound leg — surface it.
+  slog("shim Start chan=%llu recv_cb rc=%d", (unsigned long long)veil_chan_,
+       rc);
 }
 
 void VeilTransportShim::Stop() {
   bool expected = true;
   if (!started_.compare_exchange_strong(expected, false)) return;
   veil_media_set_recv_callback(veil_chan_, nullptr, nullptr);
+  slog("shim Stop chan=%llu recv_cb cleared", (unsigned long long)veil_chan_);
   for (int i = 0; i < 200; ++i) {
     if (inbound_pending_packets_.load(std::memory_order_acquire) == 0) return;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -149,6 +153,10 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
     return;
   }
   std::vector<uint8_t> owned(ptr, ptr + len);
+  if (self->inbound_packet_count_.load(std::memory_order_relaxed) == 0) {
+    slog("shim first inbound chan=%llu len=%zu",
+         (unsigned long long)self->veil_chan_, len);
+  }
   self->inbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
   self->inbound_byte_count_.fetch_add(len, std::memory_order_relaxed);
   self->inbound_pending_packets_.fetch_add(1, std::memory_order_release);
