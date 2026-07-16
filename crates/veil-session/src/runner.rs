@@ -554,19 +554,28 @@ pub const WRITE_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::fro
 // well below the cover-traffic / keepalive scheduling granularity.
 pub const PQ_DRAIN_FRAMES_PER_PASS: usize = 256;
 
+/// Byte cap for one encrypted outbound batch (one contiguous wire blob).
+/// The priority queue can only interleave BETWEEN blobs, so blob size is
+/// the REALTIME preemption granularity: 64 KiB ≈ 50-100 ms of serialization
+/// on a 5-10 Mbps relay/mobile uplink, versus seconds for the previous
+/// unbounded 256-frame batch. Individual frames are never split — a frame
+/// larger than the cap simply forms a blob of its own.
+pub const ENCRYPTED_BATCH_BYTES_CAP: usize = 64 * 1024;
+
 /// bounded capacity of the `wire_tx`/`wire_rx` channel that
 /// connects the runner's main loop (read + dispatch) to the dedicated
-/// writer task. Sized to absorb a moderate burst from a chat-node-style
-/// fan-out (8 peers × 2 in-flight frames per peer = 16, ×16 for safety
-/// margin = 256) while bounding worst-case memory at peer ≤
-/// `256 × max_frame_body` ≈ 4 GB only if we pessimistically assume every
-/// queued frame is at the 16 MB max. In practice typical wire frames
-/// are 60-300 B (control) to 64 KB (chat data), so steady-state memory
-/// is well under 16 MB. When full, `try_send` returns Err — main loop
-/// drops the frame with metric `inc_session_wire_dropped`; the writer
-/// catches up and the queue refills. Critical: this NEVER blocks the
-/// main loop, so reads always make progress.
-pub const WIRE_CHANNEL_CAPACITY: usize = 256;
+/// writer task. With batches capped at [`ENCRYPTED_BATCH_BYTES_CAP`] this
+/// bounds the post-priority-queue pipeline (where REALTIME can no longer
+/// overtake) to ≈ 8 × 64 KiB = 512 KiB — tens of milliseconds on a fast
+/// link and the kernel socket buffer still smooths the writer. The old
+/// 256-blob depth existed for 2 Gbps ogate bursts, but queued megabytes
+/// of committed-order bytes ahead of live call media; the priority queue
+/// (which this channel drains from) is the right place for that backlog
+/// to wait instead. When full, `try_send` returns Err — main loop drops
+/// the frame with metric `inc_session_wire_dropped`; the writer catches
+/// up and the queue refills. Critical: this NEVER blocks the main loop,
+/// so reads always make progress.
+pub const WIRE_CHANNEL_CAPACITY: usize = 8;
 
 /// writer task — owns the `WriteHalf<BoxIoStream>` and
 /// drains pre-encrypted/pre-coalesced wire bytes pushed onto it from
@@ -3239,6 +3248,16 @@ impl SessionRunner {
                 let mut encrypted_batch_wire_len = 0usize;
                 while !coalesce_active
                     && drained_this_pass < drain_cap
+                    // Real-time latency bound: one encrypted batch becomes one
+                    // contiguous wire blob, and a frame queued after it waits
+                    // for the WHOLE blob to serialize onto the socket. Without
+                    // a byte cap a 256-frame pass could weld megabytes into a
+                    // single blob and a REALTIME frame arriving a moment later
+                    // ate seconds of head-of-line delay (device-measured call
+                    // RTT spikes). Frames stay whole — the cap only decides
+                    // where one blob ends and the next begins, so the priority
+                    // queue can interleave between them.
+                    && encrypted_batch_wire_len < ENCRYPTED_BATCH_BYTES_CAP
                     // Do not pop a frame unless the dedicated writer can accept
                     // it. Previously a full (but healthy) channel was treated as
                     // a write failure below and tore down the whole obfs4/TCP
