@@ -216,6 +216,22 @@ pub fn dispatch_inbound_batch(peer: [u8; 32], body: &[u8]) {
     }
 }
 
+/// Route one inbound media payload by its leading byte: a
+/// [`MEDIA_BATCH_MAGIC`]-prefixed cell fans out to its packets, anything
+/// else is a single raw RTP/RTCP datagram (raw RTP/RTCP starts 0x80..0xBF,
+/// so the 0x42 magic can never be confused with a real packet). This is the
+/// RELAY/DIRECT ingress twin of the onion feed's magic peel — the relay
+/// sender now amortizes its ~24× per-packet envelope+padding overhead by
+/// batching small audio/RTCP datagrams into one envelope, and this is where
+/// the batch unfolds on the receiving endpoint.
+pub fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
+    if payload.first() == Some(&MEDIA_BATCH_MAGIC) {
+        dispatch_inbound_batch(peer, &payload[1..]);
+    } else {
+        dispatch_inbound(peer, payload);
+    }
+}
+
 /// Number of inbound media datagrams received from `peer` since process start.
 /// The all-zero peer is a diagnostic wildcard: it returns the GRAND TOTAL across
 /// every peer (useful when the sender's node id isn't yet known to the receiver).
