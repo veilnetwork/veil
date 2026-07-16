@@ -35,6 +35,7 @@ pub mod rekey_context;
 pub mod rekey_rx_grace_buffer;
 pub mod rendezvous;
 pub mod rotation_deadline;
+pub mod rt_trace;
 pub mod runner;
 pub mod session_alias_guard;
 pub mod ticket;
