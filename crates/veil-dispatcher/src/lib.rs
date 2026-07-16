@@ -3393,6 +3393,7 @@ mod tests {
             envelope: delivery.clone(),
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -3472,6 +3473,7 @@ mod tests {
             envelope: delivery,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4275,6 +4277,7 @@ mod tests {
             envelope: delivery,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4340,6 +4343,7 @@ mod tests {
             envelope: delivery,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4411,6 +4415,7 @@ mod tests {
                 envelope: delivery.clone(),
                 relay_hops: 0,
                 delivery_attempt: Some(attempt),
+                traffic_class: None,
             }
             .encode()
         };
@@ -4474,6 +4479,7 @@ mod tests {
             envelope: delivery,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4542,6 +4548,7 @@ mod tests {
             envelope: delivery,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4603,6 +4610,7 @@ mod tests {
             envelope: delivery.clone(),
             relay_hops: MAX_RELAY_HOPS,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -4622,6 +4630,7 @@ mod tests {
             envelope: delivery,
             relay_hops: MAX_RELAY_HOPS - 1,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_ok_bytes = fwd_ok.encode();
         let result_ok = disp_b.dispatch(&fwd_hdr, &fwd_ok_bytes, a_id);
@@ -4787,6 +4796,7 @@ mod tests {
             envelope: delivery,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
@@ -6685,6 +6695,7 @@ mod tests {
             envelope: delivery,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -6764,6 +6775,7 @@ mod tests {
             envelope: delivery,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd_bytes = fwd.encode();
         let fwd_hdr = FrameHeader::new(
@@ -6813,6 +6825,7 @@ mod tests {
             envelope: delivery2,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let fwd2_bytes = fwd2.encode();
         disp_b.dispatch(&fwd_hdr, &fwd2_bytes, a_id);
