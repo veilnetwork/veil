@@ -1790,6 +1790,12 @@ final int Function(int) veilMediaRepairChannel = nativeLib
     .lookup<NativeFunction<Int32 Function(Uint64)>>('veil_media_repair_channel')
     .asFunction();
 
+// debug_set_rt_trace(on) — toggle the embedded node's slow-inbound-dispatch
+// trace (session.rt_trace.slow_dispatch node-log lines); debug-hook driven.
+final void Function(int) veilDebugSetRtTrace = nativeLib
+    .lookup<NativeFunction<Void Function(Int32)>>('veil_debug_set_rt_trace')
+    .asFunction();
+
 // dispatch_direct(peer_node32*, ptr, len) -> 0 delivered/accepted, -1 invalid.
 final int Function(Pointer<Uint8>, Pointer<Uint8>, int)
     veilMediaDispatchDirectDatagram = nativeLib
