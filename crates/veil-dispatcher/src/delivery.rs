@@ -4,7 +4,7 @@ use veil_proto::{
     codec::encode_header,
     delivery::{DeliveryEnvelope, ForwardPayload},
     family::{DeliveryMsg, FrameFamily},
-    header::{FrameHeader, TrafficClass},
+    header::FrameHeader,
 };
 use veil_types::NodeIdBytes;
 use veil_util::{lock, rlock, wlock};
@@ -29,15 +29,23 @@ pub fn rand_seed_for_pick(trace_id: u64) -> u64 {
 }
 
 /// Encode the Forward trailer shared by direct-sovereign, route-cache and
-/// gateway forwarding. Keeping the optional delivery-attempt extension here
-/// prevents a fallback path from silently downgrading relay-safe retries.
+/// gateway forwarding. Keeping the optional delivery-attempt and traffic-
+/// class extensions here prevents a fallback path from silently downgrading
+/// relay-safe retries or a downstream hop's queueing class.
 fn forward_suffix(payload: &ForwardPayload, relay_hops_out: u8) -> Vec<u8> {
-    let mut suffix = Vec::with_capacity(9 + usize::from(payload.delivery_attempt.is_some()) * 2);
+    let mut suffix = Vec::with_capacity(
+        9 + usize::from(payload.delivery_attempt.is_some()) * 2
+            + usize::from(payload.traffic_class.is_some()) * 2,
+    );
     suffix.extend_from_slice(&payload.envelope.trace_id.to_be_bytes());
     suffix.push(relay_hops_out);
     if let Some(attempt) = payload.delivery_attempt {
         suffix.push(veil_proto::delivery::FORWARD_DELIVERY_ATTEMPT_MARKER);
         suffix.push(attempt);
+    }
+    if let Some(tc) = payload.traffic_class {
+        suffix.push(veil_proto::delivery::FORWARD_TRAFFIC_CLASS_MARKER);
+        suffix.push(tc);
     }
     suffix
 }
@@ -804,6 +812,7 @@ impl FrameDispatcher {
         peer_id: NodeId,
         fwd_dst: NodeIdBytes,
         relay_hops_out: u8,
+        traffic_class: u8,
     ) -> bool {
         let (Some(gl), Some(reg)) = (&self.gateway_list, &self.session_tx_registry) else {
             return false;
@@ -846,7 +855,7 @@ impl FrameDispatcher {
         frame.extend_from_slice(&gw);
         frame.extend_from_slice(&envelope_bytes);
         frame.extend_from_slice(&gw_suffix);
-        rlock!(reg).send_to(&gw, TrafficClass::Interactive as u8, frame)
+        rlock!(reg).send_to(&gw, traffic_class, frame)
     }
 
     /// DHT recursive-relay fallback: when neither route_cache nor a gateway
@@ -990,9 +999,13 @@ impl FrameDispatcher {
             // ── Acquire reg_guard only for the send window ────────────────────
             let reg_guard = rlock!(reg);
 
-            // Try direct session to recipient.
+            // Try direct session to recipient. Preserve the frame's own
+            // traffic class: a REALTIME media forward demoted to Interactive
+            // here queues behind bulk delivery chatter on a busy relay and
+            // arrives seconds late (device-measured RTT spikes with flat
+            // network pings on both physical legs).
             let fwd_frame = make_fwd_frame(dst);
-            if reg_guard.send_to(&dst, TrafficClass::Interactive as u8, fwd_frame) {
+            if reg_guard.send_to(&dst, traffic_class, fwd_frame) {
                 return DispatchResult::NoResponse;
             }
 
@@ -1054,7 +1067,7 @@ impl FrameDispatcher {
                 let mut any_sent = false;
                 for &hop in candidates.iter().take(ecmp_group_len) {
                     let fwd_frame = make_fwd_frame(hop);
-                    match reg_guard.send_to(&hop, TrafficClass::Interactive as u8, fwd_frame) {
+                    match reg_guard.send_to(&hop, traffic_class, fwd_frame) {
                         true => {
                             any_sent = true;
                         }
@@ -1153,7 +1166,8 @@ impl FrameDispatcher {
         // Gateway that has internet access. This handles the case where the
         // destination is a global-veil node that is not in the local route
         // cache but reachable through any connected gateway.
-        if self.try_forward_via_gateway(&payload, peer_id, fwd_dst, relay_hops_out) {
+        if self.try_forward_via_gateway(&payload, peer_id, fwd_dst, relay_hops_out, traffic_class)
+        {
             return DispatchResult::NoResponse;
         }
 
@@ -1271,7 +1285,14 @@ impl FrameDispatcher {
             return DispatchResult::NoResponse;
         }
 
-        self.relay_forward(payload, peer_id, header.priority())
+        // Queueing class comes from the payload's explicit traffic-class
+        // marker (size-capped for REALTIME), NOT from the frame header's
+        // 2-bit priority field: legacy senders never stamp that field, so it
+        // reads 0 (= REALTIME) for every frame and would let bulk delivery
+        // chatter ride — and starve — the media lane.
+        let _ = header;
+        let traffic_class = payload.relay_traffic_class();
+        self.relay_forward(payload, peer_id, traffic_class)
     }
 
     /// Peek the envelope's fixed-offset `created_at`+`ttl_secs` without
@@ -2145,6 +2166,7 @@ mod tests {
             envelope,
             relay_hops: 0,
             delivery_attempt: Some(1),
+            traffic_class: None,
         };
         let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
         let peer = NodeId::from(peer);
@@ -2183,6 +2205,89 @@ mod tests {
             dispatcher.check_relay_preconditions(&forward, peer),
             Err(DispatchResult::Violation(_))
         ));
+    }
+
+    /// A relayed Forward carrying the REALTIME traffic-class marker must be
+    /// re-queued toward the recipient's direct session at REALTIME priority
+    /// (not the old hardcoded Interactive that let call media queue for
+    /// seconds behind bulk delivery chatter on a busy hop), and the re-encoded
+    /// frame must still carry the marker for any further hops. An unmarked
+    /// legacy Forward rides INTERACTIVE — the frame header's unset priority
+    /// bits (0 = REALTIME) must NOT be trusted.
+    #[test]
+    fn relay_preserves_realtime_traffic_class_and_marker() {
+        use crate::DispatchResult;
+        use crate::make_test_dispatcher;
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::FrameHeader;
+        use veil_session::SessionTxRegistry;
+
+        let sender_peer = [0xB1u8; 32];
+        let dst = [0xC1u8; 32];
+
+        let mut disp = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        disp.local_node_id = [0xDDu8; 32]; // we are an intermediate relay
+        let tx = std::sync::Arc::new(std::sync::RwLock::new(SessionTxRegistry::new()));
+        disp.session_tx_registry = Some(std::sync::Arc::clone(&tx));
+        // Live direct session to the recipient — the exact path that used to
+        // hardcode Interactive.
+        let mut frame_rx = tx.write().unwrap().register(dst);
+
+        let mk_frame = |content: u8, tc: Option<u8>| {
+            let envelope = DeliveryEnvelope {
+                recipient: veil_proto::recipient::Recipient::any(dst),
+                sender_node_id: sender_peer,
+                src_app_id: [0xA1u8; 32],
+                app_id: [0xA2u8; 32],
+                endpoint_id: 7,
+                content_id: [content; 32],
+                created_at: veil_util::unix_secs_now_u64(),
+                ttl_secs: 30,
+                payload: vec![0x01; 64],
+                trace_id: 0,
+                require_ack: false,
+            };
+            let fwd = ForwardPayload {
+                next_hop_node_id: dst,
+                envelope,
+                relay_hops: 0,
+                delivery_attempt: None,
+                traffic_class: tc,
+            };
+            let body = fwd.encode();
+            let mut hdr =
+                FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            hdr.body_len = body.len() as u32;
+            (hdr, body)
+        };
+
+        // Marked REALTIME → REALTIME queue class + marker preserved on wire.
+        let (hdr, body) = mk_frame(0x51, Some(veil_proto::header::priority::REALTIME));
+        let r = disp.dispatch(&hdr, &body, sender_peer);
+        assert!(matches!(r, DispatchResult::NoResponse), "got {r:?}");
+        let (priority, bytes) = frame_rx.try_recv().expect("relayed frame expected");
+        assert_eq!(priority, veil_proto::header::priority::REALTIME);
+        let relayed =
+            ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
+        assert_eq!(
+            relayed.traffic_class,
+            Some(veil_proto::header::priority::REALTIME),
+            "marker must survive the re-encode for further hops",
+        );
+
+        // Unmarked legacy frame → INTERACTIVE, even though the frame header's
+        // priority bits read 0 (= REALTIME) on every legacy sender.
+        let (hdr, body) = mk_frame(0x52, None);
+        assert!(matches!(
+            disp.dispatch(&hdr, &body, sender_peer),
+            DispatchResult::NoResponse
+        ));
+        let (priority, bytes) = frame_rx.try_recv().expect("relayed frame expected");
+        assert_eq!(priority, veil_proto::header::priority::INTERACTIVE);
+        let relayed =
+            ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
+        assert_eq!(relayed.traffic_class, None);
     }
 
     /// Terminal DELIVERY_FORWARD replay guard: two identical terminal Forward
@@ -2232,6 +2337,7 @@ mod tests {
             envelope,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let body = fwd.encode();
         let mut hdr = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
@@ -2375,6 +2481,7 @@ mod tests {
                 envelope,
                 relay_hops: 0,
                 delivery_attempt: None,
+                traffic_class: None,
             }
             .encode();
             let mut hdr =
@@ -2512,6 +2619,7 @@ mod tests {
             envelope,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let rr = RecursiveRelayPayload {
             dst_node_id: local_id,
@@ -2573,6 +2681,7 @@ mod tests {
             envelope,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let rr = RecursiveRelayPayload {
             dst_node_id: dst,
@@ -2813,6 +2922,7 @@ mod tests {
             envelope,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
 
         // Fire the fast-path directly.
@@ -2866,6 +2976,7 @@ mod tests {
             envelope,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         assert!(!disp.try_sovereign_direct_forward(
             &fwd,
@@ -2949,6 +3060,7 @@ mod tests {
             envelope,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         assert!(!disp.try_sovereign_direct_forward(
             &fwd,

@@ -839,7 +839,13 @@ pub(crate) async fn handle_ipc_send(
                 // transit_relay capability; the IPC originator uses ForwardPayload for now.
                 let make_fwd_frame = |next_hop: [u8; 32]| -> Vec<u8> {
                     let attempt_suffix_len = if send.require_ack { 2 } else { 0 };
-                    let body_len = 32 + env_bytes.len() + 8 + 1 + attempt_suffix_len;
+                    // Real-time media stamps its class so every relay on the
+                    // path re-queues it in the REALTIME lane instead of
+                    // behind bulk delivery chatter (legacy relays ignore the
+                    // optional tail and forward unchanged).
+                    let class_suffix_len = if relay_realtime { 2 } else { 0 };
+                    let body_len =
+                        32 + env_bytes.len() + 8 + 1 + attempt_suffix_len + class_suffix_len;
                     let mut hdr = FrameHeader::new(
                         veil_proto::family::FrameFamily::Delivery as u8,
                         DeliveryMsg::Forward as u16,
@@ -853,6 +859,10 @@ pub(crate) async fn handle_ipc_send(
                     if send.require_ack {
                         frame.push(veil_proto::delivery::FORWARD_DELIVERY_ATTEMPT_MARKER);
                         frame.push(1); // initial delivery attempt
+                    }
+                    if relay_realtime {
+                        frame.push(veil_proto::delivery::FORWARD_TRAFFIC_CLASS_MARKER);
+                        frame.push(veil_proto::header::priority::REALTIME);
                     }
                     frame
                 };
