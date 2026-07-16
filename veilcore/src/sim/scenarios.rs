@@ -18,6 +18,7 @@ mod tests {
     // endpoint on B, open A→B, exchange bytes BOTH ways, close. First end-to-end
     // coverage of the full IPC stream-forwarding chain (the remote-stream
     // mechanics are otherwise only unit-tested against a mocked broadcaster).
+    #[cfg(unix)]
     mod ipc_stream_e2e {
         use super::*;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -5423,7 +5424,7 @@ mod tests {
                  silent-server reorder in handshake.rs MUST keep server \
                  quiet until client sends a valid HELLO.",
                 bytes.len(),
-                &bytes,
+                bytes,
             );
             drop(probe);
         }
@@ -5446,7 +5447,7 @@ mod tests {
                 !bytes.windows(4).any(|w| w == b"OVL1"),
                 ".3 junk probe: server response contains `OVL1` \
                  magic prefix: {:02x?}",
-                &bytes,
+                bytes,
             );
             drop(probe);
         }
@@ -5470,7 +5471,7 @@ mod tests {
                 !bytes.windows(4).any(|w| w == b"OVL1"),
                 ".3 partial-OVL1 probe: server echoed `OVL1` magic \
                  in response to crafted-magic+junk: {:02x?}",
-                &bytes,
+                bytes,
             );
             drop(probe);
         }
@@ -6054,7 +6055,17 @@ mod tests {
         net.node(0)
             .runtime
             .access()
-            .send_via_rendezvous_authenticated(&ad, app_id, endpoint_id, payload, 2, None, 1, false)
+            .send_via_rendezvous_authenticated(
+                &ad,
+                &[],
+                app_id,
+                endpoint_id,
+                payload,
+                2,
+                None,
+                1,
+                false,
+            )
             .expect("send_via_rendezvous_authenticated must succeed");
 
         // The receiver's app should get the payload with the VERIFIED sender
@@ -6241,6 +6252,7 @@ mod tests {
                 .access()
                 .send_via_rendezvous_authenticated(
                     &ad,
+                    &[],
                     app_b,
                     ep_b,
                     out.as_bytes(),

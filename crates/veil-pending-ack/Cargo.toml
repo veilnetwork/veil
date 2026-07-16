@@ -1,6 +1,6 @@
 [package]
 name = "veil-pending-ack"
-version = "0.2.0"
+version = "0.3.1"
 edition = "2024"
 description = "At-least-once delivery tracker for Veil (Epic 178): registers in-flight envelopes that require an end-to-end DELIVERY_STATUS ACK, drives retransmits per MAX_DELIVERY_ATTEMPTS, and reports terminal Failed outcomes back to the originating IPC client."
 license = "AGPL-3.0-or-later"

@@ -161,9 +161,8 @@ pub unsafe extern "C" fn veil_config_init_from_phrase_zeroize(
     // Copy into an owned zeroizing buffer, then scrub the caller's bytes
     // immediately — the plaintext window collapses to this call regardless
     // of which error path is taken below.
-    let owned = zeroize::Zeroizing::new(
-        unsafe { std::slice::from_raw_parts(phrase, phrase_len) }.to_vec(),
-    );
+    let owned =
+        zeroize::Zeroizing::new(unsafe { std::slice::from_raw_parts(phrase, phrase_len) }.to_vec());
     unsafe { std::ptr::write_bytes(phrase, 0, phrase_len) };
     let phrase_str = match std::str::from_utf8(&owned) {
         Ok(s) => s,
@@ -188,14 +187,13 @@ pub unsafe extern "C" fn veil_config_init_from_phrase_zeroize(
             ..IdentityPowParams::default()
         }
     };
-    let identity =
-        match IdentityUseCases::new(pow).provision_ed25519_from_secret(&sk_seed, None) {
-            Ok(id) => id,
-            Err(e) => {
-                unsafe { set_err(err_out, &format!("identity provisioning failed: {e}")) };
-                return std::ptr::null_mut();
-            }
-        };
+    let identity = match IdentityUseCases::new(pow).provision_ed25519_from_secret(&sk_seed, None) {
+        Ok(id) => id,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("identity provisioning failed: {e}")) };
+            return std::ptr::null_mut();
+        }
+    };
     let config = veil_cfg::Config {
         identity: Some(identity),
         ..veil_cfg::Config::default()
@@ -705,10 +703,10 @@ pub unsafe extern "C" fn veil_node_stop(node: *mut VeilNode) {
         return;
     }
     let node = unsafe { Box::from_raw(node) };
-    if let Some(tx) = node.shutdown.lock().unwrap().take() {
+    if let Some(tx) = veil_util::lock!(node.shutdown).take() {
         let _ = tx.send(true);
     }
-    if let Some(thread) = node.thread.lock().unwrap().take() {
+    if let Some(thread) = veil_util::lock!(node.thread).take() {
         let _ = thread.join();
     }
 }

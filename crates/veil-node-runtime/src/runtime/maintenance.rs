@@ -921,8 +921,7 @@ impl NodeRuntime {
                 .filter(|(_, e)| e.ephemeral_ad_identity.is_none())
                 .map(|(idx, e)| slot_fresh_stamp(idx, e))
                 .collect();
-            stamps.iter().all(|s| s.is_some())
-                && stamps.windows(2).all(|w| w[0] == w[1])
+            stamps.iter().all(|s| s.is_some()) && stamps.windows(2).all(|w| w[0] == w[1])
         };
         let mut published = 0usize;
         for (idx, entry) in snapshot.iter().take(n_slots).enumerate() {

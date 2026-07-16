@@ -63,7 +63,9 @@
 #![cfg(unix)]
 
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_void};
+#[cfg(feature = "node-embedded")]
+use std::os::raw::c_void;
+use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use zeroize::Zeroizing;
@@ -90,6 +92,7 @@ mod identity_sign;
 // NodeServices; the pure nickname helpers in lib.rs stay feature-free).
 #[cfg(feature = "node-embedded")]
 mod nickname_net;
+#[cfg(feature = "node-embedded")]
 mod node;
 
 use libc::{size_t, ssize_t};
@@ -350,6 +353,7 @@ fn stream_table() -> &'static StdMutex<HandleTable<VeilStreamFfi>> {
     T.get_or_init(|| StdMutex::new(HandleTable::new()))
 }
 
+#[cfg(feature = "node-embedded")]
 fn anon_stream_table() -> &'static StdMutex<HandleTable<VeilAnonStreamFfi>> {
     static T: OnceLock<StdMutex<HandleTable<VeilAnonStreamFfi>>> = OnceLock::new();
     T.get_or_init(|| StdMutex::new(HandleTable::new()))
@@ -410,6 +414,7 @@ pub struct VeilHandle {
     /// Node-wide anonymous-stream multiplexer, built lazily on the first
     /// `veil_anon_stream_open`/`veil_anon_stream_accept` (binds a dedicated
     /// onion-stream endpoint + spawns the demux).
+    #[cfg(feature = "node-embedded")]
     anon_hub: TokioMutex<Option<Arc<anon_stream::AnonStreamHub>>>,
 }
 
@@ -467,6 +472,7 @@ pub struct VeilStreamFfi {
 /// controlled — see [`anon_stream`]). Split read/write halves so a caller can
 /// read + write concurrently without one mutex deadlocking a blocking read
 /// against a write.
+#[cfg(feature = "node-embedded")]
 pub struct VeilAnonStreamFfi {
     bundle: Arc<RuntimeBundle>,
     abort: veil_onion_stream::OnionAbort,
@@ -476,6 +482,7 @@ pub struct VeilAnonStreamFfi {
 
 /// Get-or-lazily-build this node's anonymous-stream hub (binds the dedicated
 /// onion-stream endpoint once, on first use).
+#[cfg(feature = "node-embedded")]
 fn ensure_anon_hub(
     bundle: &Arc<RuntimeBundle>,
     slot: &TokioMutex<Option<Arc<anon_stream::AnonStreamHub>>>,
@@ -515,6 +522,7 @@ fn ensure_anon_hub(
 /// "onion-stream")` — the Dart caller derives it, mirroring `veil_stream_open`).
 /// Returns NULL on error.
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_open(
     handle: *mut VeilHandle,
     dst_node_id: *const u8,
@@ -570,6 +578,7 @@ pub unsafe extern "C" fn veil_anon_stream_open(
 /// error. On success writes the initiator's 32-byte node id + onion-stream app
 /// id into the out params (caller-allocated, 32 B each).
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_accept(
     handle: *mut VeilHandle,
     timeout_ms: u64,
@@ -632,6 +641,7 @@ pub unsafe extern "C" fn veil_anon_stream_accept(
 /// window. Idempotent; cheap when the pool is already up. Returns 0 on
 /// dispatch, -1 on error (NULL args / dead handle / hub bind failure).
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_warm_peer(
     handle: *mut VeilHandle,
     dst_node_id: *const u8,
@@ -1510,6 +1520,7 @@ pub unsafe extern "C" fn veil_media_recv_count(peer_node_id: *const u8) -> u64 {
 /// Read up to `cap` bytes. Returns the count (0 = clean EOF), or a negative
 /// error code (the stream was reset → the app should resume).
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_read(
     stream: *mut VeilAnonStreamFfi,
     buf: *mut u8,
@@ -1559,6 +1570,7 @@ pub unsafe extern "C" fn veil_anon_stream_read(
 
 /// Queue `len` bytes for reliable delivery. Returns `VEIL_OK` / a negative code.
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_write(
     stream: *mut VeilAnonStreamFfi,
     data: *const u8,
@@ -1609,6 +1621,7 @@ pub unsafe extern "C" fn veil_anon_stream_write(
 /// Half-close the send direction (a FIN follows the last queued byte). The peer
 /// reads EOF. Returns `VEIL_OK` / a negative code.
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_finish(
     stream: *mut VeilAnonStreamFfi,
     err_out: *mut *mut c_char,
@@ -1645,6 +1658,7 @@ pub unsafe extern "C" fn veil_anon_stream_finish(
 /// resource-release path: dropping the write half closes the command channel, so
 /// the driver finishes the send direction rather than resetting normal EOF.
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_close(stream: *mut VeilAnonStreamFfi) {
     if stream.is_null() {
         return;
@@ -1658,6 +1672,7 @@ pub unsafe extern "C" fn veil_anon_stream_close(stream: *mut VeilAnonStreamFfi) 
 /// wake that already-cloned Arc. First signal the local read half, then send a
 /// best-effort RST through the driver so the peer/route settle too.
 #[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
 pub unsafe extern "C" fn veil_anon_stream_abort(stream: *mut VeilAnonStreamFfi) {
     if stream.is_null() {
         return;
@@ -1867,6 +1882,7 @@ pub unsafe extern "C" fn veil_connect(
         VeilHandle {
             bundle,
             event_task: StdMutex::new(None),
+            #[cfg(feature = "node-embedded")]
             anon_hub: TokioMutex::new(None),
         },
     ) as *mut VeilHandle
@@ -4616,20 +4632,6 @@ pub unsafe extern "C" fn veil_free_replica_buf(ptr: *mut u8, len: size_t) {
     }
 }
 
-/// Free a callback buffer handed to a recv- or event-handler callback
-/// (cycle-7 H6).  `ptr` MUST be the base pointer the callback received — for
-/// recv that is the `src_node_id` pointer (the buffer is laid out
-/// `[node_id(32) | app_id(32) | data]`); for events it is the `payload`
-/// pointer — and `len` MUST be the buffer's total length (recv: `64 + data_len`;
-/// events: `payload_len`).  Safe to call on `ptr == NULL` (no-op).
-///
-/// The callback contract is callee-owns-the-buffer: the host MUST call this
-/// exactly once per callback invocation that received a non-NULL pointer, after
-/// it has finished copying the bytes it needs. This lets the host retain the
-/// pointer past the synchronous call (e.g. Dart `NativeCallable.listener`,
-/// which marshals to the isolate and reads the bytes later) without a
-/// use-after-free.
-///
 // ── Nicknames ───────────────────────────────────────────────────────────────
 // Human-readable names over veil (see veil-crypto::nickname). The host mines
 // PoW seeds OFF the UI isolate (a bounded, chunked, cancellable loop), then
@@ -4723,7 +4725,7 @@ pub unsafe extern "C" fn veil_nickname_mine(
         unsafe { write_err(err_out, "null argument") };
         return VEIL_ERR_INVALID_ARG;
     }
-    if prior_seeds_len % 32 != 0 {
+    if !prior_seeds_len.is_multiple_of(32) {
         unsafe { write_err(err_out, "prior_seeds length must be a multiple of 32") };
         return VEIL_ERR_INVALID_ARG;
     }
@@ -4810,6 +4812,15 @@ pub unsafe extern "C" fn veil_nickname_verify(
     }
 }
 
+/// Free a callback buffer handed to a recv- or event-handler callback.
+/// `ptr` MUST be the base pointer the callback received — for recv that is the
+/// `src_node_id` pointer (layout `[node_id(32) | app_id(32) | data]`); for
+/// events it is the `payload` pointer. `len` MUST be the total buffer length.
+/// Safe to call on `ptr == NULL` (no-op).
+///
+/// The host must call this exactly once per callback invocation that received a
+/// non-NULL pointer, after copying the bytes it needs.
+///
 /// # Safety
 /// `ptr` MUST be NULL or the exact base pointer a recv/event callback received
 /// and has NOT already freed, and `len` MUST equal that buffer's total length.
@@ -4914,8 +4925,8 @@ pub unsafe extern "C" fn veil_mailbox_seal(
 /// sidecar (the anonymous mailbox deposit carries no usable wire sender) and,
 /// once crypto-verified, written to `out_sender` (32 bytes). On success returns
 /// [`VEIL_OK`], writes the verified destination app id to `out_app_id` (32 bytes)
-/// + endpoint id to `*out_endpoint_id`, and a heap-allocated data buffer to
-/// `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
+/// and the endpoint id to `*out_endpoint_id`. A heap-allocated data buffer is written
+/// to `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
 ///
 /// `blob` MUST point to ≥`blob_len`. `out_sender` / `out_app_id` MUST each point
 /// to ≥32 writable bytes; the other out-pointers MUST be writable.

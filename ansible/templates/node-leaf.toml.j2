@@ -8,6 +8,13 @@ logs = "stderr"
 log_level = "info"
 log_format = "text"
 
+# Anonymous-routing capability ON by default: every node serves as an
+# onion/rendezvous relay (accepts RegisterRendezvous + per-hop circuit state +
+# publishes a signed relay-directory entry) so the network has a relay pool for
+# 3-hop circuits out of the box. Opt out per host with `-e veil_relay_capable=false`.
+[anonymity]
+relay_capable = {{ veil_relay_capable | default(true) | bool | string | lower }}
+
 {% for bp in veil_bootstrap_peers %}
 [[bootstrap_peers]]
 transport = "{{ bp.transport }}"
