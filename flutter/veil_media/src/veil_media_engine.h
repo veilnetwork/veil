@@ -137,6 +137,14 @@ int veil_media_engine_start_video(VeilMediaEngine *engine, int send, int recv,
                                   int max_bitrate_kbps, int max_fps);
 int veil_media_engine_stop_video(VeilMediaEngine *engine);
 
+/* Retune the running video send stream to a new bitrate/fps budget without
+ * restarting it (encoder reconfigure; the route stays untouched). Used by the
+ * app-side link-quality adaptation. Same clamps and VEIL_MEDIA_VIDEO_KBPS
+ * override as veil_media_engine_start_video. Returns VEIL_MEDIA_ERR_STATE if
+ * video send isn't running. */
+int veil_media_engine_set_video_bitrate(VeilMediaEngine *engine,
+                                        int max_bitrate_kbps, int max_fps);
+
 /* Open the platform camera and drive the video send stream from it (near
  * width x height at fps; the camera picks the closest supported format). Video
  * send must already be started (veil_media_engine_start_video send=1). Returns

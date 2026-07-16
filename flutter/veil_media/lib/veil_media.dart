@@ -120,6 +120,15 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineStopVideo(_ptr) == 0;
   }
 
+  /// Retune the running video send stream to a new bitrate/fps budget without
+  /// restarting it (link-quality adaptation). Returns false when video send
+  /// isn't running.
+  bool setVideoBitrate({required int maxBitrateKbps, required int maxFps}) {
+    _ensure();
+    return ffi.veilMediaEngineSetVideoBitrate(_ptr, maxBitrateKbps, maxFps) ==
+        0;
+  }
+
   /// Open the platform camera and drive the video send stream from it (video
   /// send must already be started). Returns false if this platform has no
   /// camera backend (Android, for now) or the device can't be opened — the

@@ -1316,6 +1316,57 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
 #endif
 }
 
+int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
+                                        int max_bitrate_kbps, int max_fps) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
+  WebrtcState* ws = engine->ws.get();
+  int rc = VEIL_MEDIA_ERR_STATE;
+  run_on(ws->worker_tq.get(), [&]() {
+    if (ws->video_send_stream == nullptr) return;
+    // Same budget rules as start_video: the explicit debug pin wins, and the
+    // clamps keep the encoder inside the padded-onion / direct envelopes.
+    int kbps = max_bitrate_kbps > 0 ? max_bitrate_kbps : 150;
+    if (const char* e = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
+      int v = std::atoi(e);
+      if (v > 0) kbps = v;
+    }
+    kbps = std::clamp(kbps, 30, 2500);
+    const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 5, 30);
+    const int bps = kbps * 1000;
+    if (bps == ws->video_target_bitrate_bps && fps == ws->video_max_fps) {
+      rc = VEIL_MEDIA_OK;
+      return;
+    }
+    webrtc::VideoEncoderConfig ec;
+    ec.codec_type = webrtc::kVideoCodecVP8;
+    ec.video_format = webrtc::SdpVideoFormat::VP8();
+    ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
+    ec.number_of_streams = 1;
+    ec.max_bitrate_bps = bps;
+    webrtc::VideoStream layer;
+    layer.active = true;
+    layer.min_bitrate_bps = 30000;
+    layer.target_bitrate_bps = bps * 2 / 3;
+    layer.max_bitrate_bps = bps;
+    layer.max_framerate = fps;
+    layer.max_qp = 63;
+    ec.simulcast_layers.push_back(layer);
+    ws->video_send_stream->ReconfigureVideoEncoder(std::move(ec));
+    ws->video_target_bitrate_bps = bps;
+    ws->video_max_fps = fps;
+    vlog("video: retuned to %d kbps @ %d fps", kbps, fps);
+    rc = VEIL_MEDIA_OK;
+  });
+  return rc;
+#else
+  (void)max_bitrate_kbps;
+  (void)max_fps;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
 int veil_media_engine_stop_video(VeilMediaEngine* engine) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
@@ -1616,6 +1667,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     int64_t rtt_ms = -1;
     uint32_t jitter_ms = 0;
     int loss_pct = 0;
+    int tx_jitter_ms = 0;
+    int tx_loss_pct = 0;
     run_on(ws->worker_tq.get(), [&] {
       if (ws->call) {
         const int64_t call_rtt = ws->call->GetStats().rtt_ms;
@@ -1623,9 +1676,15 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       }
       if (ws->send_stream) {
         // Per-stream RTCP report-block RTT is fresher than the call-level
-        // aggregate when both are available.
-        const int64_t stream_rtt = ws->send_stream->GetStats().rtt_ms;
-        if (stream_rtt >= 0) rtt_ms = stream_rtt;
+        // aggregate when both are available. The report block also carries
+        // what the REMOTE receiver measured on our outbound leg — that is the
+        // signal the sender-side bitrate adaptation acts on.
+        const auto s = ws->send_stream->GetStats();
+        if (s.rtt_ms >= 0) rtt_ms = s.rtt_ms;
+        if (s.jitter_ms >= 0) tx_jitter_ms = s.jitter_ms;
+        if (s.fraction_lost >= 0.0f) {
+          tx_loss_pct = static_cast<int>(s.fraction_lost * 100.0f + 0.5f);
+        }
       }
       if (ws->recv_stream) {
         const auto r =
@@ -1649,6 +1708,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"tx_bytes\":%llu,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
         "\"rtt_ms\":%lld,\"jitter_ms\":%u,\"loss_pct\":%d,"
+        "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,"
         "\"target_bitrate_bps\":%d,\"max_fps\":%d}",
         static_cast<unsigned long long>(ws->shim->outbound_packet_count()),
         static_cast<unsigned long long>(ws->shim->inbound_packet_count()),
@@ -1656,15 +1716,16 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->inbound_byte_count()),
         static_cast<unsigned long long>(ws->shim->outbound_dropped_count()),
         static_cast<unsigned long long>(ws->shim->inbound_dropped_count()),
-        static_cast<long long>(rtt_ms), jitter_ms, loss_pct,
-        ws->video_target_bitrate_bps, ws->video_max_fps);
+        static_cast<long long>(rtt_ms), jitter_ms, loss_pct, tx_jitter_ms,
+        tx_loss_pct, ws->video_target_bitrate_bps, ws->video_max_fps);
     return dup_cstr(json);
   }
 #endif
   return dup_cstr(
       "{\"tx_pkts\":0,\"rx_pkts\":0,\"tx_bytes\":0,\"rx_bytes\":0,"
       "\"tx_drops\":0,\"rx_drops\":0,\"rtt_ms\":0,\"jitter_ms\":0,"
-      "\"loss_pct\":0,\"target_bitrate_bps\":0,\"max_fps\":0}");
+      "\"loss_pct\":0,\"tx_jitter_ms\":0,\"tx_loss_pct\":0,"
+      "\"target_bitrate_bps\":0,\"max_fps\":0}");
 }
 
 void veil_media_free_string(char* s) {
