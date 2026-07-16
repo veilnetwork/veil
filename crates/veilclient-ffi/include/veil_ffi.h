@@ -374,6 +374,7 @@
 
 typedef struct Option_MediaRecvFn Option_MediaRecvFn;
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Handle to one ANONYMOUS reliable byte-stream (onion-routed, congestion-
  * controlled — see [`anon_stream`]). Split read/write halves so a caller can
@@ -381,6 +382,7 @@ typedef struct Option_MediaRecvFn Option_MediaRecvFn;
  * against a write.
  */
 typedef struct VeilAnonStreamFfi VeilAnonStreamFfi;
+#endif
 
 /**
  * Opaque app endpoint.
@@ -407,10 +409,12 @@ typedef struct VeilApp VeilApp;
  */
 typedef struct VeilHandle VeilHandle;
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Opaque handle to a running embedded node.
  */
 typedef struct VeilNode VeilNode;
+#endif
 
 /**
  * Short-lived sovereign signing burst opened from a recovery phrase. The
@@ -567,6 +571,7 @@ typedef void (*VeilEventCb)(void *user, uint8_t kind, const uint8_t *payload, si
 extern "C" {
 #endif // __cplusplus
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Open an anonymous reliable byte-stream to a peer. `dst_app_id` is the peer's
  * onion-stream endpoint app id (`deriveAppId(peer_node, "xveil",
@@ -579,7 +584,9 @@ VeilAnonStreamFfi *veil_anon_stream_open(VeilHandle *handle,
                                          const uint8_t *dst_app_id,
                                          char **err_out)
 ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Accept the next inbound anonymous stream, or NULL on timeout (no error) /
  * error. On success writes the initiator's 32-byte node id + onion-stream app
@@ -592,7 +599,9 @@ VeilAnonStreamFfi *veil_anon_stream_accept(VeilHandle *handle,
                                            uint8_t *out_src_app_id,
                                            char **err_out)
 ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Pre-warm the anonymous-stream outbound circuit pool toward a peer.
  * Fire-and-forget: kicks the background pool open (resolve ads + open +
@@ -606,6 +615,7 @@ int32_t veil_anon_stream_warm_peer(VeilHandle *handle,
                                    const uint8_t *dst_node_id,
                                    char **err_out)
 ;
+#endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
@@ -637,29 +647,17 @@ uint64_t veil_media_open_direct_channel(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Open a lossy MEDIA datagram channel over the non-onion Delivery relay path.
- * Intended for direct identities when P2P is unavailable.
+ * Open a lossy MEDIA channel forced through the ordinary Delivery relay path
+ * (no onion circuit). The daemon E2E-encrypts each datagram for `peer`; relay
+ * nodes see addressing metadata but never RTP/RTCP bytes. Intended only for
+ * direct-identity calls when the preferred P2P route is unavailable.
  */
+
 uint64_t veil_media_open_relay_channel(VeilApp *app,
                                        const uint8_t *peer_node_id,
                                        const uint8_t *peer_app_id,
                                        uint32_t peer_endpoint_id,
                                        char **err_out)
-;
-#endif
-
-#if defined(VEIL_FFI_NODE_EMBEDDED)
-/**
- * Drain inbound direct-media datagrams into the native media callback registry
- * without a host-language hop. Source app ids are verified by deriving the
- * named app from the authenticated source node.
- */
-int veil_media_start_direct_receiver(VeilApp *app,
-                                     const uint8_t *source_namespace,
-                                     size_t source_namespace_len,
-                                     const uint8_t *source_name,
-                                     size_t source_name_len,
-                                     char **err_out)
 ;
 #endif
 
@@ -701,6 +699,31 @@ int veil_media_dispatch_direct_datagram(const uint8_t *peer_node_id,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Drain one bound app endpoint directly into the native media callback
+ * registry, bypassing the host language's event loop entirely.
+ *
+ * `source_namespace` + `source_name` identify the well-known named app that a
+ * remote media sender must use. The authenticated session `src_node_id` is
+ * combined with those names to derive the only accepted `src_app_id`; frames
+ * from another app on the same peer are silently dropped. This preserves the
+ * source-app check previously performed in Dart without copying every RTP
+ * packet through the UI isolate.
+ *
+ * This function takes exclusive ownership of the app's datagram receiver. It
+ * must be called before [`veil_app_set_recv_handler`].
+ */
+
+int veil_media_start_direct_receiver(VeilApp *app,
+                                     const uint8_t *source_namespace,
+                                     size_t source_namespace_len,
+                                     const uint8_t *source_name,
+                                     size_t source_name_len,
+                                     char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Install the C recv callback invoked (native↔native, from a tokio worker)
  * once per inbound media datagram from `chan`'s peer, with the wire magic
  * already stripped. Replaces any prior callback; `cb == NULL` clears it.
@@ -727,6 +750,7 @@ int veil_media_dispatch_direct_datagram(const uint8_t *peer_node_id,
  uint64_t veil_media_recv_count(const uint8_t *peer_node_id) ;
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Read up to `cap` bytes. Returns the count (0 = clean EOF), or a negative
  * error code (the stream was reset → the app should resume).
@@ -737,7 +761,9 @@ ssize_t veil_anon_stream_read(VeilAnonStreamFfi *stream,
                               size_t cap,
                               char **err_out)
 ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Queue `len` bytes for reliable delivery. Returns `VEIL_OK` / a negative code.
  */
@@ -747,20 +773,26 @@ int veil_anon_stream_write(VeilAnonStreamFfi *stream,
                            size_t len,
                            char **err_out)
 ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Half-close the send direction (a FIN follows the last queued byte). The peer
  * reads EOF. Returns `VEIL_OK` / a negative code.
  */
  int veil_anon_stream_finish(VeilAnonStreamFfi *stream, char **err_out) ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Close + free the stream handle (idempotent, NULL-safe). This is the graceful
  * resource-release path: dropping the write half closes the command channel, so
  * the driver finishes the send direction rather than resetting normal EOF.
  */
  void veil_anon_stream_close(VeilAnonStreamFfi *stream) ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Abort + free the stream handle (idempotent, NULL-safe). Use for timeout /
  * retry cancellation. A Dart timeout may call this while another FFI worker is
@@ -769,6 +801,7 @@ int veil_anon_stream_write(VeilAnonStreamFfi *stream,
  * best-effort RST through the driver so the peer/route settle too.
  */
  void veil_anon_stream_abort(VeilAnonStreamFfi *stream) ;
+#endif
 
 /**
  * Free a C string returned by this library (error messages, etc.).
@@ -1118,6 +1151,7 @@ int veil_lookup_relay_x25519(VeilHandle *handle,
  */
  int veil_register_onion_service(VeilHandle *handle, uint32_t hop_count, char **err_out) ;
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Register a location-anonymous service under a caller-owned random Ed25519
  * seed rather than the node's sovereign key. The seed buffer is writable and
@@ -1142,7 +1176,9 @@ int veil_register_ephemeral_onion_service_zeroize(VeilHandle *handle,
                                                   uint8_t *out_identity_vk_32,
                                                   char **err_out)
 ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Provider-slotted form of
  * [`veil_register_ephemeral_onion_service_zeroize`]. Linked devices hosting
@@ -1158,7 +1194,9 @@ int veil_register_ephemeral_onion_service_zeroize_v2(VeilHandle *handle,
                                                      uint8_t *out_identity_vk_32,
                                                      char **err_out)
 ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Stop maintaining one caller-owned ephemeral onion service. Idempotent:
  * unknown/already-withdrawn public keys return `VEIL_OK` too, so this local
@@ -1171,6 +1209,7 @@ int veil_withdraw_ephemeral_onion_service(VeilHandle *handle,
                                           const uint8_t *identity_vk_32,
                                           char **err_out)
 ;
+#endif
 
 /**
  * Register a PLAIN rendezvous-publisher entry (mailbox-by-discovery): the
@@ -1449,20 +1488,6 @@ int veil_lookup_rendezvous_replicas(VeilHandle *handle,
  void veil_free_replica_buf(uint8_t *ptr, size_t len) ;
 
 /**
- * Free a callback buffer handed to a recv- or event-handler callback
- * (cycle-7 H6).  `ptr` MUST be the base pointer the callback received — for
- * recv that is the `src_node_id` pointer (the buffer is laid out
- * `[node_id(32) | app_id(32) | data]`); for events it is the `payload`
- * pointer — and `len` MUST be the buffer's total length (recv: `64 + data_len`;
- * events: `payload_len`).  Safe to call on `ptr == NULL` (no-op).
- *
- * The callback contract is callee-owns-the-buffer: the host MUST call this
- * exactly once per callback invocation that received a non-NULL pointer, after
- * it has finished copying the bytes it needs. This lets the host retain the
- * pointer past the synchronous call (e.g. Dart `NativeCallable.listener`,
- * which marshals to the isolate and reads the bytes later) without a
- * use-after-free.
- *
  * Normalize a candidate nickname. On VEIL_OK, `*out_buf`/`*out_len` hold the
  * normalized ASCII bytes (free with `veil_free_buf`); returns
  * VEIL_ERR_INVALID_ARG if the name cannot be normalized (bad charset/length).
@@ -1513,6 +1538,15 @@ int veil_nickname_mine(const uint8_t *name,
  int veil_nickname_verify(const uint8_t *record, size_t record_len, char **err_out) ;
 
 /**
+ * Free a callback buffer handed to a recv- or event-handler callback.
+ * `ptr` MUST be the base pointer the callback received — for recv that is the
+ * `src_node_id` pointer (layout `[node_id(32) | app_id(32) | data]`); for
+ * events it is the `payload` pointer. `len` MUST be the total buffer length.
+ * Safe to call on `ptr == NULL` (no-op).
+ *
+ * The host must call this exactly once per callback invocation that received a
+ * non-NULL pointer, after copying the bytes it needs.
+ *
  * # Safety
  * `ptr` MUST be NULL or the exact base pointer a recv/event callback received
  * and has NOT already freed, and `len` MUST equal that buffer's total length.
@@ -1549,8 +1583,8 @@ int veil_mailbox_seal(VeilHandle *handle,
  * sidecar (the anonymous mailbox deposit carries no usable wire sender) and,
  * once crypto-verified, written to `out_sender` (32 bytes). On success returns
  * [`VEIL_OK`], writes the verified destination app id to `out_app_id` (32 bytes)
- * + endpoint id to `*out_endpoint_id`, and a heap-allocated data buffer to
- * `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
+ * and the endpoint id to `*out_endpoint_id`. A heap-allocated data buffer is written
+ * to `*out_data` (length to `*out_data_len`); free with [`veil_free_buf`].
  *
  * `blob` MUST point to ≥`blob_len`. `out_sender` / `out_app_id` MUST each point
  * to ≥32 writable bytes; the other out-pointers MUST be writable.
@@ -2389,6 +2423,7 @@ int veil_nickname_resolve(const uint8_t *self_node_id,
 ;
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Provision a fresh node identity IN-PROCESS — generate an Ed25519 keypair and
  * mine its proof-of-work nonce — and return a ready-to-use config (TOML)
@@ -2409,7 +2444,9 @@ int veil_nickname_resolve(const uint8_t *self_node_id,
  * `err_out` (if non-null) must be a writable `*mut c_char` slot.
  */
  char *veil_config_init(uint32_t difficulty, char **err_out) ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Like `veil_config_init`, but the Ed25519 identity is DERIVED FROM A MASTER
  * PHRASE instead of random (onboarding-phrase epic P2): phrase → master seed
@@ -2431,7 +2468,9 @@ char *veil_config_init_from_phrase_zeroize(uint8_t *phrase,
                                            uint32_t difficulty,
                                            char **err_out)
 ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Compose a full, bootable node config by combining a stored identity (the
  * config TOML from `veil_config_init`, kept in the host's deniable container)
@@ -2456,7 +2495,9 @@ char *veil_config_compose(const uint8_t *identity_toml_ptr,
                           size_t admin_socket_len,
                           char **err_out)
 ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Start an embedded node from a config file at `config_path` (`(ptr,len)`,
  * UTF-8). Non-blocking. Returns an opaque handle, or null with `*err_out` set
@@ -2467,7 +2508,9 @@ char *veil_config_compose(const uint8_t *identity_toml_ptr,
  * (if non-null) must be a writable `*mut c_char` slot.
  */
  VeilNode *veil_node_start(const uint8_t *config_path_ptr, size_t config_path_len, char **err_out) ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Start an embedded node in deferred-init mode: it boots under an ephemeral
  * throwaway identity, binds ONLY the admin endpoint at `admin_socket` (`(ptr,
@@ -2496,7 +2539,9 @@ VeilNode *veil_node_start_deferred(const uint8_t *admin_socket_ptr,
                                    bool anonymous,
                                    char **err_out)
 ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Promote a deferred-init node to its real identity by applying `config_toml`
  * (`(ptr, len)`, UTF-8 — e.g. the bytes returned by `veil_config_init` and
@@ -2518,7 +2563,9 @@ int veil_node_apply_config(const VeilNode *node,
                            size_t config_len,
                            char **err_out)
 ;
+#endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Stop the embedded node: trigger graceful shutdown and join its thread.
  * Consumes the handle.
@@ -2527,6 +2574,7 @@ int veil_node_apply_config(const VeilNode *node,
  * `node` must be a handle returned by `veil_node_start*` and not yet stopped.
  */
  void veil_node_stop(VeilNode *node) ;
+#endif
 
 #ifdef __cplusplus
 }  // extern "C"

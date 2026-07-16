@@ -414,11 +414,12 @@ pub struct SessionRunner {
     /// The runner writes each frame to the wire, then fulfils the oneshot
     /// when a matching `FIND_NODE_RESPONSE` arrives.
     pub rpc_outbox: Option<mpsc::Receiver<OutboxRequest>>,
-    /// How often to send a Keepalive frame. Zero means keepalive is disabled
-    /// (no Keepalive sent, no idle timeout enforced).
+    /// How often to send a Keepalive frame. Zero disables Keepalive emission;
+    /// an independently configured idle timeout is still enforced.
     pub keepalive_interval: std::time::Duration,
     /// Close the session if no frame is received within this window.
-    /// Only enforced when keepalive_interval > 0.
+    /// Zero disables the deadline; otherwise it is enforced independently of
+    /// Keepalive emission.
     pub idle_timeout: std::time::Duration,
     /// Session identifier derived during the handshake; used as chaining salt
     /// when deriving new keys after a rekey. All-zero disables rekey.

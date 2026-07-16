@@ -526,10 +526,11 @@ mod tests {
     ///
     /// Uses `SimNetworkBuilder::session` to inject a short timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "live runtimes exchange control traffic; silent transport is covered in chaos_sim"]
     async fn idle_timeout_closes_dead_session() {
         use crate::cfg::SessionConfig;
         let session_cfg = SessionConfig {
-            keepalive_interval_secs: 0, // disable keepalive — session will go idle
+            keepalive_interval_secs: 0, // disable explicit keepalive emission
             idle_timeout_secs: 3,       // 3-second idle timeout
             ..SessionConfig::default()
         };
@@ -6539,11 +6540,21 @@ mod tests {
             .runtime
             .register_onion_service(2)
             .expect("register_onion_service must succeed");
-        let n_ads = net
-            .node(4)
-            .runtime
-            .debug_force_publish_rendezvous_ads()
-            .await;
+        let n_ads = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let published = net
+                    .node(4)
+                    .runtime
+                    .debug_force_publish_rendezvous_ads()
+                    .await;
+                if published == 1 {
+                    break published;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("service publisher registered after circuit confirmation");
         assert_eq!(n_ads, 1, "service publishes one ad");
         tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -7097,12 +7108,18 @@ mod tests {
         let period = bd::current_period(now);
         let dht_key = bd::descriptor_dht_key(&identity_vk, period).unwrap();
 
-        // Descriptor present + openable right after register.
-        let initial = net
-            .node(4)
-            .runtime
-            .dht_get_local(&dht_key)
-            .expect("descriptor stored at register");
+        // Publication is intentionally deferred until the relay confirms the
+        // cookie binding; wait for that ordering barrier instead of racing it.
+        let initial = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(bytes) = net.node(4).runtime.dht_get_local(&dht_key) {
+                    break bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("descriptor stored after circuit confirmation");
         assert!(bd::open_descriptor(&identity_vk, period, &initial).is_some());
 
         // Corrupt the stored descriptor; it must no longer open.
@@ -7122,11 +7139,18 @@ mod tests {
             .runtime
             .access()
             .maintain_onion_circuits(now + 200);
-        let restored = net
-            .node(4)
-            .runtime
-            .dht_get_local(&dht_key)
-            .expect("descriptor re-published by the tick");
+        let restored = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(bytes) = net.node(4).runtime.dht_get_local(&dht_key)
+                    && bd::open_descriptor(&identity_vk, period, &bytes).is_some()
+                {
+                    break bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("descriptor re-published after refreshed circuit confirmation");
         assert!(
             bd::open_descriptor(&identity_vk, period, &restored).is_some(),
             "the maintenance tick must re-seal a valid descriptor under the live key"
