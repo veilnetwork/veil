@@ -841,6 +841,11 @@ impl NodeRuntime {
             rendezvous_ad_dht_key_at, rendezvous_ad_needs_refresh, sign_rendezvous_ad_v5,
             verify_rendezvous_ad,
         };
+        // Call-RTT-spike experiment switch: skip the refresh tick entirely
+        // while publish is paused (see veil_session::rt_trace::publish_pause).
+        if veil_session::rt_trace::publish_pause_enabled() {
+            return 0;
+        }
         let snapshot = lock!(entries).clone();
         if snapshot.is_empty() {
             return 0;
