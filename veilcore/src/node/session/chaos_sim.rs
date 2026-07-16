@@ -362,6 +362,75 @@ async fn run_chaos_iteration(seed: u64, events: &[ChaosEvent]) -> ChaosOutcome {
     run_chaos_iteration_inner(seed, events, false).await
 }
 
+/// A live runtime pair exchanges DHT and other control frames, so it cannot
+/// reliably model a silent peer. Exercise the runner itself with the peer end
+/// held open but completely quiet: the read stays pending and only the idle
+/// deadline may terminate the session.
+#[tokio::test]
+async fn idle_timeout_closes_silent_duplex_peer() {
+    let local_id = [0x31u8; 32];
+    let peer_id = [0x32u8; 32];
+    let session_id = [0x33u8; 32];
+    let mut dispatcher = Arc::new(make_test_dispatcher(NodeRole::Core));
+    Arc::get_mut(&mut dispatcher).unwrap().local_node_id = local_id;
+    let (_silent_peer, server) = tokio::io::duplex(1 << 16);
+    let mut runner = SessionRunner {
+        stream: Box::new(server) as BoxIoStream,
+        peer_id,
+        dispatcher: crate::node::session::dispatcher_sink::arc_sink(&dispatcher),
+        logger: Arc::clone(&dispatcher.logger),
+        metrics: Some(Arc::new(NodeMetrics::new())),
+        ban_list: Arc::clone(&dispatcher.abuse.ban_list),
+        violation_tracker: Arc::clone(&dispatcher.abuse.violation_tracker),
+        crypto: crate::node::session::runner::CryptoState {
+            tx_cipher: Some(SessionCipher::new(&[0x41; 32], true)),
+            rx_cipher: Some(SessionCipher::new(&[0x42; 32], true)),
+            peer_mlkem_keys: None,
+            per_session_mlkem_dk: None,
+        },
+        outbox: None,
+        rpc_outbox: None,
+        keepalive_interval: Duration::ZERO,
+        idle_timeout: Duration::from_millis(100),
+        max_pending_responses: crate::cfg::SessionConfig::default().max_pending_responses,
+        pending_response_ttl: Duration::from_millis(
+            crate::cfg::SessionConfig::default().pending_response_ttl_ms,
+        ),
+        max_frame_body: crate::cfg::SessionConfig::default().max_frame_body_bytes,
+        rekey: crate::node::session::runner::RekeyConfig {
+            bytes_threshold: u64::MAX,
+            time_threshold_secs: u64::MAX,
+        },
+        qos_weights: crate::node::session::priority_queue::DEFAULT_WEIGHTS,
+        session_id,
+        local_node_id: local_id,
+        mobile: crate::node::session::runner::MobileConfig {
+            base_keepalive_interval: Duration::ZERO,
+            battery_keepalive_scale_low: 4.0,
+            battery_keepalive_scale_medium: 2.0,
+            battery_threshold_low: 20,
+            battery_threshold_medium: 50,
+        },
+        ticket_to_send: None,
+        raw_session_keys: None,
+        peer_tickets: None,
+        peer_public_key: None,
+        peer_nonce: None,
+        hot_standby: crate::node::session::runner::HotStandbyState {
+            swap_rx: None,
+            handoff_registry: None,
+            handoff_ack_waiters: None,
+            controller: None,
+            auto_trigger_after_write_errors: 0,
+        },
+        primary_uri: None,
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), runner.run())
+        .await
+        .expect("silent session must close at its idle deadline");
+}
+
 /// V2-C variant: same as `run_chaos_iteration` but enables the
 /// swap_inbox path so that `ChaosEvent::InjectSwap` events can take
 /// effect. Without the inbox configured, InjectSwap events are

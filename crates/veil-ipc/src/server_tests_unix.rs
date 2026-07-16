@@ -1711,10 +1711,11 @@ async fn acknowledged_oversized_send_registers_one_complete_chunk_batch() {
     let carrier_ids: std::collections::HashSet<_> =
         chunks.iter().map(|(content_id, _)| *content_id).collect();
     assert_eq!(carrier_ids.len(), chunk_count);
-    let tracker = pending.lock().unwrap();
-    assert_eq!(tracker.len(), 1);
-    assert_eq!(tracker.tracked_frame_count(&original), Some(chunk_count));
-    drop(tracker);
+    {
+        let tracker = pending.lock().unwrap();
+        assert_eq!(tracker.len(), 1);
+        assert_eq!(tracker.tracked_frame_count(&original), Some(chunk_count));
+    }
 
     drop(client);
     let _ = shutdown_tx.send(true);

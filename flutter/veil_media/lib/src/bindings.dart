@@ -556,7 +556,7 @@ final void Function(Pointer<VeilAudioPlayerHandle>) veilMediaPlayerDestroy =
             'veil_media_player_destroy')
         .asFunction();
 
-// ---- Video-note ("кружочек") recorder + player (VNOTE1) --------------------
+// ---- Round video-note recorder + player (VNOTE1) -----------------------------
 
 /// Opaque handles (VeilVnoteRecorder* / VeilVnotePlayer*).
 final class VeilVnoteRecorderHandle extends Opaque {}

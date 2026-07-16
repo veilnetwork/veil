@@ -27,6 +27,7 @@ fn make_relay_frame(dst: [u8; 32], hop_count: u8) -> Vec<u8> {
         next_hop_node_id: dst,
         envelope,
         relay_hops: 0,
+        delivery_attempt: None,
     };
     let rr = RecursiveRelayPayload {
         dst_node_id: dst,

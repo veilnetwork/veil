@@ -13,8 +13,9 @@
 #   devnet.sh logs [N]            Tail logs for node N (default: 0)
 #
 # Nodes each listen on 127.0.0.1:920{N} for peer connections.
-# The admin socket for node N is at /tmp/veil-devnet/node-N/config.sock
-# (derived automatically by veil-cli from the config file path).
+# The admin socket for node N is at /tmp/veil-devnet/node-N/config.sock.
+# Devnet persists this path explicitly so root and non-root runs use the same
+# per-node endpoint.
 
 set -euo pipefail
 
@@ -50,8 +51,7 @@ node_dir()   { echo "${DEVNET_DIR}/node-${1}"; }
 config_file(){ echo "$(node_dir "$1")/config.toml"; }
 pid_file()   { echo "$(node_dir "$1")/veil.pid"; }
 log_file()   { echo "$(node_dir "$1")/veil.log"; }
-# The CLI derives the admin socket from the config path by replacing the
-# .toml extension with .sock (see handlers.rs default_admin_socket_uri).
+# `generate_config` persists this per-node path explicitly.
 admin_sock() { echo "$(node_dir "$1")/config.sock"; }
 
 is_running() {
@@ -76,13 +76,16 @@ generate_config() {
     config="$(config_file "$n")"
     local peer_port=$(( BASE_PEER_PORT + n ))
 
-    # Generate a fresh config with identity + PoW nonce + admin socket.
-    # The admin socket path is set automatically to config.sock alongside config.toml.
+    # Generate a fresh config with identity + PoW nonce. Persist the admin
+    # socket explicitly: root defaults to the shared system socket, which is
+    # unsuitable for a multi-node devnet and disagrees with `admin_sock`.
     # ${DEVNET_POW_DIFFICULTY:-24} lets a caller override default 24-bit PoW
     # for a faster startup (e.g. Phase 6.27 production-build smoke validates
     # adaptive proximity gate, but doesn't need full production PoW work).
     "$BINARY" config init "$config" --difficulty "${DEVNET_POW_DIFFICULTY:-24}" \
         || die "config init failed for node-${n}"
+    "$BINARY" --config "$config" config set global.admin_socket "unix://${dir}/config.sock" \
+        >/dev/null || die "admin socket config failed for node-${n}"
 
     # Provision a standalone sovereign identity (device key IS master).
     # Without this, the daemon would build a degenerate one on first

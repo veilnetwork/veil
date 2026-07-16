@@ -13,6 +13,8 @@ retaining the Rust 1.97, Windows, and poisoned-lock fixes shipped in v0.3.0.
   real-time transport APIs.
 - Restored onion-provider isolation, capability negotiation, delivery retries,
   and the associated runtime hardening.
+- Regenerated the feature-gated C header and aligned the restored tail with the
+  Rust 1.97 warning policy across the workspace, embedded FFI, and simulations.
 
 `veilclient-ffi` remains on its independent 0.4.x ABI line and
 `veil-onion-stream` remains on its independent 0.1.x line.
