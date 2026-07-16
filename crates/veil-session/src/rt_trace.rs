@@ -43,3 +43,30 @@ pub fn rt_trace_enabled() -> bool {
 pub fn set_rt_trace(on: bool) {
     cell().store(on, Ordering::Relaxed);
 }
+
+static PUBLISH_PAUSE: OnceLock<AtomicBool> = OnceLock::new();
+
+fn publish_pause_cell() -> &'static AtomicBool {
+    PUBLISH_PAUSE.get_or_init(|| {
+        AtomicBool::new(std::env::var("VEIL_PUBLISH_PAUSE").is_ok_and(|v| v.trim() == "1"))
+    })
+}
+
+/// EXPERIMENT SWITCH for the call-RTT-spike investigation: while on, the
+/// node's periodic publish machinery (rendezvous-ad refresh ticks, DHT
+/// republish fan-out) is skipped. The measured spikes are synchronized
+/// bidirectional media stalls with a stable ~45 s period while both
+/// endpoints run background anonymous publish bursts through the same
+/// relay; pausing publish mid-call and watching whether the stalls vanish
+/// names (or clears) that candidate. NEVER a production mode: paused ads
+/// age toward their validity horizon and un-resolve — pause only for the
+/// duration of a measurement, mid-call, then re-enable.
+pub fn publish_pause_enabled() -> bool {
+    publish_pause_cell().load(Ordering::Relaxed)
+}
+
+/// Runtime toggle (env `VEIL_PUBLISH_PAUSE=1` at first check, FFI
+/// `veil_debug_set_publish_pause`, xVeil hook `/publish_pause`).
+pub fn set_publish_pause(on: bool) {
+    publish_pause_cell().store(on, Ordering::Relaxed);
+}
