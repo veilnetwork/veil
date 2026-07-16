@@ -1349,6 +1349,15 @@ pub extern "C" fn veil_debug_set_rt_trace(on: c_int) {
     veil_session::rt_trace::set_rt_trace(on != 0);
 }
 
+/// EXPERIMENT SWITCH (call-RTT-spike investigation): pause/resume the
+/// embedded node's periodic publish machinery (rendezvous-ad refresh, DHT
+/// republish fan-out). Mid-call measurement only — paused ads age toward
+/// their validity horizon; see `veil_session::rt_trace::set_publish_pause`.
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_debug_set_publish_pause(on: c_int) {
+    veil_session::rt_trace::set_publish_pause(on != 0);
+}
+
 /// Feed one direct-P2P media datagram received by the host on the media app
 /// endpoint into the shared native media callback registry. The host is
 /// responsible for authenticating/filtering the source app id before calling.

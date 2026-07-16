@@ -113,6 +113,12 @@ impl NodeRuntime {
                         if *shutdown_rx.borrow() { break; }
                     }
                     _ = tick_interval.tick() => {
+                        // Call-RTT-spike experiment switch: skip republish
+                        // ticks while publish is paused (staggered due times
+                        // simply fire on the first tick after resume).
+                        if veil_session::rt_trace::publish_pause_enabled() {
+                            continue;
+                        }
                         // audit cycle-7 M4: enumerate KEYS only (32 B each) and
                         // fetch values lazily for the few keys actually due
                         // this tick. The previous `stored_entries()` pulled
