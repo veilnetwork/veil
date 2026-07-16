@@ -25,6 +25,9 @@
 library veil_flutter;
 
 export 'src/background.dart' show VeilBackground;
+// Debug-only: runtime toggle for the embedded node's slow-inbound-dispatch
+// trace (call-RTT-spike investigation) — driven by the xVeil debug hook.
+export 'src/bindings.dart' show veilDebugSetRtTrace;
 export 'src/client.dart'
     show VeilClient, AppHandle, veilSealBytes, veilUnsealBytes;
 export 'src/identity.dart'
