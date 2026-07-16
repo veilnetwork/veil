@@ -4643,9 +4643,10 @@ mod tests {
         assert!(matches!(ep, AdminEndpoint::Unix(_)));
     }
 
-    /// when `global.admin_socket` is unset and a `config_dir` is
-    /// known, the resolver derives a default (`<dir>/admin.sock`) rather than
-    /// failing with "must be configured".
+    /// When `global.admin_socket` is unset and a `config_dir` is known, the
+    /// resolver derives the platform default rather than failing with "must
+    /// be configured". On Unix this is `<dir>/admin.sock` for non-root users
+    /// and the system socket for root.
     #[test]
     #[cfg(unix)]
     fn resolve_admin_endpoint_falls_back_to_default_when_unset() {
@@ -4658,8 +4659,13 @@ mod tests {
             ..Config::default()
         };
         let ep = resolve_admin_endpoint(&cfg, Some(&dir)).expect("default must apply");
+        let expected_uri = veil_cfg::default_admin_socket_uri(&dir);
+        let expected_path = expected_uri
+            .strip_prefix("unix://")
+            .map(PathBuf::from)
+            .expect("Unix default must use unix://");
         match ep {
-            AdminEndpoint::Unix(path) => assert_eq!(path, dir.join("admin.sock")),
+            AdminEndpoint::Unix(path) => assert_eq!(path, expected_path),
             other => panic!("expected Unix endpoint, got {other:?}"),
         }
     }

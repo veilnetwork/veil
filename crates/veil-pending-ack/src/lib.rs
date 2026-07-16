@@ -89,6 +89,7 @@ pub enum AckTickOutcome {
 }
 
 /// Tracks in-flight envelopes that require an end-to-end ACK.
+#[derive(Default)]
 pub struct PendingAckTracker {
     pending: HashMap<[u8; 32], PendingEntry>,
     /// per-peer entry counter for the per-peer cap.
@@ -115,18 +116,6 @@ impl Default for TrackerLimits {
             entries_per_peer: MAX_PENDING_ACK_PER_PEER,
             bytes: MAX_PENDING_ACK_BYTES,
             bytes_per_peer: MAX_PENDING_ACK_BYTES_PER_PEER,
-        }
-    }
-}
-
-impl Default for PendingAckTracker {
-    fn default() -> Self {
-        Self {
-            pending: HashMap::new(),
-            per_peer: HashMap::new(),
-            total_bytes: 0,
-            per_peer_bytes: HashMap::new(),
-            limits: TrackerLimits::default(),
         }
     }
 }

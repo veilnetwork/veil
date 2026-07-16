@@ -7688,10 +7688,8 @@ impl NodeServices {
                         veil_crypto::key_blinding::ed25519_public_from_seed(seed) == identity_vk
                     })
                     .unwrap_or(false);
-            if matches {
-                if let Some(&relay) = entry.relay_path.last() {
-                    removed.push((relay, entry.cookie));
-                }
+            if matches && let Some(&relay) = entry.relay_path.last() {
+                removed.push((relay, entry.cookie));
             }
             !matches
         });
@@ -9239,7 +9237,7 @@ impl NodeServices {
             .saturating_sub(1 + IntroducePayload::FIXED_SIZE)
             .min(MAX_INTRODUCE_CIPHERTEXT);
         let plaintext_budget = ciphertext_budget.saturating_sub(INTRODUCE_OVERHEAD);
-        if 1 + app_deliver_bytes.len() <= plaintext_budget {
+        if app_deliver_bytes.len() < plaintext_budget {
             let mut plaintext = Vec::with_capacity(1 + app_deliver_bytes.len());
             plaintext.push(final_hop_kind::APP_DELIVER);
             plaintext.extend_from_slice(app_deliver_bytes);
