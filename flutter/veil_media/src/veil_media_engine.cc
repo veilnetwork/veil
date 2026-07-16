@@ -1609,12 +1609,46 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   WebrtcState* ws = engine->ws.get();
   if (ws && ws->shim) {
-    char json[384];
+    // RTCP-derived link quality. Call and its streams may only be touched on
+    // the worker queue (stream create/destroy runs there too, so the raw
+    // pointers stay valid for the duration of the task). The shim counters
+    // below are atomics and safe from this FFI thread.
+    int64_t rtt_ms = -1;
+    uint32_t jitter_ms = 0;
+    int loss_pct = 0;
+    run_on(ws->worker_tq.get(), [&] {
+      if (ws->call) {
+        const int64_t call_rtt = ws->call->GetStats().rtt_ms;
+        if (call_rtt >= 0) rtt_ms = call_rtt;
+      }
+      if (ws->send_stream) {
+        // Per-stream RTCP report-block RTT is fresher than the call-level
+        // aggregate when both are available.
+        const int64_t stream_rtt = ws->send_stream->GetStats().rtt_ms;
+        if (stream_rtt >= 0) rtt_ms = stream_rtt;
+      }
+      if (ws->recv_stream) {
+        const auto r =
+            ws->recv_stream->GetStats(/*get_and_clear_legacy_stats=*/false);
+        jitter_ms = r.jitter_ms;
+        // packets_lost is cumulative and may go negative on duplicates.
+        if (r.packets_lost > 0) {
+          const int64_t expected =
+              int64_t(r.packets_received) + int64_t(r.packets_lost);
+          if (expected > 0) {
+            loss_pct =
+                static_cast<int>(int64_t(r.packets_lost) * 100 / expected);
+          }
+        }
+      }
+    });
+    if (rtt_ms < 0) rtt_ms = 0;  // unknown yet — keep the legacy "0" shape
+    char json[512];
     std::snprintf(
         json, sizeof(json),
         "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"tx_bytes\":%llu,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
-        "\"rtt_ms\":0,\"jitter_ms\":0,\"loss_pct\":0,"
+        "\"rtt_ms\":%lld,\"jitter_ms\":%u,\"loss_pct\":%d,"
         "\"target_bitrate_bps\":%d,\"max_fps\":%d}",
         static_cast<unsigned long long>(ws->shim->outbound_packet_count()),
         static_cast<unsigned long long>(ws->shim->inbound_packet_count()),
@@ -1622,6 +1656,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->inbound_byte_count()),
         static_cast<unsigned long long>(ws->shim->outbound_dropped_count()),
         static_cast<unsigned long long>(ws->shim->inbound_dropped_count()),
+        static_cast<long long>(rtt_ms), jitter_ms, loss_pct,
         ws->video_target_bitrate_bps, ws->video_max_fps);
     return dup_cstr(json);
   }
