@@ -702,6 +702,13 @@ struct MediaChannel {
     repair_tx: Option<mpsc::Sender<()>>,
     peer: [u8; 32],
     task: tokio::task::JoinHandle<()>,
+    /// Opt-in audio/RTCP batching on the RELAY send path (see
+    /// `veil_media_channel_set_batching`). Off by default: a batched cell is
+    /// silent noise to a legacy receiver, so the host enables it only after
+    /// call signaling proves the peer's protocol version understands
+    /// MEDIA_BATCH_MAGIC on this path. `None` on channels without a
+    /// batching-capable send task (direct/onion — onion already batches).
+    batching: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Packet ingress is sufficient for onion/P2P because their drain paths accept
@@ -1032,6 +1039,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
                 repair_tx: Some(repair_tx),
                 peer,
                 task,
+                batching: None,
             },
         );
     id
@@ -1160,6 +1168,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 repair_tx: None,
                 peer,
                 task,
+                batching: None,
             },
         );
     id
@@ -1198,6 +1207,8 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
     let (tx_video_frames, mut rx_video_frames) =
         mpsc::channel::<Vec<Vec<u8>>>(RELAY_VIDEO_FRAME_QUEUE);
     let sender = Arc::clone(&app_ref.sender);
+    let batching = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let batching_task = Arc::clone(&batching);
     let task = app_ref.bundle.runtime.spawn(async move {
         let mut prefer_video = false;
         loop {
@@ -1224,6 +1235,54 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                 }
             };
             prefer_video = matches!(work, Work::High(_));
+            // The relay path pays a full E2E envelope + cell padding PER
+            // datagram — ~2 KiB on the wire for an ~100 B Opus packet, a
+            // device-measured ~24× inflation that saturated a last-mile link
+            // and stalled the whole ordered stream (ROADMAP section S). When
+            // the peer understands MEDIA_BATCH_MAGIC (host-gated by call
+            // protocol version), gather the audio/RTCP packets that arrive
+            // within one frame interval and ship them as ONE envelope. The
+            // ~20 ms hold is one Opus frame — inside any jitter buffer —
+            // and only ever delays audio behind audio.
+            let work = match work {
+                Work::High(first)
+                    if batching_task.load(std::sync::atomic::Ordering::Relaxed) =>
+                {
+                    const RELAY_BATCH_MAX_PKTS: usize = 6;
+                    // Stay far under the relay's 8 KiB REALTIME classing cap
+                    // so a batched cell never demotes to Interactive.
+                    const RELAY_BATCH_BODY_MAX: usize = 4096;
+                    let mut pkts = vec![first];
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+                    while pkts.len() < RELAY_BATCH_MAX_PKTS {
+                        tokio::select! {
+                            biased;
+                            more = rx_hi.recv() => match more {
+                                Some(p) => pkts.push(p),
+                                None => break,
+                            },
+                            _ = tokio::time::sleep_until(deadline) => break,
+                        }
+                    }
+                    Work::High(if pkts.len() == 1 {
+                        pkts.pop().expect("one packet")
+                    } else if let Some(body) =
+                        media::encode_batch(&pkts, RELAY_BATCH_BODY_MAX)
+                    {
+                        let mut cell = Vec::with_capacity(1 + body.len());
+                        cell.push(media::MEDIA_BATCH_MAGIC);
+                        cell.extend_from_slice(&body);
+                        cell
+                    } else {
+                        // Oversized batch (only possible with pathological
+                        // datagram sizes): fall back to the first packet and
+                        // requeue nothing — same drop stance as a full queue.
+                        pkts.swap_remove(0)
+                    })
+                }
+                other => other,
+            };
             let guard = sender.lock().await;
             let Some(sender) = guard.as_ref() else {
                 break;
@@ -1269,6 +1328,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                 repair_tx: None,
                 peer,
                 task,
+                batching: Some(batching),
             },
         );
     id
@@ -1358,6 +1418,27 @@ pub extern "C" fn veil_debug_set_publish_pause(on: c_int) {
     veil_session::rt_trace::set_publish_pause(on != 0);
 }
 
+/// Enable/disable audio+RTCP batching on a RELAY media channel (the
+/// `batching` field on `MediaChannel`): batched cells amortize the relay
+/// path's per-datagram envelope+padding overhead (~24× for Opus-sized
+/// packets). The host flips this ON only after call signaling proves the
+/// remote understands `MEDIA_BATCH_MAGIC` on this path (call protocol
+/// version gate) — a batched cell is silent noise to a legacy receiver.
+/// Returns 0 on success, -1 for an unknown or non-relay channel.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_channel_set_batching(chan: u64, on: c_int) -> c_int {
+    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(ch) = map.get(&chan) else {
+        return -1;
+    };
+    let Some(b) = ch.batching.as_ref() else {
+        return -1;
+    };
+    b.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+    0
+}
+
 /// Feed one direct-P2P media datagram received by the host on the media app
 /// endpoint into the shared native media callback registry. The host is
 /// responsible for authenticating/filtering the source app id before calling.
@@ -1376,7 +1457,7 @@ pub unsafe extern "C" fn veil_media_dispatch_direct_datagram(
         ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), 32);
     }
     let payload = unsafe { std::slice::from_raw_parts(ptr, len) };
-    media::dispatch_inbound(peer, payload);
+    media::dispatch_inbound_auto(peer, payload);
     0
 }
 
@@ -1471,7 +1552,7 @@ pub unsafe extern "C" fn veil_media_start_direct_receiver(
             if src_app_id != expected {
                 continue;
             }
-            media::dispatch_inbound(src_node_id, &data);
+            media::dispatch_inbound_auto(src_node_id, &data);
         }
     });
     *task_guard = Some(task);

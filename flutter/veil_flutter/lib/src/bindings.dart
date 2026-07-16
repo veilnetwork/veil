@@ -1802,6 +1802,13 @@ final void Function(int) veilDebugSetPublishPause = nativeLib
     .lookup<NativeFunction<Void Function(Int32)>>('veil_debug_set_publish_pause')
     .asFunction();
 
+// media_channel_set_batching(chan, on) -> 0 ok / -1 unknown or non-relay
+// channel. Host-gated by call protocol version (see AppHandle wrapper).
+final int Function(int, int) veilMediaChannelSetBatching = nativeLib
+    .lookup<NativeFunction<Int32 Function(Uint64, Int32)>>(
+        'veil_media_channel_set_batching')
+    .asFunction();
+
 // dispatch_direct(peer_node32*, ptr, len) -> 0 delivered/accepted, -1 invalid.
 final int Function(Pointer<Uint8>, Pointer<Uint8>, int)
     veilMediaDispatchDirectDatagram = nativeLib
