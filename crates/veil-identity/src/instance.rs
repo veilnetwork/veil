@@ -38,7 +38,7 @@ use rand_core::{OsRng, RngCore};
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Magic bytes identifying the instance-id file.
-pub const INSTANCE_FILE_MAGIC: [u8; 2] = [b'I', b'I'];
+pub const INSTANCE_FILE_MAGIC: [u8; 2] = *b"II";
 /// Wire-format version.
 pub const INSTANCE_FILE_V1: u8 = 1;
 

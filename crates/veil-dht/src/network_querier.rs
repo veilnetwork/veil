@@ -70,6 +70,8 @@ fn next_global_request_id() -> u32 {
     }
 }
 
+type ResolvePowCache = Arc<Mutex<HashMap<[u8; 32], (u32, [u8; 16])>>>;
+
 /// Implements [`PeerQuerier`] by sending actual OVL1 FIND_NODE / V2 frames.
 ///
 /// Owns (or shares) a [`TransportCache`] used to skip the
@@ -103,7 +105,7 @@ pub struct NetworkPeerQuerier {
     /// re-mining. Reuse is sound — the verifier only checks leading-zero-bits +
     /// bucket freshness, not nonce uniqueness — and the map self-bounds to the
     /// current bucket's targets.
-    resolve_pow_cache: Arc<Mutex<HashMap<[u8; 32], (u32, [u8; 16])>>>,
+    resolve_pow_cache: ResolvePowCache,
 }
 
 impl NetworkPeerQuerier {

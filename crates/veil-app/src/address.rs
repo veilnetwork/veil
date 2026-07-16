@@ -271,13 +271,16 @@ mod tests {
     #[test]
     fn capability_app_id_is_node_independent_and_domain_separated() {
         let capability = capability_app_id("xveil.cloud", "secret-alias");
-        assert_eq!(
-            capability,
-            capability_app_id("xveil.cloud", "secret-alias")
-        );
+        assert_eq!(capability, capability_app_id("xveil.cloud", "secret-alias"));
         assert_ne!(capability, capability_app_id("xveil.cloud", "other"));
-        assert_ne!(capability, app_id(&[0u8; 32], "xveil.cloud", "secret-alias"));
-        assert_ne!(capability, app_id(&[9u8; 32], "xveil.cloud", "secret-alias"));
+        assert_ne!(
+            capability,
+            app_id(&[0u8; 32], "xveil.cloud", "secret-alias")
+        );
+        assert_ne!(
+            capability,
+            app_id(&[9u8; 32], "xveil.cloud", "secret-alias")
+        );
     }
 
     #[test]

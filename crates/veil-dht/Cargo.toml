@@ -1,6 +1,6 @@
 [package]
 name = "veil-dht"
-version = "0.2.0"
+version = "0.3.1"
 edition = "2024"
 description = "Veil network Kademlia DHT: routing table, k-bucket, iterative lookup, transport-resolution cache, lookup-result cache. Phase 5 extraction from veilcore — depends only on Tier-0/1/2 crates and on three trait surfaces (FrameRouter, RttHint, CoordinateOracle) for upper-layer hooks."
 license = "AGPL-3.0-or-later"
