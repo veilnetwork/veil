@@ -52,6 +52,39 @@ pub(crate) fn clamp_downlink_mss(stream: &TcpStream) {
     }
 }
 
+/// Upper bound we impose on the kernel send buffer (`SO_SNDBUF`) of every
+/// veil TCP socket (outbound and accepted); `VEIL_TCP_SNDBUF_BYTES`
+/// overrides it for live experiments.
+///
+/// Why: the session runner drains its priority queue in WRR order, so a
+/// REALTIME frame overtakes queued bulk INSIDE the process — but bytes
+/// already written to the socket are beyond reordering, and the kernel
+/// autotunes the send buffer into the megabytes. On a ~1 MiB/s relay leg a
+/// full autotuned buffer is SECONDS of head-of-line delay for call media —
+/// exactly the residual RTT-spike class the 2026-07-16 campaign kept
+/// measuring after every in-process frame/queue cap (the caps moved the
+/// bound to the wire channel, but the kernel buffer below it stayed
+/// unbounded). Clamping the buffer moves backpressure up into the process,
+/// where the priority queue can actually act on it. 256 KiB still allows
+/// ~5 MiB/s on a 50 ms leg — above any single relay leg observed on this
+/// overlay — and bulk swarms fan out across circuits/sessions, so file
+/// throughput is not gated by one socket's clamp.
+pub(crate) const UPLINK_SNDBUF_CLAMP: usize = 256 * 1024;
+
+/// Best-effort `SO_SNDBUF` clamp (see [`UPLINK_SNDBUF_CLAMP`]). A failure is
+/// a missed optimisation, never a correctness problem, so the `Err` is
+/// swallowed — same stance as [`clamp_downlink_mss`].
+pub(crate) fn clamp_uplink_sndbuf(stream: &TcpStream) {
+    let bytes = std::env::var("VEIL_TCP_SNDBUF_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        // Below one wire blob (64 KiB) the writer itself would stall; treat
+        // smaller overrides as misconfiguration and keep the default.
+        .filter(|v| *v >= 64 * 1024)
+        .unwrap_or(UPLINK_SNDBUF_CLAMP);
+    let _ = SockRef::from(stream).set_send_buffer_size(bytes);
+}
+
 /// Plain TCP `Transport` implementation. No encryption or framing — use a
 /// TLS layer above this transport for confidentiality.
 #[derive(Debug, Default)]
@@ -139,6 +172,7 @@ pub(crate) async fn connect_tcp_stream(
                     SockRef::from(&stream).set_tcp_keepalive(&ka)?;
                 }
                 clamp_downlink_mss(&stream);
+                clamp_uplink_sndbuf(&stream);
                 return Ok(stream);
             }
             Ok(Err(err)) => last_err = Some(err),
@@ -198,6 +232,7 @@ impl TransportListener for TcpTransportListener {
                 SockRef::from(&stream).set_tcp_keepalive(&ka)?;
             }
             clamp_downlink_mss(&stream);
+            clamp_uplink_sndbuf(&stream);
             let local_addr = stream.local_addr().ok();
             let peer = peer_meta("tcp", self.bind_uri.clone(), local_addr, Some(remote_addr));
             Ok(boxed_stream_connection(peer, stream))
