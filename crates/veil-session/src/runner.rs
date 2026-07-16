@@ -3605,10 +3605,44 @@ impl SessionRunner {
             // realistic link and bounds the worst-case memory exposure.
             if header.body_len > 0 {
                 const BODY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+                // rt_trace probe: a frame whose BODY takes whole seconds to
+                // arrive pins this loop — no dispatch, no PQ drain — for the
+                // duration. Name any oversized frame BEFORE the read and any
+                // slow body AFTER, so a live run identifies the sender and
+                // frame kind (the call-media stall investigation's probe).
+                let rt_trace_read = crate::rt_trace::rt_trace_enabled();
+                if rt_trace_read && body_len >= 128 * 1024 {
+                    self.logger.warn(
+                        "session.rt_trace.large_frame",
+                        format!(
+                            "peer_id={} family={} msg={} body_len={body_len}",
+                            hex_short(&self.peer_id),
+                            header.family,
+                            header.msg_type,
+                        ),
+                    );
+                }
+                let rt_trace_read_t0 = rt_trace_read.then(std::time::Instant::now);
                 match tokio::time::timeout(BODY_DEADLINE, read_half.read_exact(&mut raw_body[..]))
                     .await
                 {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => {
+                        if let Some(t0) = rt_trace_read_t0 {
+                            let ms = t0.elapsed().as_millis();
+                            if ms >= 500 {
+                                self.logger.warn(
+                                    "session.rt_trace.slow_body_read",
+                                    format!(
+                                        "peer_id={} family={} msg={} body_len={body_len} \
+                                         read_ms={ms}",
+                                        hex_short(&self.peer_id),
+                                        header.family,
+                                        header.msg_type,
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     Ok(Err(e)) => {
                         self.logger.warn(
                             "session.read_body_failed",
