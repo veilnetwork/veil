@@ -1,6 +1,6 @@
 [package]
 name = "veil-e2e"
-version = "0.2.0"
+version = "0.3.1"
 edition = "2024"
 description = "End-to-end encrypted envelope wrapping for veil payloads: ML-KEM-768 KEM, ChaCha20-Poly1305 AEAD, HKDF-SHA256 key derivation, encrypted-at-rest cache for prekeys. Phase 6 extraction from veilcore."
 license = "AGPL-3.0-or-later"

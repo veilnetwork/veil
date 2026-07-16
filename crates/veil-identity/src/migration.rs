@@ -56,7 +56,7 @@ use veil_proto::identity_document::{
 use veil_types::SignatureAlgorithm;
 
 /// Wire-magic identifying a `MigrationCert`.
-pub const MIGRATION_CERT_MAGIC: [u8; 2] = [b'M', b'G'];
+pub const MIGRATION_CERT_MAGIC: [u8; 2] = *b"MG";
 /// Current wire-format version.
 pub const MIGRATION_CERT_VERSION: u8 = 1;
 /// Hard cap on the migration cert's validity window. Prevents an old

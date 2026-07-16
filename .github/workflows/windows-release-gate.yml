@@ -1,0 +1,93 @@
+name: Windows release gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  native-tests:
+    name: Windows native tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build core without RocksDB
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        run: cargo build -p veilcore --lib --no-default-features
+      - name: Run TCP admin integration tests
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        run: cargo test -p veilcore --lib --no-default-features node::admin::tests::admin_tcp -- --ignored --test-threads=1
+      - name: Run token-file helpers
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+        run: cargo test -p veilcore --lib --no-default-features node::admin_transport::tests -- --test-threads=1
+
+  release-build:
+    name: Windows release build (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build production release binaries
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: 0
+          CC_x86_64_pc_windows_msvc: clang-cl
+          CXX_x86_64_pc_windows_msvc: clang-cl
+          CC_aarch64_pc_windows_msvc: clang-cl
+          CXX_aarch64_pc_windows_msvc: clang-cl
+          CXXFLAGS: ''
+        run: |
+          cargo build --release --target ${{ matrix.target }} --locked \
+            --bin veil-cli --bin ogate --bin oproxy-client --bin oproxy-server \
+            --features veil-bootstrap/production-seeds
+      - name: Stage Windows artifacts
+        shell: bash
+        run: |
+          stage="target/release-artifacts/${{ matrix.target }}"
+          mkdir -p "$stage"
+          : > "$stage/sha256.txt"
+          for b in veil-cli ogate oproxy-client oproxy-server; do
+            src="target/${{ matrix.target }}/release/${b}.exe"
+            cp "$src" "$stage/"
+            sha256sum "$stage/${b}.exe" | awk -v n="${b}.exe" '{print $1"  "n}' >> "$stage/sha256.txt"
+          done
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows-release-${{ matrix.target }}
+          path: target/release-artifacts/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 3

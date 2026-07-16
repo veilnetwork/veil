@@ -73,7 +73,7 @@ use super::cursor::{read_array, read_bytes, read_u8, read_u16, read_u32, read_u6
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// "PB" — identifies a PrekeyBundle on the wire.
-pub const PREKEY_BUNDLE_MAGIC: [u8; 2] = [b'P', b'B'];
+pub const PREKEY_BUNDLE_MAGIC: [u8; 2] = *b"PB";
 /// Wire-format version.
 pub const PREKEY_BUNDLE_V1: u8 = 1;
 

@@ -991,9 +991,7 @@ mod tests {
     // ── first-hop liveness guard (2a first-attempt-loss fix) ─────────
 
     /// RTT map: node_id[0] → rtt. Missing → None (unknown).
-    fn rtt_by_first_byte(
-        map: Vec<(u8, u32)>,
-    ) -> impl Fn(&[u8; 32]) -> Option<u32> {
+    fn rtt_by_first_byte(map: Vec<(u8, u32)>) -> impl Fn(&[u8; 32]) -> Option<u32> {
         move |id: &[u8; 32]| map.iter().find(|(b, _)| *b == id[0]).map(|(_, r)| *r)
     }
 
@@ -1021,7 +1019,10 @@ mod tests {
         )
         .expect("2 hops from 3");
         assert_eq!(picked[0].node_id[0], 3, "guard slot must be the live node");
-        assert_eq!(picked[1].node_id[0], 1, "middle slot stays best-RTT, liveness-blind");
+        assert_eq!(
+            picked[1].node_id[0], 1,
+            "middle slot stays best-RTT, liveness-blind"
+        );
     }
 
     #[test]
@@ -1085,7 +1086,7 @@ mod tests {
             &pool,
             2,
             &rtt,
-            &diversity,
+            diversity,
             |_| 0,
             live_set(vec![3]),
         )
@@ -1133,9 +1134,8 @@ mod tests {
             fixture_hop(3, 0xCC),
         ];
         let rtt = rtt_by_first_byte(vec![(1, 10), (2, 20), (3, 300)]);
-        let picked =
-            pick_circuit_hops_latency_aware_guarded(&pool, 2, &rtt, live_set(vec![3]))
-                .expect("2 hops");
+        let picked = pick_circuit_hops_latency_aware_guarded(&pool, 2, &rtt, live_set(vec![3]))
+            .expect("2 hops");
         assert_eq!(picked[0].node_id[0], 3, "guard slot = live node");
         assert_eq!(picked[1].node_id[0], 1, "rest = best remaining RTT");
     }

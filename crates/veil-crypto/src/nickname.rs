@@ -112,7 +112,7 @@ pub struct NicknameRecord {
 pub fn normalize_name(input: &str) -> Option<String> {
     let lowered: String = input.trim().to_ascii_lowercase();
     let len = lowered.chars().count();
-    if len < MIN_NICKNAME_LEN || len > MAX_NICKNAME_LEN {
+    if !(MIN_NICKNAME_LEN..=MAX_NICKNAME_LEN).contains(&len) {
         return None;
     }
     if !lowered
@@ -186,11 +186,7 @@ pub fn seed_weight(name_norm: &str, owner_node_id: &[u8; 32], seed: &[u8; 32]) -
 
 /// Sum of seed weights, or `None` on a duplicate/oversized seed list (which a
 /// verifier must reject rather than silently under-count).
-fn cumulative_weight(
-    name_norm: &str,
-    owner_node_id: &[u8; 32],
-    seeds: &[[u8; 32]],
-) -> Option<u64> {
+fn cumulative_weight(name_norm: &str, owner_node_id: &[u8; 32], seeds: &[[u8; 32]]) -> Option<u64> {
     if seeds.len() > MAX_NICKNAME_SEEDS {
         return None;
     }
@@ -236,7 +232,15 @@ pub fn mine_seeds(
     salt: u64,
     cancel: &AtomicBool,
 ) -> Option<MineOutcome> {
-    mine_seeds_continue(name, owner_node_id, &[], target_weight, max_hashes, salt, cancel)
+    mine_seeds_continue(
+        name,
+        owner_node_id,
+        &[],
+        target_weight,
+        max_hashes,
+        salt,
+        cancel,
+    )
 }
 
 /// Like [`mine_seeds`], but continues from a `prior` seed set — so a host can
@@ -265,7 +269,7 @@ pub fn mine_seeds_continue(
             kept.push((w, *s));
         }
     }
-    kept.sort_by(|a, b| b.0.cmp(&a.0));
+    kept.sort_by_key(|item| std::cmp::Reverse(item.0));
     kept.truncate(MAX_NICKNAME_SEEDS);
     if !kept.is_empty() && kept.iter().map(|(w, _)| *w).sum::<u64>() >= target_weight {
         let weight = kept.iter().map(|(w, _)| *w).sum();
@@ -297,7 +301,7 @@ pub fn mine_seeds_continue(
             continue; // never double-count a seed already kept (e.g. from prior)
         }
         kept.push((w, seed));
-        kept.sort_by(|a, b| b.0.cmp(&a.0));
+        kept.sort_by_key(|item| std::cmp::Reverse(item.0));
         kept.truncate(MAX_NICKNAME_SEEDS);
         if kept.iter().map(|(w, _)| *w).sum::<u64>() >= target_weight {
             hit_target = true;
@@ -568,7 +572,7 @@ mod tests {
                 continue; // a bits=0 seed adds ~nothing; skip to converge fast
             }
             kept.push((w, seed));
-            kept.sort_by(|a, b| b.0.cmp(&a.0));
+            kept.sort_by_key(|item| std::cmp::Reverse(item.0));
             kept.truncate(MAX_NICKNAME_SEEDS);
             if kept.iter().map(|(w, _)| *w).sum::<u64>() >= target {
                 break;
@@ -703,8 +707,7 @@ mod tests {
     fn miner_honors_cancel() {
         let (_sk, node_id) = test_key();
         let cancel = AtomicBool::new(true); // pre-cancelled
-        let out = mine_seeds("longenoughname", &node_id, u64::MAX, 5_000_000, 1, &cancel)
-            .unwrap();
+        let out = mine_seeds("longenoughname", &node_id, u64::MAX, 5_000_000, 1, &cancel).unwrap();
         assert!(!out.hit_target);
         // Cancel is checked at counter&0xFFF==0, so at most a few thousand hashes.
         assert!(out.hashes_done <= 4096);
@@ -715,8 +718,7 @@ mod tests {
         let (_sk, node_id) = test_key();
         let cancel = AtomicBool::new(false);
         // Impossible target, tiny budget → stops at the budget, not the target.
-        let out = mine_seeds("longenoughname", &node_id, u64::MAX, 1000, 1, &cancel)
-            .unwrap();
+        let out = mine_seeds("longenoughname", &node_id, u64::MAX, 1000, 1, &cancel).unwrap();
         assert!(!out.hit_target);
         assert_eq!(out.hashes_done, 1000);
     }
@@ -751,14 +753,8 @@ mod tests {
         let (sk, node_id) = test_key();
         let name = "longenoughname";
         let floor = length_weight_floor(name.len());
-        let light = NicknameRecord::sign(
-            name,
-            &sk,
-            node_id,
-            mine(name, &node_id, floor),
-            1000,
-        )
-        .unwrap();
+        let light =
+            NicknameRecord::sign(name, &sk, node_id, mine(name, &node_id, floor), 1000).unwrap();
         let light_bytes = light.to_bytes();
 
         // First claim → accept (no incumbent).
@@ -846,8 +842,7 @@ mod tests {
         let base = NicknameRecord::sign(name, &sk, node_id, light.clone(), 1000).unwrap();
 
         // Same owner, newer timestamp, same weight → refresh displaces.
-        let refreshed =
-            NicknameRecord::sign(name, &sk, node_id, light, 2000).unwrap();
+        let refreshed = NicknameRecord::sign(name, &sk, node_id, light, 2000).unwrap();
         assert!(refreshed.displaces(&base));
         assert!(!base.displaces(&refreshed));
 

@@ -110,15 +110,16 @@ pub unsafe extern "C" fn veil_identity_sign(
             return SIGN_ERR;
         }
     };
-    let pubkey =
-        match veil_crypto::signature::decode_public_key(identity.algo, identity.public_key.as_str())
-        {
-            Ok(p) => p,
-            Err(e) => {
-                unsafe { set_err(err_out, &format!("public-key decode failed: {e}")) };
-                return SIGN_ERR;
-            }
-        };
+    let pubkey = match veil_crypto::signature::decode_public_key(
+        identity.algo,
+        identity.public_key.as_str(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            unsafe { set_err(err_out, &format!("public-key decode failed: {e}")) };
+            return SIGN_ERR;
+        }
+    };
     if sig.len() != 64 || pubkey.len() != 32 {
         unsafe {
             set_err(
@@ -195,7 +196,9 @@ mod tests {
         let mut err: *mut c_char = std::ptr::null_mut();
         let out = unsafe { crate::node::veil_config_init(8, &mut err) };
         assert!(!out.is_null(), "config_init failed");
-        let toml = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+        let toml = unsafe { CStr::from_ptr(out) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { crate::veil_free_string(out) };
         toml
     }

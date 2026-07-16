@@ -847,7 +847,8 @@ impl CircuitRouteStats {
             } else {
                 self.slow_windows.fetch_add(1, Ordering::Relaxed);
             }
-            let expiry = now.saturating_duration_since(self.opened_at) + CIRCUIT_ROUTE_SLOW_MARK_TTL;
+            let expiry =
+                now.saturating_duration_since(self.opened_at) + CIRCUIT_ROUTE_SLOW_MARK_TTL;
             self.slow_mark_expiry_ms
                 .store(expiry.as_millis() as u64, Ordering::Relaxed);
         } else if busy {
@@ -1185,7 +1186,8 @@ impl CellSender for CircuitCells {
         else {
             // Circuit not up yet — drop this cell; the ARQ/handshake RTO resends.
             if ack_copies > 0 {
-                self.send_ack_copies(dst.node, None, &cell, ack_copies).await;
+                self.send_ack_copies(dst.node, None, &cell, ack_copies)
+                    .await;
             }
             return Ok(());
         };
@@ -2610,7 +2612,8 @@ impl CircuitCells {
         let Some(target) = target else {
             // No usable alternative right now: keep the streak and kick a
             // refill so the shed fires as soon as the pool widens.
-            self.ensure_outbound_opening(dst_node, RouteClass::Bulk).await;
+            self.ensure_outbound_opening(dst_node, RouteClass::Bulk)
+                .await;
             return;
         };
         let swapped = {
@@ -2661,7 +2664,8 @@ impl CircuitCells {
                 stats.snapshot(),
             ),
         );
-        self.ensure_outbound_opening(dst_node, RouteClass::Bulk).await;
+        self.ensure_outbound_opening(dst_node, RouteClass::Bulk)
+            .await;
     }
 
     async fn mark_route_send_failed(
@@ -3572,9 +3576,7 @@ fn try_open_circuit(
                 // sends don't hold the slot lock; a QueueFull/NoRelays here is
                 // harmless (the next tick retries, and a truly dead circuit is
                 // rotated by the idle-refresh below).
-                if now.saturating_duration_since(last_heartbeat)
-                    >= CIRCUIT_HEARTBEAT_INTERVAL
-                {
+                if now.saturating_duration_since(last_heartbeat) >= CIRCUIT_HEARTBEAT_INTERVAL {
                     last_heartbeat = now;
                     let circs: Vec<Arc<veil_node_runtime::DataCircuit>> =
                         circuit_slot.lock().await.iter().cloned().collect();
@@ -4268,9 +4270,8 @@ async fn confirm_circuit_with_probe(
     let started = tokio::time::Instant::now();
     let confirm_deadline = started + CIRCUIT_CONFIRM_TIMEOUT;
     let mut next_probe = started + CIRCUIT_CONFIRM_PROBE_INITIAL_DELAY;
-    let mut probe = Vec::with_capacity(
-        COOKIE_LEN + veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC.len(),
-    );
+    let mut probe =
+        Vec::with_capacity(COOKIE_LEN + veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC.len());
     probe.extend_from_slice(cookie);
     probe.extend_from_slice(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC);
     while !circuit.is_confirmed() && tokio::time::Instant::now() < confirm_deadline {
@@ -4441,9 +4442,9 @@ fn retire_circuits_later(
 #[cfg(test)]
 mod tests {
     use super::{
-        CIRCUIT_INTRO_LEN, CIRCUIT_MSS, CIRCUIT_PEER_TAG_LEN, CircuitMode, DATAGRAM_AUTH_DELIVER_MAX,
-        DATAGRAM_AUTH_SIGNATURE_MAX, DATAGRAM_MAX_CELL, DATAGRAM_MSS, circuit_env_value_mode,
-        parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
+        CIRCUIT_INTRO_LEN, CIRCUIT_MSS, CIRCUIT_PEER_TAG_LEN, CircuitMode,
+        DATAGRAM_AUTH_DELIVER_MAX, DATAGRAM_AUTH_SIGNATURE_MAX, DATAGRAM_MAX_CELL, DATAGRAM_MSS,
+        circuit_env_value_mode, parse_stream_peer_intro_plaintext, stream_peer_intro_plaintext,
     };
     use veil_anonymity::circuit_register::COOKIE_LEN;
     use veil_onion_stream::wire::{DATA_OVERHEAD, Frame, MAX_CELL};

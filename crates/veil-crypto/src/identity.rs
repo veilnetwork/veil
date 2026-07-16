@@ -151,8 +151,7 @@ pub fn derive_mlkem_dk_seed(identity_sk_seed: &[u8; 32]) -> Zeroizing<[u8; 64]> 
 /// blinded-descriptor period (`now / PERIOD_SECS`, 8 LE bytes) is appended to
 /// this constant before expansion. See [`derive_onion_auth_cookie`].
 pub const ONION_AUTH_COOKIE_DERIVATION_INFO: &[u8] = b"veil/onion-auth-cookie/v1";
-pub const ONION_PROVIDER_AUTH_COOKIE_DERIVATION_INFO: &[u8] =
-    b"veil/onion-provider-auth-cookie/v2";
+pub const ONION_PROVIDER_AUTH_COOKIE_DERIVATION_INFO: &[u8] = b"veil/onion-provider-auth-cookie/v2";
 
 /// Derive an onion service's 16-byte rendezvous **auth-cookie** deterministically
 /// from its per-identity Ed25519 SK seed and the current blinded-descriptor
@@ -222,8 +221,7 @@ pub fn derive_onion_provider_auth_cookie(
 /// The blinded-descriptor period is appended like the auth-cookie's. See
 /// [`derive_onion_reg_seed`].
 pub const ONION_REG_KEY_DERIVATION_INFO: &[u8] = b"veil/onion-reg-key/v1";
-pub const ONION_PROVIDER_REG_KEY_DERIVATION_INFO: &[u8] =
-    b"veil/onion-provider-reg-key/v2";
+pub const ONION_PROVIDER_REG_KEY_DERIVATION_INFO: &[u8] = b"veil/onion-provider-reg-key/v2";
 
 /// Derive the Ed25519 SK seed for an onion service's rendezvous registration
 /// keypair, deterministically from the identity seed and the current
@@ -458,7 +456,10 @@ mod tests {
         let p = 19876u64;
         let restart_a = derive_onion_reg_seed(&seed, p);
         let restart_b = derive_onion_reg_seed(&seed, p);
-        assert_eq!(*restart_a, *restart_b, "restart must re-derive the same key");
+        assert_eq!(
+            *restart_a, *restart_b,
+            "restart must re-derive the same key"
+        );
         let next = derive_onion_reg_seed(&seed, p + 1);
         assert_ne!(*restart_a, *next, "periods must not share a reg key");
         // Distinct identities (master vs decoy) never share a reg key.
@@ -481,8 +482,8 @@ mod tests {
         assert_eq!(a.public_key, b.public_key);
         assert_eq!(a.private_key, b.private_key);
         // And the keypair actually signs/verifies.
-        let sig = crate::sign_message(a.algo, &a.public_key, &a.private_key, b"probe")
-            .expect("sign");
+        let sig =
+            crate::sign_message(a.algo, &a.public_key, &a.private_key, b"probe").expect("sign");
         crate::verify_message(a.algo, &a.public_key, b"probe", &sig).expect("verify");
     }
 
@@ -494,10 +495,7 @@ mod tests {
         let cookie1 = derive_onion_provider_auth_cookie(&seed, period, 1);
         assert_ne!(cookie0, cookie1);
         assert_ne!(cookie0, derive_onion_auth_cookie(&seed, period));
-        assert_eq!(
-            cookie0,
-            derive_onion_provider_auth_cookie(&seed, period, 0)
-        );
+        assert_eq!(cookie0, derive_onion_provider_auth_cookie(&seed, period, 0));
 
         let reg0 = derive_onion_provider_reg_seed(&seed, period, 0);
         let reg1 = derive_onion_provider_reg_seed(&seed, period, 1);

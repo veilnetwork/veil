@@ -1923,11 +1923,7 @@ mod tests {
         );
         hdr.body_len = body.len() as u32;
 
-        let result = dispatcher.dispatch_relay_chain(
-            &hdr,
-            &body,
-            NodeId::from([0xEE; 32]),
-        );
+        let result = dispatcher.dispatch_relay_chain(&hdr, &body, NodeId::from([0xEE; 32]));
         assert!(matches!(result, DispatchResult::NoResponse));
         let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await

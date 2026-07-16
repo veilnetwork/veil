@@ -236,6 +236,7 @@ impl SessionTxRegistry {
     /// Returns:
     /// * `Some(rx)` — accepted as the canonical session.  Caller proceeds.
     /// * `None` — caller is the loser; should `shutdown()` the stream.
+    ///
     /// `evict_open_on_dedup` — when the policy would otherwise reject because an
     /// OPEN same-`peer_id` session already exists, REPLACE it instead: drop the
     /// stale sender (closing its channel ⇒ the old runner's outbox drain returns
@@ -244,6 +245,7 @@ impl SessionTxRegistry {
     /// peer only reconnects once ITS side has given up the old link, so
     /// latest-wins is correct and immediately clears an M5 zombie's tx (which
     /// otherwise blocks every reconnect until the liveness ceiling reaps it).
+    ///
     /// `false` preserves strict first-wins dedup — the mesh path always passes it.
     pub fn try_register_directional(
         &mut self,
@@ -437,7 +439,7 @@ impl SessionTxRegistry {
                     self.capacity,
                     n,
                 );
-                if n.is_power_of_two() || n % 1000 == 0 {
+                if n.is_power_of_two() || n.is_multiple_of(1000) {
                     log::warn!(
                         "LIMIT tx_queue: {} frames dropped on full session \
                          channels (cap {}); latest peer {}",

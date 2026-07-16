@@ -6000,9 +6000,7 @@ mod tests {
 
     #[test]
     fn mirror_cache_key_binding_for_provider_descriptor() {
-        use veil_anonymity::blinded_descriptor::{
-            BlindedDescriptorBody, seal_provider_descriptor,
-        };
+        use veil_anonymity::blinded_descriptor::{BlindedDescriptorBody, seal_provider_descriptor};
 
         let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
         let body = BlindedDescriptorBody {

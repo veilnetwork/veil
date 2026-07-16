@@ -204,6 +204,7 @@ pub trait AnonOnionSender: Send + Sync {
     /// `(reply_app_id, reply_endpoint_id)` on this node so the relay can answer
     /// WITHOUT either side publishing a public ad. The circuit length is the
     /// implementation's configured default.
+    #[allow(clippy::too_many_arguments)]
     fn send_authenticated_direct_with_reply<'a>(
         &'a self,
         target_node_id: [u8; 32],

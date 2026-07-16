@@ -539,23 +539,16 @@ mod tests {
         let (id_sk, id_vk) = identity();
         let period = 17;
         let expected = body(0x71);
-        let (key, descriptor) =
-            seal_provider_descriptor(&id_sk, period, 3, &expected).unwrap();
+        let (key, descriptor) = seal_provider_descriptor(&id_sk, period, 3, &expected).unwrap();
 
-        assert_eq!(
-            key,
-            provider_descriptor_dht_key(&id_vk, period, 3).unwrap()
-        );
+        assert_eq!(key, provider_descriptor_dht_key(&id_vk, period, 3).unwrap());
         assert_eq!(
             open_provider_descriptor(&id_vk, period, 3, &descriptor),
             Some(expected)
         );
         assert_eq!(verify_provider_descriptor_self(&descriptor), Some(key));
         assert!(open_provider_descriptor(&id_vk, period, 2, &descriptor).is_none());
-        assert_ne!(
-            key,
-            provider_descriptor_dht_key(&id_vk, period, 4).unwrap()
-        );
+        assert_ne!(key, provider_descriptor_dht_key(&id_vk, period, 4).unwrap());
         assert_ne!(
             key,
             provider_descriptor_dht_key(&id_vk, period + 1, 3).unwrap()
@@ -565,8 +558,7 @@ mod tests {
     #[test]
     fn provider_descriptor_rejects_tamper_and_out_of_range_slot() {
         let (id_sk, id_vk) = identity();
-        let (_, descriptor) =
-            seal_provider_descriptor(&id_sk, 4, 0, &body(0x44)).unwrap();
+        let (_, descriptor) = seal_provider_descriptor(&id_sk, 4, 0, &body(0x44)).unwrap();
 
         let mut moved = descriptor.clone();
         moved[2] = 1;
@@ -576,14 +568,10 @@ mod tests {
         let mut ciphertext_tamper = descriptor.clone();
         ciphertext_tamper[3 + 32 + NONCE_LEN + 2] ^= 1;
         assert_eq!(verify_provider_descriptor_self(&ciphertext_tamper), None);
-        assert!(
-            open_provider_descriptor(&id_vk, 4, 0, &ciphertext_tamper).is_none()
-        );
+        assert!(open_provider_descriptor(&id_vk, 4, 0, &ciphertext_tamper).is_none());
 
         assert!(provider_descriptor_dht_key(&id_vk, 4, MAX_PROVIDER_SLOTS).is_none());
-        assert!(
-            seal_provider_descriptor(&id_sk, 4, MAX_PROVIDER_SLOTS, &body(1)).is_none()
-        );
+        assert!(seal_provider_descriptor(&id_sk, 4, MAX_PROVIDER_SLOTS, &body(1)).is_none());
         assert_eq!(verify_provider_descriptor_self(&[]), None);
     }
 }
