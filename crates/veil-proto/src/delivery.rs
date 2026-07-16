@@ -269,6 +269,22 @@ impl DeliveryEnvelope {
 /// relay-loop dedup while terminal delivery still keys on `content_id` alone.
 pub const FORWARD_DELIVERY_ATTEMPT_MARKER: u8 = 0xA7;
 
+/// Optional extension marker preceding the originator's traffic class in a
+/// [`ForwardPayload`]. Same backward-compatible tail contract as the
+/// delivery-attempt marker: legacy decoders ignore bytes after `relay_hops`.
+/// Without it a relay has no way to tell a real-time media datagram from
+/// bulk delivery chatter — the frame header's 2-bit priority field is unset
+/// (0 = REALTIME) by every legacy sender, so it cannot be trusted — and
+/// relays used to re-queue everything at one class, adding seconds of queue
+/// delay to live call media on a busy hop.
+pub const FORWARD_TRAFFIC_CLASS_MARKER: u8 = 0xA8;
+
+/// A REALTIME class hint is honored by relays only for payloads at or below
+/// this size. Real-time media datagrams are small (one RTP/RTCP packet plus
+/// E2E envelope overhead); anything larger claiming REALTIME is demoted to
+/// INTERACTIVE so bulk transfers cannot jump the media lane.
+pub const FORWARD_REALTIME_MAX_PAYLOAD: usize = 8192;
+
 /// Request to forward an envelope to the next hop.
 ///
 /// Wire layout:
@@ -279,6 +295,8 @@ pub const FORWARD_DELIVERY_ATTEMPT_MARKER: u8 = 0xA7;
 /// [end+8..+1] relay_hops u8
 /// [end+9] optional 0xA7 extension marker
 /// [end+10] optional delivery_attempt u8 (1..=MAX_DELIVERY_ATTEMPTS)
+/// [then] optional 0xA8 extension marker
+/// [then+1] optional traffic_class u8 (header::priority constant)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardPayload {
@@ -296,6 +314,11 @@ pub struct ForwardPayload {
     /// wire form. Relays validate the bounded range and deduplicate each
     /// attempt separately; the final recipient deliberately ignores it.
     pub delivery_attempt: Option<u8>,
+    /// Originator's queueing-class hint ([`crate::header::priority`]).
+    /// `None` is the legacy wire form and queues as INTERACTIVE. Relays
+    /// preserve the marker when re-encoding and apply
+    /// [`Self::relay_traffic_class`], never the raw value.
+    pub traffic_class: Option<u8>,
 }
 
 impl ForwardPayload {
@@ -304,7 +327,11 @@ impl ForwardPayload {
     pub fn encode(&self) -> Vec<u8> {
         let env_bytes = self.envelope.encode();
         let mut buf = Vec::with_capacity(
-            32 + env_bytes.len() + 8 + 1 + usize::from(self.delivery_attempt.is_some()) * 2,
+            32 + env_bytes.len()
+                + 8
+                + 1
+                + usize::from(self.delivery_attempt.is_some()) * 2
+                + usize::from(self.traffic_class.is_some()) * 2,
         );
         buf.extend_from_slice(&self.next_hop_node_id);
         buf.extend_from_slice(&env_bytes);
@@ -314,11 +341,17 @@ impl ForwardPayload {
             buf.push(FORWARD_DELIVERY_ATTEMPT_MARKER);
             buf.push(attempt);
         }
+        if let Some(tc) = self.traffic_class {
+            buf.push(FORWARD_TRAFFIC_CLASS_MARKER);
+            buf.push(tc);
+        }
         buf
     }
 
     /// Parse from wire bytes. Requires the fixed `trace_id || relay_hops`
-    /// suffix after the envelope.
+    /// suffix after the envelope; the optional marker pairs may follow in any
+    /// order (each at most once — an unknown or repeated marker ends parsing,
+    /// mirroring the legacy ignore-the-tail contract).
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
         if buf.len() < 32 {
             return Err(ProtoError::BufferTooShort {
@@ -338,17 +371,48 @@ impl ForwardPayload {
         }
         envelope.trace_id = super::read_u64_be(buf, after_env)?;
         let relay_hops = buf[after_env + 8];
-        let delivery_attempt = if buf.get(need) == Some(&FORWARD_DELIVERY_ATTEMPT_MARKER) {
-            buf.get(need + 1).copied()
-        } else {
-            None
-        };
+        let mut cursor = need;
+        let mut delivery_attempt = None;
+        let mut traffic_class = None;
+        while let Some(&marker) = buf.get(cursor) {
+            match marker {
+                FORWARD_DELIVERY_ATTEMPT_MARKER if delivery_attempt.is_none() => {
+                    delivery_attempt = buf.get(cursor + 1).copied();
+                    cursor += 2;
+                }
+                FORWARD_TRAFFIC_CLASS_MARKER if traffic_class.is_none() => {
+                    traffic_class = buf.get(cursor + 1).copied();
+                    cursor += 2;
+                }
+                _ => break,
+            }
+        }
         Ok(Self {
             next_hop_node_id,
             envelope,
             relay_hops,
             delivery_attempt,
+            traffic_class,
         })
+    }
+
+    /// Queueing class a relay should apply to this forward. A REALTIME hint
+    /// is honored only for small payloads ([`FORWARD_REALTIME_MAX_PAYLOAD`])
+    /// so bulk transfers cannot jump the media lane; an explicit BULK hint is
+    /// respected; everything else — including legacy frames without the
+    /// marker and out-of-range values — rides INTERACTIVE.
+    pub fn relay_traffic_class(&self) -> u8 {
+        use crate::header::priority;
+        match self.traffic_class {
+            Some(p)
+                if p == priority::REALTIME
+                    && self.envelope.payload.len() <= FORWARD_REALTIME_MAX_PAYLOAD =>
+            {
+                p
+            }
+            Some(p) if p == priority::BULK => p,
+            _ => priority::INTERACTIVE,
+        }
     }
 }
 
@@ -1090,6 +1154,7 @@ mod tests {
             envelope: sample_envelope(),
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let encoded = payload.encode();
         let decoded = ForwardPayload::decode(&encoded).unwrap();
@@ -1112,6 +1177,7 @@ mod tests {
             envelope: sample_envelope(),
             relay_hops: 5,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let encoded = payload.encode();
         let decoded = ForwardPayload::decode(&encoded).unwrap();
@@ -1140,6 +1206,7 @@ mod tests {
             envelope: env,
             relay_hops: 12,
             delivery_attempt: Some(2),
+            traffic_class: None,
         };
         let encoded = payload.encode();
         let decoded = ForwardPayload::decode(&encoded).unwrap();
@@ -1156,6 +1223,7 @@ mod tests {
             envelope: sample_envelope(),
             relay_hops: 1,
             delivery_attempt: None,
+            traffic_class: None,
         };
         let mut unknown = payload.encode();
         unknown.extend_from_slice(&[0xEE, 7, 8]);
@@ -1164,6 +1232,73 @@ mod tests {
         let mut truncated = payload.encode();
         truncated.push(FORWARD_DELIVERY_ATTEMPT_MARKER);
         assert_eq!(ForwardPayload::decode(&truncated).unwrap(), payload);
+    }
+
+    #[test]
+    fn forward_traffic_class_roundtrip_alone_and_with_attempt() {
+        let mut payload = ForwardPayload {
+            next_hop_node_id: [5u8; 32],
+            envelope: sample_envelope(),
+            relay_hops: 1,
+            delivery_attempt: None,
+            traffic_class: Some(crate::header::priority::REALTIME),
+        };
+        let decoded = ForwardPayload::decode(&payload.encode()).unwrap();
+        assert_eq!(decoded, payload);
+
+        payload.delivery_attempt = Some(2);
+        let decoded = ForwardPayload::decode(&payload.encode()).unwrap();
+        assert_eq!(decoded.delivery_attempt, Some(2));
+        assert_eq!(
+            decoded.traffic_class,
+            Some(crate::header::priority::REALTIME)
+        );
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn forward_traffic_class_markers_decode_in_either_order() {
+        let payload = ForwardPayload {
+            next_hop_node_id: [6u8; 32],
+            envelope: sample_envelope(),
+            relay_hops: 0,
+            delivery_attempt: Some(1),
+            traffic_class: Some(crate::header::priority::REALTIME),
+        };
+        // Re-order the two marker pairs by hand: class first, attempt second.
+        let canonical = payload.encode();
+        let n = canonical.len();
+        let mut swapped = canonical[..n - 4].to_vec();
+        swapped.extend_from_slice(&canonical[n - 2..]); // class pair
+        swapped.extend_from_slice(&canonical[n - 4..n - 2]); // attempt pair
+        assert_eq!(ForwardPayload::decode(&swapped).unwrap(), payload);
+    }
+
+    #[test]
+    fn relay_traffic_class_honors_small_realtime_and_demotes_abuse() {
+        use crate::header::priority;
+        let mut payload = ForwardPayload {
+            next_hop_node_id: [7u8; 32],
+            envelope: sample_envelope(),
+            relay_hops: 0,
+            delivery_attempt: None,
+            traffic_class: Some(priority::REALTIME),
+        };
+        // Small payload + REALTIME hint → honored.
+        assert!(payload.envelope.payload.len() <= FORWARD_REALTIME_MAX_PAYLOAD);
+        assert_eq!(payload.relay_traffic_class(), priority::REALTIME);
+
+        // Oversized payload claiming REALTIME → demoted to INTERACTIVE.
+        payload.envelope.payload = vec![0u8; FORWARD_REALTIME_MAX_PAYLOAD + 1];
+        assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
+
+        // Explicit BULK is respected; junk and legacy ride INTERACTIVE.
+        payload.traffic_class = Some(priority::BULK);
+        assert_eq!(payload.relay_traffic_class(), priority::BULK);
+        payload.traffic_class = Some(0xFF);
+        assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
+        payload.traffic_class = None;
+        assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
     }
 
     #[test]

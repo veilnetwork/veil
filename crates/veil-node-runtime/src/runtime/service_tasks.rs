@@ -4222,6 +4222,7 @@ mod tests {
             envelope,
             relay_hops: 0,
             delivery_attempt: Some(1),
+            traffic_class: None,
         }
         .encode();
         let mut header = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
@@ -4269,6 +4270,7 @@ mod tests {
             envelope,
             relay_hops: 0,
             delivery_attempt: None,
+            traffic_class: None,
         }
         .encode();
         let mut header = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
@@ -4331,6 +4333,7 @@ mod tests {
                 envelope,
                 relay_hops: 0,
                 delivery_attempt: None,
+                traffic_class: None,
             }
             .encode();
             let mut header =

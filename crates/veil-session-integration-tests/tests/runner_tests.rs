@@ -2910,6 +2910,7 @@ async fn runner_delivery_forward_relayed_to_next_hop() {
         envelope,
         relay_hops: 0,
         delivery_attempt: None,
+        traffic_class: None,
     };
     let fwd_bytes = fwd.encode();
 
