@@ -1338,6 +1338,17 @@ pub unsafe extern "C" fn veil_media_repair_channel(chan: u64) -> c_int {
     }
 }
 
+/// Runtime toggle for the slow-inbound-dispatch trace
+/// (`veil_session::rt_trace`) — the embedded-node twin of the
+/// `VEIL_RT_TRACE=1` environment gate on CLI deployments. Driven by the
+/// xVeil debug hook during live call-RTT investigations; slow dispatches
+/// surface in the node log as `session.rt_trace.slow_dispatch`. Free when
+/// off; always succeeds.
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_debug_set_rt_trace(on: c_int) {
+    veil_session::rt_trace::set_rt_trace(on != 0);
+}
+
 /// Feed one direct-P2P media datagram received by the host on the media app
 /// endpoint into the shared native media callback registry. The host is
 /// responsible for authenticating/filtering the source app id before calling.

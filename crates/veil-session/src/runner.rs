@@ -3833,7 +3833,30 @@ impl SessionRunner {
             }
 
             // ── Dispatch ─────────────────────────────────────────────────────
+            // Dispatch runs SYNCHRONOUSLY on this loop: every millisecond a
+            // handler spends here delays every frame queued behind this one
+            // on the ordered stream — including REALTIME call media. The
+            // rt_trace probe names slow handlers on a live stand (the
+            // call-RTT-spike investigation); off = one relaxed load.
+            let rt_trace_t0 = crate::rt_trace::rt_trace_enabled()
+                .then(std::time::Instant::now);
+            let rt_trace_body_len = body.len();
             let result = self.dispatcher.dispatch(&header, body, self.peer_id);
+            if let Some(t0) = rt_trace_t0 {
+                let elapsed_ms = t0.elapsed().as_millis();
+                if elapsed_ms >= crate::rt_trace::SLOW_DISPATCH_MS {
+                    self.logger.warn(
+                        "session.rt_trace.slow_dispatch",
+                        format!(
+                            "peer_id={} family={} msg={} len={rt_trace_body_len} \
+                             elapsed_ms={elapsed_ms}",
+                            hex_short(&self.peer_id),
+                            header.family,
+                            header.msg_type,
+                        ),
+                    );
+                }
+            }
 
             // `process_dispatch_result` returns `true` when the runner
             // loop should break (session close due to cipher error / fatal

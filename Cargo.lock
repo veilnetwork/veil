@@ -4834,6 +4834,7 @@ dependencies = [
  "veil-node-runtime",
  "veil-onion-stream",
  "veil-proto",
+ "veil-session",
  "veil-types",
  "veil-util",
  "veilclient",
