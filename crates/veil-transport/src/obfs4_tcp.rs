@@ -29,7 +29,10 @@ use veil_obfs4::{
 use super::{
     TransportContext,
     error::{Result, TransportError},
-    tcp::{boxed_stream_connection, clamp_downlink_mss, connect_tcp_stream, peer_meta},
+    tcp::{
+        boxed_stream_connection, clamp_downlink_mss, clamp_uplink_sndbuf, connect_tcp_stream,
+        peer_meta,
+    },
     traits::{
         BoxIoStream, RawInbound, Transport, TransportCapabilities, TransportConnection,
         TransportListener,
@@ -164,6 +167,7 @@ impl TransportListener for Obfs4TcpListener {
                 socket2::SockRef::from(&tcp).set_tcp_keepalive(&ka)?;
             }
             clamp_downlink_mss(&tcp);
+            clamp_uplink_sndbuf(&tcp);
             let local_addr = tcp.local_addr().ok();
 
             // Run server-side handshake; silent-drop (return Err)
@@ -206,6 +210,7 @@ impl TransportListener for Obfs4TcpListener {
                 socket2::SockRef::from(&tcp).set_tcp_keepalive(&ka)?;
             }
             clamp_downlink_mss(&tcp);
+            clamp_uplink_sndbuf(&tcp);
             let local_addr = tcp.local_addr().ok();
             // Clone the config the handshake needs so `finish` is `'static`.
             let psk = self.psk.clone();
