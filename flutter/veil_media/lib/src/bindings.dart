@@ -59,6 +59,15 @@ final int Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineStopVideo =
             'veil_media_engine_stop_video')
         .asFunction();
 
+// set_video_bitrate(engine*, max_bitrate_kbps int, max_fps int) -> int
+final int Function(Pointer<VeilMediaEngineHandle>, int, int)
+    veilMediaEngineSetVideoBitrate = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilMediaEngineHandle>, Int32,
+                    Int32)>>('veil_media_engine_set_video_bitrate')
+        .asFunction();
+
 // push_video_frame(engine*, y, u, v, w, h, stride_y, stride_u, stride_v, ts_us) -> int
 final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Uint8>,
         Pointer<Uint8>, Pointer<Uint8>, int, int, int, int, int, int)
