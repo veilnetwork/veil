@@ -1477,8 +1477,8 @@ pub unsafe extern "C" fn veil_media_set_recv_callback(
         }
     };
     match cb {
-        Some(cb) => media::set_recv_callback(peer, cb, ctx),
-        None => media::clear_recv_callback(peer),
+        Some(cb) => media::set_recv_callback(peer, chan, cb, ctx),
+        None => media::clear_recv_callback(peer, chan),
     }
     0
 }
@@ -1496,7 +1496,7 @@ pub unsafe extern "C" fn veil_media_close_channel(chan: u64) {
         // Dropping `ch.tx` already closes the queue (the drain loop ends), but
         // abort to reclaim the task promptly even if it is mid-await.
         ch.task.abort();
-        media::clear_recv_callback(ch.peer);
+        media::clear_recv_callback(ch.peer, chan);
     }
 }
 
