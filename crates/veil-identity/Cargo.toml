@@ -1,6 +1,6 @@
 [package]
 name = "veil-identity"
-version = "0.2.0"
+version = "0.3.1"
 edition = "2024"
 description = "Sovereign identity for the Veil network — master seed (BIP39 mnemonic, Argon2id-encrypted at-rest file, QR backup share format), per-device instance state, and the full identity-document publish/verify/resolve flow.  Independent of DHT / transport / dispatcher; the production Kademlia publisher lives next to the runtime as veil_node_runtime::identity_local::publisher_dht."
 license = "AGPL-3.0-or-later"

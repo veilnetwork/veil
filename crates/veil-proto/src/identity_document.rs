@@ -40,7 +40,7 @@ use super::cursor::{read_array, read_bytes, read_u8, read_u16, read_u64};
 // ── Magic, version, algorithms ────────────────────────────────────────────────
 
 /// "ID" — identifies an IdentityDocument value in DHT.
-pub const IDENTITY_DOCUMENT_MAGIC: [u8; 2] = [b'I', b'D'];
+pub const IDENTITY_DOCUMENT_MAGIC: [u8; 2] = *b"ID";
 
 /// Wire-format version.
 pub const IDENTITY_DOCUMENT_V1: u8 = 1;

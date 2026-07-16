@@ -597,14 +597,14 @@ async fn drive<D: CellDuplex>(
     if engine.is_closed() {
         let _ = duplex.send_cell(&cell).await;
     }
-    if set_end_if_open(
+    let _ = set_end_if_open(
         &end,
         if engine.is_eof() {
             End::Eof
         } else {
             End::Reset(reset_reason::APP)
         },
-    ) {}
+    );
     let (btl_bw, rtt_min_ms, delivered) = engine.delivery_model();
     if btl_bw > 0 {
         duplex

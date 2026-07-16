@@ -753,13 +753,8 @@ impl VeilClient {
         name: &str,
         endpoint_id: u32,
     ) -> Result<AppHandle, ClientError> {
-        self.bind_with_flags(
-            namespace,
-            name,
-            endpoint_id,
-            ipc_bind_flags::CAPABILITY,
-        )
-        .await
+        self.bind_with_flags(namespace, name, endpoint_id, ipc_bind_flags::CAPABILITY)
+            .await
     }
 
     async fn bind_with_flags(

@@ -1,0 +1,75 @@
+---
+# Enable the anonymity RELAY role on the leaf nodes so onion circuits can form.
+#
+# A circuit is 3 distinct hops, every hop `[anonymity].relay_capable = true`
+# (gates the rendezvous-relay server role + per-hop circuit state). The node
+# template ships NO [anonymity] section, so nodes default to non-relay and a
+# client's circuit build returns None (insufficient distinct relays). This adds
+# the section to every leaf node, giving a 15-node relay pool.
+#
+#   ansible-playbook -i inventory.yml enable-relay-capable.yml
+#   # scope to a subset:  --limit node1,node2,node3
+#
+# Idempotent (blockinfile marker). Validates config before any restart and
+# restarts one small batch at a time so the mesh stays connected.
+- name: Enable anonymity relay role on leaf nodes
+  hosts: nodes:bootstrap
+  become: true
+  serial: 3 # keep >=12 leaf nodes + 3 bootstraps up across restarts
+
+  vars:
+    veil_config: /var/lib/veil/node.toml
+    metrics_url: http://127.0.0.1:19999/metrics
+
+  tasks:
+    - name: Ensure [anonymity] relay_capable = true
+      ansible.builtin.blockinfile:
+        path: "{{ veil_config }}"
+        marker: "# {mark} ANSIBLE MANAGED anonymity (relay_capable)"
+        block: |
+          [anonymity]
+          relay_capable = true
+        owner: veil
+        group: veil
+        mode: "0600"
+      register: cfg
+
+    - name: Validate config parses before any restart
+      ansible.builtin.command:
+        cmd: "/usr/local/bin/veil-cli --config {{ veil_config }} config validate"
+      changed_when: false
+
+    - name: Restart veil if the config changed
+      ansible.builtin.systemd:
+        name: veil
+        state: restarted
+      when: cfg.changed
+
+    - name: Wait for the metrics endpoint to come back (<=30 s)
+      ansible.builtin.shell: |
+        for _ in $(seq 1 30); do
+          curl -sf {{ metrics_url }} >/dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        exit 1
+      register: ready
+      changed_when: false
+      failed_when: ready.rc != 0
+      when: cfg.changed
+
+    - name: Restart chat-node so its IPC session re-binds (only where present)
+      ansible.builtin.systemd:
+        name: chat-node
+        state: restarted
+      when: cfg.changed
+      register: chat_restart
+      failed_when: false
+
+    - name: Report effective [anonymity] block
+      ansible.builtin.shell: "grep -A1 '^\\[anonymity\\]' {{ veil_config }} || echo '(absent!)'"
+      changed_when: false
+      register: eff
+
+    - name: Show effective relay_capable
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ eff.stdout_lines }}"

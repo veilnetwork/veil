@@ -84,6 +84,7 @@ fn prepare_ack_retransmit_frame(frame: &[u8], next_hop: [u8; 32], attempt: u32) 
 /// node_id. Shared by the direct-onion (`Full`) and rendezvous (reassembled
 /// `Fragment`) paths. Every failure is logged and dropped — never surfaced to
 /// the anonymous sender (that would leak recipient liveness).
+#[allow(clippy::too_many_arguments)]
 async fn process_auth_deliver(
     auth: veil_proto::AuthAppDeliver,
     access: &super::NodeServices,
@@ -159,7 +160,10 @@ async fn process_auth_deliver(
     // the streak, the fan-out never widened, and every message paid the
     // mailbox latency).
     if via_reply_circuit {
-        access.anonymity.send_stall.note_answer(&auth.sender_node_id);
+        access
+            .anonymity
+            .send_stall
+            .note_answer(&auth.sender_node_id);
     }
 
     // 4. Deliver with the VERIFIED sender node_id. If the message carried a
@@ -510,7 +514,10 @@ pub(crate) async fn warm_connected_relay_directory(
         // its relay (store_local, never replicated to the key's K-closest) and
         // the relay is XOR-far from its own key — device-observed have:0 under
         // 3/3 live seed sessions (2026-07-07).
-        let bytes = match dht.find_value_from_peer(peer, key, Arc::clone(outbox)).await {
+        let bytes = match dht
+            .find_value_from_peer(peer, key, Arc::clone(outbox))
+            .await
+        {
             Some(b) => Some(b),
             None => {
                 dht.find_value_iterative_network(key, Arc::clone(outbox))
@@ -3415,9 +3422,7 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     let _refresh_guard = resolve_cache.lock_refresh(receiver_id).await;
     // Another send may have completed the refresh while this one waited for
     // the per-recipient single-flight lock.
-    if !force_refresh
-        && let Some(ads) = resolve_cache.get(&receiver_id, now)
-    {
+    if !force_refresh && let Some(ads) = resolve_cache.get(&receiver_id, now) {
         return ads;
     }
 
@@ -3530,7 +3535,9 @@ fn replicas_from_freshest_ads(
         let gated: Vec<_> = ads
             .iter()
             .filter(|a| {
-                a.valid_from_unix.saturating_add(DEPOSIT_GENERATION_SKEW_SECS) >= newest
+                a.valid_from_unix
+                    .saturating_add(DEPOSIT_GENERATION_SKEW_SECS)
+                    >= newest
             })
             .cloned()
             .collect();
@@ -3744,11 +3751,7 @@ impl veil_types::AnonOnionSender for RuntimeAnonOnionSender {
                 relays.sort_unstable();
                 relays.dedup();
                 self.access
-                    .warm_known_relay_directory(
-                        &relays,
-                        6,
-                        std::time::Duration::from_secs(5),
-                    )
+                    .warm_known_relay_directory(&relays, 6, std::time::Duration::from_secs(5))
                     .await;
             }
             // The KEM-key-given mailbox FETCH: route a source-routed onion
@@ -4500,10 +4503,7 @@ mod tests {
         let old_generation = test_rendezvous_ad(0xA1, 100, 1);
         let current = test_rendezvous_ad(0xB2, 300, 2);
 
-        let out = replicas_from_freshest_ads(
-            vec![old_generation.clone(), current],
-            8,
-        );
+        let out = replicas_from_freshest_ads(vec![old_generation.clone(), current], 8);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].relay_node_id, [0xB2; 32]);
 

@@ -1,6 +1,6 @@
 [package]
 name = "veil-webtunnel"
-version = "0.2.0"
+version = "0.3.1"
 edition = "2024"
 description = "webtunnel-style anti-probe endpoint masking for WSS/TLS transports. Phase 5 of PLAN_TRANSPORT_OBFUSCATION.md — disguises the endpoint as a legitimate HTTPS site; switches to WebSocket veil-tunnel mode only with the configured secret path + auth header."
 license = "AGPL-3.0-or-later"

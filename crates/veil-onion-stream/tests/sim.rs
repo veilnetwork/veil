@@ -101,7 +101,7 @@ impl Pipe {
             let base = match p.ch.two_path {
                 // Round-robin cells across the two simulated routes.
                 Some((fast, slow)) => {
-                    if p.injected % 2 == 0 {
+                    if p.injected.is_multiple_of(2) {
                         fast
                     } else {
                         slow
@@ -813,8 +813,7 @@ fn rack_two_path_reorder_adapts_without_spurious_collapse() {
         payload_cells
     );
     assert!(
-        !out
-            .a_events
+        !out.a_events
             .iter()
             .any(|e| matches!(e, Event::DataRto { .. })),
         "reordering alone must never fire the RTO: {:?}",
@@ -897,7 +896,10 @@ fn rack_repairs_real_loss_under_reordering_before_rto() {
         // retransmit, which must get through).
         matches!(data_seen, 40 | 41)
     });
-    assert!(out.completed, "two-path transfer with drops did not complete");
+    assert!(
+        out.completed,
+        "two-path transfer with drops did not complete"
+    );
     assert_eq!(out.received, data, "ARQ failed under loss + reordering");
     assert!(
         out.elapsed_ms < 10_000,
@@ -905,8 +907,7 @@ fn rack_repairs_real_loss_under_reordering_before_rto() {
         out.elapsed_ms
     );
     assert!(
-        !out
-            .a_events
+        !out.a_events
             .iter()
             .any(|e| matches!(e, Event::DataRto { .. })),
         "RTO fired for a RACK-repairable mid-stream loss: {:?}",

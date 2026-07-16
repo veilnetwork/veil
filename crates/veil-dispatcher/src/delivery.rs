@@ -1474,7 +1474,7 @@ impl FrameDispatcher {
                 // (per-sender / global reassembly quotas, metadata mismatch, …).
                 self.logger.warn(
                     "chunk.rejected",
-                    &format!("LIMIT chunk_reassembly: {reason}"),
+                    format!("LIMIT chunk_reassembly: {reason}"),
                 );
             }
         }

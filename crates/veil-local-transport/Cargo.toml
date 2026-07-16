@@ -1,6 +1,6 @@
 [package]
 name = "veil-local-transport"
-version = "0.2.0"
+version = "0.3.1"
 edition = "2024"
 description = "Shared listener / stream / token-handshake plumbing for the Veil node's two local protocols (admin and IPC). Provides a Unix-domain-socket-or-TCP-loopback listener with optional 32-byte token authentication, behind a single AsyncRead+AsyncWrite enum.  Phase 6.3 extraction from veilcore — zero veil-internal deps; usable by mobile-app IPC clients without dragging in DHT / transport / dispatcher."
 license = "AGPL-3.0-or-later"

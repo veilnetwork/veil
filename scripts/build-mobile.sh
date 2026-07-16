@@ -88,7 +88,10 @@ build_one() {
 
   if [[ "$triple" == *android* ]]; then
     if command -v cargo-ndk >/dev/null 2>&1; then
-      cargo ndk --target "$triple" -- build "${cargo_args[@]}"
+      # Keep the local helper aligned with mobile-build.yml.  In particular,
+      # 32-bit armv7 needs bionic's fseeko/ftello declarations, which are only
+      # exposed to RocksDB's C++ build at API 24 or newer.
+      cargo ndk --target "$triple" --platform 24 -- build "${cargo_args[@]}"
     else
       echo "WARN: cargo-ndk not installed — falling back to plain cargo;" \
            "Android targets typically need 'cargo install cargo-ndk' to" \

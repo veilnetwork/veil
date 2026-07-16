@@ -1,6 +1,6 @@
 [package]
 name = "oproxy"
-version = "0.2.0"
+version = "0.3.1"
 edition = "2024"
 description = "Veil-network proxy bridge: standalone client with SOCKS5/HTTP/TProxy inbounds + standalone server with custom app_name + node_id allowlist.  Works on Windows, Linux, macOS, FreeBSD, Keenetic."
 license = "AGPL-3.0-or-later"

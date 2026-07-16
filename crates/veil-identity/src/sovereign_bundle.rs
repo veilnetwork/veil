@@ -617,8 +617,7 @@ mod tests {
         .unwrap();
 
         let next_code = b"xvrc-next-independent-code-123456789012345";
-        let replacement =
-            export_recovery_certificate(&certificate, code, next_code).unwrap();
+        let replacement = export_recovery_certificate(&certificate, code, next_code).unwrap();
         let reopened = open_recovery_certificate(&replacement, next_code).unwrap();
         assert_eq!(reopened.node_id(), original.node_id());
         assert_eq!(reopened.public_key, original.public_key);

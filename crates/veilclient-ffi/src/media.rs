@@ -81,16 +81,18 @@ static RECV_COUNT: LazyLock<Mutex<HashMap<[u8; 32], u64>>> =
 /// Register (or replace) the recv callback for media datagrams arriving from
 /// `peer`.
 pub fn set_recv_callback(peer: [u8; 32], cb: MediaRecvFn, ctx: *mut c_void) {
-    RECV.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(peer, RecvCb { cb, ctx: ctx as usize });
+    RECV.lock().unwrap_or_else(|p| p.into_inner()).insert(
+        peer,
+        RecvCb {
+            cb,
+            ctx: ctx as usize,
+        },
+    );
 }
 
 /// Drop the recv callback for `peer` (channel close).
 pub fn clear_recv_callback(peer: [u8; 32]) {
-    RECV.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&peer);
+    RECV.lock().unwrap_or_else(|p| p.into_inner()).remove(&peer);
 }
 
 /// Deliver one inbound media datagram from `peer` to its registered callback.

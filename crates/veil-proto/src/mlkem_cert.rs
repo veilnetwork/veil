@@ -53,7 +53,7 @@ use super::prekey_bundle::{ALGO_ML_KEM_768, ML_KEM_768_EK_LEN};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-pub const MLKEM_CERT_MAGIC: [u8; 2] = [b'M', b'C'];
+pub const MLKEM_CERT_MAGIC: [u8; 2] = *b"MC";
 pub const MLKEM_CERT_V1: u8 = 1;
 pub const MLKEM_CERT_SIG_CONTEXT: &[u8] = b"veil.mlkem_cert.v1";
 

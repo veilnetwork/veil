@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.3.1 — 2026-07-16
+
+Corrective release. The v0.3.0 tag accidentally omitted a signed feature tail
+that xVeil already depended on; this release restores that history while
+retaining the Rust 1.97, Windows, and poisoned-lock fixes shipped in v0.3.0.
+
+- Restored direct-P2P/relay call routing, full-frame VP8 transport, latency and
+  media diagnostics, voice messages, video notes, and group-media support.
+- Restored the iOS media plugin integration and mobile lifecycle fixes.
+- Restored sovereign recovery, headless Dart/FFI support, and authenticated
+  real-time transport APIs.
+- Restored onion-provider isolation, capability negotiation, delivery retries,
+  and the associated runtime hardening.
+
+`veilclient-ffi` remains on its independent 0.4.x ABI line and
+`veil-onion-stream` remains on its independent 0.1.x line.
+
+## v0.3.0 — 2026-07-15
+
+Feature release covering the signed `main` history after v0.2.0.
+
+- Added the embedded, diskless node lifecycle and mobile FFI configuration
+  path used by Flutter on Android, iOS, macOS, and Linux.
+- Added authenticated offline mailbox sealing, relay replication, fetch/ACK,
+  recovery, and sender verification across the Rust, C, and Dart APIs.
+- Added reliable anonymous streams, low-latency media channels, and direct-P2P
+  media with policy-controlled relay/onion routing.
+- Added sovereign identity operations and cumulative-PoW nickname claim and
+  resolution APIs.
+- Hardened relay discovery, rendezvous registration, circuit recovery, queue
+  pressure, and cold-start behavior; leaf deployments are relay-capable by
+  default, with operational playbooks for staged rollout.
+- Updated `anyhow` to 1.0.103, `crossbeam-epoch` to 0.9.20, and
+  `quinn-proto` to 0.11.15, and aligned Android builds on API 24.
+- Restored the zero-warning Rust 1.97 gate and made the Unix-only TCP MSS
+  clamp a safe no-op on Windows.
+
+`veilclient-ffi` remains on its independent 0.4.x ABI line and the new
+`veil-onion-stream` crate remains on its independent 0.1.x line.
+
 ## v0.2.0 — 2026-06-14
 
 Minor release. Bundles everything on `main` since v0.1.1 (≈330 commits) plus the

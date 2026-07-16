@@ -60,7 +60,7 @@ use super::cursor::{read_array, read_bytes, read_u8, read_u16, read_u64};
 // ── Magic, version, domain context ───────────────────────────────────────────
 
 /// "IR" — identifies an InstanceRegistry value on the wire.
-pub const INSTANCE_REGISTRY_MAGIC: [u8; 2] = [b'I', b'R'];
+pub const INSTANCE_REGISTRY_MAGIC: [u8; 2] = *b"IR";
 /// Wire-format version.
 pub const INSTANCE_REGISTRY_V1: u8 = 1;
 /// Domain-separated signing context.
