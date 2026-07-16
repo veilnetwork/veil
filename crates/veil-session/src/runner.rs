@@ -575,6 +575,13 @@ pub const ENCRYPTED_BATCH_BYTES_CAP: usize = 64 * 1024;
 /// the frame with metric `inc_session_wire_dropped`; the writer catches
 /// up and the queue refills. Critical: this NEVER blocks the main loop,
 /// so reads always make progress.
+///
+/// The LAST stage of this pipeline is the kernel TCP send buffer, which
+/// autotunes into the megabytes and silently un-bounded everything above
+/// it (seconds of committed-order bytes below the reach of the priority
+/// queue — the residual device-measured call-RTT-spike class). It is now
+/// clamped at the transport layer (`clamp_uplink_sndbuf`, 256 KiB), so
+/// the full post-priority bound is ≈ 512 KiB here + 256 KiB kernel.
 pub const WIRE_CHANNEL_CAPACITY: usize = 8;
 
 /// writer task — owns the `WriteHalf<BoxIoStream>` and
