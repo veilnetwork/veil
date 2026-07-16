@@ -2719,11 +2719,11 @@ impl NodeRuntime {
                                 // Original hop dead — re-route via the
                                 // pre-computed route-cache hop (looked up above,
                                 // before the registry guard was taken).
-                                if let Some(new_hop) = reroute_hops.get(&dst_node_id).copied() {
-                                    if send_batch(new_hop) {
-                                        // Update stored next_hop for future retransmits.
-                                        lock!(pending_ack).update_next_hop(&content_id, new_hop);
-                                    }
+                                if let Some(new_hop) = reroute_hops.get(&dst_node_id).copied()
+                                    && send_batch(new_hop)
+                                {
+                                    // Update stored next_hop for future retransmits.
+                                    lock!(pending_ack).update_next_hop(&content_id, new_hop);
                                 }
                             }
                         }

@@ -1288,17 +1288,16 @@ mod tests {
                 .unwrap()
             )
         );
-        #[cfg(unix)]
         assert_eq!(
             loaded.global.admin_socket,
-            Some(format!("unix://{}", path.with_extension("sock").display()))
+            Some(veil_cfg::default_admin_socket_uri(&path))
         );
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn init_config_assigns_default_admin_socket_next_to_config() {
+    fn init_config_assigns_platform_default_admin_socket() {
         let io = BufferIo::default();
         let ops = StdConfigOps;
         let root = unique_temp_dir("veil-init-admin-socket");
@@ -1337,23 +1336,9 @@ mod tests {
 
         assert_eq!(saved_path, path);
         let loaded = veil_cfg::load_config(&saved_path).expect("config must load");
-        #[cfg(unix)]
         assert_eq!(
             loaded.global.admin_socket,
-            Some(format!(
-                "unix://{}",
-                saved_path.with_extension("sock").display()
-            ))
-        );
-        #[cfg(not(unix))]
-        assert!(
-            loaded
-                .global
-                .admin_socket
-                .as_deref()
-                .is_some_and(|s| s.starts_with("tcp://127.0.0.1")),
-            "non-unix init must default to TCP loopback admin socket, got {:?}",
-            loaded.global.admin_socket,
+            Some(veil_cfg::default_admin_socket_uri(&saved_path))
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -1363,7 +1348,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("{prefix}-{unique}"))
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
     }
 
     /// `--profile dev` is a no-op on top of `Config::default` —

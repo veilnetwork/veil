@@ -689,7 +689,7 @@ class VnoteRecording {
   final int durationMs;
 }
 
-/// Records a video note ("кружочек"): camera + mic -> VP8 + Opus -> the
+/// Records a round video note: camera + mic -> VP8 + Opus -> the
 /// in-RAM VNOTE1 container (no plaintext ever hits disk). On platforms with a
 /// native camera backend (macOS/Linux) [start] opens it; on Android the Dart
 /// camera capturer feeds [pushFrame] instead. Poll [level]/[elapsedMs] for

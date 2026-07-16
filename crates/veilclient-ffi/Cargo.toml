@@ -35,7 +35,7 @@ test-low-difficulty = ["veilclient/test-low-difficulty"]
 # veil-node-runtime with NO default features (in-memory DHT) to keep the heavy
 # C++ RocksDB cold store off mobile. Add `node-embedded-rocksdb` for a
 # persistent DHT on desktop/server.
-node-embedded = ["dep:veil-node-runtime", "dep:veil-cfg"]
+node-embedded = ["dep:veil-node-runtime", "dep:veil-cfg", "dep:veil-util"]
 node-embedded-rocksdb = ["node-embedded", "veil-node-runtime/rocksdb-cold"]
 
 [dependencies]
@@ -47,6 +47,7 @@ veil-types = { path = "../veil-types" }
 # Embedded node runtime — optional, NO default features (see `node-embedded`).
 veil-node-runtime = { path = "../veil-node-runtime", default-features = false, optional = true }
 veil-cfg = { path = "../veil-cfg", optional = true }
+veil-util = { path = "../veil-util", optional = true }
 # Audit L-15: wrap the in-flight password copy in `Zeroizing` so the
 # `_zeroize_with_password` restore path scrubs every copy on drop.
 zeroize = "1"

@@ -3464,6 +3464,7 @@ pub unsafe extern "C" fn veil_register_onion_service(
     }
 }
 
+#[cfg(feature = "node-embedded")]
 fn embedded_services_for_bundle(
     bundle: &Arc<RuntimeBundle>,
 ) -> Result<veil_node_runtime::NodeServices, String> {
@@ -3498,6 +3499,7 @@ fn embedded_services_for_bundle(
 /// # Safety
 /// `identity_seed_32` must point to 32 WRITABLE bytes; they are zeroized.
 /// `out_identity_vk_32` must point to 32 writable bytes.
+#[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_register_ephemeral_onion_service_zeroize(
     handle: *mut VeilHandle,
@@ -3561,6 +3563,7 @@ pub unsafe extern "C" fn veil_register_ephemeral_onion_service_zeroize(
 /// the same capability seed must use distinct slots in `0..8`; the runtime
 /// publishes a collision-free descriptor for that slot while retaining the
 /// legacy descriptor for old resolvers.
+#[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_register_ephemeral_onion_service_zeroize_v2(
     handle: *mut VeilHandle,
@@ -3633,6 +3636,7 @@ pub unsafe extern "C" fn veil_register_ephemeral_onion_service_zeroize_v2(
 /// lifecycle API never becomes a remote existence oracle. DHT ciphertext and
 /// the circuit age out naturally; the host must reject capability requests as
 /// soon as its encrypted registry marks the share revoked.
+#[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_withdraw_ephemeral_onion_service(
     handle: *mut VeilHandle,
@@ -9403,6 +9407,7 @@ mod tests {
         unsafe { veil_free_replica_buf(ptr, len) };
     }
 
+    #[cfg(feature = "node-embedded")]
     #[test]
     fn ephemeral_service_registration_zeroizes_seed_before_dead_handle_error() {
         let mut seed = [0xA5u8; 32];
@@ -9410,7 +9415,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let rc = unsafe {
             veil_register_ephemeral_onion_service_zeroize(
-                1usize as *mut VeilHandle,
+                ptr::dangling_mut::<VeilHandle>(),
                 seed.as_mut_ptr(),
                 3,
                 public_key.as_mut_ptr(),
@@ -9423,6 +9428,7 @@ mod tests {
         unsafe { veil_free_string(error) };
     }
 
+    #[cfg(feature = "node-embedded")]
     #[test]
     fn ephemeral_service_registration_rejects_zero_seed_after_scrub() {
         let mut seed = [0u8; 32];
@@ -9430,7 +9436,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let rc = unsafe {
             veil_register_ephemeral_onion_service_zeroize(
-                1usize as *mut VeilHandle,
+                ptr::dangling_mut::<VeilHandle>(),
                 seed.as_mut_ptr(),
                 3,
                 public_key.as_mut_ptr(),
@@ -9443,6 +9449,7 @@ mod tests {
         unsafe { veil_free_string(error) };
     }
 
+    #[cfg(feature = "node-embedded")]
     #[test]
     fn provider_slot_registration_rejects_range_after_seed_scrub() {
         let mut seed = [0x5Au8; 32];
@@ -9450,7 +9457,7 @@ mod tests {
         let mut error: *mut c_char = ptr::null_mut();
         let rc = unsafe {
             veil_register_ephemeral_onion_service_zeroize_v2(
-                1usize as *mut VeilHandle,
+                ptr::dangling_mut::<VeilHandle>(),
                 seed.as_mut_ptr(),
                 3,
                 veil_anonymity::blinded_descriptor::MAX_PROVIDER_SLOTS,

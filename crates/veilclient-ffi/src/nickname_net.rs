@@ -82,7 +82,7 @@ pub unsafe extern "C" fn veil_nickname_claim(
         unsafe { set_err(err_out, "null argument") };
         return VEIL_ERR_INVALID_ARG;
     }
-    if seeds_len % 32 != 0 {
+    if !seeds_len.is_multiple_of(32) {
         unsafe { set_err(err_out, "seeds length must be a multiple of 32") };
         return VEIL_ERR_INVALID_ARG;
     }

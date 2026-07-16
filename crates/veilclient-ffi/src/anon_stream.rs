@@ -375,9 +375,9 @@ const DEFAULT_STRIPE_RACK_REO_FLOOR_MS: u32 = 1_500;
 ///   * interleaved cells (round-robin): the reordering generates >=3 dup-ACKs
 ///     within the first RTT -> fast-retransmit recovery cuts ssthresh ~200 KB
 ///     -> congestion-avoidance crawl (~4x slowdown).
-/// Both collapse via the loss detector misreading reordering. (Earlier notes
-/// blamed rendezvous CookieClaimed; that was wrong — clean-seed runs
-/// reproduced the collapse with zero registration errors.)
+///     Both collapse via the loss detector misreading reordering. (Earlier notes
+///     blamed rendezvous CookieClaimed; that was wrong — clean-seed runs
+///     reproduced the collapse with zero registration errors.)
 ///
 /// UPDATE (RACK, engine Config::rack default-on for circuits): the collapse
 /// is GONE — with time-threshold loss detection striped runs show zero
@@ -484,6 +484,7 @@ type OutboundCircuitPool = HashMap<[u8; 32], Vec<CircuitEntry>>;
 type StreamRouteKey = ([u8; 32], u32, RouteClass);
 type RouteCooldowns = Arc<Mutex<HashMap<[u8; 32], Instant>>>;
 type FirstHopCooldowns = Arc<Mutex<HashMap<[u8; 32], Instant>>>;
+type NextOutboundRoute = Arc<Mutex<HashMap<([u8; 32], RouteClass), usize>>>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RouteClass {
@@ -628,7 +629,7 @@ struct CircuitCells {
     /// peer tags.
     outbound_circuits: Arc<tokio::sync::Mutex<OutboundCircuitPool>>,
     stream_routes: Arc<tokio::sync::Mutex<HashMap<StreamRouteKey, CircuitRoute>>>,
-    next_outbound_route: Arc<Mutex<HashMap<([u8; 32], RouteClass), usize>>>,
+    next_outbound_route: NextOutboundRoute,
     route_cooldowns: RouteCooldowns,
     first_hop_cooldowns: FirstHopCooldowns,
     /// Per-destination anti-flap mark for throughput shedding: a crawling
@@ -810,7 +811,7 @@ impl CircuitRouteStats {
                 *last_data_at = Some(now);
             }
             self.note_rate_window(data_bytes as u64, now);
-            if data_cells % 8192 == 0 {
+            if data_cells.is_multiple_of(8192) {
                 return Some(self.snapshot());
             }
         } else {
@@ -1229,30 +1230,30 @@ impl CellSender for CircuitCells {
             // selection can pick a non-cooled path next time.
             return Ok(());
         }
-        if let Some(stats) = route.stats.as_ref() {
-            if let Some(snapshot) = stats.record_send(is_data, data_payload_len) {
-                if let Some(relay) = route.rendezvous_node {
-                    diag_node(
-                        &self.me,
-                        &format!(
-                            "outbound route stats for {} via R={} path={} {snapshot}",
-                            short_node(&dst.node),
-                            short_node(&relay),
-                            short_path(route.circuit.relay_path()),
-                        ),
-                    );
-                }
-            }
+        if let Some(stats) = route.stats.as_ref()
+            && let Some(snapshot) = stats.record_send(is_data, data_payload_len)
+            && let Some(relay) = route.rendezvous_node
+        {
+            diag_node(
+                &self.me,
+                &format!(
+                    "outbound route stats for {} via R={} path={} {snapshot}",
+                    short_node(&dst.node),
+                    short_node(&relay),
+                    short_path(route.circuit.relay_path()),
+                ),
+            );
         }
         mark_circuit_activity(&self.activity);
         if !is_handshake {
             self.mark_outbound_non_handshake(dst.node, &route).await;
         }
-        if is_data && route_class == RouteClass::Bulk {
-            if let Some(stream_id) = stream_id {
-                self.maybe_shed_slow_bulk_route(dst.node, stream_id, &route)
-                    .await;
-            }
+        if is_data
+            && route_class == RouteClass::Bulk
+            && let Some(stream_id) = stream_id
+        {
+            self.maybe_shed_slow_bulk_route(dst.node, stream_id, &route)
+                .await;
         }
         Ok(())
     }
@@ -1281,30 +1282,30 @@ impl CellSender for CircuitCells {
         if consec_rto < 2 && stream_rto_events < CIRCUIT_ROUTE_NO_PROGRESS_RTO_EVENTS {
             return;
         }
-        if let Some(rto) = route_rto.as_ref() {
-            if should_defer_busy_route_no_progress(&rto.stats, consec_rto, stream_rto_events) {
-                if stream_rto_events == CIRCUIT_ROUTE_NO_PROGRESS_RTO_EVENTS
-                    || stream_rto_events % 4 == 0
-                {
-                    diag_node(
-                        &dst.node,
-                        &format!(
-                            "outbound route no-progress deferred stream={} via R={} consec_rto={} stream_rto_events={} snd_una={} snd_una_advanced={} {}",
-                            stream_id,
-                            route
-                                .rendezvous_node
-                                .map(|relay| short_node(&relay))
-                                .unwrap_or_else(|| "-".to_string()),
-                            consec_rto,
-                            stream_rto_events,
-                            snd_una,
-                            rto.stream_snd_una_advanced,
-                            rto.stats,
-                        ),
-                    );
-                }
-                return;
+        if let Some(rto) = route_rto.as_ref()
+            && should_defer_busy_route_no_progress(&rto.stats, consec_rto, stream_rto_events)
+        {
+            if stream_rto_events == CIRCUIT_ROUTE_NO_PROGRESS_RTO_EVENTS
+                || stream_rto_events.is_multiple_of(4)
+            {
+                diag_node(
+                    &dst.node,
+                    &format!(
+                        "outbound route no-progress deferred stream={} via R={} consec_rto={} stream_rto_events={} snd_una={} snd_una_advanced={} {}",
+                        stream_id,
+                        route
+                            .rendezvous_node
+                            .map(|relay| short_node(&relay))
+                            .unwrap_or_else(|| "-".to_string()),
+                        consec_rto,
+                        stream_rto_events,
+                        snd_una,
+                        rto.stream_snd_una_advanced,
+                        rto.stats,
+                    ),
+                );
             }
+            return;
         }
         self.mark_route_no_progress(
             dst.node,
@@ -1824,20 +1825,19 @@ impl CircuitCells {
                 }
                 return Ok((sent, Some(e)));
             }
-            if let Some(stats) = route.stats.as_ref() {
-                if let Some(snapshot) = stats.record_send(true, data_payload_len) {
-                    if let Some(relay) = route.rendezvous_node {
-                        diag_node(
-                            &self.me,
-                            &format!(
-                                "outbound route stats for {} via R={} path={} {snapshot}",
-                                short_node(&dst_node),
-                                short_node(&relay),
-                                short_path(route.circuit.relay_path()),
-                            ),
-                        );
-                    }
-                }
+            if let Some(stats) = route.stats.as_ref()
+                && let Some(snapshot) = stats.record_send(true, data_payload_len)
+                && let Some(relay) = route.rendezvous_node
+            {
+                diag_node(
+                    &self.me,
+                    &format!(
+                        "outbound route stats for {} via R={} path={} {snapshot}",
+                        short_node(&dst_node),
+                        short_node(&relay),
+                        short_path(route.circuit.relay_path()),
+                    ),
+                );
             }
             cells.pop_front();
             sent += 1;
@@ -1956,16 +1956,15 @@ impl CircuitCells {
                     stats: None,
                 })),
             CircuitMode::PublishedRendezvous => {
-                if let Some(stream_id) = stream_id {
-                    if let Some(route) = self
+                if let Some(stream_id) = stream_id
+                    && let Some(route) = self
                         .stream_routes
                         .lock()
                         .await
                         .get(&(dst_node, stream_id, route_class))
                         .cloned()
-                    {
-                        return Ok(Some(route));
-                    }
+                {
+                    return Ok(Some(route));
                 }
                 let route = self
                     .ensure_outbound_circuit(dst_node, stream_id, route_class, is_handshake)
@@ -1986,10 +1985,10 @@ impl CircuitCells {
                             record_stream_route_closed(old_class, &old_route);
                         }
                     }
-                    if route_class == RouteClass::Bulk {
-                        if let Some(stats) = route.stats.as_ref() {
-                            let _ = stats.record_stream_open();
-                        }
+                    if route_class == RouteClass::Bulk
+                        && let Some(stats) = route.stats.as_ref()
+                    {
+                        let _ = stats.record_stream_open();
                     }
                     routes.insert((dst_node, stream_id, route_class), route);
                 }
@@ -2141,10 +2140,10 @@ impl CircuitCells {
         }
         {
             let circuits = self.outbound_circuits.lock().await;
-            if let Some(entries) = circuits.get(&dst_node) {
-                if let Some(entry) = entries.first() {
-                    return Ok(Some(entry.route()));
-                }
+            if let Some(entries) = circuits.get(&dst_node)
+                && let Some(entry) = entries.first()
+            {
+                return Ok(Some(entry.route()));
             }
         }
 
@@ -2354,7 +2353,7 @@ impl CircuitCells {
         // A dead first-hop session is still quarantined immediately.
         let route_local_evidence = stream_rto_events >= 2;
         let quarantine_route = (route_local_evidence
-            && (consec_rto >= 3 || stream_rto_events >= CIRCUIT_ROUTE_NO_PROGRESS_RTO_EVENTS + 1))
+            && (consec_rto >= 3 || stream_rto_events > CIRCUIT_ROUTE_NO_PROGRESS_RTO_EVENTS))
             || !self.services.has_live_session(&first_hop);
         // Pool-preserving guard: on a small relay set, two concurrent
         // quarantines that each cool a rendezvous AND a first-hop can leave
@@ -2550,10 +2549,10 @@ impl CircuitCells {
                 .bulk_shed_marks
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if let Some(last) = marks.get(&dst_node) {
-                if now.saturating_duration_since(*last) < CIRCUIT_ROUTE_SHED_COOLDOWN {
-                    return;
-                }
+            if let Some(last) = marks.get(&dst_node)
+                && now.saturating_duration_since(*last) < CIRCUIT_ROUTE_SHED_COOLDOWN
+            {
+                return;
             }
         }
         let cooled_relays: HashSet<[u8; 32]> = {
@@ -2873,10 +2872,10 @@ impl CircuitCells {
         } else {
             let deadline = Instant::now() + CIRCUIT_CONFIRM_TIMEOUT;
             while Instant::now() < deadline {
-                if let Some(entries) = self.outbound_circuits.lock().await.get(&dst_node) {
-                    if let Some(entry) = entries.first() {
-                        return Ok(Some(entry.route()));
-                    }
+                if let Some(entries) = self.outbound_circuits.lock().await.get(&dst_node)
+                    && let Some(entry) = entries.first()
+                {
+                    return Ok(Some(entry.route()));
                 }
                 if !self.outbound_opening.lock().await.contains_key(&dst_node) {
                     break;
@@ -2896,7 +2895,7 @@ impl CircuitCells {
 /// One of the two [`CellSender`] backends (gated at hub build).
 enum HubCells {
     Anon(AnonCells),
-    Circuit(CircuitCells),
+    Circuit(Box<CircuitCells>),
 }
 
 impl CellSender for HubCells {
@@ -2993,7 +2992,7 @@ impl AnonStreamHub {
         };
 
         let (cells, mss) = match circuit_cells {
-            Some(c) => (HubCells::Circuit(c), CIRCUIT_MSS),
+            Some(c) => (HubCells::Circuit(Box::new(c)), CIRCUIT_MSS),
             None => {
                 // Datagram path (default / fallback): feed inbound from msg_rx.
                 spawn_anon_feed(msg_rx, in_tx);
@@ -3419,7 +3418,7 @@ fn try_open_circuit(
                 {
                     Ok(opened) => opened,
                     Err(e) => {
-                        if attempt == 1 || attempt % 15 == 0 {
+                        if attempt == 1 || attempt.is_multiple_of(15) {
                             diag_node(&me, &format!("circuit open retry #{attempt}: {e:?}"));
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
@@ -3478,7 +3477,7 @@ fn try_open_circuit(
             }
 
             if confirmed.is_empty() {
-                if attempt == 1 || attempt % 15 == 0 {
+                if attempt == 1 || attempt.is_multiple_of(15) {
                     diag_node(
                         &me,
                         &format!("circuit confirmation timed out on attempt #{attempt}"),
@@ -3776,6 +3775,9 @@ async fn open_inbound_circuits(
     }
 }
 
+// Circuit construction owns one coherent snapshot of the hub's shared state;
+// grouping these handles would only move, rather than reduce, the coupling.
+#[allow(clippy::too_many_arguments)]
 async fn open_outbound_circuit(
     services: veil_node_runtime::NodeServices,
     dst_node: [u8; 32],
@@ -4240,16 +4242,8 @@ async fn open_outbound_circuit(
     Ok(())
 }
 
-async fn confirm_circuit(circuit: &veil_node_runtime::DataCircuit) -> bool {
-    let confirm_deadline = tokio::time::Instant::now() + CIRCUIT_CONFIRM_TIMEOUT;
-    while !circuit.is_confirmed() && tokio::time::Instant::now() < confirm_deadline {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    circuit.is_confirmed()
-}
-
-/// Like [`confirm_circuit`], but for a circuit that carries a cookie
-/// registration: while waiting for the `CircuitBuilt` ACK, periodically send a
+/// Confirm a circuit that carries a cookie registration. While waiting for the
+/// `CircuitBuilt` ACK, periodically send a
 /// loopback splice probe `[own_cookie ‖ PROBE_MAGIC]` UP the candidate. The
 /// terminus binds the cookie BEFORE it emits the ACK, and the ACK is a single
 /// unacknowledged return frame — on a lossy WAN it is lost regularly while the
