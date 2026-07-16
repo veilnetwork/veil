@@ -57,6 +57,26 @@ pub fn encode_batch(packets: &[Vec<u8>], max_bytes: usize) -> Option<Vec<u8>> {
 /// block (it hands the packet straight to the media engine's RTP receiver).
 pub type MediaRecvFn = extern "C" fn(*mut c_void, *const u8, usize);
 
+/// Debug-only breadcrumb file for the registry lifecycle. Media loss between
+/// the authenticated receiver and the engine callback is otherwise invisible
+/// (the send path keeps succeeding); debug builds trace registration and the
+/// first dispatch hits/misses per peer so a stand can attribute a dead leg.
+/// Compiled out of release builds entirely.
+#[cfg(debug_assertions)]
+fn diag(msg: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/veil_ffi_media_diag.log")
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn diag(_msg: std::fmt::Arguments<'_>) {}
+
 struct RecvCb {
     cb: MediaRecvFn,
     /// A raw `*mut c_void` is neither `Send` nor `Sync`, so it cannot live in a
@@ -64,6 +84,13 @@ struct RecvCb {
     /// pointer, keeps `RecvCb` auto-`Send`) and cast it back at call time; the
     /// host guarantees the ctx outlives the channel (cleared on close).
     ctx: usize,
+    /// Channel that owns this registration. A call bring-up can open several
+    /// channels to the SAME peer back to back (failed direct attempt, P2P →
+    /// relay switch, session rebuild); a straggling close of an OLD channel
+    /// must not wipe the LIVE channel's callback, or the inbound leg dies
+    /// silently for the rest of the call (device-observed: phone→desktop
+    /// media dead while the node kept receiving every packet).
+    chan: u64,
 }
 
 /// Inbound recv callbacks keyed by PEER node id. The circuit feed resolves the
@@ -80,19 +107,34 @@ static RECV_COUNT: LazyLock<Mutex<HashMap<[u8; 32], u64>>> =
 
 /// Register (or replace) the recv callback for media datagrams arriving from
 /// `peer`.
-pub fn set_recv_callback(peer: [u8; 32], cb: MediaRecvFn, ctx: *mut c_void) {
+pub fn set_recv_callback(peer: [u8; 32], chan: u64, cb: MediaRecvFn, ctx: *mut c_void) {
+    diag(format_args!(
+        "set_recv_callback peer={:02x}{:02x}{:02x}{:02x} chan={chan}",
+        peer[0], peer[1], peer[2], peer[3]
+    ));
     RECV.lock().unwrap_or_else(|p| p.into_inner()).insert(
         peer,
         RecvCb {
             cb,
             ctx: ctx as usize,
+            chan,
         },
     );
 }
 
-/// Drop the recv callback for `peer` (channel close).
-pub fn clear_recv_callback(peer: [u8; 32]) {
-    RECV.lock().unwrap_or_else(|p| p.into_inner()).remove(&peer);
+/// Drop the recv callback for `peer` — but only when `chan` still owns it. A
+/// newer channel to the same peer may have replaced the registration; its
+/// callback must survive the old channel's teardown.
+pub fn clear_recv_callback(peer: [u8; 32], chan: u64) {
+    let mut map = RECV.lock().unwrap_or_else(|p| p.into_inner());
+    let owned = map.get(&peer).is_some_and(|c| c.chan == chan);
+    diag(format_args!(
+        "clear_recv_callback peer={:02x}{:02x}{:02x}{:02x} chan={chan} owned={owned}",
+        peer[0], peer[1], peer[2], peer[3]
+    ));
+    if owned {
+        map.remove(&peer);
+    }
 }
 
 /// Deliver one inbound media datagram from `peer` to its registered callback.
@@ -108,6 +150,28 @@ pub fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
         let map = RECV.lock().unwrap_or_else(|p| p.into_inner());
         map.get(&peer).map(|c| (c.cb, c.ctx))
     };
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        static MISSES: AtomicU64 = AtomicU64::new(0);
+        let (counter, kind) = if target.is_some() {
+            (&HITS, "hit")
+        } else {
+            (&MISSES, "MISS")
+        };
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        if n < 5 || n % 2000 == 0 {
+            diag(format_args!(
+                "dispatch {kind} #{n} peer={:02x}{:02x}{:02x}{:02x} len={}",
+                peer[0],
+                peer[1],
+                peer[2],
+                peer[3],
+                payload.len()
+            ));
+        }
+    }
     if let Some((cb, ctx)) = target {
         cb(ctx as *mut c_void, payload.as_ptr(), payload.len());
     }
@@ -185,7 +249,7 @@ mod tests {
         RX_CALLS.store(0, Ordering::SeqCst);
         RX_BYTES.store(0, Ordering::SeqCst);
 
-        set_recv_callback(peer_a, record, std::ptr::null_mut());
+        set_recv_callback(peer_a, 1, record, std::ptr::null_mut());
         // Registered peer → delivered (magic already stripped by the caller).
         dispatch_inbound(peer_a, &[0u8; 100]);
         // Unregistered peer → dropped (no channel open for it).
@@ -194,9 +258,31 @@ mod tests {
         assert_eq!(RX_BYTES.load(Ordering::SeqCst), 100, "full payload length");
 
         // After clear → dropped, no callback invoked.
-        clear_recv_callback(peer_a);
+        clear_recv_callback(peer_a, 1);
         dispatch_inbound(peer_a, &[0u8; 50]);
         assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1, "cleared peer is silent");
+    }
+
+    #[test]
+    fn stale_channel_close_cannot_wipe_live_registration() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let peer = [5u8; 32];
+        RX_CALLS.store(0, Ordering::SeqCst);
+        RX_BYTES.store(0, Ordering::SeqCst);
+
+        // Old channel registers, then a NEWER channel to the same peer
+        // replaces the registration (failed direct attempt → relay switch,
+        // or a session rebuild).
+        set_recv_callback(peer, 1, record, std::ptr::null_mut());
+        set_recv_callback(peer, 2, record, std::ptr::null_mut());
+        // The old channel's straggling teardown must be a no-op...
+        clear_recv_callback(peer, 1);
+        dispatch_inbound(peer, &[0u8; 60]);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1, "live channel survives");
+        // ...while the owner's own close still clears it.
+        clear_recv_callback(peer, 2);
+        dispatch_inbound(peer, &[0u8; 60]);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1, "owner close clears");
     }
 
     #[test]
@@ -214,11 +300,11 @@ mod tests {
         let peer = [3u8; 32];
         RX_CALLS.store(0, Ordering::SeqCst);
         RX_BYTES.store(0, Ordering::SeqCst);
-        set_recv_callback(peer, record, std::ptr::null_mut());
+        set_recv_callback(peer, 1, record, std::ptr::null_mut());
         let packets = vec![vec![1u8; 120], vec![2u8; 130], vec![3u8; 140]];
         let encoded = encode_batch(&packets, 1024).unwrap();
         dispatch_inbound_batch(peer, &encoded);
-        clear_recv_callback(peer);
+        clear_recv_callback(peer, 1);
         assert_eq!(RX_CALLS.load(Ordering::SeqCst), 3);
         assert_eq!(RX_BYTES.load(Ordering::SeqCst), 390);
     }
@@ -228,11 +314,11 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let peer = [4u8; 32];
         RX_CALLS.store(0, Ordering::SeqCst);
-        set_recv_callback(peer, record, std::ptr::null_mut());
+        set_recv_callback(peer, 1, record, std::ptr::null_mut());
         let mut encoded = encode_batch(&[vec![1u8; 10], vec![2u8; 10]], 128).unwrap();
         encoded.pop();
         dispatch_inbound_batch(peer, &encoded);
-        clear_recv_callback(peer);
+        clear_recv_callback(peer, 1);
         assert_eq!(RX_CALLS.load(Ordering::SeqCst), 0);
     }
 }
