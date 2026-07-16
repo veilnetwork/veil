@@ -683,7 +683,7 @@ pub(crate) async fn handle_ipc_send(
                 // NO_ROUTE on the relay path) and reassembled via a metadata-
                 // losing epidemic broadcast.
                 //
-                if envelope.payload.len() > veil_proto::delivery::MAX_ENVELOPE_PAYLOAD {
+                if envelope.payload.len() > veil_proto::delivery::ENVELOPE_CHUNKING_THRESHOLD {
                     use veil_proto::budget::{MAX_CHUNK_PAYLOAD, MAX_REASSEMBLY_BYTES};
                     use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope};
                     use veil_proto::family::DeliveryMsg;
