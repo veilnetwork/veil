@@ -557,6 +557,20 @@ impl IpcClientState {
         self.handles.iter().any(|(h, _)| h.key().app_id == *app_id)
     }
 
+    /// Short hex prefixes of every app_id bound on THIS connection —
+    /// diagnostic payload for the SPOOFED_SRC reject log.
+    fn bound_app_id_prefixes(&self) -> Vec<String> {
+        self.handles
+            .iter()
+            .map(|(h, _)| {
+                h.key().app_id[..8]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     /// Remove an endpoint by `(app_id, endpoint_id)`. The RAII handle is
     /// dropped → endpoint deregistered → forwarder task exits when its rx closes.
     /// If a per-app socket file was created, it is also removed.
@@ -2379,6 +2393,19 @@ async fn handle_ipc_client(
                             // src_app_id is delivered as the sender's app identity;
                             // it must belong to this client.
                             if !client_state.has_app_id(&p.src_app_id) {
+                                // Diagnostic for the live SPOOFED_SRC class: name
+                                // the claimed src and what this connection has
+                                // actually bound (prefixes only) — the reject is
+                                // otherwise a black-box status 4 at the app.
+                                log::info!(
+                                    "veil-ipc: SendAnonymousDirect SPOOFED_SRC \
+                                     src_app_id={} bound=[{}]",
+                                    p.src_app_id[..8]
+                                        .iter()
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect::<String>(),
+                                    client_state.bound_app_id_prefixes().join(","),
+                                );
                                 ipc_send_err::SPOOFED_SRC
                             } else {
                                 match anon_onion_sender.as_deref() {
