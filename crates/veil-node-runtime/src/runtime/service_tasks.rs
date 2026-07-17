@@ -2038,7 +2038,7 @@ impl NodeRuntime {
             *self.identity.local_identity.node_id.as_bytes(),
         )
         .with_policy(anycast_policy);
-        if let Some(sov) = self.identity.sovereign_identity.as_ref() {
+        if let Some(sov) = self.identity.sovereign_identity.get() {
             // A1 (audit) fix: algo-generic owner-signer — signs v2 (Ed25519) OR
             // v3 (Falcon-512 / hybrid) records, so a PQ-only sovereign signs too
             // instead of falling back to unsigned advertise. `sig_key_idx = 0`
@@ -2224,7 +2224,7 @@ impl NodeRuntime {
         let pairing_fwd = Arc::new(crate::pairing_forwarder::PairingForwarder::new(
             Arc::clone(&self.logger),
             veil_dir,
-            self.identity.sovereign_identity.clone(),
+            self.identity.sovereign_identity.get(),
         ));
         let pair_src: Arc<dyn veil_ipc::PairSourceSink> = pairing_fwd.clone();
         let pair_tgt: Arc<dyn veil_ipc::PairTargetSink> = pairing_fwd;
