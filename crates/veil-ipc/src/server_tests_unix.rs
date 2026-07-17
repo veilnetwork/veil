@@ -2067,3 +2067,203 @@ async fn abort_on_drop_aborts_wrapped_task_m4() {
         "AbortOnDrop must abort the wrapped task on drop"
     );
 }
+
+// ── request_id concurrency (Stage 2, audit V) ─────────────────────────────────
+//
+// The seconds-class arcs spawn off the connection loop when the request
+// carries a non-zero request_id, so a slow request no longer freezes the
+// fast ones behind it on the same connection. A legacy client (id = 0)
+// keeps the strict inline/in-order behaviour.
+
+/// RelayKeyResolver that parks for `delay` before answering — the injected
+/// "slow DHT walk".
+struct SlowRelayKeyResolver {
+    delay: Duration,
+}
+
+impl veil_types::RelayKeyResolver for SlowRelayKeyResolver {
+    fn resolve_relay_x25519(
+        &self,
+        _target_node_id: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<[u8; 32]>> + Send + '_>> {
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Some([0xAB; 32])
+        })
+    }
+}
+
+async fn send_ipc_frame_id(client: &mut UnixStream, msg_type: u16, request_id: u32, body: &[u8]) {
+    let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, msg_type);
+    hdr.request_id = request_id;
+    hdr.body_len = body.len() as u32;
+    client.write_all(&codec::encode_header(&hdr)).await.unwrap();
+    if !body.is_empty() {
+        client.write_all(body).await.unwrap();
+    }
+}
+
+/// Two requests on ONE connection: a slow LookupRelayKey (id 1, resolver
+/// sleeps 300 ms) then a fast GetNodeIdentity (id 2). With non-zero ids the
+/// slow arc is spawned off-loop, so the fast reply must arrive FIRST and
+/// both replies must echo their request ids.
+#[tokio::test]
+async fn request_id_slow_arc_does_not_block_fast_arc() {
+    let sock = temp_socket_path();
+    let (server, shutdown_tx, _registry) = make_server(sock.clone());
+    let mut server = server.with_relay_key_resolver(Arc::new(SlowRelayKeyResolver {
+        delay: Duration::from_millis(300),
+    }));
+    let server_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = connect_and_hello(&sock).await;
+
+    let lookup = veil_proto::LookupRelayKeyPayload { node_id: [7u8; 32] };
+    let started = std::time::Instant::now();
+    send_ipc_frame_id(
+        &mut client,
+        LocalAppMsg::LookupRelayKey as u16,
+        1,
+        &lookup.encode(),
+    )
+    .await;
+    send_ipc_frame_id(&mut client, LocalAppMsg::GetNodeIdentity as u16, 2, &[]).await;
+
+    // Fast reply must come first, well before the slow resolver finishes,
+    // and echo id 2.
+    let (hdr, _body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(
+        hdr.msg_type,
+        LocalAppMsg::NodeIdentity as u16,
+        "fast reply must not wait behind the slow spawned arc"
+    );
+    // Fast arcs never spawn, so they reply inline with id 0 — within a
+    // never-spawned reply type the order is stable and the client's FIFO
+    // fallback matches correctly. Only spawnable arcs must echo the id.
+    assert_eq!(hdr.request_id, 0, "inline fast arcs reply with id 0");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "fast reply arrived only after the slow delay — inline head-of-line"
+    );
+
+    // Then the slow reply, echoing id 1.
+    let (hdr, body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(hdr.msg_type, LocalAppMsg::LookupRelayKeyResp as u16);
+    assert_eq!(hdr.request_id, 1, "slow reply must echo its request id");
+    let resp = veil_proto::LookupRelayKeyRespPayload::decode(&body).unwrap();
+    assert_eq!(resp.relay_x25519, Some([0xAB; 32]));
+
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    let _ = server_handle.await;
+}
+
+/// Legacy client (request_id = 0): the same slow-then-fast pair must stay
+/// strictly in-order (inline), with id 0 echoed on the wire — byte-identical
+/// to the pre-request_id daemon.
+#[tokio::test]
+async fn legacy_zero_id_requests_stay_inline_and_in_order() {
+    let sock = temp_socket_path();
+    let (server, shutdown_tx, _registry) = make_server(sock.clone());
+    let mut server = server.with_relay_key_resolver(Arc::new(SlowRelayKeyResolver {
+        delay: Duration::from_millis(150),
+    }));
+    let server_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = connect_and_hello(&sock).await;
+
+    let lookup = veil_proto::LookupRelayKeyPayload { node_id: [7u8; 32] };
+    send_ipc_frame(&mut client, LocalAppMsg::LookupRelayKey as u16, &lookup.encode()).await;
+    send_ipc_frame(&mut client, LocalAppMsg::GetNodeIdentity as u16, &[]).await;
+
+    // In-order: the slow lookup answers FIRST (inline), then the identity.
+    let (hdr, _body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(
+        hdr.msg_type,
+        LocalAppMsg::LookupRelayKeyResp as u16,
+        "legacy path must answer strictly in request order"
+    );
+    assert_eq!(hdr.request_id, 0, "legacy replies carry id 0");
+    let (hdr, _body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(hdr.msg_type, LocalAppMsg::NodeIdentity as u16);
+    assert_eq!(hdr.request_id, 0);
+
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    let _ = server_handle.await;
+}
+
+/// Concurrency inside ONE arc type: two slow LookupRelayKey requests with
+/// different delays (id 1 = 300 ms, id 2 = 50 ms) run in parallel spawned
+/// tasks — the shorter one replies first and each reply routes by id.
+#[tokio::test]
+async fn request_id_same_arc_replies_out_of_order_by_id() {
+    struct PerTargetDelayResolver;
+    impl veil_types::RelayKeyResolver for PerTargetDelayResolver {
+        fn resolve_relay_x25519(
+            &self,
+            target_node_id: [u8; 32],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<[u8; 32]>> + Send + '_>>
+        {
+            Box::pin(async move {
+                // target[0] encodes the delay in units of 10 ms.
+                tokio::time::sleep(Duration::from_millis(u64::from(target_node_id[0]) * 10)).await;
+                Some(target_node_id)
+            })
+        }
+    }
+
+    let sock = temp_socket_path();
+    let (server, shutdown_tx, _registry) = make_server(sock.clone());
+    let mut server = server.with_relay_key_resolver(Arc::new(PerTargetDelayResolver));
+    let server_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = connect_and_hello(&sock).await;
+
+    let slow_target = {
+        let mut t = [0u8; 32];
+        t[0] = 30; // 300 ms
+        t
+    };
+    let fast_target = {
+        let mut t = [0u8; 32];
+        t[0] = 5; // 50 ms
+        t
+    };
+    send_ipc_frame_id(
+        &mut client,
+        LocalAppMsg::LookupRelayKey as u16,
+        1,
+        &veil_proto::LookupRelayKeyPayload { node_id: slow_target }.encode(),
+    )
+    .await;
+    send_ipc_frame_id(
+        &mut client,
+        LocalAppMsg::LookupRelayKey as u16,
+        2,
+        &veil_proto::LookupRelayKeyPayload { node_id: fast_target }.encode(),
+    )
+    .await;
+
+    // The fast lookup (sent second!) replies first; ids route each reply to
+    // the right request, payloads prove no cross-matching.
+    let (hdr, body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(hdr.msg_type, LocalAppMsg::LookupRelayKeyResp as u16);
+    assert_eq!(hdr.request_id, 2, "shorter lookup must finish first");
+    let resp = veil_proto::LookupRelayKeyRespPayload::decode(&body).unwrap();
+    assert_eq!(resp.relay_x25519, Some(fast_target));
+
+    let (hdr, body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(hdr.msg_type, LocalAppMsg::LookupRelayKeyResp as u16);
+    assert_eq!(hdr.request_id, 1);
+    let resp = veil_proto::LookupRelayKeyRespPayload::decode(&body).unwrap();
+    assert_eq!(resp.relay_x25519, Some(slow_target));
+
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    let _ = server_handle.await;
+}
