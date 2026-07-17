@@ -92,7 +92,22 @@ pub(crate) async fn write_frame_wh(
     msg_type: u16,
     body: &[u8],
 ) -> std::io::Result<()> {
+    write_frame_wh_id(wh, family, msg_type, 0, body).await
+}
+
+/// Reply variant of [`write_frame_wh`]: echoes the request's
+/// `FrameHeader.request_id` so an id-stamping client can correlate the reply
+/// exactly (out-of-order safe). `request_id == 0` keeps the legacy
+/// positional-FIFO wire bytes.
+pub(crate) async fn write_frame_wh_id(
+    wh: &mut IpcWriteHalf,
+    family: u8,
+    msg_type: u16,
+    request_id: u32,
+    body: &[u8],
+) -> std::io::Result<()> {
     let mut hdr = FrameHeader::new(family, msg_type);
+    hdr.request_id = request_id;
     hdr.body_len = u32::try_from(body.len()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame body too large")
     })?;
@@ -102,6 +117,26 @@ pub(crate) async fn write_frame_wh(
         wh.write_all(body).await?;
     }
     Ok(())
+}
+
+/// Encode a complete `LocalApp` reply frame (header + body) into one buffer,
+/// echoing `request_id` — for handler tasks spawned off the connection loop,
+/// which hand finished frames back to the loop's reply channel instead of
+/// writing to the socket themselves.
+pub(crate) fn encode_reply_frame_id(msg_type: u16, request_id: u32, body: &[u8]) -> Vec<u8> {
+    debug_assert!(
+        body.len() <= u32::MAX as usize,
+        "encode_reply_frame_id body {} > u32::MAX — caller must enforce MAX_FRAME_BODY first",
+        body.len(),
+    );
+    let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, msg_type);
+    hdr.request_id = request_id;
+    hdr.body_len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+    let hdr_buf = codec::encode_header(&hdr);
+    let mut frame = Vec::with_capacity(hdr_buf.len() + body.len());
+    frame.extend_from_slice(&hdr_buf);
+    frame.extend_from_slice(body);
+    frame
 }
 
 /// Encode and write a framed message to a non-split `IpcStream`.
