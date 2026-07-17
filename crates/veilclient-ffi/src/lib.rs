@@ -1590,14 +1590,18 @@ pub unsafe extern "C" fn veil_media_set_recv_callback(
 ) -> c_int {
     let peer = {
         let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
-        match map.get(&chan) {
-            Some(ch) => ch.peer,
-            None => return -1,
-        }
+        map.get(&chan).map(|ch| ch.peer)
     };
-    match cb {
-        Some(cb) => media::set_recv_callback(peer, chan, cb, ctx),
-        None => media::clear_recv_callback(peer, chan),
+    match (cb, peer) {
+        (Some(cb), Some(peer)) => media::set_recv_callback(peer, chan, cb, ctx),
+        // Registering on an unknown channel has nowhere to route — error out.
+        (Some(_), None) => return -1,
+        (None, Some(peer)) => media::clear_recv_callback(peer, chan),
+        // Clearing must ALWAYS land: when the host closed the channel before
+        // the engine unregistered, the peer key can't be resolved anymore, yet
+        // leaving the stale registration would keep swallowing the peer's
+        // inbound media into a stopped receiver. Sweep by owner chan instead.
+        (None, None) => media::clear_recv_callback_by_chan(chan),
     }
     0
 }

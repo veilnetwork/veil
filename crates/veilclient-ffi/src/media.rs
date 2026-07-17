@@ -91,6 +91,12 @@ struct RecvCb {
     /// silently for the rest of the call (device-observed: phone→desktop
     /// media dead while the node kept receiving every packet).
     chan: u64,
+    /// Datagrams delivered THROUGH this registration (per-registration, unlike
+    /// the process-lifetime HITS total). Logged on clear/replace so a debug
+    /// trace can tell "the window delivered N packets into the engine" from
+    /// "the window was registered yet delivered nothing" — the discriminator
+    /// between a registry-side and an engine-side silent drop.
+    hits: u64,
 }
 
 /// Inbound recv callbacks keyed by PEER node id. The circuit feed resolves the
@@ -108,18 +114,26 @@ static RECV_COUNT: LazyLock<Mutex<HashMap<[u8; 32], u64>>> =
 /// Register (or replace) the recv callback for media datagrams arriving from
 /// `peer`.
 pub fn set_recv_callback(peer: [u8; 32], chan: u64, cb: MediaRecvFn, ctx: *mut c_void) {
-    diag(format_args!(
-        "set_recv_callback peer={:02x}{:02x}{:02x}{:02x} chan={chan}",
-        peer[0], peer[1], peer[2], peer[3]
-    ));
-    RECV.lock().unwrap_or_else(|p| p.into_inner()).insert(
+    let replaced = RECV.lock().unwrap_or_else(|p| p.into_inner()).insert(
         peer,
         RecvCb {
             cb,
             ctx: ctx as usize,
             chan,
+            hits: 0,
         },
     );
+    diag(format_args!(
+        "set_recv_callback peer={:02x}{:02x}{:02x}{:02x} chan={chan} replaces={}",
+        peer[0],
+        peer[1],
+        peer[2],
+        peer[3],
+        replaced.map_or_else(
+            || "none".to_owned(),
+            |old| format!("chan{}(hits={})", old.chan, old.hits)
+        )
+    ));
 }
 
 /// Drop the recv callback for `peer` — but only when `chan` still owns it. A
@@ -128,12 +142,37 @@ pub fn set_recv_callback(peer: [u8; 32], chan: u64, cb: MediaRecvFn, ctx: *mut c
 pub fn clear_recv_callback(peer: [u8; 32], chan: u64) {
     let mut map = RECV.lock().unwrap_or_else(|p| p.into_inner());
     let owned = map.get(&peer).is_some_and(|c| c.chan == chan);
+    let hits = map.get(&peer).map_or(0, |c| c.hits);
     diag(format_args!(
-        "clear_recv_callback peer={:02x}{:02x}{:02x}{:02x} chan={chan} owned={owned}",
+        "clear_recv_callback peer={:02x}{:02x}{:02x}{:02x} chan={chan} owned={owned} hits={hits}",
         peer[0], peer[1], peer[2], peer[3]
     ));
     if owned {
         map.remove(&peer);
+    }
+}
+
+/// Remove any registration owned by `chan`, regardless of peer key. Fallback
+/// for the host clearing a callback AFTER it already closed the channel: the
+/// normal clear resolves peer via the channel table, so once the entry is gone
+/// the unregister silently fails — and a Stopped shim's stale registration
+/// would swallow every inbound datagram for that peer (delivered to a receiver
+/// that drops them) for as long as it stays in the map.
+pub fn clear_recv_callback_by_chan(chan: u64) {
+    let mut map = RECV.lock().unwrap_or_else(|p| p.into_inner());
+    let before = map.len();
+    map.retain(|peer, c| {
+        let owned = c.chan == chan;
+        if owned {
+            diag(format_args!(
+                "clear_by_chan peer={:02x}{:02x}{:02x}{:02x} chan={chan} hits={}",
+                peer[0], peer[1], peer[2], peer[3], c.hits
+            ));
+        }
+        !owned
+    });
+    if map.len() == before {
+        diag(format_args!("clear_by_chan chan={chan} no-entry"));
     }
 }
 
@@ -146,33 +185,60 @@ pub fn dispatch_inbound(peer: [u8; 32], payload: &[u8]) {
         let mut counts = RECV_COUNT.lock().unwrap_or_else(|p| p.into_inner());
         *counts.entry(peer).or_insert(0) += 1;
     }
+    // `hits` counts within the CURRENT registration (reset by set), so the
+    // trace shows whether each nominally-live window actually delivered into
+    // the engine — the process-lifetime counters could not (a healthy first
+    // window exhausted the "first 5" quota for the whole call).
     let target = {
-        let map = RECV.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(&peer).map(|c| (c.cb, c.ctx))
+        let mut map = RECV.lock().unwrap_or_else(|p| p.into_inner());
+        map.get_mut(&peer).map(|c| {
+            c.hits += 1;
+            (c.cb, c.ctx, c.chan, c.hits)
+        })
     };
     #[cfg(debug_assertions)]
-    {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static HITS: AtomicU64 = AtomicU64::new(0);
-        static MISSES: AtomicU64 = AtomicU64::new(0);
-        let (counter, kind) = if target.is_some() {
-            (&HITS, "hit")
-        } else {
-            (&MISSES, "MISS")
-        };
-        let n = counter.fetch_add(1, Ordering::Relaxed);
-        if n < 5 || n % 2000 == 0 {
-            diag(format_args!(
-                "dispatch {kind} #{n} peer={:02x}{:02x}{:02x}{:02x} len={}",
-                peer[0],
-                peer[1],
-                peer[2],
-                peer[3],
-                payload.len()
-            ));
+    match target {
+        Some((_, _, chan, hits)) => {
+            if hits <= 3 || hits % 1000 == 0 {
+                diag(format_args!(
+                    "dispatch hit #{hits} peer={:02x}{:02x}{:02x}{:02x} chan={chan} len={}",
+                    peer[0],
+                    peer[1],
+                    peer[2],
+                    peer[3],
+                    payload.len()
+                ));
+            }
+        }
+        None => {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static MISSES: AtomicU64 = AtomicU64::new(0);
+            let n = MISSES.fetch_add(1, Ordering::Relaxed);
+            if n < 5 || n % 500 == 0 {
+                // Snapshot who IS registered: an entry under a different peer
+                // key at MISS time is a key-mismatch smoking gun; an empty
+                // registry is the plain rebuild gap.
+                let registered = {
+                    let map = RECV.lock().unwrap_or_else(|p| p.into_inner());
+                    map.iter()
+                        .map(|(p, c)| {
+                            format!("{:02x}{:02x}{:02x}{:02x}@chan{}", p[0], p[1], p[2], p[3], c.chan)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                diag(format_args!(
+                    "dispatch MISS #{n} peer={:02x}{:02x}{:02x}{:02x} len={} registered=[{registered}]",
+                    peer[0],
+                    peer[1],
+                    peer[2],
+                    peer[3],
+                    payload.len()
+                ));
+            }
         }
     }
-    if let Some((cb, ctx)) = target {
+    if let Some((cb, ctx, _, _)) = target {
         cb(ctx as *mut c_void, payload.as_ptr(), payload.len());
     }
 }
@@ -299,6 +365,28 @@ mod tests {
         clear_recv_callback(peer, 2);
         dispatch_inbound(peer, &[0u8; 60]);
         assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1, "owner close clears");
+    }
+
+    #[test]
+    fn clear_by_chan_sweeps_the_orphaned_registration() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let peer = [6u8; 32];
+        RX_CALLS.store(0, Ordering::SeqCst);
+
+        // The host closed the channel before the engine unregistered: the
+        // peer key is no longer resolvable, so teardown must sweep by chan —
+        // otherwise the stale registration swallows the peer's media forever.
+        set_recv_callback(peer, 9, record, std::ptr::null_mut());
+        clear_recv_callback_by_chan(9);
+        dispatch_inbound(peer, &[0u8; 40]);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 0, "swept registration");
+
+        // ...and it must NOT touch a registration owned by another channel.
+        set_recv_callback(peer, 10, record, std::ptr::null_mut());
+        clear_recv_callback_by_chan(9);
+        dispatch_inbound(peer, &[0u8; 40]);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1, "live chan survives");
+        clear_recv_callback(peer, 10);
     }
 
     #[test]
