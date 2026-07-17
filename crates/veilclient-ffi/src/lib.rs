@@ -1249,17 +1249,34 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                     if batching_task.load(std::sync::atomic::Ordering::Relaxed) =>
                 {
                     const RELAY_BATCH_MAX_PKTS: usize = 6;
-                    // Stay far under the relay's 8 KiB REALTIME classing cap
-                    // so a batched cell never demotes to Interactive.
-                    const RELAY_BATCH_BODY_MAX: usize = 4096;
+                    // GATHER byte budget: stop pulling once the running body
+                    // estimate crosses this. The last packet may overshoot,
+                    // but even a full MTU media datagram (~1.5 KiB) on top of
+                    // this budget stays well under the ENCODE ceiling below —
+                    // so the gathered set ALWAYS encodes and no packet that
+                    // was already dequeued is ever dropped.
+                    const RELAY_BATCH_SOFT_BYTES: usize = 3072;
+                    // ENCODE ceiling: comfortably above the gather budget +
+                    // one overshoot packet, and still under the relay's 8 KiB
+                    // REALTIME classing cap (post-envelope) so a batched cell
+                    // never demotes to Interactive.
+                    const RELAY_BATCH_BODY_MAX: usize = 7168;
+                    // Running estimate of encode_batch's body: 2-byte count
+                    // header + per packet a 2-byte length prefix + payload.
+                    let mut body_est = 2 + 2 + first.len();
                     let mut pkts = vec![first];
                     let deadline =
                         tokio::time::Instant::now() + std::time::Duration::from_millis(20);
-                    while pkts.len() < RELAY_BATCH_MAX_PKTS {
+                    while pkts.len() < RELAY_BATCH_MAX_PKTS
+                        && body_est < RELAY_BATCH_SOFT_BYTES
+                    {
                         tokio::select! {
                             biased;
                             more = rx_hi.recv() => match more {
-                                Some(p) => pkts.push(p),
+                                Some(p) => {
+                                    body_est += 2 + p.len();
+                                    pkts.push(p);
+                                }
                                 None => break,
                             },
                             _ = tokio::time::sleep_until(deadline) => break,
@@ -1275,9 +1292,10 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                         cell.extend_from_slice(&body);
                         cell
                     } else {
-                        // Oversized batch (only possible with pathological
-                        // datagram sizes): fall back to the first packet and
-                        // requeue nothing — same drop stance as a full queue.
+                        // Unreachable in practice: the gather budget guarantees
+                        // the set fits RELAY_BATCH_BODY_MAX. Defensive only — a
+                        // degenerate burst of maximally-oversized datagrams
+                        // sends the first whole rather than a malformed cell.
                         pkts.swap_remove(0)
                     })
                 }
