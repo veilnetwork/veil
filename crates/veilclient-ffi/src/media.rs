@@ -337,4 +337,37 @@ mod tests {
         clear_recv_callback(peer, 1);
         assert_eq!(RX_CALLS.load(Ordering::SeqCst), 0);
     }
+
+    #[test]
+    fn auto_dispatch_routes_batch_and_raw_by_leading_byte() {
+        // The relay ingress can receive either a single raw RTP/RTCP datagram
+        // or a MEDIA_BATCH_MAGIC cell on the SAME callback. Routing must key on
+        // the leading byte alone: raw RTP/RTCP starts 0x80..=0xDF (version bits
+        // set), so the 0x42 batch magic is unambiguous. This locks that a raw
+        // packet is never mis-parsed as a batch and a batch is always unfolded.
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let peer = [7u8; 32];
+        set_recv_callback(peer, 1, record, std::ptr::null_mut());
+
+        // A batch cell → each inner packet delivered.
+        RX_CALLS.store(0, Ordering::SeqCst);
+        RX_BYTES.store(0, Ordering::SeqCst);
+        let body = encode_batch(&[vec![0x80u8; 100], vec![0x90u8; 110]], 1024).unwrap();
+        let mut cell = vec![MEDIA_BATCH_MAGIC];
+        cell.extend_from_slice(&body);
+        dispatch_inbound_auto(peer, &cell);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 2, "batch unfolds to 2");
+        assert_eq!(RX_BYTES.load(Ordering::SeqCst), 210);
+
+        // A raw RTP datagram (leading 0x80) → delivered whole, once, unchanged.
+        RX_CALLS.store(0, Ordering::SeqCst);
+        RX_BYTES.store(0, Ordering::SeqCst);
+        let mut rtp = vec![0x80u8];
+        rtp.extend_from_slice(&[0xabu8; 149]);
+        dispatch_inbound_auto(peer, &rtp);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1, "raw RTP delivered once");
+        assert_eq!(RX_BYTES.load(Ordering::SeqCst), 150, "raw RTP intact");
+
+        clear_recv_callback(peer, 1);
+    }
 }
