@@ -1092,6 +1092,92 @@ fn emit_e2e_plaintext_capture(
     }
 }
 
+// ── Slow onion-send status jobs (request-id concurrency) ──────────────────────
+//
+// The slow halves of the standalone onion-send arcs: only the `Arc` sender is
+// touched, so the connection loop can spawn them off-loop when the request
+// carries a non-zero `request_id`. Sync validation (rate limit, decode,
+// `src_app_id` ownership against per-connection state) stays inline with the
+// caller, BEFORE the spawn.
+
+/// `SendToOnionService` after validation: resolve + send, return the wire
+/// status (0 = ok).
+pub(crate) async fn send_to_onion_service_status(
+    anon_onion_sender: Option<std::sync::Arc<dyn veil_types::AnonOnionSender>>,
+    p: veil_proto::ipc::SendToOnionServicePayload,
+) -> u16 {
+    match anon_onion_sender.as_deref() {
+        Some(s) => {
+            // anonymous → service sees src=[0;32]; else the daemon signs
+            // with our sovereign id.
+            let send = if p.anonymous {
+                s.send_to_onion_service_anonymous(
+                    p.service_identity_vk,
+                    p.target_app_id,
+                    p.target_endpoint_id,
+                    p.src_app_id,
+                    &p.data,
+                    p.hop_count as usize,
+                )
+                .await
+            } else {
+                s.send_to_onion_service(
+                    p.service_identity_vk,
+                    p.target_app_id,
+                    p.target_endpoint_id,
+                    &p.data,
+                    p.hop_count as usize,
+                )
+                .await
+            };
+            match send {
+                Ok(()) => 0,
+                Err(veil_types::AnonOnionSendError::NoRelays) => ipc_send_err::NO_ROUTE,
+                Err(veil_types::AnonOnionSendError::NoIdentity) => ipc_send_err::NO_IDENTITY,
+                Err(veil_types::AnonOnionSendError::PayloadTooLarge) => {
+                    ipc_send_err::PAYLOAD_TOO_LARGE
+                }
+                // NoRendezvous → no resolvable/decryptable descriptor for
+                // that identity.
+                Err(_) => ipc_send_err::NO_RENDEZVOUS,
+            }
+        }
+        None => ipc_send_err::NO_RENDEZVOUS,
+    }
+}
+
+/// `SendAuthenticatedDirectWithReply` (the KEM-key-given mailbox FETCH) after
+/// validation: send + await the relay leg, return the wire status (0 = ok).
+pub(crate) async fn send_authenticated_direct_with_reply_status(
+    anon_onion_sender: Option<std::sync::Arc<dyn veil_types::AnonOnionSender>>,
+    p: veil_proto::ipc::SendAuthenticatedDirectWithReplyPayload,
+) -> u16 {
+    match anon_onion_sender.as_deref() {
+        Some(s) => {
+            match s
+                .send_authenticated_direct_with_reply(
+                    p.target_node_id,
+                    p.target_x25519_pk,
+                    p.target_app_id,
+                    p.target_endpoint_id,
+                    &p.data,
+                    p.src_app_id,
+                    p.reply_endpoint_id,
+                )
+                .await
+            {
+                Ok(()) => 0,
+                Err(veil_types::AnonOnionSendError::NoRelays) => ipc_send_err::NO_ROUTE,
+                Err(veil_types::AnonOnionSendError::PayloadTooLarge) => {
+                    ipc_send_err::PAYLOAD_TOO_LARGE
+                }
+                Err(_) => ipc_send_err::NO_ROUTE,
+            }
+        }
+        None => ipc_send_err::NO_ROUTE,
+    }
+}
+
 #[cfg(test)]
 mod relay_hop_tests {
     use super::*;
