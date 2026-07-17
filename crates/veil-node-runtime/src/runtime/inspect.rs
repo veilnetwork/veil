@@ -37,7 +37,7 @@ impl NodeRuntime {
     /// nodes. Returned as an `Arc` clone so callers can hold it
     /// without taking a borrow on the runtime.
     pub fn sovereign_identity(&self) -> Option<Arc<veil_identity::sovereign::SovereignIdentity>> {
-        self.identity.sovereign_identity.clone()
+        self.identity.sovereign_identity.get()
     }
 
     pub fn listens(&self) -> Vec<ListenConfigEntry> {
