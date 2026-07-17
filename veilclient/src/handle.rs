@@ -356,6 +356,7 @@ impl AppHandle {
         use tokio::sync::oneshot;
 
         let (tx, rx) = oneshot::channel::<Result<u32, ClientError>>();
+        let request_id = self.writer.alloc_request_id();
         // Pre-create the stream event channel so the reader task can insert it
         // into dispatch.streams atomically with the StreamOpenOk resolution
         // avoiding a race where early StreamData frames are dropped.
@@ -375,7 +376,7 @@ impl AppHandle {
                     "too many pending stream opens".into(),
                 ));
             }
-            d.pending_stream_opens.push_back((tx, data_tx));
+            d.pending_stream_opens.push_back((request_id, (tx, data_tx)));
         }
 
         let payload = StreamOpenPayload {
@@ -385,7 +386,7 @@ impl AppHandle {
             initial_window,
         };
         self.writer
-            .write_frame(LocalAppMsg::StreamOpen as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::StreamOpen as u16, request_id, &payload.encode())
             .await?;
 
         // audit cycle-6 (P3): bound the wait. On timeout `rx` is dropped, which
@@ -690,6 +691,7 @@ impl AppSender {
         // uses). Carried for SendAnonymousDirect wire symmetry; we pass 0 so the
         // daemon's default governs.
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_send_authenticated_direct_with_reply);
@@ -699,7 +701,7 @@ impl AppSender {
                      ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_send_authenticated_direct_with_reply.push_back(tx);
+            d.pending_send_authenticated_direct_with_reply.push_back((request_id, tx));
         }
         let payload = veilcore::proto::SendAuthenticatedDirectWithReplyPayload {
             target_node_id: dst_node_id,
@@ -712,8 +714,8 @@ impl AppSender {
             data: data.to_vec(),
         };
         self.writer
-            .write_frame(
-                LocalAppMsg::SendAuthenticatedDirectWithReply as u16,
+            .write_request_frame(
+                LocalAppMsg::SendAuthenticatedDirectWithReply as u16, request_id,
                 &payload.encode(),
             )
             .await?;
@@ -791,6 +793,7 @@ impl AppSender {
         use tokio::sync::oneshot;
 
         let (tx, rx) = oneshot::channel::<Result<u32, ClientError>>();
+        let request_id = self.writer.alloc_request_id();
         let (data_tx, data_rx) =
             mpsc::channel::<StreamEvent>(crate::client::STREAM_EVENT_QUEUE_CAP);
         {
@@ -803,7 +806,7 @@ impl AppSender {
                     "too many pending stream opens".into(),
                 ));
             }
-            d.pending_stream_opens.push_back((tx, data_tx));
+            d.pending_stream_opens.push_back((request_id, (tx, data_tx)));
         }
         let payload = StreamOpenPayload {
             dst_node_id,
@@ -812,7 +815,7 @@ impl AppSender {
             initial_window,
         };
         self.writer
-            .write_frame(LocalAppMsg::StreamOpen as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::StreamOpen as u16, request_id, &payload.encode())
             .await?;
         // audit cycle-6 (P3): bound the wait (see AppHandle::open_stream).
         let stream_id = match tokio::time::timeout(crate::client::STREAM_OPEN_TIMEOUT, rx).await {
