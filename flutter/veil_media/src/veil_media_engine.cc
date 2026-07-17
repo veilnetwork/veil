@@ -1669,6 +1669,14 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     int loss_pct = 0;
     int tx_jitter_ms = 0;
     int tx_loss_pct = 0;
+    // Perceived-latency creep instrumentation: RTCP rtt/jitter stay flat while
+    // delay accumulates in the RECEIVE pipeline, so export the direct playout
+    // measurements — NetEq's total audio path estimate (jitter buffer + ADM
+    // playout) and the video render delay target.
+    uint32_t audio_delay_ms = 0;
+    uint32_t audio_jb_ms = 0;
+    int video_delay_ms = 0;
+    int video_jb_ms = 0;
     run_on(ws->worker_tq.get(), [&] {
       if (ws->call) {
         const int64_t call_rtt = ws->call->GetStats().rtt_ms;
@@ -1690,6 +1698,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         const auto r =
             ws->recv_stream->GetStats(/*get_and_clear_legacy_stats=*/false);
         jitter_ms = r.jitter_ms;
+        audio_delay_ms = r.delay_estimate_ms;
+        audio_jb_ms = r.jitter_buffer_ms;
         // packets_lost is cumulative and may go negative on duplicates.
         if (r.packets_lost > 0) {
           const int64_t expected =
@@ -1700,15 +1710,22 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           }
         }
       }
+      if (ws->video_recv_stream) {
+        const auto v = ws->video_recv_stream->GetStats();
+        video_delay_ms = v.current_delay_ms;
+        video_jb_ms = v.jitter_buffer_ms;
+      }
     });
     if (rtt_ms < 0) rtt_ms = 0;  // unknown yet — keep the legacy "0" shape
-    char json[512];
+    char json[640];
     std::snprintf(
         json, sizeof(json),
         "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"tx_bytes\":%llu,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
         "\"rtt_ms\":%lld,\"jitter_ms\":%u,\"loss_pct\":%d,"
         "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,"
+        "\"audio_delay_ms\":%u,\"audio_jb_ms\":%u,"
+        "\"video_delay_ms\":%d,\"video_jb_ms\":%d,"
         "\"target_bitrate_bps\":%d,\"max_fps\":%d}",
         static_cast<unsigned long long>(ws->shim->outbound_packet_count()),
         static_cast<unsigned long long>(ws->shim->inbound_packet_count()),
@@ -1717,7 +1734,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->outbound_dropped_count()),
         static_cast<unsigned long long>(ws->shim->inbound_dropped_count()),
         static_cast<long long>(rtt_ms), jitter_ms, loss_pct, tx_jitter_ms,
-        tx_loss_pct, ws->video_target_bitrate_bps, ws->video_max_fps);
+        tx_loss_pct, audio_delay_ms, audio_jb_ms, video_delay_ms, video_jb_ms,
+        ws->video_target_bitrate_bps, ws->video_max_fps);
     return dup_cstr(json);
   }
 #endif
