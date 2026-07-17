@@ -302,7 +302,7 @@ impl super::NodeRuntime {
             local_node_id: *self.identity.local_identity.node_id.as_bytes(),
             peer_mlkem_keys: Arc::clone(&self.identity.peer_mlkem_keys),
             peer_mlkem_certs: Arc::clone(&self.identity.peer_mlkem_certs),
-            sovereign: self.identity.sovereign_identity.clone(),
+            sovereign: self.identity.sovereign_identity.get(),
             mlkem_dk_seed: Arc::clone(&self.mlkem_dk_seed),
             logger: Arc::clone(&self.logger),
         }

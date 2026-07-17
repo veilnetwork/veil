@@ -428,20 +428,28 @@ impl NodeRuntime {
         // multi-device IdentityDocument (is_standalone()==false) is never touched,
         // and a rebuild for an unchanged identity is idempotent (same keypair →
         // same node_id).
-        let new_sovereign = match self.identity.sovereign_identity.as_ref() {
+        let new_sovereign = match self.identity.sovereign_identity.get() {
             Some(sov) if sov.is_standalone() => {
                 let veil_dir = self
                     .config_path
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."));
                 build_standalone_sovereign_identity(veil_dir, &config, &self.logger)
-                    .or_else(|| Some(Arc::clone(sov)))
+                    .or(Some(sov))
             }
-            other => other.cloned(),
+            other => other,
         };
+        // Reuse the SAME shared cell across the reload (only refresh its
+        // contents): long-lived holders — the maintenance re-issue tick
+        // above all — captured this cell at spawn, and a fresh cell here
+        // would silently disconnect them from what handshakes present.
+        let sovereign_cell = self.identity.sovereign_identity.clone();
+        if let Some(sov) = new_sovereign {
+            sovereign_cell.set(sov);
+        }
         self.identity = Arc::new(super::identity_state::IdentityState::new(
             new_local_identity,
-            new_sovereign,
+            sovereign_cell,
             Arc::clone(&self.identity.peer_pubkeys),
             Arc::clone(&self.identity.peer_sovereign_identities),
             Arc::clone(&self.identity.peer_roles),

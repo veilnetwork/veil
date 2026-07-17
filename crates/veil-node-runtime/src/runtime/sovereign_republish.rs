@@ -61,7 +61,7 @@ impl NodeRuntime {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
-        let Some(sov) = self.identity.sovereign_identity.as_ref().cloned() else {
+        let Some(sov) = self.identity.sovereign_identity.get() else {
             // Legacy node — nothing to republish.
             return;
         };
