@@ -128,9 +128,8 @@ impl NodeServices {
         let sov = self
             .identity
             .sovereign_identity
-            .as_ref()
-            .ok_or("node has no sovereign identity — nicknames require one")?
-            .clone();
+            .get()
+            .ok_or("node has no sovereign identity — nicknames require one")?;
         if !sov.is_standalone() {
             return Err(
                 "nickname claims require the sovereign MASTER key; this device holds a \
