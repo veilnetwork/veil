@@ -38,22 +38,17 @@ use crate::{
     PairTargetSink, PeerListProvider, PnetStatusProvider, RendezvousReplicaResolver,
 };
 
-pub(crate) async fn handle_lookup_rendezvous_replicas(
-    wh: &mut IpcWriteHalf,
-    body: &[u8],
-    client_state: &mut IpcClientState,
-    rendezvous_resolver: Option<&Arc<dyn RendezvousReplicaResolver>>,
-) -> std::io::Result<()> {
-    // App asks daemon to resolve K candidate mailbox-relays for a
-    // receiver.  Daemon does the DHT lookup + verification; reply carries
-    // up to `min(MAX_RENDEZVOUS_REPLICAS, request.max_replicas)` verified
-    // entries.  Empty list = DHT miss / no fresh ad / verification failed.
-    if !client_state.allow_query() {
-        return Ok(());
-    }
-    let Ok(req) = LookupRendezvousReplicasPayload::decode(body) else {
-        return Ok(());
-    };
+/// Slow half of `LookupRendezvousReplicas` — the app asks the daemon to
+/// resolve K candidate mailbox-relays for a receiver: DHT lookup +
+/// verification, reply carries up to `min(MAX_RENDEZVOUS_REPLICAS,
+/// request.max_replicas)` verified entries (empty list = DHT miss / no fresh
+/// ad / verification failed). Touches only the `Arc` resolver so it can run
+/// in a task spawned off the connection loop (request-id concurrency); the
+/// sync validation (rate limit, decode) stays with the caller.
+pub(crate) async fn lookup_rendezvous_replicas_reply_body(
+    rendezvous_resolver: Option<Arc<dyn RendezvousReplicaResolver>>,
+    req: LookupRendezvousReplicasPayload,
+) -> Vec<u8> {
     let cap = if req.max_replicas == 0 {
         MAX_RENDEZVOUS_REPLICAS
     } else {
@@ -77,44 +72,24 @@ pub(crate) async fn handle_lookup_rendezvous_replicas(
             .collect(),
         None => Vec::new(),
     };
-    let reply = LookupRendezvousReplicasRespPayload { entries };
-    write_frame_wh(
-        wh,
-        FrameFamily::LocalApp as u8,
-        LocalAppMsg::LookupRendezvousReplicasResp as u16,
-        &reply.encode(),
-    )
-    .await
+    LookupRendezvousReplicasRespPayload { entries }.encode()
 }
 
-pub(crate) async fn handle_lookup_relay_key(
-    wh: &mut IpcWriteHalf,
-    body: &[u8],
-    client_state: &mut IpcClientState,
-    relay_key_resolver: Option<&Arc<dyn veil_types::RelayKeyResolver>>,
-) -> std::io::Result<()> {
-    // App asks the daemon to resolve a node's relay X25519 KEM key by node_id.
-    // Daemon does the DHT walk + signature verification; reply carries the
-    // verified key or `None` (DHT miss / no record / verification failed —
-    // indistinguishable by design).
-    if !client_state.allow_query() {
-        return Ok(());
-    }
-    let Ok(req) = LookupRelayKeyPayload::decode(body) else {
-        return Ok(());
-    };
+/// Slow half of `LookupRelayKey` — the app asks the daemon to resolve a
+/// node's relay X25519 KEM key by node_id: DHT walk + signature
+/// verification, reply carries the verified key or `None` (DHT miss / no
+/// record / verification failed — indistinguishable by design). Touches only
+/// the `Arc` resolver so it can run in a task spawned off the connection
+/// loop (request-id concurrency); sync validation stays with the caller.
+pub(crate) async fn lookup_relay_key_reply_body(
+    relay_key_resolver: Option<Arc<dyn veil_types::RelayKeyResolver>>,
+    req: LookupRelayKeyPayload,
+) -> Vec<u8> {
     let relay_x25519 = match relay_key_resolver {
         Some(r) => r.resolve_relay_x25519(req.node_id).await,
         None => None,
     };
-    let reply = LookupRelayKeyRespPayload { relay_x25519 };
-    write_frame_wh(
-        wh,
-        FrameFamily::LocalApp as u8,
-        LocalAppMsg::LookupRelayKeyResp as u16,
-        &reply.encode(),
-    )
-    .await
+    LookupRelayKeyRespPayload { relay_x25519 }.encode()
 }
 
 pub(crate) async fn handle_get_node_identity(
