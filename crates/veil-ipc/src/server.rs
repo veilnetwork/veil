@@ -12,10 +12,7 @@ use crate::handlers::anycast::{
     handle_anycast_withdraw, handle_transport_hint_query,
 };
 use crate::handlers::bind::handle_bind;
-use crate::handlers::mailbox::{
-    handle_mailbox_ack, handle_mailbox_fetch, handle_mailbox_open, handle_mailbox_put,
-    handle_mailbox_seal,
-};
+use crate::handlers::mailbox::{handle_mailbox_ack, handle_mailbox_fetch, handle_mailbox_put};
 use crate::handlers::mobile::{
     handle_network_changed, handle_set_mobile_background_mode, handle_set_push_envelope,
     handle_set_wake_hmac_envelope,
@@ -23,7 +20,7 @@ use crate::handlers::mobile::{
 use crate::handlers::outbox::{handle_outbox_ack, handle_outbox_find_missing, handle_outbox_put};
 use crate::handlers::queries::{
     handle_get_mobile_status, handle_get_node_identity, handle_get_peers,
-    handle_join_bootstrap_uri, handle_lookup_relay_key, handle_lookup_rendezvous_replicas,
+    handle_join_bootstrap_uri,
 };
 use crate::handlers::send::{IpcSendContext, handle_ipc_send, handle_rt_send};
 use crate::handlers::stream::handle_stream_open;
@@ -161,6 +158,72 @@ fn delivery_queue(
         rx,
         inflight,
     )
+}
+
+/// Cap on concurrently spawned slow-handler tasks per IPC connection
+/// (request-id concurrency, audit V). When exhausted the loop falls back to
+/// INLINE handling — legacy head-of-line behaviour, never an error — so a
+/// flooding client degrades itself, not the daemon.
+pub(crate) const MAX_SPAWNED_HANDLERS_PER_CONNECTION: usize = 32;
+
+/// Capacity of the per-connection reply channel that spawned handler tasks
+/// hand finished frames back through. Must comfortably exceed
+/// `MAX_SPAWNED_HANDLERS_PER_CONNECTION` (each task sends exactly one
+/// message) so a completed task can always deliver and release its permit.
+pub(crate) const REPLY_CHANNEL_CAP: usize = 64;
+
+/// A message a spawned slow-handler task hands back to its connection loop.
+/// The loop owns the socket write half and the per-connection state, so
+/// spawned tasks never touch either directly.
+pub(crate) enum LoopReply {
+    /// A complete, ready-to-write reply frame (header echoes the request_id).
+    Frame(Vec<u8>),
+    /// A remote STREAM_OPEN completed: the loop must claim opener ownership
+    /// for `ipc_stream_id` on its `IpcClientState` BEFORE writing `frame`
+    /// (the client may reference the stream the moment it learns the id).
+    RemoteStreamOpened { ipc_stream_id: u32, frame: Vec<u8> },
+}
+
+/// Run a slow reply job either OFF-loop (spawned task; requires a non-zero
+/// `request_id` so the id-keyed client can match the out-of-order reply, plus
+/// a free permit) or inline as the legacy path. The job yields the reply
+/// BODY for `msg_type`; framing echoes `request_id` in both branches.
+async fn dispatch_reply_job<F>(
+    wh: &mut transport::IpcWriteHalf,
+    req_id: u32,
+    msg_type: u16,
+    spawn_sem: &Arc<tokio::sync::Semaphore>,
+    reply_tx: &mpsc::Sender<LoopReply>,
+    job: F,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = Vec<u8>> + Send + 'static,
+{
+    if req_id != 0
+        && let Ok(permit) = Arc::clone(spawn_sem).try_acquire_owned()
+    {
+        let reply_tx = reply_tx.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let body = job.await;
+            let _ = reply_tx
+                .send(LoopReply::Frame(crate::frame_io::encode_reply_frame_id(
+                    msg_type, req_id, &body,
+                )))
+                .await;
+        });
+        Ok(())
+    } else {
+        let body = job.await;
+        crate::frame_io::write_frame_wh_id(
+            wh,
+            FrameFamily::LocalApp as u8,
+            msg_type,
+            req_id,
+            &body,
+        )
+        .await
+    }
 }
 
 /// Wire-routing for an acceptor-side stream whose opener is on a REMOTE node.
@@ -1783,6 +1846,16 @@ async fn handle_ipc_client(
         }
     }));
 
+    // Replies from spawned slow-handler tasks (request-id concurrency). The
+    // tasks compute the reply and hand the finished frame back here; only
+    // this loop writes to `wh`, so frames never interleave. mpsc recv is
+    // cancel-safe. The semaphore bounds concurrent spawns per connection;
+    // on exhaustion handlers fall back to inline (legacy) processing.
+    let (reply_tx, mut reply_rx) = mpsc::channel::<LoopReply>(REPLY_CHANNEL_CAP);
+    let spawn_sem = Arc::new(tokio::sync::Semaphore::new(
+        MAX_SPAWNED_HANDLERS_PER_CONNECTION,
+    ));
+
     // Push-event subscription. Subscribe once per IPC
     // client; broadcast::Receiver::recv is cancel-safe so it composes
     // cleanly with the existing select!. When the bus is unset we
@@ -1808,6 +1881,24 @@ async fn handle_ipc_client(
                 delivery_inflight.fetch_sub(frame_bytes.len(), Ordering::AcqRel);
                 idle.as_mut().reset(bump());
                 if wh.write_all(&frame_bytes).await.is_err() {
+                    break;
+                }
+            }
+
+            // Finished reply from a spawned slow-handler task → socket.
+            Some(reply) = reply_rx.recv() => {
+                idle.as_mut().reset(bump());
+                let frame = match reply {
+                    LoopReply::Frame(frame) => frame,
+                    LoopReply::RemoteStreamOpened { ipc_stream_id, frame } => {
+                        // Claim ownership BEFORE the client learns the stream
+                        // id from the ok-frame below; quota was reserved at
+                        // spawn time (see handle_stream_open).
+                        client_state.claim_stream_opener(ipc_stream_id);
+                        frame
+                    }
+                };
+                if wh.write_all(&frame).await.is_err() {
                     break;
                 }
             }
@@ -1867,6 +1958,13 @@ async fn handle_ipc_client(
                     continue;
                 }
 
+                // Request-correlation id (0 = legacy client). Non-zero lets
+                // the seconds-class arcs below spawn off-loop and reply out
+                // of order — the id-stamping client matches replies by id.
+                // A legacy client stamps 0 and stays strictly inline +
+                // in-order, so the rollout needs no capability handshake.
+                let req_id = hdr.request_id;
+
                 match LocalAppMsg::try_from(hdr.msg_type) {
                     Ok(LocalAppMsg::AppBind) => {
                         {
@@ -1918,9 +2016,10 @@ async fn handle_ipc_client(
                     }
                     Ok(LocalAppMsg::StreamOpen) => {
                         handle_stream_open(
-                            &mut wh, &body, &mut client_state, &app_registry,
+                            &mut wh, &body, req_id, &mut client_state, &app_registry,
                             &stream_table, &node_id,
                             session_tx_registry.clone(), stream_bridge.as_ref(),
+                            &spawn_sem, &reply_tx,
                         ).await?;
                     }
                     Ok(LocalAppMsg::StreamData) => {
@@ -2216,71 +2315,58 @@ async fn handle_ipc_client(
                         // onion service goes through the same anon_onion_sender.
                         // Rate-limit (D2) + src_app_id ownership (D1): match the old
                         // AppIpcSend path's protections, which the standalone arms
-                        // previously skipped (diff-audit).
-                        let status: u16 = if rate_limiter.as_mut().is_some_and(|rl| !rl.allow()) {
-                            ipc_send_err::RATE_LIMITED
-                        } else if let Ok(p) = SendToOnionServicePayload::decode(&body) {
-                            // Only the anonymous variant delivers src_app_id as the
-                            // sender's app identity, so only it needs the ownership
-                            // check; the authenticated variant signs with the
-                            // sovereign identity and carries no app-id claim.
-                            if p.anonymous && !client_state.has_app_id(&p.src_app_id) {
-                                ipc_send_err::SPOOFED_SRC
-                            } else {
-                                match anon_onion_sender.as_deref() {
-                                    Some(s) => {
-                                        // anonymous → service sees src=[0;32]; else
-                                        // the daemon signs with our sovereign id.
-                                        let send = if p.anonymous {
-                                            s.send_to_onion_service_anonymous(
-                                                p.service_identity_vk,
-                                                p.target_app_id,
-                                                p.target_endpoint_id,
-                                                p.src_app_id,
-                                                &p.data,
-                                                p.hop_count as usize,
-                                            )
-                                            .await
-                                        } else {
-                                            s.send_to_onion_service(
-                                                p.service_identity_vk,
-                                                p.target_app_id,
-                                                p.target_endpoint_id,
-                                                &p.data,
-                                                p.hop_count as usize,
-                                            )
-                                            .await
-                                        };
-                                        match send {
-                                            Ok(()) => 0,
-                                            Err(veil_types::AnonOnionSendError::NoRelays) => {
-                                                ipc_send_err::NO_ROUTE
-                                            }
-                                            Err(veil_types::AnonOnionSendError::NoIdentity) => {
-                                                ipc_send_err::NO_IDENTITY
-                                            }
-                                            Err(
-                                                veil_types::AnonOnionSendError::PayloadTooLarge,
-                                            ) => ipc_send_err::PAYLOAD_TOO_LARGE,
-                                            // NoRendezvous → no resolvable/decryptable
-                                            // descriptor for that identity.
-                                            Err(_) => ipc_send_err::NO_RENDEZVOUS,
-                                        }
-                                    }
-                                    None => ipc_send_err::NO_RENDEZVOUS,
+                        // previously skipped (diff-audit). Validation stays INLINE
+                        // (reads per-connection state); the 5-15 s resolve+send is
+                        // a seconds-class arc (audit V) and runs via
+                        // dispatch_reply_job — spawned off-loop when req_id != 0.
+                        let verdict: Result<SendToOnionServicePayload, u16> =
+                            if rate_limiter.as_mut().is_some_and(|rl| !rl.allow()) {
+                                Err(ipc_send_err::RATE_LIMITED)
+                            } else if let Ok(p) = SendToOnionServicePayload::decode(&body) {
+                                // Only the anonymous variant delivers src_app_id as
+                                // the sender's app identity, so only it needs the
+                                // ownership check; the authenticated variant signs
+                                // with the sovereign identity and carries no app-id
+                                // claim.
+                                if p.anonymous && !client_state.has_app_id(&p.src_app_id) {
+                                    Err(ipc_send_err::SPOOFED_SRC)
+                                } else {
+                                    Ok(p)
                                 }
+                            } else {
+                                Err(ipc_send_err::INVALID_FLAGS)
+                            };
+                        match verdict {
+                            Err(status) => {
+                                crate::frame_io::write_frame_wh_id(
+                                    &mut wh,
+                                    FrameFamily::LocalApp as u8,
+                                    LocalAppMsg::SendToOnionServiceResult as u16,
+                                    req_id,
+                                    &status.to_be_bytes(),
+                                )
+                                .await?;
                             }
-                        } else {
-                            ipc_send_err::INVALID_FLAGS
-                        };
-                        let mut hdr = FrameHeader::new(
-                            FrameFamily::LocalApp as u8,
-                            LocalAppMsg::SendToOnionServiceResult as u16,
-                        );
-                        hdr.body_len = 2;
-                        let mut frame = codec::encode_header(&hdr).to_vec();
-                        frame.extend_from_slice(&status.to_be_bytes());
-                        wh.write_all(&frame).await?;
+                            Ok(p) => {
+                                let sender = anon_onion_sender.clone();
+                                dispatch_reply_job(
+                                    &mut wh,
+                                    req_id,
+                                    LocalAppMsg::SendToOnionServiceResult as u16,
+                                    &spawn_sem,
+                                    &reply_tx,
+                                    async move {
+                                        crate::handlers::send::send_to_onion_service_status(
+                                            sender, p,
+                                        )
+                                        .await
+                                        .to_be_bytes()
+                                        .to_vec()
+                                    },
+                                )
+                                .await?;
+                            }
+                        }
                     }
                     Ok(LocalAppMsg::SendAnonymousDirect) => {
                         use veil_proto::ipc::{SendAnonymousDirectPayload, ipc_send_err};
@@ -2343,55 +2429,58 @@ async fn handle_ipc_client(
                         // resolve) WITH a one-time reply block — the mailbox FETCH.
                         // The reply is delivered back to (src_app_id,
                         // reply_endpoint_id) on this client.
-                        // Rate-limit (D2) + src_app_id ownership (D1).
-                        let status: u16 = if rate_limiter.as_mut().is_some_and(|rl| !rl.allow()) {
-                            ipc_send_err::RATE_LIMITED
-                        } else if let Ok(p) =
-                            SendAuthenticatedDirectWithReplyPayload::decode(&body)
-                        {
-                            // src_app_id is the sender's app identity AND the app
-                            // the reply lands at; it must belong to this client.
-                            if !client_state.has_app_id(&p.src_app_id) {
-                                ipc_send_err::SPOOFED_SRC
-                            } else {
-                                match anon_onion_sender.as_deref() {
-                                    Some(s) => {
-                                        match s
-                                            .send_authenticated_direct_with_reply(
-                                                p.target_node_id,
-                                                p.target_x25519_pk,
-                                                p.target_app_id,
-                                                p.target_endpoint_id,
-                                                &p.data,
-                                                p.src_app_id,
-                                                p.reply_endpoint_id,
-                                            )
-                                            .await
-                                        {
-                                            Ok(()) => 0,
-                                            Err(veil_types::AnonOnionSendError::NoRelays) => {
-                                                ipc_send_err::NO_ROUTE
-                                            }
-                                            Err(
-                                                veil_types::AnonOnionSendError::PayloadTooLarge,
-                                            ) => ipc_send_err::PAYLOAD_TOO_LARGE,
-                                            Err(_) => ipc_send_err::NO_ROUTE,
-                                        }
-                                    }
-                                    None => ipc_send_err::NO_ROUTE,
+                        // Rate-limit (D2) + src_app_id ownership (D1) stay INLINE
+                        // (per-connection state); the ~5 s relay leg is the worst
+                        // seconds-class arc of audit V and runs via
+                        // dispatch_reply_job — spawned off-loop when req_id != 0.
+                        let verdict: Result<SendAuthenticatedDirectWithReplyPayload, u16> =
+                            if rate_limiter.as_mut().is_some_and(|rl| !rl.allow()) {
+                                Err(ipc_send_err::RATE_LIMITED)
+                            } else if let Ok(p) =
+                                SendAuthenticatedDirectWithReplyPayload::decode(&body)
+                            {
+                                // src_app_id is the sender's app identity AND the
+                                // app the reply lands at; it must belong to this
+                                // client.
+                                if !client_state.has_app_id(&p.src_app_id) {
+                                    Err(ipc_send_err::SPOOFED_SRC)
+                                } else {
+                                    Ok(p)
                                 }
+                            } else {
+                                Err(ipc_send_err::INVALID_FLAGS)
+                            };
+                        match verdict {
+                            Err(status) => {
+                                crate::frame_io::write_frame_wh_id(
+                                    &mut wh,
+                                    FrameFamily::LocalApp as u8,
+                                    LocalAppMsg::SendAuthenticatedDirectWithReplyResult as u16,
+                                    req_id,
+                                    &status.to_be_bytes(),
+                                )
+                                .await?;
                             }
-                        } else {
-                            ipc_send_err::INVALID_FLAGS
-                        };
-                        let mut hdr = FrameHeader::new(
-                            FrameFamily::LocalApp as u8,
-                            LocalAppMsg::SendAuthenticatedDirectWithReplyResult as u16,
-                        );
-                        hdr.body_len = 2;
-                        let mut frame = codec::encode_header(&hdr).to_vec();
-                        frame.extend_from_slice(&status.to_be_bytes());
-                        wh.write_all(&frame).await?;
+                            Ok(p) => {
+                                let sender = anon_onion_sender.clone();
+                                dispatch_reply_job(
+                                    &mut wh,
+                                    req_id,
+                                    LocalAppMsg::SendAuthenticatedDirectWithReplyResult as u16,
+                                    &spawn_sem,
+                                    &reply_tx,
+                                    async move {
+                                        crate::handlers::send::send_authenticated_direct_with_reply_status(
+                                            sender, p,
+                                        )
+                                        .await
+                                        .to_be_bytes()
+                                        .to_vec()
+                                    },
+                                )
+                                .await?;
+                            }
+                        }
                     }
                     Ok(LocalAppMsg::TransportHintQuery) => {
                         handle_transport_hint_query(&mut wh, hint_registry.as_ref()).await?;
@@ -2442,10 +2531,44 @@ async fn handle_ipc_client(
                         .await?;
                     }
                     Ok(LocalAppMsg::MailboxSeal) => {
-                        handle_mailbox_seal(&mut wh, &body, mailbox_crypto_sink.as_ref()).await?;
+                        // Seconds-class arc (audit V): seal does a DHT cert
+                        // resolve. Decode inline (silent drop on malformed,
+                        // as before), run the resolve+crypto off-loop when
+                        // req_id != 0.
+                        if let Ok(req) = veil_proto::MailboxSealPayload::decode(&body) {
+                            let sink = mailbox_crypto_sink.clone();
+                            dispatch_reply_job(
+                                &mut wh,
+                                req_id,
+                                LocalAppMsg::MailboxSealOk as u16,
+                                &spawn_sem,
+                                &reply_tx,
+                                async move {
+                                    crate::handlers::mailbox::mailbox_seal_reply_body(sink, req)
+                                        .await
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     Ok(LocalAppMsg::MailboxOpen) => {
-                        handle_mailbox_open(&mut wh, &body, mailbox_crypto_sink.as_ref()).await?;
+                        // Seconds-class arc (audit V): open may resolve the
+                        // sender's cert. Same spawn pattern as MailboxSeal.
+                        if let Ok(req) = veil_proto::MailboxOpenPayload::decode(&body) {
+                            let sink = mailbox_crypto_sink.clone();
+                            dispatch_reply_job(
+                                &mut wh,
+                                req_id,
+                                LocalAppMsg::MailboxOpenOk as u16,
+                                &spawn_sem,
+                                &reply_tx,
+                                async move {
+                                    crate::handlers::mailbox::mailbox_open_reply_body(sink, req)
+                                        .await
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     Ok(LocalAppMsg::OutboxPut) => {
                         handle_outbox_put(
@@ -2470,22 +2593,53 @@ async fn handle_ipc_client(
                             .await?;
                     }
                     Ok(LocalAppMsg::LookupRendezvousReplicas) => {
-                        handle_lookup_rendezvous_replicas(
-                            &mut wh,
-                            &body,
-                            &mut client_state,
-                            rendezvous_resolver.as_ref(),
-                        )
-                        .await?;
+                        // Seconds-class arc (audit V): a cold DHT resolve takes
+                        // ~3.5 s. Rate limit + decode stay inline (silent drop,
+                        // same as the legacy handler); the resolve runs
+                        // off-loop when req_id != 0.
+                        if client_state.allow_query()
+                            && let Ok(req) =
+                                veil_proto::LookupRendezvousReplicasPayload::decode(&body)
+                        {
+                            let resolver = rendezvous_resolver.clone();
+                            dispatch_reply_job(
+                                &mut wh,
+                                req_id,
+                                LocalAppMsg::LookupRendezvousReplicasResp as u16,
+                                &spawn_sem,
+                                &reply_tx,
+                                async move {
+                                    crate::handlers::queries::lookup_rendezvous_replicas_reply_body(
+                                        resolver, req,
+                                    )
+                                    .await
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     Ok(LocalAppMsg::LookupRelayKey) => {
-                        handle_lookup_relay_key(
-                            &mut wh,
-                            &body,
-                            &mut client_state,
-                            relay_key_resolver.as_ref(),
-                        )
-                        .await?;
+                        // Seconds-class arc (audit V): DHT walk, 3-9 s cold.
+                        // Same pattern as LookupRendezvousReplicas.
+                        if client_state.allow_query()
+                            && let Ok(req) = veil_proto::LookupRelayKeyPayload::decode(&body)
+                        {
+                            let resolver = relay_key_resolver.clone();
+                            dispatch_reply_job(
+                                &mut wh,
+                                req_id,
+                                LocalAppMsg::LookupRelayKeyResp as u16,
+                                &spawn_sem,
+                                &reply_tx,
+                                async move {
+                                    crate::handlers::queries::lookup_relay_key_reply_body(
+                                        resolver, req,
+                                    )
+                                    .await
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     Ok(LocalAppMsg::GetNodeIdentity) => {
                         handle_get_node_identity(
@@ -2811,15 +2965,24 @@ mod remote_stream_open_tests {
         let task = tokio::spawn(async move {
             let mut cs = IpcClientState::new(delivery_tx, src, [0u8; 16], None);
             let mut wh = wh;
+            // req_id = 0 → legacy inline path (the spawn path is covered by
+            // the request-id concurrency tests in server_tests_unix).
+            let spawn_sem = Arc::new(tokio::sync::Semaphore::new(
+                MAX_SPAWNED_HANDLERS_PER_CONNECTION,
+            ));
+            let (reply_tx, _reply_rx) = mpsc::channel::<LoopReply>(REPLY_CHANNEL_CAP);
             handle_stream_open(
                 &mut wh,
                 &body,
+                0,
                 &mut cs,
                 &registry,
                 &st_task,
                 &src,
                 Some(bc_task as Arc<dyn veil_types::FrameBroadcaster>),
                 Some(&br_task),
+                &spawn_sem,
+                &reply_tx,
             )
             .await
             .unwrap();

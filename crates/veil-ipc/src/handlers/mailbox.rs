@@ -262,18 +262,15 @@ mod tests {
 // ── Offline seal/open (node-side E2E crypto, distinct from the relay
 //    Put/Fetch/Ack above) ─────────────────────────────────────────────────────
 
-/// `LocalAppMsg::MailboxSeal`: app asks the node to seal `data` for a recipient
-/// into an offline-mailbox blob (the node holds the sovereign identity + does
-/// the DHT cert resolution). Replies `MailboxSealOk`. Malformed bodies are
-/// dropped silently; a missing sink (feature off) replies `Failed`.
-pub(crate) async fn handle_mailbox_seal(
-    wh: &mut IpcWriteHalf,
-    body: &[u8],
-    mailbox_crypto_sink: Option<&Arc<dyn MailboxCryptoSink>>,
-) -> std::io::Result<()> {
-    let Ok(req) = MailboxSealPayload::decode(body) else {
-        return Ok(());
-    };
+/// Slow half of `LocalAppMsg::MailboxSeal` — DHT cert resolution + seal
+/// crypto + reply encoding (`MailboxSealOk`), touching only the `Arc` sink so
+/// it can run in a task spawned off the connection loop (request-id
+/// concurrency). The caller decodes (malformed bodies are dropped silently);
+/// a missing sink (feature off) replies `Failed`.
+pub(crate) async fn mailbox_seal_reply_body(
+    mailbox_crypto_sink: Option<Arc<dyn MailboxCryptoSink>>,
+    req: MailboxSealPayload,
+) -> Vec<u8> {
     let reply = match mailbox_crypto_sink {
         Some(sink) => {
             match sink
@@ -303,27 +300,19 @@ pub(crate) async fn handle_mailbox_seal(
             blob: Vec::new(),
         },
     };
-    write_frame_wh(
-        wh,
-        FrameFamily::LocalApp as u8,
-        LocalAppMsg::MailboxSealOk as u16,
-        &reply.encode(),
-    )
-    .await
+    reply.encode()
 }
 
-/// `LocalAppMsg::MailboxOpen`: app asks the node to open + verify a fetched
-/// mailbox blob (decrypt under our dk_seed, verify the sender's auth-deliver
-/// signature). Replies `MailboxOpenOk` with the verified routing target +
-/// plaintext, or a non-`Ok` status.
-pub(crate) async fn handle_mailbox_open(
-    wh: &mut IpcWriteHalf,
-    body: &[u8],
-    mailbox_crypto_sink: Option<&Arc<dyn MailboxCryptoSink>>,
-) -> std::io::Result<()> {
-    let Ok(req) = MailboxOpenPayload::decode(body) else {
-        return Ok(());
-    };
+/// Slow half of `LocalAppMsg::MailboxOpen` — decrypt under our dk_seed +
+/// verify the sender's auth-deliver signature + reply encoding
+/// (`MailboxOpenOk` with the verified routing target + plaintext, or a
+/// non-`Ok` status). Touches only the `Arc` sink so it can run in a task
+/// spawned off the connection loop (request-id concurrency); the caller
+/// decodes (malformed bodies are dropped silently).
+pub(crate) async fn mailbox_open_reply_body(
+    mailbox_crypto_sink: Option<Arc<dyn MailboxCryptoSink>>,
+    req: MailboxOpenPayload,
+) -> Vec<u8> {
     let reply = match mailbox_crypto_sink {
         Some(sink) => match sink.open_blob(req.blob, req.our_cert_version).await {
             MailboxOpenOutcome::Ok {
@@ -368,11 +357,5 @@ pub(crate) async fn handle_mailbox_open(
             data: Vec::new(),
         },
     };
-    write_frame_wh(
-        wh,
-        FrameFamily::LocalApp as u8,
-        LocalAppMsg::MailboxOpenOk as u16,
-        &reply.encode(),
-    )
-    .await
+    reply.encode()
 }

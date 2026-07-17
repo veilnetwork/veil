@@ -24,7 +24,6 @@ use veil_proto::{
 use veil_types::FrameBroadcaster;
 
 use crate::bridge::{IpcStreamBridge, VeilStreamRxMap};
-use crate::frame_io::write_frame_wh;
 use crate::server::IpcClientState;
 use crate::streams::{IpcStreamTable, encode_stream_close, encode_stream_data};
 use crate::transport::IpcWriteHalf;
@@ -38,50 +37,43 @@ const OPEN_RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) async fn handle_stream_open(
     wh: &mut IpcWriteHalf,
     body: &[u8],
+    req_id: u32,
     client_state: &mut IpcClientState,
     app_registry: &AppEndpointRegistry,
     stream_table: &IpcStreamTable,
     src_node_id: &[u8; 32],
     session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
     stream_bridge: Option<&IpcStreamBridge>,
+    spawn_sem: &Arc<tokio::sync::Semaphore>,
+    reply_tx: &mpsc::Sender<crate::server::LoopReply>,
 ) -> std::io::Result<()> {
+    // `req_id` echo discipline: StreamOpenOk/Err replies for one connection
+    // may come from BOTH the inline path (local opens) and spawned tasks
+    // (remote opens). The id-stamping client matches replies by id, so when
+    // `req_id != 0` EVERY reply — inline or spawned, ok or err — must echo
+    // it; a single id-less reply would fall back to positional FIFO and could
+    // be matched to the wrong waiter. Legacy clients stamp 0 and everything
+    // stays inline + in-order.
+
     // Per-client stream-open quota: refuse new opens once the cumulative
     // count for this IPC session reaches the cap, even if the global
     // `MAX_TOTAL_STREAMS` still has room.  Without this check a single
     // misbehaving local app can exhaust the global pool and starve every
     // other client on the same node.
     if client_state.stream_quota_exhausted() {
-        let err = StreamOpenErrPayload {
-            error_code: stream_open_err::CAPACITY_REACHED,
-        };
-        return write_frame_wh(
-            wh,
-            FrameFamily::LocalApp as u8,
-            LocalAppMsg::StreamOpenErr as u16,
-            &err.encode(),
-        )
-        .await;
+        return reply_stream_open_err(wh, req_id, stream_open_err::CAPACITY_REACHED).await;
     }
 
     let p = match StreamOpenPayload::decode(body) {
         Ok(p) => p,
         Err(_) => {
-            let err = StreamOpenErrPayload {
-                error_code: stream_open_err::NOT_FOUND,
-            };
-            return write_frame_wh(
-                wh,
-                FrameFamily::LocalApp as u8,
-                LocalAppMsg::StreamOpenErr as u16,
-                &err.encode(),
-            )
-            .await;
+            return reply_stream_open_err(wh, req_id, stream_open_err::NOT_FOUND).await;
         }
     };
 
     // Cross-node STREAM_OPEN: `dst_node_id` is a remote peer. Implemented via
     // the wire AppOpen/AppData/AppClose machinery + a per-stream bridge task —
-    // see `handle_stream_open_remote` (the path mirrors
+    // see `open_remote_stream` (the path mirrors
     // `veil_proxy::VeilConnector`, which has used the same building blocks
     // for the proxy surfaces since Epic 33). Plan + history:
     // `docs/en/PLAN_IPC_STREAM_FORWARDING.md` (Phases 2-4, 2026-06-03).
@@ -95,26 +87,81 @@ pub(crate) async fn handle_stream_open(
         // rather than a hang.
         return match (session_tx_registry, stream_bridge) {
             (Some(broadcaster), Some(bridge)) => {
-                handle_stream_open_remote(wh, &p, client_state, stream_table, broadcaster, bridge)
+                // Remote opens await the peer's AppReceipt (up to 5 s) — the
+                // seconds-class arc of audit V. With a non-zero req_id and a
+                // free spawn slot, run it off-loop so it can't freeze the
+                // connection; ownership claiming (which needs `&mut
+                // client_state`) is carried back to the loop via
+                // `LoopReply::RemoteStreamOpened`.
+                if req_id != 0
+                    && let Ok(permit) = Arc::clone(spawn_sem).try_acquire_owned()
+                {
+                    // Reserve the per-session quota at REQUEST time: N spawned
+                    // opens in flight may not overshoot the cap. Failed
+                    // attempts consume quota (conservative; the cap only
+                    // guards pool exhaustion).
+                    client_state.record_stream_opened();
+                    let delivery_tx = client_state.delivery_tx_clone();
+                    let stream_table = stream_table.clone();
+                    let bridge = bridge.clone();
+                    let reply_tx = reply_tx.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let msg = match open_remote_stream(
+                            &p,
+                            delivery_tx,
+                            &stream_table,
+                            broadcaster,
+                            &bridge,
+                        )
+                        .await
+                        {
+                            Ok(ipc_stream_id) => {
+                                let ok = StreamOpenOkPayload {
+                                    stream_id: ipc_stream_id,
+                                    initial_window: STREAM_INITIAL_WINDOW,
+                                };
+                                crate::server::LoopReply::RemoteStreamOpened {
+                                    ipc_stream_id,
+                                    frame: crate::frame_io::encode_reply_frame_id(
+                                        LocalAppMsg::StreamOpenOk as u16,
+                                        req_id,
+                                        &ok.encode(),
+                                    ),
+                                }
+                            }
+                            Err(code) => crate::server::LoopReply::Frame(
+                                crate::frame_io::encode_reply_frame_id(
+                                    LocalAppMsg::StreamOpenErr as u16,
+                                    req_id,
+                                    &StreamOpenErrPayload { error_code: code }.encode(),
+                                ),
+                            ),
+                        };
+                        let _ = reply_tx.send(msg).await;
+                    });
+                    Ok(())
+                } else {
+                    handle_stream_open_remote(
+                        wh,
+                        req_id,
+                        &p,
+                        client_state,
+                        stream_table,
+                        broadcaster,
+                        bridge,
+                    )
                     .await
+                }
             }
-            _ => reply_stream_open_err(wh, stream_open_err::REMOTE_NOT_IMPLEMENTED).await,
+            _ => reply_stream_open_err(wh, req_id, stream_open_err::REMOTE_NOT_IMPLEMENTED).await,
         };
     }
 
     let b_tx = match app_registry.get_sender(p.app_id, p.endpoint_id) {
         Some(tx) => tx,
         None => {
-            let err = StreamOpenErrPayload {
-                error_code: stream_open_err::NOT_FOUND,
-            };
-            return write_frame_wh(
-                wh,
-                FrameFamily::LocalApp as u8,
-                LocalAppMsg::StreamOpenErr as u16,
-                &err.encode(),
-            )
-            .await;
+            return reply_stream_open_err(wh, req_id, stream_open_err::NOT_FOUND).await;
         }
     };
 
@@ -124,16 +171,7 @@ pub(crate) async fn handle_stream_open(
         *src_node_id,
         p.initial_window,
     ) else {
-        let err = StreamOpenErrPayload {
-            error_code: stream_open_err::CAPACITY_REACHED,
-        };
-        return write_frame_wh(
-            wh,
-            FrameFamily::LocalApp as u8,
-            LocalAppMsg::StreamOpenErr as u16,
-            &err.encode(),
-        )
-        .await;
+        return reply_stream_open_err(wh, req_id, stream_open_err::CAPACITY_REACHED).await;
     };
     client_state.record_stream_opened();
     // Claim opener-side ownership so cross-client hijack via a known /
@@ -147,10 +185,11 @@ pub(crate) async fn handle_stream_open(
         stream_id,
         initial_window: STREAM_INITIAL_WINDOW,
     };
-    write_frame_wh(
+    crate::frame_io::write_frame_wh_id(
         wh,
         FrameFamily::LocalApp as u8,
         LocalAppMsg::StreamOpenOk as u16,
+        req_id,
         &ok.encode(),
     )
     .await
@@ -169,12 +208,49 @@ pub(crate) async fn handle_stream_open(
 /// tables and replies a distinct `STREAM_OPEN_ERR` code (never a silent hang).
 async fn handle_stream_open_remote(
     wh: &mut IpcWriteHalf,
+    req_id: u32,
     p: &StreamOpenPayload,
     client_state: &mut IpcClientState,
     stream_table: &IpcStreamTable,
     broadcaster: Arc<dyn FrameBroadcaster>,
     bridge: &IpcStreamBridge,
 ) -> std::io::Result<()> {
+    let delivery_tx = client_state.delivery_tx_clone();
+    match open_remote_stream(p, delivery_tx, stream_table, broadcaster, bridge).await {
+        Ok(ipc_stream_id) => {
+            client_state.record_stream_opened();
+            client_state.claim_stream_opener(ipc_stream_id);
+            let ok = StreamOpenOkPayload {
+                stream_id: ipc_stream_id,
+                initial_window: STREAM_INITIAL_WINDOW,
+            };
+            crate::frame_io::write_frame_wh_id(
+                wh,
+                FrameFamily::LocalApp as u8,
+                LocalAppMsg::StreamOpenOk as u16,
+                req_id,
+                &ok.encode(),
+            )
+            .await
+        }
+        Err(code) => reply_stream_open_err(wh, req_id, code).await,
+    }
+}
+
+/// Core of the cross-node open — everything except the per-connection pieces
+/// (ownership claim + reply write), so it can run either inline on the
+/// connection loop or in a spawned task (request-id concurrency). On success
+/// the inbound bridge task is already running and the IPC stream-id is
+/// reserved; the CALLER must claim opener ownership before the client learns
+/// the id. On failure every registration is rolled back and the
+/// `stream_open_err` code is returned.
+async fn open_remote_stream(
+    p: &StreamOpenPayload,
+    delivery_tx: crate::server::DeliveryQueueTx,
+    stream_table: &IpcStreamTable,
+    broadcaster: Arc<dyn FrameBroadcaster>,
+    bridge: &IpcStreamBridge,
+) -> Result<u32, u16> {
     use std::sync::atomic::Ordering;
 
     let dst = p.dst_node_id;
@@ -204,7 +280,7 @@ async fn handle_stream_open_remote(
         p.endpoint_id,
     ) {
         deregister_wire_stream(bridge, &dst, wire_stream_id);
-        return reply_stream_open_err(wh, stream_open_err::NO_SESSION).await;
+        return Err(stream_open_err::NO_SESSION);
     }
 
     // Await the open receipt.
@@ -213,12 +289,12 @@ async fn handle_stream_open_remote(
         // Timeout, or the dispatcher dropped the waiter without a status.
         Ok(Err(_)) | Err(_) => {
             deregister_wire_stream(bridge, &dst, wire_stream_id);
-            return reply_stream_open_err(wh, stream_open_err::REMOTE_TIMEOUT).await;
+            return Err(stream_open_err::REMOTE_TIMEOUT);
         }
     };
     if status != receipt_status::ACCEPTED {
         deregister_wire_stream(bridge, &dst, wire_stream_id);
-        return reply_stream_open_err(wh, stream_open_err::REFUSED).await;
+        return Err(stream_open_err::REFUSED);
     }
 
     // Accepted — reserve the IPC-facing stream-id + outbound route.
@@ -237,17 +313,15 @@ async fn handle_stream_open_remote(
             p.endpoint_id,
         );
         deregister_wire_stream(bridge, &dst, wire_stream_id);
-        return reply_stream_open_err(wh, stream_open_err::CAPACITY_REACHED).await;
+        return Err(stream_open_err::CAPACITY_REACHED);
     };
-    client_state.record_stream_opened();
-    client_state.claim_stream_opener(ipc_stream_id);
 
     // Spawn the inbound bridge: remote AppData (routed by the dispatcher into
     // `data_rx`) → IPC STREAM_DATA frames pushed to this client's delivery
     // channel; tears down + emits STREAM_CLOSE when the remote side closes.
     tokio::spawn(run_remote_stream_bridge(
         data_rx,
-        client_state.delivery_tx_clone(),
+        delivery_tx,
         ipc_stream_id,
         dst,
         wire_stream_id,
@@ -258,17 +332,7 @@ async fn handle_stream_open_remote(
         Arc::clone(&broadcaster),
     ));
 
-    let ok = StreamOpenOkPayload {
-        stream_id: ipc_stream_id,
-        initial_window: STREAM_INITIAL_WINDOW,
-    };
-    write_frame_wh(
-        wh,
-        FrameFamily::LocalApp as u8,
-        LocalAppMsg::StreamOpenOk as u16,
-        &ok.encode(),
-    )
-    .await
+    Ok(ipc_stream_id)
 }
 
 /// Inbound pump for a remote-bound stream: forwards bytes the dispatcher routes
@@ -332,12 +396,17 @@ async fn run_remote_stream_bridge(
 }
 
 /// Reply a `STREAM_OPEN_ERR` with `code`.
-async fn reply_stream_open_err(wh: &mut IpcWriteHalf, code: u16) -> std::io::Result<()> {
+async fn reply_stream_open_err(
+    wh: &mut IpcWriteHalf,
+    req_id: u32,
+    code: u16,
+) -> std::io::Result<()> {
     let err = StreamOpenErrPayload { error_code: code };
-    write_frame_wh(
+    crate::frame_io::write_frame_wh_id(
         wh,
         FrameFamily::LocalApp as u8,
         LocalAppMsg::StreamOpenErr as u16,
+        req_id,
         &err.encode(),
     )
     .await
