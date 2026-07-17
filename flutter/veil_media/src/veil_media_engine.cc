@@ -1243,6 +1243,27 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       const int bps = kbps * 1000;
       ws->video_target_bitrate_bps = bps;
       ws->video_max_fps = fps;
+      // Anchor the Call's bandwidth estimate to the route budget. Without
+      // this the BWE starts at webrtc's 300 kbps default and — on the veil
+      // datagram channel, where no transport feedback ever raises it — the
+      // PACER budget stays pinned near that default while the encoder runs
+      // at the profile rate. The overshoot then stands in the pacer queue:
+      // live-observed as video (audio has pacer priority, RTCP bypasses it)
+      // arriving a stable 2-3 s late with every RTCP metric clean.
+      {
+        webrtc::BitrateSettings bs;
+        // Pin min = start: anchoring only the START is not enough — the
+        // delay-based BWE then sags below the profile on the TCP-like veil
+        // channel (it reacts to the queue it itself builds) and the pacer
+        // budget drops under the encoder rate again (live-measured 1.4-1.6 s
+        // standing pacer queue with a 900 kbps profile). Congestion response
+        // on this transport belongs to the app's own bitrate ladder, which
+        // moves this whole anchor when it retunes.
+        bs.min_bitrate_bps = bps;
+        bs.start_bitrate_bps = bps;
+        bs.max_bitrate_bps = bps + 128'000;  // audio + RTCP headroom
+        ws->call->SetClientBitratePreferences(bs);
+      }
       webrtc::VideoEncoderConfig ec;
       ec.codec_type = webrtc::kVideoCodecVP8;
       ec.video_format = webrtc::SdpVideoFormat::VP8();
@@ -1354,6 +1375,16 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
     layer.max_qp = 63;
     ec.simulcast_layers.push_back(layer);
     ws->video_send_stream->ReconfigureVideoEncoder(std::move(ec));
+    // Move the Call-level estimate anchor WITH the retune (see start_video):
+    // the pacer budget must track the encoder budget in both directions, or
+    // an upward retune re-opens the standing-queue gap.
+    {
+      webrtc::BitrateSettings bs;
+      bs.min_bitrate_bps = bps;  // pinned floor — see start_video
+      bs.start_bitrate_bps = bps;
+      bs.max_bitrate_bps = bps + 128'000;
+      ws->call->SetClientBitratePreferences(bs);
+    }
     ws->video_target_bitrate_bps = bps;
     ws->video_max_fps = fps;
     vlog("video: retuned to %d kbps @ %d fps", kbps, fps);
@@ -1677,10 +1708,16 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     uint32_t audio_jb_ms = 0;
     int video_delay_ms = 0;
     int video_jb_ms = 0;
+    // Sender-side standing queue: RTCP bypasses the pacer, so a video RTP
+    // packet can wait SECONDS in the pacer while rtt_ms stays flat — the
+    // exact signature of the live "2-3 s stable lag, all metrics clean"
+    // report. Export it so the creep is attributable.
+    int64_t pacer_delay_ms = 0;
     run_on(ws->worker_tq.get(), [&] {
       if (ws->call) {
-        const int64_t call_rtt = ws->call->GetStats().rtt_ms;
-        if (call_rtt >= 0) rtt_ms = call_rtt;
+        const auto cs = ws->call->GetStats();
+        if (cs.rtt_ms >= 0) rtt_ms = cs.rtt_ms;
+        pacer_delay_ms = cs.pacer_delay_ms;
       }
       if (ws->send_stream) {
         // Per-stream RTCP report-block RTT is fresher than the call-level
@@ -1726,6 +1763,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,"
         "\"audio_delay_ms\":%u,\"audio_jb_ms\":%u,"
         "\"video_delay_ms\":%d,\"video_jb_ms\":%d,"
+        "\"pacer_delay_ms\":%lld,"
         "\"target_bitrate_bps\":%d,\"max_fps\":%d}",
         static_cast<unsigned long long>(ws->shim->outbound_packet_count()),
         static_cast<unsigned long long>(ws->shim->inbound_packet_count()),
@@ -1735,6 +1773,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->inbound_dropped_count()),
         static_cast<long long>(rtt_ms), jitter_ms, loss_pct, tx_jitter_ms,
         tx_loss_pct, audio_delay_ms, audio_jb_ms, video_delay_ms, video_jb_ms,
+        static_cast<long long>(pacer_delay_ms),
         ws->video_target_bitrate_bps, ws->video_max_fps);
     return dup_cstr(json);
   }
