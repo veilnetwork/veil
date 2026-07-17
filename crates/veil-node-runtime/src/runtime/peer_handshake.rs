@@ -465,19 +465,20 @@ pub async fn register_connection_session(
             }
         };
         let hs_timeout = std::time::Duration::from_secs(veil_proto::budget::HANDSHAKE_TIMEOUT_SECS);
-        let sovereign_ctx =
-            runtime
-                .identity
-                .sovereign_identity
-                .as_ref()
-                .map(|sov| SovereignHandshakeCtx {
-                    sovereign: sov.as_ref(),
-                    now_unix_secs: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    local_mlkem_dk_seed: None,
-                });
+        // Read the CURRENT document from the shared cell (it advances when
+        // the maintenance loop re-issues the delegation at half-validity);
+        // the Arc binding keeps it alive for the borrow in the ctx below.
+        let sovereign_current = runtime.identity.sovereign_identity.get();
+        let sovereign_ctx = sovereign_current
+            .as_ref()
+            .map(|sov| SovereignHandshakeCtx {
+                sovereign: sov.as_ref(),
+                now_unix_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                local_mlkem_dk_seed: None,
+            });
         let local_advertised_transports: Vec<String> = {
             let state = lock_state(&runtime.state);
             state

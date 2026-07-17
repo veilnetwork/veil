@@ -2234,7 +2234,7 @@ impl NodeRuntime {
             // bundle identity-domain fields into one Arc.
             identity: Arc::new(identity_state::IdentityState::new(
                 Arc::clone(&local_identity),
-                sovereign_identity.clone(),
+                identity_state::SovereignIdentityCell::new(sovereign_identity.clone()),
                 Arc::clone(&peer_pubkeys),
                 Arc::clone(&peer_sovereign_identities),
                 Arc::clone(&peer_roles),
@@ -3266,7 +3266,7 @@ impl NodeRuntime {
         let sovereign = self
             .identity
             .sovereign_identity
-            .as_ref()
+            .get()
             .ok_or(veil_anonymity::sender::SenderError::MissingSenderIdentity)?;
 
         let now_unix = std::time::SystemTime::now()
@@ -4791,7 +4791,7 @@ impl NodeServices {
         let our_sovereign_id = self
             .identity
             .sovereign_identity
-            .as_ref()
+            .get()
             .map(|s| *s.node_id());
         // A name WE published is locally authoritative and needs NO remote
         // corroboration: quorum exists to stop a sybil forging a claim for
@@ -7706,8 +7706,8 @@ impl NodeServices {
     fn sovereign_onion_identity_seed(
         &self,
     ) -> Option<std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>> {
-        self.identity
-            .sovereign_identity
+        let sovereign_current = self.identity.sovereign_identity.get();
+        sovereign_current
             .as_ref()
             .and_then(|sov| sov.ed25519_signing_key())
             .map(|ed| std::sync::Arc::new(zeroize::Zeroizing::new(ed.to_bytes())))
@@ -8468,7 +8468,7 @@ impl NodeServices {
         let sovereign = self
             .identity
             .sovereign_identity
-            .as_ref()
+            .get()
             .ok_or(veil_anonymity::sender::SenderError::MissingSenderIdentity)?;
 
         const REPLY_CIRCUIT_HOPS: usize = 2;
@@ -8738,7 +8738,7 @@ impl NodeServices {
         let sovereign = self
             .identity
             .sovereign_identity
-            .as_ref()
+            .get()
             .ok_or(veil_anonymity::sender::SenderError::MissingSenderIdentity)?;
 
         // PREPARE the reply block (select relay path + cookie) so its bytes are

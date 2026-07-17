@@ -147,7 +147,12 @@ impl NodeRuntime {
         // The veil_dir is the config file's parent; the on-change
         // reload poll in `runtime/sovereign_republish.rs` picks up the
         // mtime change within 60 s and DHT-republishes.
-        let mut sovereign_identity_for_reissue = self.identity.sovereign_identity.clone();
+        // Shared cell, not a snapshot: a successful re-issue below is
+        // `set()` back into it so handshakes/publishers see the fresh
+        // delegation immediately (a snapshot froze the boot document
+        // into every handshake until restart — expired-proof rejects
+        // after 7 d of uptime, seen live on the production seeds).
+        let sovereign_identity_for_reissue = self.identity.sovereign_identity.clone();
         let veil_dir_for_reissue = self
             .config_path
             .parent()
@@ -284,13 +289,17 @@ impl NodeRuntime {
                         // the doc still has > half its window remaining or
                         // when this node runs in multi-device mode.
                         if let Some(reissued) = Self::tick_reissue_local_delegation(
-                            sovereign_identity_for_reissue.as_ref(),
+                            sovereign_identity_for_reissue.get().as_ref(),
                             &veil_dir_for_reissue,
                             &reissue_logger,
                         ) {
-                            // Advance the in-memory handle so the next tick sees the
-                            // extended validity and no-ops (kills the per-second spin).
-                            sovereign_identity_for_reissue = Some(reissued);
+                            // Swap the SHARED cell so every holder — the
+                            // per-handshake SovereignHandshakeCtx above all —
+                            // presents the extended delegation from the next
+                            // handshake on. Also makes the next tick no-op at
+                            // the half-validity guard (kills the per-second
+                            // spin).
+                            sovereign_identity_for_reissue.set(reissued);
                         }
                         // persist the discovered-peer cache to
                         // disk if it has any entries. Cheap (single JSON
@@ -1322,6 +1331,69 @@ mod tests {
             nonce: "AAAA".to_owned(),
             node_id,
         }
+    }
+
+    /// Regression (production seeds, 2026-07-17): the half-validity
+    /// delegation re-issue must reach the SHARED `SovereignIdentityCell` —
+    /// the handle every handshake reads — not just a task-local snapshot.
+    /// The old task-local `Option<Arc<..>>` froze the boot delegation into
+    /// every handshake, so a node with > 7 d uptime presented an expired
+    /// proof and every new peer rejected it until restart.
+    #[test]
+    fn delegation_reissue_reaches_shared_cell() {
+        use crate::runtime::identity_state::SovereignIdentityCell;
+
+        let dir = std::env::temp_dir().join(format!(
+            "veil-reissue-cell-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Issue a standalone document already past half-validity:
+        // issued 4 d ago, expiring in 3 d (7-day window, < 3.5 d left).
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([7u8; 32]);
+        let issued_at = now_unix - 4 * 24 * 3600;
+        let old_valid_until = now_unix + 3 * 24 * 3600;
+        veil_identity::sovereign_flow::save_standalone_identity_to_dir(
+            &dir,
+            &seed,
+            issued_at,
+            old_valid_until,
+        )
+        .expect("persist standalone identity");
+        let sov = veil_identity::sovereign::SovereignIdentity::load_from_dir(&dir)
+            .expect("load standalone identity");
+        let cell = SovereignIdentityCell::new(Some(Arc::new(sov)));
+        let logger = Arc::new(NodeLogger::new_noop());
+
+        let reissued =
+            NodeRuntime::tick_reissue_local_delegation(cell.get().as_ref(), &dir, &logger)
+                .expect("past half-validity — tick must re-issue");
+        // The production loop swaps the shared cell with the result.
+        cell.set(reissued);
+
+        let visible = cell.get().expect("cell holds the re-issued document");
+        let active_key = &visible.document.identity_keys[visible.sig_key_idx as usize];
+        assert!(
+            active_key.valid_until_unix > old_valid_until,
+            "handshake-visible delegation must carry the extended window \
+             (old={} new={})",
+            old_valid_until,
+            active_key.valid_until_unix,
+        );
+        // A fresh window means the next tick is a cheap no-op.
+        assert!(
+            NodeRuntime::tick_reissue_local_delegation(cell.get().as_ref(), &dir, &logger)
+                .is_none(),
+            "freshly re-issued delegation must not re-issue again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// when `relay_capable = false` the helper is a

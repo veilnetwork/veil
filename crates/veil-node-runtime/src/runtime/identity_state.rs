@@ -13,9 +13,11 @@
 //!
 //! ## Reload semantics
 //!
-//! `local_identity` and `sovereign_identity` are immutable per-process —
-//! reload swaps the whole `Arc<IdentityState>` if either changes (today
-//! only the legacy / sovereign upgrade path). Peer caches (Mutex / RwLock
+//! `local_identity` is immutable per-process — reload swaps the whole
+//! `Arc<IdentityState>` if it changes (today only the legacy / sovereign
+//! upgrade path). `sovereign_identity` lives in a shared
+//! [`SovereignIdentityCell`] so the half-validity delegation re-issue
+//! reaches every holder in place. Peer caches (Mutex / RwLock
 //! around HashMaps) are mutable in-place; reload mutates inner contents
 //! without replacing the Arc, so downstream Arc-clone holders observe new
 //! state automatically.
@@ -41,6 +43,45 @@ use veil_identity::sovereign::SovereignIdentity;
 use veil_identity::verify::ValidatedIdentity;
 use veil_types::PeerLruCache;
 
+/// Hot-swappable holder for the node's own [`SovereignIdentity`].
+///
+/// All `Arc<IdentityState>` holders share one cell (`Clone` clones the
+/// handle, not the contents), so a `set()` from the maintenance
+/// re-issue tick is immediately visible to every reader — including
+/// the per-handshake `SovereignHandshakeCtx` builder.
+#[derive(Clone)]
+pub struct SovereignIdentityCell {
+    inner: Arc<RwLock<Option<Arc<SovereignIdentity>>>>,
+}
+
+impl SovereignIdentityCell {
+    pub fn new(initial: Option<Arc<SovereignIdentity>>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(initial)),
+        }
+    }
+
+    /// Current document handle (cheap Arc clone; `None` on legacy nodes).
+    pub fn get(&self) -> Option<Arc<SovereignIdentity>> {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Swap in a freshly re-issued / reloaded document.
+    pub fn set(&self, doc: Arc<SovereignIdentity>) {
+        *self.inner.write().unwrap_or_else(|p| p.into_inner()) = Some(doc);
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+    }
+}
+
 /// Identity-domain state owned by [`crate::node::NodeRuntime`].
 pub struct IdentityState {
     /// The daemon's own handshake identity (algo + raw / base64 key
@@ -53,7 +94,17 @@ pub struct IdentityState {
     /// `None` on legacy nodes (pre-462) — they fall back to the
     /// node_id-keyed handshake. Cloned into every outbound handshake
     /// via `SovereignHandshakeCtx`.
-    pub sovereign_identity: Option<Arc<SovereignIdentity>>,
+    ///
+    /// Hot-swappable: the maintenance loop re-issues the standalone
+    /// delegation at half-validity and MUST make the fresh document
+    /// visible to every long-lived `Arc<IdentityState>` holder — above
+    /// all the per-handshake `SovereignHandshakeCtx`. A plain
+    /// `Option<Arc<..>>` here froze the boot-time delegation into every
+    /// handshake for the life of the process, so any node with more
+    /// than `DELEGATION_VALIDITY_SECS` (7 d) of uptime presented an
+    /// expired proof and was rejected by every new peer until restart
+    /// (observed live on the production seeds, 2026-07-17).
+    pub sovereign_identity: SovereignIdentityCell,
 
     /// Cache of `(peer_node_id) → (algo, raw_pubkey_bytes)` for all
     /// peers we've successfully completed an OVL1 handshake with.
@@ -107,7 +158,7 @@ impl IdentityState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         local_identity: Arc<HandshakeIdentity>,
-        sovereign_identity: Option<Arc<SovereignIdentity>>,
+        sovereign_identity: SovereignIdentityCell,
         peer_pubkeys: veil_types::PeerPubkeysCache,
         peer_sovereign_identities: Arc<
             Mutex<std::collections::HashMap<NodeIdBytes, ValidatedIdentity>>,

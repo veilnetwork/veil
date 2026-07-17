@@ -61,9 +61,8 @@ impl NodeRuntime {
         // authenticate the installed-version state file with a key derived from
         // our Ed25519 identity seed (same derivation as the apply path), so a
         // locally-tampered file can't forge a spurious downgrade notification.
-        let iv_hmac_key = self
-            .identity
-            .sovereign_identity
+        let sovereign_current = self.identity.sovereign_identity.get();
+        let iv_hmac_key = sovereign_current
             .as_ref()
             .and_then(|sov| sov.ed25519_signing_key())
             .map(|sk| veil_update::installed_version::mac_key_from_ed25519_seed(&sk.to_bytes()));
