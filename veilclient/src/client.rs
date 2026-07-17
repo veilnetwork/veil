@@ -54,9 +54,9 @@ pub(crate) async fn await_rpc_reply<T>(
 /// and legitimate callers get spuriously rejected. Run at every queue.push_back
 /// site before the cap check.
 pub(crate) fn prune_closed<T>(
-    queue: &mut std::collections::VecDeque<tokio::sync::oneshot::Sender<T>>,
+    queue: &mut std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<T>)>,
 ) {
-    queue.retain(|tx| !tx.is_closed());
+    queue.retain(|(_, tx)| !tx.is_closed());
 }
 
 /// Pop the next non-closed waiter from a pending FIFO. Dispatcher-side
@@ -64,6 +64,11 @@ pub(crate) fn prune_closed<T>(
 /// still-listening caller rather than being silently discarded into an
 /// abandoned slot, leaving subsequent legitimate callers waiting on the
 /// reply that already passed them by.
+///
+/// Retained after the `request_id` correlation migration (dispatcher now uses
+/// [`take_pending`]); still exercised by tests and kept for the legacy
+/// strict-FIFO path.
+#[allow(dead_code)]
 pub(crate) fn pop_next_open<T>(
     queue: &mut std::collections::VecDeque<tokio::sync::oneshot::Sender<T>>,
 ) -> Option<tokio::sync::oneshot::Sender<T>> {
@@ -73,6 +78,50 @@ pub(crate) fn pop_next_open<T>(
         }
     }
     None
+}
+
+/// Take the waiter a reply belongs to from an id-keyed pending queue.
+///
+/// Every request now stamps `FrameHeader.request_id` (non-zero) and enqueues
+/// `(request_id, waiter)`. A node that echoes the id (request-id capable)
+/// gets exact correlation — replies may arrive OUT OF ORDER once the node
+/// spawns slow handlers off its per-connection loop. A legacy node echoes
+/// `request_id = 0`; it also answers strictly in order, so FIFO pop remains
+/// the correct match there (same skip-closed semantics as [`pop_next_open`]).
+///
+/// An id'd reply with no matching waiter (caller timed out and was pruned)
+/// is discarded — exactly-once, never delivered to a stranger.
+pub(crate) fn take_pending<T>(
+    queue: &mut std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<T>)>,
+    request_id: u32,
+) -> Option<tokio::sync::oneshot::Sender<T>> {
+    if request_id != 0 {
+        let pos = queue.iter().position(|(id, _)| *id == request_id)?;
+        let (_, tx) = queue.remove(pos)?;
+        return (!tx.is_closed()).then_some(tx);
+    }
+    while let Some((_, tx)) = queue.pop_front() {
+        if !tx.is_closed() {
+            return Some(tx);
+        }
+    }
+    None
+}
+
+/// FIFO-slot variant for replies whose LEGACY match is positional
+/// consume-in-slot (StreamOpen: a timed-out waiter's late reply must be
+/// consumed-and-discarded in its slot, never skipped onto the next live
+/// waiter — see the audit note below). With a non-zero echoed id the match
+/// is exact and the slot discipline is irrelevant.
+pub(crate) fn take_pending_slot<T>(
+    queue: &mut std::collections::VecDeque<(u32, T)>,
+    request_id: u32,
+) -> Option<T> {
+    if request_id != 0 {
+        let pos = queue.iter().position(|(id, _)| *id == request_id)?;
+        return queue.remove(pos).map(|(_, t)| t);
+    }
+    queue.pop_front().map(|(_, t)| t)
 }
 
 // audit cycle-6 (P3 review): the former `pop_next_open_stream` (skip-closed) and
@@ -88,6 +137,10 @@ pub(crate) fn pop_next_open<T>(
 #[derive(Clone)]
 pub(crate) struct SharedWriter {
     tx: mpsc::Sender<Vec<u8>>,
+    /// Monotonic request-id source for request/response correlation
+    /// (`FrameHeader.request_id`). Non-zero by construction — zero is the
+    /// legacy "no id" marker on the wire.
+    next_request_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 pub(crate) const FRAME_TX_CAPACITY: usize = 1024;
@@ -101,11 +154,42 @@ pub const APP_IPC_SEND_PREFIX_BYTES: usize = 24 + 108;
 
 impl SharedWriter {
     pub(crate) fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            next_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
+        }
+    }
+
+    /// Allocate the next request-correlation id. Wraps, never returns 0
+    /// (0 = legacy "no id" on the wire).
+    pub(crate) fn alloc_request_id(&self) -> u32 {
+        loop {
+            let id = self
+                .next_request_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if id != 0 {
+                return id;
+            }
+        }
     }
 
     pub(crate) async fn write_frame(&self, msg_type: u16, body: &[u8]) -> Result<(), ClientError> {
         let frame = encode_frame(msg_type, body);
+        self.tx
+            .send(frame)
+            .await
+            .map_err(|_| ClientError::ConnectionClosed)
+    }
+
+    /// Request variant: stamps `request_id` into the frame header so the
+    /// reply can be matched exactly (see [`take_pending`]).
+    pub(crate) async fn write_request_frame(
+        &self,
+        msg_type: u16,
+        request_id: u32,
+        body: &[u8],
+    ) -> Result<(), ClientError> {
+        let frame = encode_frame_with_id(msg_type, request_id, body);
         self.tx
             .send(frame)
             .await
@@ -291,8 +375,13 @@ impl SharedWriter {
 /// Encode a LocalApp-family frame (header + body) into a single buffer
 /// ready to enqueue to the writer task.
 pub(crate) fn encode_frame(msg_type: u16, body: &[u8]) -> Vec<u8> {
+    encode_frame_with_id(msg_type, 0, body)
+}
+
+pub(crate) fn encode_frame_with_id(msg_type: u16, request_id: u32, body: &[u8]) -> Vec<u8> {
     let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, msg_type);
     hdr.body_len = body.len() as u32;
+    hdr.request_id = request_id;
     let header_bytes = codec::encode_header(&hdr);
     let mut frame = Vec::with_capacity(header_bytes.len() + body.len());
     frame.extend_from_slice(&header_bytes);
@@ -385,98 +474,107 @@ pub(crate) struct DispatchTable {
     /// (audit L-18).
     pub inbound_streams:
         std::collections::HashMap<u32, mpsc::Sender<crate::handle::IncomingStream>>,
-    pub pending_binds: std::collections::VecDeque<
+    pub pending_binds: std::collections::VecDeque<(
+        u32,
         tokio::sync::oneshot::Sender<Result<veilcore::proto::AppBindOkPayload, ClientError>>,
-    >,
-    pub pending_stream_opens: std::collections::VecDeque<PendingStreamOpen>,
+    )>,
+    pub pending_stream_opens: std::collections::VecDeque<(u32, PendingStreamOpen)>,
     /// pending oneshot replies for `GetNodeIdentity`.
     /// FIFO — apps making concurrent identity queries get matched in order.
     pub pending_node_identity:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<NodeIdentity>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<NodeIdentity>)>,
     /// pending oneshot replies for `GetPeers`.
     pub pending_peers_list:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<Vec<PeerEntry>>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Vec<PeerEntry>>)>,
     /// S2.A: pending oneshot replies for `PnetStatusQuery`.
-    pub pending_pnet_status: std::collections::VecDeque<tokio::sync::oneshot::Sender<PnetStatus>>,
+    pub pending_pnet_status:
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PnetStatus>)>,
     /// pending oneshot replies for `JoinBootstrapUri`.
     pub pending_bootstrap_join:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<JoinBootstrapResult>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<JoinBootstrapResult>)>,
     /// pending oneshot replies for `CreateBootstrapInvite` (Epic 489.7
     /// generator side).
     pub pending_create_invite:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<CreateBootstrapInviteReply>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<CreateBootstrapInviteReply>)>,
     /// Offline-mailbox seal replies (`MailboxSealOk`).
-    pub pending_mailbox_seal: std::collections::VecDeque<
+    pub pending_mailbox_seal: std::collections::VecDeque<(
+        u32,
         tokio::sync::oneshot::Sender<veilcore::proto::MailboxSealResultPayload>,
-    >,
+    )>,
     /// Offline-mailbox open replies (`MailboxOpenOk`).
-    pub pending_mailbox_open: std::collections::VecDeque<
+    pub pending_mailbox_open: std::collections::VecDeque<(
+        u32,
         tokio::sync::oneshot::Sender<veilcore::proto::MailboxOpenResultPayload>,
-    >,
+    )>,
     /// Epic 489.8 multi-device pairing — Source side replies.
     pub pending_pair_source_create:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<PairCreateInviteReply>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PairCreateInviteReply>)>,
     pub pending_pair_source_hello:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<PairOobReply>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PairOobReply>)>,
     pub pending_pair_source_confirm:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<PairStatusReply>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PairStatusReply>)>,
     /// Epic 489.8 multi-device pairing — Target side replies.
     pub pending_pair_target_consume:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<PairFrameReply>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PairFrameReply>)>,
     pub pending_pair_target_cert:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<PairOobReply>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PairOobReply>)>,
     pub pending_pair_target_confirm:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<PairFrameReply>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PairFrameReply>)>,
     /// pending oneshot replies for `GetMobileStatus`.
     pub pending_mobile_status:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<MobileStatus>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<MobileStatus>)>,
     ///.2: pending oneshot replies for `SetPushEnvelope`.
-    pub pending_set_push_envelope: std::collections::VecDeque<
+    pub pending_set_push_envelope: std::collections::VecDeque<(
+        u32,
         tokio::sync::oneshot::Sender<veilcore::proto::SetPushEnvelopeStatus>,
-    >,
+    )>,
     /// Epic 489.10 slice 4.3.4: pending oneshot replies for
     /// `SetWakeHmacEnvelope`.  Same dispatch pattern as the push
     /// envelope queue.
-    pub pending_set_wake_hmac_envelope: std::collections::VecDeque<
+    pub pending_set_wake_hmac_envelope: std::collections::VecDeque<(
+        u32,
         tokio::sync::oneshot::Sender<veilcore::proto::SetWakeHmacEnvelopeStatus>,
-    >,
+    )>,
     /// Pending oneshot replies for `RegisterOnionService` (2-byte status; 0=ok).
     pub pending_register_onion_service:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<u16>)>,
     /// Pending oneshot replies for `RegisterRendezvousPublisher` (2-byte status; 0=ok).
     pub pending_register_rendezvous_publisher:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<u16>)>,
     /// Pending oneshot replies for `SendToOnionService` (2-byte status; 0=ok).
     pub pending_send_to_onion_service:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<u16>)>,
     /// Pending oneshot replies for `SendAnonymousDirect` (2-byte status; 0=ok).
     pub pending_send_anonymous_direct:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<u16>)>,
     /// Pending oneshot replies for `SendAuthenticatedDirectWithReply` (the
     /// KEM-key-given mailbox FETCH; 2-byte status; 0=ok).
     pub pending_send_authenticated_direct_with_reply:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<u16>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<u16>)>,
     ///.4 P2: pending oneshot replies for `MailboxPut`.
     pub pending_mailbox_put:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<MailboxPutReply>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<MailboxPutReply>)>,
     ///.4 P2: pending oneshot replies for `MailboxFetch`.
     pub pending_mailbox_fetch:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<Vec<MailboxBlobInfo>>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Vec<MailboxBlobInfo>>)>,
     ///.4 P2: pending oneshot replies for `MailboxAck`.
-    pub pending_mailbox_ack: std::collections::VecDeque<tokio::sync::oneshot::Sender<bool>>,
+    pub pending_mailbox_ack:
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<bool>)>,
     ///.4 P4: pending oneshot replies for `OutboxPut`.
-    pub pending_outbox_put: std::collections::VecDeque<tokio::sync::oneshot::Sender<bool>>,
+    pub pending_outbox_put:
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<bool>)>,
     ///.4 P4: pending oneshot replies for `OutboxFindMissing`.
     pub pending_outbox_find_missing:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<Vec<OutboxEntryInfo>>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Vec<OutboxEntryInfo>>)>,
     ///.4 P4: pending oneshot replies for `OutboxAck`.
-    pub pending_outbox_ack: std::collections::VecDeque<tokio::sync::oneshot::Sender<bool>>,
+    pub pending_outbox_ack:
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<bool>)>,
     ///.4 P5c: pending oneshot replies for `LookupRendezvousReplicas`.
     pub pending_lookup_replicas:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<Vec<RendezvousReplicaInfo>>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Vec<RendezvousReplicaInfo>>)>,
     /// Pending oneshot replies for `LookupRelayKey` (relay X25519 by node_id).
     pub pending_lookup_relay_key:
-        std::collections::VecDeque<tokio::sync::oneshot::Sender<Option<[u8; 32]>>>,
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Option<[u8; 32]>>)>,
     /// push event sink. When set by [`VeilClient::events`]
     /// every incoming `LocalAppMsg::Event` is decoded and forwarded
     /// here. Single-subscriber by design — the Flutter UI fans the
@@ -787,6 +885,7 @@ impl VeilClient {
             mpsc::channel::<crate::handle::IncomingStream>(INBOUND_STREAM_QUEUE_CAP);
         use tokio::sync::oneshot;
         let (bind_tx, bind_rx) = oneshot::channel::<Result<AppBindOkPayload, ClientError>>();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_binds);
@@ -812,7 +911,7 @@ impl VeilClient {
             // Per-endpoint inbound-stream queue keyed by endpoint_id
             // (matches StreamOpenInboundPayload routing fields).
             d.inbound_streams.insert(endpoint_id, inbound_streams_tx);
-            d.pending_binds.push_back(bind_tx);
+            d.pending_binds.push_back((request_id, bind_tx));
         }
 
         // Send APP_BIND. If the write fails, clean up both dispatch-table
@@ -820,7 +919,7 @@ impl VeilClient {
         // dangling oneshot stay in the table.
         if let Err(e) = self
             .writer
-            .write_frame(LocalAppMsg::AppBind as u16, &bind.encode())
+            .write_request_frame(LocalAppMsg::AppBind as u16, request_id, &bind.encode())
             .await
         {
             let mut d = self.dispatch.lock().await;
@@ -918,6 +1017,7 @@ impl VeilClient {
             return Ok(veilcore::proto::SetPushEnvelopeStatus::EnvelopeTooLarge);
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_set_push_envelope);
@@ -926,7 +1026,7 @@ impl VeilClient {
                     "set_push_envelope queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_set_push_envelope.push_back(tx);
+            d.pending_set_push_envelope.push_back((request_id, tx));
         }
         let payload = veilcore::proto::SetPushEnvelopePayload {
             rendezvous_node_id,
@@ -934,7 +1034,7 @@ impl VeilClient {
             envelope,
         };
         self.writer
-            .write_frame(LocalAppMsg::SetPushEnvelope as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::SetPushEnvelope as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(status)) => Ok(status),
@@ -962,6 +1062,7 @@ impl VeilClient {
             return Ok(veilcore::proto::SetWakeHmacEnvelopeStatus::EnvelopeTooLarge);
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_set_wake_hmac_envelope);
@@ -970,7 +1071,7 @@ impl VeilClient {
                     "set_wake_hmac_envelope queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_set_wake_hmac_envelope.push_back(tx);
+            d.pending_set_wake_hmac_envelope.push_back((request_id, tx));
         }
         let payload = veilcore::proto::SetWakeHmacEnvelopePayload {
             rendezvous_node_id,
@@ -978,7 +1079,7 @@ impl VeilClient {
             envelope,
         };
         self.writer
-            .write_frame(LocalAppMsg::SetWakeHmacEnvelope as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::SetWakeHmacEnvelope as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(status)) => Ok(status),
@@ -997,6 +1098,7 @@ impl VeilClient {
     /// error (e.g. no relays available yet — retry later).
     pub async fn register_onion_service(&self, hop_count: u32) -> Result<(), ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_register_onion_service);
@@ -1005,11 +1107,11 @@ impl VeilClient {
                     "register_onion_service queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_register_onion_service.push_back(tx);
+            d.pending_register_onion_service.push_back((request_id, tx));
         }
         let payload = veilcore::proto::RegisterOnionServicePayload { hop_count };
         self.writer
-            .write_frame(LocalAppMsg::RegisterOnionService as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::RegisterOnionService as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(0)) => Ok(()),
@@ -1040,6 +1142,7 @@ impl VeilClient {
         relay_kem_pk: Vec<u8>,
     ) -> Result<(), ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_register_rendezvous_publisher);
@@ -1048,7 +1151,7 @@ impl VeilClient {
                     "register_rendezvous_publisher queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_register_rendezvous_publisher.push_back(tx);
+            d.pending_register_rendezvous_publisher.push_back((request_id, tx));
         }
         let payload = veilcore::proto::RegisterRendezvousPublisherPayload {
             rendezvous_node_id,
@@ -1058,8 +1161,8 @@ impl VeilClient {
             relay_kem_pk,
         };
         self.writer
-            .write_frame(
-                LocalAppMsg::RegisterRendezvousPublisher as u16,
+            .write_request_frame(
+                LocalAppMsg::RegisterRendezvousPublisher as u16, request_id,
                 &payload.encode(),
             )
             .await?;
@@ -1092,6 +1195,7 @@ impl VeilClient {
         data: &[u8],
     ) -> Result<(), ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_send_to_onion_service);
@@ -1100,7 +1204,7 @@ impl VeilClient {
                     "send_to_onion_service queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_send_to_onion_service.push_back(tx);
+            d.pending_send_to_onion_service.push_back((request_id, tx));
         }
         let payload = veilcore::proto::SendToOnionServicePayload {
             service_identity_vk,
@@ -1112,7 +1216,7 @@ impl VeilClient {
             data: data.to_vec(),
         };
         self.writer
-            .write_frame(LocalAppMsg::SendToOnionService as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::SendToOnionService as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(0)) => Ok(()),
@@ -1142,6 +1246,7 @@ impl VeilClient {
         data: &[u8],
     ) -> Result<(), ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_send_to_onion_service);
@@ -1150,7 +1255,7 @@ impl VeilClient {
                     "send_to_onion_service queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_send_to_onion_service.push_back(tx);
+            d.pending_send_to_onion_service.push_back((request_id, tx));
         }
         let payload = veilcore::proto::SendToOnionServicePayload {
             service_identity_vk,
@@ -1162,7 +1267,7 @@ impl VeilClient {
             data: data.to_vec(),
         };
         self.writer
-            .write_frame(LocalAppMsg::SendToOnionService as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::SendToOnionService as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(0)) => Ok(()),
@@ -1195,6 +1300,7 @@ impl VeilClient {
         data: &[u8],
     ) -> Result<(), ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_send_anonymous_direct);
@@ -1203,7 +1309,7 @@ impl VeilClient {
                     "send_anonymous_direct queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_send_anonymous_direct.push_back(tx);
+            d.pending_send_anonymous_direct.push_back((request_id, tx));
         }
         let payload = veilcore::proto::SendAnonymousDirectPayload {
             target_node_id,
@@ -1215,7 +1321,7 @@ impl VeilClient {
             data: data.to_vec(),
         };
         self.writer
-            .write_frame(LocalAppMsg::SendAnonymousDirect as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::SendAnonymousDirect as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(0)) => Ok(()),
@@ -1275,6 +1381,7 @@ impl VeilClient {
             });
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_mailbox_put);
@@ -1283,7 +1390,7 @@ impl VeilClient {
                     "mailbox_put queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_mailbox_put.push_back(tx);
+            d.pending_mailbox_put.push_back((request_id, tx));
         }
         let payload = veilcore::proto::MailboxPutPayload {
             receiver_id,
@@ -1295,7 +1402,7 @@ impl VeilClient {
             wake_hmac_envelope,
         };
         self.writer
-            .write_frame(LocalAppMsg::MailboxPut as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::MailboxPut as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(reply)) => Ok(reply),
@@ -1317,6 +1424,7 @@ impl VeilClient {
         auth_cookie: [u8; 16],
     ) -> Result<Vec<MailboxBlobInfo>, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_mailbox_fetch);
@@ -1325,14 +1433,14 @@ impl VeilClient {
                     "mailbox_fetch queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_mailbox_fetch.push_back(tx);
+            d.pending_mailbox_fetch.push_back((request_id, tx));
         }
         let payload = veilcore::proto::MailboxFetchPayload {
             receiver_id,
             auth_cookie,
         };
         self.writer
-            .write_frame(LocalAppMsg::MailboxFetch as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::MailboxFetch as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(blobs)) => Ok(blobs),
@@ -1354,6 +1462,7 @@ impl VeilClient {
         auth_cookie: [u8; 16],
     ) -> Result<bool, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_mailbox_ack);
@@ -1362,7 +1471,7 @@ impl VeilClient {
                     "mailbox_ack queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_mailbox_ack.push_back(tx);
+            d.pending_mailbox_ack.push_back((request_id, tx));
         }
         let payload = veilcore::proto::MailboxAckPayload {
             receiver_id,
@@ -1370,7 +1479,7 @@ impl VeilClient {
             auth_cookie,
         };
         self.writer
-            .write_frame(LocalAppMsg::MailboxAck as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::MailboxAck as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(removed)) => Ok(removed),
@@ -1391,6 +1500,7 @@ impl VeilClient {
         blob: Vec<u8>,
     ) -> Result<bool, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_outbox_put);
@@ -1399,7 +1509,7 @@ impl VeilClient {
                     "outbox_put queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_outbox_put.push_back(tx);
+            d.pending_outbox_put.push_back((request_id, tx));
         }
         let payload = veilcore::proto::OutboxPutPayload {
             receiver_id,
@@ -1407,7 +1517,7 @@ impl VeilClient {
             blob,
         };
         self.writer
-            .write_frame(LocalAppMsg::OutboxPut as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::OutboxPut as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(stored)) => Ok(stored),
@@ -1431,6 +1541,7 @@ impl VeilClient {
         bloom: Vec<u8>,
     ) -> Result<Vec<OutboxEntryInfo>, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_outbox_find_missing);
@@ -1439,7 +1550,7 @@ impl VeilClient {
                     "outbox_find_missing queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_outbox_find_missing.push_back(tx);
+            d.pending_outbox_find_missing.push_back((request_id, tx));
         }
         let payload = veilcore::proto::OutboxFindMissingPayload {
             receiver_id,
@@ -1447,7 +1558,7 @@ impl VeilClient {
             bloom,
         };
         self.writer
-            .write_frame(LocalAppMsg::OutboxFindMissing as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::OutboxFindMissing as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(entries)) => Ok(entries),
@@ -1467,6 +1578,7 @@ impl VeilClient {
         content_id: [u8; 32],
     ) -> Result<bool, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_outbox_ack);
@@ -1475,14 +1587,14 @@ impl VeilClient {
                     "outbox_ack queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_outbox_ack.push_back(tx);
+            d.pending_outbox_ack.push_back((request_id, tx));
         }
         let payload = veilcore::proto::OutboxAckPayload {
             receiver_id,
             content_id,
         };
         self.writer
-            .write_frame(LocalAppMsg::OutboxAck as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::OutboxAck as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(removed)) => Ok(removed),
@@ -1512,6 +1624,7 @@ impl VeilClient {
         max_replicas: u8,
     ) -> Result<Vec<RendezvousReplicaInfo>, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_lookup_replicas);
@@ -1520,15 +1633,15 @@ impl VeilClient {
                     "lookup_rendezvous_replicas queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_lookup_replicas.push_back(tx);
+            d.pending_lookup_replicas.push_back((request_id, tx));
         }
         let payload = veilcore::proto::LookupRendezvousReplicasPayload {
             receiver_id,
             max_replicas,
         };
         self.writer
-            .write_frame(
-                LocalAppMsg::LookupRendezvousReplicas as u16,
+            .write_request_frame(
+                LocalAppMsg::LookupRendezvousReplicas as u16, request_id,
                 &payload.encode(),
             )
             .await?;
@@ -1553,6 +1666,7 @@ impl VeilClient {
         node_id: [u8; 32],
     ) -> Result<Option<[u8; 32]>, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_lookup_relay_key);
@@ -1561,11 +1675,11 @@ impl VeilClient {
                     "lookup_relay_x25519 queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_lookup_relay_key.push_back(tx);
+            d.pending_lookup_relay_key.push_back((request_id, tx));
         }
         let payload = veilcore::proto::LookupRelayKeyPayload { node_id };
         self.writer
-            .write_frame(LocalAppMsg::LookupRelayKey as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::LookupRelayKey as u16, request_id, &payload.encode())
             .await?;
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(pk)) => Ok(pk),
@@ -1606,6 +1720,7 @@ impl VeilClient {
         // reader task may dispatch the reply before our `send_frame` future
         // even returns.
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             // cap pending requests so a hung
@@ -1617,12 +1732,12 @@ impl VeilClient {
                     "node_identity queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_node_identity.push_back(tx);
+            d.pending_node_identity.push_back((request_id, tx));
         }
 
         // Send the empty-body request.
         self.writer
-            .write_frame(LocalAppMsg::GetNodeIdentity as u16, &[])
+            .write_request_frame(LocalAppMsg::GetNodeIdentity as u16, request_id, &[])
             .await?;
 
         // Wait for the reader task to deliver the reply (bounded;
@@ -1642,6 +1757,7 @@ impl VeilClient {
     /// indicator or peer-debug screen, without admin-token round-trip.
     pub async fn peers(&self) -> Result<Vec<PeerEntry>, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             // cap pending requests against a
@@ -1652,10 +1768,10 @@ impl VeilClient {
                     "peers queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_peers_list.push_back(tx);
+            d.pending_peers_list.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(LocalAppMsg::GetPeers as u16, &[])
+            .write_request_frame(LocalAppMsg::GetPeers as u16, request_id, &[])
             .await?;
         await_rpc_reply(rx, "peers reply").await
     }
@@ -1681,6 +1797,7 @@ impl VeilClient {
         peer_node_id: &[u8; 32],
     ) -> Result<PnetStatus, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_pnet_status);
@@ -1689,10 +1806,10 @@ impl VeilClient {
                     "pnet_status queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_pnet_status.push_back(tx);
+            d.pending_pnet_status.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(LocalAppMsg::PnetStatusQuery as u16, peer_node_id)
+            .write_request_frame(LocalAppMsg::PnetStatusQuery as u16, request_id, peer_node_id)
             .await?;
         await_rpc_reply(rx, "pnet_status reply").await
     }
@@ -1707,6 +1824,7 @@ impl VeilClient {
     /// "why is my keepalive 30 min?" without operator-level admin access.
     pub async fn mobile_status(&self) -> Result<MobileStatus, ClientError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             // cap pending requests against a
@@ -1717,10 +1835,10 @@ impl VeilClient {
                     "mobile_status queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_mobile_status.push_back(tx);
+            d.pending_mobile_status.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(LocalAppMsg::GetMobileStatus as u16, &[])
+            .write_request_frame(LocalAppMsg::GetMobileStatus as u16, request_id, &[])
             .await?;
         await_rpc_reply(rx, "mobile_status reply").await
     }
@@ -1750,6 +1868,7 @@ impl VeilClient {
             expected_issuer_pk: expected_issuer_pk.map(String::from),
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             // cap pending requests against a
@@ -1760,10 +1879,10 @@ impl VeilClient {
                     "join_bootstrap queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_bootstrap_join.push_back(tx);
+            d.pending_bootstrap_join.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(LocalAppMsg::JoinBootstrapUri as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::JoinBootstrapUri as u16, request_id, &payload.encode())
             .await?;
         await_rpc_reply(rx, "join_bootstrap_uri reply").await
     }
@@ -1785,6 +1904,7 @@ impl VeilClient {
             password: password.map(String::from),
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_create_invite);
@@ -1793,10 +1913,10 @@ impl VeilClient {
                     "create_invite queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_create_invite.push_back(tx);
+            d.pending_create_invite.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(LocalAppMsg::CreateBootstrapInvite as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::CreateBootstrapInvite as u16, request_id, &payload.encode())
             .await?;
         await_rpc_reply(rx, "create_bootstrap_invite reply").await
     }
@@ -1820,6 +1940,7 @@ impl VeilClient {
             data,
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_mailbox_seal);
@@ -1828,10 +1949,10 @@ impl VeilClient {
                     "mailbox_seal queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_mailbox_seal.push_back(tx);
+            d.pending_mailbox_seal.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(LocalAppMsg::MailboxSeal as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::MailboxSeal as u16, request_id, &payload.encode())
             .await?;
         let reply = match tokio::time::timeout(DHT_RESOLVE_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(reply)) => reply,
@@ -1867,6 +1988,7 @@ impl VeilClient {
             blob,
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_mailbox_open);
@@ -1875,10 +1997,10 @@ impl VeilClient {
                     "mailbox_open queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_mailbox_open.push_back(tx);
+            d.pending_mailbox_open.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(LocalAppMsg::MailboxOpen as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::MailboxOpen as u16, request_id, &payload.encode())
             .await?;
         let reply = await_rpc_reply(rx, "mailbox_open reply").await?;
         match reply.status {
@@ -1906,6 +2028,7 @@ impl VeilClient {
             master_password: master_password.map(String::from),
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_pair_source_create);
@@ -1914,11 +2037,11 @@ impl VeilClient {
                     "pair_source_create queue at cap ({MAX_PENDING_OPS})"
                 )));
             }
-            d.pending_pair_source_create.push_back(tx);
+            d.pending_pair_source_create.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(
-                LocalAppMsg::PairSourceCreateInvite as u16,
+            .write_request_frame(
+                LocalAppMsg::PairSourceCreateInvite as u16, request_id,
                 &payload.encode(),
             )
             .await?;
@@ -1933,6 +2056,7 @@ impl VeilClient {
     ) -> Result<PairOobReply, ClientError> {
         let payload = veilcore::proto::PairCeremonyFramePayload { bytes: hello_bytes };
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_pair_source_hello);
@@ -1941,10 +2065,10 @@ impl VeilClient {
                     "pair_source_hello queue at cap ({MAX_PENDING_OPS})"
                 )));
             }
-            d.pending_pair_source_hello.push_back(tx);
+            d.pending_pair_source_hello.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(LocalAppMsg::PairSourceHandleHello as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::PairSourceHandleHello as u16, request_id, &payload.encode())
             .await?;
         await_rpc_reply(rx, "pair_source_handle_hello reply").await
     }
@@ -1959,6 +2083,7 @@ impl VeilClient {
             bytes: confirm_bytes,
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_pair_source_confirm);
@@ -1967,11 +2092,11 @@ impl VeilClient {
                     "pair_source_confirm queue at cap ({MAX_PENDING_OPS})"
                 )));
             }
-            d.pending_pair_source_confirm.push_back(tx);
+            d.pending_pair_source_confirm.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(
-                LocalAppMsg::PairSourceHandleConfirm as u16,
+            .write_request_frame(
+                LocalAppMsg::PairSourceHandleConfirm as u16, request_id,
                 &payload.encode(),
             )
             .await?;
@@ -1995,6 +2120,7 @@ impl VeilClient {
             instance_label: instance_label.map(|s| s.to_string()),
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_pair_target_consume);
@@ -2003,10 +2129,10 @@ impl VeilClient {
                     "pair_target_consume queue at cap ({MAX_PENDING_OPS})"
                 )));
             }
-            d.pending_pair_target_consume.push_back(tx);
+            d.pending_pair_target_consume.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(LocalAppMsg::PairTargetConsumeUri as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::PairTargetConsumeUri as u16, request_id, &payload.encode())
             .await?;
         await_rpc_reply(rx, "pair_target_consume_uri reply").await
     }
@@ -2018,6 +2144,7 @@ impl VeilClient {
     ) -> Result<PairOobReply, ClientError> {
         let payload = veilcore::proto::PairCeremonyFramePayload { bytes: cert_bytes };
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_pair_target_cert);
@@ -2026,10 +2153,10 @@ impl VeilClient {
                     "pair_target_cert queue at cap ({MAX_PENDING_OPS})"
                 )));
             }
-            d.pending_pair_target_cert.push_back(tx);
+            d.pending_pair_target_cert.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(LocalAppMsg::PairTargetHandleCert as u16, &payload.encode())
+            .write_request_frame(LocalAppMsg::PairTargetHandleCert as u16, request_id, &payload.encode())
             .await?;
         await_rpc_reply(rx, "pair_target_handle_cert reply").await
     }
@@ -2043,6 +2170,7 @@ impl VeilClient {
     ) -> Result<PairFrameReply, ClientError> {
         let payload = veilcore::proto::PairTargetBuildConfirmPayload { confirmed };
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
         {
             let mut d = self.dispatch.lock().await;
             prune_closed(&mut d.pending_pair_target_confirm);
@@ -2051,11 +2179,11 @@ impl VeilClient {
                     "pair_target_confirm queue at cap ({MAX_PENDING_OPS})"
                 )));
             }
-            d.pending_pair_target_confirm.push_back(tx);
+            d.pending_pair_target_confirm.push_back((request_id, tx));
         }
         self.writer
-            .write_frame(
-                LocalAppMsg::PairTargetBuildConfirm as u16,
+            .write_request_frame(
+                LocalAppMsg::PairTargetBuildConfirm as u16, request_id,
                 &payload.encode(),
             )
             .await?;
@@ -2363,7 +2491,7 @@ async fn reader_task(
             LocalAppMsg::AppBindOk => {
                 if let Ok(ok) = AppBindOkPayload::decode(&body) {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_binds) {
+                    if let Some(tx) = take_pending(&mut d.pending_binds, hdr.request_id) {
                         let _ = tx.send(Ok(ok));
                     }
                 }
@@ -2372,7 +2500,7 @@ async fn reader_task(
                 use veilcore::proto::AppBindErrPayload;
                 if let Ok(err) = AppBindErrPayload::decode(&body) {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_binds) {
+                    if let Some(tx) = take_pending(&mut d.pending_binds, hdr.request_id) {
                         let _ = tx.send(Err(ClientError::Bind {
                             code: err.error_code,
                             detail: String::from_utf8_lossy(&err.detail).into_owned(),
@@ -2414,7 +2542,9 @@ async fn reader_task(
                     // and mis-delivering it to a different live waiter (which
                     // would connect that caller to the WRONG destination). The
                     // daemon GCs the orphaned stream via its own idle timeout.
-                    if let Some((tx, data_tx)) = d.pending_stream_opens.pop_front() {
+                    if let Some((tx, data_tx)) =
+                        take_pending_slot(&mut d.pending_stream_opens, hdr.request_id)
+                    {
                         if tx.is_closed() {
                             // Waiter gone — drop the reply (and its data_tx) on
                             // the floor; do NOT register d.streams[stream_id].
@@ -2485,7 +2615,8 @@ async fn reader_task(
                     // if it abandoned (closed), discard the error rather than
                     // mis-delivering it to a different live waiter (see
                     // StreamOpenOk above).
-                    if let Some((tx, _data_tx)) = d.pending_stream_opens.pop_front()
+                    if let Some((tx, _data_tx)) =
+                        take_pending_slot(&mut d.pending_stream_opens, hdr.request_id)
                         && !tx.is_closed()
                     {
                         let _ = tx.send(Err(ClientError::StreamOpen {
@@ -2550,7 +2681,7 @@ async fn reader_task(
                 use veilcore::proto::NodeIdentityPayload;
                 if let Ok(p) = NodeIdentityPayload::decode(&body) {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_node_identity) {
+                    if let Some(tx) = take_pending(&mut d.pending_node_identity, hdr.request_id) {
                         let _ = tx.send(NodeIdentity {
                             node_id: p.node_id,
                             algo: p.algo,
@@ -2579,7 +2710,7 @@ async fn reader_task(
                         })
                         .collect();
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_peers_list) {
+                    if let Some(tx) = take_pending(&mut d.pending_peers_list, hdr.request_id) {
                         let _ = tx.send(entries);
                     }
                 }
@@ -2596,7 +2727,7 @@ async fn reader_task(
                         peer_node_id: p.peer_node_id,
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_pnet_status) {
+                    if let Some(tx) = take_pending(&mut d.pending_pnet_status, hdr.request_id) {
                         let _ = tx.send(status);
                     }
                 }
@@ -2607,7 +2738,7 @@ async fn reader_task(
                     && let Ok(status) = veilcore::proto::SetPushEnvelopeStatus::from_wire(body[0])
                 {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_set_push_envelope) {
+                    if let Some(tx) = take_pending(&mut d.pending_set_push_envelope, hdr.request_id) {
                         let _ = tx.send(status);
                     }
                 }
@@ -2619,7 +2750,7 @@ async fn reader_task(
                         veilcore::proto::SetWakeHmacEnvelopeStatus::from_wire(body[0])
                 {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_set_wake_hmac_envelope) {
+                    if let Some(tx) = take_pending(&mut d.pending_set_wake_hmac_envelope, hdr.request_id) {
                         let _ = tx.send(status);
                     }
                 }
@@ -2627,35 +2758,35 @@ async fn reader_task(
             LocalAppMsg::RegisterOnionServiceResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = pop_next_open(&mut d.pending_register_onion_service) {
+                if let Some(tx) = take_pending(&mut d.pending_register_onion_service, hdr.request_id) {
                     let _ = tx.send(status);
                 }
             }
             LocalAppMsg::RegisterRendezvousPublisherResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = pop_next_open(&mut d.pending_register_rendezvous_publisher) {
+                if let Some(tx) = take_pending(&mut d.pending_register_rendezvous_publisher, hdr.request_id) {
                     let _ = tx.send(status);
                 }
             }
             LocalAppMsg::SendToOnionServiceResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = pop_next_open(&mut d.pending_send_to_onion_service) {
+                if let Some(tx) = take_pending(&mut d.pending_send_to_onion_service, hdr.request_id) {
                     let _ = tx.send(status);
                 }
             }
             LocalAppMsg::SendAnonymousDirectResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = pop_next_open(&mut d.pending_send_anonymous_direct) {
+                if let Some(tx) = take_pending(&mut d.pending_send_anonymous_direct, hdr.request_id) {
                     let _ = tx.send(status);
                 }
             }
             LocalAppMsg::SendAuthenticatedDirectWithReplyResult if body.len() >= 2 => {
                 let status = u16::from_be_bytes([body[0], body[1]]);
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = pop_next_open(&mut d.pending_send_authenticated_direct_with_reply)
+                if let Some(tx) = take_pending(&mut d.pending_send_authenticated_direct_with_reply, hdr.request_id)
                 {
                     let _ = tx.send(status);
                 }
@@ -2664,7 +2795,7 @@ async fn reader_task(
                 use veilcore::proto::MailboxPutOkPayload;
                 if let Ok(p) = MailboxPutOkPayload::decode(&body) {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_mailbox_put) {
+                    if let Some(tx) = take_pending(&mut d.pending_mailbox_put, hdr.request_id) {
                         let _ = tx.send(MailboxPutReply {
                             status: p.status,
                             evicted: p.evicted,
@@ -2686,7 +2817,7 @@ async fn reader_task(
                         })
                         .collect();
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_mailbox_fetch) {
+                    if let Some(tx) = take_pending(&mut d.pending_mailbox_fetch, hdr.request_id) {
                         let _ = tx.send(blobs);
                     }
                 }
@@ -2694,14 +2825,14 @@ async fn reader_task(
             LocalAppMsg::MailboxAckOk if !body.is_empty() => {
                 let removed = body[0] != 0;
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = pop_next_open(&mut d.pending_mailbox_ack) {
+                if let Some(tx) = take_pending(&mut d.pending_mailbox_ack, hdr.request_id) {
                     let _ = tx.send(removed);
                 }
             }
             LocalAppMsg::OutboxPutOk if !body.is_empty() => {
                 let stored = body[0] != 0;
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = pop_next_open(&mut d.pending_outbox_put) {
+                if let Some(tx) = take_pending(&mut d.pending_outbox_put, hdr.request_id) {
                     let _ = tx.send(stored);
                 }
             }
@@ -2718,7 +2849,7 @@ async fn reader_task(
                         })
                         .collect();
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_outbox_find_missing) {
+                    if let Some(tx) = take_pending(&mut d.pending_outbox_find_missing, hdr.request_id) {
                         let _ = tx.send(entries);
                     }
                 }
@@ -2726,7 +2857,7 @@ async fn reader_task(
             LocalAppMsg::OutboxAckOk if !body.is_empty() => {
                 let removed = body[0] != 0;
                 let mut d = dispatch.lock().await;
-                if let Some(tx) = pop_next_open(&mut d.pending_outbox_ack) {
+                if let Some(tx) = take_pending(&mut d.pending_outbox_ack, hdr.request_id) {
                     let _ = tx.send(removed);
                 }
             }
@@ -2747,7 +2878,7 @@ async fn reader_task(
                         })
                         .collect();
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_lookup_replicas) {
+                    if let Some(tx) = take_pending(&mut d.pending_lookup_replicas, hdr.request_id) {
                         let _ = tx.send(entries);
                     }
                 }
@@ -2756,7 +2887,7 @@ async fn reader_task(
                 use veilcore::proto::LookupRelayKeyRespPayload;
                 if let Ok(p) = LookupRelayKeyRespPayload::decode(&body) {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_lookup_relay_key) {
+                    if let Some(tx) = take_pending(&mut d.pending_lookup_relay_key, hdr.request_id) {
                         let _ = tx.send(p.relay_x25519);
                     }
                 }
@@ -2774,7 +2905,7 @@ async fn reader_task(
                         battery_route_probe_factor: p.battery_route_probe_factor,
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_mobile_status) {
+                    if let Some(tx) = take_pending(&mut d.pending_mobile_status, hdr.request_id) {
                         let _ = tx.send(status);
                     }
                 }
@@ -2788,7 +2919,7 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_bootstrap_join) {
+                    if let Some(tx) = take_pending(&mut d.pending_bootstrap_join, hdr.request_id) {
                         let _ = tx.send(result);
                     }
                 }
@@ -2802,7 +2933,7 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_create_invite) {
+                    if let Some(tx) = take_pending(&mut d.pending_create_invite, hdr.request_id) {
                         let _ = tx.send(reply);
                     }
                 }
@@ -2810,7 +2941,7 @@ async fn reader_task(
             LocalAppMsg::MailboxSealOk => {
                 if let Ok(p) = veilcore::proto::MailboxSealResultPayload::decode(&body) {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_mailbox_seal) {
+                    if let Some(tx) = take_pending(&mut d.pending_mailbox_seal, hdr.request_id) {
                         let _ = tx.send(p);
                     }
                 }
@@ -2818,7 +2949,7 @@ async fn reader_task(
             LocalAppMsg::MailboxOpenOk => {
                 if let Ok(p) = veilcore::proto::MailboxOpenResultPayload::decode(&body) {
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_mailbox_open) {
+                    if let Some(tx) = take_pending(&mut d.pending_mailbox_open, hdr.request_id) {
                         let _ = tx.send(p);
                     }
                 }
@@ -2832,7 +2963,7 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_pair_source_create) {
+                    if let Some(tx) = take_pending(&mut d.pending_pair_source_create, hdr.request_id) {
                         let _ = tx.send(reply);
                     }
                 }
@@ -2847,7 +2978,7 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_pair_source_hello) {
+                    if let Some(tx) = take_pending(&mut d.pending_pair_source_hello, hdr.request_id) {
                         let _ = tx.send(reply);
                     }
                 }
@@ -2860,7 +2991,7 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_pair_source_confirm) {
+                    if let Some(tx) = take_pending(&mut d.pending_pair_source_confirm, hdr.request_id) {
                         let _ = tx.send(reply);
                     }
                 }
@@ -2874,7 +3005,7 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_pair_target_consume) {
+                    if let Some(tx) = take_pending(&mut d.pending_pair_target_consume, hdr.request_id) {
                         let _ = tx.send(reply);
                     }
                 }
@@ -2889,7 +3020,7 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_pair_target_cert) {
+                    if let Some(tx) = take_pending(&mut d.pending_pair_target_cert, hdr.request_id) {
                         let _ = tx.send(reply);
                     }
                 }
@@ -2903,7 +3034,7 @@ async fn reader_task(
                         detail: String::from_utf8_lossy(&p.detail).into_owned(),
                     };
                     let mut d = dispatch.lock().await;
-                    if let Some(tx) = pop_next_open(&mut d.pending_pair_target_confirm) {
+                    if let Some(tx) = take_pending(&mut d.pending_pair_target_confirm, hdr.request_id) {
                         let _ = tx.send(reply);
                     }
                 }
@@ -2973,7 +3104,7 @@ async fn reader_task(
     // explicit drain here.)
     {
         let mut d = dispatch.lock().await;
-        while let Some((tx, _data_tx)) = d.pending_stream_opens.pop_front() {
+        while let Some((_, (tx, _data_tx))) = d.pending_stream_opens.pop_front() {
             let _ = tx.send(Err(ClientError::ConnectionClosed));
         }
     }
@@ -3190,5 +3321,68 @@ mod tests {
             "B gets its OWN reply"
         );
         assert!(q.is_empty());
+    }
+
+    /// request_id rollout: a node that echoes the id may answer OUT OF ORDER
+    /// (it spawns slow handlers). `take_pending` must route each reply to its
+    /// own waiter by id, never positionally.
+    #[test]
+    fn take_pending_matches_by_id_out_of_order() {
+        let mut q: std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<u32>)> =
+            std::collections::VecDeque::new();
+        let (tx_slow, rx_slow) = tokio::sync::oneshot::channel::<u32>();
+        let (tx_fast, rx_fast) = tokio::sync::oneshot::channel::<u32>();
+        q.push_back((7, tx_slow)); // enqueued first (slow), id 7
+        q.push_back((8, tx_fast)); // enqueued second (fast), id 8
+
+        // The fast reply (id 8) arrives FIRST — must reach the fast waiter,
+        // NOT the front-of-queue slow one.
+        let tx = take_pending(&mut q, 8).expect("id 8 present");
+        let _ = tx.send(88);
+        assert_eq!(rx_fast.blocking_recv().unwrap(), 88);
+        assert_eq!(q.len(), 1, "only the slow waiter remains");
+
+        // Then the slow reply (id 7).
+        let tx = take_pending(&mut q, 7).expect("id 7 present");
+        let _ = tx.send(77);
+        assert_eq!(rx_slow.blocking_recv().unwrap(), 77);
+        assert!(q.is_empty());
+    }
+
+    /// Backward compatibility: a legacy node echoes request_id = 0. `take_pending`
+    /// must fall back to FIFO so an unchanged node keeps working unmodified.
+    #[test]
+    fn take_pending_zero_id_is_fifo() {
+        let mut q: std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<u32>)> =
+            std::collections::VecDeque::new();
+        let (tx_a, rx_a) = tokio::sync::oneshot::channel::<u32>();
+        let (tx_b, _rx_b) = tokio::sync::oneshot::channel::<u32>();
+        q.push_back((1, tx_a));
+        q.push_back((2, tx_b));
+
+        // id 0 → pop the front waiter regardless of id.
+        let tx = take_pending(&mut q, 0).expect("front");
+        let _ = tx.send(11);
+        assert_eq!(rx_a.blocking_recv().unwrap(), 11);
+        assert_eq!(q.len(), 1);
+    }
+
+    /// A reply whose waiter already timed out (receiver dropped) must be
+    /// discarded exactly-once by id — never handed to a different live caller.
+    #[test]
+    fn take_pending_discards_abandoned_waiter() {
+        let mut q: std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<u32>)> =
+            std::collections::VecDeque::new();
+        let (tx_dead, rx_dead) = tokio::sync::oneshot::channel::<u32>();
+        let (tx_live, _rx_live) = tokio::sync::oneshot::channel::<u32>();
+        q.push_back((5, tx_dead));
+        q.push_back((6, tx_live));
+        drop(rx_dead); // caller for id 5 gave up
+
+        // The id-5 reply lands: waiter is closed → take_pending returns None
+        // (discarded), the live id-6 waiter is untouched.
+        assert!(take_pending(&mut q, 5).is_none(), "abandoned id 5 discarded");
+        assert_eq!(q.len(), 1, "live id 6 still queued");
+        assert!(take_pending(&mut q, 6).is_some(), "id 6 intact");
     }
 }
