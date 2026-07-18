@@ -37,6 +37,7 @@
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/environment/environment.h"
 #include "api/environment/environment_factory.h"
+#include "api/field_trials_view.h"
 #include "api/media_types.h"
 #include "api/make_ref_counted.h"
 #include "api/rtp_header_extension_id.h"
@@ -77,6 +78,7 @@
 #include "api/video/video_sink_interface.h"
 #include "api/video/video_broadcaster.h"
 #include "third_party/libyuv/include/libyuv/convert_argb.h"  // I420ToABGR
+#include "third_party/libyuv/include/libyuv/rotate.h"  // Android420ToI420Rotate
 #include "rtc_base/time_utils.h"  // webrtc::TimeMicros
 #include "rtc_base/network/sent_packet.h"  // webrtc::SentPacketInfo
 
@@ -294,6 +296,19 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   uint32_t pulled_seq_ = 0;
 };
 
+void broadcast_i420(webrtc::VideoBroadcaster* source,
+                    webrtc::scoped_refptr<webrtc::I420Buffer> buf,
+                    int64_t ts_us) {
+  if (source == nullptr || !buf) return;
+  webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                 .set_video_frame_buffer(buf)
+                                 .set_timestamp_us(ts_us ? ts_us
+                                                         : webrtc::TimeMicros())
+                                 .set_rotation(webrtc::kVideoRotation_0)
+                                 .build();
+  source->OnFrame(frame);
+}
+
 // Copy a (possibly strided) I420 frame into the broadcaster (encoder source).
 void push_i420(webrtc::VideoBroadcaster* source, const uint8_t* y,
                const uint8_t* u, const uint8_t* v, int width, int height,
@@ -308,13 +323,7 @@ void push_i420(webrtc::VideoBroadcaster* source, const uint8_t* y,
     std::memcpy(buf->MutableDataU() + r * buf->StrideU(), u + r * stride_u, cw);
   for (int r = 0; r < ch; ++r)
     std::memcpy(buf->MutableDataV() + r * buf->StrideV(), v + r * stride_v, cw);
-  webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
-                                 .set_video_frame_buffer(buf)
-                                 .set_timestamp_us(ts_us ? ts_us
-                                                         : webrtc::TimeMicros())
-                                 .set_rotation(webrtc::kVideoRotation_0)
-                                 .build();
-  source->OnFrame(frame);
+  broadcast_i420(source, buf, ts_us);
 }
 
 // All webrtc state, constructed together in create() (Environment has no
@@ -385,6 +394,34 @@ struct GroupWebrtcState {
 };
 
 constexpr int kGroupVp8PayloadType = 96;
+
+// Real-time conversation should recover from a network spike by dropping late
+// video, not by retaining an ever-growing playout tail. The app already pulls
+// latest-only decoded frames, so cap WebRTC's adaptive video delay while still
+// leaving enough room for ordinary relay jitter. This is receiver-local and
+// therefore also protects calls from older peers that send no playout-delay
+// RTP extension.
+class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
+ public:
+  std::string Lookup(absl::string_view key) const override {
+    if (key == "WebRTC-ForcePlayoutDelay") return "min_ms:0,max_ms:200";
+    return {};
+  }
+
+  std::unique_ptr<webrtc::FieldTrialsView> CreateCopy() const override {
+    return std::make_unique<LowLatencyFieldTrials>();
+  }
+};
+
+webrtc::Environment create_low_latency_environment() {
+  // The trimmed libwebrtc archive does not contain the concrete FieldTrials
+  // parser implementation. Supplying the tiny immutable view directly keeps
+  // all Environment defaults (clock/task queues/event log) and avoids leaving
+  // an unresolved constructor for permissive Apple dynamic linking to turn
+  // into a null call at engine creation.
+  return webrtc::CreateEnvironment(
+      std::make_unique<LowLatencyFieldTrials>());
+}
 
 void ensure_group_video_codecs(GroupWebrtcState* ws) {
   if (!ws->video_encoder_factory)
@@ -466,7 +503,7 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   std::memcpy(engine->peer, peer_id, 32);
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
-  webrtc::Environment env = webrtc::CreateEnvironment();
+  webrtc::Environment env = create_low_latency_environment();
   auto ws = std::make_unique<WebrtcState>(env);
   // THREADING: worker + network queues own the Call's threads. Post Call/stream
   // ops onto worker_tq for the device test; direct construction is fine to
@@ -550,7 +587,7 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
   auto engine = std::make_unique<VeilGroupMediaEngine>();
   std::memcpy(engine->local, local_id, 32);
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
-  webrtc::Environment env = webrtc::CreateEnvironment();
+  webrtc::Environment env = create_low_latency_environment();
   auto ws = std::make_unique<GroupWebrtcState>(env);
   ws->worker_tq = ws->env.task_queue_factory().CreateTaskQueue(
       "veil-group-worker", webrtc::TaskQueueFactory::Priority::kNormal);
@@ -1576,6 +1613,63 @@ int veil_media_engine_push_video_frame(VeilMediaEngine* engine,
 #else
   (void)width; (void)height; (void)stride_y; (void)stride_u; (void)stride_v;
   (void)ts_us;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+int veil_media_engine_push_android420_frame(
+    VeilMediaEngine* engine, const uint8_t* y, const uint8_t* u,
+    const uint8_t* v, int width, int height, int stride_y, int stride_u,
+    int stride_v, int pixel_stride_uv, int rotation, int64_t ts_us) {
+  if (engine == nullptr || y == nullptr || u == nullptr || v == nullptr ||
+      width <= 0 || height <= 0 || stride_y <= 0 || stride_u <= 0 ||
+      stride_v <= 0 || pixel_stride_uv <= 0 ||
+      (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270))
+    return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->ws->video_source) return VEIL_MEDIA_ERR_STATE;
+  const bool swap = rotation == 90 || rotation == 270;
+  const int out_width = swap ? height : width;
+  const int out_height = swap ? width : height;
+  auto buf = webrtc::I420Buffer::Create(out_width, out_height);
+  int rc = libyuv::Android420ToI420Rotate(
+      y, stride_y, u, stride_u, v, stride_v, pixel_stride_uv,
+      buf->MutableDataY(), buf->StrideY(), buf->MutableDataU(), buf->StrideU(),
+      buf->MutableDataV(), buf->StrideV(), width, height,
+      static_cast<libyuv::RotationMode>(rotation));
+  // Flutter's Camera2 channel serializes the U and V planes independently.
+  // For semi-planar Android420 their original +/-1 pointer relationship is
+  // therefore lost, and libyuv cannot combine de-interleaving with a non-zero
+  // rotation in one call. Keep both operations native: normalize to I420 first,
+  // then rotate the tightly packed planes with SIMD instead of falling back to
+  // Dart's per-pixel loop.
+  if (rc != 0 && rotation != 0) {
+    auto unrotated = webrtc::I420Buffer::Create(width, height);
+    rc = libyuv::Android420ToI420Rotate(
+        y, stride_y, u, stride_u, v, stride_v, pixel_stride_uv,
+        unrotated->MutableDataY(), unrotated->StrideY(),
+        unrotated->MutableDataU(), unrotated->StrideU(),
+        unrotated->MutableDataV(), unrotated->StrideV(), width, height,
+        libyuv::kRotate0);
+    if (rc == 0) {
+      rc = libyuv::I420Rotate(
+          unrotated->DataY(), unrotated->StrideY(), unrotated->DataU(),
+          unrotated->StrideU(), unrotated->DataV(), unrotated->StrideV(),
+          buf->MutableDataY(), buf->StrideY(), buf->MutableDataU(),
+          buf->StrideU(), buf->MutableDataV(), buf->StrideV(), width, height,
+          static_cast<libyuv::RotationMode>(rotation));
+    }
+  }
+  if (rc != 0) return VEIL_MEDIA_ERR_ARG;
+  if (engine->ws->local_video_sink)
+    engine->ws->local_video_sink->store_i420(
+        buf->DataY(), buf->DataU(), buf->DataV(), out_width, out_height,
+        buf->StrideY(), buf->StrideU(), buf->StrideV());
+  broadcast_i420(engine->ws->video_source.get(), buf, ts_us);
+  return VEIL_MEDIA_OK;
+#else
+  (void)width; (void)height; (void)stride_y; (void)stride_u; (void)stride_v;
+  (void)pixel_stride_uv; (void)rotation; (void)ts_us;
   return VEIL_MEDIA_ERR_STATE;
 #endif
 }

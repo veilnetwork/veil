@@ -191,6 +191,67 @@ class VeilMediaEngine {
     return rc == 0;
   }
 
+  /// Push one Android Camera2 YUV_420_888 frame without doing per-pixel work
+  /// in Dart. Plane buffers are copied once into reusable native staging;
+  /// libyuv de-strides, converts and rotates them before WebRTC sees I420.
+  bool pushAndroid420Frame(
+    Uint8List y,
+    Uint8List u,
+    Uint8List v,
+    int width,
+    int height, {
+    required int yStride,
+    required int uStride,
+    required int vStride,
+    required int uvPixelStride,
+    required int rotation,
+  }) {
+    _ensure();
+    if (width <= 0 ||
+        height <= 0 ||
+        yStride <= 0 ||
+        uStride <= 0 ||
+        vStride <= 0 ||
+        uvPixelStride <= 0 ||
+        !const <int>{0, 90, 180, 270}.contains(rotation)) {
+      return false;
+    }
+    final cw = (width + 1) ~/ 2;
+    final ch = (height + 1) ~/ 2;
+    final yNeeded = (height - 1) * yStride + width;
+    final uNeeded = (ch - 1) * uStride + (cw - 1) * uvPixelStride + 1;
+    final vNeeded = (ch - 1) * vStride + (cw - 1) * uvPixelStride + 1;
+    if (y.length < yNeeded || u.length < uNeeded || v.length < vNeeded) {
+      return false;
+    }
+    final total = y.length + u.length + v.length;
+    if (_pushBuf == null || _pushCap < total) {
+      if (_pushBuf != null) calloc.free(_pushBuf!);
+      _pushCap = total;
+      _pushBuf = calloc<Uint8>(_pushCap);
+    }
+    final buf = _pushBuf!;
+    final view = buf.asTypedList(total);
+    view.setRange(0, y.length, y);
+    view.setRange(y.length, y.length + u.length, u);
+    view.setRange(y.length + u.length, total, v);
+    return ffi.veilMediaEnginePushAndroid420Frame(
+          _ptr,
+          buf,
+          buf + y.length,
+          buf + y.length + u.length,
+          width,
+          height,
+          yStride,
+          uStride,
+          vStride,
+          uvPixelStride,
+          rotation,
+          0,
+        ) ==
+        0;
+  }
+
   /// The latest decoded remote video frame (RGBA), or null if there is no NEW
   /// frame since the last call. Poll at the display rate.
   VeilVideoFrame? getVideoFrame() {
