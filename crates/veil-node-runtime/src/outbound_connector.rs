@@ -299,7 +299,9 @@ pub fn spawn_outbound_peers(
                                 // in the discarded channel. Mirror the inbound path
                                 // (mod.rs), which consumes `reserved_outbox_rx`.
                                 let outbox_rx = session.reserved_outbox_rx;
-                                let rpc_rx = access.session_outbox.register(peer_id);
+                                let rpc_rx = access
+                                    .session_outbox
+                                    .register_owned(peer_id, session_id);
 
                                 // if we're a Leaf connecting to a Gateway
                                 // send a post-handshake ATTACH to register the lease
@@ -558,8 +560,10 @@ pub fn spawn_outbound_peers(
                                 access.session_tx_registry
                                     .write()
                                     .unwrap_or_else(|p| p.into_inner())
-                                    .unregister(peer_id.as_bytes());
-                                access.session_outbox.unregister(peer_id);
+                                    .unregister_owned(peer_id.as_bytes(), &session_id);
+                                access
+                                    .session_outbox
+                                    .unregister_owned(peer_id, &session_id);
                                 let _ = runner.stream.shutdown().await;
 
                                 // trip the gateway-failover notify

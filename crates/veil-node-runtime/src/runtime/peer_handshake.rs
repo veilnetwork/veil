@@ -469,16 +469,14 @@ pub async fn register_connection_session(
         // the maintenance loop re-issues the delegation at half-validity);
         // the Arc binding keeps it alive for the borrow in the ctx below.
         let sovereign_current = runtime.identity.sovereign_identity.get();
-        let sovereign_ctx = sovereign_current
-            .as_ref()
-            .map(|sov| SovereignHandshakeCtx {
-                sovereign: sov.as_ref(),
-                now_unix_secs: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                local_mlkem_dk_seed: None,
-            });
+        let sovereign_ctx = sovereign_current.as_ref().map(|sov| SovereignHandshakeCtx {
+            sovereign: sov.as_ref(),
+            now_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            local_mlkem_dk_seed: None,
+        });
         let local_advertised_transports: Vec<String> = {
             let state = lock_state(&runtime.state);
             state
@@ -752,6 +750,7 @@ pub async fn register_connection_session(
                     .saturating_add(runtime.defaults.referral_headroom)
         };
         let remote_nid = *remote_identity.node_id.as_bytes();
+        let session_owner = remote_identity.session_keys.session_id;
         if lock!(runtime.dispatcher.abuse.ban_list).is_banned(&remote_nid) {
             let _ = stream.shutdown().await;
             runtime.logger.debug(
@@ -841,6 +840,7 @@ pub async fn register_connection_session(
                 new_is_outbound,
                 bypass_directional,
                 evict_stale_on_dedup,
+                session_owner,
             );
             if evicted_open && rx.is_some() {
                 runtime.logger.info(
@@ -924,7 +924,7 @@ pub async fn register_connection_session(
                     .session_tx_registry
                     .write()
                     .unwrap_or_else(|p| p.into_inner())
-                    .unregister(&remote_nid);
+                    .unregister_owned(&remote_nid, &session_owner);
                 let _ = stream.shutdown().await;
                 return Err(NodeError::Handshake(format!(
                     "session limit reached ({} concurrent sessions); rejecting link_id={}",

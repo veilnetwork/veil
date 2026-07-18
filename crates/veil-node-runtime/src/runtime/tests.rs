@@ -1923,7 +1923,7 @@ pub fn session_guard_drop_publishes_sessions_changed() {
 // dedup reject every reconnect from that peer forever. The guard must reap its
 // own sender on drop, but NEVER one a newer same-node_id session owns.
 #[test]
-pub fn session_guard_drop_reaps_orphaned_tx_unless_node_has_other_session() {
+pub fn session_guard_drop_removes_only_its_owned_tx_sender() {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex, RwLock};
     use veil_cfg::{NodeId, PeerId};
@@ -1957,7 +1957,7 @@ pub fn session_guard_drop_reaps_orphaned_tx_unless_node_has_other_session() {
             LinkId::new(link),
             Arc::new(veil_observability::NodeLogger::new_noop()),
             None,
-            [0u8; 32],
+            [link as u8; 32],
             Arc::new(Mutex::new(veil_session::SessionRegistry::default())),
             None,
             Arc::new(super::ip_slot::IpSlotTable::new()),
@@ -1970,12 +1970,11 @@ pub fn session_guard_drop_reaps_orphaned_tx_unless_node_has_other_session() {
 
     let node = [7u8; 32];
 
-    // CASE 1 — the dying session is the LAST owner of node_id → its orphaned
-    // (still-open) sender MUST be reaped, so the peer's next reconnect is no
-    // longer dedup-rejected.
+    // CASE 1 — the current sender has the dying session's owner token, so its
+    // still-open orphan MUST be reaped and cannot block the next reconnect.
     {
         let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
-        let _rx = tx_reg.write().unwrap().register(node); // keep the channel OPEN
+        let _rx = tx_reg.write().unwrap().register_owned(node, [1u8; 32]);
         assert!(tx_reg.read().unwrap().has_session(&node));
 
         let live = Arc::new(Mutex::new(BTreeMap::new()));
@@ -1986,15 +1985,18 @@ pub fn session_guard_drop_reaps_orphaned_tx_unless_node_has_other_session() {
         drop(build_guard(&live, &tx_reg, node, 1));
         assert!(
             !tx_reg.read().unwrap().has_session(&node),
-            "orphaned outbox sender must be reaped when no other live session owns the node_id"
+            "the dying session's owned sender must be reaped"
         );
     }
 
-    // CASE 2 — ANOTHER live session still owns node_id → the sender belongs to
-    // that newer session and MUST be preserved (never evict a peer's session).
+    // CASE 2 — a newer session has replaced the sender under the same node id.
+    // The old guard MUST preserve it based on owner identity, independently of
+    // timing or the live-session map.
     {
         let tx_reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
-        let _rx = tx_reg.write().unwrap().register(node);
+        // The newer link owns the current sender. Dropping link 1 must not
+        // unregister this link-2 entry even though both share the same node id.
+        let _rx = tx_reg.write().unwrap().register_owned(node, [2u8; 32]);
 
         let live = Arc::new(Mutex::new(BTreeMap::new()));
         live.lock()
@@ -2007,7 +2009,7 @@ pub fn session_guard_drop_reaps_orphaned_tx_unless_node_has_other_session() {
         drop(build_guard(&live, &tx_reg, node, 1)); // drop link 1; link 2 still live
         assert!(
             tx_reg.read().unwrap().has_session(&node),
-            "a sender owned by another live session for the same node_id must NOT be evicted"
+            "a replacement sender with a different owner must NOT be evicted"
         );
     }
 }

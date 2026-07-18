@@ -39,6 +39,11 @@ pub struct OutboxRequest {
 /// Default capacity for the per-session RPC outbox channel.
 pub const DEFAULT_OUTBOX_DEPTH: usize = 256;
 
+struct SessionOutboxEntry {
+    tx: mpsc::Sender<OutboxRequest>,
+    owner: Option<[u8; 32]>,
+}
+
 /// Shared request outbox, keyed by `peer_id`.
 ///
 /// `NetworkPeerQuerier` holds an `Arc<SessionOutbox>`. Each `SessionRunner`
@@ -50,7 +55,7 @@ pub const DEFAULT_OUTBOX_DEPTH: usize = 256;
 /// channel is full, so the caller sees a "no session" error rather than
 /// unbounded memory growth.
 pub struct SessionOutbox {
-    senders: Mutex<HashMap<[u8; 32], mpsc::Sender<OutboxRequest>>>,
+    senders: Mutex<HashMap<[u8; 32], SessionOutboxEntry>>,
     capacity: usize,
     /// Cumulative count of `send_request` calls dropped because the channel was full.
     drops_total: Arc<AtomicU64>,
@@ -95,20 +100,56 @@ impl SessionOutbox {
         })
     }
 
-    /// Register a new session and return the outbox receiver for that peer.
+    /// Register an unowned synthetic/test outbox for that peer.
     pub fn register(&self, peer_id: impl Into<NodeId>) -> mpsc::Receiver<OutboxRequest> {
         // H9 ergonomic accept: see `send_request` for rationale.
         let peer_id: NodeId = peer_id.into();
         let (tx, rx) = mpsc::channel(self.capacity);
-        lock!(self.senders).insert(*peer_id.as_bytes(), tx);
+        lock!(self.senders).insert(*peer_id.as_bytes(), SessionOutboxEntry { tx, owner: None });
         rx
     }
 
-    /// Remove the sender for `peer_id` (called when the session closes).
+    /// Register an RPC outbox owned by one OVL1 session. A reconnect may
+    /// replace it before the old runner exits, so normal runtime teardown must
+    /// pair this with [`Self::unregister_owned`].
+    pub fn register_owned(
+        &self,
+        peer_id: impl Into<NodeId>,
+        owner: [u8; 32],
+    ) -> mpsc::Receiver<OutboxRequest> {
+        let peer_id: NodeId = peer_id.into();
+        let (tx, rx) = mpsc::channel(self.capacity);
+        lock!(self.senders).insert(
+            *peer_id.as_bytes(),
+            SessionOutboxEntry {
+                tx,
+                owner: Some(owner),
+            },
+        );
+        rx
+    }
+
+    /// Remove the sender for `peer_id` regardless of ownership.
+    ///
+    /// Normal OVL1 runner cleanup uses [`Self::unregister_owned`].
     pub fn unregister(&self, peer_id: impl Into<NodeId>) {
         // H9 ergonomic accept: see `send_request` for rationale.
         let peer_id: NodeId = peer_id.into();
         lock!(self.senders).remove(peer_id.as_bytes());
+    }
+
+    /// Remove an RPC outbox only if it is still owned by this session.
+    pub fn unregister_owned(&self, peer_id: impl Into<NodeId>, owner: &[u8; 32]) -> bool {
+        let peer_id: NodeId = peer_id.into();
+        let mut senders = lock!(self.senders);
+        if !senders
+            .get(peer_id.as_bytes())
+            .is_some_and(|entry| entry.owner.as_ref() == Some(owner))
+        {
+            return false;
+        }
+        senders.remove(peer_id.as_bytes());
+        true
     }
 
     /// Number of currently-registered peer outboxes. Metrics-only.
@@ -143,8 +184,8 @@ impl SessionOutbox {
             response_tx,
         };
         let guard = lock!(self.senders);
-        let tx = guard.get(peer_id.as_bytes())?;
-        if tx.try_send(req).is_err() {
+        let entry = guard.get(peer_id.as_bytes())?;
+        if entry.tx.try_send(req).is_err() {
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -171,10 +212,10 @@ impl SessionOutbox {
             response_tx,
         };
         let guard = lock!(self.senders);
-        let Some(tx) = guard.get(peer_id.as_bytes()) else {
+        let Some(entry) = guard.get(peer_id.as_bytes()) else {
             return false;
         };
-        if tx.try_send(req).is_err() {
+        if entry.tx.try_send(req).is_err() {
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -206,5 +247,25 @@ impl veil_dht::FrameRouter for SessionOutbox {
     }
     fn peer_ids(&self) -> Vec<[u8; 32]> {
         SessionOutbox::peer_ids(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionOutbox;
+
+    #[test]
+    fn late_old_owner_cannot_unregister_replacement() {
+        let outbox = SessionOutbox::with_capacity(4);
+        let peer = [7u8; 32];
+        let old_owner = [1u8; 32];
+        let new_owner = [2u8; 32];
+        let _old_rx = outbox.register_owned(peer, old_owner);
+        let _new_rx = outbox.register_owned(peer, new_owner);
+
+        assert!(!outbox.unregister_owned(peer, &old_owner));
+        assert_eq!(outbox.peer_ids(), vec![peer]);
+        assert!(outbox.unregister_owned(peer, &new_owner));
+        assert!(outbox.is_empty());
     }
 }

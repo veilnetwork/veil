@@ -64,10 +64,21 @@ pub type PriorityFrame = (u8, veil_bufpool::PooledShared);
 /// Default capacity for the per-session outbound frame channel.
 pub const DEFAULT_TX_QUEUE_DEPTH: usize = 4096;
 
+/// OVL1 session id that owns a node-id keyed sender. A reconnect may replace
+/// the sender before the old runner finishes tearing down; the owner lets that
+/// late teardown prove it is stale instead of deleting the replacement.
+pub type SessionTxOwner = [u8; 32];
+
+#[derive(Debug)]
+struct SessionTxEntry {
+    tx: mpsc::Sender<PriorityFrame>,
+    owner: Option<SessionTxOwner>,
+}
+
 /// Registry of outbound send channels, one per active session.
 #[derive(Debug)]
 pub struct SessionTxRegistry {
-    senders: HashMap<NodeIdBytes, mpsc::Sender<PriorityFrame>>,
+    senders: HashMap<NodeIdBytes, SessionTxEntry>,
     /// Last send time per peer (Unix milliseconds). `AtomicU64` so the
     /// hot send path can update from `&self` under the outer read lock —
     /// LRU eviction tolerates slight staleness because the maintenance
@@ -151,7 +162,7 @@ impl SessionTxRegistry {
         let dead: Vec<NodeIdBytes> = self
             .senders
             .iter()
-            .filter_map(|(k, tx)| if tx.is_closed() { Some(*k) } else { None })
+            .filter_map(|(k, entry)| if entry.tx.is_closed() { Some(*k) } else { None })
             .collect();
         for k in dead {
             self.senders.remove(&k);
@@ -173,18 +184,42 @@ impl SessionTxRegistry {
         before.saturating_sub(self.senders.len())
     }
 
-    /// Register a new session and return its outbox receiver.
+    /// Register an unowned sender and return its outbox receiver.
     ///
     /// The caller passes the receiver to `SessionRunner`; frames pushed into
     /// the sender (stored here) are priority-tagged and drained via WRR.
     ///
-    /// The channel is bounded to `tx_queue_depth` frames; `send_to*` methods
-    /// drop frames when the channel is full rather than blocking.
+    /// This compatibility API is intended for synthetic/test entries. Runtime
+    /// OVL1 sessions use [`Self::try_register_directional`] so late teardown
+    /// can prove ownership. The channel is bounded to `tx_queue_depth` frames;
+    /// `send_to*` methods drop frames when full rather than blocking.
     pub fn register(&mut self, peer_id: impl Into<NodeId>) -> mpsc::Receiver<PriorityFrame> {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
         let (tx, rx) = mpsc::channel(self.capacity);
-        self.senders.insert(peer_id, tx);
+        self.senders
+            .insert(peer_id, SessionTxEntry { tx, owner: None });
+        self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
+        rx
+    }
+
+    /// Register a sender tied to an OVL1 session owner. Production session
+    /// teardown must use [`Self::unregister_owned`] with the same token.
+    pub fn register_owned(
+        &mut self,
+        peer_id: impl Into<NodeId>,
+        owner: SessionTxOwner,
+    ) -> mpsc::Receiver<PriorityFrame> {
+        let peer_id = *peer_id.into().as_bytes();
+        self.prune_closed();
+        let (tx, rx) = mpsc::channel(self.capacity);
+        self.senders.insert(
+            peer_id,
+            SessionTxEntry {
+                tx,
+                owner: Some(owner),
+            },
+        );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
         rx
     }
@@ -198,7 +233,7 @@ impl SessionTxRegistry {
     /// peek and both register. The atomic check-and-insert under `&mut
     /// self` (taken via the outer `RwLock` write guard in the runtime)
     /// is the canonical commit point for "this peer has a live session";
-    /// `unregister` is the canonical destroy point.
+    /// `unregister` is the canonical destroy point for these unowned entries.
     pub fn try_register_unique(
         &mut self,
         peer_id: impl Into<NodeId>,
@@ -209,7 +244,8 @@ impl SessionTxRegistry {
             return None;
         }
         let (tx, rx) = mpsc::channel(self.capacity);
-        self.senders.insert(peer_id, tx);
+        self.senders
+            .insert(peer_id, SessionTxEntry { tx, owner: None });
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
         Some(rx)
     }
@@ -254,6 +290,7 @@ impl SessionTxRegistry {
         new_is_outbound: bool,
         bypass_directional: bool,
         evict_open_on_dedup: bool,
+        owner: SessionTxOwner,
     ) -> Option<mpsc::Receiver<PriorityFrame>> {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
@@ -287,7 +324,7 @@ impl SessionTxRegistry {
         // session evicts the open-but-likely-zombie one (fall through to the
         // remove+insert below; dropping the old sender exits its runner).
         if let Some(existing) = self.senders.get(&peer_id)
-            && !existing.is_closed()
+            && !existing.tx.is_closed()
             && !evict_open_on_dedup
         {
             return None;
@@ -298,15 +335,45 @@ impl SessionTxRegistry {
         self.last_active.remove(&peer_id);
 
         let (tx, rx) = mpsc::channel(self.capacity);
-        self.senders.insert(peer_id, tx);
+        self.senders.insert(
+            peer_id,
+            SessionTxEntry {
+                tx,
+                owner: Some(owner),
+            },
+        );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
         Some(rx)
     }
 
-    /// Remove the sender for `peer_id` (called when the session closes).
+    /// Remove the sender for `peer_id` regardless of ownership.
+    ///
+    /// Reserved for administrative force-teardown and unowned synthetic
+    /// entries. Normal OVL1 runner cleanup uses [`Self::unregister_owned`].
     pub fn unregister(&mut self, peer_id: &NodeIdBytes) {
         self.senders.remove(peer_id);
         self.last_active.remove(peer_id);
+    }
+
+    /// Remove a sender only when it still belongs to `owner`.
+    ///
+    /// Reconnect admission is latest-wins for learned inbound peers. It closes
+    /// the old sender, installs a new one under the same stable node id, then
+    /// the old runner exits asynchronously. An unconditional unregister from
+    /// that old runner would otherwise delete the fresh sender and recreate the
+    /// exact post-restart delivery blackout the reconnect eviction was meant to
+    /// solve.
+    pub fn unregister_owned(&mut self, peer_id: &NodeIdBytes, owner: &SessionTxOwner) -> bool {
+        if !self
+            .senders
+            .get(peer_id)
+            .is_some_and(|entry| entry.owner.as_ref() == Some(owner))
+        {
+            return false;
+        }
+        self.senders.remove(peer_id);
+        self.last_active.remove(peer_id);
+        true
     }
 
     /// Get a reference to the sender channel for `peer_id`, skipping
@@ -314,7 +381,10 @@ impl SessionTxRegistry {
     /// Without this filter the outbound-reconnect loop would observe a
     /// dead session as live and skip recovery indefinitely.
     pub fn get_sender(&self, peer_id: &NodeIdBytes) -> Option<&mpsc::Sender<PriorityFrame>> {
-        self.senders.get(peer_id).filter(|s| !s.is_closed())
+        self.senders
+            .get(peer_id)
+            .filter(|entry| !entry.tx.is_closed())
+            .map(|entry| &entry.tx)
     }
 
     /// Set of node_ids with currently-registered live sessions. Used
@@ -324,7 +394,13 @@ impl SessionTxRegistry {
     pub fn active_node_ids(&self) -> std::collections::HashSet<NodeIdBytes> {
         self.senders
             .iter()
-            .filter_map(|(k, tx)| if !tx.is_closed() { Some(*k) } else { None })
+            .filter_map(|(k, entry)| {
+                if !entry.tx.is_closed() {
+                    Some(*k)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -333,7 +409,9 @@ impl SessionTxRegistry {
     /// race when an inbound session already exists. Skips closed-channel
     /// stragglers so the loop doesn't gate recovery on a dead session.
     pub fn has_session(&self, peer_id: &NodeIdBytes) -> bool {
-        self.senders.get(peer_id).is_some_and(|s| !s.is_closed())
+        self.senders
+            .get(peer_id)
+            .is_some_and(|entry| !entry.tx.is_closed())
     }
 
     /// Send `bytes` to every registered session at `INTERACTIVE` priority.
@@ -351,8 +429,8 @@ impl SessionTxRegistry {
     /// are skipped silently — eviction is lazy via `prune_closed` at the
     /// next write-lock op.
     pub fn send_to_all_with_priority(&self, priority: u8, bytes: veil_bufpool::PooledShared) {
-        for tx in self.senders.values() {
-            match tx.try_send((priority, bytes.clone())) {
+        for entry in self.senders.values() {
+            match entry.tx.try_send((priority, bytes.clone())) {
                 Ok(_) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
@@ -414,7 +492,7 @@ impl SessionTxRegistry {
         frame: veil_bufpool::PooledShared,
     ) -> Result<(), SendToError> {
         let tx = match self.senders.get(peer_id) {
-            Some(s) => s,
+            Some(entry) => &entry.tx,
             None => return Err(SendToError::Missing),
         };
         match tx.try_send((priority, frame)) {
@@ -479,11 +557,11 @@ impl SessionTxRegistry {
         priority: u8,
         bytes: veil_bufpool::PooledShared,
     ) {
-        for (peer_id, tx) in self.senders.iter() {
+        for (peer_id, entry) in self.senders.iter() {
             if peer_id == exclude_peer {
                 continue;
             }
-            match tx.try_send((priority, bytes.clone())) {
+            match entry.tx.try_send((priority, bytes.clone())) {
                 Ok(_) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
@@ -500,7 +578,13 @@ impl SessionTxRegistry {
     pub fn peer_ids(&self) -> Vec<NodeIdBytes> {
         self.senders
             .iter()
-            .filter_map(|(k, tx)| if !tx.is_closed() { Some(*k) } else { None })
+            .filter_map(|(k, entry)| {
+                if !entry.tx.is_closed() {
+                    Some(*k)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -519,7 +603,7 @@ impl SessionTxRegistry {
     pub fn total_queued(&self) -> usize {
         self.senders
             .values()
-            .map(|tx| self.capacity.saturating_sub(tx.capacity()))
+            .map(|entry| self.capacity.saturating_sub(entry.tx.capacity()))
             .sum()
     }
 
@@ -645,7 +729,7 @@ mod tests {
         let peer = [0xc1u8; 32]; // smaller (e.g. a bootstrap)
         // Without bypass: policy rejects the larger side's outbound (the bug).
         assert!(
-            reg.try_register_directional(peer, &local, true, false, false)
+            reg.try_register_directional(peer, &local, true, false, false, [1; 32])
                 .is_none(),
             "directional policy rejects larger-node_id outbound"
         );
@@ -653,7 +737,7 @@ mod tests {
         // channel stays open for the has_session assertion — dropping it would
         // close the sender and read as no-session.
         let _rx = reg
-            .try_register_directional(peer, &local, true, true, false)
+            .try_register_directional(peer, &local, true, true, false, [1; 32])
             .expect("bypass lets the larger side keep its outbound to a bootstrap");
         assert!(reg.has_session(&peer), "accepted session is registered");
     }
@@ -668,19 +752,19 @@ mod tests {
 
         let mut reg = SessionTxRegistry::new();
         assert!(
-            reg.try_register_directional(larger, &smaller, true, false, false)
+            reg.try_register_directional(larger, &smaller, true, false, false, [1; 32])
                 .is_some(),
             "canonical smaller→larger outbound accepted"
         );
 
         let mut reg2 = SessionTxRegistry::new();
         assert!(
-            reg2.try_register_directional(smaller, &larger, true, false, false)
+            reg2.try_register_directional(smaller, &larger, true, false, false, [1; 32])
                 .is_none(),
             "non-canonical larger→smaller outbound rejected (glare dedup)"
         );
         assert!(
-            reg2.try_register_directional(smaller, &larger, false, false, false)
+            reg2.try_register_directional(smaller, &larger, false, false, false, [1; 32])
                 .is_some(),
             "canonical inbound (larger keeps inbound) accepted"
         );
@@ -695,15 +779,17 @@ mod tests {
         let peer = [0x90u8; 32];
 
         // First learned inbound registers and stays open (hold its rx).
+        let old_owner = [1u8; 32];
+        let new_owner = [2u8; 32];
         let mut rx1 = reg
-            .try_register_directional(peer, &local, false, true, false)
+            .try_register_directional(peer, &local, false, true, false, old_owner)
             .expect("first learned inbound accepted");
         assert!(reg.has_session(&peer));
 
         // Reconnect WITHOUT the evict flag ⇒ strict first-wins dedup (this is the
         // mesh path's behaviour); the open session is kept, the newcomer rejected.
         assert!(
-            reg.try_register_directional(peer, &local, false, true, false)
+            reg.try_register_directional(peer, &local, false, true, false, new_owner)
                 .is_none(),
             "open session ⇒ strict dedup when evict flag is false"
         );
@@ -712,7 +798,7 @@ mod tests {
         // Learned reconnect WITH the evict flag ⇒ replace the open (zombie)
         // session with the fresh one.
         let _rx2 = reg
-            .try_register_directional(peer, &local, false, true, true)
+            .try_register_directional(peer, &local, false, true, true, new_owner)
             .expect("learned reconnect evicts the open session");
         assert!(reg.has_session(&peer), "fresh session registered");
         // The OLD sender was dropped, so its receiver is now disconnected — this
@@ -722,5 +808,15 @@ mod tests {
             matches!(rx1.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
             "evicted session's channel closes so its runner reaps itself"
         );
+        assert!(
+            !reg.unregister_owned(&peer, &old_owner),
+            "late teardown from old owner must not remove replacement"
+        );
+        assert!(reg.has_session(&peer), "replacement remains routable");
+        assert!(
+            reg.unregister_owned(&peer, &new_owner),
+            "current owner can remove its sender"
+        );
+        assert!(!reg.has_session(&peer));
     }
 }
