@@ -1081,24 +1081,88 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
     // create a valid-looking black hole until the session happened to appear.
     // Fail the open instead; the host must preserve the negotiated route and
     // surface/retry the direct failure rather than silently selecting onion.
-    let direct_ready = app_ref.bundle.runtime.block_on(async {
-        // The shared client mutex can itself be occupied by a slow control RPC
-        // (join/discovery/call signalling). Keep the lock acquisition inside
-        // the same deadline as PnetStatusQuery; otherwise a nominally bounded
-        // P2P probe can outlive the call FSM's media-start timeout and prevent
-        // the caller from reaching its relay fallback.
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let client = app_ref.bundle.client.lock().await;
-            client.peer_pnet_status(&peer).await
-        })
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .is_some_and(|status| status.admitted)
+    // The shared client mutex can itself be occupied by a slow control RPC
+    // (join/discovery/call signalling), and the daemon's per-connection query
+    // rate limiter drops PnetStatusQuery SILENTLY when its bucket is empty —
+    // both stalls look identical to a single fixed-deadline probe. Probe in
+    // short attempts inside one overall deadline: an attempt that times out is
+    // retried (a dropped query gets a fresh token; a busy mutex gets another
+    // chance), while an authoritative not-admitted reply fails fast. The
+    // overall budget must stay inside the call FSM's media-start timeout so
+    // the caller can still reach its relay fallback.
+    enum ProbeVerdict {
+        Admitted,
+        NotAdmitted,
+        TimedOut,
+        RpcError,
+    }
+    let verdict = app_ref.bundle.runtime.block_on(async {
+        const OVERALL: std::time::Duration = std::time::Duration::from_millis(2000);
+        const ATTEMPT: std::time::Duration = std::time::Duration::from_millis(650);
+        let started = std::time::Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let att_start = std::time::Instant::now();
+            let outcome = tokio::time::timeout(ATTEMPT, async {
+                let lock_start = std::time::Instant::now();
+                let client = app_ref.bundle.client.lock().await;
+                let lock_ms = lock_start.elapsed().as_millis();
+                (lock_ms, client.peer_pnet_status(&peer).await)
+            })
+            .await;
+            match outcome {
+                Ok((lock_ms, Ok(status))) => {
+                    media::diag(format_args!(
+                        "open_direct probe attempt={attempt} lock_ms={lock_ms} \
+                         admitted={} in {}ms",
+                        status.admitted,
+                        att_start.elapsed().as_millis(),
+                    ));
+                    return if status.admitted {
+                        ProbeVerdict::Admitted
+                    } else {
+                        ProbeVerdict::NotAdmitted
+                    };
+                }
+                Ok((lock_ms, Err(e))) => {
+                    media::diag(format_args!(
+                        "open_direct probe attempt={attempt} lock_ms={lock_ms} rpc error: {e}"
+                    ));
+                    if started.elapsed() + ATTEMPT > OVERALL {
+                        return ProbeVerdict::RpcError;
+                    }
+                    // An instant transport error would otherwise hot-spin the
+                    // remaining budget away; give the connection a beat.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(_) => {
+                    media::diag(format_args!(
+                        "open_direct probe attempt={attempt} timed out after {}ms \
+                         (lock or rpc stalled)",
+                        att_start.elapsed().as_millis(),
+                    ));
+                    if started.elapsed() + ATTEMPT > OVERALL {
+                        return ProbeVerdict::TimedOut;
+                    }
+                }
+            }
+        }
     });
-    if !direct_ready {
-        unsafe { write_err(err_out, "direct media session is not active") };
-        return 0;
+    match verdict {
+        ProbeVerdict::Admitted => {}
+        ProbeVerdict::NotAdmitted => {
+            unsafe { write_err(err_out, "direct media session is not active") };
+            return 0;
+        }
+        ProbeVerdict::TimedOut => {
+            unsafe { write_err(err_out, "direct session probe timed out") };
+            return 0;
+        }
+        ProbeVerdict::RpcError => {
+            unsafe { write_err(err_out, "direct session probe failed") };
+            return 0;
+        }
     }
 
     let (tx_hi, mut rx_hi) = mpsc::channel::<Vec<u8>>(MEDIA_TX_HI_QUEUE);
