@@ -59,6 +59,13 @@ class VeilMediaEngine {
   int _localFrameCap = 0;
   int _lastLocalFrameSeq = 0;
 
+  /// Address used only by platform-native frame producers. It is valid until
+  /// [dispose] and must never be retained after their awaited stop barrier.
+  int get nativeAddress {
+    _ensure();
+    return _ptr.address;
+  }
+
   /// Create an engine over an already-open veil media channel [veilChan]
   /// (from `VeilFlutterTransport.openMediaChannel`). [localId] is OUR 32-byte
   /// node id and [peerId] the peer's — SSRCs are derived from them so the two
