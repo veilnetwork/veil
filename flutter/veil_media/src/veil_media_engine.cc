@@ -28,6 +28,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__ANDROID__)
+#include <jni.h>
+#endif
+
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
 #include "api/audio/audio_device.h"
 #include "api/audio/builtin_audio_processing_builder.h"
@@ -1661,10 +1665,9 @@ int veil_media_engine_push_android420_frame(
     }
   }
   if (rc != 0) return VEIL_MEDIA_ERR_ARG;
-  if (engine->ws->local_video_sink)
-    engine->ws->local_video_sink->store_i420(
-        buf->DataY(), buf->DataU(), buf->DataV(), out_width, out_height,
-        buf->StrideY(), buf->StrideU(), buf->StrideV());
+  // Android call self-preview is the Camera2 SurfaceTexture itself. Converting
+  // the same frame back to RGBA here made every capture callback do another
+  // full-frame copy and periodically stalled both preview and send cadence.
   broadcast_i420(engine->ws->video_source.get(), buf, ts_us);
   return VEIL_MEDIA_OK;
 #else
@@ -1912,3 +1915,45 @@ void veil_media_free_string(char* s) {
 const char* veil_media_version(void) { return kVersion; }
 
 }  // extern "C"
+
+#if defined(__ANDROID__)
+extern "C" JNIEXPORT jint JNICALL
+Java_network_veil_xveil_NativeCallCamera_nativePushAndroid420(
+    JNIEnv* env, jobject /* self */, jlong engine_address, jobject y_buffer,
+    jobject u_buffer, jobject v_buffer, jint width, jint height, jint y_stride,
+    jint u_stride, jint v_stride, jint uv_pixel_stride, jint rotation,
+    jlong timestamp_us) {
+  if (engine_address == 0 || y_buffer == nullptr || u_buffer == nullptr ||
+      v_buffer == nullptr || width <= 0 || height <= 0 || y_stride <= 0 ||
+      u_stride <= 0 || v_stride <= 0 || uv_pixel_stride <= 0) {
+    return VEIL_MEDIA_ERR_ARG;
+  }
+  auto* y = static_cast<uint8_t*>(env->GetDirectBufferAddress(y_buffer));
+  auto* u = static_cast<uint8_t*>(env->GetDirectBufferAddress(u_buffer));
+  auto* v = static_cast<uint8_t*>(env->GetDirectBufferAddress(v_buffer));
+  const jlong y_capacity = env->GetDirectBufferCapacity(y_buffer);
+  const jlong u_capacity = env->GetDirectBufferCapacity(u_buffer);
+  const jlong v_capacity = env->GetDirectBufferCapacity(v_buffer);
+  const int chroma_width = (width + 1) / 2;
+  const int chroma_height = (height + 1) / 2;
+  const int64_t y_needed =
+      static_cast<int64_t>(height - 1) * y_stride + width;
+  const int64_t u_needed = static_cast<int64_t>(chroma_height - 1) * u_stride +
+                           static_cast<int64_t>(chroma_width - 1) *
+                               uv_pixel_stride +
+                           1;
+  const int64_t v_needed = static_cast<int64_t>(chroma_height - 1) * v_stride +
+                           static_cast<int64_t>(chroma_width - 1) *
+                               uv_pixel_stride +
+                           1;
+  if (y == nullptr || u == nullptr || v == nullptr || y_capacity < y_needed ||
+      u_capacity < u_needed || v_capacity < v_needed) {
+    return VEIL_MEDIA_ERR_ARG;
+  }
+  return veil_media_engine_push_android420_frame(
+      reinterpret_cast<VeilMediaEngine*>(
+          static_cast<uintptr_t>(engine_address)),
+      y, u, v, width, height, y_stride, u_stride, v_stride, uv_pixel_stride,
+      rotation, timestamp_us);
+}
+#endif
