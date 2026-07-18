@@ -738,14 +738,33 @@ static MEDIA_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// Outbound queue depth per media channel. Keep this bounded: media is a real-
 /// time path, and a deep FIFO turns transient overload into stale audio/video.
 /// Split audio/RTCP/unknown from VP8 RTP so a video keyframe burst cannot put
-/// audio behind it. These caps are intentionally tiny: WebRTC already has its
-/// own pacer, so a second 16/24-packet FIFO only preserved stale media and added
-/// hundreds of milliseconds under congestion. Queue-full is reported as loss
-/// to WebRTC; a later keyframe/Opus PLC recovers without replaying an old tail.
+/// audio behind it. Queue-full is reported as loss to WebRTC; a later
+/// keyframe/Opus PLC recovers without replaying an old tail.
+///
+/// Sizing (real-P2P freeze fix): the VIDEO queue must absorb one keyframe's
+/// packet burst. The relay path assembles whole frames before queueing
+/// (`RELAY_VIDEO_FRAME_QUEUE` = 4 frames × up to 512 packets), but the
+/// direct/onion paths queue raw RTP packets — with the old 4-packet cap a
+/// single VP8 keyframe (~25-50 MTU packets at 900 kbps) overflowed the queue
+/// EVERY time it coincided with a stalled drain, dropping mid-frame packets.
+/// Each drop corrupted the frame downstream (receiver froze until the next
+/// keyframe, its jitter buffer inflating then flushing) and incremented
+/// `tx_drops`, which the bitrate adapter treats as a bad sample — so the
+/// ladder oscillated 900↔675 kbps, and every retune forced ANOTHER keyframe:
+/// a self-sustaining freeze cycle on an otherwise clean LAN path. 64 packets
+/// ≈ one large keyframe; the pacer upstream keeps standing depth near zero,
+/// so this does not re-introduce a stale-media FIFO under real congestion.
 #[cfg(feature = "node-embedded")]
-const MEDIA_TX_HI_QUEUE: usize = 8;
+const MEDIA_TX_HI_QUEUE: usize = 32;
 #[cfg(feature = "node-embedded")]
-const MEDIA_TX_VIDEO_QUEUE: usize = 4;
+const MEDIA_TX_VIDEO_QUEUE: usize = 64;
+
+/// Max packets a direct-channel drain iteration sends under one sender lock.
+/// Bounds the lock hold time while still emptying a keyframe burst faster
+/// than the encoder refills it (the per-packet awaited IPC write is the slow
+/// part; see `MEDIA_TX_VIDEO_QUEUE`).
+#[cfg(feature = "node-embedded")]
+const MEDIA_TX_BURST_MAX: usize = 32;
 
 /// At 20 fps the queued portion is at most ~200 ms of complete video. Including
 /// the frame currently being drained and the in-progress assembler, pathological
@@ -1195,29 +1214,50 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             // packet gets the next slot. Without this bounded alternation the
             // continuously-ready Opus queue can starve video indefinitely.
             prefer_video = !media_is_vp8_rtp(&pkt);
+            // Greedy burst drain: absorb whatever queued behind the first
+            // packet (audio first) and send it back-to-back under ONE sender
+            // lock. Sending exactly one packet per awaited IPC write capped
+            // the drain rate at the write latency, which is what let a
+            // keyframe burst overflow the bounded queue (see
+            // MEDIA_TX_VIDEO_QUEUE) while the wire itself was nowhere near
+            // saturated.
+            let mut burst = vec![pkt];
+            while burst.len() < MEDIA_TX_BURST_MAX {
+                if let Ok(p) = rx_hi.try_recv() {
+                    burst.push(p);
+                    continue;
+                }
+                match rx_video.try_recv() {
+                    Ok(p) => burst.push(p),
+                    Err(_) => break,
+                }
+            }
             let guard = sender.lock().await;
             let Some(sender) = guard.as_ref() else {
                 break;
             };
-            let (marker, payload_type) = if pkt.len() >= 2 && (pkt[0] >> 6) == 2 {
-                ((pkt[1] >> 7) & 1, u32::from(pkt[1] & 0x7f))
-            } else {
-                (0, 0)
-            };
-            let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-            let _ = sender
-                .send_rt_data(
-                    peer,
-                    peer_app,
-                    peer_endpoint_id,
-                    transport_seq,
-                    timestamp_us,
-                    marker,
-                    payload_type,
-                    &pkt,
-                )
-                .await;
-            transport_seq = transport_seq.wrapping_add(1);
+            for pkt in burst {
+                let (marker, payload_type) = if pkt.len() >= 2 && (pkt[0] >> 6) == 2 {
+                    ((pkt[1] >> 7) & 1, u32::from(pkt[1] & 0x7f))
+                } else {
+                    (0, 0)
+                };
+                let timestamp_us =
+                    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                let _ = sender
+                    .send_rt_data(
+                        peer,
+                        peer_app,
+                        peer_endpoint_id,
+                        transport_seq,
+                        timestamp_us,
+                        marker,
+                        payload_type,
+                        &pkt,
+                    )
+                    .await;
+                transport_seq = transport_seq.wrapping_add(1);
+            }
         }
     });
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
