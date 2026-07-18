@@ -160,13 +160,25 @@ class AvfScreenCapturer : public ScreenCapturer {
 
   void Stop() override {
     @autoreleasepool {
-      if (delegate_) delegate_->cb_ = nullptr;  // stop delivering first
       AVCaptureSession* session = session_;
       AVCaptureVideoDataOutput* output = output_;
+      VeilScreenDelegate* delegate = delegate_;
+      dispatch_queue_t q = queue_;
       session_ = nil;
       output_ = nil;
       delegate_ = nil;
       queue_ = nil;
+      // Same hangup-time teardown race as the camera capturer (see
+      // veil_avf_camera.mm Stop()): clear the callback synchronously ON the
+      // capture queue so no captureOutput: is mid-flight when the caller
+      // proceeds to destroy the frame sink.
+      if (delegate != nil && q != nil) {
+        dispatch_sync(q, ^{
+          delegate->cb_ = nullptr;
+        });
+      } else if (delegate != nil) {
+        delegate->cb_ = nullptr;
+      }
       if (session) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
           @autoreleasepool {
