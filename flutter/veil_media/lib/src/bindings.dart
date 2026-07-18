@@ -87,6 +87,28 @@ final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Uint8>,
                     Int64)>>('veil_media_engine_push_video_frame')
         .asFunction();
 
+// push_android420_frame(engine*, y, u, v, w, h, stride_y, stride_u,
+//                       stride_v, pixel_stride_uv, rotation, ts_us) -> int
+late final int Function(Pointer<VeilMediaEngineHandle>, Pointer<Uint8>,
+        Pointer<Uint8>, Pointer<Uint8>, int, int, int, int, int, int, int, int)
+    veilMediaEnginePushAndroid420Frame = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                    Pointer<VeilMediaEngineHandle>,
+                    Pointer<Uint8>,
+                    Pointer<Uint8>,
+                    Pointer<Uint8>,
+                    Int32,
+                    Int32,
+                    Int32,
+                    Int32,
+                    Int32,
+                    Int32,
+                    Int32,
+                    Int64)>>('veil_media_engine_push_android420_frame')
+        .asFunction();
+
 // start_camera(engine*, width int, height int, fps int) -> int
 final int Function(Pointer<VeilMediaEngineHandle>, int, int, int)
     veilMediaEngineStartCamera = nativeLib

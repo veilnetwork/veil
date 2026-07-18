@@ -743,7 +743,7 @@ static MEDIA_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 ///
 /// Sizing (real-P2P freeze fix): the VIDEO queue must absorb one keyframe's
 /// packet burst. The relay path assembles whole frames before queueing
-/// (`RELAY_VIDEO_FRAME_QUEUE` = 4 frames × up to 512 packets), but the
+/// (`RELAY_VIDEO_FRAME_QUEUE` frames × up to 512 packets), but the
 /// direct/onion paths queue raw RTP packets — with the old 4-packet cap a
 /// single VP8 keyframe (~25-50 MTU packets at 900 kbps) overflowed the queue
 /// EVERY time it coincided with a stalled drain, dropping mid-frame packets.
@@ -773,13 +773,22 @@ const MEDIA_TX_BURST_MAX: usize = 32;
 /// frame currently being drained and the in-progress assembler, pathological
 /// output remains bounded to ~3 MiB per channel. Ordinary 640x360 VP8 frames
 /// are much smaller; the cap keeps malformed/self-buggy output from turning the
-/// realtime path into an allocator sink.
+/// realtime path into an allocator sink. This is a capacity ceiling, not a
+/// prefill target: the drain receives every complete frame immediately.
 #[cfg(feature = "node-embedded")]
 const RELAY_VIDEO_FRAME_QUEUE: usize = 16;
 #[cfg(feature = "node-embedded")]
 const RELAY_VIDEO_FRAME_MAX_PACKETS: usize = 512;
 #[cfg(feature = "node-embedded")]
 const RELAY_VIDEO_FRAME_MAX_BYTES: usize = 512 * 1024;
+/// A complete relay video frame is already available here, so packet groups
+/// can be encoded immediately without the 20 ms gather used for audio. Four
+/// MTU-sized packets stay comfortably below the relay realtime-class ceiling
+/// and preserve the existing audio-interleave cadence.
+#[cfg(feature = "node-embedded")]
+const RELAY_VIDEO_BATCH_MAX_PACKETS: usize = 4;
+#[cfg(feature = "node-embedded")]
+const RELAY_VIDEO_BATCH_BODY_MAX: usize = 7168;
 
 #[cfg(feature = "node-embedded")]
 #[derive(Default)]
@@ -837,6 +846,58 @@ impl RelayVideoFrameAssembler {
 }
 
 #[cfg(feature = "node-embedded")]
+fn flush_relay_video_chunk(chunk: &mut Vec<Vec<u8>>, cells: &mut Vec<Vec<u8>>) {
+    let packets = std::mem::take(chunk);
+    if packets.len() < 2 {
+        cells.extend(packets);
+        return;
+    }
+    if let Some(body) = media::encode_batch(&packets, RELAY_VIDEO_BATCH_BODY_MAX) {
+        let mut cell = Vec::with_capacity(1 + body.len());
+        cell.push(media::MEDIA_BATCH_MAGIC);
+        cell.extend_from_slice(&body);
+        cells.push(cell);
+    } else {
+        // Defensive fallback: never lose a frame because a future encoder
+        // constraint changed. The packets are still sent in their RTP order.
+        cells.extend(packets);
+    }
+}
+
+/// Convert one complete VP8 frame into relay wire cells. This is a capacity
+/// optimization, not a gather buffer: the frame is emitted immediately. Old
+/// peers get the original one-RTP-packet-per-cell representation.
+#[cfg(feature = "node-embedded")]
+fn relay_video_wire_cells(frame: Vec<Vec<u8>>, batching: bool) -> Vec<Vec<u8>> {
+    if !batching {
+        return frame;
+    }
+    let mut cells = Vec::with_capacity(frame.len().div_ceil(RELAY_VIDEO_BATCH_MAX_PACKETS));
+    let mut chunk = Vec::with_capacity(RELAY_VIDEO_BATCH_MAX_PACKETS);
+    let mut body_bytes = 2usize; // batch packet-count prefix
+    for packet in frame {
+        let encoded_bytes = 2usize.saturating_add(packet.len());
+        if encoded_bytes.saturating_add(2) > RELAY_VIDEO_BATCH_BODY_MAX {
+            flush_relay_video_chunk(&mut chunk, &mut cells);
+            cells.push(packet);
+            body_bytes = 2;
+            continue;
+        }
+        if !chunk.is_empty()
+            && (chunk.len() >= RELAY_VIDEO_BATCH_MAX_PACKETS
+                || body_bytes.saturating_add(encoded_bytes) > RELAY_VIDEO_BATCH_BODY_MAX)
+        {
+            flush_relay_video_chunk(&mut chunk, &mut cells);
+            body_bytes = 2;
+        }
+        body_bytes = body_bytes.saturating_add(encoded_bytes);
+        chunk.push(packet);
+    }
+    flush_relay_video_chunk(&mut chunk, &mut cells);
+    cells
+}
+
+#[cfg(feature = "node-embedded")]
 fn media_is_vp8_rtp(payload: &[u8]) -> bool {
     if payload.len() < 2 || (payload[0] >> 6) != 2 {
         return false;
@@ -850,7 +911,7 @@ fn media_is_vp8_rtp(payload: &[u8]) -> bool {
 mod media_priority_tests {
     use super::{
         RELAY_VIDEO_FRAME_MAX_BYTES, RelayVideoFrameAssembler, RelayVideoFramePush,
-        media_is_vp8_rtp, veil_media_repair_channel,
+        media_is_vp8_rtp, relay_video_wire_cells, veil_media_repair_channel,
     };
 
     fn video_packet(timestamp: u32, marker: bool, fill: u8) -> Vec<u8> {
@@ -928,6 +989,46 @@ mod media_priority_tests {
             panic!("assembler must recover immediately after a bounded drop");
         };
         assert_eq!(frame.len(), 1);
+    }
+
+    fn expand_wire_cells(cells: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        for cell in cells {
+            if cell.first() != Some(&crate::media::MEDIA_BATCH_MAGIC) {
+                packets.push(cell.clone());
+                continue;
+            }
+            let body = &cell[1..];
+            let count = u16::from_be_bytes([body[0], body[1]]) as usize;
+            let mut offset = 2;
+            for _ in 0..count {
+                let len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+                offset += 2;
+                packets.push(body[offset..offset + len].to_vec());
+                offset += len;
+            }
+            assert_eq!(offset, body.len());
+        }
+        packets
+    }
+
+    #[test]
+    fn relay_video_batching_emits_immediately_in_order_bounded_groups() {
+        let frame: Vec<Vec<u8>> = (0..9)
+            .map(|index| video_packet(7, index == 8, index as u8))
+            .collect();
+        let cells = relay_video_wire_cells(frame.clone(), true);
+        assert_eq!(cells.len(), 3, "four + four + one RTP packets");
+        assert_eq!(cells[0][0], crate::media::MEDIA_BATCH_MAGIC);
+        assert_eq!(cells[1][0], crate::media::MEDIA_BATCH_MAGIC);
+        assert_ne!(cells[2][0], crate::media::MEDIA_BATCH_MAGIC);
+        assert_eq!(expand_wire_cells(&cells), frame);
+    }
+
+    #[test]
+    fn relay_video_batching_stays_legacy_when_not_negotiated() {
+        let frame = vec![video_packet(7, false, 1), video_packet(7, true, 2)];
+        assert_eq!(relay_video_wire_cells(frame.clone(), false), frame);
     }
 }
 
@@ -1419,19 +1520,20 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                         .await;
                 }
                 Work::VideoFrame(frame) => {
-                    // Preserve the whole encoded frame and its packet order.
-                    // Give queued Opus/RTCP one slot after every four video
-                    // packets so a large keyframe cannot create an audio gap.
-                    for (index, pkt) in frame.into_iter().enumerate() {
-                        if index % 4 == 0
-                            && let Ok(high) = rx_hi.try_recv()
-                        {
+                    // The frame is complete, so batching adds no gather delay:
+                    // it only removes repeated relay envelopes and lets the
+                    // receiver assemble the frame with less arrival jitter.
+                    let batching_enabled = batching_task.load(std::sync::atomic::Ordering::Relaxed);
+                    for cell in relay_video_wire_cells(frame, batching_enabled) {
+                        // One batch contains at most four video packets, so this
+                        // preserves the former one-audio-slot-per-four cadence.
+                        if let Ok(high) = rx_hi.try_recv() {
                             let _ = sender
                                 .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, high)
                                 .await;
                         }
                         let _ = sender
-                            .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, pkt)
+                            .send_relay_realtime_owned(peer, peer_app, peer_endpoint_id, cell)
                             .await;
                     }
                 }
