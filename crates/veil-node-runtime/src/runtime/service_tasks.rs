@@ -2173,6 +2173,14 @@ impl NodeRuntime {
                                         &dial_access,
                                         &dial_shutdown_tx,
                                     );
+                                    // A repeat join for an already-claimed peer
+                                    // no-ops in spawn_outbound_peers (per-node-id
+                                    // slot), but the live reconnect loop may be
+                                    // mid 30-s sleep while the entry's transport
+                                    // was just refreshed (P2P endpoint exchange /
+                                    // network change). Kick it awake so the new
+                                    // address is dialed now, not up to 30 s later.
+                                    dial_access.force_reconnect_notify.notify_waiters();
                                 }
                                 None => break, // forwarder dropped → no more joins
                             },
