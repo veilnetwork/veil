@@ -825,6 +825,19 @@ pub enum LocalAppMsg {
     /// daemon → app: result of `SendAuthenticatedDirectWithReply` (2-byte status
     /// code, `0` = ok, else an `ipc_send_err`).
     SendAuthenticatedDirectWithReplyResult = 88,
+
+    /// **Listen-transports query: app → daemon.**  Asks for the daemon's
+    /// current listener URIs (`listen_transports` snapshot).  After a
+    /// server-reflexive NAT probe the dispatcher rewrites wildcard hosts
+    /// (`0.0.0.0`) to the observed external IP, so this is how an app
+    /// learns its own external `ip:port` candidates for direct-endpoint
+    /// exchange (real-P2P epic, Stage B).  Empty payload.  Daemon replies
+    /// with [`Self::ListenTransportsResult`].
+    ListenTransportsQuery = 89,
+    /// Reply to [`Self::ListenTransportsQuery`].  Payload:
+    /// `u16 count`, then per URI `u16 len + utf8 bytes`
+    /// (see `ListenTransportsResultPayload`).
+    ListenTransportsResult = 90,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -920,6 +933,8 @@ impl TryFrom<u16> for LocalAppMsg {
             86 => Ok(LocalAppMsg::LookupRelayKeyResp),
             87 => Ok(LocalAppMsg::SendAuthenticatedDirectWithReply),
             88 => Ok(LocalAppMsg::SendAuthenticatedDirectWithReplyResult),
+            89 => Ok(LocalAppMsg::ListenTransportsQuery),
+            90 => Ok(LocalAppMsg::ListenTransportsResult),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,

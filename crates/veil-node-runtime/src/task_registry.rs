@@ -59,6 +59,13 @@ pub enum RuntimeService {
     DhtRepublish,
     RouteMissHandler,
     Bootstrap,
+    /// Proactive server-reflexive address probe (real-P2P epic, Stage B).
+    /// Periodically fires one sentinel STUN-echo `NatProbeRequest` at a
+    /// connected peer with a public remote address so the dispatcher can
+    /// rewrite wildcard listen transports to the observed external IP
+    /// BEFORE an app asks for direct-endpoint candidates. No-op while no
+    /// wildcard listener / no suitable session exists.
+    SrflxProbe,
     /// Partition-recovery watchdog (post-cascade-failure).
     ///
     /// `Bootstrap` is one-shot at startup (bootstrap_only peers
@@ -167,6 +174,7 @@ impl RuntimeService {
         Self::DhtRepublish,
         Self::RouteMissHandler,
         Self::Bootstrap,
+        Self::SrflxProbe,
         Self::BootstrapWatchdog,
         Self::SovereignIdentityRepublish,
         Self::AuthDeliverHandler,

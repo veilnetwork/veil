@@ -891,6 +891,12 @@ pub struct IpcServer {
     /// the handler replies `admitted=false / has_cert=false` so strict-
     /// p_net apps fall back to their secondary admission path.
     pnet_status_provider: Option<Arc<dyn crate::PnetStatusProvider>>,
+    /// Listen-transports provider — answers
+    /// `LocalAppMsg::ListenTransportsQuery` with the dispatcher's current
+    /// listener URI snapshot (wildcards rewritten to the observed external
+    /// IP after a NAT probe).  Without it, the handler replies with an
+    /// empty list so apps can detect "feature not wired" cleanly.
+    listen_transports_provider: Option<Arc<dyn crate::ListenTransportsProvider>>,
     /// Bootstrap-URI join sink — handles
     /// `LocalAppMsg::JoinBootstrapUri` requests by decoding the URI
     /// and registering the resulting peer. Without it, the handler
@@ -1016,6 +1022,7 @@ impl IpcServer {
             local_relay_x25519_pubkey: None,
             peer_list_provider: None,
             pnet_status_provider: None,
+            listen_transports_provider: None,
             bootstrap_join_sink: None,
             mobile_status_provider: None,
             event_bus: None,
@@ -1293,6 +1300,18 @@ impl IpcServer {
         provider: Arc<dyn crate::PnetStatusProvider>,
     ) -> Self {
         self.pnet_status_provider = Some(provider);
+        self
+    }
+
+    /// Attach a listen-transports provider. When set
+    /// `LocalAppMsg::ListenTransportsQuery` is routed to the provider and
+    /// the reply carries the daemon's current listener URIs. Without it,
+    /// the reply is an empty list.
+    pub fn with_listen_transports_provider(
+        mut self,
+        provider: Arc<dyn crate::ListenTransportsProvider>,
+    ) -> Self {
+        self.listen_transports_provider = Some(provider);
         self
     }
 
@@ -1588,6 +1607,7 @@ impl IpcServer {
                         let local_relay_x25519_pubkey = self.local_relay_x25519_pubkey;
                         let peer_list_provider = self.peer_list_provider.clone();
                         let pnet_status_provider = self.pnet_status_provider.clone();
+                        let listen_transports_provider = self.listen_transports_provider.clone();
                         let bootstrap_join_sink = self.bootstrap_join_sink.clone();
                         let mobile_status_provider = self.mobile_status_provider.clone();
                         let event_bus = self.event_bus.clone();
@@ -1618,7 +1638,7 @@ impl IpcServer {
                             // operators can diagnose IPC disconnects without
                             // strace. Tracing is wired in at log-level WARN
                             // by the daemon binary.
-                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, stream_bridge).await {
+                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, listen_transports_provider, stream_bridge).await {
                                 eprintln!("[veil-ipc] client disconnected: {e} (kind={:?})", e.kind());
                             }
                         });
@@ -1735,6 +1755,7 @@ async fn handle_ipc_client(
     pair_source_sink: Option<Arc<dyn crate::PairSourceSink>>,
     pair_target_sink: Option<Arc<dyn crate::PairTargetSink>>,
     pnet_status_provider: Option<Arc<dyn crate::PnetStatusProvider>>,
+    listen_transports_provider: Option<Arc<dyn crate::ListenTransportsProvider>>,
     stream_bridge: Option<crate::bridge::IpcStreamBridge>,
 ) -> std::io::Result<()> {
     // ── Step 1: read APP_HELLO ──────────────────────────────────────────
@@ -2689,6 +2710,14 @@ async fn handle_ipc_client(
                             &body,
                             &mut client_state,
                             pnet_status_provider.as_ref(),
+                        )
+                        .await?;
+                    }
+                    Ok(LocalAppMsg::ListenTransportsQuery) => {
+                        crate::handlers::queries::handle_listen_transports_query(
+                            &mut wh,
+                            &mut client_state,
+                            listen_transports_provider.as_ref(),
                         )
                         .await?;
                     }
