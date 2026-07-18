@@ -919,6 +919,10 @@ impl NodeRuntime {
             ))),
             announce_seq: Arc::new(AtomicU32::new(0)),
             listen_transports: reload_listen_transports,
+            // Fresh on reload: a config reload can follow a network change,
+            // and stale srflx observations would advertise a dead address —
+            // the periodic probe re-learns within one interval.
+            own_external_addrs: Arc::new(std::sync::RwLock::new(vec![])),
             relay_node_ids: build_relay_node_ids(config),
             target_labels: build_target_labels(&config.routing),
             route_updated: Arc::new(tokio::sync::Notify::new()),

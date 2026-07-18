@@ -366,6 +366,35 @@ Uint8List _nodeIdWorker(int handleAddr) {
   }
 }
 
+/// Off-isolate body of [VeilClient.listenTransports]. Bounded at 2 s natively,
+/// but the shared client mutex can hold it for that whole window — keep it off
+/// the UI thread.
+List<String> _listenTransportsWorker(int handleAddr) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final outUris = calloc<Pointer<Utf8>>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final rc = ffi.veilListenTransports(handle, outUris, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'listen_transports failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+    final ptr = outUris.value;
+    if (ptr == nullptr) return const [];
+    final joined = ptr.toDartString();
+    ffi.veilFreeString(ptr);
+    return [
+      for (final u in joined.split('\n'))
+        if (u.isNotEmpty) u,
+    ];
+  } finally {
+    calloc.free(outUris);
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate body of [VeilClient.acceptAnonStream]. Null on timeout; throws on
 /// a fatal error; else the stream address + the initiator's node id + onion-
 /// stream app id.
@@ -1429,6 +1458,20 @@ class VeilClient implements Finalizable {
     final handleAddr = _handle.address;
     final peerCopy = Uint8List.fromList(peerNodeId);
     return Isolate.run(() => _peerPnetStatusWorker(handleAddr, peerCopy));
+  }
+
+  /// Snapshot the daemon's current listener URIs (real-P2P epic, Stage B).
+  /// After a server-reflexive NAT probe the daemon rewrites wildcard
+  /// listener hosts (`0.0.0.0`) to the observed external IP, so this is how
+  /// the app learns its own external `ip:port` candidates when minting
+  /// direct-endpoint URIs. Empty list on daemons without the provider.
+  ///
+  /// The native call is bounded at 2 s but still blocks its thread on the
+  /// shared client mutex, so it runs off-isolate like [peerPnetStatus].
+  Future<List<String>> listenTransports() async {
+    _ensureOpen();
+    final handleAddr = _handle.address;
+    return Isolate.run(() => _listenTransportsWorker(handleAddr));
   }
 
   /// Ask the daemon to assemble a bootstrap-invite URI from its own

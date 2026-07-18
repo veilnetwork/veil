@@ -1866,6 +1866,7 @@ impl NodeRuntime {
             route_seen_set: Arc::clone(&shared_route_seen_set),
             announce_seq: Arc::clone(&shared_announce_seq),
             listen_transports: Arc::clone(&listen_transports),
+            own_external_addrs: Arc::new(std::sync::RwLock::new(vec![])),
             relay_node_ids: build_relay_node_ids(&config),
             target_labels: build_target_labels(&config.routing),
             route_updated: Arc::clone(&shared_route_updated),

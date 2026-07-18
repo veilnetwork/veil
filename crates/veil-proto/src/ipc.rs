@@ -5459,6 +5459,123 @@ impl PnetStatusResultPayload {
     }
 }
 
+// ── ListenTransportsQuery / ListenTransportsResult ─────────────────────────
+
+/// Reply to [`crate::family::LocalAppMsg::ListenTransportsQuery`] — the
+/// daemon's current listener URIs.  After a server-reflexive NAT probe the
+/// dispatcher rewrites wildcard hosts (`0.0.0.0`) to the observed external
+/// IP, so an app can mine this list for its own external `ip:port`
+/// candidates (real-P2P epic, Stage B: direct-endpoint exchange).
+///
+/// Wire layout:
+/// ```text
+/// [0..2]  count u16 BE
+/// then per URI: u16 BE length + that many UTF-8 bytes
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListenTransportsResultPayload {
+    /// Listener URIs as the daemon currently advertises them.
+    pub uris: Vec<String>,
+}
+
+impl ListenTransportsResultPayload {
+    /// Cap mirrored by `decode` — a daemon has a handful of listeners, so
+    /// anything larger is a corrupt or hostile frame.
+    pub const MAX_URIS: usize = 64;
+    /// Per-URI byte cap (transport URIs are short; obfs4 with params stays
+    /// well under this).
+    pub const MAX_URI_LEN: usize = 512;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(2 + self.uris.iter().map(|u| 2 + u.len()).sum::<usize>());
+        let count = self.uris.len().min(Self::MAX_URIS) as u16;
+        buf.extend_from_slice(&count.to_be_bytes());
+        for uri in self.uris.iter().take(Self::MAX_URIS) {
+            let bytes = uri.as_bytes();
+            let len = bytes.len().min(Self::MAX_URI_LEN);
+            buf.extend_from_slice(&(len as u16).to_be_bytes());
+            buf.extend_from_slice(&bytes[..len]);
+        }
+        buf
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < 2 {
+            return Err(ProtoError::BufferTooShort {
+                need: 2,
+                got: buf.len(),
+            });
+        }
+        let count = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        if count > Self::MAX_URIS {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::MAX_URIS,
+                got: count,
+            });
+        }
+        let mut uris = Vec::with_capacity(count);
+        let mut off = 2usize;
+        for _ in 0..count {
+            if buf.len() < off + 2 {
+                return Err(ProtoError::BufferTooShort {
+                    need: off + 2,
+                    got: buf.len(),
+                });
+            }
+            let len = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
+            off += 2;
+            if len > Self::MAX_URI_LEN || buf.len() < off + len {
+                return Err(ProtoError::BufferTooShort {
+                    need: off + len.min(Self::MAX_URI_LEN),
+                    got: buf.len(),
+                });
+            }
+            let uri = std::str::from_utf8(&buf[off..off + len])
+                .map_err(|_| ProtoError::BufferTooShort { need: len, got: 0 })?
+                .to_owned();
+            off += len;
+            uris.push(uri);
+        }
+        Ok(Self { uris })
+    }
+}
+
+#[cfg(test)]
+mod listen_transports_payload_tests {
+    use super::ListenTransportsResultPayload;
+
+    #[test]
+    fn roundtrip() {
+        let p = ListenTransportsResultPayload {
+            uris: vec![
+                "tcp://203.0.113.7:9000".into(),
+                "obfs4-tcp://0.0.0.0:5556".into(),
+            ],
+        };
+        let decoded = ListenTransportsResultPayload::decode(&p.encode()).unwrap();
+        assert_eq!(decoded, p);
+    }
+
+    #[test]
+    fn empty_roundtrip() {
+        let p = ListenTransportsResultPayload::default();
+        assert_eq!(
+            ListenTransportsResultPayload::decode(&p.encode()).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn rejects_truncated() {
+        let p = ListenTransportsResultPayload {
+            uris: vec!["tcp://192.0.2.1:1".into()],
+        };
+        let enc = p.encode();
+        assert!(ListenTransportsResultPayload::decode(&enc[..enc.len() - 1]).is_err());
+        assert!(ListenTransportsResultPayload::decode(&[]).is_err());
+    }
+}
+
 // ── Offline-mailbox seal/open (node-side E2E crypto, distinct from the
 //    MailboxPut/Fetch/Ack relay transport) ─────────────────────────────────────
 
