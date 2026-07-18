@@ -63,7 +63,7 @@ pub type MediaRecvFn = extern "C" fn(*mut c_void, *const u8, usize);
 /// first dispatch hits/misses per peer so a stand can attribute a dead leg.
 /// Compiled out of release builds entirely.
 #[cfg(debug_assertions)]
-fn diag(msg: std::fmt::Arguments<'_>) {
+pub(crate) fn diag(msg: std::fmt::Arguments<'_>) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -75,7 +75,7 @@ fn diag(msg: std::fmt::Arguments<'_>) {
 }
 
 #[cfg(not(debug_assertions))]
-fn diag(_msg: std::fmt::Arguments<'_>) {}
+pub(crate) fn diag(_msg: std::fmt::Arguments<'_>) {}
 
 struct RecvCb {
     cb: MediaRecvFn,
