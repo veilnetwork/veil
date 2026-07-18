@@ -2104,6 +2104,36 @@ pub unsafe extern "C" fn veil_connect(
         client: TokioMutex::new(client),
         pending_mailbox_fetch: StdMutex::new(None),
     });
+    // IPC keepalive. The daemon reaps an established IPC connection after
+    // IPC_SESSION_IDLE_TIMEOUT (15 min) of BIDIRECTIONAL silence (audit U3
+    // slow-loris defence), and this client has no transparent reconnect — a
+    // quiet FFI connection (the dedicated media client between calls) was
+    // silently dropped, after which every media operation failed with
+    // "connection closed" until process restart. On the stand that surfaced
+    // as a call with media dead in BOTH directions ~15 min after the
+    // previous one. Tick a cheap inline query at a third of the timeout so
+    // a live handle never ages out; errors are ignored (a genuinely dead
+    // connection surfaces at the next real call site). The task holds only
+    // a Weak — it must not keep the bundle (and thus the runtime) alive
+    // after the host releases the handle; it exits when the upgrade fails
+    // and dies with the runtime either way.
+    {
+        let weak = Arc::downgrade(&bundle);
+        bundle.runtime.spawn(async move {
+            const KEEPALIVE_TICK: std::time::Duration = std::time::Duration::from_secs(300);
+            loop {
+                tokio::time::sleep(KEEPALIVE_TICK).await;
+                let Some(bundle) = weak.upgrade() else {
+                    break;
+                };
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let client = bundle.client.lock().await;
+                    let _ = client.node_identity().await;
+                })
+                .await;
+            }
+        });
+    }
     HandleTable::insert(
         handle_table(),
         VeilHandle {
