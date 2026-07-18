@@ -174,6 +174,15 @@ int veil_media_engine_push_video_frame(VeilMediaEngine *engine,
                                        int stride_y, int stride_u, int stride_v,
                                        int64_t ts_us);
 
+/* Android Camera2 fast path: convert a strided YUV_420_888 frame (shared U/V
+ * pixel stride) to upright I420 with libyuv, then enqueue it directly. This
+ * keeps per-pixel de-striding/rotation out of Dart's capture isolate. Rotation
+ * is clockwise and must be 0/90/180/270. */
+int veil_media_engine_push_android420_frame(
+    VeilMediaEngine *engine, const uint8_t *y, const uint8_t *u,
+    const uint8_t *v, int width, int height, int stride_y, int stride_u,
+    int stride_v, int pixel_stride_uv, int rotation, int64_t ts_us);
+
 /* Pull the latest decoded remote frame as tightly-packed RGBA (width*height*4
  * bytes, row stride width*4). Copies into `dst` (capacity `dst_cap`) and sets
  * *out_w / *out_h. Returns a monotonic frame sequence (>0) when a frame was
