@@ -330,6 +330,42 @@ Uint8List _nodeIdWorker(int handleAddr) {
   }
 }
 
+/// Off-isolate body of [VeilClient.peerPnetStatus]. Bounded at 2 s natively,
+/// but the shared client mutex can hold it for that whole window — keep it off
+/// the UI thread.
+({bool admitted, bool hasCert}) _peerPnetStatusWorker(
+  int handleAddr,
+  Uint8List peerNodeId,
+) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final peerC = calloc<Uint8>(32);
+  final outAdmitted = calloc<Uint8>();
+  final outHasCert = calloc<Uint8>();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    peerC.asTypedList(32).setAll(0, peerNodeId);
+    final rc = ffi.veilPeerPnetStatus(
+      handle,
+      peerC,
+      outAdmitted,
+      outHasCert,
+      errOut,
+    );
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'peer_pnet_status failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+    return (admitted: outAdmitted.value != 0, hasCert: outHasCert.value != 0);
+  } finally {
+    calloc.free(peerC);
+    calloc.free(outAdmitted);
+    calloc.free(outHasCert);
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate body of [VeilClient.acceptAnonStream]. Null on timeout; throws on
 /// a fatal error; else the stream address + the initiator's node id + onion-
 /// stream app id.
@@ -1372,6 +1408,27 @@ class VeilClient implements Finalizable {
       peerNodeId: result.peerNodeId,
       detail: result.detail,
     );
+  }
+
+  /// Query the daemon's P-Net/session status for [peerNodeId] (32 bytes):
+  /// `admitted` == true iff the node currently holds a live, handshaked
+  /// direct session to that peer — the same authoritative gate the direct
+  /// media-channel open enforces. Poll this after redeeming a direct-dial
+  /// bootstrap URI to learn when the P2P session is actually up.
+  ///
+  /// The native call is bounded at 2 s but still blocks its thread on the
+  /// shared client mutex, so it runs off-isolate like [joinBootstrapUri].
+  Future<({bool admitted, bool hasCert})> peerPnetStatus(
+    Uint8List peerNodeId,
+  ) async {
+    _ensureOpen();
+    if (peerNodeId.length != 32) {
+      throw ArgumentError.value(
+          peerNodeId.length, 'peerNodeId', 'must be 32 bytes');
+    }
+    final handleAddr = _handle.address;
+    final peerCopy = Uint8List.fromList(peerNodeId);
+    return Isolate.run(() => _peerPnetStatusWorker(handleAddr, peerCopy));
   }
 
   /// Ask the daemon to assemble a bootstrap-invite URI from its own

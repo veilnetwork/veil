@@ -5655,6 +5655,75 @@ pub unsafe extern "C" fn veil_join_bootstrap_uri(
     }
 }
 
+/// Query the daemon's P-Net/session status for a peer (P2P direct-session
+/// epic). `out_admitted` = 1 iff the node currently holds a live, handshaked
+/// direct session to `peer_node_id_32` — the same authoritative gate
+/// `veil_media_open_direct_channel` enforces, exposed so the host can (a) poll
+/// for a just-dialed direct session to come up and (b) decide p2p-vs-relay
+/// BEFORE committing a call route. `out_has_cert` = 1 iff a MembershipCert was
+/// verified for that peer at handshake (P-Net deployments; 0 in public mode).
+///
+/// Bounded at 2 s (covers a busy shared-client mutex — same rationale as the
+/// media-open probe); a timeout returns `VEIL_ERR` with `err_out` set.
+///
+/// # Safety
+/// `handle` must be a live connect handle; `peer_node_id_32` must point to 32
+/// readable bytes; `out_admitted`/`out_has_cert` must be writable; `err_out`
+/// (if non-null) must be a writable `*mut c_char` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_peer_pnet_status(
+    handle: *mut VeilHandle,
+    peer_node_id_32: *const u8,
+    out_admitted: *mut u8,
+    out_has_cert: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_peer_pnet_status") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "peer_node_id_32" => peer_node_id_32,
+        "out_admitted" => out_admitted,
+        "out_has_cert" => out_has_cert,
+    );
+    let mut peer = [0u8; 32];
+    unsafe { ptr::copy_nonoverlapping(peer_node_id_32, peer.as_mut_ptr(), 32) };
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&handle_live.bundle);
+    let res = bundle.runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let client = bundle.client.lock().await;
+            client.peer_pnet_status(&peer).await
+        })
+        .await
+    });
+    match res {
+        Ok(Ok(status)) => {
+            unsafe {
+                *out_admitted = u8::from(status.admitted);
+                *out_has_cert = u8::from(status.has_cert);
+            }
+            VEIL_OK
+        }
+        Ok(Err(e)) => {
+            unsafe { write_err(err_out, format!("pnet_status failed: {e}")) };
+            VEIL_ERR
+        }
+        Err(_) => {
+            unsafe { write_err(err_out, "pnet_status timed out (2s)") };
+            VEIL_ERR
+        }
+    }
+}
+
 /// Create-bootstrap-invite status codes (Epic 489.7 generator side).
 /// Mirror `veil_proto::create_invite_status`.
 pub const VEIL_CREATE_INVITE_OK: u8 = 0;
