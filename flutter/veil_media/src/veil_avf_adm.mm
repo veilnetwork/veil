@@ -206,35 +206,50 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     if (engine_ == nil) return;
     if (engine_.isRunning) [engine_ stop];
 
-    AVAudioInputNode* input = engine_.inputNode;
-    [input removeTapOnBus:0];
+    // `engine_.inputNode` is not a harmless getter on macOS: while microphone
+    // access is still undetermined it may synchronously bind the HAL input
+    // device and wedge inside CoreAudio. That used to strand engine_queue_ and
+    // make the later StopRecording dispatch_sync freeze the entire Flutter UI.
+    // Only touch the input graph after TCC is explicitly authorized, or when
+    // removing a tap we know was installed earlier.
+    if (capture_tap_installed_) {
+      @try {
+        [engine_.inputNode removeTapOnBus:0];
+      } @catch (NSException* e) {
+        alog("avf_adm: removeTapOnBus threw (%s)",
+             e.reason.UTF8String ? e.reason.UTF8String : "?");
+      }
+      capture_tap_installed_ = false;
+    }
     if (recording_.load()) {
       AVAuthorizationStatus mic_auth =
           [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
       alog("avf_adm: mic auth=%ld (0=notDetermined 2=denied 3=authorized)",
            (long)mic_auth);
-      // Only attempt mic capture when it can actually work: authorization must
-      // not be denied/restricted (a denied mic makes installTapOnBus throw or
-      // deliver silence) and the input node must report a usable format.
-      const bool mic_ok = (mic_auth != AVAuthorizationStatusDenied &&
-                           mic_auth != AVAuthorizationStatusRestricted);
-      AVAudioFormat* tap_fmt = [input outputFormatForBus:0];
-      if (mic_ok && tap_fmt.sampleRate > 0 && tap_fmt.channelCount > 0) {
-        int16_format_ = [[AVAudioFormat alloc]
-            initWithCommonFormat:AVAudioPCMFormatInt16
-                      sampleRate:kSampleRate
-                        channels:(AVAudioChannelCount)kChannels
-                     interleaved:YES];
-        capture_converter_ = [[AVAudioConverter alloc] initFromFormat:tap_fmt
-                                                             toFormat:int16_format_];
-        const double ratio = (double)kSampleRate / tap_fmt.sampleRate;
-        InstallCaptureTapLocked(input, tap_fmt, ratio);
-      } else if (!mic_ok) {
+      // `notDetermined` is not usable permission: requesting input in that
+      // state is exactly the blocking HAL path above. Stay playout-only until
+      // the user grants access; a later media start/reconfigure will attach it.
+      if (mic_auth == AVAuthorizationStatusAuthorized) {
+        AVAudioInputNode* input = engine_.inputNode;
+        AVAudioFormat* tap_fmt = [input outputFormatForBus:0];
+        if (tap_fmt.sampleRate <= 0 || tap_fmt.channelCount <= 0) {
+          alog("avf_adm: input format not ready (sr=%.0f ch=%u)",
+               tap_fmt.sampleRate, (unsigned)tap_fmt.channelCount);
+        } else {
+          int16_format_ = [[AVAudioFormat alloc]
+              initWithCommonFormat:AVAudioPCMFormatInt16
+                        sampleRate:kSampleRate
+                          channels:(AVAudioChannelCount)kChannels
+                       interleaved:YES];
+          capture_converter_ =
+              [[AVAudioConverter alloc] initFromFormat:tap_fmt
+                                              toFormat:int16_format_];
+          const double ratio = (double)kSampleRate / tap_fmt.sampleRate;
+          InstallCaptureTapLocked(input, tap_fmt, ratio);
+        }
+      } else {
         alog("avf_adm: mic not authorized (auth=%ld) — playout only, no capture",
              (long)mic_auth);
-      } else {
-        alog("avf_adm: input format not ready (sr=%.0f ch=%u) — mic ungranted?",
-             tap_fmt.sampleRate, (unsigned)tap_fmt.channelCount);
       }
     }
 
@@ -277,10 +292,12 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                        block:^(AVAudioPCMBuffer* buffer, AVAudioTime* /*when*/) {
                          self->OnCaptureBuffer(buffer, ratio);
                        }];
+      capture_tap_installed_ = true;
     } @catch (NSException* e) {
       alog("avf_adm: installTapOnBus threw (%s) — skipping mic capture",
            e.reason.UTF8String ? e.reason.UTF8String : "?");
       capture_converter_ = nil;
+      capture_tap_installed_ = false;
     }
   }
 
@@ -417,7 +434,15 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   void TeardownEngineLocked() {
     if (engine_ == nil) return;
     if (engine_.isRunning) [engine_ stop];
-    [engine_.inputNode removeTapOnBus:0];
+    if (capture_tap_installed_) {
+      @try {
+        [engine_.inputNode removeTapOnBus:0];
+      } @catch (NSException* e) {
+        alog("avf_adm: teardown removeTap threw (%s)",
+             e.reason.UTF8String ? e.reason.UTF8String : "?");
+      }
+      capture_tap_installed_ = false;
+    }
     engine_ = nil;
     source_node_ = nil;
     capture_converter_ = nil;
@@ -453,6 +478,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   AVAudioSourceNode* source_node_ = nil;
   AVAudioConverter* capture_converter_ = nil;
   AVAudioFormat* int16_format_ = nil;
+  bool capture_tap_installed_ = false;
 };
 
 }  // namespace
