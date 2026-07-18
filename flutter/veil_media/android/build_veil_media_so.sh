@@ -5,7 +5,8 @@
 #
 # Produces a self-contained .so: the veil call media engine (engine.cc) + the
 # webrtc::Transport shim + the AAudio ADM (veil_aaudio_adm.cc) + a codec-stripped
-# libwebrtc, all statically linked, exporting ONLY the veil_media_* extern-C ABI.
+# libwebrtc, all statically linked, exporting the veil_media_* extern-C ABI and
+# the app-owned Camera2 JNI entry point.
 # veil_media_send_datagram / veil_media_set_recv_callback stay undefined and
 # resolve at runtime from libveilclient_ffi.so in the host process (both .so's
 # live in the APK; see the Android integration notes in BUILD-INTEGRATION.md for
@@ -58,9 +59,14 @@ compile_tu "$SRCDIR/veil_audio_record.cc" "$TMP/record.o"
 compile_tu "$SRCDIR/veil_audio_play.cc"   "$TMP/play.o"
 compile_tu "$SRCDIR/veil_video_note.cc"   "$TMP/vnote.o"
 
-# ELF export control: only veil_media_* global.
+# ELF export control: public control ABI plus the direct Camera2 frame bridge.
 cat > "$TMP/exports.map" <<'MAP'
-{ global: veil_media_*; local: *; };
+{
+  global:
+    veil_media_*;
+    Java_network_veil_xveil_NativeCallCamera_*;
+  local: *;
+};
 MAP
 
 cd "$WEBRTC_SRC/$WEBRTC_OUT"
