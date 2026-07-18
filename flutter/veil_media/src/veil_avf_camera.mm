@@ -188,13 +188,31 @@ class AvfCameraCapturer : public CameraCapturer {
 
   void Stop() override {
     @autoreleasepool {
-      if (delegate_) delegate_->cb_ = nullptr;  // stop delivering before teardown
       AVCaptureSession* session = session_;
       AVCaptureVideoDataOutput* output = output_;
+      VeilCamDelegate* delegate = delegate_;
+      dispatch_queue_t q = queue_;
       session_ = nil;
       output_ = nil;
       delegate_ = nil;
       queue_ = nil;
+      // Clear the frame callback ON the capture queue, synchronously. The
+      // delegate fires on that serial queue; the old off-queue clear raced an
+      // in-flight captureOutput: between its `if (!cb_)` entry check and the
+      // actual invoke — a hangup-time teardown crashed the app with SIGSEGV
+      // at 0x0 inside captureOutput: (and could equally call into a frame
+      // sink the engine was already destroying). After this dispatch_sync
+      // returns, no callback is mid-flight and none will fire again, so the
+      // caller may safely tear down the sink. Stop() runs on engine/FFI
+      // threads, never on the capture queue itself, so the sync can't
+      // deadlock.
+      if (delegate != nil && q != nil) {
+        dispatch_sync(q, ^{
+          delegate->cb_ = nullptr;
+        });
+      } else if (delegate != nil) {
+        delegate->cb_ = nullptr;
+      }
       if (session) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
           @autoreleasepool {
