@@ -16,7 +16,10 @@
 
 #include "veil_camera.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "third_party/libyuv/include/libyuv/convert.h"  // NV12ToI420
@@ -102,7 +105,6 @@ class AvfCameraCapturer : public CameraCapturer {
 
   bool Start(int width, int height, int fps) override {
     (void)height;
-    (void)fps;
     if (session_) return true;
     @autoreleasepool {
       // Find a video capture device. macOS needs explicit discovery on some
@@ -167,6 +169,34 @@ class AvfCameraCapturer : public CameraCapturer {
       [out setSampleBufferDelegate:delegate queue:q];
       if ([session canAddOutput:out]) [session addOutput:out];
       [session commitConfiguration];
+
+      // AVCaptureSession's preset controls resolution but not cadence. Honour
+      // the route profile by selecting the closest rate supported by the
+      // active format (for example 60 when available, otherwise 30) instead of
+      // silently using the platform default.
+      NSError* rate_err = nil;
+      if (fps > 0 && [dev lockForConfiguration:&rate_err]) {
+        double best_rate = 0.0;
+        double best_distance = std::numeric_limits<double>::max();
+        for (AVFrameRateRange* range in
+             dev.activeFormat.videoSupportedFrameRateRanges) {
+          const double candidate =
+              std::min(std::max((double)fps, range.minFrameRate),
+                       range.maxFrameRate);
+          const double distance = std::abs(candidate - (double)fps);
+          if (distance < best_distance) {
+            best_rate = candidate;
+            best_distance = distance;
+          }
+        }
+        if (best_rate > 0.0) {
+          const CMTime duration =
+              CMTimeMake(1000, (int32_t)std::lround(best_rate * 1000.0));
+          dev.activeVideoMinFrameDuration = duration;
+          dev.activeVideoMaxFrameDuration = duration;
+        }
+        [dev unlockForConfiguration];
+      }
       session_ = session;
       output_ = out;
       delegate_ = delegate;

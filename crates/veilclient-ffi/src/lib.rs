@@ -766,13 +766,16 @@ const MEDIA_TX_VIDEO_QUEUE: usize = 64;
 #[cfg(feature = "node-embedded")]
 const MEDIA_TX_BURST_MAX: usize = 32;
 
-/// At 20 fps the queued portion is at most ~200 ms of complete video. Including
-/// the frame currently being drained and the in-progress assembler, pathological
-/// output remains bounded to ~3 MiB per channel. Ordinary 640x360 VP8 frames are
-/// much smaller; the cap keeps malformed/self-buggy output from turning the
+/// Sixteen frames absorb a keyframe drain plus roughly 500 ms of 30 fps camera
+/// output. Four frames were only ~130 ms after the direct profile moved above
+/// 20 fps: the relay queue then dropped whole VP8 inter-frames while draining a
+/// keyframe, and the receiver froze until the next keyframe. Including the
+/// frame currently being drained and the in-progress assembler, pathological
+/// output remains bounded to ~3 MiB per channel. Ordinary 640x360 VP8 frames
+/// are much smaller; the cap keeps malformed/self-buggy output from turning the
 /// realtime path into an allocator sink.
 #[cfg(feature = "node-embedded")]
-const RELAY_VIDEO_FRAME_QUEUE: usize = 4;
+const RELAY_VIDEO_FRAME_QUEUE: usize = 16;
 #[cfg(feature = "node-embedded")]
 const RELAY_VIDEO_FRAME_MAX_PACKETS: usize = 512;
 #[cfg(feature = "node-embedded")]
