@@ -189,12 +189,44 @@ impl BootstrapJoinSink for BootstrapJoinForwarder {
         };
         let already_known = st.peers.values().any(|entry| entry.node_id == node_id);
         if already_known {
+            // P2P direct-session epic: a repeated join for a known peer is a
+            // REFRESH, not a no-op. The caller (endpoint exchange, network
+            // change) may carry a NEW dial address, and the previous session
+            // may be long gone — so update the stored transport (app-added
+            // entries only; a configured peer's address belongs to its config)
+            // and re-enqueue a dial. Idempotence is preserved downstream: the
+            // connector's per-node-id slot claim silently no-ops when a
+            // reconnect loop is already alive, and its `has_session` pre-check
+            // skips dialing a peer whose session is up.
+            let refreshed = st
+                .peers
+                .values_mut()
+                .find(|entry| entry.node_id == node_id)
+                .filter(|entry| entry.peer_id.get() >= APP_ADDED_PEER_ID_BASE)
+                .map(|entry| {
+                    entry.transport = peer.transport.clone();
+                    entry.tls_cert = peer.tls_cert.clone();
+                    entry.tls_ca_cert = peer.tls_ca_cert.clone();
+                    entry.clone()
+                });
+            drop(st);
+            let mut redialed = false;
+            if let Some(entry) = refreshed {
+                // Keep the DHT contact's address current too (add_contact
+                // updates in place for a known node_id).
+                self.dht.add_contact(veil_dht::routing::Contact::new(
+                    node_id_bytes,
+                    &entry.transport,
+                ));
+                redialed = self.dial_tx.try_send(entry).is_ok();
+            }
             self.logger.info(
                 "ipc.bootstrap_join.already_known",
                 format!(
-                    "node_id={} transport={}",
+                    "node_id={} transport={} redialed={}",
                     veil_util::hex_short(&node_id_bytes),
                     veil_util::redact_addr_for_log(&peer.transport),
+                    redialed,
                 ),
             );
             return BootstrapJoinOutcome::AlreadyRegistered {
@@ -348,5 +380,58 @@ mod tests {
                 .any(|e| e.transport == "tcp://10.9.8.7:9000"),
             "peer must be registered in state.peers",
         );
+    }
+
+    /// P2P direct-session epic: joining the SAME peer again with a NEW
+    /// transport (endpoint exchange after a network change) must refresh the
+    /// stored dial address and enqueue a fresh dial — not silently no-op.
+    #[test]
+    fn repeat_join_refreshes_transport_and_redials() {
+        let kp = veil_crypto::generate_keypair(veil_cfg::SignatureAlgorithm::Ed25519);
+        let mk = |transport: &str| BootstrapPeer {
+            transport: transport.to_owned(),
+            public_key: kp.public_key.clone(),
+            nonce: "AAAAAAAA".to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        };
+        let uri_a = veil_bootstrap::encode_bootstrap_uri(&mk("tcp://192.168.1.70:9000")).unwrap();
+        let uri_b = veil_bootstrap::encode_bootstrap_uri(&mk("tcp://192.168.0.11:9000")).unwrap();
+
+        let state = empty_state();
+        let dht = Arc::new(veil_dht::KademliaService::new([7u8; 32]));
+        let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel(8);
+        let forwarder = BootstrapJoinForwarder::new(
+            Arc::new(NodeLogger::new_noop()),
+            Arc::clone(&state),
+            dht,
+            dial_tx,
+        );
+
+        assert!(matches!(
+            forwarder.join_uri(&uri_a, None, None),
+            BootstrapJoinOutcome::Ok { .. }
+        ));
+        let first = dial_rx.try_recv().expect("first join enqueues a dial");
+        assert_eq!(first.transport, "tcp://192.168.1.70:9000");
+
+        let outcome = forwarder.join_uri(&uri_b, None, None);
+        assert!(
+            matches!(outcome, BootstrapJoinOutcome::AlreadyRegistered { .. }),
+            "second join stays AlreadyRegistered, got {outcome:?}",
+        );
+        // The stored entry now carries the new address...
+        let st = state.lock().unwrap();
+        assert!(
+            st.peers
+                .values()
+                .any(|e| e.transport == "tcp://192.168.0.11:9000"),
+            "entry transport must be refreshed",
+        );
+        drop(st);
+        // ...and a re-dial was enqueued for it.
+        let redial = dial_rx.try_recv().expect("repeat join must re-enqueue a dial");
+        assert_eq!(redial.transport, "tcp://192.168.0.11:9000");
     }
 }

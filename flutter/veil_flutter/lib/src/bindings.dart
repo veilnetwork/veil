@@ -1267,6 +1267,24 @@ int veilJoinBootstrapUri(
         outStatus,
         errOut);
 
+final int Function(
+  Pointer<VeilHandle>,
+  Pointer<Uint8>, // peer_node_id_32
+  Pointer<Uint8>, // out_admitted
+  Pointer<Uint8>, // out_has_cert
+  Pointer<Pointer<Utf8>>,
+) veilPeerPnetStatus = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilHandle>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_peer_pnet_status')
+    .asFunction();
+
 // ── Mailbox (Epic 489.3) ────────────────────────────────────────────────────
 
 // MailboxPutStatus wire bytes (veil_proto::MailboxPutStatus).
