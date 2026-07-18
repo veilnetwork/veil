@@ -38,6 +38,7 @@
 #include "api/environment/environment.h"
 #include "api/environment/environment_factory.h"
 #include "api/media_types.h"
+#include "api/make_ref_counted.h"
 #include "api/rtp_header_extension_id.h"
 #include "api/rtp_headers.h"
 #include "api/rtp_parameters.h"
@@ -67,6 +68,7 @@
 #include "api/video_codecs/video_decoder_factory_template_libvpx_vp8_adapter.h"
 #include "api/video/builtin_video_bitrate_allocator_factory.h"
 #include "api/video_codecs/sdp_video_format.h"
+#include "api/video_codecs/video_encoder.h"
 #include "api/video/video_codec_type.h"
 #include "api/video/video_frame.h"
 #include "api/video/i420_buffer.h"
@@ -95,6 +97,21 @@ namespace {
 
 const char* kVersion = "veil_media 0.0.3 (group-video)";
 constexpr int kOpusPayloadType = 111;  // SDP convention (Opus, 48k, stereo)
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+constexpr int kVideoNackHistoryMs = 1000;
+constexpr int kVp8KeyFrameIntervalFrames = 60;
+
+webrtc::scoped_refptr<
+    webrtc::VideoEncoderConfig::EncoderSpecificSettings>
+resilient_vp8_settings() {
+  webrtc::VideoCodecVP8 vp8 = webrtc::VideoEncoder::GetDefaultVp8Settings();
+  // The default is 3000 frames (50-100 seconds at call rates). A single lost
+  // inter-frame then left the receiver frozen until that very distant keyframe.
+  vp8.keyFrameInterval = kVp8KeyFrameIntervalFrames;
+  return webrtc::make_ref_counted<
+      webrtc::VideoEncoderConfig::Vp8EncoderSpecificSettings>(vp8);
+}
+#endif
 
 // Diagnostic log to a file (a GUI app's stderr is not captured by the unified
 // log). Best-effort; append.
@@ -258,13 +275,14 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   // -1 if dst_cap too small (out_w/out_h still set).
   int get_frame(uint8_t* dst, int dst_cap, int* out_w, int* out_h) {
     std::lock_guard<std::mutex> l(m_);
-    if (seq_ == 0 || w_ <= 0) return 0;
+    if (seq_ == 0 || seq_ == pulled_seq_ || w_ <= 0) return 0;
     if (out_w) *out_w = w_;
     if (out_h) *out_h = h_;
     const size_t need = static_cast<size_t>(w_) * h_ * 4;
     if (dst == nullptr || dst_cap < 0 || static_cast<size_t>(dst_cap) < need)
       return -1;
     std::memcpy(dst, rgba_.data(), need);
+    pulled_seq_ = seq_;
     return static_cast<int>(seq_);
   }
 
@@ -273,6 +291,7 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   std::vector<uint8_t> rgba_;  // latest frame, RGBA (guarded by m_)
   int w_ = 0, h_ = 0;
   uint32_t seq_ = 0;
+  uint32_t pulled_seq_ = 0;
 };
 
 // Copy a (possibly strided) I420 frame into the broadcaster (encoder source).
@@ -391,6 +410,7 @@ bool start_group_peer_video(GroupWebrtcState* ws, GroupPeerState* peer) {
   webrtc::VideoReceiveStreamInterface::Config rc(
       peer->shim.get(), ws->video_decoder_factory.get());
   rc.rtp.remote_ssrc = peer->video_ssrc;
+  rc.rtp.nack.rtp_history_ms = kVideoNackHistoryMs;
   rc.renderer = peer->video_sink.get();
   rc.decoders.emplace_back(webrtc::SdpVideoFormat::VP8(),
                            kGroupVp8PayloadType);
@@ -798,6 +818,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       sc.rtp.ssrcs = {local_ssrc};
       sc.rtp.payload_name = "VP8";
       sc.rtp.payload_type = kGroupVp8PayloadType;
+      sc.rtp.nack.rtp_history_ms = kVideoNackHistoryMs;
       sc.rtp.extensions.emplace_back(
           webrtc::RtpExtension::kTransportSequenceNumberUri,
           webrtc::RtpHeaderExtensionId(1));
@@ -814,6 +835,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       webrtc::VideoEncoderConfig ec;
       ec.codec_type = webrtc::kVideoCodecVP8;
       ec.video_format = webrtc::SdpVideoFormat::VP8();
+      ec.encoder_specific_settings = resilient_vp8_settings();
       ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
       ec.number_of_streams = 1;
       ec.max_bitrate_bps = bps;
@@ -1223,6 +1245,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       sc.rtp.ssrcs = {local_v};                            // NOTE: vector
       sc.rtp.payload_name = "VP8";
       sc.rtp.payload_type = kVp8Pt;
+      sc.rtp.nack.rtp_history_ms = kVideoNackHistoryMs;
       sc.rtp.extensions.emplace_back(
           webrtc::RtpExtension::kTransportSequenceNumberUri,
           webrtc::RtpHeaderExtensionId(1));  // TWCC, same id as audio
@@ -1239,7 +1262,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
         if (v > 0) kbps = v;
       }
       kbps = std::clamp(kbps, 30, 2500);
-      const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 5, 30);
+      const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 5, 60);
       const int bps = kbps * 1000;
       ws->video_target_bitrate_bps = bps;
       ws->video_max_fps = fps;
@@ -1267,6 +1290,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       webrtc::VideoEncoderConfig ec;
       ec.codec_type = webrtc::kVideoCodecVP8;
       ec.video_format = webrtc::SdpVideoFormat::VP8();
+      ec.encoder_specific_settings = resilient_vp8_settings();
       ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
       ec.number_of_streams = 1;
       ec.max_bitrate_bps = bps;
@@ -1294,6 +1318,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       webrtc::VideoReceiveStreamInterface::Config rc(
           ws->shim.get(), ws->video_decoder_factory.get());
       rc.rtp.remote_ssrc = remote_v;    // do NOT set local_ssrc (deprecated)
+      rc.rtp.nack.rtp_history_ms = kVideoNackHistoryMs;
       rc.renderer = ws->video_sink.get();
       rc.decoders.emplace_back(webrtc::SdpVideoFormat::VP8(), kVp8Pt);
       ws->video_recv_stream = ws->call->CreateVideoReceiveStream(std::move(rc));
@@ -1354,7 +1379,7 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
       if (v > 0) kbps = v;
     }
     kbps = std::clamp(kbps, 30, 2500);
-    const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 5, 30);
+    const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 5, 60);
     const int bps = kbps * 1000;
     if (bps == ws->video_target_bitrate_bps && fps == ws->video_max_fps) {
       rc = VEIL_MEDIA_OK;
@@ -1363,6 +1388,7 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
     webrtc::VideoEncoderConfig ec;
     ec.codec_type = webrtc::kVideoCodecVP8;
     ec.video_format = webrtc::SdpVideoFormat::VP8();
+    ec.encoder_specific_settings = resilient_vp8_settings();
     ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
     ec.number_of_streams = 1;
     ec.max_bitrate_bps = bps;
