@@ -583,6 +583,31 @@ impl<T: PnetStatusProvider + ?Sized> PnetStatusProvider for std::sync::Arc<T> {
     }
 }
 
+// ── ListenTransportsProvider ─────────────────────────────────────────
+
+/// Hook the IPC server calls when an app issues
+/// [`veil_proto::family::LocalAppMsg::ListenTransportsQuery`].
+///
+/// Implemented by the veil runtime with access to the dispatcher's
+/// `listen_transports` snapshot.  After a server-reflexive NAT probe the
+/// dispatcher rewrites wildcard hosts to the observed external IP, so an
+/// app can mine this list for its own external `ip:port` candidates
+/// (real-P2P epic, Stage B: direct-endpoint exchange).
+///
+/// Runs synchronously on the IPC dispatch task — implementations must
+/// avoid blocking; the typical pattern is a brief read-lock + clone.
+pub trait ListenTransportsProvider: Send + Sync {
+    /// Snapshot of the daemon's current listener URIs.
+    fn listen_transports(&self) -> Vec<String>;
+}
+
+/// `Arc<T>` proxy [`ListenTransportsProvider`].
+impl<T: ListenTransportsProvider + ?Sized> ListenTransportsProvider for std::sync::Arc<T> {
+    fn listen_transports(&self) -> Vec<String> {
+        (**self).listen_transports()
+    }
+}
+
 // ── Bootstrap-URI join sink ────────────────────────────────────
 
 /// Outcome of a bootstrap-URI join request, returned by

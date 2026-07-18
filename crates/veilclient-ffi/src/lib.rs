@@ -5788,6 +5788,75 @@ pub unsafe extern "C" fn veil_peer_pnet_status(
     }
 }
 
+/// Snapshot the daemon's current listener URIs (real-P2P epic, Stage B).
+/// After a server-reflexive NAT probe the daemon rewrites wildcard listener
+/// hosts (`0.0.0.0`) to the observed external IP, so the host can mine this
+/// list for its own external `ip:port` candidates when minting
+/// direct-endpoint URIs. Output is a newline-joined UTF-8 string in a
+/// caller-owned heap allocation returned through `out_uris` — caller MUST
+/// free it via [`veil_free_string`]. An empty list yields an empty string.
+///
+/// Bounded at 2 s (same rationale as the pnet-status probe); a timeout
+/// returns `VEIL_ERR` with `err_out` set.
+///
+/// # Safety
+/// `handle` must be a live connect handle; `out_uris` must be a writable
+/// `*mut c_char` slot; `err_out` (if non-null) must be a writable
+/// `*mut c_char` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_listen_transports(
+    handle: *mut VeilHandle,
+    out_uris: *mut *mut c_char,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_listen_transports") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle,
+        "out_uris" => out_uris,
+    );
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let bundle = Arc::clone(&handle_live.bundle);
+    let res = bundle.runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let client = bundle.client.lock().await;
+            client.listen_transports().await
+        })
+        .await
+    });
+    match res {
+        Ok(Ok(uris)) => {
+            let joined = uris.join("\n");
+            match std::ffi::CString::new(joined) {
+                Ok(c) => {
+                    unsafe { *out_uris = c.into_raw() };
+                    VEIL_OK
+                }
+                Err(_) => {
+                    unsafe { write_err(err_out, "listen transports contain NUL") };
+                    VEIL_ERR
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            unsafe { write_err(err_out, format!("listen_transports failed: {e}")) };
+            VEIL_ERR
+        }
+        Err(_) => {
+            unsafe { write_err(err_out, "listen_transports timed out (2s)") };
+            VEIL_ERR
+        }
+    }
+}
+
 /// Create-bootstrap-invite status codes (Epic 489.7 generator side).
 /// Mirror `veil_proto::create_invite_status`.
 pub const VEIL_CREATE_INVITE_OK: u8 = 0;

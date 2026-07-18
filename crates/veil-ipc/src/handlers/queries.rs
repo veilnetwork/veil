@@ -146,6 +146,33 @@ pub(crate) async fn handle_get_peers(
     .await
 }
 
+/// `LocalAppMsg::ListenTransportsQuery` — reply with the daemon's current
+/// listener URI snapshot. Without a provider the reply is an empty list so
+/// apps can detect "feature not wired" cleanly. Shares the query
+/// token-bucket with the other query-class messages (silent drop on empty
+/// bucket — the rate limit must not become a probing oracle).
+pub(crate) async fn handle_listen_transports_query(
+    wh: &mut IpcWriteHalf,
+    client_state: &mut IpcClientState,
+    listen_transports_provider: Option<&Arc<dyn crate::ListenTransportsProvider>>,
+) -> std::io::Result<()> {
+    if !client_state.allow_query() {
+        return Ok(());
+    }
+    let payload = veil_proto::ListenTransportsResultPayload {
+        uris: listen_transports_provider
+            .map(|p| p.listen_transports())
+            .unwrap_or_default(),
+    };
+    write_frame_wh(
+        wh,
+        FrameFamily::LocalApp as u8,
+        LocalAppMsg::ListenTransportsResult as u16,
+        &payload.encode(),
+    )
+    .await
+}
+
 pub(crate) async fn handle_pnet_status_query(
     wh: &mut IpcWriteHalf,
     body: &[u8],

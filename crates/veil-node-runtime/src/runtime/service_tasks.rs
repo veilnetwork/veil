@@ -1491,6 +1491,141 @@ impl NodeRuntime {
     /// to `route_miss_tx`. This task receives those destinations, floods a
     /// `ROUTE_REQUEST` to all connected peers, and retries delivery up to 3
     /// times with exponential backoff (500 ms → 1 s → 2 s).
+    /// Proactive server-reflexive (srflx) address probe — real-P2P epic,
+    /// Stage B.
+    ///
+    /// The dispatcher already implements the FULL receive side of the
+    /// pure STUN-echo protocol: a `NatProbeRequest` with the `[0; 32]`
+    /// sentinel target is answered with the observed source `ip:port` as
+    /// an SRFLX candidate, and the initiator's `NatProbeReply` handler
+    /// rewrites wildcard listen transports (`0.0.0.0` → observed external
+    /// IP). What was missing is any SENDER: the only production
+    /// `NatProbeRequest` site is the relay-mode signaling driver inside
+    /// `nat_fallback_dial`, which fires only after an outbound dial has
+    /// already failed. This task closes the gap: periodically fire one
+    /// sentinel echo at a connected peer with a PUBLIC remote address so
+    /// the node knows its own external address BEFORE it is needed
+    /// (direct-endpoint exchange mines `listen_transports` for it).
+    ///
+    /// Peer choice matters: probing a LAN peer would echo our PRIVATE
+    /// address, and the reply path would freeze the wildcard rewrite on
+    /// it (rewrites only touch wildcard hosts). Sessions without a
+    /// parseable public `remote_addr` are skipped.
+    ///
+    /// Fire-and-forget: no waiter is registered — the dispatcher's reply
+    /// handler does the listen-transport update on its own.
+    pub fn spawn_srflx_probe_task(&mut self) {
+        const SRFLX_PROBE_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+        const SRFLX_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+        let Some(shutdown_tx) = &self.shutdown_tx else {
+            return;
+        };
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let dispatcher = Arc::clone(&self.dispatcher);
+        let session_tx_registry = Arc::clone(&self.session_tx_registry);
+        let live_sessions = Arc::clone(&self.live_sessions);
+        let logger = Arc::clone(&self.logger);
+        let local_node_id = *self.identity.local_identity.node_id.as_bytes();
+        let handle = supervised_spawn(Arc::clone(&self.logger), "srflx_probe", async move {
+            fn is_public_ip(ip: &std::net::IpAddr) -> bool {
+                match ip {
+                    std::net::IpAddr::V4(v4) => {
+                        !(v4.is_loopback()
+                            || v4.is_private()
+                            || v4.is_link_local()
+                            || v4.is_unspecified()
+                            || v4.is_broadcast()
+                            || v4.is_documentation()
+                            // CGNAT shared space (100.64.0.0/10) — an echo
+                            // from there is another operator-NAT view, not
+                            // our internet-facing address.
+                            || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
+                    }
+                    std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified()),
+                }
+            }
+
+            // Let the startup dials land a session before the first probe.
+            tokio::select! {
+                Ok(_) = shutdown_rx.changed() => return,
+                _ = tokio::time::sleep(SRFLX_PROBE_INITIAL_DELAY) => {}
+            }
+            let mut interval = tokio::time::interval(SRFLX_PROBE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                // Refresh every tick: `record_own_external_addr` rotates a
+                // CHANGED external IP (DHCP lease, network switch) in as the
+                // freshest observation, so periodic re-probing doubles as
+                // mobility tracking. One tiny control frame per interval.
+                let listen_snapshot = dispatcher.listen_transports_snapshot();
+                {
+                    let target = {
+                        let sessions = lock!(live_sessions);
+                        sessions.values().find_map(|s| {
+                            let node_id = s.node_id?;
+                            if node_id.as_bytes() == &local_node_id {
+                                return None;
+                            }
+                            let addr: std::net::SocketAddr =
+                                s.remote_addr.as_deref()?.parse().ok()?;
+                            is_public_ip(&addr.ip()).then_some(*node_id.as_bytes())
+                        })
+                    };
+                    if let Some(target_node_id) = target {
+                        use veil_proto::codec::encode_header;
+                        use veil_proto::control::NatProbeRequestPayload;
+                        use veil_proto::family::{ControlMsg, FrameFamily};
+                        use veil_proto::header::{FrameHeader, HEADER_SIZE};
+                        let session_token: u32 = {
+                            use rand_core::RngCore;
+                            rand_core::OsRng.next_u32()
+                        };
+                        let request = NatProbeRequestPayload {
+                            initiator_node_id: local_node_id,
+                            // `[0; 32]` sentinel = pure STUN echo: "tell me
+                            // what srflx address you see for me".
+                            target_node_id: [0u8; 32],
+                            session_token,
+                            candidates: veil_dispatcher::build_own_host_candidates(
+                                &listen_snapshot,
+                            ),
+                        };
+                        let body = request.encode();
+                        let mut hdr = FrameHeader::new(
+                            FrameFamily::Control as u8,
+                            ControlMsg::NatProbeRequest as u16,
+                        );
+                        hdr.body_len = body.len() as u32;
+                        let mut frame = Vec::with_capacity(HEADER_SIZE + body.len());
+                        frame.extend_from_slice(&encode_header(&hdr));
+                        frame.extend_from_slice(&body);
+                        let sent = rlock!(session_tx_registry).send_to(
+                            &target_node_id,
+                            veil_proto::header::priority::BACKGROUND,
+                            frame,
+                        );
+                        if sent {
+                            logger.debug(
+                                "nat.srflx_probe.sent",
+                                format!(
+                                    "target={} session_token=0x{session_token:08x}",
+                                    veil_util::hex_short(&target_node_id),
+                                ),
+                            );
+                        }
+                    }
+                }
+                tokio::select! {
+                    Ok(_) = shutdown_rx.changed() => break,
+                    _ = interval.tick() => {}
+                }
+            }
+        });
+        lock_tasks(&self.tasks).background.push(handle);
+    }
+
     ///
     /// on route discovery success the handler used to drain a
     /// mailbox for that destination; with mailbox removed it now simply
@@ -2137,6 +2272,31 @@ impl NodeRuntime {
                 Arc::clone(&self.live_sessions),
             ));
         server = server.with_pnet_status_provider(pnet_status);
+        // Listen-transports provider — surfaces the dispatcher's listener
+        // snapshot (wildcard hosts rewritten to the observed external IP
+        // after a server-reflexive NAT probe) so apps can mine their own
+        // external ip:port candidates for direct-endpoint exchange
+        // (real-P2P epic, Stage B). Cheap read-lock + clone.
+        struct DispatcherListenTransports(Arc<veil_dispatcher::FrameDispatcher>);
+        impl veil_ipc::ListenTransportsProvider for DispatcherListenTransports {
+            fn listen_transports(&self) -> Vec<String> {
+                // Advertisable listeners first, then the raw srflx
+                // observations as `srflx://ip:port` pseudo-URIs (the
+                // observed PORT is the probe session's mapping, not a
+                // listener port — consumers substitute their own).
+                let mut out = self.0.listen_transports_snapshot();
+                out.extend(
+                    self.0
+                        .own_external_addrs_snapshot()
+                        .into_iter()
+                        .map(|a| format!("srflx://{a}")),
+                );
+                out
+            }
+        }
+        let listen_transports: Arc<dyn veil_ipc::ListenTransportsProvider> =
+            Arc::new(DispatcherListenTransports(Arc::clone(&self.dispatcher)));
+        server = server.with_listen_transports_provider(listen_transports);
         // bootstrap-URI join sink — handles `JoinBootstrapUri`
         // requests by decoding the URI and registering the resulting
         // peer for outbound dial. Critical for Flutter onboarding —

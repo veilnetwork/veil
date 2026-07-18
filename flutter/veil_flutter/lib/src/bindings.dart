@@ -1285,6 +1285,20 @@ final int Function(
             )>>('veil_peer_pnet_status')
     .asFunction();
 
+final int Function(
+  Pointer<VeilHandle>,
+  Pointer<Pointer<Utf8>>, // out_uris (newline-joined; free via veilFreeString)
+  Pointer<Pointer<Utf8>>,
+) veilListenTransports = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilHandle>,
+              Pointer<Pointer<Utf8>>,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_listen_transports')
+    .asFunction();
+
 // ── Mailbox (Epic 489.3) ────────────────────────────────────────────────────
 
 // MailboxPutStatus wire bytes (veil_proto::MailboxPutStatus).
