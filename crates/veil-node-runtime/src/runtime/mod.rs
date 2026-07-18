@@ -4789,11 +4789,7 @@ impl NodeServices {
         // PoW `local_identity`. A legacy (node_id-keyed) node has no sovereign
         // identity and never publishes a name, so it always falls through to
         // remote quorum.
-        let our_sovereign_id = self
-            .identity
-            .sovereign_identity
-            .get()
-            .map(|s| *s.node_id());
+        let our_sovereign_id = self.identity.sovereign_identity.get().map(|s| *s.node_id());
         // A name WE published is locally authoritative and needs NO remote
         // corroboration: quorum exists to stop a sybil forging a claim for
         // SOMEONE ELSE's name, but a NameClaim can only bind a name to the
@@ -5659,7 +5655,10 @@ pub fn spawn_inbound_session(
             // had a TOCTOU window between dup-check and registration.
             let is_referral = session.referral;
             let outbox_rx = session.reserved_outbox_rx;
-            let rpc_rx = inbound.runtime.session_outbox.register(peer_id);
+            let rpc_rx = inbound
+                .runtime
+                .session_outbox
+                .register_owned(peer_id, session_id);
             let mut runner = veil_session::runner::SessionRunner {
                 stream: session.stream,
                 peer_id: *peer_id.as_bytes(),
@@ -5816,8 +5815,12 @@ pub fn spawn_inbound_session(
             // the closing peer and find a still-live channel that would
             // never be drained — frames silently dropped. New order
             // ensures the channel is gone before any close-handler runs.
-            wlock!(inbound.runtime.session_tx_registry).unregister(peer_id.as_bytes());
-            inbound.runtime.session_outbox.unregister(peer_id);
+            wlock!(inbound.runtime.session_tx_registry)
+                .unregister_owned(peer_id.as_bytes(), &session_id);
+            inbound
+                .runtime
+                .session_outbox
+                .unregister_owned(peer_id, &session_id);
             {
                 let mut generations = lock!(inbound.runtime.session_close_generations);
                 if generations.len() >= 4096 && !generations.contains_key(peer_id.as_bytes()) {
