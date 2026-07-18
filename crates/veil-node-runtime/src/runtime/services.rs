@@ -171,6 +171,7 @@ impl NodeRuntime {
                 config.routing.dht_fallback_enabled,
             ),
             S::Bootstrap => self.spawn_bootstrap_task(config),
+            S::SrflxProbe => self.spawn_srflx_probe_task(),
             S::BootstrapWatchdog => self.spawn_bootstrap_watchdog_task(config),
             S::SovereignIdentityRepublish => self.spawn_sovereign_identity_republish_task(),
             S::AuthDeliverHandler => self.spawn_auth_deliver_handler(),

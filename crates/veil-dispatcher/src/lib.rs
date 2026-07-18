@@ -825,6 +825,13 @@ pub struct FrameDispatcher {
     /// rewrite `0.0.0.0` / `::` hosts after the node learns its external IP
     /// from a `NatProbeReply`.
     pub listen_transports: Arc<RwLock<Vec<String>>>,
+    /// Own server-reflexive addresses learned from direct STUN-echo
+    /// `NatProbeReply`s (real-P2P epic, Stage B). `listen_transports` only
+    /// carries advertisable listeners (wildcard binds are excluded to keep
+    /// PEX clean), so the observed external address needs its own slot.
+    /// Most-recent observation first; bounded at
+    /// [`Self::MAX_OWN_EXTERNAL_ADDRS`].
+    pub own_external_addrs: Arc<RwLock<Vec<std::net::SocketAddr>>>,
     /// Relay node-ids advertised in `RouteResponsePayload.relay_ids`.
     ///
     /// Decoded from `ListenConfig.relay` entries at startup / reload.
@@ -1330,6 +1337,33 @@ impl FrameDispatcher {
         }
     }
 
+    /// Bound on [`Self::own_external_addrs`] — a node sits behind a handful
+    /// of NATs at most; anything larger is probe noise.
+    pub const MAX_OWN_EXTERNAL_ADDRS: usize = 4;
+
+    /// Record a server-reflexive observation of our own external address
+    /// (from a direct STUN-echo `NatProbeReply`). Most-recent first,
+    /// deduplicated, bounded — a changed external IP (DHCP lease, network
+    /// switch) rotates in as the freshest entry instead of being lost the
+    /// way the one-way wildcard rewrite loses it.
+    pub fn record_own_external_addr(&self, addr: std::net::SocketAddr) {
+        let mut slots = self
+            .own_external_addrs
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        slots.retain(|a| *a != addr);
+        slots.insert(0, addr);
+        slots.truncate(Self::MAX_OWN_EXTERNAL_ADDRS);
+    }
+
+    /// Snapshot of [`Self::own_external_addrs`] tolerating lock poisoning.
+    pub fn own_external_addrs_snapshot(&self) -> Vec<std::net::SocketAddr> {
+        self.own_external_addrs
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     /// Snapshot of `listen_transports` tolerating lock poisoning.
     ///
     /// `listen_transports` is read-mostly (populated at startup, occasionally
@@ -1777,6 +1811,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         route_origin_seq: Arc::new(Mutex::new(HashMap::new())),
         announce_seq: Arc::new(AtomicU32::new(0)),
         listen_transports: Arc::new(RwLock::new(vec![])),
+        own_external_addrs: Arc::new(RwLock::new(vec![])),
         relay_node_ids: vec![],
         target_labels: vec![],
         route_updated: Arc::new(Notify::new()),
@@ -2488,6 +2523,7 @@ mod tests {
             ))),
             announce_seq: Arc::new(AtomicU32::new(0)),
             listen_transports: Arc::new(RwLock::new(vec![])),
+            own_external_addrs: Arc::new(RwLock::new(vec![])),
             relay_node_ids: vec![],
             target_labels: vec![],
             route_updated: Arc::new(Notify::new()),
@@ -7054,5 +7090,26 @@ mod tests {
             map.remove(&peer_id);
             assert!(!map.contains_key(&peer_id));
         }
+    }
+
+    #[test]
+    fn own_external_addr_dedups_rotates_and_bounds() {
+        let dispatcher = make_test_dispatcher(NodeRole::Core);
+        let a1: std::net::SocketAddr = "203.0.113.1:1001".parse().unwrap();
+        let a2: std::net::SocketAddr = "203.0.113.2:1002".parse().unwrap();
+        dispatcher.record_own_external_addr(a1);
+        dispatcher.record_own_external_addr(a2);
+        // Freshest first; re-observation moves an addr back to the front
+        // instead of duplicating it.
+        dispatcher.record_own_external_addr(a1);
+        assert_eq!(dispatcher.own_external_addrs_snapshot(), vec![a1, a2]);
+        // Bounded: flooding distinct observations keeps only the newest.
+        for i in 0..10u8 {
+            dispatcher
+                .record_own_external_addr(format!("198.51.100.{i}:2000").parse().unwrap());
+        }
+        let snap = dispatcher.own_external_addrs_snapshot();
+        assert_eq!(snap.len(), FrameDispatcher::MAX_OWN_EXTERNAL_ADDRS);
+        assert_eq!(snap[0], "198.51.100.9:2000".parse().unwrap());
     }
 }

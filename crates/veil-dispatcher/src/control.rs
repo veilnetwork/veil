@@ -396,6 +396,13 @@ impl FrameDispatcher {
                                 let ip = addr.ip();
                                 if !ip.is_loopback() && !ip.is_unspecified() {
                                     self.update_wildcard_listen_addr(ip);
+                                    // real-P2P Stage B: `listen_transports`
+                                    // excludes wildcard binds entirely (PEX
+                                    // hygiene), so ALSO record the raw srflx
+                                    // observation in its own slot — the
+                                    // direct-endpoint exchange mines it for
+                                    // the external-address candidate.
+                                    self.record_own_external_addr(addr);
                                     break;
                                 }
                             }

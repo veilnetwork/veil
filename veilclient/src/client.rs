@@ -489,6 +489,10 @@ pub(crate) struct DispatchTable {
     /// S2.A: pending oneshot replies for `PnetStatusQuery`.
     pub pending_pnet_status:
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PnetStatus>)>,
+    /// pending oneshot replies for `ListenTransportsQuery` (real-P2P
+    /// epic, Stage B: external-address candidates for endpoint exchange).
+    pub pending_listen_transports:
+        std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<Vec<String>>)>,
     /// pending oneshot replies for `JoinBootstrapUri`.
     pub pending_bootstrap_join:
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<JoinBootstrapResult>)>,
@@ -670,6 +674,7 @@ impl DispatchTable {
             pending_node_identity: std::collections::VecDeque::new(),
             pending_peers_list: std::collections::VecDeque::new(),
             pending_pnet_status: std::collections::VecDeque::new(),
+            pending_listen_transports: std::collections::VecDeque::new(),
             pending_bootstrap_join: std::collections::VecDeque::new(),
             pending_create_invite: std::collections::VecDeque::new(),
             pending_mailbox_seal: std::collections::VecDeque::new(),
@@ -1814,6 +1819,32 @@ impl VeilClient {
         await_rpc_reply(rx, "pnet_status reply").await
     }
 
+    /// Snapshot the daemon's current listener URIs.
+    ///
+    /// After a server-reflexive NAT probe the daemon rewrites wildcard
+    /// listener hosts (`0.0.0.0`) to the observed external IP, so this is
+    /// how an app learns its own external `ip:port` candidates for
+    /// direct-endpoint exchange (real-P2P epic, Stage B). Returns an empty
+    /// list on daemons without the provider wired.
+    pub async fn listen_transports(&self) -> Result<Vec<String>, ClientError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_listen_transports);
+            if d.pending_listen_transports.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(format!(
+                    "listen_transports queue at cap ({MAX_PENDING_OPS}); daemon may be hung"
+                )));
+            }
+            d.pending_listen_transports.push_back((request_id, tx));
+        }
+        self.writer
+            .write_request_frame(LocalAppMsg::ListenTransportsQuery as u16, request_id, &[])
+            .await?;
+        await_rpc_reply(rx, "listen_transports reply").await
+    }
+
     /// Snapshot the daemon's current mobile/battery state.
     ///
     /// Returns the current background tier (Foreground/Active/LowPower)
@@ -2729,6 +2760,16 @@ async fn reader_task(
                     let mut d = dispatch.lock().await;
                     if let Some(tx) = take_pending(&mut d.pending_pnet_status, hdr.request_id) {
                         let _ = tx.send(status);
+                    }
+                }
+            }
+            LocalAppMsg::ListenTransportsResult => {
+                use veilcore::proto::ListenTransportsResultPayload;
+                if let Ok(p) = ListenTransportsResultPayload::decode(&body) {
+                    let mut d = dispatch.lock().await;
+                    if let Some(tx) = take_pending(&mut d.pending_listen_transports, hdr.request_id)
+                    {
+                        let _ = tx.send(p.uris);
                     }
                 }
             }
