@@ -65,6 +65,7 @@ cat > "$TMP/exports.map" <<'MAP'
   global:
     veil_media_*;
     Java_network_veil_xveil_NativeCallCamera_*;
+    Java_network_veil_xveil_NativeCallVideoRenderer_*;
   local: *;
 };
 MAP

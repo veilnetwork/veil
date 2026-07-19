@@ -52,6 +52,24 @@ typedef struct VeilApp VeilApp;
  */
 typedef void (*VeilMediaRecvFn)(void *ctx, const uint8_t *ptr, size_t len);
 
+/* Relay drain timing snapshot; all fields are u64 for a stable cross-ABI
+ * layout. Values are cumulative/maxima except `video_queue_depth`. */
+typedef struct VeilMediaChannelStats {
+    uint64_t video_frames_enqueued;
+    uint64_t video_frames_started;
+    uint64_t video_queue_depth;
+    uint64_t video_queue_max_depth;
+    uint64_t video_queue_age_max_ms;
+    uint64_t video_queue_holds_75ms;
+    uint64_t sender_lock_max_ms;
+    uint64_t sender_lock_holds_16ms;
+    uint64_t video_frame_ipc_max_ms;
+    uint64_t video_frame_ipc_holds_33ms;
+    uint64_t ipc_cell_max_ms;
+    uint64_t ipc_cell_holds_16ms;
+    uint64_t ipc_send_failures;
+} VeilMediaChannelStats;
+
 /*
  * Open a lossy MEDIA datagram channel to `peer_node_id` (32 bytes) over the
  * anonymous circuit. Reuses the reliable stream's rendezvous/pool and warms the
@@ -102,6 +120,11 @@ int veil_media_start_direct_receiver(VeilApp *app,
  *   -1  invalid argument (NULL/zero-length payload, or unknown `chan`)
  */
 int veil_media_send_datagram(uint64_t chan, const uint8_t *ptr, size_t len);
+
+/* Snapshot local relay queue/IPC timing. Direct/onion channels return zeros.
+ * Returns 0 on success or -1 for an invalid channel/output pointer. */
+int veil_media_channel_get_stats(uint64_t chan,
+                                 VeilMediaChannelStats *out);
 
 /*
  * Request a make-before-break refresh of an anonymous channel's outbound

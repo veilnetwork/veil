@@ -376,6 +376,7 @@ async fn idle_timeout_closes_silent_duplex_peer() {
     let (_silent_peer, server) = tokio::io::duplex(1 << 16);
     let mut runner = SessionRunner {
         stream: Box::new(server) as BoxIoStream,
+        quic_datagrams: None,
         peer_id,
         dispatcher: crate::node::session::dispatcher_sink::arc_sink(&dispatcher),
         logger: Arc::clone(&dispatcher.logger),
@@ -463,6 +464,7 @@ async fn run_chaos_iteration_inner(
 
     let mut runner = SessionRunner {
         stream: Box::new(server) as BoxIoStream,
+        quic_datagrams: None,
         peer_id,
         dispatcher: crate::node::session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -763,6 +765,7 @@ async fn run_chaos_iteration_lossy(
 
     let mut runner = SessionRunner {
         stream: Box::new(server) as BoxIoStream,
+        quic_datagrams: None,
         peer_id,
         dispatcher: crate::node::session::dispatcher_sink::arc_sink(&dispatcher),
         logger,
@@ -1160,6 +1163,7 @@ async fn run_p2p_iteration(seed: u64, ping_count: u64, bytes_threshold: u64) -> 
 
     let runner_a = SessionRunner {
         stream: Box::new(stream_a) as BoxIoStream,
+        quic_datagrams: None,
         peer_id: id_b,
         dispatcher: crate::node::session::dispatcher_sink::arc_sink(&dispatcher_a),
         logger: Arc::clone(&dispatcher_a.logger),
@@ -1211,6 +1215,7 @@ async fn run_p2p_iteration(seed: u64, ping_count: u64, bytes_threshold: u64) -> 
     };
     let runner_b = SessionRunner {
         stream: Box::new(stream_b) as BoxIoStream,
+        quic_datagrams: None,
         peer_id: id_a,
         dispatcher: crate::node::session::dispatcher_sink::arc_sink(&dispatcher_b),
         logger: Arc::clone(&dispatcher_b.logger),

@@ -29,10 +29,7 @@ use veil_obfs4::{
 use super::{
     TransportContext,
     error::{Result, TransportError},
-    tcp::{
-        boxed_stream_connection, clamp_downlink_mss, clamp_uplink_sndbuf, connect_tcp_stream,
-        peer_meta,
-    },
+    tcp::{boxed_stream_connection, configure_accepted_tcp, connect_tcp_stream, peer_meta},
     traits::{
         BoxIoStream, RawInbound, Transport, TransportCapabilities, TransportConnection,
         TransportListener,
@@ -138,6 +135,7 @@ impl Transport for Obfs4TcpTransport {
                 bind_uri: uri.clone(),
                 psk,
                 keepalive_idle: ctx.tcp.keepalive_idle,
+                nodelay: ctx.tcp.nodelay,
                 // Phase 2 kill-switch: snapshot the configured
                 // accept_variants list at bind time.  Operator changes
                 // (config reload) re-spawn the listener; in-flight
@@ -153,6 +151,7 @@ struct Obfs4TcpListener {
     bind_uri: TransportUri,
     psk: NodeIdMacKey,
     keepalive_idle: Option<std::time::Duration>,
+    nodelay: bool,
     /// Phase 2 kill-switch: variants accepted on this listener,
     /// in priority order.  First MAC verify wins.
     accept_variants: Vec<WireFormatVariant>,
@@ -162,12 +161,10 @@ impl TransportListener for Obfs4TcpListener {
     fn accept<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn TransportConnection>>> {
         Box::pin(async move {
             let (tcp, remote_addr) = self.listener.accept().await?;
-            if let Some(idle) = self.keepalive_idle {
-                let ka = socket2::TcpKeepalive::new().with_time(idle);
-                socket2::SockRef::from(&tcp).set_tcp_keepalive(&ka)?;
-            }
-            clamp_downlink_mss(&tcp);
-            clamp_uplink_sndbuf(&tcp);
+            // Listening sockets do not propagate TCP_NODELAY to accepted
+            // connections. Match the outbound obfs4 path before entering the
+            // handshake so small realtime frames never sit behind Nagle.
+            configure_accepted_tcp(&tcp, self.nodelay, self.keepalive_idle)?;
             let local_addr = tcp.local_addr().ok();
 
             // Run server-side handshake; silent-drop (return Err)
@@ -205,12 +202,7 @@ impl TransportListener for Obfs4TcpListener {
     fn accept_split<'a>(&'a self) -> BoxFuture<'a, Result<RawInbound>> {
         Box::pin(async move {
             let (tcp, remote_addr) = self.listener.accept().await?;
-            if let Some(idle) = self.keepalive_idle {
-                let ka = socket2::TcpKeepalive::new().with_time(idle);
-                socket2::SockRef::from(&tcp).set_tcp_keepalive(&ka)?;
-            }
-            clamp_downlink_mss(&tcp);
-            clamp_uplink_sndbuf(&tcp);
+            configure_accepted_tcp(&tcp, self.nodelay, self.keepalive_idle)?;
             let local_addr = tcp.local_addr().ok();
             // Clone the config the handshake needs so `finish` is `'static`.
             let psk = self.psk.clone();

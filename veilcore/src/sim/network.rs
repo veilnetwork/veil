@@ -740,6 +740,12 @@ pub struct SimNetworkBuilder {
     /// Most scenarios use defaults; tests that need fast DHT republishing
     /// set a short `republish_interval_secs`.
     dht_config: Option<crate::cfg::DhtConfig>,
+    /// Numeric UDP mapping reflectors applied to every node. Empty by
+    /// default, matching production's explicit deployment posture. Scenario
+    /// tests that exercise the token-bearing punch responder bind a local
+    /// reflector first and pass its address here so the service is present
+    /// from initial startup (avoids reload-induced topology churn).
+    udp_reflectors: Vec<String>,
     /// PRNG seed for deterministic topology operations.
     seed: u64,
     /// Whether to record topology events in an event log.
@@ -862,6 +868,14 @@ impl SimNetworkBuilder {
         self
     }
 
+    /// Configure the fixed-size UDP mapping reflectors used by every node.
+    /// Supplying at least one endpoint also starts each node's asynchronous
+    /// punch-responder service, exactly as it does in a deployed runtime.
+    pub fn udp_reflectors(mut self, endpoints: Vec<String>) -> Self {
+        self.udp_reflectors = endpoints;
+        self
+    }
+
     /// Set the PRNG seed for deterministic topology operations.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = seed;
@@ -952,6 +966,10 @@ impl SimNetworkBuilder {
             }
             if let Some(ref dc) = self.dht_config {
                 config.dht = dc.clone();
+            }
+            if !self.udp_reflectors.is_empty() {
+                config.nat.enabled = true;
+                config.nat.udp_reflectors = self.udp_reflectors.clone();
             }
             if self.with_metrics {
                 // Ephemeral bind (port 0) → each node gets a distinct port, no

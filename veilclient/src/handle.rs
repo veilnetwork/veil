@@ -376,7 +376,8 @@ impl AppHandle {
                     "too many pending stream opens".into(),
                 ));
             }
-            d.pending_stream_opens.push_back((request_id, (tx, data_tx)));
+            d.pending_stream_opens
+                .push_back((request_id, (tx, data_tx)));
         }
 
         let payload = StreamOpenPayload {
@@ -386,7 +387,11 @@ impl AppHandle {
             initial_window,
         };
         self.writer
-            .write_request_frame(LocalAppMsg::StreamOpen as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::StreamOpen as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
 
         // audit cycle-6 (P3): bound the wait. On timeout `rx` is dropped, which
@@ -701,7 +706,8 @@ impl AppSender {
                      ({MAX_PENDING_OPS}); daemon may be hung"
                 )));
             }
-            d.pending_send_authenticated_direct_with_reply.push_back((request_id, tx));
+            d.pending_send_authenticated_direct_with_reply
+                .push_back((request_id, tx));
         }
         let payload = veilcore::proto::SendAuthenticatedDirectWithReplyPayload {
             target_node_id: dst_node_id,
@@ -715,7 +721,8 @@ impl AppSender {
         };
         self.writer
             .write_request_frame(
-                LocalAppMsg::SendAuthenticatedDirectWithReply as u16, request_id,
+                LocalAppMsg::SendAuthenticatedDirectWithReply as u16,
+                request_id,
                 &payload.encode(),
             )
             .await?;
@@ -806,7 +813,8 @@ impl AppSender {
                     "too many pending stream opens".into(),
                 ));
             }
-            d.pending_stream_opens.push_back((request_id, (tx, data_tx)));
+            d.pending_stream_opens
+                .push_back((request_id, (tx, data_tx)));
         }
         let payload = StreamOpenPayload {
             dst_node_id,
@@ -815,7 +823,11 @@ impl AppSender {
             initial_window,
         };
         self.writer
-            .write_request_frame(LocalAppMsg::StreamOpen as u16, request_id, &payload.encode())
+            .write_request_frame(
+                LocalAppMsg::StreamOpen as u16,
+                request_id,
+                &payload.encode(),
+            )
             .await?;
         // audit cycle-6 (P3): bound the wait (see AppHandle::open_stream).
         let stream_id = match tokio::time::timeout(crate::client::STREAM_OPEN_TIMEOUT, rx).await {

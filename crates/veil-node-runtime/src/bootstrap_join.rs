@@ -431,7 +431,9 @@ mod tests {
         );
         drop(st);
         // ...and a re-dial was enqueued for it.
-        let redial = dial_rx.try_recv().expect("repeat join must re-enqueue a dial");
+        let redial = dial_rx
+            .try_recv()
+            .expect("repeat join must re-enqueue a dial");
         assert_eq!(redial.transport, "tcp://192.168.0.11:9000");
     }
 }

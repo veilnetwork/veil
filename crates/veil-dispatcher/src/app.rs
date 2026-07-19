@@ -264,8 +264,23 @@ impl FrameDispatcher {
                     m.inc_rt_frames_rx();
                     m.check_and_count_rt_seq_gap(&payload.app_id, payload.endpoint_id, payload.seq);
                 }
-                self.app_registry
+                let is_xveil_signal = payload.payload_type == u32::from_be_bytes(*b"XVSG");
+                let endpoint_id = payload.endpoint_id;
+                let app_prefix = veil_util::bytes_to_hex(&payload.app_id[..4]);
+                let payload_len = payload.payload.len();
+                let routed = self
+                    .app_registry
                     .route_rt_data(*node_id.as_bytes(), payload);
+                if is_xveil_signal {
+                    log::info!(
+                        "app.rt_control.route peer={} app={} endpoint_id={} bytes={} routed={}",
+                        veil_util::bytes_to_hex(&node_id.as_bytes()[..4]),
+                        app_prefix,
+                        endpoint_id,
+                        payload_len,
+                        routed,
+                    );
+                }
                 DispatchResult::NoResponse
             }
         }

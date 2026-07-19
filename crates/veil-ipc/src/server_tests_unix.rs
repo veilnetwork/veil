@@ -1724,18 +1724,19 @@ async fn acknowledged_oversized_send_registers_one_complete_chunk_batch() {
 
 // ── 233.5: APP_RT_SEND dispatched at REALTIME priority ───────────────────
 
-#[cfg(feature = "veilcore-internals-test")]
 #[tokio::test]
 async fn rt_send_dispatched_at_realtime_priority() {
-    use veil_types::FrameBroadcaster;
-
     let sock = temp_socket_path();
     let dst_id = [0xDDu8; 32];
     let a_id = [0xAAu8; 32];
 
-    // Register a direct session to dst_id.
-    let session_reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
-    let mut dst_rx = veil_util::wlock!(session_reg).register(dst_id);
+    // Capture the direct-session send without depending on veilcore's concrete
+    // SessionTxRegistry (veil-ipc is intentionally a stand-alone crate).
+    let (dst_tx, mut dst_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session_reg: Arc<dyn veil_types::FrameBroadcaster> = Arc::new(CapturingPeerBroadcaster {
+        peer_id: dst_id,
+        tx: dst_tx,
+    });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let registry = Arc::new(AppEndpointRegistry::new());
@@ -1783,22 +1784,11 @@ async fn rt_send_dispatched_at_realtime_priority() {
     )
     .await;
 
-    // Node must respond with APP_SEND_OK.
-    let (resp_hdr, _) =
-        tokio::time::timeout(Duration::from_millis(500), recv_ipc_frame(&mut client))
-            .await
-            .expect("timeout waiting for AppSendOk");
-    assert_eq!(
-        resp_hdr.msg_type,
-        LocalAppMsg::AppSendOk as u16,
-        "expected AppSendOk"
-    );
-
     // dst_rx must receive an AppMsg::AppRtData frame at REALTIME priority.
     let (prio, frame_bytes) = tokio::time::timeout(Duration::from_millis(500), dst_rx.recv())
         .await
         .expect("timeout waiting for RT frame at dst outbox")
-        .expect("dst outbox channel closed");
+        .expect("capture channel closed");
 
     assert_eq!(
         prio,
@@ -1826,6 +1816,16 @@ async fn rt_send_dispatched_at_realtime_priority() {
     assert_eq!(rt.marker, 1);
     assert_eq!(rt.payload_type, 99);
     assert_eq!(rt.payload, b"audio-frame");
+
+    // APP_RT_SEND is loss-tolerant fire-and-forget. The public client API has
+    // no reply waiter, so a success response per RTP packet would only consume
+    // reverse IPC bandwidth and reader time.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), recv_ipc_frame(&mut client))
+            .await
+            .is_err(),
+        "successful APP_RT_SEND must not emit APP_SEND_OK"
+    );
 
     drop(client);
     let _ = shutdown_tx.send(true);
@@ -2176,7 +2176,12 @@ async fn legacy_zero_id_requests_stay_inline_and_in_order() {
     let mut client = connect_and_hello(&sock).await;
 
     let lookup = veil_proto::LookupRelayKeyPayload { node_id: [7u8; 32] };
-    send_ipc_frame(&mut client, LocalAppMsg::LookupRelayKey as u16, &lookup.encode()).await;
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::LookupRelayKey as u16,
+        &lookup.encode(),
+    )
+    .await;
     send_ipc_frame(&mut client, LocalAppMsg::GetNodeIdentity as u16, &[]).await;
 
     // In-order: the slow lookup answers FIRST (inline), then the identity.
@@ -2238,14 +2243,20 @@ async fn request_id_same_arc_replies_out_of_order_by_id() {
         &mut client,
         LocalAppMsg::LookupRelayKey as u16,
         1,
-        &veil_proto::LookupRelayKeyPayload { node_id: slow_target }.encode(),
+        &veil_proto::LookupRelayKeyPayload {
+            node_id: slow_target,
+        }
+        .encode(),
     )
     .await;
     send_ipc_frame_id(
         &mut client,
         LocalAppMsg::LookupRelayKey as u16,
         2,
-        &veil_proto::LookupRelayKeyPayload { node_id: fast_target }.encode(),
+        &veil_proto::LookupRelayKeyPayload {
+            node_id: fast_target,
+        }
+        .encode(),
     )
     .await;
 

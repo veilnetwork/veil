@@ -434,8 +434,7 @@ impl NodeRuntime {
                     .config_path
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new("."));
-                build_standalone_sovereign_identity(veil_dir, &config, &self.logger)
-                    .or(Some(sov))
+                build_standalone_sovereign_identity(veil_dir, &config, &self.logger).or(Some(sov))
             }
             other => other,
         };
@@ -949,8 +948,11 @@ impl NodeRuntime {
             recursive_reverse_path: Arc::clone(&self.dispatcher.recursive_reverse_path),
             alias_registry: Arc::clone(&self.dispatcher.alias_registry),
             peer_observed_addrs: Arc::clone(&self.dispatcher.peer_observed_addrs),
+            local_udp_reflector_port: Arc::clone(&self.dispatcher.local_udp_reflector_port),
+            peer_udp_reflectors: Arc::clone(&self.dispatcher.peer_udp_reflectors),
             relay_tunnels: Arc::clone(&self.dispatcher.relay_tunnels),
             nat_probe_waiters: Arc::clone(&self.dispatcher.nat_probe_waiters),
+            nat_punch_offer_tx: Arc::clone(&self.dispatcher.nat_punch_offer_tx),
             // reuse the same Arc across reloads so the
             // dispatcher swap-in keeps reading the latest computed
             // params (the reload tick subsequently overwrites the
